@@ -96,9 +96,15 @@ pointers in `NonNull`/`Vec`/`RawVec`. `get_type` now looks through `TyKind::Pat(
 base type — correct because rustc’s `ty::Pat` layout clones the base layout and only tightens the
 scalar valid-range/niche (applied to *enclosing* layouts). This is target-independent and lifted
 the aarch64 `::stable` subset from **136/228 to 181/228 (+45)** with zero regressions; `vec`/`raw_vec`
-pass end-to-end. The remaining ~47 failures are a different class — *runtime/execution* failures
-(the produced assembly fails to run, with a recurring ".NET could not execute …command or file not
-found", not codegen `todo!`s), a mix of likely aarch64-runtime quirks and pre-existing limitations.
+pass end-to-end.
+
+Subsequent work lifted the subset further: the reworked float min/max/abs intrinsics
+(see [semantics_mapping.md](../docs/semantics_mapping.md)) plus clearing test-source bitrot —
+removed-intrinsic imports, and the big one: C-string pointers hardcoded as `*const i8`, which
+break on aarch64 where `c_char = u8` (the portable form is `*const core::ffi::c_char`). Net so
+far: **136 → 207 / 230 (~90%)**. The ~23 still-failing are now genuine codegen `todo!()` gaps
+(new language/std features the backend doesn't yet lower) plus the full-cargo-crate tests — real
+feature work, not bitrot or architecture issues.
 
 > Note: this covers aarch64 **Linux** (e.g. a Docker container on Apple Silicon). aarch64 **macOS**
 > native is a much larger effort — no ELF `.so`/`/lib` layout, `libSystem.dylib`, and a different
