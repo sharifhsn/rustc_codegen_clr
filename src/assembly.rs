@@ -96,7 +96,9 @@ pub fn terminator_to_ops<'tcx>(
         })) {
             Ok(ok) => ok,
             Err(payload) => {
-                let msg = if let Some(msg) = payload.downcast_ref::<&str>() {
+                let msg = if let Some(msg) =
+                    crate::codegen_error::panic_payload_msg(payload.as_ref())
+                {
                     rustc_middle::ty::print::with_no_trimmed_paths! {
                     format!("Tried to execute terminator {term:?} whose compialtion message {msg:?}!")}
                 } else {
@@ -126,7 +128,7 @@ pub fn statement_to_ops<'tcx>(
         })) {
             Ok(success) => Ok(success),
             Err(payload) => {
-                if let Some(msg) = payload.downcast_ref::<&str>() {
+                if let Some(msg) = crate::codegen_error::panic_payload_msg(payload.as_ref()) {
                     Err(crate::codegen_error::CodegenError::from_panic_message(msg))
                 } else {
                     Err(crate::codegen_error::CodegenError::from_panic_message(
@@ -235,6 +237,13 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
         vec![]
     };
     let sig_idx = ctx.alloc_sig(sig.clone());
+    // If any statement fails to compile, the per-statement `throw` recovery below would leave the
+    // surrounding block structure (branches/handlers) intact while the failed statement no longer
+    // produces the value later blocks expect — which can emit branches to blocks the optimizer then
+    // drops, yielding invalid CIL (`ilasm: Undefined Label: bbN`). To keep recovery sound, we record
+    // the first failure and, after assembling the blocks, replace the *whole* method body with a
+    // single throwing stub (no branches → always-valid IL). The method then throws if ever called.
+    let mut compile_failed: Option<String> = None;
     // Used for type-checking the CIL to ensure its validity.
     for (last_bb_id, block_data) in blocks.into_iter().enumerate() {
         let mut trees = Vec::new();
@@ -250,6 +259,11 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
                     rustc_middle::ty::print::with_no_trimmed_paths! {eprintln!(
                         "Method \"{name}\" failed to compile statement {statement:?} with message {err:?}\n"
                     )};
+                    if compile_failed.is_none() {
+                        compile_failed = rustc_middle::ty::print::with_no_trimmed_paths! {Some(format!(
+                            "Method \"{name}\" could not be compiled: statement {statement:?} failed with {err:?}."
+                        ))};
+                    }
                     rustc_middle::ty::print::with_no_trimmed_paths! {vec![(V1Root::throw(&format!("Tired to run a statement {statement:?} which failed to compile with error message {err:?}."),ctx).into())]}
                 }
             };
@@ -318,6 +332,14 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
             ));
         }
         //ops.extend(trees.iter().flat_map(|tree| tree.flatten()))
+    }
+
+    // A statement failed to compile: discard the partially-built (and potentially branch-inconsistent)
+    // body and emit a single throwing block, guaranteeing valid CIL. The method throws if called.
+    if let Some(reason) = compile_failed {
+        normal_bbs = vec![BasicBlock::new(vec![V1Root::throw(&reason, ctx).into()], 0, None)];
+        cleanup_bbs = Vec::new();
+        repack_cil = Vec::new();
     }
 
     normal_bbs

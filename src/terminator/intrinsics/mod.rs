@@ -18,7 +18,7 @@ use rustc_middle::{
 };
 use rustc_span::Spanned;
 use saturating::{saturating_add, saturating_sub};
-use type_info::{is_val_statically_known, size_of_val};
+use type_info::{align_of_val, is_val_statically_known, size_of_val};
 use utilis::{
     atomic_add, atomic_and, atomic_max, atomic_min, atomic_nand, atomic_or, atomic_xor,
     compare_bytes,
@@ -329,23 +329,10 @@ pub fn handle_intrinsic<'tcx>(
         "ptr_offset_from" => vec![ptr::ptr_offset_from(args, destination, call_instance, ctx)],
         "saturating_add" => vec![saturating_add(args, destination, ctx, call_instance)],
         "saturating_sub" => vec![saturating_sub(args, destination, ctx, call_instance)],
-        "min_align_of_val" => {
-            debug_assert_eq!(
-                args.len(),
-                1,
-                "The intrinsic `min_align_of_val` MUST take in exactly 1 argument!"
-            );
-            let tpe = ctx.monomorphize(
-                call_instance.args[0]
-                    .as_type()
-                    .expect("needs_drop works only on types!"),
-            );
-            let align = rustc_codegen_clr_type::align_of(tpe, ctx.tcx());
-            vec![place_set(
-                destination,
-                conv_usize!(V1Node::V2(ctx.alloc_node(align))),
-                ctx,
-            )]
+        // `min_align_of_val` is the historical name for `align_of_val`; both lower identically
+        // (and correctly handle `dyn` via the vtable — see `type_info::align_of_val`).
+        "min_align_of_val" | "align_of_val" => {
+            vec![align_of_val(args, destination, ctx, call_instance)]
         }
         // .NET guarantees all loads are tear-free. TODO: what bout C?
         "atomic_load" => {

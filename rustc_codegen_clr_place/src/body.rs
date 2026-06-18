@@ -84,13 +84,50 @@ fn body_field<'a>(
                     }
                 }
                 (true, true) => {
-                    assert_eq!(field_index, 0, "Can't handle DST with more than 1 field.");
-                    let field_type = ctx.type_from_cache(Ty::new_ptr(
-                        ctx.tcx(),
-                        field_type,
-                        rustc_middle::ty::Mutability::Mut,
-                    ));
-                    (field_ty.into(), ctx.cast_ptr(parrent_node, field_type))
+                    // The unsized tail field of a DST (e.g. `data: [MaybeUninit<T>]` in
+                    // `core::array::IntoIter`'s `PolymorphicIter<DATA> { alive, data }`). Its
+                    // address is itself a fat pointer:
+                    //   data     = parent.DATA_PTR + offset_of(field)
+                    //   metadata = parent.METADATA   (the tail shares the enclosing DST's metadata)
+                    // The previous code only handled an unsized field at field index 0 (offset 0)
+                    // via `assert_eq!(field_index, 0)`, which rejected every DST with a sized
+                    // prefix before the tail.
+                    let offset = FieldOffsetIterator::fields(
+                        ctx.layout_of(curr_type).layout.0.0.clone(),
+                    )
+                    .nth(field_index as usize)
+                    .expect("Field index not in field offset iterator");
+                    let curr_type_fat_ptr = ctx
+                        .type_from_cache(Ty::new_ptr(
+                            ctx.tcx(),
+                            curr_type,
+                            rustc_middle::ty::Mutability::Mut,
+                        ))
+                        .as_class_ref()
+                        .unwrap();
+                    let void_ptr = ctx.nptr(Type::Void);
+                    let data_descr = FieldDesc::new(
+                        curr_type_fat_ptr,
+                        ctx.alloc_string(cilly::DATA_PTR),
+                        void_ptr,
+                    );
+                    let metadata_descr = FieldDesc::new(
+                        curr_type_fat_ptr,
+                        ctx.alloc_string(cilly::METADATA),
+                        Type::Int(Int::USize),
+                    );
+                    let metadata = ctx.ld_field(parrent_node, metadata_descr);
+                    let data = ctx.ld_field(parrent_node, data_descr);
+                    let data = if offset == 0 {
+                        data
+                    } else {
+                        ctx.biop(data, Const::USize(u64::from(offset)), BinOp::Add)
+                    };
+                    let field_fat_ptr = fat_ptr_to(field_type, ctx);
+                    (
+                        field_ty.into(),
+                        ctx.create_slice(field_fat_ptr, data, metadata),
+                    )
                 }
             }
         }

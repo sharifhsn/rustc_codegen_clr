@@ -20,6 +20,23 @@ impl CodegenError {
     }
 }
 
+/// Best-effort extraction of a human-readable message from a panic payload.
+///
+/// `std` panics carry their message as either `&'static str` (`panic!("literal")`) or
+/// `String` (`assert!`, `assert_eq!`, `panic!("{}", x)`, `todo!`/`unimplemented!` with args).
+/// The codegen's per-statement/-terminator panic recovery previously only handled `&str`, so
+/// every *formatted* panic — which is the majority of the backend's `todo!`/`assert!` holes —
+/// was reported as an opaque "non-string message", defeating the "fail loud + specific" goal
+/// that turns the build-std walk into an actionable backlog. Handle both here.
+#[must_use]
+pub fn panic_payload_msg(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+    if let Some(msg) = payload.downcast_ref::<&'static str>() {
+        Some(msg)
+    } else {
+        payload.downcast_ref::<String>().map(String::as_str)
+    }
+}
+
 pub struct MethodCodegenError {
     file: String,
     line: u32,

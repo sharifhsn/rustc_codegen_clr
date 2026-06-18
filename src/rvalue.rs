@@ -341,7 +341,12 @@ pub fn handle_rvalue<'tcx>(
             let target = ctx.type_from_cache(*target);
             (vec![], handle_operand(operand, ctx).cast_ptr(target))
         }
-Rvalue::Cast(rustc_middle::mir::CastKind::Subtype, _, _) => todo!(),
+        // A `Subtype` cast is a representation-preserving coercion (subtyping — e.g. variance or
+        // higher-ranked-lifetime adjustments). It never changes the value's layout, so forward the
+        // operand unchanged.
+        Rvalue::Cast(rustc_middle::mir::CastKind::Subtype, operand, _target) => {
+            (vec![], handle_operand(operand, ctx))
+        }
     }
 }
 const SIMPLE_REPEAT_CAP: u64 = 16;

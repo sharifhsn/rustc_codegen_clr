@@ -27,10 +27,22 @@ impl CallInfo {
             Err(_error) => todo!(),
         };
         let conv = fn_abi.conv;
+        // CIL is calling-convention-agnostic: every call lowers to a CIL `call`/`callvirt` using
+        // the computed signature, so the *native* calling convention has no bearing on lowering.
+        // Accept the conventions that legitimately appear in core/alloc/std and compiler_builtins:
+        //  - the Rust family (`Rust`, plus `RustCold`/`RustPreserveNone`/`RustTail`, used for
+        //    `#[cold]`/tail paths) — `is_rustic_abi()`,
+        //  - `C` and the x86 variants,
+        //  - `Custom`: compiler_builtins' naked/asm-only intrinsics (rustc "does not know how to
+        //    call or define" them). Their signature is well-defined; their asm body can't be
+        //    lowered to CIL but is handled by per-method panic recovery (a throwing stub) and, for
+        //    the ones that matter (`mem*`), replaced by the linker's builtin implementations.
+        // Genuinely exotic conventions (Swift, 32-bit Arm, GPU-kernel, interrupt) still fail loud,
+        // as they must not silently appear for the .NET/CIL targets.
         #[allow(clippy::match_same_arms)]
         match conv {
-            CanonAbi::C | CanonAbi::Rust => (),
-            // TODO: check this is 100% correct!
+            _ if conv.is_rustic_abi() => (),
+            CanonAbi::C | CanonAbi::Custom => (),
             CanonAbi::X86(_) => (),
             _ => panic!("ERROR:calling using convention {conv:?} is not supported!"),
         }
@@ -58,6 +70,9 @@ impl CallInfo {
             | TargetAbi::Cdecl { unwind: _ }
             | TargetAbi::Rust
             | TargetAbi::RustCold
+            // `custom` ABI (compiler_builtins naked/asm intrinsics): not the tupled `rust_call`
+            // convention, so arguments are passed straight through (see the `conv` match above).
+            | TargetAbi::Custom
             | TargetAbi::Unadjusted
             | TargetAbi::SysV64 { unwind: _ } => false,
 

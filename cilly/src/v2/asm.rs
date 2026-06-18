@@ -1541,6 +1541,24 @@ impl Assembly {
         const EMPTY: [Interned<CILNode>; 0] = [];
         self.call(uninit_val, &EMPTY, IsPure::PURE)
     }
+    /// Builds a fat-pointer value of class `slice_tpe` (a `FatPtr*` / slice class, as produced by
+    /// [`crate::r#type::fat_ptr_to`]) from a thin data `ptr` and `metadata`, via the `create_slice`
+    /// builtin. This is the V2 counterpart of [`crate::cil_node::V1Node::create_slice`], for the
+    /// V2 place pipeline (`rustc_codegen_clr_place`'s `body.rs`).
+    pub fn create_slice(
+        &mut self,
+        slice_tpe: Interned<ClassRef>,
+        ptr: impl IntoAsmIndex<Interned<CILNode>>,
+        metadata: impl IntoAsmIndex<Interned<CILNode>>,
+    ) -> Interned<CILNode> {
+        let ptr = ptr.into_idx(self);
+        let metadata = metadata.into_idx(self);
+        let void_ptr = self.nptr(Type::Void);
+        let main = self.main_module();
+        let sig = self.sig([void_ptr, Type::Int(Int::USize)], Type::ClassRef(slice_tpe));
+        let create_slice = self.new_methodref(*main, "create_slice", sig, MethodKind::Static, []);
+        self.call(create_slice, &[ptr, metadata], IsPure::PURE)
+    }
 
     pub(crate) fn ld_arg(&mut self, arg: u32) -> Interned<CILNode> {
         self.alloc_node(CILNode::LdArg(arg))

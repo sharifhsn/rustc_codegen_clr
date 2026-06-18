@@ -193,6 +193,22 @@ fn load_scalar_pair(addr: V1Node, ctx: &mut MethodCompileCtx<'_, '_>) -> (V1Node
         },
     )
 }
+/// Pattern types (`T is <pattern>`, e.g. `NonNull`'s field `*const T is !null`) are
+/// *layout-identical* to their base type — the pattern only refines validity. The unsizing logic
+/// dispatches on `TyKind` (`RawPtr`/`Ref`/`Adt`) and operates on the underlying pointer + metadata,
+/// so a `TyKind::Pat` wrapper must be peeled to its base first; otherwise the recursion through
+/// `NonNull` reaches `Pat(*const T)` and falls through to the "invalid coercion" panic.
+fn peel_pattern_type<'tcx>(
+    fx: &mut MethodCompileCtx<'tcx, '_>,
+    layout: TyAndLayout<'tcx>,
+) -> TyAndLayout<'tcx> {
+    if let TyKind::Pat(base, _) = layout.ty.kind() {
+        // Recurse: patterns don't nest in practice, but base could itself be a pattern type.
+        peel_pattern_type(fx, fx.layout_of(*base))
+    } else {
+        layout
+    }
+}
 /// Coerce `src`, which is a reference to a value of type `src_ty`,
 /// to a value of type `dst_ty` and store the result in `dst`
 fn unsize_metadata<'tcx>(
@@ -201,6 +217,10 @@ fn unsize_metadata<'tcx>(
     src_ty: TyAndLayout<'tcx>,
     dst_ty: TyAndLayout<'tcx>,
 ) -> V1Node {
+    // Pattern types are layout-transparent; see `peel_pattern_type`. The address (`src_cil`) is
+    // unchanged because the layout is identical.
+    let src_ty = peel_pattern_type(fx, src_ty);
+    let dst_ty = peel_pattern_type(fx, dst_ty);
     let mut coerce_ptr = || {
         if fx
             .layout_of(src_ty.ty.builtin_deref(true).unwrap())
@@ -245,6 +265,10 @@ fn unsize_ptr_metadata<'tcx>(
     dst_layout: TyAndLayout<'tcx>,
     old_info: Option<V1Node>,
 ) -> V1Node {
+    // Peel layout-transparent pattern types (e.g. `NonNull`'s `*const T is !null`) so the
+    // pointer/metadata dispatch below sees the underlying `RawPtr`/`Adt`.
+    let src_layout = peel_pattern_type(fx, src_layout);
+    let dst_layout = peel_pattern_type(fx, dst_layout);
     match (&src_layout.ty.kind(), &dst_layout.ty.kind()) {
         (&TyKind::Ref(_, a, _), &TyKind::Ref(_, b, _) | &TyKind::RawPtr(b, _))
         | (&TyKind::RawPtr(a, _), &TyKind::RawPtr(b, _)) => unsized_info(fx, *a, *b, old_info),

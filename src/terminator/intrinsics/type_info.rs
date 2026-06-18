@@ -118,3 +118,61 @@ pub fn size_of_val<'tcx>(
         ctx,
     )
 }
+/// Lowering of the `align_of_val` intrinsic (formerly `min_align_of_val`): the alignment of the
+/// value behind a `*const T` / `&T`, where `T: ?Sized`.
+///
+/// Mirrors [`size_of_val`]'s structure. Alignment is *statically known* for every type except
+/// `dyn Trait`: sized types and slices/`str` (whose alignment is the element's, independent of the
+/// length metadata). A `dyn Trait` value's alignment lives in its vtable — slot 2, after
+/// `drop_in_place` (slot 0) and `size` (slot 1) — so it must be read at runtime from the metadata
+/// pointer. (The old `min_align_of_val` lowering used the static path unconditionally, which is
+/// wrong for `dyn`.)
+pub fn align_of_val<'tcx>(
+    args: &[Spanned<Operand<'tcx>>],
+    destination: &Place<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    call_instance: Instance<'tcx>,
+) -> V1Root {
+    debug_assert_eq!(
+        args.len(),
+        1,
+        "The intrinsic `align_of_val` MUST take in exactly 1 argument!"
+    );
+    let pointed_ty = ctx.monomorphize(
+        call_instance.args[0]
+            .as_type()
+            .expect("align_of_val works only on types!"),
+    );
+    if pointer_to_is_fat(pointed_ty, ctx.tcx(), ctx.instance())
+        && !matches!(pointed_ty.kind(), TyKind::Slice(_) | TyKind::Str)
+    {
+        // `dyn Trait`: read the alignment from vtable slot 2 (metadata is the vtable pointer).
+        let ptr_ty = ctx.monomorphize(args[0].node.ty(ctx.body(), ctx.tcx()));
+        let fat_tpe = ctx.type_from_cache(ptr_ty).as_class_ref().unwrap();
+        let descriptor = FieldDesc::new(
+            fat_tpe,
+            ctx.alloc_string(crate::METADATA),
+            Type::Int(Int::USize),
+        );
+        let addr = operand_address(&args[0].node, ctx);
+        let align_ptr = (ld_field!(addr, ctx.alloc_field(descriptor))
+            + conv_usize!(
+                V1Node::V2(ctx.size_of(Int::ISize).into_idx(ctx))
+                    * V1Node::V2(ctx.alloc_node(2_i32))
+            ))
+        .cast_ptr(ctx.nptr(Type::Int(Int::USize)));
+        return place_set(
+            destination,
+            V1Node::LDIndUSize {
+                ptr: Box::new(align_ptr),
+            },
+            ctx,
+        );
+    }
+    let align = rustc_codegen_clr_type::align_of(pointed_ty, ctx.tcx());
+    place_set(
+        destination,
+        conv_usize!(V1Node::V2(ctx.alloc_node(align))),
+        ctx,
+    )
+}
