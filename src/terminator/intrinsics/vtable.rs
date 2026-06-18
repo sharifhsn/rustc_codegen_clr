@@ -3,7 +3,7 @@ use cilly::{cil_node::V1Node, cil_root::V1Root, conv_usize, Int, IntoAsmIndex, T
 use rustc_codegen_clr_place::place_set;
 use rustc_codgen_clr_operand::handle_operand;
 use rustc_middle::mir::{Operand, Place};
-use rustc_span::source_map::Spanned;
+use rustc_span::Spanned;
 /// Gets the aligement of a dynamic object from a fat pointer, by looking it up from the vtable.
 pub fn vtable_align<'tcx>(
     args: &[Spanned<Operand<'tcx>>],

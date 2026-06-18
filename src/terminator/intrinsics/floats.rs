@@ -9,7 +9,7 @@ use cilly::{
 use rustc_codegen_clr_place::place_set;
 use rustc_codgen_clr_operand::handle_operand;
 use rustc_middle::mir::{Operand, Place};
-use rustc_span::source_map::Spanned;
+use rustc_span::Spanned;
 /// Implementation of the fmaf32 intrinsics. Takes in 3 arguments: a, b, c. Calcualtes a * b + c
 pub fn fmaf32<'tcx>(
     args: &[Spanned<Operand<'tcx>>],

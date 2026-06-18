@@ -12,7 +12,7 @@ use rustc_middle::{
     mir::{Operand, Place},
     ty::{TyKind, UintTy},
 };
-use rustc_span::source_map::Spanned;
+use rustc_span::Spanned;
 
 pub fn bswap<'tcx>(
     args: &[Spanned<Operand<'tcx>>],

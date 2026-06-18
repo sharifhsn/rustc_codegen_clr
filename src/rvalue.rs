@@ -5,7 +5,7 @@ use crate::{
 use cilly::{
     cil_node::V1Node,
     cil_root::V1Root,
-    conv_usize, ld_field, size_of, Const, Type,
+    conv_usize, ld_field, Const, Type,
     {cilnode::MethodKind, FieldDesc, Float, Int, MethodRef},
 };
 use rustc_codegen_clr_call::CallInfo;
@@ -21,7 +21,7 @@ use rustc_codgen_clr_operand::{
     handle_operand, is_const_zero, is_uninit, operand_address, static_data::add_allocation,
 };
 use rustc_middle::{
-    mir::{CastKind, NullOp, Operand, Place, Rvalue},
+    mir::{CastKind, Operand, Place, Rvalue},
     ty::{adjustment::PointerCoercion, GenericArgs, Instance, InstanceKind, Ty, TyKind},
 };
 macro_rules! cast {
@@ -41,7 +41,7 @@ macro_rules! cast {
 }
 pub fn is_rvalue_unint<'tcx>(rvalue: &Rvalue<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> bool {
     match rvalue {
-        Rvalue::Repeat(operand, _) | Rvalue::Use(operand) => is_uninit(operand, ctx),
+        Rvalue::Repeat(operand, _) | Rvalue::Use(operand, _) => is_uninit(operand, ctx),
         /* TODO: before enabling this, check if the aggregate is an enum, and if so, check if it has a discriminant.
         Rvalue::Aggregate(_, field_index) => field_index
         .iter()
@@ -54,7 +54,7 @@ pub fn is_rvalue_const_0<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> bool {
     match rvalue {
-        Rvalue::Repeat(operand, _) | Rvalue::Use(operand) => is_const_zero(operand, ctx),
+        Rvalue::Repeat(operand, _) | Rvalue::Use(operand, _) => is_const_zero(operand, ctx),
         _ => false,
     }
 }
@@ -65,10 +65,13 @@ pub fn handle_rvalue<'tcx>(
 ) -> (Vec<V1Root>, V1Node) {
     match rvalue {
        
-        Rvalue::Use(operand) => (vec![], handle_operand(operand, ctx)),
+        Rvalue::Use(operand, _) => (vec![], handle_operand(operand, ctx)),
         // TODO: check the exact semantics of `WrapUnsafeBinder` once it has some documentation.
         Rvalue::WrapUnsafeBinder(operand, _unknown_ty) => (vec![], handle_operand(operand, ctx)),
         Rvalue::CopyForDeref(place) => (vec![], place_get(place, ctx)),
+        // `Reborrow` creates a bitwise copy of the place (same memory layout as the source). This
+        // matches how rustc_codegen_ssa lowers it: as a plain `Operand::Copy(place)` read.
+        Rvalue::Reborrow(_ty, _mutability, place) => (vec![], place_get(place, ctx)),
         Rvalue::Ref(_region, _borrow_kind, place) => (vec![], place_address(place, ctx)),
         Rvalue::RawPtr(_mutability, place) => (vec![], place_address(place, ctx)),
         Rvalue::Cast(
@@ -107,42 +110,10 @@ pub fn handle_rvalue<'tcx>(
             vec![],
             cast!(ctx, operand, target, crate::casts::int_to_float, ctx),
         ),
-        Rvalue::NullaryOp(op, ty) => match op {
-            NullOp::SizeOf => {
-                let ty = ctx.type_from_cache(ctx.monomorphize(*ty));
-                if ty == Type::Void {
-                    let val = ctx.alloc_node(Const::USize(0));
-                    (vec![], V1Node::V2(val))
-                } else {
-                    let val = size_of!(ty)(ctx);
-                    (vec![], conv_usize!(V1Node::V2(val)))
-                }
-            }
-            NullOp::AlignOf => {
-                let algin = rustc_codegen_clr_type::align_of(ctx.monomorphize(*ty), ctx.tcx());
-                (vec![], V1Node::V2(ctx.alloc_node(Const::USize(algin))))
-            }
-            NullOp::OffsetOf(fields) => {
-                let layout = ctx.layout_of(*ty);
-                let offset = ctx
-                    .tcx()
-                    .offset_of_subfield(
-                        rustc_middle::ty::TypingEnv::fully_monomorphized(),
-                        layout,
-                        fields.iter(),
-                    )
-                    .bytes();
-                (vec![], V1Node::V2(ctx.alloc_node(Const::USize(offset))))
-            }
-            rustc_middle::mir::NullOp::UbChecks => {
-                let ub_checks = ctx.tcx().sess.ub_checks();
-                (vec![], V1Node::V2(ctx.alloc_node(ub_checks)))
-            }
-            rustc_middle::mir::NullOp::ContractChecks => {
-                let cc_checks = ctx.tcx().sess.contract_checks();
-                (vec![], V1Node::V2(ctx.alloc_node(cc_checks)))
-            }
-        },
+        // `Rvalue::NullaryOp` (SizeOf/AlignOf/OffsetOf/UbChecks/ContractChecks) no longer exists in
+        // MIR for this rustc version. SizeOf/AlignOf/OffsetOf are now const intrinsics that are
+        // fully const-evaluated before reaching the backend (they arrive as `Operand::Constant`),
+        // and UbChecks/ContractChecks are now `Operand::RuntimeChecks` (handled in the operand crate).
         Rvalue::Aggregate(aggregate_kind, field_index) => crate::aggregate::handle_aggregate(
             ctx,
             target_location,
@@ -216,24 +187,8 @@ pub fn handle_rvalue<'tcx>(
                 ),
             }
         }
-        Rvalue::ShallowInitBox(operand, dst) => {
-            let dst = ctx.monomorphize(*dst);
-            let boxed_dst = Ty::new_box(ctx.tcx(), dst);
-            //let dst = tycache.type_from_cache(dst, tcx, method_instance);
-            let src = operand.ty(&ctx.body().local_decls, ctx.tcx());
-            let boxed_dst_type = ctx.type_from_cache(boxed_dst);
-            let src = ctx.monomorphize(src);
-            assert!(
-                !pointer_to_is_fat(dst, ctx.tcx(), ctx.instance()),
-                "ERROR: shallow init box used to initialze a fat box!"
-            );
-            let src = ctx.type_from_cache(src);
-
-            (
-                vec![],
-                handle_operand(operand, ctx).transmute_on_stack(src, boxed_dst_type, ctx),
-            )
-        }
+        // `Rvalue::ShallowInitBox` no longer exists in MIR for this rustc version; box construction
+        // is now expressed through ordinary allocation + assignment, so there is nothing to handle here.
         Rvalue::Cast(CastKind::PointerWithExposedProvenance, operand, target) => {
             //FIXME: the documentation of this cast(https://doc.rust-lang.org/nightly/std/ptr/fn.from_exposed_addr.html) is a bit confusing,
             //since this seems to be something deeply linked to the rust memory model.
@@ -282,7 +237,7 @@ pub fn handle_rvalue<'tcx>(
             (vec![], ops)
         }
         Rvalue::Cast(
-            CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer, _),
+            CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer(_), _),
             operand,
             _target,
         ) => {

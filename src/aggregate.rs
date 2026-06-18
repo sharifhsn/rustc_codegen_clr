@@ -284,7 +284,7 @@ fn aggregate_adt<'tcx>(
                     .all_fields()
                     .nth(field.0 as usize)
                     .expect("Could not find field!");
-                let field_type = field_def.ty(ctx.tcx(), subst);
+                let field_type = field_def.ty(ctx.tcx(), subst).skip_normalization();
                 let field_type = ctx.monomorphize(field_type);
                 let field_type = ctx.type_from_cache(field_type);
                 // Seting a void field is a no-op.
@@ -318,7 +318,7 @@ fn aggregate_adt<'tcx>(
                     "{variant_name}_{fname}",
                     fname = escape_field_name(&field.name.to_string())
                 ));
-                let field_type = get_type(field.ty(ctx.tcx(), subst), ctx);
+                let field_type = get_type(field.ty(ctx.tcx(), subst).skip_normalization(), ctx);
                 // Seting a void field is a no-op.
                 if field_type == cilly::Type::Void {
                     continue;
@@ -357,7 +357,7 @@ fn aggregate_adt<'tcx>(
                 .nth(active_field.as_u32() as usize)
                 .expect("Could not find field!");
 
-            let field_ty = ctx.monomorphize(field_def.ty(ctx.tcx(), subst));
+            let field_ty = ctx.monomorphize(field_def.ty(ctx.tcx(), subst).skip_normalization());
             let field_type = get_type(field_ty, ctx);
             // Seting a void field is a no-op.
             if field_type == cilly::Type::Void {

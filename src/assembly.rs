@@ -1,7 +1,6 @@
 use crate::{
     basic_block::handler_for_block,
     codegen_error::{CodegenError, MethodCodegenError},
-    rustc_middle::dep_graph::DepContext,
     utilis::{alloc_id_to_u64, is_function_magic},
     IString,
 };
@@ -24,7 +23,8 @@ use rustc_codegen_clr_type::{adt::field_descrptor, r#type::get_type, utilis::is_
 use rustc_codgen_clr_operand::static_data::add_static;
 use rustc_hir::attrs::Linkage;
 use rustc_middle::{
-    mir::{interpret::GlobalAlloc, mono::MonoItem, Local, LocalDecl, Statement, Terminator},
+    mir::{interpret::GlobalAlloc, Local, LocalDecl, Statement, Terminator},
+    mono::MonoItem,
     ty::{TyCtxt, TyKind},
 };
 fn linkage_to_access(link: Option<Linkage>) -> Access {
@@ -386,7 +386,7 @@ pub fn add_item<'tcx>(
             let symbol_name: IString = function_name(item.symbol_name(tcx)).into();
             let mut ctx = MethodCompileCtx::new(tcx, None, instance, asm);
             let function_compile_timer = tcx
-                .profiler()
+                .prof
                 .generic_activity_with_arg("compile function", item.symbol_name(tcx).to_string());
             rustc_middle::ty::print::with_no_trimmed_paths! {checked_add_fn(  &mut ctx,&symbol_name,)
             .expect("Could not add function!")};
@@ -398,7 +398,7 @@ pub fn add_item<'tcx>(
             Ok(())
         }
         MonoItem::Static(stotic) => {
-            let static_compile_timer = tcx.profiler().generic_activity_with_arg(
+            let static_compile_timer = tcx.prof.generic_activity_with_arg(
                 "compile static initializer",
                 item.symbol_name(tcx).to_string(),
             );
@@ -480,9 +480,9 @@ pub fn add_item<'tcx>(
 pub(crate) fn span_source_info(tcx: TyCtxt, span: rustc_span::Span) -> V1Root {
     let (file, lstart, cstart, lend, mut cend) = tcx.sess.source_map().span_to_location_info(span);
     let file = file.map_or(String::new(), |file| {
-        file.name
-            .display(rustc_span::FileNameDisplayPreference::Local)
-            .to_string()
+        // `FileNameDisplayPreference` is now private; `prefer_local_unconditionally` is the public
+        // equivalent of the old `display(FileNameDisplayPreference::Local)`.
+        file.name.prefer_local_unconditionally().to_string()
     });
     if cstart >= cend {
         cend = cstart + 1;

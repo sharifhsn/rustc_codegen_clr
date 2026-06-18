@@ -39,9 +39,9 @@ impl FieldOffsetIterator {
         match fields {
             FieldsShape::Arbitrary {
                 offsets,
-                memory_index,
+                in_memory_order,
             } => {
-                let offsets: Box<[_]> = memory_index
+                let offsets: Box<[_]> = in_memory_order
                     .iter()
                     .enumerate()
                     .map(|(index, _mem_idx)| {
@@ -134,7 +134,9 @@ pub fn get_variant_at_index(
 ) -> LayoutData<FieldIdx, rustc_abi::VariantIdx> {
     match layout.variants {
         Variants::Single { .. } => layout,
-        Variants::Multiple { variants, .. } => variants[variant_index].clone(),
+        // `Variants::Multiple.variants` now stores reduced `VariantLayout`s rather than full
+        // `LayoutData`s. `LayoutData::for_variant` reconstructs the full per-variant `LayoutData`.
+        Variants::Multiple { .. } => LayoutData::for_variant(&layout, variant_index),
         Variants::Empty => todo!("Empty variants have no variants."),
     }
 }
@@ -196,7 +198,7 @@ pub fn set_discr<'tcx>(
                 let (tag_tpe, _) = enum_tag_info(layout, ctx);
                 //let niche = self.project_field(bx, tag_field);
                 //let niche_llty = bx.cx().immediate_backend_type(niche.layout);
-                let niche_value = variant_index.as_u32() - niche_variants.start().as_u32();
+                let niche_value = variant_index.as_u32() - niche_variants.start.as_u32();
                 let niche_value = u128::from(niche_value).wrapping_add(niche_start);
                 let tag_val = V1Node::V2(
                     ctx.alloc_node(
@@ -272,7 +274,7 @@ pub fn get_discr<'tcx>(
             niche_start,
         } => {
             let (disrc_type, _) = enum_tag_info(layout, ctx);
-            let relative_max = niche_variants.end().as_u32() - niche_variants.start().as_u32();
+            let relative_max = niche_variants.last.as_u32() - niche_variants.start.as_u32();
             let enum_tag_name = ctx.alloc_string(crate::ENUM_TAG);
             let tag = V1Node::LDField {
                 field: ctx.alloc_field(FieldDesc::new(enum_tpe, enum_tag_name, disrc_type)),
@@ -287,7 +289,7 @@ pub fn get_discr<'tcx>(
             // relative_tag = tag - niche_start
             // is_niche = relative_tag <= (ule) relative_max
             // discr = if is_niche {
-            //     cast(relative_tag) + niche_variants.start()
+            //     cast(relative_tag) + niche_variants.start
             // } else {
             //     untagged_variant
             // }
@@ -317,7 +319,7 @@ pub fn get_discr<'tcx>(
                             [
                                 tag,
                                 V1Node::const_u128(
-                                    u128::from(niche_variants.start().as_u32(),),
+                                    u128::from(niche_variants.start.as_u32(),),
                                     ctx
                                 )
                             ]
@@ -336,7 +338,7 @@ pub fn get_discr<'tcx>(
                             [
                                 tag,
                                 V1Node::const_i128(
-                                    u128::from(niche_variants.start().as_u32()),
+                                    u128::from(niche_variants.start.as_u32()),
                                     ctx
                                 )
                             ]
@@ -362,7 +364,7 @@ pub fn get_discr<'tcx>(
                 let tagged_discr = crate::casts::int_to_int(
                     Type::Int(Int::U64),
                     disrc_type,
-                    V1Node::V2(ctx.alloc_node(u64::from(niche_variants.start().as_u32()))),
+                    V1Node::V2(ctx.alloc_node(u64::from(niche_variants.start.as_u32()))),
                     ctx,
                 );
                 (is_niche, tagged_discr, 0)
@@ -437,7 +439,7 @@ pub fn get_discr<'tcx>(
                 (
                     is_niche,
                     relative_discr,
-                    u128::from(niche_variants.start().as_u32()),
+                    u128::from(niche_variants.start.as_u32()),
                 )
             };
 

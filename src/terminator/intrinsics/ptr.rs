@@ -9,7 +9,7 @@ use rustc_middle::{
     mir::{Operand, Place},
     ty::Instance,
 };
-use rustc_span::source_map::Spanned;
+use rustc_span::Spanned;
 pub fn arith_offset<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,

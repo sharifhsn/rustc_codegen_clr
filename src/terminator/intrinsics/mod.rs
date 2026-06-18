@@ -16,7 +16,7 @@ use rustc_middle::{
     mir::{Operand, Place},
     ty::{Instance, Ty, UintTy},
 };
-use rustc_span::source_map::Spanned;
+use rustc_span::Spanned;
 use saturating::{saturating_add, saturating_sub};
 use type_info::{is_val_statically_known, size_of_val};
 use utilis::{

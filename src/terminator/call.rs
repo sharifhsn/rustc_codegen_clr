@@ -25,7 +25,7 @@ use rustc_middle::{
     mir::{Operand, Place},
     ty::{GenericArg, Instance, Ty, TyKind},
 };
-use rustc_span::source_map::Spanned;
+use rustc_span::Spanned;
 fn argc_from_fn_name(function_name: &str, prefix: &str) -> u32 {
     let argc_start = function_name.find(prefix).unwrap() + (prefix.len());
     let argc_end = argc_start + function_name[argc_start..].find('_').unwrap();

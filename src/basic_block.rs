@@ -58,11 +58,10 @@ fn simplify_handler<'tcx>(
             unwind: _,
             replace: _,
             drop: _,
-            async_fut: _,
         } => {
             let ty = monomorphize(method_instance, place.ty(method, tcx).ty, tcx);
 
-            let drop_instance = Instance::resolve_drop_in_place(tcx, ty);
+            let drop_instance = Instance::resolve_drop_glue(tcx, ty);
             if let InstanceKind::DropGlue(_, None) = drop_instance.def {
                 //Empty drop, nothing needs to happen.
                 simplify_handler(Some(target.as_u32()), blocks, tcx, method_instance, method)

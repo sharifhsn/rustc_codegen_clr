@@ -76,5 +76,5 @@ pub fn sig_from_instance_<'tcx>(
 /// Checks if this function is variadic.
 #[must_use]
 pub fn is_fn_variadic<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
-    ty.fn_sig(tcx).skip_binder().c_variadic
+    ty.fn_sig(tcx).skip_binder().c_variadic()
 }

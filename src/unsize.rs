@@ -222,8 +222,8 @@ fn unsize_metadata<'tcx>(
             for i in 0..def_a.variant(FIRST_VARIANT).fields.len() {
                 let src_f = &def_a.variant(FIRST_VARIANT).fields[FieldIdx::from_usize(i)];
                 let dst_f = &def_b.variant(FIRST_VARIANT).fields[FieldIdx::from_usize(i)];
-                let src_f_ty = fx.layout_of(src_f.ty(fx.tcx(), subst_a));
-                let dst_f_ty = fx.layout_of(dst_f.ty(fx.tcx(), subst_b));
+                let src_f_ty = fx.layout_of(src_f.ty(fx.tcx(), subst_a).skip_normalization());
+                let dst_f_ty = fx.layout_of(dst_f.ty(fx.tcx(), subst_b).skip_normalization());
                 if src_f_ty.layout.is_zst() {
                     // No data here, nothing to copy/coerce.
                     continue;

@@ -114,8 +114,8 @@ pub fn handle_statement<'tcx>(
         StatementKind::ConstEvalCounter => vec![],
         // A no-op does nothing, so safe to do... nothing.
         StatementKind::Nop => vec![],
-        // This is related to stacked borrow. TODO:consider emmiting info that would prevent wrong optimizations here.
-        StatementKind::Retag(_, _) => vec![],
+        // `StatementKind::Retag` no longer exists in MIR for this rustc version (retags are now
+        // tracked via `WithRetag` on `Rvalue::Use`); there is nothing to handle here.
         // A no-op at runtime.
         StatementKind::AscribeUserType(_, _) => vec![],
     }

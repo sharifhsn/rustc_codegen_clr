@@ -297,7 +297,7 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
             let cref = fixed_array(ctx, element, length as u64, arr_size, arr_align);
             Type::ClassRef(cref)
         }
-        TyKind::Alias(_, _) => panic!("Attempted to get the .NET type of an unmorphized type"),
+        TyKind::Alias(_) => panic!("Attempted to get the .NET type of an unmorphized type"),
         TyKind::Coroutine(defid, coroutine_args) => {
             let coroutine_args = coroutine_args.as_coroutine();
 
@@ -591,7 +591,7 @@ fn struct_<'tcx>(
         .zip(explicit_offset_iter)
     {
         let name = escape_field_name(&field.name.to_string());
-        let field_type = get_type(ctx.monomorphize(field.ty(ctx.tcx(), subst)), ctx);
+        let field_type = get_type(ctx.monomorphize(field.ty(ctx.tcx(), subst).skip_normalization()), ctx);
         if field_type == Type::Void {
             continue;
         }
@@ -704,7 +704,7 @@ fn enum_<'tcx>(
                 "{variant_name}_{fname}",
                 fname = escape_field_name(&field.name.to_string())
             );
-            let field_ty = get_type(field.ty(ctx.tcx(), subst), ctx);
+            let field_ty = get_type(field.ty(ctx.tcx(), subst).skip_normalization(), ctx);
             if field_ty == Type::Void {
                 continue;
             }
@@ -759,7 +759,7 @@ fn union_<'tcx>(
         .zip(FieldOffsetIterator::fields((*layout.layout.0).clone()))
     {
         let field_name = escape_field_name(&field.name.to_string());
-        let field_ty = ctx.monomorphize(field.ty(ctx.tcx(), subst));
+        let field_ty = ctx.monomorphize(field.ty(ctx.tcx(), subst).skip_normalization());
         let field_type = get_type(field_ty, ctx);
         if field_type == Type::Void {
             continue;

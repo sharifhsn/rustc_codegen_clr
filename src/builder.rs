@@ -448,7 +448,7 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
         &mut self,
         def_id: DefId,
         linkage: Linkage,
-        visibility: rustc_middle::mir::mono::Visibility,
+        visibility: rustc_middle::mono::Visibility,
         symbol_name: &str,
     ) {
         todo!()
@@ -457,7 +457,7 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
         &mut self,
         instance: Instance<'tcx>,
         linkage: Linkage,
-        visibility: rustc_middle::mir::mono::Visibility,
+        visibility: rustc_middle::mono::Visibility,
         symbol_name: &str,
     ) {
         // TODO: Should I do something here?

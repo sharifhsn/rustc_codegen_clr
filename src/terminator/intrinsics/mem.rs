@@ -7,7 +7,7 @@ use rustc_middle::{
     mir::{Operand, Place},
     ty::Instance,
 };
-use rustc_span::source_map::Spanned;
+use rustc_span::Spanned;
 
 use super::utilis::compare_bytes;
 /// Takes in 3 args. dst, val, and count. writes count * sizeof(T) bytes of value `val` to dst.

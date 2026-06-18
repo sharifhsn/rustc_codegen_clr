@@ -129,8 +129,7 @@ pub fn garag_to_usize<'tcx>(garg: GenericArg<'tcx>, _ctx: TyCtxt<'tcx>) -> u64 {
     match kind {
         ConstKind::Value(val) => {
             let scalar = val
-                .valtree
-                .try_to_scalar_int()
+                .try_to_leaf()
                 .expect("String const did not contain valid scalar!");
             let ty = val.ty;
             assert!(
@@ -279,10 +278,8 @@ pub fn try_resolve_const_size(size: Const) -> Result<usize, &'static str> {
         None => Err("Can't resolve scalar array size!"),
     }?;
     let value = value
-        .valtree
-        .try_to_scalar()
+        .try_to_leaf()
         .unwrap()
-        .to_u64()
-        .expect("Could not convert scalar to u64!");
+        .to_u64();
     Ok(usize::try_from(value).expect("Const size value too big."))
 }

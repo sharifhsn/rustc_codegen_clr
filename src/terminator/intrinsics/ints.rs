@@ -14,7 +14,7 @@ use rustc_middle::{
     mir::{Operand, Place},
     ty::Instance,
 };
-use rustc_span::source_map::Spanned;
+use rustc_span::Spanned;
 fn ctpop_small_int(asm: &mut cilly::Assembly, operand: V1Node, int: Int) -> V1Node {
     assert!(int.size().is_none_or(|size| size <= 8));
     let mref = MethodRef::new(

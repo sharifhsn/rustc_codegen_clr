@@ -107,7 +107,7 @@ fn const_slice_backer_type<'tcx>(
                 "DSTs in slice constants must have exactly one field!"
             );
             let fld = def.all_fields().next().unwrap();
-            return const_slice_backer_type(fld.ty(ctx.tcx(), generics), ctx, alloc_id, meta);
+            return const_slice_backer_type(fld.ty(ctx.tcx(), generics).skip_normalization(), ctx, alloc_id, meta);
         }
         TyKind::Slice(elem) => ctx.type_from_cache(*elem),
         _ => todo!("Unhandled const {const_ty:?}"),
@@ -168,7 +168,7 @@ pub fn load_const_value<'tcx>(
     }
 }
 pub fn static_ty<'tcx>(def_id: DefId, tcx: TyCtxt<'tcx>) -> Ty<'tcx> {
-    tcx.type_of(def_id).instantiate_identity()
+    tcx.type_of(def_id).instantiate_identity().skip_normalization()
 }
 fn load_scalar_ptr(
     ctx: &mut MethodCompileCtx<'_, '_>,

@@ -16,7 +16,7 @@ use rustc_middle::{
     mir::{BasicBlock, Operand, Place, SwitchTargets, Terminator, TerminatorKind},
     ty::{Instance, InstanceKind, Ty, TyKind},
 };
-use rustc_span::source_map::Spanned;
+use rustc_span::Spanned;
 
 mod call;
 mod intrinsics;
@@ -218,13 +218,12 @@ pub fn handle_terminator<'tcx>(
             target,
             unwind: _,
             replace: _,
-            //TODO: figure out what the hell those 2 fields are doing.
+            //TODO: figure out what the hell those fields are doing.
             drop: _,
-            async_fut: _,
         } => {
             let ty = ctx.monomorphize(place.ty(ctx.body(), ctx.tcx()).ty);
 
-            let drop_instance = Instance::resolve_drop_in_place(ctx.tcx(), ty);
+            let drop_instance = Instance::resolve_drop_glue(ctx.tcx(), ty);
             if let InstanceKind::DropGlue(_, None) = drop_instance.def {
                 //Empty drop, nothing needs to happen.
                 vec![V1Root::GoTo {

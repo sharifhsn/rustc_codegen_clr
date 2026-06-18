@@ -68,8 +68,7 @@ pub fn garag_to_bool<'tcx>(garg: GenericArg<'tcx>, _ctx: TyCtxt<'tcx>) -> bool {
     match kind {
         ConstKind::Value(val) => {
             let scalar = val
-                .valtree
-                .try_to_scalar_int()
+                .try_to_leaf()
                 .expect("String const did not contain valid scalar!");
             let ty = val.ty;
             assert!(

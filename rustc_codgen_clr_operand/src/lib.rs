@@ -25,6 +25,11 @@ pub fn handle_operand<'tcx>(
     match operand {
         Operand::Copy(place) | Operand::Move(place) => place_get(place, ctx),
         Operand::Constant(const_val) => crate::constant::handle_constant(const_val, ctx),
+        // A compile-time query of a session flag (UB/overflow checks) -> a bool const.
+        Operand::RuntimeChecks(checks) => {
+            let value = checks.value(ctx.tcx().sess);
+            V1Node::V2(ctx.alloc_node(value))
+        }
     }
 }
 pub fn operand_address<'tcx>(
@@ -42,12 +47,24 @@ pub fn operand_address<'tcx>(
                 obj: Box::new(local_type),
             }
         }
+        Operand::RuntimeChecks(checks) => {
+            let value = checks.value(ctx.tcx().sess);
+            let local_type = ctx.type_from_cache(operand.ty(ctx.body(), ctx.tcx()));
+            let constant = V1Node::V2(ctx.alloc_node(value));
+            let ptr = V1Node::stack_addr(constant, ctx.alloc_type(local_type), ctx);
+            V1Node::LdObj {
+                ptr: Box::new(ptr),
+                obj: Box::new(local_type),
+            }
+        }
     }
 }
 /// Checks if this operand is uninitialzed, and assigements using it can safely be skipped.
 pub fn is_uninit<'tcx>(operand: &Operand<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> bool {
     match operand {
         Operand::Copy(_) | Operand::Move(_) => false,
+        // A runtime-check flag is a concrete compile-time bool: always initialized.
+        Operand::RuntimeChecks(_) => false,
         Operand::Constant(const_val) => {
             let constant = const_val.const_;
             let constant = ctx.monomorphize(constant);
@@ -111,6 +128,8 @@ pub fn is_const_zero<'tcx>(operand: &Operand<'tcx>, ctx: &mut MethodCompileCtx<'
     match operand {
         // Copy / Moves are not constants.
         Operand::Copy(_) | Operand::Move(_) => false,
+        // Known at compile time: zero iff the checked flag is disabled.
+        Operand::RuntimeChecks(checks) => !checks.value(ctx.tcx().sess),
         Operand::Constant(const_val) => {
             let constant = const_val.const_;
             let constant = ctx.monomorphize(constant);

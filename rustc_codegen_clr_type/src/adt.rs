@@ -41,9 +41,9 @@ impl FieldOffsetIterator {
         match fields {
             FieldsShape::Arbitrary {
                 offsets,
-                memory_index,
+                in_memory_order,
             } => {
-                let offsets: Box<[_]> = memory_index
+                let offsets: Box<[_]> = in_memory_order
                     .iter()
                     .enumerate()
                     .map(|(index, _mem_idx)| {
@@ -140,7 +140,9 @@ pub fn get_variant_at_index(
 ) -> LayoutData<FieldIdx, rustc_abi::VariantIdx> {
     match layout.variants {
         Variants::Single { .. } => layout,
-        Variants::Multiple { variants, .. } => variants[variant_index].clone(),
+        // `Variants::Multiple.variants` now stores reduced `VariantLayout`s rather than full
+        // `LayoutData`s; `LayoutData::for_variant` reconstructs the full per-variant layout.
+        Variants::Multiple { .. } => LayoutData::for_variant(&layout, variant_index),
         Variants::Empty => todo!("Empty variants have no variants."),
     }
 }
@@ -166,7 +168,7 @@ pub fn enum_field_descriptor<'tcx>(
         "{variant_name}_{fname}",
         fname = crate::r#type::escape_field_name(&field.name.to_string())
     ));
-    let field_ty = field.ty(ctx.tcx(), subst);
+    let field_ty = field.ty(ctx.tcx(), subst).skip_normalization();
     let field_ty = ctx.monomorphize(field_ty);
     let field_ty = ctx.type_from_cache(field_ty);
     let owner_ty = ctx
@@ -244,7 +246,7 @@ pub fn field_descrptor<'tcx>(
         .nth(field_idx as usize)
         .expect("No field with provided index!");
     let field_name = crate::r#type::escape_field_name(&field.name.to_string());
-    let field_ty = field.ty(ctx.tcx(), subst);
+    let field_ty = field.ty(ctx.tcx(), subst).skip_normalization();
     let field_ty = ctx.monomorphize(field_ty);
     let field_ty = ctx.type_from_cache(field_ty);
     let owner_ty = ctx

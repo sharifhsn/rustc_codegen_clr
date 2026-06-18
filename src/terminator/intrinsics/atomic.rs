@@ -8,7 +8,7 @@ use rustc_codegen_clr_type::adt::field_descrptor;
 use rustc_codegen_clr_type::GetTypeExt;
 use rustc_codgen_clr_operand::handle_operand;
 use rustc_middle::mir::{Operand, Place};
-use rustc_span::source_map::Spanned;
+use rustc_span::Spanned;
 pub fn xchg<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,

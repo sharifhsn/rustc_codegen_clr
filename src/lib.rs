@@ -141,7 +141,6 @@ mod utilis;
 pub mod config;
 mod unsize;
 // rustc functions used here.
-use crate::rustc_middle::dep_graph::DepContext;
 use cilly::{
     Assembly,
     {cilnode::MethodKind, MethodRef},
@@ -150,13 +149,12 @@ use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_ssa::{
     back::archive::{ArArchiveBuilder, ArchiveBuilder, ArchiveBuilderBuilder},
     traits::CodegenBackend,
-    CodegenResults, CompiledModule, CrateInfo, ModuleKind,
+    CompiledModule, CompiledModules, CrateInfo, ModuleKind,
 };
 
-use rustc_data_structures::fx::FxIndexMap;
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::{
-    dep_graph::{WorkProduct, WorkProductId},
+    dep_graph::WorkProductMap,
     ty::TyCtxt,
 };
 use rustc_session::{
@@ -176,8 +174,8 @@ impl CodegenBackend for MyBackend {
     fn name(&self)->&'static str{
         "cg_clr"
     }
-    fn locale_resource(&self) -> &'static str {
-        ""
+    fn target_cpu(&self, sess: &Session) -> String {
+        sess.target.cpu.to_string()
     }
     /// Compiles a crate, and returns its in-memory representaion as a .NET assembly.
     fn codegen_crate<'a>(
@@ -225,7 +223,7 @@ impl CodegenBackend for MyBackend {
         }
 
         let ffi_compile_timer = tcx
-            .profiler()
+            .prof
             .generic_activity("insert .NET FFI functions/types");
         //builtin::insert_ffi_functions(&mut asm, tcx);
         drop(ffi_compile_timer);
@@ -238,26 +236,29 @@ impl CodegenBackend for MyBackend {
             .to_string()
             .into();
 
-        Box::new((name, asm, CrateInfo::new(tcx, "clr".to_string())))
+        // `CrateInfo` is now constructed by the driver (it calls `target_cpu` to build it) and
+        // passed back into `join_codegen`/`link`, so the codegen no longer bundles it here.
+        Box::new((name, asm))
     }
 
     fn target_config(&self, sess: &Session) -> rustc_codegen_ssa::TargetConfig {
         use rustc_span::sym;
         // FIXME return the actually used target features. this is necessary for #[cfg(target_feature)]
-        let target_features = if sess.target.arch == "x86_64" && sess.target.os != "none" {
+        use rustc_target::spec::{Arch, Os};
+        let target_features = if sess.target.arch == Arch::X86_64 && sess.target.os != Os::None {
             // x86_64 mandates SSE2 support and rustc requires the x87 feature to be enabled
             vec![
-             
+
                 sym::sse,
                 //sym::sse2,
                 rustc_span::Symbol::intern("x87"),
             ]
-        } else if sess.target.arch == "aarch64" {
-            match &*sess.target.os {
-                "none" => vec![],
+        } else if sess.target.arch == Arch::AArch64 {
+            match sess.target.os {
+                Os::None => vec![],
                 // On macOS the aes, sha2 and sha3 features are enabled by default and ring
                 // fails to compile on macOS when they are not present.
-                "macos" => vec![sym::neon, sym::aes, sym::sha2, sym::sha3],
+                Os::MacOs => vec![sym::neon, sym::aes, sym::sha2, sym::sha3],
                 // AArch64 mandates Neon support
                 _ => vec![sym::neon],
             }
@@ -283,15 +284,16 @@ impl CodegenBackend for MyBackend {
         ongoing_codegen: Box<dyn Any>,
         _sess: &Session,
         outputs: &OutputFilenames,
-    ) -> (CodegenResults, FxIndexMap<WorkProductId, WorkProduct>) {
+        _crate_info: &CrateInfo,
+    ) -> (CompiledModules, WorkProductMap) {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             use std::io::Write;
-            let (_asm_name, asm, crate_info) = *ongoing_codegen
-                .downcast::<(IString, Assembly, CrateInfo)>()
+            let (_asm_name, asm) = *ongoing_codegen
+                .downcast::<(IString, Assembly)>()
                 .expect("in join_codegen: ongoing_codegen is not an Assembly");
             let asm_name = "";
             let serialized_asm_path =
-                outputs.temp_path_for_cgu(OutputType::Bitcode, asm_name, None);
+                outputs.temp_path_for_cgu(OutputType::Bitcode, asm_name);
             //std::fs::create_dir_all(&serialized_asm_path).expect("Could not create the directory temporary files are supposed to be in.");
 
             let mut asm_out = std::fs::File::create(&serialized_asm_path).expect(
@@ -314,21 +316,37 @@ impl CodegenBackend for MyBackend {
                 llvm_ir: None,
                 assembly: None,
                 links_from_incr_cache: Vec::new(),
+                global_asm_object: None,
             }];
-            let codegen_results = CodegenResults {
+            // `CodegenResults` was split into `CompiledModules` + `CrateInfo`; the driver now owns
+            // the `CrateInfo` and re-supplies it to `link`, so we only build `CompiledModules` here.
+            let compiled_modules = CompiledModules {
                 modules,
                 allocator_module: None,
-          
-                crate_info,
             };
-            (codegen_results, FxIndexMap::default())
+            (compiled_modules, WorkProductMap::default())
         }))
         .expect("Could not join_codegen")
     }
     /// Collects all the files emmited by the codegen for a specific crate, and turns them into a .rlib file containg the serialized assembly IR and metadata.
-    fn link(&self, sess: &Session, codegen_results: CodegenResults, metadata:EncodedMetadata, outputs: &OutputFilenames) {
+    fn link(
+        &self,
+        sess: &Session,
+        compiled_modules: CompiledModules,
+        crate_info: CrateInfo,
+        metadata: EncodedMetadata,
+        outputs: &OutputFilenames,
+    ) {
         use rustc_codegen_ssa::back::link::link_binary;
-        link_binary(sess, &RlibArchiveBuilder, codegen_results, metadata, outputs, "");
+        link_binary(
+            sess,
+            &RlibArchiveBuilder,
+            compiled_modules,
+            crate_info,
+            metadata,
+            outputs,
+            self.name(),
+        );
     }
 }
 // Inspired by cranelifts glue code. Is responsible for turing the files produced by teh backend into
