@@ -783,6 +783,7 @@ run_test! {intrinsics,alloc,stable}
 run_test! {intrinsics,arith_offset,stable}
 run_test! {intrinsics,arithmetic_misc,stable}
 run_test! {intrinsics,assert,stable}
+run_test! {intrinsics,float_minmax,stable}
 run_test! {intrinsics,atomics,stable}
 
 run_test! {intrinsics,bswap,stable}

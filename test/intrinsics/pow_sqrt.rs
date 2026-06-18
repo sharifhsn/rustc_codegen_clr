@@ -19,8 +19,7 @@ use core::intrinsics::powif32;
 use core::intrinsics::powif64;
 use core::intrinsics::sqrtf64;
 
-use core::intrinsics::fabsf32;
-use core::intrinsics::fabsf64;
+use core::intrinsics::fabs;
 
 fn main() {
     let positive = 4.0_f32;
@@ -40,24 +39,24 @@ fn main() {
     test_eq!(unsafe { sqrtf64(negative_zero) }, black_box(negative_zero));
 
     let x = 2.0_f32;
-    let abs_difference = unsafe { fabsf32(powf32(x, 2.0) - (x * x)) };
+    let abs_difference = unsafe { fabs(powf32(x, 2.0) - (x * x)) };
     test!(abs_difference <= black_box(f32::EPSILON));
     let x = 2.0_f64;
-    let abs_difference = unsafe { fabsf64(powf64(x, 2.0) - (x * x)) };
+    let abs_difference = unsafe { fabs(powf64(x, 2.0) - (x * x)) };
     test!(abs_difference <= black_box(f64::EPSILON));
     let x = 2.0_f32;
-    let abs_difference = unsafe { fabsf32(powif32(x, 2) - (x * x)) };
+    let abs_difference = unsafe { fabs(powif32(x, 2) - (x * x)) };
     test!(abs_difference <= black_box(f32::EPSILON));
     let x = 2.0_f64;
-    let abs_difference = unsafe { fabsf64(powif64(x, 2) - (x * x)) };
+    let abs_difference = unsafe { fabs(powif64(x, 2) - (x * x)) };
     test!(abs_difference <= black_box(f64::EPSILON));
 
     let f = 2.0f32;
     // 2^2 - 4 == 0
-    let abs_difference = unsafe { fabsf32(exp2f32(f) - 4.0) };
+    let abs_difference = unsafe { fabs(exp2f32(f) - 4.0) };
     test!(abs_difference <= black_box(f32::EPSILON));
     let f = 2.0f64;
     // 2^2 - 4 == 0
-    let abs_difference = unsafe { fabsf64(exp2f64(f) - 4.0) };
+    let abs_difference = unsafe { fabs(exp2f64(f) - 4.0) };
     test!(abs_difference <= black_box(f64::EPSILON));
 }

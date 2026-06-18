@@ -13,24 +13,24 @@ use core::intrinsics::copysignf32;
 use core::intrinsics::copysignf64;
 use core::intrinsics::fmaf32;
 use core::intrinsics::fmaf64;
-use core::intrinsics::maxnumf32;
-use core::intrinsics::maxnumf64;
-use core::intrinsics::minnumf32;
-use core::intrinsics::minnumf64;
+use core::intrinsics::maximum_number_nsz_f32;
+use core::intrinsics::maximum_number_nsz_f64;
+use core::intrinsics::minimum_number_nsz_f32;
+use core::intrinsics::minimum_number_nsz_f64;
 
 fn main() {
     let x = 1.0_f32;
     let y = 2.0_f32;
-    test_eq!(maxnumf32(x, y), black_box(y));
+    test_eq!(maximum_number_nsz_f32(x, y), black_box(y));
     let x = 1.0_f64;
     let y = 2.0_f64;
-    test_eq!(maxnumf64(x, y), black_box(y));
+    test_eq!(maximum_number_nsz_f64(x, y), black_box(y));
     let x = 1.0_f32;
     let y = 2.0_f32;
-    test_eq!(minnumf32(x, y), black_box(x));
+    test_eq!(minimum_number_nsz_f32(x, y), black_box(x));
     let x = 1.0_f64;
     let y = 2.0_f64;
-    test_eq!(minnumf64(x, y), black_box(x));
+    test_eq!(minimum_number_nsz_f64(x, y), black_box(x));
 
     let m = 10.0_f32;
     let x = 4.0_f32;

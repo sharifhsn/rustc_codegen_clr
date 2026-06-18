@@ -14,7 +14,7 @@
     unused_imports
 )]
 include!("../common.rs");
-use core::intrinsics::{ceilf32, ctlz, cttz, floorf32, maxnumf32, minnumf32};
+use core::intrinsics::{ceilf32, ctlz, cttz, floorf32, maximum_number_nsz_f32, minimum_number_nsz_f32};
 
 struct CustomStruct {
     field1: i32,
@@ -45,9 +45,9 @@ fn function1(arg0: i32, arg1: f32, arg2: &mut [i32], arg3: &CustomStruct) -> f32
     }
 
     if sum > arg0 {
-        result = maxnumf32(arg1, arg3.field2);
+        result = maximum_number_nsz_f32(arg1, arg3.field2);
     } else if sum < arg0 {
-        result = minnumf32(arg1, arg3.field2);
+        result = minimum_number_nsz_f32(arg1, arg3.field2);
     } else {
         result = unsafe { ceilf32(arg1) * floorf32(arg3.field2) };
     }

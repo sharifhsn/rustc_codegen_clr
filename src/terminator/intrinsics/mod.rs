@@ -673,6 +673,29 @@ pub fn handle_intrinsic<'tcx>(
         "maxnumf32" => float_binop(args, destination, ctx, Float::F32, "MaxNumber"),
         "minnumf64" => float_binop(args, destination, ctx, Float::F64, "MinNumber"),
         "minnumf32" => float_binop(args, destination, ctx, Float::F32, "MinNumber"),
+        // Float min/max/abs were reworked upstream (see docs/semantics_mapping.md for the
+        // verified Rust<->.NET truth table). Two distinct families now exist:
+        //  * IEEE 754-2019 maximum/minimum (`f32::maximum`/`minimum`): propagate NaN, order -0<+0.
+        //    .NET `Single/Double::Max/Min` implement exactly this.
+        "maximumf32" => float_binop(args, destination, ctx, Float::F32, "Max"),
+        "maximumf64" => float_binop(args, destination, ctx, Float::F64, "Max"),
+        "minimumf32" => float_binop(args, destination, ctx, Float::F32, "Min"),
+        "minimumf64" => float_binop(args, destination, ctx, Float::F64, "Min"),
+        //  * maxNum/minNum, no-signed-zero (`f32::max`/`min`): ignore NaN (return the number).
+        //    .NET `::MaxNumber/::MinNumber` match; the nsz freedom on the zero sign is satisfied.
+        "maximum_number_nsz_f32" => float_binop(args, destination, ctx, Float::F32, "MaxNumber"),
+        "maximum_number_nsz_f64" => float_binop(args, destination, ctx, Float::F64, "MaxNumber"),
+        "minimum_number_nsz_f32" => float_binop(args, destination, ctx, Float::F32, "MinNumber"),
+        "minimum_number_nsz_f64" => float_binop(args, destination, ctx, Float::F64, "MinNumber"),
+        // `fabs` is now a single generic intrinsic (replaces `fabsf32`/`fabsf64`); dispatch on the
+        // argument's float width and call `<FloatClass>::Abs`.
+        "fabs" => {
+            let arg_ty = ctx.monomorphize(args[0].node.ty(ctx.body(), ctx.tcx()));
+            match ctx.type_from_cache(arg_ty) {
+                Type::Float(float) => float_unop(args, destination, ctx, float, "Abs"),
+                other => todo!("`fabs` on non-float type {other:?}"),
+            }
+        }
         "variant_count" => {
             let const_val = ctx
                 .tcx()
