@@ -238,9 +238,11 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                         [].into(),
                     )))
                 } else if name.contains(INTEROP_STRUCT_TPE_NAME) {
+                    // A managed value type carries 3 generics: <ASSEMBLY, CLASS_PATH, SIZE>.
+                    // (The size hint is only used Rust-side for layout; the CLR knows the real size.)
                     assert!(
-                        subst.len() == 2,
-                        "Managed struct reference must have exactly 2 generic arguments!"
+                        subst.len() == 3,
+                        "Managed struct reference must have exactly 3 generic arguments (assembly, class, size)!"
                     );
                     let assembly = garg_to_string(subst[0], ctx.tcx());
                     let assembly = Some(assembly)

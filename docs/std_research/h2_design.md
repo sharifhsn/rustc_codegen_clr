@@ -158,3 +158,28 @@ M3 differential validator, M5 sysroot bisect) tells us the frontier and correctn
    frees the handle on drop. Proving the object/exception/GCHandle story on a toy is the highest-
    leverage de-risking move before writing 3k LOC of PAL on top of it.
 3. Draft `dotnet.json` + the `sys/pal/dotnet` skeleton; get `println!`+args+env hello-world running.
+
+## 10. L1 de-risk results (done — the core bet holds)
+
+Probe: [`test/std/interop_derisk.rs`](../../test/std/interop_derisk.rs), a no_std program compiled
+through cg_clr and run on .NET 8. Findings:
+
+| capability | result |
+|---|---|
+| BCL **static call** + primitive marshal | ✅ `System.Math.Max(3,7)=7` |
+| object **ctor** + **instance calls** + holding a managed ref across calls | ✅ `StringBuilder` ctor/`Append`/`get_Length`=1 |
+| **.NET exception** from a BCL call | ✅ propagates through the Rust frame as a real, well-typed exception with a clean managed stack trace (`ArgumentOutOfRangeException` at `StringBuilder.Remove` → `…main()`) |
+| **GCHandle** store-across-GC round-trip | ⚠️ now *compiles* (after a codegen fix), runtime binding of `GCHandle.Alloc(object)->GCHandle` still unresolved |
+
+**The architectural bet is validated:** Rust calls .NET, holds managed objects, and .NET exceptions
+are ordinary catchable exceptions in Rust frames. Two concrete outcomes feed back into the plan:
+
+- **Found + fixed a real codegen bug** (committed): managed value types
+  (`RustcCLRInteropManagedStruct<ASM,CLASS,SIZE>`) were rejected because `type.rs` required 2
+  generics; a value type carries 3 (the `SIZE` const) — fixed to 3. This unblocks all managed
+  valuetypes (incl. `GCHandle`).
+- **The remaining L1 work is precise, not open-ended:** (1) a **`try_catch` interop primitive**
+  to turn a propagating .NET exception into a `Result` (the CIL try/catch machinery already
+  exists — small); (2) finish the **`GCHandle` binding** (a value-type-returning BCL method
+  signature-resolution issue) so managed refs can be stored across GCs. `mycorrhiza`'s `Class`
+  is the intended pattern. These two are the L1 milestone before scaling the PAL.
