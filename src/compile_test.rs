@@ -1016,10 +1016,18 @@ static RUSTC_BUILD_STATUS: std::sync::LazyLock<Result<(), String>> =
 static RUSTC_CODEGEN_CLR_LINKER: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
     let _ = *RUSTC_BUILD_STATUS;
     if cfg!(debug_assertions) {
-        std::process::Command::new("cargo")
-            .args(["build", "--bin", "linker"])
+        // `linker` is a bin of the `cilly` package, so `-p cilly` is required — a bare
+        // `cargo build --bin linker` from the workspace root does not reliably produce it on a
+        // clean target. Fail loudly if the build doesn't succeed (it used to fail silently).
+        let out = std::process::Command::new("cargo")
+            .args(["build", "-p", "cilly", "--bin", "linker"])
             .output()
             .unwrap();
+        assert!(
+            out.status.success(),
+            "failed to build the `linker` bin:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         //TODO: Fix this for other platforms
         if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
             std::fs::canonicalize("target/debug/linker").unwrap()
@@ -1029,10 +1037,18 @@ static RUSTC_CODEGEN_CLR_LINKER: std::sync::LazyLock<PathBuf> = std::sync::LazyL
             panic!("Unsupported target OS");
         }
     } else {
-        std::process::Command::new("cargo")
-            .args(["build", "--bin", "linker", "--release"])
+        // `linker` is a bin of the `cilly` package, so `-p cilly` is required — a bare
+        // `cargo build --bin linker` from the workspace root does not reliably produce it on a
+        // clean target. Fail loudly if the build doesn't succeed (it used to fail silently).
+        let out = std::process::Command::new("cargo")
+            .args(["build", "-p", "cilly", "--bin", "linker", "--release"])
             .output()
             .unwrap();
+        assert!(
+            out.status.success(),
+            "failed to build the `linker` bin:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         //TODO: Fix this for other platforms
         if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
             std::fs::canonicalize("target/release/linker").unwrap()

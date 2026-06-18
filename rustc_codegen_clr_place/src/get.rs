@@ -1,8 +1,6 @@
 use cilly::{
-    Assembly, BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, MethodRef, Type, call,
-    cil_node::V1Node,
-    cilnode::{ExtendKind, MethodKind},
-    conv_usize, ld_field,
+    Assembly, BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, MethodRef, Type,
+    cilnode::MethodKind,
 };
 use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_type::{
@@ -16,9 +14,6 @@ use rustc_middle::{
     ty::Ty,
     ty::TyKind,
 };
-
-use super::body_ty_is_by_address;
-
 pub(super) fn local_get(
     local: usize,
     method: &rustc_middle::mir::Body,
@@ -48,9 +43,12 @@ pub(super) fn local_get(
     )
 }
 /// Returns the ops for getting the value of place.
-pub fn place_get<'tcx>(place: &Place<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> V1Node {
+pub fn place_get<'tcx>(
+    place: &Place<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Interned<cilly::v2::CILNode> {
     if place.projection.is_empty() {
-        V1Node::V2(local_get(place.local.as_usize(), ctx.body(), ctx))
+        local_get(place.local.as_usize(), ctx.body(), ctx)
     } else {
         let (mut op, mut ty) = super::local_body(place.local.as_usize(), ctx);
 
@@ -64,7 +62,7 @@ pub fn place_get<'tcx>(place: &Place<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>
             op = curr_ops;
         }
 
-        V1Node::V2(place_elem_get(head, ty, ctx, op))
+        place_elem_get(head, ty, ctx, op)
     }
 }
 fn get_field<'a>(

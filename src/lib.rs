@@ -299,7 +299,7 @@ impl CodegenBackend for MyBackend {
             let mut asm_out = std::fs::File::create(&serialized_asm_path).expect(
                 "Could not create the temporary files necessary for building the assembly!",
             );
-            let mut v2 = cilly::Assembly::from_v1(&asm);
+            let mut v2 = asm.prepared();
             v2.opt(&mut v2.fuel_from_env());
             v2.typecheck();
             asm_out

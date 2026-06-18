@@ -1,7 +1,7 @@
 use crate::r#type::get_type;
 use cilly::{
-    Assembly, ClassRef, Int, MethodRef, Type, bimap::Interned, call, cil_node::V1Node,
-    cilnode::MethodKind, utilis::escape_class_name,
+    Assembly, CILNode, ClassRef, Int, MethodRef, Type, bimap::Interned,
+    cilnode::{IsPure, MethodKind}, utilis::escape_class_name,
 };
 use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_middle::ty::Const;
@@ -21,7 +21,7 @@ pub struct DotnetArray {
 }
 
 #[must_use]
-pub fn max_value(tpe: &Type, asm: &mut Assembly) -> V1Node {
+pub fn max_value(tpe: &Type, asm: &mut Assembly) -> Interned<CILNode> {
     match tpe {
         Type::Int(Int::USize) => {
             let mref = MethodRef::new(
@@ -31,16 +31,17 @@ pub fn max_value(tpe: &Type, asm: &mut Assembly) -> V1Node {
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(asm.alloc_methodref(mref), [])
+            let mref = asm.alloc_methodref(mref);
+            asm.call(mref, &[] as &[Interned<CILNode>], IsPure::NOT)
         }
-        Type::Int(Int::U64) => V1Node::V2(asm.alloc_node(u64::MAX)),
-        Type::Int(Int::U32) => V1Node::V2(asm.alloc_node(u32::MAX)),
-        Type::Int(Int::U16) => V1Node::V2(asm.alloc_node(u16::MAX)),
-        Type::Int(Int::U8) => V1Node::V2(asm.alloc_node(u8::MAX)),
-        Type::Int(Int::I64) => V1Node::V2(asm.alloc_node(i64::MAX)),
-        Type::Int(Int::I32) => V1Node::V2(asm.alloc_node(i32::MAX)),
-        Type::Int(Int::I16) => V1Node::V2(asm.alloc_node(i16::MAX)),
-        Type::Int(Int::I8) => V1Node::V2(asm.alloc_node(i8::MAX)),
+        Type::Int(Int::U64) => asm.alloc_node(u64::MAX),
+        Type::Int(Int::U32) => asm.alloc_node(u32::MAX),
+        Type::Int(Int::U16) => asm.alloc_node(u16::MAX),
+        Type::Int(Int::U8) => asm.alloc_node(u8::MAX),
+        Type::Int(Int::I64) => asm.alloc_node(i64::MAX),
+        Type::Int(Int::I32) => asm.alloc_node(i32::MAX),
+        Type::Int(Int::I16) => asm.alloc_node(i16::MAX),
+        Type::Int(Int::I8) => asm.alloc_node(i8::MAX),
         _ => todo!("Can't get the max value of {tpe:?}"),
     }
 }

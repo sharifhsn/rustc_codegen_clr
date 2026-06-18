@@ -2,18 +2,14 @@
 
 use crate::constant::static_ty;
 use cilly::{
-    Access, Const, FnSig, Int, Interned, IntoAsmIndex, MethodDef, MethodDefIdx, MethodRef,
+    Access, CILRoot, Const, FnSig, Int, Interned, MethodDef, MethodDefIdx, MethodRef,
     StaticFieldDesc, Type,
-    basic_block::BasicBlock,
-    call,
-    cil_node::V1Node,
-    cil_root::V1Root,
-    cil_tree::CILTree,
     cilnode::MethodKind,
-    method::{Method, MethodType},
     utilis::encode,
-    v2::CILNode,
+    v2::{BasicBlock, CILNode},
 };
+
+type Root = Interned<cilly::v2::CILRoot>;
 use rustc_codegen_clr_call::CallInfo;
 pub use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_ctx::function_name;
@@ -210,38 +206,14 @@ pub fn add_const_value(asm: &mut cilly::Assembly, bytes: u128) -> StaticFieldDes
         return field_desc;
     }
     asm.add_static(uint8_ptr, alloc_fld, false, main_module_id, None, false);
-    let cst = V1Node::const_u128(bytes, asm);
 
     let field = asm.alloc_sfld(field_desc);
-    let val = cilly::CILNode::from_v1(&cst, asm);
-    let val = asm.alloc_node(val);
+    let val = asm.alloc_node(Const::U128(bytes));
     let set = asm.alloc_root(cilly::CILRoot::SetStaticField { field, val });
 
     asm.add_cctor(&[set]);
 
     field_desc
-}
-fn alloc_buff(align: u64, asm: &mut cilly::Assembly, len: usize) -> V1Node {
-    if align > 8 {
-        let aligned_alloc = MethodRef::aligned_alloc(asm);
-        Box::new(call!(
-            asm.alloc_methodref(aligned_alloc),
-            [
-                V1Node::V2(asm.alloc_node(Const::USize(len as u64))),
-                V1Node::V2(asm.alloc_node(Const::USize(align)))
-            ]
-        ))
-        .cast_ptr(asm.nptr(Type::Int(Int::U8)))
-    } else {
-        let alloc = MethodRef::alloc(asm);
-        Box::new(call!(
-            asm.alloc_methodref(alloc),
-            [V1Node::V2(asm.alloc_node(Const::ISize(
-                i64::try_from(len as u64).expect("Static alloc too big")
-            )))]
-        ))
-        .cast_ptr(asm.nptr(Type::Int(Int::U8)))
-    }
 }
 fn allocation_initializer_method(
     const_allocation: &Allocation,
@@ -253,24 +225,19 @@ fn allocation_initializer_method(
     let bytes: &[u8] =
         const_allocation.inspect_with_uninit_and_ptr_outside_interpreter(0..const_allocation.len());
     let ptrs = const_allocation.provenance().ptrs();
-    let mut trees: Vec<CILTree> = Vec::new();
+    let mut trees: Vec<Root> = Vec::new();
 
-    //trees.push(CILRoot::debug(&format!("Preparing to initialize allocation with size {}",bytes.len())).into());
-    trees.push(
-        V1Root::STLoc {
-            local: 0,
-            tree: ptr.into(),
-        }
-        .into(),
-    );
-    trees.push(
-        V1Root::CpBlk {
-            dst: Box::new(V1Node::LDLoc(0)),
-            src: Box::new(V1Node::V2(ctx.bytebuffer(bytes, Int::U8))),
-            len: Box::new(V1Node::V2(ctx.alloc_node(Const::USize(bytes.len() as u64)))),
-        }
-        .into(),
-    );
+    // Direct V2 emission, mirroring the previous V1 lowering via `CILRoot::from_v1` exactly.
+    // STLoc(0, ptr)
+    trees.push(ctx.alloc_root(CILRoot::StLoc(0, ptr)));
+    // CpBlk(dst = LdLoc(0), src = bytebuffer, len = const)
+    {
+        let dst = ctx.alloc_node(CILNode::LdLoc(0));
+        let src = ctx.bytebuffer(bytes, Int::U8);
+        let len = ctx.alloc_node(Const::USize(bytes.len() as u64));
+        let cpblk = ctx.cp_blk(dst, src, len);
+        trees.push(cpblk);
+    }
 
     if !ptrs.is_empty() {
         for (offset, prov) in ptrs.iter() {
@@ -292,58 +259,67 @@ fn allocation_initializer_method(
                     MethodKind::Static,
                     vec![].into(),
                 );
-                trees.push(
-                    V1Root::STIndISize(
-                        (V1Node::LDLoc(0)
-                            + V1Node::V2(ctx.alloc_node(Const::USize(offset.into()))))
-                        .cast_ptr(ctx.nptr(Type::Int(Int::USize))),
-                        V1Node::LDFtn(ctx.alloc_methodref(mref)).cast_ptr(Type::Int(Int::USize)),
-                    )
-                    .into(),
-                );
+                // addr = (LdLoc(0) + offset) cast to *usize
+                let ld_loc = ctx.alloc_node(CILNode::LdLoc(0));
+                let off = ctx.alloc_node(Const::USize(offset.into()));
+                let addr = ctx.biop(ld_loc, off, cilly::BinOp::Add);
+                let usize_ptr = ctx.nptr(Type::Int(Int::USize));
+                let addr = ctx.cast_ptr_to(addr, usize_ptr);
+                // val = LdFtn(mref) cast to usize
+                let mref = ctx.alloc_methodref(mref);
+                let ftn = ctx.ld_ftn(mref);
+                let val = ctx.cast_ptr_to(ftn, Type::Int(Int::USize));
+                trees.push(ctx.alloc_root(CILRoot::StInd(Box::new((
+                    addr,
+                    val,
+                    Type::Int(Int::ISize),
+                    false,
+                )))));
             } else {
                 let tpe = alloc_default_type(prov.alloc_id().0.into(), ctx);
                 let tpe = ctx.alloc_type(tpe);
                 let ptr_alloc = add_allocation(prov.alloc_id().0.into(), ctx, tpe);
 
-                trees.push(
-                    V1Root::STIndISize(
-                        (V1Node::LDLoc(0)
-                            + V1Node::V2(ctx.alloc_node(Const::USize(offset.into()))))
-                        .cast_ptr(ctx.nptr(Type::Int(Int::USize))),
-                        Into::<V1Node>::into(ptr_alloc).cast_ptr(Type::Int(Int::USize)),
-                    )
-                    .into(),
-                );
+                // addr = (LdLoc(0) + offset) cast to *usize
+                let ld_loc = ctx.alloc_node(CILNode::LdLoc(0));
+                let off = ctx.alloc_node(Const::USize(offset.into()));
+                let addr = ctx.biop(ld_loc, off, cilly::BinOp::Add);
+                let usize_ptr = ctx.nptr(Type::Int(Int::USize));
+                let addr = ctx.cast_ptr_to(addr, usize_ptr);
+                // val = ptr_alloc cast to usize
+                let val = ctx.cast_ptr_to(ptr_alloc, Type::Int(Int::USize));
+                trees.push(ctx.alloc_root(CILRoot::StInd(Box::new((
+                    addr,
+                    val,
+                    Type::Int(Int::ISize),
+                    false,
+                )))));
             }
         }
     }
-    //trees.push(CILRoot::debug(&format!("Finished initializing an allocation with size {}",bytes.len())).into());
     if void_ret {
-        trees.push(V1Root::VoidRet.into());
+        trees.push(ctx.alloc_root(CILRoot::VoidRet));
     } else {
-        trees.push(
-            V1Root::Ret {
-                tree: V1Node::LDLoc(0),
-            }
-            .into(),
-        );
+        let ld_loc = ctx.alloc_node(CILNode::LdLoc(0));
+        trees.push(ctx.alloc_root(CILRoot::Ret(ld_loc)));
     }
     let uint8_ptr = ctx.nptr(Type::Int(Int::U8));
     let ret = if void_ret { Type::Void } else { uint8_ptr };
     let uint8_ptr_idx = ctx.alloc_type(uint8_ptr);
-    let init_method = Method::new(
+    let alloc_ptr_name = ctx.alloc_string("alloc_ptr");
+    let sig = ctx.alloc_sig(FnSig::new([], ret));
+    let main_module_id = ctx.main_module();
+    let init_method = MethodDef::from_v2_blocks(
         Access::Private,
-        MethodType::Static,
-        FnSig::new([], ret),
+        main_module_id,
         &format!("init_{name}"),
-        vec![(Some("alloc_ptr".into_idx(ctx)), uint8_ptr_idx)],
+        sig,
+        MethodKind::Static,
         vec![BasicBlock::new(trees, 0, None)],
+        vec![(Some(alloc_ptr_name), uint8_ptr_idx)],
         vec![],
         ctx,
     );
-    let main_module_id = ctx.main_module();
-    let init_method = MethodDef::from_v1(&init_method, ctx, main_module_id);
     ctx.new_method(init_method)
 }
 fn calculate_hash<T: std::hash::Hash>(t: &T) -> u64 {

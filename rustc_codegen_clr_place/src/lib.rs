@@ -4,9 +4,7 @@ extern crate rustc_abi;
 extern crate rustc_driver;
 extern crate rustc_hir;
 extern crate rustc_middle;
-use cilly::cil_node::V1Node;
-use cilly::cil_root::V1Root;
-use cilly::{ClassRef, Float, Int, Interned};
+use cilly::Interned;
 use cilly::{Const, Type};
 use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_type::GetTypeExt;
@@ -83,22 +81,25 @@ pub fn deref_op<'tcx>(
 }
 
 /// Returns the ops for getting the address of a given place.
-pub fn place_address<'a>(place: &Place<'a>, ctx: &mut MethodCompileCtx<'a, '_>) -> V1Node {
+pub fn place_address<'a>(
+    place: &Place<'a>,
+    ctx: &mut MethodCompileCtx<'a, '_>,
+) -> Interned<cilly::v2::CILNode> {
     let place_ty = place.ty(ctx.body(), ctx.tcx());
     let place_ty = ctx.monomorphize(place_ty).ty;
 
     let layout = ctx.layout_of(place_ty);
     if layout.is_zst() {
         let place_type = ctx.type_from_cache(place_ty);
-        return V1Node::V2(ctx.alloc_node(Const::USize(layout.align.abi.bytes())))
-            .cast_ptr(ctx.nptr(place_type));
+        let node = ctx.alloc_node(Const::USize(layout.align.abi.bytes()));
+        return ctx.cast_ptr(node, place_type);
     }
     if place.projection.is_empty() {
         let loc_ty = ctx.monomorphize(ctx.body().local_decls[place.local].ty);
         if pointer_to_is_fat(loc_ty, ctx.tcx(), ctx.instance()) {
-            V1Node::V2(local_get(place.local.as_usize(), ctx.body(), ctx))
+            local_get(place.local.as_usize(), ctx.body(), ctx)
         } else {
-            V1Node::V2(local_address(place.local.as_usize(), ctx.body(), ctx))
+            local_address(place.local.as_usize(), ctx.body(), ctx)
         }
     } else {
         let (mut addr_calc, mut ty) = local_body(place.local.as_usize(), ctx);
@@ -108,32 +109,34 @@ pub fn place_address<'a>(place: &Place<'a>, ctx: &mut MethodCompileCtx<'a, '_>) 
 
         let (head, body) = slice_head(place.projection);
         for elem in body {
-            let (curr_ty, curr_ops) = place_elem_body(elem, ty, ctx, addr_calc.clone());
+            let (curr_ty, curr_ops) = place_elem_body(elem, ty, ctx, addr_calc);
             ty = curr_ty.monomorphize(ctx);
             addr_calc = curr_ops;
         }
-        let addr_calc = V1Node::V2(addr_calc);
         address::place_elem_address(head, ty, ctx, place_ty, addr_calc)
     }
 }
 /// Should be only used in certain builit-in features. For unsized types, returns the address of the fat pointer, not the address contained within it.
-pub fn place_address_raw<'a>(place: &Place<'a>, ctx: &mut MethodCompileCtx<'a, '_>) -> V1Node {
+pub fn place_address_raw<'a>(
+    place: &Place<'a>,
+    ctx: &mut MethodCompileCtx<'a, '_>,
+) -> Interned<cilly::v2::CILNode> {
     let place_ty = place.ty(ctx.body(), ctx.tcx());
     let place_ty = ctx.monomorphize(place_ty).ty;
 
     let layout = ctx.layout_of(place_ty);
     if layout.is_zst() {
-        return V1Node::V2(ctx.alloc_node(Const::USize(layout.align.abi.bytes())));
+        return ctx.alloc_node(Const::USize(layout.align.abi.bytes()));
     }
     if place.projection.is_empty() {
-        V1Node::V2(local_address(place.local.as_usize(), ctx.body(), ctx))
+        local_address(place.local.as_usize(), ctx.body(), ctx)
     } else if place.projection.len() == 1
         && matches!(
             slice_head(place.projection).0,
             rustc_middle::mir::PlaceElem::Deref
         )
     {
-        return V1Node::V2(local_address(place.local.as_usize(), ctx.body(), ctx));
+        return local_address(place.local.as_usize(), ctx.body(), ctx);
     } else {
         let (mut addr_calc, mut ty) = local_body(place.local.as_usize(), ctx);
 
@@ -142,21 +145,20 @@ pub fn place_address_raw<'a>(place: &Place<'a>, ctx: &mut MethodCompileCtx<'a, '
 
         let (head, body) = slice_head(place.projection);
         for elem in body {
-            let (curr_ty, curr_ops) = place_elem_body(elem, ty, ctx, addr_calc.clone());
+            let (curr_ty, curr_ops) = place_elem_body(elem, ty, ctx, addr_calc);
             ty = curr_ty.monomorphize(ctx);
             addr_calc = curr_ops;
         }
-        let addr_calc = V1Node::V2(addr_calc);
         address::place_elem_address(head, ty, ctx, place_ty, addr_calc)
     }
 }
 pub fn place_set<'tcx>(
     place: &Place<'tcx>,
-    value_calc: V1Node,
+    value_calc: Interned<cilly::v2::CILNode>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Interned<cilly::v2::CILRoot> {
     if place.projection.is_empty() {
-        set::local_set(place.local.as_usize(), ctx.body(), value_calc)
+        set::local_set(place.local.as_usize(), ctx.body(), value_calc, ctx)
     } else {
         let (mut addr_calc, ty) = local_body(place.local.as_usize(), ctx);
 
@@ -171,7 +173,6 @@ pub fn place_set<'tcx>(
         }
         //
         ty = ty.monomorphize(ctx);
-        let addr_calc = V1Node::V2(addr_calc);
         place_elem_set(head, ty, ctx, addr_calc, value_calc)
     }
 }

@@ -285,71 +285,62 @@ impl MethodDef {
         &mut self.implementation
     }
 
-    pub fn from_v1(
-        v1: &crate::method::Method,
-        asm: &mut super::Assembly,
-        class: ClassDefIdx,
-    ) -> Self {
-        let sig = v1.sig().clone();
-        let sig_idx = asm.alloc_sig(v1.sig().clone());
-        let acceess = match v1.access() {
-            crate::Access::Private => Access::Private,
-            crate::Access::Public => Access::Public,
-            crate::Access::Extern => Access::Extern,
-        };
 
-        let kind = if v1.is_static() {
-            MethodKind::Static
-        } else if v1.name() == ".ctor" {
-            MethodKind::Constructor
-        } else {
-            MethodKind::Instance
-        };
-        let name = asm.alloc_string(v1.name());
-        let blocks = v1
-            .blocks()
-            .iter()
-            .map(|block| crate::BasicBlock::from_v1(block, asm))
-            .collect();
-        let locals = v1.locals().to_vec();
+    /// Builds a `MethodDef` directly from already-lowered V2 blocks. This is the V2-native
+    /// counterpart of `Method::new` + `MethodDef::from_v1`: it performs the same debug-name
+    /// uniquing on argument/local names and the same argument-count reconciliation as those two
+    /// paths, but takes interned V2 `BasicBlock`s instead of converting from V1.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn from_v2_blocks(
+        access: Access,
+        class: ClassDefIdx,
+        name: &str,
+        sig: Interned<FnSig>,
+        kind: MethodKind,
+        blocks: Vec<BasicBlock>,
+        mut locals: Vec<LocalDef>,
+        mut arg_names: Vec<Option<Interned<IString>>>,
+        asm: &mut Assembly,
+    ) -> Self {
+        // Debug-name uniquing, identical to `Method::new`.
+        let mut used_names = FxHashSet::default();
+        for name in arg_names
+            .iter_mut()
+            .chain(locals.iter_mut().map(|loc| &mut loc.0))
+            .flatten()
+        {
+            let mut postfix = 0;
+            while used_names.contains(&if postfix == 0 {
+                *name
+            } else {
+                let new_name = format!("{name}{postfix}", name = &asm[*name]);
+                asm.alloc_string(new_name)
+            }) {
+                postfix += 1;
+            }
+            if postfix != 0 {
+                let new_name = format!("{name}{postfix}", name = &asm[*name]);
+                *name = asm.alloc_string(new_name);
+            }
+            used_names.insert(*name);
+        }
+        let name = asm.alloc_string(name);
         let implementation = MethodImpl::MethodBody { blocks, locals };
-        let mut arg_names: Vec<_> = v1.arg_names().to_vec();
+        // Argument-count reconciliation, identical to `MethodDef::from_v1`.
         let arg_debug_count = arg_names.len();
-        let arg_sig_count = sig.inputs().len();
+        let arg_sig_count = asm[sig].inputs().len();
         match arg_debug_count.cmp(&arg_sig_count) {
             std::cmp::Ordering::Less => {
-                println!(
-                    "WARNING: argument debug info count invalid(Too few). Expected {}, got {}. fn name:{}",
-                    arg_sig_count,
-                    arg_debug_count,
-                    v1.name()
-                );
                 arg_names.extend((arg_debug_count..arg_sig_count).map(|_| None));
             }
             std::cmp::Ordering::Equal => (),
             std::cmp::Ordering::Greater => {
-                println!(
-                "WARNING: argument debug info count invalid(Too many). Expected {}, got {}. fn name:{}",
-                arg_sig_count,
-                arg_debug_count,
-                v1.name()
-                );
-                for arg in &arg_names {
-                    println!("{:?}", arg.map(|arg| &asm[arg]));
-                }
                 arg_names.truncate(arg_sig_count);
             }
         }
-        assert_eq!(arg_names.len(), v1.sig().inputs().len());
-        MethodDef::new(
-            acceess,
-            class,
-            name,
-            sig_idx,
-            kind,
-            implementation,
-            arg_names,
-        )
+        assert_eq!(arg_names.len(), asm[sig].inputs().len());
+        MethodDef::new(access, class, name, sig, kind, implementation, arg_names)
     }
 
     #[must_use]

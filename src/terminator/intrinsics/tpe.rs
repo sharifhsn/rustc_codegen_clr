@@ -1,16 +1,20 @@
 use crate::assembly::MethodCompileCtx;
 use cilly::{
-    call, call_virt, cil_node::V1Node, cil_root::V1Root, cilnode::MethodKind, conv_u32, ClassRef,
-    Int, MethodRef, Type,
+    cilnode::ExtendKind, cilnode::IsPure, cilnode::MethodKind, ClassRef, Int, Interned, MethodRef,
+    Type,
 };
 use rustc_codegen_clr_place::place_set;
 use rustc_codegen_clr_type::GetTypeExt;
 use rustc_middle::{mir::Place, ty::Instance};
+
+type Node = Interned<cilly::v2::CILNode>;
+type Root = Interned<cilly::v2::CILRoot>;
+
 pub fn type_id<'tcx>(
     destination: &Place<'tcx>,
     call_instance: Instance<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
     let tpe = ctx.monomorphize(
         call_instance.args[0]
             .as_type()
@@ -42,18 +46,13 @@ pub fn type_id<'tcx>(
         MethodKind::Static,
         vec![].into(),
     );
-    place_set(
-        destination,
-        call!(
-            ctx.alloc_methodref(op_implict),
-            [conv_u32!(call_virt!(
-                ctx.alloc_methodref(get_hash_code),
-                [call!(
-                    ctx.alloc_methodref(get_type_handle),
-                    [V1Node::LDTypeToken(tpe.into())]
-                )]
-            ))]
-        ),
-        ctx,
-    )
+    let op_implict = ctx.alloc_methodref(op_implict);
+    let get_hash_code = ctx.alloc_methodref(get_hash_code);
+    let get_type_handle = ctx.alloc_methodref(get_type_handle);
+    let type_token: Node = ctx.ld_type_token(tpe);
+    let handle = ctx.call(get_type_handle, &[type_token], IsPure::NOT);
+    let hash = ctx.call(get_hash_code, &[handle], IsPure::NOT);
+    let hash_u32 = ctx.int_cast(hash, Int::U32, ExtendKind::ZeroExtend);
+    let value_calc = ctx.call(op_implict, &[hash_u32], IsPure::NOT);
+    place_set(destination, value_calc, ctx)
 }

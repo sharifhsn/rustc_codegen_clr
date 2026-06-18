@@ -1,11 +1,8 @@
 use crate::assembly::MethodCompileCtx;
 
-use cilly::cil_node::V1Node;
-use cilly::cil_root::V1Root;
-
-use cilly::{conv_u32, conv_usize, IntoAsmIndex};
-use cilly::{Const, Type};
-use cilly::{FieldDesc, Int};
+use cilly::cilnode::ExtendKind;
+use cilly::{BinOp, Const, IntoAsmIndex, Type};
+use cilly::{FieldDesc, Int, Interned};
 use rustc_abi::FieldIdx;
 use rustc_abi::FIRST_VARIANT;
 use rustc_codegen_clr_place::place_address_raw;
@@ -18,13 +15,17 @@ use rustc_middle::{
     mir::{Operand, Place},
     ty::{layout::TyAndLayout, Ty, TyKind, UintTy},
 };
+
+type Node = Interned<cilly::v2::CILNode>;
+type Root = Interned<cilly::v2::CILRoot>;
+
 /// Preforms an unsizing cast on operand `operand`, converting it to the `target` type.
 pub fn unsize2<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     operand: &Operand<'tcx>,
     target: Ty<'tcx>,
     destination: Place<'tcx>,
-) -> (Vec<V1Root>, V1Node) {
+) -> (Vec<Root>, Node) {
     // Get the monomorphized source and target type
     let target = ctx.monomorphize(target);
     let source = ctx.monomorphize(operand.ty(ctx.body(), ctx.tcx()));
@@ -54,44 +55,42 @@ pub fn unsize2<'tcx>(
         ctx.nptr(cilly::Type::Void),
     );
     let dst = place_address_raw(&destination, ctx);
-    let target_ptr = dst.clone();
+    let target_ptr = dst;
 
-    let init_metadata = V1Root::set_field(
-        target_ptr.clone().cast_ptr(ctx.nptr(fat_ptr_type)),
-        metadata.cast_ptr(Type::Int(Int::USize)),
-        ctx.alloc_field(metadata_field),
-    );
+    let fat_ptr_ptr = ctx.nptr(fat_ptr_type);
+    let init_metadata = {
+        let addr = ctx.cast_ptr_to(target_ptr, fat_ptr_ptr);
+        let val = ctx.cast_ptr_to(metadata, Type::Int(Int::USize));
+        let desc = ctx.alloc_field(metadata_field);
+        ctx.set_field(desc, addr, val)
+    };
 
     let init_ptr = if is_fat_ptr(source, ctx.tcx(), ctx.instance()) {
         let void_ptr = ctx.nptr(Type::Void);
-        V1Root::set_field(
-            target_ptr.cast_ptr(ctx.nptr(fat_ptr_type)),
-            V1Node::LDIndPtr {
-                ptr: Box::new(operand_address(operand, ctx).cast_ptr(ctx.nptr(void_ptr))),
-                loaded_ptr: Box::new(ctx.nptr(Type::Void)),
-            },
-            ctx.alloc_field(ptr_field),
-        )
+        let addr = ctx.cast_ptr_to(target_ptr, fat_ptr_ptr);
+        let src_addr = operand_address(operand, ctx);
+        let void_ptr_ptr = ctx.nptr(void_ptr);
+        let src_addr = ctx.cast_ptr_to(src_addr, void_ptr_ptr);
+        let loaded = ctx.nptr(Type::Void);
+        let val = ctx.load(src_addr, loaded);
+        let desc = ctx.alloc_field(ptr_field);
+        ctx.set_field(desc, addr, val)
     } else {
         let operand = if source.is_any_ptr() {
             handle_operand(operand, ctx)
         } else {
             let source_type = ctx.type_from_cache(source);
             // If this type is a box<thin>, then its layout *should* be equivalent to a pointer, so this *should* be OK.
-            V1Node::transmute_on_stack(
-                handle_operand(operand, ctx),
-                source_type,
-                Type::Int(Int::USize),
-                ctx,
-            )
+            let op = handle_operand(operand, ctx);
+            ctx.transmute_on_stack(source_type, Type::Int(Int::USize), op)
         };
         // `source` is not a fat pointer, so operand should be a pointer.
 
-        V1Root::set_field(
-            target_ptr.cast_ptr(ctx.nptr(fat_ptr_type)),
-            operand.cast_ptr(ctx.nptr(Type::Void)),
-            ctx.alloc_field(ptr_field),
-        )
+        let addr = ctx.cast_ptr_to(target_ptr, fat_ptr_ptr);
+        let void_ptr = ctx.nptr(Type::Void);
+        let val = ctx.cast_ptr_to(operand, void_ptr);
+        let desc = ctx.alloc_field(ptr_field);
+        ctx.set_field(desc, addr, val)
     };
     let source_size = ctx.layout_of(source).size.bytes();
     let target_size = ctx.layout_of(source).size.bytes();
@@ -99,28 +98,22 @@ pub fn unsize2<'tcx>(
     let copy_val = if source_size > 8 && !source.is_any_ptr() && target_size != source_size {
         let addr = operand_address(operand, ctx);
 
-        let addr = V1Node::Add(
-            Box::new(addr),
-            Box::new(V1Node::V2(ctx.alloc_node(8_isize))),
-        );
-        let dst_addr = V1Node::MRefToRawPtr(Box::new(dst.clone()));
-        let const_16 = V1Node::V2(ctx.alloc_node(16_isize));
-        let dst_addr = V1Node::Add(Box::new(dst_addr), Box::new(const_16));
+        let eight = ctx.alloc_node(8_isize);
+        let addr = ctx.biop(addr, eight, BinOp::Add);
+        let dst_addr = ctx.ref_to_ptr(dst);
+        let const_16 = ctx.alloc_node(16_isize);
+        let dst_addr = ctx.biop(dst_addr, const_16, BinOp::Add);
         eprintln!("WARNING:Can't propely unsize types with sized fields yet. unsize assumes that layout of Wrapper<&T> ==   layout of Wrapper<FatPtr<T>>!");
-        V1Root::CpBlk {
-            dst: Box::new(dst_addr),
-            src: Box::new(addr),
-            len: Box::new(V1Node::V2(ctx.alloc_node(Const::USize(source_size - 8)))),
-        }
+        let len = ctx.alloc_node(Const::USize(source_size - 8));
+        ctx.cp_blk(dst_addr, addr, len)
     } else {
-        V1Root::Nop
+        ctx.alloc_root(cilly::CILRoot::Nop)
     };
+    let ptr = ctx.nptr(target_type);
+    let dst = ctx.cast_ptr_to(dst, ptr);
     (
         [copy_val, init_metadata, init_ptr].into(),
-        V1Node::LdObj {
-            ptr: Box::new(dst.cast_ptr(ctx.nptr(target_type))),
-            obj: Box::new(target_type),
-        },
+        ctx.load(dst, target_type),
     )
 }
 /// Adopted from <https://github.com/rust-lang/rustc_codegen_cranelift/blob/45600348c009303847e8cddcfa8483f1f3d56625/src/unsize.rs#L64>
@@ -128,8 +121,8 @@ fn unsized_info<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     source: Ty<'tcx>,
     target: Ty<'tcx>,
-    old_info: Option<V1Node>,
-) -> V1Node {
+    old_info: Option<Node>,
+) -> Node {
     let (source, target) = ctx.tcx().struct_lockstep_tails_for_codegen(
         source,
         target,
@@ -140,7 +133,7 @@ fn unsized_info<'tcx>(
             let len = len
                 .try_to_target_usize(ctx.tcx())
                 .expect("Could not eval array length.");
-            V1Node::V2(ctx.alloc_node(Const::USize(len)))
+            ctx.alloc_node(Const::USize(len))
         }
         (
             &TyKind::Dynamic(data_a, _),
@@ -158,13 +151,15 @@ fn unsized_info<'tcx>(
 
             if let Some(entry_idx) = vptr_entry_idx {
                 let entry_idx = u32::try_from(entry_idx).unwrap();
-                let entry_offset = V1Node::V2(ctx.alloc_node(entry_idx))
-                    * conv_u32!(V1Node::V2(ctx.size_of(Int::USize).into_idx(ctx)));
-                V1Node::LDIndUSize {
-                    ptr: Box::new(
-                        (old_info + conv_usize!(entry_offset)).cast_ptr(ctx.nptr(Int::USize)),
-                    ),
-                }
+                let entry_idx = ctx.alloc_node(entry_idx);
+                let size = ctx.size_of(Int::USize).into_idx(ctx);
+                let size = ctx.int_cast(size, Int::U32, ExtendKind::ZeroExtend);
+                let entry_offset = ctx.biop(entry_idx, size, BinOp::Mul);
+                let entry_offset = ctx.int_cast(entry_offset, Int::USize, ExtendKind::ZeroExtend);
+                let addr = ctx.biop(old_info, entry_offset, BinOp::Add);
+                let usize_ptr = ctx.nptr(Int::USize);
+                let addr = ctx.cast_ptr_to(addr, usize_ptr);
+                ctx.load(addr, Type::Int(Int::USize))
             } else {
                 old_info
             }
@@ -174,24 +169,23 @@ fn unsized_info<'tcx>(
             source,
             data.principal()
                 .map(|principal| ctx.tcx().instantiate_bound_regions_with_erased(principal)),
-        )
-        .into(),
+        ),
         _ => panic!("unsized_info: invalid unsizing {source:?} -> {target:?}"),
     }
 }
 
-fn load_scalar_pair(addr: V1Node, ctx: &mut MethodCompileCtx<'_, '_>) -> (V1Node, V1Node) {
-    (
-        V1Node::LDIndUSize {
-            ptr: Box::new(Box::new(addr.clone()).cast_ptr(ctx.nptr(Type::Int(Int::USize)))),
-        },
-        V1Node::LDIndUSize {
-            ptr: Box::new(
-                Box::new(addr + conv_usize!(V1Node::V2(ctx.size_of(Int::ISize).into_idx(ctx))))
-                    .cast_ptr(ctx.nptr(Type::Int(Int::USize))),
-            ),
-        },
-    )
+fn load_scalar_pair(addr: Node, ctx: &mut MethodCompileCtx<'_, '_>) -> (Node, Node) {
+    let usize_ptr = ctx.nptr(Type::Int(Int::USize));
+    let first_addr = ctx.cast_ptr_to(addr, usize_ptr);
+    let first = ctx.load(first_addr, Type::Int(Int::USize));
+
+    let size = ctx.size_of(Int::ISize).into_idx(ctx);
+    let size = ctx.int_cast(size, Int::USize, ExtendKind::ZeroExtend);
+    let second_addr = ctx.biop(addr, size, BinOp::Add);
+    let usize_ptr = ctx.nptr(Type::Int(Int::USize));
+    let second_addr = ctx.cast_ptr_to(second_addr, usize_ptr);
+    let second = ctx.load(second_addr, Type::Int(Int::USize));
+    (first, second)
 }
 /// Pattern types (`T is <pattern>`, e.g. `NonNull`'s field `*const T is !null`) are
 /// *layout-identical* to their base type — the pattern only refines validity. The unsizing logic
@@ -213,20 +207,20 @@ fn peel_pattern_type<'tcx>(
 /// to a value of type `dst_ty` and store the result in `dst`
 fn unsize_metadata<'tcx>(
     fx: &mut MethodCompileCtx<'tcx, '_>,
-    src_cil: V1Node,
+    src_cil: Node,
     src_ty: TyAndLayout<'tcx>,
     dst_ty: TyAndLayout<'tcx>,
-) -> V1Node {
+) -> Node {
     // Pattern types are layout-transparent; see `peel_pattern_type`. The address (`src_cil`) is
     // unchanged because the layout is identical.
     let src_ty = peel_pattern_type(fx, src_ty);
     let dst_ty = peel_pattern_type(fx, dst_ty);
-    let mut coerce_ptr = || {
+    let mut coerce_ptr = |fx: &mut MethodCompileCtx<'tcx, '_>| {
         if fx
             .layout_of(src_ty.ty.builtin_deref(true).unwrap())
             .is_unsized()
         {
-            let (_, old_info) = load_scalar_pair(src_cil.clone(), fx);
+            let (_, old_info) = load_scalar_pair(src_cil, fx);
             unsize_ptr_metadata(fx, src_ty, dst_ty, Some(old_info))
         } else {
             unsize_ptr_metadata(fx, src_ty, dst_ty, None)
@@ -235,7 +229,7 @@ fn unsize_metadata<'tcx>(
 
     match (&src_ty.ty.kind(), &dst_ty.ty.kind()) {
         (&TyKind::Ref(..), &TyKind::Ref(..) | &TyKind::RawPtr(..))
-        | (&TyKind::RawPtr(..), &TyKind::RawPtr(..)) => coerce_ptr(),
+        | (&TyKind::RawPtr(..), &TyKind::RawPtr(..)) => coerce_ptr(fx),
         (&TyKind::Adt(def_a, subst_a), &TyKind::Adt(def_b, subst_b)) => {
             assert_eq!(def_a, def_b);
 
@@ -263,8 +257,8 @@ fn unsize_ptr_metadata<'tcx>(
 
     src_layout: TyAndLayout<'tcx>,
     dst_layout: TyAndLayout<'tcx>,
-    old_info: Option<V1Node>,
-) -> V1Node {
+    old_info: Option<Node>,
+) -> Node {
     // Peel layout-transparent pattern types (e.g. `NonNull`'s `*const T is !null`) so the
     // pointer/metadata dispatch below sees the underlying `RawPtr`/`Adt`.
     let src_layout = peel_pattern_type(fx, src_layout);
@@ -299,7 +293,7 @@ fn unsize_ptr_metadata<'tcx>(
                 let dst_f = dst_layout.field(fx, i);
                 assert_ne!(src_f.ty, dst_f.ty);
                 assert_eq!(result, None);
-                result = Some(unsize_ptr_metadata(fx, src_f, dst_f, old_info.clone()));
+                result = Some(unsize_ptr_metadata(fx, src_f, dst_f, old_info));
             }
             result.unwrap()
         }

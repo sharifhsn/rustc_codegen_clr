@@ -1,9 +1,6 @@
-use super::{PlaceTy, array_get_address, array_get_item, pointed_type};
+use super::{PlaceTy, pointed_type};
 use crate::{body_ty_is_by_address, deref_op};
-use cilly::{
-    BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, Type, call, conv_usize, ld_field,
-    v2::CILNode,
-};
+use cilly::{BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, Type};
 use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_type::{
     GetTypeExt,

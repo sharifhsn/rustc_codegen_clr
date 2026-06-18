@@ -1,4 +1,3 @@
-use cilly::basic_block::Handler;
 use rustc_codegen_clr_type::utilis::monomorphize;
 use rustc_middle::mir::UnwindAction;
 use rustc_middle::mir::{BasicBlock, BasicBlockData};
@@ -7,22 +6,24 @@ use rustc_middle::{
     ty::{Instance, InstanceKind, TyCtxt},
 };
 
+/// Returns the *unresolved* exception-handler block id of a MIR block, if any. Consumed by the V2
+/// `BasicBlock::new_raw` / `resolve_exception_handlers` (mirrors the old V1 `Handler::RawID`).
 pub(crate) fn handler_for_block<'tcx>(
     block_data: &BasicBlockData,
     blocks: &BasicBlocks<'tcx>,
     tcx: TyCtxt<'tcx>,
     method_instance: &Instance<'tcx>,
     method: &Body<'tcx>,
-) -> Option<Handler> {
+) -> Option<u32> {
     let term = block_data.terminator.as_ref()?;
     let unwind = term.unwind()?;
-    Some(Handler::RawID(simplify_handler(
+    simplify_handler(
         handler_from_action(*unwind),
         blocks,
         tcx,
         method_instance,
         method,
-    )?))
+    )
 }
 #[allow(clippy::match_same_arms)]
 fn simplify_handler<'tcx>(

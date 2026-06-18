@@ -8,48 +8,45 @@ use rustc_codegen_clr_type::{
 
 use crate::{PlaceTy, pointed_type};
 use cilly::{
-    BinOp, IntoAsmIndex, Type, call,
-    cil_node::V1Node,
-    cil_root::V1Root,
-    conv_usize, ld_field,
+    Assembly, BinOp, Const, Interned, IntoAsmIndex, Type,
+    cilnode::{ExtendKind, IsPure},
     {ClassRef, FieldDesc, Int, MethodRef, cilnode::MethodKind},
 };
 use rustc_middle::{
     mir::PlaceElem,
     ty::{FloatTy, IntTy, Ty, TyKind, UintTy},
 };
-pub fn local_set(local: usize, method: &rustc_middle::mir::Body, tree: V1Node) -> V1Root {
+pub fn local_set(
+    local: usize,
+    method: &rustc_middle::mir::Body,
+    tree: Interned<cilly::v2::CILNode>,
+    asm: &mut Assembly,
+) -> Interned<cilly::v2::CILRoot> {
     if let Some(spread_arg) = method.spread_arg
         && local == spread_arg.as_usize()
     {
-        return V1Root::STLoc {
-            local: (method.local_decls.len() - method.arg_count)
+        return asm.st_loc(
+            (method.local_decls.len() - method.arg_count)
                 .try_into()
                 .unwrap(),
             tree,
-        };
+        );
     }
     if local == 0 {
-        V1Root::STLoc { local: 0, tree }
+        asm.st_loc(0, tree)
     } else if local > method.arg_count {
-        V1Root::STLoc {
-            local: u32::try_from(local - method.arg_count).unwrap(),
-            tree,
-        }
+        asm.st_loc(u32::try_from(local - method.arg_count).unwrap(), tree)
     } else {
-        V1Root::STArg {
-            arg: u32::try_from(local - 1).unwrap(),
-            tree,
-        }
+        asm.st_arg(u32::try_from(local - 1).unwrap(), tree)
     }
 }
 pub fn place_elem_set<'a>(
     place_elem: &PlaceElem<'a>,
     curr_type: PlaceTy<'a>,
     ctx: &mut MethodCompileCtx<'a, '_>,
-    addr_calc: V1Node,
-    value_calc: V1Node,
-) -> V1Root {
+    addr_calc: Interned<cilly::v2::CILNode>,
+    value_calc: Interned<cilly::v2::CILNode>,
+) -> Interned<cilly::v2::CILRoot> {
     match place_elem {
         PlaceElem::Deref => {
             let pointed_type = pointed_type(curr_type);
@@ -60,17 +57,13 @@ pub fn place_elem_set<'a>(
             PlaceTy::Ty(curr_type) => {
                 let curr_type = ctx.monomorphize(curr_type);
                 let field_desc = field_descrptor(curr_type, (*field_index).into(), ctx);
-                V1Root::set_field(addr_calc, value_calc, field_desc)
+                ctx.set_field(field_desc, addr_calc, value_calc)
             }
             super::PlaceTy::EnumVariant(enm, var_idx) => {
                 let enm = ctx.monomorphize(enm);
                 let field_desc = enum_field_descriptor(enm, field_index.as_u32(), var_idx, ctx);
 
-                V1Root::SetField {
-                    addr: Box::new(addr_calc),
-                    value: Box::new(value_calc),
-                    desc: (field_desc),
-                }
+                ctx.set_field(field_desc, addr_calc, value_calc)
             }
         },
         PlaceElem::Index(index) => {
@@ -90,7 +83,8 @@ pub fn place_elem_set<'a>(
                         ctx.alloc_string(cilly::DATA_PTR),
                         ctx.nptr(Type::Void),
                     );
-                    let field_val = ld_field!(addr_calc, ctx.alloc_field(desc));
+                    let desc = ctx.alloc_field(desc);
+                    let field_val = ctx.ld_field(addr_calc, desc);
                     let size = ctx.size_of(inner_type).into_idx(ctx);
                     let size = ctx.alloc_node(cilly::CILNode::IntCast {
                         input: size,
@@ -98,7 +92,8 @@ pub fn place_elem_set<'a>(
                         extend: cilly::cilnode::ExtendKind::ZeroExtend,
                     });
                     let offset = ctx.biop(index, size, BinOp::Mul);
-                    let addr_calc = field_val.cast_ptr(inner_ptr) + V1Node::V2(offset);
+                    let field_val = ctx.cast_ptr(field_val, inner_ptr);
+                    let addr_calc = ctx.biop(field_val, offset, BinOp::Add);
                     ptr_set_op(super::PlaceTy::Ty(inner), ctx, addr_calc, value_calc)
                 }
                 TyKind::Array(element, _length) => {
@@ -115,10 +110,8 @@ pub fn place_elem_set<'a>(
                         MethodKind::Instance,
                         vec![].into(),
                     );
-                    V1Root::Call {
-                        site: ctx.alloc_methodref(mref),
-                        args: [addr_calc, V1Node::V2(index), value_calc].into(),
-                    }
+                    let mref = ctx.alloc_methodref(mref);
+                    ctx.call_root(mref, &[addr_calc, index, value_calc], IsPure::NOT)
                 }
                 _ => {
                     rustc_middle::ty::print::with_no_trimmed_paths! { todo!("Can't index into {curr_ty}!")}
@@ -134,7 +127,7 @@ pub fn place_elem_set<'a>(
             let curr_ty = curr_type
                 .as_ty()
                 .expect("INVALID PLACE: Indexing into enum variant???");
-            let index = V1Node::V2(ctx.alloc_node(*offset));
+            let index = ctx.alloc_node(*offset);
             assert!(!from_end, "Indexing slice form end");
 
             match curr_ty.kind() {
@@ -163,15 +156,22 @@ pub fn place_elem_set<'a>(
                         MethodKind::Static,
                         vec![].into(),
                     );
-                    let addr = ld_field!(addr_calc.clone(), ctx.alloc_field(desc))
-                        .cast_ptr(ctx.nptr(inner_type))
-                        + call!(
-                            ctx.alloc_methodref(mref),
-                            [
-                                conv_usize!(index),
-                                ld_field!(addr_calc, ctx.alloc_field(metadata)),
-                            ]
-                        ) * conv_usize!(V1Node::V2(ctx.size_of(inner_type).into_idx(ctx)));
+                    let desc = ctx.alloc_field(desc);
+                    let metadata = ctx.alloc_field(metadata);
+                    let inner_ptr = ctx.nptr(inner_type);
+
+                    let base = ctx.ld_field(addr_calc, desc);
+                    let base = ctx.cast_ptr(base, inner_ptr);
+
+                    let index_us = ctx.int_cast(index, Int::USize, ExtendKind::ZeroExtend);
+                    let meta_val = ctx.ld_field(addr_calc, metadata);
+                    let mref = ctx.alloc_methodref(mref);
+                    let checked = ctx.call(mref, &[index_us, meta_val], IsPure::NOT);
+
+                    let stride = ctx.size_of(inner_type).into_idx(ctx);
+                    let stride = ctx.int_cast(stride, Int::USize, ExtendKind::ZeroExtend);
+                    let scaled = ctx.biop(checked, stride, BinOp::Mul);
+                    let addr = ctx.biop(base, scaled, BinOp::Add);
                     ptr_set_op(super::PlaceTy::Ty(inner), ctx, addr, value_calc)
                 }
                 TyKind::Array(element, _length) => {
@@ -188,37 +188,15 @@ pub fn place_elem_set<'a>(
                         MethodKind::Instance,
                         vec![].into(),
                     );
-                    V1Root::Call {
-                        site: ctx.alloc_methodref(mref),
-                        args: [addr_calc, conv_usize!(index), value_calc].into(),
-                    }
+                    let mref = ctx.alloc_methodref(mref);
+                    let index_us = ctx.int_cast(index, Int::USize, ExtendKind::ZeroExtend);
+                    ctx.call_root(mref, &[addr_calc, index_us, value_calc], IsPure::NOT)
                 }
                 _ => {
                     rustc_middle::ty::print::with_no_trimmed_paths! { todo!("Can't index into {curr_ty}!")}
                 }
             }
         }
-        /*
-        PlaceElem::ConstantIndex {
-            offset,
-            min_length: _,
-            from_end,
-        } => {
-            let mut ops = if !from_end {
-                CILRoot::LdcI64(*offset as i64)]
-            } else {
-                let mut get_len = place_get_length(curr_type, ctx, method_instance, type_cache);
-                get_len.extend(CILRoot::LdcI64(*offset as i64), CILOp::Sub]);
-                get_len
-            };
-            ops.extend(place_elem_set_at(
-                curr_type,
-                ctx,
-                &method_instance,
-                type_cache,
-            ));
-            ops
-        }*/
         _ => todo!("Can't handle porojection {place_elem:?} in set"),
     }
 }
@@ -226,86 +204,74 @@ pub fn place_elem_set<'a>(
 pub fn ptr_set_op<'tcx>(
     pointed_type: PlaceTy<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    addr_calc: V1Node,
-    value_calc: V1Node,
-) -> V1Root {
+    addr_calc: Interned<cilly::v2::CILNode>,
+    value_calc: Interned<cilly::v2::CILNode>,
+) -> Interned<cilly::v2::CILRoot> {
     if let PlaceTy::Ty(pointed_type) = pointed_type {
         match pointed_type.kind() {
             TyKind::Int(int_ty) => match int_ty {
-                IntTy::I8 => V1Root::STIndI8(addr_calc, value_calc),
-                IntTy::I16 => V1Root::STIndI16(addr_calc, value_calc),
-                IntTy::I32 => V1Root::STIndI32(addr_calc, value_calc),
-                IntTy::I64 => V1Root::STIndI64(addr_calc, value_calc),
-                IntTy::Isize => V1Root::STIndISize(addr_calc, value_calc),
-                IntTy::I128 => V1Root::STObj {
-                    tpe: Box::new(ClassRef::int_128(ctx).into()),
-                    addr_calc: Box::new(addr_calc),
-                    value_calc: Box::new(value_calc),
-                },
+                IntTy::I8 => ctx.st_ind(addr_calc, value_calc, Type::Int(Int::I8), false),
+                IntTy::I16 => ctx.st_ind(addr_calc, value_calc, Type::Int(Int::I16), false),
+                IntTy::I32 => ctx.st_ind(addr_calc, value_calc, Type::Int(Int::I32), false),
+                IntTy::I64 => ctx.st_ind(addr_calc, value_calc, Type::Int(Int::I64), false),
+                IntTy::Isize => ctx.st_ind(addr_calc, value_calc, Type::Int(Int::ISize), false),
+                IntTy::I128 => {
+                    let tpe = ClassRef::int_128(ctx).into();
+                    ctx.st_ind(addr_calc, value_calc, tpe, false)
+                }
             },
             TyKind::Uint(int_ty) => match int_ty {
-                UintTy::U8 => V1Root::STIndI8(addr_calc, value_calc),
-                UintTy::U16 => V1Root::STIndI16(addr_calc, value_calc),
-                UintTy::U32 => V1Root::STIndI32(addr_calc, value_calc),
-                UintTy::U64 => V1Root::STIndI64(addr_calc, value_calc),
-                UintTy::Usize => V1Root::STIndISize(addr_calc, value_calc),
-                UintTy::U128 => V1Root::STObj {
-                    tpe: Box::new(ClassRef::uint_128(ctx).into()),
-                    addr_calc: Box::new(addr_calc),
-                    value_calc: Box::new(value_calc),
-                },
+                UintTy::U8 => ctx.st_ind(addr_calc, value_calc, Type::Int(Int::I8), false),
+                UintTy::U16 => ctx.st_ind(addr_calc, value_calc, Type::Int(Int::I16), false),
+                UintTy::U32 => ctx.st_ind(addr_calc, value_calc, Type::Int(Int::I32), false),
+                UintTy::U64 => ctx.st_ind(addr_calc, value_calc, Type::Int(Int::I64), false),
+                UintTy::Usize => ctx.st_ind(addr_calc, value_calc, Type::Int(Int::ISize), false),
+                UintTy::U128 => {
+                    let tpe = ClassRef::uint_128(ctx).into();
+                    ctx.st_ind(addr_calc, value_calc, tpe, false)
+                }
             },
             TyKind::Float(float_ty) => match float_ty {
-                FloatTy::F32 => V1Root::STIndF32(addr_calc, value_calc),
-                FloatTy::F64 => V1Root::STIndF64(addr_calc, value_calc),
-                FloatTy::F128 => V1Root::STObj {
-                    tpe: Type::Float(cilly::Float::F128).into(),
-                    addr_calc: addr_calc.into(),
-                    value_calc: Box::new(value_calc),
-                },
-                FloatTy::F16 => V1Root::STObj {
-                    tpe: Type::Float(cilly::Float::F16).into(),
-                    addr_calc: addr_calc.into(),
-                    value_calc: Box::new(value_calc),
-                },
+                FloatTy::F32 => ctx.st_ind(addr_calc, value_calc, Type::Float(cilly::Float::F32), false),
+                FloatTy::F64 => ctx.st_ind(addr_calc, value_calc, Type::Float(cilly::Float::F64), false),
+                FloatTy::F128 => {
+                    ctx.st_ind(addr_calc, value_calc, Type::Float(cilly::Float::F128), false)
+                }
+                FloatTy::F16 => {
+                    ctx.st_ind(addr_calc, value_calc, Type::Float(cilly::Float::F16), false)
+                }
             },
-            TyKind::Bool => V1Root::STIndI8(addr_calc, value_calc), // Both Rust bool and a managed bool are 1 byte wide. .NET bools are 4 byte wide only in the context of Marshaling/PInvoke,
+            // Both Rust bool and a managed bool are 1 byte wide. .NET bools are 4 byte wide only in the context of Marshaling/PInvoke,
             // due to historic reasons(BOOL was an alias for int in early Windows, and it stayed this way.) - FractalFir
-            TyKind::Char => V1Root::STIndI32(addr_calc, value_calc), // always 4 bytes wide: https://doc.rust-lang.org/std/primitive.char.html#representation
+            TyKind::Bool => ctx.st_ind(addr_calc, value_calc, Type::Int(Int::I8), false),
+            // always 4 bytes wide: https://doc.rust-lang.org/std/primitive.char.html#representation
+            TyKind::Char => ctx.st_ind(addr_calc, value_calc, Type::Int(Int::I32), false),
             TyKind::Adt(_, _)
             | TyKind::Tuple(_)
             | TyKind::Array(_, _)
             | TyKind::Closure(_, _)
             | TyKind::Coroutine(_, _) => {
                 let pointed_type = ctx.type_from_cache(pointed_type);
-                V1Root::STObj {
-                    tpe: pointed_type.into(),
-                    addr_calc: Box::new(addr_calc),
-                    value_calc: Box::new(value_calc),
-                }
+                ctx.st_ind(addr_calc, value_calc, pointed_type, false)
             }
             TyKind::Ref(_, inner, _) => {
                 if pointer_to_is_fat(*inner, ctx.tcx(), ctx.instance()) {
-                    V1Root::STObj {
-                        tpe: ctx.type_from_cache(pointed_type).into(),
-                        addr_calc: Box::new(addr_calc),
-                        value_calc: Box::new(value_calc),
-                    }
+                    let tpe = ctx.type_from_cache(pointed_type);
+                    ctx.st_ind(addr_calc, value_calc, tpe, false)
                 } else {
                     let inner = ctx.type_from_cache(*inner);
-                    V1Root::STIndPtr(addr_calc, value_calc, Box::new(inner))
+                    let ptr = ctx.nptr(inner);
+                    ctx.st_ind(addr_calc, value_calc, ptr, false)
                 }
             }
             TyKind::RawPtr(ty, _) => {
                 if pointer_to_is_fat(*ty, ctx.tcx(), ctx.instance()) {
-                    V1Root::STObj {
-                        tpe: ctx.type_from_cache(pointed_type).into(),
-                        addr_calc: Box::new(addr_calc),
-                        value_calc: Box::new(value_calc),
-                    }
+                    let tpe = ctx.type_from_cache(pointed_type);
+                    ctx.st_ind(addr_calc, value_calc, tpe, false)
                 } else {
                     let inner = ctx.type_from_cache(*ty);
-                    V1Root::STIndPtr(addr_calc, value_calc, Box::new(inner))
+                    let ptr = ctx.nptr(inner);
+                    ctx.st_ind(addr_calc, value_calc, ptr, false)
                 }
             }
             _ => todo!(" can't deref type {pointed_type:?} yet"),

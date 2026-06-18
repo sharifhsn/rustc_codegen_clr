@@ -8,7 +8,7 @@ extern crate rustc_span;
 pub mod constant;
 pub mod static_data;
 use cilly::Type;
-use cilly::cil_node::V1Node;
+use cilly::{Interned, v2::CILNode};
 use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_place::{PlaceTy, deref_op, place_address, place_get};
 use rustc_codegen_clr_type::GetTypeExt;
@@ -17,10 +17,10 @@ use rustc_middle::mir::{ConstValue, Operand};
 pub fn handle_operand<'tcx>(
     operand: &Operand<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Node {
+) -> Interned<CILNode> {
     let res = ctx.type_from_cache(ctx.monomorphize(operand.ty(ctx.body(), ctx.tcx())));
     if res == Type::Void {
-        return V1Node::uninit_val(Type::Void, ctx);
+        return ctx.uninit_val(Type::Void);
     }
     match operand {
         Operand::Copy(place) | Operand::Move(place) => place_get(place, ctx),
@@ -28,34 +28,28 @@ pub fn handle_operand<'tcx>(
         // A compile-time query of a session flag (UB/overflow checks) -> a bool const.
         Operand::RuntimeChecks(checks) => {
             let value = checks.value(ctx.tcx().sess);
-            V1Node::V2(ctx.alloc_node(value))
+            ctx.alloc_node(value)
         }
     }
 }
 pub fn operand_address<'tcx>(
     operand: &Operand<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Node {
+) -> Interned<CILNode> {
     match operand {
         Operand::Copy(place) | Operand::Move(place) => place_address(place, ctx),
         Operand::Constant(const_val) => {
             let local_type = ctx.type_from_cache(operand.ty(ctx.body(), ctx.tcx()));
             let constant = crate::constant::handle_constant(const_val, ctx);
-            let ptr = V1Node::stack_addr(constant, ctx.alloc_type(local_type), ctx);
-            V1Node::LdObj {
-                ptr: Box::new(ptr),
-                obj: Box::new(local_type),
-            }
+            let ptr = ctx.stack_addr(constant);
+            ctx.load(ptr, local_type)
         }
         Operand::RuntimeChecks(checks) => {
             let value = checks.value(ctx.tcx().sess);
             let local_type = ctx.type_from_cache(operand.ty(ctx.body(), ctx.tcx()));
-            let constant = V1Node::V2(ctx.alloc_node(value));
-            let ptr = V1Node::stack_addr(constant, ctx.alloc_type(local_type), ctx);
-            V1Node::LdObj {
-                ptr: Box::new(ptr),
-                obj: Box::new(local_type),
-            }
+            let constant = ctx.alloc_node(value);
+            let ptr = ctx.stack_addr(constant);
+            ctx.load(ptr, local_type)
         }
     }
 }

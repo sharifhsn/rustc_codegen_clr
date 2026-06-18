@@ -1,8 +1,7 @@
 use crate::assembly::MethodCompileCtx;
 use cilly::{
-    call,
-    cil_node::V1Node,
-    cil_root::V1Root,
+    cilnode::IsPure,
+    Interned,
     {cilnode::MethodKind, ClassRef, MethodRef},
 };
 use rustc_codegen_clr_place::place_set;
@@ -14,11 +13,14 @@ use rustc_middle::{
 };
 use rustc_span::Spanned;
 
+type Node = Interned<cilly::v2::CILNode>;
+type Root = Interned<cilly::v2::CILRoot>;
+
 pub fn bswap<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
     debug_assert_eq!(
         args.len(),
         1,
@@ -28,23 +30,21 @@ pub fn bswap<'tcx>(
     let ty = ctx.monomorphize(ty);
     let tpe = ctx.type_from_cache(ty);
     let operand = handle_operand(&args[0].node, ctx);
-    place_set(
-        destination,
-        match ty.kind() {
-            TyKind::Uint(UintTy::U8) => operand,
-            TyKind::Uint(_) | TyKind::Int(_) => {
-                let mref = MethodRef::new(
-                    ClassRef::binary_primitives(ctx),
-                    ctx.alloc_string("ReverseEndianness"),
-                    ctx.sig([tpe], tpe),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(ctx.alloc_methodref(mref), [operand])
-            }
+    let value_calc: Node = match ty.kind() {
+        TyKind::Uint(UintTy::U8) => operand,
+        TyKind::Uint(_) | TyKind::Int(_) => {
+            let mref = MethodRef::new(
+                ClassRef::binary_primitives(ctx),
+                ctx.alloc_string("ReverseEndianness"),
+                ctx.sig([tpe], tpe),
+                MethodKind::Static,
+                vec![].into(),
+            );
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[operand], IsPure::NOT)
+        }
 
-            _ => todo!("Can't bswap {tpe:?}"),
-        },
-        ctx,
-    )
+        _ => todo!("Can't bswap {tpe:?}"),
+    };
+    place_set(destination, value_calc, ctx)
 }

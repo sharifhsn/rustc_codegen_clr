@@ -1,14 +1,11 @@
-use cilly::cil_node::V1Node;
-use cilly::cilnode::MethodKind;
+use cilly::cilnode::{ExtendKind, IsPure, MethodKind};
 use cilly::Type;
-use cilly::{Assembly, ClassRef, Float, Int, MethodRef};
+use cilly::{Assembly, ClassRef, Float, Int, Interned, MethodRef};
 
-use cilly::{
-    call, conv_f32, conv_f64, conv_f_un, conv_i16, conv_i32, conv_i64, conv_i8, conv_isize,
-    conv_u16, conv_u32, conv_u64, conv_u8, conv_usize,
-};
+type Node = Interned<cilly::v2::CILNode>;
+
 /// Casts from intiger type `src` to target `target`
-pub fn int_to_int(src: Type, target: Type, operand: V1Node, asm: &mut Assembly) -> V1Node {
+pub fn int_to_int(src: Type, target: Type, operand: Node, asm: &mut Assembly) -> Node {
     if src == target {
         return operand;
     }
@@ -18,19 +15,24 @@ pub fn int_to_int(src: Type, target: Type, operand: V1Node, asm: &mut Assembly) 
             Type::Int(Int::U32 | Int::U16 | Int::U8 | Int::U64 | Int::USize),
             Type::Int(Int::ISize),
         ) => {
-            conv_isize!(conv_usize!(operand))
+            let us = asm.int_cast(operand, Int::USize, ExtendKind::ZeroExtend);
+            asm.int_cast(us, Int::ISize, ExtendKind::SignExtend)
         }
         (Type::Int(Int::U32 | Int::U16 | Int::U8 | Int::U64 | Int::USize), Type::Int(Int::I64)) => {
-            conv_i64!(conv_u64!(operand))
+            let u = asm.int_cast(operand, Int::U64, ExtendKind::ZeroExtend);
+            asm.int_cast(u, Int::I64, ExtendKind::SignExtend)
         }
         (Type::Int(Int::U32 | Int::U16 | Int::U8 | Int::U64 | Int::USize), Type::Int(Int::I32)) => {
-            conv_i32!(conv_u32!(operand))
+            let u = asm.int_cast(operand, Int::U32, ExtendKind::ZeroExtend);
+            asm.int_cast(u, Int::I32, ExtendKind::SignExtend)
         }
         (Type::Int(Int::U32 | Int::U16 | Int::U8 | Int::U64 | Int::USize), Type::Int(Int::I16)) => {
-            conv_i16!(conv_u16!(operand))
+            let u = asm.int_cast(operand, Int::U16, ExtendKind::ZeroExtend);
+            asm.int_cast(u, Int::I16, ExtendKind::SignExtend)
         }
         (Type::Int(Int::U32 | Int::U16 | Int::U8 | Int::U64 | Int::USize), Type::Int(Int::I8)) => {
-            conv_i8!(conv_u8!(operand))
+            let u = asm.int_cast(operand, Int::U8, ExtendKind::ZeroExtend);
+            asm.int_cast(u, Int::I8, ExtendKind::SignExtend)
         }
         //
         (Type::Int(Int::ISize), Type::Int(Int::I128)) => {
@@ -41,7 +43,8 @@ pub fn int_to_int(src: Type, target: Type, operand: V1Node, asm: &mut Assembly) 
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(asm.alloc_methodref(mref), [operand])
+            let mref = asm.alloc_methodref(mref);
+            asm.call(mref, &[operand], IsPure::NOT)
         }
         (Type::Int(Int::U32), Type::Int(Int::I128)) => {
             let mref = MethodRef::new(
@@ -51,7 +54,8 @@ pub fn int_to_int(src: Type, target: Type, operand: V1Node, asm: &mut Assembly) 
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(asm.alloc_methodref(mref), [operand])
+            let mref = asm.alloc_methodref(mref);
+            asm.call(mref, &[operand], IsPure::NOT)
         }
         (Type::Int(Int::ISize), Type::Int(Int::U128)) => {
             let mref = MethodRef::new(
@@ -61,7 +65,9 @@ pub fn int_to_int(src: Type, target: Type, operand: V1Node, asm: &mut Assembly) 
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(asm.alloc_methodref(mref), [conv_i64!(operand)])
+            let arg = asm.int_cast(operand, Int::I64, ExtendKind::SignExtend);
+            let mref = asm.alloc_methodref(mref);
+            asm.call(mref, &[arg], IsPure::NOT)
         }
         (Type::Bool, Type::Int(Int::U128)) => {
             let mref = MethodRef::new(
@@ -71,7 +77,9 @@ pub fn int_to_int(src: Type, target: Type, operand: V1Node, asm: &mut Assembly) 
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(asm.alloc_methodref(mref), [conv_i32!(operand)])
+            let arg = asm.int_cast(operand, Int::I32, ExtendKind::SignExtend);
+            let mref = asm.alloc_methodref(mref);
+            asm.call(mref, &[arg], IsPure::NOT)
         }
         (Type::Bool, Type::Int(Int::I128)) => {
             let mref = MethodRef::new(
@@ -81,14 +89,16 @@ pub fn int_to_int(src: Type, target: Type, operand: V1Node, asm: &mut Assembly) 
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(asm.alloc_methodref(mref), [conv_i32!(operand)])
+            let arg = asm.int_cast(operand, Int::I32, ExtendKind::SignExtend);
+            let mref = asm.alloc_methodref(mref);
+            asm.call(mref, &[arg], IsPure::NOT)
         }
         // Fixes sign casts
         (Type::Int(Int::I64 | Int::I32 | Int::I16 | Int::I8), Type::Int(Int::USize)) => {
-            V1Node::SignExtendToUSize(operand.into())
+            asm.int_cast(operand, Int::USize, ExtendKind::SignExtend)
         }
         (Type::Int(Int::I64 | Int::I32 | Int::I16 | Int::I8), Type::Int(Int::U64)) => {
-            V1Node::SignExtendToU64(operand.into())
+            asm.int_cast(operand, Int::U64, ExtendKind::SignExtend)
         }
         // i128 bit casts
         (Type::Int(Int::U128), Type::Int(Int::I128))
@@ -100,7 +110,8 @@ pub fn int_to_int(src: Type, target: Type, operand: V1Node, asm: &mut Assembly) 
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(asm.alloc_methodref(mref), [operand])
+            let mref = asm.alloc_methodref(mref);
+            asm.call(mref, &[operand], IsPure::NOT)
         }
         (_, Type::Int(Int::I128)) => {
             let mref = MethodRef::new(
@@ -110,7 +121,8 @@ pub fn int_to_int(src: Type, target: Type, operand: V1Node, asm: &mut Assembly) 
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(asm.alloc_methodref(mref), [operand])
+            let mref = asm.alloc_methodref(mref);
+            asm.call(mref, &[operand], IsPure::NOT)
         }
         (Type::Int(Int::I128), Type::Int(Int::U128)) => {
             let mref = MethodRef::new(
@@ -120,7 +132,8 @@ pub fn int_to_int(src: Type, target: Type, operand: V1Node, asm: &mut Assembly) 
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(asm.alloc_methodref(mref), [operand])
+            let mref = asm.alloc_methodref(mref);
+            asm.call(mref, &[operand], IsPure::NOT)
         }
         (_, Type::Int(Int::U128)) => {
             let mref = MethodRef::new(
@@ -130,7 +143,8 @@ pub fn int_to_int(src: Type, target: Type, operand: V1Node, asm: &mut Assembly) 
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(asm.alloc_methodref(mref), [operand])
+            let mref = asm.alloc_methodref(mref);
+            asm.call(mref, &[operand], IsPure::NOT)
         }
         (Type::Int(Int::I128), _) => {
             let mref = MethodRef::new(
@@ -140,7 +154,8 @@ pub fn int_to_int(src: Type, target: Type, operand: V1Node, asm: &mut Assembly) 
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(asm.alloc_methodref(mref), [operand])
+            let mref = asm.alloc_methodref(mref);
+            asm.call(mref, &[operand], IsPure::NOT)
         }
         (Type::Int(Int::U128), _) => {
             let mref = MethodRef::new(
@@ -150,14 +165,15 @@ pub fn int_to_int(src: Type, target: Type, operand: V1Node, asm: &mut Assembly) 
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(asm.alloc_methodref(mref), [operand])
+            let mref = asm.alloc_methodref(mref);
+            asm.call(mref, &[operand], IsPure::NOT)
         }
         //todo!("Casting to 128 bit intiegers is not supported!"),
-        _ => to_int(target, operand),
+        _ => to_int(target, operand, asm),
     }
 }
 /// Returns CIL ops required to convert type src to target
-pub fn float_to_int(src: Type, target: Type, operand: V1Node, asm: &mut Assembly) -> V1Node {
+pub fn float_to_int(src: Type, target: Type, operand: Node, asm: &mut Assembly) -> Node {
     match target {
         Type::Int(Int::I128) => {
             let mref = MethodRef::new(
@@ -167,7 +183,8 @@ pub fn float_to_int(src: Type, target: Type, operand: V1Node, asm: &mut Assembly
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(asm.alloc_methodref(mref), [operand])
+            let mref = asm.alloc_methodref(mref);
+            asm.call(mref, &[operand], IsPure::NOT)
         }
         Type::Int(Int::U128) => {
             let mref = MethodRef::new(
@@ -177,266 +194,82 @@ pub fn float_to_int(src: Type, target: Type, operand: V1Node, asm: &mut Assembly
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(asm.alloc_methodref(mref), [operand])
+            let mref = asm.alloc_methodref(mref);
+            asm.call(mref, &[operand], IsPure::NOT)
         }
-        Type::Int(Int::U8) => match src {
-            Type::Float(Float::F32) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f32_u8"),
-                    asm.sig([Type::Float(Float::F32)], Type::Int(Int::U8)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            Type::Float(Float::F64) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f64_u8"),
-                    asm.sig([Type::Float(Float::F64)], Type::Int(Int::U8)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            _ => panic!("Non-float type!"),
-        },
-        Type::Int(Int::U16) => match src {
-            Type::Float(Float::F32) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f32_u16"),
-                    asm.sig([Type::Float(Float::F32)], Type::Int(Int::U16)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            Type::Float(Float::F64) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f64_u16"),
-                    asm.sig([Type::Float(Float::F64)], Type::Int(Int::U16)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            _ => panic!("Non-float type!"),
-        },
-        Type::Int(Int::U32) => match src {
-            Type::Float(Float::F32) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f32_u32"),
-                    asm.sig([Type::Float(Float::F32)], Type::Int(Int::U32)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            Type::Float(Float::F64) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f64_u32"),
-                    asm.sig([Type::Float(Float::F64)], Type::Int(Int::U32)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            _ => panic!("Non-float type!"),
-        },
-        Type::Int(Int::U64) => match src {
-            Type::Float(Float::F32) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f32_u64"),
-                    asm.sig([Type::Float(Float::F32)], Type::Int(Int::U64)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            Type::Float(Float::F64) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f64_u64"),
-                    asm.sig([Type::Float(Float::F64)], Type::Int(Int::U64)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            _ => panic!("Non-float type!"),
-        },
-        Type::Int(Int::USize) => match src {
-            //TODO: Check why this caused
-            Type::Float(Float::F32) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f32_usize"),
-                    asm.sig([Type::Float(Float::F32)], Type::Int(Int::USize)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-
-            Type::Float(Float::F64) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f64_usize"),
-                    asm.sig([Type::Float(Float::F64)], Type::Int(Int::USize)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            //_=> to_int(target, operand),
-            _ => panic!("Non-float type!"),
-        },
-        Type::Int(Int::ISize) => match src {
-            Type::Float(Float::F32) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f32_isize"),
-                    asm.sig([Type::Float(Float::F32)], Type::Int(Int::ISize)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            Type::Float(Float::F64) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f64_isize"),
-                    asm.sig([Type::Float(Float::F64)], Type::Int(Int::ISize)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            _ => panic!("Non-float type!"),
-        },
-        Type::Int(Int::I8) => match src {
-            Type::Float(Float::F32) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f32_i8"),
-                    asm.sig([Type::Float(Float::F32)], Type::Int(Int::I8)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            Type::Float(Float::F64) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f64_i8"),
-                    asm.sig([Type::Float(Float::F64)], Type::Int(Int::I8)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            _ => panic!("Non-float type!"),
-        },
-        Type::Int(Int::I16) => match src {
-            Type::Float(Float::F32) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f32_i16"),
-                    asm.sig([Type::Float(Float::F32)], Type::Int(Int::I16)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            Type::Float(Float::F64) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f64_i16"),
-                    asm.sig([Type::Float(Float::F64)], Type::Int(Int::I16)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            _ => panic!("Non-float type!"),
-        },
-        Type::Int(Int::I32) => match src {
-            Type::Float(Float::F32) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f32_i32"),
-                    asm.sig([Type::Float(Float::F32)], Type::Int(Int::I32)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            Type::Float(Float::F64) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f64_i32"),
-                    asm.sig([Type::Float(Float::F64)], Type::Int(Int::I32)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            _ => panic!("Non-float type!"),
-        },
-        Type::Int(Int::I64) => match src {
-            Type::Float(Float::F32) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f32_i64"),
-                    asm.sig([Type::Float(Float::F32)], Type::Int(Int::I64)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            Type::Float(Float::F64) => {
-                let mref = MethodRef::new(
-                    *asm.main_module(),
-                    asm.alloc_string("cast_f64_i64"),
-                    asm.sig([Type::Float(Float::F64)], Type::Int(Int::I64)),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                call!(asm.alloc_methodref(mref), [operand])
-            }
-            _ => panic!("Non-float type!"),
-        },
-        _ => to_int(target, operand),
+        Type::Int(
+            int @ (Int::U8
+            | Int::U16
+            | Int::U32
+            | Int::U64
+            | Int::USize
+            | Int::ISize
+            | Int::I8
+            | Int::I16
+            | Int::I32
+            | Int::I64),
+        ) => {
+            let name = match (int, src) {
+                (Int::U8, Type::Float(Float::F32)) => "cast_f32_u8",
+                (Int::U8, Type::Float(Float::F64)) => "cast_f64_u8",
+                (Int::U16, Type::Float(Float::F32)) => "cast_f32_u16",
+                (Int::U16, Type::Float(Float::F64)) => "cast_f64_u16",
+                (Int::U32, Type::Float(Float::F32)) => "cast_f32_u32",
+                (Int::U32, Type::Float(Float::F64)) => "cast_f64_u32",
+                (Int::U64, Type::Float(Float::F32)) => "cast_f32_u64",
+                (Int::U64, Type::Float(Float::F64)) => "cast_f64_u64",
+                (Int::USize, Type::Float(Float::F32)) => "cast_f32_usize",
+                (Int::USize, Type::Float(Float::F64)) => "cast_f64_usize",
+                (Int::ISize, Type::Float(Float::F32)) => "cast_f32_isize",
+                (Int::ISize, Type::Float(Float::F64)) => "cast_f64_isize",
+                (Int::I8, Type::Float(Float::F32)) => "cast_f32_i8",
+                (Int::I8, Type::Float(Float::F64)) => "cast_f64_i8",
+                (Int::I16, Type::Float(Float::F32)) => "cast_f32_i16",
+                (Int::I16, Type::Float(Float::F64)) => "cast_f64_i16",
+                (Int::I32, Type::Float(Float::F32)) => "cast_f32_i32",
+                (Int::I32, Type::Float(Float::F64)) => "cast_f64_i32",
+                (Int::I64, Type::Float(Float::F32)) => "cast_f32_i64",
+                (Int::I64, Type::Float(Float::F64)) => "cast_f64_i64",
+                _ => panic!("Non-float type!"),
+            };
+            let mref = MethodRef::new(
+                *asm.main_module(),
+                asm.alloc_string(name),
+                asm.sig([src], Type::Int(int)),
+                MethodKind::Static,
+                vec![].into(),
+            );
+            let mref = asm.alloc_methodref(mref);
+            asm.call(mref, &[operand], IsPure::NOT)
+        }
+        _ => to_int(target, operand, asm),
     }
 
     //call uint64 [System.Runtime]System.Int128::op_Explicit(valuetype [System.Runtime]System.Int128)
     //
 }
 /// Returns CIL ops required to convert to intiger of type `target`
-fn to_int(target: Type, operand: V1Node) -> V1Node {
+fn to_int(target: Type, operand: Node, asm: &mut Assembly) -> Node {
     match target {
-        Type::Int(Int::I8) => conv_i8!(operand),
-        Type::Int(Int::U8) => conv_u8!(operand),
-        Type::Int(Int::I16) => conv_i16!(operand),
-        Type::Int(Int::U16) => conv_u16!(operand),
-        Type::Int(Int::U32) => conv_u32!(operand),
-        Type::Int(Int::I32) => conv_i32!(operand),
-        Type::Int(Int::I64) => conv_i64!(operand),
-        Type::Int(Int::U64) => conv_u64!(operand),
-        Type::Int(Int::ISize) => conv_isize!(operand),
-        Type::Int(Int::USize) => conv_usize!(operand),
-        Type::Ptr(tpe) => conv_usize!(operand).cast_ptr(Type::Ptr(tpe)),
+        Type::Int(Int::I8) => asm.int_cast(operand, Int::I8, ExtendKind::SignExtend),
+        Type::Int(Int::U8) => asm.int_cast(operand, Int::U8, ExtendKind::ZeroExtend),
+        Type::Int(Int::I16) => asm.int_cast(operand, Int::I16, ExtendKind::SignExtend),
+        Type::Int(Int::U16) => asm.int_cast(operand, Int::U16, ExtendKind::ZeroExtend),
+        Type::Int(Int::U32) => asm.int_cast(operand, Int::U32, ExtendKind::ZeroExtend),
+        Type::Int(Int::I32) => asm.int_cast(operand, Int::I32, ExtendKind::SignExtend),
+        Type::Int(Int::I64) => asm.int_cast(operand, Int::I64, ExtendKind::SignExtend),
+        Type::Int(Int::U64) => asm.int_cast(operand, Int::U64, ExtendKind::ZeroExtend),
+        Type::Int(Int::ISize) => asm.int_cast(operand, Int::ISize, ExtendKind::SignExtend),
+        Type::Int(Int::USize) => asm.int_cast(operand, Int::USize, ExtendKind::ZeroExtend),
+        Type::Ptr(tpe) => {
+            let us = asm.int_cast(operand, Int::USize, ExtendKind::ZeroExtend);
+            asm.cast_ptr(us, tpe)
+        }
         _ => todo!("Can't cast to {target:?} yet!"),
     }
 }
 /// Returns CIL ops required to casts from intiger type `src` to `target` MOVE TO CILLY
-pub fn int_to_float(src: Type, target: Type, parrent: V1Node, asm: &mut Assembly) -> V1Node {
+pub fn int_to_float(src: Type, target: Type, parrent: Node, asm: &mut Assembly) -> Node {
     if matches!(src, Type::Int(Int::I128)) {
         let mref = MethodRef::new(
             ClassRef::int_128(asm),
@@ -445,7 +278,8 @@ pub fn int_to_float(src: Type, target: Type, parrent: V1Node, asm: &mut Assembly
             MethodKind::Static,
             vec![].into(),
         );
-        call!(asm.alloc_methodref(mref), [parrent])
+        let mref = asm.alloc_methodref(mref);
+        asm.call(mref, &[parrent], IsPure::NOT)
         //todo!("Casting from 128 bit intiegers is not supported!")
     } else if matches!(src, Type::Int(Int::U128)) {
         let mref = MethodRef::new(
@@ -455,25 +289,30 @@ pub fn int_to_float(src: Type, target: Type, parrent: V1Node, asm: &mut Assembly
             MethodKind::Static,
             vec![].into(),
         );
-        call!(asm.alloc_methodref(mref), [parrent])
+        let mref = asm.alloc_methodref(mref);
+        asm.call(mref, &[parrent], IsPure::NOT)
     } else if matches!(target, Type::Int(Int::I128 | Int::U128)) {
         todo!("Casting to 128 bit intiegers is not supported!")
     } else {
         match (&src, &target) {
             (Type::Int(Int::U32 | Int::U64), Type::Float(Float::F32)) => {
-                conv_f32!(conv_f_un!(parrent))
+                let un = asm.float_cast(parrent, Float::F64, false);
+                asm.float_cast(un, Float::F32, true)
             }
             (Type::Int(Int::USize), Type::Float(Float::F32)) => {
-                conv_f32!(conv_f_un!(conv_u64!(parrent)))
+                let u = asm.int_cast(parrent, Int::U64, ExtendKind::ZeroExtend);
+                let un = asm.float_cast(u, Float::F64, false);
+                asm.float_cast(un, Float::F32, true)
             }
-            (_, Type::Float(Float::F32)) => conv_f32!(parrent),
+            (_, Type::Float(Float::F32)) => asm.float_cast(parrent, Float::F32, true),
             (Type::Int(Int::U32 | Int::U64), Type::Float(Float::F64)) => {
-                conv_f64!(conv_f_un!(parrent))
+                asm.float_cast(parrent, Float::F64, false)
             }
             (Type::Int(Int::USize), Type::Float(Float::F64)) => {
-                conv_f64!(conv_f_un!(conv_u64!(parrent)))
+                let u = asm.int_cast(parrent, Int::U64, ExtendKind::ZeroExtend);
+                asm.float_cast(u, Float::F64, false)
             }
-            (_, Type::Float(Float::F64)) => conv_f64!(parrent),
+            (_, Type::Float(Float::F64)) => asm.float_cast(parrent, Float::F64, true),
             _ => todo!("Can't  cast {src:?} to {target:?} yet!"),
         }
     }

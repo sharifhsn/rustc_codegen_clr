@@ -1,44 +1,43 @@
 use crate::assembly::MethodCompileCtx;
 use cilly::{
-    call,
-    cil_node::V1Node,
-    cil_root::V1Root,
-    cilnode::MethodKind,
-    conv_f32, conv_f64, Int, MethodRef, Type, {ClassRef, Float},
+    cilnode::MethodKind, Int, Interned, MethodRef, Type, {ClassRef, Float},
 };
+use cilly::cilnode::IsPure;
 use rustc_codegen_clr_place::place_set;
 use rustc_codgen_clr_operand::handle_operand;
 use rustc_middle::mir::{Operand, Place};
 use rustc_span::Spanned;
+
+type Node = Interned<cilly::v2::CILNode>;
+type Root = Interned<cilly::v2::CILRoot>;
+
 /// Implementation of the fmaf32 intrinsics. Takes in 3 arguments: a, b, c. Calcualtes a * b + c
 pub fn fmaf32<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
 
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
+    let sig = ctx.sig(
+        [
+            Type::Float(Float::F32),
+            Type::Float(Float::F32),
+            Type::Float(Float::F32),
+        ],
+        Type::Float(Float::F32),
+    );
     let mref = MethodRef::new(
         ClassRef::single(ctx),
         ctx.alloc_string("FusedMultiplyAdd"),
-        ctx.sig(
-            [
-                Type::Float(Float::F32),
-                Type::Float(Float::F32),
-                Type::Float(Float::F32),
-            ],
-            Type::Float(Float::F32),
-        ),
+        sig,
         MethodKind::Static,
         vec![].into(),
     );
-    let value_calc = call!(
-        ctx.alloc_methodref(mref),
-        [
-            handle_operand(&args[0].node, ctx),
-            handle_operand(&args[1].node, ctx),
-            handle_operand(&args[2].node, ctx),
-        ]
-    );
+    let mref = ctx.alloc_methodref(mref);
+    let a = handle_operand(&args[0].node, ctx);
+    let b = handle_operand(&args[1].node, ctx);
+    let c = handle_operand(&args[2].node, ctx);
+    let value_calc = ctx.call(mref, &[a, b, c], IsPure::NOT);
     place_set(destination, value_calc, ctx)
 }
 /// Implementation of the fmaf64 intrinsics. Takes in 3 arguments: a, b, c. Calcualtes a * b + c
@@ -47,29 +46,27 @@ pub fn fmaf64<'tcx>(
     destination: &Place<'tcx>,
 
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
+    let sig = ctx.sig(
+        [
+            Type::Float(Float::F64),
+            Type::Float(Float::F64),
+            Type::Float(Float::F64),
+        ],
+        Type::Float(Float::F64),
+    );
     let mref = MethodRef::new(
         ClassRef::double(ctx),
         ctx.alloc_string("FusedMultiplyAdd"),
-        ctx.sig(
-            [
-                Type::Float(Float::F64),
-                Type::Float(Float::F64),
-                Type::Float(Float::F64),
-            ],
-            Type::Float(Float::F64),
-        ),
+        sig,
         MethodKind::Static,
         vec![].into(),
     );
-    let value_calc = call!(
-        ctx.alloc_methodref(mref),
-        [
-            handle_operand(&args[0].node, ctx),
-            handle_operand(&args[1].node, ctx),
-            handle_operand(&args[2].node, ctx),
-        ]
-    );
+    let mref = ctx.alloc_methodref(mref);
+    let a = handle_operand(&args[0].node, ctx);
+    let b = handle_operand(&args[1].node, ctx);
+    let c = handle_operand(&args[2].node, ctx);
+    let value_calc = ctx.call(mref, &[a, b, c], IsPure::NOT);
     place_set(destination, value_calc, ctx)
 }
 pub fn powif32<'tcx>(
@@ -77,90 +74,80 @@ pub fn powif32<'tcx>(
     destination: &Place<'tcx>,
 
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
     debug_assert_eq!(
         args.len(),
         2,
         "The intrinsic `powif32` MUST take in exactly 2 arguments!"
     );
+    let sig = ctx.sig(
+        [Type::Float(Float::F32), Type::Float(Float::F32)],
+        Type::Float(Float::F32),
+    );
     let pow = MethodRef::new(
         ClassRef::single(ctx),
         ctx.alloc_string("Pow"),
-        ctx.sig(
-            [Type::Float(Float::F32), Type::Float(Float::F32)],
-            Type::Float(Float::F32),
-        ),
+        sig,
         MethodKind::Static,
         vec![].into(),
     );
-    place_set(
-        destination,
-        call!(
-            ctx.alloc_methodref(pow),
-            [
-                handle_operand(&args[0].node, ctx),
-                conv_f32!(handle_operand(&args[1].node, ctx))
-            ]
-        ),
-        ctx,
-    )
+    let pow = ctx.alloc_methodref(pow);
+    let a = handle_operand(&args[0].node, ctx);
+    let b = handle_operand(&args[1].node, ctx);
+    let b = ctx.float_cast(b, Float::F32, true);
+    let value_calc = ctx.call(pow, &[a, b], IsPure::NOT);
+    place_set(destination, value_calc, ctx)
 }
 pub fn powif64<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
 
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
     debug_assert_eq!(
         args.len(),
         2,
         "The intrinsic `powif64` MUST take in exactly 2 arguments!"
     );
+    let sig = ctx.sig(
+        [Type::Float(Float::F64), Type::Float(Float::F64)],
+        Type::Float(Float::F64),
+    );
     let pow = MethodRef::new(
         ClassRef::double(ctx),
         ctx.alloc_string("Pow"),
-        ctx.sig(
-            [Type::Float(Float::F64), Type::Float(Float::F64)],
-            Type::Float(Float::F64),
-        ),
+        sig,
         MethodKind::Static,
         vec![].into(),
     );
-    place_set(
-        destination,
-        call!(
-            ctx.alloc_methodref(pow),
-            [
-                handle_operand(&args[0].node, ctx),
-                conv_f64!(handle_operand(&args[1].node, ctx))
-            ]
-        ),
-        ctx,
-    )
+    let pow = ctx.alloc_methodref(pow);
+    let a = handle_operand(&args[0].node, ctx);
+    let b = handle_operand(&args[1].node, ctx);
+    let b = ctx.float_cast(b, Float::F64, true);
+    let value_calc = ctx.call(pow, &[a, b], IsPure::NOT);
+    place_set(destination, value_calc, ctx)
 }
 pub fn powf32<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
 
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
+    let sig = ctx.sig(
+        [Type::Float(Float::F32), Type::Float(Float::F32)],
+        Type::Float(Float::F32),
+    );
     let pow = MethodRef::new(
         ClassRef::single(ctx),
         ctx.alloc_string("Pow"),
-        ctx.sig(
-            [Type::Float(Float::F32), Type::Float(Float::F32)],
-            Type::Float(Float::F32),
-        ),
+        sig,
         MethodKind::Static,
         vec![].into(),
     );
-    let value_calc = call!(
-        ctx.alloc_methodref(pow),
-        [
-            handle_operand(&args[0].node, ctx),
-            handle_operand(&args[1].node, ctx),
-        ]
-    );
+    let pow = ctx.alloc_methodref(pow);
+    let a = handle_operand(&args[0].node, ctx);
+    let b = handle_operand(&args[1].node, ctx);
+    let value_calc = ctx.call(pow, &[a, b], IsPure::NOT);
     place_set(destination, value_calc, ctx)
 }
 pub fn powf64<'tcx>(
@@ -168,58 +155,47 @@ pub fn powf64<'tcx>(
     destination: &Place<'tcx>,
 
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
+    let sig = ctx.sig(
+        [Type::Float(Float::F64), Type::Float(Float::F64)],
+        Type::Float(Float::F64),
+    );
     let pow = MethodRef::new(
         ClassRef::double(ctx),
         ctx.alloc_string("Pow"),
-        ctx.sig(
-            [Type::Float(Float::F64), Type::Float(Float::F64)],
-            Type::Float(Float::F64),
-        ),
+        sig,
         MethodKind::Static,
         vec![].into(),
     );
-
-    place_set(
-        destination,
-        call!(
-            ctx.alloc_methodref(pow),
-            [
-                handle_operand(&args[0].node, ctx),
-                handle_operand(&args[1].node, ctx),
-            ]
-        ),
-        ctx,
-    )
+    let pow = ctx.alloc_methodref(pow);
+    let a = handle_operand(&args[0].node, ctx);
+    let b = handle_operand(&args[1].node, ctx);
+    let value_calc = ctx.call(pow, &[a, b], IsPure::NOT);
+    place_set(destination, value_calc, ctx)
 }
 pub fn roundf32<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
 
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
     let rounding = ClassRef::midpoint_rounding(ctx);
+    let sig = ctx.sig(
+        [Type::Float(Float::F32), Type::ClassRef(rounding)],
+        Type::Float(Float::F32),
+    );
     let round = MethodRef::new(
         ClassRef::mathf(ctx),
         ctx.alloc_string("Round"),
-        ctx.sig(
-            [Type::Float(Float::F32), Type::ClassRef(rounding)],
-            Type::Float(Float::F32),
-        ),
+        sig,
         MethodKind::Static,
         vec![].into(),
     );
-    let value_calc = call!(
-        ctx.alloc_methodref(round),
-        [
-            handle_operand(&args[0].node, ctx),
-            V1Node::V2(ctx.alloc_node(1_i32)).transmute_on_stack(
-                Type::Int(Int::I32),
-                Type::ClassRef(rounding),
-                ctx
-            )
-        ]
-    );
+    let round = ctx.alloc_methodref(round);
+    let a = handle_operand(&args[0].node, ctx);
+    let one = ctx.alloc_node(1_i32);
+    let one = ctx.transmute_on_stack(Type::Int(Int::I32), Type::ClassRef(rounding), one);
+    let value_calc = ctx.call(round, &[a, one], IsPure::NOT);
     place_set(destination, value_calc, ctx)
 }
 pub fn roundf64<'tcx>(
@@ -227,28 +203,23 @@ pub fn roundf64<'tcx>(
     destination: &Place<'tcx>,
 
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
     let rounding = ClassRef::midpoint_rounding(ctx);
+    let sig = ctx.sig(
+        [Type::Float(Float::F64), Type::ClassRef(rounding)],
+        Type::Float(Float::F64),
+    );
     let round = MethodRef::new(
         ClassRef::math(ctx),
         ctx.alloc_string("Round"),
-        ctx.sig(
-            [Type::Float(Float::F64), Type::ClassRef(rounding)],
-            Type::Float(Float::F64),
-        ),
+        sig,
         MethodKind::Static,
         vec![].into(),
     );
-    let value_calc = call!(
-        ctx.alloc_methodref(round),
-        [
-            handle_operand(&args[0].node, ctx),
-            V1Node::V2(ctx.alloc_node(1_i32)).transmute_on_stack(
-                Type::Int(Int::I32),
-                Type::ClassRef(rounding),
-                ctx
-            )
-        ]
-    );
+    let round = ctx.alloc_methodref(round);
+    let a = handle_operand(&args[0].node, ctx);
+    let one = ctx.alloc_node(1_i32);
+    let one = ctx.transmute_on_stack(Type::Int(Int::I32), Type::ClassRef(rounding), one);
+    let value_calc = ctx.call(round, &[a, one], IsPure::NOT);
     place_set(destination, value_calc, ctx)
 }

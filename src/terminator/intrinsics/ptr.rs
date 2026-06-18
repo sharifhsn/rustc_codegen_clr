@@ -1,7 +1,5 @@
 use crate::assembly::MethodCompileCtx;
-use cilly::{
-    cil_node::V1Node, cil_root::V1Root, conv_isize, conv_usize, Int, IntoAsmIndex, Type,
-};
+use cilly::{cilnode::ExtendKind, Int, Interned, Type};
 use rustc_codegen_clr_place::place_set;
 use rustc_codegen_clr_type::GetTypeExt;
 use rustc_codgen_clr_operand::handle_operand;
@@ -10,12 +8,15 @@ use rustc_middle::{
     ty::Instance,
 };
 use rustc_span::Spanned;
+
+type Root = Interned<cilly::v2::CILRoot>;
+
 pub fn arith_offset<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
     call_instance: Instance<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
     let tpe = ctx.monomorphize(
         call_instance.args[0]
             .as_type()
@@ -23,20 +24,20 @@ pub fn arith_offset<'tcx>(
     );
     let tpe = ctx.type_from_cache(tpe);
 
-    place_set(
-        destination,
-        handle_operand(&args[0].node, ctx)
-            + handle_operand(&args[1].node, ctx)
-                * conv_isize!(V1Node::V2(ctx.size_of(tpe).into_idx(ctx))),
-        ctx,
-    )
+    let a = handle_operand(&args[0].node, ctx);
+    let b = handle_operand(&args[1].node, ctx);
+    let size = ctx.size_of(tpe);
+    let size = ctx.int_cast(size, Int::ISize, ExtendKind::SignExtend);
+    let offset = ctx.biop(b, size, cilly::BinOp::Mul);
+    let calc = ctx.biop(a, offset, cilly::BinOp::Add);
+    place_set(destination, calc, ctx)
 }
 pub fn ptr_offset_from_unsigned<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
     call_instance: Instance<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
     debug_assert_eq!(
         args.len(),
         2,
@@ -50,28 +51,23 @@ pub fn ptr_offset_from_unsigned<'tcx>(
     let tpe = ctx.type_from_cache(ty);
     // This is UB, so we can do whatever.
     if ctx.layout_of(ty).is_zst() {
-        return V1Root::throw(
-            &format!("ptr_offset_from_unsigned called with zst type:{ty}"),
-            ctx,
-        );
+        return ctx.throw_msg(&format!("ptr_offset_from_unsigned called with zst type:{ty}"));
     }
-    place_set(
-        destination,
-        V1Node::DivUn(
-            (handle_operand(&args[0].node, ctx) - handle_operand(&args[1].node, ctx))
-                .cast_ptr(Type::Int(Int::USize))
-                .into(),
-            conv_usize!(V1Node::V2(ctx.size_of(tpe).into_idx(ctx))).into(),
-        ),
-        ctx,
-    )
+    let a = handle_operand(&args[0].node, ctx);
+    let b = handle_operand(&args[1].node, ctx);
+    let diff = ctx.biop(a, b, cilly::BinOp::Sub);
+    let diff = ctx.cast_ptr_to(diff, Type::Int(Int::USize));
+    let size = ctx.size_of(tpe);
+    let size = ctx.int_cast(size, Int::USize, ExtendKind::ZeroExtend);
+    let calc = ctx.biop(diff, size, cilly::BinOp::DivUn);
+    place_set(destination, calc, ctx)
 }
 pub fn ptr_offset_from<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
     call_instance: Instance<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
     debug_assert_eq!(
         args.len(),
         2,
@@ -84,18 +80,16 @@ pub fn ptr_offset_from<'tcx>(
     );
     // This is UB, so we can do whatever.
     if ctx.layout_of(ty).is_zst() {
-        return V1Root::throw(&format!("ptr_offset_from called with zst type:{ty}"), ctx);
+        return ctx.throw_msg(&format!("ptr_offset_from called with zst type:{ty}"));
     }
     let tpe = ctx.type_from_cache(ty);
 
-    place_set(
-        destination,
-        V1Node::Div(
-            (handle_operand(&args[0].node, ctx) - handle_operand(&args[1].node, ctx))
-                .cast_ptr(Type::Int(Int::ISize))
-                .into(),
-            conv_isize!(V1Node::V2(ctx.size_of(tpe).into_idx(ctx))).into(),
-        ),
-        ctx,
-    )
+    let a = handle_operand(&args[0].node, ctx);
+    let b = handle_operand(&args[1].node, ctx);
+    let diff = ctx.biop(a, b, cilly::BinOp::Sub);
+    let diff = ctx.cast_ptr_to(diff, Type::Int(Int::ISize));
+    let size = ctx.size_of(tpe);
+    let size = ctx.int_cast(size, Int::ISize, ExtendKind::SignExtend);
+    let calc = ctx.biop(diff, size, cilly::BinOp::Div);
+    place_set(destination, calc, ctx)
 }

@@ -2,10 +2,8 @@ use self::checked::{add_signed, add_unsigned, sub_signed, sub_unsigned};
 use crate::assembly::MethodCompileCtx;
 use bitop::{bit_and_unchecked, bit_or_unchecked, bit_xor_unchecked};
 use cilly::{
-    call,
-    cil_node::V1Node,
-    conv_i8, conv_u16, conv_u32, conv_u64, conv_u8, eq, gt_un, lt_un, rem, rem_un, IntoAsmIndex,
-    Type,
+    cilnode::{ExtendKind, IsPure},
+    BinOp as V2BinOp, Interned, IntoAsmIndex, Type,
     {cilnode::MethodKind, Float, Int, MethodRef},
 };
 use cmp::{eq_unchecked, gt_unchecked, lt_unchecked, ne_unchecked};
@@ -24,13 +22,15 @@ pub mod checked;
 pub mod cmp;
 pub mod shift;
 
+type Node = Interned<cilly::v2::CILNode>;
+
 /// Preforms an unchecked binary operation.
 pub(crate) fn binop<'tcx>(
     binop: BinOp,
     operand_a: &Operand<'tcx>,
     operand_b: &Operand<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Node {
+) -> Node {
     let ops_a = handle_operand(operand_a, ctx);
     let ops_b = handle_operand(operand_b, ctx);
     let ty_a = operand_a.ty(&ctx.body().local_decls, ctx.tcx());
@@ -38,17 +38,17 @@ pub(crate) fn binop<'tcx>(
     match binop {
         BinOp::AddWithOverflow => {
             if ty_a.is_signed() {
-                add_signed(&ops_a, &ops_b, ty_a, ctx)
+                add_signed(ops_a, ops_b, ty_a, ctx)
             } else {
-                add_unsigned(&ops_a, &ops_b, ty_a, ctx)
+                add_unsigned(ops_a, ops_b, ty_a, ctx)
             }
         }
         BinOp::Add | BinOp::AddUnchecked => add_unchecked(ty_a, ty_b, ctx, ops_a, ops_b),
         BinOp::SubWithOverflow => {
             if ty_a.is_signed() {
-                sub_signed(&ops_a, &ops_b, ty_a, ctx)
+                sub_signed(ops_a, ops_b, ty_a, ctx)
             } else {
-                sub_unsigned(&ops_a, &ops_b, ty_a, ctx)
+                sub_unsigned(ops_a, ops_b, ty_a, ctx)
             }
         }
         BinOp::Sub | BinOp::SubUnchecked => sub_unchecked(ty_a, ty_b, ctx, ops_a, ops_b),
@@ -66,13 +66,15 @@ pub(crate) fn binop<'tcx>(
         BinOp::ShrUnchecked => shr_unchecked(ty_a, ty_b, ctx, ops_a, ops_b),
 
         BinOp::Mul | BinOp::MulUnchecked => mul_unchecked(ty_a, ctx, ops_a, ops_b),
-        BinOp::MulWithOverflow => checked::mul(&ops_a, &ops_b, ty_a, ctx),
+        BinOp::MulWithOverflow => checked::mul(ops_a, ops_b, ty_a, ctx),
         BinOp::Div => div_unchecked(ty_a, ctx, ops_a, ops_b),
 
         BinOp::Ge => match ty_a.kind() {
             // Unordered, to handle NaNs propely
             TyKind::Float(FloatTy::F32 | FloatTy::F64) => {
-                eq!(lt_un!(ops_a, ops_b), V1Node::V2(ctx.alloc_node(false)))
+                let lt = ctx.biop(ops_a, ops_b, V2BinOp::LtUn);
+                let f = ctx.alloc_node(false);
+                ctx.biop(lt, f, V2BinOp::Eq)
             }
             TyKind::Float(FloatTy::F128) => {
                 let mref = MethodRef::new(
@@ -85,17 +87,21 @@ pub(crate) fn binop<'tcx>(
                     MethodKind::Static,
                     vec![].into(),
                 );
-                call!(ctx.alloc_methodref(mref), [ops_a, ops_b])
+                let mref = ctx.alloc_methodref(mref);
+                ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
             }
-            _ => eq!(
-                lt_unchecked(ty_a, ops_a, ops_b, ctx),
-                V1Node::V2(ctx.alloc_node(false))
-            ),
+            _ => {
+                let lt = lt_unchecked(ty_a, ops_a, ops_b, ctx);
+                let f = ctx.alloc_node(false);
+                ctx.biop(lt, f, V2BinOp::Eq)
+            }
         },
         BinOp::Le => match ty_a.kind() {
             // Unordered, to handle NaNs propely
             TyKind::Float(FloatTy::F32 | FloatTy::F64) => {
-                eq!(gt_un!(ops_a, ops_b), V1Node::V2(ctx.alloc_node(false)))
+                let gt = ctx.biop(ops_a, ops_b, V2BinOp::GtUn);
+                let f = ctx.alloc_node(false);
+                ctx.biop(gt, f, V2BinOp::Eq)
             }
             TyKind::Float(FloatTy::F128) => {
                 let mref = MethodRef::new(
@@ -108,12 +114,14 @@ pub(crate) fn binop<'tcx>(
                     MethodKind::Static,
                     vec![].into(),
                 );
-                call!(ctx.alloc_methodref(mref), [ops_a, ops_b])
+                let mref = ctx.alloc_methodref(mref);
+                ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
             }
-            _ => eq!(
-                gt_unchecked(ty_a, ops_a, ops_b, ctx),
-                V1Node::V2(ctx.alloc_node(false))
-            ),
+            _ => {
+                let gt = gt_unchecked(ty_a, ops_a, ops_b, ctx);
+                let f = ctx.alloc_node(false);
+                ctx.biop(gt, f, V2BinOp::Eq)
+            }
         },
         BinOp::Offset => {
             let pointed_ty = if let TyKind::RawPtr(inner, _) = ty_a.kind() {
@@ -128,14 +136,10 @@ pub(crate) fn binop<'tcx>(
             } else {
                 let pointed_type = ctx.type_from_cache(pointed_ty);
                 let offset_tpe = ctx.type_from_cache(ty_b);
-                ops_a
-                    + ops_b
-                        * crate::casts::int_to_int(
-                            Type::Int(Int::U64),
-                            offset_tpe,
-                            V1Node::V2(ctx.size_of(pointed_type).into_idx(ctx)),
-                            ctx,
-                        )
+                let size = ctx.size_of(pointed_type).into_idx(ctx);
+                let scaled = crate::casts::int_to_int(Type::Int(Int::U64), offset_tpe, size, ctx);
+                let off = ctx.biop(ops_b, scaled, V2BinOp::Mul);
+                ctx.biop(ops_a, off, V2BinOp::Add)
             }
         }
         BinOp::Cmp => {
@@ -150,11 +154,14 @@ pub(crate) fn binop<'tcx>(
                 rustc_middle::ty::TypingEnv::fully_monomorphized(),
             );
             let ordering_type = ctx.type_from_cache(ordering_ty);
-            let lt = -conv_i8!(lt_unchecked(ty_a, ops_a.clone(), ops_b.clone(), ctx));
-            let gt = conv_i8!(gt_unchecked(ty_a, ops_a, ops_b, ctx));
-            let res = lt | gt;
+            let lt = lt_unchecked(ty_a, ops_a, ops_b, ctx);
+            let lt = ctx.int_cast(lt, Int::I8, ExtendKind::SignExtend);
+            let lt = ctx.neg(lt);
+            let gt = gt_unchecked(ty_a, ops_a, ops_b, ctx);
+            let gt = ctx.int_cast(gt, Int::I8, ExtendKind::SignExtend);
+            let res = ctx.biop(lt, gt, V2BinOp::Or);
 
-            res.transmute_on_stack(Type::Int(Int::I8), ordering_type, ctx)
+            ctx.transmute_on_stack(Type::Int(Int::I8), ordering_type, res)
         }
     }
 }
@@ -163,9 +170,9 @@ pub fn add_unchecked<'tcx>(
     ty_a: Ty<'tcx>,
     ty_b: Ty<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    ops_a: V1Node,
-    ops_b: V1Node,
-) -> V1Node {
+    ops_a: Node,
+    ops_b: Node,
+) -> Node {
     match ty_a.kind() {
         TyKind::Int(int_ty) => {
             if let IntTy::I128 = int_ty {
@@ -179,9 +186,10 @@ pub fn add_unchecked<'tcx>(
                     MethodKind::Static,
                     vec![].into(),
                 );
-                call!(ctx.alloc_methodref(mref), [ops_a, ops_b])
+                let mref = ctx.alloc_methodref(mref);
+                ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
             } else {
-                ops_a + ops_b
+                ctx.biop(ops_a, ops_b, V2BinOp::Add)
             }
         }
         TyKind::Uint(uint_ty) => {
@@ -196,18 +204,20 @@ pub fn add_unchecked<'tcx>(
                     MethodKind::Static,
                     vec![].into(),
                 );
-                call!(ctx.alloc_methodref(mref), [ops_a, ops_b])
+                let mref = ctx.alloc_methodref(mref);
+                ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
             } else {
+                let sum = ctx.biop(ops_a, ops_b, V2BinOp::Add);
                 match uint_ty {
-                    UintTy::U8 => conv_u8!(ops_a + ops_b),
-                    UintTy::U16 => conv_u16!(ops_a + ops_b),
-                    UintTy::U32 => conv_u32!(ops_a + ops_b),
-                    UintTy::U64 => conv_u64!(ops_a + ops_b),
-                    _ => ops_a + ops_b,
+                    UintTy::U8 => ctx.int_cast(sum, Int::U8, ExtendKind::ZeroExtend),
+                    UintTy::U16 => ctx.int_cast(sum, Int::U16, ExtendKind::ZeroExtend),
+                    UintTy::U32 => ctx.int_cast(sum, Int::U32, ExtendKind::ZeroExtend),
+                    UintTy::U64 => ctx.int_cast(sum, Int::U64, ExtendKind::ZeroExtend),
+                    _ => sum,
                 }
             }
         }
-        TyKind::Float(FloatTy::F32 | FloatTy::F64) => ops_a + ops_b,
+        TyKind::Float(FloatTy::F32 | FloatTy::F64) => ctx.biop(ops_a, ops_b, V2BinOp::Add),
         TyKind::Float(FloatTy::F128) => {
             let mref = MethodRef::new(
                 *ctx.main_module(),
@@ -219,7 +229,8 @@ pub fn add_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [ops_a, ops_b,])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
         }
         TyKind::Float(FloatTy::F16) => {
             let mref = MethodRef::new(
@@ -232,7 +243,8 @@ pub fn add_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [ops_a, ops_b,])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
         }
         _ => todo!("can't add numbers of types {ty_a} and {ty_b}"),
     }
@@ -242,9 +254,9 @@ pub fn sub_unchecked<'tcx>(
     ty_a: Ty<'tcx>,
     ty_b: Ty<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    ops_a: V1Node,
-    ops_b: V1Node,
-) -> V1Node {
+    ops_a: Node,
+    ops_b: Node,
+) -> Node {
     match ty_a.kind() {
         TyKind::Int(int_ty) => {
             if let IntTy::I128 = int_ty {
@@ -258,9 +270,10 @@ pub fn sub_unchecked<'tcx>(
                     MethodKind::Static,
                     vec![].into(),
                 );
-                call!(ctx.alloc_methodref(mref), [ops_a, ops_b])
+                let mref = ctx.alloc_methodref(mref);
+                ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
             } else {
-                V1Node::Sub(Box::new(ops_a), Box::new(ops_b))
+                ctx.biop(ops_a, ops_b, V2BinOp::Sub)
             }
         }
         TyKind::Uint(uint_ty) => {
@@ -275,14 +288,13 @@ pub fn sub_unchecked<'tcx>(
                     MethodKind::Static,
                     vec![].into(),
                 );
-                call!(ctx.alloc_methodref(mref), [ops_a, ops_b])
+                let mref = ctx.alloc_methodref(mref);
+                ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
             } else {
-                V1Node::Sub(Box::new(ops_a), Box::new(ops_b))
+                ctx.biop(ops_a, ops_b, V2BinOp::Sub)
             }
         }
-        TyKind::Float(FloatTy::F32 | FloatTy::F64) => {
-            V1Node::Sub(Box::new(ops_a), Box::new(ops_b))
-        }
+        TyKind::Float(FloatTy::F32 | FloatTy::F64) => ctx.biop(ops_a, ops_b, V2BinOp::Sub),
         TyKind::Float(FloatTy::F128) => {
             let mref = MethodRef::new(
                 *ctx.main_module(),
@@ -294,7 +306,8 @@ pub fn sub_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [ops_a, ops_b])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
         }
         TyKind::Float(FloatTy::F16) => {
             let mref = MethodRef::new(
@@ -307,7 +320,8 @@ pub fn sub_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [ops_a, ops_b,])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
         }
         _ => todo!("can't sub numbers of types {ty_a} and {ty_b}"),
     }
@@ -317,9 +331,9 @@ fn rem_unchecked<'tcx>(
     ty_a: Ty<'tcx>,
     _ty_b: Ty<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    ops_a: V1Node,
-    ops_b: V1Node,
-) -> V1Node {
+    ops_a: Node,
+    ops_b: Node,
+) -> Node {
     match ty_a.kind() {
         TyKind::Int(IntTy::I128) => {
             let mref = MethodRef::new(
@@ -332,7 +346,8 @@ fn rem_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [ops_a, ops_b])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
         }
         TyKind::Uint(UintTy::U128) => {
             let mref = MethodRef::new(
@@ -345,10 +360,11 @@ fn rem_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [ops_a, ops_b])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
         }
         TyKind::Int(_) | TyKind::Char | TyKind::Float(FloatTy::F32 | FloatTy::F64) => {
-            rem!(ops_a, ops_b)
+            ctx.biop(ops_a, ops_b, V2BinOp::Rem)
         }
         TyKind::Float(FloatTy::F128) => {
             let mref = MethodRef::new(
@@ -361,7 +377,8 @@ fn rem_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [ops_a, ops_b])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
         }
         TyKind::Float(FloatTy::F16) => {
             let mref = MethodRef::new(
@@ -374,9 +391,10 @@ fn rem_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [ops_a, ops_b,])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
         }
-        TyKind::Uint(_) => rem_un!(ops_a, ops_b),
+        TyKind::Uint(_) => ctx.biop(ops_a, ops_b, V2BinOp::RemUn),
 
         _ => todo!(),
     }
@@ -386,9 +404,9 @@ fn mul_unchecked<'tcx>(
     ty_a: Ty<'tcx>,
 
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    operand_a: V1Node,
-    operand_b: V1Node,
-) -> V1Node {
+    operand_a: Node,
+    operand_b: Node,
+) -> Node {
     match ty_a.kind() {
         TyKind::Int(IntTy::I128) => {
             let mref = MethodRef::new(
@@ -401,7 +419,8 @@ fn mul_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [operand_a, operand_b])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
         }
         TyKind::Uint(UintTy::U128) => {
             let mref = MethodRef::new(
@@ -414,7 +433,8 @@ fn mul_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [operand_a, operand_b])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
         }
         TyKind::Float(FloatTy::F128) => {
             let mref = MethodRef::new(
@@ -427,7 +447,8 @@ fn mul_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [operand_a, operand_b])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
         }
         TyKind::Float(FloatTy::F16) => {
             let mref = MethodRef::new(
@@ -440,18 +461,19 @@ fn mul_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [operand_a, operand_b,])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
         }
-        _ => operand_a * operand_b,
+        _ => ctx.biop(operand_a, operand_b, V2BinOp::Mul),
     }
 }
 fn div_unchecked<'tcx>(
     ty_a: Ty<'tcx>,
 
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    operand_a: V1Node,
-    operand_b: V1Node,
-) -> V1Node {
+    operand_a: Node,
+    operand_b: Node,
+) -> Node {
     match ty_a.kind() {
         TyKind::Int(IntTy::I128) => {
             let mref = MethodRef::new(
@@ -464,7 +486,8 @@ fn div_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [operand_a, operand_b])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
         }
         TyKind::Uint(UintTy::U128) => {
             let mref = MethodRef::new(
@@ -477,11 +500,12 @@ fn div_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [operand_a, operand_b])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
         }
-        TyKind::Uint(_) => V1Node::DivUn(operand_a.into(), operand_b.into()),
+        TyKind::Uint(_) => ctx.biop(operand_a, operand_b, V2BinOp::DivUn),
         TyKind::Int(_) | TyKind::Char | TyKind::Float(FloatTy::F32 | FloatTy::F64) => {
-            V1Node::Div(Box::new(operand_a), Box::new(operand_b))
+            ctx.biop(operand_a, operand_b, V2BinOp::Div)
         }
         TyKind::Float(FloatTy::F128) => {
             let mref = MethodRef::new(
@@ -494,7 +518,8 @@ fn div_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [operand_a, operand_b])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
         }
         TyKind::Float(FloatTy::F16) => {
             let mref = MethodRef::new(
@@ -507,7 +532,8 @@ fn div_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [operand_a, operand_b,])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
         }
         _ => todo!(),
     }

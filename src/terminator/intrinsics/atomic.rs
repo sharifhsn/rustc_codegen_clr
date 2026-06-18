@@ -1,7 +1,7 @@
 use crate::assembly::MethodCompileCtx;
 use cilly::{
-    call, cil_node::V1Node, cil_root::V1Root, cilnode::MethodKind, conv_usize, ClassRef, Int,
-    MethodRef, Type,
+    cilnode::{ExtendKind, IsPure, MethodKind},
+    ClassRef, Int, Interned, MethodRef, Type,
 };
 use rustc_codegen_clr_place::{place_address, place_set};
 use rustc_codegen_clr_type::adt::field_descrptor;
@@ -9,11 +9,15 @@ use rustc_codegen_clr_type::GetTypeExt;
 use rustc_codgen_clr_operand::handle_operand;
 use rustc_middle::mir::{Operand, Place};
 use rustc_span::Spanned;
+
+type Node = Interned<cilly::v2::CILNode>;
+type Root = Interned<cilly::v2::CILRoot>;
+
 pub fn xchg<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
     let interlocked = ClassRef::interlocked(ctx);
     // *T
     let dst = handle_operand(&args[0].node, ctx);
@@ -37,11 +41,9 @@ pub fn xchg<'tcx>(
     );
     match src_type {
         Type::Int(Int::U8) => {
-            return place_set(
-                destination,
-                call!(ctx.alloc_methodref(xchng), [dst, new]),
-                ctx,
-            )
+            let xchng = ctx.alloc_methodref(xchng);
+            let call = ctx.call(xchng, &[dst, new], IsPure::NOT);
+            return place_set(destination, call, ctx);
         }
         Type::Ptr(_) => {
             let usize_ref = ctx.nref(Type::Int(Int::USize));
@@ -52,18 +54,13 @@ pub fn xchg<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            return place_set(
-                destination,
-                call!(
-                    ctx.alloc_methodref(call_site),
-                    [
-                        Box::new(dst).cast_ptr(ctx.nref(Type::Int(Int::USize))),
-                        conv_usize!(new),
-                    ]
-                )
-                .cast_ptr(src_type),
-                ctx,
-            );
+            let call_site = ctx.alloc_methodref(call_site);
+            let usize_ptr = ctx.nref(Type::Int(Int::USize));
+            let dst = ctx.cast_ptr_to(dst, usize_ptr);
+            let new = ctx.int_cast(new, Int::USize, ExtendKind::ZeroExtend);
+            let call = ctx.call(call_site, &[dst, new], IsPure::NOT);
+            let call = ctx.cast_ptr_to(call, src_type);
+            return place_set(destination, call, ctx);
         }
         Type::Int(Int::I8 | Int::U16 | Int::I16) | Type::Bool | Type::PlatformChar => {
             todo!("can't atomic_xchg {src_type:?}")
@@ -78,19 +75,17 @@ pub fn xchg<'tcx>(
         MethodKind::Static,
         vec![].into(),
     );
+    let call_site = ctx.alloc_methodref(call_site);
     // T
-    place_set(
-        destination,
-        call!(ctx.alloc_methodref(call_site), [dst, new]),
-        ctx,
-    )
+    let call = ctx.call(call_site, &[dst, new], IsPure::NOT);
+    place_set(destination, call, ctx)
 }
 pub fn cxchg<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
 
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> [V1Root; 2] {
+) -> [Root; 2] {
     let interlocked = ClassRef::interlocked(ctx);
     // *T
     let dst = handle_operand(&args[0].node, ctx);
@@ -122,18 +117,15 @@ pub fn cxchg<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(
-                ctx.alloc_methodref(call_site),
-                [
-                    Box::new(dst).cast_ptr(usize_ref),
-                    conv_usize!(value),
-                    conv_usize!(comparand.clone())
-                ]
-            )
-            .cast_ptr(src_type)
+            let call_site = ctx.alloc_methodref(call_site);
+            let dst = ctx.cast_ptr_to(dst, usize_ref);
+            let value = ctx.int_cast(value, Int::USize, ExtendKind::ZeroExtend);
+            let comparand = ctx.int_cast(comparand, Int::USize, ExtendKind::ZeroExtend);
+            let call = ctx.call(call_site, &[dst, value, comparand], IsPure::NOT);
+            ctx.cast_ptr_to(call, src_type)
         }
         // TODO: this is a bug, on purpose. The 1 byte compare exchange is not supported untill .NET 9. Remove after November, when .NET 9 Releases.
-        Type::Int(Int::U8) => comparand.clone(),
+        Type::Int(Int::U8) => comparand,
         _ => {
             let src_ref = ctx.nref(src_type);
             let call_site = MethodRef::new(
@@ -143,20 +135,38 @@ pub fn cxchg<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(
-                ctx.alloc_methodref(call_site),
-                [dst, value, comparand.clone()]
-            )
+            let call_site = ctx.alloc_methodref(call_site);
+            ctx.call(call_site, &[dst, value, comparand], IsPure::NOT)
         }
     };
     let dst_ty = destination.ty(ctx.body(), ctx.tcx());
     let val_desc = field_descrptor(dst_ty.ty, 0, ctx);
     let flag_desc = field_descrptor(dst_ty.ty, 1, ctx);
-    V1Node::cxchng_res_val(
+    cxchng_res_val(
         exchange_res,
         comparand,
         place_address(destination, ctx),
         val_desc,
         flag_desc,
+        ctx,
     )
+}
+/// Builds the two roots that store the compare-exchange result: the loaded `old_val`
+/// into the value field, and the `old_val == expected` flag into the flag field.
+/// V2 counterpart of `cilly::cil_node::V1Node::cxchng_res_val`.
+fn cxchng_res_val(
+    old_val: Node,
+    expected: Node,
+    destination_addr: Node,
+    val_desc: Interned<cilly::FieldDesc>,
+    flag_desc: Interned<cilly::FieldDesc>,
+    ctx: &mut MethodCompileCtx<'_, '_>,
+) -> [Root; 2] {
+    // Set the value of the result.
+    let set_val = ctx.set_field(val_desc, destination_addr, old_val);
+    // Get the result back
+    let val = ctx.ld_field(destination_addr, val_desc);
+    let cmp = ctx.biop(val, expected, cilly::BinOp::Eq);
+    let set_flag = ctx.set_field(flag_desc, destination_addr, cmp);
+    [set_val, set_flag]
 }

@@ -1,21 +1,22 @@
 use crate::assembly::MethodCompileCtx;
 use cilly::{
-    and, call,
-    cil_node::V1Node,
-    or, xor, Type,
-    {cilnode::MethodKind, ClassRef, Int, MethodRef},
+    cilnode::{IsPure, MethodKind},
+    BinOp, Interned, Type,
+    {ClassRef, Int, MethodRef},
 };
 use rustc_codegen_clr_type::GetTypeExt;
 use rustc_middle::span_bug;
 use rustc_middle::ty::{IntTy, Ty, TyKind, UintTy};
 
+type Node = Interned<cilly::v2::CILNode>;
+
 pub fn bit_and_unchecked<'tcx>(
     ty_a: Ty<'tcx>,
     ty_b: Ty<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    operand_a: V1Node,
-    operand_b: V1Node,
-) -> V1Node {
+    operand_a: Node,
+    operand_b: Node,
+) -> Node {
     let type_b = ctx.type_from_cache(ty_b);
     match ty_a.kind() {
         TyKind::Uint(UintTy::U128) => {
@@ -29,13 +30,9 @@ pub fn bit_and_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(
-                ctx.alloc_methodref(mref),
-                [
-                    operand_a,
-                    crate::casts::int_to_int(type_b, Type::Int(Int::U128), operand_b, ctx)
-                ]
-            )
+            let b = crate::casts::int_to_int(type_b, Type::Int(Int::U128), operand_b, ctx);
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[operand_a, b], IsPure::NOT)
         }
         TyKind::Int(IntTy::I128) => {
             let mref = MethodRef::new(
@@ -48,25 +45,21 @@ pub fn bit_and_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(
-                ctx.alloc_methodref(mref),
-                [
-                    operand_a,
-                    crate::casts::int_to_int(type_b, Type::Int(Int::I128), operand_b, ctx)
-                ]
-            )
+            let b = crate::casts::int_to_int(type_b, Type::Int(Int::I128), operand_b, ctx);
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[operand_a, b], IsPure::NOT)
         }
         TyKind::RawPtr(..) => span_bug!(ctx.span(), "bitand of ptr"),
-        _ => and!(operand_a, operand_b),
+        _ => ctx.biop(operand_a, operand_b, BinOp::And),
     }
 }
 pub fn bit_or_unchecked<'tcx>(
     ty_a: Ty<'tcx>,
     ty_b: Ty<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    operand_a: V1Node,
-    operand_b: V1Node,
-) -> V1Node {
+    operand_a: Node,
+    operand_b: Node,
+) -> Node {
     match ty_a.kind() {
         TyKind::Int(IntTy::I128) => {
             let ty_a = ctx.type_from_cache(ty_a);
@@ -78,7 +71,8 @@ pub fn bit_or_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [operand_a, operand_b])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
         }
         TyKind::Uint(UintTy::U128) => {
             let ty_a = ctx.type_from_cache(ty_a);
@@ -90,18 +84,19 @@ pub fn bit_or_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [operand_a, operand_b])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
         }
-        _ => or!(operand_a, operand_b),
+        _ => ctx.biop(operand_a, operand_b, BinOp::Or),
     }
 }
 pub fn bit_xor_unchecked<'tcx>(
     ty_a: Ty<'tcx>,
     ty_b: Ty<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    ops_a: V1Node,
-    ops_b: V1Node,
-) -> V1Node {
+    ops_a: Node,
+    ops_b: Node,
+) -> Node {
     match ty_a.kind() {
         TyKind::Int(IntTy::I128) => {
             let ty_a = ctx.type_from_cache(ty_a);
@@ -113,7 +108,8 @@ pub fn bit_xor_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [ops_a, ops_b])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
         }
         TyKind::Uint(UintTy::U128) => {
             let ty_a = ctx.type_from_cache(ty_a);
@@ -125,8 +121,9 @@ pub fn bit_xor_unchecked<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            call!(ctx.alloc_methodref(mref), [ops_a, ops_b])
+            let mref = ctx.alloc_methodref(mref);
+            ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
         }
-        _ => xor!(ops_a, ops_b),
+        _ => ctx.biop(ops_a, ops_b, BinOp::XOr),
     }
 }

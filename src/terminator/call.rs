@@ -8,11 +8,8 @@ use crate::{
     },
 };
 use cilly::{
-    call, call_virt,
-    cil_node::{CallOpArgs, V1Node},
-    cil_root::V1Root,
-    cilnode::{IsPure, MethodKind},
-    conv_usize, ld_field, ClassRef, Const, FieldDesc, FnSig, Int, IntoAsmIndex,
+    cilnode::{ExtendKind, IsPure, MethodKind},
+    BinOp, ClassRef, Const, FieldDesc, FnSig, Int, Interned, IntoAsmIndex,
 };
 use cilly::{MethodRef, Type};
 use rustc_codegen_clr_call::CallInfo;
@@ -26,6 +23,11 @@ use rustc_middle::{
     ty::{GenericArg, Instance, Ty, TyKind},
 };
 use rustc_span::Spanned;
+
+type Node = Interned<cilly::v2::CILNode>;
+type Root = Interned<cilly::v2::CILRoot>;
+const EMPTY_ARGS: &[Node] = &[];
+
 fn argc_from_fn_name(function_name: &str, prefix: &str) -> u32 {
     let argc_start = function_name.find(prefix).unwrap() + (prefix.len());
     let argc_end = argc_start + function_name[argc_start..].find('_').unwrap();
@@ -40,7 +42,7 @@ fn call_managed<'tcx>(
     destination: &Place<'tcx>,
     fn_instance: Instance<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
     let argument_count = argc_from_fn_name(function_name, MANAGED_CALL_FN_NAME);
     //FIXME: figure out the proper argc.
     //assert!(subst_ref.len() as u32 == argc + 3 || subst_ref.len() as u32 == argc + 4);
@@ -68,12 +70,10 @@ fn call_managed<'tcx>(
         );
         let call_site = ctx.alloc_methodref(call_site);
         if *signature.output() == cilly::Type::Void {
-            V1Root::Call {
-                site: call_site,
-                args: [].into(),
-            }
+            ctx.call_root(call_site, EMPTY_ARGS, IsPure::NOT)
         } else {
-            place_set(destination, call!(call_site, []), ctx)
+            let call = ctx.call(call_site, EMPTY_ARGS, IsPure::NOT);
+            place_set(destination, call, ctx)
         }
     } else {
         let is_static = garag_to_bool(subst_ref[4], ctx.tcx());
@@ -95,12 +95,10 @@ fn call_managed<'tcx>(
         );
         let call = ctx.alloc_methodref(call);
         if *signature.output() == cilly::Type::Void {
-            V1Root::Call {
-                site: call,
-                args: call_args.into(),
-            }
+            ctx.call_root(call, &call_args, IsPure::NOT)
         } else {
-            place_set(destination, call!(call, call_args), ctx)
+            let node = ctx.call(call, &call_args, IsPure::NOT);
+            place_set(destination, node, ctx)
         }
     }
 }
@@ -112,7 +110,7 @@ fn callvirt_managed<'tcx>(
     destination: &Place<'tcx>,
     fn_instance: Instance<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
     let argument_count = argc_from_fn_name(function_name, MANAGED_CALL_VIRT_FN_NAME);
     //assert!(subst_ref.len() as u32 == argc + 3 || subst_ref.len() as u32 == argc + 4);
     assert!(
@@ -142,12 +140,10 @@ fn callvirt_managed<'tcx>(
         );
         let call = ctx.alloc_methodref(call);
         if *signature.output() == cilly::Type::Void {
-            V1Root::CallVirt {
-                site: call,
-                args: [].into(),
-            }
+            ctx.call_root(call, EMPTY_ARGS, IsPure::NOT)
         } else {
-            place_set(destination, call_virt!(call, []), ctx)
+            let node = ctx.call(call, EMPTY_ARGS, IsPure::NOT);
+            place_set(destination, node, ctx)
         }
     } else {
         let is_static = garag_to_bool(subst_ref[4], ctx.tcx());
@@ -167,17 +163,12 @@ fn callvirt_managed<'tcx>(
             },
             vec![].into(),
         );
+        let call = ctx.alloc_methodref(call);
         if *signature.output() == cilly::Type::Void {
-            V1Root::CallVirt {
-                site: ctx.alloc_methodref(call),
-                args: call_args.into(),
-            }
+            ctx.call_root(call, &call_args, IsPure::NOT)
         } else {
-            place_set(
-                destination,
-                call_virt!(ctx.alloc_methodref(call), call_args),
-                ctx,
-            )
+            let node = ctx.call(call, &call_args, IsPure::NOT);
+            place_set(destination, node, ctx)
         }
     }
 }
@@ -188,7 +179,7 @@ fn call_ctor<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
     let argument_count = argc_from_fn_name(function_name, CTOR_FN_NAME);
     // Check that there are enough function path and argument specifers
     assert!(subst_ref.len() == argument_count as usize + 3);
@@ -213,15 +204,9 @@ fn call_ctor<'tcx>(
             MethodKind::Constructor,
             vec![].into(),
         );
-        place_set(
-            destination,
-            V1Node::NewObj(Box::new(CallOpArgs {
-                site: ctx.alloc_methodref(mref),
-                args: [].into(),
-                is_pure: IsPure::NOT,
-            })),
-            ctx,
-        )
+        let mref = ctx.alloc_methodref(mref);
+        let node = ctx.call(mref, EMPTY_ARGS, IsPure::NOT);
+        place_set(destination, node, ctx)
     } else {
         let mut inputs: Vec<_> = subst_ref[3..]
             .iter()
@@ -246,15 +231,9 @@ fn call_ctor<'tcx>(
             MethodKind::Constructor,
             vec![].into(),
         );
-        place_set(
-            destination,
-            V1Node::NewObj(Box::new(CallOpArgs {
-                site: ctx.alloc_methodref(ctor),
-                args: call.into(),
-                is_pure: IsPure::NOT,
-            })),
-            ctx,
-        )
+        let ctor = ctx.alloc_methodref(ctor);
+        let node = ctx.call(ctor, &call, IsPure::NOT);
+        place_set(destination, node, ctx)
     }
 }
 pub fn call_closure<'tcx>(
@@ -263,7 +242,7 @@ pub fn call_closure<'tcx>(
     sig: FnSig,
     function_name: &str,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
     let last_arg = args
         .last()
         .expect("Closure must be called with at least 2 arguments(closure + arg tuple)");
@@ -285,7 +264,8 @@ pub fn call_closure<'tcx>(
                 for (index, element) in elements.iter().enumerate() {
                     let element_type = ctx.type_from_cache(element);
                     if element_type == Type::Void {
-                        call_args.push(V1Node::uninit_val(Type::Void, ctx));
+                        let u = ctx.uninit_val(Type::Void);
+                        call_args.push(u);
                         continue;
                     }
                     let tuple_element_name = format!("Item{}", index + 1);
@@ -294,11 +274,10 @@ pub fn call_closure<'tcx>(
                         ctx.alloc_string(tuple_element_name),
                         element_type,
                     );
-
-                    call_args.push(ld_field!(
-                        handle_operand(&last_arg.node, ctx),
-                        ctx.alloc_field(field_descriptor)
-                    ));
+                    let desc = ctx.alloc_field(field_descriptor);
+                    let obj = handle_operand(&last_arg.node, ctx);
+                    let fld = ctx.ld_field(obj, desc);
+                    call_args.push(fld);
                 }
 
                 //todo!("Can't unbox tupels yet!")
@@ -320,12 +299,10 @@ pub fn call_closure<'tcx>(
     // Hande the call itself
     let call = ctx.alloc_methodref(call);
     if is_void {
-        V1Root::Call {
-            site: call,
-            args: call_args.into(),
-        }
+        ctx.call_root(call, &call_args, IsPure::NOT)
     } else {
-        place_set(destination, call!(call, call_args), ctx)
+        let node = ctx.call(call, &call_args, IsPure::NOT);
+        place_set(destination, node, ctx)
     }
 }
 pub fn call_inner<'tcx>(
@@ -335,7 +312,7 @@ pub fn call_inner<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
     span: rustc_span::Span,
-) -> Vec<V1Root> {
+) -> Vec<Root> {
     if let rustc_middle::ty::InstanceKind::Virtual(_def, fn_idx) = instance.def {
         assert!(!args.is_empty());
 
@@ -346,16 +323,14 @@ pub fn call_inner<'tcx>(
             ctx.alloc_string(crate::METADATA),
             Type::Int(Int::USize),
         );
-        let vtable_ptr = ld_field!(
-            fat_ptr_address.clone(),
-            ctx.alloc_field(vtable_ptr_field_desc)
-        );
+        let vtable_ptr_field_desc = ctx.alloc_field(vtable_ptr_field_desc);
+        let vtable_ptr = ctx.ld_field(fat_ptr_address, vtable_ptr_field_desc);
 
-        let vtable_index = V1Node::V2(
-            ctx.alloc_node(i32::try_from(fn_idx).expect("More tahn 2^31 functions in a vtable!")),
-        );
-        let vtable_offset =
-            conv_usize!(vtable_index * V1Node::V2(ctx.size_of(Int::ISize).into_idx(ctx)));
+        let vtable_index = ctx
+            .alloc_node(i32::try_from(fn_idx).expect("More tahn 2^31 functions in a vtable!"));
+        let size = ctx.size_of(Int::ISize).into_idx(ctx);
+        let vtable_offset = ctx.biop(vtable_index, size, BinOp::Mul);
+        let vtable_offset = ctx.int_cast(vtable_offset, Int::USize, ExtendKind::ZeroExtend);
         // Get the address of the function ptr, and load it
         let obj_ptr_field_desc = FieldDesc::new(
             ctx.alloc_class_ref(ClassRef::new(fat_ptr_dyn, None, true, [].into())),
@@ -363,7 +338,8 @@ pub fn call_inner<'tcx>(
             ctx.nptr(Type::Void),
         );
         // Get the addres of the object
-        let obj_ptr = ld_field!(fat_ptr_address, ctx.alloc_field(obj_ptr_field_desc));
+        let obj_ptr_field_desc = ctx.alloc_field(obj_ptr_field_desc);
+        let obj_ptr = ctx.ld_field(fat_ptr_address, obj_ptr_field_desc);
         // Get the call info
         let call_info = CallInfo::sig_from_instance_(instance, ctx);
 
@@ -391,7 +367,8 @@ pub fn call_inner<'tcx>(
                         for (index, element) in elements.iter().enumerate() {
                             let element_type = ctx.type_from_cache(element);
                             if element_type == Type::Void {
-                                call_args.push(V1Node::uninit_val(Type::Void, ctx));
+                                let u = ctx.uninit_val(Type::Void);
+                                call_args.push(u);
                                 continue;
                             }
                             let tuple_element_name = format!("Item{}", index + 1);
@@ -400,10 +377,10 @@ pub fn call_inner<'tcx>(
                                 ctx.alloc_string(tuple_element_name),
                                 element_type,
                             );
-                            call_args.push(ld_field!(
-                                handle_operand(&last_arg.node, ctx),
-                                ctx.alloc_field(field_descriptor)
-                            ));
+                            let desc = ctx.alloc_field(field_descriptor);
+                            let obj = handle_operand(&last_arg.node, ctx);
+                            let fld = ctx.ld_field(obj, desc);
+                            call_args.push(fld);
                         }
                     }
                 }
@@ -415,10 +392,10 @@ pub fn call_inner<'tcx>(
             }
         }
         let sig = ctx.alloc_sig(signature.clone());
-        let fn_ptr = V1Node::LDIndPtr {
-            ptr: Box::new((vtable_ptr + vtable_offset).cast_ptr(ctx.nptr(Type::FnPtr(sig)))),
-            loaded_ptr: Box::new(Type::FnPtr(sig)),
-        };
+        let fn_ptr_addr = ctx.biop(vtable_ptr, vtable_offset, BinOp::Add);
+        let fn_ptr_ptr = ctx.nptr(Type::FnPtr(sig));
+        let fn_ptr_addr = ctx.cast_ptr(fn_ptr_addr, fn_ptr_ptr);
+        let fn_ptr = ctx.load(fn_ptr_addr, Type::FnPtr(sig));
         assert_eq!(
             signature.inputs().len(),
             call_args.len(),
@@ -426,17 +403,10 @@ pub fn call_inner<'tcx>(
         );
         let is_ret_void = matches!(signature.output(), cilly::Type::Void);
         return if is_ret_void {
-            vec![V1Root::CallI {
-                sig: Box::new(signature),
-                fn_ptr: Box::new(fn_ptr),
-                args: call_args.into(),
-            }]
+            vec![ctx.call_indirect_root(sig, fn_ptr, call_args)]
         } else {
-            vec![place_set(
-                destination,
-                V1Node::CallI(Box::new((signature, fn_ptr, call_args.into()))),
-                ctx,
-            )]
+            let call = ctx.call_indirect(sig, fn_ptr, call_args);
+            vec![place_set(destination, call, ctx)]
         };
     }
     let call_info = CallInfo::sig_from_instance_(instance, ctx);
@@ -501,13 +471,9 @@ pub fn call_inner<'tcx>(
             "Managed calls may not use the `rust_call` calling convention!"
         );
         // Not-Virtual (for interop)
-        return vec![place_set(
-            destination,
-            V1Node::LDLen {
-                arr: Box::new(handle_operand(&args[0].node, ctx)),
-            },
-            ctx,
-        )];
+        let arr = handle_operand(&args[0].node, ctx);
+        let len = ctx.ld_len(arr);
+        return vec![place_set(destination, len, ctx)];
     } else if function_name.contains(MANAGED_LD_NULL) {
         assert!(
             !call_info.split_last_tuple(),
@@ -519,11 +485,8 @@ pub fn call_inner<'tcx>(
             .as_class_ref()
             .unwrap();
 
-        return vec![place_set(
-            destination,
-            ctx.alloc_node(Const::Null(tpe)).into(),
-            ctx,
-        )];
+        let node = ctx.alloc_node(Const::Null(tpe));
+        return vec![place_set(destination, node, ctx)];
     } else if function_name.contains(MANAGED_CHECKED_CAST) {
         let tpe = ctx
             .type_from_cache(instance.args[0].as_type().unwrap())
@@ -531,11 +494,8 @@ pub fn call_inner<'tcx>(
             .unwrap();
         let input = handle_operand(&args[0].node, ctx);
         // Not-Virtual (for interop)
-        return vec![place_set(
-            destination,
-            V1Node::CheckedCast(Box::new((input, tpe))),
-            ctx,
-        )];
+        let node = ctx.checked_cast(input, tpe);
+        return vec![place_set(destination, node, ctx)];
     } else if function_name.contains(MANAGED_IS_INST) {
         let tpe = ctx
             .type_from_cache(instance.args[0].as_type().unwrap())
@@ -543,25 +503,18 @@ pub fn call_inner<'tcx>(
             .unwrap();
         let input = handle_operand(&args[0].node, ctx);
         // Not-Virtual (for interop)
-        return vec![place_set(
-            destination,
-            V1Node::IsInst(Box::new((input, tpe))),
-            ctx,
-        )];
+        let node = ctx.is_inst(input, tpe);
+        return vec![place_set(destination, node, ctx)];
     } else if function_name.contains(MANAGED_LD_ELEM_REF) {
         assert!(
             !call_info.split_last_tuple(),
             "Managed calls may not use the `rust_call` calling convention!"
         );
         // Not-Virtual (for interop)
-        return vec![place_set(
-            destination,
-            V1Node::LDElelemRef {
-                arr: Box::new(handle_operand(&args[0].node, ctx)),
-                idx: Box::new(handle_operand(&args[1].node, ctx)),
-            },
-            ctx,
-        )];
+        let arr = handle_operand(&args[0].node, ctx);
+        let idx = handle_operand(&args[1].node, ctx);
+        let node = ctx.ld_elem_ref(arr, idx);
+        return vec![place_set(destination, node, ctx)];
     } else if function_name.contains(MANAGED_TRY_CATCH) {
         assert!(
             !call_info.split_last_tuple(),
@@ -587,11 +540,9 @@ pub fn call_inner<'tcx>(
             MethodKind::Static,
             vec![].into(),
         );
-        return vec![place_set(
-            destination,
-            call!(ctx.alloc_methodref(try_catch), [try_fn, data_ptr, catch_fn]),
-            ctx,
-        )];
+        let try_catch = ctx.alloc_methodref(try_catch);
+        let node = ctx.call(try_catch, &[try_fn, data_ptr, catch_fn], IsPure::NOT);
+        return vec![place_set(destination, node, ctx)];
     }
     if call_info.split_last_tuple() {
         return vec![call_closure(
@@ -623,14 +574,15 @@ pub fn call_inner<'tcx>(
         //assert_eq!(args.len() + 1,signature.inputs().len(),"ERROR: mismatched argument count. \nsignature inputs:{:?} \narguments:{args:?}\narg_len:{arg_len}\n",signature.inputs());
         // assert_eq!(signature.inputs()[signature.inputs().len() - 1],tpe);
         //FIXME:This assembles a panic location from uninitialized memory. This WILL lead to bugs once unwinding is added. The fields `file`,`col`, and `line` should be set there.
-        call_args.push(V1Node::uninit_val(tpe, ctx));
+        let u = ctx.uninit_val(tpe);
+        call_args.push(u);
         //panic!("Call with PanicLocation!");
     }
     //assert_eq!(args.len(),signature.inputs().len(),"CALL SIGNATURE ARG COUNT MISMATCH!");
     let is_void = matches!(signature.output(), cilly::Type::Void);
     //rustc_middle::ty::print::with_no_trimmed_paths! {call.push(CILOp::Comment(format!("Calling {instance:?}").into()))};
     if let InstanceKind::DropGlue(_def, None) = instance.def {
-        return vec![V1Root::Nop];
+        return vec![ctx.alloc_root(cilly::CILRoot::Nop)];
     }
     let call_site = MethodRef::new(
         *ctx.main_module(),
@@ -642,12 +594,9 @@ pub fn call_inner<'tcx>(
     // Handle
     let site = ctx.alloc_methodref(call_site);
     if is_void {
-        vec![V1Root::Call {
-            site,
-            args: call_args.into(),
-        }]
+        vec![ctx.call_root(site, &call_args, IsPure::NOT)]
     } else {
-        let res_calc = call!(site, call_args);
+        let res_calc = ctx.call(site, &call_args, IsPure::NOT);
         vec![place_set(destination, res_calc, ctx)]
     }
 }
@@ -658,7 +607,7 @@ pub fn call<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
     span: rustc_span::Span,
-) -> Vec<V1Root> {
+) -> Vec<Root> {
     let fn_type = ctx.monomorphize(fn_type);
     let instance = if let TyKind::FnDef(def_id, subst_ref) = fn_type.kind() {
         let subst = ctx.monomorphize(*subst_ref);

@@ -1,8 +1,8 @@
 use super::PlaceTy;
 use crate::pointer_to_is_fat;
 use cilly::{
-    Assembly, Const, FieldDesc, Int, Interned, IntoAsmIndex, MethodRef, Type, call,
-    cil_node::V1Node, cilnode::MethodKind, conv_usize, ld_field,
+    Assembly, BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, MethodRef, Type,
+    cilnode::{ExtendKind, MethodKind},
 };
 use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_type::{
@@ -41,8 +41,8 @@ pub fn address_last_dereference<'tcx>(
     target_ty: Ty<'tcx>,
     curr_type: PlaceTy<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    addr_calc: V1Node,
-) -> V1Node {
+    addr_calc: Interned<cilly::v2::CILNode>,
+) -> Interned<cilly::v2::CILNode> {
     let curr_type = match curr_type {
         PlaceTy::Ty(curr_type) => curr_type,
         // Enums don't require any special handling
@@ -60,33 +60,27 @@ pub fn address_last_dereference<'tcx>(
         (true, false) => {
             let data_ptr_name = ctx.alloc_string(cilly::DATA_PTR);
             let void_ptr = ctx.nptr(Type::Void);
-            V1Node::LDIndPtr {
-                ptr: Box::new(V1Node::LDField {
-                    field: ctx.alloc_field(FieldDesc::new(
-                        curr_type.as_class_ref().unwrap(),
-                        data_ptr_name,
-                        void_ptr,
-                    )),
-                    addr: addr_calc.into(),
-                }),
-                loaded_ptr: Box::new(ctx.nptr(target_type)),
-            }
+            let field = ctx.alloc_field(FieldDesc::new(
+                curr_type.as_class_ref().unwrap(),
+                data_ptr_name,
+                void_ptr,
+            ));
+            let data_ptr = ctx.ld_field(addr_calc, field);
+            let loaded_ptr = ctx.nptr(target_type);
+            ctx.load(data_ptr, loaded_ptr)
         }
         (false, true) => panic!("Invalid last dereference in address!"),
         (false, false) => addr_calc,
-        (true, true) => V1Node::LdObj {
-            ptr: Box::new(addr_calc),
-            obj: Box::new(curr_type),
-        },
+        (true, true) => ctx.load(addr_calc, curr_type),
     }
 }
 fn field_address<'a>(
     curr_type: super::PlaceTy<'a>,
     ctx: &mut MethodCompileCtx<'a, '_>,
-    addr_calc: V1Node,
+    addr_calc: Interned<cilly::v2::CILNode>,
     field_index: u32,
     field_type: Ty<'a>,
-) -> V1Node {
+) -> Interned<cilly::v2::CILNode> {
     match curr_type {
         super::PlaceTy::Ty(curr_type) => {
             let curr_type = ctx.monomorphize(curr_type);
@@ -97,10 +91,7 @@ fn field_address<'a>(
             ) {
                 (false, false) => {
                     let field_desc = field_descrptor(curr_type, field_index, ctx);
-                    V1Node::LDFieldAdress {
-                        addr: addr_calc.into(),
-                        field: (field_desc),
-                    }
+                    ctx.ld_field_addr(addr_calc, field_desc)
                 }
                 (false, true) => panic!(
                     "Sized type {curr_type:?} contains an unsized field of type {field_ty}. This is a bug."
@@ -124,11 +115,12 @@ fn field_address<'a>(
                         void_ptr,
                     ));
                     // Get the address of the unsized object.
-                    let obj_addr = ld_field!(addr_calc, addr_descr);
+                    let obj_addr = ctx.ld_field(addr_calc, addr_descr);
                     let obj = ctx.type_from_cache(field_type);
                     // Add the offset to the object.
-                    (obj_addr + V1Node::V2(ctx.alloc_node(Const::USize(u64::from(offset)))))
-                        .cast_ptr(ctx.nptr(obj))
+                    let obj_addr = ctx.biop(obj_addr, Const::USize(u64::from(offset)), BinOp::Add);
+                    let obj_ptr = ctx.nptr(obj);
+                    ctx.cast_ptr(obj_addr, obj_ptr)
                 }
                 (true, true) => {
                     let mut explicit_offset_iter =
@@ -151,31 +143,27 @@ fn field_address<'a>(
                         void_ptr,
                     ));
                     // Get the address of the unsized object.
-                    let obj_addr = ld_field!(addr_calc.clone(), addr_descr);
+                    let obj_addr = ctx.ld_field(addr_calc, addr_descr);
                     let metadata_descr = ctx.alloc_field(FieldDesc::new(
                         curr_type_fat_ptr.as_class_ref().unwrap(),
                         metadata_name,
                         Type::Int(Int::USize),
                     ));
-                    let metadata = ld_field!(addr_calc, metadata_descr);
-                    let ptr =
-                        obj_addr + V1Node::V2(ctx.alloc_node(Const::USize(u64::from(offset))));
+                    let metadata = ctx.ld_field(addr_calc, metadata_descr);
+                    let ptr = ctx.biop(obj_addr, Const::USize(u64::from(offset)), BinOp::Add);
                     let field_fat_ptr = ctx.type_from_cache(Ty::new_ptr(
                         ctx.tcx(),
                         field_ty,
                         rustc_middle::ty::Mutability::Mut,
                     ));
-                    V1Node::create_slice(field_fat_ptr.as_class_ref().unwrap(), ctx, metadata, ptr)
+                    ctx.create_slice(field_fat_ptr.as_class_ref().unwrap(), ptr, metadata)
                 }
             }
         }
         super::PlaceTy::EnumVariant(enm, var_idx) => {
             let owner = ctx.monomorphize(enm);
             let field_desc = enum_field_descriptor(owner, field_index, var_idx, ctx);
-            V1Node::LDFieldAdress {
-                addr: addr_calc.into(),
-                field: field_desc,
-            }
+            ctx.ld_field_addr(addr_calc, field_desc)
         }
     }
 }
@@ -184,8 +172,8 @@ pub fn place_elem_address<'tcx>(
     curr_type: PlaceTy<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     place_ty: Ty<'tcx>,
-    addr_calc: V1Node,
-) -> V1Node {
+    addr_calc: Interned<cilly::v2::CILNode>,
+) -> Interned<cilly::v2::CILNode> {
     let curr_type = curr_type.monomorphize(ctx);
 
     match place_elem {
@@ -217,12 +205,14 @@ pub fn place_elem_address<'tcx>(
                         extend: cilly::cilnode::ExtendKind::ZeroExtend,
                     });
                     let offset = ctx.biop(index, size, cilly::BinOp::Mul);
-                    (ld_field!(addr_calc.clone(), desc)).cast_ptr(ctx.nptr(inner_type))
-                        + V1Node::V2(offset)
+                    let data_ptr = ctx.ld_field(addr_calc, desc);
+                    let data_ptr = ctx.cast_ptr(data_ptr, inner_type);
+                    ctx.biop(data_ptr, offset, BinOp::Add)
                 }
                 TyKind::Array(element, _) => {
                     let mref = array_get_address(ctx, *element, curr_ty);
-                    call!(ctx.alloc_methodref(mref), [addr_calc, V1Node::V2(index)])
+                    let mref = ctx.alloc_methodref(mref);
+                    ctx.call(mref, &[addr_calc, index], cilly::cilnode::IsPure::NOT)
                 }
                 _ => {
                     todo!("Can't index into {curr_ty}!")
@@ -250,30 +240,32 @@ pub fn place_elem_address<'tcx>(
                 let ptr_field = ctx.alloc_field(FieldDesc::new(curr_type, data_ptr_name, void_ptr));
                 // len = end - start
                 // [from..slice.len() - to] -> (slice.len() - to) - from -> (slice.len() - (to + from)
-                let metadata = V1Node::Sub(
-                    Box::new(ld_field!(addr_calc.clone(), metadata_field)),
-                    Box::new(V1Node::V2(ctx.alloc_node(Const::USize(*to + from)))),
-                );
+                let meta_fld = ctx.ld_field(addr_calc, metadata_field);
+                let metadata = ctx.biop(meta_fld, Const::USize(*to + from), BinOp::Sub);
 
                 let data_ptr = if elem_type != Type::Void {
-                    ld_field!(addr_calc, ptr_field)
-                        + V1Node::V2(ctx.alloc_node(Const::USize(*from)))
-                            * conv_usize!(V1Node::V2(ctx.size_of(elem_type).into_idx(ctx)))
+                    let base = ctx.ld_field(addr_calc, ptr_field);
+                    let stride = ctx.size_of(elem_type).into_idx(ctx);
+                    let stride = ctx.int_cast(stride, Int::USize, ExtendKind::ZeroExtend);
+                    let scaled = ctx.biop(Const::USize(*from), stride, BinOp::Mul);
+                    ctx.biop(base, scaled, BinOp::Add)
                 } else {
-                    ld_field!(addr_calc, ptr_field)
+                    ctx.ld_field(addr_calc, ptr_field)
                 };
-                V1Node::create_slice(curr_type, ctx, metadata, data_ptr)
+                ctx.create_slice(curr_type, data_ptr, metadata)
             } else {
                 let void_ptr = ctx.nptr(Type::Void);
                 let data_ptr = ctx.alloc_string(cilly::DATA_PTR);
 
                 let ptr_field = ctx.alloc_field(FieldDesc::new(curr_type, data_ptr, void_ptr));
-                let metadata = V1Node::V2(ctx.alloc_node(Const::USize(to - from)));
-                let data_ptr = ld_field!(addr_calc, ptr_field)
-                    + V1Node::V2(ctx.alloc_node(Const::USize(*from)))
-                        * conv_usize!(V1Node::V2(ctx.size_of(elem_type).into_idx(ctx)));
+                let metadata = ctx.alloc_node(Const::USize(to - from));
+                let base = ctx.ld_field(addr_calc, ptr_field);
+                let stride = ctx.size_of(elem_type).into_idx(ctx);
+                let stride = ctx.int_cast(stride, Int::USize, ExtendKind::ZeroExtend);
+                let scaled = ctx.biop(Const::USize(*from), stride, BinOp::Mul);
+                let data_ptr = ctx.biop(base, scaled, BinOp::Add);
 
-                V1Node::create_slice(curr_type, ctx, metadata, data_ptr)
+                ctx.create_slice(curr_type, data_ptr, metadata)
             }
         }
         PlaceElem::ConstantIndex {
@@ -301,27 +293,28 @@ pub fn place_elem_address<'tcx>(
                         ctx.alloc_field(FieldDesc::new(slice, metadata, Type::Int(Int::USize)));
                     let index = if *from_end {
                         //eprintln!("Slice index from end is:{offset}");
-                        V1Node::Sub(
-                            Box::new(ld_field!(addr_calc.clone(), len)),
-                            Box::new(V1Node::V2(ctx.alloc_node(Const::USize(*offset)))),
-                        )
+                        let len_fld = ctx.ld_field(addr_calc, len);
+                        ctx.biop(len_fld, Const::USize(*offset), BinOp::Sub)
                     } else {
-                        V1Node::V2(ctx.alloc_node(Const::USize(*offset)))
+                        ctx.alloc_node(Const::USize(*offset))
                         //ops.extend(derf_op);
                     };
 
-                    ld_field!(addr_calc.clone(), desc).cast_ptr(ctx.nptr(inner_type))
-                        + (index * conv_usize!(V1Node::V2(ctx.size_of(inner_type).into_idx(ctx))))
+                    let base = ctx.ld_field(addr_calc, desc);
+                    let base = ctx.cast_ptr(base, inner_type);
+                    let stride = ctx.size_of(inner_type).into_idx(ctx);
+                    let stride = ctx.int_cast(stride, Int::USize, ExtendKind::ZeroExtend);
+                    let scaled = ctx.biop(index, stride, BinOp::Mul);
+                    ctx.biop(base, scaled, BinOp::Add)
                 }
                 TyKind::Array(element, _) => {
                     let mref = array_get_address(ctx, *element, curr_ty);
                     if *from_end {
                         todo!("Can't index array from end!");
                     } else {
-                        call!(
-                            ctx.alloc_methodref(mref),
-                            [addr_calc, V1Node::V2(ctx.alloc_node(Const::USize(*offset)))]
-                        )
+                        let mref = ctx.alloc_methodref(mref);
+                        let offset = ctx.alloc_node(Const::USize(*offset));
+                        ctx.call(mref, &[addr_calc, offset], cilly::cilnode::IsPure::NOT)
                     }
                 }
                 _ => {

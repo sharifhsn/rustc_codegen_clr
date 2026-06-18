@@ -3,8 +3,7 @@ use std::collections::HashSet;
 
 use cilly::{
     Assembly, CILNode, ClassRef, Const, Float, Int, Interned, IntoAsmIndex, MethodRef,
-    StaticFieldDesc, Type, call,
-    cil_node::{CallOpArgs, V1Node},
+    StaticFieldDesc, Type,
     cilnode::{IsPure, MethodKind},
     hashable::{HashableF32, HashableF64},
 };
@@ -26,7 +25,7 @@ use crate::static_data::add_allocation;
 pub fn handle_constant<'tcx>(
     constant_op: &ConstOperand<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Node {
+) -> Interned<CILNode> {
     let constant = constant_op.const_;
     let constant = ctx.monomorphize(constant);
     let evaluated = constant
@@ -123,9 +122,9 @@ pub fn load_const_value<'tcx>(
     const_val: ConstValue,
     const_ty: Ty<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Node {
+) -> Interned<CILNode> {
     match const_val {
-        ConstValue::Scalar(scalar) => load_const_scalar(scalar, const_ty, ctx).into(),
+        ConstValue::Scalar(scalar) => load_const_scalar(scalar, const_ty, ctx),
         ConstValue::ZeroSized => {
             let tpe = ctx.monomorphize(const_ty);
             assert!(
@@ -133,7 +132,7 @@ pub fn load_const_value<'tcx>(
                 "Zero sized const with a non-zero size. It is {tpe:?}"
             );
             let tpe = ctx.type_from_cache(tpe);
-            V1Node::uninit_val(tpe, ctx)
+            ctx.uninit_val(tpe)
         }
         ConstValue::Slice {  meta,alloc_id } => {
               // SUS
@@ -158,11 +157,11 @@ pub fn load_const_value<'tcx>(
                 alloc_ptr(alloc_id, &data, ctx, arr_tpe)
             };
             let ptr = ctx.cast_ptr(ptr, Type::Void);
-            let meta = V1Node::V2(ctx.alloc_node(Const::USize(meta)));
-            V1Node::create_slice(slice_dotnet, ctx, meta, ptr.into())
+            let meta = ctx.alloc_node(Const::USize(meta));
+            ctx.create_slice(slice_dotnet, ptr, meta)
         }
         ConstValue::Indirect { alloc_id, offset } => {
-            create_const_from_data(const_ty, alloc_id, offset.bytes(), ctx).into()
+            create_const_from_data(const_ty, alloc_id, offset.bytes(), ctx)
             //todo!("Can't handle by-ref allocation {alloc_id:?} {offset:?}")
         } //_ => todo!("Unhandled const value {const_val:?} of type {const_ty:?}"),
     }

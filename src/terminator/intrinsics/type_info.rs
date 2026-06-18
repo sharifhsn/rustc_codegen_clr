@@ -1,8 +1,6 @@
 use crate::assembly::MethodCompileCtx;
 use cilly::{
-    cil_node::V1Node,
-    cil_root::V1Root,
-    conv_usize, ld_field, Const, IntoAsmIndex, Type, {FieldDesc, Int},
+    cilnode::ExtendKind, BinOp, Const, Int, Interned, Type, {FieldDesc},
 };
 use rustc_codegen_clr_place::place_set;
 use rustc_codegen_clr_type::{
@@ -15,25 +13,30 @@ use rustc_middle::{
     ty::{Instance, TyKind},
 };
 use rustc_span::Spanned;
+
+type Node = Interned<cilly::v2::CILNode>;
+type Root = Interned<cilly::v2::CILRoot>;
+
 pub fn is_val_statically_known<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
     debug_assert_eq!(
         args.len(),
         1,
         "The intrinsic `is_val_statically_known` MUST take in exactly 1 argument!"
     );
     // assert_eq!(args.len(),1,"The intrinsic `unlikely` MUST take in exactly 1 argument!");
-    place_set(destination, V1Node::V2(ctx.alloc_node(false)), ctx)
+    let value_calc: Node = ctx.alloc_node(false);
+    place_set(destination, value_calc, ctx)
 }
 pub fn size_of_val<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     call_instance: Instance<'tcx>,
-) -> V1Root {
+) -> Root {
     debug_assert_eq!(
         args.len(),
         1,
@@ -46,11 +49,8 @@ pub fn size_of_val<'tcx>(
             .expect("needs_drop works only on types!"),
     );
     if is_zst(pointed_ty, ctx.tcx()) {
-        return place_set(
-            destination,
-            V1Node::V2(ctx.alloc_node(Const::USize(0))),
-            ctx,
-        );
+        let value_calc: Node = ctx.alloc_node(Const::USize(0));
+        return place_set(destination, value_calc, ctx);
     }
     if pointer_to_is_fat(pointed_ty, ctx.tcx(), ctx.instance()) {
         let ptr_ty = ctx.monomorphize(args[0].node.ty(ctx.body(), ctx.tcx()));
@@ -63,11 +63,9 @@ pub fn size_of_val<'tcx>(
                     Type::Int(Int::USize),
                 );
                 let addr = operand_address(&args[0].node, ctx);
-                return place_set(
-                    destination,
-                    ld_field!(addr, ctx.alloc_field(descriptor)),
-                    ctx,
-                );
+                let field = ctx.alloc_field(descriptor);
+                let value_calc = ctx.ld_field(addr, field);
+                return place_set(destination, value_calc, ctx);
             }
             TyKind::Slice(inner) => {
                 let slice_tpe = ctx.type_from_cache(ptr_ty).as_class_ref().unwrap();
@@ -79,12 +77,12 @@ pub fn size_of_val<'tcx>(
                     Type::Int(Int::USize),
                 );
                 let addr = operand_address(&args[0].node, ctx);
-                return place_set(
-                    destination,
-                    ld_field!(addr, ctx.alloc_field(descriptor))
-                        * conv_usize!(V1Node::V2(ctx.size_of(inner_type).into_idx(ctx))),
-                    ctx,
-                );
+                let field = ctx.alloc_field(descriptor);
+                let len = ctx.ld_field(addr, field);
+                let size = ctx.size_of(inner_type);
+                let size = ctx.int_cast(size, Int::USize, ExtendKind::ZeroExtend);
+                let value_calc = ctx.biop(len, size, BinOp::Mul);
+                return place_set(destination, value_calc, ctx);
             }
             // WARNING: ASSUMES ANY NON-SLICE DST IS A DYN.
             _ => {
@@ -96,27 +94,22 @@ pub fn size_of_val<'tcx>(
                     Type::Int(Int::USize),
                 );
                 let addr = operand_address(&args[0].node, ctx);
-                return place_set(
-                    destination,
-                    V1Node::LDIndUSize {
-                        ptr: Box::new(
-                            ld_field!(addr, ctx.alloc_field(descriptor))
-                                .cast_ptr(ctx.nptr(Type::Int(Int::USize)))
-                                + conv_usize!(V1Node::V2(ctx.size_of(Int::ISize).into_idx(ctx))),
-                        ),
-                    },
-                    ctx,
-                );
+                let field = ctx.alloc_field(descriptor);
+                let meta = ctx.ld_field(addr, field);
+                let meta = ctx.cast_ptr(meta, Type::Int(Int::USize));
+                let size = ctx.size_of(Int::ISize);
+                let size = ctx.int_cast(size, Int::USize, ExtendKind::ZeroExtend);
+                let ptr = ctx.biop(meta, size, BinOp::Add);
+                let value_calc = ctx.load(ptr, Type::Int(Int::USize));
+                return place_set(destination, value_calc, ctx);
             }
         }
     }
     let tpe = ctx.monomorphize(pointed_ty);
     let tpe = ctx.type_from_cache(tpe);
-    place_set(
-        destination,
-        conv_usize!(V1Node::V2(ctx.size_of(tpe).into_idx(ctx))),
-        ctx,
-    )
+    let size = ctx.size_of(tpe);
+    let value_calc = ctx.int_cast(size, Int::USize, ExtendKind::ZeroExtend);
+    place_set(destination, value_calc, ctx)
 }
 /// Lowering of the `align_of_val` intrinsic (formerly `min_align_of_val`): the alignment of the
 /// value behind a `*const T` / `&T`, where `T: ?Sized`.
@@ -132,7 +125,7 @@ pub fn align_of_val<'tcx>(
     destination: &Place<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     call_instance: Instance<'tcx>,
-) -> V1Root {
+) -> Root {
     debug_assert_eq!(
         args.len(),
         1,
@@ -155,24 +148,19 @@ pub fn align_of_val<'tcx>(
             Type::Int(Int::USize),
         );
         let addr = operand_address(&args[0].node, ctx);
-        let align_ptr = (ld_field!(addr, ctx.alloc_field(descriptor))
-            + conv_usize!(
-                V1Node::V2(ctx.size_of(Int::ISize).into_idx(ctx))
-                    * V1Node::V2(ctx.alloc_node(2_i32))
-            ))
-        .cast_ptr(ctx.nptr(Type::Int(Int::USize)));
-        return place_set(
-            destination,
-            V1Node::LDIndUSize {
-                ptr: Box::new(align_ptr),
-            },
-            ctx,
-        );
+        let field = ctx.alloc_field(descriptor);
+        let vtable = ctx.ld_field(addr, field);
+        let size = ctx.size_of(Int::ISize);
+        let two = ctx.alloc_node(2_i32);
+        let offset = ctx.biop(size, two, BinOp::Mul);
+        let offset = ctx.int_cast(offset, Int::USize, ExtendKind::ZeroExtend);
+        let sum = ctx.biop(vtable, offset, BinOp::Add);
+        let align_ptr = ctx.cast_ptr(sum, Type::Int(Int::USize));
+        let value_calc: Node = ctx.load(align_ptr, Type::Int(Int::USize));
+        return place_set(destination, value_calc, ctx);
     }
     let align = rustc_codegen_clr_type::align_of(pointed_ty, ctx.tcx());
-    place_set(
-        destination,
-        conv_usize!(V1Node::V2(ctx.alloc_node(align))),
-        ctx,
-    )
+    let align = ctx.alloc_node(align);
+    let value_calc = ctx.int_cast(align, Int::USize, ExtendKind::ZeroExtend);
+    place_set(destination, value_calc, ctx)
 }

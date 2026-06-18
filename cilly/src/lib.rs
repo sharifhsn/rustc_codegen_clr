@@ -35,13 +35,8 @@ impl Access {
     }
 }
 
-pub mod basic_block;
-pub mod cil_node;
-pub mod cil_root;
-pub mod cil_tree;
 pub mod entrypoint;
 pub mod libc_fns;
-pub mod method;
 
 pub mod utilis;
 pub mod v2;
@@ -122,28 +117,6 @@ pub fn mem_checks() -> bool {
 #[must_use]
 pub fn debig_sfi() -> bool {
     *crate::DEBUG_SFI
-}
-pub fn sfi_debug_print(sfi: &crate::cil_root::SFI) -> String {
-    format!(
-        "ldstr {name:?}
-        call void [System.Console]System.Console::Write(string)
-        ldstr \": \"
-        call void [System.Console]System.Console::Write(string)
-        ldc.i4 {ls}
-        call void [System.Console]System.Console::Write(uint32)
-        ldstr \"..\"
-        call void [System.Console]System.Console::Write(string)
-        ldc.i4 {le}
-        call void [System.Console]System.Console::WriteLine(uint32)
-        call class [System.Runtime]System.Reflection.MethodBase [System.Runtime]System.Reflection.MethodBase::GetCurrentMethod()
-        callvirt instance string [System.Runtime]System.Reflection.MemberInfo::get_Name()
-        call void [System.Console]System.Console::WriteLine(string)
-        ",
-        name = sfi.2,
-        ls = sfi.0.start,
-        le = sfi.0.start,
-       // col = sfi.1,
-    )
 }
 config!(
     DEBUG_SFI,

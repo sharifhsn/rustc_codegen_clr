@@ -5,16 +5,18 @@ use rustc_codegen_clr_place::{place_address, place_get, place_set};
 use rustc_codegen_clr_type::utilis::is_zst;
 use rustc_codegen_clr_type::GetTypeExt;
 
-use cilly::{cil_node::V1Node, cil_root::V1Root, cil_tree::CILTree, size_of};
-use cilly::{zero_extend, CILRoot};
+use cilly::cilnode::ExtendKind;
+use cilly::{BinOp, Int, Interned};
 
 use rustc_codgen_clr_operand::handle_operand;
 use rustc_middle::mir::{CopyNonOverlapping, NonDivergingIntrinsic, Statement, StatementKind};
+
+type Root = Interned<cilly::v2::CILRoot>;
 #[allow(clippy::match_same_arms)]
 pub fn handle_statement<'tcx>(
     statement: &Statement<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> Vec<CILTree> {
+) -> Vec<Root> {
     let kind = &statement.kind;
     match kind {
         StatementKind::StorageLive(_local) => vec![],
@@ -34,15 +36,9 @@ pub fn handle_statement<'tcx>(
             };
             //ops.push();
 
-            vec![set_discr(
-                layout.layout,
-                *variant_index,
-                place_address(place, ctx),
-                owner,
-                owner_ty,
-                ctx,
-            )
-            .into()]
+            let addr = place_address(place, ctx);
+            let root = set_discr(layout.layout, *variant_index, addr, owner, owner_ty, ctx);
+            vec![root]
         }
         StatementKind::Assign(place_rvalue) => {
             if is_rvalue_unint(&place_rvalue.as_ref().1, ctx) {
@@ -58,17 +54,13 @@ pub fn handle_statement<'tcx>(
             let tpe = ctx.type_from_cache(ty);
             let tpe = ctx.alloc_type(tpe);
             if crate::rvalue::is_rvalue_const_0(rvalue, ctx) {
-                return vec![V1Root::InitObj(place_address(&place, ctx), tpe).into()];
+                let addr = place_address(&place, ctx);
+                let root = ctx.init_obj(addr, tpe);
+                return vec![root];
             }
             let (mut trees, value_calc) = crate::rvalue::handle_rvalue(rvalue, &place, ctx);
             trees.push(place_set(&place, value_calc, ctx));
             trees
-                .into_iter()
-                .map(|v1| {
-                    let root = CILRoot::from_v1(&v1, ctx);
-                    V1Root::V2(ctx.alloc_root(root)).into()
-                })
-                .collect()
         }
         StatementKind::Intrinsic(non_diverging_intirinsic) => {
             match non_diverging_intirinsic.as_ref() {
@@ -88,14 +80,11 @@ pub fn handle_statement<'tcx>(
                         rustc_middle::ty::print::with_no_trimmed_paths! { panic!("Copy nonoverlaping called with non-pointer type {src_ty:?}")};
                     };
 
-                    vec![V1Root::CpBlk {
-                        src: Box::new(src_op),
-                        dst: Box::new(dst_op),
-                        len: Box::new(
-                            count_op * V1Node::V2(zero_extend!(size_of!(pointed), usize)(ctx)),
-                        ),
-                    }
-                    .into()]
+                    let size = ctx.size_of(pointed);
+                    let size = ctx.int_cast(size, Int::USize, ExtendKind::ZeroExtend);
+                    let len = ctx.biop(count_op, size, BinOp::Mul);
+                    let root = ctx.cp_blk(dst_op, src_op, len);
+                    vec![root]
                 }
             }
         }
@@ -103,10 +92,11 @@ pub fn handle_statement<'tcx>(
             panic!("Fake reads should not be passed from the backend to the forntend!")
         }
         rustc_middle::mir::StatementKind::BackwardIncompatibleDropHint { .. } => todo!(),
-        StatementKind::PlaceMention(place) => vec![V1Root::Pop {
-            tree: place_get(place, ctx),
+        StatementKind::PlaceMention(place) => {
+            let val = place_get(place, ctx);
+            let root = ctx.pop(val);
+            vec![root]
         }
-        .into()],
 
         //TODO: consider adding some .NET specific coverage info(Is that even possible?).
         StatementKind::Coverage(_) => vec![],

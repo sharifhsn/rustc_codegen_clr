@@ -1,9 +1,7 @@
 use crate::assembly::MethodCompileCtx;
 
-use cilly::cil_node::V1Node;
-
-use cilly::cilnode::MethodKind;
-use cilly::{call, ld_field, Type};
+use cilly::cilnode::{ExtendKind, IsPure, MethodKind};
+use cilly::{BinOp, Interned, Type};
 use cilly::{ClassRef, FieldDesc, Int, MethodRef};
 
 use rustc_codegen_clr_type::r#type::get_type;
@@ -18,7 +16,7 @@ pub fn unop<'tcx>(
     operand: &Operand<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     rvalue: &Rvalue<'tcx>,
-) -> V1Node {
+) -> Interned<cilly::v2::CILNode> {
     let parrent_node = handle_operand(operand, ctx);
     let ty = operand.ty(&ctx.body().local_decls, ctx.tcx());
     match unnop {
@@ -31,10 +29,17 @@ pub fn unop<'tcx>(
                     MethodKind::Static,
                     vec![].into(),
                 );
-                call!(ctx.alloc_methodref(mref), [parrent_node])
+                let mref = ctx.alloc_methodref(mref);
+                ctx.call(mref, &[parrent_node], IsPure::NOT)
             }
-            TyKind::Int(IntTy::I8) => V1Node::Neg(V1Node::ConvI8(parrent_node.into()).into()),
-            TyKind::Int(IntTy::I16) => V1Node::Neg(V1Node::ConvI16(parrent_node.into()).into()),
+            TyKind::Int(IntTy::I8) => {
+                let conv = ctx.int_cast(parrent_node, Int::I8, ExtendKind::SignExtend);
+                ctx.neg(conv)
+            }
+            TyKind::Int(IntTy::I16) => {
+                let conv = ctx.int_cast(parrent_node, Int::I16, ExtendKind::SignExtend);
+                ctx.neg(conv)
+            }
             TyKind::Uint(UintTy::U128) => {
                 let mref = MethodRef::new(
                     ClassRef::uint_128(ctx),
@@ -43,15 +48,16 @@ pub fn unop<'tcx>(
                     MethodKind::Static,
                     vec![].into(),
                 );
-                call!(ctx.alloc_methodref(mref), [parrent_node])
+                let mref = ctx.alloc_methodref(mref);
+                ctx.call(mref, &[parrent_node], IsPure::NOT)
             }
-            _ => V1Node::Neg(parrent_node.into()),
+            _ => ctx.neg(parrent_node),
         },
         UnOp::Not => match ty.kind() {
-            TyKind::Bool => V1Node::Eq(
-                Box::new(V1Node::V2(ctx.alloc_node(false))),
-                parrent_node.into(),
-            ),
+            TyKind::Bool => {
+                let f = ctx.alloc_node(false);
+                ctx.biop(f, parrent_node, BinOp::Eq)
+            }
             TyKind::Uint(UintTy::U128) => {
                 let mref = MethodRef::new(
                     ClassRef::uint_128(ctx),
@@ -60,7 +66,8 @@ pub fn unop<'tcx>(
                     MethodKind::Static,
                     vec![].into(),
                 );
-                call!(ctx.alloc_methodref(mref), [parrent_node])
+                let mref = ctx.alloc_methodref(mref);
+                ctx.call(mref, &[parrent_node], IsPure::NOT)
             }
             TyKind::Int(IntTy::I128) => {
                 let mref = MethodRef::new(
@@ -70,9 +77,10 @@ pub fn unop<'tcx>(
                     MethodKind::Static,
                     vec![].into(),
                 );
-                call!(ctx.alloc_methodref(mref), [parrent_node])
+                let mref = ctx.alloc_methodref(mref);
+                ctx.call(mref, &[parrent_node], IsPure::NOT)
             }
-            _ => V1Node::Not(parrent_node.into()),
+            _ => ctx.not(parrent_node),
         },
         rustc_middle::mir::UnOp::PtrMetadata => {
             let tpe = get_type(ty, ctx);
@@ -86,29 +94,25 @@ pub fn unop<'tcx>(
             {
                 TyKind::Slice(_) | TyKind::Str => {
                     let metadata = ctx.alloc_string(crate::METADATA);
-                    ld_field!(
-                        parrent_node,
-                        ctx.alloc_field(FieldDesc::new(
-                            class,
-                            metadata,
-                            cilly::Type::Int(cilly::Int::USize),
-                        ))
-                    )
+                    let field = ctx.alloc_field(FieldDesc::new(
+                        class,
+                        metadata,
+                        cilly::Type::Int(cilly::Int::USize),
+                    ));
+                    ctx.ld_field(parrent_node, field)
                 }
                 TyKind::Dynamic(..) => {
                     let metadata = ctx.alloc_string(crate::METADATA);
                     let target = get_type(rvalue.ty(ctx.body(), ctx.tcx()), ctx);
-                    ld_field!(
-                        parrent_node,
-                        ctx.alloc_field(FieldDesc::new(
-                            class,
-                            metadata,
-                            cilly::Type::Int(cilly::Int::USize),
-                        ))
-                    )
-                    .transmute_on_stack(Type::Int(Int::USize), target, ctx)
+                    let field = ctx.alloc_field(FieldDesc::new(
+                        class,
+                        metadata,
+                        cilly::Type::Int(cilly::Int::USize),
+                    ));
+                    let meta = ctx.ld_field(parrent_node, field);
+                    ctx.transmute_on_stack(Type::Int(Int::USize), target, meta)
                 }
-                _ => V1Node::uninit_val(Type::Void, ctx),
+                _ => ctx.uninit_val(Type::Void),
             }
         }
     }

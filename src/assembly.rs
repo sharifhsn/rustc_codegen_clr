@@ -1,21 +1,19 @@
 use crate::{
     basic_block::handler_for_block,
     codegen_error::{CodegenError, MethodCodegenError},
-    utilis::{alloc_id_to_u64, is_function_magic},
+    utilis::is_function_magic,
     IString,
 };
 use cilly::{
-    basic_block::BasicBlock,
-    cil_node::V1Node,
-    cil_root::V1Root,
-    cil_tree::CILTree,
     cilnode::{MethodKind, PtrCastRes},
-    method::{Method, MethodType},
     utilis::{self},
     v2::method::LocalDef,
+    v2::BasicBlock,
     Access, Assembly, CILRoot, Int, Interned, IntoAsmIndex, MethodDef, MethodRef, StaticFieldDesc,
     Type,
 };
+
+type Root = Interned<cilly::v2::CILRoot>;
 use rustc_codegen_clr_call::CallInfo;
 use rustc_codegen_clr_ctx::function_name;
 pub use rustc_codegen_clr_ctx::MethodCompileCtx;
@@ -87,7 +85,7 @@ fn locals_from_mir<'tcx>(
 pub fn terminator_to_ops<'tcx>(
     term: &Terminator<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> Result<Vec<CILTree>, CodegenError> {
+) -> Result<Vec<Root>, CodegenError> {
     let terminator = if *crate::config::ABORT_ON_ERROR {
         crate::terminator::handle_terminator(term, ctx)
     } else {
@@ -107,7 +105,7 @@ pub fn terminator_to_ops<'tcx>(
                     format!("Tried to execute terminator {term:?} whose compialtion failed with a no-string message!")
                     }
                 };
-                vec![V1Root::throw(&msg, ctx).into()]
+                vec![ctx.throw_msg(&msg)]
             }
         }
     };
@@ -118,7 +116,7 @@ pub fn terminator_to_ops<'tcx>(
 pub fn statement_to_ops<'tcx>(
     statement: &Statement<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> Result<Vec<CILTree>, CodegenError> {
+) -> Result<Vec<Root>, CodegenError> {
     ctx.set_span(statement.source_info.span);
     if *crate::config::ABORT_ON_ERROR {
         Ok(crate::statement::handle_statement(statement, ctx))
@@ -210,7 +208,7 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
             Some("repacked_arg".into_idx(ctx)),
             ctx.alloc_type(repacked_type),
         ));
-        let mut repack_cil: Vec<CILTree> = Vec::new();
+        let mut repack_cil: Vec<Root> = Vec::new();
         // For each element of the tuple, get the argument spread_arg + n
         let TyKind::Tuple(packed) = repacked_ty.kind() else {
             panic!("Arg to spread not a tuple???")
@@ -221,16 +219,11 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
             }
             let arg_field = field_descrptor(repacked_ty, arg_id.try_into().unwrap(), ctx);
             let arg = spread_arg.as_u32() - 1 + u32::try_from(arg_id).unwrap();
-            let arg = V1Node::V2(ctx.alloc_node(cilly::v2::CILNode::LdArg(arg)));
-            let repacked = V1Node::V2(ctx.alloc_node(cilly::v2::CILNode::LdLocA(repacked)));
-            repack_cil.push(
-                V1Root::SetField {
-                    addr: Box::new(repacked),
-                    value: Box::new(arg),
-                    desc: (arg_field),
-                }
-                .into(),
-            );
+            let arg = ctx.alloc_node(cilly::v2::CILNode::LdArg(arg));
+            let repacked = ctx.alloc_node(cilly::v2::CILNode::LdLocA(repacked));
+            repack_cil.push(ctx.alloc_root(cilly::CILRoot::SetField(Box::new((
+                arg_field, repacked, arg,
+            )))));
         }
         repack_cil
     } else {
@@ -246,14 +239,18 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     let mut compile_failed: Option<String> = None;
     // Used for type-checking the CIL to ensure its validity.
     for (last_bb_id, block_data) in blocks.into_iter().enumerate() {
-        let mut trees = Vec::new();
+        let mut trees: Vec<Root> = Vec::new();
         for statement in &block_data.statements {
             if *crate::config::INSERT_MIR_DEBUG_COMMENTS {
-                rustc_middle::ty::print::with_no_trimmed_paths! {trees.push(V1Root::debug(&format!("{statement:?}"),ctx).into())};
-                rustc_middle::ty::print::with_no_trimmed_paths! {trees.push(V1Root::debug(&format!("{:?}",statement.source_info.span),ctx).into())};
+                let msg = rustc_middle::ty::print::with_no_trimmed_paths!(format!("{statement:?}"));
+                let dbg = ctx.debug_msg(&msg);
+                trees.push(dbg);
+                let msg = format!("{:?}", statement.source_info.span);
+                let dbg = ctx.debug_msg(&msg);
+                trees.push(dbg);
             }
 
-            let mut statement_tree = match statement_to_ops(statement, ctx) {
+            let statement_tree = match statement_to_ops(statement, ctx) {
                 Ok(ops) => ops,
                 Err(err) => {
                     rustc_middle::ty::print::with_no_trimmed_paths! {eprintln!(
@@ -264,20 +261,12 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
                             "Method \"{name}\" could not be compiled: statement {statement:?} failed with {err:?}."
                         ))};
                     }
-                    rustc_middle::ty::print::with_no_trimmed_paths! {vec![(V1Root::throw(&format!("Tired to run a statement {statement:?} which failed to compile with error message {err:?}."),ctx).into())]}
+                    rustc_middle::ty::print::with_no_trimmed_paths! {vec![ctx.throw_msg(&format!("Tired to run a statement {statement:?} which failed to compile with error message {err:?}."))]}
                 }
             };
-            // Typecheck a *temporary* V2 lowering; do NOT replace the tree's root with the
-            // `V1Root::V2` wrapper. The pure-V1 root must survive until `resolve_exception_handlers`,
-            // which relies on `targets()` / `fix_for_exception_handler` pattern-matching the V1 branch
-            // variants (`GoTo`/`BTrue`/…). A `V1Root::V2` wrapper hides those (they fall through to
-            // `_ => ()`), so `block_gc` can't follow a cleanup chain and handler branches aren't
-            // relabeled — leaving dangling `bbN` targets (`ilasm: Undefined Label`). `from_v1` below
-            // performs the real, final conversion.
-            for tree in &statement_tree {
-                let tmp = CILRoot::from_v1(tree.root(), ctx);
-                let mut tmp_root = cilly::cil_root::V1Root::V2(ctx.alloc_root(tmp));
-                if let Err(err) = tmp_root.try_typecheck(ctx, sig_idx, &locals) {
+            // Typecheck each produced V2 root, warning (not failing) on errors.
+            for root in &statement_tree {
+                if let Err(err) = ctx.get_root(*root).clone().typecheck(sig_idx, &locals, ctx) {
                     ctx.tcx().dcx().span_warn(
                         statement.source_info.span,
                         format!("Typecheck failed:{err:?}"),
@@ -286,57 +275,45 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
             }
             // Only save debuginfo for statements which result in ops.
             if !statement_tree.is_empty() {
-                trees.push(span_source_info(ctx.tcx(), statement.source_info.span).into());
+                let sfi = span_source_info(ctx, statement.source_info.span);
+                trees.push(sfi);
             }
             trees.extend(statement_tree);
         }
         if let Some(term) = &block_data.terminator {
             if *crate::config::INSERT_MIR_DEBUG_COMMENTS {
-                rustc_middle::ty::print::with_no_trimmed_paths! {trees.push(V1Root::debug(&format!("{term:?}"),ctx).into())};
+                let msg = rustc_middle::ty::print::with_no_trimmed_paths!(format!("{term:?}"));
+                let dbg = ctx.debug_msg(&msg);
+                trees.push(dbg);
             }
-            let mut term_trees = terminator_to_ops(term, ctx).unwrap_or_else(|err| {
+            let term_trees = terminator_to_ops(term, ctx).unwrap_or_else(|err| {
                 panic!("Could not compile terminator {term:?} because {err:?}")
             });
-            // See the statement loop above: typecheck a temporary V2 lowering but keep the tree's
-            // pure-V1 root so `resolve_exception_handlers` can see branch targets.
-            for tree in &term_trees {
-                let tmp = CILRoot::from_v1(tree.root(), ctx);
-                let mut tmp_root = cilly::cil_root::V1Root::V2(ctx.alloc_root(tmp));
-                if let Err(err) = tmp_root.try_typecheck(ctx, sig_idx, &locals) {
+            for root in &term_trees {
+                if let Err(err) = ctx.get_root(*root).clone().typecheck(sig_idx, &locals, ctx) {
                     ctx.tcx()
                         .dcx()
                         .span_warn(term.source_info.span, format!("Typecheck failed:{err:?}"));
                 }
             }
             if !term_trees.is_empty() {
-                trees.push(span_source_info(ctx.tcx(), term.source_info.span).into());
+                let sfi = span_source_info(ctx, term.source_info.span);
+                trees.push(sfi);
             }
             trees.extend(term_trees);
         }
+        let handler_id = handler_for_block(
+            block_data,
+            &mir.basic_blocks,
+            ctx.tcx(),
+            &ctx.instance(),
+            mir,
+        );
+        let bb = BasicBlock::new_raw(trees, u32::try_from(last_bb_id).unwrap(), handler_id);
         if block_data.is_cleanup {
-            cleanup_bbs.push(BasicBlock::new(
-                trees,
-                u32::try_from(last_bb_id).unwrap(),
-                handler_for_block(
-                    block_data,
-                    &mir.basic_blocks,
-                    ctx.tcx(),
-                    &ctx.instance(),
-                    mir,
-                ),
-            ));
+            cleanup_bbs.push(bb);
         } else {
-            normal_bbs.push(BasicBlock::new(
-                trees,
-                u32::try_from(last_bb_id).unwrap(),
-                handler_for_block(
-                    block_data,
-                    &mir.basic_blocks,
-                    ctx.tcx(),
-                    &ctx.instance(),
-                    mir,
-                ),
-            ));
+            normal_bbs.push(bb);
         }
         //ops.extend(trees.iter().flat_map(|tree| tree.flatten()))
     }
@@ -344,35 +321,38 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     // A statement failed to compile: discard the partially-built (and potentially branch-inconsistent)
     // body and emit a single throwing block, guaranteeing valid CIL. The method throws if called.
     if let Some(reason) = compile_failed {
-        normal_bbs = vec![BasicBlock::new(vec![V1Root::throw(&reason, ctx).into()], 0, None)];
+        let throw = ctx.throw_msg(&reason);
+        normal_bbs = vec![BasicBlock::new(vec![throw], 0, None)];
         cleanup_bbs = Vec::new();
         repack_cil = Vec::new();
     }
 
-    normal_bbs
-        .iter_mut()
-        .for_each(|bb| bb.resolve_exception_handlers(&cleanup_bbs));
-    normal_bbs
-        .iter_mut()
-        .for_each(cilly::basic_block::BasicBlock::sheed_trees);
+    // Resolve exception handlers on V2 blocks (the V2 port of the V1 logic). `resolve_exception_handlers`
+    // needs `&mut Assembly`, so we drain the blocks, resolve each against the cleanup blocks, and collect.
+    let mut resolved_bbs = Vec::with_capacity(normal_bbs.len());
+    for mut bb in normal_bbs {
+        bb.resolve_exception_handlers(&cleanup_bbs, ctx);
+        bb.sheed_trees();
+        resolved_bbs.push(bb);
+    }
+    let mut normal_bbs = resolved_bbs;
     // Get the first bb, and append repack_cil at its start
     let first_bb: &mut BasicBlock = &mut normal_bbs[0];
-    repack_cil.append(first_bb.trees_mut());
-    *first_bb.trees_mut() = repack_cil;
+    repack_cil.append(first_bb.roots_mut());
+    *first_bb.roots_mut() = repack_cil;
 
-    let mut method = Method::new(
+    let main_module = ctx.main_module();
+    let mut method = MethodDef::from_v2_blocks(
         access_modifier,
-        MethodType::Static,
-        sig.clone(),
+        main_module,
         name,
-        locals,
+        sig_idx,
+        MethodKind::Static,
         normal_bbs,
+        locals,
         arg_names,
         ctx,
     );
-
-    let main_module = ctx.main_module();
-    let mut method = MethodDef::from_v1(&method, ctx, main_module);
     if let Err(err) = method.typecheck(ctx) {
         ctx.tcx()
             .dcx()
@@ -506,8 +486,12 @@ pub fn add_item<'tcx>(
     }
 }
 
-pub(crate) fn span_source_info(tcx: TyCtxt, span: rustc_span::Span) -> V1Root {
-    let (file, lstart, cstart, lend, mut cend) = tcx.sess.source_map().span_to_location_info(span);
+pub(crate) fn span_source_info<'tcx>(
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    span: rustc_span::Span,
+) -> Interned<CILRoot> {
+    let (file, lstart, cstart, lend, mut cend) =
+        ctx.tcx().sess.source_map().span_to_location_info(span);
     let file = file.map_or(String::new(), |file| {
         // `FileNameDisplayPreference` is now private; `prefer_local_unconditionally` is the public
         // equivalent of the old `display(FileNameDisplayPreference::Local)`.
@@ -516,9 +500,21 @@ pub(crate) fn span_source_info(tcx: TyCtxt, span: rustc_span::Span) -> V1Root {
     if cstart >= cend {
         cend = cstart + 1;
     }
-    V1Root::source_info(
-        &file,
-        (lstart as u64)..(lend as u64),
-        (cstart as u64)..(cend as u64),
-    )
+    // Direct V2 emission, mirroring `CILRoot::from_v1(V1Root::SourceFileInfo(..))` exactly.
+    // V1 line range is `lstart..lend`, column range is `cstart..cend` (with `cstart < cend`
+    // guaranteed by the clamp above, matching the assert in `V1Root::source_info`).
+    let line_start = u32::try_from((lstart as u64).min(u64::from(u32::MAX))).unwrap();
+    let line_end = u32::try_from((lend as u64).min(u64::from(u32::MAX))).unwrap();
+    let line_len = u16::try_from((line_end - line_start).min(u32::from(u16::MAX))).unwrap();
+    let col_start = u16::try_from((cstart as u64).min(u64::from(u16::MAX))).unwrap();
+    let col_end = u16::try_from((cend as u64).min(u64::from(u16::MAX))).unwrap();
+    let col_len = col_end - col_start;
+    let file = ctx.alloc_string(file);
+    ctx.alloc_root(CILRoot::SourceFileInfo {
+        line_start,
+        line_len,
+        col_start,
+        col_len,
+        file,
+    })
 }

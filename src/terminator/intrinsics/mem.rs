@@ -1,5 +1,8 @@
 use crate::assembly::MethodCompileCtx;
-use cilly::{cil_node::V1Node, cil_root::V1Root, conv_usize, eq, Int, IntoAsmIndex, Type};
+use cilly::{
+    cilnode::{ExtendKind, IsPure, MethodKind},
+    CILRoot, Int, Interned, MethodRef, Type,
+};
 use rustc_codegen_clr_place::place_set;
 use rustc_codegen_clr_type::GetTypeExt;
 use rustc_codgen_clr_operand::handle_operand;
@@ -9,13 +12,15 @@ use rustc_middle::{
 };
 use rustc_span::Spanned;
 
-use super::utilis::compare_bytes;
+type Node = Interned<cilly::v2::CILNode>;
+type Root = Interned<cilly::v2::CILRoot>;
+
 /// Takes in 3 args. dst, val, and count. writes count * sizeof(T) bytes of value `val` to dst.
 pub fn write_bytes<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     call_instance: Instance<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
     debug_assert_eq!(
         args.len(),
         3,
@@ -29,20 +34,18 @@ pub fn write_bytes<'tcx>(
     let tpe = ctx.type_from_cache(tpe);
     let dst = handle_operand(&args[0].node, ctx);
     let val = handle_operand(&args[1].node, ctx);
-    let count = handle_operand(&args[2].node, ctx)
-        * conv_usize!(V1Node::V2(ctx.size_of(tpe).into_idx(ctx)));
-    V1Root::InitBlk {
-        dst: Box::new(dst),
-        val: Box::new(val),
-        count: Box::new(count),
-    }
+    let count = handle_operand(&args[2].node, ctx);
+    let size = ctx.size_of(tpe);
+    let size = ctx.int_cast(size, Int::USize, ExtendKind::ZeroExtend);
+    let count = ctx.biop(count, size, cilly::BinOp::Mul);
+    ctx.init_blk(dst, val, count)
 }
 /// Takes in 3 args. dst, src, and count. copies count * sizeof(T) bytes from src to dst .
 pub fn copy<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     call_instance: Instance<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
     debug_assert_eq!(
         args.len(),
         3,
@@ -54,26 +57,24 @@ pub fn copy<'tcx>(
             .expect("needs_drop works only on types!"),
     );
     if ctx.layout_of(tpe).is_zst() {
-        return V1Root::Nop;
+        return ctx.alloc_root(CILRoot::Nop);
     }
     let tpe = ctx.type_from_cache(tpe);
     let src = handle_operand(&args[0].node, ctx);
     let dst = handle_operand(&args[1].node, ctx);
-    let count = handle_operand(&args[2].node, ctx)
-        * conv_usize!(V1Node::V2(ctx.size_of(tpe).into_idx(ctx)));
+    let count = handle_operand(&args[2].node, ctx);
+    let size = ctx.size_of(tpe);
+    let size = ctx.int_cast(size, Int::USize, ExtendKind::ZeroExtend);
+    let count = ctx.biop(count, size, cilly::BinOp::Mul);
 
-    V1Root::CpBlk {
-        src: Box::new(src),
-        dst: Box::new(dst),
-        len: Box::new(count),
-    }
+    ctx.cp_blk(dst, src, count)
 }
 pub fn raw_eq<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
     call_instance: Instance<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> V1Root {
+) -> Root {
     // Raw eq returns 0 if values are not equal, and 1 if they are, unlike memcmp, which does the oposite.
     let tpe = ctx.monomorphize(
         call_instance.args[0]
@@ -82,7 +83,8 @@ pub fn raw_eq<'tcx>(
     );
     // Raw eq always true for zsts.
     if ctx.layout_of(tpe).is_zst() {
-        return place_set(destination, V1Node::V2(ctx.alloc_node(true)), ctx);
+        let t = ctx.alloc_node(true);
+        return place_set(destination, t, ctx);
     }
     let tpe = ctx.type_from_cache(tpe);
     let size = match tpe {
@@ -100,28 +102,36 @@ pub fn raw_eq<'tcx>(
             | Int::ISize,
         )
         | Type::Ptr(_) => {
-            return place_set(
-                destination,
-                eq!(
-                    handle_operand(&args[0].node, ctx),
-                    handle_operand(&args[1].node, ctx)
-                ),
-                ctx,
-            );
+            let a = handle_operand(&args[0].node, ctx);
+            let b = handle_operand(&args[1].node, ctx);
+            let eq = ctx.biop(a, b, cilly::BinOp::Eq);
+            return place_set(destination, eq, ctx);
         }
-        _ => V1Node::V2(ctx.size_of(tpe).into_idx(ctx)),
+        _ => ctx.size_of(tpe),
     };
-    place_set(
-        destination,
-        eq!(
-            compare_bytes(
-                handle_operand(&args[0].node, ctx).cast_ptr(ctx.nptr(Type::Int(Int::U8))),
-                handle_operand(&args[1].node, ctx).cast_ptr(ctx.nptr(Type::Int(Int::U8))),
-                conv_usize!(size),
-                ctx
-            ),
-            V1Node::V2(ctx.alloc_node(0_i32))
-        ),
-        ctx,
-    )
+    let a = handle_operand(&args[0].node, ctx);
+    let u8_ptr = ctx.nptr(Type::Int(Int::U8));
+    let a = ctx.cast_ptr_to(a, u8_ptr);
+    let b = handle_operand(&args[1].node, ctx);
+    let u8_ptr = ctx.nptr(Type::Int(Int::U8));
+    let b = ctx.cast_ptr_to(b, u8_ptr);
+    let len = ctx.int_cast(size, Int::USize, ExtendKind::ZeroExtend);
+    let cmp = compare_bytes(a, b, len, ctx);
+    let zero = ctx.alloc_node(0_i32);
+    let eq = ctx.biop(cmp, zero, cilly::BinOp::Eq);
+    place_set(destination, eq, ctx)
+}
+/// Calls `memcmp` to compare `len` bytes of `a` and `b`. V2 counterpart of
+/// `super::utilis::compare_bytes`.
+fn compare_bytes(a: Node, b: Node, len: Node, ctx: &mut MethodCompileCtx<'_, '_>) -> Node {
+    let u8_ref = ctx.nptr(Type::Int(Int::U8));
+    let mref = MethodRef::new(
+        *ctx.main_module(),
+        ctx.alloc_string("memcmp"),
+        ctx.sig([u8_ref, u8_ref, Type::Int(Int::USize)], Type::Int(Int::I32)),
+        MethodKind::Static,
+        vec![].into(),
+    );
+    let mref = ctx.alloc_methodref(mref);
+    ctx.call(mref, &[a, b, len], IsPure::NOT)
 }

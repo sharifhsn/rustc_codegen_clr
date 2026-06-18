@@ -3,8 +3,8 @@ use crate::{
     utilis::{adt::set_discr, field_name, instance_try_resolve, variant_name},
 };
 use cilly::{
-    cil_node::V1Node, cil_root::V1Root, cilnode::MethodKind, ClassRef, Const, FieldDesc, FnSig,
-    Int, MethodRef, Type,
+    cilnode::{IsPure, MethodKind},
+    ClassRef, Const, FieldDesc, FnSig, Int, Interned, MethodRef, Type,
 };
 use rustc_abi::FieldIdx;
 use rustc_codegen_clr_place::{place_address, place_get, place_set};
@@ -20,13 +20,17 @@ use rustc_middle::{
     mir::{AggregateKind, Operand, Place},
     ty::{AdtDef, AdtKind, GenericArg, List, Ty, TyKind},
 };
+
+type Node = Interned<cilly::v2::CILNode>;
+type Root = Interned<cilly::v2::CILRoot>;
+
 /// Returns the CIL ops to create the aggreagate value specifed by `aggregate_kind` at `target_location`. Uses indivlidual values specifed by `value_index`
 pub fn handle_aggregate<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     target_location: &Place<'tcx>,
     aggregate_kind: &AggregateKind<'tcx>,
     value_index: &IndexVec<FieldIdx, Operand<'tcx>>,
-) -> (Vec<V1Root>, V1Node) {
+) -> (Vec<Root>, Node) {
     // Get CIL ops for each value
     let values: Vec<_> = value_index
         .iter()
@@ -83,15 +87,10 @@ pub fn handle_aggregate<'tcx>(
             );
             let mut sub_trees = Vec::new();
             for value in values {
-                sub_trees.push(V1Root::Call {
-                    site: ctx.alloc_methodref(site.clone()),
-                    args: [
-                        array_getter.clone(),
-                        V1Node::V2(ctx.alloc_node(Const::USize(u64::from(value.0)))),
-                        value.1,
-                    ]
-                    .into(),
-                });
+                let site = ctx.alloc_methodref(site.clone());
+                let idx = ctx.alloc_node(Const::USize(u64::from(value.0)));
+                let root = ctx.call_root(site, &[array_getter, idx, value.1], IsPure::NOT);
+                sub_trees.push(root);
             }
             (sub_trees, (place_get(target_location, ctx)))
         }
@@ -114,15 +113,13 @@ pub fn handle_aggregate<'tcx>(
                 let name = format!("Item{}", field.0 + 1);
 
                 let field_name = ctx.alloc_string(name);
-                sub_trees.push(V1Root::SetField {
-                    addr: Box::new(tuple_getter.clone()),
-                    value: Box::new(field.1.clone()),
-                    desc: ctx.alloc_field(FieldDesc::new(
-                        dotnet_tpe,
-                        field_name,
-                        types[field.0 as usize],
-                    )),
-                });
+                let desc = ctx.alloc_field(FieldDesc::new(
+                    dotnet_tpe,
+                    field_name,
+                    types[field.0 as usize],
+                ));
+                let root = ctx.set_field(desc, tuple_getter, field.1);
+                sub_trees.push(root);
             }
             (sub_trees, (place_get(target_location, ctx)))
         }
@@ -141,11 +138,10 @@ pub fn handle_aggregate<'tcx>(
                     continue;
                 }
                 let field_name = ctx.alloc_string(format!("f_{}", index.as_u32()));
-                sub_trees.push(V1Root::SetField {
-                    addr: Box::new(closure_getter.clone()),
-                    value: Box::new(handle_operand(value, ctx)),
-                    desc: ctx.alloc_field(FieldDesc::new(closure_dotnet, field_name, field_type)),
-                });
+                let value = handle_operand(value, ctx);
+                let desc = ctx.alloc_field(FieldDesc::new(closure_dotnet, field_name, field_type));
+                let root = ctx.set_field(desc, closure_getter, value);
+                sub_trees.push(root);
             }
 
             (sub_trees, (place_get(target_location, ctx)))
@@ -167,11 +163,10 @@ pub fn handle_aggregate<'tcx>(
                     continue;
                 }
                 let field_name = ctx.alloc_string(format!("f_{}", index.as_u32()));
-                sub_trees.push(V1Root::SetField {
-                    addr: Box::new(closure_getter.clone()),
-                    value: Box::new(handle_operand(value, ctx)),
-                    desc: ctx.alloc_field(FieldDesc::new(closure_dotnet, field_name, field_type)),
-                });
+                let value = handle_operand(value, ctx);
+                let desc = ctx.alloc_field(FieldDesc::new(closure_dotnet, field_name, field_type));
+                let root = ctx.set_field(desc, closure_getter, value);
+                sub_trees.push(root);
             }
             let layout = ctx.layout_of(coroutine_ty);
             let (disrc_type, _) = enum_tag_info(layout.layout, ctx);
@@ -209,13 +204,11 @@ pub fn handle_aggregate<'tcx>(
                 let ptr_tpe = ctx.type_from_cache(pointee);
                 assert_ne!(data_type, Type::Void);
                 // Pointer is thin, just directly assign
+                let data = handle_operand(data, ctx);
+                let ptr = ctx.nptr(ptr_tpe);
+                let data = ctx.cast_ptr(data, ptr);
                 return (
-                    [place_set(
-                        target_location,
-                        handle_operand(data, ctx).cast_ptr(ctx.nptr(ptr_tpe)),
-                        ctx,
-                    )]
-                    .into(),
+                    [place_set(target_location, data, ctx)].into(),
                     (place_get(target_location, ctx)),
                 );
             }
@@ -224,30 +217,26 @@ pub fn handle_aggregate<'tcx>(
             // Assign the components
             let data_ptr_name = ctx.alloc_string(crate::DATA_PTR);
             let void_ptr = ctx.nptr(cilly::Type::Void);
-            let assign_ptr = V1Root::SetField {
-                addr: Box::new(init_addr.clone()),
-                value: Box::new(values[0].1.clone().cast_ptr(ctx.nptr(Type::Void))),
-                desc: ctx.alloc_field(FieldDesc::new(
-                    fat_ptr_type.as_class_ref().unwrap(),
-                    data_ptr_name,
-                    void_ptr,
-                )),
-            };
+            let data_val = values[0].1;
+            let void_ptr_ty = ctx.nptr(Type::Void);
+            let data_val = ctx.cast_ptr(data_val, void_ptr_ty);
+            let data_desc = ctx.alloc_field(FieldDesc::new(
+                fat_ptr_type.as_class_ref().unwrap(),
+                data_ptr_name,
+                void_ptr,
+            ));
+            let assign_ptr = ctx.set_field(data_desc, init_addr, data_val);
             let name = ctx.alloc_string(crate::METADATA);
             let meta_type = get_type(meta.ty(ctx.body(), ctx.tcx()), ctx);
-            let assign_metadata = V1Root::SetField {
-                addr: Box::new(init_addr),
-                value: Box::new(handle_operand(meta, ctx).transmute_on_stack(
-                    meta_type,
-                    cilly::Type::Int(Int::USize),
-                    ctx,
-                )),
-                desc: ctx.alloc_field(FieldDesc::new(
-                    fat_ptr_type.as_class_ref().unwrap(),
-                    name,
-                    cilly::Type::Int(Int::USize),
-                )),
-            };
+            let meta_val = handle_operand(meta, ctx);
+            let meta_val =
+                ctx.transmute_on_stack(meta_type, cilly::Type::Int(Int::USize), meta_val);
+            let meta_desc = ctx.alloc_field(FieldDesc::new(
+                fat_ptr_type.as_class_ref().unwrap(),
+                name,
+                cilly::Type::Int(Int::USize),
+            ));
+            let assign_metadata = ctx.set_field(meta_desc, init_addr, meta_val);
 
             (
                 [assign_ptr, assign_metadata].into(),
@@ -267,9 +256,9 @@ fn aggregate_adt<'tcx>(
     adt_type: Ty<'tcx>,
     subst: &'tcx List<GenericArg<'tcx>>,
     variant_idx: u32,
-    fields: Vec<(u32, V1Node)>,
+    fields: Vec<(u32, Node)>,
     active_field: Option<FieldIdx>,
-) -> (Vec<V1Root>, V1Node) {
+) -> (Vec<Root>, Node) {
     let adt_type = ctx.monomorphize(adt_type);
     let adt_type_ref = get_type(adt_type, ctx)
         .as_class_ref()
@@ -293,11 +282,8 @@ fn aggregate_adt<'tcx>(
                 }
                 let field_desc = field_descrptor(adt_type, field.0, ctx);
 
-                sub_trees.push(V1Root::SetField {
-                    addr: Box::new(obj_getter.clone()),
-                    value: Box::new(field.1),
-                    desc: (field_desc),
-                });
+                let root = ctx.set_field(field_desc, obj_getter, field.1);
+                sub_trees.push(root);
             }
             (sub_trees, (place_get(target_location, ctx)))
         }
@@ -306,7 +292,7 @@ fn aggregate_adt<'tcx>(
 
             let variant_name = variant_name(adt_type, variant_idx);
 
-            let variant_address = adt_address_ops.clone();
+            let variant_address = adt_address_ops;
             let mut sub_trees = Vec::new();
             let enum_variant = adt
                 .variants()
@@ -324,11 +310,9 @@ fn aggregate_adt<'tcx>(
                     continue;
                 }
 
-                sub_trees.push(V1Root::SetField {
-                    addr: Box::new(variant_address.clone()),
-                    value: Box::new(field_value.1.clone()),
-                    desc: ctx.alloc_field(FieldDesc::new(adt_type_ref, field_name, field_type)),
-                });
+                let desc = ctx.alloc_field(FieldDesc::new(adt_type_ref, field_name, field_type));
+                let root = ctx.set_field(desc, variant_address, field_value.1);
+                sub_trees.push(root);
             }
 
             let layout = ctx.layout_of(adt_type);
@@ -367,11 +351,9 @@ fn aggregate_adt<'tcx>(
             let field_name = field_name(adt_type, active_field.as_u32());
 
             let desc = FieldDesc::new(adt_type_ref, ctx.alloc_string(field_name), field_type);
-            sub_trees.push(V1Root::SetField {
-                addr: Box::new(obj_getter.clone()),
-                value: Box::new(fields[0].1.clone()),
-                desc: ctx.alloc_field(desc),
-            });
+            let desc = ctx.alloc_field(desc);
+            let root = ctx.set_field(desc, obj_getter, fields[0].1);
+            sub_trees.push(root);
             (sub_trees, (place_get(target_location, ctx)))
         }
     }

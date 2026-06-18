@@ -1,7 +1,7 @@
+use fxhash::{FxBuildHasher, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use super::{bimap::Interned, opt, Assembly, CILNode, CILRoot};
-use crate::basic_block::BasicBlock as V1Block;
 pub type BlockId = u32;
 #[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
 /// A basic block - sequence of roots, protected by a handler, identified by a unique, per-method id.
@@ -10,6 +10,11 @@ pub struct BasicBlock {
     roots: Vec<Interned<CILRoot>>,
     block_id: BlockId,
     handler: Option<Vec<Self>>,
+    /// An *unresolved* exception-handler target id, set during MIR lowering and consumed by
+    /// [`BasicBlock::resolve_exception_handlers`] (which turns it into `handler`). Mirrors the V1
+    /// `Handler::RawID`. `None` for blocks with no handler or already-resolved handlers.
+    #[serde(default)]
+    handler_id: Option<BlockId>,
 }
 
 impl BasicBlock {
@@ -74,7 +79,28 @@ impl BasicBlock {
             roots,
             block_id,
             handler,
+            handler_id: None,
         }
+    }
+    /// Creates a new block with an *unresolved* exception handler id `handler_id` (mirrors the V1
+    /// `Handler::RawID`). The handler is resolved later by [`Self::resolve_exception_handlers`].
+    #[must_use]
+    pub fn new_raw(
+        roots: Vec<Interned<CILRoot>>,
+        block_id: BlockId,
+        handler_id: Option<BlockId>,
+    ) -> Self {
+        Self {
+            roots,
+            block_id,
+            handler: None,
+            handler_id,
+        }
+    }
+    /// Returns the *unresolved* handler id of this block, if any.
+    #[must_use]
+    pub fn handler_id(&self) -> Option<BlockId> {
+        self.handler_id
     }
 
     #[must_use]
@@ -244,29 +270,121 @@ impl BasicBlock {
             }
         });
     }
-}
-impl BasicBlock {
-    pub fn from_v1(v1: &V1Block, asm: &mut Assembly) -> Self {
-        let handler: Option<Vec<Self>> = v1.handler().map(|handler| {
-            handler
-                .as_blocks()
-                .unwrap()
-                .iter()
-                .map(|block| Self::from_v1(block, asm))
-                .collect()
-        });
-        Self::new(
-            v1.trees()
-                .iter()
-                .map(|root| {
-                    let root = CILRoot::from_v1(root.root(), asm);
-                    asm.alloc_root(root)
-                })
-                .collect(),
-            v1.id(),
-            handler,
-        )
+    /// Returns the `(target, sub_target)` pairs this block (excluding its handler) branches to.
+    /// Mirrors the V1 `BasicBlock::targets`, reading `CILRoot::Branch` roots.
+    #[must_use]
+    pub fn targets_with_sub(&self, asm: &Assembly) -> Vec<(BlockId, BlockId)> {
+        self.roots
+            .iter()
+            .filter_map(|root| match asm.get_root(*root) {
+                CILRoot::Branch(info) => Some((info.0, info.1)),
+                _ => None,
+            })
+            .collect()
     }
+    /// Returns the target of a trailing unconditional jump, if this block ends in one (and the
+    /// sub_target is 0). Mirrors the V1 `BasicBlock::final_uncond_jump`.
+    #[must_use]
+    pub fn final_uncond_jump(&self, asm: &Assembly) -> Option<BlockId> {
+        match self.roots.last().map(|root| asm.get_root(*root)) {
+            Some(CILRoot::Branch(info)) if info.2.is_none() && info.1 == 0 => Some(info.0),
+            _ => None,
+        }
+    }
+    /// Rewrites every branch root in this block so it targets the handler "jumpstarter" block `id`
+    /// instead of its original target (the original target becomes the `sub_target`). Mirrors the V1
+    /// `CILRoot::fix_for_exception_handler`. Asserts each branch's `sub_target` is 0.
+    fn fix_for_exception_handler(&mut self, id: BlockId, asm: &mut Assembly) {
+        for root in &mut self.roots {
+            if let CILRoot::Branch(info) = asm.get_root(*root) {
+                let (target, sub_target, cond) = (info.0, info.1, info.2.clone());
+                assert_eq!(
+                    sub_target, 0,
+                    "An exception handler can't contain inner exception handler!"
+                );
+                *root = asm.alloc_root(CILRoot::Branch(Box::new((id, target, cond))));
+            }
+        }
+    }
+    /// V2 roots are already flat (no nested trees), so shedding is a no-op. Kept for parity with the
+    /// V1 `BasicBlock::sheed_trees` call in `add_fn`.
+    pub fn sheed_trees(&mut self) {}
+    /// Resolves this block's *unresolved* exception handler (set via [`Self::new_raw`]) against the
+    /// full set of cleanup blocks `handler_bbs`. This is the V2 port of the V1
+    /// `BasicBlock::resolve_exception_handlers`: it garbage-collects the reachable handler blocks,
+    /// fixes their branches to point back through a "jumpstarter", inserts the jumpstarter, emits
+    /// `ExitSpecialRegion` launching pads for cross-block branches, and rewrites this block's
+    /// branches to use them. Must run before any optimization/serialization.
+    pub fn resolve_exception_handlers(&mut self, handler_bbs: &[Self], asm: &mut Assembly) {
+        let Some(handler_id) = self.handler_id else {
+            return;
+        };
+        // Get alive handler blocks.
+        let mut handler = block_gc(handler_id, handler_bbs, asm);
+        // Fix up handler jumps.
+        let id = self.block_id;
+        for bb in &mut handler {
+            bb.fix_for_exception_handler(id, asm);
+        }
+        // Insert the "jumpstarter": an unconditional branch into the handler region.
+        handler.insert(
+            0,
+            Self::new(
+                vec![asm.alloc_root(CILRoot::Branch(Box::new((id, handler_id, None))))],
+                BlockId::MAX,
+                None,
+            ),
+        );
+        // Generate launching pads (ExitSpecialRegion) for cross-block branches.
+        let targets = self.targets_with_sub(asm);
+        let targets: FxHashSet<_> = targets.iter().collect();
+        for (target, sub_target) in targets {
+            assert_eq!(*sub_target, 0);
+            let pad = asm.alloc_root(CILRoot::ExitSpecialRegion {
+                target: *target,
+                source: id,
+            });
+            self.roots.push(pad);
+        }
+        // Change branches to use launching pads.
+        self.fix_for_exception_handler(id, asm);
+
+        self.handler = Some(handler);
+        self.handler_id = None;
+    }
+}
+fn find_bb(id: BlockId, bbs: &[BasicBlock]) -> &BasicBlock {
+    bbs.iter().find(|bb| bb.block_id() == id).unwrap()
+}
+/// Garbage-collects the handler blocks reachable from `entrypoint`. Mirrors the V1 `block_gc`.
+fn block_gc(entrypoint: BlockId, bbs: &[BasicBlock], asm: &Assembly) -> Vec<BasicBlock> {
+    let mut alive: FxHashSet<BlockId> = FxHashSet::with_hasher(FxBuildHasher::default());
+    let mut resurecting = FxHashSet::with_hasher(FxBuildHasher::default());
+    let mut to_resurect = FxHashSet::with_hasher(FxBuildHasher::default());
+    to_resurect.insert(entrypoint);
+    while !to_resurect.is_empty() {
+        alive.extend(&resurecting);
+        resurecting.clear();
+        resurecting.extend(&to_resurect);
+        to_resurect.clear();
+        for (target, sub_target) in resurecting
+            .iter()
+            .flat_map(|bb| find_bb(*bb, bbs).targets_with_sub(asm))
+        {
+            assert_eq!(
+                sub_target, 0,
+                "No block can have subblocks before the exception handler resolving phase!"
+            );
+            if !alive.contains(&target) && !resurecting.contains(&target) {
+                to_resurect.insert(target);
+            }
+        }
+    }
+    alive.extend(&resurecting);
+    bbs.iter()
+        .filter(|bb| alive.contains(&bb.block_id))
+        .cloned()
+        .collect()
 }
 #[test]
 fn is_direct_jump() {

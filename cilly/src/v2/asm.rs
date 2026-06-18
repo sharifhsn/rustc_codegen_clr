@@ -834,15 +834,16 @@ impl Assembly {
         ))
         .unwrap()
     }
-    /// Converts the old assembly repr to the new one.
+    /// Finalizes a freshly-built assembly: ensures the `RustVoid` class exists and runs a
+    /// debug-only sanity check. (Historically this was `from_v1`, back when the backend emitted a
+    /// V1 assembly; the backend now builds a V2 assembly directly, so this is just a finalize step.)
     #[must_use]
-    pub fn from_v1(v1: &Assembly) -> Self {
-        let mut empty: Assembly = v1.clone();
-        empty.rust_void();
+    pub fn prepared(mut self) -> Self {
+        self.rust_void();
 
         #[cfg(debug_assertions)]
-        empty.sanity_check();
-        empty
+        self.sanity_check();
+        self
     }
     #[track_caller]
     pub fn sanity_check(&self) {
@@ -1580,12 +1581,551 @@ impl Assembly {
         self.alloc_node(CILNode::LdArg(arg))
     }
 
+    // ---------------------------------------------------------------------
+    // V1 -> V2 migration builders.
+    //
+    // Each of the following mirrors the exact V2 form `CILNode::from_v1` /
+    // `CILRoot::from_v1` (in `cilnode.rs` / `cilroot.rs`) produces for the
+    // corresponding V1 construct, so the backend can emit V2 directly without
+    // calling `from_v1` mid-emission. They MUST stay behavior-identical to
+    // `from_v1`; do not "improve" them.
+    // ---------------------------------------------------------------------
+
+    /// Loads the value of local number `arg`. Mirrors `from_v1(V1Node::LDLoc)`.
+    pub fn ld_loc(&mut self, arg: u32) -> Interned<CILNode> {
+        self.alloc_node(CILNode::LdLoc(arg))
+    }
+
+    /// Dereferences `addr`, loading data of type `tpe`, marking the load as `volatile`.
+    /// Mirrors the `volatile == true` `LdInd` produced by `from_v1(V1Node::Volatile(..))`.
+    pub fn load_volatile(
+        &mut self,
+        addr: impl IntoAsmIndex<Interned<CILNode>>,
+        tpe: impl IntoAsmIndex<Interned<Type>>,
+    ) -> Interned<CILNode> {
+        let addr = addr.into_idx(self);
+        let tpe = tpe.into_idx(self);
+        self.alloc_node(CILNode::LdInd {
+            addr,
+            tpe,
+            volatile: true,
+        })
+    }
+
+    /// Casts the float `input` to the float type `target`. Mirrors
+    /// `from_v1(V1Node::ConvF32 / ConvF64 / ConvF64Un)`: `ConvF32`/`ConvF64` use
+    /// `is_signed = true`, `ConvF64Un` uses `is_signed = false`.
+    pub fn float_cast(
+        &mut self,
+        input: impl IntoAsmIndex<Interned<CILNode>>,
+        target: super::Float,
+        is_signed: bool,
+    ) -> Interned<CILNode> {
+        let input = input.into_idx(self);
+        self.alloc_node(CILNode::FloatCast {
+            input,
+            target,
+            is_signed,
+        })
+    }
+
+    /// Reinterprets a managed reference as a raw pointer. Mirrors
+    /// `from_v1(V1Node::MRefToRawPtr)`.
+    pub fn ref_to_ptr(
+        &mut self,
+        val: impl IntoAsmIndex<Interned<CILNode>>,
+    ) -> Interned<CILNode> {
+        let val = val.into_idx(self);
+        self.alloc_node(CILNode::RefToPtr(val))
+    }
+
+    /// Loads a pointer to the function `mref`. Mirrors `from_v1(V1Node::LDFtn)`.
+    pub fn ld_ftn(
+        &mut self,
+        mref: impl IntoAsmIndex<Interned<MethodRef>>,
+    ) -> Interned<CILNode> {
+        let mref = mref.into_idx(self);
+        self.alloc_node(CILNode::LdFtn(mref))
+    }
+
+    /// Loads the length of a platform array `arr`. Mirrors `from_v1(V1Node::LDLen)`.
+    pub fn ld_len(
+        &mut self,
+        arr: impl IntoAsmIndex<Interned<CILNode>>,
+    ) -> Interned<CILNode> {
+        let arr = arr.into_idx(self);
+        self.alloc_node(CILNode::LdLen(arr))
+    }
+
+    /// Loads a reference to the element of `array` at `index`. Mirrors
+    /// `from_v1(V1Node::LDElelemRef)`.
+    pub fn ld_elem_ref(
+        &mut self,
+        array: impl IntoAsmIndex<Interned<CILNode>>,
+        index: impl IntoAsmIndex<Interned<CILNode>>,
+    ) -> Interned<CILNode> {
+        let array = array.into_idx(self);
+        let index = index.into_idx(self);
+        self.alloc_node(CILNode::LdElelemRef { array, index })
+    }
+
+    /// Unboxes the managed `object` into a value of `tpe`. Mirrors
+    /// `from_v1(V1Node::UnboxAny)`.
+    pub fn unbox_any(
+        &mut self,
+        object: impl IntoAsmIndex<Interned<CILNode>>,
+        tpe: impl IntoAsmIndex<Interned<Type>>,
+    ) -> Interned<CILNode> {
+        let object = object.into_idx(self);
+        let tpe = tpe.into_idx(self);
+        self.alloc_node(CILNode::UnboxAny { object, tpe })
+    }
+
+    /// Allocates `size` bytes from the local (per-call) pool. Mirrors
+    /// `from_v1(V1Node::LocAlloc)`.
+    pub fn loc_alloc(
+        &mut self,
+        size: impl IntoAsmIndex<Interned<CILNode>>,
+    ) -> Interned<CILNode> {
+        let size = size.into_idx(self);
+        self.alloc_node(CILNode::LocAlloc { size })
+    }
+
+    /// Allocates a local buffer of `sizeof(tpe)` aligned to `align`. Mirrors
+    /// `from_v1(V1Node::LocAllocAligned)`.
+    pub fn loc_alloc_aligned(
+        &mut self,
+        tpe: impl IntoAsmIndex<Interned<Type>>,
+        align: u64,
+    ) -> Interned<CILNode> {
+        let tpe = tpe.into_idx(self);
+        self.alloc_node(CILNode::LocAllocAlgined { tpe, align })
+    }
+
+    /// Loads a "type token" for `tpe`. Mirrors `from_v1(V1Node::LDTypeToken)`.
+    pub fn ld_type_token(
+        &mut self,
+        tpe: impl IntoAsmIndex<Interned<Type>>,
+    ) -> Interned<CILNode> {
+        let tpe = tpe.into_idx(self);
+        self.alloc_node(CILNode::LdTypeToken(tpe))
+    }
+
+    /// Checks whether `val` is an instance of class `class`. Mirrors
+    /// `from_v1(V1Node::IsInst)`, which wraps the class ref in `Type::ClassRef`.
+    pub fn is_inst(
+        &mut self,
+        val: impl IntoAsmIndex<Interned<CILNode>>,
+        class: Interned<ClassRef>,
+    ) -> Interned<CILNode> {
+        let val = val.into_idx(self);
+        let tpe = self.alloc_type(Type::ClassRef(class));
+        self.alloc_node(CILNode::IsInst(val, tpe))
+    }
+
+    /// Casts `val` to an instance of class `class`, throwing on failure. Mirrors
+    /// `from_v1(V1Node::CheckedCast)`, which wraps the class ref in `Type::ClassRef`.
+    pub fn checked_cast(
+        &mut self,
+        val: impl IntoAsmIndex<Interned<CILNode>>,
+        class: Interned<ClassRef>,
+    ) -> Interned<CILNode> {
+        let val = val.into_idx(self);
+        let tpe = self.alloc_type(Type::ClassRef(class));
+        self.alloc_node(CILNode::CheckedCast(val, tpe))
+    }
+
+    /// Calls function pointer `fn_ptr` of signature `sig` with `args`. Mirrors
+    /// `from_v1(V1Node::CallI)`.
+    pub fn call_indirect(
+        &mut self,
+        sig: Interned<FnSig>,
+        fn_ptr: impl IntoAsmIndex<Interned<CILNode>>,
+        args: impl Into<Box<[Interned<CILNode>]>>,
+    ) -> Interned<CILNode> {
+        let fn_ptr = fn_ptr.into_idx(self);
+        self.alloc_node(CILNode::CallI(Box::new((fn_ptr, sig, args.into()))))
+    }
+
+    // --- Roots ---
+
+    /// Stores `tree` into local number `local`. Mirrors `from_v1(V1Root::STLoc)`.
+    pub fn st_loc(
+        &mut self,
+        local: u32,
+        tree: impl IntoAsmIndex<Interned<CILNode>>,
+    ) -> Interned<CILRoot> {
+        let tree = tree.into_idx(self);
+        self.alloc_root(CILRoot::StLoc(local, tree))
+    }
+
+    /// Stores `tree` into argument number `arg`. Mirrors `from_v1(V1Root::STArg)`.
+    pub fn st_arg(
+        &mut self,
+        arg: u32,
+        tree: impl IntoAsmIndex<Interned<CILNode>>,
+    ) -> Interned<CILRoot> {
+        let tree = tree.into_idx(self);
+        self.alloc_root(CILRoot::StArg(arg, tree))
+    }
+
+    /// Returns `tree`. Mirrors `from_v1(V1Root::Ret)`.
+    pub fn ret(&mut self, tree: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILRoot> {
+        let tree = tree.into_idx(self);
+        self.alloc_root(CILRoot::Ret(tree))
+    }
+
+    /// Pops (and discards) `tree`. Mirrors `from_v1(V1Root::Pop)`.
+    pub fn pop(&mut self, tree: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILRoot> {
+        let tree = tree.into_idx(self);
+        self.alloc_root(CILRoot::Pop(tree))
+    }
+
+    /// Stores `val` (of type `tpe`) at address `addr`. This is the single V2 root
+    /// that ALL ten V1 store roots (STIndI8/I16/I32/I64/ISize/F32/F64/STObj/STIndPtr,
+    /// and the bare-int stores) collapse to in `from_v1`. `volatile` is `false` for
+    /// every non-`Volatile` store; `from_v1(V1Root::Volatile)` flips it to `true`.
+    pub fn st_ind(
+        &mut self,
+        addr: impl IntoAsmIndex<Interned<CILNode>>,
+        val: impl IntoAsmIndex<Interned<CILNode>>,
+        tpe: Type,
+        volatile: bool,
+    ) -> Interned<CILRoot> {
+        let addr = addr.into_idx(self);
+        let val = val.into_idx(self);
+        self.alloc_root(CILRoot::StInd(Box::new((addr, val, tpe, volatile))))
+    }
+
+    /// Sets `field` of the object at `addr` to `value`. Mirrors
+    /// `from_v1(V1Root::SetField)`. Note the operand evaluation order in `from_v1`
+    /// is value-then-addr, but only the stored indices matter; the resulting root
+    /// is `SetField(field, addr, value)`.
+    pub fn set_field(
+        &mut self,
+        field: Interned<FieldDesc>,
+        addr: impl IntoAsmIndex<Interned<CILNode>>,
+        value: impl IntoAsmIndex<Interned<CILNode>>,
+    ) -> Interned<CILRoot> {
+        let addr = addr.into_idx(self);
+        let value = value.into_idx(self);
+        self.alloc_root(CILRoot::SetField(Box::new((field, addr, value))))
+    }
+
+    /// Zero-initializes the value of `tpe` at address `addr`. Mirrors
+    /// `from_v1(V1Root::InitObj)`.
+    pub fn init_obj(
+        &mut self,
+        addr: impl IntoAsmIndex<Interned<CILNode>>,
+        tpe: Interned<Type>,
+    ) -> Interned<CILRoot> {
+        let addr = addr.into_idx(self);
+        self.alloc_root(CILRoot::InitObj(addr, tpe))
+    }
+
+    /// Fills `count` bytes at `dst` with `val`. Mirrors `from_v1(V1Root::InitBlk)`.
+    pub fn init_blk(
+        &mut self,
+        dst: impl IntoAsmIndex<Interned<CILNode>>,
+        val: impl IntoAsmIndex<Interned<CILNode>>,
+        count: impl IntoAsmIndex<Interned<CILNode>>,
+    ) -> Interned<CILRoot> {
+        let dst = dst.into_idx(self);
+        let val = val.into_idx(self);
+        let count = count.into_idx(self);
+        self.alloc_root(CILRoot::InitBlk(Box::new((dst, val, count))))
+    }
+
+    /// Copies `len` bytes from `src` to `dst`. Mirrors `from_v1(V1Root::CpBlk)`.
+    pub fn cp_blk(
+        &mut self,
+        dst: impl IntoAsmIndex<Interned<CILNode>>,
+        src: impl IntoAsmIndex<Interned<CILNode>>,
+        len: impl IntoAsmIndex<Interned<CILNode>>,
+    ) -> Interned<CILRoot> {
+        let dst = dst.into_idx(self);
+        let src = src.into_idx(self);
+        let len = len.into_idx(self);
+        self.alloc_root(CILRoot::CpBlk(Box::new((dst, src, len))))
+    }
+
+    /// Sets static field `field` to `val`. Mirrors `from_v1(V1Root::SetStaticField)`.
+    pub fn set_static_field(
+        &mut self,
+        field: impl IntoAsmIndex<Interned<StaticFieldDesc>>,
+        val: impl IntoAsmIndex<Interned<CILNode>>,
+    ) -> Interned<CILRoot> {
+        let field = field.into_idx(self);
+        let val = val.into_idx(self);
+        self.alloc_root(CILRoot::SetStaticField { field, val })
+    }
+
+    /// An unconditional branch to `target`/`sub_target`. Mirrors
+    /// `from_v1(V1Root::GoTo)` (`cond == None`).
+    pub fn branch(
+        &mut self,
+        target: u32,
+        sub_target: u32,
+        cond: Option<super::BranchCond>,
+    ) -> Interned<CILRoot> {
+        self.alloc_root(CILRoot::Branch(Box::new((target, sub_target, cond))))
+    }
+
+    /// Calls fn pointer `fn_ptr` of signature `sig` with `args` as a statement.
+    /// Mirrors `from_v1(V1Root::CallI)`.
+    pub fn call_indirect_root(
+        &mut self,
+        sig: Interned<FnSig>,
+        fn_ptr: impl IntoAsmIndex<Interned<CILNode>>,
+        args: impl Into<Box<[Interned<CILNode>]>>,
+    ) -> Interned<CILRoot> {
+        let fn_ptr = fn_ptr.into_idx(self);
+        self.alloc_root(CILRoot::CallI(Box::new((fn_ptr, sig, args.into()))))
+    }
+
+    /// Casts the pointer-like `val` to the pointer type `new_ptr`. Mirrors
+    /// `from_v1` of [`crate::cil_node::V1Node::cast_ptr`] / `V1Node::CastPtr`:
+    /// dispatches on `new_ptr` to the matching [`PtrCastRes`]. `new_ptr` must be a
+    /// `Ptr`/`Ref`/`FnPtr`/`USize`/`ISize`.
+    pub fn cast_ptr_to(
+        &mut self,
+        val: impl IntoAsmIndex<Interned<CILNode>>,
+        new_ptr: Type,
+    ) -> Interned<CILNode> {
+        let val = val.into_idx(self);
+        let res = match new_ptr {
+            Type::Int(Int::USize) => PtrCastRes::USize,
+            Type::Int(Int::ISize) => PtrCastRes::ISize,
+            Type::Ptr(inner) => PtrCastRes::Ptr(inner),
+            Type::Ref(inner) => PtrCastRes::Ref(inner),
+            Type::FnPtr(sig) => PtrCastRes::FnPtr(sig),
+            _ => panic!("Type {new_ptr:?} is not a pointer."),
+        };
+        self.alloc_node(CILNode::PtrCast(val, Box::new(res)))
+    }
+
+    /// Selects between `a` and `b` based on `predicate`. Mirrors `from_v1` of
+    /// [`crate::cil_node::V1Node::select`].
+    pub fn select(
+        &mut self,
+        tpe: Type,
+        a: impl IntoAsmIndex<Interned<CILNode>>,
+        b: impl IntoAsmIndex<Interned<CILNode>>,
+        predicate: impl IntoAsmIndex<Interned<CILNode>>,
+    ) -> Interned<CILNode> {
+        let a = a.into_idx(self);
+        let b = b.into_idx(self);
+        let predicate = predicate.into_idx(self);
+        match tpe {
+            Type::Int(
+                int @ (Int::I8
+                | Int::U8
+                | Int::I16
+                | Int::U16
+                | Int::I32
+                | Int::U32
+                | Int::I64
+                | Int::U64
+                | Int::I128
+                | Int::U128
+                | Int::ISize
+                | Int::USize),
+            ) => {
+                let main = *self.main_module();
+                let name = format!("select_{}", int.name());
+                let sig = self.sig([Type::Int(int), Type::Int(int), Type::Bool], Type::Int(int));
+                let select = self.new_methodref(main, name, sig, MethodKind::Static, []);
+                self.call(select, &[a, b, predicate], IsPure::PURE)
+            }
+            Type::Ptr(inner) => {
+                let int = Int::USize;
+                let main = *self.main_module();
+                let name = format!("select_{}", int.name());
+                let sig = self.sig([Type::Int(int), Type::Int(int), Type::Bool], Type::Int(int));
+                let select = self.new_methodref(main, name, sig, MethodKind::Static, []);
+                let a = self.ptr_cast(a, PtrCastRes::USize);
+                let a = self.alloc_node(a);
+                let b = self.ptr_cast(b, PtrCastRes::USize);
+                let b = self.alloc_node(b);
+                let call = self.call(select, &[a, b, predicate], IsPure::PURE);
+                self.cast_ptr(call, inner)
+            }
+            _ => todo!("Can't select {tpe:?}"),
+        }
+    }
+
+    /// Builds the overflow-check result tuple `(val, out_of_range)` of class `tuple`.
+    /// Mirrors `from_v1` of [`crate::cil_node::V1Node::ovf_check_tuple`]: a pure call to
+    /// `ovf_check_tuple(tpe, bool) -> tuple` with args `[val, out_of_range]`.
+    pub fn ovf_check_tuple(
+        &mut self,
+        tuple: Interned<ClassRef>,
+        out_of_range: impl IntoAsmIndex<Interned<CILNode>>,
+        val: impl IntoAsmIndex<Interned<CILNode>>,
+        tpe: Type,
+    ) -> Interned<CILNode> {
+        let out_of_range = out_of_range.into_idx(self);
+        let val = val.into_idx(self);
+        let main = self.main_module();
+        let sig = self.sig([tpe, Type::Bool], Type::ClassRef(tuple));
+        let site = self.new_methodref(*main, "ovf_check_tuple", sig, MethodKind::Static, []);
+        self.call(site, &[val, out_of_range], IsPure::PURE)
+    }
+
+    /// Negates `val`. Mirrors `from_v1(V1Node::Neg)`.
+    pub fn neg(&mut self, val: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILNode> {
+        let val = val.into_idx(self);
+        self.alloc_node(CILNode::UnOp(val, UnOp::Neg))
+    }
+
+    /// Bitwise/logical-nots `val`. Mirrors `from_v1(V1Node::Not)`.
+    pub fn not(&mut self, val: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILNode> {
+        let val = val.into_idx(self);
+        self.alloc_node(CILNode::UnOp(val, UnOp::Not))
+    }
+
+    /// Allocates an anonymous static initialized to `val` and loads its address.
+    /// Mirrors `from_v1` of [`crate::cil_node::V1Node::stack_addr`].
+    pub fn stack_addr(
+        &mut self,
+        val: impl IntoAsmIndex<Interned<CILNode>>,
+    ) -> Interned<CILNode> {
+        let val = val.into_idx(self);
+        let sfld = self.annon_const(val);
+        self.alloc_node(CILNode::LdStaticFieldAddress(sfld))
+    }
+
+    /// Calls `mref` with `args` as a statement. Mirrors `from_v1(V1Root::Call /
+    /// V1Root::CallVirt)`, both of which collapse to `CILRoot::call` (`IsPure::NOT`).
+    /// `is_pure` is taken explicitly to mirror the node-level [`Self::call`] for the
+    /// rare pure-call statement cases.
+    pub fn call_root(
+        &mut self,
+        mref: impl IntoAsmIndex<Interned<MethodRef>>,
+        args: &[impl IntoAsmIndex<Interned<CILNode>> + Clone],
+        is_pure: IsPure,
+    ) -> Interned<CILRoot> {
+        let mref = mref.into_idx(self);
+        let args: Vec<Interned<CILNode>> = args
+            .iter()
+            .map(|arg| IntoAsmIndex::<Interned<_>>::into_idx(arg.clone(), self))
+            .collect();
+        self.alloc_root(CILRoot::Call(Box::new((mref, args.into(), is_pure))))
+    }
+
     pub(crate) fn throw(
         &mut self,
         exception: impl IntoAsmIndex<Interned<CILNode>>,
     ) -> Interned<CILRoot> {
         let exception = exception.into_idx(self);
         self.alloc_root(CILRoot::Throw(exception))
+    }
+
+    /// Builds a V2 runtime string node for `pieces`, mirroring `from_v1` of the V1
+    /// `runtime_string` helper (used by [`crate::cil_root::V1Root::debug`]).
+    fn runtime_string(&mut self, pieces: &[&str]) -> Interned<CILNode> {
+        match pieces.len() {
+            0 => panic!("Incorrect piece count"),
+            1 => {
+                let s = self.alloc_string(pieces[0].to_owned());
+                self.alloc_node(CILNode::Const(Box::new(Const::PlatformString(s))))
+            }
+            n @ (2 | 3 | 4) => {
+                let string = ClassRef::string(self);
+                let name = self.alloc_string("Concat");
+                let inputs: Vec<Type> = (0..n).map(|_| Type::PlatformString).collect();
+                let sig = self.sig(inputs, Type::PlatformString);
+                let mref = self.alloc_methodref(MethodRef::new(
+                    string,
+                    name,
+                    sig,
+                    MethodKind::Static,
+                    vec![].into(),
+                ));
+                let args: Vec<Interned<CILNode>> = pieces
+                    .iter()
+                    .map(|p| {
+                        let s = self.alloc_string((*p).to_owned());
+                        self.alloc_node(CILNode::Const(Box::new(Const::PlatformString(s))))
+                    })
+                    .collect();
+                self.call(mref, &args, IsPure::NOT)
+            }
+            _ => {
+                let sub_part = pieces.len() / 4;
+                let string = ClassRef::string(self);
+                let name = self.alloc_string("Concat");
+                let sig = self.sig(
+                    [
+                        Type::PlatformString,
+                        Type::PlatformString,
+                        Type::PlatformString,
+                        Type::PlatformString,
+                    ],
+                    Type::PlatformString,
+                );
+                let mref = self.alloc_methodref(MethodRef::new(
+                    string,
+                    name,
+                    sig,
+                    MethodKind::Static,
+                    vec![].into(),
+                ));
+                let a = self.runtime_string(&pieces[..sub_part]);
+                let b = self.runtime_string(&pieces[sub_part..(sub_part * 2)]);
+                let c = self.runtime_string(&pieces[(sub_part * 2)..(sub_part * 3)]);
+                let d = self.runtime_string(&pieces[(sub_part * 3)..]);
+                self.call(mref, &[a, b, c, d], IsPure::NOT)
+            }
+        }
+    }
+
+    /// Re-emits the `StInd` `root` with its volatile flag set. Mirrors `from_v1` of
+    /// [`crate::cil_root::V1Root::Volatile`] (which flips the inner `StInd`'s volatile
+    /// flag to `true`). Panics if `root` is not a `StInd`.
+    pub fn make_store_volatile(&mut self, root: Interned<CILRoot>) -> Interned<CILRoot> {
+        let CILRoot::StInd(inner) = self.get_root(root).clone() else {
+            panic!("make_store_volatile called on a non-StInd root")
+        };
+        let (addr, val, tpe, _) = *inner;
+        self.alloc_root(CILRoot::StInd(Box::new((addr, val, tpe, true))))
+    }
+
+    /// Builds a root that writes `msg` to the console. Mirrors `from_v1` of
+    /// [`crate::cil_root::V1Root::debug`].
+    pub fn debug_msg(&mut self, msg: &str) -> Interned<CILRoot> {
+        let class = ClassRef::console(self);
+        let name = self.alloc_string("WriteLine");
+        let signature = self.sig([Type::PlatformString], Type::Void);
+        let mref = self.alloc_methodref(MethodRef::new(
+            class,
+            name,
+            signature,
+            MethodKind::Static,
+            vec![].into(),
+        ));
+        let pieces: Vec<&str> = msg.split_inclusive(char::is_whitespace).collect();
+        let message = self.runtime_string(&pieces);
+        self.call_root(mref, &[message], IsPure::NOT)
+    }
+
+    /// Builds a root that throws a new `Exception` with message `msg`. Mirrors
+    /// `from_v1` of [`crate::cil_root::V1Root::throw`].
+    pub fn throw_msg(&mut self, msg: &str) -> Interned<CILRoot> {
+        let class = ClassRef::exception(self);
+        let name = self.alloc_string(".ctor");
+        let signature = self.sig([class.into(), Type::PlatformString], Type::Void);
+        let ctor = self.alloc_methodref(MethodRef::new(
+            class,
+            name,
+            signature,
+            MethodKind::Constructor,
+            vec![].into(),
+        ));
+        let msg = self.alloc_string(msg);
+        let msg = self.alloc_node(CILNode::Const(Box::new(Const::PlatformString(msg))));
+        let exception = self.call(ctor, &[msg], IsPure::NOT);
+        self.throw(exception)
     }
 }
 config!(GUARANTEED_ALIGN, u8, 8);

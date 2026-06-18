@@ -2,7 +2,7 @@
 #![allow(clippy::module_name_repetitions)]
 use cilly::{
     cilnode::IsPure,
-    config, conv_usize,
+    config,
     libc_fns::{self, LIBC_FNS, LIBC_MODIFIES_ERRNO},
     MethodRef, DEAD_CODE_ELIMINATION,
     {

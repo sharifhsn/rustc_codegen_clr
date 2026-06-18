@@ -1,11 +1,11 @@
 use std::fmt::Debug;
 
 use crate::bimap::Interned;
-use crate::method::Method;
 
-use crate::cilnode::{ExtendKind, MethodKind};
-use crate::{call, call_virt, conv_usize, IntoAsmIndex, MethodDef, Type};
-use crate::{cil_node::V1Node, cil_root::V1Root, Assembly};
+use crate::cilnode::{ExtendKind, IsPure, MethodKind};
+use crate::v2::{BasicBlock, CILNode};
+use crate::{BinOp, BranchCond, CILRoot, MethodDef, Type};
+use crate::Assembly;
 use crate::{ClassRef, FnSig, Int, MethodRef, StaticFieldDesc};
 
 pub fn argc_argv_init_method(asm: &mut Assembly) -> Interned<MethodRef> {
@@ -19,7 +19,7 @@ pub fn argc_argv_init_method(asm: &mut Assembly) -> Interned<MethodRef> {
 
     asm.alloc_methodref(init_cs)
 }
-pub fn mstring_to_utf8ptr(mstring: V1Node, asm: &mut Assembly) -> V1Node {
+pub fn mstring_to_utf8ptr(mstring: Interned<CILNode>, asm: &mut Assembly) -> Interned<CILNode> {
     let mref = MethodRef::new(
         ClassRef::marshal(asm),
         asm.alloc_string("StringToCoTaskMemUTF8"),
@@ -27,7 +27,10 @@ pub fn mstring_to_utf8ptr(mstring: V1Node, asm: &mut Assembly) -> V1Node {
         MethodKind::Static,
         vec![].into(),
     );
-    call!(asm.alloc_methodref(mref), [mstring]).cast_ptr(asm.nptr(Type::Int(Int::U8)))
+    let mref = asm.alloc_methodref(mref);
+    let call = asm.call(mref, &[mstring], IsPure::NOT);
+    let u8_ptr = asm.nptr(Type::Int(Int::U8));
+    asm.cast_ptr(call, u8_ptr)
 }
 
 pub fn get_environ(asm: &mut Assembly) -> Interned<MethodRef> {
@@ -45,69 +48,73 @@ pub fn get_environ(asm: &mut Assembly) -> Interned<MethodRef> {
     if asm.method_def_from_ref(init_cs).is_some() {
         return init_cs;
     }
-    let mut get_environ = Method::new(
-        crate::Access::Extern,
-        crate::method::MethodType::Static,
-        FnSig::new([], uint8_ptr_ptr),
-        "get_environ",
-        vec![],
-        vec![],
-        vec![],
-        asm,
-    );
-    // Environ static
-    let environ = StaticFieldDesc::new(
-        *asm.main_module(),
-        asm.alloc_string("environ"),
-        uint8_ptr_ptr,
-    );
-    let environ = asm.alloc_sfld(environ);
-    let environ = asm.alloc_node(crate::v2::CILNode::LdStaticField(environ));
-    let dictionary_local = get_environ.add_local(
-        Type::ClassRef(ClassRef::i_dictionary(asm)),
-        Some("dict"),
-        asm,
-    ) as u32;
-    let envc = get_environ.add_local(Type::Int(Int::I32), Some("envc"), asm) as u32;
-    let arr_ptr = get_environ.add_local(uint8_ptr_ptr, Some("arr_ptr"), asm) as u32;
-    let idx = get_environ.add_local(Type::Int(Int::I32), Some("idx"), asm) as u32;
-    let iter_local = get_environ.add_local(
-        Type::ClassRef(ClassRef::dictionary_iterator(asm)),
-        Some("iter"),
-        asm,
-    ) as u32;
+    // Local layout (mirrors the previous `add_local` order):
+    //   0: dict, 1: envc, 2: arr_ptr, 3: idx, 4: iter, 5: keyval, 6: encoded_keyval
+    let dictionary_local: u32 = 0;
+    let envc: u32 = 1;
+    let arr_ptr: u32 = 2;
+    let idx: u32 = 3;
+    let iter_local: u32 = 4;
+    let keyval: u32 = 5;
+    let encoded_keyval: u32 = 6;
     let keyval_tpe = ClassRef::dictionary_entry(asm);
-    let keyval = get_environ.add_local(Type::ClassRef(keyval_tpe), Some("keyval"), asm) as u32;
-    let encoded_keyval = get_environ.add_local(
-        Type::ClassRef(ClassRef::string(asm)),
-        Some("encoded_keyval"),
-        asm,
-    ) as u32;
-    let first_check_bb = get_environ.new_bb();
-    let init_bb = get_environ.new_bb();
-    let loop_body_bb = get_environ.new_bb();
-    let loop_end_bb = get_environ.new_bb();
-    let ret_bb = get_environ.new_bb();
-    let mut blocks = get_environ.blocks_mut();
-    let first_check = &mut blocks[first_check_bb as usize];
-    first_check.trees_mut().push(
-        V1Root::BNe {
-            target: ret_bb,
-            sub_target: 0,
-            a: Box::new(V1Node::V2(environ)),
-            b: Box::new(conv_usize!(V1Node::V2(asm.alloc_node(0_i32))).cast_ptr(uint8_ptr_ptr)),
-        }
-        .into(),
-    );
-    first_check.trees_mut().push(
-        V1Root::GoTo {
-            target: init_bb,
-            sub_target: 0,
-        }
-        .into(),
-    );
-    let init = &mut blocks[init_bb as usize];
-    let i_dictionary = Type::ClassRef(ClassRef::i_dictionary(asm));
+    let i_dictionary_class = ClassRef::i_dictionary(asm);
+    let dictionary_iterator = ClassRef::dictionary_iterator(asm);
+    let string_class = ClassRef::string(asm);
+    let locals = vec![
+        (
+            Some(asm.alloc_string("dict")),
+            asm.alloc_type(Type::ClassRef(i_dictionary_class)),
+        ),
+        (
+            Some(asm.alloc_string("envc")),
+            asm.alloc_type(Type::Int(Int::I32)),
+        ),
+        (Some(asm.alloc_string("arr_ptr")), asm.alloc_type(uint8_ptr_ptr)),
+        (
+            Some(asm.alloc_string("idx")),
+            asm.alloc_type(Type::Int(Int::I32)),
+        ),
+        (
+            Some(asm.alloc_string("iter")),
+            asm.alloc_type(Type::ClassRef(dictionary_iterator)),
+        ),
+        (
+            Some(asm.alloc_string("keyval")),
+            asm.alloc_type(Type::ClassRef(keyval_tpe)),
+        ),
+        (
+            Some(asm.alloc_string("encoded_keyval")),
+            asm.alloc_type(Type::ClassRef(string_class)),
+        ),
+    ];
+    // Block ids (mirror the `new_bb` order): 0 first_check, 1 init, 2 loop_body, 3 loop_end, 4 ret.
+    let first_check_bb: u32 = 0;
+    let init_bb: u32 = 1;
+    let loop_body_bb: u32 = 2;
+    let loop_end_bb: u32 = 3;
+    let ret_bb: u32 = 4;
+    // Environ static field load.
+    let environ_descr =
+        StaticFieldDesc::new(*asm.main_module(), asm.alloc_string("environ"), uint8_ptr_ptr);
+    let environ_fld = asm.alloc_sfld(environ_descr);
+    let environ = asm.alloc_node(CILNode::LdStaticField(environ_fld));
+
+    // ---- first_check block ----
+    let mut first_check_roots = Vec::new();
+    let zero_i32 = asm.alloc_node(0_i32);
+    let zero_usize = asm.int_cast(zero_i32, Int::USize, ExtendKind::ZeroExtend);
+    let zero_ptr = asm.cast_ptr(zero_usize, uint8_ptr_ptr);
+    first_check_roots.push(asm.alloc_root(CILRoot::Branch(Box::new((
+        ret_bb,
+        0,
+        Some(BranchCond::Ne(environ, zero_ptr)),
+    )))));
+    first_check_roots.push(asm.alloc_root(CILRoot::Branch(Box::new((init_bb, 0, None)))));
+
+    // ---- init block ----
+    let mut init_roots = Vec::new();
+    let i_dictionary = Type::ClassRef(i_dictionary_class);
     let mref = MethodRef::new(
         ClassRef::enviroment(asm),
         asm.alloc_string("GetEnvironmentVariables"),
@@ -115,13 +122,9 @@ pub fn get_environ(asm: &mut Assembly) -> Interned<MethodRef> {
         MethodKind::Static,
         vec![].into(),
     );
-    init.trees_mut().push(
-        V1Root::STLoc {
-            local: dictionary_local,
-            tree: call!(asm.alloc_methodref(mref), []),
-        }
-        .into(),
-    );
+    let mref = asm.alloc_methodref(mref);
+    let call = asm.call(mref, &[] as &[Interned<CILNode>], IsPure::NOT);
+    init_roots.push(asm.alloc_root(CILRoot::StLoc(dictionary_local, call)));
     let mref = MethodRef::new(
         ClassRef::i_collection(asm),
         asm.alloc_string("get_Count"),
@@ -129,68 +132,45 @@ pub fn get_environ(asm: &mut Assembly) -> Interned<MethodRef> {
         MethodKind::Virtual,
         vec![].into(),
     );
-    init.trees_mut().push(
-        V1Root::STLoc {
-            local: envc,
-            tree: call_virt!(
-                asm.alloc_methodref(mref),
-                [V1Node::LDLoc(dictionary_local)]
-            ),
-        }
-        .into(),
-    );
-    let element_count = V1Node::LDLoc(envc) + V1Node::V2(asm.alloc_node(1_i32));
+    let mref = asm.alloc_methodref(mref);
+    let ld_dict = asm.ld_loc(dictionary_local);
+    let call = asm.call(mref, &[ld_dict], IsPure::NOT);
+    init_roots.push(asm.alloc_root(CILRoot::StLoc(envc, call)));
+    // arr_size = zext_usize(envc + 1) * stride
+    let ld_envc = asm.ld_loc(envc);
+    let one_i32 = asm.alloc_node(1_i32);
+    let element_count = asm.biop(ld_envc, one_i32, BinOp::Add);
+    let element_count = asm.int_cast(element_count, Int::USize, ExtendKind::ZeroExtend);
     let stride = asm.size_of(uint8_ptr_ptr);
     let stride = asm.int_cast(stride, Int::USize, ExtendKind::ZeroExtend);
-    let arr_size = conv_usize!(element_count) * V1Node::V2(stride.into_idx(asm));
-    let arr_align = conv_usize!(V1Node::V2(asm.size_of(uint8_ptr_ptr).into_idx(asm)));
+    let arr_size = asm.biop(element_count, stride, BinOp::Mul);
+    let arr_align = asm.size_of(uint8_ptr_ptr);
+    let arr_align = asm.int_cast(arr_align, Int::USize, ExtendKind::ZeroExtend);
     let aligned_alloc = MethodRef::aligned_alloc(asm);
-    init.trees_mut().push(
-        V1Root::STLoc {
-            local: arr_ptr,
-            tree: call!(asm.alloc_methodref(aligned_alloc), [arr_size, arr_align])
-                .cast_ptr(uint8_ptr_ptr),
-        }
-        .into(),
-    );
-    init.trees_mut().push(
-        V1Root::STLoc {
-            local: idx,
-            tree: V1Node::V2(asm.alloc_node(0_i32)),
-        }
-        .into(),
-    );
-    let dictionary_iterator = ClassRef::dictionary_iterator(asm);
+    let aligned_alloc = asm.alloc_methodref(aligned_alloc);
+    let alloc_call = asm.call(aligned_alloc, &[arr_size, arr_align], IsPure::NOT);
+    let alloc_call = asm.cast_ptr(alloc_call, uint8_ptr_ptr);
+    init_roots.push(asm.alloc_root(CILRoot::StLoc(arr_ptr, alloc_call)));
+    let zero_i32 = asm.alloc_node(0_i32);
+    init_roots.push(asm.alloc_root(CILRoot::StLoc(idx, zero_i32)));
     let mref = MethodRef::new(
-        ClassRef::i_dictionary(asm),
+        i_dictionary_class,
         asm.alloc_string("GetEnumerator"),
         asm.sig([i_dictionary], Type::ClassRef(dictionary_iterator)),
         MethodKind::Virtual,
         vec![].into(),
     );
-    init.trees_mut().push(
-        V1Root::STLoc {
-            local: iter_local,
-            tree: call_virt!(
-                asm.alloc_methodref(mref),
-                [V1Node::LDLoc(dictionary_local)]
-            ),
-        }
-        .into(),
-    );
+    let mref = asm.alloc_methodref(mref);
+    let ld_dict = asm.ld_loc(dictionary_local);
+    let call = asm.call(mref, &[ld_dict], IsPure::NOT);
+    init_roots.push(asm.alloc_root(CILRoot::StLoc(iter_local, call)));
+    init_roots.push(asm.alloc_root(CILRoot::Branch(Box::new((loop_body_bb, 0, None)))));
 
-    init.trees_mut().push(
-        V1Root::GoTo {
-            target: loop_body_bb,
-            sub_target: 0,
-        }
-        .into(),
-    );
-    let ret = &mut blocks[ret_bb as usize];
+    // ---- ret block ----
+    let ret_roots = vec![asm.alloc_root(CILRoot::Ret(environ))];
 
-    ret.trees_mut()
-        .push(V1Root::V2(asm.alloc_root(crate::v2::CILRoot::Ret(environ))).into());
-    let loop_body = &mut blocks[loop_body_bb as usize];
+    // ---- loop_body block ----
+    let mut loop_body_roots = Vec::new();
     let move_next = MethodRef::new(
         ClassRef::i_enumerator(asm),
         asm.alloc_string("MoveNext"),
@@ -198,14 +178,14 @@ pub fn get_environ(asm: &mut Assembly) -> Interned<MethodRef> {
         MethodKind::Virtual,
         vec![].into(),
     );
-    loop_body.trees_mut().push(
-        V1Root::BFalse {
-            target: loop_end_bb,
-            sub_target: 0,
-            cond: call_virt!(asm.alloc_methodref(move_next), [V1Node::LDLoc(iter_local)]),
-        }
-        .into(),
-    );
+    let move_next = asm.alloc_methodref(move_next);
+    let ld_iter = asm.ld_loc(iter_local);
+    let move_next_call = asm.call(move_next, &[ld_iter], IsPure::NOT);
+    loop_body_roots.push(asm.alloc_root(CILRoot::Branch(Box::new((
+        loop_end_bb,
+        0,
+        Some(BranchCond::False(move_next_call)),
+    )))));
     let get_current = MethodRef::new(
         ClassRef::i_enumerator(asm),
         asm.alloc_string("get_Current"),
@@ -213,19 +193,12 @@ pub fn get_environ(asm: &mut Assembly) -> Interned<MethodRef> {
         MethodKind::Virtual,
         vec![].into(),
     );
-    loop_body.trees_mut().push(
-        V1Root::STLoc {
-            local: keyval,
-            tree: V1Node::UnboxAny(
-                Box::new(call_virt!(
-                    asm.alloc_methodref(get_current),
-                    [V1Node::LDLoc(iter_local)]
-                )),
-                Box::new(Type::ClassRef(keyval_tpe)),
-            ),
-        }
-        .into(),
-    );
+    let get_current = asm.alloc_methodref(get_current);
+    let ld_iter = asm.ld_loc(iter_local);
+    let cur = asm.call(get_current, &[ld_iter], IsPure::NOT);
+    let keyval_ty = asm.alloc_type(Type::ClassRef(keyval_tpe));
+    let unboxed = asm.unbox_any(cur, keyval_ty);
+    loop_body_roots.push(asm.alloc_root(CILRoot::StLoc(keyval, unboxed)));
     let keyval_tpe_ref = asm.nref(Type::ClassRef(keyval_tpe));
     let sig = asm.sig([keyval_tpe_ref], Type::PlatformObject);
     let get_key = MethodRef::new(
@@ -235,18 +208,21 @@ pub fn get_environ(asm: &mut Assembly) -> Interned<MethodRef> {
         MethodKind::Instance,
         vec![].into(),
     );
-    let kv = V1Node::V2(asm.alloc_node(crate::v2::CILNode::LdLocA(keyval)));
-    let key = call!(asm.alloc_methodref(get_key), [kv.clone()]);
-    let mref = MethodRef::new(
+    let get_key = asm.alloc_methodref(get_key);
+    let kv = asm.alloc_node(CILNode::LdLocA(keyval));
+    let key = asm.call(get_key, &[kv], IsPure::NOT);
+    let get_value = MethodRef::new(
         keyval_tpe,
         asm.alloc_string("get_Value"),
         sig,
         MethodKind::Instance,
         vec![].into(),
     );
-    let value = call!(asm.alloc_methodref(mref), [kv]);
+    let get_value = asm.alloc_methodref(get_value);
+    let kv = asm.alloc_node(CILNode::LdLocA(keyval));
+    let value = asm.call(get_value, &[kv], IsPure::NOT);
     let concat = MethodRef::new(
-        ClassRef::string(asm),
+        string_class,
         asm.alloc_string("Concat"),
         asm.sig(
             [
@@ -259,70 +235,81 @@ pub fn get_environ(asm: &mut Assembly) -> Interned<MethodRef> {
         MethodKind::Static,
         vec![].into(),
     );
-    loop_body.trees_mut().push(
-        V1Root::STLoc {
-            local: encoded_keyval,
-            tree: call!(
-                asm.alloc_methodref(concat),
-                [key, V1Node::LdStr("=".into()), value]
-            ),
-        }
-        .into(),
-    );
-    let utf8_kval = mstring_to_utf8ptr(V1Node::LDLoc(encoded_keyval), asm);
-    loop_body.trees_mut().push(
-        V1Root::STIndPtr(
-            V1Node::LDLoc(arr_ptr)
-                + conv_usize!(
-                    V1Node::LDLoc(idx) * V1Node::V2(asm.size_of(uint8_ptr_ptr).into_idx(asm))
-                ),
-            utf8_kval,
-            Box::new(Type::Int(Int::U8)),
-        )
-        .into(),
-    );
-    loop_body.trees_mut().push(
-        V1Root::STLoc {
-            local: idx,
-            tree: V1Node::LDLoc(idx) + V1Node::V2(asm.alloc_node(1_i32)),
-        }
-        .into(),
-    );
+    let concat = asm.alloc_methodref(concat);
+    let eq_str = asm.alloc_string("=");
+    let eq_node = asm.alloc_node(crate::Const::PlatformString(eq_str));
+    let concat_call = asm.call(concat, &[key, eq_node, value], IsPure::NOT);
+    loop_body_roots.push(asm.alloc_root(CILRoot::StLoc(encoded_keyval, concat_call)));
+    let ld_encoded = asm.ld_loc(encoded_keyval);
+    let utf8_kval = mstring_to_utf8ptr(ld_encoded, asm);
+    // addr = arr_ptr + zext_usize(idx * size_of(uint8_ptr_ptr))
+    let ld_arr_ptr = asm.ld_loc(arr_ptr);
+    let ld_idx = asm.ld_loc(idx);
+    let stride_n = asm.size_of(uint8_ptr_ptr);
+    let mul = asm.biop(ld_idx, stride_n, BinOp::Mul);
+    let mul = asm.int_cast(mul, Int::USize, ExtendKind::ZeroExtend);
+    let addr = asm.biop(ld_arr_ptr, mul, BinOp::Add);
+    let u8_ptr_ty = asm.nptr(Type::Int(Int::U8));
+    loop_body_roots.push(asm.alloc_root(CILRoot::StInd(Box::new((
+        addr,
+        utf8_kval,
+        u8_ptr_ty,
+        false,
+    )))));
+    let ld_idx = asm.ld_loc(idx);
+    let one_i32 = asm.alloc_node(1_i32);
+    let inc = asm.biop(ld_idx, one_i32, BinOp::Add);
+    loop_body_roots.push(asm.alloc_root(CILRoot::StLoc(idx, inc)));
+    loop_body_roots.push(asm.alloc_root(CILRoot::Branch(Box::new((loop_body_bb, 0, None)))));
 
-    loop_body.trees_mut().push(
-        V1Root::GoTo {
-            target: loop_body_bb,
-            sub_target: 0,
-        }
-        .into(),
-    );
-    let loop_end = &mut blocks[loop_end_bb as usize];
-    let null_ptr = conv_usize!(V1Node::V2(asm.alloc_node(0_i32))).cast_ptr(uint8_ptr);
-    loop_end.trees_mut().push(
-        V1Root::STIndPtr(
-            V1Node::LDLoc(arr_ptr)
-                + conv_usize!(
-                    V1Node::LDLoc(envc) * V1Node::V2(asm.size_of(uint8_ptr_ptr).into_idx(asm))
-                ),
-            null_ptr,
-            Box::new(Type::Int(Int::U8)),
-        )
-        .into(),
-    );
-    loop_end.trees_mut().push(
-        V1Root::SetStaticField {
-            descr: Box::new(StaticFieldDesc::new(
-                *asm.main_module(),
-                asm.alloc_string("environ"),
-                uint8_ptr_ptr,
-            )),
-            value: V1Node::LDLoc(arr_ptr),
-        }
-        .into(),
-    );
-    drop(blocks);
+    // ---- loop_end block ----
+    let mut loop_end_roots = Vec::new();
+    let zero_i32 = asm.alloc_node(0_i32);
+    let zero_usize = asm.int_cast(zero_i32, Int::USize, ExtendKind::ZeroExtend);
+    let null_ptr = asm.cast_ptr(zero_usize, uint8_ptr);
+    // addr = arr_ptr + zext_usize(envc * size_of(uint8_ptr_ptr))
+    let ld_arr_ptr = asm.ld_loc(arr_ptr);
+    let ld_envc = asm.ld_loc(envc);
+    let stride_n = asm.size_of(uint8_ptr_ptr);
+    let mul = asm.biop(ld_envc, stride_n, BinOp::Mul);
+    let mul = asm.int_cast(mul, Int::USize, ExtendKind::ZeroExtend);
+    let addr = asm.biop(ld_arr_ptr, mul, BinOp::Add);
+    let u8_ptr_ty = asm.nptr(Type::Int(Int::U8));
+    loop_end_roots.push(asm.alloc_root(CILRoot::StInd(Box::new((
+        addr,
+        null_ptr,
+        u8_ptr_ty,
+        false,
+    )))));
+    let environ_descr2 =
+        StaticFieldDesc::new(*asm.main_module(), asm.alloc_string("environ"), uint8_ptr_ptr);
+    let environ_fld2 = asm.alloc_sfld(environ_descr2);
+    let ld_arr_ptr = asm.ld_loc(arr_ptr);
+    loop_end_roots.push(asm.alloc_root(CILRoot::SetStaticField {
+        field: environ_fld2,
+        val: ld_arr_ptr,
+    }));
 
-    let def = MethodDef::from_v1(&get_environ, asm, main_module);
+    // Blocks must be in id order: first_check(0), init(1), loop_body(2), loop_end(3), ret(4).
+    let blocks = vec![
+        BasicBlock::new(first_check_roots, first_check_bb, None),
+        BasicBlock::new(init_roots, init_bb, None),
+        BasicBlock::new(loop_body_roots, loop_body_bb, None),
+        BasicBlock::new(loop_end_roots, loop_end_bb, None),
+        BasicBlock::new(ret_roots, ret_bb, None),
+    ];
+    let sig = asm.alloc_sig(FnSig::new([], uint8_ptr_ptr));
+    let def = MethodDef::from_v2_blocks(
+        crate::Access::Extern,
+        main_module,
+        "get_environ",
+        sig,
+        MethodKind::Static,
+        blocks,
+        locals,
+        vec![],
+        asm,
+    );
     asm.new_method(def);
     asm.add_static(uint8_ptr_ptr, "environ", true, main_module, None, false);
     init_cs
@@ -388,6 +375,14 @@ fn argv() {
 fn environ() {
     let mut asm = Assembly::default();
     get_environ(&mut asm);
+}
+#[test]
+fn environ_serde_roundtrip() {
+    let mut asm = Assembly::default();
+    let _ = get_environ(&mut asm);
+    let asm = asm.prepared();
+    let bytes = postcard::to_stdvec(&asm).expect("serialize");
+    let _decoded: Assembly = postcard::from_bytes(&bytes).expect("deserialize");
 }
 #[test]
 fn test_escape_name() {
