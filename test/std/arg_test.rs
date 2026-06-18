@@ -89,7 +89,7 @@ fn main() {
             let fresh0 = i;
             i = i + 1;
             printf(
-                b"%s\n\0" as *const u8 as *const i8,
+                b"%s\n\0" as *const u8 as *const core::ffi::c_char,
                 *environ.offset(fresh0 as isize),
             );
         }

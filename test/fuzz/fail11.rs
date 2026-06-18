@@ -474,12 +474,12 @@ fn fn6() {
 
     unsafe {
         printf(
-            c"offset of fld0:%p. size of fld0:%x\n".as_ptr() as *const i8,
+            c"offset of fld0:%p. size of fld0:%x\n".as_ptr() as *const core::ffi::c_char,
             core::ptr::addr_of!(tmp5.fld0) as usize - core::ptr::addr_of!(tmp5) as usize,
             core::mem::size_of_val(&tmp5.fld0) as u32,
         );
         printf(
-            c"offset of fld1:%p. size of fld1:%x\n".as_ptr() as *const i8,
+            c"offset of fld1:%p. size of fld1:%x\n".as_ptr() as *const core::ffi::c_char,
             core::ptr::addr_of!(tmp5.fld1) as usize - core::ptr::addr_of!(tmp5) as usize,
             core::mem::size_of_val(&tmp5.fld1) as u32,
         );

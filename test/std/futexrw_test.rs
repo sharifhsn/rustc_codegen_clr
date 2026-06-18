@@ -38,13 +38,13 @@ extern "C" {
 fn main() {
     let rwlock = RwLock::new(0_u32);
     for i in 1..101_u32 {
-        //unsafe{printf("Index is:%u\n\0".as_ptr() as *const i8,i)};
+        //unsafe{printf("Index is:%u\n\0".as_ptr() as *const core::ffi::c_char,i)};
         *(rwlock.write().unwrap()) += 1;
         let value = *rwlock.read().unwrap();
         if value != i {
             unsafe {
                 printf(
-                    "RWlock value invalid. val:%u, should be %u \n\0".as_ptr() as *const i8,
+                    "RWlock value invalid. val:%u, should be %u \n\0".as_ptr() as *const core::ffi::c_char,
                     value,
                     i,
                 )
@@ -53,7 +53,7 @@ fn main() {
         } else {
             unsafe {
                 printf(
-                    "RWlock value is ok. val:%u, should be %u \n\0".as_ptr() as *const i8,
+                    "RWlock value is ok. val:%u, should be %u \n\0".as_ptr() as *const core::ffi::c_char,
                     value,
                     i,
                 )
@@ -64,11 +64,11 @@ fn main() {
     if val != 100 {
         unsafe {
             printf(
-                "RWlock value invalid. val:%u  \n\0".as_ptr() as *const i8,
+                "RWlock value invalid. val:%u  \n\0".as_ptr() as *const core::ffi::c_char,
                 val,
             )
         };
         unsafe { core::intrinsics::abort() };
     };
-    unsafe { printf("RWlock value is OK! val:%u \n\0".as_ptr() as *const i8, val) };
+    unsafe { printf("RWlock value is OK! val:%u \n\0".as_ptr() as *const core::ffi::c_char, val) };
 }

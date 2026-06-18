@@ -35,7 +35,7 @@ const WRITERS_WAITING: u32 = 1 << 31;
 
 #[inline]
 fn is_unlocked(state: u32) -> bool {
-    unsafe{super::printf("state:%x mask:%x\n\0".as_ptr() as *const i8,state,MASK)};
+    unsafe{super::printf("state:%x mask:%x\n\0".as_ptr() as *const core::ffi::c_char,state,MASK)};
     state & MASK == 0
 }
 
@@ -62,7 +62,7 @@ fn is_read_lockable(state: u32) -> bool {
     // and there's no writers waiting. The only situation when this happens is after unlocking,
     // at which point the unlocking thread might be waking up writers, which have priority over readers.
     // The unlocking thread will clear the readers waiting bit and wake up readers, if necessary.
-    unsafe{super::printf("Prepraing to check if is_read_lockable \n\0".as_ptr() as *const i8)};
+    unsafe{super::printf("Prepraing to check if is_read_lockable \n\0".as_ptr() as *const core::ffi::c_char)};
     state & MASK < MAX_READERS && !has_readers_waiting(state) && !has_writers_waiting(state)
 }
 
@@ -179,7 +179,7 @@ impl SysRwLock {
            
             self.write_contended();
         }
-        unsafe{super::printf("calling wirte. self.state is:%x\n\0".as_ptr() as *const i8,self.state.load(std::sync::atomic::Ordering::Relaxed))};
+        unsafe{super::printf("calling wirte. self.state is:%x\n\0".as_ptr() as *const core::ffi::c_char,self.state.load(std::sync::atomic::Ordering::Relaxed))};
     }
 
     #[inline]
@@ -187,9 +187,9 @@ impl SysRwLock {
         let raw_state:u32 = self.state.load(std::sync::atomic::Ordering::Relaxed);
         let expected_fsub:u32 = core::intrinsics::black_box(core::intrinsics::black_box(raw_state) - WRITE_LOCKED);
         let expected_state:u32 = expected_fsub - WRITE_LOCKED;
-        unsafe{super::printf("write_unlock called. The current state is:%x. expected_state is:%x expected_fsub:%x\n\0".as_ptr() as *const i8,raw_state,expected_state,expected_fsub)};
+        unsafe{super::printf("write_unlock called. The current state is:%x. expected_state is:%x expected_fsub:%x\n\0".as_ptr() as *const core::ffi::c_char,raw_state,expected_state,expected_fsub)};
         let fsub =  self.state.fetch_sub(WRITE_LOCKED, Release) ;
-        unsafe{super::printf("fsub is:%x\n\0".as_ptr() as *const i8,fsub)};
+        unsafe{super::printf("fsub is:%x\n\0".as_ptr() as *const core::ffi::c_char,fsub)};
         let state = fsub - WRITE_LOCKED;
 
         debug_assert!(is_unlocked(state));
@@ -263,7 +263,7 @@ impl SysRwLock {
     /// back to waking up readers if there was no writer to wake up.
     #[cold]
     fn wake_writer_or_readers(&self, mut state: u32) {
-        unsafe{super::printf("current lock state:%x \n\0".as_ptr() as *const i8,state)};
+        unsafe{super::printf("current lock state:%x \n\0".as_ptr() as *const core::ffi::c_char,state)};
         assert!(is_unlocked(state));
 
         // The readers waiting bit might be turned on at any point now,
@@ -788,7 +788,7 @@ impl<T: ?Sized> Drop for RwLockReadGuard<'_, T> {
 
 impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
-        unsafe{super::printf("Entering problem area.\n\0".as_ptr() as *const i8)};
+        unsafe{super::printf("Entering problem area.\n\0".as_ptr() as *const core::ffi::c_char)};
         // SAFETY: the conditions of `RwLockWriteGuard::new` were satisfied when created.
         unsafe {
             self.lock.inner.write_unlock();

@@ -455,7 +455,7 @@ fn to_vec(s: &[u8], alloc: Allocator) -> RawVec<u8> {
     let count = s.iter().count();
     unsafe {
         printf(
-            "Prepraing to coppy. Spare cap %d. Data length %d. Iter count %d\n\0".as_ptr() as *const i8,
+            "Prepraing to coppy. Spare cap %d. Data length %d. Iter count %d\n\0".as_ptr() as *const core::ffi::c_char,
             slots.len() as u32,
             s.len() as u32,
             count as u32,
@@ -464,11 +464,11 @@ fn to_vec(s: &[u8], alloc: Allocator) -> RawVec<u8> {
     let mut idx = 0;
     let mut iter = s.iter();
     if !iter.next().is_some(){
-        unsafe { printf("Iter should have returned Some but returned None :(.\n\0".as_ptr() as *const i8) };
+        unsafe { printf("Iter should have returned Some but returned None :(.\n\0".as_ptr() as *const core::ffi::c_char) };
         core::intrinsics::abort();
     }
     for b in s.iter(){
-        unsafe { printf("Copying at %d:%d\n\0".as_ptr() as *const i8,idx as u32,*b as u32) };
+        unsafe { printf("Copying at %d:%d\n\0".as_ptr() as *const core::ffi::c_char,idx as u32,*b as u32) };
         guard.num_init = idx;
       
         //let addr = &mut slots[idx] as *mut _ as *mut u8;
@@ -477,7 +477,7 @@ fn to_vec(s: &[u8], alloc: Allocator) -> RawVec<u8> {
         
         idx += 1;
     }
-    unsafe { printf("Coppy done.\n\0".as_ptr() as *const i8) };
+    unsafe { printf("Coppy done.\n\0".as_ptr() as *const core::ffi::c_char) };
     core::mem::forget(guard);
     // SAFETY:
     // the vec was allocated and initialized above to at least this length.
@@ -514,16 +514,16 @@ where
 
 
     fn next(&mut self) -> Option<(usize, <I as Iterator>::Item)> {
-        //unsafe{printf("Called next!\n\0".as_ptr() as *const i8)};
+        //unsafe{printf("Called next!\n\0".as_ptr() as *const core::ffi::c_char)};
         let a = self.iter.next();
-        //unsafe{printf("inner itrer `is_some` = %d!\n\0".as_ptr() as *const i8,a.is_some() as u8 as u32)};
+        //unsafe{printf("inner itrer `is_some` = %d!\n\0".as_ptr() as *const core::ffi::c_char,a.is_some() as u8 as u32)};
         let a = a?;
-        //unsafe{printf("is indeed some!\n\0".as_ptr() as *const i8)};
+        //unsafe{printf("is indeed some!\n\0".as_ptr() as *const core::ffi::c_char)};
         let i = self.count;
         self.count += 1;
 
         let res = Some((i, a));
-        //unsafe{printf("res `is_some` = %d!\n\0".as_ptr() as *const i8,res.is_some() as u8 as u32)};
+        //unsafe{printf("res `is_some` = %d!\n\0".as_ptr() as *const core::ffi::c_char,res.is_some() as u8 as u32)};
         res
     }
 }
@@ -535,14 +535,14 @@ where
 }
 fn slice_iter_test(s: &[u8]) {
     for b in s.iter() {
-        unsafe { printf("Iter byte %d\n\0".as_ptr() as *const i8, *b as u32) };
+        unsafe { printf("Iter byte %d\n\0".as_ptr() as *const core::ffi::c_char, *b as u32) };
     }
 }
 fn slice_iter_enumerate_test1(s: &[u8]) {
     for (i, b) in enumerate_(s.iter()) {
         unsafe {
             printf(
-                "IterEnum1 byte %d at index %d\n\0".as_ptr() as *const i8,
+                "IterEnum1 byte %d at index %d\n\0".as_ptr() as *const core::ffi::c_char,
                 *b as u32,
                 i as u32,
             )
@@ -554,7 +554,7 @@ fn slice_iter_enumerate_test2(s: &[u8]) {
     for (i, b) in s.iter().enumerate() {
         unsafe {
             printf(
-                "Iter Enum2 byte %d at index %d\n\0".as_ptr() as *const i8,
+                "Iter Enum2 byte %d at index %d\n\0".as_ptr() as *const core::ffi::c_char,
                 *b as u32,
                 i as u32,
             )
@@ -565,11 +565,11 @@ fn enm_tuple_test(){
     let v = 0;
     let itr:Option<<std::iter::Enumerate<std::slice::Iter<'_, u8>> as Iterator>::Item> = Some((0_usize,&v));
     if !black_box(itr).is_some(){
-        unsafe{printf("WTF? Some is... not some?\n\0".as_ptr() as *const i8)};
+        unsafe{printf("WTF? Some is... not some?\n\0".as_ptr() as *const core::ffi::c_char)};
         core::intrinsics::abort();
     }
     else{
-        unsafe{printf("Ok. Some is some.\n\0".as_ptr() as *const i8)};
+        unsafe{printf("Ok. Some is some.\n\0".as_ptr() as *const core::ffi::c_char)};
     }
 }
 fn uninit_test(){
@@ -577,11 +577,11 @@ fn uninit_test(){
    let mut uninit = black_box(MaybeUninit::<u8>::uninit());
    uninit.write(171);
    if uninit.assume_init()  != 171{
-   // unsafe{printf("WTF? MaybeUninit is broken.\n\0".as_ptr() as *const i8)};
+   // unsafe{printf("WTF? MaybeUninit is broken.\n\0".as_ptr() as *const core::ffi::c_char)};
         core::intrinsics::abort();
    }
     else{
-    //unsafe{printf("Direct MaybeUninit is OK.\n\0".as_ptr() as *const i8)};
+    //unsafe{printf("Direct MaybeUninit is OK.\n\0".as_ptr() as *const core::ffi::c_char)};
    }
    //let mut uninit_ref = &mut uninit;
 }
@@ -604,8 +604,8 @@ fn main() {
     */
     uninit_test();
     /* 
-    unsafe { printf(owned.as_mut_ptr() as *const i8) };
-    unsafe { printf("\n\0".as_ptr() as *const i8) };
+    unsafe { printf(owned.as_mut_ptr() as *const core::ffi::c_char) };
+    unsafe { printf("\n\0".as_ptr() as *const core::ffi::c_char) };
     if (original.len() != owned.len()) {
         core::intrinsics::abort();
     }
