@@ -22,3 +22,7 @@ test/out
 config.toml
 rust/
 cargo_tests/spinacz/target/
+# feasibility harness: container-only build output (mounted repo) + demo artifacts
+.docker-target/
+feasibility/demo/**/bin/
+feasibility/demo/**/obj/
