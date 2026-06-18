@@ -779,18 +779,35 @@ pub const GB_FNS: &[&str] = &[
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 // TODO: this is not portable at all.
 pub fn f128_support_lib() -> Option<PathBuf> {
-    // 1st. Open `/usr/lib/`.
-
-    let dir = std::fs::read_dir("/usr/lib64").expect("No `/usr/lib64`");
-    // 2nd Iterate trough all files there, and search for the GNU `libgcc_s`, where the f128 support is located.
-    for entry in dir {
-        let entry = entry.unwrap();
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
+    // Search the common (multiarch-aware) library dirs for the GNU `libgcc_s`,
+    // where f128 support lives. `/usr/lib64` only exists on x86_64; on other
+    // arches libgcc_s lives under `/usr/lib/<triple>/` or `/lib/<triple>/`, so
+    // we skip missing dirs instead of panicking.
+    let mut dirs: Vec<PathBuf> = vec!["/usr/lib64".into(), "/usr/lib".into(), "/lib".into()];
+    for base in ["/usr/lib", "/lib"] {
+        let Ok(rd) = std::fs::read_dir(base) else {
             continue;
         };
-        if name.contains("libgcc_s") && entry.metadata().unwrap().is_file() {
-            return Some(entry.path());
+        for entry in rd.flatten() {
+            if entry.file_name().to_string_lossy().ends_with("-linux-gnu")
+                && entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+            {
+                dirs.push(entry.path());
+            }
+        }
+    }
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.contains("libgcc_s") && entry.metadata().map(|m| m.is_file()).unwrap_or(false) {
+                return Some(entry.path());
+            }
         }
     }
     None

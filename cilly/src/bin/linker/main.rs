@@ -60,60 +60,55 @@ static BACKUP_STD: std::sync::LazyLock<Option<PathBuf>> = std::sync::LazyLock::n
         .next()
 });
 #[cfg(target_os = "linux")]
+/// Candidate directories to search for shared libraries, multiarch-aware.
+/// Auto-discovers `*-linux-gnu` subdirs (e.g. `aarch64-linux-gnu`) so library
+/// lookup works on non-x86_64 hosts, where `/lib64` does not exist and libc
+/// lives under `/usr/lib/<triple>/` instead.
+fn linux_lib_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = ["/lib", "/usr/lib", "/lib64", "/usr/lib64"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    for base in ["/lib", "/usr/lib"] {
+        let Ok(rd) = std::fs::read_dir(base) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            if entry.file_name().to_string_lossy().ends_with("-linux-gnu")
+                && entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+            {
+                dirs.push(entry.path());
+            }
+        }
+    }
+    dirs
+}
+#[cfg(target_os = "linux")]
+/// Find a shared library whose file name contains `needle` (e.g. `"libc.so."`),
+/// falling back to the bare soname for the dynamic loader to resolve. Missing
+/// directories are skipped rather than panicked on.
+fn find_linux_lib(needle: &str, fallback: &str) -> String {
+    for dir in linux_lib_dirs() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            if entry.metadata().map(|m| m.is_file()).unwrap_or(false)
+                && entry.file_name().to_string_lossy().contains(needle)
+            {
+                return entry.path().to_string_lossy().into_owned();
+            }
+        }
+    }
+    fallback.to_owned()
+}
+#[cfg(target_os = "linux")]
 fn get_libc_() -> String {
-    let mut libc = None;
-    for entry in std::fs::read_dir("/lib").unwrap() {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        if entry.metadata().unwrap().is_file() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.contains("libc.so.") {
-                libc = Some(entry.path().to_str().unwrap().to_owned());
-            }
-        }
-    }
-    for entry in std::fs::read_dir("/lib64").unwrap() {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        if entry.metadata().unwrap().is_file() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.contains("libc.so.") {
-                libc = Some(entry.path().to_str().unwrap().to_owned());
-            }
-        }
-    }
-    libc.unwrap_or("libc.so.6".into())
-    //todo!()
+    find_linux_lib("libc.so.", "libc.so.6")
 }
 #[cfg(target_os = "linux")]
 fn get_libm_() -> String {
-    let mut libc = None;
-    for entry in std::fs::read_dir("/lib").unwrap() {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        if entry.metadata().unwrap().is_file() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.contains("libm.so.") {
-                libc = Some(entry.path().to_str().unwrap().to_owned());
-            }
-        }
-    }
-    for entry in std::fs::read_dir("/lib64").unwrap() {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        if entry.metadata().unwrap().is_file() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.contains("libm.so.") {
-                libc = Some(entry.path().to_str().unwrap().to_owned());
-            }
-        }
-    }
-    libc.unwrap_or("libm.so.6".into())
-    //todo!()
+    find_linux_lib("libm.so.", "libm.so.6")
 }
 #[cfg(target_os = "windows")]
 fn get_libc_() -> String {
