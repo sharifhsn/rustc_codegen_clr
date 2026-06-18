@@ -18,7 +18,7 @@ pub fn local_address(
     local: usize,
     method: &rustc_middle::mir::Body,
     asm: &mut Assembly,
-) -> Interned<cilly::v2::CILNode> {
+) -> Interned<cilly::ir::CILNode> {
     let local = if let Some(spread_arg) = method.spread_arg
         && local == spread_arg.as_usize()
     {
@@ -41,8 +41,8 @@ pub fn address_last_dereference<'tcx>(
     target_ty: Ty<'tcx>,
     curr_type: PlaceTy<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    addr_calc: Interned<cilly::v2::CILNode>,
-) -> Interned<cilly::v2::CILNode> {
+    addr_calc: Interned<cilly::ir::CILNode>,
+) -> Interned<cilly::ir::CILNode> {
     let curr_type = match curr_type {
         PlaceTy::Ty(curr_type) => curr_type,
         // Enums don't require any special handling
@@ -77,10 +77,10 @@ pub fn address_last_dereference<'tcx>(
 fn field_address<'a>(
     curr_type: super::PlaceTy<'a>,
     ctx: &mut MethodCompileCtx<'a, '_>,
-    addr_calc: Interned<cilly::v2::CILNode>,
+    addr_calc: Interned<cilly::ir::CILNode>,
     field_index: u32,
     field_type: Ty<'a>,
-) -> Interned<cilly::v2::CILNode> {
+) -> Interned<cilly::ir::CILNode> {
     match curr_type {
         super::PlaceTy::Ty(curr_type) => {
             let curr_type = ctx.monomorphize(curr_type);
@@ -172,8 +172,8 @@ pub fn place_elem_address<'tcx>(
     curr_type: PlaceTy<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     place_ty: Ty<'tcx>,
-    addr_calc: Interned<cilly::v2::CILNode>,
-) -> Interned<cilly::v2::CILNode> {
+    addr_calc: Interned<cilly::ir::CILNode>,
+) -> Interned<cilly::ir::CILNode> {
     let curr_type = curr_type.monomorphize(ctx);
 
     match place_elem {

@@ -4,7 +4,7 @@ use cilly::{
     BranchCond, CILRoot, Const, FieldDesc, FnSig, Int, Interned, MethodRef, Type,
 };
 
-type Root = Interned<cilly::v2::CILRoot>;
+type Root = Interned<cilly::ir::CILRoot>;
 use rustc_codegen_clr_ctx::function_name;
 use rustc_codegen_clr_place::{place_address, place_set};
 use rustc_codegen_clr_type::GetTypeExt;
@@ -22,7 +22,7 @@ use rustc_span::Spanned;
 
 mod call;
 mod intrinsics;
-/// Builds an unconditional branch root, mirroring `from_v1(V1Root::GoTo { target, sub_target: 0 })`.
+/// Builds an unconditional branch root targeting `target`.
 fn goto(ctx: &mut MethodCompileCtx<'_, '_>, target: u32) -> Root {
     ctx.alloc_root(CILRoot::Branch(Box::new((target, 0, None))))
 }
@@ -143,9 +143,9 @@ pub fn handle_terminator<'tcx>(
                     format!("assert_{}", op.name())
                 }
                 AssertKind::OverflowNeg(_) => "assert_neg_overflow".into(),
-                AssertKind::BoundsCheck { len, index } => {
-                    let len = handle_operand(len, ctx);
-                    let index = handle_operand(index, ctx);
+                AssertKind::BoundsCheck { .. } => {
+                    // The surrogate `assert_bounds_check` only takes the precomputed `cond` bool;
+                    // the `len`/`index` operands are not part of its ABI.
                     let sig = ctx.sig([Type::Bool], Type::Void);
                     let site = ctx.new_methodref(
                         *main,
@@ -311,8 +311,7 @@ pub fn handle_terminator<'tcx>(
             drop: _,
         } => todo!("Can't yeld yet!"), //_ => todo!("Unhandled terminator kind {kind:?}", kind = terminator.kind),
     };
-    // Every terminator must produce at least one root. (The original V1 assert also accepted the
-    // `V1Root::V2(_)` catch-all for any V2-lowered root, so we don't tighten it further here.)
+    // Every terminator must produce at least one root.
     assert!(
         !res.is_empty(),
         "A terminator did not produce any roots!."
@@ -322,7 +321,7 @@ pub fn handle_terminator<'tcx>(
 
 fn handle_switch<'tcx>(
     ty: Ty<'tcx>,
-    discr: Interned<cilly::v2::CILNode>,
+    discr: Interned<cilly::ir::CILNode>,
     switch: &SwitchTargets,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Vec<Root> {

@@ -7,8 +7,8 @@ use rustc_codegen_clr_place::place_set;
 use rustc_codegen_clr_type::GetTypeExt;
 use rustc_middle::{mir::Place, ty::Instance};
 
-type Node = Interned<cilly::v2::CILNode>;
-type Root = Interned<cilly::v2::CILRoot>;
+type Node = Interned<cilly::ir::CILNode>;
+type Root = Interned<cilly::ir::CILRoot>;
 
 pub fn type_id<'tcx>(
     destination: &Place<'tcx>,

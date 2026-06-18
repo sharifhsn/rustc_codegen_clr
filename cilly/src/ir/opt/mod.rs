@@ -1029,6 +1029,7 @@ fn linearize_blocks(blocks: &[BasicBlock], asm: &Assembly) -> Option<BasicBlock>
     }
     Some(BasicBlock::new(res, blocks[0].block_id(), None))
 }
+// Disabled block-linearization optimization; its only call site (~line 699) is commented out.
 #[allow(dead_code)]
 fn linearilze_best_span(blocks: &mut [BasicBlock], asm: &Assembly) {
     let mut best_score = 1;

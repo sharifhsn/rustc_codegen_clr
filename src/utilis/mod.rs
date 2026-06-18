@@ -1,9 +1,8 @@
 use rustc_abi::VariantIdx;
 use rustc_codegen_clr_type::r#type::escape_field_name;
 use rustc_hir::def_id::DefId;
-use rustc_middle::{
-    mir::interpret::AllocId,
-    ty::{ConstKind, GenericArg, Instance, List, PseudoCanonicalInput, Ty, TyCtxt, TyKind},
+use rustc_middle::ty::{
+    ConstKind, GenericArg, Instance, List, PseudoCanonicalInput, Ty, TyCtxt, TyKind,
 };
 
 pub mod adt;
@@ -108,8 +107,4 @@ macro_rules! assert_morphic {
             ty = $ty
         );
     };
-}
-
-pub(crate) fn alloc_id_to_u64(alloc_id: AllocId) -> u64 {
-    alloc_id.0.into()
 }

@@ -8,7 +8,7 @@ use rustc_codegen_clr_type::GetTypeExt;
 use rustc_middle::span_bug;
 use rustc_middle::ty::{IntTy, Ty, TyKind, UintTy};
 
-type Node = Interned<cilly::v2::CILNode>;
+type Node = Interned<cilly::ir::CILNode>;
 
 pub fn bit_and_unchecked<'tcx>(
     ty_a: Ty<'tcx>,

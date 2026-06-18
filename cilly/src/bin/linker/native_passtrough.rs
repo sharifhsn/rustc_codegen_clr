@@ -1,3 +1,4 @@
+// WIP native-passthrough support; most of this module isn't wired into the linker yet.
 #![allow(dead_code)]
 use cilly::IString;
 use fxhash::{FxBuildHasher, FxHashMap};

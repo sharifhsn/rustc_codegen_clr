@@ -3,7 +3,7 @@ use cilly::{
     Interned, MethodRef, Type, {Assembly, ClassRef, Int},
 };
 
-type Node = Interned<cilly::v2::CILNode>;
+type Node = Interned<cilly::ir::CILNode>;
 
 pub fn atomic_add(addr: Node, addend: Node, tpe: Type, asm: &mut Assembly) -> Node {
     match tpe {

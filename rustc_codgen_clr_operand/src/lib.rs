@@ -8,9 +8,9 @@ extern crate rustc_span;
 pub mod constant;
 pub mod static_data;
 use cilly::Type;
-use cilly::{Interned, v2::CILNode};
+use cilly::{Interned, ir::CILNode};
 use rustc_codegen_clr_ctx::MethodCompileCtx;
-use rustc_codegen_clr_place::{PlaceTy, deref_op, place_address, place_get};
+use rustc_codegen_clr_place::{place_address, place_get};
 use rustc_codegen_clr_type::GetTypeExt;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::{ConstValue, Operand};
@@ -75,7 +75,7 @@ pub fn is_uninit<'tcx>(operand: &Operand<'tcx>, ctx: &mut MethodCompileCtx<'tcx,
                     // ZeroSized has no data, so I guess it has no initialized data, so assiments using it could propably be safely skipped.
                     true
                 }
-                ConstValue::Slice { alloc_id,meta } => {
+                ConstValue::Slice { alloc_id, meta: _ } => {
                     // SUS
                       let data = ctx.tcx().global_alloc(alloc_id).unwrap_memory();
                     let mask = data.inner().init_mask();

@@ -1,11 +1,10 @@
 #![feature(rustc_private)]
-#![feature(let_chains)]
 extern crate rustc_abi;
 extern crate rustc_driver;
 extern crate rustc_hir;
 extern crate rustc_middle;
 use cilly::Interned;
-use cilly::{Const, Type};
+use cilly::Const;
 use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_type::GetTypeExt;
 use rustc_codegen_clr_type::utilis::pointer_to_is_fat;
@@ -19,7 +18,7 @@ mod set;
 pub use address::*;
 pub use body::*;
 pub use get::*;
-use rustc_middle::ty::{FloatTy, IntTy, Ty, TyKind, UintTy};
+use rustc_middle::ty::{Ty, TyKind};
 pub use set::*;
 
 fn slice_head<T>(slice: &[T]) -> (&T, &[T]) {
@@ -68,8 +67,8 @@ fn body_ty_is_by_address<'tcx>(last_ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tc
 pub fn deref_op<'tcx>(
     derefed_type: PlaceTy<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    ptr: Interned<cilly::v2::CILNode>,
-) -> Interned<cilly::v2::CILNode> {
+    ptr: Interned<cilly::ir::CILNode>,
+) -> Interned<cilly::ir::CILNode> {
     let ptr = Box::new(ptr);
     let res = if let PlaceTy::Ty(derefed_type) = derefed_type {
         let derefed_type = ctx.type_from_cache(derefed_type);
@@ -84,7 +83,7 @@ pub fn deref_op<'tcx>(
 pub fn place_address<'a>(
     place: &Place<'a>,
     ctx: &mut MethodCompileCtx<'a, '_>,
-) -> Interned<cilly::v2::CILNode> {
+) -> Interned<cilly::ir::CILNode> {
     let place_ty = place.ty(ctx.body(), ctx.tcx());
     let place_ty = ctx.monomorphize(place_ty).ty;
 
@@ -120,7 +119,7 @@ pub fn place_address<'a>(
 pub fn place_address_raw<'a>(
     place: &Place<'a>,
     ctx: &mut MethodCompileCtx<'a, '_>,
-) -> Interned<cilly::v2::CILNode> {
+) -> Interned<cilly::ir::CILNode> {
     let place_ty = place.ty(ctx.body(), ctx.tcx());
     let place_ty = ctx.monomorphize(place_ty).ty;
 
@@ -154,9 +153,9 @@ pub fn place_address_raw<'a>(
 }
 pub fn place_set<'tcx>(
     place: &Place<'tcx>,
-    value_calc: Interned<cilly::v2::CILNode>,
+    value_calc: Interned<cilly::ir::CILNode>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> Interned<cilly::v2::CILRoot> {
+) -> Interned<cilly::ir::CILRoot> {
     if place.projection.is_empty() {
         set::local_set(place.local.as_usize(), ctx.body(), value_calc, ctx)
     } else {

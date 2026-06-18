@@ -6,7 +6,7 @@ macro_rules! binop {
     ($op_name:ident,$op_dotnet:literal) => {
         pub fn $op_name(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
             let name = asm.alloc_string(stringify!($op_name));
-            let generator = move |mref: $crate::v2::Interned<$crate::v2::MethodRef>,
+            let generator = move |mref: $crate::ir::Interned<$crate::ir::MethodRef>,
                                   asm: &mut Assembly| {
                 let sig = asm[asm[mref].sig()].clone();
 

@@ -6,10 +6,10 @@ use cilly::{
     StaticFieldDesc, Type,
     cilnode::MethodKind,
     utilis::encode,
-    v2::{BasicBlock, CILNode},
+    ir::{BasicBlock, CILNode},
 };
 
-type Root = Interned<cilly::v2::CILRoot>;
+type Root = Interned<cilly::ir::CILRoot>;
 use rustc_codegen_clr_call::CallInfo;
 pub use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_ctx::function_name;
@@ -129,7 +129,7 @@ pub fn add_allocation(
                 None,
                 false,
             );
-            return (ctx.load_static(field_desc));
+            return ctx.load_static(field_desc);
         }
         GlobalAlloc::Function { .. } => {
             //TODO: handle constant functions
@@ -137,7 +137,7 @@ pub fn add_allocation(
             let field_desc =
                 ctx.add_static(uint8_ptr, alloc_fld, false, main_module_id, None, false);
 
-            return (ctx.load_static(field_desc));
+            return ctx.load_static(field_desc);
             //todo!("Function/Vtable allocation.");
         }
         GlobalAlloc::TypeId{..} => todo!(),
@@ -149,11 +149,11 @@ pub fn add_allocation(
         const_allocation.inspect_with_uninit_and_ptr_outside_interpreter(0..const_allocation.len());
     let align = const_allocation.align.bytes().max(1);
     if const_allocation.len() == 0 {
-        return (ctx.alloc_node(Const::USize(align)));
+        return ctx.alloc_node(Const::USize(align));
     }
     // Check if const literal can be used
     if const_allocation.provenance().ptrs().is_empty() && align <= 1 {
-        return (ctx.bytebuffer(bytes, Int::U8));
+        return ctx.bytebuffer(bytes, Int::U8);
     }
     // Alloc ids are *not* unique across all crates. Adding the hash here ensures we don't overwrite allocations during linking
     // TODO:consider using something better here / making the hashes stable.
@@ -227,7 +227,7 @@ fn allocation_initializer_method(
     let ptrs = const_allocation.provenance().ptrs();
     let mut trees: Vec<Root> = Vec::new();
 
-    // Direct V2 emission, mirroring the previous V1 lowering via `CILRoot::from_v1` exactly.
+    // Emit the static-initialization roots directly.
     // STLoc(0, ptr)
     trees.push(ctx.alloc_root(CILRoot::StLoc(0, ptr)));
     // CpBlk(dst = LdLoc(0), src = bytebuffer, len = const)
@@ -309,7 +309,7 @@ fn allocation_initializer_method(
     let alloc_ptr_name = ctx.alloc_string("alloc_ptr");
     let sig = ctx.alloc_sig(FnSig::new([], ret));
     let main_module_id = ctx.main_module();
-    let init_method = MethodDef::from_v2_blocks(
+    let init_method = MethodDef::from_blocks(
         Access::Private,
         main_module_id,
         &format!("init_{name}"),

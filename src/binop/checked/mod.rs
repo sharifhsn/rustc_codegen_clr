@@ -8,7 +8,7 @@ use rustc_codegen_clr_type::utilis::simple_tuple;
 use rustc_codegen_clr_type::GetTypeExt;
 use rustc_middle::ty::{IntTy, Ty, TyKind, UintTy};
 
-type Node = Interned<cilly::v2::CILNode>;
+type Node = Interned<cilly::ir::CILNode>;
 
 pub fn result_tuple(tpe: Type, out_of_range: Node, val: Node, asm: &mut Assembly) -> Node {
     let tuple = simple_tuple(&[tpe, Type::Bool], asm);
@@ -50,7 +50,7 @@ fn min(ty: Ty, asm: &mut Assembly) -> Node {
                 vec![].into(),
             );
             let mref = asm.alloc_methodref(mref);
-            const EMPTY: [Interned<cilly::v2::CILNode>; 0] = [];
+            const EMPTY: [Interned<cilly::ir::CILNode>; 0] = [];
             asm.call(mref, &EMPTY, IsPure::NOT)
         }
         TyKind::Int(IntTy::Isize) => {
@@ -62,7 +62,7 @@ fn min(ty: Ty, asm: &mut Assembly) -> Node {
                 vec![].into(),
             );
             let mref = asm.alloc_methodref(mref);
-            const EMPTY: [Interned<cilly::v2::CILNode>; 0] = [];
+            const EMPTY: [Interned<cilly::ir::CILNode>; 0] = [];
             asm.call(mref, &EMPTY, IsPure::NOT)
         }
         TyKind::Uint(UintTy::U128) => {
@@ -74,7 +74,7 @@ fn min(ty: Ty, asm: &mut Assembly) -> Node {
                 vec![].into(),
             );
             let mref = asm.alloc_methodref(mref);
-            const EMPTY: [Interned<cilly::v2::CILNode>; 0] = [];
+            const EMPTY: [Interned<cilly::ir::CILNode>; 0] = [];
             asm.call(mref, &EMPTY, IsPure::NOT)
         }
         TyKind::Int(IntTy::I128) => {
@@ -86,7 +86,7 @@ fn min(ty: Ty, asm: &mut Assembly) -> Node {
                 vec![].into(),
             );
             let mref = asm.alloc_methodref(mref);
-            const EMPTY: [Interned<cilly::v2::CILNode>; 0] = [];
+            const EMPTY: [Interned<cilly::ir::CILNode>; 0] = [];
             asm.call(mref, &EMPTY, IsPure::NOT)
         }
         _ => todo!("Can't get min of {ty:?}"),
@@ -111,7 +111,7 @@ fn max(ty: Ty, asm: &mut Assembly) -> Node {
                 vec![].into(),
             );
             let mref = asm.alloc_methodref(mref);
-            const EMPTY: [Interned<cilly::v2::CILNode>; 0] = [];
+            const EMPTY: [Interned<cilly::ir::CILNode>; 0] = [];
             asm.call(mref, &EMPTY, IsPure::NOT)
         }
         TyKind::Int(IntTy::Isize) => {
@@ -123,7 +123,7 @@ fn max(ty: Ty, asm: &mut Assembly) -> Node {
                 vec![].into(),
             );
             let mref = asm.alloc_methodref(mref);
-            const EMPTY: [Interned<cilly::v2::CILNode>; 0] = [];
+            const EMPTY: [Interned<cilly::ir::CILNode>; 0] = [];
             asm.call(mref, &EMPTY, IsPure::NOT)
         }
         TyKind::Uint(UintTy::U128) => {
@@ -135,7 +135,7 @@ fn max(ty: Ty, asm: &mut Assembly) -> Node {
                 vec![].into(),
             );
             let mref = asm.alloc_methodref(mref);
-            const EMPTY: [Interned<cilly::v2::CILNode>; 0] = [];
+            const EMPTY: [Interned<cilly::ir::CILNode>; 0] = [];
             asm.call(mref, &EMPTY, IsPure::NOT)
         }
         TyKind::Int(IntTy::I128) => {
@@ -147,7 +147,7 @@ fn max(ty: Ty, asm: &mut Assembly) -> Node {
                 vec![].into(),
             );
             let mref = asm.alloc_methodref(mref);
-            const EMPTY: [Interned<cilly::v2::CILNode>; 0] = [];
+            const EMPTY: [Interned<cilly::ir::CILNode>; 0] = [];
             asm.call(mref, &EMPTY, IsPure::NOT)
         }
         _ => todo!("Can't get max of {ty:?}"),

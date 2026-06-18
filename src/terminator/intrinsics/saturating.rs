@@ -13,8 +13,7 @@ use rustc_middle::{
 };
 use rustc_span::Spanned;
 
-type Node = Interned<cilly::v2::CILNode>;
-type Root = Interned<cilly::v2::CILRoot>;
+type Root = Interned<cilly::ir::CILRoot>;
 
 pub fn saturating_add<'tcx>(
     args: &[Spanned<Operand<'tcx>>],

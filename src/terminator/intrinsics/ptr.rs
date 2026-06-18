@@ -9,7 +9,7 @@ use rustc_middle::{
 };
 use rustc_span::Spanned;
 
-type Root = Interned<cilly::v2::CILRoot>;
+type Root = Interned<cilly::ir::CILRoot>;
 
 pub fn arith_offset<'tcx>(
     args: &[Spanned<Operand<'tcx>>],

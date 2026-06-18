@@ -2,7 +2,6 @@ use crate::{GetTypeExt, utilis::simple_tuple};
 use cilly::{Assembly, FieldDesc, Float, Int, Type, bimap::Interned};
 use rustc_abi::{FieldIdx, FieldsShape, Layout, LayoutData, VariantIdx, Variants};
 use rustc_codegen_clr_ctx::MethodCompileCtx;
-use rustc_middle::span_bug;
 use rustc_middle::ty::List;
 use rustc_middle::ty::{AdtDef, GenericArg, Ty, TyKind};
 pub fn enum_variant_offsets(_: AdtDef, layout: Layout, vidix: VariantIdx) -> FieldOffsetIterator {
@@ -214,7 +213,7 @@ pub fn field_descrptor<'tcx>(
             field_name,
             field_type,
         ));
-    } else if let TyKind::Coroutine(_, args) = owner_ty.kind() {
+    } else if let TyKind::Coroutine(_, _args) = owner_ty.kind() {
         todo!();
         /*
         let coroutine = args.as_coroutine();
@@ -256,7 +255,7 @@ pub fn field_descrptor<'tcx>(
     let field_name = ctx.alloc_string(field_name);
     ctx.alloc_field(FieldDesc::new(owner_ty, field_name, field_ty))
 }
-pub fn as_adt(ty: Ty) -> Option<(AdtDef, &List<GenericArg>)> {
+pub fn as_adt<'tcx>(ty: Ty<'tcx>) -> Option<(AdtDef<'tcx>, &'tcx List<GenericArg<'tcx>>)> {
     match ty.kind() {
         TyKind::Adt(adt, subst) => Some((*adt, subst)),
         _ => None,

@@ -13,7 +13,7 @@ use rustc_middle::ty::{Ty, TyKind};
 pub fn local_body<'tcx>(
     local: usize,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> (Interned<cilly::v2::CILNode>, Ty<'tcx>) {
+) -> (Interned<cilly::ir::CILNode>, Ty<'tcx>) {
     let ty = ctx.body().local_decls[Local::from_usize(local)].ty;
     let ty = ctx.monomorphize(ty);
     if body_ty_is_by_address(ty, ctx) {
@@ -27,8 +27,8 @@ fn body_field<'a>(
     ctx: &mut MethodCompileCtx<'a, '_>,
     field_index: u32,
     field_ty: Ty<'a>,
-    parrent_node: Interned<cilly::v2::CILNode>,
-) -> (PlaceTy<'a>, Interned<cilly::v2::CILNode>) {
+    parrent_node: Interned<cilly::ir::CILNode>,
+) -> (PlaceTy<'a>, Interned<cilly::ir::CILNode>) {
     match curr_type {
         super::PlaceTy::Ty(curr_type) => {
             let curr_type = ctx.monomorphize(curr_type);
@@ -138,9 +138,9 @@ fn body_field<'a>(
 pub fn place_elem_body_index<'tcx>(
     curr_ty: Ty<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    parrent_node: Interned<cilly::v2::CILNode>,
+    parrent_node: Interned<cilly::ir::CILNode>,
     index: rustc_middle::mir::Local,
-) -> (PlaceTy<'tcx>, Interned<cilly::v2::CILNode>) {
+) -> (PlaceTy<'tcx>, Interned<cilly::ir::CILNode>) {
     let index = crate::local_get(index.as_usize(), ctx.body(), ctx);
     match curr_ty.kind() {
         TyKind::Slice(inner) => {
@@ -197,8 +197,8 @@ pub fn place_elem_body<'tcx>(
     place_elem: &PlaceElem<'tcx>,
     curr_type: PlaceTy<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    parrent_node: Interned<cilly::v2::CILNode>,
-) -> (PlaceTy<'tcx>, Interned<cilly::v2::CILNode>) {
+    parrent_node: Interned<cilly::ir::CILNode>,
+) -> (PlaceTy<'tcx>, Interned<cilly::ir::CILNode>) {
     let curr_ty = match curr_type {
         PlaceTy::Ty(ty) => PlaceTy::Ty(ctx.monomorphize(ty)),
         PlaceTy::EnumVariant(enm, idx) => PlaceTy::EnumVariant(ctx.monomorphize(enm), idx),

@@ -835,8 +835,7 @@ impl Assembly {
         .unwrap()
     }
     /// Finalizes a freshly-built assembly: ensures the `RustVoid` class exists and runs a
-    /// debug-only sanity check. (Historically this was `from_v1`, back when the backend emitted a
-    /// V1 assembly; the backend now builds a V2 assembly directly, so this is just a finalize step.)
+    /// debug-only sanity check.
     #[must_use]
     pub fn prepared(mut self) -> Self {
         self.rust_void();
@@ -963,7 +962,6 @@ impl Assembly {
         self.eliminate_dead_fns(false);
         self.eliminate_dead_types();
     }
-    #[allow(dead_code)]
     pub(crate) fn eliminate_dead_types(&mut self) {
         let mut previosly_ressurected: FxHashSet<ClassDefIdx> = self
             .method_defs()
@@ -1560,8 +1558,7 @@ impl Assembly {
     }
     /// Builds a fat-pointer value of class `slice_tpe` (a `FatPtr*` / slice class, as produced by
     /// [`crate::r#type::fat_ptr_to`]) from a thin data `ptr` and `metadata`, via the `create_slice`
-    /// builtin. This is the V2 counterpart of [`crate::cil_node::V1Node::create_slice`], for the
-    /// V2 place pipeline (`rustc_codegen_clr_place`'s `body.rs`).
+    /// builtin. Used by the place pipeline (`rustc_codegen_clr_place`'s `body.rs`).
     pub fn create_slice(
         &mut self,
         slice_tpe: Interned<ClassRef>,
@@ -1577,27 +1574,21 @@ impl Assembly {
         self.call(create_slice, &[ptr, metadata], IsPure::PURE)
     }
 
-    pub(crate) fn ld_arg(&mut self, arg: u32) -> Interned<CILNode> {
-        self.alloc_node(CILNode::LdArg(arg))
-    }
-
     // ---------------------------------------------------------------------
-    // V1 -> V2 migration builders.
+    // Node / root construction helpers.
     //
-    // Each of the following mirrors the exact V2 form `CILNode::from_v1` /
-    // `CILRoot::from_v1` (in `cilnode.rs` / `cilroot.rs`) produces for the
-    // corresponding V1 construct, so the backend can emit V2 directly without
-    // calling `from_v1` mid-emission. They MUST stay behavior-identical to
-    // `from_v1`; do not "improve" them.
+    // Each builds one specific CIL node or root in its canonical interned form.
+    // They are intentionally minimal and produce a fixed CIL shape that the
+    // optimizer and exporters rely on; keep them simple — do not fold extra
+    // logic into them.
     // ---------------------------------------------------------------------
 
-    /// Loads the value of local number `arg`. Mirrors `from_v1(V1Node::LDLoc)`.
+    /// Loads the value of local number `arg`.
     pub fn ld_loc(&mut self, arg: u32) -> Interned<CILNode> {
         self.alloc_node(CILNode::LdLoc(arg))
     }
 
     /// Dereferences `addr`, loading data of type `tpe`, marking the load as `volatile`.
-    /// Mirrors the `volatile == true` `LdInd` produced by `from_v1(V1Node::Volatile(..))`.
     pub fn load_volatile(
         &mut self,
         addr: impl IntoAsmIndex<Interned<CILNode>>,
@@ -1612,9 +1603,8 @@ impl Assembly {
         })
     }
 
-    /// Casts the float `input` to the float type `target`. Mirrors
-    /// `from_v1(V1Node::ConvF32 / ConvF64 / ConvF64Un)`: `ConvF32`/`ConvF64` use
-    /// `is_signed = true`, `ConvF64Un` uses `is_signed = false`.
+    /// Casts the float `input` to the float type `target`. A signed conversion uses
+    /// `is_signed = true`; an unsigned conversion uses `is_signed = false`.
     pub fn float_cast(
         &mut self,
         input: impl IntoAsmIndex<Interned<CILNode>>,
@@ -1629,8 +1619,7 @@ impl Assembly {
         })
     }
 
-    /// Reinterprets a managed reference as a raw pointer. Mirrors
-    /// `from_v1(V1Node::MRefToRawPtr)`.
+    /// Reinterprets a managed reference as a raw pointer.
     pub fn ref_to_ptr(
         &mut self,
         val: impl IntoAsmIndex<Interned<CILNode>>,
@@ -1639,7 +1628,7 @@ impl Assembly {
         self.alloc_node(CILNode::RefToPtr(val))
     }
 
-    /// Loads a pointer to the function `mref`. Mirrors `from_v1(V1Node::LDFtn)`.
+    /// Loads a pointer to the function `mref`.
     pub fn ld_ftn(
         &mut self,
         mref: impl IntoAsmIndex<Interned<MethodRef>>,
@@ -1648,7 +1637,7 @@ impl Assembly {
         self.alloc_node(CILNode::LdFtn(mref))
     }
 
-    /// Loads the length of a platform array `arr`. Mirrors `from_v1(V1Node::LDLen)`.
+    /// Loads the length of a platform array `arr`.
     pub fn ld_len(
         &mut self,
         arr: impl IntoAsmIndex<Interned<CILNode>>,
@@ -1657,8 +1646,7 @@ impl Assembly {
         self.alloc_node(CILNode::LdLen(arr))
     }
 
-    /// Loads a reference to the element of `array` at `index`. Mirrors
-    /// `from_v1(V1Node::LDElelemRef)`.
+    /// Loads a reference to the element of `array` at `index`.
     pub fn ld_elem_ref(
         &mut self,
         array: impl IntoAsmIndex<Interned<CILNode>>,
@@ -1669,8 +1657,7 @@ impl Assembly {
         self.alloc_node(CILNode::LdElelemRef { array, index })
     }
 
-    /// Unboxes the managed `object` into a value of `tpe`. Mirrors
-    /// `from_v1(V1Node::UnboxAny)`.
+    /// Unboxes the managed `object` into a value of `tpe`.
     pub fn unbox_any(
         &mut self,
         object: impl IntoAsmIndex<Interned<CILNode>>,
@@ -1681,8 +1668,7 @@ impl Assembly {
         self.alloc_node(CILNode::UnboxAny { object, tpe })
     }
 
-    /// Allocates `size` bytes from the local (per-call) pool. Mirrors
-    /// `from_v1(V1Node::LocAlloc)`.
+    /// Allocates `size` bytes from the local (per-call) pool.
     pub fn loc_alloc(
         &mut self,
         size: impl IntoAsmIndex<Interned<CILNode>>,
@@ -1691,8 +1677,7 @@ impl Assembly {
         self.alloc_node(CILNode::LocAlloc { size })
     }
 
-    /// Allocates a local buffer of `sizeof(tpe)` aligned to `align`. Mirrors
-    /// `from_v1(V1Node::LocAllocAligned)`.
+    /// Allocates a local buffer of `sizeof(tpe)` aligned to `align`.
     pub fn loc_alloc_aligned(
         &mut self,
         tpe: impl IntoAsmIndex<Interned<Type>>,
@@ -1702,7 +1687,7 @@ impl Assembly {
         self.alloc_node(CILNode::LocAllocAlgined { tpe, align })
     }
 
-    /// Loads a "type token" for `tpe`. Mirrors `from_v1(V1Node::LDTypeToken)`.
+    /// Loads a "type token" for `tpe`.
     pub fn ld_type_token(
         &mut self,
         tpe: impl IntoAsmIndex<Interned<Type>>,
@@ -1711,8 +1696,8 @@ impl Assembly {
         self.alloc_node(CILNode::LdTypeToken(tpe))
     }
 
-    /// Checks whether `val` is an instance of class `class`. Mirrors
-    /// `from_v1(V1Node::IsInst)`, which wraps the class ref in `Type::ClassRef`.
+    /// Checks whether `val` is an instance of class `class` (the class ref is wrapped in
+    /// `Type::ClassRef`).
     pub fn is_inst(
         &mut self,
         val: impl IntoAsmIndex<Interned<CILNode>>,
@@ -1723,8 +1708,8 @@ impl Assembly {
         self.alloc_node(CILNode::IsInst(val, tpe))
     }
 
-    /// Casts `val` to an instance of class `class`, throwing on failure. Mirrors
-    /// `from_v1(V1Node::CheckedCast)`, which wraps the class ref in `Type::ClassRef`.
+    /// Casts `val` to an instance of class `class`, throwing on failure (the class ref is wrapped
+    /// in `Type::ClassRef`).
     pub fn checked_cast(
         &mut self,
         val: impl IntoAsmIndex<Interned<CILNode>>,
@@ -1735,8 +1720,7 @@ impl Assembly {
         self.alloc_node(CILNode::CheckedCast(val, tpe))
     }
 
-    /// Calls function pointer `fn_ptr` of signature `sig` with `args`. Mirrors
-    /// `from_v1(V1Node::CallI)`.
+    /// Calls function pointer `fn_ptr` of signature `sig` with `args`.
     pub fn call_indirect(
         &mut self,
         sig: Interned<FnSig>,
@@ -1749,7 +1733,7 @@ impl Assembly {
 
     // --- Roots ---
 
-    /// Stores `tree` into local number `local`. Mirrors `from_v1(V1Root::STLoc)`.
+    /// Stores `tree` into local number `local`.
     pub fn st_loc(
         &mut self,
         local: u32,
@@ -1759,7 +1743,7 @@ impl Assembly {
         self.alloc_root(CILRoot::StLoc(local, tree))
     }
 
-    /// Stores `tree` into argument number `arg`. Mirrors `from_v1(V1Root::STArg)`.
+    /// Stores `tree` into argument number `arg`.
     pub fn st_arg(
         &mut self,
         arg: u32,
@@ -1769,22 +1753,21 @@ impl Assembly {
         self.alloc_root(CILRoot::StArg(arg, tree))
     }
 
-    /// Returns `tree`. Mirrors `from_v1(V1Root::Ret)`.
+    /// Returns `tree`.
     pub fn ret(&mut self, tree: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILRoot> {
         let tree = tree.into_idx(self);
         self.alloc_root(CILRoot::Ret(tree))
     }
 
-    /// Pops (and discards) `tree`. Mirrors `from_v1(V1Root::Pop)`.
+    /// Pops (and discards) `tree`.
     pub fn pop(&mut self, tree: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILRoot> {
         let tree = tree.into_idx(self);
         self.alloc_root(CILRoot::Pop(tree))
     }
 
-    /// Stores `val` (of type `tpe`) at address `addr`. This is the single V2 root
-    /// that ALL ten V1 store roots (STIndI8/I16/I32/I64/ISize/F32/F64/STObj/STIndPtr,
-    /// and the bare-int stores) collapse to in `from_v1`. `volatile` is `false` for
-    /// every non-`Volatile` store; `from_v1(V1Root::Volatile)` flips it to `true`.
+    /// Stores `val` (of type `tpe`) at address `addr`. This single root expresses every
+    /// indirect store, regardless of the stored type. `volatile` is `false` for an ordinary
+    /// store; set it to `true` for a volatile store.
     pub fn st_ind(
         &mut self,
         addr: impl IntoAsmIndex<Interned<CILNode>>,
@@ -1797,10 +1780,8 @@ impl Assembly {
         self.alloc_root(CILRoot::StInd(Box::new((addr, val, tpe, volatile))))
     }
 
-    /// Sets `field` of the object at `addr` to `value`. Mirrors
-    /// `from_v1(V1Root::SetField)`. Note the operand evaluation order in `from_v1`
-    /// is value-then-addr, but only the stored indices matter; the resulting root
-    /// is `SetField(field, addr, value)`.
+    /// Sets `field` of the object at `addr` to `value`. The resulting root is
+    /// `SetField(field, addr, value)`.
     pub fn set_field(
         &mut self,
         field: Interned<FieldDesc>,
@@ -1812,8 +1793,7 @@ impl Assembly {
         self.alloc_root(CILRoot::SetField(Box::new((field, addr, value))))
     }
 
-    /// Zero-initializes the value of `tpe` at address `addr`. Mirrors
-    /// `from_v1(V1Root::InitObj)`.
+    /// Zero-initializes the value of `tpe` at address `addr`.
     pub fn init_obj(
         &mut self,
         addr: impl IntoAsmIndex<Interned<CILNode>>,
@@ -1823,7 +1803,7 @@ impl Assembly {
         self.alloc_root(CILRoot::InitObj(addr, tpe))
     }
 
-    /// Fills `count` bytes at `dst` with `val`. Mirrors `from_v1(V1Root::InitBlk)`.
+    /// Fills `count` bytes at `dst` with `val`.
     pub fn init_blk(
         &mut self,
         dst: impl IntoAsmIndex<Interned<CILNode>>,
@@ -1836,7 +1816,7 @@ impl Assembly {
         self.alloc_root(CILRoot::InitBlk(Box::new((dst, val, count))))
     }
 
-    /// Copies `len` bytes from `src` to `dst`. Mirrors `from_v1(V1Root::CpBlk)`.
+    /// Copies `len` bytes from `src` to `dst`.
     pub fn cp_blk(
         &mut self,
         dst: impl IntoAsmIndex<Interned<CILNode>>,
@@ -1849,7 +1829,7 @@ impl Assembly {
         self.alloc_root(CILRoot::CpBlk(Box::new((dst, src, len))))
     }
 
-    /// Sets static field `field` to `val`. Mirrors `from_v1(V1Root::SetStaticField)`.
+    /// Sets static field `field` to `val`.
     pub fn set_static_field(
         &mut self,
         field: impl IntoAsmIndex<Interned<StaticFieldDesc>>,
@@ -1860,8 +1840,7 @@ impl Assembly {
         self.alloc_root(CILRoot::SetStaticField { field, val })
     }
 
-    /// An unconditional branch to `target`/`sub_target`. Mirrors
-    /// `from_v1(V1Root::GoTo)` (`cond == None`).
+    /// A branch to `target`/`sub_target`; unconditional when `cond` is `None`.
     pub fn branch(
         &mut self,
         target: u32,
@@ -1872,7 +1851,6 @@ impl Assembly {
     }
 
     /// Calls fn pointer `fn_ptr` of signature `sig` with `args` as a statement.
-    /// Mirrors `from_v1(V1Root::CallI)`.
     pub fn call_indirect_root(
         &mut self,
         sig: Interned<FnSig>,
@@ -1883,10 +1861,8 @@ impl Assembly {
         self.alloc_root(CILRoot::CallI(Box::new((fn_ptr, sig, args.into()))))
     }
 
-    /// Casts the pointer-like `val` to the pointer type `new_ptr`. Mirrors
-    /// `from_v1` of [`crate::cil_node::V1Node::cast_ptr`] / `V1Node::CastPtr`:
-    /// dispatches on `new_ptr` to the matching [`PtrCastRes`]. `new_ptr` must be a
-    /// `Ptr`/`Ref`/`FnPtr`/`USize`/`ISize`.
+    /// Casts the pointer-like `val` to the pointer type `new_ptr`: dispatches on `new_ptr` to the
+    /// matching [`PtrCastRes`]. `new_ptr` must be a `Ptr`/`Ref`/`FnPtr`/`USize`/`ISize`.
     pub fn cast_ptr_to(
         &mut self,
         val: impl IntoAsmIndex<Interned<CILNode>>,
@@ -1904,8 +1880,7 @@ impl Assembly {
         self.alloc_node(CILNode::PtrCast(val, Box::new(res)))
     }
 
-    /// Selects between `a` and `b` based on `predicate`. Mirrors `from_v1` of
-    /// [`crate::cil_node::V1Node::select`].
+    /// Selects between `a` and `b` based on `predicate`.
     pub fn select(
         &mut self,
         tpe: Type,
@@ -1954,9 +1929,8 @@ impl Assembly {
         }
     }
 
-    /// Builds the overflow-check result tuple `(val, out_of_range)` of class `tuple`.
-    /// Mirrors `from_v1` of [`crate::cil_node::V1Node::ovf_check_tuple`]: a pure call to
-    /// `ovf_check_tuple(tpe, bool) -> tuple` with args `[val, out_of_range]`.
+    /// Builds the overflow-check result tuple `(val, out_of_range)` of class `tuple`: a pure call
+    /// to `ovf_check_tuple(tpe, bool) -> tuple` with args `[val, out_of_range]`.
     pub fn ovf_check_tuple(
         &mut self,
         tuple: Interned<ClassRef>,
@@ -1972,20 +1946,19 @@ impl Assembly {
         self.call(site, &[val, out_of_range], IsPure::PURE)
     }
 
-    /// Negates `val`. Mirrors `from_v1(V1Node::Neg)`.
+    /// Negates `val`.
     pub fn neg(&mut self, val: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILNode> {
         let val = val.into_idx(self);
         self.alloc_node(CILNode::UnOp(val, UnOp::Neg))
     }
 
-    /// Bitwise/logical-nots `val`. Mirrors `from_v1(V1Node::Not)`.
+    /// Bitwise/logical-nots `val`.
     pub fn not(&mut self, val: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILNode> {
         let val = val.into_idx(self);
         self.alloc_node(CILNode::UnOp(val, UnOp::Not))
     }
 
     /// Allocates an anonymous static initialized to `val` and loads its address.
-    /// Mirrors `from_v1` of [`crate::cil_node::V1Node::stack_addr`].
     pub fn stack_addr(
         &mut self,
         val: impl IntoAsmIndex<Interned<CILNode>>,
@@ -1995,10 +1968,8 @@ impl Assembly {
         self.alloc_node(CILNode::LdStaticFieldAddress(sfld))
     }
 
-    /// Calls `mref` with `args` as a statement. Mirrors `from_v1(V1Root::Call /
-    /// V1Root::CallVirt)`, both of which collapse to `CILRoot::call` (`IsPure::NOT`).
-    /// `is_pure` is taken explicitly to mirror the node-level [`Self::call`] for the
-    /// rare pure-call statement cases.
+    /// Calls `mref` with `args` as a statement. `is_pure` is taken explicitly to match the
+    /// node-level [`Self::call`] for the rare pure-call statement cases.
     pub fn call_root(
         &mut self,
         mref: impl IntoAsmIndex<Interned<MethodRef>>,
@@ -2021,8 +1992,7 @@ impl Assembly {
         self.alloc_root(CILRoot::Throw(exception))
     }
 
-    /// Builds a V2 runtime string node for `pieces`, mirroring `from_v1` of the V1
-    /// `runtime_string` helper (used by [`crate::cil_root::V1Root::debug`]).
+    /// Builds a runtime string node concatenating `pieces` (used by [`Self::debug_msg`]).
     fn runtime_string(&mut self, pieces: &[&str]) -> Interned<CILNode> {
         match pieces.len() {
             0 => panic!("Incorrect piece count"),
@@ -2080,9 +2050,8 @@ impl Assembly {
         }
     }
 
-    /// Re-emits the `StInd` `root` with its volatile flag set. Mirrors `from_v1` of
-    /// [`crate::cil_root::V1Root::Volatile`] (which flips the inner `StInd`'s volatile
-    /// flag to `true`). Panics if `root` is not a `StInd`.
+    /// Re-emits the `StInd` `root` with its volatile flag set to `true`.
+    /// Panics if `root` is not a `StInd`.
     pub fn make_store_volatile(&mut self, root: Interned<CILRoot>) -> Interned<CILRoot> {
         let CILRoot::StInd(inner) = self.get_root(root).clone() else {
             panic!("make_store_volatile called on a non-StInd root")
@@ -2091,8 +2060,7 @@ impl Assembly {
         self.alloc_root(CILRoot::StInd(Box::new((addr, val, tpe, true))))
     }
 
-    /// Builds a root that writes `msg` to the console. Mirrors `from_v1` of
-    /// [`crate::cil_root::V1Root::debug`].
+    /// Builds a root that writes `msg` to the console.
     pub fn debug_msg(&mut self, msg: &str) -> Interned<CILRoot> {
         let class = ClassRef::console(self);
         let name = self.alloc_string("WriteLine");
@@ -2109,8 +2077,7 @@ impl Assembly {
         self.call_root(mref, &[message], IsPure::NOT)
     }
 
-    /// Builds a root that throws a new `Exception` with message `msg`. Mirrors
-    /// `from_v1` of [`crate::cil_root::V1Root::throw`].
+    /// Builds a root that throws a new `Exception` with message `msg`.
     pub fn throw_msg(&mut self, msg: &str) -> Interned<CILRoot> {
         let class = ClassRef::exception(self);
         let name = self.alloc_string(".ctor");
@@ -2182,6 +2149,7 @@ pub enum IlasmFlavour {
 pub fn ilasm_path() -> &'static str {
     ILASM_PATH.as_str()
 }
+// Only exercised by the `test_chunked_range` unit test; unused in non-test builds.
 #[allow(dead_code)]
 fn chunked_range(top: u32, parts: u32) -> impl Iterator<Item = std::ops::Range<u32>> {
     let chunk_size = top.div_ceil(parts); // Ceiling of n / m

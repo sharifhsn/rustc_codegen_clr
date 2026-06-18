@@ -1,3 +1,4 @@
+// WIP AOT-compilation support; most of this module isn't wired into the linker yet.
 #![allow(dead_code)]
 pub enum AOTCompileMode {
     NoAOT,

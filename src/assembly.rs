@@ -7,13 +7,13 @@ use crate::{
 use cilly::{
     cilnode::{MethodKind, PtrCastRes},
     utilis::{self},
-    v2::method::LocalDef,
-    v2::BasicBlock,
+    ir::method::LocalDef,
+    ir::BasicBlock,
     Access, Assembly, CILRoot, Int, Interned, IntoAsmIndex, MethodDef, MethodRef, StaticFieldDesc,
     Type,
 };
 
-type Root = Interned<cilly::v2::CILRoot>;
+type Root = Interned<cilly::ir::CILRoot>;
 use rustc_codegen_clr_call::CallInfo;
 use rustc_codegen_clr_ctx::function_name;
 pub use rustc_codegen_clr_ctx::MethodCompileCtx;
@@ -219,8 +219,8 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
             }
             let arg_field = field_descrptor(repacked_ty, arg_id.try_into().unwrap(), ctx);
             let arg = spread_arg.as_u32() - 1 + u32::try_from(arg_id).unwrap();
-            let arg = ctx.alloc_node(cilly::v2::CILNode::LdArg(arg));
-            let repacked = ctx.alloc_node(cilly::v2::CILNode::LdLocA(repacked));
+            let arg = ctx.alloc_node(cilly::ir::CILNode::LdArg(arg));
+            let repacked = ctx.alloc_node(cilly::ir::CILNode::LdLocA(repacked));
             repack_cil.push(ctx.alloc_root(cilly::CILRoot::SetField(Box::new((
                 arg_field, repacked, arg,
             )))));
@@ -264,7 +264,7 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
                     rustc_middle::ty::print::with_no_trimmed_paths! {vec![ctx.throw_msg(&format!("Tired to run a statement {statement:?} which failed to compile with error message {err:?}."))]}
                 }
             };
-            // Typecheck each produced V2 root, warning (not failing) on errors.
+            // Typecheck each produced root, warning (not failing) on errors.
             for root in &statement_tree {
                 if let Err(err) = ctx.get_root(*root).clone().typecheck(sig_idx, &locals, ctx) {
                     ctx.tcx().dcx().span_warn(
@@ -327,7 +327,7 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
         repack_cil = Vec::new();
     }
 
-    // Resolve exception handlers on V2 blocks (the V2 port of the V1 logic). `resolve_exception_handlers`
+    // Resolve exception handlers on the blocks. `resolve_exception_handlers`
     // needs `&mut Assembly`, so we drain the blocks, resolve each against the cleanup blocks, and collect.
     let mut resolved_bbs = Vec::with_capacity(normal_bbs.len());
     for mut bb in normal_bbs {
@@ -342,7 +342,7 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     *first_bb.roots_mut() = repack_cil;
 
     let main_module = ctx.main_module();
-    let mut method = MethodDef::from_v2_blocks(
+    let mut method = MethodDef::from_blocks(
         access_modifier,
         main_module,
         name,
@@ -413,7 +413,8 @@ pub fn add_item<'tcx>(
             );
 
             let alloc = tcx.eval_static_initializer(stotic).unwrap();
-            let alloc_id = tcx.reserve_and_set_memory_alloc(alloc);
+            // The reservation registers the allocation with `tcx`; we don't need the id itself here.
+            let _alloc_id = tcx.reserve_and_set_memory_alloc(alloc);
             let attrs = tcx.codegen_fn_attrs(stotic);
             let instance =
                 rustc_middle::ty::Instance::new_raw(stotic, rustc_middle::ty::List::empty());
@@ -500,9 +501,8 @@ pub(crate) fn span_source_info<'tcx>(
     if cstart >= cend {
         cend = cstart + 1;
     }
-    // Direct V2 emission, mirroring `CILRoot::from_v1(V1Root::SourceFileInfo(..))` exactly.
-    // V1 line range is `lstart..lend`, column range is `cstart..cend` (with `cstart < cend`
-    // guaranteed by the clamp above, matching the assert in `V1Root::source_info`).
+    // Emit the source-file-info root directly. The line range is `lstart..lend`, the column
+    // range is `cstart..cend` (with `cstart < cend` guaranteed by the clamp above).
     let line_start = u32::try_from((lstart as u64).min(u64::from(u32::MAX))).unwrap();
     let line_end = u32::try_from((lend as u64).min(u64::from(u32::MAX))).unwrap();
     let line_len = u16::try_from((line_end - line_start).min(u32::from(u16::MAX))).unwrap();

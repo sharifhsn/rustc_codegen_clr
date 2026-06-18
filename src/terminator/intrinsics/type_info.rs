@@ -14,8 +14,8 @@ use rustc_middle::{
 };
 use rustc_span::Spanned;
 
-type Node = Interned<cilly::v2::CILNode>;
-type Root = Interned<cilly::v2::CILRoot>;
+type Node = Interned<cilly::ir::CILNode>;
+type Root = Interned<cilly::ir::CILRoot>;
 
 pub fn is_val_statically_known<'tcx>(
     args: &[Spanned<Operand<'tcx>>],

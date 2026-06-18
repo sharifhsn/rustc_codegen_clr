@@ -10,8 +10,8 @@ use rustc_codgen_clr_operand::handle_operand;
 use rustc_middle::mir::{Operand, Place};
 use rustc_span::Spanned;
 
-type Node = Interned<cilly::v2::CILNode>;
-type Root = Interned<cilly::v2::CILRoot>;
+type Node = Interned<cilly::ir::CILNode>;
+type Root = Interned<cilly::ir::CILRoot>;
 
 pub fn xchg<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
@@ -153,7 +153,6 @@ pub fn cxchg<'tcx>(
 }
 /// Builds the two roots that store the compare-exchange result: the loaded `old_val`
 /// into the value field, and the `old_val == expected` flag into the flag field.
-/// V2 counterpart of `cilly::cil_node::V1Node::cxchng_res_val`.
 fn cxchng_res_val(
     old_val: Node,
     expected: Node,

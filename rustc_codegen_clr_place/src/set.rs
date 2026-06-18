@@ -8,7 +8,7 @@ use rustc_codegen_clr_type::{
 
 use crate::{PlaceTy, pointed_type};
 use cilly::{
-    Assembly, BinOp, Const, Interned, IntoAsmIndex, Type,
+    Assembly, BinOp, Interned, IntoAsmIndex, Type,
     cilnode::{ExtendKind, IsPure},
     {ClassRef, FieldDesc, Int, MethodRef, cilnode::MethodKind},
 };
@@ -19,9 +19,9 @@ use rustc_middle::{
 pub fn local_set(
     local: usize,
     method: &rustc_middle::mir::Body,
-    tree: Interned<cilly::v2::CILNode>,
+    tree: Interned<cilly::ir::CILNode>,
     asm: &mut Assembly,
-) -> Interned<cilly::v2::CILRoot> {
+) -> Interned<cilly::ir::CILRoot> {
     if let Some(spread_arg) = method.spread_arg
         && local == spread_arg.as_usize()
     {
@@ -44,9 +44,9 @@ pub fn place_elem_set<'a>(
     place_elem: &PlaceElem<'a>,
     curr_type: PlaceTy<'a>,
     ctx: &mut MethodCompileCtx<'a, '_>,
-    addr_calc: Interned<cilly::v2::CILNode>,
-    value_calc: Interned<cilly::v2::CILNode>,
-) -> Interned<cilly::v2::CILRoot> {
+    addr_calc: Interned<cilly::ir::CILNode>,
+    value_calc: Interned<cilly::ir::CILNode>,
+) -> Interned<cilly::ir::CILRoot> {
     match place_elem {
         PlaceElem::Deref => {
             let pointed_type = pointed_type(curr_type);
@@ -204,9 +204,9 @@ pub fn place_elem_set<'a>(
 pub fn ptr_set_op<'tcx>(
     pointed_type: PlaceTy<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    addr_calc: Interned<cilly::v2::CILNode>,
-    value_calc: Interned<cilly::v2::CILNode>,
-) -> Interned<cilly::v2::CILRoot> {
+    addr_calc: Interned<cilly::ir::CILNode>,
+    value_calc: Interned<cilly::ir::CILNode>,
+) -> Interned<cilly::ir::CILRoot> {
     if let PlaceTy::Ty(pointed_type) = pointed_type {
         match pointed_type.kind() {
             TyKind::Int(int_ty) => match int_ty {

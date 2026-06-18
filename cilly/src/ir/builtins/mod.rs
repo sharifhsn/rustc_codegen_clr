@@ -930,7 +930,7 @@ pub fn argc_argv_init(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
             val: ld_argc,
         }));
         loop_end_roots.push(asm.alloc_root(CILRoot::Branch(Box::new((final_bb, 0, None)))));
-        // status = true (kept after the GoTo, mirroring the original V1 ordering exactly).
+        // status = true (intentionally kept after the GoTo).
         let true_node = asm.alloc_node(true);
         loop_end_roots.push(asm.alloc_root(CILRoot::SetStaticField {
             field: status,
@@ -948,7 +948,7 @@ pub fn argc_argv_init(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
             BasicBlock::new(final_roots, final_bb, None),
         ];
         let sig = asm.alloc_sig(FnSig::new([], Type::Void));
-        let def = crate::v2::MethodDef::from_v2_blocks(
+        let def = crate::ir::MethodDef::from_blocks(
             crate::Access::Extern,
             main_module,
             "argc_argv_init",

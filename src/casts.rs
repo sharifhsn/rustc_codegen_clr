@@ -2,7 +2,7 @@ use cilly::cilnode::{ExtendKind, IsPure, MethodKind};
 use cilly::Type;
 use cilly::{Assembly, ClassRef, Float, Int, Interned, MethodRef};
 
-type Node = Interned<cilly::v2::CILNode>;
+type Node = Interned<cilly::ir::CILNode>;
 
 /// Casts from intiger type `src` to target `target`
 pub fn int_to_int(src: Type, target: Type, operand: Node, asm: &mut Assembly) -> Node {

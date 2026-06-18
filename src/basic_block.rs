@@ -6,8 +6,8 @@ use rustc_middle::{
     ty::{Instance, InstanceKind, TyCtxt},
 };
 
-/// Returns the *unresolved* exception-handler block id of a MIR block, if any. Consumed by the V2
-/// `BasicBlock::new_raw` / `resolve_exception_handlers` (mirrors the old V1 `Handler::RawID`).
+/// Returns the *unresolved* exception-handler block id of a MIR block, if any. Consumed by
+/// `BasicBlock::new_raw` / `resolve_exception_handlers`.
 pub(crate) fn handler_for_block<'tcx>(
     block_data: &BasicBlockData,
     blocks: &BasicBlocks<'tcx>,

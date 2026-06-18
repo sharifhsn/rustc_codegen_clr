@@ -1,10 +1,9 @@
 #![deny(unused_must_use)]
 #![allow(clippy::module_name_repetitions)]
 use cilly::{
-    cilnode::IsPure,
     config,
     libc_fns::{self, LIBC_FNS, LIBC_MODIFIES_ERRNO},
-    MethodRef, DEAD_CODE_ELIMINATION,
+    DEAD_CODE_ELIMINATION,
     {
         asm::{MissingMethodPatcher, ILASM_FLAVOUR},
         cilnode::MethodKind,
@@ -323,9 +322,9 @@ fn main() {
     }
     if !*PANIC_MANAGED_BT {
         if *C_MODE {
-           //cilly::v2::builtins::unwind::c_raise_exception(&mut final_assembly, &mut overrides);
+           //cilly::ir::builtins::unwind::c_raise_exception(&mut final_assembly, &mut overrides);
         } else {
-            //cilly::v2::builtins::unwind::raise_exception(&mut final_assembly, &mut overrides);
+            //cilly::ir::builtins::unwind::raise_exception(&mut final_assembly, &mut overrides);
         }
     }
     if !*C_MODE {

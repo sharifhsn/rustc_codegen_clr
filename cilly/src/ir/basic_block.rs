@@ -11,8 +11,8 @@ pub struct BasicBlock {
     block_id: BlockId,
     handler: Option<Vec<Self>>,
     /// An *unresolved* exception-handler target id, set during MIR lowering and consumed by
-    /// [`BasicBlock::resolve_exception_handlers`] (which turns it into `handler`). Mirrors the V1
-    /// `Handler::RawID`. `None` for blocks with no handler or already-resolved handlers.
+    /// [`BasicBlock::resolve_exception_handlers`] (which turns it into `handler`).
+    /// `None` for blocks with no handler or already-resolved handlers.
     #[serde(default)]
     handler_id: Option<BlockId>,
 }
@@ -82,8 +82,8 @@ impl BasicBlock {
             handler_id: None,
         }
     }
-    /// Creates a new block with an *unresolved* exception handler id `handler_id` (mirrors the V1
-    /// `Handler::RawID`). The handler is resolved later by [`Self::resolve_exception_handlers`].
+    /// Creates a new block with an *unresolved* exception handler id `handler_id`.
+    /// The handler is resolved later by [`Self::resolve_exception_handlers`].
     #[must_use]
     pub fn new_raw(
         roots: Vec<Interned<CILRoot>>,
@@ -270,8 +270,8 @@ impl BasicBlock {
             }
         });
     }
-    /// Returns the `(target, sub_target)` pairs this block (excluding its handler) branches to.
-    /// Mirrors the V1 `BasicBlock::targets`, reading `CILRoot::Branch` roots.
+    /// Returns the `(target, sub_target)` pairs this block (excluding its handler) branches to,
+    /// reading `CILRoot::Branch` roots.
     #[must_use]
     pub fn targets_with_sub(&self, asm: &Assembly) -> Vec<(BlockId, BlockId)> {
         self.roots
@@ -283,7 +283,7 @@ impl BasicBlock {
             .collect()
     }
     /// Returns the target of a trailing unconditional jump, if this block ends in one (and the
-    /// sub_target is 0). Mirrors the V1 `BasicBlock::final_uncond_jump`.
+    /// sub_target is 0).
     #[must_use]
     pub fn final_uncond_jump(&self, asm: &Assembly) -> Option<BlockId> {
         match self.roots.last().map(|root| asm.get_root(*root)) {
@@ -292,8 +292,8 @@ impl BasicBlock {
         }
     }
     /// Rewrites every branch root in this block so it targets the handler "jumpstarter" block `id`
-    /// instead of its original target (the original target becomes the `sub_target`). Mirrors the V1
-    /// `CILRoot::fix_for_exception_handler`. Asserts each branch's `sub_target` is 0.
+    /// instead of its original target (the original target becomes the `sub_target`).
+    /// Asserts each branch's `sub_target` is 0.
     fn fix_for_exception_handler(&mut self, id: BlockId, asm: &mut Assembly) {
         for root in &mut self.roots {
             if let CILRoot::Branch(info) = asm.get_root(*root) {
@@ -306,12 +306,11 @@ impl BasicBlock {
             }
         }
     }
-    /// V2 roots are already flat (no nested trees), so shedding is a no-op. Kept for parity with the
-    /// V1 `BasicBlock::sheed_trees` call in `add_fn`.
+    /// Roots are already flat (no nested trees), so shedding is a no-op. Kept for call-site parity
+    /// with `add_fn`.
     pub fn sheed_trees(&mut self) {}
     /// Resolves this block's *unresolved* exception handler (set via [`Self::new_raw`]) against the
-    /// full set of cleanup blocks `handler_bbs`. This is the V2 port of the V1
-    /// `BasicBlock::resolve_exception_handlers`: it garbage-collects the reachable handler blocks,
+    /// full set of cleanup blocks `handler_bbs`: it garbage-collects the reachable handler blocks,
     /// fixes their branches to point back through a "jumpstarter", inserts the jumpstarter, emits
     /// `ExitSpecialRegion` launching pads for cross-block branches, and rewrites this block's
     /// branches to use them. Must run before any optimization/serialization.
@@ -356,7 +355,7 @@ impl BasicBlock {
 fn find_bb(id: BlockId, bbs: &[BasicBlock]) -> &BasicBlock {
     bbs.iter().find(|bb| bb.block_id() == id).unwrap()
 }
-/// Garbage-collects the handler blocks reachable from `entrypoint`. Mirrors the V1 `block_gc`.
+/// Garbage-collects the handler blocks reachable from `entrypoint`.
 fn block_gc(entrypoint: BlockId, bbs: &[BasicBlock], asm: &Assembly) -> Vec<BasicBlock> {
     let mut alive: FxHashSet<BlockId> = FxHashSet::with_hasher(FxBuildHasher::default());
     let mut resurecting = FxHashSet::with_hasher(FxBuildHasher::default());

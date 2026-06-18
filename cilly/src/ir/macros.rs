@@ -194,7 +194,7 @@ macro_rules! size_of {
     (usize) => {{
         use $crate::IntoAsmIndex;
         |asm: &mut $crate::asm::Assembly| {
-            <$crate::CILNode as IntoAsmIndex<$crate::v2::Interned<$crate::v2::CILNode>>>::into_idx(
+            <$crate::CILNode as IntoAsmIndex<$crate::ir::Interned<$crate::ir::CILNode>>>::into_idx(
                 $crate::CILNode::SizeOf(asm.alloc_type($crate::Type::Int($crate::Int::USize))),
                 asm,
             )
@@ -217,7 +217,7 @@ macro_rules! size_of {
     ($val:expr) => {{
         use $crate::IntoAsmIndex;
         |asm: &mut $crate::asm::Assembly| {
-            <$crate::CILNode as IntoAsmIndex<$crate::v2::Interned<$crate::v2::CILNode>>>::into_idx(
+            <$crate::CILNode as IntoAsmIndex<$crate::ir::Interned<$crate::ir::CILNode>>>::into_idx(
                 $crate::CILNode::SizeOf($val.into_idx(asm)),
                 asm,
             )

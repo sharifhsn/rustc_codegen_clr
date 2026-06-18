@@ -1,6 +1,5 @@
 #![feature(rustc_private)]
-#![feature(let_chains)]
-#![feature(f16, alloc_error_hook)]
+#![feature(alloc_error_hook)]
 #![warn(clippy::pedantic)]
 // Used for handling some configs. Will be refactored later.
 #![allow(clippy::assertions_on_constants)]
@@ -299,12 +298,13 @@ impl CodegenBackend for MyBackend {
             let mut asm_out = std::fs::File::create(&serialized_asm_path).expect(
                 "Could not create the temporary files necessary for building the assembly!",
             );
-            let mut v2 = asm.prepared();
-            v2.opt(&mut v2.fuel_from_env());
-            v2.typecheck();
+            let mut prepared = asm.prepared();
+            prepared.opt(&mut prepared.fuel_from_env());
+            prepared.typecheck();
             asm_out
                 .write_all(
-                    &postcard::to_stdvec(&v2).expect("Could not serialize the tmp assembly file!"),
+                    &postcard::to_stdvec(&prepared)
+                        .expect("Could not serialize the tmp assembly file!"),
                 )
                 .expect("Could not save the tmp assembly file!");
             let modules = vec![CompiledModule {

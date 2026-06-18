@@ -5,8 +5,8 @@ use rustc_codgen_clr_operand::handle_operand;
 use rustc_middle::mir::{Operand, Place};
 use rustc_span::Spanned;
 
-type Node = Interned<cilly::v2::CILNode>;
-type Root = Interned<cilly::v2::CILRoot>;
+type Node = Interned<cilly::ir::CILNode>;
+type Root = Interned<cilly::ir::CILRoot>;
 
 /// Gets the aligement of a dynamic object from a fat pointer, by looking it up from the vtable.
 pub fn vtable_align<'tcx>(

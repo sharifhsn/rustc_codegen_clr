@@ -1,5 +1,4 @@
 use core::f16;
-use std::collections::HashSet;
 
 use cilly::{
     Assembly, CILNode, ClassRef, Const, Float, Int, Interned, IntoAsmIndex, MethodRef,
@@ -207,17 +206,17 @@ fn load_scalar_ptr(
                     vec![].into(),
                 );
                 let mref = ctx.alloc_methodref(mref);
-                let environ = ctx.alloc_node(cilly::v2::CILNode::call(mref, []));
+                let environ = ctx.alloc_node(cilly::ir::CILNode::call(mref, []));
                 let environ = ctx.annon_const(environ);
-                return ctx.alloc_node(cilly::v2::CILNode::LdStaticFieldAddress(environ));
+                return ctx.alloc_node(cilly::ir::CILNode::LdStaticFieldAddress(environ));
             }
             let attrs = ctx.tcx().codegen_fn_attrs(def_id);
 
             if attrs.import_linkage.is_some() {
                 // TODO: this could cause issues if the pointer to the static is not imediatly dereferenced.
                 let site = get_fn_from_static_name(&name, ctx);
-                let cst = ctx.annon_const(cilly::v2::CILNode::LdFtn(site));
-                return ctx.alloc_node(cilly::v2::CILNode::LdStaticFieldAddress(cst));
+                let cst = ctx.annon_const(cilly::ir::CILNode::LdFtn(site));
+                return ctx.alloc_node(cilly::ir::CILNode::LdStaticFieldAddress(cst));
             }
             if let Some(section) = attrs.link_section {
                 panic!("static {name} requires special linkage in section {section:?}");
@@ -388,7 +387,7 @@ fn load_const_float(
     value: u128,
     float_type: FloatTy,
     asm: &mut Assembly,
-) -> Interned<cilly::v2::CILNode> {
+) -> Interned<cilly::ir::CILNode> {
     match float_type {
         FloatTy::F16 => {
             #[cfg(not(target_family = "windows"))]
@@ -429,7 +428,7 @@ pub fn load_const_int(
     value: u128,
     int_type: IntTy,
     asm: &mut Assembly,
-) -> Interned<cilly::v2::CILNode> {
+) -> Interned<cilly::ir::CILNode> {
     match int_type {
         IntTy::I8 => asm.alloc_node(i8::from_ne_bytes([u8::try_from(value).unwrap()])),
         IntTy::I16 => asm.alloc_node(i16::from_ne_bytes(
@@ -452,7 +451,7 @@ pub fn load_const_uint(
     value: u128,
     int_type: UintTy,
     asm: &mut Assembly,
-) -> Interned<cilly::v2::CILNode> {
+) -> Interned<cilly::ir::CILNode> {
     match int_type {
         UintTy::U8 => asm.alloc_node(u8::try_from(value).unwrap()),
         UintTy::U16 => asm.alloc_node(u16::try_from(value).unwrap()),
@@ -587,7 +586,7 @@ pub fn get_vtable<'tcx>(
     fx: &mut MethodCompileCtx<'tcx, '_>,
     ty: Ty<'tcx>,
     trait_ref: Option<ExistentialTraitRef<'tcx>>,
-) -> Interned<cilly::v2::CILNode> {
+) -> Interned<cilly::ir::CILNode> {
     let ty = fx.monomorphize(ty);
 
     let alloc_id = fx.tcx().vtable_allocation((ty, trait_ref));

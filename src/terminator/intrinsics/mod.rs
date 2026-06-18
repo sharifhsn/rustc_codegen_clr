@@ -35,8 +35,8 @@ mod atomic;
 mod tpe;
 mod vtable;
 
-type Node = Interned<cilly::v2::CILNode>;
-type Root = Interned<cilly::v2::CILRoot>;
+type Node = Interned<cilly::ir::CILNode>;
+type Root = Interned<cilly::ir::CILRoot>;
 const EMPTY_ARGS: &[Node] = &[];
 
 fn call_atomic<'tcx>(

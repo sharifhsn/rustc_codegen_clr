@@ -1,7 +1,7 @@
 #![allow(clippy::module_name_repetitions)]
 #![feature(iter_intersperse, pattern)]
 
-pub use crate::v2::*;
+pub use crate::ir::*;
 use fxhash::FxHasher;
 
 pub type IString = Box<str>;
@@ -39,7 +39,7 @@ pub mod entrypoint;
 pub mod libc_fns;
 
 pub mod utilis;
-pub mod v2;
+pub mod ir;
 /// The metadata of a slice
 pub const METADATA: &str = "m";
 /// The data pointer of a slice

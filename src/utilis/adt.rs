@@ -143,11 +143,11 @@ pub fn get_variant_at_index(
 pub fn set_discr<'tcx>(
     layout: Layout<'tcx>,
     variant_index: VariantIdx,
-    enum_addr: Interned<cilly::v2::CILNode>,
+    enum_addr: Interned<cilly::ir::CILNode>,
     enum_tpe: Interned<ClassRef>,
     ty: Ty<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> Interned<cilly::v2::CILRoot> {
+) -> Interned<cilly::ir::CILRoot> {
     if get_variant_at_index(variant_index, (*layout.0).clone()).is_uninhabited() {
         // Could be skipped, but keeping a throw here can with CIL correctnes. Each block *must* terminate with a jump, return or a throw.
         // By inserting a throw, we are able to remove all code
@@ -211,11 +211,11 @@ pub fn set_discr<'tcx>(
 
 pub fn get_discr<'tcx>(
     layout: Layout<'tcx>,
-    enum_addr: Interned<cilly::v2::CILNode>,
+    enum_addr: Interned<cilly::ir::CILNode>,
     enum_tpe: Interned<ClassRef>,
     ty: Ty<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> Interned<cilly::v2::CILNode> {
+) -> Interned<cilly::ir::CILNode> {
     //return CILNode::
     assert!(!layout.is_uninhabited(), "UB: enum layout is unanhibited!");
     let (tag_tpe, _) = enum_tag_info(layout, ctx);

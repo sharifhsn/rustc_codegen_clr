@@ -22,7 +22,7 @@ pub mod checked;
 pub mod cmp;
 pub mod shift;
 
-type Node = Interned<cilly::v2::CILNode>;
+type Node = Interned<cilly::ir::CILNode>;
 
 /// Preforms an unchecked binary operation.
 pub(crate) fn binop<'tcx>(

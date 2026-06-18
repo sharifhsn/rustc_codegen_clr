@@ -80,7 +80,7 @@ fn get_adt<'tcx>(
             AdtKind::Enum => enum_(name, def, adt_ty, subst, ctx),
             AdtKind::Union => union_(name, def, adt_ty, subst, ctx),
         };
-        ctx.class_def(def);
+        ctx.class_def(def).unwrap();
         cref
     }
 }
@@ -125,7 +125,7 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
             // If there is no defition of this closure present, create the closure.
             if ctx.class_ref_to_def(cref).is_none() {
                 let type_def = closure_typedef(&fields, layout.layout, ctx, name);
-                ctx.class_def(type_def);
+                ctx.class_def(type_def).unwrap();
             }
             Type::ClassRef(cref)
         }
@@ -144,7 +144,8 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                     None,
                     None,
                     false, // Two separate pointers.
-                ));
+                ))
+                .unwrap();
             }
             Type::ClassRef(cref)
         }
@@ -320,7 +321,7 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
             if ctx.class_ref_to_def(cref).is_none() {
                 let mut type_def = closure_typedef(&fields, layout.layout, ctx, name);
                 handle_tag(&layout.layout, ctx, ty, type_def.fields_mut());
-                ctx.class_def(type_def);
+                ctx.class_def(type_def).unwrap();
             }
 
             Type::ClassRef(cref)
@@ -491,7 +492,7 @@ pub fn fat_ptr_to<'tcx>(
             Some(NonZeroU32::new(8).unwrap()),
             true,
         );
-        ctx.class_def(def);
+        ctx.class_def(def).unwrap();
     }
     cref
 }

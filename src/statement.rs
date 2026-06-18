@@ -11,7 +11,7 @@ use cilly::{BinOp, Int, Interned};
 use rustc_codgen_clr_operand::handle_operand;
 use rustc_middle::mir::{CopyNonOverlapping, NonDivergingIntrinsic, Statement, StatementKind};
 
-type Root = Interned<cilly::v2::CILRoot>;
+type Root = Interned<cilly::ir::CILRoot>;
 #[allow(clippy::match_same_arms)]
 pub fn handle_statement<'tcx>(
     statement: &Statement<'tcx>,

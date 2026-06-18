@@ -16,7 +16,7 @@ pub fn unop<'tcx>(
     operand: &Operand<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     rvalue: &Rvalue<'tcx>,
-) -> Interned<cilly::v2::CILNode> {
+) -> Interned<cilly::ir::CILNode> {
     let parrent_node = handle_operand(operand, ctx);
     let ty = operand.ty(&ctx.body().local_decls, ctx.tcx());
     match unnop {

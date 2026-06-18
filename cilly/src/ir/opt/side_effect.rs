@@ -101,7 +101,7 @@ fn select_no_side_effects() {
     let a = asm.alloc_node(1_usize);
     let b = asm.alloc_node(2_usize);
     let predictate = asm.alloc_node(CILNode::LdLoc(0));
-    let v2 = asm.select(Type::Int(Int::USize), a, b, predictate);
+    let sel = asm.select(Type::Int(Int::USize), a, b, predictate);
     let mut cache = SideEffectInfoCache::default();
-    assert!(!cache.has_side_effects(v2, &asm), "v2:{:?}", asm[v2]);
+    assert!(!cache.has_side_effects(sel, &asm), "sel:{:?}", asm[sel]);
 }

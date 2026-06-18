@@ -24,8 +24,8 @@ use rustc_middle::{
 };
 use rustc_span::Spanned;
 
-type Node = Interned<cilly::v2::CILNode>;
-type Root = Interned<cilly::v2::CILRoot>;
+type Node = Interned<cilly::ir::CILNode>;
+type Root = Interned<cilly::ir::CILRoot>;
 const EMPTY_ARGS: &[Node] = &[];
 
 fn argc_from_fn_name(function_name: &str, prefix: &str) -> u32 {

@@ -286,13 +286,12 @@ impl MethodDef {
     }
 
 
-    /// Builds a `MethodDef` directly from already-lowered V2 blocks. This is the V2-native
-    /// counterpart of `Method::new` + `MethodDef::from_v1`: it performs the same debug-name
-    /// uniquing on argument/local names and the same argument-count reconciliation as those two
-    /// paths, but takes interned V2 `BasicBlock`s instead of converting from V1.
+    /// Builds a `MethodDef` directly from already-lowered, interned `BasicBlock`s. Performs
+    /// debug-name uniquing on argument/local names and argument-count reconciliation against the
+    /// signature.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    pub fn from_v2_blocks(
+    pub fn from_blocks(
         access: Access,
         class: ClassDefIdx,
         name: &str,
@@ -327,7 +326,7 @@ impl MethodDef {
         }
         let name = asm.alloc_string(name);
         let implementation = MethodImpl::MethodBody { blocks, locals };
-        // Argument-count reconciliation, identical to `MethodDef::from_v1`.
+        // Argument-count reconciliation against the signature.
         let arg_debug_count = arg_names.len();
         let arg_sig_count = asm[sig].inputs().len();
         match arg_debug_count.cmp(&arg_sig_count) {

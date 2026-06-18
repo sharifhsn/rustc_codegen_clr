@@ -16,11 +16,11 @@ use rustc_middle::{
     ty::{layout::TyAndLayout, Ty, TyKind, UintTy},
 };
 
-type Node = Interned<cilly::v2::CILNode>;
-type Root = Interned<cilly::v2::CILRoot>;
+type Node = Interned<cilly::ir::CILNode>;
+type Root = Interned<cilly::ir::CILRoot>;
 
 /// Preforms an unsizing cast on operand `operand`, converting it to the `target` type.
-pub fn unsize2<'tcx>(
+pub fn unsize<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     operand: &Operand<'tcx>,
     target: Ty<'tcx>,
@@ -215,7 +215,7 @@ fn unsize_metadata<'tcx>(
     // unchanged because the layout is identical.
     let src_ty = peel_pattern_type(fx, src_ty);
     let dst_ty = peel_pattern_type(fx, dst_ty);
-    let mut coerce_ptr = |fx: &mut MethodCompileCtx<'tcx, '_>| {
+    let coerce_ptr = |fx: &mut MethodCompileCtx<'tcx, '_>| {
         if fx
             .layout_of(src_ty.ty.builtin_deref(true).unwrap())
             .is_unsized()

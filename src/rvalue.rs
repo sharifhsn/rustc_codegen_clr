@@ -7,15 +7,15 @@ use cilly::{
     BinOp, Const, FieldDesc, Float, Int, Interned, MethodRef, Type,
 };
 
-type Node = Interned<cilly::v2::CILNode>;
-type Root = Interned<cilly::v2::CILRoot>;
+type Node = Interned<cilly::ir::CILNode>;
+type Root = Interned<cilly::ir::CILRoot>;
 use rustc_codegen_clr_call::CallInfo;
 use rustc_codegen_clr_ctx::function_name;
-use rustc_codegen_clr_place::{place_address, place_address_raw, place_get};
+use rustc_codegen_clr_place::{place_address, place_get};
 use rustc_codegen_clr_type::{
     adt::enum_tag_info,
-    r#type::{fat_ptr_to, get_type},
-    utilis::{pointer_to_is_fat, try_resolve_const_size},
+    r#type::get_type,
+    utilis::pointer_to_is_fat,
     GetTypeExt,
 };
 use rustc_codgen_clr_operand::{
@@ -90,7 +90,7 @@ pub fn handle_rvalue<'tcx>(
             dst,
         ) => (vec![], ptr_to_ptr(ctx, operand, *dst)),
         Rvalue::Cast(CastKind::PointerCoercion(PointerCoercion::Unsize, _), operand, target) => {
-            crate::unsize::unsize2(ctx, operand, *target, *target_location)
+            crate::unsize::unsize(ctx, operand, *target, *target_location)
         }
         Rvalue::BinaryOp(binop, operands) => (
             vec![],

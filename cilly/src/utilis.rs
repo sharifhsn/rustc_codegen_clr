@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use crate::bimap::Interned;
 
 use crate::cilnode::{ExtendKind, IsPure, MethodKind};
-use crate::v2::{BasicBlock, CILNode};
+use crate::ir::{BasicBlock, CILNode};
 use crate::{BinOp, BranchCond, CILRoot, MethodDef, Type};
 use crate::Assembly;
 use crate::{ClassRef, FnSig, Int, MethodRef, StaticFieldDesc};
@@ -299,7 +299,7 @@ pub fn get_environ(asm: &mut Assembly) -> Interned<MethodRef> {
         BasicBlock::new(ret_roots, ret_bb, None),
     ];
     let sig = asm.alloc_sig(FnSig::new([], uint8_ptr_ptr));
-    let def = MethodDef::from_v2_blocks(
+    let def = MethodDef::from_blocks(
         crate::Access::Extern,
         main_module,
         "get_environ",
@@ -331,6 +331,7 @@ pub fn encode(mut int: u64) -> String {
 }
 /// Checks if all elements in a slice are truly unquie.
 #[track_caller]
+#[cfg_attr(not(debug_assertions), allow(unused_variables))] // `val`/`msg` are only read under the debug-only assert below.
 pub fn assert_unique<T: std::hash::Hash + PartialEq + Eq>(val: &[T], msg: impl Debug) {
     #[cfg(debug_assertions)]
     {

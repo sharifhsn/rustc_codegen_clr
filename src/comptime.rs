@@ -1,3 +1,4 @@
+// WIP comptime interpreter — some scaffolding (e.g. `ComptimeLocalVar`) is not wired up yet.
 #![allow(dead_code)]
 use cilly::ClassDef;
 use rustc_codegen_clr_ctx::MethodCompileCtx;

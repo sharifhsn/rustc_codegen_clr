@@ -63,22 +63,22 @@ impl<'tcx> StaticBuilderMethods for Builder<'tcx> {
     }
 }
 impl<'tcx> BackendTypes for Builder<'tcx> {
-    type Value = cilly::v2::Interned<CILNode>;
+    type Value = cilly::ir::Interned<CILNode>;
     type Metadata = ();
-    type Function = cilly::v2::Interned<MethodRef>;
+    type Function = cilly::ir::Interned<MethodRef>;
     type BasicBlock = u32;
-    type Type = cilly::v2::Interned<Type>;
+    type Type = cilly::ir::Interned<Type>;
     type Funclet = ();
     type DIScope = ();
     type DILocation = ();
     type DIVariable = ();
 }
 impl<'tcx> BackendTypes for CodegenCx<'tcx> {
-    type Value = cilly::v2::Interned<CILNode>;
+    type Value = cilly::ir::Interned<CILNode>;
     type Metadata = ();
-    type Function = cilly::v2::Interned<MethodRef>;
+    type Function = cilly::ir::Interned<MethodRef>;
     type BasicBlock = u32;
-    type Type = cilly::v2::Interned<Type>;
+    type Type = cilly::ir::Interned<Type>;
     type Funclet = ();
     type DIScope = ();
     type DILocation = ();

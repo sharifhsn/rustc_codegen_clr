@@ -8,8 +8,7 @@ use rustc_codgen_clr_operand::handle_operand;
 use rustc_middle::mir::{Operand, Place};
 use rustc_span::Spanned;
 
-type Node = Interned<cilly::v2::CILNode>;
-type Root = Interned<cilly::v2::CILRoot>;
+type Root = Interned<cilly::ir::CILRoot>;
 
 /// Implementation of the fmaf32 intrinsics. Takes in 3 arguments: a, b, c. Calcualtes a * b + c
 pub fn fmaf32<'tcx>(

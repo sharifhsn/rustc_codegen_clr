@@ -1,5 +1,4 @@
 use super::class::StaticFieldDef;
-#[allow(dead_code)]
 use super::{Assembly, ClassRef, Exporter, FnSig, Type};
 use std::io::Write;
 #[derive(Default)]

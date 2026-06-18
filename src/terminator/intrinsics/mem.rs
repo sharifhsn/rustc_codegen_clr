@@ -12,8 +12,8 @@ use rustc_middle::{
 };
 use rustc_span::Spanned;
 
-type Node = Interned<cilly::v2::CILNode>;
-type Root = Interned<cilly::v2::CILRoot>;
+type Node = Interned<cilly::ir::CILNode>;
+type Root = Interned<cilly::ir::CILRoot>;
 
 /// Takes in 3 args. dst, val, and count. writes count * sizeof(T) bytes of value `val` to dst.
 pub fn write_bytes<'tcx>(
@@ -121,8 +121,7 @@ pub fn raw_eq<'tcx>(
     let eq = ctx.biop(cmp, zero, cilly::BinOp::Eq);
     place_set(destination, eq, ctx)
 }
-/// Calls `memcmp` to compare `len` bytes of `a` and `b`. V2 counterpart of
-/// `super::utilis::compare_bytes`.
+/// Calls `memcmp` to compare `len` bytes of `a` and `b`.
 fn compare_bytes(a: Node, b: Node, len: Node, ctx: &mut MethodCompileCtx<'_, '_>) -> Node {
     let u8_ref = ctx.nptr(Type::Int(Int::U8));
     let mref = MethodRef::new(

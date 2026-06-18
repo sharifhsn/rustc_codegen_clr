@@ -9,7 +9,7 @@ use rustc_codegen_clr_type::GetTypeExt;
 
 use rustc_middle::ty::{IntTy, Ty, TyKind, UintTy};
 
-type Node = Interned<cilly::v2::CILNode>;
+type Node = Interned<cilly::ir::CILNode>;
 
 fn ci32(ctx: &mut MethodCompileCtx<'_, '_>, v: Node) -> Node {
     ctx.int_cast(v, Int::I32, ExtendKind::SignExtend)

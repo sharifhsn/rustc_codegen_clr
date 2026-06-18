@@ -141,6 +141,7 @@ fn simd_abs(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     };
     patcher.insert(name, Box::new(generator));
 }
+// WIP: `simd_shuffle` is a `todo!()` stub, not yet registered with the patcher.
 #[allow(dead_code)]
 fn simd_shuffle(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("simd_shuffle");
