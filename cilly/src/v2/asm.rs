@@ -1123,11 +1123,27 @@ impl Assembly {
             let arg_names = (0..(self[mref.sig()].inputs().len()))
                 .map(|_| None)
                 .collect();
-            let imp = if self[mref.name()].contains("__rust_alloc")
-                && !self[mref.name()].contains("__rust_alloc_error_handler")
-            {
+            let name = &self[mref.name()];
+            let is_alloc =
+                name.contains("__rust_alloc") && !name.contains("__rust_alloc_error_handler");
+            // `__rust_no_alloc_shim_is_unstable[_v2]` is a marker the alloc shim references purely to
+            // keep the global allocator symbols linked; it has no effect. Recent rustc emits it as a
+            // (mangled) *function* call rather than the old `u8` static, so provide a no-op body
+            // (a bare return) — otherwise it resolves to `MethodImpl::Missing` and throws at runtime
+            // (`box_new_uninit` -> alloc -> missing method) the moment anything allocates.
+            let is_noalloc_shim = name.contains("__rust_no_alloc_shim_is_unstable");
+            let imp = if is_alloc {
                 let alloc = MethodRef::aligned_alloc(self);
                 MethodImpl::wrapper(self.alloc_methodref(alloc), &mref, self)
+            } else if is_noalloc_shim {
+                MethodImpl::MethodBody {
+                    blocks: vec![super::BasicBlock::new(
+                        vec![self.alloc_root(CILRoot::VoidRet)],
+                        0,
+                        None,
+                    )],
+                    locals: vec![],
+                }
             } else {
                 MethodImpl::Missing
             };

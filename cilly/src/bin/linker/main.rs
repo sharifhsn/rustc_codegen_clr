@@ -524,20 +524,27 @@ fn main() {
             let bootstrap_path = path.with_extension("rs");
             let mut bootstrap_file = std::fs::File::create(&bootstrap_path).unwrap();
             bootstrap_file.write_all(bootstrap.as_bytes()).unwrap();
-            let path = std::env::var("PATH").unwrap();
+            // Compile the bootstrap launcher with the *default* (native LLVM) backend, NOT cg_clr,
+            // so we must drop the RUSTFLAGS / cargo-encoded flags that point `-Zcodegen-backend` at
+            // this backend (otherwise the launcher build would recurse into cg_clr). This previously
+            // used `env_clear()` + PATH, which also wiped `RUSTUP_TOOLCHAIN`/`HOME`: `rustc` then fell
+            // back to rustup's default channel and triggered a toolchain *download/sync* whose
+            // progress text lands on stderr, tripping the old `stderr.is_empty()` assert. Keep the
+            // environment (so the pinned toolchain is used and no sync happens) but remove only the
+            // backend-selecting vars, and gate on the exit status (rustc may emit benign warnings).
             let out = std::process::Command::new("rustc")
                 .arg("-O")
                 .arg(bootstrap_path)
                 .arg("-o")
                 .arg(output_file_path)
-                .env_clear()
-                .env("PATH", path)
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
                 .output()
                 .unwrap();
             assert!(
-                out.stderr.is_empty(),
-                "{}",
-                String::from_utf8(out.stderr).unwrap()
+                out.status.success(),
+                "bootstrap launcher compilation failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
             );
         }
     } else {
@@ -554,20 +561,27 @@ fn main() {
             let bootstrap_path = path.with_extension("rs");
             let mut bootstrap_file = std::fs::File::create(&bootstrap_path).unwrap();
             bootstrap_file.write_all(bootstrap.as_bytes()).unwrap();
-            let path = std::env::var("PATH").unwrap();
+            // Compile the bootstrap launcher with the *default* (native LLVM) backend, NOT cg_clr,
+            // so we must drop the RUSTFLAGS / cargo-encoded flags that point `-Zcodegen-backend` at
+            // this backend (otherwise the launcher build would recurse into cg_clr). This previously
+            // used `env_clear()` + PATH, which also wiped `RUSTUP_TOOLCHAIN`/`HOME`: `rustc` then fell
+            // back to rustup's default channel and triggered a toolchain *download/sync* whose
+            // progress text lands on stderr, tripping the old `stderr.is_empty()` assert. Keep the
+            // environment (so the pinned toolchain is used and no sync happens) but remove only the
+            // backend-selecting vars, and gate on the exit status (rustc may emit benign warnings).
             let out = std::process::Command::new("rustc")
                 .arg("-O")
                 .arg(bootstrap_path)
                 .arg("-o")
                 .arg(output_file_path)
-                .env_clear()
-                .env("PATH", path)
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
                 .output()
                 .unwrap();
             assert!(
-                out.stderr.is_empty(),
-                "{}",
-                String::from_utf8(out.stderr).unwrap()
+                out.status.success(),
+                "bootstrap launcher compilation failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
             );
         }
     }

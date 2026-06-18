@@ -267,16 +267,22 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
                     rustc_middle::ty::print::with_no_trimmed_paths! {vec![(V1Root::throw(&format!("Tired to run a statement {statement:?} which failed to compile with error message {err:?}."),ctx).into())]}
                 }
             };
-            for tree in &mut statement_tree {
+            // Typecheck a *temporary* V2 lowering; do NOT replace the tree's root with the
+            // `V1Root::V2` wrapper. The pure-V1 root must survive until `resolve_exception_handlers`,
+            // which relies on `targets()` / `fix_for_exception_handler` pattern-matching the V1 branch
+            // variants (`GoTo`/`BTrue`/…). A `V1Root::V2` wrapper hides those (they fall through to
+            // `_ => ()`), so `block_gc` can't follow a cleanup chain and handler branches aren't
+            // relabeled — leaving dangling `bbN` targets (`ilasm: Undefined Label`). `from_v1` below
+            // performs the real, final conversion.
+            for tree in &statement_tree {
                 let tmp = CILRoot::from_v1(tree.root(), ctx);
-                *tree.root_mut() = cilly::cil_root::V1Root::V2(ctx.alloc_root(tmp));
-                let Err(err) = tree.root_mut().try_typecheck(ctx, sig_idx, &locals) else {
-                    continue;
-                };
-                ctx.tcx().dcx().span_warn(
-                    statement.source_info.span,
-                    format!("Typecheck failed:{err:?}"),
-                );
+                let mut tmp_root = cilly::cil_root::V1Root::V2(ctx.alloc_root(tmp));
+                if let Err(err) = tmp_root.try_typecheck(ctx, sig_idx, &locals) {
+                    ctx.tcx().dcx().span_warn(
+                        statement.source_info.span,
+                        format!("Typecheck failed:{err:?}"),
+                    );
+                }
             }
             // Only save debuginfo for statements which result in ops.
             if !statement_tree.is_empty() {
@@ -291,15 +297,16 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
             let mut term_trees = terminator_to_ops(term, ctx).unwrap_or_else(|err| {
                 panic!("Could not compile terminator {term:?} because {err:?}")
             });
-            for tree in &mut term_trees {
+            // See the statement loop above: typecheck a temporary V2 lowering but keep the tree's
+            // pure-V1 root so `resolve_exception_handlers` can see branch targets.
+            for tree in &term_trees {
                 let tmp = CILRoot::from_v1(tree.root(), ctx);
-                *tree.root_mut() = cilly::cil_root::V1Root::V2(ctx.alloc_root(tmp));
-                let Err(err) = tree.root_mut().try_typecheck(ctx, sig_idx, &locals) else {
-                    continue;
-                };
-                ctx.tcx()
-                    .dcx()
-                    .span_warn(term.source_info.span, format!("Typecheck failed:{err:?}"));
+                let mut tmp_root = cilly::cil_root::V1Root::V2(ctx.alloc_root(tmp));
+                if let Err(err) = tmp_root.try_typecheck(ctx, sig_idx, &locals) {
+                    ctx.tcx()
+                        .dcx()
+                        .span_warn(term.source_info.span, format!("Typecheck failed:{err:?}"));
+                }
             }
             if !term_trees.is_empty() {
                 trees.push(span_source_info(ctx.tcx(), term.source_info.span).into());
