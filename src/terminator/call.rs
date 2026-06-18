@@ -4,7 +4,7 @@ use crate::{
     utilis::{
         garag_to_bool, CTOR_FN_NAME, MANAGED_CALL_FN_NAME, MANAGED_CALL_VIRT_FN_NAME,
         MANAGED_CHECKED_CAST, MANAGED_IS_INST, MANAGED_LD_ELEM_REF, MANAGED_LD_LEN,
-        MANAGED_LD_NULL,
+        MANAGED_LD_NULL, MANAGED_TRY_CATCH,
     },
 };
 use cilly::{
@@ -560,6 +560,36 @@ pub fn call_inner<'tcx>(
                 arr: Box::new(handle_operand(&args[0].node, ctx)),
                 idx: Box::new(handle_operand(&args[1].node, ctx)),
             },
+            ctx,
+        )];
+    } else if function_name.contains(MANAGED_TRY_CATCH) {
+        assert!(
+            !call_info.split_last_tuple(),
+            "Managed calls may not use the `rust_call` calling convention!"
+        );
+        // `try_catch(try_fn, data, catch_fn) -> i32`: run `try_fn(data)` inside a CIL
+        // try/catch that catches *any* .NET exception (the `interop_try_catch` builtin),
+        // returning 0 on normal completion and 1 if an exception was caught (after running
+        // `catch_fn(data)`). Unlike `catch_unwind`, this catches foreign/BCL exceptions.
+        let try_fn = handle_operand(&args[0].node, ctx);
+        let data_ptr = handle_operand(&args[1].node, ctx);
+        let catch_fn = handle_operand(&args[2].node, ctx);
+        let uint8_ptr = ctx.nptr(Type::Int(Int::U8));
+        let try_ptr = ctx.sig([uint8_ptr], Type::Void);
+        let catch_ptr = ctx.sig([uint8_ptr], Type::Void);
+        let try_catch = MethodRef::new(
+            *ctx.main_module(),
+            ctx.alloc_string("interop_try_catch"),
+            ctx.sig(
+                [Type::FnPtr(try_ptr), uint8_ptr, Type::FnPtr(catch_ptr)],
+                Type::Int(Int::I32),
+            ),
+            MethodKind::Static,
+            vec![].into(),
+        );
+        return vec![place_set(
+            destination,
+            call!(ctx.alloc_methodref(try_catch), [try_fn, data_ptr, catch_fn]),
             ctx,
         )];
     }

@@ -1,16 +1,20 @@
 // L1 interop de-risk probe (see docs/std_research/h2_design.md §3 and the "L1 de-risk results").
 // Validates the architectural bet H2 rests on, on a no_std program that compiles today.
 //
-// VERDICT (run on .NET 8): the core bet HOLDS.
+// VERDICT (run on .NET 8): the core bet HOLDS. All four probes pass.
 //   A) BCL static call + primitive marshaling      -> WORKS  (Math.Max(3,7)=7, prints 1007)
 //   B1) object ctor + instance calls + hold across calls -> WORKS (StringBuilder, prints 2001)
+//   B2) GCHandle store-across-GC round-trip          -> WORKS (prints 3001 then 3999). Getting here
+//      surfaced + fixed TWO real codegen bugs: (1) managed value types
+//      (RustcCLRInteropManagedStruct<ASM,CLASS,SIZE>) wrongly required 2 generics in
+//      rustc_codegen_clr_type/src/type.rs (fixed -> 3); (2) `System.Object`/`System.String` were
+//      emitted as `class [System.Runtime]System.Object` (ELEMENT_TYPE_CLASS) instead of the
+//      canonical `object`/`string` element type, so `GCHandle.Alloc(object)` failed to bind
+//      (MissingMethodException). Fixed in cilly/.../il_exporter/mod.rs `type_il`.
 //   C) .NET exception from a BCL call               -> propagates as a real, well-typed .NET
-//      exception through the Rust frame (clean managed stack trace). Catching it needs a small
-//      `try_catch` interop primitive (the codegen already emits CIL try/catch) — tractable gap.
-//   B2) GCHandle store-across-GC round-trip          -> surfaced (and fixed) a real codegen bug:
-//      managed value types (RustcCLRInteropManagedStruct<ASM,CLASS,SIZE>) wrongly required 2
-//      generics in rustc_codegen_clr_type/src/type.rs (fixed -> 3). A remaining binding issue
-//      (GCHandle.Alloc(object)->GCHandle signature resolution) is the next L1 step; see B2 below.
+//      exception through the Rust frame (clean managed stack trace). CATCHING it works via the
+//      dedicated `rustc_clr_interop_try_catch` primitive (see test/std/interop_try_catch.rs);
+//      `catch_unwind` does NOT catch foreign exceptions (it rethrows non-RustException).
 //
 // Output is integer markers via Console.WriteLine (string marshaling is a separate concern).
 #![feature(adt_const_params, core_intrinsics, unsized_const_params)]
@@ -44,7 +48,7 @@ fn rustc_clr_interop_managed_checked_cast<DST, SRC>(src: SRC) -> DST { core::int
 type Object = RustcCLRInteropManagedClass<"System.Runtime", "System.Object">;
 type StringBuilder = RustcCLRInteropManagedClass<"System.Runtime", "System.Text.StringBuilder">;
 type GCHandle = RustcCLRInteropManagedStruct<
-    "System.Runtime", "System.Runtime.InteropServices.GCHandle", { core::mem::size_of::<usize>() }>;
+    "System.Runtime.InteropServices", "System.Runtime.InteropServices.GCHandle", { core::mem::size_of::<usize>() }>;
 
 fn main() {
     // ---- Probe A: static BCL call + primitive marshaling ----
@@ -66,20 +70,26 @@ fn main() {
     >(sb);
     <i32 as Put>::putnl(2000 + len); // expect 2001
 
-    // ---- Probe B2 (DISABLED): round-trip the object through a GCHandle ----
-    // The GC-boundary mechanism (store a managed ref in unmanaged Rust memory across a GC).
-    // Now *compiles* (after the managed-struct generics fix in type.rs:241), but at runtime
-    // `GCHandle.Alloc(object) -> GCHandle` doesn't resolve (MissingMethodException) — a BCL
-    // signature-identity issue for a value-type-returning method. This is the next L1 step;
-    // mycorrhiza/src/class.rs `Class` is the intended pattern. Re-enable once that's solved:
-    //
-    //   let obj: Object = rustc_clr_interop_managed_checked_cast::<Object, StringBuilder>(sb);
-    //   let handle = rustc_clr_interop_managed_call1_::<
-    //       "System.Runtime","System.Runtime.InteropServices.GCHandle",false,"Alloc",true,GCHandle,Object>(obj);
-    //   let target = rustc_clr_interop_managed_call1_::<
-    //       "System.Runtime","System.Runtime.InteropServices.GCHandle",false,"get_Target",false,Object,&GCHandle>(&handle);
-    //   let sb_back: StringBuilder = rustc_clr_interop_managed_checked_cast::<StringBuilder, Object>(target);
-    //   // ... get_Length on sb_back should still be 1; then GCHandle.Free(&handle).
+    // ---- Probe B2: round-trip the object through a GCHandle (the GC-boundary mechanism) ----
+    // IS_VALUETYPE must be `true` for GCHandle (a struct) so the declaring type is emitted as a
+    // valuetype — the de-risk's `false` (copied from mycorrhiza's unverified Class) made it a
+    // `class`, so GCHandle.Alloc didn't resolve.
+    let obj: Object = rustc_clr_interop_managed_checked_cast::<Object, StringBuilder>(sb);
+    let handle = rustc_clr_interop_managed_call1_::<
+        "System.Runtime.InteropServices", "System.Runtime.InteropServices.GCHandle", true, "Alloc", true, GCHandle, Object,
+    >(obj);
+    let target = rustc_clr_interop_managed_call1_::<
+        "System.Runtime.InteropServices", "System.Runtime.InteropServices.GCHandle", true, "get_Target", false, Object, &GCHandle,
+    >(&handle);
+    let sb_back: StringBuilder = rustc_clr_interop_managed_checked_cast::<StringBuilder, Object>(target);
+    let len2 = rustc_clr_interop_managed_call1_::<
+        "System.Runtime", "System.Text.StringBuilder", false, "get_Length", false, i32, StringBuilder,
+    >(sb_back);
+    <i32 as Put>::putnl(3000 + len2); // expect 3001 if the GCHandle round-trip preserved the object
+    let _: () = rustc_clr_interop_managed_call1_::<
+        "System.Runtime.InteropServices", "System.Runtime.InteropServices.GCHandle", true, "Free", false, (), &GCHandle,
+    >(&handle);
+    <i32 as Put>::putnl(3999); // reached -> Alloc/get_Target/Free all returned
 
     // ---- Probe C: trigger a .NET exception from a BCL call, observe propagation ----
     <i32 as Put>::putnl(100); // marker: about to call a throwing method

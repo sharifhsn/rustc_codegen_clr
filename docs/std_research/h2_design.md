@@ -159,27 +159,40 @@ M3 differential validator, M5 sysroot bisect) tells us the frontier and correctn
    leverage de-risking move before writing 3k LOC of PAL on top of it.
 3. Draft `dotnet.json` + the `sys/pal/dotnet` skeleton; get `println!`+args+env hello-world running.
 
-## 10. L1 de-risk results (done — the core bet holds)
+## 10. L1 de-risk results (COMPLETE — the core bet holds, all probes pass)
 
-Probe: [`test/std/interop_derisk.rs`](../../test/std/interop_derisk.rs), a no_std program compiled
-through cg_clr and run on .NET 8. Findings:
+Probes: [`test/std/interop_derisk.rs`](../../test/std/interop_derisk.rs) (A/B1/B2/C-propagation),
+[`test/std/interop_try_catch.rs`](../../test/std/interop_try_catch.rs) (C-catch),
+[`test/std/interop_catch.rs`](../../test/std/interop_catch.rs) (the `catch_unwind` negative
+control). All compiled through cg_clr and run on .NET 8. Findings:
 
 | capability | result |
 |---|---|
-| BCL **static call** + primitive marshal | ✅ `System.Math.Max(3,7)=7` |
-| object **ctor** + **instance calls** + holding a managed ref across calls | ✅ `StringBuilder` ctor/`Append`/`get_Length`=1 |
-| **.NET exception** from a BCL call | ✅ propagates through the Rust frame as a real, well-typed exception with a clean managed stack trace (`ArgumentOutOfRangeException` at `StringBuilder.Remove` → `…main()`) |
-| **GCHandle** store-across-GC round-trip | ⚠️ now *compiles* (after a codegen fix), runtime binding of `GCHandle.Alloc(object)->GCHandle` still unresolved |
+| BCL **static call** + primitive marshal | ✅ `System.Math.Max(3,7)=7` (prints 1007) |
+| object **ctor** + **instance calls** + holding a managed ref across calls | ✅ `StringBuilder` ctor/`Append`/`get_Length`=1 (prints 2001) |
+| **GCHandle** store-across-GC round-trip (the GC-boundary mechanism) | ✅ `Alloc`/`get_Target`/`Free`; object survived the round-trip (prints 3001 then 3999) |
+| **.NET exception** propagation from a BCL call | ✅ propagates through the Rust frame as a real, well-typed exception with a clean managed stack trace (`ArgumentOutOfRangeException` at `StringBuilder.Remove` → `…main()`) |
+| **catching** a foreign/.NET exception from Rust | ✅ via the dedicated `rustc_clr_interop_try_catch` primitive (prints 1, 5001, 6009, 9999, clean exit) — `catch_unwind` does **not** (it rethrows non-`RustException`) |
 
-**The architectural bet is validated:** Rust calls .NET, holds managed objects, and .NET exceptions
-are ordinary catchable exceptions in Rust frames. Two concrete outcomes feed back into the plan:
+**The architectural bet is validated end-to-end:** Rust calls .NET, constructs and holds managed
+objects, stores them across GCs via `GCHandle`, and both *propagates* and *catches* .NET
+exceptions in Rust frames. Three concrete outcomes feed back into H2:
 
-- **Found + fixed a real codegen bug** (committed): managed value types
+- **Fixed codegen bug #1** (committed): managed value types
   (`RustcCLRInteropManagedStruct<ASM,CLASS,SIZE>`) were rejected because `type.rs` required 2
-  generics; a value type carries 3 (the `SIZE` const) — fixed to 3. This unblocks all managed
-  valuetypes (incl. `GCHandle`).
-- **The remaining L1 work is precise, not open-ended:** (1) a **`try_catch` interop primitive**
-  to turn a propagating .NET exception into a `Result` (the CIL try/catch machinery already
-  exists — small); (2) finish the **`GCHandle` binding** (a value-type-returning BCL method
-  signature-resolution issue) so managed refs can be stored across GCs. `mycorrhiza`'s `Class`
-  is the intended pattern. These two are the L1 milestone before scaling the PAL.
+  generics; a value type carries 3 (the `SIZE` const) — fixed to 3. Unblocks all managed valuetypes.
+- **Fixed codegen bug #2:** `System.Object`/`System.String` were emitted as
+  `class [System.Runtime]System.Object` (ELEMENT_TYPE_CLASS) in signature position instead of the
+  canonical `object`/`string` element type. The CLR matches BCL method signatures by encoding, so
+  e.g. `GCHandle.Alloc(object)` never bound (`MissingMethodException`). Fixed in
+  `cilly/.../il_exporter/mod.rs` `type_il`. **This is load-bearing for H2:** the PAL passes/returns
+  `object` to/from the BCL constantly.
+- **New codegen feature — `rustc_clr_interop_try_catch`:** wraps an indirect call in a CIL
+  `try/catch [System.Runtime]System.Object`, returning 0 (normal) / 1 (caught, after running a
+  catch fn). Built as `insert_interop_try_catch` in `cilly/.../builtins/mod.rs`, modeled on
+  `insert_catch_unwind` minus its `RustException` filter. This is the primitive std I/O will use to
+  turn BCL exceptions into `io::Error`. (Follow-up for H2: hand the exception *object* to the catch
+  fn — needs a managed-ref ABI — so the PAL can read the exception type/message.)
+
+L1 is done. Next is **P1** (make real std *compile* — the `FieldOwnerMismatch`/`CallArgTypeWrong`
+regressions) then **P2** (the `std::sys::pal::dotnet` PAL, §4), per the phased plan in §7.

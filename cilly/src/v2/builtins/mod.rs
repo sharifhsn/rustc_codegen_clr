@@ -433,6 +433,7 @@ pub fn insert_exeception_stub(asm: &mut Assembly, patcher: &mut MissingMethodPat
     ))
     .unwrap();
     insert_catch_unwind_stub(asm, patcher);
+    insert_interop_try_catch(asm, patcher);
 }
 pub fn insert_exception(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let rust_exception = asm.alloc_string("RustException");
@@ -481,6 +482,7 @@ pub fn insert_exception(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) 
         vec![Some(this), Some(data_pointer)],
     ));
     insert_catch_unwind(asm, patcher);
+    insert_interop_try_catch(asm, patcher);
 }
 pub fn insert_heap(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, use_libc: bool) {
     insert_rust_alloc(asm, patcher);
@@ -660,6 +662,70 @@ fn insert_catch_unwind(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
                 ),
                 (Some(asm.alloc_string("exception")), exception),
             ],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+/// `interop_try_catch(try_fn, data, catch_fn) -> i32` — the interop counterpart of
+/// `catch_unwind`. It wraps an indirect call to `try_fn(data)` in a CIL `try/catch`
+/// that catches **everything** (`catch [System.Runtime]System.Object`), so a foreign
+/// (.NET BCL) exception — which `catch_unwind` deliberately rethrows because it is not a
+/// `RustException` (see `insert_catch_unwind`) — is caught here. On a caught exception
+/// it invokes `catch_fn(data)` and returns 1; on normal completion it returns 0.
+/// The exception object itself is not handed to `catch_fn` (a managed reference can't be
+/// safely carried in a `*mut u8`); the handler uses no `GetException`, so the IL exporter
+/// emits a `pop` to discard the on-stack exception. Inspecting the exception is a
+/// follow-up (it can be done with further managed calls once a managed-ref ABI exists).
+fn insert_interop_try_catch(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("interop_try_catch");
+    let generator = move |_, asm: &mut Assembly| {
+        let uint8_ptr = asm.nptr(Type::Int(Int::U8));
+        let try_sig = asm.sig([uint8_ptr], Type::Void);
+        let catch_sig = asm.sig([uint8_ptr], Type::Void);
+        let ldarg_0 = asm.alloc_node(CILNode::LdArg(0)); // try_fn
+        let ldarg_1 = asm.alloc_node(CILNode::LdArg(1)); // data
+        let ldarg_2 = asm.alloc_node(CILNode::LdArg(2)); // catch_fn
+        // try region: call try_fn(data); on success leave to the "ok" block (2).
+        let calli_try = asm.alloc_root(CILRoot::CallI(Box::new((
+            ldarg_0,
+            try_sig,
+            [ldarg_1].into(),
+        ))));
+        let exit_try_success = asm.alloc_root(CILRoot::ExitSpecialRegion {
+            target: 2,
+            source: 0,
+        });
+        // catch-all handler: call catch_fn(data); leave to the "caught" block (3).
+        // No `GetException` is referenced, so the exporter inserts a `pop` to balance the
+        // stack (the caught exception object is discarded).
+        let calli_catch = asm.alloc_root(CILRoot::CallI(Box::new((
+            ldarg_2,
+            catch_sig,
+            [ldarg_1].into(),
+        ))));
+        let exit_try_failure = asm.alloc_root(CILRoot::ExitSpecialRegion {
+            target: 3,
+            source: 0,
+        });
+        let const_0 = asm.alloc_node(Const::I32(0));
+        let const_1 = asm.alloc_node(Const::I32(1));
+        let ret_0 = asm.alloc_root(CILRoot::Ret(const_0));
+        let ret_1 = asm.alloc_root(CILRoot::Ret(const_1));
+        MethodImpl::MethodBody {
+            blocks: vec![
+                BasicBlock::new(
+                    vec![calli_try, exit_try_success],
+                    0,
+                    Some(vec![BasicBlock::new(
+                        vec![calli_catch, exit_try_failure],
+                        1,
+                        None,
+                    )]),
+                ),
+                BasicBlock::new(vec![ret_0], 2, None),
+                BasicBlock::new(vec![ret_1], 3, None),
+            ],
+            locals: vec![],
         }
     };
     patcher.insert(name, Box::new(generator));

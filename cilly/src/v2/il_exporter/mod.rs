@@ -1378,7 +1378,24 @@ fn type_il(tpe: &Type, asm: &Assembly) -> String {
             super::Int::I128 => "valuetype [System.Runtime]System.Int128".into(),
             super::Int::ISize => "native int".into(),
         },
-        Type::ClassRef(cref) => class_ref(*cref, asm),
+        Type::ClassRef(cref) => {
+            // `System.Object` and `System.String` have dedicated CLI element types
+            // (ELEMENT_TYPE_OBJECT / ELEMENT_TYPE_STRING). BCL method signatures are encoded
+            // with those, so a plain `class [System.Runtime]System.Object` typeref does NOT
+            // match `object` during runtime method resolution -> MissingMethodException
+            // (this is why e.g. `GCHandle.Alloc(object)` failed to bind). Emit the canonical
+            // element type whenever such a ClassRef appears in *type-signature* position.
+            // Declaring-type position goes through `class_ref` (not this fn) and is unaffected.
+            let cr = asm.class_ref(*cref);
+            if !cr.is_valuetype() && cr.generics().is_empty() {
+                match &asm[cr.name()] {
+                    "System.Object" => return "object".into(),
+                    "System.String" => return "string".into(),
+                    _ => {}
+                }
+            }
+            class_ref(*cref, asm)
+        }
         Type::Float(float) => match float {
             super::Float::F16 => "valuetype [System.Runtime]System.Half".into(),
             super::Float::F32 => "float32".into(),
