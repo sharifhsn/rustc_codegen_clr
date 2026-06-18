@@ -323,6 +323,14 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
 
             Type::ClassRef(cref)
         }
+        // A pattern type (e.g. `pattern_type!(*const u8 is !null)`) has the exact same
+        // representation as its base type: rustc's layout for `ty::Pat` clones the base
+        // layout and only tightens the scalar valid-range / niche, which is applied when
+        // computing *enclosing* layouts (e.g. the niche that lets `Option<NonNull<T>>` be
+        // pointer-sized). The pattern type itself is laid out identically to its base, so
+        // the .NET type is just the base's. (Matches how rustc_codegen_ssa looks through
+        // `ty::Pat`.) This is pattern-agnostic — it holds for `NotNull`, `Range`, and `Or`.
+        TyKind::Pat(base, _) => get_type(*base, ctx),
         _ => todo!("Can't yet get type {ty:?} from type cache."),
     }
 }
