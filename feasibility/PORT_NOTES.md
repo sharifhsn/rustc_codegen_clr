@@ -88,12 +88,17 @@ auto-detect `*-linux-gnu` subdirs and skip missing dirs instead of panicking. Wi
 runs **end-to-end on aarch64-linux** (.NET 8 in an arm64 container): **136/228 (~60%) of the
 `::stable` subset** (excluding f128/num_test/simd/fuzz) pass, identical in serial and parallel runs.
 
-The remaining 92 failures on aarch64 are **not arch-specific** — **54 of them** are
-`rustc_codegen_clr_type/src/type.rs:326`’s `todo!()` for **pattern types**
-(`pattern_type!(*const u8 is !null)`), which the updated std now uses for non-null pointers in
-`Vec`/`RawVec`. That gap is a nightly/std-version issue that limits x86_64 on this nightly too;
-implementing pattern-type → CIL lowering (likely: map the pattern type to its base type's layout)
-would lift the pass rate on all targets equally — the single highest-leverage follow-up.
+### Pattern types (implemented)
+
+The biggest single cause of failures on this nightly was `type.rs`’s catch-all `todo!()` for
+**pattern types** (`pattern_type!(*const u8 is !null)`), which the updated std uses for non-null
+pointers in `NonNull`/`Vec`/`RawVec`. `get_type` now looks through `TyKind::Pat(base, _)` to the
+base type — correct because rustc’s `ty::Pat` layout clones the base layout and only tightens the
+scalar valid-range/niche (applied to *enclosing* layouts). This is target-independent and lifted
+the aarch64 `::stable` subset from **136/228 to 181/228 (+45)** with zero regressions; `vec`/`raw_vec`
+pass end-to-end. The remaining ~47 failures are a different class — *runtime/execution* failures
+(the produced assembly fails to run, with a recurring ".NET could not execute …command or file not
+found", not codegen `todo!`s), a mix of likely aarch64-runtime quirks and pre-existing limitations.
 
 > Note: this covers aarch64 **Linux** (e.g. a Docker container on Apple Silicon). aarch64 **macOS**
 > native is a much larger effort — no ELF `.so`/`/lib` layout, `libSystem.dylib`, and a different
