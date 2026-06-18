@@ -16,6 +16,11 @@ Three documents:
 3. **[std_roadmap.md](std_roadmap.md)** — the complexity/LOC assessment **framework**, the
    architecture decision (surrogate-libc vs a proper .NET target + `std::sys` PAL), the
    structure to build, and a phased plan with milestones.
+4. **[h2_design.md](h2_design.md)** — the **full design for H2**: the real, shippable `dotnet`
+   target + managed `std::sys` PAL that *replaces* the surrogate. Layer cake (target spec /
+   PAL / runtime lib / interop ABI / codegen), the PAL module→.NET-API map, the interop-ABI and
+   GC-boundary design, build/ship mechanism, phased plan, and risk register. **This is the
+   build target** — the surrogate is the thing we delete, not extend.
 
 ## The one-paragraph version
 
