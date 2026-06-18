@@ -72,3 +72,29 @@ The build is green and the smoke test runs, but these semantic changes deserve t
 - `ShallowInitBox` removal — box-heavy code.
 - `Rvalue::Reborrow` lowering.
 - The `join_codegen`/`link` rewrite — confirm produced `.rlib`s link end-to-end.
+
+## Running on aarch64 (non-x86_64) Linux
+
+The project was historically "x86_64 Linux only", but that turned out to be a *toolchain*
+assumption, not a codegen one. The MIR→CIL lowering is arch-neutral, type layouts come from
+rustc's target spec, and CIL output is portable across .NET runtimes (incl. arm64). The only
+x86_64-specific code was **three hardcoded library paths**:
+- `cilly/src/bin/linker/main.rs` — `get_libc_`/`get_libm_` scanned `/lib64` and `.unwrap()`'d it
+- `cilly/src/libc_fns.rs` — `f128_support_lib` read `/usr/lib64` and `.expect()`'d it
+
+On aarch64 Debian `/lib64` doesn't exist (libc/libm/libgcc_s live under `/usr/lib/<triple>/`),
+so these panicked. The fix (commit on branch `arm64-linux-support`) makes discovery multiarch-aware:
+auto-detect `*-linux-gnu` subdirs and skip missing dirs instead of panicking. With it, the codegen
+runs **end-to-end on aarch64-linux** (.NET 8 in an arm64 container): **136/228 (~60%) of the
+`::stable` subset** (excluding f128/num_test/simd/fuzz) pass, identical in serial and parallel runs.
+
+The remaining 92 failures on aarch64 are **not arch-specific** — **54 of them** are
+`rustc_codegen_clr_type/src/type.rs:326`’s `todo!()` for **pattern types**
+(`pattern_type!(*const u8 is !null)`), which the updated std now uses for non-null pointers in
+`Vec`/`RawVec`. That gap is a nightly/std-version issue that limits x86_64 on this nightly too;
+implementing pattern-type → CIL lowering (likely: map the pattern type to its base type's layout)
+would lift the pass rate on all targets equally — the single highest-leverage follow-up.
+
+> Note: this covers aarch64 **Linux** (e.g. a Docker container on Apple Silicon). aarch64 **macOS**
+> native is a much larger effort — no ELF `.so`/`/lib` layout, `libSystem.dylib`, and a different
+> libc/syscall interop story the upstream never built.
