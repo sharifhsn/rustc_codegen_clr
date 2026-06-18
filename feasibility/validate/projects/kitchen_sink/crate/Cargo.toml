@@ -1,0 +1,18 @@
+# Standalone crate (empty [workspace] keeps it out of the repo's workspace, since it
+# lives inside the repo tree).
+[workspace]
+
+[package]
+name = "kitchen_sink"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "kitchen_sink"
+path = "src/main.rs"
+
+# NOTE: deliberately NOT setting `overflow-checks = true` here. With -Zbuild-std it
+# propagates to `alloc`, and the backend currently emits invalid CIL for checked-
+# arithmetic paths in Rc/Cell/String (FieldOwnerMismatch / CallArgTypeWrong) — a real
+# codegen bug the differential harness surfaced. kitchen_sink uses explicit
+# wrapping_*/checked_*, so it doesn't depend on implicit overflow checks anyway.
