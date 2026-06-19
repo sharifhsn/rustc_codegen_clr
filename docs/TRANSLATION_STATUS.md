@@ -60,9 +60,8 @@ are unmanaged); only C#-instantiating-a-Rust-generic-with-a-new-T is blocked, an
   ~14 "handled" ops defer to runtime managed helpers that don't exist; `simd_splat` missing; most
   `simd_*` ICE via `must_be_overridden`. Builtin side (`ir/builtins/simd/`) has a fallback but
   `simd_shuffle` is an unregistered `todo!`.
-- **Atomics partial + a deliberate bug:** sub-word `xchg` is `todo!` (`atomic.rs:66`); **1-byte
-  `cxchg` intentionally returns the wrong value** (`atomic.rs:127`, stale "remove after .NET 9"
-  comment); `atomic_store` is a plain store.
+- **Atomics:** sub-word `cxchg`/`xchg` for `u8`/`i8`/`u16`/`i16` now correct via masked-CAS-loop
+  builtins (WF-5 — see §10); `atomic_store` is still a plain store.
 - **`float → int` `as` cast is wrapping, not saturating** (`casts.rs:176` via `rvalue.rs:106`) — a
   latent **correctness miscompile** for out-of-range/NaN (Rust `as` saturates).
 - f16/f128 float-to-float `as` casts `panic!` (`rvalue.rs:238`); `int → f128` cast `todo!`.
@@ -289,13 +288,18 @@ novel inline asm). proc-macros are a non-issue (host-time), not a non-goal.
 - ✅ Duplicate `_Unwind_DeleteException` registration removed in the linker.
 
 **Still open (deferred to later workflows, with sharpened specs):**
-- ⛔ **1-byte atomic `cxchg` (→ WF-5).** Original returns the comparand (always-success, no write).
-  WF-1's attempted fix was reverted: the in-tree `atomic_cmpxchng8_i32` builtin is actually an
-  *unconditional exchange* — its body never reads the comparand (no `LdArg(2)`), so reusing it would
-  **write on mismatch**, violating Rust's no-write-on-failure. A correct fix needs a comparand check
-  *inside* the masked CAS loop (merge the new byte only when the observed low byte == comparand, else
-  return observed and stop), and must cover `i8`/`u16`/`i16` (which currently fall through to a
-  nonexistent `Interlocked.CompareExchange` 8/16-bit overload).
+- ✅ **1-byte (and `i8`/`u16`/`i16`) atomic `cxchg` — FIXED (WF-5).** The old `Type::Int(Int::U8) =>
+  comparand` shortcut (always-success, no write) is replaced by dedicated comparand-checked builtins
+  `atomic_cmpxchng{8,16}_correct` (`cilly/src/ir/builtins/atomics.rs::emulate_subword_cmp_xchng`):
+  a masked 32-bit `Interlocked.CompareExchange` loop that reads the containing word, extracts the
+  target sub-word, and **bails without writing if it != comparand**, splicing+CASing only on a match
+  and retrying solely on other-byte contention; it returns the genuine old sub-word so
+  `cxchng_res_val`'s `old == expected` is exact. The loop-internal `cmpxchng{8,16}_i32` builtins (the
+  *unconditional* splice that WF-1 wrongly tried to reuse) are left untouched — they remain correct
+  inside the re-reading RMW loop in `generate_atomic`. Sub-word `atomic_xchg` (`i8`/`u16`/`i16`),
+  previously `todo!`, now uses `atomic_xchng{8,16}_correct` (an unconditional-splice CAS loop —
+  genuinely atomic, unlike the plain volatile load/store the `u8` path still uses). LE-only +
+  page-boundary caveats documented on the builtins; retire for .NET 9's native sub-word overload.
 - ⛔ `#[track_caller]` location assembled from uninitialized memory (`call.rs:576`) — benign under
   panic=abort; **fix as part of WF-6 (unwinding)**, where it actually gets read.
 - 🔶 The typechecker is off-by-default and non-fatal. Triage verdict: it **can** become a staged hard

@@ -174,6 +174,12 @@ pub fn int_to_int(src: Type, target: Type, operand: Node, asm: &mut Assembly) ->
 }
 /// Returns CIL ops required to convert type src to target
 pub fn float_to_int(src: Type, target: Type, operand: Node, asm: &mut Assembly) -> Node {
+    // `f16` has no native CIL float, and no `cast_f16_*` builtins exist; widen f16 -> f32 via
+    // `System.Half`'s explicit conversion operator first, then reuse the f32 -> int path.
+    if matches!(src, Type::Float(Float::F16)) {
+        let as_f32 = cilly::ir::builtins::f16::f16_to_float(asm, operand, Float::F32);
+        return float_to_int(Type::Float(Float::F32), target, as_f32, asm);
+    }
     match target {
         Type::Int(Int::I128) => {
             let mref = MethodRef::new(
@@ -293,6 +299,11 @@ pub fn int_to_float(src: Type, target: Type, parrent: Node, asm: &mut Assembly) 
         asm.call(mref, &[parrent], IsPure::NOT)
     } else if matches!(target, Type::Int(Int::I128 | Int::U128)) {
         todo!("Casting to 128 bit intiegers is not supported!")
+    } else if matches!(target, Type::Float(Float::F16)) {
+        // `f16` has no native CIL float; go int -> f32 first, then narrow f32 -> f16 via
+        // `System.Half`'s explicit conversion operators.
+        let as_f32 = int_to_float(src, Type::Float(Float::F32), parrent, asm);
+        cilly::ir::builtins::f16::float_to_f16(asm, as_f32, Float::F32)
     } else {
         match (&src, &target) {
             (Type::Int(Int::U32 | Int::U64), Type::Float(Float::F32)) => {

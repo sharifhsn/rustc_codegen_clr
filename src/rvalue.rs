@@ -231,10 +231,29 @@ pub fn handle_rvalue<'tcx>(
         Rvalue::Cast(CastKind::FloatToFloat, operand, target) => {
             let target = ctx.monomorphize(*target);
             let target = ctx.type_from_cache(target);
+            let src = ctx.monomorphize(operand.ty(&ctx.body().local_decls, ctx.tcx()));
+            let src = ctx.type_from_cache(src);
             let mut ops = handle_operand(operand, ctx);
-            match target {
-                Type::Float(Float::F32) => ops = ctx.float_cast(ops, Float::F32, true),
-                Type::Float(Float::F64) => ops = ctx.float_cast(ops, Float::F64, true),
+            // `f16` has no native CIL float type, so its conversions are routed through
+            // `System.Half`'s explicit conversion operators instead of the `conv.r*` opcodes
+            // (the `FloatCast` IR node `todo!()`s on `f16` in every exporter).
+            // `f128` has no .NET equivalent (it would need softfloat emulation); leave it deferred.
+            match (src, target) {
+                // f16 -> {f32, f64}
+                (Type::Float(Float::F16), Type::Float(dst @ (Float::F32 | Float::F64))) => {
+                    ops = cilly::ir::builtins::f16::f16_to_float(ctx, ops, dst);
+                }
+                // {f32, f64} -> f16
+                (Type::Float(src @ (Float::F32 | Float::F64)), Type::Float(Float::F16)) => {
+                    ops = cilly::ir::builtins::f16::float_to_f16(ctx, ops, src);
+                }
+                // f16 -> f16 is a no-op.
+                (Type::Float(Float::F16), Type::Float(Float::F16)) => (),
+                (Type::Float(Float::F128), _) | (_, Type::Float(Float::F128)) => {
+                    todo!("f128 FloatToFloat casts are unsupported: .NET has no quadruple-precision float type, so this needs softfloat emulation (src:{src:?} target:{target:?})")
+                }
+                (_, Type::Float(Float::F32)) => ops = ctx.float_cast(ops, Float::F32, true),
+                (_, Type::Float(Float::F64)) => ops = ctx.float_cast(ops, Float::F64, true),
                 _ => panic!("Can't preform a FloatToFloat cast to type {target:?}"),
             }
             (vec![], ops)

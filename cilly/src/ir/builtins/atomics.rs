@@ -12,6 +12,11 @@ use super::{
 };
 /// Emulates operations on bytes using operations on int32s. Enidianess dependent, can cause segfuaults when used on a page boundary.
 /// TODO: remove when .NET 9 is out.
+///
+/// NOTE: the `cmpxchng{8,16}` builtins generated here splice the new sub-word *unconditionally* (their
+/// body never reads the comparand). That is correct ONLY as the inner step of the re-reading RMW loop
+/// in [`generate_atomic`]. For Rust's `atomic_cxchg`/`atomic_xchg` (which must honour the comparand and
+/// not write on mismatch) use [`emulate_subword_cmp_xchng`] / [`emulate_subword_xchng`] instead.
 pub fn emulate_uint8_cmp_xchng(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     generate_atomic(
         asm,
@@ -71,6 +76,289 @@ pub fn emulate_uint8_cmp_xchng(asm: &mut Assembly, patcher: &mut MissingMethodPa
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![set_tmp, copy_arg1, ret], 0, None)],
             locals: vec![(None, uint8_idx)],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+/// Emits a sub-word (`u8`/`i8`/`u16`/`i16`) atomic exchange, named `atomic_xchng{8,16}_correct`, as a
+/// masked 32-bit `Interlocked.CompareExchange` loop that unconditionally splices the new sub-word and
+/// retries until the full word swaps. Unlike a plain volatile load/store, this is genuinely atomic
+/// against concurrent writers to the SAME word. Returns the old sub-word.
+///
+/// Signature: `int_ty atomic_xchng{8,16}_correct(int_ty& addr, int_ty new)`.
+/// Same LE-only + page-boundary caveats as [`emulate_subword_cmp_xchng`].
+pub fn emulate_subword_xchng(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, width: u8) {
+    debug_assert!(width == 1 || width == 2, "sub-word xchg width must be 1 or 2");
+    let name = asm.alloc_string(format!("atomic_xchng{}_correct", width * 8));
+    let full_mask: u32 = if width == 1 { 0xFF } else { 0xFFFF };
+    let generator = move |_, asm: &mut Assembly| {
+        // locals: 0 = word_addr (i32*), 1 = shift (i32), 2 = observed_word (i32), 3 = prev (i32)
+        let i32_t = asm.alloc_type(Type::Int(Int::I32));
+        // --- bb0: containing-word address + sub-word bit shift. ---
+        let addr_ref = asm.alloc_node(CILNode::LdArg(0));
+        let addr_ptr = asm.alloc_node(CILNode::RefToPtr(addr_ref));
+        let addr_int = asm.alloc_node(CILNode::PtrCast(
+            addr_ptr,
+            Box::new(crate::cilnode::PtrCastRes::USize),
+        ));
+        let three = asm.alloc_node(Const::USize(3));
+        let not_three = asm.alloc_node(Const::USize(!3u64));
+        let word_addr_int = asm.alloc_node(CILNode::BinOp(addr_int, not_three, BinOp::And));
+        let word_addr = asm.alloc_node(CILNode::PtrCast(
+            word_addr_int,
+            Box::new(crate::cilnode::PtrCastRes::Ptr(i32_t)),
+        ));
+        let byte_off = asm.alloc_node(CILNode::BinOp(addr_int, three, BinOp::And));
+        let eight = asm.alloc_node(Const::USize(8));
+        let shift_usize = asm.alloc_node(CILNode::BinOp(byte_off, eight, BinOp::Mul));
+        let shift = asm.alloc_node(CILNode::IntCast {
+            input: shift_usize,
+            target: Int::I32,
+            extend: ExtendKind::ZeroExtend,
+        });
+        let bb0 = vec![
+            asm.alloc_root(CILRoot::StLoc(0, word_addr)),
+            asm.alloc_root(CILRoot::StLoc(1, shift)),
+            asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None)))),
+        ];
+        // --- bb1: read word, splice new sub-word, CAS, retry on contention. ---
+        let ld_word_addr = asm.alloc_node(CILNode::LdLoc(0));
+        let observed_word = asm.alloc_node(CILNode::LdInd {
+            addr: ld_word_addr,
+            tpe: i32_t,
+            volatile: true,
+        });
+        let ld_shift = asm.alloc_node(CILNode::LdLoc(1));
+        let mask_node = asm.alloc_node(Const::I32(full_mask as i32));
+        let mask_at_shift = asm.alloc_node(CILNode::BinOp(mask_node, ld_shift, BinOp::Shl));
+        let neg_one = asm.alloc_node(Const::I32(-1));
+        let clear_mask = asm.alloc_node(CILNode::BinOp(mask_at_shift, neg_one, BinOp::XOr));
+        let ld_observed_word = asm.alloc_node(CILNode::LdLoc(2));
+        let cleared = asm.alloc_node(CILNode::BinOp(ld_observed_word, clear_mask, BinOp::And));
+        let ld_new = asm.alloc_node(CILNode::LdArg(1));
+        let new_i32 = asm.alloc_node(CILNode::IntCast {
+            input: ld_new,
+            target: Int::I32,
+            extend: ExtendKind::ZeroExtend,
+        });
+        let new_masked = asm.alloc_node(CILNode::BinOp(new_i32, mask_node, BinOp::And));
+        let ld_shift2 = asm.alloc_node(CILNode::LdLoc(1));
+        let new_at_shift = asm.alloc_node(CILNode::BinOp(new_masked, ld_shift2, BinOp::Shl));
+        let new_word = asm.alloc_node(CILNode::BinOp(cleared, new_at_shift, BinOp::Or));
+        let ld_word_addr2 = asm.alloc_node(CILNode::LdLoc(0));
+        let ld_observed_word2 = asm.alloc_node(CILNode::LdLoc(2));
+        let cmpxchng = asm.alloc_string("CompareExchange");
+        let i32_ref = asm.nref(Type::Int(Int::I32));
+        let cmpxchng_sig = asm.sig(
+            [i32_ref, Type::Int(Int::I32), Type::Int(Int::I32)],
+            Type::Int(Int::I32),
+        );
+        let interlocked = ClassRef::interlocked(asm);
+        let cmpxchng = asm.alloc_methodref(MethodRef::new(
+            interlocked,
+            cmpxchng,
+            cmpxchng_sig,
+            MethodKind::Static,
+            vec![].into(),
+        ));
+        let prev = asm.alloc_node(CILNode::call(
+            cmpxchng,
+            [ld_word_addr2, new_word, ld_observed_word2],
+        ));
+        let ld_prev = asm.alloc_node(CILNode::LdLoc(3));
+        let ld_observed_word3 = asm.alloc_node(CILNode::LdLoc(2));
+        let bb1 = vec![
+            asm.alloc_root(CILRoot::StLoc(2, observed_word)),
+            asm.alloc_root(CILRoot::StLoc(3, prev)),
+            // if CAS observed a different word, some byte changed under us -> retry bb1.
+            asm.alloc_root(CILRoot::Branch(Box::new((
+                0,
+                1,
+                Some(BranchCond::Ne(ld_prev, ld_observed_word3)),
+            )))),
+            asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None)))),
+        ];
+        // --- bb2: return the old sub-word, extracted from the word we swapped out. ---
+        let ld_old_word = asm.alloc_node(CILNode::LdLoc(3));
+        let ld_shift3 = asm.alloc_node(CILNode::LdLoc(1));
+        let mask_node2 = asm.alloc_node(Const::I32(full_mask as i32));
+        let old_shifted = asm.alloc_node(CILNode::BinOp(ld_old_word, ld_shift3, BinOp::ShrUn));
+        let old_sub = asm.alloc_node(CILNode::BinOp(old_shifted, mask_node2, BinOp::And));
+        let bb2 = vec![asm.alloc_root(CILRoot::Ret(old_sub))];
+        MethodImpl::MethodBody {
+            blocks: vec![
+                BasicBlock::new(bb0, 0, None),
+                BasicBlock::new(bb1, 1, None),
+                BasicBlock::new(bb2, 2, None),
+            ],
+            locals: vec![(None, i32_t), (None, i32_t), (None, i32_t), (None, i32_t)],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+/// Emits a CORRECT sub-word (`u8`/`i8`/`u16`/`i16`) atomic compare-exchange, named
+/// `atomic_cmpxchng{8,16}_correct`, by emulating it with a masked 32-bit `Interlocked.CompareExchange`
+/// loop. Unlike the loop-internal `cmpxchng{8,16}` builtins (which unconditionally splice the new
+/// sub-word and so write on mismatch — fine inside a re-reading RMW loop, but WRONG as Rust's
+/// `compare_exchange`), this checks the observed sub-word against the comparand *before* writing:
+///   * if the observed sub-word != comparand, it returns the observed sub-word WITHOUT writing
+///     (Rust's no-write-on-failure contract);
+///   * otherwise it splices the new sub-word into the containing word and CASes the full word,
+///     retrying only on contention from the OTHER bytes of that word.
+/// In all cases it returns the genuine old sub-word, so the caller's `old == expected` check is exact.
+///
+/// Signature: `int_ty atomic_cmpxchng{8,16}_correct(int_ty& addr, int_ty comparand, int_ty new)`.
+///
+/// CAVEATS (inherent to the word-CAS strategy, and matching the existing emulation):
+/// * Little-endian only (the LE x86_64 / .NET 8 target): the sub-word byte lives in the LOW bits of
+///   the containing word at `(addr & 3) * 8`.
+/// * Page-boundary hazard: the address is aligned DOWN to its containing 32-bit word, so up to 3
+///   bytes before the target byte are touched. A naturally-aligned `u8`/`u16` atomic is always
+///   contained within one word (Rust requires natural alignment), so the aligned-down word stays in
+///   the same allocation in practice — but the general caveat stands. Remove once .NET 9's native
+///   sub-word `Interlocked.CompareExchange` is the floor.
+pub fn emulate_subword_cmp_xchng(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, width: u8) {
+    debug_assert!(width == 1 || width == 2, "sub-word CAS width must be 1 or 2");
+    let name = asm.alloc_string(format!("atomic_cmpxchng{}_correct", width * 8));
+    let full_mask: u32 = if width == 1 { 0xFF } else { 0xFFFF };
+    let generator = move |_, asm: &mut Assembly| {
+        // locals: 0 = word_addr (i32*), 1 = shift (i32), 2 = observed_word (i32), 3 = observed_sub (i32)
+        let i32_t = asm.alloc_type(Type::Int(Int::I32));
+        // --- bb0: compute the containing-word address and the sub-word bit shift. ---
+        let addr_ref = asm.alloc_node(CILNode::LdArg(0));
+        let addr_ptr = asm.alloc_node(CILNode::RefToPtr(addr_ref));
+        let addr_int = asm.alloc_node(CILNode::PtrCast(
+            addr_ptr,
+            Box::new(crate::cilnode::PtrCastRes::USize),
+        ));
+        // word_addr = (i32*)(addr & ~3)
+        let three = asm.alloc_node(Const::USize(3));
+        let not_three = asm.alloc_node(Const::USize(!3u64));
+        let word_addr_int = asm.alloc_node(CILNode::BinOp(addr_int, not_three, BinOp::And));
+        let word_addr = asm.alloc_node(CILNode::PtrCast(
+            word_addr_int,
+            Box::new(crate::cilnode::PtrCastRes::Ptr(i32_t)),
+        ));
+        // shift = (i32)((addr & 3) * 8)
+        let byte_off = asm.alloc_node(CILNode::BinOp(addr_int, three, BinOp::And));
+        let eight = asm.alloc_node(Const::USize(8));
+        let shift_usize = asm.alloc_node(CILNode::BinOp(byte_off, eight, BinOp::Mul));
+        let shift = asm.alloc_node(CILNode::IntCast {
+            input: shift_usize,
+            target: Int::I32,
+            extend: ExtendKind::ZeroExtend,
+        });
+        let bb0 = vec![
+            asm.alloc_root(CILRoot::StLoc(0, word_addr)),
+            asm.alloc_root(CILRoot::StLoc(1, shift)),
+            asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None)))),
+        ];
+        // --- bb1: read the word, extract the observed sub-word, bail to bb3 if it != comparand. ---
+        let ld_word_addr = asm.alloc_node(CILNode::LdLoc(0));
+        let observed_word = asm.alloc_node(CILNode::LdInd {
+            addr: ld_word_addr,
+            tpe: i32_t,
+            volatile: true,
+        });
+        let ld_shift = asm.alloc_node(CILNode::LdLoc(1));
+        // observed_sub = (word >> shift) & full_mask, then zero-extended into the int_ty value space
+        let shifted = asm.alloc_node(CILNode::BinOp(observed_word, ld_shift, BinOp::ShrUn));
+        let mask_node = asm.alloc_node(Const::I32(full_mask as i32));
+        let observed_sub = asm.alloc_node(CILNode::BinOp(shifted, mask_node, BinOp::And));
+        // comparand, masked to the sub-word width so a sign-extended negative arg compares correctly.
+        let ld_comparand = asm.alloc_node(CILNode::LdArg(1));
+        let comparand_i32 = asm.alloc_node(CILNode::IntCast {
+            input: ld_comparand,
+            target: Int::I32,
+            extend: ExtendKind::ZeroExtend,
+        });
+        let comparand_sub = asm.alloc_node(CILNode::BinOp(comparand_i32, mask_node, BinOp::And));
+        let ld_observed_sub = asm.alloc_node(CILNode::LdLoc(3));
+        let bb1 = vec![
+            asm.alloc_root(CILRoot::StLoc(2, observed_word)),
+            asm.alloc_root(CILRoot::StLoc(3, observed_sub)),
+            // if observed_sub != comparand -> bb3 (return observed, NO write)
+            asm.alloc_root(CILRoot::Branch(Box::new((
+                0,
+                3,
+                Some(BranchCond::Ne(ld_observed_sub, comparand_sub)),
+            )))),
+            // else fall through to bb2 (attempt the CAS)
+            asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None)))),
+        ];
+        // --- bb2: splice the new sub-word into the word and CAS; retry bb1 only on other-byte contention. ---
+        let ld_word_addr2 = asm.alloc_node(CILNode::LdLoc(0));
+        let ld_observed_word = asm.alloc_node(CILNode::LdLoc(2));
+        let ld_shift2 = asm.alloc_node(CILNode::LdLoc(1));
+        // clear the target sub-word: word & ~(full_mask << shift)
+        let mask_node2 = asm.alloc_node(Const::I32(full_mask as i32));
+        let mask_at_shift = asm.alloc_node(CILNode::BinOp(mask_node2, ld_shift2, BinOp::Shl));
+        let neg_one = asm.alloc_node(Const::I32(-1));
+        let clear_mask = asm.alloc_node(CILNode::BinOp(mask_at_shift, neg_one, BinOp::XOr));
+        let cleared = asm.alloc_node(CILNode::BinOp(ld_observed_word, clear_mask, BinOp::And));
+        // place the new sub-word: (new & full_mask) << shift
+        let ld_new = asm.alloc_node(CILNode::LdArg(2));
+        let new_i32 = asm.alloc_node(CILNode::IntCast {
+            input: ld_new,
+            target: Int::I32,
+            extend: ExtendKind::ZeroExtend,
+        });
+        let new_masked = asm.alloc_node(CILNode::BinOp(new_i32, mask_node2, BinOp::And));
+        let ld_shift3 = asm.alloc_node(CILNode::LdLoc(1));
+        let new_at_shift = asm.alloc_node(CILNode::BinOp(new_masked, ld_shift3, BinOp::Shl));
+        let new_word = asm.alloc_node(CILNode::BinOp(cleared, new_at_shift, BinOp::Or));
+        // prev = Interlocked.CompareExchange(word_addr, new_word, observed_word)
+        let cmpxchng = asm.alloc_string("CompareExchange");
+        let i32_ref = asm.nref(Type::Int(Int::I32));
+        let cmpxchng_sig = asm.sig(
+            [i32_ref, Type::Int(Int::I32), Type::Int(Int::I32)],
+            Type::Int(Int::I32),
+        );
+        let interlocked = ClassRef::interlocked(asm);
+        let cmpxchng = asm.alloc_methodref(MethodRef::new(
+            interlocked,
+            cmpxchng,
+            cmpxchng_sig,
+            MethodKind::Static,
+            vec![].into(),
+        ));
+        let prev = asm.alloc_node(CILNode::call(
+            cmpxchng,
+            [ld_word_addr2, new_word, ld_observed_word],
+        ));
+        // Store the CAS result once into loc 4; referencing the call node twice would re-emit the
+        // (side-effecting) CompareExchange.
+        let ld_prev = asm.alloc_node(CILNode::LdLoc(4));
+        let ld_observed_word2 = asm.alloc_node(CILNode::LdLoc(2));
+        let bb2 = vec![
+            asm.alloc_root(CILRoot::StLoc(4, prev)),
+            // CompareExchange returns the value it observed; if it differs from the word we read,
+            // some OTHER byte changed under us -> retry the whole load/compare from bb1.
+            asm.alloc_root(CILRoot::Branch(Box::new((
+                0,
+                1,
+                Some(BranchCond::Ne(ld_prev, ld_observed_word2)),
+            )))),
+            // success: the target sub-word == comparand and the word was swapped -> bb3.
+            asm.alloc_root(CILRoot::Branch(Box::new((3, 0, None)))),
+        ];
+        // --- bb3: return the genuine old sub-word (==comparand on success, observed on failure). ---
+        let ret_sub = asm.alloc_node(CILNode::LdLoc(3));
+        let bb3 = vec![asm.alloc_root(CILRoot::Ret(ret_sub))];
+        MethodImpl::MethodBody {
+            blocks: vec![
+                BasicBlock::new(bb0, 0, None),
+                BasicBlock::new(bb1, 1, None),
+                BasicBlock::new(bb2, 2, None),
+                BasicBlock::new(bb3, 3, None),
+            ],
+            locals: vec![
+                (None, i32_t),
+                (None, i32_t),
+                (None, i32_t),
+                (None, i32_t),
+                (None, i32_t),
+            ],
         }
     };
     patcher.insert(name, Box::new(generator));
@@ -241,6 +529,12 @@ pub fn generate_all_atomics(asm: &mut Assembly, patcher: &mut MissingMethodPatch
     generate_atomic_for_ints(asm, patcher, "min", int_min);
     // Emulates 1 byte compare exchange
     emulate_uint8_cmp_xchng(asm, patcher);
+    // Correct, comparand-checked sub-word compare-exchange for Rust's `atomic_cxchg` (8 & 16 bit).
+    emulate_subword_cmp_xchng(asm, patcher, 1);
+    emulate_subword_cmp_xchng(asm, patcher, 2);
+    // Genuinely-atomic sub-word exchange for Rust's `atomic_xchg` (8 & 16 bit).
+    emulate_subword_xchng(asm, patcher, 1);
+    emulate_subword_xchng(asm, patcher, 2);
     for int in [Int::ISize, Int::USize, Int::U8, Int::I8] {
         generate_atomic(
             asm,

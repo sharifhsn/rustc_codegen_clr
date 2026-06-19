@@ -62,7 +62,23 @@ pub fn xchg<'tcx>(
             let call = ctx.cast_ptr_to(call, src_type);
             return place_set(destination, call, ctx);
         }
-        Type::Int(Int::I8 | Int::U16 | Int::I16) | Type::Bool | Type::PlatformChar => {
+        Type::Int(int @ (Int::I8 | Int::U16 | Int::I16)) => {
+            // Sub-word exchange via a masked 32-bit CAS loop (see `emulate_subword_xchng`).
+            // U8 keeps its existing `atomic_xchng_u8` builtin (handled above).
+            let width = int.size().expect("sub-word int has a known size");
+            let src_ref = ctx.nref(src_type);
+            let xchng = MethodRef::new(
+                *ctx.main_module(),
+                ctx.alloc_string(format!("atomic_xchng{}_correct", width * 8)),
+                ctx.sig([src_ref, src_type], src_type),
+                MethodKind::Static,
+                vec![].into(),
+            );
+            let xchng = ctx.alloc_methodref(xchng);
+            let call = ctx.call(xchng, &[dst, new], IsPure::NOT);
+            return place_set(destination, call, ctx);
+        }
+        Type::Bool | Type::PlatformChar => {
             todo!("can't atomic_xchg {src_type:?}")
         }
         _ => (),
@@ -124,8 +140,26 @@ pub fn cxchg<'tcx>(
             let call = ctx.call(call_site, &[dst, value, comparand], IsPure::NOT);
             ctx.cast_ptr_to(call, src_type)
         }
-        // TODO: this is a bug, on purpose. The 1 byte compare exchange is not supported untill .NET 9. Remove after November, when .NET 9 Releases.
-        Type::Int(Int::U8) => comparand,
+        // .NET (pre-9) has no native sub-word `Interlocked.CompareExchange`, so 8/16-bit CAS is
+        // emulated with a masked 32-bit CAS loop. The `atomic_cmpxchng{8,16}_correct` builtins
+        // (cilly::ir::builtins::atomics) check the comparand *inside* the loop and never write on a
+        // mismatch, returning the real old sub-word — so `cxchng_res_val`'s `old == expected` is exact.
+        // LE-only + page-boundary caveats documented on the builtin. Replace with the native overload
+        // once .NET 9 is the floor.
+        Type::Int(int @ (Int::U8 | Int::I8 | Int::U16 | Int::I16)) => {
+            let width = int.size().expect("sub-word int has a known size");
+            let src_ref = ctx.nref(src_type);
+            let call_site = MethodRef::new(
+                *ctx.main_module(),
+                ctx.alloc_string(format!("atomic_cmpxchng{}_correct", width * 8)),
+                ctx.sig([src_ref, src_type, src_type], src_type),
+                MethodKind::Static,
+                vec![].into(),
+            );
+            let call_site = ctx.alloc_methodref(call_site);
+            // builtin arg order: (addr, comparand, new)
+            ctx.call(call_site, &[dst, comparand, value], IsPure::NOT)
+        }
         _ => {
             let src_ref = ctx.nref(src_type);
             let call_site = MethodRef::new(
