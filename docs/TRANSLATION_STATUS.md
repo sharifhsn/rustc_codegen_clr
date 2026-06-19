@@ -1,8 +1,8 @@
 # Rust ↔ .NET translation layer — completeness & feasibility map
 
 > Status snapshot as of 2026-06 (nightly-2026-06-17, post the V1→V2 IR collapse, the
-> allocator-ABI fix, the **`dotnet` PAL**, the **complete-std** pass, and the **"go big"** full-BCL
-> binding generation). Compiled from a code audit of the whole backend cross-checked against
+> allocator-ABI fix, the **`dotnet` PAL**, the **complete-std** pass, the **"go big"** full-BCL
+> binding generation, and the **WF-6 unwinding throw-bridge**). Compiled from a code audit of the whole backend cross-checked against
 > FractalFir's design articles (`docs/ARCHITECTURE.md`, `docs/fractalfir_articles/`). Intended as a
 > planning reference: what exists, what's partial, what's missing-but-feasible, and what is
 > fundamentally limited. File:function pointers are given so each claim is checkable.
@@ -88,19 +88,23 @@ word emulation (the 1-byte `cxchg` is a real bug — §10).
 calling-convention-agnostic): `CallInfo` accepts Rust-family/C/Custom/X86.
 
 **Fragile:** **two divergent ABI checkers** — `src/function_sig.rs` (stale, `Rust|C` only) is still on
-the drop-glue + interop paths and can `panic!` where the modern `CallInfo` succeeds; `#[track_caller]`
-panic-location is filled from **uninitialized memory** (`call.rs:576`; benign under abort, a bug once
-unwinding lands); vtable layout `[drop,size,align,…]` is baked in.
+the drop-glue + interop paths and can `panic!` where the modern `CallInfo` succeeds; vtable layout
+`[drop,size,align,…]` is baked in. (`#[track_caller]` panic-location was filled from uninitialized
+memory; **fixed in WF-6** — now the real caller file/line/col, see §10.)
 
-**Unwinding — half-built:** the hard part (handler regions → real .NET `try/catch`,
-`resolve_exception_handlers`, `block_gc`, `RustException`) **is done**, but the **throw side is not
-wired** (`ir/builtins/unwind.rs` is empty, `raise_exception` commented out in the linker, no
-personality fn) → in practice it's **panic=abort with dormant plumbing**. `NO_UNWIND` strips handlers
-for perf. C-mode unwinding is a non-compiling sketch (gated on an undefined `UNWIND_SUPPORTED`, with
-`setjump`/`longjump` typos).
+**Unwinding — DONE (WF-6, managed-frames model):** the catch side (handler regions → real .NET
+`try/catch`, `resolve_exception_handlers`, `block_gc`, `RustException`) was already built; **WF-6 wired
+the throw side** (`ir/builtins/unwind.rs::raise_exception` overrides `_Unwind_RaiseException` to throw a
+`RustException` carrying the panic payload). A Rust `panic!` now propagates as a managed exception and
+`std::panic::catch_unwind` catches it end-to-end on .NET (validated by `cargo_tests/catch_panic`). This
+is the §7 managed-frames-only design: never crossing a P/Invoke boundary. `NO_UNWIND` strips handlers
+for perf. No DWARF personality fn is needed (the CLR runs the handlers). C-mode unwinding is still a
+non-compiling sketch (gated on an undefined `UNWIND_SUPPORTED`, with `setjump`/`longjump` typos).
 
 **Missing/hard terminators:** `InlineAsm` (throwing stub), `TailCall`/`Yield`/`CoroutineDrop`
-(`todo!`). `UnwindTerminate` rethrows instead of aborting.
+(`todo!`). `UnwindTerminate` now hard-aborts via `Environment.FailFast` (WF-6; was incorrectly
+re-throwing/continuing the unwind). Residual: `UnwindAction::Terminate` routing in `basic_block.rs`
+still returns `None` (needs a synthesized abort handler block).
 
 ## 4. Runtime / `std` support
 `cilly/src/libc_fns.rs`, `cilly/src/bin/linker/main.rs`, `cilly/src/ir/builtins/`.
@@ -332,8 +336,16 @@ The sibling `cast_ptr_to` (takes the full pointer type) is the correct helper. S
   previously `todo!`, now uses `atomic_xchng{8,16}_correct` (an unconditional-splice CAS loop —
   genuinely atomic, unlike the plain volatile load/store the `u8` path still uses). LE-only +
   page-boundary caveats documented on the builtins; retire for .NET 9's native sub-word overload.
-- ⛔ `#[track_caller]` location assembled from uninitialized memory (`call.rs:576`) — benign under
-  panic=abort; **fix as part of WF-6 (unwinding)**, where it actually gets read.
+- ✅ **`#[track_caller]` location — FIXED (WF-6).** Was assembled from uninitialized memory
+  (`call.rs`); now materializes the real caller file/line/col via `span_as_caller_location` +
+  `load_const_value` (the `caller_location` intrinsic's own path). Needed once unwinding lands, since
+  the location is read when a track_caller callee panics.
+- ✅ **Throw-bridge + `UnwindTerminate` — FIXED (WF-6).** `ir/builtins/unwind.rs::raise_exception`
+  overrides `_Unwind_RaiseException` to throw a `RustException` wrapping the panic payload, so
+  `catch_unwind` catches Rust panics end-to-end (`cargo_tests/catch_panic`). `UnwindTerminate` now
+  hard-aborts via `Environment.FailFast` instead of re-throwing. Residual: `UnwindAction::Terminate`
+  routing (`basic_block.rs`) still `None`; a non-fatal `CallArgTypeWrong` typecheck warning on the
+  `catch_unwind` glue (try-fn data ptr typed as the concrete closure `Data*` vs `u8*`).
 - 🔶 The typechecker is off-by-default and non-fatal. Triage verdict: it **can** become a staged hard
   gate via reviving `TYPECHECK_CIL`; most errors are real (`FieldOwnerMismatch`, `CallArgTypeWrong`),
   with benign ref-vs-ptr-store `FieldAssignWrongType` noise to clear first; ~days of effort to reach
@@ -354,12 +366,12 @@ The benchmark decomposes into 6 layers → workflows:
 | 1 correct codegen | WF-1, WF-5 | ✅ **DONE** |
 | 2 `std` runs on .NET | WF-2, WF-4 | ✅ **DONE** (PAL vertical; surrogate retiring) |
 | 3 Rust→.NET calls | WF-3 | ✅ **DONE** (full BCL, 4256 methods) |
-| 4 errors/panics cross cleanly | WF-6 | ⬜ next |
+| 4 errors/panics cross cleanly | WF-6 | ✅ **DONE** (throw-bridge; catch_unwind works) |
 | 5 .NET→Rust export (call Rust from C#) | **WF-7 — the linchpin** (the ~5%-dead direction) | ⬜ design-heavy |
 | 6 ergonomic packaged library | **WF-8** | ⬜ |
 
-**The Rust→.NET half of the benchmark stack (layers 1–3) is done.** What remains for "C# imports a real
-Rust module" is the *other* direction (WF-7) + error-crossing (WF-6) + packaging (WF-8).
+**Layers 1–4 are done** — the entire Rust→.NET half plus error-crossing. What remains for "C# imports a
+real Rust module" is the *other* direction (WF-7, the linchpin) + packaging (WF-8).
 
 **Roadmap** (run order; critical path to the benchmark is 1→2→3→7→8):
 - **WF-1** Correctness foundation — **DONE** (`50a6b39`).
@@ -373,7 +385,9 @@ Rust module" is the *other* direction (WF-7) + error-crossing (WF-6) + packaging
   and full surrogate retirement remain).
 - **WF-5** codegen pockets — **DONE** (`f3cd172`) for atomics (sub-word CAS) + f16 casts; SIMD, f128,
   `type_id` 128-bit, coroutines still open (see §2).
-- **WF-6** unwinding throw-bridge (managed-frames-only on Unix — §7). *Next; bounded, autonomous-able.*
+- **WF-6** unwinding throw-bridge — **DONE** (`22b0a00`): `_Unwind_RaiseException` throws a
+  `RustException`, `catch_unwind` catches Rust panics end-to-end on .NET (`cargo_tests/catch_panic`);
+  `UnwindTerminate`→`FailFast`; real `#[track_caller]` location. Managed-frames-only per §7.
 - **WF-7** `.NET→Rust` direction — reverse-export (`[UnmanagedCallersOnly]`-style) + `dotnet_typedef!`.
   *The linchpin: the benchmark is impossible without it, and it is the hardest, ceiling-adjacent piece.
   Design-heavy — scope before fan-out.*
@@ -387,7 +401,6 @@ Rust module" is the *other* direction (WF-7) + error-crossing (WF-6) + packaging
 - **WF-10 (open-ended)** Real-crate soak / hardening — drive an actual dependency-using crate
   end-to-end and close the long tail. Where "experimental" becomes "usable."
 
-**Status vs. the benchmark:** the capability work is **~60% done** — layers 1–3 (WF-1/2/3/5) complete,
-leaving WF-6 (errors cross), **WF-7 (the hardest, .NET→Rust)**, and WF-8 (packaging) on the critical
-path, then WF-9 (if the module's API is generic) + WF-10 (soak) for a *real* module. WF-7 remains both
-linchpin and hardest.
+**Status vs. the benchmark:** the capability work is **~70% done** — layers 1–4 (WF-1/2/3/5/6) complete,
+leaving **WF-7 (the hardest, .NET→Rust)** and WF-8 (packaging) on the critical path, then WF-9 (if the
+module's API is generic) + WF-10 (soak) for a *real* module. WF-7 remains both linchpin and hardest.
