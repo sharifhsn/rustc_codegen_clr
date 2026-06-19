@@ -23,6 +23,10 @@
 #                                the crate's built .dll (ikdasm). e.g. `il build_std rust_alloc`.
 #   dev.sh gate                  Force-rebuild, run ::stable (CI skips), diff vs baseline (416/22),
 #                                report PASS/FAIL + any NEW failures (outside the known-22 set).
+#   dev.sh pal-build             Inject the in-repo dotnet PAL (dotnet_pal/sys/**) into the
+#                                container's rust-src (mirror files + insert the target_os="dotnet"
+#                                cascade arms), then build-std cargo_tests/pal_hello for os=dotnet.
+#                                Used to iterate the std::sys::pal::dotnet work (WF-2).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -38,7 +42,7 @@ usage(){ sed -n '2,33p' "${BASH_SOURCE[0]}"; }
 # explicit guards instead.
 _in(){
   docker run --rm -i -e CARGO_TERM_COLOR=never \
-    -e DEV_CRATE -e DEV_CLEAN -e DEV_SYM \
+    -e DEV_CRATE -e DEV_CLEAN -e DEV_SYM -e DEV_RUN \
     -v "$REPO_ROOT":/work -v rcc-target:/work/target -w /work \
     "$IMAGE" bash -o pipefail -s
 }
@@ -143,6 +147,122 @@ done
 [ -n "$flaky" ] && { echo "~~ flaky (passed on retry, ignore):"; printf '%s' "$flaky"; }
 if [ -n "$real" ]; then echo "!! REAL REGRESSIONS (failed twice):"; printf '%s' "$real"; exit 1; else
   echo "OK: no real regressions (out-of-baseline failures were all flaky)"; fi
+C
+  ;;
+
+pal-build)
+  run_native=0; [ "${1:-}" = --run ] && run_native=1
+  export DEV_RUN="$run_native"
+  _in <<'C'
+set -e
+SRC="$(rustc --print sysroot)/lib/rustlib/src/rust/library/std/src/sys"
+PAL=/work/dotnet_pal/sys
+[ -d "$PAL" ] || { echo "!! no /work/dotnet_pal/sys"; exit 1; }
+echo "==> injecting dotnet PAL into rust-src ($SRC)"
+# Each --rm container starts from a pristine rust-src baked into the image, so we
+# always inject onto a clean base. Mirror every file under dotnet_pal/sys/** to $SRC/**.
+( cd "$PAL" && find . -type f ) | while read -r f; do
+  mkdir -p "$SRC/$(dirname "$f")"
+  cp "$PAL/$f" "$SRC/$f"
+done
+# Insert the `target_os = "dotnet"` arm as the FIRST arm of each cascade's cfg_select!
+# (dotnet is only true for our target, so order is irrelevant to correctness). Idempotent.
+inject_arm() { # $1 = cascade file under $SRC ; $2 = arm body (one line) ; $3 = which cfg_select! block (1-based, default 1)
+  local file="$SRC/$1"; local nth="${3:-1}"
+  [ -f "$file" ] || return 0
+  # Idempotency is per-block: a file with several cfg_select!s (thread_local/mod.rs)
+  # gets a dotnet arm injected into each of blocks 1,2,3 across calls, so we key the
+  # marker on the arm body, not just on the presence of `target_os = "dotnet"`.
+  grep -qF "$2" "$file" && return 0
+  awk -v arm="$2" -v nth="$nth" '
+    /cfg_select! \{/ { blk++ }
+    { print }
+    /cfg_select! \{/ && blk==nth && !ins {
+      print "    target_os = \"dotnet\" => {"
+      print "        " arm
+      print "    }"
+      ins=1
+    }' "$file" > "$file.__t" && mv "$file.__t" "$file"
+}
+# Anchor-based variant: insert the dotnet arm as the FIRST arm of the *next*
+# `cfg_select! {` that appears at or after a line matching $2 (a fixed-string
+# anchor). Use this for files whose cfg_select! count drifts across nightlies
+# (e.g. thread_local/mod.rs, where a `destructors` cfg_select block was added,
+# shifting every ordinal). Idempotent on the arm body. The arm body may be a
+# multi-line block: pass it with literal newlines.
+inject_arm_anchor() { # $1 = cascade file under $SRC ; $2 = fixed-string anchor ; $3 = arm body (may be multi-line)
+  local file="$SRC/$1"
+  [ -f "$file" ] || return 0
+  grep -qF "$3" "$file" && return 0
+  grep -qF "$2" "$file" || { echo "!! inject_arm_anchor: anchor '$2' not found in $1"; return 1; }
+  awk -v anchor="$2" -v arm="$3" '
+    index($0, anchor) { armed=1 }
+    { print }
+    armed && !ins && /cfg_select! \{/ {
+      print "    target_os = \"dotnet\" => {"
+      print arm
+      print "    }"
+      ins=1
+    }' "$file" > "$file.__t" && mv "$file.__t" "$file"
+}
+[ -f "$PAL/pal/dotnet/mod.rs" ]      && inject_arm pal/mod.rs          'mod dotnet; pub use self::dotnet::*;'
+[ -f "$PAL/alloc/dotnet.rs" ]        && inject_arm alloc/mod.rs        'mod dotnet;'
+[ -f "$PAL/stdio/dotnet.rs" ]        && inject_arm stdio/mod.rs        'mod dotnet; pub use dotnet::*;'
+[ -f "$PAL/args/dotnet.rs" ]         && inject_arm args/mod.rs         'mod dotnet; pub use dotnet::*;'
+[ -f "$PAL/env/dotnet.rs" ]          && inject_arm env/mod.rs          'mod dotnet; pub use dotnet::*;'
+[ -f "$PAL/random/dotnet.rs" ]       && inject_arm random/mod.rs       'mod dotnet; pub use dotnet::*;'
+if [ -f "$PAL/thread_local/dotnet.rs" ]; then
+  # thread_local/mod.rs has FOUR cfg_select!s, in source order:
+  #   (1) the storage layer (top of file),
+  #   (2) `pub(crate) mod destructors { cfg_select! { … } }`  <- added upstream;
+  #       it is `#[cfg(all(target_thread_local, …))]`-gated, so it is compiled
+  #       OUT for os=dotnet (not target_thread_local) and needs no arm,
+  #   (3) `pub(crate) mod guard { cfg_select! { … } }`  -> supplies `enable`,
+  #   (4) `pub(crate) mod key   { cfg_select! { … } }`  -> `_ => {}` (empty).
+  # The (2) `destructors` block shifted every ordinal vs the older 3-block layout
+  # this script was first written against, which is why the guard arm must be
+  # anchored to `pub(crate) mod guard {` instead of injected by ordinal (the old
+  # nth=2 landed in `destructors`, leaving `guard::enable` undefined — the very
+  # E0425 we are fixing).
+  #
+  # Storage arm (block 1, still the first cfg_select): declares `mod dotnet` at
+  # thread_local level and re-exports ITS STORAGE ITEMS ONLY (mirroring the
+  # `no_threads` arm — a glob `pub use dotnet::*` instead leaks the PAL's own
+  # `key`/`guard` items into thread_local scope and trips `hidden_glob_reexports`).
+  inject_arm thread_local/mod.rs 'pub use dotnet::{EagerStorage, LazyStorage, thread_local_inner}; pub(crate) use dotnet::{LocalPointer, local_pointer}; mod dotnet;' 1
+  # Guard arm: reach `enable` via `super::dotnet` (super of `guard` is
+  # thread_local, where `mod dotnet` was declared above). `current.rs` calls
+  # `crate::sys::thread_local::guard::enable()` from two sites; this is what they
+  # resolve to. dotnet is modelled on `no_threads` (single managed thread), whose
+  # guard `enable` is a leak-everything no-op.
+  inject_arm_anchor thread_local/mod.rs 'pub(crate) mod guard {' '        pub(crate) use super::dotnet::enable;'
+  # No `key` arm: nothing in std imports from `sys::thread_local::key` for
+  # os=dotnet (the storage layer re-exports from `dotnet` directly, not from
+  # os.rs), so the upstream `_ => {}` empty key arm compiles as-is. The PAL's
+  # `dotnet::key` module stays available for when real .NET threading lands.
+fi
+[ -f "$PAL/io/error/dotnet.rs" ]     && inject_arm io/error/mod.rs     'mod dotnet; pub use dotnet::*;'
+# Teach std's build.rs that os=dotnet is a *supported* platform, otherwise std
+# marks itself `restricted_std` (E0658 on use + "unwinding panics are not
+# supported without std"). The allow-list is the long `if target_os == "linux"
+# || ... {` block; inject our os as the first disjunct. Idempotent.
+BUILD_RS="$SRC/../../build.rs"
+if [ -f "$BUILD_RS" ] && ! grep -q 'target_os == "dotnet"' "$BUILD_RS"; then
+  echo "==> teaching std/build.rs that os=dotnet is supported (un-restricted_std)"
+  # Inject `target_os == "dotnet" ||` just before the first `target_os == "linux"`
+  # disjunct of the supported-platform allow-list. awk (no perl dependency).
+  awk '!ins && /target_os == "linux"/ {sub(/target_os == "linux"/, "target_os == \"dotnet\"\n        || target_os == \"linux\""); ins=1} {print}' "$BUILD_RS" > "$BUILD_RS.__t" && mv "$BUILD_RS.__t" "$BUILD_RS"
+fi
+echo "==> build-std pal_hello for os=dotnet"
+cd /work/cargo_tests/pal_hello
+export RUSTFLAGS="-Z codegen-backend=/work/target/release/librustc_codegen_clr.so -C linker=/work/target/release/linker -C link-args=--cargo-support"
+set +e
+cargo -Zjson-target-spec build --release 2>&1 | grep -vE 'discirminant' | grep -E '^error|error\[|could not compile|warning: unused|Compiling (std|core|alloc) |Finished' | head -60
+rc=${PIPESTATUS[0]}
+echo "== build exit: $rc =="
+out="target/x86_64-unknown-dotnet/release/pal_hello"
+[ ! -f "$out" ] && out="target/dotnet/release/pal_hello"
+if [ "$rc" = 0 ] && [ "$DEV_RUN" = 1 ] && [ -f "$out" ]; then echo "== RUN =="; "./$out"; echo "run exit: $?"; fi
 C
   ;;
 

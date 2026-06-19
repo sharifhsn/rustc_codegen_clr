@@ -453,6 +453,9 @@ fn main() {
         cilly::builtins::simd::simd(&mut final_assembly, &mut overrides);
 
         cilly::builtins::argc_argv_init(&mut final_assembly, &mut overrides);
+        // .NET PAL BCL bindings (rcl_dotnet_alloc / _free / _write) used by the
+        // std-side dotnet PAL. .NET-only: they emit calls into the BCL.
+        cilly::builtins::dotnet::insert_dotnet_pal(&mut final_assembly, &mut overrides);
     }
 
     // Ensure the cctor and tcctor exist!

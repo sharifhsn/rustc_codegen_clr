@@ -13,6 +13,7 @@ use super::{
 
 pub mod atomics;
 pub mod casts;
+pub mod dotnet;
 pub mod math;
 pub mod select;
 pub mod thread;

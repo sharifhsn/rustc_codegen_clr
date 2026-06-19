@@ -67,13 +67,24 @@ fn alloc_default_type(alloc_id: u64, ctx: &mut MethodCompileCtx<'_, '_>) -> Type
     {
         GlobalAlloc::Memory(alloc) => alloc,
         GlobalAlloc::Static(def_id) => return ctx.type_from_cache(static_ty(def_id, ctx.tcx())),
-        GlobalAlloc::VTable(..) => {
-            todo!()
-        }
-        GlobalAlloc::Function { .. } => {
-            todo!()
-        }
-        GlobalAlloc::TypeId{..}=>todo!(),
+        // A VTable alloc has no readable backing memory (`Size::ZERO`); its slots
+        // (drop-glue ptr, size, align, method ptrs) are materialized by codegen, not
+        // copied from raw bytes. The matching `add_allocation` arm emits a single
+        // pointer-sized static and ignores the type returned here, so a pointer-sized
+        // type is all that is required to keep the relocation path well-typed.
+        GlobalAlloc::VTable(..) => return Type::Int(Int::USize),
+        // A function alloc materializes a function pointer (pointer-sized). The
+        // function-provenance branch of `allocation_initializer_method` intercepts
+        // these before this is reached; this arm only exists so a stray
+        // function-typed relocation target can no longer ICE.
+        GlobalAlloc::Function { .. } => return Type::Int(Int::USize),
+        // A `TypeId` alloc is opaque: it has no backing memory. The pointer's
+        // *offset* is one pointer-sized segment of the 128-bit type-id hash, and
+        // that value is already present in the raw allocation bytes. We therefore
+        // give it a zero-sized type and (in `allocation_initializer_method`) skip
+        // the relocation patch, leaving the raw hash fragment in place. See the
+        // `GlobalAlloc::TypeId` arm there for the rationale.
+        GlobalAlloc::TypeId { .. } => return Type::Void,
     };
     let tpe = match alloc.0.0.align.bytes() {
         ..1 => Int::U8,
@@ -140,7 +151,13 @@ pub fn add_allocation(
             return ctx.load_static(field_desc);
             //todo!("Function/Vtable allocation.");
         }
-        GlobalAlloc::TypeId{..} => todo!(),
+        // A `TypeId` alloc has no backing memory: the pointer's *offset* is the
+        // type-id hash fragment and equality only requires it be self-consistent.
+        // Use a zero base, so the materialized pointer value equals the offset
+        // (the hash fragment). In practice the reloc loop in
+        // `allocation_initializer_method` short-circuits the TypeId case before
+        // reaching here, but keep this for any other caller.
+        GlobalAlloc::TypeId { .. } => return ctx.alloc_node(Const::USize(0)),
     };
 
     let const_allocation = const_allocation.inner();
@@ -244,6 +261,14 @@ fn allocation_initializer_method(
             let offset = u32::try_from(offset.bytes_usize()).unwrap();
             // Check if this allocation is a function
             let reloc_target_alloc = ctx.tcx().global_alloc(prov.alloc_id());
+            // `TypeId` provenance is opaque and has no real address: the pointer's
+            // offset (already written into the raw bytes copied above by `CpBlk`) is
+            // a segment of the 128-bit type-id hash. Leaving the raw bytes in place
+            // (base address 0 + offset == hash fragment) keeps `TypeId::of::<T>()`
+            // self-consistent for equality, which is all the program can observe.
+            if matches!(reloc_target_alloc, GlobalAlloc::TypeId { .. }) {
+                continue;
+            }
             if let GlobalAlloc::Function {
                 instance: finstance,
             } = reloc_target_alloc

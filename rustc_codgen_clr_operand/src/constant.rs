@@ -255,7 +255,16 @@ fn load_scalar_ptr(
             );
             CILNode::LdFtn(ctx.alloc_methodref(mref)).into_idx(ctx)
         }
-        GlobalAlloc::TypeId{..} => todo!(),
+        GlobalAlloc::TypeId { .. } => {
+            // A `TypeId` pointer is opaque: its integer value (`offset`) is one
+            // pointer-sized segment of the 128-bit type-id hash. There is no real
+            // allocation to point at, so materialize the segment value directly as
+            // a (base-0) pointer. `TypeId::of::<T>()` only requires this to be
+            // self-consistent for equality, which holds since identical types yield
+            // identical hash segments. See `static_data.rs`'s TypeId arms.
+            let val = ctx.alloc_node(cilly::Const::USize(offset.bytes()));
+            ctx.cast_ptr(val, Int::U8)
+        }
         GlobalAlloc::VTable(_, _) => {
             let (ty, polyref) = global_alloc.unwrap_vtable();
             get_vtable(
