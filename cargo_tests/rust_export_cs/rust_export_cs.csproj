@@ -4,6 +4,10 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>rust_export_cs</AssemblyName>
   </PropertyGroup>
+  <!-- No <Reference> to the Rust assembly: it is loaded at runtime via Assembly.LoadFrom(path) so the
+       compiler doesn't choke on the assembly's BCL reference versions (CS0012). The path is passed as
+       argv[0] by the build script. -->
 </Project>
