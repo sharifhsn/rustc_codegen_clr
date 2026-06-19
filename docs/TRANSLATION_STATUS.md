@@ -209,13 +209,30 @@ classes in Rust and reverse-export Rust functions; the real unwinding throw-brid
 **Out of scope / non-goals (treat as such):** Java/JS exporters, AOT, comptime-as-shipped,
 proc-macros, and the §7 fundamental limits.
 
-## 10. Concrete bugs surfaced by the audit
-(Independent of feature work — worth fixing/flagging.)
-- `float → int` `as` is non-saturating — a real miscompile (`casts.rs:176`).
-- 1-byte `cxchg` returns the comparand instead of exchanging (`atomic.rs:127`); stale ".NET 9" comment.
-- Two divergent ABI checkers — `function_sig.rs` (strict) vs `CallInfo` (permissive); latent `panic!`
-  on drop/interop paths.
-- `#[track_caller]` location assembled from uninitialized memory (`call.rs:576`).
-- `"System.Objetc"` typo in `mycorrhiza/src/class.rs:37`.
-- `_Unwind_DeleteException` registered twice in the linker.
-- The typechecker is off-by-default and non-fatal → miscompilations aren't caught at link time.
+## 10. Concrete bugs surfaced by the audit (WF-1 status)
+**Fixed (WF-1, gated no-regression):**
+- ✅ `float → int` `as`: `NaN` mapped to int `MAX` instead of `0` — the saturating builtin's
+  overflow branch used `bge.un`, which NaN satisfies. (Finite saturation was already correct; the
+  original "non-saturating" framing was imprecise.) Fixed with a `Ne(arg,arg)` NaN→0 guard in
+  `cilly/src/ir/builtins/casts.rs`.
+- ✅ Two divergent ABI checkers: `src/function_sig.rs::sig_from_instance_` now delegates to
+  `CallInfo::sig_from_instance_` (single source of truth) — kills the latent `panic!` on the
+  fn-ptr-reify / drop / interop paths.
+- ✅ `"System.Objetc"` typo → `"System.Object"` (`mycorrhiza/src/class.rs`); the IL exporter
+  special-cases the exact name `System.Object`, so the typo broke that path.
+- ✅ Duplicate `_Unwind_DeleteException` registration removed in the linker.
+
+**Still open (deferred to later workflows, with sharpened specs):**
+- ⛔ **1-byte atomic `cxchg` (→ WF-5).** Original returns the comparand (always-success, no write).
+  WF-1's attempted fix was reverted: the in-tree `atomic_cmpxchng8_i32` builtin is actually an
+  *unconditional exchange* — its body never reads the comparand (no `LdArg(2)`), so reusing it would
+  **write on mismatch**, violating Rust's no-write-on-failure. A correct fix needs a comparand check
+  *inside* the masked CAS loop (merge the new byte only when the observed low byte == comparand, else
+  return observed and stop), and must cover `i8`/`u16`/`i16` (which currently fall through to a
+  nonexistent `Interlocked.CompareExchange` 8/16-bit overload).
+- ⛔ `#[track_caller]` location assembled from uninitialized memory (`call.rs:576`) — benign under
+  panic=abort; **fix as part of WF-6 (unwinding)**, where it actually gets read.
+- 🔶 The typechecker is off-by-default and non-fatal. Triage verdict: it **can** become a staged hard
+  gate via reviving `TYPECHECK_CIL`; most errors are real (`FieldOwnerMismatch`, `CallArgTypeWrong`),
+  with benign ref-vs-ptr-store `FieldAssignWrongType` noise to clear first; ~days of effort to reach
+  a clean `::stable`. Candidate for its own workflow.

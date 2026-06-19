@@ -34,7 +34,7 @@ impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str> Class<ASSEMBL
         self.handle.instance0::<"get_Target", Self::NakedRef>()
     }
     pub fn from_naked_ref(naked: RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH>) -> Self {
-        let object: RustcCLRInteropManagedClass<"System.Runtime", "System.Objetc"> =
+        let object: RustcCLRInteropManagedClass<"System.Runtime", "System.Object"> =
             crate::intrinsics::rustc_clr_interop_managed_checked_cast(naked);
         let handle = GCHandle::static1::<"Alloc", _, _>(object);
         Self { handle }

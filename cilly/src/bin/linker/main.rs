@@ -359,17 +359,6 @@ fn main() {
         }),
     );
     overrides.insert(
-        final_assembly.alloc_string("_Unwind_DeleteException"),
-        Box::new(|_, asm| {
-            let ret = asm.alloc_root(CILRoot::VoidRet);
-            let blocks = vec![BasicBlock::new(vec![ret], 0, None)];
-            MethodImpl::MethodBody {
-                blocks,
-                locals: vec![],
-            }
-        }),
-    );
-    overrides.insert(
         final_assembly.alloc_string("fork"),
         Box::new(|_, asm| {
             let ret_val = asm.alloc_node(Const::I32(-1));

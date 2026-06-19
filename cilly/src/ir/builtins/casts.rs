@@ -69,6 +69,15 @@ fn float_to_int(asm: &mut Assembly, int: Int, float: Float, patcher: &mut Missin
         // Args
         let ld_arg_0 = asm.alloc_node(CILNode::LdArg(0));
 
+        // NaN maps to 0 in Rust's `as` casts. A value is NaN iff it is unequal to itself, so
+        // jump to block 3 (returns 0) when `arg != arg`. This must be checked before the
+        // overflow/underflow branches, since the unordered `bge.un`/`ble.un` comparisons below
+        // would otherwise (incorrectly) send NaN to imax/imin.
+        let is_nan = asm.alloc_root(CILRoot::Branch(Box::new((
+            3,
+            0,
+            Some(crate::cilroot::BranchCond::Ne(ld_arg_0, ld_arg_0)),
+        ))));
         // If arg is smaller than max, pass. Else jump to block 1.
         let overflow = asm.alloc_root(CILRoot::Branch(Box::new((
             1,
@@ -100,11 +109,19 @@ fn float_to_int(asm: &mut Assembly, int: Int, float: Float, patcher: &mut Missin
             },
         });
         let return_cast = asm.alloc_root(CILRoot::Ret(cast));
+        // Zero of the target int type, returned for NaN inputs.
+        let izero = asm.alloc_node(crate::Const::I32(0));
+        let izero = asm.alloc_node(CILNode::IntCast {
+            input: izero,
+            target: int,
+            extend: ExtendKind::ZeroExtend,
+        });
         MethodImpl::MethodBody {
             blocks: vec![
-                BasicBlock::new(vec![overflow, underflow, return_cast], 0, None),
+                BasicBlock::new(vec![is_nan, overflow, underflow, return_cast], 0, None),
                 BasicBlock::new(vec![asm.alloc_root(CILRoot::Ret(imax))], 1, None),
                 BasicBlock::new(vec![asm.alloc_root(CILRoot::Ret(imin))], 2, None),
+                BasicBlock::new(vec![asm.alloc_root(CILRoot::Ret(izero))], 3, None),
             ],
             locals: vec![],
         }
