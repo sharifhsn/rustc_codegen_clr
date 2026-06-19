@@ -875,7 +875,11 @@ pub fn argc_argv_init(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let eight = asm.alloc_node(8_i32);
         let eight_usize = asm.int_cast(eight, Int::USize, ExtendKind::ZeroExtend);
         let alloc_call = asm.call(aligned_alloc, &[alloc_size, eight_usize], IsPure::NOT);
-        let alloc_call = asm.cast_ptr(alloc_call, uint8_ptr_ptr);
+        // `argv` is `int8**` (a C `char**`). `cast_ptr(x, T)` yields `Ptr(T)`, so the
+        // pointee for an `int8**` is `int8*` (`uint8_ptr`, which is `nptr(i8)` here),
+        // NOT `uint8_ptr_ptr` (`int8**`) — passing the latter over-pointers to
+        // `int8***` and fails the `StLoc(argv, …)` assignability check.
+        let alloc_call = asm.cast_ptr(alloc_call, uint8_ptr);
         start_roots.push(asm.alloc_root(CILRoot::StLoc(argv, alloc_call)));
         // arg_idx = 0
         let zero_i32 = asm.alloc_node(0_i32);
@@ -888,7 +892,11 @@ pub fn argc_argv_init(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let ld_margs = asm.alloc_node(CILNode::LdLoc(managed_args));
         let ld_arg_idx = asm.alloc_node(CILNode::LdLoc(arg_idx));
         let arg_nth = asm.ld_elem_ref(ld_margs, ld_arg_idx);
+        // `mstring_to_utf8ptr` yields a `uint8*` (UTF8 bytes). The argv slots are
+        // `int8*` (this builds a C `char**`), so reinterpret the byte pointer as
+        // `int8*` before storing it (signedness-only pointer cast).
         let uarg = mstring_to_utf8ptr(arg_nth, asm);
+        let uarg = asm.cast_ptr(uarg, Type::Int(Int::I8));
         // STIndPtr(argv + zext_usize(size_of(usize) * arg_idx), uarg, *i8)
         let ld_argv = asm.alloc_node(CILNode::LdLoc(argv));
         let szof = asm.size_of(Int::USize);

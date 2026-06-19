@@ -715,25 +715,75 @@ pub fn handle_intrinsic<'tcx>(
             let value = ctx.call(eq, &[lhs, rhs], IsPure::NOT);
             vec![place_set(destination, value, ctx)]
         }
-        "simd_gt" => {
+        "simd_gt" | "simd_ge" | "simd_le" => {
+            // Element-wise comparisons producing a per-lane mask. `simd_gt`/`simd_ge`/`simd_le`
+            // all share the `(vec, vec) -> mask` shape of `simd_lt`; the builtin generator
+            // (cilly simd::binop::fallback_simd) supplies the matching body for each name.
             let comparands = ctx.type_from_cache(
                 call_instance.args[0]
                     .as_type()
-                    .expect("simd_gt works only on types!"),
+                    .expect("simd cmp works only on types!"),
             );
             let result = ctx.type_from_cache(
                 call_instance.args[1]
                     .as_type()
-                    .expect("simd_gt works only on types!"),
+                    .expect("simd cmp works only on types!"),
             );
             let lhs = handle_operand(&args[0].node, ctx);
             let rhs = handle_operand(&args[1].node, ctx);
-            let name = ctx.alloc_string("simd_gt");
+            let name = ctx.alloc_string(fn_name);
             let main_module = ctx.main_module();
             let main_module = ctx[*main_module].clone();
             let eq = main_module.static_mref(&[comparands, comparands], result, name, ctx);
             let value = ctx.call(eq, &[lhs, rhs], IsPure::NOT);
             vec![place_set(destination, value, ctx)]
+        }
+        "simd_extract" | "simd_extract_dyn" => {
+            // `simd_extract<T, U>(x: T, idx: u32) -> U`: read lane `idx` (element type `U`)
+            // out of vector `x` (type `T`). Implemented via memory: take the address of the
+            // vector, reinterpret it as `*U`, index, and load — the same spill-and-index idiom
+            // the elementwise SIMD builtins use.
+            let elem = ctx.type_from_cache(
+                call_instance.args[1]
+                    .as_type()
+                    .expect("simd_extract works only on types!"),
+            );
+            let addr = operand_address(&args[0].node, ctx);
+            // `cast_ptr` casts the vector address to a pointer-to-element (`*U`).
+            let elem_ptr = ctx.cast_ptr(addr, elem);
+            let idx = handle_operand(&args[1].node, ctx);
+            let slot = ctx.offset(elem_ptr, idx, elem);
+            let value = ctx.load(slot, elem);
+            vec![place_set(destination, value, ctx)]
+        }
+        "simd_insert" | "simd_insert_dyn" => {
+            // `simd_insert<T, U>(x: T, idx: u32, val: U) -> T`: return a copy of vector `x`
+            // with lane `idx` replaced by `val`. Spill `x` to a local, overwrite the lane in
+            // place through a reinterpreted `*U`, then yield the modified vector.
+            let vec_ty = ctx.type_from_cache(
+                call_instance.args[0]
+                    .as_type()
+                    .expect("simd_insert works only on types!"),
+            );
+            let elem = ctx.type_from_cache(
+                call_instance.args[1]
+                    .as_type()
+                    .expect("simd_insert works only on types!"),
+            );
+            let x = handle_operand(&args[0].node, ctx);
+            let idx = handle_operand(&args[1].node, ctx);
+            let val = handle_operand(&args[2].node, ctx);
+            // Stash the source vector into the destination place, then mutate that lane.
+            let mut roots = vec![place_set(destination, x, ctx)];
+            let addr = place_address(destination, ctx);
+            let elem_ptr = ctx.cast_ptr(addr, elem);
+            let slot = ctx.offset(elem_ptr, idx, elem);
+            let st = ctx.alloc_root(cilly::ir::CILRoot::StInd(Box::new((
+                slot, val, elem, false,
+            ))));
+            let _ = vec_ty;
+            roots.push(st);
+            roots
         }
         "simd_or" => {
             let vec = ctx.type_from_cache(
@@ -814,6 +864,48 @@ pub fn handle_intrinsic<'tcx>(
             let main_module = ctx[*main_module].clone();
             let mul = main_module.static_mref(&[vec, vec], vec, name, ctx);
             let value = ctx.call(mul, &[lhs, rhs], IsPure::NOT);
+            vec![place_set(destination, value, ctx)]
+        }
+        "simd_shl" | "simd_shr" | "simd_xor" => {
+            // Element-wise `(vec, vec) -> vec` ops, same shape as `simd_add`. The per-lane
+            // body is supplied by `fallback_simd` under the matching builtin name. `simd_shr`
+            // resolves to an arithmetic-vs-logical shift based on lane signedness inside the
+            // generator (the signedness is recoverable from the SIMD element type).
+            let vec = ctx.type_from_cache(
+                call_instance.args[0]
+                    .as_type()
+                    .expect("simd binop works only on types!"),
+            );
+            let lhs = handle_operand(&args[0].node, ctx);
+            let rhs = handle_operand(&args[1].node, ctx);
+            let name = ctx.alloc_string(fn_name);
+            let main_module = ctx.main_module();
+            let main_module = ctx[*main_module].clone();
+            let op = main_module.static_mref(&[vec, vec], vec, name, ctx);
+            let value = ctx.call(op, &[lhs, rhs], IsPure::NOT);
+            vec![place_set(destination, value, ctx)]
+        }
+        "simd_cast" | "simd_as" => {
+            // `simd_cast<T, U>(x: T) -> U`: per-lane numeric conversion (T and U have the same
+            // lane count, different element types). Implemented via memory: reinterpret the
+            // source vector address as `*src_elem`, the destination as `*dst_elem`, and convert
+            // each lane. The per-lane body is generated by `simd_cast` in `fallback_simd`.
+            let src = ctx.type_from_cache(
+                call_instance.args[0]
+                    .as_type()
+                    .expect("simd_cast works only on types!"),
+            );
+            let dst = ctx.type_from_cache(
+                call_instance.args[1]
+                    .as_type()
+                    .expect("simd_cast works only on types!"),
+            );
+            let val = handle_operand(&args[0].node, ctx);
+            let name = ctx.alloc_string("simd_cast");
+            let main_module = ctx.main_module();
+            let main_module = ctx[*main_module].clone();
+            let op = main_module.static_mref(&[src], dst, name, ctx);
+            let value = ctx.call(op, &[val], IsPure::NOT);
             vec![place_set(destination, value, ctx)]
         }
         "simd_fabs" => {
@@ -929,6 +1021,31 @@ pub fn handle_intrinsic<'tcx>(
             let ones_compliment = main_module.static_mref(&[result], result, ones_compliment, ctx);
             let ne = ctx.call(ones_compliment, &[eq], IsPure::NOT);
             vec![place_set(destination, ne, ctx)]
+        }
+        "simd_splat" => {
+            // `simd_splat<T, U>(value: U) -> T`: broadcast scalar `value` (type `U`,
+            // the element type) into every lane of result vector `T`. This maps 1:1 to
+            // the existing `simd_vec_from_val` builtin (.NET `Vector<E>.Create(scalar)`),
+            // the same helper the `x == y` scalar case of `simd_shuffle` reuses.
+            let vec_type = ctx.type_from_cache(
+                call_instance.args[0]
+                    .as_type()
+                    .expect("simd_splat works only on types!"),
+            );
+            let scalar_type = ctx.type_from_cache(
+                call_instance.args[1]
+                    .as_type()
+                    .expect("simd_splat works only on types!"),
+            );
+            // SANITY: the result must be a SIMD vector for this lowering to be valid.
+            let _ = vec_type.as_simdvector().expect("simd_splat result must be a SIMD vector");
+            let value = handle_operand(&args[0].node, ctx);
+            let name = ctx.alloc_string("simd_vec_from_val");
+            let main_module = ctx.main_module();
+            let main_module = ctx[*main_module].clone();
+            let splat = main_module.static_mref(&[scalar_type], vec_type, name, ctx);
+            let value = ctx.call(splat, &[value], IsPure::NOT);
+            vec![place_set(destination, value, ctx)]
         }
         "simd_reduce_any" => {
             let vec = ctx.type_from_cache(

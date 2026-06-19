@@ -303,6 +303,39 @@ impl ClassRef {
         let asm_name = Some(asm.alloc_string("System.Runtime.InteropServices"));
         asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
     }
+    /// Returns a reference to `System.Span<T>` instantiated at element type
+    /// `element` (a value type, e.g. `System.Span<uint8>`).
+    #[must_use]
+    pub fn span(asm: &mut Assembly, element: Type) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Span");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [element].into()))
+    }
+    /// Returns a reference to the class
+    /// `System.Security.Cryptography.RandomNumberGenerator`.
+    #[must_use]
+    pub fn random_number_generator(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Security.Cryptography.RandomNumberGenerator");
+        let asm_name = Some(asm.alloc_string("System.Security.Cryptography"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to the class `System.Diagnostics.Stopwatch`, the
+    /// monotonic high-resolution timer backing the `Instant` PAL hooks.
+    #[must_use]
+    pub fn stopwatch(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Diagnostics.Stopwatch");
+        let asm_name = Some(asm.alloc_string("System.Runtime.Extensions"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to the value type `System.DateTime`, the wall-clock
+    /// struct backing the `SystemTime` PAL hook.
+    #[must_use]
+    pub fn datetime(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.DateTime");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        // value type: instance calls take a managed `this` pointer.
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
+    }
     /// Returns a reference to the class `System.Numerics.BitOperations`
     #[must_use]
     pub fn bit_operations(asm: &mut Assembly) -> Interned<ClassRef> {

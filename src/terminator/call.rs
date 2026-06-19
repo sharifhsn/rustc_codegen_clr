@@ -156,10 +156,14 @@ fn callvirt_managed<'tcx>(
             ctx.alloc_class_ref(tpe),
             ctx.alloc_string(managed_fn_name),
             ctx.alloc_sig(signature.clone()),
+            // This is the *virtual* managed-call path (`virtN`). A non-static call must therefore
+            // be emitted as `callvirt`, not `call` — calling a virtual/abstract slot (e.g.
+            // `System.Type::get_FullName`) with a plain `call instance` is invalid IL and the JIT
+            // rejects the whole method with "Bad IL format".
             if is_static {
                 MethodKind::Static
             } else {
-                MethodKind::Instance
+                MethodKind::Virtual
             },
             vec![].into(),
         );

@@ -218,8 +218,11 @@ pub fn handle_aggregate<'tcx>(
             let data_ptr_name = ctx.alloc_string(crate::DATA_PTR);
             let void_ptr = ctx.nptr(cilly::Type::Void);
             let data_val = values[0].1;
-            let void_ptr_ty = ctx.nptr(Type::Void);
-            let data_val = ctx.cast_ptr(data_val, void_ptr_ty);
+            // The DATA_PTR field is typed `*void`. `cast_ptr_to` produces a value of exactly the
+            // given pointer type — `cast_ptr` would instead WRAP its argument in another `Ptr(..)`
+            // (its second arg is the pointee), yielding `**void` and a `FieldAssignWrongType`
+            // miscompile that the .NET JIT rejects as "Bad IL format" at scale.
+            let data_val = ctx.cast_ptr_to(data_val, void_ptr);
             let data_desc = ctx.alloc_field(FieldDesc::new(
                 fat_ptr_type.as_class_ref().unwrap(),
                 data_ptr_name,
@@ -260,7 +263,54 @@ fn aggregate_adt<'tcx>(
     active_field: Option<FieldIdx>,
 ) -> (Vec<Root>, Node) {
     let adt_type = ctx.monomorphize(adt_type);
-    let adt_type_ref = get_type(adt_type, ctx)
+    let adt_cil = get_type(adt_type, ctx);
+    // `repr(simd)` ADTs lower to `Type::SIMDVector`, which is not a ClassRef and so can't be
+    // built field-by-field like a normal struct. Construct the vector through memory instead:
+    // take the address of the destination place, then store each provided lane via a
+    // reinterpreted element pointer (the same spill-and-index idiom used by `simd_insert`).
+    //
+    // This is only valid when the aggregate's fields ARE the scalar lanes, i.e. one field per
+    // lane (the legacy `struct f32x4(f32,f32,f32,f32)` shape). The modern stdlib shape is a
+    // single inner-array field `struct Simd<T,N>([T;N])`; storing that `[T;N]` value through a
+    // `*elem` slot would write only `sizeof(elem)` bytes and miscompile. Guard on the lane
+    // count so the mismatched single-field case falls through to the (loud) class-ref path
+    // rather than silently producing a wrong vector.
+    if let Type::SIMDVector(simd) = adt_cil {
+        if fields.len() as u64 == u64::from(simd.count()) {
+            let elem: Type = simd.elem().into();
+            let addr = place_address(target_location, ctx);
+            let elem_ptr = ctx.cast_ptr(addr, elem);
+            let mut roots = Vec::new();
+            for (lane, value) in fields {
+                let idx = ctx.alloc_node(Const::USize(u64::from(lane)));
+                let slot = ctx.offset(elem_ptr, idx, elem);
+                roots.push(ctx.alloc_root(cilly::ir::CILRoot::StInd(Box::new((
+                    slot, value, elem, false,
+                )))));
+            }
+            return (roots, place_get(target_location, ctx));
+        }
+        // The modern stdlib shape `struct Simd<T,N>([T;N])` has a single inner-array field
+        // whose value IS the whole vector (the array `[T;N]` and the `SIMDVector` are
+        // bit-identical). Build the vector by transmuting that one field value to the vector
+        // type and storing it through the place. (The lane-by-lane path above only handles the
+        // legacy one-field-per-lane shape; without this arm we'd fall through to the class-ref
+        // `unwrap` below and ICE, leaving the enclosing method as malformed IL.)
+        if fields.len() == 1 {
+            let (field_idx, value) = fields[0];
+            let field_def = adt
+                .all_fields()
+                .nth(field_idx as usize)
+                .expect("Could not find SIMD inner field!");
+            let field_ty = field_def.ty(ctx.tcx(), subst).skip_normalization();
+            let field_ty = ctx.monomorphize(field_ty);
+            let field_cil = ctx.type_from_cache(field_ty);
+            let as_vec = ctx.transmute_on_stack(field_cil, adt_cil, value);
+            let root = place_set(target_location, as_vec, ctx);
+            return (vec![root], place_get(target_location, ctx));
+        }
+    }
+    let adt_type_ref = adt_cil
         .as_class_ref()
         .unwrap_or_else(|| panic!("Type {adt_type:?} is not a valuetype."));
     match adt.adt_kind() {

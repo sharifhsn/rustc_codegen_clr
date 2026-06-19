@@ -6,3 +6,9 @@ edition = "2021"
 [dependencies]
 mycorrhiza = {path = "../../mycorrhiza"}
 [workspace]
+
+# `abort` drops the unwinding/backtrace machinery (gimli/addr2line/object), which both shrinks
+# the build-std assembly massively and avoids the SIMD-heavy DWARF-parsing code paths that
+# stress the IL exporter.
+[profile.release]
+panic = "abort"

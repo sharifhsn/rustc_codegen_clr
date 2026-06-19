@@ -13,6 +13,11 @@
 #[allow(non_snake_case, unused_imports)]
 pub mod bindings;
 pub use bindings::*;
+/// Method-wrapper slice emitted by the `spinacz` binding generator (Console / Math /
+/// StringBuilder / String). Kept in its own module so the generated callable wrappers sit
+/// alongside the existing type-alias bindings without colliding with them.
+#[allow(non_snake_case, unused_imports, dead_code)]
+pub mod slice_bindings;
 pub mod class;
 /// Very low-level interop stuff. Don't use unless you need to.
 pub mod intrinsics;

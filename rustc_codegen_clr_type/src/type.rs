@@ -3,7 +3,7 @@ use crate::utilis::{
     INTEROP_ARR_TPE_NAME, INTEROP_CHR_TPE_NAME, INTEROP_CLASS_TPE_NAME, INTEROP_STRUCT_TPE_NAME,
     is_zst, try_resolve_const_size,
 };
-use crate::utilis::{garag_to_usize, garg_to_string, is_name_magic, pointer_to_is_fat, tuple_name};
+use crate::utilis::{garag_to_usize, garg_to_string, pointer_to_is_fat, tuple_name};
 use crate::{GetTypeExt, utilis::adt_name};
 use cilly::bimap::Interned;
 use cilly::class::ClassDefIdx;
@@ -215,13 +215,47 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                 if count == 1 {
                     return elem;
                 }
+                // .NET only has Vector64/128/256/512 — vectors wider than 512 bits (e.g.
+                // `Simd<u32, 32>` = 1024 bits, reached transitively via feature-gated stdarch
+                // paths that never execute on CoreCLR) have no managed intrinsic class, and the
+                // element may not even be a valid SIMD element. Rather than ICE in
+                // `SIMDVector::new`, represent the oversized/unrepresentable vector as a plain
+                // fixed-size array so the type (and any signature mentioning it) still lowers.
+                let layout = ctx.layout_of(ty);
+                let vec_bits = layout.layout.size().bytes().saturating_mul(8);
+                let elem_simd: Result<cilly::tpe::simd::SIMDElem, _> = elem.try_into();
+                if elem_simd.is_err() || vec_bits > 512 {
+                    let arr_size = layout.layout.size().bytes();
+                    let arr_align = layout.layout.align().abi.bytes();
+                    if std::convert::TryInto::<u32>::try_into(arr_size).is_err() {
+                        return Type::Void;
+                    }
+                    let cref = fixed_array(ctx, elem, count, arr_size, arr_align);
+                    return Type::ClassRef(cref);
+                }
                 return Type::SIMDVector(SIMDVector::new(
-                    elem.try_into().unwrap(),
+                    elem_simd.unwrap(),
                     count.try_into().unwrap(),
                 ));
             }
-            if is_name_magic(name.as_ref()) {
-                if name.contains(INTEROP_CLASS_TPE_NAME) {
+            // Gate the interop lowering on the OUTER ADT's own item name, not on a substring of
+            // the fully monomorphized `name` — the monomorphized name embeds nested generics, so
+            // a wrapper like `Option<RustcCLRInteropManagedClass<..>>` (item_name `Option`) or
+            // `RustcCLRInteropManagedArray<RustcCLRInteropManagedClass<..>, 1>` *contains* the
+            // interop substring and `is_name_magic` would (mis)route it here, where it has no
+            // matching arm and would `todo!`. Only the four interop ADTs themselves qualify; a
+            // generic type that merely HOLDS a managed value falls through to the normal ADT path.
+            let item_name = ctx.tcx().item_name(def.did());
+            let item_name = item_name.as_str();
+            let is_interop_adt = matches!(
+                item_name,
+                INTEROP_CLASS_TPE_NAME
+                    | INTEROP_STRUCT_TPE_NAME
+                    | INTEROP_ARR_TPE_NAME
+                    | INTEROP_CHR_TPE_NAME
+            );
+            if is_interop_adt {
+                if item_name == INTEROP_CLASS_TPE_NAME {
                     assert!(
                         subst.len() == 2,
                         "Managed object reference must have exactly 2 generic arguments!"
@@ -238,7 +272,7 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                         false,
                         [].into(),
                     )))
-                } else if name.contains(INTEROP_STRUCT_TPE_NAME) {
+                } else if item_name == INTEROP_STRUCT_TPE_NAME {
                     // A managed value type carries 3 generics: <ASSEMBLY, CLASS_PATH, SIZE>.
                     // (The size hint is only used Rust-side for layout; the CLR knows the real size.)
                     assert!(
@@ -257,7 +291,7 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                         true,
                         [].into(),
                     )))
-                } else if name.contains(INTEROP_ARR_TPE_NAME) {
+                } else if item_name == INTEROP_ARR_TPE_NAME {
                     assert!(
                         subst.len() == 2,
                         "Managed array reference must have exactly 2 generic arguments: type and dimension count!"
@@ -269,7 +303,7 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                         elem: ctx.alloc_type(element),
                         dims: std::num::NonZeroU8::new(dimensions.try_into().unwrap()).unwrap(),
                     }
-                } else if name.contains(INTEROP_CHR_TPE_NAME) {
+                } else if item_name == INTEROP_CHR_TPE_NAME {
                     Type::PlatformChar
                 } else {
                     todo!("Interop type {name:?} is not yet supported!")

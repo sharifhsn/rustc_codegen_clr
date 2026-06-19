@@ -29,8 +29,11 @@ pub fn mstring_to_utf8ptr(mstring: Interned<CILNode>, asm: &mut Assembly) -> Int
     );
     let mref = asm.alloc_methodref(mref);
     let call = asm.call(mref, &[mstring], IsPure::NOT);
-    let u8_ptr = asm.nptr(Type::Int(Int::U8));
-    asm.cast_ptr(call, u8_ptr)
+    // `StringToCoTaskMemUTF8` returns an `IntPtr` to a NUL-terminated UTF8 byte
+    // buffer — semantically a `uint8*` (C `char*`). `cast_ptr(x, T)` yields `Ptr(T)`,
+    // so the pointee is `u8`, NOT `uint8*` (which would over-pointer the result to
+    // `uint8**` and mismatch the `uint8*` slots its callers store it into).
+    asm.cast_ptr(call, Type::Int(Int::U8))
 }
 
 pub fn get_environ(asm: &mut Assembly) -> Interned<MethodRef> {
@@ -104,7 +107,12 @@ pub fn get_environ(asm: &mut Assembly) -> Interned<MethodRef> {
     let mut first_check_roots = Vec::new();
     let zero_i32 = asm.alloc_node(0_i32);
     let zero_usize = asm.int_cast(zero_i32, Int::USize, ExtendKind::ZeroExtend);
-    let zero_ptr = asm.cast_ptr(zero_usize, uint8_ptr_ptr);
+    // `cast_ptr(x, T)` yields `Ptr(T)`, so to get a null `uint8**` (matching the
+    // `environ` static) the pointee must be `uint8*` (`uint8_ptr`), not the full
+    // `uint8**` (`uint8_ptr_ptr`). Passing the latter over-pointers to `uint8***`,
+    // which made the null check compare `Ptr(uint8*)` against `Ptr(uint8**)` and
+    // tripped the `CantCompareTypes` typecheck (the comparison is a plain null check).
+    let zero_ptr = asm.cast_ptr(zero_usize, uint8_ptr);
     first_check_roots.push(asm.alloc_root(CILRoot::Branch(Box::new((
         ret_bb,
         0,
@@ -149,7 +157,10 @@ pub fn get_environ(asm: &mut Assembly) -> Interned<MethodRef> {
     let aligned_alloc = MethodRef::aligned_alloc(asm);
     let aligned_alloc = asm.alloc_methodref(aligned_alloc);
     let alloc_call = asm.call(aligned_alloc, &[arr_size, arr_align], IsPure::NOT);
-    let alloc_call = asm.cast_ptr(alloc_call, uint8_ptr_ptr);
+    // `cast_ptr(x, T)` yields `Ptr(T)`. `arr_ptr` is `uint8**`, so the pointee here is
+    // `uint8*` (`uint8_ptr`); passing the full `uint8**` would over-pointer to
+    // `uint8***` and fail the `StLoc(arr_ptr, …)` assignability check.
+    let alloc_call = asm.cast_ptr(alloc_call, uint8_ptr);
     init_roots.push(asm.alloc_root(CILRoot::StLoc(arr_ptr, alloc_call)));
     let zero_i32 = asm.alloc_node(0_i32);
     init_roots.push(asm.alloc_root(CILRoot::StLoc(idx, zero_i32)));
@@ -266,7 +277,11 @@ pub fn get_environ(asm: &mut Assembly) -> Interned<MethodRef> {
     let mut loop_end_roots = Vec::new();
     let zero_i32 = asm.alloc_node(0_i32);
     let zero_usize = asm.int_cast(zero_i32, Int::USize, ExtendKind::ZeroExtend);
-    let null_ptr = asm.cast_ptr(zero_usize, uint8_ptr);
+    // The array slots hold `uint8*` (the array itself is `uint8**`), and this writes
+    // the NULL terminator into a slot. `cast_ptr(x, T)` yields `Ptr(T)`, so the
+    // pointee for a `uint8*` null is `u8`, not `uint8_ptr` (which would over-pointer
+    // to `uint8**`, mismatching the `u8_ptr_ty` store type used in the StInd below).
+    let null_ptr = asm.cast_ptr(zero_usize, Type::Int(Int::U8));
     // addr = arr_ptr + zext_usize(envc * size_of(uint8_ptr_ptr))
     let ld_arr_ptr = asm.ld_loc(arr_ptr);
     let ld_envc = asm.ld_loc(envc);

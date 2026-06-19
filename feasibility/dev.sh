@@ -242,6 +242,18 @@ if [ -f "$PAL/thread_local/dotnet.rs" ]; then
   # `dotnet::key` module stays available for when real .NET threading lands.
 fi
 [ -f "$PAL/io/error/dotnet.rs" ]     && inject_arm io/error/mod.rs     'mod dotnet; pub use dotnet::*;'
+# time/mod.rs uses the `mod X; use X as imp;` cascade shape (it re-exports
+# `imp::{Instant, SystemTime, UNIX_EPOCH}` at the bottom), unlike the
+# `pub use dotnet::*` arms above. The dotnet arm backs Instant/SystemTime with
+# Stopwatch/DateTime via the rcl_dotnet_{instant_ticks,instant_freq,unix_ticks}
+# hooks (see cilly/src/ir/builtins/dotnet.rs).
+[ -f "$PAL/time/dotnet.rs" ]         && inject_arm time/mod.rs         'mod dotnet; use dotnet as imp;'
+# thread/mod.rs is a plain `pub use dotnet::*` cascade (like the `_`/unsupported
+# arm): the dotnet arm provides Thread{new,join} + sleep/yield_now/set_name/
+# current_os_id/available_parallelism/DEFAULT_MIN_STACK_SIZE, backed by
+# System.Threading.Thread / System.Environment via the rcl_dotnet_thread_* and
+# rcl_dotnet_available_parallelism hooks (see cilly/src/ir/builtins/dotnet.rs).
+[ -f "$PAL/thread/dotnet.rs" ]       && inject_arm thread/mod.rs       'mod dotnet; pub use dotnet::*;'
 # Teach std's build.rs that os=dotnet is a *supported* platform, otherwise std
 # marks itself `restricted_std` (E0658 on use + "unwinding panics are not
 # supported without std"). The allow-list is the long `if target_os == "linux"

@@ -326,6 +326,32 @@ fn alloc_ptr_unaligned<'tcx>(
         (add_allocation(alloc_id.0.into(), ctx, tpe), None)
     }
 }
+/// Load a scalar integer constant of `byte_size` bytes (its value already in `bits`), then
+/// transmute it to `dst`. `transmute_on_stack` is a size-exact reinterpret, so the SOURCE integer
+/// must match `dst`'s width — using a fixed `U128` for, say, a 1-byte fieldless enum writes 16
+/// bytes into a 1-byte slot and produces invalid IL ("Bad IL format" at JIT time). This picks the
+/// CIL integer type matching the destination's actual size.
+fn transmute_scalar_to(
+    bits: u128,
+    byte_size: u64,
+    dst: Type,
+    ctx: &mut MethodCompileCtx<'_, '_>,
+) -> Interned<CILNode> {
+    let (src_int, val) = match byte_size {
+        0 => {
+            // A ZST destination: nothing to reinterpret.
+            let dptr = ctx.nptr(dst);
+            return ctx.uninit_val(dptr);
+        }
+        1 => (Int::U8, Const::U8(bits as u8)),
+        2 => (Int::U16, Const::U16(bits as u16)),
+        3 | 4 => (Int::U32, Const::U32(bits as u32)),
+        5..=8 => (Int::U64, Const::U64(bits as u64)),
+        _ => (Int::U128, Const::U128(bits)),
+    };
+    let val = ctx.alloc_node(val);
+    ctx.transmute_on_stack(Type::Int(src_int), dst, val)
+}
 fn load_const_scalar<'tcx>(
     scalar: Scalar,
     scalar_type: Ty<'tcx>,
@@ -380,13 +406,11 @@ fn load_const_scalar<'tcx>(
                 let scalar_ptr = ctx.nptr(scalar_type);
                 ctx.uninit_val(scalar_ptr)
             } else {
-                let val = ctx.alloc_node(scalar_u128);
-                ctx.transmute_on_stack(Type::Int(Int::U128), scalar_type, val)
+                transmute_scalar_to(scalar_u128, scalar.size().bytes(), scalar_type, ctx)
             }
         }
         TyKind::Adt(_, _) | TyKind::Closure(_, _) | TyKind::Array(_, _) => {
-            let val = ctx.alloc_node(scalar_u128);
-            ctx.transmute_on_stack(Type::Int(Int::U128), scalar_type, val)
+            transmute_scalar_to(scalar_u128, scalar.size().bytes(), scalar_type, ctx)
         }
         TyKind::Char => ctx.alloc_node(u32::try_from(scalar_u128).unwrap()),
         _ => todo!("Can't load scalar constants of type {scalar_ty:?}!"),
