@@ -87,11 +87,49 @@ pub fn unaligned_read(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     patcher.insert(name, Box::new(generator));
 }
 
+/// Loads argument `arg` reinterpreted as `tpe` (which must be the same size as
+/// the argument), by reading the argument's address rather than the argument
+/// directly.
+///
+/// Recent rustc passes allocator-shim arguments wrapped in transparent value
+/// types instead of raw scalars: alignments as `core::ptr::Alignment` (a
+/// `#[repr(usize)]` niche-enum) and pointers as `NonNull<u8>`. Loading such an
+/// argument as a plain `usize`/pointer produces invalid CIL — the JIT rejects
+/// the whole method with an `InvalidProgramException`. Reinterpreting via the
+/// argument's address recovers the underlying scalar and also works for the
+/// plain (unwrapped) ABI, since both representations are pointer-sized with the
+/// scalar as their value.
+fn reinterpret_arg(asm: &mut Assembly, arg: u32, tpe: Interned<Type>) -> Interned<CILNode> {
+    let addr = asm.alloc_node(CILNode::LdArgA(arg));
+    let addr = asm.alloc_node(CILNode::RefToPtr(addr));
+    let addr = asm.alloc_node(CILNode::PtrCast(
+        addr,
+        Box::new(super::cilnode::PtrCastRes::Ptr(tpe)),
+    ));
+    asm.alloc_node(CILNode::LdInd {
+        addr,
+        tpe,
+        volatile: false,
+    })
+}
+/// Loads an allocator alignment argument (arg index `arg`) as a `usize`. See
+/// [`reinterpret_arg`].
+fn load_align_usize(asm: &mut Assembly, arg: u32) -> Interned<CILNode> {
+    let usize_ty = asm.alloc_type(Type::Int(Int::USize));
+    reinterpret_arg(asm, arg, usize_ty)
+}
+/// Loads an allocator pointer argument (arg index `arg`) as a `void*`. See
+/// [`reinterpret_arg`]; recent rustc passes the pointer wrapped in `NonNull<u8>`.
+fn load_ptr_arg(asm: &mut Assembly, arg: u32) -> Interned<CILNode> {
+    let void_ptr = asm.nptr(Type::Void);
+    let void_ptr = asm.alloc_type(void_ptr);
+    reinterpret_arg(asm, arg, void_ptr)
+}
 fn insert_rust_alloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("__rust_alloc");
     let generator = move |_, asm: &mut Assembly| {
         let size = asm.alloc_node(CILNode::LdArg(0));
-        let align = asm.alloc_node(CILNode::LdArg(1));
+        let align = load_align_usize(asm, 1);
         let void_ptr = asm.nptr(Type::Void);
         let sig = asm.sig([Type::Int(Int::USize), Type::Int(Int::USize)], void_ptr);
         let aligned_alloc = asm.alloc_string("AlignedAlloc");
@@ -133,7 +171,7 @@ fn insert_rust_alloc_zeroed(asm: &mut Assembly, patcher: &mut MissingMethodPatch
     let name = asm.alloc_string("__rust_alloc_zeroed");
     let generator = move |_, asm: &mut Assembly| {
         let size = asm.alloc_node(CILNode::LdArg(0));
-        let align = asm.alloc_node(CILNode::LdArg(1));
+        let align = load_align_usize(asm, 1);
         let void_ptr = asm.nptr(Type::Void);
         let void_idx = asm.alloc_type(Type::Void);
         let sig = asm.sig([Type::Int(Int::USize), Type::Int(Int::USize)], void_ptr);
@@ -256,19 +294,8 @@ fn insert_rust_realloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, u
     let name = asm.alloc_string("__rust_realloc");
     if use_libc {
         let generator = move |_, asm: &mut Assembly| {
-            let ptr = asm.alloc_node(CILNode::LdArg(0));
-            let void_idx = asm.alloc_type(Type::Void);
-            let ptr = asm.alloc_node(CILNode::PtrCast(
-                ptr,
-                Box::new(super::cilnode::PtrCastRes::Ptr(void_idx)),
-            ));
-            let align = asm.alloc_node(CILNode::LdArg(2));
-
-            let align = asm.alloc_node(CILNode::IntCast {
-                input: align,
-                target: Int::USize,
-                extend: super::cilnode::ExtendKind::ZeroExtend,
-            });
+            let ptr = load_ptr_arg(asm, 0);
+            let align = load_align_usize(asm, 2);
             let new_size = asm.alloc_node(CILNode::LdArg(3));
             let new_size = asm.alloc_node(CILNode::IntCast {
                 input: new_size,
@@ -322,14 +349,9 @@ fn insert_rust_realloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, u
         patcher.insert(name, Box::new(generator));
     } else {
         let generator = move |_, asm: &mut Assembly| {
-            let ptr = asm.alloc_node(CILNode::LdArg(0));
-            let align = asm.alloc_node(CILNode::LdArg(2));
+            let ptr = load_ptr_arg(asm, 0);
+            let align = load_align_usize(asm, 2);
             let new_size = asm.alloc_node(CILNode::LdArg(3));
-            let align = asm.alloc_node(CILNode::IntCast {
-                input: align,
-                target: Int::USize,
-                extend: super::cilnode::ExtendKind::ZeroExtend,
-            });
             let new_size = asm.alloc_node(CILNode::IntCast {
                 input: new_size,
                 target: Int::USize,
@@ -363,12 +385,7 @@ fn insert_rust_dealloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, u
     let name = asm.alloc_string("__rust_dealloc");
     if use_libc {
         let generator = move |_, asm: &mut Assembly| {
-            let ldarg_0 = asm.alloc_node(CILNode::LdArg(0));
-            let void_idx = asm.alloc_type(Type::Void);
-            let ldarg_0 = asm.alloc_node(CILNode::PtrCast(
-                ldarg_0,
-                Box::new(PtrCastRes::Ptr(void_idx)),
-            ));
+            let ldarg_0 = load_ptr_arg(asm, 0);
             let void_ptr = asm.nptr(Type::Void);
             let sig = asm.sig([void_ptr], Type::Void);
             let mm_free = asm.alloc_string("_mm_free");
@@ -390,7 +407,7 @@ fn insert_rust_dealloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, u
         patcher.insert(name, Box::new(generator));
     } else {
         let generator = move |_, asm: &mut Assembly| {
-            let ldarg_0 = asm.alloc_node(CILNode::LdArg(0));
+            let ldarg_0 = load_ptr_arg(asm, 0);
             let void_ptr = asm.nptr(Type::Void);
             let sig = asm.sig([void_ptr], Type::Void);
             let aligned_realloc = asm.alloc_string("AlignedFree");
