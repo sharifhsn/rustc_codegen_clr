@@ -1,7 +1,7 @@
 use crate::assembly::MethodCompileCtx;
 use cilly::{
     cilnode::{IsPure, MethodKind}, BinOp,
-    BranchCond, CILRoot, Const, FieldDesc, FnSig, Int, Interned, MethodRef, Type,
+    BranchCond, CILNode, CILRoot, ClassRef, Const, FieldDesc, FnSig, Int, Interned, MethodRef, Type,
 };
 
 type Root = Interned<cilly::ir::CILRoot>;
@@ -287,10 +287,27 @@ pub fn handle_terminator<'tcx>(
             vec![root]
         }
         TerminatorKind::UnwindTerminate(_) => {
+            // The `abort()` landing pad — reached when unwinding would cross a `nounwind` boundary (a
+            // double panic, or a panic escaping a `Drop` run during unwinding). Rust requires a hard
+            // process termination here; the previous `ReThrow` incorrectly *continued* unwinding. Map
+            // it to `System.Environment.FailFast`, the managed no-catch / no-cleanup abort.
             let loc = terminator.source_info.span;
-            let dbg = rustc_middle::ty::print::with_no_trimmed_paths! {ctx.debug_msg(&format!("UnwindTerminate reached at {loc:?}!"))};
+            let msg = format!("Rust unwinding reached a nounwind boundary and was aborted (at {loc:?}).");
+            let msg = ctx.alloc_string(msg);
+            let msg = ctx.alloc_node(CILNode::Const(Box::new(Const::PlatformString(msg))));
+            let fail_fast = MethodRef::new(
+                ClassRef::enviroment(ctx),
+                ctx.alloc_string("FailFast"),
+                ctx.sig([Type::PlatformString], Type::Void),
+                MethodKind::Static,
+                vec![].into(),
+            );
+            let fail_fast = ctx.alloc_methodref(fail_fast);
+            let abort = ctx.alloc_root(CILRoot::call(fail_fast, vec![msg]));
+            // FailFast never returns; the trailing ReThrow only keeps the cleanup block well-formed
+            // (an exception is in flight on this path, so it is valid IL but never executed).
             let rethrow = ctx.alloc_root(CILRoot::ReThrow);
-            vec![dbg, rethrow]
+            vec![abort, rethrow]
         }
         TerminatorKind::FalseEdge {
             real_target,

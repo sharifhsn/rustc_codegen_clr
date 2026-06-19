@@ -1,0 +1,9 @@
+[package]
+name = "catch_panic"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+[workspace]
+[profile.release.build-override]
+codegen-units = 1

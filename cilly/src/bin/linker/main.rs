@@ -320,12 +320,12 @@ fn main() {
         externs.insert("pthread_create_wrapper", LIBC.clone());
         call_alias(&mut overrides, &mut final_assembly, "pthread_create", mref);
     }
-    if !*PANIC_MANAGED_BT {
-        if *C_MODE {
-           //cilly::ir::builtins::unwind::c_raise_exception(&mut final_assembly, &mut overrides);
-        } else {
-            //cilly::ir::builtins::unwind::raise_exception(&mut final_assembly, &mut overrides);
-        }
+    // Throw side of the panic ↔ managed-exception bridge: override `_Unwind_RaiseException` to throw a
+    // `RustException` (the catch side is `insert_exception`/`insert_catch_unwind` above). Only for the
+    // .NET path and only when unwinding is enabled — `NO_UNWIND` installs the ctor-less exception stub,
+    // and C mode has its own setjmp/longjmp bridge.
+    if !*PANIC_MANAGED_BT && !*C_MODE && !*NO_UNWIND {
+        cilly::builtins::unwind::raise_exception(&mut final_assembly, &mut overrides);
     }
     if !*C_MODE {
         overrides.insert(

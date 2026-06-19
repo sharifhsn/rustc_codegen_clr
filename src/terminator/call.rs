@@ -16,7 +16,7 @@ use rustc_codegen_clr_call::CallInfo;
 use rustc_codegen_clr_ctx::function_name;
 use rustc_codegen_clr_place::place_set;
 use rustc_codegen_clr_type::{utilis::garg_to_string, GetTypeExt};
-use rustc_codgen_clr_operand::{handle_operand, operand_address};
+use rustc_codgen_clr_operand::{constant::load_const_value, handle_operand, operand_address};
 use rustc_middle::ty::InstanceKind;
 use rustc_middle::{
     mir::{Operand, Place},
@@ -588,14 +588,16 @@ pub fn call_inner<'tcx>(
         );
     }
     if args.len() < signature.inputs().len() {
-        let tpe: cilly::Type = signature.inputs()[signature.inputs().len() - 1];
-        // let arg_len = args.len();
-        //assert_eq!(args.len() + 1,signature.inputs().len(),"ERROR: mismatched argument count. \nsignature inputs:{:?} \narguments:{args:?}\narg_len:{arg_len}\n",signature.inputs());
-        // assert_eq!(signature.inputs()[signature.inputs().len() - 1],tpe);
-        //FIXME:This assembles a panic location from uninitialized memory. This WILL lead to bugs once unwinding is added. The fields `file`,`col`, and `line` should be set there.
-        let u = ctx.uninit_val(tpe);
-        call_args.push(u);
-        //panic!("Call with PanicLocation!");
+        // The callee is `#[track_caller]`: rustc appends an implicit `&core::panic::Location` param
+        // that the *call site* must supply (this is why `FnSig` ≠ `FnAbi` for track_caller fns).
+        // Materialize the real caller location (file/line/col) for this call site — exactly as the
+        // `caller_location` intrinsic does. Previously this pushed an uninitialized value, which
+        // becomes a garbage panic location the moment a track_caller callee actually panics (now that
+        // unwinding is wired up).
+        let caller_loc = ctx.tcx().span_as_caller_location(span);
+        let caller_loc_ty = ctx.tcx().caller_location_ty();
+        let location = load_const_value(caller_loc, caller_loc_ty, ctx);
+        call_args.push(location);
     }
     //assert_eq!(args.len(),signature.inputs().len(),"CALL SIGNATURE ARG COUNT MISMATCH!");
     let is_void = matches!(signature.output(), cilly::Type::Void);
