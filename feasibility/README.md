@@ -37,7 +37,31 @@ PLATFORM=linux/amd64 feasibility/run.sh test
 | `Dockerfile` | Env only: pinned nightly + `rustc-dev`/`rust-src`, .NET 8 SDK, `ilasm` (via mono), clang/gcc. Repo is mounted at runtime, not copied. |
 | `run.sh` | Host driver: builds the image, runs a harness step with the repo mounted. |
 | `harness.sh` | In-container steps: `build` / `smoke` / `test` / `demo`. |
+| `dev.sh` | **Deterministic dev loop** (see below): force-rebuild, build+run a cargo_tests crate, disassemble IL, gate-with-diff. Works around Docker mtime-skew + cwd-drift. |
 | `demo/` | A small Rust program (`add.rs`) + script that compiles it with the backend and runs it on CoreCLR. |
+
+## Deterministic dev tooling (`dev.sh`)
+
+`run.sh`/`harness.sh` lean on cargo's incremental cache, which is **unreliable under Docker's
+host-mount mtime skew** on macOS — edits to `cilly` silently don't reach the linker, so you debug a
+stale binary. `dev.sh` is the iteration loop that avoids that (and never rebuilds the image). It
+resolves the repo root from its own path, so it works from any cwd.
+
+```bash
+feasibility/dev.sh backend            # force clean-rebuild of cilly + linker + backend
+feasibility/dev.sh run <crate>        # build (forced relink) + run cargo_tests/<crate>; verifies the
+                                      #   binary is fresh and fails loudly if not. --clean = full clean.
+feasibility/dev.sh buildstd           # shorthand for `run build_std` (real core+alloc+std)
+feasibility/dev.sh il <crate> <sym>   # disassemble method(s) whose mangled name contains <sym>
+                                      #   e.g. `il build_std rust_alloc`  (uses ikdasm)
+feasibility/dev.sh gate               # force-rebuild + `cargo test ::stable` (CI skips), then DIFF
+                                      #   against the known-22 baseline and report only NEW failures
+feasibility/dev.sh sh '<bash>'        # arbitrary command in the container (correct mount, color off)
+```
+
+Cargo-output crates (`build_std`) link to an **ELF apphost** run directly (`./build_std`), with the
+real `.dll` assembly + `.runtimeconfig.json` beside it; `il` disassembles that `.dll` with `ikdasm`
+(`monodis` is not installed).
 
 `run.sh` mounts the repo at `/work` and masks `/work/target` with a named Docker volume
 (`rcc-target`), so the container's Linux build artifacts never clobber the host's `target/`
