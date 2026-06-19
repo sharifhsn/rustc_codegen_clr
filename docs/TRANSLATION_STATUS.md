@@ -174,8 +174,16 @@ calls its `#[no_mangle]` functions as ordinary managed methods. Proven end-to-en
 comptime interpreter (`src/comptime.rs`) is **commented out and aborts the build** (an unconditional
 `todo!`); the Cecil-based `AssemblyUtilis` backend is **unwired**. This (WF-7 P3) is the harder,
 ceiling-adjacent half — letting a Rust struct *become* a C# class with virtual methods/inheritance.
-Open follow-ups for the call direction: direct *typed* C# calls (vs reflection) need filename =
-assembly-identity packaging (WF-8); marshalling for `&str`/`String`/`Vec`/struct (WF-7 P2).
+**\.NET → Rust (string marshalling): WORKING (WF-7 P2).** Strings cross as UTF-8 `(ptr, len)` pairs
+(thin pointers → directly-C#-usable `byte*`/`nuint`). `rust_strlen(*const u8, usize)` proves inbound
+(C# `string` → Rust `&str`); `greet(*const u8, usize, *mut u8, usize)` proves outbound — it builds an
+owned Rust `String` and copies its UTF-8 into a caller-provided out-buffer (nothing crosses ownership →
+no cross-boundary free). Proven in `cargo_tests/rust_export` + `_cs` (no backend changes). Two deferred
+idiomaticity follow-ups: (a) returning a managed `System.String` directly hits a codegen mismatch — the
+interop-call result is typed `void` when returned from an exported fn (`LocalAssigementWrong got "v"`),
+so the out-buffer convention is used instead; (b) direct *typed* C# calls (vs reflection) hit `CS0012`
+because the assembly's BCL references carry version `0.0.0.0` — emitting proper reference versions is
+WF-8 packaging. Still open: `Vec`/slice/struct marshalling (the `(ptr,len)` convention generalizes).
 
 ---
 
@@ -400,7 +408,7 @@ The benchmark decomposes into 6 layers → workflows:
 | 2 `std` runs on .NET | WF-2, WF-4 | ✅ **DONE** (PAL vertical; surrogate retiring) |
 | 3 Rust→.NET calls | WF-3 | ✅ **DONE** (full BCL, 4256 methods) |
 | 4 errors/panics cross cleanly | WF-6 | ✅ **DONE** (throw-bridge; catch_unwind works) |
-| 5 .NET→Rust export (call Rust from C#) | **WF-7** | 🟡 **P1 DONE** (C# calls a Rust *library*); P2 marshalling + P3 type-export remain |
+| 5 .NET→Rust export (call Rust from C#) | **WF-7** | 🟡 **P1+P2 DONE** (C# calls a Rust *library*; string marshalling works); P3 type-export remains |
 | 6 ergonomic packaged library | **WF-8** | ⬜ |
 
 **Layers 1–4 done + WF-7 P1** — the entire Rust→.NET half, error-crossing, AND the core of the reverse
@@ -423,12 +431,14 @@ direction (C# imports a Rust library and calls its functions, §6). What remains
 - **WF-6** unwinding throw-bridge — **DONE** (`22b0a00`): `_Unwind_RaiseException` throws a
   `RustException`, `catch_unwind` catches Rust panics end-to-end on .NET (`cargo_tests/catch_panic`);
   `UnwindTerminate`→`FailFast`; real `#[track_caller]` location. Managed-frames-only per §7.
-- **WF-7** `.NET→Rust` direction — *the linchpin.* **P1 DONE** (`cargo_tests/rust_export[_cs]`): a Rust
-  **library** crate now compiles to a referenceable .NET class-library assembly, and C# calls its
-  `#[no_mangle]` functions as managed methods (§6). The reframe — Rust→managed-CIL means this is *not*
-  native FFI — collapsed most of the expected difficulty. **Remaining:** P2 marshalling
-  (`&str`/`String`/`Vec`/struct ↔ idiomatic C#); P3 the harder, ceiling-adjacent half — `dotnet_typedef!`
-  + the `src/comptime.rs` revival to expose Rust *types* as managed classes (virtual methods/inheritance).
+- **WF-7** `.NET→Rust` direction — *the linchpin.* **P1+P2 DONE** (`cargo_tests/rust_export[_cs]`): a
+  Rust **library** crate compiles to a referenceable .NET class-library assembly, and C# calls its
+  `#[no_mangle]` functions as managed methods (§6), incl. **string marshalling** both ways (UTF-8
+  `(ptr,len)`). The reframe — Rust→managed-CIL means this is *not* native FFI — collapsed most of the
+  expected difficulty. **Remaining:** P2-tail (`Vec`/slice/struct marshalling — the convention
+  generalizes); **P3** the harder, ceiling-adjacent half — `dotnet_typedef!` + the `src/comptime.rs`
+  revival to expose Rust *types* as managed classes (virtual methods/inheritance). Idiomaticity
+  follow-ups (managed `System.String` return; direct typed C# refs) are codegen/packaging items (§6).
 - **WF-8** Library packaging & ergonomic surface — emit a .NET **class library** (not an
   exe-entrypoint) with **de-mangled** public types/methods/namespaces + **bidirectional marshalling for
   real API signatures** (`Result`→exception/`out`, `Option`→nullable, `Vec`/slice↔array/`Span`,
