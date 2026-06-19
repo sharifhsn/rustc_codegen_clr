@@ -21,16 +21,30 @@ use super::{
 pub struct ILExporter {
     flavour: IlasmFlavour,
     is_lib: bool,
+    /// The .NET assembly name to emit in the `.assembly` directive. `None` keeps the legacy `_`
+    /// placeholder (used for executables, where the assembly is loaded by file path via the native
+    /// launcher and the name is irrelevant). A library passes its crate name here so C# can reference
+    /// the produced `.dll` by a real assembly identity.
+    asm_name: Option<String>,
 }
 impl ILExporter {
     #[must_use]
-    pub fn new(flavour: IlasmFlavour, is_lib: bool) -> Self {
-        Self { flavour, is_lib }
+    pub fn new(flavour: IlasmFlavour, is_lib: bool, asm_name: Option<String>) -> Self {
+        Self {
+            flavour,
+            is_lib,
+            asm_name,
+        }
     }
 
     fn export_to_write(&self, asm: &super::Assembly, out: &mut impl Write) -> std::io::Result<()> {
         let asm_mut = &mut asm.clone();
-        writeln!(out, ".assembly _{{}}")?;
+        match &self.asm_name {
+            // A named assembly so C# can reference it by identity (quoted to allow any crate name).
+            Some(name) => writeln!(out, ".assembly '{name}'{{}}")?,
+            // Legacy placeholder for executables (loaded by path, name irrelevant).
+            None => writeln!(out, ".assembly _{{}}")?,
+        }
         for (const_data, idx) in asm.const_data.1.iter() {
             let encoded = encode(idx.inner() as u64);
             let data: String = const_data.iter().map(|u| format!("{u:x} ")).collect();
@@ -1284,7 +1298,14 @@ impl Exporter for ILExporter {
         // Needed to ensure the IL file is valid!
         il_out.flush().unwrap();
         drop(il_out);
-        let exe_out = std::path::absolute(target.with_extension("exe")).unwrap();
+        // A library is the final artifact itself — emit the .NET assembly directly to the requested
+        // output path (no native launcher wraps it, unlike an executable). An executable still emits
+        // to `<stem>.exe`, which the linker's launcher then loads.
+        let exe_out = if self.is_lib {
+            std::path::absolute(target).unwrap()
+        } else {
+            std::path::absolute(target.with_extension("exe")).unwrap()
+        };
         if let Err(err) = std::fs::remove_file(&exe_out) {
             match err.kind() {
                 std::io::ErrorKind::NotFound => (),

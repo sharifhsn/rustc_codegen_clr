@@ -609,6 +609,16 @@ fn get_fn_from_static_name(name: &str, ctx: &mut MethodCompileCtx<'_, '_>) -> In
             MethodKind::Static,
             vec![].into(),
         ),
+        // `gettid()` (glibc >= 2.30, `() -> pid_t`) is referenced as a weak static by
+        // `std::sys::thread::unix::current_os_id`. Resolve it like the other libc weak statics —
+        // a main-module methodref the linker PInvokes to host libc (it is in `LIBC_FNS`).
+        "gettid" => MethodRef::new(
+            *ctx.main_module(),
+            ctx.alloc_string("gettid"),
+            ctx.sig([], Type::Int(Int::I32)),
+            MethodKind::Static,
+            vec![].into(),
+        ),
         _ => {
             todo!("Unsuported function refered to using a weak static. Function name is {name:?}.")
         }

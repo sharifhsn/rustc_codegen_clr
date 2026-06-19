@@ -2288,7 +2288,7 @@ fn export() {
         vec![None],
     ));
     #[cfg(not(miri))]
-    asm.export("/tmp/export.exe", ILExporter::new(*ILASM_FLAVOUR, false));
+    asm.export("/tmp/export.exe", ILExporter::new(*ILASM_FLAVOUR, false, None));
 }
 #[test]
 fn export2() {
@@ -2349,7 +2349,7 @@ fn export2() {
     asm.eliminate_dead_code();
     asm.realloc_roots();
     #[cfg(not(miri))]
-    asm.export("/tmp/export2.exe", ILExporter::new(*ILASM_FLAVOUR, false));
+    asm.export("/tmp/export2.exe", ILExporter::new(*ILASM_FLAVOUR, false, None));
 }
 #[test]
 fn link() {
@@ -2415,6 +2415,6 @@ fn link() {
     asm.eliminate_dead_code();
     asm.realloc_roots();
     #[cfg(not(miri))]
-    asm.export("/tmp/link_test.exe", ILExporter::new(*ILASM_FLAVOUR, false));
+    asm.export("/tmp/link_test.exe", ILExporter::new(*ILASM_FLAVOUR, false, None));
 }
 config! {LINKER_RECOVER,bool,false}

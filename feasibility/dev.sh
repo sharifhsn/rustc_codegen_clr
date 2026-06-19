@@ -59,9 +59,18 @@ backend)
   _in <<'C'
 set -e
 cd /work
-echo "==> clean-rebuild cilly + linker (removing artifacts to defeat host-mount mtime skew)"
-rm -f  target/release/linker target/release/deps/linker-* target/release/deps/libcilly-* 2>/dev/null || true
-rm -rf target/release/.fingerprint/cilly-* 2>/dev/null || true
+echo "==> clean-rebuild backend (defeat host-mount mtime skew across ALL backend crates, not just cilly)"
+# Future-date every backend source so cargo never skips a recompile on a host edit that looks "old".
+find cilly/src rustc_codgen_clr_operand/src rustc_codegen_clr_type/src rustc_codegen_clr_call/src \
+     rustc_codegen_clr_place/src rustc_codegen_clr_ctx/src src -name '*.rs' \
+     -exec touch -d 2099-01-01 {} + 2>/dev/null || true
+# Drop the cilly + operand + LINKER artifacts AND the ROOT dylib + its fingerprint/deps copy. The root
+# nuke is critical: otherwise cargo "freshly" re-hardlinks a STALE deps dylib and you test old code.
+rm -f  target/release/linker target/release/deps/linker-* target/release/deps/libcilly-* \
+       target/release/deps/*operand* target/release/librustc_codegen_clr.so \
+       target/release/deps/librustc_codegen_clr-* 2>/dev/null || true
+rm -rf target/release/.fingerprint/cilly-* target/release/.fingerprint/rustc_codgen_clr_operand-* \
+       target/release/.fingerprint/rustc_codegen_clr-* target/release/.fingerprint/linker-* 2>/dev/null || true
 ( cd cilly && cargo build --release )
 echo "==> backend dylib"
 cargo build --release -p rustc_codegen_clr
@@ -119,9 +128,15 @@ gate)
   _in <<'C'
 set -e
 cd /work
-echo "==> force-rebuild linker + backend so the gate tests current code"
-rm -f  target/release/linker target/release/deps/linker-* target/release/deps/libcilly-* 2>/dev/null || true
-rm -rf target/release/.fingerprint/cilly-* 2>/dev/null || true
+echo "==> force-rebuild linker + backend so the gate tests current code (ALL backend crates)"
+find cilly/src rustc_codgen_clr_operand/src rustc_codegen_clr_type/src rustc_codegen_clr_call/src \
+     rustc_codegen_clr_place/src rustc_codegen_clr_ctx/src src -name '*.rs' \
+     -exec touch -d 2099-01-01 {} + 2>/dev/null || true
+rm -f  target/release/linker target/release/deps/linker-* target/release/deps/libcilly-* \
+       target/release/deps/*operand* target/release/librustc_codegen_clr.so \
+       target/release/deps/librustc_codegen_clr-* 2>/dev/null || true
+rm -rf target/release/.fingerprint/cilly-* target/release/.fingerprint/rustc_codgen_clr_operand-* \
+       target/release/.fingerprint/rustc_codegen_clr-* target/release/.fingerprint/linker-* 2>/dev/null || true
 ( cd cilly && cargo build --release ) >/dev/null
 cargo build --release -p rustc_codegen_clr >/dev/null
 set +e

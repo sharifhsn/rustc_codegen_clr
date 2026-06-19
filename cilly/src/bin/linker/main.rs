@@ -539,11 +539,23 @@ fn main() {
             );
         }
     } else {
+        // For a library, derive a real .NET assembly name from the output file (strip dir, the cargo
+        // `lib` prefix, and the extension): `librust_export.so` -> `rust_export`. Executables keep the
+        // legacy `_` placeholder (loaded by path via the launcher).
+        let asm_name = if is_lib {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.strip_prefix("lib").unwrap_or(s).to_string())
+        } else {
+            None
+        };
         final_assembly.export(
             &path,
-            cilly::il_exporter::ILExporter::new(*ILASM_FLAVOUR, is_lib),
+            cilly::il_exporter::ILExporter::new(*ILASM_FLAVOUR, is_lib, asm_name),
         );
-        if cargo_support {
+        // A library has no entrypoint to launch, so it needs no native launcher — the .NET assembly
+        // emitted at `path` (above) IS the artifact. Only executables get the launcher.
+        if cargo_support && !is_lib {
             let bootstrap = bootstrap_source(
                 &path.with_extension("exe"),
                 path.to_str().unwrap(),

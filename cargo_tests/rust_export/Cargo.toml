@@ -1,0 +1,13 @@
+[package]
+name = "rust_export"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# A .NET class library: the backend emits this as a referenceable .NET assembly (no entrypoint).
+crate-type = ["cdylib"]
+
+[dependencies]
+[workspace]
+[profile.release.build-override]
+codegen-units = 1

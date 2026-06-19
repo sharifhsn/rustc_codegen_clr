@@ -152,10 +152,30 @@ are dropped pending the WF-9 generic bridge. Verified: `cargo_tests/interop_meth
 real BCL methods from Rust on .NET matching native. (Backend handles N args; the old 0–3 wrapper cap
 is gone for generated methods.)
 
-**\.NET → Rust (calling Rust, exposing Rust types): ~5%, essentially dead.** `dotnet_typedef!` → a
-comptime interpreter (`src/comptime.rs`) that is **commented out and aborts the build**; the
-Cecil-based `AssemblyUtilis` backend is **unwired**; no reverse-pinvoke export of Rust functions
-exists. Only the program `entrypoint` is exposed to managed callers.
+**\.NET → Rust (calling Rust functions): WORKING (WF-7 P1).** The key reframe: because Rust compiles
+to *managed* CIL, calling Rust from C# is **not** native FFI — a Rust fn is already a `public static`
+method on the `MainModule` class. WF-7 made a Rust **library** crate (`crate-type=["cdylib"]`) emit a
+real **.NET class-library assembly** (named after the crate, no entrypoint), so C# references it and
+calls its `#[no_mangle]` functions as ordinary managed methods. Proven end-to-end:
+`cargo_tests/rust_export` (a Rust lib) + `cargo_tests/rust_export_cs` (a C# program) — C# calls
+`rust_add`/`rust_mul`/`rust_fib`/`rust_add_f64` on .NET, all correct. The enabling backend changes:
+- `#[no_mangle]` → `Access::Extern` (`src/assembly.rs`), making exports **dead-code-elimination roots**
+  — essential, since a library has no entrypoint to root the call graph (without it the whole API is
+  eliminated).
+- Library output (`cilly/src/ir/il_exporter/mod.rs` + `bin/linker/main.rs`): for `is_lib`, the .NET
+  assembly is written to the requested `-o` path (was hard-coded `<stem>.exe`) and **no native launcher**
+  is built (a library isn't launched). Previously a `dylib`/`cdylib` produced a native ELF, not a .NET
+  assembly.
+- Assembly naming (`il_exporter` `.assembly` directive): named after the crate (was the placeholder `_`)
+  so C# can reference it by identity. (A library having no `main`/`lang_start` also sidesteps the std
+  runtime weak-static tail — see §10.)
+
+**\.NET → Rust (exposing Rust *types* as managed classes): still ~5%, dead.** `dotnet_typedef!` → the
+comptime interpreter (`src/comptime.rs`) is **commented out and aborts the build** (an unconditional
+`todo!`); the Cecil-based `AssemblyUtilis` backend is **unwired**. This (WF-7 P3) is the harder,
+ceiling-adjacent half — letting a Rust struct *become* a C# class with virtual methods/inheritance.
+Open follow-ups for the call direction: direct *typed* C# calls (vs reflection) need filename =
+assembly-identity packaging (WF-8); marshalling for `&str`/`String`/`Vec`/struct (WF-7 P2).
 
 ---
 
@@ -323,6 +343,19 @@ The sibling `cast_ptr_to` (takes the full pointer type) is the correct helper. S
 - ✅ **`callvirt` for ref-type instance receivers** (`call_managed`): abstract slots like
   `GetParameters` need `callvirt`, not `call instance`; value-type receivers still use `call`.
 
+**Fixed (WF-7 P1 — Rust library → .NET assembly).**
+- ✅ **Library crate-type emits a .NET assembly** (was native ELF). For `is_lib`, `ILExporter::export`
+  writes the assembly to the requested `-o` path (not `<stem>.exe`) and the linker builds **no native
+  launcher** (`cilly/src/ir/il_exporter/mod.rs`, `bin/linker/main.rs`). Assembly named after the crate
+  (was `_`). `#[no_mangle]` → `Access::Extern` (`src/assembly.rs`) so exports are DCE **roots** (a
+  library has no entrypoint root). See §6.
+- ✅ **`gettid` weak static** (`rustc_codgen_clr_operand/src/constant.rs::get_fn_from_static_name`): was
+  an unsupported `todo!`; added an arm + `LIBC_FNS` entry (PInvoke to host libc), like `pidfd_getpid`.
+  NOTE: a tail of sibling `import_linkage` weak statics remains (`posix_spawn_file_actions_addchdir`,
+  …); for a **library** these are unreachable from the export roots, so the per-method panic-recovery
+  skips + DCE removes them (the lib still builds). For a **bin**, `lang_start` makes them reachable →
+  fatal. General fix (derive sig from `def_id` + libc resolution) is a future std-codegen hardening.
+
 **Still open (deferred to later workflows, with sharpened specs):**
 - ✅ **1-byte (and `i8`/`u16`/`i16`) atomic `cxchg` — FIXED (WF-5).** The old `Type::Int(Int::U8) =>
   comparand` shortcut (always-success, no write) is replaced by dedicated comparand-checked builtins
@@ -367,11 +400,13 @@ The benchmark decomposes into 6 layers → workflows:
 | 2 `std` runs on .NET | WF-2, WF-4 | ✅ **DONE** (PAL vertical; surrogate retiring) |
 | 3 Rust→.NET calls | WF-3 | ✅ **DONE** (full BCL, 4256 methods) |
 | 4 errors/panics cross cleanly | WF-6 | ✅ **DONE** (throw-bridge; catch_unwind works) |
-| 5 .NET→Rust export (call Rust from C#) | **WF-7 — the linchpin** (the ~5%-dead direction) | ⬜ design-heavy |
+| 5 .NET→Rust export (call Rust from C#) | **WF-7** | 🟡 **P1 DONE** (C# calls a Rust *library*); P2 marshalling + P3 type-export remain |
 | 6 ergonomic packaged library | **WF-8** | ⬜ |
 
-**Layers 1–4 are done** — the entire Rust→.NET half plus error-crossing. What remains for "C# imports a
-real Rust module" is the *other* direction (WF-7, the linchpin) + packaging (WF-8).
+**Layers 1–4 done + WF-7 P1** — the entire Rust→.NET half, error-crossing, AND the core of the reverse
+direction (C# imports a Rust library and calls its functions, §6). What remains: WF-7 P2 (marshalling
+`&str`/`String`/`Vec`/struct) + P3 (Rust *types* as managed classes, the comptime revival) + packaging
+(WF-8).
 
 **Roadmap** (run order; critical path to the benchmark is 1→2→3→7→8):
 - **WF-1** Correctness foundation — **DONE** (`50a6b39`).
@@ -388,9 +423,12 @@ real Rust module" is the *other* direction (WF-7, the linchpin) + packaging (WF-
 - **WF-6** unwinding throw-bridge — **DONE** (`22b0a00`): `_Unwind_RaiseException` throws a
   `RustException`, `catch_unwind` catches Rust panics end-to-end on .NET (`cargo_tests/catch_panic`);
   `UnwindTerminate`→`FailFast`; real `#[track_caller]` location. Managed-frames-only per §7.
-- **WF-7** `.NET→Rust` direction — reverse-export (`[UnmanagedCallersOnly]`-style) + `dotnet_typedef!`.
-  *The linchpin: the benchmark is impossible without it, and it is the hardest, ceiling-adjacent piece.
-  Design-heavy — scope before fan-out.*
+- **WF-7** `.NET→Rust` direction — *the linchpin.* **P1 DONE** (`cargo_tests/rust_export[_cs]`): a Rust
+  **library** crate now compiles to a referenceable .NET class-library assembly, and C# calls its
+  `#[no_mangle]` functions as managed methods (§6). The reframe — Rust→managed-CIL means this is *not*
+  native FFI — collapsed most of the expected difficulty. **Remaining:** P2 marshalling
+  (`&str`/`String`/`Vec`/struct ↔ idiomatic C#); P3 the harder, ceiling-adjacent half — `dotnet_typedef!`
+  + the `src/comptime.rs` revival to expose Rust *types* as managed classes (virtual methods/inheritance).
 - **WF-8** Library packaging & ergonomic surface — emit a .NET **class library** (not an
   exe-entrypoint) with **de-mangled** public types/methods/namespaces + **bidirectional marshalling for
   real API signatures** (`Result`→exception/`out`, `Option`→nullable, `Vec`/slice↔array/`Span`,
@@ -401,6 +439,7 @@ real Rust module" is the *other* direction (WF-7, the linchpin) + packaging (WF-
 - **WF-10 (open-ended)** Real-crate soak / hardening — drive an actual dependency-using crate
   end-to-end and close the long tail. Where "experimental" becomes "usable."
 
-**Status vs. the benchmark:** the capability work is **~70% done** — layers 1–4 (WF-1/2/3/5/6) complete,
-leaving **WF-7 (the hardest, .NET→Rust)** and WF-8 (packaging) on the critical path, then WF-9 (if the
-module's API is generic) + WF-10 (soak) for a *real* module. WF-7 remains both linchpin and hardest.
+**Status vs. the benchmark:** the capability work is **~80% done** — layers 1–4 (WF-1/2/3/5/6) complete
+*and* WF-7 P1 (C# calls a Rust library). Remaining on the critical path: WF-7 P2 (marshalling) + P3
+(type-export/comptime, the hardest piece) + WF-8 (packaging — de-mangled API, filename=identity,
+NuGet), then WF-9 (if the module's API is generic) + WF-10 (soak) for a *real* module.

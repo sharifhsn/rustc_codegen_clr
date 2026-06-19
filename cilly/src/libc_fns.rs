@@ -337,6 +337,7 @@ pub const LIBC_FNS: &[&str] = &[
     "pipe",
     "pthread_mutex_unlock",
     "pause",
+    "gettid",
     "pidfd_getpid",
     "posix_spawn_file_actions_init",
     "posix_spawnattr_init",

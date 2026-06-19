@@ -183,7 +183,19 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     // FIXME: figure out the source of the bug causing visibility to not be read propely.
     // let access_modifier = Access::from_visibility(tcx.visibility(instance.def_id()));
     let attrs = ctx.tcx().codegen_fn_attrs(ctx.instance().def_id());
-    let access_modifier = linkage_to_access(attrs.linkage);
+    // `#[no_mangle]` marks a function as an *export* — externally referenceable (e.g. callable from
+    // C#). Map those to `Access::Extern`, which the linker's dead-code pass treats as a ROOT
+    // (`eliminate_dead_fns`). This is what lets a **library** crate keep its public API: a library has
+    // no entrypoint to root the call graph, so without this every method would be eliminated. (For a
+    // binary it is a no-op beyond keeping unused `#[no_mangle]` fns, which is the correct semantics.)
+    let access_modifier = if attrs
+        .flags
+        .contains(rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::NO_MANGLE)
+    {
+        Access::Extern
+    } else {
+        linkage_to_access(attrs.linkage)
+    };
     // Handle the function signature
     let call_site = CallInfo::sig_from_instance_(ctx.instance(), ctx);
     let sig = call_site.sig().clone();

@@ -146,7 +146,7 @@ fn main() {
                 let start = Instant::now();
                 println!("Preparing to export the assembly");
                 #[cfg(not(miri))]
-                asm.export(path, ILExporter::new(cilly::IlasmFlavour::Clasic, true));
+                asm.export(path, ILExporter::new(cilly::IlasmFlavour::Clasic, true, None));
                 println!(
                     "Exported the assembly in {} ms",
                     start.elapsed().as_millis()
