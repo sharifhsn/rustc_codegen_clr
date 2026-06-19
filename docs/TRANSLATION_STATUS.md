@@ -42,8 +42,11 @@ faithful (Single/Direct/Niche encodings, real `tag_field`/offsets from rustc lay
 `panic!` in `tpe/simd.rs`); `dyn` pointee is a single contentless `"Dyn"` class (fine — identity is
 in the vtable). Latent: layout offsets > `u16::MAX` are silently clamped (`adt.rs:55`).
 
-**Fundamental ceilings:** generics-with-explicit-layout (see §7), ZSTs, GC can't disambiguate an
-overlapping managed-ref vs raw-pointer field.
+**Ceilings (interrogated in §7):** the *one* true wall here is a transparent zero-cost open generic
+whose overlapping layout holds a managed ref (CLI §9.5 + the GC ref-map). Internally Rust generics
+work fully (monomorphized → concrete mangled classes with legal overlapping layout, since Rust values
+are unmanaged); only C#-instantiating-a-Rust-generic-with-a-new-T is blocked, and that has a bridge
+(§7). ZSTs are special-cased, not a true wall.
 
 ## 2. Operations & intrinsics — broad, with sharp pockets
 `src/terminator/intrinsics/`, `src/binop/`, `src/casts.rs`, `src/rvalue.rs`.
@@ -64,9 +67,11 @@ overlapping managed-ref vs raw-pointer field.
   latent **correctness miscompile** for out-of-range/NaN (Rust `as` saturates).
 - f16/f128 float-to-float `as` casts `panic!` (`rvalue.rs:238`); `int → f128` cast `todo!`.
 
-**Fundamental:** SIMD layout/semantics don't line up with .NET vectors; sub-word/weak atomics (no CLI
-primitive pre-.NET 9); `type_id` is approximated via `GetHashCode` (collision-prone vs Rust's 128-bit
-id).
+**Surmountable, not fundamental (see §7):** SIMD maps to `System.Runtime.Intrinsics`
+(`Vector128/256/512` + `Sse`/`Avx`/`AdvSimd`; the immediate-operand caveat lines up with Rust's
+const-index `simd_shuffle`) — it's the biggest *implementation* hole, not a wall. `type_id` can emit
+the real 128-bit constant instead of the `GetHashCode` shortcut. Sub-word/weak atomics need lock/wide-
+word emulation (the 1-byte `cxchg` is a real bug — §10).
 
 ## 3. Calls / dispatch / unwinding
 `rustc_codegen_clr_call/`, `src/terminator/`, `cilly/src/ir/basic_block.rs` (EH), `…/builtins/`.
@@ -137,20 +142,75 @@ exists. Only the program `entrypoint` is exposed to managed callers.
 
 ---
 
-## 7. Fundamental limits (cannot fully preserve semantics)
+## 7. The "hard ceilings", interrogated — true walls vs. polyfillable-with-cost
 
-These are architectural, not "unfinished" — more code won't erase them:
+Stress-tested against the CLR spec + GC physics + prior art (C++/CLI, IKVM, Mono). The earlier
+framing over-counted "fundamental" limits: **only one is a true wall** (and even it has a working
+bridge at the interop seam). The rest are surmountable engineering or functional-with-a-cost.
 
-1. **Rust generics can't be instantiated from .NET.** The GC bans `LayoutKind.Explicit` on generics
-   (can't disambiguate overlapping ref/ptr fields), but Rust enums/unions require explicit layout. So
-   each monomorphization becomes a distinct mangled class; you cannot call `Vec3<T>` with a new `T`
-   from C#. The author: *"my problem is not strictly a technical one… I can't do anything about it."*
-2. **ZSTs** — no .NET type is < 1 byte; collapsed to `Void`, with documented clobber hazards.
-3. **Ownership/lifetimes vs GC** — a managed ref must be GC-pinned (`GCHandle`) to be held; the type
-   system can't enforce this (`StackOnly` is advisory).
-4. **async/coroutines, inline asm, foreign/cross-language unwinding, `TailCall`** — no clean CIL
-   mapping.
-5. **proc-macros** — deliberately unsupported (cost > value, per `QUICKSTART.md`).
+### True walls (irreducible on stock CoreCLR)
+1. **A *transparent, zero-cost* open generic whose overlapping layout holds a managed reference.**
+   - Spec-level: CLI Partition I §9.5 — *"Generic types shall not be marked explicitlayout"* (blanket;
+     `TypeLoadException` at load even if `T` is unused). Overlapping a managed ref with a non-ref is
+     forbidden even in *non-generic* structs (the GC needs an unambiguous ref/non-ref map per offset;
+     an open `T` can't be classified). dotnet keeps this deliberately.
+   - **But it barely bites.** Rust generics are a *compile-time* construct; the backend monomorphizes
+     them to concrete mangled classes that *may* use explicit/overlapping layout — legal, because Rust
+     values are unmanaged memory (no overlapped slot is ever a managed ref). So Rust generics work
+     **fully** internally (Rust-on-.NET). The *only* blocked case is **C# instantiating a Rust generic
+     with a brand-new C# type at runtime**, and even that has a bridge (below). The irreducible residue
+     is just the *transparent + zero-cost + managed-ref-overlapping* combination. Author:
+     *"my problem is not strictly a technical one… I can't do anything about it"* (forked runtimes lift
+     §9.5 — it's policy, not physics).
+2. **Static borrow-safety across the managed boundary.** The CLR has no borrow checker; once a value
+   crosses the seam, Rust's compile-time ownership guarantee can't be enforced (`StackOnly`/
+   `ManagedSafe` are *advisory* markers the backend can't verify). Functional correctness is
+   achievable (below); the *guarantee* is not.
+3. **Arbitrary, novel inline asm.** No general asm→CIL lowering exists (common cases are coverable —
+   below — but a hand-rolled novel asm block is genuinely unmappable).
+
+### Polyfillable-with-cost (capability yes, at a price)
+- **Generic interop across the seam (the bridge for wall #1).** Expose a *normal* C# generic wrapper
+  `RustGeneric<T>` (legal — a thin handle-holder, no explicit layout) over either:
+  - **size-parameterized sharing for `T: unmanaged`** — one Rust monomorphization keyed by `sizeof(T)`,
+    operating via `memcpy` (like C's `void* + size_t`): **near-zero-cost, layout-preserving** (open
+    dotnet proposal #97526 would even allow explicit layout when `T: unmanaged`); or
+  - **boxing/`GCHandle` for managed `T`** — one Rust monomorphization over a universal managed-handle
+    type, each element boxed: works for **any** T, ~10–20× in hot loops + GC pressure.
+  A two-mode wrapper gives functional generic interop for any T; you forfeit only zero-cost
+  transparency for the managed-ref case.
+- **Holding managed refs from Rust (functional half of wall #2).** `GCHandle` (Pinned) + the Pinned
+  Object Heap (.NET 5+, avoids fragmentation) lets Rust hold/deref managed objects safely;
+  `[UnmanagedCallersOnly]` exposes Rust fns to managed callers (reverse P/Invoke).
+- **Cross-language exceptions.** On **Unix (the project's target) native↔managed exception crossing is
+  UB/unsupported by design** — so map Rust panics to *managed* exceptions caught entirely within
+  managed frames, never across a P/Invoke boundary (exactly what `RustException` + .NET try/catch
+  already do). Solvable *by construction*; a hard design rule for the unwinding work (§3).
+- **Inline asm (common cases).** A pattern-library of known intrinsics/syscalls → hand-written
+  CIL/BCL covers most real inline asm (the `mem*` ones already are); only novel asm stays at wall #3.
+
+### Not actually ceilings (surmountable engineering; currently unbuilt/approximated)
+- **async / coroutines.** The state-machine *struct* already lowers (just data). `Yield`/resume is a
+  *designable* codegen — a coroutine is a resumable state machine and MIR already is a switch on a
+  state discriminant; lower `Yield` to "save state + return to driver", resume to "jump to saved
+  state". Bridging to .NET `Task`/`await` is a separate adapter. Hard, **not** impossible.
+- **`type_id`.** Currently a 32-bit `GetHashCode` shortcut. The real 128-bit `TypeId` is a
+  *compile-time constant* — just emit it (the `GlobalAlloc::TypeId` `todo!`).
+- **SIMD.** `System.Runtime.Intrinsics` (`Vector128/256/512`, `Sse`/`Avx`/`AdvSimd`) covers it; the
+  immediate-operand caveat (`[ConstantExpected]`) lines up with Rust's const-index `simd_shuffle`. The
+  biggest *implementation* hole (§2), not a fundamental limit.
+- **ZSTs.** Collapsed to `Void` + skipped in layout + special-cased in the ops; residual risk is a
+  missed call-site (discipline), not representational impossibility — effectively solved.
+- **proc-macros.** A *non-issue*: they run at host compile time on normal rustc, independent of the
+  codegen backend; a crate *using* them compiles fine. ("Unsupported" only means you wouldn't compile
+  a proc-macro crate *itself* to .NET — which you'd never want.)
+
+**Net:** a near-"perfect" translation layer is mostly engineering. The only irreducible losses are
+(1) zero-cost transparency for managed-ref-overlapping open generics, (2) static borrow-safety across
+the seam, and (3) arbitrary novel inline asm — each with a functional workaround for everything but
+the specific guarantee/zero-cost it gives up. Prior art agrees: C++/CLI segregates the two worlds,
+IKVM erases+boxes, Mono shares the same §9.5 constraint — all land on **monomorphize + mangle**, which
+is exactly what this backend does.
 
 ## 8. How this relates to the PAL / `std` work
 
@@ -172,10 +232,9 @@ first real, bounded *vertical* of this translation layer applied to `std`.** Con
   and the allocator→`NativeMemory`. So the PAL does **not** depend on the thin, half-built mycorrhiza
   managed-object/`GCHandle` API or on completing the binding generator; a handful of extern→BCL maps
   suffice for the early milestones.
-- **The fundamental limits (§7) do NOT block the PAL.** Generics-not-instantiable-from-.NET is a
-  *.NET→Rust* (direction-2) problem; the PAL is Rust→.NET only and exposes no Rust generics to managed
-  callers. ZSTs/ownership-vs-GC are codegen concerns already handled. The PAL sits squarely in the
-  "feasible" zone.
+- **The §7 ceilings do NOT block the PAL.** The one true generics wall is a *.NET→Rust* (direction-2)
+  problem; the PAL is Rust→.NET only and exposes no Rust generics to managed callers. ZSTs/ownership-
+  vs-GC are codegen concerns already handled. The PAL sits squarely in the "feasible" zone.
 - **Where the PAL meets the interop-completeness gap:** `fs`/networking. `System.IO` types are *bound*
   (47 of them) but **methodless** (§6), so a real `std::fs` is where the PAL would benefit from the
   binding generator emitting methods — or from hand-written IO bindings. Until then, `fs`/`net` fall
@@ -188,7 +247,7 @@ first real, bounded *vertical* of this translation layer applied to `std`.** Con
 shippable .NET `std`" / H2 goal and kills the brittle surrogate), and it is a **forcing function**
 that exercises and hardens exactly the interop paths (alloc/stdio/thread/fs/env/time) a broader
 BCL-binding effort would also need — while steering clear of the hard `.NET→Rust` direction and the
-fundamental-limit features. Empirically the gap is small: `core`+`alloc` compile clean for
+§7 true-wall features. Empirically the gap is small: `core`+`alloc` compile clean for
 `os=dotnet`; `std` needs `dotnet` arms on ~5 `sys/*` cascades (alloc, stdio, random, thread_local,
 pal-error) that lack an `unsupported` fallback.
 
@@ -200,14 +259,21 @@ pal-error) that lack an `unsupported` fallback.
    callable BCL API. The single biggest lever for Rust→.NET breadth (and unlocks `std::fs`/`net`).
 3. **Implement marshalling traits both ways** (String↔&str, slice↔array, Option/Result, structs);
    lift the 0–3 arg cap to N.
-4. **Close codegen pockets:** real SIMD (→ `Vector128`/intrinsics), f16/f128 casts, atomics edges,
-   **float→int saturation**, coroutines.
+4. **Close codegen pockets:** real SIMD (→ `Vector128`/intrinsics), f16/f128 casts, atomics edges
+   (incl. the real 1-byte CAS — §10), the real 128-bit `type_id`. (float→int saturation: done, WF-1.)
+5. **Generic-interop bridge** (new — from the §7 interrogation): a `RustGeneric<T>` ↔ Rust wrapper,
+   *size-parameterized* for `T: unmanaged` (near-zero-cost) + *boxed/`GCHandle`* for managed `T`, so C#
+   can use Rust generic containers with C# types. The key lever for pushing direction-2 (.NET→Rust)
+   toward seamless across the one true generics wall.
 
-**Hard but buildable:** revive the comptime interpreter + wire `AssemblyUtilis` (Cecil) → define .NET
-classes in Rust and reverse-export Rust functions; the real unwinding throw-bridge.
+**Hard but buildable:** async/coroutines (`Yield`/resume as an explicit state-machine driver + a .NET
+`Task` adapter — §7, *not* a fundamental limit); revive the comptime interpreter + wire
+`AssemblyUtilis` (Cecil) to define .NET classes in Rust and reverse-export Rust functions; the real
+unwinding throw-bridge (managed-frames-only on Unix — §7).
 
-**Out of scope / non-goals (treat as such):** Java/JS exporters, AOT, comptime-as-shipped,
-proc-macros, and the §7 fundamental limits.
+**Out of scope / non-goals:** Java/JS exporters, AOT, comptime-as-shipped, and the three *true walls*
+in §7 (zero-cost managed-ref-overlapping open generics, static cross-seam borrow-safety, arbitrary
+novel inline asm). proc-macros are a non-issue (host-time), not a non-goal.
 
 ## 10. Concrete bugs surfaced by the audit (WF-1 status)
 **Fixed (WF-1, gated no-regression):**
@@ -236,3 +302,46 @@ proc-macros, and the §7 fundamental limits.
   gate via reviving `TYPECHECK_CIL`; most errors are real (`FieldOwnerMismatch`, `CallArgTypeWrong`),
   with benign ref-vs-ptr-store `FieldAssignWrongType` noise to clear first; ~days of effort to reach
   a clean `::stable`. Candidate for its own workflow.
+
+## 11. North-star benchmark & full workflow roadmap
+
+**Benchmark (the capability yardstick):** a real, dependency-using Rust module living *in* a .NET
+solution (concretely: `monark/primary-offerings`) that C# **imports and calls like a normal library** —
+correct answers, `std` working inside, a clean public API with IntelliSense. This one test exercises
+*every* capability layer at once, so **"the benchmark passes" ≈ "the translation layer works."** It is
+fundamentally the `.NET→Rust` direction sitting on the whole stack.
+
+The benchmark decomposes into 6 layers → workflows:
+
+| Layer | Workflow(s) |
+|---|---|
+| 1 correct codegen | WF-1 (done), WF-5 |
+| 2 `std` runs on .NET | WF-2, WF-4 |
+| 3 Rust→.NET calls | WF-3 |
+| 4 errors/panics cross cleanly | WF-6 |
+| 5 .NET→Rust export (call Rust from C#) | **WF-7 — the linchpin** (the ~5%-dead direction) |
+| 6 ergonomic packaged library | **WF-8** (new) |
+
+**Roadmap** (run order; critical path to the benchmark is 1→2→3→7→8):
+- **WF-1** Correctness foundation — **DONE** (`50a6b39`).
+- **WF-2** dotnet PAL core — *in progress.*
+- **WF-3** BCL binding generator (emit methods) + marshalling.
+- **WF-4** PAL flesh-out + retire surrogate.
+- **WF-5** codegen pockets — SIMD, f16/f128, atomics (incl. the real 1-byte CAS), `type_id`, coroutines.
+- **WF-6** unwinding throw-bridge (managed-frames-only on Unix — §7).
+- **WF-7** `.NET→Rust` direction — reverse-export (`[UnmanagedCallersOnly]`-style) + `dotnet_typedef!`.
+  *The linchpin: the benchmark is impossible without it, and it is the hardest, ceiling-adjacent piece.*
+- **WF-8 (new)** Library packaging & ergonomic surface — emit a .NET **class library** (not an
+  exe-entrypoint) with **de-mangled** public types/methods/namespaces + **bidirectional marshalling for
+  real API signatures** (`Result`→exception/`out`, `Option`→nullable, `Vec`/slice↔array/`Span`,
+  struct↔record, `String`↔`string`) + NuGet/`.csproj` packaging. This is what makes a Rust crate
+  *importable*. (The cargo↔MSBuild build glue is separable tooling, not codegen.)
+- **WF-9 (new)** Generic-interop bridge — `RustGeneric<T>` ↔ C# (size-parameterized for `T: unmanaged`,
+  boxed/`GCHandle` for managed T; §7). Needed iff the module's public API uses generic containers.
+- **WF-10 (new, open-ended)** Real-crate soak / hardening — drive an actual dependency-using crate
+  end-to-end and close the long tail. Where "experimental" becomes "usable."
+
+**Status vs. the benchmark:** WF-1…7 are the deep capability work (**~80%**, WF-7 the hardest). +WF-8
+reaches a *trivial* importable module; +WF-9 (if generic) + WF-10 (soak) reach a *real* one. **≈10
+workflows total, ~3 beyond the original 7** — and those 3 are mostly ergonomics/packaging/hardening,
+except WF-7 which is both linchpin and hardest.
