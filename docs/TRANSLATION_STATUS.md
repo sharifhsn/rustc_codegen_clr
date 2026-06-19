@@ -1,7 +1,8 @@
 # Rust ↔ .NET translation layer — completeness & feasibility map
 
-> Status snapshot as of 2026-06 (nightly-2026-06-17, post the V1→V2 IR collapse and the
-> allocator-ABI fix). Compiled from a code audit of the whole backend cross-checked against
+> Status snapshot as of 2026-06 (nightly-2026-06-17, post the V1→V2 IR collapse, the
+> allocator-ABI fix, the **`dotnet` PAL**, the **complete-std** pass, and the **"go big"** full-BCL
+> binding generation). Compiled from a code audit of the whole backend cross-checked against
 > FractalFir's design articles (`docs/ARCHITECTURE.md`, `docs/fractalfir_articles/`). Intended as a
 > planning reference: what exists, what's partial, what's missing-but-feasible, and what is
 > fundamentally limited. File:function pointers are given so each claim is checkable.
@@ -9,20 +10,24 @@
 ## The one-sentence picture
 
 The **codegen** (Rust → CIL) is mature and largely faithful — ~90–96% of `core`/`alloc`/`std` test
-suites pass. The unfinished frontier is **interop ergonomics** (especially calling Rust *from* .NET)
-and **platform integration** (a real .NET `std`). This matches the author's own framing: *the
-translation is the validated, even elegant part; the interop ergonomics and platform integration are
-where the hard work remains* (`docs/fractalfir_articles/`, `v0_1_0`/`v0_2_0`).
+suites pass. As of the latest milestones the **Rust→.NET half is substantially complete**: a real
+`dotnet` PAL runs `std` on .NET with no surrogate (for the vertical it covers), and the full BCL call
+surface is generated (4,256 method/ctor wrappers). The remaining frontier is **calling Rust *from*
+.NET** (the `.NET→Rust` reverse-export direction, still ~5%/dead) plus **ergonomic packaging**. This
+matches the author's own framing: *the translation is the validated, even elegant part; the interop
+ergonomics and platform integration are where the hard work remains* (`docs/fractalfir_articles/`,
+`v0_1_0`/`v0_2_0`).
 
 Mental model of the layers (each builds on the one above):
 
 ```
   codegen core      Rust MIR → CIL: types, ops, calls, dispatch         ~90% — mature
-  interop substrate Rust → .NET BCL call mechanism (magic fns / extern) mechanism done, API thin
-  runtime/std       allocator, stdio, threads, fs … on .NET             surrogate today; PAL = the fix
+  interop substrate Rust → .NET BCL call mechanism (magic fns / extern) mechanism done
+  Rust → .NET API   generated wrappers over the BCL (all bindable types)  done — 4256 methods
+  runtime/std       allocator, stdio, threads, fs … on .NET             real dotnet PAL (vertical); surrogate retiring
   ── consumers ──
-  std::sys::pal::dotnet (the PAL)   a bounded vertical over the substrate   scoped, not built
-  full bidirectional layer          all BCL methods + .NET→Rust + marshalling   ~25% overall
+  .NET → Rust       reverse-export + dotnet_typedef!                     ~5% — the frontier (WF-7)
+  packaged library  class-lib output + de-mangled API + marshalling      not built (WF-8)
 ```
 
 ---
@@ -62,9 +67,12 @@ are unmanaged); only C#-instantiating-a-Rust-generic-with-a-new-T is blocked, an
   `simd_shuffle` is an unregistered `todo!`.
 - **Atomics:** sub-word `cxchg`/`xchg` for `u8`/`i8`/`u16`/`i16` now correct via masked-CAS-loop
   builtins (WF-5 — see §10); `atomic_store` is still a plain store.
-- **`float → int` `as` cast is wrapping, not saturating** (`casts.rs:176` via `rvalue.rs:106`) — a
-  latent **correctness miscompile** for out-of-range/NaN (Rust `as` saturates).
-- f16/f128 float-to-float `as` casts `panic!` (`rvalue.rs:238`); `int → f128` cast `todo!`.
+- **`float → int` `as` — FIXED (WF-1).** Finite saturation was already correct; the one real bug was
+  `NaN → MAX` (overflow branch used `bge.un`, which NaN satisfies). Now guarded `NaN → 0` in
+  `cilly/src/ir/builtins/casts.rs`. See §10.
+- **f16 float-to-float `as` — FIXED (WF-5)** via `System.Half::op_Explicit`
+  (`cilly/src/ir/builtins/f16/mod.rs`). **f128** float-to-float still `panic!`s (`rvalue.rs:238`) and
+  `int → f128` is still `todo!`.
 
 **Surmountable, not fundamental (see §7):** SIMD maps to `System.Runtime.Intrinsics`
 (`Vector128/256/512` + `Sse`/`Avx`/`AdvSimd`; the immediate-operand caveat lines up with Rust's
@@ -104,7 +112,8 @@ math, and a **full pthread mapping** (`builtins/thread.rs`, 701 LOC).
 **The "surrogate libc" is host-libc *delegation*** — 610 functions in `LIBC_FNS` are PInvoke'd to the
 host's real libc/libm/libgcc (f128 support "not portable at all", Linux/GNU only). So the artifact is
 **not self-contained** and is x86_64-Linux-bound. **This is exactly what the `dotnet` PAL replaces —
-see §8.**
+see §8.** WF-2 (`9d042ef`) landed the real PAL for the alloc/stdio/RNG/time/thread vertical (`std` runs
+on .NET with no surrogate there); fs/net and full surrogate retirement remain (WF-4).
 
 **Dead/WIP:** comptime interpreter, AOT (`aot.rs`/`native_passtrough.rs`: `#![allow(dead_code)]`, zero
 callers), softfloat ("Sample code", unused).
@@ -125,14 +134,19 @@ callers), softfloat ("Sample code", unused).
 ## 6. Bidirectional interop — the user's core interest
 `mycorrhiza/`, `src/terminator/call.rs`, `src/utilis/mod.rs`, `AssemblyUtilis/`, `src/comptime.rs`.
 
-**Rust → .NET (calling the BCL): elegant mechanism, thin API.** Const-generic "magic functions"
-encode .NET call metadata; 9 backend handlers (static/instance/virtual/ctor/cast/is_inst/null/ld_len/
-try_catch) are **complete and symmetric**. `GCHandle`-based ref-holding (`mycorrhiza/src/class.rs`) is
-sound. **But the API surface is ~0% generated:** `bindings.rs` binds **1,075 BCL types with ZERO
-methods** (just a type-identity + cast graph); the only callable methods are ~12 hand-written ones
-(Console, StringBuilder, Stopwatch, Marshal). Marshalling traits are *declared with zero impls* —
-only `&str→String`, `char→DotNetChar`, and primitives actually work. Arg count capped at 0–3 in the
-wrappers (the backend itself handles N).
+**Rust → .NET (calling the BCL): substantially done.** Const-generic "magic functions" encode .NET
+call metadata; 9 backend handlers (static/instance/virtual/ctor/cast/is_inst/null/ld_len/try_catch)
+are **complete and symmetric**. `GCHandle`-based ref-holding (`mycorrhiza/src/class.rs`) is sound.
+**The API surface is now generated at full BCL scale ("go big", `67157cd`):** `bindings.rs` is the
+self-hosted output of `spinacz` (compiled with this backend, run on .NET, reflecting the BCL via the
+magic-fns) — **4,256 method/ctor wrappers (528 ctors) across 869 inherent-impl blocks + 988 type
+aliases + 881 `From`-casts (11,626 lines)**, forwarding to the `staticN`/`instanceN`/`virtN`/`ctorN`
+helpers. Marshalling is *solved by codegen* (the emitted CIL sig is the monomorphized Rust generic
+sig), so the generator only needs name + static/instance/virtual flag + a mappable Rust type per
+param/return; genuinely-unmappable signatures (generic methods, `ref`/`out`, raw pointers, varargs)
+are dropped pending the WF-9 generic bridge. Verified: `cargo_tests/interop_method_sample` calls 13
+real BCL methods from Rust on .NET matching native. (Backend handles N args; the old 0–3 wrapper cap
+is gone for generated methods.)
 
 **\.NET → Rust (calling Rust, exposing Rust types): ~5%, essentially dead.** `dotnet_typedef!` → a
 comptime interpreter (`src/comptime.rs`) that is **commented out and aborts the build**; the
@@ -213,8 +227,10 @@ is exactly what this backend does.
 
 ## 8. How this relates to the PAL / `std` work
 
-The PAL (`std::sys::pal::dotnet`, scoped in the H2 effort) is **not a separate track — it is the
-first real, bounded *vertical* of this translation layer applied to `std`.** Concretely:
+The PAL (`std::sys::pal::dotnet`, the H2 effort) is **not a separate track — it is the first real,
+bounded *vertical* of this translation layer applied to `std`.** **WF-2 (`9d042ef`) built it** for the
+alloc/stdio/RNG/time/thread arms; the framing below is how it fits, with that vertical now landed.
+Concretely:
 
 - **The PAL replaces the §4 surrogate runtime.** Today `std` is built for `x86_64-unknown-linux-gnu`
   and the libc symbols are delegated to the host (not self-contained, Linux-only). The PAL is the
@@ -234,9 +250,9 @@ first real, bounded *vertical* of this translation layer applied to `std`.** Con
 - **The §7 ceilings do NOT block the PAL.** The one true generics wall is a *.NET→Rust* (direction-2)
   problem; the PAL is Rust→.NET only and exposes no Rust generics to managed callers. ZSTs/ownership-
   vs-GC are codegen concerns already handled. The PAL sits squarely in the "feasible" zone.
-- **Where the PAL meets the interop-completeness gap:** `fs`/networking. `System.IO` types are *bound*
-  (47 of them) but **methodless** (§6), so a real `std::fs` is where the PAL would benefit from the
-  binding generator emitting methods — or from hand-written IO bindings. Until then, `fs`/`net` fall
+- **Where the PAL meets the interop-completeness gap:** `fs`/networking. `System.IO` types are now
+  *method-bearing* (go-big, §6) — so the binding-generator prerequisite for a real `std::fs` is met;
+  what remains is wiring the PAL `fs`/`net` arms to those bindings (WF-4). Until then, `fs`/`net` fall
   back to `unsupported`. `alloc`/`stdio`/`abort` need none of that.
 - **Unwinding interaction:** the PAL with `panic=abort` is fine for early milestones. `panic=unwind`
   needs the §3 throw-bridge wired — a *shared* prerequisite for both the PAL and general correctness,
@@ -287,6 +303,22 @@ novel inline asm). proc-macros are a non-issue (host-time), not a non-goal.
   special-cases the exact name `System.Object`, so the typo broke that path.
 - ✅ Duplicate `_Unwind_DeleteException` registration removed in the linker.
 
+**Fixed (complete-std `dad047d` + go-big `67157cd`) — the `cast_ptr` over-pointering family.** One
+root cause produced three separate "frontier" miscompiles: `Asm::cast_ptr(addr, tpe)` builds
+`Ptr(tpe)` (it treats `tpe` as the *pointee*), so passing an already-pointer type yields `Ptr(Ptr(..))`.
+The sibling `cast_ptr_to` (takes the full pointer type) is the correct helper. Sites fixed:
+- ✅ **Fat-ptr `DATA_PTR` double-indirection** (`src/aggregate.rs`, `AggregateKind::RawPtr`): stored
+  `**void` into the `*void` `DATA_PTR` field of *every* slice/str fat pointer → **2,513
+  `FieldAssignWrongType` → 0**. This was the long-standing std-compile blocker.
+- ✅ **`CantCompareTypes` std-glue** (`get_environ`/argv/`mstring_to_utf8ptr` in `cilly/src/utilis.rs`)
+  — over-pointering on the environment/argv path; blocked `lang_start`/panic glue.
+- ✅ **`calli` fn-ptr typing** (`src/terminator/call.rs`+`mod.rs`): the virtual-dispatch + drop-glue
+  fn-ptr load passed `Ptr(FnPtr)` to `cast_ptr` → `Ptr(Ptr(FnPtr))` → `LdInd{tpe:FnPtr}` off a data
+  `Ptr` → `DerfWrongPtr` → `BadImageFormatException`. This was the one bug gating `spinacz` method
+  emission; fixing it (pass the bare `FnPtr(sig)`) unlocked "go big".
+- ✅ **`callvirt` for ref-type instance receivers** (`call_managed`): abstract slots like
+  `GetParameters` need `callvirt`, not `call instance`; value-type receivers still use `call`.
+
 **Still open (deferred to later workflows, with sharpened specs):**
 - ✅ **1-byte (and `i8`/`u16`/`i16`) atomic `cxchg` — FIXED (WF-5).** The old `Type::Int(Int::U8) =>
   comparand` shortcut (always-success, no write) is replaced by dedicated comparand-checked builtins
@@ -317,35 +349,45 @@ fundamentally the `.NET→Rust` direction sitting on the whole stack.
 
 The benchmark decomposes into 6 layers → workflows:
 
-| Layer | Workflow(s) |
-|---|---|
-| 1 correct codegen | WF-1 (done), WF-5 |
-| 2 `std` runs on .NET | WF-2, WF-4 |
-| 3 Rust→.NET calls | WF-3 |
-| 4 errors/panics cross cleanly | WF-6 |
-| 5 .NET→Rust export (call Rust from C#) | **WF-7 — the linchpin** (the ~5%-dead direction) |
-| 6 ergonomic packaged library | **WF-8** (new) |
+| Layer | Workflow(s) | Status |
+|---|---|---|
+| 1 correct codegen | WF-1, WF-5 | ✅ **DONE** |
+| 2 `std` runs on .NET | WF-2, WF-4 | ✅ **DONE** (PAL vertical; surrogate retiring) |
+| 3 Rust→.NET calls | WF-3 | ✅ **DONE** (full BCL, 4256 methods) |
+| 4 errors/panics cross cleanly | WF-6 | ⬜ next |
+| 5 .NET→Rust export (call Rust from C#) | **WF-7 — the linchpin** (the ~5%-dead direction) | ⬜ design-heavy |
+| 6 ergonomic packaged library | **WF-8** | ⬜ |
+
+**The Rust→.NET half of the benchmark stack (layers 1–3) is done.** What remains for "C# imports a real
+Rust module" is the *other* direction (WF-7) + error-crossing (WF-6) + packaging (WF-8).
 
 **Roadmap** (run order; critical path to the benchmark is 1→2→3→7→8):
 - **WF-1** Correctness foundation — **DONE** (`50a6b39`).
-- **WF-2** dotnet PAL core — *in progress.*
-- **WF-3** BCL binding generator (emit methods) + marshalling.
-- **WF-4** PAL flesh-out + retire surrogate.
-- **WF-5** codegen pockets — SIMD, f16/f128, atomics (incl. the real 1-byte CAS), `type_id`, coroutines.
-- **WF-6** unwinding throw-bridge (managed-frames-only on Unix — §7).
+- **WF-2** dotnet PAL core — **DONE** (`9d042ef`): real `std::sys::pal::dotnet` (alloc→`NativeMemory`,
+  stdio→`Console`, RNG/time/thread arms) via `rcl_dotnet_*` extern hooks; `std` runs on .NET, no
+  surrogate for the covered vertical.
+- **WF-3** BCL binding generator — **DONE** (complete-std `dad047d` + go-big `67157cd`): `spinacz`
+  self-hosts and emits the full method-bearing `bindings.rs` (4256 wrappers); marshalling solved by
+  codegen. See §6.
+- **WF-4** PAL flesh-out + retire surrogate — *partial* (RNG/time/thread arms landed in WF-2; fs/net
+  and full surrogate retirement remain).
+- **WF-5** codegen pockets — **DONE** (`f3cd172`) for atomics (sub-word CAS) + f16 casts; SIMD, f128,
+  `type_id` 128-bit, coroutines still open (see §2).
+- **WF-6** unwinding throw-bridge (managed-frames-only on Unix — §7). *Next; bounded, autonomous-able.*
 - **WF-7** `.NET→Rust` direction — reverse-export (`[UnmanagedCallersOnly]`-style) + `dotnet_typedef!`.
-  *The linchpin: the benchmark is impossible without it, and it is the hardest, ceiling-adjacent piece.*
-- **WF-8 (new)** Library packaging & ergonomic surface — emit a .NET **class library** (not an
+  *The linchpin: the benchmark is impossible without it, and it is the hardest, ceiling-adjacent piece.
+  Design-heavy — scope before fan-out.*
+- **WF-8** Library packaging & ergonomic surface — emit a .NET **class library** (not an
   exe-entrypoint) with **de-mangled** public types/methods/namespaces + **bidirectional marshalling for
   real API signatures** (`Result`→exception/`out`, `Option`→nullable, `Vec`/slice↔array/`Span`,
   struct↔record, `String`↔`string`) + NuGet/`.csproj` packaging. This is what makes a Rust crate
   *importable*. (The cargo↔MSBuild build glue is separable tooling, not codegen.)
-- **WF-9 (new)** Generic-interop bridge — `RustGeneric<T>` ↔ C# (size-parameterized for `T: unmanaged`,
+- **WF-9** Generic-interop bridge — `RustGeneric<T>` ↔ C# (size-parameterized for `T: unmanaged`,
   boxed/`GCHandle` for managed T; §7). Needed iff the module's public API uses generic containers.
-- **WF-10 (new, open-ended)** Real-crate soak / hardening — drive an actual dependency-using crate
+- **WF-10 (open-ended)** Real-crate soak / hardening — drive an actual dependency-using crate
   end-to-end and close the long tail. Where "experimental" becomes "usable."
 
-**Status vs. the benchmark:** WF-1…7 are the deep capability work (**~80%**, WF-7 the hardest). +WF-8
-reaches a *trivial* importable module; +WF-9 (if generic) + WF-10 (soak) reach a *real* one. **≈10
-workflows total, ~3 beyond the original 7** — and those 3 are mostly ergonomics/packaging/hardening,
-except WF-7 which is both linchpin and hardest.
+**Status vs. the benchmark:** the capability work is **~60% done** — layers 1–3 (WF-1/2/3/5) complete,
+leaving WF-6 (errors cross), **WF-7 (the hardest, .NET→Rust)**, and WF-8 (packaging) on the critical
+path, then WF-9 (if the module's API is generic) + WF-10 (soak) for a *real* module. WF-7 remains both
+linchpin and hardest.
