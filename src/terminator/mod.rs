@@ -225,8 +225,12 @@ pub fn handle_terminator<'tcx>(
                             0
                         );
                         let sig = ctx.sig([void_ptr], Type::Void);
-                        let fn_ptr_ptr = ctx.nptr(Type::FnPtr(sig));
-                        let casted = ctx.cast_ptr(vtable_ptr, fn_ptr_ptr);
+                        // `vtable_ptr` is the address of the vtable slot holding the drop fn ptr, so
+                        // it must be cast to a pointer-to-`FnPtr` before loading. `cast_ptr` already
+                        // adds the `Ptr` level, so the pointee passed is the bare `FnPtr(sig)` — not
+                        // `nptr(FnPtr(sig))`, which would build a `Ptr(Ptr(FnPtr))` and make the
+                        // following load deref a data `Ptr` (the `DerfWrongPtr` / Bad IL bug).
+                        let casted = ctx.cast_ptr(vtable_ptr, Type::FnPtr(sig));
                         let drop_fn_ptr = ctx.load(casted, Type::FnPtr(sig));
                         let cmp_a = ctx.cast_ptr_to(drop_fn_ptr, Type::Int(Int::USize));
                         let cmp_b = ctx.alloc_node(Const::USize(0));

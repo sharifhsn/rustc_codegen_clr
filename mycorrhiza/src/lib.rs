@@ -13,11 +13,15 @@
 #[allow(non_snake_case, unused_imports)]
 pub mod bindings;
 pub use bindings::*;
-/// Method-wrapper slice emitted by the `spinacz` binding generator (Console / Math /
-/// StringBuilder / String). Kept in its own module so the generated callable wrappers sit
-/// alongside the existing type-alias bindings without colliding with them.
-#[allow(non_snake_case, unused_imports, dead_code)]
-pub mod slice_bindings;
+// Method-wrapper SLICE proof (Console / Math / StringBuilder / String), retired: it has been
+// SUPERSEDED by the full method-bearing `bindings.rs` the `spinacz` generator now emits. Its
+// hand-picked overloads (`Math::abs(i32)`, `StringBuilder::append(i32)`, …) define inherent impls
+// on the SAME concrete `RustcCLRInteropManagedClass<A, B>` types that `bindings.rs` now also impls
+// (the slice's distinct `crate::slice::…` alias path doesn't matter — inherent impls bind to the
+// concrete type, not the alias), so wiring both is `E0592 duplicate definitions`. The full
+// bindings cover this surface, so the slice module is no longer compiled in.
+//   (The standalone `cargo_tests/slice_call_test` crate still `use`s `mycorrhiza::slice_bindings`;
+//    it is not a workspace member and is superseded by the full generated surface.)
 pub mod class;
 /// Very low-level interop stuff. Don't use unless you need to.
 pub mod intrinsics;

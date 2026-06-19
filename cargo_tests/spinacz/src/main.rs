@@ -162,6 +162,12 @@ impl DType {
         if Type::virt0::<"get_IsByRef", bool>(tpe) || Type::virt0::<"get_IsPointer", bool>(tpe) {
             return Self::Skip;
         }
+        // Managed arrays (`T[]`, `T[][]`) have no generated alias and their `FullName` is
+        // `System.Byte[]` etc. — `[]` is not valid Rust type syntax, so spell them as `Skip`
+        // (drops the whole method). The marshalling for managed arrays is WF-9.
+        if Type::virt0::<"get_IsArray", bool>(tpe) {
+            return Self::Skip;
+        }
         // Open generic params / constructed generics can't be named.
         if Type::virt0::<"get_IsGenericParameter", bool>(tpe)
             || Type::virt0::<"get_ContainsGenericParameters", bool>(tpe)
@@ -179,8 +185,9 @@ impl DType {
         if let Some(prim) = prim_for(&name) {
             return Self::Prim(prim);
         }
-        // Generic / nested types are dropped by the type-alias pass too -> not bound.
-        if name.contains('`') || name.contains('+') || name.contains('<') {
+        // Generic / nested / array types are dropped by the type-alias pass too -> not bound.
+        // (`[` backstops any array-shaped `FullName` the `get_IsArray` check above missed.)
+        if name.contains('`') || name.contains('+') || name.contains('<') || name.contains('[') {
             return Self::Skip;
         }
         // Value types other than the recognised primitives have no generated alias
@@ -266,20 +273,22 @@ fn reflect_methods(tpe: Type, is_valuetype: bool) -> Vec<DotNetMethodDef> {
     //
     // Bisection confirmed that returning here (before `GetMethods`/`GetConstructors` +
     // `reflect_params`) lets spinacz run end-to-end and emit the full namespaced type/alias +
-    // `From`-impl binding surface (the target-independent product). Method wrappers are re-enabled
-    // by deleting this early return once the `calli` fn-pointer-typing bug is fixed.
-    let _ = (tpe, is_valuetype);
-    return Vec::new();
+    // `From`-impl binding surface (the target-independent product).
+    //
+    // METHOD-WRAPPER GATE — NOW LIFTED: the `calli` fn-pointer-typing bug (DerfWrongPtr) and the
+    // sibling virtual-call Bad-IL are FIXED in the backend (see src/terminator/call.rs +
+    // src/terminator/mod.rs), so `reflect_params`/`reflect_one_method`/`reflect_one_ctor` JIT and
+    // run. The early `return Vec::new();` that gated method emission has been removed, so the
+    // generator now emits per-method/constructor wrappers.
     // Skip method emission for value types: the `RustcCLRInteropManagedStruct` helper
     // set is far thinner, and we don't emit struct aliases anyway.
-    #[allow(unreachable_code)]
     if is_valuetype {
         return Vec::new();
     }
     let mut out: Vec<DotNetMethodDef> = Vec::new();
     // Track (rust_name, arity) we've already emitted so overloads don't collide as
     // duplicate inherent fns. First faithful overload wins.
-    let mut seen: Vec<(String, usize)> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
 
     // We use the parameterless `GetMethods()` / `GetConstructors()` overloads (public members)
     // rather than the `BindingFlags` overloads: `BindingFlags` is a managed *enum* (value type)
@@ -324,12 +333,12 @@ fn reflect_methods(tpe: Type, is_valuetype: bool) -> Vec<DotNetMethodDef> {
     out
 }
 
-fn push_unique(
-    out: &mut Vec<DotNetMethodDef>,
-    seen: &mut Vec<(String, usize)>,
-    def: DotNetMethodDef,
-) {
-    let key = (def.rust_name.clone(), def.sig.0.len());
+fn push_unique(out: &mut Vec<DotNetMethodDef>, seen: &mut Vec<String>, def: DotNetMethodDef) {
+    // Dedup by Rust fn name ALONE, not `(name, arity)`: Rust inherent methods cannot be
+    // overloaded on arity (or anything else), so two wrappers sharing a `rust_name` — e.g.
+    // `WriteLine()`/`WriteLine(String)` both snake-casing to `write_line`, or every ctor
+    // mapping to `new` — would be `E0592 duplicate definitions`. First faithful overload wins.
+    let key = def.rust_name.clone();
     if seen.iter().any(|k| *k == key) {
         return;
     }
@@ -348,7 +357,7 @@ fn push_unique(
 fn reflect_one_method(
     mi: MethodInfo,
     out: &mut Vec<DotNetMethodDef>,
-    seen: &mut Vec<(String, usize)>,
+    seen: &mut Vec<String>,
 ) {
     // Generic methods (own type params) need the generic bridge (WF-9) -> skip.
     if MethodInfo::virt0::<"get_IsGenericMethod", bool>(mi)
@@ -419,7 +428,7 @@ fn reflect_one_method(
 fn reflect_one_ctor(
     ci: ConstructorInfo,
     out: &mut Vec<DotNetMethodDef>,
-    seen: &mut Vec<(String, usize)>,
+    seen: &mut Vec<String>,
 ) {
     // Skip the static type initializer (`.cctor`), which is static.
     if ConstructorInfo::virt0::<"get_IsStatic", bool>(ci) {
@@ -549,11 +558,26 @@ fn to_snake_case(name: &str) -> String {
             prev_lower_or_digit = true;
         }
     }
-    // Collapse any accidental double underscores.
-    while out.contains("__") {
-        out = out.replace("__", "_");
+    // Collapse any accidental double underscores. Done as a manual single-pass byte scan rather
+    // than `out.contains("__")`/`out.replace("__", "_")`: the `&str`-pattern `contains`/`replace`
+    // route through `core::str::pattern::simd_contains` -> `Mask::to_bitmask` -> the `simd_shuffle`
+    // runtime intrinsic, which is still a `todo!()` stub on this backend (`missing method
+    // simd_shuffle`). A char-by-char scan stays on a codegen path that runs. (Char-pattern
+    // `contains('_')` would be fine — it uses memchr — but a single pass is simplest.)
+    let mut collapsed = String::new();
+    let mut prev_underscore = false;
+    for ch in out.chars() {
+        if ch == '_' {
+            if !prev_underscore {
+                collapsed.push('_');
+            }
+            prev_underscore = true;
+        } else {
+            collapsed.push(ch);
+            prev_underscore = false;
+        }
     }
-    out
+    collapsed
 }
 
 fn escape_rust_keyword(name: String) -> String {

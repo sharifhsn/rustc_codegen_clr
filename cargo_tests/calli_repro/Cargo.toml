@@ -1,0 +1,11 @@
+[package]
+name = "calli_repro"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mycorrhiza = { path = "../../mycorrhiza" }
+[workspace]
+
+[profile.release]
+panic = "abort"

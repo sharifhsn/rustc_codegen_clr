@@ -88,8 +88,19 @@ fn call_managed<'tcx>(
             ctx.alloc_sig(signature.clone()),
             if is_static {
                 MethodKind::Static
-            } else {
+            } else if is_valuetype {
+                // Value-type instance methods are non-virtual slots and must use `call instance`
+                // (`callvirt` on an unboxed valuetype receiver is invalid IL).
                 MethodKind::Instance
+            } else {
+                // Reference-type instance calls must be emitted as `callvirt`, not `call instance`:
+                // many BCL "instance" methods reached through this non-virtual `instanceN` helper
+                // are actually virtual/abstract slots (e.g. `MethodBase::GetParameters`, which is
+                // abstract). Binding an abstract/virtual slot with a plain `call instance` is
+                // invalid IL and the JIT rejects the whole method with "Bad IL format". `callvirt`
+                // is the correct, universally-valid dispatch for a reference-type receiver (it works
+                // for non-virtual instance methods too), mirroring the `callvirt_managed` path.
+                MethodKind::Virtual
             },
             vec![].into(),
         );
@@ -397,8 +408,12 @@ pub fn call_inner<'tcx>(
         }
         let sig = ctx.alloc_sig(signature.clone());
         let fn_ptr_addr = ctx.biop(vtable_ptr, vtable_offset, BinOp::Add);
-        let fn_ptr_ptr = ctx.nptr(Type::FnPtr(sig));
-        let fn_ptr_addr = ctx.cast_ptr(fn_ptr_addr, fn_ptr_ptr);
+        // `fn_ptr_addr` is the address of the vtable slot holding the function pointer, so it must
+        // be cast to a pointer-to-`FnPtr` (one level of indirection) before loading the `FnPtr`.
+        // `cast_ptr` already wraps its argument in a `Ptr`, so the pointee type passed here is the
+        // bare `FnPtr(sig)` — NOT `nptr(FnPtr(sig))`, which would yield a `Ptr(Ptr(FnPtr))` and make
+        // the subsequent `LdInd { tpe: FnPtr }` deref a data `Ptr` (the `DerfWrongPtr` / Bad IL bug).
+        let fn_ptr_addr = ctx.cast_ptr(fn_ptr_addr, Type::FnPtr(sig));
         let fn_ptr = ctx.load(fn_ptr_addr, Type::FnPtr(sig));
         assert_eq!(
             signature.inputs().len(),

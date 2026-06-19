@@ -1,0 +1,13 @@
+[package]
+name = "interop_method_sample"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mycorrhiza = { path = "../../mycorrhiza" }
+[workspace]
+
+# `abort` drops the unwinding/backtrace machinery — matches spinacz/calli_repro and keeps the
+# build-std assembly off the SIMD-heavy DWARF paths that stress the IL exporter.
+[profile.release]
+panic = "abort"
