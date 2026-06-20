@@ -192,11 +192,11 @@ generic Rust types → §7 limits.
 (thin pointers → directly-C#-usable `byte*`/`nuint`). `rust_strlen(*const u8, usize)` proves inbound
 (C# `string` → Rust `&str`); `greet(*const u8, usize, *mut u8, usize)` proves outbound — it builds an
 owned Rust `String` and copies its UTF-8 into a caller-provided out-buffer (nothing crosses ownership →
-no cross-boundary free). Proven in `cargo_tests/rust_export` + `_cs` (no backend changes). Two deferred
-idiomaticity note: returning a managed `System.String` directly hits a codegen mismatch — the
-interop-call result is typed `void` when returned from an exported fn (`LocalAssigementWrong got "v"`),
-so the out-buffer convention is used instead. (Direct *typed* C# calls — `MainModule.rust_add(2,3)`,
-vs reflection — now **work** since WF-8a emits real BCL-ref versions; see §11.) Still open:
+no cross-boundary free). Proven in `cargo_tests/rust_export` + `_cs`. A Rust fn can also return a
+managed `System.String` **directly** (`greet_managed`, WF-8c) — C# gets a `string`; the bug that typed
+such returns `void` (a 0-arg managed getter's methodref hardcoded a Void return in
+`src/terminator/call.rs`) is fixed. (Direct *typed* C# calls — `MainModule.rust_add(2,3)`, vs
+reflection — work since WF-8a emits real BCL-ref versions; see §11.) Still open:
 `Vec`/slice/struct marshalling (the `(ptr,len)` convention generalizes).
 
 ---
@@ -460,9 +460,10 @@ direction (C# imports a Rust library and calls its functions, §6). What remains
   **direct typed calls** (`MainModule.rust_add(2,3)`) instead of reflection — `cargo_tests/rust_export_cs`
   now does this, 6/6 on .NET. **WF-8b DONE** (`fb5fa71`): the comptime interpreter emits a default
   `.ctor`, so C# can `new RustObj()` and call its virtual method (`get_value()`→42,
-  `cargo_tests/rust_typedef_cs`). **Remaining:** **de-mangled** public types/methods/namespaces;
-  **richer marshalling** (`Result`→exception/`out`, `Option`→nullable, `Vec`/slice↔array/`Span`,
-  struct↔record, managed-`String` return); NuGet/`.csproj` packaging. (The cargo↔MSBuild build glue is
+  `cargo_tests/rust_typedef_cs`). **WF-8c DONE** (`b133a35`): a Rust fn returns a managed `System.String`
+  directly (the 0-arg-managed-getter Void-return codegen bug fixed). **Remaining:** **de-mangled** public
+  types/methods/namespaces; **richer marshalling** (`Result`→exception/`out`, `Option`→nullable,
+  `Vec`/slice↔array/`Span`, struct↔record); NuGet/`.csproj` packaging. (The cargo↔MSBuild build glue is
   separable tooling, not codegen.)
 - **WF-9** Generic-interop bridge — `RustGeneric<T>` ↔ C# (size-parameterized for `T: unmanaged`,
   boxed/`GCHandle` for managed T; §7). Needed iff the module's public API uses generic containers.
