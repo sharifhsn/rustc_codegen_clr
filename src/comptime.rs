@@ -16,7 +16,9 @@
 //! as plain data while walking the MIR and build + register everything in one shot at `finish_type`.
 
 use cilly::cilnode::MethodKind;
-use cilly::{Access, ClassDef, ClassRef, MethodDef, MethodImpl, MethodRef, Type};
+use cilly::{
+    Access, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, MethodDef, MethodImpl, MethodRef, Type,
+};
 use rustc_codegen_clr_call::CallInfo;
 use rustc_codegen_clr_ctx::{function_name, MethodCompileCtx};
 use rustc_codegen_clr_type::r#type::get_type;
@@ -253,5 +255,46 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             arg_names,
         );
         ctx.new_method(mdef);
+    }
+
+    // Emit a default parameterless constructor for reference types, so C# can `new` the class. Value
+    // types have no base constructor to chain to and are created differently, so skip them.
+    if !class.is_value_type {
+        if let Some(base) = extends {
+            // Reference to the base class's `.ctor` (e.g. System.Object::.ctor). Chaining to a base
+            // constructor is a plain `call instance void …::.ctor()`, so this methodref is `Instance`
+            // kind, NOT `Constructor` — the latter is for `newobj` and is rejected as a CIL-root call.
+            let base_obj_ty = Type::ClassRef(base);
+            let base_ctor_sig = ctx.sig([base_obj_ty], Type::Void);
+            let base_ctor_name = ctx.alloc_string(".ctor");
+            let base_ctor = ctx.alloc_methodref(MethodRef::new(
+                base,
+                base_ctor_name,
+                base_ctor_sig,
+                MethodKind::Instance,
+                [].into(),
+            ));
+            // Our `.ctor(this)`: chain to base then return — `ldarg.0; call base::.ctor(); ret`.
+            let self_ty = Type::ClassRef(*class_idx);
+            let ctor_sig = ctx.sig([self_ty], Type::Void);
+            let this = ctx.alloc_node(CILNode::LdArg(0));
+            let call_base = ctx.alloc_root(CILRoot::call(base_ctor, [this]));
+            let ret = ctx.alloc_root(CILRoot::VoidRet);
+            let blocks = vec![BasicBlock::new(vec![call_base, ret], 0, None)];
+            let ctor_name = ctx.alloc_string(".ctor");
+            let ctor_def = MethodDef::new(
+                Access::Extern,
+                class_idx,
+                ctor_name,
+                ctor_sig,
+                MethodKind::Constructor,
+                MethodImpl::MethodBody {
+                    blocks,
+                    locals: vec![],
+                },
+                vec![None],
+            );
+            ctx.new_method(ctor_def);
+        }
     }
 }

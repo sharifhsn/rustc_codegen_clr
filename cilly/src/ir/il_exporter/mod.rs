@@ -201,7 +201,10 @@ impl ILExporter {
                     crate::cilnode::MethodKind::Static => "static",
                     crate::cilnode::MethodKind::Instance => "instance",
                     crate::cilnode::MethodKind::Virtual => "virtual instance",
-                    crate::cilnode::MethodKind::Constructor => "rtspecialname specialname",
+                    // A constructor is an instance method (the `instance` calling-convention keyword
+                    // must come LAST, right before the return type — like `virtual instance` above —
+                    // not interspersed with the `specialname`/`rtspecialname` attributes).
+                    crate::cilnode::MethodKind::Constructor => "specialname rtspecialname instance",
                 };
                 let pinvoke = if let MethodImpl::Extern {
                     lib,

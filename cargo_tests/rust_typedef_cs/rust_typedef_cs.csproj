@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>rust_typedef_cs</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The Rust-produced .NET class library defining RustObj. Copied from lib<crate>.so by the build. -->
+    <Reference Include="rust_typedef">
+      <HintPath>rust_typedef.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>
