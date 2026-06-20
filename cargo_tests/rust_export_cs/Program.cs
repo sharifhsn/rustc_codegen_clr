@@ -53,6 +53,22 @@ public static class Program
         Check("make_point(4,5).get_x()", q.get_x(), 4, ref pass, ref total);
         Check("make_point(4,5).get_y()", q.get_y(), 5, ref pass, ref total);
 
+        // ---- WF-8e: richer marshalling — slices (collections) + Result (errors) ----
+        int[] nums = { 1, 2, 3, 4 };
+        fixed (int* np2 = nums) // inbound: C# int[] -> Rust &[i32]
+        {
+            Check("sum_slice([1,2,3,4])", MainModule.sum_slice(np2, (nuint)nums.Length), 10, ref pass, ref total);
+        }
+        int[] sq = new int[5];
+        fixed (int* sp = sq) // outbound: Rust fills C#'s buffer
+        {
+            MainModule.fill_squares(sp, (nuint)sq.Length);
+        }
+        Check("fill_squares()[4]", sq[4], 16, ref pass, ref total);
+
+        // Result Ok value crosses as the unwrapped value.
+        Check("checked_div(10,2)", MainModule.checked_div(10, 2), 5, ref pass, ref total);
+
         Console.WriteLine(pass == total ? "PASS" : $"FAIL ({pass}/{total})");
         return pass == total ? 0 : 1;
     }

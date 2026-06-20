@@ -124,3 +124,41 @@ pub extern "C" fn point_sum(p: Point) -> i32 {
 pub extern "C" fn make_point(x: i32, y: i32) -> Point {
     Point { x, y }
 }
+
+// ---- WF-8e: richer marshalling — collections (slices) + errors (Result -> exception) ----
+//
+// Slices cross via the same UTF-8-string `(ptr, len)` convention, applied to any element type: inbound,
+// C# pins an array and Rust reconstructs a `&[T]`; outbound, C# provides a buffer Rust fills (no Rust
+// pointer escapes → nothing to free across the boundary, and no GC-pinning lifetime hazard). A `Result`
+// maps to the idiomatic .NET shape — return the `Ok` value, or **throw**: a Rust panic is bridged
+// (WF-6) to a managed exception that propagates out of the managed call, so C# uses ordinary try/catch.
+
+/// Inbound slice: C# `int[]` → Rust `&[i32]`, returns the sum.
+///
+/// # Safety
+/// `ptr` must point to `len` valid, initialized `i32`s for the duration of the call (C# pins them).
+#[no_mangle]
+pub unsafe extern "C" fn sum_slice(ptr: *const i32, len: usize) -> i32 {
+    core::slice::from_raw_parts(ptr, len).iter().sum()
+}
+
+/// Outbound slice via a caller-provided buffer: Rust fills C#'s `int[]` with `i*i`.
+///
+/// # Safety
+/// `ptr` must point to `len` valid, writable `i32`s for the duration of the call (C# pins them).
+#[no_mangle]
+pub unsafe extern "C" fn fill_squares(ptr: *mut i32, len: usize) {
+    for (i, v) in core::slice::from_raw_parts_mut(ptr, len).iter_mut().enumerate() {
+        *v = (i as i32) * (i as i32);
+    }
+}
+
+/// `Result` → .NET exception: returns the quotient on `Ok`, or **throws** on `Err` (here, a panic that
+/// the WF-6 bridge turns into a managed exception C# can `catch`).
+#[no_mangle]
+pub extern "C" fn checked_div(a: i32, b: i32) -> i32 {
+    match a.checked_div(b) {
+        Some(q) => q,
+        None => panic!("checked_div: division by zero"),
+    }
+}
