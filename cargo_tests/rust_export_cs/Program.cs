@@ -69,6 +69,13 @@ public static class Program
         // Result Ok value crosses as the unwrapped value.
         Check("checked_div(10,2)", MainModule.checked_div(10, 2), 5, ref pass, ref total);
 
+        // Error direction: a Rust Err raises a .NET exception that C# catches (direct managed throw).
+        Check("try_div(10,2)", MainModule.try_div(10, 2), 5, ref pass, ref total);
+        bool threw = false;
+        try { MainModule.try_div(1, 0); }
+        catch (Exception) { threw = true; }
+        Check("try_div(1,0) -> C# catch", threw, true, ref pass, ref total);
+
         Console.WriteLine(pass == total ? "PASS" : $"FAIL ({pass}/{total})");
         return pass == total ? 0 : 1;
     }

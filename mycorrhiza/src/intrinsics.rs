@@ -264,6 +264,14 @@ pub fn rustc_clr_interop_managed_ctor0_<
 pub fn rustc_clr_interop_managed_ld_null<T>() -> T {
     core::intrinsics::abort();
 }
+/// Raises a managed `System.Exception(MSG)` directly (a `throw` IL op), so a .NET caller can `catch`
+/// it. This is the C#-catchable error direction — unlike a Rust `panic!`, which goes through the
+/// unwinder and does not propagate cleanly out to a managed frame.
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_clr_interop_throw<const MSG: &'static str>() -> ! {
+    core::intrinsics::abort();
+}
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_checked_cast<DST, SRC>(src: SRC) -> DST {

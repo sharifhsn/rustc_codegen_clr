@@ -4,7 +4,7 @@ use crate::{
     utilis::{
         garag_to_bool, CTOR_FN_NAME, MANAGED_CALL_FN_NAME, MANAGED_CALL_VIRT_FN_NAME,
         MANAGED_CHECKED_CAST, MANAGED_IS_INST, MANAGED_LD_ELEM_REF, MANAGED_LD_LEN,
-        MANAGED_LD_NULL, MANAGED_TRY_CATCH,
+        MANAGED_LD_NULL, MANAGED_THROW, MANAGED_TRY_CATCH,
     },
 };
 use cilly::{
@@ -451,7 +451,15 @@ pub fn call_inner<'tcx>(
     }
     let mut signature = call_info.sig().clone();
     // Checks if function is "magic"
-    if function_name.contains(CTOR_FN_NAME) {
+    if function_name.contains(MANAGED_THROW) {
+        // `rustc_clr_interop_throw::<MSG>()` raises a managed `System.Exception(MSG)` directly (via the
+        // `throw` IL op), so a .NET caller can `catch` it. Unlike a Rust `panic!` — which goes through
+        // the unwinder and faults when it reaches a managed frame — this is an ordinary managed throw.
+        // The fn returns `!`, so there is no destination; `throw` is a terminal op (the caller appends
+        // the usual "diverging call returned" guard after it, exactly as for `panic!`).
+        let msg = garg_to_string(instance.args[0], ctx.tcx());
+        return vec![ctx.throw_msg(&msg)];
+    } else if function_name.contains(CTOR_FN_NAME) {
         assert!(
             !call_info.split_last_tuple(),
             "Constructors may not use the `rust_call` calling convention!"

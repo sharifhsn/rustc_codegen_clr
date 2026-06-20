@@ -153,12 +153,21 @@ pub unsafe extern "C" fn fill_squares(ptr: *mut i32, len: usize) {
     }
 }
 
-/// `Result` → .NET exception: returns the quotient on `Ok`, or **throws** on `Err` (here, a panic that
-/// the WF-6 bridge turns into a managed exception C# can `catch`).
+/// `Result` → value on `Ok`. (The `Err` direction — raising a C#-catchable exception — is shown by
+/// `try_div` below, which uses a *direct managed throw* rather than a panic.)
 #[no_mangle]
 pub extern "C" fn checked_div(a: i32, b: i32) -> i32 {
+    a.checked_div(b).unwrap_or(i32::MIN)
+}
+
+/// `Result`/error → **.NET exception that C# can `catch`**. On `Err` it raises a `System.Exception`
+/// directly (the `rustc_clr_interop_throw` intrinsic emits a `throw` IL op), which propagates out of
+/// this managed method into the C# caller's `try`/`catch`. This is the reliable Rust→.NET error
+/// direction — a Rust `panic!` does *not* cross cleanly to a managed caller.
+#[no_mangle]
+pub extern "C" fn try_div(a: i32, b: i32) -> i32 {
     match a.checked_div(b) {
         Some(q) => q,
-        None => panic!("checked_div: division by zero"),
+        None => mycorrhiza::intrinsics::rustc_clr_interop_throw::<"try_div: division by zero">(),
     }
 }
