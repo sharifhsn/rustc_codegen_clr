@@ -912,6 +912,15 @@ impl Assembly {
                 .iter()
                 .map(|def: &MethodDefIdx| self.method_defs.get(def).unwrap())
             {
+                // An aliasing method (e.g. a comptime-defined virtual method) has no CIL body of its
+                // own, so the `iter_cil` walk below would miss its target — keep the alias target alive
+                // explicitly.
+                if let MethodImpl::AliasFor(target) = def.implementation() {
+                    let tdef = MethodDefIdx::from_raw(*target);
+                    if self.method_defs.contains_key(&tdef) && !alive.contains(&tdef) {
+                        to_resurrect.insert(tdef);
+                    }
+                }
                 // Iterate torugh the cil of this method, if present
                 let Some(cil) = def.iter_cil(self) else {
                     continue;

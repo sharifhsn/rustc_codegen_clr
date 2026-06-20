@@ -163,10 +163,13 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     let mir = ctx.tcx().instance_mir(ctx.instance().def);
     let mut ctx = ctx.with_body(mir);
     let ctx = &mut ctx;
-    if name.contains("rustc_codegen_clr_comptime_entrypoint") {
-        if name.contains("rustc_codegen_clr_not_magic") {
-            return Ok(());
-        }
+    // The comptime entrypoint is *interpreted* (it describes a managed class) rather than codegen'd.
+    // But `dotnet_typedef!` declares each virtual method's body fn (`…_not_magic`) *inside* the
+    // entrypoint fn, so its symbol name also contains "comptime_entrypoint" — that one must fall
+    // through to NORMAL codegen (it is the real method the class's virtual aliases forward to).
+    if name.contains("rustc_codegen_clr_comptime_entrypoint")
+        && !name.contains("rustc_codegen_clr_not_magic")
+    {
         crate::comptime::interpret(ctx, mir);
         return Ok(());
     }

@@ -1,0 +1,13 @@
+[package]
+name = "rust_typedef"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# A .NET class library that *defines a managed class from Rust* via dotnet_typedef! (WF-7 P3).
+crate-type = ["cdylib"]
+
+[dependencies]
+[workspace]
+[profile.release.build-override]
+codegen-units = 1
