@@ -17,9 +17,11 @@
 //! C#-provided buffer (no Rust allocation crosses the boundary → nothing to free across it). An
 //! idiomatic `string Greet(string)` wrapper on the C# side is a thin layer over this.
 //!
-//! (Returning a managed `System.String` directly — the most idiomatic shape — is a follow-up: it
-//! currently hits a codegen mismatch where the interop-call result is typed `void` in an exported
-//! function. The out-buffer convention here is allocation-safe and codegen-clean.)
+//! `greet_managed` (WF-8c) returns a managed `System.String` *directly* — the most idiomatic shape —
+//! now that the 0-arg-managed-getter codegen bug (which typed such returns `void`) is fixed.
+
+#![feature(adt_const_params, unsized_const_params)]
+#![allow(incomplete_features)]
 
 // ---- P1: primitives (callable directly from C#) ----
 
@@ -81,4 +83,18 @@ pub unsafe extern "C" fn greet(
     let n = core::cmp::min(bytes.len(), out_cap);
     core::ptr::copy_nonoverlapping(bytes.as_ptr(), out_ptr, n);
     bytes.len()
+}
+
+/// Like `greet`, but returns a managed `System.String` *directly* (the idiomatic shape) instead of an
+/// out-buffer. Builds an owned Rust `String` and copies it into a managed string via
+/// `Marshal.PtrToStringUTF8` (mycorrhiza's `From<&str> for MString`). C# receives a `string`.
+///
+/// # Safety
+/// `ptr` must point to `len` valid, initialized bytes for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn greet_managed(ptr: *const u8, len: usize) -> mycorrhiza::system::MString {
+    let name =
+        core::str::from_utf8(core::slice::from_raw_parts(ptr, len)).unwrap_or("<invalid utf8>");
+    let greeting = format!("Hello, {name}, from Rust (managed)!");
+    mycorrhiza::system::MString::from(greeting.as_str())
 }

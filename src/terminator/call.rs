@@ -60,7 +60,13 @@ fn call_managed<'tcx>(
         .expect("Can't get the function signature");
 
     if argument_count == 0 {
-        let ret = cilly::Type::Void;
+        // Use the REAL return type, not Void. A zero-arg managed getter (e.g. a static `get_Default`
+        // returning a managed reference) must produce a value of its declared type; hardcoding Void
+        // here made the call node Void, so storing it into the (correctly-typed) destination failed
+        // typecheck (`LocalAssigementWrong got "v"`). (A zero explicit-arg call is always `static0` —
+        // an instance receiver would be an explicit arg and take the branch below — so `Static` is
+        // correct here.)
+        let ret = *signature.output();
         let call_site = MethodRef::new(
             ctx.alloc_class_ref(tpe),
             ctx.alloc_string(managed_fn_name),
@@ -141,7 +147,9 @@ fn callvirt_managed<'tcx>(
     let signature = crate::function_sig::sig_from_instance_(fn_instance, ctx)
         .expect("Can't get the function signature");
     if argument_count == 0 {
-        let ret = cilly::Type::Void;
+        // Use the REAL return type, not Void (see `call_managed`'s 0-arg branch) — a zero-arg managed
+        // getter returning a managed reference was being typed Void, failing the destination store.
+        let ret = *signature.output();
         let call = MethodRef::new(
             ctx.alloc_class_ref(tpe),
             ctx.alloc_string(managed_fn_name),

@@ -38,6 +38,10 @@ public static class Program
                 string greeting = Encoding.UTF8.GetString(outbuf, 0, (int)n);
                 Check("greet(\"World\")", greeting, "Hello, World, from Rust!", ref pass, ref total);
             }
+
+            // Rust String -> C# string, returned DIRECTLY as a managed System.String (WF-8c).
+            string gm = MainModule.greet_managed(np, (nuint)utf8.Length);
+            Check("greet_managed(\"World\")", gm, "Hello, World, from Rust (managed)!", ref pass, ref total);
         }
 
         Console.WriteLine(pass == total ? "PASS" : $"FAIL ({pass}/{total})");

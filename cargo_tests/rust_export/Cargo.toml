@@ -8,6 +8,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
+mycorrhiza = { path = "../../mycorrhiza" }
 [workspace]
 [profile.release.build-override]
 codegen-units = 1
