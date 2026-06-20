@@ -183,9 +183,11 @@ const-generics) and registers a `ClassDef` as a side effect. Two backend fixes e
 method-body fn (`…_not_magic`, declared *inside* the entrypoint) now falls through to normal codegen
 (`src/assembly.rs`), and the dead-code pass follows `AliasFor` edges (`cilly/src/ir/asm.rs`); the
 emitted methods are `Access::Extern` (DCE roots). The Cecil-based `AssemblyUtilis` backend remains
-unwired (an alternate, unneeded emission path). **Follow-ups for full C# *use*:** `dotnet_typedef!`
-emits no constructor (the type loads + reflects, but C# can't `new` it yet); a virtual method returning
-a managed `System.String` hits the P2 managed-return codegen bug; generic Rust types → §7 limits.
+unwired (an alternate, unneeded emission path). **C# can now `new` the class** (WF-8b): the interpreter
+emits a default `.ctor` (a real CIL body chaining to the base ctor), so `new RustObj().get_value()`
+returns 42 from C# (`cargo_tests/rust_typedef_cs`). **Remaining follow-ups:** a virtual method returning
+a managed `System.String` hits the P2 managed-return codegen bug; fields/ctors with non-primitive types;
+generic Rust types → §7 limits.
 **\.NET → Rust (string marshalling): WORKING (WF-7 P2).** Strings cross as UTF-8 `(ptr, len)` pairs
 (thin pointers → directly-C#-usable `byte*`/`nuint`). `rust_strlen(*const u8, usize)` proves inbound
 (C# `string` → Rust `&str`); `greet(*const u8, usize, *mut u8, usize)` proves outbound — it builds an
@@ -456,10 +458,12 @@ direction (C# imports a Rust library and calls its functions, §6). What remains
 - **WF-8** Library packaging & ergonomic surface. **WF-8a DONE** (`3b6915f`): a produced **library**
   emits real `.assembly extern` BCL identities (`.ver`/`.publickeytoken`), so C# references it and uses
   **direct typed calls** (`MainModule.rust_add(2,3)`) instead of reflection — `cargo_tests/rust_export_cs`
-  now does this, 6/6 on .NET. **Remaining:** constructors for `dotnet_typedef!` classes (so C# can `new`
-  them); **de-mangled** public types/methods/namespaces; **richer marshalling** (`Result`→exception/`out`,
-  `Option`→nullable, `Vec`/slice↔array/`Span`, struct↔record, managed-`String` return); NuGet/`.csproj`
-  packaging. (The cargo↔MSBuild build glue is separable tooling, not codegen.)
+  now does this, 6/6 on .NET. **WF-8b DONE** (`fb5fa71`): the comptime interpreter emits a default
+  `.ctor`, so C# can `new RustObj()` and call its virtual method (`get_value()`→42,
+  `cargo_tests/rust_typedef_cs`). **Remaining:** **de-mangled** public types/methods/namespaces;
+  **richer marshalling** (`Result`→exception/`out`, `Option`→nullable, `Vec`/slice↔array/`Span`,
+  struct↔record, managed-`String` return); NuGet/`.csproj` packaging. (The cargo↔MSBuild build glue is
+  separable tooling, not codegen.)
 - **WF-9** Generic-interop bridge — `RustGeneric<T>` ↔ C# (size-parameterized for `T: unmanaged`,
   boxed/`GCHandle` for managed T; §7). Needed iff the module's public API uses generic containers.
 - **WF-10 (open-ended)** Real-crate soak / hardening — drive an actual dependency-using crate
