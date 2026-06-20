@@ -1,0 +1,7 @@
+[package]
+name = "soak_indexmap"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+indexmap = "2"
+[workspace]
