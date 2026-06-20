@@ -122,6 +122,13 @@ pub fn add_allocation(
     ctx: &mut MethodCompileCtx<'_, '_>,
     tpe: Interned<Type>,
 ) -> Interned<CILNode> {
+    // `tpe` is the caller's *expected* type for the allocation, but it is frequently
+    // pointer-sized (a `&T` const, or the `USize` `alloc_default_type` hands back for
+    // VTable/Function reloc targets) and would under-size the backing field. The Memory
+    // arm below now derives the field's storage type from the allocation's real len+align
+    // instead, so this hint is intentionally unused. Kept in the signature for the stable
+    // API and to keep call sites self-documenting.
+    let _ = tpe;
     let uint8_ptr = ctx.nptr(Type::Int(Int::U8));
     let main_module_id = ctx.main_module();
     let const_allocation = match ctx
@@ -177,15 +184,44 @@ pub fn add_allocation(
     let byte_hash = calculate_hash(&bytes);
     match (align, bytes.len()) {
         _ => {
+            // The initializer `cpblk`s the *full* `const_allocation.len()` bytes (see
+            // `allocation_initializer_method`), so the backing field MUST be at least
+            // that large. The caller-supplied `tpe` is frequently pointer-sized — e.g. a
+            // `&T` const, or the `USize` that `alloc_default_type` returns for the
+            // `VTable`/`Function` relocation-target arms — which would under-size the
+            // field and let the `cpblk` overrun into whatever static the linker happens
+            // to place next (the corrupted `DECIMAL_PAIRS` -> `__fmt_inner`
+            // NullReferenceException). Build a correctly-sized blob value-type from the
+            // allocation's real len+align and declare the field with *that*, ignoring the
+            // (possibly undersized) incoming `tpe`. Every consumer `cast_ptr`s the address
+            // we return, so widening the storage type is transparent — only the size grows
+            // to be correct.
+            let elem = match align {
+                ..1 => Int::U8,
+                ..2 => Int::U16,
+                ..4 => Int::U32,
+                _ => Int::U64,
+            };
+            let elem_size = elem.size().unwrap_or(8) as u64;
+            let len = const_allocation.len() as u64;
+            let blob_arr = fixed_array(
+                ctx,
+                Type::Int(elem),
+                len.div_ceil(elem_size),
+                len.next_multiple_of(elem_size),
+                elem_size,
+            );
+            let field_tpe = Type::ClassRef(blob_arr);
+            let field_tpe_idx = ctx.alloc_type(field_tpe);
             let alloc_name = format!(
                 "al_{}_{}_{}_{}",
                 encode(alloc_id),
                 encode(byte_hash),
-                encode(tpe.inner().into()),
+                encode(field_tpe_idx.inner().into()),
                 const_allocation.len()
             );
             let name = ctx.alloc_string(alloc_name.clone());
-            let field_desc = StaticFieldDesc::new(*ctx.main_module(), name, ctx[tpe]);
+            let field_desc = StaticFieldDesc::new(*ctx.main_module(), name, field_tpe);
             // Currently, all static fields are in one module. Consider spliting them up.
 
             let main_module = ctx.class_mut(main_module_id);
@@ -193,8 +229,7 @@ pub fn add_allocation(
             if main_module.has_static_field(name, field_desc.tpe()) {
                 return ctx.static_addr(field_desc).into();
             }
-            let tpe = ctx[tpe].clone();
-            ctx.add_static(tpe, &*alloc_name, false, main_module_id, None, false);
+            ctx.add_static(field_tpe, &*alloc_name, false, main_module_id, None, false);
 
             let ptr = ctx.static_addr(field_desc);
             let ptr = ctx.cast_ptr(ptr, Int::U8);
