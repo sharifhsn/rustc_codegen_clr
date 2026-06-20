@@ -7,7 +7,12 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>rust_export_cs</AssemblyName>
   </PropertyGroup>
-  <!-- No <Reference> to the Rust assembly: it is loaded at runtime via Assembly.LoadFrom(path) so the
-       compiler doesn't choke on the assembly's BCL reference versions (CS0012). The path is passed as
-       argv[0] by the build script. -->
+  <ItemGroup>
+    <!-- The Rust-produced .NET class library, referenced by its crate assembly name. The build script
+         copies `lib<crate>.so` (a PE) to `rust_export.dll` next to this project. WF-8a's BCL-ref
+         versions make this direct typed reference compile (no reflection). -->
+    <Reference Include="rust_export">
+      <HintPath>rust_export.dll</HintPath>
+    </Reference>
+  </ItemGroup>
 </Project>

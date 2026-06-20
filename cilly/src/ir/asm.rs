@@ -407,6 +407,27 @@ impl Assembly {
         self.class_refs.alloc(cref)
     }
 
+    /// The distinct names of all external assemblies referenced by this assembly's class refs (e.g.
+    /// `System.Runtime`, `System.Private.CoreLib`). Used to emit `.assembly extern` directives with
+    /// real BCL identities, so the produced assembly can be referenced by a C# *compiler* (otherwise
+    /// ilasm defaults extern refs to version 0.0.0.0 and Roslyn rejects them — CS0012). Sorted for
+    /// deterministic output.
+    #[must_use]
+    pub fn external_assembly_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for cref in self.class_refs.iter_keys() {
+            if let Some(asm) = self.class_refs[cref].asm() {
+                let name = &self[asm];
+                if !name.is_empty() {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
     pub fn alloc_sig(&mut self, sig: FnSig) -> Interned<FnSig> {
         self.sigs.alloc(sig)
     }

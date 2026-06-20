@@ -45,6 +45,25 @@ impl ILExporter {
             // Legacy placeholder for executables (loaded by path, name irrelevant).
             None => writeln!(out, ".assembly _{{}}")?,
         }
+        // For a LIBRARY, emit `.assembly extern` headers with real BCL identities. Without these,
+        // ilasm infers extern refs from the `[asm]Type` uses in the body and defaults them to version
+        // 0.0.0.0 / null token, which a C# *compiler* rejects when the library is referenced directly
+        // (CS0012). net8 ref assemblies are 8:0:0:0 with the ECMA token; CoreLib and mscorlib differ.
+        // Executables are run directly (the runtime resolves refs leniently) and need no headers — so
+        // they keep ilasm's defaults, leaving the `::stable` exe suite untouched.
+        if self.is_lib {
+            for ext in asm.external_assembly_names() {
+                let (ver, token) = match ext.as_str() {
+                    "System.Private.CoreLib" => ("8:0:0:0", "7C EC 85 D7 BE A7 79 8E"),
+                    "mscorlib" => ("4:0:0:0", "B7 7A 5C 56 19 34 E0 89"),
+                    _ => ("8:0:0:0", "B0 3F 5F 7F 11 D5 0A 3A"),
+                };
+                writeln!(
+                    out,
+                    ".assembly extern '{ext}' {{ .ver {ver} .publickeytoken = ({token}) }}"
+                )?;
+            }
+        }
         for (const_data, idx) in asm.const_data.1.iter() {
             let encoded = encode(idx.inner() as u64);
             let data: String = const_data.iter().map(|u| format!("{u:x} ")).collect();
