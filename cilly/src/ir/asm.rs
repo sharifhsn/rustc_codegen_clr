@@ -1672,6 +1672,127 @@ impl Assembly {
         self.alloc_node(CILNode::LdFtn(mref))
     }
 
+    /// Produces a function-pointer (`LdFtn`) value whose CIL arity matches `target_sig`, for the
+    /// physical method `real_ref` (whose own physical signature is `real_ref.sig()`).
+    ///
+    /// The backend builds a physical method signature from *every* `fn_abi.args` entry — including
+    /// `PassMode::Ignore`/ZST receivers, which lower to `Type::Void` (`valuetype RustVoid`)
+    /// parameters. A bare `fn`-pointer *type*, by contrast, is built receiver-free. So when a
+    /// closure / `FnDef` with a ZST receiver is turned into a bare `fn` pointer (either via a MIR
+    /// `ClosureFnPointer`/`ReifyFnPointer` coercion, or via a const fn-pointer relocation in static
+    /// data), the physical method has *more* parameters (the elided `Void` ones) than the fn-pointer
+    /// type it is stored into and later invoked through. Taking the method's address with a plain
+    /// `ldftn` then stores a pointer whose arity disagrees with the eventual indirect `calli`: the
+    /// `calli` pushes too few arguments, and the callee's `ldarg.N` reads a non-existent slot
+    /// (garbage). This was the root cause of the TLS `LazyStorage::initialize`
+    /// `AccessViolationException`.
+    ///
+    /// The fix is an adapter thunk: a fresh static method whose physical signature *is* `target_sig`;
+    /// it loads each real argument from its target slot, supplies an uninitialised `RustVoid` value
+    /// for each elided `Void`/ZST parameter, calls the real method, and returns its result. The
+    /// returned `LdFtn` points at this adapter, so the indirect `calli` and the callee agree on
+    /// arity.
+    ///
+    /// Fast path: when `real_ref.sig()` already equals `target_sig` (no elided params), the real
+    /// method's address is taken directly with no adapter. The adapter is memoised by
+    /// `(real method name, target sig)`, so it is emitted exactly once across coercion sites.
+    pub fn reify_fnptr(
+        &mut self,
+        real_ref: MethodRef,
+        target_sig: Interned<FnSig>,
+    ) -> Interned<CILNode> {
+        let real_sig_idx = real_ref.sig();
+        // Fast path: signatures already agree (the common case: no ZST/Ignore receiver was elided).
+        if real_sig_idx == target_sig {
+            let m = self.alloc_methodref(real_ref);
+            return self.ld_ftn(m);
+        }
+        let real_sig = self[real_sig_idx].clone();
+        let target_sig_val = self[target_sig].clone();
+        let real_inputs = real_sig.inputs();
+        let target_inputs = target_sig_val.inputs();
+        // Compute the positional mapping between the real (keep-ZST) inputs and the target inputs.
+        // The two sigs may differ ONLY by keep-ZST params whose CIL type is `Type::Void` (the elided
+        // `PassMode::Ignore`/ZST args). For each real input, record whether it consumes the next
+        // target slot (non-Void) or is filled with an uninitialised `Void` value (elided).
+        let mut target_idx = 0usize;
+        // `slot_map[i] = Some(j)` => real arg `i` is loaded from target slot `j`;
+        // `slot_map[i] = None`    => real arg `i` is an elided Void/ZST arg, supplied as `uninit_val`.
+        let mut slot_map: Vec<Option<usize>> = Vec::with_capacity(real_inputs.len());
+        for real in real_inputs {
+            if *real == Type::Void {
+                slot_map.push(None);
+            } else {
+                let Some(target) = target_inputs.get(target_idx) else {
+                    panic!(
+                        "reify_fnptr: real sig has more non-Void params than target sig. real:{:?} target:{:?}",
+                        real_inputs, target_inputs
+                    );
+                };
+                assert_eq!(
+                    *real, *target,
+                    "reify_fnptr: real param at non-Void position {target_idx} does not match \
+                     target param. real:{real_inputs:?} target:{target_inputs:?}"
+                );
+                slot_map.push(Some(target_idx));
+                target_idx += 1;
+            }
+        }
+        assert_eq!(
+            target_idx,
+            target_inputs.len(),
+            "reify_fnptr: target sig has params the real sig does not consume. \
+             real:{real_inputs:?} target:{target_inputs:?}"
+        );
+        // Deterministic, collision-free adapter name keyed on the real method + the target sig, so
+        // the adapter is emitted exactly once even across multiple coercion sites (`new_method` is
+        // idempotent for the same MethodRef).
+        let real_name = self[real_ref.name()].to_string();
+        let adapter_name = format!("{real_name}$fnptr_adapter${}", target_sig.inner());
+        let main_module = self.main_module();
+        let adapter_ref = MethodRef::new(
+            *main_module,
+            self.alloc_string(adapter_name.clone()),
+            target_sig,
+            MethodKind::Static,
+            vec![].into(),
+        );
+        let adapter_ref_idx = self.alloc_methodref(adapter_ref);
+        // Build the adapter body: load each real argument from its slot (or an uninit Void value),
+        // call the real method, and return its result.
+        let real_ret = *real_sig.output();
+        let real_ref_idx = self.alloc_methodref(real_ref);
+        let args: Vec<Interned<CILNode>> = slot_map
+            .iter()
+            .map(|slot| match slot {
+                Some(target_index) => self.alloc_node(CILNode::LdArg(*target_index as u32)),
+                None => self.uninit_val(Type::Void),
+            })
+            .collect();
+        let call = self.call(real_ref_idx, &args, IsPure::NOT);
+        let ret_root = if real_ret == Type::Void {
+            self.alloc_root(CILRoot::VoidRet)
+        } else {
+            self.alloc_root(CILRoot::Ret(call))
+        };
+        let block = super::BasicBlock::new(vec![ret_root], 0, None);
+        let arg_names = (0..target_inputs.len()).map(|_| None).collect();
+        let adapter_def = MethodDef::new(
+            Access::Private,
+            main_module,
+            self.alloc_string(adapter_name),
+            target_sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![block],
+                locals: vec![],
+            },
+            arg_names,
+        );
+        self.new_method(adapter_def);
+        self.ld_ftn(adapter_ref_idx)
+    }
+
     /// Loads the length of a platform array `arr`.
     pub fn ld_len(
         &mut self,

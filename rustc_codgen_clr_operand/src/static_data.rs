@@ -276,11 +276,12 @@ fn allocation_initializer_method(
                 // If it is a function, patch its pointer up.
                 let mut ctx = MethodCompileCtx::new(ctx.tcx(), None, finstance, ctx);
                 let call_info = CallInfo::sig_from_instance_(finstance, &mut ctx);
+                let keep_zst_sig = call_info.sig().clone();
                 let function_name = function_name(ctx.tcx().symbol_name(finstance));
                 let mref = MethodRef::new(
                     *ctx.main_module(),
                     ctx.alloc_string(function_name),
-                    ctx.alloc_sig(call_info.sig().clone()),
+                    ctx.alloc_sig(keep_zst_sig.clone()),
                     MethodKind::Static,
                     vec![].into(),
                 );
@@ -290,9 +291,24 @@ fn allocation_initializer_method(
                 let addr = ctx.biop(ld_loc, off, cilly::BinOp::Add);
                 let usize_ptr = ctx.nptr(Type::Int(Int::USize));
                 let addr = ctx.cast_ptr_to(addr, usize_ptr);
-                // val = LdFtn(mref) cast to usize
-                let mref = ctx.alloc_methodref(mref);
-                let ftn = ctx.ld_ftn(mref);
+                // A const `fn`-pointer relocation must store a pointer whose CIL arity matches the
+                // bare `fn`-pointer type it will be invoked through (`from_poly_sig`: receiver-free).
+                // The physical method `mref` keeps every `fn_abi.args` entry, including the closure's
+                // ZST/Ignore receiver, which is always the FIRST arg and is lowered to a `Type::Void`
+                // (`RustVoid`) param. If we stored a plain `ldftn` of that method, a later indirect
+                // `calli` through the narrower fn-ptr type would push too few args and the callee
+                // would read a garbage extra slot (the TLS `LazyStorage::initialize` AccessViolation).
+                // Strip only the leading `Void` receiver param(s) to form the receiver-free target
+                // sig, then route through `reify_fnptr`, which emits an arity-matching adapter thunk
+                // when (and only when) params were elided. A non-leading `Void` (a genuine ZST value
+                // argument) is preserved, so regular `fn`-item pointers keep their exact arity and hit
+                // `reify_fnptr`'s fast path (no adapter, identical to the previous behaviour).
+                let inputs = keep_zst_sig.inputs();
+                let lead_void = inputs.iter().take_while(|t| **t == Type::Void).count();
+                let target_inputs: Vec<Type> = inputs[lead_void..].to_vec();
+                let target_sig = ctx.alloc_sig(FnSig::new(target_inputs, *keep_zst_sig.output()));
+                // val = LdFtn(adapter-or-method) cast to usize
+                let ftn = ctx.reify_fnptr(mref, target_sig);
                 let val = ctx.cast_ptr_to(ftn, Type::Int(Int::USize));
                 trees.push(ctx.alloc_root(CILRoot::StInd(Box::new((
                     addr,

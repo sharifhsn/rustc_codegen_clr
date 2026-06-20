@@ -152,19 +152,10 @@ pub fn handle_rvalue<'tcx>(
                         target_type.mangle(ctx)
                     )
                 };
-                if target_sig == fn_ptr_sig {
-                    let m = ctx.alloc_methodref(call_site);
-                    (vec![], ctx.ld_ftn(m))
-                } else {
-                    eprintln!(
-                        "Possible bug. ClosureFnPointer target:{} and source {} don't match.",
-                        target_type.mangle(ctx),
-                        Type::FnPtr(fn_ptr_sig).mangle(ctx)
-                    );
-                    let m = ctx.alloc_methodref(call_site);
-                    let src = ctx.ld_ftn(m);
-                    (vec![], ctx.cast_ptr_to(src, target_type))
-                }
+                // Route through the adapter-thunk helper: when the physical method has elided
+                // (Void/ZST) params that the fn-ptr type lacks, this synthesises an arity-matching
+                // adapter instead of lying about the pointer's ABI with a bare cast.
+                (vec![], ctx.reify_fnptr(call_site, target_sig))
             }
             _ => panic!(
                 "{} cannot be cast to a fn ptr",
@@ -261,7 +252,7 @@ pub fn handle_rvalue<'tcx>(
         Rvalue::Cast(
             CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer(_), _),
             operand,
-            _target,
+            target,
         ) => {
             let operand_ty = operand.ty(ctx.body(), ctx.tcx());
             operand
@@ -293,8 +284,18 @@ pub fn handle_rvalue<'tcx>(
                 MethodKind::Static,
                 vec![].into(),
             );
-            let m = ctx.alloc_methodref(call_site);
-            (vec![], ctx.ld_ftn(m))
+            // The destination type is a bare `fn`-pointer type built receiver-free (`from_poly_sig`),
+            // so it may have fewer params than the physical method's keep-ZST signature. Reconcile
+            // arity via the adapter-thunk helper (a no-op fast path when the sigs already agree).
+            let target_type = ctx.type_from_cache(*target);
+            if let Type::FnPtr(target_sig) = target_type {
+                (vec![], ctx.reify_fnptr(call_site, target_sig))
+            } else {
+                // Defensive: the destination is not a fn-ptr type (should not happen for
+                // ReifyFnPointer). Fall back to taking the method's address directly.
+                let m = ctx.alloc_methodref(call_site);
+                (vec![], ctx.ld_ftn(m))
+            }
         }
 
         Rvalue::Discriminant(place) => {
