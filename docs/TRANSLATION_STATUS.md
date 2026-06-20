@@ -422,8 +422,8 @@ The benchmark decomposes into 6 layers → workflows:
 | 2 `std` runs on .NET | WF-2, WF-4 | ✅ **DONE** (PAL vertical; surrogate retiring) |
 | 3 Rust→.NET calls | WF-3 | ✅ **DONE** (full BCL, 4256 methods) |
 | 4 errors/panics cross cleanly | WF-6 | ✅ **DONE** (throw-bridge; catch_unwind works) |
-| 5 .NET→Rust export (call Rust from C#) | **WF-7** | 🟢 **P1+P2+P3 core DONE** (C# calls a Rust *library*; string marshalling; Rust *defines* managed classes); ergonomic tail remains |
-| 6 ergonomic packaged library | **WF-8** | ⬜ |
+| 5 .NET→Rust export (call Rust from C#) | **WF-7** | ✅ **DONE** (C# calls a Rust *library*; string marshalling; Rust *defines* managed classes) |
+| 6 ergonomic packaged library | **WF-8** | 🟢 **a/b/c/d DONE** (direct typed calls; ctors; managed-`String` return; **de-mangled type names + struct marshalling**); richer marshalling (Result/Option/Vec) + NuGet remain |
 
 **Layers 1–4 done + WF-7 P1** — the entire Rust→.NET half, error-crossing, AND the core of the reverse
 direction (C# imports a Rust library and calls its functions, §6). What remains: WF-7 P2 (marshalling
@@ -461,10 +461,16 @@ direction (C# imports a Rust library and calls its functions, §6). What remains
   now does this, 6/6 on .NET. **WF-8b DONE** (`fb5fa71`): the comptime interpreter emits a default
   `.ctor`, so C# can `new RustObj()` and call its virtual method (`get_value()`→42,
   `cargo_tests/rust_typedef_cs`). **WF-8c DONE** (`b133a35`): a Rust fn returns a managed `System.String`
-  directly (the 0-arg-managed-getter Void-return codegen bug fixed). **Remaining:** **de-mangled** public
-  types/methods/namespaces; **richer marshalling** (`Result`→exception/`out`, `Option`→nullable,
-  `Vec`/slice↔array/`Span`, struct↔record); NuGet/`.csproj` packaging. (The cargo↔MSBuild build glue is
-  separable tooling, not codegen.)
+  directly (the 0-arg-managed-getter Void-return codegen bug fixed). **WF-8d DONE** (`613dd4b` +
+  struct): **de-mangled type names** (`stable_adt_name` gives a library's exported, non-generic, local
+  types a clean build-stable `Crate.Type` name instead of `rust_export[<hash>].Type`, while keeping
+  foreign/generic types mangled for cross-crate coherence — `::stable` stays byte-identical) **+ struct
+  marshalling** (an exported `#[repr(C)]` struct lowers to a value-type with a backend-synthesized public
+  all-fields `.ctor` + per-field `get_<field>` accessors, so C# does `new Point(2,3)` / `p.get_x()` —
+  `cargo_tests/rust_export_cs` round-trips `point_sum`/`make_point`, 10/10 on .NET). **Remaining:**
+  **richer marshalling** (`Result`→exception/`out`, `Option`→nullable, `Vec`/slice↔array/`Span`);
+  NuGet/`.csproj` packaging + self `.assembly .ver`. (The cargo↔MSBuild build glue is separable tooling,
+  not codegen.)
 - **WF-9** Generic-interop bridge — `RustGeneric<T>` ↔ C# (size-parameterized for `T: unmanaged`,
   boxed/`GCHandle` for managed T; §7). Needed iff the module's public API uses generic containers.
 - **WF-10 (open-ended)** Real-crate soak / hardening — drive an actual dependency-using crate

@@ -14,7 +14,7 @@ use cilly::{
     Assembly, IntoAsmIndex, add, ld_arg, ptr_cast,
     tpe::simd::SIMDVector,
     {
-        Access, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, Float, Int, MethodDef,
+        Access, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, FieldDesc, Float, Int, MethodDef,
         MethodImpl, Type, cilnode::MethodKind,
     },
 };
@@ -78,12 +78,23 @@ fn get_adt<'tcx>(
         ctx.alloc_class_ref(cref)
     } else {
         let cref = ctx.alloc_class_ref(cref);
-        let def = match def.adt_kind() {
+        let adt_kind = def.adt_kind();
+        // A library's exported structs get public accessors synthesized below (see `add_record_accessors`).
+        let is_exported_struct =
+            adt_kind == AdtKind::Struct && stable_adt_name(def, ctx.tcx(), subst).is_some();
+        let class_def = match adt_kind {
             AdtKind::Struct => struct_(name, def, adt_ty, subst, ctx),
             AdtKind::Enum => enum_(name, def, adt_ty, subst, ctx),
             AdtKind::Union => union_(name, def, adt_ty, subst, ctx),
         };
-        ctx.class_def(def).unwrap();
+        // Capture the field list before the def is moved into `class_def` (registration).
+        let accessor_fields = is_exported_struct.then(|| class_def.fields().to_vec());
+        ctx.class_def(class_def).unwrap();
+        // Synthesize accessors only *after* the class is registered — `new_method` requires the owning
+        // ClassDef to already exist in the assembly.
+        if let Some(fields) = accessor_fields {
+            add_record_accessors(cref, &fields, ctx);
+        }
         cref
     }
 }
@@ -682,6 +693,86 @@ fn struct_<'tcx>(
         ),
         has_nonverlaping_layout,
     )
+}
+
+/// Synthesize a public all-fields constructor and per-field getters for an exported value-type struct.
+///
+/// The struct's fields are emitted without a CIL visibility modifier (so they are private to the
+/// assembly); these additive public methods are what let a .NET consumer construct the value
+/// (`new Point(x, y)`) and read its fields (`p.get_x()`). The struct's layout/codegen is unchanged —
+/// only methods are added — so this is a no-op for the `::stable` gate (whose programs are executables
+/// and therefore never `stable_adt_name`-eligible). Follows the `fixed_array` method-synthesis pattern.
+fn add_record_accessors(
+    cref: Interned<ClassRef>,
+    fields: &[(Type, Interned<IString>, Option<u32>)],
+    ctx: &mut MethodCompileCtx<'_, '_>,
+) {
+    // The owning class handle for the synthesized methods (already registered by `get_adt`).
+    let class_idx = ClassDefIdx(cref);
+    // `this` is a managed reference to the value type (as for any value-type instance method).
+    let this_ref = ctx.nref(Type::ClassRef(cref));
+
+    // ---- all-fields constructor: `.ctor(this, f0, f1, ...)`, storing each arg into its field ----
+    let mut ctor_inputs = Vec::with_capacity(fields.len() + 1);
+    ctor_inputs.push(this_ref);
+    ctor_inputs.extend(fields.iter().map(|(tpe, _, _)| *tpe));
+    let ctor_sig = ctx.sig(ctor_inputs, Type::Void);
+    let mut ctor_roots = Vec::with_capacity(fields.len() + 1);
+    let mut ctor_arg_names = Vec::with_capacity(fields.len() + 1);
+    ctor_arg_names.push(Some(ctx.alloc_string("this")));
+    for (i, (tpe, fname, _)) in fields.iter().enumerate() {
+        let field = ctx.alloc_field(FieldDesc::new(cref, *fname, *tpe));
+        let this_addr = ctx.alloc_node(CILNode::LdArg(0));
+        let val = ctx.alloc_node(CILNode::LdArg((i + 1) as u32));
+        ctor_roots.push(ctx.alloc_root(CILRoot::SetField(Box::new((field, this_addr, val)))));
+        ctor_arg_names.push(Some(*fname));
+    }
+    ctor_roots.push(ctx.alloc_root(CILRoot::VoidRet));
+    let ctor_name = ctx.alloc_string(".ctor");
+    // `Access::Extern` (not `Public`): these accessors exist solely for .NET consumers, so nothing in
+    // the Rust crate calls them. `Extern` both emits them as `public` CIL *and* marks them dead-code
+    // roots (like the `#[no_mangle]` exports), so the optimizer's `eliminate_dead_fns` keeps them.
+    ctx.new_method(MethodDef::new(
+        Access::Extern,
+        class_idx,
+        ctor_name,
+        ctor_sig,
+        MethodKind::Constructor,
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(ctor_roots, 0, None)],
+            locals: vec![],
+        },
+        ctor_arg_names,
+    ));
+
+    // ---- per-field getter: `get_<field>(this) -> field_type` ----
+    for (tpe, fname, _) in fields {
+        let getter_name = {
+            let raw = ctx[*fname].to_string();
+            ctx.alloc_string(format!("get_{raw}"))
+        };
+        let getter_sig = ctx.sig([this_ref], *tpe);
+        let field = ctx.alloc_field(FieldDesc::new(cref, *fname, *tpe));
+        let this_addr = ctx.alloc_node(CILNode::LdArg(0));
+        let ld = ctx.alloc_node(CILNode::LdField {
+            addr: this_addr,
+            field,
+        });
+        let ret = ctx.alloc_root(CILRoot::Ret(ld));
+        let this_name = ctx.alloc_string("this");
+        ctx.new_method(MethodDef::new(
+            Access::Extern,
+            class_idx,
+            getter_name,
+            getter_sig,
+            MethodKind::Instance,
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            },
+            vec![Some(this_name)],
+        ));
+    }
 }
 
 fn handle_tag<'tcx>(

@@ -44,6 +44,15 @@ public static class Program
             Check("greet_managed(\"World\")", gm, "Hello, World, from Rust (managed)!", ref pass, ref total);
         }
 
+        // ---- WF-8d: struct marshalling (de-mangled `rust_export.Point` value-type) ----
+        // The Rust struct is referenced directly by its clean name; the backend-synthesized public
+        // constructor + per-field getters make it constructible and readable from C#.
+        rust_export.Point p = new rust_export.Point(2, 3); // inbound: C# value-type -> Rust
+        Check("point_sum(new Point(2,3))", MainModule.point_sum(p), 5, ref pass, ref total);
+        rust_export.Point q = MainModule.make_point(4, 5); // outbound: Rust -> C# value-type
+        Check("make_point(4,5).get_x()", q.get_x(), 4, ref pass, ref total);
+        Check("make_point(4,5).get_y()", q.get_y(), 5, ref pass, ref total);
+
         Console.WriteLine(pass == total ? "PASS" : $"FAIL ({pass}/{total})");
         return pass == total ? 0 : 1;
     }
