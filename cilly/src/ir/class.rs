@@ -311,6 +311,75 @@ impl ClassRef {
         let asm_name = Some(asm.alloc_string("System.Runtime"));
         asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [element].into()))
     }
+    /// Returns a reference to `System.ReadOnlySpan<T>` instantiated at element
+    /// type `element` (a value type, e.g. `System.ReadOnlySpan<uint8>`). Backs
+    /// `FileStream.Write(ReadOnlySpan<byte>)` in the dotnet fs PAL arm.
+    #[must_use]
+    pub fn read_only_span(asm: &mut Assembly, element: Type) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.ReadOnlySpan");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [element].into()))
+    }
+    /// Returns a reference to the class `System.IO.FileStream`, the open-file
+    /// handle backing the dotnet `fs` PAL arm (Read/Write/Seek/Flush/Dispose/
+    /// get_Length).
+    #[must_use]
+    pub fn file_stream(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.IO.FileStream");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to the static class `System.IO.File`
+    /// (Delete/Move/Exists/GetAttributes) for the dotnet `fs` PAL arm.
+    #[must_use]
+    pub fn file(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.IO.File");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to the static class `System.IO.Directory`
+    /// (CreateDirectory/Delete/Exists/GetFileSystemEntries) for the dotnet `fs`
+    /// PAL arm.
+    #[must_use]
+    pub fn directory(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.IO.Directory");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to the class `System.IO.FileInfo`
+    /// (`new FileInfo(string).get_Length`) for sizing files in the dotnet `fs`
+    /// PAL arm.
+    #[must_use]
+    pub fn file_info(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.IO.FileInfo");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to the int-backed enum `System.IO.FileMode` (a value
+    /// type) — needed so `new FileStream(string, FileMode, FileAccess)` resolves
+    /// to a real BCL ctor (an `int32` would not match the parameter type).
+    #[must_use]
+    pub fn file_mode(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.IO.FileMode");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
+    }
+    /// Returns a reference to the int-backed enum `System.IO.FileAccess` (a value
+    /// type) — paired with [`Self::file_mode`] for the `FileStream` ctor.
+    #[must_use]
+    pub fn file_access(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.IO.FileAccess");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
+    }
+    /// Returns a reference to the int-backed enum `System.IO.SeekOrigin` (a value
+    /// type) — for `FileStream.Seek(long, SeekOrigin)`.
+    #[must_use]
+    pub fn seek_origin(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.IO.SeekOrigin");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
+    }
     /// Returns a reference to the class
     /// `System.Security.Cryptography.RandomNumberGenerator`.
     #[must_use]

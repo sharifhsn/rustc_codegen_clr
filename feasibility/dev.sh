@@ -270,6 +270,13 @@ fi
 # System.Threading.Thread / System.Environment via the rcl_dotnet_thread_* and
 # rcl_dotnet_available_parallelism hooks (see cilly/src/ir/builtins/dotnet.rs).
 [ -f "$PAL/thread/dotnet.rs" ]       && inject_arm thread/mod.rs       'mod dotnet; pub use dotnet::*;'
+# fs/mod.rs uses the `mod X; use X as imp;` cascade shape (the `_` arm is
+# `mod unsupported; use unsupported as imp;`), then re-exports
+# `imp::{Dir, DirBuilder, DirEntry, File, FileAttr, FilePermissions, FileTimes,
+# FileType, OpenOptions, ReadDir}`. The dotnet arm backs std::fs with System.IO
+# (FileStream/File/Directory/FileInfo) via the rcl_dotnet_fs_* hooks (see
+# cilly/src/ir/builtins/dotnet.rs). fs cascade is block 1 (default nth).
+[ -f "$PAL/fs/dotnet.rs" ]           && inject_arm fs/mod.rs           'mod dotnet; use dotnet as imp;'
 # personality/mod.rs holds the `eh_personality` lang item. With panic=unwind,
 # rustc's front-end requires that lang item to EXIST (the missing-eh_personality
 # weak-lang-item check that emits "unwinding panics are not supported without

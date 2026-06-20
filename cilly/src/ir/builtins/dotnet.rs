@@ -43,7 +43,40 @@
 //! * `rcl_dotnet_cotaskmem_free(ptr)` => `Marshal.FreeCoTaskMem((IntPtr)ptr)`
 //!   (frees buffers returned by `rcl_dotnet_arg` / `rcl_dotnet_getenv`).
 //!
-//! See also `dotnet_pal/sys/args/dotnet.rs` and `dotnet_pal/sys/env/dotnet.rs`.
+//! Filesystem (`sys/fs/dotnet.rs`), backed by `System.IO`. Paths arrive as
+//! `(ptr, len)` UTF-8 buffers; open files / dir snapshots are opaque `GCHandle`
+//! `IntPtr`s (never managed objects through the ABI):
+//! * `rcl_dotnet_fs_open(path_ptr, path_len, mode, access, append) -> *mut u8`
+//!   => `new FileStream(path, (FileMode)mode, (FileAccess)access)`, `GCHandle`-pinned.
+//! * `rcl_dotnet_fs_read(handle, buf_ptr, len) -> isize`
+//!   => `FileStream.Read(new Span<byte>(buf_ptr, (int)len))`.
+//! * `rcl_dotnet_fs_write(handle, buf_ptr, len) -> isize`
+//!   => `FileStream.Write(new ReadOnlySpan<byte>(buf_ptr, (int)len))`; returns `len`.
+//! * `rcl_dotnet_fs_seek(handle, offset, origin) -> i64`
+//!   => `FileStream.Seek(offset, (SeekOrigin)origin)`.
+//! * `rcl_dotnet_fs_flush(handle)`  => `FileStream.Flush()`.
+//! * `rcl_dotnet_fs_close(handle)`  => `FileStream.Dispose()` + free the `GCHandle`.
+//! * `rcl_dotnet_fs_len(handle) -> i64` => `FileStream.get_Length`.
+//! * `rcl_dotnet_fs_stat(path_ptr, path_len, out_size, out_is_dir) -> i32`
+//!   => `Directory.Exists` ? (size 0, dir) : `File.Exists` ? (FileInfo.Length, file)
+//!      : `-1` (NotFound). Fills `out_size`/`out_is_dir` via `StInd`.
+//! * `rcl_dotnet_fs_exists(path_ptr, path_len) -> i32`
+//!   => `(File.Exists || Directory.Exists) ? 1 : 0` (never errno-based).
+//! * `rcl_dotnet_fs_mkdir(path_ptr, path_len) -> i32`  => `Directory.CreateDirectory`.
+//! * `rcl_dotnet_fs_rmdir(path_ptr, path_len) -> i32`  => `Directory.Delete(path, false)`.
+//! * `rcl_dotnet_fs_unlink(path_ptr, path_len) -> i32` => `File.Delete(path)`.
+//! * `rcl_dotnet_fs_rename(old_ptr, old_len, new_ptr, new_len) -> i32`
+//!   => `File.Move(old, new, true)`.
+//! * `rcl_dotnet_fs_readdir_open(path_ptr, path_len) -> *mut u8`
+//!   => `Directory.GetFileSystemEntries(path)` (a `string[]`), `GCHandle`-pinned.
+//! * `rcl_dotnet_fs_readdir_count(handle) -> usize`     => `array.Length`.
+//! * `rcl_dotnet_fs_readdir_get(handle, idx) -> *mut u8`
+//!   => `Marshal.StringToCoTaskMemUTF8(array[idx])` (caller frees with
+//!      `rcl_dotnet_cotaskmem_free`).
+//! * `rcl_dotnet_fs_readdir_close(handle)`              => free the `GCHandle`.
+//!
+//! See also `dotnet_pal/sys/args/dotnet.rs`, `dotnet_pal/sys/env/dotnet.rs`,
+//! and `dotnet_pal/sys/fs/dotnet.rs`.
 //!
 //! `realloc` is handled std-side via `realloc_fallback` (alloc+copy+free) and
 //! `alloc_zeroed` via `rcl_dotnet_alloc` + zeroing, so those do not need their
@@ -77,6 +110,7 @@ pub fn insert_dotnet_pal(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
     insert_dotnet_cotaskmem_free(asm, patcher);
     insert_dotnet_args(asm, patcher);
     insert_dotnet_env(asm, patcher);
+    insert_dotnet_fs(asm, patcher);
 }
 
 /// `rcl_dotnet_instant_ticks() -> i64`
@@ -1003,4 +1037,761 @@ fn insert_dotnet_env(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         }
     };
     patcher.insert(unsetenv_name, Box::new(unsetenv_gen));
+}
+
+// ===========================================================================
+// fs (`sys/fs/dotnet.rs`)
+//
+// Backs std::fs with System.IO. An open file is a `GCHandle` to a `FileStream`;
+// a `read_dir` snapshot is a `GCHandle` to a `string[]`. Paths arrive as
+// `(ptr, len)` UTF-8 buffers (the same `decode_utf8` mechanism args/env use).
+// All handles cross the Rust ABI as opaque `IntPtr`/`*mut u8` — no managed
+// object is ever passed through a Rust signature.
+// ===========================================================================
+
+/// Recover the managed object pinned by an `IntPtr`/`*mut u8` handle (the value
+/// `ref_to_handle` produced) and `castclass` it to `class`, leaving the typed
+/// object node on the stack. Mirrors the handle round-trip in
+/// `insert_dotnet_thread_join`.
+fn handle_to_class(
+    asm: &mut Assembly,
+    handle_arg: u32,
+    class: Interned<ClassRef>,
+) -> Interned<CILNode> {
+    let arg = asm.alloc_node(CILNode::LdArg(handle_arg));
+    let handle_isize = asm.alloc_node(CILNode::PtrCast(arg, Box::new(PtrCastRes::ISize)));
+    let handle_to_obj = asm.alloc_string("handle_to_obj");
+    let main_module = asm.main_module();
+    let handle_to_obj = asm.class_ref(*main_module).clone().static_mref(
+        &[Type::Int(Int::ISize)],
+        Type::PlatformObject,
+        handle_to_obj,
+        asm,
+    );
+    let obj = asm.alloc_node(CILNode::call(handle_to_obj, [handle_isize]));
+    let class_ty = asm.alloc_type(Type::ClassRef(class));
+    asm.alloc_node(CILNode::CheckedCast(obj, class_ty))
+}
+
+/// Build the roots that free the `GCHandle` whose `IntPtr` is `LdArg(handle_arg)`:
+/// `GCHandle.FromIntPtr((nint)handle).Free();`, stowing the handle in local
+/// `gch_local`. Mirrors the free dance in `insert_dotnet_thread_join`.
+fn free_handle_roots(
+    asm: &mut Assembly,
+    handle_arg: u32,
+    gch_local: u32,
+) -> (Interned<CILRoot>, Interned<CILRoot>, Interned<Type>) {
+    let gc_handle = ClassRef::gc_handle(asm);
+    let from_int_ptr = asm.alloc_string("FromIntPtr");
+    let from_int_ptr = asm.class_ref(gc_handle).clone().static_mref(
+        &[Type::Int(Int::ISize)],
+        Type::ClassRef(gc_handle),
+        from_int_ptr,
+        asm,
+    );
+    let arg = asm.alloc_node(CILNode::LdArg(handle_arg));
+    let handle_isize = asm.alloc_node(CILNode::PtrCast(arg, Box::new(PtrCastRes::ISize)));
+    let gch = asm.alloc_node(CILNode::call(from_int_ptr, [handle_isize]));
+    let store_gch = asm.alloc_root(CILRoot::StLoc(gch_local, gch));
+    let free = asm.alloc_string("Free");
+    let free = asm
+        .class_ref(gc_handle)
+        .clone()
+        .instance(&[], Type::Void, free, asm);
+    let gch_addr = asm.alloc_node(CILNode::LdLocA(gch_local));
+    let free = asm.alloc_root(CILRoot::call(free, [gch_addr]));
+    let gc_handle_ty = asm.alloc_type(Type::ClassRef(gc_handle));
+    (store_gch, free, gc_handle_ty)
+}
+
+/// Build a `System.Span<byte>` (or `ReadOnlySpan<byte>` when `read_only`) from
+/// the `(buf_ptr, len)` pair at `LdArg(ptr_arg)` / `LdArg(len_arg)`, via the
+/// span's `(void*, int32)` ctor. Mirrors `insert_dotnet_random_fill`.
+fn build_byte_span(
+    asm: &mut Assembly,
+    ptr_arg: u32,
+    len_arg: u32,
+    read_only: bool,
+) -> (Interned<CILNode>, Type) {
+    let void_ptr = asm.nptr(Type::Void);
+    let byte_ty = Type::Int(Int::U8);
+    let span = if read_only {
+        ClassRef::read_only_span(asm, byte_ty)
+    } else {
+        ClassRef::span(asm, byte_ty)
+    };
+    let span_ty = Type::ClassRef(span);
+    let ctor_sig = asm.sig([span_ty, void_ptr, Type::Int(Int::I32)], Type::Void);
+    let ctor_name = asm.alloc_string(".ctor");
+    let ctor = asm.alloc_methodref(MethodRef::new(
+        span,
+        ctor_name,
+        ctor_sig,
+        MethodKind::Constructor,
+        [].into(),
+    ));
+    let ptr = asm.alloc_node(CILNode::LdArg(ptr_arg));
+    let ptr = asm.cast_ptr(ptr, void_ptr);
+    let len = asm.alloc_node(CILNode::LdArg(len_arg));
+    let len_i32 = asm.int_cast(len, Int::I32, ExtendKind::ZeroExtend);
+    let span_node = asm.alloc_node(CILNode::call(ctor, [ptr, len_i32]));
+    (span_node, span_ty)
+}
+
+/// Registers all `rcl_dotnet_fs_*` BCL bindings (System.IO) in `patcher`.
+fn insert_dotnet_fs(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    insert_dotnet_fs_open(asm, patcher);
+    insert_dotnet_fs_read(asm, patcher);
+    insert_dotnet_fs_write(asm, patcher);
+    insert_dotnet_fs_seek(asm, patcher);
+    insert_dotnet_fs_flush(asm, patcher);
+    insert_dotnet_fs_close(asm, patcher);
+    insert_dotnet_fs_len(asm, patcher);
+    insert_dotnet_fs_stat(asm, patcher);
+    insert_dotnet_fs_exists(asm, patcher);
+    insert_dotnet_fs_mkdir(asm, patcher);
+    insert_dotnet_fs_rmdir(asm, patcher);
+    insert_dotnet_fs_unlink(asm, patcher);
+    insert_dotnet_fs_rename(asm, patcher);
+    insert_dotnet_fs_readdir_open(asm, patcher);
+    insert_dotnet_fs_readdir_count(asm, patcher);
+    insert_dotnet_fs_readdir_get(asm, patcher);
+    insert_dotnet_fs_readdir_close(asm, patcher);
+}
+
+/// `rcl_dotnet_fs_open(path_ptr, path_len, mode, access, append) -> *mut u8`
+///   => `new FileStream(path, (FileMode)mode, (FileAccess)access)`, returned as
+///      an opaque `GCHandle` `IntPtr`.
+///
+/// `FileMode`/`FileAccess` are int-backed enums; the std side computes the int
+/// values, so we pass `mode`/`access` straight to the ctor. The `append` arg is
+/// unused here: std maps an append open to `FileMode.Append`, which positions
+/// the stream at end-of-file itself. On a managed I/O fault the exception
+/// unwinds (the std side never sees null, mirroring the other handle hooks).
+fn insert_dotnet_fs_open(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_open");
+    let generator = move |_, asm: &mut Assembly| {
+        let path = decode_utf8(asm, 0, 1);
+        let mode = asm.alloc_node(CILNode::LdArg(2));
+        let access = asm.alloc_node(CILNode::LdArg(3));
+        // new FileStream(string, FileMode, FileAccess). FileMode/FileAccess are
+        // int-backed enum value types; an `int32` on the stack is binary
+        // compatible, so the args feed straight in, but the ctor *signature*
+        // must name the enum types or method resolution fails (the BCL has no
+        // `(string, int, int)` ctor).
+        let file_stream = ClassRef::file_stream(asm);
+        let file_mode = Type::ClassRef(ClassRef::file_mode(asm));
+        let file_access = Type::ClassRef(ClassRef::file_access(asm));
+        let ctor = asm
+            .class_ref(file_stream)
+            .clone()
+            .ctor(&[Type::PlatformString, file_mode, file_access], asm);
+        let stream = asm.alloc_node(CILNode::call(ctor, [path, mode, access]));
+        let store = asm.alloc_root(CILRoot::StLoc(0, stream));
+        // return (void*)GCHandle.Alloc(stream)
+        let handle = CILNode::LdLoc(0).ref_to_handle(asm);
+        let handle = asm.alloc_node(handle);
+        let void = asm.alloc_type(Type::Void);
+        let handle = asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::Ptr(void))));
+        let ret = asm.alloc_root(CILRoot::Ret(handle));
+        let stream_ty = asm.alloc_type(Type::ClassRef(file_stream));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![store, ret], 0, None)],
+            locals: vec![(Some(asm.alloc_string("stream")), stream_ty)],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_read(handle, buf_ptr, len) -> isize`
+///   => `FileStream.Read(new Span<byte>(buf_ptr, (int)len))` (count read).
+fn insert_dotnet_fs_read(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_read");
+    let generator = move |_, asm: &mut Assembly| {
+        let file_stream = ClassRef::file_stream(asm);
+        let stream = handle_to_class(asm, 0, file_stream);
+        let (span, span_ty) = build_byte_span(asm, 1, 2, false);
+        let read_name = asm.alloc_string("Read");
+        let read = asm.class_ref(file_stream).clone().instance(
+            &[span_ty],
+            Type::Int(Int::I32),
+            read_name,
+            asm,
+        );
+        let count = asm.alloc_node(CILNode::call(read, [stream, span]));
+        let count = asm.int_cast(count, Int::ISize, ExtendKind::SignExtend);
+        let ret = asm.alloc_root(CILRoot::Ret(count));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_write(handle, buf_ptr, len) -> isize`
+///   => `FileStream.Write(new ReadOnlySpan<byte>(buf_ptr, (int)len))`; returns
+///      `len` (the BCL `Write(ReadOnlySpan<byte>)` overload writes all of it or
+///      throws).
+fn insert_dotnet_fs_write(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_write");
+    let generator = move |_, asm: &mut Assembly| {
+        let file_stream = ClassRef::file_stream(asm);
+        let stream = handle_to_class(asm, 0, file_stream);
+        let (span, span_ty) = build_byte_span(asm, 1, 2, true);
+        let write_name = asm.alloc_string("Write");
+        let write = asm.class_ref(file_stream).clone().instance(
+            &[span_ty],
+            Type::Void,
+            write_name,
+            asm,
+        );
+        let write = asm.alloc_root(CILRoot::call(write, [stream, span]));
+        let len = asm.alloc_node(CILNode::LdArg(2));
+        let len = asm.int_cast(len, Int::ISize, ExtendKind::ZeroExtend);
+        let ret = asm.alloc_root(CILRoot::Ret(len));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![write, ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_seek(handle, offset: i64, origin: i32) -> i64`
+///   => `FileStream.Seek(offset, (SeekOrigin)origin)` (new absolute position).
+///
+/// `offset` is a signed 64-bit value (it may be negative for `SeekFrom::End` /
+/// `Current`), so it is loaded as-is — never zero-extended.
+fn insert_dotnet_fs_seek(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_seek");
+    let generator = move |_, asm: &mut Assembly| {
+        let file_stream = ClassRef::file_stream(asm);
+        let stream = handle_to_class(asm, 0, file_stream);
+        let offset = asm.alloc_node(CILNode::LdArg(1));
+        let origin = asm.alloc_node(CILNode::LdArg(2));
+        let seek_name = asm.alloc_string("Seek");
+        // FileStream.Seek(long, SeekOrigin) — the second param is the int-backed
+        // SeekOrigin enum value type (an int32 is binary compatible on the stack).
+        let seek_origin = Type::ClassRef(ClassRef::seek_origin(asm));
+        let seek = asm.class_ref(file_stream).clone().instance(
+            &[Type::Int(Int::I64), seek_origin],
+            Type::Int(Int::I64),
+            seek_name,
+            asm,
+        );
+        let pos = asm.alloc_node(CILNode::call(seek, [stream, offset, origin]));
+        let ret = asm.alloc_root(CILRoot::Ret(pos));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_flush(handle)` => `FileStream.Flush()`.
+fn insert_dotnet_fs_flush(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_flush");
+    let generator = move |_, asm: &mut Assembly| {
+        let file_stream = ClassRef::file_stream(asm);
+        let stream = handle_to_class(asm, 0, file_stream);
+        let flush_name = asm.alloc_string("Flush");
+        let flush = asm.class_ref(file_stream).clone().instance(
+            &[],
+            Type::Void,
+            flush_name,
+            asm,
+        );
+        let flush = asm.alloc_root(CILRoot::call(flush, [stream]));
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![flush, ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_close(handle)` => `FileStream.Dispose()` then free the
+/// `GCHandle` so the stream can be collected.
+fn insert_dotnet_fs_close(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_close");
+    let generator = move |_, asm: &mut Assembly| {
+        let file_stream = ClassRef::file_stream(asm);
+        let stream = handle_to_class(asm, 0, file_stream);
+        let dispose_name = asm.alloc_string("Dispose");
+        let dispose = asm.class_ref(file_stream).clone().instance(
+            &[],
+            Type::Void,
+            dispose_name,
+            asm,
+        );
+        let dispose = asm.alloc_root(CILRoot::call(dispose, [stream]));
+        let (store_gch, free, gc_handle_ty) = free_handle_roots(asm, 0, 0);
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![dispose, store_gch, free, ret], 0, None)],
+            locals: vec![(Some(asm.alloc_string("gch")), gc_handle_ty)],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_len(handle) -> i64` => `FileStream.get_Length`.
+fn insert_dotnet_fs_len(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_len");
+    let generator = move |_, asm: &mut Assembly| {
+        let file_stream = ClassRef::file_stream(asm);
+        let stream = handle_to_class(asm, 0, file_stream);
+        let get_len_name = asm.alloc_string("get_Length");
+        let get_len = asm.class_ref(file_stream).clone().instance(
+            &[],
+            Type::Int(Int::I64),
+            get_len_name,
+            asm,
+        );
+        let len = asm.alloc_node(CILNode::call(get_len, [stream]));
+        let ret = asm.alloc_root(CILRoot::Ret(len));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_stat(path_ptr, path_len, out_size: *mut u64, out_is_dir: *mut i32) -> i32`
+///   => `Directory.Exists(path)` ? write (size 0, is_dir 1), return 0
+///      : `File.Exists(path)`    ? write (FileInfo.Length, is_dir 0), return 0
+///      : return -1 (NotFound — the std side maps -1 to `ErrorKind::NotFound`).
+fn insert_dotnet_fs_stat(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_stat");
+    let generator = move |_, asm: &mut Assembly| {
+        let directory = ClassRef::directory(asm);
+        let file = ClassRef::file(asm);
+        let file_info = ClassRef::file_info(asm);
+
+        // Decode the path once into local 0 (it is re-read in two blocks).
+        let path = decode_utf8(asm, 0, 1);
+        let store_path = asm.alloc_root(CILRoot::StLoc(0, path));
+
+        // Block 0: if Directory.Exists(path) goto dir(1) else goto file_check(2).
+        let dir_exists_name = asm.alloc_string("Exists");
+        let dir_exists = asm.class_ref(directory).clone().static_mref(
+            &[Type::PlatformString],
+            Type::Bool,
+            dir_exists_name,
+            asm,
+        );
+        let path0 = asm.alloc_node(CILNode::LdLoc(0));
+        let is_dir = asm.alloc_node(CILNode::call(dir_exists, [path0]));
+        let truec = asm.alloc_node(true);
+        let br_dir = asm.alloc_root(CILRoot::Branch(Box::new((
+            1,
+            0,
+            Some(BranchCond::Eq(is_dir, truec)),
+        ))));
+        let goto_file = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None))));
+
+        // Block 1 (dir): *out_size = 0; *out_is_dir = 1; return 0.
+        let out_size1 = asm.alloc_node(CILNode::LdArg(2));
+        let zero_u64 = asm.alloc_node(0_u64);
+        let st_size1 = asm.alloc_root(CILRoot::StInd(Box::new((
+            out_size1,
+            zero_u64,
+            Type::Int(Int::U64),
+            false,
+        ))));
+        let out_isdir1 = asm.alloc_node(CILNode::LdArg(3));
+        let one_i32 = asm.alloc_node(1_i32);
+        let st_isdir1 = asm.alloc_root(CILRoot::StInd(Box::new((
+            out_isdir1,
+            one_i32,
+            Type::Int(Int::I32),
+            false,
+        ))));
+        let zero_ret1 = asm.alloc_node(0_i32);
+        let ret_dir = asm.alloc_root(CILRoot::Ret(zero_ret1));
+
+        // Block 2 (file_check): if File.Exists(path) goto file(3) else notfound(4).
+        let file_exists_name = asm.alloc_string("Exists");
+        let file_exists = asm.class_ref(file).clone().static_mref(
+            &[Type::PlatformString],
+            Type::Bool,
+            file_exists_name,
+            asm,
+        );
+        let path2 = asm.alloc_node(CILNode::LdLoc(0));
+        let is_file = asm.alloc_node(CILNode::call(file_exists, [path2]));
+        let truec2 = asm.alloc_node(true);
+        let br_file = asm.alloc_root(CILRoot::Branch(Box::new((
+            3,
+            0,
+            Some(BranchCond::Eq(is_file, truec2)),
+        ))));
+        let goto_notfound = asm.alloc_root(CILRoot::Branch(Box::new((4, 0, None))));
+
+        // Block 3 (file): size = new FileInfo(path).Length; *out_size = (u64)size;
+        //                 *out_is_dir = 0; return 0.
+        let fi_ctor = asm
+            .class_ref(file_info)
+            .clone()
+            .ctor(&[Type::PlatformString], asm);
+        let path3 = asm.alloc_node(CILNode::LdLoc(0));
+        let fi = asm.alloc_node(CILNode::call(fi_ctor, [path3]));
+        let store_fi = asm.alloc_root(CILRoot::StLoc(1, fi));
+        let get_len_name = asm.alloc_string("get_Length");
+        let get_len = asm.class_ref(file_info).clone().instance(
+            &[],
+            Type::Int(Int::I64),
+            get_len_name,
+            asm,
+        );
+        let ld_fi = asm.alloc_node(CILNode::LdLoc(1));
+        let size_i64 = asm.alloc_node(CILNode::call(get_len, [ld_fi]));
+        let size_u64 = asm.int_cast(size_i64, Int::U64, ExtendKind::ZeroExtend);
+        let out_size3 = asm.alloc_node(CILNode::LdArg(2));
+        let st_size3 = asm.alloc_root(CILRoot::StInd(Box::new((
+            out_size3,
+            size_u64,
+            Type::Int(Int::U64),
+            false,
+        ))));
+        let out_isdir3 = asm.alloc_node(CILNode::LdArg(3));
+        let zero_i32_3 = asm.alloc_node(0_i32);
+        let st_isdir3 = asm.alloc_root(CILRoot::StInd(Box::new((
+            out_isdir3,
+            zero_i32_3,
+            Type::Int(Int::I32),
+            false,
+        ))));
+        let zero_ret3 = asm.alloc_node(0_i32);
+        let ret_file = asm.alloc_root(CILRoot::Ret(zero_ret3));
+
+        // Block 4 (notfound): return -1.
+        let neg1 = asm.alloc_node(-1_i32);
+        let ret_nf = asm.alloc_root(CILRoot::Ret(neg1));
+
+        let string_ty = asm.alloc_type(Type::PlatformString);
+        let file_info_ty = asm.alloc_type(Type::ClassRef(file_info));
+        MethodImpl::MethodBody {
+            blocks: vec![
+                BasicBlock::new(vec![store_path, br_dir, goto_file], 0, None),
+                BasicBlock::new(vec![st_size1, st_isdir1, ret_dir], 1, None),
+                BasicBlock::new(vec![br_file, goto_notfound], 2, None),
+                BasicBlock::new(vec![store_fi, st_size3, st_isdir3, ret_file], 3, None),
+                BasicBlock::new(vec![ret_nf], 4, None),
+            ],
+            locals: vec![
+                (Some(asm.alloc_string("path")), string_ty),
+                (Some(asm.alloc_string("file_info")), file_info_ty),
+            ],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_exists(path_ptr, path_len) -> i32`
+///   => `(File.Exists(path) || Directory.Exists(path)) ? 1 : 0`.
+///
+/// Never errno-based: the std side uses this for `Path::exists`, which must not
+/// surface the `Uncategorized` io-error trap on a missing path.
+fn insert_dotnet_fs_exists(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_exists");
+    let generator = move |_, asm: &mut Assembly| {
+        let file = ClassRef::file(asm);
+        let directory = ClassRef::directory(asm);
+        let path = decode_utf8(asm, 0, 1);
+        let store_path = asm.alloc_root(CILRoot::StLoc(0, path));
+
+        // Block 0: if File.Exists(path) goto yes(1) else goto dir_check(2).
+        let file_exists_name = asm.alloc_string("Exists");
+        let file_exists = asm.class_ref(file).clone().static_mref(
+            &[Type::PlatformString],
+            Type::Bool,
+            file_exists_name,
+            asm,
+        );
+        let p0 = asm.alloc_node(CILNode::LdLoc(0));
+        let is_file = asm.alloc_node(CILNode::call(file_exists, [p0]));
+        let truec = asm.alloc_node(true);
+        let br_yes = asm.alloc_root(CILRoot::Branch(Box::new((
+            1,
+            0,
+            Some(BranchCond::Eq(is_file, truec)),
+        ))));
+        let goto_dir = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None))));
+
+        // Block 1 (yes): return 1.
+        let one = asm.alloc_node(1_i32);
+        let ret_yes = asm.alloc_root(CILRoot::Ret(one));
+
+        // Block 2 (dir_check): if Directory.Exists(path) goto yes2(3) else no(4).
+        let dir_exists_name = asm.alloc_string("Exists");
+        let dir_exists = asm.class_ref(directory).clone().static_mref(
+            &[Type::PlatformString],
+            Type::Bool,
+            dir_exists_name,
+            asm,
+        );
+        let p2 = asm.alloc_node(CILNode::LdLoc(0));
+        let is_dir = asm.alloc_node(CILNode::call(dir_exists, [p2]));
+        let truec2 = asm.alloc_node(true);
+        let br_yes2 = asm.alloc_root(CILRoot::Branch(Box::new((
+            3,
+            0,
+            Some(BranchCond::Eq(is_dir, truec2)),
+        ))));
+        let goto_no = asm.alloc_root(CILRoot::Branch(Box::new((4, 0, None))));
+
+        // Block 3 (yes2): return 1.
+        let one2 = asm.alloc_node(1_i32);
+        let ret_yes2 = asm.alloc_root(CILRoot::Ret(one2));
+
+        // Block 4 (no): return 0.
+        let zero = asm.alloc_node(0_i32);
+        let ret_no = asm.alloc_root(CILRoot::Ret(zero));
+
+        let string_ty = asm.alloc_type(Type::PlatformString);
+        MethodImpl::MethodBody {
+            blocks: vec![
+                BasicBlock::new(vec![store_path, br_yes, goto_dir], 0, None),
+                BasicBlock::new(vec![ret_yes], 1, None),
+                BasicBlock::new(vec![br_yes2, goto_no], 2, None),
+                BasicBlock::new(vec![ret_yes2], 3, None),
+                BasicBlock::new(vec![ret_no], 4, None),
+            ],
+            locals: vec![(Some(asm.alloc_string("path")), string_ty)],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// Shared shape for the path-in/`i32`-out fs hooks (`mkdir`/`rmdir`/`unlink`):
+/// decode the path, issue one static System.IO call (consuming any result), and
+/// return 0. A managed fault unwinds rather than returning a non-zero code.
+fn insert_path_to_rc(
+    asm: &mut Assembly,
+    patcher: &mut MissingMethodPatcher,
+    symbol: &str,
+    build_call: impl Fn(&mut Assembly, Interned<CILNode>) -> Interned<CILRoot> + 'static,
+) {
+    let name = asm.alloc_string(symbol);
+    let generator = move |_, asm: &mut Assembly| {
+        let path = decode_utf8(asm, 0, 1);
+        let call = build_call(asm, path);
+        let zero = asm.alloc_node(0_i32);
+        let ret = asm.alloc_root(CILRoot::Ret(zero));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![call, ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_mkdir(path_ptr, path_len) -> i32`
+///   => `Directory.CreateDirectory(path)` (result `DirectoryInfo` popped); 0.
+fn insert_dotnet_fs_mkdir(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    insert_path_to_rc(asm, patcher, "rcl_dotnet_fs_mkdir", |asm, path| {
+        let directory = ClassRef::directory(asm);
+        // CreateDirectory(string) -> DirectoryInfo (a reference type).
+        let dir_info = {
+            let n = asm.alloc_string("System.IO.DirectoryInfo");
+            let a = Some(asm.alloc_string("System.Runtime"));
+            asm.alloc_class_ref(ClassRef::new(n, a, false, [].into()))
+        };
+        let create_name = asm.alloc_string("CreateDirectory");
+        let create = asm.class_ref(directory).clone().static_mref(
+            &[Type::PlatformString],
+            Type::ClassRef(dir_info),
+            create_name,
+            asm,
+        );
+        let info = asm.alloc_node(CILNode::call(create, [path]));
+        asm.alloc_root(CILRoot::Pop(info))
+    });
+}
+
+/// `rcl_dotnet_fs_rmdir(path_ptr, path_len) -> i32`
+///   => `Directory.Delete(path, recursive: false)`; 0.
+fn insert_dotnet_fs_rmdir(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    insert_path_to_rc(asm, patcher, "rcl_dotnet_fs_rmdir", |asm, path| {
+        let directory = ClassRef::directory(asm);
+        let delete_name = asm.alloc_string("Delete");
+        let delete = asm.class_ref(directory).clone().static_mref(
+            &[Type::PlatformString, Type::Bool],
+            Type::Void,
+            delete_name,
+            asm,
+        );
+        let falsec = asm.alloc_node(false);
+        asm.alloc_root(CILRoot::call(delete, [path, falsec]))
+    });
+}
+
+/// `rcl_dotnet_fs_unlink(path_ptr, path_len) -> i32` => `File.Delete(path)`; 0.
+fn insert_dotnet_fs_unlink(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    insert_path_to_rc(asm, patcher, "rcl_dotnet_fs_unlink", |asm, path| {
+        let file = ClassRef::file(asm);
+        let delete_name = asm.alloc_string("Delete");
+        let delete = asm.class_ref(file).clone().static_mref(
+            &[Type::PlatformString],
+            Type::Void,
+            delete_name,
+            asm,
+        );
+        asm.alloc_root(CILRoot::call(delete, [path]))
+    });
+}
+
+/// `rcl_dotnet_fs_rename(old_ptr, old_len, new_ptr, new_len) -> i32`
+///   => `File.Move(old, new, overwrite: true)`; 0.
+fn insert_dotnet_fs_rename(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_rename");
+    let generator = move |_, asm: &mut Assembly| {
+        let old = decode_utf8(asm, 0, 1);
+        let new = decode_utf8(asm, 2, 3);
+        let file = ClassRef::file(asm);
+        let move_name = asm.alloc_string("Move");
+        let mv = asm.class_ref(file).clone().static_mref(
+            &[Type::PlatformString, Type::PlatformString, Type::Bool],
+            Type::Void,
+            move_name,
+            asm,
+        );
+        let truec = asm.alloc_node(true);
+        let call = asm.alloc_root(CILRoot::call(mv, [old, new, truec]));
+        let zero = asm.alloc_node(0_i32);
+        let ret = asm.alloc_root(CILRoot::Ret(zero));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![call, ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_readdir_open(path_ptr, path_len) -> *mut u8`
+///   => `Directory.GetFileSystemEntries(path)` (a `string[]`), returned as an
+///      opaque `GCHandle` `IntPtr`.
+fn insert_dotnet_fs_readdir_open(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_readdir_open");
+    let generator = move |_, asm: &mut Assembly| {
+        let string = asm.alloc_type(Type::PlatformString);
+        let string_arr = Type::PlatformArray {
+            elem: string,
+            dims: NonZeroU8::new(1).unwrap(),
+        };
+        let path = decode_utf8(asm, 0, 1);
+        let directory = ClassRef::directory(asm);
+        let entries_name = asm.alloc_string("GetFileSystemEntries");
+        let entries = asm.class_ref(directory).clone().static_mref(
+            &[Type::PlatformString],
+            string_arr,
+            entries_name,
+            asm,
+        );
+        let arr = asm.alloc_node(CILNode::call(entries, [path]));
+        let store = asm.alloc_root(CILRoot::StLoc(0, arr));
+        let handle = CILNode::LdLoc(0).ref_to_handle(asm);
+        let handle = asm.alloc_node(handle);
+        let void = asm.alloc_type(Type::Void);
+        let handle = asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::Ptr(void))));
+        let ret = asm.alloc_root(CILRoot::Ret(handle));
+        let arr_ty = asm.alloc_type(string_arr);
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![store, ret], 0, None)],
+            locals: vec![(Some(asm.alloc_string("entries")), arr_ty)],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_readdir_count(handle) -> usize` => `string[].Length`.
+fn insert_dotnet_fs_readdir_count(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_readdir_count");
+    let generator = move |_, asm: &mut Assembly| {
+        let string = asm.alloc_type(Type::PlatformString);
+        let string_arr = Type::PlatformArray {
+            elem: string,
+            dims: NonZeroU8::new(1).unwrap(),
+        };
+        // handle -> object -> (string[]) via the array's value-type-less castclass.
+        let arg = asm.alloc_node(CILNode::LdArg(0));
+        let handle_isize = asm.alloc_node(CILNode::PtrCast(arg, Box::new(PtrCastRes::ISize)));
+        let handle_to_obj = asm.alloc_string("handle_to_obj");
+        let main_module = asm.main_module();
+        let handle_to_obj = asm.class_ref(*main_module).clone().static_mref(
+            &[Type::Int(Int::ISize)],
+            Type::PlatformObject,
+            handle_to_obj,
+            asm,
+        );
+        let obj = asm.alloc_node(CILNode::call(handle_to_obj, [handle_isize]));
+        let arr_ty = asm.alloc_type(string_arr);
+        let arr = asm.alloc_node(CILNode::CheckedCast(obj, arr_ty));
+        let len = asm.ld_len(arr);
+        let len = asm.int_cast(len, Int::USize, ExtendKind::ZeroExtend);
+        let ret = asm.alloc_root(CILRoot::Ret(len));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_readdir_get(handle, idx) -> *mut u8`
+///   => `Marshal.StringToCoTaskMemUTF8(string[][idx])` (caller frees via
+///      `rcl_dotnet_cotaskmem_free`).
+fn insert_dotnet_fs_readdir_get(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_readdir_get");
+    let generator = move |_, asm: &mut Assembly| {
+        let u8_ptr = asm.nptr(Type::Int(Int::U8));
+        let string = asm.alloc_type(Type::PlatformString);
+        let string_arr = Type::PlatformArray {
+            elem: string,
+            dims: NonZeroU8::new(1).unwrap(),
+        };
+        let arg = asm.alloc_node(CILNode::LdArg(0));
+        let handle_isize = asm.alloc_node(CILNode::PtrCast(arg, Box::new(PtrCastRes::ISize)));
+        let handle_to_obj = asm.alloc_string("handle_to_obj");
+        let main_module = asm.main_module();
+        let handle_to_obj = asm.class_ref(*main_module).clone().static_mref(
+            &[Type::Int(Int::ISize)],
+            Type::PlatformObject,
+            handle_to_obj,
+            asm,
+        );
+        let obj = asm.alloc_node(CILNode::call(handle_to_obj, [handle_isize]));
+        let arr_ty = asm.alloc_type(string_arr);
+        let arr = asm.alloc_node(CILNode::CheckedCast(obj, arr_ty));
+        let idx = asm.alloc_node(CILNode::LdArg(1));
+        let entry = asm.ld_elem_ref(arr, idx);
+        let to_utf8 = string_to_utf8(asm);
+        let buf = asm.alloc_node(CILNode::call(to_utf8, [entry]));
+        let buf = asm.cast_ptr(buf, u8_ptr);
+        let ret = asm.alloc_root(CILRoot::Ret(buf));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_readdir_close(handle)` => free the `string[]` `GCHandle`.
+fn insert_dotnet_fs_readdir_close(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_readdir_close");
+    let generator = move |_, asm: &mut Assembly| {
+        let (store_gch, free, gc_handle_ty) = free_handle_roots(asm, 0, 0);
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![store_gch, free, ret], 0, None)],
+            locals: vec![(Some(asm.alloc_string("gch")), gc_handle_ty)],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
 }
