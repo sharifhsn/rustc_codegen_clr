@@ -1,0 +1,4 @@
+[build]
+target = "/work/dotnet.json"
+[unstable]
+build-std = ["core", "alloc", "std", "panic_unwind"]

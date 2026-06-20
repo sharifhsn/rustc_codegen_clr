@@ -100,8 +100,22 @@ the throw side** (`ir/builtins/unwind.rs::raise_exception` overrides `_Unwind_Ra
 `RustException` carrying the panic payload). A Rust `panic!` now propagates as a managed exception and
 `std::panic::catch_unwind` catches it end-to-end on .NET (validated by `cargo_tests/catch_panic`). This
 is the §7 managed-frames-only design: never crossing a P/Invoke boundary. `NO_UNWIND` strips handlers
-for perf. No DWARF personality fn is needed (the CLR runs the handlers). C-mode unwinding is still a
-non-compiling sketch (gated on an undefined `UNWIND_SUPPORTED`, with `setjump`/`longjump` typos).
+for perf. No DWARF personality fn is *invoked* at runtime (the CLR runs the handlers) — but one must
+**exist** so `std` compiles under `panic=unwind`: rustc's front-end `eh_personality` weak-lang-item
+check (`rustc_passes`) fires *before* codegen, so a link-time builtin can't satisfy it. **Phase 3
+(real dotnet target, `panic-strategy: unwind`) provides it the no-DWARF way** (mirroring
+wasm/msvc/uefi): a trivial aborting-stub `rust_eh_personality` lang item is injected into
+`std::sys::personality` for `os = "dotnet"`, and the `panic_unwind` + `unwind` crates get
+`target_os = "dotnet"` arms (gcc flavour for `imp::panic` → `_Unwind_RaiseException`; `libunwind` for
+the `_Unwind_*` declarations). With those three rust-src arms (injected by `feasibility/dev.sh
+pal-build`) std builds under unwind and a Rust `panic!` propagates to `catch_unwind`'s managed
+try/catch on the real dotnet target — validated by `cargo_tests/pal_panic2` (catch_unwind returns
+`is_err=true` then `Some(42)`). `cargo_tests/pal_panic` (default panic hook) still crashes, but only on
+the **orthogonal pre-existing sub-word-atomic bug** (WF-5): `get_backtrace_style`'s
+`static Atomic<u8>::compare_exchange` faults in `emulate_subword_cmp_xchng` (aligns the 1-byte static
+DOWN to a 32-bit word it doesn't own → AccessViolation). That is a panic-hook atomic bug, not the
+unwind machinery. C-mode unwinding is still a non-compiling sketch (gated on an undefined
+`UNWIND_SUPPORTED`, with `setjump`/`longjump` typos).
 
 **Missing/hard terminators:** `InlineAsm` (throwing stub), `TailCall`/`Yield`/`CoroutineDrop`
 (`todo!`). `UnwindTerminate` now hard-aborts via `Environment.FailFast` (WF-6; was incorrectly
@@ -300,9 +314,17 @@ Concretely:
   *method-bearing* (go-big, §6) — so the binding-generator prerequisite for a real `std::fs` is met;
   what remains is wiring the PAL `fs`/`net` arms to those bindings (WF-4). Until then, `fs`/`net` fall
   back to `unsupported`. `alloc`/`stdio`/`abort` need none of that.
-- **Unwinding interaction:** the PAL with `panic=abort` is fine for early milestones. `panic=unwind`
-  needs the §3 throw-bridge wired — a *shared* prerequisite for both the PAL and general correctness,
-  not PAL-specific.
+- **Unwinding interaction — `panic=unwind` now works on the real dotnet target (Phase 3).** Flipping
+  `dotnet.json` to `panic-strategy: unwind` compiles std and propagates panics to `catch_unwind` end-to-end
+  (validated by `cargo_tests/pal_panic2`). The pieces: the §3 throw-bridge (gcc `imp::panic` →
+  linker-overridden `_Unwind_RaiseException` → `RustException` throw → managed try/catch), an
+  aborting-stub `eh_personality` lang item for `os = "dotnet"` in `std::sys::personality` (no-DWARF
+  pattern; the front-end weak-lang-item check needs it to *exist*, the CLR never *calls* it), and
+  `target_os = "dotnet"` arms in the `panic_unwind` (→ gcc) and `unwind` (→ libunwind decls) crates —
+  all injected into rust-src by `feasibility/dev.sh pal-build`. Residual blocker for the *default* panic
+  hook only: `get_backtrace_style`'s `static Atomic<u8>::compare_exchange` hits the orthogonal WF-5
+  sub-word-atomic page-hazard (`emulate_subword_cmp_xchng` aligns a 1-byte static down to a word it
+  doesn't own → AccessViolation); a custom hook (as in `pal_panic2`) avoids it entirely.
 
 **Why the PAL is the right next vertical:** it is bounded and high-value (delivers the "real
 shippable .NET `std`" / H2 goal and kills the brittle surrogate), and it is a **forcing function**

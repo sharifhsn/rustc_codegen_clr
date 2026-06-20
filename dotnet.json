@@ -19,7 +19,7 @@
     "tier": 1
   },
   "os": "dotnet",
-  "panic-strategy": "abort",
+  "panic-strategy": "unwind",
   "plt-by-default": false,
   "position-independent-executables": true,
   "pre-link-args": {

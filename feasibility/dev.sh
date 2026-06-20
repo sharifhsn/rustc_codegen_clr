@@ -270,6 +270,15 @@ fi
 # System.Threading.Thread / System.Environment via the rcl_dotnet_thread_* and
 # rcl_dotnet_available_parallelism hooks (see cilly/src/ir/builtins/dotnet.rs).
 [ -f "$PAL/thread/dotnet.rs" ]       && inject_arm thread/mod.rs       'mod dotnet; pub use dotnet::*;'
+# personality/mod.rs holds the `eh_personality` lang item. With panic=unwind,
+# rustc's front-end requires that lang item to EXIST (the missing-eh_personality
+# weak-lang-item check that emits "unwinding panics are not supported without
+# std"). os=dotnet has no DWARF/SEH unwinder — .NET's own managed EH runs the
+# handlers — so, exactly like the wasm/msvc/motor arm right above the gcc arm in
+# this same cfg_select!, we supply a trivial aborting STUB personality that
+# satisfies the lang item but is never actually called at runtime. (block 1 is
+# the only cfg_select! in this file, under `#[cfg(not(any(test, doctest)))]`.)
+inject_arm personality/mod.rs '#[lang = "eh_personality"] fn rust_eh_personality() { core::intrinsics::abort() }'
 # Teach std's build.rs that os=dotnet is a *supported* platform, otherwise std
 # marks itself `restricted_std` (E0658 on use + "unwinding panics are not
 # supported without std"). The allow-list is the long `if target_os == "linux"
@@ -280,6 +289,66 @@ if [ -f "$BUILD_RS" ] && ! grep -q 'target_os == "dotnet"' "$BUILD_RS"; then
   # Inject `target_os == "dotnet" ||` just before the first `target_os == "linux"`
   # disjunct of the supported-platform allow-list. awk (no perl dependency).
   awk '!ins && /target_os == "linux"/ {sub(/target_os == "linux"/, "target_os == \"dotnet\"\n        || target_os == \"linux\""); ins=1} {print}' "$BUILD_RS" > "$BUILD_RS.__t" && mv "$BUILD_RS.__t" "$BUILD_RS"
+fi
+# panic_unwind is a SEPARATE crate (library/panic_unwind/src), not under std/src/sys,
+# so it is outside the sys mirror loop above. Its lib.rs picks the unwind FLAVOUR
+# (gcc/seh/dummy/…) from a cfg_select!; os=dotnet (no target-family) falls through to
+# the aborting `dummy.rs` arm, so even with `build-std=…,panic_unwind` no real unwind
+# runtime is selected. Inject a `target_os = "dotnet"` arm that routes to the GCC
+# flavour: gcc's `imp::panic` calls `_Unwind_RaiseException`, which the cilly linker
+# overrides into a managed `RustException` throw (the WF-6 throw-bridge). The DWARF
+# personality gcc would otherwise need is never invoked — .NET EH runs the handlers —
+# and the matching `eh_personality` lang item is the dotnet stub added to
+# std/sys/personality above. The arm is literally the gcc arm (`#[path = "gcc.rs"] mod imp;`):
+# gcc.rs's `super::__rust_drop_panic`/`__rust_foreign_exception` refs must resolve to the crate
+# root, so gcc.rs is included directly as `imp` (no extra module nesting).
+# dotnet_pal/panic_unwind/dotnet.rs is a doc-only marker for this arm.
+PUSRC="$SRC/../../../panic_unwind/src"      # library/panic_unwind/src
+PUPAL=/work/dotnet_pal/panic_unwind
+if [ -d "$PUPAL" ] && [ -f "$PUSRC/lib.rs" ]; then
+  echo "==> injecting dotnet panic_unwind arm ($PUSRC)"
+  cp "$PUPAL/dotnet.rs" "$PUSRC/dotnet.rs"   # doc-only marker for the arm
+  # Add the dotnet arm as the FIRST arm of the FLAVOUR cfg_select! (the first, and
+  # only, cfg_select! in panic_unwind/lib.rs). `&& !ins` keeps it to the first block
+  # so a later cfg_select! (should upstream add one) is never touched. Idempotent.
+  if ! grep -qF 'target_os = "dotnet" =>' "$PUSRC/lib.rs"; then
+    awk '
+      /cfg_select! \{/ && !ins {
+        print
+        print "    target_os = \"dotnet\" => {"
+        print "        #[path = \"gcc.rs\"]"
+        print "        mod imp;"
+        print "    }"
+        ins=1
+        next
+      }
+      { print }' "$PUSRC/lib.rs" > "$PUSRC/lib.rs.__t" && mv "$PUSRC/lib.rs.__t" "$PUSRC/lib.rs"
+  fi
+fi
+# The `unwind` crate (library/unwind/src) is what panic_unwind's gcc.rs imports as `uw` for the
+# `_Unwind_*` type/fn DECLARATIONS. Its own flavour cfg_select! also falls through to an empty
+# `_ => {}` arm for os=dotnet (no unix/windows/wasm family), leaving `uw::_Unwind_Exception` etc.
+# undefined -> E0425/E0422 in gcc.rs. Route the dotnet arm to `libunwind` (pure declarations: the
+# `_Unwind_*` types/consts + `extern "C"` blocks). Its `#[link(name = "unwind")]` is inert here —
+# the cilly linker overrides `_Unwind_RaiseException`/`_DeleteException`/`_Backtrace` as builtins,
+# so the native libunwind is never actually linked into the .NET CIL output. `unwinder_private_data_size`
+# resolves to 2 (target_arch = x86_64, not windows), matching the surrogate llvm-target.
+UWSRC="$SRC/../../../unwind/src"            # library/unwind/src
+if [ -f "$UWSRC/lib.rs" ]; then
+  echo "==> injecting dotnet unwind arm ($UWSRC)"
+  if ! grep -qF 'target_os = "dotnet" =>' "$UWSRC/lib.rs"; then
+    awk '
+      /cfg_select! \{/ && !ins {
+        print
+        print "    target_os = \"dotnet\" => {"
+        print "        mod libunwind;"
+        print "        pub use libunwind::*;"
+        print "    }"
+        ins=1
+        next
+      }
+      { print }' "$UWSRC/lib.rs" > "$UWSRC/lib.rs.__t" && mv "$UWSRC/lib.rs.__t" "$UWSRC/lib.rs"
+  fi
 fi
 echo "==> build-std cargo_tests/$DEV_CRATE for os=dotnet"
 cd "/work/cargo_tests/$DEV_CRATE" 2>/dev/null || { echo "!! no cargo_tests/$DEV_CRATE"; exit 1; }
