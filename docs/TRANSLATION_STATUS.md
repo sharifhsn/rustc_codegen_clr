@@ -12,9 +12,11 @@
 The **codegen** (Rust → CIL) is mature and largely faithful — ~90–96% of `core`/`alloc`/`std` test
 suites pass. As of the latest milestones the **Rust→.NET half is substantially complete**: a real
 `dotnet` PAL runs `std` on .NET with no surrogate (for the vertical it covers), and the full BCL call
-surface is generated (4,256 method/ctor wrappers). The remaining frontier is **calling Rust *from*
-.NET** (the `.NET→Rust` reverse-export direction, still ~5%/dead) plus **ergonomic packaging**. This
-matches the author's own framing: *the translation is the validated, even elegant part; the interop
+surface is generated (4,256 method/ctor wrappers). And the **`.NET→Rust` direction now works at its
+core** (WF-7): C# imports a Rust *library* and calls its functions (incl. string marshalling), and a
+Rust `dotnet_typedef!` declaration emits a real managed class. What remains is the **ergonomic tail**
+(constructors, richer marshalling, de-mangled/typed API, NuGet packaging) — not new capability walls.
+This matches the author's own framing: *the translation is the validated, even elegant part; the interop
 ergonomics and platform integration are where the hard work remains* (`docs/fractalfir_articles/`,
 `v0_1_0`/`v0_2_0`).
 
@@ -26,8 +28,8 @@ Mental model of the layers (each builds on the one above):
   Rust → .NET API   generated wrappers over the BCL (all bindable types)  done — 4256 methods
   runtime/std       allocator, stdio, threads, fs … on .NET             real dotnet PAL (vertical); surrogate retiring
   ── consumers ──
-  .NET → Rust       reverse-export + dotnet_typedef!                     ~5% — the frontier (WF-7)
-  packaged library  class-lib output + de-mangled API + marshalling      not built (WF-8)
+  .NET → Rust       call Rust fns + define managed classes (WF-7)       core works; ergonomic tail left
+  packaged library  class-lib output + de-mangled API + marshalling      partial (WF-8): lib .dll emits; naming/NuGet left
 ```
 
 ---
@@ -170,10 +172,20 @@ calls its `#[no_mangle]` functions as ordinary managed methods. Proven end-to-en
   so C# can reference it by identity. (A library having no `main`/`lang_start` also sidesteps the std
   runtime weak-static tail — see §10.)
 
-**\.NET → Rust (exposing Rust *types* as managed classes): still ~5%, dead.** `dotnet_typedef!` → the
-comptime interpreter (`src/comptime.rs`) is **commented out and aborts the build** (an unconditional
-`todo!`); the Cecil-based `AssemblyUtilis` backend is **unwired**. This (WF-7 P3) is the harder,
-ceiling-adjacent half — letting a Rust struct *become* a C# class with virtual methods/inheritance.
+**\.NET → Rust (exposing Rust *types* as managed classes): core WORKING (WF-7 P3).** The comptime
+interpreter (`src/comptime.rs`) is **revived** (was a dead `todo!` over ~200 lines of drifted code). A
+`dotnet_typedef!` declaration now produces a real managed class: `cargo_tests/rust_typedef` emits
+`.class public RustObj extends [System.Runtime]System.Object { .field int32 value; .method public
+virtual int32 get_value() }` (verified by `ikdasm`), where the virtual method **aliases** an ordinary,
+separately-codegen'd Rust fn (`MethodImpl::AliasFor`). Mechanism: the interpreter reads the MIR of the
+macro-generated `…_comptime_entrypoint` (whose four magic intrinsic calls carry the class metadata as
+const-generics) and registers a `ClassDef` as a side effect. Two backend fixes enabled it — the
+method-body fn (`…_not_magic`, declared *inside* the entrypoint) now falls through to normal codegen
+(`src/assembly.rs`), and the dead-code pass follows `AliasFor` edges (`cilly/src/ir/asm.rs`); the
+emitted methods are `Access::Extern` (DCE roots). The Cecil-based `AssemblyUtilis` backend remains
+unwired (an alternate, unneeded emission path). **Follow-ups for full C# *use*:** `dotnet_typedef!`
+emits no constructor (the type loads + reflects, but C# can't `new` it yet); a virtual method returning
+a managed `System.String` hits the P2 managed-return codegen bug; generic Rust types → §7 limits.
 **\.NET → Rust (string marshalling): WORKING (WF-7 P2).** Strings cross as UTF-8 `(ptr, len)` pairs
 (thin pointers → directly-C#-usable `byte*`/`nuint`). `rust_strlen(*const u8, usize)` proves inbound
 (C# `string` → Rust `&str`); `greet(*const u8, usize, *mut u8, usize)` proves outbound — it builds an
@@ -408,7 +420,7 @@ The benchmark decomposes into 6 layers → workflows:
 | 2 `std` runs on .NET | WF-2, WF-4 | ✅ **DONE** (PAL vertical; surrogate retiring) |
 | 3 Rust→.NET calls | WF-3 | ✅ **DONE** (full BCL, 4256 methods) |
 | 4 errors/panics cross cleanly | WF-6 | ✅ **DONE** (throw-bridge; catch_unwind works) |
-| 5 .NET→Rust export (call Rust from C#) | **WF-7** | 🟡 **P1+P2 DONE** (C# calls a Rust *library*; string marshalling works); P3 type-export remains |
+| 5 .NET→Rust export (call Rust from C#) | **WF-7** | 🟢 **P1+P2+P3 core DONE** (C# calls a Rust *library*; string marshalling; Rust *defines* managed classes); ergonomic tail remains |
 | 6 ergonomic packaged library | **WF-8** | ⬜ |
 
 **Layers 1–4 done + WF-7 P1** — the entire Rust→.NET half, error-crossing, AND the core of the reverse
@@ -431,14 +443,16 @@ direction (C# imports a Rust library and calls its functions, §6). What remains
 - **WF-6** unwinding throw-bridge — **DONE** (`22b0a00`): `_Unwind_RaiseException` throws a
   `RustException`, `catch_unwind` catches Rust panics end-to-end on .NET (`cargo_tests/catch_panic`);
   `UnwindTerminate`→`FailFast`; real `#[track_caller]` location. Managed-frames-only per §7.
-- **WF-7** `.NET→Rust` direction — *the linchpin.* **P1+P2 DONE** (`cargo_tests/rust_export[_cs]`): a
-  Rust **library** crate compiles to a referenceable .NET class-library assembly, and C# calls its
-  `#[no_mangle]` functions as managed methods (§6), incl. **string marshalling** both ways (UTF-8
-  `(ptr,len)`). The reframe — Rust→managed-CIL means this is *not* native FFI — collapsed most of the
-  expected difficulty. **Remaining:** P2-tail (`Vec`/slice/struct marshalling — the convention
-  generalizes); **P3** the harder, ceiling-adjacent half — `dotnet_typedef!` + the `src/comptime.rs`
-  revival to expose Rust *types* as managed classes (virtual methods/inheritance). Idiomaticity
-  follow-ups (managed `System.String` return; direct typed C# refs) are codegen/packaging items (§6).
+- **WF-7** `.NET→Rust` direction — *the linchpin.* **P1+P2+P3-core DONE.** P1 (`rust_export[_cs]`): a
+  Rust **library** crate compiles to a referenceable .NET class-library assembly, C# calls its
+  `#[no_mangle]` functions as managed methods. P2: **string marshalling** both ways (UTF-8 `(ptr,len)`).
+  **P3 (`rust_typedef`): `dotnet_typedef!` + the revived `src/comptime.rs` now make a Rust declaration
+  emit a real managed class** (field + inheritance + virtual method aliasing a Rust fn — verified by
+  `ikdasm`, §6). The reframe — Rust→managed-CIL means this is *not* native FFI — collapsed most of the
+  expected difficulty; even the "ceiling-adjacent" type-export works for the core case. **Remaining
+  (ergonomic tail):** P2 `Vec`/slice/struct marshalling; P3 constructors (so C# can `new` a Rust class)
+  + managed-`String`-return; managed `System.String` return codegen bug; direct typed C# refs (BCL-ref
+  versions). Generic Rust types → §7 limits.
 - **WF-8** Library packaging & ergonomic surface — emit a .NET **class library** (not an
   exe-entrypoint) with **de-mangled** public types/methods/namespaces + **bidirectional marshalling for
   real API signatures** (`Result`→exception/`out`, `Option`→nullable, `Vec`/slice↔array/`Span`,
@@ -449,7 +463,9 @@ direction (C# imports a Rust library and calls its functions, §6). What remains
 - **WF-10 (open-ended)** Real-crate soak / hardening — drive an actual dependency-using crate
   end-to-end and close the long tail. Where "experimental" becomes "usable."
 
-**Status vs. the benchmark:** the capability work is **~80% done** — layers 1–4 (WF-1/2/3/5/6) complete
-*and* WF-7 P1 (C# calls a Rust library). Remaining on the critical path: WF-7 P2 (marshalling) + P3
-(type-export/comptime, the hardest piece) + WF-8 (packaging — de-mangled API, filename=identity,
-NuGet), then WF-9 (if the module's API is generic) + WF-10 (soak) for a *real* module.
+**Status vs. the benchmark:** the capability work is **~85% done** — layers 1–4 (WF-1/2/3/5/6) complete
+*and* WF-7 P1+P2+P3-core (C# calls a Rust library; string marshalling; Rust defines managed classes).
+**All five capability layers now have a working core.** Remaining is mostly the **ergonomic tail**:
+WF-7 finish (constructors, `Vec`/struct marshalling, managed-`String` return, direct typed C# refs) +
+WF-8 (packaging — de-mangled API, BCL-ref versions, NuGet), then WF-9 (if the module's API is generic)
++ WF-10 (soak) for a *real* module. The hard, ceiling-adjacent pieces are behind us.
