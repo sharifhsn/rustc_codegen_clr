@@ -166,8 +166,9 @@ C
   ;;
 
 pal-build)
-  run_native=0; [ "${1:-}" = --run ] && run_native=1
-  export DEV_RUN="$run_native"
+  crate=pal_hello; run_native=0
+  for a in "$@"; do case "$a" in --run) run_native=1;; *) crate="$a";; esac; done
+  export DEV_RUN="$run_native" DEV_CRATE="$crate"
   _in <<'C'
 set -e
 SRC="$(rustc --print sysroot)/lib/rustlib/src/rust/library/std/src/sys"
@@ -280,15 +281,15 @@ if [ -f "$BUILD_RS" ] && ! grep -q 'target_os == "dotnet"' "$BUILD_RS"; then
   # disjunct of the supported-platform allow-list. awk (no perl dependency).
   awk '!ins && /target_os == "linux"/ {sub(/target_os == "linux"/, "target_os == \"dotnet\"\n        || target_os == \"linux\""); ins=1} {print}' "$BUILD_RS" > "$BUILD_RS.__t" && mv "$BUILD_RS.__t" "$BUILD_RS"
 fi
-echo "==> build-std pal_hello for os=dotnet"
-cd /work/cargo_tests/pal_hello
+echo "==> build-std cargo_tests/$DEV_CRATE for os=dotnet"
+cd "/work/cargo_tests/$DEV_CRATE" 2>/dev/null || { echo "!! no cargo_tests/$DEV_CRATE"; exit 1; }
 export RUSTFLAGS="-Z codegen-backend=/work/target/release/librustc_codegen_clr.so -C linker=/work/target/release/linker -C link-args=--cargo-support"
 set +e
 cargo -Zjson-target-spec build --release 2>&1 | grep -vE 'discirminant' | grep -E '^error|error\[|could not compile|warning: unused|Compiling (std|core|alloc) |Finished' | head -60
 rc=${PIPESTATUS[0]}
 echo "== build exit: $rc =="
-out="target/x86_64-unknown-dotnet/release/pal_hello"
-[ ! -f "$out" ] && out="target/dotnet/release/pal_hello"
+out="target/x86_64-unknown-dotnet/release/$DEV_CRATE"
+[ ! -f "$out" ] && out="target/dotnet/release/$DEV_CRATE"
 if [ "$rc" = 0 ] && [ "$DEV_RUN" = 1 ] && [ -f "$out" ]; then echo "== RUN =="; "./$out"; echo "run exit: $?"; fi
 C
   ;;
