@@ -191,11 +191,11 @@ a managed `System.String` hits the P2 managed-return codegen bug; generic Rust t
 (C# `string` → Rust `&str`); `greet(*const u8, usize, *mut u8, usize)` proves outbound — it builds an
 owned Rust `String` and copies its UTF-8 into a caller-provided out-buffer (nothing crosses ownership →
 no cross-boundary free). Proven in `cargo_tests/rust_export` + `_cs` (no backend changes). Two deferred
-idiomaticity follow-ups: (a) returning a managed `System.String` directly hits a codegen mismatch — the
+idiomaticity note: returning a managed `System.String` directly hits a codegen mismatch — the
 interop-call result is typed `void` when returned from an exported fn (`LocalAssigementWrong got "v"`),
-so the out-buffer convention is used instead; (b) direct *typed* C# calls (vs reflection) hit `CS0012`
-because the assembly's BCL references carry version `0.0.0.0` — emitting proper reference versions is
-WF-8 packaging. Still open: `Vec`/slice/struct marshalling (the `(ptr,len)` convention generalizes).
+so the out-buffer convention is used instead. (Direct *typed* C# calls — `MainModule.rust_add(2,3)`,
+vs reflection — now **work** since WF-8a emits real BCL-ref versions; see §11.) Still open:
+`Vec`/slice/struct marshalling (the `(ptr,len)` convention generalizes).
 
 ---
 
@@ -453,11 +453,13 @@ direction (C# imports a Rust library and calls its functions, §6). What remains
   (ergonomic tail):** P2 `Vec`/slice/struct marshalling; P3 constructors (so C# can `new` a Rust class)
   + managed-`String`-return; managed `System.String` return codegen bug; direct typed C# refs (BCL-ref
   versions). Generic Rust types → §7 limits.
-- **WF-8** Library packaging & ergonomic surface — emit a .NET **class library** (not an
-  exe-entrypoint) with **de-mangled** public types/methods/namespaces + **bidirectional marshalling for
-  real API signatures** (`Result`→exception/`out`, `Option`→nullable, `Vec`/slice↔array/`Span`,
-  struct↔record, `String`↔`string`) + NuGet/`.csproj` packaging. This is what makes a Rust crate
-  *importable*. (The cargo↔MSBuild build glue is separable tooling, not codegen.)
+- **WF-8** Library packaging & ergonomic surface. **WF-8a DONE** (`3b6915f`): a produced **library**
+  emits real `.assembly extern` BCL identities (`.ver`/`.publickeytoken`), so C# references it and uses
+  **direct typed calls** (`MainModule.rust_add(2,3)`) instead of reflection — `cargo_tests/rust_export_cs`
+  now does this, 6/6 on .NET. **Remaining:** constructors for `dotnet_typedef!` classes (so C# can `new`
+  them); **de-mangled** public types/methods/namespaces; **richer marshalling** (`Result`→exception/`out`,
+  `Option`→nullable, `Vec`/slice↔array/`Span`, struct↔record, managed-`String` return); NuGet/`.csproj`
+  packaging. (The cargo↔MSBuild build glue is separable tooling, not codegen.)
 - **WF-9** Generic-interop bridge — `RustGeneric<T>` ↔ C# (size-parameterized for `T: unmanaged`,
   boxed/`GCHandle` for managed T; §7). Needed iff the module's public API uses generic containers.
 - **WF-10 (open-ended)** Real-crate soak / hardening — drive an actual dependency-using crate
