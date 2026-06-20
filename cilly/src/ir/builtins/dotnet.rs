@@ -54,7 +54,8 @@ use crate::cilnode::{ExtendKind, MethodKind, PtrCastRes};
 use crate::ir::asm::MissingMethodPatcher;
 use crate::ir::cilroot::BranchCond;
 use crate::ir::{
-    BasicBlock, CILNode, CILRoot, ClassRef, Const, Int, Interned, MethodImpl, MethodRef, Type,
+    BasicBlock, CILNode, CILRoot, ClassRef, Const, Int, Interned, MethodImpl, MethodRef,
+    StaticFieldDesc, Type,
 };
 use crate::Assembly;
 use std::num::NonZeroU8;
@@ -109,25 +110,19 @@ fn insert_dotnet_instant_ticks(asm: &mut Assembly, patcher: &mut MissingMethodPa
 }
 
 /// `rcl_dotnet_instant_freq() -> i64`
-///   => `System.Diagnostics.Stopwatch.Frequency` (the `get_Frequency` getter).
+///   => `System.Diagnostics.Stopwatch.Frequency` (the static `Frequency` field, via `ldsfld`).
 ///
 /// Ticks per second for the counter returned by `rcl_dotnet_instant_ticks`.
-/// `Frequency` is a `public static readonly long`, surfaced in CIL as the
-/// auto-generated `get_Frequency()` static getter, so this is a plain static
-/// call — no static-field load needed.
+/// `Frequency` is a `public static readonly long` FIELD on `Stopwatch` — CoreCLR
+/// exposes it directly, with no `get_Frequency()` getter — so this loads it with
+/// `ldsfld` rather than issuing a static call.
 fn insert_dotnet_instant_freq(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("rcl_dotnet_instant_freq");
     let generator = move |_, asm: &mut Assembly| {
         let stopwatch = ClassRef::stopwatch(asm);
-        let get_freq = MethodRef::new(
-            stopwatch,
-            asm.alloc_string("get_Frequency"),
-            asm.sig([], Type::Int(Int::I64)),
-            MethodKind::Static,
-            [].into(),
-        );
-        let get_freq = asm.alloc_methodref(get_freq);
-        let freq = asm.alloc_node(CILNode::call(get_freq, []));
+        let freq_name = asm.alloc_string("Frequency");
+        let freq_fld = asm.alloc_sfld(StaticFieldDesc::new(stopwatch, freq_name, Type::Int(Int::I64)));
+        let freq = asm.alloc_node(CILNode::LdStaticField(freq_fld));
         let ret = asm.alloc_root(CILRoot::Ret(freq));
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![ret], 0, None)],
