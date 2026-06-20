@@ -548,7 +548,12 @@ impl Assembly {
             {
                 return Ok(ClassDefIdx(cref));
             }
-            panic!("Invalid class {:?}", &self[def.name()])
+            panic!(
+                "Class name collision: the name {:?} is already used by a different class \
+                 definition. If this appeared after enabling de-mangling, two distinct types \
+                 mapped to the same stable name — disambiguate one of them.",
+                &self[def.name()]
+            )
         }
         self.class_defs.insert(ClassDefIdx(cref), def.clone());
         Ok(ClassDefIdx(cref))

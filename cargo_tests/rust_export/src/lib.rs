@@ -98,3 +98,29 @@ pub unsafe extern "C" fn greet_managed(ptr: *const u8, len: usize) -> mycorrhiza
     let greeting = format!("Hello, {name}, from Rust (managed)!");
     mycorrhiza::system::MString::from(greeting.as_str())
 }
+
+// ---- WF-8d: struct marshalling across the boundary ----
+//
+// A `#[repr(C)]` struct lowers to a CIL value-type. Thanks to de-mangling (`stable_adt_name`), it is
+// emitted under the clean, build-stable name `rust_export.Point` (not `rust_export[<hash>].Point`), so
+// C# can reference it directly. `point_sum` proves a struct crossing **inbound** (C# value-type → Rust)
+// and `make_point` proves it crossing **outbound** (Rust → C# value-type).
+
+/// A simple value-type exported to .NET as `rust_export.Point`.
+#[repr(C)]
+pub struct Point {
+    pub x: i32,
+    pub y: i32,
+}
+
+/// Take a `Point` by value and return the sum of its fields (inbound struct marshalling).
+#[no_mangle]
+pub extern "C" fn point_sum(p: Point) -> i32 {
+    p.x + p.y
+}
+
+/// Build and return a `Point` (outbound struct marshalling).
+#[no_mangle]
+pub extern "C" fn make_point(x: i32, y: i32) -> Point {
+    Point { x, y }
+}

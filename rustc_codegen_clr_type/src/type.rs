@@ -4,7 +4,10 @@ use crate::utilis::{
     is_zst, try_resolve_const_size,
 };
 use crate::utilis::{garag_to_usize, garg_to_string, pointer_to_is_fat, tuple_name};
-use crate::{GetTypeExt, utilis::adt_name};
+use crate::{
+    GetTypeExt,
+    utilis::{adt_name, stable_adt_name},
+};
 use cilly::bimap::Interned;
 use cilly::class::ClassDefIdx;
 use cilly::{
@@ -207,7 +210,10 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
             }
         }
         TyKind::Adt(def, subst) => {
-            let name = adt_name(*def, ctx.tcx(), subst);
+            // Prefer a stable, de-mangled public name for a library's exported types; otherwise fall
+            // back to the mangled name. See `stable_adt_name` for the (coherence-preserving) criteria.
+            let name = stable_adt_name(*def, ctx.tcx(), subst)
+                .unwrap_or_else(|| adt_name(*def, ctx.tcx(), subst));
             if def.repr().simd() {
                 let (count, elem) = ty.simd_size_and_type(ctx.tcx());
                 let elem = ctx.type_from_cache(elem);

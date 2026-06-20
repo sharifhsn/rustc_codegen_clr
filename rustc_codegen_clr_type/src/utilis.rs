@@ -4,6 +4,7 @@ use cilly::{
     cilnode::{IsPure, MethodKind}, utilis::escape_class_name,
 };
 use rustc_codegen_clr_ctx::MethodCompileCtx;
+use rustc_hir::attrs::CrateType;
 use rustc_middle::ty::Const;
 use rustc_middle::ty::List;
 use rustc_middle::ty::{
@@ -258,6 +259,66 @@ pub fn adt_name<'tcx>(
     // Replace Rust namespace(module) spearators with C# ones.
     let dotnet_class_name = demangled.replace("::", ".");
     escape_class_name(&dotnet_class_name)
+}
+/// Like [`adt_name`], but produces a **stable, de-mangled** public name (e.g. `rust_export.Point`
+/// instead of the symbol-mangled `rust_export[<hash>].Point`) for types that form a library's
+/// externally-visible surface, so a .NET consumer can reference them by a clean, build-stable name.
+///
+/// Returns `None` — and the caller falls back to [`adt_name`] (the mangled name) — unless the type is:
+///
+/// 1. **local** to the crate being compiled (`is_local`). Foreign types (`std`/`core`/`alloc`/deps)
+///    keep their mangled names *everywhere*. This is what preserves cross-crate coherence: the linker
+///    merges per-crate assemblies by matching `ClassRef` name strings, so a type's name must be a pure
+///    function of its identity, not of which crate happens to be lowering it. A foreign type is only
+///    ever de-mangled (if at all) in its *home* crate; keeping it mangled in every consumer guarantees
+///    the def and all refs agree.
+/// 2. **non-generic** (no un-erased type/const args). Monomorphized generics *must* stay mangled:
+///    distinct instantiations share one Rust `AdtDef`, and only the mangled symbol disambiguates them
+///    (also .NET bans explicit layout on generics — see ARCHITECTURE.md §5).
+/// 3. compiled into an **export artifact** — `Cdylib`/`Dylib`/`StaticLib`. This is the signal that the
+///    crate exists to be consumed. It deliberately excludes:
+///    - **`Executable`** — every `::stable` test program is an executable, so de-mangling is a strict
+///      no-op for the regression gate (its CIL stays byte-identical), and
+///    - **`Rlib`** — the `core`/`alloc`/`std` crates produced by `build-std` are rlibs, so their local
+///      types stay mangled, matching how a consuming cdylib references them (point 1).
+///
+/// The name is built from the **definition path**, which carries no mangling hash and is therefore
+/// stable across builds. Because both the def-key (`class_def`→`ref_to`) and every use-site (`get_adt`)
+/// flow through this one name with `asm = None`, interning stays coherent by construction.
+pub fn stable_adt_name<'tcx>(
+    adt: AdtDef<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    gargs: &'tcx List<GenericArg<'tcx>>,
+) -> Option<String> {
+    // (1) Foreign types keep their mangled names in every crate -> cross-crate coherent.
+    if !adt.did().is_local() {
+        return None;
+    }
+    // (2) Monomorphized generics must stay mangled (one `AdtDef`, many instantiations).
+    if gargs
+        .iter()
+        .any(|g| g.as_type().is_some() || g.as_const().is_some())
+    {
+        return None;
+    }
+    // (3) Only export artifacts de-mangle. Executables (the gate) and rlibs (build-std deps) do not.
+    let is_export_artifact = tcx
+        .crate_types()
+        .iter()
+        .any(|ct| matches!(ct, CrateType::Cdylib | CrateType::Dylib | CrateType::StaticLib));
+    if !is_export_artifact {
+        return None;
+    }
+    // Build a clean, stable name from the definition path (no symbol-mangling hash). Always qualify
+    // with the crate name so the C# type lands in a `Crate.Module.Type` namespace.
+    let krate = tcx.crate_name(adt.did().krate);
+    let def_path = tcx.def_path_str(adt.did());
+    let qualified = if def_path.starts_with(krate.as_str()) {
+        def_path
+    } else {
+        format!("{krate}::{def_path}")
+    };
+    Some(escape_class_name(&qualified))
 }
 // WARNING: this is *wrong*: For some reason, `Instance::try_resolve` should not operate on structs(why?), and this just silences the newly introduced warning.
 pub fn instance_try_resolve<'tcx>(
