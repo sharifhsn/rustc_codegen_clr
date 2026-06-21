@@ -22,22 +22,36 @@ use rustc_span::def_id::DefId;
 
 pub fn add_static(def_id: DefId, ctx: &mut MethodCompileCtx<'_, '_>) -> Interned<CILNode> {
     let main_module_id = ctx.main_module();
-    let alloc = ctx.tcx().eval_static_initializer(def_id).unwrap();
     let attrs = ctx.tcx().codegen_fn_attrs(def_id);
 
     let thread_local = attrs
         .flags
         .contains(rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::THREAD_LOCAL);
-    let align = alloc.0.align.bytes().max(1);
     let ty = static_ty(def_id, ctx.tcx());
     let tpe = ctx.type_from_cache(ty);
-    assert_eq!(align, align_of(ty, ctx.tcx()));
     assert!(ty.is_sized(ctx.tcx(), TypingEnv::fully_monomorphized()));
     let symbol: String = ctx
         .tcx()
         .symbol_name(Instance::new_raw(def_id, List::empty()))
         .to_string();
 
+    // PHASE 1 — reserve the static field BEFORE evaluating the initializer or
+    // recursing into its provenance. Statics can be mutually (or self-)
+    // referential: a static A whose initializer's provenance points at static B
+    // (and B back at A, or A at itself). The initializer for A reaches B through
+    // `allocation_initializer_method` -> `add_allocation`'s `GlobalAlloc::Static`
+    // arm -> `add_static(B)`, which can come straight back to `add_static(A)`.
+    // Without an idempotency guard this recurses forever and overflows rustc's
+    // C stack (a hard SIGSEGV that bypasses the per-item `catch_unwind` recovery
+    // and fails the whole crate). `add_allocation`'s Memory arm already memoizes
+    // on `has_static_field`; mirror that here, keyed on the static's symbol/type,
+    // so the field is present (and the recursion short-circuits) before the
+    // initializer is built. The static-fields list on the persistent `Assembly`
+    // is the memo — `MethodCompileCtx` is per-method and is even re-created
+    // inside `allocation_initializer_method`, so a visited-set must not live on
+    // the ctx.
+    let name = ctx.alloc_string(symbol.clone());
+    let already_present = ctx.class_mut(main_module_id).has_static_field(name, tpe);
     let sfld = ctx.add_static(
         tpe,
         symbol.clone(),
@@ -48,7 +62,19 @@ pub fn add_static(def_id: DefId, ctx: &mut MethodCompileCtx<'_, '_>) -> Interned
     );
     let ptr = ctx.alloc_node(CILNode::LdStaticFieldAddress(sfld));
     let ptr = ctx.cast_ptr(ptr, Int::U8);
-    let ptr = ptr;
+    if already_present {
+        // The field (and its initializer) were registered by an earlier call;
+        // return the same U8-ptr address node every call site expects, without
+        // re-evaluating the initializer or recursing again.
+        return ptr;
+    }
+
+    // PHASE 2 — build and register the initializer exactly once. Recursion back
+    // into `add_static(def_id)` from here now hits the `already_present`
+    // short-circuit above.
+    let alloc = ctx.tcx().eval_static_initializer(def_id).unwrap();
+    let align = alloc.0.align.bytes().max(1);
+    assert_eq!(align, align_of(ty, ctx.tcx()));
     let initialzer = allocation_initializer_method(&alloc.0, &symbol, ctx, ptr, true);
     let root = ctx.alloc_root(cilly::CILRoot::call(*initialzer, []));
 
