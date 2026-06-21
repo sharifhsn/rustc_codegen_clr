@@ -419,6 +419,18 @@ impl ClassRef {
         let asm_name = Some(asm.alloc_string("System.Net.Primitives"));
         asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
     }
+    /// Returns a reference to the int-backed enum `System.Net.Sockets.SocketError`
+    /// (a value type) — the type returned by `SocketException.SocketErrorCode`. The
+    /// errno translation reads it (as its underlying i32) to derive a POSIX errno.
+    /// Must be the enum type, not raw i32: the CLR matches the property's signature
+    /// EXACTLY (`SocketError get_SocketErrorCode()`), so an i32 return type yields a
+    /// runtime `MissingMethodException`. In `System.Net.Primitives`.
+    #[must_use]
+    pub fn socket_error(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Net.Sockets.SocketError");
+        let asm_name = Some(asm.alloc_string("System.Net.Primitives"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
+    }
     /// Returns a reference to the int-backed enum `System.Net.Sockets.SelectMode`
     /// (a value type) — selects the readiness mode (SelectRead=0 / SelectWrite=1 /
     /// SelectError=2) for `Socket.Poll(int microSeconds, SelectMode)` in the dotnet

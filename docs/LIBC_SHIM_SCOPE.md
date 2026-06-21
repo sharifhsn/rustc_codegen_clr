@@ -315,6 +315,34 @@ The "one cfg flip" DX is **real for the consumer crate** (it just observes `cfg(
 std side needs these dotnet arms baked into the project's patched std. That is a one-time
 project investment, not a downstream burden.
 
+#### Cap-2 attempt outcome (deferred — precise blocker)
+The flip was attempted in Cap-2 and **reverted to keep main green**. Findings, for the next run:
+
+* **Field name:** the JSON target-spec key is **`"target-family": ["unix"]`** (an array), NOT
+  `"families"` — rustc's `TargetOptions` deserializer rejects `families` (`unknown field`).
+* **The cargo wall is real and needs the flip:** upstream `mio`'s libc dep is
+  `[target.'cfg(any(unix, target_os = "hermit", target_os = "wasi"))'.dependencies]`, so cargo only
+  compiles libc into mio when `cfg(unix)` is true *at dep-resolution* — which only the spec's
+  `target-family` provides (RUSTFLAGS/`RUSTC_WRAPPER` `--cfg unix` runs after resolution).
+* **The blocker = a wide std cfg(unix) cascade** (beyond `os::unix`): with `target-family=unix`,
+  std's own `sys::*` cascades switch to their unix arms and need dotnet arms or break —
+  `sys/fs/mod.rs` (`with_native_path`, `OpenOptions::custom_flags`), `sys/paths/{mod,unix}.rs`
+  (`current_exe`, `OsStr::{from_bytes,as_bytes}`, `OsString::from_vec`, `OsStringExt`),
+  `sys/io/mod.rs` (`errno_location`/`set_errno`), `sys/process/mod.rs` (`getppid`), plus
+  `sys/backtrace.rs` + `os/mod.rs:36,85` + `os/fd/raw.rs` + `backtrace/.../elf.rs` referencing
+  `crate::os::unix` directly (so even *narrowing* `pub mod unix` off for dotnet breaks these
+  std-internal refs). Several pieces (AF_UNIX `os::unix::net`, `MetadataExt`, the `OsStr`
+  bytes-vs-wtf8 representation switch, the CStr `with_native_path` path model) have **no clean
+  .NET mapping** and are a multi-module std-PAL effort.
+* **What landed instead (green, additive):** the POSIX shim is now mio-runtime-complete —
+  multi-fd epoll (`posix_epoll.rs`), connect→EINPROGRESS, accept peer-addr + nonblocking,
+  SOCK_NONBLOCK socket(), and a latent `SocketException.SocketErrorCode` enum-return fix
+  (`ClassRef::socket_error`). Proven by `pal_libc` over the new multi-fd epoll. The
+  crate-scoped `RUSTC_WRAPPER` (`feasibility/rcc-rustc-wrapper.sh`) is committed but UNWIRED in
+  `dev.sh` (it only helps under the flip). **Next run:** land the std cfg(unix) cascade arms
+  (fs/paths/io/process + keep os::unix ON with dotnet arms or a narrower bytes-OsStr bridge),
+  THEN re-apply the `target-family` flip + re-wire the wrapper + drop the mio fork together.
+
 ### 4.3 Fallbacks (least → most invasive)
 1. **Status quo** — keep `target_os="dotnet"`, no family, per-crate `#[cfg(target_os="dotnet")] mod dotnet`
    via `patch.crates-io` vendoring (what mio does now). Clean for std, but it *is* the

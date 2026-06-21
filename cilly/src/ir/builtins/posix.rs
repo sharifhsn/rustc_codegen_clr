@@ -61,6 +61,7 @@ const ENOENT: i32 = 2;
 const EIO: i32 = 5;
 const EAGAIN: i32 = 11;
 const EADDRINUSE: i32 = 98;
+const EINPROGRESS: i32 = 115;
 const ECONNRESET: i32 = 104;
 const ETIMEDOUT: i32 = 110;
 const ECONNREFUSED: i32 = 111;
@@ -130,20 +131,6 @@ fn fd_entry_flags_field(asm: &mut Assembly) -> Interned<FieldDesc> {
     let name = asm.alloc_string("flags");
     asm.alloc_field(FieldDesc::new(entry, name, Type::Int(Int::I32)))
 }
-/// `target: i64` — for an EPOLL entry, the single registered fd (low 32 bits) the
-/// slice's simplified single-fd epoll tracks. For other kinds, unused.
-fn fd_entry_target_field(asm: &mut Assembly) -> Interned<FieldDesc> {
-    let entry = fd_entry_class(asm);
-    let name = asm.alloc_string("target");
-    asm.alloc_field(FieldDesc::new(entry, name, Type::Int(Int::I64)))
-}
-/// `token: i64` — for an EPOLL entry, the `epoll_data.u64` token to echo back in
-/// `epoll_wait`.
-fn fd_entry_token_field(asm: &mut Assembly) -> Interned<FieldDesc> {
-    let entry = fd_entry_class(asm);
-    let name = asm.alloc_string("token");
-    asm.alloc_field(FieldDesc::new(entry, name, Type::Int(Int::I64)))
-}
 
 /// Define `RclFdEntry` (fields handle/kind/flags + a ctor). `Access::Extern`
 /// survives DCE (the documented `UnmanagedThreadStart` workaround, thread.rs:432).
@@ -153,8 +140,6 @@ fn define_fd_entry(asm: &mut Assembly) {
     let handle = asm.alloc_string("handle");
     let kind = asm.alloc_string("kind");
     let flags = asm.alloc_string("flags");
-    let target = asm.alloc_string("target");
-    let token = asm.alloc_string("token");
     let entry = asm
         .class_def(ClassDef::new(
             name,
@@ -165,8 +150,6 @@ fn define_fd_entry(asm: &mut Assembly) {
                 (Type::Int(Int::ISize), handle, None),
                 (Type::Int(Int::I32), kind, None),
                 (Type::Int(Int::I32), flags, None),
-                (Type::Int(Int::I64), target, None),
-                (Type::Int(Int::I64), token, None),
             ],
             vec![],
             Access::Extern,
@@ -224,6 +207,97 @@ fn new_fd_entry(
         asm,
     );
     asm.alloc_node(CILNode::call(ctor, [handle, kind, flags]))
+}
+
+// ===========================================================================
+// RclEpollReg — the per-fd interest record stored in an epoll instance's
+// interest dict (`Dictionary<i32, object>`, key = registered fd, value = boxed
+// RclEpollReg). Multi-fd epoll: ONE epoll instance tracks a SET of registered
+// fds, each carrying its `events` mask + epoll_data `token`. (Cap-2 upgrade from
+// the Cap-1 single-fd-per-instance epoll.)
+// ===========================================================================
+
+/// The `RclEpollReg` managed class: `{ events: i32, token: i64 }` (a reference
+/// type, like RclFdEntry).
+fn epoll_reg_class(asm: &mut Assembly) -> Interned<ClassRef> {
+    let name = asm.alloc_string("RclEpollReg");
+    asm.alloc_class_ref(ClassRef::new(name, None, false, [].into()))
+}
+fn epoll_reg_events_field(asm: &mut Assembly) -> Interned<FieldDesc> {
+    let cls = epoll_reg_class(asm);
+    let name = asm.alloc_string("events");
+    asm.alloc_field(FieldDesc::new(cls, name, Type::Int(Int::I32)))
+}
+fn epoll_reg_token_field(asm: &mut Assembly) -> Interned<FieldDesc> {
+    let cls = epoll_reg_class(asm);
+    let name = asm.alloc_string("token");
+    asm.alloc_field(FieldDesc::new(cls, name, Type::Int(Int::I64)))
+}
+
+/// Define `RclEpollReg` (fields events/token + a ctor). `Access::Extern` survives
+/// DCE (the documented `UnmanagedThreadStart` workaround, as for RclFdEntry).
+fn define_epoll_reg(asm: &mut Assembly) {
+    let name = asm.alloc_string("RclEpollReg");
+    let object = ClassRef::object(asm);
+    let events = asm.alloc_string("events");
+    let token = asm.alloc_string("token");
+    let cls = asm
+        .class_def(ClassDef::new(
+            name,
+            false,
+            0,
+            Some(object),
+            vec![
+                (Type::Int(Int::I32), events, None),
+                (Type::Int(Int::I64), token, None),
+            ],
+            vec![],
+            Access::Extern,
+            None,
+            None,
+            true,
+        ))
+        .unwrap();
+
+    let ctor_name = asm.alloc_string(".ctor");
+    let this = asm.alloc_node(CILNode::LdArg(0));
+    let ld_events = asm.alloc_node(CILNode::LdArg(1));
+    let ld_token = asm.alloc_node(CILNode::LdArg(2));
+    let events_field = asm.alloc_field(FieldDesc::new(*cls, events, Type::Int(Int::I32)));
+    let token_field = asm.alloc_field(FieldDesc::new(*cls, token, Type::Int(Int::I64)));
+    let set_events = asm.alloc_root(CILRoot::SetField(Box::new((events_field, this, ld_events))));
+    let set_token = asm.alloc_root(CILRoot::SetField(Box::new((token_field, this, ld_token))));
+    let ret = asm.alloc_root(CILRoot::VoidRet);
+    let ctor_sig = asm.sig(
+        [Type::ClassRef(*cls), Type::Int(Int::I32), Type::Int(Int::I64)],
+        Type::Void,
+    );
+    asm.new_method(MethodDef::new(
+        Access::Public,
+        cls,
+        ctor_name,
+        ctor_sig,
+        MethodKind::Constructor,
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![set_events, set_token, ret], 0, None)],
+            locals: vec![],
+        },
+        vec![None, Some(events), Some(token)],
+    ));
+}
+
+/// `new RclEpollReg(events, token)`.
+fn new_epoll_reg(
+    asm: &mut Assembly,
+    events: Interned<CILNode>,
+    token: Interned<CILNode>,
+) -> Interned<CILNode> {
+    let cls = epoll_reg_class(asm);
+    let ctor = asm.class_ref(cls).clone().ctor(
+        &[Type::Int(Int::I32), Type::Int(Int::I64)],
+        asm,
+    );
+    asm.alloc_node(CILNode::call(ctor, [events, token]))
 }
 
 /// Allocate the fd-table statics + initialize them. The fd-table (the `rcl_fd_table`
@@ -645,9 +719,15 @@ fn define_errno_from_exception(asm: &mut Assembly) {
     let exn2 = asm.alloc_node(CILNode::LdArg(0));
     let se_cast = asm.alloc_node(CILNode::CheckedCast(exn2, se_ty));
     let get_code_name = asm.alloc_string("get_SocketErrorCode");
+    // `SocketException.SocketErrorCode` returns the `SocketError` ENUM, not i32 —
+    // the CLR matches the signature exactly, so declaring i32 yields a runtime
+    // MissingMethodException. Declare the enum return; the int-backed enum value
+    // is its underlying i32 on the eval stack (same transparency used for the
+    // SelectMode/SocketShutdown enum params elsewhere in the shim).
+    let socket_error = ClassRef::socket_error(asm);
     let get_code = asm.class_ref(socket_exception).clone().instance(
         &[],
-        Type::Int(Int::I32),
+        Type::ClassRef(socket_error),
         get_code_name,
         asm,
     );
@@ -676,7 +756,7 @@ fn define_errno_from_exception(asm: &mut Assembly) {
     let r_eaddrinuse = mk_ret(asm, EADDRINUSE);
     let r_default = mk_ret(asm, EIO);
 
-    let i32_ty = asm.alloc_type(Type::Int(Int::I32));
+    let se_local_ty = asm.alloc_type(Type::ClassRef(socket_error));
     let sig = asm.sig([Type::PlatformObject], Type::Int(Int::I32));
     asm.new_method(MethodDef::new(
         Access::Public,
@@ -700,7 +780,75 @@ fn define_errno_from_exception(asm: &mut Assembly) {
                 BasicBlock::new(vec![r_eaddrinuse], 14, None),
                 BasicBlock::new(vec![r_default], 15, None),
             ],
-            locals: vec![(None, i32_ty)],
+            locals: vec![(None, se_local_ty)],
+        },
+        vec![None],
+    ));
+}
+
+/// `rcl_connect_errno_from_exception(System.Object exn) -> i32` — the connect()
+/// errno map: a non-blocking `Socket.Connect` to a not-yet-accepted endpoint
+/// throws `SocketException(WouldBlock)`, which POSIX `connect` reports as
+/// **EINPROGRESS** (NOT EAGAIN). mio's `connect` (tcp.rs) treats ONLY EINPROGRESS
+/// as success; the default map (WouldBlock→EAGAIN) would make mio fail the
+/// connect. Everything else delegates to the general `rcl_errno_from_exception`.
+fn define_connect_errno_from_exception(asm: &mut Assembly) {
+    let main_module = asm.main_module();
+    let name = asm.alloc_string("rcl_connect_errno_from_exception");
+    let socket_exception = ClassRef::socket_exception(asm);
+    let se_ty = asm.alloc_type(Type::ClassRef(socket_exception));
+
+    // block 0: if !(exn isinst SocketException) goto 1 (delegate); else goto 2.
+    let exn = asm.alloc_node(CILNode::LdArg(0));
+    let is_se = asm.alloc_node(CILNode::IsInst(exn, se_ty));
+    let goto_delegate = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, Some(BranchCond::False(is_se))))));
+    let goto_se = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None))));
+    // block 1: ret rcl_errno_from_exception(exn).
+    let delegate = main_static(asm, "rcl_errno_from_exception", &[Type::PlatformObject], Type::Int(Int::I32));
+    let exn_d = asm.alloc_node(CILNode::LdArg(0));
+    let mapped = asm.alloc_node(CILNode::call(delegate, [exn_d]));
+    let ret_delegate = asm.alloc_root(CILRoot::Ret(mapped));
+    // block 2: code = ((SocketException)exn).SocketErrorCode;
+    //   if code == WouldBlock -> ret EINPROGRESS else delegate (goto 1).
+    let exn2 = asm.alloc_node(CILNode::LdArg(0));
+    let se_cast = asm.alloc_node(CILNode::CheckedCast(exn2, se_ty));
+    let get_code_name = asm.alloc_string("get_SocketErrorCode");
+    // `SocketErrorCode` returns the `SocketError` enum (see the general mapper);
+    // declaring i32 would MissingMethodException at runtime. Store into an
+    // enum-typed local, then compare (int-backed enum is its underlying i32).
+    let socket_error = ClassRef::socket_error(asm);
+    let get_code = asm.class_ref(socket_exception).clone().instance(
+        &[],
+        Type::ClassRef(socket_error),
+        get_code_name,
+        asm,
+    );
+    let code = asm.alloc_node(CILNode::call(get_code, [se_cast]));
+    let store_code = asm.alloc_root(CILRoot::StLoc(0, code));
+    let code_l = asm.alloc_node(CILNode::LdLoc(0));
+    let wb = asm.alloc_node(Const::I32(SE_WOULD_BLOCK));
+    let br_wb = asm.alloc_root(CILRoot::Branch(Box::new((3, 0, Some(BranchCond::Eq(code_l, wb))))));
+    let goto_delegate2 = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
+    // block 3: ret EINPROGRESS.
+    let einprog = asm.alloc_node(Const::I32(EINPROGRESS));
+    let ret_einprog = asm.alloc_root(CILRoot::Ret(einprog));
+
+    let se_local_ty = asm.alloc_type(Type::ClassRef(socket_error));
+    let sig = asm.sig([Type::PlatformObject], Type::Int(Int::I32));
+    asm.new_method(MethodDef::new(
+        Access::Public,
+        main_module,
+        name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![
+                BasicBlock::new(vec![goto_delegate, goto_se], 0, None),
+                BasicBlock::new(vec![ret_delegate], 1, None),
+                BasicBlock::new(vec![store_code, br_wb, goto_delegate2], 2, None),
+                BasicBlock::new(vec![ret_einprog], 3, None),
+            ],
+            locals: vec![(None, se_local_ty)],
         },
         vec![None],
     ));
@@ -722,16 +870,29 @@ fn define_errno_from_exception(asm: &mut Assembly) {
 // ===========================================================================
 fn errno_wrapped(
     asm: &mut Assembly,
+    body: Vec<Interned<CILRoot>>,
+    ret_ty: Type,
+    extra_locals: Vec<(Option<Interned<crate::IString>>, Interned<Type>)>,
+) -> MethodImpl {
+    errno_wrapped_with(asm, body, ret_ty, extra_locals, "rcl_errno_from_exception")
+}
+
+/// `errno_wrapped`, but the catch handler maps the exception via `mapper` (a
+/// main-module `(object) -> i32` MethodDef). `connect` uses the
+/// EINPROGRESS-aware `rcl_connect_errno_from_exception`.
+fn errno_wrapped_with(
+    asm: &mut Assembly,
     mut body: Vec<Interned<CILRoot>>,
     ret_ty: Type,
     extra_locals: Vec<(Option<Interned<crate::IString>>, Interned<Type>)>,
+    mapper: &str,
 ) -> MethodImpl {
     let leave_ok = asm.alloc_root(CILRoot::ExitSpecialRegion { target: 2, source: 0 });
     body.push(leave_ok);
 
-    // Block 1 (catch): errno = rcl_errno_from_exception(GetException); local0=-1; leave->2.
+    // Block 1 (catch): errno = <mapper>(GetException); local0=-1; leave->2.
     let get_exn = asm.alloc_node(CILNode::GetException);
-    let map = main_static(asm, "rcl_errno_from_exception", &[Type::PlatformObject], Type::Int(Int::I32));
+    let map = main_static(asm, mapper, &[Type::PlatformObject], Type::Int(Int::I32));
     let mapped = asm.alloc_node(CILNode::call(map, [get_exn]));
     let errno_field = errno_sfld(asm);
     let set_errno = asm.alloc_root(CILRoot::SetStaticField { field: errno_field, val: mapped });

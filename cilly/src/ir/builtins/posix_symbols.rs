@@ -243,8 +243,13 @@ fn insert_socket(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let af = asm.alloc_node(CILNode::BinOp(v4, term, BinOp::Add));
         let store_af = asm.alloc_root(CILRoot::StLoc(1, af));
 
-        // ty = (type == SOCK_DGRAM) ? Dgram : Stream ; proto = Dgram?Udp:Tcp.
+        // ty = ((type & 0xFF) == SOCK_DGRAM) ? Dgram : Stream ; proto = Dgram?Udp:Tcp.
+        // mio ORs SOCK_NONBLOCK(2048)|SOCK_CLOEXEC(524288) into `type` (net.rs), so a
+        // bare `type == SOCK_DGRAM` misclassifies a non-blocking stream socket as UDP.
+        // Mask to the low byte (the real socket-type field) before comparing.
         let typ = asm.alloc_node(CILNode::LdArg(1));
+        let type_mask = asm.alloc_node(Const::I32(0xFF));
+        let typ = asm.alloc_node(CILNode::BinOp(typ, type_mask, BinOp::And));
         let dgram_p = asm.alloc_node(Const::I32(POSIX_SOCK_DGRAM));
         let is_dgram = asm.alloc_node(CILNode::BinOp(typ, dgram_p, BinOp::Eq));
         let is_dgram_i = asm.int_cast(is_dgram, Int::I32, ExtendKind::ZeroExtend);
@@ -259,6 +264,8 @@ fn insert_socket(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let p_diff = asm.alloc_node(Const::I32(DOTNET_PROTO_UDP - DOTNET_PROTO_TCP));
         let is_dgram_i2 = {
             let typ2 = asm.alloc_node(CILNode::LdArg(1));
+            let type_mask2 = asm.alloc_node(Const::I32(0xFF));
+            let typ2 = asm.alloc_node(CILNode::BinOp(typ2, type_mask2, BinOp::And));
             let dgram_p2 = asm.alloc_node(Const::I32(POSIX_SOCK_DGRAM));
             let eq2 = asm.alloc_node(CILNode::BinOp(typ2, dgram_p2, BinOp::Eq));
             asm.int_cast(eq2, Int::I32, ExtendKind::ZeroExtend)
@@ -278,12 +285,32 @@ fn insert_socket(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let st_l = asm.alloc_node(CILNode::LdLoc(2));
         let proto_l = asm.alloc_node(CILNode::LdLoc(3));
         let h = asm.alloc_node(CILNode::call(m, [af_l, st_l, proto_l]));
+        let store_h = asm.alloc_root(CILRoot::StLoc(4, h));
+        // Honor SOCK_NONBLOCK (2048): mio ORs it into `type` and depends on the
+        // socket being non-blocking for its readiness model. nb = (type & 2048)!=0
+        // ? 1 : 0 = 1 - ((type & 2048) == 0); set on the BCL Socket. (Always-set on
+        // a blocking socket would be a no-op `set_nonblocking(.,0)`.)
+        const SOCK_NONBLOCK: i32 = 2048;
+        let typ_nb = asm.alloc_node(CILNode::LdArg(1));
+        let nbmask = asm.alloc_node(Const::I32(SOCK_NONBLOCK));
+        let masked_nb = asm.alloc_node(CILNode::BinOp(typ_nb, nbmask, BinOp::And));
+        let zero_nb = asm.alloc_node(Const::I32(0));
+        let is_zero_nb = asm.alloc_node(CILNode::BinOp(masked_nb, zero_nb, BinOp::Eq));
+        let is_zero_nb = asm.int_cast(is_zero_nb, Int::I32, ExtendKind::ZeroExtend);
+        let one_nb = asm.alloc_node(Const::I32(1));
+        let nb = asm.alloc_node(CILNode::BinOp(one_nb, is_zero_nb, BinOp::Sub));
+        let set_nb = dotnet_mref(asm, "rcl_dotnet_net_set_nonblocking", &[void_ptr, Type::Int(Int::I32)], Type::Int(Int::I32));
+        let hh = asm.alloc_node(CILNode::LdLoc(4));
+        let snb = asm.alloc_node(CILNode::call(set_nb, [hh, nb]));
+        let pop_nb = asm.alloc_root(CILRoot::Pop(snb));
         // fd = rcl_fdtable_insert(h, SOCKET, 0); local 0 = fd.
-        let fd = call_fdtable_insert(asm, h, FD_KIND_SOCKET, 0);
+        let hh2 = asm.alloc_node(CILNode::LdLoc(4));
+        let fd = call_fdtable_insert(asm, hh2, FD_KIND_SOCKET, 0);
         let store_fd = asm.alloc_root(CILRoot::StLoc(0, fd));
 
-        let body = vec![store_af, store_st, store_proto, store_fd];
+        let body = vec![store_af, store_st, store_proto, store_h, pop_nb, store_fd];
         let i32_ty = asm.alloc_type(Type::Int(Int::I32));
+        let void_ptr_idx = asm.alloc_type(void_ptr);
         errno_wrapped(
             asm,
             body,
@@ -292,6 +319,7 @@ fn insert_socket(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
                 (None, i32_ty),
                 (None, i32_ty),
                 (None, i32_ty),
+                (None, void_ptr_idx),
             ],
         )
     };
@@ -375,14 +403,117 @@ fn insert_connect(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let do_connect = asm.alloc_root(CILRoot::call(connect, [s, ep]));
         let zero = asm.alloc_node(Const::I32(0));
         let store0 = asm.alloc_root(CILRoot::StLoc(0, zero));
-        errno_wrapped(asm, vec![do_connect, store0], Type::Int(Int::I32), vec![])
+        // A non-blocking Socket.Connect to a not-yet-accepted endpoint throws
+        // SocketException(WouldBlock); the connect-specific mapper turns that into
+        // errno=EINPROGRESS (mio's connect treats ONLY EINPROGRESS as success).
+        errno_wrapped_with(
+            asm,
+            vec![do_connect, store0],
+            Type::Int(Int::I32),
+            vec![],
+            "rcl_connect_errno_from_exception",
+        )
     };
     patcher.insert(name, Box::new(generator));
 }
 
 /// `accept(fd, *sockaddr, *socklen) -> i32` — `c = s.Accept()`; register `c` as a
-/// new SOCKET fd; (we do NOT write the peer sockaddr out — std/probe re-query via
-/// getpeername if needed; the slice keeps it minimal but correct: out may be NULL).
+/// new non-blocking SOCKET fd, and write the peer endpoint into the caller's
+/// sockaddr out-param (mio's accept ALWAYS calls `to_socket_addr(addr)` and fails
+/// with InvalidInput if it is not a valid sockaddr).
+/// `rcl_accept_write_addr(Socket conn, *void sa, *void len)` — write `conn`'s
+/// RemoteEndPoint into the caller's `sockaddr_in` (`sa`) + `*len = 16`, but ONLY
+/// if `sa != null` (a raw probe like pal_libc passes NULL; mio passes a real
+/// pointer). The null branch lets accept's body stay single-block (errno_wrapped).
+fn define_accept_write_addr(asm: &mut Assembly) {
+    let socket = ClassRef::socket(asm);
+    let ip_endpoint = ClassRef::ip_endpoint(asm);
+    let endpoint_base = ClassRef::endpoint(asm);
+    let main_module = asm.main_module();
+    let void_ptr = asm.nptr(Type::Void);
+
+    // block 0: if sa(arg1) == null -> ret (block 3); else fall to 1.
+    let sa = asm.alloc_node(CILNode::LdArg(1));
+    let sa_isize = asm.alloc_node(CILNode::PtrCast(sa, Box::new(PtrCastRes::ISize)));
+    let zero = asm.alloc_node(Const::ISize(0));
+    let br_null = asm.alloc_root(CILRoot::Branch(Box::new((
+        3,
+        0,
+        Some(BranchCond::Eq(sa_isize, zero)),
+    ))));
+    let goto_write = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
+
+    // block 1: ep = (IPEndPoint)conn.RemoteEndPoint; store local 0;
+    //   write family/port/addr into *arg1 (via write_sockaddr_out on ep_local 0,
+    //   bytes_local 1, sa_arg 1); goto 2.
+    let conn = asm.alloc_node(CILNode::LdArg(0));
+    let get_remote_name = asm.alloc_string("get_RemoteEndPoint");
+    let get_remote = asm.class_ref(socket).clone().instance(
+        &[],
+        Type::ClassRef(endpoint_base),
+        get_remote_name,
+        asm,
+    );
+    let ep_obj = asm.alloc_node(CILNode::call(get_remote, [conn]));
+    let ip_ep_ty = asm.alloc_type(Type::ClassRef(ip_endpoint));
+    let ep = asm.alloc_node(CILNode::CheckedCast(ep_obj, ip_ep_ty));
+    let store_ep = asm.alloc_root(CILRoot::StLoc(0, ep));
+    let mut blk1 = vec![store_ep];
+    blk1.extend(write_sockaddr_out(asm, 0, 1, 1));
+    let goto_len = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None))));
+    blk1.push(goto_len);
+
+    // block 2: if len(arg2) != null -> *(u32*)len = 16; then ret.
+    let len = asm.alloc_node(CILNode::LdArg(2));
+    let len_isize = asm.alloc_node(CILNode::PtrCast(len, Box::new(PtrCastRes::ISize)));
+    let zero2 = asm.alloc_node(Const::ISize(0));
+    let br_len_null = asm.alloc_root(CILRoot::Branch(Box::new((
+        3,
+        0,
+        Some(BranchCond::Eq(len_isize, zero2)),
+    ))));
+    let len2 = asm.alloc_node(CILNode::LdArg(2));
+    let u32_ty = asm.alloc_type(Type::Int(Int::U32));
+    let len_ptr = asm.alloc_node(CILNode::PtrCast(len2, Box::new(PtrCastRes::Ptr(u32_ty))));
+    let sixteen = asm.alloc_node(Const::U32(16));
+    let st_len = asm.alloc_root(CILRoot::StInd(Box::new((len_ptr, sixteen, Type::Int(Int::U32), false))));
+    let goto_ret = asm.alloc_root(CILRoot::Branch(Box::new((3, 0, None))));
+
+    // block 3: ret.
+    let ret = asm.alloc_root(CILRoot::VoidRet);
+
+    let ip_ep_local = asm.alloc_type(Type::ClassRef(ip_endpoint));
+    let byte_ty = asm.alloc_type(Type::Int(Int::U8));
+    let byte_arr = asm.alloc_type(Type::PlatformArray {
+        elem: byte_ty,
+        dims: std::num::NonZeroU8::new(1).unwrap(),
+    });
+    let name = asm.alloc_string("rcl_accept_write_addr");
+    let endpoint_local_name = asm.alloc_string("endpoint");
+    let bytes_local_name = asm.alloc_string("bytes");
+    let sig = asm.sig([Type::ClassRef(socket), void_ptr, void_ptr], Type::Void);
+    asm.new_method(MethodDef::new(
+        Access::Public,
+        main_module,
+        name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![
+                BasicBlock::new(vec![br_null, goto_write], 0, None),
+                BasicBlock::new(blk1, 1, None),
+                BasicBlock::new(vec![br_len_null, st_len, goto_ret], 2, None),
+                BasicBlock::new(vec![ret], 3, None),
+            ],
+            locals: vec![
+                (Some(endpoint_local_name), ip_ep_local),
+                (Some(bytes_local_name), byte_arr),
+            ],
+        },
+        vec![None, None, None],
+    ));
+}
+
 fn insert_accept(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let mk = |asm: &mut Assembly| -> MethodImpl {
         let socket = ClassRef::socket(asm);
@@ -397,8 +528,21 @@ fn insert_accept(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
             accept_name,
             asm,
         );
+        let ip_endpoint = ClassRef::ip_endpoint(asm);
+        let endpoint_base = ClassRef::endpoint(asm);
         let conn = asm.alloc_node(CILNode::call(accept, [s]));
         let store_conn = asm.alloc_root(CILRoot::StLoc(1, conn));
+        // conn.Blocking = false (mio accepts with SOCK_NONBLOCK and depends on it).
+        let set_blocking_name = asm.alloc_string("set_Blocking");
+        let set_blocking = asm.class_ref(socket).clone().instance(
+            &[Type::Bool],
+            Type::Void,
+            set_blocking_name,
+            asm,
+        );
+        let conn_b = asm.alloc_node(CILNode::LdLoc(1));
+        let false_c = asm.alloc_node(Const::Bool(false));
+        let do_set_blocking = asm.alloc_root(CILRoot::call(set_blocking, [conn_b, false_c]));
         // handle = (void*)GCHandle.Alloc(conn).
         let handle = CILNode::LdLoc(1).ref_to_handle(asm);
         let handle = asm.alloc_node(handle);
@@ -406,12 +550,31 @@ fn insert_accept(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let handle = asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::Ptr(void))));
         let new_fd = call_fdtable_insert(asm, handle, FD_KIND_SOCKET, 0);
         let store_fd = asm.alloc_root(CILRoot::StLoc(0, new_fd));
-        let _ = void_ptr;
+        let _ = (void_ptr, ip_endpoint, endpoint_base);
+        // Write the peer endpoint into the caller's sockaddr out-param + socklen via
+        // the rcl_accept_write_addr helper. The helper NULL-CHECKS arg1/arg2 (a raw
+        // `extern "C"` probe like pal_libc passes NULL; mio passes a real pointer),
+        // so the conditional write lives in that MethodDef — keeping accept's body
+        // single-block for the errno_wrapped try/catch. Pass (conn, sa, socklen).
+        let writer = main_static(
+            asm,
+            "rcl_accept_write_addr",
+            &[Type::ClassRef(socket), void_ptr, void_ptr],
+            Type::Void,
+        );
+        let conn_w = asm.alloc_node(CILNode::LdLoc(1));
+        let sa_arg = asm.alloc_node(CILNode::LdArg(1));
+        let sa_arg = asm.cast_ptr(sa_arg, void_ptr);
+        let len_arg = asm.alloc_node(CILNode::LdArg(2));
+        let len_arg = asm.cast_ptr(len_arg, void_ptr);
+        let do_write = asm.alloc_root(CILRoot::call(writer, [conn_w, sa_arg, len_arg]));
+        let body = vec![store_conn, do_set_blocking, store_fd, do_write];
+
         let sock_ty = asm.alloc_type(Type::ClassRef(socket));
         let conn_name = asm.alloc_string("conn");
         errno_wrapped(
             asm,
-            vec![store_conn, store_fd],
+            body,
             Type::Int(Int::I32),
             vec![(Some(conn_name), sock_ty)],
         )
@@ -888,26 +1051,31 @@ fn handle_to_socket_node(asm: &mut Assembly, handle: Interned<CILNode>) -> Inter
 
 /// Registers the Phase-0 fd-table + errno + the Phase-1 POSIX symbol cluster.
 ///
-/// PROOF 2 (driving *unmodified* upstream mio through this) is OUT OF SLICE — a
-/// genuine wall, not a cfg flip (LIBC_SHIM_SCOPE §4 / the plan's mioWiring):
-///   (a) mio's epoll selector is gated on `target_os in {linux,…}`; libc's
-///       `epoll_*` externs live under `cfg(target_os="linux")` → both need a
-///       linux-shaped cfg scoped to mio+libc ALONE (e.g. a crate-name
-///       RUSTC_WRAPPER adding `--cfg unix,target_os="linux",target_env="gnu"`).
-///   (b) THE cargo wall: mio's `libc` dep is `[target.'cfg(unix…)'.dependencies]`
-///       (vendor/mio/Cargo.toml), so on os=dotnet cargo never compiles libc into
-///       mio AT ALL; RUSTFLAGS `--cfg` runs AFTER dep resolution and cannot pull
-///       it in. Needs a one-line un-gate of mio's Cargo.toml or a [patch] libc.
-///   (c) THE capstone: mio's `Source` impl is bounded `T: AsRawFd` and builds
-///       streams via `FromRawFd`; dotnet std's net `Socket` implements NEITHER
-///       (no `std::os::fd` on dotnet). Needs the std net Socket made fd-backed
-///       (LIBC_SHIM_SCOPE §4.2 item 2 — the explicitly-LAST capstone).
-/// So `pal_mio` stays on its working D1 vendored-fork arm; the FLOOR proof
-/// (`pal_libc`, a raw `extern "C"` loopback echo + ENOENT errno round-trip)
-/// proves the fd-table + symbols + errno end-to-end with NO mio.
+/// CAP-2 STATE: the POSIX shim is now mio-RUNTIME-complete — multi-fd epoll
+/// (posix_epoll.rs: a per-instance interest Dictionary swept per-fd via
+/// Socket.Poll), connect→EINPROGRESS, accept peer-addr write + nonblocking,
+/// SOCK_NONBLOCK-aware socket(). The FLOOR proof `pal_libc` (a raw `extern "C"`
+/// loopback echo over THIS multi-fd epoll + an ENOENT errno round-trip) exercises
+/// the whole cluster end-to-end with NO mio.
+///
+/// DEFERRED (the headline, driving *unmodified* upstream mio): the prerequisite is
+/// the `target_family=["unix"]` flip in x86_64-unknown-dotnet.json — the ONLY way
+/// cargo resolves mio's `[target.'cfg(unix)'.dependencies] libc` (RUSTFLAGS `--cfg`
+/// runs AFTER dep resolution). That flip is built (a crate-scoped RUSTC_WRAPPER,
+/// feasibility/rcc-rustc-wrapper.sh, forces target_os="linux"+target_env="gnu" on
+/// mio+libc so mio picks selector/epoll.rs + waker/eventfd.rs and libc exposes its
+/// linux epoll/sockaddr surface). BUT the flip turns on `target_family=unix`
+/// GLOBALLY, which switches std's own `sys::{fs,paths,io,process}` + `os::unix`
+/// cascades to their unix arms — a wide std cfg(unix) cascade (with_native_path,
+/// OsStr-bytes, errno_location, getppid, os::unix internal refs in backtrace/
+/// os/mod.rs) that exceeds this slice's budget and several pieces have no clean
+/// .NET mapping (AF_UNIX, MetadataExt). So the flip is REVERTED to keep main green
+/// (Cap-1 state); `pal_mio` stays on its vendored-fork arm. See
+/// docs/LIBC_SHIM_SCOPE.md §4.2 + the cap2 memory for the std-arm break list.
 pub fn insert_posix_shim(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     // statics + entry class + fd-table builtins (defs, not overrides).
     define_fd_entry(asm);
+    define_epoll_reg(asm);
     init_statics(asm);
     define_fdtable_builtins(asm);
     // Overrides so the dotnet std net Socket onion's bare `extern "C"`
@@ -916,6 +1084,7 @@ pub fn insert_posix_shim(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
 
     // errno.
     define_errno_from_exception(asm);
+    define_connect_errno_from_exception(asm);
     insert_errno_location(asm, patcher);
 
     // fd I/O.
@@ -930,6 +1099,7 @@ pub fn insert_posix_shim(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
     insert_bind(asm, patcher);
     insert_listen(asm, patcher);
     insert_connect(asm, patcher);
+    define_accept_write_addr(asm);
     insert_accept(asm, patcher);
     insert_send_recv(asm, patcher);
     insert_shutdown(asm, patcher);
