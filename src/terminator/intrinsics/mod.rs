@@ -473,6 +473,11 @@ pub fn handle_intrinsic<'tcx>(
                     .expect("needs_drop works only on types!"),
             );
             let tpe = ctx.monomorphize(pointed_ty);
+            // Swapping a pair of ZSTs swaps zero bytes. A ZST lowers to
+            // `Type::Void`, whose `size_of` is invalid, so short-circuit to a no-op.
+            if ctx.layout_of(tpe).is_zst() {
+                return vec![ctx.alloc_root(cilly::ir::CILRoot::Nop)];
+            }
             let tpe = ctx.type_from_cache(tpe);
             let void_ptr = ctx.nptr(Type::Void);
             let generic = MethodRef::new(

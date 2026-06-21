@@ -70,11 +70,20 @@ pub fn handle_statement<'tcx>(
                     dst,
                     count,
                 }) => {
+                    let src_ty = src.ty(ctx.body(), ctx.tcx());
+                    let src_ty = ctx.monomorphize(src_ty);
+                    // Copying N ZSTs moves zero bytes. A ZST element lowers to
+                    // `Type::Void`, whose `size_of` is invalid, so short-circuit
+                    // the copy to a no-op before computing the byte count.
+                    let pointee = src_ty
+                        .builtin_deref(true)
+                        .expect("Copy nonoverlapping called with non-pointer type");
+                    if is_zst(ctx.monomorphize(pointee), ctx.tcx()) {
+                        return vec![ctx.alloc_root(cilly::ir::CILRoot::Nop)];
+                    }
                     let dst_op = handle_operand(dst, ctx);
                     let src_op = handle_operand(src, ctx);
                     let count_op = handle_operand(count, ctx);
-                    let src_ty = src.ty(ctx.body(), ctx.tcx());
-                    let src_ty = ctx.monomorphize(src_ty);
                     let ptr_type = ctx.type_from_cache(src_ty);
                     let cilly::Type::Ptr(pointed) = ptr_type else {
                         rustc_middle::ty::print::with_no_trimmed_paths! { panic!("Copy nonoverlaping called with non-pointer type {src_ty:?}")};

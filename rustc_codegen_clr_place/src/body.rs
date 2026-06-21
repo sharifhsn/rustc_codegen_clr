@@ -251,8 +251,6 @@ pub fn place_elem_body<'tcx>(
             let curr_ty = curr_ty
                 .as_ty()
                 .expect("INVALID PLACE: Indexing into enum variant???");
-            let index = ctx.alloc_node(Const::USize(*offset));
-            assert!(!from_end);
             match curr_ty.kind() {
                 TyKind::Slice(inner) => {
                     let inner = ctx.monomorphize(*inner);
@@ -263,6 +261,19 @@ pub fn place_elem_body<'tcx>(
                         ctx.alloc_string(cilly::DATA_PTR),
                         ctx.nptr(Type::Void),
                     );
+                    let metadata = FieldDesc::new(
+                        slice,
+                        ctx.alloc_string(cilly::METADATA),
+                        Type::Int(Int::USize),
+                    );
+                    // `from_end` slice tail-patterns (e.g. `let [.., x] = ..`) index
+                    // relative to the slice length: index = len - offset.
+                    let index = if *from_end {
+                        let len_fld = ctx.ld_field(parrent_node, metadata);
+                        ctx.biop(len_fld, Const::USize(*offset), BinOp::Sub)
+                    } else {
+                        ctx.alloc_node(Const::USize(*offset))
+                    };
 
                     let addr = ctx.ld_field(parrent_node, desc);
                     let addr = ctx.cast_ptr(addr, inner_type);
@@ -278,6 +289,10 @@ pub fn place_elem_body<'tcx>(
                     }
                 }
                 TyKind::Array(element, _length) => {
+                    // Arrays have a static length, so rustc never lowers array
+                    // tail-patterns to `from_end`.
+                    assert!(!from_end, "Can't index array from end!");
+                    let index = ctx.alloc_node(Const::USize(*offset));
                     let element_tpe = ctx.type_from_cache(*element);
                     if body_ty_is_by_address(*element, ctx) {
                         let parrent_node = ctx.cast_ptr(parrent_node, element_tpe);

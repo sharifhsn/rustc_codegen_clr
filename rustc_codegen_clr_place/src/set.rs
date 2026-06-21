@@ -8,7 +8,7 @@ use rustc_codegen_clr_type::{
 
 use crate::{PlaceTy, pointed_type};
 use cilly::{
-    Assembly, BinOp, Interned, IntoAsmIndex, Type,
+    Assembly, BinOp, Const, Interned, IntoAsmIndex, Type,
     cilnode::{ExtendKind, IsPure},
     {ClassRef, FieldDesc, Int, MethodRef, cilnode::MethodKind},
 };
@@ -127,8 +127,6 @@ pub fn place_elem_set<'a>(
             let curr_ty = curr_type
                 .as_ty()
                 .expect("INVALID PLACE: Indexing into enum variant???");
-            let index = ctx.alloc_node(*offset);
-            assert!(!from_end, "Indexing slice form end");
 
             match curr_ty.kind() {
                 TyKind::Slice(inner) => {
@@ -163,8 +161,15 @@ pub fn place_elem_set<'a>(
                     let base = ctx.ld_field(addr_calc, desc);
                     let base = ctx.cast_ptr(base, inner_ptr);
 
-                    let index_us = ctx.int_cast(index, Int::USize, ExtendKind::ZeroExtend);
                     let meta_val = ctx.ld_field(addr_calc, metadata);
+                    // `from_end` slice tail-patterns (e.g. `let [.., x] = ..`) index
+                    // relative to the slice length: index = len - offset.
+                    let index = if *from_end {
+                        ctx.biop(meta_val, Const::USize(*offset), BinOp::Sub)
+                    } else {
+                        ctx.alloc_node(Const::USize(*offset))
+                    };
+                    let index_us = ctx.int_cast(index, Int::USize, ExtendKind::ZeroExtend);
                     let mref = ctx.alloc_methodref(mref);
                     let checked = ctx.call(mref, &[index_us, meta_val], IsPure::NOT);
 
@@ -176,6 +181,10 @@ pub fn place_elem_set<'a>(
                 }
                 TyKind::Array(element, _length) => {
                     //println!("WARNING: ConstantIndex has required min_length of {min_length}, but bounds checking on const access not supported yet!");
+                    // Arrays have a static length, so rustc never lowers array
+                    // tail-patterns to `from_end`.
+                    assert!(!from_end, "Can't index array from end!");
+                    let index = ctx.alloc_node(Const::USize(*offset));
                     let element = ctx.monomorphize(*element);
                     let element = ctx.type_from_cache(element);
                     let array_type = ctx.type_from_cache(curr_ty);

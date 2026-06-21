@@ -31,6 +31,11 @@ pub fn write_bytes<'tcx>(
             .as_type()
             .expect("needs_drop works only on types!"),
     );
+    // Writing bytes over N ZSTs writes zero bytes. A ZST lowers to `Type::Void`,
+    // whose `size_of` is invalid, so short-circuit to a no-op.
+    if ctx.layout_of(tpe).is_zst() {
+        return ctx.alloc_root(CILRoot::Nop);
+    }
     let tpe = ctx.type_from_cache(tpe);
     let dst = handle_operand(&args[0].node, ctx);
     let val = handle_operand(&args[1].node, ctx);
