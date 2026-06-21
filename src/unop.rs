@@ -83,6 +83,13 @@ pub fn unop<'tcx>(
             _ => ctx.not(parrent_node),
         },
         rustc_middle::mir::UnOp::PtrMetadata => {
+            // Dispatch on the MONOMORPHIZED pointee. `ty` here is the operand type as written in
+            // the (generic) MIR body, so for an instance like `ptr_metadata::<[u8]>` inlined from a
+            // generic context the pointee can still be a `Param`/projection. Matching the raw kind
+            // would route a slice/str pointee through the `_ =>` arm and synthesise a `Void`
+            // (ZST) metadata — which later stores as 0, zeroing a fat pointer's length
+            // (e.g. `Box::<[u8]>::from(&[u8])` -> `len == 0`).
+            let ty = ctx.monomorphize(ty);
             let tpe = get_type(ty, ctx);
             let class = tpe.as_class_ref().expect("Invalid pointer type");
 

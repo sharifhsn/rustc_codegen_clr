@@ -18,7 +18,9 @@ fn main() {
     println!("3  Rc<[u8]>::from:   len={} first={}", rc.len(), rc[0]);
 
     let boxed: Box<[u8]> = Box::from(s);
-    println!("4  Box<[u8]>::from:  len={} last={}", boxed.len(), boxed[boxed.len() - 1]);
+    let blen = boxed.len();
+    println!("4a Box<[u8]>::from:  len={}", blen);
+    println!("4  Box<[u8]>::from:  first={} last={}", boxed[0], boxed[blen - 1]);
 
     // Arc<str> too (str is also a DST)
     let astr: Arc<str> = Arc::from("a string");

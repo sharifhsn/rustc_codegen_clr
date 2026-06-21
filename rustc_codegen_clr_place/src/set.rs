@@ -53,9 +53,45 @@ pub fn place_elem_set<'a>(
 
             ptr_set_op(pointed_type.into(), ctx, addr_calc, value_calc)
         }
-        PlaceElem::Field(field_index, _field_type) => match curr_type {
+        PlaceElem::Field(field_index, field_type) => match curr_type {
             PlaceTy::Ty(curr_type) => {
                 let curr_type = ctx.monomorphize(curr_type);
+                // When the field's owner is a DST-tailed struct (e.g. `ArcInner<[u8]>`), it is
+                // addressed through a *fat pointer*, so `addr_calc` is the address of that fat
+                // pointer — not the object itself. A plain `SetField` would write into the fat
+                // pointer's own bytes (clobbering its DATA_PTR/METADATA). Mirror the read/address
+                // paths (`body_field` / `field_address` `(true, _)`): load DATA_PTR, add the field
+                // offset, and store through that address. (The fat-tail field — `(true, true)` — is
+                // itself unsized and cannot be assigned through a place-set, so only the sized-field
+                // `(true, false)` case is handled here.)
+                if pointer_to_is_fat(curr_type, ctx.tcx(), ctx.instance()) {
+                    let field_type = ctx.monomorphize(*field_type);
+                    let offset = rustc_codegen_clr_type::adt::FieldOffsetIterator::fields(
+                        ctx.layout_of(curr_type).layout.0.0.clone(),
+                    )
+                    .nth(field_index.as_usize())
+                    .expect("Field index not in field offset iterator");
+                    let curr_type_fat_ptr = ctx.type_from_cache(Ty::new_ptr(
+                        ctx.tcx(),
+                        curr_type,
+                        rustc_middle::ty::Mutability::Mut,
+                    ));
+                    let void_ptr = ctx.nptr(Type::Void);
+                    let data_ptr_name = ctx.alloc_string(cilly::DATA_PTR);
+                    let addr_descr = ctx.alloc_field(FieldDesc::new(
+                        curr_type_fat_ptr.as_class_ref().unwrap(),
+                        data_ptr_name,
+                        void_ptr,
+                    ));
+                    // The real object address is the fat pointer's DATA_PTR (+ the field offset).
+                    let obj_addr = ctx.ld_field(addr_calc, addr_descr);
+                    let field_addr = if offset == 0 {
+                        obj_addr
+                    } else {
+                        ctx.biop(obj_addr, Const::USize(u64::from(offset)), BinOp::Add)
+                    };
+                    return ptr_set_op(field_type.into(), ctx, field_addr, value_calc);
+                }
                 let field_desc = field_descrptor(curr_type, (*field_index).into(), ctx);
                 ctx.set_field(field_desc, addr_calc, value_calc)
             }

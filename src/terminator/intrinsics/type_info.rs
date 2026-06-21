@@ -54,42 +54,67 @@ pub fn size_of_val<'tcx>(
     }
     if pointer_to_is_fat(pointed_ty, ctx.tcx(), ctx.instance()) {
         let ptr_ty = ctx.monomorphize(args[0].node.ty(ctx.body(), ctx.tcx()));
-        match pointed_ty.kind() {
-            TyKind::Str => {
-                let slice_tpe = ctx.type_from_cache(ptr_ty).as_class_ref().unwrap();
+        // Discriminate dyn-vs-slice/str on the *struct tail* of the fat pointee, not on the
+        // pointee's own `TyKind`. A DST-tailed struct (e.g. `ArcInner<[u8]>`) has `kind() == Adt`
+        // but its tail is `[u8]`/`str`; matching on the pointee kind would route it to the `dyn`
+        // vtable path and dereference the slice *length* as a vtable pointer (NullReferenceException).
+        let tail = ctx
+            .tcx()
+            .struct_tail_for_codegen(pointed_ty, rustc_middle::ty::TypingEnv::fully_monomorphized());
+        match tail.kind() {
+            TyKind::Slice(_) | TyKind::Str => {
+                // size = align_up(prefix + len * stride, align), where:
+                //   prefix = offset of the unsized tail (0 for a bare slice/str, >0 for a tailed
+                //            struct: this is `layout.size()` of the unsized type, i.e. the sized
+                //            prefix's size),
+                //   len    = the fat-pointer metadata (element count),
+                //   stride = size of the tail element (1 for `str`),
+                //   align  = the type's ABI alignment (statically known).
+                let layout = ctx.layout_of(pointed_ty);
+                let prefix = layout.layout.size().bytes();
+                let align = layout.layout.align().abi.bytes();
+                let stride = match tail.kind() {
+                    TyKind::Str => 1,
+                    TyKind::Slice(elem) => {
+                        let elem = ctx.monomorphize(*elem);
+                        ctx.layout_of(elem).layout.size().bytes()
+                    }
+                    _ => unreachable!(),
+                };
+                let fat_tpe = ctx.type_from_cache(ptr_ty).as_class_ref().unwrap();
                 let descriptor = FieldDesc::new(
-                    slice_tpe,
-                    ctx.alloc_string(crate::METADATA),
-                    Type::Int(Int::USize),
-                );
-                let addr = operand_address(&args[0].node, ctx);
-                let field = ctx.alloc_field(descriptor);
-                let value_calc = ctx.ld_field(addr, field);
-                return place_set(destination, value_calc, ctx);
-            }
-            TyKind::Slice(inner) => {
-                let slice_tpe = ctx.type_from_cache(ptr_ty).as_class_ref().unwrap();
-                let inner = ctx.monomorphize(*inner);
-                let inner_type = ctx.type_from_cache(inner);
-                let descriptor = FieldDesc::new(
-                    slice_tpe,
+                    fat_tpe,
                     ctx.alloc_string(crate::METADATA),
                     Type::Int(Int::USize),
                 );
                 let addr = operand_address(&args[0].node, ctx);
                 let field = ctx.alloc_field(descriptor);
                 let len = ctx.ld_field(addr, field);
-                let size = ctx.size_of(inner_type);
-                let size = ctx.int_cast(size, Int::USize, ExtendKind::ZeroExtend);
-                let value_calc = ctx.biop(len, size, BinOp::Mul);
+                let stride = ctx.alloc_node(Const::USize(stride));
+                let body = ctx.biop(len, stride, BinOp::Mul);
+                let body = if prefix != 0 {
+                    let prefix = ctx.alloc_node(Const::USize(prefix));
+                    ctx.biop(body, prefix, BinOp::Add)
+                } else {
+                    body
+                };
+                // align_up(body, align) = (body + (align - 1)) & !(align - 1).
+                let value_calc = if align > 1 {
+                    let align_m1 = ctx.alloc_node(Const::USize(align - 1));
+                    let rounded = ctx.biop(body, align_m1, BinOp::Add);
+                    let mask = ctx.alloc_node(Const::USize(!(align - 1)));
+                    ctx.biop(rounded, mask, BinOp::And)
+                } else {
+                    body
+                };
                 return place_set(destination, value_calc, ctx);
             }
-            // WARNING: ASSUMES ANY NON-SLICE DST IS A DYN.
+            // `dyn Trait`: the metadata is the vtable pointer; size lives in vtable slot 1.
             _ => {
-                let slice_tpe = ctx.type_from_cache(ptr_ty).as_class_ref().unwrap();
+                let fat_tpe = ctx.type_from_cache(ptr_ty).as_class_ref().unwrap();
 
                 let descriptor = FieldDesc::new(
-                    slice_tpe,
+                    fat_tpe,
                     ctx.alloc_string(crate::METADATA),
                     Type::Int(Int::USize),
                 );
@@ -136,9 +161,21 @@ pub fn align_of_val<'tcx>(
             .as_type()
             .expect("align_of_val works only on types!"),
     );
-    if pointer_to_is_fat(pointed_ty, ctx.tcx(), ctx.instance())
-        && !matches!(pointed_ty.kind(), TyKind::Slice(_) | TyKind::Str)
-    {
+    // Alignment is statically known for every fat pointee except `dyn Trait`. Discriminate on the
+    // *struct tail* (not the pointee's own `TyKind`): a slice/str-tailed struct like `ArcInner<[u8]>`
+    // has `kind() == Adt` but a statically-known alignment, and must NOT be routed to the vtable path
+    // (which would deref the slice length as a vtable pointer -> NullReferenceException).
+    let tail_is_dyn = pointer_to_is_fat(pointed_ty, ctx.tcx(), ctx.instance())
+        && matches!(
+            ctx.tcx()
+                .struct_tail_for_codegen(
+                    pointed_ty,
+                    rustc_middle::ty::TypingEnv::fully_monomorphized()
+                )
+                .kind(),
+            TyKind::Dynamic(..)
+        );
+    if tail_is_dyn {
         // `dyn Trait`: read the alignment from vtable slot 2 (metadata is the vtable pointer).
         let ptr_ty = ctx.monomorphize(args[0].node.ty(ctx.body(), ctx.tcx()));
         let fat_tpe = ctx.type_from_cache(ptr_ty).as_class_ref().unwrap();
