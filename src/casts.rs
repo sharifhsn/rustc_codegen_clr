@@ -113,6 +113,34 @@ pub fn int_to_int(src: Type, target: Type, operand: Node, asm: &mut Assembly) ->
             let mref = asm.alloc_methodref(mref);
             asm.call(mref, &[operand], IsPure::NOT)
         }
+        // pointer -> 128-bit: cast the pointer to usize first, then widen usize -> 128-bit via
+        // op_Explicit (no direct Ptr -> 128 operator exists). Must precede the generic
+        // (_, I128) / (_, U128) arms, which would otherwise match a Ptr source and emit a
+        // malformed op_Implicit(Ptr) -> 128.
+        (Type::Ptr(_), Type::Int(Int::U128)) => {
+            let us = asm.int_cast(operand, Int::USize, ExtendKind::ZeroExtend);
+            let mref = MethodRef::new(
+                ClassRef::uint_128(asm),
+                asm.alloc_string("op_Explicit"),
+                asm.sig([Type::Int(Int::USize)], Type::Int(Int::U128)),
+                MethodKind::Static,
+                vec![].into(),
+            );
+            let mref = asm.alloc_methodref(mref);
+            asm.call(mref, &[us], IsPure::NOT)
+        }
+        (Type::Ptr(_), Type::Int(Int::I128)) => {
+            let us = asm.int_cast(operand, Int::USize, ExtendKind::ZeroExtend);
+            let mref = MethodRef::new(
+                ClassRef::int_128(asm),
+                asm.alloc_string("op_Explicit"),
+                asm.sig([Type::Int(Int::USize)], Type::Int(Int::I128)),
+                MethodKind::Static,
+                vec![].into(),
+            );
+            let mref = asm.alloc_methodref(mref);
+            asm.call(mref, &[us], IsPure::NOT)
+        }
         (_, Type::Int(Int::I128)) => {
             let mref = MethodRef::new(
                 ClassRef::int_128(asm),
@@ -145,6 +173,34 @@ pub fn int_to_int(src: Type, target: Type, operand: Node, asm: &mut Assembly) ->
             );
             let mref = asm.alloc_methodref(mref);
             asm.call(mref, &[operand], IsPure::NOT)
+        }
+        // 128-bit <-> pointer: there is no op_Explicit(Int128/UInt128) -> Ptr operator in the
+        // BCL (nor a C macro), so route through usize: 128-bit -> usize via op_Explicit, then
+        // usize -> Ptr via cast_ptr (mirrors `to_int`'s Ptr arm). Must precede the generic
+        // (I128, _) / (U128, _) arms below so Ptr targets are caught here.
+        (Type::Int(Int::I128), Type::Ptr(tpe)) => {
+            let mref = MethodRef::new(
+                ClassRef::int_128(asm),
+                asm.alloc_string("op_Explicit"),
+                asm.sig([src], Type::Int(Int::USize)),
+                MethodKind::Static,
+                vec![].into(),
+            );
+            let mref = asm.alloc_methodref(mref);
+            let us = asm.call(mref, &[operand], IsPure::NOT);
+            asm.cast_ptr(us, *tpe)
+        }
+        (Type::Int(Int::U128), Type::Ptr(tpe)) => {
+            let mref = MethodRef::new(
+                ClassRef::uint_128(asm),
+                asm.alloc_string("op_Explicit"),
+                asm.sig([src], Type::Int(Int::USize)),
+                MethodKind::Static,
+                vec![].into(),
+            );
+            let mref = asm.alloc_methodref(mref);
+            let us = asm.call(mref, &[operand], IsPure::NOT);
+            asm.cast_ptr(us, *tpe)
         }
         (Type::Int(Int::I128), _) => {
             let mref = MethodRef::new(
