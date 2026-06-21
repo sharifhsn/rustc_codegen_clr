@@ -1,0 +1,7 @@
+[package]
+name = "soak_heck"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+heck = "0.5"
+[workspace]
