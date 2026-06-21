@@ -1,0 +1,19 @@
+[package]
+name = "getrandom_dotnet"
+version = "0.1.0"
+edition = "2021"
+
+# A tiny, reusable shim that forwards `getrandom`'s custom backend to the
+# dotnet PAL's CSPRNG (`rcl_dotnet_random_fill` ->
+# System.Security.Cryptography.RandomNumberGenerator.Fill).
+#
+# It deliberately does NOT depend on `getrandom` itself: getrandom's `Error`
+# type differs between the 0.2 / 0.3 / 0.4 majors, and only the *consuming*
+# binary crate knows which one is in its graph. So this crate exposes only the
+# version-agnostic primitive (`fill`), and each consumer wires up the
+# version-specific custom symbol against its own `getrandom` (see README.md).
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+[workspace]

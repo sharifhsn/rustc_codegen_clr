@@ -7,6 +7,18 @@
 use ahash::{AHashMap, AHasher};
 use std::hash::{Hash, Hasher};
 
+// getrandom 0.3 custom backend -> dotnet PAL CSPRNG. ahash pulls getrandom 0.3,
+// which rejects os="dotnet" unless a custom backend is provided. Selected by
+// `--cfg getrandom_backend="custom"` (set in feasibility/dev.sh pal-build).
+#[no_mangle]
+unsafe extern "Rust" fn __getrandom_v03_custom(
+    dest: *mut u8,
+    len: usize,
+) -> Result<(), getrandom::Error> {
+    getrandom_dotnet::fill(unsafe { core::slice::from_raw_parts_mut(dest, len) });
+    Ok(())
+}
+
 // Hash a value with a FIXED-seed AHasher so the numeric output is deterministic across runs.
 fn fixed_hash<T: Hash>(v: &T) -> u64 {
     // AHasher::new_with_keys is available under the default feature set; if not, this is the

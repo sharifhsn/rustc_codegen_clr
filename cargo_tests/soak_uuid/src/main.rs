@@ -4,6 +4,19 @@
 //! Panic-safe: fixed bytes, no unwraps on fallible ops. SUCCESS = "== soak_uuid done ==".
 use uuid::Uuid;
 
+// getrandom 0.4 custom backend -> dotnet PAL CSPRNG. uuid's "v4" feature pulls
+// getrandom 0.4, which rejects os="dotnet" unless a custom backend is provided.
+// 0.4 uses the identical `__getrandom_v03_custom` symbol + `getrandom_backend`
+// cfg as 0.3 (set in feasibility/dev.sh pal-build).
+#[no_mangle]
+unsafe extern "Rust" fn __getrandom_v03_custom(
+    dest: *mut u8,
+    len: usize,
+) -> Result<(), getrandom::Error> {
+    getrandom_dotnet::fill(unsafe { core::slice::from_raw_parts_mut(dest, len) });
+    Ok(())
+}
+
 fn main() {
     println!("== soak_uuid start ==");
 

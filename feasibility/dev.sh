@@ -359,7 +359,12 @@ if [ -f "$UWSRC/lib.rs" ]; then
 fi
 echo "==> build-std cargo_tests/$DEV_CRATE for os=dotnet"
 cd "/work/cargo_tests/$DEV_CRATE" 2>/dev/null || { echo "!! no cargo_tests/$DEV_CRATE"; exit 1; }
-export RUSTFLAGS="-Z codegen-backend=/work/target/release/librustc_codegen_clr.so -C linker=/work/target/release/linker -C link-args=--cargo-support"
+# `--cfg getrandom_backend="custom"` selects getrandom 0.3/0.4's custom backend
+# (our os="dotnet" target has no built-in getrandom arm). The custom symbol
+# (__getrandom_v03_custom) is provided by the consuming crate via the
+# getrandom_dotnet shim, forwarding to the PAL CSPRNG (rcl_dotnet_random_fill).
+# getrandom 0.2 ignores this cfg and uses its `custom` Cargo feature instead.
+export RUSTFLAGS="-Z codegen-backend=/work/target/release/librustc_codegen_clr.so -C linker=/work/target/release/linker -C link-args=--cargo-support --cfg getrandom_backend=\"custom\""
 set +e
 cargo -Zjson-target-spec build --release 2>&1 | grep -vE 'discirminant' | grep -E '^error|error\[|could not compile|warning: unused|Compiling (std|core|alloc) |Finished' | head -60
 rc=${PIPESTATUS[0]}
