@@ -27,7 +27,7 @@ way. **Compiling std is a prerequisite; the surrogate-vs-native choice is only a
 ## 1. The layer cake
 
 ```
- L4  target spec  (dotnet.json / upstream `dotnet` target): os, datalayout, atomics, panic
+ L4  target spec  (x86_64-unknown-dotnet.json / upstream `dotnet` target): os, datalayout, atomics, panic
  L3  std::sys::pal::dotnet + sys/* cfg branches  ← the PAL (NEW, ~2–3k Rust, lives in std patches)
  L2  runtime support lib (mycorrhiza → dotnet_rt): typed BCL bindings the PAL calls (~grow 14k)
  L1  interop ABI: managed calls / newobj / fields / managed-object handles / exceptions  (HARDEN)
@@ -116,11 +116,11 @@ native backend** — no `.eh_frame`/personality machinery. Ship `panic=abort` fi
 ## 6. Build & ship
 
 Out-of-tree, no upstream required to start (the cranelift/gcc model, but with a real PAL in the patches):
-1. `dotnet.json` target spec.
+1. `x86_64-unknown-dotnet.json` target spec (4-token triple name so build.rs scripts that split TARGET on `-` see arch/vendor/os/env; internal `os = "dotnet"` is unchanged).
 2. **std patches**: add `library/std/src/sys/pal/dotnet/` + wire the `cfg(target_os="dotnet")`
    branches in `sys/*`. Apply **commit-per-patch** (gcc's `prepare.rs` model) so they survive
    nightly bumps.
-3. `cargo build --target dotnet.json -Zbuild-std=core,alloc,std,panic_unwind`.
+3. `cargo build --target x86_64-unknown-dotnet.json -Zbuild-std=core,alloc,std,panic_unwind`.
 4. No extra runtime assembly needed — `mycorrhiza`/PAL are Rust compiled through cg_clr; they call
    the BCL via L1 intrinsics. Output is a self-contained .NET assembly run by `dotnet`.
 
@@ -157,7 +157,7 @@ M3 differential validator, M5 sysroot bisect) tells us the frontier and correctn
    `System.IO.FileStream` via a `ManagedObj`, reads bytes, catches an exception → `Result`, and
    frees the handle on drop. Proving the object/exception/GCHandle story on a toy is the highest-
    leverage de-risking move before writing 3k LOC of PAL on top of it.
-3. Draft `dotnet.json` + the `sys/pal/dotnet` skeleton; get `println!`+args+env hello-world running.
+3. Draft `x86_64-unknown-dotnet.json` + the `sys/pal/dotnet` skeleton; get `println!`+args+env hello-world running.
 
 ## 10. L1 de-risk results (COMPLETE — the core bet holds, all probes pass)
 

@@ -2,7 +2,7 @@
 //!
 //! ## Why this exists
 //!
-//! Our custom rustc target (`dotnet.json`) advertises `os = "dotnet"`, which
+//! Our custom rustc target (`x86_64-unknown-dotnet.json`) advertises `os = "dotnet"`, which
 //! does not match any arm of `getrandom`'s hardcoded per-target allow-list. On
 //! such a target `getrandom` falls through to a `compile_error!(...)` in the
 //! *front end* (build exit 101, before codegen ever runs). Every crate that

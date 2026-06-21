@@ -315,7 +315,7 @@ Concretely:
   what remains is wiring the PAL `fs`/`net` arms to those bindings (WF-4). Until then, `fs`/`net` fall
   back to `unsupported`. `alloc`/`stdio`/`abort` need none of that.
 - **Unwinding interaction — `panic=unwind` now works on the real dotnet target (Phase 3).** Flipping
-  `dotnet.json` to `panic-strategy: unwind` compiles std and propagates panics to `catch_unwind` end-to-end
+  `x86_64-unknown-dotnet.json` to `panic-strategy: unwind` compiles std and propagates panics to `catch_unwind` end-to-end
   (validated by `cargo_tests/pal_panic2`). The pieces: the §3 throw-bridge (gcc `imp::panic` →
   linker-overridden `_Unwind_RaiseException` → `RustException` throw → managed try/catch), an
   aborting-stub `eh_personality` lang item for `os = "dotnet"` in `std::sys::personality` (no-DWARF
