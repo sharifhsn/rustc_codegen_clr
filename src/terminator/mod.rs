@@ -14,8 +14,11 @@ use rustc_codgen_clr_operand::{
     constant::{load_const_int, load_const_uint},
     handle_operand,
 };
+use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_middle::{
-    mir::{BasicBlock, Operand, Place, SwitchTargets, Terminator, TerminatorKind},
+    mir::{
+        BasicBlock, InlineAsmOperand, Operand, Place, SwitchTargets, Terminator, TerminatorKind,
+    },
     ty::{Instance, InstanceKind, Ty, TyKind},
 };
 use rustc_span::Spanned;
@@ -25,6 +28,282 @@ mod intrinsics;
 /// Builds an unconditional branch root targeting `target`.
 fn goto(ctx: &mut MethodCompileCtx<'_, '_>, target: u32) -> Root {
     ctx.alloc_root(CILRoot::Branch(Box::new((target, 0, None))))
+}
+
+/// Strip C-style block comments (`/* ... */`) and line comments (`// ...`) from an asm template
+/// piece. Used to recognize comment-only optimization barriers (e.g. `asm!("/* {} */", ...)`),
+/// which carry no real instructions and can be lowered to a no-op. Conservative: an unterminated
+/// `/*` consumes the rest of the string, and only the comment delimiters are removed (instruction
+/// text, if any, survives so the caller's emptiness check fails and we fall through to a throw).
+fn strip_asm_comments(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            // Block comment: skip to the closing "*/" (or end of string).
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+        } else if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            // Line comment: skip to end of line (or end of string).
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Recognize a small set of `asm!` templates the .NET backend can faithfully lower instead of
+/// throwing at runtime. Returns `Some(roots)` (always including the fall-through branch) when a
+/// template is recognized; returns `None` to let the caller keep the generic "unsupported inline
+/// asm" throw. Never silently miscompiles an unrecognized template.
+///
+/// Match precedence: (A) `cpuid` -> (B) empty/barrier -> (C) num-bigint `div` -> `None`.
+fn lower_inline_asm<'tcx>(
+    template: &[InlineAsmTemplatePiece],
+    operands: &[InlineAsmOperand<'tcx>],
+    targets: &[BasicBlock],
+    options: InlineAsmOptions,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Option<Vec<Root>> {
+    // A `noreturn` asm legitimately diverges — keep the throw, never add a fall-through goto. Also
+    // bail if there is no fall-through target to branch to.
+    if options.contains(InlineAsmOptions::NORETURN) || targets.is_empty() {
+        return None;
+    }
+    // By MIR contract `targets[0]` is the fall-through block.
+    let after = goto(ctx, targets[0].as_u32());
+
+    // The textual pieces of the template, ignoring `{N}` placeholders.
+    let str_pieces: Vec<&str> = template
+        .iter()
+        .filter_map(|p| {
+            if let InlineAsmTemplatePiece::String(s) = p {
+                Some(s.as_ref())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // (A) CPUID — stdarch `__cpuid`/`__cpuid_count` (used by std `is_x86_feature_detected!`, the
+    // `cpufeatures` crate behind all RustCrypto x86 backends, and memchr's avx2 probe). The
+    // x86_64 template is ["mov {0:r}, rbx", "cpuid", "xchg {0:r}, rbx"]; the bare "cpuid" piece
+    // matches. Lowering: write 0 to every output operand. A cpuid that reports an all-zero result
+    // makes std_detect see no features (max_basic_leaf < 1 early-returns the empty feature set),
+    // so the portable/scalar backend is selected everywhere. Strictly safe — can only force the
+    // safe scalar path.
+    if str_pieces.iter().any(|s| s.trim().eq_ignore_ascii_case("cpuid")) {
+        let mut roots = Vec::new();
+        for op in operands {
+            let out = match op {
+                InlineAsmOperand::Out { place: Some(p), .. }
+                | InlineAsmOperand::InOut {
+                    out_place: Some(p), ..
+                } => p,
+                // In / discarded outs (place None) / Const / Sym* / Label: nothing to write.
+                _ => continue,
+            };
+            // cpuid outputs are all u32.
+            let zero = load_const_uint(0, rustc_middle::ty::UintTy::U32, ctx);
+            roots.push(place_set(out, zero, ctx));
+        }
+        roots.push(after);
+        return Some(roots);
+    }
+
+    // (B) EMPTY / BARRIER — optimization-barrier asm!s whose template carries no actual
+    // instructions: pure fences, empty templates, and comment-only barriers such as the
+    // `asm!("/* {} */", ...)` black-box pattern used by ryu/float-formatting crates (e.g. the
+    // `to_decimal_fast` path reached via serde_json -> write_f64). A comment can straddle a
+    // placeholder (`["/* ", " */"]` around a `{}`), so we strip comments over the CONCATENATION of
+    // all String pieces, not piece-by-piece. Placeholders are dropped from the concatenation: in a
+    // barrier they sit inside the comment (and vanish with it); in a real instruction they are
+    // always flanked by non-comment String text that survives stripping, so the template is
+    // correctly seen as non-empty. If the stripped concatenation is whitespace-only, it is a
+    // barrier. Lower to a no-op that threads each InOut's in-value straight through to its
+    // out-place; pure Out/In barriers have no effect. (core::hint::black_box itself is a
+    // `#[rustc_intrinsic]` handled on the call path and never reaches here — this covers the
+    // third-party crate barriers that do.)
+    let joined_template: String = str_pieces.concat();
+    if !str_pieces.is_empty() && strip_asm_comments(&joined_template).trim().is_empty() {
+        let mut roots = Vec::new();
+        for op in operands {
+            if let InlineAsmOperand::InOut {
+                in_value,
+                out_place: Some(p),
+                ..
+            } = op
+            {
+                let v = handle_operand(in_value, ctx);
+                roots.push(place_set(p, v, ctx));
+            }
+        }
+        roots.push(after);
+        return Some(roots);
+    }
+
+    // (C) NUM-BIGINT DIV (stretch) — num-bigint's `div_wide` (64-bit `BigDigit=u64` arm), reached
+    // by `to_str_radix` -> `div_rem_digit`. The template is `"div {0}"`, which lowers to the String
+    // pieces ["div ", ""] flanking a `{0}` placeholder, so we test the comment-free concatenation
+    // (`"div "`) for a leading "div". Operand shape is In(reg-class)=divisor,
+    // InOut("rdx"/"dx")=hi=>rem, InOut("rax"/"ax")=lo=>quot. Compute (hi:lo) / d and (hi:lo) % d
+    // via u128 BCL div/rem builtins. If the shape is not an EXACT match, bail to None (keep
+    // throwing) — never emit a wrong-width div.
+    let div_template = strip_asm_comments(&joined_template);
+    let div_template = div_template.trim();
+    if div_template == "div" || div_template.starts_with("div ") {
+        if let Some(roots) = lower_x86_div(operands, after, ctx) {
+            return Some(roots);
+        }
+        return None;
+    }
+
+    None
+}
+
+/// Helper for case (C): match the exact `div` operand shape and emit the equivalent
+/// 128-by-64 unsigned division. Returns `None` (caller keeps throwing) on any shape mismatch.
+fn lower_x86_div<'tcx>(
+    operands: &[InlineAsmOperand<'tcx>],
+    after: Root,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Option<Vec<Root>> {
+    use rustc_target::asm::InlineAsmRegOrRegClass;
+
+    // Returns the explicit register's name (lowercased) for an InlineAsmRegOrRegClass::Reg.
+    fn reg_name(r: &InlineAsmRegOrRegClass) -> Option<String> {
+        if let InlineAsmRegOrRegClass::Reg(reg) = r {
+            Some(reg.name().to_ascii_lowercase())
+        } else {
+            None
+        }
+    }
+
+    let mut divisor: Option<&Operand<'tcx>> = None;
+    let mut hi: Option<(&Operand<'tcx>, &Place<'tcx>)> = None; // (in, rem out) — rdx/dx
+    let mut lo: Option<(&Operand<'tcx>, &Place<'tcx>)> = None; // (in, quot out) — rax/ax
+
+    for op in operands {
+        match op {
+            // The divisor: an `in(reg)` register-class operand.
+            InlineAsmOperand::In { reg, value } => {
+                if matches!(reg, InlineAsmRegOrRegClass::RegClass(_)) && divisor.is_none() {
+                    divisor = Some(value);
+                } else {
+                    return None;
+                }
+            }
+            // hi/lo: explicit-register inout operands with an out place.
+            InlineAsmOperand::InOut {
+                reg,
+                in_value,
+                out_place: Some(out),
+                ..
+            } => {
+                let name = reg_name(reg)?;
+                match name.as_str() {
+                    "rdx" | "dx" => {
+                        if hi.is_some() {
+                            return None;
+                        }
+                        hi = Some((in_value, out));
+                    }
+                    "rax" | "ax" => {
+                        if lo.is_some() {
+                            return None;
+                        }
+                        lo = Some((in_value, out));
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    let (divisor, (hi_in, rem_out), (lo_in, quot_out)) = match (divisor, hi, lo) {
+        (Some(d), Some(h), Some(l)) => (d, h, l),
+        _ => return None,
+    };
+
+    // Build the 128-bit dividend (hi << 64) | lo, divide by the widened divisor, and truncate the
+    // quotient/remainder back to u64. The hi/lo/divisor operands are u64. .NET has no `conv` to a
+    // 128-bit primitive (UInt128 is a struct), so every 64<->128 conversion and the u128 shift/or
+    // go through the BCL operator helpers used elsewhere in the backend (see src/casts.rs and
+    // src/binop/{shift,bitop}.rs), NOT raw `IntCast`/`BinOp`.
+    let hi = handle_operand(hi_in, ctx);
+    let lo = handle_operand(lo_in, ctx);
+    let d = handle_operand(divisor, ctx);
+
+    let u64_ty = Type::Int(Int::U64);
+    let u128_ty = Type::Int(Int::U128);
+    let hi128 = crate::casts::int_to_int(u64_ty, u128_ty, hi, ctx);
+    let lo128 = crate::casts::int_to_int(u64_ty, u128_ty, lo, ctx);
+    let d128 = crate::casts::int_to_int(u64_ty, u128_ty, d, ctx);
+
+    // hi128 << 64 via UInt128.op_LeftShift(UInt128, i32).
+    let shl_ref = MethodRef::new(
+        ClassRef::uint_128(ctx),
+        ctx.alloc_string("op_LeftShift"),
+        ctx.sig([u128_ty, Type::Int(Int::I32)], u128_ty),
+        MethodKind::Static,
+        vec![].into(),
+    );
+    let shl_ref = ctx.alloc_methodref(shl_ref);
+    let sh = ctx.alloc_node(Const::I32(64));
+    let hi_sh = ctx.call(shl_ref, &[hi128, sh], IsPure::NOT);
+
+    // (hi128 << 64) | lo128 via UInt128.op_BitwiseOr(UInt128, UInt128).
+    let or_ref = MethodRef::new(
+        ClassRef::uint_128(ctx),
+        ctx.alloc_string("op_BitwiseOr"),
+        ctx.sig([u128_ty, u128_ty], u128_ty),
+        MethodKind::Static,
+        vec![].into(),
+    );
+    let or_ref = ctx.alloc_methodref(or_ref);
+    let dividend = ctx.call(or_ref, &[hi_sh, lo128], IsPure::NOT);
+
+    // u128 div/rem are linker builtins (`div_u128` / `mod_u128`), NOT `BinOp::DivUn`.
+    let u128_sig = ctx.sig([u128_ty, u128_ty], u128_ty);
+    let div_ref = MethodRef::new(
+        *ctx.main_module(),
+        ctx.alloc_string("div_u128"),
+        u128_sig,
+        MethodKind::Static,
+        vec![].into(),
+    );
+    let div_ref = ctx.alloc_methodref(div_ref);
+    let quot128 = ctx.call(div_ref, &[dividend, d128], IsPure::NOT);
+
+    let mod_ref = MethodRef::new(
+        *ctx.main_module(),
+        ctx.alloc_string("mod_u128"),
+        u128_sig,
+        MethodKind::Static,
+        vec![].into(),
+    );
+    let mod_ref = ctx.alloc_methodref(mod_ref);
+    let rem128 = ctx.call(mod_ref, &[dividend, d128], IsPure::NOT);
+
+    // Truncate u128 -> u64 via UInt128.op_Explicit(UInt128) -> u64.
+    let quot = crate::casts::int_to_int(u128_ty, u64_ty, quot128, ctx);
+    let rem = crate::casts::int_to_int(u128_ty, u64_ty, rem128, ctx);
+
+    let mut roots = Vec::new();
+    roots.push(place_set(quot_out, quot, ctx));
+    roots.push(place_set(rem_out, rem, ctx));
+    roots.push(after);
+    Some(roots)
 }
 pub fn handle_call_terminator<'tycxt>(
     terminator: &Terminator<'tycxt>,
@@ -274,18 +553,31 @@ pub fn handle_terminator<'tcx>(
             ]
         }
         TerminatorKind::InlineAsm {
-            template: _,
-            operands: _,
-            options: _,
-            line_spans: _,
-            unwind: _,
-            targets: _,
-            asm_macro: _,
-        } => {
-            eprintln!("Inline assembly is not yet supported!");
-            let root = ctx.throw_msg("Inline assembly is not yet supported!");
-            vec![root]
-        }
+            template,
+            operands,
+            options,
+            targets,
+            ..
+        } => match lower_inline_asm(template, operands, targets, *options, ctx) {
+            Some(roots) => roots,
+            None => {
+                // Keep a clear diagnostic naming the unrecognized template — never a silent
+                // miscompile.
+                let joined: String = template
+                    .iter()
+                    .filter_map(|p| {
+                        if let InlineAsmTemplatePiece::String(s) = p {
+                            Some(s.as_ref())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!("Unsupported inline assembly template: {joined}");
+                vec![ctx.throw_msg(&format!("Unsupported inline assembly: {joined}"))]
+            }
+        },
         TerminatorKind::UnwindTerminate(_) => {
             // The `abort()` landing pad — reached when unwinding would cross a `nounwind` boundary (a
             // double panic, or a panic escaping a `Drop` run during unwinding). Rust requires a hard
