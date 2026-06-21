@@ -966,7 +966,7 @@ impl ILExporter {
                         super::cilroot::CmpKind::Unordered | super::cilroot::CmpKind::Unsigned => {
                             writeln!(
                                 out,
-                                "bgt {}",
+                                "bgt.un {}",
                                 branch_cond_to_name(branch.0, branch.1, has_handler, is_handler)
                             )
                         }
