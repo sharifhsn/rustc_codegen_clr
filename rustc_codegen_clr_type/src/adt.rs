@@ -42,6 +42,12 @@ impl FieldOffsetIterator {
                 offsets,
                 in_memory_order,
             } => {
+                // NOTE: `index` is the enumerate counter, not `_mem_idx`. Consumers call
+                // `nth()` with the MIR/source field index, so indexing `offsets` by the
+                // source-order counter yields the byte offset for that source field. The
+                // `u32::try_from(..).unwrap()` rejects truly impossible (>4 GiB) offsets;
+                // there is intentionally no u16 clamp here — a struct field can legitimately
+                // sit past 64 KiB, and clamping such offsets to 0 made fields alias.
                 let offsets: Box<[_]> = in_memory_order
                     .iter()
                     .enumerate()
@@ -50,14 +56,6 @@ impl FieldOffsetIterator {
                             offsets[FieldIdx::from_u32(u32::try_from(index).unwrap())].bytes(),
                         )
                         .unwrap()
-                    })
-                    //TODO: ask what does field offset of 4294967295 means.
-                    .map(|offset| {
-                        if offset > u32::from(u16::MAX) {
-                            0
-                        } else {
-                            offset
-                        }
                     })
                     .collect();
                 FieldOffsetIterator::Explicit { offsets, index: 0 }
