@@ -407,6 +407,17 @@ impl ClassRef {
         let asm_name = Some(asm.alloc_string("System.Net.Sockets"));
         asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
     }
+    /// Returns a reference to the int-backed enum `System.Net.Sockets.SelectMode`
+    /// (a value type) — selects the readiness mode (SelectRead=0 / SelectWrite=1 /
+    /// SelectError=2) for `Socket.Poll(int microSeconds, SelectMode)` in the dotnet
+    /// mio PAL arm (the readiness multiplexer behind mio's Selector). In
+    /// `System.Net.Sockets`.
+    #[must_use]
+    pub fn select_mode(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Net.Sockets.SelectMode");
+        let asm_name = Some(asm.alloc_string("System.Net.Sockets"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
+    }
     /// Returns a reference to the int-backed enum `System.Net.Sockets.AddressFamily`
     /// (a value type) — selects IPv4/IPv6 for `new Socket(AddressFamily, …)` in the
     /// dotnet `net` PAL arm. In `System.Net.Primitives` (NOT `System.Net.Sockets`).

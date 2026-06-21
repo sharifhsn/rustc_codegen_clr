@@ -5,3 +5,11 @@ edition = "2021"
 [dependencies]
 mio = { version = "1", features = ["net", "os-poll"] }
 [workspace]
+
+# DOTNET PAL ARM: use the vendored mio (1.2.1) that carries a `sys/dotnet` arm.
+# mio's upstream sys/ is unix/windows/wasi-only; the vendored copy adds an
+# os=dotnet readiness Selector over System.Net.Sockets (Socket.Poll). The patch
+# must resolve at the same MAJOR as `mio = "1"` (the committed Cargo.lock pins
+# 1.2.1) or it silently no-ops and the missing-dotnet-arm errors reappear.
+[patch.crates-io]
+mio = { path = "vendor/mio" }

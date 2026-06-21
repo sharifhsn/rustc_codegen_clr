@@ -110,6 +110,10 @@
 //! * `rcl_dotnet_net_set_nodelay(handle, on) -> i32` => `s.NoDelay = (on != 0);`
 //! * `rcl_dotnet_net_nodelay(handle) -> i32` => `return s.NoDelay ? 1 : 0;`
 //! * `rcl_dotnet_net_close(handle)` => `s.Dispose()` + free the `GCHandle`.
+//! * `rcl_dotnet_socket_poll(handle, micros, mode) -> i32`
+//!   => `return s.Poll((int)micros, (SelectMode)mode) ? 1 : 0;` — the readiness
+//!   primitive behind the dotnet `mio` PAL arm's Selector (mode 0=read/1=write/
+//!   2=error; negative micros = block forever).
 //!
 //! Address marshalling is inline CIL (no managed helper): inbound builds
 //! `new IPAddress(ReadOnlySpan<byte>(ip_ptr, ip_len))` + `new IPEndPoint(addr,
@@ -2063,6 +2067,7 @@ fn insert_dotnet_net(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     insert_dotnet_net_set_nodelay(asm, patcher);
     insert_dotnet_net_nodelay(asm, patcher);
     insert_dotnet_net_close(asm, patcher);
+    insert_dotnet_socket_poll(asm, patcher);
 }
 
 /// `rcl_dotnet_net_tcp_connect(family, ip_ptr, ip_len, port) -> *mut u8`
@@ -2649,6 +2654,42 @@ fn insert_dotnet_net_close(asm: &mut Assembly, patcher: &mut MissingMethodPatche
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![dispose, store_gch, free, ret], 0, None)],
             locals: vec![(Some(asm.alloc_string("gch")), gc_handle_ty)],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_socket_poll(handle, micros, mode) -> i32`
+///   => `return s.Poll((int)micros, (SelectMode)mode) ? 1 : 0;`
+///
+/// The readiness primitive behind the dotnet `mio` PAL arm's Selector. `mode` is
+/// passed straight through as a `System.Net.Sockets.SelectMode` value-type int
+/// (0=SelectRead, 1=SelectWrite, 2=SelectError) — exactly how `shutdown` feeds a
+/// raw int as `SocketShutdown`. A negative `micros` means an infinite wait (BCL
+/// `Socket.Poll` treats negative as block-forever). Returns 1 if the socket is
+/// ready in the requested mode, else 0.
+fn insert_dotnet_socket_poll(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_socket_poll");
+    let generator = move |_, asm: &mut Assembly| {
+        let socket = ClassRef::socket(asm);
+        let select_mode = Type::ClassRef(ClassRef::select_mode(asm));
+        let s = handle_to_socket(asm, 0);
+        let micros = asm.alloc_node(CILNode::LdArg(1));
+        let mode = asm.alloc_node(CILNode::LdArg(2));
+        let poll_name = asm.alloc_string("Poll");
+        let poll = asm.class_ref(socket).clone().instance(
+            &[Type::Int(Int::I32), select_mode],
+            Type::Bool,
+            poll_name,
+            asm,
+        );
+        let v = asm.alloc_node(CILNode::call(poll, [s, micros, mode]));
+        // bool -> i32 (0/1).
+        let v = asm.int_cast(v, Int::I32, ExtendKind::ZeroExtend);
+        let ret = asm.alloc_root(CILRoot::Ret(v));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
         }
     };
     patcher.insert(name, Box::new(generator));

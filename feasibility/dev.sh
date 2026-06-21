@@ -294,6 +294,42 @@ fi
 # arm that already catches os=dotnet (returns Err(UNSUPPORTED_PLATFORM)), and
 # `hostname()` is not exercised by the net probe.
 [ -f "$PAL/net/connection/dotnet.rs" ] && inject_arm net/connection/mod.rs 'mod dotnet; pub use dotnet::*;'
+# DOTNET PAL ARM (mio): expose the socket's opaque GCHandle on the PUBLIC
+# `std::net::{TcpStream,TcpListener,UdpSocket}` wrappers so the vendored mio
+# dotnet arm can key its readiness Selector by it. The handle lives on the inner
+# `sys` type (`dotnet_pal/sys/net/connection/dotnet.rs::dotnet_raw_handle`), but
+# `std::net::TcpStream(net_imp::TcpStream)`'s inner is only reachable via the
+# crate-private `AsInner` trait — not visible to mio. So we forward it with a
+# public inherent method `dotnet_raw_handle(&self) -> *mut u8 { self.0.dotnet_raw_handle() }`
+# injected into each `impl <Type> {` block. os=dotnet-only (these net.rs files are
+# NOT mirrored from dotnet_pal — they are the upstream std wrappers, patched in
+# place only inside the os=dotnet build), so ::stable / the surrogate are untouched.
+# inject_method anchors on the FIRST `impl <Type> {` line in $1. The injected
+# method is `#[stable]`, NOT `#[unstable]`: an unstable inherent method is invisible
+# to the consumer (mio) without a matching `#![feature(...)]`, so resolution would
+# fall back to mio's own `DotnetRawHandle` trait method and recurse. Marking it
+# stable makes the inherent method visible (and thus shadow the trait) without
+# forcing a feature gate into mio. Cosmetic-only on our patched os=dotnet std.
+inject_method() { # $1 = file under $SRC ; $2 = exact `impl X {` anchor line ; $3 = unique marker comment
+  local file="$SRC/$1"
+  [ -f "$file" ] || { echo "!! inject_method: no $1"; return 1; }
+  grep -qF "$3" "$file" && return 0
+  grep -qF "$2" "$file" || { echo "!! inject_method: anchor '$2' not in $1"; return 1; }
+  awk -v anchor="$2" -v marker="$3" '
+    { print }
+    !ins && index($0, anchor) {
+      print "    " marker
+      print "    #[cfg(target_os = \"dotnet\")]"
+      print "    #[stable(feature = \"rust1\", since = \"1.0.0\")]"
+      print "    #[allow(missing_docs)]"
+      print "    pub fn dotnet_raw_handle(&self) -> *mut u8 { self.0.dotnet_raw_handle() }"
+      ins=1
+    }' "$file" > "$file.__t" && mv "$file.__t" "$file"
+}
+# NOTE: $SRC is `…/std/src/sys`, so the public net wrappers are at `../net/*.rs`.
+inject_method "../net/tcp.rs" 'impl TcpStream {'   '// DOTNET PAL ARM: mio handle accessor (TcpStream)'
+inject_method "../net/tcp.rs" 'impl TcpListener {' '// DOTNET PAL ARM: mio handle accessor (TcpListener)'
+inject_method "../net/udp.rs" 'impl UdpSocket {'   '// DOTNET PAL ARM: mio handle accessor (UdpSocket)'
 # personality/mod.rs holds the `eh_personality` lang item. With panic=unwind,
 # rustc's front-end requires that lang item to EXIST (the missing-eh_personality
 # weak-lang-item check that emits "unwinding panics are not supported without

@@ -398,6 +398,16 @@ impl TcpStream {
         // SAFETY: `self.handle` is a live Socket handle.
         rc(unsafe { rcl_dotnet_net_set_nonblocking(self.handle, nonblocking as i32) })
     }
+
+    /// The opaque managed `GCHandle` `IntPtr` backing this socket. Bespoke
+    /// accessor for the dotnet `mio` PAL arm (the readiness Selector keys sockets
+    /// by this handle, passing it to `rcl_dotnet_socket_poll`). There is no
+    /// `target_family` on os=dotnet, so `std::os::fd`/`std::os::windows::io` are
+    /// both compiled out and there is no `AsRawFd`/`AsRawSocket` to reuse; the
+    /// vendored mio dotnet arm keys off this inherent accessor via a local trait.
+    pub fn dotnet_raw_handle(&self) -> *mut u8 {
+        self.handle
+    }
 }
 
 impl Drop for TcpStream {
@@ -494,6 +504,12 @@ impl TcpListener {
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         // SAFETY: `self.handle` is a live Socket handle.
         rc(unsafe { rcl_dotnet_net_set_nonblocking(self.handle, nonblocking as i32) })
+    }
+
+    /// The opaque managed `GCHandle` `IntPtr` backing this socket. See
+    /// `TcpStream::dotnet_raw_handle` — used by the dotnet `mio` PAL arm.
+    pub fn dotnet_raw_handle(&self) -> *mut u8 {
+        self.handle
     }
 }
 
@@ -679,6 +695,13 @@ impl UdpSocket {
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         // SAFETY: `self.handle` is a live Socket handle.
         rc(unsafe { rcl_dotnet_net_set_nonblocking(self.handle, nonblocking as i32) })
+    }
+
+    /// The opaque managed `GCHandle` `IntPtr` backing this socket. See
+    /// `TcpStream::dotnet_raw_handle` — used by the dotnet `mio` PAL arm (the
+    /// loopback waker socket is a `UdpSocket` registered for readiness).
+    pub fn dotnet_raw_handle(&self) -> *mut u8 {
+        self.handle
     }
 
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
