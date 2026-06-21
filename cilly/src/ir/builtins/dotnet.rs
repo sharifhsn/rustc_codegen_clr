@@ -75,8 +75,51 @@
 //!      `rcl_dotnet_cotaskmem_free`).
 //! * `rcl_dotnet_fs_readdir_close(handle)`              => free the `GCHandle`.
 //!
+//! Networking (`sys/net/connection/dotnet.rs`), backed by `System.Net.Sockets`.
+//! An open socket is an opaque `GCHandle` `IntPtr` pinning a managed
+//! `System.Net.Sockets.Socket`; a `SocketAddr` crosses the ABI decomposed into
+//! `(family: i32 [4=v4/6=v6], ip_ptr, ip_len, port: u16)` (network-order octets),
+//! and addresses come back through caller `out_*` pointers. No managed `Socket` /
+//! `IPEndPoint` / `IPAddress` is ever passed through a Rust signature:
+//! * `rcl_dotnet_net_tcp_connect(family, ip_ptr, ip_len, port) -> *mut u8`
+//!   => `var s = new Socket(ep.AddressFamily, Stream, Tcp); s.Connect(ep);` handle.
+//! * `rcl_dotnet_net_bind(family, ip_ptr, ip_len, port, sock_type, backlog) -> *mut u8`
+//!   => `var s = new Socket(ep.AddressFamily, (SocketType)t, (ProtocolType)p);
+//!      s.Bind(ep); if (backlog >= 0) s.Listen(backlog);` handle.
+//! * `rcl_dotnet_net_accept(handle, out_family, out_ip, out_port) -> *mut u8`
+//!   => `var c = s.Accept(); write(c.RemoteEndPoint, out_*);` new handle.
+//! * `rcl_dotnet_net_recv(handle, buf_ptr, len) -> isize`
+//!   => `s.Receive(new Span<byte>(buf_ptr, len))` (0 == orderly shutdown / EOF).
+//! * `rcl_dotnet_net_send(handle, buf_ptr, len) -> isize`
+//!   => `s.Send(new ReadOnlySpan<byte>(buf_ptr, len))` (count sent).
+//! * `rcl_dotnet_net_recv_from(handle, buf_ptr, len, out_family, out_ip, out_port) -> isize`
+//!   => `EndPoint ep = new IPEndPoint(IPAddress.IPv6Any, 0);
+//!      int n = s.ReceiveFrom(new Span<byte>(buf_ptr, len), ref ep);
+//!      write((IPEndPoint)ep, out_*);` (the `ref EndPoint` overload, so an
+//!      unconnected UDP socket reports the real sender).
+//! * `rcl_dotnet_net_send_to(handle, buf_ptr, len, family, ip_ptr, ip_len, port) -> isize`
+//!   => `s.SendTo(new ReadOnlySpan<byte>(buf_ptr, len), ep)` (count sent).
+//! * `rcl_dotnet_net_local_addr(handle, out_family, out_ip, out_port) -> i32`
+//!   => `write(s.LocalEndPoint, out_*); return 0;`
+//! * `rcl_dotnet_net_peer_addr(handle, out_family, out_ip, out_port) -> i32`
+//!   => `write(s.RemoteEndPoint, out_*); return 0;`
+//! * `rcl_dotnet_net_udp_connect(handle, family, ip_ptr, ip_len, port) -> i32`
+//!   => `s.Connect(ep); return 0;`
+//! * `rcl_dotnet_net_shutdown(handle, how) -> i32` => `s.Shutdown((SocketShutdown)how);`
+//! * `rcl_dotnet_net_set_nonblocking(handle, nb) -> i32` => `s.Blocking = (nb == 0);`
+//! * `rcl_dotnet_net_set_nodelay(handle, on) -> i32` => `s.NoDelay = (on != 0);`
+//! * `rcl_dotnet_net_nodelay(handle) -> i32` => `return s.NoDelay ? 1 : 0;`
+//! * `rcl_dotnet_net_close(handle)` => `s.Dispose()` + free the `GCHandle`.
+//!
+//! Address marshalling is inline CIL (no managed helper): inbound builds
+//! `new IPAddress(ReadOnlySpan<byte>(ip_ptr, ip_len))` + `new IPEndPoint(addr,
+//! port)` (the span length picks v4/v6 — no byte-swap; the port is host-order on
+//! `IPEndPoint`). Outbound reads the endpoint's `Address.GetAddressBytes()` into
+//! the `out_ip` buffer with `Marshal.Copy(byte[], 0, IntPtr, len)`, writes the
+//! byte-array length to `out_family` (4 for v4 / 16 for v6 — NOTE: the std side
+//! treats `>= 16` as v6, `== 4` as v4), and the port to `out_port` via `StInd`.
 //! See also `dotnet_pal/sys/args/dotnet.rs`, `dotnet_pal/sys/env/dotnet.rs`,
-//! and `dotnet_pal/sys/fs/dotnet.rs`.
+//! `dotnet_pal/sys/fs/dotnet.rs`, and `dotnet_pal/sys/net/connection/dotnet.rs`.
 //!
 //! `realloc` is handled std-side via `realloc_fallback` (alloc+copy+free) and
 //! `alloc_zeroed` via `rcl_dotnet_alloc` + zeroing, so those do not need their
@@ -111,6 +154,7 @@ pub fn insert_dotnet_pal(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
     insert_dotnet_args(asm, patcher);
     insert_dotnet_env(asm, patcher);
     insert_dotnet_fs(asm, patcher);
+    insert_dotnet_net(asm, patcher);
 }
 
 /// `rcl_dotnet_instant_ticks() -> i64`
@@ -1790,6 +1834,820 @@ fn insert_dotnet_fs_readdir_close(asm: &mut Assembly, patcher: &mut MissingMetho
         let ret = asm.alloc_root(CILRoot::VoidRet);
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![store_gch, free, ret], 0, None)],
+            locals: vec![(Some(asm.alloc_string("gch")), gc_handle_ty)],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+// ===========================================================================
+// net (`sys/net/connection/dotnet.rs`)
+//
+// An open socket is a `GCHandle` to a `System.Net.Sockets.Socket`. A SocketAddr
+// crosses the ABI as `(family, ip_ptr, ip_len, port)` (network-order octets);
+// addresses return through caller out-pointers. IPEndPoint/IPAddress are built
+// and read entirely BCL-side (inline CIL) — no managed object crosses a Rust
+// signature. See the module-doc net contract above and `insert_dotnet_fs`.
+// ===========================================================================
+
+/// `.NET SocketType` int-backed enum: Stream=1, Dgram=2 (these happen to equal
+/// our ABI `SOCK_STREAM`/`SOCK_DGRAM`, so the std side's value passes straight in).
+const NET_SOCKTYPE_STREAM: i32 = 1;
+/// `.NET ProtocolType`: Tcp=6, Udp=17.
+const NET_PROTO_TCP: i32 = 6;
+const NET_PROTO_UDP: i32 = 17;
+
+/// Build a `System.Net.IPEndPoint` from `(ip_ptr, ip_len, port)` at the given
+/// `LdArg` indices, inline:
+///   `new IPEndPoint(new IPAddress(new ReadOnlySpan<byte>(ip_ptr, (int)ip_len)),
+///                   (int)port)`.
+/// The span length picks v4/v6; the octets are network order (no byte-swap), and
+/// `IPEndPoint`'s port is host-order (no `to_be`).
+fn build_endpoint(
+    asm: &mut Assembly,
+    ip_ptr_arg: u32,
+    ip_len_arg: u32,
+    port_arg: u32,
+) -> Interned<CILNode> {
+    // new IPAddress(ReadOnlySpan<byte>(ip_ptr, ip_len))
+    let (span, span_ty) = build_byte_span(asm, ip_ptr_arg, ip_len_arg, true);
+    let ip_address = ClassRef::ip_address(asm);
+    let ip_ctor = asm.class_ref(ip_address).clone().ctor(&[span_ty], asm);
+    let addr = asm.alloc_node(CILNode::call(ip_ctor, [span]));
+    // new IPEndPoint(IPAddress, (int)port)
+    let port = asm.alloc_node(CILNode::LdArg(port_arg));
+    let port = asm.int_cast(port, Int::I32, ExtendKind::ZeroExtend);
+    let ip_endpoint = ClassRef::ip_endpoint(asm);
+    let ep_ctor = asm.class_ref(ip_endpoint).clone().ctor(
+        &[Type::ClassRef(ip_address), Type::Int(Int::I32)],
+        asm,
+    );
+    asm.alloc_node(CILNode::call(ep_ctor, [addr, port]))
+}
+
+/// Upcast an `IPEndPoint` node to the base `System.Net.EndPoint` (a `castclass`,
+/// always sound for an upcast) — the declared param type of `Socket.Bind` /
+/// `Connect` / `SendTo`. Needed because the cilly typechecker does not model
+/// class inheritance, so an `IPEndPoint`-typed arg would not match an `EndPoint`
+/// param, and the BCL only exposes those methods on the `EndPoint` base.
+fn endpoint_as_base(asm: &mut Assembly, ip_endpoint_node: Interned<CILNode>) -> Interned<CILNode> {
+    let endpoint_base = ClassRef::endpoint(asm);
+    let base_ty = asm.alloc_type(Type::ClassRef(endpoint_base));
+    asm.alloc_node(CILNode::CheckedCast(ip_endpoint_node, base_ty))
+}
+
+/// Build `new Socket(endpoint.AddressFamily, (SocketType)sock_type,
+/// (ProtocolType)proto)` for an already-built `IPEndPoint` node. The address
+/// family is read off the endpoint (so no family-int translation is needed); the
+/// `sock_type`/`proto` int nodes feed the int-backed enum params directly (the
+/// ctor signature must still name the enum types or BCL method resolution fails).
+fn build_socket(
+    asm: &mut Assembly,
+    endpoint: Interned<CILNode>,
+    ep_local: u32,
+    sock_type: Interned<CILNode>,
+    proto: Interned<CILNode>,
+) -> (Interned<CILRoot>, Interned<CILNode>, Interned<Type>) {
+    let ip_endpoint = ClassRef::ip_endpoint(asm);
+    let store_ep = asm.alloc_root(CILRoot::StLoc(ep_local, endpoint));
+    // (AddressFamily)endpoint.AddressFamily — inherited getter on IPEndPoint.
+    let address_family = ClassRef::address_family(asm);
+    let get_af_name = asm.alloc_string("get_AddressFamily");
+    let get_af = asm.class_ref(ip_endpoint).clone().instance(
+        &[],
+        Type::ClassRef(address_family),
+        get_af_name,
+        asm,
+    );
+    let ep0 = asm.alloc_node(CILNode::LdLoc(ep_local));
+    let af = asm.alloc_node(CILNode::call(get_af, [ep0]));
+    // new Socket(AddressFamily, SocketType, ProtocolType)
+    let socket = ClassRef::socket(asm);
+    let socket_type = Type::ClassRef(ClassRef::socket_type(asm));
+    let protocol_type = Type::ClassRef(ClassRef::protocol_type(asm));
+    let sock_ctor = asm.class_ref(socket).clone().ctor(
+        &[Type::ClassRef(address_family), socket_type, protocol_type],
+        asm,
+    );
+    let sock = asm.alloc_node(CILNode::call(sock_ctor, [af, sock_type, proto]));
+    let ep_ty = asm.alloc_type(Type::ClassRef(ip_endpoint));
+    (store_ep, sock, ep_ty)
+}
+
+/// Recover the `Socket` pinned by the handle at `LdArg(handle_arg)`. Thin wrapper
+/// over `handle_to_class` for readability.
+fn handle_to_socket(asm: &mut Assembly, handle_arg: u32) -> Interned<CILNode> {
+    let socket = ClassRef::socket(asm);
+    handle_to_class(asm, handle_arg, socket)
+}
+
+/// `(IntPtr)GCHandle.Alloc(socket_in_local)` as a `*mut u8`, ready to return as
+/// an opaque handle. Mirrors the `ref_to_handle` tail of `insert_dotnet_fs_open`.
+fn socket_local_to_handle(asm: &mut Assembly, sock_local: u32) -> Interned<CILNode> {
+    let handle = CILNode::LdLoc(sock_local).ref_to_handle(asm);
+    let handle = asm.alloc_node(handle);
+    let void = asm.alloc_type(Type::Void);
+    asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::Ptr(void))))
+}
+
+/// Build the roots that marshal an `IPEndPoint` (held in `ep_local`) out into the
+/// caller's `(out_family, out_ip, out_port)` pointers at the given `LdArg`
+/// indices:
+///   `byte[] b = ((IPEndPoint)ep).Address.GetAddressBytes();`
+///   `*out_family = b.Length; Marshal.Copy(b, 0, (IntPtr)out_ip, b.Length);`
+///   `*out_port = (ushort)ep.Port;`
+/// `out_family` receives the IP byte length (4 v4 / 16 v6); the std side maps it.
+/// `bytes_local` must be a `byte[]` local.
+fn write_endpoint_out(
+    asm: &mut Assembly,
+    ep_local: u32,
+    bytes_local: u32,
+    out_family_arg: u32,
+    out_ip_arg: u32,
+    out_port_arg: u32,
+) -> Vec<Interned<CILRoot>> {
+    let ip_endpoint = ClassRef::ip_endpoint(asm);
+    let ip_address = ClassRef::ip_address(asm);
+    let byte_ty = asm.alloc_type(Type::Int(Int::U8));
+    let byte_arr = Type::PlatformArray {
+        elem: byte_ty,
+        dims: NonZeroU8::new(1).unwrap(),
+    };
+
+    // addr = ep.get_Address(); b = addr.GetAddressBytes(); store b.
+    let get_addr_name = asm.alloc_string("get_Address");
+    let get_addr = asm.class_ref(ip_endpoint).clone().instance(
+        &[],
+        Type::ClassRef(ip_address),
+        get_addr_name,
+        asm,
+    );
+    let ep0 = asm.alloc_node(CILNode::LdLoc(ep_local));
+    let addr = asm.alloc_node(CILNode::call(get_addr, [ep0]));
+    let get_bytes_name = asm.alloc_string("GetAddressBytes");
+    let get_bytes = asm.class_ref(ip_address).clone().instance(
+        &[],
+        byte_arr,
+        get_bytes_name,
+        asm,
+    );
+    let bytes = asm.alloc_node(CILNode::call(get_bytes, [addr]));
+    let store_bytes = asm.alloc_root(CILRoot::StLoc(bytes_local, bytes));
+
+    // len = b.Length (i32); *out_family = len (4 v4 / 16 v6).
+    let b0 = asm.alloc_node(CILNode::LdLoc(bytes_local));
+    let len = asm.ld_len(b0);
+    let len_i32 = asm.int_cast(len, Int::I32, ExtendKind::ZeroExtend);
+    let out_family = asm.alloc_node(CILNode::LdArg(out_family_arg));
+    let st_family = asm.alloc_root(CILRoot::StInd(Box::new((
+        out_family,
+        len_i32,
+        Type::Int(Int::I32),
+        false,
+    ))));
+
+    // Marshal.Copy(byte[] src, int 0, IntPtr dst, int len).
+    let marshal = ClassRef::marshal(asm);
+    let copy_name = asm.alloc_string("Copy");
+    let copy = asm.class_ref(marshal).clone().static_mref(
+        &[byte_arr, Type::Int(Int::I32), Type::Int(Int::ISize), Type::Int(Int::I32)],
+        Type::Void,
+        copy_name,
+        asm,
+    );
+    let b1 = asm.alloc_node(CILNode::LdLoc(bytes_local));
+    let zero = asm.alloc_node(0_i32);
+    let out_ip = asm.alloc_node(CILNode::LdArg(out_ip_arg));
+    let out_ip_isize = asm.int_cast(out_ip, Int::ISize, ExtendKind::ZeroExtend);
+    let b2 = asm.alloc_node(CILNode::LdLoc(bytes_local));
+    let len2 = asm.ld_len(b2);
+    let len2_i32 = asm.int_cast(len2, Int::I32, ExtendKind::ZeroExtend);
+    let copy = asm.alloc_root(CILRoot::call(copy, [b1, zero, out_ip_isize, len2_i32]));
+
+    // *out_port = (ushort)ep.get_Port().
+    let get_port_name = asm.alloc_string("get_Port");
+    let get_port = asm.class_ref(ip_endpoint).clone().instance(
+        &[],
+        Type::Int(Int::I32),
+        get_port_name,
+        asm,
+    );
+    let ep1 = asm.alloc_node(CILNode::LdLoc(ep_local));
+    let port = asm.alloc_node(CILNode::call(get_port, [ep1]));
+    let port_u16 = asm.int_cast(port, Int::U16, ExtendKind::ZeroExtend);
+    let out_port = asm.alloc_node(CILNode::LdArg(out_port_arg));
+    let st_port = asm.alloc_root(CILRoot::StInd(Box::new((
+        out_port,
+        port_u16,
+        Type::Int(Int::U16),
+        false,
+    ))));
+
+    vec![store_bytes, st_family, copy, st_port]
+}
+
+/// Registers all `rcl_dotnet_net_*` BCL bindings (System.Net.Sockets).
+fn insert_dotnet_net(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    insert_dotnet_net_tcp_connect(asm, patcher);
+    insert_dotnet_net_bind(asm, patcher);
+    insert_dotnet_net_accept(asm, patcher);
+    insert_dotnet_net_recv(asm, patcher);
+    insert_dotnet_net_send(asm, patcher);
+    insert_dotnet_net_recv_from(asm, patcher);
+    insert_dotnet_net_send_to(asm, patcher);
+    insert_dotnet_net_addr(asm, patcher, "rcl_dotnet_net_local_addr", "get_LocalEndPoint");
+    insert_dotnet_net_addr(asm, patcher, "rcl_dotnet_net_peer_addr", "get_RemoteEndPoint");
+    insert_dotnet_net_udp_connect(asm, patcher);
+    insert_dotnet_net_shutdown(asm, patcher);
+    insert_dotnet_net_set_nonblocking(asm, patcher);
+    insert_dotnet_net_set_nodelay(asm, patcher);
+    insert_dotnet_net_nodelay(asm, patcher);
+    insert_dotnet_net_close(asm, patcher);
+}
+
+/// `rcl_dotnet_net_tcp_connect(family, ip_ptr, ip_len, port) -> *mut u8`
+///   => `var s = new Socket(ep.AddressFamily, Stream, Tcp); s.Connect(ep);`
+///      return the `GCHandle` `IntPtr`.
+/// (Args: 0=family [unused — the family is read off the endpoint], 1=ip_ptr,
+/// 2=ip_len, 3=port.)
+fn insert_dotnet_net_tcp_connect(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_net_tcp_connect");
+    let generator = move |_, asm: &mut Assembly| {
+        let socket = ClassRef::socket(asm);
+        let endpoint_base = ClassRef::endpoint(asm);
+        let endpoint = build_endpoint(asm, 1, 2, 3);
+        let stream = asm.alloc_node(NET_SOCKTYPE_STREAM);
+        let tcp = asm.alloc_node(NET_PROTO_TCP);
+        // local 0 = endpoint, local 1 = socket.
+        let (store_ep, sock, ep_ty) = build_socket(asm, endpoint, 0, stream, tcp);
+        let store_sock = asm.alloc_root(CILRoot::StLoc(1, sock));
+        // s.Connect(EndPoint) — Connect is declared on the EndPoint base.
+        let connect_name = asm.alloc_string("Connect");
+        let connect = asm.class_ref(socket).clone().instance(
+            &[Type::ClassRef(endpoint_base)],
+            Type::Void,
+            connect_name,
+            asm,
+        );
+        let sock0 = asm.alloc_node(CILNode::LdLoc(1));
+        let ep1 = asm.alloc_node(CILNode::LdLoc(0));
+        let ep1 = endpoint_as_base(asm, ep1);
+        let do_connect = asm.alloc_root(CILRoot::call(connect, [sock0, ep1]));
+        // return handle.
+        let handle = socket_local_to_handle(asm, 1);
+        let ret = asm.alloc_root(CILRoot::Ret(handle));
+        let sock_ty = asm.alloc_type(Type::ClassRef(socket));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(
+                vec![store_ep, store_sock, do_connect, ret],
+                0,
+                None,
+            )],
+            locals: vec![
+                (Some(asm.alloc_string("endpoint")), ep_ty),
+                (Some(asm.alloc_string("socket")), sock_ty),
+            ],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_net_bind(family, ip_ptr, ip_len, port, sock_type, backlog) -> *mut u8`
+///   => `var s = new Socket(ep.AddressFamily, (SocketType)sock_type,
+///      sock_type==Stream?Tcp:Udp); s.Bind(ep); if (backlog >= 0) s.Listen(backlog);`
+///      return handle. (Args: 1=ip_ptr,2=ip_len,3=port,4=sock_type,5=backlog.)
+fn insert_dotnet_net_bind(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_net_bind");
+    let generator = move |_, asm: &mut Assembly| {
+        let socket = ClassRef::socket(asm);
+        let ip_endpoint = ClassRef::ip_endpoint(asm);
+        let sock_ty = asm.alloc_type(Type::ClassRef(socket));
+        let ep_ty_t = asm.alloc_type(Type::ClassRef(ip_endpoint));
+
+        // Block 0: choose proto by sock_type (4): Stream => Tcp(2), else Udp(1).
+        // We branch the *whole* construction by proto into blocks 1 (tcp) / 2 (udp),
+        // then converge to block 3 for Bind/[Listen]/return.
+        let sock_type0 = asm.alloc_node(CILNode::LdArg(4));
+        let stream_c = asm.alloc_node(NET_SOCKTYPE_STREAM);
+        let br_tcp = asm.alloc_root(CILRoot::Branch(Box::new((
+            1,
+            0,
+            Some(BranchCond::Eq(sock_type0, stream_c)),
+        ))));
+        let goto_udp = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None))));
+
+        // Block 1 (tcp): build socket with (Stream, Tcp), store in local 1, goto 3.
+        let ep_tcp = build_endpoint(asm, 1, 2, 3);
+        let stream1 = asm.alloc_node(NET_SOCKTYPE_STREAM);
+        let tcp1 = asm.alloc_node(NET_PROTO_TCP);
+        let (store_ep_tcp, sock_tcp, _) = build_socket(asm, ep_tcp, 0, stream1, tcp1);
+        let store_sock_tcp = asm.alloc_root(CILRoot::StLoc(1, sock_tcp));
+        let goto_bind_tcp = asm.alloc_root(CILRoot::Branch(Box::new((3, 0, None))));
+
+        // Block 2 (udp): build socket with (Dgram, Udp), store in local 1, goto 3.
+        let ep_udp = build_endpoint(asm, 1, 2, 3);
+        let dgram2 = asm.alloc_node(CILNode::LdArg(4)); // sock_type == Dgram(2) here
+        let udp2 = asm.alloc_node(NET_PROTO_UDP);
+        let (store_ep_udp, sock_udp, _) = build_socket(asm, ep_udp, 0, dgram2, udp2);
+        let store_sock_udp = asm.alloc_root(CILRoot::StLoc(1, sock_udp));
+        let goto_bind_udp = asm.alloc_root(CILRoot::Branch(Box::new((3, 0, None))));
+
+        // Block 3 (bind): s.Bind(ep); if (backlog >= 0) goto listen(4) else done(5).
+        // Bind is declared on the EndPoint base; upcast the IPEndPoint local.
+        let endpoint_base = ClassRef::endpoint(asm);
+        let bind_name = asm.alloc_string("Bind");
+        let bind = asm.class_ref(socket).clone().instance(
+            &[Type::ClassRef(endpoint_base)],
+            Type::Void,
+            bind_name,
+            asm,
+        );
+        let sock3 = asm.alloc_node(CILNode::LdLoc(1));
+        let ep3 = asm.alloc_node(CILNode::LdLoc(0));
+        let ep3 = endpoint_as_base(asm, ep3);
+        let do_bind = asm.alloc_root(CILRoot::call(bind, [sock3, ep3]));
+        let backlog3 = asm.alloc_node(CILNode::LdArg(5));
+        let zero3 = asm.alloc_node(0_i32);
+        // backlog < 0  => skip listen (UDP). Branch to done(5) when backlog < 0.
+        let br_done = asm.alloc_root(CILRoot::Branch(Box::new((
+            5,
+            0,
+            Some(BranchCond::Lt(backlog3, zero3, crate::ir::cilroot::CmpKind::Signed)),
+        ))));
+        let goto_listen = asm.alloc_root(CILRoot::Branch(Box::new((4, 0, None))));
+
+        // Block 4 (listen): s.Listen(backlog); goto done(5).
+        let listen_name = asm.alloc_string("Listen");
+        let listen = asm.class_ref(socket).clone().instance(
+            &[Type::Int(Int::I32)],
+            Type::Void,
+            listen_name,
+            asm,
+        );
+        let sock4 = asm.alloc_node(CILNode::LdLoc(1));
+        let backlog4 = asm.alloc_node(CILNode::LdArg(5));
+        let do_listen = asm.alloc_root(CILRoot::call(listen, [sock4, backlog4]));
+        let goto_done = asm.alloc_root(CILRoot::Branch(Box::new((5, 0, None))));
+
+        // Block 5 (done): return handle.
+        let handle = socket_local_to_handle(asm, 1);
+        let ret = asm.alloc_root(CILRoot::Ret(handle));
+
+        MethodImpl::MethodBody {
+            blocks: vec![
+                BasicBlock::new(vec![br_tcp, goto_udp], 0, None),
+                BasicBlock::new(vec![store_ep_tcp, store_sock_tcp, goto_bind_tcp], 1, None),
+                BasicBlock::new(vec![store_ep_udp, store_sock_udp, goto_bind_udp], 2, None),
+                BasicBlock::new(vec![do_bind, br_done, goto_listen], 3, None),
+                BasicBlock::new(vec![do_listen, goto_done], 4, None),
+                BasicBlock::new(vec![ret], 5, None),
+            ],
+            locals: vec![
+                (Some(asm.alloc_string("endpoint")), ep_ty_t),
+                (Some(asm.alloc_string("socket")), sock_ty),
+            ],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_net_accept(handle, out_family, out_ip, out_port) -> *mut u8`
+///   => `var c = s.Accept(); write(c.RemoteEndPoint, out_*);` return c's handle.
+/// (Args: 0=handle, 1=out_family, 2=out_ip, 3=out_port.)
+fn insert_dotnet_net_accept(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_net_accept");
+    let generator = move |_, asm: &mut Assembly| {
+        let socket = ClassRef::socket(asm);
+        let ip_endpoint = ClassRef::ip_endpoint(asm);
+        let endpoint_base = ClassRef::endpoint(asm);
+
+        // c = s.Accept(); store c in local 0.
+        let s = handle_to_socket(asm, 0);
+        let accept_name = asm.alloc_string("Accept");
+        let accept = asm.class_ref(socket).clone().instance(
+            &[],
+            Type::ClassRef(socket),
+            accept_name,
+            asm,
+        );
+        let conn = asm.alloc_node(CILNode::call(accept, [s]));
+        let store_conn = asm.alloc_root(CILRoot::StLoc(0, conn));
+
+        // ep = (IPEndPoint)c.RemoteEndPoint; store in local 1.
+        let get_rep_name = asm.alloc_string("get_RemoteEndPoint");
+        let get_rep = asm.class_ref(socket).clone().instance(
+            &[],
+            Type::ClassRef(endpoint_base),
+            get_rep_name,
+            asm,
+        );
+        let conn0 = asm.alloc_node(CILNode::LdLoc(0));
+        let ep_obj = asm.alloc_node(CILNode::call(get_rep, [conn0]));
+        let ip_ep_ty = asm.alloc_type(Type::ClassRef(ip_endpoint));
+        let ep = asm.alloc_node(CILNode::CheckedCast(ep_obj, ip_ep_ty));
+        let store_ep = asm.alloc_root(CILRoot::StLoc(1, ep));
+
+        // write peer addr out (local 1 = ep, local 2 = byte[] scratch).
+        let mut roots = vec![store_conn, store_ep];
+        roots.extend(write_endpoint_out(asm, 1, 2, 1, 2, 3));
+
+        // return (void*)GCHandle.Alloc(conn).
+        let handle = socket_local_to_handle(asm, 0);
+        let ret = asm.alloc_root(CILRoot::Ret(handle));
+        roots.push(ret);
+
+        let sock_ty = asm.alloc_type(Type::ClassRef(socket));
+        let ep_ty = asm.alloc_type(Type::ClassRef(ip_endpoint));
+        let byte_ty = asm.alloc_type(Type::Int(Int::U8));
+        let byte_arr_ty = asm.alloc_type(Type::PlatformArray {
+            elem: byte_ty,
+            dims: NonZeroU8::new(1).unwrap(),
+        });
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(roots, 0, None)],
+            locals: vec![
+                (Some(asm.alloc_string("conn")), sock_ty),
+                (Some(asm.alloc_string("endpoint")), ep_ty),
+                (Some(asm.alloc_string("bytes")), byte_arr_ty),
+            ],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_net_recv(handle, buf_ptr, len) -> isize`
+///   => `s.Receive(new Span<byte>(buf_ptr, (int)len))` (0 == orderly shutdown).
+fn insert_dotnet_net_recv(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_net_recv");
+    let generator = move |_, asm: &mut Assembly| {
+        let socket = ClassRef::socket(asm);
+        let s = handle_to_socket(asm, 0);
+        let (span, span_ty) = build_byte_span(asm, 1, 2, false);
+        let recv_name = asm.alloc_string("Receive");
+        let recv = asm.class_ref(socket).clone().instance(
+            &[span_ty],
+            Type::Int(Int::I32),
+            recv_name,
+            asm,
+        );
+        let count = asm.alloc_node(CILNode::call(recv, [s, span]));
+        let count = asm.int_cast(count, Int::ISize, ExtendKind::SignExtend);
+        let ret = asm.alloc_root(CILRoot::Ret(count));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_net_send(handle, buf_ptr, len) -> isize`
+///   => `s.Send(new ReadOnlySpan<byte>(buf_ptr, (int)len))` (count sent).
+fn insert_dotnet_net_send(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_net_send");
+    let generator = move |_, asm: &mut Assembly| {
+        let socket = ClassRef::socket(asm);
+        let s = handle_to_socket(asm, 0);
+        let (span, span_ty) = build_byte_span(asm, 1, 2, true);
+        let send_name = asm.alloc_string("Send");
+        let send = asm.class_ref(socket).clone().instance(
+            &[span_ty],
+            Type::Int(Int::I32),
+            send_name,
+            asm,
+        );
+        let count = asm.alloc_node(CILNode::call(send, [s, span]));
+        let count = asm.int_cast(count, Int::ISize, ExtendKind::SignExtend);
+        let ret = asm.alloc_root(CILRoot::Ret(count));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_net_recv_from(handle, buf_ptr, len, out_family, out_ip, out_port) -> isize`
+///   => `EndPoint ep = new IPEndPoint(0L, 0);   // 0.0.0.0:0 seed
+///      int n = s.ReceiveFrom(new Span<byte>(buf_ptr, (int)len), ref ep);
+///      write((IPEndPoint)ep, out_*); return n;`
+/// The seed uses the `IPEndPoint(long, int)` ctor (an IPv4 0.0.0.0 placeholder)
+/// rather than `IPAddress.Any` — `Any`/`IPv6Any` are static *fields*, not
+/// property getters, and the long ctor avoids loading a static field. `ReceiveFrom`
+/// overwrites `ep` with the real sender (v4 or v6) regardless of the seed family.
+/// (Args: 0=handle,1=buf_ptr,2=len,3=out_family,4=out_ip,5=out_port.)
+fn insert_dotnet_net_recv_from(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_net_recv_from");
+    let generator = move |_, asm: &mut Assembly| {
+        let socket = ClassRef::socket(asm);
+        let ip_endpoint = ClassRef::ip_endpoint(asm);
+        let endpoint_base = ClassRef::endpoint(asm);
+
+        // seed: EndPoint ep = new IPEndPoint(0L, 0); store in local 0.
+        let zero_addr = asm.alloc_node(0_i64);
+        let zero_port = asm.alloc_node(0_i32);
+        let ep_ctor = asm.class_ref(ip_endpoint).clone().ctor(
+            &[Type::Int(Int::I64), Type::Int(Int::I32)],
+            asm,
+        );
+        let seed = asm.alloc_node(CILNode::call(ep_ctor, [zero_addr, zero_port]));
+        // ep local is typed as the base EndPoint (the `ref EndPoint` param type).
+        let ep_base_ty = asm.alloc_type(Type::ClassRef(endpoint_base));
+        let seed = asm.alloc_node(CILNode::CheckedCast(seed, ep_base_ty));
+        let store_seed = asm.alloc_root(CILRoot::StLoc(0, seed));
+
+        // n = s.ReceiveFrom(Span<byte>(buf,len), ref ep).
+        let s = handle_to_socket(asm, 0); // arg0 is the socket handle
+        let (span, span_ty) = build_byte_span(asm, 1, 2, false);
+        let ep_ref_ty = asm.nref(Type::ClassRef(endpoint_base));
+        let recv_from_name = asm.alloc_string("ReceiveFrom");
+        let recv_from = asm.class_ref(socket).clone().instance(
+            &[span_ty, ep_ref_ty],
+            Type::Int(Int::I32),
+            recv_from_name,
+            asm,
+        );
+        let ep_addr = asm.alloc_node(CILNode::LdLocA(0));
+        let n = asm.alloc_node(CILNode::call(recv_from, [s, span, ep_addr]));
+        let store_n = asm.alloc_root(CILRoot::StLoc(1, n));
+
+        // ep2 = (IPEndPoint)ep; store in local 2; write addr out (bytes scratch = 3).
+        let ep_obj = asm.alloc_node(CILNode::LdLoc(0));
+        let ip_ep_ty = asm.alloc_type(Type::ClassRef(ip_endpoint));
+        let ep2 = asm.alloc_node(CILNode::CheckedCast(ep_obj, ip_ep_ty));
+        let store_ep2 = asm.alloc_root(CILRoot::StLoc(2, ep2));
+        let mut roots = vec![store_seed, store_n, store_ep2];
+        roots.extend(write_endpoint_out(asm, 2, 3, 3, 4, 5));
+
+        // return (isize)n.
+        let n_load = asm.alloc_node(CILNode::LdLoc(1));
+        let n_isize = asm.int_cast(n_load, Int::ISize, ExtendKind::SignExtend);
+        let ret = asm.alloc_root(CILRoot::Ret(n_isize));
+        roots.push(ret);
+
+        let ep_ty = asm.alloc_type(Type::ClassRef(ip_endpoint));
+        let byte_ty = asm.alloc_type(Type::Int(Int::U8));
+        let byte_arr_ty = asm.alloc_type(Type::PlatformArray {
+            elem: byte_ty,
+            dims: NonZeroU8::new(1).unwrap(),
+        });
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(roots, 0, None)],
+            locals: vec![
+                (Some(asm.alloc_string("endpoint")), ep_base_ty),
+                (Some(asm.alloc_string("count")), asm.alloc_type(Type::Int(Int::I32))),
+                (Some(asm.alloc_string("ip_endpoint")), ep_ty),
+                (Some(asm.alloc_string("bytes")), byte_arr_ty),
+            ],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_net_send_to(handle, buf_ptr, len, family, ip_ptr, ip_len, port) -> isize`
+///   => `s.SendTo(new ReadOnlySpan<byte>(buf_ptr, (int)len), ep)` (count sent).
+/// (Args: 0=handle,1=buf_ptr,2=len,3=family,4=ip_ptr,5=ip_len,6=port.)
+fn insert_dotnet_net_send_to(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_net_send_to");
+    let generator = move |_, asm: &mut Assembly| {
+        let socket = ClassRef::socket(asm);
+        let endpoint_base = ClassRef::endpoint(asm);
+        let s = handle_to_socket(asm, 0);
+        let (span, span_ty) = build_byte_span(asm, 1, 2, true);
+        // ep = new IPEndPoint(IPAddress(span(ip_ptr,ip_len)), port). args 4/5/6.
+        let endpoint = build_endpoint(asm, 4, 5, 6);
+        // SendTo(ReadOnlySpan<byte>, EndPoint) -> int.
+        let send_to_name = asm.alloc_string("SendTo");
+        let send_to = asm.class_ref(socket).clone().instance(
+            &[span_ty, Type::ClassRef(endpoint_base)],
+            Type::Int(Int::I32),
+            send_to_name,
+            asm,
+        );
+        let endpoint = endpoint_as_base(asm, endpoint);
+        let count = asm.alloc_node(CILNode::call(send_to, [s, span, endpoint]));
+        let count = asm.int_cast(count, Int::ISize, ExtendKind::SignExtend);
+        let ret = asm.alloc_root(CILRoot::Ret(count));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// Shared generator for `rcl_dotnet_net_local_addr` / `rcl_dotnet_net_peer_addr`
+/// (`get_LocalEndPoint` / `get_RemoteEndPoint`):
+///   `write((IPEndPoint)s.<EndPoint>, out_*); return 0;`
+/// (Args: 0=handle, 1=out_family, 2=out_ip, 3=out_port.)
+fn insert_dotnet_net_addr(
+    asm: &mut Assembly,
+    patcher: &mut MissingMethodPatcher,
+    sym: &'static str,
+    getter: &'static str,
+) {
+    let name = asm.alloc_string(sym);
+    let generator = move |_, asm: &mut Assembly| {
+        let socket = ClassRef::socket(asm);
+        let ip_endpoint = ClassRef::ip_endpoint(asm);
+        let endpoint_base = ClassRef::endpoint(asm);
+
+        // ep = (IPEndPoint)s.<getter>(); store in local 0.
+        let s = handle_to_socket(asm, 0);
+        let getter_name = asm.alloc_string(getter);
+        let get_ep = asm.class_ref(socket).clone().instance(
+            &[],
+            Type::ClassRef(endpoint_base),
+            getter_name,
+            asm,
+        );
+        let ep_obj = asm.alloc_node(CILNode::call(get_ep, [s]));
+        let ip_ep_ty = asm.alloc_type(Type::ClassRef(ip_endpoint));
+        let ep = asm.alloc_node(CILNode::CheckedCast(ep_obj, ip_ep_ty));
+        let store_ep = asm.alloc_root(CILRoot::StLoc(0, ep));
+
+        // write addr out (local 0 = ep, local 1 = byte[] scratch); return 0.
+        let mut roots = vec![store_ep];
+        roots.extend(write_endpoint_out(asm, 0, 1, 1, 2, 3));
+        let zero = asm.alloc_node(0_i32);
+        let ret = asm.alloc_root(CILRoot::Ret(zero));
+        roots.push(ret);
+
+        let ep_ty = asm.alloc_type(Type::ClassRef(ip_endpoint));
+        let byte_ty = asm.alloc_type(Type::Int(Int::U8));
+        let byte_arr_ty = asm.alloc_type(Type::PlatformArray {
+            elem: byte_ty,
+            dims: NonZeroU8::new(1).unwrap(),
+        });
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(roots, 0, None)],
+            locals: vec![
+                (Some(asm.alloc_string("endpoint")), ep_ty),
+                (Some(asm.alloc_string("bytes")), byte_arr_ty),
+            ],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_net_udp_connect(handle, family, ip_ptr, ip_len, port) -> i32`
+///   => `s.Connect(ep); return 0;` (Args: 0=handle,1=family,2=ip_ptr,3=ip_len,4=port.)
+fn insert_dotnet_net_udp_connect(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_net_udp_connect");
+    let generator = move |_, asm: &mut Assembly| {
+        let socket = ClassRef::socket(asm);
+        let endpoint_base = ClassRef::endpoint(asm);
+        let s = handle_to_socket(asm, 0);
+        let endpoint = build_endpoint(asm, 2, 3, 4);
+        let endpoint = endpoint_as_base(asm, endpoint);
+        let connect_name = asm.alloc_string("Connect");
+        let connect = asm.class_ref(socket).clone().instance(
+            &[Type::ClassRef(endpoint_base)],
+            Type::Void,
+            connect_name,
+            asm,
+        );
+        let do_connect = asm.alloc_root(CILRoot::call(connect, [s, endpoint]));
+        let zero = asm.alloc_node(0_i32);
+        let ret = asm.alloc_root(CILRoot::Ret(zero));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![do_connect, ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_net_shutdown(handle, how) -> i32`
+///   => `s.Shutdown((SocketShutdown)how); return 0;`
+fn insert_dotnet_net_shutdown(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_net_shutdown");
+    let generator = move |_, asm: &mut Assembly| {
+        let socket = ClassRef::socket(asm);
+        let socket_shutdown = Type::ClassRef(ClassRef::socket_shutdown(asm));
+        let s = handle_to_socket(asm, 0);
+        let how = asm.alloc_node(CILNode::LdArg(1));
+        let shutdown_name = asm.alloc_string("Shutdown");
+        let shutdown = asm.class_ref(socket).clone().instance(
+            &[socket_shutdown],
+            Type::Void,
+            shutdown_name,
+            asm,
+        );
+        let do_shutdown = asm.alloc_root(CILRoot::call(shutdown, [s, how]));
+        let zero = asm.alloc_node(0_i32);
+        let ret = asm.alloc_root(CILRoot::Ret(zero));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![do_shutdown, ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_net_set_nonblocking(handle, nonblocking) -> i32`
+///   => `s.Blocking = (nonblocking == 0); return 0;` (Blocking is the inverse).
+fn insert_dotnet_net_set_nonblocking(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_net_set_nonblocking");
+    let generator = move |_, asm: &mut Assembly| {
+        let socket = ClassRef::socket(asm);
+        let s = handle_to_socket(asm, 0);
+        // blocking = (nonblocking == 0) : the BCL `Blocking` flag is the inverse of
+        // std's `nonblocking`. `ceq` against 0 yields a `Type::Bool`.
+        let nb = asm.alloc_node(CILNode::LdArg(1));
+        let zero = asm.alloc_node(0_i32);
+        let is_zero = asm.alloc_node(CILNode::BinOp(nb, zero, crate::cilnode::BinOp::Eq));
+        let set_blocking_name = asm.alloc_string("set_Blocking");
+        let set_blocking = asm.class_ref(socket).clone().instance(
+            &[Type::Bool],
+            Type::Void,
+            set_blocking_name,
+            asm,
+        );
+        let do_set = asm.alloc_root(CILRoot::call(set_blocking, [s, is_zero]));
+        let ret_zero = asm.alloc_node(0_i32);
+        let ret = asm.alloc_root(CILRoot::Ret(ret_zero));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![do_set, ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_net_set_nodelay(handle, on) -> i32`
+///   => `s.NoDelay = (on != 0); return 0;`
+fn insert_dotnet_net_set_nodelay(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_net_set_nodelay");
+    let generator = move |_, asm: &mut Assembly| {
+        let socket = ClassRef::socket(asm);
+        let s = handle_to_socket(asm, 0);
+        // on != 0 -> bool : !(on == 0). `ceq` yields Bool, `UnOp::Not` flips it.
+        let on = asm.alloc_node(CILNode::LdArg(1));
+        let zero = asm.alloc_node(0_i32);
+        let is_zero = asm.alloc_node(CILNode::BinOp(on, zero, crate::cilnode::BinOp::Eq));
+        let on_bool = asm.alloc_node(CILNode::UnOp(is_zero, crate::cilnode::UnOp::Not));
+        let set_nodelay_name = asm.alloc_string("set_NoDelay");
+        let set_nodelay = asm.class_ref(socket).clone().instance(
+            &[Type::Bool],
+            Type::Void,
+            set_nodelay_name,
+            asm,
+        );
+        let do_set = asm.alloc_root(CILRoot::call(set_nodelay, [s, on_bool]));
+        let ret_zero = asm.alloc_node(0_i32);
+        let ret = asm.alloc_root(CILRoot::Ret(ret_zero));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![do_set, ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_net_nodelay(handle) -> i32` => `return s.NoDelay ? 1 : 0;`
+fn insert_dotnet_net_nodelay(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_net_nodelay");
+    let generator = move |_, asm: &mut Assembly| {
+        let socket = ClassRef::socket(asm);
+        let s = handle_to_socket(asm, 0);
+        let get_nodelay_name = asm.alloc_string("get_NoDelay");
+        let get_nodelay = asm.class_ref(socket).clone().instance(
+            &[],
+            Type::Bool,
+            get_nodelay_name,
+            asm,
+        );
+        let v = asm.alloc_node(CILNode::call(get_nodelay, [s]));
+        // bool -> i32 (0/1).
+        let v = asm.int_cast(v, Int::I32, ExtendKind::ZeroExtend);
+        let ret = asm.alloc_root(CILRoot::Ret(v));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_net_close(handle)` => `s.Dispose()` then free the `GCHandle`.
+fn insert_dotnet_net_close(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_net_close");
+    let generator = move |_, asm: &mut Assembly| {
+        let socket = ClassRef::socket(asm);
+        let s = handle_to_socket(asm, 0);
+        let dispose_name = asm.alloc_string("Dispose");
+        let dispose = asm.class_ref(socket).clone().instance(
+            &[],
+            Type::Void,
+            dispose_name,
+            asm,
+        );
+        let dispose = asm.alloc_root(CILRoot::call(dispose, [s]));
+        let (store_gch, free, gc_handle_ty) = free_handle_roots(asm, 0, 0);
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![dispose, store_gch, free, ret], 0, None)],
             locals: vec![(Some(asm.alloc_string("gch")), gc_handle_ty)],
         }
     };

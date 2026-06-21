@@ -380,6 +380,90 @@ impl ClassRef {
         let asm_name = Some(asm.alloc_string("System.Runtime"));
         asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
     }
+    /// Returns a reference to the class `System.Net.Sockets.Socket`, the open
+    /// socket handle backing the dotnet `net` PAL arm (Bind/Listen/Accept/
+    /// Connect/Send/Receive/SendTo/ReceiveFrom/Shutdown/Dispose +
+    /// LocalEndPoint/RemoteEndPoint). Physically lives in `System.Net.Sockets.dll`,
+    /// but — exactly like the `System.IO.*` fs helpers — we name the assembly
+    /// `System.Net.Sockets` (its real impl assembly — unlike the `System.IO.*` fs
+    /// helpers, CoreCLR does NOT type-forward `System.Net.*` from `System.Runtime`,
+    /// so the net helpers must name their physical assemblies). `Socket`,
+    /// `SocketType`, `ProtocolType` and `SocketShutdown` live in
+    /// `System.Net.Sockets`; `IPAddress`/`IPEndPoint`/`EndPoint`/`AddressFamily`
+    /// live in `System.Net.Primitives`. The exe path resolves these simple-name
+    /// extern refs leniently at runtime.
+    #[must_use]
+    pub fn socket(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Net.Sockets.Socket");
+        let asm_name = Some(asm.alloc_string("System.Net.Sockets"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to the int-backed enum `System.Net.Sockets.SocketShutdown`
+    /// (a value type) — for `Socket.Shutdown(SocketShutdown)` in the dotnet `net`
+    /// PAL arm. In `System.Net.Sockets`.
+    #[must_use]
+    pub fn socket_shutdown(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Net.Sockets.SocketShutdown");
+        let asm_name = Some(asm.alloc_string("System.Net.Sockets"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
+    }
+    /// Returns a reference to the int-backed enum `System.Net.Sockets.AddressFamily`
+    /// (a value type) — selects IPv4/IPv6 for `new Socket(AddressFamily, …)` in the
+    /// dotnet `net` PAL arm. In `System.Net.Primitives` (NOT `System.Net.Sockets`).
+    #[must_use]
+    pub fn address_family(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Net.Sockets.AddressFamily");
+        let asm_name = Some(asm.alloc_string("System.Net.Primitives"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
+    }
+    /// Returns a reference to the int-backed enum `System.Net.Sockets.SocketType`
+    /// (a value type) — Stream/Dgram for `new Socket(…, SocketType, …)`. In
+    /// `System.Net.Sockets`.
+    #[must_use]
+    pub fn socket_type(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Net.Sockets.SocketType");
+        let asm_name = Some(asm.alloc_string("System.Net.Sockets"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
+    }
+    /// Returns a reference to the int-backed enum `System.Net.Sockets.ProtocolType`
+    /// (a value type) — Tcp/Udp for `new Socket(…, …, ProtocolType)`. In
+    /// `System.Net.Sockets`.
+    #[must_use]
+    pub fn protocol_type(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Net.Sockets.ProtocolType");
+        let asm_name = Some(asm.alloc_string("System.Net.Sockets"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
+    }
+    /// Returns a reference to the class `System.Net.IPAddress` (the IP-address
+    /// value carried in an `IPEndPoint`) for the dotnet `net` PAL arm. Built from
+    /// network-order octets via `new IPAddress(ReadOnlySpan<byte>)`. In
+    /// `System.Net.Primitives`.
+    #[must_use]
+    pub fn ip_address(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Net.IPAddress");
+        let asm_name = Some(asm.alloc_string("System.Net.Primitives"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to the class `System.Net.IPEndPoint` (an IPAddress +
+    /// port) for the dotnet `net` PAL arm. Never crosses the Rust ABI — it is
+    /// built/read entirely BCL-side from the decomposed `(family, ip, port)`. In
+    /// `System.Net.Primitives`.
+    #[must_use]
+    pub fn ip_endpoint(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Net.IPEndPoint");
+        let asm_name = Some(asm.alloc_string("System.Net.Primitives"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to the abstract base class `System.Net.EndPoint` — the
+    /// declared return type of `Socket.LocalEndPoint`/`RemoteEndPoint` and the
+    /// `ref` seed type of `Socket.ReceiveFrom`, downcast to `IPEndPoint`
+    /// BCL-side in the dotnet `net` PAL arm. In `System.Net.Primitives`.
+    #[must_use]
+    pub fn endpoint(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Net.EndPoint");
+        let asm_name = Some(asm.alloc_string("System.Net.Primitives"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
     /// Returns a reference to the class
     /// `System.Security.Cryptography.RandomNumberGenerator`.
     #[must_use]

@@ -252,8 +252,18 @@ impl CILNode {
                     volatile: *volitale,
                 }
             }
-            CILNode::IsInst(_, _) => todo!(),
-            CILNode::CheckedCast(_, _) => todo!(),
+            CILNode::IsInst(object, isinst_tpe) => {
+                let object = asm.get_node(*object).clone();
+                let object = object.propagate_locals(asm, idx, tpe, new_node, fuel);
+                let object = asm.alloc_node(object);
+                CILNode::IsInst(object, *isinst_tpe)
+            }
+            CILNode::CheckedCast(object, cast_tpe) => {
+                let object = asm.get_node(*object).clone();
+                let object = object.propagate_locals(asm, idx, tpe, new_node, fuel);
+                let object = asm.alloc_node(object);
+                CILNode::CheckedCast(object, *cast_tpe)
+            }
             CILNode::CallI(_) => todo!(),
             CILNode::GetException
             | CILNode::SizeOf(_)

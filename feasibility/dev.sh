@@ -277,6 +277,23 @@ fi
 # (FileStream/File/Directory/FileInfo) via the rcl_dotnet_fs_* hooks (see
 # cilly/src/ir/builtins/dotnet.rs). fs cascade is block 1 (default nth).
 [ -f "$PAL/fs/dotnet.rs" ]           && inject_arm fs/mod.rs           'mod dotnet; use dotnet as imp;'
+# net is a TWO-subdir module: net/mod.rs just re-exports `connection::*` and
+# `hostname::hostname`. The IMPL cascade lives in net/CONNECTION/mod.rs (a
+# `mod X; pub use X::*` cfg_select! whose `_` arm is `mod unsupported; pub use
+# unsupported::*`), so the dotnet arm goes THERE, not in net/mod.rs. The PAL file
+# lives at dotnet_pal/sys/net/connection/dotnet.rs, so the mirror loop above
+# copies it to $SRC/net/connection/dotnet.rs and the arm's `mod dotnet` resolves
+# to it. The dotnet arm provides TcpStream/TcpListener/UdpSocket/LookupHost +
+# lookup_host backed by System.Net.Sockets via the rcl_dotnet_net_* hooks (see
+# cilly/src/ir/builtins/dotnet.rs). The always-compiled module-level
+# each_addr/lookup_host_string fns in connection/mod.rs stay as-is (each_addr is
+# dead-code-allowed for dotnet; lookup_host_string finds our `lookup_host`).
+# net/connection cascade is block 1 (default nth).
+#
+# NO hostname arm is injected: net/hostname/mod.rs has its own `_ =>` unsupported
+# arm that already catches os=dotnet (returns Err(UNSUPPORTED_PLATFORM)), and
+# `hostname()` is not exercised by the net probe.
+[ -f "$PAL/net/connection/dotnet.rs" ] && inject_arm net/connection/mod.rs 'mod dotnet; pub use dotnet::*;'
 # personality/mod.rs holds the `eh_personality` lang item. With panic=unwind,
 # rustc's front-end requires that lang item to EXIST (the missing-eh_personality
 # weak-lang-item check that emits "unwinding panics are not supported without
