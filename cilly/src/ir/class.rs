@@ -407,6 +407,18 @@ impl ClassRef {
         let asm_name = Some(asm.alloc_string("System.Net.Sockets"));
         asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
     }
+    /// Returns a reference to `System.Net.Sockets.SocketException` — the exception
+    /// the BCL throws on a socket fault. The POSIX shim's errno translation
+    /// (`map_socket_exception_to_errno`) reads its `SocketErrorCode` to derive a
+    /// POSIX errno. A reference type (not a value type). In `System.Net.Sockets`
+    /// (well, `System.Net.Primitives`, but the exe path resolves the simple-name
+    /// extern ref leniently at runtime, exactly like the other net classes).
+    #[must_use]
+    pub fn socket_exception(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Net.Sockets.SocketException");
+        let asm_name = Some(asm.alloc_string("System.Net.Primitives"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
     /// Returns a reference to the int-backed enum `System.Net.Sockets.SelectMode`
     /// (a value type) — selects the readiness mode (SelectRead=0 / SelectWrite=1 /
     /// SelectError=2) for `Socket.Poll(int microSeconds, SelectMode)` in the dotnet

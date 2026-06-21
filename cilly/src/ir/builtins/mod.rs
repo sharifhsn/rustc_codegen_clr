@@ -15,6 +15,8 @@ pub mod atomics;
 pub mod casts;
 pub mod dotnet;
 pub mod math;
+pub mod posix;
+pub use posix::insert_posix_shim;
 pub mod select;
 pub mod thread;
 pub use thread::*;

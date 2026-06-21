@@ -457,6 +457,14 @@ fn main() {
         // .NET PAL BCL bindings (rcl_dotnet_alloc / _free / _write) used by the
         // std-side dotnet PAL. .NET-only: they emit calls into the BCL.
         cilly::builtins::dotnet::insert_dotnet_pal(&mut final_assembly, &mut overrides);
+        // POSIX/libc-over-.NET shim (the proof slice): int-fd⇄GCHandle fd-table +
+        // thread-local errno + the bare POSIX C-ABI symbol cluster (socket/read/
+        // epoll_*/…), each re-packaging an existing rcl_dotnet_* body. .NET-only;
+        // additive (os=dotnet symbols + overrides), so ::stable is untouched. The
+        // fd-table MethodDefs are defined here; the two patch_missing_methods passes
+        // below resolve the wrappers' forward refs to them. See
+        // cilly/src/ir/builtins/posix.rs and docs/LIBC_SHIM_SCOPE.md.
+        cilly::builtins::posix::insert_posix_shim(&mut final_assembly, &mut overrides);
     }
 
     // Ensure the cctor and tcctor exist!

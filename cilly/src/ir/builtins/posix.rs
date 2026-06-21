@@ -1,0 +1,722 @@
+//! A POSIX/libc-over-.NET shim — the **proof slice** (Phase 0 infra + the
+//! mio/tokio-net symbol cluster). See `docs/LIBC_SHIM_SCOPE.md` for the full
+//! design; this implements §3 (fd-table + errno) and §5 Phase 0/1.
+//!
+//! The idea (LIBC_SHIM_SCOPE §1): the .NET PAL already implements the hard parts
+//! (sockets, files, alloc, time) as `rcl_dotnet_*` CIL bodies over the BCL
+//! ([`super::dotnet`]). A POSIX C-ABI caller (`mio`, `socket2`, a `-sys` crate,
+//! or a raw `extern "C"` probe) wants *integer file descriptors* and *bare POSIX
+//! symbol names* (`socket`, `read`, `epoll_wait`, …) plus a thread-local `errno`.
+//! This module is the seam: it
+//!   1. owns a process-global int-fd ⇄ `GCHandle` **fd-table** (the spine),
+//!   2. owns a thread-local **errno** cell + an exception→errno translation, and
+//!   3. registers the bare POSIX symbols as [`MissingMethodPatcher`] overrides,
+//!      each threading its int fd through the fd-table to an *existing*
+//!      `rcl_dotnet_*` body — it **re-packages** the shipped bodies, it does not
+//!      re-implement the BCL logic.
+//!
+//! The patcher keys on the demangled symbol name's last `::` segment
+//! (`Assembly::patch_missing_methods`, asm.rs ~1120). A bare `extern "C"` symbol
+//! has no `::`, so `socket`/`read`/… match their override directly, and overrides
+//! are tried *before* the `LIBC_FNS` host-libc externs fallback — so e.g.
+//! `__errno_location` (in `LIBC_FNS`) is captured here, not routed to host libc.
+//!
+//! ## The honest leak (LIBC_SHIM_SCOPE §3.2)
+//! The BCL signals I/O failure by **throwing**, not by an errno. Every leaky
+//! wrapper wraps its `rcl_dotnet_*` call in a `try/catch` and, on a caught
+//! exception, maps it to a POSIX errno + returns `-1`. The map is lossy: ~20
+//! `SocketError` codes map cleanly (notably `WouldBlock`→`EAGAIN`, load-bearing
+//! for non-blocking sockets), and the long `IOException`/HResult tail collapses
+//! to `EIO`. `EINTR` never fires (fine: `is_interrupted` stays false). This is the
+//! single biggest honesty caveat of the tier.
+//!
+//! ## Scope of THIS slice
+//! Phase 0 (fd-table + errno + symbol registration) + the Phase-1 mio/tokio-net
+//! cluster (fd I/O, sockets, epoll readiness). Genuinely-new BCL is only
+//! `rcl_dotnet_net_socket` (create-without-endpoint, in [`super::dotnet`]) + the
+//! `sockaddr`↔`(family,ip,port)` parse here + the epoll interest dict. Driving
+//! *unmodified* upstream mio through this (proof 2) is out of slice — see the note
+//! at the end of [`insert_posix_shim`] and LIBC_SHIM_SCOPE §4.
+
+use super::dotnet::endpoint_as_base;
+use crate::cilnode::{ExtendKind, MethodKind, PtrCastRes};
+use crate::ir::asm::MissingMethodPatcher;
+use crate::ir::cilroot::BranchCond;
+use crate::ir::tpe::GenericKind;
+use crate::ir::{
+    Access, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, Const, FieldDesc, Int, Interned,
+    MethodDef, MethodImpl, MethodRef, StaticFieldDesc, Type,
+};
+use crate::{Assembly, BinOp};
+
+// fd-kind tags (the entry's `kind`). STD 0/1/2 are pre-seeded.
+const FD_KIND_STD: i32 = 0;
+const FD_KIND_FILE: i32 = 1;
+const FD_KIND_SOCKET: i32 = 2;
+const FD_KIND_EPOLL: i32 = 3;
+const FD_KIND_EVENTFD: i32 = 4;
+
+// POSIX errno values (Linux x86_64 numbering — the shim hardcodes the Linux ABI).
+const ENOENT: i32 = 2;
+const EIO: i32 = 5;
+const EAGAIN: i32 = 11;
+const EADDRINUSE: i32 = 98;
+const ECONNRESET: i32 = 104;
+const ETIMEDOUT: i32 = 110;
+const ECONNREFUSED: i32 = 111;
+
+// .NET `System.Net.Sockets.SocketError` enum ints (the curated set).
+const SE_WOULD_BLOCK: i32 = 10035;
+const SE_CONN_RESET: i32 = 10054;
+const SE_TIMED_OUT: i32 = 10060;
+const SE_CONN_REFUSED: i32 = 10061;
+const SE_ADDR_IN_USE: i32 = 10048;
+
+// .NET enum ints reused below.
+const DOTNET_AF_INET: i32 = 2; // AddressFamily.InterNetwork
+const DOTNET_AF_INET6: i32 = 23; // AddressFamily.InterNetworkV6
+const DOTNET_SOCKTYPE_STREAM: i32 = 1; // SocketType.Stream
+const DOTNET_SOCKTYPE_DGRAM: i32 = 2; // SocketType.Dgram
+const DOTNET_PROTO_TCP: i32 = 6; // ProtocolType.Tcp
+const DOTNET_PROTO_UDP: i32 = 17; // ProtocolType.Udp
+
+// POSIX constants the wrappers branch on.
+const POSIX_AF_INET6: i32 = 10;
+const POSIX_SOCK_DGRAM: i32 = 2;
+
+// ===========================================================================
+// statics + RclFdEntry class
+// ===========================================================================
+
+/// `System.Collections.Generic.Dictionary<i32, object>` — the fd-table value type
+/// and the epoll interest-dict type.
+fn fd_dict(asm: &mut Assembly) -> Interned<ClassRef> {
+    ClassRef::dictionary(Type::Int(Int::I32), Type::PlatformObject, asm)
+}
+fn fd_table_sfld(asm: &mut Assembly) -> Interned<StaticFieldDesc> {
+    let main_mod = *asm.main_module();
+    let dict = fd_dict(asm);
+    let name = asm.alloc_string("rcl_fd_table");
+    asm.alloc_sfld(StaticFieldDesc::new(main_mod, name, Type::ClassRef(dict)))
+}
+fn fd_next_sfld(asm: &mut Assembly) -> Interned<StaticFieldDesc> {
+    let main_mod = *asm.main_module();
+    let name = asm.alloc_string("rcl_fd_next");
+    asm.alloc_sfld(StaticFieldDesc::new(main_mod, name, Type::Int(Int::I32)))
+}
+fn errno_sfld(asm: &mut Assembly) -> Interned<StaticFieldDesc> {
+    let main_mod = *asm.main_module();
+    let name = asm.alloc_string("rcl_errno");
+    asm.alloc_sfld(StaticFieldDesc::new(main_mod, name, Type::Int(Int::I32)))
+}
+
+/// The `RclFdEntry` managed class (boxed into `Dictionary<i32,object>`).
+fn fd_entry_class(asm: &mut Assembly) -> Interned<ClassRef> {
+    let name = asm.alloc_string("RclFdEntry");
+    asm.alloc_class_ref(ClassRef::new(name, None, false, [].into()))
+}
+fn fd_entry_handle_field(asm: &mut Assembly) -> Interned<FieldDesc> {
+    let entry = fd_entry_class(asm);
+    let name = asm.alloc_string("handle");
+    asm.alloc_field(FieldDesc::new(entry, name, Type::Int(Int::ISize)))
+}
+fn fd_entry_kind_field(asm: &mut Assembly) -> Interned<FieldDesc> {
+    let entry = fd_entry_class(asm);
+    let name = asm.alloc_string("kind");
+    asm.alloc_field(FieldDesc::new(entry, name, Type::Int(Int::I32)))
+}
+fn fd_entry_flags_field(asm: &mut Assembly) -> Interned<FieldDesc> {
+    let entry = fd_entry_class(asm);
+    let name = asm.alloc_string("flags");
+    asm.alloc_field(FieldDesc::new(entry, name, Type::Int(Int::I32)))
+}
+/// `target: i64` — for an EPOLL entry, the single registered fd (low 32 bits) the
+/// slice's simplified single-fd epoll tracks. For other kinds, unused.
+fn fd_entry_target_field(asm: &mut Assembly) -> Interned<FieldDesc> {
+    let entry = fd_entry_class(asm);
+    let name = asm.alloc_string("target");
+    asm.alloc_field(FieldDesc::new(entry, name, Type::Int(Int::I64)))
+}
+/// `token: i64` — for an EPOLL entry, the `epoll_data.u64` token to echo back in
+/// `epoll_wait`.
+fn fd_entry_token_field(asm: &mut Assembly) -> Interned<FieldDesc> {
+    let entry = fd_entry_class(asm);
+    let name = asm.alloc_string("token");
+    asm.alloc_field(FieldDesc::new(entry, name, Type::Int(Int::I64)))
+}
+
+/// Define `RclFdEntry` (fields handle/kind/flags + a ctor). `Access::Extern`
+/// survives DCE (the documented `UnmanagedThreadStart` workaround, thread.rs:432).
+fn define_fd_entry(asm: &mut Assembly) {
+    let name = asm.alloc_string("RclFdEntry");
+    let object = ClassRef::object(asm);
+    let handle = asm.alloc_string("handle");
+    let kind = asm.alloc_string("kind");
+    let flags = asm.alloc_string("flags");
+    let target = asm.alloc_string("target");
+    let token = asm.alloc_string("token");
+    let entry = asm
+        .class_def(ClassDef::new(
+            name,
+            false,
+            0,
+            Some(object),
+            vec![
+                (Type::Int(Int::ISize), handle, None),
+                (Type::Int(Int::I32), kind, None),
+                (Type::Int(Int::I32), flags, None),
+                (Type::Int(Int::I64), target, None),
+                (Type::Int(Int::I64), token, None),
+            ],
+            vec![],
+            Access::Extern,
+            None,
+            None,
+            true,
+        ))
+        .unwrap();
+
+    let ctor_name = asm.alloc_string(".ctor");
+    let this = asm.alloc_node(CILNode::LdArg(0));
+    let ld_handle = asm.alloc_node(CILNode::LdArg(1));
+    let ld_kind = asm.alloc_node(CILNode::LdArg(2));
+    let ld_flags = asm.alloc_node(CILNode::LdArg(3));
+    let handle_field = asm.alloc_field(FieldDesc::new(*entry, handle, Type::Int(Int::ISize)));
+    let kind_field = asm.alloc_field(FieldDesc::new(*entry, kind, Type::Int(Int::I32)));
+    let flags_field = asm.alloc_field(FieldDesc::new(*entry, flags, Type::Int(Int::I32)));
+    let set_handle = asm.alloc_root(CILRoot::SetField(Box::new((handle_field, this, ld_handle))));
+    let set_kind = asm.alloc_root(CILRoot::SetField(Box::new((kind_field, this, ld_kind))));
+    let set_flags = asm.alloc_root(CILRoot::SetField(Box::new((flags_field, this, ld_flags))));
+    let ret = asm.alloc_root(CILRoot::VoidRet);
+    let ctor_sig = asm.sig(
+        [
+            Type::ClassRef(*entry),
+            Type::Int(Int::ISize),
+            Type::Int(Int::I32),
+            Type::Int(Int::I32),
+        ],
+        Type::Void,
+    );
+    asm.new_method(MethodDef::new(
+        Access::Public,
+        entry,
+        ctor_name,
+        ctor_sig,
+        MethodKind::Constructor,
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![set_handle, set_kind, set_flags, ret], 0, None)],
+            locals: vec![],
+        },
+        vec![None, Some(handle), Some(kind), Some(flags)],
+    ));
+}
+
+/// `new RclFdEntry(handle, kind, flags)`.
+fn new_fd_entry(
+    asm: &mut Assembly,
+    handle: Interned<CILNode>,
+    kind: Interned<CILNode>,
+    flags: Interned<CILNode>,
+) -> Interned<CILNode> {
+    let entry = fd_entry_class(asm);
+    let ctor = asm.class_ref(entry).clone().ctor(
+        &[Type::Int(Int::ISize), Type::Int(Int::I32), Type::Int(Int::I32)],
+        asm,
+    );
+    asm.alloc_node(CILNode::call(ctor, [handle, kind, flags]))
+}
+
+/// Allocate the fd-table statics + initialize them in the tcctor (mirror the
+/// `pthread_keys` pattern, thread.rs:374-412): build the Dictionary, pre-seed
+/// fd 0/1/2 with STD sentinel entries, seed `rcl_fd_next = 3`.
+fn init_statics(asm: &mut Assembly) {
+    let main_mod = asm.main_module();
+    let dict = fd_dict(asm);
+    asm.add_static(Type::ClassRef(dict), "rcl_fd_table", false, main_mod, None, false);
+    asm.add_static(Type::Int(Int::I32), "rcl_fd_next", false, main_mod, None, false);
+    // errno: thread_local=TRUE -> the exporter emits [ThreadStatic].
+    asm.add_static(Type::Int(Int::I32), "rcl_errno", true, main_mod, None, false);
+
+    // rcl_fd_table = new Dictionary<i32,object>();
+    let table_sfld = fd_table_sfld(asm);
+    let dict_ctor = asm[dict].clone().ctor(&[], asm);
+    let new_dict = asm.alloc_node(CILNode::call(dict_ctor, []));
+    let init_table = asm.alloc_root(CILRoot::SetStaticField {
+        field: table_sfld,
+        val: new_dict,
+    });
+
+    // Pre-seed fd 0/1/2 as STD sentinels (handle 0).
+    let mut roots = vec![init_table];
+    for fd in 0..3_i32 {
+        let dict_node = asm.alloc_node(CILNode::LdStaticField(table_sfld));
+        let fd_node = asm.alloc_node(Const::I32(fd));
+        let zero_h = asm.alloc_node(Const::ISize(0));
+        let std_kind = asm.alloc_node(Const::I32(FD_KIND_STD));
+        let zero_f = asm.alloc_node(Const::I32(0));
+        let entry = new_fd_entry(asm, zero_h, std_kind, zero_f);
+        roots.push(dict_set_item(asm, dict_node, fd_node, entry));
+    }
+
+    // rcl_fd_next = 3.
+    let next_sfld = fd_next_sfld(asm);
+    let three = asm.alloc_node(Const::I32(3));
+    let init_next = asm.alloc_root(CILRoot::SetStaticField {
+        field: next_sfld,
+        val: three,
+    });
+    roots.push(init_next);
+
+    asm.add_tcctor(&roots);
+}
+
+// ===========================================================================
+// fd-table builtins — MethodDefs on main_module (like handle_to_obj). The POSIX
+// wrappers CALL them; the two-pass patcher resolves the forward refs.
+// ===========================================================================
+
+fn load_fd_table(asm: &mut Assembly) -> Interned<CILNode> {
+    let sfld = fd_table_sfld(asm);
+    asm.alloc_node(CILNode::LdStaticField(sfld))
+}
+fn dict_get_item(
+    asm: &mut Assembly,
+    dict: Interned<CILNode>,
+    key: Interned<CILNode>,
+) -> Interned<CILNode> {
+    // On a generic `Dictionary<K,V>` the method ref must name the params as the
+    // class generics (!0/!1), NOT the concrete instantiation — exactly how the
+    // pthread_keys dict calls set_Item/Remove (thread.rs).
+    let fd_dict = fd_dict(asm);
+    let get_item = asm.alloc_string("get_Item");
+    let get = asm.class_ref(fd_dict).clone().virtual_mref(
+        &[Type::PlatformGeneric(0, GenericKind::TypeGeneric)],
+        Type::PlatformGeneric(1, GenericKind::TypeGeneric),
+        get_item,
+        asm,
+    );
+    asm.alloc_node(CILNode::call(get, [dict, key]))
+}
+fn dict_set_item(
+    asm: &mut Assembly,
+    dict: Interned<CILNode>,
+    key: Interned<CILNode>,
+    val: Interned<CILNode>,
+) -> Interned<CILRoot> {
+    let fd_dict = fd_dict(asm);
+    let set_item = asm.alloc_string("set_Item");
+    let set = asm.class_ref(fd_dict).clone().virtual_mref(
+        &[
+            Type::PlatformGeneric(0, GenericKind::TypeGeneric),
+            Type::PlatformGeneric(1, GenericKind::TypeGeneric),
+        ],
+        Type::Void,
+        set_item,
+        asm,
+    );
+    asm.alloc_root(CILRoot::call(set, [dict, key, val]))
+}
+/// `(RclFdEntry)rcl_fd_table.get_Item(LdArg(fd_arg))`.
+fn entry_of_fd(asm: &mut Assembly, fd_arg: u32) -> Interned<CILNode> {
+    let dict = load_fd_table(asm);
+    let fd = asm.alloc_node(CILNode::LdArg(fd_arg));
+    let obj = dict_get_item(asm, dict, fd);
+    let entry = fd_entry_class(asm);
+    let entry_ty = asm.alloc_type(Type::ClassRef(entry));
+    asm.alloc_node(CILNode::CheckedCast(obj, entry_ty))
+}
+
+/// Helper to register a straight-line main-module static MethodDef.
+fn define_main_method(
+    asm: &mut Assembly,
+    name: &str,
+    inputs: &[Type],
+    output: Type,
+    roots: Vec<Interned<CILRoot>>,
+    locals: Vec<(Option<Interned<crate::IString>>, Interned<Type>)>,
+    arg_names: Vec<Option<Interned<crate::IString>>>,
+) {
+    let main_module = asm.main_module();
+    let name = asm.alloc_string(name);
+    let sig = asm.sig(inputs.to_vec(), output);
+    asm.new_method(MethodDef::new(
+        Access::Public,
+        main_module,
+        name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(roots, 0, None)],
+            locals,
+        },
+        arg_names,
+    ));
+}
+
+/// A `static_mref` to a main-module method (the call-seam for wrappers).
+fn main_static(
+    asm: &mut Assembly,
+    name: &str,
+    inputs: &[Type],
+    output: Type,
+) -> Interned<MethodRef> {
+    let main_module = asm.main_module();
+    let fn_name = asm.alloc_string(name);
+    asm.class_ref(*main_module)
+        .clone()
+        .static_mref(inputs, output, fn_name, asm)
+}
+
+fn define_fdtable_builtins(asm: &mut Assembly) {
+    let void_ptr = asm.nptr(Type::Void);
+    let i32_ty = asm.alloc_type(Type::Int(Int::I32));
+
+    // rcl_fdtable_insert(handle: isize, kind: i32, flags: i32) -> i32
+    {
+        let next_sfld = fd_next_sfld(asm);
+        let fd_val = asm.alloc_node(CILNode::LdStaticField(next_sfld));
+        let store_fd = asm.alloc_root(CILRoot::StLoc(0, fd_val));
+        let fd0 = asm.alloc_node(CILNode::LdLoc(0));
+        let one = asm.alloc_node(Const::I32(1));
+        let incd = asm.alloc_node(CILNode::BinOp(fd0, one, BinOp::Add));
+        let store_next = asm.alloc_root(CILRoot::SetStaticField {
+            field: next_sfld,
+            val: incd,
+        });
+        let handle = asm.alloc_node(CILNode::LdArg(0));
+        let kind = asm.alloc_node(CILNode::LdArg(1));
+        let flags = asm.alloc_node(CILNode::LdArg(2));
+        let entry = new_fd_entry(asm, handle, kind, flags);
+        let dict = load_fd_table(asm);
+        let fd1 = asm.alloc_node(CILNode::LdLoc(0));
+        let set = dict_set_item(asm, dict, fd1, entry);
+        let fd2 = asm.alloc_node(CILNode::LdLoc(0));
+        let ret = asm.alloc_root(CILRoot::Ret(fd2));
+        define_main_method(
+            asm,
+            "rcl_fdtable_insert",
+            &[Type::Int(Int::ISize), Type::Int(Int::I32), Type::Int(Int::I32)],
+            Type::Int(Int::I32),
+            vec![store_fd, store_next, set, ret],
+            vec![(None, i32_ty)],
+            vec![None, None, None],
+        );
+    }
+    // rcl_fdtable_handle(fd) -> *mut u8
+    {
+        let entry = entry_of_fd(asm, 0);
+        let f = fd_entry_handle_field(asm);
+        let h = asm.alloc_node(CILNode::LdField { addr: entry, field: f });
+        let void = asm.alloc_type(Type::Void);
+        let h = asm.alloc_node(CILNode::PtrCast(h, Box::new(PtrCastRes::Ptr(void))));
+        let ret = asm.alloc_root(CILRoot::Ret(h));
+        define_main_method(
+            asm,
+            "rcl_fdtable_handle",
+            &[Type::Int(Int::I32)],
+            void_ptr,
+            vec![ret],
+            vec![],
+            vec![None],
+        );
+    }
+    // rcl_fdtable_kind(fd) -> i32
+    {
+        let entry = entry_of_fd(asm, 0);
+        let f = fd_entry_kind_field(asm);
+        let k = asm.alloc_node(CILNode::LdField { addr: entry, field: f });
+        let ret = asm.alloc_root(CILRoot::Ret(k));
+        define_main_method(
+            asm,
+            "rcl_fdtable_kind",
+            &[Type::Int(Int::I32)],
+            Type::Int(Int::I32),
+            vec![ret],
+            vec![],
+            vec![None],
+        );
+    }
+    // rcl_fdtable_get_flags(fd) -> i32
+    {
+        let entry = entry_of_fd(asm, 0);
+        let f = fd_entry_flags_field(asm);
+        let v = asm.alloc_node(CILNode::LdField { addr: entry, field: f });
+        let ret = asm.alloc_root(CILRoot::Ret(v));
+        define_main_method(
+            asm,
+            "rcl_fdtable_get_flags",
+            &[Type::Int(Int::I32)],
+            Type::Int(Int::I32),
+            vec![ret],
+            vec![],
+            vec![None],
+        );
+    }
+    // rcl_fdtable_set_flags(fd, flags)
+    {
+        let entry = entry_of_fd(asm, 0);
+        let f = fd_entry_flags_field(asm);
+        let nf = asm.alloc_node(CILNode::LdArg(1));
+        let set = asm.alloc_root(CILRoot::SetField(Box::new((f, entry, nf))));
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        define_main_method(
+            asm,
+            "rcl_fdtable_set_flags",
+            &[Type::Int(Int::I32), Type::Int(Int::I32)],
+            Type::Void,
+            vec![set, ret],
+            vec![],
+            vec![None, None],
+        );
+    }
+    // rcl_fdtable_remove(fd)
+    {
+        let fd_dict = fd_dict(asm);
+        let dict = load_fd_table(asm);
+        let fd = asm.alloc_node(CILNode::LdArg(0));
+        let remove_name = asm.alloc_string("Remove");
+        let remove = asm.class_ref(fd_dict).clone().virtual_mref(
+            &[Type::PlatformGeneric(0, GenericKind::TypeGeneric)],
+            Type::Bool,
+            remove_name,
+            asm,
+        );
+        let removed = asm.alloc_node(CILNode::call(remove, [dict, fd]));
+        let pop = asm.alloc_root(CILRoot::Pop(removed));
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        define_main_method(
+            asm,
+            "rcl_fdtable_remove",
+            &[Type::Int(Int::I32)],
+            Type::Void,
+            vec![pop, ret],
+            vec![],
+            vec![None],
+        );
+    }
+}
+
+// Convenience calls to the fd-table MethodDefs from a wrapper body.
+fn call_fdtable_handle(asm: &mut Assembly, fd: Interned<CILNode>) -> Interned<CILNode> {
+    let void_ptr = asm.nptr(Type::Void);
+    let m = main_static(asm, "rcl_fdtable_handle", &[Type::Int(Int::I32)], void_ptr);
+    asm.alloc_node(CILNode::call(m, [fd]))
+}
+fn call_fdtable_kind(asm: &mut Assembly, fd: Interned<CILNode>) -> Interned<CILNode> {
+    let m = main_static(asm, "rcl_fdtable_kind", &[Type::Int(Int::I32)], Type::Int(Int::I32));
+    asm.alloc_node(CILNode::call(m, [fd]))
+}
+fn call_fdtable_insert(
+    asm: &mut Assembly,
+    handle: Interned<CILNode>,
+    kind: i32,
+    flags: i32,
+) -> Interned<CILNode> {
+    let m = main_static(
+        asm,
+        "rcl_fdtable_insert",
+        &[Type::Int(Int::ISize), Type::Int(Int::I32), Type::Int(Int::I32)],
+        Type::Int(Int::I32),
+    );
+    let handle_isize = asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::ISize)));
+    let kind = asm.alloc_node(Const::I32(kind));
+    let flags = asm.alloc_node(Const::I32(flags));
+    asm.alloc_node(CILNode::call(m, [handle_isize, kind, flags]))
+}
+fn call_fdtable_remove(asm: &mut Assembly, fd: Interned<CILNode>) -> Interned<CILRoot> {
+    let m = main_static(asm, "rcl_fdtable_remove", &[Type::Int(Int::I32)], Type::Void);
+    asm.alloc_root(CILRoot::call(m, [fd]))
+}
+
+// A `static_mref` to a `rcl_dotnet_*` body (resolved by the dotnet PAL patcher).
+fn dotnet_mref(
+    asm: &mut Assembly,
+    name: &str,
+    inputs: &[Type],
+    output: Type,
+) -> Interned<MethodRef> {
+    main_static(asm, name, inputs, output)
+}
+
+// ===========================================================================
+// errno
+// ===========================================================================
+
+/// `__errno_location() -> *mut i32` = `&rcl_errno`.
+fn insert_errno_location(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("__errno_location");
+    let generator = move |_, asm: &mut Assembly| {
+        let sfld = errno_sfld(asm);
+        let addr = asm.alloc_node(CILNode::LdStaticFieldAddress(sfld));
+        let i32_ty = asm.alloc_type(Type::Int(Int::I32));
+        let addr = asm.alloc_node(CILNode::PtrCast(addr, Box::new(PtrCastRes::Ptr(i32_ty))));
+        let ret = asm.alloc_root(CILRoot::Ret(addr));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+fn set_errno(asm: &mut Assembly, val: i32) -> Interned<CILRoot> {
+    let sfld = errno_sfld(asm);
+    let v = asm.alloc_node(Const::I32(val));
+    asm.alloc_root(CILRoot::SetStaticField { field: sfld, val: v })
+}
+
+/// `rcl_errno_from_exception(System.Object exn) -> i32` — map a caught BCL
+/// exception to a POSIX errno. This is a normal (non-handler) MethodDef so its
+/// branch chain lives outside any `try`/`catch` region (keeping the per-wrapper
+/// catch handler to a single block — a multi-block handler with an internal
+/// switch tripped the IL exporter's label resolution). NON-discarding:
+///   `if exn isinst SocketException -> map exn.SocketErrorCode (curated switch);
+///    else -> EIO.`
+fn define_errno_from_exception(asm: &mut Assembly) {
+    let main_module = asm.main_module();
+    let name = asm.alloc_string("rcl_errno_from_exception");
+    let socket_exception = ClassRef::socket_exception(asm);
+    let se_ty = asm.alloc_type(Type::ClassRef(socket_exception));
+
+    // block 0: if !(exn isinst SocketException) goto 1 (EIO); else goto 2.
+    let exn = asm.alloc_node(CILNode::LdArg(0));
+    let is_se = asm.alloc_node(CILNode::IsInst(exn, se_ty));
+    let goto_eio = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, Some(BranchCond::False(is_se))))));
+    let goto_se = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None))));
+    // block 1: ret EIO.
+    let eio = asm.alloc_node(Const::I32(EIO));
+    let ret_eio = asm.alloc_root(CILRoot::Ret(eio));
+    // block 2: code = ((SocketException)exn).SocketErrorCode; switch.
+    let exn2 = asm.alloc_node(CILNode::LdArg(0));
+    let se_cast = asm.alloc_node(CILNode::CheckedCast(exn2, se_ty));
+    let get_code_name = asm.alloc_string("get_SocketErrorCode");
+    let get_code = asm.class_ref(socket_exception).clone().instance(
+        &[],
+        Type::Int(Int::I32),
+        get_code_name,
+        asm,
+    );
+    let code = asm.alloc_node(CILNode::call(get_code, [se_cast]));
+    let store_code = asm.alloc_root(CILRoot::StLoc(0, code));
+    // test chain: blocks 10..14 return mapped errno; default (15) returns EIO.
+    let test = |asm: &mut Assembly, se: i32, tgt: u32| {
+        let c = asm.alloc_node(CILNode::LdLoc(0));
+        let sc = asm.alloc_node(Const::I32(se));
+        asm.alloc_root(CILRoot::Branch(Box::new((tgt, 0, Some(BranchCond::Eq(c, sc))))))
+    };
+    let t_wb = test(asm, SE_WOULD_BLOCK, 10);
+    let t_to = test(asm, SE_TIMED_OUT, 11);
+    let t_cref = test(asm, SE_CONN_REFUSED, 12);
+    let t_crst = test(asm, SE_CONN_RESET, 13);
+    let t_aiu = test(asm, SE_ADDR_IN_USE, 14);
+    let goto_default = asm.alloc_root(CILRoot::Branch(Box::new((15, 0, None))));
+    let mk_ret = |asm: &mut Assembly, errno: i32| {
+        let v = asm.alloc_node(Const::I32(errno));
+        asm.alloc_root(CILRoot::Ret(v))
+    };
+    let r_eagain = mk_ret(asm, EAGAIN);
+    let r_etimedout = mk_ret(asm, ETIMEDOUT);
+    let r_econnrefused = mk_ret(asm, ECONNREFUSED);
+    let r_econnreset = mk_ret(asm, ECONNRESET);
+    let r_eaddrinuse = mk_ret(asm, EADDRINUSE);
+    let r_default = mk_ret(asm, EIO);
+
+    let i32_ty = asm.alloc_type(Type::Int(Int::I32));
+    let sig = asm.sig([Type::PlatformObject], Type::Int(Int::I32));
+    asm.new_method(MethodDef::new(
+        Access::Public,
+        main_module,
+        name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![
+                BasicBlock::new(vec![goto_eio, goto_se], 0, None),
+                BasicBlock::new(vec![ret_eio], 1, None),
+                BasicBlock::new(
+                    vec![store_code, t_wb, t_to, t_cref, t_crst, t_aiu, goto_default],
+                    2,
+                    None,
+                ),
+                BasicBlock::new(vec![r_eagain], 10, None),
+                BasicBlock::new(vec![r_etimedout], 11, None),
+                BasicBlock::new(vec![r_econnrefused], 12, None),
+                BasicBlock::new(vec![r_econnreset], 13, None),
+                BasicBlock::new(vec![r_eaddrinuse], 14, None),
+                BasicBlock::new(vec![r_default], 15, None),
+            ],
+            locals: vec![(None, i32_ty)],
+        },
+        vec![None],
+    ));
+}
+
+// ===========================================================================
+// the try/catch errno wrapper
+//
+// A leaky wrapper's `body` is a straight-line root vector that ends by storing
+// the OK result in local 0 (`StLoc(0, result)`). `errno_wrapped` appends:
+//   * `leave -> ok(2)` to the try,
+//   * a SINGLE-BLOCK catch handler: `errno = rcl_errno_from_exception(GetException);
+//     local0 = -1; leave -> 2` (the switch lives in the helper MethodDef, so the
+//     handler stays one block — a multi-block handler with an internal switch
+//     tripped the IL exporter's label resolution),
+//   * block 2: `ret local0`.
+// The body uses ONLY block 0, so the handler's fixed block ids (1, 2) don't
+// collide. Modeled on insert_catch_unwind (mod.rs:613).
+// ===========================================================================
+fn errno_wrapped(
+    asm: &mut Assembly,
+    mut body: Vec<Interned<CILRoot>>,
+    ret_ty: Type,
+    extra_locals: Vec<(Option<Interned<crate::IString>>, Interned<Type>)>,
+) -> MethodImpl {
+    let leave_ok = asm.alloc_root(CILRoot::ExitSpecialRegion { target: 2, source: 0 });
+    body.push(leave_ok);
+
+    // Block 1 (catch): errno = rcl_errno_from_exception(GetException); local0=-1; leave->2.
+    let get_exn = asm.alloc_node(CILNode::GetException);
+    let map = main_static(asm, "rcl_errno_from_exception", &[Type::PlatformObject], Type::Int(Int::I32));
+    let mapped = asm.alloc_node(CILNode::call(map, [get_exn]));
+    let errno_field = errno_sfld(asm);
+    let set_errno = asm.alloc_root(CILRoot::SetStaticField { field: errno_field, val: mapped });
+    let minus1 = asm.alloc_node(Const::I32(-1));
+    let minus1 = asm.int_cast(minus1, ret_ty_int(ret_ty), ExtendKind::SignExtend);
+    let store_minus1 = asm.alloc_root(CILRoot::StLoc(0, minus1));
+    let leave_catch = asm.alloc_root(CILRoot::ExitSpecialRegion { target: 2, source: 1 });
+
+    // Block 2: ret local0.
+    let ld0 = asm.alloc_node(CILNode::LdLoc(0));
+    let ret = asm.alloc_root(CILRoot::Ret(ld0));
+
+    let ret_ty_idx = asm.alloc_type(ret_ty);
+    let mut locals = vec![(Some(asm.alloc_string("result")), ret_ty_idx)];
+    locals.extend(extra_locals);
+
+    MethodImpl::MethodBody {
+        blocks: vec![
+            BasicBlock::new(
+                body,
+                0,
+                Some(vec![BasicBlock::new(
+                    vec![set_errno, store_minus1, leave_catch],
+                    1,
+                    None,
+                )]),
+            ),
+            BasicBlock::new(vec![ret], 2, None),
+        ],
+        locals,
+    }
+}
+
+/// The integer width to coerce `-1` to for a given return type.
+fn ret_ty_int(ret_ty: Type) -> Int {
+    match ret_ty {
+        Type::Int(i) => i,
+        Type::Ptr(_) => Int::ISize,
+        _ => Int::ISize,
+    }
+}
+
+include!("posix_symbols.rs");

@@ -843,7 +843,7 @@ fn string_to_utf8(asm: &mut Assembly) -> Interned<MethodRef> {
 /// managed `string`, via `Encoding.UTF8.GetString(byte*, int)`. Returns the
 /// node holding the decoded string. Mirrors the decode half of
 /// `insert_dotnet_write`.
-fn decode_utf8(asm: &mut Assembly, ptr_arg: u32, len_arg: u32) -> Interned<CILNode> {
+pub(crate) fn decode_utf8(asm: &mut Assembly, ptr_arg: u32, len_arg: u32) -> Interned<CILNode> {
     let u8_ptr = asm.nptr(Type::Int(Int::U8));
     let encoding = {
         let name = asm.alloc_string("System.Text.Encoding");
@@ -1101,7 +1101,7 @@ fn insert_dotnet_env(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
 /// `ref_to_handle` produced) and `castclass` it to `class`, leaving the typed
 /// object node on the stack. Mirrors the handle round-trip in
 /// `insert_dotnet_thread_join`.
-fn handle_to_class(
+pub(crate) fn handle_to_class(
     asm: &mut Assembly,
     handle_arg: u32,
     class: Interned<ClassRef>,
@@ -1124,7 +1124,7 @@ fn handle_to_class(
 /// Build the roots that free the `GCHandle` whose `IntPtr` is `LdArg(handle_arg)`:
 /// `GCHandle.FromIntPtr((nint)handle).Free();`, stowing the handle in local
 /// `gch_local`. Mirrors the free dance in `insert_dotnet_thread_join`.
-fn free_handle_roots(
+pub(crate) fn free_handle_roots(
     asm: &mut Assembly,
     handle_arg: u32,
     gch_local: u32,
@@ -1155,7 +1155,7 @@ fn free_handle_roots(
 /// Build a `System.Span<byte>` (or `ReadOnlySpan<byte>` when `read_only`) from
 /// the `(buf_ptr, len)` pair at `LdArg(ptr_arg)` / `LdArg(len_arg)`, via the
 /// span's `(void*, int32)` ctor. Mirrors `insert_dotnet_random_fill`.
-fn build_byte_span(
+pub(crate) fn build_byte_span(
     asm: &mut Assembly,
     ptr_arg: u32,
     len_arg: u32,
@@ -1867,7 +1867,7 @@ const NET_PROTO_UDP: i32 = 17;
 ///                   (int)port)`.
 /// The span length picks v4/v6; the octets are network order (no byte-swap), and
 /// `IPEndPoint`'s port is host-order (no `to_be`).
-fn build_endpoint(
+pub(crate) fn build_endpoint(
     asm: &mut Assembly,
     ip_ptr_arg: u32,
     ip_len_arg: u32,
@@ -1894,7 +1894,7 @@ fn build_endpoint(
 /// `Connect` / `SendTo`. Needed because the cilly typechecker does not model
 /// class inheritance, so an `IPEndPoint`-typed arg would not match an `EndPoint`
 /// param, and the BCL only exposes those methods on the `EndPoint` base.
-fn endpoint_as_base(asm: &mut Assembly, ip_endpoint_node: Interned<CILNode>) -> Interned<CILNode> {
+pub(crate) fn endpoint_as_base(asm: &mut Assembly, ip_endpoint_node: Interned<CILNode>) -> Interned<CILNode> {
     let endpoint_base = ClassRef::endpoint(asm);
     let base_ty = asm.alloc_type(Type::ClassRef(endpoint_base));
     asm.alloc_node(CILNode::CheckedCast(ip_endpoint_node, base_ty))
@@ -1905,7 +1905,7 @@ fn endpoint_as_base(asm: &mut Assembly, ip_endpoint_node: Interned<CILNode>) -> 
 /// family is read off the endpoint (so no family-int translation is needed); the
 /// `sock_type`/`proto` int nodes feed the int-backed enum params directly (the
 /// ctor signature must still name the enum types or BCL method resolution fails).
-fn build_socket(
+pub(crate) fn build_socket(
     asm: &mut Assembly,
     endpoint: Interned<CILNode>,
     ep_local: u32,
@@ -1940,14 +1940,14 @@ fn build_socket(
 
 /// Recover the `Socket` pinned by the handle at `LdArg(handle_arg)`. Thin wrapper
 /// over `handle_to_class` for readability.
-fn handle_to_socket(asm: &mut Assembly, handle_arg: u32) -> Interned<CILNode> {
+pub(crate) fn handle_to_socket(asm: &mut Assembly, handle_arg: u32) -> Interned<CILNode> {
     let socket = ClassRef::socket(asm);
     handle_to_class(asm, handle_arg, socket)
 }
 
 /// `(IntPtr)GCHandle.Alloc(socket_in_local)` as a `*mut u8`, ready to return as
 /// an opaque handle. Mirrors the `ref_to_handle` tail of `insert_dotnet_fs_open`.
-fn socket_local_to_handle(asm: &mut Assembly, sock_local: u32) -> Interned<CILNode> {
+pub(crate) fn socket_local_to_handle(asm: &mut Assembly, sock_local: u32) -> Interned<CILNode> {
     let handle = CILNode::LdLoc(sock_local).ref_to_handle(asm);
     let handle = asm.alloc_node(handle);
     let void = asm.alloc_type(Type::Void);
@@ -1962,7 +1962,7 @@ fn socket_local_to_handle(asm: &mut Assembly, sock_local: u32) -> Interned<CILNo
 ///   `*out_port = (ushort)ep.Port;`
 /// `out_family` receives the IP byte length (4 v4 / 16 v6); the std side maps it.
 /// `bytes_local` must be a `byte[]` local.
-fn write_endpoint_out(
+pub(crate) fn write_endpoint_out(
     asm: &mut Assembly,
     ep_local: u32,
     bytes_local: u32,
@@ -2053,6 +2053,7 @@ fn write_endpoint_out(
 /// Registers all `rcl_dotnet_net_*` BCL bindings (System.Net.Sockets).
 fn insert_dotnet_net(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     insert_dotnet_net_tcp_connect(asm, patcher);
+    insert_dotnet_net_socket(asm, patcher);
     insert_dotnet_net_bind(asm, patcher);
     insert_dotnet_net_accept(asm, patcher);
     insert_dotnet_net_recv(asm, patcher);
@@ -2112,6 +2113,43 @@ fn insert_dotnet_net_tcp_connect(asm: &mut Assembly, patcher: &mut MissingMethod
                 (Some(asm.alloc_string("endpoint")), ep_ty),
                 (Some(asm.alloc_string("socket")), sock_ty),
             ],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_net_socket(af_dotnet, sock_type, proto) -> *mut u8`
+///   => `var s = new Socket((AddressFamily)af_dotnet, (SocketType)sock_type,
+///      (ProtocolType)proto);` return the `GCHandle` `IntPtr`.
+///
+/// The endpoint-free `socket()` constructor (POSIX `socket(2)` creates an unbound
+/// socket; `build_socket` always wants an endpoint to read the family off). The
+/// caller (the POSIX `socket` wrapper in `posix.rs`) passes the *already-.NET*
+/// `AddressFamily` value (AF_INET 2 → InterNetwork 2; AF_INET6 10 → InterNetworkV6
+/// 23), the `SocketType` int (Stream 1 / Dgram 2) and `ProtocolType` int (Tcp 6 /
+/// Udp 17) straight through — the int-backed enum value-types are stack-compatible.
+fn insert_dotnet_net_socket(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_net_socket");
+    let generator = move |_, asm: &mut Assembly| {
+        let socket = ClassRef::socket(asm);
+        let address_family = ClassRef::address_family(asm);
+        let socket_type = Type::ClassRef(ClassRef::socket_type(asm));
+        let protocol_type = Type::ClassRef(ClassRef::protocol_type(asm));
+        let af = asm.alloc_node(CILNode::LdArg(0));
+        let st = asm.alloc_node(CILNode::LdArg(1));
+        let proto = asm.alloc_node(CILNode::LdArg(2));
+        let sock_ctor = asm.class_ref(socket).clone().ctor(
+            &[Type::ClassRef(address_family), socket_type, protocol_type],
+            asm,
+        );
+        let sock = asm.alloc_node(CILNode::call(sock_ctor, [af, st, proto]));
+        let store_sock = asm.alloc_root(CILRoot::StLoc(0, sock));
+        let handle = socket_local_to_handle(asm, 0);
+        let ret = asm.alloc_root(CILRoot::Ret(handle));
+        let sock_ty = asm.alloc_type(Type::ClassRef(socket));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![store_sock, ret], 0, None)],
+            locals: vec![(Some(asm.alloc_string("socket")), sock_ty)],
         }
     };
     patcher.insert(name, Box::new(generator));
