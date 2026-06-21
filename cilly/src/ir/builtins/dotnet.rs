@@ -154,6 +154,8 @@ pub fn insert_dotnet_pal(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
     insert_dotnet_thread_yield(asm, patcher);
     insert_dotnet_thread_sleep(asm, patcher);
     insert_dotnet_available_parallelism(asm, patcher);
+    insert_dotnet_getpid(asm, patcher);
+    insert_dotnet_hostname(asm, patcher);
     insert_dotnet_cotaskmem_free(asm, patcher);
     insert_dotnet_args(asm, patcher);
     insert_dotnet_env(asm, patcher);
@@ -782,6 +784,63 @@ fn insert_dotnet_available_parallelism(asm: &mut Assembly, patcher: &mut Missing
         let count = asm.alloc_node(CILNode::call(get_count, []));
         let count = asm.int_cast(count, Int::USize, ExtendKind::ZeroExtend);
         let ret = asm.alloc_root(CILRoot::Ret(count));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_getpid() -> u32` => `System.Environment.ProcessId`.
+///
+/// Backs `sys::process::getpid` on the dotnet PAL (a genuine process id, unlike
+/// `spawn`'s synthetic-pid wall). `ProcessId` is an `int` static getter
+/// (`get_ProcessId`); the symbol's return type is `u32`, and the value is always
+/// non-negative, so a plain widen-free reinterpret suffices.
+fn insert_dotnet_getpid(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_getpid");
+    let generator = move |_, asm: &mut Assembly| {
+        let env = ClassRef::enviroment(asm);
+        let get_pid = asm.alloc_string("get_ProcessId");
+        let get_pid =
+            asm.class_ref(env)
+                .clone()
+                .static_mref(&[], Type::Int(Int::I32), get_pid, asm);
+        let pid = asm.alloc_node(CILNode::call(get_pid, []));
+        let ret = asm.alloc_root(CILRoot::Ret(pid));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_hostname() -> *mut u8` =>
+///   `Marshal.StringToCoTaskMemUTF8(System.Environment.MachineName)`.
+///
+/// Backs `sys::net::hostname` on the dotnet PAL. `MachineName` is a `string`
+/// static getter (`get_MachineName`); we marshal it to a freshly-allocated,
+/// NUL-terminated UTF-8 C string (COM-task-memory heap) the std side reads with
+/// `CStr` and frees with `rcl_dotnet_cotaskmem_free` — mirroring the env getter.
+fn insert_dotnet_hostname(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_hostname");
+    let generator = move |_, asm: &mut Assembly| {
+        let u8_ptr = asm.nptr(Type::Int(Int::U8));
+        // s = Environment.MachineName (a non-null string).
+        let env = ClassRef::enviroment(asm);
+        let get_name = asm.alloc_string("get_MachineName");
+        let get_name =
+            asm.class_ref(env)
+                .clone()
+                .static_mref(&[], Type::PlatformString, get_name, asm);
+        let s = asm.alloc_node(CILNode::call(get_name, []));
+        // buf = (u8*)StringToCoTaskMemUTF8(s).
+        let to_utf8 = string_to_utf8(asm);
+        let buf = asm.alloc_node(CILNode::call(to_utf8, [s]));
+        let buf = asm.cast_ptr(buf, u8_ptr);
+        let ret = asm.alloc_root(CILRoot::Ret(buf));
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![ret], 0, None)],
             locals: vec![],

@@ -910,6 +910,9 @@ pub fn insert_posix_shim(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
     define_fd_entry(asm);
     init_statics(asm);
     define_fdtable_builtins(asm);
+    // Overrides so the dotnet std net Socket onion's bare `extern "C"`
+    // rcl_fdtable_handle/insert references resolve to the MethodDefs above.
+    insert_fdtable_externs(asm, patcher);
 
     // errno.
     define_errno_from_exception(asm);

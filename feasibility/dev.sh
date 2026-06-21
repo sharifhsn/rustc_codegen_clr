@@ -21,7 +21,7 @@
 #   dev.sh buildstd [--clean]    Shorthand for `run build_std`.
 #   dev.sh il <crate> <symbol>   Disassemble method(s) whose (mangled) name contains <symbol> from
 #                                the crate's built .dll (ikdasm). e.g. `il build_std rust_alloc`.
-#   dev.sh gate                  Force-rebuild, run ::stable (CI skips), diff vs baseline (416/22),
+#   dev.sh gate                  Force-rebuild, run ::stable (CI skips), diff vs baseline (425/13),
 #                                report PASS/FAIL + any NEW failures (outside the known-22 set).
 #   dev.sh pal-build             Inject the in-repo dotnet PAL (dotnet_pal/sys/**) into the
 #                                container's rust-src (mirror files + insert the target_os="dotnet"
@@ -294,6 +294,111 @@ fi
 # arm that already catches os=dotnet (returns Err(UNSUPPORTED_PLATFORM)), and
 # `hostname()` is not exercised by the net probe.
 [ -f "$PAL/net/connection/dotnet.rs" ] && inject_arm net/connection/mod.rs 'mod dotnet; pub use dotnet::*;'
+# ===========================================================================
+# CAP-1 LIBC-SHIM FOUNDATION ARMS (LIBC_SHIM_SCOPE §4.2). These six dotnet std
+# PAL cascade arms are injected as the FIRST cfg_select! arm of each module, so
+# that when `families=["unix"]` is flipped at Cap-2 the unix/libc arm never wins.
+# target_os="dotnet" is true ONLY for our target, so arm-0 injection cannot change
+# any other target's selection — purely additive. With `families` UNSET today
+# these modules already fall through to their `_`/no_threads/unsupported fallback,
+# so each dotnet arm need only be AT LEAST as complete as the arm it shadows
+# (most re-use the verbatim fallback source via `#[path]`). DORMANT-BUT-PRESENT
+# with families unset; LOAD-BEARING at the Cap-2 flip. The fd-backed net Socket
+# (net/connection/dotnet.rs, above) + sys::fd (below) are the exception: they are
+# load-bearing NOW (the os/fd Socket onion + std::os::fd traits depend on them).
+# ===========================================================================
+# sys::fd — FileDesc(OwnedFd) over the fd-table; the intermediate type
+# os/fd/net.rs needs (Socket(FileDesc)). fd/mod.rs `_ =>` arm is empty today.
+[ -f "$PAL/fd/dotnet.rs" ]            && inject_arm fd/mod.rs            'mod dotnet; pub use dotnet::*;'
+# sys::process — mirror unsupported + REAL getpid (Environment.ProcessId). Uses
+# the `mod X; use X as imp;` cascade shape (like time/fs), NOT `pub use dotnet::*`.
+[ -f "$PAL/process/dotnet.rs" ]       && inject_arm process/mod.rs       'mod dotnet; use dotnet as imp;'
+# sys::pipe — PRESENT-but-Unsupported (System.IO.Pipes can't ride Socket.Poll).
+[ -f "$PAL/pipe/dotnet.rs" ]          && inject_arm pipe/mod.rs          'mod dotnet; pub use dotnet::{Pipe, pipe};'
+# sys::sync::{mutex,rwlock,condvar,once} + thread_parking — Cap-1 mirrors the
+# no_threads/unsupported inner contracts (single-managed-thread correct; REAL
+# System.Threading locks deferred to Cap-2 with the [ThreadStatic] TLS fix). Each
+# of these mod.rs has exactly ONE cfg_select! (block 1), so nth=1 default is safe;
+# the futex arm is first inside but keys on an explicit target_os list dotnet
+# misses, so arm-0 dotnet injection wins. Do NOT point at pthread/queue (they
+# depend on sys::pal::unix / pull thread parking).
+[ -f "$PAL/sync/mutex/dotnet.rs" ]    && inject_arm sync/mutex/mod.rs    'mod dotnet; pub use dotnet::Mutex;'
+[ -f "$PAL/sync/rwlock/dotnet.rs" ]   && inject_arm sync/rwlock/mod.rs   'mod dotnet; pub use dotnet::RwLock;'
+[ -f "$PAL/sync/condvar/dotnet.rs" ]  && inject_arm sync/condvar/mod.rs  'mod dotnet; pub use dotnet::Condvar;'
+[ -f "$PAL/sync/once/dotnet.rs" ]     && inject_arm sync/once/mod.rs     'mod dotnet; pub use dotnet::{Once, OnceState};'
+[ -f "$PAL/sync/thread_parking/dotnet.rs" ] && inject_arm sync/thread_parking/mod.rs 'mod dotnet; pub use dotnet::Parker;'
+# sys::net::hostname — REAL (Environment.MachineName via rcl_dotnet_hostname);
+# replaces the current `_ => unsupported` catch.
+[ -f "$PAL/net/hostname/dotnet.rs" ]  && inject_arm net/hostname/mod.rs  'mod dotnet; pub use dotnet::hostname;'
+# sys::io is_terminal — a NESTED cfg_select! inside `mod is_terminal {` (the only
+# cfg_select! in io/mod.rs -> nth=1). Generic is_terminal<T>(_)->false form
+# (the isatty/AsFd form would break the Stdin/Stdout/File callers). If a future
+# nightly adds another cfg_select! to io/mod.rs, switch to inject_arm_anchor on
+# 'mod is_terminal {'.
+[ -f "$PAL/io/is_terminal/dotnet.rs" ] && inject_arm io/mod.rs 'mod dotnet; pub use dotnet::*;' 1
+# os/mod.rs gate widen: `pub mod fd` is gated `any(unix, hermit, trusty, wasi,
+# motor, doc)` — os=dotnet is NOT in that list, so std::os::fd (OwnedFd/RawFd +
+# os/fd/net.rs's Socket onion) is compiled OUT for dotnet today. Add dotnet to the
+# gate so the fd-backed net Socket's std::os::fd traits become reachable (the
+# pal_fd probe + the Cap-2 mio capstone need this). os=dotnet-only; additive.
+# `libc` IS linked into dotnet std (Cargo dep gated on not(all(windows,msvc))), so
+# owned.rs's `libc::close`/`fcntl` route through the POSIX shim, and `crate::sys::cvt`
+# is provided by pal/dotnet/mod.rs (this repo). os/mod.rs is at $SRC/../os/mod.rs.
+OSMOD="$SRC/../os/mod.rs"
+if [ -f "$OSMOD" ] && ! grep -q 'target_os = "dotnet"' "$OSMOD"; then
+  echo "==> widening os/mod.rs 'pub mod fd' gate to include os=dotnet"
+  # The `pub mod fd` gate is a multi-line `#[cfg(any( ... ))]` ending at the line
+  # before `pub mod fd;`. Find the nearest `#[cfg(any(` ABOVE `pub mod fd;` and
+  # inject `    target_os = "dotnet",` immediately after it (first disjunct). The
+  # scan keys on the unique `pub mod fd;` line, so it is robust to the disjunct
+  # set drifting across nightlies. Idempotent (guarded on the dotnet string above).
+  awk '
+    { lines[NR]=$0 }
+    END {
+      # locate the `pub mod fd;` line.
+      fdline=0;
+      for (i=1;i<=NR;i++) if (lines[i] ~ /^pub mod fd;/) { fdline=i; break }
+      # walk up to the opening `#[cfg(any(` of its gate.
+      anyline=0;
+      for (i=fdline-1;i>=1;i--) if (lines[i] ~ /#\[cfg\(any\($/) { anyline=i; break }
+      for (i=1;i<=NR;i++) {
+        print lines[i];
+        if (i==anyline && anyline>0) print "    target_os = \"dotnet\",";
+      }
+    }' "$OSMOD" > "$OSMOD.__t" && mv "$OSMOD.__t" "$OSMOD"
+fi
+# os/fd/{owned,raw}.rs File/Pipe fd-impl gating. Enabling os::fd for dotnet pulls in
+# owned.rs's + raw.rs's `impl As/From/IntoRawFd`/`AsFd`/`From<…>` impls for fs::File
+# and io::Pipe{Reader,Writer}, which require the dotnet `sys::fs::File` (System.IO
+# FileStream, GCHandle-backed) and `sys::pipe::Pipe` (the `!` unsupported) to be
+# fd-backed — they are NOT (Cap-2: fd-backing fs/pipe is a separate, large surface;
+# in raw.rs `OwnedFd` is also not even imported for os=dotnet). These impls are
+# already `#[cfg(not(target_os = "trusty"))]` (trusty has os::fd but is not fd-backed
+# for File/Pipe either — the exact precedent). Mirror it: add `not(target_os =
+# "dotnet")` to the File/Pipe impl gates ONLY, leaving the `crate::net::{TcpStream,
+# TcpListener,UdpSocket}` impls (which DO have the fd-backed Socket onion) + os/fd/net.rs
+# ENABLED for dotnet. Idempotent (guarded per-file on the dotnet string).
+for OFD in "$SRC/../os/fd/owned.rs" "$SRC/../os/fd/raw.rs"; do
+  if [ -f "$OFD" ] && ! grep -q 'not(target_os = "dotnet")' "$OFD"; then
+    echo "==> deferring File/Pipe fd-impls for dotnet in $(basename "$OFD") (Cap-2; fs/pipe not fd-backed yet)"
+    # For each `#[cfg(not(target_os = "trusty"))]` whose NEXT line is an impl
+    # referencing fs::File / io::PipeReader / io::PipeWriter, widen the cfg to
+    # also exclude dotnet. Keys on the impl target on the following line.
+    awk '
+      {
+        if (prevline ~ /#\[cfg\(not\(target_os = "trusty"\)\)\]/ &&
+            ($0 ~ /for fs::File/ || $0 ~ /<fs::File>/ ||
+             $0 ~ /for io::Pipe/ || $0 ~ /<io::Pipe(Reader|Writer)>/)) {
+          sub(/#\[cfg\(not\(target_os = "trusty"\)\)\]/,
+              "#[cfg(all(not(target_os = \"trusty\"), not(target_os = \"dotnet\")))]", prevline)
+        }
+        if (NR>1) print prevline
+        prevline=$0
+      }
+      END { if (NR>0) print prevline }
+    ' "$OFD" > "$OFD.__t" && mv "$OFD.__t" "$OFD"
+  fi
+done
 # DOTNET PAL ARM (mio): expose the socket's opaque GCHandle on the PUBLIC
 # `std::net::{TcpStream,TcpListener,UdpSocket}` wrappers so the vendored mio
 # dotnet arm can key its readiness Selector by it. The handle lives on the inner
@@ -410,6 +515,49 @@ if [ -f "$UWSRC/lib.rs" ]; then
       { print }' "$UWSRC/lib.rs" > "$UWSRC/lib.rs.__t" && mv "$UWSRC/lib.rs.__t" "$UWSRC/lib.rs"
   fi
 fi
+# The `libc` crate (vendor/libc-0.2.*) is linked into dotnet std (its Cargo dep is
+# gated on not(all(windows, msvc)), which includes dotnet), and std's std::os::fd
+# files (os/fd/raw.rs, owned.rs) reference a small fixed set of `libc::` symbols
+# (close/fcntl/STD*_FILENO/F_DUPFD*). But libc 0.2 has NO module for
+# target_os="dotnet": its top-level cfg_if! falls through to an empty `else {}`.
+# So with os::fd enabled for dotnet (the unified fd-backed net Socket capstone),
+# those `libc::` refs are E0425. Inject a minimal dotnet libc module (extern "C"
+# decls the cilly POSIX shim resolves + the consts) into that empty else block.
+# os=dotnet-only (the else only fires for unsupported OSes). The PAL file lives at
+# dotnet_pal/libc/dotnet.rs. Idempotent (guarded on the dotnet string).
+LIBC_PAL=/work/dotnet_pal/libc
+# build-std resolves libc from the cargo REGISTRY copy (…/.cargo/registry/src/…/
+# libc-0.2.*), NOT the rust-src vendor tree — and the registry copy only exists
+# AFTER a build extracts it, so it may not be present on the first invocation
+# (handled by the cargo-build-time patch step further down). Patch EVERY libc
+# lib.rs we can find (rust-src vendor + registry) so whichever one build-std picks
+# is covered. Idempotent (guarded on the dotnet string).
+inject_libc() { # $1 = libc src dir
+  local d="$1"
+  [ -f "$d/lib.rs" ] || return 0
+  [ -f "$LIBC_PAL/dotnet.rs" ] || return 0
+  cp "$LIBC_PAL/dotnet.rs" "$d/dotnet.rs"
+  grep -qF 'mod dotnet;' "$d/lib.rs" && return 0
+  # Declare the dotnet module at the libc crate ROOT (outside the big arch/os
+  # cfg_if!), cfg-gated on os=dotnet. Appending after the cfg_if avoids any
+  # macro-hygiene quirk of declaring `mod` inside cfg_if's `else` body; the glob
+  # re-export then makes `libc::{close, read, c_int, …}` resolve for dotnet.
+  {
+    echo ''
+    echo '// DOTNET PAL: minimal libc surface for os=dotnet (see dotnet_pal/libc/dotnet.rs).'
+    echo '// libc 0.2 has no module for target_os="dotnet" (its top-level cfg_if! falls'
+    echo '// through to an empty else{}); std::os::fd references libc::{close,fcntl,...}.'
+    echo '#[cfg(target_os = "dotnet")]'
+    echo 'mod dotnet;'
+    echo '#[cfg(target_os = "dotnet")]'
+    echo 'pub use crate::dotnet::*;'
+  } >> "$d/lib.rs"
+  echo "==> injected dotnet libc module ($d)"
+}
+# Patch any libc copies present now (rust-src vendor + already-extracted registry).
+for d in $(find "$SRC/../../.." /root/.cargo/registry/src -path '*libc-0.2*/src/lib.rs' 2>/dev/null); do
+  inject_libc "$(dirname "$d")"
+done
 echo "==> build-std cargo_tests/$DEV_CRATE for os=dotnet"
 cd "/work/cargo_tests/$DEV_CRATE" 2>/dev/null || { echo "!! no cargo_tests/$DEV_CRATE"; exit 1; }
 # `--cfg getrandom_backend="custom"` selects getrandom 0.3/0.4's custom backend
@@ -419,6 +567,16 @@ cd "/work/cargo_tests/$DEV_CRATE" 2>/dev/null || { echo "!! no cargo_tests/$DEV_
 # getrandom 0.2 ignores this cfg and uses its `custom` Cargo feature instead.
 export RUSTFLAGS="-Z codegen-backend=/work/target/release/librustc_codegen_clr.so -C linker=/work/target/release/linker -C link-args=--cargo-support --cfg getrandom_backend=\"custom\""
 set +e
+# build-std resolves libc from the cargo REGISTRY (not the rust-src vendor tree),
+# which is extracted on first download. `cargo fetch` materialises the registry
+# sources WITHOUT compiling, so we can patch the registry libc copy before it is
+# compiled. (Without this, the first compile of an unpatched registry libc fails
+# on the std::os::fd `libc::` refs.) Idempotent — inject_libc is a no-op on copies
+# already carrying the dotnet module.
+cargo -Zjson-target-spec fetch >/dev/null 2>&1 || true
+for d in $(find /root/.cargo/registry/src -path '*libc-0.2*/src/lib.rs' 2>/dev/null); do
+  inject_libc "$(dirname "$d")"
+done
 cargo -Zjson-target-spec build --release 2>&1 | grep -vE 'discirminant' | grep -E '^error|error\[|could not compile|warning: unused|Compiling (std|core|alloc) |Finished' | head -60
 rc=${PIPESTATUS[0]}
 echo "== build exit: $rc =="

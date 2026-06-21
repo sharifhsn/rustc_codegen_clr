@@ -226,9 +226,15 @@ fn new_fd_entry(
     asm.alloc_node(CILNode::call(ctor, [handle, kind, flags]))
 }
 
-/// Allocate the fd-table statics + initialize them in the tcctor (mirror the
-/// `pthread_keys` pattern, thread.rs:374-412): build the Dictionary, pre-seed
-/// fd 0/1/2 with STD sentinel entries, seed `rcl_fd_next = 3`.
+/// Allocate the fd-table statics + initialize them. The fd-table (the `rcl_fd_table`
+/// Dictionary + the `rcl_fd_next` counter) is **process-global**, so its init goes
+/// in the once-per-process `.cctor` — NOT the per-thread `.tcctor`. (A previous
+/// version seeded it in the tcctor; that re-ran the seed on every new managed
+/// thread, clobbering the shared table — a spawned thread would reset
+/// `rcl_fd_next` to 3 and wipe the dict, so fds registered by other threads
+/// vanished. The single-managed-thread floor proof masked this; the net Socket's
+/// real worker threads exposed it.) `rcl_errno` IS thread-local ([ThreadStatic]),
+/// so its zero-init is implicit per-thread and needs no cctor/tcctor seed.
 fn init_statics(asm: &mut Assembly) {
     let main_mod = asm.main_module();
     let dict = fd_dict(asm);
@@ -267,7 +273,8 @@ fn init_statics(asm: &mut Assembly) {
     });
     roots.push(init_next);
 
-    asm.add_tcctor(&roots);
+    // Process-global init -> the .cctor (runs once per process), NOT .tcctor.
+    asm.add_cctor(&roots);
 }
 
 // ===========================================================================
@@ -536,6 +543,54 @@ fn dotnet_mref(
     output: Type,
 ) -> Interned<MethodRef> {
     main_static(asm, name, inputs, output)
+}
+
+/// Register patcher OVERRIDES for the fd-table builtins that an EXTERNAL crate
+/// (the dotnet std net PAL, `sys/net/connection/dotnet.rs`) references as bare
+/// `extern "C"` symbols. The builtins are defined as MethodDefs on main_module
+/// (for the posix wrappers' same-module calls), but a foreign `extern "C"`
+/// reference is a *missing method* the patcher must fill — so we also provide an
+/// override body that simply forwards to the main_module MethodDef. Without this,
+/// the std-side `rcl_fdtable_handle`/`rcl_fdtable_insert` calls JIT to
+/// "missing method". (`rcl_fdtable_kind`/`get_flags`/`set_flags`/`remove` are
+/// only ever called internally by the posix wrappers, so they need no override —
+/// but the two the net Socket onion calls do.)
+fn insert_fdtable_externs(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    // rcl_fdtable_handle(fd: i32) -> *mut u8  — forward to the MethodDef.
+    let name = asm.alloc_string("rcl_fdtable_handle");
+    let gen_handle = move |_, asm: &mut Assembly| {
+        let void_ptr = asm.nptr(Type::Void);
+        let m = main_static(asm, "rcl_fdtable_handle", &[Type::Int(Int::I32)], void_ptr);
+        let fd = asm.alloc_node(CILNode::LdArg(0));
+        let r = asm.alloc_node(CILNode::call(m, [fd]));
+        let ret = asm.alloc_root(CILRoot::Ret(r));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(gen_handle));
+
+    // rcl_fdtable_insert(handle: isize, kind: i32, flags: i32) -> i32 — forward.
+    let name = asm.alloc_string("rcl_fdtable_insert");
+    let gen_insert = move |_, asm: &mut Assembly| {
+        let m = main_static(
+            asm,
+            "rcl_fdtable_insert",
+            &[Type::Int(Int::ISize), Type::Int(Int::I32), Type::Int(Int::I32)],
+            Type::Int(Int::I32),
+        );
+        let h = asm.alloc_node(CILNode::LdArg(0));
+        let kind = asm.alloc_node(CILNode::LdArg(1));
+        let flags = asm.alloc_node(CILNode::LdArg(2));
+        let r = asm.alloc_node(CILNode::call(m, [h, kind, flags]));
+        let ret = asm.alloc_root(CILRoot::Ret(r));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(gen_insert));
 }
 
 // ===========================================================================
