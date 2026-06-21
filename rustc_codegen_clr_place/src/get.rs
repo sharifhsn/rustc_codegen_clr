@@ -5,7 +5,7 @@ use cilly::{
 use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_type::{
     GetTypeExt,
-    adt::{FieldOffsetIterator, enum_field_descriptor, field_descrptor},
+    adt::{FieldOffsetIterator, field_descrptor, variant_field_descriptor},
     r#type::fat_ptr_to,
     utilis::pointer_to_is_fat,
 };
@@ -118,7 +118,7 @@ fn get_field<'a>(
         }
         super::PlaceTy::EnumVariant(enm, var_idx) => {
             let owner = ctx.monomorphize(enm);
-            let field_desc = enum_field_descriptor(owner, field_index, var_idx, ctx);
+            let field_desc = variant_field_descriptor(owner, field_index, var_idx, ctx);
             ctx.ld_field(addr_calc, field_desc)
         }
     }

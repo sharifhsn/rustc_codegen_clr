@@ -26,8 +26,10 @@ use std::{
     num::{NonZero, NonZeroU32},
 };
 
-use rustc_abi::Layout;
-use rustc_middle::ty::{AdtDef, AdtKind, FloatTy, IntTy, List, Ty, TyKind, UintTy};
+use rustc_abi::{Layout, VariantIdx};
+use rustc_middle::ty::{
+    AdtDef, AdtKind, CoroutineArgsExt, FloatTy, IntTy, List, Ty, TyKind, UintTy,
+};
 use rustc_span::def_id::DefId;
 
 #[must_use]
@@ -370,8 +372,7 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
             let cref = ctx.alloc_class_ref(ClassRef::new(name, None, true, [].into()));
             // If there is no defition of this coroutine present, create the coroutine.
             if ctx.class_ref_to_def(cref).is_none() {
-                let mut type_def = closure_typedef(&fields, layout.layout, ctx, name);
-                handle_tag(&layout.layout, ctx, ty, type_def.fields_mut());
+                let type_def = coroutine_typedef(&fields, ty, layout.layout, ctx, name);
                 ctx.class_def(type_def).unwrap();
             }
 
@@ -627,6 +628,99 @@ pub fn closure_typedef(
             .unwrap(),
         ),
         has_nonverlaping_layout,
+    )
+}
+/// Creates a [`ClassDef`] representing a coroutine (the state machine `async fn`/`gen` blocks
+/// lower to). A coroutine is enum-like: it has upvar fields (the captured environment, shared
+/// across all states — laid out like a closure's `f_N`), an `ENUM_TAG` discriminant, and a set
+/// of per-variant *saved-local* fields (the locals live across each suspend point), one group
+/// per coroutine variant. The variants overlap in memory (only one is live at a time), exactly
+/// like enum variants.
+///
+/// The saved-local field names MUST match the scheme used by
+/// [`crate::adt::coroutine_field_descriptor`] — `"{variant_name}_{field_idx}"` with
+/// `variant_name` from [`crate::adt::coroutine_variant_name`] — so place projections resolve.
+#[must_use]
+fn coroutine_typedef<'tcx>(
+    upvars: &[Type],
+    ty: Ty<'tcx>,
+    layout: Layout,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    coroutine_name: Interned<IString>,
+) -> ClassDef {
+    let (def_id, coroutine_args) = match ty.kind() {
+        TyKind::Coroutine(def_id, args) => (*def_id, args.as_coroutine()),
+        _ => unreachable!("coroutine_typedef on non-coroutine {ty:?}"),
+    };
+    let mut fields: Vec<(Type, Interned<IString>, Option<u32>)> = Vec::new();
+    // Upvar fields (the captured environment), laid out like a closure's `f_N`.
+    {
+        let offset_iter = FieldOffsetIterator::fields((*layout.0).clone());
+        for ((idx, field), offset) in upvars.iter().enumerate().zip(offset_iter) {
+            if *field == Type::Void {
+                continue;
+            }
+            let name = ctx.alloc_string(format!("f_{idx}"));
+            fields.push((*field, name, Some(offset)));
+        }
+    }
+    // The discriminant (which coroutine state we are in).
+    handle_tag(&layout, ctx, ty, &mut fields);
+    // Per-variant saved-local fields. `state_tys` yields one inner iterator per coroutine
+    // variant (outer index = `VariantIdx`); the reserved Unresumed/Returned/Panicked variants
+    // have no saved locals, so their inner iterators are empty and are naturally skipped.
+    let variant_state_tys: Vec<Vec<Ty<'tcx>>> = coroutine_args
+        .state_tys(def_id, ctx.tcx())
+        .map(|variant| variant.collect())
+        .collect();
+    for (vidx, variant_field_tys) in variant_state_tys.into_iter().enumerate() {
+        let var = VariantIdx::from_u32(vidx as u32);
+        let offset_iter =
+            crate::adt::FieldOffsetIterator::fields(crate::adt::get_variant_at_index(
+                var,
+                (*layout.0).clone(),
+            ));
+        for (field_idx, (sty, offset)) in variant_field_tys.into_iter().zip(offset_iter).enumerate()
+        {
+            let fty = get_type(ctx.monomorphize(sty), ctx);
+            // Parity with closure/enum field handling: ZST-typed fields have no .NET slot.
+            if fty == Type::Void {
+                continue;
+            }
+            let fname = ctx.alloc_string(format!(
+                "{vname}_{field_idx}",
+                vname = crate::adt::coroutine_variant_name(var)
+            ));
+            fields.push((fty, fname, Some(offset)));
+        }
+    }
+    // Coroutine variants overlap in memory (like enum variants), so the layout is NOT
+    // non-overlapping — `closure_typedef`'s upvar-only uniqueness check would wrongly report
+    // `true` once overlapping variant fields are present, so force `false` here.
+    ClassDef::new(
+        coroutine_name,
+        true,
+        0,
+        None,
+        fields,
+        vec![],
+        Access::Public,
+        Some(
+            NonZeroU32::new(layout.size().bytes().try_into().expect("Coroutine size exceeds 2^32"))
+                .unwrap(),
+        ),
+        Some(
+            NonZeroU32::new(
+                layout
+                    .align()
+                    .abi
+                    .bytes()
+                    .try_into()
+                    .expect("Coroutine alignment exceeds 2^32"),
+            )
+            .unwrap(),
+        ),
+        false,
     )
 }
 /// Turns an adt struct defintion into a [`ClassDef`]

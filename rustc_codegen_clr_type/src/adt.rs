@@ -3,7 +3,7 @@ use cilly::{Assembly, FieldDesc, Float, Int, Type, bimap::Interned};
 use rustc_abi::{FieldIdx, FieldsShape, Layout, LayoutData, VariantIdx, Variants};
 use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_middle::ty::List;
-use rustc_middle::ty::{AdtDef, GenericArg, Ty, TyKind};
+use rustc_middle::ty::{AdtDef, CoroutineArgsExt, GenericArg, Ty, TyKind};
 pub fn enum_variant_offsets(_: AdtDef, layout: Layout, vidix: VariantIdx) -> FieldOffsetIterator {
     FieldOffsetIterator::fields(get_variant_at_index(vidix, (*layout.0).clone()))
 }
@@ -175,6 +175,73 @@ pub fn enum_field_descriptor<'tcx>(
 
     ctx.alloc_field(FieldDesc::new(owner_ty, field_name, field_ty))
 }
+/// The name of coroutine variant `v`, matching `ty::CoroutineArgs::variant_name`. The first
+/// `CoroutineArgs::RESERVED_VARIANTS` (3) variants are the reserved Unresumed/Returned/Panicked
+/// states; the rest are suspend points. This MUST stay byte-identical to the field-name scheme
+/// used when the coroutine class is declared in `type::coroutine_typedef`, so that
+/// `ld_field`/`set_field`/`ld_field_addr` resolve against the declared per-variant fields.
+#[must_use]
+pub fn coroutine_variant_name(v: VariantIdx) -> String {
+    match v.as_u32() {
+        0 => "Unresumed".into(),
+        1 => "Returned".into(),
+        2 => "Panicked".into(),
+        n => format!("Suspend{}", n - 3),
+    }
+}
+/// Builds the [`FieldDesc`] for `(coroutine as variant#variant_idx).field_idx` — a saved-local
+/// field of a coroutine state. Coroutines are enum-like (`Variants::Multiple`); the field type
+/// comes from the coroutine's per-variant saved-local tys (via `state_tys`) and the field name
+/// from [`coroutine_variant_name`]. This mirrors [`enum_field_descriptor`], but coroutines have
+/// neither a `VariantDef` (for names) nor `FieldDef`s (for tys), so both are sourced from the
+/// coroutine APIs instead of `as_adt`.
+pub fn coroutine_field_descriptor<'tcx>(
+    owner_ty: Ty<'tcx>,
+    field_idx: u32,
+    variant_idx: u32,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Interned<FieldDesc> {
+    let TyKind::Coroutine(def_id, args) = owner_ty.kind() else {
+        panic!("coroutine_field_descriptor on non-coroutine {owner_ty:?}")
+    };
+    let var = VariantIdx::from_u32(variant_idx);
+    // Field TYPE: the `field_idx`th saved local live across suspend point `variant_idx`.
+    let field_ty = args
+        .as_coroutine()
+        .state_tys(*def_id, ctx.tcx())
+        .nth(variant_idx as usize)
+        .expect("No coroutine variant with such index!")
+        .nth(field_idx as usize)
+        .expect("No coroutine saved-local field with provided index!");
+    let field_ty = ctx.monomorphize(field_ty);
+    let field_ty = ctx.type_from_cache(field_ty);
+    // Field NAME: must byte-match the typedef in `type::coroutine_typedef`.
+    let field_name = ctx.alloc_string(format!(
+        "{vname}_{field_idx}",
+        vname = coroutine_variant_name(var)
+    ));
+    let owner = ctx
+        .type_from_cache(owner_ty)
+        .as_class_ref()
+        .expect("Coroutine type is not a class!");
+    ctx.alloc_field(FieldDesc::new(owner, field_name, field_ty))
+}
+/// Dispatches a variant-field descriptor request to the enum or coroutine builder. Both enums
+/// and coroutines lower to `Variants::Multiple` and are accessed through `PlaceTy::EnumVariant`
+/// (an enum/coroutine Downcast followed by a Field), so the place-handling code shares this one
+/// entry point.
+pub fn variant_field_descriptor<'tcx>(
+    owner_ty: Ty<'tcx>,
+    field_idx: u32,
+    variant_idx: u32,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Interned<FieldDesc> {
+    if let TyKind::Coroutine(..) = owner_ty.kind() {
+        coroutine_field_descriptor(owner_ty, field_idx, variant_idx, ctx)
+    } else {
+        enum_field_descriptor(owner_ty, field_idx, variant_idx, ctx)
+    }
+}
 pub fn field_descrptor<'tcx>(
     owner_ty: Ty<'tcx>,
     field_idx: u32,
@@ -211,23 +278,19 @@ pub fn field_descrptor<'tcx>(
             field_name,
             field_type,
         ));
-    } else if let TyKind::Coroutine(_, _args) = owner_ty.kind() {
-        todo!();
-        /*
+    } else if let TyKind::Coroutine(_, args) = owner_ty.kind() {
+        // A struct-path `Field` on a coroutine accesses one of its *upvar* fields (the captured
+        // environment, laid out as `f_N` exactly like a closure). Saved-local fields, by
+        // contrast, are reached through a `Downcast` (the `PlaceTy::EnumVariant` path ->
+        // `coroutine_field_descriptor`) and never come here. Mirror the closure branch.
         let coroutine = args.as_coroutine();
-        let TyKind::CoroutineWitness(_, fields) = coroutine.kind_ty() else {
-            panic!("corutine witness is not CoroutineWitness.");
-        };
-        let field_type = fields
+        let field_type = coroutine
+            .upvar_tys()
             .iter()
             .nth(field_idx as usize)
-            .expect("Could not find coroutine fields!");
+            .expect("Could not find coroutine upvar field!");
         let field_type = ctx.monomorphize(field_type);
-        let field_type = ctx.type_from_cache(
-            field_type
-                .as_type()
-                .expect("Non type args in coroutine witness."),
-        );
+        let field_type = ctx.type_from_cache(field_type);
         let owner_ty = ctx.monomorphize(owner_ty);
         let owner_type = ctx.type_from_cache(owner_ty);
         let field_name = ctx.alloc_string(format!("f_{field_idx}"));
@@ -235,7 +298,7 @@ pub fn field_descrptor<'tcx>(
             owner_type.as_class_ref().expect("Coroutine type invalid!"),
             field_name,
             field_type,
-        )); */
+        ));
     }
     let (adt, subst) = as_adt(owner_ty).expect("Tried to get a field of a non ADT or tuple type!");
     let field = adt

@@ -1,7 +1,7 @@
 use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_type::{
     GetTypeExt,
-    adt::{enum_field_descriptor, field_descrptor},
+    adt::{field_descrptor, variant_field_descriptor},
     r#type::fat_ptr_to,
     utilis::pointer_to_is_fat,
 };
@@ -97,7 +97,7 @@ pub fn place_elem_set<'a>(
             }
             super::PlaceTy::EnumVariant(enm, var_idx) => {
                 let enm = ctx.monomorphize(enm);
-                let field_desc = enum_field_descriptor(enm, field_index.as_u32(), var_idx, ctx);
+                let field_desc = variant_field_descriptor(enm, field_index.as_u32(), var_idx, ctx);
 
                 ctx.set_field(field_desc, addr_calc, value_calc)
             }

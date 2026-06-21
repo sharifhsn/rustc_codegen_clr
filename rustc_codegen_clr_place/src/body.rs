@@ -4,7 +4,7 @@ use cilly::{BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, Type};
 use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_type::{
     GetTypeExt,
-    adt::{FieldOffsetIterator, enum_field_descriptor, field_descrptor},
+    adt::{FieldOffsetIterator, field_descrptor, variant_field_descriptor},
     r#type::fat_ptr_to,
     utilis::pointer_to_is_fat,
 };
@@ -130,7 +130,7 @@ fn body_field<'a>(
         }
         super::PlaceTy::EnumVariant(enm, var_idx) => {
             let owner = ctx.monomorphize(enm);
-            let field_desc = enum_field_descriptor(owner, field_index, var_idx, ctx);
+            let field_desc = variant_field_descriptor(owner, field_index, var_idx, ctx);
             (field_ty.into(), ctx.ld_field_addr(parrent_node, field_desc))
         }
     }
@@ -224,12 +224,11 @@ pub fn place_elem_body<'tcx>(
                 .as_ty()
                 .expect("Can't get enum variant of an enum varaint!");
             let curr_type = ctx.monomorphize(curr_type);
-            if matches!(curr_ty.as_ty().unwrap().kind(), TyKind::Coroutine(_, _)) {
-                eprintln!(
-                    "UNTESTED:  downcaststing coroutines is not fully supported, and the behaviour of corrutines is not yet fully tested! variant:{variant:?} curr_type:{curr_type:?}"
-                );
-                return (curr_type.into(), parrent_node);
-            }
+            // Coroutines are enum-like (`Variants::Multiple`): a Downcast selects a variant
+            // (a suspend point or one of the reserved Unresumed/Returned/Panicked variants),
+            // exactly like an enum Downcast. Re-tag the place as an `EnumVariant` so the
+            // following `Field` projection resolves through the variant-field path. This is a
+            // pure type-level re-tag — no CIL is emitted, `parrent_node` passes through.
             let variant_type = PlaceTy::EnumVariant(curr_type, variant.as_u32());
 
             (variant_type, parrent_node)
