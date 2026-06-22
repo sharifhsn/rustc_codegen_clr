@@ -57,6 +57,12 @@ CD_LINKER="${CD_LINKER:-$CD_REPO/target/release/linker}"
 CD_TARGET_SPEC="${CD_TARGET_SPEC:-$CD_REPO/x86_64-unknown-dotnet.json}"
 CD_REGISTRY_SRC="${CD_REGISTRY_SRC:-/root/.cargo/registry/src}"
 CD_LASTBUILD_LOG="${CD_LASTBUILD_LOG:-$CD_REPO/feasibility/_lastbuild.log}"
+#   CD_EXE_EXT     host executable suffix for the produced .NET apphost. Docker/
+#                  Linux/macOS: "" (empty). Windows: ".exe". ONLY the bin-fallback
+#                  path (cargo's JSON 'executable' field is already host-correct,
+#                  carrying .exe on Windows) consults this; default "" keeps the
+#                  docker/Linux behaviour byte-identical.
+CD_EXE_EXT="${CD_EXE_EXT:-}"
 
 # Portable in-place sed: GNU sed wants `sed -i 's/…/…/' f`; BSD/macOS sed wants
 # `sed -i '' 's/…/…/' f`. The PAL-injection seds below use BSD-incompatible
@@ -775,9 +781,17 @@ if [ "$rc" = 0 ]; then
       bin=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
             | tr ',' '\n' | awk -F'"' '/"kind":\["bin"\]/{want=1} want && /"name":/{print $4; exit}')
       [ -z "$bin" ] && bin="$(basename "$(pwd)")"
-      out="target/x86_64-unknown-dotnet/$PROFILE/$bin"
-      [ -f "$out" ] || out="target/dotnet/$PROFILE/$bin"
-      [ -f "$out" ] || out=""
+      # Probe both the bare name (Linux/macOS apphost) and the host exe suffix
+      # ($CD_EXE_EXT = ".exe" on Windows; "" elsewhere, so these collapse to the
+      # bare-name probes and the docker/Linux behaviour is unchanged).
+      out=""
+      for cand in \
+        "target/x86_64-unknown-dotnet/$PROFILE/$bin$CD_EXE_EXT" \
+        "target/x86_64-unknown-dotnet/$PROFILE/$bin" \
+        "target/dotnet/$PROFILE/$bin$CD_EXE_EXT" \
+        "target/dotnet/$PROFILE/$bin"; do
+        if [ -n "$cand" ] && [ -f "$cand" ]; then out="$cand"; break; fi
+      done
     fi
   fi
 fi

@@ -217,6 +217,11 @@ case "$BACKEND" in
     export CD_TARGET_SPEC="$REPO_ROOT/x86_64-unknown-dotnet.json"
     export CD_REGISTRY_SRC="$REGISTRY_SRC"
     export CD_LASTBUILD_LOG="$REPO_ROOT/feasibility/_lastbuild.log"
+    # Host apphost exe suffix (Windows: .exe; "" elsewhere). Only the CORE's
+    # bin-fallback probe uses it — cargo's JSON 'executable' field is already
+    # host-correct (it carries .exe on Windows). Empty on mac/Linux keeps the
+    # docker path byte-identical.
+    export CD_EXE_EXT="$exe_ext"
     export CD_REL CD_RUN CD_CLEAN CD_VERBOSE
     # Quieter, deterministic dotnet (no first-run banner on a fresh install — that
     # banner lands on stderr and trips cilly's `dotnet --info` stderr assert).

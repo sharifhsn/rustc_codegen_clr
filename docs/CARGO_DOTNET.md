@@ -146,18 +146,30 @@ macOS/Linux. Treat the steps below as a starting recipe, not a guarantee.
 Prereqs (user-local where possible):
 - **Bash**: `cargo-dotnet` is a bash script. Run it under **Git Bash** (Git for Windows), MSYS2, or
   WSL. A `feasibility\cargo-dotnet.cmd` shim forwards a normal-shell `cargo dotnet ...` to bash with
-  the native backend.
+  the native backend. It prefers Git Bash (`%ProgramFiles%\Git\bin\bash.exe`, then `bash.exe` on
+  PATH) and falls back to WSL — the WSL branch translates the script path with `wslpath` so WSL bash
+  receives a `/mnt/c/...` POSIX path. Git Bash / MSYS2 is the smoother route (it accepts a Windows
+  path directly and shares the host's `%USERPROFILE%`/`.cargo` layout); WSL runs in a separate Linux
+  filesystem, so under WSL you would build the **Linux** backend and use the Linux flow instead.
 - **Toolchain**: `rustup toolchain install nightly-2026-06-17-x86_64-pc-windows-msvc` with
   `--component rust-src --component rustc-dev`. (The MSVC host toolchain + the Build Tools' linker
   environment are required to build the backend and the native launcher.)
 - **.NET 8 SDK** on PATH (`dotnet.exe`).
 - **`ilasm`**: the CoreCLR ILAsm tool for win-x64 — NuGet
   `runtime.win-x64.Microsoft.NETCore.ILAsm` (8.0.x). Place its `ilasm.exe` at
-  `%USERPROFILE%\.dotnet\ilasm-tool\ilasm.exe`, or set `ILASM_PATH` to it. (Do **not** use Mono's
-  ilasm — same PE32 problem as macOS.)
+  `%USERPROFILE%\.dotnet\ilasm-tool\ilasm.exe` (Git Bash sees this as `$HOME/.dotnet/ilasm-tool/ilasm.exe`
+  and the native driver auto-discovers it), or set `ILASM_PATH` to it. **Setting a CoreCLR `ilasm` is
+  effectively mandatory on Windows**: if `ILASM_PATH` is unset, the cilly linker's Windows default
+  (`cilly/src/ir/asm.rs::get_default_ilasm`, `#[cfg(target_os = "windows")]`) probes a bare `ilasm`
+  on PATH and then the **legacy .NET Framework** assembler under `C:\Windows\Microsoft.NET\Framework`
+  — a different, much older ilasm whose output the CoreCLR loader may reject (and which panics if no
+  Framework is installed). The native driver always exports `ILASM_PATH` so this fallback is bypassed.
+  (Do **not** use Mono's ilasm — same PE32 problem as macOS.)
 - **Backend**: build it host-native — `librustc_codegen_clr.dll` + `linker.exe` under
   `target\release\`. The native driver detects the `.dll`/`.exe` extensions automatically (via
-  `uname`/`OSTYPE`).
+  `uname`/`OSTYPE`), locates `linker.exe`, and (for the rare bin crate whose cargo JSON omits the
+  `executable` field) probes the `.exe` apphost via the `CD_EXE_EXT` host fact. The common run path
+  reads cargo's own `"executable"` field, which already carries `.exe` on Windows.
 
 Run (from Git Bash):
 ```bash
@@ -165,10 +177,18 @@ CARGO_DOTNET_BACKEND=native feasibility/cargo-dotnet run cargo_tests/cd_pure
 ```
 or from a normal Windows shell: `feasibility\cargo-dotnet.cmd run cargo_tests\cd_pure`.
 
-**Known unknowns on Windows** (unverified): whether the CoreCLR win-x64 ilasm accepts the same
-flags/output the macOS one does; whether the native launcher (compiled by the linker via `rustc -O`
-with the MSVC linker) builds cleanly; path-separator handling deep in the pipeline; and whether the
-win-x64 CoreCLR loads the produced PE without further flags. Report findings if you run it.
+**Known unknowns on Windows** (unverified — no Windows host was available to run any of this):
+- Whether the CoreCLR win-x64 `ilasm` accepts the same flags/`.il` the macOS one does, and whether
+  the win-x64 CoreCLR loads the produced PE without further flags.
+- Whether the native launcher/apphost (compiled by the linker via `rustc -O` with the MSVC linker)
+  builds and links cleanly with the MSVC toolchain.
+- Path-separator handling deep in the pipeline. The shell core is POSIX-path throughout (Git Bash
+  presents `C:\` as `/c/`), but `rust-src` injection, the registry-libc patch, and the generated
+  `.cargo/config.toml` absolute `paths` all assume forward-slash paths — untested on a Windows
+  `rust-src` layout.
+- The `cargo-dotnet.cmd` WSL branch's `wslpath` translation and delayed-expansion logic is written
+  but unexercised.
+Report findings if you run it.
 
 ---
 

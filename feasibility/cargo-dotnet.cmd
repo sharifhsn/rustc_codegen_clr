@@ -15,7 +15,7 @@ REM   * The host backend built: librustc_codegen_clr.dll + linker.exe under targ
 REM
 REM This path is IMPLEMENTED DEFENSIVELY but NOT verified on Windows. See the docs.
 
-setlocal
+setlocal enabledelayedexpansion
 set CARGO_DOTNET_BACKEND=native
 
 REM Find bash: prefer Git's, fall back to PATH, then WSL.
@@ -25,11 +25,17 @@ if not defined BASH_EXE for %%I in (bash.exe) do if not defined BASH_EXE set "BA
 
 set "SCRIPT_DIR=%~dp0"
 if defined BASH_EXE (
+  REM Git-Bash / MSYS2 bash accepts a Windows path directly.
   "%BASH_EXE%" "%SCRIPT_DIR%cargo-dotnet" %*
 ) else (
-  where wsl >nul 2>&1 && wsl bash "%SCRIPT_DIR%cargo-dotnet" %* || (
+  where wsl >nul 2>&1 || (
     echo cargo-dotnet.cmd: no bash found. Install Git for Windows or WSL. 1>&2
     exit /b 1
   )
+  REM WSL bash needs a /mnt/c/... POSIX path, so translate via `wslpath` first.
+  REM Delayed expansion (!WSL_SCRIPT!) is required because the var is both set
+  REM and used inside this same parenthesized block.
+  for /f "delims=" %%P in ('wsl wslpath "%SCRIPT_DIR%cargo-dotnet"') do set "WSL_SCRIPT=%%P"
+  wsl bash "!WSL_SCRIPT!" %*
 )
 exit /b %ERRORLEVEL%
