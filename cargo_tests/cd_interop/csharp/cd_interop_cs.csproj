@@ -8,14 +8,26 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <AssemblyName>cd_interop_cs</AssemblyName>
   </PropertyGroup>
+
+  <!-- AUTO-BUILD (recommended): import the Rust-from-C# integration, then declare the
+       Rust crate. A single `dotnet build`/`dotnet run` ALSO runs the installed
+       `cargo dotnet build ../rustlib` (G1), references the produced .NET assembly
+       (cd_interop.dll), and copies it into bin/ — no manual cargo dotnet, no dll copy,
+       no hand-written <Reference><HintPath>. Incremental: the Rust rebuild is skipped
+       when its .dll is newer than its sources.
+
+       The import prefers the INSTALLED copy (under CARGO_DOTNET_HOME / ~/.cargo-dotnet,
+       written by `cargo dotnet setup`) so the same .csproj works in any external project;
+       it falls back to this repo's canonical msbuild/RustDotnet.targets for the in-repo
+       worked example. -->
+  <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
+  <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'=='' and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+  <Import Project="$(MSBuildThisFileDirectory)../../../msbuild/RustDotnet.targets"
+          Condition="!Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets') and !Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+
   <ItemGroup>
-    <!-- The Rust-produced .NET class library, referenced by its crate assembly name. `cargo dotnet
-         build ../rustlib` emits `libcd_interop.so` (a managed PE) and copies it to `cd_interop.dll`;
-         the runner copies that .dll next to this project before `dotnet run`. The lib emits proper
-         `.assembly extern` BCL identities, so this direct typed reference compiles (no P/Invoke, no
-         reflection). -->
-    <Reference Include="cd_interop">
-      <HintPath>cd_interop.dll</HintPath>
-    </Reference>
+    <RustCrate Include="../rustlib" />
   </ItemGroup>
 </Project>

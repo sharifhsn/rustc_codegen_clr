@@ -490,7 +490,7 @@ The benchmark decomposes into 6 layers → workflows:
 | 3 Rust→.NET calls | WF-3 | ✅ **DONE** (full BCL, 4256 methods) |
 | 4 errors/panics cross cleanly | WF-6 | ✅ **DONE** (throw-bridge; catch_unwind works) |
 | 5 .NET→Rust export (call Rust from C#) | **WF-7** | ✅ **DONE** (C# calls a Rust *library*; string marshalling; Rust *defines* managed classes) |
-| 6 ergonomic packaged library | **WF-8** | 🟢 **a–e DONE** (direct typed calls; ctors; managed-`String` return; **de-mangled names + struct marshalling**; **slices + `Result`→exception both ways**); `Option`→nullable + managed-`T[]` return + NuGet remain |
+| 6 ergonomic packaged library | **WF-8** | 🟢 **a–e DONE** (direct typed calls; ctors; managed-`String` return; **de-mangled names + struct marshalling**; **slices + `Result`→exception both ways**); **MSBuild auto-build (`RustDotnet.targets`) + NuGet (`cargo dotnet pack`) DONE (G2)**; `Option`→nullable + managed-`T[]` return remain |
 
 **Layers 1–4 done + WF-7 P1** — the entire Rust→.NET half, error-crossing, AND the core of the reverse
 direction (C# imports a Rust library and calls its functions, §6). What remains: WF-7 P2 (marshalling
@@ -541,8 +541,11 @@ direction (C# imports a Rust library and calls its functions, §6). What remains
   `rustc_clr_interop_throw` intrinsic raises a managed `System.Exception` via a real `throw` IL op (not a
   Rust `panic!`, which faults reaching a managed frame), so `try_div(1,0)` is caught by C# `try`/`catch`
   (`cargo_tests/rust_export_cs`, 15/15 on .NET). **Remaining:** `Option`→nullable; managed-`T[]`/`Span`
-  *return* (needs a `newarr`/`stelem` IR op); NuGet/`.csproj` packaging + self `.assembly .ver`. (The
-  cargo↔MSBuild build glue is separable tooling, not codegen.)
+  *return* (needs a `newarr`/`stelem` IR op) + self `.assembly .ver`. The **cargo↔MSBuild build glue is
+  DONE (G2)**: `msbuild/RustDotnet.targets` makes `dotnet build`/`dotnet run` on a C# project auto-build a
+  declared `<RustCrate>` via the installed `cargo dotnet` and reference its assembly (incremental, zero
+  manual steps), and `cargo dotnet pack` emits a NuGet `.nupkg` a C# project `<PackageReference>`s from a
+  local feed. Worked: `cargo_tests/cd_interop/csharp` (auto-build) + `…/csharp_nupkg` (NuGet), both 6/6.
 - **WF-9** Generic-interop bridge — `RustGeneric<T>` ↔ C# (size-parameterized for `T: unmanaged`,
   boxed/`GCHandle` for managed T; §7). Needed iff the module's public API uses generic containers.
 - **WF-10 (open-ended)** Real-crate soak / hardening — **DONE for breadth**: ~74 real crates driven
@@ -557,7 +560,8 @@ direction (C# imports a Rust library and calls its functions, §6). What remains
 **Status vs. the benchmark:** the capability work is **~95% done** — layers 1–6 all have a working core,
 the north-star J4 has been met (a real production library run from C#), and the soak set is 73/74. The
 platform is complete (files/net/threads/time/panic/async/`os::unix` on the real PAL), and the one-command
-`cargo dotnet` DX wraps it all with zero hand-config. Remaining is the **ergonomic tail**: the `.NET→Rust`
-Tier-2 surface through the real-PAL flow (managed-`String`/`Result` return), NuGet/`.csproj` packaging,
-WF-9 (only if the consumed module's API is generic), and the `regex` allocator fix. The hard,
-ceiling-adjacent pieces are behind us.
+`cargo dotnet` DX wraps it all with zero hand-config — including the **C#-consumes-Rust seam (G2)**:
+`dotnet build` auto-compiles a declared Rust crate + references it, and `cargo dotnet pack` ships it as a
+NuGet package. Remaining is the **ergonomic tail**: the `.NET→Rust` Tier-2 surface through the real-PAL
+flow (managed-`String`/`Result` return), WF-9 (only if the consumed module's API is generic), and the
+`regex` allocator fix. The hard, ceiling-adjacent pieces are behind us.

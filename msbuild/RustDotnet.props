@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  RustDotnet.props — default properties for the Rust-from-C# auto-build integration.
+
+  This file is imported by RustDotnet.targets (so a consumer only imports the .targets).
+  Every property is defaulted with Condition="'$(X)'==''" so a project can override any of
+  them in a PropertyGroup BEFORE the import, or on the `dotnet build -p:X=...` command line.
+
+  See msbuild/README.md and docs/INTEROP_CSHARP.md for the consumer guide.
+-->
+<Project>
+  <PropertyGroup>
+    <!-- The .NET target rustc compiles the Rust crate to (CIL is arch-agnostic; the
+         "x86_64" is rustc's layout model for the dotnet output, not the host arch). -->
+    <RustDotnetTarget Condition="'$(RustDotnetTarget)'==''">x86_64-unknown-dotnet</RustDotnetTarget>
+
+    <!-- Force a `cargo dotnet build` even if MSBuild's Inputs/Outputs up-to-date check
+         says the produced .dll is newer than the Rust sources. -->
+    <RustDotnetForceBuild Condition="'$(RustDotnetForceBuild)'==''">false</RustDotnetForceBuild>
+
+    <!-- Directories prepended to PATH for the `cargo dotnet build` Exec, so the tool's
+         internal `cargo`/`rustc`/`dotnet` (and any cargo rustc-wrapper, e.g. sccache)
+         resolve under MSBuild's environment. The inherited PATH is kept (appended). -->
+    <RustDotnetToolPath Condition="'$(RustDotnetToolPath)'==''">$(HOME)/.cargo/bin:$(HOME)/.dotnet</RustDotnetToolPath>
+
+    <!-- DOTNET_ROOT the cargo-dotnet native pipeline + the cilly linker need to find a
+         `dotnet`. Defaults to the user-local install dir `cargo dotnet setup` provisions. -->
+    <RustDotnetDotnetRoot Condition="'$(RustDotnetDotnetRoot)'==''">$(HOME)/.dotnet</RustDotnetDotnetRoot>
+
+    <!-- Explicit path to the installed `cargo-dotnet` script. Empty = auto-discover
+         (FindCargoDotnet probes CARGO_DOTNET_HOME, ~/.cargo/bin, then bare cargo-dotnet). -->
+    <!-- <CargoDotnet></CargoDotnet> -->
+  </PropertyGroup>
+</Project>

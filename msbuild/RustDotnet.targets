@@ -1,0 +1,219 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  RustDotnet.targets — auto-build a Rust crate from a C# project and reference its .NET assembly.
+
+  WHAT IT DOES
+    A C# project imports this file and declares one or more Rust crates:
+
+        <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
+                Condition="'$(CARGO_DOTNET_HOME)'!=''" />
+        <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"
+                Condition="'$(CARGO_DOTNET_HOME)'=='' and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+        <ItemGroup>
+          <RustCrate Include="../path/to/rustlib" />
+        </ItemGroup>
+
+    Before the C# compile resolves references, this runs the INSTALLED `cargo dotnet build`
+    (G1) on each crate, finds the produced managed assembly
+    (<crate>/target/<RustDotnetTarget>/<profile>/<CrateName>.dll), and adds it as a
+    <Reference> with <Private>true</Private> so it is copied into bin/ for `dotnet run`.
+
+    `dotnet build`/`dotnet run` therefore ALSO build the Rust crate + reference its assembly —
+    zero manual `cargo dotnet` invocation, zero manual .dll copy, zero hand-written HintPath.
+    IDEs/CI use the same MSBuild path. It is incremental: the cargo build is skipped when the
+    .dll is newer than every Rust source (MSBuild's Inputs/Outputs up-to-date check).
+
+  ITEM: <RustCrate Include="<crate-dir>" />   (relative to the .csproj)
+    Optional metadata (all defaulted):
+      Configuration="Release|Debug"  : release or debug profile (default Release)
+      CrateName="cd_interop"         : the assembly/.dll basename = the crate's [package] name
+                                       (default: the crate dir's leaf name)
+      Clean="true"                   : force a clean rebuild
+      Private="true|false"           -> copy the Rust .dll into the consumer bin/ (default true)
+
+  See RustDotnet.props for project-level property overrides.
+-->
+<Project>
+
+  <!-- Defaults (RustDotnetTarget, RustDotnetForceBuild, RustDotnetToolPath, …). -->
+  <Import Project="$(MSBuildThisFileDirectory)RustDotnet.props" />
+
+  <!-- ====================================================================== -->
+  <!-- 1. FindCargoDotnet — resolve $(_CargoDotnetExe), the INSTALLED tool.    -->
+  <!--    Probe order: <CargoDotnet> prop > $CARGO_DOTNET_HOME/cargo-dotnet >  -->
+  <!--    $HOME/.cargo-dotnet/cargo-dotnet > $HOME/.cargo/bin/cargo-dotnet.    -->
+  <!--    If none exists -> actionable <Error>.                                -->
+  <!-- ====================================================================== -->
+  <Target Name="FindCargoDotnet">
+    <PropertyGroup>
+      <_CdHome>$(CARGO_DOTNET_HOME)</_CdHome>
+      <_CdHome Condition="'$(_CdHome)'==''">$(HOME)/.cargo-dotnet</_CdHome>
+
+      <!-- explicit override wins -->
+      <_CargoDotnetExe Condition="'$(CargoDotnet)'!='' and Exists('$(CargoDotnet)')">$(CargoDotnet)</_CargoDotnetExe>
+      <!-- the install home copy (cargo dotnet setup wrote it there) -->
+      <_CargoDotnetExe Condition="'$(_CargoDotnetExe)'=='' and Exists('$(_CdHome)/cargo-dotnet')">$(_CdHome)/cargo-dotnet</_CargoDotnetExe>
+      <!-- the cargo-subcommand install location -->
+      <_CargoDotnetExe Condition="'$(_CargoDotnetExe)'=='' and Exists('$(HOME)/.cargo/bin/cargo-dotnet')">$(HOME)/.cargo/bin/cargo-dotnet</_CargoDotnetExe>
+    </PropertyGroup>
+
+    <Error Condition="'$(_CargoDotnetExe)'==''"
+           Text="cargo dotnet is not installed (no &lt;CargoDotnet&gt; override, none at $(_CdHome)/cargo-dotnet, none at $(HOME)/.cargo/bin/cargo-dotnet). Install it once from a rustc_codegen_clr checkout: `feasibility/cargo-dotnet setup`. Then `dotnet build` auto-compiles your &lt;RustCrate&gt; items. Or set &lt;CargoDotnet&gt; to the script path. See docs/CARGO_DOTNET.md." />
+
+    <Message Importance="low" Text="RustDotnet: using cargo-dotnet at $(_CargoDotnetExe)" />
+  </Target>
+
+  <!-- ====================================================================== -->
+  <!-- 2. BuildRustCrates — for each <RustCrate>, build it (serial) and add a  -->
+  <!--    <Reference> to its produced assembly. Runs BEFORE reference          -->
+  <!--    resolution so Roslyn/RAR see the Rust .dll.                          -->
+  <!-- ====================================================================== -->
+  <Target Name="BuildRustCrates"
+          BeforeTargets="ResolveAssemblyReferences;ResolveReferences;BeforeCompile"
+          DependsOnTargets="FindCargoDotnet"
+          Condition="'@(RustCrate)'!=''">
+
+    <!-- Derive the absolute crate dir + profile per item. GetFullPath resolves the
+         Include path relative to the .csproj dir. _CrateName / _Dll are resolved INSIDE
+         _BuildOneRustCrate (per crate), because the assembly basename is the crate's
+         [package] name (parsed from Cargo.toml), which can differ from the dir name. -->
+    <!-- Copy ALL needed facts onto the single helper item type _RustCrate, so the
+         <MSBuild> task below references ONLY %(_RustCrate.*) metadata. Referencing two
+         different item types' metadata in one batched task would batch over their cross
+         product and invoke the task multiple times — the cause of a phantom empty run. -->
+    <ItemGroup>
+      <_RustCrate Include="@(RustCrate)">
+        <_Dir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/%(RustCrate.Identity)'))</_Dir>
+        <_Profile Condition="'%(RustCrate.Configuration)'=='Debug'">debug</_Profile>
+        <_Profile Condition="'%(RustCrate.Configuration)'!='Debug'">release</_Profile>
+        <_Private Condition="'%(RustCrate.Private)'!=''">%(RustCrate.Private)</_Private>
+        <_Private Condition="'%(RustCrate.Private)'==''">true</_Private>
+        <_MetaName>%(RustCrate.CrateName)</_MetaName>
+        <_Clean>%(RustCrate.Clean)</_Clean>
+      </_RustCrate>
+    </ItemGroup>
+
+    <!-- Build each crate SERIALLY (BuildInParallel=false): `cargo dotnet` mutates the
+         shared toolchain rust-src on every build, so concurrent builds would race. The
+         MSBuild task re-enters THIS project's _BuildOneRustCrate target per crate; that
+         inner target resolves the crate name + .dll path, carries the Inputs/Outputs
+         incremental check, runs the build, and RETURNS the produced .dll path. -->
+    <MSBuild Projects="$(MSBuildProjectFullPath)"
+             Targets="_BuildOneRustCrate"
+             BuildInParallel="false"
+             Properties="_OneDir=%(_RustCrate._Dir);_OneProfile=%(_RustCrate._Profile);_OneMetaName=%(_RustCrate._MetaName);_OnePrivate=%(_RustCrate._Private);_OneClean=%(_RustCrate._Clean);_CargoDotnetExe=$(_CargoDotnetExe)">
+      <Output TaskParameter="TargetOutputs" ItemName="_RustCrateDll" />
+    </MSBuild>
+
+    <!-- Every crate's .dll now exists; add the references (one pass, after all builds).
+         _RustCrateDll items carry the resolved assembly name + private flag as metadata. -->
+    <ItemGroup>
+      <Reference Include="%(_RustCrateDll.CrateName)">
+        <HintPath>%(_RustCrateDll.Identity)</HintPath>
+        <Private>%(_RustCrateDll.Private)</Private>
+        <RustDotnetGenerated>true</RustDotnetGenerated>
+      </Reference>
+    </ItemGroup>
+
+    <Message Importance="high"
+             Text="RustDotnet: referenced %(_RustCrateDll.CrateName) (%(_RustCrateDll.Identity))" />
+  </Target>
+
+  <!-- ====================================================================== -->
+  <!-- 3a. _ResolveOneCrate — compute, for ONE crate (global props _OneDir/…): -->
+  <!--     _OneCrateName  : CrateName metadata > [package] name from Cargo.toml -->
+  <!--                      > crate dir leaf name.                              -->
+  <!--     _OneDll        : <dir>/target/<target>/<profile>/<name>.dll          -->
+  <!--     @(_OneRustSources) : the crate's src/**/*.rs (incremental Inputs).   -->
+  <!--     Runs as a DependsOnTargets of _BuildOneRustCrate so these are set    -->
+  <!--     BEFORE that target's Inputs/Outputs are evaluated.                   -->
+  <!-- ====================================================================== -->
+  <Target Name="_ResolveOneCrate">
+    <!-- Read Cargo.toml; keep lines matching `name = "..."`; the FIRST is the
+         [package] name (it precedes any [lib]/[dependencies] name= keys). -->
+    <ReadLinesFromFile File="$(_OneDir)/Cargo.toml">
+      <Output TaskParameter="Lines" ItemName="_CargoTomlLine" />
+    </ReadLinesFromFile>
+    <ItemGroup>
+      <_CargoNameLine Include="@(_CargoTomlLine)"
+                      Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('%(_CargoTomlLine.Identity)', '^\s*name\s*=\s*&quot;[^&quot;]+&quot;'))" />
+    </ItemGroup>
+    <PropertyGroup>
+      <_FirstNameLine>@(_CargoNameLine)</_FirstNameLine>
+      <!-- Split on ';' (item-list join) and take the first matched line. -->
+      <_FirstNameLine>$(_FirstNameLine.Split(';')[0])</_FirstNameLine>
+      <_TomlCrateName>$([System.Text.RegularExpressions.Regex]::Match('$(_FirstNameLine)', '&quot;([^&quot;]+)&quot;').Groups[1].Value)</_TomlCrateName>
+
+      <_OneCrateName Condition="'$(_OneMetaName)'!=''">$(_OneMetaName)</_OneCrateName>
+      <_OneCrateName Condition="'$(_OneCrateName)'=='' and '$(_TomlCrateName)'!=''">$(_TomlCrateName)</_OneCrateName>
+      <_OneCrateName Condition="'$(_OneCrateName)'==''">$([System.IO.Path]::GetFileName('$(_OneDir)'))</_OneCrateName>
+
+      <_OneDll>$(_OneDir)/target/$(RustDotnetTarget)/$(_OneProfile)/$(_OneCrateName).dll</_OneDll>
+    </PropertyGroup>
+
+    <!-- Build the incremental Input set: the crate's Rust sources + ONLY the manifest
+         files that EXIST. A non-existent file in MSBuild Inputs makes the up-to-date
+         check ALWAYS fail (it can't date a missing file) -> the build would never skip;
+         so build.rs/Cargo.lock are added with Exists() conditions. Created HERE so they
+         are populated before _BuildOneRustCrate's Inputs attribute is evaluated.
+         The force-build sentinel ($(_ForceStamp)) is a non-existent path, deliberately
+         added so the check fails on demand -> RustDotnetForceBuild=true. -->
+    <ItemGroup>
+      <_OneInputs Include="$(_OneDir)/src/**/*.rs" />
+      <_OneInputs Include="$(_OneDir)/Cargo.toml" Condition="Exists('$(_OneDir)/Cargo.toml')" />
+      <_OneInputs Include="$(_OneDir)/Cargo.lock" Condition="Exists('$(_OneDir)/Cargo.lock')" />
+      <_OneInputs Include="$(_OneDir)/build.rs" Condition="Exists('$(_OneDir)/build.rs')" />
+      <_OneInputs Include="$(_OneDir)/__rustdotnet_force_rebuild__" Condition="'$(RustDotnetForceBuild)'=='true'" />
+    </ItemGroup>
+  </Target>
+
+  <!-- ====================================================================== -->
+  <!-- 3b. _BuildOneRustCrate — build ONE crate via the installed cargo dotnet.-->
+  <!--    Incremental: Inputs = the crate's Rust sources + manifests, Outputs  -->
+  <!--    = the .dll. MSBuild skips the Exec when the .dll is newer than every  -->
+  <!--    input. $(RustDotnetForceBuild)=true defeats the skip (fake-stale in). -->
+  <!--    Returns the produced .dll path (with CrateName/Private metadata) so   -->
+  <!--    the parent can add the <Reference>.                                   -->
+  <!-- ====================================================================== -->
+  <Target Name="_BuildOneRustCrate"
+          DependsOnTargets="_ResolveOneCrate"
+          Inputs="@(_OneInputs)"
+          Outputs="$(_OneDll)"
+          Returns="@(_OneBuiltDll)">
+
+    <PropertyGroup>
+      <_ProfileFlag Condition="'$(_OneProfile)'=='debug'">--debug</_ProfileFlag>
+      <_ProfileFlag Condition="'$(_OneProfile)'!='debug'">--release</_ProfileFlag>
+      <_CleanFlag Condition="'$(_OneClean)'=='true'">--clean</_CleanFlag>
+    </PropertyGroup>
+
+    <Message Importance="high"
+             Text="RustDotnet: building Rust crate $(_OneCrateName) ($(_OneProfile)) via cargo dotnet -> $(_OneDll)" />
+
+    <!-- Run the installed cargo-dotnet. PATH is the INHERITED PATH with the tool dirs
+         prepended (so the tool's internal cargo/rustc/dotnet + any cargo rustc-wrapper
+         resolve under MSBuild's non-interactive env). DOTNET_ROOT points the linker at
+         a dotnet. EnvironmentVariables ADDS to the inherited env (it does not clear it),
+         and PATH is set to "<tooldirs>:<inherited PATH>" so nothing is lost. -->
+    <Exec Command="&quot;$(_CargoDotnetExe)&quot; build &quot;$(_OneDir)&quot; $(_ProfileFlag) $(_CleanFlag)"
+          EnvironmentVariables="PATH=$(RustDotnetToolPath):$(PATH);DOTNET_ROOT=$(RustDotnetDotnetRoot)" />
+
+    <Error Condition="!Exists('$(_OneDll)')"
+           Text="RustDotnet: cargo dotnet build succeeded but the expected assembly was not found: $(_OneDll). Check that the crate's [lib] crate-type = [&quot;cdylib&quot;] and that the resolved assembly name ('$(_OneCrateName)') matches the crate's [package] name (override with &lt;RustCrate CrateName=&quot;...&quot;&gt;)." />
+  </Target>
+
+  <!-- _ComputeBuiltDll — populate the Returns item (.dll path + CrateName/Private as
+       metadata). A target's Returns is evaluated even when the main target is SKIPPED
+       as up-to-date, but the body items are NOT created on a skip; so this runs as an
+       AfterTargets of _ResolveOneCrate (always executes) to guarantee the item exists
+       whether or not the build ran. -->
+  <Target Name="_ComputeBuiltDll" AfterTargets="_ResolveOneCrate">
+    <ItemGroup>
+      <_OneBuiltDll Include="$(_OneDll)">
+        <CrateName>$(_OneCrateName)</CrateName>
+        <Private>$(_OnePrivate)</Private>
+      </_OneBuiltDll>
+    </ItemGroup>
+  </Target>
+
+</Project>

@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <!-- byte*/int* (ptr, len) string + slice marshalling crosses with `fixed` + raw pointers. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>cd_interop_nupkg</AssemblyName>
+
+    <!-- NuGet path (the distribution layer): consume the Rust crate's .NET assembly via
+         a <PackageReference> to the local .nupkg `cargo dotnet pack rustlib` produced.
+         RestoreSources adds the local feed (the nupkg dir) so `dotnet restore` finds it.
+         The package's lib/net8.0/cd_interop.dll is referenced + copied to bin/ by the
+         normal NuGet convention. This is the alternative to the auto-build .targets
+         (../csharp); use the .targets when you control the Rust source tree (no cache),
+         the .nupkg to DISTRIBUTE a pre-built Rust .NET assembly. -->
+    <RestoreSources>$(RestoreSources);$(MSBuildThisFileDirectory)../rustlib/target/nupkg</RestoreSources>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="cd_interop" Version="0.1.0" />
+  </ItemGroup>
+</Project>

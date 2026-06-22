@@ -24,6 +24,7 @@ build/run.
 ```bash
 cargo dotnet build [PATH] [--release|--debug] [--clean] [-v]
 cargo dotnet run   [PATH] [--release|--debug] [--clean] [-v] [-- ARGS...]
+cargo dotnet pack  [PATH] [--release|--debug] [--id NAME] [--version VER] [--out DIR]
 cargo dotnet help
 ```
 
@@ -35,6 +36,11 @@ cargo dotnet help
 | `--clean` | `cargo clean` first; rebuilds std. Bulletproof but slow — reach for it if a stale-cache result looks wrong. |
 | `-v` / `--verbose` | unfiltered build log. |
 | `-- ARGS` | (`run` only) args forwarded to the .NET program; **its exit code propagates** back out (see [§6 honest limits](#6-what-works--honest-limits)). |
+| `--id` / `--version` / `--out` | (`pack` only) override the NuGet package id / version / output dir (see [§5 consuming from C#](#5-consuming-a-rust-library-from-c)). |
+
+The `pack` subcommand builds the crate (a `cdylib`) and emits a NuGet `.nupkg` of its .NET assembly to
+`<crate>/target/nupkg/<id>.<ver>.nupkg`, so a C# project can `<PackageReference>` it from a local feed.
+See [§5](#5-consuming-a-rust-library-from-c).
 
 Because the Rust is compiled to **managed CIL** (not native code behind a P/Invoke wall), the produced
 assembly *is* .NET: Rust functions are ordinary managed methods, Rust panics are managed exceptions.
@@ -418,16 +424,35 @@ it to **`<crate>.dll`** beside it (a pure file copy — the assembly *identity* 
 the `.so` filename). `cargo dotnet run` on a library prints a "reference the .dll from C#" note and
 exits 0 (a library has no entrypoint).
 
-A C# project references it with a bare assembly `<Reference>` + `<HintPath>` (no `ProjectReference`, no
-NuGet). Exported `#[no_mangle] pub extern "C"` functions are `public static` methods on `MainModule`;
-de-mangled `#[repr(C)]` structs appear under their clean `Crate.Type` name with a synthesized ctor +
-per-field getters.
+**Recommended — let `dotnet build` build the Rust for you (`RustDotnet.targets`).** Import the
+integration and declare the crate; a single `dotnet build`/`dotnet run` runs `cargo dotnet build` on it
+and references the produced assembly — zero manual `cargo dotnet`, zero `.dll` copy, zero hand-written
+`<Reference>` (incremental: the Rust rebuild is skipped when its `.dll` is newer than its sources).
+`cargo dotnet setup` installs `RustDotnet.targets` into `$CARGO_DOTNET_HOME/msbuild/`, so it works in
+any external project:
+
+```xml
+<Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
+        Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
+<ItemGroup>
+  <RustCrate Include="../rustlib" />
+</ItemGroup>
+```
+
+**Manual (fallback).** A C# project can also reference a pre-built `.dll` with a bare assembly
+`<Reference>` + `<HintPath>` (no `ProjectReference`). Exported `#[no_mangle] pub extern "C"` functions
+are `public static` methods on `MainModule`; de-mangled `#[repr(C)]` structs appear under their clean
+`Crate.Type` name with a synthesized ctor + per-field getters.
 
 ```xml
 <ItemGroup>
   <Reference Include="cd_interop"><HintPath>cd_interop.dll</HintPath></Reference>
 </ItemGroup>
 ```
+
+**Distribution (NuGet).** `cargo dotnet pack path/to/rustlib` produces a `.nupkg` of the assembly that a
+C# project can `<PackageReference>` from a local feed (`<RestoreSources>`). Full guide, including the
+NuGet cache footgun, in [docs/INTEROP_CSHARP.md](INTEROP_CSHARP.md).
 
 ```csharp
 int sum = MainModule.rust_add(2, 3);                 // primitives: == 5

@@ -8,6 +8,28 @@ The worked example lives at [`cargo_tests/cd_interop/`](../cargo_tests/cd_intero
 
 ## TL;DR
 
+**Recommended — auto-build (`RustDotnet.targets`): one `dotnet run`, zero manual steps.**
+Import the integration and declare the Rust crate; `dotnet build`/`dotnet run` ALSO runs
+`cargo dotnet build` and references the produced assembly for you (incremental):
+
+```xml
+<!-- in your .csproj -->
+<Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
+        Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
+<Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"
+        Condition="'$(CARGO_DOTNET_HOME)'=='' and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+<ItemGroup>
+  <RustCrate Include="../path/to/rustlib" />
+</ItemGroup>
+```
+
+```bash
+dotnet run --project path/to/csharp   # builds the Rust crate + references it + runs. Done.
+```
+
+**Manual (fallback) — bare `<Reference>` + `<HintPath>`** (use when you don't want the
+auto-build target, e.g. you ship a pre-built `.dll`):
+
 ```bash
 # 1. Build the Rust library -> a .NET assembly + a referenceable .dll copy.
 cargo dotnet build path/to/rustlib            # emits target/x86_64-unknown-dotnet/release/cd_interop.dll
@@ -18,6 +40,10 @@ cp path/to/rustlib/target/x86_64-unknown-dotnet/release/cd_interop.dll path/to/c
 # 3. Reference + call it from C#.
 dotnet run --project path/to/csharp
 ```
+
+**Distribution — NuGet (`cargo dotnet pack`):** `cargo dotnet pack path/to/rustlib`
+produces a `.nupkg` you can `<PackageReference>` from a local feed. See
+[§4 NuGet packaging](#4-nuget-packaging-cargo-dotnet-pack).
 
 ## 1. Write the Rust library
 
@@ -85,14 +111,69 @@ to **`<crate>.dll`** beside it (a pure file copy — the assembly identity is `<
 
 ## 3. Reference + call it from C#
 
-A bare assembly `<Reference>` with a `<HintPath>` is the minimal thing both the C# *compiler* (it needs
-the `.assembly extern` BCL identities the lib emits) and the *runtime* accept — no `ProjectReference`,
-no NuGet. (`ProjectReference` targets a `.csproj` built by MSBuild/Roslyn; the Rust lib is built by
-`cargo dotnet`, so there is no buildable `.csproj` to point at. NuGet adds packaging ceremony with no
-benefit for a local consumer — defer it.)
+There are three ways to wire the Rust assembly into a C# project, from most to least automated:
+
+| Path | What you write | When |
+|------|----------------|------|
+| **Auto-build (recommended)** | `<Import RustDotnet.targets>` + `<RustCrate Include="../rustlib"/>` | you control the Rust source tree and want one-command builds |
+| **Manual `<Reference>` (fallback)** | a bare `<Reference><HintPath>` | you ship a pre-built `.dll` and don't want a build step |
+| **NuGet `<PackageReference>`** | `cargo dotnet pack` → `<PackageReference>` | you DISTRIBUTE a pre-built Rust .NET assembly (see [§4](#4-nuget-packaging-cargo-dotnet-pack)) |
+
+### 3a. Auto-build (recommended): `RustDotnet.targets`
+
+`dotnet build`/`dotnet run` itself runs `cargo dotnet build` on each declared `<RustCrate>` and
+references the produced assembly — **zero manual `cargo dotnet`, zero manual `.dll` copy, zero
+hand-written `<Reference>`**. It is incremental (the Rust rebuild is skipped when the `.dll` is newer
+than the crate's sources) and uses the same MSBuild path in plain `dotnet build`, IDEs, and CI.
+
+`RustDotnet.targets` ships in the repo (`msbuild/RustDotnet.targets`) and — for repo-independent use —
+`cargo dotnet setup` copies it into `$CARGO_DOTNET_HOME/msbuild/` (default `~/.cargo-dotnet/msbuild/`).
+A project imports the installed copy (so the same `.csproj` works anywhere) with a repo-relative
+fallback:
 
 ```xml
-<!-- cd_interop_cs.csproj -->
+<!-- cd_interop_cs.csproj — auto-build -->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>   <!-- byte*/int* (ptr, len) marshalling -->
+  </PropertyGroup>
+
+  <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
+  <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'=='' and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+
+  <ItemGroup>
+    <RustCrate Include="../rustlib" />
+  </ItemGroup>
+</Project>
+```
+
+`Include` is the path to the Rust crate dir (relative to the `.csproj`) — the only mandatory input.
+The assembly name (and `.dll` basename) defaults to the crate's `[package] name` parsed from its
+`Cargo.toml` (so the dir name may differ from the crate name, as here: dir `rustlib`, crate
+`cd_interop`). Optional per-item metadata, all defaulted: `Configuration="Release|Debug"`,
+`CrateName="..."` (override the assembly name), `Clean="true"` (force a clean rebuild),
+`Private="true|false"` (copy the Rust `.dll` into the consumer `bin/`; default `true`, needed for
+`dotnet run` to resolve it at runtime). Project-level property overrides (see
+`msbuild/RustDotnet.props`): `<CargoDotnet>` (explicit tool path), `<RustDotnetForceBuild>true`,
+`<RustDotnetToolPath>`, `<RustDotnetDotnetRoot>`.
+
+If `cargo dotnet` isn't installed, the build fails with an actionable error pointing at
+`cargo dotnet setup`. The full mechanics live in `msbuild/README.md`.
+
+### 3b. Manual (fallback): a bare `<Reference>` + `<HintPath>`
+
+A bare assembly `<Reference>` with a `<HintPath>` is the minimal thing both the C# *compiler* (it needs
+the `.assembly extern` BCL identities the lib emits) and the *runtime* accept — no `ProjectReference`
+(it targets a `.csproj` built by MSBuild/Roslyn; the Rust lib is built by `cargo dotnet`, so there is
+no buildable `.csproj` to point at). You build the lib yourself and copy the `.dll` next to the project
+(see the [Manual TL;DR](#tldr) above).
+
+```xml
+<!-- cd_interop_cs.csproj — manual -->
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -104,6 +185,8 @@ benefit for a local consumer — defer it.)
   </ItemGroup>
 </Project>
 ```
+
+### The C# program (identical for all three paths)
 
 ```csharp
 // Program.cs
@@ -137,6 +220,48 @@ Exported functions are `public static` methods on `MainModule`. De-mangled value
 
 The Rust `.dll` needs no `runtimeconfig.json` of its own — it is a plain referenced managed PE; the
 consuming `Exe`'s build emits the host runtime config.
+
+## 4. NuGet packaging (`cargo dotnet pack`)
+
+For DISTRIBUTING a pre-built Rust .NET assembly (rather than building it from source in the consumer),
+`cargo dotnet pack` produces a NuGet `.nupkg`:
+
+```bash
+cargo dotnet pack path/to/rustlib            # -> path/to/rustlib/target/nupkg/<crate>.<ver>.nupkg
+#   [--release|--debug] [--id NAME] [--version VER] [--out DIR]
+```
+
+It builds the crate via the same `cargo dotnet build` path, reads the id+version from
+`cargo metadata`, and hand-assembles a valid OPC package containing `lib/net8.0/<crate>.dll` (plus a
+`build/<crate>.targets` for copy-local and a `.nuspec`). A C# project consumes it from a local feed:
+
+```xml
+<!-- cd_interop_nupkg.csproj -->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RestoreSources>$(RestoreSources);../rustlib/target/nupkg</RestoreSources>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="cd_interop" Version="0.1.0" />
+  </ItemGroup>
+</Project>
+```
+
+```bash
+dotnet run --project path/to/csharp_nupkg    # restores the local .nupkg, references it, runs
+```
+
+The worked example is [`cargo_tests/cd_interop/csharp_nupkg/`](../cargo_tests/cd_interop/csharp_nupkg)
+(verified: all six marshalling checks pass, exit 0). `nuget.org` publish is out of scope — this is the
+local-feed path.
+
+> **Cache footgun.** NuGet pins `<crate> <version>` in `~/.nuget/packages`. After changing the Rust and
+> re-packing the **same** version, the **stale cached copy** is served. Bump `--version`, or clear the
+> cache: `dotnet nuget locals global-packages --clear`. This is a reason the auto-build `.targets`
+> (§3a) stays the primary recommendation for a source-controlled crate — it has no cache.
 
 ## What is and isn't verified here
 
