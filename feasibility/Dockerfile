@@ -46,6 +46,25 @@ RUN curl --proto '=https' --tlsv1.2 -fsSf https://sh.rustup.rs \
     && rustup default "${NIGHTLY}" \
     && rustc -V && cargo -V
 
+# .NET 9 RUNTIME (side-by-side with 8) + its matching CoreCLR ilasm, for `cargo dotnet --dotnet 9`
+# in the docker backend. Each runtime needs ITS CoreCLR ilasm: the default net8 path keeps Mono's
+# `ilasm`; net9 uses this one (Mono/older PEs are rejected by the net9 loader). The bash front-end
+# sets ILASM_PATH=/root/.dotnet/ilasm9-tool/ilasm + DOTNET_VERSION=9 when --dotnet 9 is requested.
+# Placed AFTER the rust layer so it doesn't bust that (expensive) cache.
+RUN apt-get update && apt-get install -y --no-install-recommends unzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh \
+    && bash /tmp/dotnet-install.sh --channel 9.0 --runtime dotnet --install-dir /usr/share/dotnet \
+    && rm /tmp/dotnet-install.sh \
+    && rid=linux-x64; case "$(dpkg --print-architecture)" in arm64) rid=linux-arm64;; esac \
+    && curl -fsSL -o /tmp/ilasm9.nupkg "https://www.nuget.org/api/v2/package/runtime.$rid.microsoft.netcore.ilasm/9.0.0" \
+    && mkdir -p /tmp/ilasm9 /root/.dotnet/ilasm9-tool \
+    && (cd /tmp/ilasm9 && unzip -qo /tmp/ilasm9.nupkg) \
+    && cp "/tmp/ilasm9/runtimes/$rid/native/ilasm" /root/.dotnet/ilasm9-tool/ilasm \
+    && chmod +x /root/.dotnet/ilasm9-tool/ilasm \
+    && rm -rf /tmp/ilasm9 /tmp/ilasm9.nupkg \
+    && test -x /root/.dotnet/ilasm9-tool/ilasm
+
 # Sanity-check ilasm is on PATH (mono provides it). Non-fatal: version output is noisy.
 RUN (ilasm --version 2>/dev/null || mono --version 2>/dev/null | head -1) | head -1 \
     || echo "WARNING: ilasm not found on PATH"

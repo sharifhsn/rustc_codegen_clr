@@ -135,10 +135,13 @@ ensure_dotnet_on_path(){
 # ILASM_PATH; $HOME/.dotnet/ilasm-tool/ilasm; a non-Mono `ilasm` on PATH. Needs
 # detect_host_os run first (uses exe_ext). Dies with an actionable message.
 resolve_ilasm(){
+  # Each runtime needs ITS matching CoreCLR ilasm: ilasm-tool for .NET 8, ilasm9-tool for .NET 9
+  # (the net8 ilasm's PE is rejected by the net9 loader and vice-versa).
+  local _il_tool="ilasm-tool"; [ "${CD_DOTNET:-8}" = 9 ] && _il_tool="ilasm9-tool"
   if [ -n "${ILASM_PATH:-}" ]; then
     [ -x "$ILASM_PATH" ] || die "ILASM_PATH='$ILASM_PATH' is not an executable"
-  elif [ -x "$HOME/.dotnet/ilasm-tool/ilasm$exe_ext" ]; then
-    export ILASM_PATH="$HOME/.dotnet/ilasm-tool/ilasm$exe_ext"
+  elif [ -x "$HOME/.dotnet/$_il_tool/ilasm$exe_ext" ]; then
+    export ILASM_PATH="$HOME/.dotnet/$_il_tool/ilasm$exe_ext"
   elif command -v ilasm >/dev/null 2>&1; then
     if ilasm --version 2>&1 | grep -qi mono; then
       die "the \`ilasm\` on PATH is Mono's, which emits PE32 images the native CoreCLR loader rejects. Run \`cargo dotnet setup\` (installs the CoreCLR ILAsm to \$HOME/.dotnet/ilasm-tool/ilasm), or set ILASM_PATH to a CoreCLR ilasm."
@@ -268,6 +271,26 @@ cd_setup(){
         die "setup: the installed ilasm reports Mono — expected the CoreCLR ILAsm. Aborting."
       fi
       prov_ilasm="installed"
+    fi
+    # net9 CoreCLR ILAsm (for `cargo dotnet --dotnet 9`) → ilasm9-tool; mirrors the net8 fetch.
+    # Each runtime needs ITS matching ilasm (a net8 PE is rejected by the net9 loader). The net9
+    # ilasm's --version exits non-zero, so no Mono-assert here (it is the CoreCLR NuGet binary).
+    if [ -x "$HOME/.dotnet/ilasm9-tool/ilasm$exe_ext" ]; then
+      echo "==> [3a] net9 CoreCLR ilasm present (\$HOME/.dotnet/ilasm9-tool/ilasm$exe_ext)"
+    else
+      echo "==> [3a] installing net9 CoreCLR ILAsm ($host_rid) to \$HOME/.dotnet/ilasm9-tool/ilasm$exe_ext"
+      local nupkg9="/tmp/cd_ilasm9.$$.nupkg" exdir9="/tmp/cd_ilasm9.$$.d"
+      rm -rf "$exdir9"; mkdir -p "$exdir9"
+      curl -sSL -o "$nupkg9" "https://www.nuget.org/api/v2/package/runtime.$host_rid.microsoft.netcore.ilasm/9.0.0" \
+        || die "setup: failed to download the net9 CoreCLR ILAsm NuGet package for $host_rid"
+      ( cd "$exdir9" && unzip -qo "$nupkg9" ) || die "setup: failed to unzip the net9 ILAsm package (need unzip)"
+      local src_ilasm9="$exdir9/runtimes/$host_rid/native/ilasm$exe_ext"
+      [ -f "$src_ilasm9" ] || die "setup: net9 ILAsm binary not found at runtimes/$host_rid/native/ilasm$exe_ext"
+      mkdir -p "$HOME/.dotnet/ilasm9-tool"
+      cp "$src_ilasm9" "$HOME/.dotnet/ilasm9-tool/ilasm$exe_ext"
+      chmod +x "$HOME/.dotnet/ilasm9-tool/ilasm$exe_ext"
+      [ "$(uname -s)" = Darwin ] && xattr -c "$HOME/.dotnet/ilasm9-tool/ilasm$exe_ext" 2>/dev/null || true
+      rm -f "$nupkg9"; rm -rf "$exdir9"
     fi
   fi
 
@@ -576,6 +599,7 @@ PATH_ARG=""
 CD_REL=1          # release default
 CD_CLEAN=0
 CD_VERBOSE=0
+CD_DOTNET="${DOTNET_VERSION:-8}"  # target .NET version (8|9); honour a pre-set DOTNET_VERSION
 PROG_ARGS=()      # args after `--`, forwarded to the program on `run`
 saw_dashdash=0
 while [ $# -gt 0 ]; do
@@ -585,6 +609,7 @@ while [ $# -gt 0 ]; do
     --release) CD_REL=1 ;;
     --debug)   CD_REL=0 ;;
     --clean)   CD_CLEAN=1 ;;
+    --dotnet)  CD_DOTNET="${2:-}"; shift ;;
     -v|--verbose) CD_VERBOSE=1 ;;
     -h|--help) usage; exit 0 ;;
     -*) die "unknown flag '$1' (try: cargo dotnet help)" ;;
@@ -593,6 +618,10 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ -n "$PATH_ARG" ] || PATH_ARG="."
+# Normalize + validate the target .NET version, then export it so the native inner-cargo (codegen
+# backend + cilly linker) inherits it. The docker path additionally -e's it into the container.
+case "$CD_DOTNET" in 8|net8|net8.0) CD_DOTNET=8 ;; 9|net9|net9.0) CD_DOTNET=9 ;; *) die "--dotnet: invalid value '$CD_DOTNET' (expected 8 or 9)" ;; esac
+export DOTNET_VERSION="$CD_DOTNET"
 CD_RUN=0; [ "$sub" = run ] && CD_RUN=1
 
 # ---- resolve the crate dir to an absolute host path -------------------------
@@ -632,13 +661,17 @@ case "$BACKEND" in
     #
     # Detect in-repo by repo-root prefix: REL is the repo-relative subpath if the
     # crate is strictly under the repo (and not the repo root itself).
+    # Target-version env for the container: DOTNET_VERSION always (default 8 = unchanged); the net9
+    # CoreCLR ilasm path when --dotnet 9 (the net8 path keeps the image's Mono ilasm, untouched).
+    DK_ENV=(-e DOTNET_VERSION="$CD_DOTNET")
+    [ "$CD_DOTNET" = 9 ] && DK_ENV+=(-e ILASM_PATH=/root/.dotnet/ilasm9-tool/ilasm)
     REL="${CRATE_ABS#"$REPO_ROOT"/}"
     if [ "$REL" != "$CRATE_ABS" ] && [ "$CRATE_ABS" != "$REPO_ROOT" ]; then
       # IN-REPO: build within the /work mount so sibling path-deps resolve.
       docker run --rm -i \
         -e CARGO_TERM_COLOR=never \
         -e CD_REL="$CD_REL" -e CD_RUN="$CD_RUN" -e CD_CLEAN="$CD_CLEAN" -e CD_VERBOSE="$CD_VERBOSE" \
-        -e OPTIMIZE_CIL \
+        -e OPTIMIZE_CIL "${DK_ENV[@]}" \
         -v "$REPO_ROOT":/work -v rcc-target:/work/target -w "/work/$REL" \
         "$IMAGE" bash -o pipefail -s -- ${PROG_ARGS[@]+"${PROG_ARGS[@]}"} < "$CORE"
     else
@@ -646,7 +679,7 @@ case "$BACKEND" in
       docker run --rm -i \
         -e CARGO_TERM_COLOR=never \
         -e CD_REL="$CD_REL" -e CD_RUN="$CD_RUN" -e CD_CLEAN="$CD_CLEAN" -e CD_VERBOSE="$CD_VERBOSE" \
-        -e OPTIMIZE_CIL \
+        -e OPTIMIZE_CIL "${DK_ENV[@]}" \
         -v "$REPO_ROOT":/work -v rcc-target:/work/target -v "$CRATE_ABS":/project -w /project \
         "$IMAGE" bash -o pipefail -s -- ${PROG_ARGS[@]+"${PROG_ARGS[@]}"} < "$CORE"
     fi

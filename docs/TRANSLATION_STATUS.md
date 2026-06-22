@@ -629,11 +629,17 @@ specific is concentrated at the edges and now flows through one abstraction:
   backend **and** the (separate-process) linker via one inner-cargo env seam, and selects the *matching*
   CoreCLR ilasm (`$HOME/.dotnet/ilasm-tool` vs `ilasm9-tool` — each runtime rejects the other's PE,
   `0x8007000C`).
-- **Verified both ways:** .NET 8 Docker `::stable` gate stays **426/12** (default `Net8` is byte-
-  identical), and `cargo dotnet run cargo_tests/pal_panic --dotnet 9` runs to completion on the .NET 9
-  runtime (native sub-word CAS; the default-panic-hook hazard gone).
+- **Verified both ways, all three paths:** the .NET 8 Docker `::stable` gate stays **426/12** (default
+  `Net8` byte-identical); `cargo dotnet run pal_panic --dotnet 9` runs to completion on the .NET 9
+  runtime **natively** AND **in Docker** (native sub-word CAS; the default-panic-hook hazard gone); and
+  `cargo_tests/cd_interop` is consumed from C# on **both** net8 + net9 (a net9 Rust lib `.ver 9:0:0:0`
+  loads from a net9 C# project, via `RustDotnetVersion` in the msbuild auto-build).
+- **Docker net9 (done):** the rcc-dev image carries the net9 runtime side-by-side + its matching
+  CoreCLR ilasm (arch-aware, placed after the rust layer so that cache survives); the bash front-end's
+  `--dotnet 9` `-e`-passes `DOTNET_VERSION` + the net9 ilasm into the container. `cargo dotnet setup`
+  fetches the net9 ilasm for clean native machines too. The net8 docker path is untouched (Mono ilasm).
 - **Floor/ceiling:** the practical floor is .NET 6 (`NativeMemory.AlignedAlloc`); forward versions
-  (10, 11, …) are additive (a new `DotnetVersion` arm + the matching ilasm). **Deferred:** Docker net9
-  (needs a CoreCLR-net9-ilasm image — native path first), the helper-csproj TFMs + `validate.sh`
-  (left fixed-net8; only matter for dual-version C#-consumes-Rust), and a `cargo dotnet setup` fetch of
-  the net9 ilasm for clean machines (both ilasm dirs already present on the dev box).
+  (10, 11, …) are additive (a new `DotnetVersion` arm + the matching ilasm). **Remaining (minor):** the
+  other helper csproj (`rust_export_cs`, `rust_typedef_cs`, the nupkg consumer) + `validate.sh` are left
+  fixed-net8 — they only matter for dual-version variants of those specific probes (`cd_interop` is the
+  worked dual-version example).
