@@ -207,12 +207,17 @@ fn simd_allset(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
 }
 
 pub fn simd(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    // Comparisons via the BCL `Vector` statics (all-ones masks, hardware SIMD).
     simd_eq(asm, patcher);
     simd_lt(asm, patcher);
+    simd_gt(asm, patcher);
+    simd_ge(asm, patcher);
+    simd_le(asm, patcher);
     simd_ones_compliment(asm, patcher);
     simd_neg(asm, patcher);
     simd_abs(asm, patcher);
     simd_vec_from_val(asm, patcher);
+    // Element-wise arithmetic / bitwise via the BCL `Vector` statics.
     simd_or(asm, patcher);
     simd_add(asm, patcher);
     simd_and(asm, patcher);
@@ -221,6 +226,7 @@ pub fn simd(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     simd_eq_all(asm, patcher);
     simd_eq_any(asm, patcher);
     simd_mul(asm, patcher);
-    simd_div(asm, patcher);
+    // Per-lane value ops with no BCL-static equivalent here (xor/shl/shr/div/cast).
+    binop::register_value_lane_ops(asm, patcher);
 }
 pub use binop::fallback_simd;

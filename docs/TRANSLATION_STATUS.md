@@ -63,11 +63,18 @@ intercepted before the match), Never, **Foreign** (kept thin), FnPtr/FnDef, **pa
 closures, and **monomorphized generics via name-mangling**. Enums → `[FieldOffset]` tagged unions is
 faithful (Single/Direct/Niche encodings, real `tag_field`/offsets from rustc layout).
 
-**Partial:** **f16/f128** (types lower; some constants/ops `todo!`, an f128 enum-tag panics at
-`adt.rs:132`); **coroutines/async** (type forms but field access is `todo!` at `adt.rs:216`;
-`CoroutineWitness`/`CoroutineClosure` hit the catch-all); **SIMD** (only 64/128/256/512-bit; others
-`panic!` in `tpe/simd.rs`); `dyn` pointee is a single contentless `"Dyn"` class (fine — identity is
-in the vtable). Latent: layout offsets > `u16::MAX` are silently clamped (`adt.rs:55`).
+**Partial:** **f16/f128** (types lower; f16 casts done, f128 is a genuine .NET platform gap — no quad
+float in the BCL, §4; an f128 enum-tag panics at `adt.rs:132`); **SIMD** (64/128/256/512-bit; >512-bit
+and odd-width degrade to a fixed array); `dyn` pointee is a single contentless `"Dyn"` class (fine —
+identity is in the vtable). Latent: layout offsets > `u16::MAX` are silently clamped (`adt.rs:55`).
+
+**Coroutines/async — work fully for stable async** (`adt.rs:198-228` `coroutine_field_descriptor` is
+implemented; the earlier "field access `todo!` at adt.rs:216" claim was stale). Suspend/resume AND
+dropping an incomplete `Future` both work, because rustc's `coroutine::StateTransform` pass pre-lowers
+`Yield`→(discriminant write + `Return`) and routes coroutine drop through the ordinary `Drop`
+terminator before the backend sees MIR — so the backend's `Yield`/`CoroutineDrop` arms are
+*unreachable* (now accurate `unreachable!()` assertions, not `todo!`). `CoroutineWitness`/
+`CoroutineClosure`/async-closures (unstable) still hit the catch-all.
 
 **Ceilings (interrogated in §7):** the *one* true wall here is a transparent zero-cost open generic
 whose overlapping layout holds a managed ref (CLI §9.5 + the GC ref-map). Internally Rust generics
@@ -83,12 +90,29 @@ are unmanaged); only C#-instantiating-a-Rust-generic-with-a-new-T is blocked, an
 (size/align/type_name/variant_count), aggregate construction, transmute, int↔int & int↔float casts.
 
 **Real gaps / bugs:**
-- **SIMD is effectively unimplemented — the single biggest hole.** `intrinsics/simd.rs` is empty; the
-  ~14 "handled" ops defer to runtime managed helpers that don't exist; `simd_splat` missing; most
-  `simd_*` ICE via `must_be_overridden`. Builtin side (`ir/builtins/simd/`) has a fallback but
-  `simd_shuffle` is an unregistered `todo!`.
-- **Atomics:** sub-word `cxchg`/`xchg` for `u8`/`i8`/`u16`/`i16` now correct via masked-CAS-loop
-  builtins (WF-5 — see §10); `atomic_store` is still a plain store.
+- **SIMD — now a high-coverage subset (was "the single biggest hole").** SIMD types are first-class
+  (`Type::SIMDVector` → real BCL `Vector{64,128,256,512}<T>`); the generic-static-call machinery
+  was already solved. The **dispatched + builtin-backed** op set now covers core::simd's hot path:
+  elementwise `add/sub/mul/div` (div was missing entirely → ICE; now per-lane), bitwise `and/or/xor`,
+  shifts `shl/shr` (sign-aware), all comparisons `eq/ne/lt/gt/le/ge` (BCL → correct all-ones masks),
+  `splat`, `extract`/`insert`, `cast`/`as`, `neg`/`abs`/`fabs`, `bitmask`, **`select`** (per-lane,
+  float-safe via address-select), and **horizontal reductions** `reduce_{add,mul}` (ordered+unordered),
+  `reduce_{and,or,xor,min,max}`. Value ops with no clean BCL static (xor/shl/shr/div/cast/select/reduce)
+  use a target-agnostic per-lane loop (also serves C mode). Verified by `test/intrinsics/simd.rs`
+  (differential vs native). **Still deferred (documented `todo!`/array-fallback):** general
+  `simd_shuffle` (const-index immediate; the `x==y` scalar fast-path works), `gather`/`scatter`/
+  masked, float transcendentals (`fsqrt`/`floor`/`ceil`/`round`/`trunc`/`fma`), float
+  `reduce_min/max` (portable-simd routes these through a *scalar* `f32::max` fold, not the intrinsic),
+  `ctlz`/`cttz`/`ctpop`/`bswap` in SIMD form, and >512-bit/odd-width vectors.
+- **Atomics:** sub-word `cxchg`/`xchg` for `u8`/`i8`/`u16`/`i16` correct via masked-CAS-loop builtins
+  (WF-5 — see §10); **`atomic_store` now emits a *volatile* store** (release semantics; was a plain
+  store). Residual: a sub-word-atomic page-boundary hazard (`emulate_subword_cmp_xchng` aligns the
+  byte address down to its 32-bit word, which can touch up-to-3 unowned bytes when the atomic is at
+  the start of an allocation/static-storage region → AccessViolation; only bites the *default* panic
+  hook's `get_backtrace_style` static `Atomic<u8>`). The safe fix (lay sub-word atomic statics
+  4-byte-aligned/wide) is **deferred**: it changes static-field layout and the root cause has an
+  unresolved managed-vs-unmanaged-pointer question — high risk for a narrow edge case (custom panic
+  hooks already work, `pal_panic2`).
 - **`float → int` `as` — FIXED (WF-1).** Finite saturation was already correct; the one real bug was
   `NaN → MAX` (overflow branch used `bge.un`, which NaN satisfies). Now guarded `NaN → 0` in
   `cilly/src/ir/builtins/casts.rs`. See §10.
@@ -215,6 +239,17 @@ weak-static runtime tail is unreachable and DCE'd — the lib emits cleanly pull
 refs. **Tier 2 (surrogate-only, not yet through this real-PAL flow):** returning a managed
 `System.String` directly (`mycorrhiza::system::MString`/`greet_managed`) and a Rust-raises-a-.NET-
 exception `Result` (`rustc_clr_interop_throw`/`try_div`) — both pull `mycorrhiza` + the throw intrinsic.
+**Finding (real-PAL Tier-2 blocker):** pushing these through the real `cargo dotnet` flow showed the
+*rustlib emits cleanly* (an I/O-free `cdylib` with `MString`/throw builds + DCE-clean on the dotnet PAL
+— the feared runtime-tail drag does NOT happen), **but the produced `.dll` is not C#-consumable**: the
+`mycorrhiza` intrinsics (`MString` → `System.Private.CoreLib`'s `String`; the throw → `System.Exception`)
+attribute the assembly's base types to `System.Private.CoreLib`, so a standard C# project fails with
+`CS0012` ("`Object`/`ValueType` defined in `System.Private.CoreLib`, not referenced") on *every* call —
+and referencing `System.Private.CoreLib` directly cascades into `CS0433`/`CS0518` (duplicate predefined
+types vs the `System.Runtime` ref assembly). The fix is backend-level **reference-assembly attribution**
+(emit public base/exception/string identities as the C#-resolvable `System.Runtime`, not the
+implementation `System.Private.CoreLib`) — a focused follow-up, not the pure reuse first assumed. Tier-2
+therefore remains **surrogate-proven only**; the real-PAL path is blocked on this attribution work.
 Consumer guide: `docs/INTEROP_CSHARP.md`. Zero backend code changed for J3 — only `feasibility/` shell
 (the `cargo dotnet` lib-artifact branch) + the new probe crate. The enabling backend changes (from WF-7):
 - `#[no_mangle]` → `Access::Extern` (`src/assembly.rs`), making exports **dead-code-elimination roots**

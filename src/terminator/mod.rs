@@ -379,7 +379,13 @@ pub fn handle_terminator<'tcx>(
             call_source: _,
             fn_span: _,
         } => handle_call_terminator(terminator, ctx, args, destination, func, *target),
-        TerminatorKind::TailCall { .. } => todo!(),
+        // `become` / guaranteed tail calls are gated behind the unstable, incomplete
+        // `explicit_tail_calls` feature, so this cannot appear in std/tokio or any stable crate. A
+        // correct (un-optimized) lowering would be `call` + `Ret` of the result (no `.tail` prefix is
+        // needed for correctness); left unimplemented until a real `become`-using crate appears.
+        TerminatorKind::TailCall { .. } => {
+            todo!("TailCall (`become`) requires the unstable `explicit_tail_calls` feature")
+        }
         TerminatorKind::Return => {
             let ret = ctx.monomorphize(ctx.body().return_ty());
             if ctx.type_from_cache(ret) == cilly::Type::Void {
@@ -616,13 +622,23 @@ pub fn handle_terminator<'tcx>(
             // unwind is ignored becase it can't happen.
             vec![goto(ctx, real_target.as_u32())]
         }
-        TerminatorKind::CoroutineDrop {} => todo!("Can't drop corutines yet!"),
-        TerminatorKind::Yield {
-            value: _,
-            resume: _,
-            resume_arg: _,
-            drop: _,
-        } => todo!("Can't yeld yet!"), //_ => todo!("Unhandled terminator kind {kind:?}", kind = terminator.kind),
+        // `Yield` and `CoroutineDrop` are removed by rustc's `coroutine::StateTransform` pass before
+        // `instance_mir` ever hands us a coroutine body: `Yield` becomes a discriminant write + a
+        // `Return`, resume becomes a `SwitchInt` on the discriminant, and coroutine drop is lowered
+        // into a separate sync drop shim (reached through the ordinary `Drop` terminator via
+        // `InstanceKind::DropGlue`). So the backend only ever sees the poll-style switch form — these
+        // arms are genuinely unreachable. (Async/await and dropping an incomplete `Future` both work
+        // through that machinery; see `cargo_tests/pal_async`.) An accurate invariant assertion is the
+        // correct, complete handling here — if a future rustc exposed pre-`StateTransform` MIR, this
+        // would fire loudly with a precise message rather than miscompile.
+        TerminatorKind::CoroutineDrop {} => unreachable!(
+            "CoroutineDrop is lowered away by rustc's coroutine::StateTransform before codegen; \
+             reaching it means the backend was handed pre-StateTransform MIR"
+        ),
+        TerminatorKind::Yield { .. } => unreachable!(
+            "Yield is lowered to a discriminant write + Return by rustc's coroutine::StateTransform \
+             before codegen; reaching it means the backend was handed pre-StateTransform MIR"
+        ),
     };
     // Every terminator must produce at least one root.
     assert!(

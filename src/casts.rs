@@ -236,6 +236,13 @@ pub fn float_to_int(src: Type, target: Type, operand: Node, asm: &mut Assembly) 
         let as_f32 = cilly::ir::builtins::f16::f16_to_float(asm, operand, Float::F32);
         return float_to_int(Type::Float(Float::F32), target, as_f32, asm);
     }
+    if matches!(src, Type::Float(Float::F128)) {
+        todo!(
+            "f128 -> int casts are unsupported: .NET has no quadruple-precision float type, so this \
+             would need softfloat emulation (f128 arithmetic works only in C mode, via libgcc). \
+             src:{src:?} target:{target:?}"
+        );
+    }
     match target {
         Type::Int(Int::I128) => {
             let mref = MethodRef::new(
@@ -360,6 +367,12 @@ pub fn int_to_float(src: Type, target: Type, parrent: Node, asm: &mut Assembly) 
         // `System.Half`'s explicit conversion operators.
         let as_f32 = int_to_float(src, Type::Float(Float::F32), parrent, asm);
         cilly::ir::builtins::f16::float_to_f16(asm, as_f32, Float::F32)
+    } else if matches!(target, Type::Float(Float::F128)) {
+        todo!(
+            "int -> f128 casts are unsupported: .NET has no quadruple-precision float type, so this \
+             would need softfloat emulation (f128 arithmetic works only in C mode, via libgcc). \
+             src:{src:?} target:{target:?}"
+        )
     } else {
         match (&src, &target) {
             (Type::Int(Int::U32 | Int::U64), Type::Float(Float::F32)) => {

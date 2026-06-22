@@ -176,7 +176,7 @@ pub fn handle_intrinsic<'tcx>(
             );
             vec![place_set(destination, value, ctx)]
         }
-        "type_id" => vec![tpe::type_id(destination, call_instance, ctx)],
+        "type_id" => vec![tpe::type_id(destination, call_instance, span, ctx)],
         "atomic_load_acquire"
         | "atomic_load_seqcst"
         | "atomic_load_unordered"
@@ -193,7 +193,12 @@ pub fn handle_intrinsic<'tcx>(
             vec![ctx.make_store_volatile(st)]
         }
         "atomic_store" => {
-            // TODO: implement a proper atomic store.
+            // Lower `atomic_store` to a *volatile* store (CIL `volatile. stind`), which gives release
+            // semantics — a plain store has none. .NET guarantees tear-free naturally-aligned
+            // stores, so this matches the tear-free-load assumption `atomic_load_*` already relies
+            // on. (The ordering suffix is stripped before this arm, so all orderings map to the
+            // volatile store; a full-SeqCst store would additionally need a trailing
+            // `Thread.MemoryBarrier()` — see the `atomic_fence` arm — which is left as a follow-up.)
             debug_assert_eq!(
                 args.len(),
                 2,
@@ -203,7 +208,8 @@ pub fn handle_intrinsic<'tcx>(
             let val = handle_operand(&args[1].node, ctx);
             let arg_ty = ctx.monomorphize(args[1].node.ty(ctx.body(), ctx.tcx()));
 
-            vec![ptr_set_op(arg_ty.into(), ctx, addr, val)]
+            let st = ptr_set_op(arg_ty.into(), ctx, addr, val);
+            vec![ctx.make_store_volatile(st)]
         }
         "atomic_cxchg" | "atomic_cxchgweak" => atomic::cxchg(args, destination, ctx).into(),
         "atomic_xsub" => {
@@ -871,6 +877,24 @@ pub fn handle_intrinsic<'tcx>(
             let value = ctx.call(mul, &[lhs, rhs], IsPure::NOT);
             vec![place_set(destination, value, ctx)]
         }
+        "simd_div" => {
+            // `simd_div<T>(x: T, y: T) -> T`: element-wise division, same `(vec, vec) -> vec` shape
+            // as `simd_mul`. The per-lane body is supplied by the `simd_div` builtin generator
+            // (`register_value_lane_ops`); there is no single BCL `Vector` static for it.
+            let vec = ctx.type_from_cache(
+                call_instance.args[0]
+                    .as_type()
+                    .expect("simd_div works only on types!"),
+            );
+            let lhs = handle_operand(&args[0].node, ctx);
+            let rhs = handle_operand(&args[1].node, ctx);
+            let name = ctx.alloc_string("simd_div");
+            let main_module = ctx.main_module();
+            let main_module = ctx[*main_module].clone();
+            let op = main_module.static_mref(&[vec, vec], vec, name, ctx);
+            let value = ctx.call(op, &[lhs, rhs], IsPure::NOT);
+            vec![place_set(destination, value, ctx)]
+        }
         "simd_shl" | "simd_shr" | "simd_xor" => {
             // Element-wise `(vec, vec) -> vec` ops, same shape as `simd_add`. The per-lane
             // body is supplied by `fallback_simd` under the matching builtin name. `simd_shr`
@@ -1105,6 +1129,78 @@ pub fn handle_intrinsic<'tcx>(
             let allset = main_module.static_mref(&[], vec, allset, ctx);
             let allset = ctx.call(allset, EMPTY_ARGS, IsPure::NOT);
             let value = ctx.call(eq, &[x, allset], IsPure::NOT);
+            vec![place_set(destination, value, ctx)]
+        }
+        "simd_select" => {
+            // `simd_select<M, T>(mask: M, if_true: T, if_false: T) -> T`: per-lane blend. The
+            // builtin (`simd_select` in `register_value_lane_ops`) does `mask[i] != 0 ? a[i] : b[i]`.
+            let mask_ty = ctx.type_from_cache(
+                call_instance.args[0]
+                    .as_type()
+                    .expect("simd_select works only on types!"),
+            );
+            let val_ty = ctx.type_from_cache(
+                call_instance.args[1]
+                    .as_type()
+                    .expect("simd_select works only on types!"),
+            );
+            let mask = handle_operand(&args[0].node, ctx);
+            let a = handle_operand(&args[1].node, ctx);
+            let b = handle_operand(&args[2].node, ctx);
+            let name = ctx.alloc_string("simd_select");
+            let main_module = ctx.main_module();
+            let main_module = ctx[*main_module].clone();
+            let op = main_module.static_mref(&[mask_ty, val_ty, val_ty], val_ty, name, ctx);
+            let value = ctx.call(op, &[mask, a, b], IsPure::NOT);
+            vec![place_set(destination, value, ctx)]
+        }
+        "simd_reduce_add_ordered" | "simd_reduce_mul_ordered" => {
+            // `simd_reduce_{add,mul}_ordered<T, U>(x: T, acc: U) -> U`: horizontal fold seeded with
+            // `acc`, left-to-right (for float bit-exactness). Result is the scalar element type `U`.
+            let vec = ctx.type_from_cache(
+                call_instance.args[0]
+                    .as_type()
+                    .expect("simd_reduce works only on types!"),
+            );
+            let scalar = ctx.type_from_cache(
+                call_instance.args[1]
+                    .as_type()
+                    .expect("simd_reduce works only on types!"),
+            );
+            let x = handle_operand(&args[0].node, ctx);
+            let acc = handle_operand(&args[1].node, ctx);
+            let name = ctx.alloc_string(fn_name);
+            let main_module = ctx.main_module();
+            let main_module = ctx[*main_module].clone();
+            let op = main_module.static_mref(&[vec, scalar], scalar, name, ctx);
+            let value = ctx.call(op, &[x, acc], IsPure::NOT);
+            vec![place_set(destination, value, ctx)]
+        }
+        "simd_reduce_add_unordered"
+        | "simd_reduce_mul_unordered"
+        | "simd_reduce_and"
+        | "simd_reduce_or"
+        | "simd_reduce_xor"
+        | "simd_reduce_min"
+        | "simd_reduce_max" => {
+            // `simd_reduce_*<T, U>(x: T) -> U`: horizontal fold over all lanes (no seed; starts from
+            // lane 0). The per-lane fold body is supplied by the matching `simd_reduce` builtin.
+            let vec = ctx.type_from_cache(
+                call_instance.args[0]
+                    .as_type()
+                    .expect("simd_reduce works only on types!"),
+            );
+            let scalar = ctx.type_from_cache(
+                call_instance.args[1]
+                    .as_type()
+                    .expect("simd_reduce works only on types!"),
+            );
+            let x = handle_operand(&args[0].node, ctx);
+            let name = ctx.alloc_string(fn_name);
+            let main_module = ctx.main_module();
+            let main_module = ctx[*main_module].clone();
+            let op = main_module.static_mref(&[vec], scalar, name, ctx);
+            let value = ctx.call(op, &[x], IsPure::NOT);
             vec![place_set(destination, value, ctx)]
         }
         _ => intrinsic_slow(fn_name, args, destination, ctx, call_instance, span),
