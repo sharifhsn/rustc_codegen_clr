@@ -156,6 +156,7 @@ pub fn insert_dotnet_pal(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
     insert_dotnet_available_parallelism(asm, patcher);
     insert_dotnet_getpid(asm, patcher);
     insert_dotnet_hostname(asm, patcher);
+    insert_dotnet_paths(asm, patcher);
     insert_dotnet_cotaskmem_free(asm, patcher);
     insert_dotnet_args(asm, patcher);
     insert_dotnet_env(asm, patcher);
@@ -847,6 +848,142 @@ fn insert_dotnet_hostname(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
         }
     };
     patcher.insert(name, Box::new(generator));
+}
+
+/// PACKAGE A — the four `sys::paths` hooks the `target-family="unix"` flip
+/// requires (`dotnet_pal/sys/paths/dotnet.rs`). Each `string`-returning hook
+/// marshals via `Marshal.StringToCoTaskMemUTF8` (NUL-terminated UTF-8, freed by
+/// `rcl_dotnet_cotaskmem_free`), exactly like `hostname`/`getenv`:
+/// * `rcl_dotnet_paths_getcwd()       -> *mut u8`  => `Directory.GetCurrentDirectory()`
+/// * `rcl_dotnet_paths_current_exe()  -> *mut u8`  => `Environment.ProcessPath` (may be null)
+/// * `rcl_dotnet_paths_chdir(ptr,len) -> i32`      => `Directory.SetCurrentDirectory(s)` (0 ok)
+/// * `rcl_dotnet_paths_temp_dir()     -> *mut u8`  => `Path.GetTempPath()`
+fn insert_dotnet_paths(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    // Helper: build a `() -> *mut u8` body that marshals a static string getter.
+    // `class`/`getter_name`/`sig_ret` describe the BCL static `string` getter.
+
+    // ---- rcl_dotnet_paths_getcwd() -> *mut u8 (Directory.GetCurrentDirectory) ----
+    let getcwd_name = asm.alloc_string("rcl_dotnet_paths_getcwd");
+    let getcwd_gen = move |_, asm: &mut Assembly| {
+        let u8_ptr = asm.nptr(Type::Int(Int::U8));
+        let dir = ClassRef::directory(asm);
+        let get_cwd = asm.alloc_string("GetCurrentDirectory");
+        let get_cwd = asm.class_ref(dir).clone().static_mref(
+            &[],
+            Type::PlatformString,
+            get_cwd,
+            asm,
+        );
+        let s = asm.alloc_node(CILNode::call(get_cwd, []));
+        let to_utf8 = string_to_utf8(asm);
+        let buf = asm.alloc_node(CILNode::call(to_utf8, [s]));
+        let buf = asm.cast_ptr(buf, u8_ptr);
+        let ret = asm.alloc_root(CILRoot::Ret(buf));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(getcwd_name, Box::new(getcwd_gen));
+
+    // ---- rcl_dotnet_paths_temp_dir() -> *mut u8 (Path.GetTempPath) ----
+    let temp_name = asm.alloc_string("rcl_dotnet_paths_temp_dir");
+    let temp_gen = move |_, asm: &mut Assembly| {
+        let u8_ptr = asm.nptr(Type::Int(Int::U8));
+        let path = ClassRef::path_io(asm);
+        let get_temp = asm.alloc_string("GetTempPath");
+        let get_temp = asm.class_ref(path).clone().static_mref(
+            &[],
+            Type::PlatformString,
+            get_temp,
+            asm,
+        );
+        let s = asm.alloc_node(CILNode::call(get_temp, []));
+        let to_utf8 = string_to_utf8(asm);
+        let buf = asm.alloc_node(CILNode::call(to_utf8, [s]));
+        let buf = asm.cast_ptr(buf, u8_ptr);
+        let ret = asm.alloc_root(CILRoot::Ret(buf));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(temp_name, Box::new(temp_gen));
+
+    // ---- rcl_dotnet_paths_current_exe() -> *mut u8 (Environment.ProcessPath) ----
+    // `ProcessPath` may be null; mirror getenv's null->(u8*)0 path.
+    let exe_name = asm.alloc_string("rcl_dotnet_paths_current_exe");
+    let exe_gen = move |_, asm: &mut Assembly| {
+        let u8_ptr = asm.nptr(Type::Int(Int::U8));
+        let string_class = ClassRef::string(asm);
+        let env = ClassRef::enviroment(asm);
+        let get_path = asm.alloc_string("get_ProcessPath");
+        let get_path = asm.class_ref(env).clone().static_mref(
+            &[],
+            Type::PlatformString,
+            get_path,
+            asm,
+        );
+        let s = asm.alloc_node(CILNode::call(get_path, []));
+        let store_s = asm.alloc_root(CILRoot::StLoc(0, s));
+        // Block 0: if (s == null) goto 1 else goto 2.
+        let s_load = asm.alloc_node(CILNode::LdLoc(0));
+        let null_str = asm.alloc_node(CILNode::Const(Box::new(Const::Null(string_class))));
+        let br_null = asm.alloc_root(CILRoot::Branch(Box::new((
+            1,
+            0,
+            Some(BranchCond::Eq(s_load, null_str)),
+        ))));
+        let goto_marshal = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None))));
+        // Block 1: return (u8*)0.
+        let zero = asm.alloc_node(0_i32);
+        let zero = asm.int_cast(zero, Int::ISize, ExtendKind::ZeroExtend);
+        let null_ptr = asm.cast_ptr(zero, u8_ptr);
+        let ret_null = asm.alloc_root(CILRoot::Ret(null_ptr));
+        // Block 2: return (u8*)StringToCoTaskMemUTF8(s).
+        let to_utf8 = string_to_utf8(asm);
+        let s_load2 = asm.alloc_node(CILNode::LdLoc(0));
+        let buf = asm.alloc_node(CILNode::call(to_utf8, [s_load2]));
+        let buf = asm.cast_ptr(buf, u8_ptr);
+        let ret_buf = asm.alloc_root(CILRoot::Ret(buf));
+        let string_ty = asm.alloc_type(Type::PlatformString);
+        MethodImpl::MethodBody {
+            blocks: vec![
+                BasicBlock::new(vec![store_s, br_null, goto_marshal], 0, None),
+                BasicBlock::new(vec![ret_null], 1, None),
+                BasicBlock::new(vec![ret_buf], 2, None),
+            ],
+            locals: vec![(Some(asm.alloc_string("exe_path")), string_ty)],
+        }
+    };
+    patcher.insert(exe_name, Box::new(exe_gen));
+
+    // ---- rcl_dotnet_paths_chdir(ptr, len) -> i32 (Directory.SetCurrentDirectory) ----
+    // Returns 0 (the BCL method throws on failure; for compile-floor correctness a
+    // plain 0-return after the call is sufficient — std maps any uncaught managed
+    // exception to its own error path; runtime hardening is deferred per scope).
+    let chdir_name = asm.alloc_string("rcl_dotnet_paths_chdir");
+    let chdir_gen = move |_, asm: &mut Assembly| {
+        let path = decode_utf8(asm, 0, 1);
+        let dir = ClassRef::directory(asm);
+        let set_cwd = asm.alloc_string("SetCurrentDirectory");
+        let set_cwd_sig = asm.sig([Type::PlatformString], Type::Void);
+        let set_cwd = asm.alloc_methodref(MethodRef::new(
+            dir,
+            set_cwd,
+            set_cwd_sig,
+            MethodKind::Static,
+            [].into(),
+        ));
+        let call = asm.alloc_root(CILRoot::call(set_cwd, [path]));
+        let zero = asm.alloc_node(0_i32);
+        let ret = asm.alloc_root(CILRoot::Ret(zero));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![call, ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(chdir_name, Box::new(chdir_gen));
 }
 
 // ===========================================================================

@@ -20,6 +20,7 @@
   },
   "os": "dotnet",
   "panic-strategy": "unwind",
+  "target-family": ["unix"],
   "plt-by-default": false,
   "position-independent-executables": true,
   "pre-link-args": {

@@ -24,6 +24,25 @@ pub fn errno() -> i32 {
     unsafe { *__errno_location() }
 }
 
+// PACKAGE A — the `target-family="unix"` flip activates two bare
+// `#[cfg(target_family="unix")]` re-exports in `sys/io/mod.rs`
+// (`pub use error::errno_location;` and `pub use error::set_errno;`). The dotnet
+// `io/error` arm-0 routes `error::*` here, so these two thin wrappers over the
+// already-declared `__errno_location` extern make those re-exports resolve.
+// CLEAN: the shim's real thread-local errno cell (posix.rs `__errno_location`)
+// backs both — no new hooks (LIBC_SHIM_SCOPE / STD_OS_UNIX_PLAN §A.3.C).
+pub fn errno_location() -> *mut i32 {
+    // SAFETY: as `errno()` — the shim returns the address of the thread-local cell.
+    unsafe { __errno_location() }
+}
+
+pub fn set_errno(e: i32) {
+    // SAFETY: writing through the address of the thread-local errno cell is sound.
+    unsafe {
+        *__errno_location() = e;
+    }
+}
+
 pub fn is_interrupted(code: i32) -> bool {
     // EINTR never fires on the .NET PAL (the BCL has no signal-interruptible I/O),
     // so this is always false. Kept for parity with the unix arm.

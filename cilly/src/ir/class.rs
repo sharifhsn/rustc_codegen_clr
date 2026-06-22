@@ -346,6 +346,14 @@ impl ClassRef {
         let asm_name = Some(asm.alloc_string("System.Runtime"));
         asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
     }
+    /// Returns a reference to the static class `System.IO.Path`
+    /// (`GetTempPath`) for the dotnet `paths` PAL arm (PACKAGE A).
+    #[must_use]
+    pub fn path_io(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.IO.Path");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
     /// Returns a reference to the class `System.IO.FileInfo`
     /// (`new FileInfo(string).get_Length`) for sizing files in the dotnet `fs`
     /// PAL arm.

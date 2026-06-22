@@ -114,6 +114,28 @@ impl Thread {
         // underlying `GCHandle`.
         unsafe { rcl_dotnet_thread_join(self.handle) }
     }
+
+    /// DOTNET PAL ARM (Package A/B) — `os::unix::thread::JoinHandleExt`'s
+    /// `as_pthread_t` casts `self.as_inner().id() as RawPthread`. There is no
+    /// `pthread_t` on .NET; surface the opaque managed-thread `GCHandle` `IntPtr`
+    /// as a stable, unique-per-live-thread token (cast to `usize` = `RawPthread`).
+    /// **LEAKY:** it is NOT a real `pthread_t` and must not be passed to any libc
+    /// pthread fn — none exist on this PAL.
+    pub fn id(&self) -> usize {
+        self.handle as usize
+    }
+
+    /// DOTNET PAL ARM (Package A/B) — `JoinHandleExt::into_pthread_t` consumes the
+    /// handle (`self.into_inner().into_id() as RawPthread`). Returns the same
+    /// opaque token; ownership of the join is the caller's concern (same leaky
+    /// semantics as `id`).
+    pub fn into_id(self) -> usize {
+        // `Thread` has no Drop (the managed join handle is only freed by an
+        // explicit `join`), so consuming `self` here simply forgets the handle —
+        // matching the pthread `into_pthread_t` contract where the JoinHandle no
+        // longer owns the thread.
+        self.handle as usize
+    }
 }
 
 pub fn available_parallelism() -> io::Result<NonZero<usize>> {

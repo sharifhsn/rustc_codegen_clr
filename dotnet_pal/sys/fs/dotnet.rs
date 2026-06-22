@@ -71,7 +71,7 @@
 //! would pre-check `Directory.Exists` and return `AlreadyExists`.
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use crate::ffi::{CStr, OsString};
+use crate::ffi::{CStr, OsStr, OsString};
 use crate::fmt;
 use crate::fs::TryLockError;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
@@ -87,6 +87,66 @@ use crate::sys::FromInner;
 // from `common` (its `metadata`-then-NotFound path would route through the
 // io-error `Uncategorized` trap); a dedicated `exists` is defined below.
 pub use crate::sys::fs::common::{copy, remove_dir_all, Dir};
+
+// ===========================================================================
+// PACKAGE A — symbols the `target-family="unix"` flip requires from this arm.
+//
+// The dotnet fs arm-0 is injected ahead of the
+// `any(target_family="unix", target_os="wasi")` cascade arm, so it still wins
+// post-flip. But the flip removes the FREE `with_native_path` fallback
+// (`sys/fs/mod.rs:55` is `cfg(not(any(target_family="unix",...)))` -> DROPS for
+// dotnet), and turns on `os/fd/owned.rs`'s `#[cfg(unix)]` call to
+// `crate::sys::fs::debug_assert_fd_is_open`. Both must now be supplied HERE, and
+// the injected arm widened to re-export them (see feasibility/dev.sh fs arm).
+// ===========================================================================
+
+/// No-CStr `with_native_path` — the unix arm models paths as `CStr`
+/// (`run_path_with_cstr`); the dotnet PAL has no CStr path model (paths are UTF-8
+/// `(ptr,len)` decoded BCL-side), so this is the verbatim copy of the upstream
+/// free fallback body (`sys/fs/mod.rs:55-58`).
+///
+/// **LEAKY (L6):** interior-NUL paths are not rejected at the std boundary; they
+/// surface as a `System.IO` exception rather than `ErrorKind::InvalidInput`.
+#[inline]
+pub fn with_native_path<T>(path: &Path, f: &dyn Fn(&Path) -> io::Result<T>) -> io::Result<T> {
+    f(path)
+}
+
+/// No-op `debug_assert_fd_is_open` — the unix arm verifies an fd is open before
+/// `close` via `libc::fcntl(F_GETFD)` (a UB-check diagnostic only). `os/fd/owned.rs`
+/// calls this under `#[cfg(unix)]` (active post-flip) right before `libc::close`.
+/// The dotnet fd-table already validates fds on close, so this is a sound no-op.
+/// **CLEAN** (protects the EXISTING-green os::fd from breaking under the flip).
+#[allow(unused_variables)]
+pub(crate) fn debug_assert_fd_is_open(fd: crate::os::fd::RawFd) {}
+
+// POSIX ownership / named-pipe / chroot primitives. They have NO BCL equivalent
+// (CoreCLR exposes no portable uid/gid/chroot/mkfifo), so they compile as
+// `Err(Unsupported)` stubs. They MUST EXIST because (a) the unix cascade arm
+// re-exports them (`pub use unix::{chown,fchown,lchown,mkfifo,chroot}`) — the
+// dotnet arm mirrors that re-export so `sys::fs::chown` resolves — and (b) the
+// `os::unix::fs` free fns (`chown`/`fchown`/`lchown`/`chroot`/`mkfifo`) call
+// `sys::fs::*` directly (Package B surface). **IMPOSSIBLE (I3):** synthetic
+// Unsupported; never succeed at runtime. Signatures mirror `sys/fs/unix.rs`.
+pub fn chown(_path: &Path, _uid: u32, _gid: u32) -> io::Result<()> {
+    unsupported()
+}
+
+pub fn fchown(_fd: crate::os::fd::RawFd, _uid: u32, _gid: u32) -> io::Result<()> {
+    unsupported()
+}
+
+pub fn lchown(_path: &Path, _uid: u32, _gid: u32) -> io::Result<()> {
+    unsupported()
+}
+
+pub fn chroot(_dir: &Path) -> io::Result<()> {
+    unsupported()
+}
+
+pub fn mkfifo(_path: &Path, _mode: u32) -> io::Result<()> {
+    unsupported()
+}
 
 // FIXED extern contract — mapped to the .NET BCL by the cilly linker. Do not
 // rename: the linker keys on these exact symbols.
@@ -179,6 +239,22 @@ impl FileType {
         // The BCL abstraction surfaced here has no symlink concept.
         false
     }
+
+    /// DOTNET PAL ARM (Package A/B stub) — `os::unix::fs::FileTypeExt` queries
+    /// `self.as_inner().is(libc::S_IFBLK)` etc. The dotnet `FileType` only carries
+    /// a dir/file flag, so synthesize the `S_IFMT` masked type and compare.
+    /// **LEAKY (L3):** block/char/fifo/socket are never modelled by the BCL, so
+    /// `is(S_IFBLK/S_IFCHR/S_IFIFO/S_IFSOCK)` always answers `false`; only
+    /// `S_IFDIR`/`S_IFREG` can be `true`.
+    pub fn is(&self, mode: i32) -> bool {
+        // `mode` is a `libc::S_IF*` const, typed `c_int` (i32) in the dotnet libc
+        // face — match that here.
+        const S_IFMT: i32 = 0o170000;
+        const S_IFDIR: i32 = 0o040000;
+        const S_IFREG: i32 = 0o100000;
+        let synthetic = if self.is_dir { S_IFDIR } else { S_IFREG };
+        mode & S_IFMT == synthetic
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -194,6 +270,24 @@ impl FilePermissions {
     pub fn set_readonly(&mut self, readonly: bool) {
         // Stored but not persisted to the BCL (no perms model on this arm).
         self.readonly = readonly;
+    }
+
+    /// DOTNET PAL ARM (Package A/B stub) — `os::unix::fs::PermissionsExt::mode`.
+    /// The dotnet `FilePermissions` only carries a readonly bool; synthesize a
+    /// conventional POSIX mode (0o444 read-only, else 0o644). **LEAKY (L2):** the
+    /// real per-class rwx / suid / sgid / sticky bits are not modelled by the BCL.
+    pub fn mode(&self) -> u32 {
+        if self.readonly { 0o444 } else { 0o644 }
+    }
+}
+
+/// DOTNET PAL ARM (Package A/B stub) — `os::unix::fs::PermissionsExt::{set_mode,
+/// from_mode}` build a `FilePermissions` from a raw POSIX mode via
+/// `FromInner::from_inner(mode)`. The dotnet model only honours the read-only
+/// bit, so derive readonly from "no owner-write bit" (`0o200`). **LEAKY (L2).**
+impl FromInner<u32> for FilePermissions {
+    fn from_inner(mode: u32) -> FilePermissions {
+        FilePermissions { readonly: mode & 0o200 == 0 }
     }
 }
 
@@ -277,6 +371,17 @@ impl OpenOptions {
     pub fn create_new(&mut self, create_new: bool) {
         self.create_new = create_new;
     }
+
+    /// DOTNET PAL ARM (Package A/B stub) — `os::unix::fs::OpenOptionsExt::mode`.
+    /// .NET's `FileStream` ctor cannot set a POSIX creation mode, so this is
+    /// stored-and-ignored. **LEAKY (L1):** the `mode` is silently dropped.
+    pub fn mode(&mut self, _mode: u32) {}
+
+    /// DOTNET PAL ARM (Package A/B stub) —
+    /// `os::unix::fs::OpenOptionsExt::custom_flags`. .NET's `FileStream` has no raw
+    /// `O_*` passthrough (`O_NOFOLLOW`/`O_DIRECT`/...), so flags are
+    /// stored-and-ignored. **LEAKY (L1 / I4).**
+    pub fn custom_flags(&mut self, _flags: i32) {}
 
     /// Compute the `(FileMode, FileAccess)` int pair the `FileStream` ctor wants
     /// from the high-level open flags, mapped to .NET enum semantics. Modelled
@@ -421,6 +526,38 @@ impl File {
         crate::io::default_read_buf(|buf| self.read(buf), cursor)
     }
 
+    // =======================================================================
+    // DOTNET PAL ARM (Package A/B stub) — os::unix::fs::FileExt positioned I/O.
+    //
+    // The unix arm backs these with `pread`/`pwrite` (atomic offset-relative I/O
+    // that does NOT move the stream position). .NET's `RandomAccess.{Read,Write}`
+    // is the real equivalent (a clean Package-C upgrade via a new
+    // `rcl_dotnet_fs_read_at`/`_write_at` hook), but it is not wired yet. Rather
+    // than emulate with seek+read (which would corrupt the shared position and is
+    // non-atomic), these are `Err(Unsupported)` compile-stubs. NOT reached by the
+    // pal_fs probe (which uses sequential read/write).
+    // =======================================================================
+
+    pub fn read_at(&self, _buf: &mut [u8], _offset: u64) -> io::Result<usize> {
+        unsupported()
+    }
+
+    pub fn read_buf_at(&self, _cursor: BorrowedCursor<'_, u8>, _offset: u64) -> io::Result<()> {
+        unsupported()
+    }
+
+    pub fn read_vectored_at(&self, _bufs: &mut [IoSliceMut<'_>], _offset: u64) -> io::Result<usize> {
+        unsupported()
+    }
+
+    pub fn write_at(&self, _buf: &[u8], _offset: u64) -> io::Result<usize> {
+        unsupported()
+    }
+
+    pub fn write_vectored_at(&self, _bufs: &[IoSlice<'_>], _offset: u64) -> io::Result<usize> {
+        unsupported()
+    }
+
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -516,6 +653,11 @@ impl DirBuilder {
         // module-doc semantic-gap note).
         rc(unsafe { rcl_dotnet_fs_mkdir(bytes.as_ptr(), bytes.len()) })
     }
+
+    /// DOTNET PAL ARM (Package A/B stub) — `os::unix::fs::DirBuilderExt::mode`.
+    /// .NET's `Directory.CreateDirectory` takes no POSIX creation mode, so this is
+    /// stored-and-ignored (the `DirBuilder` is a ZST). **LEAKY (L1).**
+    pub fn set_mode(&mut self, _mode: u32) {}
 }
 
 /// A snapshot of a directory's entries (a managed `string[]` GCHandle), iterated
@@ -593,6 +735,19 @@ impl DirEntry {
 
     pub fn file_type(&self) -> io::Result<FileType> {
         Ok(stat(&self.path)?.file_type())
+    }
+
+    /// DOTNET PAL ARM (Package A/B stub) — `os::unix::fs::DirEntryExt::ino`. There
+    /// is no inode identity on CoreCLR (**IMPOSSIBLE / I1**), so synthetic `0`.
+    pub fn ino(&self) -> u64 {
+        0
+    }
+
+    /// DOTNET PAL ARM (Package A/B) — `os::unix::fs::DirEntryExt2::file_name_ref`
+    /// borrows the leaf as `&OsStr`. Real (the dotnet DirEntry stores the full
+    /// `PathBuf`); just strip the leaf without an allocation.
+    pub fn file_name_os_str(&self) -> &OsStr {
+        self.path.file_name().unwrap_or_else(|| self.path.as_os_str())
     }
 }
 

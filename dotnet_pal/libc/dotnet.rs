@@ -105,6 +105,60 @@ pub const SO_NOSIGPIPE: c_int = 0x1022;
 pub const IPPROTO_IPV6: c_int = 41;
 pub const IPV6_V6ONLY: c_int = 26;
 
+// PACKAGE A/B — AF_UNIX surface for std::os::unix::net (UnixStream/UnixListener/
+// UnixDatagram) to COMPILE under the `target-family=["unix"]` flip. These consts
+// + `sockaddr_un` satisfy os/unix/net/{addr,stream,listener,datagram}.rs; the
+// genuinely-impossible pieces (abstract namespace, SCM_RIGHTS, ucred) are
+// linux/bsd-cfg'd in os/unix/net and DROP for target_os="dotnet" (never compile).
+// RUNTIME (AddressFamily.Unix / UnixDomainSocketEndPoint) is Package C; for now
+// the dotnet net Socket's AF_UNIX methods are Err(Unsupported) compile-stubs.
+pub const AF_UNIX: c_int = 1;
+pub const SOMAXCONN: c_int = 128;
+pub const SO_RCVTIMEO: c_int = 20;
+pub const SO_SNDTIMEO: c_int = 21;
+pub const MSG_PEEK: c_int = 2;
+pub const MSG_NOSIGNAL: c_int = 0x4000;
+pub const SHUT_RD: c_int = 0;
+pub const SHUT_WR: c_int = 1;
+pub const SHUT_RDWR: c_int = 2;
+
+// PACKAGE A/B — `S_IF*` file-type mask bits (Linux ABI values). os/unix/fs.rs's
+// `FileTypeExt` queries `self.as_inner().is(libc::S_IFBLK)` etc. (and the dotnet
+// `FileType::is(mode)` stub masks against `S_IFMT`). LEAKY (L3): the dotnet BCL
+// models dir-vs-file only, so block/char/fifo/socket all answer `false`.
+pub const S_IFMT: c_int = 0o170000;
+pub const S_IFSOCK: c_int = 0o140000;
+pub const S_IFLNK: c_int = 0o120000;
+pub const S_IFREG: c_int = 0o100000;
+pub const S_IFBLK: c_int = 0o060000;
+pub const S_IFDIR: c_int = 0o040000;
+pub const S_IFCHR: c_int = 0o020000;
+pub const S_IFIFO: c_int = 0o010000;
+
+// PACKAGE A/B — `SIGKILL` for os::unix::process (Child::kill ->
+// `send_process_group_signal(libc::SIGKILL)`). The dotnet `Process` is
+// uninhabited (no real spawn), so the signal is never delivered (I6); the const
+// only needs to EXIST so the re-export/call resolves.
+pub const SIGKILL: c_int = 9;
+
+// PACKAGE A/B — `O_NOFOLLOW` for os::unix::fs::OpenOptionsExt::custom_flags /
+// sys::fs::set_permissions_nofollow. The dotnet FileStream model has no raw O_*
+// passthrough (L1/I4), so `custom_flags` stores-and-ignores; the const only needs
+// to EXIST. (set_permissions_nofollow is separately routed to its unimplemented
+// arm for dotnet by feasibility/dev.sh.)
+pub const O_NOFOLLOW: c_int = 0o400000;
+
+// uintptr_t — os/unix/io/mod.rs references it for RawFd round-tripping.
+pub type uintptr_t = usize;
+
+// sockaddr_un: family@0, then a 108-byte sun_path (Linux ABI). os/unix/net/addr.rs
+// uses `mem::offset_of!(sockaddr_un, sun_path)`, `sun_family`, and `sun_path`.
+#[repr(C)]
+pub struct sockaddr_un {
+    pub sun_family: sa_family_t,
+    pub sun_path: [c_char; 108],
+}
+
 // NOTE: libc is built without the std/derive prelude in this injected `else {}`
 // context, so `#[derive(Copy, Clone)]` does not resolve. libc's own modules use
 // its `s!` macro which expands to MANUAL `impl Copy`/`impl Clone`; we mirror that
@@ -164,7 +218,7 @@ pub struct sockaddr_storage {
 }
 
 dotnet_copy_clone! {
-    in_addr in6_addr sockaddr sockaddr_in sockaddr_in6 sockaddr_storage epoll_event
+    in_addr in6_addr sockaddr sockaddr_in sockaddr_in6 sockaddr_storage epoll_event sockaddr_un
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +289,30 @@ unsafe extern "C" {
         value: *mut c_void,
         len: *mut socklen_t,
     ) -> c_int;
+
+    // PACKAGE A/B — referenced by os/unix/net + os/unix/io for COMPILE. The shim
+    // resolves getsockname/getpeername over the fd-table; recvfrom/sendto/dup2 are
+    // AF_UNIX-runtime stubs (Package C wires real AddressFamily.Unix). dup2 is used
+    // by os/unix/io's RawFd helpers.
+    pub fn getsockname(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int;
+    pub fn getpeername(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int;
+    pub fn recvfrom(
+        fd: c_int,
+        buf: *mut c_void,
+        len: size_t,
+        flags: c_int,
+        addr: *mut sockaddr,
+        addrlen: *mut socklen_t,
+    ) -> ssize_t;
+    pub fn sendto(
+        fd: c_int,
+        buf: *const c_void,
+        len: size_t,
+        flags: c_int,
+        addr: *const sockaddr,
+        addrlen: socklen_t,
+    ) -> ssize_t;
+    pub fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
 
     // epoll — bodies in posix_epoll.rs (per-fd Socket.Poll sweep).
     pub fn epoll_create1(flags: c_int) -> c_int;

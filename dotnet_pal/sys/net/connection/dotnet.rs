@@ -196,6 +196,111 @@ impl Socket {
         // GCHandle field.
         unsafe { rcl_fdtable_handle(self.as_raw_fd()) }
     }
+
+    // =======================================================================
+    // PACKAGE A/B — AF_UNIX compile-stubs.
+    //
+    // Under the `target-family=["unix"]` flip, `std::os::unix::net`
+    // (UnixStream/UnixListener/UnixDatagram) is `Socket(crate::sys::net::Socket)`
+    // and calls these inherent methods on it. The genuinely-impossible AF_UNIX
+    // pieces (abstract namespace, SCM_RIGHTS, ucred) are linux/bsd-cfg'd in
+    // os/unix/net and DROP for dotnet, so only this stable subset must EXIST.
+    //
+    // .NET *does* model unix-domain sockets (AddressFamily.Unix +
+    // UnixDomainSocketEndPoint), so these are NOT impossible — they are
+    // deliberately deferred to Package C (runtime). For Package A/B they are
+    // Err(Unsupported)/no-op compile-stubs so std + os::unix COMPILE. They are
+    // additive (new method names) and do NOT touch the working TcpStream/
+    // TcpListener/UdpSocket data-plane methods, so the net PAL is unregressed.
+    // =======================================================================
+
+    /// `Socket::new(domain, ty)` — create an AF_UNIX socket. STUB (Package C
+    /// wires `new System.Net.Sockets.Socket(AddressFamily.Unix, ...)`).
+    pub fn new(_domain: i32, _ty: i32) -> io::Result<Socket> {
+        unsupported()
+    }
+
+    /// `Socket::new_pair(domain, ty)` — `socketpair(2)`. STUB (Package C emulates
+    /// via a bound-listener+connect pair — there is no kernel socketpair on CLR).
+    pub fn new_pair(_domain: i32, _ty: i32) -> io::Result<(Socket, Socket)> {
+        unsupported()
+    }
+
+    pub fn accept(
+        &self,
+        _storage: *mut crate::ffi::c_void,
+        _len: *mut u32,
+    ) -> io::Result<Socket> {
+        unsupported()
+    }
+
+    pub fn duplicate(&self) -> io::Result<Socket> {
+        unsupported()
+    }
+
+    /// `set_timeout(dur, kind)` where `kind` is `SO_RCVTIMEO`/`SO_SNDTIMEO`. STUB.
+    pub fn set_timeout(&self, _dur: Option<Duration>, _kind: i32) -> io::Result<()> {
+        unsupported()
+    }
+
+    pub fn timeout(&self, _kind: i32) -> io::Result<Option<Duration>> {
+        Ok(None)
+    }
+
+    /// SO_MARK (Linux-only socket option). STUB (no managed equivalent).
+    pub fn set_mark(&self, _mark: u32) -> io::Result<()> {
+        unsupported()
+    }
+
+    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
+        Ok(None)
+    }
+
+    pub fn shutdown(&self, _how: Shutdown) -> io::Result<()> {
+        unsupported()
+    }
+
+    pub fn set_nonblocking(&self, _nonblocking: bool) -> io::Result<()> {
+        // No-op for the AF_UNIX stub (the fd is never live at runtime here).
+        Ok(())
+    }
+
+    pub fn peek(&self, _buf: &mut [u8]) -> io::Result<usize> {
+        unsupported()
+    }
+
+    pub fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
+        unsupported()
+    }
+
+    pub fn read_buf(&self, _cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
+        unsupported()
+    }
+
+    pub fn read_vectored(&self, _bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+        unsupported()
+    }
+
+    pub fn is_read_vectored(&self) -> bool {
+        false
+    }
+
+    pub fn write(&self, _buf: &[u8]) -> io::Result<usize> {
+        unsupported()
+    }
+
+    pub fn write_vectored(&self, _bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        unsupported()
+    }
+
+    pub fn is_write_vectored(&self) -> bool {
+        false
+    }
+
+    /// `send_with_flags(buf, MSG_NOSIGNAL)` from os::unix::net::UnixStream::write. STUB.
+    pub fn send_with_flags(&self, _buf: &[u8], _flags: i32) -> io::Result<usize> {
+        unsupported()
+    }
 }
 
 impl AsInner<FileDesc> for Socket {

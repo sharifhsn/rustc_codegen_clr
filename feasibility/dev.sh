@@ -252,10 +252,16 @@ if [ -f "$PAL/thread_local/dotnet.rs" ]; then
   # resolve to. dotnet is modelled on `no_threads` (single managed thread), whose
   # guard `enable` is a leak-everything no-op.
   inject_arm_anchor thread_local/mod.rs 'pub(crate) mod guard {' '        pub(crate) use super::dotnet::enable;'
-  # No `key` arm: nothing in std imports from `sys::thread_local::key` for
-  # os=dotnet (the storage layer re-exports from `dotnet` directly, not from
-  # os.rs), so the upstream `_ => {}` empty key arm compiles as-is. The PAL's
-  # `dotnet::key` module stays available for when real .NET threading lands.
+  # Key arm: WITH families unset the `_ => {}` empty key arm caught os=dotnet and
+  # nothing imports from `sys::thread_local::key` (storage re-exports from `dotnet`
+  # directly). Under the `target-family=["unix"]` flip, the key cascade's FIRST arm
+  # — `all(not(apple), not(wasm), target_family="unix")` — now matches dotnet and
+  # pulls `key/unix.rs` (libc::pthread_key_t/pthread_key_create/...). dotnet is the
+  # no_threads (single managed thread) model — it needs NO pthread TLS keys — so
+  # inject an EMPTY `target_os="dotnet" => {}` arm-0 (anchored on `pub(crate) mod
+  # key {`, the 4th cfg_select!) so dotnet wins with the same empty body the `_`
+  # arm gave pre-flip. CLEAN: no key consumers on this PAL.
+  inject_arm_anchor thread_local/mod.rs 'pub(crate) mod key {' '        /* dotnet: no_threads model, no pthread TLS keys */'
 fi
 [ -f "$PAL/io/error/dotnet.rs" ]     && inject_arm io/error/mod.rs     'mod dotnet; pub use dotnet::*;'
 # time/mod.rs uses the `mod X; use X as imp;` cascade shape (it re-exports
@@ -276,7 +282,33 @@ fi
 # FileType, OpenOptions, ReadDir}`. The dotnet arm backs std::fs with System.IO
 # (FileStream/File/Directory/FileInfo) via the rcl_dotnet_fs_* hooks (see
 # cilly/src/ir/builtins/dotnet.rs). fs cascade is block 1 (default nth).
-[ -f "$PAL/fs/dotnet.rs" ]           && inject_arm fs/mod.rs           'mod dotnet; use dotnet as imp;'
+# PACKAGE A — the fs arm body is WIDENED for the target-family=unix flip. With
+# families OFF, the dotnet arm only needs `mod dotnet; use dotnet as imp;` (the
+# FREE `with_native_path` fallback at fs/mod.rs:55 supplies the path adaptor, and
+# os/fd/owned.rs's debug_assert_fd_is_open call is `#[cfg(unix)]`-gated OFF). Post
+# flip BOTH of those drop/activate, so the arm must also import the dotnet
+# `with_native_path` (shadowing the now-dropped free fn) and re-export the unix
+# cascade's `chown/fchown/lchown/mkfifo`, `chroot`, and (crate) `debug_assert_fd_is_open`
+# — all defined in dotnet_pal/sys/fs/dotnet.rs (Package A stubs). These extra
+# `use`/`pub use` lines are HARMLESS with families unset (the symbols simply
+# exist and the re-exports are dead) and LOAD-BEARING under the flip.
+[ -f "$PAL/fs/dotnet.rs" ]           && inject_arm fs/mod.rs           'mod dotnet; use dotnet as imp; #[cfg(target_family = "unix")] use dotnet::with_native_path; #[cfg(target_family = "unix")] pub use dotnet::{chown, fchown, lchown, mkfifo, chroot}; #[cfg(target_family = "unix")] pub(crate) use dotnet::debug_assert_fd_is_open;'
+# PACKAGE A — sys/fs/mod.rs `set_permissions_nofollow`: the real impl is gated
+# `#[cfg(all(unix, not(target_os="vxworks")))]` (active under the flip) and pulls
+# `os::unix::fs::OpenOptionsExt::custom_flags` + `libc::O_NOFOLLOW` — neither of
+# which the dotnet FileStream model can honour (L1/I4). The dotnet PAL has no raw
+# O_* passthrough, so route dotnet to the `unimplemented!` arm instead: exclude
+# dotnet from the real-impl gate and add it to the stub gate. Idempotent (guarded
+# on the dotnet string). LEAKY-adjacent: set_permissions_nofollow is Unsupported
+# on dotnet (matches I4 — raw open flags can't be expressed by FileStream).
+FSMOD="$SRC/fs/mod.rs"
+if [ -f "$FSMOD" ] && ! grep -q 'not(target_os = "dotnet")' "$FSMOD"; then
+  echo "==> routing set_permissions_nofollow to the unimplemented arm for os=dotnet"
+  # real-impl gate: all(unix, not(vxworks)) -> all(unix, not(vxworks), not(dotnet))
+  sed -i 's/#\[cfg(all(unix, not(target_os = "vxworks")))\]/#[cfg(all(unix, not(target_os = "vxworks"), not(target_os = "dotnet")))]/' "$FSMOD"
+  # stub gate: any(not(unix), vxworks) -> any(not(unix), vxworks, dotnet)
+  sed -i 's/#\[cfg(any(not(unix), target_os = "vxworks"))\]/#[cfg(any(not(unix), target_os = "vxworks", target_os = "dotnet"))]/' "$FSMOD"
+fi
 # net is a TWO-subdir module: net/mod.rs just re-exports `connection::*` and
 # `hostname::hostname`. The IMPL cascade lives in net/CONNECTION/mod.rs (a
 # `mod X; pub use X::*` cfg_select! whose `_` arm is `mod unsupported; pub use
@@ -294,6 +326,14 @@ fi
 # arm that already catches os=dotnet (returns Err(UNSUPPORTED_PLATFORM)), and
 # `hostname()` is not exercised by the net probe.
 [ -f "$PAL/net/connection/dotnet.rs" ] && inject_arm net/connection/mod.rs 'mod dotnet; pub use dotnet::*;'
+# PACKAGE A — sys/paths/mod.rs: the `target-family="unix"` flip switches the
+# cascade onto its `target_family="unix"` arm (`mod unix; use unix as imp;`)
+# which pulls libc getcwd/chdir/getpwuid_r/getuid/sysconf + apple/bsd current_exe
+# sysctl — none mapped on dotnet (pre-flip dotnet landed in `_`/unsupported). The
+# dotnet arm-0 routes to dotnet_pal/sys/paths/dotnet.rs (REAL getcwd/current_exe/
+# chdir/temp_dir via 4 new BCL hooks + pure byte split/join + HOME-only home_dir).
+# Same `mod X; use X as imp;` shape as fs/time. paths/mod.rs cascade is block 1.
+[ -f "$PAL/paths/dotnet.rs" ]        && inject_arm paths/mod.rs        'mod dotnet; use dotnet as imp;'
 # ===========================================================================
 # CAP-1 LIBC-SHIM FOUNDATION ARMS (LIBC_SHIM_SCOPE §4.2). These six dotnet std
 # PAL cascade arms are injected as the FIRST cfg_select! arm of each module, so
@@ -336,6 +376,19 @@ fi
 # nightly adds another cfg_select! to io/mod.rs, switch to inject_arm_anchor on
 # 'mod is_terminal {'.
 [ -f "$PAL/io/is_terminal/dotnet.rs" ] && inject_arm io/mod.rs 'mod dotnet; pub use dotnet::*;' 1
+# PACKAGE A — sys/exit.rs `exit(code)`: the `target-family="unix"` flip activates
+# the `any(target_family="unix", target_os="wasi") => libc::exit(code)` arm of the
+# in-fn cfg_select! (pre-flip dotnet hit the `_ => abort()` arm). `libc::exit` is
+# NOT in the dotnet libc PAL face (close/read/socket/epoll only), so the unix arm
+# would be E0425 under the flip. Inject a `target_os="dotnet"` arm-0 routing to
+# `crate::intrinsics::abort()` (identical to the existing `_` fallback), which
+# closes the would-be host-libc::exit leak with ZERO new symbols. exit.rs has TWO
+# cfg_select!s: block 1 is the file-level `unique_thread_exit` cascade, block 2 is
+# the in-fn one inside `pub fn exit`; we target block 2 (nth=2). LEAKY (L9):
+# abort-not-clean-exit (exit code is dropped); an `rcl_dotnet_exit` ->
+# Environment.Exit(code) hook is the honest upgrade. The doc-only marker file
+# dotnet_pal/sys/exit_marker keeps this idempotent/guarded like the others.
+inject_arm exit.rs 'let _ = code; crate::intrinsics::abort()' 2
 # os/mod.rs gate widen: `pub mod fd` is gated `any(unix, hermit, trusty, wasi,
 # motor, doc)` — os=dotnet is NOT in that list, so std::os::fd (OwnedFd/RawFd +
 # os/fd/net.rs's Socket onion) is compiled OUT for dotnet today. Add dotnet to the
@@ -407,6 +460,61 @@ for OFD in "$SRC/../os/fd/owned.rs" "$SRC/../os/fd/raw.rs"; do
     ' "$OFD" > "$OFD.__t" && mv "$OFD.__t" "$OFD"
   fi
 done
+# PACKAGE A — os/unix/io/mod.rs StdioExt `null_fd()`. The above deferral keeps
+# `From<fs::File> for OwnedFd` OFF for dotnet (the dotnet sys::fs::File is a
+# managed FileStream GCHandle, NOT fd-backed — Cap-2). But the flip activates
+# `os::unix::io` whose `null_fd()` does `Ok(null_dev.into())` on a `crate::fs::File`,
+# requiring exactly that `From` — E0277 under the flip. `StdioExt` (the
+# stdio-fd-swap UNSTABLE feature) is genuinely unsupported on a non-fd-backed fs
+# PAL (you cannot hand a `/dev/null` File's "fd" to `dup2`), so neutralise
+# `null_fd()` to `Err(UNSUPPORTED_PLATFORM)` for the dotnet rust-src (this rust-src
+# is only ever built for target_os=dotnet). MUST-STUB (the matching
+# `replace_stdio_fd` already has a `_ => UNSUPPORTED_PLATFORM` arm dotnet falls
+# into, and `dup2` exists in the libc face). Idempotent (guarded on the marker).
+IOMOD="$SRC/../os/unix/io/mod.rs"
+if [ -f "$IOMOD" ] && ! grep -q 'dotnet: StdioExt null_fd unsupported' "$IOMOD"; then
+  echo "==> neutralising os::unix::io StdioExt null_fd() for dotnet (fs not fd-backed)"
+  perl -0pi -e 's/let null_dev = crate::fs::OpenOptions::new\(\)\.read\(true\)\.write\(true\)\.open\("\/dev\/null"\)\?;\s*\n\s*Ok\(null_dev\.into\(\)\)/\/\/ dotnet: StdioExt null_fd unsupported (fs::File not fd-backed)\n    Err(io::Error::UNSUPPORTED_PLATFORM)/s' "$IOMOD"
+fi
+# ===========================================================================
+# PACKAGE A/B — the os::unix `platform` keystone. The `target-family=["unix"]`
+# flip activates `os/mod.rs:84 pub mod unix;` globally, which makes
+# `os/unix/mod.rs`'s `mod platform { ... }` per-target list resolve `platform::raw`
+# (os/unix/raw.rs pthread_t/blkcnt_t/... aliases) and `platform::fs::MetadataExt`
+# (the cross-unix st_* delegate). That list has NO dotnet arm by default, so it is
+# empty for dotnet and those refs fail (E0432 "could not find raw/fs in platform").
+# Mirror the in-repo os/dotnet tree (dotnet_pal/os/dotnet/{mod,raw,fs}.rs, modelled
+# on os/darwin) into rust-src, then (1) declare `pub mod dotnet` in os/mod.rs and
+# (2) add the dotnet line to the `mod platform` list in os/unix/mod.rs. Both are
+# `#[cfg]` lists, NOT cfg_select!, so they need line-inserts (not inject_arm).
+# os=dotnet-only; idempotent (guarded on the dotnet string).
+OSDIR="$SRC/../os"
+OSPAL=/work/dotnet_pal/os
+if [ -d "$OSPAL/dotnet" ] && [ -d "$OSDIR" ]; then
+  echo "==> mirroring os/dotnet platform tree + wiring os::unix platform list"
+  mkdir -p "$OSDIR/dotnet"
+  ( cd "$OSPAL/dotnet" && find . -type f ) | while read -r f; do
+    mkdir -p "$OSDIR/dotnet/$(dirname "$f")"
+    cp "$OSPAL/dotnet/$f" "$OSDIR/dotnet/$f"
+  done
+  # (1) os/mod.rs: declare `pub mod dotnet` (model on the darwin/linux decls).
+  if ! grep -q 'pub mod dotnet;' "$OSDIR/mod.rs"; then
+    # Insert right before the first `#[cfg(target_os = "aix")]` per-target block.
+    awk '!ins && /#\[cfg\(target_os = "aix"\)\]/ {
+           print "#[cfg(target_os = \"dotnet\")]";
+           print "pub mod dotnet;";
+           ins=1
+         } { print }' "$OSDIR/mod.rs" > "$OSDIR/mod.rs.__t" && mv "$OSDIR/mod.rs.__t" "$OSDIR/mod.rs"
+  fi
+  # (2) os/unix/mod.rs: add the dotnet arm to the `mod platform { ... }` list.
+  if ! grep -q 'crate::os::dotnet' "$OSDIR/unix/mod.rs"; then
+    awk '!ins && /#\[cfg\(target_os = "aix"\)\]/ {
+           print "    #[cfg(target_os = \"dotnet\")]";
+           print "    pub use crate::os::dotnet::*;";
+           ins=1
+         } { print }' "$OSDIR/unix/mod.rs" > "$OSDIR/unix/mod.rs.__t" && mv "$OSDIR/unix/mod.rs.__t" "$OSDIR/unix/mod.rs"
+  fi
+fi
 # DOTNET PAL ARM (mio): expose the socket's opaque GCHandle on the PUBLIC
 # `std::net::{TcpStream,TcpListener,UdpSocket}` wrappers so the vendored mio
 # dotnet arm can key its readiness Selector by it. The handle lives on the inner
@@ -545,6 +653,29 @@ inject_libc() { # $1 = libc src dir
   [ -f "$d/lib.rs" ] || return 0
   [ -f "$LIBC_PAL/dotnet.rs" ] || return 0
   cp "$LIBC_PAL/dotnet.rs" "$d/dotnet.rs"
+  # PACKAGE A — under the `target-family=["unix"]` flip, `cfg(unix)` is now TRUE
+  # for os=dotnet, so libc 0.2 stops falling into its empty `else{}` and instead
+  # selects its REAL unix module tree (lib.rs `else if #[cfg(unix)]` -> `mod unix`,
+  # plus new/common/posix's `unistd`/`pthread`). That collides with the appended
+  # dotnet arm: both glob-export `c_int`/`c_long`/... (263× E0659) and `unistd`
+  # re-exports a module not wired for this config (1× E0432). The dotnet arm is
+  # the SINGLE intended libc face (LIBC_SHIM_SCOPE / cap2-outcome), so SUPPRESS
+  # libc's own unix/posix arms for os=dotnet by excluding dotnet from their cfgs;
+  # libc then falls back to the empty `else{}` and the dotnet arm is sole. These
+  # three sed patches are the make-or-break AMBER fix and mirror the existing
+  # `not(target_os="dotnet")` exclusions in os/fd. Idempotent (the patterns no
+  # longer match once rewritten). os=dotnet-only effect (no other target's libc
+  # cfg matches the BARE `unix`/`target_family="unix"` predicates we narrow here).
+  # 1) lib.rs top-level: `else if #[cfg(unix)]` (the unix module selector).
+  sed -i 's/} else if #\[cfg(unix)\] {/} else if #[cfg(all(unix, not(target_os = "dotnet")))] {/' "$d/lib.rs"
+  # 2) new/mod.rs per-family headers: `cfg(all(target_family="unix", not(qurt)))`.
+  if [ -f "$d/new/mod.rs" ]; then
+    sed -i 's/if #\[cfg(all(target_family = "unix", not(target_os = "qurt")))\] {/if #[cfg(all(target_family = "unix", not(target_os = "qurt"), not(target_os = "dotnet")))] {/' "$d/new/mod.rs"
+  fi
+  # 3) new/common/mod.rs: `#[cfg(target_family = "unix")] pub(crate) mod posix;`.
+  if [ -f "$d/new/common/mod.rs" ]; then
+    sed -i 's/#\[cfg(target_family = "unix")\]/#[cfg(all(target_family = "unix", not(target_os = "dotnet")))]/' "$d/new/common/mod.rs"
+  fi
   grep -qF 'mod dotnet;' "$d/lib.rs" && return 0
   # Declare the dotnet module at the libc crate ROOT (outside the big arch/os
   # cfg_if!), cfg-gated on os=dotnet. Appending after the cfg_if avoids any
@@ -613,7 +744,7 @@ cargo -Zjson-target-spec fetch >/dev/null 2>&1 || true
 for d in $(find /root/.cargo/registry/src -path '*libc-0.2*/src/lib.rs' 2>/dev/null); do
   inject_libc "$(dirname "$d")"
 done
-cargo -Zjson-target-spec build --release 2>&1 | grep -vE 'discirminant' | grep -E '^error|error\[|could not compile|warning: unused|Compiling (std|core|alloc) |Finished' | head -60
+cargo -Zjson-target-spec build --release 2>&1 | tee /work/feasibility/_lastbuild.log | grep -vE 'discirminant' | grep -E '^error|error\[|could not compile|warning: unused|Compiling (std|core|alloc) |Finished' | head -60
 rc=${PIPESTATUS[0]}
 echo "== build exit: $rc =="
 out="target/x86_64-unknown-dotnet/release/$DEV_CRATE"
