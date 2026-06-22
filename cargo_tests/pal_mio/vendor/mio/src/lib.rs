@@ -77,6 +77,11 @@ pub use waker::Waker;
 pub mod unix {
     //! Unix only extensions.
 
+    // DOTNET PAL ARM: mio's pipe is `IoSource<std::fs::File>`, and dotnet std
+    // fs::File is not fd-backed (deferred). The `sys::unix::pipe` module is gated
+    // off for dotnet (see sys/unix/mod.rs), so this public re-export is too. The
+    // `SourceFd` re-export below stays (plain RawFd, no File).
+    #[cfg(not(target_os = "dotnet"))]
     pub mod pipe {
         //! Unix pipe.
         //!

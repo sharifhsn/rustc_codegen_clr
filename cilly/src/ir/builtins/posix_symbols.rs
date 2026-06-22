@@ -1005,15 +1005,24 @@ fn insert_fcntl(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let generator = move |_, asm: &mut Assembly| {
         const F_GETFL: i32 = 3;
         const F_SETFL: i32 = 4;
+        const F_DUPFD: i32 = 0;
+        const F_DUPFD_CLOEXEC: i32 = 1030;
         const O_NONBLOCK: i32 = 2048;
         let void_ptr = asm.nptr(Type::Void);
-        // block 0: if cmd==F_GETFL goto 1; if cmd==F_SETFL goto 2; else goto 3.
+        // block 0: if cmd==F_GETFL goto 1; if cmd==F_SETFL goto 2;
+        //          if cmd==F_DUPFD || cmd==F_DUPFD_CLOEXEC goto 4 (dup); else goto 3.
         let cmd0 = asm.alloc_node(CILNode::LdArg(1));
         let getfl_c = asm.alloc_node(Const::I32(F_GETFL));
         let br_get = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, Some(BranchCond::Eq(cmd0, getfl_c))))));
         let cmd1 = asm.alloc_node(CILNode::LdArg(1));
         let setfl_c = asm.alloc_node(Const::I32(F_SETFL));
         let br_set = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, Some(BranchCond::Eq(cmd1, setfl_c))))));
+        let cmd2 = asm.alloc_node(CILNode::LdArg(1));
+        let dupfd_c = asm.alloc_node(Const::I32(F_DUPFD));
+        let br_dup = asm.alloc_root(CILRoot::Branch(Box::new((4, 0, Some(BranchCond::Eq(cmd2, dupfd_c))))));
+        let cmd3 = asm.alloc_node(CILNode::LdArg(1));
+        let dupcl_c = asm.alloc_node(Const::I32(F_DUPFD_CLOEXEC));
+        let br_dupcl = asm.alloc_root(CILRoot::Branch(Box::new((4, 0, Some(BranchCond::Eq(cmd3, dupcl_c))))));
         let goto_zero = asm.alloc_root(CILRoot::Branch(Box::new((3, 0, None))));
 
         // block 1: ret rcl_fdtable_get_flags(fd).
@@ -1052,12 +1061,30 @@ fn insert_fcntl(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let zero3 = asm.alloc_node(Const::I32(0));
         let ret_z = asm.alloc_root(CILRoot::Ret(zero3));
 
+        // block 4 (F_DUPFD / F_DUPFD_CLOEXEC): register a NEW fd-table entry that
+        // SHARES the original fd's handle + kind, and return the new fd. Managed
+        // handles are reference types, so both fds reference the SAME underlying
+        // object (Socket / epoll interest-dict) — exactly the dup semantics needed
+        // for tokio's `Selector::try_clone()` (OwnedFd::try_clone -> fcntl
+        // F_DUPFD_CLOEXEC): the cloned epoll fd must see the same interest dict, or
+        // epoll_ctl on the clone hits a null dict handle. (The minimum-fd `arg`
+        // floor is ignored — the fd-table allocator just hands out the next id;
+        // tokio/std do not rely on the exact value.)
+        let fd_dup = asm.alloc_node(CILNode::LdArg(0));
+        let dup_handle = call_fdtable_handle(asm, fd_dup);
+        let fd_dup2 = asm.alloc_node(CILNode::LdArg(0));
+        let dup_kind = call_fdtable_kind(asm, fd_dup2);
+        let new_fd = call_fdtable_insert_dyn(asm, dup_handle, dup_kind, 0);
+        let ret_dup = asm.alloc_root(CILRoot::Ret(new_fd));
+
+        let _ = void_ptr;
         MethodImpl::MethodBody {
             blocks: vec![
-                BasicBlock::new(vec![br_get, br_set, goto_zero], 0, None),
+                BasicBlock::new(vec![br_get, br_set, br_dup, br_dupcl, goto_zero], 0, None),
                 BasicBlock::new(vec![ret_flags], 1, None),
                 BasicBlock::new(vec![pop, do_setf, ret0], 2, None),
                 BasicBlock::new(vec![ret_z], 3, None),
+                BasicBlock::new(vec![ret_dup], 4, None),
             ],
             locals: vec![],
         }

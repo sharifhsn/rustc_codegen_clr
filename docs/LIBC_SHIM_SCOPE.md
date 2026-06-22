@@ -109,7 +109,29 @@ hook → errno map.
 | `socket()`→fd (unbound), `SO_REUSEADDR`, `getsockopt`/`setsockopt` (RCVBUF/SNDBUF/KEEPALIVE/IP_TTL/IPV6_V6ONLY/...) | **LEAKY** | existing hooks act *atomically* (connect creates+connects) → need a **new** `socket_create` + split into create/bind-only/connect-on-existing/listen; each sockopt needs a `(level,optname)`→`SocketOption{Level,Name}` switch | partial: `build_socket()` already factored |
 | `sockaddr`↔`(family,ip,port)` | **LEAKY** | hooks take a *decomposed* ABI (std decomposes `SocketAddr` itself); shim must parse opaque `sockaddr*` (`sa_family`, `sin_port` **network order** → `ntohs`/`htons`, `sin_addr`), hardcoding Linux layout | **new** helper |
 | `send`/`recv` flags (`MSG_PEEK`/`DONTWAIT`/`WAITALL`/`NOSIGNAL`), `sendmsg`/`recvmsg` (data path) | **LEAKY** | `SocketFlags.Peek`; toggle `Blocking`; loop; no-op; vectored→per-iovec loop | `net_send`/`net_recv` |
-| `SO_ERROR`, `recvmsg`/`sendmsg` **ancillary** (`cmsghdr`, `SCM_RIGHTS`), `socketpair(AF_UNIX)`, `EPOLLET`/`EPOLLEXCLUSIVE`, raw/packet sockets | **IMPOSSIBLE** | no pending-error model; no managed cmsg/fd-passing; no anonymous-pair primitive; the Poll loop is inherently **level-triggered** sampling and **O(registered)** per sweep (a perf wall at thousands of fds) | — |
+| `SO_ERROR`, `recvmsg`/`sendmsg` **ancillary** (`cmsghdr`, `SCM_RIGHTS`), `socketpair(AF_UNIX)`, raw/packet sockets | **IMPOSSIBLE** | no pending-error model; no managed cmsg/fd-passing; no anonymous-pair primitive | — |
+
+> **STATUS — I/O-driven tokio LANDED on the dotnet PAL (`pal_tokio_net`: TcpListener
+> bind/accept + TcpStream connect/read/write loopback echo → "ping-tokio").** Four
+> non-obvious runtime fixes beyond the libc decls, all in the readiness cluster:
+> 1. **`eventfd` = self-readable loopback UDP socket** (`rcl_dotnet_eventfd` BCL hook +
+>    `insert_eventfd` registers it `FD_KIND_SOCKET`). The mio `Waker` is now an
+>    `OwnedFd` over this fd (the dotnet `waker/dotnet.rs` arm), read/writing the 8-byte
+>    counter via `libc::{read,write}` — the stock `File`-backed eventfd waker still
+>    can't be used (fs::File is not fd-backed; Option-B follow-up).
+> 2. **`fcntl(F_DUPFD_CLOEXEC)`** now creates a real fd-table entry **sharing** the
+>    original's handle (tokio's `Selector::try_clone()` dups the epoll fd; the clone
+>    must see the same interest dict or `epoll_ctl` hits a null dict → was a crash).
+> 3. **`epoll_wait` polls BOTH `SelectRead` and `SelectWrite`** and ORs them — mio
+>    registers a stream with the full `EPOLLIN|EPOLLOUT` mask, and the old single-mode
+>    derivation mis-polled the listener for *write*-readiness → `accept().await` hung.
+> 4. **`EPOLLET` edge-trigger gate** (`RclEpollReg.last_ready`): report an
+>    edge-triggered fd only on a rising readiness edge — else the never-drained
+>    edge-triggered waker re-fires every sweep and busy-spins the reactor. The head-fd
+>    blocking Poll is also capped (`POLL_CAP_MICROS`, no infinite single-fd block).
+> tokio's `net::unix` (AF_UNIX + `unix::pipe`) is gated off for dotnet in the vendored
+> tokio (`cfg_net_unix!` excludes `target_os="dotnet"`) — pipe is `IoSource<fs::File>`
+> (the same fs::File wall); re-enabling it is the Option-B follow-up.
 
 ### 2.3 Filesystem + metadata
 **~55–60% covered** (~14 of ~24 entry points reuse shipped `rcl_dotnet_fs_*`; proven E2E by

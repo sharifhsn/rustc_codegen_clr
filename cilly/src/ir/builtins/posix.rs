@@ -54,6 +54,11 @@ const FD_KIND_STD: i32 = 0;
 const FD_KIND_FILE: i32 = 1;
 const FD_KIND_SOCKET: i32 = 2;
 const FD_KIND_EPOLL: i32 = 3;
+// FD_KIND_EVENTFD (4) is RETIRED: eventfd() now returns a real FD_KIND_SOCKET fd
+// backed by a self-readable loopback UDP socket (posix_epoll.rs::insert_eventfd),
+// so read/write/poll/close all kind-dispatch through the net path. Kept reserved
+// (not reused) so the tag space stays stable across the docs.
+#[allow(dead_code)]
 const FD_KIND_EVENTFD: i32 = 4;
 
 // POSIX errno values (Linux x86_64 numbering — the shim hardcodes the Linux ABI).
@@ -240,6 +245,16 @@ fn epoll_reg_token_field(asm: &mut Assembly) -> Interned<FieldDesc> {
     let name = asm.alloc_string("token");
     asm.alloc_field(FieldDesc::new(cls, name, Type::Int(Int::I64)))
 }
+/// `last_ready: i32` — edge-trigger (EPOLLET) state. epoll_wait reports an
+/// EPOLLET-flagged fd ONLY on a not-ready -> ready transition, and updates this
+/// each sweep. WITHOUT this, a perpetually-readable EPOLLET fd (e.g. the tokio
+/// eventfd waker, which is never drained because edge-triggered) re-fires every
+/// sweep and busy-spins the reactor, starving the real I/O epoll.
+fn epoll_reg_last_ready_field(asm: &mut Assembly) -> Interned<FieldDesc> {
+    let cls = epoll_reg_class(asm);
+    let name = asm.alloc_string("last_ready");
+    asm.alloc_field(FieldDesc::new(cls, name, Type::Int(Int::I32)))
+}
 
 /// Define `RclEpollReg` (fields events/token + a ctor). `Access::Extern` survives
 /// DCE (the documented `UnmanagedThreadStart` workaround, as for RclFdEntry).
@@ -248,6 +263,7 @@ fn define_epoll_reg(asm: &mut Assembly) {
     let object = ClassRef::object(asm);
     let events = asm.alloc_string("events");
     let token = asm.alloc_string("token");
+    let last_ready = asm.alloc_string("last_ready");
     let cls = asm
         .class_def(ClassDef::new(
             name,
@@ -257,6 +273,7 @@ fn define_epoll_reg(asm: &mut Assembly) {
             vec![
                 (Type::Int(Int::I32), events, None),
                 (Type::Int(Int::I64), token, None),
+                (Type::Int(Int::I32), last_ready, None),
             ],
             vec![],
             Access::Extern,
@@ -272,8 +289,13 @@ fn define_epoll_reg(asm: &mut Assembly) {
     let ld_token = asm.alloc_node(CILNode::LdArg(2));
     let events_field = asm.alloc_field(FieldDesc::new(*cls, events, Type::Int(Int::I32)));
     let token_field = asm.alloc_field(FieldDesc::new(*cls, token, Type::Int(Int::I64)));
+    let last_ready_field = asm.alloc_field(FieldDesc::new(*cls, last_ready, Type::Int(Int::I32)));
     let set_events = asm.alloc_root(CILRoot::SetField(Box::new((events_field, this, ld_events))));
     let set_token = asm.alloc_root(CILRoot::SetField(Box::new((token_field, this, ld_token))));
+    // last_ready starts 0 (not-ready) so the first readiness is an edge.
+    let this2 = asm.alloc_node(CILNode::LdArg(0));
+    let zero_lr = asm.alloc_node(Const::I32(0));
+    let set_lr = asm.alloc_root(CILRoot::SetField(Box::new((last_ready_field, this2, zero_lr))));
     let ret = asm.alloc_root(CILRoot::VoidRet);
     let ctor_sig = asm.sig(
         [Type::ClassRef(*cls), Type::Int(Int::I32), Type::Int(Int::I64)],
@@ -286,7 +308,7 @@ fn define_epoll_reg(asm: &mut Assembly) {
         ctor_sig,
         MethodKind::Constructor,
         MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![set_events, set_token, ret], 0, None)],
+            blocks: vec![BasicBlock::new(vec![set_events, set_token, set_lr, ret], 0, None)],
             locals: vec![],
         },
         vec![None, Some(events), Some(token)],
@@ -608,6 +630,24 @@ fn call_fdtable_insert(
     );
     let handle_isize = asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::ISize)));
     let kind = asm.alloc_node(Const::I32(kind));
+    let flags = asm.alloc_node(Const::I32(flags));
+    asm.alloc_node(CILNode::call(m, [handle_isize, kind, flags]))
+}
+/// Like `call_fdtable_insert` but with a DYNAMIC `kind` node (the original fd's
+/// kind, for dup). `handle` is a `void*`, `kind` an i32 node.
+fn call_fdtable_insert_dyn(
+    asm: &mut Assembly,
+    handle: Interned<CILNode>,
+    kind: Interned<CILNode>,
+    flags: i32,
+) -> Interned<CILNode> {
+    let m = main_static(
+        asm,
+        "rcl_fdtable_insert",
+        &[Type::Int(Int::ISize), Type::Int(Int::I32), Type::Int(Int::I32)],
+        Type::Int(Int::I32),
+    );
+    let handle_isize = asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::ISize)));
     let flags = asm.alloc_node(Const::I32(flags));
     asm.alloc_node(CILNode::call(m, [handle_isize, kind, flags]))
 }

@@ -470,6 +470,7 @@ fn insert_dotnet_write(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     patcher.insert(name, Box::new(generator));
 }
 
+
 /// `rcl_dotnet_random_fill(ptr: *mut u8, len: usize)`
 ///   => `RandomNumberGenerator.Fill(new Span<byte>((void*)ptr, (int)len))`.
 ///
@@ -2717,6 +2718,7 @@ fn insert_dotnet_net(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     insert_dotnet_net_nodelay(asm, patcher);
     insert_dotnet_net_close(asm, patcher);
     insert_dotnet_socket_poll(asm, patcher);
+    insert_dotnet_eventfd(asm, patcher);
 }
 
 /// `rcl_dotnet_net_tcp_connect(family, ip_ptr, ip_len, port) -> *mut u8`
@@ -3389,6 +3391,115 @@ fn insert_dotnet_socket_poll(asm: &mut Assembly, patcher: &mut MissingMethodPatc
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![ret], 0, None)],
             locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_eventfd() -> *mut u8` — the mio Waker primitive, realised as a
+/// SELF-READABLE loopback UDP socket (NOT a kernel eventfd, which CoreCLR has no
+/// equivalent of). Returns the `GCHandle` of a `Socket` that is connected to its
+/// OWN bound endpoint, so:
+///   * `write(fd, &counter)` -> `rcl_dotnet_net_send` -> `s.Send` (datagram to
+///     self) -> the socket's own receive buffer fills -> it becomes READABLE;
+///   * `epoll_wait`'s per-fd `Socket.Poll(SelectRead)` sweep then fires;
+///   * `read(fd, buf)` -> `rcl_dotnet_net_recv` -> `s.Receive` drains it.
+/// The 8-byte eventfd counter degrades gracefully to a readiness EDGE: mio's
+/// waker only cares that the read end becomes pollable, never the exact value.
+/// The fd is registered FD_KIND_SOCKET by `insert_eventfd`, so read/write/close/
+/// poll all kind-dispatch through the existing net path with NO new plumbing.
+///
+/// Body (single block):
+///   `var s = new Socket(InterNetwork, Dgram, Udp);
+///    s.Bind(new IPEndPoint(0x0100007F /*127.0.0.1*/, 0));
+///    s.Connect((EndPoint)s.LocalEndPoint);   // self-connect (UDP)
+///    s.Blocking = false;                      // EFD_NONBLOCK
+///    return GCHandle(s);`
+/// InterNetwork(2)/Dgram(2)/Udp(17) are int-backed enum values passed straight
+/// in (the ctor signature still names the enum types for BCL resolution).
+fn insert_dotnet_eventfd(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_eventfd");
+    let generator = move |_, asm: &mut Assembly| {
+        let socket = ClassRef::socket(asm);
+        let address_family = ClassRef::address_family(asm);
+        let socket_type = Type::ClassRef(ClassRef::socket_type(asm));
+        let protocol_type = Type::ClassRef(ClassRef::protocol_type(asm));
+        let ip_endpoint = ClassRef::ip_endpoint(asm);
+        let endpoint_base = ClassRef::endpoint(asm);
+
+        // var s = new Socket(InterNetwork=2, Dgram=2, Udp=17); local 0.
+        let af = asm.alloc_node(2_i32); // AddressFamily.InterNetwork
+        let st = asm.alloc_node(2_i32); // SocketType.Dgram
+        let proto = asm.alloc_node(NET_PROTO_UDP);
+        let sock_ctor = asm.class_ref(socket).clone().ctor(
+            &[Type::ClassRef(address_family), socket_type, protocol_type],
+            asm,
+        );
+        let sock = asm.alloc_node(CILNode::call(sock_ctor, [af, st, proto]));
+        let store_sock = asm.alloc_root(CILRoot::StLoc(0, sock));
+
+        // s.Bind(new IPEndPoint(0x0100007F /*127.0.0.1*/, 0)).
+        let loopback = asm.alloc_node(0x0100_007F_i64); // 127.0.0.1 (IPAddress long)
+        let zero_port = asm.alloc_node(0_i32);
+        let ep_ctor = asm.class_ref(ip_endpoint).clone().ctor(
+            &[Type::Int(Int::I64), Type::Int(Int::I32)],
+            asm,
+        );
+        let bind_ep = asm.alloc_node(CILNode::call(ep_ctor, [loopback, zero_port]));
+        let bind_ep = endpoint_as_base(asm, bind_ep);
+        let bind_name = asm.alloc_string("Bind");
+        let bind = asm.class_ref(socket).clone().instance(
+            &[Type::ClassRef(endpoint_base)],
+            Type::Void,
+            bind_name,
+            asm,
+        );
+        let s_bind = asm.alloc_node(CILNode::LdLoc(0));
+        let do_bind = asm.alloc_root(CILRoot::call(bind, [s_bind, bind_ep]));
+
+        // ep = s.LocalEndPoint (the kernel-assigned port); self-connect to it.
+        let get_local_name = asm.alloc_string("get_LocalEndPoint");
+        let get_local = asm.class_ref(socket).clone().instance(
+            &[],
+            Type::ClassRef(endpoint_base),
+            get_local_name,
+            asm,
+        );
+        let s_get = asm.alloc_node(CILNode::LdLoc(0));
+        let local_ep = asm.alloc_node(CILNode::call(get_local, [s_get]));
+        // s.Connect(localEp) — UDP connect just fixes the default peer = self.
+        let connect_name = asm.alloc_string("Connect");
+        let connect = asm.class_ref(socket).clone().instance(
+            &[Type::ClassRef(endpoint_base)],
+            Type::Void,
+            connect_name,
+            asm,
+        );
+        let s_conn = asm.alloc_node(CILNode::LdLoc(0));
+        let do_connect = asm.alloc_root(CILRoot::call(connect, [s_conn, local_ep]));
+
+        // s.Blocking = false (EFD_NONBLOCK).
+        let set_blocking_name = asm.alloc_string("set_Blocking");
+        let set_blocking = asm.class_ref(socket).clone().instance(
+            &[Type::Bool],
+            Type::Void,
+            set_blocking_name,
+            asm,
+        );
+        let s_blk = asm.alloc_node(CILNode::LdLoc(0));
+        let false_v = asm.alloc_node(false);
+        let do_blocking = asm.alloc_root(CILRoot::call(set_blocking, [s_blk, false_v]));
+
+        let handle = socket_local_to_handle(asm, 0);
+        let ret = asm.alloc_root(CILRoot::Ret(handle));
+        let sock_ty = asm.alloc_type(Type::ClassRef(socket));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(
+                vec![store_sock, do_bind, do_connect, do_blocking, ret],
+                0,
+                None,
+            )],
+            locals: vec![(Some(asm.alloc_string("socket")), sock_ty)],
         }
     };
     patcher.insert(name, Box::new(generator));

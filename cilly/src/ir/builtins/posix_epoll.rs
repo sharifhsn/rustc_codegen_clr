@@ -187,11 +187,17 @@ fn insert_epoll_ctl(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
 /// `epoll_wait(epfd, *events, maxevents, timeout_ms) -> i32` — enumerate the
 /// instance's interest dict; per registered fd `Socket.Poll` its socket; pack
 /// every ready fd's `epoll_event` (events@0, token@4) into the caller's array;
-/// return the count. The HEAD fd absorbs the real timeout (Poll blocks up to
-/// `micros`); the rest probe with micros=0. A single sweep is sufficient for the
-/// mio loop (mio itself re-polls). timeout_ms<0 → infinite on the head fd.
+/// return the count. The HEAD fd absorbs the timeout (the READ poll blocks up to
+/// `min(timeout, POLL_CAP_MICROS)`); the rest probe with micros=0. timeout_ms<0
+/// caps at POLL_CAP_MICROS too (NOT infinite — a single socket's infinite Poll
+/// would starve the multi-fd set / deadlock the tokio reactor). mio re-polls.
 ///
-/// SelectMode per fd: (events & EPOLLOUT)!=0 → 1(Write) else 0(Read).
+/// Per fd we poll BOTH `SelectRead` AND `SelectWrite` and OR the results: mio
+/// registers a fd with its full interest mask (a stream is `EPOLLIN|EPOLLOUT`),
+/// so a single-mode poll mis-classified accept-readiness as write-readiness and
+/// hung. EPOLLET-flagged fds are edge-gated (report only on a rising readiness
+/// edge) via `RclEpollReg.last_ready` — else a never-drained edge-triggered fd
+/// (the tokio eventfd waker) re-fires every sweep and busy-spins the reactor.
 fn insert_epoll_wait(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("epoll_wait");
     let generator = move |_, asm: &mut Assembly| {
@@ -320,19 +326,19 @@ fn insert_epoll_wait(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let fd_l = asm.alloc_node(CILNode::LdLoc(L_FD));
         let h = call_fdtable_handle(asm, fd_l);
         let store_h = asm.alloc_root(CILRoot::StLoc(L_H, h));
-        // mode = (reg.events & EPOLLOUT)!=0 ? 1(Write) : 0(Read).
-        let events_field = epoll_reg_events_field(asm);
-        let reg_l = asm.alloc_node(CILNode::LdLoc(L_REG));
-        let ev = asm.alloc_node(CILNode::LdField { addr: reg_l, field: events_field });
-        let out_mask = asm.alloc_node(Const::I32(EPOLLOUT));
-        let masked = asm.alloc_node(CILNode::BinOp(ev, out_mask, BinOp::And));
-        let zero_m = asm.alloc_node(Const::I32(0));
-        // mode = 1 - (masked == 0)  (CIL `not` is bitwise; logical-negate by arith).
-        let is_zero = asm.alloc_node(CILNode::BinOp(masked, zero_m, BinOp::Eq));
-        let is_zero = asm.int_cast(is_zero, Int::I32, ExtendKind::ZeroExtend);
-        let one_m = asm.alloc_node(Const::I32(1));
-        let mode = asm.alloc_node(CILNode::BinOp(one_m, is_zero, BinOp::Sub));
-        let store_mode = asm.alloc_root(CILRoot::StLoc(L_MODE, mode));
+        // NOTE (the tokio accept bug): mio registers a fd with the FULL interest
+        // mask it wants, e.g. a listener for accept is `EPOLLIN|EPOLLOUT|EPOLLRDHUP`
+        // (events=0x80002005). The OLD code derived a SINGLE poll mode = Write if
+        // EPOLLOUT set — so it polled the LISTENER for SelectWrite (never true for
+        // accept) and never reported the pending connection -> accept().await hung.
+        // FIX: poll BOTH SelectRead (if EPOLLIN) and SelectWrite (if EPOLLOUT) and
+        // OR the results (block 7 reads, block 12 writes). `store_mode` is gone;
+        // L_MODE is repurposed as the edge-trigger `prev` scratch in block 11.
+        let store_mode = {
+            // placeholder no-op root to keep block-2 shape (init L_MODE = 0).
+            let z = asm.alloc_node(Const::I32(0));
+            asm.alloc_root(CILRoot::StLoc(L_MODE, z))
+        };
         // micros: head fd (first==1) absorbs timeout; others probe with 0.
         //   if first==0 -> micros=0 (goto 6 directly).
         let first_l = asm.alloc_node(CILNode::LdLoc(L_FIRST));
@@ -344,14 +350,21 @@ fn insert_epoll_wait(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         ))));
         let goto_first_timeout = asm.alloc_root(CILRoot::Branch(Box::new((3, 0, None))));
 
-        // ---- block 3: first fd — compute micros from timeout, clear `first` ----
-        // micros = timeout<0 ? -1 : timeout*1000; first = 0; goto 7 (poll).
-        let timeout = asm.alloc_node(CILNode::LdArg(3));
-        let thousand = asm.alloc_node(Const::I32(1000));
-        let micros = asm.alloc_node(CILNode::BinOp(timeout, thousand, BinOp::Mul));
-        let store_micros = asm.alloc_root(CILRoot::StLoc(L_MICROS, micros));
+        // ---- block 3: first fd — compute a BOUNDED blocking micros, clear `first` ----
+        // CRITICAL (tokio deadlock fix): `Socket.Poll(h, -1, mode)` blocks FOREVER
+        // on a SINGLE socket. With a multi-fd interest set (tokio: waker + listener
+        // + connections) the HEAD dict entry is arbitrary, so blocking infinitely on
+        // it deadlocks the reactor when readiness is on a DIFFERENT fd. Instead the
+        // head fd blocks for at most a small CAP (POLL_CAP_MICROS); every sweep then
+        // returns within the cap (count possibly 0) and mio/tokio simply re-call
+        // epoll_wait — bounded poll latency, NO deadlock, NO busy-spin (the cap is
+        // the block, not a spin). The requested timeout is honoured up to the cap:
+        //   micros = (timeout<0) ? CAP : min(timeout*1000, CAP).
+        // (A 0 timeout still maps to 0 via the min -> a pure non-blocking sweep.)
+        const POLL_CAP_MICROS: i32 = 20_000; // 20ms head-fd block ceiling.
         let zero_set_first = asm.alloc_node(Const::I32(0));
         let clear_first = asm.alloc_root(CILRoot::StLoc(L_FIRST, zero_set_first));
+        // micros = timeout < 0 ? CAP : timeout*1000  (block 3); then clamp in block 4.
         let timeout2 = asm.alloc_node(CILNode::LdArg(3));
         let zero_t = asm.alloc_node(Const::I32(0));
         let br_neg = asm.alloc_root(CILRoot::Branch(Box::new((
@@ -359,19 +372,41 @@ fn insert_epoll_wait(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
             0,
             Some(BranchCond::Lt(timeout2, zero_t, crate::ir::cilroot::CmpKind::Signed)),
         ))));
-        let goto_poll_first = asm.alloc_root(CILRoot::Branch(Box::new((7, 0, None))));
+        // (timeout >= 0): micros = timeout*1000; goto 9 (clamp to CAP).
+        let timeout = asm.alloc_node(CILNode::LdArg(3));
+        let thousand = asm.alloc_node(Const::I32(1000));
+        let micros = asm.alloc_node(CILNode::BinOp(timeout, thousand, BinOp::Mul));
+        let store_micros = asm.alloc_root(CILRoot::StLoc(L_MICROS, micros));
+        let goto_clamp = asm.alloc_root(CILRoot::Branch(Box::new((9, 0, None))));
 
-        // ---- block 4: micros = -1 (infinite); goto 7 ----
-        let neg1 = asm.alloc_node(Const::I32(-1));
-        let store_neg = asm.alloc_root(CILRoot::StLoc(L_MICROS, neg1));
+        // ---- block 4: timeout<0 -> micros = CAP; goto 7 (already at the ceiling) ----
+        let cap1 = asm.alloc_node(Const::I32(POLL_CAP_MICROS));
+        let store_neg = asm.alloc_root(CILRoot::StLoc(L_MICROS, cap1));
         let goto_poll2 = asm.alloc_root(CILRoot::Branch(Box::new((7, 0, None))));
+
+        // ---- block 9: clamp micros to CAP (micros = min(micros, CAP)); goto 7 ----
+        let micros_c = asm.alloc_node(CILNode::LdLoc(L_MICROS));
+        let cap2 = asm.alloc_node(Const::I32(POLL_CAP_MICROS));
+        let over = asm.alloc_root(CILRoot::Branch(Box::new((
+            10,
+            0,
+            Some(BranchCond::Gt(micros_c, cap2, crate::ir::cilroot::CmpKind::Signed)),
+        ))));
+        let goto_poll_clamped = asm.alloc_root(CILRoot::Branch(Box::new((7, 0, None))));
+        // ---- block 10: micros = CAP; goto 7 ----
+        let cap3 = asm.alloc_node(Const::I32(POLL_CAP_MICROS));
+        let store_cap = asm.alloc_root(CILRoot::StLoc(L_MICROS, cap3));
+        let goto_poll_capped = asm.alloc_root(CILRoot::Branch(Box::new((7, 0, None))));
 
         // ---- block 6: non-first fd — micros = 0; goto 7 ----
         let zero_micros = asm.alloc_node(Const::I32(0));
         let store_zero_micros = asm.alloc_root(CILRoot::StLoc(L_MICROS, zero_micros));
         let goto_poll3 = asm.alloc_root(CILRoot::Branch(Box::new((7, 0, None))));
 
-        // ---- block 7: ready = poll(h, micros, mode); if 0 -> loop (1) else 8 ----
+        // ---- block 7: rd = poll(h, micros, SelectRead=0); L_READY = rd; goto 12 ----
+        // We poll BOTH read and write and OR them (mio registers streams with the
+        // full IN|OUT mask). The READ poll absorbs the head-fd blocking `micros`;
+        // the WRITE poll (block 12) is always non-blocking.
         let poll = dotnet_mref(
             asm,
             "rcl_dotnet_socket_poll",
@@ -380,9 +415,42 @@ fn insert_epoll_wait(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         );
         let hh = asm.alloc_node(CILNode::LdLoc(L_H));
         let micros_l = asm.alloc_node(CILNode::LdLoc(L_MICROS));
-        let mode_l = asm.alloc_node(CILNode::LdLoc(L_MODE));
-        let ready = asm.alloc_node(CILNode::call(poll, [hh, micros_l, mode_l]));
-        let store_ready = asm.alloc_root(CILRoot::StLoc(L_READY, ready));
+        let sel_read = asm.alloc_node(Const::I32(0)); // SelectMode.SelectRead
+        let rd = asm.alloc_node(CILNode::call(poll, [hh, micros_l, sel_read]));
+        let store_ready = asm.alloc_root(CILRoot::StLoc(L_READY, rd));
+        let goto_write_poll = asm.alloc_root(CILRoot::Branch(Box::new((12, 0, None))));
+
+        // ---- block 12: wr = poll(h, 0, SelectWrite=1); L_READY |= wr; goto 11 ----
+        let poll2 = dotnet_mref(
+            asm,
+            "rcl_dotnet_socket_poll",
+            &[void_ptr, Type::Int(Int::I32), Type::Int(Int::I32)],
+            Type::Int(Int::I32),
+        );
+        let hh2 = asm.alloc_node(CILNode::LdLoc(L_H));
+        let zero_micros_w = asm.alloc_node(Const::I32(0));
+        let sel_write = asm.alloc_node(Const::I32(1)); // SelectMode.SelectWrite
+        let wr = asm.alloc_node(CILNode::call(poll2, [hh2, zero_micros_w, sel_write]));
+        let prev_ready = asm.alloc_node(CILNode::LdLoc(L_READY));
+        let combined = asm.alloc_node(CILNode::BinOp(prev_ready, wr, BinOp::Or));
+        let store_combined = asm.alloc_root(CILRoot::StLoc(L_READY, combined));
+        let goto_edge = asm.alloc_root(CILRoot::Branch(Box::new((11, 0, None))));
+
+        // ---- block 11: edge-trigger gate ----
+        // prev = reg.last_ready; reg.last_ready = ready (always update).
+        // if ready==0 -> loop(1). if (reg.events & EPOLLET)==0 -> report(8) [level].
+        // else (EPOLLET): prev==0 -> report(8) [rising edge] else loop(1) [suppress].
+        const EPOLLET: i32 = 0x8000_0000_u32 as i32;
+        let last_ready_field = epoll_reg_last_ready_field(asm);
+        let reg_e = asm.alloc_node(CILNode::LdLoc(L_REG));
+        let prev = asm.alloc_node(CILNode::LdField { addr: reg_e, field: last_ready_field });
+        // store prev in a scratch local (reuse L_MODE — no longer needed past poll).
+        let store_prev = asm.alloc_root(CILRoot::StLoc(L_MODE, prev));
+        // reg.last_ready = ready.
+        let reg_e2 = asm.alloc_node(CILNode::LdLoc(L_REG));
+        let ready_for_store = asm.alloc_node(CILNode::LdLoc(L_READY));
+        let upd_lr = asm.alloc_root(CILRoot::SetField(Box::new((last_ready_field, reg_e2, ready_for_store))));
+        // if ready==0 -> loop(1).
         let ready_l = asm.alloc_node(CILNode::LdLoc(L_READY));
         let zero_r = asm.alloc_node(Const::I32(0));
         let br_notready = asm.alloc_root(CILRoot::Branch(Box::new((
@@ -390,7 +458,27 @@ fn insert_epoll_wait(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
             0,
             Some(BranchCond::Eq(ready_l, zero_r)),
         ))));
-        let goto_write = asm.alloc_root(CILRoot::Branch(Box::new((8, 0, None))));
+        // et = reg.events & EPOLLET; if et==0 -> report(8) [level].
+        let events_field_e = epoll_reg_events_field(asm);
+        let reg_e3 = asm.alloc_node(CILNode::LdLoc(L_REG));
+        let ev_e = asm.alloc_node(CILNode::LdField { addr: reg_e3, field: events_field_e });
+        let et_mask = asm.alloc_node(Const::I32(EPOLLET));
+        let et = asm.alloc_node(CILNode::BinOp(ev_e, et_mask, BinOp::And));
+        let zero_et = asm.alloc_node(Const::I32(0));
+        let br_level = asm.alloc_root(CILRoot::Branch(Box::new((
+            8,
+            0,
+            Some(BranchCond::Eq(et, zero_et)),
+        ))));
+        // EPOLLET: if prev==0 -> report(8) [edge] else loop(1) [suppress].
+        let prev_l = asm.alloc_node(CILNode::LdLoc(L_MODE));
+        let zero_p = asm.alloc_node(Const::I32(0));
+        let br_edge = asm.alloc_root(CILRoot::Branch(Box::new((
+            8,
+            0,
+            Some(BranchCond::Eq(prev_l, zero_p)),
+        ))));
+        let goto_suppress = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
 
         // ---- block 8: ready — write events[count] (events@0, token@4); count++; loop ----
         // base = (i8*)events + count*12.
@@ -442,7 +530,7 @@ fn insert_epoll_wait(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let count_ret = asm.alloc_node(CILNode::LdLoc(L_COUNT));
         let ret = asm.alloc_root(CILRoot::Ret(count_ret));
 
-        let _ = EPOLLIN;
+        let _ = (EPOLLIN, EPOLLOUT);
         let entry_cls = fd_entry_class(asm);
         let entry_ty = asm.alloc_type(Type::ClassRef(entry_cls));
         let dict_ty = asm.alloc_type(Type::ClassRef(dict_cls));
@@ -468,16 +556,24 @@ fn insert_epoll_wait(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
                     2,
                     None,
                 ),
-                BasicBlock::new(vec![store_micros, clear_first, br_neg, goto_poll_first], 3, None),
+                BasicBlock::new(vec![clear_first, br_neg, store_micros, goto_clamp], 3, None),
                 BasicBlock::new(vec![store_neg, goto_poll2], 4, None),
                 BasicBlock::new(vec![ret], 5, None),
                 BasicBlock::new(vec![store_zero_micros, goto_poll3], 6, None),
-                BasicBlock::new(vec![store_ready, br_notready, goto_write], 7, None),
+                BasicBlock::new(vec![store_ready, goto_write_poll], 7, None),
                 BasicBlock::new(
                     vec![store_base, st_events, st_token, store_inc, br_full, goto_loop2],
                     8,
                     None,
                 ),
+                BasicBlock::new(vec![over, goto_poll_clamped], 9, None),
+                BasicBlock::new(vec![store_cap, goto_poll_capped], 10, None),
+                BasicBlock::new(
+                    vec![store_prev, upd_lr, br_notready, br_level, br_edge, goto_suppress],
+                    11,
+                    None,
+                ),
+                BasicBlock::new(vec![store_combined, goto_edge], 12, None),
             ],
             locals: vec![
                 (Some(asm.alloc_string("entry")), entry_ty),
@@ -498,19 +594,34 @@ fn insert_epoll_wait(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     patcher.insert(name, Box::new(generator));
 }
 
-/// `eventfd(initval, flags) -> i32` — the mio Waker primitive. The MUST-LAND
-/// `pal_mio` never fires the Waker (single managed thread, no cross-thread wake),
-/// so a placeholder EVENTFD fd (handle 0) that registers + is never ready is
-/// sufficient: mio constructs the Waker lazily only on `Waker::new`, which
-/// pal_mio does not call. A self-connected loopback socket eventfd is the
-/// tokio-net upgrade (LIBC_SHIM_SCOPE §2.2).
+/// `eventfd(initval, flags) -> i32` — the mio Waker primitive (tokio's I/O driver
+/// UNCONDITIONALLY constructs one). Realised as a self-readable loopback UDP
+/// socket: `rcl_dotnet_eventfd()` (cilly/src/ir/builtins/dotnet.rs) builds a
+/// `Socket` connected to its OWN bound `127.0.0.1:port`, registered here as a
+/// real `FD_KIND_SOCKET` fd. Because the returned fd is an ordinary SOCKET fd,
+/// read/write/close/epoll_wait ALREADY kind-dispatch correctly through the net
+/// path — NO new plumbing:
+///   * `write(fd, &1u64)` -> `rcl_dotnet_net_send` -> datagram to self -> the
+///     socket becomes READABLE;
+///   * `epoll_wait`'s per-fd `Socket.Poll(SelectRead)` sweep fires;
+///   * `read(fd, &mut [0u8;8])` -> `rcl_dotnet_net_recv` drains it.
+/// The 8-byte eventfd counter degrades to a readiness EDGE — mio's waker only
+/// reads readiness, never the exact count (LIBC_SHIM_SCOPE §2.2). `initval`/
+/// `flags` are ignored (the socket is created non-blocking == EFD_NONBLOCK).
+///
+/// This SUPERSEDES the Cap-1 placeholder (a null-handle EVENTFD entry that was
+/// never ready, sufficient only because `pal_mio` never fired a Waker). `pal_mio`
+/// now also exercises this via its real OwnedFd-backed waker arm.
 fn insert_eventfd(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("eventfd");
     let generator = move |_, asm: &mut Assembly| {
         let void_ptr = asm.nptr(Type::Void);
-        let null = asm.alloc_node(Const::ISize(0));
-        let null = asm.cast_ptr(null, void_ptr);
-        let fd = call_fdtable_insert(asm, null, FD_KIND_EVENTFD, 0);
+        // handle = rcl_dotnet_eventfd()  -> the self-readable UDP Socket's GCHandle.
+        let make = dotnet_mref(asm, "rcl_dotnet_eventfd", &[], void_ptr);
+        let handle = asm.alloc_node(CILNode::call(make, []));
+        // Register it as a SOCKET fd so read/write/poll/close dispatch via the net
+        // path (rcl_dotnet_net_{send,recv,close} + Socket.Poll).
+        let fd = call_fdtable_insert(asm, handle, FD_KIND_SOCKET, 0);
         let ret = asm.alloc_root(CILRoot::Ret(fd));
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![ret], 0, None)],

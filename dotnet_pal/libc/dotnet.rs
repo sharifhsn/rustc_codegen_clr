@@ -105,6 +105,95 @@ pub const SO_NOSIGPIPE: c_int = 0x1022;
 pub const IPPROTO_IPV6: c_int = 41;
 pub const IPV6_V6ONLY: c_int = 26;
 
+// ---------------------------------------------------------------------------
+// socket2 0.6.4 surface (tokio enables socket2 with features=["all"]). socket2's
+// `src/sys/unix.rs` is selected under cfg(unix) (the global target-family flip),
+// but target_os="dotnet" matches none of its named-OS const lists, so EVERY const
+// it references must come from here. Linux x86_64 ABI values (the POSIX shim
+// hardcodes Linux numbering). MOST are setsockopt option ints reached only via
+// `SockRef` (set_nodelay/set_linger/quickack/...), which are OFF the TCP-echo hot
+// path — they must EXIST so the dep type-checks; the shim no-ops the ones it does
+// not honour (insert_setsockopt). Bodies are needed only for symbols socket2
+// actually CALLS on the echo path (none beyond the already-bodied socket/bind/
+// listen/connect/accept/read/write/setsockopt/getsockopt).
+pub const AF_UNSPEC: c_int = 0;
+pub const SOCK_RAW: c_int = 3;
+pub const SOCK_SEQPACKET: c_int = 5;
+
+pub const IPPROTO_IP: c_int = 0;
+pub const IPPROTO_ICMP: c_int = 1;
+pub const IPPROTO_TCP: c_int = 6;
+pub const IPPROTO_UDP: c_int = 17;
+pub const IPPROTO_ICMPV6: c_int = 58;
+
+pub const SOL_IP: c_int = 0;
+pub const SOL_IPV6: c_int = 41;
+
+pub const SO_TYPE: c_int = 3;
+pub const SO_BROADCAST: c_int = 6;
+pub const SO_SNDBUF: c_int = 7;
+pub const SO_RCVBUF: c_int = 8;
+pub const SO_KEEPALIVE: c_int = 9;
+pub const SO_OOBINLINE: c_int = 10;
+pub const SO_LINGER: c_int = 13;
+
+pub const TCP_NODELAY: c_int = 1;
+pub const TCP_KEEPIDLE: c_int = 4;
+pub const TCP_KEEPINTVL: c_int = 5;
+pub const TCP_KEEPCNT: c_int = 6;
+
+pub const IP_TOS: c_int = 1;
+pub const IP_TTL: c_int = 2;
+pub const IP_HDRINCL: c_int = 3;
+pub const IP_RECVTOS: c_int = 13;
+pub const IP_MULTICAST_IF: c_int = 32;
+pub const IP_MULTICAST_TTL: c_int = 33;
+pub const IP_MULTICAST_LOOP: c_int = 34;
+pub const IP_ADD_MEMBERSHIP: c_int = 35;
+pub const IP_DROP_MEMBERSHIP: c_int = 36;
+pub const IP_ADD_SOURCE_MEMBERSHIP: c_int = 39;
+pub const IP_DROP_SOURCE_MEMBERSHIP: c_int = 40;
+
+pub const IPV6_UNICAST_HOPS: c_int = 16;
+pub const IPV6_MULTICAST_IF: c_int = 17;
+pub const IPV6_MULTICAST_HOPS: c_int = 18;
+pub const IPV6_MULTICAST_LOOP: c_int = 19;
+pub const IPV6_ADD_MEMBERSHIP: c_int = 20;
+pub const IPV6_DROP_MEMBERSHIP: c_int = 21;
+pub const IPV6_RECVHOPLIMIT: c_int = 51;
+pub const IPV6_RECVTCLASS: c_int = 66;
+
+pub const MSG_OOB: c_int = 1;
+pub const MSG_EOR: c_int = 0x80;
+pub const MSG_TRUNC: c_int = 0x20;
+
+// Extra socket-type / fcntl / sockopt consts socket2 references on the dotnet
+// build (Linux x86_64). All DECLARE-ONLY: reached via SockRef option setters /
+// SockType helpers the TCP-echo path never exercises.
+pub const SOCK_RDM: c_int = 4;
+pub const F_GETFD: c_int = 1;
+pub const TCP_MAXSEG: c_int = 2;
+pub const SO_REUSEPORT: c_int = 15;
+
+pub const POLLIN: c_short = 0x1;
+pub const POLLOUT: c_short = 0x4;
+pub const POLLERR: c_short = 0x8;
+pub const POLLHUP: c_short = 0x10;
+
+// eventfd flags (the mio Waker primitive). EFD_NONBLOCK is load-bearing for the
+// tokio reactor's waker (the read end must not block the epoll sweep).
+pub const EFD_CLOEXEC: c_int = 0o2000000;
+pub const EFD_NONBLOCK: c_int = 0o4000;
+
+// `nfds_t` for poll(2). socket2 references the type; the shim never calls poll.
+pub type nfds_t = c_ulong;
+
+// time types for socket2's SO_RCVTIMEO/SO_SNDTIMEO `timeval` round-trip (DECLARE-
+// ONLY — tokio's echo never sets a socket timeout). Linux x86_64: time_t/suseconds_t
+// are i64; `timeval` is {tv_sec: time_t, tv_usec: suseconds_t}.
+pub type time_t = i64;
+pub type suseconds_t = i64;
+
 // PACKAGE A/B — AF_UNIX surface for std::os::unix::net (UnixStream/UnixListener/
 // UnixDatagram) to COMPILE under the `target-family=["unix"]` flip. These consts
 // + `sockaddr_un` satisfy os/unix/net/{addr,stream,listener,datagram}.rs; the
@@ -217,8 +306,79 @@ pub struct sockaddr_storage {
     __ss_pad2: [u8; 112],
 }
 
+// ---------------------------------------------------------------------------
+// socket2 0.6.4 struct surface (Linux x86_64 layout). All DECLARE-ONLY for the
+// TCP-echo path: socket2 references them via SockRef option setters / multicast
+// joins that tokio's loopback echo never exercises. They only need correct layout
+// so socket2's `mem::size_of`/field writes type-check; the shim never reads them.
+#[repr(C)]
+pub struct linger {
+    pub l_onoff: c_int,
+    pub l_linger: c_int,
+}
+
+#[repr(C)]
+pub struct ip_mreq {
+    pub imr_multiaddr: in_addr,
+    pub imr_interface: in_addr,
+}
+
+#[repr(C)]
+pub struct ip_mreq_source {
+    pub imr_multiaddr: in_addr,
+    pub imr_interface: in_addr,
+    pub imr_sourceaddr: in_addr,
+}
+
+#[repr(C)]
+pub struct ipv6_mreq {
+    pub ipv6mr_multiaddr: in6_addr,
+    pub ipv6mr_interface: c_uint,
+}
+
+// ip_mreqn — socket2's interface-by-index multicast join (Linux-only struct).
+// DECLARE-ONLY: the dotnet echo path never joins a multicast group.
+#[repr(C)]
+pub struct ip_mreqn {
+    pub imr_multiaddr: in_addr,
+    pub imr_address: in_addr,
+    pub imr_ifindex: c_int,
+}
+
+// timeval — socket2's SO_RCVTIMEO/SO_SNDTIMEO duration round-trip. DECLARE-ONLY.
+#[repr(C)]
+pub struct timeval {
+    pub tv_sec: time_t,
+    pub tv_usec: suseconds_t,
+}
+
+#[repr(C)]
+pub struct pollfd {
+    pub fd: c_int,
+    pub events: c_short,
+    pub revents: c_short,
+}
+
+#[repr(C)]
+pub struct iovec {
+    pub iov_base: *mut c_void,
+    pub iov_len: size_t,
+}
+
+#[repr(C)]
+pub struct msghdr {
+    pub msg_name: *mut c_void,
+    pub msg_namelen: socklen_t,
+    pub msg_iov: *mut iovec,
+    pub msg_iovlen: size_t,
+    pub msg_control: *mut c_void,
+    pub msg_controllen: size_t,
+    pub msg_flags: c_int,
+}
+
 dotnet_copy_clone! {
     in_addr in6_addr sockaddr sockaddr_in sockaddr_in6 sockaddr_storage epoll_event sockaddr_un
+    linger ip_mreq ip_mreq_source ipv6_mreq pollfd iovec msghdr ip_mreqn timeval
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +473,29 @@ unsafe extern "C" {
         addrlen: socklen_t,
     ) -> ssize_t;
     pub fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
+
+    // socket2 0.6.4 DECLARE-ONLY surface — referenced for COMPILE under cfg(unix),
+    // NEVER called on the tokio TCP-echo path (the echo path is socket/bind/listen/
+    // connect/accept/read/write, all bodied). The linker only demands a body for a
+    // REFERENCED symbol, so these resolve as missing-but-unused. socketpair is the
+    // exception that DOES have a body (the AF_UNIX listener+connect pair, B2).
+    pub fn poll(fds: *mut pollfd, nfds: nfds_t, timeout: c_int) -> c_int;
+    pub fn socketpair(domain: c_int, ty: c_int, protocol: c_int, sv: *mut c_int) -> c_int;
+    pub fn recvmsg(fd: c_int, msg: *mut msghdr, flags: c_int) -> ssize_t;
+    pub fn sendmsg(fd: c_int, msg: *const msghdr, flags: c_int) -> ssize_t;
+    pub fn if_nametoindex(ifname: *const c_char) -> c_uint;
+    // socket2's recv/send/shutdown wrappers (DECLARE-ONLY for tokio's echo, which
+    // reads/writes via TcpStream -> libc::read/write, not socket2's recv/send).
+    // shutdown has a real shim body (rcl_dotnet_net_shutdown) if ever referenced.
+    pub fn recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -> ssize_t;
+    pub fn send(fd: c_int, buf: *const c_void, len: size_t, flags: c_int) -> ssize_t;
+    pub fn shutdown(fd: c_int, how: c_int) -> c_int;
+
+    // eventfd — the mio Waker primitive. Body in posix_epoll.rs: returns a real
+    // FD_KIND_SOCKET fd backed by a self-readable loopback UDP socket, so
+    // read/write/epoll_wait dispatch over it work (the 8-byte counter degrades to
+    // a readiness edge — any byte makes the read end pollable).
+    pub fn eventfd(initval: c_uint, flags: c_int) -> c_int;
 
     // epoll — bodies in posix_epoll.rs (per-fd Socket.Poll sweep).
     pub fn epoll_create1(flags: c_int) -> c_int;

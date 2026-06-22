@@ -67,16 +67,19 @@ cfg_os_poll! {
     mod selector;
     pub(crate) use self::selector::*;
 
-    // DOTNET PAL ARM (B1 convergence): mio's waker cascade selects `waker/eventfd.rs`
-    // for linux, which needs `std::fs::File: FromRawFd` — but the dotnet std
-    // `fs::File` is GCHandle/FileStream-backed, not fd-backed (deferred — THIS is
-    // the irreducible blocker that keeps mio from being literal zero-patch). The
-    // epoll selector re-exports `Waker` RAW (needs `new(selector,token)`+`wake()`,
-    // which the File-free single_threaded.rs lacks). So route to a minimal dotnet
-    // waker (waker/dotnet.rs) with exactly that surface; pal_mio builds no Waker,
-    // so it is never exercised. Gated `target_os = "dotnet"`; the upstream cascade
-    // below is gated `not(... "dotnet")` so exactly one `mod waker;` is in scope
-    // for os=dotnet (no other target_os is true for our target).
+    // DOTNET PAL ARM: mio's waker cascade selects `waker/eventfd.rs` for linux,
+    // which is hardwired to `std::fs::File: FromRawFd` — but the dotnet std
+    // `fs::File` is GCHandle/FileStream-backed, not fd-backed (deferred — fully
+    // fd-backing fs::File (Option B) would let us drop waker/dotnet.rs and use the
+    // stock eventfd waker; that is an explicit follow-up). The epoll selector
+    // re-exports `Waker` RAW (needs `new(selector,token)`+`wake()`, which the
+    // File-free single_threaded.rs lacks). So route to waker/dotnet.rs, which now
+    // holds an `OwnedFd` (FromRawFd-capable for dotnet) over the POSIX shim's
+    // real eventfd (a self-readable loopback socket) and read/writes the counter
+    // via libc::{read,write} — a FUNCTIONAL cross-call waker (tokio's I/O driver
+    // constructs one, so it IS exercised). Gated `target_os = "dotnet"`; the
+    // upstream cascade below is gated `not(... "dotnet")` so exactly one
+    // `mod waker;` is in scope for os=dotnet.
     #[cfg(target_os = "dotnet")]
     #[path = "waker/dotnet.rs"]
     mod waker;
@@ -187,6 +190,14 @@ cfg_os_poll! {
         ),
         not(target_os = "hermit"),
         not(target_os = "wasi"),
+        // DOTNET PAL ARM: mio's pipe support is `IoSource<std::fs::File>`
+        // (File::from_raw_fd + os::fd traits), and the dotnet std fs::File is not
+        // fd-backed (deferred, same wall as the eventfd waker). tokio enables
+        // mio's `os-ext` feature, which would pull this module, but pal_tokio_net
+        // is TCP-only and never touches mio::unix::pipe. Gate it off for dotnet
+        // (mirrors the `uds` gate-off above); the public `pipe` re-export in
+        // lib.rs is correspondingly gated off for dotnet.
+        not(target_os = "dotnet"),
     ))]
     pub(crate) mod pipe;
 }
