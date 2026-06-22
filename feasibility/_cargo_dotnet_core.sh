@@ -7,7 +7,12 @@
 # or `dev.sh pal-build` which delegates to it).
 #
 # Contract (set by the driver):
-#   cwd          = /project        the crate to build (a SECOND bind mount, -w /project)
+#   cwd          = the crate to build. The docker driver sets this to either
+#                  /work/<relpath> (IN-REPO crates: built within the /work mount so
+#                  sibling RELATIVE path-deps like ../getrandom_dotnet resolve) or
+#                  /project (EXTERNAL crates: a SECOND bind mount, -w /project, with
+#                  absolute path-deps + extra read-only sibling mounts — the J4
+#                  contract). The CORE body is fully cwd-relative, so it is agnostic.
 #   /work        = the repo         (backend dylib in rcc-target volume, overlays, spec)
 #   CD_REL=1|0   release (default 1) | debug
 #   CD_RUN=1|0   build only (0) | build + run the produced apphost (1)
@@ -18,7 +23,7 @@
 # Exit code: on `run`, the program's exit code; otherwise the build exit code.
 #
 # Body below is the dev.sh pal-build in-container heredoc, generalized: the
-# hardcoded `cd /work/cargo_tests/$DEV_CRATE` is DROPPED (cwd is /project via -w),
+# hardcoded `cd /work/cargo_tests/$DEV_CRATE` is DROPPED (cwd is set by the driver -w),
 # DEV_RUN -> CD_RUN, profile/dir keyed on CD_REL, the binary name is read from
 # cargo (no dir-basename assumption, no jq/python3 — neither is in the image), and
 # the exit code is propagated. The PAL-inject + apply_overlays + libc-patch blocks

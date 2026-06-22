@@ -29,6 +29,15 @@
 # repo + crate dir, preflights, and DISPATCHES to an execution backend that runs
 # the shared pipeline CORE (feasibility/_cargo_dotnet_core.sh). The seam for a
 # future native (non-Docker) driver is CARGO_DOTNET_BACKEND (default `docker`).
+#
+# MOUNT MODEL (docker backend): the repo is ALWAYS at /work; the target crate is
+# mounted by whether it lives IN-REPO or EXTERNAL.
+#   * IN-REPO  (cargo_tests/<crate>, …): NO extra mount — cwd is set to
+#     /work/<relpath> inside the repo tree, so sibling RELATIVE path-deps
+#     (`../getrandom_dotnet`) resolve exactly as the pre-Phase-D dev.sh pal-build.
+#   * EXTERNAL (a crate OUTSIDE the repo, e.g. /tmp/…): mounted SEPARATELY at
+#     /project (-w /project); it must use ABSOLUTE path-deps + any extra read-only
+#     sibling mounts the caller adds (the J4 contract).
 set -euo pipefail
 
 # Resolve the repo root from THIS script's location (NOT the caller's cwd), so the
@@ -90,17 +99,45 @@ case "$BACKEND" in
     # (mono-devel), so the image-exists check covers "tools present".
     command -v docker >/dev/null 2>&1 || die "docker not found on PATH (the docker backend needs it; or set CARGO_DOTNET_BACKEND=native once that driver lands)"
     docker image inspect "$IMAGE" >/dev/null 2>&1 || die "docker image '$IMAGE' missing — build it first: feasibility/run.sh build"
-    # Two bind mounts: the repo at /work (backend dylib in the rcc-target volume,
-    # dotnet_overlays, the target spec all resolve via /work UNCHANGED) and the
-    # crate at /project (-w /project). This makes ANY host crate dir buildable,
-    # inside cargo_tests/ OR fully external — the CORE runs in cwd=/project.
-    # The produced apphost lands in /project/target == the user's own tree.
-    docker run --rm -i \
-      -e CARGO_TERM_COLOR=never \
-      -e CD_REL="$CD_REL" -e CD_RUN="$CD_RUN" -e CD_CLEAN="$CD_CLEAN" -e CD_VERBOSE="$CD_VERBOSE" \
-      -e OPTIMIZE_CIL \
-      -v "$REPO_ROOT":/work -v rcc-target:/work/target -v "$CRATE_ABS":/project -w /project \
-      "$IMAGE" bash -o pipefail -s -- ${PROG_ARGS[@]+"${PROG_ARGS[@]}"} < "$CORE"
+    # The repo is ALWAYS mounted at /work (backend dylib in the rcc-target volume,
+    # dotnet_overlays, the target spec all resolve via /work UNCHANGED). HOW the
+    # target crate is mounted, and the cwd the CORE runs in, depends on whether the
+    # crate lives INSIDE the repo or OUTSIDE it:
+    #
+    #   IN-REPO (e.g. cargo_tests/<crate>): the crate is already part of the /work
+    #     tree, so we do NOT add a separate mount — we just `-w /work/<relpath>`.
+    #     This makes a sibling RELATIVE path-dep like `../getrandom_dotnet` resolve
+    #     to /work/cargo_tests/getrandom_dotnet (it exists), exactly as the old
+    #     `dev.sh pal-build` did before Phase D. The crate's target/ lands at
+    #     /work/<relpath>/target (cwd-relative, written by the CORE), distinct from
+    #     the rcc-target volume at /work/target — no collision. The apphost lands in
+    #     the user's real on-host tree (host-mounted /work).
+    #
+    #   EXTERNAL (any path NOT under the repo, e.g. /tmp/...): the crate is mounted
+    #     SEPARATELY at /project (-w /project). External crates can't rely on
+    #     /work-relative siblings, so they use ABSOLUTE path-deps + any extra
+    #     read-only sibling mounts the caller adds (the J4 contract).
+    #
+    # Detect in-repo by repo-root prefix: REL is the repo-relative subpath if the
+    # crate is strictly under the repo (and not the repo root itself).
+    REL="${CRATE_ABS#"$REPO_ROOT"/}"
+    if [ "$REL" != "$CRATE_ABS" ] && [ "$CRATE_ABS" != "$REPO_ROOT" ]; then
+      # IN-REPO: build within the /work mount so sibling path-deps resolve.
+      docker run --rm -i \
+        -e CARGO_TERM_COLOR=never \
+        -e CD_REL="$CD_REL" -e CD_RUN="$CD_RUN" -e CD_CLEAN="$CD_CLEAN" -e CD_VERBOSE="$CD_VERBOSE" \
+        -e OPTIMIZE_CIL \
+        -v "$REPO_ROOT":/work -v rcc-target:/work/target -w "/work/$REL" \
+        "$IMAGE" bash -o pipefail -s -- ${PROG_ARGS[@]+"${PROG_ARGS[@]}"} < "$CORE"
+    else
+      # EXTERNAL: separate /project mount (+ any extra mounts a caller adds, as J4).
+      docker run --rm -i \
+        -e CARGO_TERM_COLOR=never \
+        -e CD_REL="$CD_REL" -e CD_RUN="$CD_RUN" -e CD_CLEAN="$CD_CLEAN" -e CD_VERBOSE="$CD_VERBOSE" \
+        -e OPTIMIZE_CIL \
+        -v "$REPO_ROOT":/work -v rcc-target:/work/target -v "$CRATE_ABS":/project -w /project \
+        "$IMAGE" bash -o pipefail -s -- ${PROG_ARGS[@]+"${PROG_ARGS[@]}"} < "$CORE"
+    fi
     # docker run exits with the container's exit code (the CORE's program/build rc).
     exit $?
     ;;

@@ -3,5 +3,11 @@ name = "soak_blake3"
 version = "0.1.0"
 edition = "2021"
 [dependencies]
-blake3 = "1"
+# `pure` forces blake3's pure-Rust implementation instead of its x86 FFI/asm SIMD
+# backend. The target spec advertises target_arch="x86_64", so blake3's build.rs
+# otherwise invokes the container's (aarch64) `cc` to assemble c/blake3_*_x86-64*.S
+# with `-m64`/`-mavx512*`, which the native aarch64 cc rejects ("unrecognized
+# command-line option '-m64'") — a cross-asm / no-x86-C-toolchain wall, unrelated
+# to codegen. The pure-Rust path produces identical hashes.
+blake3 = { version = "1", features = ["pure"] }
 [workspace]

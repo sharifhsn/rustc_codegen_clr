@@ -484,6 +484,22 @@ unsafe extern "C" {
     pub fn recvmsg(fd: c_int, msg: *mut msghdr, flags: c_int) -> ssize_t;
     pub fn sendmsg(fd: c_int, msg: *const msghdr, flags: c_int) -> ssize_t;
     pub fn if_nametoindex(ifname: *const c_char) -> c_uint;
+    // getrandom 0.2's std-feature error path (util_libc::last_os_error ->
+    // Error::raw_os_error -> message formatting) references `libc::strerror_r`
+    // under the target-family=unix flip. DECLARE-ONLY: the custom backend always
+    // returns Ok, so this error path is never taken at runtime and the reference is
+    // dead-code-eliminated by the CIL optimizer (no shim body needed). glibc XSI
+    // signature: (errnum, buf, buflen) -> c_int.
+    pub fn strerror_r(errnum: c_int, buf: *mut c_char, buflen: size_t) -> c_int;
+    // rand 0.8's thread_rng fork-handler registration references
+    // `libc::pthread_atfork` under the target-family=unix flip. soak_rand uses a
+    // SEEDED ChaCha20Rng (never thread_rng), so this is in unreachable code and is
+    // dead-code-eliminated. DECLARE-ONLY: (prepare, parent, child) handler ptrs.
+    pub fn pthread_atfork(
+        prepare: ::core::option::Option<unsafe extern "C" fn()>,
+        parent: ::core::option::Option<unsafe extern "C" fn()>,
+        child: ::core::option::Option<unsafe extern "C" fn()>,
+    ) -> c_int;
     // socket2's recv/send/shutdown wrappers (DECLARE-ONLY for tokio's echo, which
     // reads/writes via TcpStream -> libc::read/write, not socket2's recv/send).
     // shutdown has a real shim body (rcl_dotnet_net_shutdown) if ever referenced.

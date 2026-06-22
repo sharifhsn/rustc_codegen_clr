@@ -146,15 +146,26 @@ strings, a struct value-type, and a slice**. Full consumer guide:
 `cargo-dotnet` is a **thin host front-end**: it resolves the repo + crate dir,
 preflights, and dispatches to an **execution backend** (`CARGO_DOTNET_BACKEND`,
 default `docker`). The docker driver streams the shared core
-(`feasibility/_cargo_dotnet_core.sh`) into the `rcc-dev` container with **two bind
-mounts** — the repo at `/work` (backend dylib, overlays, target spec) and the
-crate at `/project` (`-w /project`) — so any host crate path is buildable and the
-produced apphost lands in the user's own `target/`. `dev.sh pal-build <crate>
-[--run]` **delegates** to this same front-end + core, so the probe regression path
-and the user-facing command can never drift. A future **native** (non-Docker)
-driver slots into the `CARGO_DOTNET_BACKEND` switch: same core, with the host's
-real repo/crate paths instead of `/work`/`/project` and a `command -v dotnet
-ilasm` host preflight — UX and pipeline unchanged.
+(`feasibility/_cargo_dotnet_core.sh`) into the `rcc-dev` container. The repo is
+**always** mounted at `/work` (backend dylib, overlays, target spec); how the
+target crate is mounted depends on whether it lives **in-repo** or **external**:
+
+- **In-repo** (`cargo_tests/<crate>`, …): no separate mount — the crate already
+  lives in the `/work` tree, so the cwd is set to `/work/<relpath>`. A sibling
+  **relative** path-dep (`getrandom_dotnet = { path = "../getrandom_dotnet" }`)
+  then resolves to `/work/cargo_tests/getrandom_dotnet` exactly as the pre-Phase-D
+  `dev.sh pal-build` did.
+- **External** (a crate **outside** the repo, e.g. `/tmp/…`): mounted separately
+  at `/project` (`-w /project`); it must use **absolute** path-deps plus any extra
+  read-only sibling mounts the caller adds (the external-crate / J4 contract).
+
+Either way the produced apphost lands in the user's own `target/`. `dev.sh
+pal-build <crate> [--run]` **delegates** to this same front-end + core (always an
+in-repo `cargo_tests/<crate>`), so the probe regression path and the user-facing
+command can never drift. A future **native** (non-Docker) driver slots into the
+`CARGO_DOTNET_BACKEND` switch: same core, with the host's real repo/crate paths
+instead of `/work`/`/project` and a `command -v dotnet ilasm` host preflight — UX
+and pipeline unchanged.
 
 ### Honesty / current limits
 
