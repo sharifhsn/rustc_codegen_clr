@@ -22,8 +22,10 @@ clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
 clap-cargo = { version = "0.15", features = ["clap"] }
 cargo_metadata = "0.18"
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"

@@ -143,9 +143,3 @@ pub struct PackArgs {
     #[arg(long)]
     pub out: Option<PathBuf>,
 }
-
-impl PackArgs {
-    pub fn is_release(&self) -> bool {
-        !self.debug
-    }
-}

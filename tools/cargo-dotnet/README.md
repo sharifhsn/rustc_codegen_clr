@@ -18,14 +18,25 @@ stable/nightly cargo — NOT the pinned nightly + `rustc_private` the backend cr
 
 ## What is Rust-native vs. shells-to-bash
 
-The CLI, the cargo-subcommand argument convention (`cargo dotnet <cmd>` dispatch), the standard-flag
-passthrough (`--features`/`-p`/`--manifest-path`/`--locked`/…), `--version`/`--help`, mode + host
-detection, the RUSTFLAGS assembly, and the build/run env orchestration are **Rust**. The inner pipeline
-(PAL injection into rust-src, the `dotnet_overlays` apply, the libc-registry patch, build-std, artifact
-location, the run) is the proven shell core (`feasibility/_cargo_dotnet_core.sh`), which the Rust binary
-drives via the `CD_*` env seam (`CD_EXTRA_CARGO_FLAGS` carries the forwarded standard flags). `setup`,
-`pack`, and the Docker dev backend are staged on the bash front-end (clearly marked in the source);
-`setup`'s one native upgrade is `cargo install`-ing this binary instead of copying a script.
+The **native backend is entirely Rust** — there is no bash core on the user path. The CLI, the
+cargo-subcommand convention, the standard-flag passthrough, mode/host detection, AND every inner stage:
+
+| stage | module | replaces (bash) |
+|-------|--------|-----------------|
+| PAL injection into rust-src | [`palinject`](src/palinject.rs) (declarative manifest + idempotent, anchor-based, unit-tested engine) | `inject_arm`/`inject_arm_anchor`/`inject_method`/`inject_libc` + the BSD/GNU `sed -i` shim |
+| typed config (no `CD_*` env) | [`context`](src/context.rs) | the ~13 `CD_*` env vars |
+| `dotnet_overlays` apply | [`overlays`](src/overlays.rs) (`toml`) | `apply_overlays` (awk/paste) |
+| `build-std` | [`buildstd`](src/buildstd.rs) | the build block + the twice-run libc patch |
+| artifact location | [`artifact`](src/artifact.rs) (`serde_json`) | the awk JSON scrape |
+| run apphost | [`run`](src/run.rs) | the run block |
+| NuGet `.nupkg` | [`pack`](src/pack.rs) (`zip` crate) | `cd_pack` (`zip -X` + heredocs + `uuidgen`) |
+
+It shells out only to external tools any build tool must (cargo/rustc/ilasm/dotnet/the linker). The
+self-containment is **verified with `feasibility/_cargo_dotnet_core.sh` physically absent** (J1/J2/J3 +
+`pack` all pass). `setup` runs the native [`palinject`] warm and `cargo install`s this binary; its heavy
+external-tool provisioning (rustup/dotnet-install/ilasm/backend build, all dev-only `--from-repo`) still
+delegates to the bash front-end. The **Docker** dev backend likewise delegates to the bash front-end,
+which owns the container mount model.
 
 See [docs/CARGO_DOTNET.md](../../docs/CARGO_DOTNET.md) for the full user guide and
 [docs/RESEARCH_CARGO_DOTNET.md](../../docs/RESEARCH_CARGO_DOTNET.md) for the audit this implements.

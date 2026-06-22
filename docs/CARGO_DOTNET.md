@@ -16,16 +16,26 @@ the codegen backend internals — those live in [docs/ARCHITECTURE.md](ARCHITECT
 
 `cargo-dotnet` is a [cargo custom subcommand](https://doc.rust-lang.org/cargo/reference/external-tools.html#custom-subcommands):
 once it is on `PATH`, `cargo dotnet …` works. It is a **`cargo install`-able clap Rust binary**
-([`tools/cargo-dotnet/`](../tools/cargo-dotnet)) that owns the CLI, the cargo-subcommand convention, and
-the standard-flag passthrough; it shells out to the shared pipeline core
-(`feasibility/_cargo_dotnet_core.sh` in a checkout, `$CARGO_DOTNET_HOME/core.sh` once installed) for the
-inner pipeline: inject the dotnet PAL into `rust-src`, set the backend RUSTFLAGS, run `build-std`, apply
-the [`dotnet_overlays`](../dotnet_overlays/README.md) registry, patch the libc registry, and build/run.
+([`tools/cargo-dotnet/`](../tools/cargo-dotnet)) that owns the **entire native pipeline in pure Rust** —
+the CLI + cargo-subcommand convention + standard-flag passthrough, AND the inner build/run/pack: it
+injects the dotnet PAL into `rust-src` (a declarative, anchor-based, unit-tested injection engine — see
+[`src/palinject.rs`](../tools/cargo-dotnet/src/palinject.rs)), sets the backend RUSTFLAGS, applies the
+[`dotnet_overlays`](../dotnet_overlays/README.md) registry (typed `toml`), patches the libc registry,
+runs `build-std`, locates the artifact (typed `serde_json`), and runs the apphost or assembles a NuGet
+`.nupkg` (the `zip` crate). It shells out only to the *external tools* it must — `cargo`/`rustc`,
+`ilasm`, the `dotnet` apphost, the cilly linker — exactly as any build tool does.
+
+> **The native path needs NO bash core.** Earlier the Rust binary shelled out to a shared bash pipeline
+> (`feasibility/_cargo_dotnet_core.sh` / `$CARGO_DOTNET_HOME/core.sh`) for the inner steps. That is gone
+> on the native path: the installed binary runs the **whole** build/run/pack pipeline itself, verified
+> with `feasibility/_cargo_dotnet_core.sh` **physically absent** (J1/J2/J3 + `pack` all pass). The bash
+> script (`feasibility/cargo-dotnet` + the core) remains ONLY the in-repo **Docker dev driver** the
+> binary delegates to for `CARGO_DOTNET_BACKEND=docker` — a developer convenience that owns the
+> container mount model, not part of the user journey.
 
 > **The Rust binary replaces the old bash front-end for users.** The previous front-end was a bash
 > script copied to `~/.cargo/bin`. It is now a real clap binary installed via
-> `cargo install --path tools/cargo-dotnet` (see [§2c](#2c-install-once-use-anywhere)). The bash script
-> (`feasibility/cargo-dotnet`) remains the in-repo **Docker dev driver** the Rust binary delegates to.
+> `cargo install --path tools/cargo-dotnet` (see [§2c](#2c-install-once-use-anywhere)).
 
 ```bash
 cargo dotnet build [PATH] [--release|--debug] [--clean] [-v] [CARGO FLAGS…]
@@ -290,8 +300,10 @@ the repo absent**:
 ```
 $CARGO_DOTNET_HOME/
   VERSION                                # manifest: git rev, build date, host triple, pinned toolchain
-  core.sh                                # copy of the pipeline core (_cargo_dotnet_core.sh)
-  cargo-dotnet                           # source of the ~/.cargo/bin copy
+  core.sh                                # legacy bash pipeline copy — NOT used by the native path
+                                         #   (kept only so an older bash front-end still works); the
+                                         #   Rust binary runs the whole native pipeline itself.
+  cargo-dotnet                           # legacy bash front-end copy (the Rust binary is on ~/.cargo/bin)
   bin/
     librustc_codegen_clr.<dylib|so|dll>  # the codegen backend (host-native)
     linker[.exe]                         # the cilly linker
@@ -301,10 +313,17 @@ $CARGO_DOTNET_HOME/
 ```
 
 The installed front-end self-locates the home, detects host OS (`.dylib`/`.so`/`.dll`), self-heals
-`dotnet` onto PATH from `$HOME/.dotnet` if needed, exports the `CD_*` seam at the home, and runs
-`core.sh` against the current crate dir — **the default backend is `native`** (no Docker). All the
-generated `.cargo/config.toml` paths and exported `CD_*` resolve into `CARGO_DOTNET_HOME`, never the
-repo. (Verified: with the repo physically moved aside, an external crate still builds and runs.)
+`dotnet` onto PATH from `$HOME/.dotnet` if needed, and runs the **pure-Rust native pipeline** against the
+current crate dir — **the default backend is `native`** (no Docker, no bash core). Every path (the
+generated `.cargo/config.toml`, the backend dylib, the PAL source) resolves into `CARGO_DOTNET_HOME`,
+never the repo. (Verified: with both the repo AND `feasibility/_cargo_dotnet_core.sh` physically absent,
+an external crate still builds, runs, and packs.)
+
+> **No `CD_*` env seam.** The old design threaded ~13 `CD_*` environment variables (CD_REPO,
+> CD_BACKEND_DYLIB, CD_LINKER, CD_TARGET_SPEC, …) from the Rust front-end into the bash core. Those are
+> gone: the native pipeline carries every fact in ONE typed `Context`
+> ([`src/context.rs`](../tools/cargo-dotnet/src/context.rs)). A child env is constructed only for the
+> inner `cargo` invocation and at the docker delegation boundary.
 
 ### Shell rc lines
 

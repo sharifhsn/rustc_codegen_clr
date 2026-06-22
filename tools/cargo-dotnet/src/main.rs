@@ -1,18 +1,28 @@
 //! `cargo-dotnet` — compile/run arbitrary Rust crates on .NET (rustc_codegen_clr).
 //!
 //! A `cargo install`-able clap binary that replaces the bash front-end
-//! (`feasibility/cargo-dotnet`). It owns the CLI, the cargo-subcommand convention, the
-//! standard-flag passthrough, and the native build/run orchestration; it shells out to
-//! cargo/rustc/ilasm/dotnet/the linker (via the proven pipeline core) for the inner
-//! pipeline — which is unavoidable and idiomatic.
+//! (`feasibility/cargo-dotnet`). On the NATIVE backend it owns the WHOLE pipeline in
+//! pure Rust — CLI + cargo-subcommand convention + standard-flag passthrough, plus the
+//! inner build/run/pack: PAL injection into rust-src ([`palinject`]), the
+//! [`dotnet_overlays`] apply ([`overlays`]), `build-std` ([`buildstd`]), artifact
+//! location ([`artifact`]), run ([`run`]) and NuGet packing ([`pack`]). It shells out
+//! only to the external tools any build tool must (cargo/rustc/ilasm/dotnet/the linker)
+//! — never to a bash pipeline core. The DOCKER backend (dev-only) still delegates to the
+//! in-repo bash front-end, which owns the container mount model.
 
+mod artifact;
+mod buildstd;
 mod cli;
+mod context;
 mod docker;
 mod host;
 mod mode;
+mod overlays;
 mod pack;
+mod palinject;
 mod passthrough;
 mod pipeline;
+mod run;
 mod rustflags;
 mod setup;
 

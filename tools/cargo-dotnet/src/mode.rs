@@ -27,6 +27,33 @@ pub enum Mode {
     Installed { home: PathBuf },
 }
 
+/// The execution backend. `Native` runs the whole pipeline on the host in pure Rust
+/// (the self-contained user journey); `Docker` shells the in-repo bash front-end (the
+/// dev-only path, which legitimately owns the container mount model).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Native,
+    Docker,
+}
+
+impl Backend {
+    /// Resolve the backend: an explicit `--backend`/`CARGO_DOTNET_BACKEND` value wins;
+    /// otherwise installed defaults to native, dev defaults to docker.
+    pub fn resolve(flag: Option<&str>, mode: &Mode) -> anyhow::Result<Self> {
+        match flag {
+            Some("native") => Ok(Backend::Native),
+            Some("docker") => Ok(Backend::Docker),
+            Some(other) => anyhow::bail!(
+                "unknown CARGO_DOTNET_BACKEND='{other}' (expected: native | docker)"
+            ),
+            None => Ok(match mode {
+                Mode::Installed { .. } => Backend::Native,
+                Mode::Dev { .. } => Backend::Docker,
+            }),
+        }
+    }
+}
+
 /// The install home: `$CARGO_DOTNET_HOME` or `$HOME/.cargo-dotnet`.
 pub fn cargo_dotnet_home() -> Result<PathBuf> {
     if let Ok(h) = env::var("CARGO_DOTNET_HOME") {
