@@ -26,5 +26,7 @@ cargo_tests/spinacz/target/
 .docker-target/
 feasibility/demo/**/bin/
 feasibility/demo/**/obj/
+# transient build log sink written by dev.sh / cargo-dotnet (the pipeline core)
+feasibility/_lastbuild.log
 # rustc internal-compiler-error dumps (common while chasing nightly drift)
 rustc-ice-*.txt

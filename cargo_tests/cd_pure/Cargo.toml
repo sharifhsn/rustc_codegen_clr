@@ -1,0 +1,21 @@
+# J1 — the `cargo dotnet` PURE-RUST proof crate.
+#
+# A brand-new minimal crate proving the zero-config DX on fresh code: no deps, no
+# [patch], no vendoring, no .cargo edits. The ONLY thing here is a normal Cargo.toml
+# + src/main.rs. Build/run it with:
+#
+#     feasibility/cargo-dotnet run cargo_tests/cd_pure
+#
+# (or, with feasibility/ on PATH: `cargo dotnet run cargo_tests/cd_pure`). The
+# command supplies the dotnet target, build-std, and the codegen backend.
+[package]
+name = "cd_pure"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+# Escape the repo's root cargo workspace (a crate placed UNDER the workspace root
+# must carry a bare [workspace] to be its own workspace). A truly external crate
+# (its own root) needs nothing.
+[workspace]

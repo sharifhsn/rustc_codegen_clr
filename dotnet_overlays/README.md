@@ -2,9 +2,10 @@
 
 This directory is the **single source of truth** for the small per-crate source
 overlays a few popular crates need to compile/run on the `x86_64-unknown-dotnet`
-target. The build framework (`feasibility/dev.sh pal-build`, and the forthcoming
-`cargo dotnet` one-command DX) **auto-applies** these overlays from here — a
-downstream user adds **nothing** to their own `Cargo.toml`.
+target. The build framework (the `cargo dotnet` one-command DX —
+`feasibility/cargo-dotnet`, shared with `feasibility/dev.sh pal-build` via the
+common pipeline core `feasibility/_cargo_dotnet_core.sh`) **auto-applies** these
+overlays from here — a downstream user adds **nothing** to their own `Cargo.toml`.
 
 ## Why this exists (the honest constraint)
 
@@ -46,7 +47,8 @@ change the overridden crate's dep set).
 
 ## How auto-apply works (the `paths` override)
 
-`feasibility/dev.sh pal-build <crate>` runs `apply_overlays`:
+`cargo dotnet build/run` (and `dev.sh pal-build`, which delegates to it) runs
+`apply_overlays` in the shared pipeline core (`feasibility/_cargo_dotnet_core.sh`):
 
 1. Ensure the project has a `Cargo.lock` (generate one if absent).
 2. Parse each `[[overlay]]` from `REGISTRY.toml` (name + version + dir).

@@ -1,0 +1,27 @@
+# J2 — the `cargo dotnet` SYSCALL-DEPS proof crate.
+#
+# A brand-new minimal crate proving the zero-config DX on fresh code with a real
+# syscall-level dependency: a tokio loopback TCP echo. The user added ONLY a normal
+# Cargo.toml tokio dep — NO [patch.crates-io], NO vendoring, NO .cargo edits. The
+# `cargo dotnet` command auto-applies the central dotnet_overlays registry, which
+# redirects tokio + its transitive mio + socket2 to their dotnet overlays via a
+# generated `.cargo/config.toml` `paths` override the user never sees or edits.
+#
+#     feasibility/cargo-dotnet run cargo_tests/cd_tokio
+#
+# This is a SEPARATE, freshly-written crate from cargo_tests/pal_tokio_net (a
+# different echo protocol), to prove the DX on NEW code, not a known-good probe.
+[package]
+name = "cd_tokio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# A perfectly ordinary tokio dependency — exactly what a real user writes. NO
+# [patch], NO path/vendor overrides. The dotnet_overlays registry (auto-applied by
+# `cargo dotnet`) supplies the mio/socket2/tokio source overlays graph-wide.
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util"] }
+
+# Escape the repo's root cargo workspace (a crate placed UNDER the workspace root
+# must carry a bare [workspace]).
+[workspace]

@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# feasibility/cargo-dotnet — the ONE-COMMAND Rust -> .NET build/run front-end.
+#
+# A cargo subcommand: any `cargo-X` on PATH makes `cargo X` work, forwarding the
+# args minus the subcommand. Put this dir on PATH (or symlink this file into
+# ~/.cargo/bin) and use it as:
+#
+#   cargo dotnet build [PATH] [--release|--debug] [--clean] [-v]
+#   cargo dotnet run   [PATH] [--release|--debug] [--clean] [-v] [-- ARGS...]
+#   cargo dotnet help
+#
+# It can ALSO be invoked directly: `feasibility/cargo-dotnet run cargo_tests/cd_pure`.
+#
+# Zero user config: NO hand RUSTFLAGS, NO [patch.crates-io], NO vendoring, NO
+# .cargo/config edits. The command supplies the target spec, build-std, the codegen
+# backend, the dotnet PAL injection, and auto-applies the dotnet_overlays registry
+# (so mio/socket2/tokio "just work"). The user writes a normal Cargo.toml.
+#
+#   PATH        the crate dir to build (default `.` — the current dir). ARBITRARY:
+#               under cargo_tests/ OR any external path.
+#   --release   release profile (DEFAULT, per project convention).
+#   --debug     debug profile.
+#   --clean     `cargo clean` first (rebuilds std; bulletproof but slow).
+#   -v          verbose: unfiltered build log.
+#   -- ARGS     (run only) args forwarded to the .NET program; its exit code
+#               propagates back out of this command.
+#
+# This is a THIN HOST FRONT-END. It contains NO pipeline logic — it resolves the
+# repo + crate dir, preflights, and DISPATCHES to an execution backend that runs
+# the shared pipeline CORE (feasibility/_cargo_dotnet_core.sh). The seam for a
+# future native (non-Docker) driver is CARGO_DOTNET_BACKEND (default `docker`).
+set -euo pipefail
+
+# Resolve the repo root from THIS script's location (NOT the caller's cwd), so the
+# command works from any directory — the dev.sh trick.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CORE="$SCRIPT_DIR/_cargo_dotnet_core.sh"
+IMAGE="${RCC_IMAGE:-rcc-dev}"
+BACKEND="${CARGO_DOTNET_BACKEND:-docker}"
+
+die(){ echo "cargo dotnet: $*" >&2; exit 1; }
+usage(){
+  # Self-doc from the header comment (the dev.sh sed pattern).
+  sed -n '3,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+# ---- parse subcommand -------------------------------------------------------
+sub="${1:-help}"; shift || true
+case "$sub" in
+  help|-h|--help) usage; exit 0 ;;
+  build|run) ;;
+  *) die "unknown subcommand '$sub' (try: build | run | help)" ;;
+esac
+
+# ---- parse flags + PATH + program args --------------------------------------
+PATH_ARG=""
+CD_REL=1          # release default
+CD_CLEAN=0
+CD_VERBOSE=0
+PROG_ARGS=()      # args after `--`, forwarded to the program on `run`
+saw_dashdash=0
+while [ $# -gt 0 ]; do
+  if [ "$saw_dashdash" = 1 ]; then PROG_ARGS+=("$1"); shift; continue; fi
+  case "$1" in
+    --) saw_dashdash=1 ;;
+    --release) CD_REL=1 ;;
+    --debug)   CD_REL=0 ;;
+    --clean)   CD_CLEAN=1 ;;
+    -v|--verbose) CD_VERBOSE=1 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) die "unknown flag '$1' (try: cargo dotnet help)" ;;
+    *) [ -z "$PATH_ARG" ] || die "unexpected extra argument '$1' (PATH already set to '$PATH_ARG')"; PATH_ARG="$1" ;;
+  esac
+  shift
+done
+[ -n "$PATH_ARG" ] || PATH_ARG="."
+CD_RUN=0; [ "$sub" = run ] && CD_RUN=1
+
+# ---- resolve the crate dir to an absolute host path -------------------------
+CRATE_ABS="$(cd "$PATH_ARG" 2>/dev/null && pwd)" || die "no such directory: $PATH_ARG"
+[ -f "$CRATE_ABS/Cargo.toml" ] || die "not a crate dir (no Cargo.toml): $CRATE_ABS"
+[ -f "$CORE" ] || die "missing pipeline core: $CORE"
+
+# ---- dispatch to the execution backend --------------------------------------
+case "$BACKEND" in
+  docker)
+    # Preflight (helpful errors). The native driver moves the dotnet/ilasm tool
+    # checks to the host; here the rcc-dev image always ships dotnet + ilasm
+    # (mono-devel), so the image-exists check covers "tools present".
+    command -v docker >/dev/null 2>&1 || die "docker not found on PATH (the docker backend needs it; or set CARGO_DOTNET_BACKEND=native once that driver lands)"
+    docker image inspect "$IMAGE" >/dev/null 2>&1 || die "docker image '$IMAGE' missing — build it first: feasibility/run.sh build"
+    # Two bind mounts: the repo at /work (backend dylib in the rcc-target volume,
+    # dotnet_overlays, the target spec all resolve via /work UNCHANGED) and the
+    # crate at /project (-w /project). This makes ANY host crate dir buildable,
+    # inside cargo_tests/ OR fully external — the CORE runs in cwd=/project.
+    # The produced apphost lands in /project/target == the user's own tree.
+    docker run --rm -i \
+      -e CARGO_TERM_COLOR=never \
+      -e CD_REL="$CD_REL" -e CD_RUN="$CD_RUN" -e CD_CLEAN="$CD_CLEAN" -e CD_VERBOSE="$CD_VERBOSE" \
+      -e OPTIMIZE_CIL \
+      -v "$REPO_ROOT":/work -v rcc-target:/work/target -v "$CRATE_ABS":/project -w /project \
+      "$IMAGE" bash -o pipefail -s -- ${PROG_ARGS[@]+"${PROG_ARGS[@]}"} < "$CORE"
+    # docker run exits with the container's exit code (the CORE's program/build rc).
+    exit $?
+    ;;
+  native)
+    die "CARGO_DOTNET_BACKEND=native is not yet implemented (Phase-D ships the docker driver; the native, non-Docker path is a later packaging concern — the front-end + CORE are already structured for it: the native driver implements the same CORE with SRC=\$(rustc --print sysroot)/... and the repo's real host path instead of /work, runs the apphost directly, and checks `command -v dotnet ilasm` on the host)"
+    ;;
+  *)
+    die "unknown CARGO_DOTNET_BACKEND='$BACKEND' (expected: docker | native)"
+    ;;
+esac

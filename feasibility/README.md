@@ -38,6 +38,8 @@ PLATFORM=linux/amd64 feasibility/run.sh test
 | `run.sh` | Host driver: builds the image, runs a harness step with the repo mounted. |
 | `harness.sh` | In-container steps: `build` / `smoke` / `test` / `demo`. |
 | `dev.sh` | **Deterministic dev loop** (see below): force-rebuild, build+run a cargo_tests crate, disassemble IL, gate-with-diff. Works around Docker mtime-skew + cwd-drift. |
+| `cargo-dotnet` | **The one-command Rust→.NET DX** (see below): `cargo dotnet build/run` on ANY crate dir, zero user config. A thin host front-end over the shared pipeline core. |
+| `_cargo_dotnet_core.sh` | The crate-agnostic **pipeline core** (PAL inject + backend RUSTFLAGS + build-std + overlay auto-apply + libc patch + build/run). Single source of truth; `cargo-dotnet` AND `dev.sh pal-build` both run it. |
 | `demo/` | A small Rust program (`add.rs`) + script that compiles it with the backend and runs it on CoreCLR. |
 
 ## Deterministic dev tooling (`dev.sh`)
@@ -73,6 +75,81 @@ nightly?" check, and `test` runs the project's own `cargo test ::stable` suite (
 end-to-end runtime validation — it drives build-std + ilasm + dotnet itself). The `smoke`/`demo`
 helpers illustrate the raw backend invocation but need the build-std cargo setup from the repo's
 `QUICKSTART.md` to actually run a standalone program.
+
+## The one-command DX (`cargo dotnet`)
+
+`feasibility/cargo-dotnet` is the **user-facing one command** that compiles an
+arbitrary Rust crate to a runnable .NET assembly with **zero hand-config** — no
+`RUSTFLAGS`, no `[patch.crates-io]`, no vendoring, no `.cargo/config` edits. It is
+a [cargo subcommand](https://doc.rust-lang.org/cargo/reference/external-tools.html#custom-subcommands):
+any `cargo-X` on `PATH` makes `cargo X` work.
+
+```bash
+cargo dotnet build [PATH] [--release|--debug] [--clean] [-v]
+cargo dotnet run   [PATH] [--release|--debug] [--clean] [-v] [-- ARGS...]
+cargo dotnet help
+```
+
+- **`PATH`** — the crate dir to build (default `.`). **Arbitrary**: under
+  `cargo_tests/` *or* any fully external path (e.g. `/tmp/myproj`).
+- **`--release`** is the default (project convention); `--debug` opts out.
+- **`--clean`** does a `cargo clean` first (rebuilds std; bulletproof, slow).
+- **`run`** builds then executes the produced apphost, forwarding `-- ARGS` and
+  **propagating its exit code** (a build failure → non-zero; see the honesty note).
+- **`-v`** shows the unfiltered build log.
+
+### Putting it on `PATH`
+
+```bash
+export PATH="$PWD/feasibility:$PATH"        # then `cargo dotnet run …`
+# or symlink it where cargo lives:
+ln -s "$PWD/feasibility/cargo-dotnet" ~/.cargo/bin/cargo-dotnet
+```
+
+Or invoke it directly without the `cargo` shim:
+`feasibility/cargo-dotnet run cargo_tests/cd_pure`.
+
+### What it does (zero config)
+
+The command supplies the `x86_64-unknown-dotnet` target spec, `build-std`, the
+codegen backend RUSTFLAGS, the dotnet-PAL injection into `rust-src`, the libc
+registry patch, and **auto-applies the `dotnet_overlays` registry** — so
+`mio`/`socket2`/`tokio` (and their transitive deps) "just work" via a generated
+per-project `.cargo/config.toml` `paths` override the user never sees or edits.
+The user writes a **normal `Cargo.toml`** (plus a bare `[workspace]` line if the
+crate is placed *under* this repo's workspace root; a truly external crate needs
+nothing). The two zero-config proof crates are `cargo_tests/cd_pure` (pure Rust)
+and `cargo_tests/cd_tokio` (a tokio loopback TCP echo whose only dep line is a
+plain `tokio = { version = "1", features = [...] }`).
+
+### Architecture (and the Docker vs. native seam)
+
+`cargo-dotnet` is a **thin host front-end**: it resolves the repo + crate dir,
+preflights, and dispatches to an **execution backend** (`CARGO_DOTNET_BACKEND`,
+default `docker`). The docker driver streams the shared core
+(`feasibility/_cargo_dotnet_core.sh`) into the `rcc-dev` container with **two bind
+mounts** — the repo at `/work` (backend dylib, overlays, target spec) and the
+crate at `/project` (`-w /project`) — so any host crate path is buildable and the
+produced apphost lands in the user's own `target/`. `dev.sh pal-build <crate>
+[--run]` **delegates** to this same front-end + core, so the probe regression path
+and the user-facing command can never drift. A future **native** (non-Docker)
+driver slots into the `CARGO_DOTNET_BACKEND` switch: same core, with the host's
+real repo/crate paths instead of `/work`/`/project` and a `command -v dotnet
+ilasm` host preflight — UX and pipeline unchanged.
+
+### Honesty / current limits
+
+- This wraps the Docker harness, so it needs the `rcc-dev` image
+  (`feasibility/run.sh build`) and a running Docker. The native path is later
+  packaging work — the front-end/core are already structured for it.
+- **Exit codes:** build failures and the program's own exit code propagate
+  faithfully. But on the dotnet PAL a **panic** (or `std::process::exit(n)`)
+  surfaces as an unhandled managed exception and the apphost still returns **0** —
+  a pre-existing PAL limitation (the managed exception is not translated to a
+  non-zero process exit), independent of `cargo dotnet`.
+- **`getrandom`:** the command passes `--cfg getrandom_backend="custom"` (harmless
+  for crates that don't use it); a crate that pulls `getrandom` still needs the
+  custom-backend shim symbol — see `dotnet_overlays/README.md`.
 
 ## The nightly pin
 
