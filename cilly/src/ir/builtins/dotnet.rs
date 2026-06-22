@@ -845,12 +845,20 @@ fn insert_dotnet_exit(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let code = asm.alloc_node(CILNode::LdArg(0));
         let code = asm.int_cast(code, Int::I32, ExtendKind::SignExtend);
         let call = asm.alloc_root(CILRoot::call(exit, [code]));
-        // Unreachable terminator: Ret an uninit value of the declared return type
-        // (libc `exit` is `-> !`, so the return type is whatever rustc lowered the
-        // never type to). This is never executed — Environment.Exit does not return.
+        // Unreachable terminator after the (never-returning) Environment.Exit.
+        // libc `exit` is `-> !`; rustc lowers the never type to either `Void`
+        // (a unit-like never callee — most call sites, incl. a raw `extern "C" fn
+        // exit(_) -> !`) or a concrete scalar. A void-typed `Ret(value)` is
+        // INVALID CIL (the JIT rejects the whole method with
+        // InvalidProgramException), so emit `VoidRet` for Void and `Ret(uninit)`
+        // otherwise.
         let ret_ty = *asm[asm[mref].sig()].output();
-        let unreachable = asm.uninit_val(ret_ty);
-        let ret = asm.alloc_root(CILRoot::Ret(unreachable));
+        let ret = if ret_ty == Type::Void {
+            asm.alloc_root(CILRoot::VoidRet)
+        } else {
+            let unreachable = asm.uninit_val(ret_ty);
+            asm.alloc_root(CILRoot::Ret(unreachable))
+        };
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![call, ret], 0, None)],
             locals: vec![],
