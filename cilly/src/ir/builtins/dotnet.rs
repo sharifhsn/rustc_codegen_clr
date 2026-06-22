@@ -155,6 +155,7 @@ pub fn insert_dotnet_pal(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
     insert_dotnet_thread_sleep(asm, patcher);
     insert_dotnet_available_parallelism(asm, patcher);
     insert_dotnet_getpid(asm, patcher);
+    insert_dotnet_exit(asm, patcher);
     insert_dotnet_hostname(asm, patcher);
     insert_dotnet_paths(asm, patcher);
     insert_dotnet_cotaskmem_free(asm, patcher);
@@ -812,6 +813,46 @@ fn insert_dotnet_getpid(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) 
         let ret = asm.alloc_root(CILRoot::Ret(pid));
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `exit(code: c_int) -> !` => `System.Environment.Exit((int)code)`.
+///
+/// B2 Piece 5 — closes the host-libc `exit` P/Invoke leak (L9). std's
+/// `sys::exit::exit` calls `libc::exit(code)` on the `target_family="unix"` arm;
+/// the bare symbol `exit` is in `LIBC_FNS`, so absent an override it resolves to
+/// a host-libc P/Invoke (green on a Linux test host, but a LEAK on a shipped
+/// non-Linux .NET host). Registering an override under the demangled last
+/// `::`-segment **`exit`** (this name, NOT `rcl_dotnet_exit`) intercepts it at
+/// link time: `patch_missing_methods` looks up `override_methods` BEFORE the
+/// LIBC externs fallback, so the override wins. `Environment.Exit(int)`
+/// terminates the process; since libc `exit` is `-> !` (noreturn) the CIL body
+/// must still typecheck, so we emit an unreachable `Ret` of an uninitialised
+/// value of the method's declared return type after the (never-returning) call.
+fn insert_dotnet_exit(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("exit");
+    let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {
+        // Environment.Exit((int)arg0) — static void Exit(int).
+        let env = ClassRef::enviroment(asm);
+        let exit_name = asm.alloc_string("Exit");
+        let exit =
+            asm.class_ref(env)
+                .clone()
+                .static_mref(&[Type::Int(Int::I32)], Type::Void, exit_name, asm);
+        let code = asm.alloc_node(CILNode::LdArg(0));
+        let code = asm.int_cast(code, Int::I32, ExtendKind::SignExtend);
+        let call = asm.alloc_root(CILRoot::call(exit, [code]));
+        // Unreachable terminator: Ret an uninit value of the declared return type
+        // (libc `exit` is `-> !`, so the return type is whatever rustc lowered the
+        // never type to). This is never executed — Environment.Exit does not return.
+        let ret_ty = *asm[asm[mref].sig()].output();
+        let unreachable = asm.uninit_val(ret_ty);
+        let ret = asm.alloc_root(CILRoot::Ret(unreachable));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![call, ret], 0, None)],
             locals: vec![],
         }
     };
