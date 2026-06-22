@@ -535,6 +535,11 @@ EOF
 }
 
 # ---- parse subcommand -------------------------------------------------------
+# When invoked as a cargo subcommand (`cargo dotnet <cmd> ...`), cargo execs this
+# file as `cargo-dotnet dotnet <cmd> ...` — i.e. it PREPENDS the subcommand name
+# ("dotnet") as $1. Drop it so both `cargo dotnet <cmd>` and a direct
+# `cargo-dotnet <cmd>` invocation see <cmd> as the subcommand.
+if [ "${1:-}" = "dotnet" ]; then shift; fi
 sub="${1:-help}"; shift || true
 case "$sub" in
   help|-h|--help) usage; exit 0 ;;
