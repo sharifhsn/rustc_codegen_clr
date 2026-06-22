@@ -169,6 +169,12 @@ unsafe extern "C" {
         path_len: usize,
         out_size: *mut u64,
         out_is_dir: *mut i32,
+        // B2 Piece 2/4: real timestamps (Unix seconds) + symlink flag, written
+        // only on the success path (rc==0); left untouched on rc==-1.
+        out_mtime: *mut i64,
+        out_atime: *mut i64,
+        out_ctime: *mut i64,
+        out_is_symlink: *mut i32,
     ) -> i32;
     fn rcl_dotnet_fs_exists(path_ptr: *const u8, path_len: usize) -> i32;
     fn rcl_dotnet_fs_mkdir(path_ptr: *const u8, path_len: usize) -> i32;
@@ -184,6 +190,20 @@ unsafe extern "C" {
     fn rcl_dotnet_fs_readdir_count(handle: *mut u8) -> usize;
     fn rcl_dotnet_fs_readdir_get(handle: *mut u8, idx: usize) -> *mut u8;
     fn rcl_dotnet_fs_readdir_close(handle: *mut u8);
+    // B2 Piece 3: offset-relative I/O via System.IO.RandomAccess (does NOT move
+    // the FileStream position). `offset` is i64.
+    fn rcl_dotnet_fs_read_at(handle: *mut u8, buf_ptr: *mut u8, len: usize, offset: i64) -> isize;
+    fn rcl_dotnet_fs_write_at(handle: *mut u8, buf_ptr: *const u8, len: usize, offset: i64) -> isize;
+    // B2 Piece 4: symlink create / resolve. symlink returns 0 (throws on failure).
+    // readlink returns a NUL-terminated UTF-8 C string (freed by
+    // rcl_dotnet_cotaskmem_free) or NULL (not a link / not found).
+    fn rcl_dotnet_fs_symlink(
+        link_ptr: *const u8,
+        link_len: usize,
+        target_ptr: *const u8,
+        target_len: usize,
+    ) -> i32;
+    fn rcl_dotnet_fs_readlink(path_ptr: *const u8, path_len: usize) -> *mut u8;
     /// Shared with args/env: `Marshal.FreeCoTaskMem`. Frees a buffer returned by
     /// `rcl_dotnet_fs_readdir_get`.
     fn rcl_dotnet_cotaskmem_free(ptr: *mut u8);
@@ -224,6 +244,11 @@ fn path_bytes(path: &Path) -> &[u8] {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FileType {
     is_dir: bool,
+    // B2 Piece 4: real symlink flag (from FileAttributes.ReparsePoint via the
+    // stat hook). lstat does not currently follow links differently from stat,
+    // but the flag IS meaningful because the underlying GetAttributes reports
+    // the reparse-point bit on the symlink target path.
+    is_symlink: bool,
 }
 
 impl FileType {
@@ -236,23 +261,30 @@ impl FileType {
     }
 
     pub fn is_symlink(&self) -> bool {
-        // The BCL abstraction surfaced here has no symlink concept.
-        false
+        // B2 Piece 4: REAL — set when FileAttributes.ReparsePoint was present.
+        self.is_symlink
     }
 
-    /// DOTNET PAL ARM (Package A/B stub) — `os::unix::fs::FileTypeExt` queries
-    /// `self.as_inner().is(libc::S_IFBLK)` etc. The dotnet `FileType` only carries
-    /// a dir/file flag, so synthesize the `S_IFMT` masked type and compare.
-    /// **LEAKY (L3):** block/char/fifo/socket are never modelled by the BCL, so
-    /// `is(S_IFBLK/S_IFCHR/S_IFIFO/S_IFSOCK)` always answers `false`; only
-    /// `S_IFDIR`/`S_IFREG` can be `true`.
+    /// DOTNET PAL ARM (Package A/B) — `os::unix::fs::FileTypeExt` queries
+    /// `self.as_inner().is(libc::S_IFBLK)` etc. The dotnet `FileType` carries a
+    /// dir/file flag (+ symlink), so synthesize the `S_IFMT` masked type and
+    /// compare. **LEAKY (L3):** block/char/fifo/socket are never modelled by the
+    /// BCL, so `is(S_IFBLK/S_IFCHR/S_IFIFO/S_IFSOCK)` always answers `false`;
+    /// `S_IFDIR`/`S_IFREG`/`S_IFLNK` can be `true`.
     pub fn is(&self, mode: i32) -> bool {
         // `mode` is a `libc::S_IF*` const, typed `c_int` (i32) in the dotnet libc
         // face — match that here.
         const S_IFMT: i32 = 0o170000;
         const S_IFDIR: i32 = 0o040000;
         const S_IFREG: i32 = 0o100000;
-        let synthetic = if self.is_dir { S_IFDIR } else { S_IFREG };
+        const S_IFLNK: i32 = 0o120000;
+        let synthetic = if self.is_symlink {
+            S_IFLNK
+        } else if self.is_dir {
+            S_IFDIR
+        } else {
+            S_IFREG
+        };
         mode & S_IFMT == synthetic
     }
 }
@@ -303,6 +335,13 @@ impl FileTimes {
 pub struct FileAttr {
     size: u64,
     is_dir: bool,
+    // B2 Piece 2/4: real Unix-seconds timestamps (0 when unknown, e.g. the
+    // live-FileStream `file_attr()` path that can't cheaply re-stat) + symlink
+    // flag (from FileAttributes.ReparsePoint).
+    mtime: i64,
+    atime: i64,
+    ctime: i64,
+    is_symlink: bool,
 }
 
 impl FileAttr {
@@ -315,20 +354,48 @@ impl FileAttr {
     }
 
     pub fn file_type(&self) -> FileType {
-        FileType { is_dir: self.is_dir }
+        FileType { is_dir: self.is_dir, is_symlink: self.is_symlink }
     }
 
+    // B2 Piece 2: real timestamps via the path-stat hook (FileInfo getters).
+    // A zero value means "not available" (the live-FileStream path) and surfaces
+    // as Unsupported so callers fall back gracefully rather than reporting 1970.
     pub fn modified(&self) -> io::Result<SystemTime> {
-        unsupported()
+        time_from_unix_secs(self.mtime)
     }
 
     pub fn accessed(&self) -> io::Result<SystemTime> {
-        unsupported()
+        time_from_unix_secs(self.atime)
     }
 
     pub fn created(&self) -> io::Result<SystemTime> {
-        unsupported()
+        time_from_unix_secs(self.ctime)
     }
+
+    /// Raw Unix-seconds accessors for the .NET `MetadataExt::st_{m,a,c}time`.
+    #[inline]
+    pub fn mtime(&self) -> i64 {
+        self.mtime
+    }
+    #[inline]
+    pub fn atime(&self) -> i64 {
+        self.atime
+    }
+    #[inline]
+    pub fn ctime(&self) -> i64 {
+        self.ctime
+    }
+}
+
+/// Map Unix-seconds (i64) to a `SystemTime`, or `Unsupported` when zero (the
+/// timestamp wasn't recovered — e.g. a live FileStream that can't re-stat).
+fn time_from_unix_secs(secs: i64) -> io::Result<SystemTime> {
+    if secs <= 0 {
+        return unsupported();
+    }
+    crate::sys::time::UNIX_EPOCH
+        .checked_add_duration(&crate::time::Duration::from_secs(secs as u64))
+        .ok_or_else(|| io::const_error!(io::ErrorKind::Uncategorized, "timestamp overflow"))
 }
 
 #[derive(Clone, Debug)]
@@ -462,9 +529,19 @@ impl File {
 
     pub fn file_attr(&self) -> io::Result<FileAttr> {
         // Only the length is recoverable from a live FileStream handle here.
+        // Timestamps are left 0 (LEAKY, documented): there is no cheap fstat on a
+        // live handle, and `modified()`/`accessed()`/`created()` surface
+        // Unsupported for a 0. Path-based `stat`/`metadata` DO carry real times.
         // SAFETY: `self.handle` is a live FileStream handle.
         let len = unsafe { rcl_dotnet_fs_len(self.handle) };
-        Ok(FileAttr { size: len.max(0) as u64, is_dir: false })
+        Ok(FileAttr {
+            size: len.max(0) as u64,
+            is_dir: false,
+            mtime: 0,
+            atime: 0,
+            ctime: 0,
+            is_symlink: false,
+        })
     }
 
     pub fn fsync(&self) -> io::Result<()> {
@@ -527,35 +604,55 @@ impl File {
     }
 
     // =======================================================================
-    // DOTNET PAL ARM (Package A/B stub) — os::unix::fs::FileExt positioned I/O.
+    // DOTNET PAL ARM (B2 Piece 3) — os::unix::fs::FileExt positioned I/O, REAL.
     //
     // The unix arm backs these with `pread`/`pwrite` (atomic offset-relative I/O
     // that does NOT move the stream position). .NET's `RandomAccess.{Read,Write}`
-    // is the real equivalent (a clean Package-C upgrade via a new
-    // `rcl_dotnet_fs_read_at`/`_write_at` hook), but it is not wired yet. Rather
-    // than emulate with seek+read (which would corrupt the shared position and is
-    // non-atomic), these are `Err(Unsupported)` compile-stubs. NOT reached by the
-    // pal_fs probe (which uses sequential read/write).
+    // is the managed equivalent, wired via the new `rcl_dotnet_fs_read_at` /
+    // `_write_at` hooks (cilly dotnet.rs) over the FileStream's SafeFileHandle.
+    // read_buf_at/read_vectored_at/write_vectored_at delegate to the
+    // `crate::io::default_*` adapters over read_at/write_at, exactly like the
+    // sequential read_vectored/read_buf above.
     // =======================================================================
 
-    pub fn read_at(&self, _buf: &mut [u8], _offset: u64) -> io::Result<usize> {
-        unsupported()
+    pub fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // SAFETY: writable region; the hook reads at most `len` bytes at `offset`.
+        let n = unsafe {
+            rcl_dotnet_fs_read_at(self.handle, buf.as_mut_ptr(), buf.len(), offset as i64)
+        };
+        if n < 0 {
+            return Err(io::const_error!(io::ErrorKind::Other, "read_at failed"));
+        }
+        Ok(n as usize)
     }
 
-    pub fn read_buf_at(&self, _cursor: BorrowedCursor<'_, u8>, _offset: u64) -> io::Result<()> {
-        unsupported()
+    pub fn read_buf_at(&self, cursor: BorrowedCursor<'_, u8>, offset: u64) -> io::Result<()> {
+        crate::io::default_read_buf(|buf| self.read_at(buf, offset), cursor)
     }
 
-    pub fn read_vectored_at(&self, _bufs: &mut [IoSliceMut<'_>], _offset: u64) -> io::Result<usize> {
-        unsupported()
+    pub fn read_vectored_at(&self, bufs: &mut [IoSliceMut<'_>], offset: u64) -> io::Result<usize> {
+        crate::io::default_read_vectored(|b| self.read_at(b, offset), bufs)
     }
 
-    pub fn write_at(&self, _buf: &[u8], _offset: u64) -> io::Result<usize> {
-        unsupported()
+    pub fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // SAFETY: readable region; the hook writes all `len` bytes at `offset`.
+        let n = unsafe {
+            rcl_dotnet_fs_write_at(self.handle, buf.as_ptr(), buf.len(), offset as i64)
+        };
+        if n < 0 {
+            return Err(io::const_error!(io::ErrorKind::Other, "write_at failed"));
+        }
+        Ok(n as usize)
     }
 
-    pub fn write_vectored_at(&self, _bufs: &[IoSlice<'_>], _offset: u64) -> io::Result<usize> {
-        unsupported()
+    pub fn write_vectored_at(&self, bufs: &[IoSlice<'_>], offset: u64) -> io::Result<usize> {
+        crate::io::default_write_vectored(|b| self.write_at(b, offset), bufs)
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
@@ -805,16 +902,44 @@ pub fn exists(path: &Path) -> io::Result<bool> {
     Ok(r != 0)
 }
 
-pub fn readlink(_p: &Path) -> io::Result<PathBuf> {
-    // No symlink concept on this PAL abstraction (STUBBED).
-    unsupported()
+pub fn readlink(p: &Path) -> io::Result<PathBuf> {
+    // B2 Piece 4: REAL — File.ResolveLinkTarget(path, returnFinalTarget=false).
+    // The hook returns a freshly-allocated NUL-terminated UTF-8 C string (the
+    // resolved target's full path), or NULL when `p` is not a symlink / missing.
+    let bytes = path_bytes(p);
+    // SAFETY: `(ptr, len)` is a readable UTF-8 region; the hook reads it and
+    // returns an owned C string (or null).
+    let ptr = unsafe { rcl_dotnet_fs_readlink(bytes.as_ptr(), bytes.len()) };
+    if ptr.is_null() {
+        return Err(io::const_error!(io::ErrorKind::NotFound, "not a symbolic link"));
+    }
+    // SAFETY: `ptr` is a valid NUL-terminated C string until freed below.
+    let out = unsafe { CStr::from_ptr(ptr.cast()) }.to_bytes().to_vec();
+    // SAFETY: bytes copied out; releasing the hook buffer is sound.
+    unsafe { rcl_dotnet_cotaskmem_free(ptr) };
+    // Build the PathBuf platform-agnostically (Buf + FromInner), matching readdir.
+    Ok(PathBuf::from(OsString::from_inner(Buf { inner: out })))
 }
 
-pub fn symlink(_original: &Path, _link: &Path) -> io::Result<()> {
-    unsupported()
+pub fn symlink(original: &Path, link: &Path) -> io::Result<()> {
+    // B2 Piece 4: REAL — File.CreateSymbolicLink(link, original). `original` is
+    // the target the link points at; `link` is the new symlink location.
+    let target = path_bytes(original);
+    let link_b = path_bytes(link);
+    // SAFETY: both `(ptr, len)` pairs are readable UTF-8 regions the hook reads.
+    let rc = unsafe {
+        rcl_dotnet_fs_symlink(link_b.as_ptr(), link_b.len(), target.as_ptr(), target.len())
+    };
+    if rc != 0 {
+        return Err(io::const_error!(io::ErrorKind::Other, "symlink failed"));
+    }
+    Ok(())
 }
 
 pub fn link(_src: &Path, _dst: &Path) -> io::Result<()> {
+    // STAYS STUBBED (honest): .NET has NO managed `File.CreateHardLink` in the
+    // BCL — only Win32 P/Invoke or libc `link(2)`, neither portable here. Hard
+    // links have no clean managed path, so this remains Unsupported (I3).
     unsupported()
 }
 
@@ -822,11 +947,24 @@ pub fn stat(p: &Path) -> io::Result<FileAttr> {
     let bytes = path_bytes(p);
     let mut size: u64 = 0;
     let mut is_dir: i32 = 0;
-    // SAFETY: `(ptr, len)` describes a readable UTF-8 region; `&mut size` /
-    // `&mut is_dir` are valid out-pointers the hook writes through (only on the
-    // success path).
+    // B2 Piece 2/4: timestamps (Unix seconds) + symlink flag out-locals.
+    let mut mtime: i64 = 0;
+    let mut atime: i64 = 0;
+    let mut ctime: i64 = 0;
+    let mut is_symlink: i32 = 0;
+    // SAFETY: `(ptr, len)` describes a readable UTF-8 region; every `&mut` is a
+    // valid out-pointer the hook writes through (only on the success path).
     let rc = unsafe {
-        rcl_dotnet_fs_stat(bytes.as_ptr(), bytes.len(), &mut size as *mut u64, &mut is_dir as *mut i32)
+        rcl_dotnet_fs_stat(
+            bytes.as_ptr(),
+            bytes.len(),
+            &mut size as *mut u64,
+            &mut is_dir as *mut i32,
+            &mut mtime as *mut i64,
+            &mut atime as *mut i64,
+            &mut ctime as *mut i64,
+            &mut is_symlink as *mut i32,
+        )
     };
     if rc == -1 {
         // CRITICAL: must be NotFound so `exists`/`remove_dir_all`/`copy`'s
@@ -836,11 +974,22 @@ pub fn stat(p: &Path) -> io::Result<FileAttr> {
     if rc != 0 {
         return Err(io::const_error!(io::ErrorKind::Uncategorized, "stat failed"));
     }
-    Ok(FileAttr { size, is_dir: is_dir != 0 })
+    Ok(FileAttr {
+        size,
+        is_dir: is_dir != 0,
+        mtime,
+        atime,
+        ctime,
+        is_symlink: is_symlink != 0,
+    })
 }
 
 pub fn lstat(p: &Path) -> io::Result<FileAttr> {
-    // No symlink distinction on this PAL.
+    // B2 Piece 4: aliases `stat`, but the FileAttr now carries a meaningful
+    // `is_symlink` flag (from FileAttributes.ReparsePoint), so
+    // `symlink_metadata().file_type().is_symlink()` is correct. LEAKY: this does
+    // not avoid following the link for size/timestamps the way a true lstat would
+    // — the BCL static getters resolve the target — but the type is reported.
     stat(p)
 }
 

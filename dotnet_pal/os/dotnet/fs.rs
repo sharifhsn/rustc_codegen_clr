@@ -98,19 +98,25 @@ impl MetadataExt for Metadata {
         self.as_inner().size()
     }
     fn st_atime(&self) -> i64 {
-        0 // timestamps deferred (FileInfo.LastAccessTimeUtc is a follow-up)
+        // B2 Piece 2: REAL — FileInfo.LastAccessTimeUtc (Unix seconds) via the
+        // dotnet stat hook. 0 only on the live-FileStream path (can't re-stat).
+        self.as_inner().atime()
     }
     fn st_atime_nsec(&self) -> i64 {
-        0
+        0 // sub-second precision not surfaced (LEAKY; cheap follow-up)
     }
     fn st_mtime(&self) -> i64 {
-        0
+        // B2 Piece 2: REAL — FileInfo.LastWriteTimeUtc (Unix seconds).
+        self.as_inner().mtime()
     }
     fn st_mtime_nsec(&self) -> i64 {
         0
     }
     fn st_ctime(&self) -> i64 {
-        0
+        // B2 Piece 2: REAL — FileInfo.CreationTimeUtc (Unix seconds). On unix
+        // st_ctime is the inode-change time; .NET has no equivalent, so we report
+        // the creation time (the closest managed analogue) — LEAKY but non-zero.
+        self.as_inner().ctime()
     }
     fn st_ctime_nsec(&self) -> i64 {
         0

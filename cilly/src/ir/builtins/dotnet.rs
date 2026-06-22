@@ -134,7 +134,7 @@ use crate::cilnode::{ExtendKind, MethodKind, PtrCastRes};
 use crate::ir::asm::MissingMethodPatcher;
 use crate::ir::cilroot::BranchCond;
 use crate::ir::{
-    BasicBlock, CILNode, CILRoot, ClassRef, Const, Int, Interned, MethodImpl, MethodRef,
+    BasicBlock, BinOp, CILNode, CILRoot, ClassRef, Const, Int, Interned, MethodImpl, MethodRef,
     StaticFieldDesc, Type,
 };
 use crate::Assembly;
@@ -1428,6 +1428,10 @@ fn insert_dotnet_fs(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     insert_dotnet_fs_open(asm, patcher);
     insert_dotnet_fs_read(asm, patcher);
     insert_dotnet_fs_write(asm, patcher);
+    insert_dotnet_fs_read_at(asm, patcher);
+    insert_dotnet_fs_write_at(asm, patcher);
+    insert_dotnet_fs_symlink(asm, patcher);
+    insert_dotnet_fs_readlink(asm, patcher);
     insert_dotnet_fs_seek(asm, patcher);
     insert_dotnet_fs_flush(asm, patcher);
     insert_dotnet_fs_close(asm, patcher);
@@ -1543,6 +1547,216 @@ fn insert_dotnet_fs_write(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
     patcher.insert(name, Box::new(generator));
 }
 
+/// Resolve a `FileStream` GCHandle (`LdArg(handle_arg)`) to its
+/// `SafeFileHandle` via the `FileStream.SafeFileHandle` instance getter — the
+/// `this` `System.IO.RandomAccess.{Read,Write}` need. Returns the SFH node and
+/// its type. Shared by the `read_at`/`write_at` hooks (B2 Piece 3).
+fn filestream_safe_handle(
+    asm: &mut Assembly,
+    handle_arg: u32,
+) -> (Interned<CILNode>, Type) {
+    let file_stream = ClassRef::file_stream(asm);
+    let safe_handle = ClassRef::safe_file_handle(asm);
+    let sfh_ty = Type::ClassRef(safe_handle);
+    let stream = handle_to_class(asm, handle_arg, file_stream);
+    let get_sfh_name = asm.alloc_string("get_SafeFileHandle");
+    let get_sfh = asm
+        .class_ref(file_stream)
+        .clone()
+        .instance(&[], sfh_ty, get_sfh_name, asm);
+    let sfh = asm.alloc_node(CILNode::call(get_sfh, [stream]));
+    (sfh, sfh_ty)
+}
+
+/// `rcl_dotnet_fs_read_at(handle, buf_ptr, len, offset: i64) -> isize`
+///   => `RandomAccess.Read(FileStream.SafeFileHandle, new Span<byte>(buf_ptr,
+///      (int)len), offset)` (count read; does NOT move the stream position).
+///
+/// B2 Piece 3 — backs `os::unix::fs::FileExt::read_at` (pread) on the dotnet PAL
+/// via `System.IO.RandomAccess`, the managed offset-relative I/O API.
+fn insert_dotnet_fs_read_at(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_read_at");
+    let generator = move |_, asm: &mut Assembly| {
+        let random_access = ClassRef::random_access(asm);
+        let (sfh, sfh_ty) = filestream_safe_handle(asm, 0);
+        let (span, span_ty) = build_byte_span(asm, 1, 2, false);
+        let offset = asm.alloc_node(CILNode::LdArg(3));
+        let read_name = asm.alloc_string("Read");
+        let read = asm.class_ref(random_access).clone().static_mref(
+            &[sfh_ty, span_ty, Type::Int(Int::I64)],
+            Type::Int(Int::I32),
+            read_name,
+            asm,
+        );
+        let count = asm.alloc_node(CILNode::call(read, [sfh, span, offset]));
+        let count = asm.int_cast(count, Int::ISize, ExtendKind::SignExtend);
+        let ret = asm.alloc_root(CILRoot::Ret(count));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_write_at(handle, buf_ptr, len, offset: i64) -> isize`
+///   => `RandomAccess.Write(FileStream.SafeFileHandle, new
+///      ReadOnlySpan<byte>(buf_ptr, (int)len), offset)`; returns `len` (Write
+///      writes all of it or throws). Does NOT move the stream position.
+///
+/// B2 Piece 3 — backs `os::unix::fs::FileExt::write_at` (pwrite).
+fn insert_dotnet_fs_write_at(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_write_at");
+    let generator = move |_, asm: &mut Assembly| {
+        let random_access = ClassRef::random_access(asm);
+        let (sfh, sfh_ty) = filestream_safe_handle(asm, 0);
+        let (span, span_ty) = build_byte_span(asm, 1, 2, true);
+        let offset = asm.alloc_node(CILNode::LdArg(3));
+        let write_name = asm.alloc_string("Write");
+        let write = asm.class_ref(random_access).clone().static_mref(
+            &[sfh_ty, span_ty, Type::Int(Int::I64)],
+            Type::Void,
+            write_name,
+            asm,
+        );
+        let write = asm.alloc_root(CILRoot::call(write, [sfh, span, offset]));
+        let len = asm.alloc_node(CILNode::LdArg(2));
+        let len = asm.int_cast(len, Int::ISize, ExtendKind::ZeroExtend);
+        let ret = asm.alloc_root(CILRoot::Ret(len));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![write, ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_symlink(link_ptr, link_len, target_ptr, target_len) -> i32`
+///   => `File.CreateSymbolicLink(link, target)` (returns 0; the BCL throws on
+///      failure, which unwinds to std's error path).
+///
+/// B2 Piece 4 — backs `sys::fs::symlink`. `.NET` names the args
+/// `CreateSymbolicLink(string path, string pathToTarget)`: `path` is the symlink
+/// location (= std `link`), `pathToTarget` is where it points (= std `original`/
+/// `target`). The result `FileSystemInfo` is popped (discarded).
+fn insert_dotnet_fs_symlink(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_symlink");
+    let generator = move |_, asm: &mut Assembly| {
+        let file = ClassRef::file(asm);
+        let fsi = ClassRef::file_system_info(asm);
+        let fsi_ty = Type::ClassRef(fsi);
+        let link = decode_utf8(asm, 0, 1);
+        let store_link = asm.alloc_root(CILRoot::StLoc(0, link));
+        let target = decode_utf8(asm, 2, 3);
+        let store_target = asm.alloc_root(CILRoot::StLoc(1, target));
+        let create_name = asm.alloc_string("CreateSymbolicLink");
+        let create = asm.class_ref(file).clone().static_mref(
+            &[Type::PlatformString, Type::PlatformString],
+            fsi_ty,
+            create_name,
+            asm,
+        );
+        let link2 = asm.alloc_node(CILNode::LdLoc(0));
+        let target2 = asm.alloc_node(CILNode::LdLoc(1));
+        // `CreateSymbolicLink` returns a FileSystemInfo, so the result must be
+        // popped — CILRoot::call is for void methods and leaving a non-void
+        // result on the stack yields an InvalidProgramException at JIT time.
+        let created = asm.alloc_node(CILNode::call(create, [link2, target2]));
+        let call = asm.alloc_root(CILRoot::Pop(created));
+        let zero = asm.alloc_node(0_i32);
+        let ret = asm.alloc_root(CILRoot::Ret(zero));
+        let string_ty = asm.alloc_type(Type::PlatformString);
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![store_link, store_target, call, ret], 0, None)],
+            locals: vec![
+                (Some(asm.alloc_string("link")), string_ty),
+                (Some(asm.alloc_string("target")), string_ty),
+            ],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_readlink(path_ptr, path_len) -> *mut u8`
+///   => `File.ResolveLinkTarget(path, returnFinalTarget: false)`; on a non-null
+///      `FileSystemInfo` marshals its `FullName` to a NUL-terminated UTF-8 C
+///      string (freed std-side by `rcl_dotnet_cotaskmem_free`); on null (the
+///      path is not a link / does not exist) returns `(u8*)0` so std maps it to
+///      `NotFound`.
+///
+/// B2 Piece 4 — backs `sys::fs::readlink`. Models the null-path on
+/// `rcl_dotnet_paths_current_exe`.
+fn insert_dotnet_fs_readlink(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_readlink");
+    let generator = move |_, asm: &mut Assembly| {
+        let u8_ptr = asm.nptr(Type::Int(Int::U8));
+        let file = ClassRef::file(asm);
+        let fsi = ClassRef::file_system_info(asm);
+        let fsi_ty = Type::ClassRef(fsi);
+
+        // info = File.ResolveLinkTarget(path, false) -> FileSystemInfo? (local 1).
+        let path = decode_utf8(asm, 0, 1);
+        let store_path = asm.alloc_root(CILRoot::StLoc(0, path));
+        let resolve_name = asm.alloc_string("ResolveLinkTarget");
+        let resolve = asm.class_ref(file).clone().static_mref(
+            &[Type::PlatformString, Type::Bool],
+            fsi_ty,
+            resolve_name,
+            asm,
+        );
+        let path2 = asm.alloc_node(CILNode::LdLoc(0));
+        let false_c = asm.alloc_node(false);
+        let info = asm.alloc_node(CILNode::call(resolve, [path2, false_c]));
+        let store_info = asm.alloc_root(CILRoot::StLoc(1, info));
+
+        // Block 0: if (info == null) goto 1 else goto 2.
+        let info_load = asm.alloc_node(CILNode::LdLoc(1));
+        let null_fsi = asm.alloc_node(CILNode::Const(Box::new(Const::Null(fsi))));
+        let br_null = asm.alloc_root(CILRoot::Branch(Box::new((
+            1,
+            0,
+            Some(BranchCond::Eq(info_load, null_fsi)),
+        ))));
+        let goto_marshal = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None))));
+
+        // Block 1: return (u8*)0.
+        let zero = asm.alloc_node(0_i32);
+        let zero = asm.int_cast(zero, Int::ISize, ExtendKind::ZeroExtend);
+        let null_ptr = asm.cast_ptr(zero, u8_ptr);
+        let ret_null = asm.alloc_root(CILRoot::Ret(null_ptr));
+
+        // Block 2: s = info.FullName; return (u8*)StringToCoTaskMemUTF8(s).
+        let get_full_name = asm.alloc_string("get_FullName");
+        let get_full = asm.class_ref(fsi).clone().instance(
+            &[],
+            Type::PlatformString,
+            get_full_name,
+            asm,
+        );
+        let info_load2 = asm.alloc_node(CILNode::LdLoc(1));
+        let s = asm.alloc_node(CILNode::call(get_full, [info_load2]));
+        let to_utf8 = string_to_utf8(asm);
+        let buf = asm.alloc_node(CILNode::call(to_utf8, [s]));
+        let buf = asm.cast_ptr(buf, u8_ptr);
+        let ret_buf = asm.alloc_root(CILRoot::Ret(buf));
+
+        let string_ty = asm.alloc_type(Type::PlatformString);
+        let fsi_local_ty = asm.alloc_type(fsi_ty);
+        MethodImpl::MethodBody {
+            blocks: vec![
+                BasicBlock::new(vec![store_path, store_info, br_null, goto_marshal], 0, None),
+                BasicBlock::new(vec![ret_null], 1, None),
+                BasicBlock::new(vec![ret_buf], 2, None),
+            ],
+            locals: vec![
+                (Some(asm.alloc_string("path")), string_ty),
+                (Some(asm.alloc_string("info")), fsi_local_ty),
+            ],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
 /// `rcl_dotnet_fs_seek(handle, offset: i64, origin: i32) -> i64`
 ///   => `FileStream.Seek(offset, (SeekOrigin)origin)` (new absolute position).
 ///
@@ -1650,6 +1864,101 @@ fn insert_dotnet_fs_len(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) 
 ///   => `Directory.Exists(path)` ? write (size 0, is_dir 1), return 0
 ///      : `File.Exists(path)`    ? write (FileInfo.Length, is_dir 0), return 0
 ///      : return -1 (NotFound — the std side maps -1 to `ErrorKind::NotFound`).
+/// .NET ticks (100-ns intervals since `0001-01-01Z`) at the Unix epoch
+/// (`1970-01-01Z`). Subtract this from a `DateTime.Ticks` and divide by
+/// `10_000_000` to get whole Unix seconds. Same constant the std `SystemTime`
+/// PAL uses to rebase `rcl_dotnet_unix_ticks`.
+const DOTNET_UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
+const DOTNET_TICKS_PER_SEC: i64 = 10_000_000;
+
+/// Build a node producing the Unix-seconds timestamp for `path_local`
+/// (`LdLoc(path_local)`) via the static getter `getter` on `System.IO.File`
+/// (e.g. `GetLastWriteTimeUtc`), which returns a `DateTime` struct. The struct
+/// is stowed in `dt_local` so its `.Ticks` instance getter can take a managed
+/// `this` (`LdLocA`); the result is rebased onto the Unix epoch. Returns the
+/// (StLoc-root, secs-node) pair — the caller schedules the StLoc then uses the
+/// node. Used by `rcl_dotnet_fs_stat` (B2 Piece 2) for mtime/atime/ctime.
+fn dotnet_path_time_unix_secs(
+    asm: &mut Assembly,
+    path_local: u32,
+    getter: &str,
+    dt_local: u32,
+) -> (Interned<CILRoot>, Interned<CILNode>) {
+    let file = ClassRef::file(asm);
+    let datetime = ClassRef::datetime(asm);
+    let datetime_ty = Type::ClassRef(datetime);
+    let datetime_ref = asm.nref(datetime_ty);
+
+    // dt = File.<getter>(path) -> DateTime (static), stowed into dt_local.
+    let getter_name = asm.alloc_string(getter);
+    let get_time = asm.class_ref(file).clone().static_mref(
+        &[Type::PlatformString],
+        datetime_ty,
+        getter_name,
+        asm,
+    );
+    let path = asm.alloc_node(CILNode::LdLoc(path_local));
+    let dt = asm.alloc_node(CILNode::call(get_time, [path]));
+    let store_dt = asm.alloc_root(CILRoot::StLoc(dt_local, dt));
+
+    // (&dt_local).Ticks -> int64.
+    let get_ticks_name = asm.alloc_string("get_Ticks");
+    let get_ticks = MethodRef::new(
+        datetime,
+        get_ticks_name,
+        asm.sig([datetime_ref], Type::Int(Int::I64)),
+        MethodKind::Instance,
+        [].into(),
+    );
+    let get_ticks = asm.alloc_methodref(get_ticks);
+    let dt_addr = asm.alloc_node(CILNode::LdLocA(dt_local));
+    let ticks = asm.alloc_node(CILNode::call(get_ticks, [dt_addr]));
+
+    // secs = (ticks - DOTNET_UNIX_EPOCH_TICKS) / DOTNET_TICKS_PER_SEC.
+    let epoch = asm.alloc_node(DOTNET_UNIX_EPOCH_TICKS);
+    let rebased = asm.alloc_node(CILNode::BinOp(ticks, epoch, BinOp::Sub));
+    let per_sec = asm.alloc_node(DOTNET_TICKS_PER_SEC);
+    let secs = asm.alloc_node(CILNode::BinOp(rebased, per_sec, BinOp::Div));
+    (store_dt, secs)
+}
+
+/// `FileAttributes.ReparsePoint` flag (a symlink/junction is a reparse point on
+/// every .NET-supported filesystem). `File.GetAttributes` returns the
+/// `[Flags] enum : int FileAttributes`.
+const DOTNET_FILE_ATTR_REPARSE_POINT: i32 = 0x400;
+
+/// Build an i32 node that is 1 if `path_local` (`LdLoc`) is a symlink (the
+/// `FileAttributes.ReparsePoint` bit is set), else 0. `File.GetAttributes`
+/// returns the int-backed `FileAttributes` enum; we mask the reparse bit and
+/// compare to non-zero. Used by `rcl_dotnet_fs_stat` (B2 Piece 2/4 is_symlink).
+fn dotnet_path_is_symlink_i32(asm: &mut Assembly, path_local: u32) -> Interned<CILNode> {
+    let file = ClassRef::file(asm);
+    let file_attributes = {
+        let name = asm.alloc_string("System.IO.FileAttributes");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
+    };
+    let fa_ty = Type::ClassRef(file_attributes);
+    let get_attrs_name = asm.alloc_string("GetAttributes");
+    let get_attrs = asm.class_ref(file).clone().static_mref(
+        &[Type::PlatformString],
+        fa_ty,
+        get_attrs_name,
+        asm,
+    );
+    let path = asm.alloc_node(CILNode::LdLoc(path_local));
+    let attrs = asm.alloc_node(CILNode::call(get_attrs, [path]));
+    // (int)attrs & ReparsePoint  — the enum is int-backed, so the `and` is on i32.
+    let attrs_i = asm.int_cast(attrs, Int::I32, ExtendKind::ZeroExtend);
+    let reparse = asm.alloc_node(DOTNET_FILE_ATTR_REPARSE_POINT);
+    let masked = asm.alloc_node(CILNode::BinOp(attrs_i, reparse, BinOp::And));
+    // (masked != 0) as i32 — `Eq` yields 1/0; negate via `1 - (masked == 0)`.
+    let zero = asm.alloc_node(0_i32);
+    let is_zero = asm.alloc_node(CILNode::BinOp(masked, zero, BinOp::Eq));
+    let one = asm.alloc_node(1_i32);
+    asm.alloc_node(CILNode::BinOp(one, is_zero, BinOp::Sub))
+}
+
 fn insert_dotnet_fs_stat(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("rcl_dotnet_fs_stat");
     let generator = move |_, asm: &mut Assembly| {
@@ -1679,7 +1988,8 @@ fn insert_dotnet_fs_stat(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
         ))));
         let goto_file = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None))));
 
-        // Block 1 (dir): *out_size = 0; *out_is_dir = 1; return 0.
+        // Block 1 (dir): *out_size = 0; *out_is_dir = 1; timestamps + is_symlink;
+        //                return 0.
         let out_size1 = asm.alloc_node(CILNode::LdArg(2));
         let zero_u64 = asm.alloc_node(0_u64);
         let st_size1 = asm.alloc_root(CILRoot::StInd(Box::new((
@@ -1693,6 +2003,44 @@ fn insert_dotnet_fs_stat(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
         let st_isdir1 = asm.alloc_root(CILRoot::StInd(Box::new((
             out_isdir1,
             one_i32,
+            Type::Int(Int::I32),
+            false,
+        ))));
+        // *out_mtime/atime/ctime = File.GetLast{Write,Access}TimeUtc /
+        // GetCreationTimeUtc(path), rebased to Unix seconds. The static File
+        // getters work for directories too (no FileInfo/DirectoryInfo split).
+        let (store_mt1, mt1) =
+            dotnet_path_time_unix_secs(asm, 0, "GetLastWriteTimeUtc", 2);
+        let out_mt1 = asm.alloc_node(CILNode::LdArg(4));
+        let st_mt1 = asm.alloc_root(CILRoot::StInd(Box::new((
+            out_mt1,
+            mt1,
+            Type::Int(Int::I64),
+            false,
+        ))));
+        let (store_at1, at1) =
+            dotnet_path_time_unix_secs(asm, 0, "GetLastAccessTimeUtc", 3);
+        let out_at1 = asm.alloc_node(CILNode::LdArg(5));
+        let st_at1 = asm.alloc_root(CILRoot::StInd(Box::new((
+            out_at1,
+            at1,
+            Type::Int(Int::I64),
+            false,
+        ))));
+        let (store_ct1, ct1) =
+            dotnet_path_time_unix_secs(asm, 0, "GetCreationTimeUtc", 4);
+        let out_ct1 = asm.alloc_node(CILNode::LdArg(6));
+        let st_ct1 = asm.alloc_root(CILRoot::StInd(Box::new((
+            out_ct1,
+            ct1,
+            Type::Int(Int::I64),
+            false,
+        ))));
+        let sym1 = dotnet_path_is_symlink_i32(asm, 0);
+        let out_sym1 = asm.alloc_node(CILNode::LdArg(7));
+        let st_sym1 = asm.alloc_root(CILRoot::StInd(Box::new((
+            out_sym1,
+            sym1,
             Type::Int(Int::I32),
             false,
         ))));
@@ -1751,6 +2099,42 @@ fn insert_dotnet_fs_stat(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             Type::Int(Int::I32),
             false,
         ))));
+        // *out_mtime/atime/ctime + *out_is_symlink (same as the dir block).
+        let (store_mt3, mt3) =
+            dotnet_path_time_unix_secs(asm, 0, "GetLastWriteTimeUtc", 2);
+        let out_mt3 = asm.alloc_node(CILNode::LdArg(4));
+        let st_mt3 = asm.alloc_root(CILRoot::StInd(Box::new((
+            out_mt3,
+            mt3,
+            Type::Int(Int::I64),
+            false,
+        ))));
+        let (store_at3, at3) =
+            dotnet_path_time_unix_secs(asm, 0, "GetLastAccessTimeUtc", 3);
+        let out_at3 = asm.alloc_node(CILNode::LdArg(5));
+        let st_at3 = asm.alloc_root(CILRoot::StInd(Box::new((
+            out_at3,
+            at3,
+            Type::Int(Int::I64),
+            false,
+        ))));
+        let (store_ct3, ct3) =
+            dotnet_path_time_unix_secs(asm, 0, "GetCreationTimeUtc", 4);
+        let out_ct3 = asm.alloc_node(CILNode::LdArg(6));
+        let st_ct3 = asm.alloc_root(CILRoot::StInd(Box::new((
+            out_ct3,
+            ct3,
+            Type::Int(Int::I64),
+            false,
+        ))));
+        let sym3 = dotnet_path_is_symlink_i32(asm, 0);
+        let out_sym3 = asm.alloc_node(CILNode::LdArg(7));
+        let st_sym3 = asm.alloc_root(CILRoot::StInd(Box::new((
+            out_sym3,
+            sym3,
+            Type::Int(Int::I32),
+            false,
+        ))));
         let zero_ret3 = asm.alloc_node(0_i32);
         let ret_file = asm.alloc_root(CILRoot::Ret(zero_ret3));
 
@@ -1760,17 +2144,36 @@ fn insert_dotnet_fs_stat(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
 
         let string_ty = asm.alloc_type(Type::PlatformString);
         let file_info_ty = asm.alloc_type(Type::ClassRef(file_info));
+        let datetime_cref = ClassRef::datetime(asm);
+        let datetime_ty = asm.alloc_type(Type::ClassRef(datetime_cref));
         MethodImpl::MethodBody {
             blocks: vec![
                 BasicBlock::new(vec![store_path, br_dir, goto_file], 0, None),
-                BasicBlock::new(vec![st_size1, st_isdir1, ret_dir], 1, None),
+                BasicBlock::new(
+                    vec![
+                        st_size1, st_isdir1, store_mt1, st_mt1, store_at1, st_at1, store_ct1,
+                        st_ct1, st_sym1, ret_dir,
+                    ],
+                    1,
+                    None,
+                ),
                 BasicBlock::new(vec![br_file, goto_notfound], 2, None),
-                BasicBlock::new(vec![store_fi, st_size3, st_isdir3, ret_file], 3, None),
+                BasicBlock::new(
+                    vec![
+                        store_fi, st_size3, st_isdir3, store_mt3, st_mt3, store_at3, st_at3,
+                        store_ct3, st_ct3, st_sym3, ret_file,
+                    ],
+                    3,
+                    None,
+                ),
                 BasicBlock::new(vec![ret_nf], 4, None),
             ],
             locals: vec![
                 (Some(asm.alloc_string("path")), string_ty),
                 (Some(asm.alloc_string("file_info")), file_info_ty),
+                (Some(asm.alloc_string("dt_mtime")), datetime_ty),
+                (Some(asm.alloc_string("dt_atime")), datetime_ty),
+                (Some(asm.alloc_string("dt_ctime")), datetime_ty),
             ],
         }
     };

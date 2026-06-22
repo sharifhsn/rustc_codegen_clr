@@ -346,6 +346,36 @@ impl ClassRef {
         let asm_name = Some(asm.alloc_string("System.Runtime"));
         asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
     }
+    /// Returns a reference to the static class `System.IO.RandomAccess`
+    /// (`Read(SafeFileHandle, Span<byte>, long)` / `Write(SafeFileHandle,
+    /// ReadOnlySpan<byte>, long)`) — the offset-relative file I/O backing the
+    /// dotnet `fs` PAL `read_at`/`write_at` (B2 Piece 3). A reference type.
+    #[must_use]
+    pub fn random_access(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.IO.RandomAccess");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to the class
+    /// `Microsoft.Win32.SafeHandles.SafeFileHandle` — `RandomAccess.{Read,Write}`
+    /// take this rather than a `FileStream`; the fs PAL bridges via the
+    /// `FileStream.SafeFileHandle` getter (B2 Piece 3). A reference type.
+    #[must_use]
+    pub fn safe_file_handle(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("Microsoft.Win32.SafeHandles.SafeFileHandle");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to the abstract class `System.IO.FileSystemInfo` — the
+    /// return type of `File.CreateSymbolicLink`/`File.ResolveLinkTarget`; the fs
+    /// PAL reads its `FullName` to recover a `readlink` target (B2 Piece 4). A
+    /// reference type.
+    #[must_use]
+    pub fn file_system_info(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.IO.FileSystemInfo");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
     /// Returns a reference to the static class `System.IO.Path`
     /// (`GetTempPath`) for the dotnet `paths` PAL arm (PACKAGE A).
     #[must_use]
