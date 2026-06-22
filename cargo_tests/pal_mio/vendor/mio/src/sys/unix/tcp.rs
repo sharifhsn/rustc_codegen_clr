@@ -74,6 +74,12 @@ pub(crate) fn accept(listener: &net::TcpListener) -> io::Result<(net::TcpStream,
         target_os = "openbsd",
         target_os = "solaris",
         target_os = "cygwin",
+        // DOTNET PAL ARM (B1 convergence): the cilly POSIX shim implements
+        // accept4(SOCK_CLOEXEC|SOCK_NONBLOCK). Cap-2.5 reached this arm via the
+        // wrapper's `--cfg target_os="linux"`; with the wrapper gone, add dotnet
+        // so accept yields a non-blocking stream atomically (the BSD/`accept`
+        // fallback below is for platforms lacking accept4 and is not for dotnet).
+        target_os = "dotnet",
     ))]
     let stream = {
         syscall!(accept4(

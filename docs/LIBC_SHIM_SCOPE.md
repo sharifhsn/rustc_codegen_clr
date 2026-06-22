@@ -436,6 +436,41 @@ surfaces that as `Err(ErrorKind::WouldBlock)` via `cvt`/`last_os_error` instead 
 loopback-socket eventfd (tokio's reactor constructs a Waker); a `std::os::unix::net` PAL (unblocks
 mio's `uds` → drop the uds gates); the full `families=["unix"]` flip for the broader os::unix DX.
 
+### 4.5 B1: mio CONVERGENCE under the committed global flip (DONE, green)
+
+Package A flipped `target-family=["unix"]` GLOBALLY on `x86_64-unknown-dotnet.json` (committed,
+e0a8a39). B1 collapses the Cap-2.5 mio scaffolding onto that flip. **The crate-scoped RUSTC_WRAPPER
+is DELETED, and the vendored mio Cargo.toml is byte-identical to crates.io mio 1.2.1.** Two Cap-2.5
+crutches dissolve under the flip:
+
+* **The wrapper's `--cfg unix` is redundant** — mio's `#[cfg(unix)]` sys arm now activates straight
+  from `--target` (the spec's `target-family`).
+* **The Cargo libc un-gate is redundant** — cargo evaluates upstream mio's
+  `[target.'cfg(any(unix, hermit, wasi))'.dependencies.libc]` as TRUE at dep-resolution (the spec
+  carries `target-family`), so libc is pulled into mio with **zero** Cargo edits.
+
+The wrapper *also* used to set `--cfg target_os="linux"` so mio's backend-selection cascades (which
+key on `target_os`, not `unix`) would pick the epoll/accept4/SOCK_NONBLOCK linux paths. With the
+wrapper gone, those are replaced by a handful of `target_os="dotnet"` cfg arms baked into the
+vendored mio. **Final mio diff vs crates.io 1.2.1 — ZERO Cargo edits + ~10 functional src lines
+across 4 files + 1 new ~24-line file:**
+
+| file | change | why |
+|---|---|---|
+| `sys/unix/mod.rs` | `#[cfg_attr(target_os="dotnet", path="selector/epoll.rs")]` selector arm | mio selects its readiness backend by `target_os`; dotnet is not in {linux,android,illumos,redox}, so no arm matched → `mod selector` failed to resolve. |
+| `sys/unix/mod.rs` | `target_os="dotnet"` waker arm → `waker/dotnet.rs` | **the irreducible blocker:** the stock eventfd waker needs `std::fs::File: FromRawFd`; the dotnet `fs::File` is GCHandle/FileStream-backed, not fd-backed (deferred). |
+| `sys/unix/mod.rs` + `net/mod.rs` | uds gated `not(target_os="dotnet")` (3 lines) | mio's uds needs `std::os::unix::net::SocketAddr::from_abstract_name` — abstract-namespace AF_UNIX, impossible on stock CoreCLR. |
+| `sys/unix/net.rs` | `target_os="dotnet"` in the SOCK_NONBLOCK\|SOCK_CLOEXEC list (1 line) | atomic non-blocking socket creation in `new_socket`; the shim honours both flags. |
+| `sys/unix/tcp.rs` | `target_os="dotnet"` in the accept4 list (1 line) | atomic non-blocking accept; the shim implements `accept4`. |
+| `sys/unix/waker/dotnet.rs` | NEW ~24-line file | the minimal `Waker{new,wake}` surface the epoll selector re-exports raw. |
+
+**The irreducible remainder** (what keeps mio from being literal zero-patch): (1) the
+`target_os`-keyed backend-selection arms (mio simply has no `target_os="dotnet"` concept — these
+will always be needed unless the project upstreams a dotnet arm to mio); (2) the waker shim, which
+disappears the day the dotnet `std::fs::File` is fd-backed (then the stock eventfd waker works); (3)
+the uds gate-off, which disappears with a real `std::os::unix::net` AF_UNIX PAL. Verified: pal_mio
+≥4/4 deterministic (`"hi-mio"` echo + `"== pal_mio done =="`, exit 0) under the flip with no wrapper.
+
 ---
 
 ## 5. Phased implementation plan

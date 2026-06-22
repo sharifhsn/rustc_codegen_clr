@@ -25,6 +25,14 @@ pub(crate) fn new_socket(domain: libc::c_int, socket_type: libc::c_int) -> io::R
         target_os = "solaris",
         target_os = "hermit",
         target_os = "cygwin",
+        // DOTNET PAL ARM (B1 convergence): the cilly POSIX shim honours
+        // SOCK_NONBLOCK|SOCK_CLOEXEC in `socket()` (linux-flavoured numbering).
+        // Cap-2.5 reached this arm via the wrapper's `--cfg target_os="linux"`;
+        // with the wrapper gone, add dotnet to the list so `new_socket` still
+        // creates a non-blocking socket atomically (mio's readiness model needs
+        // it). Without this, dotnet would match no arm and create a *blocking*
+        // socket, breaking the Poll loop.
+        target_os = "dotnet",
     ))]
     let socket_type = socket_type | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
     // WASI doesn't have the concept of `fork`ing or `exec`ing processes, so

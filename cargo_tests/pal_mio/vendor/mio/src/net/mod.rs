@@ -33,11 +33,13 @@ mod udp;
 #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
 pub use self::udp::UdpSocket;
 
-// DOTNET PAL ARM (Cap-2.5): the wrapper lights cfg(unix) for mio's TCP/UDP epoll
-// path, but mio's unix-DOMAIN-socket module needs `std::os::unix::net`
-// (UnixStream/SocketAddr/from_abstract_name) which the dotnet std PAL does not
-// provide (AF_UNIX is exactly the leaky unix surface the libc-shim avoids). Gate
-// it off for os=dotnet; pal_mio uses only TCP/UDP.
+// DOTNET PAL ARM (B1 convergence): cfg(unix) is now global (the target-family
+// flip), so mio's TCP/UDP epoll path activates from --target. But its unix-DOMAIN-
+// socket module needs `std::os::unix::net::SocketAddr::{from_pathname,
+// from_abstract_name}` — the abstract-namespace AF_UNIX surface the dotnet PAL
+// only compile-stubs as Err(Unsupported) / drops by linux-bsd cfg (impossible on
+// stock CoreCLR). Gate uds off for os=dotnet; pal_mio uses only TCP/UDP. This is
+// part of the irreducible remainder (see docs/LIBC_SHIM_SCOPE.md §4.5).
 #[cfg(all(unix, not(target_os = "dotnet")))]
 mod uds;
 #[cfg(all(unix, not(target_os = "dotnet")))]

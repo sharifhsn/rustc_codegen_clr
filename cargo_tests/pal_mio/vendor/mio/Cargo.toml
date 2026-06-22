@@ -124,16 +124,12 @@ default-features = false
 [dev-dependencies.rand]
 version = "0.9"
 
-# DOTNET PAL ARM (Cap-2.5): the one load-bearing Cargo line. Upstream gates libc
-# on `cfg(any(unix, hermit, wasi))`, evaluated by cargo at DEP-RESOLUTION against
-# the target spec — where os=dotnet has NO target_family, so cfg(unix) is false
-# and libc is never compiled into mio. The crate-scoped RUSTC_WRAPPER's --cfg runs
-# per-rustc-invocation AFTER resolution and cannot fix that. Un-gating to a plain
-# unconditional dependency makes cargo always compile libc into mio (no global
-# target-family flip needed); the wrapper then gives that single libc build its
-# real linux/gnu module. Cargo.lock already pins libc 0.2.x — only an existing
-# edge is un-gated. This is the ONLY Cargo.toml change vs published mio 1.2.1.
-[dependencies.libc]
+# B1 CONVERGENCE: reverted to UPSTREAM gating (byte-identical to published mio
+# 1.2.1). The Cap-2.5 un-gate (unconditional `[dependencies.libc]`) is no longer
+# needed: with `target-family=["unix"]` now GLOBAL on the dotnet spec, cargo
+# evaluates `cfg(any(unix, ...))` as TRUE at DEP-RESOLUTION, so libc is pulled
+# into mio without any Cargo edit. This section is now identical to crates.io mio.
+[target.'cfg(any(unix, target_os = "hermit", target_os = "wasi"))'.dependencies.libc]
 version = "0.2.183"
 
 [target.'cfg(target_os = "wasi")'.dependencies.wasi]

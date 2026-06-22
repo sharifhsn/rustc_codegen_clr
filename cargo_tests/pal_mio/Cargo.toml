@@ -6,18 +6,25 @@ edition = "2021"
 mio = { version = "1", features = ["net", "os-poll"] }
 [workspace]
 
-# DOTNET PAL ARM (Cap-2.5): NEAR-UNMODIFIED upstream mio 1.2.1. The vendored copy
-# is byte-identical to published mio 1.2.1 EXCEPT (a) one Cargo.toml line — libc
-# un-gated to an unconditional [dependencies] so cargo compiles it into mio
-# without a global target-family flip — and (b) one src hunk in sys/unix/mod.rs:
-# a `target_os = "dotnet"` waker arm routing to mio's own File-free
-# single_threaded.rs (the linux eventfd waker needs an fd-backed std fs::File,
-# deferred). NO sys/dotnet fork. mio drives its UPSTREAM #[cfg(unix)] epoll arm
-# straight onto the cilly POSIX shim; the crate-scoped RUSTC_WRAPPER
-# (feasibility/rcc-rustc-wrapper.sh, wired in dev.sh) adds --cfg unix/linux/gnu
-# to the mio+libc crates ONLY so they pick their epoll/eventfd paths and libc's
-# real linux/gnu epoll+sockaddr decls. std stays pristine os=dotnet; the spec has
-# no target-family. The patch must resolve at the same MAJOR as `mio = "1"` (the
-# committed Cargo.lock pins 1.2.1) or it silently no-ops.
+# DOTNET PAL ARM (B1 convergence): UPSTREAM mio 1.2.1 + a handful of small
+# `target_os = "dotnet"` PAL arms, ZERO Cargo edits, NO external wrapper. With
+# `target-family=["unix"]` now GLOBAL on the dotnet target spec (the committed
+# flip), mio gets `cfg(unix)` straight from --target (its #[cfg(unix)] sys arm
+# activates) and cargo evaluates `cfg(any(unix,...))` TRUE at dep-resolution so it
+# pulls libc into mio WITHOUT any Cargo.toml change (vendor/mio/Cargo.toml is now
+# byte-identical to crates.io). The vendored src differs from upstream only by:
+#   * a `#[cfg_attr(target_os="dotnet", path="selector/epoll.rs")]` selector arm
+#     (mio picks its backend by target_os and has no dotnet concept),
+#   * the `target_os="dotnet"` waker arm + waker/dotnet.rs (the stock eventfd waker
+#     needs an fd-backed std fs::File, which the dotnet GCHandle/FileStream File is
+#     NOT yet — the one irreducible blocker; the waker is never exercised by TCP/UDP),
+#   * `target_os="dotnet"` added to net.rs SOCK_NONBLOCK + tcp.rs accept4 lists
+#     (atomic non-blocking socket creation; the shim honours both),
+#   * uds gated off for dotnet (AF_UNIX abstract-namespace surface is impossible on
+#     stock CoreCLR).
+# mio drives its UPSTREAM #[cfg(unix)] epoll arm straight onto the cilly POSIX shim
+# (bare C-ABI symbol bodies). std stays os=dotnet (the dotnet PAL), with the flip.
+# The patch must resolve at the same MAJOR as `mio = "1"` (committed Cargo.lock
+# pins 1.2.1) or it silently no-ops. See docs/LIBC_SHIM_SCOPE.md §4.5.
 [patch.crates-io]
 mio = { path = "vendor/mio" }

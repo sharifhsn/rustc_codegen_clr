@@ -1,6 +1,9 @@
-// DOTNET PAL ARM (Cap-2.5): the ONLY net-new mio source FILE (everything else in
-// the vendored tree is byte-identical upstream + the sys/unix/mod.rs waker-arm +
-// 2 uds gates + 1 Cargo line).
+// DOTNET PAL ARM (B1 convergence): the ONLY net-new mio source FILE. Everything
+// else in the vendored tree is byte-identical to crates.io mio 1.2.1 except a
+// handful of `target_os = "dotnet"` cfg arms (selector + waker + net SOCK_NONBLOCK
+// + tcp accept4 + uds gate-off) and ZERO Cargo edits. This file is the irreducible
+// remainder: it exists ONLY because the dotnet std `fs::File` is not yet fd-backed,
+// so mio's stock eventfd waker cannot be used.
 //
 // mio's epoll selector re-exports `crate::sys::unix::waker::Waker` RAW (it does
 // not wrap it like the poll selector does), so that `Waker` must expose

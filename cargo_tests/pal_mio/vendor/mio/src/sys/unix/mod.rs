@@ -15,7 +15,18 @@ macro_rules! syscall {
 }
 
 cfg_os_poll! {
+    // DOTNET PAL ARM (B1 convergence): mio selects its readiness backend by
+    // `target_os` — epoll.rs only for {android, illumos, linux, redox}. os=dotnet
+    // is none of those, so without help no selector path matches and `mod selector`
+    // fails to resolve. Cap-2.5 papered over this with a crate-scoped RUSTC_WRAPPER
+    // that layered `--cfg target_os="linux"` onto mio. Now that cfg(unix) is global
+    // (the target-family flip), the wrapper is GONE; instead route os=dotnet to
+    // epoll.rs explicitly (one `#[path]` arm, symmetric with the waker arm below).
+    // The epoll path drives `libc::epoll_*`/`socket`/... whose bodies the cilly
+    // POSIX shim resolves by bare C-ABI symbol name (per-fd Socket.Poll loop).
+    #[cfg_attr(target_os = "dotnet", path = "selector/epoll.rs")]
     #[cfg_attr(all(
+        not(target_os = "dotnet"),
         not(mio_unsupported_force_poll_poll),
         any(
             target_os = "android",
@@ -56,15 +67,16 @@ cfg_os_poll! {
     mod selector;
     pub(crate) use self::selector::*;
 
-    // DOTNET PAL ARM (Cap-2.5): mio's waker cascade selects `waker/eventfd.rs`
+    // DOTNET PAL ARM (B1 convergence): mio's waker cascade selects `waker/eventfd.rs`
     // for linux, which needs `std::fs::File: FromRawFd` — but the dotnet std
-    // `fs::File` is GCHandle/FileStream-backed, not fd-backed (deferred). The
+    // `fs::File` is GCHandle/FileStream-backed, not fd-backed (deferred — THIS is
+    // the irreducible blocker that keeps mio from being literal zero-patch). The
     // epoll selector re-exports `Waker` RAW (needs `new(selector,token)`+`wake()`,
     // which the File-free single_threaded.rs lacks). So route to a minimal dotnet
     // waker (waker/dotnet.rs) with exactly that surface; pal_mio builds no Waker,
     // so it is never exercised. Gated `target_os = "dotnet"`; the upstream cascade
     // below is gated `not(... "dotnet")` so exactly one `mod waker;` is in scope
-    // when the wrapper makes both dotnet AND linux true.
+    // for os=dotnet (no other target_os is true for our target).
     #[cfg(target_os = "dotnet")]
     #[path = "waker/dotnet.rs"]
     mod waker;
@@ -135,8 +147,9 @@ cfg_os_poll! {
 
         pub(crate) mod tcp;
         pub(crate) mod udp;
-        // DOTNET PAL ARM (Cap-2.5): uds needs std::os::unix::net (no dotnet PAL);
-        // see net/mod.rs. Gate off for os=dotnet.
+        // DOTNET PAL ARM (B1 convergence): uds needs std::os::unix::net abstract-
+        // namespace AF_UNIX surface (impossible on stock CoreCLR); see net/mod.rs.
+        // Gate off for os=dotnet (irreducible remainder).
         #[cfg(not(any(target_os = "hermit", target_os = "wasi", target_os = "dotnet")))]
         pub(crate) mod uds;
     }
