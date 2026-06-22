@@ -538,6 +538,17 @@ impl ClassRef {
         asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
     }
     /// Returns a reference to the class
+    /// `System.Net.Sockets.UnixDomainSocketEndPoint` — the `EndPoint` subclass
+    /// for path-based AF_UNIX sockets (`new UnixDomainSocketEndPoint(string)`),
+    /// upcast to `EndPoint` for `Socket.Bind`/`Connect` exactly like `IPEndPoint`
+    /// (B2 Piece 1). A reference type. In `System.Net.Sockets` (NOT Primitives).
+    #[must_use]
+    pub fn unix_domain_socket_endpoint(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Net.Sockets.UnixDomainSocketEndPoint");
+        let asm_name = Some(asm.alloc_string("System.Net.Sockets"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to the class
     /// `System.Security.Cryptography.RandomNumberGenerator`.
     #[must_use]
     pub fn random_number_generator(asm: &mut Assembly) -> Interned<ClassRef> {

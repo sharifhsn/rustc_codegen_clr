@@ -16,7 +16,7 @@
 /// floor case — and falls back to v4 for anything else (the slice does not parse
 /// `sockaddr_in6`; that is a Phase-1 refinement). Produces an `IPEndPoint` node:
 ///   `new IPEndPoint(new IPAddress(ReadOnlySpan<byte>(sa+4, 4)), ntohs(*(u16*)(sa+2)))`.
-fn endpoint_from_sockaddr(asm: &mut Assembly, sa_ptr: Interned<CILNode>) -> Interned<CILNode> {
+fn endpoint_from_sockaddr_inet(asm: &mut Assembly, sa_ptr: Interned<CILNode>) -> Interned<CILNode> {
     // addr bytes: ReadOnlySpan<byte>((byte*)(sa+4), 4).
     let four = asm.alloc_node(Const::ISize(4));
     let sa_isize = asm.alloc_node(CILNode::PtrCast(sa_ptr, Box::new(PtrCastRes::ISize)));
@@ -74,6 +74,102 @@ fn endpoint_from_sockaddr(asm: &mut Assembly, sa_ptr: Interned<CILNode>) -> Inte
         asm,
     );
     asm.alloc_node(CILNode::call(ep_ctor, [addr, port]))
+}
+
+/// B2 Piece 1 — `rcl_endpoint_from_sockaddr(*void sa) -> EndPoint`: a
+/// self-branching MethodDef that reads the address family at `*(u16*)sa` and
+/// returns either a `UnixDomainSocketEndPoint` (AF_UNIX path socket) or an
+/// `IPEndPoint` (AF_INET/INET6), both upcast to the `EndPoint` base. Factoring
+/// the family dispatch into its own MethodDef keeps `bind`/`connect` single-block
+/// errno_wrapped bodies (they just call this and pass the EndPoint to Bind/
+/// Connect). For AF_UNIX the path is the NUL-terminated `sun_path` at `sa+2`
+/// (Linux ABI: `sun_family` u16 @0, `sun_path` @2), decoded via
+/// `Marshal.PtrToStringUTF8` (model: `insert_open`).
+fn define_endpoint_from_sockaddr(asm: &mut Assembly) {
+    let main_module = asm.main_module();
+    let void_ptr = asm.nptr(Type::Void);
+    let endpoint_base = ClassRef::endpoint(asm);
+    let endpoint_base_ty = Type::ClassRef(endpoint_base);
+    let uds_ep = ClassRef::unix_domain_socket_endpoint(asm);
+
+    // Block 0: fam = *(u16*)sa; if fam == AF_UNIX(1) goto 1(unix) else goto 2(inet).
+    let sa0 = asm.alloc_node(CILNode::LdArg(0));
+    let u16_ty = asm.alloc_type(Type::Int(Int::U16));
+    let sa0_ptr = asm.alloc_node(CILNode::PtrCast(sa0, Box::new(PtrCastRes::Ptr(u16_ty))));
+    let fam = asm.alloc_node(CILNode::LdInd {
+        addr: sa0_ptr,
+        tpe: u16_ty,
+        volatile: false,
+    });
+    let fam = asm.int_cast(fam, Int::I32, ExtendKind::ZeroExtend);
+    let af_unix = asm.alloc_node(Const::I32(POSIX_AF_UNIX));
+    let br_unix = asm.alloc_root(CILRoot::Branch(Box::new((
+        1,
+        0,
+        Some(BranchCond::Eq(fam, af_unix)),
+    ))));
+    let goto_inet = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None))));
+
+    // Block 1 (unix): path = Marshal.PtrToStringUTF8((IntPtr)(sa+2));
+    //   ep = new UnixDomainSocketEndPoint(path); ret (EndPoint)ep.
+    let marshal = ClassRef::marshal(asm);
+    let ptr_to_str_name = asm.alloc_string("PtrToStringUTF8");
+    let ptr_to_str = asm.class_ref(marshal).clone().static_mref(
+        &[Type::Int(Int::ISize)],
+        Type::PlatformString,
+        ptr_to_str_name,
+        asm,
+    );
+    let sa_u = asm.alloc_node(CILNode::LdArg(0));
+    let sa_u_isize = asm.alloc_node(CILNode::PtrCast(sa_u, Box::new(PtrCastRes::ISize)));
+    let two = asm.alloc_node(Const::ISize(2));
+    let path_ptr = asm.alloc_node(CILNode::BinOp(sa_u_isize, two, BinOp::Add));
+    let path_str = asm.alloc_node(CILNode::call(ptr_to_str, [path_ptr]));
+    let uds_ctor = asm.class_ref(uds_ep).clone().ctor(&[Type::PlatformString], asm);
+    let uds = asm.alloc_node(CILNode::call(uds_ctor, [path_str]));
+    let endpoint_base_ty_idx = asm.alloc_type(endpoint_base_ty);
+    let uds_base = asm.alloc_node(CILNode::CheckedCast(uds, endpoint_base_ty_idx));
+    let ret_unix = asm.alloc_root(CILRoot::Ret(uds_base));
+
+    // Block 2 (inet): ep = endpoint_from_sockaddr_inet(sa); ret (EndPoint)ep.
+    let sa_i = asm.alloc_node(CILNode::LdArg(0));
+    let inet_ep = endpoint_from_sockaddr_inet(asm, sa_i);
+    let inet_base = endpoint_as_base(asm, inet_ep);
+    let ret_inet = asm.alloc_root(CILRoot::Ret(inet_base));
+
+    let name = asm.alloc_string("rcl_endpoint_from_sockaddr");
+    let sig = asm.sig([void_ptr], endpoint_base_ty);
+    asm.new_method(MethodDef::new(
+        Access::Public,
+        main_module,
+        name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![
+                BasicBlock::new(vec![br_unix, goto_inet], 0, None),
+                BasicBlock::new(vec![ret_unix], 1, None),
+                BasicBlock::new(vec![ret_inet], 2, None),
+            ],
+            locals: vec![],
+        },
+        vec![None],
+    ));
+}
+
+/// Call the `rcl_endpoint_from_sockaddr` MethodDef on `sa_ptr`, returning an
+/// `EndPoint` node (already the base type, ready for `Bind`/`Connect`).
+fn endpoint_from_sockaddr(asm: &mut Assembly, sa_ptr: Interned<CILNode>) -> Interned<CILNode> {
+    let void_ptr = asm.nptr(Type::Void);
+    let endpoint_base = ClassRef::endpoint(asm);
+    let m = main_static(
+        asm,
+        "rcl_endpoint_from_sockaddr",
+        &[void_ptr],
+        Type::ClassRef(endpoint_base),
+    );
+    let sa = asm.cast_ptr(sa_ptr, void_ptr);
+    asm.alloc_node(CILNode::call(m, [sa]))
 }
 
 // --- fd I/O -------------------------------------------------------------------
@@ -274,6 +370,39 @@ fn insert_socket(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let proto = asm.alloc_node(CILNode::BinOp(p_tcp, p_term, BinOp::Add));
         let store_proto = asm.alloc_root(CILRoot::StLoc(3, proto));
 
+        // B2 Piece 1 — AF_UNIX override (single-block, branch-free blend): when
+        // domain == AF_UNIX(1) the BCL Socket ctor needs AddressFamily.Unix(1) +
+        // ProtocolType.Unspecified(0) (Tcp/Udp are rejected for the Unix family).
+        // is_unix = (domain == AF_UNIX). af = is_unix ? 1 : af; proto = is_unix ? 0 : proto.
+        let domain_u = asm.alloc_node(CILNode::LdArg(0));
+        let af_unix_p = asm.alloc_node(Const::I32(POSIX_AF_UNIX));
+        let is_unix = asm.alloc_node(CILNode::BinOp(domain_u, af_unix_p, BinOp::Eq));
+        let is_unix_i = asm.int_cast(is_unix, Int::I32, ExtendKind::ZeroExtend);
+        // not_unix = 1 - is_unix.
+        let one_u = asm.alloc_node(Const::I32(1));
+        let not_unix_i = asm.alloc_node(CILNode::BinOp(one_u, is_unix_i, BinOp::Sub));
+        // af_final = not_unix*af + is_unix*DOTNET_AF_UNIX.
+        let af_cur = asm.alloc_node(CILNode::LdLoc(1));
+        let af_keep = asm.alloc_node(CILNode::BinOp(not_unix_i, af_cur, BinOp::Mul));
+        let af_unix_v = asm.alloc_node(Const::I32(DOTNET_AF_UNIX));
+        let af_set = asm.alloc_node(CILNode::BinOp(is_unix_i, af_unix_v, BinOp::Mul));
+        let af_final = asm.alloc_node(CILNode::BinOp(af_keep, af_set, BinOp::Add));
+        let store_af_u = asm.alloc_root(CILRoot::StLoc(1, af_final));
+        // proto_final = not_unix*proto (+ is_unix*0 — Unspecified is 0, so just
+        // mask out the proto for the unix case).
+        let proto_cur = asm.alloc_node(CILNode::LdLoc(3));
+        let not_unix_i2 = {
+            let domain_u2 = asm.alloc_node(CILNode::LdArg(0));
+            let af_unix_p2 = asm.alloc_node(Const::I32(POSIX_AF_UNIX));
+            let eq = asm.alloc_node(CILNode::BinOp(domain_u2, af_unix_p2, BinOp::Eq));
+            let eq_i = asm.int_cast(eq, Int::I32, ExtendKind::ZeroExtend);
+            let one2 = asm.alloc_node(Const::I32(1));
+            asm.alloc_node(CILNode::BinOp(one2, eq_i, BinOp::Sub))
+        };
+        let proto_final = asm.alloc_node(CILNode::BinOp(not_unix_i2, proto_cur, BinOp::Mul));
+        let _ = DOTNET_PROTO_UNSPEC; // documents the is_unix proto (0).
+        let store_proto_u = asm.alloc_root(CILRoot::StLoc(3, proto_final));
+
         // h = rcl_dotnet_net_socket(af, st, proto).
         let m = dotnet_mref(
             asm,
@@ -308,7 +437,9 @@ fn insert_socket(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let fd = call_fdtable_insert(asm, hh2, FD_KIND_SOCKET, 0);
         let store_fd = asm.alloc_root(CILRoot::StLoc(0, fd));
 
-        let body = vec![store_af, store_st, store_proto, store_h, pop_nb, store_fd];
+        let body = vec![
+            store_af, store_st, store_proto, store_af_u, store_proto_u, store_h, pop_nb, store_fd,
+        ];
         let i32_ty = asm.alloc_type(Type::Int(Int::I32));
         let void_ptr_idx = asm.alloc_type(void_ptr);
         errno_wrapped(
@@ -338,8 +469,9 @@ fn insert_bind(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let s = handle_to_socket_node(asm, h);
         let sa = asm.alloc_node(CILNode::LdArg(1));
         let sa = asm.cast_ptr(sa, void_ptr);
+        // Family-dispatching: returns an EndPoint base (IPEndPoint or
+        // UnixDomainSocketEndPoint) — already the type Bind expects.
         let ep = endpoint_from_sockaddr(asm, sa);
-        let ep = endpoint_as_base(asm, ep);
         let bind_name = asm.alloc_string("Bind");
         let bind = asm.class_ref(socket).clone().instance(
             &[Type::ClassRef(endpoint_base)],
@@ -391,8 +523,8 @@ fn insert_connect(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let s = handle_to_socket_node(asm, h);
         let sa = asm.alloc_node(CILNode::LdArg(1));
         let sa = asm.cast_ptr(sa, void_ptr);
+        // Family-dispatching: EndPoint base (v4/v6 or Unix), ready for Connect.
         let ep = endpoint_from_sockaddr(asm, sa);
-        let ep = endpoint_as_base(asm, ep);
         let connect_name = asm.alloc_string("Connect");
         let connect = asm.class_ref(socket).clone().instance(
             &[Type::ClassRef(endpoint_base)],
@@ -432,20 +564,21 @@ fn define_accept_write_addr(asm: &mut Assembly) {
     let main_module = asm.main_module();
     let void_ptr = asm.nptr(Type::Void);
 
-    // block 0: if sa(arg1) == null -> ret (block 3); else fall to 1.
+    // block 0: if sa(arg1) == null -> ret (block 5); else fall to 1.
     let sa = asm.alloc_node(CILNode::LdArg(1));
     let sa_isize = asm.alloc_node(CILNode::PtrCast(sa, Box::new(PtrCastRes::ISize)));
     let zero = asm.alloc_node(Const::ISize(0));
     let br_null = asm.alloc_root(CILRoot::Branch(Box::new((
-        3,
+        5,
         0,
         Some(BranchCond::Eq(sa_isize, zero)),
     ))));
-    let goto_write = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
+    let goto_classify = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
 
-    // block 1: ep = (IPEndPoint)conn.RemoteEndPoint; store local 0;
-    //   write family/port/addr into *arg1 (via write_sockaddr_out on ep_local 0,
-    //   bytes_local 1, sa_arg 1); goto 2.
+    // block 1: ep = conn.RemoteEndPoint as IPEndPoint (isinst; null if it is a
+    //   UnixDomainSocketEndPoint). store local 0; if ep != null goto 2 (v4) else
+    //   goto 4 (unix). B2 Piece 1: an AF_UNIX accept's RemoteEndPoint is NOT an
+    //   IPEndPoint, so the old unconditional cast threw — branch instead.
     let conn = asm.alloc_node(CILNode::LdArg(0));
     let get_remote_name = asm.alloc_string("get_RemoteEndPoint");
     let get_remote = asm.class_ref(socket).clone().instance(
@@ -456,19 +589,28 @@ fn define_accept_write_addr(asm: &mut Assembly) {
     );
     let ep_obj = asm.alloc_node(CILNode::call(get_remote, [conn]));
     let ip_ep_ty = asm.alloc_type(Type::ClassRef(ip_endpoint));
-    let ep = asm.alloc_node(CILNode::CheckedCast(ep_obj, ip_ep_ty));
+    let ep = asm.alloc_node(CILNode::IsInst(ep_obj, ip_ep_ty));
     let store_ep = asm.alloc_root(CILRoot::StLoc(0, ep));
-    let mut blk1 = vec![store_ep];
-    blk1.extend(write_sockaddr_out(asm, 0, 1, 1));
-    let goto_len = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None))));
-    blk1.push(goto_len);
+    let ep_l = asm.alloc_node(CILNode::LdLoc(0));
+    let null_ep = asm.alloc_node(CILNode::Const(Box::new(Const::Null(ip_endpoint))));
+    let br_unix = asm.alloc_root(CILRoot::Branch(Box::new((
+        4,
+        0,
+        Some(BranchCond::Eq(ep_l, null_ep)),
+    ))));
+    let goto_v4 = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None))));
 
-    // block 2: if len(arg2) != null -> *(u32*)len = 16; then ret.
+    // block 2 (v4): write family/port/addr from the IPEndPoint into *sa; goto 3.
+    let mut blk2 = write_sockaddr_out(asm, 0, 1, 1);
+    let goto_len = asm.alloc_root(CILRoot::Branch(Box::new((3, 0, None))));
+    blk2.push(goto_len);
+
+    // block 3: if len(arg2) != null -> *(u32*)len = 16 (sockaddr_in); then ret.
     let len = asm.alloc_node(CILNode::LdArg(2));
     let len_isize = asm.alloc_node(CILNode::PtrCast(len, Box::new(PtrCastRes::ISize)));
     let zero2 = asm.alloc_node(Const::ISize(0));
     let br_len_null = asm.alloc_root(CILRoot::Branch(Box::new((
-        3,
+        5,
         0,
         Some(BranchCond::Eq(len_isize, zero2)),
     ))));
@@ -477,9 +619,34 @@ fn define_accept_write_addr(asm: &mut Assembly) {
     let len_ptr = asm.alloc_node(CILNode::PtrCast(len2, Box::new(PtrCastRes::Ptr(u32_ty))));
     let sixteen = asm.alloc_node(Const::U32(16));
     let st_len = asm.alloc_root(CILRoot::StInd(Box::new((len_ptr, sixteen, Type::Int(Int::U32), false))));
-    let goto_ret = asm.alloc_root(CILRoot::Branch(Box::new((3, 0, None))));
+    let goto_ret3 = asm.alloc_root(CILRoot::Branch(Box::new((5, 0, None))));
 
-    // block 3: ret.
+    // block 4 (unix): minimal sockaddr_un — *(u16*)sa = AF_UNIX(1); if len != null
+    //   *len = 2 (SUN_PATH_OFFSET, an unnamed accepted peer). Then ret. A full
+    //   sun_path round-trip is a refinement; this satisfies UnixStream::peer_addr/
+    //   local_addr without throwing (they only need the family + a valid len).
+    let sa_u = asm.alloc_node(CILNode::LdArg(1));
+    let sa_u_isize = asm.alloc_node(CILNode::PtrCast(sa_u, Box::new(PtrCastRes::ISize)));
+    let u16_ty = asm.alloc_type(Type::Int(Int::U16));
+    let fam_ptr = asm.alloc_node(CILNode::PtrCast(sa_u_isize, Box::new(PtrCastRes::Ptr(u16_ty))));
+    let af_unix = asm.alloc_node(Const::I32(POSIX_AF_UNIX));
+    let af_unix = asm.int_cast(af_unix, Int::U16, ExtendKind::ZeroExtend);
+    let st_fam_u = asm.alloc_root(CILRoot::StInd(Box::new((fam_ptr, af_unix, Type::Int(Int::U16), false))));
+    let len_u = asm.alloc_node(CILNode::LdArg(2));
+    let len_u_isize = asm.alloc_node(CILNode::PtrCast(len_u, Box::new(PtrCastRes::ISize)));
+    let zero_u = asm.alloc_node(Const::ISize(0));
+    let br_len_null_u = asm.alloc_root(CILRoot::Branch(Box::new((
+        5,
+        0,
+        Some(BranchCond::Eq(len_u_isize, zero_u)),
+    ))));
+    let len_u2 = asm.alloc_node(CILNode::LdArg(2));
+    let len_u_ptr = asm.alloc_node(CILNode::PtrCast(len_u2, Box::new(PtrCastRes::Ptr(u32_ty))));
+    let two_u = asm.alloc_node(Const::U32(2));
+    let st_len_u = asm.alloc_root(CILRoot::StInd(Box::new((len_u_ptr, two_u, Type::Int(Int::U32), false))));
+    let goto_ret4 = asm.alloc_root(CILRoot::Branch(Box::new((5, 0, None))));
+
+    // block 5: ret.
     let ret = asm.alloc_root(CILRoot::VoidRet);
 
     let ip_ep_local = asm.alloc_type(Type::ClassRef(ip_endpoint));
@@ -500,10 +667,12 @@ fn define_accept_write_addr(asm: &mut Assembly) {
         MethodKind::Static,
         MethodImpl::MethodBody {
             blocks: vec![
-                BasicBlock::new(vec![br_null, goto_write], 0, None),
-                BasicBlock::new(blk1, 1, None),
-                BasicBlock::new(vec![br_len_null, st_len, goto_ret], 2, None),
-                BasicBlock::new(vec![ret], 3, None),
+                BasicBlock::new(vec![store_ep, br_null, goto_classify], 0, None),
+                BasicBlock::new(vec![br_unix, goto_v4], 1, None),
+                BasicBlock::new(blk2, 2, None),
+                BasicBlock::new(vec![br_len_null, st_len, goto_ret3], 3, None),
+                BasicBlock::new(vec![st_fam_u, br_len_null_u, st_len_u, goto_ret4], 4, None),
+                BasicBlock::new(vec![ret], 5, None),
             ],
             locals: vec![
                 (Some(endpoint_local_name), ip_ep_local),
@@ -532,7 +701,25 @@ fn insert_accept(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let endpoint_base = ClassRef::endpoint(asm);
         let conn = asm.alloc_node(CILNode::call(accept, [s]));
         let store_conn = asm.alloc_root(CILRoot::StLoc(1, conn));
-        // conn.Blocking = false (mio accepts with SOCK_NONBLOCK and depends on it).
+        // conn.Blocking = listener.Blocking — INHERIT the listener's blocking mode
+        // (B2 Piece 1 fix). A non-blocking listener (mio's SOCK_NONBLOCK socket)
+        // yields a non-blocking accepted socket, exactly as before; a *blocking*
+        // listener (a plain std UnixListener/TcpListener) now yields a BLOCKING
+        // accepted socket, so a subsequent blocking `read` waits for data instead
+        // of returning EAGAIN (which previously reset the UDS echo). The dotnet
+        // BCL `Socket.Accept()` does not propagate `Blocking`, so we copy it.
+        let get_blocking_name = asm.alloc_string("get_Blocking");
+        let get_blocking = asm.class_ref(socket).clone().instance(
+            &[],
+            Type::Bool,
+            get_blocking_name,
+            asm,
+        );
+        let fd_b = asm.alloc_node(CILNode::LdArg(0));
+        let h_b = call_fdtable_handle(asm, fd_b);
+        let s_b = handle_to_socket_node(asm, h_b);
+        let listener_blocking = asm.alloc_node(CILNode::call(get_blocking, [s_b]));
+        let store_blk = asm.alloc_root(CILRoot::StLoc(2, listener_blocking));
         let set_blocking_name = asm.alloc_string("set_Blocking");
         let set_blocking = asm.class_ref(socket).clone().instance(
             &[Type::Bool],
@@ -541,8 +728,8 @@ fn insert_accept(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
             asm,
         );
         let conn_b = asm.alloc_node(CILNode::LdLoc(1));
-        let false_c = asm.alloc_node(Const::Bool(false));
-        let do_set_blocking = asm.alloc_root(CILRoot::call(set_blocking, [conn_b, false_c]));
+        let blk_v = asm.alloc_node(CILNode::LdLoc(2));
+        let do_set_blocking = asm.alloc_root(CILRoot::call(set_blocking, [conn_b, blk_v]));
         // handle = (void*)GCHandle.Alloc(conn).
         let handle = CILNode::LdLoc(1).ref_to_handle(asm);
         let handle = asm.alloc_node(handle);
@@ -568,15 +755,17 @@ fn insert_accept(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let len_arg = asm.alloc_node(CILNode::LdArg(2));
         let len_arg = asm.cast_ptr(len_arg, void_ptr);
         let do_write = asm.alloc_root(CILRoot::call(writer, [conn_w, sa_arg, len_arg]));
-        let body = vec![store_conn, do_set_blocking, store_fd, do_write];
+        let body = vec![store_conn, store_blk, do_set_blocking, store_fd, do_write];
 
         let sock_ty = asm.alloc_type(Type::ClassRef(socket));
+        let bool_ty = asm.alloc_type(Type::Bool);
         let conn_name = asm.alloc_string("conn");
+        let blk_name = asm.alloc_string("listener_blocking");
         errno_wrapped(
             asm,
             body,
             Type::Int(Int::I32),
-            vec![(Some(conn_name), sock_ty)],
+            vec![(Some(conn_name), sock_ty), (Some(blk_name), bool_ty)],
         )
     };
     let name = asm.alloc_string("accept");
@@ -1095,6 +1284,7 @@ pub fn insert_posix_shim(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
     insert_ioctl(asm, patcher);
 
     // sockets.
+    define_endpoint_from_sockaddr(asm); // B2 Piece 1 — AF_UNIX/AF_INET dispatch.
     insert_socket(asm, patcher);
     insert_bind(asm, patcher);
     insert_listen(asm, patcher);

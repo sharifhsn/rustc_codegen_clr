@@ -80,9 +80,16 @@ const DOTNET_SOCKTYPE_STREAM: i32 = 1; // SocketType.Stream
 const DOTNET_SOCKTYPE_DGRAM: i32 = 2; // SocketType.Dgram
 const DOTNET_PROTO_TCP: i32 = 6; // ProtocolType.Tcp
 const DOTNET_PROTO_UDP: i32 = 17; // ProtocolType.Udp
+// B2 Piece 1 — AF_UNIX: AddressFamily.Unix == 1 == POSIX AF_UNIX (Linux ABI), so
+// the dotnet enum value and the POSIX domain int coincide. ProtocolType for a
+// Unix socket MUST be Unspecified(0); the BCL Socket ctor throws if Tcp(6) is
+// paired with AddressFamily.Unix.
+const DOTNET_AF_UNIX: i32 = 1; // AddressFamily.Unix
+const DOTNET_PROTO_UNSPEC: i32 = 0; // ProtocolType.Unspecified
 
 // POSIX constants the wrappers branch on.
 const POSIX_AF_INET6: i32 = 10;
+const POSIX_AF_UNIX: i32 = 1;
 const POSIX_SOCK_DGRAM: i32 = 2;
 
 // ===========================================================================

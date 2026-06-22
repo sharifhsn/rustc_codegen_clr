@@ -145,7 +145,18 @@ unsafe extern "C" {
     // int fd. handle resolves an int fd back to its GCHandle.
     fn rcl_fdtable_insert(handle: isize, kind: i32, flags: i32) -> i32;
     fn rcl_fdtable_handle(fd: i32) -> *mut u8;
+
+    // B2 Piece 1 — endpoint-free socket ctor: new Socket((AddressFamily)af,
+    // (SocketType)ty, (ProtocolType)proto). Used by the AF_UNIX Socket::new path
+    // (af = AddressFamily.Unix = 1, ty = Stream = 1, proto = Unspecified = 0).
+    fn rcl_dotnet_net_socket(af: i32, ty: i32, proto: i32) -> *mut u8;
 }
+
+// B2 Piece 1 — .NET enum ints for the AF_UNIX Socket ctor (NOT the FAMILY_V4/V6
+// ABI ints above; these go straight into rcl_dotnet_net_socket -> the BCL enums).
+const DOTNET_AF_UNIX: i32 = 1; // AddressFamily.Unix
+const DOTNET_SOCKTYPE_STREAM: i32 = 1; // SocketType.Stream
+const DOTNET_PROTO_UNSPEC: i32 = 0; // ProtocolType.Unspecified
 
 // fd-table kind tag for a socket entry (matches FD_KIND_SOCKET in posix.rs).
 const FD_KIND_SOCKET: i32 = 2;
@@ -214,27 +225,73 @@ impl Socket {
     // TcpListener/UdpSocket data-plane methods, so the net PAL is unregressed.
     // =======================================================================
 
-    /// `Socket::new(domain, ty)` — create an AF_UNIX socket. STUB (Package C
-    /// wires `new System.Net.Sockets.Socket(AddressFamily.Unix, ...)`).
+    /// `Socket::new(domain, ty)` — create an AF_UNIX socket (B2 Piece 1, REAL).
+    /// Creates `new Socket(AddressFamily.Unix, Stream, Unspecified)` via the
+    /// endpoint-free ctor hook and registers it in the fd-table. The raw
+    /// `bind`/`listen`/`connect` that std then issues (UnixListener::bind /
+    /// UnixStream::connect use RAW libc on this fd) resolve through the POSIX shim.
     pub fn new(_domain: i32, _ty: i32) -> io::Result<Socket> {
-        unsupported()
+        // SAFETY: the hook is a pure ctor; it returns a non-null GCHandle or null
+        // on a managed throw (mapped to an error below).
+        let handle = unsafe {
+            rcl_dotnet_net_socket(DOTNET_AF_UNIX, DOTNET_SOCKTYPE_STREAM, DOTNET_PROTO_UNSPEC)
+        };
+        Socket::from_handle(handle)
+            .ok_or_else(|| io::const_error!(io::ErrorKind::Other, "AF_UNIX socket() failed"))
     }
 
-    /// `Socket::new_pair(domain, ty)` — `socketpair(2)`. STUB (Package C emulates
-    /// via a bound-listener+connect pair — there is no kernel socketpair on CLR).
+    /// `Socket::new_pair(domain, ty)` — `socketpair(2)` (B2 Piece 1, REAL via
+    /// pure-std emulation): there is no kernel socketpair on CLR, so bind a
+    /// UnixListener to a unique temp path, connect a client, accept the server,
+    /// unlink the path, and return (client, server). Reuses the now-real Socket
+    /// ctor + the raw bind/listen/connect/accept POSIX-shim path — NO new hook.
     pub fn new_pair(_domain: i32, _ty: i32) -> io::Result<(Socket, Socket)> {
-        unsupported()
+        use crate::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = crate::process::id();
+        let mut path = crate::env::temp_dir();
+        path.push(format!("rcl_sockpair_{pid}_{n}.sock"));
+        let _ = crate::fs::remove_file(&path);
+
+        // Listener (server side) + connect (client side) over the temp path.
+        let listener = crate::os::unix::net::UnixListener::bind(&path)?;
+        let client = crate::os::unix::net::UnixStream::connect(&path)?;
+        let (server, _addr) = listener.accept()?;
+        // Unlink the path now that both ends are connected (the fds stay valid).
+        let _ = crate::fs::remove_file(&path);
+
+        // Unwrap the std UnixStream wrappers down to the inner sys Socket via the
+        // raw fd (into_raw_fd relinquishes ownership; we re-own it as a Socket).
+        let cfd = client.into_raw_fd();
+        let sfd = server.into_raw_fd();
+        // SAFETY: each fd is a live fd-table SOCKET entry we now own exactly once.
+        let c = unsafe { Socket::from_raw_fd(cfd) };
+        let s = unsafe { Socket::from_raw_fd(sfd) };
+        Ok((c, s))
     }
 
+    /// `accept(storage, len)` — accept a connection (B2 Piece 1, REAL). Routes
+    /// through RAW `libc::accept` (the POSIX-shim `accept` symbol), which does the
+    /// BCL `Accept()`, registers the new connection as a fresh fd, and writes the
+    /// peer address into `storage`/`len` (the shim is AF_UNIX-aware — for a path
+    /// UDS it writes a minimal `sockaddr_un`). We re-own the returned int fd.
     pub fn accept(
         &self,
-        _storage: *mut crate::ffi::c_void,
-        _len: *mut u32,
+        storage: *mut crate::ffi::c_void,
+        len: *mut u32,
     ) -> io::Result<Socket> {
-        unsupported()
+        // SAFETY: `self` owns a live listening fd; `storage`/`len` are caller
+        // out-params the shim writes the peer addr into (null-checked shim-side).
+        let fd = cvt(unsafe {
+            libc::accept(self.as_raw_fd(), storage as *mut libc::sockaddr, len)
+        })?;
+        // SAFETY: `fd` is a fresh fd-table SOCKET entry the shim just registered.
+        Ok(unsafe { Socket::from_raw_fd(fd) })
     }
 
     pub fn duplicate(&self) -> io::Result<Socket> {
+        // No clean BCL path to clone a Socket handle into an independent fd. STUB.
         unsupported()
     }
 
@@ -256,50 +313,85 @@ impl Socket {
         Ok(None)
     }
 
-    pub fn shutdown(&self, _how: Shutdown) -> io::Result<()> {
-        unsupported()
+    pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        // B2 Piece 1: REAL — rcl_dotnet_net_shutdown over the fd-table handle.
+        let how = match how {
+            Shutdown::Read => SHUT_READ,
+            Shutdown::Write => SHUT_WRITE,
+            Shutdown::Both => SHUT_BOTH,
+        };
+        // SAFETY: live handle resolved fresh from the fd-table.
+        let rc = unsafe { rcl_dotnet_net_shutdown(self.handle(), how) };
+        if rc != 0 {
+            return Err(io::const_error!(io::ErrorKind::Other, "shutdown failed"));
+        }
+        Ok(())
     }
 
-    pub fn set_nonblocking(&self, _nonblocking: bool) -> io::Result<()> {
-        // No-op for the AF_UNIX stub (the fd is never live at runtime here).
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        // B2 Piece 1: REAL — rcl_dotnet_net_set_nonblocking (Socket.Blocking).
+        // SAFETY: live handle.
+        let rc = unsafe { rcl_dotnet_net_set_nonblocking(self.handle(), nonblocking as i32) };
+        if rc != 0 {
+            return Err(io::const_error!(io::ErrorKind::Other, "set_nonblocking failed"));
+        }
         Ok(())
     }
 
     pub fn peek(&self, _buf: &mut [u8]) -> io::Result<usize> {
+        // MSG_PEEK-style peek has no clean fd-table-handle path here. STUB.
         unsupported()
     }
 
-    pub fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
-        unsupported()
+    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        // B2 Piece 1: REAL — rcl_dotnet_net_recv (same data-plane as TcpStream).
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // SAFETY: writable region; handle resolved fresh from the fd-table.
+        let n = unsafe { rcl_dotnet_net_recv(self.handle(), buf.as_mut_ptr(), buf.len()) };
+        let n = cvt(n)?;
+        Ok(n as usize)
     }
 
-    pub fn read_buf(&self, _cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
-        unsupported()
+    pub fn read_buf(&self, cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
+        crate::io::default_read_buf(|buf| self.read(buf), cursor)
     }
 
-    pub fn read_vectored(&self, _bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-        unsupported()
+    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+        crate::io::default_read_vectored(|b| self.read(b), bufs)
     }
 
     pub fn is_read_vectored(&self) -> bool {
         false
     }
 
-    pub fn write(&self, _buf: &[u8]) -> io::Result<usize> {
-        unsupported()
+    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        // B2 Piece 1: REAL — rcl_dotnet_net_send.
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // SAFETY: readable region; live handle.
+        let n = unsafe { rcl_dotnet_net_send(self.handle(), buf.as_ptr(), buf.len()) };
+        if n < 0 {
+            return Err(io::const_error!(io::ErrorKind::Other, "send failed"));
+        }
+        Ok(n as usize)
     }
 
-    pub fn write_vectored(&self, _bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        unsupported()
+    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        crate::io::default_write_vectored(|b| self.write(b), bufs)
     }
 
     pub fn is_write_vectored(&self) -> bool {
         false
     }
 
-    /// `send_with_flags(buf, MSG_NOSIGNAL)` from os::unix::net::UnixStream::write. STUB.
-    pub fn send_with_flags(&self, _buf: &[u8], _flags: i32) -> io::Result<usize> {
-        unsupported()
+    /// `send_with_flags(buf, MSG_NOSIGNAL)` from os::unix::net::UnixStream::write
+    /// (B2 Piece 1, REAL). `.NET` has no SIGPIPE, so MSG_NOSIGNAL is a documented
+    /// no-op; the send goes through the same hook as `write`.
+    pub fn send_with_flags(&self, buf: &[u8], _flags: i32) -> io::Result<usize> {
+        self.write(buf)
     }
 }
 
