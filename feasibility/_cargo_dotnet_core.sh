@@ -612,6 +612,17 @@ for d in $(find "$SRC/../../.." "$CD_REGISTRY_SRC" -path '*libc-0.2*/src/lib.rs'
   inject_libc "$(dirname "$d")"
 done
 
+# G1 SETUP HOOK: when `cargo dotnet setup` warms the PAL injection (deliverable #4),
+# it runs THIS core with CD_INJECT_ONLY=1 so the per-toolchain rust-src mutation
+# (everything above) is applied + verified ONCE, fail-fast, WITHOUT a crate build.
+# Default 0 => fully backward-compatible (the build below runs as before). The
+# registry-libc patch (which needs an extracted libc-0.2) is the only part not yet
+# done at this point; setup's first real external build covers it (idempotent).
+if [ "${CD_INJECT_ONLY:-0}" = 1 ]; then
+  echo "== PAL injection complete (CD_INJECT_ONLY) =="
+  exit 0
+fi
+
 # ===========================================================================
 # CRATE-AGNOSTIC BUILD + RUN (the generalization of dev.sh pal-build).
 # cwd is the project dir (/project via the docker -w, or the crate's real host

@@ -76,6 +76,13 @@ and `ilasm`.
 > **[§2b Native (no Docker)](#2b-native-no-docker)** below and
 > [feasibility/README.md](../feasibility/README.md).
 
+> **Dev path vs installed tool.** Running `feasibility/cargo-dotnet` (or `dev.sh pal-build`) from a
+> checkout is the **development** path — it builds from the repo layout and defaults to the Docker
+> backend. For the **end-user** journey — install once, then build/run *any* crate in *any* directory
+> with no repo present — use **[§2c Install once, use anywhere](#2c-install-once-use-anywhere)**. The
+> two are additive: the same script source is both the dev front-end and (after `cargo dotnet setup`
+> copies it to `~/.cargo/bin`) the installed tool.
+
 ---
 
 ## 2b. Native (no Docker)
@@ -189,6 +196,110 @@ or from a normal Windows shell: `feasibility\cargo-dotnet.cmd run cargo_tests\cd
 - The `cargo-dotnet.cmd` WSL branch's `wslpath` translation and delayed-expansion logic is written
   but unexercised.
 Report findings if you run it.
+
+---
+
+## 2c. Install once, use anywhere
+
+§2b runs the native pipeline **from a repo checkout**. The end-user journey removes the repo from the
+loop entirely: **clone once, run `cargo dotnet setup`, then build/run any crate in any directory** —
+no repo, no `RUSTFLAGS`, no env. `setup` provisions a self-contained install home and drops an
+installed `cargo-dotnet` on your PATH.
+
+```bash
+# 1. Clone the repo (the ONLY time you need it).
+git clone https://github.com/FractalFir/rustc_codegen_clr && cd rustc_codegen_clr
+
+# 2. Provision everything (idempotent — safe to re-run).
+feasibility/cargo-dotnet setup        # builds the backend, populates the install home,
+                                      # installs `cargo-dotnet` to ~/.cargo/bin, warms rust-src
+
+# 3. From now on, in ANY crate directory (the repo can be deleted):
+cd ~/my-rust-crate
+cargo dotnet run                      # build + run on .NET
+cargo dotnet build                    # build only
+cargo dotnet run /path/to/other-crate # or point it at a path
+```
+
+### What `setup` provisions
+
+`cargo dotnet setup` is **detect-then-act / idempotent** — each step is skipped when already
+satisfied (or re-done with `--force`):
+
+1. **Toolchain** — ensures the pinned `nightly-2026-06-17` + `rust-src`/`rustc-dev`/`llvm-tools-preview`
+   (via `rustup`). It does **not** hijack your global `rustup default`; the installed front-end pins the
+   toolchain per-build via `RUSTUP_TOOLCHAIN` instead.
+2. **.NET 8 SDK** — installs to `$HOME/.dotnet` (via `dotnet-install.sh`) if neither `$HOME/.dotnet/dotnet`
+   nor a PATH `dotnet` is present.
+3. **CoreCLR `ilasm`** — installs the host-RID `runtime.<rid>.Microsoft.NETCore.ILAsm` (8.0.0) NuGet
+   package's `ilasm` to `$HOME/.dotnet/ilasm-tool/ilasm` (**not** Mono — Mono's PE32 output is rejected
+   by the native CoreCLR loader; see §2b).
+4. **Backend + install home** — builds the backend dylib + `linker` (`cargo +<toolchain> build --release`)
+   from the checkout and copies them, the `dotnet_pal/` + `dotnet_overlays/` trees, the target spec, and a
+   copy of the pipeline core into `CARGO_DOTNET_HOME`.
+5. **Front-end** — copies the `cargo-dotnet` script (a real copy, not a symlink — it survives the repo
+   being moved/deleted) to `~/.cargo/bin/cargo-dotnet`, so `cargo dotnet …` works as a cargo subcommand.
+6. **rust-src PAL injection** — runs the per-toolchain `rust-src` PAL injection once, sourced from the
+   install home, to fail-fast (verifies `rust-src` is writable and every arm applies).
+
+Flags: `--from-repo <path>` (default: the checkout `setup` is run from), `--home <dir>`
+(default `CARGO_DOTNET_HOME`), `--toolchain <name>`, `--skip-toolchain` / `--skip-dotnet` /
+`--skip-ilasm`, `--force`.
+
+### `CARGO_DOTNET_HOME` (the install home)
+
+Default `$HOME/.cargo-dotnet`, overridable by the `CARGO_DOTNET_HOME` env var. It is self-contained —
+the installed front-end runs the whole native pipeline from it with **`CD_REPO` pointed at the home,
+the repo absent**:
+
+```
+$CARGO_DOTNET_HOME/
+  VERSION                                # manifest: git rev, build date, host triple, pinned toolchain
+  core.sh                                # copy of the pipeline core (_cargo_dotnet_core.sh)
+  cargo-dotnet                           # source of the ~/.cargo/bin copy
+  bin/
+    librustc_codegen_clr.<dylib|so|dll>  # the codegen backend (host-native)
+    linker[.exe]                         # the cilly linker
+  target/x86_64-unknown-dotnet.json      # the target spec (CIL is arch-agnostic — unchanged)
+  dotnet_pal/                            # copy of the repo PAL arms (the rust-src injection source)
+  dotnet_overlays/                       # copy of the overlay registry (mio/socket2/tokio + REGISTRY.toml)
+```
+
+The installed front-end self-locates the home, detects host OS (`.dylib`/`.so`/`.dll`), self-heals
+`dotnet` onto PATH from `$HOME/.dotnet` if needed, exports the `CD_*` seam at the home, and runs
+`core.sh` against the current crate dir — **the default backend is `native`** (no Docker). All the
+generated `.cargo/config.toml` paths and exported `CD_*` resolve into `CARGO_DOTNET_HOME`, never the
+repo. (Verified: with the repo physically moved aside, an external crate still builds and runs.)
+
+### Shell rc lines
+
+`setup` prints any lines you should add to your shell rc. Typically:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"      # if ~/.cargo/bin is not already on PATH
+export DOTNET_ROOT="$HOME/.dotnet"        # only if `dotnet` is not on PATH
+export PATH="$HOME/.dotnet:$PATH"         # so the linker can find `dotnet`
+```
+
+(The installed front-end already self-heals `dotnet` from `$HOME/.dotnet`, but exporting it makes other
+tools see it too.)
+
+### Caveats & maintenance
+
+- **`getrandom`** — the command passes `--cfg getrandom_backend="custom"`, but a crate that actually
+  pulls `getrandom` still needs the custom-backend shim symbol (a documented follow-up). Pure
+  compute/`println!` crates and most deps just work.
+- **rust-src is a shared, per-toolchain mutation.** The PAL injection patches the *toolchain's*
+  `rust-src` in place. Every arm is `#[cfg(target_os = "dotnet")]`-gated, so it is inert for any
+  non-dotnet build under that nightly — but it **is** a global side effect (the install is not fully
+  hermetic; it depends on and writes into the rustup toolchain). This is pre-existing repo behaviour,
+  not new to the installed tool.
+- **After a repo update**, re-run `cargo dotnet setup --from-repo <path> --force` to rebuild the
+  backend and refresh the install home.
+
+> The in-repo `feasibility/cargo-dotnet` (and `dev.sh pal-build`) remain the **development** path,
+> unchanged: when invoked from a checkout (the sibling pipeline core present) the script uses the repo
+> layout and the Docker backend by default. The installed tool is purely additive.
 
 ---
 

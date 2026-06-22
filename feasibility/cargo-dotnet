@@ -5,6 +5,8 @@
 # args minus the subcommand. Put this dir on PATH (or symlink this file into
 # ~/.cargo/bin) and use it as:
 #
+#   cargo dotnet setup [--from-repo PATH] [--home DIR] [--skip-toolchain]
+#                      [--skip-dotnet] [--skip-ilasm] [--force]
 #   cargo dotnet build [PATH] [--release|--debug] [--clean] [-v]
 #   cargo dotnet run   [PATH] [--release|--debug] [--clean] [-v] [-- ARGS...]
 #   cargo dotnet help
@@ -15,6 +17,17 @@
 # .cargo/config edits. The command supplies the target spec, build-std, the codegen
 # backend, the dotnet PAL injection, and auto-applies the dotnet_overlays registry
 # (so mio/socket2/tokio "just work"). The user writes a normal Cargo.toml.
+#
+# TWO MODES (G1 — install once, use anywhere). This SAME script runs both:
+#   * DEV (in-repo): invoked as feasibility/cargo-dotnet from a checkout. The
+#     sibling _cargo_dotnet_core.sh is PRESENT, so the repo is the source of the
+#     backend dylib/linker/PAL/overlays/spec. Default backend=docker (unchanged).
+#   * INSTALLED: a copy of this script at ~/.cargo/bin/cargo-dotnet, with the
+#     sibling core ABSENT. It SELF-LOCATES CARGO_DOTNET_HOME (default
+#     $HOME/.cargo-dotnet, populated by `cargo dotnet setup`) and runs the WHOLE
+#     native pipeline from there — NO repo needed. Default backend=native.
+#   `cargo dotnet setup` provisions CARGO_DOTNET_HOME + installs this script to
+#   ~/.cargo/bin; see the setup() function below.
 #
 #   PATH        the crate dir to build (default `.` — the current dir). ARBITRARY:
 #               under cargo_tests/ OR any external path.
@@ -40,27 +53,336 @@
 #     sibling mounts the caller adds (the J4 contract).
 set -euo pipefail
 
-# Resolve the repo root from THIS script's location (NOT the caller's cwd), so the
-# command works from any directory — the dev.sh trick.
+# Resolve THIS script's location (NOT the caller's cwd), so the command works from
+# any directory — the dev.sh trick.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-CORE="$SCRIPT_DIR/_cargo_dotnet_core.sh"
+
+# ---- G1: MODE DETECTION (dev/in-repo vs installed) --------------------------
+# CARGO_DOTNET_HOME is the self-contained install dir (populated by `cargo dotnet
+# setup`). Default $HOME/.cargo-dotnet; overridable by env.
+CARGO_DOTNET_HOME="${CARGO_DOTNET_HOME:-$HOME/.cargo-dotnet}"
+# We are in DEV mode iff the sibling pipeline core is present next to this script
+# (i.e. we are still inside a repo checkout). When this script was COPIED out to
+# ~/.cargo/bin by setup, the sibling core is gone -> INSTALLED mode, and the core +
+# all artifacts come from CARGO_DOTNET_HOME instead.
+if [ -f "$SCRIPT_DIR/_cargo_dotnet_core.sh" ]; then
+  INSTALLED=0
+  REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+  CORE="$SCRIPT_DIR/_cargo_dotnet_core.sh"
+  # DEV default backend stays docker (unchanged); native is opt-in via env.
+  BACKEND="${CARGO_DOTNET_BACKEND:-docker}"
+else
+  INSTALLED=1
+  REPO_ROOT=""                       # no repo in installed mode
+  CORE="$CARGO_DOTNET_HOME/core.sh"
+  # INSTALLED default backend is native (the real user journey: no Docker needed).
+  BACKEND="${CARGO_DOTNET_BACKEND:-native}"
+fi
 IMAGE="${RCC_IMAGE:-rcc-dev}"
-BACKEND="${CARGO_DOTNET_BACKEND:-docker}"
+# The pinned nightly the backend dylib + build-std require. The installed branch
+# exports this as RUSTUP_TOOLCHAIN so an EXTERNAL crate (which has no rustup
+# dir-override) builds under the right toolchain. Read from the VERSION manifest in
+# CARGO_DOTNET_HOME when installed; fall back to the literal pin.
+CD_TOOLCHAIN_DEFAULT="nightly-2026-06-17"
 
 die(){ echo "cargo dotnet: $*" >&2; exit 1; }
 usage(){
   # Self-doc from the header comment (the dev.sh sed pattern).
-  sed -n '3,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '3,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+# ============================================================================
+# SHARED HOST HELPERS (used by both the native build arm AND `cargo dotnet setup`).
+# ============================================================================
+
+# detect_host_os: sets globals dylib_ext (so|dylib|dll), exe_ext (""|.exe), host_rid
+# (the .NET runtime id for the CoreCLR ILAsm NuGet package). uname-first, OSTYPE
+# fallback (Git-Bash/MSYS may report MINGW*).
+detect_host_os(){
+  local host_os host_arch
+  host_os="$(uname -s 2>/dev/null || echo unknown)"
+  host_arch="$(uname -m 2>/dev/null || echo unknown)"
+  case "$host_os" in
+    Darwin)                 dylib_ext="dylib"; exe_ext="";    [ "$host_arch" = arm64 ] && host_rid="osx-arm64" || host_rid="osx-x64" ;;
+    Linux)                  dylib_ext="so";    exe_ext="";    [ "$host_arch" = aarch64 ] && host_rid="linux-arm64" || host_rid="linux-x64" ;;
+    MINGW*|MSYS*|CYGWIN*)   dylib_ext="dll";   exe_ext=".exe"; host_rid="win-x64" ;;
+    *)
+      case "${OSTYPE:-}" in
+        msys|cygwin|win32) dylib_ext="dll"; exe_ext=".exe"; host_rid="win-x64" ;;
+        darwin*)           dylib_ext="dylib"; exe_ext="";   host_rid="osx-arm64" ;;
+        *)                 dylib_ext="so"; exe_ext="";       host_rid="linux-x64" ;;
+      esac ;;
+  esac
+}
+
+# ensure_dotnet_on_path: `dotnet` must be reachable for the CORE (cilly runs
+# `dotnet --info`) and the linker's apphost build. If it is NOT on PATH but the
+# user-local $HOME/.dotnet/dotnet exists (the documented install loc that setup
+# provisions), self-heal by prepending $HOME/.dotnet to PATH + exporting DOTNET_ROOT.
+# This closes the verified gap: `dotnet` is not on PATH on this host.
+ensure_dotnet_on_path(){
+  if ! command -v dotnet >/dev/null 2>&1; then
+    if [ -x "$HOME/.dotnet/dotnet" ]; then
+      export PATH="$HOME/.dotnet:$PATH"
+      export DOTNET_ROOT="${DOTNET_ROOT:-$HOME/.dotnet}"
+    fi
+  fi
+}
+
+# resolve_ilasm: EXPORT ILASM_PATH to a CoreCLR (NOT Mono) ilasm. Order: explicit
+# ILASM_PATH; $HOME/.dotnet/ilasm-tool/ilasm; a non-Mono `ilasm` on PATH. Needs
+# detect_host_os run first (uses exe_ext). Dies with an actionable message.
+resolve_ilasm(){
+  if [ -n "${ILASM_PATH:-}" ]; then
+    [ -x "$ILASM_PATH" ] || die "ILASM_PATH='$ILASM_PATH' is not an executable"
+  elif [ -x "$HOME/.dotnet/ilasm-tool/ilasm$exe_ext" ]; then
+    export ILASM_PATH="$HOME/.dotnet/ilasm-tool/ilasm$exe_ext"
+  elif command -v ilasm >/dev/null 2>&1; then
+    if ilasm --version 2>&1 | grep -qi mono; then
+      die "the \`ilasm\` on PATH is Mono's, which emits PE32 images the native CoreCLR loader rejects. Run \`cargo dotnet setup\` (installs the CoreCLR ILAsm to \$HOME/.dotnet/ilasm-tool/ilasm), or set ILASM_PATH to a CoreCLR ilasm."
+    fi
+    : # a non-Mono `ilasm` on PATH — cilly's bare `ilasm` default is fine
+  else
+    die "ilasm not found (no ILASM_PATH, none at \$HOME/.dotnet/ilasm-tool/ilasm, none on PATH). Run \`cargo dotnet setup\` to install the CoreCLR ILAsm NuGet tool."
+  fi
+}
+
+# read_home_toolchain: echo the pinned toolchain recorded in CARGO_DOTNET_HOME/VERSION
+# (key `toolchain = …`), or the literal default if no manifest. An external crate has
+# no rustup dir-override, so the installed build arm EXPORTs this as RUSTUP_TOOLCHAIN.
+read_home_toolchain(){
+  local v="$CARGO_DOTNET_HOME/VERSION"
+  if [ -f "$v" ] && grep -q '^toolchain *=' "$v"; then
+    awk -F'=' '/^toolchain *=/{gsub(/[ \t]/,"",$2); print $2; exit}' "$v"
+  else
+    echo "$CD_TOOLCHAIN_DEFAULT"
+  fi
+}
+
+# ============================================================================
+# `cargo dotnet setup` — the idempotent provisioner (G1 deliverable #3).
+# Builds + populates CARGO_DOTNET_HOME from a repo checkout, installs the front-end
+# to ~/.cargo/bin, warms the per-toolchain rust-src PAL injection. Detect-then-act:
+# every step skips cleanly when already satisfied (or overwrites on --force).
+# ============================================================================
+cd_setup(){
+  local FROM_REPO="" HOME_DIR="$CARGO_DOTNET_HOME" FORCE=0
+  local SKIP_TOOLCHAIN=0 SKIP_DOTNET=0 SKIP_ILASM=0
+  local TOOLCHAIN="$CD_TOOLCHAIN_DEFAULT"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from-repo) FROM_REPO="${2:-}"; shift ;;
+      --home)      HOME_DIR="${2:-}"; shift ;;
+      --toolchain) TOOLCHAIN="${2:-}"; shift ;;
+      --skip-toolchain) SKIP_TOOLCHAIN=1 ;;
+      --skip-dotnet)    SKIP_DOTNET=1 ;;
+      --skip-ilasm)     SKIP_ILASM=1 ;;
+      --force)     FORCE=1 ;;
+      -h|--help)   usage; return 0 ;;
+      *) die "setup: unknown flag '$1'" ;;
+    esac
+    shift
+  done
+
+  # In DEV mode the default FROM_REPO is THIS checkout (so `clone && cargo dotnet
+  # setup` works). In INSTALLED mode there is no repo, so --from-repo is REQUIRED.
+  if [ -z "$FROM_REPO" ]; then
+    if [ "$INSTALLED" = 0 ] && [ -n "$REPO_ROOT" ]; then
+      FROM_REPO="$REPO_ROOT"
+    else
+      die "setup: --from-repo <path> is required when running the installed front-end (no repo to build from). Re-run from a repo checkout, or pass --from-repo."
+    fi
+  fi
+  FROM_REPO="$(cd "$FROM_REPO" 2>/dev/null && pwd)" || die "setup: --from-repo path does not exist: $FROM_REPO"
+  [ -f "$FROM_REPO/feasibility/_cargo_dotnet_core.sh" ] || die "setup: '$FROM_REPO' is not a rustc_codegen_clr checkout (no feasibility/_cargo_dotnet_core.sh)"
+  [ -f "$FROM_REPO/x86_64-unknown-dotnet.json" ] || die "setup: target spec missing in repo: $FROM_REPO/x86_64-unknown-dotnet.json"
+
+  detect_host_os
+  local prov_tc="skipped" prov_dotnet="skipped" prov_ilasm="skipped"
+
+  echo "== cargo dotnet setup =="
+  echo "   from-repo : $FROM_REPO"
+  echo "   home      : $HOME_DIR"
+  echo "   toolchain : $TOOLCHAIN"
+  echo "   host      : $(uname -sm) (rid=$host_rid, dylib=.$dylib_ext, exe='${exe_ext:-<none>}')"
+  echo ""
+
+  # ---- STEP 1: toolchain (rustup nightly + components) -----------------------
+  if [ "$SKIP_TOOLCHAIN" = 1 ]; then
+    echo "==> [1/6] toolchain: skipped (--skip-toolchain)"
+  else
+    command -v rustup >/dev/null 2>&1 || die "setup: rustup not found on PATH (needed to install the pinned nightly). Install rustup, then re-run."
+    if rustup toolchain list 2>/dev/null | grep -q "^$TOOLCHAIN"; then
+      echo "==> [1/6] toolchain $TOOLCHAIN already installed"
+    else
+      echo "==> [1/6] installing toolchain $TOOLCHAIN (+ rust-src rustc-dev llvm-tools-preview)"
+      rustup toolchain install "$TOOLCHAIN" \
+        --component rust-src --component rustc-dev --component llvm-tools-preview \
+        || die "setup: rustup toolchain install failed"
+      prov_tc="installed"
+    fi
+    # Components are idempotent to (re)add — ensure all three regardless.
+    rustup component add --toolchain "$TOOLCHAIN" rust-src rustc-dev llvm-tools-preview >/dev/null 2>&1 || true
+    [ "$prov_tc" = installed ] || prov_tc="present"
+  fi
+
+  # ---- STEP 2: .NET 8 SDK + CoreCLR ilasm ------------------------------------
+  if [ "$SKIP_DOTNET" = 1 ]; then
+    echo "==> [2/6] .NET SDK: skipped (--skip-dotnet)"
+  else
+    if [ -x "$HOME/.dotnet/dotnet" ] || command -v dotnet >/dev/null 2>&1; then
+      echo "==> [2/6] .NET SDK present ($( [ -x "$HOME/.dotnet/dotnet" ] && echo "\$HOME/.dotnet" || echo "on PATH" ))"
+    else
+      echo "==> [2/6] installing .NET 8 SDK to \$HOME/.dotnet (dotnet-install.sh)"
+      curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 8.0 --install-dir "$HOME/.dotnet" \
+        || die "setup: dotnet-install failed"
+      prov_dotnet="installed"
+    fi
+    [ "$prov_dotnet" = installed ] || prov_dotnet="present"
+  fi
+
+  if [ "$SKIP_ILASM" = 1 ]; then
+    echo "==> [3a] ilasm: skipped (--skip-ilasm)"
+  else
+    if [ -x "$HOME/.dotnet/ilasm-tool/ilasm$exe_ext" ]; then
+      echo "==> [3a] CoreCLR ilasm present (\$HOME/.dotnet/ilasm-tool/ilasm$exe_ext)"
+      prov_ilasm="present"
+    else
+      echo "==> [3a] installing CoreCLR ILAsm ($host_rid) to \$HOME/.dotnet/ilasm-tool/ilasm$exe_ext"
+      local nupkg="/tmp/cd_ilasm.$$.nupkg" exdir="/tmp/cd_ilasm.$$.d"
+      rm -rf "$exdir"; mkdir -p "$exdir"
+      curl -sSL -o "$nupkg" "https://www.nuget.org/api/v2/package/runtime.$host_rid.microsoft.netcore.ilasm/8.0.0" \
+        || die "setup: failed to download the CoreCLR ILAsm NuGet package for $host_rid"
+      ( cd "$exdir" && unzip -qo "$nupkg" ) || die "setup: failed to unzip the ILAsm package (need unzip)"
+      local src_ilasm="$exdir/runtimes/$host_rid/native/ilasm$exe_ext"
+      [ -f "$src_ilasm" ] || die "setup: ILAsm binary not found in package at runtimes/$host_rid/native/ilasm$exe_ext"
+      mkdir -p "$HOME/.dotnet/ilasm-tool"
+      cp "$src_ilasm" "$HOME/.dotnet/ilasm-tool/ilasm$exe_ext"
+      chmod +x "$HOME/.dotnet/ilasm-tool/ilasm$exe_ext"
+      [ "$(uname -s)" = Darwin ] && xattr -c "$HOME/.dotnet/ilasm-tool/ilasm$exe_ext" 2>/dev/null || true
+      rm -f "$nupkg"; rm -rf "$exdir"
+      # Assert it is NOT Mono.
+      if "$HOME/.dotnet/ilasm-tool/ilasm$exe_ext" --version 2>&1 | grep -qi mono; then
+        die "setup: the installed ilasm reports Mono — expected the CoreCLR ILAsm. Aborting."
+      fi
+      prov_ilasm="installed"
+    fi
+  fi
+
+  # ---- STEP 3: build backend + populate CARGO_DOTNET_HOME ---------------------
+  echo "==> [4/6] building the backend (cilly + linker, then the codegen dylib) from $FROM_REPO"
+  ensure_dotnet_on_path
+  ( cd "$FROM_REPO/cilly" && cargo "+$TOOLCHAIN" build --release ) || die "setup: cilly build failed"
+  ( cd "$FROM_REPO" && cargo "+$TOOLCHAIN" build --release -p rustc_codegen_clr ) || die "setup: codegen dylib build failed"
+  local dylib="$FROM_REPO/target/release/librustc_codegen_clr.$dylib_ext"
+  local linker="$FROM_REPO/target/release/linker$exe_ext"
+  [ -f "$dylib" ]  || die "setup: backend dylib not produced: $dylib"
+  [ -f "$linker" ] || die "setup: linker not produced: $linker"
+
+  echo "==> [4/6] populating $HOME_DIR"
+  mkdir -p "$HOME_DIR/bin" "$HOME_DIR/target"
+  cp -f "$dylib"  "$HOME_DIR/bin/librustc_codegen_clr.$dylib_ext"
+  cp -f "$linker" "$HOME_DIR/bin/linker$exe_ext"
+  cp -f "$FROM_REPO/x86_64-unknown-dotnet.json" "$HOME_DIR/target/x86_64-unknown-dotnet.json"
+  cp -f "$FROM_REPO/feasibility/_cargo_dotnet_core.sh" "$HOME_DIR/core.sh"
+  cp -f "$FROM_REPO/feasibility/cargo-dotnet"          "$HOME_DIR/cargo-dotnet"
+  # PAL + overlay trees — keep the repo NAMES (dotnet_pal/dotnet_overlays) so the
+  # CORE's hardcoded $CD_REPO/dotnet_pal + $CD_REPO/dotnet_overlays resolve in HOME
+  # with CD_REPO=$HOME and ZERO core edits (this is why the per-build PAL injection
+  # auto-sources from the install home — deliverable #4 for free). On --force, wipe
+  # first so a stale arm/overlay can't linger.
+  if [ "$FORCE" = 1 ]; then rm -rf "$HOME_DIR/dotnet_pal" "$HOME_DIR/dotnet_overlays"; fi
+  rm -rf "$HOME_DIR/dotnet_pal" "$HOME_DIR/dotnet_overlays"   # always refresh (cheap, avoids stale)
+  cp -R "$FROM_REPO/dotnet_pal"      "$HOME_DIR/dotnet_pal"
+  cp -R "$FROM_REPO/dotnet_overlays" "$HOME_DIR/dotnet_overlays"
+  # VERSION manifest.
+  {
+    echo "# CARGO_DOTNET_HOME manifest — generated by \`cargo dotnet setup\`."
+    echo "schema = 1"
+    echo "git_rev = $(git -C "$FROM_REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "built = $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "host = $(uname -sm)"
+    echo "host_rid = $host_rid"
+    echo "toolchain = $TOOLCHAIN"
+    echo "dylib_ext = $dylib_ext"
+    echo "exe_ext = ${exe_ext}"
+  } > "$HOME_DIR/VERSION"
+  echo "==> [4/6] wrote $HOME_DIR/VERSION"
+
+  # ---- STEP 4: install the front-end to ~/.cargo/bin -------------------------
+  local cargobin="${CARGO_HOME:-$HOME/.cargo}/bin"
+  mkdir -p "$cargobin"
+  cp -f "$HOME_DIR/cargo-dotnet" "$cargobin/cargo-dotnet"
+  chmod +x "$cargobin/cargo-dotnet"
+  echo "==> [5/6] installed cargo-dotnet -> $cargobin/cargo-dotnet"
+  case ":$PATH:" in *":$cargobin:"*) : ;; *) echo "!! NOTE: $cargobin is not on your PATH — add it (see summary below)";; esac
+
+  # ---- STEP 5: warm the per-toolchain rust-src PAL injection -----------------
+  # The PAL injection runs from $CD_REPO/dotnet_pal on EVERY build; here we run it
+  # ONCE against a scratch dir with CD_INJECT_ONLY=1, sourced from the INSTALLED
+  # home (CD_REPO=$HOME_DIR), to fail-fast (rust-src writable + every arm applies)
+  # and to prove deliverable #4 (injection from the install home, not the repo).
+  echo "==> [6/6] warming the rust-src PAL injection from $HOME_DIR (CD_INJECT_ONLY)"
+  resolve_ilasm 2>/dev/null || true   # not needed for inject-only, but harmless
+  local scratch="/tmp/cd_inject_warm.$$"
+  rm -rf "$scratch"; mkdir -p "$scratch"
+  printf '[package]\nname = "cd_inject_warm"\nversion = "0.0.0"\nedition = "2021"\n[workspace]\n' > "$scratch/Cargo.toml"
+  mkdir -p "$scratch/src"; printf 'fn main(){}\n' > "$scratch/src/main.rs"
+  (
+    cd "$scratch"
+    RUSTUP_TOOLCHAIN="$TOOLCHAIN" \
+    CD_INJECT_ONLY=1 \
+    CD_REPO="$HOME_DIR" \
+    CD_REGISTRY_SRC="${CARGO_HOME:-$HOME/.cargo}/registry/src" \
+    CD_LASTBUILD_LOG="$HOME_DIR/_lastbuild.log" \
+    bash -o pipefail "$HOME_DIR/core.sh"
+  ) || { rm -rf "$scratch"; die "setup: PAL injection warm-up FAILED — rust-src may not be writable (rustup component dirs normally are). See $HOME_DIR/_lastbuild.log"; }
+  rm -rf "$scratch"
+  echo "==> [6/6] PAL injection OK (toolchain $TOOLCHAIN rust-src patched, idempotent)"
+
+  # ---- STEP 6: ready summary -------------------------------------------------
+  echo ""
+  echo "============================================================"
+  echo " cargo dotnet: READY"
+  echo "============================================================"
+  echo " install home : $HOME_DIR"
+  echo " front-end    : $cargobin/cargo-dotnet"
+  echo " toolchain    : $TOOLCHAIN  ($prov_tc)"
+  echo " .NET SDK     : $prov_dotnet     ilasm: $prov_ilasm"
+  echo " git rev      : $(git -C "$FROM_REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  echo ""
+  echo " Add these to your shell rc IF they are not already there:"
+  case ":$PATH:" in *":$cargobin:"*) : ;; *) echo "   export PATH=\"$cargobin:\$PATH\"";; esac
+  if ! command -v dotnet >/dev/null 2>&1; then
+    echo "   export DOTNET_ROOT=\"$HOME/.dotnet\""
+    echo "   export PATH=\"$HOME/.dotnet:\$PATH\"        # so the linker can find \`dotnet\`"
+  fi
+  echo ""
+  echo " Now, in ANY Rust crate directory (outside this repo too):"
+  echo "   cargo dotnet run            # build + run on .NET"
+  echo "   cargo dotnet build          # build only"
+  echo ""
+  echo " Caveat: a crate that uses \`getrandom\` still needs the custom-backend shim"
+  echo " symbol (documented follow-up); pure compute/println + most deps just work."
+  echo " Re-run \`cargo dotnet setup --from-repo <path> --force\` after a repo update."
+  echo "============================================================"
+  return 0
 }
 
 # ---- parse subcommand -------------------------------------------------------
 sub="${1:-help}"; shift || true
 case "$sub" in
   help|-h|--help) usage; exit 0 ;;
+  setup) cd_setup "$@"; exit $? ;;
   build|run) ;;
-  *) die "unknown subcommand '$sub' (try: build | run | help)" ;;
+  *) die "unknown subcommand '$sub' (try: setup | build | run | help)" ;;
 esac
+
+# build/run in INSTALLED mode require a provisioned home.
+if [ "$INSTALLED" = 1 ]; then
+  [ -d "$CARGO_DOTNET_HOME" ] && [ -f "$CORE" ] \
+    || die "no install home at $CARGO_DOTNET_HOME (run \`cargo dotnet setup\` first; from a repo checkout)"
+fi
 
 # ---- parse flags + PATH + program args --------------------------------------
 PATH_ARG=""
@@ -94,6 +416,9 @@ CRATE_ABS="$(cd "$PATH_ARG" 2>/dev/null && pwd)" || die "no such directory: $PAT
 # ---- dispatch to the execution backend --------------------------------------
 case "$BACKEND" in
   docker)
+    # The docker backend is a DEV/in-repo path (it mounts the repo at /work). It is
+    # not available to the installed front-end, which has no repo.
+    [ "$INSTALLED" = 0 ] || die "the docker backend needs a repo checkout (mounts it at /work); the installed tool runs native. Use the in-repo feasibility/cargo-dotnet for the docker path, or unset CARGO_DOTNET_BACKEND to use native."
     # Preflight (helpful errors). The native driver moves the dotnet/ilasm tool
     # checks to the host; here the rcc-dev image always ships dotnet + ilasm
     # (mono-devel), so the image-exists check covers "tools present".
@@ -156,54 +481,43 @@ case "$BACKEND" in
 
     # ---- detect host OS -> the codegen backend cdylib file extension -------------
     # rustc emits the backend as a cdylib: .so (linux) / .dylib (macOS) / .dll
-    # (windows). The linker binary picks up .exe on windows. Detect via uname (and
-    # OSTYPE as a Git-Bash/MSYS fallback where uname may report MINGW*/MSYS*).
-    host_os="$(uname -s 2>/dev/null || echo unknown)"
-    case "$host_os" in
-      Darwin)                 dylib_ext="dylib"; exe_ext="" ;;
-      Linux)                  dylib_ext="so";    exe_ext="" ;;
-      MINGW*|MSYS*|CYGWIN*)   dylib_ext="dll";   exe_ext=".exe" ;;
-      *)
-        # Last-resort: OSTYPE (set by bash). msys/cygwin => windows.
-        case "${OSTYPE:-}" in
-          msys|cygwin|win32) dylib_ext="dll"; exe_ext=".exe" ;;
-          darwin*)           dylib_ext="dylib"; exe_ext="" ;;
-          *)                 dylib_ext="so"; exe_ext="" ;;
-        esac ;;
-    esac
+    # (windows). The linker binary picks up .exe on windows. (Shared helper.)
+    detect_host_os
 
     # ---- host toolchain preflight (helpful, actionable errors) -------------------
-    command -v rustc >/dev/null 2>&1 || die "rustc not found on PATH (native backend needs the project's pinned nightly with rust-src + rustc-dev; see docs/CARGO_DOTNET.md)"
+    command -v rustc >/dev/null 2>&1 || die "rustc not found on PATH (native backend needs the project's pinned nightly with rust-src + rustc-dev; run \`cargo dotnet setup\`)"
     command -v cargo >/dev/null 2>&1 || die "cargo not found on PATH"
-    command -v dotnet >/dev/null 2>&1 || die "dotnet not found on PATH (install the .NET 8 SDK; see docs/CARGO_DOTNET.md 'Native' section)"
-    # ilasm: on the NATIVE .NET path we need the CoreCLR `ilasm` (NOT Mono's). Mono's
-    # ilasm can only emit a PE32/i386 image and produces assemblies the native (macOS
-    # arm64 / Windows) CoreCLR loader REJECTS (FileLoadException 0x8007000C). The
-    # CoreCLR ILAsm (NuGet runtime.<rid>.Microsoft.NETCore.ILAsm) emits a PE the host
-    # CoreCLR loads. So PREFER, in order: an explicit ILASM_PATH; the conventional
-    # user-local CoreCLR install this repo documents ($HOME/.dotnet/ilasm-tool/ilasm);
-    # then `ilasm` on PATH ONLY if it is NOT Mono (a CoreCLR ilasm symlinked there).
-    # EXPORT ILASM_PATH so the cilly linker uses exactly this binary.
-    if [ -n "${ILASM_PATH:-}" ]; then
-      [ -x "$ILASM_PATH" ] || die "ILASM_PATH='$ILASM_PATH' is not an executable"
-    elif [ -x "$HOME/.dotnet/ilasm-tool/ilasm$exe_ext" ]; then
-      export ILASM_PATH="$HOME/.dotnet/ilasm-tool/ilasm$exe_ext"
-    elif command -v ilasm >/dev/null 2>&1; then
-      # Only accept a PATH ilasm if it is NOT Mono (Mono's `--version` says "Mono").
-      if ilasm --version 2>&1 | grep -qi mono; then
-        die "the \`ilasm\` on PATH is Mono's, which emits PE32 images the native CoreCLR loader rejects. Install the CoreCLR ILAsm NuGet tool to \$HOME/.dotnet/ilasm-tool/ilasm (see docs/CARGO_DOTNET.md), or set ILASM_PATH to a CoreCLR ilasm."
-      fi
-      : # a non-Mono `ilasm` on PATH — cilly's bare `ilasm` default is fine
-    else
-      die "ilasm not found (no ILASM_PATH, none at \$HOME/.dotnet/ilasm-tool/ilasm, none on PATH). Install the CoreCLR ILAsm NuGet tool; see docs/CARGO_DOTNET.md."
-    fi
+    # `dotnet`: self-heal from $HOME/.dotnet (the install loc setup provisions) if it
+    # is not already on PATH, THEN require it.
+    ensure_dotnet_on_path
+    command -v dotnet >/dev/null 2>&1 || die "dotnet not found on PATH or at \$HOME/.dotnet/dotnet (run \`cargo dotnet setup\`, or add \$HOME/.dotnet to PATH)"
+    # ilasm: CoreCLR (NOT Mono), exported as ILASM_PATH for the cilly linker.
+    resolve_ilasm
 
-    # ---- locate the host-native backend artifacts -------------------------------
-    BACKEND_DYLIB="$REPO_ROOT/target/release/librustc_codegen_clr.$dylib_ext"
-    LINKER="$REPO_ROOT/target/release/linker$exe_ext"
-    [ -f "$BACKEND_DYLIB" ] || die "native backend dylib missing: $BACKEND_DYLIB — build it first: (cd cilly && cargo build --release) && cargo build --release -p rustc_codegen_clr"
-    [ -f "$LINKER" ] || die "native linker missing: $LINKER — build it: (cd cilly && cargo build --release)"
-    [ -f "$REPO_ROOT/x86_64-unknown-dotnet.json" ] || die "target spec missing: $REPO_ROOT/x86_64-unknown-dotnet.json"
+    if [ "$INSTALLED" = 1 ]; then
+      # ---- INSTALLED: everything comes from CARGO_DOTNET_HOME (no repo) ----------
+      BACKEND_DYLIB="$CARGO_DOTNET_HOME/bin/librustc_codegen_clr.$dylib_ext"
+      LINKER="$CARGO_DOTNET_HOME/bin/linker$exe_ext"
+      [ -f "$BACKEND_DYLIB" ] || die "installed backend dylib missing: $BACKEND_DYLIB — run \`cargo dotnet setup\`"
+      [ -f "$LINKER" ]        || die "installed linker missing: $LINKER — run \`cargo dotnet setup\`"
+      [ -f "$CARGO_DOTNET_HOME/target/x86_64-unknown-dotnet.json" ] || die "installed target spec missing — run \`cargo dotnet setup\`"
+      export CD_REPO="$CARGO_DOTNET_HOME"        # CORE's $CD_REPO/dotnet_pal + /dotnet_overlays resolve in HOME
+      export CD_TARGET_SPEC="$CARGO_DOTNET_HOME/target/x86_64-unknown-dotnet.json"
+      export CD_LASTBUILD_LOG="$CARGO_DOTNET_HOME/_lastbuild.log"
+      # An EXTERNAL crate has NO rustup dir-override, so pin the toolchain explicitly
+      # (else build-std + the backend dylib run under the wrong nightly and fail).
+      export RUSTUP_TOOLCHAIN="${CARGO_DOTNET_TOOLCHAIN:-$(read_home_toolchain)}"
+    else
+      # ---- DEV (native): artifacts from the repo checkout (unchanged) ------------
+      BACKEND_DYLIB="$REPO_ROOT/target/release/librustc_codegen_clr.$dylib_ext"
+      LINKER="$REPO_ROOT/target/release/linker$exe_ext"
+      [ -f "$BACKEND_DYLIB" ] || die "native backend dylib missing: $BACKEND_DYLIB — build it first: (cd cilly && cargo build --release) && cargo build --release -p rustc_codegen_clr"
+      [ -f "$LINKER" ] || die "native linker missing: $LINKER — build it: (cd cilly && cargo build --release)"
+      [ -f "$REPO_ROOT/x86_64-unknown-dotnet.json" ] || die "target spec missing: $REPO_ROOT/x86_64-unknown-dotnet.json"
+      export CD_REPO="$REPO_ROOT"
+      export CD_TARGET_SPEC="$REPO_ROOT/x86_64-unknown-dotnet.json"
+      export CD_LASTBUILD_LOG="$REPO_ROOT/feasibility/_lastbuild.log"
+    fi
 
     # ---- the cargo registry src dir build-std extracts libc into ----------------
     # The CORE patches the registry's libc-0.2 copy. Honour CARGO_HOME; default to
@@ -211,12 +525,9 @@ case "$BACKEND" in
     REGISTRY_SRC="${CARGO_HOME:-$HOME/.cargo}/registry/src"
 
     # ---- export the host facts the CORE reads (defaults are the docker layout) ---
-    export CD_REPO="$REPO_ROOT"
     export CD_BACKEND_DYLIB="$BACKEND_DYLIB"
     export CD_LINKER="$LINKER"
-    export CD_TARGET_SPEC="$REPO_ROOT/x86_64-unknown-dotnet.json"
     export CD_REGISTRY_SRC="$REGISTRY_SRC"
-    export CD_LASTBUILD_LOG="$REPO_ROOT/feasibility/_lastbuild.log"
     # Host apphost exe suffix (Windows: .exe; "" elsewhere). Only the CORE's
     # bin-fallback probe uses it — cargo's JSON 'executable' field is already
     # host-correct (it carries .exe on Windows). Empty on mac/Linux keeps the
