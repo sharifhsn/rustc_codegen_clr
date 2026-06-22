@@ -93,7 +93,10 @@ impl ILExporter {
             } else {
                 "auto"
             };
-            let name = &asm[class_def.name()];
+            // Shorten over-long monomorphized names so the stricter CoreCLR `ilasm` (native
+            // macOS/Windows) accepts them; within-limit names pass through unchanged (Linux/Docker
+            // + ::stable unaffected). The matching reference sites apply the identical transform.
+            let name = dotnet_class_name(&asm[class_def.name()]);
             writeln!(
                 out,
                 ".class {vis} ansi {sealed} {explicit} '{name}' extends {extends}{{"
@@ -1341,9 +1344,50 @@ impl Exporter for ILExporter {
         Ok(())
     }
 }
+/// The maximum class-name length the CoreCLR `ilasm` accepts ("Full class name too long
+/// (N characters, 1023 allowed)"). Mono's `ilasm` (the Linux/Docker assembler) has no such
+/// cap, so the deeply-nested monomorphized generic names the backend emits (e.g.
+/// `addr2line…LookupResult<…>` can exceed 2KB) only break the CoreCLR assembler — which is the
+/// one used on the NATIVE macOS / Windows path. See `dotnet_class_name`.
+const ILASM_MAX_CLASS_NAME: usize = 1023;
+
+/// Deterministically shorten an over-long class name so the CoreCLR `ilasm` accepts it.
+///
+/// .NET class names are pure identifiers — the IL is self-consistent as long as the SAME
+/// transform is applied at the type's definition AND at every reference. Both sites resolve
+/// the identical interned name string and call this pure function, so the shortened forms
+/// always match (no def/ref skew). Names within the limit are returned UNCHANGED (a borrow),
+/// so the Linux/Docker output and the `::stable` suite are byte-for-byte unaffected — this only
+/// rewrites the handful of >1023-char monomorphized generic names that the stricter CoreCLR
+/// assembler would otherwise reject.
+///
+/// The short form keeps a readable head (so disassembly is still navigable) plus a 64-bit
+/// FNV-1a hash of the FULL original name (collision-resistant across distinct long names). The
+/// length budget is well under the limit. FNV-1a is used (not `DefaultHasher`) so the mapping is
+/// stable and identical at every call site regardless of build.
+fn dotnet_class_name(name: &str) -> std::borrow::Cow<'_, str> {
+    if name.len() <= ILASM_MAX_CLASS_NAME {
+        return std::borrow::Cow::Borrowed(name);
+    }
+    // FNV-1a 64-bit over the full original name.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // Keep a readable, identifier-safe head. `name` is an already-escaped IL identifier (no `'`
+    // or other quoting needed inside the surrounding quotes), so a byte-prefix is safe to splice
+    // — but cut on a char boundary to keep it valid UTF-8 for the formatter.
+    const HEAD: usize = 900;
+    let mut head_end = HEAD.min(name.len());
+    while head_end > 0 && !name.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}__h{hash:016x}", &name[..head_end]))
+}
 fn simple_class_ref(cref: Interned<ClassRef>, asm: &Assembly) -> String {
     let cref = asm.class_ref(cref);
-    let name = &asm[cref.name()];
+    let name = dotnet_class_name(&asm[cref.name()]);
     if let Some(assembly) = cref.asm() {
         format!("[{assembly}]'{name}'", assembly = &asm[assembly])
     } else {
@@ -1352,7 +1396,7 @@ fn simple_class_ref(cref: Interned<ClassRef>, asm: &Assembly) -> String {
 }
 pub(crate) fn class_ref(cref: Interned<ClassRef>, asm: &Assembly) -> String {
     let cref = asm.class_ref(cref);
-    let name = &asm[cref.name()];
+    let name = dotnet_class_name(&asm[cref.name()]);
     let prefix = if cref.is_valuetype() {
         "valuetype"
     } else {

@@ -142,7 +142,95 @@ case "$BACKEND" in
     exit $?
     ;;
   native)
-    die "CARGO_DOTNET_BACKEND=native is not yet implemented (Phase-D ships the docker driver; the native, non-Docker path is a later packaging concern — the front-end + CORE are already structured for it: the native driver implements the same CORE with SRC=\$(rustc --print sysroot)/... and the repo's real host path instead of /work, runs the apphost directly, and checks `command -v dotnet ilasm` on the host)"
+    # NATIVE (non-Docker) driver: run the SAME pipeline CORE directly on the host.
+    # No /work mount, no container — the CORE's docker-specific paths are supplied as
+    # CD_* env vars (defaults reproduce the container layout for the docker driver;
+    # here we point them at the real host repo + toolchain). The CORE body is
+    # byte-identical between the two backends; only these host facts differ.
+    #
+    # WHY this works on ANY .NET host arch (arm64 macOS, x64 Windows, …): the backend
+    # output is .NET CIL, which is ARCHITECTURE-AGNOSTIC — a compiled assembly JITs +
+    # runs on the host's native .NET 8 regardless of host CPU. So the TARGET stays
+    # x86_64-unknown-dotnet (the "x86_64" is rustc's layout model for the dotnet
+    # output, NOT the host arch); only the toolchain BINARIES are host-native.
+
+    # ---- detect host OS -> the codegen backend cdylib file extension -------------
+    # rustc emits the backend as a cdylib: .so (linux) / .dylib (macOS) / .dll
+    # (windows). The linker binary picks up .exe on windows. Detect via uname (and
+    # OSTYPE as a Git-Bash/MSYS fallback where uname may report MINGW*/MSYS*).
+    host_os="$(uname -s 2>/dev/null || echo unknown)"
+    case "$host_os" in
+      Darwin)                 dylib_ext="dylib"; exe_ext="" ;;
+      Linux)                  dylib_ext="so";    exe_ext="" ;;
+      MINGW*|MSYS*|CYGWIN*)   dylib_ext="dll";   exe_ext=".exe" ;;
+      *)
+        # Last-resort: OSTYPE (set by bash). msys/cygwin => windows.
+        case "${OSTYPE:-}" in
+          msys|cygwin|win32) dylib_ext="dll"; exe_ext=".exe" ;;
+          darwin*)           dylib_ext="dylib"; exe_ext="" ;;
+          *)                 dylib_ext="so"; exe_ext="" ;;
+        esac ;;
+    esac
+
+    # ---- host toolchain preflight (helpful, actionable errors) -------------------
+    command -v rustc >/dev/null 2>&1 || die "rustc not found on PATH (native backend needs the project's pinned nightly with rust-src + rustc-dev; see docs/CARGO_DOTNET.md)"
+    command -v cargo >/dev/null 2>&1 || die "cargo not found on PATH"
+    command -v dotnet >/dev/null 2>&1 || die "dotnet not found on PATH (install the .NET 8 SDK; see docs/CARGO_DOTNET.md 'Native' section)"
+    # ilasm: on the NATIVE .NET path we need the CoreCLR `ilasm` (NOT Mono's). Mono's
+    # ilasm can only emit a PE32/i386 image and produces assemblies the native (macOS
+    # arm64 / Windows) CoreCLR loader REJECTS (FileLoadException 0x8007000C). The
+    # CoreCLR ILAsm (NuGet runtime.<rid>.Microsoft.NETCore.ILAsm) emits a PE the host
+    # CoreCLR loads. So PREFER, in order: an explicit ILASM_PATH; the conventional
+    # user-local CoreCLR install this repo documents ($HOME/.dotnet/ilasm-tool/ilasm);
+    # then `ilasm` on PATH ONLY if it is NOT Mono (a CoreCLR ilasm symlinked there).
+    # EXPORT ILASM_PATH so the cilly linker uses exactly this binary.
+    if [ -n "${ILASM_PATH:-}" ]; then
+      [ -x "$ILASM_PATH" ] || die "ILASM_PATH='$ILASM_PATH' is not an executable"
+    elif [ -x "$HOME/.dotnet/ilasm-tool/ilasm$exe_ext" ]; then
+      export ILASM_PATH="$HOME/.dotnet/ilasm-tool/ilasm$exe_ext"
+    elif command -v ilasm >/dev/null 2>&1; then
+      # Only accept a PATH ilasm if it is NOT Mono (Mono's `--version` says "Mono").
+      if ilasm --version 2>&1 | grep -qi mono; then
+        die "the \`ilasm\` on PATH is Mono's, which emits PE32 images the native CoreCLR loader rejects. Install the CoreCLR ILAsm NuGet tool to \$HOME/.dotnet/ilasm-tool/ilasm (see docs/CARGO_DOTNET.md), or set ILASM_PATH to a CoreCLR ilasm."
+      fi
+      : # a non-Mono `ilasm` on PATH — cilly's bare `ilasm` default is fine
+    else
+      die "ilasm not found (no ILASM_PATH, none at \$HOME/.dotnet/ilasm-tool/ilasm, none on PATH). Install the CoreCLR ILAsm NuGet tool; see docs/CARGO_DOTNET.md."
+    fi
+
+    # ---- locate the host-native backend artifacts -------------------------------
+    BACKEND_DYLIB="$REPO_ROOT/target/release/librustc_codegen_clr.$dylib_ext"
+    LINKER="$REPO_ROOT/target/release/linker$exe_ext"
+    [ -f "$BACKEND_DYLIB" ] || die "native backend dylib missing: $BACKEND_DYLIB — build it first: (cd cilly && cargo build --release) && cargo build --release -p rustc_codegen_clr"
+    [ -f "$LINKER" ] || die "native linker missing: $LINKER — build it: (cd cilly && cargo build --release)"
+    [ -f "$REPO_ROOT/x86_64-unknown-dotnet.json" ] || die "target spec missing: $REPO_ROOT/x86_64-unknown-dotnet.json"
+
+    # ---- the cargo registry src dir build-std extracts libc into ----------------
+    # The CORE patches the registry's libc-0.2 copy. Honour CARGO_HOME; default to
+    # ~/.cargo. (The CORE globs '*libc-0.2*/src/lib.rs' under this base.)
+    REGISTRY_SRC="${CARGO_HOME:-$HOME/.cargo}/registry/src"
+
+    # ---- export the host facts the CORE reads (defaults are the docker layout) ---
+    export CD_REPO="$REPO_ROOT"
+    export CD_BACKEND_DYLIB="$BACKEND_DYLIB"
+    export CD_LINKER="$LINKER"
+    export CD_TARGET_SPEC="$REPO_ROOT/x86_64-unknown-dotnet.json"
+    export CD_REGISTRY_SRC="$REGISTRY_SRC"
+    export CD_LASTBUILD_LOG="$REPO_ROOT/feasibility/_lastbuild.log"
+    export CD_REL CD_RUN CD_CLEAN CD_VERBOSE
+    # Quieter, deterministic dotnet (no first-run banner on a fresh install — that
+    # banner lands on stderr and trips cilly's `dotnet --info` stderr assert).
+    export DOTNET_CLI_TELEMETRY_OPTOUT="${DOTNET_CLI_TELEMETRY_OPTOUT:-1}"
+    export DOTNET_NOLOGO="${DOTNET_NOLOGO:-1}"
+    export DOTNET_SKIP_FIRST_TIME_EXPERIENCE="${DOTNET_SKIP_FIRST_TIME_EXPERIENCE:-1}"
+    export CARGO_TERM_COLOR=never
+
+    # ---- run the CORE in the crate dir, forwarding program args -----------------
+    # cwd = the crate (so sibling RELATIVE path-deps resolve exactly as the docker
+    # IN-REPO case; an EXTERNAL crate with absolute path-deps also just works since
+    # there is no mount boundary natively). The CORE is fully cwd-relative.
+    ( cd "$CRATE_ABS" && bash -o pipefail "$CORE" ${PROG_ARGS[@]+"${PROG_ARGS[@]}"} )
+    exit $?
     ;;
   *)
     die "unknown CARGO_DOTNET_BACKEND='$BACKEND' (expected: docker | native)"

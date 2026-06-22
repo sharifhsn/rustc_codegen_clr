@@ -29,9 +29,49 @@
 # the exit code is propagated. The PAL-inject + apply_overlays + libc-patch blocks
 # are byte-identical to dev.sh (crate-independent).
 set -e
+# ---------------------------------------------------------------------------
+# HOST PARAMETERIZATION (docker vs native). Everything below is byte-identical
+# between the two backends EXCEPT a handful of host-specific facts, supplied by
+# these env vars. The docker driver leaves them UNSET, so the DEFAULTS reproduce
+# the original /work + /root layout (Linux container) EXACTLY — no behaviour
+# change for docker/Linux users. The native driver (CARGO_DOTNET_BACKEND=native
+# in feasibility/cargo-dotnet) exports host equivalents before streaming this in.
+#
+#   CD_REPO        repo root that holds dotnet_pal/, dotnet_overlays/, the target
+#                  spec, and target/release/<backend dylib>+linker. Docker: /work.
+#   CD_BACKEND_DYLIB  absolute path to the codegen backend cdylib. Docker:
+#                  /work/target/release/librustc_codegen_clr.so. The host
+#                  extension differs (.so linux / .dylib macOS / .dll windows).
+#   CD_LINKER      absolute path to the cilly linker binary. Docker:
+#                  /work/target/release/linker.
+#   CD_TARGET_SPEC absolute path to x86_64-unknown-dotnet.json. Docker:
+#                  /work/x86_64-unknown-dotnet.json.
+#   CD_REGISTRY_SRC  cargo registry src root scanned for the libc-0.2 copy
+#                  build-std extracts. Docker: /root/.cargo/registry/src. Native:
+#                  $CARGO_HOME/registry/src (or ~/.cargo/registry/src).
+#   CD_LASTBUILD_LOG  where the filtered build log is tee'd. Docker:
+#                  /work/feasibility/_lastbuild.log.
+CD_REPO="${CD_REPO:-/work}"
+CD_BACKEND_DYLIB="${CD_BACKEND_DYLIB:-$CD_REPO/target/release/librustc_codegen_clr.so}"
+CD_LINKER="${CD_LINKER:-$CD_REPO/target/release/linker}"
+CD_TARGET_SPEC="${CD_TARGET_SPEC:-$CD_REPO/x86_64-unknown-dotnet.json}"
+CD_REGISTRY_SRC="${CD_REGISTRY_SRC:-/root/.cargo/registry/src}"
+CD_LASTBUILD_LOG="${CD_LASTBUILD_LOG:-$CD_REPO/feasibility/_lastbuild.log}"
+
+# Portable in-place sed: GNU sed wants `sed -i 's/…/…/' f`; BSD/macOS sed wants
+# `sed -i '' 's/…/…/' f`. The PAL-injection seds below use BSD-incompatible
+# `sed -i` GNU syntax; route them all through this so the SAME script edits
+# rust-src correctly on Linux (docker) AND macOS (native). Detection is a cheap
+# one-shot probe of the local sed (GNU `--version` succeeds; BSD has no such flag).
+if sed --version >/dev/null 2>&1; then
+  sed_i() { sed -i "$@"; }            # GNU sed (Linux container / GNU coreutils)
+else
+  sed_i() { local e="$1"; shift; sed -i '' "$e" "$@"; }   # BSD sed (macOS native)
+fi
+
 SRC="$(rustc --print sysroot)/lib/rustlib/src/rust/library/std/src/sys"
-PAL=/work/dotnet_pal/sys
-[ -d "$PAL" ] || { echo "!! no /work/dotnet_pal/sys"; exit 1; }
+PAL="$CD_REPO/dotnet_pal/sys"
+[ -d "$PAL" ] || { echo "!! no $PAL"; exit 1; }
 echo "==> injecting dotnet PAL into rust-src ($SRC)"
 # Each --rm container starts from a pristine rust-src baked into the image, so we
 # always inject onto a clean base. Mirror every file under dotnet_pal/sys/** to $SRC/**.
@@ -163,9 +203,9 @@ FSMOD="$SRC/fs/mod.rs"
 if [ -f "$FSMOD" ] && ! grep -q 'not(target_os = "dotnet")' "$FSMOD"; then
   echo "==> routing set_permissions_nofollow to the unimplemented arm for os=dotnet"
   # real-impl gate: all(unix, not(vxworks)) -> all(unix, not(vxworks), not(dotnet))
-  sed -i 's/#\[cfg(all(unix, not(target_os = "vxworks")))\]/#[cfg(all(unix, not(target_os = "vxworks"), not(target_os = "dotnet")))]/' "$FSMOD"
+  sed_i 's/#\[cfg(all(unix, not(target_os = "vxworks")))\]/#[cfg(all(unix, not(target_os = "vxworks"), not(target_os = "dotnet")))]/' "$FSMOD"
   # stub gate: any(not(unix), vxworks) -> any(not(unix), vxworks, dotnet)
-  sed -i 's/#\[cfg(any(not(unix), target_os = "vxworks"))\]/#[cfg(any(not(unix), target_os = "vxworks", target_os = "dotnet"))]/' "$FSMOD"
+  sed_i 's/#\[cfg(any(not(unix), target_os = "vxworks"))\]/#[cfg(any(not(unix), target_os = "vxworks", target_os = "dotnet"))]/' "$FSMOD"
 fi
 # net is a TWO-subdir module: net/mod.rs just re-exports `connection::*` and
 # `hostname::hostname`. The IMPL cascade lives in net/CONNECTION/mod.rs (a
@@ -346,7 +386,7 @@ fi
 # `#[cfg]` lists, NOT cfg_select!, so they need line-inserts (not inject_arm).
 # os=dotnet-only; idempotent (guarded on the dotnet string).
 OSDIR="$SRC/../os"
-OSPAL=/work/dotnet_pal/os
+OSPAL="$CD_REPO/dotnet_pal/os"
 if [ -d "$OSPAL/dotnet" ] && [ -d "$OSDIR" ]; then
   echo "==> mirroring os/dotnet platform tree + wiring os::unix platform list"
   mkdir -p "$OSDIR/dotnet"
@@ -442,7 +482,7 @@ fi
 # root, so gcc.rs is included directly as `imp` (no extra module nesting).
 # dotnet_pal/panic_unwind/dotnet.rs is a doc-only marker for this arm.
 PUSRC="$SRC/../../../panic_unwind/src"      # library/panic_unwind/src
-PUPAL=/work/dotnet_pal/panic_unwind
+PUPAL="$CD_REPO/dotnet_pal/panic_unwind"
 if [ -d "$PUPAL" ] && [ -f "$PUSRC/lib.rs" ]; then
   echo "==> injecting dotnet panic_unwind arm ($PUSRC)"
   cp "$PUPAL/dotnet.rs" "$PUSRC/dotnet.rs"   # doc-only marker for the arm
@@ -498,7 +538,7 @@ fi
 # decls the cilly POSIX shim resolves + the consts) into that empty else block.
 # os=dotnet-only (the else only fires for unsupported OSes). The PAL file lives at
 # dotnet_pal/libc/dotnet.rs. Idempotent (guarded on the dotnet string).
-LIBC_PAL=/work/dotnet_pal/libc
+LIBC_PAL="$CD_REPO/dotnet_pal/libc"
 # build-std resolves libc from the cargo REGISTRY copy (…/.cargo/registry/src/…/
 # libc-0.2.*), NOT the rust-src vendor tree — and the registry copy only exists
 # AFTER a build extracts it, so it may not be present on the first invocation
@@ -524,14 +564,14 @@ inject_libc() { # $1 = libc src dir
   # longer match once rewritten). os=dotnet-only effect (no other target's libc
   # cfg matches the BARE `unix`/`target_family="unix"` predicates we narrow here).
   # 1) lib.rs top-level: `else if #[cfg(unix)]` (the unix module selector).
-  sed -i 's/} else if #\[cfg(unix)\] {/} else if #[cfg(all(unix, not(target_os = "dotnet")))] {/' "$d/lib.rs"
+  sed_i 's/} else if #\[cfg(unix)\] {/} else if #[cfg(all(unix, not(target_os = "dotnet")))] {/' "$d/lib.rs"
   # 2) new/mod.rs per-family headers: `cfg(all(target_family="unix", not(qurt)))`.
   if [ -f "$d/new/mod.rs" ]; then
-    sed -i 's/if #\[cfg(all(target_family = "unix", not(target_os = "qurt")))\] {/if #[cfg(all(target_family = "unix", not(target_os = "qurt"), not(target_os = "dotnet")))] {/' "$d/new/mod.rs"
+    sed_i 's/if #\[cfg(all(target_family = "unix", not(target_os = "qurt")))\] {/if #[cfg(all(target_family = "unix", not(target_os = "qurt"), not(target_os = "dotnet")))] {/' "$d/new/mod.rs"
   fi
   # 3) new/common/mod.rs: `#[cfg(target_family = "unix")] pub(crate) mod posix;`.
   if [ -f "$d/new/common/mod.rs" ]; then
-    sed -i 's/#\[cfg(target_family = "unix")\]/#[cfg(all(target_family = "unix", not(target_os = "dotnet")))]/' "$d/new/common/mod.rs"
+    sed_i 's/#\[cfg(target_family = "unix")\]/#[cfg(all(target_family = "unix", not(target_os = "dotnet")))]/' "$d/new/common/mod.rs"
   fi
   grep -qF 'mod dotnet;' "$d/lib.rs" && return 0
   # Declare the dotnet module at the libc crate ROOT (outside the big arch/os
@@ -562,14 +602,15 @@ inject_libc() { # $1 = libc src dir
   echo "==> injected dotnet libc module ($d)"
 }
 # Patch any libc copies present now (rust-src vendor + already-extracted registry).
-for d in $(find "$SRC/../../.." /root/.cargo/registry/src -path '*libc-0.2*/src/lib.rs' 2>/dev/null); do
+for d in $(find "$SRC/../../.." "$CD_REGISTRY_SRC" -path '*libc-0.2*/src/lib.rs' 2>/dev/null); do
   inject_libc "$(dirname "$d")"
 done
 
 # ===========================================================================
 # CRATE-AGNOSTIC BUILD + RUN (the generalization of dev.sh pal-build).
-# cwd is the project dir (/project via the docker -w, or any path under a native
-# driver). NO `cd /work/cargo_tests/$DEV_CRATE` — the crate is supplied by cwd.
+# cwd is the project dir (/project via the docker -w, or the crate's real host
+# path under the native driver). NO `cd $CD_REPO/cargo_tests/$DEV_CRATE` — the
+# crate is supplied by cwd.
 # ===========================================================================
 [ -f Cargo.toml ] || { echo "!! no Cargo.toml in $(pwd) — not a crate dir"; exit 2; }
 PROFILE=release; CARGOFLAGS=(--release)
@@ -579,7 +620,7 @@ if [ "${CD_CLEAN:-0}" = 1 ]; then echo "==> cargo clean (full, bulletproof)"; ca
 # `--cfg getrandom_backend="custom"` selects getrandom 0.3/0.4's custom backend
 # (our os="dotnet" target has no built-in getrandom arm). Harmless for crates that
 # don't depend on getrandom (the cfg is simply unused). See dev.sh pal-build.
-export RUSTFLAGS="-Z codegen-backend=/work/target/release/librustc_codegen_clr.so -C linker=/work/target/release/linker -C link-args=--cargo-support --cfg getrandom_backend=\"custom\""
+export RUSTFLAGS="-Z codegen-backend=$CD_BACKEND_DYLIB -C linker=$CD_LINKER -C link-args=--cargo-support --cfg getrandom_backend=\"custom\""
 set +e
 # PHASE G — CENTRAL OVERLAY REGISTRY auto-apply. Three load-bearing crates (mio,
 # socket2, tokio) need a small, marked source overlay to build/run on os=dotnet
@@ -592,8 +633,8 @@ set +e
 # satisfy the locked requirement) is silently ignored by cargo, so emitting all
 # overlays is safe; we ALSO parse the lock afterwards and warn loudly on a
 # name-match/version-mismatch (the "overlay silently not applied" footgun).
-apply_overlays() { # cwd = the project dir; reads /work/dotnet_overlays/REGISTRY.toml
-  local reg=/work/dotnet_overlays/REGISTRY.toml
+apply_overlays() { # cwd = the project dir; reads $CD_REPO/dotnet_overlays/REGISTRY.toml
+  local reg="$CD_REPO/dotnet_overlays/REGISTRY.toml"
   [ -f "$reg" ] || { echo "==> no overlay registry at $reg (skipping auto-apply)"; return 0; }
   # Parse REGISTRY.toml [[overlay]] blocks into parallel name/version/dir arrays.
   local names vers dirs
@@ -604,13 +645,13 @@ apply_overlays() { # cwd = the project dir; reads /work/dotnet_overlays/REGISTRY
   local paths_lines="" d
   while IFS= read -r d; do
     [ -n "$d" ] || continue
-    [ -d "/work/dotnet_overlays/$d" ] || { echo "!! overlay dir missing: /work/dotnet_overlays/$d"; continue; }
-    paths_lines="$paths_lines    \"/work/dotnet_overlays/$d\",
+    [ -d "$CD_REPO/dotnet_overlays/$d" ] || { echo "!! overlay dir missing: $CD_REPO/dotnet_overlays/$d"; continue; }
+    paths_lines="$paths_lines    \"$CD_REPO/dotnet_overlays/$d\",
 "
   done <<< "$dirs"
   # Regenerate .cargo/config.toml FROM SCRATCH (idempotent): preserve the dotnet
   # target + build-std, then append the top-level `paths` override. Paths are
-  # resolved relative to the dir containing .cargo/, so absolute /work paths.
+  # resolved relative to the dir containing .cargo/, so absolute $CD_REPO paths.
   mkdir -p .cargo
   # NOTE: `paths` is a TOP-LEVEL config key (a local-source override), NOT an
   # `[unstable]` or `[build]` sub-key — it MUST be emitted before any table header
@@ -623,7 +664,7 @@ apply_overlays() { # cwd = the project dir; reads /work/dotnet_overlays/REGISTRY
     printf '%s' "$paths_lines"
     echo ']'
     echo '[build]'
-    echo 'target = "/work/x86_64-unknown-dotnet.json"'
+    echo "target = \"$CD_TARGET_SPEC\""
     echo '[unstable]'
     echo 'build-std = ["core", "alloc", "std", "panic_unwind"]'
   } > .cargo/config.toml
@@ -645,7 +686,7 @@ apply_overlays() { # cwd = the project dir; reads /work/dotnet_overlays/REGISTRY
       if [ -z "$locked" ]; then
         : # overlay crate not in this project's graph — fine, paths entry is inert.
       elif [ "$locked" = "$v" ]; then
-        echo "==> overlay APPLIED: $n $v (locked $locked) -> /work/dotnet_overlays/$n"
+        echo "==> overlay APPLIED: $n $v (locked $locked) -> $CD_REPO/dotnet_overlays/$n"
       else
         echo "!! OVERLAY VERSION MISMATCH: $n overlay=$v but Cargo.lock pins $locked"
         echo "!! cargo will IGNORE the paths override for $n (footgun: overlay NOT applied)."
@@ -662,15 +703,15 @@ apply_overlays
 # on the std::os::fd `libc::` refs.) Idempotent — inject_libc is a no-op on copies
 # already carrying the dotnet module.
 cargo -Zjson-target-spec fetch >/dev/null 2>&1 || true
-for d in $(find /root/.cargo/registry/src -path '*libc-0.2*/src/lib.rs' 2>/dev/null); do
+for d in $(find "$CD_REGISTRY_SRC" -path '*libc-0.2*/src/lib.rs' 2>/dev/null); do
   inject_libc "$(dirname "$d")"
 done
 # Build. Filter the log like dev.sh unless CD_VERBOSE=1 (errors always shown).
 if [ "${CD_VERBOSE:-0}" = 1 ]; then
-  cargo -Zjson-target-spec build "${CARGOFLAGS[@]}" 2>&1 | tee /work/feasibility/_lastbuild.log
+  cargo -Zjson-target-spec build "${CARGOFLAGS[@]}" 2>&1 | tee "$CD_LASTBUILD_LOG"
   rc=${PIPESTATUS[0]}
 else
-  cargo -Zjson-target-spec build "${CARGOFLAGS[@]}" 2>&1 | tee /work/feasibility/_lastbuild.log \
+  cargo -Zjson-target-spec build "${CARGOFLAGS[@]}" 2>&1 | tee "$CD_LASTBUILD_LOG" \
     | grep -vE 'discirminant' \
     | grep -E '^error|error\[|could not compile|warning: unused|Compiling (std|core|alloc) |Finished' | head -60
   rc=${PIPESTATUS[0]}

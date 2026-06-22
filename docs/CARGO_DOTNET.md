@@ -68,11 +68,107 @@ You need a running Docker daemon. That is the **only** host dependency — the i
 and `ilasm`.
 
 > **The Docker-vs-native seam.** `cargo-dotnet` dispatches on `CARGO_DOTNET_BACKEND` (default
-> `docker`). A future **native** (non-Docker) driver slots into the same switch: it runs the *same*
-> pipeline core against the host's real repo path and `command -v dotnet ilasm`, with the UX and
-> pipeline unchanged. It is not yet implemented (`CARGO_DOTNET_BACKEND=native` errors today) — it is a
-> later packaging concern, and the front-end + core are already structured for it. Full mechanics:
+> `docker`). A **native** (non-Docker) driver (`CARGO_DOTNET_BACKEND=native`) runs the *same*
+> pipeline core directly on the host — no container — against the host's real repo path and
+> `command -v rustc cargo dotnet` + a CoreCLR `ilasm`. The UX and pipeline are unchanged; only the
+> host-specific paths/tools differ (supplied to the shared core as `CD_*` env vars whose defaults
+> reproduce the container layout, so the Docker path is byte-for-byte unchanged). See
+> **[§2b Native (no Docker)](#2b-native-no-docker)** below and
 > [feasibility/README.md](../feasibility/README.md).
+
+---
+
+## 2b. Native (no Docker)
+
+The native driver runs the whole pipeline on the host's own toolchain — useful where Docker is
+unavailable or slow (e.g. a developer laptop). It is **additive**: the Docker path is the default and
+is unchanged. Select it with `CARGO_DOTNET_BACKEND=native`.
+
+> **Why the target is still `x86_64-unknown-dotnet` on a non-x86 host.** The backend output is .NET
+> **CIL**, which is architecture-agnostic — a compiled assembly JITs and runs on the host's native
+> .NET 8 regardless of host CPU. The `x86_64` in the target name is rustc's *layout model* for the
+> dotnet output, not the host arch. So you do **not** change the target spec; you only build the
+> toolchain binaries (backend dylib + linker + build-std) for the host.
+
+### macOS (arm64, Apple Silicon) — verified
+
+This flow is verified end-to-end on macOS arm64 (J1/J2/J3 all pass, zero Docker). Setup is
+**user-local, no sudo**:
+
+1. **Toolchain** (match the pinned nightly to avoid rustc-API drift):
+   ```bash
+   rustup toolchain install nightly-2026-06-17 \
+     --component rust-src --component rustc-dev --component llvm-tools-preview
+   rustup override set nightly-2026-06-17           # in the repo root
+   ```
+2. **.NET 8 SDK** (the Homebrew cask is .NET 10 — match the Docker .NET 8 instead):
+   ```bash
+   curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 8.0 --install-dir "$HOME/.dotnet"
+   export PATH="$HOME/.dotnet:$PATH"; export DOTNET_ROOT="$HOME/.dotnet"
+   ```
+3. **`ilasm` — use the CoreCLR ILAsm, NOT Mono.** Mono's `ilasm` only emits PE32/i386 images, which
+   the native (macOS arm64 / Windows) CoreCLR loader **rejects** (`FileLoadException 0x8007000C`). The
+   CoreCLR ILAsm from NuGet emits a PE the host CoreCLR loads:
+   ```bash
+   # download + extract the osx-arm64 ILAsm tool, then place its `ilasm` here:
+   #   runtime.osx-arm64.Microsoft.NETCore.ILAsm  (version 8.0.0, matching .NET 8)
+   mkdir -p "$HOME/.dotnet/ilasm-tool"
+   # cp <extracted>/runtimes/osx-arm64/native/ilasm "$HOME/.dotnet/ilasm-tool/ilasm"
+   chmod +x "$HOME/.dotnet/ilasm-tool/ilasm" && xattr -c "$HOME/.dotnet/ilasm-tool/ilasm"
+   ```
+   The native driver auto-discovers `$HOME/.dotnet/ilasm-tool/ilasm`; override with `ILASM_PATH`.
+   *(`brew install mono` is the documented Mono fallback for the Docker/Linux flow, but it does NOT
+   work for the native macOS run — its PE32 output won't load on arm64 CoreCLR.)*
+4. **Build the host-native backend:**
+   ```bash
+   (cd cilly && cargo build --release) && cargo build --release -p rustc_codegen_clr
+   # -> target/release/librustc_codegen_clr.dylib + target/release/linker
+   ```
+5. **Run any crate, no Docker:**
+   ```bash
+   CARGO_DOTNET_BACKEND=native feasibility/cargo-dotnet run cargo_tests/cd_pure
+   CARGO_DOTNET_BACKEND=native feasibility/cargo-dotnet run cargo_tests/cd_tokio
+   CARGO_DOTNET_BACKEND=native feasibility/cargo-dotnet build cargo_tests/cd_interop/rustlib
+   ```
+
+> **One backend change made this work:** the CoreCLR `ilasm` caps class names at 1023 chars, which
+> the backend's deeply-nested monomorphized generic names exceed (Mono had no such cap). The IL
+> exporter now deterministically shortens any >1023-char class name (readable head + a 64-bit hash of
+> the full name), applied identically at the type's definition and every reference. Names within the
+> limit are emitted unchanged, so the Linux/Docker output and the `::stable` suite are unaffected.
+
+### Windows (x86_64) — best-effort, UNTESTED
+
+The same native pipeline is wired for Windows x64, but **it has not been run or verified on Windows**
+(no Windows host was available). The changes are defensive OS-detection branches that do not affect
+macOS/Linux. Treat the steps below as a starting recipe, not a guarantee.
+
+Prereqs (user-local where possible):
+- **Bash**: `cargo-dotnet` is a bash script. Run it under **Git Bash** (Git for Windows), MSYS2, or
+  WSL. A `feasibility\cargo-dotnet.cmd` shim forwards a normal-shell `cargo dotnet ...` to bash with
+  the native backend.
+- **Toolchain**: `rustup toolchain install nightly-2026-06-17-x86_64-pc-windows-msvc` with
+  `--component rust-src --component rustc-dev`. (The MSVC host toolchain + the Build Tools' linker
+  environment are required to build the backend and the native launcher.)
+- **.NET 8 SDK** on PATH (`dotnet.exe`).
+- **`ilasm`**: the CoreCLR ILAsm tool for win-x64 — NuGet
+  `runtime.win-x64.Microsoft.NETCore.ILAsm` (8.0.x). Place its `ilasm.exe` at
+  `%USERPROFILE%\.dotnet\ilasm-tool\ilasm.exe`, or set `ILASM_PATH` to it. (Do **not** use Mono's
+  ilasm — same PE32 problem as macOS.)
+- **Backend**: build it host-native — `librustc_codegen_clr.dll` + `linker.exe` under
+  `target\release\`. The native driver detects the `.dll`/`.exe` extensions automatically (via
+  `uname`/`OSTYPE`).
+
+Run (from Git Bash):
+```bash
+CARGO_DOTNET_BACKEND=native feasibility/cargo-dotnet run cargo_tests/cd_pure
+```
+or from a normal Windows shell: `feasibility\cargo-dotnet.cmd run cargo_tests\cd_pure`.
+
+**Known unknowns on Windows** (unverified): whether the CoreCLR win-x64 ilasm accepts the same
+flags/output the macOS one does; whether the native launcher (compiled by the linker via `rustc -O`
+with the MSVC linker) builds cleanly; path-separator handling deep in the pipeline; and whether the
+win-x64 CoreCLR loads the produced PE without further flags. Report findings if you run it.
 
 ---
 

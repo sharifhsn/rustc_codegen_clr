@@ -162,16 +162,30 @@ target crate is mounted depends on whether it lives **in-repo** or **external**:
 Either way the produced apphost lands in the user's own `target/`. `dev.sh
 pal-build <crate> [--run]` **delegates** to this same front-end + core (always an
 in-repo `cargo_tests/<crate>`), so the probe regression path and the user-facing
-command can never drift. A future **native** (non-Docker) driver slots into the
-`CARGO_DOTNET_BACKEND` switch: same core, with the host's real repo/crate paths
-instead of `/work`/`/project` and a `command -v dotnet ilasm` host preflight — UX
-and pipeline unchanged.
+command can never drift.
+
+A **native** (non-Docker) driver also slots into the `CARGO_DOTNET_BACKEND` switch
+(`CARGO_DOTNET_BACKEND=native`): it runs the *same* core directly on the host — no
+container — with the host's real repo path instead of `/work`/`/project` and a
+`command -v rustc cargo dotnet` + CoreCLR-`ilasm` preflight. The host-specific facts
+(repo root, backend dylib extension `.so`/`.dylib`/`.dll`, linker, target spec,
+cargo registry path) are passed to the core as `CD_*` env vars whose **defaults
+reproduce the container layout**, so the docker path is byte-for-byte unchanged and
+native is purely additive. Verified end-to-end on **macOS arm64** (J1/J2/J3, zero
+Docker); a **Windows x64** path is wired defensively but UNTESTED. Full setup +
+known-unknowns: [docs/CARGO_DOTNET.md §2b](../docs/CARGO_DOTNET.md#2b-native-no-docker).
+The two key native facts: the .NET target is unchanged (CIL is arch-agnostic, so it
+JITs on any host's native .NET 8), and the assembler MUST be the **CoreCLR `ilasm`**,
+not Mono (Mono emits PE32 images the native CoreCLR loader rejects).
 
 ### Honesty / current limits
 
-- This wraps the Docker harness, so it needs the `rcc-dev` image
-  (`feasibility/run.sh build`) and a running Docker. The native path is later
-  packaging work — the front-end/core are already structured for it.
+- The **docker** backend (default) needs the `rcc-dev` image
+  (`feasibility/run.sh build`) and a running Docker. The **native** backend
+  (`CARGO_DOTNET_BACKEND=native`) needs no Docker but requires the host toolchain
+  (pinned nightly + rust-src/rustc-dev, .NET 8 SDK, a CoreCLR `ilasm`, and the
+  host-built backend dylib + linker). Native is verified on macOS arm64; Windows is
+  wired but untested. See [docs/CARGO_DOTNET.md §2b](../docs/CARGO_DOTNET.md#2b-native-no-docker).
 - **Exit codes:** build failures and the program's own exit code propagate
   faithfully. But on the dotnet PAL a **panic** (or `std::process::exit(n)`)
   surfaces as an unhandled managed exception and the apphost still returns **0** —
