@@ -121,6 +121,7 @@ fn warm_pal(_args: &SetupArgs) -> Result<()> {
         clean: false,
         verbose: false,
         backend: Some("native".to_string()),
+        dotnet: "8".to_string(), // PAL warm targets the default runtime; version-agnostic enough.
         features: clap_cargo::Features::default(),
         manifest: clap_cargo::Manifest::default(),
         workspace: clap_cargo::Workspace::default(),

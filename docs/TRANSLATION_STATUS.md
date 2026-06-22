@@ -115,10 +115,12 @@ are unmanaged); only C#-instantiating-a-Rust-generic-with-a-new-T is blocked, an
   emulation — *zero* pointer arithmetic on the managed byref, so the hazard is eliminated by
   construction (`src/terminator/intrinsics/atomic.rs`, guarded on `crate::config::DOTNET9`). The .NET 9
   overloads were verified to exist + behave correctly; the flag defaults off (keeps the .NET 8-compatible
-  emulation, gate stays byte-identical). Residual: the *end-to-end run* on the .NET 9 runtime is gated on
-  cargo-dotnet learning to target .NET 9 (drive the .NET 9 ilasm + emit a `net9.0` runtimeconfig) — a
-  separate plumbing task. The earlier "lay statics 4-byte-aligned" workaround is moot (the native
-  overload supersedes it).
+  emulation, gate stays byte-identical). The earlier "lay statics 4-byte-aligned" workaround is moot (the
+  native overload supersedes it). **End-to-end CLOSED (§12):** the `DOTNET9` bool is now derived from a
+  general `DotnetVersion` (TFM) abstraction, and `cargo dotnet --dotnet 9` drives the matching net9 ilasm
+  + net9 runtimeconfig — `cargo_tests/pal_panic` runs to completion on the .NET 9 runtime with the default
+  panic hook (the `get_backtrace_style` static `Atomic<u8>::compare_exchange` hazard gone), while the .NET
+  8 Docker gate stays 426/12.
 - **`float → int` `as` — FIXED (WF-1).** Finite saturation was already correct; the one real bug was
   `NaN → MAX` (overflow branch used `bge.un`, which NaN satisfies). Now guarded `NaN → 0` in
   `cilly/src/ir/builtins/casts.rs`. See §10.
@@ -606,3 +608,32 @@ platform is complete (files/net/threads/time/panic/async/`os::unix` on the real 
 NuGet package. Remaining is the **ergonomic tail**: the `.NET→Rust` Tier-2 surface through the real-PAL
 flow (managed-`String`/`Result` return), WF-9 (only if the consumed module's API is generic), and the
 `regex` allocator fix. The hard, ceiling-adjacent pieces are behind us.
+
+## 12. Multi-version .NET targeting (`DotnetVersion`)
+
+The backend is fundamentally **version-agnostic** (it emits standard MSIL); everything .NET-version-
+specific is concentrated at the edges and now flows through one abstraction:
+
+- **`cilly::DotnetVersion`** (`cilly/src/ir/asm.rs`, next to `IlasmFlavour`) — a `Net8 < Net9` enum
+  read once from the `DOTNET_VERSION` env (default `Net8`), with `tfm()` (`net8.0`/`net9.0`),
+  `assembly_ver()` (`8:0:0:0`/`9:0:0:0`), `framework_version()`, `major()`. It lives in cilly because
+  the version-bearing string emission does, and the dep is one-way (root → cilly). `src/config::DOTNET9`
+  is now a *derived* `dotnet_version() >= Net9`, so the codegen gates are unchanged and future Net10+
+  auto-takes the newer path.
+- **Edges parameterised by it:** the codegen gate (sub-word atomics → native `Interlocked` on ≥ Net9),
+  the `.assembly extern .ver` stamps + runtimeconfig TFM (`il_exporter`), the launcher runtimeconfig
+  (`linker/dotnet_jumpstart.rs` + `main.rs`), the fuzz-harness runtimeconfig, and the NuGet TFM
+  (`cargo-dotnet pack`). **Public-key tokens are version-INVARIANT** (verified identical on 8 and 9) —
+  only the `.ver` triplet flips; there is deliberately no token accessor.
+- **Front-end:** `cargo dotnet --dotnet <8|9>` (env `DOTNET_VERSION`) sets the version for the codegen
+  backend **and** the (separate-process) linker via one inner-cargo env seam, and selects the *matching*
+  CoreCLR ilasm (`$HOME/.dotnet/ilasm-tool` vs `ilasm9-tool` — each runtime rejects the other's PE,
+  `0x8007000C`).
+- **Verified both ways:** .NET 8 Docker `::stable` gate stays **426/12** (default `Net8` is byte-
+  identical), and `cargo dotnet run cargo_tests/pal_panic --dotnet 9` runs to completion on the .NET 9
+  runtime (native sub-word CAS; the default-panic-hook hazard gone).
+- **Floor/ceiling:** the practical floor is .NET 6 (`NativeMemory.AlignedAlloc`); forward versions
+  (10, 11, …) are additive (a new `DotnetVersion` arm + the matching ilasm). **Deferred:** Docker net9
+  (needs a CoreCLR-net9-ilasm image — native path first), the helper-csproj TFMs + `validate.sh`
+  (left fixed-net8; only matter for dual-version C#-consumes-Rust), and a `cargo dotnet setup` fetch of
+  the net9 ilasm for clean machines (both ilasm dirs already present on the dev box).

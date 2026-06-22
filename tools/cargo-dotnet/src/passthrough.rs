@@ -67,6 +67,7 @@ mod tests {
             clean: false,
             verbose: false,
             backend: None,
+            dotnet: "8".to_string(),
             features: clap_cargo::Features::default(),
             manifest: clap_cargo::Manifest::default(),
             workspace: clap_cargo::Workspace::default(),

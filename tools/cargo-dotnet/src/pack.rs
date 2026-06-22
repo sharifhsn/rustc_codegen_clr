@@ -32,6 +32,7 @@ pub fn run(args: &PackArgs) -> Result<i32> {
         clean: false,
         verbose: false,
         backend: None, // pack is native-only (it builds a cdylib through the Rust stages).
+        dotnet: args.dotnet.clone(),
         features: clap_cargo::Features::default(),
         manifest: clap_cargo::Manifest::default(),
         workspace: clap_cargo::Workspace::default(),
@@ -87,11 +88,14 @@ pub fn run(args: &PackArgs) -> Result<i32> {
     let _ = fs::remove_file(&nupkg);
 
     let dll_bytes = fs::read(&dll).with_context(|| format!("read {}", dll.display()))?;
-    write_nupkg(&nupkg, &name, &ver, &dll_bytes)?;
+    write_nupkg(&nupkg, &name, &ver, &dll_bytes, ctx.dotnet.tfm())?;
 
     eprintln!();
     eprintln!("== packed: {} ==", nupkg.display());
-    eprintln!("   id={name}  version={ver}  net8.0  lib/net8.0/{name}.dll");
+    eprintln!(
+        "   id={name}  version={ver}  {tfm}  lib/{tfm}/{name}.dll",
+        tfm = ctx.dotnet.tfm()
+    );
     eprintln!();
     eprintln!(" Consume it from a C# project via a local feed:");
     eprintln!(
@@ -109,7 +113,7 @@ pub fn run(args: &PackArgs) -> Result<i32> {
 /// Write the OPC `.nupkg` with the zip crate. `[Content_Types].xml` is written FIRST
 /// (strict OPC readers expect it as the first entry), then the rest. Stored (no
 /// compression) for the small XML parts; the dll is deflated.
-fn write_nupkg(nupkg: &PathBuf, name: &str, ver: &str, dll: &[u8]) -> Result<()> {
+fn write_nupkg(nupkg: &PathBuf, name: &str, ver: &str, dll: &[u8], tfm: &str) -> Result<()> {
     let guid = random_hex_guid();
     let file = File::create(nupkg)
         .with_context(|| format!("create {}", nupkg.display()))?;
@@ -169,7 +173,7 @@ fn write_nupkg(nupkg: &PathBuf, name: &str, ver: &str, dll: &[u8]) -> Result<()>
     <authors>cargo dotnet</authors>
     <description>Rust crate '{name}' compiled to a .NET assembly by rustc_codegen_clr (cargo dotnet pack). Managed CIL — call its exported functions as ordinary .NET methods.</description>
     <dependencies>
-      <group targetFramework=\"net8.0\" />
+      <group targetFramework=\"{tfm}\" />
     </dependencies>
   </metadata>
 </package>
@@ -184,7 +188,7 @@ fn write_nupkg(nupkg: &PathBuf, name: &str, ver: &str, dll: &[u8]) -> Result<()>
 <Project>
   <ItemGroup>
     <Reference Include=\"{name}\">
-      <HintPath>$(MSBuildThisFileDirectory)../lib/net8.0/{name}.dll</HintPath>
+      <HintPath>$(MSBuildThisFileDirectory)../lib/{tfm}/{name}.dll</HintPath>
       <Private>true</Private>
     </Reference>
   </ItemGroup>
@@ -193,8 +197,8 @@ fn write_nupkg(nupkg: &PathBuf, name: &str, ver: &str, dll: &[u8]) -> Result<()>
     );
     add_entry(&mut zip, &format!("build/{name}.targets"), targets.as_bytes(), stored)?;
 
-    // lib/net8.0/<id>.dll — the assembly (deflated).
-    add_entry(&mut zip, &format!("lib/net8.0/{name}.dll"), dll, deflated)?;
+    // lib/<tfm>/<id>.dll — the assembly (deflated).
+    add_entry(&mut zip, &format!("lib/{tfm}/{name}.dll"), dll, deflated)?;
 
     zip.finish().context("finalize .nupkg zip")?;
     Ok(())

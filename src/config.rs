@@ -93,4 +93,12 @@ config_flag! {TRACE_CIL_OPS,false,"Tells the print each CIL op before it is exec
 
 config_flag! {DRY_RUN,false,"Tells the codegen test suite to not execute or link any test code, enabling testing on platforms without the .NET runtime present."}
 
-config_flag! {DOTNET9,false,"Target .NET 9+: lower sub-word (u8/i8/u16/i16) atomic compare-exchange and swap to the native `Interlocked.CompareExchange`/`Exchange(ref T, ...)` overloads (added in .NET 9) instead of the masked 32-bit-word emulation. The native overloads take the sub-word byref directly, eliminating the emulation's page-boundary hazard (down-aligning a sub-word address into a word it may not own). Requires the .NET 9 runtime; the default (false) keeps the .NET 8-compatible emulation."}
+/// Whether the target runtime is .NET 9+ — **derived** from [`cilly::dotnet_version`] (env
+/// `DOTNET_VERSION`, default 8), not an input of its own. On .NET 9+, the sub-word (u8/i8/u16/i16)
+/// atomic compare-exchange/swap use the native `Interlocked.CompareExchange`/`Exchange(ref T, …)`
+/// overloads (added in .NET 9) instead of the masked-32-bit-word emulation, eliminating the
+/// emulation's page-boundary hazard (down-aligning a sub-word address into a word it may not own).
+/// Kept as a `bool` so the codegen gates that read it stay unchanged; `DOTNET_VERSION` is the single
+/// version input across the whole backend.
+pub static DOTNET9: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| cilly::dotnet_version() >= cilly::DotnetVersion::Net9);

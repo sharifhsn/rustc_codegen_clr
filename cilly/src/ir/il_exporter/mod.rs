@@ -52,11 +52,15 @@ impl ILExporter {
         // Executables are run directly (the runtime resolves refs leniently) and need no headers — so
         // they keep ilasm's defaults, leaving the `::stable` exe suite untouched.
         if self.is_lib {
+            // The BCL `.ver` triplet tracks the target .NET version (8:0:0:0 / 9:0:0:0); the
+            // public-key tokens are version-INVARIANT (verified identical on 8 and 9), and mscorlib
+            // keeps its legacy 4:0:0:0. Single source: `DotnetVersion::assembly_ver`.
+            let dv_ver = crate::ir::dotnet_version().assembly_ver();
             for ext in asm.external_assembly_names() {
                 let (ver, token) = match ext.as_str() {
-                    "System.Private.CoreLib" => ("8:0:0:0", "7C EC 85 D7 BE A7 79 8E"),
+                    "System.Private.CoreLib" => (dv_ver, "7C EC 85 D7 BE A7 79 8E"),
                     "mscorlib" => ("4:0:0:0", "B7 7A 5C 56 19 34 E0 89"),
-                    _ => ("8:0:0:0", "B0 3F 5F 7F 11 D5 0A 3A"),
+                    _ => (dv_ver, "B0 3F 5F 7F 11 D5 0A 3A"),
                 };
                 writeln!(
                     out,
@@ -1543,10 +1547,15 @@ static RUNTIME_CONFIG: std::sync::LazyLock<String> = std::sync::LazyLock::new(||
     let version_start = version_start + "Version:".len();
     let version_end = info.find("Architecture:").unwrap();
     let version = &info[version_start..version_end].trim();
+    // TFM tracks the target .NET version (default net8.0); the framework version stays the live
+    // host scrape — this config feeds the `::stable` test harness (compile_test.rs), which always
+    // runs the default Net8, so this is byte-identical there. (The cargo-dotnet *bin* path uses the
+    // linker's jumpstart runtimeconfig, which is version-parameterised separately.)
+    let tfm = crate::ir::dotnet_version().tfm();
     format!(
         "{{
         \"runtimeOptions\": {{
-          \"tfm\": \"net8.0\",
+          \"tfm\": \"{tfm}\",
           \"framework\": {{
             \"name\": \"Microsoft.NETCore.App\",
             \"version\": \"{version}\"

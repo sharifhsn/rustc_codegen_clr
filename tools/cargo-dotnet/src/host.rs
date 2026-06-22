@@ -101,7 +101,10 @@ pub fn ensure_dotnet(heal: &Option<(PathBuf, PathBuf)>) -> Result<()> {
 /// `ILASM_PATH`. Order: explicit `$ILASM_PATH`; `$HOME/.dotnet/ilasm-tool/ilasm`; a
 /// non-Mono `ilasm` on PATH (returns `None`, letting cilly's bare default fire).
 /// Ports `resolve_ilasm` (cargo-dotnet:137-150).
-pub fn resolve_ilasm(facts: &HostFacts) -> Result<Option<PathBuf>> {
+pub fn resolve_ilasm(
+    facts: &HostFacts,
+    dotnet: crate::context::DotnetVersion,
+) -> Result<Option<PathBuf>> {
     if let Ok(explicit) = env::var("ILASM_PATH") {
         if !explicit.is_empty() {
             let p = PathBuf::from(&explicit);
@@ -112,7 +115,13 @@ pub fn resolve_ilasm(facts: &HostFacts) -> Result<Option<PathBuf>> {
         }
     }
     if let Some(home) = home_dir() {
-        let tool = home.join(format!(".dotnet/ilasm-tool/ilasm{}", facts.exe_ext));
+        // Each runtime needs its MATCHING CoreCLR ilasm (a net8 ilasm's PE is rejected by the net9
+        // runtime and vice-versa): ilasm-tool for .NET 8, ilasm9-tool for .NET 9.
+        let tool = home.join(format!(
+            ".dotnet/{}/ilasm{}",
+            dotnet.ilasm_tool_dir(),
+            facts.exe_ext
+        ));
         if tool.is_file() {
             return Ok(Some(tool));
         }

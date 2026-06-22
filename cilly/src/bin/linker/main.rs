@@ -612,6 +612,10 @@ fn bootstrap_source(fpath: &Path, output_file_path: &str, jumpstart_cmd: &str) -
     format!(
         include_str!("dotnet_jumpstart.rs"),
         jumpstart_cmd = jumpstart_cmd,
+        // The launcher's runtimeconfig targets the DOTNET_VERSION runtime (default net8.0). The
+        // linker is a SEPARATE process from the codegen dylib, so it reads DOTNET_VERSION itself.
+        tfm = cilly::dotnet_version().tfm(),
+        framework_version = cilly::dotnet_version().framework_version(),
         exec_file = fpath.file_name().unwrap().to_string_lossy(),
         has_native_companion = *NATIVE_PASSTROUGH,
         has_pdb = match *ILASM_FLAVOUR {

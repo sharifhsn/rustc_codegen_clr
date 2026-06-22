@@ -149,6 +149,56 @@ impl Paths {
     }
 }
 
+/// The target .NET runtime version selected by `--dotnet` (env `DOTNET_VERSION`). The front-end is
+/// the *producer* of the version: it exports `DOTNET_VERSION` to the inner cargo (so both the codegen
+/// backend and the cilly linker see it) and selects the matching CoreCLR ilasm. It deliberately does
+/// NOT know per-version BCL tokens / `.ver` strings — those live in cilly (`cilly::DotnetVersion`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DotnetVersion {
+    /// .NET 8 (default).
+    #[default]
+    Net8,
+    /// .NET 9.
+    Net9,
+}
+impl DotnetVersion {
+    /// Target-framework moniker for NuGet packaging (`net8.0` / `net9.0`).
+    #[must_use]
+    pub fn tfm(self) -> &'static str {
+        match self {
+            DotnetVersion::Net8 => "net8.0",
+            DotnetVersion::Net9 => "net9.0",
+        }
+    }
+    /// The `DOTNET_VERSION` value the cilly/backend parser expects (canonical bare major).
+    #[must_use]
+    pub fn as_env(self) -> &'static str {
+        match self {
+            DotnetVersion::Net8 => "8",
+            DotnetVersion::Net9 => "9",
+        }
+    }
+    /// The matching CoreCLR ilasm tool dir under `$HOME/.dotnet` (each runtime needs its own — a
+    /// net8 ilasm's PE is rejected by the net9 runtime and vice-versa).
+    #[must_use]
+    pub fn ilasm_tool_dir(self) -> &'static str {
+        match self {
+            DotnetVersion::Net8 => "ilasm-tool",
+            DotnetVersion::Net9 => "ilasm9-tool",
+        }
+    }
+}
+impl std::str::FromStr for DotnetVersion {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "8" | "net8" | "net8.0" => Ok(DotnetVersion::Net8),
+            "9" | "net9" | "net9.0" => Ok(DotnetVersion::Net9),
+            other => Err(format!("--dotnet: invalid value {other:?}; expected 8 or 9")),
+        }
+    }
+}
+
 /// The single typed config threaded (by reference) through the stage pipeline. It is
 /// only ever resolved on the NATIVE backend (the docker backend short-circuits in
 /// `pipeline::run` before this), so it carries no `backend` discriminant.
@@ -166,6 +216,8 @@ pub struct Context {
     pub cargo: String,
     /// A resolved CoreCLR ilasm to export as ILASM_PATH (None lets cilly's default fire).
     pub ilasm: Option<PathBuf>,
+    /// The target .NET runtime version (`--dotnet`). Exported as `DOTNET_VERSION` to the inner cargo.
+    pub dotnet: DotnetVersion,
     /// `(PATH addition, DOTNET_ROOT)` if dotnet was self-healed from `$HOME/.dotnet`.
     pub dotnet_heal: Option<(PathBuf, PathBuf)>,
 }
@@ -182,7 +234,8 @@ impl Context {
         host::ensure_rust_toolchain()?;
         let dotnet_heal = host::dotnet_env_additions();
         host::ensure_dotnet(&dotnet_heal)?;
-        let ilasm = host::resolve_ilasm(&host)?;
+        let dotnet: DotnetVersion = args.dotnet.parse().map_err(anyhow::Error::msg)?;
+        let ilasm = host::resolve_ilasm(&host, dotnet)?;
 
         let paths = Paths::resolve(&mode, &host)?;
 
@@ -216,6 +269,7 @@ impl Context {
             toolchain,
             cargo: host::inner_cargo(),
             ilasm,
+            dotnet,
             dotnet_heal,
         })
     }

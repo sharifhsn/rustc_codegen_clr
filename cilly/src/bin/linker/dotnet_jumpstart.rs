@@ -2,10 +2,11 @@ use std::io::Write;
 static DOTNET_ASSEMBLY:&[u8] = include_bytes!("{exec_file}");
 static RUNTIME_COFIG:&[u8] = b"{{
     \"runtimeOptions\": {{
-      \"tfm\": \"net8.0\",
+      \"tfm\": \"{tfm}\",
+      \"rollForward\": \"LatestMinor\",
       \"framework\": {{
         \"name\": \"Microsoft.NETCore.App\",
-        \"version\": \"8.0.1\"
+        \"version\": \"{framework_version}\"
       }},
       \"configProperties\": {{
         \"System.Threading.ThreadPool.MinThreads\": 4,

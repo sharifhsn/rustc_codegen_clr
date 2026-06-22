@@ -72,6 +72,11 @@ pub struct BuildArgs {
     /// Execution backend: `native` (default installed) or `docker` (in-repo dev).
     #[arg(long, env = "CARGO_DOTNET_BACKEND")]
     pub backend: Option<String>,
+    /// Target .NET runtime version: `8` or `9` (default 8). Selects the matching CoreCLR ilasm,
+    /// sets `DOTNET_VERSION` for the codegen backend + linker, and stamps the runtimeconfig / TFM /
+    /// `.assembly extern .ver`.
+    #[arg(long, value_name = "8|9", default_value = "8", env = "DOTNET_VERSION")]
+    pub dotnet: String,
 
     // ---- standard cargo flag groups (clap-cargo) — forwarded to the inner cargo ----
     #[command(flatten)]
@@ -142,4 +147,8 @@ pub struct PackArgs {
     /// Output directory (default: <crate>/target/nupkg).
     #[arg(long)]
     pub out: Option<PathBuf>,
+    /// Target .NET runtime version for the package: `8` or `9` (default 8). Sets the build's
+    /// `DOTNET_VERSION` + ilasm and the NuGet TFM (`lib/<tfm>/`), which must agree with the dll.
+    #[arg(long, value_name = "8|9", default_value = "8", env = "DOTNET_VERSION")]
+    pub dotnet: String,
 }

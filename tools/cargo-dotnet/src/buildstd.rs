@@ -140,10 +140,15 @@ fn base_cargo(ctx: &Context) -> Command {
         cmd.env("RUSTUP_TOOLCHAIN", tc);
     }
 
-    // ilasm (CoreCLR, exported for the cilly linker).
+    // ilasm (CoreCLR, exported for the cilly linker; version-matched in `host::resolve_ilasm`).
     if let Some(ilasm) = &ctx.ilasm {
         cmd.env("ILASM_PATH", ilasm);
     }
+
+    // Target .NET version — the SINGLE seam: exported so BOTH the codegen backend (rustc, which
+    // reads it via cilly) AND the cilly linker (a separate process: runtimeconfig + `.ver` stamps)
+    // target the same runtime. Pairs with the version-matched ILASM_PATH above.
+    cmd.env("DOTNET_VERSION", ctx.dotnet.as_env());
 
     // dotnet self-heal from $HOME/.dotnet.
     if let Some((path_add, dotnet_root)) = &ctx.dotnet_heal {

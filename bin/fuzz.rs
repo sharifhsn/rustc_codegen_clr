@@ -512,10 +512,17 @@ static RUNTIME_CONFIG: std::sync::LazyLock<String> = std::sync::LazyLock::new(||
     let version_start = version_start + "Version:".len();
     let version_end = info.find("Architecture:").unwrap();
     let version = &info[version_start..version_end].trim();
+    // TFM tracks DOTNET_VERSION (default net8.0), mirroring the rest of the toolchain — this was a
+    // stray hardcoded net9.0, the one site out of sync. fuzz.rs is a standalone cargo-script (no
+    // cilly dep), so it reads the env directly rather than via `cilly::dotnet_version()`.
+    let tfm = match std::env::var("DOTNET_VERSION").as_deref() {
+        Ok("9" | "net9" | "net9.0") => "net9.0",
+        _ => "net8.0",
+    };
     format!(
         "{{
         \"runtimeOptions\": {{
-          \"tfm\": \"net9.0\",
+          \"tfm\": \"{tfm}\",
           \"framework\": {{
             \"name\": \"Microsoft.NETCore.App\",
             \"version\": \"{version}\"

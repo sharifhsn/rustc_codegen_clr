@@ -7,7 +7,7 @@ pub use super::bimap::Interned;
 use std::path::Path;
 
 pub use crate::Access;
-pub use asm::{Assembly, IlasmFlavour};
+pub use asm::{dotnet_version, Assembly, DotnetVersion, IlasmFlavour};
 pub use basic_block::BasicBlock;
 pub use bimap::BiMap;
 pub use cilnode::{BinOp, CILNode};

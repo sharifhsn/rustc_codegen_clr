@@ -2334,6 +2334,106 @@ pub static ILASM_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(||
         .unwrap_or(get_default_ilasm())
 });
 
+/// The target .NET runtime version. Single source of truth for every version-specific string the
+/// backend emits (`runtimeconfig.json` TFM, `.assembly extern` `.ver` stamps) and for version-gated
+/// codegen (e.g. native sub-word `Interlocked` overloads, added in .NET 9). Read once from the
+/// `DOTNET_VERSION` env var via [`dotnet_version`]; defaults to [`DotnetVersion::Net8`] so an
+/// unconfigured build keeps the historical .NET 8 behaviour.
+///
+/// Declaration order is load-bearing: `Net8 < Net9`, so feature gates read `version >= Net9`
+/// (and a future `Net10` auto-takes the newer path with no edit).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash, Default)]
+pub enum DotnetVersion {
+    /// .NET 8 (the default / primary CI target).
+    #[default]
+    Net8,
+    /// .NET 9.
+    Net9,
+}
+impl DotnetVersion {
+    /// Target-framework moniker for `runtimeconfig.json` / `.nuspec` (`net8.0` / `net9.0`).
+    #[must_use]
+    pub fn tfm(self) -> &'static str {
+        match self {
+            DotnetVersion::Net8 => "net8.0",
+            DotnetVersion::Net9 => "net9.0",
+        }
+    }
+    /// The `.ver` triplet for a BCL `.assembly extern` stamp (`8:0:0:0` / `9:0:0:0`).
+    ///
+    /// NOTE: the public-key *tokens* are version-INVARIANT (verified identical on 8 and 9) — only
+    /// this triplet changes — so there is deliberately no token accessor.
+    #[must_use]
+    pub fn assembly_ver(self) -> &'static str {
+        match self {
+            DotnetVersion::Net8 => "8:0:0:0",
+            DotnetVersion::Net9 => "9:0:0:0",
+        }
+    }
+    /// A `Microsoft.NETCore.App` framework-version floor for `runtimeconfig.json` (`8.0.0` / `9.0.0`),
+    /// paired with roll-forward to the latest installed patch.
+    #[must_use]
+    pub fn framework_version(self) -> &'static str {
+        match self {
+            DotnetVersion::Net8 => "8.0.0",
+            DotnetVersion::Net9 => "9.0.0",
+        }
+    }
+    /// The major version number (`8` / `9`).
+    #[must_use]
+    pub fn major(self) -> u32 {
+        match self {
+            DotnetVersion::Net8 => 8,
+            DotnetVersion::Net9 => 9,
+        }
+    }
+}
+impl std::str::FromStr for DotnetVersion {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "8" | "net8" | "net8.0" => Ok(DotnetVersion::Net8),
+            "9" | "net9" | "net9.0" => Ok(DotnetVersion::Net9),
+            other => Err(format!(
+                "DOTNET_VERSION has invalid value {other:?}; expected 8 or 9 (or net8.0/net9.0)"
+            )),
+        }
+    }
+}
+/// The target .NET version for this process, read once from the `DOTNET_VERSION` env var (default
+/// [`DotnetVersion::Net8`]). Both the codegen backend and the (separate-process) linker read this,
+/// so a build must set `DOTNET_VERSION` in BOTH environments.
+pub static DOTNET_VERSION: std::sync::LazyLock<DotnetVersion> = std::sync::LazyLock::new(|| {
+    match std::env::var("DOTNET_VERSION") {
+        Ok(val) => val.parse().unwrap_or_else(|e| panic!("{e}")),
+        Err(_) => DotnetVersion::default(),
+    }
+});
+/// Convenience accessor for [`DOTNET_VERSION`] — the target .NET version of this build.
+#[must_use]
+pub fn dotnet_version() -> DotnetVersion {
+    *DOTNET_VERSION
+}
+
+#[cfg(test)]
+mod dotnet_version_tests {
+    use super::DotnetVersion;
+    #[test]
+    fn parse_and_order() {
+        assert_eq!("8".parse(), Ok(DotnetVersion::Net8));
+        assert_eq!("9".parse(), Ok(DotnetVersion::Net9));
+        assert_eq!("net9.0".parse(), Ok(DotnetVersion::Net9));
+        assert_eq!(DotnetVersion::default(), DotnetVersion::Net8);
+        assert!(DotnetVersion::Net9 > DotnetVersion::Net8);
+        assert!(!(DotnetVersion::Net8 >= DotnetVersion::Net9));
+        assert!("7".parse::<DotnetVersion>().is_err());
+        assert!("".parse::<DotnetVersion>().is_err());
+        assert_eq!(DotnetVersion::Net8.tfm(), "net8.0");
+        assert_eq!(DotnetVersion::Net9.assembly_ver(), "9:0:0:0");
+        assert_eq!(DotnetVersion::Net9.major(), 9);
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 /// Finds the default instance of the IL assembler.
 fn get_default_ilasm() -> String {
