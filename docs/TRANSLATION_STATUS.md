@@ -2,23 +2,33 @@
 
 > Status snapshot as of 2026-06 (nightly-2026-06-17, post the V1→V2 IR collapse, the
 > allocator-ABI fix, the **`dotnet` PAL**, the **complete-std** pass, the **"go big"** full-BCL
-> binding generation, and the **WF-6 unwinding throw-bridge**). Compiled from a code audit of the whole backend cross-checked against
+> binding generation, the **WF-6 unwinding throw-bridge**, the **libc/POSIX shim + `target-family=["unix"]`
+> flip**, **full `std::os::unix`**, **async/tokio on the PAL**, and the **one-command `cargo dotnet` DX**).
+> Compiled from a code audit of the whole backend cross-checked against
 > FractalFir's design articles (`docs/ARCHITECTURE.md`, `docs/fractalfir_articles/`). Intended as a
 > planning reference: what exists, what's partial, what's missing-but-feasible, and what is
 > fundamentally limited. File:function pointers are given so each claim is checkable.
+>
+> **New-user entry point:** [docs/CARGO_DOTNET.md](CARGO_DOTNET.md) — compile arbitrary Rust to .NET in
+> one command (`cargo dotnet build|run`), and consume a Rust library from C#. This status doc is the
+> deep map; CARGO_DOTNET.md is the how-to.
 
 ## The one-sentence picture
 
 The **codegen** (Rust → CIL) is mature and largely faithful — ~90–96% of `core`/`alloc`/`std` test
-suites pass. As of the latest milestones the **Rust→.NET half is substantially complete**: a real
-`dotnet` PAL runs `std` on .NET with no surrogate (for the vertical it covers), and the full BCL call
-surface is generated (4,256 method/ctor wrappers). And the **`.NET→Rust` direction now works at its
-core** (WF-7): C# imports a Rust *library* and calls its functions (incl. string marshalling), and a
-Rust `dotnet_typedef!` declaration emits a real managed class. What remains is the **ergonomic tail**
-(constructors, richer marshalling, de-mangled/typed API, NuGet packaging) — not new capability walls.
-This matches the author's own framing: *the translation is the validated, even elegant part; the interop
-ergonomics and platform integration are where the hard work remains* (`docs/fractalfir_articles/`,
-`v0_1_0`/`v0_2_0`).
+suites pass. The **Rust→.NET half is complete end-to-end**: a real `dotnet` PAL runs `std` on .NET with
+no surrogate (files, net, threads, time, **`panic=unwind`**, **async/await + tokio**, **full
+`std::os::unix`** under the `target-family=["unix"]` flip + a libc/POSIX shim), the full BCL call surface
+is generated (4,256 method/ctor wrappers), and an arbitrary crate compiles + runs with **zero hand-config**
+via the one-command **`cargo dotnet`** DX (with auto-applied crate overlays for syscall-using deps). The
+**`.NET→Rust` direction works at its core** (WF-7): C# imports a Rust *library* and calls its functions
+on the **real dotnet PAL** through `cargo dotnet` (primitives, UTF-8 strings, de-mangled `#[repr(C)]`
+structs, slices), and a Rust `dotnet_typedef!` declaration emits a real managed class. **Soak: ~74 real
+crates, 73/74 pass** on the PAL (the one non-pass, `regex`, is a deep allocator issue). What remains is
+the **ergonomic tail** of `.NET→Rust` (managed-`String`/`Result` through the real-PAL flow, NuGet
+packaging) — not new capability walls. This matches the author's own framing: *the translation is the
+validated, even elegant part; the interop ergonomics and platform integration are where the hard work
+remains* (`docs/fractalfir_articles/`, `v0_1_0`/`v0_2_0`).
 
 Mental model of the layers (each builds on the one above):
 
@@ -26,11 +36,21 @@ Mental model of the layers (each builds on the one above):
   codegen core      Rust MIR → CIL: types, ops, calls, dispatch         ~90% — mature
   interop substrate Rust → .NET BCL call mechanism (magic fns / extern) mechanism done
   Rust → .NET API   generated wrappers over the BCL (all bindable types)  done — 4256 methods
-  runtime/std       allocator, stdio, threads, fs … on .NET             real dotnet PAL (vertical); surrogate retiring
+  runtime/std       alloc, stdio, threads, fs, net, async, os::unix      real dotnet PAL (no surrogate); +libc/POSIX shim
+  build DX          arbitrary crate → .NET, zero config                 `cargo dotnet build|run` + auto overlays
   ── consumers ──
   .NET → Rust       call Rust fns + define managed classes (WF-7)       core works; ergonomic tail left
   packaged library  class-lib output + de-mangled API + marshalling      J3: real-PAL .dll via `cargo dotnet`, C#-called (Tier-1 marshalling)
 ```
+
+The Rust→.NET stack is now exercised end-to-end by **four worked journeys** (`cargo_tests/cd_*` + the
+north-star), documented for the average user in [docs/CARGO_DOTNET.md](CARGO_DOTNET.md):
+- **J1** pure Rust → .NET (`cargo_tests/cd_pure`);
+- **J2** syscall-deps → .NET via auto-applied overlays (`cargo_tests/cd_tokio`, a tokio echo);
+- **J3** a Rust `cdylib` consumed from C# (`cargo_tests/cd_interop`, all four marshalling categories);
+- **J4** the north-star: a **real, dependency-using production library** imported by C# and running its
+  logic as .NET CIL, returning the correct result (via a transient FFI wrapper + a read-only cross-repo
+  mount, leak-safe).
 
 ---
 
@@ -129,11 +149,17 @@ still returns `None` (needs a synthesized abort handler block).
 (malloc/realloc/free → `Marshal.*HGlobal`), EH → `RustException` try/catch, atomics → `Interlocked`,
 math, and a **full pthread mapping** (`builtins/thread.rs`, 701 LOC).
 
-**The "surrogate libc" is host-libc *delegation*** — 610 functions in `LIBC_FNS` are PInvoke'd to the
-host's real libc/libm/libgcc (f128 support "not portable at all", Linux/GNU only). So the artifact is
-**not self-contained** and is x86_64-Linux-bound. **This is exactly what the `dotnet` PAL replaces —
-see §8.** WF-2 (`9d042ef`) landed the real PAL for the alloc/stdio/RNG/time/thread vertical (`std` runs
-on .NET with no surrogate there); fs/net and full surrogate retirement remain (WF-4).
+**The "surrogate libc" was host-libc *delegation*** — 610 functions in `LIBC_FNS` PInvoke'd to the
+host's real libc/libm/libgcc (Linux/GNU only), so that artifact was **not self-contained** and
+x86_64-Linux-bound. **The `dotnet` PAL replaces it — see §8 — and now covers the full vertical:** WF-2
+(`9d042ef`) landed alloc/stdio/RNG/time/thread; subsequent work added **fs** (`System.IO`), **net**
+(TCP/UDP over `System.Net.Sockets` + I/O-driven async/tokio via the mio reactor), **`panic=unwind`**,
+and — under the `target-family=["unix"]` flip plus a **libc/POSIX shim** (fd-table + thread-local errno
++ ~20 bare-C-ABI POSIX symbols backed by the existing BCL hooks) — **full `std::os::unix`** (AF_UNIX,
+`MetadataExt`, symlinks, pread/pwrite, the fd onion). `std` runs on .NET with **no surrogate**; the
+remaining host-libc `LIBC_FNS` entries are unreachable on the dotnet target. The detailed libc map is
+[docs/LIBC_SHIM_SCOPE.md](LIBC_SHIM_SCOPE.md); the os::unix plan + leaky-bits ledger is
+[docs/STD_OS_UNIX_PLAN.md](STD_OS_UNIX_PLAN.md).
 
 **Dead/WIP:** comptime interpreter, AOT (`aot.rs`/`native_passtrough.rs`: `#![allow(dead_code)]`, zero
 callers), softfloat ("Sample code", unused).
@@ -446,18 +472,21 @@ The sibling `cast_ptr_to` (takes the full pointer type) is the correct helper. S
 
 ## 11. North-star benchmark & full workflow roadmap
 
-**Benchmark (the capability yardstick):** a real, dependency-using Rust module living *in* a .NET
-solution (concretely: `monark/primary-offerings`) that C# **imports and calls like a normal library** —
-correct answers, `std` working inside, a clean public API with IntelliSense. This one test exercises
-*every* capability layer at once, so **"the benchmark passes" ≈ "the translation layer works."** It is
-fundamentally the `.NET→Rust` direction sitting on the whole stack.
+**Benchmark (the capability yardstick):** a real, dependency-using Rust production module living *in* a
+.NET solution that C# **imports and calls like a normal library** — correct answers, `std` working
+inside, a clean public API. This one test exercises *every* capability layer at once, so **"the
+benchmark passes" ≈ "the translation layer works."** It is fundamentally the `.NET→Rust` direction
+sitting on the whole stack. **This has now been met (J4):** a real production library (built on
+serde/chrono/uuid) was imported by C# and ran its pagination logic as .NET CIL, returning the correct
+result, via a transient FFI wrapper over a read-only cross-repo mount (leak-safe). The four end-to-end
+journeys (J1–J4) are walked in [docs/CARGO_DOTNET.md](CARGO_DOTNET.md) §7.
 
 The benchmark decomposes into 6 layers → workflows:
 
 | Layer | Workflow(s) | Status |
 |---|---|---|
 | 1 correct codegen | WF-1, WF-5 | ✅ **DONE** |
-| 2 `std` runs on .NET | WF-2, WF-4 | ✅ **DONE** (PAL vertical; surrogate retiring) |
+| 2 `std` runs on .NET | WF-2, WF-4 | ✅ **DONE** (full PAL — files/net/threads/time/panic/**async-tokio**/**`os::unix`**; no surrogate; 73/74 soak) |
 | 3 Rust→.NET calls | WF-3 | ✅ **DONE** (full BCL, 4256 methods) |
 | 4 errors/panics cross cleanly | WF-6 | ✅ **DONE** (throw-bridge; catch_unwind works) |
 | 5 .NET→Rust export (call Rust from C#) | **WF-7** | ✅ **DONE** (C# calls a Rust *library*; string marshalling; Rust *defines* managed classes) |
@@ -516,12 +545,19 @@ direction (C# imports a Rust library and calls its functions, §6). What remains
   cargo↔MSBuild build glue is separable tooling, not codegen.)
 - **WF-9** Generic-interop bridge — `RustGeneric<T>` ↔ C# (size-parameterized for `T: unmanaged`,
   boxed/`GCHandle` for managed T; §7). Needed iff the module's public API uses generic containers.
-- **WF-10 (open-ended)** Real-crate soak / hardening — drive an actual dependency-using crate
-  end-to-end and close the long tail. Where "experimental" becomes "usable."
+- **WF-10 (open-ended)** Real-crate soak / hardening — **DONE for breadth**: ~74 real crates driven
+  through `cargo dotnet` on the dotnet PAL under the flip, **73/74 pass** (the one non-pass, `regex`, is
+  a deep allocator issue, not a class-level gap); 11+ class-level codegen fixes landed over the campaign.
+  This is where "experimental" became "usable" for the covered surface.
+- **The build DX (the consolidation):** the whole stack is now driven by the one-command **`cargo dotnet
+  build|run`** (`feasibility/cargo-dotnet` over the shared `_cargo_dotnet_core.sh`), with the
+  [`dotnet_overlays`](../dotnet_overlays/README.md) registry auto-applied for syscall-using deps and
+  `cdylib` library output for C# consumption. New-user guide: [docs/CARGO_DOTNET.md](CARGO_DOTNET.md).
 
-**Status vs. the benchmark:** the capability work is **~85% done** — layers 1–4 (WF-1/2/3/5/6) complete
-*and* WF-7 P1+P2+P3-core (C# calls a Rust library; string marshalling; Rust defines managed classes).
-**All five capability layers now have a working core.** Remaining is mostly the **ergonomic tail**:
-WF-7 finish (constructors, `Vec`/struct marshalling, managed-`String` return, direct typed C# refs) +
-WF-8 (packaging — de-mangled API, BCL-ref versions, NuGet), then WF-9 (if the module's API is generic)
-+ WF-10 (soak) for a *real* module. The hard, ceiling-adjacent pieces are behind us.
+**Status vs. the benchmark:** the capability work is **~95% done** — layers 1–6 all have a working core,
+the north-star J4 has been met (a real production library run from C#), and the soak set is 73/74. The
+platform is complete (files/net/threads/time/panic/async/`os::unix` on the real PAL), and the one-command
+`cargo dotnet` DX wraps it all with zero hand-config. Remaining is the **ergonomic tail**: the `.NET→Rust`
+Tier-2 surface through the real-PAL flow (managed-`String`/`Result` return), NuGet/`.csproj` packaging,
+WF-9 (only if the consumed module's API is generic), and the `regex` allocator fix. The hard,
+ceiling-adjacent pieces are behind us.

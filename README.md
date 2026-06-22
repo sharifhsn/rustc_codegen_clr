@@ -3,6 +3,13 @@
 > [!WARNING]
 > This project is still early in its developement. Bugs, crashes and miscompilations are expected. DO NOT USE IT FOR ANYTHING SERIOUS.
 
+> [!TIP]
+> **New here? Start with [docs/CARGO_DOTNET.md](docs/CARGO_DOTNET.md)** — the one-command developer
+> experience: `cargo dotnet build|run` compiles an arbitrary Rust crate to a .NET assembly (or a
+> C#-referenceable `.dll`) with zero hand-config. The deeper map of what translates and what doesn't is
+> [docs/TRANSLATION_STATUS.md](docs/TRANSLATION_STATUS.md); the backend internals are
+> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 `rustc_codegen_clr` is an experimental Rust compiler backend(plugin), which allows you to transpile Rust into .NET assemblies, or C source files. 
 
 The end goal of the project is allowing Rust to be used in places where it could not be used before. 
