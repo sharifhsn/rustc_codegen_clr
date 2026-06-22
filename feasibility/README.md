@@ -122,6 +122,25 @@ nothing). The two zero-config proof crates are `cargo_tests/cd_pure` (pure Rust)
 and `cargo_tests/cd_tokio` (a tokio loopback TCP echo whose only dep line is a
 plain `tokio = { version = "1", features = [...] }`).
 
+### Library output — calling Rust *from* C# (J3)
+
+`cargo dotnet` also builds a Rust **library** (`crate-type = ["cdylib"]`) into a
+**C#-referenceable .NET assembly**. It detects the crate-type from cargo's JSON
+stream, emits `target/x86_64-unknown-dotnet/<profile>/lib<crate>.so` (a managed
+PE), and copies it to **`<crate>.dll`** beside it (a pure file copy — the assembly
+identity is `<crate>` regardless of the `.so` name). `cargo dotnet run` on a
+library prints a "reference the .dll from C#" note and exits 0 (no entrypoint).
+
+A C# project references it with a bare assembly `<Reference>` + `<HintPath>` (no
+P/Invoke, no NuGet) and calls the `#[no_mangle] pub extern "C"` exports as
+`public static MainModule.<fn>` — ordinary managed calls, because the Rust is
+compiled to managed CIL. De-mangled `#[repr(C)]` structs appear under their clean
+`Crate.Type` name with synthesized ctor + getters. The worked example is
+`cargo_tests/cd_interop/` (`rustlib/` cdylib + `csharp/` console app); marshalling
+verified end-to-end on the real dotnet PAL: **primitives, UTF-8 `(ptr, len)`
+strings, a struct value-type, and a slice**. Full consumer guide:
+[`docs/INTEROP_CSHARP.md`](../docs/INTEROP_CSHARP.md).
+
 ### Architecture (and the Docker vs. native seam)
 
 `cargo-dotnet` is a **thin host front-end**: it resolves the repo + crate dir,
@@ -164,6 +183,12 @@ maintenance tax: each bump may surface a fresh batch of rustc-internal API drift
 
 - **Build on latest nightly:** the point of this harness — see the top-level summary / PR.
 - **Rust running on .NET:** the supported direction; `smoke`/`demo` exercise it.
-- **Calling Rust *from* C#/EF Core ergonomically:** the project's least-finished area
-  (`mycorrhiza`, `dotnet_typedef!`). Not demonstrated here on purpose — it's the real
-  remaining work, independent of getting the build green.
+- **Calling Rust *from* C# (J3):** demonstrated end-to-end via `cargo dotnet`'s
+  library output — a real C# console app references a `cargo dotnet`-built Rust
+  `cdylib` and calls its exports, asserting the results match Rust (primitives,
+  strings, a struct, a slice). See the "Library output" subsection above,
+  `cargo_tests/cd_interop/`, and [`docs/INTEROP_CSHARP.md`](../docs/INTEROP_CSHARP.md).
+  The richer / more idiomatic surface — managed `System.String` returns and
+  Rust-raises-a-.NET-exception `Result`s (`mycorrhiza`, `dotnet_typedef!`) — is
+  proven on the surrogate target (`cargo_tests/rust_export/`) but not yet through
+  this real-PAL flow; that is the remaining interop work.

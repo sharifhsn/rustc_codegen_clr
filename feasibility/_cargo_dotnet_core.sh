@@ -671,28 +671,78 @@ else
   rc=${PIPESTATUS[0]}
 fi
 echo "== build exit: $rc =="
-# Derive the produced apphost path. Do NOT assume dir-basename == bin-name (true
-# for cargo_tests/* but NOT for an arbitrary crate). Read the real "executable"
-# path emitted by cargo's JSON message stream — the most reliable source, already
-# produced by the build. No jq/python3 (neither is in the rcc-dev image): a tiny
-# awk extracts the LAST "executable":"…" non-null field. Fall back to the bin
-# target name from `cargo metadata`, then to the dir basename.
-out=""
+# Derive the produced artifact path(s) from cargo's JSON message stream — the most
+# reliable source, already produced by the build. No jq/python3 (neither is in the
+# rcc-dev image). Two artifact kinds:
+#   * an EXECUTABLE (a bin crate)        -> the `"executable":"…"` field. Run it.
+#   * a LIBRARY (cdylib/dylib/staticlib) -> a compiler-artifact whose target
+#     crate_types includes cdylib/dylib/staticlib; its `"filenames":[…]` lists the
+#     produced `.so`. The dotnet target has dynamic-linking:true, so a
+#     crate-type=["cdylib"] makes cargo pass `-o …/lib<crate>.so` and the cilly
+#     linker (is_lib keys on the .so) writes a referenceable .NET PE there. C# has
+#     no entrypoint to run, so we copy that .so to `<crate>.dll` beside it for a
+#     direct `<Reference>`/<HintPath> and DON'T try to run it.
+# We capture the JSON stream ONCE (rebuilding twice is wasteful and was the old
+# shape's only inefficiency) and extract both kinds from it.
+out=""        # executable apphost path (bin crate)
+libout=""     # produced library .so path (cdylib/dylib/staticlib crate)
+libdll=""     # the <crate>.dll copy beside the .so (C#-referenceable)
 if [ "$rc" = 0 ]; then
-  out=$(cargo -Zjson-target-spec build "${CARGOFLAGS[@]}" --message-format=json 2>/dev/null \
+  jsonlog=$(cargo -Zjson-target-spec build "${CARGOFLAGS[@]}" --message-format=json 2>/dev/null)
+  # (1) executable apphost: LAST non-null "executable":"…" field.
+  out=$(printf '%s\n' "$jsonlog" \
         | awk 'match($0, /"executable":"[^"]+"/){ s=substr($0,RSTART+14,RLENGTH-15); if (s!="null" && s!="") last=s } END{ if(last!="") print last }')
   # awk above strips the leading `"executable":"` (14 chars) and trailing `"`.
-  if [ -z "$out" ] || [ ! -f "$out" ]; then
-    # Fallback: bin target name from cargo metadata (no jq) -> conventional path.
-    bin=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
-          | tr ',' '\n' | awk -F'"' '/"kind":\["bin"\]/{want=1} want && /"name":/{print $4; exit}')
-    [ -z "$bin" ] && bin="$(basename "$(pwd)")"
-    out="target/x86_64-unknown-dotnet/$PROFILE/$bin"
-    [ -f "$out" ] || out="target/dotnet/$PROFILE/$bin"
+  if { [ -z "$out" ] || [ ! -f "$out" ]; }; then
+    # No executable -> maybe a bin crate cargo metadata can name, else a LIBRARY.
+    # (2) library .so: a compiler-artifact JSON line whose target lists a
+    # cdylib/dylib/staticlib crate-type; pull a `.so`/`.dll`/`.dylib` from its
+    # "filenames" array. One awk pass per line (the whole artifact JSON is on one
+    # line in the cargo stream), keying on the crate_types presence.
+    libout=$(printf '%s\n' "$jsonlog" \
+      | awk '
+          /"reason":"compiler-artifact"/ &&
+          (/"cdylib"/ || /"dylib"/ || /"staticlib"/) {
+            # extract the first "filenames":["…"] entry that looks like a shared obj
+            if (match($0, /"filenames":\[[^]]*\]/)) {
+              fns=substr($0,RSTART,RLENGTH)
+              n=split(fns, parts, "\"")
+              for (i=1;i<=n;i++) if (parts[i] ~ /\.(so|dll|dylib)$/) last=parts[i]
+            }
+          }
+          END{ if(last!="") print last }')
+    if [ -z "$out" ] || [ ! -f "$out" ]; then out=""; fi
+    if [ -n "$libout" ] && [ -f "$libout" ]; then
+      # The .so PE's real .NET assembly identity is `<crate>` regardless of the .so
+      # filename, so the .dll is a pure FILE COPY (never a transmute). Derive the
+      # crate name from the lib<crate>.so stem (strip dir, the cargo `lib` prefix,
+      # and the extension) and copy beside the .so so a C# <Reference>/<HintPath>
+      # (HintPath=<crate>.dll) resolves it. cp -f overwrites a stale copy.
+      libstem=$(basename "$libout"); libstem="${libstem%.*}"; libstem="${libstem#lib}"
+      libdll="$(dirname "$libout")/${libstem}.dll"
+      cp -f "$libout" "$libdll"
+      echo "== lib PE: $libout -> $libdll (assembly '$libstem') =="
+    fi
+    # Bin fallback ONLY if neither an executable nor a library was found (an
+    # arbitrary bin crate whose JSON 'executable' field cargo left null).
+    if [ -z "$out" ] && [ -z "$libout" ]; then
+      bin=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
+            | tr ',' '\n' | awk -F'"' '/"kind":\["bin"\]/{want=1} want && /"name":/{print $4; exit}')
+      [ -z "$bin" ] && bin="$(basename "$(pwd)")"
+      out="target/x86_64-unknown-dotnet/$PROFILE/$bin"
+      [ -f "$out" ] || out="target/dotnet/$PROFILE/$bin"
+      [ -f "$out" ] || out=""
+    fi
   fi
 fi
 if [ "$rc" != 0 ]; then exit "$rc"; fi
 if [ "${CD_RUN:-0}" = 1 ]; then
+  if [ -z "$out" ] && [ -n "$libdll" ]; then
+    # A library has no entrypoint — refuse to run it, but cleanly (exit 0): the
+    # build SUCCEEDED, the user just asked to run a non-runnable artifact.
+    echo "cargo dotnet run: '$libstem' is a LIBRARY (no entrypoint) — reference $(basename "$libdll") from a C# project (see docs/INTEROP_CSHARP.md)"
+    exit 0
+  fi
   [ -n "$out" ] && [ -f "$out" ] || { echo "!! cargo dotnet run: no runnable apphost found (looked for an executable artifact)"; exit 3; }
   echo "== RUN $out =="
   "$out" "$@"
@@ -700,5 +750,9 @@ if [ "${CD_RUN:-0}" = 1 ]; then
   echo "run exit: $prc"
   exit "$prc"
 fi
-echo "== built: ${out:-<no bin artifact>} =="
+if [ -n "$libdll" ]; then
+  echo "== built lib: $libout (referenceable as $(basename "$libdll")) =="
+else
+  echo "== built: ${out:-<no bin artifact>} =="
+fi
 exit 0

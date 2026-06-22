@@ -29,7 +29,7 @@ Mental model of the layers (each builds on the one above):
   runtime/std       allocator, stdio, threads, fs … on .NET             real dotnet PAL (vertical); surrogate retiring
   ── consumers ──
   .NET → Rust       call Rust fns + define managed classes (WF-7)       core works; ergonomic tail left
-  packaged library  class-lib output + de-mangled API + marshalling      partial (WF-8): lib .dll emits; naming/NuGet left
+  packaged library  class-lib output + de-mangled API + marshalling      J3: real-PAL .dll via `cargo dotnet`, C#-called (Tier-1 marshalling)
 ```
 
 ---
@@ -174,7 +174,23 @@ method on the `MainModule` class. WF-7 made a Rust **library** crate (`crate-typ
 real **.NET class-library assembly** (named after the crate, no entrypoint), so C# references it and
 calls its `#[no_mangle]` functions as ordinary managed methods. Proven end-to-end:
 `cargo_tests/rust_export` (a Rust lib) + `cargo_tests/rust_export_cs` (a C# program) — C# calls
-`rust_add`/`rust_mul`/`rust_fib`/`rust_add_f64` on .NET, all correct. The enabling backend changes:
+`rust_add`/`rust_mul`/`rust_fib`/`rust_add_f64` on .NET, all correct.
+
+**J3 (the real-PAL `cargo dotnet` flow): WORKING for Tier-1 marshalling.** The interop above was first
+proven on the **surrogate** target (`x86_64-unknown-linux-gnu`, no `panic_unwind`). J3 brings it onto
+the **real dotnet PAL** through the one-command `cargo dotnet` library flow: `cargo dotnet build` detects
+a `cdylib`, emits `lib<crate>.so` (a managed PE), and copies it to `<crate>.dll`; a real C# console app
+references it and asserts results match Rust. Worked example: `cargo_tests/cd_interop/` (`rustlib/` +
+`csharp/`). **Verified on the real PAL (Tier 1):** primitives (`rust_add`), UTF-8 `(ptr, len)` strings
+(`greet` out-buffer round-trip), a de-mangled `#[repr(C)]` struct value-type (`cd_interop.Point` with
+synthesized ctor/getters, `point_sum`/`make_point`), and an inbound slice/`Vec` sum (`sum_slice`). The
+make-or-break assumption held: an I/O-free, panic-free `cdylib` has no entrypoint, so `lang_start` /
+weak-static runtime tail is unreachable and DCE'd — the lib emits cleanly pulling only CoreLib extern
+refs. **Tier 2 (surrogate-only, not yet through this real-PAL flow):** returning a managed
+`System.String` directly (`mycorrhiza::system::MString`/`greet_managed`) and a Rust-raises-a-.NET-
+exception `Result` (`rustc_clr_interop_throw`/`try_div`) — both pull `mycorrhiza` + the throw intrinsic.
+Consumer guide: `docs/INTEROP_CSHARP.md`. Zero backend code changed for J3 — only `feasibility/` shell
+(the `cargo dotnet` lib-artifact branch) + the new probe crate. The enabling backend changes (from WF-7):
 - `#[no_mangle]` → `Access::Extern` (`src/assembly.rs`), making exports **dead-code-elimination roots**
   — essential, since a library has no entrypoint to root the call graph (without it the whole API is
   eliminated).

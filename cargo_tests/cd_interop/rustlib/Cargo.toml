@@ -1,0 +1,17 @@
+[package]
+name = "cd_interop"
+edition = "2021"
+version = "0.1.0"
+
+[lib]
+# A .NET class library: `cargo dotnet build` emits this cdylib as a referenceable
+# .NET assembly (named `cd_interop`, no entrypoint) whose `#[no_mangle] pub extern
+# "C"` functions are `public static` methods on `MainModule`, callable from C#.
+crate-type = ["cdylib"]
+
+# This crate lives UNDER the repo workspace root, so it needs a bare `[workspace]`
+# line or cargo treats it as a member of the outer workspace (the cd_pure footgun).
+[workspace]
+
+[profile.release.build-override]
+codegen-units = 1
