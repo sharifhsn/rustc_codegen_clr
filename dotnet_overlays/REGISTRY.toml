@@ -18,6 +18,16 @@
 #
 # dir = the overlay's directory under dotnet_overlays/ (a full crate dir: byte-
 # identical upstream + a handful of `// DOTNET PAL`-marked lines; see README.md).
+#
+# MULTI-VERSION (same NAME, different versions): several [[overlay]] blocks may share
+# a `name` so long as they declare distinct `version`s + `dir`s — getrandom does this
+# for its three coexisting majors (0.2/0.3/0.4 can ALL be live in one dep graph). The
+# auto-apply step emits one `paths` dir per [[overlay]]; cargo's `paths` override is
+# keyed by crate NAME and picks, among the candidate dirs, the one whose own
+# Cargo.toml version SATISFIES each locked instance — so the three same-name dirs
+# coexist and resolve 0.2.17->getrandom-0.2, 0.3.4->getrandom-0.3, 0.4.3->getrandom-0.4.
+# The lock-mismatch verifier matches on (name, version), not name alone, so each
+# major reports APPLIED/MISMATCH independently.
 
 [[overlay]]
 name = "mio"
@@ -33,3 +43,23 @@ dir = "socket2"
 name = "tokio"
 version = "1.52.3"
 dir = "tokio"
+
+# getrandom — three coexisting majors. Each overlay IS getrandom (patched) with a
+# self-contained `target_os="dotnet"` backend arm that calls the PAL CSPRNG
+# (rcl_dotnet_random_fill), so rand/ahash/uuid (and any getrandom user) build with
+# ZERO consumer wiring — no custom symbol, no `getrandom_backend=custom` cfg, no
+# `getrandom_dotnet` dep. See README.md "The overlays, line by line".
+[[overlay]]
+name = "getrandom"
+version = "0.4.3"
+dir = "getrandom-0.4"
+
+[[overlay]]
+name = "getrandom"
+version = "0.3.4"
+dir = "getrandom-0.3"
+
+[[overlay]]
+name = "getrandom"
+version = "0.2.17"
+dir = "getrandom-0.2"

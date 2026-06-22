@@ -390,8 +390,8 @@ cd_setup(){
   echo "   cargo dotnet run            # build + run on .NET"
   echo "   cargo dotnet build          # build only"
   echo ""
-  echo " Caveat: a crate that uses \`getrandom\` still needs the custom-backend shim"
-  echo " symbol (documented follow-up); pure compute/println + most deps just work."
+  echo " getrandom (rand/uuid/ahash) auto-works via the dotnet_overlays registry — no"
+  echo " wiring. Pure compute/println + most deps just work."
   echo " Re-run \`cargo dotnet setup --from-repo <path> --force\` after a repo update."
   echo "============================================================"
   return 0

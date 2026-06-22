@@ -3,12 +3,9 @@ name = "soak_rand"
 version = "0.1.0"
 edition = "2021"
 [dependencies]
+# rand -> rand_core -> getrandom 0.2 transitively; the dotnet_overlays/getrandom-0.2
+# overlay supplies the PAL CSPRNG backend, so NO getrandom wiring is needed (no
+# `custom` feature, no register_custom_getrandom! macro).
 rand = "0.8"
 rand_chacha = "0.3"
-# rand -> rand_core -> getrandom 0.2, which rejects os="dotnet". 0.2 selects its
-# custom backend via the Cargo `custom` FEATURE (not a cfg); feature unification
-# turns it on for rand_core's transitive copy too. The symbol is installed by
-# `register_custom_getrandom!` in main.rs (must be in the root binary crate).
-getrandom = { version = "0.2", features = ["custom"] }
-getrandom_dotnet = { path = "../getrandom_dotnet" }
 [workspace]

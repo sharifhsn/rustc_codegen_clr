@@ -1,5 +1,19 @@
 //! `getrandom` custom-backend forwarding to the dotnet PAL's CSPRNG.
 //!
+//! ## SUPERSEDED for the cargo-dotnet auto path (kept as the manual reference primitive)
+//!
+//! As of the getrandom overlays in `dotnet_overlays/getrandom-{0.2,0.3,0.4}`, the
+//! `cargo dotnet` / `dev.sh pal-build` path makes `getrandom` (and `rand`/`uuid`/
+//! `ahash`) **auto-work with ZERO wiring**: each overlay IS getrandom (patched) with a
+//! self-contained `target_os="dotnet"` backend arm that calls `rcl_dotnet_random_fill`
+//! directly, so NO consumer-provided symbol/macro/feature and NO dependency on this
+//! crate is needed. Consumers just `use uuid`/`rand`/`ahash`.
+//!
+//! This crate is RETAINED as the documented reference fill primitive + the correct
+//! manual escape hatch for ad-hoc / non-overlaid builds (a one-off crate built without
+//! the cargo-dotnet overlay registry). The per-major wiring recipes below still apply
+//! to that manual path.
+//!
 //! ## Why this exists
 //!
 //! Our custom rustc target (`x86_64-unknown-dotnet.json`) advertises `os = "dotnet"`, which

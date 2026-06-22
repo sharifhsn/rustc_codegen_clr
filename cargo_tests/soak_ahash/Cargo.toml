@@ -3,8 +3,7 @@ name = "soak_ahash"
 version = "0.1.0"
 edition = "2021"
 [dependencies]
+# ahash pulls getrandom 0.3 transitively; the dotnet_overlays/getrandom-0.3 overlay
+# supplies the PAL CSPRNG backend, so NO getrandom wiring is needed.
 ahash = "0.8"
-# ahash -> getrandom 0.3 (rejects os="dotnet" without a custom backend).
-getrandom = "0.3"
-getrandom_dotnet = { path = "../getrandom_dotnet" }
 [workspace]

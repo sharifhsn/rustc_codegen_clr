@@ -16,6 +16,27 @@
 
 ## 1. Q1 — Why `getrandom` does not auto-work, and the recommended auto-fix
 
+> **RESOLVED (update).** getrandom 0.2 / 0.3 / 0.4 now **auto-work with ZERO consumer
+> wiring** via the overlay registry (`dotnet_overlays/getrandom-{0.2,0.3,0.4}`), exactly
+> like mio/socket2/tokio. The analysis below is accurate about the EXTERNAL custom hatch
+> (the `__getrandom_v03_custom` symbol / `register_custom_getrandom!` macro) — and that
+> hatch genuinely cannot be supplied by an overlay. But the conclusion that getrandom
+> therefore "cannot be auto-fixed by an overlay" (and the §1.3/§1.4 pessimism that 0.2 in
+> particular cannot be fully automated) was **too narrow**: it overlooked that the overlay
+> can edit getrandom's **in-crate backend dispatch** directly. Because the overlay IS
+> getrandom (patched), it can add a `target_os="dotnet"` arm to the internal backend
+> cascade that DEFINES the entropy backend itself (calling the PAL CSPRNG
+> `rcl_dotnet_random_fill` via a directly-declared `extern "C"`) — bypassing the external
+> symbol/macro/feature entirely. No application-provided link symbol is ever needed, and
+> the version-coupled `getrandom::Error` is never constructed (the PAL fill is infallible,
+> so the arm always returns `Ok(())`). 0.2's older single-`imp` model is handled the same
+> way (a `#[path="dotnet.rs"] mod imp;` first-arm of its `cfg_if!`), so 0.2 is fully
+> automated too — no `custom` feature, no macro. The `--cfg getrandom_backend="custom"`
+> RUSTFLAG was REMOVED (it would shadow the overlay's dotnet arm for 0.3/0.4). The
+> multi-major coexistence is handled by emitting only the locked major's overlay dir in
+> the `paths` override (single-version-per-name; see `dotnet_overlays/README.md`). The
+> `getrandom_dotnet` crate remains as the reference primitive for manual/ad-hoc builds.
+
 ### 1.1 The symptom
 
 Our custom target spec (`x86_64-unknown-dotnet.json`) advertises `"os": "dotnet"`. `getrandom`

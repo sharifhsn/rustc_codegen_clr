@@ -191,9 +191,12 @@ not Mono (Mono emits PE32 images the native CoreCLR loader rejects).
   surfaces as an unhandled managed exception and the apphost still returns **0** —
   a pre-existing PAL limitation (the managed exception is not translated to a
   non-zero process exit), independent of `cargo dotnet`.
-- **`getrandom`:** the command passes `--cfg getrandom_backend="custom"` (harmless
-  for crates that don't use it); a crate that pulls `getrandom` still needs the
-  custom-backend shim symbol — see `dotnet_overlays/README.md`.
+- **`getrandom`:** `getrandom` 0.2 / 0.3 / 0.4 **auto-work with ZERO wiring** via the
+  `dotnet_overlays/getrandom-{0.2,0.3,0.4}` overlays (each IS getrandom, patched with
+  a self-contained `target_os="dotnet"` backend arm that calls the PAL CSPRNG). So
+  `rand` / `uuid` / `ahash` (and any getrandom user) just build — no custom symbol,
+  no macro, no `getrandom_dotnet` dep, and no `--cfg getrandom_backend="custom"` RUSTFLAG
+  (it was removed). See `dotnet_overlays/README.md`.
 
 ## The nightly pin
 

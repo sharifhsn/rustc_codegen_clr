@@ -643,22 +643,33 @@ if [ -n "${CD_EXTRA_CARGO_FLAGS:-}" ]; then
 fi
 echo "==> cargo dotnet: building $(pwd) (profile=$PROFILE)"
 if [ "${CD_CLEAN:-0}" = 1 ]; then echo "==> cargo clean (full, bulletproof)"; cargo clean; fi
-# `--cfg getrandom_backend="custom"` selects getrandom 0.3/0.4's custom backend
-# (our os="dotnet" target has no built-in getrandom arm). Harmless for crates that
-# don't depend on getrandom (the cfg is simply unused). See dev.sh pal-build.
-export RUSTFLAGS="-Z codegen-backend=$CD_BACKEND_DYLIB -C linker=$CD_LINKER -C link-args=--cargo-support --cfg getrandom_backend=\"custom\""
+# getrandom needs NO RUSTFLAGS: the dotnet_overlays/getrandom-{0.2,0.3,0.4} overlays
+# supply a self-contained `target_os="dotnet"` backend arm that calls the PAL CSPRNG
+# (rcl_dotnet_random_fill), so rand/ahash/uuid build with zero wiring. The old
+# `--cfg getrandom_backend="custom"` is REMOVED: for 0.3/0.4 the custom arm is the
+# FIRST branch of getrandom's backend cascade, so the cfg would WIN over the overlay's
+# dotnet arm and pull custom.rs's unresolved `__getrandom_v03_custom` extern (which no
+# consumer defines now) -> link error. The overlay's dotnet arm is the single backend.
+export RUSTFLAGS="-Z codegen-backend=$CD_BACKEND_DYLIB -C linker=$CD_LINKER -C link-args=--cargo-support"
 set +e
-# PHASE G — CENTRAL OVERLAY REGISTRY auto-apply. Three load-bearing crates (mio,
-# socket2, tokio) need a small, marked source overlay to build/run on os=dotnet
-# that NO cfg flip can supply. The overlays live ONCE under /work/dotnet_overlays/
-# {mio,socket2,tokio} (REGISTRY.toml lists name/version/dir). We auto-redirect any
-# present in this project's dep graph via a generated `.cargo/config.toml`
-# `paths = [...]` override — the user's tracked Cargo.toml is NEVER touched, and
-# `paths` is graph-wide by crate NAME so it covers a TRANSITIVE dep (mio under
-# tokio). A `paths` entry whose crate isn't in the graph (or whose version doesn't
-# satisfy the locked requirement) is silently ignored by cargo, so emitting all
-# overlays is safe; we ALSO parse the lock afterwards and warn loudly on a
-# name-match/version-mismatch (the "overlay silently not applied" footgun).
+# PHASE G — CENTRAL OVERLAY REGISTRY auto-apply. A handful of load-bearing crates
+# (mio, socket2, tokio, getrandom) need a small, marked source overlay to build/run
+# on os=dotnet that NO cfg flip can supply. The overlays live ONCE under
+# /work/dotnet_overlays/{mio,socket2,tokio,getrandom-*} (REGISTRY.toml lists
+# name/version/dir). We auto-redirect any present in this project's dep graph via a
+# generated `.cargo/config.toml` `paths = [...]` override — the user's tracked
+# Cargo.toml is NEVER touched, and `paths` is graph-wide by crate NAME so it covers a
+# TRANSITIVE dep (mio under tokio, getrandom under rand/uuid/ahash).
+#
+# SINGLE-VERSION-PER-NAME RULE (the getrandom multi-major footgun). cargo's `paths`
+# override picks exactly ONE version per crate NAME for the whole graph: with several
+# same-name dirs in `paths` it takes the HIGHEST and warns "path override … has
+# altered the original list of dependencies" — which would wrongly link e.g. rand's
+# rand_core (needs getrandom 0.2) against the 0.4 overlay (no `pub fn getrandom`) and
+# fail. So for a name with MULTIPLE registry overlays (getrandom 0.2/0.3/0.4), we emit
+# ONLY the dir whose version is LOCKED in THIS project — making it a single-version
+# override (the proven-reliable shape mio/socket2/tokio use). This needs the lock
+# FIRST, so we generate it (with a paths-free config) before building the paths list.
 apply_overlays() { # cwd = the project dir; reads $CD_REPO/dotnet_overlays/REGISTRY.toml
   local reg="$CD_REPO/dotnet_overlays/REGISTRY.toml"
   [ -f "$reg" ] || { echo "==> no overlay registry at $reg (skipping auto-apply)"; return 0; }
@@ -667,27 +678,58 @@ apply_overlays() { # cwd = the project dir; reads $CD_REPO/dotnet_overlays/REGIS
   names=$(awk -F'"' '/^name *=/{print $2}' "$reg")
   vers=$(awk -F'"' '/^version *=/{print $2}' "$reg")
   dirs=$(awk -F'"' '/^dir *=/{print $2}' "$reg")
-  # Build the paths list (one dir per overlay; cargo ignores entries not in graph).
-  local paths_lines="" d
-  while IFS= read -r d; do
-    [ -n "$d" ] || continue
-    [ -d "$CD_REPO/dotnet_overlays/$d" ] || { echo "!! overlay dir missing: $CD_REPO/dotnet_overlays/$d"; continue; }
-    paths_lines="$paths_lines    \"$CD_REPO/dotnet_overlays/$d\",
-"
-  done <<< "$dirs"
-  # Regenerate .cargo/config.toml FROM SCRATCH (idempotent): preserve the dotnet
-  # target + build-std, then append the top-level `paths` override. Paths are
-  # resolved relative to the dir containing .cargo/, so absolute $CD_REPO paths.
+  # STEP 1: write a paths-FREE config (target + build-std only) so the lock can be
+  # generated against the dotnet target. (The override doesn't affect WHICH versions
+  # resolve — only the source dir at compile time — so a paths-free lock pins the same
+  # versions the final build uses; it just lets us read them to filter the paths.)
   mkdir -p .cargo
-  # NOTE: `paths` is a TOP-LEVEL config key (a local-source override), NOT an
-  # `[unstable]` or `[build]` sub-key — it MUST be emitted before any table header
-  # or cargo silently ignores it (`unused config key`), the override no-ops, and
-  # the crate resolves unpatched from the registry. Emit it first.
+  {
+    echo '# GENERATED by feasibility/cargo-dotnet (apply_overlays) — do not hand-edit.'
+    echo '[build]'
+    echo "target = \"$CD_TARGET_SPEC\""
+    echo '[unstable]'
+    echo 'build-std = ["core", "alloc", "std", "panic_unwind"]'
+  } > .cargo/config.toml
+  # Ensure a Cargo.lock exists so cargo pins versions (and so we can filter/verify
+  # them). Run generate-lockfile only if absent (keeps an existing lock stable).
+  [ -f Cargo.lock ] || cargo -Zjson-target-spec generate-lockfile >/dev/null 2>&1 || true
+  # Helper: ALL locked versions for a crate name (one per line; may be empty).
+  locked_versions() { awk -v want="$1" '
+    $1=="name" && $3=="\""want"\""{f=1; next}
+    f && $1=="version"{gsub(/"/,"",$3); print $3; f=0}
+    $1=="name"{f=0}' Cargo.lock; }
+  # STEP 2: build the paths list. For each overlay, include its dir IFF either (a) the
+  # name has a single registry overlay (mio/socket2/tokio — always emit, cargo ignores
+  # it when the crate isn't in the graph), or (b) the name has MULTIPLE overlays and
+  # THIS overlay's version is the one LOCKED (so only the matching getrandom major's
+  # dir is emitted — single-version-per-name). A name with no lock yet (no Cargo.lock)
+  # falls back to emitting all single-overlay names only.
+  local paths_lines="" n v d count
+  # count overlays per name (to detect multi-version names).
+  declare -A name_count=()
+  while IFS= read -r n; do [ -n "$n" ] && name_count["$n"]=$(( ${name_count["$n"]:-0} + 1 )); done <<< "$names"
+  # iterate the three parallel arrays in lock-step.
+  paste <(echo "$names") <(echo "$vers") <(echo "$dirs") | while IFS=$'\t' read -r n v d; do
+    [ -n "$n" ] || continue
+    [ -d "$CD_REPO/dotnet_overlays/$d" ] || { echo "!! overlay dir missing: $CD_REPO/dotnet_overlays/$d"; continue; }
+    count="${name_count["$n"]:-1}"
+    if [ "$count" -gt 1 ] && [ -f Cargo.lock ]; then
+      # Multi-version name: emit ONLY if this exact version is locked.
+      if ! locked_versions "$n" | grep -qxF "$v"; then continue; fi
+    fi
+    echo "    \"$CD_REPO/dotnet_overlays/$d\","
+  done > .cargo/_paths_lines.$$
+  paths_lines="$(cat .cargo/_paths_lines.$$)"; rm -f .cargo/_paths_lines.$$
+  # STEP 3: regenerate .cargo/config.toml FROM SCRATCH with the filtered paths. NOTE:
+  # `paths` is a TOP-LEVEL config key (a local-source override), NOT an `[unstable]` or
+  # `[build]` sub-key — it MUST be emitted before any table header or cargo silently
+  # ignores it (`unused config key`), the override no-ops, and the crate resolves
+  # unpatched from the registry. Emit it first.
   {
     echo '# GENERATED by feasibility/cargo-dotnet (apply_overlays) — do not hand-edit.'
     echo '# (Phase G: the dotnet_overlays paths-override; Phase D: cargo dotnet.)'
     echo 'paths = ['
-    printf '%s' "$paths_lines"
+    printf '%s\n' "$paths_lines"
     echo ']'
     echo '[build]'
     echo "target = \"$CD_TARGET_SPEC\""
@@ -695,29 +737,48 @@ apply_overlays() { # cwd = the project dir; reads $CD_REPO/dotnet_overlays/REGIS
     echo 'build-std = ["core", "alloc", "std", "panic_unwind"]'
   } > .cargo/config.toml
   echo "==> regenerated .cargo/config.toml with dotnet_overlays paths override"
-  # Ensure a Cargo.lock exists so cargo pins versions (and so we can verify them).
-  # The `paths` override participates in resolution, so the lock pins the overlay
-  # versions. Run generate-lockfile only if absent (keeps an existing lock stable).
-  [ -f Cargo.lock ] || cargo -Zjson-target-spec generate-lockfile >/dev/null 2>&1 || true
-  # Verify each overlay's declared version against the locked version; warn loudly
-  # on a mismatch (cargo would silently ignore the override -> miscompile risk).
+  # Verify the overlays against the lock; warn loudly only on a REAL mismatch (cargo
+  # would silently ignore an override -> miscompile risk). MULTI-VERSION aware: a crate
+  # NAME may appear several times in the lock (the three getrandom majors can coexist in
+  # one graph) with one overlay per major. Two independent checks:
+  #   (1) APPLIED   — this overlay's exact (name, version) is locked. The old `head -1`
+  #       reported only the FIRST locked version, so it missed/mis-flagged sibling
+  #       majors; we match (name, version) exactly. For single-version crates
+  #       (mio/socket2/tokio) this is behaviour-identical.
+  #   (2) MISMATCH  — a LOCKED version of an overlaid name is covered by NO overlay at
+  #       all (cargo resolves it UNPATCHED -> the footgun). A sibling overlay whose
+  #       version simply isn't in THIS graph (e.g. the getrandom 0.2/0.3 overlays when
+  #       only 0.4 is locked) is INERT, not a footgun, so it is reported silently.
   if [ -f Cargo.lock ]; then
-    local n v locked
+    local n v all_locked lv
+    # (1) per-overlay APPLIED (exact name+version locked).
     paste <(echo "$names") <(echo "$vers") | while IFS=$'\t' read -r n v; do
       [ -n "$n" ] || continue
-      locked=$(awk -v want="$n" '
+      all_locked=$(awk -v want="$n" '
         $1=="name" && $3=="\""want"\""{f=1; next}
         f && $1=="version"{gsub(/"/,"",$3); print $3; f=0}
-        $1=="name"{f=0}' Cargo.lock | head -1)
-      if [ -z "$locked" ]; then
-        : # overlay crate not in this project's graph — fine, paths entry is inert.
-      elif [ "$locked" = "$v" ]; then
-        echo "==> overlay APPLIED: $n $v (locked $locked) -> $CD_REPO/dotnet_overlays/$n"
-      else
-        echo "!! OVERLAY VERSION MISMATCH: $n overlay=$v but Cargo.lock pins $locked"
-        echo "!! cargo will IGNORE the paths override for $n (footgun: overlay NOT applied)."
-        echo "!! Fix: refresh dotnet_overlays/$n to $locked + bump REGISTRY.toml (see README)."
-      fi
+        $1=="name"{f=0}' Cargo.lock)
+      [ -n "$all_locked" ] && printf '%s\n' "$all_locked" | grep -qxF "$v" \
+        && echo "==> overlay APPLIED: $n $v (locked)"
+    done
+    # (2) per-overlaid-NAME footgun: a locked version that NO overlay covers.
+    for n in $(echo "$names" | sort -u); do
+      [ -n "$n" ] || continue
+      # all overlay versions registered for this name.
+      ov_vers=$(paste <(echo "$names") <(echo "$vers") | awk -F'\t' -v want="$n" '$1==want{print $2}')
+      all_locked=$(awk -v want="$n" '
+        $1=="name" && $3=="\""want"\""{f=1; next}
+        f && $1=="version"{gsub(/"/,"",$3); print $3; f=0}
+        $1=="name"{f=0}' Cargo.lock)
+      [ -n "$all_locked" ] || continue   # name not in graph — all its overlays inert.
+      while IFS= read -r lv; do
+        [ -n "$lv" ] || continue
+        if ! printf '%s\n' "$ov_vers" | grep -qxF "$lv"; then
+          echo "!! OVERLAY VERSION MISMATCH: $n is locked at $lv but no dotnet_overlays/ dir covers it"
+          echo "!! cargo will resolve $n $lv UNPATCHED (footgun: overlay NOT applied)."
+          echo "!! Fix: refresh/add a dotnet_overlays/ dir for $n $lv + a REGISTRY.toml entry (see README)."
+        fi
+      done <<< "$all_locked"
     done
   fi
 }

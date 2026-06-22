@@ -340,10 +340,11 @@ tools see it too.)
 
 ### Caveats & maintenance
 
-- **`getrandom`** — the command passes `--cfg getrandom_backend="custom"`, but a crate that actually
-  pulls `getrandom` still needs the custom-backend shim symbol (a documented follow-up). Pure
-  compute/`println!` crates and most deps just work. (For getrandom 0.2, the new standard-flag
-  passthrough lets you enable its `custom` feature directly, e.g. `cargo dotnet run --features getrandom/custom`.)
+- **`getrandom`** — 0.2 / 0.3 / 0.4 **auto-work with ZERO wiring** via the
+  `dotnet_overlays/getrandom-{0.2,0.3,0.4}` overlays (each IS getrandom, patched with a
+  self-contained `target_os="dotnet"` backend arm that calls the PAL CSPRNG). So `rand`/`uuid`/`ahash`
+  and any getrandom user just build — no custom symbol/macro/feature, no `getrandom_dotnet` dep, and
+  no `--cfg getrandom_backend="custom"` RUSTFLAG (removed). See `dotnet_overlays/README.md`.
 - **rust-src is a shared, per-toolchain mutation.** The PAL injection patches the *toolchain's*
   `rust-src` in place. Every arm is `#[cfg(target_os = "dotnet")]`-gated, so it is inert for any
   non-dotnet build under that nightly — but it **is** a global side effect (the install is not fully
@@ -446,9 +447,10 @@ minimal edit). **Adding a new overlay** is a small recipe — vendor the pinned 
 minimal `// DOTNET PAL`-marked edit, add a `[[overlay]]` block to `REGISTRY.toml`. Full recipe and the
 line-by-line rationale for the existing three: [dotnet_overlays/README.md](../dotnet_overlays/README.md).
 
-> **`getrandom` note.** The command passes `--cfg getrandom_backend="custom"` (harmless for crates that
-> don't use it); a crate that pulls `getrandom` still needs the custom-backend shim symbol — see the
-> overlay README.
+> **`getrandom` note.** getrandom 0.2 / 0.3 / 0.4 auto-work with ZERO wiring via the
+> `dotnet_overlays/getrandom-{0.2,0.3,0.4}` overlays (each is getrandom patched with a self-contained
+> `target_os="dotnet"` backend arm). No custom symbol/macro/feature, no `--cfg getrandom_backend`. The
+> multi-major case uses single-version-per-name path filtering — see the overlay README.
 
 ---
 

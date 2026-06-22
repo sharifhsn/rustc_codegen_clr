@@ -3,8 +3,7 @@ name = "soak_uuid"
 version = "0.1.0"
 edition = "2021"
 [dependencies]
+# uuid "v4" pulls getrandom 0.4 transitively; the dotnet_overlays/getrandom-0.4
+# overlay supplies the PAL CSPRNG backend, so NO getrandom wiring is needed.
 uuid = { version = "1", features = ["v4"] }
-# uuid "v4" -> getrandom 0.4 (rejects os="dotnet" without a custom backend).
-getrandom = "0.4"
-getrandom_dotnet = { path = "../getrandom_dotnet" }
 [workspace]

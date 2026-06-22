@@ -13,18 +13,44 @@ overlays from here — a downstream user adds **nothing** to their own `Cargo.to
 `target-family = ["unix"]`, so `cfg(unix)`/`cfg(target_family="unix")` are true and
 those crates pick their existing unix arms straight onto the .NET PAL.
 
-But three load-bearing crates need a *source* edit that no cfg flip can supply,
-and the three edits are **heterogeneous** — there is no single trick:
+But a handful of load-bearing crates need a *source* edit that no cfg flip can
+supply, and the edits are **heterogeneous** — there is no single trick:
 
 | crate | overlay shape | why a cfg flip can't do it |
 |---|---|---|
 | `mio` | ~22 `#[cfg(target_os="dotnet")]` arm lines across 5 files + 1 new `waker/dotnet.rs` | mio selects its readiness backend/waker by `target_os`, and has no `dotnet` concept; the dotnet waker is a new file |
 | `socket2` | 1 crate-INTERNAL `type IovLen = libc::size_t` alias | a private type alias inside the crate — nothing external can inject it |
 | `tokio` | 2 lines (a `cfg_net_unix!` gate + a `memchr` fallback arm) | excludes dotnet from the AF_UNIX/`unix::pipe` surface and from the libc memchr arm |
+| `getrandom` ×3 (0.2/0.3/0.4) | 1 new `dotnet` backend module + 1 marked `target_os="dotnet"` arm in the backend cascade, per major | getrandom hard-`compile_error!`s on os=dotnet (no built-in arm); the overlay IS getrandom (patched), so it DEFINES the entropy backend internally (calls the PAL CSPRNG `rcl_dotnet_random_fill`) — NO consumer symbol/macro/feature, NO `getrandom_dotnet` dep |
 
 So the generalization is a **bundled overlay registry the framework auto-applies**,
 not a flag. Each overlay is stored ONCE here and serves every consuming project
-(direct or transitive — e.g. `mio` is pulled in by `tokio`).
+(direct or transitive — e.g. `mio` is pulled in by `tokio`; `getrandom` by
+`rand`/`uuid`/`ahash`).
+
+### getrandom: the multi-version case (same NAME, three majors)
+
+getrandom is the first overlaid crate with **multiple coexisting majors** —
+`rand`→`getrandom 0.2`, `ahash`→`0.3`, `uuid`→`0.4`, and all three can be live in
+one dependency graph at once. The registry therefore carries **three** `[[overlay]]`
+entries all named `getrandom` (versions 0.2.17 / 0.3.4 / 0.4.3, dirs
+`getrandom-0.2` / `getrandom-0.3` / `getrandom-0.4`).
+
+The auto-apply step handles this with a **single-version-per-name rule**: cargo's
+`paths` override picks exactly ONE version per crate NAME for the whole graph (with
+several same-name dirs it takes the highest and warns *"path override … has altered
+the original list of dependencies"*, which would wrongly link e.g. rand_core against
+the 0.4 overlay). So for a name with multiple overlays, the framework generates the
+`Cargo.lock` FIRST and then emits **only the overlay dir whose version is locked** in
+this project — turning each multi-major case back into the proven-reliable
+single-version override that mio/socket2/tokio use. (Single-overlay names are always
+emitted; cargo ignores entries whose crate isn't in the graph.)
+
+Once the overlay supplies a real dotnet backend, **no consumer wiring is needed at
+all** — `rand`/`uuid`/`ahash` just build. There is also no `--cfg
+getrandom_backend="custom"` RUSTFLAG (it was removed: for 0.3/0.4 the `custom` arm is
+the FIRST branch of getrandom's cascade, so the cfg would win over the overlay's
+dotnet arm and pull the now-undefined `__getrandom_v03_custom` extern → link error).
 
 ## Layout
 
@@ -35,6 +61,9 @@ dotnet_overlays/
   mio/            # full crate: upstream mio 1.2.1 + the marked dotnet arms
   socket2/        # full crate: upstream socket2 0.6.4 + the 1 marked line
   tokio/          # full crate: upstream tokio 1.52.3 + the 2 marked lines
+  getrandom-0.4/  # full crate: upstream getrandom 0.4.3 + the dotnet backend arm
+  getrandom-0.3/  # full crate: upstream getrandom 0.3.4 + the dotnet backend arm
+  getrandom-0.2/  # full crate: upstream getrandom 0.2.17 + the dotnet backend arm
 ```
 
 Each overlay is a **full crate directory** (upstream byte-identical except the
@@ -137,3 +166,27 @@ socket2's named-OS `IovLen` arms; an external libc widening cannot supply it).
   mio's uds + an fd-backed `fs::File`; pal_tokio_net is TCP-only).
 - `util/memchr.rs`: both arms get `not(target_os="dotnet")` so dotnet routes to
   the pure-Rust memchr fallback (the dotnet libc face does not model `memchr`).
+
+**getrandom 0.4.3 / 0.3.4** (`getrandom-0.4/src/`, `getrandom-0.3/src/`) — these two
+majors are STRUCTURALLY IDENTICAL; the dotnet backend file is byte-identical between
+them:
+- `src/backends/dotnet.rs`: NEW — exports `fill_inner(dest: &mut [MaybeUninit<u8>])`
+  over the PAL CSPRNG (`extern "C" { fn rcl_dotnet_random_fill(ptr, len); }`) plus
+  `pub use crate::util::{inner_u32, inner_u64}` (the backend contract lib.rs calls).
+  Infallible (RandomNumberGenerator.Fill always succeeds) → always `Ok(())`, so a
+  `getrandom::Error` is never constructed.
+- `src/backends.rs`: one `// DOTNET PAL`-marked `else if #[cfg(target_os = "dotnet")]`
+  arm, placed AFTER the last `getrandom_backend="…"` opt-in arm (so an explicit cfg
+  still wins) and BEFORE the first per-os arm + the `compile_error!` tail.
+
+**getrandom 0.2.17** (`getrandom-0.2/src/`) — the older single-`imp` model; the
+contract differs (`getrandom_inner`, no `inner_u32`/`inner_u64`):
+- `src/dotnet.rs`: NEW — exports `getrandom_inner(dest: &mut [MaybeUninit<u8>])` over
+  the same PAL CSPRNG (modelled on `fuchsia.rs`), using
+  `crate::util::uninit_slice_fill_zero`. Always `Ok(())`.
+- `src/lib.rs`: one `// DOTNET PAL`-marked `if #[cfg(target_os = "dotnet")] { #[path =
+  "dotnet.rs"] mod imp; }` as the FIRST arm of the imp-selector `cfg_if!`, so it
+  pre-empts the late `feature = "custom"` arm regardless of feature unification. (0.2
+  uses the `custom` FEATURE, not the `getrandom_backend` cfg — editing the in-crate
+  cascade sidesteps the feature+macro entirely, so NO consumer wiring is needed; this
+  is more than the external custom hatch can do.)

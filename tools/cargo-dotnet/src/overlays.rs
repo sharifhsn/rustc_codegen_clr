@@ -7,8 +7,10 @@
 //! Cargo.toml is never touched, and `paths` is graph-wide by crate NAME so it covers a
 //! transitive dep (mio under tokio).
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
@@ -28,39 +30,22 @@ struct Overlay {
     dir: String,
 }
 
-/// Regenerate the crate's `.cargo/config.toml` from scratch with the overlay
-/// paths-override, preserving the CRITICAL emit order, then warn on a lock mismatch.
-pub fn apply(ctx: &Context) -> Result<()> {
-    let reg_path = ctx.paths.overlays_root.join("REGISTRY.toml");
-    if !reg_path.is_file() {
-        eprintln!(
-            "==> no overlay registry at {} (skipping auto-apply)",
-            reg_path.display()
-        );
-        return Ok(());
-    }
-    let reg_text = fs::read_to_string(&reg_path)
-        .with_context(|| format!("read {}", reg_path.display()))?;
-    let reg: Registry =
-        toml::from_str(&reg_text).with_context(|| format!("parse {}", reg_path.display()))?;
+#[derive(Deserialize)]
+struct Lock {
+    #[serde(default)]
+    package: Vec<Pkg>,
+}
+#[derive(Deserialize)]
+struct Pkg {
+    name: String,
+    version: String,
+}
 
-    // Build the paths list (one existing dir per overlay; cargo ignores entries whose
-    // crate isn't in the graph, so emitting all overlays is safe).
-    let mut paths_lines = String::new();
-    for ov in &reg.overlay {
-        let dir = ctx.paths.overlays_root.join(&ov.dir);
-        if !dir.is_dir() {
-            eprintln!("!! overlay dir missing: {}", dir.display());
-            continue;
-        }
-        paths_lines.push_str(&format!("    \"{}\",\n", dir.display()));
-    }
-
-    // Regenerate .cargo/config.toml FROM SCRATCH. EMIT ORDER IS LOAD-BEARING: the
-    // top-level `paths` key MUST precede any table header, or cargo silently drops it
-    // (`unused config key`) and the override no-ops -> the crate resolves UNPATCHED ->
-    // miscompile. So we write the string in this exact sequence (not toml::to_string,
-    // which won't guarantee a top-level key precedes the tables).
+/// Write a `.cargo/config.toml` with the given (already-formatted) `paths` body plus
+/// the dotnet target + build-std. EMIT ORDER IS LOAD-BEARING: the top-level `paths`
+/// key MUST precede any table header, or cargo silently drops it (`unused config key`)
+/// and the override no-ops -> the crate resolves UNPATCHED -> miscompile.
+fn write_config(ctx: &Context, paths_lines: &str) -> Result<()> {
     let cargo_dir = ctx.crate_dir.join(".cargo");
     fs::create_dir_all(&cargo_dir)
         .with_context(|| format!("mkdir -p {}", cargo_dir.display()))?;
@@ -75,13 +60,96 @@ pub fn apply(ctx: &Context) -> Result<()> {
     );
     fs::write(cargo_dir.join("config.toml"), config)
         .with_context(|| format!("write {}", cargo_dir.join("config.toml").display()))?;
+    Ok(())
+}
+
+/// Regenerate the crate's `.cargo/config.toml` from scratch with the overlay
+/// paths-override, preserving the CRITICAL emit order, then warn on a lock mismatch.
+///
+/// SINGLE-VERSION-PER-NAME RULE (the getrandom multi-major footgun): cargo's `paths`
+/// override picks exactly ONE version per crate NAME for the whole graph — with several
+/// same-name dirs in `paths` it takes the HIGHEST and warns it "altered the original
+/// list of dependencies", which would wrongly link e.g. rand's rand_core (needs
+/// getrandom 0.2) against the 0.4 overlay and fail. So for a name with MULTIPLE
+/// registry overlays (getrandom 0.2/0.3/0.4) we emit ONLY the dir whose version is
+/// LOCKED in THIS project — making it a single-version override (the proven-reliable
+/// mio/socket2/tokio shape). That needs the lock FIRST, so we generate it with a
+/// paths-free config before building the filtered paths list.
+pub fn apply(ctx: &Context) -> Result<()> {
+    let reg_path = ctx.paths.overlays_root.join("REGISTRY.toml");
+    if !reg_path.is_file() {
+        eprintln!(
+            "==> no overlay registry at {} (skipping auto-apply)",
+            reg_path.display()
+        );
+        return Ok(());
+    }
+    let reg_text = fs::read_to_string(&reg_path)
+        .with_context(|| format!("read {}", reg_path.display()))?;
+    let reg: Registry =
+        toml::from_str(&reg_text).with_context(|| format!("parse {}", reg_path.display()))?;
+
+    // STEP 1: write a paths-FREE config so the lock can be generated against the dotnet
+    // target. (The override doesn't change WHICH versions resolve — only the source dir
+    // at compile time — so a paths-free lock pins the same versions the final build
+    // uses; it just lets us read them to filter the paths.)
+    write_config(ctx, "")?;
+    let lock_path = ctx.crate_dir.join("Cargo.lock");
+    if !lock_path.is_file() {
+        let _ = Command::new(&ctx.cargo)
+            .current_dir(&ctx.crate_dir)
+            .arg("-Zjson-target-spec")
+            .arg("generate-lockfile")
+            .status();
+    }
+    let locked: Option<Lock> = if lock_path.is_file() {
+        fs::read_to_string(&lock_path)
+            .ok()
+            .and_then(|t| toml::from_str(&t).ok())
+    } else {
+        None
+    };
+
+    // count overlays per name (to detect multi-version names).
+    let mut name_count: HashMap<&str, usize> = HashMap::new();
+    for ov in &reg.overlay {
+        *name_count.entry(ov.name.as_str()).or_insert(0) += 1;
+    }
+
+    // STEP 2: build the paths list. Include an overlay's dir IFF either (a) its name has
+    // a single registry overlay (mio/socket2/tokio — always emit; cargo ignores it when
+    // the crate isn't in the graph), or (b) its name has MULTIPLE overlays AND this
+    // overlay's version is the one LOCKED (so only the matching getrandom major's dir is
+    // emitted — single-version-per-name).
+    let mut paths_lines = String::new();
+    for ov in &reg.overlay {
+        let dir = ctx.paths.overlays_root.join(&ov.dir);
+        if !dir.is_dir() {
+            eprintln!("!! overlay dir missing: {}", dir.display());
+            continue;
+        }
+        let multi = name_count.get(ov.name.as_str()).copied().unwrap_or(1) > 1;
+        if multi {
+            let version_locked = locked.as_ref().is_some_and(|l| {
+                l.package
+                    .iter()
+                    .any(|p| p.name == ov.name && p.version == ov.version)
+            });
+            if !version_locked {
+                continue; // a non-locked major of a multi-version name — skip its dir.
+            }
+        }
+        paths_lines.push_str(&format!("    \"{}\",\n", dir.display()));
+    }
+
+    // STEP 3: regenerate .cargo/config.toml FROM SCRATCH with the filtered paths.
+    write_config(ctx, &paths_lines)?;
     eprintln!("==> regenerated .cargo/config.toml with dotnet_overlays paths override");
 
     // Verify each overlay's declared version against the locked version; warn loudly on
-    // a mismatch (cargo would silently ignore the override -> miscompile risk).
-    let lock = ctx.crate_dir.join("Cargo.lock");
-    if lock.is_file() {
-        warn_on_lock_mismatch(&lock, &reg)?;
+    // a REAL mismatch (cargo would silently ignore the override -> miscompile risk).
+    if lock_path.is_file() {
+        warn_on_lock_mismatch(&lock_path, &reg)?;
     }
     Ok(())
 }
@@ -90,45 +158,56 @@ pub fn apply(ctx: &Context) -> Result<()> {
 /// (the "overlay silently not applied" footgun). The lock is TOML, so this replaces the
 /// bash awk/paste scan with a typed parse.
 fn warn_on_lock_mismatch(lock: &Path, reg: &Registry) -> Result<()> {
-    #[derive(Deserialize)]
-    struct Lock {
-        #[serde(default)]
-        package: Vec<Pkg>,
-    }
-    #[derive(Deserialize)]
-    struct Pkg {
-        name: String,
-        version: String,
-    }
     let text = fs::read_to_string(lock).with_context(|| format!("read {}", lock.display()))?;
     let parsed: Lock = match toml::from_str(&text) {
         Ok(l) => l,
         Err(_) => return Ok(()), // a malformed/partial lock isn't fatal to the build.
     };
+    // Verify the overlays against the lock; warn loudly only on a REAL mismatch.
+    // MULTI-VERSION aware: a crate NAME may appear several times in the lock (the three
+    // getrandom majors can coexist in one graph) with one overlay per major.
+    //   (1) APPLIED   — this overlay's exact (name, version) is locked. (The old code
+    //       matched name-only and stopped at the first hit, mis-flagging siblings.)
+    //   (2) MISMATCH  — a LOCKED version of an overlaid name is covered by NO overlay
+    //       at all (cargo resolves it UNPATCHED -> the footgun). A sibling overlay whose
+    //       version simply isn't in THIS graph (e.g. the getrandom 0.2/0.3 overlays when
+    //       only 0.4 is locked) is INERT, not a footgun — reported silently.
+    // For single-version crates (mio/socket2/tokio) this is behaviour-identical.
+
+    // (1) per-overlay APPLIED (exact name+version locked).
     for ov in &reg.overlay {
-        let Some(locked) = parsed
+        if parsed
             .package
             .iter()
-            .find(|p| p.name == ov.name)
-            .map(|p| p.version.as_str())
-        else {
-            continue; // overlay crate not in this graph — fine, the paths entry is inert.
-        };
-        if locked == ov.version {
-            eprintln!("==> overlay APPLIED: {} {} (locked {locked})", ov.name, ov.version);
-        } else {
-            eprintln!(
-                "!! OVERLAY VERSION MISMATCH: {} overlay={} but Cargo.lock pins {locked}",
-                ov.name, ov.version
-            );
-            eprintln!(
-                "!! cargo will IGNORE the paths override for {} (footgun: overlay NOT applied).",
-                ov.name
-            );
-            eprintln!(
-                "!! Fix: refresh dotnet_overlays/{} to {locked} + bump REGISTRY.toml.",
-                ov.name
-            );
+            .any(|p| p.name == ov.name && p.version == ov.version)
+        {
+            eprintln!("==> overlay APPLIED: {} {} (locked)", ov.name, ov.version);
+        }
+    }
+    // (2) per-overlaid-NAME footgun: a locked version that NO overlay covers.
+    let mut names: Vec<&str> = reg.overlay.iter().map(|o| o.name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        for pkg in parsed.package.iter().filter(|p| p.name == name) {
+            let covered = reg
+                .overlay
+                .iter()
+                .any(|o| o.name == name && o.version == pkg.version);
+            if !covered {
+                eprintln!(
+                    "!! OVERLAY VERSION MISMATCH: {name} is locked at {} but no dotnet_overlays/ dir covers it",
+                    pkg.version
+                );
+                eprintln!(
+                    "!! cargo will resolve {name} {} UNPATCHED (footgun: overlay NOT applied).",
+                    pkg.version
+                );
+                eprintln!(
+                    "!! Fix: refresh/add a dotnet_overlays/ dir for {name} {} + a REGISTRY.toml entry.",
+                    pkg.version
+                );
+            }
         }
     }
     Ok(())

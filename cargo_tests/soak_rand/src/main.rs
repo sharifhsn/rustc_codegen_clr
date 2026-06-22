@@ -8,15 +8,9 @@ use rand::{Rng, SeedableRng};
 use rand::seq::SliceRandom;
 use rand_chacha::ChaCha20Rng;
 
-// getrandom 0.2 custom backend -> dotnet PAL CSPRNG. rand -> rand_core ->
-// getrandom 0.2 rejects os="dotnet" unless a custom backend is registered.
-// 0.2 uses a Cargo feature (`custom`, enabled in Cargo.toml) + this macro,
-// which must be invoked in the root binary crate. Distinct symbol from 0.3/0.4.
-fn dotnet_getrandom(buf: &mut [u8]) -> Result<(), getrandom::Error> {
-    getrandom_dotnet::fill(buf);
-    Ok(())
-}
-getrandom::register_custom_getrandom!(dotnet_getrandom);
+// NO getrandom wiring: rand -> rand_core -> getrandom 0.2 transitively, and the
+// dotnet_overlays/getrandom-0.2 overlay supplies a self-contained `target_os="dotnet"`
+// backend (the PAL CSPRNG) — no `custom` feature, no register_custom_getrandom! macro.
 
 fn main() {
     println!("== soak_rand start ==");
