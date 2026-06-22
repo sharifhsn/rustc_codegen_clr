@@ -101,7 +101,7 @@
     <MSBuild Projects="$(MSBuildProjectFullPath)"
              Targets="_BuildOneRustCrate"
              BuildInParallel="false"
-             Properties="_OneDir=%(_RustCrate._Dir);_OneProfile=%(_RustCrate._Profile);_OneMetaName=%(_RustCrate._MetaName);_OnePrivate=%(_RustCrate._Private);_OneClean=%(_RustCrate._Clean);_CargoDotnetExe=$(_CargoDotnetExe)">
+             Properties="_OneDir=%(_RustCrate._Dir);_OneProfile=%(_RustCrate._Profile);_OneMetaName=%(_RustCrate._MetaName);_OnePrivate=%(_RustCrate._Private);_OneClean=%(_RustCrate._Clean);_OneDotnet=$(RustDotnetVersion);_CargoDotnetExe=$(_CargoDotnetExe)">
       <Output TaskParameter="TargetOutputs" ItemName="_RustCrateDll" />
     </MSBuild>
 
@@ -185,6 +185,9 @@
       <_ProfileFlag Condition="'$(_OneProfile)'=='debug'">--debug</_ProfileFlag>
       <_ProfileFlag Condition="'$(_OneProfile)'!='debug'">--release</_ProfileFlag>
       <_CleanFlag Condition="'$(_OneClean)'=='true'">--clean</_CleanFlag>
+      <!-- Target .NET version (default 8): builds the crate's `.ver`/runtimeconfig + selects the
+           matching CoreCLR ilasm so the produced assembly loads on the consumer's runtime. -->
+      <_DotnetFlag Condition="'$(_OneDotnet)'!=''">--dotnet $(_OneDotnet)</_DotnetFlag>
     </PropertyGroup>
 
     <Message Importance="high"
@@ -195,7 +198,7 @@
          resolve under MSBuild's non-interactive env). DOTNET_ROOT points the linker at
          a dotnet. EnvironmentVariables ADDS to the inherited env (it does not clear it),
          and PATH is set to "<tooldirs>:<inherited PATH>" so nothing is lost. -->
-    <Exec Command="&quot;$(_CargoDotnetExe)&quot; build &quot;$(_OneDir)&quot; $(_ProfileFlag) $(_CleanFlag)"
+    <Exec Command="&quot;$(_CargoDotnetExe)&quot; build &quot;$(_OneDir)&quot; $(_ProfileFlag) $(_CleanFlag) $(_DotnetFlag)"
           EnvironmentVariables="PATH=$(RustDotnetToolPath):$(PATH);DOTNET_ROOT=$(RustDotnetDotnetRoot)" />
 
     <Error Condition="!Exists('$(_OneDll)')"
