@@ -6,25 +6,11 @@ edition = "2021"
 mio = { version = "1", features = ["net", "os-poll"] }
 [workspace]
 
-# DOTNET PAL ARM (B1 convergence): UPSTREAM mio 1.2.1 + a handful of small
-# `target_os = "dotnet"` PAL arms, ZERO Cargo edits, NO external wrapper. With
-# `target-family=["unix"]` now GLOBAL on the dotnet target spec (the committed
-# flip), mio gets `cfg(unix)` straight from --target (its #[cfg(unix)] sys arm
-# activates) and cargo evaluates `cfg(any(unix,...))` TRUE at dep-resolution so it
-# pulls libc into mio WITHOUT any Cargo.toml change (vendor/mio/Cargo.toml is now
-# byte-identical to crates.io). The vendored src differs from upstream only by:
-#   * a `#[cfg_attr(target_os="dotnet", path="selector/epoll.rs")]` selector arm
-#     (mio picks its backend by target_os and has no dotnet concept),
-#   * the `target_os="dotnet"` waker arm + waker/dotnet.rs (the stock eventfd waker
-#     needs an fd-backed std fs::File, which the dotnet GCHandle/FileStream File is
-#     NOT yet — the one irreducible blocker; the waker is never exercised by TCP/UDP),
-#   * `target_os="dotnet"` added to net.rs SOCK_NONBLOCK + tcp.rs accept4 lists
-#     (atomic non-blocking socket creation; the shim honours both),
-#   * uds gated off for dotnet (AF_UNIX abstract-namespace surface is impossible on
-#     stock CoreCLR).
-# mio drives its UPSTREAM #[cfg(unix)] epoll arm straight onto the cilly POSIX shim
-# (bare C-ABI symbol bodies). std stays os=dotnet (the dotnet PAL), with the flip.
-# The patch must resolve at the same MAJOR as `mio = "1"` (committed Cargo.lock
-# pins 1.2.1) or it silently no-ops. See docs/LIBC_SHIM_SCOPE.md §4.5.
-[patch.crates-io]
-mio = { path = "vendor/mio" }
+# PHASE G: NO per-project vendoring, NO hand-written [patch.crates-io]. mio needs
+# a small dotnet source overlay (target_os="dotnet" selector/waker/net arms; see
+# dotnet_overlays/README.md) that a cfg flip cannot supply, but the overlay lives
+# ONCE in the CENTRAL registry at /work/dotnet_overlays/mio. The build framework
+# (feasibility/dev.sh pal-build `apply_overlays`, the future `cargo dotnet`) auto-
+# applies it via a generated `.cargo/config.toml` `paths = [...]` override, keyed
+# by crate name+version against Cargo.lock — this manifest stays clean upstream
+# (the user adds nothing). Cargo.lock pins mio 1.2.1, matching the overlay.

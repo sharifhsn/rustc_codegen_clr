@@ -6,26 +6,14 @@ edition = "2021"
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util"] }
 [workspace]
 
-# DOTNET PAL: I/O-driven tokio over loopback. tokio's net pulls mio + socket2,
-# which need the dotnet PAL arms:
-#   * mio -> ../pal_mio/vendor/mio (byte-identical crates.io 1.2.1 + ~10
-#     target_os="dotnet" src lines incl. the OwnedFd-backed eventfd Waker). The
-#     global target-family=["unix"] flip makes cargo pull libc into mio at
-#     dep-resolution with ZERO Cargo edits; reuse the EXISTING pal_mio vendor (do
-#     NOT re-vendor a 2nd copy). Patch resolves at major "1" (lock pins 1.2.1).
-#   * socket2 -> vendor/socket2 (byte-identical crates.io 0.6.4 + ONE line: a
-#     target_os="dotnet" `IovLen` alias). target_os="dotnet" matches none of
-#     socket2's named-OS IovLen arms, so the stock crate is E0412 — a crate-
-#     INTERNAL alias no libc widening can supply (LIBC_SHIM_SCOPE §2). Patch
-#     resolves at major "0.6" (lock pins 0.6.4).
-#   * tokio -> vendor/tokio (byte-identical crates.io 1.52.3 + ONE line: exclude
-#     target_os="dotnet" from `cfg_net_unix!`). Under the unix flip tokio's
-#     net::unix (AF_UNIX + unix::pipe) would compile and pull mio's uds + pipe
-#     (pipe = IoSource<fs::File>, not fd-backed for dotnet) + libc stat/fstat/
-#     O_*/ucred the dotnet libc face omits. pal_tokio_net is TCP-only, so gating
-#     net::unix off for dotnet is the clean fix (LIBC_SHIM_SCOPE §2.2). Patch
-#     resolves at major "1" (lock pins 1.52.3).
-[patch.crates-io]
-mio = { path = "../pal_mio/vendor/mio" }
-socket2 = { path = "vendor/socket2" }
-tokio = { path = "vendor/tokio" }
+# PHASE G: NO per-project vendoring, NO hand-written [patch.crates-io]. tokio's net
+# pulls mio + socket2 + tokio itself, all three of which need small dotnet source
+# overlays (mio = target_os arms, socket2 = a crate-internal IovLen alias, tokio =
+# a cfg_net_unix gate + a memchr fallback arm; see dotnet_overlays/README.md) that
+# no cfg flip can supply. The overlays live ONCE in the CENTRAL registry under
+# /work/dotnet_overlays/{mio,socket2,tokio}. The build framework (feasibility/
+# dev.sh pal-build `apply_overlays`, the future `cargo dotnet`) auto-applies them
+# via a generated `.cargo/config.toml` `paths = [...]` override — `paths` is graph-
+# wide by crate NAME, so it covers the TRANSITIVE mio (pulled by tokio) too. This
+# manifest stays clean upstream (the user adds nothing). Cargo.lock pins mio 1.2.1
+# / socket2 0.6.4 / tokio 1.52.3, matching the overlays.

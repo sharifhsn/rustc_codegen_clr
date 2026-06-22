@@ -1,0 +1,35 @@
+# dotnet_overlays registry — the single source of crate overlays for the .NET target.
+#
+# Each [[overlay]] declares a crate that needs a small, marked source overlay to
+# compile/run on the x86_64-unknown-dotnet target, plus the EXACT upstream version
+# the overlay was prepared against. The auto-apply step (feasibility/dev.sh
+# `apply_overlays`, the future `cargo dotnet`) reads this file, finds which of a
+# project's *locked* deps have an overlay here, and redirects them via a generated
+# `.cargo/config.toml` `paths = [...]` override — the user edits NOTHING in their
+# own Cargo.toml.
+#
+# version = the version pinned in the consuming project's Cargo.lock. A `paths`
+# override only takes effect when the local crate's version SATISFIES the locked
+# requirement; on a name match with a version MISMATCH cargo warns and ignores the
+# override (it does not error and does not silently substitute the wrong version).
+# The auto-apply step ALSO warns loudly on such a mismatch, because a silently-
+# unused overlay is the "patch not applied -> miscompile" footgun. Bump `version`
+# here whenever you refresh an overlay against a newer upstream (see README.md).
+#
+# dir = the overlay's directory under dotnet_overlays/ (a full crate dir: byte-
+# identical upstream + a handful of `// DOTNET PAL`-marked lines; see README.md).
+
+[[overlay]]
+name = "mio"
+version = "1.2.1"
+dir = "mio"
+
+[[overlay]]
+name = "socket2"
+version = "0.6.4"
+dir = "socket2"
+
+[[overlay]]
+name = "tokio"
+version = "1.52.3"
+dir = "tokio"
