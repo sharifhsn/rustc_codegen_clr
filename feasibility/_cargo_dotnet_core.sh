@@ -632,6 +632,15 @@ fi
 [ -f Cargo.toml ] || { echo "!! no Cargo.toml in $(pwd) — not a crate dir"; exit 2; }
 PROFILE=release; CARGOFLAGS=(--release)
 if [ "${CD_REL:-1}" = 0 ]; then PROFILE=debug; CARGOFLAGS=(); fi
+# CD_EXTRA_CARGO_FLAGS: standard cargo flags forwarded by the Rust front-end
+# (tools/cargo-dotnet) to this inner build — --features/-p/--manifest-path/--locked/
+# --offline/--target-dir/… (the P2/D4 passthrough). Space-separated; appended to
+# CARGOFLAGS so they reach EVERY inner `cargo build` (incl. the JSON pass). Empty/
+# unset by default, so the bash front-end + dev.sh path are byte-for-byte unchanged.
+if [ -n "${CD_EXTRA_CARGO_FLAGS:-}" ]; then
+  # shellcheck disable=SC2206  # word-splitting is intended (the front-end pre-quotes).
+  CARGOFLAGS+=($CD_EXTRA_CARGO_FLAGS)
+fi
 echo "==> cargo dotnet: building $(pwd) (profile=$PROFILE)"
 if [ "${CD_CLEAN:-0}" = 1 ]; then echo "==> cargo clean (full, bulletproof)"; cargo clean; fi
 # `--cfg getrandom_backend="custom"` selects getrandom 0.3/0.4's custom backend

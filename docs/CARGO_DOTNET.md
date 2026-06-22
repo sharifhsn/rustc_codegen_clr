@@ -14,29 +14,41 @@ the codegen backend internals — those live in [docs/ARCHITECTURE.md](ARCHITECT
 
 ## 1. What it is
 
-`feasibility/cargo-dotnet` is a [cargo custom subcommand](https://doc.rust-lang.org/cargo/reference/external-tools.html#custom-subcommands):
-once it is on `PATH`, `cargo dotnet …` works. It is a **thin host front-end** that resolves your crate,
-preflights, and dispatches to the shared pipeline core (`feasibility/_cargo_dotnet_core.sh`) which does
-the actual work: inject the dotnet PAL into `rust-src`, set the backend RUSTFLAGS, run `build-std`,
-apply the [`dotnet_overlays`](../dotnet_overlays/README.md) registry, patch the libc registry, and
-build/run.
+`cargo-dotnet` is a [cargo custom subcommand](https://doc.rust-lang.org/cargo/reference/external-tools.html#custom-subcommands):
+once it is on `PATH`, `cargo dotnet …` works. It is a **`cargo install`-able clap Rust binary**
+([`tools/cargo-dotnet/`](../tools/cargo-dotnet)) that owns the CLI, the cargo-subcommand convention, and
+the standard-flag passthrough; it shells out to the shared pipeline core
+(`feasibility/_cargo_dotnet_core.sh` in a checkout, `$CARGO_DOTNET_HOME/core.sh` once installed) for the
+inner pipeline: inject the dotnet PAL into `rust-src`, set the backend RUSTFLAGS, run `build-std`, apply
+the [`dotnet_overlays`](../dotnet_overlays/README.md) registry, patch the libc registry, and build/run.
+
+> **The Rust binary replaces the old bash front-end for users.** The previous front-end was a bash
+> script copied to `~/.cargo/bin`. It is now a real clap binary installed via
+> `cargo install --path tools/cargo-dotnet` (see [§2c](#2c-install-once-use-anywhere)). The bash script
+> (`feasibility/cargo-dotnet`) remains the in-repo **Docker dev driver** the Rust binary delegates to.
 
 ```bash
-cargo dotnet build [PATH] [--release|--debug] [--clean] [-v]
-cargo dotnet run   [PATH] [--release|--debug] [--clean] [-v] [-- ARGS...]
+cargo dotnet build [PATH] [--release|--debug] [--clean] [-v] [CARGO FLAGS…]
+cargo dotnet run   [PATH] [--release|--debug] [--clean] [-v] [CARGO FLAGS…] [-- ARGS…]
 cargo dotnet pack  [PATH] [--release|--debug] [--id NAME] [--version VER] [--out DIR]
-cargo dotnet help
+cargo dotnet --version
+cargo dotnet --help
 ```
 
 | arg / flag | meaning |
 |---|---|
 | `PATH` | the crate dir to build (default `.`). **Arbitrary** — under `cargo_tests/` *or* any fully external path (e.g. `/tmp/myproj`). |
-| `--release` | release profile — **the default** (project convention). |
+| `--release` | release profile — **the default** (project convention; release unless `--debug`). |
 | `--debug` | debug profile (opt out of release). |
 | `--clean` | `cargo clean` first; rebuilds std. Bulletproof but slow — reach for it if a stale-cache result looks wrong. |
 | `-v` / `--verbose` | unfiltered build log. |
+| **CARGO FLAGS** | **standard cargo flags forwarded to the inner build-std** — `--features`/`--all-features`/`--no-default-features`, `--manifest-path`, `-p`/`--package`, `--workspace`/`--exclude`, and any other flag (`--locked`/`--offline`/`--frozen`/`--target-dir`/`--message-format`/…) passed verbatim. (Unblocks getrandom 0.2's `custom` feature, too.) |
 | `-- ARGS` | (`run` only) args forwarded to the .NET program; **its exit code propagates** back out (see [§6 honest limits](#6-what-works--honest-limits)). |
 | `--id` / `--version` / `--out` | (`pack` only) override the NuGet package id / version / output dir (see [§5 consuming from C#](#5-consuming-a-rust-library-from-c)). |
+| `--version` | print the front-end version. `--help` prints usage. |
+
+Standard cargo flags come **before** any `-- ARGS`. Example:
+`cargo dotnet run ./mycrate --features net,fast -p mycrate --locked -- --port 8080`.
 
 The `pack` subcommand builds the crate (a `cdylib`) and emits a NuGet `.nupkg` of its .NET assembly to
 `<crate>/target/nupkg/<id>.<ver>.nupkg`, so a C# project can `<PackageReference>` it from a local feed.
@@ -60,14 +72,18 @@ depend on your host (macOS/arm64 is doubly off-path: wrong OS *and* wrong arch).
 feasibility/run.sh build
 ```
 
-Then put `cargo dotnet` on `PATH` (or invoke it directly):
+Then put `cargo dotnet` on `PATH`. The supported route is the **Rust binary** (see
+[§2c](#2c-install-once-use-anywhere)):
 
 ```bash
-export PATH="$PWD/feasibility:$PATH"          # then: cargo dotnet run …
-# or symlink it where cargo looks for subcommands:
-ln -s "$PWD/feasibility/cargo-dotnet" ~/.cargo/bin/cargo-dotnet
-# or skip the cargo shim entirely:
-feasibility/cargo-dotnet run cargo_tests/cd_pure
+cargo install --path tools/cargo-dotnet        # -> ~/.cargo/bin/cargo-dotnet => `cargo dotnet …`
+```
+
+For the **in-repo Docker dev flow** you can still invoke the bash front-end directly (it carries the
+Docker mount model the Rust binary delegates to):
+
+```bash
+feasibility/cargo-dotnet run cargo_tests/cd_pure   # Docker dev driver (CARGO_DOTNET_BACKEND=docker)
 ```
 
 You need a running Docker daemon. That is the **only** host dependency — the image carries `dotnet`
@@ -216,16 +232,27 @@ installed `cargo-dotnet` on your PATH.
 # 1. Clone the repo (the ONLY time you need it).
 git clone https://github.com/FractalFir/rustc_codegen_clr && cd rustc_codegen_clr
 
-# 2. Provision everything (idempotent — safe to re-run).
-feasibility/cargo-dotnet setup        # builds the backend, populates the install home,
-                                      # installs `cargo-dotnet` to ~/.cargo/bin, warms rust-src
+# 2a. Install the Rust front-end (the cargo-install-able clap binary).
+cargo install --path tools/cargo-dotnet   # -> ~/.cargo/bin/cargo-dotnet => `cargo dotnet`
+
+# 2b. Provision the toolchain + backend + install home (idempotent — safe to re-run).
+cargo dotnet setup                    # builds the backend, populates CARGO_DOTNET_HOME,
+                                      # (re)installs the Rust front-end, warms rust-src
+# (`cargo dotnet setup` ALSO runs `cargo install --path tools/cargo-dotnet`, so 2a is
+#  optional from a checkout — but it bootstraps the binary you then call in 2b.)
 
 # 3. From now on, in ANY crate directory (the repo can be deleted):
 cd ~/my-rust-crate
-cargo dotnet run                      # build + run on .NET
+cargo dotnet run                      # build + run on .NET (works through real cargo dispatch)
 cargo dotnet build                    # build only
 cargo dotnet run /path/to/other-crate # or point it at a path
+cargo dotnet run --features foo -p mycrate --locked -- --port 8080   # standard cargo flags + program args
 ```
+
+> **`cargo dotnet <cmd>` works through genuine cargo dispatch.** The Rust binary handles the
+> cargo-subcommand argument convention (cargo prepends the `dotnet` token) idiomatically, so both
+> `cargo dotnet build …` and a direct `cargo-dotnet build …` (used by `dev.sh` + the MSBuild
+> integration) work. The previous bash front-end only worked via the direct form.
 
 ### What `setup` provisions
 
@@ -243,8 +270,10 @@ satisfied (or re-done with `--force`):
 4. **Backend + install home** — builds the backend dylib + `linker` (`cargo +<toolchain> build --release`)
    from the checkout and copies them, the `dotnet_pal/` + `dotnet_overlays/` trees, the target spec, and a
    copy of the pipeline core into `CARGO_DOTNET_HOME`.
-5. **Front-end** — copies the `cargo-dotnet` script (a real copy, not a symlink — it survives the repo
-   being moved/deleted) to `~/.cargo/bin/cargo-dotnet`, so `cargo dotnet …` works as a cargo subcommand.
+5. **Front-end** — `cargo install --path tools/cargo-dotnet` installs the **Rust** `cargo-dotnet` binary
+   to `~/.cargo/bin/cargo-dotnet`, so `cargo dotnet …` works as a cargo subcommand. (It falls back to
+   copying the bash script only if the crate or a host cargo is unavailable.) The binary is self-contained
+   and survives the repo being moved/deleted; it self-locates `CARGO_DOTNET_HOME` for everything else.
 6. **rust-src PAL injection** — runs the per-toolchain `rust-src` PAL injection once, sourced from the
    install home, to fail-fast (verifies `rust-src` is writable and every arm applies).
 
@@ -294,7 +323,8 @@ tools see it too.)
 
 - **`getrandom`** — the command passes `--cfg getrandom_backend="custom"`, but a crate that actually
   pulls `getrandom` still needs the custom-backend shim symbol (a documented follow-up). Pure
-  compute/`println!` crates and most deps just work.
+  compute/`println!` crates and most deps just work. (For getrandom 0.2, the new standard-flag
+  passthrough lets you enable its `custom` feature directly, e.g. `cargo dotnet run --features getrandom/custom`.)
 - **rust-src is a shared, per-toolchain mutation.** The PAL injection patches the *toolchain's*
   `rust-src` in place. Every arm is `#[cfg(target_os = "dotnet")]`-gated, so it is inert for any
   non-dotnet build under that nightly — but it **is** a global side effect (the install is not fully

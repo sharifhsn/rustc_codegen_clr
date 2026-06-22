@@ -322,11 +322,27 @@ cd_setup(){
   echo "==> [4/6] wrote $HOME_DIR/VERSION"
 
   # ---- STEP 4: install the front-end to ~/.cargo/bin -------------------------
+  # PREFER the real clap Rust binary (tools/cargo-dotnet) via `cargo install` — it is
+  # the idiomatic, cargo-install-able front-end that supersedes this bash for users
+  # (standard-flag passthrough, --version, the `cargo dotnet <cmd>` convention). Fall
+  # back to copying this script only if the crate or cargo-install is unavailable, so
+  # setup still produces a working front-end on a host without the Rust crate.
   local cargobin="${CARGO_HOME:-$HOME/.cargo}/bin"
   mkdir -p "$cargobin"
-  cp -f "$HOME_DIR/cargo-dotnet" "$cargobin/cargo-dotnet"
-  chmod +x "$cargobin/cargo-dotnet"
-  echo "==> [5/6] installed cargo-dotnet -> $cargobin/cargo-dotnet"
+  local rust_fe="$FROM_REPO/tools/cargo-dotnet"
+  if [ -f "$rust_fe/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+    echo "==> [5/6] installing the Rust cargo-dotnet binary (cargo install --path tools/cargo-dotnet)"
+    if cargo install --path "$rust_fe" --force; then
+      echo "==> [5/6] installed cargo-dotnet (Rust) -> $cargobin/cargo-dotnet"
+    else
+      echo "!! [5/6] cargo install failed; falling back to the bash front-end copy"
+      cp -f "$HOME_DIR/cargo-dotnet" "$cargobin/cargo-dotnet"; chmod +x "$cargobin/cargo-dotnet"
+      echo "==> [5/6] installed cargo-dotnet (bash fallback) -> $cargobin/cargo-dotnet"
+    fi
+  else
+    cp -f "$HOME_DIR/cargo-dotnet" "$cargobin/cargo-dotnet"; chmod +x "$cargobin/cargo-dotnet"
+    echo "==> [5/6] installed cargo-dotnet (bash; tools/cargo-dotnet absent) -> $cargobin/cargo-dotnet"
+  fi
   case ":$PATH:" in *":$cargobin:"*) : ;; *) echo "!! NOTE: $cargobin is not on your PATH — add it (see summary below)";; esac
 
   # ---- STEP 5: warm the per-toolchain rust-src PAL injection -----------------

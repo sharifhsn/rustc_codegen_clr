@@ -1,0 +1,31 @@
+[package]
+name = "cargo-dotnet"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/FractalFir/rustc_codegen_clr"
+rust-version = "1.74"
+description = "Compile and run arbitrary Rust crates on .NET (a cargo subcommand for rustc_codegen_clr)."
+
+# MANDATORY empty [workspace] table: this makes tools/cargo-dotnet its OWN workspace
+# root so cargo stops scanning ancestors and never treats it as a member of the
+# rustc_private root workspace. It therefore builds with the HOST stable/nightly
+# cargo, NOT the pinned nightly + rustc_private the backend needs.
+[workspace]
+
+[[bin]]
+name = "cargo-dotnet"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+clap-cargo = { version = "0.15", features = ["clap"] }
+cargo_metadata = "0.18"
+anyhow = "1"
+serde_json = "1"
+toml = "0.8"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
