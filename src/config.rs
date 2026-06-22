@@ -92,3 +92,5 @@ config_flag! {TYPECHECK_CIL,false,"Checks the geneareted CIL for type safety."}
 config_flag! {TRACE_CIL_OPS,false,"Tells the print each CIL op before it is executed."}
 
 config_flag! {DRY_RUN,false,"Tells the codegen test suite to not execute or link any test code, enabling testing on platforms without the .NET runtime present."}
+
+config_flag! {DOTNET9,false,"Target .NET 9+: lower sub-word (u8/i8/u16/i16) atomic compare-exchange and swap to the native `Interlocked.CompareExchange`/`Exchange(ref T, ...)` overloads (added in .NET 9) instead of the masked 32-bit-word emulation. The native overloads take the sub-word byref directly, eliminating the emulation's page-boundary hazard (down-aligning a sub-word address into a word it may not own). Requires the .NET 9 runtime; the default (false) keeps the .NET 8-compatible emulation."}

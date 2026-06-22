@@ -109,10 +109,16 @@ are unmanaged); only C#-instantiating-a-Rust-generic-with-a-new-T is blocked, an
   store). Residual: a sub-word-atomic page-boundary hazard (`emulate_subword_cmp_xchng` aligns the
   byte address down to its 32-bit word, which can touch up-to-3 unowned bytes when the atomic is at
   the start of an allocation/static-storage region → AccessViolation; only bites the *default* panic
-  hook's `get_backtrace_style` static `Atomic<u8>`). The safe fix (lay sub-word atomic statics
-  4-byte-aligned/wide) is **deferred**: it changes static-field layout and the root cause has an
-  unresolved managed-vs-unmanaged-pointer question — high risk for a narrow edge case (custom panic
-  hooks already work, `pal_panic2`).
+  hook's `get_backtrace_style` static `Atomic<u8>`). **Properly fixed by the `DOTNET9` config flag:**
+  on .NET 9 (which added native `Interlocked.CompareExchange`/`Exchange(ref byte/sbyte/short/ushort, …)`)
+  the sub-word `cxchg`/`xchg` arms fall through to those native byref overloads instead of the masked
+  emulation — *zero* pointer arithmetic on the managed byref, so the hazard is eliminated by
+  construction (`src/terminator/intrinsics/atomic.rs`, guarded on `crate::config::DOTNET9`). The .NET 9
+  overloads were verified to exist + behave correctly; the flag defaults off (keeps the .NET 8-compatible
+  emulation, gate stays byte-identical). Residual: the *end-to-end run* on the .NET 9 runtime is gated on
+  cargo-dotnet learning to target .NET 9 (drive the .NET 9 ilasm + emit a `net9.0` runtimeconfig) — a
+  separate plumbing task. The earlier "lay statics 4-byte-aligned" workaround is moot (the native
+  overload supersedes it).
 - **`float → int` `as` — FIXED (WF-1).** Finite saturation was already correct; the one real bug was
   `NaN → MAX` (overflow branch used `bge.un`, which NaN satisfies). Now guarded `NaN → 0` in
   `cilly/src/ir/builtins/casts.rs`. See §10.
