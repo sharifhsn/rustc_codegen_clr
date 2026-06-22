@@ -14,11 +14,51 @@ use rustc_codegen_clr_call::CallInfo;
 pub use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_ctx::function_name;
 use rustc_codegen_clr_type::{GetTypeExt, align_of, r#type::fixed_array};
+use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::interpret::{AllocId, Allocation, GlobalAlloc},
-    ty::{Instance, List, TypingEnv},
+    ty::{Instance, List, TyCtxt, TypingEnv},
 };
 use rustc_span::def_id::DefId;
+
+/// A `static X: &[T] = &[..]` (and similar `&[..]`-valued statics) lifts its array
+/// literal into an *anonymous nested static*: `DefKind::Static { nested: true, .. }`.
+/// Such a static is **untyped** — its HIR owner node is `Node::Synthetic`, so
+/// `tcx.type_of(def_id)` has no valid arm and ICEs with
+/// `unexpected sort of node in type_of(): Synthetic`. We must therefore obtain its
+/// storage size/align from the allocation itself, never from `type_of`. This mirrors
+/// rustc's own `GlobalAlloc::size_and_align`, which branches on exactly this flag.
+fn static_is_nested(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    matches!(tcx.def_kind(def_id), DefKind::Static { nested: true, .. })
+}
+
+/// Build the .NET storage `Type` for a static's backing field directly from its
+/// evaluated allocation's real `len` + `align`, with no `type_of` query. Used for
+/// nested/anonymous statics (whose `type_of` would ICE) and as the type-of-free
+/// fallback. The shape mirrors the `add_allocation` Memory-arm blob: a fixed-size
+/// array of the largest integer the alignment guarantees, sized to cover the bytes.
+fn nested_static_blob_type(alloc: &Allocation, ctx: &mut MethodCompileCtx<'_, '_>) -> Type {
+    let align = alloc.align.bytes().max(1);
+    let elem = match align {
+        ..1 => Int::U8,
+        ..2 => Int::U16,
+        ..4 => Int::U32,
+        _ => Int::U64,
+    };
+    let elem_size = elem.size().unwrap_or(8) as u64;
+    let len = alloc.len() as u64;
+    if len == 0 {
+        return Type::Void;
+    }
+    let blob_arr = fixed_array(
+        ctx,
+        Type::Int(elem),
+        len.div_ceil(elem_size),
+        len.next_multiple_of(elem_size),
+        elem_size,
+    );
+    Type::ClassRef(blob_arr)
+}
 
 pub fn add_static(def_id: DefId, ctx: &mut MethodCompileCtx<'_, '_>) -> Interned<CILNode> {
     let main_module_id = ctx.main_module();
@@ -27,9 +67,26 @@ pub fn add_static(def_id: DefId, ctx: &mut MethodCompileCtx<'_, '_>) -> Interned
     let thread_local = attrs
         .flags
         .contains(rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::THREAD_LOCAL);
-    let ty = static_ty(def_id, ctx.tcx());
-    let tpe = ctx.type_from_cache(ty);
-    assert!(ty.is_sized(ctx.tcx(), TypingEnv::fully_monomorphized()));
+    // An anonymous nested static (`static X: &[T] = &[..]` lifts its `&[..]` into one)
+    // is untyped: `tcx.type_of` has no arm for its `Node::Synthetic` owner and ICEs.
+    // For that case derive the backing-field type from the evaluated allocation's real
+    // len+align (the type_of-free path rustc itself uses in `GlobalAlloc::size_and_align`),
+    // never from `static_ty`. Top-level named statics keep the exact existing behaviour.
+    let nested = static_is_nested(ctx.tcx(), def_id);
+    // `eval_static_initializer` is valid for nested statics too (it asserts only
+    // `is_static`, and we need the alloc for the type below as well as for Phase 2).
+    let alloc = ctx.tcx().eval_static_initializer(def_id).unwrap();
+    let tpe = if nested {
+        nested_static_blob_type(&alloc.0, ctx)
+    } else {
+        let ty = static_ty(def_id, ctx.tcx());
+        assert!(ty.is_sized(ctx.tcx(), TypingEnv::fully_monomorphized()));
+        let tpe = ctx.type_from_cache(ty);
+        // Cross-check the alloc's align against the type's (named statics only; a nested
+        // static has no type to compare and is the whole reason this branch is split).
+        assert_eq!(alloc.0.align.bytes().max(1), align_of(ty, ctx.tcx()));
+        tpe
+    };
     let symbol: String = ctx
         .tcx()
         .symbol_name(Instance::new_raw(def_id, List::empty()))
@@ -71,10 +128,8 @@ pub fn add_static(def_id: DefId, ctx: &mut MethodCompileCtx<'_, '_>) -> Interned
 
     // PHASE 2 — build and register the initializer exactly once. Recursion back
     // into `add_static(def_id)` from here now hits the `already_present`
-    // short-circuit above.
-    let alloc = ctx.tcx().eval_static_initializer(def_id).unwrap();
-    let align = alloc.0.align.bytes().max(1);
-    assert_eq!(align, align_of(ty, ctx.tcx()));
+    // short-circuit above. The allocation was evaluated above (it determines the
+    // field type for nested statics and is cross-checked for named ones).
     let initialzer = allocation_initializer_method(&alloc.0, &symbol, ctx, ptr, true);
     let root = ctx.alloc_root(cilly::CILRoot::call(*initialzer, []));
 
@@ -92,7 +147,17 @@ fn alloc_default_type(alloc_id: u64, ctx: &mut MethodCompileCtx<'_, '_>) -> Type
         .global_alloc(AllocId(alloc_id.try_into().expect("0 alloc id?")))
     {
         GlobalAlloc::Memory(alloc) => alloc,
-        GlobalAlloc::Static(def_id) => return ctx.type_from_cache(static_ty(def_id, ctx.tcx())),
+        GlobalAlloc::Static(def_id) => {
+            // A nested/anonymous static (`static X: &[T] = &[..]`) is untyped — its
+            // `type_of` ICEs (`Node::Synthetic`). Derive the type from the allocation
+            // instead, the way `add_static` and the Memory arm already do; only
+            // top-level named statics have a `type_of` to use.
+            if static_is_nested(ctx.tcx(), def_id) {
+                let alloc = ctx.tcx().eval_static_initializer(def_id).unwrap();
+                return nested_static_blob_type(&alloc.0, ctx);
+            }
+            return ctx.type_from_cache(static_ty(def_id, ctx.tcx()));
+        }
         // A VTable alloc has no readable backing memory (`Size::ZERO`); its slots
         // (drop-glue ptr, size, align, method ptrs) are materialized by codegen, not
         // copied from raw bytes. The matching `add_allocation` arm emits a single

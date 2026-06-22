@@ -3,6 +3,7 @@
 extern crate rustc_abi;
 extern crate rustc_const_eval;
 extern crate rustc_driver;
+extern crate rustc_hir;
 extern crate rustc_middle;
 extern crate rustc_span;
 pub mod constant;
