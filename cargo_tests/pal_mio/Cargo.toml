@@ -6,10 +6,18 @@ edition = "2021"
 mio = { version = "1", features = ["net", "os-poll"] }
 [workspace]
 
-# DOTNET PAL ARM: use the vendored mio (1.2.1) that carries a `sys/dotnet` arm.
-# mio's upstream sys/ is unix/windows/wasi-only; the vendored copy adds an
-# os=dotnet readiness Selector over System.Net.Sockets (Socket.Poll). The patch
-# must resolve at the same MAJOR as `mio = "1"` (the committed Cargo.lock pins
-# 1.2.1) or it silently no-ops and the missing-dotnet-arm errors reappear.
+# DOTNET PAL ARM (Cap-2.5): NEAR-UNMODIFIED upstream mio 1.2.1. The vendored copy
+# is byte-identical to published mio 1.2.1 EXCEPT (a) one Cargo.toml line — libc
+# un-gated to an unconditional [dependencies] so cargo compiles it into mio
+# without a global target-family flip — and (b) one src hunk in sys/unix/mod.rs:
+# a `target_os = "dotnet"` waker arm routing to mio's own File-free
+# single_threaded.rs (the linux eventfd waker needs an fd-backed std fs::File,
+# deferred). NO sys/dotnet fork. mio drives its UPSTREAM #[cfg(unix)] epoll arm
+# straight onto the cilly POSIX shim; the crate-scoped RUSTC_WRAPPER
+# (feasibility/rcc-rustc-wrapper.sh, wired in dev.sh) adds --cfg unix/linux/gnu
+# to the mio+libc crates ONLY so they pick their epoll/eventfd paths and libc's
+# real linux/gnu epoll+sockaddr decls. std stays pristine os=dotnet; the spec has
+# no target-family. The patch must resolve at the same MAJOR as `mio = "1"` (the
+# committed Cargo.lock pins 1.2.1) or it silently no-ops.
 [patch.crates-io]
 mio = { path = "vendor/mio" }

@@ -56,6 +56,19 @@ cfg_os_poll! {
     mod selector;
     pub(crate) use self::selector::*;
 
+    // DOTNET PAL ARM (Cap-2.5): mio's waker cascade selects `waker/eventfd.rs`
+    // for linux, which needs `std::fs::File: FromRawFd` — but the dotnet std
+    // `fs::File` is GCHandle/FileStream-backed, not fd-backed (deferred). The
+    // epoll selector re-exports `Waker` RAW (needs `new(selector,token)`+`wake()`,
+    // which the File-free single_threaded.rs lacks). So route to a minimal dotnet
+    // waker (waker/dotnet.rs) with exactly that surface; pal_mio builds no Waker,
+    // so it is never exercised. Gated `target_os = "dotnet"`; the upstream cascade
+    // below is gated `not(... "dotnet")` so exactly one `mod waker;` is in scope
+    // when the wrapper makes both dotnet AND linux true.
+    #[cfg(target_os = "dotnet")]
+    #[path = "waker/dotnet.rs"]
+    mod waker;
+    #[cfg(not(target_os = "dotnet"))]
     #[cfg_attr(all(
         not(mio_unsupported_force_waker_pipe),
         any(
@@ -122,7 +135,9 @@ cfg_os_poll! {
 
         pub(crate) mod tcp;
         pub(crate) mod udp;
-        #[cfg(not(any(target_os = "hermit", target_os = "wasi")))]
+        // DOTNET PAL ARM (Cap-2.5): uds needs std::os::unix::net (no dotnet PAL);
+        // see net/mod.rs. Gate off for os=dotnet.
+        #[cfg(not(any(target_os = "hermit", target_os = "wasi", target_os = "dotnet")))]
         pub(crate) mod uds;
     }
 

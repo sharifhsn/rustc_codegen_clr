@@ -13,9 +13,7 @@ use std::os::windows::io::{
 };
 
 use crate::io_source::IoSource;
-// DOTNET PAL ARM: dotnet connects through std::net (no raw-fd path), so it does
-// not use the raw-socket helpers below.
-#[cfg(all(not(all(target_os = "wasi", target_env = "p1")), not(target_os = "dotnet")))]
+#[cfg(not(all(target_os = "wasi", target_env = "p1")))]
 use crate::sys::tcp::{connect, new_for_addr};
 use crate::{event, Interest, Registry, Token};
 
@@ -89,19 +87,7 @@ impl TcpStream {
     /// entries in the routing cache.
     ///
     /// [write interest]: Interest::WRITABLE
-    // DOTNET PAL ARM: no raw-fd path. `std::net::TcpStream::connect` completes the
-    // connection synchronously (the dotnet std arm has no non-blocking connect);
-    // we then set the socket non-blocking. A freshly-connected socket is
-    // immediately write-ready, so a WRITABLE registration fires on the next poll —
-    // which is exactly mio's contract for a connected stream.
-    #[cfg(target_os = "dotnet")]
-    pub fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
-        let std_stream = net::TcpStream::connect(addr)?;
-        std_stream.set_nonblocking(true)?;
-        Ok(TcpStream::from_std(std_stream))
-    }
-
-    #[cfg(all(not(all(target_os = "wasi", target_env = "p1")), not(target_os = "dotnet")))]
+    #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
     pub fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
         let socket = new_for_addr(addr)?;
         #[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
@@ -478,15 +464,9 @@ impl From<OwnedSocket> for TcpStream {
 
 impl From<TcpStream> for net::TcpStream {
     fn from(stream: TcpStream) -> Self {
-        // DOTNET PAL ARM: unwrap the IoSource (no from_raw_* on the dotnet std type).
-        #[cfg(target_os = "dotnet")]
-        {
-            stream.inner.into_inner()
-        }
         // Safety: This is safe since we are extracting the raw fd from a well-constructed
         // mio::net::TcpStream which ensures that we actually pass in a valid file
         // descriptor/socket
-        #[cfg(not(target_os = "dotnet"))]
         unsafe {
             #[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
             {

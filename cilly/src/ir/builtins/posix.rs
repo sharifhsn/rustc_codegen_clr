@@ -868,7 +868,7 @@ fn define_connect_errno_from_exception(asm: &mut Assembly) {
 // The body uses ONLY block 0, so the handler's fixed block ids (1, 2) don't
 // collide. Modeled on insert_catch_unwind (mod.rs:613).
 // ===========================================================================
-fn errno_wrapped(
+pub(super) fn errno_wrapped(
     asm: &mut Assembly,
     body: Vec<Interned<CILRoot>>,
     ret_ty: Type,

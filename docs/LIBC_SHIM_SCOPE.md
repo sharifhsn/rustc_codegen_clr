@@ -364,6 +364,78 @@ fd-traits **first** (gate stays green with `families` unset), then flip `familie
 the dotnet arm and let `#[cfg(unix)]` drive it by injecting `--cfg unix` *for the mio crate
 alone* via RUSTFLAGS. Proves the shim symbols satisfy mio before committing to a global family flip.
 
+### 4.4 Cap-2.5: near-unmodified mio via a crate-scoped wrapper — NO global flip (DONE, green)
+
+Cap-2.5 delivers fallback **(2)** as a *working downstream DX* without the global `families` flip.
+Headline: `cargo_tests/pal_mio` runs (`"hi-mio"` + `"== pal_mio done =="`) on **near-unmodified
+upstream mio 1.2.1** through the POSIX shim — the whole D1 `sys/dotnet` fork (7 files) is deleted;
+mio's own `#[cfg(unix)]` `selector/epoll.rs` + `net.rs`/`tcp.rs`/`udp.rs`/`io_source.rs` drive it,
+byte-identical to crates.io. std stays **pristine** os=dotnet; the spec has **no** `target-family`.
+
+**The DX (3 steps a consumer follows):**
+1. `[patch.crates-io] mio = { path = "vendor/mio" }` pointing at the near-unmodified vendored mio.
+2. `export RUSTC_WRAPPER=<repo>/feasibility/rcc-rustc-wrapper.sh` — the crate-scoped wrapper that
+   adds `-A explicit_builtin_cfgs_in_flags --cfg unix --cfg target_os="linux"` to the **`mio` crate
+   only** (keyed on `--crate-name=mio` + `--target` present). Every other crate (std/core/alloc/
+   libc/the user crate) is passed through unchanged.
+3. In the vendored mio `Cargo.toml`, the libc dep is **unconditional** (`[dependencies.libc]`, not
+   `[target.'cfg(any(unix,...))'.dependencies.libc]`). cargo evaluates the target-gated form at
+   dep-resolution against the spec (os=dotnet, no family ⇒ `cfg(unix)=false`) and would never
+   compile libc into mio; the wrapper's `--cfg` runs *after* resolution and can't fix that. Un-gating
+   compiles libc into mio with **no** families flip. (This is the one load-bearing Cargo line.)
+
+**The honest mio patch size** (vs published crates.io mio 1.2.1 — verified with `diff -r`): it is
+**NOT a literal 1-line diff**. It is `1 Cargo.toml line` + `~7 functional source lines` across two
+files (`net/mod.rs` + `sys/unix/mod.rs`) + `1 new ~20-line file` (`sys/unix/waker/dotnet.rs`). All
+three source touches are forced, real walls — documented inline as `// DOTNET PAL ARM (Cap-2.5)`:
+* **waker arm** (`sys/unix/mod.rs`): the epoll selector re-exports `Waker` *raw* and needs
+  `new(selector, token)` + `wake()`; the only File-free stock waker (`single_threaded.rs`) has only
+  `new_unregistered()` (it is the *poll* selector's internal waker), and the stock `eventfd.rs` waker
+  needs `std::fs::File: FromRawFd` which the dotnet `fs::File` (GCHandle/FileStream) is not. So a
+  minimal `waker/dotnet.rs` supplies exactly that surface (pal_mio never builds a Waker, so it is
+  never exercised). A literal-1-line mio needs fd-backed `fs::File` + a real loopback-socket eventfd
+  — deferred.
+* **uds gate** (`net/mod.rs` + `sys/unix/mod.rs`): `--cfg unix` activates mio's unix-DOMAIN-socket
+  module, which needs `std::os::unix::net` (`UnixStream`/`SocketAddr`/`from_abstract_name`) — exactly
+  the leaky AF_UNIX surface the libc-shim avoids and the dotnet std PAL does not provide. Gated
+  `not(target_os="dotnet")`; pal_mio uses only TCP/UDP.
+
+**libc-once-for-both — the reconciliation (CORRECTED from the §4.2 premise).** The §4.2 plan assumed
+the wrapper would give the *single* libc build its real **linux/gnu module** (a "strict superset").
+That premise is **false** and was abandoned: forcing libc's linux module while `target_os="dotnet"`
+is *also* active makes libc 0.2's `new/` module tree inconsistent (the gnu-gated `pub use
+net::route::*` + the `prelude!()` base-type imports `c_int`/... fail — verified `E0433`/`E0432`),
+because `target_os` cannot be *unset* via `--cfg`, only added. The clean resolution: the wrapper
+does **not** re-cfg libc at all. libc stays on its **dotnet arm** for *every* build, and that single
+arm (`dotnet_pal/libc/dotnet.rs`) is the superset declaring the surface for **both** faces —
+`std::os::fd`'s `close`/`fcntl`/`F_DUPFD*` **and** mio's `epoll_*`/`socket`/`bind`/`connect`/
+`accept`/`accept4`/`setsockopt`/`getsockopt` + `epoll_event`/`sockaddr*`/`EPOLL*`/`AF_*`/`SOCK_*`/
+`SO_*` consts. The function **bodies** are resolved at link time by the cilly POSIX shim
+(`posix.rs`/`posix_symbols.rs`/`posix_epoll.rs`) by bare C-ABI symbol name, independent of which libc
+Rust module is in scope. Struct/const layouts mirror Linux x86_64 (the shim hardcodes that numbering:
+`epoll_event` `#[repr(C,packed)]` events:u32@0/data:u64@4 stride 12; `sockaddr_in` family@0/port@2
+net-order/addr@4). So **libc-once-for-both = libc-once, period** — one dotnet arm, no multi-OS
+module conflict, no symbol collision, no std breakage. The `inject_libc` gate is plain
+`target_os="dotnet"`.
+
+**WouldBlock determinism (the other Cap-2.5 fix).** pal_mio was pre-existing ~50% flaky: a
+non-blocking `Socket.Receive` after `Socket.Poll` says ready can still race and throw
+`SocketException(WouldBlock)`, which propagated uncaught out of `rcl_dotnet_net_recv`. Fixed in two
+halves: (A) the backend wraps `rcl_dotnet_net_recv`/`_recv_from` in the POSIX errno catch
+(`errno_wrapped`; WouldBlock→EAGAIN, real errno for other SocketExceptions) so a racing recv returns
+`-1`/`errno`; (B) the std net PAL (`dotnet_pal/sys/net/connection/dotnet.rs` read/recv/recv_from)
+surfaces that as `Err(ErrorKind::WouldBlock)` via `cvt`/`last_os_error` instead of a flat
+`ErrorKind::Other`, so mio re-polls. pal_mio is now deterministic (≥5/5 green).
+
+**Verified:** pal_mio ≥5/5 deterministic; pal_net/pal_libc/pal_fd/pal_soak/pal_tokio/pal_probe2 all
+"done"; `::stable` gate 426/12 (no real regressions); `target-family`/`families` absent from
+`x86_64-unknown-dotnet.json` (no global flip; std unchanged).
+
+**Deferred to a literal-1-line mio / the global-flip end-state (4.2 fallback (3)):** fd-backed
+`std::fs::File` (unblocks the stock eventfd waker → drop `waker/dotnet.rs`) + a real
+loopback-socket eventfd (tokio's reactor constructs a Waker); a `std::os::unix::net` PAL (unblocks
+mio's `uds` → drop the uds gates); the full `families=["unix"]` flip for the broader os::unix DX.
+
 ---
 
 ## 5. Phased implementation plan

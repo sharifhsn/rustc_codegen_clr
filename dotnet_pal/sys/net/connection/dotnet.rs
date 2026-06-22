@@ -67,6 +67,7 @@ use crate::fmt;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
 use crate::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use crate::sys::cvt;
 use crate::sys::fd::FileDesc;
 use crate::sys::unsupported;
 use crate::sys::{AsInner, FromInner, IntoInner};
@@ -380,9 +381,10 @@ impl TcpStream {
         }
         // SAFETY: writable region; the handle is resolved fresh from the fd-table.
         let n = unsafe { rcl_dotnet_net_recv(self.inner.handle(), buf.as_mut_ptr(), buf.len()) };
-        if n < 0 {
-            return Err(io::const_error!(io::ErrorKind::Other, "recv failed"));
-        }
+        // WouldBlock fix: the shim now returns -1/errno on a non-blocking recv
+        // race (errno=EAGAIN → ErrorKind::WouldBlock), so surface the real errno
+        // rather than a flat ErrorKind::Other — mio re-polls on WouldBlock.
+        let n = cvt(n)?;
         Ok(n as usize)
     }
 
@@ -704,8 +706,11 @@ impl UdpSocket {
                 &mut port as *mut u16,
             )
         };
+        // WouldBlock fix: surface the real errno (EAGAIN → WouldBlock) on a
+        // non-blocking recvfrom race; keep the explicit form because the addr
+        // decode below runs only on success.
         if n < 0 {
-            return Err(io::const_error!(io::ErrorKind::Other, "recv_from failed"));
+            return Err(io::Error::last_os_error());
         }
         let from = addr_from_parts(family, &ip, port)?;
         Ok((n as usize, from))
@@ -833,9 +838,9 @@ impl UdpSocket {
         }
         // SAFETY: writable region.
         let n = unsafe { rcl_dotnet_net_recv(self.inner.handle(), buf.as_mut_ptr(), buf.len()) };
-        if n < 0 {
-            return Err(io::const_error!(io::ErrorKind::Other, "recv failed"));
-        }
+        // WouldBlock fix: surface the real errno (EAGAIN → WouldBlock) on a
+        // non-blocking recv race instead of a flat ErrorKind::Other.
+        let n = cvt(n)?;
         Ok(n as usize)
     }
 

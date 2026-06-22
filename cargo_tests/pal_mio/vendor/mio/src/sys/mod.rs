@@ -73,16 +73,6 @@ cfg_os_poll! {
     pub(crate) use self::wasip1::*;
 }
 
-// DOTNET PAL ARM: a readiness Selector over System.Net.Sockets (Socket.Poll via
-// the `rcl_dotnet_socket_poll` backend hook). os=dotnet has no target_family, so
-// none of the unix/windows/wasi blocks above fire — without this the `sys` module
-// is empty and Event/Events/Selector/IoSourceState/Waker are missing.
-#[cfg(target_os = "dotnet")]
-cfg_os_poll! {
-    mod dotnet;
-    pub use self::dotnet::*;
-}
-
 cfg_not_os_poll! {
     mod shell;
     pub(crate) use self::shell::*;

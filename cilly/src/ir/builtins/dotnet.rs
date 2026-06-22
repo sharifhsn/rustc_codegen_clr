@@ -2394,11 +2394,15 @@ fn insert_dotnet_net_recv(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
         );
         let count = asm.alloc_node(CILNode::call(recv, [s, span]));
         let count = asm.int_cast(count, Int::ISize, ExtendKind::SignExtend);
-        let ret = asm.alloc_root(CILRoot::Ret(count));
-        MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
-            locals: vec![],
-        }
+        // WouldBlock fix: a non-blocking Socket.Receive after Socket.Poll says
+        // ready can still race and throw SocketException(WouldBlock/10035). Wrap
+        // the body in the POSIX errno catch (result -> local 0) so that race
+        // returns -1 / errno=EAGAIN cleanly instead of an uncaught managed
+        // exception propagating up through std's recv. `errno_wrapped`'s default
+        // mapper (`rcl_errno_from_exception`) maps WouldBlock(10035)->EAGAIN(11)
+        // and delegates other SocketExceptions to their real errno.
+        let store = asm.alloc_root(CILRoot::StLoc(0, count));
+        super::posix::errno_wrapped(asm, vec![store], Type::Int(Int::ISize), vec![])
     };
     patcher.insert(name, Box::new(generator));
 }
@@ -2456,7 +2460,11 @@ fn insert_dotnet_net_recv_from(asm: &mut Assembly, patcher: &mut MissingMethodPa
         // ep local is typed as the base EndPoint (the `ref EndPoint` param type).
         let ep_base_ty = asm.alloc_type(Type::ClassRef(endpoint_base));
         let seed = asm.alloc_node(CILNode::CheckedCast(seed, ep_base_ty));
-        let store_seed = asm.alloc_root(CILRoot::StLoc(0, seed));
+        // WouldBlock fix: wrap the body in the POSIX errno catch. errno_wrapped
+        // reserves local 0 = result (isize) and appends our extra_locals AFTER
+        // it, so every local index here is shifted up by one:
+        //   result=0, endpoint=1, count=2, ip_endpoint=3, bytes=4.
+        let store_seed = asm.alloc_root(CILRoot::StLoc(1, seed));
 
         // n = s.ReceiveFrom(Span<byte>(buf,len), ref ep).
         let s = handle_to_socket(asm, 0); // arg0 is the socket handle
@@ -2469,23 +2477,25 @@ fn insert_dotnet_net_recv_from(asm: &mut Assembly, patcher: &mut MissingMethodPa
             recv_from_name,
             asm,
         );
-        let ep_addr = asm.alloc_node(CILNode::LdLocA(0));
+        let ep_addr = asm.alloc_node(CILNode::LdLocA(1));
         let n = asm.alloc_node(CILNode::call(recv_from, [s, span, ep_addr]));
-        let store_n = asm.alloc_root(CILRoot::StLoc(1, n));
+        let store_n = asm.alloc_root(CILRoot::StLoc(2, n));
 
-        // ep2 = (IPEndPoint)ep; store in local 2; write addr out (bytes scratch = 3).
-        let ep_obj = asm.alloc_node(CILNode::LdLoc(0));
+        // ep2 = (IPEndPoint)ep; store in local 3; write addr out (bytes scratch = 4).
+        let ep_obj = asm.alloc_node(CILNode::LdLoc(1));
         let ip_ep_ty = asm.alloc_type(Type::ClassRef(ip_endpoint));
         let ep2 = asm.alloc_node(CILNode::CheckedCast(ep_obj, ip_ep_ty));
-        let store_ep2 = asm.alloc_root(CILRoot::StLoc(2, ep2));
+        let store_ep2 = asm.alloc_root(CILRoot::StLoc(3, ep2));
         let mut roots = vec![store_seed, store_n, store_ep2];
-        roots.extend(write_endpoint_out(asm, 2, 3, 3, 4, 5));
+        // out args (family=3, ip=4, port=5) are LdArg indices, unaffected by the
+        // local shift; only the ep_local (3) and bytes_local (4) move up.
+        roots.extend(write_endpoint_out(asm, 3, 4, 3, 4, 5));
 
-        // return (isize)n.
-        let n_load = asm.alloc_node(CILNode::LdLoc(1));
+        // store (isize)n in local 0 (result); errno_wrapped emits the ret.
+        let n_load = asm.alloc_node(CILNode::LdLoc(2));
         let n_isize = asm.int_cast(n_load, Int::ISize, ExtendKind::SignExtend);
-        let ret = asm.alloc_root(CILRoot::Ret(n_isize));
-        roots.push(ret);
+        let store_result = asm.alloc_root(CILRoot::StLoc(0, n_isize));
+        roots.push(store_result);
 
         let ep_ty = asm.alloc_type(Type::ClassRef(ip_endpoint));
         let byte_ty = asm.alloc_type(Type::Int(Int::U8));
@@ -2493,15 +2503,18 @@ fn insert_dotnet_net_recv_from(asm: &mut Assembly, patcher: &mut MissingMethodPa
             elem: byte_ty,
             dims: NonZeroU8::new(1).unwrap(),
         });
-        MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(roots, 0, None)],
-            locals: vec![
-                (Some(asm.alloc_string("endpoint")), ep_base_ty),
-                (Some(asm.alloc_string("count")), asm.alloc_type(Type::Int(Int::I32))),
-                (Some(asm.alloc_string("ip_endpoint")), ep_ty),
-                (Some(asm.alloc_string("bytes")), byte_arr_ty),
-            ],
-        }
+        let i32_ty = asm.alloc_type(Type::Int(Int::I32));
+        let n_endpoint = asm.alloc_string("endpoint");
+        let n_count = asm.alloc_string("count");
+        let n_ip_endpoint = asm.alloc_string("ip_endpoint");
+        let n_bytes = asm.alloc_string("bytes");
+        let extra_locals = vec![
+            (Some(n_endpoint), ep_base_ty),
+            (Some(n_count), i32_ty),
+            (Some(n_ip_endpoint), ep_ty),
+            (Some(n_bytes), byte_arr_ty),
+        ];
+        super::posix::errno_wrapped(asm, roots, Type::Int(Int::ISize), extra_locals)
     };
     patcher.insert(name, Box::new(generator));
 }

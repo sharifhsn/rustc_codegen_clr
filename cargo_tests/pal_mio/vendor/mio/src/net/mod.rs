@@ -33,7 +33,12 @@ mod udp;
 #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
 pub use self::udp::UdpSocket;
 
-#[cfg(unix)]
+// DOTNET PAL ARM (Cap-2.5): the wrapper lights cfg(unix) for mio's TCP/UDP epoll
+// path, but mio's unix-DOMAIN-socket module needs `std::os::unix::net`
+// (UnixStream/SocketAddr/from_abstract_name) which the dotnet std PAL does not
+// provide (AF_UNIX is exactly the leaky unix surface the libc-shim avoids). Gate
+// it off for os=dotnet; pal_mio uses only TCP/UDP.
+#[cfg(all(unix, not(target_os = "dotnet")))]
 mod uds;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "dotnet")))]
 pub use self::uds::{UnixDatagram, UnixListener, UnixStream};

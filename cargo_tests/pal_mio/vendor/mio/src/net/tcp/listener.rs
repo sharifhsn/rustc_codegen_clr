@@ -19,9 +19,7 @@ use crate::net::TcpStream;
     all(target_os = "wasi", not(target_env = "p1"))
 ))]
 use crate::sys::tcp::set_reuseaddr;
-// DOTNET PAL ARM: dotnet builds the listener through std::net (no raw-fd path),
-// so it does not use the raw-socket helpers below.
-#[cfg(all(not(all(target_os = "wasi", target_env = "p1")), not(target_os = "dotnet")))]
+#[cfg(not(all(target_os = "wasi", target_env = "p1")))]
 use crate::sys::tcp::{bind, listen, new_for_addr};
 use crate::{event, sys, Interest, Registry, Token};
 
@@ -65,18 +63,7 @@ impl TcpListener {
     /// 2. Set the `SO_REUSEADDR` option on the socket on Unix.
     /// 3. Bind the socket to the specified address.
     /// 4. Calls `listen` on the socket to prepare it to receive new connections.
-    // DOTNET PAL ARM: the dotnet std::net::TcpListener::bind already creates,
-    // binds, listens (and the dotnet PAL sets SO_REUSEADDR-equivalent behaviour),
-    // and there is no raw-fd path to wrap. So bind through std and set the socket
-    // non-blocking so `accept`'s WouldBlock drives the readiness loop.
-    #[cfg(target_os = "dotnet")]
-    pub fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
-        let std_listener = net::TcpListener::bind(addr)?;
-        std_listener.set_nonblocking(true)?;
-        Ok(TcpListener::from_std(std_listener))
-    }
-
-    #[cfg(all(not(all(target_os = "wasi", target_env = "p1")), not(target_os = "dotnet")))]
+    #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
     pub fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
         let socket = new_for_addr(addr)?;
         #[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
@@ -306,17 +293,9 @@ impl From<OwnedSocket> for TcpListener {
 
 impl From<TcpListener> for net::TcpListener {
     fn from(listener: TcpListener) -> Self {
-        // DOTNET PAL ARM: the mio TcpListener already wraps a std listener; just
-        // unwrap the IoSource (no raw-fd round-trip — the dotnet std type has no
-        // from_raw_* path).
-        #[cfg(target_os = "dotnet")]
-        {
-            listener.inner.into_inner()
-        }
         // Safety: This is safe since we are extracting the raw fd from a well-constructed
         // mio::net::TcpListener which ensures that we actually pass in a valid file
         // descriptor/socket
-        #[cfg(not(target_os = "dotnet"))]
         unsafe {
             #[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
             {

@@ -7,10 +7,6 @@ use std::os::fd::AsRawFd;
 use std::os::hermit::io::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
-// DOTNET PAL ARM: os=dotnet has no `AsRawFd`/`AsRawSocket`; the IoSource keys off
-// the local `DotnetRawHandle` trait (GCHandle widened to u64) instead.
-#[cfg(target_os = "dotnet")]
-use crate::sys::DotnetRawHandle;
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fmt, io};
@@ -180,47 +176,6 @@ where
         #[cfg(debug_assertions)]
         self.selector_id.remove_association(_registry)?;
         self.state.deregister()
-    }
-}
-
-// DOTNET PAL ARM: keyed by `DotnetRawHandle` (the std::net GCHandle as u64), the
-// dotnet analogue of the windows `AsRawSocket` block. The dotnet Selector keeps no
-// per-socket OS state to re-arm, so register/reregister/deregister all just mutate
-// the registry by handle.
-#[cfg(target_os = "dotnet")]
-impl<T> event::Source for IoSource<T>
-where
-    T: DotnetRawHandle,
-{
-    fn register(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
-    ) -> io::Result<()> {
-        #[cfg(debug_assertions)]
-        self.selector_id.associate(registry)?;
-        self.state
-            .register(registry, token, interests, self.inner.dotnet_raw_handle())
-    }
-
-    fn reregister(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
-    ) -> io::Result<()> {
-        #[cfg(debug_assertions)]
-        self.selector_id.check_association(registry)?;
-        self.state
-            .reregister(registry, token, interests, self.inner.dotnet_raw_handle())
-    }
-
-    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
-        #[cfg(debug_assertions)]
-        self.selector_id.remove_association(registry)?;
-        self.state
-            .deregister(registry, self.inner.dotnet_raw_handle())
     }
 }
 

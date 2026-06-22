@@ -367,12 +367,14 @@ if [ -f "$OSMOD" ] && ! grep -q 'target_os = "dotnet"' "$OSMOD"; then
       }
     }' "$OSMOD" > "$OSMOD.__t" && mv "$OSMOD.__t" "$OSMOD"
 fi
-# CAP-2 DEFERRED (families=["unix"] flip): the flip is NOT applied — it triggers a
-# wide std cfg(unix) cascade (sys::{fs,paths,io,process} unix arms + os::unix
-# internal references in os/mod.rs/backtrace) that exceeds the Cap-2 slice budget.
-# See docs/LIBC_SHIM_SCOPE.md §4.2 + the cap2 memory for the precise blocker list.
-# If/when the flip lands, narrow os/mod.rs's `pub mod unix` gate here to exclude
-# os=dotnet (mirror the os/fd/owned.rs trusty-narrow below).
+# CAP-2.5 (wrapper-without-flip): the global families=["unix"] flip is NOT applied
+# and is NOT needed. Instead the crate-scoped RUSTC_WRAPPER (wired below) gives
+# ONLY the mio+libc crates a unix/linux/gnu cfg, so std stays PRISTINE os=dotnet
+# (no families flip => no wide std cfg(unix) cascade on sys::{fs,paths,io,process}
+# /os::unix). The target spec stays target-family-free. See LIBC_SHIM_SCOPE.md §4.4.
+# (The families flip remains the documented end-state for the FULL os::unix DX, but
+# the wrapper delivers near-unmodified mio without dragging in leaky unix std
+# surface (OsStr-bytes/AF_UNIX/MetadataExt) that mio never uses.)
 # os/fd/{owned,raw}.rs File/Pipe fd-impl gating. Enabling os::fd for dotnet pulls in
 # owned.rs's + raw.rs's `impl As/From/IntoRawFd`/`AsFd`/`From<…>` impls for fs::File
 # and io::Pipe{Reader,Writer}, which require the dotnet `sys::fs::File` (System.IO
@@ -549,27 +551,24 @@ inject_libc() { # $1 = libc src dir
   # macro-hygiene quirk of declaring `mod` inside cfg_if's `else` body; the glob
   # re-export then makes `libc::{close, read, c_int, …}` resolve for dotnet.
   #
-  # CAP-2: the crate-scoped RUSTC_WRAPPER (feasibility/rcc-rustc-wrapper.sh)
-  # compiles the libc CRATE with `--cfg target_os="linux" --cfg target_env="gnu"`
-  # ADDED (multi-valued cfg) so mio gets libc's REAL linux/gnu module (epoll_*,
-  # sockaddr_*, EPOLL*/EFD*, …). But `target_os="dotnet"` STAYS true for that
-  # compile, so a bare `#[cfg(target_os="dotnet")]` dotnet module would ALSO
-  # activate and collide with linux's `close`/`read`/… . The base dotnet target
-  # spec has `env=""` (so `target_env` is NOT "gnu"); the wrapper sets it to
-  # "gnu". So gate the minimal dotnet module on `not(target_env="gnu")`: it is the
-  # std-side surface when libc is the plain dotnet build, and it switches OFF the
-  # instant the wrapper turns on the full linux/gnu libc module for mio. Clean,
-  # collision-free, one source of truth per compile.
+  # CAP-2.5: libc is the SINGLE dotnet libc face for BOTH std::os::fd AND mio.
+  # The crate-scoped RUSTC_WRAPPER does NOT re-cfg libc (only mio gets
+  # unix/linux): forcing libc's real linux module while target_os="dotnet" is
+  # also active makes libc 0.2's new/ module tree inconsistent (verified
+  # E0433/E0432). So the dotnet arm stays ON for EVERY libc build, declaring the
+  # full epoll/socket/sockaddr surface mio imports (dotnet_pal/libc/dotnet.rs);
+  # the POSIX shim resolves the bodies by bare C-ABI name. Gate is plain
+  # target_os="dotnet" (the empty-else only fires for unsupported OSes).
   {
     echo ''
-    echo '// DOTNET PAL: minimal libc surface for os=dotnet (see dotnet_pal/libc/dotnet.rs).'
+    echo '// DOTNET PAL: the single libc face for os=dotnet (see dotnet_pal/libc/dotnet.rs).'
     echo '// libc 0.2 has no module for target_os="dotnet" (its top-level cfg_if! falls'
-    echo '// through to an empty else{}); std::os::fd references libc::{close,fcntl,...}.'
-    echo '// Gated `not(target_env="gnu")` so the Cap-2 mio-scoped wrapper (which adds'
-    echo '// target_os="linux"+target_env="gnu" to the libc crate) gets libc-linux instead.'
-    echo '#[cfg(all(target_os = "dotnet", not(target_env = "gnu")))]'
+    echo '// through to an empty else{}); std::os::fd references libc::{close,fcntl,...} and'
+    echo '// (Cap-2.5) near-unmodified mio references libc::{epoll_*,socket,sockaddr_*,...}.'
+    echo '// One dotnet arm serves both; the mio-scoped wrapper re-cfgs ONLY mio, not libc.'
+    echo '#[cfg(target_os = "dotnet")]'
     echo 'mod dotnet;'
-    echo '#[cfg(all(target_os = "dotnet", not(target_env = "gnu")))]'
+    echo '#[cfg(target_os = "dotnet")]'
     echo 'pub use crate::dotnet::*;'
   } >> "$d/lib.rs"
   echo "==> injected dotnet libc module ($d)"
@@ -586,16 +585,23 @@ cd "/work/cargo_tests/$DEV_CRATE" 2>/dev/null || { echo "!! no cargo_tests/$DEV_
 # getrandom_dotnet shim, forwarding to the PAL CSPRNG (rcl_dotnet_random_fill).
 # getrandom 0.2 ignores this cfg and uses its `custom` Cargo feature instead.
 export RUSTFLAGS="-Z codegen-backend=/work/target/release/librustc_codegen_clr.so -C linker=/work/target/release/linker -C link-args=--cargo-support --cfg getrandom_backend=\"custom\""
-# CAP-2 DEFERRED: the crate-scoped RUSTC_WRAPPER (feasibility/rcc-rustc-wrapper.sh)
-# adds target_os="linux"+target_env="gnu"+unix to the mio+libc crates so unmodified
-# upstream mio picks its epoll selector/eventfd waker and libc exposes its linux
-# epoll+sockaddr surface. It is INERT until the families=["unix"] flip lands (the
-# flip is the prerequisite that makes cargo resolve mio's cfg(unix) libc dep). The
-# flip surfaced a wide std cfg(unix) cascade beyond the Cap-2 slice; until that std
-# work is done, the wrapper stays UNWIRED (forcing libc-linux without the flip
-# breaks the dotnet libc shim). To resume: re-export RUSTC_WRAPPER here AND apply
-# the families flip + the std cascade arms together.
-# export RUSTC_WRAPPER=/work/feasibility/rcc-rustc-wrapper.sh
+# CAP-2.5 WIRED: the crate-scoped RUSTC_WRAPPER (feasibility/rcc-rustc-wrapper.sh)
+# adds `--cfg unix --cfg target_os="linux"` to the `mio` crate ONLY (keyed on
+# --crate-name=mio + --target present). std/core/alloc/libc/the user crate pass
+# through UNCHANGED, so they stay pristine os=dotnet — there is NO global
+# target-family flip and the target spec stays family-free. This lets
+# near-unmodified upstream mio pick its #[cfg(unix)] sys arm + selector/epoll.rs;
+# mio drives epoll through libc::epoll_*/socket/... whose BODIES are resolved at
+# link time by the cilly POSIX shim (by bare C-ABI symbol name). libc-once-for-both
+# is reconciled by keeping libc on its dotnet arm for EVERY build (inject_libc gate
+# is plain target_os="dotnet"): that single arm (dotnet_pal/libc/dotnet.rs) is the
+# superset declaring the epoll/socket/sockaddr surface for BOTH std::os::fd and
+# mio. The wrapper deliberately does NOT re-cfg libc — libc's real linux module is
+# inconsistent under a multi-valued target_os (dotnet+linux), so the dotnet arm,
+# not libc-linux, is the single source of truth. The cargo libc-dep wall is fixed
+# by the one unconditional `[dependencies.libc]` line in the vendored mio
+# Cargo.toml (NOT a families flip). See docs/LIBC_SHIM_SCOPE.md §4.4.
+export RUSTC_WRAPPER=/work/feasibility/rcc-rustc-wrapper.sh
 set +e
 # build-std resolves libc from the cargo REGISTRY (not the rust-src vendor tree),
 # which is extracted on first download. `cargo fetch` materialises the registry

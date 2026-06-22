@@ -762,15 +762,9 @@ impl From<OwnedSocket> for UdpSocket {
 
 impl From<UdpSocket> for net::UdpSocket {
     fn from(socket: UdpSocket) -> Self {
-        // DOTNET PAL ARM: unwrap the IoSource (no from_raw_* on the dotnet std type).
-        #[cfg(target_os = "dotnet")]
-        {
-            socket.inner.into_inner()
-        }
         // Safety: This is safe since we are extracting the raw fd from a well-constructed
         // mio::net::UdpSocket which ensures that we actually pass in a valid file
         // descriptor/socket
-        #[cfg(not(target_os = "dotnet"))]
         unsafe {
             #[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
             {
