@@ -26,6 +26,11 @@
 //! * `rcl_dotnet_thread_join(handle)` => `Thread.Join()` on the handle's thread.
 //! * `rcl_dotnet_thread_yield()`       => `System.Threading.Thread.Yield()`.
 //! * `rcl_dotnet_thread_sleep(millis)` => `System.Threading.Thread.Sleep((int)millis)`.
+//! * `rcl_dotnet_tls_create() -> *mut u8`
+//!   => `new ThreadLocal<nint>()`, `GCHandle`-pinned; the returned `IntPtr` is an
+//!      opaque per-thread TLS "key" (its `.Value` is per-thread by construction).
+//! * `rcl_dotnet_tls_get(key) -> *mut u8` => `((ThreadLocal<nint>)key).Value`.
+//! * `rcl_dotnet_tls_set(key, val)`       => `((ThreadLocal<nint>)key).Value = (nint)val`.
 //! * `rcl_dotnet_available_parallelism() -> usize`
 //!   => `System.Environment.ProcessorCount`.
 //! * `rcl_dotnet_args_count() -> usize`
@@ -133,6 +138,7 @@ use super::UNMANAGED_THREAD_START;
 use crate::cilnode::{ExtendKind, MethodKind, PtrCastRes};
 use crate::ir::asm::MissingMethodPatcher;
 use crate::ir::cilroot::BranchCond;
+use crate::ir::tpe::GenericKind;
 use crate::ir::{
     BasicBlock, BinOp, CILNode, CILRoot, ClassRef, Const, Int, Interned, MethodImpl, MethodRef,
     StaticFieldDesc, Type,
@@ -153,6 +159,13 @@ pub fn insert_dotnet_pal(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
     insert_dotnet_thread_join(asm, patcher);
     insert_dotnet_thread_yield(asm, patcher);
     insert_dotnet_thread_sleep(asm, patcher);
+    insert_dotnet_mutex_new(asm, patcher);
+    insert_dotnet_mutex_lock(asm, patcher);
+    insert_dotnet_mutex_unlock(asm, patcher);
+    insert_dotnet_mutex_trylock(asm, patcher);
+    insert_dotnet_tls_create(asm, patcher);
+    insert_dotnet_tls_get(asm, patcher);
+    insert_dotnet_tls_set(asm, patcher);
     insert_dotnet_available_parallelism(asm, patcher);
     insert_dotnet_getpid(asm, patcher);
     insert_dotnet_exit(asm, patcher);
@@ -764,6 +777,273 @@ fn insert_dotnet_thread_sleep(asm: &mut Assembly, patcher: &mut MissingMethodPat
         let ret = asm.alloc_root(CILRoot::VoidRet);
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![sleep, ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_mutex_new() -> *mut u8`
+///   => `new SemaphoreSlim(1, 1)`; return a `GCHandle` `IntPtr` pinning it.
+///
+/// The dotnet PAL `Mutex` is a single-permit counting semaphore: `SemaphoreSlim`
+/// with `initialCount = 1` (available immediately) and `maxCount = 1` (a single
+/// release at a time — non-reentrant, exactly the std `sys::sync::Mutex`
+/// contract). The managed object is pinned in a `GCHandle` and the handle's
+/// `IntPtr` is returned as `*mut u8`, mirroring `rcl_dotnet_thread_spawn`'s
+/// handle round-trip (`ref_to_handle` => `GCHandle.Alloc`). The std side
+/// CAS-installs this handle on first lock and never frees it (one semaphore per
+/// live `Mutex`, freed implicitly at process exit).
+fn insert_dotnet_mutex_new(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_mutex_new");
+    let generator = move |_, asm: &mut Assembly| {
+        // new SemaphoreSlim(1, 1)
+        let sem = ClassRef::semaphore_slim(asm);
+        let ctor = asm
+            .class_ref(sem)
+            .clone()
+            .ctor(&[Type::Int(Int::I32), Type::Int(Int::I32)], asm);
+        let one_a = asm.alloc_node(Const::I32(1));
+        let one_b = asm.alloc_node(Const::I32(1));
+        let sem_obj = asm.alloc_node(CILNode::call(ctor, [one_a, one_b]));
+        let store = asm.alloc_root(CILRoot::StLoc(0, sem_obj));
+
+        // return (void*)GCHandle.Alloc(sem)
+        let void = asm.alloc_type(Type::Void);
+        let handle = CILNode::LdLoc(0).ref_to_handle(asm);
+        let handle = asm.alloc_node(handle);
+        let handle = asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::Ptr(void))));
+        let ret = asm.alloc_root(CILRoot::Ret(handle));
+
+        let sem_ty = asm.alloc_type(Type::ClassRef(sem));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![store, ret], 0, None)],
+            locals: vec![(Some(asm.alloc_string("sem")), sem_ty)],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// Recover the `SemaphoreSlim` from a `GCHandle` `IntPtr` (arg0, `*mut u8`):
+/// `handle_to_obj((nint)h)` then `(SemaphoreSlim)obj`. Mirrors the
+/// `rcl_dotnet_thread_join` recovery dance. Returns the casted node.
+fn recover_semaphore(asm: &mut Assembly) -> Interned<CILNode> {
+    let arg0 = asm.alloc_node(CILNode::LdArg(0));
+    let handle_isize = asm.alloc_node(CILNode::PtrCast(arg0, Box::new(PtrCastRes::ISize)));
+    let handle_to_obj = asm.alloc_string("handle_to_obj");
+    let main_module = asm.main_module();
+    let handle_to_obj = asm.class_ref(*main_module).clone().static_mref(
+        &[Type::Int(Int::ISize)],
+        Type::PlatformObject,
+        handle_to_obj,
+        asm,
+    );
+    let obj = asm.alloc_node(CILNode::call(handle_to_obj, [handle_isize]));
+    let sem = ClassRef::semaphore_slim(asm);
+    let sem_ty = asm.alloc_type(Type::ClassRef(sem));
+    asm.alloc_node(CILNode::CheckedCast(obj, sem_ty))
+}
+
+/// `rcl_dotnet_mutex_lock(h: *mut u8)`
+///   => recover the `SemaphoreSlim` from `h` and `Wait()` (block until acquired).
+///
+/// `SemaphoreSlim.Wait()` (no args) is the blocking acquire — it returns void and
+/// decrements the single permit. Backs `sys::sync::Mutex::lock`.
+fn insert_dotnet_mutex_lock(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_mutex_lock");
+    let generator = move |_, asm: &mut Assembly| {
+        let sem = recover_semaphore(asm);
+        let sem_class = ClassRef::semaphore_slim(asm);
+        let wait = asm.alloc_string("Wait");
+        let wait = asm
+            .class_ref(sem_class)
+            .clone()
+            .instance(&[], Type::Void, wait, asm);
+        let wait = asm.alloc_root(CILRoot::call(wait, [sem]));
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![wait, ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_mutex_unlock(h: *mut u8)`
+///   => recover the `SemaphoreSlim` from `h` and `Release()` (return the permit).
+///
+/// `SemaphoreSlim.Release()` returns the previous count (an `int`); the std
+/// `unlock` contract is void, so the result is popped. Backs
+/// `sys::sync::Mutex::unlock`.
+fn insert_dotnet_mutex_unlock(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_mutex_unlock");
+    let generator = move |_, asm: &mut Assembly| {
+        let sem = recover_semaphore(asm);
+        let sem_class = ClassRef::semaphore_slim(asm);
+        let release = asm.alloc_string("Release");
+        let release =
+            asm.class_ref(sem_class)
+                .clone()
+                .instance(&[], Type::Int(Int::I32), release, asm);
+        let prev = asm.alloc_node(CILNode::call(release, [sem]));
+        let pop = asm.alloc_root(CILRoot::Pop(prev));
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![pop, ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_mutex_trylock(h: *mut u8) -> bool`
+///   => recover the `SemaphoreSlim` from `h` and `Wait(0)` (non-blocking acquire).
+///
+/// `SemaphoreSlim.Wait(int millisecondsTimeout)` with `0` polls without blocking,
+/// returning `true` iff the permit was taken — exactly the
+/// `sys::sync::Mutex::try_lock` contract. Backs `sys::sync::Mutex::try_lock`.
+fn insert_dotnet_mutex_trylock(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_mutex_trylock");
+    let generator = move |_, asm: &mut Assembly| {
+        let sem = recover_semaphore(asm);
+        let sem_class = ClassRef::semaphore_slim(asm);
+        let wait = asm.alloc_string("Wait");
+        let wait = asm.class_ref(sem_class).clone().instance(
+            &[Type::Int(Int::I32)],
+            Type::Bool,
+            wait,
+            asm,
+        );
+        let zero = asm.alloc_node(Const::I32(0));
+        let entered = asm.alloc_node(CILNode::call(wait, [sem, zero]));
+        let ret = asm.alloc_root(CILRoot::Ret(entered));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_tls_create() -> *mut u8`
+///   => `new ThreadLocal<nint>()`; return a `GCHandle` `IntPtr` pinning it.
+///
+/// Slice 2 — REAL per-thread thread-local storage. Each `thread_local!` TLS key
+/// is one managed `System.Threading.ThreadLocal<IntPtr>` whose `.Value` is
+/// per-thread BY CONSTRUCTION (no `ManagedThreadId` composite key needed). The
+/// object is pinned in a `GCHandle` and the handle's `IntPtr` is returned as
+/// `*mut u8` — the opaque "key" the std side stores. Mirrors
+/// `rcl_dotnet_mutex_new`'s handle round-trip (`ref_to_handle` => `GCHandle.Alloc`).
+/// The key lives for the program's lifetime (no Free binding in this slice; one
+/// `ThreadLocal` per live TLS key, collected at process exit).
+fn insert_dotnet_tls_create(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_tls_create");
+    let generator = move |_, asm: &mut Assembly| {
+        // new ThreadLocal<nint>()  (the parameterless ctor; default Value is 0)
+        let tl = ClassRef::thread_local(asm, Type::Int(Int::ISize));
+        let ctor = asm.class_ref(tl).clone().ctor(&[], asm);
+        let tl_obj = asm.alloc_node(CILNode::call(ctor, []));
+        let store = asm.alloc_root(CILRoot::StLoc(0, tl_obj));
+
+        // return (void*)GCHandle.Alloc(threadLocal)
+        let void = asm.alloc_type(Type::Void);
+        let handle = CILNode::LdLoc(0).ref_to_handle(asm);
+        let handle = asm.alloc_node(handle);
+        let handle = asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::Ptr(void))));
+        let ret = asm.alloc_root(CILRoot::Ret(handle));
+
+        let tl_ty = asm.alloc_type(Type::ClassRef(tl));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![store, ret], 0, None)],
+            locals: vec![(Some(asm.alloc_string("tl")), tl_ty)],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// Recover the `ThreadLocal<nint>` from a `GCHandle` `IntPtr` (arg0, `*mut u8`):
+/// `handle_to_obj((nint)h)` then `(ThreadLocal<nint>)obj`. Mirrors
+/// `recover_semaphore`. Returns the casted node.
+fn recover_thread_local(asm: &mut Assembly) -> Interned<CILNode> {
+    let arg0 = asm.alloc_node(CILNode::LdArg(0));
+    let handle_isize = asm.alloc_node(CILNode::PtrCast(arg0, Box::new(PtrCastRes::ISize)));
+    let handle_to_obj = asm.alloc_string("handle_to_obj");
+    let main_module = asm.main_module();
+    let handle_to_obj = asm.class_ref(*main_module).clone().static_mref(
+        &[Type::Int(Int::ISize)],
+        Type::PlatformObject,
+        handle_to_obj,
+        asm,
+    );
+    let obj = asm.alloc_node(CILNode::call(handle_to_obj, [handle_isize]));
+    let tl = ClassRef::thread_local(asm, Type::Int(Int::ISize));
+    let tl_ty = asm.alloc_type(Type::ClassRef(tl));
+    asm.alloc_node(CILNode::CheckedCast(obj, tl_ty))
+}
+
+/// `rcl_dotnet_tls_get(key: *mut u8) -> *mut u8`
+///   => recover the `ThreadLocal<nint>` from `key` and return `key.Value` (an
+///      `nint`) reinterpreted as `*mut u8`.
+///
+/// `ThreadLocal<T>.get_Value()` is the instance property getter; its result is
+/// the CALLING THREAD's slot (per-thread by construction). Backs the dotnet PAL
+/// `key::get`.
+fn insert_dotnet_tls_get(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_tls_get");
+    let generator = move |_, asm: &mut Assembly| {
+        let tl = recover_thread_local(asm);
+        let tl_class = ClassRef::thread_local(asm, Type::Int(Int::ISize));
+        let get_value = asm.alloc_string("get_Value");
+        // `ThreadLocal<T>.get_Value()` returns the CLASS generic `!0` (here `nint`),
+        // NOT a concrete `IntPtr` — the CLR matches the property's exact generic
+        // signature, so a literal `IntPtr` return yields a runtime
+        // MissingMethodException. Use `PlatformGeneric(0)` (the class generic),
+        // mirroring how `ConcurrentDictionary<K,V>.get_Item` is referenced.
+        let get_value = asm.class_ref(tl_class).clone().instance(
+            &[],
+            Type::PlatformGeneric(0, GenericKind::MethodGeneric),
+            get_value,
+            asm,
+        );
+        let val = asm.alloc_node(CILNode::call(get_value, [tl]));
+        // nint -> *mut u8
+        let void = asm.alloc_type(Type::Void);
+        let val = asm.alloc_node(CILNode::PtrCast(val, Box::new(PtrCastRes::Ptr(void))));
+        let ret = asm.alloc_root(CILRoot::Ret(val));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_tls_set(key: *mut u8, val: *mut u8)`
+///   => recover the `ThreadLocal<nint>` from `key` and `key.Value = (nint)val`.
+///
+/// `ThreadLocal<T>.set_Value(T)` is the instance property setter; it writes the
+/// CALLING THREAD's slot only. Backs the dotnet PAL `key::set`.
+fn insert_dotnet_tls_set(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_tls_set");
+    let generator = move |_, asm: &mut Assembly| {
+        let tl = recover_thread_local(asm);
+        let tl_class = ClassRef::thread_local(asm, Type::Int(Int::ISize));
+        let set_value = asm.alloc_string("set_Value");
+        // `ThreadLocal<T>.set_Value(T)` takes the CLASS generic `!0` (here `nint`),
+        // not a concrete `IntPtr` — same exact-signature-match reason as the getter.
+        let set_value = asm.class_ref(tl_class).clone().instance(
+            &[Type::PlatformGeneric(0, GenericKind::MethodGeneric)],
+            Type::Void,
+            set_value,
+            asm,
+        );
+        // (nint)val  (arg1 is the *mut u8 value to store)
+        let val = asm.alloc_node(CILNode::LdArg(1));
+        let val = asm.alloc_node(CILNode::PtrCast(val, Box::new(PtrCastRes::ISize)));
+        let set = asm.alloc_root(CILRoot::call(set_value, [tl, val]));
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![set, ret], 0, None)],
             locals: vec![],
         }
     };

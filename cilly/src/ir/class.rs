@@ -223,6 +223,35 @@ impl ClassRef {
         let asm_name = Some(asm.alloc_string("System.Threading.Thread"));
         asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
     }
+    /// Returns a reference to the `System.Threading.SemaphoreSlim`
+    pub fn semaphore_slim(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Threading.SemaphoreSlim");
+        // SemaphoreSlim physically lives in System.Private.CoreLib; method bodies
+        // must name the IMPL assembly (the runtime resolves it directly), while
+        // `ref_assembly_name` normalizes it to System.Runtime in the C#-visible
+        // metadata. Naming `System.Runtime` here makes the body's
+        // `[System.Runtime]SemaphoreSlim` unresolvable at run time (TypeLoadException).
+        let asm_name = Some(asm.alloc_string("System.Private.CoreLib"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to `System.Threading.ThreadLocal<T>` instantiated at
+    /// element type `element` (e.g. `System.Threading.ThreadLocal<nint>`).
+    ///
+    /// Backs the dotnet PAL's per-thread thread-local storage (Slice 2): each
+    /// `thread_local!` TLS key is one `ThreadLocal<IntPtr>` whose `.Value` is
+    /// per-thread BY CONSTRUCTION. A reference type (generic arity 1).
+    ///
+    /// ASM-NAME LESSON (same as `semaphore_slim`): `ThreadLocal<T>` physically
+    /// lives in `System.Private.CoreLib`; method-BODY type references must name
+    /// the IMPL assembly so the runtime resolves it directly. Naming
+    /// `System.Runtime` here makes the body's `[System.Runtime]ThreadLocal\`1`
+    /// unresolvable at run time (TypeLoadException); `ref_assembly_name`
+    /// normalizes CoreLib -> System.Runtime only in C#-visible metadata.
+    pub fn thread_local(asm: &mut Assembly, element: Type) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Threading.ThreadLocal");
+        let asm_name = Some(asm.alloc_string("System.Private.CoreLib"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [element].into()))
+    }
     /// Returns a reference to the `System.Type`
     pub fn type_type(asm: &mut Assembly) -> Interned<ClassRef> {
         let name = asm.alloc_string("System.Type");

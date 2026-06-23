@@ -198,10 +198,16 @@ throughput vs C# is not where this backend competes today.
   differential-tested; the un-triaged tail of the ~111 advisory warnings stays flagged, not silenced.
   RECOMMENDED-NOT-APPLIED owner-gated checker fixes (for a deliberate future pass) are recorded in the
   WF-TC result — narrow layout-based fat-ptr equivalence + the two `StInd` disjuncts + the `*u8`-sink arm.
-- **WF-F (threading/TLS)** — scoped + first-slice attempted (WF-F1): **spawn/join already fully real**;
-  the only blockers to correct multithreading are `Mutex` (no_threads `Cell<bool>`) + per-thread TLS
-  (process-global statics). Mutex-first plan ready (real `SemaphoreSlim`-backed `Mutex` via new cilly
-  hooks = self-contained/low-risk; per-thread TLS = gate-risky 2nd slice). WF-F1 landed NOTHING (the
-  new threading codegen can't ship unverified, and the rebuild+gate+repeated-probe loop wasn't
-  completed in-pass). HELD for a dedicated implement pass.
+- **WF-F (threading/TLS)** — DONE. **Multithreaded Rust now runs on .NET.** Spawn/join were already
+  real; the two no_threads gaps are closed: (Slice 1) real `Mutex` backed by `SemaphoreSlim(1,1)` (4
+  new cilly hooks + `ClassRef::semaphore_slim`; PAL `Cell<bool>` → `AtomicUsize`-handle, lazy CAS,
+  word-width); (Slice 2) real per-thread TLS via `ThreadLocal<nint>` per key (3 hooks +
+  `ClassRef::thread_local`; `dotnet_pal/sys/thread_local` swapped from process-global statics to std's
+  `os.rs` key-backed storage wired to the hooks; `palinject` + bash-core key/storage arms routed).
+  Verified: `cargo_tests/pal_threads` — 4 threads × 100k shared-`Mutex<u64>` increments (counter=400000,
+  no lost updates) + per-thread `thread_local` isolation (distinct ids, no bleed) — 5/5 + 3/3 clean,
+  gate 426/12. Asm-name lesson: method-body refs to `SemaphoreSlim`/`ThreadLocal` must name the impl
+  assembly `System.Private.CoreLib` (System.Runtime → runtime `TypeLoadException`); exporter normalizes
+  for C#-visible metadata only. Deferred: TLS-drop destructors (leak-on-exit), Condvar/RwLock/Once/
+  Parker still no_threads, the `target-family=unix` flip (separate).
 - Branch `gaps-campaign` (off `main` = pushed Tier-2 state); pushed to `mine/gaps-campaign`.

@@ -146,26 +146,29 @@ if [ -f "$PAL/thread_local/dotnet.rs" ]; then
   # E0425 we are fixing).
   #
   # Storage arm (block 1, still the first cfg_select): declares `mod dotnet` at
-  # thread_local level and re-exports ITS STORAGE ITEMS ONLY (mirroring the
-  # `no_threads` arm — a glob `pub use dotnet::*` instead leaks the PAL's own
-  # `key`/`guard` items into thread_local scope and trips `hidden_glob_reexports`).
-  inject_arm thread_local/mod.rs 'pub use dotnet::{EagerStorage, LazyStorage, thread_local_inner}; pub(crate) use dotnet::{LocalPointer, local_pointer}; mod dotnet;' 1
+  # thread_local level and re-exports ITS STORAGE ITEMS ONLY (a glob `pub use
+  # dotnet::*` instead leaks the PAL's own `key`/`guard` items into thread_local
+  # scope and trips `hidden_glob_reexports`).
+  # SLICE 2: dotnet TLS is now `os.rs`-shaped (per-thread, key-backed), so it
+  # re-exports `Storage`/`value_align` exactly like the `_`/`os` arm — NOT the old
+  # `no_threads`-style `EagerStorage`/`LazyStorage`.
+  inject_arm thread_local/mod.rs 'pub use dotnet::{Storage, thread_local_inner, value_align}; pub(crate) use dotnet::{LocalPointer, local_pointer}; mod dotnet;' 1
   # Guard arm: reach `enable` via `super::dotnet` (super of `guard` is
   # thread_local, where `mod dotnet` was declared above). `current.rs` calls
   # `crate::sys::thread_local::guard::enable()` from two sites; this is what they
   # resolve to. dotnet is modelled on `no_threads` (single managed thread), whose
   # guard `enable` is a leak-everything no-op.
   inject_arm_anchor thread_local/mod.rs 'pub(crate) mod guard {' '        pub(crate) use super::dotnet::enable;'
-  # Key arm: WITH families unset the `_ => {}` empty key arm caught os=dotnet and
-  # nothing imports from `sys::thread_local::key` (storage re-exports from `dotnet`
-  # directly). Under the `target-family=["unix"]` flip, the key cascade's FIRST arm
-  # — `all(not(apple), not(wasm), target_family="unix")` — now matches dotnet and
-  # pulls `key/unix.rs` (libc::pthread_key_t/pthread_key_create/...). dotnet is the
-  # no_threads (single managed thread) model — it needs NO pthread TLS keys — so
-  # inject an EMPTY `target_os="dotnet" => {}` arm-0 (anchored on `pub(crate) mod
-  # key {`, the 4th cfg_select!) so dotnet wins with the same empty body the `_`
-  # arm gave pre-flip. CLEAN: no key consumers on this PAL.
-  inject_arm_anchor thread_local/mod.rs 'pub(crate) mod key {' '        /* dotnet: no_threads model, no pthread TLS keys */'
+  # Key arm: SLICE 2 wires the dotnet PAL's per-thread key module. Under the
+  # `target-family=["unix"]` flip, the key cascade's FIRST `_`-relative arm —
+  # `all(not(apple), not(wasm), target_family="unix")` — would match dotnet and
+  # pull `key/unix.rs` (libc::pthread_key_t/...). Injecting `target_os="dotnet"`
+  # as arm-0 (anchored on `pub(crate) mod key {`) makes dotnet win and re-export
+  # OUR per-thread key module — one managed `ThreadLocal<IntPtr>` per key — which
+  # the os.rs-style storage above imports via `super::key::{Key, LazyKey, get,
+  # set}`. This is what makes `thread_local!` (and `thread::set_current`'s CURRENT)
+  # per-thread, so a 2nd spawned thread no longer aborts ("already set").
+  inject_arm_anchor thread_local/mod.rs 'pub(crate) mod key {' '        pub(super) use super::dotnet::key::{Key, LazyKey, get, set};'
 fi
 [ -f "$PAL/io/error/dotnet.rs" ]     && inject_arm io/error/mod.rs     'mod dotnet; pub use dotnet::*;'
 # time/mod.rs uses the `mod X; use X as imp;` cascade shape (it re-exports

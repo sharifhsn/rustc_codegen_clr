@@ -389,9 +389,13 @@ fn sys_targets() -> Vec<Target> {
             injections: vec![
                 // Storage arm (block 1, the first cfg_select!): re-export STORAGE ITEMS
                 // ONLY (a glob would leak key/guard and trip hidden_glob_reexports).
+                // Slice 2: the dotnet TLS backend is now `os.rs`-shaped (per-thread,
+                // key-backed) instead of `no_threads`-shaped (process-global), so it
+                // exports `Storage`/`value_align` exactly like the `_`/`os` arm,
+                // NOT `EagerStorage`/`LazyStorage`.
                 arm(
-                    "pub use dotnet::{EagerStorage, LazyStorage, thread_local_inner}; pub(crate) use dotnet::{LocalPointer, local_pointer}; mod dotnet;",
-                    "pub use dotnet::{EagerStorage, LazyStorage, thread_local_inner};",
+                    "pub use dotnet::{Storage, thread_local_inner, value_align}; pub(crate) use dotnet::{LocalPointer, local_pointer}; mod dotnet;",
+                    "pub use dotnet::{Storage, thread_local_inner, value_align};",
                     Anchor::After("cfg_select! {".to_string()),
                 ),
                 // Guard arm: anchored on `pub(crate) mod guard {` (super::dotnet::enable).
@@ -400,10 +404,13 @@ fn sys_targets() -> Vec<Target> {
                     "pub(crate) use super::dotnet::enable;",
                     Anchor::After("pub(crate) mod guard {".to_string()),
                 ),
-                // Key arm: anchored on `pub(crate) mod key {` — empty (no pthread TLS keys).
+                // Key arm: anchored on `pub(crate) mod key {`. Slice 2 wires the
+                // per-thread key module (one managed `ThreadLocal<IntPtr>` per key);
+                // the `os.rs`-style storage above imports `super::key::{Key, LazyKey,
+                // get, set}`, so this re-export is what makes storage per-thread.
                 arm(
-                    "/* dotnet: no_threads model, no pthread TLS keys */",
-                    "/* dotnet: no_threads model, no pthread TLS keys */",
+                    "pub(super) use super::dotnet::key::{Key, LazyKey, get, set};",
+                    "pub(super) use super::dotnet::key::{Key, LazyKey, get, set};",
                     Anchor::After("pub(crate) mod key {".to_string()),
                 ),
             ],
