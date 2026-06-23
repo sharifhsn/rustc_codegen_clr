@@ -185,5 +185,23 @@ throughput vs C# is not where this backend competes today.
   wire flags + make fatal behind-flag + green `::stable` → THEN the owner's default-flip decision is
   meaningful. Landed: an 11-line log-only void-`StLoc` guard (`cilly/src/ir/typecheck.rs`); gate 426/12,
   config defaults unchanged.
-- **WF-F (threading/TLS)** — HELD; scope-only pass next (no code).
+- **WF-TC (typechecker soundness hunt)** — DONE, decisive. Differential-tested (native vs backend,
+  byte-for-byte) the ~5 fat-pointer-nesting flags + the 3 dominant false-positive families. **Verdict:
+  ZERO real miscompiles** — all are checker-model false positives. Decisive fact: `fat_ptr_to`
+  (`type.rs`) builds *every* fat pointer with identical layout `{void* @0, usize @8, size 16}`; the
+  inner type only changes the interned name, so `FatPtr<u8>` ≡ `FatPtr<FatPtr<u8>>` at the bit level
+  and the checker's name-compare mis-flags them. `WriteWrongAddr` ppX/X + void-addr: `StInd` picks the
+  store from `tpe`, not the address pointee (`tpe:Void` still correctly throws). `catch_unwind *Data→
+  *u8`: matches `__rust_try`'s erased ABI. **Zero source changed** (checker relaxations recommended but
+  owner-gated — left unapplied; an advisory checker needn't be correct to be safe). Evidence crates
+  `cargo_tests/cd_fatptr` + `cd_fpfam`; gate 426/12. Honest scope: only these 5 patterns were
+  differential-tested; the un-triaged tail of the ~111 advisory warnings stays flagged, not silenced.
+  RECOMMENDED-NOT-APPLIED owner-gated checker fixes (for a deliberate future pass) are recorded in the
+  WF-TC result — narrow layout-based fat-ptr equivalence + the two `StInd` disjuncts + the `*u8`-sink arm.
+- **WF-F (threading/TLS)** — scoped + first-slice attempted (WF-F1): **spawn/join already fully real**;
+  the only blockers to correct multithreading are `Mutex` (no_threads `Cell<bool>`) + per-thread TLS
+  (process-global statics). Mutex-first plan ready (real `SemaphoreSlim`-backed `Mutex` via new cilly
+  hooks = self-contained/low-risk; per-thread TLS = gate-risky 2nd slice). WF-F1 landed NOTHING (the
+  new threading codegen can't ship unverified, and the rebuild+gate+repeated-probe loop wasn't
+  completed in-pass). HELD for a dedicated implement pass.
 - Branch `gaps-campaign` (off `main` = pushed Tier-2 state); pushed to `mine/gaps-campaign`.

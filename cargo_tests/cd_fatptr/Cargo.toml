@@ -1,0 +1,11 @@
+[package]
+name = "cd_fatptr"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[profile.dev]
+opt-level = 0
+
+[workspace]
