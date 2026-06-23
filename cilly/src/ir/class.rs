@@ -457,6 +457,49 @@ impl ClassRef {
         let asm_name = Some(asm.alloc_string("System.Net.Primitives"));
         asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
     }
+    /// Returns a reference to `System.IO.FileNotFoundException` — thrown by the
+    /// BCL when a file path does not exist (e.g. `new FileStream` on a missing
+    /// file). The fs errno mapper (`rcl_errno_from_exception`) maps it to
+    /// `ENOENT`. HOST-AGNOSTIC: the exception type is thrown identically on
+    /// Unix-host and Windows-host CoreCLR. A reference type, in `System.Runtime`.
+    #[must_use]
+    pub fn file_not_found_exception(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.IO.FileNotFoundException");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to `System.IO.DirectoryNotFoundException` — thrown by
+    /// the BCL when a directory in a path does not exist. Maps to `ENOENT`.
+    /// HOST-AGNOSTIC. A reference type, in `System.Runtime`.
+    #[must_use]
+    pub fn directory_not_found_exception(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.IO.DirectoryNotFoundException");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to `System.UnauthorizedAccessException` (note: in the
+    /// `System` namespace, NOT `System.IO`; it derives from `SystemException`, NOT
+    /// `IOException`) — thrown by the BCL on a permission/ACL denial. Maps to
+    /// `EACCES`. HOST CAVEAT: the *mapping* is host-agnostic, but the *meaning* of
+    /// EACCES (rwx/uid/gid) is only faithful on a Unix host; a Windows-host
+    /// CoreCLR throws this for ACL denials too and has no POSIX permission model,
+    /// so PermissionDenied fidelity is Unix-host-best-effort. A reference type, in
+    /// `System.Runtime`.
+    #[must_use]
+    pub fn unauthorized_access_exception(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.UnauthorizedAccessException");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to `System.IO.PathTooLongException` — thrown by the BCL
+    /// when a path exceeds the platform limit. Maps to `ENAMETOOLONG`.
+    /// HOST-AGNOSTIC. A reference type, in `System.Runtime`.
+    #[must_use]
+    pub fn path_too_long_exception(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.IO.PathTooLongException");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
     /// Returns a reference to the int-backed enum `System.Net.Sockets.SocketError`
     /// (a value type) — the type returned by `SocketException.SocketErrorCode`. The
     /// errno translation reads it (as its underlying i32) to derive a POSIX errno.

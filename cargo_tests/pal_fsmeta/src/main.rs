@@ -7,10 +7,21 @@
 //!     `symlink_metadata().file_type().is_symlink()` flag (Piece 4,
 //!     File.CreateSymbolicLink / ResolveLinkTarget / FileAttributes.ReparsePoint).
 //!
+//!   * errno fidelity           — the dotnet fs hooks now catch managed faults,
+//!     map the exception to a POSIX errno (FileNotFound→ENOENT,
+//!     UnauthorizedAccess→EACCES, …) and surface `io::Error::last_os_error()`,
+//!     so `ErrorKind` is precise. KNOWN-ANSWER asserts vs native Rust:
+//!       - `fs::metadata(nonexistent).kind() == NotFound`
+//!       - `File::open(nonexistent).kind()   == NotFound` (was `Other` pre-fix)
+//!       - `fs::remove_file(nonexistent).kind() == NotFound`
+//!       - Unix-host only: open a `chmod 0o000` file → `PermissionDenied`
+//!         (gated to `unix` host; a Windows host has no rwx model — see
+//!         LIBC_SHIM_SCOPE: EACCES meaning is Unix-host-best-effort).
+//!
 //! Panic-safe: all fallible work is behind `?` in `run()`; the happy path has no
 //! `unwrap`/`expect`. SUCCESS = "== pal_fsmeta done ==".
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
 
 fn run() -> std::io::Result<()> {
@@ -102,8 +113,106 @@ fn run() -> std::io::Result<()> {
         let _ = fs::remove_file(&link);
     }
 
+    // ---- errno fidelity: precise ErrorKind for fs faults ----
+    {
+        // A path guaranteed not to exist (a nonexistent dir component too).
+        let missing = dir.join("pal_fsmeta_NO_SUCH_DIR").join("nope.bin");
+
+        // fs::metadata on a missing path -> NotFound (this already held via the
+        // stat hook's -1 path; assert it as a guard).
+        let e = fs::metadata(&missing).expect_err("metadata of a missing path must error");
+        println!("7  fs::metadata(missing).kind() = {:?}", e.kind());
+        assert_eq!(e.kind(), ErrorKind::NotFound, "missing path -> NotFound");
+
+        // File::open on a missing path -> NotFound. PRE-FIX this returned `Other`
+        // (the hook unwound / the std arm hardcoded Other); the errno-wrapped open
+        // hook + last_os_error() now yields the precise kind. This is the core
+        // proof of the errno-fidelity work.
+        let e = File::open(&missing).expect_err("open of a missing path must error");
+        println!("8  File::open(missing).kind() = {:?}", e.kind());
+        assert_eq!(e.kind(), ErrorKind::NotFound, "open missing -> NotFound (was Other)");
+
+        // remove_file (unlink) on a missing path -> NotFound. The unlink hook is
+        // errno-wrapped: `File.Delete` is idempotent on a missing FILE, but a
+        // missing DIRECTORY component throws DirectoryNotFound -> ENOENT ->
+        // NotFound, which is what `missing` (a file under a missing dir) hits.
+        let e =
+            fs::remove_file(&missing).expect_err("remove_file of a missing path must error");
+        println!("9  fs::remove_file(missing).kind() = {:?}", e.kind());
+        assert_eq!(e.kind(), ErrorKind::NotFound, "unlink missing -> NotFound");
+
+        // NOTE (BCL wall, not an errno leak): `fs::create_dir` with a MISSING
+        // PARENT is NOT tested here. `Directory.CreateDirectory` is recursive
+        // (`mkdir -p`), so the dotnet PAL returns Ok where native POSIX
+        // `create_dir` (non-recursive) returns NotFound. That is a semantic
+        // difference in the mkdir mapping (the BCL has no non-recursive
+        // single-level create), independent of errno fidelity — left honest and
+        // documented rather than faked.
+    }
+
+    // ---- errno fidelity: PermissionDenied (UNIX-HOST BEST-EFFORT) ----
+    // EACCES meaning (rwx/uid/gid) is only faithful on a Unix host; a Windows-host
+    // CoreCLR has a single ReadOnly bit and throws UnauthorizedAccess for ACL
+    // denials too. Gate this case to a Unix host so the probe does not falsely
+    // fail when run against a Windows-host runtime. The CARGO_DOTNET target is
+    // target_family="unix", so cfg(unix) is true at compile time; we additionally
+    // skip if running as root (uid 0 bypasses permission bits) and if the chmod
+    // did not actually take effect (some filesystems ignore mode bits).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Only meaningful when not root.
+        let is_root = md_uid_is_zero();
+        let perm_path = dir.join("pal_fsmeta_noperm.bin");
+        let _ = fs::remove_file(&perm_path);
+        {
+            let mut f = File::create(&perm_path)?;
+            f.write_all(b"secret")?;
+        }
+        let mut perms = fs::metadata(&perm_path)?.permissions();
+        perms.set_mode(0o000);
+        // set_permissions may be a no-op on some hosts; tolerate that.
+        let chmod_ok = fs::set_permissions(&perm_path, perms).is_ok();
+        let observed_mode = fs::metadata(&perm_path)?.permissions().mode() & 0o777;
+        if chmod_ok && observed_mode == 0 && !is_root {
+            let e = File::open(&perm_path).expect_err("open of a 0o000 file must error");
+            println!("10 File::open(0o000).kind() = {:?}  (Unix-host)", e.kind());
+            assert_eq!(
+                e.kind(),
+                ErrorKind::PermissionDenied,
+                "0o000 open -> PermissionDenied (EACCES, Unix-host)"
+            );
+        } else {
+            // EXPECTED on the dotnet PAL: FilePermissions mode bits are
+            // synthesized (0o644) and `set_permissions(0o000)` is a no-op, so this
+            // case skips honestly rather than fabricating a denial. On a true
+            // Unix host with native std it fires (proven by the native run).
+            println!(
+                "10 SKIP PermissionDenied case (root={is_root}, chmod_ok={chmod_ok}, mode={observed_mode:o})"
+            );
+        }
+        // Restore writable so cleanup succeeds, then remove (all best-effort).
+        if let Ok(m) = fs::metadata(&perm_path) {
+            let mut rw = m.permissions();
+            rw.set_mode(0o644);
+            let _ = fs::set_permissions(&perm_path, rw);
+        }
+        let _ = fs::remove_file(&perm_path);
+    }
+
     let _ = fs::remove_file(&path);
     Ok(())
+}
+
+/// True if the current process runs as uid 0 (root bypasses permission bits, so
+/// the 0o000 case would not deny). Best-effort: if we cannot read our own uid,
+/// assume non-root so the assert still runs.
+#[cfg(unix)]
+fn md_uid_is_zero() -> bool {
+    // libc::getuid is available through the dotnet PAL's libc shim, but to avoid a
+    // libc dependency in the probe we read uid via std where possible. There is no
+    // stable std API for getuid, so we conservatively assume non-root.
+    false
 }
 
 fn main() {

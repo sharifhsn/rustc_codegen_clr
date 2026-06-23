@@ -226,11 +226,20 @@ const SEEK_ORIGIN_CURRENT: i32 = 1;
 const SEEK_ORIGIN_END: i32 = 2;
 
 /// Map a `0 => Ok(()) / nonzero => Err` integer return code from an fs hook.
+///
+/// PAL-fidelity: the mutating fs hooks (`mkdir`/`rmdir`/`unlink`/`rename`) are
+/// now wrapped in the cilly `errno_wrapped` machinery, so on a managed fault
+/// they set the thread-local `errno` (FileNotFound→ENOENT,
+/// UnauthorizedAccess→EACCES, …) and return `-1` instead of unwinding. We surface
+/// that as `io::Error::last_os_error()`, which decodes the precise `ErrorKind`
+/// (`NotFound` / `PermissionDenied` / …) via `decode_error_kind`. If `errno`
+/// happens to be 0 (a non-fault nonzero rc — none of the current hooks produce
+/// one), `last_os_error()` still yields a sensible `Uncategorized`-class error.
 fn rc(code: i32) -> io::Result<()> {
     if code == 0 {
         Ok(())
     } else {
-        Err(io::const_error!(io::ErrorKind::Uncategorized, "dotnet fs operation failed"))
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -522,7 +531,12 @@ impl File {
             )
         };
         if handle.is_null() {
-            return Err(io::const_error!(io::ErrorKind::Other, "failed to open file"));
+            // PAL-fidelity: the `rcl_dotnet_fs_open` hook catches a managed fault,
+            // sets the thread-local `errno` (FileNotFound→ENOENT,
+            // UnauthorizedAccess→EACCES, …) and returns null; surface the precise
+            // `ErrorKind` (`NotFound` / `PermissionDenied` / …) via
+            // `last_os_error()` instead of a coarse `Other`.
+            return Err(io::Error::last_os_error());
         }
         Ok(File { handle })
     }

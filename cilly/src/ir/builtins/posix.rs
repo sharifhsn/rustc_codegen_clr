@@ -70,6 +70,19 @@ const EINPROGRESS: i32 = 115;
 const ECONNRESET: i32 = 104;
 const ETIMEDOUT: i32 = 110;
 const ECONNREFUSED: i32 = 111;
+// fs-side errno values added for the exception→errno enrichment (PAL-fidelity).
+// Mapping is HOST-AGNOSTIC (the BCL throws the same exception types on Unix-host
+// and Windows-host CoreCLR); see the per-arm caveats in the mapper.
+#[allow(dead_code)]
+const EPERM: i32 = 1;
+const EACCES: i32 = 13;
+#[allow(dead_code)]
+const EBUSY: i32 = 16;
+#[allow(dead_code)]
+const EEXIST: i32 = 17;
+#[allow(dead_code)]
+const EPIPE: i32 = 32;
+const ENAMETOOLONG: i32 = 36;
 
 // .NET `System.Net.Sockets.SocketError` enum ints (the curated set).
 const SE_WOULD_BLOCK: i32 = 10035;
@@ -464,7 +477,7 @@ fn define_main_method(
 }
 
 /// A `static_mref` to a main-module method (the call-seam for wrappers).
-fn main_static(
+pub(super) fn main_static(
     asm: &mut Assembly,
     name: &str,
     inputs: &[Type],
@@ -735,10 +748,24 @@ fn insert_errno_location(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
     patcher.insert(name, Box::new(generator));
 }
 
+// Symmetric constant-valued counterpart to `set_errno_node` (sets `rcl_errno` to
+// a fixed errno). Currently unused — `open_errno_wrapped` was switched from a
+// blind `ENOENT` to the rich `rcl_errno_from_exception` mapper — but kept as the
+// obvious helper for any future fixed-errno wrapper.
+#[allow(dead_code)]
 fn set_errno(asm: &mut Assembly, val: i32) -> Interned<CILRoot> {
     let sfld = errno_sfld(asm);
     let v = asm.alloc_node(Const::I32(val));
     asm.alloc_root(CILRoot::SetStaticField { field: sfld, val: v })
+}
+
+/// Like `set_errno`, but stores an already-built i32 NODE into the thread-local
+/// `rcl_errno` cell (e.g. the result of `rcl_errno_from_exception`). Used by the
+/// pointer-returning `rcl_dotnet_fs_open` hook, which catches faults itself
+/// (it must return null, not the `errno_wrapped` `-1`).
+pub(super) fn set_errno_node(asm: &mut Assembly, val: Interned<CILNode>) -> Interned<CILRoot> {
+    let sfld = errno_sfld(asm);
+    asm.alloc_root(CILRoot::SetStaticField { field: sfld, val })
 }
 
 /// `rcl_errno_from_exception(System.Object exn) -> i32` — map a caught BCL
@@ -746,22 +773,71 @@ fn set_errno(asm: &mut Assembly, val: i32) -> Interned<CILRoot> {
 /// branch chain lives outside any `try`/`catch` region (keeping the per-wrapper
 /// catch handler to a single block — a multi-block handler with an internal
 /// switch tripped the IL exporter's label resolution). NON-discarding:
-///   `if exn isinst SocketException -> map exn.SocketErrorCode (curated switch);
-///    else -> EIO.`
+///   * `exn isinst SocketException` -> map exn.SocketErrorCode (curated switch);
+///   * `exn isinst FileNotFoundException` / `DirectoryNotFoundException` -> ENOENT;
+///   * `exn isinst UnauthorizedAccessException` -> EACCES;
+///   * `exn isinst PathTooLongException` -> ENAMETOOLONG;
+///   * else (general IOException tail + anything unknown) -> EIO.
+///
+/// ORDER MATTERS: `FileNotFoundException`/`DirectoryNotFoundException`/
+/// `PathTooLongException` all derive from `IOException`, so they MUST be tested
+/// before any general `IOException` arm (we keep none — the IOException tail just
+/// falls through to the EIO default, which is the honest leak per
+/// LIBC_SHIM_SCOPE §3.2). `UnauthorizedAccessException` derives from
+/// `SystemException`, not `IOException`, so its position relative to the IO
+/// subclasses is free; it precedes the EIO fallthrough. The whole fs map is
+/// HOST-AGNOSTIC (the BCL throws the same exception types on Unix-host and
+/// Windows-host CoreCLR); the *meaning* of EACCES is Unix-host-best-effort (a
+/// Windows host has no rwx model and throws UnauthorizedAccess for ACL denials
+/// too) — see `ClassRef::unauthorized_access_exception`.
 fn define_errno_from_exception(asm: &mut Assembly) {
     let main_module = asm.main_module();
     let name = asm.alloc_string("rcl_errno_from_exception");
     let socket_exception = ClassRef::socket_exception(asm);
     let se_ty = asm.alloc_type(Type::ClassRef(socket_exception));
+    let fnf = ClassRef::file_not_found_exception(asm);
+    let fnf_ty = asm.alloc_type(Type::ClassRef(fnf));
+    let dnf = ClassRef::directory_not_found_exception(asm);
+    let dnf_ty = asm.alloc_type(Type::ClassRef(dnf));
+    let uae = ClassRef::unauthorized_access_exception(asm);
+    let uae_ty = asm.alloc_type(Type::ClassRef(uae));
+    let ptl = ClassRef::path_too_long_exception(asm);
+    let ptl_ty = asm.alloc_type(Type::ClassRef(ptl));
 
-    // block 0: if !(exn isinst SocketException) goto 1 (EIO); else goto 2.
+    // block 0: a chain of isinst tests. SocketException -> block 2 (socket
+    // switch); the fs exceptions -> their small return blocks (20..23); the EIO
+    // default -> block 1. Each arm `if isinst<T> goto <tgt>`; a final
+    // unconditional `goto 1` is the EIO fallthrough.
     let exn = asm.alloc_node(CILNode::LdArg(0));
     let is_se = asm.alloc_node(CILNode::IsInst(exn, se_ty));
-    let goto_eio = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, Some(BranchCond::False(is_se))))));
-    let goto_se = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None))));
+    let goto_se = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, Some(BranchCond::True(is_se))))));
+    let exn_fnf = asm.alloc_node(CILNode::LdArg(0));
+    let is_fnf = asm.alloc_node(CILNode::IsInst(exn_fnf, fnf_ty));
+    let goto_fnf =
+        asm.alloc_root(CILRoot::Branch(Box::new((20, 0, Some(BranchCond::True(is_fnf))))));
+    let exn_dnf = asm.alloc_node(CILNode::LdArg(0));
+    let is_dnf = asm.alloc_node(CILNode::IsInst(exn_dnf, dnf_ty));
+    let goto_dnf =
+        asm.alloc_root(CILRoot::Branch(Box::new((20, 0, Some(BranchCond::True(is_dnf))))));
+    let exn_uae = asm.alloc_node(CILNode::LdArg(0));
+    let is_uae = asm.alloc_node(CILNode::IsInst(exn_uae, uae_ty));
+    let goto_uae =
+        asm.alloc_root(CILRoot::Branch(Box::new((21, 0, Some(BranchCond::True(is_uae))))));
+    let exn_ptl = asm.alloc_node(CILNode::LdArg(0));
+    let is_ptl = asm.alloc_node(CILNode::IsInst(exn_ptl, ptl_ty));
+    let goto_ptl =
+        asm.alloc_root(CILRoot::Branch(Box::new((22, 0, Some(BranchCond::True(is_ptl))))));
+    let goto_eio = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
     // block 1: ret EIO.
     let eio = asm.alloc_node(Const::I32(EIO));
     let ret_eio = asm.alloc_root(CILRoot::Ret(eio));
+    // blocks 20..22: ret the fs errno.
+    let enoent = asm.alloc_node(Const::I32(ENOENT));
+    let ret_enoent = asm.alloc_root(CILRoot::Ret(enoent));
+    let eacces = asm.alloc_node(Const::I32(EACCES));
+    let ret_eacces = asm.alloc_root(CILRoot::Ret(eacces));
+    let enametoolong = asm.alloc_node(Const::I32(ENAMETOOLONG));
+    let ret_enametoolong = asm.alloc_root(CILRoot::Ret(enametoolong));
     // block 2: code = ((SocketException)exn).SocketErrorCode; switch.
     let exn2 = asm.alloc_node(CILNode::LdArg(0));
     let se_cast = asm.alloc_node(CILNode::CheckedCast(exn2, se_ty));
@@ -813,7 +889,11 @@ fn define_errno_from_exception(asm: &mut Assembly) {
         MethodKind::Static,
         MethodImpl::MethodBody {
             blocks: vec![
-                BasicBlock::new(vec![goto_eio, goto_se], 0, None),
+                BasicBlock::new(
+                    vec![goto_se, goto_fnf, goto_dnf, goto_uae, goto_ptl, goto_eio],
+                    0,
+                    None,
+                ),
                 BasicBlock::new(vec![ret_eio], 1, None),
                 BasicBlock::new(
                     vec![store_code, t_wb, t_to, t_cref, t_crst, t_aiu, goto_default],
@@ -826,6 +906,10 @@ fn define_errno_from_exception(asm: &mut Assembly) {
                 BasicBlock::new(vec![r_econnreset], 13, None),
                 BasicBlock::new(vec![r_eaddrinuse], 14, None),
                 BasicBlock::new(vec![r_default], 15, None),
+                // fs exception arms (ENOENT/EACCES/ENAMETOOLONG).
+                BasicBlock::new(vec![ret_enoent], 20, None),
+                BasicBlock::new(vec![ret_eacces], 21, None),
+                BasicBlock::new(vec![ret_enametoolong], 22, None),
             ],
             locals: vec![(None, se_local_ty)],
         },

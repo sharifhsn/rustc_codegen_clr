@@ -157,5 +157,12 @@ throughput vs C# is not where this backend competes today.
   items (`src/terminator/mod.rs`); panic messages now byte-match native. Unbreaks `swap_panics`×4 +
   `vec::test_index_out_of_bounds`; makes div0/overflow panics native-correct. 7 repro crates added;
   Docker gate 426/12 (no regressions).
-- WF-C / WF-E / WF-G / WF-F — not started.
+- **WF-E (PAL fidelity)** — DONE. The metadata timestamp/size/symlink "leaks" were already closed by
+  B2 (docs were stale → corrected). Real win: **errno fidelity** — enriched exception→errno
+  (`FileNotFound`/`DirectoryNotFound`→`ENOENT`, `UnauthorizedAccess`→`EACCES`, `PathTooLong`→
+  `ENAMETOOLONG`), errno-wrapped fs hooks (`mkdir`/`rmdir`/`unlink`/`rename`/`open`), std-side
+  `last_os_error()` → `File::open(missing)` now `NotFound` (was `ErrorKind::Other`). Walls left honest
+  (inode/dev/nlink=0 not faked, `ctime`=creation-time documented, `EACCES` Unix-host-best-effort,
+  `create_dir` recursive = BCL wall). `pal_fsmeta` extended + green; gate 426/12.
+- WF-C / WF-G / WF-F — not started.
 - Branch `gaps-campaign` (off `main` = pushed Tier-2 state); pushed to `mine/gaps-campaign`.

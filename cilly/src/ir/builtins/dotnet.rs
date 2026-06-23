@@ -1464,8 +1464,15 @@ fn insert_dotnet_fs(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
 /// `FileMode`/`FileAccess` are int-backed enums; the std side computes the int
 /// values, so we pass `mode`/`access` straight to the ctor. The `append` arg is
 /// unused here: std maps an append open to `FileMode.Append`, which positions
-/// the stream at end-of-file itself. On a managed I/O fault the exception
-/// unwinds (the std side never sees null, mirroring the other handle hooks).
+/// the stream at end-of-file itself.
+///
+/// PAL-fidelity: on a managed I/O fault the body catches the exception, maps it
+/// to a POSIX `errno` via `rcl_errno_from_exception` (FileNotFound→ENOENT,
+/// UnauthorizedAccess→EACCES, …) and returns **null**. The std `File::open` arm
+/// then reports the precise `ErrorKind` via `io::Error::last_os_error()`. This
+/// does NOT use `super::posix::errno_wrapped` because that helper returns `-1`
+/// (a non-null pointer), which would defeat the std-side `handle.is_null()`
+/// check — the open hook must return a null pointer on failure.
 fn insert_dotnet_fs_open(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("rcl_dotnet_fs_open");
     let generator = move |_, asm: &mut Assembly| {
@@ -1486,16 +1493,55 @@ fn insert_dotnet_fs_open(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             .ctor(&[Type::PlatformString, file_mode, file_access], asm);
         let stream = asm.alloc_node(CILNode::call(ctor, [path, mode, access]));
         let store = asm.alloc_root(CILRoot::StLoc(0, stream));
-        // return (void*)GCHandle.Alloc(stream)
+        // result(local 1) = (void*)GCHandle.Alloc(stream).
         let handle = CILNode::LdLoc(0).ref_to_handle(asm);
         let handle = asm.alloc_node(handle);
         let void = asm.alloc_type(Type::Void);
+        let void_ptr = Type::Ptr(void);
         let handle = asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::Ptr(void))));
-        let ret = asm.alloc_root(CILRoot::Ret(handle));
+        let store_ok = asm.alloc_root(CILRoot::StLoc(1, handle));
+        // try { build stream; result = handle; leave -> 2 }
+        let leave_ok = asm.alloc_root(CILRoot::ExitSpecialRegion { target: 2, source: 0 });
+        // catch (block 1): errno = rcl_errno_from_exception(GetException);
+        //                  result = null; leave -> 2.
+        let get_exn = asm.alloc_node(CILNode::GetException);
+        let mapper = super::posix::main_static(
+            asm,
+            "rcl_errno_from_exception",
+            &[Type::PlatformObject],
+            Type::Int(Int::I32),
+        );
+        let mapped = asm.alloc_node(CILNode::call(mapper, [get_exn]));
+        let set_errno = super::posix::set_errno_node(asm, mapped);
+        // null = (void*)(isize)0 — the established null-pointer idiom.
+        let zero_addr = asm.alloc_node(0_i32);
+        let zero_addr = asm.int_cast(zero_addr, Int::ISize, ExtendKind::ZeroExtend);
+        let nullp = asm.cast_ptr(zero_addr, void_ptr);
+        let store_null = asm.alloc_root(CILRoot::StLoc(1, nullp));
+        let leave_catch = asm.alloc_root(CILRoot::ExitSpecialRegion { target: 2, source: 1 });
+        // block 2: ret result.
+        let ld_result = asm.alloc_node(CILNode::LdLoc(1));
+        let ret = asm.alloc_root(CILRoot::Ret(ld_result));
+
         let stream_ty = asm.alloc_type(Type::ClassRef(file_stream));
+        let void_ptr_ty = asm.alloc_type(void_ptr);
         MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![store, ret], 0, None)],
-            locals: vec![(Some(asm.alloc_string("stream")), stream_ty)],
+            blocks: vec![
+                BasicBlock::new(
+                    vec![store, store_ok, leave_ok],
+                    0,
+                    Some(vec![BasicBlock::new(
+                        vec![set_errno, store_null, leave_catch],
+                        1,
+                        None,
+                    )]),
+                ),
+                BasicBlock::new(vec![ret], 2, None),
+            ],
+            locals: vec![
+                (Some(asm.alloc_string("stream")), stream_ty),
+                (Some(asm.alloc_string("result")), void_ptr_ty),
+            ],
         }
     };
     patcher.insert(name, Box::new(generator));
@@ -1869,10 +1915,21 @@ fn insert_dotnet_fs_len(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) 
     patcher.insert(name, Box::new(generator));
 }
 
-/// `rcl_dotnet_fs_stat(path_ptr, path_len, out_size: *mut u64, out_is_dir: *mut i32) -> i32`
-///   => `Directory.Exists(path)` ? write (size 0, is_dir 1), return 0
-///      : `File.Exists(path)`    ? write (FileInfo.Length, is_dir 0), return 0
+/// `rcl_dotnet_fs_stat(path_ptr, path_len, out_size: *mut u64, out_is_dir: *mut i32,
+///                     out_mtime: *mut i64, out_atime: *mut i64, out_ctime: *mut i64,
+///                     out_is_symlink: *mut i32) -> i32`
+///   => `Directory.Exists(path)` ? write (size 0, is_dir 1) + times + symlink, return 0
+///      : `File.Exists(path)`    ? write (FileInfo.Length, is_dir 0) + times + symlink, return 0
 ///      : return -1 (NotFound — the std side maps -1 to `ErrorKind::NotFound`).
+///
+/// B2 Piece 2/4 extended this from the original 4-arg `(size, is_dir)` shape to
+/// the full 8-arg shape: mtime/atime via `File.GetLast{Write,Access}TimeUtc`,
+/// ctime via `GetCreationTimeUtc` (a documented semantic mismatch: this is the
+/// .NET *creation* time, NOT the POSIX inode-change time), is_symlink via the
+/// `FileAttributes.ReparsePoint` bit. The `-1` return is reserved for the
+/// genuinely-not-found case (both `Exists` checks false) — a managed throw
+/// (e.g. an ACL denial) still unwinds here; the not-found `-1` is correctly
+/// `ErrorKind::NotFound` on the std side.
 /// .NET ticks (100-ns intervals since `0001-01-01Z`) at the Unix epoch
 /// (`1970-01-01Z`). Subtract this from a `DateTime.Ticks` and divide by
 /// `10_000_000` to get whole Unix seconds. Same constant the std `SystemTime`
@@ -2267,7 +2324,14 @@ fn insert_dotnet_fs_exists(asm: &mut Assembly, patcher: &mut MissingMethodPatche
 
 /// Shared shape for the path-in/`i32`-out fs hooks (`mkdir`/`rmdir`/`unlink`):
 /// decode the path, issue one static System.IO call (consuming any result), and
-/// return 0. A managed fault unwinds rather than returning a non-zero code.
+/// return 0 on success. PAL-fidelity: the body is wrapped in
+/// `super::posix::errno_wrapped`, so a managed fault sets the thread-local
+/// `errno` (via `rcl_errno_from_exception`: FileNotFound→ENOENT,
+/// UnauthorizedAccess→EACCES, …) and returns -1 instead of unwinding. The std fs
+/// arm then reports the precise `ErrorKind` via `io::Error::last_os_error()`.
+/// The wrapper owns blocks 1/2 and local 0, so the body uses ONLY block 0 and
+/// stores nothing into local 0 (the success value 0 is filled by the wrapper's
+/// `leave`; on a fault the wrapper stores -1).
 fn insert_path_to_rc(
     asm: &mut Assembly,
     patcher: &mut MissingMethodPatcher,
@@ -2278,12 +2342,10 @@ fn insert_path_to_rc(
     let generator = move |_, asm: &mut Assembly| {
         let path = decode_utf8(asm, 0, 1);
         let call = build_call(asm, path);
+        // On success, local 0 (the wrapper's `result`) must hold 0.
         let zero = asm.alloc_node(0_i32);
-        let ret = asm.alloc_root(CILRoot::Ret(zero));
-        MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![call, ret], 0, None)],
-            locals: vec![],
-        }
+        let store_ok = asm.alloc_root(CILRoot::StLoc(0, zero));
+        super::posix::errno_wrapped(asm, vec![call, store_ok], Type::Int(Int::I32), vec![])
     };
     patcher.insert(name, Box::new(generator));
 }
@@ -2344,7 +2406,11 @@ fn insert_dotnet_fs_unlink(asm: &mut Assembly, patcher: &mut MissingMethodPatche
 }
 
 /// `rcl_dotnet_fs_rename(old_ptr, old_len, new_ptr, new_len) -> i32`
-///   => `File.Move(old, new, overwrite: true)`; 0.
+///   => `File.Move(old, new, overwrite: true)`; 0 on success. PAL-fidelity:
+/// wrapped in `errno_wrapped` (a missing source path throws FileNotFound→ENOENT,
+/// an ACL denial throws UnauthorizedAccess→EACCES), so a fault sets `errno` and
+/// returns -1 rather than unwinding. Body uses only block 0; local 0 is the
+/// wrapper's `result`.
 fn insert_dotnet_fs_rename(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("rcl_dotnet_fs_rename");
     let generator = move |_, asm: &mut Assembly| {
@@ -2361,11 +2427,8 @@ fn insert_dotnet_fs_rename(asm: &mut Assembly, patcher: &mut MissingMethodPatche
         let truec = asm.alloc_node(true);
         let call = asm.alloc_root(CILRoot::call(mv, [old, new, truec]));
         let zero = asm.alloc_node(0_i32);
-        let ret = asm.alloc_root(CILRoot::Ret(zero));
-        MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![call, ret], 0, None)],
-            locals: vec![],
-        }
+        let store_ok = asm.alloc_root(CILRoot::StLoc(0, zero));
+        super::posix::errno_wrapped(asm, vec![call, store_ok], Type::Int(Int::I32), vec![])
     };
     patcher.insert(name, Box::new(generator));
 }

@@ -1192,23 +1192,37 @@ fn insert_open(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let store_fd = asm.alloc_root(CILRoot::StLoc(0, fd));
         let _ = void_ptr;
 
-        // A dedicated try/catch: any throw (FileNotFound etc.) -> errno=ENOENT, ret -1.
-        // (open is the floor's ENOENT proof; the generic SocketException map does
-        // not apply to file faults, which all surface as ENOENT/EACCES — here we
-        // coarsely map to ENOENT, the documented file-side leak.)
+        // A dedicated try/catch: any throw -> errno via the rich fs mapper
+        // (`rcl_errno_from_exception`: FileNotFound→ENOENT,
+        // UnauthorizedAccess→EACCES, PathTooLong→ENAMETOOLONG, …), ret -1. This is
+        // the libc `open()` face used by `-sys`/mio consumers; routing through the
+        // shared mapper (instead of the old blind ENOENT) gives them the same
+        // errno fidelity the std `File::open` arm gets.
         open_errno_wrapped(asm, vec![store_path, store_stream, store_fd])
     };
     patcher.insert(name, Box::new(generator));
 }
 
-/// A specialized errno wrapper for `open`: catch-all → errno=ENOENT, ret -1.
-/// Block 0 try { body; leave -> 2 }; catch { errno=ENOENT; result=-1; leave->2 };
-/// block 2 ret result.
+/// A specialized errno wrapper for `open`: catch-all → errno via the rich fs
+/// mapper (`rcl_errno_from_exception`), ret -1. Block 0 try { body; leave -> 2 };
+/// catch { errno = rcl_errno_from_exception(GetException); result=-1; leave->2 };
+/// block 2 ret result. PAL-fidelity: the catch used to set ENOENT blindly; it now
+/// routes through the shared exception→errno map so the libc `open()` face gets
+/// FileNotFound→ENOENT / UnauthorizedAccess→EACCES / PathTooLong→ENAMETOOLONG.
 fn open_errno_wrapped(asm: &mut Assembly, mut body: Vec<Interned<CILRoot>>) -> MethodImpl {
     let leave_ok = asm.alloc_root(CILRoot::ExitSpecialRegion { target: 2, source: 0 });
     body.push(leave_ok);
-    // catch (block 1): errno = ENOENT; result(local0) = -1; leave -> 2.
-    let set_enoent = set_errno(asm, ENOENT);
+    // catch (block 1): errno = rcl_errno_from_exception(GetException);
+    //                  result(local0) = -1; leave -> 2.
+    let get_exn = asm.alloc_node(CILNode::GetException);
+    let mapper = main_static(
+        asm,
+        "rcl_errno_from_exception",
+        &[Type::PlatformObject],
+        Type::Int(Int::I32),
+    );
+    let mapped = asm.alloc_node(CILNode::call(mapper, [get_exn]));
+    let set_enoent = set_errno_node(asm, mapped);
     let minus1 = asm.alloc_node(Const::I32(-1));
     let store_m1 = asm.alloc_root(CILRoot::StLoc(0, minus1));
     let leave_catch = asm.alloc_root(CILRoot::ExitSpecialRegion { target: 2, source: 1 });

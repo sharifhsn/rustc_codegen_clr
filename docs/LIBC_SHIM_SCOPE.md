@@ -141,7 +141,7 @@ Phase-4 WF-fs, commit `461d38a`).
 |---|---|---|---|
 | `open`/`openat`/`creat`, `close`, `read`/`write` (+`pread`/`pwrite`/`lseek` as compositions), `fsync`/`fdatasync`, `mkdir`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`, `access(F_OK)`, `opendir`/`readdir`/`closedir` | **CLEAN** | `new FileStream((FileMode)…,(FileAccess)…)`, `Dispose`, `Read`/`Write`, `Flush`, `Directory.CreateDirectory`/`Delete`, `File.Delete`/`Move`, `File.Exists`, `Directory.GetFileSystemEntries` (per-index) | `rcl_dotnet_fs_{open,close,read,write,seek,flush,mkdir,rmdir,unlink,rename,exists,readdir_*}` — **all exist** |
 | `ftruncate`/`truncate`, `getcwd`, `chdir`, `realpath`/`canonicalize`, `symlink`/`readlink` | **CLEAN** (small new hooks) | `FileStream.SetLength`; `Directory.GetCurrentDirectory`/`SetCurrentDirectory`; `Path.GetFullPath`; `File.CreateSymbolicLink`/`ResolveLinkTarget` (NET6+) | **new** thin hooks |
-| `stat`/`fstat`/`lstat` (rich struct), `chmod`/`access(R/W/X)` | **LEAKY** | `FileInfo`: `Length`/`LastWriteTimeUtc`/`LastAccessTimeUtc`/`Attributes`→`S_IFDIR/S_IFREG/S_IFLNK`; `File.{Get,Set}UnixFileMode` (NET7+, **Unix-host only**; Windows-host→single ReadOnly bit). **.NET ctime=creation ≠ POSIX ctime=inode-change.** Current `rcl_dotnet_fs_stat` returns only `(size,is_dir)` → need a **wide stat** writing each scalar via `StInd` (no managed struct from IR — §3) | partial |
+| `stat`/`fstat`/`lstat` (rich struct), `chmod`/`access(R/W/X)` | **LEAKY (mostly CLOSED)** | `FileInfo`: `Length`/`LastWriteTimeUtc`/`LastAccessTimeUtc`/`Attributes`→`S_IFDIR/S_IFREG/S_IFLNK`; `File.{Get,Set}UnixFileMode` (NET7+, **Unix-host only**; Windows-host→single ReadOnly bit). **.NET ctime=creation ≠ POSIX ctime=inode-change.** ✅ **CLOSED (B2 Piece 2/4):** `rcl_dotnet_fs_stat` is now the **wide 8-arg** stat — `(size, is_dir, mtime, atime, ctime, is_symlink)` each written via `StInd` (mtime/atime via `File.GetLast{Write,Access}TimeUtc`, ctime via `GetCreationTimeUtc` [creation, NOT inode-change — honest mismatch], is_symlink via `FileAttributes.ReparsePoint`). `std::fs` `modified()`/`accessed()`/`created()`/`file_type().is_symlink()` are all real. Remaining-leaky: `chmod`/`access(R/W/X)` mode bits (synthesized 0o644 on the PAL; Unix-host-best-effort only) | mostly done |
 | `mkstemp`, `fdatasync` durability, `d_type`/`d_ino`, mkdir EEXIST semantics | **LEAKY** | `Path.GetTempFileName`+open (O_EXCL atomicity weakened); `Flush(true)` over-syncs; `DT_UNKNOWN` (spec-legal) or extra stat; shim must pre-check `Directory.Exists` for EEXIST | — |
 | `st_ino`/`st_dev`/`st_nlink`/`st_blocks`, `link` (hard), `chown`, `umask` (kernel), `statvfs` inode counts, exotic `O_*` (`O_DIRECT`/`O_SYNC`/`O_TMPFILE`), real ctime | **IMPOSSIBLE** | no portable managed source of truth; `link` needs P/Invoke (breaks pure-BCL); `statvfs` space fields *are* derivable from `DriveInfo` (leaky-clean) but inode fields are not | — |
 
@@ -252,6 +252,35 @@ approximate — curate the ~20 errnos crates actually branch on, default `EIO`. 
 single biggest net-new piece (~3–5 days) and the main honesty caveat of the whole tier.
 `EINTR`-never-fires is actually *fine*: `is_interrupted` stays false and `nanosleep` loops
 just never loop.
+
+**UPDATE (PAL-fidelity pass — partially CLOSED).** The fs-side exception→errno map is now
+enriched and wired through the std `std::fs` arm:
+- `rcl_errno_from_exception` (`cilly/src/ir/builtins/posix.rs`) gained `isinst` arms
+  `FileNotFoundException`→`ENOENT`, `DirectoryNotFoundException`→`ENOENT`,
+  `UnauthorizedAccessException`→`EACCES`, `PathTooLongException`→`ENAMETOOLONG`, tested
+  **before** the general `IOException` tail (which still defaults to `EIO` — the honest
+  remainder). New `ClassRef` helpers in `cilly/src/ir/class.rs`.
+- The mutating fs hooks `rcl_dotnet_fs_{mkdir,rmdir,unlink,rename}` are now wrapped in
+  `errno_wrapped` (set `errno`, return `-1` on a managed fault instead of unwinding);
+  `rcl_dotnet_fs_open` catches itself and returns **null** (it returns a pointer, so it
+  cannot use the `-1` wrapper). The std arm constructs errors with
+  `io::Error::last_os_error()` (`rc()`, `File::open` in `dotnet_pal/sys/fs/dotnet.rs`), so
+  callers now see precise `ErrorKind::{NotFound, PermissionDenied, …}` instead of
+  `Uncategorized`/`Other`. The libc `open()` face (`open_errno_wrapped`) routes through the
+  same rich mapper instead of its old blind `ENOENT`.
+- HOST CAVEAT: the *mapping* (exception type → errno) is **host-agnostic** (the BCL throws the
+  same types on Unix-host and Windows-host CoreCLR). The *meaning* of `EACCES` /
+  `PermissionDenied` is **Unix-host-best-effort** only: a Windows-host CoreCLR has a single
+  ReadOnly bit and throws `UnauthorizedAccessException` for ACL denials too, with no rwx/uid/gid
+  model. `FilePermissions` mode bits stay synthesized (0o644) on the dotnet PAL, so a
+  `set_permissions(0o000)` denial cannot be reproduced there — the `pal_fsmeta` probe gates
+  that case to a real Unix host and SKIPs it honestly on the PAL.
+- STILL OPEN (honest remainder): the general `IOException`/HResult tail still defaults to
+  `EIO` (Windows-flavored HResults even on Unix CoreCLR make `EEXIST`/`EBUSY` HResult-sniffing
+  leaky — better delivered by std-side pre-checks than guessed here). `EINTR` never fires.
+  Proof: `cargo_tests/pal_fsmeta` (cases 7–9: `metadata`/`File::open`/`remove_file` of a
+  missing path → `NotFound`, with `File::open`→`NotFound` being the headline; was `Other`
+  pre-fix) + `cargo_tests/pal_libc` (libc `open(missing)` → `errno==ENOENT`).
 
 ### 3.3 The no-IList constraint → per-fd `Socket.Poll` loops
 The backend IR **cannot construct a managed array / `IList<T>`** from Rust. This drives three
