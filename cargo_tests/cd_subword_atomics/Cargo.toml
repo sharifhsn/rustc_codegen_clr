@@ -1,0 +1,26 @@
+# Regression: sub-word (u8/i8/u16/i16/bool) atomic compare_exchange / swap on .NET 8
+# (the masked-32-bit-CAS emulation path).
+#
+# The emulated `atomic_cmpxchng{8,16}_correct` / `atomic_xchng{8,16}_correct` builtins
+# (cilly/src/ir/builtins/atomics.rs) declared their loc 0 — the containing-word ADDRESS
+# that is passed as the `int32&` argument of `Interlocked.CompareExchange(int32&,…)` — as
+# a plain `int32` local instead of a pointer (`int32*`). A plain-`int32` loaded onto the
+# stack is not a (un)managed pointer, so the JIT rejected the helper the instant it ran:
+#   System.InvalidProgramException: Common Language Runtime detected an invalid program.
+#      at MainModule.atomic_cmpxchng8_correct(Byte& , Byte , Byte )
+# This crashed ANY program doing an 8/16-bit atomic CAS or swap — including, transitively,
+# `std::panic::catch_unwind` (the panic-count machinery does a `compare_exchange` on a
+# static `Atomic<u8>`). Fix: declare loc 0 as `Type::Ptr(i32)` so `ldloc.0` yields a
+# pointer the runtime accepts for the `int32&` parameter.
+#
+# Known-answer: self-asserting; verify byte-identical to native with the differential oracle.
+#
+#     feasibility/cargo-dotnet run cargo_tests/cd_subword_atomics --release
+[package]
+name = "cd_subword_atomics"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[workspace]

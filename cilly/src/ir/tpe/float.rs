@@ -69,7 +69,9 @@ impl Float {
                 asm.alloc_node(CILNode::call(mref, [val]))
             }
             Float::F64 => {
-                let double = ClassRef::single(asm);
+                // `f64::is_nan` must call `System.Double::IsNaN`, NOT `System.Single::IsNaN`
+                // (copy-paste slip). Calling the f32 method on an f64 arg is a type mismatch.
+                let double = ClassRef::double(asm);
                 let mref = asm.alloc_methodref(MethodRef::new(
                     double,
                     is_nan,

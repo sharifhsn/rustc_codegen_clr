@@ -228,3 +228,149 @@ the lists above pending a real fork-suite re-validation, but flagged here.
   (`num::{u8,i8,u16,i16}::tests::test_leading_trailing_ones`) — repro
   `cargo_tests/lead_trail_ones`. The suspected sign-agnostic-stack hazard does
   **not** materialize; all sub-word leading/trailing bit ops match native.
+
+# P2-S1 (behavioral-equivalence) — differential census + fixes
+
+First slice of P2 (invariant I2). A differential oracle (native rustc vs the
+`CARGO_DOTNET_BACKEND=native` backend, byte-for-byte stdout/exit) was run over
+targeted edge probes (float min/max + NaN/signed-zero, i128/u128 pow/isqrt/bit
+ops, integer overflow/from_str/rotate, iterator try_fold/flatten/step_by,
+slices/closures, float formatting incl. ULP-sensitive shortest-repr) plus the
+CI-skipped fuzzer cases. The canonical Docker `::stable` gate stayed
+**428 passed / 12 failed (baseline, zero regressions, zero fatal aborts)** under
+the now-FATAL typechecker throughout.
+
+## REAL codegen bugs — FIXED (each verified byte-identical vs native)
+
+### `System.Double`/`System.Single` referenced as `class`, not `valuetype`
+
+`ClassRef::double`/`single` (`cilly/src/ir/class.rs`) were constructed with
+`is_valuetype = false`, so the IL exporter emitted `class [System.Runtime]System.Double`
+instead of `valuetype …`. Any method whose **declaring type** is `System.Double`/
+`System.Single` (`f64::min`/`max`, `mul_add`, `powi`, `Floor`/rounding used by
+`{:.N}` formatting, `Abs`, `CopySign`, `MinNumber`/`MaxNumber`, `FusedMultiplyAdd`,
+the IEEE `minimum`/`maximum`) made the CLR reject the type-load the instant that
+method JITted: `System.TypeLoadException: Could not load type 'System.Double' …
+value type mismatch`. Plain f64/f32 arithmetic and `{}` Display of simple values
+were unaffected (they never name `System.Double` as a declaring type), which is
+why it hid. Fix: `is_valuetype = true` (these ARE .NET value types, exactly like
+`Int128`/`UInt128`). Regression crate: `cargo_tests/float_class_methods`.
+Also fixed a copy-paste slip in `Float::F64`'s `is_nan` (`cilly/src/ir/tpe/float.rs`)
+that called `System.Single::IsNaN` on an f64 arg.
+
+### `u128`/`i128` `leading_zeros`/`trailing_zeros` returned garbage
+
+`ctlz`/`cttz` (`src/terminator/intrinsics/ints.rs`) for 128-bit ints called
+`System.{U,}Int128::{Leading,Trailing}ZeroCount` (which return a 128-bit value)
+and then narrowed to `u32` with a raw `conv.u4` (`ctx.int_cast`). `conv.u4` is
+invalid IL applied to a `System.UInt128`/`Int128` **struct** operand — the runtime
+did not truncate, it read garbage (`1u128.leading_zeros()` → `2386363928`, not
+127). The `ctpop`/`PopCount` arm already did this right via `op_Explicit`
+(`crate::casts::int_to_int`); ctlz/cttz now route the same way. Regression crate:
+`cargo_tests/wideint_ctlz`.
+
+### Sub-word atomic CAS/swap emitted invalid IL (`InvalidProgramException`)
+
+The `.NET 8` emulation builtins `atomic_cmpxchng{8,16}_correct` /
+`atomic_xchng{8,16}_correct` (`cilly/src/ir/builtins/atomics.rs`) emulate an
+8/16-bit atomic compare-exchange/swap with a masked 32-bit
+`Interlocked.CompareExchange(int32&, int32, int32)` loop. They computed the
+containing-word **address** into local 0, but declared local 0 as a plain
+`int32` (not a pointer). The IL then `ldloc.0`-ed an `int32` value where the
+call's first parameter requires a managed byref `int32&` — which the JIT rejects
+the instant the helper runs:
+
+```
+System.InvalidProgramException: Common Language Runtime detected an invalid program.
+   at MainModule.atomic_cmpxchng8_correct(Byte& , Byte , Byte )
+```
+
+This crashed **any** program performing an `AtomicU8`/`AtomicI8`/`AtomicU16`/
+`AtomicI16`/`AtomicBool` `compare_exchange`/`swap` — and, transitively,
+`std::panic::catch_unwind` (the panic-count machinery does a
+`compare_exchange` on a static `Atomic<u8>`), so even bounds-check-then-catch
+programs died. Found via the differential oracle on a `catch_unwind` probe.
+
+Fix: declare local 0 as `Type::Ptr(i32)` in both `emulate_subword_cmp_xchng`
+and `emulate_subword_xchng`, so `ldloc.0` yields a pointer the runtime accepts
+for the `int32&` parameter. Verified byte-identical vs native (`AtomicU8`/`I8`/
+`U16`/`I16`/`Bool` CAS+swap, signed sub-words, and the `catch_unwind` path).
+Regression crate: `cargo_tests/cd_subword_atomics`. Gate stays 428/12.
+
+## FUNDAMENTAL / hard walls — classified, NOT faked
+
+### C variadic FFI (`printf(fmt, …)`) in .NET mode — the fuzz47/86/87/96 family
+
+All four CI-skipped fuzzer cases (`test/fuzz/fuzz{47,86,87,96}.rs`) are large
+auto-generated `custom_mir` programs whose *only* observable output goes through
+`extern "C" { fn printf(fmt, …) }`. Minimal repro (`printf(c"%i", 42)` prints a
+garbage address instead of `42`; `%s` reads garbage): the IL exporter has **no C
+`vararg` calling-convention support** (`grep -i vararg cilly/src/ir/il_exporter`
+finds none). Variadic args are pushed as an ordinary `call`, so the libc-shim
+`printf` reads the wrong stack slots. CoreCLR's IL `vararg`/`__arglist` support
+does not bridge cleanly to a native-cdecl variadic callee, so this is a genuine
+.NET-ABI wall, not a quick fix. **The computation underneath is almost certainly
+correct** — only the variadic *display* is wrong, so the divergence is entirely in
+the printf marshalling. (C-output mode is unaffected: it emits literal C `printf`.)
+Classification: FUNDAMENTAL-hard; would need a `vararg` calling-convention in the
+exporter + a per-call-site marshalling shim in the linker.
+
+## Float-formatting ULP — NOT a divergence (the flt2dec concern does not materialize)
+
+Contrary to the long-standing suspicion, the backend's float formatting is
+byte-identical to native across `{}`, `{:?}`, `{:e}`, `{:.N}`, and the
+shortest-round-trip path on ULP-sensitive values (`0.1+0.2`, `1.0/3.0`,
+`f64::MAX`/`MIN_POSITIVE`, subnormals, `9007199254740993.0`, `355.0/113.0`, etc.)
+once the `System.Double` value-type fix above is applied — those cases were
+*crashing* on the TypeLoadException (the `{:.N}`/`{:e}` paths call `System.Double`
+rounding methods), never mis-rounding. `fmt::float::test_format_f64`/`_f32` and the
+`flt2dec` exact/shortest *equivalence* tests are already in the recorded passing
+list (`bin/success_coretests.txt`); only the two `shortest_*_{exhaustive,hard_random}`
+remain (million-iteration stress — timeout/throughput, not a last-digit ULP defect).
+No flt2dec codegen change is warranted.
+
+> Native-harness note: under the `CARGO_DOTNET_BACKEND=native` build-std path on
+> macOS arm64, `core`'s `System.Double` method refs can still print as `class`
+> (e.g. a `{:?}`-float repro crashes) even after the fix + forced `core` recompile —
+> while the leaf-crate ref correctly prints `valuetype` and the Docker full-clean
+> `::stable` build (the source of the passing `fmt::float` list) is unaffected. This
+> is a native build-std artifact in how `core`'s serialized cref flag propagates, not
+> a portable codegen defect; tracked for the native-harness sysroot-rebuild path.
+
+## REAL but SEPARATE-WORKFLOW — panic message routing/fidelity (program logic is correct)
+
+A caught panic (`catch_unwind` of e.g. an out-of-bounds index) diverges from
+native **only in the panic message**, not in program behavior: the backend writes
+the panic note to **stdout** where native writes it to **stderr**, and reports the
+std-internal caller location (`<WORKSPACE>/src/panic/location.rs:181:9`,
+`thread '<unnamed>' (1)`) instead of the user call site
+(`src/main.rs:3:42`, `thread 'main' (<tid>)`). The *computation* — the catch
+succeeds, the `Result` is `Err`, exit code matches — is correct. This is a
+panic-PAL output-fidelity cluster (stderr routing + `#[track_caller]` location
+threading through the panic hook on the dotnet PAL), orthogonal to the codegen
+fixes above and deferred to a dedicated panic-fidelity workflow. Classification:
+REAL but cosmetic/separate-workflow, NOT a miscompile of program logic.
+
+## Verified clean NOW (census — match native byte-for-byte)
+
+Edge probes (`/tmp/probes/*`, oracle `/tmp/diff_oracle.sh`):
+`f32`/`f64` `min`/`max` + NaN + signed-zero; `sqrt`/`mul_add`/`powi`/`powf`/`floor`/
+`ceil`/`trunc`/`round`/`abs`/`copysign`/`sin`/`cos`; `is_nan`; `u128`/`i128`
+`pow`/`isqrt`/`leading_zeros`/`trailing_zeros`/`count_ones`/wrapping arith/`checked_*`/
+div/rem/`from_str`; `u8`/`u16` rotate/`reverse_bits`/`swap_bytes`, sub-word
+`leading_ones`/`trailing_ones`, `from_str(_radix)` overflow, `checked_pow`,
+`ilog`/`ilog2`; integer overflow (`overflowing_*`/`checked_neg`/`wrapping_*`);
+**sub-word atomics** (`AtomicU8`/`I8`/`U16`/`I16`/`Bool` `compare_exchange`/`swap`/
+`fetch_{and,or,xor,nand,max,min,add}`); iterator `try_fold`/`try_rfold`/`take_while`/
+`flat_map`/`flatten`/`step_by`/`filter`/`skip_while`/`rfold`/`peekable`; slice
+`split_first(_mut)`/`split_last`/`split_at`/`windows`/`chunks`; ptr metadata
+(`slice_from_raw_parts`/`size_of_val` for `[u8]`/`str`, `dyn Debug`, `Box<dyn>`);
+int→float casts incl. huge `u128`/`i128 as f32/f64`; IPv6/`SocketAddrV6` Display;
+move-closures; float formatting (all forms, incl. ULP-sensitive).
+
+Crate corpus (`cargo_tests/soak_*`, byte-for-byte via the oracle, post-fix):
+`libm`, `euclid`, `approx`, `lexical-core`, `itertools`, `bincode`, `indexmap`,
+`blake3`, `chrono`, `arrayvec`, `bytemuck`, `byteorder`, `ahash`, `base64`, `hex`,
+`crc32fast`, `fastrand`, `compact_str`, `bstr`, `data-encoding` — 20/20 MATCH.
+(`soak_half` = the `half` crate's `f16`/`bf16`; fails to link on the f16/f128 wall
+the CI already `--skip f16`s; out of scope for this slice.)

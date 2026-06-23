@@ -94,6 +94,10 @@ pub fn emulate_subword_xchng(asm: &mut Assembly, patcher: &mut MissingMethodPatc
     let generator = move |_, asm: &mut Assembly| {
         // locals: 0 = word_addr (i32*), 1 = shift (i32), 2 = observed_word (i32), 3 = prev (i32)
         let i32_t = asm.alloc_type(Type::Int(Int::I32));
+        // Loc 0 is the `int32&` argument of `Interlocked.CompareExchange` — declare it as a
+        // pointer (`int32*`), not `int32`, or the JIT rejects the call (`InvalidProgramException`,
+        // StackUnexpected). See the matching note in `emulate_subword_cmp_xchng`.
+        let i32_ptr_t = asm.alloc_type(Type::Ptr(i32_t));
         // --- bb0: containing-word address + sub-word bit shift. ---
         let addr_ref = asm.alloc_node(CILNode::LdArg(0));
         let addr_ptr = asm.alloc_node(CILNode::RefToPtr(addr_ref));
@@ -191,7 +195,12 @@ pub fn emulate_subword_xchng(asm: &mut Assembly, patcher: &mut MissingMethodPatc
                 BasicBlock::new(bb1, 1, None),
                 BasicBlock::new(bb2, 2, None),
             ],
-            locals: vec![(None, i32_t), (None, i32_t), (None, i32_t), (None, i32_t)],
+            locals: vec![
+                (None, i32_ptr_t),
+                (None, i32_t),
+                (None, i32_t),
+                (None, i32_t),
+            ],
         }
     };
     patcher.insert(name, Box::new(generator));
@@ -224,6 +233,13 @@ pub fn emulate_subword_cmp_xchng(asm: &mut Assembly, patcher: &mut MissingMethod
     let generator = move |_, asm: &mut Assembly| {
         // locals: 0 = word_addr (i32*), 1 = shift (i32), 2 = observed_word (i32), 3 = observed_sub (i32)
         let i32_t = asm.alloc_type(Type::Int(Int::I32));
+        // Loc 0 holds the containing-word ADDRESS and is passed as the `int32&` argument of
+        // `Interlocked.CompareExchange(int32&,int32,int32)`. It MUST be declared as a pointer
+        // (`int32*`), not `int32`: a plain-`int32` local loaded onto the stack is NOT a
+        // managed/unmanaged pointer, so the JIT rejects the call with
+        // `InvalidProgramException` (StackUnexpected: int32 where int32& expected). With the
+        // local typed `int32*`, `ldloc.0` yields a pointer the runtime accepts for `int32&`.
+        let i32_ptr_t = asm.alloc_type(Type::Ptr(i32_t));
         // --- bb0: compute the containing-word address and the sub-word bit shift. ---
         let addr_ref = asm.alloc_node(CILNode::LdArg(0));
         let addr_ptr = asm.alloc_node(CILNode::RefToPtr(addr_ref));
@@ -353,7 +369,7 @@ pub fn emulate_subword_cmp_xchng(asm: &mut Assembly, patcher: &mut MissingMethod
                 BasicBlock::new(bb3, 3, None),
             ],
             locals: vec![
-                (None, i32_t),
+                (None, i32_ptr_t),
                 (None, i32_t),
                 (None, i32_t),
                 (None, i32_t),

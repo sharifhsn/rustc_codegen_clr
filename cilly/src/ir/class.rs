@@ -100,13 +100,18 @@ impl ClassRef {
     pub fn double(asm: &mut Assembly) -> Interned<ClassRef> {
         let name = asm.alloc_string("System.Double");
         let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, vec![].into()))
+        // `System.Double` is a .NET value type. It MUST be referenced as `valuetype`
+        // (not `class`) in IL, or any call whose declaring type is `System.Double`
+        // (e.g. `MinNumber`/`MaxNumber`/`Max`/`Min`/`FusedMultiplyAdd`/`Pow`) makes the
+        // runtime reject the type-load with `TypeLoadException: ... value type mismatch`.
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, vec![].into()))
     }
     /// Retusn a reference to the class `System.Single`
     pub fn single(asm: &mut Assembly) -> Interned<ClassRef> {
         let name = asm.alloc_string("System.Single");
         let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, vec![].into()))
+        // `System.Single` is a .NET value type — see `double` above.
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, vec![].into()))
     }
     /// Returns a reference to the class `System.MathF`
     #[must_use]

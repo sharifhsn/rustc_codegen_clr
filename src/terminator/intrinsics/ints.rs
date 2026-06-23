@@ -157,7 +157,12 @@ pub fn ctlz<'tcx>(
             let mref = ctx.alloc_methodref(mref);
             let arg = handle_operand(&args[0].node, ctx);
             let call = ctx.call(mref, &[arg], IsPure::NOT);
-            let value = ctx.int_cast(call, Int::U32, ExtendKind::ZeroExtend);
+            // `LeadingZeroCount` returns a 128-bit value (`System.Int128`), so the narrowing to
+            // u32 must go through the BCL `op_Explicit` operator (`int_to_int`), NOT a raw
+            // `conv.u4` (`int_cast`) — the latter is invalid IL on a 128-bit struct operand and
+            // yields garbage. (Mirrors the `ctpop`/`PopCount` arms.)
+            let value =
+                crate::casts::int_to_int(Type::Int(Int::I128), Type::Int(Int::U32), call, ctx);
             return place_set(destination, value, ctx);
         }
         Type::Int(Int::U128) => {
@@ -171,7 +176,8 @@ pub fn ctlz<'tcx>(
             let mref = ctx.alloc_methodref(mref);
             let arg = handle_operand(&args[0].node, ctx);
             let call = ctx.call(mref, &[arg], IsPure::NOT);
-            let value = ctx.int_cast(call, Int::U32, ExtendKind::ZeroExtend);
+            let value =
+                crate::casts::int_to_int(Type::Int(Int::U128), Type::Int(Int::U32), call, ctx);
             return place_set(destination, value, ctx);
         }
         _ => todo!("Can't `ctlz`  type {tpe:?} yet!"),
@@ -330,7 +336,10 @@ pub fn cttz<'tcx>(
             let mref = ctx.alloc_methodref(mref);
             let arg = handle_operand(&args[0].node, ctx);
             let call = ctx.call(mref, &[arg], IsPure::NOT);
-            let value_calc = ctx.int_cast(call, Int::U32, ExtendKind::ZeroExtend);
+            // 128-bit -> u32 must go through `op_Explicit` (`int_to_int`), not a raw `conv.u4`
+            // (`int_cast`), which is invalid IL on a 128-bit struct and yields garbage.
+            let value_calc =
+                crate::casts::int_to_int(Type::Int(Int::I128), Type::Int(Int::U32), call, ctx);
             place_set(destination, value_calc, ctx)
         }
         Type::Int(Int::U128) => {
@@ -344,7 +353,8 @@ pub fn cttz<'tcx>(
             let mref = ctx.alloc_methodref(mref);
             let arg = handle_operand(&args[0].node, ctx);
             let call = ctx.call(mref, &[arg], IsPure::NOT);
-            let value_calc = ctx.int_cast(call, Int::U32, ExtendKind::ZeroExtend);
+            let value_calc =
+                crate::casts::int_to_int(Type::Int(Int::U128), Type::Int(Int::U32), call, ctx);
             place_set(destination, value_calc, ctx)
         }
         _ => {
