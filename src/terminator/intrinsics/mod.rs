@@ -996,6 +996,41 @@ pub fn handle_intrinsic<'tcx>(
             let value = ctx.call(eq, &[val], IsPure::NOT);
             vec![place_set(destination, value, ctx)]
         }
+        // SIMD-tail unary `(vec) -> vec` ops. Each maps 1:1 to a per-lane builtin of the same name
+        // (`cilly/src/ir/builtins/simd/tail.rs`): per-lane integer bit ops and float rounders.
+        "simd_ctlz" | "simd_cttz" | "simd_ctpop" | "simd_bswap" | "simd_bitreverse"
+        | "simd_fsqrt" | "simd_floor" | "simd_ceil" | "simd_trunc" | "simd_round"
+        | "simd_round_ties_even" => {
+            let vec = ctx.type_from_cache(
+                call_instance.args[0]
+                    .as_type()
+                    .expect("simd unary works only on types!"),
+            );
+            let val = handle_operand(&args[0].node, ctx);
+            let name = ctx.alloc_string(fn_name);
+            let main_module = ctx.main_module();
+            let main_module = ctx[*main_module].clone();
+            let op = main_module.static_mref(&[vec], vec, name, ctx);
+            let value = ctx.call(op, &[val], IsPure::NOT);
+            vec![place_set(destination, value, ctx)]
+        }
+        // SIMD fused multiply-add `(vec, vec, vec) -> vec`, single-rounding, per-lane builtin.
+        "simd_fma" | "simd_relaxed_fma" => {
+            let vec = ctx.type_from_cache(
+                call_instance.args[0]
+                    .as_type()
+                    .expect("simd_fma works only on types!"),
+            );
+            let x = handle_operand(&args[0].node, ctx);
+            let y = handle_operand(&args[1].node, ctx);
+            let z = handle_operand(&args[2].node, ctx);
+            let name = ctx.alloc_string(fn_name);
+            let main_module = ctx.main_module();
+            let main_module = ctx[*main_module].clone();
+            let op = main_module.static_mref(&[vec, vec, vec], vec, name, ctx);
+            let value = ctx.call(op, &[x, y, z], IsPure::NOT);
+            vec![place_set(destination, value, ctx)]
+        }
         "simd_shuffle" => {
             let t_type = ctx.type_from_cache(
                 call_instance.args[0]
@@ -1210,6 +1245,16 @@ pub fn handle_intrinsic<'tcx>(
             let op = main_module.static_mref(&[vec], scalar, name, ctx);
             let value = ctx.call(op, &[x], IsPure::NOT);
             vec![place_set(destination, value, ctx)]
+        }
+        // SIMD WALLS — intrinsics with no clean BCL `Vector` primitive (gather/scatter walk a vector
+        // of raw pointers per lane; masked_load/store add a const ALIGN generic on top of that;
+        // funnel shifts are out of the current target list). These are left as explicit walls so the
+        // failure mode is a clear message rather than a confusing generic-call fall-through. The safe
+        // path when wiring them later is the per-lane spill-and-index builtin (see
+        // `cilly/src/ir/builtins/simd/tail.rs`).
+        "simd_gather" | "simd_scatter" | "simd_masked_load" | "simd_masked_store"
+        | "simd_funnel_shl" | "simd_funnel_shr" => {
+            todo!("SIMD intrinsic `{fn_name}` is not yet supported (no clean BCL Vector primitive; wire per-lane in cilly/src/ir/builtins/simd/tail.rs)")
         }
         _ => intrinsic_slow(fn_name, args, destination, ctx, call_instance, span),
     }

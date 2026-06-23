@@ -270,6 +270,10 @@ pub(super) fn register_value_lane_ops(asm: &mut Assembly, patcher: &mut MissingM
     simd_reduce("simd_reduce_xor", ReduceKind::Xor, false, asm, patcher);
     simd_reduce("simd_reduce_min", ReduceKind::Min, false, asm, patcher);
     simd_reduce("simd_reduce_max", ReduceKind::Max, false, asm, patcher);
+    // The SIMD "tail": `simd_shuffle`, per-lane integer bit ops (ctlz/cttz/ctpop/bswap/bitreverse),
+    // float rounders (sqrt/floor/ceil/trunc/round/round_ties_even), and fma. All target-agnostic
+    // per-lane bodies, so they serve both the .NET and C builtin sets.
+    super::tail::register_tail_ops(asm, patcher);
 }
 
 /// `simd_select<M, T>(mask: M, if_true: T, if_false: T) -> T`: per-lane

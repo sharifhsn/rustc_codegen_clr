@@ -6,6 +6,7 @@ mod eq;
 use eq::*;
 mod binop;
 use binop::*;
+mod tail;
 fn dotnet_vec_cast(
     src: Interned<CILNode>,
     src_type: SIMDVector,
@@ -141,19 +142,8 @@ fn simd_abs(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     };
     patcher.insert(name, Box::new(generator));
 }
-// WIP: `simd_shuffle` is a `todo!()` stub, not yet registered with the patcher.
-#[allow(dead_code)]
-fn simd_shuffle(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    let name = asm.alloc_string("simd_shuffle");
-    let generator = move |_mref: Interned<MethodRef>, _asm: &mut Assembly| {
-        todo!("simd_shuffle not supported yet!");
-        /*MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![], 0, None)],
-            locals: vec![],
-        }*/
-    };
-    patcher.insert(name, Box::new(generator));
-}
+// `simd_shuffle` and the rest of the SIMD tail (per-lane ctlz/cttz/ctpop/bswap/bitreverse, the float
+// rounders, and fma) live in `tail.rs` and are registered through `register_value_lane_ops`.
 fn simd_vec_from_val(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("simd_vec_from_val");
     let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {

@@ -141,5 +141,10 @@ throughput vs C# is not where this backend competes today.
   fallbacks. `cargo_tests/intr_bits` green; Docker gate 426/12.
 - **Benchmark** — DONE, commit `a9d8a6d`. See *Performance findings* above.
 - **WF-OPT (optimizer)** — PARKED (negative result, nothing committed). See *Performance findings*.
-- WF-B / WF-C / WF-D / WF-E / WF-G / WF-F — not started.
-- Branch `gaps-campaign` (off `main` = pushed Tier-2 state); not pushed.
+- **WF-B (SIMD tail)** — DONE. 14 ops wired via per-lane spill-and-index (`simd_shuffle`,
+  `ctpop`/`ctlz`/`cttz`/`bswap`/`bitreverse`, `fsqrt`/`floor`/`ceil`/`trunc`/`round`/`round_ties_even`,
+  `fma`/`relaxed_fma`); walls (`gather`/`scatter`/`masked_*`/`funnel_*`) left as explicit `todo!`.
+  `cargo_tests/simd_tail` 18/18 on real .NET; Docker gate 426/12. Float `reduce_min`/`reduce_max` left
+  unwired — blocked by a pre-existing, orthogonal `f32::min` `TypeLoadException`, not this change.
+- WF-C / WF-D / WF-E / WF-G / WF-F — not started.
+- Branch `gaps-campaign` (off `main` = pushed Tier-2 state); pushed to `mine/gaps-campaign`.
