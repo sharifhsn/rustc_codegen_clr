@@ -56,12 +56,21 @@ impl ILExporter {
             // public-key tokens are version-INVARIANT (verified identical on 8 and 9), and mscorlib
             // keeps its legacy 4:0:0:0. Single source: `DotnetVersion::assembly_ver`.
             let dv_ver = crate::ir::dotnet_version().assembly_ver();
-            for ext in asm.external_assembly_names() {
-                let (ver, token) = match ext.as_str() {
-                    "System.Private.CoreLib" => (dv_ver, "7C EC 85 D7 BE A7 79 8E"),
-                    "mscorlib" => ("4:0:0:0", "B7 7A 5C 56 19 34 E0 89"),
-                    _ => (dv_ver, "B0 3F 5F 7F 11 D5 0A 3A"),
-                };
+            // Normalize each extern name to its public REFERENCE assembly (CoreLib/mscorlib ->
+            // System.Runtime) BEFORE stamping, and de-dup so a CoreLib entry collapses into the
+            // single `System.Runtime` extern instead of emitting both a phantom CoreLib header and
+            // System.Runtime. Only the C#-visible METADATA is normalized (this extern table + the
+            // base-type `extends` clause via `simple_class_ref`); method-body instruction operands
+            // keep the impl-assembly name — `call instance [System.Runtime]System.String::m` is
+            // "Bad IL format" on a real CoreLib String (see mycorrhiza/src/system/mod.rs), and a
+            // C# compiler never reads method bodies anyway.
+            let raw = asm.external_assembly_names();
+            let mut externs: Vec<&str> = raw.iter().map(|e| ref_assembly_name(e)).collect();
+            externs.sort();
+            externs.dedup();
+            for ext in externs {
+                // CoreLib/mscorlib are now normalized to System.Runtime, so they fall through to `_`.
+                let (ver, token) = (dv_ver, "B0 3F 5F 7F 11 D5 0A 3A");
                 writeln!(
                     out,
                     ".assembly extern '{ext}' {{ .ver {ver} .publickeytoken = ({token}) }}"
@@ -1389,11 +1398,28 @@ fn dotnet_class_name(name: &str) -> std::borrow::Cow<'_, str> {
     }
     std::borrow::Cow::Owned(format!("{}__h{hash:016x}", &name[..head_end]))
 }
+/// Map an IMPLEMENTATION-assembly name to the public REFERENCE assembly a C# compiler resolves
+/// against: `System.Object`/`ValueType`/`String`/`Exception` physically live in
+/// `System.Private.CoreLib` but are type-forwarded from `System.Runtime`. A separately-compiled C#
+/// project only references the ref assembly, so any CoreLib name in the C#-VISIBLE METADATA — the
+/// `.assembly extern` table and base-type `extends` clauses — fails to resolve with CS0012.
+///
+/// Applied to METADATA ONLY, never to method-body instruction operands. A
+/// `call instance [System.Runtime]System.String::method` is JIT-rejected as "Bad IL format" on a
+/// real CoreLib String (see `mycorrhiza/src/system/mod.rs`), so declaring-type refs inside
+/// instruction bodies (`class_ref`) keep the impl-assembly name; the runtime resolves the
+/// type-forward fine, and a C# compiler never reads method bodies.
+fn ref_assembly_name(name: &str) -> &str {
+    match name {
+        "System.Private.CoreLib" | "mscorlib" => "System.Runtime",
+        other => other,
+    }
+}
 fn simple_class_ref(cref: Interned<ClassRef>, asm: &Assembly) -> String {
     let cref = asm.class_ref(cref);
     let name = dotnet_class_name(&asm[cref.name()]);
     if let Some(assembly) = cref.asm() {
-        format!("[{assembly}]'{name}'", assembly = &asm[assembly])
+        format!("[{assembly}]'{name}'", assembly = ref_assembly_name(&asm[assembly]))
     } else {
         format!("'{name}'")
     }
@@ -1425,6 +1451,10 @@ pub(crate) fn class_ref(cref: Interned<ClassRef>, asm: &Assembly) -> String {
         format!("`{}", cref.generics().len())
     };
     if let Some(assembly) = cref.asm() {
+        // Declaring-type position inside method-body instructions (call/callvirt/ldfld/ldobj/...).
+        // Keep the IMPL-assembly name verbatim: a `call instance [System.Runtime]System.String::m`
+        // is "Bad IL format" on a real CoreLib String. C# never reads bodies, so the CS0012 fix is
+        // confined to metadata (`ref_assembly_name` is applied in `simple_class_ref`/extern table).
         format!(
             "{prefix} [{assembly}]'{name}{generic_postfix}'{generic_list}",
             assembly = &asm[assembly]

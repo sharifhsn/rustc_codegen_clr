@@ -244,20 +244,28 @@ references it and asserts results match Rust. Worked example: `cargo_tests/cd_in
 synthesized ctor/getters, `point_sum`/`make_point`), and an inbound slice/`Vec` sum (`sum_slice`). The
 make-or-break assumption held: an I/O-free, panic-free `cdylib` has no entrypoint, so `lang_start` /
 weak-static runtime tail is unreachable and DCE'd — the lib emits cleanly pulling only CoreLib extern
-refs. **Tier 2 (surrogate-only, not yet through this real-PAL flow):** returning a managed
-`System.String` directly (`mycorrhiza::system::MString`/`greet_managed`) and a Rust-raises-a-.NET-
-exception `Result` (`rustc_clr_interop_throw`/`try_div`) — both pull `mycorrhiza` + the throw intrinsic.
-**Finding (real-PAL Tier-2 blocker):** pushing these through the real `cargo dotnet` flow showed the
+refs. **Tier 2 — NOW WORKS on the real PAL:** returning a managed `System.String` directly
+(`mycorrhiza::system::MString`/`greet_managed`) and a Rust-raises-a-.NET-exception `Result`
+(`rustc_clr_interop_throw`/`try_div`) — both pull `mycorrhiza` + the throw intrinsic. Worked example:
+`cargo_tests/cd_interop_tier2/` (`rustlib/` + `csharp/`); a real C# project compiles against the
+produced `.dll` and runs it: `greet_managed` returns a `System.String`, `try_div` raises a `.NET`
+exception C# `catch`es. **The blocker was a ref-vs-impl assembly split (CS0012), now fixed:** the
 *rustlib emits cleanly* (an I/O-free `cdylib` with `MString`/throw builds + DCE-clean on the dotnet PAL
-— the feared runtime-tail drag does NOT happen), **but the produced `.dll` is not C#-consumable**: the
-`mycorrhiza` intrinsics (`MString` → `System.Private.CoreLib`'s `String`; the throw → `System.Exception`)
-attribute the assembly's base types to `System.Private.CoreLib`, so a standard C# project fails with
-`CS0012` ("`Object`/`ValueType` defined in `System.Private.CoreLib`, not referenced") on *every* call —
-and referencing `System.Private.CoreLib` directly cascades into `CS0433`/`CS0518` (duplicate predefined
-types vs the `System.Runtime` ref assembly). The fix is backend-level **reference-assembly attribution**
-(emit public base/exception/string identities as the C#-resolvable `System.Runtime`, not the
-implementation `System.Private.CoreLib`) — a focused follow-up, not the pure reuse first assumed. Tier-2
-therefore remains **surrogate-proven only**; the real-PAL path is blocked on this attribution work.
+— the feared runtime-tail drag does NOT happen), but the produced `.dll` *was* not C#-consumable —
+public references to `System.String`/`System.Exception`/base types resolved to the **implementation**
+assembly `System.Private.CoreLib`, which a separately-compiled C# project never references (it sees only
+the **reference** assembly `System.Runtime` of type-forwarders), so a standard C# project failed with
+`CS0012` ("type defined in `System.Private.CoreLib`, not referenced"); referencing
+`System.Private.CoreLib` directly instead cascades into `CS0433`/`CS0518` (duplicate predefined types).
+**Fix (`cilly/src/ir/il_exporter/mod.rs`):** a single `ref_assembly_name()` helper maps
+`System.Private.CoreLib`/`mscorlib` → `System.Runtime`, applied **only to C#-visible metadata** — the
+`.assembly extern` table (normalized + de-duped) and base-type `extends` clauses (`simple_class_ref`).
+Method-body instruction operands (`class_ref`) keep the impl-assembly name: a
+`call instance [System.Runtime]System.String::m` is "Bad IL format" on a real CoreLib String (see
+`mycorrhiza/src/system/mod.rs`), and a C# compiler never reads method bodies — so body emission is
+byte-identical to before, leaving `interop_method_sample` (Rust→.NET String instance methods) and the
+`::stable` exe suite unaffected by construction. Verified native (macOS arm64 / .NET 8) + the Docker
+`::stable` gate (426/12 baseline, no regressions).
 Consumer guide: `docs/INTEROP_CSHARP.md`. Zero backend code changed for J3 — only `feasibility/` shell
 (the `cargo dotnet` lib-artifact branch) + the new probe crate. The enabling backend changes (from WF-7):
 - `#[no_mangle]` → `Access::Extern` (`src/assembly.rs`), making exports **dead-code-elimination roots**

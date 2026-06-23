@@ -1,0 +1,16 @@
+[package]
+name = "cd_interop_tier2"
+edition = "2021"
+version = "0.1.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mycorrhiza = { path = "../../../mycorrhiza" }
+
+# Lives UNDER the repo workspace root -> bare [workspace] so cargo treats it standalone.
+[workspace]
+
+[profile.release.build-override]
+codegen-units = 1
