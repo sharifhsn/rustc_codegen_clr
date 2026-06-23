@@ -382,6 +382,9 @@ pub fn custom_alloc_error_hook(layout: Layout) {
     panic!("memory allocation of {} bytes failed", layout.size());
 }
 
+// Retained as a generic MIR→cilly binop mapper. No longer used since `Assert` overflow lowering
+// switched from the `assert_<op>` surrogate to the native `panic_*_overflow` lang items.
+#[allow(dead_code)]
 fn map_binop(op: &rustc_middle::mir::BinOp) -> cilly::BinOp {
     use rustc_middle::mir::BinOp::*;
     match op {

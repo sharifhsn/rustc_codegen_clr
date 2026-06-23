@@ -30,6 +30,58 @@ fn goto(ctx: &mut MethodCompileCtx<'_, '_>, target: u32) -> Root {
     ctx.alloc_root(CILRoot::Branch(Box::new((target, 0, None))))
 }
 
+/// Emit a call to a `#[lang]`-item panic function (e.g. `panic_bounds_check`), supplying `args`
+/// and — because every such lang item is `#[track_caller]` — the materialized caller `Location`.
+///
+/// This lowers a checked-failure terminator (`Assert`) to the *exact* panic the native Rust
+/// codegen would emit, so the panic message (`"index out of bounds: the len is N but the index is
+/// M"`) and the unwinding behaviour match native. The previous surrogate (`assert_bounds_check`)
+/// discarded the `len`/`index` operands and called an unbodied `abort`, which crashed the program
+/// with "missing method abort" instead of producing the correct, catchable panic.
+fn call_panic_lang_item<'tcx>(
+    lang: rustc_hir::lang_items::LangItem,
+    args: &[Interned<CILNode>],
+    span: rustc_span::Span,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Vec<Root> {
+    let def_id = ctx.tcx().require_lang_item(lang, span);
+    let instance = Instance::expect_resolve(
+        ctx.tcx(),
+        rustc_middle::ty::TypingEnv::fully_monomorphized(),
+        def_id,
+        rustc_middle::ty::List::empty(),
+        span,
+    );
+    let call_info = rustc_codegen_clr_call::CallInfo::sig_from_instance_(instance, ctx);
+    let signature = call_info.sig().clone();
+    let name = function_name(ctx.tcx().symbol_name(instance));
+    let mut call_args: Vec<Interned<CILNode>> = args.to_vec();
+    // The lang item is `#[track_caller]`: rustc appends an implicit `&core::panic::Location` param
+    // that the call site must supply (FnSig ≠ FnAbi). Materialize the real caller location for
+    // this site, exactly as a normal track_caller call does.
+    if call_args.len() < signature.inputs().len() {
+        let caller_loc = ctx.tcx().span_as_caller_location(span);
+        let caller_loc_ty = ctx.tcx().caller_location_ty();
+        let location =
+            rustc_codgen_clr_operand::constant::load_const_value(caller_loc, caller_loc_ty, ctx);
+        call_args.push(location);
+    }
+    let main = ctx.main_module();
+    let site = MethodRef::new(
+        *main,
+        ctx.alloc_string(name),
+        ctx.alloc_sig(signature),
+        MethodKind::Static,
+        vec![].into(),
+    );
+    let site = ctx.alloc_methodref(site);
+    // `panic_*` lang items return `!`; the call diverges. The guard throw is unreachable but keeps
+    // the block well-formed (same pattern as a normal diverging `panic!` call site).
+    let call = ctx.call_root(site, &call_args, IsPure::NOT);
+    let guard = ctx.throw_msg("panic lang item returned!");
+    vec![call, guard]
+}
+
 /// Strip C-style block comments (`/* ... */`) and line comments (`// ...`) from an asm template
 /// piece. Used to recognize comment-only optimization barriers (e.g. `asm!("/* {} */", ...)`),
 /// which carry no real instructions and can be lowered to a no-op. Conservative: an unterminated
@@ -407,6 +459,14 @@ pub fn handle_terminator<'tcx>(
             target,
             unwind: _,
         } => {
+            // `cond` is the "no-panic" condition: when it holds, control continues to `target`;
+            // otherwise the assertion failed and we must panic. Mirror native rustc codegen
+            // (`codegen_assert_terminator`): branch to `target` on the no-panic condition, and on
+            // the failing path call the *exact* panic lang item the native backend would, with the
+            // same operands. This makes the panic message and unwinding match native. The previous
+            // implementation routed every kind through a surrogate `assert_*` builtin that discarded
+            // the operands and called an unbodied `abort`, which crashed the program with
+            // "missing method abort" instead of producing the correct, catchable Rust panic.
             let cond = if *expected {
                 handle_operand(cond, ctx)
             } else {
@@ -414,51 +474,42 @@ pub fn handle_terminator<'tcx>(
                 let e = ctx.alloc_node(*expected);
                 ctx.biop(c, e, BinOp::Eq)
             };
-            // FIXME: propelrly handle *all* assertion messages.
-            let main = ctx.main_module();
-
-            let name = match msg.as_ref() 
-            {
-                AssertKind::InvalidEnumConstruction(_)=>{
-               
-                    format!("assert_iec")
+            let span = terminator.source_info.span;
+            // Branch to the success block when the no-panic condition holds.
+            let branch_ok = ctx.alloc_root(CILRoot::Branch(Box::new((
+                target.as_u32(),
+                0,
+                Some(BranchCond::True(cond)),
+            ))));
+            // Otherwise (fall through) call the matching panic lang item. The special-cased kinds
+            // take extra operands before the implicit `#[track_caller]` Location; all others take
+            // just the Location (supplied inside `call_panic_lang_item`).
+            use rustc_hir::lang_items::LangItem;
+            let (lang_item, extra_args): (LangItem, Vec<Interned<CILNode>>) = match msg.as_ref() {
+                AssertKind::BoundsCheck { len, index } => {
+                    // `fn panic_bounds_check(index: usize, len: usize)`
+                    let index = handle_operand(index, ctx);
+                    let len = handle_operand(len, ctx);
+                    (LangItem::PanicBoundsCheck, vec![index, len])
                 }
-                AssertKind::Overflow(op, _, _) => {
-                    let op: BinOp = crate::map_binop(op);
-                    format!("assert_{}", op.name())
+                AssertKind::MisalignedPointerDereference { required, found } => {
+                    // `fn panic_misaligned_pointer_dereference(required: usize, found: usize)`
+                    let required = handle_operand(required, ctx);
+                    let found = handle_operand(found, ctx);
+                    (LangItem::PanicMisalignedPointerDereference, vec![required, found])
                 }
-                AssertKind::OverflowNeg(_) => "assert_neg_overflow".into(),
-                AssertKind::BoundsCheck { .. } => {
-                    // The surrogate `assert_bounds_check` only takes the precomputed `cond` bool;
-                    // the `len`/`index` operands are not part of its ABI.
-                    let sig = ctx.sig([Type::Bool], Type::Void);
-                    let site = ctx.new_methodref(
-                        *main,
-                        "assert_bounds_check",
-                        sig,
-                        MethodKind::Static,
-                        vec![],
-                    );
-                    let call = ctx.call_root(site, &[cond], IsPure::NOT);
-                    let goto = goto(ctx, target.as_u32());
-                    return vec![call, goto];
+                AssertKind::InvalidEnumConstruction(source) => {
+                    // `fn panic_invalid_enum_construction(source: u128)`
+                    let source = handle_operand(source, ctx);
+                    (LangItem::PanicInvalidEnumConstruction, vec![source])
                 }
-                AssertKind::NullPointerDereference => "assert_notnull".into(),
-                AssertKind::MisalignedPointerDereference {
-                    required: _,
-                    found: _,
-                } => "assert_ptr_align".into(),
-                AssertKind::DivisionByZero(_) => "assert_zero_div".into(),
-                AssertKind::RemainderByZero(_) => "assert_zero_rem".into(),
-                AssertKind::ResumedAfterReturn(_) => "assert_coroutine_resume_after_return".into(),
-                AssertKind::ResumedAfterPanic(_) => "assert_coroutine_resume_after_panic".into(),
-                AssertKind::ResumedAfterDrop(_) => "assert_coroutine_resume_after_drop".into(),
+                // Overflow / OverflowNeg / DivisionByZero / RemainderByZero / NullPointerDereference
+                // / coroutine-resume kinds: a parameterless `panic_*()` (+ implicit Location).
+                other => (other.panic_function(), vec![]),
             };
-            let sig = ctx.sig([Type::Bool], Type::Void);
-            let site = ctx.new_methodref(*main, name, sig, MethodKind::Static, vec![]);
-            let call = ctx.call_root(site, &[cond], IsPure::NOT);
-            let goto = goto(ctx, target.as_u32());
-            vec![call, goto]
+            let mut roots = vec![branch_ok];
+            roots.extend(call_panic_lang_item(lang_item, &extra_args, span, ctx));
+            roots
         }
         TerminatorKind::Goto { target } => vec![goto(ctx, target.as_u32())],
         TerminatorKind::UnwindResume => {

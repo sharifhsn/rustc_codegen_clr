@@ -146,5 +146,16 @@ throughput vs C# is not where this backend competes today.
   `fma`/`relaxed_fma`); walls (`gather`/`scatter`/`masked_*`/`funnel_*`) left as explicit `todo!`.
   `cargo_tests/simd_tail` 18/18 on real .NET; Docker gate 426/12. Float `reduce_min`/`reduce_max` left
   unwired — blocked by a pre-existing, orthogonal `f32::min` `TypeLoadException`, not this change.
-- WF-C / WF-D / WF-E / WF-G / WF-F — not started.
+- **WF-D (test-failure triage)** — DONE, with a bonus high-impact find. The targeted clusters
+  (IPv6 fmt, iterator `try_fold`, `i128` saturating, sub-word `leading/trailing_ones`) all repro
+  **clean** vs native → those `BROKEN_TESTS.md` lines are **stale** (fail test-harness-wide, not
+  codegen; `i128` saturating was transitively fixed by WF-A) — now flagged "Verified STALE". The real
+  bug found+fixed: the **entire `Assert`-terminator panic family** (bounds check, div/rem-by-zero, all
+  arithmetic/neg overflow, null/misaligned-ptr deref, invalid-enum, coroutine-resume) lowered to a
+  surrogate that discarded operands and called an unbodied `abort` → runtime crash `missing methiod
+  abort` instead of a catchable native panic. Fixed to call the exact `#[track_caller]` panic lang
+  items (`src/terminator/mod.rs`); panic messages now byte-match native. Unbreaks `swap_panics`×4 +
+  `vec::test_index_out_of_bounds`; makes div0/overflow panics native-correct. 7 repro crates added;
+  Docker gate 426/12 (no regressions).
+- WF-C / WF-E / WF-G / WF-F — not started.
 - Branch `gaps-campaign` (off `main` = pushed Tier-2 state); pushed to `mine/gaps-campaign`.

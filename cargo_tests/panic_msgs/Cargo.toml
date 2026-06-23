@@ -1,0 +1,16 @@
+[package]
+name = "panic_msgs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[workspace]
+
+# Force overflow checks ON even in release so the checked-arithmetic Assert
+# terminators (Overflow/OverflowNeg) are emitted and exercised in both profiles.
+[profile.dev]
+overflow-checks = true
+
+[profile.release]
+overflow-checks = true

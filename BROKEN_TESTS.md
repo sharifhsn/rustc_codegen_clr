@@ -57,7 +57,6 @@ num::i8::tests::test_pow
 iter::adapters::flat_map::test_flat_map_try_folds
 num::bignum::test_add_small_overflow
 num::i16::tests::test_checked_next_multiple_of
-slice::swap_panics::index_b_equals_len
 num::bignum::test_mul_small_overflow
 mem::uninit_fill_clone_panic_drop
 num::i128::tests::test_lots_of_isqrt
@@ -69,7 +68,6 @@ num::test_int_from_str_overflow
 iter::traits::double_ended::test_rev_try_folds
 ascii::test_is_ascii_align_size_thoroughly
 num::i16::tests::test_pow
-slice::swap_panics::index_a_equals_len
 net::ip_addr::ipv6_addr_to_string
 iter::adapters::flatten::test_flatten_try_folds
 num::bignum::test_get_bit_out_of_range
@@ -94,13 +92,11 @@ iter::range::test_range_inclusive_folds
 iter::adapters::take_while::test_take_while_folds
 iter::adapters::take::test_take_try_folds
 num::u16::tests::test_leading_trailing_ones
-slice::swap_panics::index_b_greater_than_len
 iter::adapters::skip_while::test_skip_while_try_fold
 slice::take_first_mut_nonempty
 num::f64::max
 net::socket_addr::socket_v6_to_str
 num::i16::tests::test_rotate
-slice::swap_panics::index_a_greater_than_len
 num::i8::tests::test_checked_next_multiple_of
 num::bignum::test_mul_digits_overflow_2
 num::f64::min
@@ -167,7 +163,6 @@ vec_deque::test_try_reserve
 ## Failed:
 ```
 slice::test_split_first_mut
-vec::test_index_out_of_bounds
 vec::vec_macro_repeating_null_raw_fat_pointer
 slice::test_split_first
 vec::extract_if_unconsumed_panic
@@ -177,3 +172,59 @@ vec_deque::test_try_fold_moves_iter
 str::const_str_ptr
 vec::test_collect_after_iterator_clone
 ```
+
+# Recently fixed (codegen corrections)
+
+## `Assert`-terminator panic family — now matches native (fixed)
+
+The `Assert` terminator (bounds check, division/remainder by zero, arithmetic
+overflow, negate overflow, null/misaligned-pointer deref, invalid-enum
+construction, coroutine-resume) used to lower through surrogate `assert_*`
+builtins that **discarded the operands** and, on failure, called an **unbodied
+`abort`** method. At runtime the program crashed with
+`System.Exception: missing methiod abort` instead of producing the correct,
+catchable Rust panic. For `BoundsCheck` this also meant the message never
+contained the `len`/`index`.
+
+Fix (`src/terminator/mod.rs`, `handle_terminator`'s `Assert` arm + new
+`call_panic_lang_item` helper): lower each kind to the **exact** panic lang item
+the native rustc backend uses — branch to the success block on the no-panic
+condition, otherwise call e.g. `panic_bounds_check(index, len)` /
+`panic_div_zero()` / `panic_add_overflow()` (all `#[track_caller]`, so the
+implicit caller `Location` is materialized at the call site). Panic messages and
+unwinding now match native exactly. Gate stays 426/12.
+
+Repros (known-answer, verified backend-output == native Rust):
+`cargo_tests/swap_panics`, `cargo_tests/panic_msgs`.
+
+Now-passing entries moved out of the lists above:
+
+- `slice::swap_panics::index_a_equals_len`
+- `slice::swap_panics::index_b_equals_len`
+- `slice::swap_panics::index_a_greater_than_len`
+- `slice::swap_panics::index_b_greater_than_len`
+- `vec::test_index_out_of_bounds`
+
+## Verified STALE (per-feature codegen is already correct)
+
+These BROKEN_TESTS.md entries do **not** reproduce as codegen bugs: minimized
+standalone repros (native-first, then through the backend, `cargo clean` between)
+produce byte-identical output to native Rust. They almost certainly fail in the
+real fork test-binary for a test-binary-wide reason (an unrelated test in the
+same module aborting, or test-source bit-rot), not the listed lowering. Left in
+the lists above pending a real fork-suite re-validation, but flagged here.
+
+- IPv6 Display/formatting: `net::ip_addr::ipv6_addr_to_string`,
+  `net::ip_addr::ipv6_properties`, `net::socket_addr::ipv6_socket_addr_to_string`,
+  `net::socket_addr::socket_v6_to_str` — repro `cargo_tests/ipv6_fmt`,
+  `cargo_tests/ipv6_props`.
+- Iterator try_fold/try_rfold/ControlFlow family
+  (`iter::adapters::*::test_*_try_folds`, `step_by` nth_try_fold/rfold,
+  `double_ended::test_rev_try_folds`, …) — repro `cargo_tests/iter_tryfold`.
+- i128 saturating: `num::i128::tests::test_saturating_abs`,
+  `test_saturating_neg` (already green via WF-A `e3cdd4b`) — repro
+  `cargo_tests/i128_sat`.
+- Sub-word `leading_ones`/`trailing_ones` masking
+  (`num::{u8,i8,u16,i16}::tests::test_leading_trailing_ones`) — repro
+  `cargo_tests/lead_trail_ones`. The suspected sign-agnostic-stack hazard does
+  **not** materialize; all sub-word leading/trailing bit ops match native.
