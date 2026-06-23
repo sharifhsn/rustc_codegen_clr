@@ -1453,8 +1453,28 @@ fn simple_class_ref(cref: Interned<ClassRef>, asm: &Assembly) -> String {
 }
 pub(crate) fn class_ref(cref: Interned<ClassRef>, asm: &Assembly) -> String {
     let cref = asm.class_ref(cref);
-    let name = dotnet_class_name(&asm[cref.name()]);
-    let prefix = if cref.is_valuetype() {
+    let raw_name = &asm[cref.name()];
+    let name = dotnet_class_name(raw_name);
+    // Normalize the known BCL primitive value types: these CoreLib types are
+    // *unconditionally* `valuetype` in .NET, so a `class`-prefixed reference to one
+    // makes the runtime reject the type-load with
+    // `TypeLoadException: ... due to value type mismatch` the moment the call is JITted.
+    // Some codegen/intrinsic paths (e.g. `f64::abs`/`copysign`/`mul_add` ->
+    // `System.Double::Abs`/`CopySign`/`FusedMultiplyAdd`) still produce a
+    // `is_valuetype=false` ClassRef for these names (a residual of the pre-P2-S1 default);
+    // forcing the prefix here closes the whole family at the rendering boundary regardless
+    // of which path interned the ref. Safe because these exact names are ALWAYS .NET value
+    // types (P2-S2 differential-oracle fix; regression: cargo_tests/float_debug_fmt). Only
+    // applies to the System.Runtime-qualified BCL names, never to user/Rust types.
+    let is_bcl_valuetype = matches!(
+        raw_name,
+        "System.Double"
+            | "System.Single"
+            | "System.Half"
+            | "System.Int128"
+            | "System.UInt128"
+    );
+    let prefix = if cref.is_valuetype() || is_bcl_valuetype {
         "valuetype"
     } else {
         "class"

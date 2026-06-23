@@ -282,19 +282,18 @@ fi
 # nightly adds another cfg_select! to io/mod.rs, switch to inject_arm_anchor on
 # 'mod is_terminal {'.
 [ -f "$PAL/io/is_terminal/dotnet.rs" ] && inject_arm io/mod.rs 'mod dotnet; pub use dotnet::*;' 1
-# PACKAGE A — sys/exit.rs `exit(code)`: the `target-family="unix"` flip activates
-# the `any(target_family="unix", target_os="wasi") => libc::exit(code)` arm of the
-# in-fn cfg_select! (pre-flip dotnet hit the `_ => abort()` arm). `libc::exit` is
-# NOT in the dotnet libc PAL face (close/read/socket/epoll only), so the unix arm
-# would be E0425 under the flip. Inject a `target_os="dotnet"` arm-0 routing to
-# `crate::intrinsics::abort()` (identical to the existing `_` fallback), which
-# closes the would-be host-libc::exit leak with ZERO new symbols. exit.rs has TWO
-# cfg_select!s: block 1 is the file-level `unique_thread_exit` cascade, block 2 is
-# the in-fn one inside `pub fn exit`; we target block 2 (nth=2). LEAKY (L9):
-# abort-not-clean-exit (exit code is dropped); an `rcl_dotnet_exit` ->
-# Environment.Exit(code) hook is the honest upgrade. The doc-only marker file
-# dotnet_pal/sys/exit_marker keeps this idempotent/guarded like the others.
-inject_arm exit.rs 'let _ = code; crate::intrinsics::abort()' 2
+# PACKAGE A — sys/exit.rs `exit(code)`: inject a `target_os="dotnet"` arm-0 that
+# declares + calls `rcl_dotnet_exit(code)`, the dedicated PAL symbol the cilly linker
+# maps to `System.Environment.Exit((int)code)` — a CLEAN managed process-exit WITH the
+# code, matching native rustc's `exit(code)`. We canNOT call `libc::exit` here: std's
+# IN-TREE `libc` shim does not declare `exit` (E0425), unlike the crates.io libc crate.
+# This was previously `crate::intrinsics::abort()` (P2-S2 differential-oracle fix): that
+# DROPPED the exit code and threw "Called abort!" (exit 134) instead of exiting with the
+# code — a real behavioral divergence vs native (cargo_tests/pal_exit_code regression).
+# exit.rs has TWO cfg_select!s: block 1 is the file-level `unique_thread_exit` cascade,
+# block 2 is the in-fn one inside `pub fn exit`; we target block 2 (nth=2). The doc-only
+# marker file dotnet_pal/sys/exit_marker keeps this idempotent/guarded like the others.
+inject_arm exit.rs 'unsafe { unsafe extern "C" { fn rcl_dotnet_exit(code: i32) -> !; } rcl_dotnet_exit(code) }' 2
 # os/mod.rs gate widen: `pub mod fd` is gated `any(unix, hermit, trusty, wasi,
 # motor, doc)` — os=dotnet is NOT in that list, so std::os::fd (OwnedFd/RawFd +
 # os/fd/net.rs's Socket onion) is compiled OUT for dotnet today. Add dotnet to the

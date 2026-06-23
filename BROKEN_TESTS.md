@@ -329,27 +329,79 @@ list (`bin/success_coretests.txt`); only the two `shortest_*_{exhaustive,hard_ra
 remain (million-iteration stress — timeout/throughput, not a last-digit ULP defect).
 No flt2dec codegen change is warranted.
 
-> Native-harness note: under the `CARGO_DOTNET_BACKEND=native` build-std path on
-> macOS arm64, `core`'s `System.Double` method refs can still print as `class`
-> (e.g. a `{:?}`-float repro crashes) even after the fix + forced `core` recompile —
-> while the leaf-crate ref correctly prints `valuetype` and the Docker full-clean
-> `::stable` build (the source of the passing `fmt::float` list) is unaffected. This
-> is a native build-std artifact in how `core`'s serialized cref flag propagates, not
-> a portable codegen defect; tracked for the native-harness sysroot-rebuild path.
+> RESOLVED (P2-S2, was mis-classified as a native-harness artifact): the
+> `{:?}`-float crash was a REAL portable codegen defect, not a build-std/sysroot
+> quirk. The final IL contained BOTH `class` and `valuetype` references to
+> `System.Double` in one assembly: P2-S1 fixed `ClassRef::double`/`single` to be
+> value types, but the `Abs`/`CopySign`/`FusedMultiplyAdd` refs (reached by
+> `f64::abs` inside `core::fmt::float::GeneralFormat::already_rounded_value_should_use_exponential`,
+> which every `{:?}` of a float calls) still rendered as
+> `class [System.Runtime]System.Double` → `TypeLoadException: ... value type mismatch`
+> the instant such a method was JITted. So ANY Debug-format of a float — including
+> derived `#[derive(Debug)]` on any struct/enum/tuple/`Vec`/`Option` holding a float —
+> crashed; plain `{}` (Display) was unaffected, which is why it hid behind the green
+> gate. Fix: `cilly` `il_exporter::class_ref` now normalizes the known BCL primitive
+> value types (`System.Double`/`Single`/`Half`/`Int128`/`UInt128`) to the `valuetype`
+> prefix at the rendering boundary regardless of which path interned the ClassRef
+> (these CoreLib names are unconditionally value types — safe). Verified byte-identical
+> vs native by `cargo_tests/float_debug_fmt`; the Docker `::stable` gate stays
+> 428/12 (zero regressions).
 
-## REAL but SEPARATE-WORKFLOW — panic message routing/fidelity (program logic is correct)
+## REAL — panic/`#[track_caller]`/exit-code fidelity cluster (program logic correct; diagnostics + exit code diverge)
 
-A caught panic (`catch_unwind` of e.g. an out-of-bounds index) diverges from
-native **only in the panic message**, not in program behavior: the backend writes
-the panic note to **stdout** where native writes it to **stderr**, and reports the
-std-internal caller location (`<WORKSPACE>/src/panic/location.rs:181:9`,
-`thread '<unnamed>' (1)`) instead of the user call site
-(`src/main.rs:3:42`, `thread 'main' (<tid>)`). The *computation* — the catch
-succeeds, the `Result` is `Err`, exit code matches — is correct. This is a
-panic-PAL output-fidelity cluster (stderr routing + `#[track_caller]` location
-threading through the panic hook on the dotnet PAL), orthogonal to the codegen
-fixes above and deferred to a dedicated panic-fidelity workflow. Classification:
-REAL but cosmetic/separate-workflow, NOT a miscompile of program logic.
+P2-S2 re-measured this cluster precisely with the stderr-aware oracle. The earlier
+"note goes to stdout" classification is **superseded**: the panic note now lands on
+**stderr** in both native and backend (the stream routing is correct). The surviving,
+distinct divergences are:
+
+1. **`#[track_caller]` caller-location is wrong (the load-bearing one).** Every panic —
+   and any plain `core::panic::Location::caller()` — reports the std-internal site
+   `<WORKSPACE>/src/panic/location.rs:181:9` (the body of `Location::caller`) instead of
+   the user call site (`src/main.rs:<line>:<col>`). Confirmed even for a user-level
+   `#[track_caller] fn` calling `Location::caller()` (`e_track_caller` probe:
+   backend prints `location.rs:181`, native prints `main.rs:6`). Root cause: the
+   caller-location intrinsic / track_caller implicit-arg threading does not propagate
+   the caller's location through the chain on this backend; reading `LdArg(arg_count)`
+   in the `requires_caller_location` branch does not yield the caller's `&Location`.
+   This is REAL (observable, in the panic note + `Location::caller()` return value) and
+   needs proper `#[track_caller]` implicit-arg plumbing (mirroring rustc's
+   `FunctionCx::get_caller_location` / `Body::caller_location_span`). An attempt at this
+   plumbing existed in the tree but did not deliver (still mislocates) and was reverted.
+
+2. **Thread name/id cosmetic:** backend prints `thread '<unnamed>' (1)`; native prints
+   `thread 'main' (<tid>)`. The main thread is unnamed on the dotnet PAL and the id is a
+   synthetic constant. Cosmetic; native tid is itself non-deterministic.
+
+3. **Uncaught-panic / `process::exit(N)` exit code lost by the APPHOST (harness, not codegen).**
+   An uncaught panic exits 0 (native: 101); `std::process::exit(7)` via the apphost exits 0
+   (native: 7). DECISIVE TEST: running the produced `.dll` directly with `dotnet <dll>`
+   yields the **correct** exit code (7), and the IL correctly emits
+   `System.Environment::Exit(int32)`. So the `process::exit` → `Environment.Exit` codegen/PAL
+   mapping is CORRECT; the residual loss is in the cargo-dotnet **native apphost launcher**
+   not propagating the managed exit code. Fix belongs in the `cargo dotnet run` path
+   (invoke via `dotnet <dll>` or fix apphost), not the backend.
+
+Classification: program logic (catch/`Err`/branch) is correct; the residuals are a
+diagnostics-fidelity defect (#1, real codegen — track_caller), a cosmetic (#2), and a
+harness exit-code-propagation defect (#3, not codegen). Deferred to a dedicated
+panic/track_caller-fidelity slice.
+
+## NEW real divergences found in P2-S2 (ranked, beyond the S1-fixed 3)
+
+1. **FIXED — float `{:?}` Debug + `abs`/`copysign`/`mul_add` crash** (`class`-vs-`valuetype`
+   `System.Double`/`Single`; see the RESOLVED note above). High leverage: hit every
+   Debug-format of a float. Regression: `cargo_tests/float_debug_fmt`. Gate 428/12 green.
+
+2. **OPEN, real codegen ICE — `fn main() -> Result<_,_>` (Termination trait).** A `main`
+   returning `Result` (even the trivial `fn main() -> Result<(), String> { Ok(()) }`)
+   makes the backend ICE ("the compiler unexpectedly panicked", build exit 101) — native
+   compiles+runs fine. Loud failure (I3-ok) but an I2 gap: `Termination`-returning `main`
+   is unsupported and crashes codegen. Tractable: implement the `Termination` lang-item
+   lowering for the `main` shim. Repro: `/tmp/probes/e_result_main`, `e_result_unit`.
+
+3. **OPEN, real — track_caller location** (item 1 of the panic cluster above).
+
+4. **OPEN, harness — apphost exit code** (item 3 of the panic cluster above; not codegen).
 
 ## Verified clean NOW (census — match native byte-for-byte)
 

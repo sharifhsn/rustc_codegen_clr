@@ -418,12 +418,17 @@ fn sys_targets() -> Vec<Target> {
         // exit.rs: the ONLY Ordinal in the whole manifest. block 1 is the file-level
         // `unique_thread_exit` cascade; block 2 is the in-fn one inside `pub fn exit`.
         // Its two cfg_select!s have no distinguishing nearby string, so Ordinal(2) is
-        // the documented exception. Routes to abort() (= the existing `_` fallback).
+        // the documented exception. Declares + calls `rcl_dotnet_exit(code)`, which the
+        // cilly linker maps to `System.Environment.Exit((int)code)` — a CLEAN managed
+        // process-exit WITH the code (matching native rustc). We canNOT call `libc::exit`
+        // here: std's in-tree libc shim does not declare `exit` (E0425). Previously this
+        // dropped the code and called `intrinsics::abort()` ("Called abort!", exit 134)
+        // — a real differential divergence fixed in P2-S2 (cargo_tests/pal_exit_code).
         Target {
             rel: "exit.rs",
             injections: vec![arm(
-                "let _ = code; crate::intrinsics::abort()",
-                "let _ = code; crate::intrinsics::abort()",
+                "unsafe { unsafe extern \"C\" { fn rcl_dotnet_exit(code: i32) -> !; } rcl_dotnet_exit(code) }",
+                "unsafe { unsafe extern \"C\" { fn rcl_dotnet_exit(code: i32) -> !; } rcl_dotnet_exit(code) }",
                 Anchor::Ordinal(2),
             )],
         },
@@ -912,14 +917,14 @@ pub fn exit(code: i32) -> ! {
     #[test]
     fn cfg_arm_ordinal_two_targets_second_block() {
         let inj = arm(
-            "let _ = code; crate::intrinsics::abort()",
-            "let _ = code; crate::intrinsics::abort()",
+            "unsafe { unsafe extern \"C\" { fn rcl_dotnet_exit(code: i32) -> !; } rcl_dotnet_exit(code) }",
+            "unsafe { unsafe extern \"C\" { fn rcl_dotnet_exit(code: i32) -> !; } rcl_dotnet_exit(code) }",
             Anchor::Ordinal(2),
         );
         let (out, applied) = apply_one_str(ORDINAL_IN, &inj).unwrap();
         assert_eq!(applied, Applied::Inserted);
         // must be inside the SECOND cfg_select! (after `pub fn exit`), not the first.
-        let arm_pos = out.find("let _ = code; crate::intrinsics::abort()").unwrap();
+        let arm_pos = out.find("rcl_dotnet_exit(code)").unwrap();
         let exit_pos = out.find("pub fn exit").unwrap();
         assert!(arm_pos > exit_pos, "ordinal-2 arm must land in the exit() block");
     }

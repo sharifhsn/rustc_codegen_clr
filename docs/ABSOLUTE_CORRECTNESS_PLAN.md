@@ -112,6 +112,77 @@ first ill-typed method. The canonical Docker `::stable` gate stays green under t
 - **Systematic edge probes** for what fixed tests under-cover: FP bit-exactness, multithreaded
   invariants (build on the new `pal_threads`), panic/unwind across boundaries, atomics under contention.
 
+### P2 status (in progress — iterative slices, I2 NOT complete)
+
+**P2-S1 (commit 69b8e0e).** Stood up the differential oracle (native rustc vs `cargo dotnet`,
+byte-identical stdout+exit) and fixed 3 real codegen miscompiles: float-valuetype `TypeLoadException`
+(`class.rs`), `u128/i128` `ctlz/cttz` garbage (`ints.rs`), and the sub-word atomic
+`InvalidProgramException` that crashed all 8/16-bit atomics + `catch_unwind` (`atomics.rs`). Each has a
+permanent build-std regression crate (`float_class_methods`, `wideint_ctlz`, `cd_subword_atomics`).
+Proved flt2dec ULP a non-divergence; classified C-variadic `printf` (fuzz47/86/87/96) + half
+`f16/bf16` as fundamental walls.
+
+**P2-S2 (this slice).** Extended the oracle to also diff **stderr** (the panic family is a
+stderr-shape question). Fixes + findings:
+
+- **FIXED — `std::process::exit(code)` aborted instead of exiting with the code.** The injected
+  `target_os="dotnet"` arm of `sys::exit::exit` was `let _ = code; crate::intrinsics::abort()` — it
+  dropped the requested code and threw "Called abort!" (SIGABRT, exit 134) where native rustc exits
+  with `code`. Fixed: the arm now declares + calls `rcl_dotnet_exit(code)`, a PAL symbol the cilly
+  linker (`insert_dotnet_exit`, `cilly/src/ir/builtins/dotnet.rs`) maps to
+  `System.Environment.Exit((int)code)` — a clean managed process-exit carrying the code. (`libc::exit`
+  is NOT usable here: std's in-tree libc shim does not declare `exit`.) Injected by both
+  `feasibility/_cargo_dotnet_core.sh` and `tools/cargo-dotnet/src/palinject.rs`. Verified
+  byte-identical vs native (stdout + exit 7) by **`cargo_tests/pal_exit_code`** (new permanent
+  regression crate). Canonical Docker `::stable` gate stays **428 pass / 12 fail** (baseline, zero
+  regressions).
+
+- **Panic note STREAM routing is already CORRECT.** Contrary to the S1 deferral note, the dotnet PAL
+  panic note already lands on **stderr** (fd 2 → `Console.Error`): `rcl_dotnet_write(fd=2,…)` maps to
+  `Console.Error.Write` and `dotnet_pal/sys/stdio/dotnet.rs` routes fd 2 → `Stderr` →
+  `panic_output()`. Re-verified by splitting the produced `.dll`'s streams directly (`panic!` +
+  `catch_unwind`, index-OOB, `expect`, `assert_eq!`): all panic notes + `note:` + `eprintln!` lines are
+  on stderr, stdout matches native exactly. No fix needed.
+
+- **OPEN (real, deferred) — caught/uncaught panic note reports the WRONG caller-location text.**
+  Every panic note prints `panicked at <WORKSPACE>/src/panic/location.rs:181:9` (the body of
+  `core::panic::Location::caller`) instead of the user call site (e.g. `src/main.rs:4:9`). Reproduces
+  minimally with a bare `Location::caller()` and with `panic!`/`v[i]`/`expect`/`assert_eq!`. **Root
+  cause is NOT in the call/intrinsic/Assert terminator codegen** — instrumentation proved
+  `caller_location` never reaches those paths for these programs; the wrong `Location` is materialized
+  upstream as a **`ConstOperand`** (the const-`Location` value baked by rustc's MIR/const-eval), so the
+  divergence is in const-`Location` materialization (`rustc_codgen_clr_operand`), not the
+  `#[track_caller]` threading. Program *logic* (catch → `is_err()`, `Err`, exit code) is fully correct;
+  only the diagnostic `file:line:col` diverges. Tractable but a distinct, deeper fix — left for a
+  follow-up slice. (A unifying `materialize_caller_location` helper mirroring rustc's
+  `Body::caller_location_span` was prototyped and reverted: it is correct for the live track_caller-call
+  path but does NOT touch the const path that actually produces these notes, so it added hot-path risk
+  without delivering the fix.)
+
+- **FOUND (build-time, deferred) — `overflow-checks = true` in the build-std profile ICEs the backend
+  while compiling `std`.** A backend panic (swallowed by cargo) during the overflow-assert-heavy std
+  build; **pre-existing** (confirmed independent of any S2 edit by bisect). Default profiles are
+  unaffected (the `::stable` gate and all default-profile probes are green), so this is an
+  overflow-checked-build limitation, not a default-path miscompile.
+
+**Differential census (this slice), all default-profile, byte-identical stdout+stderr+exit vs native:**
+edge probes `ep_float / ep_int / ep_str / ep_coll / ep_iter / ep_enum / ep_dyn / ep_overflow_rt`
+(FP bit patterns, 128-bit ints, UTF-8/formatting, BTree/Hash/VecDeque/BinaryHeap, iterator adaptors,
+enum/Result/Option, trait objects + closures, wrapping/checked/saturating/euclid) and soak crates
+`itertools / hex / base64 / arrayvec / bitflags / byteorder / fxhash / smallvec / tinyvec / memchr /
+indexmap / libm / euclid / approx / data-encoding / compact_str / bstr` — **all FULL MATCH**. The only
+recurring real runtime divergence is the caller-location TEXT above; `soak_half` is the known f16/bf16
+wall. **I2 remains open** (caller-location const path + overflow-checked-build ICE are the next
+codegen targets; full upstream library suites still not routed in this env).
+
+**CI-surface gap (honest).** The P2-S1 + S2 regression crates (`float_class_methods`, `wideint_ctlz`,
+`cd_subword_atomics`, `pal_exit_code`) are `cargo dotnet` **build-std PAL** crates and do **not** fit
+the `::stable` harness (`src/compile_test.rs`), which compiles against the host/surrogate target
+without build-std and cannot exercise the dotnet PAL. They need a **separate CI surface**: a
+`cargo dotnet`-driven differential runner (akin to `feasibility/dev.sh pal-build`, extended to run the
+artifact and diff stdout/stderr/exit vs native). Not force-fit into `::stable`. Tracked as a P2 CI
+follow-up.
+
 ## 5. Phase P3 — Totality census + loud failure (delivers I3)
 
 - **Enumerate every construct:** each MIR `Rvalue`/`StatementKind`/`TerminatorKind`, each rustc

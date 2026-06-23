@@ -1,0 +1,8 @@
+[package]
+name = "float_debug_fmt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[workspace]

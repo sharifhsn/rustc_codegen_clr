@@ -1114,8 +1114,10 @@ fn insert_dotnet_getpid(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) 
 /// must still typecheck, so we emit an unreachable `Ret` of an uninitialised
 /// value of the method's declared return type after the (never-returning) call.
 fn insert_dotnet_exit(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    let name = asm.alloc_string("exit");
-    let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {
+    // The generator body is shared by two override keys (below). It emits
+    // `System.Environment.Exit((int)arg0)` then an unreachable terminator typed
+    // to the call site's declared return.
+    fn gen_exit(mref: Interned<MethodRef>, asm: &mut Assembly) -> MethodImpl {
         // Environment.Exit((int)arg0) — static void Exit(int).
         let env = ClassRef::enviroment(asm);
         let exit_name = asm.alloc_string("Exit");
@@ -1144,8 +1146,21 @@ fn insert_dotnet_exit(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
             blocks: vec![BasicBlock::new(vec![call, ret], 0, None)],
             locals: vec![],
         }
-    };
-    patcher.insert(name, Box::new(generator));
+    }
+    // Key 1: bare `exit` — intercepts the host-libc `exit` P/Invoke on the
+    // `target_family="unix"` arm of `sys::process` / non-dotnet exit paths.
+    let exit = asm.alloc_string("exit");
+    patcher.insert(exit, Box::new(gen_exit));
+    // Key 2: `rcl_dotnet_exit` — the dedicated symbol the std dotnet `sys::exit`
+    // arm calls. std's in-tree `libc` shim does NOT declare `exit`, so the dotnet
+    // arm cannot call `libc::exit` (E0425); instead it declares + calls
+    // `rcl_dotnet_exit(code)`, which this override maps to `Environment.Exit(code)`
+    // for a CLEAN process-exit WITH the code (matching native rustc's `exit(7)`).
+    // P2-S2 differential-oracle fix: the arm previously dropped the code and called
+    // `intrinsics::abort()` ("Called abort!", exit 134) — a real behavioral
+    // divergence. Verified byte-identical vs native by cargo_tests/pal_exit_code.
+    let rcl = asm.alloc_string("rcl_dotnet_exit");
+    patcher.insert(rcl, Box::new(gen_exit));
 }
 
 /// `rcl_dotnet_hostname() -> *mut u8` =>
