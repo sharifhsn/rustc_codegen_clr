@@ -171,7 +171,19 @@ throughput vs C# is not where this backend competes today.
   Verified: `cd_interop_tier2`'s `make_ints()` → `int[]{10,20,30}` consumed in C# (8/8 checks); gate
   426/12. C-mode/JVM array return left as documented `todo!` (only .NET needed); arrays-of-structs/
   strings + the **generic-interop bridge remain XL / scope-only**.
-- **WF-C (typechecker hard gate)** — HELD for owner OK (the safe investigate/triage can run; flipping
-  `ALLOW_MISCOMPILATIONS` off is a posture decision).
-- **WF-F (threading/TLS)** — HELD for owner OK (XL/architectural; scope-first).
+- **WF-C (typechecker — SAFE measurement pass)** — DONE. **Key finding: the config flags are dead
+  wiring.** `TYPECHECK_CIL`/`VERIFY_METHODS`/`ENFORCE_CIL_VALID`/`CHECK_REFS`/`ALLOW_MISCOMPILATIONS`
+  are declared in `src/config.rs` but **never read** — the checker already runs unconditionally and
+  only warns (`src/lib.rs:304`→`cilly/src/ir/asm.rs:184` eprintln; `src/assembly.rs` span_warn). So
+  "flip `ALLOW_MISCOMPILATIONS`" is **impossible without first wiring the flags** — a prerequisite
+  refactor, not a config change. Measured ~105 violations/build (std-systemic): **~75% `WriteWrongAddr`
+  = false positives of the checker's own model** on code that runs green (a hard gate would reject std
+  day-one). The **only ~5 plausible real silent miscompiles**: fat-pointer **nesting** mismatches
+  (`FatPtr<u8>` vs `FatPtr<FatPtr<u8>>`) in `LocalAssignmentWrong`(3) + `String::push_str_slice`(2) —
+  the DST/fat-ptr class. **Flip verdict: NOT feasible now**; staged path = A clear checker false
+  positives (void-`StLoc` DONE here = task #43) → B investigate the ~5 fat-ptr-nesting violations → C
+  wire flags + make fatal behind-flag + green `::stable` → THEN the owner's default-flip decision is
+  meaningful. Landed: an 11-line log-only void-`StLoc` guard (`cilly/src/ir/typecheck.rs`); gate 426/12,
+  config defaults unchanged.
+- **WF-F (threading/TLS)** — HELD; scope-only pass next (no code).
 - Branch `gaps-campaign` (off `main` = pushed Tier-2 state); pushed to `mine/gaps-campaign`.

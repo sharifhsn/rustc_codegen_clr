@@ -1019,6 +1019,17 @@ impl CILRoot {
             Self::StLoc(loc, node) => {
                 let got = asm.get_node(*node).clone().typecheck(sig, locals, asm)?;
                 let expected = asm[locals[*loc as usize].1];
+                // Benign-noise suppression (diagnostics only): storing a Void-typed value into a
+                // local is a no-op at runtime — a Void value carries no bits and is elided by the
+                // exporter/JIT. This arises from `LdStaticField` of opaque/ZST marker statics (e.g.
+                // `__rust_no_alloc_shim_is_unstable`) whose declared field type is `Void`. The
+                // checker's `is_assignable_to` has no Void arm by design (broadening it would
+                // over-permit Void everywhere), so the safe, narrowly-scoped fix is to accept a
+                // Void source *only* at the StLoc store. Cannot alter emitted CIL (the typechecker
+                // only logs). See task #43.
+                if got == Type::Void {
+                    return Ok(());
+                }
                 if !got.is_assignable_to(expected, asm) {
                     Err(TypeCheckError::LocalAssigementWrong {
                         loc: *loc,
