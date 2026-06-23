@@ -4,7 +4,7 @@ use crate::{
     utilis::{
         garag_to_bool, CTOR_FN_NAME, MANAGED_CALL_FN_NAME, MANAGED_CALL_VIRT_FN_NAME,
         MANAGED_CHECKED_CAST, MANAGED_IS_INST, MANAGED_LD_ELEM_REF, MANAGED_LD_LEN,
-        MANAGED_LD_NULL, MANAGED_THROW, MANAGED_TRY_CATCH,
+        MANAGED_LD_NULL, MANAGED_NEW_ARR, MANAGED_SET_ELEM, MANAGED_THROW, MANAGED_TRY_CATCH,
     },
 };
 use cilly::{
@@ -550,6 +550,32 @@ pub fn call_inner<'tcx>(
         let idx = handle_operand(&args[1].node, ctx);
         let node = ctx.ld_elem_ref(arr, idx);
         return vec![place_set(destination, node, ctx)];
+    } else if function_name.contains(MANAGED_NEW_ARR) {
+        assert!(
+            !call_info.split_last_tuple(),
+            "Managed calls may not use the `rust_call` calling convention!"
+        );
+        // Allocates a managed 1-D array of the (primitive) element type `T` with `len` elements.
+        // The element type is the first generic argument of the intrinsic.
+        let elem = ctx.type_from_cache(instance.args[0].as_type().unwrap());
+        let elem = ctx.alloc_type(elem);
+        let len = handle_operand(&args[0].node, ctx);
+        let node = ctx.new_arr(elem, len);
+        return vec![place_set(destination, node, ctx)];
+    } else if function_name.contains(MANAGED_SET_ELEM) {
+        assert!(
+            !call_info.split_last_tuple(),
+            "Managed calls may not use the `rust_call` calling convention!"
+        );
+        // Stores `val` into managed array `arr` at `idx`. Side-effecting; destination is unit.
+        let elem = ctx.type_from_cache(instance.args[0].as_type().unwrap());
+        let elem = ctx.alloc_type(elem);
+        let arr = handle_operand(&args[0].node, ctx);
+        let idx = handle_operand(&args[1].node, ctx);
+        let val = handle_operand(&args[2].node, ctx);
+        let root = ctx.st_elem(arr, idx, val, elem);
+        let root = ctx.alloc_root(root);
+        return vec![root];
     } else if function_name.contains(MANAGED_TRY_CATCH) {
         assert!(
             !call_info.split_last_tuple(),

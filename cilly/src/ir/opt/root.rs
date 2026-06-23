@@ -285,6 +285,8 @@ pub fn root_opt(
         }
         CILRoot::StLoc(loc, val) if asm[val] == CILNode::LdLoc(loc) => CILRoot::Nop,
         CILRoot::StArg(loc, val) if asm[val] == CILNode::LdArg(loc) => CILRoot::Nop,
+        // A managed-array element store is meaningful and is left untouched by the optimizer.
+        CILRoot::StElem { .. } => root,
         _ => root,
     }
 }

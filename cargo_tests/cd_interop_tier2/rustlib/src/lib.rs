@@ -32,3 +32,16 @@ pub extern "C" fn try_div(a: i32, b: i32) -> i32 {
         None => mycorrhiza::intrinsics::rustc_clr_interop_throw::<"try_div: division by zero">(),
     }
 }
+
+/// A first-class managed `System.Int32[]` returned to C#. Rust constructs a real .NET array via
+/// `newarr`, populates it via `stelem`, and returns it; the public signature lowers to `int[]`.
+type IntArray = mycorrhiza::intrinsics::RustcCLRInteropManagedArray<i32, 1>;
+
+#[no_mangle]
+pub extern "C" fn make_ints() -> IntArray {
+    let a: IntArray = mycorrhiza::intrinsics::rustc_clr_interop_managed_new_arr::<i32>(3);
+    mycorrhiza::intrinsics::rustc_clr_interop_managed_set_elem::<i32>(a, 0, 10);
+    mycorrhiza::intrinsics::rustc_clr_interop_managed_set_elem::<i32>(a, 1, 20);
+    mycorrhiza::intrinsics::rustc_clr_interop_managed_set_elem::<i32>(a, 2, 30);
+    a
+}

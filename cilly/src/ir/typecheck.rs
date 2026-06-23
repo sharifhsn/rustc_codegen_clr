@@ -990,6 +990,21 @@ impl CILNode {
                 };
                 Ok(asm[*tpe])
             }
+            CILNode::NewArr { elem, len } => {
+                let len_tpe = asm.get_node(*len).clone().typecheck(sig, locals, asm)?;
+                match len_tpe {
+                    Type::Int(Int::I32 | Int::U32 | Int::I64 | Int::USize | Int::ISize) => (),
+                    _ => {
+                        return Err(TypeCheckError::ArrIndexInvalidType {
+                            index_tpe: len_tpe,
+                        })
+                    }
+                }
+                Ok(Type::PlatformArray {
+                    elem: *elem,
+                    dims: std::num::NonZeroU8::new(1).unwrap(),
+                })
+            }
         }
     }
 }
@@ -1156,6 +1171,52 @@ impl CILRoot {
                             mname: asm[mref.name()].into(),
                         });
                     }
+                }
+                Ok(())
+            }
+            Self::StElem {
+                array,
+                index,
+                value,
+                elem,
+            } => {
+                let arr_tpe = asm.get_node(*array).clone().typecheck(sig, locals, asm)?;
+                let index_tpe = asm.get_node(*index).clone().typecheck(sig, locals, asm)?;
+                let value_tpe = asm.get_node(*value).clone().typecheck(sig, locals, asm)?;
+                let Type::PlatformArray { elem: arr_elem, dims } = arr_tpe else {
+                    return Err(TypeCheckError::LdLenArgNotArray { got: arr_tpe });
+                };
+                if dims.get() != 1 {
+                    return Err(TypeCheckError::LdLenArrNot1D { got: arr_tpe });
+                }
+                match index_tpe {
+                    Type::Int(Int::I32 | Int::U32 | Int::I64 | Int::USize | Int::ISize) => (),
+                    _ => return Err(TypeCheckError::ArrIndexInvalidType { index_tpe }),
+                }
+                let elem_tpe = asm[*elem];
+                // The declared element type must match the array's element type (modulo sign).
+                if !(asm[arr_elem] == elem_tpe
+                    || asm[arr_elem]
+                        .as_int()
+                        .zip(elem_tpe.as_int())
+                        .is_some_and(|(a, b)| a.as_unsigned() == b.as_unsigned()))
+                {
+                    return Err(TypeCheckError::WriteWrongValue {
+                        tpe: elem_tpe,
+                        value: asm[arr_elem],
+                    });
+                }
+                // The value being stored must be assignable to the element type (modulo sign).
+                if !(value_tpe.is_assignable_to(elem_tpe, asm)
+                    || value_tpe
+                        .as_int()
+                        .zip(elem_tpe.as_int())
+                        .is_some_and(|(a, b)| a.as_unsigned() == b.as_unsigned()))
+                {
+                    return Err(TypeCheckError::WriteWrongValue {
+                        tpe: elem_tpe,
+                        value: value_tpe,
+                    });
                 }
                 Ok(())
             }

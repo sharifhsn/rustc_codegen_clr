@@ -1320,6 +1320,7 @@ impl Assembly {
                 | CILNode::LdLen(_)
                 | CILNode::LocAllocAlgined { .. }
                 | CILNode::LdElelemRef { .. }
+                | CILNode::NewArr { .. }
                 | CILNode::UnboxAny { .. } => None,
             })
             .chain(self.iter_roots().filter_map(|root| match root {
@@ -1344,6 +1345,7 @@ impl Assembly {
                 | CILRoot::ReThrow
                 | CILRoot::SetStaticField { .. }
                 | CILRoot::CpObj { .. }
+                | CILRoot::StElem { .. }
                 | CILRoot::Unreachable(_) => None,
             }))
             .collect();
@@ -1811,6 +1813,37 @@ impl Assembly {
         let array = array.into_idx(self);
         let index = index.into_idx(self);
         self.alloc_node(CILNode::LdElelemRef { array, index })
+    }
+
+    /// Allocates a new 1-D managed (platform) array of `elem` with `len` elements (`newarr`).
+    pub fn new_arr(
+        &mut self,
+        elem: impl IntoAsmIndex<Interned<Type>>,
+        len: impl IntoAsmIndex<Interned<CILNode>>,
+    ) -> Interned<CILNode> {
+        let elem = elem.into_idx(self);
+        let len = len.into_idx(self);
+        self.alloc_node(CILNode::NewArr { elem, len })
+    }
+
+    /// Stores `value` (of element type `elem`) into managed array `array` at `index` (`stelem`).
+    pub fn st_elem(
+        &mut self,
+        array: impl IntoAsmIndex<Interned<CILNode>>,
+        index: impl IntoAsmIndex<Interned<CILNode>>,
+        value: impl IntoAsmIndex<Interned<CILNode>>,
+        elem: impl IntoAsmIndex<Interned<Type>>,
+    ) -> CILRoot {
+        let array = array.into_idx(self);
+        let index = index.into_idx(self);
+        let value = value.into_idx(self);
+        let elem = elem.into_idx(self);
+        CILRoot::StElem {
+            array,
+            index,
+            value,
+            elem,
+        }
     }
 
     /// Unboxes the managed `object` into a value of `tpe`.

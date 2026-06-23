@@ -56,6 +56,13 @@ pub enum CILRoot {
     Unreachable(Interned<IString>),
     /// Zero-initializes the value at *address* of *type*.
     InitObj(Interned<CILNode>, Interned<Type>),
+    /// Stores `value` (of element type `elem`) into the managed array `array` at `index` (`stelem`).
+    StElem {
+        array: Interned<CILNode>,
+        index: Interned<CILNode>,
+        value: Interned<CILNode>,
+        elem: Interned<Type>,
+    },
 }
 
 #[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
@@ -160,6 +167,12 @@ impl CILRoot {
                 args.into()
             }
             CILRoot::CpObj { src, dst, .. } => [src, dst].into(),
+            CILRoot::StElem {
+                array,
+                index,
+                value,
+                ..
+            } => [array, index, value].into(),
         }
     }
     pub fn nodes(&self) -> Box<[&Interned<CILNode>]> {
@@ -211,6 +224,12 @@ impl CILRoot {
                 args.into()
             }
             CILRoot::CpObj { src, dst, .. } => [src, dst].into(),
+            CILRoot::StElem {
+                array,
+                index,
+                value,
+                ..
+            } => [array, index, value].into(),
         }
     }
     /// Maps this root using `root_map` and `node_map`.
@@ -408,6 +427,23 @@ impl CILRoot {
                     .collect();
                 let ptr = asm.get_node(ptr).clone().map(asm, node_map);
                 let root = CILRoot::CallI(Box::new((asm.alloc_node(ptr), sig, args)));
+                root_map(root, asm)
+            }
+            CILRoot::StElem {
+                array,
+                index,
+                value,
+                elem,
+            } => {
+                let array = asm.get_node(array).clone().map(asm, node_map);
+                let index = asm.get_node(index).clone().map(asm, node_map);
+                let value = asm.get_node(value).clone().map(asm, node_map);
+                let root = CILRoot::StElem {
+                    array: asm.alloc_node(array),
+                    index: asm.alloc_node(index),
+                    value: asm.alloc_node(value),
+                    elem,
+                };
                 root_map(root, asm)
             }
         }

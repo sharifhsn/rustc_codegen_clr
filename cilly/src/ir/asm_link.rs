@@ -310,6 +310,13 @@ impl Assembly {
                 let tpe = self.alloc_type(tpe);
                 CILNode::UnboxAny { object, tpe }
             }
+            CILNode::NewArr { elem, len } => {
+                let elem = self.translate_type(source, source[*elem]);
+                let elem = self.alloc_type(elem);
+                let len = self.translate_node(source, source.get_node(*len).clone());
+                let len = self.alloc_node(len);
+                CILNode::NewArr { elem, len }
+            }
         }
     }
     // The complexity of this function is unavoidable.
@@ -515,6 +522,27 @@ impl Assembly {
                 let field = self.translate_static_field(source, *source.get_static_field(field));
                 let field = self.alloc_sfld(field);
                 CILRoot::SetStaticField { field, val }
+            }
+            CILRoot::StElem {
+                array,
+                index,
+                value,
+                elem,
+            } => {
+                let array = self.translate_node(source, source.get_node(array).clone());
+                let array = self.alloc_node(array);
+                let index = self.translate_node(source, source.get_node(index).clone());
+                let index = self.alloc_node(index);
+                let value = self.translate_node(source, source.get_node(value).clone());
+                let value = self.alloc_node(value);
+                let elem = self.translate_type(source, source[elem]);
+                let elem = self.alloc_type(elem);
+                CILRoot::StElem {
+                    array,
+                    index,
+                    value,
+                    elem,
+                }
             }
         }
     }

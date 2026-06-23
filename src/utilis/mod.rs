@@ -14,6 +14,8 @@ pub const MANAGED_LD_NULL: &str = "rustc_clr_interop_managed_ld_null";
 pub const MANAGED_CHECKED_CAST: &str = "rustc_clr_interop_managed_checked_cast";
 pub const MANAGED_IS_INST: &str = "rustc_clr_interop_managed_is_inst";
 pub const MANAGED_LD_ELEM_REF: &str = "rustc_clr_interop_managed_ld_elem_ref";
+pub const MANAGED_NEW_ARR: &str = "rustc_clr_interop_managed_new_arr";
+pub const MANAGED_SET_ELEM: &str = "rustc_clr_interop_managed_set_elem";
 pub const MANAGED_TRY_CATCH: &str = "rustc_clr_interop_try_catch";
 /// Raises a managed `System.Exception` directly (so a .NET caller can `catch` it) — distinct from a
 /// Rust `panic!`, which goes through the unwinder and does not propagate cleanly out to managed callers.

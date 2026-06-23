@@ -24,6 +24,13 @@ public static class Program
         catch (Exception) { threw = true; }
         Check("try_div(1,0) -> C# catch", threw, true, ref pass, ref total);
 
+        // Rust returns a first-class managed System.Int32[] (newarr + stelem), consumed as int[].
+        int[] ints = MainModule.make_ints();
+        Check("make_ints().Length", ints.Length, 3, ref pass, ref total);
+        Check("make_ints()[0]", ints[0], 10, ref pass, ref total);
+        Check("make_ints()[1]", ints[1], 20, ref pass, ref total);
+        Check("make_ints()[2]", ints[2], 30, ref pass, ref total);
+
         Console.WriteLine(pass == total ? "PASS" : $"FAIL ({pass}/{total})");
         return pass == total ? 0 : 1;
     }

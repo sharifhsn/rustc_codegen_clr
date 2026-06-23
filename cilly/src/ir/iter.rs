@@ -175,6 +175,7 @@ impl Iterator for CILIter<'_> {
                     | CILNode::IsInst(val, _)
                     | CILNode::CheckedCast(val, _)
                     | CILNode::LocAlloc { size: val }
+                    | CILNode::NewArr { len: val, .. }
                     | CILNode::UnboxAny { object: val, .. },
                 )
                 | CILIterElem::Root(
@@ -238,6 +239,35 @@ impl Iterator for CILIter<'_> {
                         *idx += 1;
                         let rhs = self.asm.get_node(blk.2);
                         self.elems.push((CILIterElem::Node(rhs.clone()), 0));
+                        continue;
+                    }
+                    _ => {
+                        self.elems.pop();
+                        continue;
+                    }
+                },
+                CILIterElem::Root(CILRoot::StElem {
+                    array,
+                    index,
+                    value,
+                    ..
+                }) => match idx {
+                    1 => {
+                        *idx += 1;
+                        let node = self.asm.get_node(*array);
+                        self.elems.push((CILIterElem::Node(node.clone()), 0));
+                        continue;
+                    }
+                    2 => {
+                        *idx += 1;
+                        let node = self.asm.get_node(*index);
+                        self.elems.push((CILIterElem::Node(node.clone()), 0));
+                        continue;
+                    }
+                    3 => {
+                        *idx += 1;
+                        let node = self.asm.get_node(*value);
+                        self.elems.push((CILIterElem::Node(node.clone()), 0));
                         continue;
                     }
                     _ => {
@@ -492,6 +522,7 @@ impl<'this, T: Iterator<Item = CILIterElem> + 'this> TpeIter<'this> for T {
                     | CILNode::CheckedCast(_, tpe)
                     | CILNode::LdTypeToken(tpe)
                     | CILNode::UnboxAny { tpe, .. }
+                    | CILNode::NewArr { elem: tpe, .. }
                     | CILNode::LocAllocAlgined { tpe, .. } => {
                         Some(Box::new(std::iter::once(asm[tpe])))
                     }
@@ -537,7 +568,9 @@ impl<'this, T: Iterator<Item = CILIterElem> + 'this> TpeIter<'this> for T {
                         let tpe = field.tpe();
                         Some(Box::new([class, tpe].into_iter()))
                     }
-                    CILRoot::CpObj { tpe, .. } | CILRoot::InitObj(_, tpe) => {
+                    CILRoot::CpObj { tpe, .. }
+                    | CILRoot::InitObj(_, tpe)
+                    | CILRoot::StElem { elem: tpe, .. } => {
                         Some(Box::new(std::iter::once(asm[tpe])))
                     }
                     // Since this method is called, then if it uses an "internal" type, we must assume it is defined in this module. Thus, its types are already included, and we don't need to include them again.

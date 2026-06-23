@@ -143,6 +143,23 @@ pub fn rustc_clr_interop_managed_call0_<
 pub fn rustc_clr_interop_managed_ld_len<T>(arr: RustcCLRInteropManagedArray<T, 1>) -> i32 {
     core::intrinsics::abort();
 }
+/// Allocates a new managed (.NET) 1-D array of `T` with `len` elements (`newarr`). The element type
+/// `T` must be a primitive that maps to a .NET primitive (e.g. `i32`/`i64`/`f64`).
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_clr_interop_managed_new_arr<T>(len: i32) -> RustcCLRInteropManagedArray<T, 1> {
+    core::intrinsics::abort();
+}
+/// Stores `val` into the managed array `arr` at `idx` (`stelem`).
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_clr_interop_managed_set_elem<T>(
+    arr: RustcCLRInteropManagedArray<T, 1>,
+    idx: i32,
+    val: T,
+) {
+    core::intrinsics::abort();
+}
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_ld_elem_ref<

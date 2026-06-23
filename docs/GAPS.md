@@ -164,5 +164,14 @@ throughput vs C# is not where this backend competes today.
   `last_os_error()` → `File::open(missing)` now `NotFound` (was `ErrorKind::Other`). Walls left honest
   (inode/dev/nlink=0 not faked, `ctime`=creation-time documented, `EACCES` Unix-host-best-effort,
   `create_dir` recursive = BCL wall). `pal_fsmeta` extended + green; gate 426/12.
-- WF-C / WF-G / WF-F — not started.
+- **WF-G part 1 (managed-array return)** — DONE. Two new IR ops `CILNode::NewArr` + `CILRoot::StElem`
+  (real `newarr`/`stelem`) threaded through every exhaustive match (interner/visitor/typecheck/opt/
+  il-exporter + asm `shallow_methodef_gc`); reuses the existing marker→`PlatformArray` return path. A
+  Rust `#[no_mangle]` fn now returns a first-class managed `System.Int32[]` to C# (not a ptr/len pair).
+  Verified: `cd_interop_tier2`'s `make_ints()` → `int[]{10,20,30}` consumed in C# (8/8 checks); gate
+  426/12. C-mode/JVM array return left as documented `todo!` (only .NET needed); arrays-of-structs/
+  strings + the **generic-interop bridge remain XL / scope-only**.
+- **WF-C (typechecker hard gate)** — HELD for owner OK (the safe investigate/triage can run; flipping
+  `ALLOW_MISCOMPILATIONS` off is a posture decision).
+- **WF-F (threading/TLS)** — HELD for owner OK (XL/architectural; scope-first).
 - Branch `gaps-campaign` (off `main` = pushed Tier-2 state); pushed to `mine/gaps-campaign`.

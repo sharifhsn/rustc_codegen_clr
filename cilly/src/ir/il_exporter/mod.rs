@@ -878,6 +878,10 @@ impl ILExporter {
                 self.export_node(asm, out, object, sig, locals)?;
                 writeln!(out, "unbox.any {object}", object = type_il(&asm[tpe], asm))
             }
+            CILNode::NewArr { elem, len } => {
+                self.export_node(asm, out, len, sig, locals)?;
+                writeln!(out, "newarr {elem}", elem = type_il(&asm[elem], asm))
+            }
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -1237,6 +1241,29 @@ impl ILExporter {
                     "ldstr {:?} newobj void [System.Runtime]System.Exception::.ctor(string) throw",
                     &asm[msg]
                 )
+            }
+            super::CILRoot::StElem {
+                array,
+                index,
+                value,
+                elem,
+            } => {
+                self.export_node(asm, out, array, sig, locals)?;
+                self.export_node(asm, out, index, sig, locals)?;
+                self.export_node(asm, out, value, sig, locals)?;
+                // Primitive element types use the dedicated `stelem.*` opcodes; everything else
+                // uses the generic typed `stelem <type>` form.
+                match asm[elem] {
+                    Type::Int(super::Int::I8 | super::Int::U8) => writeln!(out, "stelem.i1"),
+                    Type::Int(super::Int::I16 | super::Int::U16) => writeln!(out, "stelem.i2"),
+                    Type::Int(super::Int::I32 | super::Int::U32) => writeln!(out, "stelem.i4"),
+                    Type::Int(super::Int::I64 | super::Int::U64) => writeln!(out, "stelem.i8"),
+                    Type::Int(super::Int::ISize | super::Int::USize) => writeln!(out, "stelem.i"),
+                    Type::Bool => writeln!(out, "stelem.i1"),
+                    Type::Float(super::Float::F32) => writeln!(out, "stelem.r4"),
+                    Type::Float(super::Float::F64) => writeln!(out, "stelem.r8"),
+                    _ => writeln!(out, "stelem {elem}", elem = type_il(&asm[elem], asm)),
+                }
             }
         }
     }

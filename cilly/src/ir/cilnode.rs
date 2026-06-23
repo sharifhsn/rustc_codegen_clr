@@ -105,6 +105,11 @@ pub enum CILNode {
         object: Interned<CILNode>,
         tpe: Interned<Type>,
     },
+    /// Allocates a new 1-D managed (platform) array of `elem` with `len` elements (`newarr`).
+    NewArr {
+        elem: Interned<Type>,
+        len: Interned<CILNode>,
+    },
 }
 #[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
 pub enum PtrCastRes {
@@ -306,6 +311,7 @@ impl CILNode {
             | CILNode::LdElelemRef {
                 array: node_idx, ..
             }
+            | CILNode::NewArr { len: node_idx, .. }
             | CILNode::UnboxAny {
                 object: node_idx, ..
             } => vec![*node_idx],
@@ -505,6 +511,14 @@ impl CILNode {
                 let node = CILNode::UnboxAny {
                     object: asm.alloc_node(object),
                     tpe,
+                };
+                map(node, asm)
+            }
+            CILNode::NewArr { elem, len } => {
+                let len = asm.get_node(len).clone().map(asm, map);
+                let node = CILNode::NewArr {
+                    elem,
+                    len: asm.alloc_node(len),
                 };
                 map(node, asm)
             }

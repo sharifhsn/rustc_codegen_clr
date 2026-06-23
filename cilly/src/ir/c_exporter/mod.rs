@@ -758,6 +758,12 @@ impl CExporter {
                 "({object})",
                 object = Self::node_to_string(asm[object].clone(), asm, locals, inputs, sig)?
             ),
+            // Managed (platform) array construction has no C equivalent (it is a .NET GC object).
+            // C-mode managed-array support is a documented follow-up; the .NET (il) exporter is the
+            // tested target for this feature.
+            CILNode::NewArr { .. } => {
+                todo!("Managed-array construction (newarr) is not supported in C mode")
+            }
         })
     }
     fn root_to_string(
@@ -1021,6 +1027,11 @@ impl CExporter {
             CILRoot::CpObj { src, dst, tpe } => todo!(),
             CILRoot::Unreachable(string_idx) => {
                 format!("\neprintf({:?});\nabort();\n", &asm[string_idx])
+            }
+            // Storing into a managed (platform) array has no C equivalent. C-mode managed-array
+            // support is a documented follow-up; the .NET (il) exporter is the tested target.
+            CILRoot::StElem { .. } => {
+                todo!("Managed-array element store (stelem) is not supported in C mode")
             }
         })
     }
