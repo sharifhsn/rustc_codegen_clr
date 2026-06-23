@@ -534,6 +534,19 @@ pub fn bitreverse<'tcx>(
         Type::Int(int @ (Int::I32 | Int::U32 | Int::I64 | Int::U64 | Int::U128 | Int::I128)) => {
             bitreverse_int(val, int, ctx)
         }
+        // usize/isize: assume a 64-bit target (the same convention used by `ctlz` and the
+        // saturating isize arms). Widen to u64, reuse the tested `bitreverse_u64` helper, then
+        // narrow back. This avoids needing a separate `bitreverse_usize` patcher body.
+        Type::Int(Int::USize) => {
+            let widened = ctx.int_cast(val, Int::U64, ExtendKind::ZeroExtend);
+            let rev = bitreverse_int(widened, Int::U64, ctx);
+            ctx.int_cast(rev, Int::USize, ExtendKind::ZeroExtend)
+        }
+        Type::Int(Int::ISize) => {
+            let widened = ctx.int_cast(val, Int::U64, ExtendKind::ZeroExtend);
+            let rev = bitreverse_int(widened, Int::U64, ctx);
+            ctx.int_cast(rev, Int::ISize, ExtendKind::ZeroExtend)
+        }
         _ => todo!("can't yet bitreverse {val_tpe:?}"),
     };
     place_set(destination, value, ctx)

@@ -200,6 +200,26 @@ pub fn saturating_add<'tcx>(
             let diff_capped = ctx.call(mref, &[diff, min, max], IsPure::NOT);
             ctx.int_cast(diff_capped, Int::I8, cilly::cilnode::ExtendKind::SignExtend)
         }
+        Type::Int(Int::I128) => {
+            // There is no integer wider than 128 bits to widen-and-clamp into (the trick used by
+            // the <=64-bit signed arms), so detect overflow from the sign bits directly:
+            // signed add overflows iff both operands share a sign and the result's sign differs,
+            // i.e. `(a ^ sum) & (b ^ sum) < 0`. On overflow, saturate toward the operands' shared
+            // sign: `i128::MAX` if `b >= 0`, else `i128::MIN`.
+            let sum = crate::binop::add_unchecked(a_ty, a_ty, ctx, a, b);
+            let a_xor_sum = crate::binop::bitop::bit_xor_unchecked(a_ty, a_ty, ctx, a, sum);
+            let b_xor_sum = crate::binop::bitop::bit_xor_unchecked(a_ty, a_ty, ctx, b, sum);
+            let and = crate::binop::bitop::bit_and_unchecked(a_ty, a_ty, ctx, a_xor_sum, b_xor_sum);
+            let zero = ctx.alloc_node(0_i128);
+            let overflow = crate::binop::cmp::lt_unchecked(a_ty, and, zero, ctx);
+            // Pick the saturation target based on the sign of `b`.
+            let zero2 = ctx.alloc_node(0_i128);
+            let b_neg = crate::binop::cmp::lt_unchecked(a_ty, b, zero2, ctx);
+            let max = ctx.alloc_node(i128::MAX);
+            let min = ctx.alloc_node(i128::MIN);
+            let saturated = ctx.select(a_type, min, max, b_neg);
+            ctx.select(a_type, saturated, sum, overflow)
+        }
         _ => todo!("Can't use the intrinsic `saturating_add` on {a_type:?}"),
     };
     place_set(destination, calc, ctx)
@@ -376,6 +396,24 @@ pub fn saturating_sub<'tcx>(
             let max = ctx.alloc_node(i32::from(i8::MAX));
             let diff_capped = ctx.call(clamp, &[diff, min, max], IsPure::NOT);
             ctx.int_cast(diff_capped, Int::I8, cilly::cilnode::ExtendKind::SignExtend)
+        }
+        Type::Int(Int::I128) => {
+            // No wider integer exists to clamp into (see the I128 add arm). Signed sub overflows
+            // iff the operands have different signs and the result's sign differs from `a`, i.e.
+            // `(a ^ b) & (a ^ diff) < 0`. On overflow saturate to `i128::MAX` when `b < 0` (the
+            // subtraction pushed the value up) else to `i128::MIN`.
+            let diff = crate::binop::sub_unchecked(a_ty, a_ty, ctx, a, b);
+            let a_xor_b = crate::binop::bitop::bit_xor_unchecked(a_ty, a_ty, ctx, a, b);
+            let a_xor_diff = crate::binop::bitop::bit_xor_unchecked(a_ty, a_ty, ctx, a, diff);
+            let and = crate::binop::bitop::bit_and_unchecked(a_ty, a_ty, ctx, a_xor_b, a_xor_diff);
+            let zero = ctx.alloc_node(0_i128);
+            let overflow = crate::binop::cmp::lt_unchecked(a_ty, and, zero, ctx);
+            let zero2 = ctx.alloc_node(0_i128);
+            let b_neg = crate::binop::cmp::lt_unchecked(a_ty, b, zero2, ctx);
+            let max = ctx.alloc_node(i128::MAX);
+            let min = ctx.alloc_node(i128::MIN);
+            let saturated = ctx.select(a_type, max, min, b_neg);
+            ctx.select(a_type, saturated, diff, overflow)
         }
         _ => todo!("Can't use the intrinsic `saturating_sub` on {a_type:?}"),
     };

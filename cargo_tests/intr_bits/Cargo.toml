@@ -1,0 +1,9 @@
+[package]
+name = "intr_bits"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+# Own workspace so it escapes the repo root workspace.
+[workspace]

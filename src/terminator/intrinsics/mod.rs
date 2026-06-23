@@ -534,6 +534,14 @@ pub fn handle_intrinsic<'tcx>(
                 Type::Int(Int::I32) => ctx.int_cast(input, Int::I32, ExtendKind::SignExtend),
                 Type::Int(Int::I64) => ctx.int_cast(input, Int::I64, ExtendKind::SignExtend),
                 Type::Int(Int::ISize) => ctx.int_cast(input, Int::ISize, ExtendKind::SignExtend),
+                // 128-bit targets: `IntCast` to {U,I}128 is unimplemented in the IL exporter, so
+                // route through `casts::float_to_int`, which emits the BCL float->{U,I}128
+                // `op_Explicit` conversion operator (mirrors the f32/f64 -> int cast paths above).
+                Type::Int(Int::U128 | Int::I128) => {
+                    let src = ctx.monomorphize(args[0].node.ty(ctx.body(), ctx.tcx()));
+                    let src = ctx.type_from_cache(src);
+                    crate::casts::float_to_int(src, tpe, input, ctx)
+                }
                 _ => todo!("can't float_to_int_unchecked on {tpe:?}"),
             };
             vec![place_set(destination, value, ctx)]
