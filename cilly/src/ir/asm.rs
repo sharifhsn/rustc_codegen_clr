@@ -181,14 +181,51 @@ impl Assembly {
         let field = field.into_idx(self);
         self.alloc_node(CILNode::LdFieldAddress { addr, field })
     }
-    pub fn typecheck(&mut self) {
+    /// Run the CIL type-verifier over every emitted method.
+    ///
+    /// Wiring for Phase P1 of `docs/ABSOLUTE_CORRECTNESS_PLAN.md` (invariant I1). Behaviour is
+    /// controlled by three env flags (declared in `cilly/src/lib.rs`):
+    ///  * `TYPECHECK_CIL` / `VERIFY_METHODS` — if *both* are `0`, the verifier is skipped entirely
+    ///    (escape hatch; default is on).
+    ///  * `ALLOW_MISCOMPILATIONS` — when `true` (default) a violation is logged and codegen
+    ///    continues (historical advisory behaviour); when `false` the **first** violation makes this
+    ///    function `panic!`, naming the offending method + the typecheck error, which aborts the
+    ///    rustc/linker process and fails the build. That is the "fatal type gate".
+    ///
+    /// Returns the number of methods that failed to typecheck (0 when the assembly is clean). Callers
+    /// in advisory mode may ignore it; in fatal mode a non-zero count never returns (we panic first).
+    pub fn typecheck(&mut self) -> usize {
+        // Read the wiring flags once, then delegate to the pure-policy implementation. Splitting it
+        // out keeps the fatal/advisory decision unit-testable without fighting the env `LazyLock`s.
+        let enabled = *crate::TYPECHECK_CIL || *crate::VERIFY_METHODS;
+        let fatal = !*crate::ALLOW_MISCOMPILATIONS;
+        self.typecheck_with_policy(enabled, fatal)
+    }
+    /// Policy core of [`Assembly::typecheck`]. `enabled` gates the whole pass; `fatal` makes the
+    /// first violation `panic!` (the I1 build-failing gate) instead of just logging it.
+    pub fn typecheck_with_policy(&mut self, enabled: bool, fatal: bool) -> usize {
+        if !enabled {
+            return 0;
+        }
         let method_def_idxs: Box<[_]> = self.method_defs.keys().copied().collect();
+        let mut violations = 0usize;
         for method in method_def_idxs {
             let mut tmp_method = self.method_def(method).clone();
             if let Err(err) = tmp_method.typecheck(self) {
-                eprintln!("{err:?}");
+                violations += 1;
+                let mname = self[self[method].name()].to_string();
+                if fatal {
+                    // Fatal type gate: never emit an ill-typed method.
+                    panic!(
+                        "CIL type-verifier rejected method `{mname}`: {err:?}. \
+                         Refusing to emit ill-typed CIL (ALLOW_MISCOMPILATIONS=0). \
+                         This is invariant I1 of the absolute-correctness plan."
+                    );
+                }
+                eprintln!("Typecheck violation in method `{mname}`: {err:?}");
             };
         }
+        violations
     }
     #[must_use]
     pub fn class_defs(&self) -> &FxHashMap<ClassDefIdx, ClassDef> {

@@ -806,6 +806,7 @@ run_test! {intrinsics,trigonometry,stable}
 run_test! {intrinsics,type_id,stable}
 run_test! {intrinsics,wrapping_ops,stable}
 run_test! {iter,fold,stable}
+run_test! {iter,array_byval,stable}
 run_test! {statics,thread_local,stable}
 run_test! {std,arg_test,stable}
 run_test! {std,getopt,stable}

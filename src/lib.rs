@@ -301,7 +301,10 @@ impl CodegenBackend for MyBackend {
             );
             let mut prepared = asm.prepared();
             prepared.opt(&mut prepared.fuel_from_env());
-            prepared.typecheck();
+            // Phase P1 type gate: in fatal mode (ALLOW_MISCOMPILATIONS=0) this aborts the build on
+            // the first ill-typed method; in the default advisory mode it returns the violation
+            // count, which we intentionally drop here (per-method warnings are already emitted).
+            let _typecheck_violations = prepared.typecheck();
             asm_out
                 .write_all(
                     &postcard::to_stdvec(&prepared)

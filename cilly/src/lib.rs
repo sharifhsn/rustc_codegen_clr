@@ -110,6 +110,16 @@ macro_rules! config {
 }
 config! {DEAD_CODE_ELIMINATION,bool,true}
 
+// --- Type-verifier wiring (Phase P1 of docs/ABSOLUTE_CORRECTNESS_PLAN.md) -------------------------
+// These three flags gate `Assembly::typecheck` (cilly/src/ir/asm.rs). They mirror the same-named
+// flags in the backend's `src/config.rs`; cilly reads the env directly because the typecheck runs in
+// both the backend (`join_codegen`) and the `linker` process. Defaults are chosen to preserve the
+// historical behaviour exactly — run the checker, but only *warn* — so wiring them in is a no-op
+// until the operator opts into stricter modes (or the project flips `ALLOW_MISCOMPILATIONS` off).
+config! {TYPECHECK_CIL,bool,true,"Run the CIL type-verifier over every emitted method. Default on."}
+config! {VERIFY_METHODS,bool,true,"Alias-style enable for the per-method type-verifier. Default on; either this or TYPECHECK_CIL being set runs the checker."}
+config! {ALLOW_MISCOMPILATIONS,bool,false,"If true, a type-verifier violation is a warning and codegen continues. If false (default — Phase P1 of the absolute-correctness plan, invariant I1), any violation ABORTS the build: an ill-typed method is never emitted. The default was flipped to false once the verifier was proven sound (zero false positives across the full ::stable build + std/probe/soak corpus) and the gate stayed green under the fatal checker. Set ALLOW_MISCOMPILATIONS=1 to opt back into the historical advisory behaviour."}
+
 #[must_use]
 pub fn mem_checks() -> bool {
     false

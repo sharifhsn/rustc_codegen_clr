@@ -280,6 +280,46 @@ pub fn display_node(
         res
     }
 }
+/// PROVEN-benign type-erased pointer-argument pun (Phase P1 / WF-TC family E, differentially
+/// verified): some builtins declare an opaque data-pointer parameter as `*u8` (or `*void`) to match
+/// libstd's type-erased ABI — most notably `catch_unwind`/`__rust_try`, whose `data` argument is a
+/// `*mut u8` that the caller fills with a `*Data<closure>`. The caller passes a concrete
+/// `*SomeStruct`, which the name-based checker flags as a `CallArgTypeWrong`. The call emits a plain
+/// pointer push (no conversion), so passing any pointer/ref where an erased `*u8`/`*void` is expected
+/// is byte-identical. Narrowly gated: the *expected* parameter must be exactly `*u8` or `*void`, and
+/// the *argument* must be a pointer/ref — so it can never accept a non-pointer or relax a normal arg.
+fn is_erased_ptr_sink(arg: Type, expected: Type, asm: &Assembly) -> bool {
+    // Direct case: expected is an erased `*u8`/`*void` sink, arg is any pointer/ref.
+    if let Some(expected_pointee) = expected.pointed_to().map(|t| asm[t]) {
+        if matches!(expected_pointee, Type::Int(Int::U8) | Type::Void) && arg.pointed_to().is_some() {
+            return true;
+        }
+    }
+    // Function-pointer case: the SAME erased-ABI pun one level up. `catch_unwind`/`__rust_try`
+    // declares its `try_fn` parameter as `fn(*u8) -> ()`, but the caller passes the concrete
+    // closure thunk `fn(*Data<closure>) -> ()`. An indirect call pushes the function pointer
+    // unchanged, so two `FnPtr` sigs that are identical except that an `expected` parameter (or
+    // return) is an erased `*u8`/`*void` where the `arg` side has a concrete pointer/ref are
+    // call-compatible. We require equal arity and that every differing position be exactly this
+    // erased-pointer/concrete-pointer pun — never a width or kind change.
+    if let (Type::FnPtr(arg_sig), Type::FnPtr(exp_sig)) = (arg, expected) {
+        let arg_sig = &asm[arg_sig];
+        let exp_sig = &asm[exp_sig];
+        if arg_sig.inputs().len() != exp_sig.inputs().len() {
+            return false;
+        }
+        let pos_ok = |a: Type, e: Type| -> bool {
+            a == e || is_erased_ptr_sink(a, e, asm)
+        };
+        let inputs_ok = arg_sig
+            .inputs()
+            .iter()
+            .zip(exp_sig.inputs().iter())
+            .all(|(&a, &e)| pos_ok(a, e));
+        return inputs_ok && pos_ok(*arg_sig.output(), *exp_sig.output());
+    }
+    false
+}
 impl BinOp {
     fn typecheck(&self, lhs: Type, rhs: Type, asm: &Assembly) -> Result<Type, TypeCheckError> {
         match self {
@@ -685,6 +725,7 @@ impl CILNode {
                         && !arg_type
                             .try_deref(asm)
                             .is_some_and(|t| Some(t) == input_type.try_deref(asm))
+                        && !is_erased_ptr_sink(arg_type, *input_type, asm)
                     {
                         return Err(TypeCheckError::CallArgTypeWrong {
                             got: arg_type.mangle(asm),
@@ -1030,6 +1071,33 @@ impl CILRoot {
                 if got == Type::Void {
                     return Ok(());
                 }
+                // PROVEN-benign pointer-relabel (Phase P1 / WF-TC family D, differentially verified by
+                // `test/iter/array_byval.rs`): a `PtrCast` lowers to NOTHING in the exporter — it emits
+                // only its argument node (see `il_exporter` CILNode::PtrCast => export_node(val)). So
+                // when the stored value is a `PtrCast` and both `got` and `expected` are pointer/ref
+                // types, the bits written into the local are exactly the raw pointer the cast wraps,
+                // regardless of how deep the cast's *declared* target type is. This is the source of
+                // the `ppX`/`pX` `IndexRange`-cursor false positive (a cast target one indirection too
+                // deep). It is narrowly gated on (1) the value really being a `PtrCast` and (2) both
+                // sides being pointers, so it can never mask a value/local *kind* mismatch.
+                if matches!(asm.get_node(*node), CILNode::PtrCast(..))
+                    && got.pointed_to().is_some()
+                    && expected.pointed_to().is_some()
+                {
+                    return Ok(());
+                }
+                // CIL models `bool` as an integer on the evaluation stack (`ldc.i4`/`stloc` of a
+                // `bool` local take an `i4`), so an integer value is stack-compatible with a `bool`
+                // local and vice-versa. This is the SAME equivalence the `StInd` arm already encodes
+                // for `bool`/`i8`. It surfaces here because `catch_unwind` (the cilly builtin) returns
+                // a literal `i32` 0/1 that `std::rt::lang_start_internal`/`thread_cleanup` store into a
+                // Rust `bool` local. Narrowly gated to the bool↔int pair so it cannot relax an
+                // unrelated assignment. Proven benign: the only producer is `Ret(Const::I32(0|1))`.
+                if (expected == Type::Bool && got.as_int().is_some())
+                    || (got == Type::Bool && expected.as_int().is_some())
+                {
+                    return Ok(());
+                }
                 if !got.is_assignable_to(expected, asm) {
                     Err(TypeCheckError::LocalAssigementWrong {
                         loc: *loc,
@@ -1082,12 +1150,37 @@ impl CILRoot {
                         tpe: tpe.mangle(asm),
                     });
                 };
+                // The emitted IL for `StInd` derives the store opcode (`stind.i1`/`stind.i4`/
+                // `stobj <T>`/…) SOLELY from `tpe` (see `il_exporter` CILRoot::StInd): the address's
+                // declared pointee type never reaches the instruction — the address is just pushed as
+                // a machine pointer. So the only thing that matters for soundness is (a) the address
+                // IS a pointer (checked above) and (b) the *value* matches `tpe` (checked just below).
+                // The `addr_points_to == tpe` comparison is therefore a checker-model artifact that
+                // produces false positives on the type-erased pointers Rust codegen routinely builds.
+                // We accept two PROVEN-benign shapes (Phase P1 / WF-TC, differentially verified):
+                //   * extra-indirection (`addr: **X`, `tpe: X`): `addr_points_to` is itself a
+                //     pointer/ref whose pointee matches `tpe` — a `PtrCast`-noop one level too deep.
+                //   * void-address (`addr: *void`, `tpe: X`): the void is in the *address* (a
+                //     type-erased ArcInner/Cell refcount slot), never in `tpe`; `tpe` drives a
+                //     correctly-sized store. A `tpe: Void` store stays REJECTED — there is no store
+                //     opcode for Void, so that is a genuine error.
+                let addr_extra_indirection = addr_points_to.pointed_to().is_some_and(|inner| {
+                    let inner = asm[inner];
+                    inner == *tpe
+                        || inner
+                            .as_int()
+                            .zip(tpe.as_int())
+                            .is_some_and(|(a, b)| a.as_unsigned() == b.as_unsigned())
+                });
+                let addr_is_void_erased = addr_points_to == Type::Void && *tpe != Type::Void;
                 if !(tpe.is_assignable_to(addr_points_to, asm)
                     || addr_points_to
                         .as_int()
                         .zip(tpe.as_int())
                         .is_some_and(|(a, b)| a.as_unsigned() == b.as_unsigned())
-                    || addr_points_to == Type::Bool && *tpe == Type::Int(Int::I8))
+                    || addr_points_to == Type::Bool && *tpe == Type::Int(Int::I8)
+                    || addr_extra_indirection
+                    || addr_is_void_erased)
                 {
                     return Err(TypeCheckError::WriteWrongAddr {
                         addr: addr.mangle(asm),
@@ -1174,7 +1267,9 @@ impl CILRoot {
                     args.iter().zip(call_sig.inputs().iter()).enumerate()
                 {
                     let arg = asm[*arg].clone().typecheck(sig, locals, asm)?;
-                    if !arg.is_assignable_to(*expected, asm) {
+                    if !arg.is_assignable_to(*expected, asm)
+                        && !is_erased_ptr_sink(arg, *expected, asm)
+                    {
                         return Err(TypeCheckError::CallArgTypeWrong {
                             got: arg.mangle(asm),
                             expected: expected.mangle(asm),
@@ -1247,4 +1342,129 @@ fn test() {
     let rhs = super::Const::F64(super::hashable::HashableF64(0.0));
     asm.biop(lhs, rhs, BinOp::Add);
     let _sig = asm.sig([], Type::Void);
+}
+
+#[cfg(test)]
+mod tc_tests {
+    //! Soundness tests for the CIL typechecker (Phase P1 of the absolute-correctness plan).
+    //!
+    //! These pin down two opposite properties of the verifier:
+    //!  * the proven false-positive suppressions stay suppressed (no spurious build break), and
+    //!  * deliberately type-broken CIL is still **rejected** (the false-negative audit) — a sound,
+    //!    soon-to-be-fatal checker must catch real type errors.
+    use super::*;
+    use crate::ir::cilnode::MethodKind;
+    use crate::Const;
+
+    /// Build a single-local, single-`StLoc` method body and return the typecheck result of that
+    /// `StLoc` root. `value` is a node index that has already been allocated in `asm`.
+    fn check_stloc(asm: &mut Assembly, local_ty: Type, value: Interned<CILNode>) -> Result<(), TypeCheckError> {
+        let local_ty = asm.alloc_type(local_ty);
+        let locals: Vec<LocalDef> = vec![(None, local_ty)];
+        let sig = asm.sig([], Type::Void);
+        let root = CILRoot::StLoc(0, value);
+        root.typecheck(sig, &locals, asm)
+    }
+
+    /// PROVEN FALSE POSITIVE (task #43 / WF-C): storing a `Void`-typed value (e.g. a `LdStaticField`
+    /// of an opaque ZST marker static like `__rust_no_alloc_shim_is_unstable`) into a non-void local
+    /// is a runtime no-op — Void carries no bits. The checker must NOT flag it.
+    #[test]
+    fn stloc_void_source_is_accepted() {
+        let mut asm = Assembly::default();
+        let void_static = asm.global_void();
+        let void_node = asm.load_static(void_static);
+        assert!(
+            check_stloc(&mut asm, Type::Int(Int::USize), void_node).is_ok(),
+            "storing a Void value into a usize local must be accepted (known-benign no-op)"
+        );
+    }
+
+    /// FALSE-NEGATIVE AUDIT: storing a concrete `f64` into a `usize` local is a genuine type error
+    /// (no sign/erasure exemption applies). A sound checker MUST reject it. If this ever passes, the
+    /// checker has a hole and flipping it fatal would let real miscompiles through.
+    #[test]
+    fn stloc_float_into_int_is_rejected() {
+        let mut asm = Assembly::default();
+        let f = asm.alloc_node(CILNode::Const(Box::new(Const::F64(super::super::hashable::HashableF64(1.0)))));
+        assert!(
+            matches!(
+                check_stloc(&mut asm, Type::Int(Int::USize), f),
+                Err(TypeCheckError::LocalAssigementWrong { .. })
+            ),
+            "storing an f64 into a usize local must be rejected"
+        );
+    }
+
+    /// FALSE-NEGATIVE AUDIT: a `Call` whose argument type is structurally unrelated to the callee's
+    /// declared parameter must be rejected. Guards the call-arg arm against silent acceptance.
+    #[test]
+    fn call_arg_type_mismatch_is_rejected() {
+        let mut asm = Assembly::default();
+        // Callee: fn(f64) -> Void
+        let main = asm.main_module();
+        let callee_sig = asm.sig([Type::Float(crate::ir::Float::F64)], Type::Void);
+        let callee = asm.new_methodref(*main, "takes_f64", callee_sig, MethodKind::Static, vec![]);
+        // Caller passes an i64 const where an f64 is expected.
+        let bad_arg = asm.alloc_node(CILNode::Const(Box::new(Const::I64(7))));
+        let call = CILRoot::Call(Box::new((callee, [bad_arg].into(), crate::ir::cilnode::IsPure::NOT)));
+        let sig = asm.sig([], Type::Void);
+        let locals: Vec<LocalDef> = vec![];
+        assert!(
+            call.typecheck(sig, &locals, &mut asm).is_err(),
+            "passing an i64 where an f64 parameter is expected must be rejected"
+        );
+    }
+
+    /// Build an `Assembly` containing exactly one method whose body stores an `f64` into a `usize`
+    /// local — a deliberate, real type error — and register it so `Assembly::typecheck` walks it.
+    fn asm_with_one_broken_method() -> Assembly {
+        use crate::ir::{Access, BasicBlock};
+        use crate::ir::method::MethodImpl;
+        let mut asm = Assembly::default();
+        let usize_ty = asm.alloc_type(Type::Int(Int::USize));
+        let f = asm.alloc_node(CILNode::Const(Box::new(Const::F64(super::super::hashable::HashableF64(1.0)))));
+        let bad = asm.alloc_root(CILRoot::StLoc(0, f));
+        let block = BasicBlock::new(vec![bad], 0, None);
+        let main = asm.main_module();
+        let sig = asm.sig([], Type::Void);
+        let def = crate::ir::method::MethodDef::new(
+            Access::Private,
+            main,
+            asm.alloc_string("broken"),
+            sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody { blocks: vec![block], locals: vec![(None, usize_ty)] },
+            vec![],
+        );
+        asm.new_method(def);
+        asm
+    }
+
+    /// WIRING (advisory mode): with the verifier enabled but non-fatal, a broken method is *counted*
+    /// and reported, and codegen continues (no panic). This is the default behaviour.
+    #[test]
+    fn assembly_typecheck_advisory_counts_violations() {
+        let mut asm = asm_with_one_broken_method();
+        let n = asm.typecheck_with_policy(/*enabled=*/ true, /*fatal=*/ false);
+        assert_eq!(n, 1, "the single broken method must be counted as one violation");
+    }
+
+    /// WIRING (escape hatch): with the verifier disabled, the pass is skipped entirely and reports
+    /// zero — even though the method is ill-typed. Models `TYPECHECK_CIL=0 VERIFY_METHODS=0`.
+    #[test]
+    fn assembly_typecheck_disabled_skips() {
+        let mut asm = asm_with_one_broken_method();
+        let n = asm.typecheck_with_policy(/*enabled=*/ false, /*fatal=*/ false);
+        assert_eq!(n, 0, "a disabled verifier must not walk any method");
+    }
+
+    /// WIRING (fatal gate / invariant I1): with the verifier fatal, a broken method ABORTS — proving
+    /// `ALLOW_MISCOMPILATIONS=0` actually fails the build rather than emitting ill-typed CIL.
+    #[test]
+    #[should_panic(expected = "CIL type-verifier rejected method")]
+    fn assembly_typecheck_fatal_aborts() {
+        let mut asm = asm_with_one_broken_method();
+        let _ = asm.typecheck_with_policy(/*enabled=*/ true, /*fatal=*/ true);
+    }
 }

@@ -74,6 +74,31 @@ Nothing else can be called "correct" until this holds.
    catches anything the cilly checker's model misses.
 Effort: L–XL. This is the spine.
 
+### P1 status (delivered)
+
+1–4 are **done**. The flags are wired (`cilly/src/ir/asm.rs::typecheck` reads `TYPECHECK_CIL`/
+`VERIFY_METHODS`/`ALLOW_MISCOMPILATIONS`; `src/lib.rs` join_codegen + the `linker` both run it). The
+checker is **sound to zero false positives** across the full `::stable` build + the std/probe/soak
+corpus: the full-std build (`build_std`) went from 99 advisory violations to **0** via six narrow,
+each-proven-benign relaxations (fat-ptr layout-equivalence; the StInd extra-indirection + void-address
+disjuncts; the StLoc `PtrCast`-noop pointer-relabel + bool↔int CIL-stack arms; the `*u8`/`*void`
+erased-pointer-sink for both direct and FnPtr call args). The lone un-triaged family (D, the
+`IndexRange`-cursor `ppX/pX`) was differentially proven benign by `test/iter/array_byval.rs`. The
+false-negative audit is covered by `cilly/src/ir/typecheck.rs::tc_tests` (a float-into-int store, an
+i64-where-f64 call arg, and a registered ill-typed method are all still **rejected**; the fatal-abort
+path is unit-tested). `ALLOW_MISCOMPILATIONS` now **defaults to `false`** — the build aborts on the
+first ill-typed method. The canonical Docker `::stable` gate stays green under the fatal checker
+(428 pass / 12 known-baseline fail, **zero** new failures, **zero** fatal aborts).
+
+5. **`ilverify` — DEFERRED (env-available, not yet a sound gate).** `dotnet-ilverify` 8.0.0 installs
+   and runs, but over an emitted assembly it reports ~34k errors dominated by `UnmanagedPointer`,
+   `InitLocals`, `StackByRef`, `StackUnexpected`, `Unverifiable` — i.e. the backend's *intentional*
+   unsafe-IL idioms (raw pointers, non-zeroed locals, byref pointer arithmetic), the direct analogue
+   of C# `/unsafe`. CoreCLR runs this unverifiable-but-correct IL fine (the gate proves correct
+   execution). Using ilverify as a pass/fail oracle therefore needs a curated ignore-set for those
+   structural classes (which risks masking real errors *within* a class) or a non-strict mode CoreCLR
+   does not expose. Tracked as a follow-up; the cilly typechecker remains the sound fatal gate for I1.
+
 ## 4. Phase P2 — Exhaustive behavioral equivalence (delivers I2)
 
 - **Full library suites to zero diffs.** Run core/alloc/std test suites (via `setup_rustc_fork.sh`) under

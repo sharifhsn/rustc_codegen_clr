@@ -49,7 +49,10 @@ fn main() {
         let body = body.trim().trim_matches(')').trim();
         let stem = stem.trim();
         match stem {
-            "typecheck" => asm.typecheck(),
+            "typecheck" => {
+                let n = asm.typecheck();
+                eprintln!("typecheck: {n} method(s) failed");
+            }
             "simptypes" => {
                 let start = std::time::Instant::now();
                 let mut simplify_candidates = FxHashSet::default();

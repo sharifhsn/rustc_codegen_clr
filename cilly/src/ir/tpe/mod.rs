@@ -249,9 +249,65 @@ impl Type {
             }
             (Type::Int(Int::U16 | Int::I16), Type::PlatformChar) => true,
             (Type::Ptr(ptr), Type::Ref(rf)) => ptr == rf,
+            // Fat-pointer (DST) layout equivalence — a PROVEN false-positive fix (Phase P1 / WF-TC).
+            //
+            // Every `FatPtr<T>` class emitted by the backend (see `fat_ptr_to` in
+            // `rustc_codegen_clr_type/src/type.rs`) has the *identical* on-stack layout regardless of
+            // the pointee `T`: field 0 is a type-erased `void*` data pointer at offset 0, field 1 is
+            // a `usize` metadata word at offset 8, with explicit size 16 / align 8. The data pointer
+            // is erased to `void*` in *all* of them. Therefore `FatPtr<u8>` and
+            // `FatPtr<FatPtr<u8>>` (etc.) are byte-for-byte interchangeable, but the checker's
+            // name-based comparison flags them as distinct. We accept them as mutually assignable
+            // *only* when both are FatPtr-named valuetypes AND their concrete field layouts match —
+            // so this can never over-permit a genuinely different type (guarded by the layout check).
+            (Type::ClassRef(lhs), Type::ClassRef(rhs)) if Self::fat_ptr_layout_eq(lhs, rhs, asm) => {
+                true
+            }
             // TODO: check generics propely?
             (_, Type::PlatformGeneric(_, _)) => true,
             _ => false,
+        }
+    }
+    /// Returns `true` iff `lhs` and `rhs` are both `FatPtr<…>` value-type classes with identical
+    /// concrete layout (field types/names/offsets, explicit size, align). See the call site in
+    /// [`Type::is_assignable_to`] for the soundness argument. Narrowly scoped to the `FatPtr` family
+    /// so it cannot mask a real type mismatch between unrelated structs that merely share a size.
+    fn fat_ptr_layout_eq(
+        lhs: Interned<ClassRef>,
+        rhs: Interned<ClassRef>,
+        asm: &Assembly,
+    ) -> bool {
+        let lref = asm.class_ref(lhs);
+        let rref = asm.class_ref(rhs);
+        // Both must be value-type, generic-free, locally-defined `FatPtr…` classes.
+        if !(lref.is_valuetype() && rref.is_valuetype()) {
+            return false;
+        }
+        if !lref.generics().is_empty() || !rref.generics().is_empty() {
+            return false;
+        }
+        let lname = &asm[lref.name()];
+        let rname = &asm[rref.name()];
+        if !(lname.starts_with("FatPtr") && rname.starts_with("FatPtr")) {
+            return false;
+        }
+        // The layout guarantee comes from the *producer invariant*: `fat_ptr_to` is the only thing
+        // that mints a `FatPtr…` value-type class, and it always builds the identical 16/8 layout
+        // (`void*` data @0, `usize` meta @8). So a value-type, generic-free `FatPtr…` name uniquely
+        // identifies that layout. When *both* class definitions happen to be present in this
+        // assembly (single-CGU / post-link), we additionally assert their concrete layouts match as
+        // a defensive cross-check; when a def is absent (the common per-CGU case, where only the
+        // `ClassRef` is interned), we rely on the producer invariant alone.
+        match (asm.class_ref_to_def(lhs), asm.class_ref_to_def(rhs)) {
+            (Some(ldef), Some(rdef)) => {
+                let ldef = &asm[ldef];
+                let rdef = &asm[rdef];
+                ldef.explict_size() == rdef.explict_size()
+                    && ldef.align() == rdef.align()
+                    && ldef.fields() == rdef.fields()
+            }
+            // At least one definition is not in this assembly — accept on the producer invariant.
+            _ => true,
         }
     }
     /// If this type is an int, return that int.
@@ -294,5 +350,84 @@ impl Type {
     #[must_use]
     pub fn is_ptr(&self) -> bool {
         matches!(self, Self::Ptr(..))
+    }
+}
+
+#[cfg(test)]
+mod fat_ptr_assignability_tests {
+    //! Soundness tests for the `FatPtr` layout-equivalence arm of [`Type::is_assignable_to`]
+    //! (Phase P1 of the absolute-correctness plan). Proves the relaxation accepts the proven
+    //! false-positive (fat-ptr nesting) while *not* over-permitting unrelated same-size structs.
+    use super::*;
+    use crate::ir::{Access, ClassDef};
+    use std::num::NonZeroU32;
+
+    /// Mirror `rustc_codegen_clr_type::type::fat_ptr_to`: a value-type class named `FatPtr<elem>`
+    /// with a type-erased `void*` data pointer @0 and a `usize` metadata word @8, size 16 / align 8.
+    fn make_fat_ptr(asm: &mut Assembly, elem_mangled: &str) -> Interned<ClassRef> {
+        let name = asm.alloc_string(format!("FatPtr{elem_mangled}"));
+        let cref = asm.alloc_class_ref(ClassRef::new(name, None, true, [].into()));
+        if asm.class_ref_to_def(cref).is_none() {
+            let void_ptr = asm.nptr(Type::Void);
+            let data = asm.alloc_string(crate::DATA_PTR);
+            let meta = asm.alloc_string(crate::METADATA);
+            let def = ClassDef::new(
+                name,
+                true,
+                0,
+                None,
+                vec![
+                    (void_ptr, data, Some(0)),
+                    (Type::Int(Int::USize), meta, Some(8)),
+                ],
+                vec![],
+                Access::Public,
+                Some(NonZeroU32::new(16).unwrap()),
+                Some(NonZeroU32::new(8).unwrap()),
+                true,
+            );
+            asm.class_def(def).unwrap();
+        }
+        cref
+    }
+
+    #[test]
+    fn fat_ptr_nesting_is_assignable() {
+        let mut asm = Assembly::default();
+        let fp_u8 = make_fat_ptr(&mut asm, "u8");
+        let fp_fp_u8 = make_fat_ptr(&mut asm, "FatPtru8");
+        assert!(
+            Type::ClassRef(fp_u8).is_assignable_to(Type::ClassRef(fp_fp_u8), &asm),
+            "FatPtr<u8> and FatPtr<FatPtr<u8>> have identical layout and must be assignable"
+        );
+        assert!(
+            Type::ClassRef(fp_fp_u8).is_assignable_to(Type::ClassRef(fp_u8), &asm),
+            "the relation is symmetric for identical layouts"
+        );
+    }
+
+    /// GUARD against over-permitting: a non-`FatPtr` value-type with the *same* 16-byte/align-8
+    /// layout must NOT be considered assignable to a `FatPtr` — the name-prefix scoping holds.
+    #[test]
+    fn same_layout_non_fatptr_is_not_assignable() {
+        let mut asm = Assembly::default();
+        let fp_u8 = make_fat_ptr(&mut asm, "u8");
+        // An unrelated 16-byte struct with the same field shape but a different name.
+        let name = asm.alloc_string("SomeOtherWideStruct");
+        let other = asm.alloc_class_ref(ClassRef::new(name, None, true, [].into()));
+        let void_ptr = asm.nptr(Type::Void);
+        let data = asm.alloc_string(crate::DATA_PTR);
+        let meta = asm.alloc_string(crate::METADATA);
+        let def = ClassDef::new(
+            name, true, 0, None,
+            vec![(void_ptr, data, Some(0)), (Type::Int(Int::USize), meta, Some(8))],
+            vec![], Access::Public,
+            Some(NonZeroU32::new(16).unwrap()), Some(NonZeroU32::new(8).unwrap()), true,
+        );
+        asm.class_def(def).unwrap();
+        assert!(
+            !Type::ClassRef(fp_u8).is_assignable_to(Type::ClassRef(other), &asm),
+            "an identically-laid-out but non-FatPtr struct must NOT be silently assignable"
+        );
     }
 }

@@ -64,7 +64,7 @@ config_flag! {CHECK_ALLOCATIONS,false,"Turns on allocation checks/debug info."}
 config_flag! {VERIFY_METHODS,false,"Typechecks all methods"}
 
 config_flag! {SPLIT_LOCAL_STRUCTS,false,"Turns on the struct spliting optimzation."}
-config_flag! {ALLOW_MISCOMPILATIONS,true,"Should the codegen continue working after it encoutnered a miscompilation?"}
+config_flag! {ALLOW_MISCOMPILATIONS,false,"If true, codegen continues after a type-verifier violation (historical advisory behaviour). If false (default — Phase P1 / invariant I1 of docs/ABSOLUTE_CORRECTNESS_PLAN.md), a violation ABORTS the build so an ill-typed method is never emitted. Mirrors cilly's flag of the same name (the linker reads cilly's). Set =1 to opt back into advisory mode."}
 config_flag! {INSERT_MIR_DEBUG_COMMENTS,false,"Tells the codegen to insert comments containing the MIR statemtens after each one of them."}
 config_flag! {PRINT_LOCAL_TYPES,false,"Prints local types of all compiled MIR functions."}
 config_flag! {VALIDTE_VALUES,false,"Tells the codegen to insert additional checks on each variable asigement."}
