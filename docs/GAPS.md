@@ -96,6 +96,50 @@ can and **reports honestly** what it finished, what it couldn't, and why — par
 expected and fine. Tier-0 walls are out of scope by definition. This file is updated as each workflow
 lands (status + commit).
 
+## Performance findings (benchmark + WF-OPT outcome)
+
+A head-to-head vs hand-written C# on the same .NET 8 (`cargo_tests/bench_rs_vs_cs/`, byte-identical
+logic, identical result sinks → fair) measured the *actual* cost of going through this backend:
+
+| Workload | Rust → .NET | C# | Ratio |
+|---|---|---|---|
+| `numeric` (tight int loop, zero alloc) | 165 ms | 92 ms | **1.8×** |
+| `alloc_churn` (iterator fill/sum) | 3182 ms | 108 ms | 29.5× |
+| `alloc_churn_indexed` (plain `while` loops) | 858 ms | 108 ms | **7.9×** |
+
+The 30× allocation gap decomposes into two **independent** multipliers:
+- **Iterator/closure codegen ≈ 3.7×** (3182 → 858 ms just by dropping `.iter()`/`.enumerate()`).
+- **Allocation model ≈ 7.9×** (`NativeMemory` malloc/free vs .NET's gen0 bump allocator) — the GC
+  *wins* on allocation **throughput**. The earlier "Rust avoids GC pressure so it's faster"
+  intuition is a **latency/pause** argument, not throughput, and did not show here.
+
+**WF-OPT (optimizer) — attempted, parked with a negative result.** The hypothesis (the 1.8× came from
+a redundant per-iteration `conv.u8` no-op u64 zero-extend) was implemented and **reverted**: it changed
+zero IL in the hot loop (the loop uses `wrapping_*`/`+=`, which lower through the checked path at
+`src/binop/checked/mod.rs:~165`, not the plain-`Add` arm at `src/binop/mod.rs:215` that was edited), and
+even at the right site **RyuJIT almost certainly already elides a trailing no-op `conv.u8`** — so the
+pure-compute 1.8× is largely **RyuJIT-vs-LLVM fundamental**, with a low optimizer ceiling. Nothing
+committed; gate untouched at baseline.
+
+**Decision: optimizer/compute-throughput work is parked.** The genuinely high-value optimizer levers
+(deferred, not abandoned) are the *bigger* ones FractalFir flagged and the bench confirms:
+- **Iterator/closure lowering** (the measured 3.7×) — recoverable, impactful, a real lift.
+- **Exception-handler reduction** (his measured ~2× via `NO_UNWIND`; cleanup-block bloat also defeats
+  RyuJIT's >5-basic-block inline limit).
+- A safe IL-hygiene win: generalize the nested-`IntCast` collapse in `cilly/src/ir/opt/opt_node.rs:43`
+  to fire whenever `target == target2` (same-target re-cast = guaranteed no-op, no type table needed) —
+  shrinks IL (helps inlining + the typechecker) even though the bench would stay flat.
+
+**Re-open performance only with a pause-sensitive (latency) workload** — large/long-lived working set,
+tail-latency-sensitive — where the deterministic-drop / unmanaged-heap model could actually win. Raw
+throughput vs C# is not where this backend competes today.
+
 ## Status log
 
-- _(updated per workflow as the campaign runs)_
+- **WF-A (intrinsics tail)** — DONE, commit `e3cdd4b`. Wired signed-`i128` saturating + `bitreverse`
+  usize/isize + `float_to_int_unchecked` u128/i128; verified the other `todo!`s are unreachable
+  fallbacks. `cargo_tests/intr_bits` green; Docker gate 426/12.
+- **Benchmark** — DONE, commit `a9d8a6d`. See *Performance findings* above.
+- **WF-OPT (optimizer)** — PARKED (negative result, nothing committed). See *Performance findings*.
+- WF-B / WF-C / WF-D / WF-E / WF-G / WF-F — not started.
+- Branch `gaps-campaign` (off `main` = pushed Tier-2 state); not pushed.
