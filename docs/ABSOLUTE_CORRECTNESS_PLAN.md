@@ -203,9 +203,12 @@ follow-up.
    `intrinsic_slow`/`call_panic_lang_item`. Verified byte-identical vs native via
    `cargo_tests/caller_location` (depth-1/2 `Location::caller` chains, a 2-arg `#[track_caller]`
    forwarder = the `panic_bounds_check` shape, a non-track_caller `caller()`), plus a forced-clean-core
-   bounds-check probe: native `line=11` == backend `line=11` (was `181`). Lesson: to actually recompile
-   out-of-line `core` items under the native harness, perturb RUSTFLAGS (the dylib path/content is not
-   fingerprinted).
+   bounds-check probe: native `line=11` == backend `line=11` (was `181`). **Harness footgun now FIXED**:
+   `_cargo_dotnet_core.sh` + `tools/cargo-dotnet/src/rustflags.rs` fold the backend dylib's content hash
+   into RUSTFLAGS as an inert, `--check-cfg`-declared `--cfg cd_backend_<hash>`, so cargo's build-std
+   fingerprint busts EXACTLY when the backend changes (and only then — unchanged backend keeps the key,
+   caching preserved, installed users pay nothing). This removes the silent-stale-`core` trap that
+   produced the wrong S2 root cause; investigations can no longer be fooled by reused `core` artifacts.
 
 2. **`fn main() -> T: Termination` ICE — FIXED.** `cilly::entrypoint::wrapper` handled only `() -> ()`
    and the C-main ABI, so `fn main() -> Result<_,_>` / `-> ExitCode` (non-`Void` return, no args) hit

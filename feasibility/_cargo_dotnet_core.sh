@@ -652,7 +652,28 @@ if [ "${CD_CLEAN:-0}" = 1 ]; then echo "==> cargo clean (full, bulletproof)"; ca
 # FIRST branch of getrandom's backend cascade, so the cfg would WIN over the overlay's
 # dotnet arm and pull custom.rs's unresolved `__getrandom_v03_custom` extern (which no
 # consumer defines now) -> link error. The overlay's dotnet arm is the single backend.
-export RUSTFLAGS="-Z codegen-backend=$CD_BACKEND_DYLIB -C linker=$CD_LINKER -C link-args=--cargo-support"
+# ── Backend-content cache key (correctness over a sharp footgun) ───────────────
+# cargo's build-std fingerprint hashes the RUSTFLAGS *string*, which contains the
+# `-Zcodegen-backend` PATH but NOT the dylib's content. So rebuilding the backend at the
+# SAME path leaves the compiled core/std/alloc artifacts CACHED: out-of-line `core`
+# functions (panic_bounds_check, Location::caller, …) silently keep their STALE codegen
+# while only the user crate picks up the new backend. That footgun once produced a
+# confidently-WRONG root cause (a caller-location fix that looked ineffective because the
+# instrumented `core` never recompiled). Fold the dylib's content hash into RUSTFLAGS as an
+# otherwise-inert, check-cfg-declared cfg so the fingerprint busts EXACTLY when the backend
+# changes — and only then (an unchanged backend keeps the same hash, so normal incremental
+# caching still applies; installed/production users with a fixed backend pay nothing).
+_cd_file_hash() {
+  if   command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" 2>/dev/null | cut -c1-16
+  elif command -v shasum    >/dev/null 2>&1; then shasum -a 256 "$1" 2>/dev/null | cut -c1-16
+  else cksum "$1" 2>/dev/null | cut -d' ' -f1; fi
+}
+CD_BACKEND_KEY="$(_cd_file_hash "$CD_BACKEND_DYLIB")"
+CD_BACKEND_CFG=""
+if [ -n "$CD_BACKEND_KEY" ]; then
+  CD_BACKEND_CFG=" --cfg cd_backend_$CD_BACKEND_KEY --check-cfg=cfg(cd_backend_$CD_BACKEND_KEY)"
+fi
+export RUSTFLAGS="-Z codegen-backend=$CD_BACKEND_DYLIB -C linker=$CD_LINKER -C link-args=--cargo-support$CD_BACKEND_CFG"
 set +e
 # PHASE G — CENTRAL OVERLAY REGISTRY auto-apply. A handful of load-bearing crates
 # (mio, socket2, tokio, getrandom) need a small, marked source overlay to build/run
