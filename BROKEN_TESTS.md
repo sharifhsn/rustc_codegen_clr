@@ -404,6 +404,31 @@ exit-code-propagation defect (#3, not codegen — the apphost launcher).
 
 3. **FIXED (P2-S3) — track_caller location** (item 1 of the panic cluster above).
 
+## P2-S4 — `UnwindAction::Terminate` abort path (seam-audit Slice A)
+
+**FIXED (med-impact headline) — a panic crossing a `nounwind` boundary is now uncatchable.** A panic
+that must abort the process (escaping an `extern "C"`/`nounwind` fn → `UnwindAction::Terminate(Abi)`)
+used to map to `None` (no handler), so it propagated as an ordinary managed exception and an outer
+`catch_unwind` *absorbed* it — a real silent-wrong (`cargo_tests/term_abort`: backend printed
+`REACHED`, exit 0; native aborts). FIX (`src/basic_block.rs` + `src/terminator/mod.rs` +
+`src/assembly.rs`): `handler_for_block` routes a `Terminate` edge to a synthetic `FailFast` handler
+(shared `emit_terminate` helper, also now used by the `UnwindTerminate` *terminator*, dispatching the
+message on `Abi` vs `InCleanup` — closes the "reason ignored" gap #6). Verified: `term_abort` aborts
+uncatchably — stdout `start` only (never `REACHED`), and `dotnet <dll>` exits **134**, matching native;
+the abort *message* (managed `FailFast` vs Rust "panic in a function that cannot unwind") and the
+apphost exit-code are the known orthogonal abort-fidelity residuals.
+
+**RESIDUAL (low-impact, documented) — `Terminate` on a CLEANUP block is not yet wrapped.** When the
+`Terminate` edge is on a MIR *cleanup* block — a destructor that panics *during* unwinding
+(`Terminate(InCleanup)`, a double panic), or a `Drop` that unwinds inside a `nounwind` fn
+(`Terminate(Abi)` on cleanup) — the fix does **not** fire: cleanup blocks are the catch *body* of a
+normal block and the backend's exporter renders only a **single** try/catch layer per block
+(`cilly/src/ir/il_exporter`), so a cleanup block cannot itself carry a nested try/catch→FailFast. This
+is a facet of the pre-existing "cleanup blocks don't get their own unwind handler resolved" limitation
+(`src/assembly.rs` only runs `resolve_exception_handlers` on normal blocks). Closing it needs nested
+exception regions — a separate, larger EH change. Low impact (a destructor panicking mid-unwind is
+already a bug). Repro: `/tmp/term_incleanup` still prints `REACHED`.
+
 4. **OPEN, harness — apphost exit code** (item 3 of the panic cluster above; not codegen).
 
 ## Verified clean NOW (census — match native byte-for-byte)

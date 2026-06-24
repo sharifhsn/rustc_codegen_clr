@@ -18,6 +18,7 @@ use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_middle::{
     mir::{
         BasicBlock, InlineAsmOperand, Operand, Place, SwitchTargets, Terminator, TerminatorKind,
+        UnwindTerminateReason,
     },
     ty::{Instance, InstanceKind, Ty, TyKind},
 };
@@ -28,6 +29,43 @@ mod intrinsics;
 /// Builds an unconditional branch root targeting `target`.
 fn goto(ctx: &mut MethodCompileCtx<'_, '_>, target: u32) -> Root {
     ctx.alloc_root(CILRoot::Branch(Box::new((target, 0, None))))
+}
+
+/// Emit the hard-abort landing for a `nounwind`-boundary unwind — used by BOTH the `UnwindTerminate`
+/// *terminator* and a synthetic handler for an `UnwindAction::Terminate` *edge* (see
+/// `crate::basic_block`). Rust requires the process to terminate **uncatchably** here, so we map it to
+/// `System.Environment.FailFast` (the managed no-catch / no-cleanup abort) — NOT a `ReThrow`, which
+/// would let an outer `catch_unwind` wrongly absorb an abort Rust guarantees is final. The message
+/// distinguishes the reason: `Abi` = a panic escaping a `nounwind`/`extern "C"` boundary
+/// ("panic in a function that cannot unwind"); `InCleanup` = a panic in a destructor run while already
+/// unwinding ("panic in a destructor during cleanup", a double panic).
+pub(crate) fn emit_terminate(
+    ctx: &mut MethodCompileCtx<'_, '_>,
+    reason: UnwindTerminateReason,
+) -> Vec<Root> {
+    let msg = match reason {
+        UnwindTerminateReason::Abi => {
+            "Rust unwinding crossed a `nounwind` ABI boundary (panic in a function that cannot unwind); aborted."
+        }
+        UnwindTerminateReason::InCleanup => {
+            "Rust panicked while running a destructor during unwinding (panic in a destructor during cleanup); aborted."
+        }
+    };
+    let msg = ctx.alloc_string(msg);
+    let msg = ctx.alloc_node(CILNode::Const(Box::new(Const::PlatformString(msg))));
+    let fail_fast = MethodRef::new(
+        ClassRef::enviroment(ctx),
+        ctx.alloc_string("FailFast"),
+        ctx.sig([Type::PlatformString], Type::Void),
+        MethodKind::Static,
+        vec![].into(),
+    );
+    let fail_fast = ctx.alloc_methodref(fail_fast);
+    let abort = ctx.alloc_root(CILRoot::call(fail_fast, vec![msg]));
+    // FailFast never returns; the trailing ReThrow only keeps the block well-formed (valid IL on a
+    // path where an exception is in flight, but never executed).
+    let rethrow = ctx.alloc_root(CILRoot::ReThrow);
+    vec![abort, rethrow]
 }
 
 /// Materialize the `&core::panic::Location` value that a `#[track_caller]` callee — or the
@@ -676,28 +714,12 @@ pub fn handle_terminator<'tcx>(
                 vec![ctx.throw_msg(&format!("Unsupported inline assembly: {joined}"))]
             }
         },
-        TerminatorKind::UnwindTerminate(_) => {
+        TerminatorKind::UnwindTerminate(reason) => {
             // The `abort()` landing pad — reached when unwinding would cross a `nounwind` boundary (a
-            // double panic, or a panic escaping a `Drop` run during unwinding). Rust requires a hard
-            // process termination here; the previous `ReThrow` incorrectly *continued* unwinding. Map
-            // it to `System.Environment.FailFast`, the managed no-catch / no-cleanup abort.
-            let loc = terminator.source_info.span;
-            let msg = format!("Rust unwinding reached a nounwind boundary and was aborted (at {loc:?}).");
-            let msg = ctx.alloc_string(msg);
-            let msg = ctx.alloc_node(CILNode::Const(Box::new(Const::PlatformString(msg))));
-            let fail_fast = MethodRef::new(
-                ClassRef::enviroment(ctx),
-                ctx.alloc_string("FailFast"),
-                ctx.sig([Type::PlatformString], Type::Void),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let fail_fast = ctx.alloc_methodref(fail_fast);
-            let abort = ctx.alloc_root(CILRoot::call(fail_fast, vec![msg]));
-            // FailFast never returns; the trailing ReThrow only keeps the cleanup block well-formed
-            // (an exception is in flight on this path, so it is valid IL but never executed).
-            let rethrow = ctx.alloc_root(CILRoot::ReThrow);
-            vec![abort, rethrow]
+            // double panic, or a panic escaping a `Drop`/`extern "C"` run during unwinding). Rust
+            // requires a hard process termination here; a `ReThrow` would incorrectly *continue*
+            // unwinding (catchable). Shared with the `UnwindAction::Terminate` *edge* handler.
+            emit_terminate(ctx, *reason)
         }
         TerminatorKind::FalseEdge {
             real_target,

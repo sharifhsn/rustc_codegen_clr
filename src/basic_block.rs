@@ -1,5 +1,5 @@
 use rustc_codegen_clr_type::utilis::monomorphize;
-use rustc_middle::mir::UnwindAction;
+use rustc_middle::mir::{UnwindAction, UnwindTerminateReason};
 use rustc_middle::mir::{BasicBlock, BasicBlockData};
 use rustc_middle::{
     mir::{BasicBlocks, Body, TerminatorKind},
@@ -17,6 +17,17 @@ pub(crate) fn handler_for_block<'tcx>(
 ) -> Option<u32> {
     let term = block_data.terminator.as_ref()?;
     let unwind = term.unwind()?;
+    if *crate::config::NO_UNWIND {
+        return None;
+    }
+    // `UnwindAction::Terminate` has no MIR cleanup block to point at; route it to a SYNTHETIC
+    // terminate handler (built + appended to the cleanup blocks by `assembly::add_fn`) that hard-aborts
+    // via `FailFast`. Returning `None` here (the pre-P2-S4 behavior) let an outer `catch_unwind` absorb
+    // an abort Rust guarantees is uncatchable. Short-circuited BEFORE `simplify_handler`, which only
+    // understands real MIR block indices.
+    if let UnwindAction::Terminate(reason) = unwind {
+        return Some(terminate_handler_id(*reason, blocks));
+    }
     simplify_handler(
         handler_from_action(*unwind),
         blocks,
@@ -24,6 +35,17 @@ pub(crate) fn handler_for_block<'tcx>(
         method_instance,
         method,
     )
+}
+
+/// The synthetic block id of the terminate handler for `reason`. MIR block indices are dense
+/// (`0..blocks.len()`), so placing the handlers one/two past the end never collides with a real block.
+/// `assembly::add_fn` materializes the matching cleanup block(s) on demand (see `emit_terminate`).
+pub(crate) fn terminate_handler_id(reason: UnwindTerminateReason, blocks: &BasicBlocks) -> u32 {
+    let base = u32::try_from(blocks.len()).expect("function has more than 2^32 basic blocks");
+    match reason {
+        UnwindTerminateReason::Abi => base,
+        UnwindTerminateReason::InCleanup => base + 1,
+    }
 }
 #[allow(clippy::match_same_arms)]
 fn simplify_handler<'tcx>(
@@ -99,8 +121,10 @@ pub(crate) fn handler_from_action(action: UnwindAction) -> Option<u32> {
     match action {
         UnwindAction::Continue => None,
         UnwindAction::Cleanup(handler) => Some(handler.as_u32()),
-        // This is triggered during double panics and panic corssing FFI boundaries.
-        // TODO: This is incorrect, since it does nothing when it should terminate this program.
+        // Double panics / panics crossing a `nounwind` (FFI) boundary. Handled UPSTREAM in
+        // `handler_for_block`, which routes `Terminate` to a synthetic `FailFast` handler before this
+        // function is reached — so this arm is effectively unreachable. (Kept exhaustive + `None` as a
+        // defensive fallback: continuing to unwind is still less wrong than mis-indexing a block.)
         UnwindAction::Terminate(_reason) => None,
         // Reaching this is UB, so we can do whatever here
         // continuing unwinding seems like an OK option.

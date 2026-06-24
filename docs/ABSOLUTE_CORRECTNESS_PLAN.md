@@ -229,6 +229,24 @@ Both fixes keep the `::stable` gate green (428/12) under the fatal checker, with
 relaxation (the type-verifier is the proof, not a bypass). Regression crates `caller_location` +
 `term_main` join the P2 build-std differential set (same CI-surface gap as above).
 
+**P2-S4 (this slice) — seam-audit Slice A: the `UnwindAction::Terminate` abort path.** The first
+finding driven by the `docs/SEAM_AUDIT.md` reimplementation-drift map. `handler_for_block` mapped a
+`Terminate` unwind *edge* to `None` (no handler), so a panic that must abort uncatchably (escaping a
+`nounwind`/`extern "C"` boundary) instead propagated as a managed exception an outer `catch_unwind`
+**absorbed** — a real silent-wrong (`cargo_tests/term_abort`: backend printed `REACHED`/exit 0; native
+aborts). FIX (`src/basic_block.rs` + `src/terminator/mod.rs` + `src/assembly.rs`): route a `Terminate`
+edge to a **synthetic `FailFast` handler** (id placed past the dense MIR block range, materialized in
+`add_fn`), via a shared `emit_terminate` helper now also used by the `UnwindTerminate` *terminator* —
+dispatching the message on `Abi` vs `InCleanup` (closes the audit's "reason ignored" gap #6). Verified:
+`term_abort` aborts uncatchably (stdout `start`, never `REACHED`; `dotnet <dll>` exit **134** = native).
+**Honest partial close:** this closes the med-impact headline (gap #3, a panic *directly* in a nounwind
+context, the common case) + #6. It does **not** cover a `Terminate` edge on a MIR *cleanup* block — a
+destructor panicking *during* unwinding (`InCleanup` double panic) or a `Drop` unwinding inside a
+nounwind fn — because cleanup blocks are the catch *body* of a normal block and the exporter renders a
+single try/catch layer per block (no nested regions). That tail is a documented low-impact residual
+(needs nested exception regions; `BROKEN_TESTS.md` §P2-S4), not a regression. Gate stays 428/12 under
+the fatal checker; `typecheck.rs` unchanged.
+
 ## 5. Phase P3 — Totality census + loud failure (delivers I3)
 
 - **Enumerate every construct:** each MIR `Rvalue`/`StatementKind`/`TerminatorKind`, each rustc

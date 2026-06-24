@@ -213,6 +213,11 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     let blocks = &mir.basic_blocks;
     let mut normal_bbs = Vec::new();
     let mut cleanup_bbs = Vec::new();
+    // Synthetic terminate-handler ids (one/two past the last MIR block) referenced by
+    // `UnwindAction::Terminate` edges; the matching `FailFast` cleanup blocks are materialized after
+    // the loop (see `basic_block::terminate_handler_id` / `terminator::emit_terminate`).
+    let n_blocks = u32::try_from(blocks.len()).expect("function has more than 2^32 basic blocks");
+    let mut used_terminate: std::collections::HashSet<u32> = std::collections::HashSet::new();
     // Used for funcrions with the rust_call ABI
     let mut repack_cil = if let Some(spread_arg) = mir.spread_arg {
         // Prepare for repacking the argument tuple, by allocating a local
@@ -324,6 +329,13 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
             &ctx.instance(),
             mir,
         );
+        // A handler id past the last real MIR block is a synthetic terminate handler — record it so
+        // the matching FailFast cleanup block is emitted below.
+        if let Some(h) = handler_id {
+            if h >= n_blocks {
+                used_terminate.insert(h);
+            }
+        }
         let bb = BasicBlock::new_raw(trees, u32::try_from(last_bb_id).unwrap(), handler_id);
         if block_data.is_cleanup {
             cleanup_bbs.push(bb);
@@ -331,6 +343,23 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
             normal_bbs.push(bb);
         }
         //ops.extend(trees.iter().flat_map(|tree| tree.flatten()))
+    }
+
+    // Materialize the synthetic terminate-handler cleanup blocks referenced by `UnwindAction::Terminate`
+    // edges: a hard, uncatchable `FailFast` abort (NOT a rethrow that an outer `catch_unwind` could
+    // absorb). Built here, after the block loop, because `emit_terminate` needs `&mut ctx`. If a
+    // statement failed to compile, the `compile_failed` reset below wipes these too — consistent.
+    for (reason, id) in [
+        (rustc_middle::mir::UnwindTerminateReason::Abi, n_blocks),
+        (
+            rustc_middle::mir::UnwindTerminateReason::InCleanup,
+            n_blocks.saturating_add(1),
+        ),
+    ] {
+        if used_terminate.contains(&id) {
+            let roots = crate::terminator::emit_terminate(ctx, reason);
+            cleanup_bbs.push(BasicBlock::new(roots, id, None));
+        }
     }
 
     // A statement failed to compile: discard the partially-built (and potentially branch-inconsistent)
