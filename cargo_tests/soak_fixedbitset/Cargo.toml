@@ -1,0 +1,7 @@
+[package]
+name = "soak_fixedbitset"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+fixedbitset = "0.5"
+[workspace]

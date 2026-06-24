@@ -466,14 +466,37 @@ fn allocation_initializer_method(
                 let tpe = ctx.alloc_type(tpe);
                 let ptr_alloc = add_allocation(prov.alloc_id().0.into(), ctx, tpe);
 
+                // A provenance pointer embedded in this static stores its offset INTO the
+                // target allocation inline in the raw bytes (already copied by the `CpBlk`
+                // above); the relocation itself only names the target's BASE. Recover that
+                // inline addend and add it back — otherwise a `&OTHER_STATIC.field`
+                // reference (or any interior pointer into another static) collapses to the
+                // START of the target allocation. This was the encoding_rs single-byte-table
+                // miscompile: every `&SINGLE_BYTE_DATA.<encoding>` read the FIRST field
+                // (`ibm866`), so windows-1252 decoded as IBM866. Mirrors the scalar-pointer
+                // offset handling in `constant.rs` (`create_const_from_data`).
+                let ptr_size = ctx.tcx().data_layout.pointer_size().bytes_usize();
+                let addend = {
+                    let start = offset as usize;
+                    let mut buf = [0u8; 8];
+                    buf[..ptr_size].copy_from_slice(&bytes[start..start + ptr_size]);
+                    u64::from_le_bytes(buf)
+                };
+
                 // addr = (LdLoc(0) + offset) cast to *usize
                 let ld_loc = ctx.alloc_node(CILNode::LdLoc(0));
                 let off = ctx.alloc_node(Const::USize(offset.into()));
                 let addr = ctx.biop(ld_loc, off, cilly::BinOp::Add);
                 let usize_ptr = ctx.nptr(Type::Int(Int::USize));
                 let addr = ctx.cast_ptr_to(addr, usize_ptr);
-                // val = ptr_alloc cast to usize
+                // val = (ptr_alloc base + inline addend) cast to usize
                 let val = ctx.cast_ptr_to(ptr_alloc, Type::Int(Int::USize));
+                let val = if addend != 0 {
+                    let addend = ctx.alloc_node(Const::USize(addend));
+                    ctx.biop(val, addend, cilly::BinOp::Add)
+                } else {
+                    val
+                };
                 trees.push(ctx.alloc_root(CILRoot::StInd(Box::new((
                     addr,
                     val,
