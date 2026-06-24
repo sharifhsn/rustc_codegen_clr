@@ -1,0 +1,19 @@
+# P3-S1 regression probe — static/const trait-object vtable relocation.
+#
+# Proves the unified GlobalAlloc::VTable / ::Function relocation resolver in
+# rustc_codgen_clr_operand/src/static_data.rs::add_allocation. Before the fix, a
+# `static OBJ: &dyn T = &S;` laid out a fat pointer whose vtable field routed through
+# the null `v_{id}` stub -> NullReferenceException at first virtual dispatch, with NO
+# compile diagnostic. The ::stable corpus only builds `&dyn` at RUNTIME (path A), so
+# this static-trait-object path was previously untested.
+#
+# Run: feasibility/cargo-dotnet run cargo_tests/cd_static_dyn
+[package]
+name = "cd_static_dyn"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+# Escape the repo's root cargo workspace.
+[workspace]

@@ -1,6 +1,6 @@
 
 
-use crate::constant::static_ty;
+use crate::constant::{get_vtable, static_ty};
 use cilly::{
     Access, CILRoot, Const, FnSig, Int, Interned, MethodDef, MethodDefIdx, MethodRef,
     StaticFieldDesc, Type,
@@ -220,7 +220,6 @@ pub fn add_allocation(
     // instead, so this hint is intentionally unused. Kept in the signature for the stable
     // API and to keep call sites self-documenting.
     let _ = tpe;
-    let uint8_ptr = ctx.nptr(Type::Int(Int::U8));
     let main_module_id = ctx.main_module();
     let const_allocation = match ctx
         .tcx()
@@ -229,25 +228,45 @@ pub fn add_allocation(
         GlobalAlloc::Memory(alloc) => alloc,
         GlobalAlloc::Static(def_id) => return add_static(def_id, ctx),
         GlobalAlloc::VTable(..) => {
-            //TODO: handle VTables
-            let field_desc = ctx.add_static(
-                uint8_ptr,
-                format!("v_{alloc_id:x}"),
-                false,
-                main_module_id,
-                None,
-                false,
+            // Resolve the symbolic VTable alloc into the real vtable blob exactly as
+            // `load_scalar_ptr`'s VTable arm (constant.rs) does. `get_vtable` queries
+            // `tcx.vtable_allocation`, which returns a *separate* `GlobalAlloc::Memory`
+            // alloc holding the actual vtable bytes (drop-glue/size/align/method ptrs);
+            // its Memory arm materializes that blob and its reloc loop patches the method
+            // pointers. The returned node is the ADDRESS of that blob = the correct vtable
+            // pointer. Previously this arm registered an UNINITIALIZED null `v_{id}` static
+            // and returned its (null) *value*, silently null-ing the vtable field of any
+            // `static OBJ: &dyn T = &S;` and faulting at first virtual dispatch. Delegating
+            // to the shared `get_vtable` eliminates that drift (one resolver, both paths).
+            let global_alloc = ctx
+                .tcx()
+                .global_alloc(AllocId(alloc_id.try_into().expect("0 alloc id?")));
+            let (ty, polyref) = global_alloc.unwrap_vtable();
+            return get_vtable(
+                ctx,
+                ty,
+                polyref
+                    .map(|principal| ctx.tcx().instantiate_bound_regions_with_erased(principal)),
             );
-            return ctx.load_static(field_desc);
         }
-        GlobalAlloc::Function { .. } => {
-            //TODO: handle constant functions
-            let alloc_fld = format!("f_{alloc_id:x}");
-            let field_desc =
-                ctx.add_static(uint8_ptr, alloc_fld, false, main_module_id, None, false);
-
-            return ctx.load_static(field_desc);
-            //todo!("Function/Vtable allocation.");
+        GlobalAlloc::Function { instance } => {
+            // Defensive: `allocation_initializer_method`'s Function-provenance branch
+            // intercepts function relocations before they reach here, so for reloc-walking
+            // this arm is dead. But `add_allocation` is also a public entry point, so resolve
+            // a function alloc to a real fn-ptr (mirroring `load_scalar_ptr`'s Function arm in
+            // constant.rs) instead of returning a null `f_{id}` static, closing the latent
+            // null for any direct `add_allocation(Function)` caller.
+            let call_info = CallInfo::sig_from_instance_(instance, ctx);
+            let function_name = function_name(ctx.tcx().symbol_name(instance));
+            let mref = MethodRef::new(
+                *ctx.main_module(),
+                ctx.alloc_string(function_name),
+                ctx.alloc_sig(call_info.sig().clone()),
+                MethodKind::Static,
+                vec![].into(),
+            );
+            let mref = ctx.alloc_methodref(mref);
+            return ctx.alloc_node(CILNode::LdFtn(mref));
         }
         // A `TypeId` alloc has no backing memory: the pointer's *offset* is the
         // type-id hash fragment and equality only requires it be self-consistent.

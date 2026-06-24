@@ -299,6 +299,34 @@ the old never-wired route; does not occur in double-panic MIR, no regression, lo
   (`Condvar`/`RwLock`/`Once`/`Parker` — same hook pattern as the just-landed Mutex/TLS), TLS-drop
   destructors, the SIMD walls that are polyfillable, arrays-of-structs/strings interop.
 
+### P3 status (census done; first slice landed)
+
+The **census is complete** — `docs/P3_TOTALITY.md` (the `p3-totality-census` workflow): 242
+failure/fallthrough sites across 8 areas, classified reachable + loud-vs-silent, the silent-wrong subset
+adversarially verified. **VERDICT: substantially I3-clean** — the faithful-to-MIR discipline means nearly
+every catch-all is a LOUD `todo!`/`panic!` over a structurally-impossible MIR shape, not a silent wrong
+fallback; the cast machinery and `place_projections` came up with ZERO silent-wrong; the fatal CIL
+typechecker is a real loud backstop. ~180 sites are genuinely-exotic/unreachable loud walls (I3-acceptable,
+documented). 6 work slices proposed (silent-wrong first).
+
+- **P3-S1 (this slice) — the one reachable silent miscompile, FIXED.** `static OBJ: &dyn T = &S;`
+  (const/static trait object) dispatched through a **null vtable** → `NullReferenceException`, zero
+  diagnostic. Root cause = the campaign's recurring *reimplementation-drift* class, internal to the operand
+  crate: two implementations of "resolve a `GlobalAlloc` relocation to a pointer" — `load_scalar_ptr`
+  (correct) and `add_allocation`/`create_const_from_data` (stubbed `VTable`/`Function` to a null static).
+  FIX (`p3-const-ptr-unify` workflow → integrated + re-verified by the parent): the `add_allocation`
+  `VTable` arm now delegates to the shared `crate::constant::get_vtable` (and `Function` → `LdFtn`),
+  recovered via `unwrap_vtable()`. Because `add_allocation` is the **single chokepoint both paths funnel
+  through** (path A's `get_vtable` calls it; path B's reloc loop calls it), fixing the one arm makes the
+  resolver **total for every caller** — true unification, not a re-duplication. `get_vtable` →
+  `tcx.vtable_allocation` → a `GlobalAlloc::Memory` alloc the Memory arm already materializes correctly, so
+  no self-recursion. Verified: `cargo_tests/cd_static_dyn` FULL MATCH vs native (static `&dyn` / array-`&dyn`
+  / fn-ptr static → 7/7/42, was a null-NRE crash); fatal type-checker accepts the output; Docker `::stable`
+  gate 426/14 = baseline, no regressions, no const/static/vtable test failed. One small tracked change
+  (`static_data.rs`, +38/-19). The remaining P3 slices (S2 trivial loud-ICE one-liners, S3 fn-ptr store +
+  variadic wall, S4 size-clamp→fatal, S5 ABI two-enum + signed static defaults, S6 typechecker totality)
+  are loud/exotic or hardening — none is another reachable silent miscompile.
+
 ## 6. Phase P4 — The frontier ("everything *possible*", with cost)
 
 - **`f128` via softfloat.** No native .NET quad float, but it is *translatable* via a softfloat
