@@ -259,7 +259,11 @@ pub fn handle_intrinsic<'tcx>(
         "atomic_xor" => call_atomic(args, destination, ctx, atomic_xor),
         "atomic_and" => call_atomic(args, destination, ctx, atomic_and),
         "atomic_nand" => call_atomic(args, destination, ctx, atomic_nand),
-        "atomic_fence" => {
+        // `atomic_singlethreadfence` is a COMPILER-only fence (orders ops within one thread, e.g. vs a
+        // signal handler); a full `Thread.MemoryBarrier` is a correct — if stronger-than-required —
+        // lowering on .NET, same as `atomic_fence`. Previously `atomic_singlethreadfence` (reachable
+        // via `std::sync::atomic::compiler_fence`) fell through to a `span_bug!` ICE (seam-audit gap #8).
+        "atomic_fence" | "atomic_singlethreadfence" => {
             let thread = ClassRef::thread(ctx);
             let fence = MethodRef::new(
                 thread,
@@ -274,6 +278,13 @@ pub fn handle_intrinsic<'tcx>(
         "atomic_xadd" => call_atomic(args, destination, ctx, atomic_add),
         "atomic_umin" => call_atomic(args, destination, ctx, atomic_min),
         "atomic_umax" => call_atomic(args, destination, ctx, atomic_max),
+        // Signed `atomic_max`/`atomic_min` (`AtomicI*::fetch_max`/`fetch_min`) previously `span_bug!`-ICE'd
+        // (seam-audit gap #7). The `atomic_min`/`atomic_max` helpers are sign-aware via the operand type:
+        // `call_atomic` reads `args[1].node.ty(..)`, so an `i32` arg mangles to `atomic_min_i32` (signed
+        // compare) while a `u32` arg gives `atomic_min_u32` — so the SIGNED arms wire to the same helpers
+        // as `atomic_umin`/`atomic_umax`, and signedness is carried correctly by the argument's type.
+        "atomic_min" => call_atomic(args, destination, ctx, atomic_min),
+        "atomic_max" => call_atomic(args, destination, ctx, atomic_max),
         "atomic_xchg" => vec![atomic::xchg(args, destination, ctx)],
         // TODO: ensure those intrinsics are sound in C. perhaps time for a new cillyIR node?
         "ptr_offset_from_unsigned" => {

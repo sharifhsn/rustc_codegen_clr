@@ -429,6 +429,40 @@ is a facet of the pre-existing "cleanup blocks don't get their own unwind handle
 exception regions — a separate, larger EH change. Low impact (a destructor panicking mid-unwind is
 already a bug). Repro: `/tmp/term_incleanup` still prints `REACHED`.
 
+## P2-S5 — seam-audit Slices B / C / D (the tractable remainder), all FIXED + FULL MATCH
+
+Driven by the `seam-close` workflow (which produced verified designs + rustc-API checks; the parent
+implemented on the live tree, since the workflow's worktrees landed on a stale pre-flip base and its
+diffs referenced the old V1 IR). All three differential-verified byte-identical to native; regression
+crates added; gate 428/12 under the fatal checker.
+
+1. **FIXED (Slice B) — release overflow-check elision.** `src/terminator/mod.rs` Assert arm now elides
+   the panic when `!ctx.tcx().sess.overflow_checks() && msg.is_optional_overflow_check()` (branch
+   straight to the success target = the wrap path), mirroring rustc `codegen_assert_terminator`. A
+   `#[rustc_inherit_overflow_checks]` helper (`<u8 as Add>::add`) inlined into a release crate now WRAPS
+   (300 → 44) instead of panicking. Regression: `cargo_tests/overflow_elision` (native 44 == backend 44).
+
+2. **FIXED (Slice C) — `ConstValue::Indirect { offset != 0 }`.** `rustc_codgen_clr_operand/src/constant.rs`
+   `create_const_from_data` no longer discards `offset_bytes` (`let _ = offset_bytes;` removed): the
+   scalar fast-path is gated on `offset == 0` (it materializes the whole alloc), and the by-ref paths add
+   the byte offset to the pointer (`biop(ptr, Const::USize(offset), Add)`), mirroring `load_scalar_ptr`. A
+   const pointing into the middle of a larger alloc (`ARR[2]` of a 4-elem const array) now reads the right
+   sub-object. Regression: `cargo_tests/indirect_offset` (native `63636363` == backend, was `61616161`).
+
+3. **FIXED (Slice D) — three loud-ICE arms.** (a) signed `atomic_max`/`atomic_min`
+   (`AtomicI*::fetch_max/min`) — added arms wired to the SAME `atomic_max`/`atomic_min` helpers as the
+   unsigned ones (sign-aware via the operand's mangled type: `i32` → `atomic_min_i32`). (b)
+   `atomic_singlethreadfence` (`compiler_fence`) — folded into the `atomic_fence` arm (`Thread.MemoryBarrier`,
+   a correct stronger-than-required lowering). (c) `PointerExposeProvenance` to a narrow int (`ptr as u32`)
+   — the `Type::Int(Int::U64|I64)` arm in `src/rvalue.rs` generalized to `Type::Int(_)` (expose as usize +
+   `int_to_int`). Each previously ICE'd at codegen. Regression: `cargo_tests/atomic_cast_arms` (native
+   `2 true` == backend).
+
+**Remaining open (the only un-closed seam-audit gap):** Slice A's CLEANUP-block `Terminate(InCleanup)`
+double-panic case (above) — needs nested exception regions, an architectural EH change the seam-close
+workflow itself flagged as too-high-blast-radius for a minimal slice. All other confirmed seam-audit
+gaps (the 4 LOUD + 5 of the 6 SILENT_WRONG) are now closed; `#[link_section]` stays a deliberate loud wall.
+
 4. **OPEN, harness — apphost exit code** (item 3 of the panic cluster above; not codegen).
 
 ## Verified clean NOW (census — match native byte-for-byte)

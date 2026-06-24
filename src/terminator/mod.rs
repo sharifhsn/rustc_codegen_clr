@@ -534,6 +534,16 @@ pub fn handle_terminator<'tcx>(
             target,
             unwind: _,
         } => {
+            // Optional overflow asserts (`+`/`-`/`*`/`<<`/`>>` and unary `-`) are ELIDED when the
+            // session has overflow-checks off — the operation wraps instead of panicking. The backend
+            // must honor that (mirrors rustc `codegen_assert_terminator`: when `!overflow_checks() &&
+            // msg.is_optional_overflow_check()`, branch straight to the success target). Without it, a
+            // `#[rustc_inherit_overflow_checks]` helper inlined into a release crate panicked where
+            // native wraps — a real panic-vs-wrap miscompile (seam-audit gap #1). The CIL optimizer
+            // cannot recover this (the `cond` is a runtime overflow flag), so it must be done here.
+            if !ctx.tcx().sess.overflow_checks() && msg.is_optional_overflow_check() {
+                return vec![goto(ctx, target.as_u32())];
+            }
             // `cond` is the "no-panic" condition: when it holds, control continues to `target`;
             // otherwise the assertion failed and we must panic. Mirror native rustc codegen
             // (`codegen_assert_terminator`): branch to `target` on the no-panic condition, and on

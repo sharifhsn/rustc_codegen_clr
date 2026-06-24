@@ -44,7 +44,6 @@ fn create_const_from_data<'tcx>(
     offset_bytes: u64,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Interned<CILNode> {
-    let _ = offset_bytes;
     let ty = ctx.monomorphize(ty);
     let tpe = ctx.type_from_cache(ty);
     let tpe_idx = ctx.alloc_type(tpe);
@@ -55,8 +54,16 @@ fn create_const_from_data<'tcx>(
         let mut bytes: Vec<u8> = const_allocation
             .inspect_with_uninit_and_ptr_outside_interpreter(0..const_allocation.len())
             .into();
-        // Right aligment, fits, and has no pointers - can be a scalar.
-        if align <= 8 && bytes.len() <= 16 && const_allocation.provenance().ptrs().is_empty() {
+        // Right aligment, fits, and has no pointers - can be a scalar. ONLY at offset 0: this path
+        // materializes the WHOLE allocation, so a nonzero offset (a const pointing into the MIDDLE of a
+        // larger alloc — e.g. GVN const-propagating `ARR[2]` out of a 4-elem const array) would read the
+        // wrong sub-object. For offset != 0 fall through to the by-ref path, which applies the offset
+        // (seam-audit gap #2: the offset was previously discarded entirely via `let _ = offset_bytes;`).
+        if offset_bytes == 0
+            && align <= 8
+            && bytes.len() <= 16
+            && const_allocation.provenance().ptrs().is_empty()
+        {
             while bytes.len() < 16 {
                 bytes.push(0);
             }
@@ -65,6 +72,13 @@ fn create_const_from_data<'tcx>(
             return load_const_scalar(scalar, ty, ctx).into();
         }
         let (ptr, align) = alloc_ptr_unaligned(alloc_id, &alloc, ctx, tpe_idx);
+        // Apply the byte offset on the raw pointer (CIL `add` is byte arithmetic), mirroring
+        // `load_scalar_ptr`'s `GlobalAlloc::Memory` arm.
+        let ptr = if offset_bytes != 0 {
+            ctx.biop(ptr, cilly::Const::USize(offset_bytes), cilly::BinOp::Add)
+        } else {
+            ptr
+        };
         let ty = ctx.monomorphize(ty);
 
         let tpe = ctx.type_from_cache(ty);
@@ -78,6 +92,11 @@ fn create_const_from_data<'tcx>(
     }
 
     let ptr = add_allocation(alloc_id.0.into(), ctx, tpe_idx);
+    let ptr = if offset_bytes != 0 {
+        ctx.biop(ptr, cilly::Const::USize(offset_bytes), cilly::BinOp::Add)
+    } else {
+        ptr
+    };
     let ptr = ctx.cast_ptr(ptr, tpe);
     return ctx.load(ptr, tpe);
 }

@@ -247,6 +247,24 @@ single try/catch layer per block (no nested regions). That tail is a documented 
 (needs nested exception regions; `BROKEN_TESTS.md` §P2-S4), not a regression. Gate stays 428/12 under
 the fatal checker; `typecheck.rs` unchanged.
 
+**P2-S5 (this slice) — seam-audit Slices B + C + D (the tractable remainder), all FIXED + FULL MATCH.**
+Driven by the `seam-close` workflow (it produced verified designs + rustc-API checks in parallel; the
+parent implemented on the live tree + did the execution-differential verification, since the workflow's
+isolated worktrees landed on a stale pre-V1→V2-flip base whose diffs don't apply). **B** —
+`src/terminator/mod.rs` Assert arm elides an optional overflow assert when `!sess.overflow_checks() &&
+msg.is_optional_overflow_check()` (mirrors `codegen_assert_terminator`), so a `#[rustc_inherit_overflow_checks]`
+helper inlined into a release crate WRAPS (300→44) instead of panicking. **C** —
+`rustc_codgen_clr_operand/src/constant.rs` `create_const_from_data` stops discarding `offset_bytes`
+(gates the whole-alloc scalar path on `offset==0`; adds the byte offset to the pointer in the by-ref
+paths like `load_scalar_ptr`), so a const into the middle of a larger alloc (`ARR[2]`) reads the right
+sub-object. **D** — three loud-ICE arms: signed `atomic_max`/`atomic_min` (wired to the sign-aware
+helpers), `atomic_singlethreadfence` (folded into `atomic_fence`), and narrow `PointerExposeProvenance`
+(`ptr as u32`, generalized to `Type::Int(_)`). Regression crates `overflow_elision` / `indirect_offset`
+/ `atomic_cast_arms`, all byte-identical to native; gate 428/12 under the fatal checker, `typecheck.rs`
+unchanged. **Net across the seam audit:** all 4 LOUD gaps + 5 of the 6 SILENT_WRONG are closed; the lone
+remainder is the Slice A cleanup-block `Terminate(InCleanup)` double-panic (needs nested EH, §P2-S4);
+`#[link_section]` stays a deliberate loud wall.
+
 ## 5. Phase P3 — Totality census + loud failure (delivers I3)
 
 - **Enumerate every construct:** each MIR `Rvalue`/`StatementKind`/`TerminatorKind`, each rustc

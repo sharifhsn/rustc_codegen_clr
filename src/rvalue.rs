@@ -211,7 +211,11 @@ pub fn handle_rvalue<'tcx>(
                 Type::Int(Int::USize | Int::ISize) | Type::Ptr(_) | Type::FnPtr(_) => {
                     ctx.cast_ptr_to(val, target)
                 }
-                Type::Int(Int::U64 | Int::I64) => {
+                // Any other integer width (u64/i64 and the narrow u32/u16/u8 / i32/i16/i8 / u128/i128):
+                // expose the address as `usize`, then narrow/widen to the target like a normal int cast.
+                // Previously only u64/i64 were handled and a narrow target (`ptr as u32`) hit the `todo!`
+                // ICE (seam-audit gap #9).
+                Type::Int(_) => {
                     let us = ctx.cast_ptr_to(val, Type::Int(Int::USize));
                     crate::casts::int_to_int(Type::Int(Int::USize), target, us, ctx)
                 }
