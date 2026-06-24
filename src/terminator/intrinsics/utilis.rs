@@ -36,7 +36,7 @@ pub fn atomic_add(addr: Node, addend: Node, tpe: Type, asm: &mut Assembly) -> No
             asm.cast_ptr_to(call, tpe)
         }
 
-        _ => todo!(),
+        _ => todo!("Can't atomic add {tpe:?}"),
     }
 }
 pub fn atomic_or(addr: Node, addend: Node, tpe: Type, asm: &mut Assembly) -> Node {
@@ -351,6 +351,6 @@ pub fn atomic_max(addr: Node, addend: Node, tpe: Type, asm: &mut Assembly) -> No
             let call = asm.call(mref, &[arg0, arg1], IsPure::NOT);
             asm.cast_ptr_to(call, Type::Ptr(inner))
         }
-        _ => todo!(),
+        _ => todo!("Can't atomic max {tpe:?}"),
     }
 }

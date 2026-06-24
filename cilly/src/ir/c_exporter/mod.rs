@@ -1755,15 +1755,3 @@ pub fn class_to_mangled(class: &super::ClassRef, asm: &Assembly) -> String {
     };
     format!("{assembly}{name}", name = escape_ident(&asm[class.name()]))
 }
-#[must_use]
-pub fn name_sig_class_to_mangled(
-    name: &str,
-    sig: super::Interned<FnSig>,
-    class: Option<Interned<ClassRef>>,
-    asm: &Assembly,
-) -> String {
-    let class = match class {
-        Some(_) => todo!(),
-        None => todo!(),
-    };
-}

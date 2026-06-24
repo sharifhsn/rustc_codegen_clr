@@ -968,14 +968,47 @@ impl CILNode {
             CILNode::GetException => Ok(Type::ClassRef(ClassRef::exception(asm))),
             CILNode::IsInst(obj, _) => {
                 let obj = asm.get_node(*obj).clone();
-                let _obj = obj.typecheck(sig, locals, asm)?;
-                // TODO: check obj
+                let obj = obj.typecheck(sig, locals, asm)?;
+                // `isinst` requires an object reference on the stack. Accept every GC-reference
+                // shape the backend produces (managed class refs, Object, platform string/array,
+                // open generics); reject clearly-non-reference operands (Int/Float/Ptr/...).
+                // Mirrors the `UnboxAny` operand check; result stays `Bool` because this backend's
+                // IsInst feeds a Rust `bool` (mycorrhiza `..._is_inst`) and a `BranchCond::False`.
+                match obj {
+                    Type::ClassRef(cref) => {
+                        if asm.class_ref(cref).is_valuetype() {
+                            return Err(TypeCheckError::ExpectedClassGotValuetype {
+                                cref: asm.class_ref(cref).clone(),
+                            });
+                        }
+                    }
+                    Type::PlatformObject
+                    | Type::PlatformGeneric(_, _)
+                    | Type::PlatformString
+                    | Type::PlatformArray { .. } => (),
+                    _ => return Err(TypeCheckError::TypeNotClass { object: obj }),
+                }
                 Ok(Type::Bool)
             }
             CILNode::CheckedCast(obj, cast_res) => {
                 let obj = asm.get_node(*obj).clone();
-                let _obj = obj.typecheck(sig, locals, asm)?;
-                // TODO: check obj
+                let obj = obj.typecheck(sig, locals, asm)?;
+                // `castclass` requires an object reference on the stack (same accept-set as `isinst`
+                // / `UnboxAny`). The result is the target ref, exactly as `castclass T` yields a `T`.
+                match obj {
+                    Type::ClassRef(cref) => {
+                        if asm.class_ref(cref).is_valuetype() {
+                            return Err(TypeCheckError::ExpectedClassGotValuetype {
+                                cref: asm.class_ref(cref).clone(),
+                            });
+                        }
+                    }
+                    Type::PlatformObject
+                    | Type::PlatformGeneric(_, _)
+                    | Type::PlatformString
+                    | Type::PlatformArray { .. } => (),
+                    _ => return Err(TypeCheckError::TypeNotClass { object: obj }),
+                }
                 Ok(asm[*cast_res])
             }
 
@@ -1431,6 +1464,71 @@ mod tc_tests {
         assert!(
             call.typecheck(sig, &locals, &mut asm).is_err(),
             "passing an i64 where an f64 parameter is expected must be rejected"
+        );
+    }
+
+    /// FALSE-NEGATIVE AUDIT (S6): `isinst`/`castclass` on a non-reference operand (an `i64`) is a
+    /// genuine type error — the CLR requires an object reference. A sound checker MUST reject it.
+    #[test]
+    fn isinst_on_int_operand_is_rejected() {
+        let mut asm = Assembly::default();
+        let bad = asm.alloc_node(CILNode::Const(Box::new(Const::I64(7))));
+        let target = {
+            let c = ClassRef::exception(&mut asm);
+            asm.alloc_type(Type::ClassRef(c))
+        };
+        let node = asm.alloc_node(CILNode::IsInst(bad, target));
+        let sig = asm.sig([], Type::Void);
+        let locals: Vec<LocalDef> = vec![];
+        assert!(
+            matches!(
+                asm.get_node(node).clone().typecheck(sig, &locals, &mut asm),
+                Err(TypeCheckError::TypeNotClass { .. })
+            ),
+            "isinst with an i64 operand must be rejected (not a reference type)"
+        );
+    }
+
+    /// FALSE-NEGATIVE AUDIT (S6): `castclass` on a non-reference operand must likewise be rejected.
+    #[test]
+    fn castclass_on_int_operand_is_rejected() {
+        let mut asm = Assembly::default();
+        let bad = asm.alloc_node(CILNode::Const(Box::new(Const::I64(7))));
+        let target = {
+            let c = ClassRef::exception(&mut asm);
+            asm.alloc_type(Type::ClassRef(c))
+        };
+        let node = asm.alloc_node(CILNode::CheckedCast(bad, target));
+        let sig = asm.sig([], Type::Void);
+        let locals: Vec<LocalDef> = vec![];
+        assert!(
+            asm.get_node(node).clone().typecheck(sig, &locals, &mut asm).is_err(),
+            "castclass with an i64 operand must be rejected"
+        );
+    }
+
+    /// NO FALSE POSITIVE (S6): the real interop shape — a managed class-ref operand cast to another
+    /// class ref — must still be ACCEPTED (this is what mycorrhiza emits; rejecting it breaks the gate).
+    #[test]
+    fn castclass_classref_operand_is_accepted() {
+        let mut asm = Assembly::default();
+        // operand: a non-valuetype managed ref (System.Exception) loaded as arg 0.
+        let src = asm.alloc_node(CILNode::LdArg(0));
+        let target = {
+            let c = ClassRef::exception(&mut asm);
+            asm.alloc_type(Type::ClassRef(c))
+        };
+        let node = asm.alloc_node(CILNode::CheckedCast(src, target));
+        // sig has one ClassRef param so LdArg(0) typechecks to a reference.
+        let src_ty = {
+            let c = ClassRef::exception(&mut asm);
+            Type::ClassRef(c)
+        };
+        let sig = asm.sig([src_ty], Type::Void);
+        let locals: Vec<LocalDef> = vec![];
+        assert!(
+            asm.get_node(node).clone().typecheck(sig, &locals, &mut asm).is_ok(),
+            "castclass of a managed class-ref operand to another class ref must be accepted"
         );
     }
 

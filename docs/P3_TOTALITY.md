@@ -132,6 +132,16 @@ These fire only on unstable features, pre-codegen-lowered constructs, or structu
 
 ## 6. Suggested P3 work slices
 
+> **✅ ALL SLICES DONE — P3 COMPLETE.** S1 (silent const/static vtable) → `4a770d6`; S2/S3+ (all 11 reachable
+> ICEs) → `929b8d6`; **S4/S5/S6 (size-clamp→fatal, S5 already-landed, checker IsInst/CheckedCast totality) →
+> commit pending.** S4: the three over-size arms (`type.rs` struct/Array/SIMD) now `span_fatal` instead of
+> clamping / returning a silent `Void` ZST slot (+ a `transmute_scalar_to` width-assert) — the last
+> silent-mis-layout class is gone; all unreachable-on-real-code so the gate is unaffected. S6: `IsInst`/
+> `CheckedCast` now validate the operand is a GC-reference (no false positive — only mycorrhiza interop is
+> checker-reachable; 3 new `tc_tests` + gate-green with zero interop failures + `rust_export` clean under
+> the fatal checker). `adt.rs` `unwrap_or(0)` deliberately kept (fieldless single-variant enum legitimately
+> yields `None`). **Net: no reachable silent miscompile and no reachable cryptic ICE remain.**
+
 Scoped like P2 slices: one focused fix + a differential/compile regression crate + keep the fatal gate (`::stable` 416/22, `TYPECHECK_CIL=true`) green. Ordered by leverage — **silent-wrong first.**
 
 ### P3-S1 — const/static trait-object vtables (the one reachable silent miscompile) [HIGHEST]

@@ -1,14 +1,12 @@
-use crate::r#type::get_type;
 use cilly::{
-    Assembly, CILNode, ClassRef, Int, MethodRef, Type, bimap::Interned,
-    cilnode::{IsPure, MethodKind}, utilis::escape_class_name,
+    Assembly, ClassRef, Type, bimap::Interned,
+    utilis::escape_class_name,
 };
-use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_hir::attrs::CrateType;
 use rustc_middle::ty::Const;
 use rustc_middle::ty::List;
 use rustc_middle::ty::{
-    AdtDef, ConstKind, EarlyBinder, GenericArg, Instance, PseudoCanonicalInput, Ty, TyCtxt, TyKind,
+    AdtDef, ConstKind, EarlyBinder, GenericArg, Instance, PseudoCanonicalInput, Ty, TyCtxt,
     TypeFoldable,
 };
 use rustc_span::def_id::DefId;
@@ -21,42 +19,6 @@ pub struct DotnetArray {
     pub dimensions: u64,
 }
 
-#[must_use]
-pub fn max_value(tpe: &Type, asm: &mut Assembly) -> Interned<CILNode> {
-    match tpe {
-        Type::Int(Int::USize) => {
-            let mref = MethodRef::new(
-                ClassRef::usize_type(asm),
-                asm.alloc_string("get_MaxValue"),
-                asm.sig([], Type::Int(Int::USize)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            asm.call(mref, &[] as &[Interned<CILNode>], IsPure::NOT)
-        }
-        Type::Int(Int::U64) => asm.alloc_node(u64::MAX),
-        Type::Int(Int::U32) => asm.alloc_node(u32::MAX),
-        Type::Int(Int::U16) => asm.alloc_node(u16::MAX),
-        Type::Int(Int::U8) => asm.alloc_node(u8::MAX),
-        Type::Int(Int::I64) => asm.alloc_node(i64::MAX),
-        Type::Int(Int::I32) => asm.alloc_node(i32::MAX),
-        Type::Int(Int::I16) => asm.alloc_node(i16::MAX),
-        Type::Int(Int::I8) => asm.alloc_node(i8::MAX),
-        _ => todo!("Can't get the max value of {tpe:?}"),
-    }
-}
-
-/// Gets the element type of a slice OR array.
-/// # Panics
-/// Panics if type is not a slice or an array.
-#[must_use]
-pub fn element_type(src: Ty<'_>) -> Ty<'_> {
-    match src.kind() {
-        TyKind::Slice(element) | TyKind::Array(element, _) => *element,
-        _ => panic!("Can't get element type of {src:?}"),
-    }
-}
 pub const INTEROP_CLASS_TPE_NAME: &str = "RustcCLRInteropManagedClass";
 pub const INTEROP_STRUCT_TPE_NAME: &str = "RustcCLRInteropManagedStruct";
 pub const INTEROP_CHR_TPE_NAME: &str = "RustcCLRInteropManagedChar";
@@ -65,62 +27,6 @@ pub const INTEROP_ARR_TPE_NAME: &str = "RustcCLRInteropManagedArray";
 /// Checks if a type is a magic interop type.
 pub fn is_name_magic(name: &str) -> bool {
     name.contains("RustcCLRInteropManaged")
-}
-/// Handling of `magic` interop types.
-/// # Panics
-/// Will panic if interop type is invalid.
-#[must_use]
-pub fn magic_type<'tcx>(
-    name: &str,
-    _adt: &AdtDef<'tcx>,
-    subst: &[GenericArg<'tcx>],
-    ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> Type {
-    if name.contains(INTEROP_CLASS_TPE_NAME) {
-        assert!(
-            subst.len() == 2,
-            "Managed object reference must have exactly 2 generic arguments!"
-        );
-        let assembly = garg_to_string(subst[0], ctx.tcx());
-        let assembly = Some(assembly)
-            .filter(|assembly| !assembly.is_empty())
-            .map(|a| ctx.alloc_string(a));
-        let name = garg_to_string(subst[1], ctx.tcx());
-        let name = ctx.alloc_string(name);
-        let dotnet_tpe = ctx.alloc_class_ref(ClassRef::new(name, assembly, false, [].into()));
-        Type::ClassRef(dotnet_tpe)
-    } else if name.contains(INTEROP_STRUCT_TPE_NAME) {
-        assert!(
-            subst.len() == 3,
-            "Managed struct reference must have exactly 3 generic arguments!"
-        );
-        let assembly = garg_to_string(subst[0], ctx.tcx());
-        let assembly = Some(assembly)
-            .filter(|assembly| !assembly.is_empty())
-            .map(|a| ctx.alloc_string(a));
-        let name = garg_to_string(subst[1], ctx.tcx());
-        let name = ctx.alloc_string(name);
-        let dotnet_tpe = ctx.alloc_class_ref(ClassRef::new(name, assembly, true, [].into()));
-        Type::ClassRef(dotnet_tpe)
-    } else if name.contains(INTEROP_ARR_TPE_NAME) {
-        assert!(
-            subst.len() == 2,
-            "Managed array reference must have exactly 2 generic arguments: type and dimension count!"
-        );
-        let element = &subst[0].as_type().expect("Array type must be specified!");
-        let element = ctx.monomorphize(*element);
-        let dimensions = garag_to_usize(subst[1], ctx.tcx());
-        let element = get_type(element, ctx);
-
-        Type::PlatformArray {
-            elem: ctx.alloc_type(element),
-            dims: std::num::NonZeroU8::new(dimensions.try_into().unwrap()).unwrap(),
-        }
-    } else if name.contains(INTEROP_CHR_TPE_NAME) {
-        Type::PlatformChar
-    } else {
-        todo!("Interop type {name:?} is not yet supported!")
-    }
 }
 #[must_use]
 pub fn garag_to_usize<'tcx>(garg: GenericArg<'tcx>, _ctx: TyCtxt<'tcx>) -> u64 {

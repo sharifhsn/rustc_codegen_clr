@@ -366,7 +366,15 @@ fn transmute_scalar_to(
         2 => (Int::U16, Const::U16(bits as u16)),
         3 | 4 => (Int::U32, Const::U32(bits as u32)),
         5..=8 => (Int::U64, Const::U64(bits as u64)),
-        _ => (Int::U128, Const::U128(bits)),
+        16 => (Int::U128, Const::U128(bits)),
+        // `transmute_on_stack` is size-EXACT: the source integer must be the same width as `dst`.
+        // Only 1/2/4/8/16-byte dsts have a matching CIL integer; a 9..=15-byte dst would reinterpret
+        // a 16-byte U128 source onto a narrower slot and emit invalid IL ("Bad IL format") at JIT.
+        // `byte_size` is at most 16 (a scalar is u128-backed), so this arm cannot fire on valid code;
+        // fail loud at codegen rather than silently produce bad IL. (I3 totality.)
+        other => panic!(
+            "transmute_scalar_to: cannot size-exactly reinterpret a 16-byte source onto a {other}-byte scalar destination ({dst:?}); transmute_on_stack requires src width == dst width, so a constant of an odd 9..=15-byte size would emit invalid IL (\"Bad IL format\") at JIT time"
+        ),
     };
     let val = ctx.alloc_node(val);
     ctx.transmute_on_stack(Type::Int(src_int), dst, val)

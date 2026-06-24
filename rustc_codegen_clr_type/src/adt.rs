@@ -89,6 +89,12 @@ pub fn enum_tag_info(r#enum: Layout<'_>, asm: &mut Assembly) -> (Type, u32) {
     match r#enum.variants() {
         Variants::Single { .. } => (
             Type::Void,
+            // `Variants::Single` enums carry no real discriminant tag — the field-offset iterator is
+            // legitimately empty for a fieldless single-variant enum (e.g. `discriminant()` of a
+            // `SocketAddrV6`-style enum in `core::net`), so a `None` here is NORMAL, not a bug.
+            // Default to offset 0 (the conceptual tag position). Do NOT `.expect()` this: it is a
+            // reachable shape in ordinary `core`/`std` code and a panic would degrade an otherwise
+            // valid method into a throwing stub.
             FieldOffsetIterator::from_fields_shape(r#enum.fields())
                 .next()
                 .unwrap_or(0),

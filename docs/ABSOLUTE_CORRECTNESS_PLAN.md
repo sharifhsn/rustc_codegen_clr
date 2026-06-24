@@ -348,6 +348,36 @@ documented). 6 work slices proposed (silent-wrong first).
   Remaining: S4 (size/layout clamp-and-continue → `fatal`) and S5/S6 hardening are *exotic walls / rigor*,
   not reachable crashes.
 
+- **P3-S4/S5/S6 — P3 COMPLETE.** The last silent-mis-layout class and the checker-totality gaps are closed.
+  - **S4 (size/layout clamp-and-continue → fatal):** the three *silent* over-size arms in
+    `rustc_codegen_clr_type/src/type.rs` — `struct_` size (clamped to `u32::MAX`), `Array` >4GiB
+    (`eprintln` + `return Type::Void`, the ZST slot place-ops then read/write = a silent miscompile), and
+    SIMD >4GiB (bare `return Type::Void`) — now `ctx.tcx().dcx().span_fatal(...)` with a clear message
+    (returns `!`, so no Void slot is produced). Plus a width-assert on `constant.rs` `transmute_scalar_to`
+    (a 9–15-byte scalar dst would reinterpret a 16-byte U128 → "Bad IL" at JIT; now fails loud at codegen).
+    All confirmed *unreachable on real code* (rustc's `obj_size_bound` allows the layout, but such a type is
+    uninstantiable and absent from std/test/cargo_tests), so the fatals cannot break the gate. `adt.rs`
+    enum-tag `unwrap_or(0)` was **deliberately kept** (a fieldless single-variant enum legitimately yields
+    `None`; `.expect()` would *false-positive* on real `core::net` code) with a comment — a judgment call
+    that beats the literal census instruction.
+  - **S5:** already landed in the ICE batch (extern-ABI `_ => false` reconciliation + signed/float static
+    defaults) — verified, nothing remained.
+  - **S6 (typechecker totality):** the two pass-blind `// TODO: check obj` arms in `typecheck.rs` —
+    `IsInst` and `CheckedCast` — now validate the operand is a GC-reference type (mirroring `UnboxAny`:
+    `ClassRef`-non-valuetype / `PlatformObject` / `PlatformGeneric` / `PlatformString` / `PlatformArray`),
+    rejecting an `Int`/`Ptr`/valuetype operand with `TypeCheckError`, while keeping the `Bool` / target-ref
+    result. THE CARDINAL RULE held — no false positive: the only checker-reachable site is mycorrhiza interop
+    (`call.rs:532/541`, a `ClassRef`-non-valuetype operand), and the linker-injected builtin casts are never
+    typechecked. Three new `tc_tests` (isinst/castclass-on-`i64` **rejected**, classref-operand **accepted**)
+    lock it in. Also swept the verified-dead-code (`name_sig_class_to_mangled`, `utilis::{max_value,
+    element_type, magic_type}`) and added messages to two bare `todo!()`s. Done via the `p3-finish-s4-s6`
+    workflow, integrated + re-verified by the parent. VERIFIED: a `>4GiB` array now **errors clearly** (not a
+    silent Void); `cargo test -p cilly tc_tests` 9/9; `rust_export` (managed casts) builds clean under
+    `TYPECHECK_CIL=1`; Docker `::stable` gate 426/14 = baseline, **zero regressions, zero interop/cast test
+    failures** (the on-by-default fatal checker compiles the `interop_*` tests = the real no-false-positive
+    proof). **P3 is done end-to-end: census-complete + S1 silent-vtable + all reachable ICEs + size-fatal +
+    checker-totality. No reachable silent miscompile and no reachable cryptic ICE remain in the backend.**
+
 ## 6. Phase P4 — The frontier ("everything *possible*", with cost)
 
 - **`f128` via softfloat.** No native .NET quad float, but it is *translatable* via a softfloat

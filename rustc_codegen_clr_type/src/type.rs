@@ -246,8 +246,17 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                 if elem_simd.is_err() || vec_bits > 512 {
                     let arr_size = layout.layout.size().bytes();
                     let arr_align = layout.layout.align().abi.bytes();
+                    // I3 totality: a SIMD vector lowered to a fixed array can't exceed 2^32 bytes on
+                    // .NET. Unreachable (max SIMD is kilobytes), but fail loud rather than return a
+                    // silent ZST `Void`. `span_fatal` returns `!`, so the fixed_array call below runs
+                    // only for representable sizes.
                     if std::convert::TryInto::<u32>::try_into(arr_size).is_err() {
-                        return Type::Void;
+                        ctx.tcx().dcx().span_fatal(
+                            ctx.span(),
+                            format!(
+                                "SIMD vector {ty:?} lowered to a fixed array of {arr_size} bytes, which exceeds the .NET maximum type size of 2^32 bytes."
+                            ),
+                        );
                     }
                     let cref = fixed_array(ctx, elem, count, arr_size, arr_align);
                     return Type::ClassRef(cref);
@@ -343,12 +352,18 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
             let layout = ctx.layout_of(ty);
             let arr_size = layout.layout.size().bytes();
             let arr_align = layout.layout.align().abi.bytes();
-            // An array of this size can't be represented on the .NET side
+            // An array of this size can't be represented on the .NET side. I3 totality: the old
+            // `return Type::Void` produced a ZST slot that place ops then read/write as if it were
+            // the array — a silent miscompile. Fail loud instead. `span_fatal` returns `!`, so the
+            // `if` body diverges and control never reaches `fixed_array` for an oversized array.
+            // Unreachable on real code (no std/test/cargo_tests array is > 4 GiB).
             if std::convert::TryInto::<u32>::try_into(arr_size).is_err() {
-                eprintln!(
-                    "WARNING: Array {ty:?} of size {arr_size:?} can't be represented on the .NET side. Repleacing it with an unsided void."
+                ctx.tcx().dcx().span_fatal(
+                    ctx.span(),
+                    format!(
+                        "Array {ty:?} has size {arr_size} bytes, which exceeds the .NET maximum type size of 2^32 bytes and cannot be represented as a .NET fixed-size array."
+                    ),
                 );
-                return Type::Void;
             }
             let cref = fixed_array(ctx, element, length as u64, arr_size, arr_align);
             Type::ClassRef(cref)
@@ -755,13 +770,18 @@ fn struct_<'tcx>(
         fields.push((field_type, ctx.alloc_string(name), Some(offset)));
     }
     let size = layout.layout.size().bytes();
-    let size = if let Ok(size) = std::convert::TryInto::<u32>::try_into(size) {
-        size
-    } else {
-        eprintln!(
-            "WARNING: Struct {adt_ty:?} excceeds max size of 2^32. Clamping the size, this can cause UB."
-        );
-        u32::MAX
+    let size = match std::convert::TryInto::<u32>::try_into(size) {
+        Ok(size) => size,
+        // I3 totality: a struct >= 2^32 bytes cannot be represented as a .NET value type.
+        // Clamping to `u32::MAX` (the old behaviour) silently mis-lays-out the type, so fail loud.
+        // Unreachable on real code (rustc allows the layout up to obj_size_bound = 1<<61, but such a
+        // type is uninstantiable and absent from std/test/cargo_tests).
+        Err(_) => ctx.tcx().dcx().span_fatal(
+            ctx.span(),
+            format!(
+                "Struct {adt_ty:?} has size {size} bytes, which exceeds the .NET maximum type size of 2^32 bytes. This type cannot be represented as a .NET value type."
+            ),
+        ),
     };
     let has_nonverlaping_layout = unique_checks.len() == fields.len();
     ClassDef::new(
