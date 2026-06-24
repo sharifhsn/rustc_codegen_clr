@@ -85,12 +85,15 @@ fn locals_from_mir<'tcx>(
 pub fn terminator_to_ops<'tcx>(
     term: &Terminator<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
+    // Whether the MIR block being lowered is a `cleanup` block — threaded to `handle_terminator` so
+    // a `Drop` carrying an `UnwindAction::Terminate` edge can be wrapped in an inline abort guard.
+    is_cleanup_block: bool,
 ) -> Result<Vec<Root>, CodegenError> {
     let terminator = if *crate::config::ABORT_ON_ERROR {
-        crate::terminator::handle_terminator(term, ctx)
+        crate::terminator::handle_terminator(term, ctx, is_cleanup_block)
     } else {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::terminator::handle_terminator(term, ctx)
+            crate::terminator::handle_terminator(term, ctx, is_cleanup_block)
         })) {
             Ok(ok) => ok,
             Err(payload) => {
@@ -306,9 +309,10 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
                 let dbg = ctx.debug_msg(&msg);
                 trees.push(dbg);
             }
-            let term_trees = terminator_to_ops(term, ctx).unwrap_or_else(|err| {
-                panic!("Could not compile terminator {term:?} because {err:?}")
-            });
+            let term_trees =
+                terminator_to_ops(term, ctx, block_data.is_cleanup).unwrap_or_else(|err| {
+                    panic!("Could not compile terminator {term:?} because {err:?}")
+                });
             for root in &term_trees {
                 if let Err(err) = ctx.get_root(*root).clone().typecheck(sig_idx, &locals, ctx) {
                     ctx.tcx()

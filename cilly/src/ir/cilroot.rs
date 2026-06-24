@@ -40,6 +40,19 @@ pub enum CILRoot {
         target: u32,
         source: u32,
     },
+    /// A self-contained, single-op protected region that aborts uncatchably (`FailFast`) if the
+    /// `protected` root throws. Used to model a `Drop`-glue call sitting on a MIR **cleanup** block
+    /// whose `UnwindAction` is `Terminate` — i.e. a destructor that may panic *while already
+    /// unwinding* (a double panic, `InCleanup`) or that crosses a `nounwind` boundary mid-cleanup
+    /// (`Abi`). At export time this renders the inner CLR region
+    /// `.try{ <protected>; leave done } catch System.Object { pop; ldstr <msg>; FailFast; rethrow } done: nop`.
+    /// It is NOT a `BasicBlock` handler (so it never trips the single-layer handler ban) and its only
+    /// child is the single `protected` root. `reason`: 0 = Abi, 1 = InCleanup (kept a plain `u8` so
+    /// `cilly` stays free of rustc's `UnwindTerminateReason`).
+    TerminateRegion {
+        protected: Interned<CILRoot>,
+        reason: u8,
+    },
     /// Rethrows the current exception
     ReThrow,
     /// Sets the static field to a value.
@@ -133,6 +146,7 @@ impl CILRoot {
             | CILRoot::VoidRet
             | CILRoot::Break
             | CILRoot::Nop
+            | CILRoot::TerminateRegion { .. }
             | CILRoot::ReThrow => [].into(),
             CILRoot::Branch(info) => {
                 let (_, _, cond) = info.as_mut();
@@ -190,6 +204,7 @@ impl CILRoot {
             | CILRoot::VoidRet
             | CILRoot::Break
             | CILRoot::Nop
+            | CILRoot::TerminateRegion { .. }
             | CILRoot::ReThrow => [].into(),
             CILRoot::Branch(info) => {
                 let (_, _, cond) = info.as_ref();
@@ -279,6 +294,14 @@ impl CILRoot {
             | CILRoot::Nop
             | CILRoot::ExitSpecialRegion { .. }
             | CILRoot::ReThrow => root_map(self, asm),
+            CILRoot::TerminateRegion { protected, reason } => {
+                // Recurse into the single protected child root so optimizer/realloc passes that go
+                // through `map` see and rewrite it, then re-wrap.
+                let inner = asm.get_root(protected).clone().map(asm, root_map, node_map);
+                let protected = asm.alloc_root(inner);
+                let root = CILRoot::TerminateRegion { protected, reason };
+                root_map(root, asm)
+            }
             CILRoot::Branch(branch) => {
                 let (a, b, cond) = *branch;
                 let cond = match cond {

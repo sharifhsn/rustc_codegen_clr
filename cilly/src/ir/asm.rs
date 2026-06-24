@@ -1105,7 +1105,16 @@ impl Assembly {
                     .flat_map(|blocks| blocks.iter_mut())
                     .flat_map(super::basic_block::BasicBlock::roots_mut),
             ) {
-                *root = new_roots.alloc(self.roots.get(*root).clone());
+                let mut val = self.roots.get(*root).clone();
+                // A `TerminateRegion`'s `protected` child is NOT in any block's root list, so it
+                // would be dropped by the rebuild. Re-intern it into `new_roots` first and rewrite
+                // the region to point at the new index (`realloc_roots` rebuilds only the ROOT
+                // bimap, so the protected root's own node indices remain valid).
+                if let CILRoot::TerminateRegion { protected, .. } = &mut val {
+                    let inner = self.roots.get(*protected).clone();
+                    *protected = new_roots.alloc(inner);
+                }
+                *root = new_roots.alloc(val);
             }
         }
         self.roots = new_roots;
@@ -1380,6 +1389,9 @@ impl Assembly {
                 | CILRoot::CallI(_)
                 | CILRoot::ExitSpecialRegion { .. }
                 | CILRoot::ReThrow
+                // `protected` is interned in the same root bimap, so this `iter_roots` over
+                // `self.roots.0` already visits it directly — the region itself holds no MethodRef.
+                | CILRoot::TerminateRegion { .. }
                 | CILRoot::SetStaticField { .. }
                 | CILRoot::CpObj { .. }
                 | CILRoot::StElem { .. }

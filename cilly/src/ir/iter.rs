@@ -222,6 +222,19 @@ impl Iterator for CILIter<'_> {
                 ) => {
                     self.elems.pop();
                 }
+                CILIterElem::Root(CILRoot::TerminateRegion { protected, .. }) => {
+                    if idx == &1 {
+                        *idx += 1;
+                        // Recurse into the single protected child ROOT (not a node) so node/type
+                        // collection reaches the guarded op — it lives nowhere else in the block.
+                        let protected = self.asm.get_root(*protected).clone();
+                        self.elems.push((CILIterElem::Root(protected), 0));
+                        continue;
+                    } else {
+                        self.elems.pop();
+                        continue;
+                    }
+                }
                 CILIterElem::Root(CILRoot::InitBlk(blk) | CILRoot::CpBlk(blk)) => match idx {
                     1 => {
                         *idx += 1;
@@ -555,6 +568,9 @@ impl<'this, T: Iterator<Item = CILIterElem> + 'this> TpeIter<'this> for T {
                     | CILRoot::InitBlk(_)
                     | CILRoot::CpBlk(_)
                     | CILRoot::ReThrow
+                    // The protected child root is yielded separately by the iterator (see the
+                    // `TerminateRegion` arm in `next`), so this region itself contributes no types.
+                    | CILRoot::TerminateRegion { .. }
                     | CILRoot::Unreachable(_) => None,
                     CILRoot::SetStaticField { field, .. } => {
                         let field = asm.get_static_field(field);

@@ -26,6 +26,13 @@ pub struct ILExporter {
     /// launcher and the name is irrelevant). A library passes its crate name here so C# can reference
     /// the produced `.dll` by a real assembly identity.
     asm_name: Option<String>,
+    /// Monotonic counter handing out unique `tr_done_N` leave-target labels for each emitted
+    /// `TerminateRegion` inner protected region. The interned root index is NOT usable as the label:
+    /// a single interned `protected` root can be referenced from several block roots within one
+    /// method (CSE/realloc share identical roots), and IL labels must be unique within a method —
+    /// reusing the index produced `Duplicate label: 'tr_done_N'` ilasm errors. A fresh counter value
+    /// per emission guarantees uniqueness even when the same root is emitted multiple times.
+    terminate_region_label: std::cell::Cell<u64>,
 }
 impl ILExporter {
     #[must_use]
@@ -34,6 +41,7 @@ impl ILExporter {
             flavour,
             is_lib,
             asm_name,
+            terminate_region_label: std::cell::Cell::new(0),
         }
     }
 
@@ -1214,6 +1222,45 @@ impl ILExporter {
                     .intersperse(",".to_owned())
                     .collect();
                 writeln!(out, "calli {output} ({inputs})")
+            }
+            super::CILRoot::TerminateRegion { protected, reason } => {
+                // Render a self-contained inner protected region whose catch does an uncatchable
+                // `FailFast`. This models a `Drop`-glue call on a MIR cleanup block carrying an
+                // `UnwindAction::Terminate` edge (a destructor that may panic while already
+                // unwinding, or cross a `nounwind` boundary mid-cleanup). The `protected` op runs;
+                // if it throws, the catch aborts the process (FailFast bypasses every managed
+                // catch — exactly Rust's `terminate`/double-panic semantics). If it does NOT throw,
+                // control `leave`s the region to `tr_done_N` and the surrounding cleanup continues
+                // unchanged (the block's `goto`/rethrow continuation is emitted SEPARATELY, after
+                // this root — see the frontend `Drop` arm). The `tr_*` label namespace is disjoint
+                // from `bb`/`h`/`jp`, so there is no collision with any block/handler label. `N` is a
+                // fresh monotonic counter value (NOT the interned root index, which can repeat within
+                // a method via shared/CSE'd roots and would yield `Duplicate label` ilasm errors).
+                let lbl = self.terminate_region_label.get();
+                self.terminate_region_label.set(lbl + 1);
+                // Message mirrors `emit_terminate` (src/terminator/mod.rs): 1 = InCleanup, else Abi.
+                let msg = if reason == 1 {
+                    "Rust panicked while running a destructor during unwinding (panic in a destructor during cleanup); aborted."
+                } else {
+                    "Rust unwinding crossed a `nounwind` ABI boundary (panic in a function that cannot unwind); aborted."
+                };
+                writeln!(out, ".try{{")?;
+                // `is_handler`/`has_handler` are propagated unchanged: the protected op is lexically
+                // inside whatever enclosing region this root already lives in.
+                self.export_root(asm, out, protected, is_handler, has_handler, sig, locals)?;
+                // A protected region cannot fall through — its normal exit MUST be `leave`.
+                writeln!(out, "leave tr_done_{lbl}")?;
+                writeln!(out, "}} catch [System.Runtime]System.Object{{")?;
+                writeln!(out, "pop")?;
+                writeln!(out, "ldstr {msg:?}")?;
+                writeln!(
+                    out,
+                    "call void class [System.Runtime]'System.Environment'::'FailFast'(string)"
+                )?;
+                // FailFast never returns; the trailing `rethrow` only keeps the catch well-formed.
+                writeln!(out, "rethrow")?;
+                writeln!(out, "}}")?;
+                writeln!(out, "tr_done_{lbl}: nop")
             }
             super::CILRoot::ExitSpecialRegion { target, source } => {
                 if is_handler {

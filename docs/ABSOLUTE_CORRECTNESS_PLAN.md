@@ -261,9 +261,31 @@ sub-object. **D** — three loud-ICE arms: signed `atomic_max`/`atomic_min` (wir
 helpers), `atomic_singlethreadfence` (folded into `atomic_fence`), and narrow `PointerExposeProvenance`
 (`ptr as u32`, generalized to `Type::Int(_)`). Regression crates `overflow_elision` / `indirect_offset`
 / `atomic_cast_arms`, all byte-identical to native; gate 428/12 under the fatal checker, `typecheck.rs`
-unchanged. **Net across the seam audit:** all 4 LOUD gaps + 5 of the 6 SILENT_WRONG are closed; the lone
-remainder is the Slice A cleanup-block `Terminate(InCleanup)` double-panic (needs nested EH, §P2-S4);
-`#[link_section]` stays a deliberate loud wall.
+unchanged. **Net across the seam audit (before P2-S6):** all 4 LOUD gaps + 5 of the 6 SILENT_WRONG closed; the lone
+remainder was the Slice A cleanup-block `Terminate(InCleanup)` double-panic — closed next.
+
+**P2-S6 (this slice) — Slice A CLOSED: cleanup-block `Terminate` via nested exception regions.** The last
+open seam-audit gap, and the one architectural EH change. A destructor that panics *while a first panic
+is unwinding* (a double panic, `Terminate(InCleanup)`) sits on a `Drop` call in a MIR *cleanup* block;
+P2-S4's synthetic FailFast handler only covered NORMAL-block edges (cleanup blocks are never run through
+`resolve_exception_handlers`, and the il_exporter renders one try/catch layer per block). Produced by the
+`eh-nested-regions` workflow (5-facet investigate → 3-design judge panel that disqualified full-nesting as
+high-blast-radius and a naive promotion as producing dangling `leave` IL → a single writer agent), then
+integrated + re-verified by the parent. FIX: a new leaf IR root `CILRoot::TerminateRegion { protected,
+reason }` that the frontend `Drop` arm wraps around ONLY the cleanup-block drop call; it exports as an
+inner `.try{ <drop>; leave done } catch System.Object { pop; ldstr msg; Environment.FailFast(msg);
+rethrow } done: nop` — an **uncatchable** abort — WITHOUT any `BasicBlock` carrying a nested handler, so
+the single-layer handler model / `resolve_exception_handlers` / `block_gc` / the 2-layer assert are all
+untouched and IL is byte-identical for every method without such an edge. Threaded through the IR core
+(iter recurse, `realloc_roots` re-intern of the off-block-list `protected` child, `asm_link` translate,
+`typecheck` delegate); C mode delegates unguarded (no managed EH — a mid-cleanup panic already aborts).
+Verified: `cargo_tests/double_panic` aborts (`dotnet <dll>` exit 134 with the "panic in a destructor
+during cleanup" FailFast message; stdout `start`, never `REACHED`); a NORMAL `catch_unwind` still catches
+(`caught=true`, exit 0 — the load-bearing no-regression check); the P2-S4 extern-C abort still aborts.
+Docker `::stable` gate: no real regressions (no drop/panic/unwind/terminate test failed), fatal checker
+accepts `TerminateRegion`. **With this, every confirmed seam-audit gap is closed** except the deliberate
+`#[link_section]` loud wall. (Residual: a cleanup-block `Call`-with-`Terminate` — not `Drop` — stays on
+the old never-wired route; does not occur in double-panic MIR, no regression, low impact.)
 
 ## 5. Phase P3 — Totality census + loud failure (delivers I3)
 

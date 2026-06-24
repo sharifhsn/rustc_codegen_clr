@@ -516,6 +516,13 @@ impl Assembly {
             CILRoot::ExitSpecialRegion { target, source } => {
                 CILRoot::ExitSpecialRegion { target, source }
             }
+            CILRoot::TerminateRegion { protected, reason } => {
+                // The protected child root is NOT in any block's root list (only the region and the
+                // continuation `goto` are), so it must be translated + re-interned here explicitly.
+                let inner = self.translate_root(source, source.get_root(protected).clone());
+                let protected = self.alloc_root(inner);
+                CILRoot::TerminateRegion { protected, reason }
+            }
             CILRoot::SetStaticField { field, val } => {
                 let val = self.translate_node(source, source.get_node(val).clone());
                 let val = self.alloc_node(val);

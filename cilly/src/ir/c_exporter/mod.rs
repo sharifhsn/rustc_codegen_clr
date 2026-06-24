@@ -1016,6 +1016,23 @@ impl CExporter {
                 }
             }
             CILRoot::ReThrow => "RUST_RETHROW".into(),
+            CILRoot::TerminateRegion { protected, .. } => {
+                // C mode has no real exception model (UNWIND_SUPPORTED is never defined; every
+                // `RUST_THROW` aborts), so a destructor that panics mid-cleanup already aborts the
+                // whole program — the InCleanup-uncatchability guarantee is vacuously satisfied.
+                // Just emit the protected op unguarded so the C build stays green.
+                let protected = asm.get_root(protected).clone();
+                self.root_to_string(
+                    protected,
+                    asm,
+                    locals,
+                    inputs,
+                    sig,
+                    next,
+                    is_handler,
+                    has_handler,
+                )?
+            }
             CILRoot::SetStaticField { field, val } => {
                 let field = asm[field];
                 let class = asm[field.owner()].clone();

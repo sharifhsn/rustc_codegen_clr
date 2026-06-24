@@ -1326,6 +1326,13 @@ impl CILRoot {
                 }
                 Ok(())
             }
+            Self::TerminateRegion { protected, .. } => {
+                // A `TerminateRegion` is a side-effecting region whose only child is `protected`;
+                // it yields no stack value (like `ReThrow`/`ExitSpecialRegion`). Delegate to the
+                // protected root's own typecheck so the guarded op is still verified (it is not in
+                // any block's top-level root list, so nothing else would check it).
+                asm.get_root(*protected).clone().typecheck(sig, locals, asm)
+            }
             _ => {
                 for node in self.nodes() {
                     asm.get_node(*node).clone().typecheck(sig, locals, asm)?;

@@ -495,6 +495,12 @@ pub fn handle_call_terminator<'tycxt>(
 pub fn handle_terminator<'tcx>(
     terminator: &Terminator<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
+    // Whether the MIR block this terminator belongs to is a `cleanup` block (runs only while
+    // unwinding). Needed to decide whether a `Drop` whose `UnwindAction` is `Terminate` must be
+    // wrapped in an inline `TerminateRegion` abort guard (a destructor panicking mid-cleanup — a
+    // double panic — which Rust requires to abort uncatchably). For NORMAL-block `Terminate(Abi)`
+    // edges the existing synthetic-handler route (see `crate::basic_block`) is left untouched.
+    is_cleanup_block: bool,
 ) -> Vec<Root> {
     let res = match &terminator.kind {
         TerminatorKind::Call {
@@ -607,12 +613,45 @@ pub fn handle_terminator<'tcx>(
         TerminatorKind::Drop {
             place,
             target,
-            unwind: _,
+            unwind,
             replace: _,
             //TODO: figure out what the hell those fields are doing.
             drop: _,
         } => {
             let ty = ctx.monomorphize(place.ty(ctx.body(), ctx.tcx()).ty);
+
+            // If this drop sits on a CLEANUP block and its unwind action is `Terminate`, then a
+            // panic escaping the drop glue (a destructor panicking *while already unwinding* — a
+            // double panic, or one crossing a `nounwind` boundary mid-cleanup) must abort the
+            // process UNCATCHABLY. We model that with an inline `TerminateRegion` guard wrapping
+            // ONLY the drop call, leaving the cleanup continuation (`goto`/`beq`) untouched. This
+            // is the InCleanup-edge counterpart to the P2-S4 synthetic-handler route used for
+            // `Terminate(Abi)` edges on NORMAL blocks (which is deliberately left untouched, gated
+            // on `is_cleanup_block`). No-op under NO_UNWIND (no cleanup blocks/handlers exist then).
+            let terminate_reason: Option<u8> = if is_cleanup_block && !*crate::config::NO_UNWIND {
+                match unwind {
+                    rustc_middle::mir::UnwindAction::Terminate(
+                        UnwindTerminateReason::InCleanup,
+                    ) => Some(1),
+                    rustc_middle::mir::UnwindAction::Terminate(UnwindTerminateReason::Abi) => {
+                        Some(0)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            // Wrap a single drop-call root in a `TerminateRegion` iff this is a Terminate-on-cleanup
+            // edge; otherwise return it unchanged.
+            let guard = |ctx: &mut MethodCompileCtx<'tcx, '_>, call: Root| -> Root {
+                match terminate_reason {
+                    Some(reason) => ctx.alloc_root(CILRoot::TerminateRegion {
+                        protected: call,
+                        reason,
+                    }),
+                    None => call,
+                }
+            };
 
             let drop_instance = Instance::resolve_drop_glue(ctx.tcx(), ty);
             if let InstanceKind::DropGlue(_, None) = drop_instance.def {
@@ -661,6 +700,9 @@ pub fn handle_terminator<'tcx>(
                         let cmp_b = ctx.alloc_node(Const::USize(0));
                         let fn_sig = ctx.alloc_sig(FnSig::new([void_ptr], Type::Void));
                         let calli = ctx.call_indirect_root(fn_sig, drop_fn_ptr, [obj_ptr]);
+                        // Guard ONLY the indirect drop call (not the null-vtable `beq` short-circuit
+                        // nor the `goto` continuation) when this is a Terminate-on-cleanup edge.
+                        let calli = guard(ctx, calli);
                         let beq = ctx.alloc_root(CILRoot::Branch(Box::new((
                             target.as_u32(),
                             0,
@@ -684,6 +726,9 @@ pub fn handle_terminator<'tcx>(
                         let site = ctx.alloc_methodref(mref);
                         let addr = place_address(place, ctx);
                         let call = ctx.call_root(site, &[addr], IsPure::NOT);
+                        // Guard ONLY the drop call (not the `goto` continuation) on a
+                        // Terminate-on-cleanup edge — see `guard`/`terminate_reason` above.
+                        let call = guard(ctx, call);
                         let goto = goto(ctx, target.as_u32());
                         vec![call, goto]
                     }

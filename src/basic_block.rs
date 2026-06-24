@@ -26,6 +26,23 @@ pub(crate) fn handler_for_block<'tcx>(
     // an abort Rust guarantees is uncatchable. Short-circuited BEFORE `simplify_handler`, which only
     // understands real MIR block indices.
     if let UnwindAction::Terminate(reason) = unwind {
+        // A `Terminate` edge on a CLEANUP block whose terminator is a `Drop` is now handled by an
+        // inline `TerminateRegion` abort guard wrapping the drop call itself (see
+        // `terminator::handle_terminator`'s `Drop` arm). Returning a synthetic handler id here would
+        // additionally materialize a now-DEAD `FailFast` cleanup block (assembly.rs) and, worse,
+        // cleanup blocks are never run through `resolve_exception_handlers` anyway — so the
+        // synthetic route never actually wired the abort for the InCleanup edge (that was the bug).
+        // Returning `None` lets the inline guard be the sole, correct mechanism. The NORMAL-block
+        // `Terminate(Abi)` edge (P2-S4) is left byte-identical: it keeps the synthetic-handler
+        // route. We gate strictly on `is_cleanup` + `Drop` so no other Terminate edge is affected.
+        if block_data.is_cleanup
+            && matches!(
+                term.kind,
+                rustc_middle::mir::TerminatorKind::Drop { .. }
+            )
+        {
+            return None;
+        }
         return Some(terminate_handler_id(*reason, blocks));
     }
     simplify_handler(

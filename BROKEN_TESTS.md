@@ -427,7 +427,7 @@ normal block and the backend's exporter renders only a **single** try/catch laye
 is a facet of the pre-existing "cleanup blocks don't get their own unwind handler resolved" limitation
 (`src/assembly.rs` only runs `resolve_exception_handlers` on normal blocks). Closing it needs nested
 exception regions — a separate, larger EH change. Low impact (a destructor panicking mid-unwind is
-already a bug). Repro: `/tmp/term_incleanup` still prints `REACHED`.
+already a bug). **CLOSED in P2-S6** — see below.
 
 ## P2-S5 — seam-audit Slices B / C / D (the tractable remainder), all FIXED + FULL MATCH
 
@@ -458,10 +458,29 @@ crates added; gate 428/12 under the fatal checker.
    `int_to_int`). Each previously ICE'd at codegen. Regression: `cargo_tests/atomic_cast_arms` (native
    `2 true` == backend).
 
-**Remaining open (the only un-closed seam-audit gap):** Slice A's CLEANUP-block `Terminate(InCleanup)`
-double-panic case (above) — needs nested exception regions, an architectural EH change the seam-close
-workflow itself flagged as too-high-blast-radius for a minimal slice. All other confirmed seam-audit
-gaps (the 4 LOUD + 5 of the 6 SILENT_WRONG) are now closed; `#[link_section]` stays a deliberate loud wall.
+**CLOSED in P2-S6 (below):** Slice A's CLEANUP-block `Terminate(InCleanup)` double-panic. With it, ALL
+confirmed seam-audit gaps are closed except the deliberate `#[link_section]` loud wall.
+
+## P2-S6 — Slice A cleanup-block `Terminate` CLOSED via nested exception regions
+
+**FIXED — a destructor panicking during unwinding (double panic) now hard-aborts uncatchably.** The
+`Terminate(InCleanup)` (and `Terminate(Abi)`-on-cleanup) edge sits on a `Drop` call in a MIR *cleanup*
+block; P2-S4's synthetic FailFast handler only covered NORMAL-block Terminate edges (cleanup blocks are
+never run through `resolve_exception_handlers`, and the il_exporter renders one try/catch layer per
+block). FIX (eh-nested-regions workflow, integrated + re-verified by the parent): a new leaf IR root
+`CILRoot::TerminateRegion { protected, reason }` (cilly/src/ir/cilroot.rs) that the frontend `Drop` arm
+wraps around ONLY the cleanup-block drop call; it exports (cilly/src/ir/il_exporter) as an inner
+`.try{ <drop>; leave done } catch System.Object { pop; ldstr msg; Environment.FailFast(msg); rethrow }
+done: nop` — an uncatchable abort — WITHOUT any BasicBlock carrying a nested handler (so the single-layer
+handler model, `resolve_exception_handlers`, `block_gc`, and the 2-layer assert are all untouched; IL is
+byte-identical for every method without such an edge). Threaded through the IR core (iter recurse,
+realloc re-intern of the off-block-list `protected` child, asm_link translate, typecheck delegate); C
+mode delegates unguarded (no managed EH — a mid-cleanup panic already aborts). Verified: `cargo_tests/
+double_panic` aborts (stdout `start`, never `REACHED`; `dotnet <dll>` exit 134 with the
+"panic in a destructor during cleanup" FailFast message), a NORMAL `catch_unwind` still catches
+(`caught=true`, exit 0), the P2-S4 extern-C abort still aborts; gate 428/12 under the fatal checker;
+`typecheck.rs` accepts `TerminateRegion`. NOTE: a cleanup-block `Call` (not `Drop`) carrying `Terminate`
+remains on the old (never-wired) route — does not occur in double-panic MIR, no regression, low impact.
 
 4. **OPEN, harness — apphost exit code** (item 3 of the panic cluster above; not codegen).
 
