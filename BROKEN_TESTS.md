@@ -354,19 +354,20 @@ P2-S2 re-measured this cluster precisely with the stderr-aware oracle. The earli
 **stderr** in both native and backend (the stream routing is correct). The surviving,
 distinct divergences are:
 
-1. **`#[track_caller]` caller-location is wrong (the load-bearing one).** Every panic —
-   and any plain `core::panic::Location::caller()` — reports the std-internal site
-   `<WORKSPACE>/src/panic/location.rs:181:9` (the body of `Location::caller`) instead of
-   the user call site (`src/main.rs:<line>:<col>`). Confirmed even for a user-level
-   `#[track_caller] fn` calling `Location::caller()` (`e_track_caller` probe:
-   backend prints `location.rs:181`, native prints `main.rs:6`). Root cause: the
-   caller-location intrinsic / track_caller implicit-arg threading does not propagate
-   the caller's location through the chain on this backend; reading `LdArg(arg_count)`
-   in the `requires_caller_location` branch does not yield the caller's `&Location`.
-   This is REAL (observable, in the panic note + `Location::caller()` return value) and
-   needs proper `#[track_caller]` implicit-arg plumbing (mirroring rustc's
-   `FunctionCx::get_caller_location` / `Body::caller_location_span`). An attempt at this
-   plumbing existed in the tree but did not deliver (still mislocates) and was reverted.
+1. **FIXED (P2-S3) — `#[track_caller]` caller-location text.** Every panic — and any plain
+   `core::panic::Location::caller()` — used to report `location.rs:181:9` (the body of
+   `Location::caller`) instead of the user call site. Root cause WAS the `#[track_caller]`
+   threading (the earlier "reverted attempt that still mislocates" was a *measurement* artifact:
+   the native `cargo dotnet` harness reuses compiled `core`/`std` across crates — cargo
+   fingerprints the RUSTFLAGS string holding the backend dylib **path**, not its content — so the
+   recompile that would exercise the fix never ran, and the fix looked ineffective). FIX: a single
+   `get_caller_location(ctx, source_info)` helper (`src/terminator/mod.rs`) mirroring rustc's
+   `FunctionCx::get_caller_location` — forwards the enclosing fn's implicit `&Location` arg
+   (`LdArg(arg_count)`) when it is `#[track_caller]`, and delegates the MIR-inlining scope walk to
+   rustc's `Body::caller_location_span`; `SourceInfo` is threaded through the call/intrinsic/Assert
+   sites. Verified byte-identical vs native: `cargo_tests/caller_location` (FULL MATCH) + a
+   forced-clean-core bounds-check probe (`line=11`, was `181`). To recompile out-of-line `core` items
+   under the native harness, perturb RUSTFLAGS (the dylib path is not fingerprinted).
 
 2. **Thread name/id cosmetic:** backend prints `thread '<unnamed>' (1)`; native prints
    `thread 'main' (<tid>)`. The main thread is unnamed on the dotnet PAL and the id is a
@@ -381,10 +382,9 @@ distinct divergences are:
    not propagating the managed exit code. Fix belongs in the `cargo dotnet run` path
    (invoke via `dotnet <dll>` or fix apphost), not the backend.
 
-Classification: program logic (catch/`Err`/branch) is correct; the residuals are a
-diagnostics-fidelity defect (#1, real codegen — track_caller), a cosmetic (#2), and a
-harness exit-code-propagation defect (#3, not codegen). Deferred to a dedicated
-panic/track_caller-fidelity slice.
+Classification: program logic (catch/`Err`/branch) is correct. #1 (track_caller text) is now
+**FIXED in P2-S3**; the residuals are a cosmetic (#2, thread name/id) and a harness
+exit-code-propagation defect (#3, not codegen — the apphost launcher).
 
 ## NEW real divergences found in P2-S2 (ranked, beyond the S1-fixed 3)
 
@@ -392,14 +392,17 @@ panic/track_caller-fidelity slice.
    `System.Double`/`Single`; see the RESOLVED note above). High leverage: hit every
    Debug-format of a float. Regression: `cargo_tests/float_debug_fmt`. Gate 428/12 green.
 
-2. **OPEN, real codegen ICE — `fn main() -> Result<_,_>` (Termination trait).** A `main`
-   returning `Result` (even the trivial `fn main() -> Result<(), String> { Ok(()) }`)
-   makes the backend ICE ("the compiler unexpectedly panicked", build exit 101) — native
-   compiles+runs fine. Loud failure (I3-ok) but an I2 gap: `Termination`-returning `main`
-   is unsupported and crashes codegen. Tractable: implement the `Termination` lang-item
-   lowering for the `main` shim. Repro: `/tmp/probes/e_result_main`, `e_result_unit`.
+2. **FIXED (P2-S3) — `fn main() -> Result<_,_>` / `-> ExitCode` (Termination trait).** Such a
+   `main` (non-`Void` return, no args) used to ICE at `cilly::entrypoint::wrapper`'s `panic!`
+   (it handled only `() -> ()` and the C-main ABI). FIX mirrors rustc's `create_entry_fn`:
+   `src/lib.rs` resolves `std::rt::lang_start::<main_ret_ty>` and `entrypoint::wrapper_lang_start`
+   calls `lang_start(ldftn main, 0, null, sigpipe) -> isize`, propagating the code via
+   `Environment.Exit`. The fatal type-checker caught a first cut (argv one indirection too deep)
+   at build time. Verified: `cargo_tests/term_main` (`Ok`/exit 0) FULL MATCH; `Err` → stderr
+   `Error: …` + exit 1, `ExitCode::from(3)` → exit 3 (byte-identical via `dotnet <dll>`). Plain
+   `fn main() -> ()` unchanged.
 
-3. **OPEN, real — track_caller location** (item 1 of the panic cluster above).
+3. **FIXED (P2-S3) — track_caller location** (item 1 of the panic cluster above).
 
 4. **OPEN, harness — apphost exit code** (item 3 of the panic cluster above; not codegen).
 

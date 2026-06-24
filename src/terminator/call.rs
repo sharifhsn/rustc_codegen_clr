@@ -16,7 +16,7 @@ use rustc_codegen_clr_call::CallInfo;
 use rustc_codegen_clr_ctx::function_name;
 use rustc_codegen_clr_place::place_set;
 use rustc_codegen_clr_type::{utilis::garg_to_string, GetTypeExt};
-use rustc_codgen_clr_operand::{constant::load_const_value, handle_operand, operand_address};
+use rustc_codgen_clr_operand::{handle_operand, operand_address};
 use rustc_middle::ty::InstanceKind;
 use rustc_middle::{
     mir::{Operand, Place},
@@ -334,7 +334,7 @@ pub fn call_inner<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
-    span: rustc_span::Span,
+    source_info: rustc_middle::mir::SourceInfo,
 ) -> Vec<Root> {
     if let rustc_middle::ty::InstanceKind::Virtual(_def, fn_idx) = instance.def {
         assert!(!args.is_empty());
@@ -445,7 +445,7 @@ pub fn call_inner<'tcx>(
             args,
             destination,
             instance,
-            span,
+            source_info,
             ctx,
         );
     }
@@ -632,13 +632,12 @@ pub fn call_inner<'tcx>(
     if args.len() < signature.inputs().len() {
         // The callee is `#[track_caller]`: rustc appends an implicit `&core::panic::Location` param
         // that the *call site* must supply (this is why `FnSig` ≠ `FnAbi` for track_caller fns).
-        // Materialize the real caller location (file/line/col) for this call site — exactly as the
-        // `caller_location` intrinsic does. Previously this pushed an uninitialized value, which
-        // becomes a garbage panic location the moment a track_caller callee actually panics (now that
-        // unwinding is wired up).
-        let caller_loc = ctx.tcx().span_as_caller_location(span);
-        let caller_loc_ty = ctx.tcx().caller_location_ty();
-        let location = load_const_value(caller_loc, caller_loc_ty, ctx);
+        // Supply the correct caller location: if *we* are also track_caller, forward our own implicit
+        // arg (so the location propagates up the chain to the real user site); otherwise, and after
+        // accounting for any MIR-inlined track_caller frames, materialize it from the call-site span.
+        // Previously this unconditionally materialized the local span, which both lost the propagation
+        // and (under MIR inlining) reported the inlined body's span instead of the user's.
+        let location = crate::terminator::get_caller_location(ctx, source_info);
         call_args.push(location);
     }
     //assert_eq!(args.len(),signature.inputs().len(),"CALL SIGNATURE ARG COUNT MISMATCH!");
@@ -669,7 +668,7 @@ pub fn call<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
-    span: rustc_span::Span,
+    source_info: rustc_middle::mir::SourceInfo,
 ) -> Vec<Root> {
     let fn_type = ctx.monomorphize(fn_type);
     let instance = if let TyKind::FnDef(def_id, subst_ref) = fn_type.kind() {
@@ -685,5 +684,5 @@ pub fn call<'tcx>(
     } else {
         todo!("Trying to call a type which is not a function definition!");
     };
-    call_inner(fn_type, instance, ctx, args, destination, span)
+    call_inner(fn_type, instance, ctx, args, destination, source_info)
 }

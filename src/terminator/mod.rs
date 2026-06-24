@@ -30,6 +30,45 @@ fn goto(ctx: &mut MethodCompileCtx<'_, '_>, target: u32) -> Root {
     ctx.alloc_root(CILRoot::Branch(Box::new((target, 0, None))))
 }
 
+/// Materialize the `&core::panic::Location` value that a `#[track_caller]` callee — or the
+/// `caller_location` intrinsic — must observe at this point in the function currently being compiled.
+///
+/// Mirrors rustc's `FunctionCx::get_caller_location` exactly. Two effects compose:
+///   * **MIR-inlining scope walk** (delegated to `Body::caller_location_span`): release builds inline
+///     `#[track_caller]` callees, so the location must be recovered by climbing the inlined source
+///     scopes to the real outer call site rather than reading the (inlined) statement span.
+///   * **Implicit-arg forwarding**: if the function being compiled is *itself* `#[track_caller]`, an
+///     un-inlined chain forwards its own implicit trailing `&Location` argument, so a chain
+///     `user_site → #[track_caller] a → #[track_caller] b → Location::caller()` reports `user_site`.
+///
+/// Only at the root of the chain (a non-track_caller frame) is a fresh `Location` constant
+/// materialized from the (walked) span. Previously every site unconditionally materialized the local
+/// statement span, so `Location::caller()` reported the body of `core::panic::Location::caller`
+/// itself (`library/core/src/panic/location.rs`) instead of the real user call site.
+pub(crate) fn get_caller_location<'tcx>(
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    source_info: rustc_middle::mir::SourceInfo,
+) -> Interned<CILNode> {
+    let tcx = ctx.tcx();
+    // rustc appends exactly one implicit `&Location` to the `FnAbi` of every track_caller fn, so it
+    // is the last CIL argument. MIR arg locals `_1..=arg_count` map to `LdArg(0..arg_count-1)` (see
+    // `rustc_codegen_clr_place::get::local_get`), so the implicit trailing arg is at `LdArg(arg_count)`.
+    let own_caller_location = if ctx.instance().def.requires_caller_location(tcx) {
+        let idx = u32::try_from(ctx.body().arg_count).expect("arg_count exceeds u32");
+        Some(ctx.alloc_node(CILNode::LdArg(idx)))
+    } else {
+        None
+    };
+    // `body()` returns a `'tcx` reference, so it does not borrow `ctx` — the `from_span` closure is
+    // free to take `&mut ctx` to materialize the constant.
+    let body = ctx.body();
+    body.caller_location_span(source_info, own_caller_location, tcx, |span| {
+        let caller_loc = tcx.span_as_caller_location(span);
+        let caller_loc_ty = tcx.caller_location_ty();
+        rustc_codgen_clr_operand::constant::load_const_value(caller_loc, caller_loc_ty, ctx)
+    })
+}
+
 /// Emit a call to a `#[lang]`-item panic function (e.g. `panic_bounds_check`), supplying `args`
 /// and — because every such lang item is `#[track_caller]` — the materialized caller `Location`.
 ///
@@ -41,9 +80,10 @@ fn goto(ctx: &mut MethodCompileCtx<'_, '_>, target: u32) -> Root {
 fn call_panic_lang_item<'tcx>(
     lang: rustc_hir::lang_items::LangItem,
     args: &[Interned<CILNode>],
-    span: rustc_span::Span,
+    source_info: rustc_middle::mir::SourceInfo,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Vec<Root> {
+    let span = source_info.span;
     let def_id = ctx.tcx().require_lang_item(lang, span);
     let instance = Instance::expect_resolve(
         ctx.tcx(),
@@ -57,13 +97,10 @@ fn call_panic_lang_item<'tcx>(
     let name = function_name(ctx.tcx().symbol_name(instance));
     let mut call_args: Vec<Interned<CILNode>> = args.to_vec();
     // The lang item is `#[track_caller]`: rustc appends an implicit `&core::panic::Location` param
-    // that the call site must supply (FnSig ≠ FnAbi). Materialize the real caller location for
-    // this site, exactly as a normal track_caller call does.
+    // that the call site must supply (FnSig ≠ FnAbi). Supply the correct caller location — forwarded
+    // from our own implicit arg if we are track_caller, else materialized from `span`.
     if call_args.len() < signature.inputs().len() {
-        let caller_loc = ctx.tcx().span_as_caller_location(span);
-        let caller_loc_ty = ctx.tcx().caller_location_ty();
-        let location =
-            rustc_codgen_clr_operand::constant::load_const_value(caller_loc, caller_loc_ty, ctx);
+        let location = get_caller_location(ctx, source_info);
         call_args.push(location);
     }
     let main = ctx.main_module();
@@ -381,7 +418,7 @@ pub fn handle_call_terminator<'tycxt>(
                 "fn_ty{fn_ty:?} in call is not a function type!"
             );
             let fn_ty = ctx.monomorphize(fn_ty);
-            let call_ops = call::call(fn_ty, ctx, args, destination, terminator.source_info.span);
+            let call_ops = call::call(fn_ty, ctx, args, destination, terminator.source_info);
             //eprintln!("\nCalling FnDef:{fn_ty:?}. call_ops:{call_ops:?}");
             trees.extend(call_ops);
         }
@@ -474,7 +511,6 @@ pub fn handle_terminator<'tcx>(
                 let e = ctx.alloc_node(*expected);
                 ctx.biop(c, e, BinOp::Eq)
             };
-            let span = terminator.source_info.span;
             // Branch to the success block when the no-panic condition holds.
             let branch_ok = ctx.alloc_root(CILRoot::Branch(Box::new((
                 target.as_u32(),
@@ -508,7 +544,12 @@ pub fn handle_terminator<'tcx>(
                 other => (other.panic_function(), vec![]),
             };
             let mut roots = vec![branch_ok];
-            roots.extend(call_panic_lang_item(lang_item, &extra_args, span, ctx));
+            roots.extend(call_panic_lang_item(
+                lang_item,
+                &extra_args,
+                terminator.source_info,
+                ctx,
+            ));
             roots
         }
         TerminatorKind::Goto { target } => vec![goto(ctx, target.as_u32())],

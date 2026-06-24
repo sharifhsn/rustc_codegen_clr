@@ -196,12 +196,12 @@ impl CodegenBackend for MyBackend {
             }
         }
 
-        if let Some((entrypoint, _kind)) = tcx.entry_fn(()) {
+        if let Some((entrypoint_did, kind)) = tcx.entry_fn(()) {
             let penv = rustc_middle::ty::TypingEnv::fully_monomorphized();
             let entrypoint = rustc_middle::ty::Instance::try_resolve(
                 tcx,
                 penv,
-                entrypoint,
+                entrypoint_did,
                 rustc_middle::ty::List::empty(),
             )
             .expect("Could not resolve entrypoint!")
@@ -211,6 +211,12 @@ impl CodegenBackend for MyBackend {
                 .expect("Could not get the signature of the entrypoint.");
             let symbol = tcx.symbol_name(entrypoint);
             let symbol = format!("{symbol:?}");
+            // A `fn main() -> T where T: Termination` (`-> Result<_,_>` / `-> ExitCode`) has a
+            // non-`Void` return and no args; `entrypoint::wrapper` only handles `() -> ()` and the
+            // C-main ABI, so it would `panic!` (ICE). Mirror rustc's `create_entry_fn`: route through
+            // `std::rt::lang_start::<T>`, which runs `main`, maps `T` to an exit code via
+            // `Termination::report`, and returns it. Everything else keeps the direct wrapper.
+            let needs_lang_start = sig.inputs().is_empty() && *sig.output() != cilly::Type::Void;
             let cs = MethodRef::new(
                 *asm.main_module(),
                 asm.alloc_string(symbol),
@@ -219,7 +225,35 @@ impl CodegenBackend for MyBackend {
                 vec![].into(),
             );
 
-            cilly::entrypoint::wrapper(cs, &mut asm);
+            if needs_lang_start {
+                let rustc_session::config::EntryFnType::Main { sigpipe } = kind;
+                let main_ret_ty = entrypoint.ty(tcx, penv).fn_sig(tcx).output().skip_binder();
+                let start_did = tcx
+                    .require_lang_item(rustc_hir::lang_items::LangItem::Start, rustc_span::DUMMY_SP);
+                let start_inst = rustc_middle::ty::Instance::expect_resolve(
+                    tcx,
+                    penv,
+                    start_did,
+                    tcx.mk_args(&[main_ret_ty.into()]),
+                    rustc_span::DUMMY_SP,
+                );
+                let start_sig = {
+                    let mut sctx = MethodCompileCtx::new(tcx, None, start_inst, &mut asm);
+                    function_sig::sig_from_instance_(start_inst, &mut sctx)
+                        .expect("Could not get the signature of lang_start.")
+                };
+                let start_symbol = format!("{:?}", tcx.symbol_name(start_inst));
+                let lang_start = MethodRef::new(
+                    *asm.main_module(),
+                    asm.alloc_string(start_symbol),
+                    asm.alloc_sig(start_sig),
+                    MethodKind::Static,
+                    vec![].into(),
+                );
+                cilly::entrypoint::wrapper_lang_start(cs, lang_start, sigpipe, &mut asm);
+            } else {
+                cilly::entrypoint::wrapper(cs, &mut asm);
+            }
         }
 
         let ffi_compile_timer = tcx

@@ -183,6 +183,49 @@ without build-std and cannot exercise the dotnet PAL. They need a **separate CI 
 artifact and diff stdout/stderr/exit vs native). Not force-fit into `::stable`. Tracked as a P2 CI
 follow-up.
 
+**P2-S3 (this slice) — the two OPEN codegen targets above, both fixed + differential-verified.**
+
+1. **Caller-location text — FIXED (the S2 "ConstOperand" diagnosis was WRONG).** The S2 note above
+   blamed a const-`Location` `ConstOperand`; that was a *measurement artifact* of build-std core
+   caching. The native `cargo dotnet` harness reuses compiled `core`/`std` artifacts across crates
+   (cargo fingerprints the RUSTFLAGS *string*, which holds the backend dylib **path**, not its
+   content), so the instrumentation never saw `Location::caller`/`panic_bounds_check` recompiled and
+   wrongly concluded the intrinsic path was untouched. The real cause is exactly the `#[track_caller]`
+   threading: the backend materialized `span_as_caller_location(span)` with the *local* statement span
+   at all three sites (the `caller_location` intrinsic, the track_caller call-site append, the
+   `Assert`→panic-lang-item append), so `Location::caller()` reported its own body
+   (`location.rs:181:9`). FIX: a single `get_caller_location(ctx, source_info)` helper
+   (`src/terminator/mod.rs`) that mirrors rustc's `FunctionCx::get_caller_location` — it forwards the
+   enclosing fn's implicit trailing `&Location` arg when the fn is `#[track_caller]` (`LdArg(arg_count)`)
+   and delegates the MIR-inlining scope walk to rustc's own `Body::caller_location_span` (release builds
+   inline the track_caller chain, so the span must climb the inlined source scopes to the real user
+   site). Threaded `SourceInfo` (not bare `Span`) through `call`/`call_inner`/`handle_intrinsic`/
+   `intrinsic_slow`/`call_panic_lang_item`. Verified byte-identical vs native via
+   `cargo_tests/caller_location` (depth-1/2 `Location::caller` chains, a 2-arg `#[track_caller]`
+   forwarder = the `panic_bounds_check` shape, a non-track_caller `caller()`), plus a forced-clean-core
+   bounds-check probe: native `line=11` == backend `line=11` (was `181`). Lesson: to actually recompile
+   out-of-line `core` items under the native harness, perturb RUSTFLAGS (the dylib path/content is not
+   fingerprinted).
+
+2. **`fn main() -> T: Termination` ICE — FIXED.** `cilly::entrypoint::wrapper` handled only `() -> ()`
+   and the C-main ABI, so `fn main() -> Result<_,_>` / `-> ExitCode` (non-`Void` return, no args) hit
+   its `panic!`. FIX mirrors rustc's `create_entry_fn`: `src/lib.rs` detects the non-`Void`/no-arg entry,
+   resolves `std::rt::lang_start::<main_ret_ty>` (`LangItem::Start`), and a new
+   `entrypoint::wrapper_lang_start` loads a fn-ptr to user `main`, calls
+   `lang_start(main_ptr, 0, null, sigpipe) -> isize` (which runs `main`, maps `T` via
+   `Termination::report`, printing `Error: <e>` to stderr on `Err`), and propagates the returned code
+   via `System.Environment.Exit`. The **fatal type-checker (I1) caught a first cut** (a `*const*const u8`
+   argv built one indirection too deep — `pppu8` vs `ppu8`) at build time instead of miscompiling —
+   exactly its job. Verified: `cargo_tests/term_main` (`Ok`-returning `Result`, exit 0) FULL MATCH;
+   `Err`-returning `main` → `Error: "boom"` on stderr + exit **1**, and `-> ExitCode::from(3)` → exit
+   **3**, both byte-identical to native via `dotnet <dll>` directly. (The single-file `cargo dotnet run`
+   apphost still drops a non-zero managed exit code — the known P2-S2 harness limitation, orthogonal to
+   this codegen; the `Ok`/exit-0 path is unaffected.) The plain `fn main() -> ()` path is unchanged.
+
+Both fixes keep the `::stable` gate green (428/12) under the fatal checker, with **no** checker
+relaxation (the type-verifier is the proof, not a bypass). Regression crates `caller_location` +
+`term_main` join the P2 build-std differential set (same CI-surface gap as above).
+
 ## 5. Phase P3 — Totality census + loud failure (delivers I3)
 
 - **Enumerate every construct:** each MIR `Rvalue`/`StatementKind`/`TerminatorKind`, each rustc

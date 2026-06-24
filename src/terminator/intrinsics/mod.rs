@@ -94,9 +94,10 @@ pub fn handle_intrinsic<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
     call_instance: Instance<'tcx>,
-    span: rustc_span::Span,
+    source_info: rustc_middle::mir::SourceInfo,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Vec<Root> {
+    let span = source_info.span;
     match fn_name {
         "arith_offset" => vec![arith_offset(args, destination, call_instance, ctx)],
         "breakpoint" => vec![breakpoint(args, ctx)],
@@ -104,7 +105,7 @@ pub fn handle_intrinsic<'tcx>(
             vec![ctx.alloc_root(cilly::CILRoot::Nop)]
         }
         "black_box" => vec![black_box(args, destination, call_instance, ctx)],
-        "caller_location" => vec![caller_location(destination, ctx, span)],
+        "caller_location" => vec![caller_location(destination, ctx, source_info)],
         "compare_bytes" => {
             let a = handle_operand(&args[0].node, ctx);
             let b = handle_operand(&args[1].node, ctx);
@@ -1256,7 +1257,7 @@ pub fn handle_intrinsic<'tcx>(
         | "simd_funnel_shl" | "simd_funnel_shr" => {
             todo!("SIMD intrinsic `{fn_name}` is not yet supported (no clean BCL Vector primitive; wire per-lane in cilly/src/ir/builtins/simd/tail.rs)")
         }
-        _ => intrinsic_slow(fn_name, args, destination, ctx, call_instance, span),
+        _ => intrinsic_slow(fn_name, args, destination, ctx, call_instance, source_info),
     }
 }
 use rustc_middle::span_bug;
@@ -1266,8 +1267,9 @@ fn intrinsic_slow<'tcx>(
     destination: &Place<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     call_instance: Instance<'tcx>,
-    span: rustc_span::Span,
+    source_info: rustc_middle::mir::SourceInfo,
 ) -> Vec<Root> {
+    let span = source_info.span;
     // Then, demangle the type name, converting it to a Rust-style one (eg. `core::option::Option::h8zc8s`)
     let demangled = rustc_demangle::demangle(fn_name);
     // Using formating preserves the generic hash.
@@ -1288,12 +1290,12 @@ fn intrinsic_slow<'tcx>(
             ctx,
             args,
             destination,
-            span,
+            source_info,
         )
     } else {
         assert!(demangled.contains("::"));
         let striped = demangled_to_stem(&demangled);
-        handle_intrinsic(striped, args, destination, call_instance, span, ctx)
+        handle_intrinsic(striped, args, destination, call_instance, source_info, ctx)
     }
 }
 fn volitale_load<'tcx>(
@@ -1317,11 +1319,13 @@ fn volitale_load<'tcx>(
 fn caller_location<'tcx>(
     destination: &Place<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    span: rustc_span::Span,
+    source_info: rustc_middle::mir::SourceInfo,
 ) -> Root {
-    let caller_loc = ctx.tcx().span_as_caller_location(span);
-    let caller_loc_ty = ctx.tcx().caller_location_ty();
-    let value = load_const_value(caller_loc, caller_loc_ty, ctx);
+    // `caller_location` only ever appears inside a `#[track_caller]` fn (e.g. `Location::caller`).
+    // `get_caller_location` forwards that fn's implicit trailing `&Location` argument (and walks any
+    // MIR-inlined track_caller frames) rather than materializing a constant from this intrinsic's own
+    // span (which was `location.rs` itself).
+    let value = crate::terminator::get_caller_location(ctx, source_info);
     place_set(destination, value, ctx)
 }
 fn demangled_to_stem(s: &str) -> &str {
