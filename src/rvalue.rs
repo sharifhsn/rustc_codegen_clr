@@ -23,7 +23,7 @@ use rustc_codgen_clr_operand::{
 };
 use rustc_middle::{
     mir::{CastKind, Operand, Place, Rvalue},
-    ty::{adjustment::PointerCoercion, GenericArgs, Instance, InstanceKind, Ty, TyKind},
+    ty::{adjustment::PointerCoercion, Instance, Ty, TyKind},
 };
 macro_rules! cast {
     ($ctx:ident,$operand:ident,$target:ident,$cast_name:path,$asm:expr) => {{
@@ -337,12 +337,18 @@ pub fn handle_rvalue<'tcx>(
         Rvalue::Repeat(operand, times) => repeat(rvalue, ctx, operand, *times, target_location),
         Rvalue::ThreadLocalRef(def_id) => {
             if !def_id.is_local() && ctx.tcx().needs_thread_local_shim(*def_id) {
-                let _instance = Instance {
-                    def: InstanceKind::ThreadLocalShim(*def_id),
-                    args: GenericArgs::empty(),
-                };
-                // Call instance
-                todo!("Thread locals with shims unsupported!")
+                // Cross-crate `#[thread_local]` shim. UNREACHABLE from safe/stable Rust on the
+                // .NET target: `needs_thread_local_shim` requires `is_thread_local_static` (the
+                // unstable `#![feature(thread_local)]` attribute) AND a cross-crate (`!is_local`)
+                // access. std's stable `thread_local!` macro routes through the runtime-key PAL
+                // arm, never this native `ThreadLocalRef` path. Lowering the shim would mean
+                // emitting a call to the synthesised `InstanceKind::ThreadLocalShim`, which the
+                // .NET TLS model does not yet support.
+                todo!(
+                    "Cross-crate `#[thread_local]` shim for {def_id:?} is unsupported on the .NET \
+                     target (requires unstable `#![feature(thread_local)]` + cross-crate access; \
+                     std's stable `thread_local!` uses the runtime-key PAL arm instead)."
+                )
             } else {
                 let alloc_id = ctx.tcx().reserve_and_set_static_alloc(*def_id);
                 let rvalue_ty = rvalue.ty(ctx.body(), ctx.tcx());

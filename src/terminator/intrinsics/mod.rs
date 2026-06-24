@@ -101,7 +101,11 @@ pub fn handle_intrinsic<'tcx>(
     match fn_name {
         "arith_offset" => vec![arith_offset(args, destination, call_instance, ctx)],
         "breakpoint" => vec![breakpoint(args, ctx)],
-        "cold_path" | "assert_inhabited" | "assert_zero_valid" | "const_deallocate" => {
+        "cold_path"
+        | "assert_inhabited"
+        | "assert_zero_valid"
+        | "assert_mem_uninitialized_valid"
+        | "const_deallocate" => {
             vec![ctx.alloc_root(cilly::CILRoot::Nop)]
         }
         "black_box" => vec![black_box(args, destination, call_instance, ctx)],

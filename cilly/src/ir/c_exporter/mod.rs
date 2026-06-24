@@ -1041,7 +1041,17 @@ impl CExporter {
                 let val = Self::node_to_string(asm[val].clone(), asm, locals, inputs, sig)?;
                 format!("{fname} = {val};")
             }
-            CILRoot::CpObj { src, dst, tpe } => todo!(),
+            CILRoot::CpObj { src, dst, tpe } => {
+                // `cpobj` copies exactly one `tpe`-sized value from `src` ptr to `dst` ptr
+                // (mirrors the il_exporter `cpobj {tpe}` semantics). A typed memcpy is the
+                // C equivalent: `sizeof`+`c_tpe` per InitObj, parenthesized memcpy per CpBlk.
+                let dst = Self::node_to_string(asm[dst].clone(), asm, locals, inputs, sig)?;
+                let src = Self::node_to_string(asm[src].clone(), asm, locals, inputs, sig)?;
+                format!(
+                    "memcpy(({dst}),({src}),sizeof({tpe}));",
+                    tpe = c_tpe(asm[tpe], asm)
+                )
+            }
             CILRoot::Unreachable(string_idx) => {
                 format!("\neprintf({:?});\nabort();\n", &asm[string_idx])
             }
@@ -1390,7 +1400,50 @@ impl CExporter {
                     Const::U8(v) => {
                         format!("{v}")
                     }
-                    _ => todo!("Unsupported default {default:?}"),
+                    // Signed / float / wide variants — reuse the canonical C literal renderings
+                    // from `CILNode::Const` (mref_to_string) so the two matches agree. Latent
+                    // until a future interop const-field producer drives this `default_value`.
+                    Const::I8(v) => format!("{v}"),
+                    Const::I16(v) => format!("{v}"),
+                    Const::I32(v) => format!("{v}"),
+                    Const::I64(v) => format!("((int64_t)0x{v:x}L)"),
+                    Const::ISize(v) => format!("(intptr_t)0x{v:x}L"),
+                    Const::USize(v) => {
+                        if *v < u32::MAX as u64 {
+                            format!("{v}")
+                        } else {
+                            format!("0x{v:x}uL")
+                        }
+                    }
+                    Const::I128(v) => {
+                        let low = *v as u128 as u64;
+                        let high = ((*v as u128) >> 64) as u64;
+                        format!("(__int128)((unsigned __int128)(0x{low:x}) | ((unsigned __int128)(0x{high:x}) << 64))")
+                    }
+                    Const::U128(v) => {
+                        let low = *v as u64;
+                        let high = ({ *v } >> 64) as u64;
+                        format!("((unsigned __int128)(0x{low:x}) | ((unsigned __int128)(0x{high:x}) << 64))")
+                    }
+                    Const::F32(b) => {
+                        if !b.0.is_nan() {
+                            format!("{:?}f", b.0)
+                        } else {
+                            "NAN".into()
+                        }
+                    }
+                    Const::F64(b) => {
+                        if !b.0.is_nan() {
+                            format!("{:?}", b.0)
+                        } else {
+                            "NAN".into()
+                        }
+                    }
+                    // Non-scalar variants (PlatformString/Null/ByteBuffer) have no scalar C
+                    // literal form; refuse loudly per the project's descriptive clean-wall idiom.
+                    other => todo!(
+                        "static-field default value of kind {other:?} is unsupported in C output"
+                    ),
                 };
                 writeln!(type_defs, "{extrn} {field_tpe} {fname} = {val};")?;
                 continue;

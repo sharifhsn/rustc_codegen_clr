@@ -190,14 +190,71 @@ impl ILExporter {
                             writeln!(
                                 out,
                                 ".data cil C_{c} = bytearray({})",
+                                // ILAsm `bytearray(...)` expects HEX byte pairs — match the I128
+                                // arm below. (Was decimal `{v}`, a latent wrong-bytes bug for any
+                                // >u64 unsigned static-field default; no producer drives it today.)
                                 b.to_le_bytes()
                                     .iter()
-                                    .map(|v| format!(" {v}"))
+                                    .map(|v| format!(" {v:02x}"))
                                     .collect::<String>()
                             )?;
                             format!(" at C_{c}")
                         }
-                        _ => todo!("unhandled const {default_value:?}"),
+                        // Signed ints share the byte-slot encoding of their unsigned siblings;
+                        // emit via the matching width directive (ILAsm `intN(...)` accepts signed
+                        // decimals). Latent until a future interop const-field producer drives it.
+                        Const::I8(b) => {
+                            c += 1;
+                            writeln!(out, ".data cil C_{c} = int8({b})")?;
+                            format!(" at C_{c}")
+                        }
+                        Const::I16(b) => {
+                            c += 1;
+                            writeln!(out, ".data cil C_{c} = int16({b})")?;
+                            format!(" at C_{c}")
+                        }
+                        Const::I32(b) => {
+                            c += 1;
+                            writeln!(out, ".data cil C_{c} = int32({b})")?;
+                            format!(" at C_{c}")
+                        }
+                        Const::I64(b) | Const::ISize(b) => {
+                            c += 1;
+                            writeln!(out, ".data cil C_{c} = int64({b})")?;
+                            format!(" at C_{c}")
+                        }
+                        Const::USize(b) => {
+                            c += 1;
+                            writeln!(out, ".data cil C_{c} = int64({b})")?;
+                            format!(" at C_{c}")
+                        }
+                        Const::I128(b) => {
+                            c += 1;
+                            writeln!(
+                                out,
+                                ".data cil C_{c} = bytearray({})",
+                                b.to_le_bytes()
+                                    .iter()
+                                    .map(|v| format!(" {v:02x}"))
+                                    .collect::<String>()
+                            )?;
+                            format!(" at C_{c}")
+                        }
+                        Const::F32(b) => {
+                            c += 1;
+                            writeln!(out, ".data cil C_{c} = float32({})", **b)?;
+                            format!(" at C_{c}")
+                        }
+                        Const::F64(b) => {
+                            c += 1;
+                            writeln!(out, ".data cil C_{c} = float64({})", **b)?;
+                            format!(" at C_{c}")
+                        }
+                        // Non-static-field-shaped variants (PlatformString/Null/ByteBuffer) have
+                        // no `.data` rendering; refuse loudly per the project's clean-wall idiom.
+                        other => panic!(
+                            "static-field default value of kind {other:?} is unsupported on the .NET target"
+                        ),
                     }
                 } else {
                     "".into()

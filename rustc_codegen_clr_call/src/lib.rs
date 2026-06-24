@@ -24,7 +24,12 @@ impl CallInfo {
         });
         let fn_abi = match fn_abi {
             Ok(abi) => abi,
-            Err(_error) => todo!(),
+            // Bind and surface the layout/ABI error instead of swallowing it — `fn_abi_of_instance`
+            // only fails on a layout-computation error (`FnAbiError::Layout`), which should be a
+            // loud, informative compiler-internal abort, not a bare `todo!()`.
+            Err(error) => rustc_middle::bug!(
+                "`fn_abi_of_instance` failed for {function:?}: {error:?}"
+            ),
         };
         let conv = fn_abi.conv;
         // CIL is calling-convention-agnostic: every call lowers to a CIL `call`/`callvirt` using
@@ -62,7 +67,15 @@ impl CallInfo {
             TyKind::FnDef(_, _) => fn_ty.fn_sig(ctx.tcx()).abi(),
             TyKind::Closure(_, args) => args.as_closure().sig().abi(),
             TyKind::Coroutine(_, _) => TargetAbi::Rust, // TODO: this assumes all coroutines have the ABI Rust. This *should* be correct.
-            _ => todo!("Can't get signature of {fn_ty}"),
+            // Defensive catch-all for a genuinely novel fn-type kind. NOTE: this is NOT the firing
+            // site for async closures (`CoroutineClosure`) — their `get_type` of the FnMut-shim's
+            // self-arg panics first at rustc_codegen_clr_type/src/type.rs (the real async-closure
+            // wall), so this arm only ever sees an unexpected `fn_ty.kind()`.
+            _ => todo!(
+                "Cannot derive a CIL signature for instance type {fn_ty} (kind: {:?}). \
+                 This function-type shape is unsupported on the .NET target.",
+                fn_ty.kind()
+            ),
         };
         // Only those ABIs are supported
         let split_last_tuple = match internal_abi {
@@ -79,7 +92,13 @@ impl CallInfo {
             TargetAbi::RustCall => true, /*Err(CodegenError::FunctionABIUnsuported(
             "\"rust_call\" ABI, used for things like clsoures, is not supported yet!",
             ))?,*/
-            _ => todo!("Unsuported ABI:{internal_abi:?}"),
+            // `split_last_tuple` only governs the tupled `rust_call` argument-splitting; every
+            // other ABI passes arguments straight through, so `false` is correct for all of them
+            // (`extern "system"/"win64"/"efiapi"/"vectorcall"`, the rustic `RustPreserveNone`/
+            // `RustTail`, etc.). This makes `internal_abi` AGREE with the `conv` gate above, which
+            // already ran first (lines 43-48) and `panic!`s loudly on genuinely-exotic conventions
+            // (Swift/Arm/GpuKernel/Interrupt) — so no exotic ABI can slip through here.
+            _ => false,
         };
         let mut sig = FnSig::new(args, ret);
         if fn_abi.c_variadic {

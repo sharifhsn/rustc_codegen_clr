@@ -64,6 +64,18 @@ These are the paths that can miscompile silently — the heart of I3. Ranked by 
 
 ## 3. REACHABLE loud-bail table (implement / upgrade-to-clear-wall), ranked
 
+> **✅ ALL 11 CLOSED in P3-S2/S3+ (commit pending).** 6 implemented (rows 1,2,4,5,6,10); row 11 a correct
+> `Ok` result-type fix (adds the valid by-value-`ClassRef` `ldflda` arm — strictness preserved, residual is
+> `unreachable!`, NOT a checker weakening); row 3 split (bool→u8 bridge on .NET 8 + a clean `span_bug` wall
+> for the .NET-9/`char` truncation hazard); rows 7/8/9 upgraded to clean documented walls. Verified:
+> combined oracle probe `cargo_tests/cd_ice_probes` (rows 1,2,4,5 → FULL MATCH vs native); rows 6/10/11 are
+> correct-if-reached (no producer drives them today); the .NET-9-bool / `char` / TLS-shim / async-closure
+> walls are unreachable from safe-stable. Docker `::stable` gate clean, no regressions. **No reachable
+> cryptic ICE remains.** Two notes from the work: (a) `AtomicBool::swap` actually lowers `atomic_xchg<u8>`
+> (the working U8 arm) so row 3's "reachable" tag was imprecise — the bool arm is unstable-intrinsic-only;
+> (b) a pre-existing latent **U128** static-field-default wrong-bytes bug (decimal where ILAsm `bytearray`
+> wants hex, `il_exporter:195`) was fixed alongside row 6.
+
 Loud failures on code that real safe-stable Rust on `x86_64-unknown-dotnet` can hit. Loud is OK-ish for I3, but these should be **implemented** (common/tractable) or **upgraded to a clear documented wall**.
 
 | # | location | construct | recommendation | why |

@@ -1,0 +1,5 @@
+[package]
+name = "cd_ice_probes"
+version = "0.0.0"
+edition = "2024"
+[workspace]

@@ -82,9 +82,32 @@ pub fn xchg<'tcx>(
             let call = ctx.call(xchng, &[dst, new], IsPure::NOT);
             return place_set(destination, call, ctx);
         }
-        Type::Bool | Type::PlatformChar => {
-            todo!("can't atomic_xchg {src_type:?}")
+        // `bool` is a 1-byte value; on .NET 8 it can reuse the dedicated `atomic_xchng_u8`
+        // builtin (the U8 arm above). The checker does NOT treat `Bool` as assignable to `U8`,
+        // so bridge the byref/value/result explicitly across the Bool<->U8 boundary. Unreachable
+        // from safe-stable Rust today (AtomicBool::swap lowers `atomic_xchg` with T = u8 — see
+        // core::sync::atomic), but correct if hit via the unstable `core::intrinsics::atomic_xchg`.
+        Type::Bool if !*crate::config::DOTNET9 => {
+            let xchng = ctx.alloc_methodref(xchng);
+            let u8_ref = ctx.nref(Type::Int(Int::U8));
+            let dst = ctx.cast_ptr_to(dst, u8_ref);
+            let new = ctx.transmute_on_stack(Type::Bool, Type::Int(Int::U8), new);
+            let call = ctx.call(xchng, &[dst, new], IsPure::NOT);
+            // `place_set` of a Bool destination from a U8 result: re-narrow to bool (0/1).
+            let call = ctx.transmute_on_stack(Type::Int(Int::U8), Type::Bool, call);
+            return place_set(destination, call, ctx);
         }
+        // `PlatformChar` is a 2-byte interop char with no native sub-word `Interlocked.Exchange`
+        // overload before .NET 9 and no width-correct emulation wired for it; routing it through
+        // the 1-byte `atomic_xchng_u8` builtin would truncate it (a miscompile), so refuse loudly.
+        // Unreachable from safe-stable Rust (there is no `AtomicChar`; the only producer is the
+        // interop `dotnet::char` type) — kept as a documented wall per the I3 invariant.
+        Type::Bool | Type::PlatformChar => rustc_middle::span_bug!(
+            ctx.span(),
+            "atomic exchange (`atomic_xchg`) of `{src_type:?}` is unsupported on this .NET target: \
+             there is no native sub-word `Interlocked.Exchange` overload before .NET 9 and no \
+             width-correct emulation is wired for this type. (Not produced by any stable atomic API.)"
+        ),
         _ => (),
     }
     let src_ref = ctx.nref(src_type);

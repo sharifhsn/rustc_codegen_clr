@@ -52,7 +52,15 @@ fn body_ty_is_by_address<'tcx>(last_ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tc
         | TyKind::Slice(_)
         | TyKind::Str => true,
 
-        TyKind::Int(_) | TyKind::Float(_) | TyKind::Uint(_) | TyKind::Bool | TyKind::Char => false,
+        // A `fn()` is a pointer-sized leaf scalar with no projectable structure, so it is
+        // by-value exactly like the other scalar leaves. (Defensive for I3 totality — a bare
+        // fn-ptr only reaches here in well-formed MIR wrapped in a Ref/RawPtr, handled below.)
+        TyKind::Int(_)
+        | TyKind::Float(_)
+        | TyKind::Uint(_)
+        | TyKind::Bool
+        | TyKind::Char
+        | TyKind::FnPtr(..) => false,
         TyKind::Ref(_, ty, _) | TyKind::RawPtr(ty, _) => {
             pointer_to_is_fat(ty, ctx.tcx(), ctx.instance())
         }

@@ -319,6 +319,15 @@ pub fn ptr_set_op<'tcx>(
                     ctx.st_ind(addr_calc, value_calc, ptr, false)
                 }
             }
+            // A fn-ptr is a by-VALUE pointer-sized scalar whose cached `Type` is already
+            // `Type::FnPtr(sig)` — the value-type to store, exactly like an Adt. Mirror the
+            // Adt/Tuple/Closure/Coroutine arm (`type_from_cache` + `st_ind`), NOT the Ref/RawPtr
+            // arms (which rebuild an `nptr(inner)` for a pointer-to lowering). `st_ind` emits
+            // `stind.i`, which the exporters + typechecker already accept for `Type::FnPtr`.
+            TyKind::FnPtr(..) => {
+                let pointed_type = ctx.type_from_cache(pointed_type);
+                ctx.st_ind(addr_calc, value_calc, pointed_type, false)
+            }
             _ => todo!(" can't deref type {pointed_type:?} yet"),
         }
     } else {

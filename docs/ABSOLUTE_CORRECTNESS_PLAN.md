@@ -327,6 +327,27 @@ documented). 6 work slices proposed (silent-wrong first).
   variadic wall, S4 size-clamp→fatal, S5 ABI two-enum + signed static defaults, S6 typechecker totality)
   are loud/exotic or hardening — none is another reachable silent miscompile.
 
+- **P3-S2/S3+ — all 11 reachable loud-bail / ICE sites (census §3) CLOSED.** Every cryptic
+  `todo!`/`span_bug!`/`panic!` on a path that real safe-stable Rust can reach is gone: **6 implemented**
+  (BackwardIncompatibleDropHint→`vec![]`; `assert_mem_uninitialized_valid`→Nop; fn-pointer store
+  `ptr_set_op`+`body_ty_is_by_address`; extern-ABI two-enum reconciled with the `conv` gate; signed/float
+  static-field defaults in both exporters; C-mode `CpObj`→memcpy), **row 11** a correct `Ok` result-type
+  fix for by-value-`ClassRef` `ldflda` (the loud backstop no longer panics on a *valid* shape — strictness
+  preserved, residual is `unreachable!`), **row 3** split (bool→u8 `atomic_xchg` bridge on .NET 8 + a clean
+  `span_bug` wall for the .NET-9/`char` truncation hazard), and **rows 7/8/9** upgraded to clean documented
+  walls (cross-crate `#[thread_local]` shim; async-closure/novel-fn-type; `fn_abi` error now surfaced not
+  swallowed). Done via the `p3-close-reachable-ices` workflow (7 parallel investigators → one writer → 2
+  adversarial reviewers), integrated + re-verified by the parent. VERIFIED: `cargo_tests/cd_ice_probes`
+  (rows 1,2,4,5) FULL MATCH vs native; rows 6/10/11 correct-if-reached (no producer today); the .NET-9-bool
+  /`char`/TLS/async-closure walls unreachable from safe-stable; Docker `::stable` gate 426/14 = baseline,
+  zero regressions across statement/intrinsics/atomic/place/call/exporters/typecheck. Two findings: (a)
+  `AtomicBool::swap` lowers `atomic_xchg<u8>` (not `<bool>`) so row 3's "reachable" tag was imprecise — the
+  bool arm is unstable-intrinsic-only; (b) a pre-existing latent **U128** static-field-default wrong-bytes
+  bug (decimal vs ILAsm hex `bytearray`) was fixed alongside row 6. **Net: the backend now has no known
+  reachable cryptic ICE — I3 holds on reachable safe-stable code modulo the deliberate documented walls.**
+  Remaining: S4 (size/layout clamp-and-continue → `fatal`) and S5/S6 hardening are *exotic walls / rigor*,
+  not reachable crashes.
+
 ## 6. Phase P4 — The frontier ("everything *possible*", with cost)
 
 - **`f128` via softfloat.** No native .NET quad float, but it is *translatable* via a softfloat

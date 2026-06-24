@@ -100,7 +100,11 @@ pub fn handle_statement<'tcx>(
         StatementKind::FakeRead(_) => {
             panic!("Fake reads should not be passed from the backend to the forntend!")
         }
-        rustc_middle::mir::StatementKind::BackwardIncompatibleDropHint { .. } => todo!(),
+        // Pure edition-2024 drop-order migration lint marker. rustc-src
+        // (rustc_middle/src/mir/syntax.rs) documents it as "semantically equivalent to `Nop`",
+        // emitting NO runtime code — codegen_ssa maps it to `{}`. Mirror the adjacent no-op
+        // statement arms (`Coverage`/`ConstEvalCounter`/`Nop`/`AscribeUserType`) with `vec![]`.
+        rustc_middle::mir::StatementKind::BackwardIncompatibleDropHint { .. } => vec![],
         StatementKind::PlaceMention(place) => {
             let val = place_get(place, ctx);
             let root = ctx.pop(val);

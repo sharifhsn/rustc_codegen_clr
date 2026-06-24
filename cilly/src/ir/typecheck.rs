@@ -884,7 +884,18 @@ impl CILNode {
                 match addr_tpe {
                     Type::Ref(_) => Ok(asm.nref(field.tpe())),
                     Type::Ptr(_) => Ok(asm.nptr(field.tpe())),
-                    _ => panic!("impossible. Type not a pointer or ref, but got dereferned during typechecks. {addr_tpe:?}"),
+                    // `ldflda` on a by-value object reference (`ClassRef`) is legal CIL: it yields
+                    // a managed pointer to the field. This case is deliberately accepted by the
+                    // pointed-type match above (line ~851) and fully validated (owner + field
+                    // presence); `LdField` returns `Ok` for the identical case and BOTH exporters
+                    // emit `ldflda` for it. The correct result type is a managed reference to the
+                    // field type — mirror the `Type::Ref` result. Returning a `TypeCheckError`
+                    // here would be a FALSE NEGATIVE rejecting valid IR the exporters emit.
+                    Type::ClassRef(_) => Ok(asm.nref(field.tpe())),
+                    _ => unreachable!(
+                        "LdFieldAddress addr typechecked to {addr_tpe:?}, which was not accepted by \
+                         the pointed-type match above"
+                    ),
                 }
             }
 
