@@ -1,0 +1,7 @@
+[package]
+name = "soak_blake2"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+blake2 = "0.10"
+[workspace]

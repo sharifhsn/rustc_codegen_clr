@@ -1,0 +1,8 @@
+[package]
+name = "soak_ron"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+ron = "0.8"
+serde = { version = "1", features = ["derive"] }
+[workspace]

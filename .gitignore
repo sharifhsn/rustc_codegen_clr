@@ -30,3 +30,12 @@ feasibility/demo/**/obj/
 feasibility/_lastbuild.log
 # rustc internal-compiler-error dumps (common while chasing nightly drift)
 rustc-ice-*.txt
+# cargo_tests corpus: per-crate build artifacts. The corpus tracks ONLY Cargo.toml + src/;
+# the .cargo/config.toml (generated per-machine by cargo-dotnet), Cargo.lock, and target/ are
+# regenerated and MUST NOT be committed (machine-specific paths -> dirty trees / broken native).
+cargo_tests/**/target/
+# .NET runtime config emitted by cargo-dotnet / the linker into the run dir
+.runtimeconfig.json
+*.runtimeconfig.json
+# macOS debug-symbol bundles from running compiled test binaries
+*.dSYM/

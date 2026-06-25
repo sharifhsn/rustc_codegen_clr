@@ -1,0 +1,7 @@
+[package]
+name = "soak_compact_str"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+compact_str = "0.8"
+[workspace]

@@ -1,0 +1,7 @@
+[package]
+name = "soak_crc-any"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+crc-any = "2"
+[workspace]

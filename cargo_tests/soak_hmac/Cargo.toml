@@ -1,0 +1,8 @@
+[package]
+name = "soak_hmac"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+hmac = "0.12"
+sha2 = "0.10"
+[workspace]
