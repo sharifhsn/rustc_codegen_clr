@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# mirtool — deterministic MIR ⇄ CIL inspection for the rustc_codegen_clr backend.
+#
+# The backend translates rustc's *optimized MIR* into CIL. To debug a miscompile you
+# need (a) the exact MIR the backend received and (b) the CIL it produced, aligned.
+# The winning recipe (found empirically — `--emit=mir` misses monomorphized library
+# generics, `INSERT_MIR_DEBUG_COMMENTS` shreds statements into per-token ldstr):
+#
+#   * MIR  : the backend's `DUMP_MIR=<substr>` hook (src/assembly.rs add_fn) writes the
+#            optimized MIR of every codegen'd fn whose mangled name contains <substr>
+#            to a file — the ONLY reliable source for instances like Vec::<u32>::extend_with.
+#   * CIL  : build with `OPTIMIZE_CIL=0` (1:1 MIR→CIL, no reordering) and slice the
+#            named method out of the emitted `.il`.
+#   * RUN  : native-vs-backend differential (delegates to diff_oracle.sh if present).
+#
+# Library (std/alloc/core) generics are codegen'd in cargo-dotnet's discarded warm
+# pass, so dumping them needs the shared std target cleared once (--std forces it).
+#
+# Usage:
+#   feasibility/mirtool mir  <crate_dir> <fn_substr>  [--std]   # dump optimized MIR
+#   feasibility/mirtool cil  <crate_dir> <method_substr> [--std]# dump clean CIL of a method
+#   feasibility/mirtool both <crate_dir> <fn_substr>  [--std]   # MIR then CIL, aligned
+#   feasibility/mirtool run  <crate_dir>                        # native-vs-backend output diff
+set -uo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.dotnet:$PATH"
+export DOTNET_ROOT="${DOTNET_ROOT:-$HOME/.dotnet}"
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-nightly-2026-06-17}"
+CD="$REPO/feasibility/cargo-dotnet"
+STD_TARGET="$HOME/.cargo-dotnet/target/x86_64-unknown-dotnet"
+
+usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+[ $# -lt 2 ] && usage
+CMD="$1"; CRATE="$2"; FILTER="${3:-}"; FLAG="${4:-}"
+
+prep() { # $1 = clear std?  truncate the dump file + clear crate (and optionally std) caches
+  rm -f /tmp/dump_mir.txt
+  rm -rf "$CRATE/target" "$CRATE/.cargo" "$CRATE/Cargo.lock"
+  [ "$1" = "yes" ] && rm -rf "$STD_TARGET"
+}
+
+build_mir() { # $1 filter $2 clearstd  — DUMP_MIR build, output to /tmp/dump_mir.txt
+  prep "$2"
+  DUMP_MIR="$1" OPTIMIZE_CIL=0 timeout 500 env CARGO_DOTNET_BACKEND=native "$CD" build "$CRATE" >/dev/null 2>&1
+}
+
+dump_one_mir() { # print the first DUMP_MIR block whose header contains $1
+  awk -v f="$1" '
+    index($0,"===DUMP_MIR_BEGIN") && index($0,f) {p=1}
+    p {print}
+    index($0,"===DUMP_MIR_END") && p {exit}
+  ' /tmp/dump_mir.txt
+}
+
+dump_cil() { # slice the .il method whose .method line contains $1, dropping debug noise
+  local il; il="$(find "$CRATE/target" -name '*.il' 2>/dev/null | head -1)"
+  [ -z "$il" ] && { echo "(no .il — build failed?)"; return 1; }
+  awk -v f="$1" '
+    /^\.method/ { inm=0; if (index($0,f)) {inm=1; depth=0} }
+    inm {
+      print
+      n=gsub(/{/,"{"); depth+=n; n=gsub(/}/,"}"); depth-=n
+      if (depth<=0 && /}/ && NR>start) inm=0
+    }
+  ' "$il" | grep -vE "WriteLine|^[[:space:]]*ldstr |^\.line"
+}
+
+case "$CMD" in
+  mir)
+    [ -z "$FILTER" ] && usage
+    [ "$FLAG" = "--std" ] && S=yes || S=no
+    echo ">> DUMP_MIR='$FILTER' (clear-std=$S) ..." >&2
+    build_mir "$FILTER" "$S"
+    echo "## captured: $(grep -c DUMP_MIR_BEGIN /tmp/dump_mir.txt 2>/dev/null) block(s) for '$FILTER'" >&2
+    grep '===DUMP_MIR_BEGIN' /tmp/dump_mir.txt | sed 's/===DUMP_MIR_BEGIN /  - /' >&2
+    cat /tmp/dump_mir.txt
+    ;;
+  cil)
+    [ -z "$FILTER" ] && usage
+    [ "$FLAG" = "--std" ] && S=yes || S=no
+    prep "$S"
+    OPTIMIZE_CIL=0 timeout 500 env CARGO_DOTNET_BACKEND=native "$CD" build "$CRATE" >/dev/null 2>&1
+    dump_cil "$FILTER"
+    ;;
+  both)
+    [ -z "$FILTER" ] && usage
+    [ "$FLAG" = "--std" ] && S=yes || S=no
+    build_mir "$FILTER" "$S"
+    echo "================ MIR ($FILTER) ================"
+    dump_one_mir "$FILTER"
+    echo; echo "================ CIL ($FILTER) ================"
+    dump_cil "$FILTER"
+    ;;
+  run)
+    if [ -x /tmp/diff_oracle.sh ]; then bash /tmp/diff_oracle.sh "$CRATE"
+    else echo "diff_oracle.sh not found at /tmp; build native vs CARGO_DOTNET_BACKEND=native and diff manually"; fi
+    ;;
+  *) usage ;;
+esac

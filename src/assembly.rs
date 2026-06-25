@@ -164,6 +164,39 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
         return Ok(());
     }
     let mir = ctx.tcx().instance_mir(ctx.instance().def);
+    // DUMP_MIR=<substr>: print the EXACT optimized MIR the backend is about to translate, for any
+    // function whose (mangled) name contains <substr>. This is the ground truth for MIR↔CIL diffing —
+    // the monomorphized `instance_mir` is otherwise hard to obtain (library generics like
+    // `Vec::<u32>::extend_with` are instantiated at codegen, not emitted by `--emit=mir`). Pairs with
+    // `INSERT_MIR_DEBUG_COMMENTS=1` (which annotates the emitted CIL with these same statements).
+    if let Ok(filter) = std::env::var("DUMP_MIR") {
+        if !filter.is_empty() && name.contains(filter.as_str()) {
+            use std::fmt::Write as _;
+            use std::io::Write as _;
+            // APPEND to a file (default /tmp/dump_mir.txt, override DUMP_MIR_OUT) rather than stderr:
+            // cargo-dotnet codegens std/alloc in a discarded warm pass, so library generics like
+            // `Vec::<u32>::extend_with` would be lost from stderr. A file survives every pass.
+            let path =
+                std::env::var("DUMP_MIR_OUT").unwrap_or_else(|_| "/tmp/dump_mir.txt".to_string());
+            let mut out = format!("\n===DUMP_MIR_BEGIN {name}\n");
+            for (local, decl) in mir.local_decls.iter_enumerated() {
+                let _ = writeln!(out, "  let {local:?}: {:?};", decl.ty);
+            }
+            for (bb, data) in mir.basic_blocks.iter_enumerated() {
+                let _ = writeln!(out, "  {bb:?}:");
+                for stmt in &data.statements {
+                    let _ = writeln!(out, "    {stmt:?};");
+                }
+                if let Some(term) = &data.terminator {
+                    let _ = writeln!(out, "    {:?};", term.kind);
+                }
+            }
+            let _ = writeln!(out, "===DUMP_MIR_END {name}");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = f.write_all(out.as_bytes());
+            }
+        }
+    }
     let mut ctx = ctx.with_body(mir);
     let ctx = &mut ctx;
     // The comptime entrypoint is *interpreted* (it describes a managed class) rather than codegen'd.
