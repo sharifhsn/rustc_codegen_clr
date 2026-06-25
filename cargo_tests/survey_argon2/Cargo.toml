@@ -1,0 +1,9 @@
+[package]
+name = "survey_argon2"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+argon2 = "0.5"
+
+[workspace]

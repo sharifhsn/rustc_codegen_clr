@@ -1,0 +1,7 @@
+[package]
+name = "survey_globset"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+globset = "0.4"
+[workspace]

@@ -1,0 +1,9 @@
+[package]
+name = "survey_curve25519-dalek"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables"] }
+
+[workspace]

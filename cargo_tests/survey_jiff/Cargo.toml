@@ -1,0 +1,9 @@
+[package]
+name = "survey_jiff"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+jiff = { version = "0.2.29", default-features = false, features = ["std"] }
+
+[workspace]

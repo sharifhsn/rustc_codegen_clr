@@ -1,0 +1,7 @@
+[package]
+name = "survey_eyre"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+eyre = "0.6"
+[workspace]

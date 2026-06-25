@@ -1,0 +1,9 @@
+[package]
+name = "survey_flume"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+flume = { version = "0.12", default-features = false }
+
+[workspace]

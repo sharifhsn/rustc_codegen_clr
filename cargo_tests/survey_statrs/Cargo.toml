@@ -1,0 +1,9 @@
+[package]
+name = "survey_statrs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+statrs = { version = "0.18", default-features = false }
+
+[workspace]

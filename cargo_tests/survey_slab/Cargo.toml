@@ -1,0 +1,7 @@
+[package]
+name = "survey_slab"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+slab = "0.4.12"
+[workspace]

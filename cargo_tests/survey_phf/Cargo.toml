@@ -1,0 +1,9 @@
+[package]
+name = "survey_phf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+phf = { version = "0.14", features = ["macros"] }
+
+[workspace]
