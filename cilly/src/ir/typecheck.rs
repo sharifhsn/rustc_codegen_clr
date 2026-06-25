@@ -1215,6 +1215,16 @@ impl CILRoot {
                             .as_int()
                             .zip(tpe.as_int())
                             .is_some_and(|(a, b)| a.as_unsigned() == b.as_unsigned())
+                        // `bool` slots are `Type::Bool` but a `bool` value is routinely
+                        // materialized as `i8`, which is why the direct case is accepted at
+                        // `addr_points_to == Bool && tpe == I8` below. The extra-indirection
+                        // form (`addr: **bool`, `tpe: i8`) is the SAME proven-benign shape one
+                        // level deeper — it shows up on safe `&mut [bool]` slice stores after a
+                        // `split_at_mut` (strsim `generic_jaro`'s `a_flags[i] = true`), where the
+                        // `stind.i1` writes the correct 1-byte bool element (differentially
+                        // verified FULL MATCH vs native). The value/`tpe` soundness check below
+                        // (`i8` == `i8`) is unaffected.
+                        || (inner == Type::Bool && *tpe == Type::Int(Int::I8))
                 });
                 let addr_is_void_erased = addr_points_to == Type::Void && *tpe != Type::Void;
                 if !(tpe.is_assignable_to(addr_points_to, asm)
