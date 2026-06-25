@@ -339,10 +339,23 @@ pub fn call_inner<'tcx>(
     if let rustc_middle::ty::InstanceKind::Virtual(_def, fn_idx) = instance.def {
         assert!(!args.is_empty());
 
-        let fat_ptr_address = operand_address(&args[0].node, ctx);
+        let mut fat_ptr_address = operand_address(&args[0].node, ctx);
         let fat_ptr_dyn = ctx.alloc_string("FatPtrn3Dyn");
+        let fat_ptr_dyn_cref = ctx.alloc_class_ref(ClassRef::new(fat_ptr_dyn, None, true, [].into()));
+        // The `m`/METADATA and `d`/DATA_PTR loads below read from the canonical erased fat-ptr class
+        // `FatPtrn3Dyn`. When the virtual-call receiver is a `#[repr(transparent)]` ADT over the fat
+        // pointer (e.g. `Pin<&mut dyn Future>`), `operand_address` yields a pointer whose pointee class
+        // is the WRAPPER, so the loads would be `FieldOwnerMismatch` (futures' `LocalFutureObj::poll`).
+        // The wrapper's storage IS the inner fat pointer (repr(transparent)), so reinterpret it as
+        // `FatPtrn3Dyn`. A bare `&dyn`/`*mut dyn` receiver is already `FatPtrn3Dyn` (no cast); a
+        // non-transparent by-value receiver (`Box<dyn _>` `self`) is excluded — it must not be cast.
+        let recv_ty = args[0].node.ty(ctx.body(), ctx.tcx());
+        let recv_ty = ctx.monomorphize(recv_ty);
+        if matches!(recv_ty.kind(), TyKind::Adt(adt_def, _) if adt_def.repr().transparent()) {
+            fat_ptr_address = ctx.cast_ptr(fat_ptr_address, Type::ClassRef(fat_ptr_dyn_cref));
+        }
         let vtable_ptr_field_desc = FieldDesc::new(
-            ctx.alloc_class_ref(ClassRef::new(fat_ptr_dyn, None, true, [].into())),
+            fat_ptr_dyn_cref,
             ctx.alloc_string(crate::METADATA),
             Type::Int(Int::USize),
         );
@@ -356,7 +369,7 @@ pub fn call_inner<'tcx>(
         let vtable_offset = ctx.int_cast(vtable_offset, Int::USize, ExtendKind::ZeroExtend);
         // Get the address of the function ptr, and load it
         let obj_ptr_field_desc = FieldDesc::new(
-            ctx.alloc_class_ref(ClassRef::new(fat_ptr_dyn, None, true, [].into())),
+            fat_ptr_dyn_cref,
             ctx.alloc_string(crate::DATA_PTR),
             ctx.nptr(Type::Void),
         );
