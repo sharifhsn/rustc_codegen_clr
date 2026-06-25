@@ -261,13 +261,13 @@ fi
 [ -f "$PAL/process/dotnet.rs" ]       && inject_arm process/mod.rs       'mod dotnet; use dotnet as imp;'
 # sys::pipe — PRESENT-but-Unsupported (System.IO.Pipes can't ride Socket.Poll).
 [ -f "$PAL/pipe/dotnet.rs" ]          && inject_arm pipe/mod.rs          'mod dotnet; pub use dotnet::{Pipe, pipe};'
-# sys::sync::{mutex,rwlock,condvar,once} + thread_parking — Cap-1 mirrors the
-# no_threads/unsupported inner contracts (single-managed-thread correct; REAL
-# System.Threading locks deferred to Cap-2 with the [ThreadStatic] TLS fix). Each
-# of these mod.rs has exactly ONE cfg_select! (block 1), so nth=1 default is safe;
-# the futex arm is first inside but keys on an explicit target_os list dotnet
-# misses, so arm-0 dotnet injection wins. Do NOT point at pthread/queue (they
-# depend on sys::pal::unix / pull thread parking).
+# sys::sync::{mutex,rwlock,condvar,once} + thread_parking — REAL multi-thread sync
+# (Class-D keystone; docs/THREADING_PAL_RESEARCH.md). mutex = SemaphoreSlim;
+# thread_parking = a counting-SemaphoreSlim-backed Parker; once/rwlock then ride
+# std's GENERIC queue impls (pure Parker + atomics, NO sys::pal dep); condvar = a
+# SemaphoreSlim wakeup-counter. Each mod.rs has exactly ONE cfg_select! (block 1),
+# so nth=1 default is safe; the futex arm is first inside but keys on an explicit
+# target_os list dotnet misses, so arm-0 dotnet injection wins.
 [ -f "$PAL/sync/mutex/dotnet.rs" ]    && inject_arm sync/mutex/mod.rs    'mod dotnet; pub use dotnet::Mutex;'
 [ -f "$PAL/sync/rwlock/dotnet.rs" ]   && inject_arm sync/rwlock/mod.rs   'mod dotnet; pub use dotnet::RwLock;'
 [ -f "$PAL/sync/condvar/dotnet.rs" ]  && inject_arm sync/condvar/mod.rs  'mod dotnet; pub use dotnet::Condvar;'

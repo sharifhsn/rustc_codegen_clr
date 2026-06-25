@@ -294,6 +294,22 @@ fn is_erased_ptr_sink(arg: Type, expected: Type, asm: &Assembly) -> bool {
         if matches!(expected_pointee, Type::Int(Int::U8) | Type::Void) && arg.pointed_to().is_some() {
             return true;
         }
+        // Atomic word-address pun (Class-D / WF-TC): the `atomic_{add,or,and,xor,…}_{usize,isize}`
+        // builtins declare their ADDRESS parameter as `&usize`/`&isize` (a managed ref to a
+        // word). std's generic queue `RwLock`/`Once` reach those builtins through `AtomicPtr`
+        // bit-tagging, so the address arrives as a concrete `**T`/`*T` (e.g. `ppv`) — a different
+        // declared pointee than `&usize`, but the SAME machine address. The atomic op reads/writes
+        // a pointer-width word at that address regardless of the declared pointee, and the call
+        // pushes the address unchanged (any preceding `PtrCast` lowers to nothing and is elided by
+        // `.opt()` before this check), so the two are byte-identical. Narrowly gated: the expected
+        // pointee must be exactly `usize`/`isize`, and the arg must be a pointer/ref — so it can
+        // never accept a non-pointer or a differently-WIDTH atomic. Proven benign (rayon/parking_lot
+        // run correctly on this path).
+        if matches!(expected_pointee, Type::Int(Int::USize | Int::ISize))
+            && arg.pointed_to().is_some()
+        {
+            return true;
+        }
     }
     // Function-pointer case: the SAME erased-ABI pun one level up. `catch_unwind`/`__rust_try`
     // declares its `try_fn` parameter as `fn(*u8) -> ()`, but the caller passes the concrete
@@ -1136,6 +1152,21 @@ impl CILRoot {
                 // sides being pointers, so it can never mask a value/local *kind* mismatch.
                 if matches!(asm.get_node(*node), CILNode::PtrCast(..))
                     && got.pointed_to().is_some()
+                    && expected.pointed_to().is_some()
+                {
+                    return Ok(());
+                }
+                // Atomic word-result write-back pun (Class-D / WF-TC, symmetric to the
+                // `is_erased_ptr_sink` atomic word-address pun): the `atomic_{or,and,xor,add,…}_usize`
+                // builtins RETURN a `usize`/`isize` word. std's generic queue `RwLock`/`Once` apply
+                // those to an `AtomicPtr`, so the word result is stored straight back into a pointer
+                // local (`got: usize`, `expected: pv`). The `atomic_*` Ptr-arms DO cast the result
+                // back to the pointer type, but that `PtrCast` lowers to nothing and is elided by
+                // `.opt()` before this check, leaving the bare word. Pointers are word-width on this
+                // target, so the word and the (tagged) pointer are bit-identical and the `stloc`
+                // pushes the same bits. Narrowly gated: `got` must be exactly `usize`/`isize` and
+                // `expected` must be a pointer/ref — so it can never relax a value/kind mismatch.
+                if matches!(got, Type::Int(Int::USize | Int::ISize))
                     && expected.pointed_to().is_some()
                 {
                     return Ok(());

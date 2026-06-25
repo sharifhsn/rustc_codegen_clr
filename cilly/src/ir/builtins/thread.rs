@@ -321,6 +321,16 @@ fn insert_pthread_create(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             .ctor(&[Type::ClassRef(thread_start)], asm);
         let thread_obj = asm.alloc_node(CILNode::call(thread_ctor, [thread_start_obj]));
         let create_thread = asm.alloc_root(CILRoot::StLoc(0, thread_obj));
+        // Background thread (mirror rcl_dotnet_thread_spawn): an unjoined pthread must not keep the
+        // process alive at exit — matches Rust process-exit semantics. `Join` still waits for it.
+        let set_is_background = asm.alloc_string("set_IsBackground");
+        let set_bg_mref = asm
+            .class_ref(thread_type)
+            .clone()
+            .virtual_mref(&[Type::Bool], Type::Void, set_is_background, asm);
+        let ld_thread_bg = asm.alloc_node(CILNode::LdLoc(0));
+        let true_const = asm.alloc_node(Const::Bool(true));
+        let set_bg = asm.alloc_root(CILRoot::call(set_bg_mref, [ld_thread_bg, true_const]));
         let thread_start =
             asm.class_ref(thread_type)
                 .clone()
@@ -345,6 +355,7 @@ fn insert_pthread_create(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
                     transmute_arg_2,
                     create_thread_start,
                     create_thread,
+                    set_bg,
                     start_thread,
                     set_thread_handle,
                     ret,

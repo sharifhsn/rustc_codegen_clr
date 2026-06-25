@@ -163,6 +163,14 @@ pub fn insert_dotnet_pal(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
     insert_dotnet_mutex_lock(asm, patcher);
     insert_dotnet_mutex_unlock(asm, patcher);
     insert_dotnet_mutex_trylock(asm, patcher);
+    insert_dotnet_park_new(asm, patcher);
+    insert_dotnet_park_wait(asm, patcher);
+    insert_dotnet_park_wait_timeout(asm, patcher);
+    insert_dotnet_park_release(asm, patcher);
+    insert_dotnet_condvar_new(asm, patcher);
+    insert_dotnet_condvar_wait(asm, patcher);
+    insert_dotnet_condvar_wait_timeout(asm, patcher);
+    insert_dotnet_condvar_release(asm, patcher);
     insert_dotnet_tls_create(asm, patcher);
     insert_dotnet_tls_get(asm, patcher);
     insert_dotnet_tls_set(asm, patcher);
@@ -619,6 +627,20 @@ fn insert_dotnet_thread_spawn(asm: &mut Assembly, patcher: &mut MissingMethodPat
             .ctor(&[Type::ClassRef(thread_start)], asm);
         let thread_obj = asm.alloc_node(CILNode::call(thread_ctor, [thread_start_obj]));
         let store_thread = asm.alloc_root(CILRoot::StLoc(0, thread_obj));
+        // Mark the thread BACKGROUND before starting it, to match Rust process-exit semantics:
+        // when `main` returns the process exits regardless of still-running threads. A foreground
+        // .NET thread (the default) instead keeps the process alive at exit, hanging any program
+        // with unjoined long-lived threads — e.g. rayon's global work-stealing pool (whose workers
+        // park forever and are never joined). Joined threads (pal_threads) are unaffected: `Join`
+        // still waits for a background thread.
+        let set_is_background = asm.alloc_string("set_IsBackground");
+        let set_bg_mref = asm
+            .class_ref(thread)
+            .clone()
+            .virtual_mref(&[Type::Bool], Type::Void, set_is_background, asm);
+        let ld_thread_bg = asm.alloc_node(CILNode::LdLoc(0));
+        let true_const = asm.alloc_node(Const::Bool(true));
+        let set_bg = asm.alloc_root(CILRoot::call(set_bg_mref, [ld_thread_bg, true_const]));
         let thread_start_call =
             asm.class_ref(thread)
                 .clone()
@@ -637,7 +659,7 @@ fn insert_dotnet_thread_spawn(asm: &mut Assembly, patcher: &mut MissingMethodPat
         let thread_start_local_ty = asm.alloc_type(Type::ClassRef(thread_start));
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(
-                vec![store_ts, store_thread, start_thread, ret],
+                vec![store_ts, store_thread, set_bg, start_thread, ret],
                 0,
                 None,
             )],
@@ -919,6 +941,304 @@ fn insert_dotnet_mutex_trylock(asm: &mut Assembly, patcher: &mut MissingMethodPa
         let ret = asm.alloc_root(CILRoot::Ret(entered));
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+// ===========================================================================
+// Parker — the Class-D threading keystone (research: docs/THREADING_PAL_RESEARCH.md).
+//
+// One COUNTING `SemaphoreSlim(0, int.MaxValue)` per `Parker`, reached through an
+// opaque `*mut u8` GCHandle, exactly mirroring the `rcl_dotnet_mutex_*` handle
+// round-trip. A counting semaphore is the token-not-lost primitive *for free*
+// (research §2): `unpark` Releases a permit, `park` Waits for one. A `Release`
+// that happens BEFORE the matching `Wait` is not lost — the permit persists in
+// the count, so the next `Wait` returns immediately. This needs NO manual reset
+// and NO event-level Set/Reset race (the earlier ManualResetEventSlim variant
+// deadlocked rayon: resetting a level-triggered event after consuming a wakeup
+// raced a concurrent unpark and lost it). The std-side `Parker` (dotnet arm)
+// keeps the EMPTY/PARKED/NOTIFIED atom only for the FAST PATH (an unpark-before-
+// park is consumed by the atom without touching the semaphore at all), and
+// touches the semaphore exactly once per real block/wake — so the permit count
+// stays balanced and any rare extra permit is just a permitted spurious wakeup.
+// ===========================================================================
+
+/// `rcl_dotnet_park_new() -> *mut u8`
+///   => `new SemaphoreSlim(0, int.MaxValue)`; return a `GCHandle` `IntPtr`.
+///
+/// `initialCount = 0` => a fresh `Parker` has no token, so the first `park()`
+/// blocks until an `unpark()` Releases a permit. `maxCount = int.MaxValue` so a
+/// burst of unparks never throws. The managed object is pinned in a `GCHandle`
+/// and the handle's `IntPtr` is returned as `*mut u8`, mirroring
+/// `rcl_dotnet_mutex_new`. The std side CAS-installs this handle on first use and
+/// never frees it (one semaphore per live `Parker`).
+fn insert_dotnet_park_new(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_park_new");
+    let generator = move |_, asm: &mut Assembly| {
+        // new SemaphoreSlim(0, int.MaxValue)
+        let sem = ClassRef::semaphore_slim(asm);
+        let ctor = asm
+            .class_ref(sem)
+            .clone()
+            .ctor(&[Type::Int(Int::I32), Type::Int(Int::I32)], asm);
+        let zero = asm.alloc_node(Const::I32(0));
+        let max = asm.alloc_node(Const::I32(i32::MAX));
+        let sem_obj = asm.alloc_node(CILNode::call(ctor, [zero, max]));
+        let store = asm.alloc_root(CILRoot::StLoc(0, sem_obj));
+
+        // return (void*)GCHandle.Alloc(sem)
+        let void = asm.alloc_type(Type::Void);
+        let handle = CILNode::LdLoc(0).ref_to_handle(asm);
+        let handle = asm.alloc_node(handle);
+        let handle = asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::Ptr(void))));
+        let ret = asm.alloc_root(CILRoot::Ret(handle));
+
+        let sem_ty = asm.alloc_type(Type::ClassRef(sem));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![store, ret], 0, None)],
+            locals: vec![(Some(asm.alloc_string("sem")), sem_ty)],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_park_wait(h: *mut u8)`
+///   => recover the `SemaphoreSlim` from `h` and `Wait()` (block for a permit).
+///
+/// `SemaphoreSlim.Wait()` blocks until a permit is available, consuming it. A
+/// permit deposited by an earlier `unpark` releases immediately (token-not-lost).
+/// Backs the dotnet `Parker::park` blocking step.
+fn insert_dotnet_park_wait(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_park_wait");
+    let generator = move |_, asm: &mut Assembly| {
+        let sem = recover_semaphore(asm);
+        let sem_class = ClassRef::semaphore_slim(asm);
+        let wait = asm.alloc_string("Wait");
+        let wait = asm
+            .class_ref(sem_class)
+            .clone()
+            .instance(&[], Type::Void, wait, asm);
+        let wait = asm.alloc_root(CILRoot::call(wait, [sem]));
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![wait, ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_park_wait_timeout(h: *mut u8, millis: usize) -> bool`
+///   => recover the semaphore from `h` and `Wait((int)millis)` (block up to ms).
+///
+/// `SemaphoreSlim.Wait(int millisecondsTimeout)` blocks up to the timeout,
+/// returning `true` iff a permit was taken (vs. timing out). Backs the dotnet
+/// `Parker::park_timeout`. The std side clamps long timeouts to `<= i32::MAX` ms,
+/// so the truncation to the `int` overload is lossless.
+fn insert_dotnet_park_wait_timeout(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_park_wait_timeout");
+    let generator = move |_, asm: &mut Assembly| {
+        let sem = recover_semaphore(asm);
+        let sem_class = ClassRef::semaphore_slim(asm);
+        let millis = asm.alloc_node(CILNode::LdArg(1));
+        let millis_i32 = asm.int_cast(millis, Int::I32, ExtendKind::ZeroExtend);
+        let wait = asm.alloc_string("Wait");
+        let wait = asm.class_ref(sem_class).clone().instance(
+            &[Type::Int(Int::I32)],
+            Type::Bool,
+            wait,
+            asm,
+        );
+        let taken = asm.alloc_node(CILNode::call(wait, [sem, millis_i32]));
+        let ret = asm.alloc_root(CILRoot::Ret(taken));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_park_release(h: *mut u8)`
+///   => recover the semaphore from `h` and `Release()` (deposit one wakeup permit).
+///
+/// `SemaphoreSlim.Release()` adds one permit, waking a blocked `Wait` or persisting
+/// for a future one (this is what makes an `unpark` before `park` not lose the
+/// token). The returned previous-count is popped. Backs the dotnet `Parker::unpark`.
+fn insert_dotnet_park_release(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_park_release");
+    let generator = move |_, asm: &mut Assembly| {
+        let sem = recover_semaphore(asm);
+        let sem_class = ClassRef::semaphore_slim(asm);
+        let release = asm.alloc_string("Release");
+        let release =
+            asm.class_ref(sem_class)
+                .clone()
+                .instance(&[], Type::Int(Int::I32), release, asm);
+        let prev = asm.alloc_node(CILNode::call(release, [sem]));
+        let pop = asm.alloc_root(CILRoot::Pop(prev));
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![pop, ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+// ===========================================================================
+// Condvar — a counting-semaphore condition variable (Class-D).
+//
+// `std::sync::Condvar` has no generic Parker-only arm in std (the generic ones
+// are `futex` and `pthread`, both unavailable here). The dotnet `Condvar`
+// (`dotnet_pal/sys/sync/condvar/dotnet.rs`) is a small bespoke arm built on a
+// `System.Threading.SemaphoreSlim(0, int.MaxValue)` as a wakeup counter — the
+// textbook semaphore condvar that composes correctly across multiple waiters
+// (unlike a single shared ManualResetEventSlim, whose manual Reset races between
+// waiters). `notify_*` Release N permits; `wait` Acquires one. A Release BEFORE
+// the matching Wait is not lost (SemaphoreSlim counts permits), and an extra
+// permit only ever causes a permitted spurious wakeup.
+// ===========================================================================
+
+/// `rcl_dotnet_condvar_new() -> *mut u8`
+///   => `new SemaphoreSlim(0, int.MaxValue)`; return a `GCHandle` `IntPtr`.
+///
+/// `initialCount = 0` (no waiter may proceed until a notify), `maxCount =
+/// int.MaxValue` (unbounded outstanding notifications). Mirrors
+/// `rcl_dotnet_mutex_new`'s handle round-trip.
+fn insert_dotnet_condvar_new(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_condvar_new");
+    let generator = move |_, asm: &mut Assembly| {
+        // new SemaphoreSlim(0, int.MaxValue)
+        let sem = ClassRef::semaphore_slim(asm);
+        let ctor = asm
+            .class_ref(sem)
+            .clone()
+            .ctor(&[Type::Int(Int::I32), Type::Int(Int::I32)], asm);
+        let zero = asm.alloc_node(Const::I32(0));
+        let max = asm.alloc_node(Const::I32(i32::MAX));
+        let sem_obj = asm.alloc_node(CILNode::call(ctor, [zero, max]));
+        let store = asm.alloc_root(CILRoot::StLoc(0, sem_obj));
+
+        // return (void*)GCHandle.Alloc(sem)
+        let void = asm.alloc_type(Type::Void);
+        let handle = CILNode::LdLoc(0).ref_to_handle(asm);
+        let handle = asm.alloc_node(handle);
+        let handle = asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::Ptr(void))));
+        let ret = asm.alloc_root(CILRoot::Ret(handle));
+
+        let sem_ty = asm.alloc_type(Type::ClassRef(sem));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![store, ret], 0, None)],
+            locals: vec![(Some(asm.alloc_string("sem")), sem_ty)],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_condvar_wait(h: *mut u8)`
+///   => recover the `SemaphoreSlim` from `h` and `Wait()` (block for a permit).
+///
+/// Backs `Condvar::wait`'s blocking step (the std side unlocks the mutex first,
+/// blocks here, then relocks). A permit deposited by an earlier `notify` releases
+/// immediately (token-not-lost).
+fn insert_dotnet_condvar_wait(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_condvar_wait");
+    let generator = move |_, asm: &mut Assembly| {
+        let sem = recover_semaphore(asm);
+        let sem_class = ClassRef::semaphore_slim(asm);
+        let wait = asm.alloc_string("Wait");
+        let wait = asm
+            .class_ref(sem_class)
+            .clone()
+            .instance(&[], Type::Void, wait, asm);
+        let wait = asm.alloc_root(CILRoot::call(wait, [sem]));
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![wait, ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_condvar_wait_timeout(h: *mut u8, millis: usize) -> bool`
+///   => recover the `SemaphoreSlim` and `Wait((int)millis)` (block up to ms).
+///
+/// Returns `true` iff a permit was taken (vs. timing out). Backs
+/// `Condvar::wait_timeout`. The std side clamps long timeouts, so truncation to
+/// the `int` overload is lossless.
+fn insert_dotnet_condvar_wait_timeout(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_condvar_wait_timeout");
+    let generator = move |_, asm: &mut Assembly| {
+        let sem = recover_semaphore(asm);
+        let sem_class = ClassRef::semaphore_slim(asm);
+        let millis = asm.alloc_node(CILNode::LdArg(1));
+        let millis_i32 = asm.int_cast(millis, Int::I32, ExtendKind::ZeroExtend);
+        let wait = asm.alloc_string("Wait");
+        let wait = asm.class_ref(sem_class).clone().instance(
+            &[Type::Int(Int::I32)],
+            Type::Bool,
+            wait,
+            asm,
+        );
+        let taken = asm.alloc_node(CILNode::call(wait, [sem, millis_i32]));
+        let ret = asm.alloc_root(CILRoot::Ret(taken));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_condvar_release(h: *mut u8, n: usize)`
+///   => recover the `SemaphoreSlim` and `Release((int)n)` if `n > 0` (deposit
+///      `n` wakeup permits).
+///
+/// Backs `Condvar::notify_one` (n=1) and `notify_all` (n=#waiters).
+/// `SemaphoreSlim.Release(int)` throws on `0`, so the `n == 0` case is skipped
+/// (no waiter to wake). The returned previous-count is popped.
+fn insert_dotnet_condvar_release(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_condvar_release");
+    let generator = move |_, asm: &mut Assembly| {
+        // Block 0: if ((int)n == 0) goto ret(2) else goto release(1).
+        let n = asm.alloc_node(CILNode::LdArg(1));
+        let n_i32 = asm.int_cast(n, Int::I32, ExtendKind::ZeroExtend);
+        let zero = asm.alloc_node(Const::I32(0));
+        let br_ret = asm.alloc_root(CILRoot::Branch(Box::new((
+            2,
+            0,
+            Some(BranchCond::Eq(n_i32, zero)),
+        ))));
+        let goto_release = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
+        let entry = BasicBlock::new(vec![br_ret, goto_release], 0, None);
+
+        // Block 1: sem.Release((int)n); pop; goto ret(2).
+        let sem = recover_semaphore(asm);
+        let sem_class = ClassRef::semaphore_slim(asm);
+        let n2 = asm.alloc_node(CILNode::LdArg(1));
+        let n2_i32 = asm.int_cast(n2, Int::I32, ExtendKind::ZeroExtend);
+        let release = asm.alloc_string("Release");
+        let release = asm.class_ref(sem_class).clone().instance(
+            &[Type::Int(Int::I32)],
+            Type::Int(Int::I32),
+            release,
+            asm,
+        );
+        let prev = asm.alloc_node(CILNode::call(release, [sem, n2_i32]));
+        let pop = asm.alloc_root(CILRoot::Pop(prev));
+        let goto_ret = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None))));
+        let rel_blk = BasicBlock::new(vec![pop, goto_ret], 1, None);
+
+        // Block 2: ret.
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        let ret_blk = BasicBlock::new(vec![ret], 2, None);
+
+        MethodImpl::MethodBody {
+            blocks: vec![entry, rel_blk, ret_blk],
             locals: vec![],
         }
     };

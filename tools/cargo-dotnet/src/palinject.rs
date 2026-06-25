@@ -371,7 +371,11 @@ fn sys_targets() -> Vec<Target> {
         Target { rel: "process/mod.rs", injections: vec![arm_blk1("mod dotnet; use dotnet as imp;")] },
         // sys::pipe — PRESENT-but-Unsupported.
         Target { rel: "pipe/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::{Pipe, pipe};")] },
-        // sys::sync::* + thread_parking — Cap-1 single-managed-thread mirrors.
+        // sys::sync::* + thread_parking — REAL multi-thread sync (Class-D keystone).
+        // mutex = SemaphoreSlim; thread_parking = a counting-SemaphoreSlim-backed
+        // Parker; once/rwlock then ride std's GENERIC queue impls (pure Parker +
+        // atomics); condvar = a SemaphoreSlim wakeup-counter. See
+        // docs/THREADING_PAL_RESEARCH.md + dotnet_pal/sys/sync/*/dotnet.rs.
         Target { rel: "sync/mutex/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::Mutex;")] },
         Target { rel: "sync/rwlock/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::RwLock;")] },
         Target { rel: "sync/condvar/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::Condvar;")] },

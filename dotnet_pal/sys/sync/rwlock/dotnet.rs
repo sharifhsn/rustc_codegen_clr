@@ -1,14 +1,12 @@
-//! `sys::sync::RwLock` for the .NET ("dotnet") platform — Cap-1 foundation arm.
+//! `sys::sync::RwLock` for the .NET ("dotnet") platform — REAL reader/writer lock.
 //!
-//! See `sys/sync/mutex/dotnet.rs` for the full rationale. Injected as the FIRST
-//! `cfg_select!` arm of `sys/sync/rwlock/mod.rs` so the `queue` arm (which pulls
-//! thread parking, gated on `target_family="unix"`) never wins at the Cap-2
-//! `families=["unix"]` flip. With `families` UNSET it is a pure no-op: dotnet
-//! already falls to `no_threads`, whose verbatim source this re-uses.
-//
-// TODO(Cap-2): swap to a System.Threading ReaderWriterLockSlim-backed RwLock,
-// bundled with the [ThreadStatic] TLS fix.
+//! Routes to std's GENERIC queue-based `RwLock` (`sys/sync/rwlock/queue.rs`), the
+//! same implementation generic-Unix / win7 / SGX / xous use. It is written purely
+//! against `crate::thread::{park, unpark}` + atomics — NO `sys::`/`pal::`/`libc`
+//! dependency — so with the dotnet `Parker` now real (see
+//! `sys/sync/thread_parking/dotnet.rs`) it compiles and runs unmodified on
+//! os=dotnet. (research: `docs/THREADING_PAL_RESEARCH.md`.)
 
-#[path = "no_threads.rs"]
+#[path = "queue.rs"]
 mod imp;
 pub use imp::RwLock;

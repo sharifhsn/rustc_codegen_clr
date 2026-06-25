@@ -1,13 +1,15 @@
-//! `sys::sync::{Once, OnceState}` for the .NET ("dotnet") platform — Cap-1 arm.
+//! `sys::sync::{Once, OnceState}` for the .NET ("dotnet") platform — REAL Once.
 //!
-//! See `sys/sync/mutex/dotnet.rs` for the full rationale. Injected as the FIRST
-//! `cfg_select!` arm of `sys/sync/once/mod.rs` so the `queue` arm (which pulls
-//! thread parking, gated on `target_family="unix"`) never wins at the Cap-2
-//! `families=["unix"]` flip. With `families` UNSET it is a pure no-op: dotnet
-//! already falls to `no_threads`, whose verbatim source this re-uses.
-//
-// TODO(Cap-2): swap to a real concurrent Once when threads land.
+//! Routes to std's GENERIC queue-based `Once` (`sys/sync/once/queue.rs`), the same
+//! implementation Windows / generic-Unix / SGX / xous use. It is written purely
+//! against `crate::thread::{park, unpark}` + atomics — NO `sys::`/`pal::`/`libc`
+//! dependency — so with the dotnet `Parker` now real (see
+//! `sys/sync/thread_parking/dotnet.rs`) it compiles and runs unmodified on
+//! os=dotnet. This is the Class-D keystone payoff: one real Parker lets the
+//! generic Once block-until-Complete on `State::Running` instead of panicking,
+//! which is exactly what rayon's lazy global-pool init needs (research:
+//! `docs/THREADING_PAL_RESEARCH.md`).
 
-#[path = "no_threads.rs"]
+#[path = "queue.rs"]
 mod imp;
 pub use imp::{Once, OnceState};

@@ -23,12 +23,14 @@
 //! * `rcl_dotnet_available_parallelism() -> usize`
 //!   => `System.Environment.ProcessorCount`.
 //!
-//! The codegen backend currently produces a single managed thread of execution
-//! for the rest of the PAL (TLS is process-global — see `thread_local/dotnet.rs`),
-//! so spawned threads share that global TLS; this is "minimal-correct": good
-//! enough to spawn/join/yield/sleep and report parallelism, which is all `std`'s
-//! thread surface needs to link and run. Real per-thread TLS via `[ThreadStatic]`
-//! is the documented follow-up in `thread_local/dotnet.rs`.
+//! These are REAL preemptive OS threads (`System.Threading.Thread`), with REAL
+//! per-thread TLS (each `thread_local!` key is a `ThreadLocal<IntPtr>` — see
+//! `thread_local/dotnet.rs`), a REAL `Mutex` (`SemaphoreSlim`), and — as of the
+//! Class-D threading slice — a REAL `Parker` (counting-`SemaphoreSlim`-backed)
+//! that lets std's generic `Once`/`RwLock` and a `SemaphoreSlim` `Condvar` work
+//! unmodified (see `sync/thread_parking/dotnet.rs` + `docs/THREADING_PAL_RESEARCH.md`).
+//! This is sufficient to run contended multi-threaded code (e.g. rayon's
+//! work-stealing pool).
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 use crate::ffi::CStr;
