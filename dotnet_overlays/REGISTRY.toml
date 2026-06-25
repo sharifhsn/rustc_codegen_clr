@@ -44,6 +44,15 @@ name = "tokio"
 version = "1.52.3"
 dir = "tokio"
 
+# parking_lot_core — ONE marked arm (a `target_os="dotnet"` branch in
+# thread_parker/mod.rs) routing the parker off the raw-pthread `unix.rs` (which has
+# no .NET libc) onto upstream's own portable `generic.rs` spin parker. Unblocks
+# every parking_lot / lock_api consumer (dashmap, ...) with NO pthread shim.
+[[overlay]]
+name = "parking_lot_core"
+version = "0.9.12"
+dir = "parking_lot_core"
+
 # getrandom — three coexisting majors. Each overlay IS getrandom (patched) with a
 # self-contained `target_os="dotnet"` backend arm that calls the PAL CSPRNG
 # (rcl_dotnet_random_fill), so rand/ahash/uuid (and any getrandom user) build with
