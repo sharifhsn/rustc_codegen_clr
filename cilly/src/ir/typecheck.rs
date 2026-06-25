@@ -945,8 +945,18 @@ impl CILNode {
                 tpe,
                 volatile: volitale,
             } => {
+                let _ = volitale;
                 let addr = asm.get_node(*addr).clone();
                 let addr_tpe = addr.typecheck(sig, locals, asm)?;
+                // NOTE: the `StInd` *store* dual drops the address-pointee-vs-`tpe` comparison
+                // entirely (it is a checker-model artifact — see that arm). The `LdInd` *load* arm
+                // deliberately KEEPS it, for two reasons: (1) it uses the looser `is_assignable_to`
+                // (not `==`), so it has not accreted the special-case pile the store side did; and
+                // (2) it REPORTS the address's pointee type as its result, and downstream nodes rely
+                // on that (e.g. a `SetField` consuming an `LdInd` of a pointer field in `Weak::drop`
+                // — reporting the declared `tpe` instead reintroduces `FieldAssignWrongType` false
+                // positives one hop downstream, differentially observed on aho-corasick/regex). The
+                // store side is where the strsim false-positive pile lived and is fixed there.
                 let pointed_tpe = addr_tpe
                     .pointed_to()
                     .ok_or(TypeCheckError::TypeNotPtr { tpe: addr_tpe })?;
@@ -1188,67 +1198,43 @@ impl CILRoot {
                 let (addr, value, tpe, _) = boxed.as_ref();
                 let addr = asm[*addr].clone().typecheck(sig, locals, asm)?;
                 let value = asm[*value].clone().typecheck(sig, locals, asm)?;
-                let Some(addr_points_to) = addr.pointed_to().map(|tpe| asm[tpe]) else {
-                    return Err(TypeCheckError::WriteWrongAddr {
-                        addr: addr.mangle(asm),
-                        tpe: tpe.mangle(asm),
-                    });
-                };
-                // The emitted IL for `StInd` derives the store opcode (`stind.i1`/`stind.i4`/
-                // `stobj <T>`/…) SOLELY from `tpe` (see `il_exporter` CILRoot::StInd): the address's
-                // declared pointee type never reaches the instruction — the address is just pushed as
-                // a machine pointer. So the only thing that matters for soundness is (a) the address
-                // IS a pointer (checked above) and (b) the *value* matches `tpe` (checked just below).
-                // The `addr_points_to == tpe` comparison is therefore a checker-model artifact that
-                // produces false positives on the type-erased pointers Rust codegen routinely builds.
-                // We accept two PROVEN-benign shapes (Phase P1 / WF-TC, differentially verified):
-                //   * extra-indirection (`addr: **X`, `tpe: X`): `addr_points_to` is itself a
-                //     pointer/ref whose pointee matches `tpe` — a `PtrCast`-noop one level too deep.
-                //   * void-address (`addr: *void`, `tpe: X`): the void is in the *address* (a
-                //     type-erased ArcInner/Cell refcount slot), never in `tpe`; `tpe` drives a
-                //     correctly-sized store. A `tpe: Void` store stays REJECTED — there is no store
-                //     opcode for Void, so that is a genuine error.
-                let addr_extra_indirection = addr_points_to.pointed_to().is_some_and(|inner| {
-                    let inner = asm[inner];
-                    inner == *tpe
-                        || inner
-                            .as_int()
-                            .zip(tpe.as_int())
-                            .is_some_and(|(a, b)| a.as_unsigned() == b.as_unsigned())
-                        // `bool` slots are `Type::Bool` but a `bool` value is routinely
-                        // materialized as `i8`, which is why the direct case is accepted at
-                        // `addr_points_to == Bool && tpe == I8` below. The extra-indirection
-                        // form (`addr: **bool`, `tpe: i8`) is the SAME proven-benign shape one
-                        // level deeper — it shows up on safe `&mut [bool]` slice stores after a
-                        // `split_at_mut` (strsim `generic_jaro`'s `a_flags[i] = true`), where the
-                        // `stind.i1` writes the correct 1-byte bool element (differentially
-                        // verified FULL MATCH vs native). The value/`tpe` soundness check below
-                        // (`i8` == `i8`) is unaffected.
-                        || (inner == Type::Bool && *tpe == Type::Int(Int::I8))
-                });
-                let addr_is_void_erased = addr_points_to == Type::Void && *tpe != Type::Void;
-                if !(tpe.is_assignable_to(addr_points_to, asm)
-                    || addr_points_to
-                        .as_int()
-                        .zip(tpe.as_int())
-                        .is_some_and(|(a, b)| a.as_unsigned() == b.as_unsigned())
-                    || addr_points_to == Type::Bool && *tpe == Type::Int(Int::I8)
-                    || addr_extra_indirection
-                    || addr_is_void_erased)
-                {
+                let tpe = *tpe;
+                // ARCHITECTURAL NOTE (the address pointee-type is NOT a checkable invariant). The
+                // exporter emits a `stind.i1`/`stind.i4`/`stobj <T>` whose width+kind are derived
+                // from `tpe` ALONE; the address is pushed as a raw machine pointer and its *declared
+                // pointee type never reaches the instruction*. Pointer pointee-types in this IR are
+                // also routinely ERASED by ordinary Rust codegen — `*u8` byte cursors, `*Void`
+                // refcount slots (ArcInner/Cell), extra-indirected `PtrCast` relabels (`**X` for an
+                // `X` store), `bool` slots typed `Bool` for an `i8` value. So comparing the address's
+                // pointee type against `tpe` carries no reliable information: it cannot distinguish a
+                // benign relabel from a real bug, and historically generated only FALSE POSITIVES,
+                // each patched with another hand-proven exception (extra-indirection, void-erased,
+                // bool/i8, …). We therefore do NOT check it. The reliable, soundness-relevant
+                // invariants are exactly:
+                //   (a) the address IS a pointer/ref — a valid machine address to store through;
+                //   (b) `tpe` is storeable — there is no store opcode for `Void`;
+                //   (c) the *value* matches the store type `tpe` (this is what binds the pushed bits
+                //       to the emitted opcode, and IS reliably checkable).
+                if addr.pointed_to().is_none() {
                     return Err(TypeCheckError::WriteWrongAddr {
                         addr: addr.mangle(asm),
                         tpe: tpe.mangle(asm),
                     });
                 }
-                if !(value.is_assignable_to(*tpe, asm)
+                if tpe == Type::Void {
+                    return Err(TypeCheckError::WriteWrongAddr {
+                        addr: addr.mangle(asm),
+                        tpe: tpe.mangle(asm),
+                    });
+                }
+                if !(value.is_assignable_to(tpe, asm)
                     || value
                         .as_int()
                         .zip(tpe.as_int())
                         .is_some_and(|(a, b)| a.as_unsigned() == b.as_unsigned())
-                    || value == Type::Bool && *tpe == Type::Int(Int::I8))
+                    || value == Type::Bool && tpe == Type::Int(Int::I8))
                 {
-                    return Err(TypeCheckError::WriteWrongValue { tpe: *tpe, value });
+                    return Err(TypeCheckError::WriteWrongValue { tpe, value });
                 }
                 Ok(())
             }
@@ -1454,6 +1440,65 @@ mod tc_tests {
                 Err(TypeCheckError::LocalAssigementWrong { .. })
             ),
             "storing an f64 into a usize local must be rejected"
+        );
+    }
+
+    /// Build a single-`StInd` root storing `value` (a pre-allocated node) through an address local
+    /// of type `*store_tpe`, with declared store type `store_tpe`; return the typecheck result.
+    fn check_stind(
+        asm: &mut Assembly,
+        store_tpe: Type,
+        value: Interned<CILNode>,
+    ) -> Result<(), TypeCheckError> {
+        let store_tpe_idx = asm.alloc_type(store_tpe);
+        let ptr_ty = asm.nptr(store_tpe_idx);
+        let ptr_ty_idx = asm.alloc_type(ptr_ty);
+        let locals: Vec<LocalDef> = vec![(None, ptr_ty_idx)];
+        let addr = asm.alloc_node(CILNode::LdLoc(0));
+        let sig = asm.sig([], Type::Void);
+        let root = CILRoot::StInd(Box::new((addr, value, store_tpe, false)));
+        root.typecheck(sig, &locals, asm)
+    }
+
+    /// FALSE-NEGATIVE AUDIT (StInd architectural refactor): dropping the address-pointee check must
+    /// NOT weaken the kept value/`tpe` invariant. Storing an `f64` value through an `i32` `stind` is
+    /// a genuine type error (the pushed bits do not match the store opcode). A sound checker MUST
+    /// reject it. If this passes, the StInd refactor created a hole.
+    #[test]
+    fn stind_value_type_mismatch_is_rejected() {
+        let mut asm = Assembly::default();
+        let f = asm.alloc_node(CILNode::Const(Box::new(Const::F64(
+            super::super::hashable::HashableF64(1.0),
+        ))));
+        assert!(
+            matches!(
+                check_stind(&mut asm, Type::Int(Int::I32), f),
+                Err(TypeCheckError::WriteWrongValue { .. })
+            ),
+            "storing an f64 value through an i32 stind must be rejected (value/type mismatch)"
+        );
+    }
+
+    /// REGRESSION GUARD (StInd architectural refactor): a type-ERASED address pointee must be
+    /// accepted with NO special case. `**bool` storing an `i8` is the strsim `a_flags[i] = true`
+    /// shape (a `&mut [bool]` slice store after `split_at_mut`); the address pointee type is
+    /// intentionally not checked — only `value == tpe` (here `i8 == i8`) matters. Must be Ok.
+    #[test]
+    fn stind_erased_pointee_is_accepted() {
+        let mut asm = Assembly::default();
+        let bool_ty = asm.alloc_type(Type::Bool);
+        let p_bool = asm.nptr(bool_ty);
+        let p_bool = asm.alloc_type(p_bool);
+        let pp_bool = asm.nptr(p_bool);
+        let pp_bool = asm.alloc_type(pp_bool);
+        let locals: Vec<LocalDef> = vec![(None, pp_bool)];
+        let addr = asm.alloc_node(CILNode::LdLoc(0));
+        let val = asm.alloc_node(CILNode::Const(Box::new(Const::I8(1))));
+        let root = CILRoot::StInd(Box::new((addr, val, Type::Int(Int::I8), false)));
+        let sig = asm.sig([], Type::Void);
+        assert!(
+            root.typecheck(sig, &locals, &mut asm).is_ok(),
+            "storing i8 through a **bool address (erased pointee) must be accepted with no special case"
         );
     }
 
