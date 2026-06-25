@@ -154,6 +154,31 @@ hit a *different* SIMD site (non-panic build error); **B2** globset + regex now 
 is no fundamental .NET wall; real threads/Mutex/TLS/atomics already work, and the rest is a single keystone
 primitive (a `ManualResetEventSlim`-backed `Parker`) + routing std's generic sync arms + a few BCL overlays.
 
+## 3.6 Status 2 — Class D keystone + Class E/A2/B2 cluster landed
+
+**Class D Parker keystone landed (commit c6607d5).** The `Parker` (a *counting* `SemaphoreSlim` — the
+pinned `ManualResetEventSlim` deadlocked rayon via a lost-wakeup race) + std's generic `Once`/`Condvar`/
+`RwLock` arms + `IsBackground=true` on spawned threads (Rust process-exit semantics): **rayon FULL MATCH and
+exits cleanly**, **flume a free win**, `probe_std_sync` FULL MATCH, gate 426/14. Still open (orthogonal libc
+work): dashmap, parking_lot (own pthread parker → needs `pthread_cond_*`), smol.
+
+**Class E/A2/B2 cluster landed (commits ead9b49, 46f2c25)** — root-caused by a workflow, 6 crates flip:
+- **toml** — the `Bool/F64` mismatch was a **checker** bug: float `%` (`BinOp::Rem`/`RemUn`) returned
+  `Ok(Bool)` instead of `Ok(Float)`. Fixes all float `%`.
+- **half** — `il_exporter` `StInd(F16)` was `todo!()` → `stobj System.Half`.
+- **A2 → SIMD-shuffle wide index** — the `simd_shuffle` builtin `.unwrap()`ed `as_simdvector()` on a
+  `[u32;N]` index that exceeds 512 bits (lowered to a fixed array). Derive the lane element
+  representation-agnostically. **Clears sha2/hmac/ed25519 — the whole RustCrypto x86 family.**
+- **B2 → `Arc<dyn>::drop` AccessViolation** — confirmed a **silent miscompile**: an over-aligned `dyn`
+  payload (e.g. `repr(align(32))` behind `Arc<dyn T>`) read at the static min-align offset. Fix: round the
+  unsized-tail offset up to `align_of_val` (vtable slot 2) for `dyn` tails. Gate-clean.
+
+**Remaining cluster follow-ups (root-caused, not yet landed):** **futures** (`FieldOwnerMismatch`: cast the
+virtual-call receiver to `*FatPtrn3Dyn` before the `m`/`d` loads, gated to the by-address case — touches
+*all* dyn dispatch, needs a focused regression pass); **dashmap + parking_lot** (one fix: 23 pthread/clock
+decls in the libc shim); **globset** (a *second*, separate `drop_glue::<GlobSetMatchStrategy>` DST-drop
+crash past the B2 fix). `nalgebra` is not a backend bug (a frontend `wide`-crate cfg mismatch).
+
 ## 4. Ranked next fixes (what the survey surfaced)
 
 1. **Class A — SIMD lane-extract/store `U32*USize` binop** — one codegen fix, ~7 crates (crypto + linalg).
