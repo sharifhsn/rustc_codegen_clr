@@ -117,6 +117,25 @@ PAL does not fully provide.
 - **hmac**, **sha2** — non-panic build error (generic crypto trait codegen; adjacent to Class A SIMD).
 - **toml** — `CantCompareTypes { Bool vs F64 }` in `write_toml_value` (an enum-value comparison).
 
+## 3.5 Status — Class A/B/C fixes landed (commit c103b47)
+
+Four clean root-cause fixes landed; **9 crates flipped to byte-identical** (curve25519-dalek, ndarray,
+chacha20, sha1, flume, aho-corasick, jiff, json5, quick-xml), 0 regression:
+- **A** — `Assembly::offset` zero-extends the lane index to USize (was an ill-typed `U32*USize`).
+- **B** — `field_address` passes the pointee, not `nptr(pointee)`, to `cast_ptr` (Weak<dyn>::drop).
+- **C1/C2** — the 128-bit multiply-overflow-check builtins compared the div-back to `rhs` not `lhs`
+  (a **broad** latent miscompile: every `i128`/`u128` checked multiply wrongly overflowed).
+- **C3** — `place_address_raw`'s single-Deref fast-path is gated on `pointer_to_is_fat` (the quick-xml
+  memory-corruption miscompile).
+
+**Residual second-layer bugs** (separate, exposed by the above; tracked): **A2** ed25519-dalek + nalgebra
+hit a *different* SIMD site (non-panic build error); **B2** globset + regex now build but crash with an
+`AccessViolation` in `Arc<dyn>::drop` drop-glue (a fat-pointer drop bug, same family as B/C3).
+
+**Class D** is fully researched in **[docs/THREADING_PAL_RESEARCH.md](THREADING_PAL_RESEARCH.md)** — there
+is no fundamental .NET wall; real threads/Mutex/TLS/atomics already work, and the rest is a single keystone
+primitive (a `ManualResetEventSlim`-backed `Parker`) + routing std's generic sync arms + a few BCL overlays.
+
 ## 4. Ranked next fixes (what the survey surfaced)
 
 1. **Class A — SIMD lane-extract/store `U32*USize` binop** — one codegen fix, ~7 crates (crypto + linalg).
