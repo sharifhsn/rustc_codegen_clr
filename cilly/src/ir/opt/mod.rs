@@ -437,6 +437,24 @@ fn propagate_roots(
             {
                 return true;
             }
+            // SOUNDNESS: a field stored THROUGH `&local` (`LdLocA(loc)`) can also be read inside
+            // `tree` via the by-VALUE form `LdLoc(loc)` — e.g. a read-modify-write `f.x = f.x + 1`
+            // loads the whole struct value then projects the field. The address-only check above
+            // misses that, so propagating `tree` forward would re-evaluate its embedded field read
+            // AFTER this store, yielding the JUST-WRITTEN value instead of the pre-store one. (This
+            // was the `Vec::resize` → n+1 miscompile: `SetLenOnDrop`'s `local_len += 1` got
+            // propagated into the inlined drop's `*len = local_len`, making it `local_len + 1`.)
+            // Block propagation entirely when `tree` reads the local's value form. NOTE: this
+            // by-value self-dependence was previously checked ONLY for the second propagation below,
+            // leaving the first (by-address) one unsound — the actual defect.
+            if let CILNode::LdLocA(loc) = &asm[*addr] {
+                let loc_node = asm.alloc_node(CILNode::LdLoc(*loc));
+                if CILIter::new(asm.get_node(*tree).clone(), asm)
+                    .any(|node| node == CILIterElem::Node(asm[loc_node].clone()))
+                {
+                    return true;
+                }
+            }
 
             let res = propagate_root(
                 asm,
