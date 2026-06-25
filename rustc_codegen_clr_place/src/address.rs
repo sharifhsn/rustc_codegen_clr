@@ -154,7 +154,44 @@ fn field_address<'a>(
                         Type::Int(Int::USize),
                     ));
                     let metadata = ctx.ld_field(addr_calc, metadata_descr);
-                    let ptr = ctx.biop(obj_addr, Const::USize(u64::from(offset)), BinOp::Add);
+                    // The layout offset of an unsized tail is its MIN-alignment offset. For a `dyn`
+                    // tail the real alignment is only known at runtime (vtable slot 2, after
+                    // drop_in_place + size), so round the offset up to `align_of_val` before adding
+                    // it. Otherwise an over-aligned payload (e.g. a `repr(align(32))` value behind
+                    // `Arc<dyn T>`) is read at the wrong address — a silent miscompile, surfacing as
+                    // the `Arc<dyn>::drop` AccessViolation in globset/regex. For a slice/str tail the
+                    // alignment is static and already baked into `offset`, and `metadata` is a length
+                    // (not a vtable), so it must be left unchanged there. Mirrors `align_of_val`.
+                    let tail_is_dyn = matches!(
+                        ctx.tcx()
+                            .struct_tail_for_codegen(
+                                field_ty,
+                                rustc_middle::ty::TypingEnv::fully_monomorphized(),
+                            )
+                            .kind(),
+                        TyKind::Dynamic(..)
+                    );
+                    let field_offset = if tail_is_dyn {
+                        // align = *(vtable + 2 * size_of::<isize>())
+                        let isize_sz = ctx.size_of(Int::ISize);
+                        let two = ctx.alloc_node(2_i32);
+                        let slot_off = ctx.biop(isize_sz, two, BinOp::Mul);
+                        let slot_off = ctx.int_cast(slot_off, Int::USize, ExtendKind::ZeroExtend);
+                        let align_addr = ctx.biop(metadata, slot_off, BinOp::Add);
+                        let align_ptr = ctx.cast_ptr(align_addr, Type::Int(Int::USize));
+                        let align = ctx.load(align_ptr, Type::Int(Int::USize));
+                        // align_up(offset, align) = (offset + (align - 1)) & !(align - 1)
+                        let one = ctx.alloc_node(Const::USize(1));
+                        let am1 = ctx.biop(align, one, BinOp::Sub);
+                        let off_const = ctx.alloc_node(Const::USize(u64::from(offset)));
+                        let off_plus = ctx.biop(off_const, am1, BinOp::Add);
+                        let all_ones = ctx.alloc_node(Const::USize(u64::MAX));
+                        let mask = ctx.biop(am1, all_ones, BinOp::XOr);
+                        ctx.biop(off_plus, mask, BinOp::And)
+                    } else {
+                        ctx.alloc_node(Const::USize(u64::from(offset)))
+                    };
+                    let ptr = ctx.biop(obj_addr, field_offset, BinOp::Add);
                     let field_fat_ptr = ctx.type_from_cache(Ty::new_ptr(
                         ctx.tcx(),
                         field_ty,
