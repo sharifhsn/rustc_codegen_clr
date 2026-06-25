@@ -5,6 +5,17 @@ Research into how the Rust threading/sync/async primitives that the compat-surve
 dotnet PAL + the full `System.Threading` / `System.Threading.Tasks` / `System.Collections.Concurrent`
 surface (the backend can name any BCL type via `ClassRef`).
 
+> **✅ KEYSTONE LANDED (commit c6607d5).** The Parker + std generic sync arms are implemented and verified:
+> **rayon runs FULL MATCH vs native and exits cleanly**, `probe_std_sync` shows std's generic
+> Once/RwLock/Condvar working under contention, **flume is now a free win (FULL MATCH)**, `pal_threads`
+> no-regression, gate 426/14, corpus re-sweep 0 new divergence. Two refinements vs the design below: the
+> Parker uses a **counting `SemaphoreSlim`** (the pinned `ManualResetEventSlim` deadlocked rayon via a
+> lost-wakeup race), and spawned threads are now **`IsBackground=true`** (Rust process-exit semantics —
+> this is what let rayon's never-joined pool threads not hang the process at exit). Still open (orthogonal
+> follow-ups, NOT the Parker): **dashmap** (a non-fatal link error), **parking_lot** (bypasses std's Parker
+> for its own pthread `ThreadParker` → needs `pthread_cond_*`/`clock_gettime` in the libc shim), **smol**
+> (needs `strlen`+`ERANGE`+`timerfd`). Steps 3–5 of §8 below remain.
+
 ## Headline
 
 **Far more already works than the survey implied, and the remaining gap is small + cleanly mappable.**
