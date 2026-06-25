@@ -1235,7 +1235,11 @@ impl ILExporter {
                         }
                     }
                     Type::Float(float) => match float {
-                        super::Float::F16 => todo!(),
+                        // f16 has no `stind`; store the 2-byte `System.Half` value type via `stobj`,
+                        // mirroring the `LdInd(F16) => ldobj System.Half` arm above.
+                        super::Float::F16 => {
+                            writeln!(out, "{is_volitale} stobj [System.Runtime]System.Half")
+                        }
                         super::Float::F32 => writeln!(out, "{is_volitale} stind.r4"),
                         super::Float::F64 => writeln!(out, "{is_volitale} stind.r8"),
                         super::Float::F128 => writeln!(out, "stobj {}", type_il(&tpe, asm)),

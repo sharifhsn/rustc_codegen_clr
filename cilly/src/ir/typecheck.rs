@@ -467,7 +467,10 @@ impl BinOp {
                 (Type::Int(lhs), Type::Int(rhs)) if rhs == lhs && rhs.is_signed() => {
                     Ok(Type::Int(lhs))
                 }
-                (Type::Float(lhs), Type::Float(rhs)) if rhs == lhs => Ok(Type::Bool),
+                // Float `%` (CIL `rem`) yields a FLOAT of the same width — mirror the Add/Sub/Mul/Div
+                // float arms. The previous `Ok(Type::Bool)` was a copy-paste from a comparison op and
+                // surfaced downstream as toml's `CantCompareTypes { Bool, F64 }`.
+                (Type::Float(lhs), Type::Float(rhs)) if rhs == lhs => Ok(Type::Float(lhs)),
                 _ => {
                     if lhs.is_assignable_to(rhs, asm)
                         && (lhs.as_int().is_some() || rhs.as_int().is_some())
@@ -486,7 +489,8 @@ impl BinOp {
                 (Type::Int(lhs), Type::Int(rhs)) if rhs == lhs && !rhs.is_signed() => {
                     Ok(Type::Int(lhs))
                 }
-                (Type::Float(lhs), Type::Float(rhs)) if rhs == lhs => Ok(Type::Bool),
+                // Float `%` yields a float (see the `Rem` arm) — was wrongly `Ok(Type::Bool)`.
+                (Type::Float(lhs), Type::Float(rhs)) if rhs == lhs => Ok(Type::Float(lhs)),
                 _ => {
                     if lhs.is_assignable_to(rhs, asm)
                         && (lhs.as_int().is_some() || rhs.as_int().is_some())

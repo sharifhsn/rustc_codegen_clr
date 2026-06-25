@@ -366,8 +366,16 @@ fn simd_shuffle(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         // Per the simd_shuffle contract the input element type equals the output element type.
         let src_vec = sig.inputs()[0].as_simdvector().unwrap().clone();
         let src_count = src_vec.count() as u64;
-        let idx_vec = sig.inputs()[2].as_simdvector().unwrap().clone();
-        let idx_elem: Type = idx_vec.elem().into();
+        // The shuffle index is `[u32; out_count]` (the rustc `simd_shuffle` contract). When
+        // out_count > 16 the index vector exceeds 512 bits and is lowered to a fixed-array ClassRef
+        // (type.rs >512-bit path), NOT a SIMDVector — so `as_simdvector()` is None and must not be
+        // `.unwrap()`ed (the panic that blocked sha2/hmac/ed25519 + the RustCrypto x86 family). The
+        // element is u32 regardless of representation, and idx_count is unused (the loop is
+        // `0..out_count`), so derive the element representation-agnostically.
+        let idx_elem: Type = match sig.inputs()[2].as_simdvector() {
+            Some(v) => v.elem().into(),
+            None => Type::Int(Int::U32),
+        };
 
         let out_elem_idx = asm.alloc_type(out_elem);
         let idx_elem_idx = asm.alloc_type(idx_elem);
