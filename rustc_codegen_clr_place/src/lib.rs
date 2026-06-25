@@ -142,7 +142,11 @@ pub fn place_address_raw<'a>(
             slice_head(place.projection).0,
             rustc_middle::mir::PlaceElem::Deref
         )
+        && pointer_to_is_fat(place_ty, ctx.tcx(), ctx.instance())
     {
+        // The deref'd place is *itself* unsized (a DST), so a pointer to it is fat.
+        // `place_address_raw`'s contract is to hand back the address of the fat-pointer
+        // storage in that case, which is exactly the address of the local being deref'd.
         return local_address(place.local.as_usize(), ctx.body(), ctx);
     } else {
         let (mut addr_calc, mut ty) = local_body(place.local.as_usize(), ctx);

@@ -135,16 +135,21 @@ pub fn i128_mul_ovf_check(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
             1,
             Some(BranchCond::False(rhs_zero)),
         ))));
-        let ret_false = asm.alloc_node(Const::Bool(false));
-        let ret_false = asm.alloc_root(CILRoot::Ret(ret_false));
+        // rhs == 0: `lhs*0 == 0` always fits. This builtin returns true == "product in range",
+        // so the rhs==0 fast path must return TRUE (was `Bool(false)` = spuriously "overflow").
+        let ret_safe = asm.alloc_node(Const::Bool(true));
+        let ret_safe = asm.alloc_root(CILRoot::Ret(ret_safe));
         let lhs_mul_rhs = asm.alloc_node(CILNode::call(i128_mul, [lhs, rhs]));
-        let recomputed_rhs = asm.alloc_node(CILNode::call(i128_div, [lhs_mul_rhs, rhs]));
-        let ovf = asm.alloc_node(CILNode::call(i128_eq, [recomputed_rhs, rhs]));
+        // `(lhs*rhs)/rhs == LHS` iff the multiply did not overflow — compare the div-back to the
+        // multiplicand `lhs`, NOT `rhs` (the previous `== rhs` reported overflow for nearly every
+        // input, wrongly tripping every 128-bit checked-multiply, e.g. jiff rounding / json5 hex).
+        let recomputed_lhs = asm.alloc_node(CILNode::call(i128_div, [lhs_mul_rhs, rhs]));
+        let ovf = asm.alloc_node(CILNode::call(i128_eq, [recomputed_lhs, lhs]));
         let ret_ovf = asm.alloc_root(CILRoot::Ret(ovf));
 
         MethodImpl::MethodBody {
             blocks: vec![
-                BasicBlock::new(vec![jmp_nz, ret_false], 0, None),
+                BasicBlock::new(vec![jmp_nz, ret_safe], 0, None),
                 BasicBlock::new(vec![ret_ovf], 1, None),
             ],
             locals: vec![],
@@ -353,11 +358,15 @@ pub fn u128_mul_ovf_check(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
             1,
             Some(BranchCond::False(rhs_zero)),
         ))));
-        let ret_false = asm.alloc_node(Const::Bool(false));
-        let ret_false = asm.alloc_root(CILRoot::Ret(ret_false));
+        // rhs == 0: `lhs*0 == 0` always fits. This builtin returns true == "product in range",
+        // so the rhs==0 fast path must return TRUE (was `Bool(false)` = spuriously "overflow").
+        let ret_safe = asm.alloc_node(Const::Bool(true));
+        let ret_safe = asm.alloc_root(CILRoot::Ret(ret_safe));
         let lhs_mul_rhs = asm.alloc_node(CILNode::call(u128_mul, [lhs, rhs]));
-        let recomputed_rhs = asm.alloc_node(CILNode::call(u128_div, [lhs_mul_rhs, rhs]));
-        let ovf = asm.alloc_node(CILNode::call(u128_eq, [recomputed_rhs, rhs]));
+        // `(lhs*rhs)/rhs == LHS` iff the multiply did not overflow — compare to the multiplicand
+        // `lhs`, NOT `rhs` (the previous `== rhs` reported overflow for nearly every input).
+        let recomputed_lhs = asm.alloc_node(CILNode::call(u128_div, [lhs_mul_rhs, rhs]));
+        let ovf = asm.alloc_node(CILNode::call(u128_eq, [recomputed_lhs, lhs]));
         /*let ovf2 = asm.alloc_node(CILNode::BinOp(lhs, lhs_mul_rhs, BinOp::GtUn));
         let ovf2 = asm.alloc_node(CILNode::UnOp(ovf2, UnOp::Neg));
         let ovf = asm.alloc_node(CILNode::BinOp(ovf, ovf2, BinOp::Or));*/
@@ -365,7 +374,7 @@ pub fn u128_mul_ovf_check(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
 
         MethodImpl::MethodBody {
             blocks: vec![
-                BasicBlock::new(vec![jmp_nz, ret_false], 0, None),
+                BasicBlock::new(vec![jmp_nz, ret_safe], 0, None),
                 BasicBlock::new(vec![ret_ovf], 1, None),
             ],
             locals: vec![],

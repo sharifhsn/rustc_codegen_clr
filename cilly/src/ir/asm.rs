@@ -132,6 +132,13 @@ impl Assembly {
         tpe: impl IntoAsmIndex<Interned<Type>>,
     ) -> Interned<CILNode> {
         let index = index.into_idx(self);
+        // A byte offset is inherently a usize/native-int quantity, but the index can arrive
+        // narrower — notably the `u32` lane index of `simd_extract`/`simd_insert`. Zero-extend
+        // it to USize so the `index * stride` Mul has matching operand widths (an array/lane
+        // index is a small non-negative value, so the zero-extension is value-preserving and
+        // computes the identical byte address). Redundant USize→USize casts on the array/slice
+        // callers (which already pass USize) are well-typed and optimized away.
+        let index = self.int_cast(index, Int::USize, ExtendKind::ZeroExtend);
         let stride = self.size_of(tpe);
         let stride = self.int_cast(stride, Int::USize, ExtendKind::ZeroExtend);
         let offset = self.biop(index, stride, BinOp::Mul);

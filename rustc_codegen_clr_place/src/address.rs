@@ -119,8 +119,12 @@ fn field_address<'a>(
                     let obj = ctx.type_from_cache(field_type);
                     // Add the offset to the object.
                     let obj_addr = ctx.biop(obj_addr, Const::USize(u64::from(offset)), BinOp::Add);
-                    let obj_ptr = ctx.nptr(obj);
-                    ctx.cast_ptr(obj_addr, obj_ptr)
+                    // `cast_ptr(addr, pointee)` builds a `PtrCast` whose second arg is the POINTEE
+                    // type, so pass the field value-type `obj` — NOT `nptr(obj)`, which would
+                    // mislabel the result `Ptr(Ptr(field))`. That double-pointer mislabel is the
+                    // `Weak<dyn T>::drop` `FieldAssignWrongType` (taking `&(*fat_ptr).sized_field`
+                    // through a fat pointer). Pure pointer relabel, no runtime IL change.
+                    ctx.cast_ptr(obj_addr, obj)
                 }
                 (true, true) => {
                     let mut explicit_offset_iter =
