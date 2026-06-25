@@ -109,13 +109,31 @@ PAL does not fully provide.
 - These overlap the known PAL threading boundary (real `std::thread`/futex/TLS), tracked in the libc-shim /
   PAL scope docs.
 
-### Class E — miscellaneous one-offs
+### Class E — miscellaneous one-offs (RECLASSIFIED — none are walls; all are fixable codegen bugs)
 
+Verified by root-causing each: **Class E contains NO true walls.** Every item is a fixable codegen bug,
+to be folded into the A/B/C-style fix sweep:
 - **futures** — `FieldOwnerMismatch` in `LocalFutureObj::poll` (a field interned against the wrong owner).
+  Type-gate-caught codegen bug, family of B. Fixable.
+- **toml** — `CantCompareTypes { Bool vs F64 }` in `write_toml_value`. Type-gate-caught codegen bug
+  (a comparison emitting mismatched operands). Fixable.
+- **half** — **NOT an f16 wall** (the prior label was wrong). half's core is u16 *software* float; it
+  fails at the LINKER because `half-2.4.1/src/binary16/arch.rs` pulls x86 **F16C** SIMD intrinsics
+  (`_mm_cvtph_ps`/`_mm_cvtps_ph`, behind a runtime `is_x86_feature_detected!("f16c")` guard) for the
+  conversion fast-path, which the backend cannot yet lower. A **SIMD-intrinsic codegen gap** (same family
+  as Class A), not a fundamental float limitation — and even Rust's *native* `f16` has a plausible
+  `System.Half` mapping. Fixable.
+- **hmac**, **sha2** — non-panic build error, Class-A-adjacent (crypto SIMD). Fixable.
 - **serde_with** — a deserialize-visitor method rejected by the gate (`#[serde_as]` generated code).
-- **half** — f16 (a documented float wall).
-- **hmac**, **sha2** — non-panic build error (generic crypto trait codegen; adjacent to Class A SIMD).
-- **toml** — `CantCompareTypes { Bool vs F64 }` in `write_toml_value` (an enum-value comparison).
+
+### Wall audit — what is *actually* irreducible
+
+After this survey + the Class-D research, the genuinely-irreducible walls are **narrow**: AF_UNIX
+abstract-namespace / `SCM_RIGHTS`, true inode/dev/nlink identity, `fork`/`execve`, and arbitrary novel
+inline asm (see ABSOLUTE_CORRECTNESS_PLAN §7). **f16 is NOT one of them** (System.Half exists; half's
+failure is the F16C intrinsic gap above), and **threading/async is NOT one of them** (Class-D research:
+real threads/Mutex/TLS work; the rest is the Parker keystone + BCL overlays). Most "walls" the survey
+first reported were mislabeled fixable codegen gaps.
 
 ## 3.5 Status — Class A/B/C fixes landed (commit c103b47)
 
