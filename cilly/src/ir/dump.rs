@@ -56,6 +56,22 @@ fn node_label(node: &CILNode, asm: &Assembly) -> String {
         CILNode::LdArgA(a) => format!("LdArgA({a})"),
         CILNode::PtrCast(_, res) => format!("PtrCast<{res:?}>"),
         CILNode::RefToPtr(_) => "RefToPtr".to_string(),
+        CILNode::LdField { field, .. } => {
+            let fd = asm.get_field(*field);
+            format!(
+                "LdField {}::{}",
+                &asm[asm.class_ref(fd.owner()).name()],
+                &asm[fd.name()]
+            )
+        }
+        CILNode::LdFieldAddress { field, .. } => {
+            let fd = asm.get_field(*field);
+            format!(
+                "LdFieldAddress {}::{}",
+                &asm[asm.class_ref(fd.owner()).name()],
+                &asm[fd.name()]
+            )
+        }
         other => {
             let s = format!("{other:?}");
             if s.len() > 72 {

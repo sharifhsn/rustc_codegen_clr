@@ -261,12 +261,42 @@ pub fn place_elem_address<'tcx>(
             }
         }
         PlaceElem::Subslice { from, to, from_end } => {
-            let elem_type = curr_type
-                .as_ty()
-                .expect("Can't index into an enum!")
-                .sequence_element_type(ctx.tcx());
-            let elem_type = get_type(elem_type, ctx);
-            let curr_type = fat_ptr_to(curr_type.as_ty().expect("Can't index into an enum!"), ctx);
+            let base_ty = curr_type.as_ty().expect("Can't index into an enum!");
+            let elem_ty = ctx.monomorphize(base_ty.sequence_element_type(ctx.tcx()));
+            let elem_type = get_type(elem_ty, ctx);
+            let curr_type = fat_ptr_to(base_ty, ctx);
+
+            // ARRAY base (`[T; N]`): a Subslice of an array yields a SIZED sub-array `[T; to-from]`,
+            // so its place address is a THIN pointer to that sub-array — the element-`from` address
+            // inside the contiguous array. The slice-base arms below instead build a fat pointer
+            // (`create_slice`) by reading the in-memory fat ptr's `d`/`m` fields, which an array value
+            // does not have (it stores the elements inline, not a `FatPtr`). Without this the array
+            // case both read a non-existent `FatPtr::d` (`FieldOwnerMismatch`) and produced a fat
+            // slice where a `*[T; K]` is expected (`LocalAssigementWrong`). Surfaced by alloctests
+            // `slice::subslice_patterns` (`sub @ ..` / `ref sub @ ..` sub-array bindings on arrays).
+            if let TyKind::Array(_, array_len) = base_ty.kind() {
+                let array_len = array_len
+                    .try_to_target_usize(ctx.tcx())
+                    .expect("Non-const array length in a Subslice projection");
+                let sub_len = if *from_end {
+                    array_len - (*to + *from)
+                } else {
+                    *to - *from
+                };
+                let sub_ty = Ty::new_array(ctx.tcx(), elem_ty, sub_len);
+                let sub_ptr_ty = get_type(
+                    Ty::new_ptr(ctx.tcx(), sub_ty, rustc_middle::ty::Mutability::Mut),
+                    ctx,
+                );
+                let elem_ptr = ctx.cast_ptr(addr_calc, elem_type);
+                let at_from = if *from != 0 {
+                    let from_node = ctx.alloc_node(Const::USize(*from));
+                    ctx.offset(elem_ptr, from_node, elem_type)
+                } else {
+                    elem_ptr
+                };
+                return ctx.cast_ptr_to(at_from, sub_ptr_ty);
+            }
 
             if *from_end {
                 //assert!(from >= to, "from_end:{from_end} from:{from} to:{to}");

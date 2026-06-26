@@ -1,0 +1,10 @@
+[package]
+name = "probe_subslice_pat"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "probe_subslice_pat"
+path = "src/main.rs"
+
+[workspace]
