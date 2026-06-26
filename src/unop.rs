@@ -93,12 +93,19 @@ pub fn unop<'tcx>(
             let tpe = get_type(ty, ctx);
             let class = tpe.as_class_ref().expect("Invalid pointer type");
 
-            // Check what type ty is - dyn, slices and "other" types have different behaviour.
-            match ty
-                .builtin_deref(true)
-                .expect("Non-ptr type in PtrMetadata.")
-                .kind()
-            {
+            let pointee = ty.builtin_deref(true).expect("Non-ptr type in PtrMetadata.");
+            // Discriminate dyn / slice-or-str / sized on the pointee's struct TAIL, not on the
+            // pointee's own `TyKind`. A DST-tailed struct (`UnsafeCell<[i32]>`, `ArcInner<[u8]>`, …)
+            // has `kind() == Adt` but a `[T]`/`str`/`dyn` tail; matching the raw pointee kind routes
+            // it to the `_ =>` arm, which synthesises a `Void` (ZST) metadata. That `Void` then
+            // flows into `<[T]>::len()` etc. — e.g. coretests `cells::unsafe_cell_unsized` compares
+            // the slice length and the verifier rejects `CantCompareTypes { USize, Void }`. Mirrors
+            // the tail-dispatch already used in intrinsics/type_info.rs (size_of_val).
+            let tail = ctx
+                .tcx()
+                .struct_tail_for_codegen(pointee, rustc_middle::ty::TypingEnv::fully_monomorphized());
+            // Check what the tail is - dyn, slices and "other" types have different behaviour.
+            match tail.kind() {
                 TyKind::Slice(_) | TyKind::Str => {
                     let metadata = ctx.alloc_string(crate::METADATA);
                     let field = ctx.alloc_field(FieldDesc::new(

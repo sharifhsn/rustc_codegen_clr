@@ -1,0 +1,10 @@
+[package]
+name = "probe_dst_tail"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "probe_dst_tail"
+path = "src/main.rs"
+
+[workspace]
