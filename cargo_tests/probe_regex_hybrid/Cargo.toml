@@ -1,0 +1,10 @@
+[package]
+name = "probe_regex_hybrid"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "meta", "hybrid"] }
+[[bin]]
+name = "probe_regex_hybrid"
+path = "src/main.rs"
+[workspace]
