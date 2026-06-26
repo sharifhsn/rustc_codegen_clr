@@ -110,6 +110,18 @@ macro_rules! config {
 }
 config! {DEAD_CODE_ELIMINATION,bool,true}
 
+/// Debug tooling: when set, every method whose mangled **or** demangled name contains this substring
+/// is printed as a deterministic, type-annotated IR dump during the type-verifier pass (see
+/// [`crate::ir::dump`]). Empty/unset disables it. Read directly because the dump fires in both the
+/// backend (`join_codegen`) and the `linker` process.
+pub static DUMP_FN: std::sync::LazyLock<Option<String>> =
+    std::sync::LazyLock::new(|| std::env::var("DUMP_FN").ok().filter(|s| !s.is_empty()));
+/// The active `DUMP_FN` substring filter, if any.
+#[must_use]
+pub fn dump_fn_filter() -> Option<&'static str> {
+    DUMP_FN.as_deref()
+}
+
 // --- Type-verifier wiring (Phase P1 of docs/ABSOLUTE_CORRECTNESS_PLAN.md) -------------------------
 // These three flags gate `Assembly::typecheck` (cilly/src/ir/asm.rs). They mirror the same-named
 // flags in the backend's `src/config.rs`; cilly reads the env directly because the typecheck runs in

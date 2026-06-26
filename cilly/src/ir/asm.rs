@@ -215,12 +215,29 @@ impl Assembly {
             return 0;
         }
         let method_def_idxs: Box<[_]> = self.method_defs.keys().copied().collect();
+        let dump_filter = crate::dump_fn_filter();
         let mut violations = 0usize;
         for method in method_def_idxs {
             let mut tmp_method = self.method_def(method).clone();
+            // DUMP_FN tooling: emit a readable, type-annotated dump of any method whose (de)mangled
+            // name contains the filter substring — fires whether or not it passes the checker, so a
+            // failing method can be inspected next to its callers/callees.
+            if let Some(filter) = dump_filter {
+                let mname = self[self[method].name()].to_string();
+                let dem = format!("{:#}", rustc_demangle::demangle(&mname));
+                if mname.contains(filter) || dem.contains(filter) {
+                    let dump = crate::ir::dump::dump_method(&tmp_method, self);
+                    eprintln!("{dump}");
+                }
+            }
             if let Err(err) = tmp_method.typecheck(self) {
                 violations += 1;
                 let mname = self[self[method].name()].to_string();
+                // Always dump the offending method in full (deterministic tooling for diagnosing
+                // verifier rejections): every node is annotated with its inferred type, so the
+                // node that introduces a wrong type / extra indirection is read straight off.
+                let dump = crate::ir::dump::dump_method(&tmp_method, self);
+                eprintln!("{dump}");
                 if fatal {
                     // Fatal type gate: never emit an ill-typed method.
                     panic!(

@@ -50,6 +50,9 @@ pub mod field;
 pub mod fnsig;
 /// Defines hashable and equable floating point types. All NaNs are compared by bits, and -0.0 != 0.0.
 pub mod hashable;
+/// Deterministic, type-annotated human-readable IR dump for a single method (debug tooling, gated by
+/// the `DUMP_FN` env var). See [`dump::dump_method`].
+pub mod dump;
 /// Exports IR to .NET bytecode
 pub mod il_exporter;
 /// IR iterator
