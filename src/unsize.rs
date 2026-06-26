@@ -93,8 +93,20 @@ pub fn unsize<'tcx>(
         ctx.set_field(desc, addr, val)
     };
     let source_size = ctx.layout_of(source).size.bytes();
-    let target_size = ctx.layout_of(source).size.bytes();
-    // Assumes a 64 bit pointer!
+    // The TARGET layout — NOT the source. Reading `layout_of(source)` here made `target_size ==
+    // source_size` always, so the `target_size != source_size` guard below was permanently false and
+    // the trailing-field copy was dead code: for a struct unsizing where SIZED fields follow the
+    // coerced field (e.g. `RefMut<[T; N]>` -> `RefMut<[T]>`, whose `borrow` guard sits after the
+    // `value` pointer), those fields were never copied into the destination. The coerced `RefMut`'s
+    // borrow guard was left uninitialized and its `Drop` failed to release the `RefCell` borrow ->
+    // a spurious "already mutably borrowed" panic on the next `borrow()` (coretests
+    // `cell::refcell_ref_coercion`).
+    let target_size = ctx.layout_of(target).size.bytes();
+    // Copy the trailing sized fields. The coerced (first) field grows from a thin pointer (8 bytes)
+    // to a fat pointer (16 bytes), shifting every following field by 8, so copy `source_size - 8`
+    // bytes from `src + 8` to `dst + 16`. Assumes the coerced field is first with thin=8/fat=16 —
+    // holds for the std smart pointers (Ref/RefMut/Rc/Arc/Box); arbitrary layouts are not yet
+    // general (but were already broken before this — the copy never ran at all).
     let copy_val = if source_size > 8 && !source.is_any_ptr() && target_size != source_size {
         let addr = operand_address(operand, ctx);
 
@@ -103,7 +115,6 @@ pub fn unsize<'tcx>(
         let dst_addr = ctx.ref_to_ptr(dst);
         let const_16 = ctx.alloc_node(16_isize);
         let dst_addr = ctx.biop(dst_addr, const_16, BinOp::Add);
-        eprintln!("WARNING:Can't propely unsize types with sized fields yet. unsize assumes that layout of Wrapper<&T> ==   layout of Wrapper<FatPtr<T>>!");
         let len = ctx.alloc_node(Const::USize(source_size - 8));
         ctx.cp_blk(dst_addr, addr, len)
     } else {
