@@ -18,6 +18,8 @@ use super::{
     MethodDefIdx, Type,
 };
 
+mod partition;
+
 pub struct ILExporter {
     flavour: IlasmFlavour,
     is_lib: bool,
@@ -33,6 +35,11 @@ pub struct ILExporter {
     /// reusing the index produced `Duplicate label: 'tr_done_N'` ilasm errors. A fresh counter value
     /// per emission guarantees uniqueness even when the same root is emitted multiple times.
     terminate_region_label: std::cell::Cell<u64>,
+    /// When `MainModule` exceeds CoreCLR's per-type method cap, holds the split of its methods across
+    /// per-module classes (rebuilt per export in [`Self::export_to_write`]); `None` for normal-size
+    /// assemblies, where `MainModule` is emitted as a single class exactly as before. Read at
+    /// method-reference emission to redirect a `MainModule::m` call to the class `m` was emitted in.
+    partition: std::cell::RefCell<Option<partition::ModulePartition>>,
 }
 impl ILExporter {
     #[must_use]
@@ -42,6 +49,7 @@ impl ILExporter {
             is_lib,
             asm_name,
             terminate_region_label: std::cell::Cell::new(0),
+            partition: std::cell::RefCell::new(None),
         }
     }
 
@@ -91,6 +99,16 @@ impl ILExporter {
             writeln!(out, " .data cil I_{encoded} = bytearray ({data})\n.field assembly static uint8 c_{encoded} at I_{encoded}")?;
         }
         let mut c = 0;
+        // If `MainModule` is too large for a single .NET type (CoreCLR caps a type at ~65k methods),
+        // split its methods across per-module partition classes. A no-op for normal-size assemblies
+        // (returns `None`), so ordinary builds and the `::stable` suite are byte-for-byte unchanged.
+        {
+            let main_module_methods: Vec<MethodDefIdx> = asm
+                .iter_class_defs()
+                .find(|cd| asm[cd.name()] == *super::asm::MAIN_MODULE)
+                .map_or_else(Vec::new, |cd| cd.methods().to_vec());
+            *self.partition.borrow_mut() = partition::build(asm, &main_module_methods);
+        }
         // Iterate trough all types
         for class_def in asm.iter_class_defs() {
             let vis = match class_def.access() {
@@ -118,6 +136,12 @@ impl ILExporter {
             // macOS/Windows) accepts them; within-limit names pass through unchanged (Linux/Docker
             // + ::stable unaffected). The matching reference sites apply the identical transform.
             let name = dotnet_class_name(&asm[class_def.name()]);
+            // When `MainModule` is split across partition classes, its static fields are read by
+            // methods that now live in sibling classes — widen them to `public` so the cross-class
+            // `ldsfld`/`stsfld` is legal (default field accessibility is `private`).
+            let main_partitioned =
+                asm[class_def.name()] == *super::asm::MAIN_MODULE && self.partition.borrow().is_some();
+            let field_vis = if main_partitioned { "public " } else { "" };
             writeln!(
                 out,
                 ".class {vis} ansi {sealed} {explicit} '{name}' extends {extends}{{"
@@ -261,7 +285,7 @@ impl ILExporter {
                 };
                 writeln!(
                     out,
-                    ".field static {is_const} {tpe} '{name}'{default_value}"
+                    ".field {field_vis}static {is_const} {tpe} '{name}'{default_value}"
                 )?;
                 if *is_tls {
                     writeln!(out,".custom instance void [System.Runtime]System.ThreadStaticAttribute::.ctor() = (01 00 00 00)")?;
@@ -272,96 +296,173 @@ impl ILExporter {
                 std::collections::HashSet::new();
             // Export all methods
 
-            for method_id in class_def.methods() {
-                let method = asm.method_def(*method_id);
-                let vis = match method.access() {
-                    crate::Access::Extern | crate::Access::Public => "public",
-                    crate::Access::Private => "private",
+            // Export all methods. When `MainModule` overflows a single .NET type, split its
+            // methods across per-module partition classes (see `partition`); otherwise emit the one
+            // class as before. Assignment keys on the method NAME, matching the reference redirect.
+            if &asm[class_def.name()] == super::asm::MAIN_MODULE && self.partition.borrow().is_some() {
+                let (residual, extras): (Vec<MethodDefIdx>, Vec<(String, Vec<MethodDefIdx>)>) = {
+                    let guard = self.partition.borrow();
+                    let part = guard.as_ref().unwrap();
+                    (
+                        part.residual_methods().to_vec(),
+                        part.extra_classes()
+                            .map(|(c, m)| (c.to_string(), m.to_vec()))
+                            .collect(),
+                    )
                 };
-                let kind = match method.kind() {
-                    crate::cilnode::MethodKind::Static => "static",
-                    crate::cilnode::MethodKind::Instance => "instance",
-                    crate::cilnode::MethodKind::Virtual => "virtual instance",
-                    // A constructor is an instance method (the `instance` calling-convention keyword
-                    // must come LAST, right before the return type — like `virtual instance` above —
-                    // not interspersed with the `specialname`/`rtspecialname` attributes).
-                    crate::cilnode::MethodKind::Constructor => "specialname rtspecialname instance",
-                };
-                let pinvoke = if let MethodImpl::Extern {
-                    lib,
-                    preserve_errno,
-                } = method.implementation()
-                {
-                    let lib = &asm[*lib];
-                    if *preserve_errno {
-                        format!("pinvokeimpl(\"{lib}\" cdecl lasterr)")
-                    } else {
-                        format!("pinvokeimpl(\"{lib}\" cdecl)")
-                    }
-                } else {
-                    String::new()
-                };
-                let name = &asm[method.name()];
-                let sig = &asm[method.sig()];
-                let ret = type_il(sig.output(), asm);
-                assert_eq!(method.arg_names().len(), sig.inputs().len(), "{name:?}");
-                let inputs = match method.kind() {
-                    crate::cilnode::MethodKind::Static => sig.inputs(),
-                    crate::cilnode::MethodKind::Instance
-                    | crate::cilnode::MethodKind::Virtual
-                    | crate::cilnode::MethodKind::Constructor => &sig.inputs()[1..],
-                };
-
-                let inputs: String = inputs
-                    .iter()
-                    .zip(method.arg_names())
-                    .map(|(tpe, name)| match name {
-                        Some(name) => {
-                            format!("{} '{}'", non_void_type_il(tpe, asm_mut), &asm_mut[*name])
-                        }
-                        None => non_void_type_il(tpe, asm_mut),
-                    })
-                    .intersperse(",".to_string())
-                    .collect();
-                let preservesig = if method.implementation().is_extern() {
-                    "preservesig"
-                } else {
-                    ""
-                };
-                writeln!(
-                    out,
-                    ".method {vis} hidebysig {kind} {pinvoke} {ret} '{name}'({inputs}) cil managed {preservesig}{{// Method ID {method_id:?}"
-                )?;
-                debug_assert!(ensure_unqiue.insert(*method_id));
-                let stack_size = match method.resolved_implementation(asm_mut) {
-                    MethodImpl::MethodBody { blocks, .. } => blocks
-                        .iter()
-                        .flat_map(|block| block.roots().iter())
-                        .map(|root| {
-                            crate::CILIter::new(asm_mut.get_root(*root).clone(), asm_mut).count()
-                                + 10
-                        })
-                        .max()
-                        .unwrap_or(0),
-                    MethodImpl::Extern { .. } => 0,
-                    MethodImpl::AliasFor(_) => todo!(),
-                    MethodImpl::Missing => 3,
-                };
-
-                writeln!(out, ".maxstack {stack_size}")?;
-
-                if *name == *"entrypoint" {
-                    writeln!(out, ".entrypoint")?;
+                for method_id in &residual {
+                    self.emit_one_method(asm, asm_mut, out, *method_id, &mut ensure_unqiue)?;
                 }
-                // Export the implementation
-                let mimpl = method.resolved_implementation(asm_mut).clone();
-                self.export_method_imp(asm_mut, out, &mimpl, name, method.sig())?;
-                writeln!(out, "}}")?;
+                writeln!(out, "}}")?; // close the `MainModule` residual class
+                for (cname, method_ids) in &extras {
+                    writeln!(
+                        out,
+                        ".class public ansi auto '{cname}' extends [System.Runtime]System.Object{{"
+                    )?;
+                    for method_id in method_ids {
+                        self.emit_one_method(asm, asm_mut, out, *method_id, &mut ensure_unqiue)?;
+                    }
+                    writeln!(out, "}}")?;
+                }
+                continue;
+            }
+            for method_id in class_def.methods() {
+                self.emit_one_method(asm, asm_mut, out, *method_id, &mut ensure_unqiue)?;
             }
             writeln!(out, "}}")?;
         }
 
         Ok(())
+    }
+    /// Emit one `.method … { … }` definition. Factored out of the class loop so an over-large
+    /// `MainModule` can spread its methods across several partition classes (see [`partition`]).
+    fn emit_one_method(
+        &self,
+        asm: &super::Assembly,
+        asm_mut: &mut super::Assembly,
+        out: &mut impl Write,
+        method_id: MethodDefIdx,
+        ensure_unqiue: &mut std::collections::HashSet<MethodDefIdx>,
+    ) -> std::io::Result<()> {
+        let method = asm.method_def(method_id);
+        // Under an active `MainModule` partition its methods call one another across class
+        // boundaries, so they must be cross-class accessible — force `public`. `class_of` is `Some`
+        // for every `MainModule` method (residual ones included); a same-named data-type method
+        // being widened too is harmless. Non-partitioned builds keep the source visibility.
+        let force_public = self
+            .partition
+            .borrow()
+            .as_ref()
+            .is_some_and(|p| p.class_of(method.name()).is_some());
+        let vis = if force_public {
+            "public"
+        } else {
+            match method.access() {
+                crate::Access::Extern | crate::Access::Public => "public",
+                crate::Access::Private => "private",
+            }
+        };
+        let kind = match method.kind() {
+            crate::cilnode::MethodKind::Static => "static",
+            crate::cilnode::MethodKind::Instance => "instance",
+            crate::cilnode::MethodKind::Virtual => "virtual instance",
+            // A constructor is an instance method (the `instance` calling-convention keyword
+            // must come LAST, right before the return type — like `virtual instance` above —
+            // not interspersed with the `specialname`/`rtspecialname` attributes).
+            crate::cilnode::MethodKind::Constructor => "specialname rtspecialname instance",
+        };
+        let pinvoke = if let MethodImpl::Extern {
+            lib,
+            preserve_errno,
+        } = method.implementation()
+        {
+            let lib = &asm[*lib];
+            if *preserve_errno {
+                format!("pinvokeimpl(\"{lib}\" cdecl lasterr)")
+            } else {
+                format!("pinvokeimpl(\"{lib}\" cdecl)")
+            }
+        } else {
+            String::new()
+        };
+        let name = &asm[method.name()];
+        let sig = &asm[method.sig()];
+        let ret = type_il(sig.output(), asm);
+        assert_eq!(method.arg_names().len(), sig.inputs().len(), "{name:?}");
+        let inputs = match method.kind() {
+            crate::cilnode::MethodKind::Static => sig.inputs(),
+            crate::cilnode::MethodKind::Instance
+            | crate::cilnode::MethodKind::Virtual
+            | crate::cilnode::MethodKind::Constructor => &sig.inputs()[1..],
+        };
+
+        let inputs: String = inputs
+            .iter()
+            .zip(method.arg_names())
+            .map(|(tpe, name)| match name {
+                Some(name) => {
+                    format!("{} '{}'", non_void_type_il(tpe, asm_mut), &asm_mut[*name])
+                }
+                None => non_void_type_il(tpe, asm_mut),
+            })
+            .intersperse(",".to_string())
+            .collect();
+        let preservesig = if method.implementation().is_extern() {
+            "preservesig"
+        } else {
+            ""
+        };
+        writeln!(
+            out,
+            ".method {vis} hidebysig {kind} {pinvoke} {ret} '{name}'({inputs}) cil managed {preservesig}{{// Method ID {method_id:?}"
+        )?;
+        debug_assert!(ensure_unqiue.insert(method_id));
+        let stack_size = match method.resolved_implementation(asm_mut) {
+            MethodImpl::MethodBody { blocks, .. } => blocks
+                .iter()
+                .flat_map(|block| block.roots().iter())
+                .map(|root| {
+                    crate::CILIter::new(asm_mut.get_root(*root).clone(), asm_mut).count()
+                        + 10
+                })
+                .max()
+                .unwrap_or(0),
+            MethodImpl::Extern { .. } => 0,
+            MethodImpl::AliasFor(_) => todo!(),
+            MethodImpl::Missing => 3,
+        };
+
+        writeln!(out, ".maxstack {stack_size}")?;
+
+        if *name == *"entrypoint" {
+            writeln!(out, ".entrypoint")?;
+        }
+        // Export the implementation
+        let mimpl = method.resolved_implementation(asm_mut).clone();
+        self.export_method_imp(asm_mut, out, &mimpl, name, method.sig())?;
+        writeln!(out, "}}")?;
+
+        Ok(())
+    }
+    /// Resolve the IL class token for a method reference, honoring an active `MainModule` partition:
+    /// a reference to a `MainModule` method is redirected to the per-module class its NAME was emitted
+    /// in (see [`partition`]). Def + ref key on the same name, so they always agree.
+    fn partitioned_class(
+        &self,
+        class: Interned<ClassRef>,
+        name: Interned<crate::IString>,
+        asm: &super::Assembly,
+    ) -> String {
+        if let Some(part) = self.partition.borrow().as_ref() {
+            if asm[asm.class_ref(class).name()] == *super::asm::MAIN_MODULE {
+                if let Some(cls) = part.class_of(name) {
+                    if cls != super::asm::MAIN_MODULE {
+                        return format!("class '{cls}'");
+                    }
+                }
+            }
+        }
+        class_ref(class, asm)
     }
     fn export_method_imp(
         &self,
@@ -652,7 +753,7 @@ impl ILExporter {
                     format!("<{generic_list}>")
                 };
                 let name = &asm[mref.name()];
-                let class = class_ref(mref.class(), asm);
+                let class = self.partitioned_class(mref.class(), mref.name(), asm);
                 writeln!(
                     out,
                     "{call_op} {output} {class}::'{name}'{generic}({inputs})"
@@ -912,7 +1013,7 @@ impl ILExporter {
                     .intersperse(",".to_owned())
                     .collect();
                 let name = &asm[mref.name()];
-                let class = class_ref(mref.class(), asm);
+                let class = self.partitioned_class(mref.class(), mref.name(), asm);
                 let ldftn_op = match mref.kind() {
                     crate::cilnode::MethodKind::Static => "ldftn",
                     crate::cilnode::MethodKind::Instance => "ldftn instance",
@@ -1177,7 +1278,7 @@ impl ILExporter {
                     .intersperse(",".to_owned())
                     .collect();
                 let name = &asm[mref.name()];
-                let class = class_ref(mref.class(), asm);
+                let class = self.partitioned_class(mref.class(), mref.name(), asm);
 
                 writeln!(
                     out,
