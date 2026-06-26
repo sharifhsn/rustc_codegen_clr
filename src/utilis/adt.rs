@@ -318,7 +318,12 @@ pub fn get_discr<'tcx>(
                             vec![].into(),
                         );
                         let mref = ctx.alloc_methodref(mref);
-                        let nc = ctx.alloc_node(u128::from(niche_variants.start.as_u32()));
+                        // `is_niche = tag == niche_start` — compare against the niche *value*
+                        // (`niche_start`), NOT the variant index (`niche_variants.start`). They
+                        // coincide for niche_start==0 enums (e.g. `Option`), but differ for a
+                        // shifted niche like `Result<Big, Small>` (niche_start = 2^128-2), where
+                        // using the index would misread the niche variant as the untagged one.
+                        let nc = ctx.alloc_node(niche_start);
                         ctx.call(mref, &[tag, nc], IsPure::NOT)
                     }
                     Type::Int(Int::I128) => {
@@ -330,7 +335,7 @@ pub fn get_discr<'tcx>(
                             vec![].into(),
                         );
                         let mref = ctx.alloc_methodref(mref);
-                        let nc = ctx.alloc_node(u128::from(niche_variants.start.as_u32()) as i128);
+                        let nc = ctx.alloc_node(niche_start as i128);
                         ctx.call(mref, &[tag, nc], IsPure::NOT)
                     }
 
