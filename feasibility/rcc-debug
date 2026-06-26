@@ -12,7 +12,17 @@
 #   rcc-debug trace  <crate_dir> <fn_substr>      # TRACE_FN: runtime block-entry trace (which branch ran)
 #   rcc-debug val    <crate_dir> <fn_substr>      # TRACE_VAL: runtime SwitchInt discriminant values
 #   rcc-debug diff   <crate_dir>                  # native-vs-backend output differential (the oracle)
+#   rcc-debug layout <crate_dir> <type_substr>    # dump the backend's computed enum/niche layout (DUMP_LAYOUT)
 #   rcc-debug vendor <crate> <version> [dst]      # vendor a registry crate for instrumentation (see below)
+#
+# DUMP_LAYOUT=<substr> (rustc_codegen_clr_type handle_tag) appends the backend's enum layout — tag
+# encoding (Direct/Niche), tag type + byte offset, per-variant field offsets, and rustc's
+# untagged_variant/niche_variants/niche_start — to a file, for any enum whose type name contains
+# <substr>. This is the introspection that root-caused the regex `get_discr` 128-bit-niche bug
+# (niche_start=2^128-2 vs a variant-index compare). The discriminant/niche/layout family (Direct vs
+# Niche tags, 128-bit tags, shifted/nested niches, tag offsets) is the canonical "passes the
+# type-checker, fails silently" bug class — reach for `layout` whenever an enum/match misbehaves.
+# Regression net: cargo_tests/probe_enum_discr (a minimal U128-niche Result that catches this class).
 #
 # Backend runtime hooks (env vars, read at codegen — see src/assembly.rs / src/terminator/mod.rs):
 #   TRACE_FN=<substr>   inject `Console.WriteLine(">>T bb<N> <fn>")` at every basic-block entry of any
@@ -59,6 +69,11 @@ case "$CMD" in
   diff)
     if [ -x /tmp/diff_oracle.sh ]; then bash /tmp/diff_oracle.sh "$CRATE"
     else echo "diff_oracle.sh not at /tmp; run native rustc vs CARGO_DOTNET_BACKEND=native and compare"; fi ;;
+  layout)
+    [ -z "$FILTER" ] && usage
+    rm -f /tmp/dump_layout.txt; rm -rf "$CRATE/target" "$CRATE/Cargo.lock"
+    DUMP_LAYOUT="$FILTER" OPTIMIZE_CIL=0 timeout 300 env CARGO_DOTNET_BACKEND=native "$CD" build "$CRATE" >/dev/null 2>&1
+    grep -A20 "^LAYOUT.*$FILTER" /tmp/dump_layout.txt 2>/dev/null | head -80 || echo "(no layout dumped — check the type-name filter)" ;;
   vendor)
     VER="${3:?usage: vendor <crate> <version> [dst]}"; DST="${4:-/tmp/$CRATE-dbg}"
     SRC="$(find "$HOME/.cargo/registry/src" -maxdepth 1 -type d -name "$CRATE-$VER" | head -1)"

@@ -889,12 +889,78 @@ fn add_record_accessors(
     }
 }
 
+/// `DUMP_LAYOUT=<substr>`: append the backend's computed enum layout — tag encoding, tag type + byte
+/// offset, per-variant field offsets, and (for niche enums) rustc's `untagged_variant` /
+/// `niche_variants` / `niche_start` — to a file (`DUMP_LAYOUT_OUT`, default `/tmp/dump_layout.txt`), for
+/// any enum whose type name contains `<substr>`. This is the introspection that root-caused the regex
+/// `get_discr` 128-bit-niche miscompile (`niche_start=2^128-2` revealed the index-vs-value compare bug):
+/// it lets you diff what the backend laid out / decodes against rustc's intent. The whole discriminant
+/// class (Direct vs Niche tags, multi-byte/128-bit tags, shifted/nested niches, tag offsets) is exactly
+/// the kind of bug that passes the type-checker and fails silently — keep this around. Off unless set.
+/// Pairs with runtime `TRACE_VAL` / `feasibility/rcc-debug` and `cargo_tests/probe_enum_discr`.
+fn dump_enum_layout<'tcx>(adt_ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) {
+    let Ok(filter) = std::env::var("DUMP_LAYOUT") else {
+        return;
+    };
+    if filter.is_empty() || !format!("{adt_ty:?}").contains(filter.as_str()) {
+        return;
+    }
+    use std::io::Write as _;
+    let layout = ctx.layout_of(adt_ty);
+    let (tag_type, tag_offset) = crate::adt::enum_tag_info(layout.layout, ctx);
+    let mut out = format!(
+        "LAYOUT {adt_ty:?}  size={} align={}\n",
+        layout.layout.size().bytes(),
+        layout.layout.align().abi.bytes()
+    );
+    match &layout.layout.variants {
+        rustc_abi::Variants::Multiple {
+            tag_encoding,
+            tag_field,
+            ..
+        } => {
+            out += &match tag_encoding {
+                rustc_abi::TagEncoding::Direct => format!(
+                    "  encoding=Direct tag_type={tag_type:?} tag_offset={tag_offset} tag_field={tag_field:?}\n"
+                ),
+                rustc_abi::TagEncoding::Niche {
+                    untagged_variant,
+                    niche_variants,
+                    niche_start,
+                } => format!(
+                    "  encoding=Niche tag_type={tag_type:?} tag_offset={tag_offset} tag_field={tag_field:?} untagged={untagged_variant:?} niche_variants={niche_variants:?} niche_start={niche_start}\n"
+                ),
+            };
+            if let Some(adt) = adt_ty.ty_adt_def() {
+                for (vidx, _v) in adt.variants().iter_enumerated() {
+                    let voff: Vec<u32> =
+                        crate::adt::enum_variant_offsets(adt, layout.layout, vidx).collect();
+                    out += &format!("  variant {vidx:?} field_offsets={voff:?}\n");
+                }
+            }
+        }
+        other => {
+            out += &format!("  variants={other:?} tag_type={tag_type:?} tag_offset={tag_offset}\n");
+        }
+    }
+    let path =
+        std::env::var("DUMP_LAYOUT_OUT").unwrap_or_else(|_| "/tmp/dump_layout.txt".to_string());
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(out.as_bytes());
+    }
+}
+
 fn handle_tag<'tcx>(
     layout: &Layout,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     adt_ty: Ty<'tcx>,
     fields: &mut Vec<(Type, Interned<IString>, Option<u32>)>,
 ) {
+    dump_enum_layout(adt_ty, ctx);
     match &layout.variants {
         rustc_abi::Variants::Single { index: _ } => {
             let (tag_type, offset) = crate::adt::enum_tag_info(*layout, ctx);

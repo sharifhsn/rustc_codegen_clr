@@ -55,6 +55,13 @@ use); the step where native stays correct but the backend flips is the miscompil
 
 ## 3. The static tools (complementary)
 
+- **`DUMP_LAYOUT=<substr>`** (`rcc-debug layout <crate> <type>`) — dump the backend's computed enum
+  layout: tag encoding (Direct/Niche), tag type + byte offset, per-variant field offsets, and rustc's
+  `untagged_variant`/`niche_variants`/`niche_start`. This pinpointed the regex root cause (a U128 niche
+  with `niche_start = 2^128-2` exposed an index-vs-value compare in `get_discr`). **The
+  discriminant/niche/layout family — Direct vs Niche tags, 128-bit tags, shifted/nested niches, tag
+  offsets — is the canonical "passes the type-checker, fails silently" class**; reach for `layout` on any
+  enum/`match`/discriminant misbehavior. Minimal regression net: `cargo_tests/probe_enum_discr`.
 - `feasibility/mirtool cil <crate> <method_substr>` — slice a method's CIL out of the linked `.il`
   (the reliable source of emitted CIL; works where `DUMP_MIR` misses bin-CU/strategy fns).
 - `DUMP_MIR=<substr>` (`src/assembly.rs`) — dump the optimized MIR the backend received, for MIR↔CIL

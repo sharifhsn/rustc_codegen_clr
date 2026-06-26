@@ -1,0 +1,8 @@
+[package]
+name="probe_enum_discr"
+version="0.0.0"
+edition="2021"
+[[bin]]
+name="probe_enum_discr"
+path="src/main.rs"
+[workspace]
