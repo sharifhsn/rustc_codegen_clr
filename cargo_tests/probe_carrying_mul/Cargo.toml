@@ -1,0 +1,10 @@
+[package]
+name = "probe_carrying_mul"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "probe_carrying_mul"
+path = "src/main.rs"
+
+[workspace]

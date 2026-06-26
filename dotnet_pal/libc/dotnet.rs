@@ -86,6 +86,12 @@ pub const EWOULDBLOCK: c_int = 11;
 pub const EINPROGRESS: c_int = 115;
 pub const EINTR: c_int = 4;
 
+// Signals (Linux x86_64 glibc numbering). `SIGABRT` is needed by libtest's
+// `test_result.rs` (it classifies a child that died with SIGABRT as TrFailed) — required
+// to build the `test` crate when running the rust-lang/rust stdlib test suites (coretests
+// /alloctests/std) through the backend.
+pub const SIGABRT: c_int = 6;
+
 // ---------------------------------------------------------------------------
 // Sockets (mio sys/unix/net.rs + tcp.rs + udp.rs).
 // ---------------------------------------------------------------------------

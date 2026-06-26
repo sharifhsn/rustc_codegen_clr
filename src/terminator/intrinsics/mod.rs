@@ -376,30 +376,43 @@ pub fn handle_intrinsic<'tcx>(
             let promoted = oint
                 .promoted()
                 .expect("Can't carrying_mul_add cause type is too large");
+            // The intrinsic is `carrying_mul_add<T, U>(multiplier: T, multiplicand: T, addend: T,
+            // carry: T) -> (U, T)` with `U = T::Unsigned`. So all four runtime operands have type
+            // `T` (== `wint`), NOT `U` (== `oint`). They must therefore be widened from `wint`: for
+            // a signed `T` this sign-extends into the promoted type (the fallback is
+            // `(self as $w) * (a as $w) + …` where `$w` is the double-width signed type), which is
+            // exactly the bit pattern the subsequent unsigned mul/add/div needs. Widening from
+            // `oint` instead routed a signed `i64` through an unsigned (zero-extending) conversion —
+            // a real miscompile for negative operands, caught by the I1 CIL type-verifier (the
+            // op_Implicit arg/param signedness mismatch). The unsigned case (`wint == oint`) is
+            // unchanged. The promoted *arithmetic* stays unsigned: after correct sign-extension the
+            // low 128/64 bits of a signed and unsigned multiply coincide, the low half truncates to
+            // `U`, and the logical-shift (unsigned div) high half truncated to `T` equals
+            // `(wide >> BITS) as T`.
             let mul_a_op = handle_operand(&args[0].node, ctx);
             let mul_a = casts::int_to_int(
-                cilly::Type::Int(oint),
+                cilly::Type::Int(wint),
                 cilly::Type::Int(promoted),
                 mul_a_op,
                 ctx,
             );
             let mul_b_op = handle_operand(&args[1].node, ctx);
             let mul_b = casts::int_to_int(
-                cilly::Type::Int(oint),
+                cilly::Type::Int(wint),
                 cilly::Type::Int(promoted),
                 mul_b_op,
                 ctx,
             );
             let carry_op = handle_operand(&args[2].node, ctx);
             let carry = casts::int_to_int(
-                cilly::Type::Int(oint),
+                cilly::Type::Int(wint),
                 cilly::Type::Int(promoted),
                 carry_op,
                 ctx,
             );
             let addend_op = handle_operand(&args[3].node, ctx);
             let addend = casts::int_to_int(
-                cilly::Type::Int(oint),
+                cilly::Type::Int(wint),
                 cilly::Type::Int(promoted),
                 addend_op,
                 ctx,
@@ -639,6 +652,15 @@ pub fn handle_intrinsic<'tcx>(
         "maxnumf32" => float_binop(args, destination, ctx, Float::F32, "MaxNumber"),
         "minnumf64" => float_binop(args, destination, ctx, Float::F64, "MinNumber"),
         "minnumf32" => float_binop(args, destination, ctx, Float::F32, "MinNumber"),
+        // The `*_algebraic` float intrinsics permit the optimizer to reassociate/contract the
+        // operation. .NET/RyuJIT does neither across these boundaries, so the faithful lowering is
+        // the plain IEEE-754 op (never less precise than the source program). Generic over f32/f64
+        // — the operand type carries the width. Needed by coretests (the stdlib test suite).
+        "fadd_algebraic" => float_algebraic(args, destination, ctx, cilly::BinOp::Add),
+        "fsub_algebraic" => float_algebraic(args, destination, ctx, cilly::BinOp::Sub),
+        "fmul_algebraic" => float_algebraic(args, destination, ctx, cilly::BinOp::Mul),
+        "fdiv_algebraic" => float_algebraic(args, destination, ctx, cilly::BinOp::Div),
+        "frem_algebraic" => float_algebraic(args, destination, ctx, cilly::BinOp::Rem),
         // Float min/max/abs were reworked upstream (see docs/semantics_mapping.md for the
         // verified Rust<->.NET truth table). Two distinct families now exist:
         //  * IEEE 754-2019 maximum/minimum (`f32::maximum`/`minimum`): propagate NaN, order -0<+0.
@@ -1371,6 +1393,19 @@ fn float_unop<'tcx>(
     let log = ctx.alloc_methodref(log);
     let arg0 = handle_operand(&args[0].node, ctx);
     let value = ctx.call(log, &[arg0], IsPure::NOT);
+    vec![place_set(destination, value, ctx)]
+}
+/// Lower an `*_algebraic` float intrinsic to the plain IR binary op (`a OP b`). The operand type
+/// (f32/f64) is carried by the args, so one helper covers both widths.
+fn float_algebraic<'tcx>(
+    args: &[Spanned<Operand<'tcx>>],
+    destination: &Place<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    op: cilly::BinOp,
+) -> Vec<Root> {
+    let arg0 = handle_operand(&args[0].node, ctx);
+    let arg1 = handle_operand(&args[1].node, ctx);
+    let value = ctx.biop(arg0, arg1, op);
     vec![place_set(destination, value, ctx)]
 }
 fn float_binop<'tcx>(

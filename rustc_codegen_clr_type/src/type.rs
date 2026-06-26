@@ -352,20 +352,33 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
             let layout = ctx.layout_of(ty);
             let arr_size = layout.layout.size().bytes();
             let arr_align = layout.layout.align().abi.bytes();
-            // An array of this size can't be represented on the .NET side. I3 totality: the old
-            // `return Type::Void` produced a ZST slot that place ops then read/write as if it were
-            // the array — a silent miscompile. Fail loud instead. `span_fatal` returns `!`, so the
-            // `if` body diverges and control never reaches `fixed_array` for an oversized array.
-            // Unreachable on real code (no std/test/cargo_tests array is > 4 GiB).
-            if std::convert::TryInto::<u32>::try_into(arr_size).is_err() {
-                ctx.tcx().dcx().span_fatal(
-                    ctx.span(),
-                    format!(
-                        "Array {ty:?} has size {arr_size} bytes, which exceeds the .NET maximum type size of 2^32 bytes and cannot be represented as a .NET fixed-size array."
-                    ),
-                );
-            }
-            let cref = fixed_array(ctx, element, length as u64, arr_size, arr_align);
+            // An array > 2^32 bytes can't be a .NET fixed-size value type — but it is also
+            // *uninstantiable*: a 4 GiB+ value can never be materialized (on the stack, as a struct
+            // field — the enclosing struct is then also over-size and hits this same path — or on
+            // the heap, where a real ~128 TB allocation OOMs exactly as it would natively). So the
+            // type only ever appears at the type level: `size_of`/`align_of` read rustc's
+            // `layout_of` (the true size, below), and `&[T; N]`/`Box<[T; N]>` lower to pointers
+            // (size-agnostic, and array indexing is pointer arithmetic in element strides — it
+            // never reads the array's declared .NET size). We therefore lower it to a placeholder
+            // fixed array whose .NET `.size` attribute is capped to a single element stride: the
+            // class identity is still keyed on the real `length` (so it never aliases a small
+            // array), and the capped size is never read because the value is never materialized.
+            // Faithful for every reachable use. (Previously `span_fatal` under the I3-totality
+            // assumption that this was unreachable — the rust-lang/rust coretests suite, e.g.
+            // `size_of::<[u8; isize::MAX as usize]>()`, disproves that, so it must not be fatal.
+            // This is NOT the silent-`Void`-ZST miscompile the fatal replaced: that aliased the
+            // array to a 0-byte slot that place ops then read/wrote; here the type is uninstantiable
+            // so no place op ever touches it, and `size_of` stays exact via rustc's layout.)
+            let n_arr_size = if std::convert::TryInto::<u32>::try_into(arr_size).is_err() {
+                // one element stride: >= element size (so the f0 field fits) and < 2^32 for any
+                // real element (an element that were itself over-size would recurse into this arm).
+                (arr_size / (length as u64).max(1))
+                    .max(arr_align)
+                    .min(u64::from(u32::MAX - 1))
+            } else {
+                arr_size
+            };
+            let cref = fixed_array(ctx, element, length as u64, n_arr_size, arr_align);
             Type::ClassRef(cref)
         }
         TyKind::Alias(_) => panic!("Attempted to get the .NET type of an unmorphized type"),
@@ -772,16 +785,22 @@ fn struct_<'tcx>(
     let size = layout.layout.size().bytes();
     let size = match std::convert::TryInto::<u32>::try_into(size) {
         Ok(size) => size,
-        // I3 totality: a struct >= 2^32 bytes cannot be represented as a .NET value type.
-        // Clamping to `u32::MAX` (the old behaviour) silently mis-lays-out the type, so fail loud.
-        // Unreachable on real code (rustc allows the layout up to obj_size_bound = 1<<61, but such a
-        // type is uninstantiable and absent from std/test/cargo_tests).
-        Err(_) => ctx.tcx().dcx().span_fatal(
-            ctx.span(),
-            format!(
-                "Struct {adt_ty:?} has size {size} bytes, which exceeds the .NET maximum type size of 2^32 bytes. This type cannot be represented as a .NET value type."
-            ),
-        ),
+        // A struct > 2^32 bytes — same reasoning as the over-size array arm above: such a value is
+        // *uninstantiable* (you can never materialize a 4 GiB+ value type), so it only ever appears
+        // at the type level, where `size_of`/`align_of` read rustc's `layout_of` (the true size).
+        // We lower it to a placeholder whose .NET `.size` is capped just past the last field rather
+        // than `span_fatal`. The field that makes the struct over-size is itself an over-size type
+        // and so was already placeholdered (its .NET extent is small), so every field's slot fits
+        // under the capped size. (Was `span_fatal` on the assumption this is unreachable — the
+        // rust-lang/rust coretests suite disproves it: `ptr::align_offset`'s
+        // `HugeSize([u8; isize::MAX - 1])` is exactly this. This is NOT the old silent `u32::MAX`
+        // clamp that mis-laid-out an *instantiated* type: the type here is never materialized, so
+        // the capped .NET size is never read — `size_of` stays exact via rustc's layout.)
+        Err(_) => {
+            let max_field_off = fields.iter().filter_map(|(_, _, o)| *o).max().unwrap_or(0) as u64;
+            let align_b = layout.layout.align().abi.bytes().max(1);
+            (max_field_off + align_b).min(u64::from(u32::MAX - 1)) as u32
+        }
     };
     let has_nonverlaping_layout = unique_checks.len() == fields.len();
     ClassDef::new(
