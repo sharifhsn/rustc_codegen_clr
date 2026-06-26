@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# rcc-debug — runtime debugging framework for the rustc_codegen_clr backend.
+#
+# The hard class of bug in this backend is a RUNTIME divergence (AccessViolation, wrong
+# output) where the *static* CIL looks internally consistent. Reading the `.il` cannot
+# tell you which branch ran, what value a niche/discriminant actually held, or where a
+# pointer went bad. This tool bridges that static→runtime gap. The techniques here cracked
+# the regex `meta::Regex` AV after static analysis had stalled for an entire session.
+#
+# Subcommands:
+#   rcc-debug stack  <crate_dir>                  # run; on crash print the demangled managed stack
+#   rcc-debug trace  <crate_dir> <fn_substr>      # TRACE_FN: runtime block-entry trace (which branch ran)
+#   rcc-debug val    <crate_dir> <fn_substr>      # TRACE_VAL: runtime SwitchInt discriminant values
+#   rcc-debug diff   <crate_dir>                  # native-vs-backend output differential (the oracle)
+#   rcc-debug vendor <crate> <version> [dst]      # vendor a registry crate for instrumentation (see below)
+#
+# Backend runtime hooks (env vars, read at codegen — see src/assembly.rs / src/terminator/mod.rs):
+#   TRACE_FN=<substr>   inject `Console.WriteLine(">>T bb<N> <fn>")` at every basic-block entry of any
+#                       fn whose MANGLED name contains <substr>. Fires at RUNTIME, so it is immune to
+#                       cargo-dotnet's discarded-warm-pass / bin-CU codegen-placement issues that defeat
+#                       the codegen-time DUMP_MIR (mirtool). The LAST line before a crash = the crash block.
+#   TRACE_VAL=<substr>  print the runtime SwitchInt discriminant (`>>V switch <fn> = <value>`) — the direct
+#                       answer to "what value does the miscompiled branch actually see?" (e.g. a niche tag).
+#
+# DIFFERENTIAL SOURCE INSTRUMENTATION (the decisive technique — observe real pointer/niche bytes):
+#   Registry sources are re-extracted on Cargo.lock delete, so in-place edits are unreliable. Instead:
+#     1. `rcc-debug vendor regex-automata 0.4.9 /tmp/ra-dbg`   (copies + strips the checksum)
+#     2. add to the repro's Cargo.toml:  [patch.crates-io]\n  regex-automata = { path = "/tmp/ra-dbg" }
+#     3. edit /tmp/ra-dbg, sprinkling `std::eprintln!("RCC ... {}", <bytes>)` at suspect sites
+#     4. run native (truth) and `CARGO_DOTNET_BACKEND=native` (backend); diff the printed values.
+#   GOTCHA — PIN THE VERSION (`=0.4.9`) in the repro: `0.4` re-resolves to a different patch release with
+#   a DIFFERENT code path (this caused a multi-hour misdiagnosis: 0.4.9 builds NO prefilter for `[a-o]`
+#   (Core.pre=None) while 0.4.14 does (Core.pre=Some) — completely different crash mechanisms).
+#   To read a niche byte from a `&T`:  unsafe { *(&v as *const T as *const u8).add(<niche_offset>) }.
+set -uo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.dotnet:$PATH"
+export DOTNET_ROOT="${DOTNET_ROOT:-$HOME/.dotnet}"
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-nightly-2026-06-17}"
+CD="$REPO/feasibility/cargo-dotnet"
+
+usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+[ $# -lt 2 ] && usage
+CMD="$1"; CRATE="$2"; FILTER="${3:-}"
+
+run_backend() { rm -rf "$CRATE/target"; timeout 300 env "$@" CARGO_DOTNET_BACKEND=native "$CD" run "$CRATE" 2>&1; }
+
+case "$CMD" in
+  stack)
+    run_backend | grep -E "AccessViol|Fatal|Unhandled|^   at MainModule" \
+      | sed -E "s/_lsbra_[a-f0-9]+_rsbra_//g; s/\(.*//" | head -30 ;;
+  trace)
+    [ -z "$FILTER" ] && usage
+    run_backend TRACE_FN="$FILTER" | grep -E ">>T|AccessViol|Fatal|^   at MainModule" \
+      | sed -E "s/_lsbra_[a-f0-9]+_rsbra_//g; s/\(.*//" ;;
+  val)
+    [ -z "$FILTER" ] && usage
+    run_backend TRACE_FN="$FILTER" TRACE_VAL="$FILTER" | grep -E ">>T|>>V|^[0-9-]+$|AccessViol|Fatal" ;;
+  diff)
+    if [ -x /tmp/diff_oracle.sh ]; then bash /tmp/diff_oracle.sh "$CRATE"
+    else echo "diff_oracle.sh not at /tmp; run native rustc vs CARGO_DOTNET_BACKEND=native and compare"; fi ;;
+  vendor)
+    VER="${3:?usage: vendor <crate> <version> [dst]}"; DST="${4:-/tmp/$CRATE-dbg}"
+    SRC="$(find "$HOME/.cargo/registry/src" -maxdepth 1 -type d -name "$CRATE-$VER" | head -1)"
+    [ -z "$SRC" ] && { echo "not found in registry: $CRATE-$VER (run a build that uses it first)"; exit 1; }
+    rm -rf "$DST"; cp -r "$SRC" "$DST"; chmod -R u+w "$DST"; rm -f "$DST/.cargo-ok" "$DST/.cargo_vcs_info.json"
+    echo "vendored -> $DST"
+    echo "add to the repro Cargo.toml:"; printf '  [patch.crates-io]\n  %s = { path = "%s" }\n' "$CRATE" "$DST" ;;
+  *) usage ;;
+esac

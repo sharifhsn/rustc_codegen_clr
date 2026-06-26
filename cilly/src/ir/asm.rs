@@ -2322,6 +2322,29 @@ impl Assembly {
         self.call_root(mref, &[message], IsPure::NOT)
     }
 
+    /// Builds a root that writes the integer `val` (widened to i64) to the console — for runtime value
+    /// tracing (e.g. a `SwitchInt` discriminant / niche tag). `signed` selects sign- vs zero-extension.
+    /// Used by the `TRACE_VAL` debug hook (see `src/terminator/mod.rs::handle_switch`).
+    pub fn debug_val(&mut self, val: Interned<CILNode>, signed: bool) -> Interned<CILRoot> {
+        let class = ClassRef::console(self);
+        let name = self.alloc_string("WriteLine");
+        let signature = self.sig([Type::Int(Int::I64)], Type::Void);
+        let mref = self.alloc_methodref(MethodRef::new(
+            class,
+            name,
+            signature,
+            MethodKind::Static,
+            vec![].into(),
+        ));
+        let extend = if signed {
+            ExtendKind::SignExtend
+        } else {
+            ExtendKind::ZeroExtend
+        };
+        let i64val = self.int_cast(val, Int::I64, extend);
+        self.call_root(mref, &[i64val], IsPure::NOT)
+    }
+
     /// Builds a root that throws a new `Exception` with message `msg`.
     pub fn throw_msg(&mut self, msg: &str) -> Interned<CILRoot> {
         let class = ClassRef::exception(self);

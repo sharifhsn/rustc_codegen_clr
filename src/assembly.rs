@@ -293,9 +293,24 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     // the first failure and, after assembling the blocks, replace the *whole* method body with a
     // single throwing stub (no branches → always-valid IL). The method then throws if ever called.
     let mut compile_failed: Option<String> = None;
+    // TRACE_FN=<substr>: inject a runtime `Console.WriteLine` at each basic-block entry (and at every
+    // `SwitchInt`, via `handle_switch`) for any function whose (mangled) name contains <substr>. Unlike
+    // `DUMP_MIR` (which dumps at *codegen* time and is blind to which cargo-dotnet build pass actually
+    // runs), this fires at *runtime*, so it reveals the actually-executed control-flow path — exactly the
+    // static→runtime gap that defeats hand-reading the `.il`. Output is greppable via the ">>T" prefix.
+    // Keep the filter narrow (one type/fn) to avoid flooding hot loops. See feasibility/rcc-debug.
+    let trace_this_fn = std::env::var("TRACE_FN")
+        .ok()
+        .is_some_and(|f| !f.is_empty() && name.contains(f.as_str()));
+    // Compact, stable per-function tag for trace lines (tail of the mangled name fits the symbol identity).
+    let trace_tag: String = name.chars().rev().take(48).collect::<String>().chars().rev().collect();
     // Used for type-checking the CIL to ensure its validity.
     for (last_bb_id, block_data) in blocks.into_iter().enumerate() {
         let mut trees: Vec<Root> = Vec::new();
+        if trace_this_fn {
+            let dbg = ctx.debug_msg(&format!(">>T bb{last_bb_id} {trace_tag}"));
+            trees.push(dbg);
+        }
         for statement in &block_data.statements {
             if *crate::config::INSERT_MIR_DEBUG_COMMENTS {
                 let msg = rustc_middle::ty::print::with_no_trimmed_paths!(format!("{statement:?}"));

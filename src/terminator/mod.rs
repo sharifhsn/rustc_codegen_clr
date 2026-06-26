@@ -824,6 +824,24 @@ fn handle_switch<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Vec<Root> {
     let mut trees = Vec::new();
+    // TRACE_VAL=<substr>: print the runtime `SwitchInt` discriminant (the value the branch actually
+    // sees — a niche/enum tag) for any function whose (mangled) name contains <substr>. This is the
+    // direct answer to "what value does the miscompiled branch read?" that the static `.il` can't give.
+    // Pairs with TRACE_FN (block trace). Greppable via ">>V". See feasibility/rcc-debug.
+    if let Ok(filter) = std::env::var("TRACE_VAL") {
+        if !filter.is_empty() {
+            let sym = ctx.tcx().symbol_name(ctx.instance()).name.to_string();
+            if sym.contains(filter.as_str()) {
+                let tail: String = sym.chars().rev().take(40).collect::<String>();
+                let tail: String = tail.chars().rev().collect();
+                let tag = ctx.debug_msg(&format!(">>V switch {tail} ="));
+                trees.push(tag);
+                let signed = matches!(ty.kind(), TyKind::Int(_));
+                let pv = ctx.debug_val(discr, signed);
+                trees.push(pv);
+            }
+        }
+    }
     for (value, target) in switch.iter() {
         //ops.extend(CILOp::debug_msg("Switchin"));
 
