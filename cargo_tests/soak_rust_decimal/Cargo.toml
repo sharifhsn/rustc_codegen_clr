@@ -1,7 +1,10 @@
 [package]
 name = "soak_rust_decimal"
-version = "0.1.0"
+version = "0.0.0"
 edition = "2021"
 [dependencies]
-rust_decimal = "1.42"
+rust_decimal = "1"
+[[bin]]
+name = "soak_rust_decimal"
+path = "src/main.rs"
 [workspace]

@@ -1,10 +1,9 @@
 [package]
-name = "soak_itertools"
+name = "soak_compute"
 version = "0.0.0"
 edition = "2021"
 [dependencies]
-itertools = "0.13"
 [[bin]]
-name = "soak_itertools"
+name = "soak_compute"
 path = "src/main.rs"
 [workspace]

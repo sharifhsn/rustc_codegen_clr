@@ -1,10 +1,11 @@
 [package]
-name = "soak_itertools"
+name = "soak_num_bigint"
 version = "0.0.0"
 edition = "2021"
 [dependencies]
-itertools = "0.13"
+num-bigint = "0.4"
+num-traits = "0.2"
 [[bin]]
-name = "soak_itertools"
+name = "soak_num_bigint"
 path = "src/main.rs"
 [workspace]

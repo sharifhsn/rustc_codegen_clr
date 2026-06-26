@@ -1,10 +1,10 @@
 [package]
-name = "soak_itertools"
+name = "soak_rayon"
 version = "0.0.0"
 edition = "2021"
 [dependencies]
-itertools = "0.13"
+rayon = "1"
 [[bin]]
-name = "soak_itertools"
+name = "soak_rayon"
 path = "src/main.rs"
 [workspace]

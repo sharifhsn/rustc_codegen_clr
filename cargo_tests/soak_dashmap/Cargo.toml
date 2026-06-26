@@ -1,10 +1,10 @@
 [package]
-name = "soak_itertools"
+name = "soak_dashmap"
 version = "0.0.0"
 edition = "2021"
 [dependencies]
-itertools = "0.13"
+dashmap = "5"
 [[bin]]
-name = "soak_itertools"
+name = "soak_dashmap"
 path = "src/main.rs"
 [workspace]
