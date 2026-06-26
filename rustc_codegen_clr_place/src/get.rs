@@ -229,6 +229,34 @@ fn place_elem_get<'a>(
             }
         }
        
+        // A `Subslice` projection read by value. Only a SIZED result can be loaded: on an array base
+        // `[T; N]` the projection `arr[from..to]` (from_end == false) has type `[T; to - from]`, a
+        // fixed-size sub-array. A slice base (`[T]`) is unsized and only ever appears under a `Ref`
+        // (handled in address.rs::Subslice), never as a by-value get. Surfaced by alloctests
+        // slice-pattern bindings (e.g. `let [_, a, b, c, ..] = arr`).
+        PlaceElem::Subslice { from, to, from_end } => {
+            let curr_ty = curr_type
+                .as_ty()
+                .expect("INVALID PLACE: subslice of an enum variant");
+            match (curr_ty.kind(), from_end) {
+                (TyKind::Array(element, _), false) => {
+                    let element = ctx.monomorphize(*element);
+                    let elem_type = ctx.type_from_cache(element);
+                    // addr = base + from * stride
+                    let addr = ctx.cast_ptr(addr_calc, elem_type);
+                    let from_node = ctx.alloc_node(cilly::Const::USize(*from));
+                    let addr = ctx.offset(addr, from_node, elem_type);
+                    // Load the `[element; to - from]` sub-array value.
+                    let sub_ty = Ty::new_array(ctx.tcx(), element, to - from);
+                    let sub_type = ctx.type_from_cache(sub_ty);
+                    let addr = ctx.cast_ptr(addr, sub_type);
+                    ctx.load(addr, sub_type)
+                }
+                _ => rustc_middle::ty::print::with_no_trimmed_paths! {
+                    todo!("Subslice get {place_elem:?} on base {curr_ty} not yet supported")
+                },
+            }
+        }
         _ => todo!("Can't handle porojection {place_elem:?} in get"),
     }
 }
