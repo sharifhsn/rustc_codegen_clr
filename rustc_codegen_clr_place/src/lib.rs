@@ -96,12 +96,21 @@ pub fn place_address<'a>(
     let place_ty = ctx.monomorphize(place_ty).ty;
 
     let layout = ctx.layout_of(place_ty);
-    if layout.is_zst() {
-        let place_type = ctx.type_from_cache(place_ty);
-        let node = ctx.alloc_node(Const::USize(layout.align.abi.bytes()));
-        return ctx.cast_ptr(node, place_type);
-    }
+    // A *free-standing* ZST place (a ZST local with no projection) has no storage, so a dangling
+    // but correctly-aligned pointer is the right answer (matching `NonNull::dangling`). But this
+    // must NOT be applied to a PROJECTED ZST place — the address of `struct.zst_field` /
+    // `(*ptr).zst_field` is a real, offset-correct pointer (only *dereferencing* it is a no-op),
+    // and code relies on that: e.g. `Arc::as_ptr` is `&raw (*inner).data` for a ZST `data` field,
+    // a handle that `Arc::from_raw` reverses by subtracting the field offset. Short-circuiting a
+    // projected ZST place to a dangling sentinel made `Arc<ZST>`/`Waker::from(Arc<W>)`
+    // AccessViolate. Projected places fall through to the projection machinery below (the final
+    // ZST field is handled by `field_address`, which computes `base + offset`).
     if place.projection.is_empty() {
+        if layout.is_zst() {
+            let place_type = ctx.type_from_cache(place_ty);
+            let node = ctx.alloc_node(Const::USize(layout.align.abi.bytes()));
+            return ctx.cast_ptr(node, place_type);
+        }
         let loc_ty = ctx.monomorphize(ctx.body().local_decls[place.local].ty);
         if pointer_to_is_fat(loc_ty, ctx.tcx(), ctx.instance()) {
             local_get(place.local.as_usize(), ctx.body(), ctx)
@@ -109,6 +118,29 @@ pub fn place_address<'a>(
             local_address(place.local.as_usize(), ctx.body(), ctx)
         }
     } else {
+        // A projected ZST place keeps the dangling sentinel UNLESS it ends in a `Field` projection:
+        // the address of a ZST field of a (non-ZST) container is a real, offset-correct pointer that
+        // code round-trips (`Arc::as_ptr` = `&raw (*inner).data`), handled by `field_address`. Other
+        // ZST projections (Index / Deref / Downcast) keep the sentinel — their address is never used
+        // as a handle, and routing them through the general machinery would surface ZST paths the
+        // blanket short-circuit historically masked.
+        if layout.is_zst() {
+            // Only a `Field` reached through `Deref`s alone (`&s.z` = `[Field]`, `Arc::as_ptr` =
+            // `[Deref, Field]`) gets the real base+offset address — `field_address` handles the final
+            // ZST field, and the `Deref`-only body cannot hit the field-of-non-object paths the
+            // blanket short-circuit historically masked. Every other ZST place keeps the dangling
+            // sentinel (its address is never used as a round-trip handle).
+            let (head, body) = slice_head(place.projection);
+            let field_of_derefs = matches!(head, rustc_middle::mir::PlaceElem::Field(..))
+                && body
+                    .iter()
+                    .all(|e| matches!(e, rustc_middle::mir::PlaceElem::Deref));
+            if !field_of_derefs {
+                let place_type = ctx.type_from_cache(place_ty);
+                let node = ctx.alloc_node(Const::USize(layout.align.abi.bytes()));
+                return ctx.cast_ptr(node, place_type);
+            }
+        }
         let (mut addr_calc, mut ty) = local_body(place.local.as_usize(), ctx);
 
         ty = ctx.monomorphize(ty);

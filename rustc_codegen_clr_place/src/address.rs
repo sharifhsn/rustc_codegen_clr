@@ -90,6 +90,25 @@ fn field_address<'a>(
                 pointer_to_is_fat(field_ty, ctx.tcx(), ctx.instance()),
             ) {
                 (false, false) => {
+                    // A ZST field is ELIDED from the .NET struct (type.rs skips `Void` fields — .NET
+                    // has no zero-size fields), so there is no field to `ldflda`; doing so yields a
+                    // dangling sentinel. But the field's ADDRESS is still a real, offset-correct
+                    // pointer in Rust (`base + field_offset`) and is used as such — e.g.
+                    // `Arc::as_ptr` is `&raw (*inner).data` for a ZST `data` field, a handle that
+                    // `Arc::from_raw` reverses by subtracting the same offset. Returning the dangling
+                    // ldflda value made `Arc<ZST>`/`Waker::from(Arc<W>)` AccessViolate. Compute the
+                    // address from the layout instead (mirrors how raw `ptr.add(n) as *ZST` works).
+                    let field_type = ctx.type_from_cache(field_ty);
+                    if field_type == Type::Void {
+                        let offset = FieldOffsetIterator::fields(
+                            ctx.layout_of(curr_type).layout.0.0.clone(),
+                        )
+                        .nth(field_index as usize)
+                        .expect("Field index not in field offset iterator");
+                        let base = ctx.cast_ptr(addr_calc, Type::Int(Int::U8));
+                        let base = ctx.biop(base, Const::USize(u64::from(offset)), BinOp::Add);
+                        return ctx.cast_ptr(base, Type::Void);
+                    }
                     let field_desc = field_descrptor(curr_type, field_index, ctx);
                     ctx.ld_field_addr(addr_calc, field_desc)
                 }
