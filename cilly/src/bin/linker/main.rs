@@ -620,7 +620,12 @@ fn bootstrap_source(fpath: &Path, output_file_path: &str, jumpstart_cmd: &str) -
         has_native_companion = *NATIVE_PASSTROUGH,
         has_pdb = match *ILASM_FLAVOUR {
             IlasmFlavour::Clasic => false,
-            IlasmFlavour::Modern => true,
+            // Reflect whether ilasm actually produced a PDB rather than assuming Modern always
+            // does. For very large assemblies (e.g. the rust-lang/rust `coretests` harness, ~5M IL
+            // lines) ilasm's PDB writer fails and `assemble_file` falls back to assembling without
+            // `-debug`, so no `.pdb` exists. The launcher must then embed/refresh no PDB instead of
+            // `include_bytes!`-ing a missing file (which is a hard compile error in the launcher).
+            IlasmFlavour::Modern => fpath.with_extension("pdb").exists(),
         },
         pdb_file = match *ILASM_FLAVOUR {
             IlasmFlavour::Clasic => String::new(),

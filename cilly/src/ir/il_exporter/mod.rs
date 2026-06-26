@@ -1379,26 +1379,43 @@ impl ILExporter {
 #[cfg(not(target_os = "windows"))]
 fn assemble_file(exe_out: &Path, il_path: &Path, is_lib: bool) {
     let asm_type = if is_lib { "-dll" } else { "-exe" };
-    let mut cmd = std::process::Command::new(ILASM_PATH.clone());
-    cmd.arg(il_path)
-    .arg(format!("-output:{exe_out}", exe_out = exe_out.to_string_lossy()))
-    .arg("-debug")
-    .arg("-OPTIMIZE")
-    .arg(asm_type)
-    // .arg("-FOLD") saves up on space, consider enabling.
-    ;
-    if *ILASM_FLAVOUR == IlasmFlavour::Clasic {
-        // Limit the memory usage of mono
-        cmd.env("MONO_GC_PARAMS", "soft-heap-limit=500m");
+    let run = |debug: bool| {
+        let mut cmd = std::process::Command::new(ILASM_PATH.clone());
+        cmd.arg(il_path)
+            .arg(format!("-output:{exe_out}", exe_out = exe_out.to_string_lossy()))
+            .arg("-OPTIMIZE")
+            .arg(asm_type);
+        // .arg("-FOLD") saves up on space, consider enabling.
+        if debug {
+            cmd.arg("-debug");
+        }
+        if *ILASM_FLAVOUR == IlasmFlavour::Clasic {
+            // Limit the memory usage of mono
+            cmd.env("MONO_GC_PARAMS", "soft-heap-limit=500m");
+        }
+        let out = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        (cmd, stdout, stderr)
+    };
+    let failed = |stdout: &str, stderr: &str| {
+        stderr.contains("\nError\n") || stderr.contains("FAILURE") || stdout.contains("FAILURE")
+    };
+    let (mut cmd, mut stdout, mut stderr) = run(true);
+    // ilasm can assemble the whole module and write the PE, then fail *only* when writing the PDB
+    // (its debug-info writer chokes on very large assemblies — the rust-lang/rust `coretests`
+    // harness is ~5M IL lines and hits `Failed to write PDB file, error code=0x80070057`). The PE
+    // is valid and PDBs are optional, so retry without `-debug` to still get a runnable assembly.
+    // Gated on "Writing PE file" so a genuine IL error (which fails before the PE) is never masked.
+    if failed(&stdout, &stderr)
+        && (stdout.contains("Failed to write PDB") || stderr.contains("Failed to write PDB"))
+        && stdout.contains("Writing PE file")
+    {
+        (cmd, stdout, stderr) = run(false);
     }
-    let out = cmd.output().unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !(stderr.contains("\nError\n") || stderr.contains("FAILURE") || stdout.contains("FAILURE")),
-        "stdout:{} stderr:{} cmd:{cmd:?}",
-        stdout,
-        String::from_utf8_lossy(&out.stderr)
+        !failed(&stdout, &stderr),
+        "stdout:{stdout} stderr:{stderr} cmd:{cmd:?}"
     );
 }
 #[cfg(target_os = "windows")]
