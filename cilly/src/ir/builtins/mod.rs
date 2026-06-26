@@ -352,7 +352,24 @@ fn insert_rust_realloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, u
         patcher.insert(name, Box::new(generator));
     } else {
         let generator = move |_, asm: &mut Assembly| {
+            // realloc = AlignedAlloc + copy + AlignedFree, NOT `NativeMemory.AlignedRealloc`.
+            // `AlignedRealloc` THROWS `OutOfMemoryException` when the requested size is unsatisfiable
+            // (e.g. a `Vec<u8>` grown to `isize::MAX` bytes), which aborts the process; `AlignedAlloc`
+            // instead returns NULL there — exactly like `__rust_alloc` above — so `try_reserve`/
+            // `GlobalAlloc::grow` can report `AllocError` rather than aborting. The new block is also
+            // only filled and the old block freed when the allocation SUCCEEDS: the
+            // `GlobalAlloc::realloc` contract requires the old block to stay valid on failure (the
+            // previous unconditional copy+free would memcpy into NULL and free the still-owned old
+            // block). `min(old, new)` bytes are copied so a shrink never overruns the smaller block.
+            // Surfaced by alloctests `{vec,string,vec_deque}::test_try_reserve`.
+            let void_ptr = asm.nptr(Type::Void);
             let ptr = load_ptr_arg(asm, 0);
+            let old_size = asm.alloc_node(CILNode::LdArg(1));
+            let old_size = asm.alloc_node(CILNode::IntCast {
+                input: old_size,
+                target: Int::USize,
+                extend: super::cilnode::ExtendKind::ZeroExtend,
+            });
             let align = load_align_usize(asm, 2);
             let new_size = asm.alloc_node(CILNode::LdArg(3));
             let new_size = asm.alloc_node(CILNode::IntCast {
@@ -360,25 +377,77 @@ fn insert_rust_realloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, u
                 target: Int::USize,
                 extend: super::cilnode::ExtendKind::ZeroExtend,
             });
-            let void_ptr = asm.nptr(Type::Void);
-            let sig = asm.sig(
-                [void_ptr, Type::Int(Int::USize), Type::Int(Int::USize)],
-                void_ptr,
-            );
-            let aligned_realloc = asm.alloc_string("AlignedRealloc");
+            // loc0 = NativeMemory.AlignedAlloc(new_size, align)   (NULL on unsatisfiable size)
             let native_mem = ClassRef::native_mem(asm);
-            let call_method = asm.alloc_methodref(MethodRef::new(
+            let alloc_name = asm.alloc_string("AlignedAlloc");
+            let alloc_sig = asm.sig([Type::Int(Int::USize), Type::Int(Int::USize)], void_ptr);
+            let aligned_alloc = asm.alloc_methodref(MethodRef::new(
                 native_mem,
-                aligned_realloc,
-                sig,
+                alloc_name,
+                alloc_sig,
                 MethodKind::Static,
                 [].into(),
             ));
-            let alloc = asm.alloc_node(CILNode::call(call_method, [ptr, new_size, align]));
-            let ret = asm.alloc_root(CILRoot::Ret(alloc));
+            // cap guard, mirroring `__rust_alloc`: `AlignedAlloc` OOM-THROWS for sizes beyond
+            // `ALLOC_CAP` (it does not return NULL), so short-circuit to NULL *without calling it*
+            // when `new_size` exceeds the cap. (block 0 -> block 2 on `new_size > ALLOC_CAP`.)
+            let cap = asm.alloc_node(Const::USize(ALLOC_CAP));
+            let cap_check = asm.alloc_root(CILRoot::Branch(Box::new((
+                2,
+                0,
+                Some(super::cilroot::BranchCond::Gt(
+                    new_size,
+                    cap,
+                    super::cilroot::CmpKind::Unsigned,
+                )),
+            ))));
+            let buff = asm.alloc_node(CILNode::call(aligned_alloc, [new_size, align]));
+            let st_buff = asm.alloc_root(CILRoot::StLoc(0, buff));
+            // if the new block is NULL, return NULL WITHOUT touching the old block (block 0 -> 2).
+            let buff_ld = asm.alloc_node(CILNode::LdLoc(0));
+            let buff_usize = asm.cast_ptr_to(buff_ld, Type::Int(Int::USize));
+            let alloc_fail = asm.alloc_root(CILRoot::Branch(Box::new((
+                2,
+                0,
+                Some(BranchCond::False(buff_usize)),
+            ))));
+            // copy_len = min(old_size, new_size)
+            let lt = asm.alloc_node(CILNode::BinOp(old_size, new_size, super::cilnode::BinOp::LtUn));
+            let copy_len = asm.select(Type::Int(Int::USize), old_size, new_size, lt);
+            let buff_dst = asm.alloc_node(CILNode::LdLoc(0));
+            let copy = asm.alloc_root(CILRoot::CpBlk(Box::new((buff_dst, ptr, copy_len))));
+            // free the old block (only reached on success)
+            let free_name = asm.alloc_string("AlignedFree");
+            let free_sig = asm.sig([void_ptr], Type::Void);
+            let aligned_free = asm.alloc_methodref(MethodRef::new(
+                native_mem,
+                free_name,
+                free_sig,
+                MethodKind::Static,
+                [].into(),
+            ));
+            let free_old = asm.alloc_root(CILRoot::call(aligned_free, [ptr]));
+            // explicit goto block 1: block 0 ends in a (non-terminating) `call`, so without this it
+            // would fall through into block 2 (`ret NULL`) and a SUCCESSFUL realloc would return NULL.
+            let goto_ok = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
+            // block 1: success -> return the new block.
+            let ret_buff = asm.alloc_node(CILNode::LdLoc(0));
+            let ret_ok = asm.alloc_root(CILRoot::Ret(ret_buff));
+            // block 2: failure (cap exceeded or AlignedAlloc returned NULL) -> return NULL; the old
+            // block is left allocated, as `GlobalAlloc::realloc` requires.
+            let null = asm.alloc_node(Const::USize(0));
+            let ret_null = asm.alloc_root(CILRoot::Ret(null));
             MethodImpl::MethodBody {
-                blocks: vec![BasicBlock::new(vec![ret], 0, None)],
-                locals: vec![],
+                blocks: vec![
+                    BasicBlock::new(
+                        vec![cap_check, st_buff, alloc_fail, copy, free_old, goto_ok],
+                        0,
+                        None,
+                    ),
+                    BasicBlock::new(vec![ret_ok], 1, None),
+                    BasicBlock::new(vec![ret_null], 2, None),
+                ],
+                locals: vec![(None, asm.alloc_type(void_ptr))],
             }
         };
         patcher.insert(name, Box::new(generator));

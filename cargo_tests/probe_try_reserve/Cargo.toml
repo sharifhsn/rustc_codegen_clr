@@ -1,0 +1,8 @@
+[package]
+name = "probe_try_reserve"
+version = "0.1.0"
+edition = "2021"
+[[bin]]
+name = "probe_try_reserve"
+path = "src/main.rs"
+[workspace]
