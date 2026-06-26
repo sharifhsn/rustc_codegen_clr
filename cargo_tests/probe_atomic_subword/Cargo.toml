@@ -1,0 +1,8 @@
+[package]
+name = "probe_atomic_subword"
+version = "0.1.0"
+edition = "2021"
+[[bin]]
+name = "probe_atomic_subword"
+path = "src/main.rs"
+[workspace]

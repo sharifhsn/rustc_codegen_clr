@@ -387,46 +387,35 @@ pub fn compare_exchange(
     comaprand: Interned<CILNode>,
 ) -> Interned<CILNode> {
     match int.size().unwrap_or(8) {
-        // u16 is buggy :(. TODO: fix it.
+        // Sub-word (u8/i8/u16/i16) CAS via the COMPARAND-CHECKED `_correct` builtin. The old path
+        // called `atomic_cmpxchng{8,16}_i32`, which splices the new sub-word UNCONDITIONALLY — it
+        // never reads the comparand, so it is an atomic *exchange*, not a CAS. As the inner step of
+        // the re-reading RMW loop in `generate_atomic` an unconditional exchange writes every
+        // iteration, so the value oscillates and `loc0 != loc1` never clears: e.g.
+        // `AtomicBool::fetch_or(false)` / `AtomicU8::fetch_*` on any nonzero atom spins FOREVER
+        // (the coretests `atomic::atomic_access_bool` hang). `_correct` only writes when the
+        // observed sub-word equals the comparand (returning the genuine old value otherwise), so
+        // the loop converges. Same builtin + signature + (addr, comparand, new) arg order that
+        // `intrinsics::atomic::cxchg` already uses for Rust's `compare_exchange`. `addr` stays the
+        // `int_ty&` argument as-is — the builtin word-aligns and masks internally (no `int32*`
+        // pre-cast); `value`/`comparand` are already `int_ty`. Also fixes the long-standing u16 TODO.
         1 | 2 => {
-            let compare_exchange = asm.alloc_string(format!(
-                "atomic_cmpxchng{}_i32",
+            let cmpxchng = asm.alloc_string(format!(
+                "atomic_cmpxchng{}_correct",
                 int.size().unwrap_or(8) * 8
             ));
-
-            let i32 = Type::Int(int);
-            let i32_ref = asm.nref(Type::Int(Int::I32));
-            let cmpxchng_sig = asm.sig([i32_ref, i32, i32], i32);
+            let int_ty = Type::Int(int);
+            let int_ref = asm.nref(int_ty);
+            let cmpxchng_sig = asm.sig([int_ref, int_ty, int_ty], int_ty);
             let main_mod = asm.main_module();
             let mref = asm.alloc_methodref(MethodRef::new(
                 *main_mod,
-                compare_exchange,
+                cmpxchng,
                 cmpxchng_sig,
                 MethodKind::Static,
                 vec![].into(),
             ));
-            let cast_value = asm.alloc_node(CILNode::IntCast {
-                input: value,
-                target: int,
-                extend: crate::cilnode::ExtendKind::ZeroExtend,
-            });
-            let cast_comparand = asm.alloc_node(CILNode::IntCast {
-                input: comaprand,
-                target: int,
-                extend: crate::cilnode::ExtendKind::ZeroExtend,
-            });
-            let addr = asm.alloc_node(CILNode::RefToPtr(addr));
-            let i32_tidx = asm.alloc_type(Type::Int(Int::I32));
-            let addr = asm.alloc_node(CILNode::PtrCast(
-                addr,
-                Box::new(crate::cilnode::PtrCastRes::Ptr(i32_tidx)),
-            ));
-            let res = asm.alloc_node(CILNode::call(mref, [addr, cast_value, cast_comparand]));
-            asm.alloc_node(CILNode::IntCast {
-                input: res,
-                target: int,
-                extend: crate::cilnode::ExtendKind::ZeroExtend,
-            })
+            asm.alloc_node(CILNode::call(mref, [addr, comaprand, value]))
         }
         4..=8 => {
             let compare_exchange = asm.alloc_string("CompareExchange");
