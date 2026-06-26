@@ -206,7 +206,14 @@ pub fn handle_aggregate<'tcx>(
                 // Pointer is thin, just directly assign
                 let data = handle_operand(data, ctx);
                 let ptr = ctx.nptr(ptr_tpe);
-                let data = ctx.cast_ptr(data, ptr);
+                // `ptr` is the FULL thin-pointer type (`*pointee`). `cast_ptr_to` produces a value of
+                // exactly that type; `cast_ptr` would instead WRAP `ptr` in another `Ptr(..)` (its
+                // second arg is the *pointee*), yielding `**pointee`. The bits are the same single
+                // data pointer, so it runs — but the value's *type* is one indirection too deep, and
+                // that ill-typed value, passed on (e.g. `ThinBox`'s `from_raw_parts_mut` result fed
+                // to `WithHeader::drop(value: *mut T)`), is a `CallArgTypeWrong`. This mirrors the
+                // already-correct fat-ptr DATA_PTR arm below. Surfaced by alloctests `thin_box`.
+                let data = ctx.cast_ptr_to(data, ptr);
                 return (
                     [place_set(target_location, data, ctx)].into(),
                     (place_get(target_location, ctx)),
