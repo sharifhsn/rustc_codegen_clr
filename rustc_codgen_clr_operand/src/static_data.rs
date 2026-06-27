@@ -207,6 +207,33 @@ fn alloc_default_type(alloc_id: u64, ctx: &mut MethodCompileCtx<'_, '_>) -> Type
     );
     Type::ClassRef(tpe)
 }
+/// Returns a pointer to the backing buffer of a const-allocation static, rounded up to `align` at
+/// runtime when the allocation is over-aligned (`over_aligned == align > elem_size`).
+///
+/// .NET does not guarantee >8-byte alignment for value-type *static* fields, so an over-aligned
+/// const allocation (a `#[repr(align(N>8))]` value, or the `const_allocate(_, 64)` metadata buffer
+/// behind `ThinBox::<dyn>::new_unsize_zst`) has its field over-allocated by `align` bytes (see
+/// `add_allocation`) and the usable buffer base is `align_up(field_addr, align)`. Computing it here
+/// — once, deterministically from the fixed static address — keeps the initializer's writes and
+/// every consumer's reads in agreement. For the common `align <= elem_size` case the field address
+/// is already adequately aligned, so it is returned unchanged.
+fn aligned_static_buf(
+    ctx: &mut MethodCompileCtx<'_, '_>,
+    field_desc: StaticFieldDesc,
+    align: u64,
+    over_aligned: bool,
+) -> Interned<CILNode> {
+    let base = ctx.static_addr(field_desc);
+    if !over_aligned {
+        return base;
+    }
+    // align_up(p, a) == (p + (a - 1)) & !(a - 1), computed in usize then cast back to *u8.
+    let base_int = ctx.cast_ptr_to(base, Type::Int(Int::USize));
+    let added = ctx.biop(base_int, Const::USize(align - 1), cilly::BinOp::Add);
+    let aligned = ctx.biop(added, Const::USize(!(align - 1)), cilly::BinOp::And);
+    let u8_ptr = ctx.nptr(Int::U8);
+    ctx.cast_ptr_to(aligned, u8_ptr)
+}
 /// Adds a static field and initialized for allocation represented by `alloc_id`.
 pub fn add_allocation(
     alloc_id: u64,
@@ -314,22 +341,62 @@ pub fn add_allocation(
             };
             let elem_size = elem.size().unwrap_or(8) as u64;
             let len = const_allocation.len() as u64;
+            // .NET does NOT guarantee >8-byte alignment for a value-type *static* field (a
+            // `[FieldOffset]`/classlayout `.pack` controls *instance* layout, not where the runtime
+            // places the static's storage), so an OVER-aligned const allocation — e.g. a
+            // `#[repr(align(64))]` value, or the `const_allocate(_, 64)` metadata buffer that
+            // `ThinBox::<dyn>::new_unsize_zst` const-makes-global for a 64-aligned ZST — cannot rely
+            // on the field landing 64-aligned (it lands ~8-aligned, silently corrupting any pointer
+            // round-trip that asserts alignment — the ThinBox `verify_aligned` 32/8-vs-64 failure).
+            // Fix it at RUNTIME: when `align > elem_size`, over-allocate the field by `align` bytes
+            // and return an interior pointer rounded up to `align` (see `aligned_static_buf`). For
+            // the overwhelmingly common `align <= 8` case nothing changes — no padding, no rounding.
+            let over_aligned = align > elem_size;
+            let pad = if over_aligned { align } else { 0 };
+            let arr_size = (len + pad).next_multiple_of(elem_size);
             let blob_arr = fixed_array(
                 ctx,
                 Type::Int(elem),
-                len.div_ceil(elem_size),
-                len.next_multiple_of(elem_size),
+                arr_size / elem_size,
+                arr_size,
                 elem_size,
             );
             let field_tpe = Type::ClassRef(blob_arr);
             let field_tpe_idx = ctx.alloc_type(field_tpe);
-            let alloc_name = format!(
-                "al_{}_{}_{}_{}",
-                encode(alloc_id),
-                encode(byte_hash),
-                encode(field_tpe_idx.inner().into()),
-                const_allocation.len()
-            );
+            // Content-based dedup of READ-ONLY (immutable) allocations: identical immutable
+            // allocations must share ONE backing static so `ptr::eq` on two references to the same
+            // promoted const holds — most visibly `Waker::will_wake`, which compares the addresses
+            // of two `RawWakerVTable` promotions (the `Waker::from`/`clone_waker` sites get distinct
+            // `AllocId`s for the same const). Native does this via LLVM merging identical read-only
+            // `unnamed_addr` globals; Rust permits it (const/promoted addresses are NOT guaranteed
+            // distinct). Naming a read-only alloc by its CONTENT (bytes + align + len + relocation
+            // targets) instead of its `AllocId` lets the linker's merge-by-name collapse the
+            // duplicates. The relocation targets are part of the fingerprint so two byte-identical
+            // allocations pointing at DIFFERENT functions/statics never wrongly merge. MUTABLE
+            // statics must stay distinct, so they keep the unique `AllocId` in the name.
+            let alloc_name = if const_allocation.mutability == rustc_middle::mir::Mutability::Not {
+                let relocs: Vec<(u32, u64)> = const_allocation
+                    .provenance()
+                    .ptrs()
+                    .iter()
+                    .map(|(off, prov)| (off.bytes_usize() as u32, prov.alloc_id().0.get()))
+                    .collect();
+                let content_hash = calculate_hash(&(bytes, align, const_allocation.len(), relocs));
+                format!(
+                    "ro_{}_{}_{}",
+                    encode(content_hash),
+                    encode(field_tpe_idx.inner().into()),
+                    const_allocation.len()
+                )
+            } else {
+                format!(
+                    "al_{}_{}_{}_{}",
+                    encode(alloc_id),
+                    encode(byte_hash),
+                    encode(field_tpe_idx.inner().into()),
+                    const_allocation.len()
+                )
+            };
             let name = ctx.alloc_string(alloc_name.clone());
             let field_desc = StaticFieldDesc::new(*ctx.main_module(), name, field_tpe);
             // Currently, all static fields are in one module. Consider spliting them up.
@@ -337,12 +404,15 @@ pub fn add_allocation(
             let main_module = ctx.class_mut(main_module_id);
 
             if main_module.has_static_field(name, field_desc.tpe()) {
-                return ctx.static_addr(field_desc).into();
+                return aligned_static_buf(ctx, field_desc, align, over_aligned);
             }
             ctx.add_static(field_tpe, &*alloc_name, false, main_module_id, None, false);
 
-            let ptr = ctx.static_addr(field_desc);
-            let ptr = ctx.cast_ptr(ptr, Int::U8);
+            // The runtime-aligned interior pointer is the canonical buffer base: the initializer
+            // writes (and patches relocations) at it, and every consumer reads from it, so the two
+            // always agree. `Interned` is `Copy`, so we reuse `buf` for both the init and the return.
+            let buf = aligned_static_buf(ctx, field_desc, align, over_aligned);
+            let ptr = ctx.cast_ptr(buf, Int::U8);
 
             let initialzer: MethodDefIdx =
                 allocation_initializer_method(const_allocation, &alloc_name, ctx, ptr.into(), true);
@@ -351,7 +421,7 @@ pub fn add_allocation(
             let root = ctx.alloc_root(cilly::CILRoot::call(*initialzer, []));
             ctx.add_cctor(&[root]);
 
-            ctx.static_addr(field_desc)
+            buf
         }
     }
 }
