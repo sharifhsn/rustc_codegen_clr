@@ -125,6 +125,12 @@ pub fn cosh(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
 // P/Invoke (`LIBM_FNS`), which does not resolve on macOS/Windows. Surfaced by alloctests
 // `sort::*::correct_i32_random_z{1_03,2}` (Zipf with a non-1.0 exponent), which crashed with
 // `missing method expm1`.
+//
+// The naive forms also LOSE THE SIGN OF ZERO: `exp(-0)-1 = 1-1 = +0` and `log(1+-0) = log(1) = +0`,
+// but IEEE/libm require `expm1(-0) = -0` and `log1p(-0) = -0`. Both are monotonic through the
+// origin, so `sign(result) == sign(x)` for every value in range; restoring the input's sign with
+// `CopySign` fixes the signed zero and is a no-op for all other inputs. (Needed because `f32::atanh`
+// = `0.5 * ((2x)/(1-x)).ln_1p()` and `atanh(-0)` must be `-0` — coretests `num::floats::atanh`.)
 pub fn expm1(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("expm1");
     let generator = move |_, asm: &mut Assembly| {
@@ -132,6 +138,7 @@ pub fn expm1(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let exp = Float::F64.math1(arg, asm, "Exp");
         let one = asm.alloc_node(Const::F64(HashableF64(1.0)));
         let res = asm.alloc_node(CILNode::BinOp(exp, one, BinOp::Sub));
+        let res = Float::F64.math2(res, arg, asm, "CopySign");
         let ret = asm.alloc_root(CILRoot::Ret(res));
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![ret], 0, None)],
@@ -147,6 +154,7 @@ pub fn expm1f(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let exp = Float::F32.math1(arg, asm, "Exp");
         let one = asm.alloc_node(Const::F32(HashableF32(1.0)));
         let res = asm.alloc_node(CILNode::BinOp(exp, one, BinOp::Sub));
+        let res = Float::F32.math2(res, arg, asm, "CopySign");
         let ret = asm.alloc_root(CILRoot::Ret(res));
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![ret], 0, None)],
@@ -162,6 +170,7 @@ pub fn log1p(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let one = asm.alloc_node(Const::F64(HashableF64(1.0)));
         let onepx = asm.alloc_node(CILNode::BinOp(one, arg, BinOp::Add));
         let log = Float::F64.math1(onepx, asm, "Log");
+        let log = Float::F64.math2(log, arg, asm, "CopySign");
         let ret = asm.alloc_root(CILRoot::Ret(log));
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![ret], 0, None)],
@@ -177,7 +186,100 @@ pub fn log1pf(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let one = asm.alloc_node(Const::F32(HashableF32(1.0)));
         let onepx = asm.alloc_node(CILNode::BinOp(one, arg, BinOp::Add));
         let log = Float::F32.math1(onepx, asm, "Log");
+        let log = Float::F32.math2(log, arg, asm, "CopySign");
         let ret = asm.alloc_root(CILRoot::Ret(log));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+// Inverse hyperbolic functions. Like `sinh`/`cosh`, these are libm externs (`acosh`/`asinh`/`atanh`
+// + f32 forms) that `core`/`std` reach through `cmath`; with no implementation the linker leaves
+// them unresolved and the first call throws `missing method <name>` — which unwinds the test thread
+// (caught → FAILED) or crosses a nounwind boundary (→ process abort). Surfaced by coretests
+// `num::floats::{acosh,asinh,atanh}::test_f{32,64}`. .NET has exact equivalents
+// (`System.Math.Acosh/Asinh/Atanh`, `System.MathF.*`), so map them directly via `math1` — no
+// precision-losing composition needed (unlike `expm1`/`log1p`).
+pub fn asinh(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("asinh");
+    let generator = move |_, asm: &mut Assembly| {
+        let arg = asm.alloc_node(CILNode::LdArg(0));
+        let res = Float::F64.math1(arg, asm, "Asinh");
+        let ret = asm.alloc_root(CILRoot::Ret(res));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+pub fn asinhf(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("asinhf");
+    let generator = move |_, asm: &mut Assembly| {
+        let arg = asm.alloc_node(CILNode::LdArg(0));
+        let res = Float::F32.math1(arg, asm, "Asinh");
+        let ret = asm.alloc_root(CILRoot::Ret(res));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+pub fn acosh(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("acosh");
+    let generator = move |_, asm: &mut Assembly| {
+        let arg = asm.alloc_node(CILNode::LdArg(0));
+        let res = Float::F64.math1(arg, asm, "Acosh");
+        let ret = asm.alloc_root(CILRoot::Ret(res));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+pub fn acoshf(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("acoshf");
+    let generator = move |_, asm: &mut Assembly| {
+        let arg = asm.alloc_node(CILNode::LdArg(0));
+        let res = Float::F32.math1(arg, asm, "Acosh");
+        let ret = asm.alloc_root(CILRoot::Ret(res));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+// `System.Math.Atanh` loses the sign of `-0.0` (returns `+0.0`), but IEEE/Rust require
+// `atanh(-0.0) == -0.0`. `atanh` is odd and sign-preserving across its whole domain `(-1, 1)`
+// (and the ±1→±inf / out-of-domain→NaN edges keep the input's sign too), so copying the input's
+// sign onto the result via `CopySign` restores the signed zero without changing any other value.
+// Surfaced by coretests `num::floats::atanh::test_f{32,64}` (`atanh(-0.0)` biteq `-0.0`).
+pub fn atanh(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("atanh");
+    let generator = move |_, asm: &mut Assembly| {
+        let arg = asm.alloc_node(CILNode::LdArg(0));
+        let res = Float::F64.math1(arg, asm, "Atanh");
+        let res = Float::F64.math2(res, arg, asm, "CopySign");
+        let ret = asm.alloc_root(CILRoot::Ret(res));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+pub fn atanhf(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("atanhf");
+    let generator = move |_, asm: &mut Assembly| {
+        let arg = asm.alloc_node(CILNode::LdArg(0));
+        let res = Float::F32.math1(arg, asm, "Atanh");
+        let res = Float::F32.math2(res, arg, asm, "CopySign");
+        let ret = asm.alloc_root(CILRoot::Ret(res));
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![ret], 0, None)],
             locals: vec![],
@@ -227,6 +329,12 @@ pub fn math(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     sinh(asm, patcher);
     coshf(asm, patcher);
     cosh(asm, patcher);
+    asinh(asm, patcher);
+    asinhf(asm, patcher);
+    acosh(asm, patcher);
+    acoshf(asm, patcher);
+    atanh(asm, patcher);
+    atanhf(asm, patcher);
     expm1(asm, patcher);
     expm1f(asm, patcher);
     log1p(asm, patcher);
