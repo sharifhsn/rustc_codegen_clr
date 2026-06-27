@@ -27,10 +27,8 @@ fn simd_ones_compliment(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) 
         let sig = asm[asm[mref].sig()].clone();
 
         let Some(vec_type) = sig.inputs()[0].as_simdvector() else {
-            todo!(
-                "Can't calc the ones compliment of {vec_type:?}",
-                vec_type = sig.inputs()[0]
-            )
+            // Array fallback (unsupported vector size): per-lane bitwise NOT.
+            return binop::lane_unop_body(mref, asm, &|asm, x, _, _| asm.not(x));
         };
         let elem: Type = vec_type.elem().into();
         let extension_class = vec_type.extension_class(asm);
@@ -68,10 +66,8 @@ fn simd_neg(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let sig = asm[asm[mref].sig()].clone();
 
         let Some(vec_type) = sig.inputs()[0].as_simdvector() else {
-            todo!(
-                "Can't calc the ones compliment of {vec_type:?}",
-                vec_type = sig.inputs()[0]
-            )
+            // Array fallback (unsupported vector size): negate per lane.
+            return binop::lane_unop_body(mref, asm, &|asm, x, _, _| asm.neg(x));
         };
         let elem: Type = vec_type.elem().into();
         let extension_class = vec_type.extension_class(asm);
@@ -108,10 +104,21 @@ fn simd_abs(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let sig = asm[asm[mref].sig()].clone();
 
         let Some(vec_type) = sig.inputs()[0].as_simdvector() else {
-            todo!(
-                "Can't calc simd_abs of {vec_type:?}",
-                vec_type = sig.inputs()[0]
-            )
+            // Array fallback (unsupported vector size): per-lane abs. Signed ints use the branchless
+            // `(x ^ s) - s` with `s = x >> (bits-1)` (arithmetic shift); unsigned is the identity.
+            return binop::lane_unop_body(mref, asm, &|asm, x, elem, _| match elem {
+                crate::tpe::simd::SIMDElem::Int(int) if !int.is_signed() => x,
+                crate::tpe::simd::SIMDElem::Int(int) => {
+                    let bits = int.bits().unwrap_or(64);
+                    let shift = asm.alloc_node(crate::Const::I32(i32::from(bits) - 1));
+                    let s = asm.biop(x, shift, crate::BinOp::Shr);
+                    let xs = asm.biop(x, s, crate::BinOp::XOr);
+                    asm.biop(xs, s, crate::BinOp::Sub)
+                }
+                crate::tpe::simd::SIMDElem::Float(_) => {
+                    todo!("float simd_abs (fabs) array fallback for an unsupported vector size")
+                }
+            });
         };
         let elem: Type = vec_type.elem().into();
         let extension_class = vec_type.extension_class(asm);
@@ -149,10 +156,8 @@ fn simd_vec_from_val(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {
         let sig = asm[asm[mref].sig()].clone();
         let Some(vec_type) = sig.output().as_simdvector() else {
-            todo!(
-                "Can't simd_vec_from_val  {vec_type:?}",
-                vec_type = sig.output()
-            )
+            // Array fallback (unsupported vector size): splat the scalar into every lane.
+            return binop::lane_splat_body(mref, asm);
         };
         let extension_class = vec_type.extension_class(asm);
         let extension_class = asm[extension_class].clone();
@@ -173,7 +178,33 @@ fn simd_allset(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {
         let sig = asm[asm[mref].sig()].clone();
         let Some(vec_type) = sig.output().as_simdvector() else {
-            todo!("Can't simd_allset {vec_type:?}", vec_type = sig.output())
+            // Array fallback (unsupported vector size): store all-ones into every lane.
+            let res = *sig.output();
+            let (elem_s, count) =
+                binop::simd_lane_info(res, asm).expect("simd_allset result is not a vector");
+            let elem: Type = elem_s.into();
+            let allones = match elem_s {
+                crate::tpe::simd::SIMDElem::Int(int) => {
+                    let neg1 = asm.alloc_node(crate::Const::I64(-1));
+                    asm.int_cast(neg1, int, crate::cilnode::ExtendKind::SignExtend)
+                }
+                crate::tpe::simd::SIMDElem::Float(_) => {
+                    todo!("simd_allset float array fallback for an unsupported vector size")
+                }
+            };
+            let res_ptr = asm.alloc_node(CILNode::LdLocA(0));
+            let mut roots = vec![];
+            for idx in 0..count {
+                let rp = asm.cast_ptr(res_ptr, elem);
+                let slot = asm.offset(rp, crate::Const::USize(idx), elem);
+                roots.push(asm.alloc_root(CILRoot::StInd(Box::new((slot, allones, elem, false)))));
+            }
+            let ret = asm.alloc_node(CILNode::LdLoc(0));
+            roots.push(asm.alloc_root(CILRoot::Ret(ret)));
+            return MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(roots, 0, None)],
+                locals: vec![(None, asm.alloc_type(res))],
+            };
         };
         let class = vec_type.class(asm);
         let class = asm[class].clone();

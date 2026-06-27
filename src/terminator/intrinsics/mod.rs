@@ -1147,8 +1147,8 @@ pub fn handle_intrinsic<'tcx>(
                     .as_type()
                     .expect("simd_splat works only on types!"),
             );
-            // SANITY: the result must be a SIMD vector for this lowering to be valid.
-            let _ = vec_type.as_simdvector().expect("simd_splat result must be a SIMD vector");
+            // The result is normally a managed SIMD vector, but may be the fixed-array fallback for
+            // an unsupported vector size — the `simd_vec_from_val` builtin handles both.
             let value = handle_operand(&args[0].node, ctx);
             let name = ctx.alloc_string("simd_vec_from_val");
             let main_module = ctx.main_module();

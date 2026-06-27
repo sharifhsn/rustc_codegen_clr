@@ -3,7 +3,7 @@ use crate::{
     Const, Int, Interned, MethodImpl, MethodRef, Type,
 };
 macro_rules! binop {
-    ($op_name:ident,$op_dotnet:literal) => {
+    ($op_name:ident,$op_dotnet:literal,$binop:expr) => {
         pub fn $op_name(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
             let name = asm.alloc_string(stringify!($op_name));
             let generator = move |mref: $crate::ir::Interned<$crate::ir::MethodRef>,
@@ -11,8 +11,9 @@ macro_rules! binop {
                 let sig = asm[asm[mref].sig()].clone();
 
                 let Some(comparands) = sig.inputs()[0].as_simdvector() else {
-                    let name = stringify!($op_name);
-                    todo!("Can't {name} {comparands:?} ", comparands = sig.inputs()[0])
+                    // Array fallback: an unsupported vector size (sub-64-bit / >512 / non-power-of-2)
+                    // has no managed `Vector{bits}` class, so lower the op per lane instead.
+                    return lane_binop_body(mref, asm, &|asm, l, r, _, _| asm.biop(l, r, $binop));
                 };
                 let elem: Type = comparands.elem().into();
 
@@ -48,14 +49,254 @@ macro_rules! binop {
         }
     };
 }
-binop!(simd_or, "BitwiseOr");
-binop!(simd_add, "Add");
-binop!(simd_and, "BitwiseAnd");
-binop!(simd_sub, "Subtract");
-binop!(simd_mul, "Multiply");
+binop!(simd_or, "BitwiseOr", BinOp::Or);
+binop!(simd_add, "Add", BinOp::Add);
+binop!(simd_and, "BitwiseAnd", BinOp::And);
+binop!(simd_sub, "Subtract", BinOp::Sub);
+binop!(simd_mul, "Multiply", BinOp::Mul);
 // NOTE: `simd_div` is NOT a `binop!`: `System.Runtime.Intrinsics.Vector{bits}` exposes no generic
 // static `Divides`/`Divide<T>` for every element type (the old `"Divides"` mapping would
 // `MissingMethodException`). It is lowered per-lane instead — see `register_value_lane_ops`.
+/// Recover `(element, lane count)` for a SIMD operand whose lowered type is EITHER a
+/// `Type::SIMDVector` (the managed-vector case for 64/128/256/512-bit widths) OR the fixed-array
+/// fallback used for unsupported sizes — sub-64-bit (`Simd<i8,4>`), >512-bit, or non-power-of-two
+/// (see `rustc_codegen_clr_type::r#type::get_type`). The array fallback is a class with a single
+/// field `f0` of the element type, sized to hold `count` contiguous elements, so the lane count is
+/// `byte_size / sizeof(element)`. The two reps share an identical contiguous memory layout, which
+/// is exactly why the spill-and-index per-lane body below works unchanged on either.
+pub(super) fn simd_lane_info(tpe: Type, asm: &Assembly) -> Option<(SIMDElem, u64)> {
+    if let Some(v) = tpe.as_simdvector() {
+        return Some((v.elem(), u64::from(v.count())));
+    }
+    let Type::ClassRef(cref) = tpe else {
+        return None;
+    };
+    let def = asm.class_ref_to_def(cref)?;
+    let def = &asm[def];
+    let (elem_tpe, _, _) = *def.fields().first()?;
+    let elem: SIMDElem = elem_tpe.try_into().ok()?;
+    let total = u64::from(def.explict_size()?.get());
+    let elem_size = u64::from(asm.sizeof_type(elem_tpe));
+    if elem_size == 0 {
+        return None;
+    }
+    Some((elem, total / elem_size))
+}
+
+/// Per-lane spill-and-index body for an element-wise binary op: read lane `i` of each input
+/// (reinterpreting the operand address as `*elem`), apply `op`, store to result lane `i`. Works for
+/// BOTH `SIMDVector` operands and the array fallback (same memory layout) via `simd_lane_info`, so
+/// the .NET fast-path ops can delegate here for unsupported vector sizes.
+pub(super) fn lane_binop_body(
+    mref: Interned<MethodRef>,
+    asm: &mut Assembly,
+    op: &dyn Fn(&mut Assembly, Interned<CILNode>, Interned<CILNode>, SIMDElem, Type) -> Interned<CILNode>,
+) -> MethodImpl {
+    let sig = asm[asm[mref].sig()].clone();
+    let res = *sig.output();
+    let (res_elem_s, _) = simd_lane_info(res, asm).expect("simd binop result is not a vector");
+    let res_elem: Type = res_elem_s.into();
+    let (elem, count) =
+        simd_lane_info(sig.inputs()[0], asm).expect("simd binop input is not a vector");
+    let res_ptr = asm.alloc_node(CILNode::LdLocA(0));
+    let tpe: Type = elem.into();
+    let tpe_idx = asm.alloc_type(tpe);
+    let lhs = asm.alloc_node(CILNode::LdArgA(0));
+    let rhs = asm.alloc_node(CILNode::LdArgA(1));
+    let lhs = asm.cast_ptr(lhs, tpe);
+    let rhs = asm.cast_ptr(rhs, tpe);
+    let mut roots = vec![];
+    for idx in 0..count {
+        let lhs = asm.offset(lhs, Const::USize(idx), tpe);
+        let rhs = asm.offset(rhs, Const::USize(idx), tpe);
+        let lhs = asm.alloc_node(CILNode::LdInd {
+            addr: lhs,
+            tpe: tpe_idx,
+            volatile: false,
+        });
+        let rhs = asm.alloc_node(CILNode::LdInd {
+            addr: rhs,
+            tpe: tpe_idx,
+            volatile: false,
+        });
+        let res_ptr = asm.cast_ptr(res_ptr, res_elem);
+        let res_ptr = asm.offset(res_ptr, Const::USize(idx), res_elem);
+        let res = op(asm, lhs, rhs, elem, res_elem);
+        roots.push(asm.alloc_root(CILRoot::StInd(Box::new((res_ptr, res, res_elem, false)))));
+    }
+    let ret = asm.alloc_node(CILNode::LdLoc(0));
+    roots.push(asm.alloc_root(CILRoot::Ret(ret)));
+    MethodImpl::MethodBody {
+        blocks: vec![BasicBlock::new(roots, 0, None)],
+        locals: vec![(None, asm.alloc_type(res))],
+    }
+}
+
+/// Per-lane spill-and-index body for a unary op (`(vec) -> vec`): read lane `i`, apply `op`, store
+/// to result lane `i`. The array-fallback counterpart of the BCL-static unops (`simd_neg`, …).
+pub(super) fn lane_unop_body(
+    mref: Interned<MethodRef>,
+    asm: &mut Assembly,
+    op: &dyn Fn(&mut Assembly, Interned<CILNode>, SIMDElem, Type) -> Interned<CILNode>,
+) -> MethodImpl {
+    let sig = asm[asm[mref].sig()].clone();
+    let res = *sig.output();
+    let (res_elem_s, _) = simd_lane_info(res, asm).expect("simd unop result is not a vector");
+    let res_elem: Type = res_elem_s.into();
+    let (elem, count) =
+        simd_lane_info(sig.inputs()[0], asm).expect("simd unop input is not a vector");
+    let res_ptr = asm.alloc_node(CILNode::LdLocA(0));
+    let tpe: Type = elem.into();
+    let tpe_idx = asm.alloc_type(tpe);
+    let src = asm.alloc_node(CILNode::LdArgA(0));
+    let src = asm.cast_ptr(src, tpe);
+    let mut roots = vec![];
+    for idx in 0..count {
+        let slot = asm.offset(src, Const::USize(idx), tpe);
+        let lane = asm.alloc_node(CILNode::LdInd {
+            addr: slot,
+            tpe: tpe_idx,
+            volatile: false,
+        });
+        let res_ptr = asm.cast_ptr(res_ptr, res_elem);
+        let res_ptr = asm.offset(res_ptr, Const::USize(idx), res_elem);
+        let res = op(asm, lane, elem, res_elem);
+        roots.push(asm.alloc_root(CILRoot::StInd(Box::new((res_ptr, res, res_elem, false)))));
+    }
+    let ret = asm.alloc_node(CILNode::LdLoc(0));
+    roots.push(asm.alloc_root(CILRoot::Ret(ret)));
+    MethodImpl::MethodBody {
+        blocks: vec![BasicBlock::new(roots, 0, None)],
+        locals: vec![(None, asm.alloc_type(res))],
+    }
+}
+
+/// Per-lane body for `simd_vec_from_val` (splat): store the scalar `LdArg(0)` into every lane of the
+/// result. The array-fallback counterpart of the BCL `Vector{bits}.Create(scalar)`.
+pub(super) fn lane_splat_body(mref: Interned<MethodRef>, asm: &mut Assembly) -> MethodImpl {
+    let sig = asm[asm[mref].sig()].clone();
+    let res = *sig.output();
+    let (res_elem_s, count) = simd_lane_info(res, asm).expect("simd splat result is not a vector");
+    let res_elem: Type = res_elem_s.into();
+    let res_ptr = asm.alloc_node(CILNode::LdLocA(0));
+    let mut roots = vec![];
+    for idx in 0..count {
+        let val = asm.alloc_node(CILNode::LdArg(0));
+        let res_ptr = asm.cast_ptr(res_ptr, res_elem);
+        let slot = asm.offset(res_ptr, Const::USize(idx), res_elem);
+        roots.push(asm.alloc_root(CILRoot::StInd(Box::new((slot, val, res_elem, false)))));
+    }
+    let ret = asm.alloc_node(CILNode::LdLoc(0));
+    roots.push(asm.alloc_root(CILRoot::Ret(ret)));
+    MethodImpl::MethodBody {
+        blocks: vec![BasicBlock::new(roots, 0, None)],
+        locals: vec![(None, asm.alloc_type(res))],
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum CmpKind {
+    Eq,
+    Lt,
+    Gt,
+    Ge,
+    Le,
+}
+
+/// Per-lane comparison producing an all-ones/zero mask lane — matching both the BCL `Vector`
+/// comparisons and Rust's `Mask` representation — for the array fallback of
+/// `simd_eq`/`lt`/`gt`/`ge`/`le`. Reuses `lane_binop_body`; signedness of `<`/`>` is taken from the
+/// (input) lane type, and `>=`/`<=` are `!(<)`/`!(>)`. The result lane type is the mask element.
+pub(super) fn lane_cmp_body(
+    mref: Interned<MethodRef>,
+    asm: &mut Assembly,
+    kind: CmpKind,
+) -> MethodImpl {
+    lane_binop_body(mref, asm, &move |asm, l, r, elem, res_elem| {
+        let unsigned = matches!(elem, SIMDElem::Int(i) if !i.is_signed());
+        let lt = if unsigned { BinOp::LtUn } else { BinOp::Lt };
+        let gt = if unsigned { BinOp::GtUn } else { BinOp::Gt };
+        let cmp01 = match kind {
+            CmpKind::Eq => asm.biop(l, r, BinOp::Eq),
+            CmpKind::Lt => asm.biop(l, r, lt),
+            CmpKind::Gt => asm.biop(l, r, gt),
+            CmpKind::Ge => {
+                let lt = asm.biop(l, r, lt);
+                let zero = asm.alloc_node(Const::I32(0));
+                asm.biop(lt, zero, BinOp::Eq)
+            }
+            CmpKind::Le => {
+                let gt = asm.biop(l, r, gt);
+                let zero = asm.alloc_node(Const::I32(0));
+                asm.biop(gt, zero, BinOp::Eq)
+            }
+        };
+        // `cmp01` is 0/1 (i32). Widen to the mask lane width, then negate: 0 -> 0, 1 -> all-ones.
+        let widened = asm.int_cast(
+            cmp01,
+            res_elem.as_int().expect("simd mask element must be an integer"),
+            crate::cilnode::ExtendKind::ZeroExtend,
+        );
+        asm.neg(widened)
+    })
+}
+
+/// Per-lane body for `simd_eq_all`/`simd_eq_any` (`(vec, vec) -> bool`): fold `a[i] == b[i]` across
+/// lanes with `&&` (all) or `||` (any). Array fallback for the BCL `EqualsAll`/`EqualsAny`.
+pub(super) fn lane_all_any_body(
+    mref: Interned<MethodRef>,
+    asm: &mut Assembly,
+    all: bool,
+) -> MethodImpl {
+    let sig = asm[asm[mref].sig()].clone();
+    let (elem, count) =
+        simd_lane_info(sig.inputs()[0], asm).expect("simd_eq_all/any input is not a vector");
+    let tpe: Type = elem.into();
+    let tpe_idx = asm.alloc_type(tpe);
+    let lhs = asm.alloc_node(CILNode::LdArgA(0));
+    let lhs = asm.cast_ptr(lhs, tpe);
+    let rhs = asm.alloc_node(CILNode::LdArgA(1));
+    let rhs = asm.cast_ptr(rhs, tpe);
+    let acc_addr = asm.alloc_node(CILNode::LdLocA(0));
+    // `all` seeds true and ANDs; `any` seeds false and ORs.
+    let seed = asm.alloc_node(Const::Bool(all));
+    let mut roots = vec![asm.alloc_root(CILRoot::StInd(Box::new((
+        acc_addr,
+        seed,
+        Type::Bool,
+        false,
+    ))))];
+    for idx in 0..count {
+        let a = asm.offset(lhs, Const::USize(idx), tpe);
+        let a = asm.alloc_node(CILNode::LdInd {
+            addr: a,
+            tpe: tpe_idx,
+            volatile: false,
+        });
+        let b = asm.offset(rhs, Const::USize(idx), tpe);
+        let b = asm.alloc_node(CILNode::LdInd {
+            addr: b,
+            tpe: tpe_idx,
+            volatile: false,
+        });
+        let eq = asm.biop(a, b, BinOp::Eq);
+        let acc = asm.alloc_node(CILNode::LdLoc(0));
+        let new_acc = asm.biop(acc, eq, if all { BinOp::And } else { BinOp::Or });
+        roots.push(asm.alloc_root(CILRoot::StInd(Box::new((
+            acc_addr,
+            new_acc,
+            Type::Bool,
+            false,
+        )))));
+    }
+    let ret = asm.alloc_node(CILNode::LdLoc(0));
+    roots.push(asm.alloc_root(CILRoot::Ret(ret)));
+    MethodImpl::MethodBody {
+        blocks: vec![BasicBlock::new(roots, 0, None)],
+        locals: vec![(None, asm.alloc_type(Type::Bool))],
+    }
+}
+
 fn simd_binop(
     op: impl Fn(&mut Assembly, Interned<CILNode>, Interned<CILNode>, SIMDElem, Type) -> Interned<CILNode>
         + 'static,
@@ -64,48 +305,8 @@ fn simd_binop(
     patcher: &mut MissingMethodPatcher,
 ) {
     let name = asm.alloc_string(name);
-    let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {
-        // Extrac types from signature
-        let sig = &asm[asm[mref].sig()];
-        let res = *sig.output();
-        let res_elem = res.as_simdvector().unwrap().elem().into();
-        let vec = sig.inputs()[0].as_simdvector().unwrap().clone();
-        let elem = vec.elem();
-        let res_ptr = asm.alloc_node(CILNode::LdLocA(0));
-        let tpe: Type = elem.into();
-        let tpe_idx = asm.alloc_type(tpe);
-        // Get args
-        let lhs = asm.alloc_node(CILNode::LdArgA(0));
-        let rhs = asm.alloc_node(CILNode::LdArgA(1));
-        let lhs = asm.cast_ptr(lhs, tpe);
-        let rhs = asm.cast_ptr(rhs, tpe);
-        // Iter trough all elements
-        let mut roots = vec![];
-        for idx in 0..vec.count() {
-            let lhs = asm.offset(lhs, Const::USize(idx as u64), tpe);
-            let rhs = asm.offset(rhs, Const::USize(idx as u64), tpe);
-            let lhs = asm.alloc_node(CILNode::LdInd {
-                addr: lhs,
-                tpe: tpe_idx,
-                volatile: false,
-            });
-            let rhs = asm.alloc_node(CILNode::LdInd {
-                addr: rhs,
-                tpe: tpe_idx,
-                volatile: false,
-            });
-            let res_ptr = asm.cast_ptr(res_ptr, res_elem);
-            let res_ptr = asm.offset(res_ptr, Const::USize(idx as u64), res_elem);
-            let res = op(asm, lhs, rhs, elem, res_elem);
-            roots.push(asm.alloc_root(CILRoot::StInd(Box::new((res_ptr, res, res_elem, false)))));
-        }
-        let ret = asm.alloc_node(CILNode::LdLoc(0));
-        roots.push(asm.alloc_root(CILRoot::Ret(ret)));
-        MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(roots, 0, None)],
-            locals: vec![(None, asm.alloc_type(res))],
-        }
-    };
+    let generator =
+        move |mref: Interned<MethodRef>, asm: &mut Assembly| lane_binop_body(mref, asm, &op);
     patcher.insert(name, Box::new(generator));
 }
 pub fn fallback_simd(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
@@ -286,10 +487,11 @@ fn simd_select(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {
         let sig = asm[asm[mref].sig()].clone();
         let res = *sig.output();
-        let res_vec = res.as_simdvector().unwrap();
-        let elem: Type = res_vec.elem().into();
-        let count = res_vec.count();
-        let mask_elem: Type = sig.inputs()[0].as_simdvector().unwrap().elem().into();
+        let (elem_s, count) = simd_lane_info(res, asm).expect("simd_select result is not a vector");
+        let elem: Type = elem_s.into();
+        let (mask_elem_s, _) =
+            simd_lane_info(sig.inputs()[0], asm).expect("simd_select mask is not a vector");
+        let mask_elem: Type = mask_elem_s.into();
         let elem_idx = asm.alloc_type(elem);
         let mask_idx = asm.alloc_type(mask_elem);
         let elem_ptr_ty = asm.nptr(elem_idx);
@@ -305,17 +507,17 @@ fn simd_select(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
 
         let mut roots = vec![];
         for idx in 0..count {
-            let m_slot = asm.offset(mask, Const::USize(idx as u64), mask_elem);
+            let m_slot = asm.offset(mask, Const::USize(idx), mask_elem);
             let m_val = asm.load(m_slot, mask_idx);
             let m_i32 = asm.int_cast(m_val, Int::I32, crate::cilnode::ExtendKind::SignExtend);
             let zero = asm.alloc_node(Const::I32(0));
             // predicate true  => mask lane is zero => pick `if_false`.
             let is_false = asm.biop(m_i32, zero, BinOp::Eq);
-            let a_slot = asm.offset(a, Const::USize(idx as u64), elem);
-            let b_slot = asm.offset(b, Const::USize(idx as u64), elem);
+            let a_slot = asm.offset(a, Const::USize(idx), elem);
+            let b_slot = asm.offset(b, Const::USize(idx), elem);
             let chosen = asm.select(elem_ptr_ty, b_slot, a_slot, is_false);
             let val = asm.load(chosen, elem_idx);
-            let r_slot = asm.offset(res_ptr, Const::USize(idx as u64), elem);
+            let r_slot = asm.offset(res_ptr, Const::USize(idx), elem);
             roots.push(asm.alloc_root(CILRoot::StInd(Box::new((r_slot, val, elem, false)))));
         }
         let ret = asm.alloc_node(CILNode::LdLoc(0));
@@ -353,14 +555,14 @@ fn simd_reduce(
     let nm = asm.alloc_string(name);
     let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {
         let sig = asm[asm[mref].sig()].clone();
-        let vec = sig.inputs()[0].as_simdvector().unwrap();
-        let elem: Type = vec.elem().into();
-        let signed = match vec.elem() {
+        let (elem_s, count) =
+            simd_lane_info(sig.inputs()[0], asm).expect("simd_reduce input is not a vector");
+        let elem: Type = elem_s.into();
+        let signed = match elem_s {
             SIMDElem::Int(int) => int.is_signed(),
             SIMDElem::Float(_) => true,
         };
         let elem_idx = asm.alloc_type(elem);
-        let count = vec.count();
 
         let x = asm.alloc_node(CILNode::LdArgA(0));
         let x = asm.cast_ptr(x, elem);
@@ -428,15 +630,15 @@ fn simd_reduce(
 fn simd_cast(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("simd_cast");
     let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {
-        let sig = &asm[asm[mref].sig()];
+        let sig = asm[asm[mref].sig()].clone();
         let res = *sig.output();
-        let res_vec = res.as_simdvector().unwrap().clone();
-        let res_elem = res_vec.elem();
+        // Both the src and dst may be the array fallback (e.g. `mask.to_array()` casts an
+        // `i32x4` mask to an `i8x4` `[bool; 4]`), so recover lane info via `simd_lane_info`.
+        let (res_elem, _) = simd_lane_info(res, asm).expect("simd_cast result is not a vector");
         let res_elem_tpe: Type = res_elem.into();
-        let src_vec = sig.inputs()[0].as_simdvector().unwrap().clone();
-        let src_elem = src_vec.elem();
+        let (src_elem, count) =
+            simd_lane_info(sig.inputs()[0], asm).expect("simd_cast input is not a vector");
         let src_elem_tpe: Type = src_elem.into();
-        let count = src_vec.count();
 
         let res_ptr = asm.alloc_node(CILNode::LdLocA(0));
         let src_tpe_idx = asm.alloc_type(src_elem_tpe);
@@ -444,7 +646,7 @@ fn simd_cast(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let src = asm.cast_ptr(src, src_elem_tpe);
         let mut roots = vec![];
         for idx in 0..count {
-            let slot = asm.offset(src, Const::USize(idx as u64), src_elem_tpe);
+            let slot = asm.offset(src, Const::USize(idx), src_elem_tpe);
             let lane = asm.alloc_node(CILNode::LdInd {
                 addr: slot,
                 tpe: src_tpe_idx,
@@ -481,7 +683,7 @@ fn simd_cast(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
                 }
             };
             let res_ptr = asm.cast_ptr(res_ptr, res_elem_tpe);
-            let res_ptr = asm.offset(res_ptr, Const::USize(idx as u64), res_elem_tpe);
+            let res_ptr = asm.offset(res_ptr, Const::USize(idx), res_elem_tpe);
             roots.push(asm.alloc_root(CILRoot::StInd(Box::new((
                 res_ptr,
                 converted,

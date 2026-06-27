@@ -3,6 +3,7 @@ use crate::{
     MethodRef, Type,
 };
 
+use super::binop::{lane_all_any_body, lane_cmp_body, CmpKind};
 use super::dotnet_vec_cast;
 pub(super) fn simd_eq(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("simd_eq");
@@ -10,10 +11,8 @@ pub(super) fn simd_eq(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let sig = asm[asm[mref].sig()].clone();
         let result = sig.output();
         let Some(comparands) = sig.inputs()[0].as_simdvector() else {
-            todo!(
-                "Can't simd compare {comparands:?} and get {result:?}",
-                comparands = sig.inputs()[0]
-            )
+            // Array fallback (unsupported vector size): compare per lane into an all-ones mask.
+            return lane_cmp_body(mref, asm, CmpKind::Eq);
         };
         let elem: Type = comparands.elem().into();
         let Some(result) = result.as_simdvector() else {
@@ -55,10 +54,8 @@ pub(super) fn simd_lt(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let sig = asm[asm[mref].sig()].clone();
         let result = sig.output();
         let Some(comparands) = sig.inputs()[0].as_simdvector() else {
-            todo!(
-                "Can't simd compare {comparands:?} and get {result:?}",
-                comparands = sig.inputs()[0]
-            )
+            // Array fallback (unsupported vector size): compare per lane into an all-ones mask.
+            return lane_cmp_body(mref, asm, CmpKind::Lt);
         };
         let elem: Type = comparands.elem().into();
         let Some(result) = result.as_simdvector() else {
@@ -99,17 +96,15 @@ pub(super) fn simd_lt(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
 /// static, which returns the correct all-ones-per-true-lane mask Rust's SIMD expects — a per-lane
 /// `0`/`1` fallback would silently break `simd_bitmask` and any MSB-reading consumer.
 macro_rules! simd_cmp {
-    ($fn_name:ident, $dotnet:literal) => {
+    ($fn_name:ident, $dotnet:literal, $kind:expr) => {
         pub(super) fn $fn_name(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
             let name = asm.alloc_string(stringify!($fn_name));
             let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {
                 let sig = asm[asm[mref].sig()].clone();
                 let result = sig.output();
                 let Some(comparands) = sig.inputs()[0].as_simdvector() else {
-                    todo!(
-                        "Can't simd compare {comparands:?} and get {result:?}",
-                        comparands = sig.inputs()[0]
-                    )
+                    // Array fallback (unsupported vector size): compare per lane into an all-ones mask.
+                    return lane_cmp_body(mref, asm, $kind);
                 };
                 let elem: Type = comparands.elem().into();
                 let Some(result) = result.as_simdvector() else {
@@ -146,19 +141,17 @@ macro_rules! simd_cmp {
         }
     };
 }
-simd_cmp!(simd_gt, "GreaterThan");
-simd_cmp!(simd_ge, "GreaterThanOrEqual");
-simd_cmp!(simd_le, "LessThanOrEqual");
+simd_cmp!(simd_gt, "GreaterThan", CmpKind::Gt);
+simd_cmp!(simd_ge, "GreaterThanOrEqual", CmpKind::Ge);
+simd_cmp!(simd_le, "LessThanOrEqual", CmpKind::Le);
 pub(super) fn simd_eq_all(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("simd_eq_all");
     let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {
         let sig = asm[asm[mref].sig()].clone();
         let result = sig.output();
         let Some(comparands) = sig.inputs()[0].as_simdvector() else {
-            todo!(
-                "Can't simd compare {comparands:?} and get {result:?}",
-                comparands = sig.inputs()[0]
-            )
+            // Array fallback (unsupported vector size): fold per lane.
+            return lane_all_any_body(mref, asm, true);
         };
         let elem: Type = comparands.elem().into();
 
@@ -198,10 +191,8 @@ pub(super) fn simd_eq_any(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
         let sig = asm[asm[mref].sig()].clone();
         let result = sig.output();
         let Some(comparands) = sig.inputs()[0].as_simdvector() else {
-            todo!(
-                "Can't simd compare {comparands:?} and get {result:?}",
-                comparands = sig.inputs()[0]
-            )
+            // Array fallback (unsupported vector size): fold per lane.
+            return lane_all_any_body(mref, asm, false);
         };
         let elem: Type = comparands.elem().into();
 

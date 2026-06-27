@@ -234,16 +234,20 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                 if count == 1 {
                     return elem;
                 }
-                // .NET only has Vector64/128/256/512 — vectors wider than 512 bits (e.g.
-                // `Simd<u32, 32>` = 1024 bits, reached transitively via feature-gated stdarch
-                // paths that never execute on CoreCLR) have no managed intrinsic class, and the
-                // element may not even be a valid SIMD element. Rather than ICE in
-                // `SIMDVector::new`, represent the oversized/unrepresentable vector as a plain
-                // fixed-size array so the type (and any signature mentioning it) still lowers.
+                // .NET has a managed intrinsic vector class ONLY for the four widths
+                // Vector64/128/256/512. Any other size has no managed class: too wide
+                // (`Simd<u32, 32>` = 1024 bits), too narrow (`Simd<i8, 4>` = 32 bits — produced
+                // e.g. when a 4-lane mask is materialized to `[bool; 4]`), or a non-power-of-two
+                // width; the element may also not be a valid SIMD element. Rather than ICE in
+                // `SIMDVector::new`, represent any such vector as a plain fixed-size array — the
+                // only SIZE-CORRECT representation (padding to a wider managed vector would change
+                // the type's byte size and corrupt struct/array/transmute layout). The SIMD
+                // intrinsic builtins detect this array fallback via `simd_lane_info` and lower ops
+                // over it element-wise (the per-lane spill-and-index path already works on it).
                 let layout = ctx.layout_of(ty);
                 let vec_bits = layout.layout.size().bytes().saturating_mul(8);
                 let elem_simd: Result<cilly::tpe::simd::SIMDElem, _> = elem.try_into();
-                if elem_simd.is_err() || vec_bits > 512 {
+                if elem_simd.is_err() || !matches!(vec_bits, 64 | 128 | 256 | 512) {
                     let arr_size = layout.layout.size().bytes();
                     let arr_align = layout.layout.align().abi.bytes();
                     // I3 totality: a SIMD vector lowered to a fixed array can't exceed 2^32 bytes on
