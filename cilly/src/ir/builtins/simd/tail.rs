@@ -25,12 +25,11 @@ fn simd_unary(
 ) {
     let name = asm.alloc_string(name);
     let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {
-        let sig = &asm[asm[mref].sig()];
+        let sig = asm[asm[mref].sig()].clone();
         let res = *sig.output();
-        let src_vec = sig.inputs()[0].as_simdvector().unwrap().clone();
-        let src_elem = src_vec.elem();
+        let (src_elem, count) = super::binop::simd_lane_info(sig.inputs()[0], asm)
+            .expect("simd value-lane unop input is not a vector");
         let src_elem_tpe: Type = src_elem.into();
-        let count = src_vec.count();
 
         let res_ptr = asm.alloc_node(CILNode::LdLocA(0));
         let src_tpe_idx = asm.alloc_type(src_elem_tpe);
@@ -38,7 +37,7 @@ fn simd_unary(
         let src = asm.cast_ptr(src, src_elem_tpe);
         let mut roots = vec![];
         for idx in 0..count {
-            let slot = asm.offset(src, Const::USize(idx as u64), src_elem_tpe);
+            let slot = asm.offset(src, Const::USize(idx), src_elem_tpe);
             let lane = asm.alloc_node(CILNode::LdInd {
                 addr: slot,
                 tpe: src_tpe_idx,
@@ -46,7 +45,7 @@ fn simd_unary(
             });
             let transformed = op(asm, lane, src_elem);
             let res_ptr = asm.cast_ptr(res_ptr, src_elem_tpe);
-            let res_ptr = asm.offset(res_ptr, Const::USize(idx as u64), src_elem_tpe);
+            let res_ptr = asm.offset(res_ptr, Const::USize(idx), src_elem_tpe);
             roots.push(asm.alloc_root(CILRoot::StInd(Box::new((
                 res_ptr,
                 transformed,

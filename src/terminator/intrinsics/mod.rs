@@ -26,7 +26,7 @@ mod ints;
 mod saturating;
 mod type_info;
 mod utilis;
-use floats::{fmaf32, fmaf64, powf32, powf64, powif32, powif64, roundf32, roundf64};
+use floats::{fmaf16, fmaf32, fmaf64, powf32, powf64, powif32, powif64, roundf32, roundf64};
 mod ptr;
 use ptr::arith_offset;
 mod mem;
@@ -648,6 +648,18 @@ pub fn handle_intrinsic<'tcx>(
         "floorf64" => float_unop(args, destination, ctx, Float::F64, "Floor"),
         "ceilf32" => float_unop(args, destination, ctx, Float::F32, "Ceiling"),
         "ceilf64" => float_unop(args, destination, ctx, Float::F64, "Ceiling"),
+        // f16 math via `System.Half` (.NET 8 implements `IBinaryFloatingPointIeee754<Half>`, so
+        // these static methods exist just like on `float`/`double`). Reached e.g. by proptest's
+        // `f16` value strategies and any half-precision `core::simd`/`std::f16` code.
+        "floorf16" => float_unop(args, destination, ctx, Float::F16, "Floor"),
+        "ceilf16" => float_unop(args, destination, ctx, Float::F16, "Ceiling"),
+        "truncf16" => float_unop(args, destination, ctx, Float::F16, "Truncate"),
+        "sqrtf16" => float_unop(args, destination, ctx, Float::F16, "Sqrt"),
+        "fabsf16" => float_unop(args, destination, ctx, Float::F16, "Abs"),
+        "copysignf16" => float_binop(args, destination, ctx, Float::F16, "CopySign"),
+        "maxnumf16" => float_binop(args, destination, ctx, Float::F16, "MaxNumber"),
+        "minnumf16" => float_binop(args, destination, ctx, Float::F16, "MinNumber"),
+        "fmaf16" => vec![fmaf16(args, destination, ctx)],
         "maxnumf64" => float_binop(args, destination, ctx, Float::F64, "MaxNumber"),
         "maxnumf32" => float_binop(args, destination, ctx, Float::F32, "MaxNumber"),
         "minnumf64" => float_binop(args, destination, ctx, Float::F64, "MinNumber"),
@@ -941,11 +953,12 @@ pub fn handle_intrinsic<'tcx>(
             let value = ctx.call(op, &[lhs, rhs], IsPure::NOT);
             vec![place_set(destination, value, ctx)]
         }
-        "simd_shl" | "simd_shr" | "simd_xor" => {
+        "simd_shl" | "simd_shr" | "simd_xor" | "simd_rem" => {
             // Element-wise `(vec, vec) -> vec` ops, same shape as `simd_add`. The per-lane
             // body is supplied by `fallback_simd` under the matching builtin name. `simd_shr`
             // resolves to an arithmetic-vs-logical shift based on lane signedness inside the
-            // generator (the signedness is recoverable from the SIMD element type).
+            // generator (the signedness is recoverable from the SIMD element type); `simd_rem`
+            // likewise resolves signed-vs-unsigned remainder from the element type.
             let vec = ctx.type_from_cache(
                 call_instance.args[0]
                     .as_type()

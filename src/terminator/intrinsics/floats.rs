@@ -39,6 +39,34 @@ pub fn fmaf32<'tcx>(
     let value_calc = ctx.call(mref, &[a, b, c], IsPure::NOT);
     place_set(destination, value_calc, ctx)
 }
+/// Implementation of the `fmaf16` intrinsic: `a * b + c` via `System.Half.FusedMultiplyAdd`.
+pub fn fmaf16<'tcx>(
+    args: &[Spanned<Operand<'tcx>>],
+    destination: &Place<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Root {
+    let sig = ctx.sig(
+        [
+            Type::Float(Float::F16),
+            Type::Float(Float::F16),
+            Type::Float(Float::F16),
+        ],
+        Type::Float(Float::F16),
+    );
+    let mref = MethodRef::new(
+        ClassRef::half(ctx),
+        ctx.alloc_string("FusedMultiplyAdd"),
+        sig,
+        MethodKind::Static,
+        vec![].into(),
+    );
+    let mref = ctx.alloc_methodref(mref);
+    let a = handle_operand(&args[0].node, ctx);
+    let b = handle_operand(&args[1].node, ctx);
+    let c = handle_operand(&args[2].node, ctx);
+    let value_calc = ctx.call(mref, &[a, b, c], IsPure::NOT);
+    place_set(destination, value_calc, ctx)
+}
 /// Implementation of the fmaf64 intrinsics. Takes in 3 arguments: a, b, c. Calcualtes a * b + c
 pub fn fmaf64<'tcx>(
     args: &[Spanned<Operand<'tcx>>],

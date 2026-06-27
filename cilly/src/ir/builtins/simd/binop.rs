@@ -68,6 +68,14 @@ pub(super) fn simd_lane_info(tpe: Type, asm: &Assembly) -> Option<(SIMDElem, u64
     if let Some(v) = tpe.as_simdvector() {
         return Some((v.elem(), u64::from(v.count())));
     }
+    // A 1-lane vector (`Simd<T, 1>`) is lowered straight to its scalar element (see `get_type`'s
+    // `count == 1` early return), so a SIMD op on it arrives with a plain `Int`/`Float` operand —
+    // treat that as a single-lane vector.
+    match tpe {
+        Type::Int(int) => return Some((SIMDElem::Int(int), 1)),
+        Type::Float(float) => return Some((SIMDElem::Float(float), 1)),
+        _ => {}
+    }
     let Type::ClassRef(cref) = tpe else {
         return None;
     };
@@ -453,6 +461,20 @@ pub(super) fn register_value_lane_ops(asm: &mut Assembly, patcher: &mut MissingM
             asm.biop(lhs, rhs, op)
         },
         "simd_div",
+        asm,
+        patcher,
+    );
+    // `simd_rem` — element-wise remainder. Like `simd_div`, pick signed/unsigned/float remainder
+    // from the lane type (`Rem` for signed/float, `RemUn` for unsigned).
+    simd_binop(
+        |asm, lhs, rhs, elem, _| {
+            let op = match elem {
+                SIMDElem::Int(int) if !int.is_signed() => BinOp::RemUn,
+                _ => BinOp::Rem,
+            };
+            asm.biop(lhs, rhs, op)
+        },
+        "simd_rem",
         asm,
         patcher,
     );
