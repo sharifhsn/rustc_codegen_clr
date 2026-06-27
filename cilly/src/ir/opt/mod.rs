@@ -723,7 +723,7 @@ impl MethodDef {
             self.dedup_roots(asm);
         }
         if fuel.consume(1) {
-            self.opt_roots(fuel, cache, asm);
+            self.opt_roots(fuel, cache, asm, sig);
         }
         if fuel.consume(1) {
             self.implementation_mut().remove_duplicate_sfi(asm);
@@ -841,6 +841,7 @@ impl MethodDef {
         fuel: &mut OptFuel,
         cache: &mut SideEffectInfoCache,
         asm: &mut Assembly,
+        sig: Interned<FnSig>,
     ) {
         if self.implementation().blocks().is_none() {
             return;
@@ -854,7 +855,7 @@ impl MethodDef {
             asm,
             &mut |root, asm| {
                 let mut root_fuel = fuel.lock().unwrap();
-                root_opt(root, asm, &mut root_fuel, cache, &locals)
+                root_opt(root, asm, &mut root_fuel, cache, &locals, sig)
             },
             &mut |node, asm| {
                 let mut fuel = fuel.lock().unwrap();

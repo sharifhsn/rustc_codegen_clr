@@ -1,6 +1,8 @@
 use super::inline::inline_trivial_call_root;
 
-use super::super::{cilroot::BranchCond, method::LocalDef, BinOp, CILNode, CILRoot, Const, Type};
+use super::super::{
+    cilroot::BranchCond, method::LocalDef, BinOp, CILNode, CILRoot, Const, FnSig, Type,
+};
 pub use super::opt_fuel::OptFuel;
 use super::opt_if_fuel;
 pub use super::side_effect::*;
@@ -8,12 +10,41 @@ use crate::bimap::Interned;
 use crate::cilroot::CmpKind;
 use crate::Assembly;
 
+/// Pick the `CmpKind` for a comparison produced by *negating* an ordered/signed comparison-branch
+/// (`!(a < b)` → `a >= b`, `!(a > b)` → `a <= b`, and their unordered/unsigned `…Un` forms). The
+/// fused branch (`bge`/`ble`) is only correct for FLOATS when it uses the UNORDERED complement
+/// (`bge.un`/`ble.un`): ordered `clt`/`cgt` are false for NaN, so e.g. `!(a < b)` must still branch
+/// when an operand is NaN — which only `bge.un` does, not `bge`. For integers the signed/ordered
+/// complement (`int_kind`) is correct. `BinOp::Lt`/`Gt` (and `…Un`) are shared by float-ordered and
+/// int-signed comparisons, so the kind is chosen from the operand's type; if the type can't be
+/// determined, `int_kind` (the historical, integer-correct choice) is used.
+fn negation_cmp_kind(
+    operand: Interned<CILNode>,
+    int_kind: CmpKind,
+    float_kind: CmpKind,
+    sig: Interned<FnSig>,
+    locals: &[LocalDef],
+    asm: &mut Assembly,
+) -> CmpKind {
+    let is_float = asm
+        .get_node(operand)
+        .clone()
+        .typecheck(sig, locals, asm)
+        .map(|t| matches!(t, Type::Float(_)))
+        .unwrap_or(false);
+    if is_float {
+        float_kind
+    } else {
+        int_kind
+    }
+}
 pub fn root_opt(
     root: CILRoot,
     asm: &mut Assembly,
     root_fuel: &mut OptFuel,
     cache: &mut SideEffectInfoCache,
     locals: &[LocalDef],
+    sig: Interned<FnSig>,
 ) -> CILRoot {
     match root {
         CILRoot::Pop(pop) => match asm.get_node(pop) {
@@ -47,7 +78,9 @@ pub fn root_opt(
             let (target, sub_target, cond) = info.as_ref();
             match cond {
                 Some(BranchCond::False(cond)) => {
-                    match asm.get_node(*cond) {
+                    // `.clone()` so the `asm` borrow is released — the negation arms below need a
+                    // mutable `asm` to typecheck the operand and pick ordered-vs-unordered.
+                    match asm.get_node(*cond).clone() {
                         CILNode::Const(cst) => match cst.as_ref() {
                             Const::Bool(false) => opt_if_fuel(
                                 CILRoot::Branch(Box::new((*target, *sub_target, None))),
@@ -57,8 +90,10 @@ pub fn root_opt(
                             Const::Bool(true) => opt_if_fuel(CILRoot::Nop, root, root_fuel),
                             _ => root,
                         },
-                        // a == b is false <=> a != b
-                        CILNode::BinOp(lhs, rhs, BinOp::Eq) => opt_if_fuel(
+                        // a == b is false <=> a != b. `Ne` lowers to `bne.un`, which is the correct
+                        // negation of ordered `ceq` for both ints and floats (NaN ≠ NaN is true), so
+                        // no kind selection is needed here.
+                        CILNode::BinOp(ref lhs, ref rhs, BinOp::Eq) => opt_if_fuel(
                             {
                                 CILRoot::Branch(Box::new((
                                     *target,
@@ -70,51 +105,83 @@ pub fn root_opt(
                             root_fuel,
                         ),
                         // a > b is false <=> a <= b
-                        CILNode::BinOp(lhs, rhs, BinOp::Gt) => opt_if_fuel(
-                            {
+                        CILNode::BinOp(ref lhs, ref rhs, BinOp::Gt) => {
+                            let kind = negation_cmp_kind(
+                                *lhs,
+                                CmpKind::Ordered,
+                                CmpKind::Unordered,
+                                sig,
+                                locals,
+                                asm,
+                            );
+                            opt_if_fuel(
                                 CILRoot::Branch(Box::new((
                                     *target,
                                     *sub_target,
-                                    Some(BranchCond::Le(*lhs, *rhs, CmpKind::Ordered)),
-                                )))
-                            },
-                            root,
-                            root_fuel,
-                        ),
-                        CILNode::BinOp(lhs, rhs, BinOp::GtUn) => opt_if_fuel(
-                            {
+                                    Some(BranchCond::Le(*lhs, *rhs, kind)),
+                                ))),
+                                root,
+                                root_fuel,
+                            )
+                        }
+                        CILNode::BinOp(ref lhs, ref rhs, BinOp::GtUn) => {
+                            let kind = negation_cmp_kind(
+                                *lhs,
+                                CmpKind::Unordered,
+                                CmpKind::Ordered,
+                                sig,
+                                locals,
+                                asm,
+                            );
+                            opt_if_fuel(
                                 CILRoot::Branch(Box::new((
                                     *target,
                                     *sub_target,
-                                    Some(BranchCond::Le(*lhs, *rhs, CmpKind::Unordered)),
-                                )))
-                            },
-                            root,
-                            root_fuel,
-                        ),
+                                    Some(BranchCond::Le(*lhs, *rhs, kind)),
+                                ))),
+                                root,
+                                root_fuel,
+                            )
+                        }
                         // a < b is false <=> a >= b
-                        CILNode::BinOp(lhs, rhs, BinOp::Lt) => opt_if_fuel(
-                            {
+                        CILNode::BinOp(ref lhs, ref rhs, BinOp::Lt) => {
+                            let kind = negation_cmp_kind(
+                                *lhs,
+                                CmpKind::Ordered,
+                                CmpKind::Unordered,
+                                sig,
+                                locals,
+                                asm,
+                            );
+                            opt_if_fuel(
                                 CILRoot::Branch(Box::new((
                                     *target,
                                     *sub_target,
-                                    Some(BranchCond::Ge(*lhs, *rhs, CmpKind::Ordered)),
-                                )))
-                            },
-                            root,
-                            root_fuel,
-                        ),
-                        CILNode::BinOp(lhs, rhs, BinOp::LtUn) => opt_if_fuel(
-                            {
+                                    Some(BranchCond::Ge(*lhs, *rhs, kind)),
+                                ))),
+                                root,
+                                root_fuel,
+                            )
+                        }
+                        CILNode::BinOp(ref lhs, ref rhs, BinOp::LtUn) => {
+                            let kind = negation_cmp_kind(
+                                *lhs,
+                                CmpKind::Unordered,
+                                CmpKind::Ordered,
+                                sig,
+                                locals,
+                                asm,
+                            );
+                            opt_if_fuel(
                                 CILRoot::Branch(Box::new((
                                     *target,
                                     *sub_target,
-                                    Some(BranchCond::Ge(*lhs, *rhs, CmpKind::Unordered)),
-                                )))
-                            },
-                            root,
-                            root_fuel,
-                        ),
+                                    Some(BranchCond::Ge(*lhs, *rhs, kind)),
+                                ))),
+                                root,
+                                root_fuel,
+                            )
+                        }
                         //CILNode::IntCast { input, target, extend }
                         _ => root,
                     }
