@@ -69,6 +69,12 @@ fn simd_neg(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
             // Array fallback (unsupported vector size): negate per lane.
             return binop::lane_unop_body(mref, asm, &|asm, x, _, _| asm.neg(x));
         };
+        // IL `neg` (sign-flip) preserves the sign of zero/NaN, matching Rust `-x`; the BCL
+        // `Vector{bits}.Negate` computes `0 - x`, which turns `+0.0` into `+0.0` instead of `-0.0`.
+        // Negate FLOAT lanes per-lane (correct signed zero); ints keep the hardware `Negate`.
+        if matches!(vec_type.elem(), crate::tpe::simd::SIMDElem::Float(_)) {
+            return binop::lane_unop_body(mref, asm, &|asm, x, _, _| asm.neg(x));
+        }
         let elem: Type = vec_type.elem().into();
         let extension_class = vec_type.extension_class(asm);
         let extension_class = asm[extension_class].clone();
@@ -115,9 +121,7 @@ fn simd_abs(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
                     let xs = asm.biop(x, s, crate::BinOp::XOr);
                     asm.biop(xs, s, crate::BinOp::Sub)
                 }
-                crate::tpe::simd::SIMDElem::Float(_) => {
-                    todo!("float simd_abs (fabs) array fallback for an unsupported vector size")
-                }
+                crate::tpe::simd::SIMDElem::Float(f) => f.math1(x, asm, "Abs"),
             });
         };
         let elem: Type = vec_type.elem().into();

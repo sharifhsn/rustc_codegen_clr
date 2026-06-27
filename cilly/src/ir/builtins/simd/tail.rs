@@ -296,10 +296,10 @@ fn round_lane(
 fn simd_fma(name: &str, asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string(name);
     let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {
-        let sig = &asm[asm[mref].sig()];
+        let sig = asm[asm[mref].sig()].clone();
         let res = *sig.output();
-        let vec = sig.inputs()[0].as_simdvector().unwrap().clone();
-        let elem = vec.elem();
+        let (elem, count) = super::binop::simd_lane_info(sig.inputs()[0], asm)
+            .expect("simd_fma input is not a vector");
         let elem_tpe: Type = elem.into();
         let elem_idx = asm.alloc_type(elem_tpe);
         let SIMDElem::Float(float) = elem else {
@@ -319,10 +319,10 @@ fn simd_fma(name: &str, asm: &mut Assembly, patcher: &mut MissingMethodPatcher) 
         let z = asm.alloc_node(CILNode::LdArgA(2));
         let z = asm.cast_ptr(z, elem_tpe);
         let mut roots = vec![];
-        for idx in 0..vec.count() {
-            let xs = asm.offset(x, Const::USize(idx as u64), elem_tpe);
-            let ys = asm.offset(y, Const::USize(idx as u64), elem_tpe);
-            let zs = asm.offset(z, Const::USize(idx as u64), elem_tpe);
+        for idx in 0..count {
+            let xs = asm.offset(x, Const::USize(idx), elem_tpe);
+            let ys = asm.offset(y, Const::USize(idx), elem_tpe);
+            let zs = asm.offset(z, Const::USize(idx), elem_tpe);
             let xv = asm.load(xs, elem_idx);
             let yv = asm.load(ys, elem_idx);
             let zv = asm.load(zs, elem_idx);
@@ -335,7 +335,7 @@ fn simd_fma(name: &str, asm: &mut Assembly, patcher: &mut MissingMethodPatcher) 
                 &[xv, yv, zv],
             );
             let rp = asm.cast_ptr(res_ptr, elem_tpe);
-            let rp = asm.offset(rp, Const::USize(idx as u64), elem_tpe);
+            let rp = asm.offset(rp, Const::USize(idx), elem_tpe);
             roots.push(asm.alloc_root(CILRoot::StInd(Box::new((rp, fused, elem_tpe, false)))));
         }
         let ret = asm.alloc_node(CILNode::LdLoc(0));

@@ -953,7 +953,8 @@ pub fn handle_intrinsic<'tcx>(
             let value = ctx.call(op, &[lhs, rhs], IsPure::NOT);
             vec![place_set(destination, value, ctx)]
         }
-        "simd_shl" | "simd_shr" | "simd_xor" | "simd_rem" => {
+        "simd_shl" | "simd_shr" | "simd_xor" | "simd_rem" | "simd_maximum_number_nsz"
+        | "simd_minimum_number_nsz" => {
             // Element-wise `(vec, vec) -> vec` ops, same shape as `simd_add`. The per-lane
             // body is supplied by `fallback_simd` under the matching builtin name. `simd_shr`
             // resolves to an arithmetic-vs-logical shift based on lane signedness inside the

@@ -478,6 +478,27 @@ pub(super) fn register_value_lane_ops(asm: &mut Assembly, patcher: &mut MissingM
         asm,
         patcher,
     );
+    // `simd_maximum_number_nsz` / `simd_minimum_number_nsz` — element-wise IEEE maximumNumber/
+    // minimumNumber (NaN-ignoring) on float lanes; the `_nsz` (no-signed-zero) is an optimization
+    // hint we can safely ignore. Per-lane `System.{Single,Double,Half}.MaxNumber`/`MinNumber`.
+    simd_binop(
+        |asm, l, r, elem, _| match elem {
+            SIMDElem::Float(f) => f.math2(l, r, asm, "MaxNumber"),
+            SIMDElem::Int(_) => asm.biop(l, r, BinOp::Add), // unreachable: float-only op
+        },
+        "simd_maximum_number_nsz",
+        asm,
+        patcher,
+    );
+    simd_binop(
+        |asm, l, r, elem, _| match elem {
+            SIMDElem::Float(f) => f.math2(l, r, asm, "MinNumber"),
+            SIMDElem::Int(_) => asm.biop(l, r, BinOp::Add), // unreachable: float-only op
+        },
+        "simd_minimum_number_nsz",
+        asm,
+        patcher,
+    );
     // `simd_cast<T,U>` — per-lane numeric conversion. Not a binop (single input vector), so it
     // has its own generator that walks lanes, converting each `src_elem` to `dst_elem`.
     simd_cast(asm, patcher);
@@ -687,18 +708,34 @@ fn simd_cast(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
                 (SIMDElem::Int(src_int), SIMDElem::Float(dst_float)) => {
                     asm.float_cast(lane, dst_float, src_int.is_signed())
                 }
-                (SIMDElem::Float(_), SIMDElem::Int(dst_int)) => {
-                    // float -> int: cilly's IntCast handles a float source. The ExtendKind
-                    // selects the conv opcode's signedness (conv.i* vs conv.u*), so it MUST
-                    // track the destination lane's signedness — otherwise a signed `f32 -> i32`
-                    // lane would emit `conv.u4` and miscompile negative values. Matches the
-                    // sign-selection in `src/casts.rs::to_int`.
-                    let extend = if dst_int.is_signed() {
-                        crate::cilnode::ExtendKind::SignExtend
+                (SIMDElem::Float(src_float), SIMDElem::Int(dst_int)) => {
+                    // Rust `as` float->int SATURATES (NaN->0, clamp to [MIN, MAX]); a bare `conv.i*`
+                    // truncates and is undefined on overflow (e.g. a large-negative `f32 -> i8`
+                    // wraps to 0 instead of -128). Reuse the per-`(float, int)` saturating
+                    // `cast_<f>_<i>` builtins that the SCALAR cast (`src/casts.rs::float_to_int`)
+                    // uses, applied per lane. f16/f128 sources and i128/u128 targets have no such
+                    // builtin — keep the plain conv there (rare in SIMD).
+                    let has_builtin = matches!(src_float, crate::Float::F32 | crate::Float::F64)
+                        && !matches!(dst_int, Int::I128 | Int::U128);
+                    if has_builtin {
+                        let name =
+                            asm.alloc_string(format!("cast_{}_{}", src_float.name(), dst_int.name()));
+                        let main_module = *asm.main_module();
+                        let cast_mref = asm.class_ref(main_module).clone().static_mref(
+                            &[src_elem_tpe],
+                            res_elem_tpe,
+                            name,
+                            asm,
+                        );
+                        asm.alloc_node(CILNode::call(cast_mref, [lane]))
                     } else {
-                        crate::cilnode::ExtendKind::ZeroExtend
-                    };
-                    asm.int_cast(lane, dst_int, extend)
+                        let extend = if dst_int.is_signed() {
+                            crate::cilnode::ExtendKind::SignExtend
+                        } else {
+                            crate::cilnode::ExtendKind::ZeroExtend
+                        };
+                        asm.int_cast(lane, dst_int, extend)
+                    }
                 }
                 (SIMDElem::Float(_), SIMDElem::Float(dst_float)) => {
                     asm.float_cast(lane, dst_float, true)
