@@ -15,25 +15,21 @@
 //!   => `Environment.SetEnvironmentVariable(<key>, null)` (deletes the var).
 //!
 //! This replaces the earlier stub (read returned `None`, writes reported
-//! `Unsupported`). The full-environment iterator (`Env`, `env()`) is still taken
-//! from the shared `unsupported` arm — enumerating every variable is a larger
-//! surface than `std::env::var`/`set_var`/`remove_var` need (those route through
-//! `getenv`/`setenv`/`unsetenv`, all real now), and the `zkvm` arm does the same.
+//! `Unsupported`). The full-environment iterator (`Env`, `env()`) is also real now:
+//! a fourth hook `rcl_dotnet_environ()` enumerates `GetEnvironmentVariables()` into a
+//! `KEY=VALUE\n` block that `env()` parses, so `std::env::vars()`/`vars_os()` work
+//! instead of panicking via the shared `unsupported` arm.
 //!
-//! Modeled on `sys/env/zkvm.rs`: build the `OsString` from the returned bytes
-//! with the platform-agnostic `os_str::Buf` + `FromInner` (no unix-only
-//! `OsStringExt`). The free-buffer hook is shared with the args arm.
+//! All `OsString`s are built from the returned bytes with the platform-agnostic
+//! `os_str::Buf` + `FromInner` (no unix-only `OsStringExt`). The free-buffer hook is
+//! shared with the args arm.
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-#[expect(dead_code)]
-#[path = "unsupported.rs"]
-mod unsupported_env;
-pub use unsupported_env::{Env, env};
-
 use crate::ffi::{CStr, OsStr, OsString};
-use crate::io;
 use crate::sys::os_str::Buf;
 use crate::sys::FromInner;
+use crate::vec;
+use crate::{fmt, io};
 
 // FIXED extern contract — the names must match EXACTLY the symbols the cilly
 // linker patches in (`cilly/src/ir/builtins/dotnet.rs`). Do not rename these.
@@ -48,6 +44,60 @@ unsafe extern "C" {
     /// `Marshal.FreeCoTaskMem((IntPtr)ptr)` — release a buffer returned by
     /// `rcl_dotnet_getenv` (shared with the args arm's `rcl_dotnet_arg`).
     fn rcl_dotnet_cotaskmem_free(ptr: *mut u8);
+    /// Enumerate `Environment.GetEnvironmentVariables()` into a freshly-allocated,
+    /// NUL-terminated UTF-8 buffer of `KEY=VALUE\n` lines (caller frees with
+    /// `rcl_dotnet_cotaskmem_free`).
+    fn rcl_dotnet_environ() -> *mut u8;
+}
+
+/// Iterator over the process environment (`std::env::vars()`/`vars_os()`).
+pub struct Env {
+    iter: vec::IntoIter<(OsString, OsString)>,
+}
+
+impl Iterator for Env {
+    type Item = (OsString, OsString);
+    fn next(&mut self) -> Option<(OsString, OsString)> {
+        self.iter.next()
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
+}
+
+impl fmt::Debug for Env {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter.as_slice().iter()).finish()
+    }
+}
+
+/// Snapshot the whole environment by parsing the `KEY=VALUE\n` block produced by
+/// `rcl_dotnet_environ`. Each line is split on its FIRST `=` (env var names cannot
+/// contain `=`); empty lines are skipped. Mirrors how the unix arm reads `environ`,
+/// but the block is built once on the .NET side rather than walking a `char**`.
+pub fn env() -> Env {
+    let mut entries: Vec<(OsString, OsString)> = Vec::new();
+    // SAFETY: the hook returns either null or a freshly-allocated NUL-terminated
+    // UTF-8 buffer that we own and free below.
+    let ptr = unsafe { rcl_dotnet_environ() };
+    if !ptr.is_null() {
+        // SAFETY: `ptr` is a valid NUL-terminated C string until we free it.
+        let bytes = unsafe { CStr::from_ptr(ptr.cast()) }.to_bytes().to_vec();
+        // SAFETY: `ptr` came from `rcl_dotnet_environ` and has not been freed; the
+        // bytes were copied out, so releasing it now is sound.
+        unsafe { rcl_dotnet_cotaskmem_free(ptr) };
+        for line in bytes.split(|&b| b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(eq) = line.iter().position(|&b| b == b'=') {
+                let key = OsString::from_inner(Buf { inner: line[..eq].to_vec() });
+                let val = OsString::from_inner(Buf { inner: line[eq + 1..].to_vec() });
+                entries.push((key, val));
+            }
+        }
+    }
+    Env { iter: entries.into_iter() }
 }
 
 pub fn getenv(key: &OsStr) -> Option<OsString> {

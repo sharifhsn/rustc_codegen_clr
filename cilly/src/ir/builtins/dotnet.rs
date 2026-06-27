@@ -1946,6 +1946,132 @@ fn insert_dotnet_env(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         }
     };
     patcher.insert(unsetenv_name, Box::new(unsetenv_gen));
+
+    // ---- rcl_dotnet_environ() -> *mut u8 (Environment.GetEnvironmentVariables) ----
+    // Enumerate the whole process environment into a freshly-allocated,
+    // NUL-terminated UTF-8 buffer of `KEY=VALUE\n` lines (the caller copies it out
+    // and frees with `rcl_dotnet_cotaskmem_free`). Backs `std::env::vars()`/`vars_os()`
+    // on the .NET PAL, which previously fell through to the panicking `unsupported`
+    // arm. Iterates the `IDictionary` returned by `Environment.GetEnvironmentVariables`
+    // with the same `IDictionaryEnumerator` walk used by the epoll shim
+    // (`posix_epoll.rs`). NOTE: lines are `\n`-separated; an environment *value*
+    // containing a literal newline would split wrong (keys cannot contain `=`/newlines,
+    // and no value can contain `\0` since the OS environ is NUL-separated). Newlines in
+    // values are pathological and never produced by real environments.
+    let environ_name = asm.alloc_string("rcl_dotnet_environ");
+    let environ_gen = move |_, asm: &mut Assembly| {
+        let u8_ptr = asm.nptr(Type::Int(Int::U8));
+        let i_dictionary = ClassRef::i_dictionary(asm);
+        let i_enumerator = ClassRef::i_enumerator(asm);
+        let dict_iter = ClassRef::dictionary_iterator(asm);
+        let dict_entry = ClassRef::dictionary_entry(asm);
+        let env = ClassRef::enviroment(asm);
+        let string_cls = ClassRef::string(asm);
+        let string_ty = asm.alloc_type(Type::PlatformString);
+        let iter_ty = asm.alloc_type(Type::ClassRef(dict_iter));
+        let entry_ty = asm.alloc_type(Type::ClassRef(dict_entry));
+
+        // Method references.
+        let get_env_vars = {
+            let n = asm.alloc_string("GetEnvironmentVariables");
+            asm.class_ref(env).clone().static_mref(&[], Type::ClassRef(i_dictionary), n, asm)
+        };
+        let get_enum = {
+            let n = asm.alloc_string("GetEnumerator");
+            asm.class_ref(i_dictionary).clone().virtual_mref(&[], Type::ClassRef(dict_iter), n, asm)
+        };
+        let move_next = {
+            let n = asm.alloc_string("MoveNext");
+            asm.class_ref(i_enumerator).clone().virtual_mref(&[], Type::Bool, n, asm)
+        };
+        let get_current = {
+            let n = asm.alloc_string("get_Current");
+            asm.class_ref(i_enumerator).clone().virtual_mref(&[], Type::PlatformObject, n, asm)
+        };
+        let entry_ref = asm.nref(Type::ClassRef(dict_entry));
+        let get_key = {
+            let n = asm.alloc_string("get_Key");
+            let sig = asm.sig([entry_ref], Type::PlatformObject);
+            asm.alloc_methodref(MethodRef::new(dict_entry, n, sig, MethodKind::Instance, [].into()))
+        };
+        let get_value = {
+            let n = asm.alloc_string("get_Value");
+            let sig = asm.sig([entry_ref], Type::PlatformObject);
+            asm.alloc_methodref(MethodRef::new(dict_entry, n, sig, MethodKind::Instance, [].into()))
+        };
+        let concat2 = {
+            let n = asm.alloc_string("Concat");
+            asm.class_ref(string_cls).clone().static_mref(
+                &[Type::PlatformString, Type::PlatformString], Type::PlatformString, n, asm)
+        };
+        let concat4 = {
+            let n = asm.alloc_string("Concat");
+            asm.class_ref(string_cls).clone().static_mref(
+                &[Type::PlatformString, Type::PlatformString, Type::PlatformString, Type::PlatformString],
+                Type::PlatformString, n, asm)
+        };
+        let to_utf8 = string_to_utf8(asm);
+        let empty = { let s = asm.ldstr(""); asm.alloc_node(s) };
+        let eq_str = { let s = asm.ldstr("="); asm.alloc_node(s) };
+        let nl_str = { let s = asm.ldstr("\n"); asm.alloc_node(s) };
+
+        const L_ACC: u32 = 0;
+        const L_ITER: u32 = 1;
+        const L_ENTRY: u32 = 2;
+
+        // Block 0: acc = ""; iter = GetEnvironmentVariables().GetEnumerator(); goto 1.
+        let store_acc0 = asm.alloc_root(CILRoot::StLoc(L_ACC, empty));
+        let dict = asm.alloc_node(CILNode::call(get_env_vars, []));
+        let iter = asm.alloc_node(CILNode::call(get_enum, [dict]));
+        let store_iter = asm.alloc_root(CILRoot::StLoc(L_ITER, iter));
+        let goto1 = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
+
+        // Block 1 (loop head): if !iter.MoveNext() goto 3 else goto 2.
+        let iter_l1 = asm.alloc_node(CILNode::LdLoc(L_ITER));
+        let has_next = asm.alloc_node(CILNode::call(move_next, [iter_l1]));
+        let br_end = asm.alloc_root(CILRoot::Branch(Box::new((3, 0, Some(BranchCond::False(has_next))))));
+        let goto2 = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None))));
+
+        // Block 2 (body): entry = (DictionaryEntry)iter.get_Current;
+        //   key=(string)entry.get_Key; val=(string)entry.get_Value;
+        //   acc = Concat(acc, key, "=", Concat(val, "\n")); goto 1.
+        let iter_l2 = asm.alloc_node(CILNode::LdLoc(L_ITER));
+        let cur = asm.alloc_node(CILNode::call(get_current, [iter_l2]));
+        let entry = asm.unbox_any(cur, entry_ty);
+        let store_entry = asm.alloc_root(CILRoot::StLoc(L_ENTRY, entry));
+        let ek = asm.alloc_node(CILNode::LdLocA(L_ENTRY));
+        let key_obj = asm.alloc_node(CILNode::call(get_key, [ek]));
+        let key = asm.alloc_node(CILNode::CheckedCast(key_obj, string_ty));
+        let ev = asm.alloc_node(CILNode::LdLocA(L_ENTRY));
+        let val_obj = asm.alloc_node(CILNode::call(get_value, [ev]));
+        let val = asm.alloc_node(CILNode::CheckedCast(val_obj, string_ty));
+        let val_nl = asm.alloc_node(CILNode::call(concat2, [val, nl_str]));
+        let acc_l = asm.alloc_node(CILNode::LdLoc(L_ACC));
+        let new_acc = asm.alloc_node(CILNode::call(concat4, [acc_l, key, eq_str, val_nl]));
+        let store_acc2 = asm.alloc_root(CILRoot::StLoc(L_ACC, new_acc));
+        let goto1b = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
+
+        // Block 3 (return): return (u8*)StringToCoTaskMemUTF8(acc).
+        let acc_final = asm.alloc_node(CILNode::LdLoc(L_ACC));
+        let buf = asm.alloc_node(CILNode::call(to_utf8, [acc_final]));
+        let buf = asm.cast_ptr(buf, u8_ptr);
+        let ret = asm.alloc_root(CILRoot::Ret(buf));
+
+        MethodImpl::MethodBody {
+            blocks: vec![
+                BasicBlock::new(vec![store_acc0, store_iter, goto1], 0, None),
+                BasicBlock::new(vec![br_end, goto2], 1, None),
+                BasicBlock::new(vec![store_entry, store_acc2, goto1b], 2, None),
+                BasicBlock::new(vec![ret], 3, None),
+            ],
+            locals: vec![
+                (Some(asm.alloc_string("acc")), string_ty),
+                (Some(asm.alloc_string("iter")), iter_ty),
+                (Some(asm.alloc_string("entry")), entry_ty),
+            ],
+        }
+    };
+    patcher.insert(environ_name, Box::new(environ_gen));
 }
 
 // ===========================================================================

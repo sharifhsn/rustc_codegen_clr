@@ -35,6 +35,41 @@ These are annotated with `#[ignore = "..."]` on the f32 variant in the harness c
 `library/coretests/tests/num/floats.rs`. To skip them when running an unpatched coretests binary:
 `--skip num::floats::next_up::test_f32 --skip num::floats::next_down::test_f32`.
 
+# `library/std/tests/*.rs` integration-test census (.NET PAL)
+
+Running the toolchain's std integration tests through the backend. **Passing**: `num` (incl. signed
+`SystemTime`), `thread`, `time`, `panic`, `path` (35/0), `error` (14/0), `env` (8/0 — `vars()`/
+`vars_os()` now work, see below), `eq-multidispatch`, `istr`, `seq-compare`, `type-name-unsized`,
+`volatile-fat-ptr`, `builtin-clone`, `ambiguous-hash_map`, `minmax-stability-issue-23687`,
+`run-time-detect`, `slice-from-array-issue-113238`, `log-knows-the-names-of-variants-in-std`,
+`create_dir_all_bare`.
+
+**`env::vars()`/`vars_os()` — FIXED.** Previously the dotnet env PAL re-exported `Env`/`env()` from
+the panicking `unsupported` arm, so any full-environment enumeration aborted. Added a fourth env hook
+`rcl_dotnet_environ()` (enumerates `Environment.GetEnvironmentVariables()` into a `KEY=VALUE\n` block)
+and a real parsing `env()` in `dotnet_pal/sys/env/dotnet.rs`. `env` test now 8/0.
+
+The remaining std-integration failures are **PAL feature gaps / inherent .NET platform limits**, not
+codegen miscompiles:
+
+- **`env_modify::test_set_var_overwrite` — inherent .NET limit (won't-fix).** It does
+  `set_var(k,"")` then expects `var_os(k) == Some("")`. .NET's `Environment.SetEnvironmentVariable(k,"")`
+  **deletes** the variable (documented cross-platform .NET behavior — verified: after a `""`-set,
+  `GetEnvironmentVariable` returns `null` and the var is absent from `GetEnvironmentVariables()`). There
+  is **no representation that is both present-to-Rust and visible to .NET's `Environment`**: a libc
+  `setenv(k,"",1)` *does* store the empty value (libc `getenv` sees it) but .NET's
+  `GetEnvironmentVariable` still returns `null` for it. So any workaround (a side overlay, or routing env
+  through libc) would desync Rust's environment from .NET's `Environment` — strictly worse for the
+  H2 interop goal (C# and Rust sharing one process environment). We match .NET semantics: an env var set
+  to the empty string reads back as absent. The other 6 `env_modify` behaviors (set / remove /
+  overwrite-to-nonempty) pass.
+- **`switch-stdout` — does not compile.** Needs `OwnedFd: From<File>` (fd-backed `std::fs::File`), a
+  deferred PAL feature (`File` is not yet fd-table-backed on .NET).
+- **`process_spawning` / `pipe_subprocess` — process spawning unimplemented.** `process_spawning`
+  hits `Unsupported` at the first `fs::copy` (file copy is not yet a PAL hook); the test then re-execs
+  its own binary, which the .NET PAL cannot do (no `fork`/`exec`). `pipe_subprocess` is cfg-gated to 0
+  tests on this target.
+
 # List of broken core test:
 ## Did not compleate:
 ```
