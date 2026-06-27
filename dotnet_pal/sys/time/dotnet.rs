@@ -43,10 +43,23 @@ const DOTNET_TICKS_AT_UNIX_EPOCH: i64 = 621_355_968_000_000_000;
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub struct Instant(Duration);
 
+/// Wall-clock time as a SIGNED offset from the Unix epoch, mirroring the unix
+/// `Timespec` (`secs: i64`, `nanos` always normalized into `0..1_000_000_000`).
+///
+/// The previous representation was a plain `Duration`, which is UNSIGNED: it could
+/// not represent any time before 1970, and made `SystemTime::{MIN, MAX}` wrong
+/// (`MIN` was the epoch, `MAX` was `u64::MAX` seconds) — so `UNIX_EPOCH - 1s`
+/// returned `None`, file timestamps before the epoch were unrepresentable, and the
+/// coretests/std `system_time_duration_since_max_range_on_unix` regression test
+/// (which the `cfg(unix)` target runs) aborted. Because `nanos` stays normalized,
+/// the derived `Ord` compares `secs` then `nanos`, i.e. chronological order.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
-pub struct SystemTime(Duration);
+pub struct SystemTime {
+    secs: i64,
+    nanos: u32,
+}
 
-pub const UNIX_EPOCH: SystemTime = SystemTime(Duration::from_secs(0));
+pub const UNIX_EPOCH: SystemTime = SystemTime { secs: 0, nanos: 0 };
 
 /// Convert a raw monotonic tick count + frequency into a `Duration` since the
 /// counter's (arbitrary) zero, using 128-bit math so the multiply by 1e9 cannot
@@ -85,32 +98,65 @@ impl Instant {
 }
 
 impl SystemTime {
-    pub const MAX: SystemTime = SystemTime(Duration::MAX);
+    pub const MAX: SystemTime = SystemTime { secs: i64::MAX, nanos: 999_999_999 };
 
-    pub const MIN: SystemTime = SystemTime(Duration::ZERO);
+    pub const MIN: SystemTime = SystemTime { secs: i64::MIN, nanos: 0 };
 
     pub fn now() -> SystemTime {
         // SAFETY: as above — a single argumentless BCL property read.
         let dotnet_ticks = unsafe { rcl_dotnet_unix_ticks() };
         // Rebase onto the Unix epoch. Wall-clock time on any sane system is well
-        // after 1970, so the difference is non-negative; clamp the impossible
-        // pre-epoch case to UNIX_EPOCH rather than wrapping.
+        // after 1970, so the offset is non-negative and fits in i64 seconds; clamp
+        // the impossible pre-epoch case to UNIX_EPOCH rather than wrapping.
         let since_epoch = dotnet_ticks.saturating_sub(DOTNET_TICKS_AT_UNIX_EPOCH).max(0) as u64;
-        let secs = since_epoch / 10_000_000;
+        let secs = (since_epoch / 10_000_000) as i64;
         let sub_ticks = since_epoch % 10_000_000;
-        let sub_nanos = (sub_ticks * NANOS_PER_DOTNET_TICK) as u32;
-        SystemTime(Duration::new(secs, sub_nanos))
+        let nanos = (sub_ticks * NANOS_PER_DOTNET_TICK) as u32;
+        SystemTime { secs, nanos }
     }
 
     pub fn sub_time(&self, other: &SystemTime) -> Result<Duration, Duration> {
-        self.0.checked_sub(other.0).ok_or_else(|| other.0 - self.0)
+        if *self >= *other {
+            // `self - other` as a non-negative `Duration`. The seconds difference is
+            // computed with wrapping arithmetic (the unix arm relies on the same
+            // modular semantics) so the extreme `MAX - MIN == Duration::MAX` case
+            // does not overflow-panic.
+            let (secs, nanos) = if self.nanos >= other.nanos {
+                (self.secs.wrapping_sub(other.secs) as u64, self.nanos - other.nanos)
+            } else {
+                (
+                    self.secs.wrapping_sub(other.secs).wrapping_sub(1) as u64,
+                    self.nanos + 1_000_000_000 - other.nanos,
+                )
+            };
+            Ok(Duration::new(secs, nanos))
+        } else {
+            match other.sub_time(self) {
+                Ok(d) => Err(d),
+                Err(d) => Ok(d),
+            }
+        }
     }
 
     pub fn checked_add_duration(&self, other: &Duration) -> Option<SystemTime> {
-        Some(SystemTime(self.0.checked_add(*other)?))
+        let mut secs = self.secs.checked_add_unsigned(other.as_secs())?;
+        // Each operand's nanos are < 1e9, so the sum fits in a u32 and carries at
+        // most one second.
+        let mut nanos = self.nanos + other.subsec_nanos();
+        if nanos >= 1_000_000_000 {
+            nanos -= 1_000_000_000;
+            secs = secs.checked_add(1)?;
+        }
+        Some(SystemTime { secs, nanos })
     }
 
     pub fn checked_sub_duration(&self, other: &Duration) -> Option<SystemTime> {
-        Some(SystemTime(self.0.checked_sub(*other)?))
+        let mut secs = self.secs.checked_sub_unsigned(other.as_secs())?;
+        let mut nanos = self.nanos as i32 - other.subsec_nanos() as i32;
+        if nanos < 0 {
+            nanos += 1_000_000_000;
+            secs = secs.checked_sub(1)?;
+        }
+        Some(SystemTime { secs, nanos: nanos as u32 })
     }
 }
