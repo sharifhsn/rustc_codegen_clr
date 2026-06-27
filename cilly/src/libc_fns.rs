@@ -698,8 +698,6 @@ pub const LIBM_FNS: &[&str] = &[
     "hypot",
     "lgammaf_r",
     "lgamma_r",
-    "log1p",
-    "log1pf",
     "tgamma",
     "tgammaf",
     "fmodl",

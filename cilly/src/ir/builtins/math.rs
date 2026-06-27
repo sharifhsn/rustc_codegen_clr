@@ -117,6 +117,74 @@ pub fn cosh(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     };
     patcher.insert(name, Box::new(generator));
 }
+// `expm1`/`log1p` (and their f32 forms) have no `System.Math` equivalent, so compose them from
+// `Exp`/`Log`. The naive `exp(x)-1` / `log(1+x)` lose precision for |x| very near 0 (catastrophic
+// cancellation), but every std/libm caller (e.g. the Zipf rejection sampler's `helper1`/`helper2`)
+// already switches to a Taylor series for |x| < ~1e-8 and only calls these for larger |x|, where the
+// naive forms are accurate. A portable `Math`-based body also avoids the Linux-only `libm.so.6`
+// P/Invoke (`LIBM_FNS`), which does not resolve on macOS/Windows. Surfaced by alloctests
+// `sort::*::correct_i32_random_z{1_03,2}` (Zipf with a non-1.0 exponent), which crashed with
+// `missing method expm1`.
+pub fn expm1(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("expm1");
+    let generator = move |_, asm: &mut Assembly| {
+        let arg = asm.alloc_node(CILNode::LdArg(0));
+        let exp = Float::F64.math1(arg, asm, "Exp");
+        let one = asm.alloc_node(Const::F64(HashableF64(1.0)));
+        let res = asm.alloc_node(CILNode::BinOp(exp, one, BinOp::Sub));
+        let ret = asm.alloc_root(CILRoot::Ret(res));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+pub fn expm1f(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("expm1f");
+    let generator = move |_, asm: &mut Assembly| {
+        let arg = asm.alloc_node(CILNode::LdArg(0));
+        let exp = Float::F32.math1(arg, asm, "Exp");
+        let one = asm.alloc_node(Const::F32(HashableF32(1.0)));
+        let res = asm.alloc_node(CILNode::BinOp(exp, one, BinOp::Sub));
+        let ret = asm.alloc_root(CILRoot::Ret(res));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+pub fn log1p(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("log1p");
+    let generator = move |_, asm: &mut Assembly| {
+        let arg = asm.alloc_node(CILNode::LdArg(0));
+        let one = asm.alloc_node(Const::F64(HashableF64(1.0)));
+        let onepx = asm.alloc_node(CILNode::BinOp(one, arg, BinOp::Add));
+        let log = Float::F64.math1(onepx, asm, "Log");
+        let ret = asm.alloc_root(CILRoot::Ret(log));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+pub fn log1pf(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("log1pf");
+    let generator = move |_, asm: &mut Assembly| {
+        let arg = asm.alloc_node(CILNode::LdArg(0));
+        let one = asm.alloc_node(Const::F32(HashableF32(1.0)));
+        let onepx = asm.alloc_node(CILNode::BinOp(one, arg, BinOp::Add));
+        let log = Float::F32.math1(onepx, asm, "Log");
+        let ret = asm.alloc_root(CILRoot::Ret(log));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
 pub fn ldexp(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("ldexp");
     let generator = move |_, asm: &mut Assembly| {
@@ -159,6 +227,10 @@ pub fn math(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     sinh(asm, patcher);
     coshf(asm, patcher);
     cosh(asm, patcher);
+    expm1(asm, patcher);
+    expm1f(asm, patcher);
+    log1p(asm, patcher);
+    log1pf(asm, patcher);
 }
 pub fn bitreverse(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     bitreverse_u32(asm, patcher);
