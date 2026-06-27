@@ -12,6 +12,29 @@
 6. Clean the build cache using `cargo clean` again before rebuilding to prevent issues. DO NOT SKIP THS STEP.
 7. Repeat steps 2-7 untill the test program can no longer be simplified.
 8. Create an issue with your simplified broken test.
+# Known-deferred (won't-fix) tests — signaling-NaN payload on f32
+
+These pass natively but are **intentionally ignored** under `rustc_codegen_clr`, because they assert
+a property .NET does not provide and Rust does not guarantee portably:
+
+- `num::floats::next_up::test_f32`
+- `num::floats::next_down::test_f32`
+
+**Why.** Both check that a *signaling* NaN round-trips bit-exactly through `next_up`/`next_down`
+(which return `self` for a NaN). On .NET an f32 signaling NaN is **quieted** (its quiet bit gets set,
+e.g. `0x7f955555` → `0x7fd55555`) whenever it is materialized as a live `float32` on the CLI
+evaluation stack or in a managed local — ECMA-335 §I.12.1.3 lets f32 use a wider internal
+representation, and the f32↔wider conversions canonicalize sNaN→qNaN. Since these functions surface
+the value as an `f32`, the payload cannot be preserved without representing **every** f32 as raw
+`u32` bits throughout the bit-manipulation paths (a pervasive rewrite) — disproportionate for a
+property that even Rust marks platform-dependent. `f64` is full-width and unaffected (`test_f64`
+passes). The mechanism was pinned to a `stloc`/`ldloc` of a `float32` local in the coretests `.il`;
+direct uses, arrays (`stind.r4`/`ldind.r4`), and `f64` all preserve.
+
+These are annotated with `#[ignore = "..."]` on the f32 variant in the harness copy of
+`library/coretests/tests/num/floats.rs`. To skip them when running an unpatched coretests binary:
+`--skip num::floats::next_up::test_f32 --skip num::floats::next_down::test_f32`.
+
 # List of broken core test:
 ## Did not compleate:
 ```
