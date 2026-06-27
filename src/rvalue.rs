@@ -59,6 +59,38 @@ pub fn is_rvalue_const_0<'tcx>(
         _ => false,
     }
 }
+/// Discriminant of a `Variants::Single` enum (a layout with a single inhabited
+/// variant — either a ZST enum or a tag-less sized enum such as the `Result<Infallible, _>`
+/// residual of `Try::branch`). Such layouts carry no in-memory tag, so the discriminant is
+/// the *constant* discriminant of that sole inhabited variant (mapped through any explicit
+/// `#[repr]` discriminant), cast to `target`. Falls back to `index` if there is no explicit
+/// discriminant, and to 0 for any non-`Single` layout (defensive; the callers only reach
+/// this for tag-less layouts).
+fn single_variant_discr<'tcx>(
+    owner_ty: Ty<'tcx>,
+    target: Type,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Node {
+    let index = match ctx.layout_of(owner_ty).layout.variants {
+        rustc_abi::Variants::Single { index } => Some(index),
+        _ => None,
+    };
+    let discr_val: u128 = match index {
+        Some(index) => owner_ty
+            .discriminant_for_variant(ctx.tcx(), index)
+            .map_or(u128::from(index.as_u32()), |discr| discr.val),
+        None => 0,
+    };
+    match target {
+        Type::Int(Int::U128) => ctx.alloc_node(discr_val),
+        Type::Int(Int::I128) => ctx.alloc_node(discr_val as i128),
+        _ => {
+            let v = ctx
+                .alloc_node(u64::try_from(discr_val).expect("single-variant discriminant fits in u64"));
+            crate::casts::int_to_int(Type::Int(Int::U64), target, v, ctx)
+        }
+    }
+}
 pub fn handle_rvalue<'tcx>(
     rvalue: &Rvalue<'tcx>,
     target_location: &Place<'tcx>,
@@ -311,21 +343,22 @@ pub fn handle_rvalue<'tcx>(
             let target = ctx.type_from_cache(owner_ty.discriminant_ty(ctx.tcx()));
             let (disrc_type, _) = enum_tag_info(layout.layout, ctx);
             let Type::ClassRef(owner) = owner else {
-                eprintln!("Can't get the discirminant of type {owner_ty:?}, because it is a zst. Size:{} Discr type:{:?}",layout.layout.size.bytes(), owner_ty.discriminant_ty(ctx.tcx()));
-                let zero = ctx.alloc_node(0_i32);
-                return (
-                    vec![],
-                    crate::casts::int_to_int(Type::Int(Int::I32), target, zero, ctx),
-                );
+                // ZST enum (e.g. `Result<Infallible, ()>` — uninhabited `Ok`, ZST `Err`
+                // payload): no in-memory discriminant. It is a `Variants::Single` layout,
+                // so the discriminant is the constant discriminant of the sole inhabited
+                // variant. A hardcoded 0 misrouted such values into the layout's first
+                // variant (the uninhabited one) and aborted in the dead arm.
+                return (vec![], single_variant_discr(owner_ty, target, ctx));
             };
 
             if disrc_type == Type::Void {
-                // TODO: This always returns 0 if the discriminat type is `()` - this seems to work, but is incorrect. I should be finding the only inhabited variant instead.
-                let zero = ctx.alloc_node(0_i32);
-                (
-                    vec![],
-                    crate::casts::int_to_int(Type::Int(Int::I32), target, zero, ctx),
-                )
+                // Tag-less but sized enum (one inhabited variant carrying a payload, e.g.
+                // `Result<Infallible, i32>` where `Ok` is uninhabited): same as the ZST
+                // case — the discriminant is the constant discriminant of that one
+                // inhabited variant, not a hardcoded 0. Returning 0 made a generic `match`
+                // monomorphized for `Result<Infallible, _>` read `Ok` and walk into the
+                // uninhabited arm.
+                (vec![], single_variant_discr(owner_ty, target, ctx))
             } else {
                 let discr = get_discr(layout.layout, addr, owner, owner_ty, ctx);
                 (
