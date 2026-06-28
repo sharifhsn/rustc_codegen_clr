@@ -292,6 +292,23 @@ impl Assembly {
     }
     /// Optimizes the assembly uitill all fuel is consumed, or no more progress can be made
     pub fn opt(&mut self, fuel: &mut OptFuel) {
+        // The general single-block inliner is made sound by an assembly-level snapshot/revert: take a
+        // pre-opt snapshot of every method body, optimize, then typecheck each method at its FINAL
+        // state and revert any that inlining left ill-typed back to its (always type-valid)
+        // un-optimized body. Checking here — at the same point + with the same `MethodDef::typecheck`
+        // the fatal verifier uses — avoids the per-method-verify timing fragility (a method's state
+        // can change between an in-`optimize` check and the final whole-assembly check).
+        let inline = crate::ir::opt::inlining_enabled();
+        let snapshots = if inline {
+            let m: std::collections::HashMap<_, _> = self
+                .method_defs
+                .iter()
+                .map(|(k, v)| (*k, v.implementation().clone()))
+                .collect();
+            Some(m)
+        } else {
+            None
+        };
         let mut cache = SideEffectInfoCache::default();
         while !fuel.exchausted() {
             let prev = fuel.clone();
@@ -301,6 +318,29 @@ impl Assembly {
                 break;
             }
             //let _pass_min_cost: bool = fuel.consume(1);
+        }
+        if let Some(snapshots) = snapshots {
+            let methods: Box<[_]> = self.method_defs.keys().copied().collect();
+            for method in methods {
+                let mut m = self.borrow_methoddef(method);
+                // Non-printing typecheck of the method at its final optimized state (the dump in
+                // `MethodDef::typecheck` would be noisy for every reverted method).
+                let sig = m.sig();
+                let locals: Vec<_> = m.iter_locals(self).cloned().collect();
+                let roots: Vec<_> = m
+                    .iter_roots_mut()
+                    .map(|it| it.map(|r| *r).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let ill_typed = roots
+                    .into_iter()
+                    .any(|r| self.get_root(r).clone().typecheck(sig, &locals, self).is_err());
+                if ill_typed {
+                    if let Some(snap) = snapshots.get(&method) {
+                        *m.implementation_mut() = snap.clone();
+                    }
+                }
+                self.return_methoddef(method, m);
+            }
         }
     }
     /// Optimizes the assembly, cosuming some fuel. This performs a single optimization pass.

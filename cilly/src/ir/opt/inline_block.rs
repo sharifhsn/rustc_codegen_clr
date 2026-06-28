@@ -25,21 +25,23 @@
 use super::OptFuel;
 use crate::{
     bimap::Interned, cilnode::MethodKind, method::LocalDef, Assembly, BasicBlock, CILNode, CILRoot,
-    FnSig, MethodImpl, MethodRef,
+    MethodImpl, MethodRef,
 };
 
 /// Callees larger than this many roots are not inlined (guards against code-size blowup).
 const MAX_CALLEE_ROOTS: usize = 48;
 
-/// Whether the general inliner is enabled. **Opt-in (default OFF)** while a residual soundness issue
-/// is resolved: the per-site arg/return type guards below are necessary but not yet sufficient — a
-/// representation pun can still be surfaced onto a spliced store by a *later* pass (`propagate_locals`
-/// folding a niche-encoded value through the fresh temps), which the fatal CIL type-verifier then
-/// (correctly) rejects, so `core`/`std` fail to compile with it on. The splice machinery + guards are
-/// complete and compile-verified; the remaining work is to make the inline atomic w.r.t. the
-/// downstream passes (e.g. typecheck the whole method after splicing and roll back on failure, or
-/// only inline returns/args that are type-faithful *carriers* — `Call`/`LdLoc`/`LdArg` — never
-/// computed expressions). Set `INLINE_BLOCKS=1` to experiment.
+/// Whether the general inliner is enabled. **Opt-in (default OFF)** — set `INLINE_BLOCKS=1`.
+///
+/// Status: TYPE-safety is solved. The assembly-level snapshot/verify/revert net in `Assembly::opt`
+/// (typecheck every method at its final state, revert any inlining left ill-typed to its trusted
+/// un-optimized body) plus the `.cctor`/`.tcctor` skip make the inliner produce only type-valid CIL
+/// that compiles, links, and runs. The remaining blocker is a residual *semantic* miscompile in the
+/// splice: a type-valid but behaviourally-wrong inline (e.g. collecting `(0..n).map(f)` into a `Vec`
+/// faults). The type verifier cannot catch this by construction; it needs differential debugging
+/// (run with `INLINE_BLOCKS=1` under the diff oracle, bisect to the miscompiled method, dump its
+/// pre/post-inline IR). Suspects: argument-by-value vs by-address evaluation, or the `Ret`->`StLoc`
+/// tail when the returned value aliases a caller local.
 #[must_use]
 pub fn inlining_enabled() -> bool {
     matches!(std::env::var("INLINE_BLOCKS").as_deref(), Ok("1"))
@@ -61,7 +63,6 @@ pub fn inline_single_block_calls(
     blocks: &mut [BasicBlock],
     locals: &mut Vec<LocalDef>,
     self_ref: Interned<MethodRef>,
-    caller_sig: Interned<FnSig>,
     asm: &mut Assembly,
     fuel: &mut OptFuel,
 ) -> bool {
@@ -72,7 +73,7 @@ pub fn inline_single_block_calls(
         let old: Vec<Interned<CILRoot>> = std::mem::take(block.roots_mut());
         let mut new_roots = Vec::with_capacity(old.len());
         for root in old {
-            match try_inline_root(root, self_ref, caller_sig, locals, asm, fuel) {
+            match try_inline_root(root, self_ref, locals, asm, fuel) {
                 Some(spliced) => {
                     new_roots.extend(spliced);
                     changed = true;
@@ -89,7 +90,6 @@ pub fn inline_single_block_calls(
 fn try_inline_root(
     root_idx: Interned<CILRoot>,
     self_ref: Interned<MethodRef>,
-    caller_sig: Interned<FnSig>,
     caller_locals: &mut Vec<LocalDef>,
     asm: &mut Assembly,
     fuel: &mut OptFuel,
@@ -140,52 +140,19 @@ fn try_inline_root(
     if croots.len() > MAX_CALLEE_ROOTS || !is_straightline_returning(&croots, asm) {
         return None;
     }
-    // SOUNDNESS GUARD for the `StLoc` tail. `Ret`/`Drop` tails are always safe: turning the callee's
-    // `Ret(v)` into the caller's `Ret(v)` reuses the same lenient return-boundary check that already
-    // accepted the callee, and `Pop(v)` discards `v` with no type constraint. But `StLoc(dest, v)` is
-    // checked strictly, and `v` may be a representation pun the callee only ever exposes across the
-    // return boundary (e.g. computing an `Option<&u8>` niche as a raw `u64` and returning it). So for
-    // an `StLoc` tail, only inline when the callee's returned value is *assignable* to the
-    // destination local — which keeps the type-faithful cases (the iterator hot path: a `u64`-typed
-    // closure result into a `u64` accumulator) and skips the punning ones.
-    if let Tail::StLoc(loc) = tail {
-        let ret_val = croots.iter().rev().find_map(|&r| match asm.get_root(r) {
-            CILRoot::Ret(v) => Some(*v),
-            _ => None,
-        });
-        let Some(rv) = ret_val else { return None };
-        let Ok(got) = asm.get_node(rv).clone().typecheck(def.sig(), &clocals, asm) else {
-            return None;
-        };
-        let expected = asm[caller_locals[loc as usize].1];
-        // EXACT equality (not merely assignable): `is_assignable_to` accepts representation puns
-        // (e.g. a `u64` niche into an `Option<&u8>`) that the strict `StLoc` check later rejects, and
-        // a punned value can be surfaced onto this store by `propagate_locals`. Exact types are
-        // pun-free and survive the downstream passes. The iterator hot path is exact (`u64`->`u64`).
-        if got != expected {
-            return None;
-        }
-    }
     // Arg count must match the signature (static call: args == params).
     let sig_inputs: Vec<crate::Type> = asm[def.sig()].inputs().to_vec();
     if sig_inputs.len() != args.len() {
         return None;
     }
-    // SOUNDNESS GUARD for argument materialization (symmetric to the `StLoc`-tail guard): we evaluate
-    // each arg into a fresh local typed as the *parameter*, so the store `StLoc(temp:param, arg)`
-    // must typecheck. A caller can pun across the call boundary too (pass a raw word where the param
-    // is a niche type), so require each arg's type to be assignable to its parameter type. The
-    // iterator hot path passes only `void*`/`u64` matching the params, so it is unaffected.
-    for (i, &arg) in args.iter().enumerate() {
-        let Ok(got) = asm.get_node(arg).clone().typecheck(caller_sig, caller_locals, asm) else {
-            return None;
-        };
-        // Exact equality (see the StLoc-tail guard): a punned arg would store a mistyped value into
-        // the param temp, which `propagate_locals` can then surface as an ill-typed assignment.
-        if got != sig_inputs[i] {
-            return None;
-        }
-    }
+    // No per-site type guards: soundness is enforced at the *method* level. The IR-with-lenient-puns
+    // model means a representation pun (e.g. core `dec2flt` computing an `Option<&u8>` niche as a raw
+    // `u64`) can be moved by a later `propagate_locals` pass across the boundary between a
+    // pun-accepting and a pun-rejecting context — which no per-boundary guard here can see. Instead,
+    // `MethodDef::optimize` snapshots the method, inlines + runs the normal passes, then typechecks
+    // the result and reverts the whole method to its (trusted) pre-inline form if it became
+    // ill-typed. So this pass may freely splice; only inlines that survive the full optimize +
+    // verify are kept.
     // Budget: cost ~ body size + arg materialization.
     if !fuel.consume((croots.len() + args.len() + 4) as u32) {
         return None;
