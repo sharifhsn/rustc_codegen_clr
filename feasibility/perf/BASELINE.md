@@ -89,3 +89,42 @@ gate (426/14, no regressions).
 
 Remaining perf axes are unchanged by this work: allocation cost (`box_churn`/`vec_churn`, the
 gen-0-vs-malloc memory-model axis) and the RyuJIT scalar ceiling.
+
+---
+
+## Run 3 — SROA (scalar replacement of non-escaping aggregates) + checked-arith de-call
+
+A second RyuJIT-friendliness pass, `cilly/src/ir/opt/scalarize.rs` (default ON; `SROA=0` disables).
+Even after MIR inlining collapses an iterator chain, the body still builds a per-element `Option<T>`
+and — for `.sum()`/`.product()` — an overflow-check `(T,bool)` tuple, both via `ldloca; stfld`. That
+address-taken form makes RyuJIT mark the local **address-exposed** and refuse to enregister it. The
+pass splits such a non-escaping aggregate local into per-field **scalar** locals (escape-checked +
+field-overlap-guarded for soundness), after which copy-prop + dead-store-elim forward the live field
+and delete the dead ones. A small companion step **de-calls** the `ovf_check_tuple` helper into field
+stores first, so the same scalarizer dissolves the checked-arithmetic tuple — and since the overflow
+`assert` is already elided in release, the whole overflow apparatus (the redundant add, the carry
+compare, the tuple) falls out as dead code, leaving a plain wrapping add (exactly what native gets).
+
+Isolation on a focused probe (`v_iter = (0..n).map.filter.sum`, normalized to an in-run manual-loop
+control to cancel machine load): the dead **overflow check was ~40% of `v_iter`**; removing it took
+`v_iter` from **2.0–2.55× → 1.30–1.46×** the manual loop.
+
+Full harness, on top of Run 2 (MIR inlining):
+
+| workload     | native | backend (Run 2) | **backend (Run 3)** | further | bk/nat | bk/C# |
+|--------------|-------:|----------------:|--------------------:|--------:|-------:|------:|
+| iter_sum     |  30.5  |           343.7 |           **155.8** | **2.2×**|  5.1×  |  2.7× |
+| iter_indexed |  30.5  |           112.2 |               110.3 |   flat  |  3.6×  |  1.9× |
+| sort_ints    |  14.7  |           263.2 |               224.9 |  better |  15.3× |  3.0× |
+| vec_churn    |  35.1  |          1125.2 |              1016.3 |  better |  29.0× | 14.7× |
+
+`iter_sum` is now **1.4× the hand-written manual loop** (down from 15× at the original baseline) and
+**5.1× native** (down from 57.7×). Cumulative across Run 2 + Run 3: **1764 → 156 ms = 11.3×**. The win
+generalizes — sort/vec/box all improved — because it removes address-exposed value-type locals across
+all struct-heavy code, not just iterators. The remaining `iter_sum`-vs-manual gap and the
+`iter_indexed`/`int_arith` ~3.6× vs native are the RyuJIT scalar/autovectorization ceiling.
+
+Correctness: three native-vs-backend differential checksums byte-identical, including a probe that
+exercises the **live** overflow path (`checked_mul`/`checked_add` → `Some`/`None`, which must keep the
+flag) alongside the dead path (`sum`/`product`) and sub-word (`i8`) checked+saturating arithmetic;
+plus the `::stable` gate (426/14, no regressions) under the fatal CIL type-checker.

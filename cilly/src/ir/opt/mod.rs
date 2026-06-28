@@ -15,6 +15,7 @@ pub use opt_fuel::OptFuel;
 pub use side_effect::*;
 mod inline;
 mod opt_fuel;
+mod scalarize;
 mod opt_node;
 mod root;
 mod side_effect;
@@ -716,6 +717,17 @@ impl MethodDef {
         // so a `(0..n).map(f).filter(g).sum()` is collapsed into one flat loop BEFORE codegen (see
         // the harness RUSTFLAGS). That is correct by construction (typed MIR + real borrow info), so
         // the CIL optimizer here does only local, intra-method cleanup; it does NOT inline calls.
+        //
+        // Scalar-replacement of non-escaping aggregate locals runs FIRST: it turns a field-built,
+        // address-exposed `Option`/tuple/struct local (which RyuJIT cannot enregister) into per-field
+        // scalar locals, so the copy-prop + dead-store passes below forward and delete them and
+        // RyuJIT keeps the live field in a register. The dead discriminant store falls out as a dead
+        // write on the next fixpoint iteration.
+        if scalarize::sroa_enabled() {
+            if let MethodImpl::MethodBody { blocks, locals } = self.implementation_mut() {
+                scalarize::scalarize_aggregates(blocks, locals, asm, fuel);
+            }
+        }
         self.implementation_mut()
             .propagate_locals(asm, cache, fuel, sig);
         self.implementation_mut()
