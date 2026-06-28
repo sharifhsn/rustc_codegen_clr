@@ -22,8 +22,18 @@ use std::path::Path;
 /// is inert (nothing reads it) and `--check-cfg`-declared (no `unexpected_cfgs` warning).
 /// Matches the shell logic in `_cargo_dotnet_core.sh`.
 pub fn assemble(backend_dylib: &Path, linker: &Path) -> String {
+    // `-Z inline-mir-hint-threshold=500`: raise rustc's MIR-inliner budget for `#[inline]`
+    // items (iterator combinators, closures, small wrappers — the zero-cost-abstraction
+    // surface). rustc inlines these conservatively because the native pipeline lets LLVM
+    // finish the job; our backend hands MIR to RyuJIT, which won't inline struct-returning
+    // adapter chains, so `(0..n).map(f).filter(g).sum()` would otherwise survive as a
+    // per-element `Range::fold` CALL. Collapsing the chain at the MIR level (typed, with
+    // real borrow info, battle-tested) gives RyuJIT the same flat loop LLVM gets for native.
+    // Inert in debug (mir-opt-level 1 disables the MIR inliner); non-`#[inline]` fns keep the
+    // default `threshold` (50).
     let base = format!(
-        "-Z codegen-backend={dylib} -C linker={linker} -C link-args=--cargo-support",
+        "-Z codegen-backend={dylib} -C linker={linker} -C link-args=--cargo-support \
+         -Z inline-mir-hint-threshold=500",
         dylib = backend_dylib.display(),
         linker = linker.display(),
     );

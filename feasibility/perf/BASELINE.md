@@ -52,3 +52,40 @@ fib_rec             12.7      35.2      21.9      2.8x     1.6x            0    
 - `bk/nat` overstates the "real" gap for scalar code because native = LLVM -O3 (autovectorized);
   `bk/C#` is the fairer peer comparison (both on RyuJIT).
 - Concurrency caveat: don't run two `cargo dotnet` builds at once (shared target dir / config).
+
+---
+
+## Run 2 — MIR-level inlining (the zero-cost-abstraction fix)
+
+The #1 bottleneck above (iterators not collapsing) is fixed at the **MIR layer**, not the CIL layer.
+rustc's own MIR inliner already runs at `mir-opt-level>=2` (release) but is tuned conservatively
+because the native pipeline lets LLVM finish inlining `#[inline]` adapter chains. Our backend hands
+MIR to RyuJIT, which will **not** inline struct-returning adapter chains — so `(0..n).map(f).sum()`
+survived as a per-element `Range::fold` CALL. Raising **only** the `#[inline]` budget,
+`-Z inline-mir-hint-threshold=500` (in the cargo-dotnet harness RUSTFLAGS), makes rustc collapse the
+whole chain into one flat loop *before* the backend sees it — correct by construction (typed MIR +
+real borrow info), exactly the MIR LLVM gets for native.
+
+| workload     | native | backend (Run 1) | **backend (Run 2)** | speedup | bk/nat | bk/C# |
+|--------------|-------:|----------------:|--------------------:|--------:|-------:|------:|
+| iter_sum     |  29.8  |          1763.9 |           **343.7** | **5.1×**|  11.5× |  6.1× |
+| iter_zip     |  35.7  |          2765.0 |           **575.3** | **4.8×**|  16.1× | 10.4× |
+| iter_indexed |  30.2  |           114.4 |               112.2 |   flat  |   3.7× |  2.0× |
+
+`iter_indexed` (the identical math as a manual `while` loop, no `#[inline]` chain) is the control: it
+stays flat, confirming the win is specifically from collapsing the iterator abstraction. The residual
+`iter_sum` gap vs the manual loop (~3×) is the RyuJIT scalar ceiling — the collapsed loop still packs/
+unpacks `Option<u64>` per iteration (a niche struct RyuJIT doesn't scalarize like LLVM does), the same
+floor `iter_indexed`/`int_arith` hit (~3.7× native). MIR inlining can't close that; the JIT is the wall.
+
+**This replaced a CIL-level single-block inliner** (an earlier attempt, commits af6ab62/de23c11/
+4384107). That inliner re-derived at the untyped CIL level the type/borrow/aliasing safety MIR already
+guarantees, which bred subtle miscompiles (a niche/alloc-path bug) and forced a type-only verify/revert
+net. Moving inlining to the MIR layer made all of that disappear: the CIL inliner + the net were
+deleted (−317 lines net), the optimizer is purely local/intra-method again, and correctness is rustc's
+battle-tested responsibility. Validated by two native-vs-backend differential checksums (iterator +
+alloc + enum-niche + Option/Result + dyn-trait + generic patterns, byte-identical) and the `::stable`
+gate (426/14, no regressions).
+
+Remaining perf axes are unchanged by this work: allocation cost (`box_churn`/`vec_churn`, the
+gen-0-vs-malloc memory-model axis) and the RyuJIT scalar ceiling.

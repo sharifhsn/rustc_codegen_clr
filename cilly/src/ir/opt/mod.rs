@@ -14,8 +14,6 @@ use crate::{Assembly, MethodDef};
 pub use opt_fuel::OptFuel;
 pub use side_effect::*;
 mod inline;
-mod inline_block;
-pub(crate) use inline_block::inlining_enabled;
 mod opt_fuel;
 mod opt_node;
 mod root;
@@ -713,35 +711,11 @@ impl MethodDef {
         fuel: &mut OptFuel,
     ) {
         let sig = self.sig();
-        // The general single-block inliner (the zero-cost-abstraction keystone) runs first so the
-        // normal passes below clean up the spliced temps. Its soundness is enforced once, at the
-        // assembly level, after the whole opt fixpoint (see `Assembly::opt`): any method inlining
-        // leaves ill-typed is reverted to its trusted pre-opt body there. Verifying per-method *here*
-        // is unreliable — the method's state can still change between this point and the final
-        // whole-assembly typecheck.
-        // Never inline into the static constructors `.cctor`/`.tcctor`: the linker MERGES them across
-        // crates (`merge_cctor_impls`), which asserts the copies have identical locals — and inlining
-        // appends fresh temps, breaking that invariant.
-        let cctor = asm.alloc_string(crate::ir::asm::CCTOR);
-        let tcctor = asm.alloc_string(crate::ir::asm::TCCTOR);
-        let is_cctor = self.name() == cctor || self.name() == tcctor;
-        if inline_block::inlining_enabled() && !is_cctor {
-            let self_ref = asm.alloc_methodref(self.ref_to());
-            if let MethodImpl::MethodBody { blocks, locals } = self.implementation_mut() {
-                inline_block::inline_single_block_calls(blocks, locals, self_ref, asm, fuel);
-            }
-        }
-        self.run_opt_passes(asm, cache, fuel, sig);
-    }
-    /// The standard per-method optimization pass sequence (everything except the inliner, which is
-    /// orchestrated by [`Self::optimize`]).
-    fn run_opt_passes(
-        &mut self,
-        asm: &mut Assembly,
-        cache: &mut SideEffectInfoCache,
-        fuel: &mut OptFuel,
-        sig: Interned<FnSig>,
-    ) {
+        // NOTE: inlining of Rust's zero-cost abstractions (iterator/closure/adapter chains) is done
+        // at the MIR level by rustc's own inliner — the backend raises `-Zinline-mir-hint-threshold`
+        // so a `(0..n).map(f).filter(g).sum()` is collapsed into one flat loop BEFORE codegen (see
+        // the harness RUSTFLAGS). That is correct by construction (typed MIR + real borrow info), so
+        // the CIL optimizer here does only local, intra-method cleanup; it does NOT inline calls.
         self.implementation_mut()
             .propagate_locals(asm, cache, fuel, sig);
         self.implementation_mut()
@@ -770,11 +744,6 @@ impl MethodDef {
         }
 
         self.remove_useless_handlers(asm, fuel, cache);
-        // Mirror the `remove_dead_blocks` that `opt_sigle_pass` runs right after `optimize`, so the
-        // method's state seen by the inline soundness verify in `optimize` is exactly the state the
-        // final `Assembly::typecheck` sees (a dead-block sweep is the only mutation between them).
-        // Idempotent, so the second call in `opt_sigle_pass` is a no-op.
-        self.remove_dead_blocks(asm);
     }
     fn remove_useless_handlers(
         &mut self,

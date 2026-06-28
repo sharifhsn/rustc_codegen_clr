@@ -673,7 +673,18 @@ CD_BACKEND_CFG=""
 if [ -n "$CD_BACKEND_KEY" ]; then
   CD_BACKEND_CFG=" --cfg cd_backend_$CD_BACKEND_KEY --check-cfg=cfg(cd_backend_$CD_BACKEND_KEY)"
 fi
-export RUSTFLAGS="-Z codegen-backend=$CD_BACKEND_DYLIB -C linker=$CD_LINKER -C link-args=--cargo-support$CD_BACKEND_CFG"
+# ── Aggressive MIR inlining of #[inline] items (the zero-cost-abstraction lever) ──
+# rustc's own MIR inliner runs at mir-opt-level>=2 (release) but is tuned conservatively
+# because the native pipeline leans on LLVM to finish inlining iterator/closure chains.
+# Our backend hands MIR to RyuJIT, which will NOT inline struct-returning adapter chains —
+# so a `(0..n).map(f).filter(g).sum()` survives as a per-element `Range::fold` CALL, the
+# dominant iterator-codegen cost. Raising ONLY the `#[inline]` budget (`hint-threshold`,
+# default 100) makes rustc collapse the whole chain into one flat loop BEFORE the backend
+# sees it — correct by construction (typed MIR, real borrow/aliasing info), exactly the MIR
+# LLVM gets for native. Targeted: non-`#[inline]` fns keep the default `threshold` (50), and
+# the flag is inert in debug (mir-opt-level 1 disables the MIR inliner). 500 ≈ 5x default;
+# fully collapses the common map/filter/sum chains and plateaus there.
+export RUSTFLAGS="-Z codegen-backend=$CD_BACKEND_DYLIB -C linker=$CD_LINKER -C link-args=--cargo-support -Z inline-mir-hint-threshold=500$CD_BACKEND_CFG"
 set +e
 # PHASE G — CENTRAL OVERLAY REGISTRY auto-apply. A handful of load-bearing crates
 # (mio, socket2, tokio, getrandom) need a small, marked source overlay to build/run
