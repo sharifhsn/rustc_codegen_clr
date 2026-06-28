@@ -660,14 +660,19 @@ pub fn get_vtable<'tcx>(
     let ty = fx.monomorphize(ty);
 
     let alloc_id = fx.tcx().vtable_allocation((ty, trait_ref));
-    let vtable_len = fx
-        .tcx()
-        .vtable_entries(
-            trait_ref
-                .expect("None trait ref :(")
-                .with_self_ty(fx.tcx(), ty),
-        )
-        .len();
+    let vtable_len = match trait_ref {
+        Some(trait_ref) => fx
+            .tcx()
+            .vtable_entries(trait_ref.with_self_ty(fx.tcx(), ty))
+            .len(),
+        // A principal-less trait object — `dyn Send`, `dyn Send + Sync`, … (only auto-traits, no
+        // principal trait, reachable via trait-object "principal upcasting" like
+        // `Box<dyn Any + Send>` -> `Box<dyn Send>`) — has no method entries. Its vtable holds only
+        // the three common entries: drop_in_place, size, align. `vtable_allocation` already built
+        // the matching allocation above; `vtable_entries` requires a principal, so use the common
+        // count directly instead of unwrapping `None`.
+        None => rustc_middle::ty::TyCtxt::COMMON_VTABLE_ENTRIES.len(),
+    };
     let tpe = fixed_array(
         fx,
         cilly::Type::Int(Int::USize),

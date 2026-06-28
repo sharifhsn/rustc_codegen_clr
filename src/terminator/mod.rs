@@ -432,13 +432,15 @@ fn lower_x86_div<'tcx>(
     roots.push(after);
     Some(roots)
 }
-pub fn handle_call_terminator<'tycxt>(
+/// Emit the ops that evaluate `func(args)` and write the result into `destination`, *without* any
+/// final control-flow edge. Shared by the regular `Call` terminator (which then jumps to its
+/// `target`) and the `TailCall` (`become`) terminator (which then `Ret`s the result).
+fn emit_call_into<'tycxt>(
     terminator: &Terminator<'tycxt>,
     ctx: &mut MethodCompileCtx<'tycxt, '_>,
     args: &[Spanned<Operand<'tycxt>>],
     destination: &Place<'tycxt>,
     func: &Operand<'tycxt>,
-    target: Option<BasicBlock>,
 ) -> Vec<Root> {
     let mut trees = Vec::new();
 
@@ -482,6 +484,17 @@ pub fn handle_call_terminator<'tycxt>(
         }
         _ => todo!("Can't call type {func_ty:?}"),
     }
+    trees
+}
+pub fn handle_call_terminator<'tycxt>(
+    terminator: &Terminator<'tycxt>,
+    ctx: &mut MethodCompileCtx<'tycxt, '_>,
+    args: &[Spanned<Operand<'tycxt>>],
+    destination: &Place<'tycxt>,
+    func: &Operand<'tycxt>,
+    target: Option<BasicBlock>,
+) -> Vec<Root> {
+    let mut trees = emit_call_into(terminator, ctx, args, destination, func);
     // Final Jump
     if let Some(target) = target {
         let goto = goto(ctx, target.as_u32());
@@ -512,12 +525,23 @@ pub fn handle_terminator<'tcx>(
             call_source: _,
             fn_span: _,
         } => handle_call_terminator(terminator, ctx, args, destination, func, *target),
-        // `become` / guaranteed tail calls are gated behind the unstable, incomplete
-        // `explicit_tail_calls` feature, so this cannot appear in std/tokio or any stable crate. A
-        // correct (un-optimized) lowering would be `call` + `Ret` of the result (no `.tail` prefix is
-        // needed for correctness); left unimplemented until a real `become`-using crate appears.
-        TerminatorKind::TailCall { .. } => {
-            todo!("TailCall (`become`) requires the unstable `explicit_tail_calls` feature")
+        // `become f(args)` (the unstable `explicit_tail_calls` feature) is semantically
+        // `return f(args)`: rustc guarantees the callee's return type matches the current
+        // function's. We lower it as a normal `call` into the return place `_0` followed by a
+        // `Ret`/`VoidRet` — exactly like a `Call` whose destination is `_0` plus a `Return`. The
+        // CIL `.tail` prefix (the actual tail-call stack optimization) is deliberately omitted; a
+        // plain call+return is behaviorally identical, only without guaranteed O(1) stack growth.
+        TerminatorKind::TailCall { func, args, fn_span: _ } => {
+            let ret_place = Place::return_place();
+            let mut trees = emit_call_into(terminator, ctx, args, &ret_place, func);
+            let ret = ctx.monomorphize(ctx.body().return_ty());
+            if ctx.type_from_cache(ret) == cilly::Type::Void {
+                trees.push(ctx.alloc_root(CILRoot::VoidRet));
+            } else {
+                let ld = ctx.alloc_node(cilly::CILNode::LdLoc(0));
+                trees.push(ctx.alloc_root(CILRoot::Ret(ld)));
+            }
+            trees
         }
         TerminatorKind::Return => {
             let ret = ctx.monomorphize(ctx.body().return_ty());
