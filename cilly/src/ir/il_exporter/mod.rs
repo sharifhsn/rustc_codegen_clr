@@ -412,9 +412,26 @@ impl ILExporter {
         } else {
             ""
         };
+        // Layer 3 (help RyuJIT): hint the JIT to inline small, straight-line leaf methods — the
+        // monomorphized closure bodies / iterator-adapter `next`/`fold` wrappers that Rust's
+        // zero-cost abstractions lower to. RyuJIT won't inline across these by default (struct-by-value
+        // returns + its size heuristic), so the per-element call survives; `aggressiveinlining`
+        // (MethodImplOptions.AggressiveInlining) tells it to. Scoped to single-block, handler-free,
+        // small bodies so we don't bloat the JIT or hint methods it can't inline anyway. Pure JIT
+        // hint — cannot affect correctness.
+        let aggrinline = match method.implementation() {
+            MethodImpl::MethodBody { blocks, .. }
+                if blocks.len() == 1
+                    && blocks[0].handler().is_none()
+                    && blocks[0].roots().len() <= 24 =>
+            {
+                "aggressiveinlining "
+            }
+            _ => "",
+        };
         writeln!(
             out,
-            ".method {vis} hidebysig {kind} {pinvoke} {ret} '{name}'({inputs}) cil managed {preservesig}{{// Method ID {method_id:?}"
+            ".method {vis} hidebysig {kind} {pinvoke} {ret} '{name}'({inputs}) cil managed {aggrinline}{preservesig}{{// Method ID {method_id:?}"
         )?;
         debug_assert!(ensure_unqiue.insert(method_id));
         let stack_size = match method.resolved_implementation(asm_mut) {

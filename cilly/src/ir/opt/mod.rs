@@ -14,6 +14,7 @@ use crate::{Assembly, MethodDef};
 pub use opt_fuel::OptFuel;
 pub use side_effect::*;
 mod inline;
+mod inline_block;
 mod opt_fuel;
 mod opt_node;
 mod root;
@@ -711,6 +712,15 @@ impl MethodDef {
         fuel: &mut OptFuel,
     ) {
         let sig = self.sig();
+        // General single-block inliner (the zero-cost-abstraction keystone). Runs first so the
+        // existing copy-propagation + dead-store elimination below clean up the spliced temps in the
+        // same fuel-bounded fixpoint. Inlining a method into itself is guarded inside.
+        if inline_block::inlining_enabled() {
+            let self_ref = asm.alloc_methodref(self.ref_to());
+            if let MethodImpl::MethodBody { blocks, locals } = self.implementation_mut() {
+                inline_block::inline_single_block_calls(blocks, locals, self_ref, sig, asm, fuel);
+            }
+        }
         self.implementation_mut()
             .propagate_locals(asm, cache, fuel, sig);
         self.implementation_mut()
