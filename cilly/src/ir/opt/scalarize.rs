@@ -161,6 +161,35 @@ fn fields_disjoint(asm: &Assembly, fields: &HashSet<Interned<FieldDesc>>) -> boo
     true
 }
 
+/// Rebuild one root list, replacing a whole-value initializer `StLoc(L, val)` of a to-be-decomposed
+/// local with `StLoc(tmp, val)` followed by one `StLoc(NL_f, tmp.f)` per accessed field of `L`.
+fn decompose_whole_writes(
+    roots: &mut Vec<Interned<CILRoot>>,
+    decompose_tmp: &HashMap<u32, u32>,
+    fields: &[HashSet<Interned<FieldDesc>>],
+    field_to_nl: &HashMap<(u32, Interned<FieldDesc>), u32>,
+    asm: &mut Assembly,
+) {
+    let old = std::mem::take(roots);
+    let mut out = Vec::with_capacity(old.len());
+    for rid in old {
+        if let CILRoot::StLoc(l, val) = *asm.get_root(rid) {
+            if let Some(&tmp) = decompose_tmp.get(&l) {
+                out.push(asm.alloc_root(CILRoot::StLoc(tmp, val)));
+                for &f in &fields[l as usize] {
+                    let nl = field_to_nl[&(l, f)];
+                    let addr = asm.alloc_node(CILNode::LdLocA(tmp));
+                    let read = asm.alloc_node(CILNode::LdField { addr, field: f });
+                    out.push(asm.alloc_root(CILRoot::StLoc(nl, read)));
+                }
+                continue;
+            }
+        }
+        out.push(rid);
+    }
+    *roots = out;
+}
+
 /// Split every eligible non-escaping aggregate local into per-field scalar locals. Returns whether
 /// anything changed (the normal copy-prop + dead-store passes then dissolve the temporaries).
 pub fn scalarize_aggregates(
@@ -176,11 +205,13 @@ pub fn scalarize_aggregates(
     // First field-build any pure tuple-constructor calls (checked-arith `ovf_check_tuple`) so the
     // scalarizer below can treat their results like any other field-built local.
     decall_tuple_ctors(blocks, locals, asm);
-    // total[L] = every `LdLoc(L)`/`LdLocA(L)` node occurrence; ok[L] = those that are a field-op
-    // address. disq[L] = a hard disqualifier (whole-value `StLoc`). fields[L] = accessed FieldDescs.
+    // Per local: total = every `LdLoc`/`LdLocA` node occurrence; ok = those that are a field-op
+    // address; whole_writes = count of whole-value `StLoc(l, _)`; has_setfield = any field stored;
+    // fields = accessed FieldDescs.
     let mut total = vec![0u32; nlocals];
     let mut ok = vec![0u32; nlocals];
-    let mut disq = vec![false; nlocals];
+    let mut whole_writes = vec![0u32; nlocals];
+    let mut has_setfield = vec![false; nlocals];
     let mut fields: Vec<HashSet<Interned<FieldDesc>>> = vec![HashSet::new(); nlocals];
 
     let root_ids: Vec<_> = blocks.iter().flat_map(BasicBlock::iter_roots).collect();
@@ -191,11 +222,11 @@ pub fn scalarize_aggregates(
                 CILIterElem::Root(CILRoot::SetField(info)) => {
                     if let Some(l) = store_addr_local(asm, info.1) {
                         ok[l as usize] += 1;
+                        has_setfield[l as usize] = true;
                         fields[l as usize].insert(info.0);
                     }
                 }
-                // A whole-value write of the local can't be split without exploding its rvalue.
-                CILIterElem::Root(CILRoot::StLoc(l, _)) => disq[l as usize] = true,
+                CILIterElem::Root(CILRoot::StLoc(l, _)) => whole_writes[l as usize] += 1,
                 CILIterElem::Node(CILNode::LdLoc(l) | CILNode::LdLocA(l)) => {
                     total[l as usize] += 1;
                 }
@@ -210,11 +241,20 @@ pub fn scalarize_aggregates(
         }
     }
 
-    // Decide which locals to scalarize and mint their per-field scalar replacements.
+    // Decide which locals to scalarize, mint per-field scalar replacements, and (for a local with a
+    // single whole-value initializer that is then mutated field-wise — e.g. an iterator adapter built
+    // by a non-inlinable constructor and then advanced) a temp to decompose that initializer through.
     let mut field_to_nl: HashMap<(u32, Interned<FieldDesc>), u32> = HashMap::new();
+    let mut decompose_tmp: HashMap<u32, u32> = HashMap::new();
     let mut changed = false;
     for l in 0..nlocals {
-        if disq[l] || fields[l].is_empty() || ok[l] != total[l] {
+        if fields[l].is_empty() || ok[l] != total[l] || whole_writes[l] > 1 {
+            continue;
+        }
+        // A single whole-write is only worth decomposing when the local is ALSO field-mutated — and
+        // that condition is load-bearing for TERMINATION: the value-holding temp introduced below has
+        // a whole-write but NO field store, so it can never itself be decomposed on a later pass.
+        if whole_writes[l] == 1 && !has_setfield[l] {
             continue;
         }
         if !fields_disjoint(asm, &fields[l]) {
@@ -227,14 +267,35 @@ pub fn scalarize_aggregates(
             locals.push((None, ity));
             field_to_nl.insert((l as u32, f), nl);
         }
+        if whole_writes[l] == 1 {
+            let ty = locals[l].1;
+            let tmp = locals.len() as u32;
+            locals.push((None, ty));
+            decompose_tmp.insert(l as u32, tmp);
+        }
         changed = true;
     }
     if !changed {
         return false;
     }
 
-    // Rewrite: `SetField(&L, F, v)` -> `StLoc(NL, v)`, `LdField(L|&L, F)` -> `LdLoc(NL)`. The original
-    // aggregate local is now unreferenced and `realloc_locals` compacts it away.
+    // Decompose pre-pass: a whole-value initializer `StLoc(L, val)` of a scalarized L becomes
+    // `StLoc(tmp, val); StLoc(NL_f, tmp.f)…` — `val` is evaluated exactly once into the temp, then
+    // each accessed field is read out into its scalar. Covers handler roots too (whole_writes[L]==1
+    // means there is exactly one such initializer anywhere).
+    if !decompose_tmp.is_empty() {
+        for block in blocks.iter_mut() {
+            decompose_whole_writes(block.roots_mut(), &decompose_tmp, &fields, &field_to_nl, asm);
+            if let Some(handler) = block.handler_mut() {
+                for hb in handler.iter_mut() {
+                    decompose_whole_writes(hb.roots_mut(), &decompose_tmp, &fields, &field_to_nl, asm);
+                }
+            }
+        }
+    }
+
+    // Rewrite the field ops: `SetField(&L, F, v)` -> `StLoc(NL, v)`, `LdField(L|&L, F)` -> `LdLoc(NL)`.
+    // The original aggregate local is now unreferenced and `realloc_locals` compacts it away.
     for block in blocks.iter_mut() {
         block.map_roots(
             asm,
