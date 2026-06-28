@@ -33,15 +33,18 @@ const MAX_CALLEE_ROOTS: usize = 48;
 
 /// Whether the general inliner is enabled. **Opt-in (default OFF)** — set `INLINE_BLOCKS=1`.
 ///
-/// Status: TYPE-safety is solved. The assembly-level snapshot/verify/revert net in `Assembly::opt`
-/// (typecheck every method at its final state, revert any inlining left ill-typed to its trusted
-/// un-optimized body) plus the `.cctor`/`.tcctor` skip make the inliner produce only type-valid CIL
-/// that compiles, links, and runs. The remaining blocker is a residual *semantic* miscompile in the
-/// splice: a type-valid but behaviourally-wrong inline (e.g. collecting `(0..n).map(f)` into a `Vec`
-/// faults). The type verifier cannot catch this by construction; it needs differential debugging
-/// (run with `INLINE_BLOCKS=1` under the diff oracle, bisect to the miscompiled method, dump its
-/// pre/post-inline IR). Suspects: argument-by-value vs by-address evaluation, or the `Ret`->`StLoc`
-/// tail when the returned value aliases a caller local.
+/// TYPE-safety is fully solved (the assembly-level snapshot/verify/revert net in `Assembly::opt`
+/// reverts any method inlining left ill-typed to its trusted un-optimized body). One semantic bug is
+/// FIXED — the splice now renumbers the destination index of `StLoc`/`StArg` roots (which live in the
+/// root, not a node), without which a callee silently clobbered a caller local; this fixed the whole
+/// scalar/iterator path (verified: `(0..n).map(f).sum()` etc. produce native-identical results).
+///
+/// ONE residual semantic miscompile remains, in the struct/allocation path: inlining into
+/// `RawVecInner::{try_allocate_in,finish_grow,grow_amortized}` corrupts a freshly-allocated Vec's
+/// `ptr`/`cap`, which later faults in `RawVecInner::deallocate` (crash-site != bug-site). The diff of
+/// those methods (INLINE_BLOCKS=1 vs 0, via `DUMP_FN=7raw_vec`) is renumber-noisy; the bug is a subtle
+/// value/ordering issue in the alloc-result handling, not an obvious wrong write. Needs a focused
+/// trace to pinpoint. Until then the inliner is OFF so the backend never emits the miscompile.
 #[must_use]
 pub fn inlining_enabled() -> bool {
     matches!(std::env::var("INLINE_BLOCKS").as_deref(), Ok("1"))
@@ -233,7 +236,16 @@ fn splice(
         let root = asm.get_root(cr).clone();
         let mapped = root.map(
             asm,
-            &mut |r, _| r,
+            // Roots carry a destination local/arg index DIRECTLY (not as a node), so they must be
+            // renumbered here too — `root.map` only feeds the node closure the *value* sub-trees. A
+            // callee `StLoc(k, v)` writes callee-local `k`; spliced verbatim it would clobber the
+            // *caller's* local `k` — type-valid but a silent miscompile. `StArg(i, v)` (write to
+            // param `i`) becomes a write to that param's materialized temp.
+            &mut |r, _| match r {
+                CILRoot::StLoc(loc, val) => CILRoot::StLoc(base + loc, val),
+                CILRoot::StArg(arg, val) => CILRoot::StLoc(arg_temps[arg as usize], val),
+                other => other,
+            },
             &mut |node, _| match node {
                 CILNode::LdArg(a) => CILNode::LdLoc(arg_temps[a as usize]),
                 CILNode::LdArgA(a) => CILNode::LdLocA(arg_temps[a as usize]),
