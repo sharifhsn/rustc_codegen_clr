@@ -1,0 +1,5 @@
+rust/target/
+rust/.cargo/config.toml
+csharp/obj/
+csharp/bin/
+results/
