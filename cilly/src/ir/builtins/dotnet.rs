@@ -2186,6 +2186,7 @@ fn insert_dotnet_fs(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     insert_dotnet_fs_flush(asm, patcher);
     insert_dotnet_fs_close(asm, patcher);
     insert_dotnet_fs_len(asm, patcher);
+    insert_dotnet_fs_set_len(asm, patcher);
     insert_dotnet_fs_stat(asm, patcher);
     insert_dotnet_fs_exists(asm, patcher);
     insert_dotnet_fs_mkdir(asm, patcher);
@@ -2650,6 +2651,35 @@ fn insert_dotnet_fs_len(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) 
         let ret = asm.alloc_root(CILRoot::Ret(len));
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_set_len(handle, len: i64) -> i32` => `FileStream.SetLength(len)`; returns 0.
+///
+/// Backs `File::truncate` (`std::fs::File::set_len`) on the dotnet PAL. `SetLength` truncates or
+/// zero-grows the file to `len`; it throws on failure (mapped upstream like the other fs hooks), so
+/// the success path is always 0.
+fn insert_dotnet_fs_set_len(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_set_len");
+    let generator = move |_, asm: &mut Assembly| {
+        let file_stream = ClassRef::file_stream(asm);
+        let stream = handle_to_class(asm, 0, file_stream);
+        let len = asm.alloc_node(CILNode::LdArg(1));
+        let set_len_name = asm.alloc_string("SetLength");
+        let set_len = asm.class_ref(file_stream).clone().instance(
+            &[Type::Int(Int::I64)],
+            Type::Void,
+            set_len_name,
+            asm,
+        );
+        let call = asm.alloc_root(CILRoot::call(set_len, [stream, len]));
+        let zero = asm.alloc_node(0_i32);
+        let ret = asm.alloc_root(CILRoot::Ret(zero));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![call, ret], 0, None)],
             locals: vec![],
         }
     };

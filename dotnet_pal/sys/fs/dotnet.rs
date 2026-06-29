@@ -182,6 +182,7 @@ unsafe extern "C" {
     fn rcl_dotnet_fs_flush(handle: *mut u8);
     fn rcl_dotnet_fs_close(handle: *mut u8);
     fn rcl_dotnet_fs_len(handle: *mut u8) -> i64;
+    fn rcl_dotnet_fs_set_len(handle: *mut u8, len: i64) -> i32;
     fn rcl_dotnet_fs_stat(
         path_ptr: *const u8,
         path_len: usize,
@@ -605,9 +606,10 @@ impl File {
         unsupported()
     }
 
-    pub fn truncate(&self, _size: u64) -> io::Result<()> {
-        // Could map to FileStream.SetLength via an extra hook; not exercised.
-        unsupported()
+    pub fn truncate(&self, size: u64) -> io::Result<()> {
+        // FileStream.SetLength(len): truncates or zero-grows the file to `size`.
+        // SAFETY: `self.handle` is a live FileStream handle.
+        rc(unsafe { rcl_dotnet_fs_set_len(self.handle, size as i64) })
     }
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
