@@ -93,10 +93,26 @@ impl ILExporter {
                 )?;
             }
         }
+        // Const-data blobs live in FieldRVA statics (`.field static <T> c_X at I_X` + a `.data` blob).
+        // The field's declared type must be SIZED to the blob: the JIT loads the whole contiguous
+        // `.data` section so reading N bytes from `&c_X` works regardless of the field type, but
+        // NativeAOT/ILC preserves only `sizeof(<T>)` bytes of FieldRVA data and zeros the rest — so a
+        // `uint8` field over an N-byte blob silently becomes "first byte, then zeros" under AOT (this
+        // is what broke every `format!`/`&str`-literal/`DEC_DIGITS_LUT`/const-`&[T]` under AOT). Emit
+        // a value-type sized to each distinct blob length (the Roslyn `__StaticArrayInitTypeSize`
+        // idiom) and type the field with it, so ILC keeps the full blob. Consumers take `&c_X`
+        // (`ldsflda`), so the field type is otherwise transparent.
+        let mut blob_sizes: Vec<usize> = asm.const_data.1.keys().map(|d| d.len().max(1)).collect();
+        blob_sizes.sort_unstable();
+        blob_sizes.dedup();
+        for n in &blob_sizes {
+            writeln!(out, ".class private explicit ansi sealed '__rcl_const_blob_{n}' extends [System.Runtime]System.ValueType {{ .pack 1 .size {n} }}")?;
+        }
         for (const_data, idx) in asm.const_data.1.iter() {
             let encoded = encode(idx.inner() as u64);
+            let n = const_data.len().max(1);
             let data: String = const_data.iter().map(|u| format!("{u:x} ")).collect();
-            writeln!(out, " .data cil I_{encoded} = bytearray ({data})\n.field assembly static uint8 c_{encoded} at I_{encoded}")?;
+            writeln!(out, " .data cil I_{encoded} = bytearray ({data})\n.field assembly static valuetype '__rcl_const_blob_{n}' c_{encoded} at I_{encoded}")?;
         }
         let mut c = 0;
         // If `MainModule` is too large for a single .NET type (CoreCLR caps a type at ~65k methods),
@@ -550,7 +566,10 @@ impl ILExporter {
         match node {
             CILNode::Const(cst) => match cst.as_ref() {
                 super::Const::ByteBuffer { data, tpe:_ }=>{
-                    writeln!(out,"ldsflda uint8 c_{}", encode(data.inner() as u64))
+                    // Must match the FieldRVA field's declared type (a blob-sized value-type, so ILC
+                    // preserves the full blob under AOT — see the const_data emission above).
+                    let n = asm.const_data[*data].len().max(1);
+                    writeln!(out,"ldsflda valuetype '__rcl_const_blob_{n}' c_{}", encode(data.inner() as u64))
                 }
                 super::Const::Null(_) => writeln!(out, "ldnull"),
                 super::Const::I8(val) => match val {
