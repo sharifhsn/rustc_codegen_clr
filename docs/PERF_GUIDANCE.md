@@ -96,26 +96,29 @@ dotnet publish -c Release                   # ILC compiles the Rust IL + C# host
 ```
 
 Validated end-to-end on the full `cd_interop` marshalling sample (arm64 native binary): **primitives,
-de-mangled struct value-types, struct methods, and inbound slices all marshal correctly under AOT**,
-and separately **collections (`Vec`/`RawVec` growth), `String::push`, heap allocation, and constant
-`format!` all work**. So AOT is not just for pure compute — most of the interop surface survives ILC.
+de-mangled struct value-types, struct methods, inbound slices, collections (`Vec`/`RawVec` growth),
+`String`, heap allocation, `format!` (including interpolated args), and `str::parse` all work** — the
+full `cd_interop` marshalling sample is 6/6 under AOT. There are no known whole-program-AOT correctness
+gaps.
 
 > Caveat: the lib build needs a *current* installed toolchain — re-run `cargo dotnet setup` if
-> `~/.cargo-dotnet` predates a std-PAL change (a stale PAL fails `build-std`, unrelated to AOT).
+> `~/.cargo-dotnet` predates a backend change (a stale install builds with the old linker/dylib; the
+> il_exporter + optimizer run in BOTH the backend dylib and the linker, so refresh both).
 
-### The one known whole-program-AOT gap: `core::fmt` interpolation
+### Const data under AOT (the bug that hid here)
 
-`format!` with an **interpolated argument** drops that argument under AOT only (it works under RyuJIT).
-Precisely localized with a minimal repro: `format!("Hello, from Rust!")` → 17 bytes ✓, but
-`format!("val={x}")` → `"val="` (the `{x}` vanishes; 4 bytes, expected 6). The literal pieces are
-written directly; the per-`{}` value is written through a `core::fmt` **formatter function-pointer**
-(`ldftn` to the monomorphized `Display::fmt`), and ILC does not dispatch that `calli` the way RyuJIT
-does — the call silently no-ops. This is the same fn-pointer/`calli`-ABI class as the historical
-DerfWrongPtr bug, but ILC enforces a stricter `calli` contract. Fixing it (the backend's
-fn-pointer-call emission vs ILC's `calli` requirements) is the next AOT step; until then, AOT programs
-that format interpolated values are miscompiled — keep formatting on the JIT side, or pass values out
-to C# to format.
+What first looked like a `core::fmt` fn-pointer bug was actually a **FieldRVA sizing** bug (fixed): the
+backend emitted every const-data blob (string literals, the integer-formatting `DEC_DIGITS_LUT`, const
+`&[T]`) as a FieldRVA static typed `uint8` regardless of the blob length. The JIT loads the whole
+contiguous `.data` section, so reading N bytes from `&c_X` worked and masked it — but NativeAOT/ILC
+preserves only `sizeof(field-type)` = 1 byte of FieldRVA data and zeros the rest. So under AOT every
+const blob was "first byte correct, then zeros": broken string literals, integer formatting (LUT →
+garbage digits), `parse`, and all `format!`. Fixed by sizing each FieldRVA field to its blob (the
+Roslyn `__StaticArrayInitTypeSize` idiom). Lesson for AOT debugging: FieldRVA field types must match
+their data size — the JIT is forgiving, ILC is not.
 
 Tradeoffs: AOT changes the deployment model (self-contained native binary, faster startup, no JIT
-warm-up, larger artifact, no runtime codegen). A first-class `cargo dotnet publish --aot` (and full
-I/O-PAL AOT-compatibility) waits on the `core::fmt` fn-pointer fix above.
+warm-up, larger artifact, no runtime codegen). With the const-data gap closed, a first-class
+`cargo dotnet publish --aot` is now a tooling task (wrap the `PublishAot` host generation); full I/O-PAL
+AOT-compatibility for a standalone Rust *binary* (vs the C#-host-consumes-Rust-lib path proven here) is
+the remaining frontier.
