@@ -1639,6 +1639,31 @@ impl Assembly {
         if src == dst {
             return val;
         }
+        // Inline the pervasive transparent-newtype reinterpret (e.g. `NonNull<T>` -> `*T`, `Box`-style
+        // wrappers) as a plain field load. A single-field struct whose sole field sits at offset 0 and
+        // is exactly `dst` has identical bits to that field, so `ldfld` is an exact, allocation-free,
+        // RyuJIT-inlinable replacement for the `transmute` HELPER CALL — which RyuJIT refuses to inline
+        // because it returns a struct, leaving a per-call cost in every hot pointer-threading loop
+        // (iterator adapters, Box deref). Guards (single field / offset 0 / type-equal / size-equal)
+        // keep it a true bit-reinterpret; anything else falls through to the general helper below.
+        let dst_ty = self[dst];
+        if let Type::ClassRef(cref) = self[src] {
+            if let Some(cdef) = self.class_ref_to_def(cref) {
+                let field = {
+                    let flds = self[cdef].fields();
+                    (flds.len() == 1
+                        && flds[0].0 == dst_ty
+                        && matches!(flds[0].2, None | Some(0)))
+                    .then_some((flds[0].0, flds[0].1))
+                };
+                if let Some((ftpe, fname)) = field {
+                    if self.sizeof_type(self[src]) == self.sizeof_type(dst_ty) {
+                        let field = self.alloc_field(FieldDesc::new(cref, fname, ftpe));
+                        return self.alloc_node(CILNode::LdField { addr: val, field });
+                    }
+                }
+            }
+        }
         let main_module = *self.main_module();
 
         let sig = self.sig([self[src]], self[dst]);
