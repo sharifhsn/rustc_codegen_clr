@@ -50,6 +50,8 @@ unsafe extern "C" {
     fn rcl_dotnet_proc_psi_cwd(psi: *mut u8, ptr: *const u8, len: usize);
     fn rcl_dotnet_proc_psi_capture(psi: *mut u8);
     fn rcl_dotnet_proc_start(psi: *mut u8) -> *mut u8;
+    fn rcl_dotnet_proc_stdout(handle: *mut u8) -> *mut u8;
+    fn rcl_dotnet_proc_stderr(handle: *mut u8) -> *mut u8;
     fn rcl_dotnet_proc_wait(handle: *mut u8) -> i32;
     fn rcl_dotnet_proc_has_exited(handle: *mut u8) -> i32;
     fn rcl_dotnet_proc_id(handle: *mut u8) -> u32;
@@ -247,7 +249,18 @@ impl Command {
             || (default_is_pipe
                 && (self.stdin.is_none() || self.stdout.is_none() || self.stderr.is_none()));
         if wants_pipe {
-            return unsupported();
+            // CAPTURE path (Command::output): start with stdout/stderr redirected and hand back
+            // readable Pipes over the child streams. stdin is left inherited (None) — output()
+            // drops it anyway; a live piped stdin (streaming `spawn`) is the deferred case.
+            let handle = build_and_start(self, true)?;
+            let stdout = unsafe { rcl_dotnet_proc_stdout(handle) };
+            let stderr = unsafe { rcl_dotnet_proc_stderr(handle) };
+            let pipes = StdioPipes {
+                stdin: None,
+                stdout: Some(crate::sys::pipe::Pipe::from_handle(stdout)),
+                stderr: Some(crate::sys::pipe::Pipe::from_handle(stderr)),
+            };
+            return Ok((Process { handle }, pipes));
         }
         let handle = build_and_start(self, false)?;
         Ok((Process { handle }, StdioPipes { stdin: None, stdout: None, stderr: None }))
@@ -587,11 +600,25 @@ pub type ChildPipe = crate::sys::pipe::Pipe;
 
 pub fn read_output(
     out: ChildPipe,
-    _stdout: &mut Vec<u8>,
-    _err: ChildPipe,
-    _stderr: &mut Vec<u8>,
+    stdout: &mut Vec<u8>,
+    err: ChildPipe,
+    stderr: &mut Vec<u8>,
 ) -> io::Result<()> {
-    match out.diverge() {}
+    // Drain stderr on a worker thread so stdout+stderr empty CONCURRENTLY — a child that fills one
+    // pipe's buffer while we block reading the other would otherwise deadlock (the child blocks on
+    // write, never closes the stream we're reading). Threads are real on this PAL.
+    let reader = crate::thread::Builder::new().spawn(move || {
+        let mut buf = Vec::new();
+        err.read_to_end(&mut buf).map(|_| buf)
+    })?;
+    out.read_to_end(stdout)?;
+    match reader.join() {
+        Ok(res) => *stderr = res?,
+        Err(_) => {
+            return Err(io::const_error!(io::ErrorKind::Other, "stderr reader thread panicked"));
+        }
+    }
+    Ok(())
 }
 
 pub fn getpid() -> u32 {

@@ -417,6 +417,123 @@ fn insert_dotnet_process(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
         patcher.insert(name, Box::new(generator));
     }
 
+    // child-stream getters: rcl_dotnet_proc_{stdout,stderr,stdin}(proc_handle) -> *mut u8
+    //   => GCHandle to Process.Standard{Output,Error}.BaseStream (a reader) /
+    //      Process.StandardInput.BaseStream (a writer) — the raw byte Stream for capture.
+    let mut child_stream = |asm: &mut Assembly, hook: &str, getter: &str, reader: bool| {
+        let name = asm.alloc_string(hook);
+        let getter = getter.to_string();
+        let generator = move |_, asm: &mut Assembly| {
+            let proc_cr = ClassRef::process(asm);
+            let rw_cr = if reader {
+                ClassRef::stream_reader(asm)
+            } else {
+                ClassRef::stream_writer(asm)
+            };
+            let rw_ty = Type::ClassRef(rw_cr);
+            let stream_cr = ClassRef::stream(asm);
+            let stream_ty = Type::ClassRef(stream_cr);
+            let p = handle_to_class(asm, 0, proc_cr);
+            let gname = asm.alloc_string(getter.as_str());
+            let get_std = asm.class_ref(proc_cr).clone().instance(&[], rw_ty, gname, asm);
+            let rw = asm.alloc_node(CILNode::call(get_std, [p]));
+            let store_rw = asm.alloc_root(CILRoot::StLoc(0, rw));
+            let bs_name = asm.alloc_string("get_BaseStream");
+            let get_bs = asm.class_ref(rw_cr).clone().instance(&[], stream_ty, bs_name, asm);
+            let rw_load = asm.alloc_node(CILNode::LdLoc(0));
+            let stream = asm.alloc_node(CILNode::call(get_bs, [rw_load]));
+            let store_s = asm.alloc_root(CILRoot::StLoc(1, stream));
+            let handle = CILNode::LdLoc(1).ref_to_handle(asm);
+            let handle = asm.alloc_node(handle);
+            let void = asm.alloc_type(Type::Void);
+            let handle = asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::Ptr(void))));
+            let ret = asm.alloc_root(CILRoot::Ret(handle));
+            let rw_local = asm.alloc_type(rw_ty);
+            let s_local = asm.alloc_type(stream_ty);
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![store_rw, store_s, ret], 0, None)],
+                locals: vec![
+                    (Some(asm.alloc_string("rw")), rw_local),
+                    (Some(asm.alloc_string("s")), s_local),
+                ],
+            }
+        };
+        patcher.insert(name, Box::new(generator));
+    };
+    child_stream(asm, "rcl_dotnet_proc_stdout", "get_StandardOutput", true);
+    child_stream(asm, "rcl_dotnet_proc_stderr", "get_StandardError", true);
+    child_stream(asm, "rcl_dotnet_proc_stdin", "get_StandardInput", false);
+
+    // rcl_dotnet_stream_read(stream_handle, buf_ptr, len) -> i32 => Stream.Read(Span<byte>) (0 at EOF).
+    {
+        let name = asm.alloc_string("rcl_dotnet_stream_read");
+        let generator = move |_, asm: &mut Assembly| {
+            let stream_cr = ClassRef::stream(asm);
+            let s = handle_to_class(asm, 0, stream_cr);
+            let (span, span_ty) = build_byte_span(asm, 1, 2, false);
+            let read_name = asm.alloc_string("Read");
+            let read = asm.class_ref(stream_cr).clone().instance(
+                &[span_ty],
+                Type::Int(Int::I32),
+                read_name,
+                asm,
+            );
+            let n = asm.alloc_node(CILNode::call(read, [s, span]));
+            let ret = asm.alloc_root(CILRoot::Ret(n));
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            }
+        };
+        patcher.insert(name, Box::new(generator));
+    }
+
+    // rcl_dotnet_stream_write(stream_handle, buf_ptr, len) -> i32 => Stream.Write(ROSpan<byte>); ret len.
+    {
+        let name = asm.alloc_string("rcl_dotnet_stream_write");
+        let generator = move |_, asm: &mut Assembly| {
+            let stream_cr = ClassRef::stream(asm);
+            let s = handle_to_class(asm, 0, stream_cr);
+            let (span, span_ty) = build_byte_span(asm, 1, 2, true);
+            let write_name = asm.alloc_string("Write");
+            let write = asm.class_ref(stream_cr).clone().instance(
+                &[span_ty],
+                Type::Void,
+                write_name,
+                asm,
+            );
+            let r_write = asm.alloc_root(CILRoot::call(write, [s, span]));
+            let len = asm.alloc_node(CILNode::LdArg(2));
+            let len = asm.int_cast(len, Int::I32, ExtendKind::ZeroExtend);
+            let ret = asm.alloc_root(CILRoot::Ret(len));
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![r_write, ret], 0, None)],
+                locals: vec![],
+            }
+        };
+        patcher.insert(name, Box::new(generator));
+    }
+
+    // rcl_dotnet_stream_close(stream_handle) => Stream.Dispose() + free the GCHandle.
+    {
+        let name = asm.alloc_string("rcl_dotnet_stream_close");
+        let generator = move |_, asm: &mut Assembly| {
+            let stream_cr = ClassRef::stream(asm);
+            let s = handle_to_class(asm, 0, stream_cr);
+            let dispose_name = asm.alloc_string("Dispose");
+            let dispose =
+                asm.class_ref(stream_cr).clone().instance(&[], Type::Void, dispose_name, asm);
+            let r_disp = asm.alloc_root(CILRoot::call(dispose, [s]));
+            let (store_gch, free, gc_handle_ty) = free_handle_roots(asm, 0, 0);
+            let ret = asm.alloc_root(CILRoot::VoidRet);
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![r_disp, store_gch, free, ret], 0, None)],
+                locals: vec![(Some(asm.alloc_string("gch")), gc_handle_ty)],
+            }
+        };
+        patcher.insert(name, Box::new(generator));
+    }
+
     // rcl_dotnet_proc_free(proc_handle) => p.Dispose() + free the GCHandle.
     {
         let name = asm.alloc_string("rcl_dotnet_proc_free");

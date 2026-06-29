@@ -668,6 +668,31 @@ impl ClassRef {
         let asm_name = Some(asm.alloc_string("System.Diagnostics.Process"));
         asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
     }
+    /// Returns a reference to the abstract class `System.IO.Stream` — the raw byte
+    /// stream backing a child's redirected stdout/stderr/stdin (`Read`/`Write`/
+    /// `Dispose`) for the dotnet `process` capture path. A reference type.
+    #[must_use]
+    pub fn stream(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.IO.Stream");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to `System.IO.StreamReader` — `Process.StandardOutput`/
+    /// `StandardError`; the PAL reads its `BaseStream` for raw child output.
+    #[must_use]
+    pub fn stream_reader(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.IO.StreamReader");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to `System.IO.StreamWriter` — `Process.StandardInput`;
+    /// the PAL writes its `BaseStream` for raw child input.
+    #[must_use]
+    pub fn stream_writer(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.IO.StreamWriter");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
     /// Returns a reference to the value type `System.DateTime`, the wall-clock
     /// struct backing the `SystemTime` PAL hook.
     #[must_use]
