@@ -167,3 +167,42 @@ Net: the tractable JIT-codegen wins (iterators, the extract transmutes) are bank
 cluster's real lever is NativeAOT (proven) and its floor is intrinsic. hashmap is the hasher algorithm
 (use FxHash/ahash, §1). The small scalar gaps (int/iter_indexed ~2× C#) are RyuJIT-on-our-IL quality —
 also collapsed by NativeAOT (int_arith 14.3 → 6.5 ms, §5).
+
+---
+
+## Run 5 — NativeAOT sweep across the FULL workload set (now that AOT is correctness-complete)
+
+With the FieldRVA const-data fix (4b487f7) AOT produces correct output for every workload (all
+checksums below are byte-identical across native/JIT/AOT). So AOT can now be measured as a complete
+path, not just on pure compute. One probe, all kernels, best-of-8 (arm64, .NET 8):
+
+| kernel       | native | JIT (RyuJIT) | AOT (ILC) | AOT vs JIT | AOT vs native |
+|--------------|-------:|-------------:|----------:|-----------:|--------------:|
+| int_arith    | 0.0*   | 11.1         | **9.7**   | 1.1×       | — |
+| iter_sum     | 0.0*   | 13.1         | **9.6**   | 1.4×       | — |
+| iter_zip     | 0.3*   | 11.1         | **4.3**   | 2.6×       | — |
+| vec_churn    | 271.9  | 1114.7       | **388.9** | 2.9×       | 1.4× |
+| box_churn    | 9.5*   | 751.8        | **455.7** | 1.6×       | — |
+| string_build | 194.4  | 1430.8       | **408.6** | 3.5×       | 2.1× |
+| hashmap      | 44.9   | 1370.3       | **488.4** | 2.8×       | 10.9× |
+
+`*` native folds/elides these: LLVM constant-folds the pure-compute loops (int_arith/iter_sum/iter_zip
+→ ~0) and elides box_churn's allocation (Box::new(i); *b ⇒ i), so native is not a fair baseline for
+them — JIT-vs-AOT is the real comparison there.
+
+### Conclusions — where we can go from here
+
+1. **AOT is faster than JIT on EVERY workload — 1.6-3.5× on the real (allocation/format/hashmap) ones.**
+   This is ILC inlining the std wrapper layer RyuJIT won't (box_new_uninit, drop_glue, the fmt machinery)
+   + autovectorizing. It is the single convergent lever and it is now correctness-complete.
+2. **AOT closes most of the JIT-vs-native allocation gap:** vec_churn 4.1× → **1.4×** native, string_build
+   7.4× → **2.1×**, hashmap 30× → **10.9×** (the residual is SipHash — swap to FxHash/ahash, §1, to close
+   most of it). The allocation cluster that the JIT path could not move (un-inlinable wrappers + alloc
+   floor) is largely answered by AOT.
+3. **The JIT path's own wins are banked** (MIR-inline + SROA + transmute-ldfld + const-hoist): iterators
+   essentially solved; the residual JIT gaps (allocation, hashmap) are exactly what AOT closes.
+
+So the highest-leverage next step is **tooling, not codegen**: a first-class `cargo dotnet publish --aot`
+(wrap the proven `PublishAot` host-generation) to make this 1.6-3.5× available as one command. Remaining
+codegen frontier: AOT for a standalone Rust *binary* + the full I/O PAL (vs the C#-host-consumes-Rust-lib
+path proven here), and the FxHash default for hash-heavy code.
