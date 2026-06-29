@@ -83,16 +83,39 @@ adapter chain — the `Option`, the transmute reinterprets, the closures — exa
 leaves behind. So NativeAOT is the single highest-leverage option for compute-heavy Rust on .NET, and
 it closes the scalar "JIT ceiling" that the JIT path cannot.
 
-Recipe (proven for a pure-compute lib; whole-program AOT incl. the I/O PAL is not yet wired):
+### Whole-program AOT works through the C#-consumes-Rust interop path
+
+A `PublishAot` C# host that references a Rust crate (directly or via `msbuild/RustDotnet.targets`)
+publishes to a **standalone native binary** (no .NET runtime) with the Rust compiled in. Recipe:
 
 ```bash
 cargo dotnet build mylib --release          # Rust cdylib -> mylib.dll (managed assembly)
 # host.csproj: <PublishAot>true</PublishAot> <RuntimeIdentifier>osx-arm64</RuntimeIdentifier>
 #              <Reference Include="mylib"><HintPath>.../mylib.dll</HintPath></Reference>
-dotnet publish -c Release                   # ILC compiles the Rust IL + C# host to a native binary
+dotnet publish -c Release                   # ILC compiles the Rust IL + C# host -> native Mach-O/ELF
 ```
 
-Tradeoffs: AOT changes the deployment model (a self-contained native binary, faster startup, no JIT
-warm-up, larger artifact, no runtime codegen). For a compute kernel exposed to a .NET app, the C#
-host + `PublishAot` path above is the way to get LLVM-class codegen out of Rust-on-.NET today. A
-first-class `cargo dotnet publish --aot` (and AOT-compatibility for the full I/O PAL) is a follow-up.
+Validated end-to-end on the full `cd_interop` marshalling sample (arm64 native binary): **primitives,
+de-mangled struct value-types, struct methods, and inbound slices all marshal correctly under AOT**,
+and separately **collections (`Vec`/`RawVec` growth), `String::push`, heap allocation, and constant
+`format!` all work**. So AOT is not just for pure compute — most of the interop surface survives ILC.
+
+> Caveat: the lib build needs a *current* installed toolchain — re-run `cargo dotnet setup` if
+> `~/.cargo-dotnet` predates a std-PAL change (a stale PAL fails `build-std`, unrelated to AOT).
+
+### The one known whole-program-AOT gap: `core::fmt` interpolation
+
+`format!` with an **interpolated argument** drops that argument under AOT only (it works under RyuJIT).
+Precisely localized with a minimal repro: `format!("Hello, from Rust!")` → 17 bytes ✓, but
+`format!("val={x}")` → `"val="` (the `{x}` vanishes; 4 bytes, expected 6). The literal pieces are
+written directly; the per-`{}` value is written through a `core::fmt` **formatter function-pointer**
+(`ldftn` to the monomorphized `Display::fmt`), and ILC does not dispatch that `calli` the way RyuJIT
+does — the call silently no-ops. This is the same fn-pointer/`calli`-ABI class as the historical
+DerfWrongPtr bug, but ILC enforces a stricter `calli` contract. Fixing it (the backend's
+fn-pointer-call emission vs ILC's `calli` requirements) is the next AOT step; until then, AOT programs
+that format interpolated values are miscompiled — keep formatting on the JIT side, or pass values out
+to C# to format.
+
+Tradeoffs: AOT changes the deployment model (self-contained native binary, faster startup, no JIT
+warm-up, larger artifact, no runtime codegen). A first-class `cargo dotnet publish --aot` (and full
+I/O-PAL AOT-compatibility) waits on the `core::fmt` fn-pointer fix above.
