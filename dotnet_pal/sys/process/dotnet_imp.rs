@@ -42,6 +42,96 @@ use crate::sys::fs::File;
 use crate::sys::unsupported;
 use crate::{fmt, io};
 
+// DOTNET PAL ARM — real process spawning via a `System.Diagnostics.Process` bridge (the hooks build
+// a ProcessStartInfo, start it, and wait). Handles are GCHandle IntPtrs (fs/net convention).
+unsafe extern "C" {
+    fn rcl_dotnet_proc_psi_new(prog_ptr: *const u8, prog_len: usize) -> *mut u8;
+    fn rcl_dotnet_proc_psi_args(psi: *mut u8, ptr: *const u8, len: usize);
+    fn rcl_dotnet_proc_psi_cwd(psi: *mut u8, ptr: *const u8, len: usize);
+    fn rcl_dotnet_proc_psi_capture(psi: *mut u8);
+    fn rcl_dotnet_proc_start(psi: *mut u8) -> *mut u8;
+    fn rcl_dotnet_proc_wait(handle: *mut u8) -> i32;
+    fn rcl_dotnet_proc_has_exited(handle: *mut u8) -> i32;
+    fn rcl_dotnet_proc_id(handle: *mut u8) -> u32;
+    fn rcl_dotnet_proc_kill(handle: *mut u8);
+    fn rcl_dotnet_proc_free(handle: *mut u8);
+}
+
+/// Quote `args` into a single string for `ProcessStartInfo.Arguments`, using .NET's
+/// `PasteArguments` convention so .NET parses them back into the exact child argv (no shell). The
+/// common no-space/no-quote case is just space-joined; quoting only kicks in for ' ', '\t', '"'.
+fn paste_arguments(args: &[OsString]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    for (i, arg) in args.iter().enumerate() {
+        if i > 0 {
+            out.push(b' ');
+        }
+        let bytes = arg.as_encoded_bytes();
+        let needs_quote =
+            bytes.is_empty() || bytes.iter().any(|&b| b == b' ' || b == b'\t' || b == b'"');
+        if !needs_quote {
+            out.extend_from_slice(bytes);
+            continue;
+        }
+        out.push(b'"');
+        let mut j = 0;
+        while j < bytes.len() {
+            let mut backslashes = 0;
+            while j < bytes.len() && bytes[j] == b'\\' {
+                backslashes += 1;
+                j += 1;
+            }
+            if j == bytes.len() {
+                // Escape all trailing backslashes so they don't escape the closing quote.
+                for _ in 0..backslashes * 2 {
+                    out.push(b'\\');
+                }
+            } else if bytes[j] == b'"' {
+                for _ in 0..backslashes * 2 + 1 {
+                    out.push(b'\\');
+                }
+                out.push(b'"');
+                j += 1;
+            } else {
+                for _ in 0..backslashes {
+                    out.push(b'\\');
+                }
+                out.push(bytes[j]);
+                j += 1;
+            }
+        }
+        out.push(b'"');
+    }
+    out
+}
+
+/// Build a `ProcessStartInfo` from `cmd` and `Process.Start` it; returns the process GCHandle.
+/// `capture` requests stdout/stderr redirection (for `output()`). `program` is `args[0]` (FileName);
+/// the rest become `Arguments`. A null from a hook means the start failed (errno set BCL-side).
+fn build_and_start(cmd: &Command, capture: bool) -> io::Result<*mut u8> {
+    let prog = cmd.program.as_encoded_bytes();
+    let psi = unsafe { rcl_dotnet_proc_psi_new(prog.as_ptr(), prog.len()) };
+    if psi.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    if cmd.args.len() > 1 {
+        let pasted = paste_arguments(&cmd.args[1..]);
+        unsafe { rcl_dotnet_proc_psi_args(psi, pasted.as_ptr(), pasted.len()) };
+    }
+    if let Some(cwd) = &cmd.cwd {
+        let b = cwd.as_encoded_bytes();
+        unsafe { rcl_dotnet_proc_psi_cwd(psi, b.as_ptr(), b.len()) };
+    }
+    if capture {
+        unsafe { rcl_dotnet_proc_psi_capture(psi) };
+    }
+    let handle = unsafe { rcl_dotnet_proc_start(psi) };
+    if handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(handle)
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Command
 ////////////////////////////////////////////////////////////////////////////////
@@ -142,10 +232,25 @@ impl Command {
 
     pub fn spawn(
         &mut self,
-        _default: Stdio,
+        default: Stdio,
         _needs_stdin: bool,
     ) -> io::Result<(Process, StdioPipes)> {
-        unsupported()
+        // PACKAGE C (this arm): real spawn for INHERITED stdio (`Command::status`, and any
+        // spawn that doesn't pipe). Captured/piped stdio (`Stdio::MakePipe` — `Command::output`
+        // and `Stdio::piped()`) needs readable `AnonPipe`s over the child streams and is handled
+        // by the dedicated `output()` path below; a direct piped `spawn` stays Unsupported for now.
+        let is_pipe = |s: &Option<Stdio>| matches!(s, Some(Stdio::MakePipe));
+        let default_is_pipe = matches!(default, Stdio::MakePipe);
+        let wants_pipe = is_pipe(&self.stdin)
+            || is_pipe(&self.stdout)
+            || is_pipe(&self.stderr)
+            || (default_is_pipe
+                && (self.stdin.is_none() || self.stdout.is_none() || self.stderr.is_none()));
+        if wants_pipe {
+            return unsupported();
+        }
+        let handle = build_and_start(self, false)?;
+        Ok((Process { handle }, StdioPipes { stdin: None, stdout: None, stderr: None }))
     }
 
     // =======================================================================
@@ -306,23 +411,25 @@ impl fmt::Debug for Command {
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Default)]
 #[non_exhaustive]
-pub struct ExitStatus();
+pub struct ExitStatus(i32);
 
 impl ExitStatus {
     pub fn exit_ok(&self) -> Result<(), ExitStatusError> {
-        Ok(())
+        // .NET reports only a plain exit code (no POSIX wait-status). 0 = success.
+        match NonZero::new(self.0) {
+            None => Ok(()),
+            Some(c) => Err(ExitStatusError(c)),
+        }
     }
 
     pub fn code(&self) -> Option<i32> {
-        Some(0)
+        Some(self.0)
     }
 
     // =======================================================================
-    // DOTNET PAL ARM (Package A stub) — os::unix::process::ExitStatusExt surface.
-    //
-    // IMPOSSIBLE (I7): there is no POSIX wait-status on CoreCLR. `ExitStatus` is a
-    // synthetic always-success (`code()==Some(0)`), so every signal/stop/continue
-    // query is `None`/`false` and the raw form is `0`.
+    // os::unix::process::ExitStatusExt surface. IMPOSSIBLE (I7): there is no POSIX
+    // wait-status on CoreCLR — a child only yields a plain exit code — so every
+    // signal/stop/continue query is `None`/`false` and `into_raw` is the code.
     // =======================================================================
 
     pub fn signal(&self) -> Option<i32> {
@@ -342,59 +449,35 @@ impl ExitStatus {
     }
 
     pub fn into_raw(&self) -> i32 {
-        0
+        self.0
     }
 }
 
 impl fmt::Display for ExitStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<dummy exit status>")
+        write!(f, "exit status: {}", self.0)
     }
 }
 
-// DOTNET PAL ARM (Package A stub): `ExitStatusExt::from_raw` is
-// `process::ExitStatus::from_inner(From::from(raw))` — the inner `From<i32>`. The
-// dotnet `ExitStatus` is the synthetic always-success unit, so any raw maps to it
-// (the wait-status the int encodes is meaningless on CLR — I7).
+// `ExitStatusExt::from_raw`. .NET has no wait-status encoding, so the raw IS the exit code.
 impl From<i32> for ExitStatus {
-    fn from(_raw: i32) -> ExitStatus {
-        ExitStatus()
+    fn from(raw: i32) -> ExitStatus {
+        ExitStatus(raw)
     }
 }
 
-pub struct ExitStatusError(!);
-
-impl Clone for ExitStatusError {
-    fn clone(&self) -> ExitStatusError {
-        self.0
-    }
-}
-
-impl Copy for ExitStatusError {}
-
-impl PartialEq for ExitStatusError {
-    fn eq(&self, _other: &ExitStatusError) -> bool {
-        self.0
-    }
-}
-
-impl Eq for ExitStatusError {}
-
-impl fmt::Debug for ExitStatusError {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0
-    }
-}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExitStatusError(NonZero<i32>);
 
 impl Into<ExitStatus> for ExitStatusError {
     fn into(self) -> ExitStatus {
-        self.0
+        ExitStatus(self.0.get())
     }
 }
 
 impl ExitStatusError {
     pub fn code(self) -> Option<NonZero<i32>> {
-        self.0
+        Some(self.0)
     }
 }
 
@@ -416,35 +499,58 @@ impl From<u8> for ExitCode {
     }
 }
 
-pub struct Process(!);
+/// A spawned child: a `GCHandle` `IntPtr` pinning the managed `System.Diagnostics.Process`.
+pub struct Process {
+    handle: *mut u8,
+}
+
+// The handle is an opaque GCHandle IntPtr; the managed Process it pins is owned solely by this
+// value (freed on Drop), so it is sound to move across threads like the net/fs handles.
+unsafe impl Send for Process {}
+unsafe impl Sync for Process {}
 
 impl Process {
     pub fn id(&self) -> u32 {
-        self.0
+        // SAFETY: `self.handle` pins a live managed Process until Drop.
+        unsafe { rcl_dotnet_proc_id(self.handle) }
     }
 
     pub fn kill(&mut self) -> io::Result<()> {
-        self.0
+        // SAFETY: live handle.
+        unsafe { rcl_dotnet_proc_kill(self.handle) };
+        Ok(())
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.0
+        // SAFETY: live handle; WaitForExit + ExitCode.
+        Ok(ExitStatus(unsafe { rcl_dotnet_proc_wait(self.handle) }))
     }
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.0
+        // SAFETY: live handle. HasExited is non-blocking; if exited, WaitForExit returns at once.
+        if unsafe { rcl_dotnet_proc_has_exited(self.handle) } != 0 {
+            Ok(Some(ExitStatus(unsafe { rcl_dotnet_proc_wait(self.handle) })))
+        } else {
+            Ok(None)
+        }
     }
 
-    // DOTNET PAL ARM (Package A stub) — os::unix::process::ChildExt surface.
-    // `Process` is uninhabited (spawn never succeeds), so these diverge on the
-    // never value exactly like `id`/`kill`/`wait` above. IMPOSSIBLE (I6): no
-    // signal delivery to a child that does not exist.
+    // os::unix::process::ChildExt surface. IMPOSSIBLE (I6): stock CoreCLR has no POSIX signal
+    // delivery to a child (only `Kill`), so arbitrary signal sends are Unsupported.
     pub fn send_signal(&self, _signal: i32) -> io::Result<()> {
-        self.0
+        unsupported()
     }
 
     pub fn send_process_group_signal(&self, _signal: i32) -> io::Result<()> {
-        self.0
+        unsupported()
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        // Release our reference to the managed Process (Rust drops a Child as "detach"; the OS
+        // process keeps running). SAFETY: handle freed exactly once, here.
+        unsafe { rcl_dotnet_proc_free(self.handle) };
     }
 }
 

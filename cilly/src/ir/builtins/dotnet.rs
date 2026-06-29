@@ -184,6 +184,258 @@ pub fn insert_dotnet_pal(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
     insert_dotnet_env(asm, patcher);
     insert_dotnet_fs(asm, patcher);
     insert_dotnet_net(asm, patcher);
+    insert_dotnet_process(asm, patcher);
+}
+
+/// Process-spawn hooks for the dotnet `process` PAL arm — a `System.Diagnostics.Process` bridge.
+/// The Rust PAL builds a `ProcessStartInfo` (handle), sets FileName/Arguments/cwd, optionally
+/// requests stdout/stderr capture, starts it (→ a `Process` handle), and waits. Each hook is
+/// loop-free; the orchestration (arg pasting, etc.) is on the Rust side. Handles are `GCHandle`
+/// `IntPtr`s (same convention as fs `FileStream` / net `Socket`).
+fn insert_dotnet_process(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let void_ptr = |asm: &mut Assembly| {
+        let void = asm.alloc_type(Type::Void);
+        (void, Type::Ptr(void))
+    };
+
+    // rcl_dotnet_proc_psi_new(prog_ptr, prog_len) -> *mut u8
+    //   => psi = new ProcessStartInfo(); psi.FileName = prog; psi.UseShellExecute = false;
+    //      return (void*)GCHandle.Alloc(psi).
+    {
+        let name = asm.alloc_string("rcl_dotnet_proc_psi_new");
+        let generator = move |_, asm: &mut Assembly| {
+            let psi_cr = ClassRef::process_start_info(asm);
+            let psi_ty = Type::ClassRef(psi_cr);
+            let ctor = asm.class_ref(psi_cr).clone().ctor(&[], asm);
+            let psi = asm.alloc_node(CILNode::call(ctor, []));
+            let store = asm.alloc_root(CILRoot::StLoc(0, psi));
+            // psi.FileName = decode(prog)
+            let prog = decode_utf8(asm, 0, 1);
+            let set_fn = asm.alloc_string("set_FileName");
+            let set_file_name = asm.class_ref(psi_cr).clone().instance(
+                &[Type::PlatformString],
+                Type::Void,
+                set_fn,
+                asm,
+            );
+            let psi0 = asm.alloc_node(CILNode::LdLoc(0));
+            let r_fn = asm.alloc_root(CILRoot::call(set_file_name, [psi0, prog]));
+            // psi.UseShellExecute = false
+            let set_use = asm.alloc_string("set_UseShellExecute");
+            let set_use_shell = asm.class_ref(psi_cr).clone().instance(
+                &[Type::Bool],
+                Type::Void,
+                set_use,
+                asm,
+            );
+            let psi1 = asm.alloc_node(CILNode::LdLoc(0));
+            let false_c = asm.alloc_node(false);
+            let r_use = asm.alloc_root(CILRoot::call(set_use_shell, [psi1, false_c]));
+            // return (void*)GCHandle.Alloc(psi)
+            let handle = CILNode::LdLoc(0).ref_to_handle(asm);
+            let handle = asm.alloc_node(handle);
+            let (void, _) = void_ptr(asm);
+            let handle = asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::Ptr(void))));
+            let ret = asm.alloc_root(CILRoot::Ret(handle));
+            let psi_local = asm.alloc_type(psi_ty);
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![store, r_fn, r_use, ret], 0, None)],
+                locals: vec![(Some(asm.alloc_string("psi")), psi_local)],
+            }
+        };
+        patcher.insert(name, Box::new(generator));
+    }
+
+    // setter hooks taking (psi_handle, str_ptr, str_len): set a string property on the PSI.
+    let mut str_setter = |asm: &mut Assembly, hook: &str, setter: &str| {
+        let name = asm.alloc_string(hook);
+        let setter = setter.to_string();
+        let generator = move |_, asm: &mut Assembly| {
+            let psi_cr = ClassRef::process_start_info(asm);
+            let psi = handle_to_class(asm, 0, psi_cr);
+            let val = decode_utf8(asm, 1, 2);
+            let sname = asm.alloc_string(setter.as_str());
+            let set = asm.class_ref(psi_cr).clone().instance(
+                &[Type::PlatformString],
+                Type::Void,
+                sname,
+                asm,
+            );
+            let call = asm.alloc_root(CILRoot::call(set, [psi, val]));
+            let ret = asm.alloc_root(CILRoot::VoidRet);
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![call, ret], 0, None)],
+                locals: vec![],
+            }
+        };
+        patcher.insert(name, Box::new(generator));
+    };
+    str_setter(asm, "rcl_dotnet_proc_psi_args", "set_Arguments");
+    str_setter(asm, "rcl_dotnet_proc_psi_cwd", "set_WorkingDirectory");
+
+    // rcl_dotnet_proc_psi_capture(psi_handle): psi.RedirectStandardOutput = true; ...Error = true.
+    {
+        let name = asm.alloc_string("rcl_dotnet_proc_psi_capture");
+        let generator = move |_, asm: &mut Assembly| {
+            let psi_cr = ClassRef::process_start_info(asm);
+            let mut roots = Vec::new();
+            for setter in ["set_RedirectStandardOutput", "set_RedirectStandardError"] {
+                let psi = handle_to_class(asm, 0, psi_cr);
+                let sname = asm.alloc_string(setter);
+                let set = asm.class_ref(psi_cr).clone().instance(
+                    &[Type::Bool],
+                    Type::Void,
+                    sname,
+                    asm,
+                );
+                let true_c = asm.alloc_node(true);
+                roots.push(asm.alloc_root(CILRoot::call(set, [psi, true_c])));
+            }
+            roots.push(asm.alloc_root(CILRoot::VoidRet));
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(roots, 0, None)],
+                locals: vec![],
+            }
+        };
+        patcher.insert(name, Box::new(generator));
+    }
+
+    // rcl_dotnet_proc_start(psi_handle) -> *mut u8
+    //   => p = Process.Start(psi); free the psi GCHandle; return (void*)GCHandle.Alloc(p).
+    {
+        let name = asm.alloc_string("rcl_dotnet_proc_start");
+        let generator = move |_, asm: &mut Assembly| {
+            let psi_cr = ClassRef::process_start_info(asm);
+            let proc_cr = ClassRef::process(asm);
+            let psi = handle_to_class(asm, 0, psi_cr);
+            let start_name = asm.alloc_string("Start");
+            let start = asm.class_ref(proc_cr).clone().static_mref(
+                &[Type::ClassRef(psi_cr)],
+                Type::ClassRef(proc_cr),
+                start_name,
+                asm,
+            );
+            let p = asm.alloc_node(CILNode::call(start, [psi]));
+            let store_p = asm.alloc_root(CILRoot::StLoc(0, p));
+            // free the psi GCHandle (arg 0); it is consumed.
+            let (store_gch, free, gc_handle_ty) = free_handle_roots(asm, 0, 1);
+            // return (void*)GCHandle.Alloc(p)
+            let handle = CILNode::LdLoc(0).ref_to_handle(asm);
+            let handle = asm.alloc_node(handle);
+            let (void, _) = void_ptr(asm);
+            let handle = asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::Ptr(void))));
+            let ret = asm.alloc_root(CILRoot::Ret(handle));
+            let proc_local = asm.alloc_type(Type::ClassRef(proc_cr));
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![store_p, store_gch, free, ret], 0, None)],
+                locals: vec![
+                    (Some(asm.alloc_string("p")), proc_local),
+                    (Some(asm.alloc_string("gch")), gc_handle_ty),
+                ],
+            }
+        };
+        patcher.insert(name, Box::new(generator));
+    }
+
+    // rcl_dotnet_proc_wait(proc_handle) -> i32 => p.WaitForExit(); return p.ExitCode.
+    {
+        let name = asm.alloc_string("rcl_dotnet_proc_wait");
+        let generator = move |_, asm: &mut Assembly| {
+            let proc_cr = ClassRef::process(asm);
+            let p = handle_to_class(asm, 0, proc_cr);
+            let wfe_name = asm.alloc_string("WaitForExit");
+            let wfe = asm.class_ref(proc_cr).clone().instance(&[], Type::Void, wfe_name, asm);
+            let r_wait = asm.alloc_root(CILRoot::call(wfe, [p]));
+            let p2 = handle_to_class(asm, 0, proc_cr);
+            let ec_name = asm.alloc_string("get_ExitCode");
+            let get_ec =
+                asm.class_ref(proc_cr).clone().instance(&[], Type::Int(Int::I32), ec_name, asm);
+            let code = asm.alloc_node(CILNode::call(get_ec, [p2]));
+            let ret = asm.alloc_root(CILRoot::Ret(code));
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![r_wait, ret], 0, None)],
+                locals: vec![],
+            }
+        };
+        patcher.insert(name, Box::new(generator));
+    }
+
+    // simple instance-getter hooks: rcl_dotnet_proc_id -> u32 (Id), rcl_dotnet_proc_has_exited -> i32.
+    let mut int_getter = |asm: &mut Assembly, hook: &str, getter: &str, ret: Int| {
+        let name = asm.alloc_string(hook);
+        let getter = getter.to_string();
+        let generator = move |_, asm: &mut Assembly| {
+            let proc_cr = ClassRef::process(asm);
+            let p = handle_to_class(asm, 0, proc_cr);
+            let gname = asm.alloc_string(getter.as_str());
+            let get = asm.class_ref(proc_cr).clone().instance(&[], Type::Int(ret), gname, asm);
+            let v = asm.alloc_node(CILNode::call(get, [p]));
+            let ret_root = asm.alloc_root(CILRoot::Ret(v));
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![ret_root], 0, None)],
+                locals: vec![],
+            }
+        };
+        patcher.insert(name, Box::new(generator));
+    };
+    int_getter(asm, "rcl_dotnet_proc_id", "get_Id", Int::I32);
+
+    // rcl_dotnet_proc_has_exited(proc_handle) -> i32 (1 if exited else 0).
+    {
+        let name = asm.alloc_string("rcl_dotnet_proc_has_exited");
+        let generator = move |_, asm: &mut Assembly| {
+            let proc_cr = ClassRef::process(asm);
+            let p = handle_to_class(asm, 0, proc_cr);
+            let he_name = asm.alloc_string("get_HasExited");
+            let get = asm.class_ref(proc_cr).clone().instance(&[], Type::Bool, he_name, asm);
+            let b = asm.alloc_node(CILNode::call(get, [p]));
+            let v = asm.int_cast(b, Int::I32, ExtendKind::ZeroExtend);
+            let ret_root = asm.alloc_root(CILRoot::Ret(v));
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![ret_root], 0, None)],
+                locals: vec![],
+            }
+        };
+        patcher.insert(name, Box::new(generator));
+    }
+
+    // rcl_dotnet_proc_kill(proc_handle) => p.Kill().
+    {
+        let name = asm.alloc_string("rcl_dotnet_proc_kill");
+        let generator = move |_, asm: &mut Assembly| {
+            let proc_cr = ClassRef::process(asm);
+            let p = handle_to_class(asm, 0, proc_cr);
+            let kill_name = asm.alloc_string("Kill");
+            let kill = asm.class_ref(proc_cr).clone().instance(&[], Type::Void, kill_name, asm);
+            let r_kill = asm.alloc_root(CILRoot::call(kill, [p]));
+            let ret = asm.alloc_root(CILRoot::VoidRet);
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![r_kill, ret], 0, None)],
+                locals: vec![],
+            }
+        };
+        patcher.insert(name, Box::new(generator));
+    }
+
+    // rcl_dotnet_proc_free(proc_handle) => p.Dispose() + free the GCHandle.
+    {
+        let name = asm.alloc_string("rcl_dotnet_proc_free");
+        let generator = move |_, asm: &mut Assembly| {
+            let proc_cr = ClassRef::process(asm);
+            let p = handle_to_class(asm, 0, proc_cr);
+            let dispose_name = asm.alloc_string("Dispose");
+            let dispose =
+                asm.class_ref(proc_cr).clone().instance(&[], Type::Void, dispose_name, asm);
+            let r_disp = asm.alloc_root(CILRoot::call(dispose, [p]));
+            let (store_gch, free, gc_handle_ty) = free_handle_roots(asm, 0, 0);
+            let ret = asm.alloc_root(CILRoot::VoidRet);
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![r_disp, store_gch, free, ret], 0, None)],
+                locals: vec![(Some(asm.alloc_string("gch")), gc_handle_ty)],
+            }
+        };
+        patcher.insert(name, Box::new(generator));
+    }
 }
 
 /// `rcl_dotnet_instant_ticks() -> i64`

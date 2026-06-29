@@ -650,6 +650,24 @@ impl ClassRef {
         let asm_name = Some(asm.alloc_string("System.Runtime.Extensions"));
         asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
     }
+    /// Returns a reference to `System.Diagnostics.ProcessStartInfo` — the spawn
+    /// recipe (FileName/Arguments/WorkingDirectory/Redirect*) for the dotnet
+    /// `process` PAL arm. A reference type in assembly `System.Diagnostics.Process`.
+    #[must_use]
+    pub fn process_start_info(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Diagnostics.ProcessStartInfo");
+        let asm_name = Some(asm.alloc_string("System.Diagnostics.Process"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
+    /// Returns a reference to `System.Diagnostics.Process` — a spawned child
+    /// (Start/WaitForExit/ExitCode/Id/Kill/HasExited) for the dotnet `process`
+    /// PAL arm. A reference type in assembly `System.Diagnostics.Process`.
+    #[must_use]
+    pub fn process(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.Diagnostics.Process");
+        let asm_name = Some(asm.alloc_string("System.Diagnostics.Process"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
+    }
     /// Returns a reference to the value type `System.DateTime`, the wall-clock
     /// struct backing the `SystemTime` PAL hook.
     #[must_use]
