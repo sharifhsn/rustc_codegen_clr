@@ -63,3 +63,36 @@ Decomposed with a C# microbenchmark (5M alloc+free):
 
 These are backend-codegen targets, not advice to write un-idiomatic Rust — they're listed so a hot path
 can be restructured if the profiler points here.
+
+## 5. NativeAOT — the big lever for compute-bound code (~2.1× scalar, iterators fully collapse)
+
+The JIT (RyuJIT) leaves real performance on the table: it won't autovectorize, and it won't inline
+struct-returning helpers (the transparent-newtype reinterprets that thread through iterator/pointer
+code). **`ILC`, the NativeAOT compiler, does both** — and it accepts this backend's IL unmodified.
+
+Measured (controlled experiment, .NET 8, arm64): a pure-compute Rust `cdylib` built with this backend,
+referenced from a `PublishAot` C# host and AOT-compiled by ILC:
+
+| 20M-iteration kernel | JIT (RyuJIT) | NativeAOT (ILC) |
+|----------------------|-------------:|----------------:|
+| `int_arith` (scalar) | 14.3 ms | **6.5 ms (~2.1×)** |
+| `iter_sum` (iterator)| —        | **4.9 ms** — *below* the manual scalar loop |
+
+`iter_sum` under AOT runs *faster than the hand-written integer loop* because ILC inlined the whole
+adapter chain — the `Option`, the transmute reinterprets, the closures — exactly the residue RyuJIT
+leaves behind. So NativeAOT is the single highest-leverage option for compute-heavy Rust on .NET, and
+it closes the scalar "JIT ceiling" that the JIT path cannot.
+
+Recipe (proven for a pure-compute lib; whole-program AOT incl. the I/O PAL is not yet wired):
+
+```bash
+cargo dotnet build mylib --release          # Rust cdylib -> mylib.dll (managed assembly)
+# host.csproj: <PublishAot>true</PublishAot> <RuntimeIdentifier>osx-arm64</RuntimeIdentifier>
+#              <Reference Include="mylib"><HintPath>.../mylib.dll</HintPath></Reference>
+dotnet publish -c Release                   # ILC compiles the Rust IL + C# host to a native binary
+```
+
+Tradeoffs: AOT changes the deployment model (a self-contained native binary, faster startup, no JIT
+warm-up, larger artifact, no runtime codegen). For a compute kernel exposed to a .NET app, the C#
+host + `PublishAot` path above is the way to get LLVM-class codegen out of Rust-on-.NET today. A
+first-class `cargo dotnet publish --aot` (and AOT-compatibility for the full I/O PAL) is a follow-up.
