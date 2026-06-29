@@ -13,6 +13,7 @@ use super::{
 use crate::{Assembly, MethodDef};
 pub use opt_fuel::OptFuel;
 pub use side_effect::*;
+mod hoist;
 mod inline;
 mod opt_fuel;
 mod scalarize;
@@ -756,6 +757,16 @@ impl MethodDef {
         }
 
         self.remove_useless_handlers(asm, fuel, cache);
+
+        // Hoist loop-invariant aggregate-constant materialization (`transmute(<const>)`, e.g. an
+        // alloc `Layout`) out of loop bodies into a once-evaluated entry-block local — RyuJIT cannot
+        // hoist the opaque struct-returning `transmute` call itself. Runs after block linearization so
+        // it sees the final block structure.
+        if fuel.consume(2) {
+            if let MethodImpl::MethodBody { blocks, locals } = self.implementation_mut() {
+                hoist::hoist_const_calls(blocks, locals, asm);
+            }
+        }
     }
     fn remove_useless_handlers(
         &mut self,
