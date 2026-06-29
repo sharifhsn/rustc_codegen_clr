@@ -81,12 +81,30 @@ use crate::sys::time::SystemTime;
 use crate::sys::unsupported;
 use crate::sys::FromInner;
 
-// `Dir` lives in the shared `common` arm; `copy` and `remove_dir_all` are
-// delegated there too (they compose `File::open` / `io::copy` / `read_dir` /
-// `remove_file` / `remove_dir`, all real on this arm). `exists` is NOT taken
-// from `common` (its `metadata`-then-NotFound path would route through the
-// io-error `Uncategorized` trap); a dedicated `exists` is defined below.
-pub use crate::sys::fs::common::{copy, remove_dir_all, Dir};
+// `Dir` lives in the shared `common` arm; `remove_dir_all` is delegated there too (it composes
+// `read_dir` / `remove_file` / `remove_dir`, all real on this arm). `copy` is NOT taken from
+// `common`: `common::copy` finishes with `writer.set_permissions(from's mode)`, and .NET has no
+// Unix permission model so `File::set_permissions` is `Unsupported` — that made `fs::copy` fail at
+// the very end after the bytes were already written. A dedicated `copy` below copies the bytes and
+// skips the permission propagation (correct for managed files). `exists` is also NOT taken from
+// `common` (its `metadata`-then-NotFound path would route through the io-error `Uncategorized` trap).
+pub use crate::sys::fs::common::{remove_dir_all, Dir};
+
+/// `std::fs::copy` for the .NET arm: copy the file's bytes, but DON'T propagate the source's Unix
+/// mode (managed files have no such model — `File::set_permissions` is `Unsupported`). Mirrors
+/// `sys::fs::common::copy` minus the final `set_permissions`.
+pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
+    use crate::fs;
+    let mut reader = fs::File::open(from)?;
+    if !reader.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the source path is not an existing regular file",
+        ));
+    }
+    let mut writer = fs::File::create(to)?;
+    io::copy(&mut reader, &mut writer)
+}
 
 // ===========================================================================
 // PACKAGE A — symbols the `target-family="unix"` flip requires from this arm.
