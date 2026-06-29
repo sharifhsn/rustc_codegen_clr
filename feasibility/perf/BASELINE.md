@@ -128,3 +128,42 @@ Correctness: three native-vs-backend differential checksums byte-identical, incl
 exercises the **live** overflow path (`checked_mul`/`checked_add` → `Some`/`None`, which must keep the
 flag) alongside the dead path (`sum`/`product`) and sub-word (`i8`) checked+saturating arithmetic;
 plus the `::stable` gate (426/14, no regressions) under the fatal CIL type-checker.
+
+---
+
+## Run 4 — cumulative state (MIR-inline + SROA + nested-SROA + transmute-ldfld) + loose-ends audit
+
+Full harness with everything landed:
+
+| workload     | native | backend | C# | bk/nat | bk/C# | vs Run 1 backend |
+|--------------|-------:|--------:|----:|-------:|------:|-----------------:|
+| int_arith    | 30.8   | 111.0   | 60.7| 3.6×   | 1.8×  | — |
+| iter_sum     | 30.6   | 156.0   | 56.2| 5.1×   | 2.8×  | 1764 → 156 (**11.3×**) |
+| iter_zip     | 35.8   | **215.6** | 55.5| 6.0× | 3.9×  | 2765 → 216 (**12.8×**) |
+| iter_indexed | 30.8   | 118.7   | 57.7| 3.9×   | 2.1×  | — |
+| vec_churn    | 35.1   | 817.6   | 71.5| 23.3×  | 11.4× | 1125 → 818 |
+| box_churn    | 32.1   | 1547.5  | 68.4| 48.3×  | 22.6× | 1701 → 1548 |
+| hashmap      | 84.2   | 1258.6  | 22.1| 14.9×  | 57.0× | (mostly SipHash — FxHash 2.35×, §1) |
+| string_build | 7.3    | 83.3    | 8.6 | 11.5×  | 9.7×  | (alloc-bound) |
+| sort_ints    | 14.8   | 224.9   | 77.4| 15.2×  | 2.9×  | — |
+
+`iter_zip` joined `iter_sum` in the "essentially solved" column (12.8× cumulative; the transmute-`ldfld`
++ nested-SROA collapse it). The remaining cluster is **allocation** (box/vec/string) and **hashmap**.
+
+### box_churn / allocation — audited: AOT territory + intrinsic floor, not a clean JIT fix
+
+box_churn's per-iteration residual (from its IL) is: an un-inlined `box_new_uninit` + `drop_glue` (Rust
+std method calls), a 2-field `transmute(UInt128 → Layout)`, and a nested `transmute(*u8 → Box<u64>)` —
+**none of which are the single-field extracts the `ldfld` rewrite handles** (`Layout` is 2-field, `Box`
+is a nested wrapper), and `box_new_uninit`/`drop_glue` are methods RyuJIT won't inline. Measured under
+**NativeAOT**: box_churn **38.8 → 21.6 ns/op (~1.8×)**, landing on the NativeMemory alloc+free floor
+(~17 ns) — i.e. ILC inlines exactly that wrapper layer RyuJIT leaves. So the JIT-path residual is *not*
+a clean codegen bug to fix; it's (a) the un-inlinable std/transmute wrappers → **NativeAOT** closes them,
+and (b) the gen-0-vs-malloc floor → intrinsic (a custom managed allocator was explicitly out of scope).
+The construct-direction transmute inline (field→struct) was considered but the hot cases here are
+multi-field/nested, so it would not move box_churn; deferred as a general newtype-construct cleanup.
+
+Net: the tractable JIT-codegen wins (iterators, the extract transmutes) are banked; the allocation
+cluster's real lever is NativeAOT (proven) and its floor is intrinsic. hashmap is the hasher algorithm
+(use FxHash/ahash, §1). The small scalar gaps (int/iter_indexed ~2× C#) are RyuJIT-on-our-IL quality —
+also collapsed by NativeAOT (int_arith 14.3 → 6.5 ms, §5).
