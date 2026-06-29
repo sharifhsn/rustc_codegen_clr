@@ -2187,6 +2187,8 @@ fn insert_dotnet_fs(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     insert_dotnet_fs_close(asm, patcher);
     insert_dotnet_fs_len(asm, patcher);
     insert_dotnet_fs_set_len(asm, patcher);
+    insert_dotnet_fs_canonicalize(asm, patcher);
+    insert_dotnet_fs_set_readonly(asm, patcher);
     insert_dotnet_fs_stat(asm, patcher);
     insert_dotnet_fs_exists(asm, patcher);
     insert_dotnet_fs_mkdir(asm, patcher);
@@ -2681,6 +2683,155 @@ fn insert_dotnet_fs_set_len(asm: &mut Assembly, patcher: &mut MissingMethodPatch
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![call, ret], 0, None)],
             locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_canonicalize(path_ptr, path_len) -> *mut u8`
+///   => if neither `File.Exists(path)` nor `Directory.Exists(path)`, returns `(u8*)0` (std maps to
+///      `NotFound`, matching `canonicalize`'s require-exists contract); else marshals
+///      `Path.GetFullPath(path)` (absolute, `.`/`..`-normalized) to a NUL-terminated UTF-8 C string
+///      (freed std-side by `rcl_dotnet_cotaskmem_free`).
+///
+/// Backs `sys::fs::canonicalize`. NOTE: `GetFullPath` does not resolve symlinks in the path; on the
+/// common (no-symlink) path this equals Rust's `canonicalize`.
+fn insert_dotnet_fs_canonicalize(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_canonicalize");
+    let generator = move |_, asm: &mut Assembly| {
+        let u8_ptr = asm.nptr(Type::Int(Int::U8));
+        let file = ClassRef::file(asm);
+        let directory = ClassRef::directory(asm);
+        let path_io = ClassRef::path_io(asm);
+        let exists_name = asm.alloc_string("Exists");
+
+        // Block 0: path = decode_utf8; if File.Exists(path) goto 2 else goto 1.
+        let path = decode_utf8(asm, 0, 1);
+        let store_path = asm.alloc_root(CILRoot::StLoc(0, path));
+        let file_exists = asm.class_ref(file).clone().static_mref(
+            &[Type::PlatformString],
+            Type::Bool,
+            exists_name,
+            asm,
+        );
+        let p1 = asm.alloc_node(CILNode::LdLoc(0));
+        let fe = asm.alloc_node(CILNode::call(file_exists, [p1]));
+        let true_c = asm.alloc_node(true);
+        let br_fe = asm.alloc_root(CILRoot::Branch(Box::new((
+            2,
+            0,
+            Some(BranchCond::Eq(fe, true_c)),
+        ))));
+        let goto_dir = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
+
+        // Block 1: if Directory.Exists(path) goto 2 else goto 3 (null).
+        let dir_exists = asm.class_ref(directory).clone().static_mref(
+            &[Type::PlatformString],
+            Type::Bool,
+            exists_name,
+            asm,
+        );
+        let p2 = asm.alloc_node(CILNode::LdLoc(0));
+        let de = asm.alloc_node(CILNode::call(dir_exists, [p2]));
+        let true_c2 = asm.alloc_node(true);
+        let br_de = asm.alloc_root(CILRoot::Branch(Box::new((
+            2,
+            0,
+            Some(BranchCond::Eq(de, true_c2)),
+        ))));
+        let goto_null = asm.alloc_root(CILRoot::Branch(Box::new((3, 0, None))));
+
+        // Block 2: return (u8*)StringToCoTaskMemUTF8(Path.GetFullPath(path)).
+        let gfp_name = asm.alloc_string("GetFullPath");
+        let gfp = asm.class_ref(path_io).clone().static_mref(
+            &[Type::PlatformString],
+            Type::PlatformString,
+            gfp_name,
+            asm,
+        );
+        let p3 = asm.alloc_node(CILNode::LdLoc(0));
+        let full = asm.alloc_node(CILNode::call(gfp, [p3]));
+        let to_utf8 = string_to_utf8(asm);
+        let buf = asm.alloc_node(CILNode::call(to_utf8, [full]));
+        let buf = asm.cast_ptr(buf, u8_ptr);
+        let ret_buf = asm.alloc_root(CILRoot::Ret(buf));
+
+        // Block 3: return (u8*)0.
+        let zero = asm.alloc_node(0_i32);
+        let zero = asm.int_cast(zero, Int::ISize, ExtendKind::ZeroExtend);
+        let null_ptr = asm.cast_ptr(zero, u8_ptr);
+        let ret_null = asm.alloc_root(CILRoot::Ret(null_ptr));
+
+        let string_ty = asm.alloc_type(Type::PlatformString);
+        MethodImpl::MethodBody {
+            blocks: vec![
+                BasicBlock::new(vec![store_path, br_fe, goto_dir], 0, None),
+                BasicBlock::new(vec![br_de, goto_null], 1, None),
+                BasicBlock::new(vec![ret_buf], 2, None),
+                BasicBlock::new(vec![ret_null], 3, None),
+            ],
+            locals: vec![(Some(asm.alloc_string("path")), string_ty)],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+/// `rcl_dotnet_fs_set_readonly(path_ptr, path_len, readonly: i32) -> i32` (returns 0)
+///   => `File.SetAttributes(path, readonly ? FileAttributes.ReadOnly : FileAttributes.Normal)`.
+///
+/// Backs `sys::fs::set_perm` on the dotnet PAL. .NET has no Unix mode model, so a `FilePermissions`
+/// carries only the read-only bit (`FilePermissions::readonly`); this toggles `FileAttributes.ReadOnly`
+/// (`= 1`) vs `FileAttributes.Normal` (`= 128`). It throws on failure (mapped upstream), so 0 = ok.
+fn insert_dotnet_fs_set_readonly(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("rcl_dotnet_fs_set_readonly");
+    let generator = move |_, asm: &mut Assembly| {
+        let file = ClassRef::file(asm);
+        let fattr = ClassRef::file_attributes(asm);
+        let fattr_ty = Type::ClassRef(fattr);
+        let sa_name = asm.alloc_string("SetAttributes");
+        let set_attrs = asm.class_ref(file).clone().static_mref(
+            &[Type::PlatformString, fattr_ty],
+            Type::Void,
+            sa_name,
+            asm,
+        );
+
+        // Block 0: path = decode_utf8; if readonly == 0 goto 2 (Normal) else goto 1 (ReadOnly).
+        let path = decode_utf8(asm, 0, 1);
+        let store_path = asm.alloc_root(CILRoot::StLoc(0, path));
+        let ro = asm.alloc_node(CILNode::LdArg(2));
+        let zero_arg = asm.alloc_node(0_i32);
+        let br = asm.alloc_root(CILRoot::Branch(Box::new((
+            2,
+            0,
+            Some(BranchCond::Eq(ro, zero_arg)),
+        ))));
+        let goto_ro = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
+
+        // Block 1 (readonly): SetAttributes(path, (FileAttributes)1); return 0.
+        let p1 = asm.alloc_node(CILNode::LdLoc(0));
+        let one = asm.alloc_node(1_i32);
+        let one_fa = asm.transmute_on_stack(Type::Int(Int::I32), fattr_ty, one);
+        let call1 = asm.alloc_root(CILRoot::call(set_attrs, [p1, one_fa]));
+        let z1 = asm.alloc_node(0_i32);
+        let ret1 = asm.alloc_root(CILRoot::Ret(z1));
+
+        // Block 2 (not readonly): SetAttributes(path, (FileAttributes)128 /*Normal*/); return 0.
+        let p2 = asm.alloc_node(CILNode::LdLoc(0));
+        let n128 = asm.alloc_node(128_i32);
+        let n128_fa = asm.transmute_on_stack(Type::Int(Int::I32), fattr_ty, n128);
+        let call2 = asm.alloc_root(CILRoot::call(set_attrs, [p2, n128_fa]));
+        let z2 = asm.alloc_node(0_i32);
+        let ret2 = asm.alloc_root(CILRoot::Ret(z2));
+
+        let string_ty = asm.alloc_type(Type::PlatformString);
+        MethodImpl::MethodBody {
+            blocks: vec![
+                BasicBlock::new(vec![store_path, br, goto_ro], 0, None),
+                BasicBlock::new(vec![call1, ret1], 1, None),
+                BasicBlock::new(vec![call2, ret2], 2, None),
+            ],
+            locals: vec![(Some(asm.alloc_string("path")), string_ty)],
         }
     };
     patcher.insert(name, Box::new(generator));

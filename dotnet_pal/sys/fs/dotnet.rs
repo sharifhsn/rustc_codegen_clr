@@ -223,6 +223,11 @@ unsafe extern "C" {
         target_len: usize,
     ) -> i32;
     fn rcl_dotnet_fs_readlink(path_ptr: *const u8, path_len: usize) -> *mut u8;
+    /// `Path.GetFullPath` of an existing path (NUL-terminated UTF-8 C string, free with
+    /// `rcl_dotnet_cotaskmem_free`), or NULL when the path does not exist.
+    fn rcl_dotnet_fs_canonicalize(path_ptr: *const u8, path_len: usize) -> *mut u8;
+    /// `File.SetAttributes(path, readonly ? ReadOnly : Normal)`; returns 0.
+    fn rcl_dotnet_fs_set_readonly(path_ptr: *const u8, path_len: usize, readonly: i32) -> i32;
     /// Shared with args/env: `Marshal.FreeCoTaskMem`. Frees a buffer returned by
     /// `rcl_dotnet_fs_readdir_get`.
     fn rcl_dotnet_cotaskmem_free(ptr: *mut u8);
@@ -908,9 +913,13 @@ pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
     rc(unsafe { rcl_dotnet_fs_rename(ob.as_ptr(), ob.len(), nb.as_ptr(), nb.len()) })
 }
 
-pub fn set_perm(_p: &Path, _perm: FilePermissions) -> io::Result<()> {
-    // No perms model on this arm (see module-doc STUBBED list).
-    unsupported()
+pub fn set_perm(p: &Path, perm: FilePermissions) -> io::Result<()> {
+    // .NET has no Unix mode; a FilePermissions on this arm carries only the read-only bit, which
+    // maps to FileAttributes.ReadOnly. (Other mode bits have no managed equivalent and are ignored.)
+    let bytes = path_bytes(p);
+    let readonly = if perm.readonly() { 1 } else { 0 };
+    // SAFETY: `(ptr, len)` is a readable UTF-8 region the hook reads.
+    rc(unsafe { rcl_dotnet_fs_set_readonly(bytes.as_ptr(), bytes.len(), readonly) })
 }
 
 pub fn set_times(_p: &Path, _times: FileTimes) -> io::Result<()> {
@@ -1027,7 +1036,19 @@ pub fn lstat(p: &Path) -> io::Result<FileAttr> {
     stat(p)
 }
 
-pub fn canonicalize(_p: &Path) -> io::Result<PathBuf> {
-    // Could map to Path.GetFullPath; not exercised (STUBBED).
-    unsupported()
+pub fn canonicalize(p: &Path) -> io::Result<PathBuf> {
+    // Path.GetFullPath (absolute + `.`/`..`-normalized) of an existing path. The hook returns NULL
+    // when the path does not exist (canonicalize requires existence), else an owned NUL-terminated
+    // UTF-8 C string (freed below). Same decode/free pattern as `readlink`.
+    let bytes = path_bytes(p);
+    // SAFETY: `(ptr, len)` is a readable UTF-8 region; the hook returns an owned C string or null.
+    let ptr = unsafe { rcl_dotnet_fs_canonicalize(bytes.as_ptr(), bytes.len()) };
+    if ptr.is_null() {
+        return Err(io::const_error!(io::ErrorKind::NotFound, "no such file or directory"));
+    }
+    // SAFETY: `ptr` is a valid NUL-terminated C string until freed below.
+    let out = unsafe { CStr::from_ptr(ptr.cast()) }.to_bytes().to_vec();
+    // SAFETY: bytes copied out; releasing the hook buffer is sound.
+    unsafe { rcl_dotnet_cotaskmem_free(ptr) };
+    Ok(PathBuf::from(OsString::from_inner(Buf { inner: out })))
 }

@@ -452,6 +452,15 @@ impl ClassRef {
         let asm_name = Some(asm.alloc_string("System.Runtime"));
         asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
     }
+    /// Returns a reference to the int-backed `[Flags]` enum `System.IO.FileAttributes`
+    /// (a value type) — for `File.{Get,Set}Attributes`, backing the dotnet `fs` PAL
+    /// `set_perm` (the read-only bit; `ReadOnly = 1`, `Normal = 128`).
+    #[must_use]
+    pub fn file_attributes(asm: &mut Assembly) -> Interned<ClassRef> {
+        let name = asm.alloc_string("System.IO.FileAttributes");
+        let asm_name = Some(asm.alloc_string("System.Runtime"));
+        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
+    }
     /// Returns a reference to the class `System.Net.Sockets.Socket`, the open
     /// socket handle backing the dotnet `net` PAL arm (Bind/Listen/Accept/
     /// Connect/Send/Receive/SendTo/ReceiveFrom/Shutdown/Dispose +
