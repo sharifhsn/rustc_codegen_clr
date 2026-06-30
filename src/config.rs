@@ -1,29 +1,10 @@
 #[macro_export]
 macro_rules! config {
-    ($name:ident,bool,$default:expr) => {
-        pub static $name: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::vars()
-                .find_map(|(key, value)| {
-                    if key == stringify!($name) {
-                        Some(value)
-                    } else {
-                        None
-                    }
-                })
-                .map(|value| match value.as_ref() {
-                    "0" | "false" | "False" | "FALSE" => false,
-                    "1" | "true" | "True" | "TRUE" => true,
-                    _ => panic!(
-                        "Boolean enviroment variable {} has invalid value {}",
-                        stringify!($name),
-                        value
-                    ),
-                })
-                .unwrap_or($default)
-        });
-    };
-    ($name:ident,bool,$default:expr,$comment:literal) => {
-        #[doc = $comment]
+    // Single arm with an optional trailing doc-comment literal. The `$(#[doc = $comment])?`
+    // repetition expands to the `#[doc = ...]` attribute when a comment is supplied and to
+    // nothing otherwise, so the documented and undocumented forms share one LazyLock body.
+    ($name:ident,bool,$default:expr $(,$comment:literal)?) => {
+        $(#[doc = $comment])?
         pub static $name: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
             std::env::vars()
                 .find_map(|(key, value)| {
@@ -47,11 +28,8 @@ macro_rules! config {
     };
 }
 macro_rules! config_flag {
-    ($var:ident,$default:expr) => {
-        config! {$var,bool,$default}
-    };
-    ($var:ident,$default:expr,$comment:literal) => {
-        config! {$var,bool,$default,$comment}
+    ($var:ident,$default:expr $(,$comment:literal)?) => {
+        config! {$var,bool,$default $(,$comment)?}
     };
 }
 config_flag! {ABORT_ON_ERROR,false,"Should the codegen stop working when ecountering an error, or try to press on, replacing unusuported code with exceptions throws?"}

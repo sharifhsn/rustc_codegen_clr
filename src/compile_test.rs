@@ -326,59 +326,43 @@ macro_rules! compare_tests {
 }
 
 macro_rules! test_lib {
+    // Inner arm: emits one test fn `$fname`. `$($opt:literal,)*` is the leading
+    // optimization flag (`"-O",` for release, empty for debug); the rest of the rustc
+    // argument array is shared, so both variants expand to identical bodies modulo `-O`.
+    (@body $test_name:ident, $fname:ident, [$($opt:literal,)*]) => {
+        #[test]
+        fn $fname() {
+            // Ensures no two compilations run at the same time.
+            let lock = COMPILE_LOCK.lock();
+            super::super::test_lib(
+                &[
+                    $($opt,)*
+                    "--crate-type=lib",
+                    "-Z",
+                    &super::super::backend_path(),
+                    "-C",
+                    &format!(
+                        "linker={}",
+                        super::super::RUSTC_CODEGEN_CLR_LINKER.display()
+                    ),
+                    concat!("../", stringify!($test_name), ".rs"),
+                    "-o",
+                    concat!("./", stringify!($test_name), ".rlib"),
+                    //"--target",
+                    // "clr64-unknown-clr"
+                ],
+                stringify!($test_name),
+            );
+            drop(lock);
+        }
+    };
     ($test_name:ident,$is_stable:ident) => {
         mod $test_name {
             mod $is_stable {
                 #[cfg(test)]
                 static COMPILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-                #[test]
-                fn release() {
-                    // Ensures no two compilations run at the same time.
-                    let lock = COMPILE_LOCK.lock();
-                    super::super::test_lib(
-                        &[
-                            "-O",
-                            "--crate-type=lib",
-                            "-Z",
-                            &super::super::backend_path(),
-                            "-C",
-                            &format!(
-                                "linker={}",
-                                super::super::RUSTC_CODEGEN_CLR_LINKER.display()
-                            ),
-                            concat!("../", stringify!($test_name), ".rs"),
-                            "-o",
-                            concat!("./", stringify!($test_name), ".rlib"),
-                            //"--target",
-                            // "clr64-unknown-clr"
-                        ],
-                        stringify!($test_name),
-                    );
-                    drop(lock);
-                }
-                #[test]
-                fn debug() {
-                    let lock = COMPILE_LOCK.lock();
-                    super::super::test_lib(
-                        &[
-                            "--crate-type=lib",
-                            "-Z",
-                            &super::super::backend_path(),
-                            "-C",
-                            &format!(
-                                "linker={}",
-                                super::super::RUSTC_CODEGEN_CLR_LINKER.display()
-                            ),
-                            concat!("../", stringify!($test_name), ".rs"),
-                            "-o",
-                            concat!("./", stringify!($test_name), ".rlib"),
-                            //"--target",
-                            // "clr64-unknown-clr"
-                        ],
-                        stringify!($test_name),
-                    );
-                    drop(lock);
-                }
+                test_lib! {@body $test_name, release, ["-O",]}
+                test_lib! {@body $test_name, debug, []}
             }
         }
     };
