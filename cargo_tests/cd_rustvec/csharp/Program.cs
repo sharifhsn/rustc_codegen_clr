@@ -11,6 +11,7 @@
 // (which §9.5 forbids).
 
 using System;
+using System.Runtime.InteropServices;
 
 /// A growable list of unmanaged `T`, backed by a single size-erased Rust vector.
 public unsafe struct RustVec<T> : IDisposable where T : unmanaged
@@ -51,10 +52,78 @@ public unsafe struct RustVec<T> : IDisposable where T : unmanaged
     }
 }
 
+/// A growable list of ANY `T` (managed reference types, structs holding references, anything),
+/// backed by the SAME size-erased Rust vector — but each element is a `GCHandle` rooting the managed
+/// object, and the vector stores only the pointer-sized handle. This is the managed-`T` arm of the
+/// two-mode bridge (docs/TRANSLATION_STATUS §7): works for any `T` at the cost of a box + GC root per
+/// element (vs `RustVec<T : unmanaged>`'s near-zero-cost byte copy). Rust never sees the object — only
+/// the opaque handle — so the same Rust monomorphization serves both modes. Reference identity is
+/// preserved: `Get` returns the very object that was `Push`ed.
+public unsafe struct RustBoxVec<T> : IDisposable
+{
+    private nuint _handle;
+
+    public static RustBoxVec<T> New() =>
+        new RustBoxVec<T> { _handle = MainModule.rcl_vec_new((nuint)IntPtr.Size) };
+
+    public int Count => (int)MainModule.rcl_vec_len(_handle);
+
+    public void Push(T value)
+    {
+        // A normal (strong) GCHandle roots the object so the GC keeps it alive while it sits in the
+        // Rust-side vector (which holds only the handle's integer value, never a managed reference).
+        GCHandle gh = GCHandle.Alloc(value);
+        IntPtr p = GCHandle.ToIntPtr(gh);
+        MainModule.rcl_vec_push(_handle, (byte*)&p);
+    }
+
+    public T Get(int idx)
+    {
+        IntPtr p = default;
+        if (!MainModule.rcl_vec_get(_handle, (nuint)idx, (byte*)&p))
+            throw new IndexOutOfRangeException();
+        return (T)GCHandle.FromIntPtr(p).Target;
+    }
+
+    public void Set(int idx, T value)
+    {
+        IntPtr old = default;
+        if (!MainModule.rcl_vec_get(_handle, (nuint)idx, (byte*)&old))
+            throw new IndexOutOfRangeException();
+        GCHandle.FromIntPtr(old).Free(); // release the replaced element's root
+        GCHandle gh = GCHandle.Alloc(value);
+        IntPtr p = GCHandle.ToIntPtr(gh);
+        MainModule.rcl_vec_set(_handle, (nuint)idx, (byte*)&p);
+    }
+
+    public void Dispose()
+    {
+        if (_handle != 0)
+        {
+            int n = Count;
+            for (int i = 0; i < n; i++)
+            {
+                IntPtr p = default;
+                MainModule.rcl_vec_get(_handle, (nuint)i, (byte*)&p);
+                GCHandle.FromIntPtr(p).Free(); // free every rooted element
+            }
+            MainModule.rcl_vec_free(_handle);
+            _handle = 0;
+        }
+    }
+}
+
 public struct Point
 {
     public int X;
     public int Y;
+}
+
+// A managed reference type, to exercise the GCHandle-boxed path (reference identity + a field).
+public sealed class Thing
+{
+    public string Name;
+    public int Id;
 }
 
 // A struct with INTERNAL PADDING (byte at 0, then 7 bytes padding, long at 8 → 16 bytes). The
@@ -160,6 +229,46 @@ public static class Program
             for (int i = 0; i < 10; i++)
                 sweepOk &= vs.Get(i) == i * i;
             Check("Set sweep", sweepOk, true, ref pass, ref total);
+        }
+
+        // ====================== managed-T mode (RustBoxVec<T>, GCHandle-boxed) ======================
+
+        // ---- RustBoxVec<string>: managed reference type — value + reference identity ----
+        using (var vstr = RustBoxVec<string>.New())
+        {
+            string s0 = new string('a', 3); // a distinct (non-interned) instance
+            vstr.Push(s0);
+            vstr.Push("beta");
+            Check("string Count", vstr.Count, 2, ref pass, ref total);
+            Check("string[0] value", vstr.Get(0), "aaa", ref pass, ref total);
+            Check("string[0] identity", ReferenceEquals(vstr.Get(0), s0), true, ref pass, ref total);
+            Check("string[1] value", vstr.Get(1), "beta", ref pass, ref total);
+        }
+
+        // ---- RustBoxVec<Thing>: a managed class — field round-trip + reference identity + Set ----
+        using (var vt = RustBoxVec<Thing>.New())
+        {
+            var t0 = new Thing { Name = "zero", Id = 0 };
+            vt.Push(t0);
+            vt.Push(new Thing { Name = "one", Id = 1 });
+            Check("Thing Count", vt.Count, 2, ref pass, ref total);
+            Check("Thing[1].Name", vt.Get(1).Name, "one", ref pass, ref total);
+            Check("Thing[1].Id", vt.Get(1).Id, 1, ref pass, ref total);
+            Check("Thing[0] identity", ReferenceEquals(vt.Get(0), t0), true, ref pass, ref total);
+            var t2 = new Thing { Name = "two", Id = 2 };
+            vt.Set(0, t2); // overwrite (frees t0's GCHandle)
+            Check("Thing[0].Id after Set", vt.Get(0).Id, 2, ref pass, ref total);
+            Check("Thing[0] identity after Set", ReferenceEquals(vt.Get(0), t2), true, ref pass, ref total);
+        }
+
+        // ---- RustBoxVec<int[]>: a managed ARRAY element — identity + contents ----
+        using (var va = RustBoxVec<int[]>.New())
+        {
+            int[] arr = { 5, 6, 7 };
+            va.Push(arr);
+            Check("array Count", va.Count, 1, ref pass, ref total);
+            Check("array identity", ReferenceEquals(va.Get(0), arr), true, ref pass, ref total);
+            Check("array[0][2]", va.Get(0)[2], 7, ref pass, ref total);
         }
 
         Console.WriteLine($"cd_rustvec: {pass}/{total} checks passed");
