@@ -126,17 +126,41 @@ pub struct RustcCLRInteropManagedArray<T, const DIMENSIONS: usize> {
     object_ref: usize,
     pd: core::marker::PhantomData<T>,
 }
+/// Arity-ladder generator for the interop "magic" function declarations.
+///
+/// Every member of the `rustc_clr_interop_managed_call*` / `_call_virt*` / `_ctor*` and WF-9
+/// `rustc_clr_interop_generic_call*` / `_generic_ctor*` families is the same shape: a `pub fn` whose
+/// body is `core::intrinsics::abort();` and which differs *only* by how many `ArgN` type params /
+/// `argN` value params it declares. They are never actually run — the codegen backend recognizes them
+/// by *name* (see `is_function_magic` / the call-site dispatch in `src/terminator/call.rs`) and lowers
+/// the call directly to a managed `call`/`callvirt`/`newobj`/etc.
+///
+/// **The function name is load-bearing and must be byte-identical.** The backend matches on name
+/// substrings (`rustc_clr_interop_managed_call`, …) and parses the arity digit + the trailing `_`
+/// (`argc_from_fn_name`). So each invocation spells the *literal* `ident` name — including the arity
+/// digit and any trailing underscore — rather than building it from `concat!`/`paste!`; the macro only
+/// factors out the repeated `#[allow]/#[inline(never)]` attributes, the common generic-param prefix,
+/// and the `arg`-ladder body.
+macro_rules! interop_magic_fn {
+    (
+        $name:ident
+        [ $($prefix:tt)* ]
+        ( $($arg:ident : $argty:ident),* $(,)? )
+        -> $ret:ty
+    ) => {
+        #[allow(unused_variables)]
+        #[inline(never)]
+        pub fn $name< $($prefix)* $(, $argty)* >( $($arg : $argty),* ) -> $ret {
+            core::intrinsics::abort();
+        }
+    };
+}
+
 //Calls
-#[allow(unused_variables)]
-#[inline(never)]
-pub fn rustc_clr_interop_managed_call0_<
-    const ASSEMBLY: &'static str,
-    const CLASS_PATH: &'static str,
-    const IS_VALUETYPE: bool,
-    const METHOD: &'static str,
-    Ret,
->() -> Ret {
-    core::intrinsics::abort();
+interop_magic_fn! {
+    rustc_clr_interop_managed_call0_
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, Ret]
+    () -> Ret
 }
 #[allow(unused_variables)]
 #[inline(never)]
@@ -171,110 +195,42 @@ pub fn rustc_clr_interop_managed_ld_elem_ref<
 ) -> RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH> {
     core::intrinsics::abort();
 }
-#[allow(unused_variables)]
-#[inline(never)]
-pub fn rustc_clr_interop_managed_call1_<
-    const ASSEMBLY: &'static str,
-    const CLASS_PATH: &'static str,
-    const IS_VALUETYPE: bool,
-    const METHOD: &'static str,
-    const IS_STATIC: bool,
-    Ret,
-    Arg1,
->(
-    arg1: Arg1,
-) -> Ret {
-    core::intrinsics::abort();
+interop_magic_fn! {
+    rustc_clr_interop_managed_call1_
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const IS_STATIC: bool, Ret]
+    (arg1: Arg1) -> Ret
 }
-#[allow(unused_variables)]
-#[inline(never)]
-pub fn rustc_clr_interop_managed_call2_<
-    const ASSEMBLY: &'static str,
-    const CLASS_PATH: &'static str,
-    const IS_VALUETYPE: bool,
-    const METHOD: &'static str,
-    const IS_STATIC: bool,
-    Ret,
-    Arg1,
-    Arg2,
->(
-    arg1: Arg1,
-    arg2: Arg2,
-) -> Ret {
-    core::intrinsics::abort();
+interop_magic_fn! {
+    rustc_clr_interop_managed_call2_
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const IS_STATIC: bool, Ret]
+    (arg1: Arg1, arg2: Arg2) -> Ret
 }
-#[allow(unused_variables)]
-#[inline(never)]
-pub fn rustc_clr_interop_managed_call3_<
-    const ASSEMBLY: &'static str,
-    const CLASS_PATH: &'static str,
-    const IS_VALUETYPE: bool,
-    const METHOD: &'static str,
-    const IS_STATIC: bool,
-    Ret,
-    Arg1,
-    Arg2,
-    Arg3,
->(
-    arg1: Arg1,
-    arg2: Arg2,
-    arg3: Arg3,
-) -> Ret {
-    core::intrinsics::abort();
+interop_magic_fn! {
+    rustc_clr_interop_managed_call3_
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const IS_STATIC: bool, Ret]
+    (arg1: Arg1, arg2: Arg2, arg3: Arg3) -> Ret
 }
 //VCalls
-#[allow(unused_variables)]
-#[inline(never)]
-pub fn rustc_clr_interop_managed_call_virt0_<
-    const ASSEMBLY: &'static str,
-    const CLASS_PATH: &'static str,
-    const IS_VALUETYPE: bool,
-    const METHOD: &'static str,
-    Ret,
->() -> Ret {
-    core::intrinsics::abort();
+interop_magic_fn! {
+    rustc_clr_interop_managed_call_virt0_
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, Ret]
+    () -> Ret
 }
-#[allow(unused_variables)]
-#[inline(never)]
-pub fn rustc_clr_interop_managed_call_virt1_<
-    const ASSEMBLY: &'static str,
-    const CLASS_PATH: &'static str,
-    const IS_VALUETYPE: bool,
-    const METHOD: &'static str,
-    const IS_STATIC: bool,
-    Ret,
-    Arg1,
->(
-    arg1: Arg1,
-) -> Ret {
-    core::intrinsics::abort();
+interop_magic_fn! {
+    rustc_clr_interop_managed_call_virt1_
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const IS_STATIC: bool, Ret]
+    (arg1: Arg1) -> Ret
 }
-#[allow(unused_variables)]
-#[inline(never)]
-pub fn rustc_clr_interop_managed_call_virt2_<
-    const ASSEMBLY: &'static str,
-    const CLASS_PATH: &'static str,
-    const IS_VALUETYPE: bool,
-    const METHOD: &'static str,
-    const IS_STATIC: bool,
-    Ret,
-    Arg1,
-    Arg2,
->(
-    arg1: Arg1,
-    arg2: Arg2,
-) -> Ret {
-    core::intrinsics::abort();
+interop_magic_fn! {
+    rustc_clr_interop_managed_call_virt2_
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const IS_STATIC: bool, Ret]
+    (arg1: Arg1, arg2: Arg2) -> Ret
 }
 //Ctors
-#[allow(unused_variables)]
-#[inline(never)]
-pub fn rustc_clr_interop_managed_ctor0_<
-    const ASSEMBLY: &'static str,
-    const CLASS_PATH: &'static str,
-    const IS_VALUETYPE: bool,
->() -> RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH> {
-    core::intrinsics::abort();
+interop_magic_fn! {
+    rustc_clr_interop_managed_ctor0_
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool]
+    () -> RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH>
 }
 #[allow(unused_variables)]
 #[inline(never)]
@@ -299,47 +255,20 @@ pub fn rustc_clr_interop_managed_checked_cast<DST, SRC>(src: SRC) -> DST {
 pub fn rustc_clr_interop_managed_is_inst<DST, SRC>(src: SRC) -> bool {
     core::intrinsics::abort();
 }
-#[allow(unused_variables)]
-#[inline(never)]
-pub fn rustc_clr_interop_managed_ctor1_<
-    const ASSEMBLY: &'static str,
-    const CLASS_PATH: &'static str,
-    const IS_VALUETYPE: bool,
-    Arg1,
->(
-    arg1: Arg1,
-) -> RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH> {
-    core::intrinsics::abort();
+interop_magic_fn! {
+    rustc_clr_interop_managed_ctor1_
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool]
+    (arg1: Arg1) -> RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH>
 }
-#[allow(unused_variables)]
-#[inline(never)]
-pub fn rustc_clr_interop_managed_ctor2_<
-    const ASSEMBLY: &'static str,
-    const CLASS_PATH: &'static str,
-    const IS_VALUETYPE: bool,
-    Arg1,
-    Arg2,
->(
-    arg1: Arg1,
-    arg2: Arg2,
-) -> RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH> {
-    core::intrinsics::abort();
+interop_magic_fn! {
+    rustc_clr_interop_managed_ctor2_
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool]
+    (arg1: Arg1, arg2: Arg2) -> RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH>
 }
-#[allow(unused_variables)]
-#[inline(never)]
-pub fn rustc_clr_interop_managed_ctor3_<
-    const ASSEMBLY: &'static str,
-    const CLASS_PATH: &'static str,
-    const IS_VALUETYPE: bool,
-    Arg1,
-    Arg2,
-    Arg3,
->(
-    arg1: Arg1,
-    arg2: Arg2,
-    arg3: Arg3,
-) -> RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH> {
-    core::intrinsics::abort();
+interop_magic_fn! {
+    rustc_clr_interop_managed_ctor3_
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool]
+    (arg1: Arg1, arg2: Arg2, arg3: Arg3) -> RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH>
 }
 impl From<u16> for RustcCLRInteropManagedChar {
     fn from(utf16_char: u16) -> RustcCLRInteropManagedChar {
@@ -399,120 +328,44 @@ unsafe impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, ClassG
 
 // `KIND` for `rustc_clr_interop_generic_call*`: 0 = static, 1 = instance (`call instance`),
 // 2 = virtual (`callvirt`).
-#[allow(unused_variables)]
-#[inline(never)]
-pub fn rustc_clr_interop_generic_call0<
-    const ASSEMBLY: &'static str,
-    const CLASS_PATH: &'static str,
-    const IS_VALUETYPE: bool,
-    const METHOD: &'static str,
-    const KIND: u8,
-    ClassGenerics,
-    Sig,
-    Ret,
->() -> Ret {
-    core::intrinsics::abort();
+//
+// NOTE: the generic family names carry NO trailing `_` (unlike the `managed_*` family). The backend
+// dispatches on the `rustc_clr_interop_generic_call` / `_generic_ctor` substring and reads the arity
+// from the call's argument count rather than from the name, but the spelled name must still be exact.
+interop_magic_fn! {
+    rustc_clr_interop_generic_call0
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const KIND: u8, ClassGenerics, Sig, Ret]
+    () -> Ret
 }
-#[allow(unused_variables)]
-#[inline(never)]
-pub fn rustc_clr_interop_generic_call1<
-    const ASSEMBLY: &'static str,
-    const CLASS_PATH: &'static str,
-    const IS_VALUETYPE: bool,
-    const METHOD: &'static str,
-    const KIND: u8,
-    ClassGenerics,
-    Sig,
-    Ret,
-    Arg1,
->(
-    arg1: Arg1,
-) -> Ret {
-    core::intrinsics::abort();
+interop_magic_fn! {
+    rustc_clr_interop_generic_call1
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const KIND: u8, ClassGenerics, Sig, Ret]
+    (arg1: Arg1) -> Ret
 }
-#[allow(unused_variables)]
-#[inline(never)]
-pub fn rustc_clr_interop_generic_call2<
-    const ASSEMBLY: &'static str,
-    const CLASS_PATH: &'static str,
-    const IS_VALUETYPE: bool,
-    const METHOD: &'static str,
-    const KIND: u8,
-    ClassGenerics,
-    Sig,
-    Ret,
-    Arg1,
-    Arg2,
->(
-    arg1: Arg1,
-    arg2: Arg2,
-) -> Ret {
-    core::intrinsics::abort();
+interop_magic_fn! {
+    rustc_clr_interop_generic_call2
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const KIND: u8, ClassGenerics, Sig, Ret]
+    (arg1: Arg1, arg2: Arg2) -> Ret
 }
-#[allow(unused_variables)]
-#[inline(never)]
-pub fn rustc_clr_interop_generic_call3<
-    const ASSEMBLY: &'static str,
-    const CLASS_PATH: &'static str,
-    const IS_VALUETYPE: bool,
-    const METHOD: &'static str,
-    const KIND: u8,
-    ClassGenerics,
-    Sig,
-    Ret,
-    Arg1,
-    Arg2,
-    Arg3,
->(
-    arg1: Arg1,
-    arg2: Arg2,
-    arg3: Arg3,
-) -> Ret {
-    core::intrinsics::abort();
+interop_magic_fn! {
+    rustc_clr_interop_generic_call3
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const KIND: u8, ClassGenerics, Sig, Ret]
+    (arg1: Arg1, arg2: Arg2, arg3: Arg3) -> Ret
 }
-#[allow(unused_variables)]
-#[inline(never)]
-pub fn rustc_clr_interop_generic_ctor0<
-    const ASSEMBLY: &'static str,
-    const CLASS_PATH: &'static str,
-    const IS_VALUETYPE: bool,
-    ClassGenerics,
-    Sig,
-    Ret,
->() -> Ret {
-    core::intrinsics::abort();
+interop_magic_fn! {
+    rustc_clr_interop_generic_ctor0
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, ClassGenerics, Sig, Ret]
+    () -> Ret
 }
-#[allow(unused_variables)]
-#[inline(never)]
-pub fn rustc_clr_interop_generic_ctor1<
-    const ASSEMBLY: &'static str,
-    const CLASS_PATH: &'static str,
-    const IS_VALUETYPE: bool,
-    ClassGenerics,
-    Sig,
-    Ret,
-    Arg1,
->(
-    arg1: Arg1,
-) -> Ret {
-    core::intrinsics::abort();
+interop_magic_fn! {
+    rustc_clr_interop_generic_ctor1
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, ClassGenerics, Sig, Ret]
+    (arg1: Arg1) -> Ret
 }
-#[allow(unused_variables)]
-#[inline(never)]
-pub fn rustc_clr_interop_generic_ctor2<
-    const ASSEMBLY: &'static str,
-    const CLASS_PATH: &'static str,
-    const IS_VALUETYPE: bool,
-    ClassGenerics,
-    Sig,
-    Ret,
-    Arg1,
-    Arg2,
->(
-    arg1: Arg1,
-    arg2: Arg2,
-) -> Ret {
-    core::intrinsics::abort();
+interop_magic_fn! {
+    rustc_clr_interop_generic_ctor2
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, ClassGenerics, Sig, Ret]
+    (arg1: Arg1, arg2: Arg2) -> Ret
 }
 
 impl RustcCLRInteropManagedChar {
