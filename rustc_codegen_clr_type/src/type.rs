@@ -1,7 +1,8 @@
 use crate::adt::FieldOffsetIterator;
 use crate::utilis::{
-    INTEROP_ARR_TPE_NAME, INTEROP_CHR_TPE_NAME, INTEROP_CLASS_TPE_NAME, INTEROP_STRUCT_TPE_NAME,
-    is_zst, try_resolve_const_size,
+    INTEROP_ARR_TPE_NAME, INTEROP_CHR_TPE_NAME, INTEROP_CLASS_TPE_NAME, INTEROP_GENERIC_TPE_NAME,
+    INTEROP_METHOD_GENERIC_TPE_NAME, INTEROP_STRUCT_TPE_NAME, INTEROP_TYPE_GENERIC_TPE_NAME, is_zst,
+    try_resolve_const_size,
 };
 use crate::utilis::{garag_to_usize, garg_to_string, pointer_to_is_fat, tuple_name};
 use crate::{
@@ -12,6 +13,7 @@ use cilly::bimap::Interned;
 use cilly::class::ClassDefIdx;
 use cilly::{
     Assembly, IntoAsmIndex, add, ld_arg, ptr_cast,
+    tpe::GenericKind,
     tpe::simd::SIMDVector,
     {
         Access, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, FieldDesc, Float, Int, MethodDef,
@@ -100,11 +102,43 @@ fn get_adt<'tcx>(
         cref
     }
 }
+/// Lowers a generic argument that must be a *tuple type* into the lowered .NET types of its elements.
+/// Used by the WF-9 generic interop bridge to pass a generic .NET type's argument list (e.g. the
+/// `(i32,)` of `List<i32>`, or the `(K, V)` of `Dictionary<K, V>`) as a single type parameter.
+pub fn tuple_garg_types<'tcx>(
+    garg: rustc_middle::ty::GenericArg<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Vec<Type> {
+    let ty = ctx.monomorphize(
+        garg.as_type()
+            .expect("a generic-argument tuple must be passed as a type"),
+    );
+    match ty.kind() {
+        TyKind::Tuple(elems) => elems
+            .iter()
+            .map(|elem| get_type(ctx.monomorphize(elem), ctx))
+            .collect(),
+        _ => panic!("expected a tuple of generic arguments, got {ty:?}"),
+    }
+}
 /// Converts a Rust MIR type to an optimized .NET type representation.
 pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Type {
     let ty = ctx.monomorphize(ty);
+    // The WF-9 generic-parameter markers (`RustcCLRInteropTypeGeneric`/`…MethodGeneric`) are
+    // zero-sized but must lower to `!N`/`!!N` — they only ever appear at the type level (inside a
+    // method's definition-shape signature), never as a runtime value, so the usual ZST→Void
+    // collapse would erase them. Exempt them before the ZST early-return.
+    let is_generic_marker = if let TyKind::Adt(def, _) = ty.kind() {
+        let item_name = ctx.tcx().item_name(def.did());
+        matches!(
+            item_name.as_str(),
+            INTEROP_TYPE_GENERIC_TPE_NAME | INTEROP_METHOD_GENERIC_TPE_NAME
+        )
+    } else {
+        false
+    };
     // If this is a ZST, return a void type.
-    if is_zst(ty, ctx.tcx()) {
+    if is_zst(ty, ctx.tcx()) && !is_generic_marker {
         return Type::Void;
     }
 
@@ -285,6 +319,9 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                     | INTEROP_STRUCT_TPE_NAME
                     | INTEROP_ARR_TPE_NAME
                     | INTEROP_CHR_TPE_NAME
+                    | INTEROP_GENERIC_TPE_NAME
+                    | INTEROP_TYPE_GENERIC_TPE_NAME
+                    | INTEROP_METHOD_GENERIC_TPE_NAME
             );
             if is_interop_adt {
                 if item_name == INTEROP_CLASS_TPE_NAME {
@@ -337,6 +374,43 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                     }
                 } else if item_name == INTEROP_CHR_TPE_NAME {
                     Type::PlatformChar
+                } else if item_name == INTEROP_GENERIC_TPE_NAME {
+                    // `RustcCLRInteropManagedGeneric<ASSEMBLY, CLASS_PATH, ClassGenerics>` — a handle
+                    // to a managed object of a generic instantiation (e.g. `List<i32>`). The third
+                    // generic is a *tuple* of the concrete .NET type arguments; lower it to a
+                    // `ClassRef` carrying those generics (the exporter renders the `` `arity<args> ``).
+                    assert!(
+                        subst.len() == 3,
+                        "RustcCLRInteropManagedGeneric must have exactly 3 generic arguments (assembly, class, class-generics-tuple)!"
+                    );
+                    let assembly = garg_to_string(subst[0], ctx.tcx());
+                    let assembly = Some(assembly)
+                        .filter(|assembly| !assembly.is_empty())
+                        .map(|asm| ctx.alloc_string(asm));
+                    let name = garg_to_string(subst[1], ctx.tcx());
+                    let name = ctx.alloc_string(name);
+                    let class_generics: Vec<Type> = tuple_garg_types(subst[2], ctx);
+                    Type::ClassRef(ctx.alloc_class_ref(ClassRef::new(
+                        name,
+                        assembly,
+                        false,
+                        class_generics.into(),
+                    )))
+                } else if item_name == INTEROP_TYPE_GENERIC_TPE_NAME {
+                    // Lowers to the .NET *class* generic parameter `!N` (a method-definition-shape
+                    // marker used when calling a method on a generic instantiation).
+                    let n = garag_to_usize(subst[0], ctx.tcx());
+                    Type::PlatformGeneric(
+                        u32::try_from(n).expect("class generic index over 2^32"),
+                        GenericKind::TypeGeneric,
+                    )
+                } else if item_name == INTEROP_METHOD_GENERIC_TPE_NAME {
+                    // Lowers to the .NET *method* generic parameter `!!N`.
+                    let n = garag_to_usize(subst[0], ctx.tcx());
+                    Type::PlatformGeneric(
+                        u32::try_from(n).expect("method generic index over 2^32"),
+                        GenericKind::CallGeneric,
+                    )
                 } else {
                     todo!("Interop type {name:?} is not yet supported!")
                 }

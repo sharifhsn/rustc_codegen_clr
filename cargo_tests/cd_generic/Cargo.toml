@@ -1,0 +1,8 @@
+[package]
+name = "cd_generic"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mycorrhiza = { path = "../../mycorrhiza" }
+[workspace]

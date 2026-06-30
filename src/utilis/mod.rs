@@ -17,11 +17,21 @@ pub const MANAGED_LD_ELEM_REF: &str = "rustc_clr_interop_managed_ld_elem_ref";
 pub const MANAGED_NEW_ARR: &str = "rustc_clr_interop_managed_new_arr";
 pub const MANAGED_SET_ELEM: &str = "rustc_clr_interop_managed_set_elem";
 pub const MANAGED_TRY_CATCH: &str = "rustc_clr_interop_try_catch";
+/// Calls a method on a *generic* .NET instantiation (e.g. `List<i32>::Add`). Unlike the
+/// `rustc_clr_interop_managed_*` family, the target class carries concrete generic arguments and the
+/// method signature is described in its *definition* shape (`!N`/`!!N` markers) — see WF-9.
+pub const GENERIC_CALL_FN_NAME: &str = "rustc_clr_interop_generic_call";
+/// Constructs a managed object of a *generic* .NET instantiation (e.g. `new List<i32>()`).
+pub const GENERIC_CTOR_FN_NAME: &str = "rustc_clr_interop_generic_ctor";
 /// Raises a managed `System.Exception` directly (so a .NET caller can `catch` it) — distinct from a
 /// Rust `panic!`, which goes through the unwinder and does not propagate cleanly out to managed callers.
 pub const MANAGED_THROW: &str = "rustc_clr_interop_throw";
 pub fn is_function_magic(name: &str) -> bool {
-    name.contains(CTOR_FN_NAME) || name.contains(MANAGED_CALL_FN_NAME) || name.contains(MANAGED_THROW)
+    name.contains(CTOR_FN_NAME)
+        || name.contains(MANAGED_CALL_FN_NAME)
+        || name.contains(MANAGED_THROW)
+        || name.contains(GENERIC_CALL_FN_NAME)
+        || name.contains(GENERIC_CTOR_FN_NAME)
 }
 
 // WARNING: this is *wrong*: For some reason, `Instance::try_resolve` should not operate on structs(why?), and this just silences the newly introduced warning.

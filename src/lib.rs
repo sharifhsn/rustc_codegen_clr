@@ -320,6 +320,28 @@ impl CodegenBackend for MyBackend {
         outputs: &OutputFilenames,
         _crate_info: &CrateInfo,
     ) -> (CompiledModules, WorkProductMap) {
+        // Debug side-channel: rustc swallows codegen-backend ICE messages (only "the compiler
+        // unexpectedly panicked" survives), and `cargo dotnet` buffers stderr. Mirror every panic's
+        // location+message to /tmp/rcl_ice.txt so a swallowed codegen panic is recoverable. Chains
+        // the previous (rustc ICE) hook so normal diagnostics are unaffected. Gated on RCL_ICE_LOG.
+        if std::env::var_os("RCL_ICE_LOG").is_some() {
+            use std::sync::Once;
+            static ICE_HOOK: Once = Once::new();
+            ICE_HOOK.call_once(|| {
+                let prev = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |info| {
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/rcl_ice.txt")
+                    {
+                        use std::io::Write;
+                        let _ = writeln!(f, "=== ICE: {info}");
+                    }
+                    prev(info);
+                }));
+            });
+        }
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             use std::io::Write;
             let (_asm_name, asm) = *ongoing_codegen

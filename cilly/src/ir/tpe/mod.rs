@@ -123,7 +123,17 @@ impl Type {
             Type::Float(float) => float.name().to_owned(),
             Type::PlatformString => "st".into(),
             Type::PlatformChar => "c".into(),
-            Type::PlatformGeneric(_, _) => todo!(),
+            // A generic parameter `!N` (class) / `!!N` (method). Mangled so methodrefs whose
+            // signatures carry generic-definition-shape types (WF-9 generic interop bridge) get a
+            // stable, collision-free name; the kind tag keeps `!0` and `!!0` distinct.
+            Type::PlatformGeneric(arg, kind) => {
+                let kind = match kind {
+                    GenericKind::TypeGeneric => "t",
+                    GenericKind::MethodGeneric => "m",
+                    GenericKind::CallGeneric => "c",
+                };
+                format!("g{kind}{arg}")
+            }
             Type::PlatformObject => "o".into(),
             Type::Bool => "b".into(),
             Type::Void => "v".into(),
@@ -263,8 +273,17 @@ impl Type {
             (Type::ClassRef(lhs), Type::ClassRef(rhs)) if Self::fat_ptr_layout_eq(lhs, rhs, asm) => {
                 true
             }
-            // TODO: check generics propely?
-            (_, Type::PlatformGeneric(_, _)) => true,
+            // A generic parameter `!N` (class) / `!!N` (method) is mutually assignable with any
+            // concrete type. It appears ONLY in a generic-instantiation methodref signature (WF-9
+            // generic interop bridge, or a builtin like `ThreadLocal<T>`), where the value crossing
+            // the boundary is *bound* to a concrete type at the call: pushing an `int32` arg where
+            // the definition signature says `!0`, and storing a `!0` return into the concrete local
+            // it resolves to (`List<int32>::get_Item -> !0`, with `!0 == int32`). The .NET runtime's
+            // own type verifier resolves the binding at method load, so accepting both directions
+            // *delegates* generic-binding verification to the CLR rather than masking a mismatch —
+            // `PlatformGeneric` is never produced for ordinary (non-generic-call) codegen, so this
+            // cannot over-permit a genuine concrete-vs-concrete error.
+            (_, Type::PlatformGeneric(_, _)) | (Type::PlatformGeneric(_, _), _) => true,
             _ => false,
         }
     }

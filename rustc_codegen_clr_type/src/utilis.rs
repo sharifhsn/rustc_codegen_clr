@@ -23,6 +23,15 @@ pub const INTEROP_CLASS_TPE_NAME: &str = "RustcCLRInteropManagedClass";
 pub const INTEROP_STRUCT_TPE_NAME: &str = "RustcCLRInteropManagedStruct";
 pub const INTEROP_CHR_TPE_NAME: &str = "RustcCLRInteropManagedChar";
 pub const INTEROP_ARR_TPE_NAME: &str = "RustcCLRInteropManagedArray";
+/// A handle to a managed object of a *generic* .NET instantiation, e.g. `List<i32>`. Carries
+/// `<ASSEMBLY, CLASS_PATH, ClassGenerics>` where `ClassGenerics` is a tuple of the concrete .NET type
+/// arguments — lowers to a `ClassRef` with those generics. (WF-9 generic interop bridge.)
+pub const INTEROP_GENERIC_TPE_NAME: &str = "RustcCLRInteropManagedGeneric";
+/// Signature-shape marker lowering to the .NET *class* generic parameter `!N` — used to describe the
+/// definition signature of a method called on a generic instantiation.
+pub const INTEROP_TYPE_GENERIC_TPE_NAME: &str = "RustcCLRInteropTypeGeneric";
+/// Signature-shape marker lowering to the .NET *method* generic parameter `!!N`.
+pub const INTEROP_METHOD_GENERIC_TPE_NAME: &str = "RustcCLRInteropMethodGeneric";
 #[must_use]
 /// Checks if a type is a magic interop type.
 pub fn is_name_magic(name: &str) -> bool {

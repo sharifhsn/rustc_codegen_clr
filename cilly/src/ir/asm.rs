@@ -1573,7 +1573,11 @@ impl Assembly {
             Type::Float(float) => float.size().into(),
             Type::PlatformString => self.ptr_size(),
             Type::PlatformChar => 1,
-            Type::PlatformGeneric(_, _) => todo!(),
+            // A generic parameter `!N` / `!!N` (WF-9): only ever appears in a methodref's
+            // definition-shape signature, where it is bound to a concrete type at the call site —
+            // it is never materialized as a sized local. Any incidental sizing pass gets a
+            // conservative pointer-sized answer (a generic slot is reference-or-pointer-sized).
+            Type::PlatformGeneric(_, _) => self.ptr_size(),
             Type::PlatformObject => self.ptr_size(),
             Type::Bool => 1,
             Type::Void => 0,

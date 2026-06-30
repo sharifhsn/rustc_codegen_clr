@@ -351,6 +351,170 @@ impl From<u16> for RustcCLRInteropManagedChar {
     }
 }
 
+// ===========================================================================================
+// WF-9 — generic interop bridge (Rust → generic .NET): calling methods on generic .NET
+// instantiations such as `List<i32>` / `Dictionary<K, V>`.
+//
+// A method reference on a generic instantiation must use the *definition* signature shape
+// (`!0` for the class's first generic, `!!0` for the method's first generic), NOT the
+// instantiated one — `List<int32>::Add(!0)`, never `Add(int32)`. So each call carries two extra
+// pieces of type information beyond the existing managed-call family:
+//   * `ClassGenerics`: a tuple of the *concrete* .NET type arguments for the class instantiation
+//     (e.g. `(i32,)` for `List<i32>`), threaded onto the `ClassRef`.
+//   * `Sig`: a tuple `(Output, In0, In1, …)` describing the method in *definition* shape, using
+//     the `DotnetTypeGeneric<N>` / `DotnetMethodGeneric<N>` markers for `!N` / `!!N` and concrete
+//     types elsewhere. (Receiver excluded — it is implied by `instance`/`callvirt`.)
+// The runtime argument values are passed normally (concrete); the JIT binds `!N` to the class
+// instantiation.
+// ===========================================================================================
+
+/// A handle to a managed object of a *generic* .NET instantiation, e.g. `List<i32>`.
+/// `ASSEMBLY`/`CLASS_PATH` name the open generic type and `ClassGenerics` is a tuple of the
+/// concrete .NET type arguments. Lowers to a `ClassRef` carrying those generics.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct RustcCLRInteropManagedGeneric<
+    const ASSEMBLY: &'static str,
+    const CLASS_PATH: &'static str,
+    ClassGenerics,
+> {
+    object_ref: usize,
+    pd: core::marker::PhantomData<ClassGenerics>,
+}
+
+/// Method-definition-signature marker: lowers to the .NET *class* generic parameter `!N`.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct RustcCLRInteropTypeGeneric<const N: usize>;
+
+/// Method-definition-signature marker: lowers to the .NET *method* generic parameter `!!N`.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct RustcCLRInteropMethodGeneric<const N: usize>;
+
+unsafe impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, ClassGenerics> ManagedSafe
+    for RustcCLRInteropManagedGeneric<ASSEMBLY, CLASS_PATH, ClassGenerics>
+{
+}
+
+// `KIND` for `rustc_clr_interop_generic_call*`: 0 = static, 1 = instance (`call instance`),
+// 2 = virtual (`callvirt`).
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_clr_interop_generic_call0<
+    const ASSEMBLY: &'static str,
+    const CLASS_PATH: &'static str,
+    const IS_VALUETYPE: bool,
+    const METHOD: &'static str,
+    const KIND: u8,
+    ClassGenerics,
+    Sig,
+    Ret,
+>() -> Ret {
+    core::intrinsics::abort();
+}
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_clr_interop_generic_call1<
+    const ASSEMBLY: &'static str,
+    const CLASS_PATH: &'static str,
+    const IS_VALUETYPE: bool,
+    const METHOD: &'static str,
+    const KIND: u8,
+    ClassGenerics,
+    Sig,
+    Ret,
+    Arg1,
+>(
+    arg1: Arg1,
+) -> Ret {
+    core::intrinsics::abort();
+}
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_clr_interop_generic_call2<
+    const ASSEMBLY: &'static str,
+    const CLASS_PATH: &'static str,
+    const IS_VALUETYPE: bool,
+    const METHOD: &'static str,
+    const KIND: u8,
+    ClassGenerics,
+    Sig,
+    Ret,
+    Arg1,
+    Arg2,
+>(
+    arg1: Arg1,
+    arg2: Arg2,
+) -> Ret {
+    core::intrinsics::abort();
+}
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_clr_interop_generic_call3<
+    const ASSEMBLY: &'static str,
+    const CLASS_PATH: &'static str,
+    const IS_VALUETYPE: bool,
+    const METHOD: &'static str,
+    const KIND: u8,
+    ClassGenerics,
+    Sig,
+    Ret,
+    Arg1,
+    Arg2,
+    Arg3,
+>(
+    arg1: Arg1,
+    arg2: Arg2,
+    arg3: Arg3,
+) -> Ret {
+    core::intrinsics::abort();
+}
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_clr_interop_generic_ctor0<
+    const ASSEMBLY: &'static str,
+    const CLASS_PATH: &'static str,
+    const IS_VALUETYPE: bool,
+    ClassGenerics,
+    Sig,
+    Ret,
+>() -> Ret {
+    core::intrinsics::abort();
+}
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_clr_interop_generic_ctor1<
+    const ASSEMBLY: &'static str,
+    const CLASS_PATH: &'static str,
+    const IS_VALUETYPE: bool,
+    ClassGenerics,
+    Sig,
+    Ret,
+    Arg1,
+>(
+    arg1: Arg1,
+) -> Ret {
+    core::intrinsics::abort();
+}
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_clr_interop_generic_ctor2<
+    const ASSEMBLY: &'static str,
+    const CLASS_PATH: &'static str,
+    const IS_VALUETYPE: bool,
+    ClassGenerics,
+    Sig,
+    Ret,
+    Arg1,
+    Arg2,
+>(
+    arg1: Arg1,
+    arg2: Arg2,
+) -> Ret {
+    core::intrinsics::abort();
+}
+
 impl RustcCLRInteropManagedChar {
     pub fn single_codepoint_unchecked(value: char) -> Self {
         let byte1 = (value as u64) & 0xFF;

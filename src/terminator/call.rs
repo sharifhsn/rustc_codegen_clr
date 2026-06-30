@@ -2,9 +2,10 @@ use crate::{
     assembly::MethodCompileCtx,
     interop::AssemblyRef,
     utilis::{
-        garag_to_bool, CTOR_FN_NAME, MANAGED_CALL_FN_NAME, MANAGED_CALL_VIRT_FN_NAME,
-        MANAGED_CHECKED_CAST, MANAGED_IS_INST, MANAGED_LD_ELEM_REF, MANAGED_LD_LEN,
-        MANAGED_LD_NULL, MANAGED_NEW_ARR, MANAGED_SET_ELEM, MANAGED_THROW, MANAGED_TRY_CATCH,
+        garag_to_bool, CTOR_FN_NAME, GENERIC_CALL_FN_NAME, GENERIC_CTOR_FN_NAME,
+        MANAGED_CALL_FN_NAME, MANAGED_CALL_VIRT_FN_NAME, MANAGED_CHECKED_CAST, MANAGED_IS_INST,
+        MANAGED_LD_ELEM_REF, MANAGED_LD_LEN, MANAGED_LD_NULL, MANAGED_NEW_ARR, MANAGED_SET_ELEM,
+        MANAGED_THROW, MANAGED_TRY_CATCH,
     },
 };
 use cilly::{
@@ -15,7 +16,10 @@ use cilly::{MethodRef, Type};
 use rustc_codegen_clr_call::CallInfo;
 use rustc_codegen_clr_ctx::function_name;
 use rustc_codegen_clr_place::place_set;
-use rustc_codegen_clr_type::{utilis::garg_to_string, GetTypeExt};
+use rustc_codegen_clr_type::{
+    utilis::{garag_to_usize, garg_to_string},
+    GetTypeExt,
+};
 use rustc_codgen_clr_operand::{handle_operand, operand_address};
 use rustc_middle::ty::InstanceKind;
 use rustc_middle::{
@@ -194,6 +198,147 @@ fn callvirt_managed<'tcx>(
             place_set(destination, node, ctx)
         }
     }
+}
+/// WF-9 generic interop bridge — decompose a tuple-typed generic argument into the lowered .NET
+/// types of its elements. Used to pass a class's generic-argument list (`(i32,)` of `List<i32>`) or
+/// a method's *definition-shape* signature (`(Output, In0, …)` with `!N`/`!!N` markers) as a single
+/// type parameter.
+fn tuple_garg_to_types<'tcx>(
+    garg: GenericArg<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Vec<Type> {
+    let ty = ctx.monomorphize(
+        garg.as_type()
+            .expect("WF-9 generic interop: expected a tuple type parameter"),
+    );
+    let elems: Vec<Ty<'tcx>> = match ty.kind() {
+        TyKind::Tuple(elems) => elems.iter().collect(),
+        _ => panic!("WF-9 generic interop: expected a tuple type, got {ty:?}"),
+    };
+    elems
+        .into_iter()
+        .map(|elem| {
+            let elem = ctx.monomorphize(elem);
+            ctx.type_from_cache(elem)
+        })
+        .collect()
+}
+/// WF-9 — calls a method on a *generic* .NET instantiation (e.g. `List<i32>::Add`). The target class
+/// carries concrete generic arguments (so the `ClassRef` renders `` List`1<int32> ``) and the method
+/// signature is given in *definition* shape (`!N`/`!!N` markers), which is what a methodref on a
+/// generic instantiation must use. `KIND`: 0 = static, 1 = `call instance`, 2 = `callvirt`.
+fn call_generic<'tcx>(
+    subst_ref: &[GenericArg<'tcx>],
+    args: &[Spanned<Operand<'tcx>>],
+    destination: &Place<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Root {
+    let asm = AssemblyRef::decode_assembly_ref(subst_ref[0], ctx.tcx());
+    let asm = asm.name().map(|name| ctx.alloc_string(name));
+    let class_name = garg_to_string(subst_ref[1], ctx.tcx());
+    let class_name = ctx.alloc_string(class_name);
+    let is_valuetype = garag_to_bool(subst_ref[2], ctx.tcx());
+    let managed_fn_name = garg_to_string(subst_ref[3], ctx.tcx());
+    let managed_fn_name = ctx.alloc_string(managed_fn_name);
+    let kind = garag_to_usize(subst_ref[4], ctx.tcx());
+    // Concrete .NET type arguments of the class instantiation (e.g. the `(i32,)` of `List<i32>`).
+    let class_generics = tuple_garg_to_types(subst_ref[5], ctx);
+    // Definition-shape method signature: `(output, explicit-input0, …)` with `!N`/`!!N` markers.
+    let mut sig_types = tuple_garg_to_types(subst_ref[6], ctx);
+    assert!(
+        !sig_types.is_empty(),
+        "WF-9 generic interop: the signature tuple must carry at least a return type"
+    );
+    let output = sig_types.remove(0);
+    let explicit_inputs = sig_types;
+
+    let this = ctx.alloc_class_ref(ClassRef::new(
+        class_name,
+        asm,
+        is_valuetype,
+        class_generics.into(),
+    ));
+    // Build the methodref signature in the cilly convention (the receiver, if any, is `inputs[0]`).
+    let mut inputs = Vec::with_capacity(explicit_inputs.len() + 1);
+    let mkind = match kind {
+        0 => MethodKind::Static,
+        1 => {
+            assert!(
+                !is_valuetype,
+                "WF-9 generic interop: instance calls on generic *value types* (e.g. Span<T>) are not yet supported; use a reference type"
+            );
+            inputs.push(Type::ClassRef(this));
+            MethodKind::Instance
+        }
+        2 => {
+            inputs.push(Type::ClassRef(this));
+            MethodKind::Virtual
+        }
+        _ => panic!("WF-9 generic interop: invalid call KIND {kind}"),
+    };
+    inputs.extend(explicit_inputs);
+    let sig = ctx.sig(inputs, output);
+    let mref = MethodRef::new(this, managed_fn_name, sig, mkind, vec![].into());
+    let mref = ctx.alloc_methodref(mref);
+
+    let mut call_args = Vec::new();
+    for arg in args {
+        call_args.push(handle_operand(&arg.node, ctx));
+    }
+    if output == Type::Void {
+        ctx.call_root(mref, &call_args, IsPure::NOT)
+    } else {
+        let node = ctx.call(mref, &call_args, IsPure::NOT);
+        place_set(destination, node, ctx)
+    }
+}
+/// WF-9 — constructs a managed object of a *generic* .NET instantiation (e.g. `new List<i32>()`).
+fn ctor_generic<'tcx>(
+    subst_ref: &[GenericArg<'tcx>],
+    args: &[Spanned<Operand<'tcx>>],
+    destination: &Place<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Root {
+    let asm = AssemblyRef::decode_assembly_ref(subst_ref[0], ctx.tcx());
+    let asm = asm.name().map(|name| ctx.alloc_string(name));
+    let class_name = garg_to_string(subst_ref[1], ctx.tcx());
+    let class_name = ctx.alloc_string(class_name);
+    let is_valuetype = garag_to_bool(subst_ref[2], ctx.tcx());
+    let class_generics = tuple_garg_to_types(subst_ref[3], ctx);
+    // The ctor signature tuple is `(ignored-return, explicit-input0, …)`. A `.ctor` methodref returns
+    // void; only the explicit inputs matter. (The first slot keeps the `Sig` tuple shape uniform with
+    // the call path, where slot 0 is the genuine return type.)
+    let mut sig_types = tuple_garg_to_types(subst_ref[4], ctx);
+    assert!(
+        !sig_types.is_empty(),
+        "WF-9 generic interop: the ctor signature tuple must carry at least the (ignored) return slot"
+    );
+    let _ignored_ret = sig_types.remove(0);
+    let explicit_inputs = sig_types;
+
+    let this = ctx.alloc_class_ref(ClassRef::new(
+        class_name,
+        asm,
+        is_valuetype,
+        class_generics.into(),
+    ));
+    let mut inputs = vec![Type::ClassRef(this)];
+    inputs.extend(explicit_inputs);
+    let sig = ctx.sig(inputs, Type::Void);
+    let ctor = MethodRef::new(
+        this,
+        ctx.alloc_string(".ctor"),
+        sig,
+        MethodKind::Constructor,
+        vec![].into(),
+    );
+    let ctor = ctx.alloc_methodref(ctor);
+    let mut call_args = Vec::new();
+    for arg in args {
+        call_args.push(handle_operand(&arg.node, ctx));
+    }
+    let node = ctx.call(ctor, &call_args, IsPure::NOT);
+    place_set(destination, node, ctx)
 }
 /// Creates a new managed object, and places a reference to it in destination
 fn call_ctor<'tcx>(
@@ -464,7 +609,21 @@ pub fn call_inner<'tcx>(
     }
     let mut signature = call_info.sig().clone();
     // Checks if function is "magic"
-    if function_name.contains(MANAGED_THROW) {
+    if function_name.contains(GENERIC_CTOR_FN_NAME) {
+        assert!(
+            !call_info.split_last_tuple(),
+            "Generic constructors may not use the `rust_call` calling convention!"
+        );
+        // WF-9: `new List<i32>()` and friends.
+        return vec![ctor_generic(instance.args, args, destination, ctx)];
+    } else if function_name.contains(GENERIC_CALL_FN_NAME) {
+        assert!(
+            !call_info.split_last_tuple(),
+            "Generic managed calls may not use the `rust_call` calling convention!"
+        );
+        // WF-9: `List<i32>::Add(…)` and friends.
+        return vec![call_generic(instance.args, args, destination, ctx)];
+    } else if function_name.contains(MANAGED_THROW) {
         // `rustc_clr_interop_throw::<MSG>()` raises a managed `System.Exception(MSG)` directly (via the
         // `throw` IL op), so a .NET caller can `catch` it. Unlike a Rust `panic!` — which goes through
         // the unwinder and faults when it reaches a managed frame — this is an ordinary managed throw.
