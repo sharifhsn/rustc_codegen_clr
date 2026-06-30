@@ -319,6 +319,189 @@ macro_rules! ld_arg {
         CILNode::LdArg($literal)
     };
 }
+/// Generates the near-identical `ClassRef` constructors of shape
+/// `pub fn NAME(asm: &mut Assembly) -> Interned<ClassRef>` whose body is just
+/// `asm.alloc_class_ref(ClassRef::new(asm.alloc_string(TYPE_NAME),
+/// Some(asm.alloc_string(ASM_NAME)), IS_VALUETYPE, GENERICS.into()))`.
+///
+/// Each row varies only by: the .NET type-name string, the assembly string
+/// (defaults to `"System.Runtime"`, used by the majority of rows), the
+/// valuetype flag (`value` => value type, `class` => reference type), and an
+/// optional generic-parameter list. Load-bearing doc-comments are preserved
+/// verbatim by writing them above the row — they are forwarded to the generated
+/// associated function.
+///
+/// Row forms (each may be prefixed with `#[doc = "…"]` / `///` doc lines):
+/// - `NAME => "TypeName", class;`                       (asm = System.Runtime)
+/// - `NAME => "TypeName", value;`                       (asm = System.Runtime)
+/// - `NAME => "TypeName", "AsmName", class;`
+/// - `NAME => "TypeName", "AsmName", value;`
+/// - `NAME => "TypeName", class, generics(element);`    (one generic, default asm)
+/// - `NAME => "TypeName", value, generics(element);`
+/// - `NAME => "TypeName", "AsmName", class, generics(element);`
+/// - `NAME => "TypeName", "AsmName", value, generics(element);`
+/// - `NAME => "TypeName", class, generics(key, value);` (two generics, default asm)
+/// - `NAME => "TypeName", value, generics(key, value);`
+/// - `NAME => "TypeName", "AsmName", class, generics(key, value);`
+/// - `NAME => "TypeName", "AsmName", value, generics(key, value);`
+#[macro_export]
+macro_rules! bcl_class {
+    // ---- internal valuetype-token -> bool normalization ----
+    (@vt class) => { false };
+    (@vt value) => { true };
+
+    // ---- single-row emitters ----
+
+    // no generics, explicit asm
+    (@one
+        $(#[$meta:meta])*
+        $name:ident => $tname:literal, $asm:literal, $vt:tt
+    ) => {
+        $(#[$meta])*
+        pub fn $name(asm: &mut $crate::ir::Assembly) -> $crate::ir::Interned<$crate::ir::ClassRef> {
+            let name = asm.alloc_string($tname);
+            let asm_name = Some(asm.alloc_string($asm));
+            asm.alloc_class_ref($crate::ir::ClassRef::new(
+                name,
+                asm_name,
+                $crate::bcl_class!(@vt $vt),
+                [].into(),
+            ))
+        }
+    };
+    // no generics, default asm (System.Runtime)
+    (@one
+        $(#[$meta:meta])*
+        $name:ident => $tname:literal, $vt:tt
+    ) => {
+        $crate::bcl_class!(@one $(#[$meta])* $name => $tname, "System.Runtime", $vt);
+    };
+
+    // one generic, explicit asm
+    (@one
+        $(#[$meta:meta])*
+        $name:ident => $tname:literal, $asm:literal, $vt:tt, generics($element:ident)
+    ) => {
+        $(#[$meta])*
+        pub fn $name(asm: &mut $crate::ir::Assembly, $element: $crate::ir::Type)
+            -> $crate::ir::Interned<$crate::ir::ClassRef>
+        {
+            let name = asm.alloc_string($tname);
+            let asm_name = Some(asm.alloc_string($asm));
+            asm.alloc_class_ref($crate::ir::ClassRef::new(
+                name,
+                asm_name,
+                $crate::bcl_class!(@vt $vt),
+                [$element].into(),
+            ))
+        }
+    };
+    // one generic, default asm
+    (@one
+        $(#[$meta:meta])*
+        $name:ident => $tname:literal, $vt:tt, generics($element:ident)
+    ) => {
+        $crate::bcl_class!(@one $(#[$meta])* $name => $tname, "System.Runtime", $vt, generics($element));
+    };
+
+    // two generics, explicit asm
+    (@one
+        $(#[$meta:meta])*
+        $name:ident => $tname:literal, $asm:literal, $vt:tt, generics($k:ident, $v:ident)
+    ) => {
+        $(#[$meta])*
+        pub fn $name(asm: &mut $crate::ir::Assembly, $k: $crate::ir::Type, $v: $crate::ir::Type)
+            -> $crate::ir::Interned<$crate::ir::ClassRef>
+        {
+            let name = asm.alloc_string($tname);
+            let asm_name = Some(asm.alloc_string($asm));
+            asm.alloc_class_ref($crate::ir::ClassRef::new(
+                name,
+                asm_name,
+                $crate::bcl_class!(@vt $vt),
+                [$k, $v].into(),
+            ))
+        }
+    };
+    // two generics, default asm
+    (@one
+        $(#[$meta:meta])*
+        $name:ident => $tname:literal, $vt:tt, generics($k:ident, $v:ident)
+    ) => {
+        $crate::bcl_class!(@one $(#[$meta])* $name => $tname, "System.Runtime", $vt, generics($k, $v));
+    };
+
+    // ---- table body tt-muncher: peel off one complete `;`-terminated row, then
+    //      recurse on the remainder. Matches each concrete row shape directly so
+    //      recursion depth is O(#rows), not O(#tokens). ----
+    // done
+    (@rows) => {};
+    // two generics, explicit asm
+    (@rows
+        $(#[$meta:meta])*
+        $name:ident => $tname:literal, $asm:literal, $vt:tt, generics($k:ident, $v:ident) ;
+        $($rest:tt)*
+    ) => {
+        $crate::bcl_class!(@one $(#[$meta])* $name => $tname, $asm, $vt, generics($k, $v));
+        $crate::bcl_class!(@rows $($rest)*);
+    };
+    // two generics, default asm
+    (@rows
+        $(#[$meta:meta])*
+        $name:ident => $tname:literal, $vt:tt, generics($k:ident, $v:ident) ;
+        $($rest:tt)*
+    ) => {
+        $crate::bcl_class!(@one $(#[$meta])* $name => $tname, $vt, generics($k, $v));
+        $crate::bcl_class!(@rows $($rest)*);
+    };
+    // one generic, explicit asm
+    (@rows
+        $(#[$meta:meta])*
+        $name:ident => $tname:literal, $asm:literal, $vt:tt, generics($element:ident) ;
+        $($rest:tt)*
+    ) => {
+        $crate::bcl_class!(@one $(#[$meta])* $name => $tname, $asm, $vt, generics($element));
+        $crate::bcl_class!(@rows $($rest)*);
+    };
+    // one generic, default asm
+    (@rows
+        $(#[$meta:meta])*
+        $name:ident => $tname:literal, $vt:tt, generics($element:ident) ;
+        $($rest:tt)*
+    ) => {
+        $crate::bcl_class!(@one $(#[$meta])* $name => $tname, $vt, generics($element));
+        $crate::bcl_class!(@rows $($rest)*);
+    };
+    // no generics, explicit asm
+    (@rows
+        $(#[$meta:meta])*
+        $name:ident => $tname:literal, $asm:literal, $vt:tt ;
+        $($rest:tt)*
+    ) => {
+        $crate::bcl_class!(@one $(#[$meta])* $name => $tname, $asm, $vt);
+        $crate::bcl_class!(@rows $($rest)*);
+    };
+    // no generics, default asm
+    (@rows
+        $(#[$meta:meta])*
+        $name:ident => $tname:literal, $vt:tt ;
+        $($rest:tt)*
+    ) => {
+        $crate::bcl_class!(@one $(#[$meta])* $name => $tname, $vt);
+        $crate::bcl_class!(@rows $($rest)*);
+    };
+
+    // ---- table entry point: emit one impl block holding every row ----
+    (
+        impl $self:ident {
+            $($body:tt)*
+        }
+    ) => {
+        impl $self {
+            $crate::bcl_class!(@rows $($body)*);
+        }
+    };
+}
 #[test]
 fn macro_test() {
     let sum = add!(

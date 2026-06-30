@@ -64,12 +64,6 @@ impl ClassRef {
             generics,
         }
     }
-    pub fn interlocked(asm: &mut super::Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Threading.Interlocked");
-        let asm_name = Some(asm.alloc_string("System.Threading"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, vec![].into()))
-    }
-
     /// Returns the assembly containing this typedef
     #[must_use]
     pub fn asm(&self) -> Option<Interned<IString>> {
@@ -89,639 +83,6 @@ impl ClassRef {
     #[must_use]
     pub fn generics(&self) -> &[Type] {
         &self.generics
-    }
-    /// The .NET math class
-    pub fn math(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Math");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, vec![].into()))
-    }
-    /// Retusn a reference to the class `System.Double`
-    pub fn double(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Double");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        // `System.Double` is a .NET value type. It MUST be referenced as `valuetype`
-        // (not `class`) in IL, or any call whose declaring type is `System.Double`
-        // (e.g. `MinNumber`/`MaxNumber`/`Max`/`Min`/`FusedMultiplyAdd`/`Pow`) makes the
-        // runtime reject the type-load with `TypeLoadException: ... value type mismatch`.
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, vec![].into()))
-    }
-    /// Retusn a reference to the class `System.Single`
-    pub fn single(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Single");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        // `System.Single` is a .NET value type — see `double` above.
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, vec![].into()))
-    }
-    /// Returns a reference to the class `System.MathF`
-    #[must_use]
-    pub fn mathf(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name: Interned<IString> = asm.alloc_string("System.MathF");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the `System.UInt128` type.
-    pub fn uint_128(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.UInt128");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the `System.Int128` type.
-    pub fn int_128(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Int128");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the `System.UIntPtr` type.
-    pub fn usize_type(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.UIntPtr");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the `System.UInt16` type.
-    pub fn uint16(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.UInt16");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the `System.Int16` type.
-    pub fn int16(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Int16");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the `System.UInt32` type.
-    pub fn uint32(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.UInt32");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the `System.Int32` type.
-    pub fn int32(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Int32");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the `System.UInt64` type.
-    pub fn uint64(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.UInt64");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the `System.Int64` type.
-    pub fn int64(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Int64");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the `System.IntPtr` type.
-    pub fn isize_type(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.IntPtr");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the `System.Half` type.
-    pub fn half(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Half");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the `System.Byte` type.
-    pub fn byte(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Byte");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the `System.SByte` type.
-    pub fn sbyte(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.SByte");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the GC handle class.
-    pub fn gc_handle(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Runtime.InteropServices.GCHandle");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the `System.String`
-    pub fn string(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.String");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the `System.Object`
-    pub fn object(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Object");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the `System.Threading.Thread`
-    pub fn thread(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Threading.Thread");
-        let asm_name = Some(asm.alloc_string("System.Threading.Thread"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the `System.Threading.ThreadStart`
-    pub fn thread_start(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Threading.ThreadStart");
-        let asm_name = Some(asm.alloc_string("System.Threading.Thread"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the `System.Threading.SemaphoreSlim`
-    pub fn semaphore_slim(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Threading.SemaphoreSlim");
-        // SemaphoreSlim physically lives in System.Private.CoreLib; method bodies
-        // must name the IMPL assembly (the runtime resolves it directly), while
-        // `ref_assembly_name` normalizes it to System.Runtime in the C#-visible
-        // metadata. Naming `System.Runtime` here makes the body's
-        // `[System.Runtime]SemaphoreSlim` unresolvable at run time (TypeLoadException).
-        let asm_name = Some(asm.alloc_string("System.Private.CoreLib"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to `System.Threading.ThreadLocal<T>` instantiated at
-    /// element type `element` (e.g. `System.Threading.ThreadLocal<nint>`).
-    ///
-    /// Backs the dotnet PAL's per-thread thread-local storage (Slice 2): each
-    /// `thread_local!` TLS key is one `ThreadLocal<IntPtr>` whose `.Value` is
-    /// per-thread BY CONSTRUCTION. A reference type (generic arity 1).
-    ///
-    /// ASM-NAME LESSON (same as `semaphore_slim`): `ThreadLocal<T>` physically
-    /// lives in `System.Private.CoreLib`; method-BODY type references must name
-    /// the IMPL assembly so the runtime resolves it directly. Naming
-    /// `System.Runtime` here makes the body's `[System.Runtime]ThreadLocal\`1`
-    /// unresolvable at run time (TypeLoadException); `ref_assembly_name`
-    /// normalizes CoreLib -> System.Runtime only in C#-visible metadata.
-    pub fn thread_local(asm: &mut Assembly, element: Type) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Threading.ThreadLocal");
-        let asm_name = Some(asm.alloc_string("System.Private.CoreLib"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [element].into()))
-    }
-    /// Returns a reference to the `System.Type`
-    pub fn type_type(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Type");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the `System.RuntimeTypeHandle`
-    pub fn runtime_type_hadle(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.RuntimeTypeHandle");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the `System.String`
-    pub fn exception(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Exception");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the `System.Console`
-    pub fn console(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Console");
-        let asm_name = Some(asm.alloc_string("System.Console"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the class `System.Collections.IDictionaryEnumerator`
-    #[must_use]
-    pub fn dictionary_iterator(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Collections.IDictionaryEnumerator");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the class `System.Collections.IEnumerator`
-    #[must_use]
-    pub fn i_enumerator(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Collections.IEnumerator");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the class `System.Collections.IDictionary`
-    #[must_use]
-    pub fn i_dictionary(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Collections.IDictionary");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the class `System.Collections.ICollection`
-    #[must_use]
-    pub fn i_collection(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Collections.ICollection");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the class `System.Environment`
-    #[must_use]
-    pub fn enviroment(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Environment");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the class `System.Runtime.InteropServices.Marshal`
-    #[must_use]
-    pub fn marshal(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Runtime.InteropServices.Marshal");
-        let asm_name = Some(asm.alloc_string("System.Runtime.InteropServices"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the class `System.Collections.DictionaryEntry`
-    #[must_use]
-    pub fn dictionary_entry(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Collections.DictionaryEntry");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the class `System.Runtime.InteropServices.NativeMemory`
-    #[must_use]
-    pub fn native_mem(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Runtime.InteropServices.NativeMemory");
-        let asm_name = Some(asm.alloc_string("System.Runtime.InteropServices"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to `System.Span<T>` instantiated at element type
-    /// `element` (a value type, e.g. `System.Span<uint8>`).
-    #[must_use]
-    pub fn span(asm: &mut Assembly, element: Type) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Span");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [element].into()))
-    }
-    /// Returns a reference to `System.ReadOnlySpan<T>` instantiated at element
-    /// type `element` (a value type, e.g. `System.ReadOnlySpan<uint8>`). Backs
-    /// `FileStream.Write(ReadOnlySpan<byte>)` in the dotnet fs PAL arm.
-    #[must_use]
-    pub fn read_only_span(asm: &mut Assembly, element: Type) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.ReadOnlySpan");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [element].into()))
-    }
-    /// Returns a reference to the class `System.IO.FileStream`, the open-file
-    /// handle backing the dotnet `fs` PAL arm (Read/Write/Seek/Flush/Dispose/
-    /// get_Length).
-    #[must_use]
-    pub fn file_stream(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.IO.FileStream");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the static class `System.IO.File`
-    /// (Delete/Move/Exists/GetAttributes) for the dotnet `fs` PAL arm.
-    #[must_use]
-    pub fn file(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.IO.File");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the static class `System.IO.Directory`
-    /// (CreateDirectory/Delete/Exists/GetFileSystemEntries) for the dotnet `fs`
-    /// PAL arm.
-    #[must_use]
-    pub fn directory(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.IO.Directory");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the static class `System.IO.RandomAccess`
-    /// (`Read(SafeFileHandle, Span<byte>, long)` / `Write(SafeFileHandle,
-    /// ReadOnlySpan<byte>, long)`) — the offset-relative file I/O backing the
-    /// dotnet `fs` PAL `read_at`/`write_at` (B2 Piece 3). A reference type.
-    #[must_use]
-    pub fn random_access(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.IO.RandomAccess");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the class
-    /// `Microsoft.Win32.SafeHandles.SafeFileHandle` — `RandomAccess.{Read,Write}`
-    /// take this rather than a `FileStream`; the fs PAL bridges via the
-    /// `FileStream.SafeFileHandle` getter (B2 Piece 3). A reference type.
-    #[must_use]
-    pub fn safe_file_handle(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("Microsoft.Win32.SafeHandles.SafeFileHandle");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the abstract class `System.IO.FileSystemInfo` — the
-    /// return type of `File.CreateSymbolicLink`/`File.ResolveLinkTarget`; the fs
-    /// PAL reads its `FullName` to recover a `readlink` target (B2 Piece 4). A
-    /// reference type.
-    #[must_use]
-    pub fn file_system_info(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.IO.FileSystemInfo");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the static class `System.IO.Path`
-    /// (`GetTempPath`) for the dotnet `paths` PAL arm (PACKAGE A).
-    #[must_use]
-    pub fn path_io(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.IO.Path");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the class `System.IO.FileInfo`
-    /// (`new FileInfo(string).get_Length`) for sizing files in the dotnet `fs`
-    /// PAL arm.
-    #[must_use]
-    pub fn file_info(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.IO.FileInfo");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the int-backed enum `System.IO.FileMode` (a value
-    /// type) — needed so `new FileStream(string, FileMode, FileAccess)` resolves
-    /// to a real BCL ctor (an `int32` would not match the parameter type).
-    #[must_use]
-    pub fn file_mode(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.IO.FileMode");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the int-backed enum `System.IO.FileAccess` (a value
-    /// type) — paired with [`Self::file_mode`] for the `FileStream` ctor.
-    #[must_use]
-    pub fn file_access(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.IO.FileAccess");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the int-backed enum `System.IO.SeekOrigin` (a value
-    /// type) — for `FileStream.Seek(long, SeekOrigin)`.
-    #[must_use]
-    pub fn seek_origin(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.IO.SeekOrigin");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the int-backed `[Flags]` enum `System.IO.FileAttributes`
-    /// (a value type) — for `File.{Get,Set}Attributes`, backing the dotnet `fs` PAL
-    /// `set_perm` (the read-only bit; `ReadOnly = 1`, `Normal = 128`).
-    #[must_use]
-    pub fn file_attributes(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.IO.FileAttributes");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the class `System.Net.Sockets.Socket`, the open
-    /// socket handle backing the dotnet `net` PAL arm (Bind/Listen/Accept/
-    /// Connect/Send/Receive/SendTo/ReceiveFrom/Shutdown/Dispose +
-    /// LocalEndPoint/RemoteEndPoint). Physically lives in `System.Net.Sockets.dll`,
-    /// but — exactly like the `System.IO.*` fs helpers — we name the assembly
-    /// `System.Net.Sockets` (its real impl assembly — unlike the `System.IO.*` fs
-    /// helpers, CoreCLR does NOT type-forward `System.Net.*` from `System.Runtime`,
-    /// so the net helpers must name their physical assemblies). `Socket`,
-    /// `SocketType`, `ProtocolType` and `SocketShutdown` live in
-    /// `System.Net.Sockets`; `IPAddress`/`IPEndPoint`/`EndPoint`/`AddressFamily`
-    /// live in `System.Net.Primitives`. The exe path resolves these simple-name
-    /// extern refs leniently at runtime.
-    #[must_use]
-    pub fn socket(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Net.Sockets.Socket");
-        let asm_name = Some(asm.alloc_string("System.Net.Sockets"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the int-backed enum `System.Net.Sockets.SocketShutdown`
-    /// (a value type) — for `Socket.Shutdown(SocketShutdown)` in the dotnet `net`
-    /// PAL arm. In `System.Net.Sockets`.
-    #[must_use]
-    pub fn socket_shutdown(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Net.Sockets.SocketShutdown");
-        let asm_name = Some(asm.alloc_string("System.Net.Sockets"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to `System.Net.Sockets.SocketException` — the exception
-    /// the BCL throws on a socket fault. The POSIX shim's errno translation
-    /// (`map_socket_exception_to_errno`) reads its `SocketErrorCode` to derive a
-    /// POSIX errno. A reference type (not a value type). In `System.Net.Sockets`
-    /// (well, `System.Net.Primitives`, but the exe path resolves the simple-name
-    /// extern ref leniently at runtime, exactly like the other net classes).
-    #[must_use]
-    pub fn socket_exception(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Net.Sockets.SocketException");
-        let asm_name = Some(asm.alloc_string("System.Net.Primitives"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to `System.IO.FileNotFoundException` — thrown by the
-    /// BCL when a file path does not exist (e.g. `new FileStream` on a missing
-    /// file). The fs errno mapper (`rcl_errno_from_exception`) maps it to
-    /// `ENOENT`. HOST-AGNOSTIC: the exception type is thrown identically on
-    /// Unix-host and Windows-host CoreCLR. A reference type, in `System.Runtime`.
-    #[must_use]
-    pub fn file_not_found_exception(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.IO.FileNotFoundException");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to `System.IO.DirectoryNotFoundException` — thrown by
-    /// the BCL when a directory in a path does not exist. Maps to `ENOENT`.
-    /// HOST-AGNOSTIC. A reference type, in `System.Runtime`.
-    #[must_use]
-    pub fn directory_not_found_exception(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.IO.DirectoryNotFoundException");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to `System.UnauthorizedAccessException` (note: in the
-    /// `System` namespace, NOT `System.IO`; it derives from `SystemException`, NOT
-    /// `IOException`) — thrown by the BCL on a permission/ACL denial. Maps to
-    /// `EACCES`. HOST CAVEAT: the *mapping* is host-agnostic, but the *meaning* of
-    /// EACCES (rwx/uid/gid) is only faithful on a Unix host; a Windows-host
-    /// CoreCLR throws this for ACL denials too and has no POSIX permission model,
-    /// so PermissionDenied fidelity is Unix-host-best-effort. A reference type, in
-    /// `System.Runtime`.
-    #[must_use]
-    pub fn unauthorized_access_exception(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.UnauthorizedAccessException");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to `System.IO.PathTooLongException` — thrown by the BCL
-    /// when a path exceeds the platform limit. Maps to `ENAMETOOLONG`.
-    /// HOST-AGNOSTIC. A reference type, in `System.Runtime`.
-    #[must_use]
-    pub fn path_too_long_exception(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.IO.PathTooLongException");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the int-backed enum `System.Net.Sockets.SocketError`
-    /// (a value type) — the type returned by `SocketException.SocketErrorCode`. The
-    /// errno translation reads it (as its underlying i32) to derive a POSIX errno.
-    /// Must be the enum type, not raw i32: the CLR matches the property's signature
-    /// EXACTLY (`SocketError get_SocketErrorCode()`), so an i32 return type yields a
-    /// runtime `MissingMethodException`. In `System.Net.Primitives`.
-    #[must_use]
-    pub fn socket_error(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Net.Sockets.SocketError");
-        let asm_name = Some(asm.alloc_string("System.Net.Primitives"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the int-backed enum `System.Net.Sockets.SelectMode`
-    /// (a value type) — selects the readiness mode (SelectRead=0 / SelectWrite=1 /
-    /// SelectError=2) for `Socket.Poll(int microSeconds, SelectMode)` in the dotnet
-    /// mio PAL arm (the readiness multiplexer behind mio's Selector). In
-    /// `System.Net.Sockets`.
-    #[must_use]
-    pub fn select_mode(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Net.Sockets.SelectMode");
-        let asm_name = Some(asm.alloc_string("System.Net.Sockets"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the int-backed enum `System.Net.Sockets.AddressFamily`
-    /// (a value type) — selects IPv4/IPv6 for `new Socket(AddressFamily, …)` in the
-    /// dotnet `net` PAL arm. In `System.Net.Primitives` (NOT `System.Net.Sockets`).
-    #[must_use]
-    pub fn address_family(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Net.Sockets.AddressFamily");
-        let asm_name = Some(asm.alloc_string("System.Net.Primitives"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the int-backed enum `System.Net.Sockets.SocketType`
-    /// (a value type) — Stream/Dgram for `new Socket(…, SocketType, …)`. In
-    /// `System.Net.Sockets`.
-    #[must_use]
-    pub fn socket_type(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Net.Sockets.SocketType");
-        let asm_name = Some(asm.alloc_string("System.Net.Sockets"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the int-backed enum `System.Net.Sockets.ProtocolType`
-    /// (a value type) — Tcp/Udp for `new Socket(…, …, ProtocolType)`. In
-    /// `System.Net.Sockets`.
-    #[must_use]
-    pub fn protocol_type(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Net.Sockets.ProtocolType");
-        let asm_name = Some(asm.alloc_string("System.Net.Sockets"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the class `System.Net.IPAddress` (the IP-address
-    /// value carried in an `IPEndPoint`) for the dotnet `net` PAL arm. Built from
-    /// network-order octets via `new IPAddress(ReadOnlySpan<byte>)`. In
-    /// `System.Net.Primitives`.
-    #[must_use]
-    pub fn ip_address(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Net.IPAddress");
-        let asm_name = Some(asm.alloc_string("System.Net.Primitives"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the class `System.Net.IPEndPoint` (an IPAddress +
-    /// port) for the dotnet `net` PAL arm. Never crosses the Rust ABI — it is
-    /// built/read entirely BCL-side from the decomposed `(family, ip, port)`. In
-    /// `System.Net.Primitives`.
-    #[must_use]
-    pub fn ip_endpoint(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Net.IPEndPoint");
-        let asm_name = Some(asm.alloc_string("System.Net.Primitives"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the abstract base class `System.Net.EndPoint` — the
-    /// declared return type of `Socket.LocalEndPoint`/`RemoteEndPoint` and the
-    /// `ref` seed type of `Socket.ReceiveFrom`, downcast to `IPEndPoint`
-    /// BCL-side in the dotnet `net` PAL arm. In `System.Net.Primitives`.
-    #[must_use]
-    pub fn endpoint(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Net.EndPoint");
-        let asm_name = Some(asm.alloc_string("System.Net.Primitives"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the class
-    /// `System.Net.Sockets.UnixDomainSocketEndPoint` — the `EndPoint` subclass
-    /// for path-based AF_UNIX sockets (`new UnixDomainSocketEndPoint(string)`),
-    /// upcast to `EndPoint` for `Socket.Bind`/`Connect` exactly like `IPEndPoint`
-    /// (B2 Piece 1). A reference type. In `System.Net.Sockets` (NOT Primitives).
-    #[must_use]
-    pub fn unix_domain_socket_endpoint(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Net.Sockets.UnixDomainSocketEndPoint");
-        let asm_name = Some(asm.alloc_string("System.Net.Sockets"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the class
-    /// `System.Security.Cryptography.RandomNumberGenerator`.
-    #[must_use]
-    pub fn random_number_generator(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Security.Cryptography.RandomNumberGenerator");
-        let asm_name = Some(asm.alloc_string("System.Security.Cryptography"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the class `System.Diagnostics.Stopwatch`, the
-    /// monotonic high-resolution timer backing the `Instant` PAL hooks.
-    #[must_use]
-    pub fn stopwatch(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Diagnostics.Stopwatch");
-        let asm_name = Some(asm.alloc_string("System.Runtime.Extensions"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to `System.Diagnostics.ProcessStartInfo` — the spawn
-    /// recipe (FileName/Arguments/WorkingDirectory/Redirect*) for the dotnet
-    /// `process` PAL arm. A reference type in assembly `System.Diagnostics.Process`.
-    #[must_use]
-    pub fn process_start_info(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Diagnostics.ProcessStartInfo");
-        let asm_name = Some(asm.alloc_string("System.Diagnostics.Process"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to `System.Diagnostics.Process` — a spawned child
-    /// (Start/WaitForExit/ExitCode/Id/Kill/HasExited) for the dotnet `process`
-    /// PAL arm. A reference type in assembly `System.Diagnostics.Process`.
-    #[must_use]
-    pub fn process(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.Diagnostics.Process");
-        let asm_name = Some(asm.alloc_string("System.Diagnostics.Process"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the abstract class `System.IO.Stream` — the raw byte
-    /// stream backing a child's redirected stdout/stderr/stdin (`Read`/`Write`/
-    /// `Dispose`) for the dotnet `process` capture path. A reference type.
-    #[must_use]
-    pub fn stream(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.IO.Stream");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to `System.IO.StreamReader` — `Process.StandardOutput`/
-    /// `StandardError`; the PAL reads its `BaseStream` for raw child output.
-    #[must_use]
-    pub fn stream_reader(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.IO.StreamReader");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to `System.IO.StreamWriter` — `Process.StandardInput`;
-    /// the PAL writes its `BaseStream` for raw child input.
-    #[must_use]
-    pub fn stream_writer(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.IO.StreamWriter");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the value type `System.DateTime`, the wall-clock
-    /// struct backing the `SystemTime` PAL hook.
-    #[must_use]
-    pub fn datetime(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = asm.alloc_string("System.DateTime");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        // value type: instance calls take a managed `this` pointer.
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
-    }
-    /// Returns a reference to the class `System.Numerics.BitOperations`
-    #[must_use]
-    pub fn bit_operations(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name: Interned<IString> = asm.alloc_string("System.Numerics.BitOperations");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the class `System.Buffers.Binary.BinaryPrimitives`
-    #[must_use]
-    pub fn binary_primitives(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name: Interned<IString> = asm.alloc_string("System.Buffers.Binary.BinaryPrimitives");
-        let asm_name = Some(asm.alloc_string("System.Memory"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [].into()))
-    }
-    /// Returns a reference to the class `System.MidpointRounding`
-    #[must_use]
-    pub fn midpoint_rounding(asm: &mut Assembly) -> Interned<ClassRef> {
-        let name: Interned<IString> = asm.alloc_string("System.MidpointRounding");
-        let asm_name = Some(asm.alloc_string("System.Runtime"));
-        asm.alloc_class_ref(ClassRef::new(name, asm_name, true, [].into()))
     }
     #[must_use]
     pub fn fixed_array(element: Type, length: u64, asm: &mut Assembly) -> Interned<ClassRef> {
@@ -828,6 +189,9 @@ impl ClassRef {
         ))
     }
     // Returns a `System.Collections.Concurrent.ConcurrentDictionary` of key,value
+    // NOTE: kept hand-written (not folded into the `bcl_class!` table) because its
+    // signature takes `asm` LAST — unlike the span/thread_local family which take
+    // `asm` first — and hundreds of call-sites depend on that argument order.
     pub fn concurent_dictionary(key: Type, value: Type, asm: &mut Assembly) -> Interned<ClassRef> {
         let name: Interned<IString> =
             asm.alloc_string("System.Collections.Concurrent.ConcurrentDictionary");
@@ -835,6 +199,7 @@ impl ClassRef {
         asm.alloc_class_ref(ClassRef::new(name, asm_name, false, [key, value].into()))
     }
     // Returns a `System.Collections.Generic.Dictionary` of key,value
+    // NOTE: kept hand-written for the same `asm`-last reason as `concurent_dictionary`.
     pub fn dictionary(key: Type, value: Type, asm: &mut Assembly) -> Interned<ClassRef> {
         let name: Interned<IString> = asm.alloc_string("System.Collections.Generic.Dictionary");
         let asm_name = Some(asm.alloc_string("System.Collections"));
@@ -843,6 +208,346 @@ impl ClassRef {
 
     pub fn set_generics(&mut self, generics: Vec<Type>) {
         self.generics = generics.into();
+    }
+}
+// The bulk of the `ClassRef` BCL-type constructors are near-identical one-liners
+// (name string + assembly string + valuetype flag, sometimes a generic arg), so
+// they are generated from a table by `bcl_class!`. The generated functions have
+// exactly the same names/signatures as before (`ClassRef::double(asm)`, …), so
+// every call-site across the repo is unchanged. `value`/`class` is the valuetype
+// flag; the assembly string defaults to `"System.Runtime"` (used by most rows)
+// and is given explicitly only when it differs. Load-bearing doc-comments are
+// preserved verbatim above their rows. The handful of helpers whose bodies are
+// not pure table rows (`fixed_array`, which formats its name; `ctor`/`instance`/
+// `static_mref`/… instance helpers; the accessors) stay hand-written above.
+crate::bcl_class! {
+    impl ClassRef {
+        interlocked => "System.Threading.Interlocked", "System.Threading", class;
+        /// The .NET math class
+        math => "System.Math", class;
+        /// Retusn a reference to the class `System.Double`
+        // `System.Double` is a .NET value type. It MUST be referenced as `valuetype`
+        // (not `class`) in IL, or any call whose declaring type is `System.Double`
+        // (e.g. `MinNumber`/`MaxNumber`/`Max`/`Min`/`FusedMultiplyAdd`/`Pow`) makes the
+        // runtime reject the type-load with `TypeLoadException: ... value type mismatch`.
+        double => "System.Double", value;
+        /// Retusn a reference to the class `System.Single`
+        // `System.Single` is a .NET value type — see `double` above.
+        single => "System.Single", value;
+        /// Returns a reference to the class `System.MathF`
+        #[must_use]
+        mathf => "System.MathF", class;
+        /// Returns a reference to the `System.UInt128` type.
+        uint_128 => "System.UInt128", value;
+        /// Returns a reference to the `System.Int128` type.
+        int_128 => "System.Int128", value;
+        /// Returns a reference to the `System.UIntPtr` type.
+        usize_type => "System.UIntPtr", value;
+        /// Returns a reference to the `System.UInt16` type.
+        uint16 => "System.UInt16", value;
+        /// Returns a reference to the `System.Int16` type.
+        int16 => "System.Int16", value;
+        /// Returns a reference to the `System.UInt32` type.
+        uint32 => "System.UInt32", value;
+        /// Returns a reference to the `System.Int32` type.
+        int32 => "System.Int32", value;
+        /// Returns a reference to the `System.UInt64` type.
+        uint64 => "System.UInt64", value;
+        /// Returns a reference to the `System.Int64` type.
+        int64 => "System.Int64", value;
+        /// Returns a reference to the `System.IntPtr` type.
+        isize_type => "System.IntPtr", value;
+        /// Returns a reference to the `System.Half` type.
+        half => "System.Half", value;
+        /// Returns a reference to the `System.Byte` type.
+        byte => "System.Byte", value;
+        /// Returns a reference to the `System.SByte` type.
+        sbyte => "System.SByte", value;
+        /// Returns a reference to the GC handle class.
+        gc_handle => "System.Runtime.InteropServices.GCHandle", value;
+        /// Returns a reference to the `System.String`
+        string => "System.String", class;
+        /// Returns a reference to the `System.Object`
+        object => "System.Object", class;
+        /// Returns a reference to the `System.Threading.Thread`
+        thread => "System.Threading.Thread", "System.Threading.Thread", class;
+        /// Returns a reference to the `System.Threading.ThreadStart`
+        thread_start => "System.Threading.ThreadStart", "System.Threading.Thread", class;
+        /// Returns a reference to the `System.Threading.SemaphoreSlim`
+        // SemaphoreSlim physically lives in System.Private.CoreLib; method bodies
+        // must name the IMPL assembly (the runtime resolves it directly), while
+        // `ref_assembly_name` normalizes it to System.Runtime in the C#-visible
+        // metadata. Naming `System.Runtime` here makes the body's
+        // `[System.Runtime]SemaphoreSlim` unresolvable at run time (TypeLoadException).
+        semaphore_slim => "System.Threading.SemaphoreSlim", "System.Private.CoreLib", class;
+        /// Returns a reference to `System.Threading.ThreadLocal<T>` instantiated at
+        /// element type `element` (e.g. `System.Threading.ThreadLocal<nint>`).
+        ///
+        /// Backs the dotnet PAL's per-thread thread-local storage (Slice 2): each
+        /// `thread_local!` TLS key is one `ThreadLocal<IntPtr>` whose `.Value` is
+        /// per-thread BY CONSTRUCTION. A reference type (generic arity 1).
+        ///
+        /// ASM-NAME LESSON (same as `semaphore_slim`): `ThreadLocal<T>` physically
+        /// lives in `System.Private.CoreLib`; method-BODY type references must name
+        /// the IMPL assembly so the runtime resolves it directly. Naming
+        /// `System.Runtime` here makes the body's `[System.Runtime]ThreadLocal\`1`
+        /// unresolvable at run time (TypeLoadException); `ref_assembly_name`
+        /// normalizes CoreLib -> System.Runtime only in C#-visible metadata.
+        thread_local => "System.Threading.ThreadLocal", "System.Private.CoreLib", class, generics(element);
+        /// Returns a reference to the `System.Type`
+        type_type => "System.Type", class;
+        /// Returns a reference to the `System.RuntimeTypeHandle`
+        runtime_type_hadle => "System.RuntimeTypeHandle", value;
+        /// Returns a reference to the `System.String`
+        exception => "System.Exception", class;
+        /// Returns a reference to the `System.Console`
+        console => "System.Console", "System.Console", class;
+        /// Returns a reference to the class `System.Collections.IDictionaryEnumerator`
+        #[must_use]
+        dictionary_iterator => "System.Collections.IDictionaryEnumerator", class;
+        /// Returns a reference to the class `System.Collections.IEnumerator`
+        #[must_use]
+        i_enumerator => "System.Collections.IEnumerator", class;
+        /// Returns a reference to the class `System.Collections.IDictionary`
+        #[must_use]
+        i_dictionary => "System.Collections.IDictionary", class;
+        /// Returns a reference to the class `System.Collections.ICollection`
+        #[must_use]
+        i_collection => "System.Collections.ICollection", class;
+        /// Returns a reference to the class `System.Environment`
+        #[must_use]
+        enviroment => "System.Environment", class;
+        /// Returns a reference to the class `System.Runtime.InteropServices.Marshal`
+        #[must_use]
+        marshal => "System.Runtime.InteropServices.Marshal", "System.Runtime.InteropServices", class;
+        /// Returns a reference to the class `System.Collections.DictionaryEntry`
+        #[must_use]
+        dictionary_entry => "System.Collections.DictionaryEntry", value;
+        /// Returns a reference to the class `System.Runtime.InteropServices.NativeMemory`
+        #[must_use]
+        native_mem => "System.Runtime.InteropServices.NativeMemory", "System.Runtime.InteropServices", class;
+        /// Returns a reference to `System.Span<T>` instantiated at element type
+        /// `element` (a value type, e.g. `System.Span<uint8>`).
+        #[must_use]
+        span => "System.Span", value, generics(element);
+        /// Returns a reference to `System.ReadOnlySpan<T>` instantiated at element
+        /// type `element` (a value type, e.g. `System.ReadOnlySpan<uint8>`). Backs
+        /// `FileStream.Write(ReadOnlySpan<byte>)` in the dotnet fs PAL arm.
+        #[must_use]
+        read_only_span => "System.ReadOnlySpan", value, generics(element);
+        /// Returns a reference to the class `System.IO.FileStream`, the open-file
+        /// handle backing the dotnet `fs` PAL arm (Read/Write/Seek/Flush/Dispose/
+        /// get_Length).
+        #[must_use]
+        file_stream => "System.IO.FileStream", class;
+        /// Returns a reference to the static class `System.IO.File`
+        /// (Delete/Move/Exists/GetAttributes) for the dotnet `fs` PAL arm.
+        #[must_use]
+        file => "System.IO.File", class;
+        /// Returns a reference to the static class `System.IO.Directory`
+        /// (CreateDirectory/Delete/Exists/GetFileSystemEntries) for the dotnet `fs`
+        /// PAL arm.
+        #[must_use]
+        directory => "System.IO.Directory", class;
+        /// Returns a reference to the static class `System.IO.RandomAccess`
+        /// (`Read(SafeFileHandle, Span<byte>, long)` / `Write(SafeFileHandle,
+        /// ReadOnlySpan<byte>, long)`) — the offset-relative file I/O backing the
+        /// dotnet `fs` PAL `read_at`/`write_at` (B2 Piece 3). A reference type.
+        #[must_use]
+        random_access => "System.IO.RandomAccess", class;
+        /// Returns a reference to the class
+        /// `Microsoft.Win32.SafeHandles.SafeFileHandle` — `RandomAccess.{Read,Write}`
+        /// take this rather than a `FileStream`; the fs PAL bridges via the
+        /// `FileStream.SafeFileHandle` getter (B2 Piece 3). A reference type.
+        #[must_use]
+        safe_file_handle => "Microsoft.Win32.SafeHandles.SafeFileHandle", class;
+        /// Returns a reference to the abstract class `System.IO.FileSystemInfo` — the
+        /// return type of `File.CreateSymbolicLink`/`File.ResolveLinkTarget`; the fs
+        /// PAL reads its `FullName` to recover a `readlink` target (B2 Piece 4). A
+        /// reference type.
+        #[must_use]
+        file_system_info => "System.IO.FileSystemInfo", class;
+        /// Returns a reference to the static class `System.IO.Path`
+        /// (`GetTempPath`) for the dotnet `paths` PAL arm (PACKAGE A).
+        #[must_use]
+        path_io => "System.IO.Path", class;
+        /// Returns a reference to the class `System.IO.FileInfo`
+        /// (`new FileInfo(string).get_Length`) for sizing files in the dotnet `fs`
+        /// PAL arm.
+        #[must_use]
+        file_info => "System.IO.FileInfo", class;
+        /// Returns a reference to the int-backed enum `System.IO.FileMode` (a value
+        /// type) — needed so `new FileStream(string, FileMode, FileAccess)` resolves
+        /// to a real BCL ctor (an `int32` would not match the parameter type).
+        #[must_use]
+        file_mode => "System.IO.FileMode", value;
+        /// Returns a reference to the int-backed enum `System.IO.FileAccess` (a value
+        /// type) — paired with [`Self::file_mode`] for the `FileStream` ctor.
+        #[must_use]
+        file_access => "System.IO.FileAccess", value;
+        /// Returns a reference to the int-backed enum `System.IO.SeekOrigin` (a value
+        /// type) — for `FileStream.Seek(long, SeekOrigin)`.
+        #[must_use]
+        seek_origin => "System.IO.SeekOrigin", value;
+        /// Returns a reference to the int-backed `[Flags]` enum `System.IO.FileAttributes`
+        /// (a value type) — for `File.{Get,Set}Attributes`, backing the dotnet `fs` PAL
+        /// `set_perm` (the read-only bit; `ReadOnly = 1`, `Normal = 128`).
+        #[must_use]
+        file_attributes => "System.IO.FileAttributes", value;
+        /// Returns a reference to the class `System.Net.Sockets.Socket`, the open
+        /// socket handle backing the dotnet `net` PAL arm (Bind/Listen/Accept/
+        /// Connect/Send/Receive/SendTo/ReceiveFrom/Shutdown/Dispose +
+        /// LocalEndPoint/RemoteEndPoint). Physically lives in `System.Net.Sockets.dll`,
+        /// but — exactly like the `System.IO.*` fs helpers — we name the assembly
+        /// `System.Net.Sockets` (its real impl assembly — unlike the `System.IO.*` fs
+        /// helpers, CoreCLR does NOT type-forward `System.Net.*` from `System.Runtime`,
+        /// so the net helpers must name their physical assemblies). `Socket`,
+        /// `SocketType`, `ProtocolType` and `SocketShutdown` live in
+        /// `System.Net.Sockets`; `IPAddress`/`IPEndPoint`/`EndPoint`/`AddressFamily`
+        /// live in `System.Net.Primitives`. The exe path resolves these simple-name
+        /// extern refs leniently at runtime.
+        #[must_use]
+        socket => "System.Net.Sockets.Socket", "System.Net.Sockets", class;
+        /// Returns a reference to the int-backed enum `System.Net.Sockets.SocketShutdown`
+        /// (a value type) — for `Socket.Shutdown(SocketShutdown)` in the dotnet `net`
+        /// PAL arm. In `System.Net.Sockets`.
+        #[must_use]
+        socket_shutdown => "System.Net.Sockets.SocketShutdown", "System.Net.Sockets", value;
+        /// Returns a reference to `System.Net.Sockets.SocketException` — the exception
+        /// the BCL throws on a socket fault. The POSIX shim's errno translation
+        /// (`map_socket_exception_to_errno`) reads its `SocketErrorCode` to derive a
+        /// POSIX errno. A reference type (not a value type). In `System.Net.Sockets`
+        /// (well, `System.Net.Primitives`, but the exe path resolves the simple-name
+        /// extern ref leniently at runtime, exactly like the other net classes).
+        #[must_use]
+        socket_exception => "System.Net.Sockets.SocketException", "System.Net.Primitives", class;
+        /// Returns a reference to `System.IO.FileNotFoundException` — thrown by the
+        /// BCL when a file path does not exist (e.g. `new FileStream` on a missing
+        /// file). The fs errno mapper (`rcl_errno_from_exception`) maps it to
+        /// `ENOENT`. HOST-AGNOSTIC: the exception type is thrown identically on
+        /// Unix-host and Windows-host CoreCLR. A reference type, in `System.Runtime`.
+        #[must_use]
+        file_not_found_exception => "System.IO.FileNotFoundException", class;
+        /// Returns a reference to `System.IO.DirectoryNotFoundException` — thrown by
+        /// the BCL when a directory in a path does not exist. Maps to `ENOENT`.
+        /// HOST-AGNOSTIC. A reference type, in `System.Runtime`.
+        #[must_use]
+        directory_not_found_exception => "System.IO.DirectoryNotFoundException", class;
+        /// Returns a reference to `System.UnauthorizedAccessException` (note: in the
+        /// `System` namespace, NOT `System.IO`; it derives from `SystemException`, NOT
+        /// `IOException`) — thrown by the BCL on a permission/ACL denial. Maps to
+        /// `EACCES`. HOST CAVEAT: the *mapping* is host-agnostic, but the *meaning* of
+        /// EACCES (rwx/uid/gid) is only faithful on a Unix host; a Windows-host
+        /// CoreCLR throws this for ACL denials too and has no POSIX permission model,
+        /// so PermissionDenied fidelity is Unix-host-best-effort. A reference type, in
+        /// `System.Runtime`.
+        #[must_use]
+        unauthorized_access_exception => "System.UnauthorizedAccessException", class;
+        /// Returns a reference to `System.IO.PathTooLongException` — thrown by the BCL
+        /// when a path exceeds the platform limit. Maps to `ENAMETOOLONG`.
+        /// HOST-AGNOSTIC. A reference type, in `System.Runtime`.
+        #[must_use]
+        path_too_long_exception => "System.IO.PathTooLongException", class;
+        /// Returns a reference to the int-backed enum `System.Net.Sockets.SocketError`
+        /// (a value type) — the type returned by `SocketException.SocketErrorCode`. The
+        /// errno translation reads it (as its underlying i32) to derive a POSIX errno.
+        /// Must be the enum type, not raw i32: the CLR matches the property's signature
+        /// EXACTLY (`SocketError get_SocketErrorCode()`), so an i32 return type yields a
+        /// runtime `MissingMethodException`. In `System.Net.Primitives`.
+        #[must_use]
+        socket_error => "System.Net.Sockets.SocketError", "System.Net.Primitives", value;
+        /// Returns a reference to the int-backed enum `System.Net.Sockets.SelectMode`
+        /// (a value type) — selects the readiness mode (SelectRead=0 / SelectWrite=1 /
+        /// SelectError=2) for `Socket.Poll(int microSeconds, SelectMode)` in the dotnet
+        /// mio PAL arm (the readiness multiplexer behind mio's Selector). In
+        /// `System.Net.Sockets`.
+        #[must_use]
+        select_mode => "System.Net.Sockets.SelectMode", "System.Net.Sockets", value;
+        /// Returns a reference to the int-backed enum `System.Net.Sockets.AddressFamily`
+        /// (a value type) — selects IPv4/IPv6 for `new Socket(AddressFamily, …)` in the
+        /// dotnet `net` PAL arm. In `System.Net.Primitives` (NOT `System.Net.Sockets`).
+        #[must_use]
+        address_family => "System.Net.Sockets.AddressFamily", "System.Net.Primitives", value;
+        /// Returns a reference to the int-backed enum `System.Net.Sockets.SocketType`
+        /// (a value type) — Stream/Dgram for `new Socket(…, SocketType, …)`. In
+        /// `System.Net.Sockets`.
+        #[must_use]
+        socket_type => "System.Net.Sockets.SocketType", "System.Net.Sockets", value;
+        /// Returns a reference to the int-backed enum `System.Net.Sockets.ProtocolType`
+        /// (a value type) — Tcp/Udp for `new Socket(…, …, ProtocolType)`. In
+        /// `System.Net.Sockets`.
+        #[must_use]
+        protocol_type => "System.Net.Sockets.ProtocolType", "System.Net.Sockets", value;
+        /// Returns a reference to the class `System.Net.IPAddress` (the IP-address
+        /// value carried in an `IPEndPoint`) for the dotnet `net` PAL arm. Built from
+        /// network-order octets via `new IPAddress(ReadOnlySpan<byte>)`. In
+        /// `System.Net.Primitives`.
+        #[must_use]
+        ip_address => "System.Net.IPAddress", "System.Net.Primitives", class;
+        /// Returns a reference to the class `System.Net.IPEndPoint` (an IPAddress +
+        /// port) for the dotnet `net` PAL arm. Never crosses the Rust ABI — it is
+        /// built/read entirely BCL-side from the decomposed `(family, ip, port)`. In
+        /// `System.Net.Primitives`.
+        #[must_use]
+        ip_endpoint => "System.Net.IPEndPoint", "System.Net.Primitives", class;
+        /// Returns a reference to the abstract base class `System.Net.EndPoint` — the
+        /// declared return type of `Socket.LocalEndPoint`/`RemoteEndPoint` and the
+        /// `ref` seed type of `Socket.ReceiveFrom`, downcast to `IPEndPoint`
+        /// BCL-side in the dotnet `net` PAL arm. In `System.Net.Primitives`.
+        #[must_use]
+        endpoint => "System.Net.EndPoint", "System.Net.Primitives", class;
+        /// Returns a reference to the class
+        /// `System.Net.Sockets.UnixDomainSocketEndPoint` — the `EndPoint` subclass
+        /// for path-based AF_UNIX sockets (`new UnixDomainSocketEndPoint(string)`),
+        /// upcast to `EndPoint` for `Socket.Bind`/`Connect` exactly like `IPEndPoint`
+        /// (B2 Piece 1). A reference type. In `System.Net.Sockets` (NOT Primitives).
+        #[must_use]
+        unix_domain_socket_endpoint => "System.Net.Sockets.UnixDomainSocketEndPoint", "System.Net.Sockets", class;
+        /// Returns a reference to the class
+        /// `System.Security.Cryptography.RandomNumberGenerator`.
+        #[must_use]
+        random_number_generator => "System.Security.Cryptography.RandomNumberGenerator", "System.Security.Cryptography", class;
+        /// Returns a reference to the class `System.Diagnostics.Stopwatch`, the
+        /// monotonic high-resolution timer backing the `Instant` PAL hooks.
+        #[must_use]
+        stopwatch => "System.Diagnostics.Stopwatch", "System.Runtime.Extensions", class;
+        /// Returns a reference to `System.Diagnostics.ProcessStartInfo` — the spawn
+        /// recipe (FileName/Arguments/WorkingDirectory/Redirect*) for the dotnet
+        /// `process` PAL arm. A reference type in assembly `System.Diagnostics.Process`.
+        #[must_use]
+        process_start_info => "System.Diagnostics.ProcessStartInfo", "System.Diagnostics.Process", class;
+        /// Returns a reference to `System.Diagnostics.Process` — a spawned child
+        /// (Start/WaitForExit/ExitCode/Id/Kill/HasExited) for the dotnet `process`
+        /// PAL arm. A reference type in assembly `System.Diagnostics.Process`.
+        #[must_use]
+        process => "System.Diagnostics.Process", "System.Diagnostics.Process", class;
+        /// Returns a reference to the abstract class `System.IO.Stream` — the raw byte
+        /// stream backing a child's redirected stdout/stderr/stdin (`Read`/`Write`/
+        /// `Dispose`) for the dotnet `process` capture path. A reference type.
+        #[must_use]
+        stream => "System.IO.Stream", class;
+        /// Returns a reference to `System.IO.StreamReader` — `Process.StandardOutput`/
+        /// `StandardError`; the PAL reads its `BaseStream` for raw child output.
+        #[must_use]
+        stream_reader => "System.IO.StreamReader", class;
+        /// Returns a reference to `System.IO.StreamWriter` — `Process.StandardInput`;
+        /// the PAL writes its `BaseStream` for raw child input.
+        #[must_use]
+        stream_writer => "System.IO.StreamWriter", class;
+        /// Returns a reference to the value type `System.DateTime`, the wall-clock
+        /// struct backing the `SystemTime` PAL hook.
+        #[must_use]
+        // value type: instance calls take a managed `this` pointer.
+        datetime => "System.DateTime", value;
+        /// Returns a reference to the class `System.Numerics.BitOperations`
+        #[must_use]
+        bit_operations => "System.Numerics.BitOperations", class;
+        /// Returns a reference to the class `System.Buffers.Binary.BinaryPrimitives`
+        #[must_use]
+        binary_primitives => "System.Buffers.Binary.BinaryPrimitives", "System.Memory", class;
+        /// Returns a reference to the class `System.MidpointRounding`
+        #[must_use]
+        midpoint_rounding => "System.MidpointRounding", value;
     }
 }
 #[derive(Hash, Eq, Clone, Debug, Serialize, Deserialize)]
