@@ -4,7 +4,7 @@ use crate::utilis::{
     INTEROP_METHOD_GENERIC_TPE_NAME, INTEROP_STRUCT_TPE_NAME, INTEROP_TYPE_GENERIC_TPE_NAME, is_zst,
     try_resolve_const_size,
 };
-use crate::utilis::{garag_to_usize, garg_to_string, pointer_to_is_fat, tuple_name};
+use crate::utilis::{garg_to_usize, garg_to_string, pointer_to_is_fat, tuple_name};
 use crate::{
     GetTypeExt,
     utilis::{adt_name, stable_adt_name},
@@ -367,7 +367,7 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                     );
                     let element = &subst[0].as_type().expect("Array type must be specified!");
                     let element = get_type(ctx.monomorphize(*element), ctx);
-                    let dimensions = garag_to_usize(subst[1], ctx.tcx());
+                    let dimensions = garg_to_usize(subst[1], ctx.tcx());
                     Type::PlatformArray {
                         elem: ctx.alloc_type(element),
                         dims: std::num::NonZeroU8::new(dimensions.try_into().unwrap()).unwrap(),
@@ -399,14 +399,14 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                 } else if item_name == INTEROP_TYPE_GENERIC_TPE_NAME {
                     // Lowers to the .NET *class* generic parameter `!N` (a method-definition-shape
                     // marker used when calling a method on a generic instantiation).
-                    let n = garag_to_usize(subst[0], ctx.tcx());
+                    let n = garg_to_usize(subst[0], ctx.tcx());
                     Type::PlatformGeneric(
                         u32::try_from(n).expect("class generic index over 2^32"),
                         GenericKind::TypeGeneric,
                     )
                 } else if item_name == INTEROP_METHOD_GENERIC_TPE_NAME {
                     // Lowers to the .NET *method* generic parameter `!!N`.
-                    let n = garag_to_usize(subst[0], ctx.tcx());
+                    let n = garg_to_usize(subst[0], ctx.tcx());
                     Type::PlatformGeneric(
                         u32::try_from(n).expect("method generic index over 2^32"),
                         GenericKind::CallGeneric,

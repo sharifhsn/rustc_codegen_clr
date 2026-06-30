@@ -27,7 +27,7 @@ use rustc_middle::mir::{Rvalue, StatementKind, TerminatorKind};
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{Instance, TyKind, TypingEnv};
 
-use crate::utilis::garag_to_bool;
+use crate::utilis::garg_to_bool;
 
 /// A `.NET` class being described, accumulated as plain data (no interning) until `finish_type`.
 #[derive(Clone)]
@@ -120,7 +120,7 @@ pub fn interpret<'tcx>(
 
                 let result = if fname.contains("rustc_codegen_clr_new_typedef") {
                     let name = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
-                    let is_value_type = garag_to_bool(subst_ref[1], ctx.tcx());
+                    let is_value_type = garg_to_bool(subst_ref[1], ctx.tcx());
                     let superclass_asm = garg_to_string(subst_ref[2], ctx.tcx()).replace("::", ".");
                     let superclass_name = garg_to_string(subst_ref[3], ctx.tcx()).replace("::", ".");
                     let superclass = if superclass_name.is_empty() {

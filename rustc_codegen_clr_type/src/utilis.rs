@@ -38,7 +38,7 @@ pub fn is_name_magic(name: &str) -> bool {
     name.contains("RustcCLRInteropManaged")
 }
 #[must_use]
-pub fn garag_to_usize<'tcx>(garg: GenericArg<'tcx>, _ctx: TyCtxt<'tcx>) -> u64 {
+pub fn garg_to_usize<'tcx>(garg: GenericArg<'tcx>, _ctx: TyCtxt<'tcx>) -> u64 {
     let usize_const = garg
         .as_const()
         .expect("Generic argument was not an constant!");

@@ -74,7 +74,7 @@ pub fn variant_name(ty: Ty, idx: u32) -> crate::IString {
 }
 
 /// Converts a generic argument to a boolean, and panics if it could not.
-pub fn garag_to_bool<'tcx>(garg: GenericArg<'tcx>, _ctx: TyCtxt<'tcx>) -> bool {
+pub fn garg_to_bool<'tcx>(garg: GenericArg<'tcx>, _ctx: TyCtxt<'tcx>) -> bool {
     let usize_const = garg
         .as_const()
         .expect("Generic argument was not an constant!");

@@ -2,7 +2,7 @@ use crate::{
     assembly::MethodCompileCtx,
     interop::AssemblyRef,
     utilis::{
-        garag_to_bool, CTOR_FN_NAME, GENERIC_CALL_FN_NAME, GENERIC_CTOR_FN_NAME,
+        garg_to_bool, CTOR_FN_NAME, GENERIC_CALL_FN_NAME, GENERIC_CTOR_FN_NAME,
         MANAGED_CALL_FN_NAME, MANAGED_CALL_VIRT_FN_NAME, MANAGED_CHECKED_CAST, MANAGED_IS_INST,
         MANAGED_LD_ELEM_REF, MANAGED_LD_LEN, MANAGED_LD_NULL, MANAGED_NEW_ARR, MANAGED_SET_ELEM,
         MANAGED_THROW, MANAGED_TRY_CATCH,
@@ -10,7 +10,7 @@ use crate::{
 };
 use cilly::{
     cilnode::{ExtendKind, IsPure, MethodKind},
-    BinOp, ClassRef, Const, FieldDesc, FnSig, Int, Interned, IntoAsmIndex,
+    BinOp, ClassRef, Const, FieldDesc, FnSig, IString, Int, Interned, IntoAsmIndex,
 };
 use cilly::tpe::GenericKind;
 use cilly::{MethodRef, Type};
@@ -18,7 +18,7 @@ use rustc_codegen_clr_call::CallInfo;
 use rustc_codegen_clr_ctx::function_name;
 use rustc_codegen_clr_place::place_set;
 use rustc_codegen_clr_type::{
-    utilis::{garag_to_usize, garg_to_string},
+    utilis::{garg_to_usize, garg_to_string},
     GetTypeExt,
 };
 use rustc_codgen_clr_operand::{handle_operand, operand_address};
@@ -39,6 +39,35 @@ fn argc_from_fn_name(function_name: &str, prefix: &str) -> u32 {
     let argument_count = &function_name[argc_start..argc_end];
     argument_count.parse::<u32>().unwrap()
 }
+/// The common `<ASSEMBLY, CLASS_PATH, IS_VALUETYPE>` prefix shared by every interop magic-fn's
+/// generic-argument list (`subst[0..3]`). Every managed-call/ctor path — `call_managed`,
+/// `callvirt_managed`, `call_generic`, `ctor_generic`, `call_ctor` — names the target .NET class the
+/// same way, so this header is decoded once instead of repeating the position-0/1/2 reads in each (the
+/// off-by-one-prone manual indexing was duplicated nearly verbatim five times). The per-fn trailing
+/// positional reads (`subst[3..]`) stay where they are.
+struct InteropHeader {
+    /// The containing assembly, or `None` when the class lives in the assembly being compiled.
+    asm: Option<Interned<IString>>,
+    /// The interned, demangled .NET class path (e.g. `System.Collections.Generic.List`).
+    class_name: Interned<IString>,
+    /// Whether the target is a value type (`true`) or a reference type (`false`).
+    is_vt: bool,
+}
+impl InteropHeader {
+    /// Decode `subst[0]`=assembly, `subst[1]`=class path, `subst[2]`=is-valuetype.
+    fn decode<'tcx>(subst: &[GenericArg<'tcx>], ctx: &mut MethodCompileCtx<'tcx, '_>) -> Self {
+        let asm = AssemblyRef::decode_assembly_ref(subst[0], ctx.tcx());
+        let asm = asm.name().map(|name| ctx.alloc_string(name));
+        let class_name = garg_to_string(subst[1], ctx.tcx());
+        let class_name = ctx.alloc_string(class_name);
+        let is_vt = garg_to_bool(subst[2], ctx.tcx());
+        Self {
+            asm,
+            class_name,
+            is_vt,
+        }
+    }
+}
 /// Calls a non-virtual managed function(used for interop)
 fn call_managed<'tcx>(
     subst_ref: &[GenericArg<'tcx>],
@@ -52,11 +81,11 @@ fn call_managed<'tcx>(
     //FIXME: figure out the proper argc.
     //assert!(subst_ref.len() as u32 == argc + 3 || subst_ref.len() as u32 == argc + 4);
     assert!(args.len() == argument_count as usize);
-    let asm = AssemblyRef::decode_assembly_ref(subst_ref[0], ctx.tcx());
-    let asm = asm.name().map(|name| ctx.alloc_string(name));
-    let class_name = garg_to_string(subst_ref[1], ctx.tcx());
-    let class_name = ctx.alloc_string(class_name);
-    let is_valuetype = garag_to_bool(subst_ref[2], ctx.tcx());
+    let InteropHeader {
+        asm,
+        class_name,
+        is_vt: is_valuetype,
+    } = InteropHeader::decode(subst_ref, ctx);
     let managed_fn_name = garg_to_string(subst_ref[3], ctx.tcx());
     let tpe = ClassRef::new(class_name, asm, is_valuetype, [].into());
 
@@ -87,7 +116,7 @@ fn call_managed<'tcx>(
             place_set(destination, call, ctx)
         }
     } else {
-        let is_static = garag_to_bool(subst_ref[4], ctx.tcx());
+        let is_static = garg_to_bool(subst_ref[4], ctx.tcx());
 
         let mut call_args = Vec::new();
         for arg in args {
@@ -138,11 +167,11 @@ fn callvirt_managed<'tcx>(
     assert!(
         u32::try_from(args.len()).expect("More than 2^32 function arguments.") == argument_count
     );
-    let asm = AssemblyRef::decode_assembly_ref(subst_ref[0], ctx.tcx());
-    let asm = asm.name().map(|name| ctx.alloc_string(name));
-    let class_name = garg_to_string(subst_ref[1], ctx.tcx());
-    let class_name = ctx.alloc_string(class_name);
-    let is_valuetype = garag_to_bool(subst_ref[2], ctx.tcx());
+    let InteropHeader {
+        asm,
+        class_name,
+        is_vt: is_valuetype,
+    } = InteropHeader::decode(subst_ref, ctx);
 
     let managed_fn_garg = &subst_ref[3];
     let managed_fn_garg = ctx.monomorphize(*managed_fn_garg);
@@ -170,7 +199,7 @@ fn callvirt_managed<'tcx>(
             place_set(destination, node, ctx)
         }
     } else {
-        let is_static = garag_to_bool(subst_ref[4], ctx.tcx());
+        let is_static = garg_to_bool(subst_ref[4], ctx.tcx());
 
         let mut call_args = Vec::new();
         for arg in args {
@@ -280,14 +309,14 @@ fn call_generic<'tcx>(
     destination: &Place<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Root {
-    let asm = AssemblyRef::decode_assembly_ref(subst_ref[0], ctx.tcx());
-    let asm = asm.name().map(|name| ctx.alloc_string(name));
-    let class_name = garg_to_string(subst_ref[1], ctx.tcx());
-    let class_name = ctx.alloc_string(class_name);
-    let is_valuetype = garag_to_bool(subst_ref[2], ctx.tcx());
+    let InteropHeader {
+        asm,
+        class_name,
+        is_vt: is_valuetype,
+    } = InteropHeader::decode(subst_ref, ctx);
     let managed_fn_name = garg_to_string(subst_ref[3], ctx.tcx());
     let managed_fn_name = ctx.alloc_string(managed_fn_name);
-    let kind = garag_to_usize(subst_ref[4], ctx.tcx());
+    let kind = garg_to_usize(subst_ref[4], ctx.tcx());
     // Concrete .NET type arguments of the class instantiation (e.g. the `(i32,)` of `List<i32>`).
     let class_generics = tuple_garg_to_types(subst_ref[5], ctx);
     // Definition-shape method signature: `(output, explicit-input0, …)` with `!N`/`!!N` markers.
@@ -358,11 +387,11 @@ fn ctor_generic<'tcx>(
     destination: &Place<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Root {
-    let asm = AssemblyRef::decode_assembly_ref(subst_ref[0], ctx.tcx());
-    let asm = asm.name().map(|name| ctx.alloc_string(name));
-    let class_name = garg_to_string(subst_ref[1], ctx.tcx());
-    let class_name = ctx.alloc_string(class_name);
-    let is_valuetype = garag_to_bool(subst_ref[2], ctx.tcx());
+    let InteropHeader {
+        asm,
+        class_name,
+        is_vt: is_valuetype,
+    } = InteropHeader::decode(subst_ref, ctx);
     let class_generics = tuple_garg_to_types(subst_ref[3], ctx);
     // The ctor signature tuple is `(ignored-return, explicit-input0, …)`. A `.ctor` methodref returns
     // void; only the explicit inputs matter. (The first slot keeps the `Sig` tuple shape uniform with
@@ -419,14 +448,15 @@ fn call_ctor<'tcx>(
     assert!(subst_ref.len() == argument_count as usize + 3);
     // Check that a proper number of arguments is used
     assert!(args.len() == argument_count as usize);
-    // Get the name of the assembly the constructed object resides in
-    let asm = AssemblyRef::decode_assembly_ref(subst_ref[0], ctx.tcx());
-    let asm = asm.name().map(|name| ctx.alloc_string(name));
-    // Get the name of the constructed object
-    let class_name = garg_to_string(subst_ref[1], ctx.tcx());
-    let class_name = ctx.alloc_string(class_name);
-    // Check if the costructed object is valuetype. TODO: this may be unnecesary. Are valuetpes constructed using newobj?
-    let is_valuetype = garag_to_bool(subst_ref[2], ctx.tcx());
+    // Decode the `<assembly, class path, is-valuetype>` header (subst[0..3]):
+    // - the assembly the constructed object resides in,
+    // - the name of the constructed object,
+    // - whether the constructed object is a valuetype. TODO: this may be unnecesary. Are valuetpes constructed using newobj?
+    let InteropHeader {
+        asm,
+        class_name,
+        is_vt: is_valuetype,
+    } = InteropHeader::decode(subst_ref, ctx);
     let tpe = ClassRef::new(class_name, asm, is_valuetype, [].into());
     let tpe = ctx.alloc_class_ref(tpe);
     // If no arguments, inputs don't have to be handled, so a simpler call handling is used.
