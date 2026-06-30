@@ -23,6 +23,10 @@ pub use bindings::*;
 //   (The standalone `cargo_tests/slice_call_test` crate still `use`s `mycorrhiza::slice_bindings`;
 //    it is not a workspace member and is superseded by the full generated surface.)
 pub mod class;
+/// WF-9 generic-interop ergonomics macros (`dotnet_generic!` / `dotnet_generic_impl!` / `gen!`),
+/// which remove the hand-written `rustc_clr_interop_generic_*` turbofish boilerplate. The macros are
+/// `#[macro_export]`ed, so they are also reachable at the crate root (`mycorrhiza::dotnet_generic!`).
+pub mod generic_bridge;
 /// Very low-level interop stuff. Don't use unless you need to.
 pub mod intrinsics;
 use class::*;
