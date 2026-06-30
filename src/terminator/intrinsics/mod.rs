@@ -418,29 +418,16 @@ pub fn handle_intrinsic<'tcx>(
                 ctx,
             );
             let sum = if promoted.size() == Some(16) {
-                let main_module = ctx.main_module();
-                let op_mul = MethodRef::new(
-                    *main_module,
-                    ctx.alloc_string(format!("mul_{}", promoted.name())),
-                    ctx.sig(
-                        [Type::Int(promoted), Type::Int(promoted)],
-                        Type::Int(promoted),
-                    ),
-                    MethodKind::Static,
-                    vec![].into(),
+                let op_mul = ctx.static_mref(
+                    &format!("mul_{}", promoted.name()),
+                    [Type::Int(promoted), Type::Int(promoted)],
+                    Type::Int(promoted),
                 );
-                let op_add = MethodRef::new(
-                    *main_module,
-                    ctx.alloc_string(format!("add_{}", promoted.name())),
-                    ctx.sig(
-                        [Type::Int(promoted), Type::Int(promoted)],
-                        Type::Int(promoted),
-                    ),
-                    MethodKind::Static,
-                    vec![].into(),
+                let op_add = ctx.static_mref(
+                    &format!("add_{}", promoted.name()),
+                    [Type::Int(promoted), Type::Int(promoted)],
+                    Type::Int(promoted),
                 );
-                let op_mul = ctx.alloc_methodref(op_mul);
-                let op_add = ctx.alloc_methodref(op_add);
                 let mul = ctx.call(op_mul, &[mul_a, mul_b], IsPure::NOT);
                 let add = ctx.call(op_add, &[carry, addend], IsPure::NOT);
                 ctx.call(op_add, &[mul, add], IsPure::NOT)
@@ -450,18 +437,11 @@ pub fn handle_intrinsic<'tcx>(
                 ctx.biop(mul_carry, addend, cilly::BinOp::Add)
             };
             let ovf = if promoted.size() == Some(16) {
-                let main_module = ctx.main_module();
-                let op_div = MethodRef::new(
-                    *main_module,
-                    ctx.alloc_string(format!("div_{}", promoted.name())),
-                    ctx.sig(
-                        [Type::Int(promoted), Type::Int(promoted)],
-                        Type::Int(promoted),
-                    ),
-                    MethodKind::Static,
-                    vec![].into(),
+                let op_div = ctx.static_mref(
+                    &format!("div_{}", promoted.name()),
+                    [Type::Int(promoted), Type::Int(promoted)],
+                    Type::Int(promoted),
                 );
-                let op_div = ctx.alloc_methodref(op_div);
                 let divisor_const = ctx.alloc_node(1_u128 << (oint.size().unwrap_or(8) * 8));
                 let divisor = casts::int_to_int(
                     cilly::Type::Int(Int::U128),
@@ -515,14 +495,11 @@ pub fn handle_intrinsic<'tcx>(
             }
             let tpe = ctx.type_from_cache(tpe);
             let void_ptr = ctx.nptr(Type::Void);
-            let generic = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("swap_at_generic"),
-                ctx.sig([void_ptr, void_ptr, Type::Int(Int::USize)], Type::Void),
-                MethodKind::Static,
-                vec![].into(),
+            let generic = ctx.static_mref(
+                "swap_at_generic",
+                [void_ptr, void_ptr, Type::Int(Int::USize)],
+                Type::Void,
             );
-            let generic = ctx.alloc_methodref(generic);
             let arg0 = handle_operand(&args[0].node, ctx);
             let arg0 = ctx.cast_ptr_to(arg0, void_ptr);
             let arg1 = handle_operand(&args[1].node, ctx);
@@ -590,18 +567,11 @@ pub fn handle_intrinsic<'tcx>(
         "copysignf32" => float_binop(args, destination, ctx, Float::F32, "CopySign"),
         "copysignf64" => float_binop(args, destination, ctx, Float::F64, "CopySign"),
         "copysignf128" => {
-            let main_module = ctx.main_module();
-            let log = MethodRef::new(
-                *main_module,
-                ctx.alloc_string("copysignf128"),
-                ctx.sig(
-                    [Type::Float(Float::F128), Type::Float(Float::F128)],
-                    Float::F128,
-                ),
-                MethodKind::Static,
-                vec![].into(),
+            let log = ctx.static_mref(
+                "copysignf128",
+                [Type::Float(Float::F128), Type::Float(Float::F128)],
+                Type::Float(Float::F128),
             );
-            let log = ctx.alloc_methodref(log);
             let arg0 = handle_operand(&args[0].node, ctx);
             let arg1 = handle_operand(&args[1].node, ctx);
             let value = ctx.call(log, &[arg0, arg1], IsPure::NOT);
@@ -722,18 +692,12 @@ pub fn handle_intrinsic<'tcx>(
             let uint8_ptr = ctx.nptr(Type::Int(Int::U8));
             let try_ptr = ctx.sig([uint8_ptr], Type::Void);
             let catch_ptr = ctx.sig([uint8_ptr, uint8_ptr], Type::Void);
-            let catch_unwind = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("catch_unwind"),
-                ctx.sig(
-                    [Type::FnPtr(try_ptr), uint8_ptr, Type::FnPtr(catch_ptr)],
-                    Type::Int(Int::I32),
-                ),
-                MethodKind::Static,
-                vec![].into(),
+            let value = ctx.call_static(
+                "catch_unwind",
+                [Type::FnPtr(try_ptr), uint8_ptr, Type::FnPtr(catch_ptr)],
+                Type::Int(Int::I32),
+                &[try_fn, data_ptr, catch_fn],
             );
-            let catch_unwind = ctx.alloc_methodref(catch_unwind);
-            let value = ctx.call(catch_unwind, &[try_fn, data_ptr, catch_fn], IsPure::NOT);
             vec![place_set(destination, value, ctx)]
         }
         "abort" => vec![ctx.throw_msg("Called abort!")],

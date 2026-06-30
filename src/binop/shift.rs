@@ -169,41 +169,29 @@ pub fn shl_checked<'tcx>(
         .expect("Intiger has over 2^32 bits.");
     match value_type.kind() {
         TyKind::Uint(UintTy::U128) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("shl_u128"),
-                ctx.sig(
-                    [Type::Int(Int::U128), Type::Int(Int::I32)],
-                    Type::Int(Int::U128),
-                ),
-                MethodKind::Static,
-                vec![].into(),
+            let mref = ctx.static_mref(
+                "shl_u128",
+                [Type::Int(Int::U128), Type::Int(Int::I32)],
+                Type::Int(Int::U128),
             );
             let b = crate::casts::int_to_int(type_b, Type::Int(Int::U32), ops_b, ctx);
             let b = cu32(ctx, b);
             let cap = ctx.alloc_node(bit_cap);
             let b = ctx.biop(b, cap, BinOp::RemUn);
             let b = ci32(ctx, b);
-            let mref = ctx.alloc_methodref(mref);
             ctx.call(mref, &[ops_a, b], IsPure::NOT)
         }
         TyKind::Int(IntTy::I128) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("shl_i128"),
-                ctx.sig(
-                    [Type::Int(Int::I128), Type::Int(Int::I32)],
-                    Type::Int(Int::I128),
-                ),
-                MethodKind::Static,
-                vec![].into(),
+            let mref = ctx.static_mref(
+                "shl_i128",
+                [Type::Int(Int::I128), Type::Int(Int::I32)],
+                Type::Int(Int::I128),
             );
             let b = crate::casts::int_to_int(type_b, Type::Int(Int::U32), ops_b, ctx);
             let b = cu32(ctx, b);
             let cap = ctx.alloc_node(bit_cap);
             let b = ctx.biop(b, cap, BinOp::RemUn);
             let b = ci32(ctx, b);
-            let mref = ctx.alloc_methodref(mref);
             ctx.call(mref, &[ops_a, b], IsPure::NOT)
         }
         TyKind::Uint(_) => match shift_type.kind() {

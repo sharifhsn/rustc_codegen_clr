@@ -1,7 +1,7 @@
 use crate::assembly::MethodCompileCtx;
 use cilly::{
-    cilnode::{ExtendKind, IsPure, MethodKind},
-    CILRoot, Int, Interned, MethodRef, Type,
+    cilnode::ExtendKind,
+    CILRoot, Int, Interned, Type,
 };
 use rustc_codegen_clr_place::place_set;
 use rustc_codegen_clr_type::GetTypeExt;
@@ -129,13 +129,10 @@ pub fn raw_eq<'tcx>(
 /// Calls `memcmp` to compare `len` bytes of `a` and `b`.
 fn compare_bytes(a: Node, b: Node, len: Node, ctx: &mut MethodCompileCtx<'_, '_>) -> Node {
     let u8_ref = ctx.nptr(Type::Int(Int::U8));
-    let mref = MethodRef::new(
-        *ctx.main_module(),
-        ctx.alloc_string("memcmp"),
-        ctx.sig([u8_ref, u8_ref, Type::Int(Int::USize)], Type::Int(Int::I32)),
-        MethodKind::Static,
-        vec![].into(),
-    );
-    let mref = ctx.alloc_methodref(mref);
-    ctx.call(mref, &[a, b, len], IsPure::NOT)
+    ctx.call_static(
+        "memcmp",
+        [u8_ref, u8_ref, Type::Int(Int::USize)],
+        Type::Int(Int::I32),
+        &[a, b, len],
+    )
 }

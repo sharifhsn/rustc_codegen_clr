@@ -71,15 +71,12 @@ pub fn xchg<'tcx>(
             // (Under `DOTNET9` this arm is skipped → native `Interlocked.Exchange` below.)
             let width = int.size().expect("sub-word int has a known size");
             let src_ref = ctx.nref(src_type);
-            let xchng = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string(format!("atomic_xchng{}_correct", width * 8)),
-                ctx.sig([src_ref, src_type], src_type),
-                MethodKind::Static,
-                vec![].into(),
+            let call = ctx.call_static(
+                &format!("atomic_xchng{}_correct", width * 8),
+                [src_ref, src_type],
+                src_type,
+                &[dst, new],
             );
-            let xchng = ctx.alloc_methodref(xchng);
-            let call = ctx.call(xchng, &[dst, new], IsPure::NOT);
             return place_set(destination, call, ctx);
         }
         // `bool` is a 1-byte value; on .NET 8 it can reuse the dedicated `atomic_xchng_u8`
@@ -180,14 +177,11 @@ pub fn cxchg<'tcx>(
         Type::Int(int @ (Int::U8 | Int::I8 | Int::U16 | Int::I16)) if !*crate::config::DOTNET9 => {
             let width = int.size().expect("sub-word int has a known size");
             let src_ref = ctx.nref(src_type);
-            let call_site = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string(format!("atomic_cmpxchng{}_correct", width * 8)),
-                ctx.sig([src_ref, src_type, src_type], src_type),
-                MethodKind::Static,
-                vec![].into(),
+            let call_site = ctx.static_mref(
+                &format!("atomic_cmpxchng{}_correct", width * 8),
+                [src_ref, src_type, src_type],
+                src_type,
             );
-            let call_site = ctx.alloc_methodref(call_site);
             // builtin arg order: (addr, comparand, new)
             ctx.call(call_site, &[dst, comparand, value], IsPure::NOT)
         }

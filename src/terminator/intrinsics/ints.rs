@@ -499,14 +499,11 @@ fn bitreverse_u16(ushort: Node, asm: &mut Assembly) -> Node {
     asm.biop(low_scaled, high, BinOp::Add)
 }
 pub fn bitreverse_int(val: Node, int: Int, asm: &mut cilly::Assembly) -> Node {
-    let mref = MethodRef::new(
-        *asm.main_module(),
-        asm.alloc_string(format!("bitreverse_{}", int.as_unsigned().name())),
-        asm.sig([Type::Int(int.as_unsigned())], Type::Int(int.as_unsigned())),
-        MethodKind::Static,
-        vec![].into(),
+    let mref = asm.static_mref(
+        &format!("bitreverse_{}", int.as_unsigned().name()),
+        [Type::Int(int.as_unsigned())],
+        Type::Int(int.as_unsigned()),
     );
-    let mref = asm.alloc_methodref(mref);
     let arg = crate::casts::int_to_int(int.into(), int.as_unsigned().into(), val, asm);
     let call = asm.call(mref, &[arg], IsPure::NOT);
     crate::casts::int_to_int(int.as_unsigned().into(), int.into(), call, asm)

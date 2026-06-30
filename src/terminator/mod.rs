@@ -401,26 +401,9 @@ fn lower_x86_div<'tcx>(
     let dividend = ctx.call(or_ref, &[hi_sh, lo128], IsPure::NOT);
 
     // u128 div/rem are linker builtins (`div_u128` / `mod_u128`), NOT `BinOp::DivUn`.
-    let u128_sig = ctx.sig([u128_ty, u128_ty], u128_ty);
-    let div_ref = MethodRef::new(
-        *ctx.main_module(),
-        ctx.alloc_string("div_u128"),
-        u128_sig,
-        MethodKind::Static,
-        vec![].into(),
-    );
-    let div_ref = ctx.alloc_methodref(div_ref);
-    let quot128 = ctx.call(div_ref, &[dividend, d128], IsPure::NOT);
+    let quot128 = ctx.call_static("div_u128", [u128_ty, u128_ty], u128_ty, &[dividend, d128]);
 
-    let mod_ref = MethodRef::new(
-        *ctx.main_module(),
-        ctx.alloc_string("mod_u128"),
-        u128_sig,
-        MethodKind::Static,
-        vec![].into(),
-    );
-    let mod_ref = ctx.alloc_methodref(mod_ref);
-    let rem128 = ctx.call(mod_ref, &[dividend, d128], IsPure::NOT);
+    let rem128 = ctx.call_static("mod_u128", [u128_ty, u128_ty], u128_ty, &[dividend, d128]);
 
     // Truncate u128 -> u64 via UInt128.op_Explicit(UInt128) -> u64.
     let quot = crate::casts::int_to_int(u128_ty, u64_ty, quot128, ctx);

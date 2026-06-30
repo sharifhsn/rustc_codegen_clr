@@ -1674,6 +1674,59 @@ impl Assembly {
         let mref = self.new_methodref(main_module, "transmute", sig, MethodKind::Static, vec![]);
         self.call(mref, &[val], IsPure::PURE)
     }
+    /// Returns a reference to a `static` method of the assembly's main module
+    /// (the synthetic `RustModule` class that holds the backend's builtins),
+    /// with the given `name`, parameter types `inputs`, and return type `output`.
+    ///
+    /// This is the main-module counterpart of [`ClassRef::static_mref`]: it folds the
+    /// recurring `*self.main_module()` + `alloc_string` + `sig` + `MethodRef::new(.., Static, ..)`
+    /// + `alloc_methodref` boilerplate into one call. Use [`Self::call_static`] /
+    /// [`Self::call_static_root`] when you immediately call the method (the common case).
+    pub fn static_mref(
+        &mut self,
+        name: &str,
+        inputs: impl Into<Box<[Type]>>,
+        output: Type,
+    ) -> Interned<MethodRef> {
+        let main_module = *self.main_module();
+        let name = self.alloc_string(name);
+        let sig = self.sig(inputs, output);
+        self.alloc_methodref(MethodRef::new(
+            main_module,
+            name,
+            sig,
+            MethodKind::Static,
+            [].into(),
+        ))
+    }
+    /// Builds a `Call` node invoking a `static` main-module method `name` with the given
+    /// signature (`inputs` -> `output`) and `args`, with `IsPure::NOT`.
+    ///
+    /// Equivalent to the hand-rolled `MethodRef::new(*self.main_module(), .., Static, ..)`
+    /// + `alloc_methodref` + `self.call(.., IsPure::NOT)` idiom, collapsed to one line.
+    pub fn call_static(
+        &mut self,
+        name: &str,
+        inputs: impl Into<Box<[Type]>>,
+        output: Type,
+        args: &[Interned<CILNode>],
+    ) -> Interned<CILNode> {
+        let mref = self.static_mref(name, inputs, output);
+        self.call(mref, args, IsPure::NOT)
+    }
+    /// `Root`-producing (void-call) counterpart of [`Self::call_static`]: invokes a `static`
+    /// main-module method `name` as a side-effecting [`CILRoot`] (with `IsPure::NOT`),
+    /// returning the interned root.
+    pub fn call_static_root(
+        &mut self,
+        name: &str,
+        inputs: impl Into<Box<[Type]>>,
+        output: Type,
+        args: &[Interned<CILNode>],
+    ) -> Interned<CILRoot> {
+        let mref = self.static_mref(name, inputs, output);
+        self.alloc_root(CILRoot::call(mref, args.to_vec()))
+    }
     /// Calls a function with arguments and a certain purity.
     pub fn call(
         &mut self,

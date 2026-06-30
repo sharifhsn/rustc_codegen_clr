@@ -278,137 +278,95 @@ pub fn mul<'tcx>(
             ctx.call(op_gt, &[mul, mx], IsPure::NOT)
         }
         TyKind::Int(IntTy::I64) => {
-            let main_module = *ctx.main_module();
-            let op_mul = MethodRef::new(
-                main_module,
-                ctx.alloc_string("mul_i128"),
-                ctx.sig(
-                    [Type::Int(Int::I128), Type::Int(Int::I128)],
-                    Type::Int(Int::I128),
-                ),
-                MethodKind::Static,
-                vec![].into(),
+            let op_mul = ctx.static_mref(
+                "mul_i128",
+                [Type::Int(Int::I128), Type::Int(Int::I128)],
+                Type::Int(Int::I128),
             );
             let a = casts::int_to_int(Type::Int(Int::I64), Type::Int(Int::I128), ops_a, ctx);
             let b = casts::int_to_int(Type::Int(Int::I64), Type::Int(Int::I128), ops_b, ctx);
-            let op_mul = ctx.alloc_methodref(op_mul);
             let mul = ctx.call(op_mul, &[a, b], IsPure::NOT);
-            let op_greater_than = MethodRef::new(
-                main_module,
-                ctx.alloc_string("gt_i128"),
-                ctx.sig([Type::Int(Int::I128), Type::Int(Int::I128)], Type::Bool),
-                MethodKind::Static,
-                vec![].into(),
+            let op_greater_than = ctx.static_mref(
+                "gt_i128",
+                [Type::Int(Int::I128), Type::Int(Int::I128)],
+                Type::Bool,
             );
             let mx = max(ty, ctx);
             let mx = casts::int_to_int(Type::Int(Int::I64), Type::Int(Int::I128), mx, ctx);
-            let op_greater_than = ctx.alloc_methodref(op_greater_than);
             let gt = ctx.call(op_greater_than, &[mul, mx], IsPure::NOT);
-            let op_lt = MethodRef::new(
-                main_module,
-                ctx.alloc_string("lt_i128"),
-                ctx.sig([Type::Int(Int::I128), Type::Int(Int::I128)], Type::Bool),
-                MethodKind::Static,
-                vec![].into(),
+            let op_lt = ctx.static_mref(
+                "lt_i128",
+                [Type::Int(Int::I128), Type::Int(Int::I128)],
+                Type::Bool,
             );
             let mn = min(ty, ctx);
             let mn = casts::int_to_int(Type::Int(Int::I64), Type::Int(Int::I128), mn, ctx);
-            let op_lt = ctx.alloc_methodref(op_lt);
             let lt = ctx.call(op_lt, &[mul, mn], IsPure::NOT);
             ctx.biop(gt, lt, BinOp::Or)
         }
 
         TyKind::Uint(UintTy::Usize) => {
-            let main_module = *ctx.main_module();
-            let op_mul = MethodRef::new(
-                main_module,
-                ctx.alloc_string("mul_u128"),
-                ctx.sig(
-                    [Type::Int(Int::U128), Type::Int(Int::U128)],
-                    Type::Int(Int::U128),
-                ),
-                MethodKind::Static,
-                vec![].into(),
+            let op_mul = ctx.static_mref(
+                "mul_u128",
+                [Type::Int(Int::U128), Type::Int(Int::U128)],
+                Type::Int(Int::U128),
             );
             let a = casts::int_to_int(Type::Int(Int::USize), Type::Int(Int::U128), ops_a, ctx);
             let b = casts::int_to_int(Type::Int(Int::USize), Type::Int(Int::U128), ops_b, ctx);
-            let op_mul = ctx.alloc_methodref(op_mul);
             let mul = ctx.call(op_mul, &[a, b], IsPure::NOT);
-            let op_gt = MethodRef::new(
-                main_module,
-                ctx.alloc_string("gt_u128"),
-                ctx.sig([Type::Int(Int::U128), Type::Int(Int::U128)], Type::Bool),
-                MethodKind::Static,
-                vec![].into(),
+            let op_gt = ctx.static_mref(
+                "gt_u128",
+                [Type::Int(Int::U128), Type::Int(Int::U128)],
+                Type::Bool,
             );
             let mx = max(ty, ctx);
             let mx = casts::int_to_int(Type::Int(Int::USize), Type::Int(Int::U128), mx, ctx);
-            let op_gt = ctx.alloc_methodref(op_gt);
             ctx.call(op_gt, &[mul, mx], IsPure::NOT)
         }
         TyKind::Int(IntTy::Isize) => {
-            let main_module = *ctx.main_module();
-            let op_mul = MethodRef::new(
-                main_module,
-                ctx.alloc_string("mul_i128"),
-                ctx.sig(
-                    [Type::Int(Int::I128), Type::Int(Int::I128)],
-                    Type::Int(Int::I128),
-                ),
-                MethodKind::Static,
-                vec![].into(),
+            let op_mul = ctx.static_mref(
+                "mul_i128",
+                [Type::Int(Int::I128), Type::Int(Int::I128)],
+                Type::Int(Int::I128),
             );
             let a = casts::int_to_int(Type::Int(Int::ISize), Type::Int(Int::I128), ops_a, ctx);
             let b = casts::int_to_int(Type::Int(Int::ISize), Type::Int(Int::I128), ops_b, ctx);
-            let op_mul = ctx.alloc_methodref(op_mul);
             let mul = ctx.call(op_mul, &[a, b], IsPure::NOT);
-            let op_greater_than = MethodRef::new(
-                main_module,
-                ctx.alloc_string("gt_i128"),
-                ctx.sig([Type::Int(Int::I128), Type::Int(Int::I128)], Type::Bool),
-                MethodKind::Static,
-                vec![].into(),
+            let op_greater_than = ctx.static_mref(
+                "gt_i128",
+                [Type::Int(Int::I128), Type::Int(Int::I128)],
+                Type::Bool,
             );
             let mx = max(ty, ctx);
             let mx = casts::int_to_int(Type::Int(Int::ISize), Type::Int(Int::I128), mx, ctx);
-            let op_greater_than = ctx.alloc_methodref(op_greater_than);
             let gt = ctx.call(op_greater_than, &[mul, mx], IsPure::NOT);
-            let op_lt = MethodRef::new(
-                main_module,
-                ctx.alloc_string("lt_i128"),
-                ctx.sig([Type::Int(Int::I128), Type::Int(Int::I128)], Type::Bool),
-                MethodKind::Static,
-                vec![].into(),
+            let op_lt = ctx.static_mref(
+                "lt_i128",
+                [Type::Int(Int::I128), Type::Int(Int::I128)],
+                Type::Bool,
             );
             let mn = min(ty, ctx);
             let mn = casts::int_to_int(Type::Int(Int::ISize), Type::Int(Int::I128), mn, ctx);
-            let op_lt = ctx.alloc_methodref(op_lt);
             let lt = ctx.call(op_lt, &[mul, mn], IsPure::NOT);
             ctx.biop(gt, lt, BinOp::Or)
         }
         TyKind::Int(IntTy::I128) => {
-            let op_mul = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("i128_mul_ovf_check"),
-                ctx.sig([Type::Int(Int::I128), Type::Int(Int::I128)], Type::Bool),
-                MethodKind::Static,
-                vec![].into(),
+            let called = ctx.call_static(
+                "i128_mul_ovf_check",
+                [Type::Int(Int::I128), Type::Int(Int::I128)],
+                Type::Bool,
+                &[ops_a, ops_b],
             );
-            let op_mul = ctx.alloc_methodref(op_mul);
-            let called = ctx.call(op_mul, &[ops_a, ops_b], IsPure::NOT);
             let f = ctx.alloc_node(false);
             ctx.biop(called, f, BinOp::Eq)
         }
         TyKind::Uint(UintTy::U128) => {
-            let op_mul = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("u128_mul_ovf_check"),
-                ctx.sig([Type::Int(Int::U128), Type::Int(Int::U128)], Type::Bool),
-                MethodKind::Static,
-                vec![].into(),
+            let called = ctx.call_static(
+                "u128_mul_ovf_check",
+                [Type::Int(Int::U128), Type::Int(Int::U128)],
+                Type::Bool,
+                &[ops_a, ops_b],
             );
-            let op_mul = ctx.alloc_methodref(op_mul);
-            let called = ctx.call(op_mul, &[ops_a, ops_b], IsPure::NOT);
             let f = ctx.alloc_node(false);
             ctx.biop(called, f, BinOp::Eq)
         }

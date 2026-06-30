@@ -307,17 +307,13 @@ pub fn get_discr<'tcx>(
                 // } else {
                 //     untagged_variant
                 // }
-                let main_module = *ctx.main_module();
                 let is_niche = match tag_tpe {
                     Type::Int(Int::U128) => {
-                        let mref = MethodRef::new(
-                            main_module,
-                            ctx.alloc_string("eq_u128"),
-                            ctx.sig([Type::Int(Int::U128), Type::Int(Int::U128)], Type::Bool),
-                            MethodKind::Static,
-                            vec![].into(),
+                        let mref = ctx.static_mref(
+                            "eq_u128",
+                            [Type::Int(Int::U128), Type::Int(Int::U128)],
+                            Type::Bool,
                         );
-                        let mref = ctx.alloc_methodref(mref);
                         // `is_niche = tag == niche_start` — compare against the niche *value*
                         // (`niche_start`), NOT the variant index (`niche_variants.start`). They
                         // coincide for niche_start==0 enums (e.g. `Option`), but differ for a
@@ -327,14 +323,11 @@ pub fn get_discr<'tcx>(
                         ctx.call(mref, &[tag, nc], IsPure::NOT)
                     }
                     Type::Int(Int::I128) => {
-                        let mref = MethodRef::new(
-                            main_module,
-                            ctx.alloc_string("eq_i128"),
-                            ctx.sig([Type::Int(Int::I128), Type::Int(Int::I128)], Type::Bool),
-                            MethodKind::Static,
-                            vec![].into(),
+                        let mref = ctx.static_mref(
+                            "eq_i128",
+                            [Type::Int(Int::I128), Type::Int(Int::I128)],
+                            Type::Bool,
                         );
-                        let mref = ctx.alloc_methodref(mref);
                         let nc = ctx.alloc_node(niche_start as i128);
                         ctx.call(mref, &[tag, nc], IsPure::NOT)
                     }

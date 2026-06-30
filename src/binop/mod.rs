@@ -2,9 +2,9 @@ use self::checked::{add_signed, add_unsigned, sub_signed, sub_unsigned};
 use crate::assembly::MethodCompileCtx;
 use bitop::{bit_and_unchecked, bit_or_unchecked, bit_xor_unchecked};
 use cilly::{
-    cilnode::{ExtendKind, IsPure},
+    cilnode::ExtendKind,
     BinOp as V2BinOp, Interned, IntoAsmIndex, Type,
-    {cilnode::MethodKind, Float, Int, MethodRef},
+    {Float, Int},
 };
 use cmp::{eq_unchecked, gt_unchecked, lt_unchecked, ne_unchecked};
 use rustc_codegen_clr_type::{utilis::instance_try_resolve, GetTypeExt};
@@ -76,20 +76,12 @@ pub(crate) fn binop<'tcx>(
                 let f = ctx.alloc_node(false);
                 ctx.biop(lt, f, V2BinOp::Eq)
             }
-            TyKind::Float(FloatTy::F128) => {
-                let mref = MethodRef::new(
-                    *ctx.main_module(),
-                    ctx.alloc_string("__getf2"),
-                    ctx.sig(
-                        [Type::Float(Float::F128), Type::Float(Float::F128)],
-                        Type::Bool,
-                    ),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                let mref = ctx.alloc_methodref(mref);
-                ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
-            }
+            TyKind::Float(FloatTy::F128) => ctx.call_static(
+                "__getf2",
+                [Type::Float(Float::F128), Type::Float(Float::F128)],
+                Type::Bool,
+                &[ops_a, ops_b],
+            ),
             _ => {
                 let lt = lt_unchecked(ty_a, ops_a, ops_b, ctx);
                 let f = ctx.alloc_node(false);
@@ -103,20 +95,12 @@ pub(crate) fn binop<'tcx>(
                 let f = ctx.alloc_node(false);
                 ctx.biop(gt, f, V2BinOp::Eq)
             }
-            TyKind::Float(FloatTy::F128) => {
-                let mref = MethodRef::new(
-                    *ctx.main_module(),
-                    ctx.alloc_string("__letf2"),
-                    ctx.sig(
-                        [Type::Float(Float::F128), Type::Float(Float::F128)],
-                        Type::Bool,
-                    ),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                let mref = ctx.alloc_methodref(mref);
-                ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
-            }
+            TyKind::Float(FloatTy::F128) => ctx.call_static(
+                "__letf2",
+                [Type::Float(Float::F128), Type::Float(Float::F128)],
+                Type::Bool,
+                &[ops_a, ops_b],
+            ),
             _ => {
                 let gt = gt_unchecked(ty_a, ops_a, ops_b, ctx);
                 let f = ctx.alloc_node(false);
@@ -176,36 +160,24 @@ pub fn add_unchecked<'tcx>(
     match ty_a.kind() {
         TyKind::Int(int_ty) => {
             if let IntTy::I128 = int_ty {
-                let mref = MethodRef::new(
-                    *ctx.main_module(),
-                    ctx.alloc_string("add_i128"),
-                    ctx.sig(
-                        [Type::Int(Int::I128), Type::Int(Int::I128)],
-                        Type::Int(Int::I128),
-                    ),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                let mref = ctx.alloc_methodref(mref);
-                ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
+                ctx.call_static(
+                    "add_i128",
+                    [Type::Int(Int::I128), Type::Int(Int::I128)],
+                    Type::Int(Int::I128),
+                    &[ops_a, ops_b],
+                )
             } else {
                 ctx.biop(ops_a, ops_b, V2BinOp::Add)
             }
         }
         TyKind::Uint(uint_ty) => {
             if let UintTy::U128 = uint_ty {
-                let mref = MethodRef::new(
-                    *ctx.main_module(),
-                    ctx.alloc_string("add_u128"),
-                    ctx.sig(
-                        [Type::Int(Int::U128), Type::Int(Int::U128)],
-                        Type::Int(Int::U128),
-                    ),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                let mref = ctx.alloc_methodref(mref);
-                ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
+                ctx.call_static(
+                    "add_u128",
+                    [Type::Int(Int::U128), Type::Int(Int::U128)],
+                    Type::Int(Int::U128),
+                    &[ops_a, ops_b],
+                )
             } else {
                 let sum = ctx.biop(ops_a, ops_b, V2BinOp::Add);
                 match uint_ty {
@@ -218,34 +190,18 @@ pub fn add_unchecked<'tcx>(
             }
         }
         TyKind::Float(FloatTy::F32 | FloatTy::F64) => ctx.biop(ops_a, ops_b, V2BinOp::Add),
-        TyKind::Float(FloatTy::F128) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("__addtf3"),
-                ctx.sig(
-                    [Type::Float(Float::F128), Type::Float(Float::F128)],
-                    Type::Float(Float::F128),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
-        }
-        TyKind::Float(FloatTy::F16) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("add_f16"),
-                ctx.sig(
-                    [Type::Float(Float::F16), Type::Float(Float::F16)],
-                    Type::Float(Float::F16),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
-        }
+        TyKind::Float(FloatTy::F128) => ctx.call_static(
+            "__addtf3",
+            [Type::Float(Float::F128), Type::Float(Float::F128)],
+            Type::Float(Float::F128),
+            &[ops_a, ops_b],
+        ),
+        TyKind::Float(FloatTy::F16) => ctx.call_static(
+            "add_f16",
+            [Type::Float(Float::F16), Type::Float(Float::F16)],
+            Type::Float(Float::F16),
+            &[ops_a, ops_b],
+        ),
         _ => todo!("can't add numbers of types {ty_a} and {ty_b}"),
     }
 }
@@ -260,69 +216,41 @@ pub fn sub_unchecked<'tcx>(
     match ty_a.kind() {
         TyKind::Int(int_ty) => {
             if let IntTy::I128 = int_ty {
-                let mref = MethodRef::new(
-                    *ctx.main_module(),
-                    ctx.alloc_string("sub_i128"),
-                    ctx.sig(
-                        [Type::Int(Int::I128), Type::Int(Int::I128)],
-                        Type::Int(Int::I128),
-                    ),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                let mref = ctx.alloc_methodref(mref);
-                ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
+                ctx.call_static(
+                    "sub_i128",
+                    [Type::Int(Int::I128), Type::Int(Int::I128)],
+                    Type::Int(Int::I128),
+                    &[ops_a, ops_b],
+                )
             } else {
                 ctx.biop(ops_a, ops_b, V2BinOp::Sub)
             }
         }
         TyKind::Uint(uint_ty) => {
             if let UintTy::U128 = uint_ty {
-                let mref = MethodRef::new(
-                    *ctx.main_module(),
-                    ctx.alloc_string("sub_u128"),
-                    ctx.sig(
-                        [Type::Int(Int::U128), Type::Int(Int::U128)],
-                        Type::Int(Int::U128),
-                    ),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                let mref = ctx.alloc_methodref(mref);
-                ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
+                ctx.call_static(
+                    "sub_u128",
+                    [Type::Int(Int::U128), Type::Int(Int::U128)],
+                    Type::Int(Int::U128),
+                    &[ops_a, ops_b],
+                )
             } else {
                 ctx.biop(ops_a, ops_b, V2BinOp::Sub)
             }
         }
         TyKind::Float(FloatTy::F32 | FloatTy::F64) => ctx.biop(ops_a, ops_b, V2BinOp::Sub),
-        TyKind::Float(FloatTy::F128) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("__subtf3"),
-                ctx.sig(
-                    [Type::Float(Float::F128), Type::Float(Float::F128)],
-                    Type::Float(Float::F128),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
-        }
-        TyKind::Float(FloatTy::F16) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("sub_f16"),
-                ctx.sig(
-                    [Type::Float(Float::F16), Type::Float(Float::F16)],
-                    Type::Float(Float::F16),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
-        }
+        TyKind::Float(FloatTy::F128) => ctx.call_static(
+            "__subtf3",
+            [Type::Float(Float::F128), Type::Float(Float::F128)],
+            Type::Float(Float::F128),
+            &[ops_a, ops_b],
+        ),
+        TyKind::Float(FloatTy::F16) => ctx.call_static(
+            "sub_f16",
+            [Type::Float(Float::F16), Type::Float(Float::F16)],
+            Type::Float(Float::F16),
+            &[ops_a, ops_b],
+        ),
         _ => todo!("can't sub numbers of types {ty_a} and {ty_b}"),
     }
 }
@@ -335,65 +263,33 @@ fn rem_unchecked<'tcx>(
     ops_b: Node,
 ) -> Node {
     match ty_a.kind() {
-        TyKind::Int(IntTy::I128) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("mod_i128"),
-                ctx.sig(
-                    [Type::Int(Int::I128), Type::Int(Int::I128)],
-                    Type::Int(Int::I128),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
-        }
-        TyKind::Uint(UintTy::U128) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("mod_u128"),
-                ctx.sig(
-                    [Type::Int(Int::U128), Type::Int(Int::U128)],
-                    Type::Int(Int::U128),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
-        }
+        TyKind::Int(IntTy::I128) => ctx.call_static(
+            "mod_i128",
+            [Type::Int(Int::I128), Type::Int(Int::I128)],
+            Type::Int(Int::I128),
+            &[ops_a, ops_b],
+        ),
+        TyKind::Uint(UintTy::U128) => ctx.call_static(
+            "mod_u128",
+            [Type::Int(Int::U128), Type::Int(Int::U128)],
+            Type::Int(Int::U128),
+            &[ops_a, ops_b],
+        ),
         TyKind::Int(_) | TyKind::Char | TyKind::Float(FloatTy::F32 | FloatTy::F64) => {
             ctx.biop(ops_a, ops_b, V2BinOp::Rem)
         }
-        TyKind::Float(FloatTy::F128) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("fmodl"),
-                ctx.sig(
-                    [Type::Float(Float::F128), Type::Float(Float::F128)],
-                    Type::Float(Float::F128),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
-        }
-        TyKind::Float(FloatTy::F16) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("mod_f16"),
-                ctx.sig(
-                    [Type::Float(Float::F16), Type::Float(Float::F16)],
-                    Type::Float(Float::F16),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            ctx.call(mref, &[ops_a, ops_b], IsPure::NOT)
-        }
+        TyKind::Float(FloatTy::F128) => ctx.call_static(
+            "fmodl",
+            [Type::Float(Float::F128), Type::Float(Float::F128)],
+            Type::Float(Float::F128),
+            &[ops_a, ops_b],
+        ),
+        TyKind::Float(FloatTy::F16) => ctx.call_static(
+            "mod_f16",
+            [Type::Float(Float::F16), Type::Float(Float::F16)],
+            Type::Float(Float::F16),
+            &[ops_a, ops_b],
+        ),
         TyKind::Uint(_) => ctx.biop(ops_a, ops_b, V2BinOp::RemUn),
 
         _ => todo!(),
@@ -408,62 +304,30 @@ fn mul_unchecked<'tcx>(
     operand_b: Node,
 ) -> Node {
     match ty_a.kind() {
-        TyKind::Int(IntTy::I128) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("mul_i128"),
-                ctx.sig(
-                    [Type::Int(Int::I128), Type::Int(Int::I128)],
-                    Type::Int(Int::I128),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
-        }
-        TyKind::Uint(UintTy::U128) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("mul_u128"),
-                ctx.sig(
-                    [Type::Int(Int::U128), Type::Int(Int::U128)],
-                    Type::Int(Int::U128),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
-        }
-        TyKind::Float(FloatTy::F128) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("__multf3"),
-                ctx.sig(
-                    [Type::Float(Float::F128), Type::Float(Float::F128)],
-                    Type::Float(Float::F128),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
-        }
-        TyKind::Float(FloatTy::F16) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("mul_f16"),
-                ctx.sig(
-                    [Type::Float(Float::F16), Type::Float(Float::F16)],
-                    Type::Float(Float::F16),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
-        }
+        TyKind::Int(IntTy::I128) => ctx.call_static(
+            "mul_i128",
+            [Type::Int(Int::I128), Type::Int(Int::I128)],
+            Type::Int(Int::I128),
+            &[operand_a, operand_b],
+        ),
+        TyKind::Uint(UintTy::U128) => ctx.call_static(
+            "mul_u128",
+            [Type::Int(Int::U128), Type::Int(Int::U128)],
+            Type::Int(Int::U128),
+            &[operand_a, operand_b],
+        ),
+        TyKind::Float(FloatTy::F128) => ctx.call_static(
+            "__multf3",
+            [Type::Float(Float::F128), Type::Float(Float::F128)],
+            Type::Float(Float::F128),
+            &[operand_a, operand_b],
+        ),
+        TyKind::Float(FloatTy::F16) => ctx.call_static(
+            "mul_f16",
+            [Type::Float(Float::F16), Type::Float(Float::F16)],
+            Type::Float(Float::F16),
+            &[operand_a, operand_b],
+        ),
         _ => ctx.biop(operand_a, operand_b, V2BinOp::Mul),
     }
 }
@@ -475,66 +339,34 @@ fn div_unchecked<'tcx>(
     operand_b: Node,
 ) -> Node {
     match ty_a.kind() {
-        TyKind::Int(IntTy::I128) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("div_i128"),
-                ctx.sig(
-                    [Type::Int(Int::I128), Type::Int(Int::I128)],
-                    Type::Int(Int::I128),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
-        }
-        TyKind::Uint(UintTy::U128) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("div_u128"),
-                ctx.sig(
-                    [Type::Int(Int::U128), Type::Int(Int::U128)],
-                    Type::Int(Int::U128),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
-        }
+        TyKind::Int(IntTy::I128) => ctx.call_static(
+            "div_i128",
+            [Type::Int(Int::I128), Type::Int(Int::I128)],
+            Type::Int(Int::I128),
+            &[operand_a, operand_b],
+        ),
+        TyKind::Uint(UintTy::U128) => ctx.call_static(
+            "div_u128",
+            [Type::Int(Int::U128), Type::Int(Int::U128)],
+            Type::Int(Int::U128),
+            &[operand_a, operand_b],
+        ),
         TyKind::Uint(_) => ctx.biop(operand_a, operand_b, V2BinOp::DivUn),
         TyKind::Int(_) | TyKind::Char | TyKind::Float(FloatTy::F32 | FloatTy::F64) => {
             ctx.biop(operand_a, operand_b, V2BinOp::Div)
         }
-        TyKind::Float(FloatTy::F128) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("__divtf3"),
-                ctx.sig(
-                    [Type::Float(Float::F128), Type::Float(Float::F128)],
-                    Type::Float(Float::F128),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
-        }
-        TyKind::Float(FloatTy::F16) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("div_f16"),
-                ctx.sig(
-                    [Type::Float(Float::F16), Type::Float(Float::F16)],
-                    Type::Float(Float::F16),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
-        }
+        TyKind::Float(FloatTy::F128) => ctx.call_static(
+            "__divtf3",
+            [Type::Float(Float::F128), Type::Float(Float::F128)],
+            Type::Float(Float::F128),
+            &[operand_a, operand_b],
+        ),
+        TyKind::Float(FloatTy::F16) => ctx.call_static(
+            "div_f16",
+            [Type::Float(Float::F16), Type::Float(Float::F16)],
+            Type::Float(Float::F16),
+            &[operand_a, operand_b],
+        ),
         _ => todo!(),
     }
 }

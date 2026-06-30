@@ -9,27 +9,21 @@ pub fn atomic_add(addr: Node, addend: Node, tpe: Type, asm: &mut Assembly) -> No
     match tpe {
         Type::Int(int) => {
             let u64_ref = asm.nref(Type::Int(int));
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string(format!("atomic_add_{int}", int = int.name())),
-                asm.sig([u64_ref, Type::Int(int)], Type::Int(int)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            asm.call(mref, &[addr, addend], IsPure::NOT)
+            asm.call_static(
+                &format!("atomic_add_{int}", int = int.name()),
+                [u64_ref, Type::Int(int)],
+                Type::Int(int),
+                &[addr, addend],
+            )
         }
 
         Type::Ptr(_) => {
             let usize_ref = asm.nref(Type::Int(Int::USize));
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string("atomic_add_usize"),
-                asm.sig([usize_ref, Type::Int(Int::USize)], Type::Int(Int::USize)),
-                MethodKind::Static,
-                vec![].into(),
+            let mref = asm.static_mref(
+                "atomic_add_usize",
+                [usize_ref, Type::Int(Int::USize)],
+                Type::Int(Int::USize),
             );
-            let mref = asm.alloc_methodref(mref);
             let arg0 = asm.cast_ptr_to(addr, usize_ref);
             let arg1 = asm.cast_ptr_to(addend, Type::Int(Int::USize));
             let call = asm.call(mref, &[arg0, arg1], IsPure::NOT);
@@ -67,28 +61,18 @@ pub fn atomic_or(addr: Node, addend: Node, tpe: Type, asm: &mut Assembly) -> Nod
         }
         Type::Int(Int::ISize | Int::USize | Int::U8 | Int::I8) | Type::Bool => {
             let int_ref = asm.nref(tpe);
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string(format!("atomic_or_{}", tpe.mangle(asm))),
-                asm.sig([int_ref, tpe], tpe),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            asm.call(mref, &[addr, addend], IsPure::NOT)
+            let name = format!("atomic_or_{}", tpe.mangle(asm));
+            asm.call_static(&name, [int_ref, tpe], tpe, &[addr, addend])
         }
 
         Type::Ptr(inner) => {
             let int = Int::USize;
             let int_ref = asm.nref(Type::Int(int));
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string(format!("atomic_or_{}", int.name())),
-                asm.sig([int_ref, Type::Int(int)], Type::Int(int)),
-                MethodKind::Static,
-                vec![].into(),
+            let mref = asm.static_mref(
+                &format!("atomic_or_{}", int.name()),
+                [int_ref, Type::Int(int)],
+                Type::Int(int),
             );
-            let mref = asm.alloc_methodref(mref);
             let usize_ref = asm.nref(Type::Int(Int::USize));
             let arg0 = asm.cast_ptr_to(addr, usize_ref);
             let arg1 = asm.cast_ptr_to(addend, Type::Int(Int::USize));
@@ -106,28 +90,18 @@ pub fn atomic_xor(addr: Node, addend: Node, tpe: Type, asm: &mut Assembly) -> No
             Int::U8 | Int::I8 | Int::U32 | Int::I32 | Int::U64 | Int::I64 | Int::USize | Int::ISize,
         ) => {
             let iref = asm.nref(tpe);
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string(format!("atomic_xor_{}", tpe.mangle(asm))),
-                asm.sig([iref, tpe], tpe),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            asm.call(mref, &[addr, addend], IsPure::NOT)
+            let name = format!("atomic_xor_{}", tpe.mangle(asm));
+            asm.call_static(&name, [iref, tpe], tpe, &[addr, addend])
         }
 
         Type::Ptr(inner) => {
             let int = Int::USize;
             let iref = asm.nref(Type::Int(int));
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string(format!("atomic_xor_{}", int.name())),
-                asm.sig([iref, Type::Int(int)], Type::Int(int)),
-                MethodKind::Static,
-                vec![].into(),
+            let mref = asm.static_mref(
+                &format!("atomic_xor_{}", int.name()),
+                [iref, Type::Int(int)],
+                Type::Int(int),
             );
-            let mref = asm.alloc_methodref(mref);
             let usize_ref = asm.nref(Type::Int(Int::USize));
             let arg0 = asm.cast_ptr_to(addr, usize_ref);
             let arg1 = asm.cast_ptr_to(addend, Type::Int(Int::USize));
@@ -165,26 +139,20 @@ pub fn atomic_and(addr: Node, addend: Node, tpe: Type, asm: &mut Assembly) -> No
         }
         Type::Int(Int::USize) => {
             let usize_ref = asm.nref(Type::Int(Int::USize));
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string("atomic_and_usize"),
-                asm.sig([usize_ref, Type::Int(Int::USize)], Type::Int(Int::USize)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            asm.call(mref, &[addr, addend], IsPure::NOT)
+            asm.call_static(
+                "atomic_and_usize",
+                [usize_ref, Type::Int(Int::USize)],
+                Type::Int(Int::USize),
+                &[addr, addend],
+            )
         }
         Type::Int(Int::ISize) => {
             let usize_ref = asm.nref(Type::Int(Int::USize));
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string("atomic_and_usize"),
-                asm.sig([usize_ref, Type::Int(Int::USize)], Type::Int(Int::USize)),
-                MethodKind::Static,
-                vec![].into(),
+            let mref = asm.static_mref(
+                "atomic_and_usize",
+                [usize_ref, Type::Int(Int::USize)],
+                Type::Int(Int::USize),
             );
-            let mref = asm.alloc_methodref(mref);
             let usize_ref2 = asm.nref(Type::Int(Int::USize));
             let arg0 = asm.cast_ptr_to(addr, usize_ref2);
             let arg1 = asm.cast_ptr_to(addend, Type::Int(Int::USize));
@@ -193,14 +161,11 @@ pub fn atomic_and(addr: Node, addend: Node, tpe: Type, asm: &mut Assembly) -> No
         }
         Type::Ptr(inner) => {
             let usize_ref = asm.nref(Type::Int(Int::USize));
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string("atomic_and_usize"),
-                asm.sig([usize_ref, Type::Int(Int::USize)], Type::Int(Int::USize)),
-                MethodKind::Static,
-                vec![].into(),
+            let mref = asm.static_mref(
+                "atomic_and_usize",
+                [usize_ref, Type::Int(Int::USize)],
+                Type::Int(Int::USize),
             );
-            let mref = asm.alloc_methodref(mref);
             let usize_ref2 = asm.nref(Type::Int(Int::USize));
             let arg0 = asm.cast_ptr_to(addr, usize_ref2);
             let arg1 = asm.cast_ptr_to(addend, Type::Int(Int::USize));
@@ -209,56 +174,40 @@ pub fn atomic_and(addr: Node, addend: Node, tpe: Type, asm: &mut Assembly) -> No
         }
         Type::Bool | Type::Int(Int::U8 | Int::I8) => {
             let iref = asm.nref(tpe);
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string(format!("atomic_and_{}", tpe.mangle(asm))),
-                asm.sig([iref, tpe], tpe),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            asm.call(mref, &[addr, addend], IsPure::NOT)
+            let name = format!("atomic_and_{}", tpe.mangle(asm));
+            asm.call_static(&name, [iref, tpe], tpe, &[addr, addend])
         }
         _ => todo!("Can't atomic and {tpe:?}"),
     }
 }
 pub fn compare_bytes(a: Node, b: Node, len: Node, asm: &mut Assembly) -> Node {
     let u8_ref = asm.nptr(Type::Int(Int::U8));
-    let mref = MethodRef::new(
-        *asm.main_module(),
-        asm.alloc_string("memcmp"),
-        asm.sig([u8_ref, u8_ref, Type::Int(Int::USize)], Type::Int(Int::I32)),
-        MethodKind::Static,
-        vec![].into(),
-    );
-    let mref = asm.alloc_methodref(mref);
-    asm.call(mref, &[a, b, len], IsPure::NOT)
+    asm.call_static(
+        "memcmp",
+        [u8_ref, u8_ref, Type::Int(Int::USize)],
+        Type::Int(Int::I32),
+        &[a, b, len],
+    )
 }
 pub fn atomic_nand(addr: Node, addend: Node, tpe: Type, asm: &mut Assembly) -> Node {
     match tpe {
         Type::Int(int @ (Int::U32 | Int::I32 | Int::U64 | Int::I64 | Int::USize | Int::ISize)) => {
             let iref = asm.nref(Type::Int(int));
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string(format!("atomic_nand_{}", int.name())),
-                asm.sig([iref, Type::Int(int)], Type::Int(int)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            asm.call(mref, &[addr, addend], IsPure::NOT)
+            asm.call_static(
+                &format!("atomic_nand_{}", int.name()),
+                [iref, Type::Int(int)],
+                Type::Int(int),
+                &[addr, addend],
+            )
         }
         Type::Ptr(inner) => {
             let int = Int::USize;
             let iref = asm.nref(Type::Int(int));
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string(format!("atomic_nand_{}", int.name())),
-                asm.sig([iref, Type::Int(int)], Type::Int(int)),
-                MethodKind::Static,
-                vec![].into(),
+            let mref = asm.static_mref(
+                &format!("atomic_nand_{}", int.name()),
+                [iref, Type::Int(int)],
+                Type::Int(int),
             );
-            let mref = asm.alloc_methodref(mref);
             let usize_ref = asm.nref(Type::Int(Int::USize));
             let arg0 = asm.cast_ptr_to(addr, usize_ref);
             let arg1 = asm.cast_ptr_to(addend, Type::Int(Int::USize));
@@ -267,15 +216,8 @@ pub fn atomic_nand(addr: Node, addend: Node, tpe: Type, asm: &mut Assembly) -> N
         }
         Type::Bool | Type::Int(Int::U8 | Int::I8) => {
             let iref = asm.nref(tpe);
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string(format!("atomic_nand_{}", tpe.mangle(asm))),
-                asm.sig([iref, tpe], tpe),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            asm.call(mref, &[addr, addend], IsPure::NOT)
+            let name = format!("atomic_nand_{}", tpe.mangle(asm));
+            asm.call_static(&name, [iref, tpe], tpe, &[addr, addend])
         }
         _ => todo!("Can't atomic nand {tpe:?}"),
     }
@@ -287,27 +229,17 @@ pub fn atomic_min(addr: Node, addend: Node, tpe: Type, asm: &mut Assembly) -> No
             Int::U8 | Int::I8 | Int::U32 | Int::I32 | Int::U64 | Int::I64 | Int::USize | Int::ISize,
         ) => {
             let iref = asm.nref(tpe);
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string(format!("atomic_min_{}", tpe.mangle(asm))),
-                asm.sig([iref, tpe], tpe),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            asm.call(mref, &[addr, addend], IsPure::NOT)
+            let name = format!("atomic_min_{}", tpe.mangle(asm));
+            asm.call_static(&name, [iref, tpe], tpe, &[addr, addend])
         }
         Type::Ptr(inner) => {
             let int = Int::USize;
             let iref = asm.nref(Type::Int(int));
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string(format!("atomic_min_{}", int.name())),
-                asm.sig([iref, Type::Int(int)], Type::Int(int)),
-                MethodKind::Static,
-                vec![].into(),
+            let mref = asm.static_mref(
+                &format!("atomic_min_{}", int.name()),
+                [iref, Type::Int(int)],
+                Type::Int(int),
             );
-            let mref = asm.alloc_methodref(mref);
             let usize_ref = asm.nref(Type::Int(Int::USize));
             let arg0 = asm.cast_ptr_to(addr, usize_ref);
             let arg1 = asm.cast_ptr_to(addend, Type::Int(Int::USize));
@@ -324,27 +256,17 @@ pub fn atomic_max(addr: Node, addend: Node, tpe: Type, asm: &mut Assembly) -> No
             Int::U8 | Int::I8 | Int::U32 | Int::I32 | Int::U64 | Int::I64 | Int::USize | Int::ISize,
         ) => {
             let iref = asm.nref(tpe);
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string(format!("atomic_max_{}", tpe.mangle(asm))),
-                asm.sig([iref, tpe], tpe),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            asm.call(mref, &[addr, addend], IsPure::NOT)
+            let name = format!("atomic_max_{}", tpe.mangle(asm));
+            asm.call_static(&name, [iref, tpe], tpe, &[addr, addend])
         }
         Type::Ptr(inner) => {
             let int = Int::USize;
             let iref = asm.nref(Type::Int(int));
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string(format!("atomic_max_{}", int.name())),
-                asm.sig([iref, Type::Int(int)], Type::Int(int)),
-                MethodKind::Static,
-                vec![].into(),
+            let mref = asm.static_mref(
+                &format!("atomic_max_{}", int.name()),
+                [iref, Type::Int(int)],
+                Type::Int(int),
             );
-            let mref = asm.alloc_methodref(mref);
             let usize_ref = asm.nref(Type::Int(Int::USize));
             let arg0 = asm.cast_ptr_to(addr, usize_ref);
             let arg1 = asm.cast_ptr_to(addend, Type::Int(Int::USize));

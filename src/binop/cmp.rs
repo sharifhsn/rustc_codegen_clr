@@ -27,33 +27,21 @@ pub fn eq_unchecked<'tcx>(
 ) -> Node {
     match ty_a.kind() {
         TyKind::Uint(uint) => match uint {
-            UintTy::U128 => {
-                let main_module = *ctx.main_module();
-                let mref = MethodRef::new(
-                    main_module,
-                    ctx.alloc_string("eq_u128"),
-                    ctx.sig([Type::Int(Int::U128), Type::Int(Int::U128)], Type::Bool),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                let mref = ctx.alloc_methodref(mref);
-                ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
-            }
+            UintTy::U128 => ctx.call_static(
+                "eq_u128",
+                [Type::Int(Int::U128), Type::Int(Int::U128)],
+                Type::Bool,
+                &[operand_a, operand_b],
+            ),
             _ => ctx.biop(operand_a, operand_b, BinOp::Eq),
         },
         TyKind::Int(int) => match int {
-            IntTy::I128 => {
-                let main_module = *ctx.main_module();
-                let mref = MethodRef::new(
-                    main_module,
-                    ctx.alloc_string("eq_i128"),
-                    ctx.sig([Type::Int(Int::I128), Type::Int(Int::I128)], Type::Bool),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
-                let mref = ctx.alloc_methodref(mref);
-                ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
-            }
+            IntTy::I128 => ctx.call_static(
+                "eq_i128",
+                [Type::Int(Int::I128), Type::Int(Int::I128)],
+                Type::Bool,
+                &[operand_a, operand_b],
+            ),
             _ => ctx.biop(operand_a, operand_b, BinOp::Eq),
         },
         TyKind::Bool | TyKind::Char | TyKind::Float(FloatTy::F32 | FloatTy::F64) => {
@@ -75,34 +63,18 @@ pub fn eq_unchecked<'tcx>(
                 ctx.biop(operand_a, operand_b, BinOp::Eq)
             }
         }
-        TyKind::Float(FloatTy::F128) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("__eqtf2"),
-                ctx.sig(
-                    [Type::Float(Float::F128), Type::Float(Float::F128)],
-                    Type::Bool,
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
-        }
-        TyKind::Float(FloatTy::F16) => {
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string("eq_f16"),
-                ctx.sig(
-                    [Type::Float(Float::F16), Type::Float(Float::F16)],
-                    Type::Bool,
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            ctx.call(mref, &[operand_a, operand_b], IsPure::NOT)
-        }
+        TyKind::Float(FloatTy::F128) => ctx.call_static(
+            "__eqtf2",
+            [Type::Float(Float::F128), Type::Float(Float::F128)],
+            Type::Bool,
+            &[operand_a, operand_b],
+        ),
+        TyKind::Float(FloatTy::F16) => ctx.call_static(
+            "eq_f16",
+            [Type::Float(Float::F16), Type::Float(Float::F16)],
+            Type::Bool,
+            &[operand_a, operand_b],
+        ),
         _ => panic!("Can't eq type  {ty_a:?}"),
     }
 }
@@ -142,34 +114,18 @@ pub fn lt_unchecked(ty_a: Ty<'_>, operand_a: Node, operand_b: Node, asm: &mut As
             asm.biop(operand_a, operand_b, BinOp::Lt)
         }
         TyKind::RawPtr(_, _) | TyKind::FnPtr(_, _) => asm.biop(operand_a, operand_b, BinOp::LtUn),
-        TyKind::Float(FloatTy::F128) => {
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string("__lttf2"),
-                asm.sig(
-                    [Type::Float(Float::F128), Type::Float(Float::F128)],
-                    Type::Bool,
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            asm.call(mref, &[operand_a, operand_b], IsPure::NOT)
-        }
-        TyKind::Float(FloatTy::F16) => {
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string("lt_f16"),
-                asm.sig(
-                    [Type::Float(Float::F16), Type::Float(Float::F16)],
-                    Type::Bool,
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            asm.call(mref, &[operand_a, operand_b], IsPure::NOT)
-        }
+        TyKind::Float(FloatTy::F128) => asm.call_static(
+            "__lttf2",
+            [Type::Float(Float::F128), Type::Float(Float::F128)],
+            Type::Bool,
+            &[operand_a, operand_b],
+        ),
+        TyKind::Float(FloatTy::F16) => asm.call_static(
+            "lt_f16",
+            [Type::Float(Float::F16), Type::Float(Float::F16)],
+            Type::Bool,
+            &[operand_a, operand_b],
+        ),
         _ => panic!("Can't eq type  {ty_a:?}"),
     }
 }
@@ -207,34 +163,18 @@ pub fn gt_unchecked(ty_a: Ty<'_>, operand_a: Node, operand_b: Node, asm: &mut As
         TyKind::Bool | TyKind::Char | TyKind::Float(FloatTy::F32 | FloatTy::F64) => {
             asm.biop(operand_a, operand_b, BinOp::Gt)
         }
-        TyKind::Float(FloatTy::F128) => {
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string("__gttf2"),
-                asm.sig(
-                    [Type::Float(Float::F128), Type::Float(Float::F128)],
-                    Type::Bool,
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            asm.call(mref, &[operand_a, operand_b], IsPure::NOT)
-        }
-        TyKind::Float(FloatTy::F16) => {
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string("gt_f16"),
-                asm.sig(
-                    [Type::Float(Float::F16), Type::Float(Float::F16)],
-                    Type::Bool,
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            asm.call(mref, &[operand_a, operand_b], IsPure::NOT)
-        }
+        TyKind::Float(FloatTy::F128) => asm.call_static(
+            "__gttf2",
+            [Type::Float(Float::F128), Type::Float(Float::F128)],
+            Type::Bool,
+            &[operand_a, operand_b],
+        ),
+        TyKind::Float(FloatTy::F16) => asm.call_static(
+            "gt_f16",
+            [Type::Float(Float::F16), Type::Float(Float::F16)],
+            Type::Bool,
+            &[operand_a, operand_b],
+        ),
         TyKind::RawPtr(_, _) => asm.biop(operand_a, operand_b, BinOp::GtUn),
         _ => panic!("Can't eq type  {ty_a:?}"),
     }

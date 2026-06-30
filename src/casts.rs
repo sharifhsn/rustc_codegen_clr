@@ -301,15 +301,7 @@ pub fn float_to_int(src: Type, target: Type, operand: Node, asm: &mut Assembly) 
                 (Int::I64, Type::Float(Float::F64)) => "cast_f64_i64",
                 _ => panic!("Non-float type!"),
             };
-            let mref = MethodRef::new(
-                *asm.main_module(),
-                asm.alloc_string(name),
-                asm.sig([src], Type::Int(int)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            asm.call(mref, &[operand], IsPure::NOT)
+            asm.call_static(name, [src], Type::Int(int), &[operand])
         }
         _ => to_int(target, operand, asm),
     }
