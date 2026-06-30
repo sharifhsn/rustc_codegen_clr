@@ -12,6 +12,7 @@ use cilly::{
     cilnode::{ExtendKind, IsPure, MethodKind},
     BinOp, ClassRef, Const, FieldDesc, FnSig, Int, Interned, IntoAsmIndex,
 };
+use cilly::tpe::GenericKind;
 use cilly::{MethodRef, Type};
 use rustc_codegen_clr_call::CallInfo;
 use rustc_codegen_clr_ctx::function_name;
@@ -223,6 +224,52 @@ fn tuple_garg_to_types<'tcx>(
         })
         .collect()
 }
+/// WF-9 binding-consistency guard. A definition-shape signature position that is a class generic
+/// marker `!N` MUST resolve, via the concrete `class_generics`, to the SAME concrete type as the
+/// corresponding runtime value (the declared `Ret`/`ArgK` of the magic fn). If it doesn't, the
+/// binding the caller wrote is inconsistent (e.g. declaring a `List<i64>` return as `i32`) and would
+/// **silently miscompile** — CoreCLR runs UNVERIFIED, so RyuJIT narrows/widens rather than rejecting.
+/// Failing loud at codegen here is what makes the `is_assignable_to` `!N`-vs-concrete relaxation
+/// *precisely* sound (the `!N` value provably equals its concrete binding) rather than merely trusted.
+/// Method generics `!!N` (CallGeneric) are not validated (the current bridge carries no method generics).
+fn check_generic_marker<'tcx>(
+    sig_ty: Type,
+    runtime_ty: Type,
+    class_generics: &[Type],
+    role: &str,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) {
+    let Type::PlatformGeneric(n, GenericKind::TypeGeneric) = sig_ty else {
+        return;
+    };
+    match class_generics.get(n as usize) {
+        Some(&resolved) if resolved == runtime_ty => {}
+        Some(&resolved) => ctx.tcx().dcx().span_fatal(
+            ctx.span(),
+            format!(
+                "WF-9 generic interop: the `!{n}` {role} resolves to class generic {n} = {resolved:?}, but the declared runtime type is {runtime_ty:?}. The binding is inconsistent and would silently miscompile (CoreCLR runs unverified)."
+            ),
+        ),
+        None => ctx.tcx().dcx().span_fatal(
+            ctx.span(),
+            format!(
+                "WF-9 generic interop: a `!{n}` {role} references class generic {n}, but only {} class generic argument(s) were provided.",
+                class_generics.len()
+            ),
+        ),
+    }
+}
+/// Lower a magic-fn type-parameter `subst_ref[i]` (always a real type) to its .NET type.
+fn garg_ty_to_type<'tcx>(
+    garg: GenericArg<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Type {
+    let ty = ctx.monomorphize(
+        garg.as_type()
+            .expect("WF-9 generic interop: expected a type parameter"),
+    );
+    ctx.type_from_cache(ty)
+}
 /// WF-9 — calls a method on a *generic* .NET instantiation (e.g. `List<i32>::Add`). The target class
 /// carries concrete generic arguments (so the `ClassRef` renders `` List`1<int32> ``) and the method
 /// signature is given in *definition* shape (`!N`/`!!N` markers), which is what a methodref on a
@@ -251,6 +298,18 @@ fn call_generic<'tcx>(
     );
     let output = sig_types.remove(0);
     let explicit_inputs = sig_types;
+
+    // Loud-fail on an inconsistent binding (see `check_generic_marker`). Runtime types come from the
+    // magic fn's declared `Ret` (subst[7]) and runtime args (subst[8..], receiver-first for
+    // instance/virtual). The Sig excludes the receiver, so explicit input `j` pairs with runtime arg
+    // `recv_offset + j`.
+    let ret_ty = garg_ty_to_type(subst_ref[7], ctx);
+    check_generic_marker(output, ret_ty, &class_generics, "return", ctx);
+    let recv_offset = if kind == 0 { 0 } else { 1 };
+    for (j, &sig_in) in explicit_inputs.iter().enumerate() {
+        let arg_ty = garg_ty_to_type(subst_ref[8 + recv_offset + j], ctx);
+        check_generic_marker(sig_in, arg_ty, &class_generics, "argument", ctx);
+    }
 
     let this = ctx.alloc_class_ref(ClassRef::new(
         class_name,
@@ -315,6 +374,13 @@ fn ctor_generic<'tcx>(
     );
     let _ignored_ret = sig_types.remove(0);
     let explicit_inputs = sig_types;
+
+    // Loud-fail on an inconsistent binding (see `check_generic_marker`). A ctor takes no receiver, so
+    // explicit input `j` pairs with runtime arg `subst[6 + j]`.
+    for (j, &sig_in) in explicit_inputs.iter().enumerate() {
+        let arg_ty = garg_ty_to_type(subst_ref[6 + j], ctx);
+        check_generic_marker(sig_in, arg_ty, &class_generics, "argument", ctx);
+    }
 
     let this = ctx.alloc_class_ref(ClassRef::new(
         class_name,

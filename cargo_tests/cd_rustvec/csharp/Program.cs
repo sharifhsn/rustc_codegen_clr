@@ -57,6 +57,14 @@ public struct Point
     public int Y;
 }
 
+// A struct with INTERNAL PADDING (byte at 0, then 7 bytes padding, long at 8 → 16 bytes). The
+// byte-erased core memcpys sizeof(T) bytes verbatim, so the padding round-trips with the fields.
+public struct Padded
+{
+    public byte B;
+    public long L;
+}
+
 public static class Program
 {
     public static int Main()
@@ -98,6 +106,60 @@ public static class Program
             Check("long Count", vl.Count, 2, ref pass, ref total);
             Check("long[0]", vl.Get(0), big, ref pass, ref total);
             Check("long[1]", vl.Get(1), -7L, ref pass, ref total);
+        }
+
+        // ---- large count: force the backing Rust Vec to grow/realloc many times ----
+        using (var vbig = RustVec<int>.New())
+        {
+            for (int i = 0; i < 1000; i++)
+                vbig.Push(i * 3);
+            Check("big Count", vbig.Count, 1000, ref pass, ref total);
+            Check("big[0]", vbig.Get(0), 0, ref pass, ref total);
+            Check("big[500]", vbig.Get(500), 1500, ref pass, ref total);
+            Check("big[999]", vbig.Get(999), 2997, ref pass, ref total);
+        }
+
+        // ---- RustVec<byte>: a 1-byte element ----
+        using (var vb = RustVec<byte>.New())
+        {
+            vb.Push(255);
+            vb.Push(0);
+            vb.Push(128);
+            Check("byte Count", vb.Count, 3, ref pass, ref total);
+            Check("byte[0]", vb.Get(0), (byte)255, ref pass, ref total);
+            Check("byte[2]", vb.Get(2), (byte)128, ref pass, ref total);
+        }
+
+        // ---- RustVec<double>: 8-byte float, bit-exact round-trip ----
+        using (var vd = RustVec<double>.New())
+        {
+            vd.Push(3.141592653589793);
+            vd.Push(-1.5e300);
+            Check("double Count", vd.Count, 2, ref pass, ref total);
+            Check("double[0]", vd.Get(0), 3.141592653589793, ref pass, ref total);
+            Check("double[1]", vd.Get(1), -1.5e300, ref pass, ref total);
+        }
+
+        // ---- RustVec<Padded>: a 16-byte struct WITH internal padding (memcpy preserves it) ----
+        using (var vpad = RustVec<Padded>.New())
+        {
+            vpad.Push(new Padded { B = 7, L = 1L << 50 });
+            Padded got = vpad.Get(0);
+            Check("Padded.B", got.B, (byte)7, ref pass, ref total);
+            Check("Padded.L", got.L, 1L << 50, ref pass, ref total);
+        }
+
+        // ---- Set sweep: overwrite every index, then read back ----
+        using (var vs = RustVec<int>.New())
+        {
+            for (int i = 0; i < 10; i++)
+                vs.Push(0);
+            for (int i = 0; i < 10; i++)
+                vs.Set(i, i * i);
+            bool sweepOk = true;
+            for (int i = 0; i < 10; i++)
+                sweepOk &= vs.Get(i) == i * i;
+            Check("Set sweep", sweepOk, true, ref pass, ref total);
         }
 
         Console.WriteLine($"cd_rustvec: {pass}/{total} checks passed");

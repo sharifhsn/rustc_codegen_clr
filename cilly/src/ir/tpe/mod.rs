@@ -274,15 +274,17 @@ impl Type {
                 true
             }
             // A generic parameter `!N` (class) / `!!N` (method) is mutually assignable with any
-            // concrete type. It appears ONLY in a generic-instantiation methodref signature (WF-9
-            // generic interop bridge, or a builtin like `ThreadLocal<T>`), where the value crossing
-            // the boundary is *bound* to a concrete type at the call: pushing an `int32` arg where
-            // the definition signature says `!0`, and storing a `!0` return into the concrete local
-            // it resolves to (`List<int32>::get_Item -> !0`, with `!0 == int32`). The .NET runtime's
-            // own type verifier resolves the binding at method load, so accepting both directions
-            // *delegates* generic-binding verification to the CLR rather than masking a mismatch —
-            // `PlatformGeneric` is never produced for ordinary (non-generic-call) codegen, so this
-            // cannot over-permit a genuine concrete-vs-concrete error.
+            // concrete type, at the StLoc and call-arg boundaries. `!N` appears ONLY in the
+            // *signature* of a generic-instantiation methodref — never as a bare value of ordinary
+            // (non-generic-call) codegen — emitted by the WF-9 bridge (`call_generic`/`ctor_generic`)
+            // or a builtin like `ThreadLocal<T>`. The IL methodref MUST use the textual `!N` for the
+            // CLR to bind it, so the checker has to accept `!N` against the concrete type the call
+            // pushes/returns. This is NOT a "trust the CLR to re-verify" relaxation — CoreCLR runs
+            // UNVERIFIED, so a wrong binding would silently narrow/widen, not abort. Soundness instead
+            // comes from `src/terminator/call.rs::check_generic_marker`, which fails the build at
+            // codegen unless every `!N` provably resolves (via the concrete class generics) to exactly
+            // the runtime type it is paired with. So a `!N` value here is *guaranteed* to equal its
+            // concrete binding; accepting the pair cannot mask a real mismatch.
             (_, Type::PlatformGeneric(_, _)) | (Type::PlatformGeneric(_, _), _) => true,
             _ => false,
         }
