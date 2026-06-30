@@ -1286,9 +1286,16 @@ impl CILRoot {
                         val,
                     });
                 }
-                let Some(pointed_tpe) = addr.pointed_to().map(|tpe| asm[tpe]) else {
-                    return Err(TypeCheckError::TypeNotPtr { tpe: addr });
-                };
+                // The store target is either a pointer/ref to the owning class (value-type `stfld`
+                // through a struct pointer) OR — for a managed REFERENCE type — the object reference
+                // itself (`stfld` on an objref is valid CIL; the exporter emits exactly that). This
+                // mirrors the `LdField` check above, which already accepts a direct `ClassRef`.
+                let pointed_tpe = match addr {
+                    Type::Ptr(type_idx) | Type::Ref(type_idx) => Some(asm[type_idx]),
+                    Type::ClassRef(_) => Some(addr),
+                    _ => None,
+                }
+                .ok_or(TypeCheckError::TypeNotPtr { tpe: addr })?;
                 let Type::ClassRef(pointed_owner) = pointed_tpe else {
                     return Err(TypeCheckError::FieldAccessInvalidType {
                         tpe: pointed_tpe,

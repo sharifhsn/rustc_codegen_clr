@@ -17,7 +17,8 @@
 
 use cilly::cilnode::MethodKind;
 use cilly::{
-    Access, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, MethodDef, MethodImpl, MethodRef, Type,
+    Access, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, FieldDesc, MethodDef, MethodImpl,
+    MethodRef, Type,
 };
 use rustc_codegen_clr_call::CallInfo;
 use rustc_codegen_clr_ctx::{function_name, MethodCompileCtx};
@@ -40,6 +41,9 @@ struct PendingClass<'tcx> {
     fields: Vec<(Type, String)>,
     /// `(managed_method_name, target_rust_fn)` — the virtual method aliases the Rust fn.
     methods: Vec<(String, Instance<'tcx>)>,
+    /// Synthesize a field-initializing primary ctor `.ctor(field0, field1, …)` (in field order) so a
+    /// managed caller can `new <Name>(…)` and get an instance with its fields set.
+    has_primary_ctor: bool,
 }
 
 #[derive(Clone)]
@@ -134,6 +138,7 @@ pub fn interpret<'tcx>(
                         superclass,
                         fields: vec![],
                         methods: vec![],
+                        has_primary_ctor: false,
                     })
                 } else if fname.contains("rustc_codegen_clr_add_field_def") {
                     let src = operand_local(&args[0].node);
@@ -156,6 +161,11 @@ pub fn interpret<'tcx>(
                         .expect("comptime: invalid method target")
                         .expect("comptime: could not resolve method target instance");
                     class.methods.push((method_name, target));
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_add_primary_ctor") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    class.has_primary_ctor = true;
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_finish_type") {
                     let src = operand_local(&args[0].node);
@@ -257,15 +267,22 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         ctx.new_method(mdef);
     }
 
-    // Emit a default parameterless constructor for reference types, so C# can `new` the class. Value
-    // types have no base constructor to chain to and are created differently, so skip them.
+    // Emit a constructor for reference types so C# can `new` the class. By default it is parameterless
+    // (chain to base + return); if a primary ctor was requested (`#[dotnet_class]`), it instead takes
+    // one argument per field, in declaration order, and stores each into its field. Value types have
+    // no base constructor to chain to and are created differently, so skip them.
     if !class.is_value_type {
         if let Some(base) = extends {
             // Reference to the base class's `.ctor` (e.g. System.Object::.ctor). Chaining to a base
             // constructor is a plain `call instance void …::.ctor()`, so this methodref is `Instance`
             // kind, NOT `Constructor` — the latter is for `newobj` and is rejected as a CIL-root call.
-            let base_obj_ty = Type::ClassRef(base);
-            let base_ctor_sig = ctx.sig([base_obj_ty], Type::Void);
+            // The base ctor's `this` param is typed as the DERIVED class (the actual `this` at the
+            // call). The methodref still targets the base's `.ctor` (its `class` is `base`), so the IL
+            // is `call instance void <base>::.ctor()`; typing the param as the derived type just lets
+            // the inheritance-unaware CIL checker accept the `this` argument, which is a sound upcast
+            // (a derived reference IS-A base reference).
+            let self_ty = Type::ClassRef(*class_idx);
+            let base_ctor_sig = ctx.sig([self_ty], Type::Void);
             let base_ctor_name = ctx.alloc_string(".ctor");
             let base_ctor = ctx.alloc_methodref(MethodRef::new(
                 base,
@@ -274,13 +291,30 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                 MethodKind::Instance,
                 [].into(),
             ));
-            // Our `.ctor(this)`: chain to base then return — `ldarg.0; call base::.ctor(); ret`.
-            let self_ty = Type::ClassRef(*class_idx);
-            let ctor_sig = ctx.sig([self_ty], Type::Void);
+            // `.ctor(this[, field0, field1, …])`: chain to base, then store each arg into its field:
+            // `ldarg.0; call base::.ctor(); [ldarg.0; ldarg.{i+1}; stfld field_i;]* ret`.
+            let mut inputs = vec![self_ty];
+            if class.has_primary_ctor {
+                inputs.extend(class.fields.iter().map(|(tpe, _)| *tpe));
+            }
+            let n_inputs = inputs.len();
+            let ctor_sig = ctx.sig(inputs, Type::Void);
             let this = ctx.alloc_node(CILNode::LdArg(0));
             let call_base = ctx.alloc_root(CILRoot::call(base_ctor, [this]));
-            let ret = ctx.alloc_root(CILRoot::VoidRet);
-            let blocks = vec![BasicBlock::new(vec![call_base, ret], 0, None)];
+            let mut roots = vec![call_base];
+            if class.has_primary_ctor {
+                for (idx, (tpe, fname)) in class.fields.iter().enumerate() {
+                    let fname = ctx.alloc_string(fname.clone());
+                    let fdesc = ctx.alloc_field(FieldDesc::new(*class_idx, fname, *tpe));
+                    let obj = ctx.alloc_node(CILNode::LdArg(0));
+                    let value = ctx.alloc_node(CILNode::LdArg(
+                        u32::try_from(idx + 1).expect("comptime: too many ctor fields"),
+                    ));
+                    roots.push(ctx.alloc_root(CILRoot::SetField(Box::new((fdesc, obj, value)))));
+                }
+            }
+            roots.push(ctx.alloc_root(CILRoot::VoidRet));
+            let blocks = vec![BasicBlock::new(roots, 0, None)];
             let ctor_name = ctx.alloc_string(".ctor");
             let ctor_def = MethodDef::new(
                 Access::Extern,
@@ -292,9 +326,38 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                     blocks,
                     locals: vec![],
                 },
-                vec![None],
+                vec![None; n_inputs],
             );
             ctx.new_method(ctor_def);
+
+            // For a primary-ctor (record-like) class, also emit a public accessor per field —
+            // `read_<field>(this) -> field_ty` = `ldarg.0; ldfld field; ret` — so a managed caller can
+            // observe the ctor-initialized state (the fields themselves are private).
+            if class.has_primary_ctor {
+                for (tpe, fname) in &class.fields {
+                    let fname_str = ctx.alloc_string(fname.clone());
+                    let fdesc = ctx.alloc_field(FieldDesc::new(*class_idx, fname_str, *tpe));
+                    let this = ctx.alloc_node(CILNode::LdArg(0));
+                    let load = ctx.ld_field(this, fdesc);
+                    let ret = ctx.alloc_root(CILRoot::Ret(load));
+                    let self_ty = Type::ClassRef(*class_idx);
+                    let getter_sig = ctx.sig([self_ty], *tpe);
+                    let getter_name = ctx.alloc_string(format!("read_{fname}"));
+                    let getter_def = MethodDef::new(
+                        Access::Extern,
+                        class_idx,
+                        getter_name,
+                        getter_sig,
+                        MethodKind::Virtual,
+                        MethodImpl::MethodBody {
+                            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+                            locals: vec![],
+                        },
+                        vec![None],
+                    );
+                    ctx.new_method(getter_def);
+                }
+            }
         }
     }
 }

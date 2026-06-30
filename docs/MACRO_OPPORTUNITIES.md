@@ -63,8 +63,9 @@ project-specific reasons it is the wrong tool here:
 
 The one place a proc-macro *would* genuinely pull its weight — a
 `#[dotnet_class]` attribute that turns an annotated Rust struct directly into a
-`dotnet_typedef!` — is **deferred**, because it depends on a backend
-"comptime" capability we don't have yet. See "Implemented vs deferred".
+managed .NET class — is now **implemented** (the project's first proc-macro crate,
+`dotnet_macros`), together with the backend "comptime" capability it was gated on
+(a field-initializing parameterized constructor). See "Implemented vs deferred".
 
 ---
 
@@ -201,22 +202,30 @@ hook / call_static), or release-build green (cmp / simd). Host-buildable crates
 (`cilly`, `mycorrhiza`) were compiled; the `.NET`-target interop crates
 (`cd_generic` etc.) are validated on the real target in **Phase 3**, not here.
 
-**Deferred:**
+**Implemented (later) — `#[dotnet_class]` proc-macro + the comptime capability it needed:**
 
-- **`#[dotnet_class]` proc-macro → `dotnet_typedef!`.** A real proc-macro that
-  turns an annotated Rust struct directly into the `dotnet_typedef!` declaration
-  (field-by-field, with layout) is the *one* place a proc-macro would earn its
-  keep. It is gated on a backend **comptime capability** — the backend would need
-  to evaluate/emit the typedef at compile time from the attribute, which the
-  current pipeline can't do. Until that exists, `dotnet_typedef!` stays a
-  declarative macro and structs are declared by hand. Revisit when comptime
-  lands.
+- A new `proc-macro = true` crate `dotnet_macros` (the workspace's first; host-compiled, so it never
+  reaches the codegen backend — a target crate only ever sees its ordinary-Rust expansion). Its
+  `#[dotnet_class]` attribute parses a real `syn::ItemStruct` and emits the same
+  `rustc_codegen_clr_comptime_entrypoint` shape `dotnet_typedef!` produces — real field syntax + real
+  diagnostics instead of the `tt`-muncher DSL. The magic intrinsics moved into a `mycorrhiza::comptime`
+  module (still zero external deps — they are bare `#[inline(never)]` fn declarations).
+- The backend capability it was gated on: a **field-initializing parameterized primary constructor**.
+  `src/comptime.rs` now synthesizes `.ctor(field0, field1, …)` (chain to base + `stfld` each arg into
+  its field) plus a public `read_<field>()` accessor per field — so a Rust `struct Counter { value: i32,
+  step: i64 }` becomes a .NET class C# can `new Counter(5, 100)` and read back. Two latent backend gaps
+  the fatal checker had never seen on this path were also fixed: the base-ctor `this` upcast typing, and
+  `SetField` parity with `LdField` (a managed reference type accepts `stfld`/`ldfld` on the objref
+  directly — valid CIL the exporter already emits). Verified on real CoreCLR: `cargo_tests/cd_typedef`
+  (Rust lib + C# consumer) 4/4; `::stable` gate + the WF-9 interop tests (cd_generic 18/18, cd_rustvec
+  37/37) green, no regression. Remaining `#[dotnet_class]` follow-up: virtual methods (needs a
+  re-open-an-existing-class comptime capability) and managed-type fields.
 
-- **Optional `IrChildren` derive.** A derive macro to generate the
-  "iterate/visit child nodes" traversal for IR nodes (currently hand-written
-  exhaustive matches) was considered and **not** done — it would re-introduce the
-  exhaustiveness-fallthrough hazard the DON'Ts warn against (a new variant with
-  children would derive an empty/incorrect traversal silently). If ever pursued,
-  it must be paired with a compile-time exhaustiveness assertion, and it brings a
-  proc-macro dependency the project is explicitly avoiding. Left as a documented
-  non-goal.
+**Deferred / non-goal:**
+
+- **Optional `IrChildren` derive — confirmed NON-GOAL.** A derive to generate the IR child-traversal
+  (currently hand-written exhaustive matches) was reconsidered and explicitly **declined** (owner's call):
+  it would trade a compiler-enforced exhaustiveness guarantee (a new variant = compile error at every
+  traversal today) for a proc-macro with a silent-miscompile failure mode, on the correctness-critical IR
+  core, for marginal boilerplate savings — and it would add `syn`/`quote` to `cilly`. The exhaustive
+  matches stay. If ever pursued, it must be paired with a compile-time exhaustiveness assertion.

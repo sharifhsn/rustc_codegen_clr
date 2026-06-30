@@ -28,8 +28,8 @@ opt-level = 3
 crate-type = ["dylib"]
 
 [workspace]
-members = [ "cilly", "dotnet_aot",
-    "mycorrhiza", "rustc_codegen_clr_call", "rustc_codegen_clr_ctx", "rustc_codegen_clr_place", "rustc_codegen_clr_type", "rustc_codgen_clr_operand", 
+members = [ "cilly", "dotnet_aot", "dotnet_macros",
+    "mycorrhiza", "rustc_codegen_clr_call", "rustc_codegen_clr_ctx", "rustc_codegen_clr_place", "rustc_codegen_clr_type", "rustc_codgen_clr_operand",
 ]
 exclude = ["rust/src/bootstrap","backup_rust/src/bootstrap", "bin", "tools/cargo-dotnet"]
 [profile.release]

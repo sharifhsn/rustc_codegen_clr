@@ -1,0 +1,19 @@
+[package]
+name = "dotnet_macros"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Procedural macros for rustc_codegen_clr interop — `#[dotnet_class]` turns a Rust struct into a managed .NET class via the comptime type-export path."
+
+# A proc-macro crate is compiled for the HOST and run at the consumer's compile time, regardless of the
+# consumer's target. So even though `mycorrhiza`/the interop test crates are compiled BY this backend
+# for the `dotnet` target, this macro runs on the host toolchain and the backend only ever sees its
+# (ordinary Rust) expansion — the same `rustc_codegen_clr_comptime_entrypoint` shape `dotnet_typedef!`
+# already produces.
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

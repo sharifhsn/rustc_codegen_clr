@@ -23,6 +23,9 @@ pub use bindings::*;
 //   (The standalone `cargo_tests/slice_call_test` crate still `use`s `mycorrhiza::slice_bindings`;
 //    it is not a workspace member and is superseded by the full generated surface.)
 pub mod class;
+/// Comptime type-export intrinsics — defining a managed .NET class from Rust (used by the
+/// `dotnet_macros::dotnet_class` proc-macro and the declarative `dotnet_typedef!`).
+pub mod comptime;
 /// WF-9 generic-interop ergonomics macros (`dotnet_generic!` / `dotnet_generic_impl!` / `gen!`),
 /// which remove the hand-written `rustc_clr_interop_generic_*` turbofish boilerplate. The macros are
 /// `#[macro_export]`ed, so they are also reachable at the crate root (`mycorrhiza::dotnet_generic!`).
