@@ -1,5 +1,10 @@
 # GAPS.md — what's missing, and the workflow campaign to close it
 
+> **⚠️ Historical campaign doc.** Written mid-campaign (2026-06); every workflow in it is now DONE
+> (see the status log) and several claims are stale — notably WF-C: the typechecker is **fatal by
+> default** now. Current truth: [STATE_OF_THE_PROJECT.md](STATE_OF_THE_PROJECT.md). The Tier-0 walls
+> table remains authoritative.
+
 > Companion to [docs/TRANSLATION_STATUS.md](TRANSLATION_STATUS.md). That doc maps what *works*; this
 > one is the honest backlog of what doesn't, tiered by whether it's a permanent **wall**, a
 > **tractable** engineering gap, or **polish**, with a rough effort estimate and the workflow that

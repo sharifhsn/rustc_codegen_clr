@@ -1,5 +1,11 @@
 # Rust ↔ .NET translation layer — completeness & feasibility map
 
+> **⚠️ Dated snapshot — several deep-section claims are stale** (typechecker is now *fatal by
+> default*; `regex` is fixed; the .NET→Rust ergonomic tail and the generics/delegate/interface/LINQ
+> interop walls have since shipped). Current truth + corrections table:
+> [STATE_OF_THE_PROJECT.md](STATE_OF_THE_PROJECT.md). This doc remains the best *deep map* of how
+> each layer works.
+
 > Status snapshot as of 2026-06 (nightly-2026-06-17, post the V1→V2 IR collapse, the
 > allocator-ABI fix, the **`dotnet` PAL**, the **complete-std** pass, the **"go big"** full-BCL
 > binding generation, the **WF-6 unwinding throw-bridge**, the **libc/POSIX shim + `target-family=["unix"]`

@@ -1,5 +1,11 @@
 # Ergonomics campaign — completion report
 
+> **⚠️ Superseded snapshot (2026-06-30).** The 🟡/⬜ items below were subsequently closed almost in
+> full — value-type generics, dict iteration, `Span<T>`, `Nullable<T>`, generic methods `!!N`,
+> capturing closures, delegate-as-generic-arg, interface impls, enum interop, LINQ + EF expression
+> trees all **shipped** after this was written. Current truth:
+> [STATE_OF_THE_PROJECT.md](STATE_OF_THE_PROJECT.md) (incl. a corrections table for this doc).
+
 Concise, verified status of the interop-ergonomics campaign against
 [ERGONOMICS_ROADMAP.md](ERGONOMICS_ROADMAP.md). The *how-to-operate + start-here* is
 [ERGONOMICS_HANDOFF.md](ERGONOMICS_HANDOFF.md); this is *what-landed / what-didn't / why*.
