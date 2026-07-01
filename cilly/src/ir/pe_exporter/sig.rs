@@ -1,0 +1,381 @@
+//! Signature-blob encoding (§II.23.2): `Type` → `ELEMENT_TYPE_*` byte sequences for field,
+//! method, local-variable, `MethodSpec`, and `calli` stand-alone signatures.
+//!
+//! Class references need a metadata *row* to point at, which only the table builder knows, so the
+//! encoder is parameterized over a [`TypeDefOrRefResolver`]. Everything else — including wrapping
+//! a generic instantiation in `GENERICINST` and lowering `i128`/`u128`/`f16` to their BCL
+//! valuetype classes — happens here, mirroring how `il_exporter`'s `type_il` renders the same
+//! `Type` values (that rendering is the semantic spec; see `docs/PE_EMISSION_PLAN.md`).
+
+use super::heaps::write_compressed_u32;
+use crate::ir::tpe::GenericKind;
+use crate::ir::{Assembly, ClassRef, FnSig, Interned, Type};
+
+// ELEMENT_TYPE_* constants (§II.23.1.16) — only the ones this backend emits.
+const ET_VOID: u8 = 0x01;
+const ET_BOOLEAN: u8 = 0x02;
+const ET_CHAR: u8 = 0x03;
+const ET_I1: u8 = 0x04;
+const ET_U1: u8 = 0x05;
+const ET_I2: u8 = 0x06;
+const ET_U2: u8 = 0x07;
+const ET_I4: u8 = 0x08;
+const ET_U4: u8 = 0x09;
+const ET_I8: u8 = 0x0A;
+const ET_U8: u8 = 0x0B;
+const ET_R4: u8 = 0x0C;
+const ET_R8: u8 = 0x0D;
+const ET_STRING: u8 = 0x0E;
+const ET_PTR: u8 = 0x0F;
+const ET_BYREF: u8 = 0x10;
+const ET_VALUETYPE: u8 = 0x11;
+const ET_CLASS: u8 = 0x12;
+const ET_VAR: u8 = 0x13;
+const ET_ARRAY: u8 = 0x14;
+const ET_GENERICINST: u8 = 0x15;
+const ET_I: u8 = 0x18;
+const ET_U: u8 = 0x19;
+const ET_FNPTR: u8 = 0x1B;
+const ET_OBJECT: u8 = 0x1C;
+const ET_SZARRAY: u8 = 0x1D;
+const ET_MVAR: u8 = 0x1E;
+
+// Method-signature calling-convention byte (§II.23.2.1–II.23.2.3).
+pub const SIG_HASTHIS: u8 = 0x20;
+pub const SIG_GENERIC: u8 = 0x10;
+pub const SIG_DEFAULT: u8 = 0x00;
+/// Field-signature marker (§II.23.2.4).
+pub const SIG_FIELD: u8 = 0x06;
+/// Local-variable-signature marker (§II.23.2.6).
+pub const SIG_LOCALS: u8 = 0x07;
+/// MethodSpec instantiation marker (§II.23.2.15).
+pub const SIG_GENERICINST_METHOD: u8 = 0x0A;
+
+/// Supplies the §II.23.2.8 `TypeDefOrRef` *coded index* for the **open** shape of a class
+/// reference — `(row << 2) | tag` with tag 0 = TypeDef, 1 = TypeRef, 2 = TypeSpec. The encoder
+/// wraps generic arguments in `GENERICINST` itself, so implementations key rows on
+/// (assembly, name, arity) and ignore the `generics` list.
+pub trait TypeDefOrRefResolver {
+    fn type_def_or_ref(&mut self, cref: Interned<ClassRef>, asm: &mut Assembly) -> u32;
+}
+
+/// Encodes one `Type` (§II.23.2.12) into `out`.
+pub fn encode_type(
+    tpe: Type,
+    asm: &mut Assembly,
+    resolver: &mut impl TypeDefOrRefResolver,
+    out: &mut Vec<u8>,
+) {
+    use crate::ir::{Float, Int};
+    match tpe {
+        Type::Void => out.push(ET_VOID),
+        Type::Bool => out.push(ET_BOOLEAN),
+        Type::PlatformChar => out.push(ET_CHAR),
+        Type::PlatformString => out.push(ET_STRING),
+        Type::PlatformObject => out.push(ET_OBJECT),
+        Type::Int(int) => match int {
+            Int::I8 => out.push(ET_I1),
+            Int::U8 => out.push(ET_U1),
+            Int::I16 => out.push(ET_I2),
+            Int::U16 => out.push(ET_U2),
+            Int::I32 => out.push(ET_I4),
+            Int::U32 => out.push(ET_U4),
+            Int::I64 => out.push(ET_I8),
+            Int::U64 => out.push(ET_U8),
+            Int::ISize => out.push(ET_I),
+            Int::USize => out.push(ET_U),
+            // 128-bit ints are BCL valuetypes, exactly as type_il renders them.
+            Int::I128 => {
+                let cref = ClassRef::int_128(asm);
+                encode_class(cref, /*is_valuetype*/ true, asm, resolver, out);
+            }
+            Int::U128 => {
+                let cref = ClassRef::uint_128(asm);
+                encode_class(cref, true, asm, resolver, out);
+            }
+        },
+        Type::Float(float) => match float {
+            Float::F32 => out.push(ET_R4),
+            Float::F64 => out.push(ET_R8),
+            Float::F16 => {
+                let cref = ClassRef::half(asm);
+                encode_class(cref, true, asm, resolver, out);
+            }
+            // il_exporter renders `valuetype f128` (a synthetic module-local struct); wiring that
+            // TypeDef up is deferred with the rest of f128 (a .NET-mode wall — C-mode only).
+            Float::F128 => todo!("f128 in a PE signature"),
+        },
+        Type::Ptr(inner) => {
+            out.push(ET_PTR);
+            encode_type(asm[inner], asm, resolver, out);
+        }
+        Type::Ref(inner) => {
+            out.push(ET_BYREF);
+            encode_type(asm[inner], asm, resolver, out);
+        }
+        Type::ClassRef(cref) => {
+            let is_valuetype = asm[cref].is_valuetype();
+            encode_class(cref, is_valuetype, asm, resolver, out);
+        }
+        // NB the naming crossover (mirrors type_il): MethodGeneric/TypeGeneric render as `!N`
+        // (a *type's* generic parameter, VAR); CallGeneric renders as `!!N` (a *method's*
+        // generic parameter, MVAR).
+        Type::PlatformGeneric(idx, GenericKind::MethodGeneric | GenericKind::TypeGeneric) => {
+            out.push(ET_VAR);
+            write_compressed_u32(out, idx);
+        }
+        Type::PlatformGeneric(idx, GenericKind::CallGeneric) => {
+            out.push(ET_MVAR);
+            write_compressed_u32(out, idx);
+        }
+        Type::PlatformArray { elem, dims } => {
+            if dims.get() == 1 {
+                out.push(ET_SZARRAY);
+                encode_type(asm[elem], asm, resolver, out);
+            } else {
+                // General array shape (§II.23.2.13): rank, no explicit sizes, no lower bounds —
+                // matching the bare `T[,]` il_exporter writes.
+                out.push(ET_ARRAY);
+                encode_type(asm[elem], asm, resolver, out);
+                write_compressed_u32(out, u32::from(dims.get()));
+                write_compressed_u32(out, 0);
+                write_compressed_u32(out, 0);
+            }
+        }
+        Type::FnPtr(sig) => {
+            // il_exporter writes `method ret *(args)` — the managed DEFAULT convention.
+            out.push(ET_FNPTR);
+            let sig = asm[sig].clone();
+            encode_method_sig(SIG_DEFAULT, 0, &sig, asm, resolver, out);
+        }
+        Type::SIMDVector(_) => {
+            todo!("SIMD vector in a PE signature (Phase 1b: resolve to the Vector64/128 ClassRef)")
+        }
+    }
+}
+
+/// `CLASS`/`VALUETYPE` (+ `GENERICINST` when instantiated) for a class reference.
+fn encode_class(
+    cref: Interned<ClassRef>,
+    is_valuetype: bool,
+    asm: &mut Assembly,
+    resolver: &mut impl TypeDefOrRefResolver,
+    out: &mut Vec<u8>,
+) {
+    let kind = if is_valuetype { ET_VALUETYPE } else { ET_CLASS };
+    let generics: Vec<Type> = asm[cref].generics().to_vec();
+    if generics.is_empty() {
+        out.push(kind);
+        write_compressed_u32(out, resolver.type_def_or_ref(cref, asm));
+    } else {
+        out.push(ET_GENERICINST);
+        out.push(kind);
+        write_compressed_u32(out, resolver.type_def_or_ref(cref, asm));
+        write_compressed_u32(out, u32::try_from(generics.len()).unwrap());
+        for g in generics {
+            encode_type(g, asm, resolver, out);
+        }
+    }
+}
+
+/// A `MethodDefSig`/`MethodRefSig` (§II.23.2.1–II.23.2.2): convention byte, optional generic
+/// parameter count, parameter count, return type, parameter types. `convention` is a bitwise OR
+/// of [`SIG_DEFAULT`]/[`SIG_HASTHIS`]/[`SIG_GENERIC`]; `generic_params` must be non-zero iff
+/// `SIG_GENERIC` is set.
+pub fn encode_method_sig(
+    convention: u8,
+    generic_params: u32,
+    sig: &FnSig,
+    asm: &mut Assembly,
+    resolver: &mut impl TypeDefOrRefResolver,
+    out: &mut Vec<u8>,
+) {
+    debug_assert_eq!(convention & SIG_GENERIC != 0, generic_params != 0);
+    out.push(convention);
+    if generic_params != 0 {
+        write_compressed_u32(out, generic_params);
+    }
+    // For instance methods the `this` pointer is implicit — it is NOT in the param count.
+    write_compressed_u32(out, u32::try_from(sig.inputs().len()).unwrap());
+    encode_type(*sig.output(), asm, resolver, out);
+    for input in sig.inputs().to_vec() {
+        encode_type(input, asm, resolver, out);
+    }
+}
+
+/// A field signature (§II.23.2.4).
+pub fn encode_field_sig(
+    tpe: Type,
+    asm: &mut Assembly,
+    resolver: &mut impl TypeDefOrRefResolver,
+    out: &mut Vec<u8>,
+) {
+    out.push(SIG_FIELD);
+    encode_type(tpe, asm, resolver, out);
+}
+
+/// A local-variable signature (§II.23.2.6), stored via `StandAloneSig` and referenced by fat
+/// method-body headers.
+pub fn encode_locals_sig(
+    locals: &[Type],
+    asm: &mut Assembly,
+    resolver: &mut impl TypeDefOrRefResolver,
+    out: &mut Vec<u8>,
+) {
+    out.push(SIG_LOCALS);
+    write_compressed_u32(out, u32::try_from(locals.len()).unwrap());
+    for local in locals {
+        encode_type(*local, asm, resolver, out);
+    }
+}
+
+/// A `MethodSpec` instantiation blob (§II.23.2.15) — the `<int32, …>` of a generic-method call.
+pub fn encode_method_spec_sig(
+    args: &[Type],
+    asm: &mut Assembly,
+    resolver: &mut impl TypeDefOrRefResolver,
+    out: &mut Vec<u8>,
+) {
+    out.push(SIG_GENERICINST_METHOD);
+    write_compressed_u32(out, u32::try_from(args.len()).unwrap());
+    for arg in args {
+        encode_type(*arg, asm, resolver, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{Float, Int};
+    use std::num::NonZeroU8;
+
+    /// Hands out fixed coded indices so blobs are predictable without a table builder.
+    struct StubResolver;
+    impl TypeDefOrRefResolver for StubResolver {
+        fn type_def_or_ref(&mut self, _: Interned<ClassRef>, _: &mut Assembly) -> u32 {
+            // TypeRef row 1 → (1 << 2) | 1 = 5.
+            5
+        }
+    }
+
+    fn encode(tpe: Type, asm: &mut Assembly) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_type(tpe, asm, &mut StubResolver, &mut out);
+        out
+    }
+
+    #[test]
+    fn primitives() {
+        let mut asm = Assembly::default();
+        assert_eq!(encode(Type::Bool, &mut asm), [ET_BOOLEAN]);
+        assert_eq!(encode(Type::Int(Int::I32), &mut asm), [ET_I4]);
+        assert_eq!(encode(Type::Int(Int::USize), &mut asm), [ET_U]);
+        assert_eq!(encode(Type::Float(Float::F64), &mut asm), [ET_R8]);
+        assert_eq!(encode(Type::PlatformString, &mut asm), [ET_STRING]);
+        assert_eq!(encode(Type::PlatformObject, &mut asm), [ET_OBJECT]);
+    }
+
+    #[test]
+    fn pointers_nest() {
+        let mut asm = Assembly::default();
+        let inner = asm.alloc_type(Type::Int(Int::U8));
+        assert_eq!(encode(Type::Ptr(inner), &mut asm), [ET_PTR, ET_U1]);
+        let void = asm.alloc_type(Type::Void);
+        assert_eq!(encode(Type::Ptr(void), &mut asm), [ET_PTR, ET_VOID]);
+        let ptr = asm.alloc_type(Type::Ptr(inner));
+        assert_eq!(
+            encode(Type::Ref(ptr), &mut asm),
+            [ET_BYREF, ET_PTR, ET_U1]
+        );
+    }
+
+    #[test]
+    fn int128_lowers_to_bcl_valuetype() {
+        let mut asm = Assembly::default();
+        assert_eq!(
+            encode(Type::Int(Int::I128), &mut asm),
+            [ET_VALUETYPE, 5],
+            "i128 must encode as VALUETYPE System.Int128 via the resolver"
+        );
+    }
+
+    #[test]
+    fn generic_params_map_to_var_mvar() {
+        let mut asm = Assembly::default();
+        assert_eq!(
+            encode(Type::PlatformGeneric(0, GenericKind::TypeGeneric), &mut asm),
+            [ET_VAR, 0]
+        );
+        assert_eq!(
+            encode(Type::PlatformGeneric(1, GenericKind::MethodGeneric), &mut asm),
+            [ET_VAR, 1],
+            "MethodGeneric renders as !N (VAR) — the type_il naming crossover"
+        );
+        assert_eq!(
+            encode(Type::PlatformGeneric(2, GenericKind::CallGeneric), &mut asm),
+            [ET_MVAR, 2]
+        );
+    }
+
+    #[test]
+    fn arrays() {
+        let mut asm = Assembly::default();
+        let elem = asm.alloc_type(Type::Int(Int::I32));
+        assert_eq!(
+            encode(
+                Type::PlatformArray {
+                    elem,
+                    dims: NonZeroU8::new(1).unwrap()
+                },
+                &mut asm
+            ),
+            [ET_SZARRAY, ET_I4]
+        );
+        assert_eq!(
+            encode(
+                Type::PlatformArray {
+                    elem,
+                    dims: NonZeroU8::new(2).unwrap()
+                },
+                &mut asm
+            ),
+            [ET_ARRAY, ET_I4, 2, 0, 0]
+        );
+    }
+
+    #[test]
+    fn method_and_field_and_locals_sigs() {
+        let mut asm = Assembly::default();
+        let sig = FnSig::new([Type::Int(Int::I32), Type::Bool], Type::Void);
+        let mut out = Vec::new();
+        encode_method_sig(SIG_DEFAULT, 0, &sig, &mut asm, &mut StubResolver, &mut out);
+        assert_eq!(out, [SIG_DEFAULT, 2, ET_VOID, ET_I4, ET_BOOLEAN]);
+
+        let mut out = Vec::new();
+        encode_field_sig(Type::Int(Int::U64), &mut asm, &mut StubResolver, &mut out);
+        assert_eq!(out, [SIG_FIELD, ET_U8]);
+
+        let mut out = Vec::new();
+        encode_locals_sig(
+            &[Type::Int(Int::I32), Type::PlatformString],
+            &mut asm,
+            &mut StubResolver,
+            &mut out,
+        );
+        assert_eq!(out, [SIG_LOCALS, 2, ET_I4, ET_STRING]);
+
+        let mut out = Vec::new();
+        encode_method_spec_sig(&[Type::Int(Int::I32)], &mut asm, &mut StubResolver, &mut out);
+        assert_eq!(out, [SIG_GENERICINST_METHOD, 1, ET_I4]);
+    }
+
+    #[test]
+    fn fn_ptr_embeds_a_method_sig() {
+        let mut asm = Assembly::default();
+        let sig = asm.sig([Type::Int(Int::I32)], Type::Bool);
+        assert_eq!(
+            encode(Type::FnPtr(sig), &mut asm),
+            [ET_FNPTR, SIG_DEFAULT, 1, ET_BOOLEAN, ET_I4]
+        );
+    }
+}

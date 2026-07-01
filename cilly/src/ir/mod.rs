@@ -66,6 +66,8 @@ pub mod method;
 pub mod method_builder;
 /// IR optimization functions
 pub mod opt;
+/// Exports IR directly to an ECMA-335 PE (no ilasm) — see `docs/PE_EMISSION_PLAN.md`
+pub mod pe_exporter;
 /// IR type repr
 pub mod tpe;
 /// IR typechecker
