@@ -176,7 +176,8 @@ impl Iterator for CILIter<'_> {
                     | CILNode::CheckedCast(val, _)
                     | CILNode::LocAlloc { size: val }
                     | CILNode::NewArr { len: val, .. }
-                    | CILNode::UnboxAny { object: val, .. },
+                    | CILNode::UnboxAny { object: val, .. }
+                    | CILNode::Box { value: val, .. },
                 )
                 | CILIterElem::Root(
                     CILRoot::StLoc(_, val)
@@ -535,6 +536,7 @@ impl<'this, T: Iterator<Item = CILIterElem> + 'this> TpeIter<'this> for T {
                     | CILNode::CheckedCast(_, tpe)
                     | CILNode::LdTypeToken(tpe)
                     | CILNode::UnboxAny { tpe, .. }
+                    | CILNode::Box { tpe, .. }
                     | CILNode::NewArr { elem: tpe, .. }
                     | CILNode::LocAllocAlgined { tpe, .. } => {
                         Some(Box::new(std::iter::once(asm[tpe])))

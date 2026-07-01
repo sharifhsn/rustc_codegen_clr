@@ -1104,6 +1104,10 @@ impl ILExporter {
                 self.export_node(asm, out, object, sig, locals)?;
                 writeln!(out, "unbox.any {object}", object = type_il(&asm[tpe], asm))
             }
+            CILNode::Box { value, tpe } => {
+                self.export_node(asm, out, value, sig, locals)?;
+                writeln!(out, "box {tpe}", tpe = type_il(&asm[tpe], asm))
+            }
             CILNode::NewArr { elem, len } => {
                 self.export_node(asm, out, len, sig, locals)?;
                 writeln!(out, "newarr {elem}", elem = type_il(&asm[elem], asm))

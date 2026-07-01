@@ -304,6 +304,18 @@ impl CILNode {
                     tpe: *unboxtpe,
                 }
             }
+            CILNode::Box {
+                value,
+                tpe: boxtpe,
+            } => {
+                let value = asm.get_node(*value).clone();
+                let value = value.propagate_locals(asm, idx, tpe, new_node, fuel);
+                let value = asm.alloc_node(value);
+                CILNode::Box {
+                    value,
+                    tpe: *boxtpe,
+                }
+            }
             CILNode::NewArr { elem, len } => {
                 let new_len = asm.get_node(*len).clone();
                 let new_len = new_len.propagate_locals(asm, idx, tpe, new_node, fuel);

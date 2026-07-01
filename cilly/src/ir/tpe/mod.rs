@@ -236,6 +236,15 @@ impl Type {
                 let cref = asm.class_ref(cref);
                 !cref.is_valuetype()
             }
+            // The reverse of the arm above, restricted to `System.Object`: the intrinsic `object`
+            // (`PlatformObject`, e.g. the result of a `box`) IS `System.Object`, so it is assignable to
+            // a reference-typed `System.Object` ClassRef local (the shape mycorrhiza uses everywhere:
+            // `RustcCLRInteropManagedClass<.., "System.Object">`). Restricted to the name `System.Object`
+            // so this can never permit an unchecked downcast to some *other* class.
+            (Type::PlatformObject, Type::ClassRef(cref)) => {
+                let cref = asm.class_ref(cref);
+                !cref.is_valuetype() && &asm[cref.name()] == "System.Object"
+            }
             (Type::ClassRef(cref), Type::PlatformString)
             | (Type::PlatformString, Type::ClassRef(cref)) => {
                 let cref = asm.class_ref(cref);

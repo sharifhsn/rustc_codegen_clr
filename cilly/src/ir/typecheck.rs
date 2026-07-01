@@ -84,6 +84,12 @@ pub enum TypeCheckError {
     TypeNotClass {
         object: Type,
     },
+    /// A `box` instruction was applied to a non-value-type (only value types can be boxed into
+    /// `System.Object`), or to a value whose type differs from the declared box type.
+    BoxNotValuetype {
+        got: Type,
+        boxed_as: Type,
+    },
     FloatCastInvalidInput {
         got: Type,
         target: super::Float,
@@ -1119,6 +1125,30 @@ impl CILNode {
                     elem: *elem,
                     dims: std::num::NonZeroU8::new(1).unwrap(),
                 })
+            }
+            CILNode::Box { value, tpe } => {
+                let value_tpe = asm.get_node(*value).clone().typecheck(sig, locals, asm)?;
+                let box_tpe = asm[*tpe];
+                // `box <T>` requires a value-type `T` on the stack, and the operand's type must be
+                // exactly `T` (the JIT rejects a mismatched box). The result is a `System.Object`.
+                let is_valuetype = |t: Type| -> bool {
+                    match t {
+                        Type::Int(_)
+                        | Type::Float(_)
+                        | Type::Bool
+                        | Type::PlatformChar
+                        | Type::SIMDVector(_) => true,
+                        Type::ClassRef(cref) => asm.class_ref(cref).is_valuetype(),
+                        _ => false,
+                    }
+                };
+                if !is_valuetype(box_tpe) || value_tpe != box_tpe {
+                    return Err(TypeCheckError::BoxNotValuetype {
+                        got: value_tpe,
+                        boxed_as: box_tpe,
+                    });
+                }
+                Ok(Type::PlatformObject)
             }
         }
     }

@@ -1402,6 +1402,7 @@ impl Assembly {
                 | CILNode::LocAllocAlgined { .. }
                 | CILNode::LdElelemRef { .. }
                 | CILNode::NewArr { .. }
+                | CILNode::Box { .. }
                 | CILNode::UnboxAny { .. } => None,
             })
             .chain(self.iter_roots().filter_map(|root| match root {
@@ -2030,6 +2031,17 @@ impl Assembly {
         let object = object.into_idx(self);
         let tpe = tpe.into_idx(self);
         self.alloc_node(CILNode::UnboxAny { object, tpe })
+    }
+
+    /// Boxes the value-type `value` of type `tpe` into a managed `System.Object` (`box <tpe>`).
+    pub fn box_value(
+        &mut self,
+        value: impl IntoAsmIndex<Interned<CILNode>>,
+        tpe: impl IntoAsmIndex<Interned<Type>>,
+    ) -> Interned<CILNode> {
+        let value = value.into_idx(self);
+        let tpe = tpe.into_idx(self);
+        self.alloc_node(CILNode::Box { value, tpe })
     }
 
     /// Allocates `size` bytes from the local (per-call) pool.

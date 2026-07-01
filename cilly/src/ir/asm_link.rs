@@ -310,6 +310,13 @@ impl Assembly {
                 let tpe = self.alloc_type(tpe);
                 CILNode::UnboxAny { object, tpe }
             }
+            CILNode::Box { value, tpe } => {
+                let value = self.translate_node(source, source.get_node(*value).clone());
+                let value = self.alloc_node(value);
+                let tpe = self.translate_type(source, source[*tpe]);
+                let tpe = self.alloc_type(tpe);
+                CILNode::Box { value, tpe }
+            }
             CILNode::NewArr { elem, len } => {
                 let elem = self.translate_type(source, source[*elem]);
                 let elem = self.alloc_type(elem);

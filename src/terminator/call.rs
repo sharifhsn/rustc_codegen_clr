@@ -4,8 +4,9 @@ use crate::{
     utilis::{
         garg_to_bool, CTOR_FN_NAME, DELEGATE_CLOSURE_FN_NAME, DELEGATE_FN_NAME, GENERIC_CALL_FN_NAME,
         GENERIC_METHOD_CALL_FN_NAME, GENERIC_CTOR_FN_NAME,
-        MANAGED_CALL_FN_NAME, MANAGED_CALL_VIRT_FN_NAME, MANAGED_CHECKED_CAST, MANAGED_IS_INST,
-        MANAGED_LD_ELEM_REF, MANAGED_LD_LEN, MANAGED_LD_NULL, MANAGED_NEW_ARR, MANAGED_SET_ELEM,
+        MANAGED_BOX, MANAGED_CALL_FN_NAME, MANAGED_CALL_VIRT_FN_NAME, MANAGED_CHECKED_CAST,
+        MANAGED_IS_INST, MANAGED_LD_ELEM_REF, MANAGED_LD_LEN, MANAGED_LD_NULL, MANAGED_NEW_ARR,
+        MANAGED_SET_ELEM,
         MANAGED_THROW, MANAGED_TRY_CATCH,
     },
 };
@@ -1407,6 +1408,14 @@ pub fn call_inner<'tcx>(
         let input = handle_operand(&args[0].node, ctx);
         // Not-Virtual (for interop)
         let node = ctx.is_inst(input, tpe);
+        return vec![place_set(destination, node, ctx)];
+    } else if function_name.contains(MANAGED_BOX) {
+        // Boxes the value of type `T` (the intrinsic's type generic) into `System.Object` (`box T`).
+        // The typechecker enforces that `T` is a value type.
+        let tpe = ctx.type_from_cache(instance.args[0].as_type().unwrap());
+        let tpe = ctx.alloc_type(tpe);
+        let value = handle_operand(&args[0].node, ctx);
+        let node = ctx.box_value(value, tpe);
         return vec![place_set(destination, node, ctx)];
     } else if function_name.contains(MANAGED_LD_ELEM_REF) {
         assert!(

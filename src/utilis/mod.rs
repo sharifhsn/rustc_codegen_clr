@@ -16,6 +16,8 @@ pub const MANAGED_IS_INST: &str = "rustc_clr_interop_managed_is_inst";
 pub const MANAGED_LD_ELEM_REF: &str = "rustc_clr_interop_managed_ld_elem_ref";
 pub const MANAGED_NEW_ARR: &str = "rustc_clr_interop_managed_new_arr";
 pub const MANAGED_SET_ELEM: &str = "rustc_clr_interop_managed_set_elem";
+/// Boxes a value type into `System.Object` (the .NET `box` instruction).
+pub const MANAGED_BOX: &str = "rustc_clr_interop_box";
 pub const MANAGED_TRY_CATCH: &str = "rustc_clr_interop_try_catch";
 /// Calls a method on a *generic* .NET instantiation (e.g. `List<i32>::Add`). Unlike the
 /// `rustc_clr_interop_managed_*` family, the target class carries concrete generic arguments and the

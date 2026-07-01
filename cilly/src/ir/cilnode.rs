@@ -110,6 +110,12 @@ pub enum CILNode {
         elem: Interned<Type>,
         len: Interned<CILNode>,
     },
+    /// Boxes the value `value` of value-type `tpe` into a managed `System.Object` (`box <tpe>`). The
+    /// inverse of [`CILNode::UnboxAny`].
+    Box {
+        value: Interned<CILNode>,
+        tpe: Interned<Type>,
+    },
 }
 #[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
 pub enum PtrCastRes {
@@ -312,6 +318,9 @@ impl CILNode {
                 array: node_idx, ..
             }
             | CILNode::NewArr { len: node_idx, .. }
+            | CILNode::Box {
+                value: node_idx, ..
+            }
             | CILNode::UnboxAny {
                 object: node_idx, ..
             } => vec![*node_idx],
@@ -510,6 +519,14 @@ impl CILNode {
                 let object = asm.get_node(object).clone().map(asm, map);
                 let node = CILNode::UnboxAny {
                     object: asm.alloc_node(object),
+                    tpe,
+                };
+                map(node, asm)
+            }
+            CILNode::Box { value, tpe } => {
+                let value = asm.get_node(value).clone().map(asm, map);
+                let node = CILNode::Box {
+                    value: asm.alloc_node(value),
                     tpe,
                 };
                 map(node, asm)

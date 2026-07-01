@@ -255,6 +255,14 @@ pub fn rustc_clr_interop_managed_checked_cast<DST, SRC>(src: SRC) -> DST {
 pub fn rustc_clr_interop_managed_is_inst<DST, SRC>(src: SRC) -> bool {
     core::intrinsics::abort();
 }
+/// Boxes the value-type `val` into a managed `System.Object` (the .NET `box <T>` instruction). `T`
+/// must be a value type (an integer/float/bool primitive or a value-type managed struct); boxing a
+/// reference type is rejected by the CIL typechecker.
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_clr_interop_box<T>(val: T) -> RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Object"> {
+    core::intrinsics::abort();
+}
 interop_magic_fn! {
     rustc_clr_interop_managed_ctor1_
     [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool]

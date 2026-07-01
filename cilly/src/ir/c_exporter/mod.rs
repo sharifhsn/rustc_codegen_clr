@@ -764,6 +764,12 @@ impl CExporter {
             CILNode::NewArr { .. } => {
                 todo!("Managed-array construction (newarr) is not supported in C mode")
             }
+            // Boxing a value into a managed `System.Object` is a .NET GC operation with no C
+            // equivalent; like `newarr`, C-mode support is a follow-up and the .NET exporter is the
+            // tested target. Fail loudly rather than silently miscompile.
+            CILNode::Box { .. } => {
+                todo!("Boxing a value into System.Object (box) is not supported in C mode")
+            }
         })
     }
     fn root_to_string(
