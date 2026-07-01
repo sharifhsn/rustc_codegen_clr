@@ -24,11 +24,25 @@
 //! and a **[`Expr::lambda`]**. A built tree can be inspected ([`Lambda::text`] = `Expression.ToString`,
 //! what a query provider translates) AND executed end-to-end ([`Lambda::compile`] then
 //! [`Compiled::call_str`]/[`Compiled::call_i32`], returning the real boolean).
+//!
+//! The full **EF `IQueryable.Where` handoff** is also here ([`IntQuery`]): a strongly-typed
+//! `Expression<Func<int,bool>>` (built via the *generic* `Expression.Lambda<T>` — [`Expr::typed_pred`])
+//! is passed to `Queryable.Where<int>`, exactly as EF Core consumes a predicate to translate to SQL.
+//! ```ignore
+//! let n = IntQuery::range(1, 10)                                    // IQueryable<int> over 1..=10
+//!     .where_(a.expr().gt(Expr::const_i32(5)).typed_pred(&a))       // Where(Expression<Func<int,bool>>)
+//!     .count();                                                     // == 5  ({6,7,8,9,10})
+//! ```
+//! This crosses the nested-generic-value production path (`Expression<Func<int,bool>>`, `IQueryable<int>`)
+//! end to end — a generic method returning a nested-generic value, held in a Rust local, and fed to
+//! another generic method whose parameter is the doubly-nested `Expression<Func<!!0,bool>>`.
 
 use crate::intrinsics::{
-    rustc_clr_interop_box as box_value, rustc_clr_interop_managed_checked_cast as cast,
+    rustc_clr_interop_box as box_value, rustc_clr_interop_generic_method_call1 as gmethod1,
+    rustc_clr_interop_generic_method_call2 as gmethod2, rustc_clr_interop_managed_checked_cast as cast,
     rustc_clr_interop_managed_new_arr as new_arr, rustc_clr_interop_managed_set_elem as set_elem,
-    RustcCLRInteropManagedArray, RustcCLRInteropManagedClass,
+    RustcCLRInteropManagedArray, RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric,
+    RustcCLRInteropMethodGeneric,
 };
 use crate::system::{DotNetString, MString};
 
@@ -51,6 +65,43 @@ type CObject = RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Obj
 type CConvert = RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Convert">;
 /// A managed `object[]` (`DynamicInvoke`'s argument array).
 type CObjArray = RustcCLRInteropManagedArray<CObject, 1>;
+
+// ---- Strongly-typed predicate types for the EF `IQueryable<int>.Where` path ----
+// `System.Func`2<int32,bool>` — a generic *delegate* instantiation.
+type CFuncIB = RustcCLRInteropManagedGeneric<"System.Private.CoreLib", "System.Func", (i32, bool)>;
+// `Expression`1<Func`2<int32,bool>>` — the NESTED-generic type EF's `Where` consumes.
+type CExprFuncIB =
+    RustcCLRInteropManagedGeneric<"System.Linq.Expressions", "System.Linq.Expressions.Expression", (CFuncIB,)>;
+// The *def-shape* return of `Expression.Lambda<!!0>` — `Expression`1<!!0>`, where `!!0` is the method
+// generic. Bound to `Func<int,bool>` at the call site; `check_generic_marker` proves the binding.
+type CExprMethGen0 = RustcCLRInteropManagedGeneric<
+    "System.Linq.Expressions",
+    "System.Linq.Expressions.Expression",
+    (RustcCLRInteropMethodGeneric<0>,),
+>;
+type CParamArr = RustcCLRInteropManagedArray<CParam, 1>;
+
+// ---- The IQueryable pipeline types (concrete `<int>` + the `<!!0>` def-shapes) ----
+type CIEnumInt =
+    RustcCLRInteropManagedGeneric<"System.Private.CoreLib", "System.Collections.Generic.IEnumerable", (i32,)>;
+type CIQueryInt = RustcCLRInteropManagedGeneric<"System.Linq.Expressions", "System.Linq.IQueryable", (i32,)>;
+type CIEnumMG = RustcCLRInteropManagedGeneric<
+    "System.Private.CoreLib",
+    "System.Collections.Generic.IEnumerable",
+    (RustcCLRInteropMethodGeneric<0>,),
+>;
+type CIQueryMG = RustcCLRInteropManagedGeneric<
+    "System.Linq.Expressions",
+    "System.Linq.IQueryable",
+    (RustcCLRInteropMethodGeneric<0>,),
+>;
+// `Expression`1<Func`2<!!0,bool>>` — the doubly-nested def-shape of `Where`'s predicate parameter.
+type CExprFuncMG = RustcCLRInteropManagedGeneric<
+    "System.Linq.Expressions",
+    "System.Linq.Expressions.Expression",
+    (RustcCLRInteropManagedGeneric<"System.Private.CoreLib", "System.Func", (RustcCLRInteropMethodGeneric<0>, bool)>,),
+>;
+type CEnumerable = RustcCLRInteropManagedClass<"System.Linq", "System.Linq.Enumerable">;
 
 fn mstr(s: &str) -> MString {
     DotNetString::from(s).handle()
@@ -202,6 +253,122 @@ impl Expr {
             CLambda,
         >(self.inner, arr);
         Lambda { inner }
+    }
+
+    /// Wrap this body into a STRONGLY-TYPED `Expression<Func<i32,bool>>` over the single `i32`
+    /// parameter `p`, via the GENERIC `Expression.Lambda<TDelegate>(body, ParameterExpression[])`
+    /// method (`!!0 = Func<int,bool>`). This is the nested-generic value EF's
+    /// `IQueryable<int>.Where` consumes — producing it exercises the generic-method + nested-generic
+    /// path end-to-end (`call_gmethod` + the `is_assignable_to` structural arm; `check_generic_marker`
+    /// proves `!!0` binds to `Func<int,bool>`).
+    #[must_use]
+    pub fn typed_pred(self, p: &Param) -> Predicate {
+        let arr: CParamArr = new_arr::<CParam>(1);
+        set_elem::<CParam>(arr, 0, p.inner);
+        // Expression.Lambda<Func<int,bool>>(body: Expression, prms: ParameterExpression[])
+        //   KIND=0 (static), ClassGenerics=() (Expression is a non-generic declaring class),
+        //   MethodGenerics=(Func<int,bool>,), Sig = (ret: Expression<!!0>, body: Expression, prms[]).
+        let inner: CExprFuncIB = gmethod2::<
+            "System.Linq.Expressions",
+            "System.Linq.Expressions.Expression",
+            false,
+            "Lambda",
+            0,
+            (),
+            (CFuncIB,),
+            (CExprMethGen0, CExpr, CParamArr),
+            CExprFuncIB,
+            CExpr,
+            CParamArr,
+        >(self.inner, arr);
+        Predicate { inner }
+    }
+}
+
+/// A strongly-typed predicate — `Expression<Func<int,bool>>`, the exact type EF Core's
+/// `IQueryable<int>.Where(Expression<Func<int,bool>>)` consumes.
+#[derive(Clone, Copy)]
+pub struct Predicate {
+    inner: CExprFuncIB,
+}
+
+impl Predicate {
+    /// The provider-visible rendering — upcast the nested-generic `Expression<Func<int,bool>>` to the
+    /// base `Expression` and `ToString()`.
+    #[must_use]
+    pub fn text(self) -> std::string::String {
+        let base = cast::<CExpr, CExprFuncIB>(self.inner);
+        to_rust(base.virt0::<"ToString", MString>())
+    }
+}
+
+/// An `IQueryable<int>` — an EF-Core-style query source that consumes `Expression<Func<int,bool>>`
+/// predicates (it TRANSLATES them, unlike `IEnumerable.Where`, which takes a compiled `Func`). This is
+/// the actual `IQueryable.Where(Expression<Func>)` handoff — the whole point of building expression
+/// trees. All three operators are generic methods on `System.Linq.Queryable` (`!!0 = int`).
+#[derive(Clone, Copy)]
+pub struct IntQuery {
+    inner: CIQueryInt,
+}
+
+impl IntQuery {
+    /// A source `IQueryable<int>` over `start .. start+count` — `Enumerable.Range(start, count)`
+    /// (an `IEnumerable<int>`) then `Queryable.AsQueryable<int>` (the generic promotion to a query).
+    #[must_use]
+    pub fn range(start: i32, count: i32) -> IntQuery {
+        let seq: CIEnumInt = CEnumerable::static2::<"Range", i32, i32, CIEnumInt>(start, count);
+        // Queryable.AsQueryable<int>(IEnumerable<int>) -> IQueryable<int>
+        let inner: CIQueryInt = gmethod1::<
+            "System.Linq.Queryable",
+            "System.Linq.Queryable",
+            false,
+            "AsQueryable",
+            0,
+            (),
+            (i32,),
+            (CIQueryMG, CIEnumMG),
+            CIQueryInt,
+            CIEnumInt,
+        >(seq);
+        IntQuery { inner }
+    }
+
+    /// Filter with a predicate expression TREE — `Queryable.Where<int>(this,
+    /// Expression<Func<int,bool>>)`. The provider receives the tree (it would translate to SQL); the
+    /// in-memory LINQ-to-Objects provider compiles+runs it.
+    #[must_use]
+    pub fn where_(self, pred: Predicate) -> IntQuery {
+        let inner: CIQueryInt = gmethod2::<
+            "System.Linq.Queryable",
+            "System.Linq.Queryable",
+            false,
+            "Where",
+            0,
+            (),
+            (i32,),
+            (CIQueryMG, CIQueryMG, CExprFuncMG),
+            CIQueryInt,
+            CIQueryInt,
+            CExprFuncIB,
+        >(self.inner, pred.inner);
+        IntQuery { inner }
+    }
+
+    /// Materialize the count — `Queryable.Count<int>(this)`.
+    #[must_use]
+    pub fn count(self) -> i32 {
+        gmethod1::<
+            "System.Linq.Queryable",
+            "System.Linq.Queryable",
+            false,
+            "Count",
+            0,
+            (),
+            (i32,),
+            (i32, CIQueryMG),
+            i32,
+            CIQueryInt,
+        >(self.inner)
     }
 }
 

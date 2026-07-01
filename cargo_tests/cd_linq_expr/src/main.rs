@@ -123,6 +123,38 @@ fn main() -> std::process::ExitCode {
     chk!(gt5_pred.call_i32(7), true);
     chk!(gt5_pred.call_i32(3), false);
 
+    // NESTED-GENERIC PRODUCTION: a strongly-typed Expression<Func<int,bool>> for `a => (a > 5)`,
+    // built via the generic Expression.Lambda<Func<int,bool>> — the exact type EF's Where consumes.
+    let typed = a.expr().gt(Expr::const_i32(5)).typed_pred(&a);
+    say("typed pred", &typed.text());
+    chk!(typed.text().contains('>'), true);
+    chk!(typed.text().contains('5'), true);
+
+    // THE EF `IQueryable.Where(Expression<Func>)` HANDOFF: filter a query with the predicate TREE.
+    // Queryable.Where TRANSLATES the tree (unlike Enumerable.Where which takes a compiled Func).
+    // 1..10, keep a > 5  ->  {6,7,8,9,10}  -> count 5.
+    use mycorrhiza::linq::IntQuery;
+    let n = IntQuery::range(1, 10)
+        .where_(a.expr().gt(Expr::const_i32(5)).typed_pred(&a))
+        .count();
+    Console::writeln_u64(n as u64);
+    chk!(n, 5);
+    // Different bound: 1..10, keep a >= 8 -> {8,9,10} -> 3.
+    let n2 = IntQuery::range(1, 10)
+        .where_(a.expr().ge(Expr::const_i32(8)).typed_pred(&a))
+        .count();
+    chk!(n2, 3);
+    // Composed predicate a range: 1..20, keep (a > 5) && (a < 10) -> {6,7,8,9} -> 4.
+    let n3 = IntQuery::range(1, 20)
+        .where_(
+            a.expr()
+                .gt(Expr::const_i32(5))
+                .and(a.expr().lt(Expr::const_i32(10)))
+                .typed_pred(&a),
+        )
+        .count();
+    chk!(n3, 4);
+
     Console::writeln_u64(pass as u64);
     Console::writeln_u64(total as u64);
     if pass == total {
