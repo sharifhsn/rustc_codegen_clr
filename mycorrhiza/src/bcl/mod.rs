@@ -27,6 +27,7 @@
 pub mod datetime;
 pub mod environment;
 pub mod guid;
+pub mod json;
 pub mod mathf;
 pub mod random;
 pub mod regex;
