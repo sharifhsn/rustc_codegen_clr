@@ -1,0 +1,43 @@
+---
+# Weekly canary: does the backend still compile against TODAY'S nightly? The tree is pinned
+# (rust-toolchain.toml = nightly-2026-06-17) and only compiles against a narrow window of
+# nightlies, so it bit-rots silently if never checked. This job overrides the pin, checks the
+# workspace, and files/updates an issue on drift so the re-port (feasibility/PORT_NOTES.md)
+# starts when the drift is one week old, not eight months.
+name: Nightly drift canary
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install today's nightly (with rustc-dev components)
+        run: |
+          rustup toolchain install nightly \
+            --component rust-src --component rustc-dev --component llvm-tools-preview
+          rustup run nightly rustc --version
+      - name: cargo check against current nightly (pin overridden)
+        id: check
+        run: |
+          RUSTUP_TOOLCHAIN=nightly cargo check --workspace 2>&1 | tee /tmp/drift.log | tail -60
+      - name: File / update drift issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          nightly="$(rustup run nightly rustc --version)"
+          title="nightly drift: backend no longer compiles on current nightly"
+          body="$(printf 'Canary failed on `%s`.\n\nRe-port playbook: feasibility/PORT_NOTES.md (most fixes are mechanical renames resolved against the local rustc-src).\n\nLast 60 lines:\n```\n%s\n```' "$nightly" "$(tail -60 /tmp/drift.log)")"
+          existing="$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

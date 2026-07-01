@@ -1,0 +1,50 @@
+---
+# Fork CI (github.com/sharifhsn/rustc_codegen_clr) — runs the canonical ::stable gate with the
+# FATAL CIL typechecker (on by default) on the pinned nightly from rust-toolchain.toml.
+# Mirrors feasibility/dev.sh `gate`: same skip set, same known-failure baseline groups, same
+# flaky-retry filter — CI fails only on a REPRODUCING failure outside the baseline.
+# Upstream's rust.yml is left untouched to avoid merge conflicts.
+name: Fork gate
+on:
+  push:
+    branches: [main, gaps-campaign]
+  pull_request:
+    branches: [main, gaps-campaign]
+  workflow_dispatch:
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  gate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup dotnet
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Ensure ilasm (mono)
+        run: |
+          ilasm --version 2>/dev/null || {
+            sudo apt-get update -qq && sudo apt-get install -y -qq mono-devel
+            ilasm --version
+          }
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # the test harness rebuilds test crates constantly; cache only the backend deps
+          cache-targets: "true"
+      - name: Build backend (unified workspace, release)
+        # ONE invocation for dylib + linker — two separate builds can produce two divergent
+        # libcilly builds whose serialized .bc formats mismatch (see docs/DEBUGGING.md).
+        run: cargo build --release --workspace
+      - name: Run ::stable gate (baseline diff + flaky retry)
+        run: bash .github/scripts/gate.sh
+  windows_build:
+    # best-effort: backend must keep COMPILING on Windows; tests are Linux-canonical
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build on Windows
+        run: cargo build --release --workspace
