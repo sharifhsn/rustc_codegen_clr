@@ -32,17 +32,17 @@ that was compiled with the backend and executed on real .NET (`CARGO_DOTNET_BACK
 | `cargo_tests/cd_containers2` | Rust-from-C# | **30/30** |
 | `cargo_tests/cd_rustvec` | Rust-from-C# | **37/37** |
 | `cargo_tests/cd_typedef` | Rust-from-C# (`#[dotnet_class]`) | **16/16** |
+| `cargo_tests/cd_containers` | Rust-from-C# (`RustVec` only) | **13/13** |
 | `cargo_tests/cd_interop` | Rust-from-C# | **PASS** |
 | `cargo_tests/cd_interop_tier2` | Rust-from-C# | **PASS** |
 
-> **Known example-wiring snag (not a surface gap):** `cargo_tests/cd_containers` currently fails to
-> **build the C# side** — its `rustlib` calls only `export_rust_containers!()` (the `RustVec` core),
-> but the installed shipped `RustDotnet.Containers.cs` now unconditionally references the
-> `rcl_map_*` / `rcl_str_*` cores (`CS0117: MainModule does not contain rcl_map_remove …`). The
-> container **surface itself is proven** by `cd_containers2`, which exports all three
-> (`export_rust_containers!` + `export_rust_hashmap!` + `export_rust_string!`) and passes 30/30. The
-> fix is to have `cd_containers` also invoke the map/string macros (or gate the shipped `.cs` on which
-> cores exist) — an example/wiring change, out of scope for this docs pass.
+> **Per-core opt-in (fixed):** the shipped `RustDotnet.Containers.cs` now gates each wrapper behind a
+> preprocessor symbol driven by an msbuild prop, so a project compiles only the wrappers whose Rust
+> cores it actually exports: `<UseRustDotnetContainers>` → `RustVec`/`RustBoxVec`,
+> `<UseRustDotnetHashMap>` → `RustHashMap`, `<UseRustDotnetString>` → `RustString`. A `RustVec`-only
+> consumer (`cd_containers`) no longer sees the `rcl_map_*`/`rcl_str_*` references, and a consumer that
+> exports all three (`cd_containers2`) opts into all three props. This closes the earlier `CS0117`
+> break for any consumer that exports a subset of the cores.
 
 ---
 

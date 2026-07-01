@@ -13,6 +13,8 @@
          crate below invokes export_rust_containers!() + export_rust_hashmap!() + export_rust_string!(),
          so MainModule.rcl_vec_* / rcl_map_* / rcl_str_* all exist. -->
     <UseRustDotnetContainers>true</UseRustDotnetContainers>
+    <UseRustDotnetHashMap>true</UseRustDotnetHashMap>
+    <UseRustDotnetString>true</UseRustDotnetString>
   </PropertyGroup>
 
   <!-- Auto-build the Rust crate + reference its assembly (see cd_containers for the full explanation). -->

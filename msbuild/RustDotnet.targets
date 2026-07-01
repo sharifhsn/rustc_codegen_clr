@@ -38,14 +38,31 @@
   <!-- Defaults (RustDotnetTarget, RustDotnetForceBuild, RustDotnetToolPath, …). -->
   <Import Project="$(MSBuildThisFileDirectory)RustDotnet.props" />
 
-  <!-- Opt-in: compile the shipped reusable C#->Rust generic containers
-       (RustDotnet.RustVec<T> / RustDotnet.RustBoxVec<T>) into this project. Enable with
-       <UseRustDotnetContainers>true</UseRustDotnetContainers>. The consuming Rust cdylib must have
-       invoked `mycorrhiza::export_rust_containers!()` so `MainModule.rcl_vec_*` exists — otherwise the
-       C# compile fails with an unresolved-member error (a clear signal, not a silent break). -->
-  <ItemGroup Condition="'$(UseRustDotnetContainers)'=='true'">
+  <!-- Opt-in: compile the shipped reusable C#->Rust generic containers into this project. Each
+       wrapper is independently gated so a project only compiles references to the cores it actually
+       exports (otherwise the C# compile would fail on an unresolved MainModule.rcl_* member — a clear
+       signal, but it would break a consumer that opted into one core and not another):
+
+         <UseRustDotnetContainers>true</UseRustDotnetContainers>  -> RustVec<T> / RustBoxVec<T>
+             (needs `mycorrhiza::export_rust_containers!()` -> MainModule.rcl_vec_*)
+         <UseRustDotnetHashMap>true</UseRustDotnetHashMap>        -> RustHashMap<K,V>
+             (needs `mycorrhiza::export_rust_hashmap!()`   -> MainModule.rcl_map_*)
+         <UseRustDotnetString>true</UseRustDotnetString>          -> RustString
+             (needs `mycorrhiza::export_rust_string!()`    -> MainModule.rcl_str_*)
+
+       The single RustDotnet.Containers.cs is compiled if ANY of the three is enabled; the wrappers
+       inside are #if'd on the RUSTDOTNET_VEC/HASHMAP/STRING symbols defined below. -->
+  <PropertyGroup>
+    <_RustDotnetAnyContainer Condition="'$(UseRustDotnetContainers)'=='true' or '$(UseRustDotnetHashMap)'=='true' or '$(UseRustDotnetString)'=='true'">true</_RustDotnetAnyContainer>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(_RustDotnetAnyContainer)'=='true'">
     <Compile Include="$(MSBuildThisFileDirectory)RustDotnet.Containers.cs" />
   </ItemGroup>
+  <PropertyGroup Condition="'$(_RustDotnetAnyContainer)'=='true'">
+    <DefineConstants Condition="'$(UseRustDotnetContainers)'=='true'">$(DefineConstants);RUSTDOTNET_VEC</DefineConstants>
+    <DefineConstants Condition="'$(UseRustDotnetHashMap)'=='true'">$(DefineConstants);RUSTDOTNET_HASHMAP</DefineConstants>
+    <DefineConstants Condition="'$(UseRustDotnetString)'=='true'">$(DefineConstants);RUSTDOTNET_STRING</DefineConstants>
+  </PropertyGroup>
 
   <!-- ====================================================================== -->
   <!-- 1. FindCargoDotnet — resolve $(_CargoDotnetExe), the INSTALLED tool.    -->

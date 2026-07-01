@@ -21,6 +21,12 @@
 // on the consuming crate's module. `global::MainModule` names them regardless of this file's
 // namespace. A wrapper here compiles only if the matching `export_rust_*!()` macro was invoked in the
 // Rust cdylib; otherwise Roslyn reports the unresolved MainModule member (a clear signal).
+//
+// Each wrapper is guarded by a preprocessor symbol that RustDotnet.targets defines from the opt-in
+// props, so a project that exports only some of the cores never compiles a reference to a core it
+// lacks:  <UseRustDotnetContainers> -> RUSTDOTNET_VEC (RustVec/RustBoxVec),
+//         <UseRustDotnetHashMap>    -> RUSTDOTNET_HASHMAP (RustHashMap),
+//         <UseRustDotnetString>     -> RUSTDOTNET_STRING (RustString).
 
 using System;
 using System.Runtime.InteropServices;
@@ -28,6 +34,7 @@ using System.Text;
 
 namespace RustDotnet
 {
+#if RUSTDOTNET_VEC
     /// <summary>
     /// A growable list of unmanaged <typeparamref name="T"/>, backed by a single size-erased Rust
     /// vector. Near-zero-cost: each element is memcpy'd to/from the Rust buffer by its raw bytes.
@@ -138,7 +145,9 @@ namespace RustDotnet
             }
         }
     }
+#endif // RUSTDOTNET_VEC
 
+#if RUSTDOTNET_HASHMAP
     /// <summary>
     /// A hash map from unmanaged <typeparamref name="K"/> to unmanaged <typeparamref name="V"/>,
     /// backed by a size-erased Rust <c>HashMap</c> keyed by the raw key bytes. Near-zero-cost: keys
@@ -207,7 +216,9 @@ namespace RustDotnet
             }
         }
     }
+#endif // RUSTDOTNET_HASHMAP
 
+#if RUSTDOTNET_STRING
     /// <summary>
     /// A mutable, growable string owned by Rust (a UTF-8 byte buffer). Text crosses the seam as UTF-8:
     /// <see cref="Append(string)"/> encodes with <see cref="Encoding.UTF8"/>, and
@@ -269,4 +280,5 @@ namespace RustDotnet
             }
         }
     }
+#endif // RUSTDOTNET_STRING
 }
