@@ -44,6 +44,13 @@ pub use crate::enumerate::{Enumerable, Enumerator};
 // .NET delegate. `Action1`/`Action2` are void-returning; `Func1`/`Func2` return a value.
 pub use crate::delegate::{Action1, Action2, Func1, Func2};
 
+// The Task ↔ Future bridge — `.await` a .NET `Task` (`await_unit`) / `Task<T>` (`await_task`), expose a
+// Rust `async fn` as a .NET `Task` (`future_to_task_unit`), and block a Rust future on the PAL
+// (`block_on`). `Task` is the non-generic managed Task handle; `TaskT<T>` the result-bearing one.
+pub use crate::task::{
+    await_task, await_unit, block_on, future_to_task_unit, Task, TaskFuture, TaskT, TaskUnitFuture,
+};
+
 // The idiomatic managed `System.String` wrapper (Display / == / Hash) and the raw handle alias.
 pub use crate::system::{DotNetString, MString};
 

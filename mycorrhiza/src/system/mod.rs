@@ -12,6 +12,13 @@ pub mod text;
 pub type MString =
     crate::intrinsics::RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.String">;
 
+/// The universal managed base type `System.Object` (a raw handle). Every managed reference upcasts to
+/// it implicitly; use it as a marker-free intermediary when a method's declared return is a nested
+/// generic def-shape (e.g. `Task`1<!0>`) that cannot be produced into a concrete local — obtain the
+/// value as `MObject`, then `castclass` to the concrete handle.
+pub type MObject =
+    crate::intrinsics::RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Object">;
+
 impl From<&str> for MString {
     fn from(val: &str) -> Self {
         Marshal::static2::<"PtrToStringUTF8", isize, i32, MString>(

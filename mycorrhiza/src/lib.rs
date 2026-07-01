@@ -58,6 +58,11 @@ pub mod intrinsics;
 /// One-glance import surface — `use mycorrhiza::prelude::*;` pulls in the collections, the managed
 /// `DotNetString`, and the generic-bridge macros so interop code reads like `std`.
 pub mod prelude;
+/// The Task ↔ Future bridge — `.await` a .NET `Task<T>` from Rust (poll `IsCompleted` / read
+/// `Result`) and expose a Rust `async fn` as a .NET `Task<T>` (drive to completion into a
+/// `TaskCompletionSource<T>`). Built on the WF-9 generic bridge; async coroutine lowering already
+/// runs on the dotnet PAL, this is the interop seam. See [`task::await_task`] / [`task::future_to_task`].
+pub mod task;
 use class::*;
 /// Wrappers around types from the `System` namespace
 pub mod system;
