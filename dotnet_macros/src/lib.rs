@@ -15,8 +15,8 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    parse_macro_input, punctuated::Punctuated, spanned::Spanned, FnArg, ItemFn, ItemStruct,
-    LitBool, LitStr, MetaNameValue, ReturnType, Token, Type,
+    parse_macro_input, punctuated::Punctuated, spanned::Spanned, FnArg, ImplItem, ItemFn, ItemImpl,
+    ItemStruct, LitBool, LitStr, MetaNameValue, ReturnType, Token, Type,
 };
 
 /// Split a `"[Assembly]Namespace.Type"` spec into `(assembly, type_name)`. An empty/`[]`-less spec
@@ -39,9 +39,12 @@ fn split_dotnet_ref(spec: &str) -> (String, String) {
 pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemStruct);
 
-    // ---- attribute args: extends = "...", value_type = bool ----
+    // ---- attribute args: extends = "...", value_type = bool, default_ctor = bool,
+    //      field_setters = bool ----
     let mut extends = "[System.Runtime]System.Object".to_string();
     let mut value_type = false;
+    let mut default_ctor = false;
+    let mut field_setters = false;
     if !attr.is_empty() {
         let parser = Punctuated::<MetaNameValue, Token![,]>::parse_terminated;
         let metas = match syn::parse::Parser::parse(parser, attr) {
@@ -64,6 +67,22 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }) = &m.value
                 {
                     value_type = *value;
+                }
+            } else if m.path.is_ident("default_ctor") {
+                if let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Bool(LitBool { value, .. }),
+                    ..
+                }) = &m.value
+                {
+                    default_ctor = *value;
+                }
+            } else if m.path.is_ident("field_setters") {
+                if let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Bool(LitBool { value, .. }),
+                    ..
+                }) = &m.value
+                {
+                    field_setters = *value;
                 }
             }
         }
@@ -89,6 +108,19 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     });
 
+    // Optional extras, gated on the attribute flags: a parameterless default ctor (overloading the
+    // primary ctor) and a `set_<field>` mutator per field (paired with the `read_<field>` accessor).
+    let default_ctor_call = if default_ctor {
+        quote! { let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_default_ctor(class); }
+    } else {
+        quote! {}
+    };
+    let field_setters_call = if field_setters {
+        quote! { let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_field_setters(class); }
+    } else {
+        quote! {}
+    };
+
     let expanded = quote! {
         #input
 
@@ -112,11 +144,182 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                 >();
                 #(#field_calls)*
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_primary_ctor(class);
+                #default_ctor_call
+                #field_setters_call
                 ::mycorrhiza::comptime::rustc_codegen_clr_finish_type(class);
             }
         }
     };
     expanded.into()
+}
+
+// ============================================================================
+// #[dotnet_methods] — attach static / instance methods to a `#[dotnet_class]` type.
+// ============================================================================
+
+/// `#[dotnet_methods]` on an inherent `impl <Name> { … }` block attaches the block's functions to the
+/// managed class `<Name>` that a `#[dotnet_class] struct <Name>` declared. It emits a *second* comptime
+/// entrypoint that re-opens `<Name>` (the backend's `finish_type` is idempotent — it reuses the
+/// already-registered class and just appends these methods) and adds one method per `fn`:
+///
+///   * a `fn` whose FIRST parameter is `<Name>Handle` (the managed-handle alias `#[dotnet_class]` emits)
+///     becomes a **virtual instance** method `<Name>.method(this, …)` — C# calls `obj.method(…)`;
+///   * any other `fn` becomes a **static** method `<Name>.method(…)` — C# calls `<Name>.method(…)`.
+///
+/// The functions are ordinary Rust code (still callable from Rust), codegen'd separately; the managed
+/// method *aliases* the Rust fn, so its signature must match (the receiver, for an instance method, is
+/// the explicit first `<Name>Handle` arg). Methods must be free-standing (no `self`): the alias targets
+/// a static symbol.
+///
+/// ```ignore
+/// #[dotnet_class]
+/// pub struct Counter { value: i32 }
+///
+/// #[dotnet_methods]
+/// impl Counter {
+///     pub fn make(value: i32) -> CounterHandle { /* … */ }          // static:   Counter.make(5)
+///     pub fn get(this: CounterHandle) -> i32 { this.read_value() }   // instance: c.get()
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as ItemImpl);
+
+    // The class name is the impl's self type (a plain path like `Counter`); its handle alias is
+    // `<Name>Handle` (what an instance method takes as its receiver).
+    let self_ty = &input.self_ty;
+    let class_name = match &**self_ty {
+        Type::Path(tp) if tp.qself.is_none() => match tp.path.segments.last() {
+            Some(seg) => seg.ident.to_string(),
+            None => {
+                return syn::Error::new(self_ty.span(), "#[dotnet_methods]: empty self type path")
+                    .to_compile_error()
+                    .into();
+            }
+        },
+        _ => {
+            return syn::Error::new(
+                self_ty.span(),
+                "#[dotnet_methods]: expected an inherent `impl <Name> { … }` over a plain type name",
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+    let handle_name = format!("{class_name}Handle");
+    let name_lit = LitStr::new(&class_name, self_ty.span());
+    let entry_mod = format_ident!("__dotnet_methods_{}", class_name);
+
+    // Emit one `add_*_method_def` call per method, in declaration order. `self`-taking methods and
+    // non-fn impl items are rejected loudly.
+    let mut method_calls = Vec::new();
+    let mut keep_anchors = Vec::new();
+    for it in &input.items {
+        let ImplItem::Fn(f) = it else {
+            return syn::Error::new(
+                it.span(),
+                "#[dotnet_methods]: only `fn` items are supported in the impl block",
+            )
+            .to_compile_error()
+            .into();
+        };
+        let fn_ident = &f.sig.ident;
+        let fname_lit = LitStr::new(&fn_ident.to_string(), fn_ident.span());
+
+        // A `#[used]` anchor holding the reified fn pointer forces rustc's own mono-collector to
+        // codegen this method (a plain `pub fn` on a cdylib type is otherwise pruned as unreachable —
+        // nothing *calls* it; the comptime entrypoint only names it, and that entrypoint is
+        // interpreted, not codegen'd). Without this the managed method's `AliasFor` edge would dangle
+        // (`method_def_from_ref` → None → "alias for an extern function" panic at typecheck time).
+        // Build the fn-pointer type `fn(<in-types>) -> <out>` from the method's signature (dropping
+        // the parameter *patterns*, keeping just the types), so the anchor is a `Sync`, const-eval-OK
+        // `static` — `*const ()`/`usize` casts fail in const-eval, but a fn-pointer static is fine
+        // (this is the same anchor shape the older `dotnet_typedef!` used).
+        let in_types = f.sig.inputs.iter().map(|arg| match arg {
+            FnArg::Typed(pt) => (*pt.ty).clone(),
+            // `self` was already rejected above; unreachable, but keep the map total.
+            FnArg::Receiver(_) => syn::parse_quote! { () },
+        });
+        let out_ty = match &f.sig.output {
+            ReturnType::Default => quote! { () },
+            ReturnType::Type(_, ty) => quote! { #ty },
+        };
+        let keep_ident = format_ident!("KEEP_{}", fn_ident);
+        keep_anchors.push(quote! {
+            #[used]
+            static #keep_ident: fn(#(#in_types),*) -> #out_ty = #self_ty::#fn_ident;
+        });
+
+        // Decide static vs instance by the first parameter's type. A `self` receiver is rejected — the
+        // alias must target a static symbol, so instance methods take the handle explicitly.
+        if let Some(FnArg::Receiver(r)) = f.sig.inputs.first() {
+            return syn::Error::new(
+                r.span(),
+                "#[dotnet_methods]: methods with a `self` receiver are not supported; take the \
+                 receiver explicitly as a first `<Name>Handle` parameter for an instance method",
+            )
+            .to_compile_error()
+            .into();
+        }
+        let first_is_handle = matches!(
+            f.sig.inputs.first(),
+            Some(FnArg::Typed(pt)) if type_last_ident_is(&pt.ty, &handle_name)
+        );
+
+        if first_is_handle {
+            // Instance (virtual) method: signature includes the receiver as arg 0.
+            method_calls.push(quote! {
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_method_def::<
+                    "pub", "virtual", #fname_lit, _,
+                >(class, #self_ty::#fn_ident);
+            });
+        } else {
+            // Static method: signature verbatim, no receiver.
+            method_calls.push(quote! {
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_static_method_def::<
+                    #fname_lit, _,
+                >(class, #self_ty::#fn_ident);
+            });
+        }
+    }
+
+    let expanded = quote! {
+        // The user's impl block, verbatim — the methods remain ordinary callable Rust functions.
+        #input
+
+        #[allow(non_snake_case, dead_code, unused_variables, internal_features, non_upper_case_globals)]
+        mod #entry_mod {
+            use super::*;
+            // The comptime interpreter only *reads* this fn's MIR; nothing calls it, so a `#[used]`
+            // root is required or the dead-code pass would drop it.
+            #[used]
+            static PREVENT_DCE: fn() = rustc_codegen_clr_comptime_entrypoint;
+            // Keep each aliased method fn alive through rustc's mono-collector (see above).
+            #(#keep_anchors)*
+            #[inline(never)]
+            pub fn rustc_codegen_clr_comptime_entrypoint() {
+                // Re-open the class: same name/super/value-type as the `#[dotnet_class]` decl, so the
+                // idempotent `finish_type` finds the already-registered class and appends these methods.
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_new_typedef::<
+                    #name_lit, false, "System.Runtime", "System.Object",
+                >();
+                #(#method_calls)*
+                ::mycorrhiza::comptime::rustc_codegen_clr_finish_type(class);
+            }
+        }
+    };
+    expanded.into()
+}
+
+/// True if `ty` is a plain path whose last segment ident equals `name` (e.g. matching `CounterHandle`
+/// regardless of any leading path qualification).
+fn type_last_ident_is(ty: &Type, name: &str) -> bool {
+    matches!(
+        ty,
+        Type::Path(tp)
+            if tp.qself.is_none()
+                && tp.path.segments.last().is_some_and(|s| s.ident == name)
+    )
 }
 
 // ============================================================================

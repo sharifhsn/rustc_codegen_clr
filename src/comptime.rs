@@ -41,9 +41,18 @@ struct PendingClass<'tcx> {
     fields: Vec<(Type, String)>,
     /// `(managed_method_name, target_rust_fn)` — the virtual method aliases the Rust fn.
     methods: Vec<(String, Instance<'tcx>)>,
+    /// `(managed_method_name, target_rust_fn)` — a `static` method aliasing the Rust fn (no receiver;
+    /// the fn's signature is used verbatim).
+    static_methods: Vec<(String, Instance<'tcx>)>,
     /// Synthesize a field-initializing primary ctor `.ctor(field0, field1, …)` (in field order) so a
     /// managed caller can `new <Name>(…)` and get an instance with its fields set.
     has_primary_ctor: bool,
+    /// Also synthesize a parameterless `.ctor()` (overloading the primary ctor) so a managed caller
+    /// can `new <Name>()` and get a default-initialized instance.
+    has_default_ctor: bool,
+    /// Also synthesize a `set_<field>(value)` mutator per field, paired with the `read_<field>`
+    /// accessor.
+    has_field_setters: bool,
 }
 
 #[derive(Clone)]
@@ -138,7 +147,10 @@ pub fn interpret<'tcx>(
                         superclass,
                         fields: vec![],
                         methods: vec![],
+                        static_methods: vec![],
                         has_primary_ctor: false,
+                        has_default_ctor: false,
+                        has_field_setters: false,
                     })
                 } else if fname.contains("rustc_codegen_clr_add_field_def") {
                     let src = operand_local(&args[0].node);
@@ -162,10 +174,35 @@ pub fn interpret<'tcx>(
                         .expect("comptime: could not resolve method target instance");
                     class.methods.push((method_name, target));
                     ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_add_static_method_def") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    // Generics: <const FNAME, FnType> — so FNAME is [0], FnType is [1].
+                    let method_name = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
+                    let fn_ty = ctx.monomorphize(subst_ref[1].as_type().unwrap());
+                    let TyKind::FnDef(fdef, fsubst) = fn_ty.kind() else {
+                        panic!("comptime: static method target is not a function definition");
+                    };
+                    let fsubst = ctx.monomorphize(*fsubst);
+                    let target = Instance::try_resolve(ctx.tcx(), env, *fdef, fsubst)
+                        .expect("comptime: invalid static method target")
+                        .expect("comptime: could not resolve static method target instance");
+                    class.static_methods.push((method_name, target));
+                    ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_add_primary_ctor") {
                     let src = operand_local(&args[0].node);
                     let mut class = locals[src].as_class().clone();
                     class.has_primary_ctor = true;
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_add_default_ctor") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    class.has_default_ctor = true;
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_add_field_setters") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    class.has_field_setters = true;
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_finish_type") {
                     let src = operand_local(&args[0].node);
@@ -221,21 +258,43 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         .collect();
 
     let name = ctx.alloc_string(class.name.clone());
-    let def = ClassDef::new(
-        name,
-        class.is_value_type,
-        0,
-        extends,
-        fields,
-        vec![],
-        Access::Public,
-        None,
-        None,
-        true,
-    );
-    let class_idx = ctx
-        .class_def(def)
-        .expect("comptime: layout error registering interop class");
+    // Idempotent registration: a class may be described by more than one comptime entrypoint (e.g. the
+    // `#[dotnet_class]` struct decl plus a `#[dotnet_methods]` impl block re-opening it). `class_def`
+    // panics on a duplicate name, so if this class is already registered, reuse its `ClassDefIdx` and
+    // just append this entrypoint's methods/ctors. Codegen-unit ordering is NOT guaranteed, so a
+    // re-opening entrypoint (which carries no fields) can register the bare class first; when the
+    // field-carrying struct entrypoint then runs, it MERGES its fields into the existing def (adding
+    // only those not already present). This keeps field/method emission order-independent: whichever
+    // entrypoint runs last, the final classdef has every field, so the `read_*`/`set_*` accessors
+    // typecheck.
+    let self_cref = ctx.alloc_class_ref(ClassRef::new(name, None, class.is_value_type, [].into()));
+    let class_idx = if let Some(existing) = ctx.class_ref_to_def(self_cref) {
+        if !fields.is_empty() {
+            let def = ctx.class_mut(existing);
+            let existing_fields = def.fields_mut();
+            for field in &fields {
+                if !existing_fields.iter().any(|(_, n, _)| *n == field.1) {
+                    existing_fields.push(*field);
+                }
+            }
+        }
+        existing
+    } else {
+        let def = ClassDef::new(
+            name,
+            class.is_value_type,
+            0,
+            extends,
+            fields,
+            vec![],
+            Access::Public,
+            None,
+            None,
+            true,
+        );
+        ctx.class_def(def)
+            .expect("comptime: layout error registering interop class")
+    };
 
     // Each virtual method aliases an ordinary Rust fn (codegen'd separately). The Rust fn takes the
     // receiver as its first explicit arg, so its signature matches the virtual method's.
@@ -267,12 +326,41 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         ctx.new_method(mdef);
     }
 
-    // Emit a constructor for reference types so C# can `new` the class. By default it is parameterless
-    // (chain to base + return); if a primary ctor was requested (`#[dotnet_class]`), it instead takes
-    // one argument per field, in declaration order, and stores each into its field. Value types have
-    // no base constructor to chain to and are created differently, so skip them.
+    // Each static method aliases an ordinary Rust fn, but unlike a virtual it has NO receiver — its
+    // signature is the Rust fn's verbatim, and it is emitted as `MethodKind::Static` (so `MainModule`
+    // — actually `<Class>` — exposes it as `static <Ret> FNAME(<inputs>)` and C# calls it as
+    // `<Class>.FNAME(…)`).
+    for (method_name, target) in &class.static_methods {
+        let call_info = CallInfo::sig_from_instance_(*target, ctx);
+        let fn_sig = call_info.sig().clone();
+        let arg_names = vec![None; fn_sig.inputs().len()];
+        let sig = ctx.alloc_sig(fn_sig);
+        let target_name = function_name(ctx.tcx().symbol_name(*target));
+        let target_name = ctx.alloc_string(target_name);
+        let main_module = *ctx.main_module();
+        let target_mref = MethodRef::new(main_module, target_name, sig, MethodKind::Static, [].into());
+        let target_ref = ctx.alloc_methodref(target_mref);
+        let mname = ctx.alloc_string(method_name.clone());
+        let mdef = MethodDef::new(
+            Access::Extern,
+            class_idx,
+            mname,
+            sig,
+            MethodKind::Static,
+            MethodImpl::AliasFor(target_ref),
+            arg_names,
+        );
+        ctx.new_method(mdef);
+    }
+
+    // Emit constructors for reference types so C# can `new` the class. Value types have no base
+    // constructor to chain to and are created differently, so skip them. A class may request several
+    // ctors (overloaded by arity): a field-initializing *primary* ctor `.ctor(field0, …)` and/or a
+    // parameterless *default* ctor `.ctor()`. If neither is requested we still emit the parameterless
+    // ctor (the historical default — so `new <Name>()` always works).
     if !class.is_value_type {
         if let Some(base) = extends {
+            let self_ty = Type::ClassRef(*class_idx);
             // Reference to the base class's `.ctor` (e.g. System.Object::.ctor). Chaining to a base
             // constructor is a plain `call instance void …::.ctor()`, so this methodref is `Instance`
             // kind, NOT `Constructor` — the latter is for `newobj` and is rejected as a CIL-root call.
@@ -281,7 +369,6 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             // is `call instance void <base>::.ctor()`; typing the param as the derived type just lets
             // the inheritance-unaware CIL checker accept the `this` argument, which is a sound upcast
             // (a derived reference IS-A base reference).
-            let self_ty = Type::ClassRef(*class_idx);
             let base_ctor_sig = ctx.sig([self_ty], Type::Void);
             let base_ctor_name = ctx.alloc_string(".ctor");
             let base_ctor = ctx.alloc_methodref(MethodRef::new(
@@ -291,18 +378,17 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                 MethodKind::Instance,
                 [].into(),
             ));
-            // `.ctor(this[, field0, field1, …])`: chain to base, then store each arg into its field:
+
+            // Field-initializing primary ctor: `.ctor(this, field0, field1, …)`:
             // `ldarg.0; call base::.ctor(); [ldarg.0; ldarg.{i+1}; stfld field_i;]* ret`.
-            let mut inputs = vec![self_ty];
             if class.has_primary_ctor {
+                let mut inputs = vec![self_ty];
                 inputs.extend(class.fields.iter().map(|(tpe, _)| *tpe));
-            }
-            let n_inputs = inputs.len();
-            let ctor_sig = ctx.sig(inputs, Type::Void);
-            let this = ctx.alloc_node(CILNode::LdArg(0));
-            let call_base = ctx.alloc_root(CILRoot::call(base_ctor, [this]));
-            let mut roots = vec![call_base];
-            if class.has_primary_ctor {
+                let n_inputs = inputs.len();
+                let ctor_sig = ctx.sig(inputs, Type::Void);
+                let this = ctx.alloc_node(CILNode::LdArg(0));
+                let call_base = ctx.alloc_root(CILRoot::call(base_ctor, [this]));
+                let mut roots = vec![call_base];
                 for (idx, (tpe, fname)) in class.fields.iter().enumerate() {
                     let fname = ctx.alloc_string(fname.clone());
                     let fdesc = ctx.alloc_field(FieldDesc::new(*class_idx, fname, *tpe));
@@ -312,23 +398,46 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                     ));
                     roots.push(ctx.alloc_root(CILRoot::SetField(Box::new((fdesc, obj, value)))));
                 }
+                roots.push(ctx.alloc_root(CILRoot::VoidRet));
+                let ctor_name = ctx.alloc_string(".ctor");
+                let ctor_def = MethodDef::new(
+                    Access::Extern,
+                    class_idx,
+                    ctor_name,
+                    ctor_sig,
+                    MethodKind::Constructor,
+                    MethodImpl::MethodBody {
+                        blocks: vec![BasicBlock::new(roots, 0, None)],
+                        locals: vec![],
+                    },
+                    vec![None; n_inputs],
+                );
+                ctx.new_method(ctor_def);
             }
-            roots.push(ctx.alloc_root(CILRoot::VoidRet));
-            let blocks = vec![BasicBlock::new(roots, 0, None)];
-            let ctor_name = ctx.alloc_string(".ctor");
-            let ctor_def = MethodDef::new(
-                Access::Extern,
-                class_idx,
-                ctor_name,
-                ctor_sig,
-                MethodKind::Constructor,
-                MethodImpl::MethodBody {
-                    blocks,
-                    locals: vec![],
-                },
-                vec![None; n_inputs],
-            );
-            ctx.new_method(ctor_def);
+
+            // Parameterless default ctor `.ctor(this)`: `ldarg.0; call base::.ctor(); ret`. Emitted
+            // when explicitly requested, or implicitly whenever no primary ctor exists (so every
+            // reference class has at least one ctor). When BOTH exist they overload by arity.
+            if class.has_default_ctor || !class.has_primary_ctor {
+                let ctor_sig = ctx.sig([self_ty], Type::Void);
+                let this = ctx.alloc_node(CILNode::LdArg(0));
+                let call_base = ctx.alloc_root(CILRoot::call(base_ctor, [this]));
+                let ret = ctx.alloc_root(CILRoot::VoidRet);
+                let ctor_name = ctx.alloc_string(".ctor");
+                let ctor_def = MethodDef::new(
+                    Access::Extern,
+                    class_idx,
+                    ctor_name,
+                    ctor_sig,
+                    MethodKind::Constructor,
+                    MethodImpl::MethodBody {
+                        blocks: vec![BasicBlock::new(vec![call_base, ret], 0, None)],
+                        locals: vec![],
+                    },
+                    vec![None],
+                );
+                ctx.new_method(ctor_def);
+            }
 
             // For a primary-ctor (record-like) class, also emit a public accessor per field —
             // `read_<field>(this) -> field_ty` = `ldarg.0; ldfld field; ret` — so a managed caller can
@@ -340,7 +449,6 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                     let this = ctx.alloc_node(CILNode::LdArg(0));
                     let load = ctx.ld_field(this, fdesc);
                     let ret = ctx.alloc_root(CILRoot::Ret(load));
-                    let self_ty = Type::ClassRef(*class_idx);
                     let getter_sig = ctx.sig([self_ty], *tpe);
                     let getter_name = ctx.alloc_string(format!("read_{fname}"));
                     let getter_def = MethodDef::new(
@@ -356,6 +464,34 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                         vec![None],
                     );
                     ctx.new_method(getter_def);
+                }
+            }
+
+            // Field setters: `set_<field>(this, value)` = `ldarg.0; ldarg.1; stfld field; ret`, paired
+            // with the `read_<field>` accessor so a managed caller can update the field state too.
+            if class.has_field_setters {
+                for (tpe, fname) in &class.fields {
+                    let fname_str = ctx.alloc_string(fname.clone());
+                    let fdesc = ctx.alloc_field(FieldDesc::new(*class_idx, fname_str, *tpe));
+                    let obj = ctx.alloc_node(CILNode::LdArg(0));
+                    let value = ctx.alloc_node(CILNode::LdArg(1));
+                    let store = ctx.alloc_root(CILRoot::SetField(Box::new((fdesc, obj, value))));
+                    let ret = ctx.alloc_root(CILRoot::VoidRet);
+                    let setter_sig = ctx.sig([self_ty, *tpe], Type::Void);
+                    let setter_name = ctx.alloc_string(format!("set_{fname}"));
+                    let setter_def = MethodDef::new(
+                        Access::Extern,
+                        class_idx,
+                        setter_name,
+                        setter_sig,
+                        MethodKind::Virtual,
+                        MethodImpl::MethodBody {
+                            blocks: vec![BasicBlock::new(vec![store, ret], 0, None)],
+                            locals: vec![],
+                        },
+                        vec![None, None],
+                    );
+                    ctx.new_method(setter_def);
                 }
             }
         }

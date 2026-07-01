@@ -50,8 +50,8 @@ pub fn rustc_codegen_clr_add_field_def<T, const FNAME: &'static str>(class: Clas
     diverge!()
 }
 
-/// Add a virtual method `FNAME` aliasing the ordinary Rust fn `fn_type` (which takes the receiver as
-/// its first explicit argument).
+/// Add a virtual (instance) method `FNAME` aliasing the ordinary Rust fn `fn_type` (which takes the
+/// receiver as its first explicit argument).
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_codegen_clr_add_method_def<
@@ -66,12 +66,43 @@ pub fn rustc_codegen_clr_add_method_def<
     diverge!()
 }
 
+/// Add a `static` method `FNAME` aliasing the ordinary Rust fn `fn_type`. Unlike
+/// [`rustc_codegen_clr_add_method_def`], a static method has no receiver — its parameter list is the
+/// Rust fn's signature verbatim — so a managed caller invokes it as `<Class>.FNAME(…)`.
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_codegen_clr_add_static_method_def<const FNAME: &'static str, FnType>(
+    class: ClassDef,
+    fn_type: FnType,
+) -> ClassDef {
+    diverge!()
+}
+
 /// Request a *primary constructor*: a field-initializing `.ctor(field0, field1, …)` over the declared
 /// fields, in declaration order — so a managed caller (C#) can `new <Name>(…)` and get an instance
 /// with its fields set. (The backend synthesizes the ctor body; no Rust fn is aliased.)
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_codegen_clr_add_primary_ctor(class: ClassDef) -> ClassDef {
+    diverge!()
+}
+
+/// Request an additional *parameterless* constructor `.ctor()` (in addition to any primary ctor),
+/// which chains to the base ctor and zero-initializes the fields — so a managed caller can
+/// `new <Name>()` and get a default instance. Overloads the primary ctor (distinct arity), giving the
+/// class multiple constructors. (The backend synthesizes the body; no Rust fn is aliased.)
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_codegen_clr_add_default_ctor(class: ClassDef) -> ClassDef {
+    diverge!()
+}
+
+/// Request that each declared field also gets a public `set_<field>(value)` mutator (a paired setter
+/// for the `read_<field>` accessor the primary ctor already emits) — so a managed caller can both
+/// observe and update the field state through methods. (The backend synthesizes the bodies.)
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_codegen_clr_add_field_setters(class: ClassDef) -> ClassDef {
     diverge!()
 }
 
