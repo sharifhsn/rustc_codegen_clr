@@ -164,6 +164,134 @@ fn main() -> std::process::ExitCode {
     chk!(u.to_rust_string().as_str(), "héllo");
     chk!(std::format!("{}", u).as_str(), "héllo");
 
+    // ---------- SortedDictionary<i32, i64> (key-ordered) ----------
+    let mut sd = SortedDictionary::<i32, i64>::new();
+    sd.insert(3, 300);
+    sd.insert(1, 100);
+    sd.insert(2, 200);
+    sd.insert(1, 111); // overwrite
+    chk!(sd.len(), 3);
+    chk!(sd.get(1), Some(111));
+    chk!(sd.get(2), Some(200));
+    chk!(sd.get(99), None);
+    chk!(sd.contains_key(3), true);
+    chk!(sd.get_or_default(2, -1), 200);
+    chk!(sd.get_or_default(9, -1), -1);
+    chk!(sd.remove(2), true);
+    chk!(sd.remove(2), false); // already gone
+    chk!(sd.contains_key(2), false);
+    chk!(sd.len(), 2);
+
+    // ---------- SortedSet<i32> (ordered; iterates ascending) ----------
+    let mut ss = SortedSet::<i32>::new();
+    chk!(ss.insert(30), true);
+    chk!(ss.insert(10), true);
+    chk!(ss.insert(20), true);
+    chk!(ss.insert(10), false); // duplicate
+    chk!(ss.len(), 3);
+    chk!(ss.contains(20), true);
+    chk!(ss.contains(999), false);
+    // Enumeration yields ascending order (10,20,30).
+    let mut sorted = std::vec::Vec::new();
+    for v in &ss {
+        sorted.push(v);
+    }
+    chk!(sorted, std::vec![10, 20, 30]);
+    chk!(ss.remove(20), true);
+    chk!(ss.contains(20), false);
+    // FromIterator / Extend
+    let mut ss2: SortedSet<i32> = std::vec![5, 1, 3].into_iter().collect();
+    ss2.extend(std::vec![2, 4]);
+    let mut ss2v = std::vec::Vec::new();
+    for v in &ss2 {
+        ss2v.push(v);
+    }
+    chk!(ss2v, std::vec![1, 2, 3, 4, 5]);
+
+    // ---------- LinkedList<i32> ----------
+    let mut ll = LinkedList::<i32>::new();
+    ll.push_back(1);
+    ll.push_back(2);
+    ll.push_back(3);
+    chk!(ll.len(), 3);
+    chk!(ll.contains(2), true);
+    chk!(ll.contains(99), false);
+    let mut llv = std::vec::Vec::new();
+    for v in &ll {
+        llv.push(v); // front-to-back
+    }
+    chk!(llv, std::vec![1, 2, 3]);
+    chk!(ll.remove(2), true);
+    chk!(ll.remove(2), false);
+    let mut llv2 = std::vec::Vec::new();
+    for v in &ll {
+        llv2.push(v);
+    }
+    chk!(llv2, std::vec![1, 3]);
+    // FromIterator
+    let ll2: LinkedList<i32> = std::vec![7, 8, 9].into_iter().collect();
+    chk!(ll2.len(), 3);
+
+    // ---------- PriorityQueue<i32, i32> (min-priority) ----------
+    let mut pq = PriorityQueue::<i32, i32>::new();
+    pq.enqueue(100, 5); // element 100 with priority 5
+    pq.enqueue(200, 1); // priority 1 -> dequeues first
+    pq.enqueue(300, 3);
+    chk!(pq.len(), 3);
+    chk!(pq.peek(), Some(200)); // lowest priority (1)
+    chk!(pq.dequeue(), Some(200));
+    chk!(pq.dequeue(), Some(300)); // priority 3 next
+    chk!(pq.dequeue(), Some(100)); // priority 5 last
+    chk!(pq.dequeue(), None); // empty -> None
+    chk!(pq.peek(), None);
+    chk!(pq.is_empty(), true);
+
+    // ---------- ConcurrentDictionary<i32, i64> ----------
+    let mut cd = ConcurrentDictionary::<i32, i64>::new();
+    chk!(cd.is_empty(), true);
+    cd.insert(1, 100);
+    chk!(cd.try_add(1, 999), false); // key exists -> not added, not overwritten
+    chk!(cd.get(1), Some(100)); // still 100
+    chk!(cd.try_add(2, 200), true); // new key -> added
+    chk!(cd.get(2), Some(200));
+    chk!(cd.get(99), None);
+    chk!(cd.contains_key(1), true);
+    chk!(cd.len(), 2);
+    chk!(cd.is_empty(), false);
+    chk!(cd.get_or_default(2, -1), 200);
+    chk!(cd.get_or_default(9, -1), -1);
+    cd.clear();
+    chk!(cd.is_empty(), true);
+
+    // ---------- ConcurrentQueue<i32> (produce then drain-by-iteration) ----------
+    let mut cq = ConcurrentQueue::<i32>::new();
+    chk!(cq.is_empty(), true);
+    cq.enqueue(10);
+    cq.enqueue(20);
+    cq.enqueue(30);
+    chk!(cq.len(), 3);
+    chk!(cq.is_empty(), false);
+    let mut cqv = std::vec::Vec::new();
+    for v in &cq {
+        cqv.push(v); // FIFO snapshot
+    }
+    chk!(cqv, std::vec![10, 20, 30]);
+
+    // ---------- ConcurrentBag<i32> (add then drain-by-iteration) ----------
+    let mut cb = ConcurrentBag::<i32>::new();
+    chk!(cb.is_empty(), true);
+    cb.add(1);
+    cb.add(2);
+    cb.add(3);
+    chk!(cb.len(), 3);
+    chk!(cb.is_empty(), false);
+    // Unordered, so check via a sum (order not guaranteed).
+    let mut bagsum = 0i32;
+    for v in &cb {
+        bagsum += v;
+    }
+    chk!(bagsum, 6);
+
     Console::writeln_u64(pass as u64);
     Console::writeln_u64(total as u64);
     if pass == total {

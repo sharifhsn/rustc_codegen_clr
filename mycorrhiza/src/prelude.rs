@@ -19,7 +19,10 @@
 //! [`crate::intrinsics`] magic. Reach into the fuller module paths when you need the raw handles.
 
 // The .NET generic collections, used like `std`.
-pub use crate::collections::{Dictionary, HashSet, List, ListIter, Queue, Stack};
+pub use crate::collections::{
+    ConcurrentBag, ConcurrentDictionary, ConcurrentQueue, Dictionary, HashSet, LinkedList, List,
+    ListIter, PriorityQueue, Queue, SortedDictionary, SortedSet, Stack,
+};
 
 // The idiomatic BCL type wrappers — used like normal Rust types (`DateTime::now()`, `Guid::new_v4()`,
 // `Regex::new(..)`, `Math::sqrt(..)`, …). `TimeSpan` is re-exported under its idiomatic name (the
