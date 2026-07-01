@@ -43,6 +43,10 @@ pub use crate::enumerate::{Enumerable, Enumerator};
 // The idiomatic managed `System.String` wrapper (Display / == / Hash) and the raw handle alias.
 pub use crate::system::{DotNetString, MString};
 
+// Idiomatic error/optional-value bridges: `null` ↔ `Option` (`Nullable::map_present` / `from_nullable`)
+// and a thrown .NET exception ↔ `Result` (`try_managed` / the `.try_()` combinator).
+pub use crate::error::{from_nullable, try_managed, ManagedException, Nullable, TryManaged};
+
 // The single-codepoint managed `char`.
 pub use crate::DotNetChar;
 

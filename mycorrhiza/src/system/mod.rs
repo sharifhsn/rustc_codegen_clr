@@ -86,11 +86,149 @@ impl DotNetString {
             .map(|r| r.unwrap_or(core::char::REPLACEMENT_CHARACTER))
             .collect()
     }
+
+    // ---- The common `System.String` methods, surfaced idiomatically. Each delegates to the real
+    // ---- BCL member on the underlying `System.String` handle (the same concrete type as
+    // ---- `System::String`, so its instance methods are inherent on `MString`).
+
+    /// The empty managed string (`""`).
+    #[inline(always)]
+    pub fn empty() -> Self {
+        DotNetString::from("")
+    }
+    /// Whether the string has zero UTF-16 code units.
+    #[inline(always)]
+    pub fn is_empty(self) -> bool {
+        self.len_utf16() == 0
+    }
+    /// `String.Contains` — whether `needle` occurs as a substring.
+    #[inline(always)]
+    pub fn contains(self, needle: DotNetString) -> bool {
+        self.0.instance1::<"Contains", MString, bool>(needle.0)
+    }
+    /// `String.StartsWith` (ordinal) — whether the string begins with `prefix`.
+    #[inline(always)]
+    pub fn starts_with(self, prefix: DotNetString) -> bool {
+        self.0.instance1::<"StartsWith", MString, bool>(prefix.0)
+    }
+    /// `String.EndsWith` (ordinal) — whether the string ends with `suffix`.
+    #[inline(always)]
+    pub fn ends_with(self, suffix: DotNetString) -> bool {
+        self.0.instance1::<"EndsWith", MString, bool>(suffix.0)
+    }
+    /// `String.IndexOf` — the UTF-16 code-unit index of the first occurrence of `needle`, or `-1`.
+    #[inline(always)]
+    pub fn index_of(self, needle: DotNetString) -> i32 {
+        self.0.instance1::<"IndexOf", MString, i32>(needle.0)
+    }
+    /// `String.ToUpperInvariant` — an uppercased copy (culture-invariant).
+    #[inline(always)]
+    pub fn to_upper(self) -> DotNetString {
+        DotNetString(self.0.instance0::<"ToUpperInvariant", MString>())
+    }
+    /// `String.ToLowerInvariant` — a lowercased copy (culture-invariant).
+    #[inline(always)]
+    pub fn to_lower(self) -> DotNetString {
+        DotNetString(self.0.instance0::<"ToLowerInvariant", MString>())
+    }
+    /// `String.Trim` — a copy with leading/trailing whitespace removed.
+    #[inline(always)]
+    pub fn trim(self) -> DotNetString {
+        DotNetString(self.0.instance0::<"Trim", MString>())
+    }
+    /// `String.Substring(start)` — the tail of the string from UTF-16 index `start`.
+    #[inline(always)]
+    pub fn substring(self, start: i32) -> DotNetString {
+        DotNetString(self.0.instance1::<"Substring", i32, MString>(start))
+    }
+    /// `String.Replace(old, new)` — every occurrence of `old` replaced by `new`.
+    #[inline(always)]
+    pub fn replace(self, old: DotNetString, new: DotNetString) -> DotNetString {
+        DotNetString(
+            self.0
+                .instance2::<"Replace", MString, MString, MString>(old.0, new.0),
+        )
+    }
+    /// `String.Concat(a, b)` — the concatenation of two managed strings.
+    #[inline(always)]
+    pub fn concat(self, other: DotNetString) -> DotNetString {
+        DotNetString(MString::static2::<"Concat", MString, MString, MString>(
+            self.0, other.0,
+        ))
+    }
+    /// `String.CompareOrdinal` — ordinal (code-unit) ordering: `<0`, `0`, or `>0`.
+    #[inline(always)]
+    fn compare_ordinal(self, other: DotNetString) -> i32 {
+        MString::static2::<"CompareOrdinal", MString, MString, i32>(self.0, other.0)
+    }
 }
 
 impl From<&str> for DotNetString {
     fn from(val: &str) -> Self {
         DotNetString(MString::from(val))
+    }
+}
+
+impl From<&std::string::String> for DotNetString {
+    fn from(val: &std::string::String) -> Self {
+        DotNetString::from(val.as_str())
+    }
+}
+
+impl From<DotNetString> for std::string::String {
+    fn from(val: DotNetString) -> Self {
+        val.to_rust_string()
+    }
+}
+
+impl core::str::FromStr for DotNetString {
+    type Err = core::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(DotNetString::from(s))
+    }
+}
+
+impl Default for DotNetString {
+    /// The empty managed string (`""`).
+    fn default() -> Self {
+        DotNetString::empty()
+    }
+}
+
+// Seamless `&str` comparison so `dotnet_string == "literal"` reads naturally.
+impl PartialEq<&str> for DotNetString {
+    fn eq(&self, other: &&str) -> bool {
+        *self == DotNetString::from(*other)
+    }
+}
+impl PartialEq<DotNetString> for &str {
+    fn eq(&self, other: &DotNetString) -> bool {
+        DotNetString::from(*self) == *other
+    }
+}
+
+impl core::cmp::PartialOrd for DotNetString {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl core::cmp::Ord for DotNetString {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        // Ordinal (code-unit) ordering, consistent with the ordinal `PartialEq` above.
+        self.compare_ordinal(*other).cmp(&0)
+    }
+}
+
+// `a + b` and `a += b` concatenate, like Rust's `String`.
+impl core::ops::Add for DotNetString {
+    type Output = DotNetString;
+    fn add(self, rhs: DotNetString) -> DotNetString {
+        self.concat(rhs)
+    }
+}
+impl core::ops::AddAssign for DotNetString {
+    fn add_assign(&mut self, rhs: DotNetString) {
+        *self = self.concat(rhs);
     }
 }
 

@@ -40,6 +40,10 @@ pub mod comptime;
 /// The enumerator bridge — wrap any .NET `IEnumerator<T>` as a Rust `impl Iterator<Item = T>`. This
 /// is what backs by-reference iteration (`for x in &list`) over the [`collections`] wrappers.
 pub mod enumerate;
+/// Idiomatic error/optional-value bridges: managed `null` ↔ [`Option`](core::option::Option) and a
+/// thrown .NET exception ↔ [`Result`](core::result::Result) via the interop `try/catch` primitive
+/// (`try_managed` / the `.try_()` combinator).
+pub mod error;
 /// WF-9 generic-interop ergonomics macros (`dotnet_generic!` / `dotnet_generic_impl!` / `gen!`),
 /// which remove the hand-written `rustc_clr_interop_generic_*` turbofish boilerplate. The macros are
 /// `#[macro_export]`ed, so they are also reachable at the crate root (`mycorrhiza::dotnet_generic!`).
