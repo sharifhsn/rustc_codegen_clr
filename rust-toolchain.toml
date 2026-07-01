@@ -1,3 +1,6 @@
 [toolchain]
-channel = "nightly"
+# Pinned: this tree is ported to (and verified on) this exact nightly. A bare "nightly" makes a
+# fresh checkout grab *today's* nightly, which almost never compiles a rustc_private backend
+# (see feasibility/PORT_NOTES.md for the re-port playbook when bumping).
+channel = "nightly-2026-06-17"
 components = ["rustfmt", "clippy", "rust-src", "rustc-dev", "llvm-tools-preview"]
