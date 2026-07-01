@@ -14,6 +14,14 @@ stands, the exact patterns to copy, and where to start. The *what-to-build* back
   explicitly asks). End every commit message with
   `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
 - **The interop/ergonomics arc that just shipped** (newest first):
+  - **Delegates & callbacks** (Theme-3 ⚑, `5277560`) — a Rust `extern "C" fn` becomes a real managed
+    `Action`/`Func`/`Comparison` delegate that .NET invokes via `callvirt Delegate::Invoke`. New magic
+    fn `rustc_clr_interop_delegate` (`src/terminator/call.rs`) synthesises a memoised per-signature
+    **shim class** (holds the native ptr, `calli`s it from `Invoke`) then `newobj`s the generic delegate
+    over `ldftn shim::Invoke` — the `ThreadStart`/`insert_dotnet_thread_spawn` dance generalised. Face:
+    `mycorrhiza::delegate` (`Action1/2`, `Func1/2`, `Comparison`; in the prelude). Proof: `cd_delegates`
+    14/14. Follow-ups: closure captures, delegate-as-generic-method-arg (needs a nested-`!N`-binding
+    typecheck extension — do NOT just relax the checker), .NET events.
   - **`#[dotnet_export]`** (Theme-4 ⚑) — `#[dotnet_export] fn greet(name: &str) -> String` → C# calls
     `MainModule.greet("x")` and gets a `string`, NO `(ptr,len)` dance. Proc-macro in `dotnet_macros`;
     `&str`/`String` cross as a real managed `System.String` (the `MString` seam) so there is **zero
