@@ -38,6 +38,15 @@
   <!-- Defaults (RustDotnetTarget, RustDotnetForceBuild, RustDotnetToolPath, …). -->
   <Import Project="$(MSBuildThisFileDirectory)RustDotnet.props" />
 
+  <!-- Opt-in: compile the shipped reusable C#->Rust generic containers
+       (RustDotnet.RustVec<T> / RustDotnet.RustBoxVec<T>) into this project. Enable with
+       <UseRustDotnetContainers>true</UseRustDotnetContainers>. The consuming Rust cdylib must have
+       invoked `mycorrhiza::export_rust_containers!()` so `MainModule.rcl_vec_*` exists — otherwise the
+       C# compile fails with an unresolved-member error (a clear signal, not a silent break). -->
+  <ItemGroup Condition="'$(UseRustDotnetContainers)'=='true'">
+    <Compile Include="$(MSBuildThisFileDirectory)RustDotnet.Containers.cs" />
+  </ItemGroup>
+
   <!-- ====================================================================== -->
   <!-- 1. FindCargoDotnet — resolve $(_CargoDotnetExe), the INSTALLED tool.    -->
   <!--    Probe order: <CargoDotnet> prop > $CARGO_DOTNET_HOME/cargo-dotnet >  -->

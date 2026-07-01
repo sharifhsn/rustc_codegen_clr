@@ -1,0 +1,17 @@
+[package]
+name = "cd_containers"
+edition = "2021"
+version = "0.1.0"
+
+[lib]
+# The Rust side of the reusable C#->Rust container: this crate's ENTIRE body is one macro call that
+# emits `MainModule.rcl_vec_*` into the produced .NET assembly. The C# consumer's RustVec<T>/
+# RustBoxVec<T> (shipped RustDotnet.Containers.cs, auto-included) call those.
+crate-type = ["cdylib"]
+
+[dependencies]
+mycorrhiza = { path = "../../../mycorrhiza" }
+[workspace]
+
+[profile.release.build-override]
+codegen-units = 1

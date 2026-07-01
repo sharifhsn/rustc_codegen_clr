@@ -27,6 +27,9 @@ pub mod class;
 /// `Dictionary<K, V>`, `HashSet<T>`, `Stack<T>`, `Queue<T>`) — backed by real managed objects, used
 /// like `std`. Built on [`generic_bridge`]; no CLR-interop knowledge required at the call site.
 pub mod collections;
+/// The reusable C#→Rust generic container: [`export_rust_containers!`] emits a size-erased byte
+/// vector into your `cdylib`, backing the shipped C# `RustDotnet.RustVec<T>` / `RustBoxVec<T>`.
+pub mod containers;
 /// Comptime type-export intrinsics — defining a managed .NET class from Rust (used by the
 /// `dotnet_macros::dotnet_class` proc-macro and the declarative `dotnet_typedef!`).
 pub mod comptime;

@@ -327,8 +327,10 @@ cd_setup(){
   # msbuild/README.md + docs/INTEROP_CSHARP.md.
   if [ -d "$FROM_REPO/msbuild" ]; then
     rm -rf "$HOME_DIR/msbuild"; mkdir -p "$HOME_DIR/msbuild"
-    cp -f "$FROM_REPO/msbuild/RustDotnet.targets" "$HOME_DIR/msbuild/RustDotnet.targets"
-    cp -f "$FROM_REPO/msbuild/RustDotnet.props"   "$HOME_DIR/msbuild/RustDotnet.props"
+    cp -f "$FROM_REPO/msbuild/RustDotnet.targets"    "$HOME_DIR/msbuild/RustDotnet.targets"
+    cp -f "$FROM_REPO/msbuild/RustDotnet.props"      "$HOME_DIR/msbuild/RustDotnet.props"
+    # The reusable C#->Rust container wrappers, auto-included when <UseRustDotnetContainers>true.
+    cp -f "$FROM_REPO/msbuild/RustDotnet.Containers.cs" "$HOME_DIR/msbuild/RustDotnet.Containers.cs"
   fi
   # VERSION manifest.
   {
