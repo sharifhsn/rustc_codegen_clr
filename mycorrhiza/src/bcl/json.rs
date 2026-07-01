@@ -1,66 +1,66 @@
 //! Idiomatic Rust wrapper over `System.Text.Json` (assembly `System.Text.Json`) — **parse** a JSON
 //! string into a navigable document, **navigate** it (property lookup, array indexing, typed scalar
-//! reads), and **serialize** a document back to a string.
+//! reads), and **serialize** it back to a string.
 //!
-//! The value model is `System.Text.Json.JsonDocument` (owning the parsed tree) plus its
-//! `System.Text.Json.JsonElement` value type (a read-only cursor into the tree). `JsonElement`
-//! exposes plain, non-generic instance members that map cleanly onto Rust — `GetProperty(string)`
-//! for objects, an `this[int]` indexer for arrays, `GetArrayLength()`, a `ValueKind` discriminant,
-//! and the typed leaf reads `GetString`/`GetInt64`/`GetDouble`/`GetBoolean`. No enumerators,
-//! delegates, or generic method instantiations are needed at the seam, so this is a thin, honest
-//! mapping onto real managed members.
+//! The value model is `System.Text.Json.Nodes.JsonNode` (the mutable DOM). Unlike the read-only
+//! `JsonElement` *value type* — which embeds a managed `JsonDocument` reference and so cannot be
+//! carried inside a Rust `Option`/enum at the interop seam — `JsonNode` is a plain reference type: a
+//! bare managed-object handle that composes cleanly. It exposes non-generic instance members that map
+//! onto Rust: an object indexer (`node["prop"]`), an array indexer (`node[i]`), an array `Count`, a
+//! `GetValueKind()` discriminant, and `ToJsonString()`/`ToString()` for (re)serialization. No
+//! enumerators, delegates, or generic method instantiations are needed at the seam.
 //!
 //! ```ignore
 //! use mycorrhiza::bcl::json::Json;
 //!
 //! let doc = Json::parse(r#"{ "name": "ada", "age": 36, "tags": ["a", "b"] }"#).unwrap();
-//! assert_eq!(doc.root().get("name").and_then(|n| n.as_str()).as_deref(), Some("ada"));
-//! assert_eq!(doc.root().get("age").and_then(|n| n.as_i64()), Some(36));
-//! assert_eq!(doc.root().get("tags").map(|t| t.len()), Some(2));
-//! assert_eq!(
-//!     doc.root().get("tags").and_then(|t| t.index(0)).and_then(|n| n.as_str()).as_deref(),
-//!     Some("a"),
-//! );
-//! let s = doc.root().to_json_string();      // re-serialize
+//! assert_eq!(doc.get("name").and_then(|n| n.as_str()).as_deref(), Some("ada"));
+//! assert_eq!(doc.get("age").and_then(|n| n.as_i64()), Some(36));
+//! assert_eq!(doc.get("tags").map(|t| t.len()), Some(2));
+//! assert_eq!(doc.get("tags").and_then(|t| t.index(0)).and_then(|n| n.as_str()).as_deref(), Some("a"));
+//! let s = doc.to_json_string();      // re-serialize
 //! ```
 //!
 //! ## Scope
 //! `parse` / navigation (`get`, `index`, `len`, `kind`) / the scalar reads
 //! (`as_str`, `as_i64`, `as_f64`, `as_bool`, `is_null`) / `to_json_string` are surfaced. Anything
-//! beyond — mutation, `JsonSerializer<T>` (which needs a generic method instantiation), enumeration
-//! of an object's properties (needs the enumerator bridge) — is not, but the raw handles are
-//! reachable via [`Json::handle`] / [`Value::handle`] for lower-level BCL calls.
+//! beyond — construction/mutation, `JsonSerializer<T>` (needs a generic method instantiation),
+//! enumeration of an object's properties (needs the enumerator bridge) — is not, but the raw
+//! [`JsonNode`](NodeHandle) handle is reachable via [`Json::handle`] for lower-level BCL calls.
+//!
+//! ## `as_i64` / `as_f64` honesty
+//! `JsonNode`'s typed value reads (`GetValue<long>()`) are *generic method* instantiations, which the
+//! interop seam does not model. So numeric reads decode the node's own canonical text
+//! (`JsonNode.ToJsonString()`, which for a number is its exact JSON token) with Rust's `str::parse`.
+//! This is deterministic and lossless for values that fit the target type; anything else yields
+//! `None`. `as_str` is exact: `JsonNode.ToString()` on a string value returns its raw content.
 
+use crate::error::try_managed;
 use crate::intrinsics::{RustcCLRInteropManagedClass, RustcCLRInteropManagedStruct};
 use crate::system::{DotNetString, MString};
 
 const ASM: &str = "System.Text.Json";
-const JSON_DOCUMENT: &str = "System.Text.Json.JsonDocument";
-const JSON_ELEMENT: &str = "System.Text.Json.JsonElement";
-const JSON_DOC_OPTIONS: &str = "System.Text.Json.JsonDocumentOptions";
+const JSON_NODE: &str = "System.Text.Json.Nodes.JsonNode";
+const JSON_ARRAY: &str = "System.Text.Json.Nodes.JsonArray";
+const JSON_NODE_OPTS_N: &str = "System.Nullable`1<System.Text.Json.Nodes.JsonNodeOptions>";
+const JSON_DOC_OPTS: &str = "System.Text.Json.JsonDocumentOptions";
 
-/// A managed `System.Text.Json.JsonDocument` handle (a reference type owning the parsed tree).
-type DocHandle = RustcCLRInteropManagedClass<{ ASM }, { JSON_DOCUMENT }>;
-
-/// `sizeof(System.Text.Json.JsonElement)`. `JsonElement` is a small readonly struct: a `JsonDocument`
-/// object reference (pointer-sized) plus two `int` cursors (`_idx`, `_row`) — 16 bytes on a 64-bit
-/// runtime.
-const JSON_ELEMENT_SIZE: usize = 16;
-/// The managed value-type handle for `System.Text.Json.JsonElement`.
-type ElemHandle = RustcCLRInteropManagedStruct<{ ASM }, { JSON_ELEMENT }, JSON_ELEMENT_SIZE>;
-
-/// `sizeof(System.Text.Json.JsonDocumentOptions)`: `int MaxDepth` + `JsonCommentHandling`
-/// (byte-backed enum) + `bool AllowTrailingCommas`, laid out as 8 bytes. Only ever passed as its
-/// all-zero **default** value, so a zeroed handle is the correct `default(JsonDocumentOptions)`.
-const JSON_DOC_OPTIONS_SIZE: usize = 8;
-/// The managed value-type handle for `System.Text.Json.JsonDocumentOptions`.
-type DocOptsHandle = RustcCLRInteropManagedStruct<{ ASM }, { JSON_DOC_OPTIONS }, JSON_DOC_OPTIONS_SIZE>;
+/// A managed `System.Text.Json.Nodes.JsonNode` handle (an object, array, value, or `null`).
+type NodeHandle = RustcCLRInteropManagedClass<{ ASM }, { JSON_NODE }>;
+/// A managed `System.Text.Json.Nodes.JsonArray` handle (a `JsonNode` subclass exposing `Count`).
+type ArrayHandle = RustcCLRInteropManagedClass<{ ASM }, { JSON_ARRAY }>;
+/// A managed `System.Nullable<JsonNodeOptions>` value (2 bytes: a bool flag + a bool option). Only
+/// its all-zero (`None`) default is ever passed to `Parse`.
+type NodeOptsHandle = RustcCLRInteropManagedStruct<{ ASM }, { JSON_NODE_OPTS_N }, 2>;
+/// A managed `System.Text.Json.JsonDocumentOptions` value (8 bytes: an `int`, a byte enum, a bool).
+/// Only its all-zero default is ever passed to `Parse`.
+type DocOptsHandle = RustcCLRInteropManagedStruct<{ ASM }, { JSON_DOC_OPTS }, 8>;
 
 /// The `JsonValueKind` discriminant (`System.Text.Json.JsonValueKind`), an `int32`-backed enum.
 /// The numeric values are the stable .NET enum values.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
-    /// No value (a detached / default element) — `JsonValueKind.Undefined` (0).
+    /// No value (a detached / default node) — `JsonValueKind.Undefined` (0).
     Undefined,
     /// A JSON object `{ … }` — `JsonValueKind.Object` (1).
     Object,
@@ -99,126 +99,121 @@ fn net(s: &str) -> MString {
     DotNetString::from(s).handle()
 }
 
-/// A parsed JSON document (`System.Text.Json.JsonDocument`).
+/// A parsed, navigable JSON document — a handle to a managed `JsonNode`.
 ///
-/// A move-only handle; the .NET GC owns the underlying `JsonDocument` (no `Drop` — `Dispose` is not
-/// called, which is fine on the GC heap). Obtain the root cursor with [`root`](Json::root), then walk
-/// it with [`Value::get`] / [`Value::index`] and read leaves with [`Value::as_str`] etc.
+/// A move-only handle; the .NET GC owns the underlying object (no `Drop`). Obtain the root with
+/// [`Json::parse`], then walk it with [`get`](Json::get) / [`index`](Json::index) and read leaves
+/// with [`as_str`](Json::as_str) / [`as_i64`](Json::as_i64) / [`as_bool`](Json::as_bool).
 pub struct Json {
-    h: DocHandle,
+    h: NodeHandle,
 }
 
 impl Json {
-    /// Parse `text` into a `JsonDocument` (`JsonDocument.Parse(string, JsonDocumentOptions)` with the
-    /// default options). Malformed JSON throws a `JsonException` on the .NET side; that is surfaced
-    /// here as `None`.
+    /// Parse `text` into a `JsonNode` DOM
+    /// (`JsonNode.Parse(string, JsonNodeOptions?, JsonDocumentOptions)`, default options). The JSON
+    /// literal `null` parses to a managed-`null` node and is surfaced as `None`; malformed input
+    /// throws a `JsonException` on the .NET side, which is caught and also surfaced as `None`.
     pub fn parse(text: &str) -> Option<Json> {
-        // The default (all-zero) `JsonDocumentOptions`.
-        let opts: DocOptsHandle = unsafe { core::mem::zeroed() };
+        let node_opts: NodeOptsHandle = unsafe { core::mem::zeroed() };
+        let doc_opts: DocOptsHandle = unsafe { core::mem::zeroed() };
         let net_text = net(text);
-        let h = DocHandle::static2::<"Parse", MString, DocOptsHandle, DocHandle>(net_text, opts);
-        Some(Json { h })
+        // `JsonNode.Parse` is a 3-arg static (the two option params have C# defaults but the IL method
+        // takes all three). No `static3` on the class wrapper, so call the raw call3 intrinsic with
+        // IS_STATIC = true.
+        let parsed = try_managed(|| {
+            crate::intrinsics::rustc_clr_interop_managed_call3_::<
+                { ASM },
+                { JSON_NODE },
+                false,
+                "Parse",
+                true,
+                NodeHandle,
+                MString,
+                NodeOptsHandle,
+                DocOptsHandle,
+            >(net_text, node_opts, doc_opts)
+        })
+        .ok()?;
+        Self::wrap(parsed)
     }
 
-    /// The root element of the document (`JsonDocument.RootElement`).
-    pub fn root(&self) -> Value {
-        Value {
-            h: self.h.instance0::<"get_RootElement", ElemHandle>(),
+    #[inline(always)]
+    fn wrap(h: NodeHandle) -> Option<Json> {
+        let j = Json { h };
+        if j.h.is_null() {
+            None
+        } else {
+            Some(j)
         }
     }
 
-    /// The raw managed [`JsonDocument`](DocHandle) handle, for lower-level BCL calls.
-    pub fn handle(&self) -> DocHandle {
-        self.h
-    }
-}
-
-/// A cursor into a parsed [`Json`] document — one `System.Text.Json.JsonElement` value.
-///
-/// A `Copy` value type (no GC), valid only while its owning [`Json`] is alive. Read its kind with
-/// [`kind`](Value::kind), navigate with [`get`](Value::get) (objects) / [`index`](Value::index)
-/// (arrays), and read leaves with [`as_str`](Value::as_str) / [`as_i64`](Value::as_i64) /
-/// [`as_f64`](Value::as_f64) / [`as_bool`](Value::as_bool).
-#[derive(Clone, Copy)]
-pub struct Value {
-    h: ElemHandle,
-}
-
-impl Value {
-    /// The value kind of this element (`JsonElement.ValueKind`).
+    /// The value kind of this node (`JsonNode.GetValueKind()`).
     pub fn kind(&self) -> Kind {
-        Kind::from_i32(self.h.vt_instance0::<"get_ValueKind", i32>())
+        Kind::from_i32(self.h.instance0::<"GetValueKind", i32>())
     }
 
-    /// The child under property `name` for an **object** element (`JsonElement.GetProperty(string)`),
-    /// or `None` if this is not an object or the property is absent. (`GetProperty` throws
-    /// `KeyNotFoundException` on a missing property; that is caught and surfaced as `None`.)
-    pub fn get(&self, name: &str) -> Option<Value> {
+    /// The child under property `name` for an **object** node (`JsonNode.get_Item(string)`), or
+    /// `None` if this is not an object or the property is absent / JSON `null`.
+    pub fn get(&self, name: &str) -> Option<Json> {
         if self.kind() != Kind::Object {
             return None;
         }
-        let key = net(name);
-        Some(Value {
-            h: self.h.vt_instance1::<"GetProperty", MString, ElemHandle>(key),
-        })
+        Self::wrap(self.h.instance1::<"get_Item", MString, NodeHandle>(net(name)))
     }
 
-    /// The element at `idx` for an **array** element (`JsonElement[int]`), or `None` if this is not
-    /// an array or `idx` is out of range.
-    pub fn index(&self, idx: i32) -> Option<Value> {
+    /// The element at `idx` for an **array** node (`JsonNode.get_Item(int)`), or `None` if this is
+    /// not an array, `idx` is out of range, or the element is JSON `null`.
+    pub fn index(&self, idx: i32) -> Option<Json> {
         if self.kind() != Kind::Array || idx < 0 || idx >= self.len() {
             return None;
         }
-        Some(Value {
-            h: self.h.vt_instance1::<"get_Item", i32, ElemHandle>(idx),
-        })
+        Self::wrap(self.h.instance1::<"get_Item", i32, NodeHandle>(idx))
     }
 
-    /// The number of elements for an **array** element (`JsonElement.GetArrayLength()`); `0` for
-    /// anything else.
+    /// The number of elements for an **array** node (`JsonArray.Count`); `0` for anything else.
     pub fn len(&self) -> i32 {
         if self.kind() != Kind::Array {
             return 0;
         }
-        self.h.vt_instance0::<"GetArrayLength", i32>()
+        // `JsonArray` is-a `JsonNode`; the underlying managed reference is identical and both handle
+        // aliases are the same `RustcCLRInteropManagedClass` layout (one pointer-sized field), so
+        // reinterpreting the handle as `JsonArray` to reach its `get_Count` member is sound.
+        let arr: ArrayHandle = unsafe { core::mem::transmute::<NodeHandle, ArrayHandle>(self.h) };
+        arr.instance0::<"get_Count", i32>()
     }
 
-    /// `true` if this array element has no elements (or is not an array).
+    /// `true` if this array node has no elements (or is not an array).
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// This element's string value if it is a JSON string (`JsonElement.GetString()`), else `None`.
+    /// This node's string value if it is a JSON string (`kind() == String`), else `None`. Backed by
+    /// `JsonNode.ToString()`, which for a string value returns the raw (unescaped) content.
     pub fn as_str(&self) -> Option<std::string::String> {
         if self.kind() != Kind::String {
             return None;
         }
-        Some(
-            DotNetString::from_handle(self.h.vt_instance0::<"GetString", MString>())
-                .to_rust_string(),
-        )
+        Some(self.text())
     }
 
-    /// This element's value as an `i64` if it is a JSON number that fits (`JsonElement.GetInt64()`),
-    /// else `None`. A number that does not fit an `i64` throws on the .NET side → `None`.
+    /// This node's value as an `i64` if it is a JSON number that fits, else `None`. See the module
+    /// note on numeric honesty (decoded from the node's canonical JSON token).
     pub fn as_i64(&self) -> Option<i64> {
         if self.kind() != Kind::Number {
             return None;
         }
-        Some(self.h.vt_instance0::<"GetInt64", i64>())
+        self.json_text().parse::<i64>().ok()
     }
 
-    /// This element's value as an `f64` if it is a JSON number (`JsonElement.GetDouble()`), else
-    /// `None`.
+    /// This node's value as an `f64` if it is a JSON number, else `None`.
     pub fn as_f64(&self) -> Option<f64> {
         if self.kind() != Kind::Number {
             return None;
         }
-        Some(self.h.vt_instance0::<"GetDouble", f64>())
+        self.json_text().parse::<f64>().ok()
     }
 
-    /// This element's boolean value if it is a JSON `true`/`false` (`JsonElement.GetBoolean()`),
-    /// else `None`.
+    /// This node's boolean value if it is a JSON `true`/`false`, else `None`.
     pub fn as_bool(&self) -> Option<bool> {
         match self.kind() {
             Kind::True => Some(true),
@@ -227,35 +222,47 @@ impl Value {
         }
     }
 
-    /// Whether this element is the JSON literal `null`.
+    /// Whether this node is the JSON literal `null`. (A *missing* property is `None` from
+    /// [`get`](Json::get), not a null node.)
     pub fn is_null(&self) -> bool {
         self.kind() == Kind::Null
     }
 
-    /// Whether this element is a JSON object.
+    /// Whether this node is a JSON object.
     pub fn is_object(&self) -> bool {
         self.kind() == Kind::Object
     }
 
-    /// Whether this element is a JSON array.
+    /// Whether this node is a JSON array.
     pub fn is_array(&self) -> bool {
         self.kind() == Kind::Array
     }
 
-    /// Serialize this element (sub-tree) back to its compact JSON text (`JsonElement.ToString()` for
-    /// scalars; the raw JSON via `GetRawText()` for objects/arrays, so structure round-trips).
+    /// Serialize this node (sub-tree) back to a compact JSON string (`JsonNode.ToJsonString()`).
     pub fn to_json_string(&self) -> std::string::String {
-        DotNetString::from_handle(self.h.vt_instance0::<"GetRawText", MString>()).to_rust_string()
+        self.json_text()
     }
 
-    /// The raw managed [`JsonElement`](ElemHandle) value handle, for lower-level BCL calls.
-    pub fn handle(&self) -> ElemHandle {
+    /// The raw managed [`JsonNode`](NodeHandle) handle, for lower-level BCL calls.
+    pub fn handle(&self) -> NodeHandle {
         self.h
+    }
+
+    /// `JsonNode.ToString()` — for a string value node, its raw (unescaped) content.
+    #[inline(always)]
+    fn text(&self) -> std::string::String {
+        DotNetString::from_handle(self.h.instance0::<"ToString", MString>()).to_rust_string()
+    }
+
+    /// `JsonNode.ToJsonString()` — the node's compact JSON representation.
+    #[inline(always)]
+    fn json_text(&self) -> std::string::String {
+        DotNetString::from_handle(self.h.instance0::<"ToJsonString", MString>()).to_rust_string()
     }
 }
 
-impl core::fmt::Display for Value {
-    /// The element's raw JSON text (`GetRawText`).
+impl core::fmt::Display for Json {
+    /// The re-serialized JSON (`ToJsonString`).
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(&self.to_json_string())
     }
