@@ -155,6 +155,37 @@ objs.Push("hello");
 One Rust monomorphization backs `RustVec<T>` for every `T` you instantiate. Runnable:
 `cargo_tests/cd_containers` (Rust side: one macro line; C# side: no hand-written interop at all).
 
+### 2c. Export a Rust function with `#[dotnet_export]` — no `(ptr, len)` dance
+
+§2a's hand-written export makes strings cross as a UTF-8 `(ptr, len)` pair — C# has to pin a byte
+buffer, guess an output size, and re-decode (see `cargo_tests/cd_interop`). `#[dotnet_export]` removes
+all of that: write an ordinary Rust fn with `&str`/`String`/primitive parameters and a `&str`/`String`/
+primitive return, and C# calls it as a plain typed method.
+
+```rust
+use dotnet_macros::dotnet_export;
+
+#[dotnet_export]
+pub fn greet(name: &str) -> String {
+    format!("Hello, {name}, from Rust!")
+}
+```
+
+```csharp
+string g = MainModule.greet("World");   // -> "Hello, World, from Rust!"
+```
+
+The macro leaves your function untouched (still callable from Rust) and emits a hidden
+`#[no_mangle] extern "C"` shim that marshals the managed seam: `&str`/`String` cross as a real managed
+`System.String` (so C# sees `string`, **not** a pointer pair — no buffer, no free, no re-decode), and
+the numeric/`bool` primitives pass through unchanged. **No C#-side glue is needed at all** — the shim
+already presents a clean `string`/`int`/`double`/`bool` signature on `MainModule`.
+
+Supported today: the integer/float primitives, `bool`, `&str`, `String` (params and returns), and a
+`-> ()` return. Anything else is a **clear compile error** (marshalling is never faked); those types
+are the follow-up backlog. The consuming `cdylib` depends on `mycorrhiza` + `dotnet_macros`. Runnable:
+`cargo_tests/cd_export`.
+
 ---
 
 ## 3. What crosses the boundary
@@ -163,7 +194,8 @@ One Rust monomorphization backs `RustVec<T>` for every `T` you instantiate. Runn
 |---|---|---|
 | `i8..i128`, `u8..u128`, `f32/f64`, `bool` | the matching primitive | direct |
 | `#[repr(C)] struct` of the above | a value-type `struct` | de-mangled name for `cdylib` exports; synthesized ctor/getters |
-| `&str` / `String` (as `*const u8`, `usize`) | `byte*` + `nuint` | UTF-8; nothing crosses ownership |
+| `&str` / `String` (as `*const u8`, `usize`) | `byte*` + `nuint` | UTF-8; nothing crosses ownership (the hand-written §2a form) |
+| `&str` / `String` in a `#[dotnet_export] fn` | a managed `string` | §2c — no `(ptr, len)`, no glue |
 | `#[dotnet_class] struct` | a managed class | §1c |
 | `mycorrhiza::collections::*` | the real BCL collection | §1a |
 | a C# `T` in `RustVec<T>`/`RustBoxVec<T>` | a Rust-owned list | §2b |

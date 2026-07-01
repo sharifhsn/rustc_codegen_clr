@@ -53,7 +53,7 @@ Stack/Queue, used like `std`); the WF-9 generic bridge + `dotnet_generic!` macro
 
 | Item | What the user gets | Effort | Payoff | Notes / deps |
 |---|---|---|---|---|
-| **`#[dotnet_export]` auto-marshal ⚑** | write `#[dotnet_export] fn greet(name: &str) -> String`; C# calls `greet("x")` and gets a `string` — no hand-written `(ptr,len)` buffer dance | M–L | ★★★ | The Rust-from-C# counterpart to what `collections` did for the other direction. A proc-macro (the `dotnet_macros` crate exists) + a few backend marshalling helpers. Makes exporting Rust as easy as the container macro made containers. |
+| ~~**`#[dotnet_export]` auto-marshal ⚑**~~ **SHIPPED** | write `#[dotnet_export] fn greet(name: &str) -> String`; C# calls `MainModule.greet("x")` and gets a `string` — no hand-written `(ptr,len)` buffer dance | M–L | ★★★ | Done — proc-macro in `dotnet_macros` (`dotnet_export`). Marshals `&str`/`String`/primitives; strings cross as a real managed `System.String` (the `MString` seam), so **zero C#-side glue** — no backend change needed either. Runnable: `cargo_tests/cd_export` (11/11). Follow-ups: slices, `char`, `Vec<T>`, `Option`/`Result` returns. |
 | Extend `#[dotnet_class]` | virtual methods; managed-type fields; properties (`get_`/`set_`); static methods; multiple ctors; implement a .NET interface | L | ★★★ | Virtual methods need a "re-open an existing class" comptime capability (split class decl from an `impl` block). This is the path to real, subclassable/​interface-implementing managed types. |
 | Export Rust `enum` / `Result` / `Option` | Rust enum → C# enum; `Result` → try-pattern/exception; `Option` → nullable | M | ★★ | Removes the manual bool/out-param convention. |
 | Export Rust traits as C# interfaces | a Rust trait object usable polymorphically from C# | L | ★★ | Advanced; pairs with `#[dotnet_class]` interface support. |
@@ -89,7 +89,7 @@ The keystones aren't independent — there's a natural order where each unlocks 
 1. **Quick wins first** (a day total): `prelude`, collection conveniences, `Vec`↔`List`, std-trait impls (`Display`/`Debug`/`Eq`/`Hash`). Immediate "it feels like std" payoff, no new machinery.
 2. **Enumerator bridge** (Theme 1 ⚑): unlocks all iteration, dict iteration, and the LINQ/predicate story downstream.
 3. **`cargo dotnet new` + prelude** (Theme 5 ⚑): the onboarding cliff. Cheap, huge for adoption.
-4. **`#[dotnet_export]` auto-marshal** (Theme 4 ⚑): makes the Rust-from-C# side as turnkey as containers already are — symmetry with the .NET-from-Rust polish.
+4. ~~**`#[dotnet_export]` auto-marshal** (Theme 4 ⚑)~~ **SHIPPED** — the Rust-from-C# side is now as turnkey as containers: `#[dotnet_export] fn` → `MainModule.method(...)` with managed-`string` marshalling and no glue. See `cargo_tests/cd_export`.
 5. **Delegates & callbacks** (Theme 3 ⚑): the hard, highest-ceiling item. Unlocks events, LINQ lambdas, and is a prerequisite for the async bridge's ergonomics. Tackle once the cheaper wins are banked.
 6. **Task/async bridge** (Theme 3 ⚑): with delegates in hand, this opens the entire modern .NET surface.
 7. Then breadth: more collections, BCL type wrappers, JSON, extended `#[dotnet_class]`, publish/pack polish, cookbook.

@@ -15,7 +15,8 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    parse_macro_input, punctuated::Punctuated, ItemStruct, LitBool, LitStr, MetaNameValue, Token,
+    parse_macro_input, punctuated::Punctuated, spanned::Spanned, FnArg, ItemFn, ItemStruct,
+    LitBool, LitStr, MetaNameValue, ReturnType, Token, Type,
 };
 
 /// Split a `"[Assembly]Namespace.Type"` spec into `(assembly, type_name)`. An empty/`[]`-less spec
@@ -112,6 +113,316 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #(#field_calls)*
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_primary_ctor(class);
                 ::mycorrhiza::comptime::rustc_codegen_clr_finish_type(class);
+            }
+        }
+    };
+    expanded.into()
+}
+
+// ============================================================================
+// #[dotnet_export] — auto-marshal a Rust fn so C# can call it as a plain typed method.
+// ============================================================================
+
+/// How one Rust param/return type crosses the managed seam: the CIL-visible type the shim uses, plus
+/// the code that converts between it and the idiomatic Rust type.
+struct Marshal {
+    /// The type the `#[no_mangle] extern "C"` shim uses at the seam (what C# sees).
+    seam_ty: proc_macro2::TokenStream,
+    /// Given a binding `#id` of `seam_ty`, produce an expression of the idiomatic Rust type to pass
+    /// to the inner fn. `None` means "pass `#id` through unchanged" (identity marshalling).
+    to_rust: Option<fn(&syn::Ident) -> proc_macro2::TokenStream>,
+    /// Given a binding `#id` of the idiomatic Rust return type, produce an expression of `seam_ty`.
+    /// `None` means "return `#id` unchanged".
+    from_rust: Option<fn(&syn::Ident) -> proc_macro2::TokenStream>,
+}
+
+/// The set of primitive types passed across the seam unchanged (they are already `ManagedSafe` and
+/// map 1:1 to a CIL primitive C# understands).
+fn is_passthrough_primitive(path: &str) -> bool {
+    matches!(
+        path,
+        "i8" | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "isize"
+            | "usize"
+            | "f32"
+            | "f64"
+            | "bool"
+    )
+}
+
+/// The single-segment path name of a plain type path (e.g. `String`, `i32`), or `None` for anything
+/// more complex (generics, qualified paths, …).
+fn simple_path_ident(ty: &Type) -> Option<String> {
+    if let Type::Path(tp) = ty {
+        if tp.qself.is_none() && tp.path.segments.len() == 1 {
+            let seg = &tp.path.segments[0];
+            if seg.arguments.is_empty() {
+                return Some(seg.ident.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Resolve how a **parameter** type is marshalled, or `Err(message)` if unsupported.
+fn marshal_param(ty: &Type) -> Result<Marshal, String> {
+    // `&str` (shared ref to a `str`) → managed `System.String` inbound.
+    if let Type::Reference(r) = ty {
+        if r.mutability.is_none() {
+            if let Type::Path(tp) = &*r.elem {
+                if tp.qself.is_none() && tp.path.is_ident("str") {
+                    return Ok(Marshal {
+                        seam_ty: quote! { ::mycorrhiza::system::MString },
+                        to_rust: Some(|id| {
+                            quote! {
+                                let #id: ::std::string::String =
+                                    ::mycorrhiza::system::DotNetString::from_handle(#id).to_rust_string();
+                            }
+                        }),
+                        from_rust: None,
+                    });
+                }
+            }
+        }
+        return Err(format!(
+            "#[dotnet_export]: unsupported reference parameter type `{}`; only `&str` is marshalled \
+             among references. Pass an owned/primitive type, or marshal manually with `MString`.",
+            quote! { #ty }
+        ));
+    }
+
+    if let Some(name) = simple_path_ident(ty) {
+        if name == "String" {
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::system::MString },
+                to_rust: Some(|id| {
+                    quote! {
+                        let #id: ::std::string::String =
+                            ::mycorrhiza::system::DotNetString::from_handle(#id).to_rust_string();
+                    }
+                }),
+                from_rust: None,
+            });
+        }
+        if is_passthrough_primitive(&name) {
+            return Ok(Marshal {
+                seam_ty: quote! { #ty },
+                to_rust: None,
+                from_rust: None,
+            });
+        }
+        return Err(format!(
+            "#[dotnet_export]: unsupported parameter type `{name}`. Supported: the integer/float \
+             primitives, `bool`, `&str`, and `String`."
+        ));
+    }
+
+    Err(format!(
+        "#[dotnet_export]: unsupported parameter type `{}`. Supported: the integer/float primitives, \
+         `bool`, `&str`, and `String`.",
+        quote! { #ty }
+    ))
+}
+
+/// Resolve how the **return** type is marshalled, or `Err(message)` if unsupported.
+fn marshal_return(ty: &Type) -> Result<Marshal, String> {
+    // `&str` return (typically a `&'static str`) → managed string outbound.
+    if let Type::Reference(r) = ty {
+        if r.mutability.is_none() {
+            if let Type::Path(tp) = &*r.elem {
+                if tp.qself.is_none() && tp.path.is_ident("str") {
+                    return Ok(Marshal {
+                        seam_ty: quote! { ::mycorrhiza::system::MString },
+                        to_rust: None,
+                        from_rust: Some(|id| {
+                            quote! { ::mycorrhiza::system::DotNetString::from(#id).handle() }
+                        }),
+                    });
+                }
+            }
+        }
+        return Err(format!(
+            "#[dotnet_export]: unsupported reference return type `{}`; only `&str` is marshalled \
+             among references.",
+            quote! { #ty }
+        ));
+    }
+
+    if let Some(name) = simple_path_ident(ty) {
+        if name == "String" {
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::system::MString },
+                to_rust: None,
+                from_rust: Some(|id| {
+                    quote! { ::mycorrhiza::system::DotNetString::from(#id.as_str()).handle() }
+                }),
+            });
+        }
+        if is_passthrough_primitive(&name) {
+            return Ok(Marshal {
+                seam_ty: quote! { #ty },
+                to_rust: None,
+                from_rust: None,
+            });
+        }
+        return Err(format!(
+            "#[dotnet_export]: unsupported return type `{name}`. Supported: the integer/float \
+             primitives, `bool`, `&str`, `String`, and `()`."
+        ));
+    }
+
+    Err(format!(
+        "#[dotnet_export]: unsupported return type `{}`. Supported: the integer/float primitives, \
+         `bool`, `&str`, `String`, and `()`.",
+        quote! { #ty }
+    ))
+}
+
+/// `#[dotnet_export]` on a free function — makes it callable from C# as a plain, typed method on
+/// `MainModule`, with no hand-written `(ptr, len)` buffer dance.
+///
+/// The user writes an ordinary Rust fn:
+///
+/// ```ignore
+/// #[dotnet_export]
+/// pub fn greet(name: &str) -> String { format!("Hello, {name}!") }
+/// ```
+///
+/// and C# calls `MainModule.greet("x")`, getting back a `string`. The macro leaves the original fn
+/// untouched (still callable from Rust) and emits a hidden `#[no_mangle] extern "C"` **shim** that
+/// crosses the managed seam: each supported argument/return type is marshalled to/from its
+/// CIL-visible form. `&str`/`String` cross as a real managed `System.String` (so C# sees `string`,
+/// not a pointer pair); the numeric/`bool` primitives pass through unchanged.
+///
+/// The consuming `cdylib` must depend on `mycorrhiza`. Types outside the supported set produce a
+/// clear compile error (marshalling is never faked).
+#[proc_macro_attribute]
+pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let func = parse_macro_input!(item as ItemFn);
+    let sig = &func.sig;
+
+    // Refuse constructs the seam can't express, with a precise message.
+    if let Some(c) = &sig.constness {
+        return syn::Error::new(c.span(), "#[dotnet_export]: `const fn` cannot be exported")
+            .to_compile_error()
+            .into();
+    }
+    if let Some(a) = &sig.asyncness {
+        return syn::Error::new(
+            a.span(),
+            "#[dotnet_export]: `async fn` is not yet supported (Task/async bridge is separate)",
+        )
+        .to_compile_error()
+        .into();
+    }
+    if !sig.generics.params.is_empty() {
+        return syn::Error::new(
+            sig.generics.span(),
+            "#[dotnet_export]: generic functions cannot be exported (each C# call needs one concrete \
+             .NET signature)",
+        )
+        .to_compile_error()
+        .into();
+    }
+    if let Some(v) = &sig.variadic {
+        return syn::Error::new(v.span(), "#[dotnet_export]: variadic functions cannot be exported")
+            .to_compile_error()
+            .into();
+    }
+
+    let fn_name = sig.ident.clone();
+    let shim_mod = format_ident!("__dotnet_export_{}", fn_name);
+
+    // Marshal each parameter. `receiver` (self) is rejected — only free functions are exportable.
+    let mut seam_params = Vec::new(); // `#pname: #seam_ty` tokens for the shim signature.
+    let mut pre_call = Vec::new(); // in-conversion statements (seam value → idiomatic Rust value).
+    let mut call_args = Vec::new(); // expressions passed to the inner fn.
+    for (idx, arg) in sig.inputs.iter().enumerate() {
+        let pat_ty = match arg {
+            FnArg::Receiver(r) => {
+                return syn::Error::new(
+                    r.span(),
+                    "#[dotnet_export]: methods with `self` cannot be exported; use a free function",
+                )
+                .to_compile_error()
+                .into();
+            }
+            FnArg::Typed(pt) => pt,
+        };
+        // Use a fresh, positional binding name so we don't depend on the user's pattern being a
+        // plain identifier (it may be `mut x`, `_`, a tuple pattern, …).
+        let pname = format_ident!("arg{}", idx);
+        let marshal = match marshal_param(&pat_ty.ty) {
+            Ok(m) => m,
+            Err(msg) => {
+                return syn::Error::new(pat_ty.ty.span(), msg)
+                    .to_compile_error()
+                    .into();
+            }
+        };
+        let seam_ty = &marshal.seam_ty;
+        seam_params.push(quote! { #pname: #seam_ty });
+        match marshal.to_rust {
+            Some(conv) => {
+                // `#pname` is rebound (shadowed) to the idiomatic Rust value; `&str` params also
+                // need a borrow at the call site.
+                pre_call.push(conv(&pname));
+                if matches!(&*pat_ty.ty, Type::Reference(_)) {
+                    call_args.push(quote! { &#pname });
+                } else {
+                    call_args.push(quote! { #pname });
+                }
+            }
+            None => call_args.push(quote! { #pname }),
+        }
+    }
+
+    // Marshal the return type.
+    let (seam_ret, ret_expr) = match &sig.output {
+        ReturnType::Default => (quote! {}, quote! { __ret }), // `-> ()`; identity.
+        ReturnType::Type(_, ty) => {
+            let marshal = match marshal_return(ty) {
+                Ok(m) => m,
+                Err(msg) => {
+                    return syn::Error::new(ty.span(), msg).to_compile_error().into();
+                }
+            };
+            let seam_ty = marshal.seam_ty;
+            let ret_ident = format_ident!("__ret");
+            let expr = match marshal.from_rust {
+                Some(conv) => conv(&ret_ident),
+                None => quote! { #ret_ident },
+            };
+            (quote! { -> #seam_ty }, expr)
+        }
+    };
+
+    let call = quote! { super::#fn_name(#(#call_args),*) };
+
+    let expanded = quote! {
+        // The user's function, verbatim — still callable from Rust with its idiomatic signature.
+        #func
+
+        // The generated seam shim. `#[no_mangle]` gives it the flat symbol `#fn_name`, which the
+        // backend marks `Access::Extern` (a DCE root) and the exporter emits as a public static
+        // method on the assembly's `MainModule` — so C# calls it as `MainModule::#fn_name`.
+        #[doc(hidden)]
+        #[allow(non_snake_case, unused_imports, clippy::useless_conversion)]
+        mod #shim_mod {
+            use super::*;
+            #[no_mangle]
+            pub extern "C" fn #fn_name(#(#seam_params),*) #seam_ret {
+                #(#pre_call)*
+                let __ret = #call;
+                #ret_expr
             }
         }
     };
