@@ -9,15 +9,22 @@
 //   * RustBoxVec<T>                     — works for ANY T (managed classes, arrays, structs holding
 //                                         references) by storing a GCHandle per element; reference
 //                                         identity is preserved.
+//   * RustHashMap<K,V> where K,V : unmanaged — a size-erased Rust HashMap keyed by the raw key bytes
+//                                         (needs `export_rust_hashmap!()` in the Rust cdylib).
+//   * RustString                        — a mutable, Rust-owned UTF-8 buffer that marshals to/from a
+//                                         managed string (needs `export_rust_string!()`).
 //
-// Both are thin, move-only handles to a Rust-owned allocation; call Dispose() (or use `using`) to
+// All are thin, move-only handles to a Rust-owned allocation; call Dispose() (or use `using`) to
 // free it (and, for RustBoxVec, to release the element GCHandles).
 //
-// The Rust core is `MainModule.rcl_vec_{new,push,get,set,len,free}` — flat `#[no_mangle]` symbols on
-// the consuming crate's module. `global::MainModule` names them regardless of this file's namespace.
+// The Rust cores are `MainModule.rcl_vec_*` / `rcl_map_*` / `rcl_str_*` — flat `#[no_mangle]` symbols
+// on the consuming crate's module. `global::MainModule` names them regardless of this file's
+// namespace. A wrapper here compiles only if the matching `export_rust_*!()` macro was invoked in the
+// Rust cdylib; otherwise Roslyn reports the unresolved MainModule member (a clear signal).
 
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace RustDotnet
 {
@@ -127,6 +134,137 @@ namespace RustDotnet
                     GCHandle.FromIntPtr(p).Free();
                 }
                 global::MainModule.rcl_vec_free(_handle);
+                _handle = 0;
+            }
+        }
+    }
+
+    /// <summary>
+    /// A hash map from unmanaged <typeparamref name="K"/> to unmanaged <typeparamref name="V"/>,
+    /// backed by a size-erased Rust <c>HashMap</c> keyed by the raw key bytes. Near-zero-cost: keys
+    /// and values are memcpy'd to/from the Rust side by their raw bytes, so a single Rust
+    /// monomorphization backs every <c>K</c>/<c>V</c> instantiation. Requires
+    /// <c>mycorrhiza::export_rust_hashmap!()</c> in the consuming Rust cdylib.
+    /// </summary>
+    public unsafe struct RustHashMap<K, V> : IDisposable
+        where K : unmanaged
+        where V : unmanaged
+    {
+        private nuint _handle;
+
+        /// <summary>Create an empty <c>RustHashMap&lt;K, V&gt;</c>.</summary>
+        public static RustHashMap<K, V> New() =>
+            new RustHashMap<K, V>
+            {
+                _handle = global::MainModule.rcl_map_new((nuint)sizeof(K), (nuint)sizeof(V))
+            };
+
+        /// <summary>Number of entries.</summary>
+        public readonly int Count => (int)global::MainModule.rcl_map_len(_handle);
+
+        /// <summary>Insert or overwrite; returns <c>true</c> if a previous value was replaced.</summary>
+        public readonly bool Insert(K key, V value) =>
+            global::MainModule.rcl_map_insert(_handle, (byte*)&key, (byte*)&value);
+
+        /// <summary>Get the value for <paramref name="key"/> into <paramref name="value"/>; returns
+        /// <c>false</c> (leaving <paramref name="value"/> default) if the key is absent.</summary>
+        public readonly bool TryGetValue(K key, out V value)
+        {
+            V v = default;
+            bool found = global::MainModule.rcl_map_get(_handle, (byte*)&key, (byte*)&v);
+            value = v;
+            return found;
+        }
+
+        /// <summary>The value for <paramref name="key"/>; throws if absent.</summary>
+        public readonly V this[K key]
+        {
+            get
+            {
+                V v = default;
+                if (!global::MainModule.rcl_map_get(_handle, (byte*)&key, (byte*)&v))
+                    throw new System.Collections.Generic.KeyNotFoundException();
+                return v;
+            }
+            set => global::MainModule.rcl_map_insert(_handle, (byte*)&key, (byte*)&value);
+        }
+
+        /// <summary><c>true</c> if <paramref name="key"/> is present.</summary>
+        public readonly bool ContainsKey(K key) =>
+            global::MainModule.rcl_map_contains(_handle, (byte*)&key);
+
+        /// <summary>Remove <paramref name="key"/>; returns <c>true</c> if it was present.</summary>
+        public readonly bool Remove(K key) =>
+            global::MainModule.rcl_map_remove(_handle, (byte*)&key);
+
+        /// <summary>Free the Rust-owned allocation. The handle is invalid afterwards.</summary>
+        public void Dispose()
+        {
+            if (_handle != 0)
+            {
+                global::MainModule.rcl_map_free(_handle);
+                _handle = 0;
+            }
+        }
+    }
+
+    /// <summary>
+    /// A mutable, growable string owned by Rust (a UTF-8 byte buffer). Text crosses the seam as UTF-8:
+    /// <see cref="Append(string)"/> encodes with <see cref="Encoding.UTF8"/>, and
+    /// <see cref="ToString"/> decodes the whole buffer back. <see cref="Length"/> is a UTF-8 <b>byte</b>
+    /// count (not a UTF-16 char count). Requires <c>mycorrhiza::export_rust_string!()</c> in the
+    /// consuming Rust cdylib.
+    /// </summary>
+    public unsafe struct RustString : IDisposable
+    {
+        private nuint _handle;
+
+        /// <summary>Create an empty <c>RustString</c>.</summary>
+        public static RustString New() =>
+            new RustString { _handle = global::MainModule.rcl_str_new() };
+
+        /// <summary>Create a <c>RustString</c> initialised from <paramref name="s"/>.</summary>
+        public static RustString From(string s)
+        {
+            var rs = New();
+            rs.Append(s);
+            return rs;
+        }
+
+        /// <summary>Length in UTF-8 <b>bytes</b>.</summary>
+        public readonly int Length => (int)global::MainModule.rcl_str_len(_handle);
+
+        /// <summary>Append <paramref name="s"/> (encoded as UTF-8). A null/empty string is a no-op.</summary>
+        public readonly void Append(string s)
+        {
+            if (string.IsNullOrEmpty(s))
+                return;
+            byte[] bytes = Encoding.UTF8.GetBytes(s);
+            fixed (byte* p = bytes)
+                global::MainModule.rcl_str_push_bytes(_handle, p, (nuint)bytes.Length);
+        }
+
+        /// <summary>Truncate to empty (keeps the backing allocation).</summary>
+        public readonly void Clear() => global::MainModule.rcl_str_clear(_handle);
+
+        /// <summary>Decode the whole Rust-owned buffer back into a managed UTF-8 string.</summary>
+        public override readonly string ToString()
+        {
+            int n = Length;
+            if (n == 0)
+                return string.Empty;
+            byte[] bytes = new byte[n];
+            fixed (byte* p = bytes)
+                global::MainModule.rcl_str_copy_to(_handle, p);
+            return Encoding.UTF8.GetString(bytes);
+        }
+
+        /// <summary>Free the Rust-owned allocation. The handle is invalid afterwards.</summary>
+        public void Dispose()
+        {
+            if (_handle != 0)
+            {
+                global::MainModule.rcl_str_free(_handle);
                 _handle = 0;
             }
         }

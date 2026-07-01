@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RustDotnetVersion Condition="'$(RustDotnetVersion)'==''">8</RustDotnetVersion>
+    <TargetFramework>net$(RustDotnetVersion).0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>cd_containers2_cs</AssemblyName>
+
+    <!-- Opt in to the shipped reusable RustDotnet wrappers (RustVec<T>/RustBoxVec<T>/RustHashMap<K,V>/
+         RustString). The imported RustDotnet.targets auto-compiles RustDotnet.Containers.cs; the Rust
+         crate below invokes export_rust_containers!() + export_rust_hashmap!() + export_rust_string!(),
+         so MainModule.rcl_vec_* / rcl_map_* / rcl_str_* all exist. -->
+    <UseRustDotnetContainers>true</UseRustDotnetContainers>
+  </PropertyGroup>
+
+  <!-- Auto-build the Rust crate + reference its assembly (see cd_containers for the full explanation). -->
+  <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
+  <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'=='' and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+  <Import Project="$(MSBuildThisFileDirectory)../../../msbuild/RustDotnet.targets"
+          Condition="!Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets') and !Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+
+  <ItemGroup>
+    <RustCrate Include="../rustlib" />
+  </ItemGroup>
+</Project>
