@@ -14,6 +14,7 @@ mod artifact;
 mod buildstd;
 mod cli;
 mod context;
+mod doctor;
 mod docker;
 mod host;
 mod mode;
@@ -24,7 +25,9 @@ mod passthrough;
 mod pipeline;
 mod run;
 mod rustflags;
+mod scaffold;
 mod setup;
+mod test;
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -57,6 +60,9 @@ fn main() -> ExitCode {
     let result = match &cli.cmd {
         Cmd::Build(args) => pipeline::run(args, false),
         Cmd::Run(args) => pipeline::run(args, true),
+        Cmd::New(args) => scaffold::run(args),
+        Cmd::Doctor(args) => doctor::run(args),
+        Cmd::Test(args) => test::run(args),
         Cmd::Setup(args) => setup::run(args),
         Cmd::Pack(args) => pack::run(args),
     };
@@ -95,7 +101,7 @@ fn split_program_args(argv: &mut Vec<OsString>) -> Vec<String> {
 /// no program args.)
 fn inject_prog_args(cmd: &mut Cmd, prog_args: Vec<String>) {
     match cmd {
-        Cmd::Build(args) | Cmd::Run(args) => args.prog_args = prog_args,
-        Cmd::Setup(_) | Cmd::Pack(_) => {}
+        Cmd::Build(args) | Cmd::Run(args) | Cmd::Test(args) => args.prog_args = prog_args,
+        Cmd::New(_) | Cmd::Doctor(_) | Cmd::Setup(_) | Cmd::Pack(_) => {}
     }
 }

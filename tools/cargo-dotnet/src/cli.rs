@@ -43,6 +43,12 @@ pub enum Cmd {
     Build(BuildArgs),
     /// Build a Rust crate and run it on .NET (forwards exit code; args after `--`).
     Run(BuildArgs),
+    /// Scaffold a ready-to-run interop project (--app / --lib / --plugin).
+    New(NewArgs),
+    /// Diagnose the toolchain, or translate a .NET runtime failure into an actionable fix.
+    Doctor(DoctorArgs),
+    /// Build a crate's #[test]s with the backend and run them on .NET.
+    Test(BuildArgs),
     /// Provision the toolchain + install home, then install this binary to ~/.cargo/bin.
     Setup(SetupArgs),
     /// Build a crate's cdylib and produce a NuGet .nupkg of its .NET assembly.
@@ -107,6 +113,67 @@ impl BuildArgs {
     pub fn is_release(&self) -> bool {
         !self.debug
     }
+}
+
+/// Which scaffold template `cargo dotnet new` emits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Template {
+    /// A Rust-on-.NET binary (models cd_collections).
+    App,
+    /// A Rust cdylib + C# consumer via export_rust_containers! (models cd_containers).
+    Lib,
+    /// A #[dotnet_class] managed type + C# host (models cd_typedef).
+    Plugin,
+}
+
+impl Template {
+    /// A short human label for the post-scaffold message.
+    pub fn label(self) -> &'static str {
+        match self {
+            Template::App => "app (Rust-on-.NET binary)",
+            Template::Lib => "lib (Rust cdylib consumed from C#)",
+            Template::Plugin => "plugin (#[dotnet_class] managed type)",
+        }
+    }
+}
+
+#[derive(clap::Args)]
+pub struct NewArgs {
+    /// The directory (and, unless `--name` is given, the crate name) to scaffold into.
+    pub path: PathBuf,
+
+    /// A Rust-on-.NET binary using `mycorrhiza::prelude` (the default template).
+    #[arg(long, conflicts_with_all = ["lib", "plugin"])]
+    pub app: bool,
+    /// A Rust cdylib exported to C# via `export_rust_containers!()` + a C# consumer.
+    #[arg(long, conflicts_with_all = ["app", "plugin"])]
+    pub lib: bool,
+    /// A `#[dotnet_class]` managed type + a C# host that constructs it.
+    #[arg(long, conflicts_with_all = ["app", "lib"])]
+    pub plugin: bool,
+
+    /// Override the crate name (default: the final path component).
+    #[arg(long)]
+    pub name: Option<String>,
+}
+
+impl NewArgs {
+    /// Resolve the selected template. `--app` is the default when none is given.
+    pub fn template(&self) -> anyhow::Result<Template> {
+        match (self.app, self.lib, self.plugin) {
+            (_, true, _) => Ok(Template::Lib),
+            (_, _, true) => Ok(Template::Plugin),
+            _ => Ok(Template::App), // --app or nothing.
+        }
+    }
+}
+
+#[derive(clap::Args)]
+pub struct DoctorArgs {
+    /// A .NET runtime error to translate: a path to a build/run log, or the message text
+    /// itself. If omitted, and stdin is piped, the piped text is diagnosed; otherwise a
+    /// full toolchain/backend-install environment check runs.
+    pub input: Option<String>,
 }
 
 #[derive(clap::Args)]
