@@ -455,4 +455,56 @@ impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const SIZE: u
             arg1,
         )
     }
+
+    // ---- value-type-correct instance calls (`call instance` on a `valuetype` receiver) -------------
+    //
+    // A .NET **value type**'s instance method is a non-virtual slot and MUST be reached with
+    // `call instance` on the unboxed `valuetype` receiver — emitting `callvirt` (or referencing the
+    // receiver as a reference-type `class`) is invalid for a value type and makes the CLR reject the
+    // type with a `TypeLoadException: ... due to value type mismatch`. The plain `instance0` above
+    // passes `IS_VALUETYPE = false` (it predates the value-type BCL wrappers and is kept for the
+    // GCHandle path), which lowers to `callvirt`/`class`. These `vt_*` variants pass
+    // `IS_VALUETYPE = true`, so the backend emits `call instance` against the `valuetype` — the
+    // correct dispatch for `DateTime`/`TimeSpan`/`Guid` and every other real BCL value type. The
+    // receiver is passed by managed reference (`&self`), which is how a `call instance` on a value
+    // type takes its `this`.
+
+    /// A zero-explicit-arg value-type instance call (a getter/`ToString`/etc.) — `call instance`.
+    #[inline(always)]
+    pub fn vt_instance0<const METHOD: &'static str, Ret>(self) -> Ret {
+        rustc_clr_interop_managed_call1_::<ASSEMBLY, CLASS_PATH, true, METHOD, false, Ret, &Self>(
+            &self,
+        )
+    }
+
+    /// A one-explicit-arg value-type instance call — `call instance`, receiver by `&self`.
+    #[inline(always)]
+    pub fn vt_instance1<const METHOD: &'static str, Arg1, Ret>(self, arg1: Arg1) -> Ret {
+        rustc_clr_interop_managed_call2_::<
+            ASSEMBLY,
+            CLASS_PATH,
+            true,
+            METHOD,
+            false,
+            Ret,
+            &Self,
+            Arg1,
+        >(&self, arg1)
+    }
+
+    /// A zero-arg value-type **static** call/factory (e.g. `TimeSpan.FromTicks` is `static1`; a
+    /// static *property* getter like `get_Zero`/`get_MinValue` is this) — `call` on the `valuetype`.
+    #[inline(always)]
+    pub fn vt_static0<const METHOD: &'static str, Ret>() -> Ret {
+        rustc_clr_interop_managed_call0_::<ASSEMBLY, CLASS_PATH, true, METHOD, Ret>()
+    }
+
+    /// A one-arg value-type **static** factory (e.g. `TimeSpan.FromTicks`/`Guid.Parse`) — `call` on
+    /// the `valuetype`, returning a fresh value.
+    #[inline(always)]
+    pub fn vt_static1<const METHOD: &'static str, Arg1, Ret>(arg1: Arg1) -> Ret {
+        rustc_clr_interop_managed_call1_::<ASSEMBLY, CLASS_PATH, true, METHOD, true, Ret, Arg1>(
+            arg1,
+        )
+    }
 }

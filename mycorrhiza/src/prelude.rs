@@ -21,6 +21,20 @@
 // The .NET generic collections, used like `std`.
 pub use crate::collections::{Dictionary, HashSet, List, ListIter, Queue, Stack};
 
+// The idiomatic BCL type wrappers — used like normal Rust types (`DateTime::now()`, `Guid::new_v4()`,
+// `Regex::new(..)`, `Math::sqrt(..)`, …). `TimeSpan` is re-exported under its idiomatic name (the
+// module type is `DotNetTimeSpan` to avoid colliding with `std::time`-flavoured expectations).
+pub use crate::bcl::datetime::DateTime;
+pub use crate::bcl::environment::Environment;
+pub use crate::bcl::guid::Guid;
+pub use crate::bcl::mathf::Math;
+pub use crate::bcl::random::Random;
+pub use crate::bcl::regex::Regex;
+pub use crate::bcl::stopwatch::Stopwatch;
+pub use crate::bcl::stringbuilder::StringBuilder;
+pub use crate::bcl::timespan::DotNetTimeSpan;
+pub use crate::bcl::uri::Uri;
+
 // The enumerator bridge — `for x in &collection` over the reference-type collections, backed by the
 // .NET `IEnumerator<T>`. The `Enumerable` trait provides `.iter_enumerator()`; `Enumerator<T>` is the
 // resulting `Iterator`.

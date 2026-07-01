@@ -22,6 +22,10 @@ pub use bindings::*;
 // bindings cover this surface, so the slice module is no longer compiled in.
 //   (The standalone `cargo_tests/slice_call_test` crate still `use`s `mycorrhiza::slice_bindings`;
 //    it is not a workspace member and is superseded by the full generated surface.)
+/// Idiomatic Rust wrappers over the most-used Base Class Library value types and static helpers
+/// (`DateTime`, `TimeSpan`, `Guid`, `Uri`, `Regex`, `Random`, `Stopwatch`, `StringBuilder`,
+/// `Environment`, `Math`) — used like normal Rust types, no CLR-interop knowledge at the call site.
+pub mod bcl;
 pub mod class;
 /// Ready-to-use, idiomatic wrappers over the common .NET generic collections (`List<T>`,
 /// `Dictionary<K, V>`, `HashSet<T>`, `Stack<T>`, `Queue<T>`) — backed by real managed objects, used
