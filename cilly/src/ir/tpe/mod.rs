@@ -258,6 +258,19 @@ impl Type {
                     && &asm[cref.name()] == "System.UInt128"
             }
             (Type::Int(Int::U16 | Int::I16), Type::PlatformChar) => true,
+            // A pointer/byref whose pointee is a generic marker `!N` is mutually assignable with a
+            // pointer/byref of the concrete type `!N` binds to — e.g. `Span<T>.get_Item(int)` returns
+            // `!0&`, produced into a Rust `*mut T` local. ONLY a *marker* pointee is loosened here (a
+            // concrete-vs-concrete pointee still requires a sound leaf arm below), and every such site
+            // is proven consistent at codegen by `check_generic_marker` (which recurses into Ptr/Ref
+            // pointees). Placed before the exact `(Ptr, Ref)` arm so a marker pointee is caught for all
+            // four pointer/byref combinations.
+            (Type::Ptr(a) | Type::Ref(a), Type::Ptr(b) | Type::Ref(b))
+                if matches!(asm[a], Type::PlatformGeneric(_, _))
+                    || matches!(asm[b], Type::PlatformGeneric(_, _)) =>
+            {
+                asm[a].is_assignable_to(asm[b], asm)
+            }
             (Type::Ptr(ptr), Type::Ref(rf)) => ptr == rf,
             // Fat-pointer (DST) layout equivalence — a PROVEN false-positive fix (Phase P1 / WF-TC).
             //

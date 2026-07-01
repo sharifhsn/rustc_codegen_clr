@@ -378,6 +378,16 @@ pub struct RustcCLRInteropTypeGeneric<const N: usize>;
 #[repr(C)]
 pub struct RustcCLRInteropMethodGeneric<const N: usize>;
 
+/// Signature-shape marker: lowers to a managed byref `Inner&` (`Type::Ref`). Use it in a `Sig` return
+/// slot for a byref-returning member — e.g. `Span<T>.get_Item(int) -> ref T` is
+/// `RustcCLRInteropByRef<RustcCLRInteropTypeGeneric<0>>` (`!0&`). The matching runtime value is a raw
+/// pointer (`*mut Inner`), read/written through directly.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct RustcCLRInteropByRef<Inner> {
+    _pd: core::marker::PhantomData<Inner>,
+}
+
 unsafe impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, ClassGenerics> ManagedSafe
     for RustcCLRInteropManagedGeneric<ASSEMBLY, CLASS_PATH, ClassGenerics>
 {

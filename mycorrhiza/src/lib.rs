@@ -57,6 +57,8 @@ pub mod generic_bridge;
 pub mod intrinsics;
 /// `System.Nullable<T>` ↔ Rust `Option<T>` bridge (a generic value type). See [`nullable::NullableExt`].
 pub mod nullable;
+/// `System.Span<T>` / `ReadOnlySpan<T>` — zero-copy views over a Rust slice. See [`span::Span`].
+pub mod span;
 /// One-glance import surface — `use mycorrhiza::prelude::*;` pulls in the collections, the managed
 /// `DotNetString`, and the generic-bridge macros so interop code reads like `std`.
 pub mod prelude;

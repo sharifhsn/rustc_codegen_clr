@@ -1,8 +1,9 @@
 use crate::adt::FieldOffsetIterator;
 use crate::utilis::{
     INTEROP_ARR_TPE_NAME, INTEROP_CHR_TPE_NAME, INTEROP_CLASS_TPE_NAME,
-    INTEROP_GENERIC_STRUCT_TPE_NAME, INTEROP_GENERIC_TPE_NAME, INTEROP_METHOD_GENERIC_TPE_NAME,
-    INTEROP_STRUCT_TPE_NAME, INTEROP_TYPE_GENERIC_TPE_NAME, is_zst, try_resolve_const_size,
+    INTEROP_BYREF_TPE_NAME, INTEROP_GENERIC_STRUCT_TPE_NAME, INTEROP_GENERIC_TPE_NAME,
+    INTEROP_METHOD_GENERIC_TPE_NAME, INTEROP_STRUCT_TPE_NAME, INTEROP_TYPE_GENERIC_TPE_NAME, is_zst,
+    try_resolve_const_size,
 };
 use crate::utilis::{garg_to_usize, garg_to_string, pointer_to_is_fat, tuple_name};
 use crate::{
@@ -132,7 +133,7 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
         let item_name = ctx.tcx().item_name(def.did());
         matches!(
             item_name.as_str(),
-            INTEROP_TYPE_GENERIC_TPE_NAME | INTEROP_METHOD_GENERIC_TPE_NAME
+            INTEROP_TYPE_GENERIC_TPE_NAME | INTEROP_METHOD_GENERIC_TPE_NAME | INTEROP_BYREF_TPE_NAME
         )
     } else {
         false
@@ -323,6 +324,7 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                     | INTEROP_GENERIC_STRUCT_TPE_NAME
                     | INTEROP_TYPE_GENERIC_TPE_NAME
                     | INTEROP_METHOD_GENERIC_TPE_NAME
+                    | INTEROP_BYREF_TPE_NAME
             );
             if is_interop_adt {
                 if item_name == INTEROP_CLASS_TPE_NAME {
@@ -436,6 +438,17 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                         u32::try_from(n).expect("method generic index over 2^32"),
                         GenericKind::CallGeneric,
                     )
+                } else if item_name == INTEROP_BYREF_TPE_NAME {
+                    // Lowers to a managed byref `Inner&` (`Type::Ref`) — the return shape of a
+                    // byref-returning member, e.g. `Span<T>.get_Item(int) -> ref T` written as
+                    // `RustcCLRInteropByRef<gen!(0)>` => `!0&`. `Inner` is a type argument (often a
+                    // `!N` marker), lowered recursively then wrapped in a managed reference.
+                    let inner = subst[0]
+                        .as_type()
+                        .expect("RustcCLRInteropByRef expects a type argument");
+                    let inner = ctx.monomorphize(inner);
+                    let inner = get_type(inner, ctx);
+                    ctx.nref(inner)
                 } else {
                     todo!("Interop type {name:?} is not yet supported!")
                 }

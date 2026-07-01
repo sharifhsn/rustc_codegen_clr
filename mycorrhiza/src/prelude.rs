@@ -66,6 +66,10 @@ pub use crate::error::{from_nullable, try_managed, ManagedException, Nullable, T
 // `.to_option()` on a `.NET`-produced nullable. The `Nullable<T>` type lives at `mycorrhiza::nullable`.
 pub use crate::nullable::NullableExt;
 
+// `System.Span<T>` / `ReadOnlySpan<T>` — zero-copy views over a Rust slice, for handing Rust memory to
+// a .NET API (or reading a managed span element-by-element).
+pub use crate::span::{ReadOnlySpan, Span};
+
 // The single-codepoint managed `char`.
 pub use crate::DotNetChar;
 

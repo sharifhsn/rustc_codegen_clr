@@ -311,6 +311,16 @@ fn check_generic_marker<'tcx>(
                 }
             }
         }
+        // A pointer/byref to a marker — e.g. `Span<T>.get_Item` returns `!0&` (a `Ptr(!0)`), produced
+        // into a concrete `*mut T`. Recurse into the pointees so the nested `!N` is proven consistent.
+        Type::Ptr(sig_inner) | Type::Ref(sig_inner) => {
+            let Some(rt_inner) = runtime_ty.pointed_to() else {
+                return;
+            };
+            let inner_sig = ctx[sig_inner];
+            let inner_rt = ctx[rt_inner];
+            check_generic_marker(inner_sig, inner_rt, class_generics, role, ctx);
+        }
         _ => {}
     }
 }

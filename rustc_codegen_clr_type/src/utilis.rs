@@ -36,6 +36,9 @@ pub const INTEROP_GENERIC_STRUCT_TPE_NAME: &str = "RustcCLRInteropManagedGeneric
 pub const INTEROP_TYPE_GENERIC_TPE_NAME: &str = "RustcCLRInteropTypeGeneric";
 /// Signature-shape marker lowering to the .NET *method* generic parameter `!!N`.
 pub const INTEROP_METHOD_GENERIC_TPE_NAME: &str = "RustcCLRInteropMethodGeneric";
+/// Signature-shape marker lowering to a managed byref `Inner&` (`Type::Ref`) — the return shape of a
+/// byref-returning member such as `Span<T>.get_Item(int) -> ref T` (`RustcCLRInteropByRef<gen!(0)>`).
+pub const INTEROP_BYREF_TPE_NAME: &str = "RustcCLRInteropByRef";
 #[must_use]
 /// Checks if a type is a magic interop type.
 pub fn is_name_magic(name: &str) -> bool {
