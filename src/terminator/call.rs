@@ -2,7 +2,7 @@ use crate::{
     assembly::MethodCompileCtx,
     interop::AssemblyRef,
     utilis::{
-        garg_to_bool, CTOR_FN_NAME, DELEGATE_FN_NAME, GENERIC_CALL_FN_NAME,
+        garg_to_bool, CTOR_FN_NAME, DELEGATE_CLOSURE_FN_NAME, DELEGATE_FN_NAME, GENERIC_CALL_FN_NAME,
         GENERIC_METHOD_CALL_FN_NAME, GENERIC_CTOR_FN_NAME,
         MANAGED_CALL_FN_NAME, MANAGED_CALL_VIRT_FN_NAME, MANAGED_CHECKED_CAST, MANAGED_IS_INST,
         MANAGED_LD_ELEM_REF, MANAGED_LD_LEN, MANAGED_LD_NULL, MANAGED_NEW_ARR, MANAGED_SET_ELEM,
@@ -801,6 +801,217 @@ fn delegate_from_fnptr<'tcx>(
     let delegate = ctx.call(delegate_ctor, &[shim_obj, invoke_ftn], IsPure::NOT);
     place_set(destination, delegate, ctx)
 }
+/// Delegates & callbacks — wrap a **capturing** Rust closure into a managed delegate. Unlike
+/// [`delegate_from_fnptr`] (a capture-less `fn`), the closure has an environment, so the caller (the
+/// mycorrhiza `from_closure`) boxes it to a thin `*mut ()` and hands us BOTH that env pointer and a
+/// monomorphic trampoline `extern "C" fn(env, In..) -> Ret` that reconstructs the closure and calls it.
+/// The synthesised shim holds two fields (env + trampoline) and its `Invoke(this, In..)` loads the env
+/// field, prepends it to the args, and `calli`s the trampoline — so the closure's captured state rides
+/// along on the .NET side.
+///
+/// subst layout: `[0]`=assembly `[1]`=delegate class `[2]`=is-vt `[3]`=`ClassGenerics`
+///   `[4]`=`Sig` `(Ret, In0, …)` (the delegate's Invoke signature, NO env) `[5]`=`EnvTy` (`*mut ()`)
+///   `[6]`=`FnPtrTy` (the trampoline's type; unused, the value carries it). args: `[0]`=env `[1]`=trampoline.
+fn delegate_from_closure<'tcx>(
+    subst_ref: &[GenericArg<'tcx>],
+    args: &[Spanned<Operand<'tcx>>],
+    destination: &Place<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Root {
+    use cilly::cilnode::PtrCastRes;
+    use cilly::{Access, BasicBlock, ClassDef, MethodDef, MethodImpl};
+    assert_eq!(
+        args.len(),
+        2,
+        "rustc_clr_interop_delegate_closure takes two arguments (env pointer, trampoline fn pointer)"
+    );
+    let InteropHeader {
+        asm,
+        class_name,
+        is_vt: is_valuetype,
+    } = InteropHeader::decode(subst_ref, ctx);
+    let class_generics = tuple_garg_to_types(subst_ref[3], ctx);
+    let mut sig_types = tuple_garg_to_types(subst_ref[4], ctx);
+    assert!(
+        !sig_types.is_empty(),
+        "rustc_clr_interop_delegate_closure: the signature tuple must carry at least a return type"
+    );
+    let output = sig_types.remove(0);
+    let inputs = sig_types;
+    let env_ty = garg_ty_to_type(subst_ref[5], ctx);
+
+    // The trampoline is invoked as `(env, In0, …) -> Ret` — env prepended to the delegate's inputs.
+    let mut tramp_inputs = vec![env_ty];
+    tramp_inputs.extend(inputs.iter().copied());
+    let tramp_fn_sig = ctx.sig(tramp_inputs, output);
+    let tramp_fn_ptr_ty = Type::FnPtr(tramp_fn_sig);
+
+    // Memoised per (env, trampoline-sig) shape.
+    let shim_name = format!("RustClosureShim_{}", tramp_fn_ptr_ty.mangle(ctx));
+    let shim_name = ctx.alloc_string(shim_name);
+    let shim_cref = ctx.alloc_class_ref(ClassRef::new(shim_name, None, false, [].into()));
+    let env_field_name = ctx.alloc_string("env");
+    let env_field = ctx.alloc_field(FieldDesc::new(shim_cref, env_field_name, env_ty));
+    let fnptr_field_name = ctx.alloc_string("fnptr");
+    let fnptr_field = ctx.alloc_field(FieldDesc::new(shim_cref, fnptr_field_name, tramp_fn_ptr_ty));
+    if !ctx
+        .class_defs()
+        .contains_key(&cilly::ir::class::ClassDefIdx(shim_cref))
+    {
+        let object = ClassRef::object(ctx);
+        let shim_def = ctx
+            .class_def(ClassDef::new(
+                shim_name,
+                false,
+                0,
+                Some(object),
+                vec![
+                    (env_ty, env_field_name, None),
+                    (tramp_fn_ptr_ty, fnptr_field_name, None),
+                ],
+                vec![],
+                Access::Extern,
+                None,
+                None,
+                true,
+            ))
+            .expect("rustc_clr_interop_delegate_closure: shim class layout check failed");
+
+        // ---- shim `.ctor(this, env, fnptr)` ----
+        let ctor_name = ctx.alloc_string(".ctor");
+        let ctor_this = ctx.alloc_node(cilly::CILNode::LdArg(0));
+        let ctor_env = ctx.alloc_node(cilly::CILNode::LdArg(1));
+        let ctor_fnptr = ctx.alloc_node(cilly::CILNode::LdArg(2));
+        let set_env = ctx.alloc_root(cilly::CILRoot::SetField(Box::new((
+            env_field, ctor_this, ctor_env,
+        ))));
+        let ctor_this2 = ctx.alloc_node(cilly::CILNode::LdArg(0));
+        let set_fnptr = ctx.alloc_root(cilly::CILRoot::SetField(Box::new((
+            fnptr_field,
+            ctor_this2,
+            ctor_fnptr,
+        ))));
+        let ctor_ret = ctx.alloc_root(cilly::CILRoot::VoidRet);
+        let ctor_sig = ctx.sig(
+            [Type::ClassRef(shim_cref), env_ty, tramp_fn_ptr_ty],
+            Type::Void,
+        );
+        ctx.new_method(MethodDef::new(
+            Access::Public,
+            shim_def,
+            ctor_name,
+            ctor_sig,
+            MethodKind::Constructor,
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![set_env, set_fnptr, ctor_ret], 0, None)],
+                locals: vec![],
+            },
+            vec![None, Some(env_field_name), Some(fnptr_field_name)],
+        ));
+
+        // ---- shim `Invoke(this, In0, …) -> Ret` : ldfld env ; ldargs ; ldfld fnptr ; calli(env, In..) ----
+        let invoke_name = ctx.alloc_string("Invoke");
+        let invoke_this = ctx.alloc_node(cilly::CILNode::LdArg(0));
+        let env_val = ctx.ld_field(invoke_this, env_field);
+        let mut invoke_call_args = Vec::with_capacity(inputs.len() + 1);
+        invoke_call_args.push(env_val);
+        for (i, _in_ty) in inputs.iter().enumerate() {
+            let a = ctx.alloc_node(cilly::CILNode::LdArg(
+                u32::try_from(i + 1).expect("closure shim: too many arguments"),
+            ));
+            invoke_call_args.push(a);
+        }
+        let invoke_this2 = ctx.alloc_node(cilly::CILNode::LdArg(0));
+        let fnptr_val = ctx.ld_field(invoke_this2, fnptr_field);
+        let mut invoke_sig_inputs = vec![Type::ClassRef(shim_cref)];
+        invoke_sig_inputs.extend(inputs.iter().copied());
+        let invoke_sig = ctx.sig(invoke_sig_inputs, output);
+        let invoke_body = if output == Type::Void {
+            let call = ctx.call_indirect_root(tramp_fn_sig, fnptr_val, invoke_call_args);
+            let ret = ctx.alloc_root(cilly::CILRoot::VoidRet);
+            vec![call, ret]
+        } else {
+            let call = ctx.call_indirect(tramp_fn_sig, fnptr_val, invoke_call_args);
+            let ret = ctx.alloc_root(cilly::CILRoot::Ret(call));
+            vec![ret]
+        };
+        let mut invoke_arg_names = vec![None];
+        invoke_arg_names.extend((0..inputs.len()).map(|_| None));
+        ctx.new_method(MethodDef::new(
+            Access::Public,
+            shim_def,
+            invoke_name,
+            invoke_sig,
+            MethodKind::Instance,
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(invoke_body, 0, None)],
+                locals: vec![],
+            },
+            invoke_arg_names,
+        ));
+    }
+
+    // --- Emit: newobj shim(env, trampoline) ; ldftn shim::Invoke ; newobj Delegate::.ctor(obj, ftn) ---
+    let env_arg = handle_operand(&args[0].node, ctx);
+    let tramp_arg = handle_operand(&args[1].node, ctx);
+    let tramp_arg = ctx.alloc_node(cilly::CILNode::PtrCast(
+        tramp_arg,
+        Box::new(PtrCastRes::FnPtr(tramp_fn_sig)),
+    ));
+
+    let shim_ctor_sig = ctx.sig(
+        [Type::ClassRef(shim_cref), env_ty, tramp_fn_ptr_ty],
+        Type::Void,
+    );
+    let shim_ctor = MethodRef::new(
+        shim_cref,
+        ctx.alloc_string(".ctor"),
+        shim_ctor_sig,
+        MethodKind::Constructor,
+        vec![].into(),
+    );
+    let shim_ctor = ctx.alloc_methodref(shim_ctor);
+    let shim_obj = ctx.call(shim_ctor, &[env_arg, tramp_arg], IsPure::NOT);
+
+    let mut invoke_sig_inputs = vec![Type::ClassRef(shim_cref)];
+    invoke_sig_inputs.extend(inputs.iter().copied());
+    let invoke_sig = ctx.sig(invoke_sig_inputs, output);
+    let shim_invoke = MethodRef::new(
+        shim_cref,
+        ctx.alloc_string("Invoke"),
+        invoke_sig,
+        MethodKind::Instance,
+        vec![].into(),
+    );
+    let shim_invoke = ctx.alloc_methodref(shim_invoke);
+    let invoke_ftn = ctx.ld_ftn(shim_invoke);
+    let invoke_ftn = ctx.alloc_node(cilly::CILNode::PtrCast(invoke_ftn, Box::new(PtrCastRes::ISize)));
+
+    let delegate_cref = ctx.alloc_class_ref(ClassRef::new(
+        class_name,
+        asm,
+        is_valuetype,
+        class_generics.into(),
+    ));
+    let delegate_ctor_sig = ctx.sig(
+        [
+            Type::ClassRef(delegate_cref),
+            Type::PlatformObject,
+            Type::Int(Int::ISize),
+        ],
+        Type::Void,
+    );
+    let delegate_ctor = MethodRef::new(
+        delegate_cref,
+        ctx.alloc_string(".ctor"),
+        delegate_ctor_sig,
+        MethodKind::Constructor,
+        vec![].into(),
+    );
+    let delegate_ctor = ctx.alloc_methodref(delegate_ctor);
+    let delegate = ctx.call(delegate_ctor, &[shim_obj, invoke_ftn], IsPure::NOT);
+    place_set(destination, delegate, ctx)
+}
 /// Creates a new managed object, and places a reference to it in destination
 fn call_ctor<'tcx>(
     subst_ref: &[GenericArg<'tcx>],
@@ -1094,6 +1305,13 @@ pub fn call_inner<'tcx>(
         );
         // WF-9: `List<i32>::Add(…)` and friends.
         return vec![call_generic(instance.args, args, destination, ctx)];
+    } else if function_name.contains(DELEGATE_CLOSURE_FN_NAME) {
+        // Checked BEFORE `DELEGATE_FN_NAME` — `delegate_closure` CONTAINS `delegate`.
+        assert!(
+            !call_info.split_last_tuple(),
+            "Closure delegate construction may not use the `rust_call` calling convention!"
+        );
+        return vec![delegate_from_closure(instance.args, args, destination, ctx)];
     } else if function_name.contains(DELEGATE_FN_NAME) {
         assert!(
             !call_info.split_last_tuple(),

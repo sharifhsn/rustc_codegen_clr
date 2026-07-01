@@ -39,6 +39,10 @@ pub const MANAGED_THROW: &str = "rustc_clr_interop_throw";
 /// backend builds a small managed *shim* class holding the pointer whose `Invoke` `calli`s it, then
 /// `newobj`s the real generic delegate over `ldftn shim::Invoke`. See `delegate_from_fnptr`.
 pub const DELEGATE_FN_NAME: &str = "rustc_clr_interop_delegate";
+/// Like [`DELEGATE_FN_NAME`] but for a **capturing** closure: the shim holds a boxed-environment
+/// pointer AND a trampoline fn pointer, and `Invoke` prepends the env before the `calli`. NOTE: the
+/// name CONTAINS `rustc_clr_interop_delegate`, so the dispatch must check this substring FIRST.
+pub const DELEGATE_CLOSURE_FN_NAME: &str = "rustc_clr_interop_delegate_closure";
 pub fn is_function_magic(name: &str) -> bool {
     name.contains(CTOR_FN_NAME)
         || name.contains(MANAGED_CALL_FN_NAME)

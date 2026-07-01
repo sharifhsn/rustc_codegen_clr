@@ -113,6 +113,37 @@ macro_rules! delegate_wrapper {
             ) -> Self {
                 Self { h }
             }
+
+            /// Build the delegate from a **capturing** Rust closure (`move |x| ...` over local state).
+            /// The closure's environment is boxed and **leaked** (kept alive for the process, since the
+            /// .NET delegate may outlive this call and the GC won't free Rust memory); the .NET side
+            /// invokes it through a trampoline. Use [`from_fn`](Self::from_fn) for a capture-less `fn`
+            /// when you don't need to leak.
+            #[inline]
+            pub fn from_closure<Fun: ::core::ops::Fn( $($iaty),* ) -> $iret + 'static>(f: Fun) -> Self {
+                // Box to a `dyn Fn`, then box THAT to get a thin `*mut ()` the shim can hold.
+                let boxed: ::std::boxed::Box<dyn ::core::ops::Fn( $($iaty),* ) -> $iret> =
+                    ::std::boxed::Box::new(f);
+                let env = ::std::boxed::Box::into_raw(::std::boxed::Box::new(boxed)) as *mut ();
+                // Monomorphic trampoline (one per delegate signature): reconstruct & call the closure.
+                extern "C" fn tramp< $($garg),+ >(
+                    env: *mut (),
+                    $( $ia : $iaty ),*
+                ) -> $iret {
+                    let f = unsafe {
+                        &*(env as *const ::std::boxed::Box<dyn ::core::ops::Fn( $($iaty),* ) -> $iret>)
+                    };
+                    f( $($ia),* )
+                }
+                let h = $crate::intrinsics::rustc_clr_interop_delegate_closure::<
+                    { CORELIB }, { $class }, false,
+                    ( $($genarg,)+ ),
+                    ( $iret, $($iaty,)* ),
+                    *mut (),
+                    extern "C" fn(*mut (), $($iaty),*) -> $iret,
+                >(env, tramp::< $($garg),+ >);
+                Self { h }
+            }
         }
     };
 }

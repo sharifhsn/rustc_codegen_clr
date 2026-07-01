@@ -491,6 +491,28 @@ pub fn rustc_clr_interop_delegate<
     core::intrinsics::abort();
 }
 
+/// Wraps a **capturing** closure into a managed delegate: `env` is a boxed-environment pointer and
+/// `trampoline` an `extern "C" fn(env, In..) -> Ret` that reconstructs the closure and calls it. The
+/// backend synthesises a shim holding both, whose `Invoke` prepends `env` before the `calli`, so the
+/// captured state rides along on the .NET side. Generic layout mirrors [`rustc_clr_interop_delegate`]
+/// with an extra `EnvTy` before the fn-ptr type.
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_clr_interop_delegate_closure<
+    const ASSEMBLY: &'static str,
+    const CLASS_PATH: &'static str,
+    const IS_VALUETYPE: bool,
+    ClassGenerics,
+    Sig,
+    EnvTy,
+    FnPtrTy,
+>(
+    env: EnvTy,
+    trampoline: FnPtrTy,
+) -> RustcCLRInteropManagedGeneric<ASSEMBLY, CLASS_PATH, ClassGenerics> {
+    core::intrinsics::abort();
+}
+
 impl RustcCLRInteropManagedChar {
     /// The raw UTF-16 code unit (`System.Char` is a 16-bit value). Inverse of the `From<u16>` impl.
     #[inline(always)]
