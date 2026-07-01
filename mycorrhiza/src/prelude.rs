@@ -28,6 +28,7 @@ pub use crate::collections::{
 // `Regex::new(..)`, `Math::sqrt(..)`, …). `TimeSpan` is re-exported under its idiomatic name (the
 // module type is `DotNetTimeSpan` to avoid colliding with `std::time`-flavoured expectations).
 pub use crate::bcl::datetime::DateTime;
+pub use crate::bcl::decimal::DotNetDecimal;
 pub use crate::bcl::environment::Environment;
 pub use crate::bcl::guid::Guid;
 pub use crate::bcl::mathf::Math;

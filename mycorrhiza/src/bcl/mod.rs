@@ -25,6 +25,7 @@
 //! call the low-level bindings directly.
 
 pub mod datetime;
+pub mod decimal;
 pub mod environment;
 pub mod guid;
 pub mod json;

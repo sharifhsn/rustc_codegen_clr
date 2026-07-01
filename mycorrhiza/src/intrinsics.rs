@@ -419,6 +419,27 @@ interop_magic_fn! {
     [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const KIND: u8, ClassGenerics, Sig, Ret]
     (arg1: Arg1, arg2: Arg2, arg3: Arg3) -> Ret
 }
+
+// Generic-METHOD calls (`!!N`): a method that itself takes type arguments (e.g.
+// `Activator.CreateInstance<T>()`, `Deserialize<T>(s)`, `GetService<T>()`). Identical to the
+// `generic_call` family plus a `MethodGenerics` tuple (the method's concrete type args) after
+// `ClassGenerics`. `!N` in `Sig` still refers to the CLASS generics; `!!N` refers to these method
+// generics. Name carries no `_` after `call` (the backend reads arity from the call's arg count).
+interop_magic_fn! {
+    rustc_clr_interop_generic_method_call0
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const KIND: u8, ClassGenerics, MethodGenerics, Sig, Ret]
+    () -> Ret
+}
+interop_magic_fn! {
+    rustc_clr_interop_generic_method_call1
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const KIND: u8, ClassGenerics, MethodGenerics, Sig, Ret]
+    (arg1: Arg1) -> Ret
+}
+interop_magic_fn! {
+    rustc_clr_interop_generic_method_call2
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const KIND: u8, ClassGenerics, MethodGenerics, Sig, Ret]
+    (arg1: Arg1, arg2: Arg2) -> Ret
+}
 interop_magic_fn! {
     rustc_clr_interop_generic_ctor0
     [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, ClassGenerics, Sig, Ret]
@@ -594,5 +615,21 @@ impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const SIZE: u
         rustc_clr_interop_managed_call1_::<ASSEMBLY, CLASS_PATH, true, METHOD, true, Ret, Arg1>(
             arg1,
         )
+    }
+
+    /// A two-arg value-type **static** call — used for the operator methods of arithmetic value types
+    /// (`Decimal.op_Addition(Decimal, Decimal)`, `Decimal.Compare(Decimal, Decimal)`, …).
+    #[inline(always)]
+    pub fn vt_static2<const METHOD: &'static str, Arg1, Arg2, Ret>(arg1: Arg1, arg2: Arg2) -> Ret {
+        rustc_clr_interop_managed_call2_::<
+            ASSEMBLY,
+            CLASS_PATH,
+            true,
+            METHOD,
+            true,
+            Ret,
+            Arg1,
+            Arg2,
+        >(arg1, arg2)
     }
 }

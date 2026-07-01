@@ -23,6 +23,12 @@ pub const MANAGED_TRY_CATCH: &str = "rustc_clr_interop_try_catch";
 pub const GENERIC_CALL_FN_NAME: &str = "rustc_clr_interop_generic_call";
 /// Constructs a managed object of a *generic* .NET instantiation (e.g. `new List<i32>()`).
 pub const GENERIC_CTOR_FN_NAME: &str = "rustc_clr_interop_generic_ctor";
+/// Calls a *generic method* (`!!N`) — a method that itself takes type arguments, e.g.
+/// `Activator.CreateInstance<T>()`, `JsonSerializer.Deserialize<T>(s)`, `provider.GetService<T>()`.
+/// Unlike [`GENERIC_CALL_FN_NAME`] (a method on a generic *type*), the type arguments live on the
+/// method: the emitted methodref carries them (`Method<int32>`) and the signature uses `!!N` markers.
+/// (Note: does NOT collide with the `_generic_call` substring — `_generic_method_call` differs.)
+pub const GENERIC_METHOD_CALL_FN_NAME: &str = "rustc_clr_interop_generic_method_call";
 /// Raises a managed `System.Exception` directly (so a .NET caller can `catch` it) — distinct from a
 /// Rust `panic!`, which goes through the unwinder and does not propagate cleanly out to managed callers.
 pub const MANAGED_THROW: &str = "rustc_clr_interop_throw";
@@ -38,6 +44,7 @@ pub fn is_function_magic(name: &str) -> bool {
         || name.contains(MANAGED_CALL_FN_NAME)
         || name.contains(MANAGED_THROW)
         || name.contains(GENERIC_CALL_FN_NAME)
+        || name.contains(GENERIC_METHOD_CALL_FN_NAME)
         || name.contains(GENERIC_CTOR_FN_NAME)
         || name.contains(DELEGATE_FN_NAME)
 }

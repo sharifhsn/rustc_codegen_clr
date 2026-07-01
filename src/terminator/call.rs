@@ -2,7 +2,8 @@ use crate::{
     assembly::MethodCompileCtx,
     interop::AssemblyRef,
     utilis::{
-        garg_to_bool, CTOR_FN_NAME, DELEGATE_FN_NAME, GENERIC_CALL_FN_NAME, GENERIC_CTOR_FN_NAME,
+        garg_to_bool, CTOR_FN_NAME, DELEGATE_FN_NAME, GENERIC_CALL_FN_NAME,
+        GENERIC_METHOD_CALL_FN_NAME, GENERIC_CTOR_FN_NAME,
         MANAGED_CALL_FN_NAME, MANAGED_CALL_VIRT_FN_NAME, MANAGED_CHECKED_CAST, MANAGED_IS_INST,
         MANAGED_LD_ELEM_REF, MANAGED_LD_LEN, MANAGED_LD_NULL, MANAGED_NEW_ARR, MANAGED_SET_ELEM,
         MANAGED_THROW, MANAGED_TRY_CATCH,
@@ -260,32 +261,45 @@ fn tuple_garg_to_types<'tcx>(
 /// **silently miscompile** — CoreCLR runs UNVERIFIED, so RyuJIT narrows/widens rather than rejecting.
 /// Failing loud at codegen here is what makes the `is_assignable_to` `!N`-vs-concrete relaxation
 /// *precisely* sound (the `!N` value provably equals its concrete binding) rather than merely trusted.
-/// Method generics `!!N` (CallGeneric) are not validated (the current bridge carries no method generics).
+/// Method generics `!!N` (CallGeneric) are validated the same way against the concrete
+/// `method_generics` (the type arguments carried on the generic-method call — see `call_gmethod`).
 fn check_generic_marker<'tcx>(
     sig_ty: Type,
     runtime_ty: Type,
     class_generics: &[Type],
+    method_generics: &[Type],
     role: &str,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) {
     match sig_ty {
-        // Leaf: a bare class generic `!N` must resolve to exactly the runtime type.
-        Type::PlatformGeneric(n, GenericKind::TypeGeneric) => match class_generics.get(n as usize) {
-            Some(&resolved) if resolved == runtime_ty => {}
-            Some(&resolved) => ctx.tcx().dcx().span_fatal(
-                ctx.span(),
-                format!(
-                    "WF-9 generic interop: the `!{n}` {role} resolves to class generic {n} = {resolved:?}, but the declared runtime type is {runtime_ty:?}. The binding is inconsistent and would silently miscompile (CoreCLR runs unverified)."
+        // Leaf: a class generic `!N` resolves via `class_generics`; a method generic `!!N` via
+        // `method_generics`. Either must resolve to EXACTLY the runtime type.
+        Type::PlatformGeneric(n, kind) => {
+            let (gens, prefix, which) = match kind {
+                GenericKind::TypeGeneric => (class_generics, "!", "class"),
+                // `!!N` — the `RustcCLRInteropMethodGeneric` marker lowers to `CallGeneric`; treat the
+                // legacy `MethodGeneric` variant the same (both are method type parameters).
+                GenericKind::CallGeneric | GenericKind::MethodGeneric => {
+                    (method_generics, "!!", "method")
+                }
+            };
+            match gens.get(n as usize) {
+                Some(&resolved) if resolved == runtime_ty => {}
+                Some(&resolved) => ctx.tcx().dcx().span_fatal(
+                    ctx.span(),
+                    format!(
+                        "WF-9 generic interop: the `{prefix}{n}` {role} resolves to {which} generic {n} = {resolved:?}, but the declared runtime type is {runtime_ty:?}. The binding is inconsistent and would silently miscompile (CoreCLR runs unverified)."
+                    ),
                 ),
-            ),
-            None => ctx.tcx().dcx().span_fatal(
-                ctx.span(),
-                format!(
-                    "WF-9 generic interop: a `!{n}` {role} references class generic {n}, but only {} class generic argument(s) were provided.",
-                    class_generics.len()
+                None => ctx.tcx().dcx().span_fatal(
+                    ctx.span(),
+                    format!(
+                        "WF-9 generic interop: a `{prefix}{n}` {role} references {which} generic {n}, but only {} {which} generic argument(s) were provided.",
+                        gens.len()
+                    ),
                 ),
-            ),
-        },
+            }
+        }
         // Nested generic: a def-shape type like `Dictionary<K,V>.KeyCollection<!0,!1>`,
         // `Comparison<!0>`, or `Task<!0>`. When the runtime type is the SAME open generic (same
         // name/assembly/valuetype and arity), recurse pairwise into the generic arguments so every
@@ -307,7 +321,7 @@ fn check_generic_marker<'tcx>(
             };
             if same_open {
                 for (sg, rg) in sig_gen.into_iter().zip(rt_gen) {
-                    check_generic_marker(sg, rg, class_generics, role, ctx);
+                    check_generic_marker(sg, rg, class_generics, method_generics, role, ctx);
                 }
             }
         }
@@ -319,7 +333,7 @@ fn check_generic_marker<'tcx>(
             };
             let inner_sig = ctx[sig_inner];
             let inner_rt = ctx[rt_inner];
-            check_generic_marker(inner_sig, inner_rt, class_generics, role, ctx);
+            check_generic_marker(inner_sig, inner_rt, class_generics, method_generics, role, ctx);
         }
         _ => {}
     }
@@ -369,11 +383,11 @@ fn call_generic<'tcx>(
     // instance/virtual). The Sig excludes the receiver, so explicit input `j` pairs with runtime arg
     // `recv_offset + j`.
     let ret_ty = garg_ty_to_type(subst_ref[7], ctx);
-    check_generic_marker(output, ret_ty, &class_generics, "return", ctx);
+    check_generic_marker(output, ret_ty, &class_generics, &[], "return", ctx);
     let recv_offset = if kind == 0 { 0 } else { 1 };
     for (j, &sig_in) in explicit_inputs.iter().enumerate() {
         let arg_ty = garg_ty_to_type(subst_ref[8 + recv_offset + j], ctx);
-        check_generic_marker(sig_in, arg_ty, &class_generics, "argument", ctx);
+        check_generic_marker(sig_in, arg_ty, &class_generics, &[], "argument", ctx);
     }
 
     let this = ctx.alloc_class_ref(ClassRef::new(
@@ -422,6 +436,94 @@ fn call_generic<'tcx>(
         place_set(destination, node, ctx)
     }
 }
+/// WF-9 — calls a *generic method* (`!!N`), i.e. a method that itself takes type arguments, e.g.
+/// `Activator.CreateInstance<T>()`, `JsonSerializer.Deserialize<T>(s)`, `provider.GetService<T>()`.
+/// Mirrors [`call_generic`], but the methodref *carries the method's concrete type arguments* (so the
+/// exporter renders `Method<int32>`) and the signature may use `!!N` markers (resolved via the method
+/// generics) in addition to `!N` (the class generics). subst layout inserts a `MethodGenerics` tuple
+/// after `ClassGenerics`:
+///   `[0]`=assembly `[1]`=class `[2]`=is-vt `[3]`=method `[4]`=KIND `[5]`=ClassGenerics
+///   `[6]`=MethodGenerics `[7]`=Sig `[8]`=Ret `[9..]`=runtime arg types.
+fn call_gmethod<'tcx>(
+    subst_ref: &[GenericArg<'tcx>],
+    args: &[Spanned<Operand<'tcx>>],
+    destination: &Place<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Root {
+    let InteropHeader {
+        asm,
+        class_name,
+        is_vt: is_valuetype,
+    } = InteropHeader::decode(subst_ref, ctx);
+    let managed_fn_name = garg_to_string(subst_ref[3], ctx.tcx());
+    let managed_fn_name = ctx.alloc_string(managed_fn_name);
+    let kind = garg_to_usize(subst_ref[4], ctx.tcx());
+    let class_generics = tuple_garg_to_types(subst_ref[5], ctx);
+    // The method's own concrete type arguments (e.g. the `(int32,)` of `CreateInstance<int32>`).
+    let method_generics = tuple_garg_to_types(subst_ref[6], ctx);
+    assert!(
+        !method_generics.is_empty(),
+        "WF-9 generic method: a generic method call must carry at least one method type argument"
+    );
+    let mut sig_types = tuple_garg_to_types(subst_ref[7], ctx);
+    assert!(
+        !sig_types.is_empty(),
+        "WF-9 generic method: the signature tuple must carry at least a return type"
+    );
+    let output = sig_types.remove(0);
+    let explicit_inputs = sig_types;
+
+    // Loud-fail on an inconsistent binding — `!N` against class generics, `!!N` against method generics.
+    let ret_ty = garg_ty_to_type(subst_ref[8], ctx);
+    check_generic_marker(output, ret_ty, &class_generics, &method_generics, "return", ctx);
+    let recv_offset = if kind == 0 { 0 } else { 1 };
+    for (j, &sig_in) in explicit_inputs.iter().enumerate() {
+        let arg_ty = garg_ty_to_type(subst_ref[9 + recv_offset + j], ctx);
+        check_generic_marker(sig_in, arg_ty, &class_generics, &method_generics, "argument", ctx);
+    }
+
+    let this = ctx.alloc_class_ref(ClassRef::new(
+        class_name,
+        asm,
+        is_valuetype,
+        class_generics.into(),
+    ));
+    let mut inputs = Vec::with_capacity(explicit_inputs.len() + 1);
+    let mkind = match kind {
+        0 => MethodKind::Static,
+        1 => {
+            if is_valuetype {
+                let this_ref = ctx.nref(Type::ClassRef(this));
+                inputs.push(this_ref);
+            } else {
+                inputs.push(Type::ClassRef(this));
+            }
+            MethodKind::Instance
+        }
+        2 => {
+            inputs.push(Type::ClassRef(this));
+            MethodKind::Virtual
+        }
+        _ => panic!("WF-9 generic method: invalid call KIND {kind}"),
+    };
+    inputs.extend(explicit_inputs);
+    let sig = ctx.sig(inputs, output);
+    // The KEY difference from `call_generic`: the methodref carries the method's concrete type args, so
+    // the exporter emits `Method<..>` and the CLR binds the right instantiation.
+    let mref = MethodRef::new(this, managed_fn_name, sig, mkind, method_generics.into());
+    let mref = ctx.alloc_methodref(mref);
+
+    let mut call_args = Vec::new();
+    for arg in args {
+        call_args.push(handle_operand(&arg.node, ctx));
+    }
+    if output == Type::Void {
+        ctx.call_root(mref, &call_args, IsPure::NOT)
+    } else {
+        let node = ctx.call(mref, &call_args, IsPure::NOT);
+        place_set(destination, node, ctx)
+    }
+}
 /// WF-9 — constructs a managed object of a *generic* .NET instantiation (e.g. `new List<i32>()`).
 fn ctor_generic<'tcx>(
     subst_ref: &[GenericArg<'tcx>],
@@ -450,7 +552,7 @@ fn ctor_generic<'tcx>(
     // explicit input `j` pairs with runtime arg `subst[6 + j]`.
     for (j, &sig_in) in explicit_inputs.iter().enumerate() {
         let arg_ty = garg_ty_to_type(subst_ref[6 + j], ctx);
-        check_generic_marker(sig_in, arg_ty, &class_generics, "argument", ctx);
+        check_generic_marker(sig_in, arg_ty, &class_generics, &[], "argument", ctx);
     }
 
     let this = ctx.alloc_class_ref(ClassRef::new(
@@ -976,6 +1078,15 @@ pub fn call_inner<'tcx>(
         );
         // WF-9: `new List<i32>()` and friends.
         return vec![ctor_generic(instance.args, args, destination, ctx)];
+    } else if function_name.contains(GENERIC_METHOD_CALL_FN_NAME) {
+        // Checked BEFORE `GENERIC_CALL_FN_NAME` for clarity (the names don't actually collide —
+        // `_generic_method_call` doesn't contain `_generic_call`).
+        assert!(
+            !call_info.split_last_tuple(),
+            "Generic method calls may not use the `rust_call` calling convention!"
+        );
+        // WF-9: `Activator.CreateInstance<T>()`, `Deserialize<T>(…)`, `GetService<T>()` and friends.
+        return vec![call_gmethod(instance.args, args, destination, ctx)];
     } else if function_name.contains(GENERIC_CALL_FN_NAME) {
         assert!(
             !call_info.split_last_tuple(),
