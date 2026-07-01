@@ -2,7 +2,7 @@ use crate::{
     assembly::MethodCompileCtx,
     interop::AssemblyRef,
     utilis::{
-        garg_to_bool, CTOR_FN_NAME, GENERIC_CALL_FN_NAME, GENERIC_CTOR_FN_NAME,
+        garg_to_bool, CTOR_FN_NAME, DELEGATE_FN_NAME, GENERIC_CALL_FN_NAME, GENERIC_CTOR_FN_NAME,
         MANAGED_CALL_FN_NAME, MANAGED_CALL_VIRT_FN_NAME, MANAGED_CHECKED_CAST, MANAGED_IS_INST,
         MANAGED_LD_ELEM_REF, MANAGED_LD_LEN, MANAGED_LD_NULL, MANAGED_NEW_ARR, MANAGED_SET_ELEM,
         MANAGED_THROW, MANAGED_TRY_CATCH,
@@ -435,6 +435,228 @@ fn ctor_generic<'tcx>(
     let node = ctx.call(ctor, &call_args, IsPure::NOT);
     place_set(destination, node, ctx)
 }
+/// Delegates & callbacks — wrap a Rust `extern` fn pointer into a managed .NET delegate instance
+/// (`Action<..>` / `Func<.., R>`), so a Rust callback can be passed to any .NET API that takes a
+/// delegate (`List.ForEach`, a sort comparator, LINQ, an event `add_*`).
+///
+/// A managed delegate must be constructed via `ldftn <managed method>; newobj Delegate::.ctor(object,
+/// native int)` — the `native int` has to be the address of a *managed* method whose signature matches
+/// the delegate's `Invoke`, NOT a raw native pointer. Our callback arrives as a native `FnPtr` (a
+/// capture-less closure / `fn` item is coerced to one before it reaches here), so we synthesise a small
+/// managed **shim** class per concrete signature, holding the native pointer in a field, whose `Invoke`
+/// method `calli`s it. Then `newobj shim(fnptr)` → `ldftn shim::Invoke` → `newobj Delegate::.ctor`.
+/// This is the exact dance `insert_dotnet_thread_spawn` performs for `ThreadStart`, generalised to any
+/// arity and to the generic `Func`/`Action` families.
+///
+/// The shim's `Invoke` signature is the *concrete* lowered signature (from the `Sig` tuple), which by
+/// construction equals the delegate's instantiated `Invoke` — so `newobj Func`N<T..>::.ctor(object,
+/// native int)` binding `ldftn shim::Invoke` is sound (this is exactly what C#'s
+/// `new Func<..>(obj.Invoke)` compiles to). Keeping the shim `Invoke` concrete is why the delegate type
+/// mapping stays exact: the class generics on the delegate are the concrete `ClassGenerics`, and every
+/// runtime value crosses with its ordinary Rust type.
+///
+/// subst layout (mirrors the WF-9 generic family header + a fn-ptr tail):
+///   `[0]`=assembly `[1]`=delegate class path `[2]`=is-valuetype(false)
+///   `[3]`=`ClassGenerics` tuple (concrete delegate type args, e.g. `(i32, bool)` for `Func<i32,bool>`)
+///   `[4]`=`Sig` tuple `(Ret, In0, In1, …)` — the *concrete* signature the pointer is called with
+///   `[5]`=`FnPtrTy` (the fn-ptr type of the argument; unused, the value carries the pointer)
+fn delegate_from_fnptr<'tcx>(
+    subst_ref: &[GenericArg<'tcx>],
+    args: &[Spanned<Operand<'tcx>>],
+    destination: &Place<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Root {
+    use cilly::cilnode::PtrCastRes;
+    use cilly::{Access, BasicBlock, ClassDef, MethodDef, MethodImpl};
+    assert_eq!(
+        args.len(),
+        1,
+        "rustc_clr_interop_delegate takes exactly one argument (the fn pointer)"
+    );
+    let InteropHeader {
+        asm,
+        class_name,
+        is_vt: is_valuetype,
+    } = InteropHeader::decode(subst_ref, ctx);
+    // Concrete .NET type arguments of the delegate instantiation (e.g. the `(i32, bool)` of
+    // `Func<i32, bool>`). May be empty for a non-generic delegate (rare; e.g. plain `Action`).
+    let class_generics = tuple_garg_to_types(subst_ref[3], ctx);
+    // The concrete signature the native pointer is invoked with: `(Ret, In0, In1, …)`.
+    let mut sig_types = tuple_garg_to_types(subst_ref[4], ctx);
+    assert!(
+        !sig_types.is_empty(),
+        "rustc_clr_interop_delegate: the signature tuple must carry at least a return type"
+    );
+    let output = sig_types.remove(0);
+    let inputs = sig_types;
+
+    // --- The native `fn`-pointer signature the shim `calli`s and its field type. ---
+    let shim_fn_sig = ctx.sig(inputs.clone(), output);
+    let shim_fn_ptr_ty = Type::FnPtr(shim_fn_sig);
+
+    // --- Build (once) the monomorphic shim class holding the native pointer. ---
+    // Name it uniquely by the concrete signature so distinct delegate shapes get distinct shims; a
+    // second delegate of the *same* shape reuses the memoised class (re-defining a class name panics).
+    let shim_name = format!("RustDelegateShim_{}", shim_fn_ptr_ty.mangle(ctx));
+    let shim_name = ctx.alloc_string(shim_name);
+    let shim_cref = ctx.alloc_class_ref(ClassRef::new(shim_name, None, false, [].into()));
+    let fnptr_field_name = ctx.alloc_string("fnptr");
+    let fnptr_field = ctx.alloc_field(FieldDesc::new(shim_cref, fnptr_field_name, shim_fn_ptr_ty));
+    if !ctx
+        .class_defs()
+        .contains_key(&cilly::ir::class::ClassDefIdx(shim_cref))
+    {
+        let object = ClassRef::object(ctx);
+        let shim_def = ctx
+            .class_def(ClassDef::new(
+                shim_name,
+                false,
+                0,
+                Some(object),
+                vec![(shim_fn_ptr_ty, fnptr_field_name, None)],
+                vec![],
+                // Extern: keep the linker's dead-code pass from pruning a shim whose only reference is
+                // the `ldftn` inside the delegate `newobj` (matches `UnmanagedThreadStart`).
+                Access::Extern,
+                None,
+                None,
+                true,
+            ))
+            .expect("rustc_clr_interop_delegate: shim class layout check failed");
+
+        // ---- shim `.ctor(this, fnptr)` : stores the pointer into the field ----
+        let ctor_name = ctx.alloc_string(".ctor");
+        let ctor_this = ctx.alloc_node(cilly::CILNode::LdArg(0));
+        let ctor_arg = ctx.alloc_node(cilly::CILNode::LdArg(1));
+        let set_field = ctx.alloc_root(cilly::CILRoot::SetField(Box::new((
+            fnptr_field,
+            ctor_this,
+            ctor_arg,
+        ))));
+        let ctor_ret = ctx.alloc_root(cilly::CILRoot::VoidRet);
+        let ctor_sig = ctx.sig(
+            [Type::ClassRef(shim_cref), shim_fn_ptr_ty],
+            Type::Void,
+        );
+        ctx.new_method(MethodDef::new(
+            Access::Public,
+            shim_def,
+            ctor_name,
+            ctor_sig,
+            MethodKind::Constructor,
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![set_field, ctor_ret], 0, None)],
+                locals: vec![],
+            },
+            vec![None, Some(fnptr_field_name)],
+        ));
+
+        // ---- shim `Invoke(this, In0, …) -> Ret` : loads args, loads the field, `calli`s it ----
+        let invoke_name = ctx.alloc_string("Invoke");
+        // The `Invoke` receiver is arg 0; the explicit inputs are args 1..=N.
+        let mut invoke_call_args = Vec::with_capacity(inputs.len());
+        for (i, _in_ty) in inputs.iter().enumerate() {
+            let a = ctx.alloc_node(cilly::CILNode::LdArg(
+                u32::try_from(i + 1).expect("delegate shim: too many arguments"),
+            ));
+            invoke_call_args.push(a);
+        }
+        let invoke_this = ctx.alloc_node(cilly::CILNode::LdArg(0));
+        let fnptr_val = ctx.ld_field(invoke_this, fnptr_field);
+        // The methodref receiver goes at sig position 0 (cilly convention); the shim `calli` sig is the
+        // *native* pointer sig (no receiver), so a separate value list is used for the indirect call.
+        let mut invoke_sig_inputs = vec![Type::ClassRef(shim_cref)];
+        invoke_sig_inputs.extend(inputs.iter().copied());
+        let invoke_sig = ctx.sig(invoke_sig_inputs, output);
+        let invoke_body = if output == Type::Void {
+            let call = ctx.call_indirect_root(shim_fn_sig, fnptr_val, invoke_call_args);
+            let ret = ctx.alloc_root(cilly::CILRoot::VoidRet);
+            vec![call, ret]
+        } else {
+            let call = ctx.call_indirect(shim_fn_sig, fnptr_val, invoke_call_args);
+            let ret = ctx.alloc_root(cilly::CILRoot::Ret(call));
+            vec![ret]
+        };
+        let mut invoke_arg_names = vec![None];
+        invoke_arg_names.extend((0..inputs.len()).map(|_| None));
+        ctx.new_method(MethodDef::new(
+            Access::Public,
+            shim_def,
+            invoke_name,
+            invoke_sig,
+            MethodKind::Instance,
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(invoke_body, 0, None)],
+                locals: vec![],
+            },
+            invoke_arg_names,
+        ));
+    }
+
+    // --- Emit: newobj shim(fnptr) ; ldftn shim::Invoke ; newobj Delegate::.ctor(object, native int) ---
+    let fnptr_arg = handle_operand(&args[0].node, ctx);
+    // The incoming pointer is a `FnPtr` value; normalise it to the shim ctor's declared `FnPtr` param
+    // type (a `ReifyFnPointer`/`ClosureFnPointer` coercion already produced a `FnPtr`, but its concrete
+    // sig may differ in receiver-elision). Cast directly to `FnPtr` — NOT `cast_ptr`, which would wrap
+    // it in a `Ptr(FnPtr)` (that mismatch was `CallArgTypeWrong got p1i32v expected 1i32v`).
+    let fnptr_arg = ctx.alloc_node(cilly::CILNode::PtrCast(
+        fnptr_arg,
+        Box::new(cilly::cilnode::PtrCastRes::FnPtr(shim_fn_sig)),
+    ));
+
+    let shim_ctor_sig = ctx.sig([Type::ClassRef(shim_cref), shim_fn_ptr_ty], Type::Void);
+    let shim_ctor = MethodRef::new(
+        shim_cref,
+        ctx.alloc_string(".ctor"),
+        shim_ctor_sig,
+        MethodKind::Constructor,
+        vec![].into(),
+    );
+    let shim_ctor = ctx.alloc_methodref(shim_ctor);
+    let shim_obj = ctx.call(shim_ctor, &[fnptr_arg], IsPure::NOT);
+
+    // ldftn shim::Invoke  (an instance method: methodref receiver is sig position 0)
+    let mut invoke_sig_inputs = vec![Type::ClassRef(shim_cref)];
+    invoke_sig_inputs.extend(inputs.iter().copied());
+    let invoke_sig = ctx.sig(invoke_sig_inputs, output);
+    let shim_invoke = MethodRef::new(
+        shim_cref,
+        ctx.alloc_string("Invoke"),
+        invoke_sig,
+        MethodKind::Instance,
+        vec![].into(),
+    );
+    let shim_invoke = ctx.alloc_methodref(shim_invoke);
+    let invoke_ftn = ctx.ld_ftn(shim_invoke);
+    // `ldftn` yields `native int`; the delegate `.ctor`'s second param is `native int`. Normalise.
+    let invoke_ftn = ctx.alloc_node(cilly::CILNode::PtrCast(invoke_ftn, Box::new(PtrCastRes::ISize)));
+
+    // newobj DelegateClass<ClassGenerics..>::.ctor(object, native int)
+    let delegate_cref = ctx.alloc_class_ref(ClassRef::new(
+        class_name,
+        asm,
+        is_valuetype,
+        class_generics.into(),
+    ));
+    let delegate_ctor_sig = ctx.sig(
+        [
+            Type::ClassRef(delegate_cref),
+            Type::PlatformObject,
+            Type::Int(Int::ISize),
+        ],
+        Type::Void,
+    );
+    let delegate_ctor = MethodRef::new(
+        delegate_cref,
+        ctx.alloc_string(".ctor"),
+        delegate_ctor_sig,
+        MethodKind::Constructor,
+        vec![].into(),
+    );
+    let delegate_ctor = ctx.alloc_methodref(delegate_ctor);
+    let delegate = ctx.call(delegate_ctor, &[shim_obj, invoke_ftn], IsPure::NOT);
+    place_set(destination, delegate, ctx)
+}
 /// Creates a new managed object, and places a reference to it in destination
 fn call_ctor<'tcx>(
     subst_ref: &[GenericArg<'tcx>],
@@ -719,6 +941,13 @@ pub fn call_inner<'tcx>(
         );
         // WF-9: `List<i32>::Add(…)` and friends.
         return vec![call_generic(instance.args, args, destination, ctx)];
+    } else if function_name.contains(DELEGATE_FN_NAME) {
+        assert!(
+            !call_info.split_last_tuple(),
+            "Delegate construction may not use the `rust_call` calling convention!"
+        );
+        // Delegates & callbacks: wrap a Rust `extern` fn pointer into a managed `Action`/`Func`.
+        return vec![delegate_from_fnptr(instance.args, args, destination, ctx)];
     } else if function_name.contains(MANAGED_THROW) {
         // `rustc_clr_interop_throw::<MSG>()` raises a managed `System.Exception(MSG)` directly (via the
         // `throw` IL op), so a .NET caller can `catch` it. Unlike a Rust `panic!` — which goes through

@@ -31,6 +31,11 @@ pub mod class;
 /// `Dictionary<K, V>`, `HashSet<T>`, `Stack<T>`, `Queue<T>`) — backed by real managed objects, used
 /// like `std`. Built on [`generic_bridge`]; no CLR-interop knowledge required at the call site.
 pub mod collections;
+/// Delegates & callbacks — wrap a Rust `extern "C" fn` as a managed `Action<..>`/`Func<.., R>`
+/// delegate, invoke a held .NET delegate, and pass delegates to .NET APIs / events. Built on the
+/// [`intrinsics::rustc_clr_interop_delegate`] magic fn + the WF-9 generic bridge; no CLR-interop
+/// knowledge required at the call site.
+pub mod delegate;
 /// The reusable C#→Rust generic container: [`export_rust_containers!`] emits a size-erased byte
 /// vector into your `cdylib`, backing the shipped C# `RustDotnet.RustVec<T>` / `RustBoxVec<T>`.
 pub mod containers;

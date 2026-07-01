@@ -382,6 +382,41 @@ interop_magic_fn! {
     (arg1: Arg1, arg2: Arg2) -> Ret
 }
 
+// ===========================================================================================
+// Delegates & callbacks (Rust → .NET): wrap a Rust `extern` fn pointer into a managed delegate
+// instance (`Action<..>` / `Func<.., R>`), so a Rust callback can be handed to any .NET method
+// that takes a delegate (a sort comparator, `List.ForEach`, a LINQ predicate, an event `add_*`).
+//
+// The pointer arrives as a plain native `FnPtr` (a capture-less closure / `fn` item is coerced to
+// one before the call), so the backend synthesises a small managed *shim* class holding the pointer
+// whose `Invoke` `calli`s it, then `newobj`s the real generic delegate over `ldftn shim::Invoke`.
+// The generic-argument layout mirrors the WF-9 generic family:
+//   * `ClassGenerics`: a tuple of the *concrete* .NET type args of the delegate instantiation
+//     (e.g. `(i32, bool)` for `Func<i32, bool>`; `(i32,)` for `Action<i32>`).
+//   * `Sig`: a tuple `(Ret, In0, In1, …)` giving the *concrete* signature the pointer is invoked
+//     with — this is the shim's `calli` signature and equals the delegate's instantiated `Invoke`.
+//     For an `Action` (void), the return slot is `()`; a parameterless delegate is `((),)`.
+// ===========================================================================================
+
+/// Wraps the native fn pointer `f` into a managed delegate of the instantiation
+/// `{ASSEMBLY}{CLASS_PATH}<ClassGenerics..>` (e.g. `System.Func`2<i32,bool>`). Returns the delegate
+/// as a [`RustcCLRInteropManagedGeneric`] handle (a managed object reference), which can be passed to
+/// any .NET method taking that delegate type, or invoked via the generic bridge's `Invoke` wrapper.
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_clr_interop_delegate<
+    const ASSEMBLY: &'static str,
+    const CLASS_PATH: &'static str,
+    const IS_VALUETYPE: bool,
+    ClassGenerics,
+    Sig,
+    FnPtrTy,
+>(
+    f: FnPtrTy,
+) -> RustcCLRInteropManagedGeneric<ASSEMBLY, CLASS_PATH, ClassGenerics> {
+    core::intrinsics::abort();
+}
+
 impl RustcCLRInteropManagedChar {
     /// The raw UTF-16 code unit (`System.Char` is a 16-bit value). Inverse of the `From<u16>` impl.
     #[inline(always)]

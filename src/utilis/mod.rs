@@ -26,12 +26,20 @@ pub const GENERIC_CTOR_FN_NAME: &str = "rustc_clr_interop_generic_ctor";
 /// Raises a managed `System.Exception` directly (so a .NET caller can `catch` it) — distinct from a
 /// Rust `panic!`, which goes through the unwinder and does not propagate cleanly out to managed callers.
 pub const MANAGED_THROW: &str = "rustc_clr_interop_throw";
+/// Wraps a Rust `extern` fn pointer into a managed .NET **delegate** instance (e.g. `Action<T>` /
+/// `Func<T, R>`), so a Rust callback can be handed to any .NET API that takes a delegate (LINQ,
+/// `List.ForEach`, a sort comparator, an event `add_*`). The pointer is a plain native `FnPtr` by the
+/// time it reaches the call site (a capture-less closure / `fn` item is coerced to one), so the
+/// backend builds a small managed *shim* class holding the pointer whose `Invoke` `calli`s it, then
+/// `newobj`s the real generic delegate over `ldftn shim::Invoke`. See `delegate_from_fnptr`.
+pub const DELEGATE_FN_NAME: &str = "rustc_clr_interop_delegate";
 pub fn is_function_magic(name: &str) -> bool {
     name.contains(CTOR_FN_NAME)
         || name.contains(MANAGED_CALL_FN_NAME)
         || name.contains(MANAGED_THROW)
         || name.contains(GENERIC_CALL_FN_NAME)
         || name.contains(GENERIC_CTOR_FN_NAME)
+        || name.contains(DELEGATE_FN_NAME)
 }
 
 // WARNING: this is *wrong*: For some reason, `Instance::try_resolve` should not operate on structs(why?), and this just silences the newly introduced warning.

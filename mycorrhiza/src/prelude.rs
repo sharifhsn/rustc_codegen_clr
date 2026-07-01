@@ -40,6 +40,10 @@ pub use crate::bcl::uri::Uri;
 // resulting `Iterator`.
 pub use crate::enumerate::{Enumerable, Enumerator};
 
+// Delegates & callbacks — hand a Rust `extern "C" fn` to .NET as an `Action`/`Func`, or invoke a held
+// .NET delegate. `Action1`/`Action2` are void-returning; `Func1`/`Func2` return a value.
+pub use crate::delegate::{Action1, Action2, Func1, Func2};
+
 // The idiomatic managed `System.String` wrapper (Display / == / Hash) and the raw handle alias.
 pub use crate::system::{DotNetString, MString};
 
