@@ -119,6 +119,14 @@ fn fields_disjoint(asm: &Assembly, fields: &HashSet<Interned<FieldDesc>>) -> boo
     let mut explicit = false;
     for &f in fields {
         let fd = *asm.get_field(f);
+        // A field whose TYPE is an external managed type (a BCL valuetype like `KeyValuePair<K,V>` —
+        // only a `ClassRef`, no local `ClassDef`) has a layout the backend can't see, so its size is
+        // unknown. Never safe to compute split ranges around it — bail conservatively.
+        if let crate::Type::ClassRef(cr) = fd.tpe() {
+            if asm.class_ref_to_def(cr).is_none() {
+                return false;
+            }
+        }
         let Some(cdef_idx) = asm.class_ref_to_def(fd.owner()) else {
             return false; // can't resolve the owning layout -> bail conservatively
         };

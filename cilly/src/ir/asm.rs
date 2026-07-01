@@ -1566,10 +1566,19 @@ impl Assembly {
                 .size()
                 .unwrap_or(self.ptr_size().try_into().unwrap())
                 .into(),
-            Type::ClassRef(class_ref_idx) => self[self.class_ref_to_def(class_ref_idx).unwrap()]
-                .explict_size()
-                .unwrap()
-                .into(),
+            Type::ClassRef(class_ref_idx) => self
+                .class_ref_to_def(class_ref_idx)
+                .and_then(|def| self[def].explict_size())
+                .map_or_else(
+                    // An EXTERNAL managed type (a BCL valuetype like `KeyValuePair<K,V>`) has only a
+                    // `ClassRef`, no local `ClassDef`, so the backend doesn't know its size — only the
+                    // CLR does. Fall back to a conservative pointer size instead of panicking (mirrors
+                    // the `PlatformObject`/`!N` arms). The one caller that needs an EXACT size — the
+                    // `scalarize` layout pass — separately bails on a field whose def can't be
+                    // resolved, so this fallback only ever feeds size-presence checks.
+                    || self.ptr_size(),
+                    |sz| sz.get(),
+                ),
             Type::Float(float) => float.size().into(),
             Type::PlatformString => self.ptr_size(),
             Type::PlatformChar => 1,

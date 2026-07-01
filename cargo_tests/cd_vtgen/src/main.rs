@@ -12,17 +12,50 @@
 #![feature(adt_const_params, unsized_const_params)]
 #![allow(internal_features, incomplete_features, dead_code)]
 
+use mycorrhiza::delegate::Action1;
 use mycorrhiza::gen;
 use mycorrhiza::intrinsics::{
     rustc_clr_interop_generic_call1, rustc_clr_interop_generic_call2,
     rustc_clr_interop_generic_call3, rustc_clr_interop_generic_ctor0,
-    rustc_clr_interop_generic_ctor2, RustcCLRInteropManagedGeneric, RustcCLRInteropTypeGeneric,
+    rustc_clr_interop_generic_ctor1, rustc_clr_interop_generic_ctor2,
+    RustcCLRInteropManagedGeneric, RustcCLRInteropManagedGenericStruct, RustcCLRInteropTypeGeneric,
 };
 use mycorrhiza::system::console::Console;
 
 const CORELIB: &str = "System.Private.CoreLib";
 const KVP: &str = "System.Collections.Generic.KeyValuePair";
 const LIST: &str = "System.Collections.Generic.List";
+const NULLABLE: &str = "System.Nullable";
+const ACTION: &str = "System.Action";
+
+// ---- Capability A: Nullable<T> (a generic value type) — ctor + value-type instance getters. ----
+type NullI32 = RustcCLRInteropManagedGenericStruct<CORELIB, NULLABLE, 16, (i32,)>;
+fn nullable_new(v: i32) -> NullI32 {
+    rustc_clr_interop_generic_ctor1::<CORELIB, NULLABLE, true, (i32,), ((), gen!(0)), NullI32, i32>(v)
+}
+fn nullable_has_value(n: &NullI32) -> bool {
+    rustc_clr_interop_generic_call1::<CORELIB, NULLABLE, true, "get_HasValue", 1, (i32,), (bool,), bool, &NullI32>(n)
+}
+fn nullable_value(n: &NullI32) -> i32 {
+    rustc_clr_interop_generic_call1::<CORELIB, NULLABLE, true, "get_Value", 1, (i32,), (gen!(0),), i32, &NullI32>(n)
+}
+
+// ---- Capability B: delegate as a generic-method arg. `List<T>.ForEach(Action<!0>)` — the def-shape
+// param `Action<!0>` binds against the concrete `Action<i32>` delegate handle (nested-generic arg). ----
+type ActionI32 = RustcCLRInteropManagedGeneric<CORELIB, ACTION, (i32,)>;
+type ActionDef = RustcCLRInteropManagedGeneric<CORELIB, ACTION, (RustcCLRInteropTypeGeneric<0>,)>;
+fn list_for_each(l: RList<i32>, action: ActionI32) {
+    rustc_clr_interop_generic_call2::<
+        CORELIB, LIST, false, "ForEach", 2, (i32,),
+        ((), ActionDef), // Sig: void ForEach(Action<!0>)
+        (), RList<i32>, ActionI32,
+    >(l, action)
+}
+
+static mut FE_SUM: i32 = 0;
+extern "C" fn accum(x: i32) {
+    unsafe { FE_SUM += x }
+}
 
 // ---- Capability B: nested-generic binding. `List<T>.GetRange(i,n)` returns `List<!0>` in def shape;
 // the concrete local is `List<i32>`. Exercises the `is_assignable_to` nested-ClassRef arm + the
@@ -125,6 +158,24 @@ fn main() -> std::process::ExitCode {
     chk_i64(10, list_get::<i32>(sub, 0) as i64, 20);
     chk_i64(11, list_get::<i32>(sub, 1) as i64, 30);
     chk_i64(12, list_count::<i32>(l) as i64, 4); // original unchanged
+
+    // ---- Capability A: Nullable<i32> ----
+    let nv = nullable_new(42);
+    chk_i64(13, nullable_has_value(&nv) as i64, 1);
+    chk_i64(14, nullable_value(&nv) as i64, 42);
+
+    // ---- Capability B: delegate as generic-method arg — List<i32>.ForEach(Action<i32>) ----
+    let l3 = list_new::<i32>();
+    list_add::<i32>(l3, 5);
+    list_add::<i32>(l3, 10);
+    list_add::<i32>(l3, 20);
+    let action = Action1::<i32>::from_fn(accum);
+    list_for_each(l3, action.handle());
+    chk_i64(15, unsafe { FE_SUM } as i64, 35); // 5+10+20, applied by the .NET ForEach to our Rust cb
+
+    // ---- Ergonomic Nullable<T> -> Option<T> (mycorrhiza::nullable) ----
+    use mycorrhiza::nullable::NullableExt;
+    chk_i64(16, mycorrhiza::nullable::some(7i32).to_option().unwrap() as i64, 7);
 
     unsafe {
         Console::writeln_u64(PASS as u64);

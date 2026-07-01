@@ -61,6 +61,10 @@ pub use crate::system::{DotNetString, MString};
 // and a thrown .NET exception ↔ `Result` (`try_managed` / the `.try_()` combinator).
 pub use crate::error::{from_nullable, try_managed, ManagedException, Nullable, TryManaged};
 
+// `System.Nullable<T>` (a generic *value type*, distinct from managed-reference `null`) ↔ `Option<T>`:
+// `.to_option()` on a `.NET`-produced nullable. The `Nullable<T>` type lives at `mycorrhiza::nullable`.
+pub use crate::nullable::NullableExt;
+
 // The single-codepoint managed `char`.
 pub use crate::DotNetChar;
 

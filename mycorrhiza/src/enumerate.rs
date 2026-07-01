@@ -29,7 +29,8 @@
 //! the interface, so the cast is infallible.
 
 use crate::intrinsics::{
-    RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric, RustcCLRInteropTypeGeneric,
+    RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric, RustcCLRInteropManagedGenericStruct,
+    RustcCLRInteropTypeGeneric,
 };
 
 /// The impl assembly for the `System.Collections[.Generic]` interfaces — all live in
@@ -104,6 +105,75 @@ impl<T> Iterator for Enumerator<T> {
         }
     }
 }
+
+/// A managed `KeyValuePair<K, V>` value — the element type produced by enumerating a
+/// `Dictionary<K, V>`. It is a generic **value type**, so `get_Key()`/`get_Value()` are reached with
+/// `call instance` on the unboxed valuetype (the value-type-generic instance-method path). The `SIZE`
+/// parameter is a Rust-side placeholder only — the backend lowers this to a `ClassRef` and the CLR
+/// knows the real size regardless of `K`/`V` — so a single fixed `SIZE` works for every `K`, `V`.
+pub type KeyValuePair<K, V> = RustcCLRInteropManagedGenericStruct<
+    { CORELIB },
+    { "System.Collections.Generic.KeyValuePair" },
+    16,
+    (K, V),
+>;
+
+/// `KeyValuePair<K, V>::get_Key()` — a value-type instance getter (`call instance`, receiver by `&`),
+/// returning the class generic `!0`.
+fn kvp_key<K, V>(kvp: &KeyValuePair<K, V>) -> K {
+    crate::intrinsics::rustc_clr_interop_generic_call1::<
+        { CORELIB },
+        { "System.Collections.Generic.KeyValuePair" },
+        true,
+        "get_Key",
+        1,
+        (K, V),
+        (RustcCLRInteropTypeGeneric<0>,),
+        K,
+        &KeyValuePair<K, V>,
+    >(kvp)
+}
+/// `KeyValuePair<K, V>::get_Value()` — value-type instance getter returning `!1`.
+fn kvp_value<K, V>(kvp: &KeyValuePair<K, V>) -> V {
+    crate::intrinsics::rustc_clr_interop_generic_call1::<
+        { CORELIB },
+        { "System.Collections.Generic.KeyValuePair" },
+        true,
+        "get_Value",
+        1,
+        (K, V),
+        (RustcCLRInteropTypeGeneric<1>,),
+        V,
+        &KeyValuePair<K, V>,
+    >(kvp)
+}
+
+/// A Rust [`Iterator`] over a `Dictionary<K, V>`'s `(key, value)` entries. Drives the enumerator over
+/// `KeyValuePair<K, V>` (a generic value type) and splits each pair into `(K, V)` with the value-type
+/// instance getters. Yielded in the dictionary's own enumeration order.
+pub struct EntryIter<K, V> {
+    inner: Enumerator<KeyValuePair<K, V>>,
+}
+impl<K, V> Iterator for EntryIter<K, V> {
+    type Item = (K, V);
+    fn next(&mut self) -> Option<(K, V)> {
+        let kvp = self.inner.next()?;
+        Some((kvp_key::<K, V>(&kvp), kvp_value::<K, V>(&kvp)))
+    }
+}
+
+/// A managed object that enumerates as `KeyValuePair<K, V>` (i.e. a `Dictionary<K, V>`), yielding a
+/// Rust iterator of `(K, V)` pairs. The blanket [`Enumerable`] gives the raw `KeyValuePair` stream;
+/// this splits each pair into a Rust tuple.
+pub trait EnumerableEntries<K, V>: Enumerable<KeyValuePair<K, V>> {
+    /// Iterate `(key, value)` entries by driving the .NET enumerator.
+    fn iter_entries(&self) -> EntryIter<K, V> {
+        EntryIter {
+            inner: self.iter_enumerator(),
+        }
+    }
+}
+impl<K, V, C: Enumerable<KeyValuePair<K, V>>> EnumerableEntries<K, V> for C {}
 
 /// Upcast a collection's raw managed handle (its `RustcCLRInteropManagedGeneric<…, (T,)>`) to the
 /// generic `IEnumerable<T>` interface via a real `castclass` (NOT a bare reinterpretation — a

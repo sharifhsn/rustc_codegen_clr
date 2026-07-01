@@ -19,6 +19,15 @@ fn hash_of<T: core::hash::Hash>(v: &T) -> u64 {
     h.finish()
 }
 
+// Callbacks for `List::sort_by` / `for_each` (delegate-as-generic-method-arg).
+extern "C" fn cmp_i32(a: i32, b: i32) -> i32 {
+    a - b
+}
+static mut FE_ACC: i32 = 0;
+extern "C" fn fe_add(x: i32) {
+    unsafe { FE_ACC += x }
+}
+
 fn main() -> std::process::ExitCode {
     let mut pass: u32 = 0;
     let mut total: u32 = 0;
@@ -291,6 +300,37 @@ fn main() -> std::process::ExitCode {
         bagsum += v;
     }
     chk!(bagsum, 6);
+
+    // ===== Dictionary entry iteration (`for (k, v) in &dict`) — value-type-generic KeyValuePair =====
+    let mut dm: Dictionary<i32, i64> = Dictionary::new();
+    dm.insert(1, 100);
+    dm.insert(2, 200);
+    dm.insert(3, 300);
+    let (mut ksum, mut vsum, mut n) = (0i32, 0i64, 0i32);
+    for (k, v) in &dm {
+        ksum += k;
+        vsum += v;
+        n += 1;
+    }
+    chk!(n, 3);
+    chk!(ksum, 6); // 1+2+3
+    chk!(vsum, 600i64); // 100+200+300
+    // `.iter()` yields the same and composes with Iterator adapters.
+    chk!(dm.iter().map(|(_, v)| v).sum::<i64>(), 600i64);
+    chk!(dm.iter().find(|&(k, _)| k == 2).map(|(_, v)| v), Some(200i64));
+
+    // ===== List.sort_by / for_each — delegate as a generic-method argument (Comparison/Action<T>) =====
+    let mut sl: List<i32> = List::new();
+    sl.push(30);
+    sl.push(10);
+    sl.push(20);
+    sl.sort_by(cmp_i32); // ascending
+    chk!(sl.get(0), Some(10));
+    chk!(sl.get(1), Some(20));
+    chk!(sl.get(2), Some(30));
+    unsafe { FE_ACC = 0 };
+    sl.for_each(fe_add); // .NET ForEach drives the Rust callback
+    chk!(unsafe { FE_ACC }, 60); // 10+20+30
 
     Console::writeln_u64(pass as u64);
     Console::writeln_u64(total as u64);

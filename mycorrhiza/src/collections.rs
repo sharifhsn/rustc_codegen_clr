@@ -58,7 +58,37 @@ const CORELIB: &str = "System.Private.CoreLib";
 
 mod list {
     use super::CORELIB;
+    use crate::intrinsics::{
+        rustc_clr_interop_generic_call2, RustcCLRInteropManagedGeneric, RustcCLRInteropTypeGeneric,
+    };
     use crate::{dotnet_generic, dotnet_generic_impl, gen};
+
+    const LIST: &str = "System.Collections.Generic.List";
+    const ACTION: &str = "System.Action";
+    const COMPARISON: &str = "System.Comparison";
+    /// The concrete `Action<T>` / `Comparison<T>` delegate handles a `List<T>` method accepts.
+    type ActionH<T> = RustcCLRInteropManagedGeneric<CORELIB, ACTION, (T,)>;
+    type ComparisonH<T> = RustcCLRInteropManagedGeneric<CORELIB, COMPARISON, (T,)>;
+
+    // `List<T>.ForEach(Action<!0>)` / `Sort(Comparison<!0>)` — the delegate parameter's def-shape type
+    // is parameterised by the *class* generic (`Action<!0>`), so it binds against the concrete
+    // `Action<T>` argument via the nested-generic rule. Hand-written (the `dotnet_generic_impl!` line
+    // grammar doesn't express a nested-generic delegate arg); the `gen!(0)` inside the delegate's own
+    // generics is the `!0` def-shape spelling.
+    fn raw_for_each<T>(h: Handle<T>, action: ActionH<T>) {
+        rustc_clr_interop_generic_call2::<
+            CORELIB, LIST, false, "ForEach", 2, (T,),
+            ((), RustcCLRInteropManagedGeneric<CORELIB, ACTION, (RustcCLRInteropTypeGeneric<0>,)>),
+            (), Handle<T>, ActionH<T>,
+        >(h, action)
+    }
+    fn raw_sort_by<T>(h: Handle<T>, cmp: ComparisonH<T>) {
+        rustc_clr_interop_generic_call2::<
+            CORELIB, LIST, false, "Sort", 2, (T,),
+            ((), RustcCLRInteropManagedGeneric<CORELIB, COMPARISON, (RustcCLRInteropTypeGeneric<0>,)>),
+            (), Handle<T>, ComparisonH<T>,
+        >(h, cmp)
+    }
 
     dotnet_generic!(Handle<T> = [CORELIB] "System.Collections.Generic.List" < (T,) >);
     dotnet_generic_impl! {
@@ -145,6 +175,17 @@ mod list {
         /// Remove all elements (`Clear`).
         pub fn clear(&mut self) {
             raw_clear::<T>(self.h)
+        }
+        /// Apply a callback to each element in order (`List<T>.ForEach(Action<T>)`) — the .NET side
+        /// drives the Rust `extern "C" fn` through a managed delegate. Pass a top-level fn or a
+        /// capture-less closure. (Capturing closures need a boxed-env delegate — see [`crate::delegate`].)
+        pub fn for_each(&self, f: extern "C" fn(T)) {
+            raw_for_each::<T>(self.h, crate::delegate::Action1::<T>::from_fn(f).handle())
+        }
+        /// Sort in place by a comparator (`List<T>.Sort(Comparison<T>)`); `cmp(a, b)` returns negative
+        /// / zero / positive like `Ord::cmp`. The .NET sort drives the Rust `extern "C" fn`.
+        pub fn sort_by(&mut self, cmp: extern "C" fn(T, T) -> i32) {
+            raw_sort_by::<T>(self.h, crate::delegate::Comparison::<T>::from_fn(cmp).handle())
         }
         /// The first element, or `None` if empty (like `slice::first`, by value).
         pub fn first(&self) -> Option<T> {
@@ -410,16 +451,34 @@ mod dictionary {
         }
     }
 
-    // NOTE — iteration (`for (k, v) in &dict`, `.keys()`, `.values()`) is NOT provided yet. Both
-    // routes are blocked by a *backend* gap (not weakenable at the library level):
-    //   * Enumerating entries yields `KeyValuePair<K, V>`, a **generic value type**; extracting
-    //     `.Key`/`.Value` needs `get_Key()`/`get_Value()`, which are instance methods on a generic
-    //     value type — unsupported (`src/terminator/call.rs` asserts `!is_valuetype` for KIND=1).
-    //   * `get_Keys()`/`get_Values()` return `Dictionary<K,V>.KeyCollection`/`ValueCollection`, a
-    //     *nested generic* whose method-definition-shape return spells the enclosing `!0`/`!1`; the
-    //     CIL typechecker soundly accepts a bare `!N` return against a concrete local (via the WF-9
-    //     marker guard) but not a nested generic like `KeyCollection<!0,!1>`, and the checker must
-    //     not be relaxed. See `crate::enumerate` for the reference-type collections that *do* iterate.
+    impl<K, V> Dictionary<K, V> {
+        /// Iterate the `(key, value)` entries (`for (k, v) in &dict` / `dict.iter()`), driving the
+        /// .NET enumerator over `KeyValuePair<K, V>`. The dictionary must not be mutated during
+        /// iteration (the .NET enumerator throws `InvalidOperationException`, exactly as in C#).
+        pub fn iter(&self) -> crate::enumerate::EntryIter<K, V> {
+            use crate::enumerate::EnumerableEntries;
+            self.iter_entries()
+        }
+    }
+
+    // Entry enumeration: a `Dictionary<K, V>` enumerates as `KeyValuePair<K, V>` — a generic *value
+    // type* — and each pair is split into `(K, V)` with the value-type instance getters. Both halves
+    // (value-type-generic instance methods for `KeyValuePair`) are now supported by the backend.
+    impl<K, V> crate::enumerate::Enumerable<crate::enumerate::KeyValuePair<K, V>> for Dictionary<K, V> {
+        fn enumerable_handle(
+            &self,
+        ) -> crate::enumerate::IEnumerable<crate::enumerate::KeyValuePair<K, V>> {
+            unsafe { crate::enumerate::as_enumerable_handle::<_, crate::enumerate::KeyValuePair<K, V>>(self.h) }
+        }
+    }
+    impl<'a, K, V> IntoIterator for &'a Dictionary<K, V> {
+        type Item = (K, V);
+        type IntoIter = crate::enumerate::EntryIter<K, V>;
+        fn into_iter(self) -> Self::IntoIter {
+            self.iter()
+        }
+    }
+
     impl<K, V> Default for Dictionary<K, V> {
         fn default() -> Self {
             Self::new()
