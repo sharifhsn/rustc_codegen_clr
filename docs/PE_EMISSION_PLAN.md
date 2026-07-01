@@ -85,11 +85,18 @@ for reproducible builds and for workflow resume constraints).
 
 ## Phasing
 
-- **Phase 0 — harvest the latent PDB (immediate quick win).** Verify what today's ilasm-produced
-  portable PDB already gives: does an exception stack trace under `dotnet` show `main.rs:LINE`?
-  Does a VS Code breakpoint in a `.rs` file bind? Fix trivial blockers (e.g. absolute-vs-relative
-  document paths), default `-debug` on everywhere it isn't, and document "debugging Rust on .NET"
-  in CARGO_DOTNET.md. Outcome either way calibrates Phase 2 and may ship user value same-day.
+- **Phase 0 — harvest the latent PDB. RAN 2026-07-01 (`cargo_tests/cd_pdb`): mechanism PROVEN,
+  three quality gaps found.** `Environment.StackTrace` on the real backend resolves a frame
+  through the ilasm-produced portable PDB to a real `file.rs:line` — the whole
+  `.line`→ilasm→PDB→CoreCLR chain is live. Gaps that now define Phase 2's quality bar:
+  (a) **missing frames** — the exporter's `aggressiveinlining` heuristic makes RyuJIT inline the
+  user's `#[inline(never)]` fns out of the managed trace (suppress the hint when debug info is the
+  priority, or accept + document); (b) **wrong attribution under MIR inlining** — `main`'s frame
+  reported `<WORKSPACE>/src/slice/memchr.rs:19` (an inlined-std span) instead of user source; the
+  fix is the `get_caller_location`-style walk: attribute sequence points to the OUTERMOST
+  non-inlined scope (`span_source_info` in src/assembly.rs); (c) **`<WORKSPACE>` path remapping**
+  — build-std remaps std paths; user-crate paths must stay absolute (or cargo-dotnet must emit a
+  debugger source-map config) for breakpoints to bind.
 - **Phase 1a — skeleton**: heaps + sig encoder + tables with unit tests; a hand-built
   two-method assembly (static entrypoint calling Console.WriteLine via MemberRef) loads and runs.
 - **Phase 1b — full construct coverage**: drive with the inventory checklist; `cd_*` suite green
