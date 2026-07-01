@@ -23,6 +23,10 @@ pub use bindings::*;
 //   (The standalone `cargo_tests/slice_call_test` crate still `use`s `mycorrhiza::slice_bindings`;
 //    it is not a workspace member and is superseded by the full generated surface.)
 pub mod class;
+/// Ready-to-use, idiomatic wrappers over the common .NET generic collections (`List<T>`,
+/// `Dictionary<K, V>`, `HashSet<T>`, `Stack<T>`, `Queue<T>`) — backed by real managed objects, used
+/// like `std`. Built on [`generic_bridge`]; no CLR-interop knowledge required at the call site.
+pub mod collections;
 /// Comptime type-export intrinsics — defining a managed .NET class from Rust (used by the
 /// `dotnet_macros::dotnet_class` proc-macro and the declarative `dotnet_typedef!`).
 pub mod comptime;

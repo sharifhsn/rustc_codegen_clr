@@ -300,7 +300,6 @@ impl From<u16> for RustcCLRInteropManagedChar {
 /// A handle to a managed object of a *generic* .NET instantiation, e.g. `List<i32>`.
 /// `ASSEMBLY`/`CLASS_PATH` name the open generic type and `ClassGenerics` is a tuple of the
 /// concrete .NET type arguments. Lowers to a `ClassRef` carrying those generics.
-#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct RustcCLRInteropManagedGeneric<
     const ASSEMBLY: &'static str,
@@ -309,6 +308,21 @@ pub struct RustcCLRInteropManagedGeneric<
 > {
     object_ref: usize,
     pd: core::marker::PhantomData<ClassGenerics>,
+}
+// `Clone`/`Copy` are UNCONDITIONAL: the handle is just a managed object reference (a pointer-sized
+// `object_ref` + a zero-sized `PhantomData`), so it is always bit-copyable regardless of whether the
+// element type is `Copy`. `#[derive(Copy)]` would wrongly require `ClassGenerics: Copy`, which forces
+// a spurious `T: Copy` bound on every wrapper built over the handle (e.g. `collections::List<T>`).
+impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, ClassGenerics> Clone
+    for RustcCLRInteropManagedGeneric<ASSEMBLY, CLASS_PATH, ClassGenerics>
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, ClassGenerics> Copy
+    for RustcCLRInteropManagedGeneric<ASSEMBLY, CLASS_PATH, ClassGenerics>
+{
 }
 
 /// Method-definition-signature marker: lowers to the .NET *class* generic parameter `!N`.

@@ -144,6 +144,29 @@ macro_rules! __dotnet_generic_methods {
         }
     };
 
+    // ---- instance method, 0 value args (receiver only), void return (e.g. `Clear()`) ----
+    (
+        @alias $alias:ident < $($cg:ident),+ >
+        @asm { $asm:expr } @class { $class:expr } @cg { $cgtuple:ty }
+        fn $fname:ident = $mname:literal ( $recv:ident );
+        $( $rest:tt )*
+    ) => {
+        fn $fname< $($cg),+ >($recv: $alias< $($cg),+ >) {
+            $crate::intrinsics::rustc_clr_interop_generic_call1::<
+                { $asm }, { $class }, false, $mname, 2,
+                $cgtuple,
+                ( (), ),
+                (),
+                $alias< $($cg),+ >,
+            >($recv)
+        }
+        $crate::__dotnet_generic_methods! {
+            @alias $alias < $($cg),+ >
+            @asm { $asm } @class { $class } @cg { $cgtuple }
+            $( $rest )*
+        }
+    };
+
     // ---- instance method, 1 value arg: -> Ret ----
     (
         @alias $alias:ident < $($cg:ident),+ >
