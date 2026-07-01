@@ -59,6 +59,8 @@ mod list {
         fn raw_remove_at = "RemoveAt"(r, idx: i32 as i32);
         fn raw_insert    = "Insert"(r, idx: i32 as i32, item: T as gen!(0));
         fn raw_clear     = "Clear"(r);
+        fn raw_sort      = "Sort"(r);
+        fn raw_reverse   = "Reverse"(r);
     }
 
     /// A managed `System.Collections.Generic.List<T>`. See the [module docs](super).
@@ -130,6 +132,56 @@ mod list {
         pub fn clear(&mut self) {
             raw_clear::<T>(self.h)
         }
+        /// The first element, or `None` if empty (like `slice::first`, by value).
+        pub fn first(&self) -> Option<T> {
+            self.get(0)
+        }
+        /// The last element, or `None` if empty (like `slice::last`, by value).
+        pub fn last(&self) -> Option<T> {
+            self.get(self.len() - 1)
+        }
+        /// Remove and return the last element, or `None` if empty (like `Vec::pop`).
+        pub fn pop(&mut self) -> Option<T> {
+            let last = self.len() - 1;
+            if last >= 0 {
+                let v = raw_get::<T>(self.h, last);
+                raw_remove_at::<T>(self.h, last);
+                Some(v)
+            } else {
+                None
+            }
+        }
+        /// Sort in place using the default .NET comparer (`List<T>.Sort()`; ascending for the
+        /// numeric primitives). The element type must be `.NET`-comparable or this throws at runtime.
+        pub fn sort(&mut self) {
+            raw_sort::<T>(self.h)
+        }
+        /// Reverse the elements in place (`List<T>.Reverse()`).
+        pub fn reverse(&mut self) {
+            raw_reverse::<T>(self.h)
+        }
+        /// Copy the elements out into a Rust [`Vec`] (by value, in order).
+        pub fn to_vec(&self) -> std::vec::Vec<T> {
+            let n = self.len();
+            let mut v = std::vec::Vec::with_capacity(n.max(0) as usize);
+            let mut i = 0;
+            while i < n {
+                v.push(raw_get::<T>(self.h, i));
+                i += 1;
+            }
+            v
+        }
+        /// Build a `List<T>` from a slice, copying each element (`T: Copy`).
+        pub fn from_slice(items: &[T]) -> Self
+        where
+            T: Copy,
+        {
+            let mut l = Self::new();
+            for &item in items {
+                l.push(item);
+            }
+            l
+        }
         /// Iterate the elements by value (index-based; the list must not be mutated during iteration).
         pub fn iter(&self) -> ListIter<T> {
             ListIter {
@@ -147,6 +199,83 @@ mod list {
     impl<T> Default for List<T> {
         fn default() -> Self {
             Self::new()
+        }
+    }
+
+    // Deep clone: a fresh managed `List<T>` with the elements copied over (`T: Copy`, so the copy is
+    // element-wise and the two lists are independent — mutating one does not affect the other).
+    impl<T: Copy> Clone for List<T> {
+        fn clone(&self) -> Self {
+            let mut out = Self::new();
+            let n = self.len();
+            let mut i = 0;
+            while i < n {
+                out.push(raw_get::<T>(self.h, i));
+                i += 1;
+            }
+            out
+        }
+    }
+
+    // Element-wise equality, computed in Rust (NOT reference identity — `List<T>` inherits `object`'s
+    // reference `Equals`, which would compare handles, so we compare lengths + elements ourselves to
+    // match what a Rust user means by `==`).
+    impl<T: Copy + PartialEq> PartialEq for List<T> {
+        fn eq(&self, other: &Self) -> bool {
+            let n = self.len();
+            if n != other.len() {
+                return false;
+            }
+            let mut i = 0;
+            while i < n {
+                if raw_get::<T>(self.h, i) != raw_get::<T>(other.h, i) {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+    }
+    impl<T: Copy + Eq> Eq for List<T> {}
+
+    // Hash the elements in order, consistent with the element-wise `PartialEq` above.
+    impl<T: Copy + core::hash::Hash> core::hash::Hash for List<T> {
+        fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+            let n = self.len();
+            state.write_i32(n);
+            let mut i = 0;
+            while i < n {
+                raw_get::<T>(self.h, i).hash(state);
+                i += 1;
+            }
+        }
+    }
+
+    impl<T: Copy> From<std::vec::Vec<T>> for List<T> {
+        fn from(v: std::vec::Vec<T>) -> Self {
+            let mut l = Self::new();
+            for item in v {
+                l.push(item);
+            }
+            l
+        }
+    }
+
+    impl<T> FromIterator<T> for List<T> {
+        fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+            let mut l = Self::new();
+            for item in iter {
+                l.push(item);
+            }
+            l
+        }
+    }
+
+    impl<T> Extend<T> for List<T> {
+        fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+            for item in iter {
+                self.push(item);
+            }
         }
     }
 
@@ -239,6 +368,14 @@ mod dictionary {
                 Some(raw_get::<K, V>(self.h, key))
             } else {
                 None
+            }
+        }
+        /// The value for `key`, or `default` if the key is absent (never throws, never inserts).
+        pub fn get_or_default(&self, key: K, default: V) -> V {
+            if raw_contains::<K, V>(self.h, key) {
+                raw_get::<K, V>(self.h, key)
+            } else {
+                default
             }
         }
     }

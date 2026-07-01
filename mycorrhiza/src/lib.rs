@@ -39,6 +39,9 @@ pub mod comptime;
 pub mod generic_bridge;
 /// Very low-level interop stuff. Don't use unless you need to.
 pub mod intrinsics;
+/// One-glance import surface — `use mycorrhiza::prelude::*;` pulls in the collections, the managed
+/// `DotNetString`, and the generic-bridge macros so interop code reads like `std`.
+pub mod prelude;
 use class::*;
 /// Wrappers around types from the `System` namespace
 pub mod system;

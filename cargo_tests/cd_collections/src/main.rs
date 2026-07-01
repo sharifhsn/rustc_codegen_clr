@@ -7,8 +7,17 @@
 // failing check) and returns non-zero on any mismatch.
 #![allow(dead_code)]
 
-use mycorrhiza::collections::{Dictionary, HashSet, List, Queue, Stack};
+// One-glance import: the prelude brings the collections + `DotNetString` into scope like `std`.
+use mycorrhiza::prelude::*;
 use mycorrhiza::system::console::Console;
+
+// A tiny helper so the Hash checks read cleanly.
+fn hash_of<T: core::hash::Hash>(v: &T) -> u64 {
+    use core::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    v.hash(&mut h);
+    h.finish()
+}
 
 fn main() -> std::process::ExitCode {
     let mut pass: u32 = 0;
@@ -93,6 +102,67 @@ fn main() -> std::process::ExitCode {
     chk!(q.len(), 1);
     let mut empty = Queue::<i32>::new();
     chk!(empty.dequeue(), None); // empty → None (no exception)
+
+    // ---------- List conveniences: first/last/pop/sort/reverse/to_vec/from_slice ----------
+    let mut cv = List::<i32>::from_slice(&[3, 1, 2]);
+    chk!(cv.len(), 3);
+    chk!(cv.first(), Some(3));
+    chk!(cv.last(), Some(2));
+    cv.sort(); // ascending -> [1,2,3]
+    chk!(cv.to_vec(), std::vec![1, 2, 3]);
+    chk!(cv.first(), Some(1));
+    chk!(cv.last(), Some(3));
+    cv.reverse(); // -> [3,2,1]
+    chk!(cv.to_vec(), std::vec![3, 2, 1]);
+    chk!(cv.pop(), Some(1)); // pops the last element
+    chk!(cv.to_vec(), std::vec![3, 2]);
+    let mut ecv = List::<i32>::new();
+    chk!(ecv.first(), None); // empty
+    chk!(ecv.last(), None);
+    chk!(ecv.pop(), None);
+
+    // ---------- List std traits: From<Vec> / FromIterator / Extend / PartialEq / Clone / Hash ----------
+    let a: List<i32> = std::vec![1, 2, 3].into(); // From<Vec<T>>
+    let b: List<i32> = (1..=3).collect(); // FromIterator
+    chk!((a == b), true); // element-wise PartialEq (NOT reference identity)
+    chk!(a.to_vec(), std::vec![1, 2, 3]);
+    let mut c: List<i32> = std::vec![1, 2].into();
+    c.extend(3..=4); // Extend -> [1,2,3,4]
+    chk!(c.to_vec(), std::vec![1, 2, 3, 4]);
+    let different: List<i32> = std::vec![1, 2, 4].into();
+    chk!((a == different), false);
+    // Clone is a DEEP copy — mutating the clone must not touch the original.
+    let mut cloned = a.clone();
+    chk!((cloned == a), true);
+    cloned.push(99);
+    chk!((cloned == a), false); // independence
+    chk!(a.to_vec(), std::vec![1, 2, 3]); // original untouched
+    // Hash is consistent with element-wise PartialEq: equal lists -> equal hashes.
+    chk!((hash_of(&a) == hash_of(&b)), true);
+
+    // ---------- Dictionary::get_or_default ----------
+    let mut dm = Dictionary::<i32, i64>::new();
+    dm.insert(1, 100);
+    chk!(dm.get_or_default(1, -1), 100); // present
+    chk!(dm.get_or_default(2, -1), -1); // absent -> default
+    chk!(dm.contains_key(2), false); // get_or_default does NOT insert
+
+    // ---------- DotNetString: Display / Debug / PartialEq / Eq / Hash / round-trip ----------
+    let s1 = DotNetString::from("hello");
+    let s2 = DotNetString::from("hello");
+    let s3 = DotNetString::from("world");
+    chk!((s1 == s2), true); // content equality (op_Equality)
+    chk!((s1 == s3), false);
+    chk!(std::format!("{}", s1).as_str(), "hello"); // Display round-trips the content
+    chk!(std::format!("{:?}", s1).as_str(), "\"hello\""); // Debug quotes it
+    chk!(s1.to_rust_string().as_str(), "hello"); // explicit marshal-back
+    chk!(s1.len_utf16(), 5);
+    // GetHashCode is content-based: equal strings -> equal Rust hashes.
+    chk!((hash_of(&s1) == hash_of(&s2)), true);
+    // A non-ASCII round-trip (multi-byte UTF-8 -> UTF-16 -> back).
+    let u = DotNetString::from("héllo");
+    chk!(u.to_rust_string().as_str(), "héllo");
+    chk!(std::format!("{}", u).as_str(), "héllo");
 
     Console::writeln_u64(pass as u64);
     Console::writeln_u64(total as u64);

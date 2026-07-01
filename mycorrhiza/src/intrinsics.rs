@@ -383,6 +383,13 @@ interop_magic_fn! {
 }
 
 impl RustcCLRInteropManagedChar {
+    /// The raw UTF-16 code unit (`System.Char` is a 16-bit value). Inverse of the `From<u16>` impl.
+    #[inline(always)]
+    pub fn as_u16(self) -> u16 {
+        unsafe {
+            core::mem::transmute::<RustcCLRInteropManagedChar, u16>(core::intrinsics::black_box(self))
+        }
+    }
     pub fn single_codepoint_unchecked(value: char) -> Self {
         let byte1 = (value as u64) & 0xFF;
         if (byte1 & 0x80) == 0x00 {
