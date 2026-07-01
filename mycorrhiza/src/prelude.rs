@@ -21,6 +21,11 @@
 // The .NET generic collections, used like `std`.
 pub use crate::collections::{Dictionary, HashSet, List, ListIter, Queue, Stack};
 
+// The enumerator bridge — `for x in &collection` over the reference-type collections, backed by the
+// .NET `IEnumerator<T>`. The `Enumerable` trait provides `.iter_enumerator()`; `Enumerator<T>` is the
+// resulting `Iterator`.
+pub use crate::enumerate::{Enumerable, Enumerator};
+
 // The idiomatic managed `System.String` wrapper (Display / == / Hash) and the raw handle alias.
 pub use crate::system::{DotNetString, MString};
 

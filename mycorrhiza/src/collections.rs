@@ -279,6 +279,22 @@ mod list {
         }
     }
 
+    // By-reference iteration via the enumerator bridge: `for x in &list` drives the .NET
+    // `IEnumerator<T>` (`GetEnumerator`/`MoveNext`/`Current`) rather than an index loop.
+    impl<T> crate::enumerate::Enumerable<T> for List<T> {
+        fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
+            unsafe { crate::enumerate::as_enumerable_handle(self.h) }
+        }
+    }
+    impl<'a, T> IntoIterator for &'a List<T> {
+        type Item = T;
+        type IntoIter = crate::enumerate::Enumerator<T>;
+        fn into_iter(self) -> Self::IntoIter {
+            use crate::enumerate::Enumerable;
+            self.iter_enumerator()
+        }
+    }
+
     /// By-value iterator over a [`List`] (see [`List::iter`]).
     pub struct ListIter<T> {
         h: Handle<T>,
@@ -380,6 +396,16 @@ mod dictionary {
         }
     }
 
+    // NOTE — iteration (`for (k, v) in &dict`, `.keys()`, `.values()`) is NOT provided yet. Both
+    // routes are blocked by a *backend* gap (not weakenable at the library level):
+    //   * Enumerating entries yields `KeyValuePair<K, V>`, a **generic value type**; extracting
+    //     `.Key`/`.Value` needs `get_Key()`/`get_Value()`, which are instance methods on a generic
+    //     value type — unsupported (`src/terminator/call.rs` asserts `!is_valuetype` for KIND=1).
+    //   * `get_Keys()`/`get_Values()` return `Dictionary<K,V>.KeyCollection`/`ValueCollection`, a
+    //     *nested generic* whose method-definition-shape return spells the enclosing `!0`/`!1`; the
+    //     CIL typechecker soundly accepts a bare `!N` return against a concrete local (via the WF-9
+    //     marker guard) but not a nested generic like `KeyCollection<!0,!1>`, and the checker must
+    //     not be relaxed. See `crate::enumerate` for the reference-type collections that *do* iterate.
     impl<K, V> Default for Dictionary<K, V> {
         fn default() -> Self {
             Self::new()
@@ -445,6 +471,39 @@ mod hash_set {
     impl<T> Default for HashSet<T> {
         fn default() -> Self {
             Self::new()
+        }
+    }
+
+    // Iteration via the enumerator bridge (order is the .NET set's internal order, as in C#).
+    impl<T> crate::enumerate::Enumerable<T> for HashSet<T> {
+        fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
+            unsafe { crate::enumerate::as_enumerable_handle(self.h) }
+        }
+    }
+    impl<'a, T> IntoIterator for &'a HashSet<T> {
+        type Item = T;
+        type IntoIter = crate::enumerate::Enumerator<T>;
+        fn into_iter(self) -> Self::IntoIter {
+            use crate::enumerate::Enumerable;
+            self.iter_enumerator()
+        }
+    }
+
+    impl<T> FromIterator<T> for HashSet<T> {
+        fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+            let mut s = Self::new();
+            for item in iter {
+                s.insert(item);
+            }
+            s
+        }
+    }
+
+    impl<T> Extend<T> for HashSet<T> {
+        fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+            for item in iter {
+                self.insert(item);
+            }
         }
     }
 }
@@ -521,6 +580,21 @@ mod stack {
             Self::new()
         }
     }
+
+    // Iteration via the enumerator bridge. `Stack<T>` enumerates LIFO (top first), matching C#.
+    impl<T> crate::enumerate::Enumerable<T> for Stack<T> {
+        fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
+            unsafe { crate::enumerate::as_enumerable_handle(self.h) }
+        }
+    }
+    impl<'a, T> IntoIterator for &'a Stack<T> {
+        type Item = T;
+        type IntoIter = crate::enumerate::Enumerator<T>;
+        fn into_iter(self) -> Self::IntoIter {
+            use crate::enumerate::Enumerable;
+            self.iter_enumerator()
+        }
+    }
 }
 
 mod queue {
@@ -591,6 +665,21 @@ mod queue {
     impl<T> Default for Queue<T> {
         fn default() -> Self {
             Self::new()
+        }
+    }
+
+    // Iteration via the enumerator bridge. `Queue<T>` enumerates FIFO (front first), matching C#.
+    impl<T> crate::enumerate::Enumerable<T> for Queue<T> {
+        fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
+            unsafe { crate::enumerate::as_enumerable_handle(self.h) }
+        }
+    }
+    impl<'a, T> IntoIterator for &'a Queue<T> {
+        type Item = T;
+        type IntoIter = crate::enumerate::Enumerator<T>;
+        fn into_iter(self) -> Self::IntoIter {
+            use crate::enumerate::Enumerable;
+            self.iter_enumerator()
         }
     }
 }

@@ -33,6 +33,9 @@ pub mod containers;
 /// Comptime type-export intrinsics — defining a managed .NET class from Rust (used by the
 /// `dotnet_macros::dotnet_class` proc-macro and the declarative `dotnet_typedef!`).
 pub mod comptime;
+/// The enumerator bridge — wrap any .NET `IEnumerator<T>` as a Rust `impl Iterator<Item = T>`. This
+/// is what backs by-reference iteration (`for x in &list`) over the [`collections`] wrappers.
+pub mod enumerate;
 /// WF-9 generic-interop ergonomics macros (`dotnet_generic!` / `dotnet_generic_impl!` / `gen!`),
 /// which remove the hand-written `rustc_clr_interop_generic_*` turbofish boilerplate. The macros are
 /// `#[macro_export]`ed, so they are also reachable at the crate root (`mycorrhiza::dotnet_generic!`).
