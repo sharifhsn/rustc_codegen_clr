@@ -58,6 +58,8 @@ pub mod error;
 pub mod generic_bridge;
 /// Very low-level interop stuff. Don't use unless you need to.
 pub mod intrinsics;
+/// Building `System.Linq.Expressions` trees (the shape EF Core / `IQueryable` consumes). See [`linq`].
+pub mod linq;
 /// `System.Nullable<T>` ↔ Rust `Option<T>` bridge (a generic value type). See [`nullable::NullableExt`].
 pub mod nullable;
 /// `System.Span<T>` / `ReadOnlySpan<T>` — zero-copy views over a Rust slice. See [`span::Span`].
