@@ -1,8 +1,8 @@
 use crate::adt::FieldOffsetIterator;
 use crate::utilis::{
-    INTEROP_ARR_TPE_NAME, INTEROP_CHR_TPE_NAME, INTEROP_CLASS_TPE_NAME, INTEROP_GENERIC_TPE_NAME,
-    INTEROP_METHOD_GENERIC_TPE_NAME, INTEROP_STRUCT_TPE_NAME, INTEROP_TYPE_GENERIC_TPE_NAME, is_zst,
-    try_resolve_const_size,
+    INTEROP_ARR_TPE_NAME, INTEROP_CHR_TPE_NAME, INTEROP_CLASS_TPE_NAME,
+    INTEROP_GENERIC_STRUCT_TPE_NAME, INTEROP_GENERIC_TPE_NAME, INTEROP_METHOD_GENERIC_TPE_NAME,
+    INTEROP_STRUCT_TPE_NAME, INTEROP_TYPE_GENERIC_TPE_NAME, is_zst, try_resolve_const_size,
 };
 use crate::utilis::{garg_to_usize, garg_to_string, pointer_to_is_fat, tuple_name};
 use crate::{
@@ -320,6 +320,7 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                     | INTEROP_ARR_TPE_NAME
                     | INTEROP_CHR_TPE_NAME
                     | INTEROP_GENERIC_TPE_NAME
+                    | INTEROP_GENERIC_STRUCT_TPE_NAME
                     | INTEROP_TYPE_GENERIC_TPE_NAME
                     | INTEROP_METHOD_GENERIC_TPE_NAME
             );
@@ -394,6 +395,30 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                         name,
                         assembly,
                         false,
+                        class_generics.into(),
+                    )))
+                } else if item_name == INTEROP_GENERIC_STRUCT_TPE_NAME {
+                    // `RustcCLRInteropManagedGenericStruct<ASSEMBLY, CLASS_PATH, SIZE, ClassGenerics>`
+                    // — a *value type* of a generic instantiation (e.g. `Nullable<JsonNodeOptions>`).
+                    // Like the reference-type `INTEROP_GENERIC_TPE_NAME` arm, the trailing generic is
+                    // a *tuple* of the concrete .NET type arguments; lower to a `ClassRef` that is
+                    // BOTH a value type (`true`) AND carries those generics. `SIZE` (subst[2]) is only
+                    // used Rust-side for layout — the CLR knows the real size — so it is ignored here.
+                    assert!(
+                        subst.len() == 4,
+                        "RustcCLRInteropManagedGenericStruct must have exactly 4 generic arguments (assembly, class, size, class-generics-tuple)!"
+                    );
+                    let assembly = garg_to_string(subst[0], ctx.tcx());
+                    let assembly = Some(assembly)
+                        .filter(|assembly| !assembly.is_empty())
+                        .map(|asm| ctx.alloc_string(asm));
+                    let name = garg_to_string(subst[1], ctx.tcx());
+                    let name = ctx.alloc_string(name);
+                    let class_generics: Vec<Type> = tuple_garg_types(subst[3], ctx);
+                    Type::ClassRef(ctx.alloc_class_ref(ClassRef::new(
+                        name,
+                        assembly,
+                        true,
                         class_generics.into(),
                     )))
                 } else if item_name == INTEROP_TYPE_GENERIC_TPE_NAME {

@@ -325,6 +325,49 @@ impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, ClassGenerics
 {
 }
 
+/// A managed **value type** of a *generic* .NET instantiation, e.g. `Nullable<JsonNodeOptions>` or
+/// `Span<i32>`. This is the value-type counterpart to [`RustcCLRInteropManagedGeneric`] (a reference
+/// type) and the generic counterpart to [`RustcCLRInteropManagedStruct`] (a non-generic value type):
+/// it lowers to a `ClassRef` that is **both** a value type **and** carries concrete generic
+/// arguments — the combination neither of the other two markers can express.
+///
+/// `ASSEMBLY`/`CLASS_PATH` name the open generic value type, `SIZE` is its byte size (used only for
+/// Rust-side layout — the CLR knows the real size), and `ClassGenerics` is a tuple of the concrete
+/// .NET type arguments (e.g. `(JsonNodeOptions,)`).
+#[repr(C)]
+pub struct RustcCLRInteropManagedGenericStruct<
+    const ASSEMBLY: &'static str,
+    const CLASS_PATH: &'static str,
+    const SIZE: usize,
+    ClassGenerics,
+> {
+    size_hint: [u8; SIZE],
+    pd: core::marker::PhantomData<ClassGenerics>,
+}
+// `Clone`/`Copy` are UNCONDITIONAL (as for `RustcCLRInteropManagedGeneric`): the handle is a plain
+// byte buffer + a zero-sized `PhantomData`, always bit-copyable regardless of whether `ClassGenerics`
+// is `Copy`. A `#[derive(Copy)]` would wrongly demand `ClassGenerics: Copy`.
+impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const SIZE: usize, ClassGenerics>
+    Clone for RustcCLRInteropManagedGenericStruct<ASSEMBLY, CLASS_PATH, SIZE, ClassGenerics>
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const SIZE: usize, ClassGenerics>
+    Copy for RustcCLRInteropManagedGenericStruct<ASSEMBLY, CLASS_PATH, SIZE, ClassGenerics>
+{
+}
+unsafe impl<
+        const ASSEMBLY: &'static str,
+        const CLASS_PATH: &'static str,
+        const SIZE: usize,
+        ClassGenerics,
+    > ManagedSafe
+    for RustcCLRInteropManagedGenericStruct<ASSEMBLY, CLASS_PATH, SIZE, ClassGenerics>
+{
+}
+
 /// Method-definition-signature marker: lowers to the .NET *class* generic parameter `!N`.
 #[derive(Clone, Copy)]
 #[repr(C)]

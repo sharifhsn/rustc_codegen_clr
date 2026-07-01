@@ -36,22 +36,39 @@
 //! `None`. `as_str` is exact: `JsonNode.ToString()` on a string value returns its raw content.
 
 use crate::error::try_managed;
-use crate::intrinsics::{RustcCLRInteropManagedClass, RustcCLRInteropManagedStruct};
-use crate::system::{DotNetString, MString};
+use crate::intrinsics::{
+    RustcCLRInteropManagedClass, RustcCLRInteropManagedGenericStruct, RustcCLRInteropManagedStruct,
+};
+use crate::system::{DotNetString, MObject, MString};
 
 const ASM: &str = "System.Text.Json";
+const CORELIB: &str = "System.Private.CoreLib";
 const JSON_NODE: &str = "System.Text.Json.Nodes.JsonNode";
 const JSON_ARRAY: &str = "System.Text.Json.Nodes.JsonArray";
-const JSON_NODE_OPTS_N: &str = "System.Nullable`1<System.Text.Json.Nodes.JsonNodeOptions>";
+const NULLABLE: &str = "System.Nullable";
+const JSON_NODE_OPTS: &str = "System.Text.Json.Nodes.JsonNodeOptions";
 const JSON_DOC_OPTS: &str = "System.Text.Json.JsonDocumentOptions";
+const JSON_VALUE_KIND: &str = "System.Text.Json.JsonValueKind";
+const JSON_SERIALIZER_OPTS: &str = "System.Text.Json.JsonSerializerOptions";
 
 /// A managed `System.Text.Json.Nodes.JsonNode` handle (an object, array, value, or `null`).
 type NodeHandle = RustcCLRInteropManagedClass<{ ASM }, { JSON_NODE }>;
 /// A managed `System.Text.Json.Nodes.JsonArray` handle (a `JsonNode` subclass exposing `Count`).
 type ArrayHandle = RustcCLRInteropManagedClass<{ ASM }, { JSON_ARRAY }>;
-/// A managed `System.Nullable<JsonNodeOptions>` value (2 bytes: a bool flag + a bool option). Only
-/// its all-zero (`None`) default is ever passed to `Parse`.
-type NodeOptsHandle = RustcCLRInteropManagedStruct<{ ASM }, { JSON_NODE_OPTS_N }, 2>;
+/// The managed value type `System.Text.Json.JsonValueKind` — an `int32`-backed enum (4 bytes). It is
+/// what `GetValueKind()` returns; read as its 4-byte `int32` payload.
+type ValueKindHandle = RustcCLRInteropManagedStruct<{ ASM }, { JSON_VALUE_KIND }, 4>;
+/// The reference type `System.Text.Json.JsonSerializerOptions`. Only a managed `null` (= "use the
+/// defaults") is ever passed, to the `ToJsonString(JsonSerializerOptions?)` overload.
+type SerializerOptsHandle = RustcCLRInteropManagedClass<{ ASM }, { JSON_SERIALIZER_OPTS }>;
+/// The managed value type `System.Text.Json.Nodes.JsonNodeOptions` (one `bool` field → 1 byte). Only
+/// used as the generic argument of the `Nullable<..>` below.
+type NodeOpts = RustcCLRInteropManagedStruct<{ ASM }, { JSON_NODE_OPTS }, 1>;
+/// A managed `System.Nullable<JsonNodeOptions>` value (2 bytes: a `bool has_value` + the 1-byte
+/// option). A *generic value type* — its open type `System.Nullable`1` lives in `System.Private.CoreLib`,
+/// instantiated with `JsonNodeOptions`. Only its all-zero (`None`) default is ever passed to `Parse`.
+type NodeOptsHandle =
+    RustcCLRInteropManagedGenericStruct<{ CORELIB }, { NULLABLE }, 2, (NodeOpts,)>;
 /// A managed `System.Text.Json.JsonDocumentOptions` value (8 bytes: an `int`, a byte enum, a bool).
 /// Only its all-zero default is ever passed to `Parse`.
 type DocOptsHandle = RustcCLRInteropManagedStruct<{ ASM }, { JSON_DOC_OPTS }, 8>;
@@ -99,6 +116,17 @@ fn net(s: &str) -> MString {
     DotNetString::from(s).handle()
 }
 
+/// Whether a `JsonNode` handle is a managed `null` reference. `JsonNode` overloads `==` in C#
+/// (value-ish comparison) but does **not** expose a static `op_Equality` methodref usable here, so
+/// reference-null is tested with `System.Object.ReferenceEquals(node, null)` — a CoreLib static that
+/// works for any reference type. The `JsonNode` handle upcasts to `System.Object` (both are
+/// pointer-sized object-reference handles), so the reinterpret is sound.
+#[inline(always)]
+fn node_is_null(h: NodeHandle) -> bool {
+    let obj: MObject = unsafe { core::mem::transmute::<NodeHandle, MObject>(h) };
+    MObject::static2::<"ReferenceEquals", MObject, MObject, bool>(obj, MObject::null())
+}
+
 /// A parsed, navigable JSON document — a handle to a managed `JsonNode`.
 ///
 /// A move-only handle; the .NET GC owns the underlying object (no `Drop`). Obtain the root with
@@ -120,8 +148,15 @@ impl Json {
         // `JsonNode.Parse` is a 3-arg static (the two option params have C# defaults but the IL method
         // takes all three). No `static3` on the class wrapper, so call the raw call3 intrinsic with
         // IS_STATIC = true.
-        let parsed = try_managed(|| {
-            crate::intrinsics::rustc_clr_interop_managed_call3_::<
+        //
+        // The managed `JsonNode` reference is written into `out` via the closure's captured `&mut`,
+        // NOT returned through `try_managed` — a `Result<NodeHandle, _>` would place the object
+        // reference inside a Rust enum niche, which the CLR layout rejects (a managed ref cannot be
+        // overlapped by a discriminant). The closure returns `()`, so nothing managed crosses the
+        // `try/catch` boundary; on a `JsonException` (malformed input) `out` stays null → `None`.
+        let mut out = NodeHandle::null();
+        let ran = try_managed(|| {
+            out = crate::intrinsics::rustc_clr_interop_managed_call3_::<
                 { ASM },
                 { JSON_NODE },
                 false,
@@ -131,25 +166,30 @@ impl Json {
                 MString,
                 NodeOptsHandle,
                 DocOptsHandle,
-            >(net_text, node_opts, doc_opts)
-        })
-        .ok()?;
-        Self::wrap(parsed)
+            >(net_text, node_opts, doc_opts);
+        });
+        if ran.is_err() {
+            return None;
+        }
+        Self::wrap(out)
     }
 
     #[inline(always)]
     fn wrap(h: NodeHandle) -> Option<Json> {
-        let j = Json { h };
-        if j.h.is_null() {
+        if node_is_null(h) {
             None
         } else {
-            Some(j)
+            Some(Json { h })
         }
     }
 
     /// The value kind of this node (`JsonNode.GetValueKind()`).
     pub fn kind(&self) -> Kind {
-        Kind::from_i32(self.h.instance0::<"GetValueKind", i32>())
+        // `GetValueKind` returns the `JsonValueKind` enum value type; read it as its 4-byte `int32`
+        // payload (a .NET enum is exactly its underlying integer).
+        let vk = self.h.instance0::<"GetValueKind", ValueKindHandle>();
+        let raw = unsafe { core::mem::transmute::<ValueKindHandle, i32>(vk) };
+        Kind::from_i32(raw)
     }
 
     /// The child under property `name` for an **object** node (`JsonNode.get_Item(string)`), or
@@ -254,10 +294,17 @@ impl Json {
         DotNetString::from_handle(self.h.instance0::<"ToString", MString>()).to_rust_string()
     }
 
-    /// `JsonNode.ToJsonString()` — the node's compact JSON representation.
+    /// `JsonNode.ToJsonString(JsonSerializerOptions?)` — the node's compact JSON representation. The
+    /// only IL overload takes an options argument (a *reference-type* `JsonSerializerOptions`, so a
+    /// plain managed `null` selects the defaults — no generic value type needed here).
     #[inline(always)]
     fn json_text(&self) -> std::string::String {
-        DotNetString::from_handle(self.h.instance0::<"ToJsonString", MString>()).to_rust_string()
+        let opts = SerializerOptsHandle::null();
+        DotNetString::from_handle(
+            self.h
+                .instance1::<"ToJsonString", SerializerOptsHandle, MString>(opts),
+        )
+        .to_rust_string()
     }
 }
 

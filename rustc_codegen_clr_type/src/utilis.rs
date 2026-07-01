@@ -27,6 +27,10 @@ pub const INTEROP_ARR_TPE_NAME: &str = "RustcCLRInteropManagedArray";
 /// `<ASSEMBLY, CLASS_PATH, ClassGenerics>` where `ClassGenerics` is a tuple of the concrete .NET type
 /// arguments — lowers to a `ClassRef` with those generics. (WF-9 generic interop bridge.)
 pub const INTEROP_GENERIC_TPE_NAME: &str = "RustcCLRInteropManagedGeneric";
+/// A managed **value type** of a generic .NET instantiation, e.g. `Nullable<T>` / `Span<T>`. Carries
+/// `<ASSEMBLY, CLASS_PATH, SIZE, ClassGenerics>` — lowers to a *value-type* `ClassRef` that also
+/// carries the concrete generic arguments (the value-type counterpart to `RustcCLRInteropManagedGeneric`).
+pub const INTEROP_GENERIC_STRUCT_TPE_NAME: &str = "RustcCLRInteropManagedGenericStruct";
 /// Signature-shape marker lowering to the .NET *class* generic parameter `!N` — used to describe the
 /// definition signature of a method called on a generic instantiation.
 pub const INTEROP_TYPE_GENERIC_TPE_NAME: &str = "RustcCLRInteropTypeGeneric";
