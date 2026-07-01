@@ -45,25 +45,23 @@
 //! [`#[dotnet_export]`](../../dotnet_macros) this is how a Rust `async fn` becomes a C#-awaitable
 //! method.
 //!
-//! ## What is NOT here (the `Task<T>` production wall)
+//! ## Result-bearing `Task<T>` — both directions supported
 //!
-//! Awaiting a **result-bearing** `Task<T>` works (`await_task` — `IsCompleted`/`Result` need no
-//! nested-generic handling) *when a .NET API hands you a concrete `Task<int>`*. But *producing* a
-//! `Task<T>` from a Rust value (an `async fn -> T`) is currently walled: the only producers
-//! (`TaskCompletionSource<T>.Task`, `Task.FromResult<T>`) return a **nested-generic def-shape**
-//! `Task`1<!0>` / `Task`1<!!0>` that cannot be materialised into a valid Rust local without either a
-//! (sound) backend addition — an inserted upcast in `call_generic`, or generic-*method* argument
-//! support — or weakening the CIL verifier (forbidden). This is the same ceiling the enumerator bridge
-//! documents; the non-generic `Task` direction (fully supported here) covers the large non-result
-//! async surface in the meantime.
+//! Awaiting a `Task<T>` ([`await_task`]) and **producing** one ([`future_to_task`], via
+//! `TaskCompletionSource<T>.get_Task()`) both work. `get_Task()`'s def-shape nested-generic return
+//! `Task`1<!0>` binds against the concrete `Task<T>` local — the CIL verifier accepts it (same open
+//! generic, `!0` pairwise-assignable) and codegen proves `!0` == `T` via the recursive WF-9 marker
+//! guard. So `async fn -> T` ⇒ `Task<T>` is symmetric with the non-generic `Task` direction.
+//! (`Task.FromResult<T>` remains unused — it needs generic-*method* `!!N` argument support the backend
+//! doesn't emit; the `TaskCompletionSource<T>` route is fully sufficient.)
 
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::intrinsics::{
-    rustc_clr_interop_generic_call1, RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric,
-    RustcCLRInteropTypeGeneric,
+    rustc_clr_interop_generic_call1, rustc_clr_interop_generic_call2, rustc_clr_interop_generic_ctor0,
+    RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric, RustcCLRInteropTypeGeneric,
 };
 
 /// `Task` / `Task<T>` / `TaskCompletionSource<T>` all live in the core implementation assembly
@@ -382,4 +380,66 @@ where
     let tcs = crate::System::Threading::Tasks::TaskCompletionSource::new();
     tcs.set_result();
     Task::from_raw(tcs.get_task())
+}
+
+// ---- Result-bearing `Task<T>` PRODUCTION (the former wall — now unblocked) ----------------------
+//
+// `TaskCompletionSource<T>.get_Task()` returns the def-shape nested generic `Task`1<!0>`. That is now
+// bindable: the CIL type-verifier accepts a `Task<!0>` return against the concrete `Task<T>` local
+// (same open generic, `!0` pairwise-assignable), and codegen proves `!0` == `T` via the recursive
+// WF-9 marker guard. So `async fn -> T` ⇒ `Task<T>` works — the symmetric counterpart to
+// `future_to_task_unit`.
+
+const TCS_GEN: &str = "System.Threading.Tasks.TaskCompletionSource";
+/// A managed `TaskCompletionSource<T>` handle — produces a `Task<T>` whose result we set from Rust.
+type TaskCompletionSourceT<T> = RustcCLRInteropManagedGeneric<{ CORELIB }, { TCS_GEN }, (T,)>;
+
+/// `new TaskCompletionSource<T>()`.
+#[inline]
+fn tcs_new<T>() -> TaskCompletionSourceT<T> {
+    rustc_clr_interop_generic_ctor0::<
+        { CORELIB }, { TCS_GEN }, false,
+        (T,),
+        ((),),
+        TaskCompletionSourceT<T>,
+    >()
+}
+/// `TaskCompletionSource<T>.SetResult(!0)` — completes the task with `value`.
+#[inline]
+fn tcs_set_result<T>(tcs: TaskCompletionSourceT<T>, value: T) {
+    rustc_clr_interop_generic_call2::<
+        { CORELIB }, { TCS_GEN }, false, "SetResult", 2u8,
+        (T,),
+        ((), RustcCLRInteropTypeGeneric<0>),
+        (),
+        TaskCompletionSourceT<T>,
+        T,
+    >(tcs, value)
+}
+/// `TaskCompletionSource<T>.get_Task()` — the produced `Task<T>`. The def-shape return `Task`1<!0>`
+/// binds against the concrete `TaskT<T>` local (nested-generic binding).
+#[inline]
+fn tcs_get_task<T>(tcs: TaskCompletionSourceT<T>) -> TaskT<T> {
+    rustc_clr_interop_generic_call1::<
+        { CORELIB }, { TCS_GEN }, false, "get_Task", 2u8,
+        (T,),
+        (TaskT<RustcCLRInteropTypeGeneric<0>>,), // Sig return: `Task<!0>` (def shape)
+        TaskT<T>,
+        TaskCompletionSourceT<T>,
+    >(tcs)
+}
+
+/// Run a Rust [`Future`] to completion and package its output into a **completed** managed `Task<T>` —
+/// the result-bearing Future→Task half of the bridge (the counterpart to [`future_to_task_unit`]). A
+/// .NET caller can `await` the returned `Task<T>` and receive the value; because the work is already
+/// done, it completes synchronously. Pair a Rust `async fn -> T` with this and `#[dotnet_export]` to
+/// hand it to C# as an awaitable `Task<T>`-returning method.
+pub fn future_to_task<T, F>(fut: F) -> TaskT<T>
+where
+    F: Future<Output = T>,
+{
+    let value = block_on(fut);
+    let tcs = tcs_new::<T>();
+    tcs_set_result::<T>(tcs, value);
+    tcs_get_task::<T>(tcs)
 }

@@ -148,6 +148,20 @@ fn main() -> std::process::ExitCode {
         chk!(v, 10);
     }
 
+    // ---------- 7. RESULT-BEARING Task<T> production (the former wall) ----------
+    // `future_to_task` packages an `async fn -> T` into a managed `Task<T>` (via
+    // `TaskCompletionSource<T>.get_Task()`, a nested-generic def-shape return). We prove the full
+    // round-trip: produce a `Task<i32>` from Rust, then `.await` it back and read the value.
+    {
+        let t: TaskT<i32> = future_to_task(async { 40 + 2 });
+        let got: i32 = block_on(async { await_task(t).await });
+        chk!(got, 42);
+        // A wider type, to exercise a non-i32 result across the generic Task<T>.
+        let t2: TaskT<i64> = future_to_task(async { (1i64 << 40) + 5 });
+        let got2: i64 = block_on(async { await_task(t2).await });
+        chk!(got2, (1i64 << 40) + 5);
+    }
+
     println!("== cd_async done ==");
     Console::writeln_u64(pass as u64);
     Console::writeln_u64(total as u64);

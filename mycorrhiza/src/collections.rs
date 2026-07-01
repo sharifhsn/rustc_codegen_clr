@@ -459,6 +459,16 @@ mod dictionary {
             use crate::enumerate::EnumerableEntries;
             self.iter_entries()
         }
+        /// Iterate the keys (`for k in dict.keys()`). Built on entry iteration — the .NET
+        /// `get_Keys()`/`KeyCollection` route additionally needs nested-generic type-name rendering,
+        /// which this sidesteps.
+        pub fn keys(&self) -> impl Iterator<Item = K> {
+            self.iter().map(|(k, _)| k)
+        }
+        /// Iterate the values (`for v in dict.values()`).
+        pub fn values(&self) -> impl Iterator<Item = V> {
+            self.iter().map(|(_, v)| v)
+        }
     }
 
     // Entry enumeration: a `Dictionary<K, V>` enumerates as `KeyValuePair<K, V>` — a generic *value
@@ -948,11 +958,29 @@ mod sorted_set {
 
 mod linked_list {
     use super::CORELIB;
+    use crate::intrinsics::{
+        rustc_clr_interop_generic_call2, RustcCLRInteropManagedGeneric, RustcCLRInteropTypeGeneric,
+    };
     use crate::{dotnet_generic, dotnet_generic_impl, gen};
 
     // `LinkedList<T>` is implemented in `System.Collections.dll` (see `sorted_dictionary`). The
     // `ICollection<T>` interface it is upcast to, however, is a core interface in CoreLib.
     const ASM: &str = "System.Collections";
+    const LL: &str = "System.Collections.Generic.LinkedList";
+    const LLNODE: &str = "System.Collections.Generic.LinkedListNode";
+    /// The `LinkedListNode<T>` a node-returning op hands back (discarded by `push_front`).
+    type NodeH<T> = RustcCLRInteropManagedGeneric<ASM, LLNODE, (T,)>;
+
+    // `LinkedList<T>.AddFirst(T)` returns a `LinkedListNode<T>` — a *nested generic* reference type.
+    // The def-shape return `LinkedListNode`1<!0>` now binds against the concrete `NodeH<T>` local
+    // (nested-generic binding), so `push_front` can call it (and discard the node).
+    fn raw_add_first<T>(h: Handle<T>, item: T) -> NodeH<T> {
+        rustc_clr_interop_generic_call2::<
+            ASM, LL, false, "AddFirst", 2u8, (T,),
+            (RustcCLRInteropManagedGeneric<ASM, LLNODE, (RustcCLRInteropTypeGeneric<0>,)>, RustcCLRInteropTypeGeneric<0>),
+            NodeH<T>, Handle<T>, T,
+        >(h, item)
+    }
 
     dotnet_generic!(Handle<T> = [ASM] "System.Collections.Generic.LinkedList" < (T,) >);
     // `ICollection<T>` — the interface view used to append (`Add` == `AddLast` for a linked list).
@@ -975,10 +1003,9 @@ mod linked_list {
         fn raw_icoll_add = "Add"(r, item: T as gen!(0));
     }
 
-    /// A managed `System.Collections.Generic.LinkedList<T>` — a doubly-linked list. Node-returning
-    /// operations (`AddFirst`/`AddLast`/`First`/`Last`, which hand back a `LinkedListNode<T>`) are not
-    /// exposed (that nested generic crosses a typechecker wall); use the value-level surface below plus
-    /// enumerator iteration. See the [module docs](super).
+    /// A managed `System.Collections.Generic.LinkedList<T>` — a doubly-linked list. `push_front`
+    /// (`AddFirst`) and `push_back` are both exposed; `AddFirst`'s returned `LinkedListNode<T>` (a
+    /// nested generic) is now bindable and simply discarded. See the [module docs](super).
     pub struct LinkedList<T> {
         h: Handle<T>,
     }
@@ -1004,6 +1031,10 @@ mod linked_list {
                 )
             };
             raw_icoll_add::<T>(ic, item)
+        }
+        /// Prepend `item` at the front (`AddFirst`). The `LinkedListNode<T>` it returns is discarded.
+        pub fn push_front(&mut self, item: T) {
+            let _node = raw_add_first::<T>(self.h, item);
         }
         /// Whether `item` is present (`Contains`, `.NET` equality).
         pub fn contains(&self, item: T) -> bool {

@@ -332,6 +332,19 @@ fn main() -> std::process::ExitCode {
     sl.for_each(fe_add); // .NET ForEach drives the Rust callback
     chk!(unsafe { FE_ACC }, 60); // 10+20+30
 
+    // ===== Dictionary.keys() / values() (over the working entry iteration) =====
+    chk!(dm.keys().sum::<i32>(), 6); // 1+2+3
+    chk!(dm.values().sum::<i64>(), 600i64); // 100+200+300
+
+    // ===== LinkedList.push_front (AddFirst -> LinkedListNode<T>, nested-generic return) =====
+    let mut ll: LinkedList<i32> = LinkedList::new();
+    ll.push_back(2);
+    ll.push_front(1); // [1, 2]
+    ll.push_back(3); // [1, 2, 3]
+    chk!(ll.len(), 3);
+    let order: std::vec::Vec<i32> = (&ll).into_iter().collect();
+    chk!(order, std::vec![1, 2, 3]);
+
     Console::writeln_u64(pass as u64);
     Console::writeln_u64(total as u64);
     if pass == total {
