@@ -44,6 +44,9 @@ struct PendingClass<'tcx> {
     /// `(managed_method_name, target_rust_fn)` — a `static` method aliasing the Rust fn (no receiver;
     /// the fn's signature is used verbatim).
     static_methods: Vec<(String, Instance<'tcx>)>,
+    /// `(interface_assembly, interface_name)` — managed interfaces this class implements. The virtual
+    /// methods above satisfy them by name+signature (implicit interface implementation).
+    interfaces: Vec<(String, String)>,
     /// Synthesize a field-initializing primary ctor `.ctor(field0, field1, …)` (in field order) so a
     /// managed caller can `new <Name>(…)` and get an instance with its fields set.
     has_primary_ctor: bool,
@@ -148,6 +151,7 @@ pub fn interpret<'tcx>(
                         fields: vec![],
                         methods: vec![],
                         static_methods: vec![],
+                        interfaces: vec![],
                         has_primary_ctor: false,
                         has_default_ctor: false,
                         has_field_setters: false,
@@ -188,6 +192,14 @@ pub fn interpret<'tcx>(
                         .expect("comptime: invalid static method target")
                         .expect("comptime: could not resolve static method target instance");
                     class.static_methods.push((method_name, target));
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_add_interface_impl") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    // Generics: <const IFACE_ASM, const IFACE>.
+                    let iface_asm = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
+                    let iface_name = garg_to_string(subst_ref[1], ctx.tcx()).replace("::", ".");
+                    class.interfaces.push((iface_asm, iface_name));
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_add_primary_ctor") {
                     let src = operand_local(&args[0].node);
@@ -295,6 +307,19 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         ctx.class_def(def)
             .expect("comptime: layout error registering interop class")
     };
+
+    // Attach implemented interfaces. Each is a ClassRef into the interface's declaring assembly; the
+    // virtual methods emitted below satisfy them by name+signature (implicit interface implementation).
+    for (iface_asm, iface_name) in &class.interfaces {
+        let iface_cls = ctx.alloc_string(iface_name.clone());
+        let iface_asm_ref = if iface_asm.is_empty() {
+            None
+        } else {
+            Some(ctx.alloc_string(iface_asm.clone()))
+        };
+        let iface_ref = ctx.alloc_class_ref(ClassRef::new(iface_cls, iface_asm_ref, false, [].into()));
+        ctx.class_mut(class_idx).add_interface(iface_ref);
+    }
 
     // Each virtual method aliases an ordinary Rust fn (codegen'd separately). The Rust fn takes the
     // receiver as its first explicit arg, so its signature matches the virtual method's.

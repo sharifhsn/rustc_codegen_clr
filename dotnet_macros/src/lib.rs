@@ -45,6 +45,9 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut value_type = false;
     let mut default_ctor = false;
     let mut field_setters = false;
+    // Managed interfaces this class implements, `;`-separated in one string (usually just one), e.g.
+    // `implements = "[MyLib]MyLib.IService"` or `"[A]A.I1;[B]B.I2"`. See the interface `add_*` intrinsic.
+    let mut implements: Vec<String> = Vec::new();
     if !attr.is_empty() {
         let parser = Punctuated::<MetaNameValue, Token![,]>::parse_terminated;
         let metas = match syn::parse::Parser::parse(parser, attr) {
@@ -84,6 +87,20 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                 {
                     field_setters = *value;
                 }
+            } else if m.path.is_ident("implements") {
+                if let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(s),
+                    ..
+                }) = &m.value
+                {
+                    implements = s
+                        .value()
+                        .split(';')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                }
             }
         }
     }
@@ -91,6 +108,20 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let name = input.ident.clone();
     let span = name.span();
+
+    // One `add_interface_impl::<"asm", "name">` per implemented interface. The virtual methods a
+    // `#[dotnet_methods]` block adds satisfy them by name+signature (implicit interface impl).
+    let interface_calls: Vec<_> = implements
+        .iter()
+        .map(|spec| {
+            let (asm, iface) = split_dotnet_ref(spec);
+            let asm_lit = LitStr::new(&asm, span);
+            let iface_lit = LitStr::new(&iface, span);
+            quote! {
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_interface_impl::<#asm_lit, #iface_lit>(class);
+            }
+        })
+        .collect();
     let handle_ident = format_ident!("{}Handle", name);
     let entry_mod = format_ident!("__dotnet_class_{}", name);
     let name_lit = LitStr::new(&name.to_string(), span);
@@ -143,6 +174,7 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #name_lit, #value_type, #super_asm_lit, #super_name_lit,
                 >();
                 #(#field_calls)*
+                #(#interface_calls)*
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_primary_ctor(class);
                 #default_ctor_call
                 #field_setters_call

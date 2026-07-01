@@ -1,0 +1,19 @@
+[package]
+name = "cd_iface"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# A .NET class library: `cargo dotnet build` emits `cd_iface.dll` containing the managed class
+# `Greeter` (declared by `#[dotnet_class]`) which IMPLEMENTS `[Contracts]Contracts.IGreeter`.
+crate-type = ["cdylib"]
+
+[dependencies]
+mycorrhiza = { path = "../../../mycorrhiza" }
+dotnet_macros = { path = "../../../dotnet_macros" }
+
+# Under the repo workspace root -> needs a bare `[workspace]` (the cd_pure footgun).
+[workspace]
+
+[profile.release.build-override]
+codegen-units = 1

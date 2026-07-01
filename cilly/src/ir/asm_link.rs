@@ -665,7 +665,7 @@ impl Assembly {
                 },
             )
             .collect();
-        let translated = ClassDef::new(
+        let mut translated = ClassDef::new(
             name,
             def.is_valuetype(),
             def.generics(),
@@ -677,6 +677,11 @@ impl Assembly {
             def.align(),
             def.has_nonveralpping_layout(),
         );
+        // Carry the implemented-interface set across the assembly boundary.
+        for iface in def.implements() {
+            let iface = self.translate_class_ref(source, *iface);
+            translated.add_interface(iface);
+        }
         let class_ref = self.alloc_class_ref(translated.ref_to());
         let (defs_mut, _) = self.class_defs_mut_strings();
         match defs_mut.entry(ClassDefIdx(class_ref)) {

@@ -39,7 +39,7 @@ fn load_ar(r: &mut impl std::io::Read) -> std::io::Result<(cilly::Assembly, Vec<
                 .read_to_end(&mut asm_bytes)
                 .expect("ERROR: Could not load the assembly file!");
             let assembly = postcard::from_bytes(&asm_bytes)
-                .unwrap_or_else(|_| panic!("ERROR:Could not decode the assembly file {name}!"));
+                .unwrap_or_else(|e| panic!("ERROR:Could not decode the assembly file {name}! err={e:?} bytes={}", asm_bytes.len()));
             final_assembly = final_assembly.link(assembly);
         } else if ext.contains("o") {
             let mut file_bytes = Vec::with_capacity(0x100);

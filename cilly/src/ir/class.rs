@@ -572,6 +572,12 @@ pub struct ClassDef {
     is_valuetype: bool,
     generics: u32,
     extends: Option<Interned<ClassRef>>,
+    /// `.NET` interfaces this class implements (`implements` clause). Empty for the vast majority of
+    /// classes; populated only for Rust-defined managed classes that deliberately implement a managed
+    /// interface (see `comptime::finish_type` and `#[dotnet_class(implements(...))]`). The implementing
+    /// methods are the ordinary `MethodKind::Virtual` aliases — CLR resolves them by name+signature
+    /// (implicit interface implementation), which is why no explicit `.override` is needed.
+    implements: Vec<Interned<ClassRef>>,
     fields: Vec<(Type, Interned<IString>, Option<u32>)>,
     static_fields: Vec<StaticFieldDef>,
     methods: Vec<MethodDefIdx>,
@@ -599,6 +605,9 @@ impl ClassDef {
             )
             .copied()
             .chain(self.extends.iter().map(|cref| Type::ClassRef(*cref)))
+            // Pull each implemented interface's assembly into the `.assembly extern` table (avoids
+            // CS0012 when the interface lives in a third assembly, e.g. a consumer's own library).
+            .chain(self.implements.iter().map(|cref| Type::ClassRef(*cref)))
     }
     #[allow(clippy::too_many_arguments)]
     #[must_use]
@@ -620,6 +629,7 @@ impl ClassDef {
             is_valuetype,
             generics,
             extends,
+            implements: vec![],
             fields,
             static_fields,
             methods: vec![],
@@ -627,6 +637,21 @@ impl ClassDef {
             explict_size,
             align,
             has_nonveralpping_layout,
+        }
+    }
+
+    /// The `.NET` interfaces this class implements (see the `implements` field). Usually empty.
+    #[must_use]
+    pub fn implements(&self) -> &[Interned<ClassRef>] {
+        &self.implements
+    }
+
+    /// Declare that this class implements `iface` (append, deduplicating). The class must expose a
+    /// public virtual method matching each interface member's name+signature — CLR then binds them
+    /// implicitly, so no `.override` is emitted.
+    pub fn add_interface(&mut self, iface: Interned<ClassRef>) {
+        if !self.implements.contains(&iface) {
+            self.implements.push(iface);
         }
     }
 
@@ -721,6 +746,12 @@ impl ClassDef {
         assert_eq!(self.generics(), translated.generics());
         // Check inheretence matches
         assert_eq!(self.extends(), translated.extends());
+
+        // Union the implemented interfaces (a class re-opened by several entrypoints may accumulate
+        // its `implements` set across them, exactly like fields/methods).
+        for iface in translated.implements() {
+            self.add_interface(*iface);
+        }
 
         // Merge the static fields, removing duplicates
         self.static_fields_mut()
@@ -1065,6 +1096,36 @@ fn extends() {
     );
     assert_eq!(def.extends(), Some(exception));
     assert_eq!(def.iter_types().count(), 1);
+}
+#[test]
+fn implements_roundtrip() {
+    let mut asm = Assembly::default();
+    let name: Interned<IString> = asm.alloc_string("Impl");
+    let iface_name = asm.alloc_string("Some.IFace");
+    let iface_asm = asm.alloc_string("SomeLib");
+    let iface = asm.alloc_class_ref(ClassRef::new(iface_name, Some(iface_asm), false, [].into()));
+    let mut def = ClassDef::new(
+        name,
+        false,
+        0,
+        None,
+        vec![],
+        vec![],
+        Access::Extern,
+        None,
+        None,
+        true,
+    );
+    def.add_interface(iface);
+    def.add_interface(iface); // dedup
+    assert_eq!(def.implements(), &[iface]);
+    // The interface is pulled into iter_types (so its assembly lands in `.assembly extern`).
+    assert_eq!(def.iter_types().count(), 1);
+    // Exact postcard round-trip: the serialized `.bc` shape must survive dylib->linker unchanged.
+    let bytes = postcard::to_allocvec(&def).unwrap();
+    let back: ClassDef = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(def, back);
+    assert_eq!(back.implements(), &[iface]);
 }
 #[test]
 fn class_ref() {

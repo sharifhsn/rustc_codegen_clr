@@ -85,12 +85,23 @@ impl ILExporter {
             externs.sort();
             externs.dedup();
             for ext in externs {
-                // CoreLib/mscorlib are now normalized to System.Runtime, so they fall through to `_`.
-                let (ver, token) = (dv_ver, "B0 3F 5F 7F 11 D5 0A 3A");
-                writeln!(
-                    out,
-                    ".assembly extern '{ext}' {{ .ver {ver} .publickeytoken = ({token}) }}"
-                )?;
+                if is_bcl_assembly(ext) {
+                    // CoreLib/mscorlib are now normalized to System.Runtime, so they fall through to
+                    // `_`. All BCL assemblies share the ECMA public-key token and the runtime `.ver`.
+                    let (ver, token) = (dv_ver, "B0 3F 5F 7F 11 D5 0A 3A");
+                    writeln!(
+                        out,
+                        ".assembly extern '{ext}' {{ .ver {ver} .publickeytoken = ({token}) }}"
+                    )?;
+                } else {
+                    // A NON-BCL assembly — a consumer's own C# library (e.g. an interface/contracts
+                    // assembly a Rust type implements). A plain `dotnet build` produces it as
+                    // version 1.0.0.0 with NO strong-name token, so stamping the BCL ver+token here
+                    // makes the reference fail to bind (`CS0012`: the type is in an assembly that is
+                    // not referenced, with a mismatched identity). Emit a simple-name reference so it
+                    // resolves against whatever `Name.dll` the app probes at build/run time.
+                    writeln!(out, ".assembly extern '{ext}' {{ }}")?;
+                }
             }
         }
         // Const-data blobs live in FieldRVA statics (`.field static <T> c_X at I_X` + a `.data` blob).
@@ -151,6 +162,19 @@ impl ILExporter {
             // Shorten over-long monomorphized names so the stricter CoreCLR `ilasm` (native
             // macOS/Windows) accepts them; within-limit names pass through unchanged (Linux/Docker
             // + ::stable unaffected). The matching reference sites apply the identical transform.
+            // `implements I1, I2, …` clause for Rust-defined managed classes that implement a managed
+            // interface. Empty (no clause) for the overwhelming majority of classes.
+            let implements = if class_def.implements().is_empty() {
+                String::new()
+            } else {
+                let list: String = class_def
+                    .implements()
+                    .iter()
+                    .map(|iface| simple_class_ref(*iface, asm))
+                    .intersperse(", ".to_string())
+                    .collect();
+                format!(" implements {list}")
+            };
             let name = dotnet_class_name(&asm[class_def.name()]);
             // When `MainModule` is split across partition classes, its static fields are read by
             // methods that now live in sibling classes — widen them to `public` so the cross-class
@@ -160,7 +184,7 @@ impl ILExporter {
             let field_vis = if main_partitioned { "public " } else { "" };
             writeln!(
                 out,
-                ".class {vis} ansi {sealed} {explicit} '{name}' extends {extends}{{"
+                ".class {vis} ansi {sealed} {explicit} '{name}' extends {extends}{implements}{{"
             )?;
             // Export size
             if let Some(size) = class_def.explict_size() {
@@ -1703,6 +1727,16 @@ fn ref_assembly_name(name: &str) -> &str {
         "System.Private.CoreLib" | "mscorlib" => "System.Runtime",
         other => other,
     }
+}
+/// Whether an external assembly name is part of the .NET base class library (so its `.assembly extern`
+/// header carries the runtime `.ver` + the shared ECMA public-key token). Everything else is treated as
+/// a consumer-supplied assembly, referenced by simple name only (no version/token) so it binds against
+/// a plain `dotnet build` output. The `::stable` suite references only `System.*`/`Microsoft.*`/CoreLib
+/// assemblies, so its externs are unaffected.
+fn is_bcl_assembly(name: &str) -> bool {
+    name.starts_with("System")
+        || name.starts_with("Microsoft")
+        || matches!(name, "mscorlib" | "netstandard" | "WindowsBase")
 }
 fn simple_class_ref(cref: Interned<ClassRef>, asm: &Assembly) -> String {
     let cref = asm.class_ref(cref);

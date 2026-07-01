@@ -1197,7 +1197,13 @@ impl Assembly {
             if let Some(overrider) = override_methods.get(&name) {
                 let mref = mref.clone();
                 let implementation = overrider(mref_idx, self);
-                self.new_method(mref.into_def(implementation, Access::Private, self));
+                // `Access::Public`, not `Private`: these patched helpers live on `MainModule`
+                // (`transmute`, alloc shims, …) but are called from *other* classes too — e.g. a
+                // `#[dotnet_class]` method whose body uses `format!` calls `MainModule.transmute`.
+                // A `private` def would make that cross-class call fail at runtime with
+                // `MethodAccessException`. Public is not a DCE root, so unused helpers are still
+                // culled; intra-class callers (the `::stable` executables) are unaffected.
+                self.new_method(mref.into_def(implementation, Access::Public, self));
                 continue;
             }
 

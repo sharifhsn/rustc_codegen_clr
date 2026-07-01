@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- A tiny C# class library that OWNS the interfaces. Both the Rust crate (which implements them)
+       and the consumer (which uses the Rust object through them) reference THIS assembly — so the
+       interface lives in a third assembly and there is no cyclic Rust<->consumer reference. This is
+       exactly the shape of consuming a real C# codebase: their contracts assembly is the shared
+       vocabulary, and a Rust type slots in behind one of their interfaces. -->
+  <PropertyGroup>
+    <RustDotnetVersion Condition="'$(RustDotnetVersion)'==''">8</RustDotnetVersion>
+    <TargetFramework>net$(RustDotnetVersion).0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <!-- The assembly name the Rust `.assembly extern` clause and the consumer both reference. -->
+    <AssemblyName>Contracts</AssemblyName>
+  </PropertyGroup>
+</Project>

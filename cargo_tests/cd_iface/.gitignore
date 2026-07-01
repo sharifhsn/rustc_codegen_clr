@@ -1,0 +1,8 @@
+# Rust build output
+rustlib/target/
+rustlib/rustc-ice-*.txt
+# C# build output
+csharp/bin/
+csharp/obj/
+contracts/bin/
+contracts/obj/

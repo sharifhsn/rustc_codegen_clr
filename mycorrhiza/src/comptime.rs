@@ -106,6 +106,23 @@ pub fn rustc_codegen_clr_add_field_setters(class: ClassDef) -> ClassDef {
     diverge!()
 }
 
+/// Declare that this class implements the managed interface `[IFACE_ASM]IFACE` (an `implements` clause).
+/// The class must expose a public virtual method matching each interface member by name+signature —
+/// those are the ordinary `rustc_codegen_clr_add_method_def` aliases — and CLR binds them implicitly,
+/// so no explicit `.override` is emitted. Call once per interface. This lets a Rust-defined managed
+/// type satisfy an interface defined in a *third* assembly (e.g. a C# consumer's own `IService`), so it
+/// can be used polymorphically / injected into a DI container on the .NET side.
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_codegen_clr_add_interface_impl<
+    const IFACE_ASM: &'static str,
+    const IFACE: &'static str,
+>(
+    class: ClassDef,
+) -> ClassDef {
+    diverge!()
+}
+
 /// Finish the class: register it (and its methods / primary ctor) into the assembly.
 #[allow(unused_variables)]
 #[inline(never)]
