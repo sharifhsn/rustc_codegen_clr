@@ -268,24 +268,50 @@ fn check_generic_marker<'tcx>(
     role: &str,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) {
-    let Type::PlatformGeneric(n, GenericKind::TypeGeneric) = sig_ty else {
-        return;
-    };
-    match class_generics.get(n as usize) {
-        Some(&resolved) if resolved == runtime_ty => {}
-        Some(&resolved) => ctx.tcx().dcx().span_fatal(
-            ctx.span(),
-            format!(
-                "WF-9 generic interop: the `!{n}` {role} resolves to class generic {n} = {resolved:?}, but the declared runtime type is {runtime_ty:?}. The binding is inconsistent and would silently miscompile (CoreCLR runs unverified)."
+    match sig_ty {
+        // Leaf: a bare class generic `!N` must resolve to exactly the runtime type.
+        Type::PlatformGeneric(n, GenericKind::TypeGeneric) => match class_generics.get(n as usize) {
+            Some(&resolved) if resolved == runtime_ty => {}
+            Some(&resolved) => ctx.tcx().dcx().span_fatal(
+                ctx.span(),
+                format!(
+                    "WF-9 generic interop: the `!{n}` {role} resolves to class generic {n} = {resolved:?}, but the declared runtime type is {runtime_ty:?}. The binding is inconsistent and would silently miscompile (CoreCLR runs unverified)."
+                ),
             ),
-        ),
-        None => ctx.tcx().dcx().span_fatal(
-            ctx.span(),
-            format!(
-                "WF-9 generic interop: a `!{n}` {role} references class generic {n}, but only {} class generic argument(s) were provided.",
-                class_generics.len()
+            None => ctx.tcx().dcx().span_fatal(
+                ctx.span(),
+                format!(
+                    "WF-9 generic interop: a `!{n}` {role} references class generic {n}, but only {} class generic argument(s) were provided.",
+                    class_generics.len()
+                ),
             ),
-        ),
+        },
+        // Nested generic: a def-shape type like `Dictionary<K,V>.KeyCollection<!0,!1>`,
+        // `Comparison<!0>`, or `Task<!0>`. When the runtime type is the SAME open generic (same
+        // name/assembly/valuetype and arity), recurse pairwise into the generic arguments so every
+        // nested `!N` is proven to resolve to exactly the runtime argument in that position — the same
+        // codegen-time proof the bare-`!N` leaf gets. This is what makes the `is_assignable_to`
+        // nested-ClassRef relaxation *precisely* sound rather than merely trusted.
+        Type::ClassRef(sig_cref) => {
+            let Type::ClassRef(rt_cref) = runtime_ty else {
+                return;
+            };
+            let (same_open, sig_gen, rt_gen) = {
+                let s = ctx.class_ref(sig_cref);
+                let r = ctx.class_ref(rt_cref);
+                let same = s.name() == r.name()
+                    && s.asm() == r.asm()
+                    && s.is_valuetype() == r.is_valuetype()
+                    && s.generics().len() == r.generics().len();
+                (same, s.generics().to_vec(), r.generics().to_vec())
+            };
+            if same_open {
+                for (sg, rg) in sig_gen.into_iter().zip(rt_gen) {
+                    check_generic_marker(sg, rg, class_generics, role, ctx);
+                }
+            }
+        }
+        _ => {}
     }
 }
 /// Lower a magic-fn type-parameter `subst_ref[i]` (always a real type) to its .NET type.
@@ -351,11 +377,17 @@ fn call_generic<'tcx>(
     let mkind = match kind {
         0 => MethodKind::Static,
         1 => {
-            assert!(
-                !is_valuetype,
-                "WF-9 generic interop: instance calls on generic *value types* (e.g. Span<T>) are not yet supported; use a reference type"
-            );
-            inputs.push(Type::ClassRef(this));
+            // Instance method reached with `call instance` (a non-virtual slot). A **value-type**
+            // receiver's `this` is a *managed pointer* to the unboxed valuetype (`valuetype Foo&`),
+            // exactly as the non-generic `RustcCLRInteropManagedStruct::vt_instance*` path in
+            // `call_managed` passes `&self` — so the wrapper hands us the address and we type the
+            // receiver slot as a ref. A reference-type receiver is the object reference itself.
+            if is_valuetype {
+                let this_ref = ctx.nref(Type::ClassRef(this));
+                inputs.push(this_ref);
+            } else {
+                inputs.push(Type::ClassRef(this));
+            }
             MethodKind::Instance
         }
         2 => {

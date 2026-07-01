@@ -286,6 +286,34 @@ impl Type {
             // the runtime type it is paired with. So a `!N` value here is *guaranteed* to equal its
             // concrete binding; accepting the pair cannot mask a real mismatch.
             (_, Type::PlatformGeneric(_, _)) | (Type::PlatformGeneric(_, _), _) => true,
+            // Two instantiations of the SAME open generic type are mutually assignable when their
+            // type arguments are pairwise assignable. This is what lets a *definition-shape*
+            // nested-generic methodref signature — `Dictionary<K,V>.KeyCollection<!0,!1>`,
+            // `Comparison<!0>`, `Task<!0>` — bind against the concrete instantiation the WF-9 bridge
+            // produces/consumes (`KeyCollection<int32,int32>`, `Comparison<int32>`, `Task<int32>`).
+            // The only *loose* element-pairing is `!N`-vs-concrete, handled by the `PlatformGeneric`
+            // arm above; every such site is proven consistent at codegen by
+            // `src/terminator/call.rs::check_generic_marker`, which recurses into nested generics —
+            // so a `!N` element here provably equals its concrete binding and this cannot mask a real
+            // mismatch. Concrete-vs-concrete arguments must themselves be soundly assignable (the
+            // recursion bottoms out in the sound leaf arms), and the open types must match exactly
+            // (same name/assembly/valuetype and arity), so unrelated generics stay unassignable.
+            (Type::ClassRef(lhs), Type::ClassRef(rhs)) => {
+                let lref = asm.class_ref(lhs);
+                let rref = asm.class_ref(rhs);
+                let same_open = lref.name() == rref.name()
+                    && lref.asm() == rref.asm()
+                    && lref.is_valuetype() == rref.is_valuetype()
+                    && !lref.generics().is_empty()
+                    && lref.generics().len() == rref.generics().len();
+                if same_open {
+                    let lg: Vec<Type> = lref.generics().to_vec();
+                    let rg: Vec<Type> = rref.generics().to_vec();
+                    lg.iter().zip(rg.iter()).all(|(a, b)| a.is_assignable_to(*b, asm))
+                } else {
+                    false
+                }
+            }
             _ => false,
         }
     }
