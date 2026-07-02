@@ -70,9 +70,26 @@ const CLI_HEADER_CB: u32 = 0x48;
 pub struct ExportOptions {
     /// `true` for a `.dll`, `false` for a `.exe` — forwarded to [`PeOptions::is_dll`].
     pub is_dll: bool,
-    /// The `.NET` module name stamped into the `Module` table and hashed for the deterministic
-    /// MVID (see [`MetadataBuilder::finish_module`]).
+    /// The `Assembly` table's own identity name (§II.22.2's `Name` column) — `"_"` for an
+    /// executable (loaded by path, identity irrelevant, mirrors `il_exporter`'s `.assembly _{}`),
+    /// or the crate name for a library (so C# can reference the produced `.dll` by assembly
+    /// identity). NOT the same thing as `module_name` — see that field's doc for why conflating
+    /// them broke `Assembly.Load`.
     pub assembly_name: String,
+    /// The `Module` table's own name (§II.22.30's `Name` column), independent of
+    /// `assembly_name`. `ilasm` (given no explicit `.module` directive, which `il_exporter` never
+    /// emits) defaults this to the `-output:` file's own basename — e.g.
+    /// `cd_json-7dec5593b2da6ade.exe`, NOT the assembly identity `"_"`. Reusing `assembly_name`
+    /// here (this field's original, wrong, implementation) stamped `Module.Name = "_"` for every
+    /// executable; `System.Runtime.Loader.AssemblyLoadContext.InternalLoad`'s native path
+    /// apparently cross-checks this against the manifest and rejects the mismatch with
+    /// `System.IO.FileLoadException: Could not load file or assembly '_, ...'` — a
+    /// `0x8007000C`/`COMException` thrown from native code *before* the CLI-aware managed loader
+    /// (and even `System.Reflection.Metadata`'s own `PEReader`/`MetadataReader`, which validates
+    /// this binary with zero errors) ever gets a look — root-caused via a real `ilasm`-produced
+    /// `.dll` for the identical source, which loads fine and whose `Module.Name` was confirmed
+    /// (via a from-scratch metadata reader) to be the output filename, not `"_"`.
+    pub module_name: String,
 }
 
 /// Builds the complete PE image bytes for `asm`: populates metadata for every class/field/method,
@@ -458,7 +475,7 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
     // sole `#GUID` heap entry for the MVID), which changes the serialized length just like any
     // other row addition would — doing it after the probe was a real bug caught by the
     // `debug_assert_eq!` below during development (probe/final length mismatch).
-    mb.finish_module(&options.assembly_name);
+    mb.finish_module(&options.module_name);
     let metadata_len_probe = mb.serialize().len();
     // `pe::text_header_len` is the single source of truth for how many bytes precede the CLI
     // header within `.text` (0 for a `.dll`, or the bootstrap IAT's length for an `.exe` — see
@@ -666,6 +683,7 @@ mod tests {
         let options = ExportOptions {
             is_dll: true,
             assembly_name: "export_pe_smoke".to_string(),
+            module_name: "export_pe_smoke.exe".to_string(),
         };
         let image = export_pe(&mut asm, &options);
         assert_eq!(&image[0..2], b"MZ", "must start with the DOS signature");
@@ -721,6 +739,7 @@ mod tests {
         let options = ExportOptions {
             is_dll: false,
             assembly_name: "pe_e2e_hello".to_string(),
+            module_name: "pe_e2e_hello.exe".to_string(),
         };
         let image = export_pe(&mut asm, &options);
         assert_eq!(&image[0..2], b"MZ");
@@ -822,6 +841,7 @@ mod tests {
         let options = ExportOptions {
             is_dll: false,
             assembly_name: "pe_e2e_hello".to_string(),
+            module_name: "pe_e2e_hello.exe".to_string(),
         };
         let image = export_pe(&mut asm, &options);
 
@@ -899,6 +919,7 @@ mod tests {
         let options = ExportOptions {
             is_dll: false,
             assembly_name: "pe_e2e_const_data".to_string(),
+            module_name: "pe_e2e_const_data.exe".to_string(),
         };
         let image = export_pe(&mut asm, &options);
 
@@ -994,6 +1015,7 @@ mod tests {
         let options = ExportOptions {
             is_dll: false,
             assembly_name: "pe_e2e_no_alias".to_string(),
+            module_name: "pe_e2e_no_alias.exe".to_string(),
         };
         let image = export_pe(&mut asm, &options);
 
@@ -1103,6 +1125,7 @@ mod tests {
         let options = ExportOptions {
             is_dll: false,
             assembly_name: "pe_e2e_no_pinvoke_alias".to_string(),
+            module_name: "pe_e2e_no_pinvoke_alias.exe".to_string(),
         };
         let image = export_pe(&mut asm, &options);
 
@@ -1264,6 +1287,7 @@ mod tests {
         let options = ExportOptions {
             is_dll: false,
             assembly_name: "pe_e2e_static_default".to_string(),
+            module_name: "pe_e2e_static_default.exe".to_string(),
         };
         let image = export_pe(&mut asm, &options);
 
@@ -1296,6 +1320,7 @@ mod tests {
         let options = ExportOptions {
             is_dll: true,
             assembly_name: "export_pe_implements".to_string(),
+            module_name: "export_pe_implements.exe".to_string(),
         };
         let image = export_pe(&mut asm, &options);
         assert_eq!(&image[0..2], b"MZ");
@@ -1404,6 +1429,7 @@ mod tests {
         let options = ExportOptions {
             is_dll: false,
             assembly_name: "pe_e2e_layout".to_string(),
+            module_name: "pe_e2e_layout.exe".to_string(),
         };
         let image = export_pe(&mut asm, &options);
 

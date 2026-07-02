@@ -579,11 +579,26 @@ fn main() {
                 _ => panic!("Could not remove tmp file because {err:?}"),
             }
         }
+        // `Module.Name` (§II.22.30) must be the OUTPUT file's own basename, not the assembly
+        // identity (`asm_name`, `"_"` for an executable) — `ilasm`, given no explicit `.module`
+        // directive (`il_exporter` never emits one), defaults the `Module` table's name to its
+        // `-output:` argument's filename. Conflating the two here previously stamped
+        // `Module.Name = "_"` for every executable, which `AssemblyLoadContext.InternalLoad`'s
+        // native path rejects with a `FileLoadException` naming the mismatched assembly `"_"`
+        // (`0x8007000C`), before the CLI-aware managed loader (or even
+        // `System.Reflection.Metadata`'s reader, which accepts the file with zero errors) ever
+        // sees it — see `ExportOptions::module_name`'s doc for the full root-cause writeup.
+        let module_name = exe_out
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| asm_name.clone());
         let bytes = cilly::pe_exporter::export::export_pe(
             &mut final_assembly,
             &cilly::pe_exporter::export::ExportOptions {
                 is_dll: is_lib,
                 assembly_name: asm_name,
+                module_name,
             },
         );
         std::fs::write(&exe_out, bytes).unwrap();

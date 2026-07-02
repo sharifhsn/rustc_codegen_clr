@@ -2439,6 +2439,64 @@ mod tests {
         assert_eq!(method_flags & 0x10, 0x10, "static bit must be set");
     }
 
+    /// `Module.Name` (§II.22.30) and `Assembly.Name` (§II.22.2) are DISTINCT columns on DISTINCT
+    /// tables — `finish_module` and `set_assembly` must never be called with the same string
+    /// under the assumption they're "the same name". A real regression (found via the
+    /// `cd_json`/`cd_async`/`pal_threads` A/B differential): the linker's `DIRECT_PE` call site
+    /// passed the SAME string (the executable's `"_"` assembly-identity placeholder, mirroring
+    /// `il_exporter`'s `.assembly _{}`) to both `MetadataBuilder::set_assembly` AND
+    /// `export_pe`'s `finish_module` call — but `ilasm`, given no explicit `.module` directive
+    /// (`il_exporter` never emits one), defaults `Module.Name` to its `-output:` file's own
+    /// basename, NOT the assembly identity. Stamping `Module.Name = "_"` made
+    /// `AssemblyLoadContext.InternalLoad`'s native path reject the image with
+    /// `System.IO.FileLoadException: Could not load file or assembly '_, ...'` (`0x8007000C`) —
+    /// thrown from native code before the CLI-aware managed loader (or even
+    /// `System.Reflection.Metadata`'s own reader, which accepted the same bytes with zero errors)
+    /// ever inspected the metadata.
+    #[test]
+    fn module_name_and_assembly_name_are_independent_columns() {
+        let mut mb = MetadataBuilder::new();
+        // The exact real-world shape: an executable's assembly identity is the "_" placeholder,
+        // but its Module.Name must be the real output filename.
+        mb.set_assembly("_", (0, 0, 0, 0));
+        mb.finish_module("cd_json-7dec5593b2da6ade.exe");
+
+        let bytes = mb.serialize();
+        let reader = MetadataReader::parse(&bytes);
+        let header = reader.tables_header();
+        let row_bytes = &reader.stream("#~")[header.row_data_offset..];
+
+        // Module row is always first: Generation(2) + Name(2) + Mvid(2) + EncId(2) + EncBaseId(2).
+        let module_name_off = u16::from_le_bytes(row_bytes[2..4].try_into().unwrap());
+        assert_eq!(
+            reader.strings_at(u32::from(module_name_off)),
+            "cd_json-7dec5593b2da6ade.exe",
+            "Module.Name must be the output filename, not the assembly identity"
+        );
+
+        // Assembly row comes after Module + TypeDef(<Module> pseudo-type, since no add_type_def
+        // was called here it's the only TypeDef row). Locate it via the table header's row
+        // ordering instead of a hardcoded offset, to stay robust to unrelated table layout.
+        let counts: HashMap<u32, usize> = header.counts.iter().copied().collect();
+        assert_eq!(counts.get(&Token::TABLE_ASSEMBLY).copied(), Some(1));
+        // Module(10) + TypeDef(1 row * 14 bytes, the mandatory <Module> pseudo-type).
+        let assembly_start = 10 + 14;
+        // Assembly: HashAlgId(4) + MajorVersion(2) + MinorVersion(2) + BuildNumber(2) +
+        // RevisionNumber(2) + Flags(4) + PublicKey(2, blob) + Name(2) = offset 18 for Name.
+        let assembly_name_off =
+            u16::from_le_bytes(row_bytes[assembly_start + 18..assembly_start + 20].try_into().unwrap());
+        assert_eq!(
+            reader.strings_at(u32::from(assembly_name_off)),
+            "_",
+            "Assembly.Name keeps the executable's placeholder identity"
+        );
+
+        assert_ne!(
+            module_name_off, assembly_name_off,
+            "Module.Name and Assembly.Name must intern to different #Strings offsets here"
+        );
+    }
+
     /// `add_method`'s `param_names` slice drives real `Param` rows (§II.22.33), one per entry —
     /// including entries with no name. Verified against real CoreCLR `ilasm`/`monodis`: an
     /// unnamed parameter still gets a `Param` row (empty `Name`, real 1-based `Sequence`), it is
