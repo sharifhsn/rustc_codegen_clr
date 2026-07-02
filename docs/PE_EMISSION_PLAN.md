@@ -184,13 +184,14 @@ quickest way to tell the two paths' output apart (ilasm stamps a real build time
     `names probe fn`) print `true`.
   - `cargo_tests/cd_collections` (battery slice): **141/141** (`chk!` tally), rebuilt+run fresh
     against current HEAD.
-  - The Phase-1c Docker `::stable` serial gate (424/16, byte-identical named-failure set to the
-    ilasm baseline — see Phase 1c above) was run against the pre-PDB-writer commit (`fc619fe`/
-    `eac6d9b`-era, DIRECT_PE-flip only); it has **not** been re-run end-to-end against the
-    post-PDB-writer commits (`5b6f362`..`02da7b8`) in Docker in this session — the in-repo unit
-    suite, the cd_pdb probe, and the cd_collections slice are the verified evidence for Phase 2
-    specifically. Re-running the full serial gate against `02da7b8` is the one open verification
-    item before calling the PDB writer gate-proven at the same bar as Phase 1.
+  - The Docker `::stable` gate **has now been re-run against the post-PDB-writer HEAD**
+    (`02da7b8`+docs, default DIRECT_PE path): `feasibility/dev.sh gate` verdict **"OK: no real
+    regressions"** (exit 0). The parallel run scored 405/35 vs the 16-failure baseline, and the
+    gate's built-in retry arbiter confirmed every out-of-baseline failure passes in isolation —
+    the same parallel-contention noise signature characterized in Phase 1c (its serial control
+    run there showed 424/16 byte-identical to the ilasm baseline). The PE+PDB path is
+    gate-proven at the same bar as Phase 1; the parallel-mode contention sensitivity of the
+    direct-PE path (vs ilasm) remains a flagged, unexplained follow-up.
   - A manual VS Code / debugger step-through was **not** performed this session (stretch item,
     unverified).
 
