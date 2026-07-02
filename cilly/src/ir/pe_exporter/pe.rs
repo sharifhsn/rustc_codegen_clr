@@ -497,13 +497,24 @@ pub fn write_pe(
 
     write_coff_header(&mut out, num_sections, optional_header_size, options.is_dll);
 
-    // The native stub's own RVA (§II.25.4 places `AddressOfEntryPoint` at the stub, not at
-    // `.text`'s start, once a bootstrap is present — a plain "point at .text" AEP is only valid
-    // when there's no native code to run at all, i.e. no bootstrap).
+    // The native stub's own RVA (§II.25.4 places `AddressOfEntryPoint` at the stub, once a
+    // bootstrap is present). §II.25.2.3.1 requires `AddressOfEntryPoint` to be **0** when the
+    // image has no native entry point — i.e. every `.dll` (a library is never natively executed;
+    // the CLR reaches it only through the CLI header's own `EntryPointToken`/managed loading, per
+    // the module doc's "A `.dll` … skips all of the above" note). Pointing it at `.text`'s base
+    // instead (as if any in-section RVA were "inert") is what this backend did before this fix —
+    // that RVA lands on the CLI header itself (`.text` = [IAT] + CLI header + metadata + bodies,
+    // and a `.dll` has no IAT), so a nonzero `AddressOfEntryPoint` told CoreCLR's native PE loader
+    // "there is native code to run here", and it tried to validate/treat the CLI header bytes as
+    // an executable entry stub — rejected with `BadImageFormatException` at `Assembly.Load`,
+    // *before* the CLI-aware managed loader ever got to inspect the metadata (confirmed via the
+    // reference-grade `System.Reflection.Metadata` reader accepting the same bytes with zero
+    // errors, and a real `ilasm`-produced `.dll` for the identical source loading fine with
+    // `AddressOfEntryPoint = 0`).
     let entry_point_rva = if needs_bootstrap {
         import_table_rva + bootstrap.unwrap().stub_offset_in_import_region()
     } else {
-        text.rva
+        0
     };
     write_optional_header(
         &mut out,
@@ -647,7 +658,7 @@ fn write_optional_header(
     out.extend_from_slice(&align_up(size_of_text, FILE_ALIGNMENT).to_le_bytes()); // SizeOfCode.
     out.extend_from_slice(&0u32.to_le_bytes()); // SizeOfInitializedData (folded into .text/.sdata's own accounting; ECMA-335 images conventionally leave this 0, matching ilasm).
     out.extend_from_slice(&0u32.to_le_bytes()); // SizeOfUninitializedData.
-    out.extend_from_slice(&entry_point_rva.to_le_bytes()); // AddressOfEntryPoint: the native bootstrap stub's RVA for a .exe (see module doc's "Risk #1 confirmed"), or .text's own start for a .dll (never executed, so any in-section RVA is inert).
+    out.extend_from_slice(&entry_point_rva.to_le_bytes()); // AddressOfEntryPoint: the native bootstrap stub's RVA for a .exe (see module doc's "Risk #1 confirmed"), or 0 for a .dll (§II.25.2.3.1 requires 0 when there is no native entry point — see this call site's doc).
     out.extend_from_slice(&text_rva.to_le_bytes()); // BaseOfCode.
     out.extend_from_slice(&0u32.to_le_bytes()); // BaseOfData (PE32-only field).
 
@@ -857,6 +868,7 @@ mod tests {
         time_date_stamp: u32,
         characteristics: u16,
         magic: u16,
+        address_of_entry_point: u32,
         image_base: u32,
         section_alignment: u32,
         file_alignment: u32,
@@ -910,6 +922,10 @@ mod tests {
 
         let opt = coff + 20;
         let magic = read_u16(data, opt);
+        // Optional header layout (§II.25.2.3.1, PE32): Magic(2) LMajor(1) LMinor(1)
+        // SizeOfCode(4) SizeOfInitializedData(4) SizeOfUninitializedData(4)
+        // AddressOfEntryPoint(4) @ offset 16.
+        let address_of_entry_point = read_u32(data, opt + 16);
         let image_base = read_u32(data, opt + 28);
         let section_alignment = read_u32(data, opt + 32);
         let file_alignment = read_u32(data, opt + 36);
@@ -953,6 +969,7 @@ mod tests {
             time_date_stamp,
             characteristics,
             magic,
+            address_of_entry_point,
             image_base,
             section_alignment,
             file_alignment,
@@ -1040,6 +1057,21 @@ mod tests {
             pe.characteristics & IMAGE_FILE_DLL,
             IMAGE_FILE_DLL,
             "is_dll must set IMAGE_FILE_DLL"
+        );
+        // §II.25.2.3.1: `AddressOfEntryPoint` shall be 0 when the image has no native entry
+        // point. A library never carries the `mscoree.dll`/`_CorExeMain` bootstrap stub — pointing
+        // this at `.text`'s base instead (as if any in-section RVA were harmlessly "unexecuted")
+        // told CoreCLR's *native* PE loader there WAS a native entry point to validate there, and
+        // it rejected the CLI-header bytes sitting at that RVA as malformed code —
+        // `System.IO.FileLoadException`/`BadImageFormatException` at `Assembly.Load`, before the
+        // CLI-aware managed loader ever inspected the metadata (root-caused via the `cd_interop`
+        // C# consumer battery item: MSBuild's `dotnet build` failed with CS0246 because the
+        // referenced `cd_interop.dll` — otherwise structurally perfect, confirmed via
+        // `System.Reflection.Metadata` and a real `ilasm`-built `.dll` for the same source loading
+        // fine — could not be `Assembly.Load`ed at all).
+        assert_eq!(
+            pe.address_of_entry_point, 0,
+            "a .dll with no bootstrap must have AddressOfEntryPoint == 0, not point into .text"
         );
     }
 
