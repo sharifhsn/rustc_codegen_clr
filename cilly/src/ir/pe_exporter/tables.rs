@@ -801,6 +801,15 @@ impl MetadataBuilder {
         tok
     }
 
+    /// Test-only: the `#Blob` offset of a `MemberRef` row's `Signature` column, by RID. Lets
+    /// `body.rs`'s regression tests decode a real resolved-through-`method_token` `MethodRefSig`
+    /// blob without the `member_ref` field itself needing to be `pub` outside `tables.rs`.
+    #[cfg(test)]
+    pub(crate) fn member_ref_signature_for_test(&self, token: Token) -> u32 {
+        assert_eq!(token.table(), Token::TABLE_MEMBER_REF);
+        self.member_ref[(token.rid() - 1) as usize].signature
+    }
+
     /// Interns a `TypeSpec` row (§II.22.39): a signature-encoded type too complex for a
     /// `TypeDef`/`TypeRef` token alone (generic instantiations, arrays, pointers used as a
     /// standalone type operand — e.g. `ldelem`/`newarr` on `List<T>`). `blob` is a pre-encoded

@@ -702,7 +702,22 @@ impl<'a> Emitter<'a> {
         self.push_token(tok);
     }
     fn emit_int128_ctor(&mut self, cref: Interned<ClassRef>) {
-        let sig = self.asm.sig([Type::Int(Int::U64), Type::Int(Int::U64)], Type::Void);
+        // Every `Constructor`-kind `MethodRef`'s stored `FnSig` carries the owning type as an
+        // IMPLICIT receiver at `inputs()[0]` — the same convention `rustc_codegen_clr_call`'s
+        // `MethodRef::new(... MethodKind::Constructor ...)` call sites always follow (`this` is
+        // prepended before the explicit ctor args), and which `TokenSink::method_token`
+        // (`tables.rs`) / `il_exporter`'s own MemberRef-rendering (`mod.rs` `&sig.inputs()[1..]`)
+        // both unconditionally strip back off before encoding. Omitting it here made this
+        // writer's `method_token` strip a REAL constructor argument instead of a placeholder,
+        // encoding `UInt128::.ctor(uint64,uint64)` as a bogus 1-arg `.ctor(uint64)` MemberRef —
+        // a real regression caught by `dotnet-ilverify` on `cargo_tests/cd_collections`
+        // (164 `MissingMethod: Void System.UInt128..ctor(UInt64)` errors, 0 for the ilasm A/B
+        // twin) that manifested at runtime as a `FileLoadException` the moment any JITted method
+        // referencing this bogus MemberRef got resolved.
+        let this_ty = Type::ClassRef(cref);
+        let sig = self
+            .asm
+            .sig([this_ty, Type::Int(Int::U64), Type::Int(Int::U64)], Type::Void);
         let mref = self
             .asm
             .new_methodref(cref, ".ctor", sig, crate::ir::cilnode::MethodKind::Constructor, vec![]);
@@ -1219,7 +1234,11 @@ impl<'a> Emitter<'a> {
 
     fn system_exception_ctor(&mut self) -> Token {
         let cref = self.bcl_class_ref("System.Exception", false);
-        let sig = self.asm.sig([Type::PlatformString], Type::Void);
+        // Same "implicit receiver at `inputs()[0]`" convention as `emit_int128_ctor` above — see
+        // its doc comment. Without the leading `this` type here, `method_token` strips the real
+        // (only) `string` argument, encoding a bogus zero-arg `System.Exception::.ctor()`.
+        let this_ty = Type::ClassRef(cref);
+        let sig = self.asm.sig([this_ty, Type::PlatformString], Type::Void);
         let mref = self
             .asm
             .new_methodref(cref, ".ctor", sig, crate::ir::cilnode::MethodKind::Constructor, vec![]);
@@ -1507,6 +1526,7 @@ mod tests {
     use crate::ir::cilnode::MethodKind;
     use crate::ir::method::MethodDef;
     use crate::ir::{Access, BasicBlock as BB, BinOp, FnSig, MethodRef};
+    use crate::ir::pe_exporter::tables::MetadataBuilder;
 
     /// A [`TokenSink`] stub for tests: hands out small monotonically increasing tokens per
     /// category and records every request so tests can assert on what was resolved.
@@ -1630,6 +1650,90 @@ mod tests {
         let operand = i32::from_le_bytes([code[1], code[2], code[3], code[4]]);
         assert_eq!(operand, -100);
         assert_eq!(code[5], 0x28, "call op_Implicit");
+    }
+
+    /// A 128-bit constant too large for any `ldc` + `op_Implicit` band falls back to
+    /// `ldc.i8 <high> ldc.i8 <low> newobj instance void UInt128::.ctor(uint64,uint64)`. This is a
+    /// regression test for a real bug caught wiring `DIRECT_PE=1` into the linker on
+    /// `cargo_tests/cd_collections`: `emit_int128_ctor` built the `.ctor` signature as EXACTLY
+    /// `[uint64, uint64] -> void`, but `MetadataBuilder::method_token` (the real `TokenSink`, NOT
+    /// `StubSink`) unconditionally treats `inputs()[0]` as an implicit `this` placeholder for any
+    /// non-static `MethodKind` (matching `rustc_codegen_clr_call`'s own `MethodRef::new(...,
+    /// MethodKind::Constructor, ...)` call sites, which always prepend the owning class as
+    /// `inputs()[0]` — see `src/terminator/call.rs`) and strips it before encoding the
+    /// `MethodRefSig` blob. Without a leading `this`-type slot, that strip ate a REAL argument,
+    /// encoding a bogus 1-param `.ctor(uint64)` MemberRef — caught at runtime as 164
+    /// `dotnet-ilverify` `MissingMethod: Void System.UInt128..ctor(UInt64)` errors and a
+    /// `FileLoadException` the moment any JITted method referenced the bogus MemberRef.
+    #[test]
+    fn u128_ctor_fallback_signature_has_two_params_not_one_after_this_stripping() {
+        let mut asm = Assembly::default();
+        let sig = asm.sig([], Type::Void);
+        // Outside every `ldc` + `op_Implicit` band (needs the full 128 bits): forces the
+        // `emit_u128` `_ =>` arm, i.e. the `.ctor(uint64,uint64)` fallback.
+        let huge = u128::MAX / 3;
+        let node = asm.alloc_node(CILNode::Const(Box::new(Const::U128(huge))));
+        let pop = asm.alloc_root(CILRoot::Pop(node));
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        let block = BB::new(vec![pop, ret], 0, None);
+        let method = make_static_method(&mut asm, sig, vec![block], vec![]);
+
+        let mut mb = MetadataBuilder::default();
+        let body = assemble_method(&mut asm, method, &mut mb);
+        // Fat header (12 bytes) + `ldc.i8 <high>`(9) + `ldc.i8 <low>`(9) + `newobj`(1) + token(4).
+        let code = &body.bytes[12..];
+        assert_eq!(code[0], 0x21, "ldc.i8 <high>");
+        assert_eq!(code[9], 0x21, "ldc.i8 <low>");
+        assert_eq!(code[18], 0x73, "newobj");
+        let token_bytes = [code[19], code[20], code[21], code[22]];
+        let token = Token(u32::from_le_bytes(token_bytes));
+        assert_eq!(token.table(), Token::TABLE_MEMBER_REF, "external BCL ctor resolves as a MemberRef");
+
+        // Decode the interned `MethodRefSig` blob (§II.23.2.2) at the row's `Signature` column and
+        // assert its declared param count is 2 — the two `uint64`s, NOT 1 (the bug's symptom).
+        let row = &mb_member_ref_row(&mb, token);
+        let blob = read_blob_at(mb.blobs.as_bytes(), row.signature);
+        // byte0 = calling convention (HASTHIS), byte1 = compressed param count.
+        assert_eq!(blob[0] & 0x20, 0x20, "HASTHIS bit set for an instance/ctor MemberRef");
+        assert_eq!(blob[1], 2, "MethodRefSig ParamCount must be 2 (uint64,uint64), not 1");
+    }
+
+    /// Test-only accessor: `MetadataBuilder::member_ref` rows are private to `tables.rs`, but a
+    /// `MemberRef` token's row-derived fields are exactly what this regression test needs to
+    /// inspect. Re-derives the row by re-running the SAME dedup lookup `member_ref()` uses,
+    /// which is safe here because `emit_int128_ctor` is the only call site that could have
+    /// produced this exact (class, ".ctor", signature) key in this test's tiny assembly.
+    fn mb_member_ref_row(mb: &MetadataBuilder, token: Token) -> TestMemberRefRow {
+        assert_eq!(token.table(), Token::TABLE_MEMBER_REF);
+        let sig_off = mb.member_ref_signature_for_test(token);
+        TestMemberRefRow { signature: sig_off }
+    }
+    struct TestMemberRefRow {
+        signature: u32,
+    }
+
+    /// Reads a length-prefixed `#Blob` heap entry (§II.24.2.4) at `offset`, returning just the
+    /// blob's payload bytes (the compressed length prefix is consumed, not included).
+    fn read_blob_at(heap: &[u8], offset: u32) -> Vec<u8> {
+        let start = offset as usize;
+        let (len, header_len) = read_compressed_u32(&heap[start..]);
+        heap[start + header_len..start + header_len + len as usize].to_vec()
+    }
+    fn read_compressed_u32(bytes: &[u8]) -> (u32, usize) {
+        let b0 = bytes[0];
+        if b0 & 0x80 == 0 {
+            (u32::from(b0), 1)
+        } else if b0 & 0xC0 == 0x80 {
+            (u32::from(b0 & 0x3F) << 8 | u32::from(bytes[1]), 2)
+        } else {
+            (
+                u32::from(b0 & 0x1F) << 24
+                    | u32::from(bytes[1]) << 16
+                    | u32::from(bytes[2]) << 8
+                    | u32::from(bytes[3]),
+                4,
+            )
+        }
     }
 
     /// `ldc.i4.3 ldc.i4.s 4 add ret` — straight-line arithmetic, fat header, tiny code, no locals.
