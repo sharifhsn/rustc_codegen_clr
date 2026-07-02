@@ -547,6 +547,79 @@ fn main() {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+    } else if *DIRECT_PE {
+        // Hand-rolled ECMA-335 PE writer (`cilly::pe_exporter`) — bypasses `ilasm` entirely. See
+        // `docs/PE_EMISSION_PLAN.md`. `il_exporter`'s own `Exporter::export` (the `else` branch
+        // below) is left byte-for-byte untouched; this is a parallel call site, not a
+        // modification of it, per the task's hard constraint that the ilasm path must keep
+        // working unchanged.
+        //
+        // Output-path convention mirrors `ILExporter::export` exactly (see that function): a
+        // library's `.dll` bytes land at `path` itself; an executable's bytes land at
+        // `path.with_extension("exe")` (the legacy launcher-loaded artifact).
+        let asm_name = if is_lib {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.strip_prefix("lib").unwrap_or(s).to_string())
+                .unwrap_or_else(|| "rust_export".to_string())
+        } else {
+            // `il_exporter` stamps a name-agnostic `.assembly _{}` placeholder for executables
+            // (loaded by path, name irrelevant); `pe_exporter::ExportOptions` always needs a
+            // concrete name, so use the same placeholder text.
+            "_".to_string()
+        };
+        let exe_out = if is_lib {
+            std::path::absolute(&path).unwrap()
+        } else {
+            std::path::absolute(path.with_extension("exe")).unwrap()
+        };
+        if let Err(err) = std::fs::remove_file(&exe_out) {
+            match err.kind() {
+                std::io::ErrorKind::NotFound => (),
+                _ => panic!("Could not remove tmp file because {err:?}"),
+            }
+        }
+        let bytes = cilly::pe_exporter::export::export_pe(
+            &mut final_assembly,
+            &cilly::pe_exporter::export::ExportOptions {
+                is_dll: is_lib,
+                assembly_name: asm_name,
+            },
+        );
+        std::fs::write(&exe_out, bytes).unwrap();
+        // Mirrors the ilasm branch exactly (see its own `cargo_support && !is_lib` block just
+        // below): a library IS the final artifact at `path`, no launcher needed. An executable's
+        // real bytes live at `path.with_extension("exe")` (above), so cargo/`rustc`'s own
+        // expected output path (`path`, no extension on macOS/Linux) needs a tiny native
+        // (non-cg_clr) launcher that execs the `.exe` — otherwise cargo's `--emit link` output
+        // file never appears and downstream tooling (e.g. `cargo dotnet run`'s artifact scan)
+        // finds nothing at `path`.
+        if cargo_support && !is_lib {
+            let bootstrap = bootstrap_source(
+                &path.with_extension("exe"),
+                path.to_str().unwrap(),
+                "dotnet",
+            );
+            let bootstrap_path = path.with_extension("rs");
+            let mut bootstrap_file = std::fs::File::create(&bootstrap_path).unwrap();
+            bootstrap_file.write_all(bootstrap.as_bytes()).unwrap();
+            // See the identical comment on the ilasm branch's launcher build below for why only
+            // the backend-selecting env vars are stripped (not the whole environment).
+            let out = std::process::Command::new("rustc")
+                .arg("-O")
+                .arg(bootstrap_path)
+                .arg("-o")
+                .arg(output_file_path)
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "bootstrap launcher compilation failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     } else {
         // For a library, derive a real .NET assembly name from the output file (strip dir, the cargo
         // `lib` prefix, and the extension): `librust_export.so` -> `rust_export`. Executables keep the
@@ -650,3 +723,12 @@ config!(C_MODE, bool, false);
 config!(NO_UNWIND, bool, false);
 config!(JAVA_MODE, bool, false);
 config!(PANIC_MANAGED_BT, bool, false);
+config!(
+    DIRECT_PE,
+    bool,
+    false,
+    "Emit the .NET assembly via the hand-rolled ECMA-335 PE writer (cilly::pe_exporter) instead \
+     of going through ilasm. Default off — the ilasm path (il_exporter) remains the default until \
+     this path survives the full ::stable gate under an A/B differential. See \
+     docs/PE_EMISSION_PLAN.md."
+);

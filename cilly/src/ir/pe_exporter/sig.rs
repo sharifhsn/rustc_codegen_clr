@@ -59,6 +59,38 @@ pub trait TypeDefOrRefResolver {
     fn type_def_or_ref(&mut self, cref: Interned<ClassRef>, asm: &mut Assembly) -> u32;
 }
 
+/// Encodes one `Type` (§II.23.2.12) into `out`, substituting the real `RustVoid` valuetype
+/// (§II sentinel already materialized as a module-local `ClassDef` by `Assembly::prepared`,
+/// called before every exporter runs — see `src/lib.rs`'s `.prepared()` call) for `Type::Void`.
+///
+/// `ELEMENT_TYPE_VOID` (§II.23.1.16) is only legal as a method's *return* type (or under a
+/// `PTR`, §II.23.2.10) — a field signature, a parameter, a local variable, or a `MethodSpec`
+/// generic argument typed `void` is malformed metadata (CoreCLR: "Illegal 'void' in
+/// signature."). `il_exporter`'s `non_void_type_il` (the semantic oracle for this exact
+/// substitution) renders `Type::Void` as `valuetype RustVoid` everywhere except a bare return
+/// type / `FnPtr` output — mirror that split here: [`encode_type`] stays the raw encoder (used
+/// for return types and `PTR`/`BYREF` targets, matching `il_exporter::type_il`), and every
+/// value-carrying position (field sig, method params, locals, `MethodSpec` args) must call
+/// this wrapper instead.
+fn encode_non_void_type(
+    tpe: Type,
+    asm: &mut Assembly,
+    resolver: &mut impl TypeDefOrRefResolver,
+    out: &mut Vec<u8>,
+) {
+    if tpe == Type::Void {
+        // No `bcl_class!` row: `RustVoid` is a module-local `ClassDef` (no assembly
+        // qualifier), not a BCL type — construct the reference the same way
+        // `Assembly::eliminate_dead_types` does (`asm.rs`) when it needs to name the same
+        // sentinel class: `ClassRef::new(name, /*asm*/ None, /*is_valuetype*/ true, [])`.
+        let name = asm.alloc_string("RustVoid");
+        let cref = asm.alloc_class_ref(ClassRef::new(name, None, true, vec![].into()));
+        encode_class(cref, /*is_valuetype*/ true, asm, resolver, out);
+    } else {
+        encode_type(tpe, asm, resolver, out);
+    }
+}
+
 /// Encodes one `Type` (§II.23.2.12) into `out`.
 pub fn encode_type(
     tpe: Type,
@@ -204,13 +236,16 @@ pub fn encode_method_sig(
     }
     // For instance methods the `this` pointer is implicit — it is NOT in the param count.
     write_compressed_u32(out, u32::try_from(sig.inputs().len()).unwrap());
+    // Return position: bare `void` is legal (§II.23.2.11) — matches `il_exporter::type_il`.
     encode_type(*sig.output(), asm, resolver, out);
+    // Parameter position: `void` is illegal — matches `il_exporter::non_void_type_il`.
     for input in sig.inputs().to_vec() {
-        encode_type(input, asm, resolver, out);
+        encode_non_void_type(input, asm, resolver, out);
     }
 }
 
-/// A field signature (§II.23.2.4).
+/// A field signature (§II.23.2.4). A field typed `void` is illegal metadata — substitutes
+/// `RustVoid`, matching `il_exporter`'s `non_void_type_il` at every `.field` call site.
 pub fn encode_field_sig(
     tpe: Type,
     asm: &mut Assembly,
@@ -218,11 +253,12 @@ pub fn encode_field_sig(
     out: &mut Vec<u8>,
 ) {
     out.push(SIG_FIELD);
-    encode_type(tpe, asm, resolver, out);
+    encode_non_void_type(tpe, asm, resolver, out);
 }
 
 /// A local-variable signature (§II.23.2.6), stored via `StandAloneSig` and referenced by fat
-/// method-body headers.
+/// method-body headers. A `void`-typed local is illegal — substitutes `RustVoid`, matching
+/// `il_exporter`'s `.locals` rendering (`non_void_type_il`).
 pub fn encode_locals_sig(
     locals: &[Type],
     asm: &mut Assembly,
@@ -232,11 +268,16 @@ pub fn encode_locals_sig(
     out.push(SIG_LOCALS);
     write_compressed_u32(out, u32::try_from(locals.len()).unwrap());
     for local in locals {
-        encode_type(*local, asm, resolver, out);
+        encode_non_void_type(*local, asm, resolver, out);
     }
 }
 
 /// A `MethodSpec` instantiation blob (§II.23.2.15) — the `<int32, …>` of a generic-method call.
+/// Generic arguments render with the RAW encoder, matching `il_exporter`'s call-site generic
+/// list (mod.rs `generic_list`, built with `type_il`, not `non_void_type_il`) — a `void`
+/// generic argument does not occur in practice (ZSTs never reach codegen as `Type::Void`
+/// generic args), so this mirrors the oracle exactly rather than guessing a substitution it
+/// doesn't make.
 pub fn encode_method_spec_sig(
     args: &[Type],
     asm: &mut Assembly,
@@ -434,6 +475,60 @@ mod tests {
         assert_eq!(
             encode(Type::FnPtr(sig), &mut asm),
             [ET_FNPTR, SIG_DEFAULT, 1, ET_BOOLEAN, ET_I4]
+        );
+    }
+
+    /// Regression for a `dotnet` load-time `FileLoadException: Illegal 'void' in signature.`
+    /// hit smoke-testing `DIRECT_PE=1` on `cargo_tests/hello_world`: `Type::Void` is only legal
+    /// as a method's *return* type (§II.23.1.16 / CoreCLR's own signature validator) — a field,
+    /// a parameter, or a local variable typed bare `void` is malformed metadata. `il_exporter`'s
+    /// `non_void_type_il` substitutes `valuetype RustVoid` in exactly these positions; these
+    /// four assertions pin the same substitution in the PE writer's blob encoder so this class
+    /// of bug cannot regress silently (a hand-built `Assembly` — not a real Rust program — can
+    /// still exercise the same code path deterministically here).
+    #[test]
+    fn void_is_illegal_outside_return_position_and_gets_rust_void_substituted() {
+        let mut asm = Assembly::default();
+
+        // A field typed `void` (the `global_void` static's actual shape, `asm.rs::global_void`)
+        // must encode as `valuetype RustVoid`, not the bare ET_VOID byte.
+        let mut out = Vec::new();
+        encode_field_sig(Type::Void, &mut asm, &mut StubResolver, &mut out);
+        assert_eq!(
+            out,
+            [SIG_FIELD, ET_VALUETYPE, 5],
+            "a void-typed field must substitute RustVoid (ET_VALUETYPE), not ET_VOID"
+        );
+
+        // A `void`-typed method PARAMETER (e.g. a `PassMode::Ignore`/ZST receiver slot) must
+        // substitute RustVoid; the RETURN type in the same signature stays bare `void`
+        // (ET_VOID) — this is the same split `il_exporter::type_il`/`non_void_type_il` draw.
+        let sig = FnSig::new([Type::Void, Type::Int(Int::I32)], Type::Void);
+        let mut out = Vec::new();
+        encode_method_sig(SIG_DEFAULT, 0, &sig, &mut asm, &mut StubResolver, &mut out);
+        assert_eq!(
+            out,
+            [SIG_DEFAULT, 2, ET_VOID, ET_VALUETYPE, 5, ET_I4],
+            "return-position void stays ET_VOID; parameter-position void substitutes RustVoid"
+        );
+
+        // A `void`-typed local must substitute RustVoid.
+        let mut out = Vec::new();
+        encode_locals_sig(&[Type::Void], &mut asm, &mut StubResolver, &mut out);
+        assert_eq!(
+            out,
+            [SIG_LOCALS, 1, ET_VALUETYPE, 5],
+            "a void-typed local must substitute RustVoid, not ET_VOID"
+        );
+
+        // `Type::FnPtr`'s own return position stays bare `void`; its param position substitutes
+        // RustVoid — exercises the same split through the `encode_type` -> `encode_method_sig`
+        // nesting `Type::FnPtr` uses.
+        let fnptr_sig = asm.sig([Type::Void], Type::Void);
+        assert_eq!(
+            encode(Type::FnPtr(fnptr_sig), &mut asm),
+            [ET_FNPTR, SIG_DEFAULT, 1, ET_VOID, ET_VALUETYPE, 5],
+            "an fn-ptr's own return type stays ET_VOID; its parameter substitutes RustVoid"
         );
     }
 }

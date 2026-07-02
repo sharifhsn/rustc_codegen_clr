@@ -134,6 +134,22 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
     // def's TypeDef row to already exist — see `tables.rs`'s `TypeDefOrRefResolver` impl doc
     // ("population walks class defs before any signature needs to resolve one"). Mirrors
     // `il_exporter::export_to_write`'s per-class loop (`.class … extends …`).
+    //
+    // Creating every `TypeDef` up front (before Pass 2/3 add any field/method row) means every
+    // row's `FieldList`/`MethodList` (§II.22.37's run-start columns) is stamped `1` here — no
+    // field/method row exists yet at ANY of these calls, so `tables.rs::add_type_def`'s "one past
+    // the current end" capture is vacuously `1` every time. That is WRONG for any class that
+    // owns >0 fields/methods once Pass 2/3 actually append them (only a lucky single-class
+    // assembly — e.g. this milestone's early hand-built E2E tests, which only ever populate
+    // `MainModule` — masks it: a `dotnet` load against a REAL multi-class compiler-generated
+    // assembly instead attributes runs of unrelated fields to whichever TypeDef the table
+    // position happens to land in, surfacing as `TypeLoadException: field '…' was not given an
+    // explicit offset` or similar on a totally unrelated type). Pass 2/3 below re-stamp the
+    // correct value via `set_type_def_field_list`/`set_type_def_method_list` immediately before
+    // adding each class's own rows — this map is what lets them find the right `TypeDef` token
+    // without a second `find_type_def` scan.
+    let mut type_def_token_of: std::collections::HashMap<crate::ir::class::ClassDefIdx, Token> =
+        std::collections::HashMap::with_capacity(class_def_ids.len());
     for &class_def_id in &class_def_ids {
         let class_def = asm[class_def_id].clone();
         // Every class needs an `Extends` row: `il_exporter::export_to_write` never leaves it NIL
@@ -170,7 +186,8 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
             (None, None)
         };
         let raw_name = asm[class_def.name()].to_string();
-        mb.add_type_def("", &raw_name, class_def.is_valuetype(), Some(extends), pack, size, &implements);
+        let tok = mb.add_type_def("", &raw_name, class_def.is_valuetype(), Some(extends), pack, size, &implements);
+        type_def_token_of.insert(class_def_id, tok);
     }
 
     // Every `FieldRVA` blob (§II.22.18) queued for `.sdata` placement, in the order queued —
@@ -202,6 +219,11 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
     // see Pass 0's doc comment for the `MissingFieldException`/`entrypoint`-moved symptom it produced.
     for &class_def_id in &class_def_ids {
         let class_def = asm[class_def_id].clone();
+        // Re-stamp THIS class's `FieldList` run-start to the table's current end, right before
+        // adding any of its own field rows (see Pass 1's doc comment for why Pass 1 alone leaves
+        // every row at the placeholder value `1`). Every class needs this call, including ones
+        // with zero fields — the run-start still marks the correct boundary for its neighbors.
+        mb.set_type_def_field_list(type_def_token_of[&class_def_id]);
         for &(tpe, name, offset) in class_def.fields() {
             let name_str = asm[name].to_string();
             let mut blob = Vec::new();
@@ -296,6 +318,10 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
     let mut entry_point_token: Option<Token> = None;
     for &class_def_id in &class_def_ids {
         let class_def = asm[class_def_id].clone();
+        // Same run-start re-stamp as Pass 2's `set_type_def_field_list`, for `MethodList`
+        // instead of `FieldList` — see Pass 1's doc comment; `add_method`'s own doc documents
+        // the identical "most recently added TypeDef" assumption this call satisfies.
+        mb.set_type_def_method_list(type_def_token_of[&class_def_id]);
         for &method_id in class_def.methods() {
             let method = asm[method_id].clone();
             let name = asm[method.name()].to_string();
@@ -311,7 +337,23 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
             };
             let mut blob = Vec::new();
             let convention = if is_static { sig::SIG_DEFAULT } else { sig::SIG_HASTHIS };
-            sig::encode_method_sig(convention, 0, &sig, asm, &mut mb, &mut blob);
+            // `sig.inputs()` carries the IMPLICIT receiver (`this`) at index 0 for every
+            // non-static kind (Instance/Virtual/Constructor) — matches `method.arg_names()`'s
+            // "parallel to the FULL sig.inputs()" contract documented just below, and
+            // `il_exporter`'s own `&sig.inputs()[1..]` skip at every one of its instance-method
+            // signature-rendering sites (mod.rs:436/796/1068/1337 — the semantic oracle). A
+            // `HASTHIS` `MethodDefSig`/`MethodRefSig` (§II.23.2.1) encodes the receiver
+            // IMPLICITLY via the calling-convention byte alone — writing it out AGAIN as
+            // parameter #0 doubles it, producing a `Method not found` at every call site
+            // (regression caught wiring `DIRECT_PE=1`: a generic ctor's `MemberRef` signature
+            // came out as `.ctor(Dictionary\`2<…>)` instead of `.ctor()`, the receiver type
+            // itself masquerading as a real argument).
+            let encode_sig = if is_static {
+                sig.clone()
+            } else {
+                crate::ir::FnSig::new(sig.inputs()[1..].to_vec(), *sig.output())
+            };
+            sig::encode_method_sig(convention, 0, &encode_sig, asm, &mut mb, &mut blob);
             let sig_off = mb.blobs.intern(&blob);
             // Named `Param` rows: `method.arg_names()` is parallel to the FULL `sig.inputs()`
             // (including the implicit `this` slot at index 0 for instance/virtual/ctor kinds), but

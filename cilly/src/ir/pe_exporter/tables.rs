@@ -410,12 +410,21 @@ impl MetadataBuilder {
         tok
     }
 
-    /// Adds a `TypeDef` row (§II.22.37) for a class this assembly defines. See the trait doc for
-    /// the `FieldList`/`MethodList` run-pointer contract: they are stamped with "one past the
-    /// current end of field/method rows" here (i.e. the *insertion-order* invariant that
-    /// `add_field`/`add_method` always extend the most-recently-added `TypeDef`'s run) and never
-    /// need patching, since this backend only ever appends fields/methods for the class that was
-    /// added last — exactly how `il_exporter`'s per-class loop emits them.
+    /// Adds a `TypeDef` row (§II.22.37) for a class this assembly defines. `FieldList`/
+    /// `MethodList` (§II.22.37's run-start columns) are stamped with "one past the current end
+    /// of field/method rows" AT THIS CALL — correct only when this class's own fields/methods
+    /// are added immediately afterward, with no other `add_type_def` call in between (the
+    /// *insertion-order* invariant `add_field`/`add_method` assume, matching `il_exporter`'s
+    /// per-class loop, which emits a class's `.class` block and its `.field`/method bodies as
+    /// one contiguous unit).
+    ///
+    /// A caller that must create every `TypeDef` row UP FRONT (before any field/method exists —
+    /// needed so a field's *type* can forward-reference a class def that appears later in
+    /// iteration order, resolved via [`MetadataBuilder::find_type_def`]) gets a WRONG
+    /// `field_list`/`method_list` here (every such row reads back as `1`, since no field/method
+    /// row exists yet at any of those calls) and MUST re-stamp the correct run-start once that
+    /// class's fields/methods are about to be appended, via
+    /// [`MetadataBuilder::set_type_def_field_list`] / [`MetadataBuilder::set_type_def_method_list`].
     pub fn add_type_def(
         &mut self,
         namespace: &str,
@@ -472,6 +481,38 @@ impl MetadataBuilder {
             });
         }
         tok
+    }
+
+    /// Re-stamps a `TypeDef` row's `FieldList` run-start column (§II.22.37) to the CURRENT end
+    /// of the `Field` table (i.e. `self.field.len() + 1` — "the next field row added belongs to
+    /// this class"). For a caller that creates every `TypeDef` up front (see
+    /// [`MetadataBuilder::add_type_def`]'s doc) and only later walks classes again to append
+    /// their fields: call this immediately BEFORE adding `tok`'s class's fields, in the SAME
+    /// per-class order `add_type_def` originally ran in — `FieldList` is a run-START pointer
+    /// (the run's END is implicit: whatever the NEXT TypeDef row's `FieldList` says), so classes
+    /// must still be visited in a consistent order or ranges overlap/gap incorrectly. A class
+    /// with zero fields still needs this call (stamping the current cursor, an empty range) so
+    /// the run boundary is correct for its NEIGHBORS even though it owns no rows itself.
+    ///
+    /// # Panics
+    /// If `tok` is not a `TypeDef` token, or its row index is out of range.
+    pub fn set_type_def_field_list(&mut self, tok: Token) {
+        assert_eq!(tok.table(), Token::TABLE_TYPE_DEF, "not a TypeDef token: {tok:?}");
+        let idx = usize::try_from(tok.rid()).unwrap() - 1;
+        self.type_def[idx].field_list = u32::try_from(self.field.len() + 1).unwrap();
+    }
+
+    /// The `MethodDef`-table analogue of [`MetadataBuilder::set_type_def_field_list`] — re-stamps
+    /// `MethodList` (§II.22.37) to `self.method_def.len() + 1`. See that method's doc for the
+    /// full run-pointer contract and the "call before this class's OWN methods, zero-method
+    /// classes included" ordering requirement.
+    ///
+    /// # Panics
+    /// If `tok` is not a `TypeDef` token, or its row index is out of range.
+    pub fn set_type_def_method_list(&mut self, tok: Token) {
+        assert_eq!(tok.table(), Token::TABLE_TYPE_DEF, "not a TypeDef token: {tok:?}");
+        let idx = usize::try_from(tok.rid()).unwrap() - 1;
+        self.type_def[idx].method_list = u32::try_from(self.method_def.len() + 1).unwrap();
     }
 
     /// Adds a `private explicit ansi sealed` `TypeDef` (§II.22.37) sized to exactly `size` bytes
@@ -542,11 +583,18 @@ impl MetadataBuilder {
     /// `offset` mirrors `ClassDef::fields()`'s `Option<u32>` (`.field [N] …`) and populates a
     /// `FieldLayout` row (§II.22.16) when present.
     pub fn add_field(&mut self, name: &str, signature_blob: u32, offset: Option<u32>) -> Token {
-        // §II.23.1.5 `FieldAttributes`: 0x1 = Public (fields need to be reachable from generated
-        // method bodies in other TypeDefs, mirroring the "default field accessibility is
-        // private" note `il_exporter` calls out for the MainModule-partition case — public is a
-        // safe superset here since this writer never emits cross-class private field coupling).
-        let flags: u16 = 0x1;
+        // §II.23.1.5 `FieldAttributes`: the low 3 bits are `FieldAccessMask`
+        // (CompilerControlled=0x0, Private=0x1, FamANDAssem=0x2, Assembly=0x3, Family=0x4,
+        // FamORAssem=0x5, **Public=0x6**) — NOT the `TypeAttributes::VisibilityMask` numbering
+        // (where `0x1` happens to mean Public) this constant was previously copy-pasted from.
+        // `0x1` here is actually `Private`, which a real CoreCLR JIT enforces at field-access
+        // time (unlike `ilasm`, which apparently never got exercised with cross-class field
+        // access in the differential suite) — surfaced as `FieldAccessException: Attempt by
+        // method '…' to access field '….x' failed` once fields started landing in their real
+        // owning `TypeDef` instead of accidentally aliasing the caller's own class (see the
+        // `FieldList`/`MethodList` run-pointer fix this same commit makes). Public (0x6) is a
+        // safe superset here since this writer never emits cross-class private field coupling.
+        let flags: u16 = 0x6;
         let name_off = self.strings.intern(name);
         self.field.push(FieldRow {
             flags,
@@ -583,8 +631,9 @@ impl MetadataBuilder {
         is_thread_static: bool,
         is_const: bool,
     ) -> Token {
-        // §II.23.1.5 `FieldAttributes`: 0x1 Public | 0x10 Static | 0x20 InitOnly (when `is_const`).
-        let mut flags: u16 = 0x1 | 0x10;
+        // §II.23.1.5 `FieldAttributes`: Public (0x6, see `add_field`'s doc for why not 0x1) |
+        // Static (0x10) | InitOnly (0x20, when `is_const`).
+        let mut flags: u16 = 0x6 | 0x10;
         if is_const {
             flags |= 0x20;
         }
@@ -629,10 +678,13 @@ impl MetadataBuilder {
         is_ctor: bool,
         pinvoke: Option<(&str, bool)>,
     ) -> Token {
-        // §II.23.1.10 `MethodAttributes`: 0x1 Public, 0x10 Static, 0x40 Virtual,
-        // 0x400 NewSlot (paired with Virtual so it doesn't try to override a base slot),
-        // 0x1000 SpecialName | 0x800 RTSpecialName (ctors only), 0x2000 PInvokeImpl.
-        let mut flags: u16 = 0x1; // public
+        // §II.23.1.10 `MethodAttributes`: the low 3 bits are `MemberAccessMask`, numbered
+        // identically to `FieldAttributes::FieldAccessMask` (see `add_field`'s doc) —
+        // CompilerControlled=0x0, Private=0x1, FamANDAssem=0x2, Assembly=0x3, Family=0x4,
+        // FamORAssem=0x5, **Public=0x6**. 0x10 Static, 0x40 Virtual, 0x400 NewSlot (paired with
+        // Virtual so it doesn't try to override a base slot), 0x1000 SpecialName | 0x800
+        // RTSpecialName (ctors only), 0x2000 PInvokeImpl.
+        let mut flags: u16 = 0x6; // public
         if is_static {
             flags |= 0x10;
         }
@@ -1661,6 +1713,35 @@ impl TypeDefOrRefResolver for MetadataBuilder {
 }
 
 impl MetadataBuilder {
+    /// Resolves `cref` to a token usable as a STANDALONE metadata reference — a `MemberRef`'s
+    /// `Class` parent (§II.22.25 `MemberRefParent`), or an instruction operand's declaring type
+    /// (`newobj`/`castclass`/…, via [`TokenSink::type_token`]). Unlike
+    /// [`TypeDefOrRefResolver::type_def_or_ref`] (used ONLY inside a signature blob, where
+    /// `sig::encode_class` wraps a generic instantiation's arguments in `GENERICINST` itself —
+    /// see that impl's doc), a bare `TypeDef`/`TypeRef` token naming just the OPEN generic shape
+    /// (`Dictionary\`2`, arguments erased) is not a valid concrete-type reference on its own: a
+    /// real CoreCLR rejects it with `TypeLoadException: Could not load type '…\`2' from assembly
+    /// '_'` (the runtime treats an uninstantiated open-generic operand as needing the CALLER's
+    /// own module to supply a matching TypeDef, since there is no instantiation to bind — this
+    /// was a real regression caught wiring `DIRECT_PE=1` into the linker, on `Dictionary<K,V>`
+    /// statics initialized from a `.cctor`). A generic `cref` must resolve to a `TypeSpec`
+    /// (§II.22.39) carrying the FULL `GENERICINST` blob instead — mirrors what `ilasm` builds
+    /// under the hood whenever `il_exporter`'s textual `class 'Name'<T,…>` appears as a
+    /// `newobj`/`MemberRef` operand.
+    fn class_ref_token(&mut self, asm: &mut Assembly, cref: Interned<ClassRef>) -> Token {
+        if asm[cref].generics().is_empty() {
+            let coded = self.type_def_or_ref(cref, asm);
+            decode_type_def_or_ref(coded)
+        } else {
+            let mut blob = Vec::new();
+            sig::encode_type(Type::ClassRef(cref), asm, self, &mut blob);
+            let off = self.blobs.intern(&blob);
+            self.type_spec(off)
+        }
+    }
+}
+
+impl MetadataBuilder {
     /// Finds a previously-added `TypeDef` row by its (already-shortened) name. Namespace is
     /// always emitted empty by this backend (mirrors `il_exporter`, which never splits a Rust
     /// mangled name into namespace+name — the full name goes in `Name` and `Namespace` stays
@@ -1795,19 +1876,24 @@ impl TokenSink for MetadataBuilder {
             // Not (yet) known as an in-assembly MethodDef row: resolve as a MemberRef against
             // its declaring ClassRef, mirroring `il_exporter`'s BCL-call rendering.
             let method_ref = asm[*method].clone();
-            let class_tok = {
-                let coded = self.type_def_or_ref(method_ref.class(), asm);
-                decode_type_def_or_ref(coded)
-            };
+            let class_tok = self.class_ref_token(asm, method_ref.class());
             let name = asm[method_ref.name()].to_string();
             let sig = method_ref.sig();
             let mut blob = Vec::new();
             let fnsig = asm[sig].clone();
-            let convention = match method_ref.kind() {
-                crate::ir::cilnode::MethodKind::Static => sig::SIG_DEFAULT,
-                _ => sig::SIG_HASTHIS,
+            let is_static = method_ref.kind() == crate::ir::cilnode::MethodKind::Static;
+            let convention = if is_static { sig::SIG_DEFAULT } else { sig::SIG_HASTHIS };
+            // Strip the implicit receiver (`this`) `fnsig.inputs()[0]` carries for every
+            // non-static kind before encoding — see `export_pe`'s Pass 3 (`export.rs`) doc
+            // comment on the identical fix for `MethodDef` signatures; a `MethodRef`'s stored
+            // `FnSig` carries the SAME "receiver at index 0" convention (mirrors `il_exporter`'s
+            // `&sig.inputs()[1..]` skip at its own `MethodRef` call-site rendering, mod.rs:796).
+            let encode_sig = if is_static {
+                fnsig
+            } else {
+                crate::ir::FnSig::new(fnsig.inputs()[1..].to_vec(), *fnsig.output())
             };
-            sig::encode_method_sig(convention, 0, &fnsig, asm, self, &mut blob);
+            sig::encode_method_sig(convention, 0, &encode_sig, asm, self, &mut blob);
             let sig_off = self.blobs.intern(&blob);
             self.member_ref(class_tok, &name, sig_off)
         };
@@ -1832,10 +1918,7 @@ impl TokenSink for MetadataBuilder {
                 return tok;
             }
         }
-        let class_tok = {
-            let coded = self.type_def_or_ref(desc.owner(), asm);
-            decode_type_def_or_ref(coded)
-        };
+        let class_tok = self.class_ref_token(asm, desc.owner());
         let name = asm[desc.name()].to_string();
         let mut blob = Vec::new();
         sig::encode_field_sig(desc.tpe(), asm, self, &mut blob);
@@ -1854,10 +1937,7 @@ impl TokenSink for MetadataBuilder {
                 return tok;
             }
         }
-        let class_tok = {
-            let coded = self.type_def_or_ref(desc.owner(), asm);
-            decode_type_def_or_ref(coded)
-        };
+        let class_tok = self.class_ref_token(asm, desc.owner());
         let name = asm[desc.name()].to_string();
         let mut blob = Vec::new();
         sig::encode_field_sig(desc.tpe(), asm, self, &mut blob);
@@ -1885,10 +1965,9 @@ impl TokenSink for MetadataBuilder {
 
     fn type_token(&mut self, asm: &mut Assembly, tpe: Type) -> Token {
         match tpe {
-            Type::ClassRef(cref) => {
-                let coded = self.type_def_or_ref(cref, asm);
-                decode_type_def_or_ref(coded)
-            }
+            // See `class_ref_token`'s doc: a generic `ClassRef` needs the `TypeSpec` treatment,
+            // not the bare open-shape `TypeDefOrRef` coded index.
+            Type::ClassRef(cref) => self.class_ref_token(asm, cref),
             other => {
                 let mut blob = Vec::new();
                 sig::encode_type(other, asm, self, &mut blob);
@@ -2692,9 +2771,10 @@ mod tests {
         assert_eq!(plain_flags & 0x20, 0, "non-const static must NOT have InitOnly set");
         assert_eq!(konst_flags & 0x20, 0x20, "const static must have InitOnly set");
         // Both still carry the ordinary Public|Static bits — `is_const` only adds InitOnly, it
-        // doesn't replace the base flag set.
-        assert_eq!(plain_flags & (0x1 | 0x10), 0x1 | 0x10);
-        assert_eq!(konst_flags & (0x1 | 0x10), 0x1 | 0x10);
+        // doesn't replace the base flag set. `FieldAttributes::Public` is 0x6 (FieldAccessMask,
+        // §II.23.1.5), not 0x1 (that's `Private` — see `add_field`'s doc for the bug this fixes).
+        assert_eq!(plain_flags & (0x6 | 0x10), 0x6 | 0x10);
+        assert_eq!(konst_flags & (0x6 | 0x10), 0x6 | 0x10);
         assert_eq!(mb.custom_attribute.len(), 0, "is_const must not add any CustomAttribute row");
     }
 
@@ -2736,6 +2816,53 @@ mod tests {
         assert_ne!(m, mr);
     }
 
+    /// Regression for `MissingMethodException: Method not found: 'Void
+    /// Dictionary\`2..ctor(Dictionary\`2<Int32,IntPtr>)'` caught wiring `DIRECT_PE=1` into the
+    /// linker: a `MethodRef`'s stored `FnSig` carries the IMPLICIT receiver (`this`) at
+    /// `inputs()[0]` for every non-static kind (mirrors `MethodDef`'s identical convention,
+    /// `il_exporter`'s oracle skip at mod.rs:436/796/1068/1337). `TokenSink::method_token`
+    /// resolving an out-of-assembly instance/virtual/ctor `MethodRef` as a `MemberRef` must strip
+    /// that receiver before encoding the `MemberRefSig` blob — a `HASTHIS` signature (§II.23.2.1)
+    /// already encodes the receiver implicitly via the calling-convention byte; writing it out
+    /// AGAIN as parameter #0 doubles it, corrupting the argument list for every real argument
+    /// after it (here: a parameterless generic `.ctor()` came out looking like it took ONE
+    /// argument typed as the class itself).
+    #[test]
+    fn instance_member_ref_signature_excludes_the_implicit_receiver() {
+        let mut mb = MetadataBuilder::new();
+        let mut asm = Assembly::default();
+
+        // An out-of-assembly instance method `Foo::Bar(int32) -> bool`: `FnSig::inputs()` is
+        // `[Foo (the receiver), int32]` per the "receiver at index 0" convention, matching how
+        // the codegen backend actually builds a `MethodRef`'s stored signature.
+        let owner_name = asm.alloc_string("Foo");
+        let owner = asm.alloc_class_ref(ClassRef::new(owner_name, None, false, [].into()));
+        let method_name = asm.alloc_string("Bar");
+        let fn_sig = asm.sig([Type::ClassRef(owner), Type::Int(crate::ir::Int::I32)], Type::Bool);
+        let mref = asm.alloc_methodref(crate::ir::MethodRef::new(
+            owner,
+            method_name,
+            fn_sig,
+            crate::ir::cilnode::MethodKind::Instance,
+            vec![].into(),
+        ));
+
+        let tok = TokenSink::method_token(&mut mb, &mut asm, MethodDefIdx::from_raw(mref), &[]);
+        assert_eq!(tok.table(), Token::TABLE_MEMBER_REF);
+        let sig_off = mb.member_ref[(tok.rid() - 1) as usize].signature;
+        let blob = &mb.blobs.as_bytes()[sig_off as usize..];
+        // `SIG_HASTHIS`, param-count-prefix (1, NOT 2 — the receiver must not be counted),
+        // return type ET_BOOLEAN, then the ONE real parameter ET_I4. `blob[0]` (`SIG_HASTHIS`)
+        // has a length prefix from blob interning ahead of it in `#Blob` — read via the marker
+        // bytes directly instead of assuming a fixed offset.
+        assert_eq!(blob[1], sig::SIG_HASTHIS, "calling convention byte");
+        assert_eq!(blob[2], 1, "param count must be 1 (the receiver is NOT counted)");
+        const ET_BOOLEAN: u8 = 0x02;
+        const ET_I4: u8 = 0x08;
+        assert_eq!(blob[3], ET_BOOLEAN, "return type");
+        assert_eq!(blob[4], ET_I4, "the ONE real parameter, not the receiver's own ClassRef type");
+    }
+
     #[test]
     fn type_ref_interning_dedupes_identical_requests() {
         let mut mb = MetadataBuilder::new();
@@ -2774,6 +2901,70 @@ mod tests {
         assert_eq!(mb.class_layout[0].parent, t.rid());
         assert_eq!(mb.class_layout[0].packing_size, 4);
         assert_eq!(mb.class_layout[0].class_size, 16);
+    }
+
+    /// Regression for a `dotnet` load-time misattribution caught wiring `DIRECT_PE=1` into the
+    /// linker: a caller that creates every `TypeDef` row UP FRONT (needed so a field's type can
+    /// forward-reference a class def appearing later in iteration order — `export_pe`'s Pass 1)
+    /// leaves every row's `FieldList`/`MethodList` (§II.22.37 run-start columns) stamped `1`,
+    /// since `add_type_def` captures "one past the current end of field/method rows" AT ITS OWN
+    /// CALL, before any field/method exists. Left unpatched, EVERY class's fields/methods read
+    /// back as belonging to the FIRST class in the table (`dotnet` doesn't error — it silently
+    /// resolves cross-class field/method references to whichever TypeDef the stale run actually
+    /// covers, surfacing downstream as `TypeLoadException`/`FieldAccessException` far from the
+    /// real cause). `set_type_def_field_list`/`set_type_def_method_list` re-stamp the correct
+    /// run-start once a class's own rows are about to be appended; this test builds two classes
+    /// with disjoint field/method sets and checks each `TypeDef`'s run genuinely covers only ITS
+    /// OWN rows, not a `1..1` no-op or the other class's range.
+    #[test]
+    fn set_type_def_field_and_method_list_patches_the_run_start_not_left_at_the_placeholder() {
+        let mut mb = MetadataBuilder::new();
+
+        // Two `TypeDef`s created up front (mirrors `export_pe`'s Pass 1) — at this point BOTH
+        // rows have the placeholder `field_list == method_list == 1`.
+        let a = mb.add_type_def("", "A", false, None, None, None, &[]);
+        let b = mb.add_type_def("", "B", false, None, None, None, &[]);
+        assert_eq!(mb.type_def[(a.rid() - 1) as usize].field_list, 1);
+        assert_eq!(mb.type_def[(b.rid() - 1) as usize].field_list, 1);
+        assert_eq!(mb.type_def[(a.rid() - 1) as usize].method_list, 1);
+        assert_eq!(mb.type_def[(b.rid() - 1) as usize].method_list, 1);
+
+        // Populate `A`'s fields (2) then `B`'s fields (1), re-stamping immediately before each,
+        // exactly as `export_pe`'s Pass 2 does.
+        let field_sig = mb.field_sig_for_valuetype_token(a); // any resolvable signature blob.
+        mb.set_type_def_field_list(a);
+        mb.add_field("a0", field_sig, None);
+        mb.add_field("a1", field_sig, None);
+        mb.set_type_def_field_list(b);
+        mb.add_field("b0", field_sig, None);
+
+        let a_row = &mb.type_def[(a.rid() - 1) as usize];
+        let b_row = &mb.type_def[(b.rid() - 1) as usize];
+        assert_eq!(a_row.field_list, 1, "A's fields start at row 1 (a0)");
+        assert_eq!(b_row.field_list, 3, "B's fields start at row 3 (b0), AFTER A's 2 fields");
+        assert_eq!(mb.field.len(), 3, "3 field rows total: a0, a1, b0");
+        assert_eq!(&mb.strings.as_bytes()[mb.field[0].name as usize..][..2], b"a0");
+        assert_eq!(&mb.strings.as_bytes()[mb.field[2].name as usize..][..2], b"b0");
+
+        // Same shape for methods: `B` gets 2 methods, `A` gets 0 — checks a ZERO-method class
+        // still gets a correct (empty) run for its neighbor's sake.
+        let method_sig = {
+            let mut blob = Vec::new();
+            blob.push(sig::SIG_DEFAULT);
+            blob.push(0); // 0 params
+            blob.push(0x01); // ET_VOID return
+            mb.blobs.intern(&blob)
+        };
+        mb.set_type_def_method_list(a);
+        mb.set_type_def_method_list(b);
+        mb.add_method("b_m0", method_sig, &[], true, false, false, None);
+        mb.add_method("b_m1", method_sig, &[], true, false, false, None);
+
+        let a_row = &mb.type_def[(a.rid() - 1) as usize];
+        let b_row = &mb.type_def[(b.rid() - 1) as usize];
+        assert_eq!(a_row.method_list, 1, "A owns zero methods: its run starts where B's begins");
+        assert_eq!(b_row.method_list, 1, "B's methods start at row 1 (b_m0)");
+        assert_eq!(mb.method_def.len(), 2);
     }
 
     /// `add_blob_sized_valuetype` — the `__rcl_const_blob_{n}` carrier type a const-data
@@ -2910,6 +3101,41 @@ mod tests {
         let tok = decode_type_def_or_ref(coded);
         assert_eq!(tok.table(), Token::TABLE_TYPE_REF);
         assert_eq!(mb.type_ref.len(), 1);
+    }
+
+    /// Regression for `TypeLoadException: Could not load type '…\`2' from assembly '_'` caught
+    /// wiring `DIRECT_PE=1` into the linker: `TokenSink::type_token`/`method_token`/`field_token`
+    /// must NOT use `TypeDefOrRefResolver::type_def_or_ref`'s bare open-shape token for a generic
+    /// declaring type — that's only valid INSIDE a signature blob (see that impl's doc). A
+    /// `newobj`/`call`/`ldfld`/`castclass` OPERAND naming a closed generic instantiation (e.g.
+    /// `Dictionary<int32,object>::.ctor()`) needs a `TypeSpec` (§II.22.39) carrying the full
+    /// `GENERICINST` blob — `class_ref_token` (the shared helper both paths route through) is
+    /// what makes that split. A non-generic `ClassRef` must still resolve to the plain
+    /// `TypeDef`/`TypeRef` (no spurious `TypeSpec` row for the common case).
+    #[test]
+    fn generic_declaring_type_resolves_to_a_type_spec_not_the_bare_open_type_ref() {
+        let mut mb = MetadataBuilder::new();
+        let mut asm = Assembly::default();
+
+        // `Span<u8>` (a generic external BCL type, arity 1) as an instruction operand's type —
+        // e.g. what `box`/`castclass`/`newobj` on it would need.
+        let generic = ClassRef::span(&mut asm, Type::Int(Int::U8));
+        let tok = TokenSink::type_token(&mut mb, &mut asm, Type::ClassRef(generic));
+        assert_eq!(
+            tok.table(),
+            Token::TABLE_TYPE_SPEC,
+            "a generic declaring type used as an operand must resolve to a TypeSpec"
+        );
+        assert_eq!(mb.type_spec.len(), 1);
+        // The open TypeRef (`Span\`1`) still gets created too — the TypeSpec's blob references it
+        // via the ordinary `type_def_or_ref` coded index inside `GENERICINST`.
+        assert_eq!(mb.type_ref.len(), 1);
+
+        // A non-generic ClassRef must NOT get the TypeSpec treatment — plain TypeRef, no new row.
+        let plain = ClassRef::console(&mut asm);
+        let plain_tok = TokenSink::type_token(&mut mb, &mut asm, Type::ClassRef(plain));
+        assert_eq!(plain_tok.table(), Token::TABLE_TYPE_REF);
+        assert_eq!(mb.type_spec.len(), 1, "a non-generic ClassRef must not add a TypeSpec row");
     }
 
     #[test]
