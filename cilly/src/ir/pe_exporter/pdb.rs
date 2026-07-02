@@ -87,16 +87,19 @@
 //! next to a PDB this module wrote, and check the managed trace still resolves
 //! `cd_pdb/src/main.rs:<line>` — i.e. swap only the producer, keep the same consumer-side check.
 //!
-//! # This module's scope (interface-pinning only)
+//! # This module's scope
 //!
-//! Everything below is a **compiling stub**: types and function signatures the real
-//! sequence-point collection (`body.rs`), metadata population (`tables.rs`-style
-//! populate/size/serialize), and debug-directory PE wiring (`pe.rs`) will be built against, so
-//! those three call sites can be implemented independently without re-deciding the shapes that
-//! cross module boundaries. No portable-PDB bytes are actually assembled yet
-//! ([`PdbBuilder::build`] is a documented `todo!()`).
+//! This module serializes standalone Portable PDB bytes for collected method sequence points:
+//! the `#Pdb` stream, PDB-only `#~` tables (`Document` and `MethodDebugInformation`), and the
+//! independent debug heaps. Sequence-point collection in `body.rs` and PE Debug Directory wiring
+//! in `pe.rs` remain separate follow-up integration points; the writer here is metadata-only and
+//! does not change emitted IL or execution semantics.
 
-use super::tables::Token;
+use super::{
+    heaps::{BlobHeap, GuidHeap, StringsHeap, UserStringHeap, write_compressed_u32},
+    tables::Token,
+};
+use std::collections::{BTreeMap, HashMap};
 
 /// One sequence point (dotnet/runtime `PortablePdb-Metadata.md` §"Sequence Points Blob"): maps an
 /// IL byte offset within a method body to a source location, or marks the offset as a *hidden*
@@ -231,16 +234,484 @@ impl PdbBuilder {
     /// doc and `docs/PE_EMISSION_PLAN.md`'s "FORMAT SPEC" section).
     ///
     /// # Panics
-    /// Always, for now — Phase 2's actual heap/table serialization is not implemented by this
-    /// interface-pinning stub.
+    /// Panics if a local signature token is not a `StandAloneSig`, if sequence-point coordinates
+    /// violate the Portable PDB ranges/order constraints, or if duplicate/invalid type-system row
+    /// counts are supplied.
     #[must_use]
     pub fn build(self) -> (Vec<u8>, PdbId) {
-        todo!(
-            "Phase 2: serialize the #Pdb stream + Document/MethodDebugInformation tables \
-             (dotnet/runtime PortablePdb-Metadata.md); this stub only pins the call shape \
-             pe.rs's debug-directory hook and body.rs's sequence-point collector build against."
-        )
+        let mut documents = Vec::new();
+        let mut document_ids = HashMap::new();
+        for method in self.methods.iter().flatten() {
+            for point in &method.points {
+                intern_document_id(&mut documents, &mut document_ids, &point.document_path);
+            }
+        }
+
+        let strings = StringsHeap::default();
+        let mut blobs = BlobHeap::default();
+        let guids = GuidHeap::default();
+        let user_strings = UserStringHeap::default();
+
+        let document_rows: Vec<DocumentRow> = documents
+            .iter()
+            .map(|path| DocumentRow {
+                name: encode_document_name(&mut blobs, path),
+                // PortablePdb-Metadata.md defines C#, VB, and F# language GUIDs, but no Rust GUID.
+                // Emit nil Language/HashAlgorithm and an empty Hash so readers treat the values as
+                // intentionally unspecified instead of falsely identifying the source language.
+                hash_algorithm: 0,
+                hash: 0,
+                language: 0,
+            })
+            .collect();
+
+        let method_rows: Vec<MethodDebugInformationRow> = self
+            .methods
+            .into_iter()
+            .map(|method| {
+                let Some(method) = method else {
+                    return MethodDebugInformationRow::default();
+                };
+                if method.points.is_empty() {
+                    return MethodDebugInformationRow::default();
+                }
+                let document = single_document_id(&method.points, &document_ids).unwrap_or(0);
+                let sequence_points = encode_sequence_points(&method, &document_ids, document);
+                MethodDebugInformationRow {
+                    document,
+                    sequence_points: blobs.intern(&sequence_points),
+                }
+            })
+            .collect();
+
+        let widths =
+            PdbWidths::compute(&strings, &blobs, &guids, &user_strings, document_rows.len());
+        let tables_stream = pad4(&serialize_tables(&document_rows, &method_rows, &widths));
+        let strings_stream = pad4(strings.as_bytes());
+        let user_strings_stream = pad4(user_strings.as_bytes());
+        let guid_stream = pad4(guids.as_bytes());
+        let blob_stream = pad4(blobs.as_bytes());
+
+        let pdb_stream = pad4(&serialize_pdb_stream([0u8; 20], &self.type_system));
+        let (mut bytes, pdb_id_offset) = serialize_standalone_pdb(
+            &pdb_stream,
+            &tables_stream,
+            &strings_stream,
+            &user_strings_stream,
+            &guid_stream,
+            &blob_stream,
+        );
+        let id = deterministic_pdb_id(&bytes);
+        bytes[pdb_id_offset..pdb_id_offset + 20].copy_from_slice(&id);
+        (bytes, id)
     }
+}
+
+const TABLE_DOCUMENT: u32 = 0x30;
+const TABLE_METHOD_DEBUG_INFORMATION: u32 = 0x31;
+const HIDDEN_LINE: u32 = 0x00FE_EFEE;
+
+#[derive(Debug, Clone)]
+struct DocumentRow {
+    name: u32,
+    hash_algorithm: u32,
+    hash: u32,
+    language: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MethodDebugInformationRow {
+    document: u32,
+    sequence_points: u32,
+}
+
+struct PdbWidths {
+    heap_sizes: u8,
+    blob_wide: bool,
+    guid_wide: bool,
+    document_wide: bool,
+}
+
+impl PdbWidths {
+    fn compute(
+        strings: &StringsHeap,
+        blobs: &BlobHeap,
+        guids: &GuidHeap,
+        user_strings: &UserStringHeap,
+        document_rows: usize,
+    ) -> Self {
+        let mut heap_sizes = 0u8;
+        if strings.as_bytes().len() > 0xFFFF {
+            heap_sizes |= 0x1;
+        }
+        if guids.as_bytes().len() > 0xFFFF {
+            heap_sizes |= 0x2;
+        }
+        if blobs.as_bytes().len() > 0xFFFF {
+            heap_sizes |= 0x4;
+        }
+        let _us_wide = user_strings.as_bytes().len() > 0xFFFF;
+        Self {
+            heap_sizes,
+            blob_wide: blobs.as_bytes().len() > 0xFFFF,
+            guid_wide: guids.as_bytes().len() > 0xFFFF,
+            document_wide: document_rows > 0xFFFF,
+        }
+    }
+}
+
+fn intern_document_id(
+    documents: &mut Vec<String>,
+    ids: &mut HashMap<String, u32>,
+    path: &str,
+) -> u32 {
+    if let Some(&rid) = ids.get(path) {
+        return rid;
+    }
+    let rid = u32::try_from(documents.len() + 1).expect("Document table exceeded u32 rows");
+    documents.push(path.to_string());
+    ids.insert(path.to_string(), rid);
+    rid
+}
+
+fn encode_document_name(blobs: &mut BlobHeap, path: &str) -> u32 {
+    let part = if path.is_empty() {
+        0
+    } else {
+        blobs.intern(path.as_bytes())
+    };
+    let mut name = Vec::new();
+    // Separator 0 means "empty separator". A single UTF-8 part therefore round-trips every path
+    // byte-for-byte without imposing a platform separator choice on mixed `/` and `\` inputs.
+    name.push(0);
+    write_compressed_u32(&mut name, part);
+    blobs.intern(&name)
+}
+
+fn single_document_id(points: &[SequencePoint], documents: &HashMap<String, u32>) -> Option<u32> {
+    let mut id = None;
+    for point in points {
+        let point_id = documents[&point.document_path];
+        if id.is_some_and(|seen| seen != point_id) {
+            return None;
+        }
+        id = Some(point_id);
+    }
+    id
+}
+
+fn encode_sequence_points(
+    method: &MethodSequencePoints,
+    documents: &HashMap<String, u32>,
+    method_document: u32,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let local_signature = match method.local_signature {
+        Some(token) => {
+            assert_eq!(
+                token.table(),
+                Token::TABLE_STAND_ALONE_SIG,
+                "sequence-point LocalSignature must be a StandAloneSig token"
+            );
+            token.rid()
+        }
+        None => 0,
+    };
+    write_compressed_u32(&mut out, local_signature);
+
+    let first_document = documents[&method.points[0].document_path];
+    let mut current_document = if method_document == 0 {
+        write_compressed_u32(&mut out, first_document);
+        first_document
+    } else {
+        method_document
+    };
+
+    let mut previous_il_offset = None;
+    let mut previous_non_hidden = None;
+    for point in &method.points {
+        let point_document = documents[&point.document_path];
+        if previous_il_offset.is_some() && point_document != current_document {
+            write_compressed_u32(&mut out, 0);
+            write_compressed_u32(&mut out, point_document);
+            current_document = point_document;
+        }
+        encode_sequence_point_record(
+            &mut out,
+            point,
+            &mut previous_il_offset,
+            &mut previous_non_hidden,
+        );
+    }
+    out
+}
+
+fn encode_sequence_point_record(
+    out: &mut Vec<u8>,
+    point: &SequencePoint,
+    previous_il_offset: &mut Option<u32>,
+    previous_non_hidden: &mut Option<(u32, u32)>,
+) {
+    assert!(
+        point.il_offset < 0x2000_0000,
+        "sequence-point IL offset out of Portable PDB range: {}",
+        point.il_offset
+    );
+    let il_delta = match *previous_il_offset {
+        Some(previous) => {
+            assert!(
+                point.il_offset > previous,
+                "sequence-point IL offsets must be strictly increasing: {} after {}",
+                point.il_offset,
+                previous
+            );
+            point.il_offset - previous
+        }
+        None => point.il_offset,
+    };
+    write_compressed_u32(out, il_delta);
+    *previous_il_offset = Some(point.il_offset);
+
+    if point.is_hidden {
+        write_compressed_u32(out, 0);
+        write_compressed_u32(out, 0);
+        return;
+    }
+
+    validate_visible_sequence_point(point);
+
+    let delta_lines = point.end_line - point.line;
+    write_compressed_u32(out, delta_lines);
+    if delta_lines == 0 {
+        write_compressed_u32(out, point.end_col - point.col);
+    } else {
+        write_compressed_i32(out, point.end_col as i32 - point.col as i32);
+    }
+
+    match *previous_non_hidden {
+        Some((previous_line, previous_col)) => {
+            write_compressed_i32(out, point.line as i32 - previous_line as i32);
+            write_compressed_i32(out, point.col as i32 - previous_col as i32);
+        }
+        None => {
+            write_compressed_u32(out, point.line);
+            write_compressed_u32(out, point.col);
+        }
+    }
+    *previous_non_hidden = Some((point.line, point.col));
+}
+
+fn validate_visible_sequence_point(point: &SequencePoint) {
+    assert!(
+        point.line < 0x2000_0000 && point.end_line < 0x2000_0000,
+        "sequence-point lines out of Portable PDB range: {}..{}",
+        point.line,
+        point.end_line
+    );
+    assert!(
+        point.line != HIDDEN_LINE && point.end_line != HIDDEN_LINE,
+        "visible sequence point uses the Portable PDB hidden line marker"
+    );
+    assert!(
+        point.col < 0x1_0000 && point.end_col < 0x1_0000,
+        "sequence-point columns out of Portable PDB range: {}..{}",
+        point.col,
+        point.end_col
+    );
+    assert!(
+        point.end_line >= point.line,
+        "sequence-point end line precedes start line: {} < {}",
+        point.end_line,
+        point.line
+    );
+    if point.end_line == point.line {
+        assert!(
+            point.end_col > point.col,
+            "same-line sequence point must have end column greater than start column"
+        );
+    }
+}
+
+fn write_compressed_i32(out: &mut Vec<u8>, value: i32) {
+    assert!(
+        (-(1 << 28)..=(1 << 28) - 1).contains(&value),
+        "signed compressed integer out of range: {value}"
+    );
+    let sign = u32::from(value < 0);
+    if (-64..=63).contains(&value) {
+        let encoded = (((value as u32) & 0x3F) << 1) | sign;
+        out.push(encoded as u8);
+    } else if (-8192..=8191).contains(&value) {
+        let encoded = (((value as u32) & 0x1FFF) << 1) | sign;
+        out.extend_from_slice(&[(0x80 | (encoded >> 8)) as u8, encoded as u8]);
+    } else {
+        let encoded = (((value as u32) & 0x0FFF_FFFF) << 1) | sign;
+        out.extend_from_slice(&[
+            (0xC0 | (encoded >> 24)) as u8,
+            (encoded >> 16) as u8,
+            (encoded >> 8) as u8,
+            encoded as u8,
+        ]);
+    }
+}
+
+fn serialize_pdb_stream(id: PdbId, type_system: &TypeSystemRowCounts) -> Vec<u8> {
+    let rows = normalized_type_system_rows(type_system);
+    let mut mask = 0u64;
+    for &(table, _) in &rows {
+        assert!(
+            table < 64,
+            "type-system table id {table:#x} does not fit the #Pdb mask"
+        );
+        mask |= 1u64 << table;
+    }
+
+    let mut out = Vec::with_capacity(32 + rows.len() * 4);
+    out.extend_from_slice(&id);
+    out.extend_from_slice(&type_system.entry_point_token.to_le_bytes());
+    out.extend_from_slice(&mask.to_le_bytes());
+    for &(_, count) in &rows {
+        out.extend_from_slice(&count.to_le_bytes());
+    }
+    out
+}
+
+fn normalized_type_system_rows(type_system: &TypeSystemRowCounts) -> Vec<(u32, u32)> {
+    let mut rows = BTreeMap::new();
+    for &(table, count) in &type_system.rows {
+        if count == 0 {
+            continue;
+        }
+        assert!(
+            rows.insert(table, count).is_none(),
+            "duplicate type-system row count for table {table:#x}"
+        );
+    }
+    rows.into_iter().collect()
+}
+
+fn serialize_tables(
+    documents: &[DocumentRow],
+    methods: &[MethodDebugInformationRow],
+    widths: &PdbWidths,
+) -> Vec<u8> {
+    let mut valid = 0u64;
+    if !documents.is_empty() {
+        valid |= 1u64 << TABLE_DOCUMENT;
+    }
+    if !methods.is_empty() {
+        valid |= 1u64 << TABLE_METHOD_DEBUG_INFORMATION;
+    }
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.push(2);
+    out.push(0);
+    out.push(widths.heap_sizes);
+    out.push(1);
+    out.extend_from_slice(&valid.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes());
+    for table in 0..64u32 {
+        if valid & (1u64 << table) != 0 {
+            let count = match table {
+                TABLE_DOCUMENT => documents.len(),
+                TABLE_METHOD_DEBUG_INFORMATION => methods.len(),
+                _ => unreachable!(),
+            };
+            out.extend_from_slice(&(count as u32).to_le_bytes());
+        }
+    }
+
+    for row in documents {
+        write_heap_idx(&mut out, row.name, widths.blob_wide);
+        write_heap_idx(&mut out, row.hash_algorithm, widths.guid_wide);
+        write_heap_idx(&mut out, row.hash, widths.blob_wide);
+        write_heap_idx(&mut out, row.language, widths.guid_wide);
+    }
+    for row in methods {
+        write_heap_idx(&mut out, row.document, widths.document_wide);
+        write_heap_idx(&mut out, row.sequence_points, widths.blob_wide);
+    }
+    out
+}
+
+fn write_heap_idx(out: &mut Vec<u8>, value: u32, wide: bool) {
+    if wide {
+        out.extend_from_slice(&value.to_le_bytes());
+    } else {
+        out.extend_from_slice(&(value as u16).to_le_bytes());
+    }
+}
+
+fn serialize_standalone_pdb(
+    pdb_stream: &[u8],
+    tables_stream: &[u8],
+    strings_stream: &[u8],
+    user_strings_stream: &[u8],
+    guid_stream: &[u8],
+    blob_stream: &[u8],
+) -> (Vec<u8>, usize) {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"BSJB");
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+
+    const VERSION: &str = "v4.0.30319";
+    let mut version_bytes = VERSION.as_bytes().to_vec();
+    version_bytes.push(0);
+    while version_bytes.len() % 4 != 0 {
+        version_bytes.push(0);
+    }
+    out.extend_from_slice(&(version_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&version_bytes);
+
+    let streams = [
+        ("#Pdb", pdb_stream),
+        ("#~", tables_stream),
+        ("#Strings", strings_stream),
+        ("#US", user_strings_stream),
+        ("#GUID", guid_stream),
+        ("#Blob", blob_stream),
+    ];
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&(streams.len() as u16).to_le_bytes());
+
+    let header_names: Vec<Vec<u8>> = streams
+        .iter()
+        .map(|(name, _)| {
+            let mut bytes = name.as_bytes().to_vec();
+            bytes.push(0);
+            while bytes.len() % 4 != 0 {
+                bytes.push(0);
+            }
+            bytes
+        })
+        .collect();
+    let header_total_len: usize = header_names.iter().map(|name| 8 + name.len()).sum();
+    let mut running = out.len() + header_total_len;
+    let mut pdb_id_offset = None;
+    for ((name, bytes), name_bytes) in streams.iter().zip(&header_names) {
+        if *name == "#Pdb" {
+            pdb_id_offset = Some(running);
+        }
+        out.extend_from_slice(&(running as u32).to_le_bytes());
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(name_bytes);
+        running += bytes.len();
+    }
+    for (_, bytes) in &streams {
+        out.extend_from_slice(bytes);
+    }
+    (out, pdb_id_offset.expect("#Pdb stream is always present"))
+}
+
+fn pad4(bytes: &[u8]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+    out
 }
 
 /// The 20-byte Portable PDB content identifier (`PortablePdb-Metadata.md`'s "PDB Stream" `Id`
@@ -330,6 +801,439 @@ impl DebugDirectoryEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    #[derive(Debug)]
+    struct TestPdbReader<'a> {
+        bytes: &'a [u8],
+        streams: HashMap<String, (usize, usize)>,
+    }
+
+    #[derive(Debug)]
+    struct TestTablesHeader {
+        heap_sizes: u8,
+        valid: u64,
+        counts: Vec<(u32, usize)>,
+        row_data_offset: usize,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestMethodDebugInformationRow {
+        document: u32,
+        sequence_points: u32,
+    }
+
+    impl<'a> TestPdbReader<'a> {
+        fn parse(bytes: &'a [u8]) -> Self {
+            assert_eq!(&bytes[0..4], b"BSJB");
+            assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 1);
+            assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 1);
+            let version_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+            let version = &bytes[16..16 + version_len];
+            let nul = version.iter().position(|&b| b == 0).unwrap();
+            assert_eq!(&version[..nul], b"v4.0.30319");
+
+            let mut cursor = 16 + version_len;
+            assert_eq!(
+                u16::from_le_bytes(bytes[cursor..cursor + 2].try_into().unwrap()),
+                0
+            );
+            cursor += 2;
+            let stream_count = u16::from_le_bytes(bytes[cursor..cursor + 2].try_into().unwrap());
+            cursor += 2;
+
+            let mut streams = HashMap::new();
+            for _ in 0..stream_count {
+                let offset =
+                    u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+                let size =
+                    u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+                cursor += 8;
+                let name_start = cursor;
+                let name_end =
+                    bytes[name_start..].iter().position(|&b| b == 0).unwrap() + name_start;
+                let name = std::str::from_utf8(&bytes[name_start..name_end])
+                    .unwrap()
+                    .to_string();
+                let mut name_len = name_end - name_start + 1;
+                while name_len % 4 != 0 {
+                    name_len += 1;
+                }
+                cursor = name_start + name_len;
+                assert_eq!(offset % 4, 0, "stream {name} offset must be 4-byte aligned");
+                assert_eq!(size % 4, 0, "stream {name} size must be padded to 4 bytes");
+                streams.insert(name, (offset, size));
+            }
+            Self { bytes, streams }
+        }
+
+        fn stream(&self, name: &str) -> &'a [u8] {
+            let (offset, size) = self.streams[name];
+            &self.bytes[offset..offset + size]
+        }
+
+        fn stream_offset(&self, name: &str) -> usize {
+            self.streams[name].0
+        }
+
+        fn pdb_id(&self) -> PdbId {
+            self.stream("#Pdb")[0..20].try_into().unwrap()
+        }
+
+        fn pdb_stream_rows(&self) -> (u32, Vec<(u32, u32)>) {
+            let pdb = self.stream("#Pdb");
+            let entry_point = u32::from_le_bytes(pdb[20..24].try_into().unwrap());
+            let mask = u64::from_le_bytes(pdb[24..32].try_into().unwrap());
+            let mut cursor = 32;
+            let mut rows = Vec::new();
+            for table in 0..64u32 {
+                if mask & (1u64 << table) != 0 {
+                    let count = u32::from_le_bytes(pdb[cursor..cursor + 4].try_into().unwrap());
+                    rows.push((table, count));
+                    cursor += 4;
+                }
+            }
+            (entry_point, rows)
+        }
+
+        fn tables_header(&self) -> TestTablesHeader {
+            let tables = self.stream("#~");
+            assert_eq!(u32::from_le_bytes(tables[0..4].try_into().unwrap()), 0);
+            assert_eq!(tables[4], 2);
+            assert_eq!(tables[5], 0);
+            assert_eq!(tables[7], 1);
+            let heap_sizes = tables[6];
+            let valid = u64::from_le_bytes(tables[8..16].try_into().unwrap());
+            let mut cursor = 24;
+            let mut counts = Vec::new();
+            for table in 0..64u32 {
+                if valid & (1u64 << table) != 0 {
+                    let count =
+                        u32::from_le_bytes(tables[cursor..cursor + 4].try_into().unwrap()) as usize;
+                    counts.push((table, count));
+                    cursor += 4;
+                }
+            }
+            TestTablesHeader {
+                heap_sizes,
+                valid,
+                counts,
+                row_data_offset: cursor,
+            }
+        }
+
+        fn table_row_count(header: &TestTablesHeader, table: u32) -> usize {
+            header
+                .counts
+                .iter()
+                .find(|&&(id, _)| id == table)
+                .map_or(0, |&(_, count)| count)
+        }
+
+        fn row_width(table: u32, header: &TestTablesHeader) -> usize {
+            let index = |wide| if wide { 4 } else { 2 };
+            let blob = index(header.heap_sizes & 0x4 != 0);
+            let guid = index(header.heap_sizes & 0x2 != 0);
+            match table {
+                TABLE_DOCUMENT => blob + guid + blob + guid,
+                TABLE_METHOD_DEBUG_INFORMATION => {
+                    let doc_rows = Self::table_row_count(header, TABLE_DOCUMENT);
+                    index(doc_rows > 0xFFFF) + blob
+                }
+                other => panic!("unexpected test PDB table {other:#x}"),
+            }
+        }
+
+        fn table_offset(&self, table: u32, header: &TestTablesHeader) -> usize {
+            let mut offset = 0;
+            for &(id, count) in &header.counts {
+                if id == table {
+                    return offset;
+                }
+                offset += count * Self::row_width(id, header);
+            }
+            panic!("table {table:#x} is not present");
+        }
+
+        fn read_index(bytes: &[u8], cursor: &mut usize, wide: bool) -> u32 {
+            if wide {
+                let value = u32::from_le_bytes(bytes[*cursor..*cursor + 4].try_into().unwrap());
+                *cursor += 4;
+                value
+            } else {
+                let value = u16::from_le_bytes(bytes[*cursor..*cursor + 2].try_into().unwrap());
+                *cursor += 2;
+                u32::from(value)
+            }
+        }
+
+        fn blob_at(&self, offset: u32) -> &'a [u8] {
+            assert_ne!(offset, 0, "offset 0 is the nil/empty blob");
+            let blob = self.stream("#Blob");
+            let mut cursor = offset as usize;
+            let len = read_compressed_u32_from(blob, &mut cursor) as usize;
+            &blob[cursor..cursor + len]
+        }
+
+        fn documents(&self) -> Vec<String> {
+            let header = self.tables_header();
+            let count = Self::table_row_count(&header, TABLE_DOCUMENT);
+            let mut cursor = header.row_data_offset + self.table_offset(TABLE_DOCUMENT, &header);
+            let tables = self.stream("#~");
+            let blob_wide = header.heap_sizes & 0x4 != 0;
+            let guid_wide = header.heap_sizes & 0x2 != 0;
+            let mut docs = Vec::new();
+            for _ in 0..count {
+                let name = Self::read_index(tables, &mut cursor, blob_wide);
+                let _hash_algorithm = Self::read_index(tables, &mut cursor, guid_wide);
+                let _hash = Self::read_index(tables, &mut cursor, blob_wide);
+                let _language = Self::read_index(tables, &mut cursor, guid_wide);
+                docs.push(self.document_name(name));
+            }
+            docs
+        }
+
+        fn document_name(&self, name_offset: u32) -> String {
+            let name = self.blob_at(name_offset);
+            let mut cursor = 0;
+            let separator = match name[0] {
+                0 => {
+                    cursor += 1;
+                    String::new()
+                }
+                _ => {
+                    let text = std::str::from_utf8(name).unwrap();
+                    let ch = text.chars().next().unwrap();
+                    cursor += ch.len_utf8();
+                    ch.to_string()
+                }
+            };
+            let mut parts = Vec::new();
+            while cursor < name.len() {
+                let part_offset = read_compressed_u32_from(name, &mut cursor);
+                if part_offset == 0 {
+                    parts.push(String::new());
+                } else {
+                    parts.push(
+                        std::str::from_utf8(self.blob_at(part_offset))
+                            .unwrap()
+                            .to_string(),
+                    );
+                }
+            }
+            parts.join(&separator)
+        }
+
+        fn method_rows(&self) -> Vec<TestMethodDebugInformationRow> {
+            let header = self.tables_header();
+            let count = Self::table_row_count(&header, TABLE_METHOD_DEBUG_INFORMATION);
+            let mut cursor =
+                header.row_data_offset + self.table_offset(TABLE_METHOD_DEBUG_INFORMATION, &header);
+            let tables = self.stream("#~");
+            let document_wide = Self::table_row_count(&header, TABLE_DOCUMENT) > 0xFFFF;
+            let blob_wide = header.heap_sizes & 0x4 != 0;
+            let mut rows = Vec::new();
+            for _ in 0..count {
+                rows.push(TestMethodDebugInformationRow {
+                    document: Self::read_index(tables, &mut cursor, document_wide),
+                    sequence_points: Self::read_index(tables, &mut cursor, blob_wide),
+                });
+            }
+            rows
+        }
+
+        fn decode_sequence_points(
+            &self,
+            row: TestMethodDebugInformationRow,
+            documents: &[String],
+        ) -> (u32, Vec<SequencePoint>) {
+            if row.sequence_points == 0 {
+                return (0, Vec::new());
+            }
+            let blob = self.blob_at(row.sequence_points);
+            let mut cursor = 0;
+            let local_signature = read_compressed_u32_from(blob, &mut cursor);
+            let mut current_document = if row.document == 0 {
+                read_compressed_u32_from(blob, &mut cursor)
+            } else {
+                row.document
+            };
+            let mut first_sequence_record = true;
+            let mut previous_il = None;
+            let mut previous_non_hidden = None;
+            let mut points = Vec::new();
+            while cursor < blob.len() {
+                let il_delta = read_compressed_u32_from(blob, &mut cursor);
+                if !first_sequence_record && il_delta == 0 {
+                    current_document = read_compressed_u32_from(blob, &mut cursor);
+                    continue;
+                }
+                let il_offset = match previous_il {
+                    Some(previous) => previous + il_delta,
+                    None => il_delta,
+                };
+                previous_il = Some(il_offset);
+                first_sequence_record = false;
+
+                let delta_lines = read_compressed_u32_from(blob, &mut cursor);
+                let delta_columns_or_hidden = if delta_lines == 0 {
+                    read_compressed_u32_from(blob, &mut cursor) as i32
+                } else {
+                    read_compressed_i32_from(blob, &mut cursor)
+                };
+
+                let document_path = documents[(current_document - 1) as usize].clone();
+                if delta_lines == 0 && delta_columns_or_hidden == 0 {
+                    points.push(SequencePoint {
+                        il_offset,
+                        document_path,
+                        line: HIDDEN_LINE,
+                        col: 0,
+                        end_line: HIDDEN_LINE,
+                        end_col: 0,
+                        is_hidden: true,
+                    });
+                    continue;
+                }
+
+                let (line, col) = match previous_non_hidden {
+                    Some((previous_line, previous_col)) => {
+                        let line_delta = read_compressed_i32_from(blob, &mut cursor);
+                        let col_delta = read_compressed_i32_from(blob, &mut cursor);
+                        (
+                            (previous_line as i32 + line_delta) as u32,
+                            (previous_col as i32 + col_delta) as u32,
+                        )
+                    }
+                    None => (
+                        read_compressed_u32_from(blob, &mut cursor),
+                        read_compressed_u32_from(blob, &mut cursor),
+                    ),
+                };
+                let end_line = line + delta_lines;
+                let end_col = if delta_lines == 0 {
+                    col + delta_columns_or_hidden as u32
+                } else {
+                    (col as i32 + delta_columns_or_hidden) as u32
+                };
+                previous_non_hidden = Some((line, col));
+                points.push(SequencePoint {
+                    il_offset,
+                    document_path,
+                    line,
+                    col,
+                    end_line,
+                    end_col,
+                    is_hidden: false,
+                });
+            }
+            (local_signature, points)
+        }
+    }
+
+    fn read_compressed_u32_from(bytes: &[u8], cursor: &mut usize) -> u32 {
+        let first = bytes[*cursor];
+        *cursor += 1;
+        if first & 0x80 == 0 {
+            return u32::from(first);
+        }
+        if first & 0xC0 == 0x80 {
+            let second = bytes[*cursor];
+            *cursor += 1;
+            return (u32::from(first & 0x3F) << 8) | u32::from(second);
+        }
+        assert_eq!(first & 0xE0, 0xC0);
+        let b1 = bytes[*cursor];
+        let b2 = bytes[*cursor + 1];
+        let b3 = bytes[*cursor + 2];
+        *cursor += 3;
+        (u32::from(first & 0x1F) << 24)
+            | (u32::from(b1) << 16)
+            | (u32::from(b2) << 8)
+            | u32::from(b3)
+    }
+
+    fn read_compressed_i32_from(bytes: &[u8], cursor: &mut usize) -> i32 {
+        let first = bytes[*cursor];
+        let payload_bits = if first & 0x80 == 0 {
+            6
+        } else if first & 0xC0 == 0x80 {
+            13
+        } else {
+            28
+        };
+        let raw = read_compressed_u32_from(bytes, cursor);
+        let payload = (raw >> 1) as i32;
+        if raw & 1 == 0 {
+            payload
+        } else {
+            payload - (1 << payload_bits)
+        }
+    }
+
+    fn sp(
+        il_offset: u32,
+        document_path: &str,
+        line: u32,
+        col: u32,
+        end_line: u32,
+        end_col: u32,
+    ) -> SequencePoint {
+        SequencePoint {
+            il_offset,
+            document_path: document_path.to_string(),
+            line,
+            col,
+            end_line,
+            end_col,
+            is_hidden: false,
+        }
+    }
+
+    fn hidden(il_offset: u32, document_path: &str) -> SequencePoint {
+        SequencePoint {
+            il_offset,
+            document_path: document_path.to_string(),
+            line: HIDDEN_LINE,
+            col: 0,
+            end_line: HIDDEN_LINE,
+            end_col: 0,
+            is_hidden: true,
+        }
+    }
+
+    fn two_doc_three_method_fixture() -> (PdbBuilder, Vec<Vec<SequencePoint>>) {
+        let type_system = TypeSystemRowCounts {
+            rows: vec![
+                (Token::TABLE_METHOD_DEF, 3),
+                (Token::TABLE_STAND_ALONE_SIG, 1),
+            ],
+            entry_point_token: Token::new(Token::TABLE_METHOD_DEF, 1).0,
+        };
+        let mut builder = PdbBuilder::new(type_system, 3);
+        let method1 = vec![
+            sp(0, "src/main.rs", 10, 2, 10, 7),
+            sp(4, "src/main.rs", 11, 1, 12, 3),
+            hidden(8, "src/lib.rs"),
+            sp(12, "src/lib.rs", 20, 4, 20, 9),
+        ];
+        let method3 = vec![sp(0, "src/lib.rs", 30, 1, 30, 5)];
+        builder.add_method(
+            Token::new(Token::TABLE_METHOD_DEF, 1),
+            MethodSequencePoints {
+                local_signature: Some(Token::new(Token::TABLE_STAND_ALONE_SIG, 1)),
+                points: method1.clone(),
+            },
+        );
+        builder.add_method(
+            Token::new(Token::TABLE_METHOD_DEF, 3),
+            MethodSequencePoints {
+                local_signature: None,
+                points: method3.clone(),
+            },
+        );
+        (builder, vec![method1, Vec::new(), method3])
+    }
 
     #[test]
     fn deterministic_pdb_id_is_stable_across_calls() {
@@ -364,7 +1268,10 @@ mod tests {
             *b = i as u8;
         }
         let entry = DebugDirectoryEntry::from_pdb_id(id, "foo.pdb".to_string());
-        assert_eq!(entry.guid, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(
+            entry.guid,
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
         assert_eq!(entry.pdb_path, "foo.pdb");
         // stamp bytes are [16,17,18,19] little-endian = 0x13121110; OR 1 keeps it nonzero (it
         // already is here) without masking any bit we care about asserting.
@@ -378,7 +1285,10 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             builder.add_method(bogus, MethodSequencePoints::default());
         }));
-        assert!(result.is_err(), "expected a panic for a non-MethodDef token");
+        assert!(
+            result.is_err(),
+            "expected a panic for a non-MethodDef token"
+        );
     }
 
     #[test]
@@ -401,5 +1311,130 @@ mod tests {
             },
         );
         assert_eq!(builder.methods[1].as_ref().unwrap().points.len(), 1);
+    }
+
+    #[test]
+    fn build_serializes_two_documents_and_three_method_debug_rows() {
+        let (builder, expected) = two_doc_three_method_fixture();
+        let (bytes, id) = builder.build();
+        let reader = TestPdbReader::parse(&bytes);
+
+        assert_eq!(reader.pdb_id(), id);
+        let (entry_point, type_system_rows) = reader.pdb_stream_rows();
+        assert_eq!(entry_point, Token::new(Token::TABLE_METHOD_DEF, 1).0);
+        assert_eq!(
+            type_system_rows,
+            vec![
+                (Token::TABLE_METHOD_DEF, 3),
+                (Token::TABLE_STAND_ALONE_SIG, 1),
+            ]
+        );
+
+        let header = reader.tables_header();
+        assert_eq!(
+            header.valid,
+            (1u64 << TABLE_DOCUMENT) | (1u64 << TABLE_METHOD_DEBUG_INFORMATION)
+        );
+        let documents = reader.documents();
+        assert_eq!(
+            documents,
+            vec!["src/main.rs".to_string(), "src/lib.rs".to_string()]
+        );
+
+        let method_rows = reader.method_rows();
+        assert_eq!(method_rows.len(), 3);
+        assert_eq!(
+            method_rows[0].document, 0,
+            "multi-document method uses InitialDocument"
+        );
+        assert_eq!(
+            method_rows[1].sequence_points, 0,
+            "method without points uses the empty blob"
+        );
+        assert_eq!(
+            method_rows[2].document, 2,
+            "single-document method stores its Document row id"
+        );
+
+        let (local_sig1, points1) = reader.decode_sequence_points(method_rows[0], &documents);
+        assert_eq!(local_sig1, 1);
+        assert_eq!(points1, expected[0]);
+        assert_eq!(
+            reader.decode_sequence_points(method_rows[1], &documents).1,
+            expected[1]
+        );
+        let (local_sig3, points3) = reader.decode_sequence_points(method_rows[2], &documents);
+        assert_eq!(local_sig3, 0);
+        assert_eq!(points3, expected[2]);
+    }
+
+    #[test]
+    fn sequence_point_delta_encoding_handles_boundaries_and_document_switches() {
+        assert_eq!(compressed_i32_bytes(-64), [0x01]);
+        assert_eq!(compressed_i32_bytes(-1), [0x7F]);
+        assert_eq!(compressed_i32_bytes(0), [0x00]);
+        assert_eq!(compressed_i32_bytes(63), [0x7E]);
+        assert_eq!(compressed_i32_bytes(64), [0x80, 0x80]);
+        assert_eq!(compressed_i32_bytes(-65), [0xBF, 0x7F]);
+        assert_eq!(compressed_i32_bytes(-8192), [0x80, 0x01]);
+
+        let points = vec![
+            sp(0, "a.rs", 1, 1, 1, 2),
+            sp(1, "a.rs", 1, 2, 1, 3),
+            hidden(2, "a.rs"),
+            sp(3, "b.rs", 2, 10, 3, 4),
+            sp(4, "a.rs", 1, 8, 2, 5),
+        ];
+        let mut builder = PdbBuilder::new(
+            TypeSystemRowCounts {
+                rows: vec![(Token::TABLE_METHOD_DEF, 1)],
+                entry_point_token: 0,
+            },
+            1,
+        );
+        builder.add_method(
+            Token::new(Token::TABLE_METHOD_DEF, 1),
+            MethodSequencePoints {
+                local_signature: None,
+                points: points.clone(),
+            },
+        );
+        let (bytes, _) = builder.build();
+        let reader = TestPdbReader::parse(&bytes);
+        let documents = reader.documents();
+        assert_eq!(documents, vec!["a.rs".to_string(), "b.rs".to_string()]);
+        let rows = reader.method_rows();
+        assert_eq!(
+            rows[0].document, 0,
+            "document switches force MethodDebugInformation.Document nil"
+        );
+        let (_, decoded) = reader.decode_sequence_points(rows[0], &documents);
+        assert_eq!(decoded, points);
+    }
+
+    fn compressed_i32_bytes(value: i32) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_compressed_i32(&mut out, value);
+        let mut cursor = 0;
+        assert_eq!(read_compressed_i32_from(&out, &mut cursor), value);
+        assert_eq!(cursor, out.len());
+        out
+    }
+
+    #[test]
+    fn pdb_build_is_deterministic_including_pdb_id() {
+        let (builder_a, _) = two_doc_three_method_fixture();
+        let (bytes_a, id_a) = builder_a.build();
+        let (builder_b, _) = two_doc_three_method_fixture();
+        let (bytes_b, id_b) = builder_b.build();
+
+        assert_eq!(id_a, id_b);
+        assert_eq!(bytes_a, bytes_b);
+        let reader = TestPdbReader::parse(&bytes_a);
+        assert_eq!(reader.pdb_id(), id_a);
+        assert_eq!(
+            &bytes_a[reader.stream_offset("#Pdb")..reader.stream_offset("#Pdb") + 20],
+            &id_a
+        );
     }
 }
