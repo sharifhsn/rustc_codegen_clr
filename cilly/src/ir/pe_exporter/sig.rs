@@ -146,6 +146,34 @@ pub fn encode_type(
             encode_type(asm[inner], asm, resolver, out);
         }
         Type::ClassRef(cref) => {
+            // `System.Object`/`System.String` have DEDICATED CLI element types
+            // (ELEMENT_TYPE_OBJECT 0x1C / ELEMENT_TYPE_STRING 0x0E, §II.23.1.16) — mirrors
+            // `il_exporter::type_il`'s identical `Type::ClassRef` special-case (that fn's own
+            // doc comment: "BCL method signatures are encoded with those [element types], so a
+            // plain `class […]System.Object` typeref does NOT match `object` during runtime
+            // method resolution -> MissingMethodException"). Some codegen paths still produce a
+            // `Type::ClassRef` naming `System.String`/`System.Object` instead of the intrinsic
+            // `Type::PlatformString`/`Type::PlatformObject` (a "residual of the pre-P2-S1
+            // default" per that same comment) — e.g. `StringBuilder::ToString()`'s return type
+            // arrived this way, and without this fallback the encoded `ET_CLASS +
+            // TypeRef(System.String)` blob doesn't match the real BCL signature's `ET_STRING`
+            // byte, so `dotnet` rejects the `MemberRef` with `MissingMethodException: Method not
+            // found` even though the class/name/param-count are all correct (regression caught
+            // wiring `DIRECT_PE=1`).
+            let cr = asm.class_ref(cref);
+            if !cr.is_valuetype() && cr.generics().is_empty() {
+                match &asm[cr.name()] {
+                    "System.Object" => {
+                        out.push(ET_OBJECT);
+                        return;
+                    }
+                    "System.String" => {
+                        out.push(ET_STRING);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             let is_valuetype = asm[cref].is_valuetype();
             encode_class(cref, is_valuetype, asm, resolver, out);
         }
@@ -321,6 +349,51 @@ mod tests {
         assert_eq!(encode(Type::Float(Float::F64), &mut asm), [ET_R8]);
         assert_eq!(encode(Type::PlatformString, &mut asm), [ET_STRING]);
         assert_eq!(encode(Type::PlatformObject, &mut asm), [ET_OBJECT]);
+    }
+
+    /// Regression for `MissingMethodException: Method not found:
+    /// 'System.String System.Text.StringBuilder.ToString()'` caught wiring `DIRECT_PE=1` into
+    /// the linker: some codegen paths hand `encode_type` a `Type::ClassRef` naming
+    /// `System.String`/`System.Object` instead of the intrinsic `Type::PlatformString`/
+    /// `Type::PlatformObject` (`StringBuilder::ToString()`'s RETURN type arrived this way). A
+    /// real BCL method signature is encoded with the DEDICATED `ET_STRING`/`ET_OBJECT` element
+    /// types (§II.23.1.16), not `ET_CLASS + TypeRef(System.String)` — the two are NOT
+    /// interchangeable for CoreCLR's method-lookup, so an un-collapsed `ClassRef` blob doesn't
+    /// match the real signature and `dotnet` rejects the whole `MemberRef` with
+    /// `MissingMethodException`, even though the class/name/param-count all match. Mirrors
+    /// `il_exporter::type_il`'s identical `Type::ClassRef` fallback (that fn's own doc explains
+    /// the exact same `GCHandle.Alloc(object)` failure mode this fixes for the PE path).
+    #[test]
+    fn classref_naming_system_string_or_object_collapses_to_the_dedicated_element_type() {
+        let mut asm = Assembly::default();
+
+        let string_name = asm.alloc_string("System.String");
+        let string_asm = asm.alloc_string("System.Runtime");
+        let string_cref =
+            asm.alloc_class_ref(ClassRef::new(string_name, Some(string_asm), false, [].into()));
+        assert_eq!(
+            encode(Type::ClassRef(string_cref), &mut asm),
+            [ET_STRING],
+            "a ClassRef literally naming System.String must collapse to ET_STRING, not ET_CLASS+TypeRef"
+        );
+
+        let object_name = asm.alloc_string("System.Object");
+        let object_cref =
+            asm.alloc_class_ref(ClassRef::new(object_name, Some(string_asm), false, [].into()));
+        assert_eq!(
+            encode(Type::ClassRef(object_cref), &mut asm),
+            [ET_OBJECT],
+            "a ClassRef literally naming System.Object must collapse to ET_OBJECT, not ET_CLASS+TypeRef"
+        );
+
+        // A DIFFERENT class named "System.String" nowhere near the real BCL type (e.g. a
+        // VALUETYPE, or one with generics) must NOT collapse — the fallback is scoped to
+        // `!is_valuetype && generics().is_empty()`, matching `il_exporter`'s own guard exactly.
+        let valuetype_string_cref =
+            asm.alloc_class_ref(ClassRef::new(string_name, Some(string_asm), true, [].into()));
+        let encoded = encode(Type::ClassRef(valuetype_string_cref), &mut asm);
+        assert_ne!(encoded, vec![ET_STRING], "a VALUETYPE must not collapse to ET_STRING");
+        assert_eq!(encoded[0], ET_VALUETYPE);
     }
 
     #[test]
