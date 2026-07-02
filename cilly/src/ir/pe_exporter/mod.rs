@@ -11,10 +11,16 @@
 //! * [`sig`] — `Type` → `ELEMENT_TYPE_*` signature-blob encoding (fields, methods, locals,
 //!   `MethodSpec`, `calli` stand-alone sigs).
 //! * [`tables`] — the metadata tables + coded-index/heap-index width computation and the
-//!   populate → size → serialize pipeline. *(skeleton; implementation in progress)*
+//!   populate → size → serialize pipeline. *(Phase 1a: implemented + unit-tested)*
 //! * [`body`] — method bodies: tiny/fat headers, opcode bytes, branch layout, fat EH sections.
-//!   *(skeleton; implementation in progress)*
-//! * [`pe`] — the PE/COFF container and CLI header. *(skeleton; implementation in progress)*
+//!   *(Phase 1a: implemented + unit-tested)*
+//! * [`pe`] — the PE/COFF container and CLI header. *(Phase 1a: implemented + unit-tested)*
+//!
+//! Phase 1a status: each module is unit-tested in isolation (heaps/sig/tables/body/pe), but no
+//! end-to-end driver wires `tables::MetadataBuilder` + `body::assemble_method` +
+//! `pe::write_pe` into a single `Assembly::export_pe(...)` entry point yet — that integration,
+//! plus the "hand-built two-method assembly loads and runs under `dotnet`" acceptance check from
+//! `docs/PE_EMISSION_PLAN.md`, is the next step (Phase 1a close-out / Phase 1b).
 
 pub mod heaps;
 pub mod sig;
