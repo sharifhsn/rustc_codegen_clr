@@ -316,6 +316,36 @@ pub fn text_header_len(has_entry_point: bool) -> u32 {
     }
 }
 
+/// The RVA `.sdata` (the section holding `FieldRVA` blobs) will start at, given the sizes of the
+/// pieces that precede it in `.text`. **Single source of truth**, same rationale as
+/// [`text_header_len`]: a caller (`export::export_pe`) must call [`MetadataBuilder::set_field_rva`]
+/// (`super::tables::MetadataBuilder::set_field_rva`) with real RVAs before the FINAL
+/// `MetadataBuilder::serialize()` call, i.e. before `write_pe` itself runs and could otherwise be
+/// the only place this arithmetic lives — re-deriving `write_pe`'s internal `.text`-content-length
+/// math (header + CLI header + metadata + method bodies + bootstrap import table/stub tail, all
+/// `SectionAlignment`-rounded) independently would risk the same "8 bytes short" class of bug
+/// `text_header_len`'s doc comment describes, just for `FieldRVA.RVA` instead of `MethodDef.RVA`.
+///
+/// Mirrors `write_pe`'s own `sdata` [`SectionLayout::plan`] call exactly: `.text`'s content is
+/// `text_header_len(has_entry_point) + CLI_HEADER_CB + metadata_len + method_bodies_len [+
+/// bootstrap import-table-and-stub tail when `has_entry_point`]`, and `.sdata` starts at that,
+/// rounded up to `SectionAlignment` from a `SectionAlignment`-aligned `.text` base.
+#[must_use]
+pub fn field_rva_section_start(has_entry_point: bool, metadata_len: usize, method_bodies_len: usize) -> u32 {
+    let iat_len = text_header_len(has_entry_point);
+    let tail_len = if has_entry_point {
+        BootstrapLayout::plan().import_and_stub_len()
+    } else {
+        0
+    };
+    let text_content_len = iat_len
+        + CLI_HEADER_CB
+        + u32::try_from(metadata_len).expect("metadata exceeds u32")
+        + u32::try_from(method_bodies_len).expect("method bodies exceed u32")
+        + tail_len;
+    align_up(SECTION_ALIGNMENT + text_content_len, SECTION_ALIGNMENT)
+}
+
 /// Writes the complete PE image: DOS header, COFF header, PE32 optional header, section table,
 /// `.text` (CLI header + metadata + method bodies), `.sdata` (`FieldRVA` data). See the module
 /// doc for the RVA-fixup pipeline this function is the last step of.
@@ -1110,6 +1140,39 @@ mod tests {
         let off = sdata.file_offset as usize;
         assert_eq!(&image[off..off + field_rva_data.len()], &field_rva_data[..]);
         assert_eq!(sdata.virtual_size, field_rva_data.len() as u32);
+    }
+
+    /// [`field_rva_section_start`] is the "single source of truth" callers (`export::export_pe`)
+    /// must use to pre-compute `FieldRVA.RVA` values before `write_pe` is even called (see that
+    /// function's doc for the two-pass `set_field_rva`-before-`serialize` dance this exists for).
+    /// Cross-checks its prediction against `write_pe`'s OWN internal layout for both an `.exe`
+    /// (bootstrap stub present — the case with the extra IAT + import-table-and-stub tail term)
+    /// and a `.dll` (no bootstrap), so any future drift between the two independent computations
+    /// fails a fast unit test instead of only surfacing as a corrupted `FieldRVA.RVA` under `dotnet`.
+    #[test]
+    fn field_rva_section_start_matches_write_pes_actual_sdata_rva() {
+        let metadata = vec![0xAAu8; 137]; // an odd length, to exercise the non-4-aligned case too.
+        let bodies = vec![0xBBu8; 61];
+        let field_rva_data = vec![0x11, 0x22, 0x33, 0x44];
+
+        // `0x06000001` = `MethodDef` table id (0x06) << 24 | rid 1 — a plausible entry-point
+        // token; `field_rva_section_start`/`write_pe` only care whether `entry_point` is `Some`,
+        // not its value, so any well-formed token works here.
+        for entry_point in [None, Some(0x0600_0001u32)] {
+            let opts = PeOptions {
+                is_dll: entry_point.is_none(),
+                entry_point,
+            };
+            let image = write_pe(&metadata, &bodies, &field_rva_data, &opts);
+            let pe = parse_pe(&image);
+            let sdata = section_named(&pe, ".sdata").expect(".sdata must exist");
+
+            let predicted = field_rva_section_start(entry_point.is_some(), metadata.len(), bodies.len());
+            assert_eq!(
+                predicted, sdata.rva,
+                "entry_point={entry_point:?}: field_rva_section_start's prediction must match write_pe's actual .sdata RVA"
+            );
+        }
     }
 
     #[test]

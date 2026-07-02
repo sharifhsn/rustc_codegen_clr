@@ -516,6 +516,28 @@ impl MetadataBuilder {
         tok
     }
 
+    /// Encodes a field signature (§II.23.2.4) whose type is a bare `valuetype` reference to a
+    /// `TypeDef`/`TypeRef` `token` — `SIG_FIELD (0x06) ET_VALUETYPE (0x11) <coded TypeDefOrRef
+    /// index>`. Interns the blob and returns its `#Blob` heap offset, ready for
+    /// [`MetadataBuilder::add_static_field`]'s `signature_blob` parameter.
+    ///
+    /// A standalone helper rather than routing through [`sig::encode_field_sig`] /
+    /// [`sig::TypeDefOrRefResolver`]: that path resolves a `ClassRef` through `type_def_or_ref`,
+    /// which decides TypeDef-vs-TypeRef by checking `Assembly::class_ref_to_def` — but the
+    /// `__rcl_const_blob_{n}` carrier types [`MetadataBuilder::add_blob_sized_valuetype`] creates
+    /// are metadata-only rows with no matching `Assembly`-level `ClassDef`/`ClassRef` (mirrors
+    /// `il_exporter`, which never allocates a Rust-side `ClassRef` for them either — they only
+    /// ever exist as raw IL text). This writer already has the `TypeDef` `Token` in hand (the
+    /// return value of `add_blob_sized_valuetype`), so it skips the resolver entirely.
+    pub fn field_sig_for_valuetype_token(&mut self, token: Token) -> u32 {
+        let mut blob = Vec::new();
+        blob.push(sig::SIG_FIELD);
+        const ET_VALUETYPE: u8 = 0x11;
+        blob.push(ET_VALUETYPE);
+        write_compressed_u32(&mut blob, encode_type_def_or_ref_token(token));
+        self.blobs.intern(&blob)
+    }
+
     /// Adds an instance `Field` row (§II.22.15) to the most recently added `TypeDef`.
     /// `offset` mirrors `ClassDef::fields()`'s `Option<u32>` (`.field [N] …`) and populates a
     /// `FieldLayout` row (§II.22.16) when present.
