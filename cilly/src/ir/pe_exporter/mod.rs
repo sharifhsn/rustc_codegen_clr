@@ -8,13 +8,16 @@
 //!
 //! Layout of the writer (each stage is independently unit-tested):
 //! * [`heaps`] — the four metadata heaps (`#Strings`, `#Blob`, `#GUID`, `#US`), interned + deduped.
-//! * `sig` — `Type` → `ELEMENT_TYPE_*` signature-blob encoding (fields, methods, locals,
-//!   `MethodSpec`, `calli` stand-alone sigs). *(next)*
-//! * `tables` — the metadata tables + coded-index/heap-index width computation and the
-//!   populate → size → serialize pipeline. *(next)*
-//! * `body` — method bodies: tiny/fat headers, opcode bytes, branch layout, fat EH sections.
-//!   *(next)*
-//! * `pe` — the PE/COFF container and CLI header. *(next)*
+//! * [`sig`] — `Type` → `ELEMENT_TYPE_*` signature-blob encoding (fields, methods, locals,
+//!   `MethodSpec`, `calli` stand-alone sigs).
+//! * [`tables`] — the metadata tables + coded-index/heap-index width computation and the
+//!   populate → size → serialize pipeline. *(skeleton; implementation in progress)*
+//! * [`body`] — method bodies: tiny/fat headers, opcode bytes, branch layout, fat EH sections.
+//!   *(skeleton; implementation in progress)*
+//! * [`pe`] — the PE/COFF container and CLI header. *(skeleton; implementation in progress)*
 
 pub mod heaps;
 pub mod sig;
+pub mod tables;
+pub mod body;
+pub mod pe;
