@@ -393,7 +393,7 @@ fn main() {
     cilly::builtins::unaligned_read(&mut final_assembly, &mut overrides);
 
     cilly::builtins::casts::insert_casts(&mut final_assembly, &mut overrides);
-    cilly::builtins::insert_heap(&mut final_assembly, &mut overrides, *C_MODE);
+    cilly::builtins::insert_heap(&mut final_assembly, &mut overrides, *C_MODE, *POOL_ALLOC);
     cilly::builtins::rust_assert(&mut final_assembly, &mut overrides);
     cilly::builtins::int128::generate_int128_ops(&mut final_assembly, &mut overrides, *C_MODE);
     cilly::builtins::int128::i128_mul_ovf_check(&mut final_assembly, &mut overrides);
@@ -456,7 +456,11 @@ fn main() {
         cilly::builtins::argc_argv_init(&mut final_assembly, &mut overrides);
         // .NET PAL BCL bindings (rcl_dotnet_alloc / _free / _write) used by the
         // std-side dotnet PAL. .NET-only: they emit calls into the BCL.
-        cilly::builtins::dotnet::insert_dotnet_pal(&mut final_assembly, &mut overrides);
+        cilly::builtins::dotnet::insert_dotnet_pal(
+            &mut final_assembly,
+            &mut overrides,
+            *POOL_ALLOC,
+        );
         // POSIX/libc-over-.NET shim (the proof slice): int-fd⇄GCHandle fd-table +
         // thread-local errno + the bare POSIX C-ABI symbol cluster (socket/read/
         // epoll_*/…), each re-packaging an existing rcl_dotnet_* body. .NET-only;
@@ -519,8 +523,12 @@ fn main() {
     } else if *JAVA_MODE {
         final_assembly.export(&path, cilly::java_exporter::JavaExporter::new(is_lib));
         if cargo_support {
-            let bootstrap =
-                bootstrap_source(&path.with_extension("jar"), path.to_str().unwrap(), "java", None);
+            let bootstrap = bootstrap_source(
+                &path.with_extension("jar"),
+                path.to_str().unwrap(),
+                "java",
+                None,
+            );
             let bootstrap_path = path.with_extension("rs");
             let mut bootstrap_file = std::fs::File::create(&bootstrap_path).unwrap();
             bootstrap_file.write_all(bootstrap.as_bytes()).unwrap();
@@ -741,7 +749,12 @@ fn main() {
 /// can differ from `fpath.file_stem() + ".pdb"`: cargo's hashed `deps/` build path is not the
 /// final artifact name). `None` falls back to the pre-existing `{fpath-stem}.pdb` convention
 /// (ilasm path, and the `DIRECT_PE` library case where `fpath`'s own name already IS final).
-fn bootstrap_source(fpath: &Path, output_file_path: &str, jumpstart_cmd: &str, pdb_file_override: Option<&str>) -> String {
+fn bootstrap_source(
+    fpath: &Path,
+    output_file_path: &str,
+    jumpstart_cmd: &str,
+    pdb_file_override: Option<&str>,
+) -> String {
     if let Err(err) = std::fs::remove_file(output_file_path) {
         match err.kind() {
             std::io::ErrorKind::NotFound => (),
@@ -775,7 +788,11 @@ fn bootstrap_source(fpath: &Path, output_file_path: &str, jumpstart_cmd: &str, p
         exec_file = fpath.file_name().unwrap().to_string_lossy(),
         has_native_companion = *NATIVE_PASSTROUGH,
         has_pdb = has_pdb,
-        pdb_file = if *ILASM_FLAVOUR == IlasmFlavour::Clasic { String::new() } else { pdb_file },
+        pdb_file = if *ILASM_FLAVOUR == IlasmFlavour::Clasic {
+            String::new()
+        } else {
+            pdb_file
+        },
         native_companion_file = if *NATIVE_PASSTROUGH {
             format!(
                 "rust_native_{output_file_path}.so",
@@ -792,6 +809,13 @@ config!(C_MODE, bool, false);
 config!(NO_UNWIND, bool, false);
 config!(JAVA_MODE, bool, false);
 config!(PANIC_MANAGED_BT, bool, false);
+config!(
+    POOL_ALLOC,
+    bool,
+    false,
+    "Enable the experimental per-thread size-classed unmanaged allocation pool for Rust allocator \
+     shims. Default OFF preserves the direct NativeMemory allocator path."
+);
 config!(
     DIRECT_PE,
     bool,

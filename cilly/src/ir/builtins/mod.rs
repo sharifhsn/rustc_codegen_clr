@@ -15,6 +15,7 @@ pub mod atomics;
 pub mod casts;
 pub mod dotnet;
 pub mod math;
+pub mod pool_alloc;
 pub mod posix;
 pub use posix::insert_posix_shim;
 pub mod select;
@@ -128,7 +129,11 @@ fn load_ptr_arg(asm: &mut Assembly, arg: u32) -> Interned<CILNode> {
     let void_ptr = asm.alloc_type(void_ptr);
     reinterpret_arg(asm, arg, void_ptr)
 }
-fn insert_rust_alloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+fn insert_rust_alloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, use_pool_alloc: bool) {
+    if use_pool_alloc {
+        pool_alloc::insert_rust_alloc(asm, patcher);
+        return;
+    }
     let name = asm.alloc_string("__rust_alloc");
     let generator = move |_, asm: &mut Assembly| {
         let size = asm.alloc_node(CILNode::LdArg(0));
@@ -170,7 +175,15 @@ fn insert_rust_alloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     };
     patcher.insert(name, Box::new(generator));
 }
-fn insert_rust_alloc_zeroed(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+fn insert_rust_alloc_zeroed(
+    asm: &mut Assembly,
+    patcher: &mut MissingMethodPatcher,
+    use_pool_alloc: bool,
+) {
+    if use_pool_alloc {
+        pool_alloc::insert_rust_alloc_zeroed(asm, patcher);
+        return;
+    }
     let name = asm.alloc_string("__rust_alloc_zeroed");
     let generator = move |_, asm: &mut Assembly| {
         let size = asm.alloc_node(CILNode::LdArg(0));
@@ -293,7 +306,12 @@ pub fn create_slice(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     };
     patcher.insert(name, Box::new(generator));
 }
-fn insert_rust_realloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, use_libc: bool) {
+fn insert_rust_realloc(
+    asm: &mut Assembly,
+    patcher: &mut MissingMethodPatcher,
+    use_libc: bool,
+    use_pool_alloc: bool,
+) {
     let name = asm.alloc_string("__rust_realloc");
     if use_libc {
         let generator = move |_, asm: &mut Assembly| {
@@ -350,6 +368,8 @@ fn insert_rust_realloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, u
             }
         };
         patcher.insert(name, Box::new(generator));
+    } else if use_pool_alloc {
+        pool_alloc::insert_rust_realloc(asm, patcher);
     } else {
         let generator = move |_, asm: &mut Assembly| {
             // realloc = AlignedAlloc + copy + AlignedFree, NOT `NativeMemory.AlignedRealloc`.
@@ -412,7 +432,11 @@ fn insert_rust_realloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, u
                 Some(BranchCond::False(buff_usize)),
             ))));
             // copy_len = min(old_size, new_size)
-            let lt = asm.alloc_node(CILNode::BinOp(old_size, new_size, super::cilnode::BinOp::LtUn));
+            let lt = asm.alloc_node(CILNode::BinOp(
+                old_size,
+                new_size,
+                super::cilnode::BinOp::LtUn,
+            ));
             let copy_len = asm.select(Type::Int(Int::USize), old_size, new_size, lt);
             let buff_dst = asm.alloc_node(CILNode::LdLoc(0));
             let copy = asm.alloc_root(CILRoot::CpBlk(Box::new((buff_dst, ptr, copy_len))));
@@ -453,7 +477,12 @@ fn insert_rust_realloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, u
         patcher.insert(name, Box::new(generator));
     }
 }
-fn insert_rust_dealloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, use_libc: bool) {
+fn insert_rust_dealloc(
+    asm: &mut Assembly,
+    patcher: &mut MissingMethodPatcher,
+    use_libc: bool,
+    use_pool_alloc: bool,
+) {
     let name = asm.alloc_string("__rust_dealloc");
     if use_libc {
         let generator = move |_, asm: &mut Assembly| {
@@ -477,6 +506,8 @@ fn insert_rust_dealloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, u
             }
         };
         patcher.insert(name, Box::new(generator));
+    } else if use_pool_alloc {
+        pool_alloc::insert_rust_dealloc(asm, patcher);
     } else {
         let generator = move |_, asm: &mut Assembly| {
             let ldarg_0 = load_ptr_arg(asm, 0);
@@ -570,11 +601,20 @@ pub fn insert_exception(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) 
     insert_catch_unwind(asm, patcher);
     insert_interop_try_catch(asm, patcher);
 }
-pub fn insert_heap(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, use_libc: bool) {
-    insert_rust_alloc(asm, patcher);
-    insert_rust_alloc_zeroed(asm, patcher);
-    insert_rust_realloc(asm, patcher, use_libc);
-    insert_rust_dealloc(asm, patcher, use_libc);
+pub fn insert_heap(
+    asm: &mut Assembly,
+    patcher: &mut MissingMethodPatcher,
+    use_libc: bool,
+    use_pool_alloc: bool,
+) {
+    let use_pool_alloc = use_pool_alloc && !use_libc;
+    if use_pool_alloc {
+        pool_alloc::insert_pool_helpers(asm);
+    }
+    insert_rust_alloc(asm, patcher, use_pool_alloc);
+    insert_rust_alloc_zeroed(asm, patcher, use_pool_alloc);
+    insert_rust_realloc(asm, patcher, use_libc, use_pool_alloc);
+    insert_rust_dealloc(asm, patcher, use_libc, use_pool_alloc);
     insert_pause(asm, patcher);
 }
 
@@ -771,7 +811,7 @@ fn insert_interop_try_catch(asm: &mut Assembly, patcher: &mut MissingMethodPatch
         let ldarg_0 = asm.alloc_node(CILNode::LdArg(0)); // try_fn
         let ldarg_1 = asm.alloc_node(CILNode::LdArg(1)); // data
         let ldarg_2 = asm.alloc_node(CILNode::LdArg(2)); // catch_fn
-        // try region: call try_fn(data); on success leave to the "ok" block (2).
+                                                         // try region: call try_fn(data); on success leave to the "ok" block (2).
         let calli_try = asm.alloc_root(CILRoot::CallI(Box::new((
             ldarg_0,
             try_sig,
@@ -816,7 +856,7 @@ fn insert_interop_try_catch(asm: &mut Assembly, patcher: &mut MissingMethodPatch
     };
     patcher.insert(name, Box::new(generator));
 }
-const ALLOC_CAP: u64 = u32::MAX as u64;
+pub(super) const ALLOC_CAP: u64 = u32::MAX as u64;
 pub(crate) const UNMANAGED_THREAD_START: &str = "UnmanagedThreadStart";
 
 pub fn transmute(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
@@ -976,12 +1016,7 @@ pub fn argc_argv_init(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let mul = asm.int_cast(mul, Int::USize, ExtendKind::ZeroExtend);
         let addr = asm.biop(ld_argv, mul, BinOp::Add);
         let i8_ptr_ty = asm.nptr(Type::Int(Int::I8));
-        loop_roots.push(asm.alloc_root(CILRoot::StInd(Box::new((
-            addr,
-            uarg,
-            i8_ptr_ty,
-            false,
-        )))));
+        loop_roots.push(asm.alloc_root(CILRoot::StInd(Box::new((addr, uarg, i8_ptr_ty, false)))));
         // arg_idx += 1
         let ld_arg_idx = asm.alloc_node(CILNode::LdLoc(arg_idx));
         let one = asm.alloc_node(1_i32);
@@ -1004,11 +1039,8 @@ pub fn argc_argv_init(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
 
         // ---- loop_end block ----
         let mut loop_end_roots = Vec::new();
-        let argv_static = StaticFieldDesc::new(
-            *asm.main_module(),
-            asm.alloc_string("argv"),
-            uint8_ptr_ptr,
-        );
+        let argv_static =
+            StaticFieldDesc::new(*asm.main_module(), asm.alloc_string("argv"), uint8_ptr_ptr);
         let argv_static = asm.alloc_sfld(argv_static);
         let ld_argv = asm.alloc_node(CILNode::LdLoc(argv));
         loop_end_roots.push(asm.alloc_root(CILRoot::SetStaticField {

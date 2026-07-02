@@ -4,7 +4,17 @@
 //! hooks that the cilly linker maps to BCL calls:
 //!
 //! * `rcl_dotnet_alloc(size, align)` -> `NativeMemory.AlignedAlloc((nuint)size, (nuint)align)`
-//! * `rcl_dotnet_free(ptr, align)`   -> `NativeMemory.AlignedFree((void*)ptr)`
+//! * `rcl_dotnet_free(ptr, size, align)` -> `NativeMemory.AlignedFree((void*)ptr)`
+//!
+//! `size` on the free hook is unused in the direct (`NativeMemory`) mapping —
+//! `AlignedFree` only needs the pointer — but is REQUIRED by the optional
+//! `POOL_ALLOC=1` pooled-allocator fast path (`cilly/src/ir/builtins/pool_alloc.rs`),
+//! which needs to know which per-thread size-class free list to push a freed
+//! block onto (a `GlobalAlloc::dealloc` call always carries the same `Layout`
+//! — hence the same size+align — the block was allocated with, so this is a
+//! sound, ABI-stable addition; both hooks are always emitted by the SAME
+//! linker build as the PAL that declares them, so there is no versioning
+//! hazard). Do not rename these symbols.
 //!
 //! `realloc` is implemented with the shared `realloc_fallback` (alloc + copy +
 //! free) from [`super`], and `alloc_zeroed` allocates and then zeroes the buffer,
@@ -21,8 +31,10 @@ use crate::ptr;
 unsafe extern "C" {
     /// `NativeMemory.AlignedAlloc((nuint)size, (nuint)align)`.
     fn rcl_dotnet_alloc(size: usize, align: usize) -> *mut u8;
-    /// `NativeMemory.AlignedFree((void*)ptr)`.
-    fn rcl_dotnet_free(ptr: *mut u8, align: usize);
+    /// `NativeMemory.AlignedFree((void*)ptr)`. `size` is unused in direct mode,
+    /// consumed by the pooled-allocator fast path when `POOL_ALLOC=1` (see the
+    /// module doc above).
+    fn rcl_dotnet_free(ptr: *mut u8, size: usize, align: usize);
 }
 
 #[stable(feature = "alloc_system_type", since = "1.28.0")]
@@ -48,10 +60,10 @@ unsafe impl GlobalAlloc for System {
 
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: caller upholds the `GlobalAlloc::dealloc` preconditions; the
-        // alignment matches the one passed to `rcl_dotnet_alloc`, as required by
-        // `NativeMemory.AlignedFree`.
-        unsafe { rcl_dotnet_free(ptr, layout.align()) }
+        // SAFETY: caller upholds the `GlobalAlloc::dealloc` preconditions; direct
+        // `NativeMemory` only needs the pointer, while the optional pool uses the
+        // original layout to select the free-list class.
+        unsafe { rcl_dotnet_free(ptr, layout.size(), layout.align()) }
     }
 
     #[inline]

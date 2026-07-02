@@ -10,7 +10,7 @@
 //! FIXED extern contract:
 //! * `rcl_dotnet_alloc(size, align) -> *mut u8`
 //!   => `System.Runtime.InteropServices.NativeMemory.AlignedAlloc((nuint)size, (nuint)align)`
-//! * `rcl_dotnet_free(ptr, align)`
+//! * `rcl_dotnet_free(ptr, size, align)`
 //!   => `System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)ptr)`
 //! * `rcl_dotnet_write(fd, ptr, len) -> isize`
 //!   => writes `len` UTF-8 bytes from `ptr` to `System.Console`'s stdout (fd 1)
@@ -203,9 +203,16 @@ macro_rules! dotnet_hook {
 }
 
 /// Registers all `rcl_dotnet_*` BCL bindings in `patcher`.
-pub fn insert_dotnet_pal(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    insert_dotnet_alloc(asm, patcher);
-    insert_dotnet_free(asm, patcher);
+pub fn insert_dotnet_pal(
+    asm: &mut Assembly,
+    patcher: &mut MissingMethodPatcher,
+    use_pool_alloc: bool,
+) {
+    if use_pool_alloc {
+        super::pool_alloc::insert_pool_helpers(asm);
+    }
+    insert_dotnet_alloc(asm, patcher, use_pool_alloc);
+    insert_dotnet_free(asm, patcher, use_pool_alloc);
     insert_dotnet_write(asm, patcher);
     insert_dotnet_random_fill(asm, patcher);
     insert_dotnet_instant_ticks(asm, patcher);
@@ -703,7 +710,25 @@ fn insert_dotnet_unix_ticks(asm: &mut Assembly, patcher: &mut MissingMethodPatch
 /// `AlignedAlloc`. Recent rustc wraps allocator-shim scalars in transparent
 /// value types, but this symbol comes from our own PAL's `extern "C"` decl with
 /// plain `usize` arguments, so the args are loaded directly.
-fn insert_dotnet_alloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+fn insert_dotnet_alloc(
+    asm: &mut Assembly,
+    patcher: &mut MissingMethodPatcher,
+    use_pool_alloc: bool,
+) {
+    if use_pool_alloc {
+        dotnet_hook!(asm, patcher, "rcl_dotnet_alloc", |asm| {
+            let size = asm.alloc_node(CILNode::LdArg(0));
+            let align = asm.alloc_node(CILNode::LdArg(1));
+            let alloc_mref = super::pool_alloc::pool_alloc_mref(asm);
+            let alloc = asm.alloc_node(CILNode::call(alloc_mref, [size, align]));
+            let ret = asm.alloc_root(CILRoot::Ret(alloc));
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            }
+        });
+        return;
+    }
     dotnet_hook!(asm, patcher, "rcl_dotnet_alloc", |asm| {
         let size = asm.alloc_node(CILNode::LdArg(0));
         let align = asm.alloc_node(CILNode::LdArg(1));
@@ -729,13 +754,34 @@ fn insert_dotnet_alloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     });
 }
 
-/// `rcl_dotnet_free(ptr: *mut u8, align: usize)`
+/// `rcl_dotnet_free(ptr: *mut u8, size: usize, align: usize)`
 ///   => `NativeMemory.AlignedFree((void*)ptr)`.
 ///
-/// Models the non-libc `__rust_dealloc` builtin. The `align` argument is unused
-/// (`AlignedFree` takes only the pointer); it is part of the contract so the
-/// std side can stay symmetric with `AlignedAlloc`.
-fn insert_dotnet_free(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+/// Models the non-libc `__rust_dealloc` builtin. In direct mode, `size` and
+/// `align` are unused (`AlignedFree` takes only the pointer); pooled mode uses
+/// `size`/`align` to select the free-list class.
+fn insert_dotnet_free(
+    asm: &mut Assembly,
+    patcher: &mut MissingMethodPatcher,
+    use_pool_alloc: bool,
+) {
+    if use_pool_alloc {
+        dotnet_hook!(asm, patcher, "rcl_dotnet_free", |asm| {
+            let ptr = asm.alloc_node(CILNode::LdArg(0));
+            let void_ptr = asm.nptr(Type::Void);
+            let ptr = asm.cast_ptr(ptr, void_ptr);
+            let size = asm.alloc_node(CILNode::LdArg(1));
+            let align = asm.alloc_node(CILNode::LdArg(2));
+            let free_mref = super::pool_alloc::pool_free_mref(asm);
+            let free = asm.alloc_root(CILRoot::call(free_mref, [ptr, size, align]));
+            let ret = asm.alloc_root(CILRoot::VoidRet);
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![free, ret], 0, None)],
+                locals: vec![],
+            }
+        });
+        return;
+    }
     dotnet_hook!(asm, patcher, "rcl_dotnet_free", |asm| {
         let ptr = asm.alloc_node(CILNode::LdArg(0));
         let void_ptr = asm.nptr(Type::Void);
