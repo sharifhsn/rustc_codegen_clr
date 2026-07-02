@@ -141,6 +141,35 @@ const CLI_MINOR_RUNTIME_VERSION: u16 = 5;
 /// bit 0x20000) is deliberately never set, matching ilasm's AnyCPU output.
 const COMIMAGE_FLAGS_ILONLY: u32 = 0x1;
 
+/// `.reloc` section characteristics: `IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ |
+/// IMAGE_SCN_MEM_DISCARDABLE`. Matches the `0x4200_0040` observed in a real ilasm-produced image
+/// (the loader discards `.reloc` after applying fixups — it isn't needed once the image is bound).
+const RELOC_SECTION_CHARACTERISTICS: u32 = 0x4200_0040;
+
+/// Index of the "Import Table" data directory (§II.25.2.3.3).
+const DATA_DIRECTORY_IMPORT_TABLE: usize = 1;
+/// Index of the "Base Relocation Table" data directory (§II.25.2.3.3).
+const DATA_DIRECTORY_BASE_RELOCATION_TABLE: usize = 5;
+/// Index of the "IAT" (Import Address Table) data directory (§II.25.2.3.3).
+const DATA_DIRECTORY_IAT: usize = 12;
+
+/// `IMAGE_REL_BASED_HIGHLOW` — a 32-bit base-relocation fixup type (the only kind this writer's
+/// single stub-address fixup needs).
+const IMAGE_REL_BASED_HIGHLOW: u16 = 3;
+
+/// The native x86 bootstrap thunk every ilasm/Roslyn-produced managed `.exe` carries:
+/// `jmp dword ptr [addr]` (`FF 25` + a 4-byte absolute VA operand, patched in by
+/// [`write_bootstrap_stub`] once the IAT's RVA is known). This is what
+/// `AddressOfEntryPoint` points at — the OS loader binds the IAT slot the operand addresses to
+/// `mscoree.dll!_CorExeMain`'s real address before this instruction executes; `_CorExeMain` is
+/// what actually reads the CLI header and starts the CLR. Without this, the *native* PE loader
+/// (not the CLR) rejects the image before ever inspecting the CLI header — see the module doc's
+/// "Risk #1 confirmed" note.
+const ENTRY_STUB_OPCODE: [u8; 2] = [0xFF, 0x25];
+/// Total stub length: the 2-byte opcode + 4-byte operand. ilasm pads the rest of a 16-byte-aligned
+/// region with zeros; this writer does the same (harmless — never executed).
+const ENTRY_STUB_LEN: u32 = 6;
+
 /// Rounds `value` up to the next multiple of `align` (`align` must be a power of two). Used for
 /// both `FileAlignment` (raw section placement) and `SectionAlignment` (mapped RVA placement).
 #[must_use]
@@ -196,6 +225,97 @@ impl SectionLayout {
     }
 }
 
+/// The `mscoree.dll!_CorExeMain` bootstrap thunk's fixed-shape sub-layout (§II.25.4's referenced
+/// `.idata`/import-table conventions — this writer needs exactly one imported function, so the
+/// generic multi-import table shape collapses to fixed offsets computed once here). Byte shapes
+/// were confirmed against a real CoreCLR-`ilasm`-produced `.exe` (see `write_pe`'s module doc).
+///
+/// Layout of the "Import Table + stub" region this describes (placed at the tail of `.text`,
+/// after the method bodies — see `write_import_table_and_stub`):
+/// ```text
+/// offset 0   : Import Directory Table: 1 IMAGE_IMPORT_DESCRIPTOR (20B) + 1 null terminator (20B)
+/// offset 40  : Import Lookup Table (ILT): Hint/Name RVA (4B) + null terminator (4B)
+/// offset 48  : Hint/Name entry: Hint (2B, always 0) + "_CorExeMain\0" (12B, already even)
+/// offset 62  : "mscoree.dll\0" (12B)
+/// offset 74  : padding to a 16-byte-aligned stub start
+/// offset ??  : native stub: FF 25 <abs VA> (6B), zero-padded to a 16-byte region
+/// ```
+#[derive(Debug, Clone, Copy)]
+struct BootstrapLayout;
+
+/// `IMAGE_IMPORT_DESCRIPTOR` size (§II.25.3.1's referenced Windows import-table format): 20 bytes.
+const IMPORT_DESCRIPTOR_LEN: u32 = 20;
+/// Import Directory Table: one real descriptor + one all-zero terminator descriptor.
+const IMPORT_DIRECTORY_LEN: u32 = IMPORT_DESCRIPTOR_LEN * 2;
+/// ILT: one Hint/Name RVA `DWORD` + one null-terminator `DWORD` (mirrors the IAT's own shape
+/// before the loader binds it — both tables are byte-identical pre-bind, §II conventions).
+const ILT_LEN: u32 = 8;
+/// Hint/Name entry: 2-byte Hint (always 0, no ordinal-only import) + `"_CorExeMain\0"` (12 bytes,
+/// already an even length so no extra padding byte is needed).
+const HINT_NAME_LEN: u32 = 2 + 12;
+const COR_EXE_MAIN: &[u8] = b"_CorExeMain\0";
+/// `"mscoree.dll\0"` (12 bytes).
+const MSCOREE_DLL: &[u8] = b"mscoree.dll\0";
+/// `.reloc` section content: one relocation block, one page, one `HIGHLOW` entry, padded to a
+/// 4-byte `DWORD` boundary (§II.25.3 base relocation block shape: `PageRVA(4) BlockSize(4)` +
+/// `N` × 2-byte `(type<<12)|offset` entries, `BlockSize` rounded up to a multiple of 4).
+const RELOC_CONTENT_LEN: u32 = 12; // 8-byte block header + 1 entry (2B) + 2B padding to align.
+
+impl BootstrapLayout {
+    fn plan() -> Self {
+        BootstrapLayout
+    }
+    /// IAT length: identical shape/size to the ILT (one Hint/Name RVA + a null terminator).
+    fn iat_len(self) -> u32 {
+        ILT_LEN
+    }
+    /// Total length of the "Import Table + stub" region placed at the tail of `.text`.
+    fn import_and_stub_len(self) -> u32 {
+        self.stub_offset_in_import_region() + ENTRY_STUB_LEN
+    }
+    /// Byte offset, within the "Import Table + stub" region, of the Import Directory Table.
+    fn import_directory_offset(self) -> u32 {
+        0
+    }
+    /// Byte offset, within the region, of the Import Lookup Table.
+    fn ilt_offset(self) -> u32 {
+        self.import_directory_offset() + IMPORT_DIRECTORY_LEN
+    }
+    /// Byte offset, within the region, of the Hint/Name entry.
+    fn hint_name_offset(self) -> u32 {
+        self.ilt_offset() + ILT_LEN
+    }
+    /// Byte offset, within the region, of the `"mscoree.dll\0"` name string.
+    fn dll_name_offset(self) -> u32 {
+        self.hint_name_offset() + HINT_NAME_LEN
+    }
+    /// Byte offset, within the region, of the native entry stub — 16-byte aligned (matches the
+    /// reference image; not load-bearing, just conventional tidiness for disassembly).
+    fn stub_offset_in_import_region(self) -> u32 {
+        align_up(self.dll_name_offset() + u32::try_from(MSCOREE_DLL.len()).unwrap(), 16)
+    }
+}
+
+/// The number of bytes `write_pe` places in `.text` BEFORE the CLI header — `0` for a `.dll`
+/// (`has_entry_point = false`), or [`BootstrapLayout::iat_len`] for an `.exe` (the IAT the native
+/// bootstrap stub needs, see `write_pe`'s module doc). **Single source of truth**: callers that
+/// need to pre-compute an RVA before calling `write_pe` (e.g. `export::export_pe`'s two-pass
+/// metadata-length-probe layout) must use this instead of re-deriving the same constant, so the
+/// two can never drift out of sync — an earlier version of `export_pe` hardcoded `0` here and
+/// produced `MethodDef.RVA` values 8 bytes short of the bodies' real position once the bootstrap
+/// stub's IAT was added, which a real `dotnet` load surfaced as
+/// `BadImageFormatException: Index not found` (a corrupted-looking method body, since every
+/// `call`/`ldstr` token inside it was being read from 8 bytes into the ACTUAL body instead of its
+/// start).
+#[must_use]
+pub fn text_header_len(has_entry_point: bool) -> u32 {
+    if has_entry_point {
+        BootstrapLayout::plan().iat_len()
+    } else {
+        0
+    }
+}
+
 /// Writes the complete PE image: DOS header, COFF header, PE32 optional header, section table,
 /// `.text` (CLI header + metadata + method bodies), `.sdata` (`FieldRVA` data). See the module
 /// doc for the RVA-fixup pipeline this function is the last step of.
@@ -226,14 +346,39 @@ impl SectionLayout {
 /// `metadata`/`method_bodies` bytes by the time `write_pe` runs). `.sdata` (if `field_rva_data`
 /// is non-empty) follows `.text`, `SectionAlignment`-aligned.
 ///
-/// No import table, IAT, or `.reloc` native-bootstrap stub is emitted (deviation from ilasm/Mono
-/// output, which still carries the legacy `mscoree.dll`-load stub for `.NET Framework`-era
-/// loaders). Modern CoreCLR (`dotnet foo.dll`, or an `apphost`-produced native launcher) reads
-/// only the CLI header and never walks the import table, so this should be a pure size reduction.
-/// If a `dotnet run`/E2E test against a real CoreCLR host rejects an import-table-free image, the
-/// fallback plan (`docs/PE_EMISSION_PLAN.md` Risk #1) is adding the standard 3-piece stub back:
-/// `.reloc` fixup for the bootstrap's absolute jump, an Import Table row for
-/// `mscoree.dll!_CorExeMain`/`_CorDllMain`, and a matching IAT entry.
+/// **Risk #1 confirmed, and the fallback is now the only path this writer emits**: a
+/// `.text`-only, import-table-free `.exe` (the shape this function produced before the Phase 1a
+/// E2E milestone) loads its metadata fine but CoreCLR's *native* PE loader (not the CLI-aware
+/// managed loader — the OS-level image loader `dotnet`'s apphost/corehost invokes first) rejects
+/// it with `BadImageFormatException` before the CLR ever inspects the CLI header: a `.exe`'s
+/// `AddressOfEntryPoint` must point at *real native code*, and the standard `mscoree.dll`
+/// `_CorExeMain` bootstrap thunk is how every ilasm/Mono/Roslyn-produced managed `.exe` satisfies
+/// that (byte-diffed against a real CoreCLR-`ilasm`-produced `.exe` while chasing this exact
+/// failure — see the `bootstrap_stub_matches_the_ilasm_reference_shape` test below for the
+/// annotated reference bytes). So when `options.entry_point.is_some()` (i.e. an `.exe`, not a
+/// library `.dll` — a `.dll` is never natively executed, so it carries no bootstrap stub, matching
+/// `il_exporter`'s `.dll`-vs-`.exe` split), `write_pe` now also emits:
+/// * An **IAT** (Import Address Table, §II.25.4.2) — one `DWORD` (the Hint/Name RVA) + a null
+///   terminator `DWORD`, placed at the very start of `.text` (RVA = `.text`'s own base), exactly
+///   where a real CoreCLR `ilasm` puts it.
+/// * An **Import Table** (§II.25.3.1's referenced `.idata` layout) — one `IMAGE_IMPORT_DESCRIPTOR`
+///   (20 bytes) + a null terminator descriptor (20 bytes) naming `mscoree.dll`, plus an Import
+///   Lookup Table (ILT, byte-identical to the IAT before the loader binds it), a Hint/Name entry
+///   for `_CorExeMain`, and the `mscoree.dll` name string — placed after the method bodies, at the
+///   tail of `.text`.
+/// * A **native x86 entry stub** (6 bytes: `FF 25 <abs VA of the IAT slot>`, i.e.
+///   `jmp dword ptr [IAT slot]`) — `AddressOfEntryPoint` points here; the OS loader binds the IAT
+///   slot to `_CorExeMain`'s real address before this instruction ever runs, and `_CorExeMain`
+///   is what actually reads the CLI header and hands off to the CLR.
+/// * A **`.reloc` section** (§II.25.3, the standard base-relocation table) with one
+///   `IMAGE_REL_BASED_HIGHLOW` fixup for the stub's hardcoded absolute address operand — required
+///   because the stub bakes in an absolute VA (`ImageBase + IAT RVA`), which only stays correct if
+///   the image loads at its preferred `ImageBase`; ASLR/ address-space contention can relocate it.
+///
+/// A `.dll` (`options.entry_point.is_none()`) skips all of the above — no IAT, Import Table,
+/// native stub, or `.reloc` — since `dotnet <name>.dll`/`Assembly.LoadFrom` never executes a
+/// native entry point; only the CLI header + metadata matter for a library. This matches
+/// `il_exporter`'s `is_lib` split (a library gets no native launcher at all).
 #[must_use]
 pub fn write_pe(
     metadata: &[u8],
@@ -242,11 +387,15 @@ pub fn write_pe(
     options: &PeOptions,
 ) -> Vec<u8> {
     let has_sdata = !field_rva_data.is_empty();
+    // An `.exe` (has a managed entry point) needs the native bootstrap stub — see the module doc's
+    // "Risk #1 confirmed" note. A `.dll` never carries one (nothing natively executes it).
+    let needs_bootstrap = options.entry_point.is_some();
+    let bootstrap = needs_bootstrap.then(BootstrapLayout::plan);
 
     // --- Layout pass -----------------------------------------------------------------------
     // Section count fixes the header table sizes, which fixes where the first section's raw
     // data may start on disk.
-    let num_sections: u16 = if has_sdata { 2 } else { 1 };
+    let num_sections: u16 = 1 + u16::from(has_sdata) + u16::from(needs_bootstrap);
 
     let optional_header_size = optional_header_len();
     let headers_len = DOS_STUB_LEN
@@ -256,9 +405,22 @@ pub fn write_pe(
         + u32::from(num_sections) * SECTION_HEADER_LEN;
     let headers_raw_size = align_up(headers_len, FILE_ALIGNMENT);
 
-    let text_content_len = CLI_HEADER_CB
-        + u32::try_from(metadata.len()).expect("metadata exceeds u32")
-        + u32::try_from(method_bodies.len()).expect("method bodies exceed u32");
+    // `.text` = [IAT (bootstrap only)] + CLI header + metadata + method bodies +
+    // [Import Table + stub (bootstrap only)]. The IAT sits FIRST so its RVA is simply `.text`'s
+    // own base RVA (matching a real ilasm image, and letting the stub's hardcoded operand be
+    // computed before anything else is laid out).
+    let iat_len = if needs_bootstrap { bootstrap.unwrap().iat_len() } else { 0 };
+    let cli_header_offset_in_text = iat_len;
+    let metadata_offset_in_text = cli_header_offset_in_text + CLI_HEADER_CB;
+    let bodies_offset_in_text =
+        metadata_offset_in_text + u32::try_from(metadata.len()).expect("metadata exceeds u32");
+    let import_stub_offset_in_text =
+        bodies_offset_in_text + u32::try_from(method_bodies.len()).expect("method bodies exceed u32");
+    let text_content_len = if needs_bootstrap {
+        import_stub_offset_in_text + bootstrap.unwrap().import_and_stub_len()
+    } else {
+        import_stub_offset_in_text
+    };
     let text = SectionLayout::plan(headers_raw_size, SECTION_ALIGNMENT, text_content_len);
 
     let sdata = has_sdata.then(|| {
@@ -272,17 +434,30 @@ pub fn write_pe(
         )
     });
 
-    let cli_header_rva = text.rva;
-    let metadata_rva = cli_header_rva + CLI_HEADER_CB;
-    let metadata_len = u32::try_from(metadata.len()).expect("metadata exceeds u32");
+    let reloc = needs_bootstrap.then(|| {
+        let prev = sdata.as_ref().unwrap_or(&text);
+        let rva = align_up(prev.next_rva_floor(), SECTION_ALIGNMENT);
+        let file_offset = prev.next_file_offset();
+        debug_assert_eq!(file_offset % FILE_ALIGNMENT, 0);
+        SectionLayout::plan(file_offset, rva, RELOC_CONTENT_LEN)
+    });
 
-    let last_section = sdata.as_ref().unwrap_or(&text);
+    let iat_rva = text.rva;
+    let cli_header_rva = text.rva + cli_header_offset_in_text;
+    let metadata_rva = text.rva + metadata_offset_in_text;
+    let metadata_len = u32::try_from(metadata.len()).expect("metadata exceeds u32");
+    let import_table_rva = text.rva + import_stub_offset_in_text;
+
+    let last_section = reloc.as_ref().or(sdata.as_ref()).unwrap_or(&text);
     let size_of_image = align_up(last_section.next_rva_floor(), SECTION_ALIGNMENT);
     let size_of_headers = headers_raw_size;
 
     // --- Emit --------------------------------------------------------------------------------
     let mut out = Vec::with_capacity(
-        headers_raw_size as usize + text.raw_size as usize + sdata.map_or(0, |s| s.raw_size as usize),
+        headers_raw_size as usize
+            + text.raw_size as usize
+            + sdata.map_or(0, |s| s.raw_size as usize)
+            + reloc.map_or(0, |s| s.raw_size as usize),
     );
 
     write_dos_header_and_stub(&mut out);
@@ -292,26 +467,43 @@ pub fn write_pe(
 
     write_coff_header(&mut out, num_sections, optional_header_size, options.is_dll);
 
+    // The native stub's own RVA (§II.25.4 places `AddressOfEntryPoint` at the stub, not at
+    // `.text`'s start, once a bootstrap is present — a plain "point at .text" AEP is only valid
+    // when there's no native code to run at all, i.e. no bootstrap).
+    let entry_point_rva = if needs_bootstrap {
+        import_table_rva + bootstrap.unwrap().stub_offset_in_import_region()
+    } else {
+        text.rva
+    };
     write_optional_header(
         &mut out,
         size_of_image,
         size_of_headers,
         text.virtual_size,
+        entry_point_rva,
         text.rva,
         cli_header_rva,
+        bootstrap.map(|b| (import_table_rva, iat_rva, b)),
+        reloc.map(|r| (r.rva, r.virtual_size)),
     );
 
     write_section_header(&mut out, b".text", &text, TEXT_SECTION_CHARACTERISTICS);
     if let Some(sdata) = &sdata {
         write_section_header(&mut out, b".sdata", sdata, SDATA_SECTION_CHARACTERISTICS);
     }
+    if let Some(reloc) = &reloc {
+        write_section_header(&mut out, b".reloc", reloc, RELOC_SECTION_CHARACTERISTICS);
+    }
 
     // Pad up to the end of the (FileAlignment-aligned) header region.
     out.resize(headers_raw_size as usize, 0);
     debug_assert_eq!(out.len() as u32 % FILE_ALIGNMENT, 0);
 
-    // .text: CLI header, then metadata, then method bodies.
+    // .text: [IAT] CLI header, metadata, method bodies, [Import Table + stub].
     debug_assert_eq!(out.len() as u32, text.file_offset);
+    if let Some(b) = bootstrap {
+        write_iat(&mut out, import_table_rva, b);
+    }
     write_cli_header(
         &mut out,
         metadata_rva,
@@ -320,6 +512,9 @@ pub fn write_pe(
     );
     out.extend_from_slice(metadata);
     out.extend_from_slice(method_bodies);
+    if let Some(b) = bootstrap {
+        write_import_table_and_stub(&mut out, import_table_rva, iat_rva, b);
+    }
     out.resize(text.next_file_offset() as usize, 0);
     debug_assert_eq!(out.len() as u32 % FILE_ALIGNMENT, 0);
 
@@ -328,6 +523,17 @@ pub fn write_pe(
         debug_assert_eq!(out.len() as u32, sdata.file_offset);
         out.extend_from_slice(field_rva_data);
         out.resize(sdata.next_file_offset() as usize, 0);
+        debug_assert_eq!(out.len() as u32 % FILE_ALIGNMENT, 0);
+    }
+
+    // .reloc: one HIGHLOW fixup for the stub's hardcoded absolute-VA operand.
+    if let (Some(reloc), Some(b)) = (&reloc, bootstrap) {
+        debug_assert_eq!(out.len() as u32, reloc.file_offset);
+        let stub_rva = import_table_rva + b.stub_offset_in_import_region();
+        // The fixup targets the stub's 4-byte operand, which starts 2 bytes into the 6-byte
+        // `FF 25 <VA>` stub (past the `FF 25` opcode).
+        write_base_relocation_block(&mut out, stub_rva + 2);
+        out.resize(reloc.next_file_offset() as usize, 0);
         debug_assert_eq!(out.len() as u32 % FILE_ALIGNMENT, 0);
     }
 
@@ -390,13 +596,19 @@ fn write_coff_header(out: &mut Vec<u8>, num_sections: u16, optional_header_size:
 
 /// Writes the PE32 optional header (§II.25.2.3.1/.2/.3): standard fields, NT-specific fields,
 /// then the 16-entry data directory (all zero except `DataDirectory[14]`, the CLI header).
+/// `bootstrap` is `Some((import_table_rva, iat_rva, layout))` when a native bootstrap stub is
+/// present (an `.exe` — see `write_pe`'s module doc); `reloc` is `Some((rva, size))` for the
+/// matching `.reloc` section. Both `None` for a `.dll`.
 fn write_optional_header(
     out: &mut Vec<u8>,
     size_of_image: u32,
     size_of_headers: u32,
     size_of_text: u32,
+    entry_point_rva: u32,
     text_rva: u32,
     cli_header_rva: u32,
+    bootstrap: Option<(u32, u32, BootstrapLayout)>,
+    reloc: Option<(u32, u32)>,
 ) {
     // --- Standard fields (§II.25.2.3.1) ---
     out.extend_from_slice(&PE32_MAGIC.to_le_bytes());
@@ -405,7 +617,7 @@ fn write_optional_header(
     out.extend_from_slice(&align_up(size_of_text, FILE_ALIGNMENT).to_le_bytes()); // SizeOfCode.
     out.extend_from_slice(&0u32.to_le_bytes()); // SizeOfInitializedData (folded into .text/.sdata's own accounting; ECMA-335 images conventionally leave this 0, matching ilasm).
     out.extend_from_slice(&0u32.to_le_bytes()); // SizeOfUninitializedData.
-    out.extend_from_slice(&text_rva.to_le_bytes()); // AddressOfEntryPoint: no native entry stub, so this points at .text start (unused by CoreCLR, which reads the CLI header's EntryPointToken instead).
+    out.extend_from_slice(&entry_point_rva.to_le_bytes()); // AddressOfEntryPoint: the native bootstrap stub's RVA for a .exe (see module doc's "Risk #1 confirmed"), or .text's own start for a .dll (never executed, so any in-section RVA is inert).
     out.extend_from_slice(&text_rva.to_le_bytes()); // BaseOfCode.
     out.extend_from_slice(&0u32.to_le_bytes()); // BaseOfData (PE32-only field).
 
@@ -434,13 +646,22 @@ fn write_optional_header(
 
     // --- Data directories (§II.25.2.3.3) ---
     for i in 0..NUMBER_OF_RVA_AND_SIZES as usize {
-        if i == DATA_DIRECTORY_CLI_HEADER {
-            out.extend_from_slice(&cli_header_rva.to_le_bytes());
-            out.extend_from_slice(&CLI_HEADER_CB.to_le_bytes());
+        let entry = if i == DATA_DIRECTORY_CLI_HEADER {
+            Some((cli_header_rva, CLI_HEADER_CB))
+        } else if i == DATA_DIRECTORY_IMPORT_TABLE {
+            // Size is the Import Directory Table's own span (descriptor rows only, not the
+            // ILT/Hint-Name/name-string/stub bytes that follow it in the same region).
+            bootstrap.map(|(import_table_rva, _, _)| (import_table_rva, IMPORT_DIRECTORY_LEN))
+        } else if i == DATA_DIRECTORY_IAT {
+            bootstrap.map(|(_, iat_rva, b)| (iat_rva, b.iat_len()))
+        } else if i == DATA_DIRECTORY_BASE_RELOCATION_TABLE {
+            reloc
         } else {
-            out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes());
-        }
+            None
+        };
+        let (rva, size) = entry.unwrap_or((0, 0));
+        out.extend_from_slice(&rva.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
     }
 }
 
@@ -481,6 +702,81 @@ fn write_cli_header(out: &mut Vec<u8>, metadata_rva: u32, metadata_len: u32, ent
         out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes());
     }
+}
+
+/// Writes the IAT (§II.25.4.2) at the very start of `.text`: one Hint/Name RVA `DWORD` (pointing
+/// at the Hint/Name entry inside the "Import Table + stub" region emitted later, at
+/// `import_table_rva + BootstrapLayout::hint_name_offset`) + a null-terminator `DWORD`. Before the
+/// OS loader binds it, this is byte-identical to the ILT (both start life as a copy of the same
+/// Hint/Name RVA, per §II conventions) — the loader overwrites this slot in memory with
+/// `_CorExeMain`'s resolved address at load time; the on-disk bytes are only ever this pre-bind
+/// form.
+fn write_iat(out: &mut Vec<u8>, import_table_rva: u32, b: BootstrapLayout) {
+    let hint_name_rva = import_table_rva + b.hint_name_offset();
+    out.extend_from_slice(&hint_name_rva.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // null terminator DWORD.
+}
+
+/// Writes the "Import Table + stub" region (§II.25.3.1's referenced import-table conventions +
+/// the native bootstrap stub) at the tail of `.text`: Import Directory Table, ILT, Hint/Name
+/// entry, `"mscoree.dll\0"` name, padding, then the `FF 25 <abs VA>` stub. `import_table_rva` is
+/// this region's own base RVA; `iat_rva` is the (already-emitted, earlier-in-`.text`) IAT's RVA,
+/// which both the descriptor's `FirstThunk` and the stub's absolute-VA operand reference.
+fn write_import_table_and_stub(out: &mut Vec<u8>, import_table_rva: u32, iat_rva: u32, b: BootstrapLayout) {
+    let region_start = out.len();
+    let ilt_rva = import_table_rva + b.ilt_offset();
+    let hint_name_rva = import_table_rva + b.hint_name_offset();
+    let dll_name_rva = import_table_rva + b.dll_name_offset();
+
+    // Import Directory Table: one real IMAGE_IMPORT_DESCRIPTOR (§II conventions, 20 bytes) +
+    // one all-zero terminator descriptor (20 bytes).
+    out.extend_from_slice(&ilt_rva.to_le_bytes()); // OriginalFirstThunk (the ILT).
+    out.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp: 0 (determinism; also "not bound" per §II conventions).
+    out.extend_from_slice(&0u32.to_le_bytes()); // ForwarderChain: unused.
+    out.extend_from_slice(&dll_name_rva.to_le_bytes()); // Name RVA ("mscoree.dll").
+    out.extend_from_slice(&iat_rva.to_le_bytes()); // FirstThunk (the IAT).
+    out.extend_from_slice(&[0u8; IMPORT_DESCRIPTOR_LEN as usize]); // null terminator descriptor.
+
+    // ILT: identical pre-bind shape to the IAT (§II conventions — both point at the same
+    // Hint/Name RVA before binding).
+    out.extend_from_slice(&hint_name_rva.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // null terminator DWORD.
+
+    // Hint/Name entry: 2-byte Hint (0, no ordinal import) + "_CorExeMain\0".
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(COR_EXE_MAIN);
+
+    // "mscoree.dll\0".
+    out.extend_from_slice(MSCOREE_DLL);
+
+    // Pad to the 16-byte-aligned stub start (region-relative, not RVA-relative — the region's
+    // own start may not itself be 16-byte aligned within .text, but ilasm's convention aligns the
+    // STUB specifically, which is what matters for disassembly tidiness; not load-bearing).
+    let region_len_so_far = u32::try_from(out.len() - region_start).unwrap();
+    let pad = b.stub_offset_in_import_region() - region_len_so_far;
+    out.resize(out.len() + pad as usize, 0);
+    debug_assert_eq!(u32::try_from(out.len() - region_start).unwrap(), b.stub_offset_in_import_region());
+
+    // Native stub: `jmp dword ptr [iat_rva]` = FF 25 <abs VA of the IAT slot>.
+    out.extend_from_slice(&ENTRY_STUB_OPCODE);
+    let abs_va = IMAGE_BASE + iat_rva;
+    out.extend_from_slice(&abs_va.to_le_bytes());
+}
+
+/// Writes a `.reloc` section's single base-relocation block (§II.25.3): `PageRVA` (the
+/// 4KiB-aligned page `fixup_rva` falls in), `BlockSize` (this block's total byte length, header
+/// included, rounded up to a 4-byte boundary per §II.25.3), then one `IMAGE_REL_BASED_HIGHLOW`
+/// entry `(type<<12)|(fixup_rva - PageRVA)`, padded with an `IMAGE_REL_BASED_ABSOLUTE`
+/// (type 0, a documented no-op padding entry) `u16` if needed to reach the 4-byte boundary.
+fn write_base_relocation_block(out: &mut Vec<u8>, fixup_rva: u32) {
+    const PAGE_SIZE: u32 = 0x1000;
+    let page_rva = fixup_rva & !(PAGE_SIZE - 1);
+    let offset_in_page = fixup_rva - page_rva;
+    let entry = (u16::from(IMAGE_REL_BASED_HIGHLOW) << 12) | u16::try_from(offset_in_page).unwrap();
+    out.extend_from_slice(&page_rva.to_le_bytes());
+    out.extend_from_slice(&RELOC_CONTENT_LEN.to_le_bytes()); // BlockSize: 8-byte header + 1 entry (2B) + 2B ABSOLUTE padding = 12.
+    out.extend_from_slice(&entry.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // IMAGE_REL_BASED_ABSOLUTE padding entry.
 }
 
 #[cfg(test)]
@@ -665,7 +961,10 @@ mod tests {
 
         assert_eq!(pe.e_lfanew, DOS_STUB_LEN);
         assert_eq!(pe.machine, IMAGE_FILE_MACHINE_I386);
-        assert_eq!(pe.num_sections, 1, "no field_rva_data => no .sdata section");
+        // 2, not 1: no field_rva_data => no .sdata, but `entry_point: Some(..)` means this is an
+        // `.exe` => the native bootstrap stub's `.reloc` section is always present (see
+        // `write_pe`'s module doc's "Risk #1 confirmed" note).
+        assert_eq!(pe.num_sections, 2, "no .sdata (no field_rva_data), but .reloc IS present (has an entry point)");
         assert_eq!(pe.time_date_stamp, 0, "determinism: zero COFF timestamp");
         assert_eq!(
             pe.characteristics,

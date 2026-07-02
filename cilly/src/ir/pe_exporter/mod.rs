@@ -14,16 +14,22 @@
 //!   populate → size → serialize pipeline. *(Phase 1a: implemented + unit-tested)*
 //! * [`body`] — method bodies: tiny/fat headers, opcode bytes, branch layout, fat EH sections.
 //!   *(Phase 1a: implemented + unit-tested)*
-//! * [`pe`] — the PE/COFF container and CLI header. *(Phase 1a: implemented + unit-tested)*
-//!
-//! Phase 1a status: each module is unit-tested in isolation (heaps/sig/tables/body/pe), but no
-//! end-to-end driver wires `tables::MetadataBuilder` + `body::assemble_method` +
-//! `pe::write_pe` into a single `Assembly::export_pe(...)` entry point yet — that integration,
-//! plus the "hand-built two-method assembly loads and runs under `dotnet`" acceptance check from
-//! `docs/PE_EMISSION_PLAN.md`, is the next step (Phase 1a close-out / Phase 1b).
+//! * [`pe`] — the PE/COFF container and CLI header, including the native `mscoree.dll`
+//!   `_CorExeMain` bootstrap stub (IAT/Import Table/`.reloc`) an `.exe` needs to satisfy the OS's
+//!   native PE loader before the CLR ever inspects the CLI header. *(Phase 1a: implemented +
+//!   unit-tested)*
+//! * [`export`] — `export_pe`: the top-level driver wiring `tables::MetadataBuilder` +
+//!   `body::assemble_method` + the RVA layout pass + `pe::write_pe` into one entry point.
+//!   *(Phase 1a MILESTONE PROVEN 2026-07-02: a hand-built static-entrypoint-calling-
+//!   `Console.WriteLine` `Assembly`, exported with no `ilasm` anywhere, loads and runs under a
+//!   real `dotnet` host — `export::tests::e2e_hand_built_assembly_runs_under_dotnet`. Only the
+//!   inventory subset that test exercises is wired; const-data `FieldRVA` blobs, non-`ByteBuffer`
+//!   static-field defaults, and `MainModule` method-count partitioning are loud `todo!()`s left
+//!   for Phase 1b — see `export`'s module doc.)*
 
 pub mod heaps;
 pub mod sig;
 pub mod tables;
 pub mod body;
 pub mod pe;
+pub mod export;

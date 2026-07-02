@@ -329,9 +329,33 @@ const SORTED_TABLES: &[u32] = &[
 ];
 
 impl MetadataBuilder {
+    /// Builds a fresh, empty builder — already seeded with the mandatory `<Module>` pseudo-`TypeDef`
+    /// (§II.22.37: "The first row of the TypeDef table represents the pseudo class that acts as
+    /// the parent for functions and variables defined at module scope" — every real assembly's
+    /// user-defined types start at `TypeDef` **row 2**, never row 1). Discovered the hard way
+    /// during the Phase 1a E2E milestone: without this, the first `add_type_def` call (e.g. for
+    /// `MainModule`) became TypeDef row 1 itself, and the CLR silently reinterpreted it AS the
+    /// `<Module>` pseudo-type — its methods were then treated as ownerless "global methods" (no
+    /// enclosing class at all, confirmed via `monodis`), and the real load failure surfaced many
+    /// steps downstream as an opaque `BadImageFormatException: Index not found`.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        let mut mb = Self::default();
+        // `<Module>`: TypeAttributes = 0 (not-public — it's never referenced by name), no fields,
+        // no methods (`field_list`/`method_list` = 1, the same "run start" convention every other
+        // `add_type_def` caller gets — an empty run when nothing follows it), Extends = NIL (the
+        // pseudo-type has no base type at all, unlike every real class).
+        let name_off = mb.strings.intern("<Module>");
+        let namespace_off = mb.strings.intern("");
+        mb.type_def.push(TypeDefRow {
+            flags: 0,
+            name: name_off,
+            namespace: namespace_off,
+            extends: 0,
+            field_list: 1,
+            method_list: 1,
+        });
+        mb
     }
 
     /// Interns an `AssemblyRef` row (§II.22.5), returning its token. `name` is the `.NET`
@@ -605,6 +629,23 @@ impl MetadataBuilder {
         let tok = Token::new(Token::TABLE_MODULE_REF, rid);
         self.module_ref_cache.insert(Box::from(lib), tok);
         tok
+    }
+
+    /// Records that `method` (an `Assembly`-level `MethodDefIdx`) was emitted as the `MethodDef`
+    /// row `tok`, so [`TokenSink::method_token`] resolves later in-assembly calls to `method`
+    /// directly instead of (incorrectly) synthesizing a `MemberRef` to itself. Callers driving the
+    /// populate pass (e.g. `export::export_pe`) call this once per method immediately after
+    /// [`MetadataBuilder::add_method`], mirroring how [`MetadataBuilder::add_type_def`]'s caller
+    /// is expected to add a class's methods only after its own `TypeDef` row exists.
+    pub fn register_method_def(&mut self, method: MethodDefIdx, tok: Token) {
+        self.method_def_cache.insert(method, tok);
+    }
+
+    /// Looks up the `MethodDef` token previously recorded via
+    /// [`MetadataBuilder::register_method_def`], if any.
+    #[must_use]
+    pub fn method_def_token(&self, method: MethodDefIdx) -> Option<Token> {
+        self.method_def_cache.get(&method).copied()
     }
 
     /// Patches the body RVA of a previously-added `MethodDef` row (§II.22.26 `RVA` column) once
@@ -1544,8 +1585,12 @@ impl MetadataBuilder {
 
     /// Finds-or-creates an `AssemblyRef` row for `name`, applying the same BCL-vs-consumer split
     /// as `il_exporter`'s `is_bcl_assembly` (this local port avoids depending on `il_exporter`,
-    /// per the hard constraint that `pe_exporter` may not import it).
-    fn find_or_create_assembly_ref(&mut self, name: &str) -> Token {
+    /// per the hard constraint that `pe_exporter` may not import it). Public so other `pe_exporter`
+    /// modules (e.g. `export::export_pe`, bootstrapping a `System.Object`/`System.ValueType`
+    /// `TypeRef`) share the same deduplicated row instead of calling the always-inserts
+    /// [`MetadataBuilder::assembly_ref`] directly and creating duplicate rows for repeated
+    /// bootstrap references.
+    pub fn find_or_create_assembly_ref(&mut self, name: &str) -> Token {
         for (i, row) in self.assembly_ref.iter().enumerate() {
             if self.strings_eq(row.name, name) {
                 return Token::new(Token::TABLE_ASSEMBLY_REF, u32::try_from(i + 1).unwrap());
@@ -1570,12 +1615,29 @@ fn is_bcl_assembly(name: &str) -> bool {
         || matches!(name, "mscorlib" | "netstandard" | "WindowsBase")
 }
 
-/// This backend (mirroring `il_exporter`) never splits a class's mangled name into a metadata
-/// `TypeNamespace`/`TypeName` pair — the whole name goes in `TypeName` and `TypeNamespace` is
-/// always empty. Kept as a named helper (rather than inlined `("", name)`) so a future namespace
-/// split is a one-line change.
+/// Splits an EXTERNAL type's dotted name into a metadata `TypeNamespace`/`TypeName` pair
+/// (§II.22.38) at the last `.` — e.g. `"System.Console"` -> `("System", "Console")`. Needed for
+/// every `TypeRef` this writer creates to a real BCL type: `il_exporter`'s textual
+/// `[System.Console]System.Console::WriteLine` syntax lets ilasm itself perform this split when it
+/// assembles the `TypeRef` row (the text form doesn't distinguish `Namespace`+`Name` from a single
+/// dotted `Name`, but the *binary* metadata row genuinely has two separate columns, and a real BCL
+/// type's `TypeDef` in `System.Console.dll`/`System.Private.CoreLib.dll` has `Namespace="System"`,
+/// `Name="Console"` — a `TypeRef` with `Namespace=""`, `Name="System.Console"` matches NO type,
+/// which is a `TypeLoadException`, not a `BadImageFormatException`, so it surfaces well past the
+/// PE/CLI-header layer). Confirmed against a real CoreCLR-`ilasm`-produced reference image during
+/// the Phase 1a E2E milestone (`TypeRef` row for `System.Console` there has `Namespace="System"`,
+/// `Name="Console"`).
+///
+/// Only used for `TypeRef` (external, §II.22.38 `TypeNamespace`); `TypeDef` (this assembly's own
+/// classes, §II.22.37) intentionally stays UNSPLIT — `il_exporter` never gives its own mangled
+/// Rust type names a namespace concept either (its `.class 'MangledName' { … }` is one quoted
+/// identifier with no `.` interpreted specially, and nothing outside this backend's own generated
+/// code ever needs to resolve one of its `TypeDef`s by namespace).
 fn split_namespace(name: &str) -> (&str, &str) {
-    ("", name)
+    match name.rfind('.') {
+        Some(idx) => (&name[..idx], &name[idx + 1..]),
+        None => ("", name),
+    }
 }
 
 /// The token queries `body.rs` needs while assembling instruction bytes: every operand that is a
@@ -1812,10 +1874,24 @@ mod tests {
     #[test]
     fn metadata_builder_default_heaps_are_empty() {
         let mb = MetadataBuilder::new();
-        assert_eq!(mb.strings.as_bytes(), b"\0");
+        // The `#Strings` heap is NOT empty: `new()` seeds the mandatory `<Module>` pseudo-`TypeDef`
+        // row (§II.22.37 — see `MetadataBuilder::new`'s doc comment), which interns "<Module>".
+        assert_eq!(mb.strings.as_bytes(), b"\0<Module>\0");
         assert_eq!(mb.blobs.as_bytes(), &[0]);
         assert_eq!(mb.guids.as_bytes(), &[] as &[u8]);
         assert_eq!(mb.user_strings.as_bytes(), b"\0");
+    }
+
+    #[test]
+    fn metadata_builder_new_seeds_the_module_pseudo_type_as_type_def_row_1() {
+        // §II.22.37: "The first row of the TypeDef table represents the pseudo class that acts
+        // as the parent for functions and variables defined at module scope." A real class added
+        // afterwards must land on row 2, never row 1 — landing on row 1 makes the CLR treat its
+        // methods as ownerless "global methods" (confirmed via `monodis` during development; see
+        // `MetadataBuilder::new`'s doc comment for the full story).
+        let mut mb = MetadataBuilder::new();
+        let tok = mb.add_type_def("", "MainModule", false, None, None, None, &[]);
+        assert_eq!(tok.rid(), 2, "the first real class def must be TypeDef row 2, not row 1");
     }
 
     #[test]
@@ -2043,7 +2119,9 @@ mod tests {
         // One string interned via a Field so #Strings is nonempty and independently checkable.
         let type_tok = mb.add_type_def("", "MyType", false, None, None, None, &[]);
         assert_eq!(type_tok.table(), Token::TABLE_TYPE_DEF);
-        assert_eq!(type_tok.rid(), 1);
+        // Row 1 is always the mandatory `<Module>` pseudo-type (§II.22.37) `MetadataBuilder::new`
+        // seeds — the first REAL class def lands on row 2.
+        assert_eq!(type_tok.rid(), 2);
 
         let sig_blob = {
             let mut out = Vec::new();
@@ -2094,13 +2172,15 @@ mod tests {
 
         let counts: HashMap<u32, usize> = header.counts.into_iter().collect();
         assert_eq!(counts[&Token::TABLE_MODULE], 1);
-        assert_eq!(counts[&Token::TABLE_TYPE_DEF], 1);
+        // 2, not 1: row 1 is the mandatory `<Module>` pseudo-type `MetadataBuilder::new` seeds
+        // (§II.22.37), row 2 is the real `MyType` added above.
+        assert_eq!(counts[&Token::TABLE_TYPE_DEF], 2);
         assert_eq!(counts[&Token::TABLE_METHOD_DEF], 1);
         assert_eq!(counts[&Token::TABLE_MEMBER_REF], 1);
         assert_eq!(counts[&Token::TABLE_TYPE_REF], 1);
         assert_eq!(counts[&Token::TABLE_ASSEMBLY_REF], 1);
 
-        // Decode the TypeDef row's Name column and check it round-trips to "MyType" via #Strings.
+        // Decode the TypeDef rows' Name columns and check "MyType" round-trips via #Strings.
         let row_bytes = &reader.stream("#~")[header.row_data_offset..];
         // Module row: Generation(2) + Name(2) + Mvid(2) + EncId(2) + EncBaseId(2) = 10 bytes (all
         // narrow since nothing here exceeds 0xFFFF).
@@ -2114,15 +2194,20 @@ mod tests {
             u16::from_le_bytes(row_bytes[type_ref_start + 2..type_ref_start + 4].try_into().unwrap());
         assert_eq!(reader.strings_at(u32::from(type_ref_name_off)), "Console");
 
-        // TypeDef rows come after TypeRef (1 row * 6 bytes).
+        // TypeDef rows come after TypeRef (1 row * 6 bytes). Row 1 (the `<Module>` pseudo-type)
+        // comes first; "MyType" is row 2.
         let type_def_start = type_ref_start + 6;
         // TypeDef: Flags(4) + Name(2) + Namespace(2) + Extends(2, coded) + FieldList(2) +
         // MethodList(2) = 14 bytes.
-        let type_def_name_off =
+        let module_pseudo_type_name_off =
             u16::from_le_bytes(row_bytes[type_def_start + 4..type_def_start + 6].try_into().unwrap());
+        assert_eq!(reader.strings_at(u32::from(module_pseudo_type_name_off)), "<Module>");
+        let my_type_start = type_def_start + 14;
+        let type_def_name_off =
+            u16::from_le_bytes(row_bytes[my_type_start + 4..my_type_start + 6].try_into().unwrap());
         assert_eq!(reader.strings_at(u32::from(type_def_name_off)), "MyType");
         let method_list = u16::from_le_bytes(
-            row_bytes[type_def_start + 10..type_def_start + 12]
+            row_bytes[my_type_start + 10..my_type_start + 12]
                 .try_into()
                 .unwrap(),
         );
@@ -2130,7 +2215,7 @@ mod tests {
 
         // MethodDef rows: RVA(4) + ImplFlags(2) + Flags(2) + Name(2) + Signature(2) +
         // ParamList(2) = 14 bytes.
-        let method_def_start = type_def_start + 14;
+        let method_def_start = my_type_start + 14;
         let method_name_off = u16::from_le_bytes(
             row_bytes[method_def_start + 8..method_def_start + 10]
                 .try_into()
@@ -2215,15 +2300,21 @@ mod tests {
     fn interface_impl_rows_are_emitted_sorted_by_class() {
         let mut mb = MetadataBuilder::new();
         // Two TypeDefs, each implementing the same (single) interface TypeRef, added in an order
-        // that would violate Class-sort if rows were emitted in insertion order.
+        // that would violate Class-sort if rows were emitted in insertion order. `MetadataBuilder::
+        // new` already seeds the mandatory `<Module>` pseudo-type at TypeDef rid 1 (§II.22.37), so
+        // the first REAL class def below (`BType`) lands on rid 2, not rid 1.
         let ext = mb.assembly_ref("SomeLib", AssemblyRefTarget::NameOnly);
         let iface = mb.type_ref(Some(ext), "", "ISomeInterface");
 
-        // Add type B first (would become TypeDef rid 1)…
+        // Add type B first (becomes TypeDef rid 2, after the seeded `<Module>` at rid 1) — its
+        // `implements: &[iface]` already pushes one InterfaceImpl row for class=2 via
+        // `add_type_def` itself…
         let _b = mb.add_type_def("", "BType", false, None, None, None, &[iface]);
-        // …then type A (rid 2) also implementing it — InterfaceImpl rows are pushed in
-        // (class=1, iface), (class=2, iface) order already here since add_type_def appends in
-        // call order, so exercise an out-of-order case explicitly via the standalone API.
+        // …then push a second class=2 row plus a class=1 row (referencing `<Module>` itself, a
+        // synthetic lower-rid "class" value — §II.22.23 doesn't forbid a pseudo-type row
+        // appearing in InterfaceImpl; this test only cares about sort-order mechanics, not
+        // semantic validity) directly via the standalone API, so insertion order (2, 2, 1)
+        // disagrees with the required ascending-by-Class sort order.
         mb.interface_impl(Token::new(Token::TABLE_TYPE_DEF, 2), iface);
         mb.interface_impl(Token::new(Token::TABLE_TYPE_DEF, 1), iface);
 
@@ -2250,7 +2341,7 @@ mod tests {
             classes.windows(2).all(|w| w[0] <= w[1]),
             "InterfaceImpl rows must be sorted ascending by Class: {classes:?}"
         );
-        assert_eq!(classes, vec![1, 1, 2], "the three rows added (1 via add_type_def + 2 standalone)");
+        assert_eq!(classes, vec![1, 2, 2], "the three rows added (class=2 via add_type_def's own implements + class=2, class=1 standalone)");
     }
 
     #[test]
@@ -2437,7 +2528,9 @@ mod tests {
         let cref = asm.alloc_class_ref(ClassRef::new(name, None, false, [].into()));
 
         let tok = mb.add_type_def("", "MyType", false, None, None, None, &[]);
-        assert_eq!(tok.rid(), 1);
+        // Rid 2, not 1: `MetadataBuilder::new` seeds the mandatory `<Module>` pseudo-type at
+        // TypeDef rid 1 (§II.22.37) — the first real class def lands on rid 2.
+        assert_eq!(tok.rid(), 2);
 
         let coded = TypeDefOrRefResolver::type_def_or_ref(&mut mb, cref, &mut asm);
         assert_eq!(decode_type_def_or_ref(coded), tok, "must resolve to the TypeDef, not create a TypeRef");
