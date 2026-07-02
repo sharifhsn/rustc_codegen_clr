@@ -20,7 +20,31 @@ generics), delegates **including capturing closures**, **implementing .NET inter
 expression trees), `Task` bridging both directions, and a `box` IR primitive. The DX is one command
 (`cargo dotnet new|build|run|test|pack`, MSBuild auto-build, NuGet), and whole-program **NativeAOT is
 proven** (1.6–3.5× over JIT on real workloads). What remains is not capability: it is distribution,
-industrial-grade continuous trust, performance parity on allocation-heavy code, and debuggability.
+industrial-grade continuous trust, and performance parity on allocation-heavy code.
+
+## The debugging story
+
+Default builds now emit a real `foo.pdb` next to `foo.dll`/`.exe`, written entirely by this repo's
+own hand-rolled Portable PDB writer (`cilly::ir::pe_exporter::pdb`, `docs/PE_EMISSION_PLAN.md`
+Phase 2, DONE) — no `ilasm` anywhere in the default path (`DIRECT_PE` defaults to `true` and now
+also builds the PDB; `DIRECT_PE=0` is the ilasm escape hatch, unchanged). Unhandled-exception stack
+traces resolve to real Rust source: a fresh rebuild of the `cargo_tests/cd_pdb` probe against
+current `HEAD` under the default path prints frames reading
+`deep_leaf_for_pdb_probe() in .../cd_pdb/src/main.rs:line 19` and
+`main() in .../cd_pdb/src/main.rs:line 32` — the produced `.pdb` is a 301596-byte `BSJB`-magic
+file, and both a MIR-inlining mis-attribution bug (a frame previously resolving into
+`memchr.rs` instead of the user's own source) and a PDB-file-naming bug in the embedded-launcher
+template (unpacking the PDB under the wrong filename, so CoreCLR's loader silently found none) were
+found and fixed while closing this out. `cargo test -p cilly --lib pe_exporter` is 119/0 (grown
+from the 99-test Phase-1 baseline). **Remaining limitations**: no LocalScope/LocalVariable tables
+(local-variable names are not resolvable while stepping — only file:line sequence points); nobody
+has yet driven an actual VS Code breakpoint/step-through session against the writer's output (the
+underlying primitive — sequence points — is the same one stack-trace resolution already proves
+works, but the interactive-debugger UX itself is unverified); and the post-PDB-writer commits have
+not yet been re-run through the full Docker `::stable` serial gate (the 424/16-identical-to-ilasm
+gate result on record predates the PDB writer, from the Phase-1-only `DIRECT_PE` flip) — the
+verified-in-this-session evidence for Phase 2 itself is the unit suite, the `cd_pdb` probe, and a
+`cd_collections` 141/141 slice, all rebuilt fresh against current `HEAD`.
 
 ## Verified capability ledger
 
@@ -45,6 +69,7 @@ run on the **real .NET backend**, `CARGO_DOTNET_BACKEND=native`) and/or the Dock
 | BCL breadth | collections/DateTime/Guid/Regex/Json/… idiomatic wrappers | `cd_bcl` 313/313, `cd_json` 47/47 |
 | Tooling | `cargo dotnet` full pipeline, dual-mode (installed/DEV), macOS-ARM native + Docker Linux, `--dotnet 8|9`, MSBuild `RustDotnet.targets`, `pack`→`.nupkg` | scaffolds + cd_* consumers build hands-free |
 | Perf | MIR-layer inlining + SROA + const-hoist: `iter_sum` 1764→156 ms, `iter_zip` 2765→216 ms; **whole-program NativeAOT proven** (FieldRVA sizing fixed), AOT 1.6–3.5× over JIT | `bench_rs_vs_cs`, perf docs |
+| Direct PE + PDB writer | Hand-rolled ECMA-335 PE writer is the **default** linker path, no `ilasm`; hand-rolled Portable PDB writer emits `foo.pdb`, stack traces resolve `file.rs:line` | `cargo test -p cilly --lib pe_exporter` 119/0, `cd_pdb` probe, `docs/PE_EMISSION_PLAN.md` |
 
 ## Honest remaining surface
 
@@ -71,9 +96,10 @@ cleanup-block bloat under `panic=unwind` (~2× on unwind-heavy code; `NO_UNWIND`
 **Exporters.** IL: production (ilasm path, now the fallback). C: ~80% prototype (33 cold-path
 `todo!`). JVM: skeleton. **Direct PE writer** (`cilly::ir::pe_exporter`, no ilasm): **Phase 1
 COMPLETE and now the default linker path** (`DIRECT_PE` defaults to `true`; `DIRECT_PE=0` falls
-back to ilasm) — see [PE_EMISSION_PLAN.md](PE_EMISSION_PLAN.md). **Portable PDBs (Phase 2)** are
-next: sequence points from the already-threaded MIR spans → breakpoints/stepping on Rust source
-under a .NET debugger.
+back to ilasm), and **Phase 2 (Portable PDBs) is also COMPLETE** — default builds now emit a
+standalone `foo.pdb` next to `foo.dll`/`.exe` with no `ilasm` involved — see
+[PE_EMISSION_PLAN.md](PE_EMISSION_PLAN.md). LocalScope/LocalVariable tables (local-variable-name
+debugging) remain a documented stretch item; a manual VS Code step-through has not been done.
 
 ## Corrections to the older docs (read this before trusting them)
 
@@ -95,12 +121,15 @@ under a .NET debugger.
    auto-shim, standalone hello-world demo repo, prebuilt-toolchain `cargo dotnet setup`.
 2. **CI industrialization** — fork CI running the gate + fatal checker on pinned nightly; weekly
    nightly-drift canary; manual heavy jobs (soak/coretests).
-3. **Direct PE emission (Phase 1 DONE) + Portable PDBs (Phase 2, NEXT)** — the ilasm dependency
+3. **Direct PE emission (Phase 1 DONE) + Portable PDBs (Phase 2 DONE)** — the ilasm dependency
    (per-runtime assembler, PE32 arm64 mismatch, 1023-char class-name cap) is now bypassed by default:
    the hand-rolled ECMA-335 writer (`cilly::ir::pe_exporter`) is the default linker path (`DIRECT_PE`
-   defaults to `true`; `DIRECT_PE=0` escape-hatches back to ilasm). Next: thread the already-present
-   MIR spans through into sequence points → **breakpoints/stepping on Rust source under a .NET
-   debugger**. The largest remaining DX gap.
+   defaults to `true`; `DIRECT_PE=0` escape-hatches back to ilasm), and it now also writes the
+   `foo.pdb` — sequence points from the already-threaded MIR spans resolve real `file.rs:line` in
+   managed stack traces with zero `ilasm` involvement. Remaining: a manual VS Code
+   breakpoints/stepping session (mechanism should work — sequence points are the same primitive —
+   but nobody has clicked through it yet), and LocalScope/LocalVariable tables for local-variable-
+   name inspection while stepping.
 4. **Deferred big bets** — pooled allocator vs the 7.9× alloc floor; memory-model litmus audit;
    upstreaming universal fixes to FractalFir; a tier-3 `*-unknown-dotnet` rustc target as the long-game
    end state.

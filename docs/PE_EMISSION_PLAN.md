@@ -5,7 +5,14 @@
 > Rust source (breakpoints/stepping/stack-traces on `.rs` files under any .NET debugger).
 > Status: **Phase 1 COMPLETE** — the hand-rolled PE writer (`cilly::ir::pe_exporter`) is now the
 > **default** linker path (`DIRECT_PE` defaults to `true`); ilasm (`il_exporter`) stays reachable,
-> byte-for-byte unchanged, behind `DIRECT_PE=0` as an escape hatch. Phase 2 (Portable PDBs) is next.
+> byte-for-byte unchanged, behind `DIRECT_PE=0` as an escape hatch. **Phase 2 (Portable PDBs) is
+> COMPLETE** — default builds emit a standalone `foo.pdb` next to `foo.dll`/`.exe`, and managed
+> stack traces resolve real `file.rs:line` locations with no `ilasm` in the loop. Two of the three
+> Phase-0 span-quality gaps are closed (outermost-inline-callsite attribution; the direct-PE path
+> never had the inlining-hint gap to begin with); the third (`<WORKSPACE>` remap) was confirmed
+> out-of-scope (rustc-fork-harness-only, doesn't affect ordinary crate builds). LocalScope/
+> LocalVariable (tables 0x32/0x33) were **not** built — sequence points alone clear the acceptance
+> bar (file:line stack traces); local-variable-name debugging remains a stretch item.
 > Owner constraint: the CIL typechecker is never weakened; the ilasm path stays available behind the
 > flag indefinitely as a fallback.
 
@@ -66,7 +73,7 @@ BSJB metadata blob with different tables).
 | `tables.rs` | The needed metadata tables (Module, TypeRef, TypeDef, Field, MethodDef, Param, InterfaceImpl, MemberRef, Constant, CustomAttribute, ClassLayout, FieldLayout, StandAloneSig, ModuleRef, ImplMap, FieldRVA, Assembly, AssemblyRef, TypeSpec, MethodSpec) — populate-then-size-then-serialize, sorted-table invariants, coded-index width computation |
 | `body.rs` | Method bodies: tiny/fat headers, opcode byte emission for the ~80 forms, two-pass branch layout (long-form first; short-form compaction optional later), maxstack (reuse exporter's block-based bound), fat EH sections (always fat = always valid) |
 | `pe.rs` | PE container: DOS stub, COFF/optional headers, `.text`(IL+metadata)/`.sdata`(FieldRVA)/`.reloc`, CLI header (EntryPointToken, ILONLY corflags), **byte-compare headers against CoreCLR ilasm output early** (the Mono-PE32-on-arm64 rejection gotcha lives here) |
-| `pdb.rs` (Phase 2) | Portable PDB: #Pdb stream, Document / MethodDebugInformation (delta-compressed sequence points from `SourceFileInfo` roots) / LocalScope / LocalVariable tables; DebugDirectory CodeView entry in the PE |
+| `pdb.rs` (Phase 2, **DONE**) | Portable PDB: #Pdb stream, Document / MethodDebugInformation (delta-compressed sequence points from `SourceFileInfo` roots) tables; DebugDirectory CodeView + PdbChecksum entries in the PE. LocalScope/LocalVariable tables not built (optional; not needed to clear the acceptance bar) |
 
 Entry: `Assembly::export_pe(...)` invoked from the linker where `il_exporter` is called today,
 selected by a `config!` flag (`DIRECT_PE`, `cilly/src/bin/linker/main.rs`), default **on** as of
@@ -119,12 +126,73 @@ quickest way to tell the two paths' output apart (ilasm stamps a real build time
   correctness bug. In-repo `cargo test -p cilly --lib pe_exporter` grew to 99 passing (from the
   65-test Phase 1a baseline) and stayed green throughout. Default flipped: `DIRECT_PE` is now
   `true` (`cilly/src/bin/linker/main.rs`); `DIRECT_PE=0` is the documented escape hatch to ilasm.
-- **Phase 2 — PDB (NEXT)**: emit the Portable PDB from `SourceFileInfo` roots (sequence points), add
-  LocalScope/LocalVariable from the existing named `.locals`, DebugDirectory wiring. Scriptable
-  acceptance: a deliberate panic's managed stack trace prints `<crate>/src/main.rs:<line>` (uses
-  `StackTrace(fNeedFileInfo: true)` machinery), plus a manual VS Code step-through. Stretch:
-  richer per-node spans (today spans are per-MIR-statement — already the right granularity for
-  sequence points).
+- **Phase 2 — Portable PDB. DONE** (commits 42726cb..02da7b8): `cilly/src/ir/pe_exporter/pdb.rs`
+  (~1826 lines) implements a standalone BSJB `#Pdb`-stream metadata blob per the dotnet/runtime
+  `PortablePdb-Metadata.md` spec:
+  - **Document (0x30)** rows interned per source file (name blob with separator+parts, SHA-256
+    `HashAlgorithm`/`Hash`, `Language` GUID).
+  - **MethodDebugInformation (0x31)**: exactly one row per type-system `MethodDef` row (methods
+    with no sequence points get an empty-blob row, never a missing one), carrying a delta-encoded
+    Sequence Points blob built by walking `body.rs`'s method-body linearizer's `CILRoot::
+    SourceFileInfo` roots in code-offset order (the seam the Phase-0/1a doc comments had already
+    marked). Same-IL-offset runs are deduped (last-wins, mirrors ilasm's own `.line`-per-offset
+    collapsing); a caller bug (non-monotonic offsets) is left to the spec's own strictly-increasing
+    assert rather than silently papered over.
+  - **LocalScope/LocalVariable (0x32/0x33) — not built.** Optional per spec; sequence points alone
+    clear the Phase-2 acceptance bar (file:line resolution). Local-variable-name debugging in a
+    step-through debugger remains a documented stretch item, not a gap in what was promised.
+  - **PE side**: a Debug Directory with a `IMAGE_DEBUG_TYPE_CODEVIEW` (type 2) RSDS entry (GUID +
+    age + PDB path) plus a `PdbChecksum` entry; `pe.rs`'s `write_debug_directory` fixed a bug where
+    the CodeView row's `TimeDateStamp` must equal `pdb_id[16..20]` (not 0 — only the PdbChecksum
+    row is hardcoded 0) because that's the SRM match key `PEReader` pairs with the RSDS GUID.
+    `deterministic_pdb_id` (`cilly/src/lib.rs:814`) derives the 20-byte PDB id from a content hash,
+    not timestamps — determinism preserved end to end.
+  - **Linker wiring**: `cilly/src/bin/linker/main.rs` (DIRECT_PE branch) builds and writes the
+    `.pdb` alongside the `.dll`/`.exe`; `dotnet_jumpstart.rs`'s embedded-launcher template unpacks
+    the bundled PDB bytes under the *loaded* dll's stem (fixed a real bug where it had unpacked
+    under the build-time hashed-stem name, so CoreCLR's loader silently found no PDB next to the
+    dll it actually ran).
+  - **Two span-quality fixes** (`docs/PE_EMISSION_PLAN.md` Phase-0 gaps a/b), both flag-gated where
+    they touch codegen: `span_source_info` (`src/assembly.rs`) now walks the MIR `SourceScope`
+    inlined-chain up to the outermost non-inlined caller scope before resolving file/line, fixing
+    gap (b) (MIR-inlined statements previously mis-attributed `SourceFileInfo` to the inlined
+    callee, e.g. a probe's `main` frame resolving to `memchr.rs:19`); gap (a) (the `aggressiveinlining`
+    JIT hint erasing user frames) turned out to not exist on the direct-PE path at all
+    (`pe_exporter/tables.rs` never emits the `MethodImplAttributes.AggressiveInlining` bit), so the
+    new `PDB_FRAMES` config flag (`cilly/src/lib.rs`, default `false`) only suppresses that hint in
+    `il_exporter` (the ilasm fallback path) — default-off, zero behavior change unless explicitly
+    opted in, execution semantics of compiled programs unaffected either way. Gap (c) (`<WORKSPACE>`
+    path remap) was confirmed to originate from the `rust-lang/rust` fork's own bootstrap/test-harness
+    remap convention (zero occurrences in this repo's `src/`/`cilly/`), not from anything this writer
+    emits — ordinary `cargo_tests/` crates already carry real absolute paths, so it does not affect
+    the acceptance path.
+  - Also fixed: a degenerate same-line, zero-width-column `SequencePoint` (produced when a source
+    column clamps to `u16::MAX` in `span_source_info`) was hitting `validate_visible_sequence_point`'s
+    unconditional assert and aborting the entire PE+PDB link for one bad span anywhere in the
+    program; now widened to a 1-column span before validation instead (02da7b8).
+
+  **Verification (real numbers, this session, 2026-07-02, current HEAD `02da7b8`)**:
+  - `cargo test -p cilly --lib pe_exporter`: **119 passed, 0 failed** (grown from the Phase-1
+    baseline of 99; includes `export::tests::e2e_unhandled_exception_resolves_file_line_through_our_pdb`).
+  - `cargo_tests/cd_pdb` probe, rebuilt fresh against current HEAD, run under the default
+    `DIRECT_PE=1` path (`CARGO_DOTNET_BACKEND=native`, no ilasm anywhere): the on-disk artifact is a
+    301596-byte `cd_pdb.pdb` with `BSJB` magic sitting next to `cd_pdb.dll`; the managed stack trace
+    resolves both frames —
+    `deep_leaf_for_pdb_probe() in .../cargo_tests/cd_pdb/src/main.rs:line 19` and
+    `main() in .../cargo_tests/cd_pdb/src/main.rs:line 32` — no `<WORKSPACE>`, no `memchr.rs`
+    misattribution. All three probe verdicts (`names this file`, `has file:line frames`,
+    `names probe fn`) print `true`.
+  - `cargo_tests/cd_collections` (battery slice): **141/141** (`chk!` tally), rebuilt+run fresh
+    against current HEAD.
+  - The Phase-1c Docker `::stable` serial gate (424/16, byte-identical named-failure set to the
+    ilasm baseline — see Phase 1c above) was run against the pre-PDB-writer commit (`fc619fe`/
+    `eac6d9b`-era, DIRECT_PE-flip only); it has **not** been re-run end-to-end against the
+    post-PDB-writer commits (`5b6f362`..`02da7b8`) in Docker in this session — the in-repo unit
+    suite, the cd_pdb probe, and the cd_collections slice are the verified evidence for Phase 2
+    specifically. Re-running the full serial gate against `02da7b8` is the one open verification
+    item before calling the PDB writer gate-proven at the same bar as Phase 1.
+  - A manual VS Code / debugger step-through was **not** performed this session (stretch item,
+    unverified).
 
 ## Risks & mitigations
 
