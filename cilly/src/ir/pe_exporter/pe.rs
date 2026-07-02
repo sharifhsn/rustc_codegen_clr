@@ -77,6 +77,22 @@ pub struct PeOptions {
     /// (see `asm::ENTRYPOINT`), i.e. `Token::new(Token::TABLE_METHOD_DEF, rid).0`. `None` for a
     /// library with no managed entry point (`EntryPointToken` field written as 0).
     pub entry_point: Option<u32>,
+    /// The Portable PDB's [`super::pdb::DebugDirectoryEntry`], if a PDB was built for this image
+    /// (see `export::export_pe`'s wiring) — emits a `DataDirectory[6]` (Debug) entry pointing at a
+    /// small table of `IMAGE_DEBUG_DIRECTORY` rows in `.text`: `IMAGE_DEBUG_TYPE_CODEVIEW`
+    /// (RSDS payload) always, plus `IMAGE_DEBUG_TYPE_PDBCHECKSUM` when
+    /// [`pdb_checksum`](Self::pdb_checksum) is also `Some` (see that field's doc for why BOTH are
+    /// required in practice, not just documented as spec-optional). `None` omits the directory
+    /// entirely (all-zero, exactly like every other unused directory slot) — a valid image with no
+    /// debug info, matching this writer's pre-Phase-2 output.
+    pub debug_directory: Option<super::pdb::DebugDirectoryEntry>,
+    /// The `IMAGE_DEBUG_TYPE_PDBCHECKSUM` entry's payload — a SHA-256 digest of the COMPLETE
+    /// on-disk PDB file bytes (see [`super::pdb::sha256`]'s doc for the full root-cause writeup:
+    /// CoreCLR's runtime `StackTraceSymbols` provider silently refuses to resolve file:line info
+    /// for a portable PDB that lacks this entry, even though the PDB is otherwise fully
+    /// spec-conformant and readable by `System.Reflection.Metadata`'s own static reader). Ignored
+    /// if [`debug_directory`](Self::debug_directory) is `None` (no PDB, nothing to checksum).
+    pub pdb_checksum: Option<super::pdb::PdbChecksumEntry>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -165,6 +181,12 @@ const DLL_CHARACTERISTICS: u16 = 0x8540;
 /// Index of the "CLI Header" entry within the optional header's data-directory array
 /// (§II.25.2.3.3, table titled "Optional Header Data Directories").
 const DATA_DIRECTORY_CLI_HEADER: usize = 14;
+/// Index of the "Debug" data directory (§II.25.2.3.3's referenced Windows PE data-directory
+/// table — the Debug Directory isn't an ECMA-335 CLI concept, it's the plain PE/COFF mechanism
+/// CoreCLR repurposes to locate a `.pdb`; see `pdb::DebugDirectoryEntry`'s doc). Points at one or
+/// more `IMAGE_DEBUG_DIRECTORY` (§ "Debug Directory", 28 bytes each) entries placed in `.text`;
+/// this writer emits exactly one, type `IMAGE_DEBUG_TYPE_CODEVIEW` (2), carrying an "RSDS" payload.
+const DATA_DIRECTORY_DEBUG: usize = 6;
 
 /// `.text` section characteristics: `IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE |
 /// IMAGE_SCN_MEM_READ`. Matches the `0x6000_0020` observed in a real ilasm-produced image.
@@ -369,11 +391,16 @@ pub fn text_header_len(has_entry_point: bool) -> u32 {
 /// `text_header_len`'s doc comment describes, just for `FieldRVA.RVA` instead of `MethodDef.RVA`.
 ///
 /// Mirrors `write_pe`'s own `sdata` [`SectionLayout::plan`] call exactly: `.text`'s content is
-/// `text_header_len(has_entry_point) + CLI_HEADER_CB + metadata_len + method_bodies_len [+
-/// bootstrap import-table-and-stub tail when `has_entry_point`]`, and `.sdata` starts at that,
-/// rounded up to `SectionAlignment` from a `SectionAlignment`-aligned `.text` base.
+/// `text_header_len(has_entry_point) + CLI_HEADER_CB + metadata_len + method_bodies_len +
+/// debug_dir_len [+ bootstrap import-table-and-stub tail when `has_entry_point`]`, and `.sdata`
+/// starts at that, rounded up to `SectionAlignment` from a `SectionAlignment`-aligned `.text` base.
+///
+/// `debug_dir_len` is `0` when no PDB is being emitted for this image, or
+/// [`debug_directory_region_len`] of the [`super::pdb::DebugDirectoryEntry`] that will be passed
+/// as `PeOptions::debug_directory` — see that function's doc for why callers can't just recompute
+/// it inline (RSDS payload length depends on the PDB path string length).
 #[must_use]
-pub fn field_rva_section_start(has_entry_point: bool, metadata_len: usize, method_bodies_len: usize) -> u32 {
+pub fn field_rva_section_start(has_entry_point: bool, metadata_len: usize, method_bodies_len: usize, debug_dir_len: u32) -> u32 {
     let iat_len = text_header_len(has_entry_point);
     let tail_len = if has_entry_point {
         BootstrapLayout::plan().import_and_stub_len()
@@ -384,8 +411,17 @@ pub fn field_rva_section_start(has_entry_point: bool, metadata_len: usize, metho
         + CLI_HEADER_CB
         + u32::try_from(metadata_len).expect("metadata exceeds u32")
         + u32::try_from(method_bodies_len).expect("method bodies exceed u32")
+        + debug_dir_len
         + tail_len;
     align_up(SECTION_ALIGNMENT + text_content_len, SECTION_ALIGNMENT)
+}
+
+/// Public wrapper for [`debug_directory_region_len`] — `export.rs`'s two-pass metadata-length
+/// probe (mirroring [`field_rva_section_start`]'s own rationale) needs this BEFORE it can call
+/// `field_rva_section_start`, since the debug directory sits ahead of `.sdata` in `.text`.
+#[must_use]
+pub fn debug_directory_len(entry: &super::pdb::DebugDirectoryEntry, checksum: Option<&super::pdb::PdbChecksumEntry>) -> u32 {
+    debug_directory_region_len(entry, checksum)
 }
 
 /// Writes the complete PE image: DOS header, COFF header, PE32 optional header, section table,
@@ -478,16 +514,25 @@ pub fn write_pe(
     let headers_raw_size = align_up(headers_len, FILE_ALIGNMENT);
 
     // `.text` = [IAT (bootstrap only)] + CLI header + metadata + method bodies +
+    // [Debug Directory + RSDS payload (only if `options.debug_directory.is_some()`)] +
     // [Import Table + stub (bootstrap only)]. The IAT sits FIRST so its RVA is simply `.text`'s
     // own base RVA (matching a real ilasm image, and letting the stub's hardcoded operand be
-    // computed before anything else is laid out).
+    // computed before anything else is laid out). The Debug Directory region sits between the
+    // method bodies and the bootstrap tail — position within `.text` is not spec-mandated (the
+    // data directory entry carries its own RVA), this placement just keeps every "extra tail
+    // region" grouped together the same way the import-table/stub already is.
     let iat_len = if needs_bootstrap { bootstrap.unwrap().iat_len() } else { 0 };
     let cli_header_offset_in_text = iat_len;
     let metadata_offset_in_text = cli_header_offset_in_text + CLI_HEADER_CB;
     let bodies_offset_in_text =
         metadata_offset_in_text + u32::try_from(metadata.len()).expect("metadata exceeds u32");
-    let import_stub_offset_in_text =
+    let debug_dir_offset_in_text =
         bodies_offset_in_text + u32::try_from(method_bodies.len()).expect("method bodies exceed u32");
+    let debug_dir_len = options
+        .debug_directory
+        .as_ref()
+        .map_or(0, |d| debug_directory_region_len(d, options.pdb_checksum.as_ref()));
+    let import_stub_offset_in_text = debug_dir_offset_in_text + debug_dir_len;
     let text_content_len = if needs_bootstrap {
         import_stub_offset_in_text + bootstrap.unwrap().import_and_stub_len()
     } else {
@@ -518,6 +563,7 @@ pub fn write_pe(
     let cli_header_rva = text.rva + cli_header_offset_in_text;
     let metadata_rva = text.rva + metadata_offset_in_text;
     let metadata_len = u32::try_from(metadata.len()).expect("metadata exceeds u32");
+    let debug_dir_rva = text.rva + debug_dir_offset_in_text;
     let import_table_rva = text.rva + import_stub_offset_in_text;
 
     let last_section = reloc.as_ref().or(sdata.as_ref()).unwrap_or(&text);
@@ -568,6 +614,17 @@ pub fn write_pe(
         cli_header_rva,
         bootstrap.map(|b| (import_table_rva, iat_rva, b)),
         reloc.map(|r| (r.rva, r.virtual_size)),
+        options.debug_directory.as_ref().map(|_| {
+            // `DataDirectory[6].Size` is the ROW TABLE's own size only (`N *
+            // IMAGE_DEBUG_DIRECTORY_LEN`), NOT the region's total length including payloads —
+            // confirmed against a real Roslyn-built `.dll` (`PEReader.ReadDebugDirectory()`'s 3
+            // rows summed to exactly `84 = 3 * 28`, not the region's full byte length). Passing
+            // `debug_dir_len` (the whole region) here was a real bug caught during Phase 2
+            // acceptance testing: it doesn't stop a well-behaved reader from parsing more entries
+            // than exist (nothing reads past `Size` on a well-formed table), but is not spec-clean.
+            let row_count = 1 + u32::from(options.pdb_checksum.is_some());
+            (debug_dir_rva, row_count * IMAGE_DEBUG_DIRECTORY_LEN)
+        }),
     );
 
     write_section_header(&mut out, b".text", &text, TEXT_SECTION_CHARACTERISTICS);
@@ -582,7 +639,7 @@ pub fn write_pe(
     out.resize(headers_raw_size as usize, 0);
     debug_assert_eq!(out.len() as u32 % FILE_ALIGNMENT, 0);
 
-    // .text: [IAT] CLI header, metadata, method bodies, [Import Table + stub].
+    // .text: [IAT] CLI header, metadata, method bodies, [Debug Directory + RSDS], [Import Table + stub].
     debug_assert_eq!(out.len() as u32, text.file_offset);
     if let Some(b) = bootstrap {
         write_iat(&mut out, import_table_rva, b);
@@ -595,6 +652,16 @@ pub fn write_pe(
     );
     out.extend_from_slice(metadata);
     out.extend_from_slice(method_bodies);
+    if let Some(entry) = &options.debug_directory {
+        debug_assert_eq!(out.len() as u32, debug_dir_rva - text.rva + text.file_offset, "debug directory must start exactly where the layout pass placed it");
+        let before = out.len();
+        write_debug_directory(&mut out, debug_dir_rva, entry, options.pdb_checksum.as_ref());
+        debug_assert_eq!(
+            u32::try_from(out.len() - before).unwrap(),
+            debug_dir_len,
+            "write_debug_directory must emit exactly debug_directory_region_len(entry, checksum) bytes"
+        );
+    }
     if let Some(b) = bootstrap {
         write_import_table_and_stub(&mut out, import_table_rva, iat_rva, b);
     }
@@ -692,6 +759,7 @@ fn write_optional_header(
     cli_header_rva: u32,
     bootstrap: Option<(u32, u32, BootstrapLayout)>,
     reloc: Option<(u32, u32)>,
+    debug: Option<(u32, u32)>,
 ) {
     // --- Standard fields (§II.25.2.3.1) ---
     out.extend_from_slice(&PE32_MAGIC.to_le_bytes());
@@ -739,6 +807,8 @@ fn write_optional_header(
             bootstrap.map(|(_, iat_rva, b)| (iat_rva, b.iat_len()))
         } else if i == DATA_DIRECTORY_BASE_RELOCATION_TABLE {
             reloc
+        } else if i == DATA_DIRECTORY_DEBUG {
+            debug
         } else {
             None
         };
@@ -846,6 +916,136 @@ fn write_import_table_and_stub(out: &mut Vec<u8>, import_table_rva: u32, iat_rva
     out.extend_from_slice(&abs_va.to_le_bytes());
 }
 
+/// `IMAGE_DEBUG_DIRECTORY` (Windows PE "Debug Directory" format, referenced but not defined by
+/// ECMA-335 — CoreCLR repurposes it to locate a `.pdb`) fixed row size: `Characteristics`(4) +
+/// `TimeDateStamp`(4) + `MajorVersion`(2) + `MinorVersion`(2) + `Type`(4) + `SizeOfData`(4) +
+/// `AddressOfRawData`(4) + `PointerToRawData`(4) = 28 bytes. `DataDirectory[6]`'s `Size` is
+/// `N * IMAGE_DEBUG_DIRECTORY_LEN` for `N` consecutive rows — a loader iterates
+/// `Size / IMAGE_DEBUG_DIRECTORY_LEN` rows starting at `DataDirectory[6].VirtualAddress`, which is
+/// how this writer emits more than one Debug Directory entry (CodeView + PdbChecksum) from a
+/// single data-directory slot.
+const IMAGE_DEBUG_DIRECTORY_LEN: u32 = 28;
+/// `IMAGE_DEBUG_TYPE_CODEVIEW`: the Debug Directory entry `Type` value CoreCLR's PDB-matching
+/// logic looks for.
+const IMAGE_DEBUG_TYPE_CODEVIEW: u32 = 2;
+/// `IMAGE_DEBUG_TYPE_PDBCHECKSUM`: see `pdb::sha256`'s doc for why this entry — not just
+/// `CodeView`/RSDS — is required for CoreCLR's RUNTIME `StackTraceSymbols` provider (as opposed to
+/// the static `System.Reflection.Metadata` reader, which never checks it) to trust a portable PDB.
+const IMAGE_DEBUG_TYPE_PDB_CHECKSUM: u32 = 19;
+/// The CodeView entry's `MajorVersion`/`MinorVersion` fields, when the payload is a PORTABLE (not
+/// classic Windows) PDB pointer: `MajorVersion = 0x0100`, `MinorVersion = 0x504D` (ASCII "PM",
+/// dotnet/runtime's `PortablePdbVersions.DefaultMajorVersion`/`DefaultMinorVersion` convention;
+/// confirmed byte-for-byte against a real Roslyn-built `.dll`'s CodeView entry).
+///
+/// **This is the actual root cause of Phase 2's acceptance gap**, found by tracing
+/// `System.Reflection.Metadata.PortableExecutable.PEReader.TryOpenAssociatedPortablePdb`'s IL
+/// (the exact API `System.Diagnostics.StackTraceSymbols` — the runtime's `StackTrace`/
+/// `Environment.StackTrace` file:line resolver — calls): the writer previously left
+/// `MajorVersion`/`MinorVersion` at `0`, which is a syntactically valid `IMAGE_DEBUG_DIRECTORY` row
+/// (every structural check — RSDS signature, GUID/age match, row counts, sequence-point encoding —
+/// passed) but `TryOpenAssociatedPortablePdb` uses these two fields (NOT the RSDS payload alone)
+/// to recognize "this CodeView entry points at a Portable PDB, go look for
+/// `<dll-stem>.pdb` next to the image" — with the wrong version marker it silently returns `false`
+/// without even attempting to open a file, which is exactly the symptom this task's acceptance
+/// testing hit (a structurally perfect PDB, confirmed readable by
+/// `MetadataReaderProvider.FromPortablePdbStream` directly, that `Environment.StackTrace` never
+/// even tried to load).
+const PORTABLE_CODEVIEW_MAJOR_VERSION: u16 = 0x0100;
+const PORTABLE_CODEVIEW_MINOR_VERSION: u16 = 0x504D;
+/// The CodeView "RSDS" signature (PDB 7.0 format — `RSDS` + 16-byte GUID + 4-byte Age +
+/// NUL-terminated path), per `pdb::DebugDirectoryEntry`'s doc.
+const CV_SIGNATURE_RSDS: &[u8; 4] = b"RSDS";
+
+/// Total byte length of the Debug Directory region `write_pe` places in `.text`: one or two
+/// `IMAGE_DEBUG_DIRECTORY` rows (`IMAGE_DEBUG_DIRECTORY_LEN` each — CodeView always, PdbChecksum
+/// when `checksum` is `Some`) followed by their payloads in the same order (RSDS, then the
+/// checksum payload if present). Computing this as its own function (rather than inline at each of
+/// `write_pe`'s two call sites — layout pass and emit pass) is what lets both agree on the
+/// region's size without duplicating either payload's shape twice, mirroring how
+/// [`BootstrapLayout`] is the single source of truth for the import-table-and-stub region's size.
+#[must_use]
+fn debug_directory_region_len(entry: &super::pdb::DebugDirectoryEntry, checksum: Option<&super::pdb::PdbChecksumEntry>) -> u32 {
+    let row_count = 1 + u32::from(checksum.is_some());
+    let rsds_len = 4 + 16 + 4 + u32::try_from(entry.pdb_path.len()).expect("pdb path exceeds u32") + 1;
+    let checksum_len = checksum.map_or(0, |c| u32::try_from(c.payload_bytes().len()).unwrap());
+    row_count * IMAGE_DEBUG_DIRECTORY_LEN + rsds_len + checksum_len
+}
+
+/// Writes the Debug Directory region at `region_rva` (within `.text`, per this writer's layout
+/// pass): the `IMAGE_DEBUG_DIRECTORY` row(s) first (CodeView, then PdbChecksum if `checksum` is
+/// `Some`), followed by their payloads in the same order — each row's `AddressOfRawData`/
+/// `PointerToRawData` point at its own payload placed after ALL the rows (so file-offset and RVA
+/// are always `region_rva`-relative + a fixed row-table length — no separate layout step needed
+/// for either payload). `TimeDateStamp` is written as `0` on every row (determinism — see this
+/// writer's module doc; the RSDS `Age`/GUID and the checksum bytes carry the real content
+/// identity, not this field).
+fn write_debug_directory(
+    out: &mut Vec<u8>,
+    region_rva: u32,
+    entry: &super::pdb::DebugDirectoryEntry,
+    checksum: Option<&super::pdb::PdbChecksumEntry>,
+) {
+    let row_count = 1 + u32::from(checksum.is_some());
+    let rows_len = row_count * IMAGE_DEBUG_DIRECTORY_LEN;
+    let rsds_rva = region_rva + rows_len;
+    let rsds_file_offset = u32::try_from(out.len()).unwrap() + rows_len;
+    let rsds_len = 4 + 16 + 4 + u32::try_from(entry.pdb_path.len()).expect("pdb path exceeds u32") + 1;
+
+    // Row 0: CodeView. MajorVersion/MinorVersion MUST carry the Portable-PDB marker (see
+    // PORTABLE_CODEVIEW_{MAJOR,MINOR}_VERSION's doc) — this is the field
+    // `PEReader.TryOpenAssociatedPortablePdb` actually keys off of before it will even attempt to
+    // open a `<dll-stem>.pdb` file, independent of the RSDS payload's own correctness.
+    //
+    // **`TimeDateStamp` is NOT cosmetic here** — this is the SECOND root-cause bug found chasing
+    // Phase 2's acceptance gap (see `PORTABLE_CODEVIEW_MAJOR_VERSION`'s doc for the first). Per
+    // `System.Reflection.Metadata`'s own decompiled source
+    // (`PEReader.TryOpenCodeViewPortablePdb`): the match key it builds is
+    // `new BlobContentId(codeViewDebugDirectoryData.Guid, codeViewEntry.Stamp)` — i.e. the GUID
+    // comes from the RSDS payload, but the 4-byte "age"/stamp half comes from THIS ROW's
+    // `TimeDateStamp` field, NOT from the RSDS payload's own `Age` field (`Age` is read but never
+    // compared against anything by this code path). That combined id is then compared against
+    // `metadataReaderProvider.GetMetadataReader().DebugMetadataHeader.Id` (the PDB's own `#Pdb`
+    // stream `Id`, bytes `0..20`) — a mismatch silently returns `false` with `pdbPath` left `null`,
+    // exactly the symptom this task's acceptance testing hit even after every other structural
+    // check (RSDS GUID, row counts, entry point, sequence points, PdbChecksum) passed. Writing `0`
+    // here — determinism-safe in isolation, since it never touches wall-clock — was thus a REAL
+    // correctness bug: it silently mismatched the PDB id's real stamp bytes (`pdb_id[16..20]`,
+    // always nonzero for non-degenerate content) whenever they weren't already `0`.
+    out.extend_from_slice(&0u32.to_le_bytes()); // Characteristics: reserved, always 0.
+    out.extend_from_slice(&entry.stamp.to_le_bytes()); // TimeDateStamp: pdb_id[16..20] — the SRM match key (see above), still deterministic (content-derived, never wall-clock).
+    out.extend_from_slice(&PORTABLE_CODEVIEW_MAJOR_VERSION.to_le_bytes());
+    out.extend_from_slice(&PORTABLE_CODEVIEW_MINOR_VERSION.to_le_bytes());
+    out.extend_from_slice(&IMAGE_DEBUG_TYPE_CODEVIEW.to_le_bytes());
+    out.extend_from_slice(&rsds_len.to_le_bytes()); // SizeOfData.
+    out.extend_from_slice(&rsds_rva.to_le_bytes()); // AddressOfRawData.
+    out.extend_from_slice(&rsds_file_offset.to_le_bytes()); // PointerToRawData.
+
+    // Row 1 (optional): PdbChecksum.
+    if let Some(checksum) = checksum {
+        let checksum_len = u32::try_from(checksum.payload_bytes().len()).unwrap();
+        let checksum_rva = rsds_rva + rsds_len;
+        let checksum_file_offset = rsds_file_offset + rsds_len;
+        out.extend_from_slice(&0u32.to_le_bytes()); // Characteristics.
+        out.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp: 0.
+        out.extend_from_slice(&0u16.to_le_bytes()); // MajorVersion.
+        out.extend_from_slice(&0u16.to_le_bytes()); // MinorVersion.
+        out.extend_from_slice(&IMAGE_DEBUG_TYPE_PDB_CHECKSUM.to_le_bytes());
+        out.extend_from_slice(&checksum_len.to_le_bytes());
+        out.extend_from_slice(&checksum_rva.to_le_bytes());
+        out.extend_from_slice(&checksum_file_offset.to_le_bytes());
+    }
+
+    // Payloads, in row order.
+    out.extend_from_slice(CV_SIGNATURE_RSDS);
+    out.extend_from_slice(&entry.guid);
+    out.extend_from_slice(&entry.age.to_le_bytes());
+    out.extend_from_slice(entry.pdb_path.as_bytes());
+    out.push(0); // NUL terminator.
+    if let Some(checksum) = checksum {
+        out.extend_from_slice(&checksum.payload_bytes());
+    }
+}
+
 /// Writes a `.reloc` section's single base-relocation block (§II.25.3): `PageRVA` (the
 /// 4KiB-aligned page `fixup_rva` falls in), `BlockSize` (this block's total byte length, header
 /// included, rounded up to a 4-byte boundary per §II.25.3), then one `IMAGE_REL_BASED_HIGHLOW`
@@ -871,6 +1071,8 @@ mod tests {
         let opts = PeOptions {
             is_dll: false,
             entry_point: Some(0x0600_0001),
+            debug_directory: None,
+        pdb_checksum: None,
         };
         assert!(!opts.is_dll);
         assert_eq!(opts.entry_point, Some(0x0600_0001));
@@ -881,6 +1083,8 @@ mod tests {
         let opts = PeOptions {
             is_dll: true,
             entry_point: None,
+            debug_directory: None,
+        pdb_checksum: None,
         };
         assert!(opts.is_dll);
         assert_eq!(opts.entry_point, None);
@@ -927,6 +1131,8 @@ mod tests {
         cli_metadata_size: u32,
         cli_flags: u32,
         cli_entry_point_token: u32,
+        debug_dir: (u32, u32),
+        raw: Vec<u8>,
     }
 
     fn read_u16(data: &[u8], off: usize) -> u16 {
@@ -980,6 +1186,10 @@ mod tests {
             read_u32(data, dir_base + DATA_DIRECTORY_CLI_HEADER * 8),
             read_u32(data, dir_base + DATA_DIRECTORY_CLI_HEADER * 8 + 4),
         );
+        let debug_dir = (
+            read_u32(data, dir_base + DATA_DIRECTORY_DEBUG * 8),
+            read_u32(data, dir_base + DATA_DIRECTORY_DEBUG * 8 + 4),
+        );
 
         let sec_table = opt + opt_header_size as usize;
         let mut sections = Vec::new();
@@ -1029,6 +1239,8 @@ mod tests {
             cli_metadata_size,
             cli_flags,
             cli_entry_point_token,
+            debug_dir,
+            raw: data.to_vec(),
         }
     }
 
@@ -1047,6 +1259,8 @@ mod tests {
         let opts = PeOptions {
             is_dll: false,
             entry_point: Some(0x0600_0001),
+            debug_directory: None,
+        pdb_checksum: None,
         };
         let image = write_pe(&metadata, &bodies, &[], &opts);
         let pe = parse_pe(&image);
@@ -1094,6 +1308,8 @@ mod tests {
         let opts = PeOptions {
             is_dll: true,
             entry_point: None,
+            debug_directory: None,
+        pdb_checksum: None,
         };
         let image = write_pe(&[1, 2, 3], &[4, 5, 6], &[], &opts);
         let pe = parse_pe(&image);
@@ -1139,6 +1355,8 @@ mod tests {
             let opts = PeOptions {
                 is_dll,
                 entry_point: if is_dll { None } else { Some(0x0600_0001) },
+                debug_directory: None,
+            pdb_checksum: None,
             };
             let image = write_pe(&[1, 2, 3], &[4, 5, 6], &[], &opts);
             let pe = parse_pe(&image);
@@ -1156,6 +1374,8 @@ mod tests {
         let opts = PeOptions {
             is_dll: false,
             entry_point: Some(0x0600_0001),
+            debug_directory: None,
+        pdb_checksum: None,
         };
         for metadata_len in [0usize, 1, 3, 200, 4095, 4096, 8193] {
             for body_len in [0usize, 1, 5, 511, 512, 513, 10_000] {
@@ -1209,6 +1429,8 @@ mod tests {
         let opts = PeOptions {
             is_dll: true,
             entry_point: None,
+            debug_directory: None,
+        pdb_checksum: None,
         };
         let image = write_pe(&[1, 2, 3], &[4, 5, 6], &[], &opts);
         let pe = parse_pe(&image);
@@ -1221,6 +1443,8 @@ mod tests {
         let opts = PeOptions {
             is_dll: true,
             entry_point: None,
+            debug_directory: None,
+        pdb_checksum: None,
         };
         let metadata = vec![0xAAu8; 100];
         let bodies = vec![0xBBu8; 50];
@@ -1246,6 +1470,130 @@ mod tests {
         let off = sdata.file_offset as usize;
         assert_eq!(&image[off..off + field_rva_data.len()], &field_rva_data[..]);
         assert_eq!(sdata.virtual_size, field_rva_data.len() as u32);
+    }
+
+    /// `PeOptions::debug_directory` wires a `DataDirectory[6]` (Debug) entry pointing at an
+    /// `IMAGE_DEBUG_DIRECTORY` row (type `IMAGE_DEBUG_TYPE_CODEVIEW`) + RSDS payload placed in
+    /// `.text`, and `.sdata` (when present) still lands correctly AFTER that region — proving
+    /// `field_rva_section_start`'s `debug_dir_len` parameter (and `write_pe`'s own internal
+    /// `debug_dir_offset_in_text` arithmetic) actually agree with each other, the same way
+    /// `field_rva_section_start_matches_write_pes_actual_sdata_rva` cross-checks the bootstrap-tail
+    /// case.
+    #[test]
+    fn debug_directory_round_trips_through_write_pe() {
+        let entry = super::super::pdb::DebugDirectoryEntry {
+            guid: [
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+            ],
+            age: 7,
+            stamp: 0x1234_5678,
+            pdb_path: "cd_pdb-deadbeef.pdb".to_string(),
+        };
+        let opts = PeOptions {
+            is_dll: true,
+            entry_point: None,
+            debug_directory: Some(entry.clone()),
+            pdb_checksum: None,
+        };
+        let metadata = vec![0xAAu8; 100];
+        let bodies = vec![0xBBu8; 50];
+        let field_rva_data = vec![0x11, 0x22, 0x33, 0x44];
+        let image = write_pe(&metadata, &bodies, &field_rva_data, &opts);
+        let pe = parse_pe(&image);
+
+        assert_ne!(pe.debug_dir, (0, 0), "DataDirectory[6] must be populated when debug_directory is Some");
+        let (debug_dir_rva, debug_dir_size) = pe.debug_dir;
+        // `DataDirectory[6].Size` is the row-table's own size only (one CodeView row here, no
+        // PdbChecksum row since `pdb_checksum: None`) — see `write_optional_header`'s call site
+        // doc for why this is NOT `debug_directory_region_len`'s full region length.
+        assert_eq!(debug_dir_size, IMAGE_DEBUG_DIRECTORY_LEN);
+
+        let file_off = rva_to_file_offset(&pe.sections, debug_dir_rva) as usize;
+        let data = &pe.raw;
+        assert_eq!(read_u32(data, file_off), 0, "Characteristics: reserved, always 0");
+        // TimeDateStamp = entry.stamp (pdb_id[16..20], verbatim) — NOT 0 and NOT entry.age; see
+        // `DebugDirectoryEntry::stamp`'s doc for why this exact field is the real SRM match key.
+        assert_eq!(read_u32(data, file_off + 4), entry.stamp, "TimeDateStamp carries the real PDB-id stamp, the field SRM actually matches on");
+        assert_eq!(read_u16(data, file_off + 8), PORTABLE_CODEVIEW_MAJOR_VERSION, "MajorVersion carries the Portable-PDB marker");
+        assert_eq!(read_u16(data, file_off + 10), PORTABLE_CODEVIEW_MINOR_VERSION, "MinorVersion carries the Portable-PDB marker ('PM')");
+        assert_eq!(read_u32(data, file_off + 12), IMAGE_DEBUG_TYPE_CODEVIEW);
+        let size_of_data = read_u32(data, file_off + 16);
+        let address_of_raw_data = read_u32(data, file_off + 20);
+        let pointer_to_raw_data = read_u32(data, file_off + 24);
+        assert_eq!(address_of_raw_data, debug_dir_rva + IMAGE_DEBUG_DIRECTORY_LEN);
+        assert_eq!(pointer_to_raw_data, file_off as u32 + IMAGE_DEBUG_DIRECTORY_LEN);
+
+        let rsds_off = pointer_to_raw_data as usize;
+        assert_eq!(&data[rsds_off..rsds_off + 4], b"RSDS");
+        assert_eq!(&data[rsds_off + 4..rsds_off + 20], &entry.guid);
+        assert_eq!(read_u32(data, rsds_off + 20), entry.age);
+        let path_start = rsds_off + 24;
+        let path_bytes = &data[path_start..path_start + entry.pdb_path.len()];
+        assert_eq!(path_bytes, entry.pdb_path.as_bytes());
+        assert_eq!(data[path_start + entry.pdb_path.len()], 0, "NUL-terminated");
+        assert_eq!(
+            size_of_data,
+            u32::try_from(entry.pdb_path.len()).unwrap() + 1 + 4 + 16 + 4,
+            "SizeOfData is the RSDS payload's own length (signature+guid+age+path+NUL)"
+        );
+
+        // .sdata must still exist and land strictly after the Debug Directory region (row table +
+        // RSDS payload — NOT just `debug_dir_size`, which is the row-table-only DataDirectory[6]
+        // size; see this test's earlier comment on that distinction).
+        let sdata = section_named(&pe, ".sdata").expect(".sdata must exist");
+        assert!(sdata.rva >= debug_dir_rva + debug_directory_region_len(&entry, None));
+    }
+
+    /// Same shape as [`debug_directory_round_trips_through_write_pe`] but WITH a `PdbChecksum`
+    /// entry too — the actual fix for Phase 2's acceptance gap (see `pdb::sha256`'s doc): asserts
+    /// `DataDirectory[6].Size` covers BOTH rows, the second row's `Type`/payload match, and
+    /// `.sdata` lands after both rows' payloads.
+    #[test]
+    fn debug_directory_with_pdb_checksum_emits_two_rows() {
+        let entry = super::super::pdb::DebugDirectoryEntry {
+            guid: [0xAAu8; 16],
+            age: 3,
+            stamp: 0x9abc_def0,
+            pdb_path: "mini.pdb".to_string(),
+        };
+        let checksum = super::super::pdb::PdbChecksumEntry::from_pdb_bytes(b"pretend pdb bytes");
+        let opts = PeOptions {
+            is_dll: true,
+            entry_point: None,
+            debug_directory: Some(entry.clone()),
+            pdb_checksum: Some(checksum.clone()),
+        };
+        let metadata = vec![0xAAu8; 40];
+        let bodies = vec![0xBBu8; 20];
+        let image = write_pe(&metadata, &bodies, &[], &opts);
+        let pe = parse_pe(&image);
+
+        let (debug_dir_rva, debug_dir_size) = pe.debug_dir;
+        assert_eq!(debug_dir_size, 2 * IMAGE_DEBUG_DIRECTORY_LEN, "two rows: CodeView + PdbChecksum");
+
+        let file_off = rva_to_file_offset(&pe.sections, debug_dir_rva) as usize;
+        let data = &pe.raw;
+        // Row 0: CodeView (same shape as the single-row test).
+        assert_eq!(read_u32(data, file_off + 4), entry.stamp, "TimeDateStamp carries entry.stamp, not entry.age");
+        assert_eq!(read_u32(data, file_off + 12), IMAGE_DEBUG_TYPE_CODEVIEW);
+        let rsds_size = read_u32(data, file_off + 16);
+
+        // Row 1: PdbChecksum, immediately after row 0 in the table.
+        let row1_off = file_off + IMAGE_DEBUG_DIRECTORY_LEN as usize;
+        assert_eq!(read_u32(data, row1_off + 12), IMAGE_DEBUG_TYPE_PDB_CHECKSUM);
+        let checksum_size = read_u32(data, row1_off + 16);
+        let checksum_rva = read_u32(data, row1_off + 20);
+        let checksum_ptr = read_u32(data, row1_off + 24);
+        let expected_payload = checksum.payload_bytes();
+        assert_eq!(checksum_size as usize, expected_payload.len());
+        // The checksum payload starts right after the RSDS payload (row-table then RSDS then
+        // checksum, per `write_debug_directory`'s doc).
+        assert_eq!(checksum_rva, debug_dir_rva + 2 * IMAGE_DEBUG_DIRECTORY_LEN + rsds_size);
+        let checksum_off = checksum_ptr as usize;
+        assert_eq!(&data[checksum_off..checksum_off + expected_payload.len()], &expected_payload[..]);
+        assert_eq!(&data[checksum_off..checksum_off + 7], b"SHA256\0");
+
+        assert!(pe.sections.is_empty() == false, "at least .text must exist");
     }
 
     /// Regression test for a real, confirmed macOS ARM64 CoreCLR load bug (`FileLoadException
@@ -1287,6 +1635,8 @@ mod tests {
         let opts = PeOptions {
             is_dll: true,
             entry_point: None,
+            debug_directory: None,
+        pdb_checksum: None,
         };
         let image = write_pe(&metadata, &bodies, &field_rva_data, &opts);
         let pe = parse_pe(&image);
@@ -1323,12 +1673,14 @@ mod tests {
             let opts = PeOptions {
                 is_dll: entry_point.is_none(),
                 entry_point,
+                debug_directory: None,
+            pdb_checksum: None,
             };
             let image = write_pe(&metadata, &bodies, &field_rva_data, &opts);
             let pe = parse_pe(&image);
             let sdata = section_named(&pe, ".sdata").expect(".sdata must exist");
 
-            let predicted = field_rva_section_start(entry_point.is_some(), metadata.len(), bodies.len());
+            let predicted = field_rva_section_start(entry_point.is_some(), metadata.len(), bodies.len(), 0);
             assert_eq!(
                 predicted, sdata.rva,
                 "entry_point={entry_point:?}: field_rva_section_start's prediction must match write_pe's actual .sdata RVA"
@@ -1341,6 +1693,8 @@ mod tests {
         let opts = PeOptions {
             is_dll: false,
             entry_point: Some(0x0600_0001),
+            debug_directory: None,
+        pdb_checksum: None,
         };
         let metadata = vec![0u8; 1000];
         let bodies = vec![0u8; 2000];

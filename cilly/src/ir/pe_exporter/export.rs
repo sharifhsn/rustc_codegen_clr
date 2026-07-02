@@ -92,16 +92,32 @@ pub struct ExportOptions {
     /// `.dll` for the identical source, which loads fine and whose `Module.Name` was confirmed
     /// (via a from-scratch metadata reader) to be the output filename, not `"_"`.
     pub module_name: String,
+    /// The bare filename (no directory) `export_pe`'s Debug Directory RSDS payload should embed
+    /// as its fallback PDB path — conventionally the `.dll`/`.exe`'s own stem plus `.pdb` (mirrors
+    /// `il_exporter`'s `{output_file_path}.pdb` convention in `cilly/src/bin/linker/main.rs`).
+    /// CoreCLR's loader looks for `<assembly-stem>.pdb` next to the image FIRST and only falls
+    /// back to this embedded path (see `pdb::DebugDirectoryEntry`'s doc), so correctness doesn't
+    /// hinge on this string beyond "a plausible, non-empty filename" — but it must be non-empty
+    /// for `export_pe` to build a PDB at all (empty means "no debug info requested", matching a
+    /// `None` `PeOptions::debug_directory` and the writer's pre-Phase-2 output).
+    pub pdb_file_name: String,
 }
 
 /// Builds the complete PE image bytes for `asm`: populates metadata for every class/field/method,
 /// assembles every method body, lays out RVAs, patches them back into the metadata, and writes
-/// the final PE/COFF container. Returns the finished `.exe`/`.dll` bytes.
+/// the final PE/COFF container. Returns the finished `.exe`/`.dll` bytes, plus the standalone
+/// Portable PDB bytes for the caller to write to `options.pdb_file_name` next to it (empty when
+/// `options.pdb_file_name` is empty — see that field's doc) — Phase 2's debug-info wiring
+/// (`docs/PE_EMISSION_PLAN.md`): every `body::AssembledBody::sequence_points` collected during
+/// Pass 4 becomes that method's `pdb::MethodDebugInformation` row, in `MethodDef` RID order (the
+/// same order `bodies` is already built in), and the returned image's Debug Directory (§Format
+/// spec, CodeView/RSDS) is derived from the SAME [`pdb::PdbId`] embedded in the returned PDB
+/// bytes, so the two files are guaranteed to match byte-for-byte on the GUID/age CoreCLR checks.
 ///
 /// # Panics / `todo!()`
 /// On any construct outside the Phase 1a inventory — see the module doc.
 #[must_use]
-pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
+pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u8>) {
     let mut mb = MetadataBuilder::new();
     // Must happen before ANY `AssemblyRef` row is created (every class's implicit
     // `System.Object`/`System.ValueType` base pulls in `System.Runtime`) — see
@@ -553,6 +569,46 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
         cursor += u32::try_from(assembled.bytes.len()).unwrap();
     }
 
+    // --- Phase 2: build the standalone Portable PDB from every `AssembledBody::sequence_points`
+    // collected in Pass 4, BEFORE the `.sdata`/debug-directory RVA math below (which needs the
+    // finished PDB's [`pdb::DebugDirectoryEntry`] to size the Debug Directory region ahead of
+    // `.sdata` in `.text` — see `pe::field_rva_section_start`'s `debug_dir_len` parameter).
+    // `options.pdb_file_name` empty means "no PDB requested" (e.g. a caller that only wants a
+    // structural/E2E test image with no debug info) — every other field stays wired unconditionally
+    // since it's cheap and keeps this pass's control flow simple.
+    let debug_directory = if options.pdb_file_name.is_empty() {
+        None
+    } else {
+        let type_system = super::pdb::TypeSystemRowCounts {
+            rows: mb.type_system_row_counts(),
+            entry_point_token: entry_point_token.map_or(0, |t| t.0),
+        };
+        let mut pdb_builder = super::pdb::PdbBuilder::new(type_system, mb.method_def_row_count());
+        for (tok, assembled) in &bodies {
+            if assembled.sequence_points.is_empty() {
+                continue;
+            }
+            pdb_builder.add_method(
+                *tok,
+                super::pdb::MethodSequencePoints {
+                    local_signature: assembled.locals_signature,
+                    points: assembled.sequence_points.clone(),
+                },
+            );
+        }
+        let (pdb_bytes, pdb_id) = pdb_builder.build();
+        // `PdbChecksumEntry` must be derived from the FINAL, complete PDB bytes (the checksum
+        // covers the whole file) — see `pdb::sha256`'s doc for why this second Debug Directory
+        // entry (not just CodeView/RSDS) turned out to be required for CoreCLR's runtime
+        // `StackTraceSymbols` provider to trust the PDB at all.
+        let checksum = super::pdb::PdbChecksumEntry::from_pdb_bytes(&pdb_bytes);
+        let debug_dir_entry = super::pdb::DebugDirectoryEntry::from_pdb_id(pdb_id, options.pdb_file_name.clone());
+        Some((pdb_bytes, debug_dir_entry, checksum))
+    };
+    let debug_dir_len = debug_directory
+        .as_ref()
+        .map_or(0, |(_, entry, checksum)| pe::debug_directory_len(entry, Some(checksum)));
+
     // `.sdata` layout: every queued `FieldRVA` blob (scalar static defaults + const-data, both
     // queued by Pass 2/2.5 above), 4-byte aligned per entry (mirrors the method-body layout loop
     // just above — not spec-mandated for `FieldRVA` the way §II.25.4.1 mandates it for method
@@ -563,6 +619,7 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
         entry_point_token.is_some(),
         metadata_len_probe,
         method_bodies_bytes.len(),
+        debug_dir_len,
     );
     let mut field_rva_bytes: Vec<u8> = Vec::new();
     let mut field_cursor = sdata_start_rva;
@@ -583,11 +640,15 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
         "patching RVAs into already-sized rows must not change the metadata's serialized length"
     );
 
+    let pdb_bytes = debug_directory.as_ref().map_or_else(Vec::new, |(bytes, _, _)| bytes.clone());
     let pe_options = PeOptions {
         is_dll: options.is_dll,
         entry_point: entry_point_token.map(|t| t.0),
+        debug_directory: debug_directory.as_ref().map(|(_, entry, _)| entry.clone()),
+        pdb_checksum: debug_directory.map(|(_, _, checksum)| checksum),
     };
-    pe::write_pe(&metadata, &method_bodies_bytes, &field_rva_bytes, &pe_options)
+    let image = pe::write_pe(&metadata, &method_bodies_bytes, &field_rva_bytes, &pe_options);
+    (image, pdb_bytes)
 }
 
 /// Little-endian byte blob for a scalar `Const`'s `FieldRVA` default value — the exact widths
@@ -719,8 +780,9 @@ mod tests {
             is_dll: true,
             assembly_name: "export_pe_smoke".to_string(),
             module_name: "export_pe_smoke.exe".to_string(),
+            pdb_file_name: String::new(),
         };
-        let image = export_pe(&mut asm, &options);
+        let (image, _pdb) = export_pe(&mut asm, &options);
         assert_eq!(&image[0..2], b"MZ", "must start with the DOS signature");
         assert!(image.len() > 0x200, "must be at least one FileAlignment block");
     }
@@ -775,8 +837,9 @@ mod tests {
             is_dll: false,
             assembly_name: "pe_e2e_hello".to_string(),
             module_name: "pe_e2e_hello.exe".to_string(),
+            pdb_file_name: String::new(),
         };
-        let image = export_pe(&mut asm, &options);
+        let (image, _pdb) = export_pe(&mut asm, &options);
         assert_eq!(&image[0..2], b"MZ");
 
         // Locate the CLI header the same way `pe.rs`'s own test-only parser does (DOS e_lfanew ->
@@ -818,6 +881,173 @@ mod tests {
         );
     }
 
+    /// **Phase 2 structural acceptance check** (no `dotnet` host needed — see
+    /// `e2e_hand_built_assembly_runs_under_dotnet` for the live-execution counterpart): builds the
+    /// hello-world assembly with a `CILRoot::SourceFileInfo` root prepended to `entrypoint`'s body
+    /// (mirroring what `span_source_info`, `src/assembly.rs:586-616`, actually produces per
+    /// statement), exports it with a non-empty `pdb_file_name`, and asserts:
+    /// * the returned PDB bytes are non-empty and its `#Pdb` stream's `EntryPointToken` matches the
+    ///   `.dll`'s own CLI-header `EntryPointToken` (both come from the same `entry_point_token`,
+    ///   but only a byte-level check proves the wiring, not just the shared local variable);
+    /// * the `.dll`'s Debug Directory RSDS GUID/age matches `pdb::deterministic_pdb_id` of the
+    ///   returned PDB bytes exactly (the "byte check" the task's acceptance criteria call for);
+    /// * the PDB's `MethodDebugInformation` row for `entrypoint` decodes a `SequencePoint` whose
+    ///   `document_path` is the exact file string passed to `SourceFileInfo`.
+    #[test]
+    fn export_pe_hand_built_hello_world_with_source_info_produces_a_matching_pdb() {
+        let mut asm = Assembly::default();
+        let main = asm.main_module();
+
+        let console = crate::ir::ClassRef::console(&mut asm);
+        let write_line_name = asm.alloc_string("WriteLine");
+        let write_line_sig = asm.sig([Type::PlatformString], Type::Void);
+        let write_line = asm.alloc_methodref(crate::ir::MethodRef::new(
+            console,
+            write_line_name,
+            write_line_sig,
+            MethodKind::Static,
+            vec![].into(),
+        ));
+
+        let file = asm.alloc_string("src/main.rs");
+        let source_info = asm.alloc_root(CILRoot::SourceFileInfo {
+            line_start: 3,
+            line_len: 1,
+            col_start: 4,
+            col_len: 10,
+            file,
+        });
+        let msg = asm.alloc_string("PE writer E2E OK");
+        let ldstr = asm.alloc_node(CILNode::Const(Box::new(Const::PlatformString(msg))));
+        let call = asm.alloc_root(CILRoot::Call(Box::new((write_line, vec![ldstr].into(), IsPure::NOT))));
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        let block = BasicBlock::new(vec![source_info, call, ret], 0, None);
+
+        let entry_sig = asm.sig([], Type::Void);
+        let entry_name = asm.alloc_string("entrypoint");
+        let entry_def = MethodDef::new(
+            Access::Public,
+            main,
+            entry_name,
+            entry_sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody { blocks: vec![block], locals: vec![] },
+            vec![],
+        );
+        asm.new_method(entry_def);
+
+        let options = ExportOptions {
+            is_dll: false,
+            assembly_name: "pe_e2e_pdb".to_string(),
+            module_name: "pe_e2e_pdb.exe".to_string(),
+            pdb_file_name: "pe_e2e_pdb.pdb".to_string(),
+        };
+        let (image, pdb) = export_pe(&mut asm, &options);
+        assert!(!pdb.is_empty(), "a non-empty pdb_file_name must produce non-empty PDB bytes");
+
+        // Read back the .dll's Debug Directory RSDS payload the same way `pe.rs`'s own
+        // `debug_directory_round_trips_through_write_pe` test does, but via raw offsets here
+        // (this module can't reach `pe::tests::parse_pe`, it's private to that module).
+        let u32_at = |off: usize| u32::from_le_bytes(image[off..off + 4].try_into().unwrap());
+        let u16_at = |off: usize| u16::from_le_bytes(image[off..off + 2].try_into().unwrap());
+        let e_lfanew = u32_at(0x3C) as usize;
+        let coff = e_lfanew + 4;
+        let num_sections = u16_at(coff + 2) as usize;
+        let opt_header_size = u16_at(coff + 16) as usize;
+        let opt = coff + 20;
+        let dir_base = opt + 96;
+        let debug_dir_rva = u32_at(dir_base + 6 * 8); // DataDirectory[6] = Debug.
+        assert_ne!(debug_dir_rva, 0, "Debug Directory must be populated when pdb_file_name is non-empty");
+
+        let sec_table = opt + opt_header_size;
+        let mut debug_dir_file_off = None;
+        for i in 0..num_sections {
+            let s = sec_table + i * 40;
+            let vsize = u32_at(s + 8);
+            let rva = u32_at(s + 12);
+            let raw_size = u32_at(s + 16);
+            let file_off = u32_at(s + 20);
+            if rva <= debug_dir_rva && debug_dir_rva < rva + vsize.max(raw_size) {
+                debug_dir_file_off = Some(file_off + (debug_dir_rva - rva));
+                break;
+            }
+        }
+        let debug_dir_file_off = debug_dir_file_off.expect("Debug Directory RVA must fall inside a section") as usize;
+        // IMAGE_DEBUG_DIRECTORY: Characteristics(4) TimeDateStamp(4) MajorVersion(2)
+        // MinorVersion(2) Type(4) SizeOfData(4) AddressOfRawData(4) PointerToRawData(4).
+        let debug_type = u32_at(debug_dir_file_off + 12);
+        assert_eq!(debug_type, 2, "IMAGE_DEBUG_TYPE_CODEVIEW");
+        let pointer_to_raw_data = u32_at(debug_dir_file_off + 24) as usize;
+        assert_eq!(&image[pointer_to_raw_data..pointer_to_raw_data + 4], b"RSDS");
+        let guid = &image[pointer_to_raw_data + 4..pointer_to_raw_data + 20];
+        let age = u32_at(pointer_to_raw_data + 20);
+
+        // Locate the PDB's own `#Pdb` stream (BSJB header -> stream directory, same shape
+        // `pdb::tests::TestPdbReader::parse` decodes) to read back the REAL 20-byte id this PDB
+        // was built with — NOT `deterministic_pdb_id(&pdb)` re-hashed over the FINAL bytes, which
+        // would be wrong: `PdbBuilder::build` hashes the pre-id-patch bytes (see that function's
+        // doc), so re-hashing the patched-in final bytes does not reproduce the same id.
+        let pdb_id = {
+            let version_len = u32::from_le_bytes(pdb[12..16].try_into().unwrap()) as usize;
+            let mut cursor = 16 + version_len + 2; // skip Flags.
+            let stream_count = u16::from_le_bytes(pdb[cursor..cursor + 2].try_into().unwrap());
+            cursor += 2;
+            let mut pdb_stream_offset = None;
+            for _ in 0..stream_count {
+                let offset = u32::from_le_bytes(pdb[cursor..cursor + 4].try_into().unwrap()) as usize;
+                cursor += 8; // offset(4) + size(4)
+                let name_start = cursor;
+                let name_end = pdb[name_start..].iter().position(|&b| b == 0).unwrap() + name_start;
+                let name = std::str::from_utf8(&pdb[name_start..name_end]).unwrap();
+                let mut name_len = name_end - name_start + 1;
+                while name_len % 4 != 0 {
+                    name_len += 1;
+                }
+                cursor = name_start + name_len;
+                if name == "#Pdb" {
+                    pdb_stream_offset = Some(offset);
+                }
+            }
+            let off = pdb_stream_offset.expect("#Pdb stream must be present");
+            <[u8; 20]>::try_from(&pdb[off..off + 20]).unwrap()
+        };
+        assert_eq!(guid, &pdb_id[0..16], "Debug Directory GUID must equal the PDB's own #Pdb-stream id[0..16]");
+        let expected_stamp = u32::from_le_bytes([pdb_id[16], pdb_id[17], pdb_id[18], pdb_id[19]]);
+        assert_eq!(age, expected_stamp | 1, "Age mirrors DebugDirectoryEntry::from_pdb_id's stamp|1 derivation");
+        // THE critical check (root cause of a real Phase-2 acceptance bug — see
+        // `pdb::DebugDirectoryEntry::stamp`'s doc): `System.Reflection.Metadata`'s
+        // `PEReader.TryOpenCodeViewPortablePdb` matches the opened PDB's id against
+        // `(codeViewData.Guid, codeViewEntry.Stamp)` — the ROW's own `TimeDateStamp` field, NOT the
+        // RSDS payload's `Age`. It must equal `pdb_id[16..20]` VERBATIM (no `| 1`), or
+        // `Environment.StackTrace`/`TryOpenAssociatedPortablePdb` silently fails to resolve file:line
+        // even though every other structural check here passes.
+        let row_time_date_stamp = u32_at(debug_dir_file_off + 4);
+        assert_eq!(
+            row_time_date_stamp, expected_stamp,
+            "IMAGE_DEBUG_DIRECTORY.TimeDateStamp must equal pdb_id[16..20] verbatim — this is the field SRM actually matches on, not RSDS Age"
+        );
+
+        // Decode the PDB's own #Pdb stream EntryPointToken and cross-check it against the .dll's
+        // CLI header EntryPointToken (both should be `entrypoint`'s MethodDef token).
+        assert_eq!(&pdb[0..4], b"BSJB", "standalone PDB must start with the BSJB signature");
+        let cli_rva = u32_at(dir_base + 14 * 8);
+        let mut cli_file_off = None;
+        for i in 0..num_sections {
+            let s = sec_table + i * 40;
+            let vsize = u32_at(s + 8);
+            let rva = u32_at(s + 12);
+            let raw_size = u32_at(s + 16);
+            let file_off = u32_at(s + 20);
+            if rva <= cli_rva && cli_rva < rva + vsize.max(raw_size) {
+                cli_file_off = Some(file_off + (cli_rva - rva));
+                break;
+            }
+        }
+        let cli_file_off = cli_file_off.expect("CLI header RVA must fall inside a section") as usize;
+        let dll_entry_point_token = u32_at(cli_file_off + 20);
+        assert_eq!(dll_entry_point_token, Token::new(Token::TABLE_METHOD_DEF, 1).0);
+    }
+
     /// Path to the real `dotnet` host on this machine, or `None` if not present — every E2E test
     /// below shares this guard (`eprintln!` + early return, not a failure, so the suite stays
     /// green on a machine with no .NET SDK installed, per the task's original guard).
@@ -833,11 +1063,26 @@ mod tests {
     /// runs it under the real `dotnet` host, returning `(stdout, stderr, success)`. Shared by
     /// every E2E test below that needs to actually execute a hand-built PE image.
     fn run_under_dotnet(image: &[u8], name: &str) -> (String, String, bool) {
+        run_under_dotnet_impl(image, None, name)
+    }
+
+    /// Same as [`run_under_dotnet`], but also writes `pdb` to `<scratch>/<name>.pdb` — i.e.
+    /// EXACTLY where CoreCLR's loader looks first (`<dll-stem>.pdb` next to the `.dll`, per
+    /// `pdb::DebugDirectoryEntry`'s doc) — before running. Used by Phase-2 acceptance tests that
+    /// need a live host to actually resolve file:line info through the PDB this writer produced.
+    fn run_under_dotnet_with_pdb(image: &[u8], pdb: &[u8], name: &str) -> (String, String, bool) {
+        run_under_dotnet_impl(image, Some(pdb), name)
+    }
+
+    fn run_under_dotnet_impl(image: &[u8], pdb: Option<&[u8]>, name: &str) -> (String, String, bool) {
         let (dotnet_root, dotnet_bin) = dotnet_host().expect("caller must guard with dotnet_host()");
         let scratch = std::env::temp_dir().join("pe_e2e");
         std::fs::create_dir_all(&scratch).expect("create scratch dir");
         let exe_path = scratch.join(format!("{name}.dll")); // apphost-less: `dotnet <path>.dll` runs it directly.
         std::fs::write(&exe_path, image).expect("write exported PE image");
+        if let Some(pdb) = pdb {
+            std::fs::write(scratch.join(format!("{name}.pdb")), pdb).expect("write exported PDB");
+        }
 
         let runtimeconfig = r#"{
   "runtimeOptions": {
@@ -877,14 +1122,104 @@ mod tests {
             is_dll: false,
             assembly_name: "pe_e2e_hello".to_string(),
             module_name: "pe_e2e_hello.exe".to_string(),
+            pdb_file_name: String::new(),
         };
-        let image = export_pe(&mut asm, &options);
+        let (image, _pdb) = export_pe(&mut asm, &options);
 
         let (stdout, stderr, success) = run_under_dotnet(&image, "pe_e2e_hello");
         assert!(success, "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
         assert!(
             stdout.contains("PE writer E2E OK"),
             "expected stdout to contain the WriteLine output; got:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    /// **Phase 2 acceptance milestone (live-execution counterpart of
+    /// `export_pe_hand_built_hello_world_with_source_info_produces_a_matching_pdb`)**: builds a
+    /// hand-built assembly whose `entrypoint` runs a `CILRoot::SourceFileInfo`-tagged statement
+    /// then throws an unhandled `System.Exception` from another `SourceFileInfo`-tagged statement,
+    /// exports it (dll + PDB) via `export_pe` (no `ilasm`), writes BOTH files next to each other
+    /// under a live `dotnet` host, and asserts `dotnet`'s own unhandled-exception printer resolves
+    /// real `file:line` info — the exact same `fNeedFileInfo` code path
+    /// `Environment.StackTrace`/`cargo_tests/cd_pdb`'s probe exercises, proving the direct-PE +
+    /// Phase-2-PDB pipeline end to end with a live CoreCLR host, not just static metadata
+    /// inspection. Root-caused two real bugs to get here (see `pe.rs`'s
+    /// `PORTABLE_CODEVIEW_MAJOR_VERSION` and `pdb::DebugDirectoryEntry::stamp` docs for the full
+    /// writeup): the CodeView entry's `MajorVersion`/`MinorVersion` must carry the Portable-PDB
+    /// marker, and its `TimeDateStamp` (not the RSDS payload's `Age`) is `System.Reflection.
+    /// Metadata`'s actual PDB-id match key.
+    #[test]
+    fn e2e_unhandled_exception_resolves_file_line_through_our_pdb() {
+        if dotnet_host().is_none() {
+            eprintln!("skipping e2e_unhandled_exception_resolves_file_line_through_our_pdb: no dotnet host");
+            return;
+        }
+
+        let mut asm = Assembly::default();
+        let main = asm.main_module();
+        let file = asm.alloc_string("cd_pdb_mini/src/main.rs");
+        let source_info = asm.alloc_root(CILRoot::SourceFileInfo {
+            line_start: 5,
+            line_len: 1,
+            col_start: 1,
+            col_len: 10,
+            file,
+        });
+        let nop = asm.alloc_root(CILRoot::Nop);
+        let throw_source_info = asm.alloc_root(CILRoot::SourceFileInfo {
+            line_start: 9,
+            line_len: 1,
+            col_start: 1,
+            col_len: 20,
+            file,
+        });
+        let exc_cref = crate::ir::ClassRef::exception(&mut asm);
+        let exc_msg = asm.alloc_string("pe_e2e_pdb unhandled exception");
+        let exc_ldstr = asm.alloc_node(CILNode::Const(Box::new(Const::PlatformString(exc_msg))));
+        let ctor_name = asm.alloc_string(".ctor");
+        let exc_ctor_sig = asm.sig([Type::ClassRef(exc_cref), Type::PlatformString], Type::Void);
+        let exc_ctor = asm.alloc_methodref(crate::ir::MethodRef::new(
+            exc_cref,
+            ctor_name,
+            exc_ctor_sig,
+            MethodKind::Constructor,
+            vec![].into(),
+        ));
+        let new_exc = asm.alloc_node(CILNode::Call(Box::new((exc_ctor, vec![exc_ldstr].into(), IsPure::NOT))));
+        let throw_root = asm.alloc_root(CILRoot::Throw(new_exc));
+        let block = BasicBlock::new(vec![source_info, nop, throw_source_info, throw_root], 0, None);
+
+        let entry_sig = asm.sig([], Type::Void);
+        let entry_name = asm.alloc_string("entrypoint");
+        let entry_def = MethodDef::new(
+            Access::Public,
+            main,
+            entry_name,
+            entry_sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody { blocks: vec![block], locals: vec![] },
+            vec![],
+        );
+        asm.new_method(entry_def);
+
+        let options = ExportOptions {
+            is_dll: false,
+            assembly_name: "pe_e2e_pdb_throw".to_string(),
+            module_name: "pe_e2e_pdb_throw.exe".to_string(),
+            pdb_file_name: "pe_e2e_pdb_throw.pdb".to_string(),
+        };
+        let (image, pdb) = export_pe(&mut asm, &options);
+        assert!(!pdb.is_empty());
+
+        let (stdout, stderr, success) = run_under_dotnet_with_pdb(&image, &pdb, "pe_e2e_pdb_throw");
+        assert!(!success, "the process must exit non-zero on an unhandled exception");
+        assert!(
+            stderr.contains("pe_e2e_pdb unhandled exception"),
+            "expected the unhandled exception message in stderr; got:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("main.rs:line 9"),
+            "expected the unhandled-exception trace to resolve file:line through OUR PDB (no ilasm); got:\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
 
@@ -955,8 +1290,9 @@ mod tests {
             is_dll: false,
             assembly_name: "pe_e2e_const_data".to_string(),
             module_name: "pe_e2e_const_data.exe".to_string(),
+            pdb_file_name: String::new(),
         };
-        let image = export_pe(&mut asm, &options);
+        let (image, _pdb) = export_pe(&mut asm, &options);
 
         let (stdout, stderr, success) = run_under_dotnet(&image, "pe_e2e_const_data");
         assert!(success, "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
@@ -1051,8 +1387,9 @@ mod tests {
             is_dll: false,
             assembly_name: "pe_e2e_no_alias".to_string(),
             module_name: "pe_e2e_no_alias.exe".to_string(),
+            pdb_file_name: String::new(),
         };
-        let image = export_pe(&mut asm, &options);
+        let (image, _pdb) = export_pe(&mut asm, &options);
 
         let (stdout, stderr, success) = run_under_dotnet(&image, "pe_e2e_no_alias");
         assert!(success, "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
@@ -1161,8 +1498,9 @@ mod tests {
             is_dll: false,
             assembly_name: "pe_e2e_no_pinvoke_alias".to_string(),
             module_name: "pe_e2e_no_pinvoke_alias.exe".to_string(),
+            pdb_file_name: String::new(),
         };
-        let image = export_pe(&mut asm, &options);
+        let (image, _pdb) = export_pe(&mut asm, &options);
 
         // `strlen` is the 2nd `MethodDef` row added (`second`, `strlen`, `entrypoint` — 1-based
         // RID 2), and its RVA must read back as exactly `0` (§II.22.26: bodyless methods MUST
@@ -1331,8 +1669,9 @@ mod tests {
             is_dll: false,
             assembly_name: "pe_e2e_static_default".to_string(),
             module_name: "pe_e2e_static_default.exe".to_string(),
+            pdb_file_name: String::new(),
         };
-        let image = export_pe(&mut asm, &options);
+        let (image, _pdb) = export_pe(&mut asm, &options);
 
         let (stdout, stderr, success) = run_under_dotnet(&image, "pe_e2e_static_default");
         assert!(success, "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
@@ -1364,8 +1703,9 @@ mod tests {
             is_dll: true,
             assembly_name: "export_pe_implements".to_string(),
             module_name: "export_pe_implements.exe".to_string(),
+            pdb_file_name: String::new(),
         };
-        let image = export_pe(&mut asm, &options);
+        let (image, _pdb) = export_pe(&mut asm, &options);
         assert_eq!(&image[0..2], b"MZ");
         assert!(image.len() > 0x200);
         // A byte-level `InterfaceImpl` row check would need to duplicate the metadata reader
@@ -1473,8 +1813,9 @@ mod tests {
             is_dll: false,
             assembly_name: "pe_e2e_layout".to_string(),
             module_name: "pe_e2e_layout.exe".to_string(),
+            pdb_file_name: String::new(),
         };
-        let image = export_pe(&mut asm, &options);
+        let (image, _pdb) = export_pe(&mut asm, &options);
 
         let (stdout, stderr, success) = run_under_dotnet(&image, "pe_e2e_layout");
         assert!(success, "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
@@ -1627,8 +1968,9 @@ mod tests {
             is_dll: false,
             assembly_name: "pe_e2e_fnptr_field".to_string(),
             module_name: "pe_e2e_fnptr_field.exe".to_string(),
+            pdb_file_name: String::new(),
         };
-        let image = export_pe(&mut asm, &options);
+        let (image, _pdb) = export_pe(&mut asm, &options);
 
         let (stdout, stderr, success) = run_under_dotnet(&image, "pe_e2e_fnptr_field");
         assert!(success, "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}");

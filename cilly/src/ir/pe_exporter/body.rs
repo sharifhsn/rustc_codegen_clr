@@ -37,6 +37,7 @@
 //! 4)` (§II.25.4.4: the offset is relative to the instruction immediately *following* the branch,
 //! i.e. measured from the end of the 5-byte long-form instruction).
 
+use super::pdb::SequencePoint;
 use super::tables::{Token, TokenSink};
 use crate::ir::basic_block::BasicBlock;
 use crate::ir::cilnode::ExtendKind;
@@ -56,6 +57,19 @@ pub struct AssembledBody {
     /// `Flags = CorILMethod_Sect_EHTable | CorILMethod_Sect_FatFormat`) appended after the code
     /// and 4-byte aligned relative to the body start.
     pub bytes: Vec<u8>,
+    /// Every `CILRoot::SourceFileInfo` root visited while linearizing this body (same order
+    /// `il_exporter`'s `.line` directives appear in, per this module's parity-bar doc), each
+    /// tagged with the IL byte offset (within [`bytes`](Self::bytes)'s code stream, i.e. counting
+    /// past the fat header — `pdb::PdbBuilder`/`export.rs`'s wiring must subtract the header
+    /// length if it needs an offset relative to `code` alone) it was recorded at. Empty for a
+    /// method with no source spans (`MethodImpl::Extern`/`Missing`, or a body whose MIR carried no
+    /// spans) — [`pdb::PdbBuilder::add_method`] treats that as "no debug info", matching the spec's
+    /// empty-blob convention for such rows.
+    pub sequence_points: Vec<SequencePoint>,
+    /// The `StandAloneSig` token of this method's `.locals`, if any — mirrors the fat header's own
+    /// `LocalVarSigTok` field (`finish_body`'s `locals_tok` parameter) so `pdb.rs`'s
+    /// `MethodSequencePoints::local_signature` never needs to re-derive it.
+    pub locals_signature: Option<Token>,
 }
 
 // §II.25.4.3 fat-header flag bits (the low nibble of the Flags/Size u16).
@@ -110,6 +124,10 @@ struct Emitter<'a> {
     clauses: Vec<PendingClause>,
     marker_counter: u64,
     terminate_region_counter: u64,
+    /// Collected in the same visitation order `emit_root` runs (see this struct's doc and
+    /// `AssembledBody::sequence_points`), one entry per `CILRoot::SourceFileInfo` root — the
+    /// side-collector this module's doc describes as "the natural seam for Phase 2".
+    sequence_points: Vec<SequencePoint>,
 }
 
 impl<'a> Emitter<'a> {
@@ -967,8 +985,28 @@ impl<'a> Emitter<'a> {
             CILRoot::Break => self.push_u8(0x01),   // break
             CILRoot::Nop => self.push_u8(0x00),     // nop
             CILRoot::Branch(branch) => self.emit_branch(*branch, is_handler, has_handler),
-            CILRoot::SourceFileInfo { .. } => {
-                // Debug-info only; the pure-body writer emits no bytes for it (Phase 2 = PDB).
+            CILRoot::SourceFileInfo { line_start, line_len, col_start, col_len, file } => {
+                // Debug-info only — emits no IL bytes (mirrors `il_exporter`'s `.line` directive,
+                // which is likewise not an instruction). The sequence point is attributed to
+                // WHATEVER instruction comes next in the code stream, i.e. `self.out.len()` at
+                // this exact point — parity with `il_exporter`, whose `.line` directive textually
+                // precedes (and thus, per ilasm's own PDB writer, applies to) the very next
+                // emitted instruction.
+                let il_offset = u32::try_from(self.out.len()).expect("method body exceeds 4 GiB");
+                let file_path = self.asm[file].to_string();
+                let line = line_start;
+                let end_line = line_start + u32::from(line_len);
+                let col = u32::from(col_start);
+                let end_col = col + u32::from(col_len);
+                self.sequence_points.push(SequencePoint {
+                    il_offset,
+                    document_path: file_path,
+                    line,
+                    col,
+                    end_line,
+                    end_col,
+                    is_hidden: false,
+                });
             }
             CILRoot::SetField(flds) => {
                 let (field, addr, val) = *flds;
@@ -1335,14 +1373,18 @@ pub fn assemble_method(asm: &mut Assembly, method: MethodDefIdx, tokens: &mut dy
     let mimpl = asm[method].resolved_implementation(asm).clone();
     match mimpl {
         MethodImpl::MethodBody { blocks, locals } => assemble_method_body(asm, tokens, &blocks, &locals),
-        MethodImpl::Extern { .. } => AssembledBody { bytes: Vec::new() },
+        MethodImpl::Extern { .. } => AssembledBody {
+            bytes: Vec::new(),
+            sequence_points: Vec::new(),
+            locals_signature: None,
+        },
         MethodImpl::AliasFor(_) => panic!("resolved_implementation returned `AliasFor`"),
         MethodImpl::Missing => {
             let name = asm[asm[method].name()].to_string();
             let mut emitter = new_emitter(asm, tokens);
             let msg = format!("missing methiod {name}");
             emitter.emit_throw_new_exception(&msg);
-            finish_body(emitter.out, 3, None, &[], Token::new(0, 0))
+            finish_body(emitter.out, 3, None, &[], Token::new(0, 0), Vec::new())
         }
     }
 }
@@ -1357,6 +1399,7 @@ fn new_emitter<'a>(asm: &'a mut Assembly, tokens: &'a mut dyn TokenSink) -> Emit
         clauses: Vec::new(),
         marker_counter: 0,
         terminate_region_counter: 0,
+        sequence_points: Vec::new(),
     }
 }
 
@@ -1444,7 +1487,10 @@ fn assemble_method_body(
         Token::new(0, 0)
     };
 
-    finish_body(emitter.out, maxstack, locals_tok, &clauses_resolved, catch_type)
+    let sequence_points = emitter.sequence_points;
+    let mut body = finish_body(emitter.out, maxstack, locals_tok, &clauses_resolved, catch_type, sequence_points);
+    body.locals_signature = locals_tok;
+    body
 }
 
 /// Writes the fat header (§II.25.4.3) + code + optional fat EH section (§II.25.4.6) into the
@@ -1455,6 +1501,7 @@ fn finish_body(
     locals_tok: Option<Token>,
     clauses: &[(u32, u32, u32, u32)],
     catch_type: Token,
+    sequence_points: Vec<SequencePoint>,
 ) -> AssembledBody {
     let has_eh = !clauses.is_empty();
     let mut bytes = Vec::new();
@@ -1500,7 +1547,12 @@ fn finish_body(
         }
     }
 
-    AssembledBody { bytes }
+    // `sequence_points`' `il_offset`s were recorded against `code` (the raw instruction stream,
+    // before the fat header was prepended above) — exactly what the Portable PDB spec wants
+    // (`MethodDebugInformation`'s sequence points are offsets from the start of the method body's
+    // IL, not counting the header; §II.25.4.3's `CodeSize` field has the same "header doesn't
+    // count" convention). No offset adjustment needed here.
+    AssembledBody { bytes, sequence_points, locals_signature: None }
 }
 
 /// Computes `.maxstack` (§II.25.4.3 `MaxStack` field) for one method body, mirroring
@@ -1606,7 +1658,7 @@ mod tests {
 
     #[test]
     fn assembled_body_is_a_plain_byte_buffer() {
-        let body = AssembledBody { bytes: vec![0u8; 12] };
+        let body = AssembledBody { bytes: vec![0u8; 12], sequence_points: Vec::new(), locals_signature: None };
         assert_eq!(body.bytes.len(), 12);
     }
 
@@ -1750,6 +1802,59 @@ mod tests {
                 4,
             )
         }
+    }
+
+    /// A `CILRoot::SourceFileInfo` root immediately before `ret` is collected as a `SequencePoint`
+    /// at the IL offset of `ret` itself (`SourceFileInfo` emits zero bytes — this is the exact
+    /// "seam" this module's doc describes: the source root marks whatever comes next). Also
+    /// covers a *second* `SourceFileInfo` between two more instructions, proving offsets track the
+    /// running code length (not e.g. always 0) and multiple points from ONE method collect in
+    /// visitation order.
+    #[test]
+    fn source_file_info_roots_become_sequence_points_at_the_next_instructions_offset() {
+        let mut asm = Assembly::default();
+        let sig = asm.sig([], Type::Int(Int::I32));
+        let file = asm.alloc_string("src/main.rs");
+        let span1 = asm.alloc_root(CILRoot::SourceFileInfo {
+            line_start: 10,
+            line_len: 1,
+            col_start: 4,
+            col_len: 3,
+            file,
+        });
+        let three = asm.alloc_node(CILNode::Const(Box::new(Const::I32(3))));
+        let pop = asm.alloc_root(CILRoot::Pop(three));
+        let span2 = asm.alloc_root(CILRoot::SourceFileInfo {
+            line_start: 11,
+            line_len: 2,
+            col_start: 0,
+            col_len: 5,
+            file,
+        });
+        let four = asm.alloc_node(CILNode::Const(Box::new(Const::I32(4))));
+        let ret = asm.alloc_root(CILRoot::Ret(four));
+        let block = BB::new(vec![span1, pop, span2, ret], 0, None);
+        let method = make_static_method(&mut asm, sig, vec![block], vec![]);
+
+        let mut sink = StubSink::default();
+        let body = assemble_method(&mut asm, method, &mut sink);
+
+        assert_eq!(body.sequence_points.len(), 2, "one SequencePoint per SourceFileInfo root");
+        let p1 = &body.sequence_points[0];
+        assert_eq!(p1.il_offset, 0, "first SourceFileInfo precedes the very first instruction (`ldc.i4.3`)");
+        assert_eq!(p1.document_path, "src/main.rs");
+        assert_eq!(p1.line, 10);
+        assert_eq!(p1.end_line, 11, "line_start + line_len");
+        assert_eq!(p1.col, 4);
+        assert_eq!(p1.end_col, 7, "col_start + col_len");
+        assert!(!p1.is_hidden);
+
+        let p2 = &body.sequence_points[1];
+        // `ldc.i4.3`(1) + `pop`(1) = 2 bytes precede the second SourceFileInfo root.
+        assert_eq!(p2.il_offset, 2, "second SourceFileInfo's offset tracks the running code length");
+        assert_eq!(p2.line, 11);
+        assert_eq!(p2.end_line, 13);
+        assert!(p2.il_offset > p1.il_offset, "offsets strictly increase in visitation order");
     }
 
     /// `ldc.i4.3 ldc.i4.s 4 add ret` — straight-line arithmetic, fat header, tiny code, no locals.

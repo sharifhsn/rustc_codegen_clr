@@ -1094,6 +1094,52 @@ impl MetadataBuilder {
         out
     }
 
+    /// The number of `MethodDef` rows added so far — the count [`super::pdb::PdbBuilder::new`]
+    /// pre-sizes its per-method slot vector with (one `MethodDebugInformation` row must exist for
+    /// EVERY `MethodDef` row, per the Portable PDB spec's "PDB Stream" section, in the same RID
+    /// order the type-system table uses — see that constructor's doc).
+    #[must_use]
+    pub fn method_def_row_count(&self) -> usize {
+        self.method_def.len()
+    }
+
+    /// `(table id, row count)` pairs for every non-empty type-system table this builder has
+    /// populated, in table-id order — exactly the shape [`super::pdb::TypeSystemRowCounts::rows`]
+    /// needs for the standalone PDB's `#Pdb` stream (`ReferencedTypeSystemTables` mask + per-table
+    /// row counts, per the Portable PDB spec). Reuses the same `(Token::TABLE_*, count)` pairing
+    /// [`serialize_tables`](Self::serialize_tables) computes from [`row_counts`](Self::row_counts),
+    /// so this can never drift out of sync with what `serialize()` actually wrote to the `.dll`'s
+    /// own `#~` stream.
+    #[must_use]
+    pub fn type_system_row_counts(&self) -> Vec<(u32, u32)> {
+        let sizes = self.row_counts();
+        [
+            (Token::TABLE_MODULE, sizes.module),
+            (Token::TABLE_TYPE_REF, sizes.type_ref),
+            (Token::TABLE_TYPE_DEF, sizes.type_def),
+            (Token::TABLE_FIELD, sizes.field),
+            (Token::TABLE_METHOD_DEF, sizes.method_def),
+            (Token::TABLE_PARAM, sizes.param),
+            (Token::TABLE_INTERFACE_IMPL, sizes.interface_impl),
+            (Token::TABLE_MEMBER_REF, sizes.member_ref),
+            (Token::TABLE_CUSTOM_ATTRIBUTE, sizes.custom_attribute),
+            (Token::TABLE_CLASS_LAYOUT, sizes.class_layout),
+            (Token::TABLE_FIELD_LAYOUT, sizes.field_layout),
+            (Token::TABLE_STAND_ALONE_SIG, sizes.standalone_sig),
+            (Token::TABLE_MODULE_REF, sizes.module_ref),
+            (Token::TABLE_TYPE_SPEC, sizes.type_spec),
+            (Token::TABLE_IMPL_MAP, sizes.impl_map),
+            (Token::TABLE_FIELD_RVA, sizes.field_rva),
+            (Token::TABLE_ASSEMBLY, sizes.assembly),
+            (Token::TABLE_ASSEMBLY_REF, sizes.assembly_ref),
+            (Token::TABLE_METHOD_SPEC, sizes.method_spec),
+        ]
+        .into_iter()
+        .filter(|&(_, count)| count > 0)
+        .map(|(table, count)| (table, u32::try_from(count).expect("row count exceeds u32")))
+        .collect()
+    }
+
     fn row_counts(&self) -> RowCounts {
         RowCounts {
             module: self.module.len(),

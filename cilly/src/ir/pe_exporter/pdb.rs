@@ -209,7 +209,20 @@ impl PdbBuilder {
     /// `tables.rs`). Panics if `method_token` isn't a `MethodDef` token or is out of range for the
     /// row count passed to [`new`](Self::new) — both indicate a caller bug (a token from the wrong
     /// table, or a row count that didn't match the type-system metadata this PDB describes).
-    pub fn add_method(&mut self, method_token: Token, info: MethodSequencePoints) {
+    ///
+    /// `info.points` may contain multiple entries at the SAME `il_offset` — `body.rs`'s linearizer
+    /// deliberately does not dedupe (parity bar: it visits every `CILRoot::SourceFileInfo` root
+    /// exactly like `il_exporter`'s unconditional `.line` emission, and consecutive
+    /// `SourceFileInfo` roots with no instruction between them — e.g. an inlined call's span
+    /// immediately followed by another span before any code is emitted — are a legitimate MIR
+    /// shape). The Portable PDB spec requires STRICTLY increasing IL offsets within one method's
+    /// sequence-points blob (`encode_sequence_point_record` asserts this), so this method collapses
+    /// any run of same-offset points down to the LAST one before storing — matching the intuitive
+    /// "last `.line` directive before an instruction wins" semantics ilasm's own PDB writer applies
+    /// silently, and keeping [`SequencePoint::il_offset`] strictly increasing is this module's
+    /// responsibility to enforce, not `body.rs`'s (which stays a pure, undeduped mirror of the
+    /// oracle exporter).
+    pub fn add_method(&mut self, method_token: Token, mut info: MethodSequencePoints) {
         let table = method_token.0 >> 24;
         assert_eq!(
             table,
@@ -222,6 +235,7 @@ impl PdbBuilder {
             "MethodDef rid {rid} out of range for {} declared rows",
             self.methods.len()
         );
+        info.points = dedupe_same_offset_points(info.points);
         self.methods[rid - 1] = Some(info);
     }
 
@@ -252,13 +266,19 @@ impl PdbBuilder {
         let guids = GuidHeap::default();
         let user_strings = UserStringHeap::default();
 
+        // Nil Language/HashAlgorithm/Hash: `PortablePdb-Metadata.md` defines C#/VB/F# language
+        // GUIDs but no Rust one, and no hash algorithm is computed for a Document's source content
+        // here. Empirically confirmed NOT to block runtime symbol resolution: the real Phase-2
+        // acceptance blocker (see `pe.rs`'s `PORTABLE_CODEVIEW_MAJOR_VERSION`/
+        // `DebugDirectoryEntry::stamp` docs) was the PE-side CodeView entry's version marker and
+        // `TimeDateStamp` fields, not anything in this table — a from-scratch test that stamped a
+        // real (C#) language GUID here resolved file:line identically to nil, isolating this as
+        // genuinely optional in practice, matching the spec's own "optional" framing for these
+        // three columns.
         let document_rows: Vec<DocumentRow> = documents
             .iter()
             .map(|path| DocumentRow {
                 name: encode_document_name(&mut blobs, path),
-                // PortablePdb-Metadata.md defines C#, VB, and F# language GUIDs, but no Rust GUID.
-                // Emit nil Language/HashAlgorithm and an empty Hash so readers treat the values as
-                // intentionally unspecified instead of falsely identifying the source language.
                 hash_algorithm: 0,
                 hash: 0,
                 language: 0,
@@ -305,6 +325,29 @@ impl PdbBuilder {
         bytes[pdb_id_offset..pdb_id_offset + 20].copy_from_slice(&id);
         (bytes, id)
     }
+}
+
+/// Collapses consecutive [`SequencePoint`]s sharing the same [`SequencePoint::il_offset`] down to
+/// the LAST one in each run — see [`PdbBuilder::add_method`]'s doc for why this is necessary (the
+/// Portable PDB spec requires strictly increasing offsets) and why "last wins" is the right rule
+/// (mirrors the intuitive reading of ilasm's own `.line`-directive-per-offset collapsing). Assumes
+/// `points` is already offset-sorted (non-decreasing) — true for every real caller, since
+/// `body.rs`'s linearizer visits roots in code-offset order — but does not itself require strict
+/// sortedness beyond non-decreasing runs; a later, smaller offset after a larger one is a caller
+/// bug this function does not attempt to paper over (the subsequent strictly-increasing assert in
+/// `encode_sequence_point_record` will catch it).
+fn dedupe_same_offset_points(points: Vec<SequencePoint>) -> Vec<SequencePoint> {
+    let mut out: Vec<SequencePoint> = Vec::with_capacity(points.len());
+    for point in points {
+        if let Some(last) = out.last_mut() {
+            if last.il_offset == point.il_offset {
+                *last = point;
+                continue;
+            }
+        }
+        out.push(point);
+    }
+    out
 }
 
 const TABLE_DOCUMENT: u32 = 0x30;
@@ -752,6 +795,134 @@ pub fn deterministic_pdb_id(content: &[u8]) -> PdbId {
     out
 }
 
+/// SHA-256 (FIPS 180-4) of `data`, dependency-free (the workspace has no `sha2` crate; this is
+/// ~50 lines of a well-specified, unchanging algorithm — not worth a new dependency for one call
+/// site). Used ONLY for [`PdbChecksumEntry`]'s payload: a `PdbChecksum` (type 19) PE Debug
+/// Directory entry whose payload is `"SHA256\0"` + this hash of the WHOLE on-disk PDB file.
+///
+/// # Why this exists (root-caused during Phase-2 acceptance testing)
+/// A from-scratch, otherwise spec-conformant Portable PDB (verified byte-for-byte against
+/// `System.Reflection.Metadata`'s own reader — correct `#Pdb` stream row counts/entry-point token,
+/// correct RSDS GUID/age matching the PE's CodeView entry, correct delta-encoded sequence points)
+/// still produced NO file:line info from a live `Environment.StackTrace`/unhandled-exception trace
+/// under CoreCLR 8.0.28 on this machine — even though the SAME mechanism resolved a Roslyn-built
+/// assembly fine. Diffing the Debug Directory of a minimal Roslyn `.dll` against ours found Roslyn
+/// emits THREE entries (`CodeView`, `PdbChecksum`, `Reproducible`), not just `CodeView` — CoreCLR's
+/// runtime `StackTraceSymbols` provider (unlike the static SRM reader) apparently requires the
+/// `PdbChecksum` entry before it will trust/load a portable PDB at runtime. Adding it (this
+/// function + [`PdbChecksumEntry`] + `pe.rs`'s wiring) is what actually closed Phase 2's
+/// acceptance gap — the GUID/age pairing alone, while spec-correct, was NOT sufficient in
+/// practice.
+#[must_use]
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+
+    let mut msg = data.to_vec();
+    let bit_len = (data.len() as u64) * 8;
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (i, word) in w.iter_mut().take(16).enumerate() {
+            *word = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+
+    let mut out = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// A `PdbChecksum` (type 19) PE Debug Directory entry's payload (see [`sha256`]'s doc for why this
+/// entry is required, not just the `CodeView`/RSDS one): `"SHA256\0"` (NUL-terminated algorithm
+/// name) followed by the 32-byte SHA-256 digest of the complete on-disk PDB file bytes — matching
+/// the exact payload shape a real Roslyn-produced `.dll`'s Debug Directory carries (confirmed via
+/// `System.Reflection.PortableExecutable.PEReader.ReadDebugDirectory`/`GetSectionData` against a
+/// live-built reference assembly during this investigation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdbChecksumEntry {
+    pub algorithm_name: &'static str,
+    pub checksum: [u8; 32],
+}
+
+impl PdbChecksumEntry {
+    /// Computes the entry from the COMPLETE final PDB file bytes (i.e. [`PdbBuilder::build`]'s
+    /// first return value) — must be called with the bytes exactly as written to disk, since the
+    /// checksum covers the whole file, not just the `#Pdb` stream's own id field.
+    #[must_use]
+    pub fn from_pdb_bytes(pdb_bytes: &[u8]) -> Self {
+        Self {
+            algorithm_name: "SHA256",
+            checksum: sha256(pdb_bytes),
+        }
+    }
+
+    /// Serializes this entry's payload bytes: `"SHA256\0"` + the 32-byte digest, matching the
+    /// reference Roslyn payload shape byte-for-byte (see this type's doc).
+    #[must_use]
+    pub fn payload_bytes(&self) -> Vec<u8> {
+        let mut out = self.algorithm_name.as_bytes().to_vec();
+        out.push(0);
+        out.extend_from_slice(&self.checksum);
+        out
+    }
+}
+
 /// The PE-side hook: a type-2 (`IMAGE_DEBUG_TYPE_CODEVIEW`) Debug Directory entry
 /// (§II.25.3.1-adjacent — the Debug Directory isn't in ECMA-335 proper, it's a plain PE/COFF
 /// concept CoreCLR repurposes for PDB association) carrying an "RSDS" payload: magic `b"RSDS"`,
@@ -769,10 +940,26 @@ pub fn deterministic_pdb_id(content: &[u8]) -> PdbId {
 pub struct DebugDirectoryEntry {
     /// Bytes `0..16` of the [`PdbId`] this entry's PDB was built with.
     pub guid: [u8; 16],
-    /// The `Age` field (conventionally starts at 1 and increments per PDB rebuild for the same
-    /// GUID under the reference toolchain; this writer has no incremental-rebuild concept, so it
-    /// is always `1` — content changes produce a new GUID instead, via [`deterministic_pdb_id`]).
+    /// The RSDS payload's `Age` field (conventionally starts at 1 and increments per PDB rebuild
+    /// for the same GUID under the reference toolchain; this writer has no incremental-rebuild
+    /// concept, so it is always `1` — content changes produce a new GUID instead, via
+    /// [`deterministic_pdb_id`]). **Cosmetic only** — confirmed via `System.Reflection.Metadata`'s
+    /// own decompiled source (`PEReader.TryOpenCodeViewPortablePdb`) that the runtime's PDB-match
+    /// check never reads this field; [`stamp`](Self::stamp) is what actually gates resolution (see
+    /// that field's doc — this was the root cause of a real Phase 2 acceptance-testing bug).
     pub age: u32,
+    /// Bytes `16..20` of the [`PdbId`], written VERBATIM into the `IMAGE_DEBUG_DIRECTORY` row's own
+    /// `TimeDateStamp` field (`pe.rs`'s `write_debug_directory`) — **this, not [`age`](Self::age),
+    /// is what `PEReader.TryOpenCodeViewPortablePdb` actually compares against the opened PDB's own
+    /// `#Pdb`-stream `Id` bytes `16..20`** (`new BlobContentId(codeViewDebugDirectoryData.Guid,
+    /// codeViewEntry.Stamp)` in that decompiled source — the GUID half comes from the RSDS payload,
+    /// but the 4-byte stamp half comes from the ROW, not the payload). A real bug found during
+    /// Phase 2 acceptance testing: `pe.rs` previously wrote a hardcoded `0` into `TimeDateStamp`
+    /// "for determinism" (a reasonable-looking but WRONG generalization from the COFF header's own
+    /// `TimeDateStamp`, which genuinely should be `0`) — that silently mismatched this field
+    /// whenever the real stamp was nonzero, making `TryOpenAssociatedPortablePdb` return `false`
+    /// with no exception and no diagnostic, even though the PDB was otherwise byte-perfect.
+    pub stamp: u32,
     /// NUL-terminated (on write) path/filename CoreCLR's fallback resolver would use — conventionally
     /// just the PDB's bare filename (e.g. `"foo.pdb"`), matching `il_exporter`'s
     /// `pdb_file`/`{output_file_path}.pdb` convention in `cilly/src/bin/linker/main.rs:718-724`.
@@ -782,9 +969,10 @@ pub struct DebugDirectoryEntry {
 impl DebugDirectoryEntry {
     /// Builds the entry from a [`PdbId`] ([`PdbBuilder::build`]'s second return value) and the PDB
     /// file's on-disk name, splitting the 20 content-hash bytes into the CodeView GUID (bytes
-    /// `0..16`) and folding bytes `16..20` into `age` (kept nonzero — `0` is a valid but unusual
-    /// `Age`; XORing with `1` keeps this stub's placeholder derivation trivially distinguishable
-    /// from "no debug directory" without claiming semantic meaning for the low bits it borrows).
+    /// `0..16`), the row `TimeDateStamp` (bytes `16..20`, VERBATIM — see [`stamp`](Self::stamp)'s
+    /// doc for why this exact value, not `age`, is the real match key), and a cosmetic RSDS `Age`
+    /// (`stamp | 1`, kept nonzero purely so `age == 0` — a valid but unusual value — never gets
+    /// confused with "field not set" while eyeballing a hex dump; the runtime never reads it).
     #[must_use]
     pub fn from_pdb_id(id: PdbId, pdb_path: String) -> Self {
         let mut guid = [0u8; 16];
@@ -793,6 +981,7 @@ impl DebugDirectoryEntry {
         Self {
             guid,
             age: stamp | 1,
+            stamp,
             pdb_path,
         }
     }
@@ -1273,9 +1462,47 @@ mod tests {
             [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         );
         assert_eq!(entry.pdb_path, "foo.pdb");
-        // stamp bytes are [16,17,18,19] little-endian = 0x13121110; OR 1 keeps it nonzero (it
+        // stamp bytes are [16,17,18,19] little-endian = 0x13121110; OR 1 keeps `age` nonzero (it
         // already is here) without masking any bit we care about asserting.
         assert_eq!(entry.age, 0x1312_1110 | 1);
+        // `stamp` (the field the runtime ACTUALLY matches against, per `stamp`'s doc) must be the
+        // RAW bytes[16..20] value, NOT OR'd with 1 like `age` — this is the whole point of having
+        // two separate fields.
+        assert_eq!(entry.stamp, 0x1312_1110);
+    }
+
+    /// FIPS 180-4 / NIST published test vectors — the empty string and `"abc"` — the canonical
+    /// sanity check for any from-scratch SHA-256 implementation.
+    #[test]
+    fn sha256_matches_nist_test_vectors() {
+        assert_eq!(
+            hex_string(&sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex_string(&sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    fn hex_string(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn pdb_checksum_entry_payload_matches_roslyn_shape() {
+        let entry = PdbChecksumEntry::from_pdb_bytes(b"pretend pdb bytes");
+        let payload = entry.payload_bytes();
+        assert_eq!(&payload[0..7], b"SHA256\0", "NUL-terminated algorithm name");
+        assert_eq!(payload.len(), 7 + 32, "algorithm name + 32-byte digest, no extra padding");
+        assert_eq!(&payload[7..], &sha256(b"pretend pdb bytes"));
+    }
+
+    #[test]
+    fn pdb_checksum_entry_changes_with_pdb_content() {
+        let a = PdbChecksumEntry::from_pdb_bytes(b"content-a");
+        let b = PdbChecksumEntry::from_pdb_bytes(b"content-b");
+        assert_ne!(a.checksum, b.checksum);
     }
 
     #[test]
@@ -1311,6 +1538,52 @@ mod tests {
             },
         );
         assert_eq!(builder.methods[1].as_ref().unwrap().points.len(), 1);
+    }
+
+    /// Regression test for a real bug caught wiring `DIRECT_PE=1` end-to-end
+    /// (`cargo_tests/cd_pdb`): `body.rs`'s linearizer can visit two-or-more `SourceFileInfo` roots
+    /// with no instruction between them (offsets tie), which `encode_sequence_point_record`'s
+    /// strictly-increasing assert would otherwise reject with "sequence-point IL offsets must be
+    /// strictly increasing: N after N". `add_method` must collapse same-offset runs BEFORE that
+    /// assert ever sees them, keeping the LAST point per offset (see `dedupe_same_offset_points`'s
+    /// doc for why "last wins").
+    #[test]
+    fn add_method_collapses_same_il_offset_runs_keeping_the_last_point() {
+        let mut builder = PdbBuilder::new(
+            TypeSystemRowCounts { rows: vec![(Token::TABLE_METHOD_DEF, 1)], entry_point_token: 0 },
+            1,
+        );
+        let tok = Token::new(Token::TABLE_METHOD_DEF, 1);
+        builder.add_method(
+            tok,
+            MethodSequencePoints {
+                local_signature: None,
+                points: vec![
+                    sp(0, "a.rs", 1, 1, 1, 2),
+                    // Two more `SourceFileInfo` roots at the SAME il_offset (167 in the real bug) —
+                    // no instruction was emitted between them.
+                    sp(5, "a.rs", 2, 1, 2, 2),
+                    sp(5, "a.rs", 3, 1, 3, 2),
+                    sp(5, "a.rs", 4, 1, 4, 2),
+                    sp(9, "a.rs", 5, 1, 5, 2),
+                ],
+            },
+        );
+        let stored = builder.methods[0].as_ref().unwrap().points.clone();
+        assert_eq!(
+            stored,
+            [sp(0, "a.rs", 1, 1, 1, 2), sp(5, "a.rs", 4, 1, 4, 2), sp(9, "a.rs", 5, 1, 5, 2)],
+            "same-offset run at il_offset=5 collapses to its LAST entry (line 4), not the first"
+        );
+
+        // The whole pipeline (not just the stored Vec) must accept this without panicking, and the
+        // encoded blob must decode back to exactly the deduped points.
+        let (bytes, _) = builder.build();
+        let reader = TestPdbReader::parse(&bytes);
+        let documents = reader.documents();
+        let rows = reader.method_rows();
+        let (_, decoded) = reader.decode_sequence_points(rows[0], &documents);
+        assert_eq!(decoded, stored);
     }
 
     #[test]

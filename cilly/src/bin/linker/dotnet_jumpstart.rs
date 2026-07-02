@@ -27,7 +27,14 @@ fn main(){{
     let curr_path = std::env::current_exe().unwrap();
     let dll_path = curr_path.with_extension("dll");
     let config = curr_path.with_extension("runtimeconfig.json");
-    let pdb_file = curr_path.with_file_name("{pdb_file}");
+    // CoreCLR's loader looks for `<dll-stem>.pdb` NEXT TO the loaded `.dll` (see
+    // `pdb::DebugDirectoryEntry`'s doc) — i.e. it must match `dll_path` (the name THIS launcher
+    // unpacks the assembly bytes to, e.g. `cd_pdb.dll`), not `{pdb_file}` (the build-time,
+    // hashed-stem name the embedded PDB bytes were originally written under, e.g.
+    // `cd_pdb-<hash>.pdb`). Using the hashed name here was a real bug: it unpacked a PDB that sat
+    // right next to `dll_path` on disk but under the WRONG filename, so CoreCLR's stack-trace
+    // resolver silently found no PDB at all.
+    let pdb_file = dll_path.with_extension("pdb");
     let mut requires_refresh = false;
     if dll_path.exists() {{
     	let ondisk_len = std::fs::File::open(dll_path.clone()).expect("Could not create a file to unpack the .NET assembly").metadata().unwrap().len();

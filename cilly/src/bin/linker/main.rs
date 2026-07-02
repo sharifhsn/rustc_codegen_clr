@@ -520,7 +520,7 @@ fn main() {
         final_assembly.export(&path, cilly::java_exporter::JavaExporter::new(is_lib));
         if cargo_support {
             let bootstrap =
-                bootstrap_source(&path.with_extension("jar"), path.to_str().unwrap(), "java");
+                bootstrap_source(&path.with_extension("jar"), path.to_str().unwrap(), "java", None);
             let bootstrap_path = path.with_extension("rs");
             let mut bootstrap_file = std::fs::File::create(&bootstrap_path).unwrap();
             bootstrap_file.write_all(bootstrap.as_bytes()).unwrap();
@@ -593,15 +593,61 @@ fn main() {
             .and_then(|s| s.to_str())
             .map(str::to_string)
             .unwrap_or_else(|| asm_name.clone());
-        let bytes = cilly::pe_exporter::export::export_pe(
+        // Portable PDB (Phase 2, `docs/PE_EMISSION_PLAN.md`): mirrors the ilasm path's
+        // `{output_file_path}.pdb` convention (`bootstrap_source`'s `pdb_file` computation below).
+        //
+        // The RSDS-embedded path (this `pdb_file_name`) must be the filename `System.Reflection.
+        // Metadata.PortableExecutable.PEReader.TryOpenAssociatedPortablePdb` will ACTUALLY try to
+        // open — confirmed via that method's decompiled source: it resolves the candidate path as
+        // `Combine(dllDirectory, GetFileName(codeViewData.Path))`, i.e. the RSDS payload's OWN
+        // filename, not a fixed `<dll-stem>.pdb` convention this writer could just assume.
+        //
+        // For a LIBRARY, `exe_out == path` (the final artifact IS what's on disk, no launcher
+        // renames it), so `exe_out`'s stem is correct.
+        //
+        // For a `cargo_support` EXECUTABLE, `path`/`exe_out` are BOTH the linker's OWN `-o`
+        // argument — cargo's internal, hash-suffixed `deps/<crate>-<hash>` name (e.g.
+        // `cd_pdb-ee896e2c3711274b`), NOT the final artifact name cargo copies it to afterward
+        // (`cd_pdb`, no hash — `dotnet_jumpstart.rs`'s launcher already handles this correctly for
+        // the DLL bytes themselves via `current_exe().with_extension("dll")`, resolved dynamically
+        // at RUNTIME, but the PDB is written ONCE at BUILD TIME to a fixed path, so it can't use
+        // that same trick). A real bug caught during Phase 2 acceptance testing: using `path`'s own
+        // hashed stem here embedded an RSDS path (`cd_pdb-<hash>.pdb`) that never exists on disk
+        // post-cargo-copy (only `cd_pdb.pdb` does) — `TryOpenAssociatedPortablePdb` tried to open
+        // exactly that nonexistent hashed name and silently returned `false`.
+        //
+        // Fix: prefer `CARGO_CRATE_NAME` (set by cargo on every `rustc`/linker invocation it
+        // drives — confirmed present here; this is cargo's own source of truth for what the final,
+        // unhashed artifact will be named) for the executable case; fall back to `path`'s own stem
+        // (correct for the library case, and a reasonable degradation for any non-cargo caller
+        // that never sets the env var, e.g. `bin/rustflags.rs`'s manual usage — such a caller has
+        // no cargo-driven copy step to begin with, so `path`'s own name IS the final one there).
+        let pdb_stem = if is_lib {
+            None
+        } else {
+            std::env::var("CARGO_CRATE_NAME").ok()
+        };
+        let pdb_file_name = match pdb_stem {
+            Some(stem) => format!("{stem}.pdb"),
+            None => (if is_lib { &exe_out } else { &path })
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| format!("{s}.pdb"))
+                .unwrap_or_else(|| format!("{module_name}.pdb")),
+        };
+        let (bytes, pdb_bytes) = cilly::pe_exporter::export::export_pe(
             &mut final_assembly,
             &cilly::pe_exporter::export::ExportOptions {
                 is_dll: is_lib,
                 assembly_name: asm_name,
                 module_name,
+                pdb_file_name: pdb_file_name.clone(),
             },
         );
         std::fs::write(&exe_out, bytes).unwrap();
+        if !pdb_bytes.is_empty() {
+            std::fs::write(exe_out.with_file_name(&pdb_file_name), pdb_bytes).unwrap();
+        }
         // Mirrors the ilasm branch exactly (see its own `cargo_support && !is_lib` block just
         // below): a library IS the final artifact at `path`, no launcher needed. An executable's
         // real bytes live at `path.with_extension("exe")` (above), so cargo/`rustc`'s own
@@ -614,6 +660,7 @@ fn main() {
                 &path.with_extension("exe"),
                 path.to_str().unwrap(),
                 "dotnet",
+                Some(&pdb_file_name),
             );
             let bootstrap_path = path.with_extension("rs");
             let mut bootstrap_file = std::fs::File::create(&bootstrap_path).unwrap();
@@ -657,6 +704,7 @@ fn main() {
                 &path.with_extension("exe"),
                 path.to_str().unwrap(),
                 "dotnet",
+                None,
             );
             let bootstrap_path = path.with_extension("rs");
             let mut bootstrap_file = std::fs::File::create(&bootstrap_path).unwrap();
@@ -688,7 +736,12 @@ fn main() {
 
     //todo!();
 }
-fn bootstrap_source(fpath: &Path, output_file_path: &str, jumpstart_cmd: &str) -> String {
+/// `pdb_file_override`: `Some(name)` when the caller already knows the EXACT bare filename its
+/// PDB was written under (the `DIRECT_PE` executable case — see that call site's doc for why this
+/// can differ from `fpath.file_stem() + ".pdb"`: cargo's hashed `deps/` build path is not the
+/// final artifact name). `None` falls back to the pre-existing `{fpath-stem}.pdb` convention
+/// (ilasm path, and the `DIRECT_PE` library case where `fpath`'s own name already IS final).
+fn bootstrap_source(fpath: &Path, output_file_path: &str, jumpstart_cmd: &str, pdb_file_override: Option<&str>) -> String {
     if let Err(err) = std::fs::remove_file(output_file_path) {
         match err.kind() {
             std::io::ErrorKind::NotFound => (),
@@ -697,6 +750,21 @@ fn bootstrap_source(fpath: &Path, output_file_path: &str, jumpstart_cmd: &str) -
             }
         }
     };
+    let pdb_file = match pdb_file_override {
+        Some(name) => name.to_string(),
+        None => format!(
+            "{output_file_path}.pdb",
+            output_file_path = fpath.file_stem().unwrap().to_string_lossy()
+        ),
+    };
+    // Both the ilasm path (`IlasmFlavour::Modern`, `-debug`) and the direct-PE writer
+    // (`DIRECT_PE=1`, Phase 2's `pdb.rs`) place a PDB in `fpath`'s directory when they produced
+    // debug info — checking existence at `fpath`'s own directory (not assuming a PDB exists just
+    // because a given flavour/mode CAN produce one; ilasm's own PDB writer can fail and fall back
+    // silently for giant assemblies — see this comment's earlier form for that case) is
+    // flavour-agnostic UNLESS `IlasmFlavour::Clasic`, which never writes one under EITHER exporter.
+    let has_pdb =
+        *ILASM_FLAVOUR != IlasmFlavour::Clasic && fpath.with_file_name(&pdb_file).exists();
     format!(
         include_str!("dotnet_jumpstart.rs"),
         jumpstart_cmd = jumpstart_cmd,
@@ -706,22 +774,8 @@ fn bootstrap_source(fpath: &Path, output_file_path: &str, jumpstart_cmd: &str) -
         framework_version = cilly::dotnet_version().framework_version(),
         exec_file = fpath.file_name().unwrap().to_string_lossy(),
         has_native_companion = *NATIVE_PASSTROUGH,
-        has_pdb = match *ILASM_FLAVOUR {
-            IlasmFlavour::Clasic => false,
-            // Reflect whether ilasm actually produced a PDB rather than assuming Modern always
-            // does. For very large assemblies (e.g. the rust-lang/rust `coretests` harness, ~5M IL
-            // lines) ilasm's PDB writer fails and `assemble_file` falls back to assembling without
-            // `-debug`, so no `.pdb` exists. The launcher must then embed/refresh no PDB instead of
-            // `include_bytes!`-ing a missing file (which is a hard compile error in the launcher).
-            IlasmFlavour::Modern => fpath.with_extension("pdb").exists(),
-        },
-        pdb_file = match *ILASM_FLAVOUR {
-            IlasmFlavour::Clasic => String::new(),
-            IlasmFlavour::Modern => format!(
-                "{output_file_path}.pdb",
-                output_file_path = fpath.file_stem().unwrap().to_string_lossy()
-            ),
-        },
+        has_pdb = has_pdb,
+        pdb_file = if *ILASM_FLAVOUR == IlasmFlavour::Clasic { String::new() } else { pdb_file },
         native_companion_file = if *NATIVE_PASSTROUGH {
             format!(
                 "rust_native_{output_file_path}.so",
