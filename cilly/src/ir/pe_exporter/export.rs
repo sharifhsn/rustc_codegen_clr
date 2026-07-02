@@ -292,7 +292,32 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
                 .0
                 .iter()
                 .enumerate()
-                .map(|(zero_based, data)| (data.len().max(1), u32::try_from(zero_based + 1).unwrap(), data.to_vec()))
+                .map(|(zero_based, data)| {
+                    let n = data.len().max(1);
+                    // `n` (the `__rcl_const_blob_N` carrier's declared, ALWAYS-nonzero size — a
+                    // zero-sized .NET valuetype is illegal, hence the `.max(1)` above) must equal
+                    // the ACTUAL number of bytes queued into `pending_field_rva` below: the exact
+                    // FieldRVA-sizing invariant `docs/PE_EMISSION_PLAN.md`/commit 4b487f7 already
+                    // codify for scalar statics (a field's RVA data must match its declared type's
+                    // width, or a NativeAOT ILC — and, as caught here, this writer's OWN `.sdata`
+                    // layout cursor in the loop just below — reads/advances the wrong number of
+                    // bytes). A `data.len() == 0` blob (a real, if rare, case: an empty
+                    // `&[T; 0]`-shaped Rust static) used to push the RAW empty `Vec` here while the
+                    // carrier was sized 1 — the `.sdata` layout loop advances its cursor by
+                    // `bytes.len()` (0, not 1), so the NEXT queued blob landed on the SAME RVA as
+                    // this one, silently aliasing two unrelated static fields onto one address (a
+                    // real regression caught via `dotnet-ilverify`-clean-but-`Assembly.Load`-still-
+                    // rejects on `cargo_tests/cd_collections`: a corrupted `.sdata` region is below
+                    // the metadata-table layer ILVerify checks, so it never showed up as a
+                    // `MissingMethod`/`TypeLoad` diagnostic — only as a `FileLoadException` from
+                    // `Assembly.Load` itself refusing the whole malformed image). Padding with a
+                    // trailing zero byte here keeps every blob's `.sdata` footprint equal to its
+                    // carrier's declared size, exactly like the scalar-default path's own
+                    // "declared type width == blob length" invariant just above.
+                    let mut bytes = data.to_vec();
+                    bytes.resize(n, 0);
+                    (n, u32::try_from(zero_based + 1).unwrap(), bytes)
+                })
                 .collect();
             entries.sort_by_key(|&(_, idx_inner, _)| idx_inner);
             for (n, idx_inner, bytes) in entries {
@@ -423,6 +448,28 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
     let mut method_bodies_bytes = Vec::new();
     let mut cursor = bodies_start_rva;
     for (tok, assembled) in &bodies {
+        // A method with NO body — `MethodImpl::Extern` (P/Invoke, `ImplMap`-forwarded, e.g. the
+        // `strlen`/`memcmp` libc imports panic/backtrace formatting pulls in) or any other kind
+        // `body::assemble_method` returns empty bytes for — must keep `RVA = 0` (§II.22.26: "for
+        // methods with no body — abstract or runtime-supplied — RVA MUST be 0"; a P/Invoke
+        // method's real entry point lives in `ImplMap`, not at an RVA in `.text`). `add_method`
+        // already defaults every row's `rva` to 0, so the fix is simply SKIPPING both the
+        // `set_method_body_rva` overwrite and (critically) the `cursor` advance for these —
+        // advancing the cursor for a 0-byte body is a silent no-op that looks harmless in
+        // isolation, but skipping the advance is NOT optional: leaving `cursor` unmoved after
+        // stamping a bogus nonzero RVA here meant the very NEXT real method body got laid out
+        // starting at the SAME address, silently aliasing two unrelated methods' code — a real
+        // regression caught wiring `DIRECT_PE=1` into the linker (`cargo_tests/cd_collections`,
+        // any `fn main() -> ExitCode` combined with allocator/libc-touching code): the resulting
+        // `.text` corruption is below what `dotnet-ilverify`'s per-method IL analysis checks (it
+        // verifies each method's OWN bytes, not cross-method RVA disjointness), so the only
+        // observable symptom was `Assembly.Load` itself rejecting the whole image with a
+        // `FileLoadException` naming this assembly's own placeholder identity ("_") — nowhere
+        // near the actual defect. Mirrors the identical fix (and identical bug shape) for
+        // zero-length `FieldRVA` const-data blobs in this same function's Pass 2.5, above.
+        if assembled.bytes.is_empty() {
+            continue;
+        }
         while cursor % 4 != 0 {
             cursor += 1;
             method_bodies_bytes.push(0);
@@ -839,6 +886,300 @@ mod tests {
             stdout.trim() == "733",
             "expected the const-data readback to print 733; got:\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
+    }
+
+    /// Regression test for a real bug caught wiring `DIRECT_PE=1` into the linker on
+    /// `cargo_tests/cd_collections` (via `Box::new`/`Vec` pulling in std's panic/backtrace
+    /// machinery, which embeds a great many small `&[T]` `const_data` buffers, including
+    /// zero-length ones): Pass 2.5's `entries` map computed the `__rcl_const_blob_N` carrier's
+    /// size as `data.len().max(1)` (never zero — a zero-sized valuetype is illegal) but queued
+    /// the RAW, un-padded `data` bytes into `pending_field_rva`. For an EMPTY buffer this queued
+    /// 0 bytes under a 1-byte-sized carrier, so the `.sdata` layout loop's cursor (which advances
+    /// by `bytes.len()`, not the carrier's declared size) failed to advance past it — the NEXT
+    /// queued blob landed on the exact same RVA, silently aliasing two unrelated static fields.
+    /// `dotnet-ilverify` reported no error (a corrupted `.sdata` region is below the metadata-table
+    /// layer it checks) — the only symptom was `Assembly.Load` itself rejecting the whole image
+    /// with a `FileLoadException` naming the CURRENT assembly's own placeholder identity ("_"),
+    /// nowhere near the actual defect. Two buffers of the SAME small size class (`<= 1` byte) are
+    /// used here specifically so a regression reproduces the exact aliasing shape found in the
+    /// wild: an empty buffer immediately followed by another buffer that would land on its start.
+    #[test]
+    fn e2e_two_const_data_statics_do_not_alias_when_the_first_is_empty() {
+        if dotnet_host().is_none() {
+            eprintln!("skipping e2e_two_const_data_statics_do_not_alias_when_the_first_is_empty: no dotnet host");
+            return;
+        }
+
+        let mut asm = Assembly::default();
+        let main = asm.main_module();
+
+        let console = crate::ir::ClassRef::console(&mut asm);
+        let write_line_name = asm.alloc_string("WriteLine");
+        let write_line_sig = asm.sig([Type::Int(crate::ir::Int::I32)], Type::Void);
+        let write_line = asm.alloc_methodref(crate::ir::MethodRef::new(
+            console,
+            write_line_name,
+            write_line_sig,
+            MethodKind::Static,
+            vec![].into(),
+        ));
+
+        // Buffer 1: EMPTY (`data.len() == 0`) — forces the `.max(1)`-sized-carrier /
+        // un-padded-bytes mismatch this test pins. Read back as a `u8` (the carrier's actual
+        // on-disk size once padded) — a real Rust `&[T; 0]` static never gets dereferenced as a
+        // value, so this only needs to prove the BYTES don't alias, not model real codegen.
+        let u8_ty = asm.alloc_type(Type::Int(crate::ir::Int::U8));
+        let empty_ptr = asm.bytebuffer(&[], u8_ty);
+        let empty_val = asm.alloc_node(CILNode::LdInd {
+            addr: empty_ptr,
+            tpe: u8_ty,
+            volatile: false,
+        });
+        let empty_val = asm.int_cast(empty_val, crate::ir::Int::I32, crate::ir::cilnode::ExtendKind::ZeroExtend);
+
+        // Buffer 2: a real 4-byte `i32` payload — if buffer 1 failed to advance the `.sdata`
+        // cursor, this lands on buffer 1's RVA and reads back some mix of buffer 1's (nonexistent)
+        // bytes instead of `733`.
+        let i32_ty = asm.alloc_type(Type::Int(crate::ir::Int::I32));
+        let data_ptr = asm.bytebuffer(&733i32.to_le_bytes(), i32_ty);
+        let value = asm.alloc_node(CILNode::LdInd {
+            addr: data_ptr,
+            tpe: i32_ty,
+            volatile: false,
+        });
+
+        let print_empty = asm.alloc_root(CILRoot::Call(Box::new((write_line, vec![empty_val].into(), IsPure::NOT))));
+        let print_value = asm.alloc_root(CILRoot::Call(Box::new((write_line, vec![value].into(), IsPure::NOT))));
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        let block = BasicBlock::new(vec![print_empty, print_value, ret], 0, None);
+
+        let entry_sig = asm.sig([], Type::Void);
+        let entry_name = asm.alloc_string("entrypoint");
+        let entry_def = MethodDef::new(
+            Access::Public,
+            main,
+            entry_name,
+            entry_sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![block],
+                locals: vec![],
+            },
+            vec![],
+        );
+        asm.new_method(entry_def);
+
+        let options = ExportOptions {
+            is_dll: false,
+            assembly_name: "pe_e2e_no_alias".to_string(),
+        };
+        let image = export_pe(&mut asm, &options);
+
+        let (stdout, stderr, success) = run_under_dotnet(&image, "pe_e2e_no_alias");
+        assert!(success, "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["0", "733"],
+            "the empty buffer must read back 0 (its zero-padded byte) and the SECOND buffer must \
+             still read back 733 — not corrupted by aliasing onto the empty buffer's RVA\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    /// Regression test for a second, closely-related bug caught in the SAME `cd_collections`
+    /// investigation as the const-data one above: Pass 5's method-body layout loop unconditionally
+    /// called `set_method_body_rva` for every method, including `MethodImpl::Extern` (P/Invoke,
+    /// `ImplMap`-forwarded) ones — which `body::assemble_method` returns as an EMPTY body for
+    /// (§II.22.26 requires `RVA == 0` for a method with no body; the real entry point is the
+    /// `ImplMap` row, not an RVA into `.text`). Stamping a nonzero RVA onto a P/Invoke method's
+    /// `MethodDef` row is a structural metadata defect even though CoreCLR happens to tolerate it
+    /// at runtime here (it checks the `PInvokeImpl` flag before ever consulting `RVA`) — verified
+    /// directly against the emitted bytes rather than via a `dotnet`-host E2E run, since the
+    /// runtime-observable symptom this bug produced in the wild (a `FileLoadException` loading
+    /// `cargo_tests/cd_collections`, `fn main() -> ExitCode` + allocator/libc-touching code) traces
+    /// to a DIFFERENT still-open defect this fix's `continue` does not, by itself, resolve — see
+    /// this round's summary. Keeping the spec-conformance fix (and this test) regardless: a
+    /// bodyless method's `RVA` must be `0` per §II.22.26 independent of what CoreCLR tolerates.
+    #[test]
+    fn extern_method_keeps_rva_zero_after_pass_5_layout() {
+        let mut asm = Assembly::default();
+        let main = asm.main_module();
+
+        // A real, non-trivial method defined FIRST — its body actually gets appended to
+        // `method_bodies_bytes` before the P/Invoke method below is even reached, so its own RVA
+        // is unaffected by the bug; it exists purely to give the P/Invoke method's phantom
+        // "cursor didn't advance" position somewhere non-zero to alias onto.
+        let second_sig = asm.sig([], Type::Int(crate::ir::Int::I32));
+        let second_name = asm.alloc_string("second");
+        let const_733 = asm.alloc_node(Const::I32(733));
+        let second_ret = asm.alloc_root(CILRoot::Ret(const_733));
+        let second_block = BasicBlock::new(vec![second_ret], 0, None);
+        let second_def = MethodDef::new(
+            Access::Public,
+            main,
+            second_name,
+            second_sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![second_block],
+                locals: vec![],
+            },
+            vec![],
+        );
+        let second = asm.new_method(second_def);
+
+        // A real P/Invoke method — `strlen` from the platform C library, exactly the shape
+        // `cargo_tests/cd_collections`'s failure surfaced (see `ImplMap` dump in the investigation:
+        // `strlen`/`memcmp` from `libSystem.B.dylib`). Body-less (`MethodImpl::Extern`), so
+        // `body::assemble_method` returns zero bytes for it — the exact case Pass 5 mishandled:
+        // its cursor-position bookkeeping (RVA metadata) does not advance past `second`'s body,
+        // but the SEPARATE `method_bodies_bytes` output buffer keeps growing regardless (plain
+        // `Vec::extend_from_slice`, not a positional write) — so the method placed immediately
+        // AFTER this one gets its `MethodDef.RVA` metadata stamped with a STALE address (this
+        // P/Invoke method's non-advanced cursor, landing inside/at the end of `second`'s body)
+        // while its ACTUAL bytes are appended much later in the buffer. The result: `entrypoint`
+        // below JITs whatever bytes truly sit at the stale RVA (garbage / `second`'s tail),
+        // never reaching its real, correctly-assembled-but-wrongly-addressed body.
+        let libc_name = asm.alloc_string(if cfg!(target_os = "macos") { "libSystem.B.dylib" } else { "libc.so.6" });
+        let strlen_name = asm.alloc_string("strlen");
+        let u8_ptr = asm.nptr(Type::Int(crate::ir::Int::U8));
+        let strlen_sig = asm.sig([u8_ptr], Type::Int(crate::ir::Int::USize));
+        let strlen_def = MethodDef::new(
+            Access::Extern,
+            main,
+            strlen_name,
+            strlen_sig,
+            MethodKind::Static,
+            MethodImpl::Extern {
+                lib: libc_name,
+                preserve_errno: false,
+            },
+            vec![None],
+        );
+        asm.new_method(strlen_def);
+
+        let _ = second; // registered via `new_method`; RID checked directly below, not called.
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        let block = BasicBlock::new(vec![ret], 0, None);
+
+        let entry_sig = asm.sig([], Type::Void);
+        let entry_name = asm.alloc_string("entrypoint");
+        let entry_def = MethodDef::new(
+            Access::Public,
+            main,
+            entry_name,
+            entry_sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![block],
+                locals: vec![],
+            },
+            vec![],
+        );
+        asm.new_method(entry_def);
+
+        let options = ExportOptions {
+            is_dll: false,
+            assembly_name: "pe_e2e_no_pinvoke_alias".to_string(),
+        };
+        let image = export_pe(&mut asm, &options);
+
+        // `strlen` is the 2nd `MethodDef` row added (`second`, `strlen`, `entrypoint` — 1-based
+        // RID 2), and its RVA must read back as exactly `0` (§II.22.26: bodyless methods MUST
+        // have RVA 0) — Pass 5, pre-fix, stamped it with the (bogus, nonzero) layout cursor
+        // instead.
+        let rva = read_method_def_rva(&image, 2 /* RID of `strlen` */);
+        assert_eq!(rva, 0, "a bodyless (P/Invoke) MethodDef row's RVA column must stay 0, not the Pass 5 layout cursor");
+
+        // The two REAL-bodied methods (`second` RID 1, `entrypoint` RID 3) must each have their
+        // OWN distinct, nonzero RVA — proving Pass 5's `continue` for the bodyless row in between
+        // didn't also skip (or double-assign) either of theirs.
+        let second_rva = read_method_def_rva(&image, 1);
+        let entry_rva = read_method_def_rva(&image, 3);
+        assert_ne!(second_rva, 0, "`second` has a real body; its RVA must be nonzero");
+        assert_ne!(entry_rva, 0, "`entrypoint` has a real body; its RVA must be nonzero");
+        assert_ne!(second_rva, entry_rva, "two distinct method bodies must not share an RVA");
+    }
+
+    /// Reads `MethodDef` row `rid`'s (1-based) `RVA` column (§II.22.26) straight out of a
+    /// freshly-`export_pe`'d image — a minimal, test-only ECMA-335 reader (PE section table ->
+    /// CLI header -> BSJB metadata root -> `#~` stream header -> row-count array -> per-table
+    /// byte offset -> row). `RVA` is always a raw `u32` at column 0 (never a heap/coded index),
+    /// so only the STRIDE between rows (which DOES depend on heap/index widths) needs real width
+    /// computation.
+    fn read_method_def_rva(image: &[u8], rid: u32) -> u32 {
+        let cli_off = rva_to_file_offset(image, 0x2008); // CLI header directory RVA (§II.25.3.3, fixed by `pe.rs`).
+        let md_rva = u32::from_le_bytes(image[cli_off + 8..cli_off + 12].try_into().unwrap());
+        let md_off = rva_to_file_offset(image, md_rva);
+        let version_len = u32::from_le_bytes(image[md_off + 12..md_off + 16].try_into().unwrap()) as usize;
+        let mut p = md_off + 16 + version_len + 2 /* Flags */;
+        let n_streams = u16::from_le_bytes(image[p..p + 2].try_into().unwrap());
+        p += 2;
+        let mut ts = None;
+        for _ in 0..n_streams {
+            let s_off = u32::from_le_bytes(image[p..p + 4].try_into().unwrap()) as usize;
+            p += 8;
+            let name_start = p;
+            let name_end = image[name_start..].iter().position(|&b| b == 0).unwrap() + name_start;
+            let name = std::str::from_utf8(&image[name_start..name_end]).unwrap();
+            let mut name_len = name_end - name_start + 1;
+            while name_len % 4 != 0 {
+                name_len += 1;
+            }
+            p = name_start + name_len;
+            if name == "#~" {
+                ts = Some(md_off + s_off);
+            }
+        }
+        let ts = ts.expect("#~ stream must be present");
+        let heap_sizes = image[ts + 6];
+        let str_w: usize = if heap_sizes & 0x1 != 0 { 4 } else { 2 };
+        let blob_w: usize = if heap_sizes & 0x4 != 0 { 4 } else { 2 };
+        let valid = u64::from_le_bytes(image[ts + 8..ts + 16].try_into().unwrap());
+        let mut row_counts = [0u32; 64];
+        let mut rp = ts + 24;
+        for i in 0..64u32 {
+            if valid & (1 << i) != 0 {
+                row_counts[i as usize] = u32::from_le_bytes(image[rp..rp + 4].try_into().unwrap());
+                rp += 4;
+            }
+        }
+        let simple_w = |rows: u32| if rows > 0xFFFF { 4usize } else { 2usize };
+        let coded_w_2tag = |max_rows: u32| if max_rows as usize >= (1usize << 14) { 4usize } else { 2usize };
+        // Table row widths for JUST the tables that precede `MethodDef` (id 0x06) in the fixed
+        // §II.22 table ordering: Module(0x00), TypeRef(0x01), TypeDef(0x02), Field(0x04) —
+        // Param(0x08)/others come AFTER `MethodDef` so they don't affect this table's start
+        // offset, only its OWN row stride (computed separately below).
+        let module_w = 2 + str_w + 3 * 2; // this reader's test images always have a tiny (narrow) #GUID heap.
+        let type_or_ref_max = row_counts[0x02].max(row_counts[0x01]);
+        let typeref_w = coded_w_2tag(row_counts[0x00].max(row_counts[0x1A]).max(row_counts[0x23])) + 2 * str_w;
+        let typedef_w = 4 + 2 * str_w + coded_w_2tag(type_or_ref_max) + simple_w(row_counts[0x04]) + simple_w(row_counts[0x06]);
+        let field_w = 2 + str_w + blob_w;
+        let mut table_off = rp;
+        for (id, width) in [(0x00u32, module_w), (0x01, typeref_w), (0x02, typedef_w), (0x04, field_w)] {
+            table_off += row_counts[id as usize] as usize * width;
+        }
+        let row_width = 4 + 2 + 2 + str_w + blob_w + simple_w(row_counts[0x08]);
+        let row_off = table_off + (rid as usize - 1) * row_width;
+        u32::from_le_bytes(image[row_off..row_off + 4].try_into().unwrap())
+    }
+
+    /// Resolves a PE RVA to a file offset via the section table (§II.25.3).
+    fn rva_to_file_offset(image: &[u8], rva: u32) -> usize {
+        let pe_off = u32::from_le_bytes(image[0x3c..0x40].try_into().unwrap()) as usize;
+        let n_sections = u16::from_le_bytes(image[pe_off + 6..pe_off + 8].try_into().unwrap());
+        let opt_hdr_size = u16::from_le_bytes(image[pe_off + 20..pe_off + 22].try_into().unwrap());
+        let sec_table_off = pe_off + 24 + opt_hdr_size as usize;
+        for i in 0..n_sections as usize {
+            let off = sec_table_off + i * 40;
+            let vsize = u32::from_le_bytes(image[off + 8..off + 12].try_into().unwrap());
+            let vaddr = u32::from_le_bytes(image[off + 12..off + 16].try_into().unwrap());
+            let praw = u32::from_le_bytes(image[off + 20..off + 24].try_into().unwrap());
+            if vaddr <= rva && rva < vaddr + vsize {
+                return (praw + (rva - vaddr)) as usize;
+            }
+        }
+        panic!("rva {rva:#x} not found in any section");
     }
 
     /// **Phase 1b acceptance check: scalar `StaticFieldDef::default_value` `FieldRVA` blobs.**
