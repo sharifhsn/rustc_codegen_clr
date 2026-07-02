@@ -101,6 +101,11 @@ pub struct ExportOptions {
 #[must_use]
 pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
     let mut mb = MetadataBuilder::new();
+    // Must happen before ANY `AssemblyRef` row is created (every class's implicit
+    // `System.Object`/`System.ValueType` base pulls in `System.Runtime`) — see
+    // `MetadataBuilder::is_lib`'s doc for why an unversioned executable-shaped `AssemblyRef` vs. a
+    // versioned library-shaped one is not cosmetic (`FileLoadException 0x8007000C` on load).
+    mb.set_is_lib(options.is_dll);
 
     // The `Assembly` table's single self-identity row (§II.22.2) — mirrors `il_exporter`'s
     // `.assembly '<name>'{}` / `.assembly _{}` directive, emitted unconditionally for both a
@@ -393,7 +398,23 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
             // static).
             let is_ctor = method.kind() == crate::ir::cilnode::MethodKind::Constructor
                 || name == crate::ir::asm::CCTOR;
-            let pinvoke_owned = match method.implementation() {
+            // Resolve `MethodImpl::AliasFor` chains before deciding P/Invoke-ness — mirrors
+            // `il_exporter`'s `method.resolved_implementation(asm_mut)` (mod.rs:477) and
+            // `body.rs`'s own `resolved_implementation` call (the single source of truth for
+            // whether a method has a real body). Using the RAW, unresolved `method.implementation()`
+            // here was a real bug: for a method whose OWN `MethodImpl` is `AliasFor(target)`, the
+            // raw match falls through to `_ => None` regardless of what `target` resolves to, so a
+            // method aliasing an unpatched `MethodImpl::Extern` stub got emitted with NORMAL
+            // (non-abstract, non-PInvoke) `MethodDef` flags — while `body.rs` correctly resolved the
+            // alias, found no body to assemble, and left `RVA = 0`. §II.22.26 requires RVA == 0 ONLY
+            // for abstract/PInvoke/runtime-supplied methods; a "normal" method with RVA == 0 is
+            // exactly the malformed shape CoreCLR's native type loader rejects as `TypeLoadException:
+            // Abstract method with non-zero RVA` (the message is misleading — the real defect is a
+            // *zero*-RVA method not flagged abstract/PInvoke, not a nonzero-RVA abstract method;
+            // reproduced by the `pal_threads`/`cd_interop`-adjacent `rcl_dotnet_thread_spawn` P/Invoke
+            // hook, whose aliasing wrapper hit this exact path with `codegen-units = 1`, which changes
+            // whether the alias or its target gets visited first by `patch_missing_methods`).
+            let pinvoke_owned = match method.resolved_implementation(asm) {
                 crate::ir::MethodImpl::Extern { lib, preserve_errno } => {
                     Some((asm[*lib].to_string(), *preserve_errno))
                 }
@@ -1438,6 +1459,160 @@ mod tests {
         assert!(
             stdout.trim() == "42",
             "expected x(10)+y(32) read back through explicit offsets to print 42; got:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    /// **Regression probe for the `pal_threads`/`cd_interop`/whole-program `FileLoadException
+    /// 0x8007000C` bug class.** Real codegen's `format_args!` lowering (`core::fmt::rt::Argument`,
+    /// `library/core/src/fmt/rt.rs`) stores an `ldftn`-obtained function pointer into an
+    /// EXPLICIT-LAYOUT struct field typed `Type::FnPtr` (the `Placeholder_formatter` field of the
+    /// `ArgumentType` union), then later reads that field back and `calli`s through it — isolated
+    /// via a differential bisection: `println!("{}", x)` for a `let`-bound `i128`/`u128` fails to
+    /// even `Assembly.Load` under `DIRECT_PE=1` (same `FileLoadException` signature as
+    /// `pal_threads`), while `x.to_string()` (same `Display::fmt`, called directly instead of
+    /// through a stored/reloaded `Argument`) loads fine — narrowing the defect to the
+    /// store-fnptr-in-a-field-then-load-and-`calli`-it pattern, not `Display` or 128-bit types
+    /// themselves. This test reproduces the SAME shape (an explicit-layout struct with a
+    /// `Type::FnPtr` field, `ldftn` + `stfld` + `ldfld` + `calli`) with a trivial `i32 -> i32`
+    /// callee, minimizing everything else, to isolate whether `pe_exporter`'s handling of a
+    /// function-pointer-typed FIELD (as opposed to a `calli` call site's own signature, which
+    /// `e2e_hand_built_assembly_runs_under_dotnet`-adjacent call-site paths already exercise) is
+    /// the defect. If this test itself fails to load, the bug is in FIELD/local `Type::FnPtr`
+    /// signature encoding (`sig::encode_field_sig`/`encode_locals_sig`'s `ET_FNPTR` branch) or in
+    /// `ClassLayout`/`FieldLayout` row shaping for a fnptr-typed field — not in a 128-bit-specific
+    /// code path.
+    #[test]
+    fn e2e_fnptr_field_store_then_calli_round_trips_at_runtime() {
+        if dotnet_host().is_none() {
+            eprintln!("skipping e2e_fnptr_field_store_then_calli_round_trips_at_runtime: no dotnet host");
+            return;
+        }
+
+        let mut asm = Assembly::default();
+        let main = asm.main_module();
+
+        // `callee(i128* p) -> i32`: returns `42` unconditionally, but the PARAMETER is a
+        // pointer-to-BCL-128-bit-valuetype — a stand-in for `<i128 as Display>::fmt` taking
+        // `&i128` (the REAL bug's callee shape: a BY-REF/BY-POINTER 128-bit BCL valuetype
+        // argument, not a plain scalar). Only the SIGNATURE shape matters for this probe, not the
+        // arithmetic — we just need to know whether `dotnet` still loads the assembly.
+        let i128_cref = crate::ir::ClassRef::int_128(&mut asm);
+        let i128_ty = Type::ClassRef(i128_cref);
+        let i128_ptr_ty = asm.alloc_type(i128_ty);
+        let callee_sig = asm.sig([Type::Ptr(i128_ptr_ty)], Type::Int(crate::ir::Int::I32));
+        let callee_name = asm.alloc_string("callee");
+        let forty_two_i32 = asm.alloc_node(CILNode::Const(Box::new(Const::I32(42))));
+        let callee_ret = asm.alloc_root(CILRoot::Ret(forty_two_i32));
+        let callee_block = BasicBlock::new(vec![callee_ret], 0, None);
+        let callee_def = MethodDef::new(
+            Access::Public,
+            main,
+            callee_name,
+            callee_sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![callee_block],
+                locals: vec![],
+            },
+            vec![None],
+        );
+        let callee_idx = asm.new_method(callee_def);
+        let callee_mref = asm.alloc_methodref(crate::ir::MethodRef::new(
+            main.0,
+            callee_name,
+            callee_sig,
+            MethodKind::Static,
+            vec![].into(),
+        ));
+        let _ = callee_idx;
+
+        // `Holder { fp: fn(native uint) -> i32 }` — DELIBERATELY a DIFFERENT signature than
+        // `callee`'s real `fn(i32) -> i32` (mirrors Rust's `transmute::<fn(&T, &Formatter) -> R,
+        // fn(NonNull<()>, &Formatter) -> R>` in `Argument::new_display`: the field's declared
+        // fnptr type is the type-ERASED signature, not the callee's real one). Explicit layout,
+        // size 8 (matches a raw function pointer's size on a 64-bit target) — mirrors
+        // `ArgumentType`'s `Placeholder_formatter` field shape (a fnptr-typed field inside an
+        // explicit-layout struct storing a type-erased function pointer).
+        let holder_name = asm.alloc_string("Holder");
+        let fp_name = asm.alloc_string("fp");
+        let erased_sig = asm.sig([Type::Int(crate::ir::Int::USize)], Type::Int(crate::ir::Int::I32));
+        let fnptr_ty = Type::FnPtr(erased_sig);
+        let holder_def = crate::ir::class::ClassDef::new(
+            holder_name,
+            true, // valuetype
+            0,
+            None,
+            vec![(fnptr_ty, fp_name, Some(0))],
+            vec![],
+            Access::Public,
+            std::num::NonZeroU32::new(8),
+            None,
+            true,
+        );
+        let holder_idx = asm.class_def(holder_def).expect("Holder layout check");
+        let holder_cref = holder_idx.0;
+        let fp_field = asm.alloc_field(crate::ir::field::FieldDesc::new(holder_cref, fp_name, fnptr_ty));
+
+        let console = crate::ir::ClassRef::console(&mut asm);
+        let write_line_name = asm.alloc_string("WriteLine");
+        let write_line_sig = asm.sig([Type::Int(crate::ir::Int::I32)], Type::Void);
+        let write_line = asm.alloc_methodref(crate::ir::MethodRef::new(
+            console,
+            write_line_name,
+            write_line_sig,
+            MethodKind::Static,
+            vec![].into(),
+        ));
+
+        // `local 0`: a `Holder`. `ldftn callee` -> `ldloca.0 ; stfld fp` -> `ldloc.0 ; ldfld fp` ->
+        // `calli (i32)->i32` with arg 41 -> `WriteLine(result)`. Expects `42`.
+        let ftn = asm.alloc_node(CILNode::LdFtn(callee_mref));
+        let loc_addr = asm.alloc_node(CILNode::LdLocA(0));
+        let set_fp = asm.alloc_root(CILRoot::SetField(Box::new((fp_field, loc_addr, ftn))));
+
+        let loc_val = asm.alloc_node(CILNode::LdLoc(0));
+        let get_fp = asm.alloc_node(CILNode::LdField {
+            addr: loc_val,
+            field: fp_field,
+        });
+        let forty_one = asm.alloc_node(CILNode::Const(Box::new(Const::USize(41))));
+        let call_result = asm.alloc_node(CILNode::CallI(Box::new((
+            get_fp,
+            erased_sig,
+            vec![forty_one].into(),
+        ))));
+        let call = asm.alloc_root(CILRoot::Call(Box::new((write_line, vec![call_result].into(), IsPure::NOT))));
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        let block = BasicBlock::new(vec![set_fp, call, ret], 0, None);
+
+        let entry_sig = asm.sig([], Type::Void);
+        let entry_name = asm.alloc_string("entrypoint");
+        let entry_def = MethodDef::new(
+            Access::Public,
+            main,
+            entry_name,
+            entry_sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![block],
+                locals: vec![(None, asm.alloc_type(Type::ClassRef(holder_cref)))],
+            },
+            vec![],
+        );
+        asm.new_method(entry_def);
+
+        let options = ExportOptions {
+            is_dll: false,
+            assembly_name: "pe_e2e_fnptr_field".to_string(),
+            module_name: "pe_e2e_fnptr_field.exe".to_string(),
+        };
+        let image = export_pe(&mut asm, &options);
+
+        let (stdout, stderr, success) = run_under_dotnet(&image, "pe_e2e_fnptr_field");
+        assert!(success, "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            stdout.trim() == "42",
+            "expected callee(41)=42 read back through a stored/reloaded fnptr field; got:\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
 }

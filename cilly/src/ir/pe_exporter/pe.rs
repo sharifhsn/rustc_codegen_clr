@@ -120,6 +120,20 @@ const SUBSYSTEM_CUI: u16 = 3;
 /// `NumberOfRvaAndSizes` (§II.25.2.3.3) — this writer always emits the full 16-entry data
 /// directory, all-zero except the CLI header entry.
 const NUMBER_OF_RVA_AND_SIZES: u32 = 16;
+/// `DllCharacteristics` (§II.25.2.3.2) — ilasm's real value, confirmed byte-for-byte against a
+/// live-built `.exe` (`IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE (0x0040)
+/// | IMAGE_DLLCHARACTERISTICS_NX_COMPAT (0x0100) | IMAGE_DLLCHARACTERISTICS_NO_SEH (0x0400)
+/// | IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE (0x8000)` = `0x8540`), NOT the all-zero value
+/// this writer previously hardcoded. This was a real, previously-undiagnosed bug (not cosmetic):
+/// leaving `DllCharacteristics` at 0 made `AssemblyLoadContext.InternalLoad`'s native binder
+/// reject the image with `FileLoadException … The access code is invalid. (0x8007000C)` — CoreCLR's
+/// native PE loader treats an all-zero `DllCharacteristics` (no `NX_COMPAT`/`DYNAMIC_BASE` bits) as
+/// a signal the image predates those flags' existence and does not defensively "just allow it"; a
+/// managed reader (`System.Reflection.Metadata`) never even inspects this field, which is why every
+/// prior round's structural check (SRM `PEReader`, Mono) found nothing wrong in a file that failed
+/// to load. Reproduced as the root cause of the `pal_threads`/`cd_interop` `FileLoadException`
+/// residual carried across three A/B differential rounds.
+const DLL_CHARACTERISTICS: u16 = 0x8540;
 /// Index of the "CLI Header" entry within the optional header's data-directory array
 /// (§II.25.2.3.3, table titled "Optional Header Data Directories").
 const DATA_DIRECTORY_CLI_HEADER: usize = 14;
@@ -677,7 +691,7 @@ fn write_optional_header(
     out.extend_from_slice(&size_of_headers.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // CheckSum: 0 is valid (unchecked by loaders unless the image is a driver/signed).
     out.extend_from_slice(&SUBSYSTEM_CUI.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes()); // DllCharacteristics: none set (matches ilasm's unsigned/non-ASLR-flagged output).
+    out.extend_from_slice(&DLL_CHARACTERISTICS.to_le_bytes()); // DllCharacteristics: see that constant's doc — this is the confirmed cause of the FileLoadException 0x8007000C load bug, not a stylistic no-op.
     out.extend_from_slice(&0x0010_0000u32.to_le_bytes()); // SizeOfStackReserve: conventional default.
     out.extend_from_slice(&0x0000_1000u32.to_le_bytes()); // SizeOfStackCommit.
     out.extend_from_slice(&0x0010_0000u32.to_le_bytes()); // SizeOfHeapReserve.
@@ -873,6 +887,7 @@ mod tests {
         section_alignment: u32,
         file_alignment: u32,
         subsystem: u16,
+        dll_characteristics: u16,
         number_of_rva_and_sizes: u32,
         cli_header_dir: (u32, u32),
         sections: Vec<ParsedSection>,
@@ -930,6 +945,7 @@ mod tests {
         let section_alignment = read_u32(data, opt + 32);
         let file_alignment = read_u32(data, opt + 36);
         let subsystem = read_u16(data, opt + 68);
+        let dll_characteristics = read_u16(data, opt + 70);
         let number_of_rva_and_sizes = read_u32(data, opt + 92);
         let dir_base = opt + 96;
         let cli_header_dir = (
@@ -974,6 +990,7 @@ mod tests {
             section_alignment,
             file_alignment,
             subsystem,
+            dll_characteristics,
             number_of_rva_and_sizes,
             cli_header_dir,
             sections,
@@ -1073,6 +1090,35 @@ mod tests {
             pe.address_of_entry_point, 0,
             "a .dll with no bootstrap must have AddressOfEntryPoint == 0, not point into .text"
         );
+    }
+
+    /// **Regression test for the `pal_threads`/`cd_interop` `FileLoadException 0x8007000C` load
+    /// bug** (the residual carried across three prior A/B differential rounds — see
+    /// `DLL_CHARACTERISTICS`'s doc for the full root-cause writeup). `DllCharacteristics`
+    /// (§II.25.2.3.2) was previously hardcoded to 0, on the (WRONG, never actually checked)
+    /// assumption that this "matches ilasm's unsigned/non-ASLR-flagged output". A live-built
+    /// ilasm `.exe`'s raw optional-header bytes at this offset are `0x8540` —
+    /// `IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE (0x0040) | IMAGE_DLLCHARACTERISTICS_NX_COMPAT
+    /// (0x0100) | IMAGE_DLLCHARACTERISTICS_NO_SEH (0x0400) |
+    /// IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE (0x8000)` — and CoreCLR's native PE loader
+    /// (not the lenient `System.Reflection.Metadata` reader every prior round's structural check
+    /// used) rejects an all-zero `DllCharacteristics` image at `Assembly.Load`, before the
+    /// CLI-aware managed loader ever inspects the metadata. Applies to both a `.dll` and an `.exe`
+    /// (the field lives in the shared optional header, independent of `is_dll`).
+    #[test]
+    fn dll_characteristics_matches_ilasms_real_value_not_zero() {
+        for is_dll in [false, true] {
+            let opts = PeOptions {
+                is_dll,
+                entry_point: if is_dll { None } else { Some(0x0600_0001) },
+            };
+            let image = write_pe(&[1, 2, 3], &[4, 5, 6], &[], &opts);
+            let pe = parse_pe(&image);
+            assert_eq!(
+                pe.dll_characteristics, 0x8540,
+                "DllCharacteristics must match ilasm's real (non-zero) value for is_dll={is_dll}"
+            );
+        }
     }
 
     // --- (b) alignment invariants across several odd-sized inputs ----------------------------

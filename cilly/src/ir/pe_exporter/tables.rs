@@ -315,6 +315,26 @@ pub struct MetadataBuilder {
     /// know which owner's field/method run they're extending, mirroring `il_exporter`'s
     /// per-class emission loop.
     current_type_def: Option<u32>,
+
+    /// `true` for a `.dll` output, `false` for a `.exe` — mirrors `il_exporter`'s `is_lib` flag
+    /// (`ILExporter::new`'s `is_lib` parameter). Gates whether BCL `AssemblyRef` rows get a real
+    /// version+public-key-token (`il_exporter::export_to_write`'s `if self.is_lib { … }` block,
+    /// mod.rs:70-106) or stay name-only/`0.0.0.0` (an executable emits no `.assembly extern`
+    /// headers at all; `ilasm` then infers unversioned externs from type-use, and the CLR's
+    /// executable-load path resolves those leniently). Defaults to `false` (exe) since that is
+    /// every existing hand-built test's shape; `export_pe` sets this explicitly from
+    /// `ExportOptions::is_dll` before any `AssemblyRef` gets created.
+    ///
+    /// Getting this wrong is not cosmetic: stamping a real BCL version (`8.0.0.0` etc.) on an
+    /// executable's `AssemblyRef` rows makes `AssemblyLoadContext.InternalLoad`'s native binder
+    /// try to resolve each referenced BCL assembly at that EXACT version via the app's
+    /// `.runtimeconfig.json`/deps rollForward machinery — and fail before the managed loader (or
+    /// even `System.Reflection.Metadata`'s lenient `PEReader`) ever runs, surfacing as
+    /// `System.IO.FileLoadException … The access code is invalid. (0x8007000C)` on the assembly's
+    /// OWN identity, not the mismatched reference — root-caused by comparing a real `ilasm`-built
+    /// `.exe` for the same source (whose `AssemblyRef` rows are all `0.0.0.0`, confirmed via a
+    /// from-scratch metadata reader) against this exporter's `8.0.0.0`-stamped output.
+    is_lib: bool,
 }
 
 /// The 64-bit `Valid`/`Sorted` bitmask position for each table id (§II.24.2.6: bit `N` set iff
@@ -356,6 +376,13 @@ impl MetadataBuilder {
             method_list: 1,
         });
         mb
+    }
+
+    /// Sets [`MetadataBuilder::is_lib`] — see that field's doc. Must be called before any
+    /// `AssemblyRef` row is created (i.e. right after [`MetadataBuilder::new`]), since it only
+    /// affects rows created from that point on; `export_pe` calls this first, before Pass 0.
+    pub fn set_is_lib(&mut self, is_lib: bool) {
+        self.is_lib = is_lib;
     }
 
     /// Interns an `AssemblyRef` row (§II.22.5), returning its token. `name` is the `.NET`
@@ -681,15 +708,30 @@ impl MetadataBuilder {
         // §II.23.1.10 `MethodAttributes`: the low 3 bits are `MemberAccessMask`, numbered
         // identically to `FieldAttributes::FieldAccessMask` (see `add_field`'s doc) —
         // CompilerControlled=0x0, Private=0x1, FamANDAssem=0x2, Assembly=0x3, Family=0x4,
-        // FamORAssem=0x5, **Public=0x6**. 0x10 Static, 0x40 Virtual, 0x400 NewSlot (paired with
+        // FamORAssem=0x5, **Public=0x6**. 0x10 Static, 0x40 Virtual, **0x100 NewSlot** (paired with
         // Virtual so it doesn't try to override a base slot), 0x1000 SpecialName | 0x800
         // RTSpecialName (ctors only), 0x2000 PInvokeImpl.
+        //
+        // BUG FIX (was `0x0400`, which is `Abstract`, NOT `NewSlot` — a real off-by-one-hex-digit
+        // confusion between adjacent flag bits): this previously stamped `Abstract` on EVERY
+        // virtual method this exporter ever emitted, real body or not. §II.22.26 requires a
+        // non-abstract method's `RVA` be nonzero (it has a body); a method that is BOTH `Abstract`
+        // and has a nonzero `RVA` is the exact malformed shape CoreCLR's native type loader rejects
+        // outright with `TypeLoadException: Abstract method with non-zero RVA` the moment the
+        // declaring type is loaded — before any managed reflection API (which never surfaced this,
+        // since `System.Reflection.Metadata` treats `Attributes`/`RelativeVirtualAddress` as inert
+        // data, not a loader-enforced invariant) or the IL body itself is ever touched. Root-caused
+        // via `UnmanagedThreadStart::Start` (`cilly/src/ir/builtins/thread.rs`) in the `pal_threads`
+        // battery target: a real virtual method with a real body, whose class only gets touched
+        // (and only then type-loaded, tripping this check) once `thread::spawn` first runs — this
+        // is why simpler probes with no virtual dispatch never hit it, and why the failure surfaced
+        // as "abstract method" arbitrarily far from the actual defect site in the stack trace.
         let mut flags: u16 = 0x6; // public
         if is_static {
             flags |= 0x10;
         }
         if is_virtual {
-            flags |= 0x40 | 0x0400;
+            flags |= 0x40 | 0x0100;
         }
         if is_ctor {
             flags |= 0x1000 | 0x0800;
@@ -928,12 +970,20 @@ impl MetadataBuilder {
         // threading is needed — mirrors `il_exporter`'s `dv_ver = dotnet_version().assembly_ver()`
         // (mod.rs:74). Uses the tuple sibling since `AssemblyRefRow`'s columns are raw `u16`s
         // (§II.22.5), not the `"8:0:0:0"` string il_exporter interpolates into IL text.
-        self.assembly_ref(
-            NAME,
+        //
+        // Gated on `self.is_lib` exactly like `il_exporter`'s `if self.is_lib { … }` (mod.rs:70):
+        // an executable gets a name-only (`0.0.0.0`) reference — mirrors ilasm's own inferred-extern
+        // default for an `.exe`'s implicit `[[assembly]Type` uses — while a `.dll` gets the real BCL
+        // version+token so a C# compiler can bind it directly (CS0012 otherwise). See
+        // `MetadataBuilder::is_lib`'s doc for the concrete `FileLoadException` this fixes.
+        let target = if self.is_lib {
             AssemblyRefTarget::Bcl {
                 version: crate::ir::dotnet_version().assembly_ver_tuple(),
-            },
-        )
+            }
+        } else {
+            AssemblyRefTarget::NameOnly
+        };
+        self.assembly_ref(NAME, target)
     }
 
     fn strings_eq(&self, off: u32, s: &str) -> bool {
@@ -1778,10 +1828,11 @@ impl MetadataBuilder {
                 return Token::new(Token::TABLE_ASSEMBLY_REF, u32::try_from(i + 1).unwrap());
             }
         }
-        let target = if is_bcl_assembly(name) {
+        let target = if is_bcl_assembly(name) && self.is_lib {
             // Same single source of truth as `system_runtime_assembly_ref`: `dotnet_version()` is
             // reachable here with zero threading (free fn, same crate) — mirrors `il_exporter`'s
-            // `dv_ver`.
+            // `dv_ver`. Also gated on `self.is_lib` for the same reason `system_runtime_assembly_ref`
+            // is — see `MetadataBuilder::is_lib`'s doc.
             AssemblyRefTarget::Bcl {
                 version: crate::ir::dotnet_version().assembly_ver_tuple(),
             }
@@ -2800,7 +2851,9 @@ mod tests {
     /// BCL branch both stamp the `AssemblyRef.MajorVersion..RevisionNumber` columns from
     /// `crate::ir::dotnet_version()` — the single source of truth `il_exporter` also reads
     /// (`dv_ver = dotnet_version().assembly_ver()`, mod.rs:74) — rather than a crate-local
-    /// hardcoded `(8, 0, 0, 0)` literal. This asserts the threading, not a specific version
+    /// hardcoded `(8, 0, 0, 0)` literal, WHEN `is_lib` is set (mirrors `il_exporter`'s `if
+    /// self.is_lib { … }` gate — an executable gets name-only/`0.0.0.0` refs instead, see
+    /// `MetadataBuilder::is_lib`'s doc). This asserts the threading, not a specific version
     /// number: the test process has no `DOTNET_VERSION` env var set, so `dotnet_version()`
     /// resolves to the `Net8` default, and both call sites must agree with whatever that
     /// resolves to (proving they consult it, rather than merely happening to match by
@@ -2810,6 +2863,7 @@ mod tests {
         let expected = crate::ir::dotnet_version().assembly_ver_tuple();
 
         let mut mb = MetadataBuilder::new();
+        mb.set_is_lib(true);
         let sys_runtime_tok = mb.find_or_create_assembly_ref("System.Runtime");
         let row = &mb.assembly_ref[(sys_runtime_tok.rid() - 1) as usize];
         assert_eq!((row.major, row.minor, row.build, row.revision), expected);
@@ -2817,6 +2871,7 @@ mod tests {
         // A second, distinct BCL name via the same helper must agree too (not a fluke of caching
         // the first lookup).
         let mut mb2 = MetadataBuilder::new();
+        mb2.set_is_lib(true);
         let intrinsics_tok = mb2.find_or_create_assembly_ref("System.Runtime.Intrinsics");
         let row2 = &mb2.assembly_ref[(intrinsics_tok.rid() - 1) as usize];
         assert_eq!((row2.major, row2.minor, row2.build, row2.revision), expected);
@@ -2826,11 +2881,41 @@ mod tests {
         // static field, which routes through `thread_static_attribute` -> `thread_static_ctor_ref`
         // -> `system_runtime_assembly_ref`.
         let mut mb3 = MetadataBuilder::new();
+        mb3.set_is_lib(true);
         let field = mb3.add_static_field("TLS", 0, None, true, false);
         let _ = field;
         assert_eq!(mb3.assembly_ref.len(), 1, "the TLS path must have created exactly one AssemblyRef");
         let row3 = &mb3.assembly_ref[0];
         assert_eq!((row3.major, row3.minor, row3.build, row3.revision), expected);
+    }
+
+    /// The `is_lib` gate itself (not just that the version, when stamped, comes from
+    /// `dotnet_version()`): an executable-shaped builder (`is_lib` left at its `false` default)
+    /// must produce NAME-ONLY/`0.0.0.0` `AssemblyRef` rows for BCL assemblies too — mirrors
+    /// `il_exporter`'s executable path, which emits no `.assembly extern` headers at all and lets
+    /// `ilasm` infer unversioned externs. This is the regression test for the concrete
+    /// `FileLoadException 0x8007000C` bug: a version-stamped `AssemblyRef` on an executable's own
+    /// dependency graph makes the CLR's native binder try to resolve each BCL reference at that
+    /// exact version via the app's rollForward machinery and fail before the managed loader (or
+    /// even a lenient `System.Reflection.Metadata` reader) ever runs.
+    #[test]
+    fn executable_shaped_builder_leaves_bcl_assembly_refs_unversioned() {
+        let mut mb = MetadataBuilder::new();
+        // `is_lib` NOT set — defaults to `false`, matching `export_pe`'s call before Pass 0.
+        let sys_runtime_tok = mb.find_or_create_assembly_ref("System.Runtime");
+        let row = &mb.assembly_ref[(sys_runtime_tok.rid() - 1) as usize];
+        assert_eq!((row.major, row.minor, row.build, row.revision), (0, 0, 0, 0));
+        assert_eq!(row.public_key_or_token, 0, "an unversioned exe ref carries no public-key token either");
+
+        let mut mb2 = MetadataBuilder::new();
+        let field = mb2.add_static_field("TLS", 0, None, true, false);
+        let _ = field;
+        let row2 = &mb2.assembly_ref[0];
+        assert_eq!(
+            (row2.major, row2.minor, row2.build, row2.revision),
+            (0, 0, 0, 0),
+            "system_runtime_assembly_ref must respect is_lib too"
+        );
     }
 
     #[test]
@@ -3420,5 +3505,43 @@ mod tests {
         let tok = mb.add_method(".tcctor", sig_blob, &[], true, false, false, None);
         let row = &mb.method_def[(tok.rid() - 1) as usize];
         assert_eq!(row.flags & (0x1000 | 0x0800), 0);
+    }
+
+    /// **Regression test for the `pal_threads` `TypeLoadException: Abstract method with non-zero
+    /// RVA` load bug** (root-caused via `UnmanagedThreadStart::Start`, `cilly/src/ir/builtins/
+    /// thread.rs` — a real virtual method with a real body). `add_method`'s `is_virtual` branch
+    /// previously OR'd in `0x0400`, believing it to be `NewSlot` (§II.23.1.10) — it is actually
+    /// `Abstract`. `NewSlot` is `0x0100`. This silently marked EVERY virtual method this exporter
+    /// ever emitted as `Abstract`, regardless of whether it had a real body/RVA; CoreCLR's native
+    /// type loader enforces "abstract methods must have RVA == 0" (§II.22.26) at TYPE-LOAD time
+    /// (not method-call time), which is why the resulting `TypeLoadException` surfaced arbitrarily
+    /// far from the actual defect in a stack trace, and why a purely-managed reader
+    /// (`System.Reflection.Metadata`, which never enforces this invariant) found nothing wrong.
+    #[test]
+    fn add_method_virtual_sets_newslot_not_abstract() {
+        let mut mb = MetadataBuilder::new();
+        let sig_blob = {
+            let mut out = Vec::new();
+            out.push(sig::SIG_DEFAULT);
+            write_compressed_u32(&mut out, 0);
+            out.push(0x01); // void
+            mb.blobs.intern(&out)
+        };
+        let _t = mb.add_type_def("", "Start", false, None, None, None, &[]);
+        let tok = mb.add_method("Start", sig_blob, &[], false, true, false, None);
+        let row = &mb.method_def[(tok.rid() - 1) as usize];
+        const NEW_SLOT: u16 = 0x0100;
+        const ABSTRACT: u16 = 0x0400;
+        assert_eq!(
+            row.flags & NEW_SLOT,
+            NEW_SLOT,
+            "a virtual method must carry NewSlot (0x0100)"
+        );
+        assert_eq!(
+            row.flags & ABSTRACT,
+            0,
+            "a virtual method with a real body must NOT carry Abstract (0x0400) — CoreCLR's \
+             native type loader rejects Abstract+nonzero-RVA as malformed at type-load time"
+        );
     }
 }
