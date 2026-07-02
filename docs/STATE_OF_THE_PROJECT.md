@@ -68,9 +68,12 @@ interfaces; `IEnumerable<T>` over `RustVec`; `cargo dotnet publish --aot` as a s
 allocation) — candidate fix: a pooled/arena allocator over pinned .NET memory (unattempted); EH
 cleanup-block bloat under `panic=unwind` (~2× on unwind-heavy code; `NO_UNWIND` exists).
 
-**Exporters.** IL: production. C: ~80% prototype (33 cold-path `todo!`). JVM: skeleton. A **direct
-PE writer (no ilasm) + Portable PDBs** is the active architectural project — see
-[PE_EMISSION_PLAN.md](PE_EMISSION_PLAN.md) when it lands.
+**Exporters.** IL: production (ilasm path, now the fallback). C: ~80% prototype (33 cold-path
+`todo!`). JVM: skeleton. **Direct PE writer** (`cilly::ir::pe_exporter`, no ilasm): **Phase 1
+COMPLETE and now the default linker path** (`DIRECT_PE` defaults to `true`; `DIRECT_PE=0` falls
+back to ilasm) — see [PE_EMISSION_PLAN.md](PE_EMISSION_PLAN.md). **Portable PDBs (Phase 2)** are
+next: sequence points from the already-threaded MIR spans → breakpoints/stepping on Rust source
+under a .NET debugger.
 
 ## Corrections to the older docs (read this before trusting them)
 
@@ -92,10 +95,12 @@ PE writer (no ilasm) + Portable PDBs** is the active architectural project — s
    auto-shim, standalone hello-world demo repo, prebuilt-toolchain `cargo dotnet setup`.
 2. **CI industrialization** — fork CI running the gate + fatal checker on pinned nightly; weekly
    nightly-drift canary; manual heavy jobs (soak/coretests).
-3. **Direct PE emission + Portable PDBs** — drop the ilasm dependency (per-runtime assembler, PE32
-   arm64 mismatch, 1023-char class-name cap) by writing ECMA-335 metadata straight from the interned
-   IR; then thread MIR spans through and emit sequence points → **breakpoints/stepping on Rust source
-   under a .NET debugger**. The largest remaining DX gap.
+3. **Direct PE emission (Phase 1 DONE) + Portable PDBs (Phase 2, NEXT)** — the ilasm dependency
+   (per-runtime assembler, PE32 arm64 mismatch, 1023-char class-name cap) is now bypassed by default:
+   the hand-rolled ECMA-335 writer (`cilly::ir::pe_exporter`) is the default linker path (`DIRECT_PE`
+   defaults to `true`; `DIRECT_PE=0` escape-hatches back to ilasm). Next: thread the already-present
+   MIR spans through into sequence points → **breakpoints/stepping on Rust source under a .NET
+   debugger**. The largest remaining DX gap.
 4. **Deferred big bets** — pooled allocator vs the 7.9× alloc floor; memory-model litmus audit;
    upstreaming universal fixes to FractalFir; a tier-3 `*-unknown-dotnet` rustc target as the long-game
    end state.

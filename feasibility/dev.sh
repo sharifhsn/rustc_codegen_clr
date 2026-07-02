@@ -42,7 +42,7 @@ usage(){ sed -n '2,33p' "${BASH_SOURCE[0]}"; }
 # explicit guards instead.
 _in(){
   docker run --rm -i -e CARGO_TERM_COLOR=never \
-    -e DEV_CRATE -e DEV_CLEAN -e DEV_SYM -e DEV_RUN -e OPTIMIZE_CIL \
+    -e DEV_CRATE -e DEV_CLEAN -e DEV_SYM -e DEV_RUN -e OPTIMIZE_CIL -e DIRECT_PE \
     -v "$REPO_ROOT":/work -v rcc-target:/work/target -w /work \
     "$IMAGE" bash -o pipefail -s
 }

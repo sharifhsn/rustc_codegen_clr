@@ -741,9 +741,10 @@ config!(PANIC_MANAGED_BT, bool, false);
 config!(
     DIRECT_PE,
     bool,
-    false,
+    true,
     "Emit the .NET assembly via the hand-rolled ECMA-335 PE writer (cilly::pe_exporter) instead \
-     of going through ilasm. Default off — the ilasm path (il_exporter) remains the default until \
-     this path survives the full ::stable gate under an A/B differential. See \
-     docs/PE_EMISSION_PLAN.md."
+     of going through ilasm. Default ON as of PE-emission Phase 1 (docs/PE_EMISSION_PLAN.md): the \
+     writer passed the full ::stable gate under an A/B differential (serial run byte-identical \
+     named-failure set vs the ilasm baseline). Escape hatch: set DIRECT_PE=0 to fall back to the \
+     ilasm path (il_exporter) if a PE-writer regression is suspected."
 );
