@@ -26,6 +26,10 @@
 //!   inventory subset that test exercises is wired; const-data `FieldRVA` blobs, non-`ByteBuffer`
 //!   static-field defaults, and `MainModule` method-count partitioning are loud `todo!()`s left
 //!   for Phase 1b — see `export`'s module doc.)*
+//! * [`pdb`] — Portable PDB (dotnet/runtime `PortablePdb-Metadata.md`): `#Pdb` stream +
+//!   `Document`/`MethodDebugInformation` tables from `CILRoot::SourceFileInfo` sequence points,
+//!   plus the PE-side Debug Directory (CodeView/RSDS) hook. *(Phase 2: interface-pinning stub —
+//!   see that module's doc for the parity bar against `il_exporter`'s `.line` + `ilasm -debug`.)*
 
 pub mod heaps;
 pub mod sig;
@@ -33,3 +37,4 @@ pub mod tables;
 pub mod body;
 pub mod pe;
 pub mod export;
+pub mod pdb;
