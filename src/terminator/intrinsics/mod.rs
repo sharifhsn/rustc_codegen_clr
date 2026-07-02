@@ -230,11 +230,19 @@ pub fn handle_intrinsic<'tcx>(
         }
         "atomic_store" => {
             // Lower `atomic_store` to a *volatile* store (CIL `volatile. stind`), which gives release
-            // semantics — a plain store has none. .NET guarantees tear-free naturally-aligned
-            // stores, so this matches the tear-free-load assumption `atomic_load_*` already relies
-            // on. (The ordering suffix is stripped before this arm, so all orderings map to the
-            // volatile store; a full-SeqCst store would additionally need a trailing
-            // `Thread.MemoryBarrier()` — see the `atomic_fence` arm — which is left as a follow-up.)
+            // semantics per ECMA-335 I.12.6.8 — a plain store has none. .NET guarantees tear-free
+            // naturally-aligned stores, so this matches the tear-free-load assumption `atomic_load`
+            // relies on. The ordering suffix is stripped before this arm (the const-generic
+            // `AtomicOrdering` parameter is never read on the live dispatch path — see the
+            // `atomic_load` comment above), so every nominal ordering — including `SeqCst` — funnels
+            // through here. `volatile. stind` alone is a release fence, not a full/SeqCst fence: it
+            // does not prevent a later load from being reordered ahead of this store (the classic
+            // StoreLoad reordering that `Ordering::SeqCst`'s total-order guarantee forbids). We
+            // therefore unconditionally emit a trailing `Thread.MemoryBarrier()` (the same call the
+            // `atomic_fence` arm below uses) after the volatile store. This is a real, full,
+            // bidirectional fence, so it upgrades every store to at least as strong as SeqCst —
+            // strictly stronger than Relaxed/Release require, which is safe (costs a barrier
+            // instruction on `Release`/`Relaxed` atomic stores; only `SeqCst` strictly needs it).
             debug_assert_eq!(
                 args.len(),
                 2,
@@ -245,7 +253,20 @@ pub fn handle_intrinsic<'tcx>(
             let arg_ty = ctx.monomorphize(args[1].node.ty(ctx.body(), ctx.tcx()));
 
             let st = ptr_set_op(arg_ty.into(), ctx, addr, val);
-            vec![ctx.make_store_volatile(st)]
+            let st = ctx.make_store_volatile(st);
+
+            let thread = ClassRef::thread(ctx);
+            let fence = MethodRef::new(
+                thread,
+                ctx.alloc_string("MemoryBarrier"),
+                ctx.sig([], Type::Void),
+                MethodKind::Static,
+                vec![].into(),
+            );
+            let fence = ctx.alloc_methodref(fence);
+            let fence = ctx.call_root(fence, EMPTY_ARGS, IsPure::NOT);
+
+            vec![st, fence]
         }
         "atomic_cxchg" | "atomic_cxchgweak" => atomic::cxchg(args, destination, ctx).into(),
         "atomic_xsub" => {
@@ -359,9 +380,16 @@ pub fn handle_intrinsic<'tcx>(
         "min_align_of_val" | "align_of_val" => {
             vec![align_of_val(args, destination, ctx, call_instance)]
         }
-        // .NET guarantees all loads are tear-free. TODO: what bout C?
+        // .NET guarantees all loads are tear-free. The ordering suffix is stripped before this arm
+        // (see the const-generic-ordering note on `atomic_store` below), so this one lowering must
+        // be sound for Acquire/SeqCst as well as Relaxed. A *plain* `ldind` (volatile:false) only
+        // guarantees tear-free access — it is NOT an acquire fence per ECMA-335 I.12.6.7, so the
+        // CoreCLR JIT is free to reorder a later load/store above it, which is exactly what
+        // `Ordering::Acquire`/`Ordering::SeqCst` forbid. Emitting `volatile.ldind` gives a real
+        // acquire fence (I.12.6.7: "no ... read ... may be moved before" a volatile read), which is
+        // correct for Acquire and sufficient for the load half of SeqCst; it is stronger than
+        // Relaxed strictly requires, which is safe (just gives up some reordering headroom).
         "atomic_load" => {
-            //I am not sure this is implemented properly
             debug_assert_eq!(
                 args.len(),
                 1,
@@ -371,7 +399,7 @@ pub fn handle_intrinsic<'tcx>(
             let arg = ctx.monomorphize(args[0].node.ty(ctx.body(), ctx.tcx()));
             let arg_ty = arg.builtin_deref(true).unwrap();
             let arg_type = ctx.type_from_cache(arg_ty);
-            let ops = ctx.load(ops, arg_type); //;deref_op(arg_ty.into(), ctx, ops);
+            let ops = ctx.load_volatile(ops, arg_type);
             vec![place_set(destination, ops, ctx)]
         }
         "sqrtf32" => float_unop(args, destination, ctx, Float::F32, "Sqrt"),

@@ -138,8 +138,13 @@ pub fn opt_node(
                 original,
                 fuel,
             ),
-            CILNode::LdLocA(loc) => opt_if_fuel(CILNode::LdLoc(*loc), original, fuel),
-            CILNode::LdArgA(loc) => opt_if_fuel(CILNode::LdArg(*loc), original, fuel),
+            // Only fold `ldind(ldloca X)` -> `ldloc X` for NON-volatile loads: a `volatile.`
+            // prefix is a real acquire fence (ECMA-335 I.12.6.7) and folding it away to a plain
+            // `ldloc` would silently drop that fence, which is unsound for e.g. `volatile_load`/
+            // `atomic_load` against a directly-owned local's address. Plain loads carry no fence
+            // semantics, so folding them is safe.
+            CILNode::LdLocA(loc) if !volitale => opt_if_fuel(CILNode::LdLoc(*loc), original, fuel),
+            CILNode::LdArgA(loc) if !volitale => opt_if_fuel(CILNode::LdArg(*loc), original, fuel),
             CILNode::LdFieldAddress { addr, field } => {
                 let field_desc = asm.get_field(*field);
                 if field_desc.tpe() == asm[tpe] {

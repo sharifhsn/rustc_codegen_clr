@@ -60,8 +60,13 @@ pub fn root_opt(
         },
         CILRoot::Call(info) => inline_trivial_call_root(info.0, &info.1, root_fuel, asm),
 
+        // As with the `LdInd`->`LdLoc` fold in `opt_node.rs`: only collapse `stind(ldloca X, v)`
+        // to `stloc X, v` when the store is NOT volatile. A `volatile.` store is a release fence
+        // (ECMA-335 I.12.6.8) — folding it into a plain `stloc` would silently drop that fence,
+        // which would be unsound for `volatile_store`/`atomic_store` against a directly-owned
+        // local's address (`info.3` is the volatile flag).
         CILRoot::StInd(ref info) => match asm.get_node(info.0) {
-            CILNode::LdLocA(loc) if asm[locals[*loc as usize].1] == info.2 => {
+            CILNode::LdLocA(loc) if !info.3 && asm[locals[*loc as usize].1] == info.2 => {
                 CILRoot::StLoc(*loc, info.1)
             }
             _ => root,
