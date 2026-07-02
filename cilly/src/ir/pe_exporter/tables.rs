@@ -1891,7 +1891,31 @@ impl TokenSink for MetadataBuilder {
             let mut blob = Vec::new();
             let fnsig = asm[sig].clone();
             let is_static = method_ref.kind() == crate::ir::cilnode::MethodKind::Static;
-            let convention = if is_static { sig::SIG_DEFAULT } else { sig::SIG_HASTHIS };
+            let mut convention = if is_static { sig::SIG_DEFAULT } else { sig::SIG_HASTHIS };
+            // §II.23.2.2 `MethodRefSig`: when this call site is a generic-method instantiation
+            // (`generic_args` non-empty — the caller wraps the result in a `MethodSpec`,
+            // §II.22.29), the base MemberRef this MethodSpec points at must ITSELF carry the
+            // `GENERIC` convention bit (0x10) plus the method's own generic-parameter COUNT (not
+            // the instantiation's argument types — those live only in the MethodSpec's
+            // instantiation blob). Its parameter/return positions reference that arity via
+            // `ET_MVAR` (`Type::PlatformGeneric(_, CallGeneric)`, already correctly encoded by
+            // `sig::encode_type`) — e.g. `Queryable.Count<T>(this IQueryable<T> source)` becomes
+            // `int32 Count<GENPARAMCOUNT=1>(class IQueryable`1<!!0>)`, matching `il_exporter`'s
+            // `call int32 …Queryable::'Count'<int32>(class …IQueryable`1<!!0>)` call-site
+            // rendering byte-for-byte at the semantic level (ilasm's own assembler adds this flag
+            // for a `<…>`-suffixed call; a hand-rolled writer must add it explicitly). Omitting
+            // this produces a MemberRefSig CoreCLR cannot bind to any real method overload —
+            // regression caught wiring `DIRECT_PE=1` into cd_linq_expr's `IntQuery::count`
+            // (`MissingMethodException: Method not found: 'Int32
+            // System.Linq.Queryable.Count(System.Linq.IQueryable`1<!!0>)'` — note the missing
+            // `<T>` in the CLR's own error text, confirming it read this as a NON-generic
+            // 1-arg method and correctly failed to find one).
+            let generic_param_count = if generic_args.is_empty() {
+                0
+            } else {
+                convention |= sig::SIG_GENERIC;
+                u32::try_from(generic_args.len()).unwrap()
+            };
             // Strip the implicit receiver (`this`) `fnsig.inputs()[0]` carries for every
             // non-static kind before encoding — see `export_pe`'s Pass 3 (`export.rs`) doc
             // comment on the identical fix for `MethodDef` signatures; a `MethodRef`'s stored
@@ -1902,7 +1926,7 @@ impl TokenSink for MetadataBuilder {
             } else {
                 crate::ir::FnSig::new(fnsig.inputs()[1..].to_vec(), *fnsig.output())
             };
-            sig::encode_method_sig(convention, 0, &encode_sig, asm, self, &mut blob);
+            sig::encode_method_sig(convention, generic_param_count, &encode_sig, asm, self, &mut blob);
             let sig_off = self.blobs.intern(&blob);
             self.member_ref(class_tok, &name, sig_off)
         };
@@ -3169,6 +3193,72 @@ mod tests {
             mb.strings_eq(row.name, "Span`1"),
             "generic external TypeRef name must carry the `N postfix, matching real BCL metadata"
         );
+    }
+
+    /// Regression for `MissingMethodException: Method not found: 'Int32
+    /// System.Linq.Queryable.Count(System.Linq.IQueryable\`1<!!0>)'` caught wiring `DIRECT_PE=1`
+    /// into cd_linq_expr's `IntQuery::count` (a call through `gmethod1`'s WF-9 generic-method
+    /// bridge, e.g. `Queryable.Count<int32>(IQueryable<int32>)`). `TokenSink::method_token`'s
+    /// out-of-assembly MemberRef-building arm hardcoded `generic_params = 0` and never OR'd
+    /// `SIG_GENERIC` into the calling convention, even when `generic_args` (the call site's own
+    /// instantiation, e.g. `[Int32]`) is non-empty — so the base MemberRef a `MethodSpec` points
+    /// at (§II.22.29) was encoded as an ordinary non-generic signature. §II.23.2.2 requires that
+    /// base MemberRef to carry `GENERIC` (0x10) + the method's own generic-parameter COUNT (not
+    /// the instantiation's concrete types — those live only in the MethodSpec's own blob); its
+    /// parameter positions reference that arity via `ET_MVAR`/`!!0`
+    /// (`Type::PlatformGeneric(_, CallGeneric)`, independently confirmed correct elsewhere).
+    /// Ground-truthed against the actual `.il` ilasm consumed for cd_linq_expr's `Count` call:
+    /// `call int32 …Queryable::'Count'<int32>(class …IQueryable\`1<!!0>)` — the `<int32>`
+    /// instantiation syntax is exactly what forces ilasm to stamp `GENERIC` on the underlying
+    /// MemberRef; a hand-rolled writer gets no such auto-detection from the assembler.
+    #[test]
+    fn generic_method_call_stamps_sig_generic_on_the_base_member_ref() {
+        let mut mb = MetadataBuilder::new();
+        let mut asm = Assembly::default();
+
+        // `Queryable::Count<T>(this IQueryable<T> source) -> int32`, called as `Count<int32>`.
+        // `Type::PlatformGeneric(0, CallGeneric)` inside the receiver's ClassRef generics is
+        // exactly what `call_gmethod` (src/terminator/call.rs) builds for the method's own `!!0`
+        // marker — mirrored here rather than re-deriving it.
+        let owner_name = asm.alloc_string("Queryable");
+        let owner = asm.alloc_class_ref(ClassRef::new(owner_name, None, false, [].into()));
+        let iqueryable_name = asm.alloc_string("IQueryable");
+        let mvar0 = Type::PlatformGeneric(0, crate::ir::tpe::GenericKind::CallGeneric);
+        let iqueryable_of_mvar0 =
+            asm.alloc_class_ref(ClassRef::new(iqueryable_name, None, false, [mvar0].into()));
+        let method_name = asm.alloc_string("Count");
+        let fn_sig = asm.sig([Type::ClassRef(iqueryable_of_mvar0)], Type::Int(crate::ir::Int::I32));
+        let mref = asm.alloc_methodref(crate::ir::MethodRef::new(
+            owner,
+            method_name,
+            fn_sig,
+            crate::ir::cilnode::MethodKind::Static,
+            vec![].into(),
+        ));
+
+        // The call site's instantiation: `Count<int32>`.
+        let generic_args = [Type::Int(crate::ir::Int::I32)];
+        let tok = TokenSink::method_token(&mut mb, &mut asm, MethodDefIdx::from_raw(mref), &generic_args);
+        assert_eq!(tok.table(), Token::TABLE_METHOD_SPEC, "call site wraps the base in a MethodSpec");
+
+        // Unwrap the MethodSpec to inspect the base MemberRef's OWN signature (not the
+        // instantiation blob, which was already correct before this fix). `MethodSpecRow.method`
+        // is a MethodDefOrRef-coded u32 (`(rid << 1) | tag`, tag=1 for MemberRef, mirroring
+        // `encode_method_def_or_ref`) — not a plain `Token`.
+        let spec_row = &mb.method_spec[(tok.rid() - 1) as usize];
+        assert_eq!(spec_row.method & 1, 1, "base must be a MemberRef, not a MethodDef");
+        let base_rid = spec_row.method >> 1;
+        let sig_off = mb.member_ref[(base_rid - 1) as usize].signature;
+        let blob = &mb.blobs.as_bytes()[sig_off as usize..];
+        // Blob has a length-prefix byte from interning ahead of the actual signature bytes.
+        assert_eq!(
+            blob[1] & sig::SIG_GENERIC,
+            sig::SIG_GENERIC,
+            "the base MemberRef for a generic-method call site must carry SIG_GENERIC, or CoreCLR \
+             resolves it as a non-generic overload and MissingMethodExceptions"
+        );
+        assert_eq!(blob[2], 1, "generic parameter COUNT (the method has one type parameter)");
+        assert_eq!(blob[3], 1, "value parameter count (the receiver is not counted)");
     }
 
     #[test]
