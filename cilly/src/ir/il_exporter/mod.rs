@@ -458,10 +458,13 @@ impl ILExporter {
         // returns + its size heuristic), so the per-element call survives; `aggressiveinlining`
         // (MethodImplOptions.AggressiveInlining) tells it to. Scoped to single-block, handler-free,
         // small bodies so we don't bloat the JIT or hint methods it can't inline anyway. Pure JIT
-        // hint — cannot affect correctness.
+        // hint — cannot affect correctness. `PDB_FRAMES=1` suppresses only this hint so debug/PDB
+        // runs can keep user frames visible in managed stack traces; default-off preserves current
+        // RyuJIT behaviour.
         let aggrinline = match method.implementation() {
             MethodImpl::MethodBody { blocks, .. }
-                if blocks.len() == 1
+                if !*crate::PDB_FRAMES
+                    && blocks.len() == 1
                     && blocks[0].handler().is_none()
                     && blocks[0].roots().len() <= 24 =>
             {

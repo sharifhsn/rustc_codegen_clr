@@ -346,7 +346,7 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
             }
             // Only save debuginfo for statements which result in ops.
             if !statement_tree.is_empty() {
-                let sfi = span_source_info(ctx, statement.source_info.span);
+                let sfi = span_source_info(ctx, statement.source_info);
                 trees.push(sfi);
             }
             trees.extend(statement_tree);
@@ -369,7 +369,7 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
                 }
             }
             if !term_trees.is_empty() {
-                let sfi = span_source_info(ctx, term.source_info.span);
+                let sfi = span_source_info(ctx, term.source_info);
                 trees.push(sfi);
             }
             trees.extend(term_trees);
@@ -585,15 +585,12 @@ pub fn add_item<'tcx>(
 
 pub(crate) fn span_source_info<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    span: rustc_span::Span,
+    source_info: rustc_middle::mir::SourceInfo,
 ) -> Interned<CILRoot> {
+    let span = outermost_inlined_callsite_span(ctx.body(), source_info);
     let (file, lstart, cstart, lend, mut cend) =
         ctx.tcx().sess.source_map().span_to_location_info(span);
-    let file = file.map_or(String::new(), |file| {
-        // `FileNameDisplayPreference` is now private; `prefer_local_unconditionally` is the public
-        // equivalent of the old `display(FileNameDisplayPreference::Local)`.
-        file.name.prefer_local_unconditionally().to_string()
-    });
+    let file = file.map_or(String::new(), |file| debuginfo_file_name(&file));
     if cstart >= cend {
         cend = cstart + 1;
     }
@@ -613,4 +610,40 @@ pub(crate) fn span_source_info<'tcx>(
         col_len,
         file,
     })
+}
+
+fn outermost_inlined_callsite_span<'tcx>(
+    body: &rustc_middle::mir::Body<'tcx>,
+    mut source_info: rustc_middle::mir::SourceInfo,
+) -> rustc_span::Span {
+    let mut outermost_callsite = None;
+    loop {
+        let scope_data = &body.source_scopes[source_info.scope];
+        if let Some((_, callsite_span)) = scope_data.inlined {
+            outermost_callsite = Some(callsite_span);
+        }
+        match scope_data.inlined_parent_scope {
+            Some(parent) => source_info.scope = parent,
+            None => break,
+        }
+    }
+    outermost_callsite.unwrap_or(source_info.span)
+}
+
+fn debuginfo_file_name(file: &rustc_span::SourceFile) -> String {
+    match &file.name {
+        rustc_span::FileName::Real(name) => {
+            let (working_dir, embeddable_name) =
+                name.embeddable_name(rustc_span::RemapPathScopeComponents::DEBUGINFO);
+            let path = if embeddable_name.is_absolute() || working_dir.as_os_str().is_empty() {
+                embeddable_name.to_path_buf()
+            } else {
+                working_dir.join(embeddable_name)
+            };
+            path.to_string_lossy().into_owned()
+        }
+        name => name
+            .display(rustc_span::RemapPathScopeComponents::DEBUGINFO)
+            .to_string(),
+    }
 }
