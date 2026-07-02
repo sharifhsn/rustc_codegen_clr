@@ -1412,9 +1412,17 @@ fn simple_wide(rows: usize) -> bool {
 }
 
 /// Whether a coded index with `tag_bits` needs 4 bytes: §II.24.2.6, "iff the number of rows in
-/// the largest target table exceeds 2^(16 - tag_bits)".
+/// the largest target table is equal to or greater than 2^(16 - tag_bits)".
+///
+/// This is a `>=`, not a `>`: the coded value packs `(rid << tag_bits) | tag`, so a table with
+/// exactly `2^(16-tag_bits)` rows already produces a coded value of `(2^(16-tag_bits) << tag_bits)
+/// == 0x1_0000` for its highest row — one bit too many for a `u16` — so the column must already
+/// be wide AT that row count, not only past it. Ground-truthed against
+/// `System.Reflection.Metadata.Ecma335.MetadataBuilder` (.NET 8): the reference writer emits a
+/// wide `TypeDefOrRef` (`Extends`) column once the largest target table reaches exactly 16384
+/// (`2^14`) rows.
 fn coded_wide(tag_bits: u32, max_rows: usize) -> bool {
-    max_rows > (1usize << (16 - tag_bits))
+    max_rows >= (1usize << (16 - tag_bits))
 }
 
 struct Widths {
@@ -1984,7 +1992,9 @@ mod tests {
             let guid_w = w(hs & 0x2 != 0);
             let count = |id: u32| header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c);
             let simple_w = |rows: usize| w(rows > 0xFFFF);
-            let coded_w = |tag_bits: u32, max_rows: usize| w(max_rows > (1usize << (16 - tag_bits)));
+            // Mirrors this module's own `coded_wide` exactly (§II.24.2.6: `>=`, not `>` — see its
+            // doc comment for why the threshold row count itself already needs a wide column).
+            let coded_w = |tag_bits: u32, max_rows: usize| w(max_rows >= (1usize << (16 - tag_bits)));
 
             match table_id {
                 Token::TABLE_MODULE => 2 + str_w + 3 * guid_w,
@@ -2242,15 +2252,69 @@ mod tests {
 
     #[test]
     fn coded_index_width_flips_at_documented_thresholds() {
-        // TypeDefOrRef: 2 tag bits -> threshold 2^14.
-        assert!(!coded_wide(2, 1 << 14));
-        assert!(coded_wide(2, (1 << 14) + 1));
+        // TypeDefOrRef: 2 tag bits -> threshold 2^14. The threshold row count itself is already
+        // wide (§II.24.2.6 uses `>=`); one row below it must still be narrow.
+        assert!(!coded_wide(2, (1 << 14) - 1));
+        assert!(coded_wide(2, 1 << 14));
         // MethodDefOrRef: 1 tag bit -> threshold 2^15.
-        assert!(!coded_wide(1, 1 << 15));
-        assert!(coded_wide(1, (1 << 15) + 1));
+        assert!(!coded_wide(1, (1 << 15) - 1));
+        assert!(coded_wide(1, 1 << 15));
         // HasCustomAttribute: 5 tag bits -> threshold 2^11.
-        assert!(!coded_wide(5, 1 << 11));
-        assert!(coded_wide(5, (1 << 11) + 1));
+        assert!(!coded_wide(5, (1 << 11) - 1));
+        assert!(coded_wide(5, 1 << 11));
+    }
+
+    /// Regression test for the coded-index width off-by-one at the EXACT threshold row count.
+    ///
+    /// §II.24.2.6: a coded index with `tag_bits` tag bits must use a 4-byte column "if the number
+    /// of rows in the largest target table is equal to or greater than 2^(16-tag_bits)". That is
+    /// a `>=` predicate, not `>`. At `max_rows == 2^(16-tag_bits)` exactly, the largest encodable
+    /// coded value is `(max_rows << tag_bits) | tag = (2^(16-tag_bits) << tag_bits) = 0x1_0000`,
+    /// which does not fit in a `u16` — so the column MUST already be wide at that row count, one
+    /// row earlier than a strict `>` comparison would switch it.
+    ///
+    /// Ground-truthed against `System.Reflection.Metadata.Ecma335.MetadataBuilder` (.NET 8): for
+    /// the `TypeDefOrRef` coded index (`tag_bits = 2`, threshold `2^14 = 16384`), SRM emits a
+    /// wide `Extends` column once the largest target table (`TypeRef` here) reaches exactly 16384
+    /// rows, not 16385.
+    #[test]
+    fn coded_index_width_flips_at_the_threshold_row_count_itself_not_one_past_it() {
+        // TypeDefOrRef: 2 tag bits -> threshold 2^14 = 16384. At exactly 16384 rows the column
+        // must ALREADY be wide (previously: `coded_wide(2, 1 << 14)` incorrectly returned false).
+        assert!(
+            coded_wide(2, 1 << 14),
+            "coded index must go wide AT the 2^(16-tag_bits) row count, not only past it"
+        );
+        // One row below the threshold must still be narrow.
+        assert!(!coded_wide(2, (1 << 14) - 1));
+    }
+
+    /// Reproduces the concrete corruption `coded_wide`'s off-by-one causes: at exactly the
+    /// threshold row count, a coded value that should require 4 bytes gets truncated to 2,
+    /// silently dropping the high bits and pointing the reader at the wrong row/table entirely.
+    #[test]
+    fn coded_index_at_threshold_row_count_does_not_truncate_high_bits() {
+        // TypeDefOrRef, tag_bits = 2, threshold = 2^14 = 16384 target rows.
+        let tag_bits = 2u32;
+        let max_rows = 1usize << (16 - tag_bits); // 16384
+        assert!(
+            coded_wide(tag_bits, max_rows),
+            "must be wide at the threshold row count"
+        );
+
+        // The coded value for the highest-numbered row (rid = max_rows, tag = 0):
+        // (rid << tag_bits) | tag == (16384 << 2) | 0 == 0x1_0000 — doesn't fit in u16.
+        let value: u32 = (u32::try_from(max_rows).unwrap() << tag_bits) | 0;
+        assert_eq!(value, 0x1_0000);
+
+        let mut out = Vec::new();
+        write_coded_idx(&mut out, value, coded_wide(tag_bits, max_rows));
+        assert_eq!(out.len(), 4, "wide column must write 4 bytes");
+        let round_tripped = u32::from_le_bytes(out.try_into().unwrap());
+        assert_eq!(
+            round_tripped, value,
+            "coded index must round-trip losslessly at the threshold row count, not truncate to 0"
+        );
     }
 
     #[test]
