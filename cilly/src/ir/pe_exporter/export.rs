@@ -59,12 +59,14 @@ use super::tables::{MetadataBuilder, Token};
 use crate::ir::class::StaticFieldDef;
 use crate::ir::{Assembly, Const};
 
-/// `SectionAlignment` (§II.25.2.3.1) — duplicated from `pe.rs`'s private constant since the RVA
-/// pre-computation below must match `pe::write_pe`'s own layout pass exactly (see that module's
-/// doc for why method/field RVAs must be known before the FINAL `serialize()` call).
-const SECTION_ALIGNMENT: u32 = 0x2000;
-/// CLI header size (§II.25.3.3) — duplicated from `pe.rs`'s private constant for the same reason.
-const CLI_HEADER_CB: u32 = 0x48;
+// `pe::SECTION_ALIGNMENT`/`pe::CLI_HEADER_CB` (both `pub(super)`) are used directly below rather
+// than duplicated here — an earlier version of this file kept its own copies "since the RVA
+// pre-computation below must match `pe::write_pe`'s own layout pass exactly", but that duplication
+// was exactly the trap it warned about: bumping `pe::SECTION_ALIGNMENT` from `0x2000` to `0x4000`
+// (see that constant's doc — a real macOS ARM64 `mprotect`-alignment `FileLoadException` fix) left
+// THIS file's stale `0x2000` copy silently out of sync, producing `MethodDef`/`FieldRVA` RVAs that
+// pointed outside `.text` entirely (`BadImageFormatException: Bad IL range` on every E2E test).
+// Sharing the one real constant makes that class of drift impossible instead of just documented.
 
 /// Everything `export_pe` needs beyond the `Assembly` itself.
 pub struct ExportOptions {
@@ -207,8 +209,20 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
         } else {
             (None, None)
         };
+        // Split the last `.` into `TypeDef.Namespace`/`TypeDef.Name` (§II.22.37), exactly matching
+        // what `ilasm` does with a `.class 'Full.Dotted.Name'` quoted identifier (confirmed
+        // byte-for-byte against a real ilasm-built assembly: `.class 'cd_interop.Point'` becomes
+        // `Namespace="cd_interop"`/`Name="Point"`, NOT `Namespace=""`/`Name="cd_interop.Point"`).
+        // A prior version of this call always passed `namespace=""` and the FULL dotted string as
+        // `name` — that loads and runs fine (token-based resolution doesn't care), but makes the
+        // type uncompilable-against from C#: Roslyn's reference resolution looks a type up by
+        // `Namespace`+`Name`, so `cd_interop.Point` (namespace `cd_interop`, name `Point`) was
+        // simply absent, surfacing as `CS0246: The type or namespace name 'cd_interop' could not
+        // be found` the moment a C# consumer referenced a namespaced Rust-exported type — see
+        // `MetadataBuilder::find_type_def`'s doc for the paired lookup-side fix this requires.
         let raw_name = asm[class_def.name()].to_string();
-        let tok = mb.add_type_def("", &raw_name, class_def.is_valuetype(), Some(extends), pack, size, &implements);
+        let (namespace, name) = super::tables::split_namespace(&raw_name);
+        let tok = mb.add_type_def(namespace, name, class_def.is_valuetype(), Some(extends), pack, size, &implements);
         type_def_token_of.insert(class_def_id, tok);
     }
 
@@ -504,7 +518,7 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
     // silently shifted every method body 8 bytes short of where `MethodDef.RVA` said it was).
     let text_header_len = pe::text_header_len(entry_point_token.is_some());
     let bodies_start_rva =
-        SECTION_ALIGNMENT + text_header_len + CLI_HEADER_CB + u32::try_from(metadata_len_probe).unwrap();
+        pe::SECTION_ALIGNMENT + text_header_len + pe::CLI_HEADER_CB + u32::try_from(metadata_len_probe).unwrap();
     let mut method_bodies_bytes = Vec::new();
     let mut cursor = bodies_start_rva;
     for (tok, assembled) in &bodies {
@@ -1174,7 +1188,15 @@ mod tests {
     /// so only the STRIDE between rows (which DOES depend on heap/index widths) needs real width
     /// computation.
     fn read_method_def_rva(image: &[u8], rid: u32) -> u32 {
-        let cli_off = rva_to_file_offset(image, 0x2008); // CLI header directory RVA (§II.25.3.3, fixed by `pe.rs`).
+        // CLI header directory RVA (§II.25.3.3, fixed by `pe.rs`): `.text` starts at
+        // `pe::SECTION_ALIGNMENT` and the CLI header sits 8 bytes in, after the (always-present,
+        // even for a `.dll`) 8-byte IAT-shaped pad `pe::write_pe` reserves at `.text`'s start —
+        // see that module's `text_header_len`. Derived from the real (`pub(super)`) constant, not
+        // a hand-copied literal — a hardcoded `0x2008`/`0x4008` here is exactly the drift trap
+        // that made every E2E test fail with `BadImageFormatException: Bad IL range` the first
+        // time `SECTION_ALIGNMENT` was bumped (`0x2000` -> `0x4000`, fixing a macOS ARM64
+        // `mprotect`-alignment `FileLoadException`; see that constant's doc).
+        let cli_off = rva_to_file_offset(image, pe::SECTION_ALIGNMENT + 8);
         let md_rva = u32::from_le_bytes(image[cli_off + 8..cli_off + 12].try_into().unwrap());
         let md_off = rva_to_file_offset(image, md_rva);
         let version_len = u32::from_le_bytes(image[md_off + 12..md_off + 16].try_into().unwrap()) as usize;

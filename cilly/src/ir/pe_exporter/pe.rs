@@ -110,8 +110,36 @@ const PE32_MAGIC: u16 = 0x10B;
 /// `ImageBase` (§II.25.2.3.1) — the conventional default every ilasm-produced image uses.
 const IMAGE_BASE: u32 = 0x0040_0000;
 /// `SectionAlignment` (§II.25.2.3.1): RVAs of each section start at a multiple of this once
-/// mapped into memory.
-const SECTION_ALIGNMENT: u32 = 0x2000;
+/// mapped into memory. §II.25.2.3.1 only requires this to be a power of two `>= FileAlignment`;
+/// ilasm conventionally uses `0x2000` (8KiB), which this writer matched until the following bug
+/// was found.
+///
+/// **Bumped from `0x2000` to `0x4000` (16KiB) to fix a real, confirmed `FileLoadException
+/// 0x8007000C` load bug on macOS ARM64 CoreCLR 8.0.28**, root-caused via `lldb` against the
+/// release `libcoreclr.dylib` (no managed reader — `System.Reflection.Metadata`, ilverify, Mono —
+/// or unit test can see this; it is a native-loader-only invariant): CoreCLR's non-Windows PE
+/// loader (`FlatImageLayout::LoadImageByCopyingParts`, the manual "PAL" path every non-Windows
+/// host takes because `mmap`ing a Windows-style PE section table directly isn't portable) copies
+/// each section into one big anonymous mapping and then calls `mprotect`/`ClrVirtualProtect`
+/// **per section boundary** to apply that section's own protection bits (`.text` -> RX/RWX,
+/// `.sdata` -> RW). `mprotect(2)` requires its `addr` argument to be aligned to the HOST OS's
+/// native page size — 4KiB on Linux/Windows/x86_64 macOS, but **16KiB on Apple Silicon
+/// (macOS ARM64)**. An `0x2000`-aligned section boundary is only ever `0x0` or `0x2000` (mod
+/// `0x4000`) — exactly a coin flip whether it lands on a real 16KiB page boundary — so whenever a
+/// `.text` section's content length happened NOT to round to a 16KiB multiple (i.e. most of the
+/// time; every dll in this writer's own E2E tests happened to round the other way, which is why
+/// this shipped undetected), the `.sdata` section's `mprotect` call landed mid-page and macOS's
+/// kernel rejected it, which CoreCLR's loader converts into exactly the `FileLoadException`
+/// naming this assembly's own `"_"` identity that four prior A/B differential rounds chased
+/// through the metadata-table layer and never found (`ilverify`/SRM/Mono only ever see the file
+/// AFTER a successful `mmap`+`mprotect`, so this class of bug is invisible to every managed-reader
+/// check this project has). Confirmed via `lldb`: the failing `ClrVirtualProtect(addr, 0x23f10,
+/// PAGE_READWRITE)` call for `.sdata` returned `0` (failure) exactly when `.sdata`'s RVA was
+/// `0x2000`-but-not-`0x4000`-aligned; the SAME bytes with a `0x4000`-aligned `.sdata` RVA load and
+/// run cleanly. `0x4000` is still spec-legal (a power of two, still `>= FILE_ALIGNMENT`) and is
+/// exactly what real multi-platform toolchains (e.g. modern Mono/Roslyn-adjacent AOT linkers) use
+/// for the same reason; it costs a little more padding in `.text`/`.sdata`, not correctness.
+pub(super) const SECTION_ALIGNMENT: u32 = 0x4000;
 /// `FileAlignment` (§II.25.2.3.1): each section's raw (on-disk) data starts at a multiple of
 /// this.
 const FILE_ALIGNMENT: u32 = 0x0200;
@@ -147,7 +175,7 @@ const TEXT_SECTION_CHARACTERISTICS: u32 = 0x6000_0020;
 const SDATA_SECTION_CHARACTERISTICS: u32 = 0xC000_0040;
 
 /// CLI header `cb` (§II.25.3.3): the header's own fixed size in bytes.
-const CLI_HEADER_CB: u32 = 0x48;
+pub(super) const CLI_HEADER_CB: u32 = 0x48;
 const CLI_MAJOR_RUNTIME_VERSION: u16 = 2;
 const CLI_MINOR_RUNTIME_VERSION: u16 = 5;
 /// CLI header `Flags` bit: `COMIMAGE_FLAGS_ILONLY`. This is the *only* flag this writer sets —
@@ -1218,6 +1246,61 @@ mod tests {
         let off = sdata.file_offset as usize;
         assert_eq!(&image[off..off + field_rva_data.len()], &field_rva_data[..]);
         assert_eq!(sdata.virtual_size, field_rva_data.len() as u32);
+    }
+
+    /// Regression test for a real, confirmed macOS ARM64 CoreCLR load bug (`FileLoadException
+    /// 0x8007000C`, root-caused via `lldb` against the release `libcoreclr.dylib` — see
+    /// `SECTION_ALIGNMENT`'s own doc for the full writeup). CoreCLR's non-Windows PE loader
+    /// (`FlatImageLayout::LoadImageByCopyingParts`) `mprotect`s each section independently once
+    /// it has copied the whole image into one anonymous mapping; `mprotect(2)` requires its
+    /// address argument to be aligned to the HOST's native page size, which is 16KiB (`0x4000`)
+    /// on Apple Silicon — NOT the 4KiB most other `mprotect`-based platforms use. A
+    /// `SectionAlignment` smaller than that (ilasm/this writer's old `0x2000`) lets a section
+    /// boundary land at, e.g., RVA `0x27a000` (`% 0x4000 == 0x2000`, exactly half a real page)
+    /// whenever the PRECEDING section's content length doesn't happen to round to a 16KiB
+    /// multiple — which is content-dependent (method-body/metadata size), so it silently varied
+    /// per-assembly and only failed for SOME crates, which is exactly why 4+ prior differential
+    /// rounds saw an intermittent, assembly-dependent `FileLoadException` that no managed-reader
+    /// check (`System.Reflection.Metadata`, ilverify, Mono) could ever catch — those readers only
+    /// ever see bytes AFTER a successful `mmap`+`mprotect`.
+    ///
+    /// This test pins the actual load-bearing invariant directly (every section's mapped RVA must
+    /// be a multiple of the largest plausible host OS page size, not just `SectionAlignment`
+    /// itself) using odd, non-16KiB-multiple content lengths chosen to reproduce the exact
+    /// "coin flip" shape the real bug had before the `SECTION_ALIGNMENT` bump — a weaker test that
+    /// only checked alignment to the OLD `0x2000` would have passed on this exact input and missed
+    /// the bug entirely.
+    #[test]
+    fn every_section_boundary_is_aligned_to_the_largest_plausible_host_page_size() {
+        const APPLE_SILICON_PAGE_SIZE: u32 = 0x4000; // 16KiB — the property that actually matters.
+        assert_eq!(
+            SECTION_ALIGNMENT, APPLE_SILICON_PAGE_SIZE,
+            "SECTION_ALIGNMENT itself must be >= the largest real host page size, or this test's \
+             boundary check below is not actually guaranteed by construction"
+        );
+
+        // A content length deliberately NOT a multiple of 16KiB (`0x4000`) — this is exactly the
+        // shape that exposed the bug: `.text`'s end (and thus `.sdata`'s start) landing mid-page.
+        let metadata = vec![0xAAu8; 12_345];
+        let bodies = vec![0xBBu8; 54_321];
+        let field_rva_data = vec![0x01u8; 999];
+        let opts = PeOptions {
+            is_dll: true,
+            entry_point: None,
+        };
+        let image = write_pe(&metadata, &bodies, &field_rva_data, &opts);
+        let pe = parse_pe(&image);
+
+        assert!(pe.num_sections >= 2, "this input must produce both .text and .sdata");
+        for section in &pe.sections {
+            assert_eq!(
+                section.rva % APPLE_SILICON_PAGE_SIZE,
+                0,
+                "section {:?} RVA {:#x} is not 16KiB-aligned — mprotect() on macOS ARM64 will reject this",
+                String::from_utf8_lossy(&section.name),
+                section.rva
+            );
+        }
     }
 
     /// [`field_rva_section_start`] is the "single source of truth" callers (`export::export_pe`)

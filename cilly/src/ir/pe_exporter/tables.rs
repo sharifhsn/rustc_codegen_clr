@@ -1801,14 +1801,34 @@ impl MetadataBuilder {
 }
 
 impl MetadataBuilder {
-    /// Finds a previously-added `TypeDef` row by its (already-shortened) name. Namespace is
-    /// always emitted empty by this backend (mirrors `il_exporter`, which never splits a Rust
-    /// mangled name into namespace+name — the full name goes in `Name` and `Namespace` stays
-    /// `""`), so lookup only needs to compare `Name`.
+    /// Finds a previously-added `TypeDef` row by its (already-shortened) name.
+    ///
+    /// **Must split on the last `.` exactly like [`add_type_def`](Self::add_type_def) does**, via
+    /// the same [`split_namespace`] `TypeRef` already uses. This was a real bug (found wiring
+    /// `cd_interop`'s C#-consumer battery target, not caught by any prior A/B round because every
+    /// earlier check either read metadata generically — `System.Reflection.Metadata`, `ilverify`,
+    /// this crate's own reader-based unit tests — none of which care whether `Namespace` is `""`
+    /// or split out, or exercised `dotnet run`/`Assembly.Load`, which resolves types by TOKEN, not
+    /// by name — only Roslyn's COMPILE-TIME reference resolution (`csc`/`dotnet build` against a
+    /// `<Reference>`) looks a type up by `Namespace`+`Name`): a prior version of this fn assumed
+    /// "namespace is always emitted empty by this backend, mirrors il_exporter" — false. `ilasm`
+    /// itself, given `.class 'cd_interop.Point' …`, DOES split on the last `.` into
+    /// `TypeDef.Namespace="cd_interop"`/`TypeDef.Name="Point"` (confirmed by decoding a real
+    /// ilasm-built `cd_interop.dll` byte-for-byte) — `il_exporter` just never has to do that split
+    /// ITSELF because it hands ilasm one opaque quoted string and lets the assembler's own name
+    /// parser do it. This writer, bypassing ilasm, must replicate that split by hand or every
+    /// namespaced Rust-exported type becomes uncompilable-against from C# (`CS0246: The type or
+    /// namespace name 'cd_interop' could not be found`) even though it loads and runs fine at
+    /// runtime (token-based resolution never notices the empty `Namespace`).
     fn find_type_def(&self, raw_name: &str) -> Option<Token> {
-        let shortened = dotnet_class_name(raw_name);
+        // Split BEFORE shortening (not after) to match `add_type_def`'s own contract exactly: it
+        // shortens only the (already-split-by-the-caller) `name` argument, never the combined
+        // dotted string — splitting a POST-shortened (hash-suffixed) string here would risk
+        // disagreeing with `add_type_def` for any name near the 1023-char cutoff.
+        let (namespace, name) = split_namespace(raw_name);
+        let shortened = dotnet_class_name(name);
         for (i, row) in self.type_def.iter().enumerate() {
-            if self.strings_eq(row.name, &shortened) {
+            if self.strings_eq(row.name, &shortened) && self.strings_eq(row.namespace, namespace) {
                 return Some(Token::new(Token::TABLE_TYPE_DEF, u32::try_from(i + 1).unwrap()));
             }
         }
@@ -1864,12 +1884,22 @@ fn is_bcl_assembly(name: &str) -> bool {
 /// the Phase 1a E2E milestone (`TypeRef` row for `System.Console` there has `Namespace="System"`,
 /// `Name="Console"`).
 ///
-/// Only used for `TypeRef` (external, §II.22.38 `TypeNamespace`); `TypeDef` (this assembly's own
-/// classes, §II.22.37) intentionally stays UNSPLIT — `il_exporter` never gives its own mangled
-/// Rust type names a namespace concept either (its `.class 'MangledName' { … }` is one quoted
-/// identifier with no `.` interpreted specially, and nothing outside this backend's own generated
-/// code ever needs to resolve one of its `TypeDef`s by namespace).
-fn split_namespace(name: &str) -> (&str, &str) {
+/// Used for BOTH `TypeRef` (external, §II.22.38 `TypeNamespace`) AND `TypeDef` (this assembly's
+/// own classes, §II.22.37 `TypeNamespace`) — an EARLIER version of this doc claimed `TypeDef`
+/// "intentionally stays UNSPLIT" on the theory that `il_exporter` never gives its own mangled Rust
+/// type names a namespace concept either. That reasoning doesn't survive contact with a real
+/// ilasm-produced image: `il_exporter`'s `.class 'MangledName' { … }` IS one quoted identifier
+/// with no `.` interpreted specially *in the IL text*, but `ilasm` itself still splits that string
+/// on its last `.` when it writes the BINARY `TypeDef` row — confirmed byte-for-byte against a
+/// real `cd_interop.dll`: `.class 'cd_interop.Point'` becomes `TypeDef.Namespace="cd_interop"` /
+/// `TypeDef.Name="Point"`, not `Namespace=""`/`Name="cd_interop.Point"`. Leaving `TypeDef`
+/// unsplit loads and runs fine (CLR token-based method/field resolution never looks at
+/// `Namespace`), but makes the type uncompilable-against from C#: Roslyn's reference resolution
+/// looks types up by `Namespace`+`Name`, so an unsplit `cd_interop.Point` is invisible to
+/// `csc`/`dotnet build`, surfacing as `CS0246: The type or namespace name 'cd_interop' could not
+/// be found` — see `MetadataBuilder::find_type_def` and `export::export_pe`'s Pass 1 for the two
+/// call sites this split had to be threaded into together.
+pub(super) fn split_namespace(name: &str) -> (&str, &str) {
     match name.rfind('.') {
         Some(idx) => (&name[..idx], &name[idx + 1..]),
         None => ("", name),
@@ -3238,6 +3268,63 @@ mod tests {
 
         let coded = TypeDefOrRefResolver::type_def_or_ref(&mut mb, cref, &mut asm);
         assert_eq!(decode_type_def_or_ref(coded), tok, "must resolve to the TypeDef, not create a TypeRef");
+        assert_eq!(mb.type_ref.len(), 0, "no TypeRef should be created for an in-assembly type");
+    }
+
+    /// Regression test for a real bug caught wiring the `cd_interop` C#-consumer A/B battery
+    /// target: a `TypeDef` for a DOTTED (namespaced) Rust-exported name (e.g. `cd_interop.Point`,
+    /// the backend's real shape for a `#[repr(C)]` struct crossing the Rust/.NET boundary) must
+    /// split its `Namespace`/`Name` columns on the last `.`, exactly like `ilasm` does (confirmed
+    /// byte-for-byte against a real ilasm-built `cd_interop.dll`: `TypeDef.Namespace="cd_interop"`,
+    /// `TypeDef.Name="Point"`) — NOT dump the whole dotted string into `Name` with an empty
+    /// `Namespace`. Both shapes load and run identically under `dotnet` (CLR method/field
+    /// resolution is token-based, never looks at `Namespace`), which is exactly why this shipped
+    /// undetected through every earlier E2E/A-B round: only Roslyn's COMPILE-TIME reference
+    /// resolution (`csc`/`dotnet build` against a `<Reference>`) looks a type up by
+    /// `Namespace`+`Name`, and no prior round built a C# PROJECT against a pe_exporter-produced
+    /// library (only `dotnet run`/`Assembly.Load` on the raw bytes) until this one did — the
+    /// unsplit shape surfaced as `CS0246: The type or namespace name 'cd_interop' could not be
+    /// found`. Exercises both halves together: `add_type_def` (population) and
+    /// `TypeDefOrRefResolver::type_def_or_ref` -> `find_type_def` (lookup) must agree on the SAME
+    /// split, or a self-referencing signature (e.g. a method returning this very type) would fail
+    /// to resolve even though the row itself is correctly split.
+    #[test]
+    fn namespaced_type_def_splits_into_namespace_and_name_columns_matching_ilasm() {
+        let mut mb = MetadataBuilder::new();
+        let mut asm = Assembly::default();
+        let name = asm.alloc_string("cd_interop.Point");
+        asm.class_def(crate::ir::ClassDef::new(
+            name,
+            true,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Public,
+            None,
+            None,
+            true,
+        ))
+        .unwrap();
+        let cref = asm.alloc_class_ref(ClassRef::new(name, None, true, [].into()));
+
+        let (namespace, short_name) = split_namespace("cd_interop.Point");
+        let tok = mb.add_type_def(namespace, short_name, true, None, None, None, &[]);
+
+        // The row itself must carry the SPLIT columns, not the whole dotted string in `Name`.
+        let row = &mb.type_def[(tok.rid() - 1) as usize];
+        assert!(mb.strings_eq(row.namespace, "cd_interop"), "TypeDef.Namespace must be \"cd_interop\"");
+        assert!(mb.strings_eq(row.name, "Point"), "TypeDef.Name must be \"Point\", not the full dotted string");
+
+        // A self-referencing `ClassRef` (e.g. a method returning `Point`) must still resolve to
+        // this SAME TypeDef token via `find_type_def`'s lookup, proving population and lookup
+        // agree on the split (not just population alone).
+        let coded = TypeDefOrRefResolver::type_def_or_ref(&mut mb, cref, &mut asm);
+        assert_eq!(
+            decode_type_def_or_ref(coded),
+            tok,
+            "a self-reference to a namespaced TypeDef must resolve via find_type_def's matching split, not fail to find it"
+        );
         assert_eq!(mb.type_ref.len(), 0, "no TypeRef should be created for an in-assembly type");
     }
 
