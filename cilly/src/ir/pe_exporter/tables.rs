@@ -474,6 +474,48 @@ impl MetadataBuilder {
         tok
     }
 
+    /// Adds a `private explicit ansi sealed` `TypeDef` (§II.22.37) sized to exactly `size` bytes
+    /// with `.pack 1` — the "blob-sized valuetype" shape a const-data buffer's synthetic
+    /// `__rcl_const_blob_{size}` carrier type needs (see `docs/PE_EMISSION_PLAN.md`'s FieldRVA-
+    /// sizing lesson: a `FieldRVA` field must be typed to its blob's exact byte width, or
+    /// NativeAOT's ILC keeps only 1 byte of the blob — commit 4b487f7). Mirrors `il_exporter`'s
+    /// literal text for this exact construct: `.class private explicit ansi sealed
+    /// '__rcl_const_blob_{n}' extends [System.Runtime]System.ValueType {{ .pack 1 .size {n} }}`
+    /// (`il_exporter/mod.rs:120`).
+    ///
+    /// Deliberately a separate method rather than a new parameter on [`MetadataBuilder::add_type_def`]:
+    /// that method's existing "every TypeDef is conservatively marked Public" contract is
+    /// documented and depended on by every other caller (9 call sites as of Phase 1b), so this adds
+    /// the one new (private, sealed, explicit-layout, fixed-size) shape as its own entry point
+    /// instead of threading a visibility flag through everything that doesn't need it.
+    pub fn add_blob_sized_valuetype(&mut self, name: &str, extends: Token, size: u32) -> Token {
+        let name = dotnet_class_name(name);
+        let name_off = self.strings.intern(&name);
+        let namespace_off = self.strings.intern("");
+        let extends_coded = encode_type_def_or_ref_token(extends);
+        // §II.23.1.15 `TypeAttributes`: 0x0 NotPublic (private) | 0x100 Sealed | 0x10 ExplicitLayout.
+        let flags: u32 = 0x100 | 0x10;
+        let field_list = u32::try_from(self.field.len() + 1).unwrap();
+        let method_list = u32::try_from(self.method_def.len() + 1).unwrap();
+        self.type_def.push(TypeDefRow {
+            flags,
+            name: name_off,
+            namespace: namespace_off,
+            extends: extends_coded,
+            field_list,
+            method_list,
+        });
+        let rid = u32::try_from(self.type_def.len()).unwrap();
+        let tok = Token::new(Token::TABLE_TYPE_DEF, rid);
+        self.current_type_def = Some(rid);
+        self.class_layout.push(ClassLayoutRow {
+            packing_size: 1,
+            class_size: size,
+            parent: rid,
+        });
+        tok
+    }
+
     /// Adds an instance `Field` row (§II.22.15) to the most recently added `TypeDef`.
     /// `offset` mirrors `ClassDef::fields()`'s `Option<u32>` (`.field [N] …`) and populates a
     /// `FieldLayout` row (§II.22.16) when present.
@@ -506,16 +548,24 @@ impl MetadataBuilder {
     /// row (§II.22.18) is added once that placement assigns a real RVA (see
     /// [`MetadataBuilder::set_field_rva`]). `is_thread_static` triggers
     /// [`MetadataBuilder::thread_static_attribute`] on the returned token, mirroring
-    /// `StaticFieldDef::is_tls`.
+    /// `StaticFieldDef::is_tls`. `is_const` sets `FieldAttributes::InitOnly` (§II.23.1.5, 0x20),
+    /// mirroring `StaticFieldDef::is_const` / `il_exporter`'s `initonly` keyword (mod.rs:224,328)
+    /// — note this is the .NET *InitOnly* semantic (settable once, typically from a `.cctor`), NOT
+    /// the metadata `Constant` table (§II.22.9, compile-time-substituted literals) — `il_exporter`
+    /// never emits a `Constant` row for these either, so this mirrors that scope exactly.
     pub fn add_static_field(
         &mut self,
         name: &str,
         signature_blob: u32,
         rva_data: Option<Vec<u8>>,
         is_thread_static: bool,
+        is_const: bool,
     ) -> Token {
-        // §II.23.1.5 `FieldAttributes`: 0x1 Public | 0x10 Static.
+        // §II.23.1.5 `FieldAttributes`: 0x1 Public | 0x10 Static | 0x20 InitOnly (when `is_const`).
         let mut flags: u16 = 0x1 | 0x10;
+        if is_const {
+            flags |= 0x20;
+        }
         if rva_data.is_some() {
             flags |= 0x100; // HasFieldRVA
         }
@@ -791,14 +841,14 @@ impl MetadataBuilder {
                 return Token::new(Token::TABLE_ASSEMBLY_REF, u32::try_from(i + 1).unwrap());
             }
         }
-        // il_exporter's `dv_ver`/`assembly_ver()` BCL version triplet is not reachable from this
-        // crate-local module without threading a `DotnetVersion` through every call site; net8's
-        // triplet is the long-standing default (`8:0:0:0`) used throughout the existing BCL
-        // ClassRef table, so it is hardcoded here for this one bootstrap reference.
+        // `crate::ir::dotnet_version()` is a free function in this same crate (cilly), so no
+        // threading is needed — mirrors `il_exporter`'s `dv_ver = dotnet_version().assembly_ver()`
+        // (mod.rs:74). Uses the tuple sibling since `AssemblyRefRow`'s columns are raw `u16`s
+        // (§II.22.5), not the `"8:0:0:0"` string il_exporter interpolates into IL text.
         self.assembly_ref(
             NAME,
             AssemblyRefTarget::Bcl {
-                version: (8, 0, 0, 0),
+                version: crate::ir::dotnet_version().assembly_ver_tuple(),
             },
         )
     }
@@ -1617,8 +1667,11 @@ impl MetadataBuilder {
             }
         }
         let target = if is_bcl_assembly(name) {
+            // Same single source of truth as `system_runtime_assembly_ref`: `dotnet_version()` is
+            // reachable here with zero threading (free fn, same crate) — mirrors `il_exporter`'s
+            // `dv_ver`.
             AssemblyRefTarget::Bcl {
-                version: (8, 0, 0, 0),
+                version: crate::ir::dotnet_version().assembly_ver_tuple(),
             }
         } else {
             AssemblyRefTarget::NameOnly
@@ -2252,6 +2305,64 @@ mod tests {
         assert_eq!(method_flags & 0x10, 0x10, "static bit must be set");
     }
 
+    /// `add_method`'s `param_names` slice drives real `Param` rows (§II.22.33), one per entry —
+    /// including entries with no name. Verified against real CoreCLR `ilasm`/`monodis`: an
+    /// unnamed parameter still gets a `Param` row (empty `Name`, real 1-based `Sequence`), it is
+    /// not omitted — so this backend's "always push a row" behavior in `add_method` (never
+    /// skipping `None` entries) is the semantically correct mirror of what the real assembler
+    /// does, not an over-approximation. Phase 1b's `export_pe` wiring (Cluster C item 1) depends
+    /// on this: it must be safe to pass `method.arg_names()` straight through without special-
+    /// casing the `None` slots.
+    #[test]
+    fn named_and_unnamed_params_both_get_param_rows_with_correct_sequence() {
+        let mut mb = MetadataBuilder::new();
+        mb.finish_module("param_test");
+        mb.add_type_def("", "MyType", false, None, None, None, &[]);
+
+        let sig_blob = {
+            let mut out = Vec::new();
+            out.push(sig::SIG_DEFAULT);
+            write_compressed_u32(&mut out, 2);
+            out.push(0x01); // void return
+            out.push(0x08); // int32
+            out.push(0x08); // int32
+            mb.blobs.intern(&out)
+        };
+        // Mirrors `il_exporter`'s per-arg `Option<name>` shape: first param named, second not.
+        let method_tok = mb.add_method(
+            "Mixed",
+            sig_blob,
+            &[Some("x"), None],
+            true,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(method_tok.rid(), 1);
+
+        let bytes = mb.serialize();
+        let reader = MetadataReader::parse(&bytes);
+        let header = reader.tables_header();
+        let counts: HashMap<u32, usize> = header.counts.iter().copied().collect();
+        assert_eq!(counts[&Token::TABLE_PARAM], 2, "one Param row per arg_names entry, named or not");
+
+        let row_bytes = &reader.stream("#~")[header.row_data_offset..];
+        let param_start = reader.table_offset(Token::TABLE_PARAM, &header);
+        // Param row: Flags(2) + Sequence(2) + Name(2, narrow — small tables here) = 6 bytes.
+        let row0 = &row_bytes[param_start..param_start + 6];
+        let row1 = &row_bytes[param_start + 6..param_start + 12];
+
+        let seq0 = u16::from_le_bytes(row0[2..4].try_into().unwrap());
+        let name0 = u16::from_le_bytes(row0[4..6].try_into().unwrap());
+        assert_eq!(seq0, 1, "first real arg is Sequence 1 (this is a static method, no implicit this)");
+        assert_eq!(reader.strings_at(u32::from(name0)), "x");
+
+        let seq1 = u16::from_le_bytes(row1[2..4].try_into().unwrap());
+        let name1 = u16::from_le_bytes(row1[4..6].try_into().unwrap());
+        assert_eq!(seq1, 2, "second arg is Sequence 2");
+        assert_eq!(name1, 0, "unnamed param has a null #Strings offset, not a dangling/garbage one");
+    }
+
     // ---------------------------------------------------------------------------------------
     // (b) Coded-index width flips at the documented row-count thresholds.
     // ---------------------------------------------------------------------------------------
@@ -2492,10 +2603,48 @@ mod tests {
         assert_eq!(mb.assembly_ref[1].public_key_or_token, 0, "name-only ref carries no token");
     }
 
+    /// `system_runtime_assembly_ref` (the bootstrap `System.Runtime` ref backing
+    /// `thread_static_ctor_ref`/`system_runtime_type_ref`) and `find_or_create_assembly_ref`'s
+    /// BCL branch both stamp the `AssemblyRef.MajorVersion..RevisionNumber` columns from
+    /// `crate::ir::dotnet_version()` — the single source of truth `il_exporter` also reads
+    /// (`dv_ver = dotnet_version().assembly_ver()`, mod.rs:74) — rather than a crate-local
+    /// hardcoded `(8, 0, 0, 0)` literal. This asserts the threading, not a specific version
+    /// number: the test process has no `DOTNET_VERSION` env var set, so `dotnet_version()`
+    /// resolves to the `Net8` default, and both call sites must agree with whatever that
+    /// resolves to (proving they consult it, rather than merely happening to match by
+    /// coincidence with a stale literal).
+    #[test]
+    fn bcl_assembly_refs_are_stamped_from_dotnet_version_not_a_hardcoded_literal() {
+        let expected = crate::ir::dotnet_version().assembly_ver_tuple();
+
+        let mut mb = MetadataBuilder::new();
+        let sys_runtime_tok = mb.find_or_create_assembly_ref("System.Runtime");
+        let row = &mb.assembly_ref[(sys_runtime_tok.rid() - 1) as usize];
+        assert_eq!((row.major, row.minor, row.build, row.revision), expected);
+
+        // A second, distinct BCL name via the same helper must agree too (not a fluke of caching
+        // the first lookup).
+        let mut mb2 = MetadataBuilder::new();
+        let intrinsics_tok = mb2.find_or_create_assembly_ref("System.Runtime.Intrinsics");
+        let row2 = &mb2.assembly_ref[(intrinsics_tok.rid() - 1) as usize];
+        assert_eq!((row2.major, row2.minor, row2.build, row2.revision), expected);
+
+        // `system_runtime_assembly_ref` (used by the ThreadStaticAttribute bootstrap path) is a
+        // separate call site from `find_or_create_assembly_ref` — exercise it directly via a TLS
+        // static field, which routes through `thread_static_attribute` -> `thread_static_ctor_ref`
+        // -> `system_runtime_assembly_ref`.
+        let mut mb3 = MetadataBuilder::new();
+        let field = mb3.add_static_field("TLS", 0, None, true, false);
+        let _ = field;
+        assert_eq!(mb3.assembly_ref.len(), 1, "the TLS path must have created exactly one AssemblyRef");
+        let row3 = &mb3.assembly_ref[0];
+        assert_eq!((row3.major, row3.minor, row3.build, row3.revision), expected);
+    }
+
     #[test]
     fn thread_static_attribute_uses_fixed_blob() {
         let mut mb = MetadataBuilder::new();
-        let field = mb.add_static_field("TLS", 0, None, false);
+        let field = mb.add_static_field("TLS", 0, None, false, false);
         let attr = mb.thread_static_attribute(field);
         assert_eq!(attr.table(), Token::TABLE_CUSTOM_ATTRIBUTE);
         assert_eq!(mb.custom_attribute.len(), 1);
@@ -2505,10 +2654,32 @@ mod tests {
         assert_eq!(&bytes[value_off as usize..value_off as usize + 5], &[4, 0x01, 0x00, 0x00, 0x00]);
     }
 
+    /// `StaticFieldDef::is_const` (Cluster C item 3's `initonly` case) sets `FieldAttributes`
+    /// bit 0x20 (§II.23.1.5 InitOnly) and nothing else — must not be confused with a metadata
+    /// `Constant` row (§II.22.9), which `il_exporter` never emits for these fields either
+    /// (mod.rs:224/328 only ever renders the `initonly` keyword).
+    #[test]
+    fn add_static_field_is_const_sets_initonly_flag_only() {
+        let mut mb = MetadataBuilder::new();
+        let plain = mb.add_static_field("Plain", 0, None, false, false);
+        let konst = mb.add_static_field("Konst", 0, None, false, true);
+
+        let plain_flags = mb.field[(plain.rid() - 1) as usize].flags;
+        let konst_flags = mb.field[(konst.rid() - 1) as usize].flags;
+
+        assert_eq!(plain_flags & 0x20, 0, "non-const static must NOT have InitOnly set");
+        assert_eq!(konst_flags & 0x20, 0x20, "const static must have InitOnly set");
+        // Both still carry the ordinary Public|Static bits — `is_const` only adds InitOnly, it
+        // doesn't replace the base flag set.
+        assert_eq!(plain_flags & (0x1 | 0x10), 0x1 | 0x10);
+        assert_eq!(konst_flags & (0x1 | 0x10), 0x1 | 0x10);
+        assert_eq!(mb.custom_attribute.len(), 0, "is_const must not add any CustomAttribute row");
+    }
+
     #[test]
     fn set_field_rva_materializes_pending_row() {
         let mut mb = MetadataBuilder::new();
-        let field = mb.add_static_field("DATA", 0, Some(vec![1, 2, 3]), false);
+        let field = mb.add_static_field("DATA", 0, Some(vec![1, 2, 3]), false, false);
         assert_eq!(mb.field_rva.len(), 1);
         assert_eq!(mb.field_rva[0].rva, 0);
         mb.set_field_rva(field, 0x2000);
@@ -2581,6 +2752,74 @@ mod tests {
         assert_eq!(mb.class_layout[0].parent, t.rid());
         assert_eq!(mb.class_layout[0].packing_size, 4);
         assert_eq!(mb.class_layout[0].class_size, 16);
+    }
+
+    /// `add_blob_sized_valuetype` — the `__rcl_const_blob_{n}` carrier type a const-data
+    /// `FieldRVA` static needs (Phase 1b Cluster C item 4, lesson 1's blob-sizing rule). Checks
+    /// every column `il_exporter`'s equivalent text (`.class private explicit ansi sealed
+    /// '__rcl_const_blob_{n}' extends [System.Runtime]System.ValueType {{ .pack 1 .size {n} }}`,
+    /// `il_exporter/mod.rs:120`) implies: NotPublic, Sealed, ExplicitLayout flags; a `ClassLayout`
+    /// row with `.pack 1` and `.size` set to the EXACT blob length (not rounded/truncated — the
+    /// whole point of the lesson-1 fix); and `Extends` resolving to whatever `System.ValueType`
+    /// token the caller passes in (this method doesn't create that TypeRef itself — the caller,
+    /// e.g. `export_pe`'s existing `system_runtime_type_ref` helper, is expected to own that, same
+    /// as every other `extends` resolution in this module).
+    #[test]
+    fn add_blob_sized_valuetype_is_private_sealed_explicit_and_exactly_sized() {
+        let mut mb = MetadataBuilder::new();
+        let value_type_ref = mb.type_ref(None, "System", "ValueType");
+
+        let tok = mb.add_blob_sized_valuetype("__rcl_const_blob_37", value_type_ref, 37);
+        assert_eq!(tok.table(), Token::TABLE_TYPE_DEF);
+
+        let row = &mb.type_def[(tok.rid() - 1) as usize];
+        assert_eq!(row.flags & 0x1, 0, "must be NotPublic (0x0), not Public (0x1)");
+        assert_eq!(row.flags & 0x100, 0x100, "Sealed bit must be set");
+        assert_eq!(row.flags & 0x10, 0x10, "ExplicitLayout bit must be set");
+        assert_eq!(
+            row.extends,
+            encode_type_def_or_ref_token(value_type_ref),
+            "Extends must resolve to the caller-supplied System.ValueType TypeRef"
+        );
+
+        assert_eq!(mb.class_layout.len(), 1);
+        assert_eq!(mb.class_layout[0].parent, tok.rid());
+        assert_eq!(mb.class_layout[0].packing_size, 1, ".pack 1, matching il_exporter's literal text");
+        assert_eq!(
+            mb.class_layout[0].class_size, 37,
+            "class size must be the blob's EXACT byte length, per the FieldRVA-sizing lesson \
+             (commit 4b487f7) — a mismatch here is exactly the bug that lesson fixed"
+        );
+
+        let name = reader_strings_at_offset(&mb, row.name);
+        assert_eq!(name, "__rcl_const_blob_37");
+    }
+
+    /// Two distinct blob sizes must land as two distinct `TypeDef`/`ClassLayout` row pairs (each
+    /// `n` needs its own carrier type — `il_exporter` dedups by exact size via a sorted+deduped
+    /// `Vec<usize>` over `asm.const_data.1.keys()`, mod.rs:116-121). This module doesn't dedupe
+    /// internally (the caller is expected to, same as `il_exporter`'s explicit dedup step) — this
+    /// test documents that contract so a future caller doesn't assume dedup happens for free.
+    #[test]
+    fn add_blob_sized_valuetype_does_not_dedupe_distinct_sizes() {
+        let mut mb = MetadataBuilder::new();
+        let value_type_ref = mb.type_ref(None, "System", "ValueType");
+        let a = mb.add_blob_sized_valuetype("__rcl_const_blob_4", value_type_ref, 4);
+        let b = mb.add_blob_sized_valuetype("__rcl_const_blob_8", value_type_ref, 8);
+        assert_ne!(a, b);
+        assert_eq!(mb.class_layout.len(), 2);
+        assert_eq!(mb.class_layout[0].class_size, 4);
+        assert_eq!(mb.class_layout[1].class_size, 8);
+    }
+
+    /// Small helper shared by the two tests above: reads a `#Strings` offset back out via the
+    /// same private `strings_eq`-adjacent access other tests in this module use directly (kept as
+    /// a free fn since it's only needed here).
+    fn reader_strings_at_offset(mb: &MetadataBuilder, off: u32) -> String {
+        let bytes = mb.strings.as_bytes();
+        let start = off as usize;
+        let end = bytes[start..].iter().position(|&b| b == 0).unwrap() + start;
+        std::str::from_utf8(&bytes[start..end]).unwrap().to_string()
     }
 
     #[test]

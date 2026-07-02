@@ -118,7 +118,7 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
             name,
             is_tls,
             default_value,
-            is_const: _,
+            is_const,
         } in class_def.static_fields()
         {
             if default_value.is_some() {
@@ -132,7 +132,7 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
             let mut blob = Vec::new();
             sig::encode_field_sig(*tpe, asm, &mut mb, &mut blob);
             let sig_off = mb.blobs.intern(&blob);
-            mb.add_static_field(&name_str, sig_off, None, *is_tls);
+            mb.add_static_field(&name_str, sig_off, None, *is_tls, *is_const);
         }
     }
 

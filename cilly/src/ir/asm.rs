@@ -2613,6 +2613,18 @@ impl DotnetVersion {
             DotnetVersion::Net9 => "9:0:0:0",
         }
     }
+    /// The same `.ver` triplet as [`DotnetVersion::assembly_ver`], pre-parsed into the
+    /// `(major, minor, build, revision)` tuple shape `pe_exporter`'s raw `AssemblyRefRow` wants
+    /// (§II.22.5 `AssemblyRef` columns `MajorVersion`/`MinorVersion`/`BuildNumber`/`RevisionNumber`,
+    /// each a `u16`). Kept as a thin sibling of the string accessor rather than replacing it, since
+    /// `il_exporter` interpolates the string form directly into `.ver` IL text.
+    #[must_use]
+    pub fn assembly_ver_tuple(self) -> (u16, u16, u16, u16) {
+        match self {
+            DotnetVersion::Net8 => (8, 0, 0, 0),
+            DotnetVersion::Net9 => (9, 0, 0, 0),
+        }
+    }
     /// A `Microsoft.NETCore.App` framework-version floor for `runtimeconfig.json` (`8.0.0` / `9.0.0`),
     /// paired with roll-forward to the latest installed patch.
     #[must_use]
@@ -2674,6 +2686,8 @@ mod dotnet_version_tests {
         assert_eq!(DotnetVersion::Net8.tfm(), "net8.0");
         assert_eq!(DotnetVersion::Net9.assembly_ver(), "9:0:0:0");
         assert_eq!(DotnetVersion::Net9.major(), 9);
+        assert_eq!(DotnetVersion::Net8.assembly_ver_tuple(), (8, 0, 0, 0));
+        assert_eq!(DotnetVersion::Net9.assembly_ver_tuple(), (9, 0, 0, 0));
     }
 }
 
