@@ -1382,6 +1382,22 @@ fn assemble_method_body(
         if let Some(handler) = block.handler() {
             let try_end = emitter.here();
             let handler_start = emitter.here();
+            // §I.12.4.2.5: the CLR pushes the caught exception object onto the (otherwise empty)
+            // eval stack at the start of every catch handler. `CILNode::GetException` is the only
+            // way this IR "names" that object (it emits zero bytes — see `emit_node`'s arm for
+            // it) — a handler that never uses it never consumes the object, so it must be popped
+            // here or every instruction after it runs with the stack one deeper than the JIT's
+            // verifier expects (a corrupted stack depth that surfaces as `InvalidProgramException`
+            // at JIT time, not at write time — the bug has no signal until the method actually
+            // runs). Mirrors `il_exporter`'s identical conditional-`pop` (mod.rs, `export_method_imp`):
+            // "Check for the GetException intrinsic. If it is not used, put a pop here."
+            let uses_get_exception = handler.iter().flat_map(BasicBlock::roots).any(|root| {
+                crate::ir::CILIter::new(emitter.asm[*root].clone(), emitter.asm)
+                    .any(|elem| matches!(elem, crate::ir::CILIterElem::Node(CILNode::GetException)))
+            });
+            if !uses_get_exception {
+                emitter.push_u8(0x26); // pop
+            }
             for hblock in handler {
                 emitter.define_label(Label::HandlerLeave(block.block_id(), hblock.block_id()));
                 for root in hblock.roots() {
@@ -1900,5 +1916,49 @@ mod tests {
         assert!(handler_len > 0, "handler emits pop + leave, so its length must be non-zero");
         let catch_tok = u32::from_le_bytes(body.bytes[clause_off + 20..clause_off + 24].try_into().unwrap());
         assert_eq!(Token(catch_tok).table(), Token::TABLE_TYPE_REF, "System.Object via the stub sink");
+    }
+
+    /// Regression for the `InvalidProgramException` on `main()` bisected from cd_collections
+    /// down to a minimal `Vec::push` + `println!` + `if` program: a catch handler that never
+    /// references `CILNode::GetException` (the common case — most Rust panic/unwind cleanup
+    /// handlers just `leave` without inspecting the exception object) must still have the CLR's
+    /// implicitly-pushed exception object popped off the stack (§I.12.4.2.5), or every
+    /// instruction after the handler runs with the eval stack one slot deeper than the JIT's
+    /// verifier expects — surfacing as `InvalidProgramException` at JIT time (not at write time,
+    /// so it has no signal until the method actually runs). `il_exporter`'s
+    /// `export_method_imp` has the identical conditional (mod.rs: "Check for the GetException
+    /// intrinsic. If it is not used, put a pop here."); `assemble_method_body`'s handler-emission
+    /// loop originally omitted it unconditionally. `bb0 { nop } catch System.Object { leave bb1 }`
+    /// (no `GetException`/`Pop` in the handler at all) must assemble a leading `pop` opcode.
+    #[test]
+    fn handler_without_get_exception_gets_an_implicit_pop() {
+        let mut asm = Assembly::default();
+        let sig = asm.sig([], Type::Void);
+
+        let nop = asm.alloc_root(CILRoot::Nop);
+        let leave = asm.alloc_root(CILRoot::ExitSpecialRegion { target: 1, source: 0 });
+        // No `GetException`/`Pop` anywhere in the handler — this is the common shape (a cleanup
+        // handler that just unwinds further, ignoring the caught exception's value).
+        let handler_block = BB::new(vec![leave], 0, None);
+        let bb0 = BB::new(vec![nop], 0, Some(vec![handler_block]));
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        let bb1 = BB::new(vec![ret], 1, None);
+
+        let method = make_static_method(&mut asm, sig, vec![bb0, bb1], vec![]);
+        let mut sink = StubSink::default();
+        let body = assemble_method(&mut asm, method, &mut sink);
+
+        let code_size = u32::from_le_bytes([body.bytes[4], body.bytes[5], body.bytes[6], body.bytes[7]]) as usize;
+        let code = &body.bytes[12..12 + code_size];
+        // Protected region: one `nop` (1 byte) at code offset 0. The handler starts at offset 1
+        // and — since the handler never names the caught exception — must open with `pop` (0x26)
+        // before its own `leave` (0xDD).
+        assert_eq!(code[0], 0x00, "nop");
+        assert_eq!(
+            code[1], 0x26,
+            "a catch handler that never uses GetException must open with an implicit pop \
+             (§I.12.4.2.5), or the eval stack is left one slot too deep for the rest of the method"
+        );
+        assert_eq!(code[2], 0xDD, "leave");
     }
 }
