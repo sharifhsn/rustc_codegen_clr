@@ -976,9 +976,11 @@ fn debug_directory_region_len(entry: &super::pdb::DebugDirectoryEntry, checksum:
 /// `Some`), followed by their payloads in the same order — each row's `AddressOfRawData`/
 /// `PointerToRawData` point at its own payload placed after ALL the rows (so file-offset and RVA
 /// are always `region_rva`-relative + a fixed row-table length — no separate layout step needed
-/// for either payload). `TimeDateStamp` is written as `0` on every row (determinism — see this
-/// writer's module doc; the RSDS `Age`/GUID and the checksum bytes carry the real content
-/// identity, not this field).
+/// for either payload). `TimeDateStamp` is `0` on the PdbChecksum row, but on the CodeView row it
+/// is `entry.stamp` (`pdb_id[16..20]`) — NOT zero. That field is the SRM match key `PEReader`
+/// pairs with the RSDS GUID to find the PDB (see the in-body comment below), so it must track the
+/// PDB id's content hash; only the row's *presence* is deterministic (content-derived, never
+/// wall-clock), not its value.
 fn write_debug_directory(
     out: &mut Vec<u8>,
     region_rva: u32,

@@ -521,6 +521,8 @@ fn encode_sequence_point_record(
         return;
     }
 
+    let point = widen_degenerate_same_line_span(point);
+    let point = &point;
     validate_visible_sequence_point(point);
 
     let delta_lines = point.end_line - point.line;
@@ -542,6 +544,39 @@ fn encode_sequence_point_record(
         }
     }
     *previous_non_hidden = Some((point.line, point.col));
+}
+
+/// Widens a degenerate same-line, zero-width-column `SequencePoint` (`end_col == col`) to a
+/// 1-column span so it survives [`validate_visible_sequence_point`]'s `end_col > col` check
+/// instead of panicking.
+///
+/// This shape is reachable from real (if rare) input: `span_source_info`
+/// (`src/assembly.rs`) independently clamps `col_start`/`col_end` to `u16::MAX` before computing
+/// `col_len = col_end - col_start`. A same-line span whose start column is already >= 65535
+/// (e.g. from a source line >= 65534 columns wide — minified/generated `.rs`, a giant single-line
+/// const array) clamps BOTH ends to 65535, collapsing `col_len` to 0 even though the ORIGINAL
+/// (unclamped) span was non-empty. Prior to this fix that degenerate point either hit the
+/// `end_col > col` assert (aborting the entire link for one bad span, no `catch_unwind` anywhere
+/// upstream) or — had the assert simply been removed — would have been silently misencoded as a
+/// HIDDEN point (delta_lines == 0 && delta_col == 0 is literally the hidden-point encoding, see
+/// this function's siblings), which is worse: it would silently erase a real, resolvable
+/// source location from the PDB instead of widening it. Widening by growing `end_col` (or, at the
+/// `u16::MAX` ceiling, shrinking `col` instead) keeps the point visible and off-by-at-most-one
+/// column, which is a far better debugging experience than either a full-link abort or a silently
+/// hidden point.
+fn widen_degenerate_same_line_span(point: &SequencePoint) -> SequencePoint {
+    let mut widened = point.clone();
+    if !widened.is_hidden && widened.end_line == widened.line && widened.end_col <= widened.col {
+        if widened.col < u32::from(u16::MAX) {
+            widened.end_col = widened.col + 1;
+        } else {
+            // `col` is already at the u16 ceiling (65535): widen backwards instead, since
+            // `end_col` cannot exceed 65535 either (see `validate_visible_sequence_point`'s
+            // column-range check).
+            widened.col = widened.col.saturating_sub(1);
+        }
+    }
+    widened
 }
 
 fn validate_visible_sequence_point(point: &SequencePoint) {
@@ -1584,6 +1619,84 @@ mod tests {
         let rows = reader.method_rows();
         let (_, decoded) = reader.decode_sequence_points(rows[0], &documents);
         assert_eq!(decoded, stored);
+    }
+
+    /// Regression test for a real bug found in cross-model review: `span_source_info`
+    /// (`src/assembly.rs`) independently clamps `col_start`/`col_end` to `u16::MAX` (65535) before
+    /// computing `col_len = col_end - col_start`. For a same-line span whose start column is
+    /// already >= 65535 (e.g. `cstart=65535, cend=65536`), BOTH clamp to 65535, so `col_len` becomes
+    /// 0 and the resulting `SequencePoint` has `col == end_col` on the same line — exactly the
+    /// degenerate shape `validate_visible_sequence_point` used to `assert!(end_col > col)` against,
+    /// aborting the ENTIRE link with no PDB/PE output for a single degenerate span anywhere in the
+    /// program. `add_method`/`build` must accept this shape (by widening it to a 1-column span, the
+    /// least surprising fix that keeps the point visible instead of silently turning it hidden)
+    /// rather than panicking.
+    #[test]
+    fn add_method_accepts_degenerate_same_line_zero_width_column_span() {
+        let mut builder = PdbBuilder::new(
+            TypeSystemRowCounts { rows: vec![(Token::TABLE_METHOD_DEF, 1)], entry_point_token: 0 },
+            1,
+        );
+        let tok = Token::new(Token::TABLE_METHOD_DEF, 1);
+        // col == end_col == 65535 on the same line: the exact shape produced by clamping
+        // cstart=65535, cend=65536 to u16::MAX in `span_source_info`.
+        let degenerate = sp(0, "a.rs", 10, 65535, 10, 65535);
+        builder.add_method(
+            tok,
+            MethodSequencePoints {
+                local_signature: None,
+                points: vec![degenerate],
+            },
+        );
+
+        // Must not panic, and must still produce a well-formed, decodable blob.
+        let (bytes, _) = builder.build();
+        let reader = TestPdbReader::parse(&bytes);
+        let documents = reader.documents();
+        let rows = reader.method_rows();
+        let (_, decoded) = reader.decode_sequence_points(rows[0], &documents);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].line, 10);
+        assert_eq!(decoded[0].end_line, 10);
+        assert!(
+            decoded[0].end_col > decoded[0].col,
+            "widened to a non-empty column span instead of panicking or silently going hidden: {:?}",
+            decoded[0]
+        );
+        assert!(!decoded[0].is_hidden, "a real span should stay visible, not collapse to hidden");
+        // `col` was already at the u16 ceiling (65535), so the widen must shrink `col` backwards
+        // (not grow `end_col`, which cannot legally exceed 65535 either).
+        assert_eq!(decoded[0].col, 65534);
+        assert_eq!(decoded[0].end_col, 65535);
+    }
+
+    /// Sibling of the above, covering the OTHER branch: when `col` is below the u16 ceiling, the
+    /// widen must grow `end_col` forward instead of touching `col` (matches the span's true start
+    /// position, which is more informative for a debugger than shifting it backwards).
+    #[test]
+    fn add_method_widens_degenerate_span_forward_when_col_is_not_at_the_ceiling() {
+        let mut builder = PdbBuilder::new(
+            TypeSystemRowCounts { rows: vec![(Token::TABLE_METHOD_DEF, 1)], entry_point_token: 0 },
+            1,
+        );
+        let tok = Token::new(Token::TABLE_METHOD_DEF, 1);
+        let degenerate = sp(0, "a.rs", 7, 42, 7, 42);
+        builder.add_method(
+            tok,
+            MethodSequencePoints {
+                local_signature: None,
+                points: vec![degenerate],
+            },
+        );
+
+        let (bytes, _) = builder.build();
+        let reader = TestPdbReader::parse(&bytes);
+        let documents = reader.documents();
+        let rows = reader.method_rows();
+        let (_, decoded) = reader.decode_sequence_points(rows[0], &documents);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].col, 42, "start column left untouched");
+        assert_eq!(decoded[0].end_col, 43, "end column widened forward by one");
     }
 
     #[test]
