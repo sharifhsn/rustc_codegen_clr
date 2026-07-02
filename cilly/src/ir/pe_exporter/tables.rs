@@ -3214,4 +3214,63 @@ mod tests {
         // test above is trimmed during future edits.
         let _ = MethodKind::Static;
     }
+
+    /// Regression for the SIGSEGV-on-first-virtual-dispatch bug found bisecting cd_collections
+    /// under `DIRECT_PE=1`: `add_method`'s `is_ctor` flag is the ONLY thing that sets
+    /// `SpecialName (0x1000) | RTSpecialName (0x0800)` (§II.23.1.10) on a `MethodDef` row. The
+    /// assembly-wide static initializer built by `Assembly::cctor()` (asm.rs) is a
+    /// `MethodKind::Static` method literally named `.cctor` — NOT `MethodKind::Constructor` — so
+    /// a caller that derives `is_ctor` purely from `MethodKind::Constructor` (as `export.rs`'s
+    /// driver originally did) never sets these flags for it. Without `RTSpecialName` the CLR
+    /// loader does not recognize the method as a type initializer and never auto-invokes it
+    /// before first access to the type's static fields — every static/const-data/vtable
+    /// initializer inside `.cctor` (including `dyn Trait` vtable slots, populated by `ldftn`
+    /// writes INSIDE `.cctor`, not `FieldRVA` data) silently never runs, leaving those fields
+    /// zeroed. `il_exporter`'s emitted `.il` text for `.cctor` has no `specialname`/
+    /// `rtspecialname` keywords either (ground-truthed against the actual `.il` ilasm consumes
+    /// for cd_collections) — ilasm auto-recognizes the reserved name `.cctor` and stamps the
+    /// flags in regardless, so a hand-rolled writer must special-case the name explicitly
+    /// (`export.rs`'s `is_ctor` now also checks `name == asm::CCTOR`).
+    #[test]
+    fn add_method_sets_specialname_rtspecialname_for_is_ctor_true() {
+        let mut mb = MetadataBuilder::new();
+        let sig_blob = {
+            let mut out = Vec::new();
+            out.push(sig::SIG_DEFAULT);
+            write_compressed_u32(&mut out, 0);
+            out.push(0x01); // void
+            mb.blobs.intern(&out)
+        };
+        let _t = mb.add_type_def("", "MainModule", false, None, None, None, &[]);
+        // Mirrors `export.rs`'s call for `.cctor`: MethodKind is Static, but the reserved-name
+        // check must still route `is_ctor = true` into `add_method`.
+        let tok = mb.add_method(".cctor", sig_blob, &[], true, false, true, None);
+        let row = &mb.method_def[(tok.rid() - 1) as usize];
+        assert_eq!(
+            row.flags & (0x1000 | 0x0800),
+            0x1000 | 0x0800,
+            ".cctor's MethodDef row must carry SpecialName|RTSpecialName or the CLR will never \
+             auto-invoke it as a type initializer"
+        );
+    }
+
+    #[test]
+    fn add_method_does_not_set_specialname_for_an_ordinary_static_method() {
+        // Negative case: a plain static helper (e.g. `.tcctor`, which this project explicitly
+        // `call`s rather than relying on CLR auto-invocation) must NOT get SpecialName/
+        // RTSpecialName — those flags are reserved for `.cctor`/`.ctor` and setting them on an
+        // arbitrary method would be its own (different) metadata bug.
+        let mut mb = MetadataBuilder::new();
+        let sig_blob = {
+            let mut out = Vec::new();
+            out.push(sig::SIG_DEFAULT);
+            write_compressed_u32(&mut out, 0);
+            out.push(0x01);
+            mb.blobs.intern(&out)
+        };
+        let _t = mb.add_type_def("", "MainModule", false, None, None, None, &[]);
+        let tok = mb.add_method(".tcctor", sig_blob, &[], true, false, false, None);
+        let row = &mb.method_def[(tok.rid() - 1) as usize];
+        assert_eq!(row.flags & (0x1000 | 0x0800), 0);
+    }
 }

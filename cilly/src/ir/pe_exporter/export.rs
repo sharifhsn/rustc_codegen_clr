@@ -353,7 +353,29 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> Vec<u8> {
             let sig = asm[method.sig()].clone();
             let is_static = method.kind() == crate::ir::cilnode::MethodKind::Static;
             let is_virtual = method.kind() == crate::ir::cilnode::MethodKind::Virtual;
-            let is_ctor = method.kind() == crate::ir::cilnode::MethodKind::Constructor;
+            // `SpecialName | RTSpecialName` (§II.22.26, §II.10.5.3) is what makes the CLR loader
+            // recognize a type initializer and run it automatically before first access to any of
+            // the type's static members. `MethodKind::Constructor` (instance `.ctor`) is the usual
+            // source, but the assembly-wide static initializer built by `Assembly::cctor()`
+            // (cilly/src/ir/asm.rs) is a *`MethodKind::Static`* method literally named `.cctor` —
+            // `il_exporter`'s emitted `.il` text for it has NO `specialname`/`rtspecialname`
+            // keywords either (verified against the actual `.il` ilasm consumes), yet the ilasm-built
+            // assembly's `.cctor` carries those flags in its metadata: MS ilasm auto-recognizes the
+            // reserved name `.cctor` (and `.ctor`) and stamps the flags in regardless of what the
+            // source text asked for (ECMA-335 §II.10.5.3 requires this at the class-file-format
+            // level: a type initializer method MUST be `.cctor`/rtspecialname to be auto-invoked; it
+            // is one of the two runtime-reserved names, `.ctor`/`.cctor`). A hand-rolled writer gets
+            // no such assembler-side auto-detection, so it must special-case the reserved name here.
+            // Without this, the CLR never runs `.cctor` (it just looks like an ordinary unreferenced
+            // static method) and every static/const-data/vtable initializer inside it is skipped —
+            // every static field (including `dyn Trait` vtable slots, which are populated by
+            // `ldftn`/`StInd` writes INSIDE `.cctor`, not `FieldRVA` data) stays zeroed, and the
+            // first virtual dispatch through such a vtable calls a null function pointer (SIGSEGV,
+            // no managed exception — this is exactly the residual cd_collections crash: a `blr` to
+            // a zeroed vtable slot loaded from an uninitialized `dyn Trait` fat-pointer vtable
+            // static).
+            let is_ctor = method.kind() == crate::ir::cilnode::MethodKind::Constructor
+                || name == crate::ir::asm::CCTOR;
             let pinvoke_owned = match method.implementation() {
                 crate::ir::MethodImpl::Extern { lib, preserve_errno } => {
                     Some((asm[*lib].to_string(), *preserve_errno))
