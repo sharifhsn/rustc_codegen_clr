@@ -1568,7 +1568,19 @@ impl TypeDefOrRefResolver for MetadataBuilder {
                 let name = &asm[asm_name_id];
                 self.find_or_create_assembly_ref(name)
             });
-            let (namespace, name) = split_namespace(raw_name);
+            // A generic external type's real metadata `Name` carries a `` `N `` arity postfix
+            // (e.g. `Vector128`1`, confirmed against a real CoreCLR System.Runtime.Intrinsics.dll
+            // via `.class extern forwarder System.Runtime.Intrinsics.Vector128`1`) — `il_exporter`
+            // builds the identical string via its own `generic_postfix` (`format!("`{}",
+            // cref.generics().len())`) baked into the quoted IL name that ilasm then parses back
+            // apart itself. This writer has no assembler to do that for it, so the postfix must be
+            // appended by hand before the name is split/interned.
+            let full_name = if class_ref.generics().is_empty() {
+                raw_name.to_string()
+            } else {
+                format!("{raw_name}`{}", class_ref.generics().len())
+            };
+            let (namespace, name) = split_namespace(&full_name);
             self.type_ref(scope, namespace, name)
         };
         self.class_token_cache.insert(cref, tok);
@@ -2637,6 +2649,30 @@ mod tests {
         let tok = decode_type_def_or_ref(coded);
         assert_eq!(tok.table(), Token::TABLE_TYPE_REF);
         assert_eq!(mb.type_ref.len(), 1);
+    }
+
+    #[test]
+    fn generic_external_type_ref_name_carries_the_arity_postfix() {
+        // Real BCL metadata names a generic external type with a `` `N `` arity postfix baked
+        // into the `TypeRef`/`TypeDef` `Name` column itself — confirmed against a real CoreCLR
+        // `System.Runtime.Intrinsics.dll` (`.class extern forwarder
+        // System.Runtime.Intrinsics.Vector128`1`, via `monodis`). `il_exporter` gets this for
+        // free because ilasm parses the postfix back out of the quoted `'Name`1'` text it emits;
+        // this writer has no assembler, so `type_def_or_ref` must append it by hand before
+        // interning/splitting the name, or the TypeRef row resolves to a type that doesn't exist.
+        let mut mb = MetadataBuilder::new();
+        let mut asm = Assembly::default();
+        let open = ClassRef::span(&mut asm, Type::Int(Int::U8));
+
+        let _ = TypeDefOrRefResolver::type_def_or_ref(&mut mb, open, &mut asm);
+
+        assert_eq!(mb.type_ref.len(), 1);
+        let row = &mb.type_ref[0];
+        assert!(mb.strings_eq(row.namespace, "System"));
+        assert!(
+            mb.strings_eq(row.name, "Span`1"),
+            "generic external TypeRef name must carry the `N postfix, matching real BCL metadata"
+        );
     }
 
     #[test]

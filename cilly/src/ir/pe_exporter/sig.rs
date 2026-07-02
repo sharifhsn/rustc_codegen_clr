@@ -148,8 +148,15 @@ pub fn encode_type(
             let sig = asm[sig].clone();
             encode_method_sig(SIG_DEFAULT, 0, &sig, asm, resolver, out);
         }
-        Type::SIMDVector(_) => {
-            todo!("SIMD vector in a PE signature (Phase 1b: resolve to the Vector64/128 ClassRef)")
+        Type::SIMDVector(simdvec) => {
+            // `SIMDVector::class` already builds exactly the `ClassRef` `il_exporter::type_il`'s
+            // `Type::SIMDVector` arm renders textually: a `valuetype` in
+            // `System.Runtime.Intrinsics` named `System.Runtime.Intrinsics.Vector{bits}` with the
+            // scalar element type as its sole generic argument — e.g. `Vector128<int32>`. Routing
+            // it through `encode_class` (the same path `i128`/`u128`/`f16` use) gets the
+            // `GENERICINST`+`VALUETYPE` wrapping and the `TypeDefOrRefResolver` call for free.
+            let cref = simdvec.class(asm);
+            encode_class(cref, /*is_valuetype*/ true, asm, resolver, out);
         }
     }
 }
@@ -297,6 +304,57 @@ mod tests {
             [ET_VALUETYPE, 5],
             "i128 must encode as VALUETYPE System.Int128 via the resolver"
         );
+    }
+
+    #[test]
+    fn simd_vector_lowers_to_intrinsics_generic_valuetype() {
+        // Mirrors il_exporter::type_il's `Type::SIMDVector` arm: `valuetype
+        // [System.Runtime.Intrinsics]System.Runtime.Intrinsics.Vector128`1<int32>` becomes
+        // GENERICINST + VALUETYPE + (coded TypeDefOrRef index) + argc(1) + the element type.
+        use crate::ir::tpe::simd::SIMDVector;
+        let mut asm = Assembly::default();
+        let vec4xi32 = SIMDVector::new(Int::I32.into(), 4); // 4 * 32 = 128 bits
+        assert_eq!(
+            encode(Type::SIMDVector(vec4xi32), &mut asm),
+            [ET_GENERICINST, ET_VALUETYPE, 5, 1, ET_I4],
+            "SIMD vector must encode as GENERICINST VALUETYPE Vector128<int32> via the resolver"
+        );
+
+        // A different element width and lane count still round through the same shape (256-bit,
+        // f64 elements) — this also exercises the arity-postfix fix in
+        // `MetadataBuilder::type_def_or_ref` end-to-end for a *second* distinct generic external
+        // ClassRef (name differs per `bits()`, so it must not collide with the 128-bit case above
+        // in the resolver's cache).
+        let vec4xf64 = SIMDVector::new(Float::F64.into(), 4); // 4 * 64 = 256 bits
+        assert_eq!(
+            encode(Type::SIMDVector(vec4xf64), &mut asm),
+            [ET_GENERICINST, ET_VALUETYPE, 5, 1, ET_R8]
+        );
+    }
+
+    #[test]
+    fn simd_vector_resolver_uses_the_real_metadata_builder() {
+        // End-to-end through the real MetadataBuilder resolver (not the StubResolver): confirms
+        // encode_type actually drives `type_def_or_ref` (a live TypeRef row, not a stub), and
+        // that resolving the same (open) ClassRef a second time reuses the cached row instead of
+        // minting a fresh one — the two encodings must be byte-for-byte identical. The emitted
+        // row's exact `Vector128`1`/`System.Runtime.Intrinsics` name+namespace (and the
+        // arity-postfix fix that makes that possible) is covered by
+        // `tables::tests::generic_external_type_ref_name_carries_the_arity_postfix`, which has
+        // visibility into MetadataBuilder's private row storage.
+        use super::super::tables::MetadataBuilder;
+        use crate::ir::tpe::simd::SIMDVector;
+        let mut asm = Assembly::default();
+        let mut mb = MetadataBuilder::new();
+        let vec2xi64 = SIMDVector::new(Int::I64.into(), 2); // 2 * 64 = 128 bits
+
+        let mut first = Vec::new();
+        encode_type(Type::SIMDVector(vec2xi64), &mut asm, &mut mb, &mut first);
+        assert_eq!(first[..2], [ET_GENERICINST, ET_VALUETYPE]);
+
+        let mut second = Vec::new();
+        encode_type(Type::SIMDVector(vec2xi64), &mut asm, &mut mb, &mut second);
+        assert_eq!(first, second, "the resolver's cache must dedupe the repeat lookup");
     }
 
     #[test]
