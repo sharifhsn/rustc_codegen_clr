@@ -75,10 +75,10 @@ run on the **real .NET backend**, `CARGO_DOTNET_BACKEND=native`) and/or the Dock
 
 **Correctness tails.** `overflow-checks=true` build-std ICE (pre-existing, deferred); the
 `adt.rs` field-offset `u16::MAX` clamp (latent, no observed repro); sub-word-atomic page-boundary
-hazard on .NET 8 (eliminated on .NET 9 via native `Interlocked` overloads); the Rust-atomic-ordering →
-`Interlocked`/`Volatile` **memory-model audit has never been done** (real threads + ARM64 make this the
-one place a latent soundness gap could still hide); `ilverify` as an independent oracle (reports ~34k
-intentional-unsafe-IL idioms; needs a triage layer).
+hazard on .NET 8 (eliminated on .NET 9 via native `Interlocked` overloads); `ilverify` as an
+independent oracle (reports ~34k intentional-unsafe-IL idioms; needs a triage layer). The
+Rust-atomic-ordering → `Interlocked`/`Volatile` memory-model audit is **done** (d874a84, see
+below) — one residual is now known and deferred rather than latent-unknown.
 
 **PAL tails.** `hard_link`; TLS drop-destructors (leak-on-exit); `timerfd`-over-loopback (unblocks
 smol); fd-backed `File` for `switch_stdout`; signals beyond INT/TERM/HUP/QUIT (wall); synthetic pids;
@@ -89,9 +89,24 @@ fidelity, real signal delivery, f128 on .NET, …).
 `#[dotnet_class]` **virtual-method overrides** (interfaces are done); exporting Rust traits as C#
 interfaces; `IEnumerable<T>` over `RustVec`; `cargo dotnet publish --aot` as a subcommand.
 
-**Performance.** The measured **7.9× allocation floor** (`NativeMemory` malloc vs gen0 bump
-allocation) — candidate fix: a pooled/arena allocator over pinned .NET memory (unattempted); EH
-cleanup-block bloat under `panic=unwind` (~2× on unwind-heavy code; `NO_UNWIND` exists).
+**Performance.** The `NativeMemory` malloc vs gen0-bump allocation-model gap was re-measured and
+is smaller than previously documented: the malloc/free floor itself is 28–34 ns/op (§3 of
+`PERF_GUIDANCE.md`), and on the target `bench_rs_vs_cs` alloc-churn workload the measured gap to
+C# is **1.9×**, not the previously-cited 7.9× (that figure was stale). A size-classed pool
+allocator (`POOL_ALLOC=1`, opt-in) was built and benchmarked to close it — see *Performance
+findings* below; verdict **PARKED-NEGATIVE**, left off by default. EH cleanup-block bloat under
+`panic=unwind` (~2× on unwind-heavy code; `NO_UNWIND` exists) is unchanged.
+
+**Memory-model soundness.** The Rust-atomic-ordering → `Interlocked`/`Volatile` lowering audit
+(deferred big bet, now closed) found and fixed two real cells weaker than Rust's memory model
+requires — `atomic_load` (missing the `volatile.` acquire-fence prefix entirely) and
+`atomic_store` (missing the trailing full fence `SeqCst` needs to forbid StoreLoad reordering) —
+plus an independent optimizer soundness gap (two V2 peephole folds silently dropped the
+`volatile` flag on local-address accesses). All three fixed; verified with litmus-testing on
+real weak-memory ARM64 hardware, native-calibrated, zero violations across 3×300,000-iteration
+backend runs plus a fuller MP/SB/LB/IRIW sweep. One known-unsound residual was surfaced (not
+introduced) and is explicitly deferred: `AtomicU8`/`AtomicBool::swap` races on .NET 8 (fixed on
+.NET 9). Full accounting, ECMA-335 citations, and calibration caveats: `docs/MEMORY_MODEL.md`.
 
 **Exporters.** IL: production (ilasm path, now the fallback). C: ~80% prototype (33 cold-path
 `todo!`). JVM: skeleton. **Direct PE writer** (`cilly::ir::pe_exporter`, no ilasm): **Phase 1
@@ -130,6 +145,10 @@ debugging) remain a documented stretch item; a manual VS Code step-through has n
    breakpoints/stepping session (mechanism should work — sequence points are the same primitive —
    but nobody has clicked through it yet), and LocalScope/LocalVariable tables for local-variable-
    name inspection while stepping.
-4. **Deferred big bets** — pooled allocator vs the 7.9× alloc floor; memory-model litmus audit;
-   upstreaming universal fixes to FractalFir; a tier-3 `*-unknown-dotnet` rustc target as the long-game
-   end state.
+4. **Deferred big bets — both closed this campaign.** Memory-model litmus audit: **done**, two real
+   fence-soundness bugs found and fixed (d874a84), documented in `docs/MEMORY_MODEL.md`. Pooled
+   allocator vs the alloc-model gap: **built, measured, PARKED-NEGATIVE** (0610062, 89be4cc) — ~1.03×
+   on target workloads, short of the pre-committed 1.5× bar, because the malloc/free floor it targets
+   is only ~3% of total per-iteration time; documented in `docs/PERF_GUIDANCE.md` §6. Remaining:
+   upstreaming universal fixes to FractalFir; a tier-3 `*-unknown-dotnet` rustc target as the
+   long-game end state.

@@ -215,4 +215,30 @@ throughput vs C# is not where this backend competes today.
   assembly `System.Private.CoreLib` (System.Runtime → runtime `TypeLoadException`); exporter normalizes
   for C#-visible metadata only. Deferred: TLS-drop destructors (leak-on-exit), Condvar/RwLock/Once/
   Parker still no_threads, the `target-family=unix` flip (separate).
+- **Memory-model audit (deferred big bet)** — DONE, commit `d874a84` (+ review-fix follow-up
+  `9ea05cc`). Found and fixed two real lowering cells weaker than Rust's memory model requires:
+  `atomic_load` was a plain `ldind` (no acquire fence at all — real violation on weak-memory
+  ARM64, confirmed on this machine), and `atomic_store` was missing the trailing full fence
+  `SeqCst` needs to forbid StoreLoad reordering. Also fixed an independent optimizer soundness gap
+  (two V2 peephole folds in `cilly/src/ir/opt/` silently dropped the `volatile` flag on
+  local-address folds). Verified via two litmus harnesses (`cargo_tests/mp_litmus_probe`,
+  `cargo_tests/pal_litmus`), native-calibrated, zero violations across backend runs. Surfaced one
+  pre-existing known-unsound residual (`AtomicU8`/`AtomicBool::swap` lost-update race on .NET 8,
+  fixed on .NET 9) as reachable from safe stable Rust — explicitly deferred, not silently dropped.
+  The follow-up commit corrected an overclaimed ECMA-335 citation (the SeqCst total-order half
+  rests on CoreCLR's documented guarantee, not spec text alone) and added per-shape calibration
+  caveats. `cargo test -p cilly --lib` 186/186 throughout. Full accounting:
+  `docs/MEMORY_MODEL.md`.
+- **Pooled allocator (deferred big bet)** — PARKED-NEGATIVE, commits `0610062` (build) + `89be4cc`
+  (verdict). A size-classed free-list pool allocator (`POOL_ALLOC=1`, opt-in, off by default) was
+  built and benchmarked against the target `bench_rs_vs_cs` alloc-churn workloads. Two independent
+  interleaved A/B/C rounds both land at ~1.03× median speedup — short of the pre-committed 1.5×
+  default-on bar. Decomposition shows why: the pool saves ~24.5 ns/iter against a measured
+  `NativeMemory.Alloc`/`Free` floor of 28–34 ns for the same op pair — it's already capturing
+  essentially the whole addressable allocation-model cost, but that cost is only ~3% of total
+  per-iteration time. Correction along the way: the prior "7.9× allocation floor" figure was
+  stale; the actual measured gap on this workload is 1.9×. Correctness clean throughout
+  (`cargo test -p cilly --lib` 186/186; `pal_allocstress` + `cd_collections` green under the
+  flag) — parked purely on magnitude, code stays in the tree as a tested opt-in. Full accounting:
+  `docs/PERF_GUIDANCE.md` §6.
 - Branch `gaps-campaign` (off `main` = pushed Tier-2 state); pushed to `mine/gaps-campaign`.
