@@ -1,104 +1,130 @@
 # pal_litmus results
 
-`pal_litmus` is the campaign's canonical weak-memory litmus harness: MP (message passing), SB
-(store buffering), LB (load buffering), and IRIW (4-thread independent reads), each parameterized
-by `std::sync::atomic::Ordering`, plus a `Relaxed` sensitivity-control variant of MP/SB/LB used to
-confirm the harness can actually observe hardware reordering on this machine before trusting a
-clean (zero-violation) result under stronger orderings.
+`pal_litmus` is a weak-memory litmus harness for MP, SB, LB, and IRIW using real
+`std::thread` worker threads. Each test resets its atomics before every iteration and uses
+`std::sync::Barrier` synchronization for the per-iteration start and finish rendezvous.
 
-Methodology: real `std::thread` parallelism, persistent worker threads (not spawned per iteration)
-synchronized every round via a reusable `std::sync::Barrier`, ≥1,000,000 iterations per test per
-run, ≥3 process-level runs per side, machine-parseable `RESULT ...` lines.
+The first backend smoke found that using the same `Barrier` object for both start and finish could
+hang on the backend after the first iteration. The committed harness uses two reusable barriers per
+test, one for start and one for finish. This still uses `std::sync::Barrier` for synchronization and
+keeps persistent worker threads instead of spawning per iteration.
 
-**Interpretation rule**: on the backend, outcomes Rust forbids under the tested ordering (MP
-Release/Acquire stale-data read, SB SeqCst both-zero, LB SeqCst both-one, IRIW SeqCst disagreeing
-orders) must be zero across all runs. `Relaxed`-control reorderings are allowed on the backend
-(stronger-than-required is fine) and are reported, not flagged.
+Methodology for the table below:
 
-## Native (oracle) — 3 runs × 1,000,000 iterations, this machine (macOS ARM64 / Apple Silicon)
+- 1,000,000 iterations per test per process.
+- 3 process-level runs per side.
+- Native oracle command: `cargo +nightly-2026-06-17 run --release -- --iterations 1000000`.
+- Backend command: `cargo-dotnet dotnet run -- --iterations 1000000` with
+  `CARGO_DOTNET_BACKEND=native`, `DOTNET_ROOT=$HOME/.dotnet`, and the nightly toolchain on `PATH`.
+- In this sandbox, backend runs used a writable copy-on-write sysroot under `/private/tmp` plus a
+  writable `CARGO_HOME` overlay, because `cargo-dotnet` injects the dotnet PAL into rust-src and the
+  real `~/.rustup` sysroot was read-only to the command sandbox.
 
-| Run | MP Relaxed viol (control) | MP Rel/Acq viol (forbidden) | SB Relaxed both-zero (control) | SB SeqCst both-zero (forbidden) | LB Relaxed both-one (control) | LB SeqCst both-one (forbidden) | IRIW SeqCst disagree (forbidden) |
-|---|---|---|---|---|---|---|---|
-| 1 | 0 / 498,767 observed | 0 / 499,683 observed | 55 | 0 | 0 | 0 | 0 / 249,564 observed |
-| 2 | 0 / 500,144 observed | 0 / 499,117 observed | 40 | 0 | 0 | 0 | 0 / 250,365 observed |
-| 3 | 1 / 500,383 observed | 0 / 497,818 observed | 43 | 0 | 0 | 0 | 0 / 251,752 observed |
+## Summary
 
-**Calibration gate: PASSED.** Every run's SB-Relaxed control showed real StoreLoad reorderings
-(40–55 out of 1,000,000, consistent order of magnitude across all 3 runs), and run 3's MP-Relaxed
-control additionally showed a real stale-data reordering (1/500,383 races where the flag was
-observed set). This confirms the harness's race window is tight enough to observe genuine ARM64
-weak-memory behavior, and that native Rust correctly forbids these outcomes once the ordering is
-strengthened to Release/Acquire or SeqCst (0 violations for every forbidden column, every run, as
-required by the Rust memory model). LB's `Relaxed` control did not show a reordering in these 3
-runs at this iteration count — LB is the hardest classic shape to trigger even on real weak-memory
-hardware (it requires a same-cycle load-then-store dependency to race just right); this is reported
-honestly as a non-trigger rather than treated as a calibration failure, since MP and SB already
-independently establish the harness is sensitive.
+Calibration gate: **PASSED**. Native relaxed controls produced 77 reorderings total:
 
-Raw `RESULT` lines (run 1):
+- MP Relaxed stale-data control: 0 total.
+- SB Relaxed both-zero control: 14 + 51 + 12 = 77 total.
+- LB Relaxed both-one control: 0 total.
+
+Backend forbidden outcomes were zero in all runs:
+
+- MP Release/Acquire stale data: 0 total.
+- SB SeqCst both-zero: 0 total.
+- LB SeqCst both-one: 0 total.
+- IRIW SeqCst disagreement: 0 total.
+
+Backend relaxed controls also reported zero reorderings. That is allowed by the interpretation rule;
+it is a stronger-than-required/null observation, not a failure.
+
+## Comparison table
+
+Violation counts are shown as `violations / observed` for MP and IRIW, where the interesting
+observation count is smaller than the iteration count. SB and LB are shown as violations out of
+1,000,000 iterations.
+
+| Side | Run | MP Relaxed control | MP Release/Acquire forbidden | SB Relaxed control | SB SeqCst forbidden | LB Relaxed control | LB SeqCst forbidden | IRIW SeqCst forbidden |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| native | 1 | 0 / 500,952 | 0 / 503,138 | 14 | 0 | 0 | 0 | 0 / 245,882 |
+| native | 2 | 0 / 499,811 | 0 / 502,319 | 51 | 0 | 0 | 0 | 0 / 246,275 |
+| native | 3 | 0 / 500,737 | 0 / 498,799 | 12 | 0 | 0 | 0 | 0 / 249,532 |
+| backend | 1 | 0 / 497,462 | 0 / 519,078 | 0 | 0 | 0 | 0 | 0 / 250,859 |
+| backend | 2 | 0 / 509,751 | 0 / 508,109 | 0 | 0 | 0 | 0 | 0 / 251,455 |
+| backend | 3 | 0 / 497,687 | 0 / 497,272 | 0 | 0 | 0 | 0 | 0 / 251,740 |
+
+## Native raw output
+
+Run 1:
+
+```text
+RESULT name=MP ordering=Relaxed forbidden="flag=1,data=0 allowed control" iterations=1000000 violations=0 observed=500952 elapsed_ms=12160
+RESULT name=MP ordering=Release/Acquire forbidden="flag=1,data=0" iterations=1000000 violations=0 observed=503138 elapsed_ms=12209
+RESULT name=SB ordering=Relaxed forbidden="r1=0,r2=0 allowed control" iterations=1000000 violations=14 observed=1000000 elapsed_ms=12101
+RESULT name=SB ordering=SeqCst forbidden="r1=0,r2=0" iterations=1000000 violations=0 observed=1000000 elapsed_ms=12193
+RESULT name=LB ordering=Relaxed forbidden="r1=1,r2=1 allowed" iterations=1000000 violations=0 observed=1000000 elapsed_ms=12060
+RESULT name=LB ordering=SeqCst forbidden="r1=1,r2=1" iterations=1000000 violations=0 observed=1000000 elapsed_ms=12033
+RESULT name=IRIW ordering=SeqCst forbidden="xy=1,0 and yx=1,0" iterations=1000000 violations=0 observed=245882 elapsed_ms=23739
 ```
-RESULT name=MP ordering=Relaxed forbidden="flag=1,data=0 allowed control" iterations=1000000 violations=0 observed=498767 elapsed_ms=12210
-RESULT name=MP ordering=Release/Acquire forbidden="flag=1,data=0" iterations=1000000 violations=0 observed=499683 elapsed_ms=11918
-RESULT name=SB ordering=Relaxed forbidden="r1=0,r2=0 allowed control" iterations=1000000 violations=55 observed=1000000 elapsed_ms=12687
-RESULT name=SB ordering=SeqCst forbidden="r1=0,r2=0" iterations=1000000 violations=0 observed=1000000 elapsed_ms=14179
-RESULT name=LB ordering=Relaxed forbidden="r1=1,r2=1 allowed" iterations=1000000 violations=0 observed=1000000 elapsed_ms=12942
-RESULT name=LB ordering=SeqCst forbidden="r1=1,r2=1" iterations=1000000 violations=0 observed=1000000 elapsed_ms=12192
-RESULT name=IRIW ordering=SeqCst forbidden="xy=1,0 and yx=1,0" iterations=1000000 violations=0 observed=249564 elapsed_ms=27484
-```
-Raw `RESULT` lines (run 2):
-```
-RESULT name=MP ordering=Relaxed forbidden="flag=1,data=0 allowed control" iterations=1000000 violations=0 observed=500144 elapsed_ms=11871
-RESULT name=MP ordering=Release/Acquire forbidden="flag=1,data=0" iterations=1000000 violations=0 observed=499117 elapsed_ms=11945
-RESULT name=SB ordering=Relaxed forbidden="r1=0,r2=0 allowed control" iterations=1000000 violations=40 observed=1000000 elapsed_ms=15939
-RESULT name=SB ordering=SeqCst forbidden="r1=0,r2=0" iterations=1000000 violations=0 observed=1000000 elapsed_ms=18187
-RESULT name=LB ordering=Relaxed forbidden="r1=1,r2=1 allowed" iterations=1000000 violations=0 observed=1000000 elapsed_ms=17692
-RESULT name=LB ordering=SeqCst forbidden="r1=1,r2=1" iterations=1000000 violations=0 observed=1000000 elapsed_ms=18233
-RESULT name=IRIW ordering=SeqCst forbidden="xy=1,0 and yx=1,0" iterations=1000000 violations=0 observed=250365 elapsed_ms=36810
-```
-Raw `RESULT` lines (run 3):
-```
-RESULT name=MP ordering=Relaxed forbidden="flag=1,data=0 allowed control" iterations=1000000 violations=1 observed=500383 elapsed_ms=13060
-RESULT name=MP ordering=Release/Acquire forbidden="flag=1,data=0" iterations=1000000 violations=0 observed=497818 elapsed_ms=12268
-RESULT name=SB ordering=Relaxed forbidden="r1=0,r2=0 allowed control" iterations=1000000 violations=43 observed=1000000 elapsed_ms=14840
-RESULT name=SB ordering=SeqCst forbidden="r1=0,r2=0" iterations=1000000 violations=0 observed=1000000 elapsed_ms=17666
-RESULT name=LB ordering=Relaxed forbidden="r1=1,r2=1 allowed" iterations=1000000 violations=0 observed=1000000 elapsed_ms=17442
-RESULT name=LB ordering=SeqCst forbidden="r1=1,r2=1" iterations=1000000 violations=0 observed=1000000 elapsed_ms=17514
-RESULT name=IRIW ordering=SeqCst forbidden="xy=1,0 and yx=1,0" iterations=1000000 violations=0 observed=251752 elapsed_ms=33968
+
+Run 2:
+
+```text
+RESULT name=MP ordering=Relaxed forbidden="flag=1,data=0 allowed control" iterations=1000000 violations=0 observed=499811 elapsed_ms=12856
+RESULT name=MP ordering=Release/Acquire forbidden="flag=1,data=0" iterations=1000000 violations=0 observed=502319 elapsed_ms=12528
+RESULT name=SB ordering=Relaxed forbidden="r1=0,r2=0 allowed control" iterations=1000000 violations=51 observed=1000000 elapsed_ms=12416
+RESULT name=SB ordering=SeqCst forbidden="r1=0,r2=0" iterations=1000000 violations=0 observed=1000000 elapsed_ms=12413
+RESULT name=LB ordering=Relaxed forbidden="r1=1,r2=1 allowed" iterations=1000000 violations=0 observed=1000000 elapsed_ms=12009
+RESULT name=LB ordering=SeqCst forbidden="r1=1,r2=1" iterations=1000000 violations=0 observed=1000000 elapsed_ms=12123
+RESULT name=IRIW ordering=SeqCst forbidden="xy=1,0 and yx=1,0" iterations=1000000 violations=0 observed=246275 elapsed_ms=24335
 ```
 
-## Backend — status: NOT COMPLETED for this harness
+Run 3:
 
-The backend (`.NET`/CoreCLR via `cargo-dotnet`) run of `pal_litmus` itself did not finish inside
-this task's time budget. The process building/running it hit a sandbox-specific obstacle (its
-execution sandbox had `~/.rustup` mounted read-only, which `cargo-dotnet`'s dotnet-PAL injection
-step needs to write to) and spent its budget building a writable toolchain-copy workaround rather
-than completing the actual litmus runs. This is a tooling/sandboxing issue in that specific
-execution environment, not a finding about the backend's atomics lowering, and no backend numbers
-for `pal_litmus`'s MP/SB/LB/IRIW shapes are fabricated or estimated here.
+```text
+RESULT name=MP ordering=Relaxed forbidden="flag=1,data=0 allowed control" iterations=1000000 violations=0 observed=500737 elapsed_ms=12122
+RESULT name=MP ordering=Release/Acquire forbidden="flag=1,data=0" iterations=1000000 violations=0 observed=498799 elapsed_ms=12155
+RESULT name=SB ordering=Relaxed forbidden="r1=0,r2=0 allowed control" iterations=1000000 violations=12 observed=1000000 elapsed_ms=12195
+RESULT name=SB ordering=SeqCst forbidden="r1=0,r2=0" iterations=1000000 violations=0 observed=1000000 elapsed_ms=12181
+RESULT name=LB ordering=Relaxed forbidden="r1=1,r2=1 allowed" iterations=1000000 violations=0 observed=1000000 elapsed_ms=12062
+RESULT name=LB ordering=SeqCst forbidden="r1=1,r2=1" iterations=1000000 violations=0 observed=1000000 elapsed_ms=12149
+RESULT name=IRIW ordering=SeqCst forbidden="xy=1,0 and yx=1,0" iterations=1000000 violations=0 observed=249532 elapsed_ms=23844
+```
 
-**What is empirically confirmed instead**: a second, independently-built litmus probe covering the
-two shapes most directly implicated by the atomic-lowering analysis (MP Release/Acquire, which
-targets the `atomic_load` fix, and SB SeqCst, which targets the `atomic_store` fix) — designed the
-same way (persistent threads, reusable `Barrier`, native-calibrated) — was run directly with full
-filesystem access (no sandbox obstacle) and produced a real, clean, 3-run backend result. See
-`docs/MEMORY_MODEL.md` §5.2–5.3 for that harness's design and full data:
+## Backend raw output
 
-- Native calibration: MP-Relaxed control 1 violation / 151,065 observed; SB-Relaxed control 1
-  both-zero — harness confirmed sensitive.
-- Backend, 3 runs × 300,000 iterations: **MP Release/Acquire violations = 0, SB SeqCst
-  both-zero = 0, all 3 runs** — matching the native oracle's zero-violation result for those
-  forbidden outcomes.
+Run 1:
 
-`pal_litmus`'s LB and IRIW shapes were **not** empirically run on the backend by either harness.
-Per the code-level ECMA-335 soundness argument in `docs/MEMORY_MODEL.md` §3–4, both are expected to
-inherit the same fix (LB's SeqCst shape depends on the same load-not-hoisted-above-local-store
-property the `atomic_load` fix provides; IRIW built from plain SeqCst loads depends on the same
-property, and IRIW built from RMW-observing reads was already sound via `Interlocked`), but this
-expectation is explicitly flagged as **unconfirmed by direct measurement**, not claimed as tested.
+```text
+RESULT name=MP ordering=Relaxed forbidden="flag=1,data=0 allowed control" iterations=1000000 violations=0 observed=497462 elapsed_ms=4907
+RESULT name=MP ordering=Release/Acquire forbidden="flag=1,data=0" iterations=1000000 violations=0 observed=519078 elapsed_ms=5543
+RESULT name=SB ordering=Relaxed forbidden="r1=0,r2=0 allowed control" iterations=1000000 violations=0 observed=1000000 elapsed_ms=5985
+RESULT name=SB ordering=SeqCst forbidden="r1=0,r2=0" iterations=1000000 violations=0 observed=1000000 elapsed_ms=6342
+RESULT name=LB ordering=Relaxed forbidden="r1=1,r2=1 allowed" iterations=1000000 violations=0 observed=1000000 elapsed_ms=4702
+RESULT name=LB ordering=SeqCst forbidden="r1=1,r2=1" iterations=1000000 violations=0 observed=1000000 elapsed_ms=5528
+RESULT name=IRIW ordering=SeqCst forbidden="xy=1,0 and yx=1,0" iterations=1000000 violations=0 observed=250859 elapsed_ms=15469
+```
 
-This harness (`cargo_tests/pal_litmus`) is committed as-is so a future session with unrestricted
-filesystem access to `~/.rustup` can complete its backend run (`CARGO_DOTNET_BACKEND=native
-DOTNET_ROOT=$HOME/.dotnet PATH="$HOME/.rustup/toolchains/nightly-2026-06-17-aarch64-apple-darwin/bin:$PATH"
-/Users/sharif/Code/rustc_codegen_clr/tools/cargo-dotnet/target/release/cargo-dotnet dotnet run --
---iterations 1000000`, 3×) to close LB/IRIW empirically and cross-check MP/SB against this fuller
-harness's own numbers.
+Run 2:
+
+```text
+RESULT name=MP ordering=Relaxed forbidden="flag=1,data=0 allowed control" iterations=1000000 violations=0 observed=509751 elapsed_ms=4328
+RESULT name=MP ordering=Release/Acquire forbidden="flag=1,data=0" iterations=1000000 violations=0 observed=508109 elapsed_ms=4877
+RESULT name=SB ordering=Relaxed forbidden="r1=0,r2=0 allowed control" iterations=1000000 violations=0 observed=1000000 elapsed_ms=4378
+RESULT name=SB ordering=SeqCst forbidden="r1=0,r2=0" iterations=1000000 violations=0 observed=1000000 elapsed_ms=4804
+RESULT name=LB ordering=Relaxed forbidden="r1=1,r2=1 allowed" iterations=1000000 violations=0 observed=1000000 elapsed_ms=3967
+RESULT name=LB ordering=SeqCst forbidden="r1=1,r2=1" iterations=1000000 violations=0 observed=1000000 elapsed_ms=4723
+RESULT name=IRIW ordering=SeqCst forbidden="xy=1,0 and yx=1,0" iterations=1000000 violations=0 observed=251455 elapsed_ms=14503
+```
+
+Run 3:
+
+```text
+RESULT name=MP ordering=Relaxed forbidden="flag=1,data=0 allowed control" iterations=1000000 violations=0 observed=497687 elapsed_ms=5055
+RESULT name=MP ordering=Release/Acquire forbidden="flag=1,data=0" iterations=1000000 violations=0 observed=497272 elapsed_ms=5593
+RESULT name=SB ordering=Relaxed forbidden="r1=0,r2=0 allowed control" iterations=1000000 violations=0 observed=1000000 elapsed_ms=2963
+RESULT name=SB ordering=SeqCst forbidden="r1=0,r2=0" iterations=1000000 violations=0 observed=1000000 elapsed_ms=5087
+RESULT name=LB ordering=Relaxed forbidden="r1=1,r2=1 allowed" iterations=1000000 violations=0 observed=1000000 elapsed_ms=2833
+RESULT name=LB ordering=SeqCst forbidden="r1=1,r2=1" iterations=1000000 violations=0 observed=1000000 elapsed_ms=4316
+RESULT name=IRIW ordering=SeqCst forbidden="xy=1,0 and yx=1,0" iterations=1000000 violations=0 observed=251740 elapsed_ms=15053
+```

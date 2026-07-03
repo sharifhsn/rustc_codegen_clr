@@ -78,18 +78,20 @@ fn run_mp(iterations: usize, flag_store: Ordering, flag_load: Ordering) -> Count
     let flag = Arc::new(AtomicUsize::new(0));
     let r_flag = Arc::new(AtomicUsize::new(usize::MAX));
     let r_data = Arc::new(AtomicUsize::new(usize::MAX));
-    let barrier = Arc::new(Barrier::new(3));
+    let start_barrier = Arc::new(Barrier::new(3));
+    let end_barrier = Arc::new(Barrier::new(3));
 
     let t0 = {
         let data = Arc::clone(&data);
         let flag = Arc::clone(&flag);
-        let barrier = Arc::clone(&barrier);
+        let start_barrier = Arc::clone(&start_barrier);
+        let end_barrier = Arc::clone(&end_barrier);
         thread::spawn(move || {
             for _ in 0..iterations {
-                barrier.wait();
+                start_barrier.wait();
                 data.store(1, Ordering::Relaxed);
                 flag.store(1, flag_store);
-                barrier.wait();
+                end_barrier.wait();
             }
         })
     };
@@ -99,15 +101,16 @@ fn run_mp(iterations: usize, flag_store: Ordering, flag_load: Ordering) -> Count
         let flag = Arc::clone(&flag);
         let r_flag = Arc::clone(&r_flag);
         let r_data = Arc::clone(&r_data);
-        let barrier = Arc::clone(&barrier);
+        let start_barrier = Arc::clone(&start_barrier);
+        let end_barrier = Arc::clone(&end_barrier);
         thread::spawn(move || {
             for _ in 0..iterations {
-                barrier.wait();
+                start_barrier.wait();
                 let seen_flag = flag.load(flag_load);
                 let seen_data = data.load(Ordering::Relaxed);
                 r_flag.store(seen_flag, Ordering::Relaxed);
                 r_data.store(seen_data, Ordering::Relaxed);
-                barrier.wait();
+                end_barrier.wait();
             }
         })
     };
@@ -119,8 +122,8 @@ fn run_mp(iterations: usize, flag_store: Ordering, flag_load: Ordering) -> Count
         flag.store(0, Ordering::Relaxed);
         r_flag.store(usize::MAX, Ordering::Relaxed);
         r_data.store(usize::MAX, Ordering::Relaxed);
-        barrier.wait();
-        barrier.wait();
+        start_barrier.wait();
+        end_barrier.wait();
 
         let seen_flag = r_flag.load(Ordering::Relaxed);
         let seen_data = r_data.load(Ordering::Relaxed);
@@ -142,20 +145,22 @@ fn run_sb(iterations: usize, ordering: Ordering) -> Counts {
     let y = Arc::new(AtomicUsize::new(0));
     let r1 = Arc::new(AtomicUsize::new(usize::MAX));
     let r2 = Arc::new(AtomicUsize::new(usize::MAX));
-    let barrier = Arc::new(Barrier::new(3));
+    let start_barrier = Arc::new(Barrier::new(3));
+    let end_barrier = Arc::new(Barrier::new(3));
 
     let t0 = {
         let x = Arc::clone(&x);
         let y = Arc::clone(&y);
         let r1 = Arc::clone(&r1);
-        let barrier = Arc::clone(&barrier);
+        let start_barrier = Arc::clone(&start_barrier);
+        let end_barrier = Arc::clone(&end_barrier);
         thread::spawn(move || {
             for _ in 0..iterations {
-                barrier.wait();
+                start_barrier.wait();
                 x.store(1, ordering);
                 let seen = y.load(ordering);
                 r1.store(seen, Ordering::Relaxed);
-                barrier.wait();
+                end_barrier.wait();
             }
         })
     };
@@ -164,14 +169,15 @@ fn run_sb(iterations: usize, ordering: Ordering) -> Counts {
         let x = Arc::clone(&x);
         let y = Arc::clone(&y);
         let r2 = Arc::clone(&r2);
-        let barrier = Arc::clone(&barrier);
+        let start_barrier = Arc::clone(&start_barrier);
+        let end_barrier = Arc::clone(&end_barrier);
         thread::spawn(move || {
             for _ in 0..iterations {
-                barrier.wait();
+                start_barrier.wait();
                 y.store(1, ordering);
                 let seen = x.load(ordering);
                 r2.store(seen, Ordering::Relaxed);
-                barrier.wait();
+                end_barrier.wait();
             }
         })
     };
@@ -182,8 +188,8 @@ fn run_sb(iterations: usize, ordering: Ordering) -> Counts {
         y.store(0, Ordering::Relaxed);
         r1.store(usize::MAX, Ordering::Relaxed);
         r2.store(usize::MAX, Ordering::Relaxed);
-        barrier.wait();
-        barrier.wait();
+        start_barrier.wait();
+        end_barrier.wait();
 
         if r1.load(Ordering::Relaxed) == 0 && r2.load(Ordering::Relaxed) == 0 {
             violations += 1;
@@ -200,20 +206,22 @@ fn run_lb(iterations: usize, ordering: Ordering) -> Counts {
     let y = Arc::new(AtomicUsize::new(0));
     let r1 = Arc::new(AtomicUsize::new(usize::MAX));
     let r2 = Arc::new(AtomicUsize::new(usize::MAX));
-    let barrier = Arc::new(Barrier::new(3));
+    let start_barrier = Arc::new(Barrier::new(3));
+    let end_barrier = Arc::new(Barrier::new(3));
 
     let t0 = {
         let x = Arc::clone(&x);
         let y = Arc::clone(&y);
         let r1 = Arc::clone(&r1);
-        let barrier = Arc::clone(&barrier);
+        let start_barrier = Arc::clone(&start_barrier);
+        let end_barrier = Arc::clone(&end_barrier);
         thread::spawn(move || {
             for _ in 0..iterations {
-                barrier.wait();
+                start_barrier.wait();
                 let seen = y.load(ordering);
                 x.store(1, ordering);
                 r1.store(seen, Ordering::Relaxed);
-                barrier.wait();
+                end_barrier.wait();
             }
         })
     };
@@ -222,14 +230,15 @@ fn run_lb(iterations: usize, ordering: Ordering) -> Counts {
         let x = Arc::clone(&x);
         let y = Arc::clone(&y);
         let r2 = Arc::clone(&r2);
-        let barrier = Arc::clone(&barrier);
+        let start_barrier = Arc::clone(&start_barrier);
+        let end_barrier = Arc::clone(&end_barrier);
         thread::spawn(move || {
             for _ in 0..iterations {
-                barrier.wait();
+                start_barrier.wait();
                 let seen = x.load(ordering);
                 y.store(1, ordering);
                 r2.store(seen, Ordering::Relaxed);
-                barrier.wait();
+                end_barrier.wait();
             }
         })
     };
@@ -240,8 +249,8 @@ fn run_lb(iterations: usize, ordering: Ordering) -> Counts {
         y.store(0, Ordering::Relaxed);
         r1.store(usize::MAX, Ordering::Relaxed);
         r2.store(usize::MAX, Ordering::Relaxed);
-        barrier.wait();
-        barrier.wait();
+        start_barrier.wait();
+        end_barrier.wait();
 
         if r1.load(Ordering::Relaxed) == 1 && r2.load(Ordering::Relaxed) == 1 {
             violations += 1;
@@ -260,28 +269,31 @@ fn run_iriw(iterations: usize, ordering: Ordering) -> Counts {
     let r2 = Arc::new(AtomicUsize::new(usize::MAX));
     let r3 = Arc::new(AtomicUsize::new(usize::MAX));
     let r4 = Arc::new(AtomicUsize::new(usize::MAX));
-    let barrier = Arc::new(Barrier::new(5));
+    let start_barrier = Arc::new(Barrier::new(5));
+    let end_barrier = Arc::new(Barrier::new(5));
 
     let writer_x = {
         let x = Arc::clone(&x);
-        let barrier = Arc::clone(&barrier);
+        let start_barrier = Arc::clone(&start_barrier);
+        let end_barrier = Arc::clone(&end_barrier);
         thread::spawn(move || {
             for _ in 0..iterations {
-                barrier.wait();
+                start_barrier.wait();
                 x.store(1, ordering);
-                barrier.wait();
+                end_barrier.wait();
             }
         })
     };
 
     let writer_y = {
         let y = Arc::clone(&y);
-        let barrier = Arc::clone(&barrier);
+        let start_barrier = Arc::clone(&start_barrier);
+        let end_barrier = Arc::clone(&end_barrier);
         thread::spawn(move || {
             for _ in 0..iterations {
-                barrier.wait();
+                start_barrier.wait();
                 y.store(1, ordering);
-                barrier.wait();
+                end_barrier.wait();
             }
         })
     };
@@ -291,15 +303,16 @@ fn run_iriw(iterations: usize, ordering: Ordering) -> Counts {
         let y = Arc::clone(&y);
         let r1 = Arc::clone(&r1);
         let r2 = Arc::clone(&r2);
-        let barrier = Arc::clone(&barrier);
+        let start_barrier = Arc::clone(&start_barrier);
+        let end_barrier = Arc::clone(&end_barrier);
         thread::spawn(move || {
             for _ in 0..iterations {
-                barrier.wait();
+                start_barrier.wait();
                 let first = x.load(ordering);
                 let second = y.load(ordering);
                 r1.store(first, Ordering::Relaxed);
                 r2.store(second, Ordering::Relaxed);
-                barrier.wait();
+                end_barrier.wait();
             }
         })
     };
@@ -309,15 +322,16 @@ fn run_iriw(iterations: usize, ordering: Ordering) -> Counts {
         let y = Arc::clone(&y);
         let r3 = Arc::clone(&r3);
         let r4 = Arc::clone(&r4);
-        let barrier = Arc::clone(&barrier);
+        let start_barrier = Arc::clone(&start_barrier);
+        let end_barrier = Arc::clone(&end_barrier);
         thread::spawn(move || {
             for _ in 0..iterations {
-                barrier.wait();
+                start_barrier.wait();
                 let first = y.load(ordering);
                 let second = x.load(ordering);
                 r3.store(first, Ordering::Relaxed);
                 r4.store(second, Ordering::Relaxed);
-                barrier.wait();
+                end_barrier.wait();
             }
         })
     };
@@ -331,8 +345,8 @@ fn run_iriw(iterations: usize, ordering: Ordering) -> Counts {
         r2.store(usize::MAX, Ordering::Relaxed);
         r3.store(usize::MAX, Ordering::Relaxed);
         r4.store(usize::MAX, Ordering::Relaxed);
-        barrier.wait();
-        barrier.wait();
+        start_barrier.wait();
+        end_barrier.wait();
 
         let xy_first = r1.load(Ordering::Relaxed);
         let xy_second = r2.load(Ordering::Relaxed);
