@@ -122,3 +122,50 @@ warm-up, larger artifact, no runtime codegen). With the const-data gap closed, a
 `cargo dotnet publish --aot` is now a tooling task (wrap the `PublishAot` host generation); full I/O-PAL
 AOT-compatibility for a standalone Rust *binary* (vs the C#-host-consumes-Rust-lib path proven here) is
 the remaining frontier.
+
+## 6. Size-classed pool allocator (`POOL_ALLOC=1`) — PARKED, negative result
+
+A size-classed free-list pool allocator for `NativeMemory.Alloc`/`Free` was built and evaluated as a
+candidate to close (part of) the "~22 ns above the malloc floor" gap from §3 and the alloc-churn gap
+in `cargo_tests/bench_rs_vs_cs`. It exists in the tree (`cilly/src/ir/builtins/pool_alloc.rs`,
+`dotnet_pal/sys/alloc/dotnet.rs`) behind an **opt-in, off-by-default** env flag `POOL_ALLOC=1` — it is
+**not** the default allocation path and there is no plan to make it one.
+
+**Verdict: PARKED-NEGATIVE.** Two independent rounds of interleaved A/B/C benchmarking (A = pool off,
+B = pool on, C = hand-written C# baseline), re-verified with a full re-run rather than trusting round 1,
+converged on the same small-but-real result that does not clear the pre-committed 1.5× bar:
+
+| Workload | A/B median ratio (round 1) | A/B median ratio (round 2, re-verified) |
+|---|---:|---:|
+| numeric (zero-alloc sentinel) | ~1.00 | 1.004–1.006 (flat, noise) |
+| `alloc_churn` (iterator) | ~1.03 | 1.033 |
+| `alloc_churn_indexed` (target) | ~1.03 | 1.025–1.026 |
+
+Round 2 pooled all 12 paired interleaved rounds — including a batch run under heavy external machine
+load (uptime load average ~15 → ~23+, absolute latencies 2–3× noisier) — into a paired-ratio analysis
+that is robust to the absolute noise level. It reproduced the same ~1.03× median with the pool faster
+in 10/12 paired rounds; the extra load widened the spread but did not change the direction or
+magnitude of the verdict.
+
+**Why the win is real but small, and why it doesn't have headroom to grow into 1.5×:** decomposing the
+target workload's alloc+free pair (300k iterations, 4096 B each) gives **~24.5 ns/iter saved** by the
+pool. The documented `NativeMemory.Alloc`/`Free` floor for that exact op pair is **28–34 ns**
+(2 × 14–17 ns from the §3 table). That means the pool is already capturing essentially the *entire*
+addressable allocation-model cost for this workload — there is no more malloc-floor left to shave.
+The other ~97% of `alloc_churn_indexed`'s per-iteration time is in the indexed-loop
+bounds-check/fill-sum codegen path (§4), a different, unrelated investigation. A magazine/thread-cache
+layer, lock-free cross-thread frees, or bigger slabs could only compete for a sliver of an
+already-nearly-fully-closed budget and would not plausibly move 1.03× to 1.5×.
+
+Correctness was clean throughout and is not the reason for parking: `cargo test -p cilly --lib`
+(186/186) stays green under the flag, `pal_allocstress` (8-thread alloc/free storm, cross-thread free,
+realloc grow/shrink chains, alignment, zeroing contract) passes under `POOL_ALLOC=1`, and
+`cd_collections` (141/141) passes under `POOL_ALLOC=1` — the pool is correct, just not worth defaulting
+on.
+
+**Guidance:** leave `POOL_ALLOC` off (the default). The flag is kept in the tree as a working,
+tested opt-in for anyone who wants to re-measure on a different workload shape or hardware, but it is
+not recommended for general use — the ~3% win is within the noise of many real workloads and isn't
+worth the added allocator complexity as a default. If allocation-model work resumes, the productive
+next target is the non-allocation cost of the indexed-loop codegen path (§4), not further allocator
+tuning — that axis is considered closed.
