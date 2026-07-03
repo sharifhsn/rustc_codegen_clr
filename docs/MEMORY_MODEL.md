@@ -48,6 +48,15 @@ call site.
   (both acquire and release) — on CoreCLR/ARM64 this compiles to `ldaxr`/`stlxr`/`dmb`-class
   instructions, i.e. genuinely strong enough for `SeqCst` in both directions.
 - `Thread.MemoryBarrier()` is an explicit, unconditional, full bidirectional fence.
+- **Important caveat on "full fence" claims below**: ECMA-335 I.12.6 itself only specifies
+  acquire semantics for a volatile read and release semantics for a volatile write (see the two
+  bullets above) — the spec text does **not**, by itself, guarantee a single total order visible to
+  all threads (the multi-copy-atomicity property SeqCst needs; see IRIW-style counterexamples).
+  Where this document argues a lowering is "sound for SeqCst," the total-order half of that
+  argument rests on CoreCLR's documented behavior for `Thread.MemoryBarrier()`/`Interlocked.*`
+  being a real, implementation-specific full hardware fence — stronger than the ECMA floor — not on
+  I.12.6 wording alone. That implementation-specific claim is corroborated empirically by the
+  litmus results in §5, with the calibration caveats noted there (see §5.6).
 
 ## 3. The two cells that were unsound, and the fix
 
@@ -63,10 +72,13 @@ all, so a later load/store in program order is free to be hoisted above it — e
 **Fix** (`src/terminator/intrinsics/mod.rs`, `atomic_load` arm): emit `LdInd { volatile: true }`
 via `ctx.load_volatile` instead of `ctx.load`.
 
-**Soundness argument**: `volatile.ldind` is an acquire fence per I.12.6.7 — sound for `Acquire`
-and (paired with a fenced store — see 3.2) for the load half of `SeqCst`. It is strictly stronger
-than `Relaxed` requires, which only costs some reordering headroom, not correctness — i.e. this is
-a safe direction to be wrong in, unlike the previous lowering.
+**Soundness argument**: `volatile.ldind` is an acquire fence per I.12.6.7 — sound for `Acquire`.
+It is strictly stronger than `Relaxed` requires, which only costs some reordering headroom, not
+correctness — i.e. this is a safe direction to be wrong in, unlike the previous lowering. For the
+load half of `SeqCst` specifically, the acquire fence alone is necessary but not sufficient — the
+total-order property additionally depends on the paired store's fence (see 3.2) actually providing
+multi-copy atomicity, which is a CoreCLR implementation guarantee, not something I.12.6.7 states on
+its own (see the caveat in §2).
 
 ### 3.2 `atomic_store` — was weaker than Rust requires (specifically `SeqCst`)
 
@@ -81,10 +93,14 @@ SeqCst store would additionally need a trailing `Thread.MemoryBarrier()`... left
 unconditionally emit a trailing `Thread.MemoryBarrier()` call after it (the same call the
 `atomic_fence` arm already uses).
 
-**Soundness argument**: `Thread.MemoryBarrier()` is a full, bidirectional fence, so every store
-(regardless of nominal ordering, since the ordering argument is unread) is now at least as strong
-as `SeqCst` requires. This is strictly stronger than `Relaxed`/`Release` require — safe, at the
-cost of an extra barrier instruction on every atomic store (see §6, "Known conservatisms").
+**Soundness argument**: `Thread.MemoryBarrier()` is documented by CoreCLR as a full, bidirectional,
+real hardware fence, so every store (regardless of nominal ordering, since the ordering argument is
+unread) is now at least as strong as `SeqCst` requires. This is strictly stronger than
+`Relaxed`/`Release` require — safe, at the cost of an extra barrier instruction on every atomic
+store (see §6, "Known conservatisms"). As noted in §2, the total-order (multi-copy-atomicity)
+guarantee this relies on is a property of CoreCLR's implementation of `Thread.MemoryBarrier()`, not
+something ECMA-335 I.12.6 text guarantees by itself; the empirical litmus results in §5 are what
+actually exercise this on real weak-memory hardware, within the calibration limits noted in §5.6.
 
 ### 3.3 Optimizer soundness gap — volatile flag silently dropped on local-address folds
 
@@ -130,8 +146,9 @@ any exporter.
 
 Two independent litmus harnesses were used:
 
-1. **`cargo_tests/pal_litmus`** — the campaign's canonical harness (MP, SB, LB, IRIW, each with a
-   `Relaxed` sensitivity-control variant), built for this task. Persistent worker threads
+1. **`cargo_tests/pal_litmus`** — the campaign's canonical harness (MP, SB, LB, IRIW), built for
+   this task. MP, SB, and LB each have a `Relaxed` sensitivity-control variant; IRIW does not (see
+   §5.6 for why that matters for IRIW's calibration status). Persistent worker threads
    synchronized per-round via a reusable `std::sync::Barrier` (a spin barrier built from the atomics
    under test would be circular), ≥1,000,000 iterations/test/run, ≥3 process-level runs per side.
 2. **`cargo_tests/mp_litmus_probe`** — a smaller, faster independent cross-check built in parallel
@@ -140,10 +157,14 @@ Two independent litmus harnesses were used:
    without waiting on the fuller harness's longer runtime. This is the harness whose numbers are
    reported in full below; both harnesses target the same underlying shapes.
 
-**Calibration gate**: the harness is only trustworthy if its Relaxed-ordering control shows
-nonzero reorderings on the *native* ARM64 run (proving the race window is tight enough to observe
-real hardware reordering). If Relaxed shows zero on native, the harness is too weak to conclude
-anything either way.
+**Calibration gate**: a given shape's forbidden-outcome result is only trustworthy if that same
+shape's Relaxed-ordering control shows nonzero reorderings on the *native* ARM64 run (proving the
+race window is tight enough to observe real hardware reordering for that specific shape). This is
+evaluated per shape, not once for the whole harness — a harness can be sensitive enough for one
+shape (e.g. SB) while being too weak, at this iteration count/hardware, to demonstrate the
+reordering for another (e.g. MP or LB). If a shape's Relaxed control shows zero on native, that
+shape's forbidden-outcome result (whether zero or nonzero) is uninformative on its own. See §5.6 for
+the actual per-shape calibration outcome across both harnesses used here.
 
 ### 5.2 Native (oracle) calibration — `mp_litmus_probe`, 300,000 iterations
 
@@ -181,23 +202,35 @@ a violation) and is discussed as a known conservatism in §6.
 Before the fix (pre-patch lowering: plain `ldind` for loads, no trailing fence on stores), the
 code-level analysis in §3.1/§3.2 predicts MP-Acquire/Release and SB-SeqCst violations were
 possible on the backend; the specific counts were not captured pre-fix on this machine (the fix
-was applied before a full pre-fix litmus sweep completed — see §5.4). The post-fix zero-violation
-result above, combined with the ECMA-335 soundness argument in §3, is the basis for closing this
+was applied before a full pre-fix litmus sweep completed). The post-fix zero-violation
+result above, combined with the ECMA-335 soundness argument in §3 (with the caveat in §2 about
+what ECMA-335 alone does vs. does not guarantee), is the basis for closing this
 out: the argument does not rest on empirical absence of a bug alone, but on both (a) the emitted
-CIL now having the fence semantics ECMA-335 defines as required for the ordering in question, and
-(b) 3/3 clean empirical runs on a real weak-memory machine with a calibration-verified harness.
+CIL now having the fence semantics required for the ordering in question, and
+(b) 3/3 clean empirical runs on a real weak-memory machine with a calibration-verified harness (see
+§5.6 for the calibration coverage's actual scope, which is narrower than "all four shapes").
 
 ### 5.4 `cargo_tests/pal_litmus` (fuller MP/SB/LB/IRIW harness)
 
 This harness was also built during the same investigation (`cargo_tests/pal_litmus/src/main.rs`)
-to additionally cover LB and IRIW at the required ≥1,000,000-iteration scale. Its native run was
-completed; its backend run did not finish inside this task's time budget (it hit a sandboxing
-issue unrelated to the backend itself — the process building it needed a writable copy of the
-rustup sysroot to inject the dotnet PAL, which took long enough that results were not available at
-write-time). The crate is committed as-is for future use; §5.2/§5.3 above (the independently-built
-`mp_litmus_probe`, same design, run directly with full filesystem access) is the run that actually
-produced verified numbers for this task and is what the "violations fixed" conclusion rests on.
-No fabricated or estimated numbers for `pal_litmus`'s backend side are reported here.
+to additionally cover LB and IRIW at the required ≥1,000,000-iteration scale, with two reusable
+`std::sync::Barrier`s per test (start/finish) and persistent worker threads. Both the native and
+backend runs completed and are committed in full in `cargo_tests/pal_litmus/RESULTS.md` (3
+process-level runs per side, 1,000,000 iterations/test/run). Summary (see RESULTS.md for the full
+per-run table and raw output):
+
+- Native calibration: MP Relaxed control 0/500,952+499,811+500,737 observed (never fired on this
+  harness/hardware/iteration-count combination — see §5.6), SB Relaxed control fired 77 times total
+  (14 + 51 + 12) across the 3 runs, LB Relaxed control 0 (never fired — see §5.6).
+- Backend, forbidden outcomes: MP Release/Acquire stale-data 0 total, SB SeqCst both-zero 0 total,
+  LB SeqCst both-one 0 total, IRIW SeqCst disagreement 0 total — across all 3 runs.
+- Backend relaxed controls also came back 0 across all 3 runs, consistent with the
+  stronger-than-required conservatism discussed in §6 (not itself informative given the controls
+  were already weak/zero on native for MP and LB — see §5.6).
+
+This is in addition to, not a replacement for, `mp_litmus_probe`'s independent MP/SB run in
+§5.2/§5.3 (which was built and run first, in parallel with `pal_litmus`, as a faster cross-check).
+Both harnesses target the same underlying shapes and agree wherever they overlap (MP, SB).
 
 ### 5.5 Sanity: real-world concurrency battery
 
@@ -212,6 +245,45 @@ run exit: 0
 Correct under the fixed lowering (as it was before — `Mutex`'s own atomics route through the
 already-sound `Interlocked`-backed compare_exchange, not the fixed load/store cells directly, so
 this is a no-regression check, not new coverage of the fix).
+
+### 5.6 Calibration coverage is per-shape, and is incomplete for MP, LB, and IRIW
+
+The calibration gate stated in §5.1 ("the harness is only trustworthy if its Relaxed control shows
+nonzero reorderings on the native run") is a per-shape claim, not a single harness-wide pass/fail.
+Looking at `cargo_tests/pal_litmus/RESULTS.md`'s own committed native numbers (§5.4):
+
+- **SB**: Relaxed control fired 77 times total across 3 native runs. Calibrated — a zero result on
+  the backend for SB SeqCst is meaningful evidence the fencing forbids the reordering the harness
+  can actually provoke.
+- **MP**: Relaxed control fired **0** times across all 3 native runs (0/500,952, 0/499,811,
+  0/497,687 observed races). The native oracle itself never demonstrated the reordering this
+  control is supposed to detect, on this hardware at this iteration count. The backend's 0-violation
+  result for MP Release/Acquire is therefore **not calibration-proven** by this control — it is
+  consistent with correct fencing, but equally consistent with a detector insensitive to MP's
+  reordering shape at 10^6 iterations. `mp_litmus_probe` (§5.2, a different, independently-built
+  harness) did observe 1 MP-Relaxed violation out of 151,065 races at 300,000 iterations, so MP's
+  reorderability was demonstrated by that harness, on that run — the two harnesses are not
+  interchangeable calibration evidence for each other, but a reader taking `pal_litmus`'s own MP
+  numbers as self-calibrating would be wrong.
+- **LB**: Relaxed control fired **0** times across all 3 native runs. Same status as MP — the
+  native oracle never demonstrated an LB reordering with this harness, so the backend's 0-violation
+  LB SeqCst result is uncalibrated for this shape.
+- **IRIW**: `pal_litmus` has no Relaxed-control variant for IRIW at all (only a SeqCst-forbidden
+  check is implemented). The IRIW SeqCst zero-violation result (0/245,882+246,275+249,532 native,
+  0/250,859+251,455+251,740 backend) has no calibration evidence in this harness whatsoever — it is
+  uninformative about detector sensitivity either way, independent of whether the underlying
+  lowering is correct.
+
+None of this indicates a lowering bug — the code-level soundness argument in §3–4 does not depend
+on these litmus numbers, and MP/SB/LB's underlying mechanism (single-writer/single-reader loads and
+stores) is covered by the same `atomic_load`/`atomic_store` fix regardless of which shape observes
+it. But the empirical-confidence claims in §5.3/§5.4/§8 should be read as: **strongly calibrated for
+SB, uncalibrated for MP and LB within `pal_litmus` alone (though MP has independent calibration via
+`mp_litmus_probe`), and entirely uncalibrated for IRIW.** Closing this gap would mean either running
+`pal_litmus` at a much higher iteration count / longer duration to see if MP and LB controls
+eventually fire on this hardware, or accepting that this hardware/OS/iteration-count combination may
+just not expose those particular reorderings within a practical test budget — both are legitimate
+follow-ups, not attempted in this pass.
 
 ## 6. Known conservatisms (stronger than required) and their cost
 
@@ -275,17 +347,22 @@ a scaling or correctness risk.
   requires, i.e. a legal (if less optimization-friendly on hypothetical future LL/SC-native
   lowerings) implementation of `_weak`. Not a soundness gap, not exercised by a litmus test here.
 - **IRIW (4-thread, SeqCst, disagreeing total-order-across-threads)** was written into
-  `cargo_tests/pal_litmus` but its backend run did not complete in this task's time budget (§5.4).
-  Per the code-level argument in §3–4, IRIW built from plain SeqCst loads would inherit the same
-  load-cell weakness MP exercises, and IRIW built from RMW-observing reads would inherit the
-  already-sound `Interlocked`-backed rmw path — so the fix in §3.1 is expected to close IRIW's
-  load-based exposure too, but this expectation is **not empirically confirmed** by this pass and
-  is explicitly flagged as unconfirmed rather than claimed.
-- **LB (load buffering)** — same status as IRIW: written into `cargo_tests/pal_litmus`, not
-  empirically run to completion on the backend in this task. The fix in §3.1 (load) directly
-  targets LB's `SeqCst` shape (`r1=1,r2=1` requires each thread's load to observe the other's
-  not-yet-issued store being forbidden, i.e. the load must not be hoisted above the local store) —
-  expected sound by the same argument, not independently confirmed here.
+  `cargo_tests/pal_litmus` and its backend run did complete (§5.4: 0 disagreements across 3 runs,
+  ~250K observed races/run). Per the code-level argument in §3–4, IRIW built from plain SeqCst
+  loads would inherit the same load-cell weakness MP exercises, and IRIW built from RMW-observing
+  reads would inherit the already-sound `Interlocked`-backed rmw path — so the fix in §3.1 is
+  expected to close IRIW's load-based exposure too, and the zero-disagreement result is consistent
+  with that. However, `pal_litmus` has **no Relaxed-control variant for IRIW at all** (§5.6), so
+  this result is entirely uncalibrated — it has no empirical demonstration that the harness can
+  observe an IRIW disagreement on this hardware in the first place. Treat this as consistent with,
+  not proof of, soundness.
+- **LB (load buffering)** — its backend run also completed (§5.4: 0 both-one outcomes across 3
+  runs). The fix in §3.1 (load) directly targets LB's `SeqCst` shape (`r1=1,r2=1` requires each
+  thread's load to observe the other's not-yet-issued store being forbidden, i.e. the load must not
+  be hoisted above the local store) — expected sound by the same argument. But LB's own Relaxed
+  control also fired 0/1,000,000 on the *native* oracle across all 3 runs (§5.6), meaning this
+  harness never demonstrated it can provoke an LB reordering on this hardware at all; the backend's
+  zero result is uncalibrated by the same standard applied to MP.
 - **Non-atomic data races** (i.e. any race not going through `atomic_*`/`Mutex`/`Atomic*`) are
   undefined behavior in Rust regardless of backend and are out of scope for a memory-*model*
   document — this file is about ordering semantics of well-formed atomic operations, not about
@@ -298,10 +375,15 @@ Two lowering cells were confirmed weaker than the Rust memory model requires and
 (was `volatile.stind` alone, now additionally trailed by `Thread.MemoryBarrier()` — real full
 fence, closing the SeqCst StoreLoad-reordering hole). A related optimizer soundness gap (silent
 `volatile`-flag drop on two peephole local-address folds in `cilly/src/ir/opt/`) was independently
-found and fixed with a one-line guard at each site. All three fixes are argued sound against
-ECMA-335 I.12.6.7/I.12.6.8 and CoreCLR's documented `Interlocked`/`MemoryBarrier` fence semantics,
-and were empirically confirmed with zero violations across 3 backend litmus runs (300,000
-iterations each) against a native-oracle-calibrated harness on real weak-memory ARM64 hardware.
+found and fixed with a one-line guard at each site. The acquire/release half of each fix is argued
+sound directly from ECMA-335 I.12.6.7/I.12.6.8; the SeqCst total-order half additionally relies on
+CoreCLR's documented `Interlocked`/`MemoryBarrier` fence semantics being a real, implementation-
+specific full hardware fence — ECMA-335's spec text alone does not guarantee multi-copy atomicity
+(see §2's caveat) — and were empirically corroborated with zero violations across 3 backend litmus
+runs (300,000 iterations each) against a native-oracle-calibrated harness on real weak-memory ARM64
+hardware, plus the fuller `pal_litmus` MP/SB/LB/IRIW sweep in §5.4 (subject to the calibration
+limits in §5.6 — the MP and LB backend zero results are corroborating, not independently
+calibration-proven, for those two shapes).
 `cargo test -p cilly --lib` (186 tests) remained green throughout. The xchg/cxchg/rmw/fence
 families were already sound and are unchanged. One known-unsound residual (`AtomicU8::swap`/
 `AtomicBool::swap` on .NET 8 — a lost-update race, not a fence gap) was newly identified as

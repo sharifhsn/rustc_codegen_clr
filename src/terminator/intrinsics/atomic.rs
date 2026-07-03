@@ -81,9 +81,13 @@ pub fn xchg<'tcx>(
         }
         // `bool` is a 1-byte value; on .NET 8 it can reuse the dedicated `atomic_xchng_u8`
         // builtin (the U8 arm above). The checker does NOT treat `Bool` as assignable to `U8`,
-        // so bridge the byref/value/result explicitly across the Bool<->U8 boundary. Unreachable
-        // from safe-stable Rust today (AtomicBool::swap lowers `atomic_xchg` with T = u8 — see
-        // core::sync::atomic), but correct if hit via the unstable `core::intrinsics::atomic_xchg`.
+        // so bridge the byref/value/result explicitly across the Bool<->U8 boundary.
+        // REACHABLE from 100% safe/stable Rust: `AtomicBool::swap`/`AtomicU8::swap` both lower to
+        // `core::sync::atomic::atomic_swap` -> `intrinsics::atomic_xchg` (see
+        // library/core/src/sync/atomic.rs). NOTE: `atomic_xchng_u8` (the U8 arm above, reused
+        // here for Bool) is a plain volatile-ld/volatile-st with no CAS — it is NOT atomic against
+        // a racing writer of the same byte on .NET 8 (lost-update race). This is a known, disclosed
+        // residual; see docs/MEMORY_MODEL.md §7/§8. Do not reintroduce an "unreachable" claim here.
         Type::Bool if !*crate::config::DOTNET9 => {
             let xchng = ctx.alloc_methodref(xchng);
             let u8_ref = ctx.nref(Type::Int(Int::U8));
