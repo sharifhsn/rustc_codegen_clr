@@ -211,12 +211,15 @@ impl CodegenBackend for MyBackend {
                 .expect("Could not get the signature of the entrypoint.");
             let symbol = tcx.symbol_name(entrypoint);
             let symbol = format!("{symbol:?}");
-            // A `fn main() -> T where T: Termination` (`-> Result<_,_>` / `-> ExitCode`) has a
-            // non-`Void` return and no args; `entrypoint::wrapper` only handles `() -> ()` and the
-            // C-main ABI, so it would `panic!` (ICE). Mirror rustc's `create_entry_fn`: route through
-            // `std::rt::lang_start::<T>`, which runs `main`, maps `T` to an exit code via
-            // `Termination::report`, and returns it. Everything else keeps the direct wrapper.
-            let needs_lang_start = sig.inputs().is_empty() && *sig.output() != cilly::Type::Void;
+            // A zero-arg `fn main()` (including a `Termination`-returning one, e.g.
+            // `-> Result<_,_>` / `-> ExitCode`) must always go through `std::rt::lang_start::<T>`,
+            // exactly like real rustc's `create_entry_fn` (`EntryFnType::Main`): `lang_start` runs
+            // `main`, maps `T` to an exit code via `Termination::report` (`()` implements
+            // `Termination` too), and crucially wraps the call in `catch_unwind` so an escaping
+            // panic is converted into a clean abort with the right exit code instead of an
+            // unhandled exception. Only the non-standard C-ABI `#[no_main]`-style entry (non-empty
+            // inputs) still skips lang_start, matching rustc's `EntryFnType::Start`.
+            let needs_lang_start = sig.inputs().is_empty();
             let cs = MethodRef::new(
                 *asm.main_module(),
                 asm.alloc_string(symbol),
