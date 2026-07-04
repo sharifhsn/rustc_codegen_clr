@@ -211,15 +211,29 @@ impl CodegenBackend for MyBackend {
                 .expect("Could not get the signature of the entrypoint.");
             let symbol = tcx.symbol_name(entrypoint);
             let symbol = format!("{symbol:?}");
-            // A zero-arg `fn main()` (including a `Termination`-returning one, e.g.
-            // `-> Result<_,_>` / `-> ExitCode`) must always go through `std::rt::lang_start::<T>`,
-            // exactly like real rustc's `create_entry_fn` (`EntryFnType::Main`): `lang_start` runs
-            // `main`, maps `T` to an exit code via `Termination::report` (`()` implements
-            // `Termination` too), and crucially wraps the call in `catch_unwind` so an escaping
-            // panic is converted into a clean abort with the right exit code instead of an
-            // unhandled exception. Only the non-standard C-ABI `#[no_main]`-style entry (non-empty
-            // inputs) still skips lang_start, matching rustc's `EntryFnType::Start`.
-            let needs_lang_start = sig.inputs().is_empty();
+            // A `fn main() -> T where T: Termination` (`-> Result<_,_>` / `-> ExitCode`) has a
+            // non-`Void` return and no args; `entrypoint::wrapper` only handles `() -> ()` and the
+            // C-main ABI, so it would `panic!` (ICE). Mirror rustc's `create_entry_fn`: route through
+            // `std::rt::lang_start::<T>`, which runs `main`, maps `T` to an exit code via
+            // `Termination::report`, and returns it. Everything else keeps the direct wrapper.
+            //
+            // IMPORTANT: a plain zero-arg `fn main()` (`Void` return) is deliberately EXCLUDED here,
+            // even though real rustc's `create_entry_fn` routes it through `lang_start` too (`()`
+            // implements `Termination`). A prior change (56890ea) made that "fix" and it regressed
+            // ~94% of the `::stable` test suite: `lang_start::<()>` internally calls
+            // `lang_start_internal(main: &(dyn Fn() -> i32 + Sync + RefUnwindSafe), ...)` through an
+            // indirect call on a trait-object-coerced closure, and that monomorphized instantiation
+            // is only reliably discovered when `std` is rebuilt alongside the user crate
+            // (`-Z build-std`) — NOT when compiling against the toolchain's precompiled sysroot `std`
+            // (the default path, and what `compile_test.rs`/virtually all real users hit), which
+            // fails at link/load time with "missing methiod ...lang_start_internal". That
+            // cross-crate generic-instantiation gap is real but out of scope here; until it's fixed,
+            // void mains instead go through `entrypoint::wrapper_catch_and_exit` in `src/lib.rs`
+            // below, which reuses `catch_unwind`'s proven try/catch shape to get a clean panic exit
+            // (101) without ever calling `lang_start`. Do NOT revert this exclusion without first
+            // fixing `lang_start_internal`'s cross-crate reachability against a prebuilt sysroot.
+            let needs_lang_start = sig.inputs().is_empty() && *sig.output() != cilly::Type::Void;
+            let is_void_main = sig.inputs().is_empty() && *sig.output() == cilly::Type::Void;
             let cs = MethodRef::new(
                 *asm.main_module(),
                 asm.alloc_string(symbol),
@@ -254,6 +268,11 @@ impl CodegenBackend for MyBackend {
                     vec![].into(),
                 );
                 cilly::entrypoint::wrapper_lang_start(cs, lang_start, sigpipe, &mut asm);
+            } else if is_void_main {
+                // Plain `fn main()`: see the `needs_lang_start` comment above for why this does
+                // NOT go through `lang_start`. Reuses `catch_unwind`'s CIL shape for a clean,
+                // exit-101 panic path instead of an unhandled-exception crash.
+                cilly::entrypoint::wrapper_catch_and_exit(cs, &mut asm);
             } else {
                 cilly::entrypoint::wrapper(cs, &mut asm);
             }

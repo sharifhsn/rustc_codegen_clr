@@ -1,8 +1,9 @@
 use std::num::NonZeroU8;
 
 use crate::{
-    cilnode::ExtendKind, Access, BasicBlock, CILNode, CILRoot, ClassRef, Const, MethodDef,
-    MethodDefIdx, MethodImpl, Type, {cilnode::MethodKind, Assembly, Int, MethodRef},
+    cilnode::ExtendKind, cilroot::BranchCond, Access, BasicBlock, CILNode, CILRoot, ClassRef,
+    Const, MethodDef, MethodDefIdx, MethodImpl, Type,
+    {cilnode::MethodKind, Assembly, Int, MethodRef},
 };
 
 /// Entry wrapper for a `fn main() -> T where T: Termination` (e.g. `-> Result<_, _>` / `-> ExitCode`).
@@ -102,6 +103,138 @@ pub fn wrapper_lang_start(
         },
         vec![],
     );
+    asm.new_method(method)
+}
+
+/// Entry wrapper for a plain `fn main()` (zero args, `Void` return).
+///
+/// Real rustc routes even a plain `fn main()` through `std::rt::lang_start::<()>`
+/// (`()` implements `Termination`), which internally calls
+/// `lang_start_internal(main: &(dyn Fn() -> i32 + Sync + RefUnwindSafe), ...)` — an indirect call
+/// through a trait-object-coerced closure. That monomorphized instantiation of
+/// `lang_start_internal` is reliably discovered when `std` is rebuilt alongside the user crate
+/// (`-Z build-std`), but is NOT reliably emitted when compiling against the toolchain's
+/// precompiled sysroot `std` (the default/common path) — a real, latent cross-crate
+/// generic-instantiation gap, tracked separately, that is NOT fixed here. Routing plain `()`
+/// mains through `lang_start` (as a prior change briefly did) therefore ICEs with a "missing
+/// method ... lang_start_internal" against a normal sysroot build.
+///
+/// So for the `Void`-returning case we deliberately do NOT call `lang_start` at all. Instead we
+/// reuse the exact proven CIL `try`/`catch` shape that `std::panic::catch_unwind`'s own
+/// `catch_unwind` builtin uses (see `insert_catch_unwind` in `cilly::ir::builtins`): call `main`
+/// directly in a protected region; on a caught exception, check it `IsInst RustException` —
+/// rethrow anything else unchanged (so a genuine backend miscompile/AV still surfaces visibly,
+/// exactly like `catch_unwind` does) — and on a real Rust panic, simply exit with code `101`
+/// (matching native's panic exit code) via `System.Environment.Exit`, without printing anything
+/// else: the "thread '<name>' panicked at ..." message was already printed by std's own
+/// `panic_fmt`/default hook before the exception was thrown, so nothing further is needed here.
+///
+/// One documented trade-off versus the (currently broken) `lang_start` path: because we never
+/// call `lang_start`/`lang_start_internal`, the main OS thread is never renamed to `"main"` by
+/// std's runtime init, so panic messages may show the default `<unnamed>` thread name instead.
+/// This is intentional and strictly better than the alternative (an unhandled-exception crash).
+pub fn wrapper_catch_and_exit(entrypoint: MethodRef, asm: &mut Assembly) -> MethodDefIdx {
+    let main_module = asm.main_module();
+    let entrypoint_name = asm.alloc_string("entrypoint");
+    // Force `user_init`/`static_init` to exist (see `wrapper`).
+    asm.user_init();
+
+    let entrypoint = asm.alloc_methodref(entrypoint);
+
+    let tcctor = MethodRef::new(
+        *asm.main_module(),
+        asm.alloc_string(".tcctor"),
+        asm.sig([], Type::Void),
+        MethodKind::Static,
+        vec![].into(),
+    );
+    let tcctor = asm.alloc_methodref(tcctor);
+    let static_init = MethodRef::new(
+        *asm.main_module(),
+        asm.alloc_string("static_init"),
+        asm.sig([], Type::Void),
+        MethodKind::Static,
+        vec![].into(),
+    );
+    let static_init = asm.alloc_methodref(static_init);
+
+    let tcctor_call = asm.alloc_root(CILRoot::call(tcctor, []));
+    let static_init_call = asm.alloc_root(CILRoot::call(static_init, []));
+    let call_main = asm.alloc_root(CILRoot::call(entrypoint, []));
+    let exit_try_success = asm.alloc_root(CILRoot::ExitSpecialRegion {
+        target: 2,
+        source: 0,
+    });
+
+    // Handler: check the caught exception is a `RustException`; if not, rethrow unchanged.
+    let ldloc_0 = asm.alloc_node(CILNode::LdLoc(0));
+    let get_exception = asm.alloc_node(CILNode::GetException);
+    let set_exception = asm.alloc_root(CILRoot::StLoc(0, get_exception));
+    let exception = Type::ClassRef(ClassRef::exception(asm));
+    let exception = asm.alloc_type(exception);
+    let rust_exception = asm.alloc_string("RustException");
+    let rust_exception = asm.alloc_class_ref(ClassRef::new(rust_exception, None, false, [].into()));
+    let rust_exception_tpe = Type::ClassRef(rust_exception);
+    let rust_exception_tpe = asm.alloc_type(rust_exception_tpe);
+    let check_exception_tpe = asm.alloc_node(CILNode::IsInst(ldloc_0, rust_exception_tpe));
+    let rethrow_if_wrong_exception = asm.alloc_root(CILRoot::Branch(Box::new((
+        0,
+        4,
+        Some(BranchCond::False(check_exception_tpe)),
+    ))));
+    // It IS a genuine Rust panic: the clean "thread panicked at ..." message was already printed
+    // by std before the throw, so just exit(101), matching native's panic exit code.
+    let env = ClassRef::enviroment(asm);
+    let exit_name = asm.alloc_string("Exit");
+    let exit = asm
+        .class_ref(env)
+        .clone()
+        .static_mref(&[Type::Int(Int::I32)], Type::Void, exit_name, asm);
+    let exit_code = asm.alloc_node(Const::I32(101));
+    let exit_call = asm.alloc_root(CILRoot::call(exit, [exit_code]));
+    let exit_try_failure = asm.alloc_root(CILRoot::ExitSpecialRegion {
+        target: 3,
+        source: 0,
+    });
+    let rethrow = asm.alloc_root(CILRoot::ReThrow);
+
+    let sig = asm.sig([], Type::Void);
+    let ret_ok = asm.alloc_root(CILRoot::VoidRet);
+    let ret_caught = asm.alloc_root(CILRoot::VoidRet);
+    let blocks = vec![
+        BasicBlock::new(
+            vec![tcctor_call, static_init_call, call_main, exit_try_success],
+            0,
+            Some(vec![
+                BasicBlock::new(
+                    vec![
+                        set_exception,
+                        rethrow_if_wrong_exception,
+                        exit_call,
+                        exit_try_failure,
+                    ],
+                    1,
+                    None,
+                ),
+                BasicBlock::new(vec![rethrow], 4, None),
+            ]),
+        ),
+        BasicBlock::new(vec![ret_ok], 2, None),
+        BasicBlock::new(vec![ret_caught], 3, None),
+    ];
+    let method = MethodDef::new(
+        Access::Extern,
+        main_module,
+        entrypoint_name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks,
+            locals: vec![(Some(asm.alloc_string("exception")), exception)],
+        },
+        vec![],
+    );
+
     asm.new_method(method)
 }
 
