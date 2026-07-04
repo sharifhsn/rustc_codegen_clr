@@ -585,7 +585,15 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
         };
         let mut pdb_builder = super::pdb::PdbBuilder::new(type_system, mb.method_def_row_count());
         for (tok, assembled) in &bodies {
-            if assembled.sequence_points.is_empty() {
+            // Methods with zero sequence points AND zero named locals have truly nothing for the
+            // PDB to say about them — skip and let `PdbBuilder::build` fall back to its default
+            // (empty) `MethodDebugInformation` row. A method with named locals but (implausibly)
+            // no sequence points must NOT be skipped here: `LocalScope`/`LocalVariable` rows are
+            // keyed by `MethodDef` row, independent of sequence-point presence, so skipping would
+            // silently drop its locals from the PDB.
+            if assembled.sequence_points.is_empty()
+                && assembled.locals.iter().all(Option::is_none)
+            {
                 continue;
             }
             pdb_builder.add_method(
@@ -593,6 +601,8 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
                 super::pdb::MethodSequencePoints {
                     local_signature: assembled.locals_signature,
                     points: assembled.sequence_points.clone(),
+                    locals: assembled.locals.clone(),
+                    code_len: assembled.code_len,
                 },
             );
         }

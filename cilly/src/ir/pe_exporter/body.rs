@@ -70,6 +70,22 @@ pub struct AssembledBody {
     /// `LocalVarSigTok` field (`finish_body`'s `locals_tok` parameter) so `pdb.rs`'s
     /// `MethodSequencePoints::local_signature` never needs to re-derive it.
     pub locals_signature: Option<Token>,
+    /// This method's locals, in `LocalVarSig` declaration order (i.e. index == the local's slot
+    /// index), resolved to owned `Option<String>` names (`None` for an unnamed/compiler-generated
+    /// temporary) — the source `pdb.rs`'s `LocalScope`/`LocalVariable` (0x32/0x33) row emission
+    /// reads from. Resolved to an owned `String` HERE (not left as a raw `Interned<IString>`)
+    /// for the same reason [`SequencePoint::document_path`] is already an owned `String`: this
+    /// struct must not carry a handle that assumes a specific `Assembly` outlives it, and `asm`
+    /// is in scope right here in `assemble_method_body` (via `emitter.asm`) but not in `pdb.rs`,
+    /// which builds its own independent heaps (see that module's doc). Empty for a method with no
+    /// locals at all (`Extern`/`Missing`, or a body whose MIR declared zero locals).
+    pub locals: Vec<Option<String>>,
+    /// The method body's pure IL code length in bytes — i.e. `bytes.len()` MINUS the fat header
+    /// (and minus any trailing EH section) — matching the fat header's own `CodeSize` field
+    /// (§II.25.4.3) and [`SequencePoint::il_offset`]'s "offset from start of code, header not
+    /// counted" convention. `pdb.rs`'s `LocalScope.Length` (0x32) uses this to cover the whole
+    /// method body as one flat scope. `0` for a body with no code (`Extern`).
+    pub code_len: u32,
 }
 
 // §II.25.4.3 fat-header flag bits (the low nibble of the Flags/Size u16).
@@ -1377,6 +1393,8 @@ pub fn assemble_method(asm: &mut Assembly, method: MethodDefIdx, tokens: &mut dy
             bytes: Vec::new(),
             sequence_points: Vec::new(),
             locals_signature: None,
+            locals: Vec::new(),
+            code_len: 0,
         },
         MethodImpl::AliasFor(_) => panic!("resolved_implementation returned `AliasFor`"),
         MethodImpl::Missing => {
@@ -1487,9 +1505,15 @@ fn assemble_method_body(
         Token::new(0, 0)
     };
 
+    let local_names: Vec<Option<String>> = locals
+        .iter()
+        .map(|(name, _)| name.map(|n| emitter.asm[n].to_string()))
+        .collect();
+
     let sequence_points = emitter.sequence_points;
     let mut body = finish_body(emitter.out, maxstack, locals_tok, &clauses_resolved, catch_type, sequence_points);
     body.locals_signature = locals_tok;
+    body.locals = local_names;
     body
 }
 
@@ -1552,7 +1576,7 @@ fn finish_body(
     // (`MethodDebugInformation`'s sequence points are offsets from the start of the method body's
     // IL, not counting the header; §II.25.4.3's `CodeSize` field has the same "header doesn't
     // count" convention). No offset adjustment needed here.
-    AssembledBody { bytes, sequence_points, locals_signature: None }
+    AssembledBody { bytes, sequence_points, locals_signature: None, locals: Vec::new(), code_len: code_size }
 }
 
 /// Computes `.maxstack` (§II.25.4.3 `MaxStack` field) for one method body, mirroring
@@ -1658,7 +1682,13 @@ mod tests {
 
     #[test]
     fn assembled_body_is_a_plain_byte_buffer() {
-        let body = AssembledBody { bytes: vec![0u8; 12], sequence_points: Vec::new(), locals_signature: None };
+        let body = AssembledBody {
+            bytes: vec![0u8; 12],
+            sequence_points: Vec::new(),
+            locals_signature: None,
+            locals: Vec::new(),
+            code_len: 0,
+        };
         assert_eq!(body.bytes.len(), 12);
     }
 

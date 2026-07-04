@@ -152,6 +152,17 @@ pub struct SequencePoint {
 pub struct MethodSequencePoints {
     pub local_signature: Option<Token>,
     pub points: Vec<SequencePoint>,
+    /// This method's locals in `LocalVarSig` declaration order (index == slot index), resolved to
+    /// owned names (`None` = unnamed/compiler-generated temporary) — the source
+    /// [`PdbBuilder::build`]'s `LocalScope`/`LocalVariable` (0x32/0x33) row emission reads from.
+    /// Mirrors `body::AssembledBody::locals` (see that field's doc for why names are resolved to
+    /// owned `String`s upstream rather than carried as raw `Interned<IString>` handles here — a
+    /// `PdbBuilder` has no `Assembly` reference to resolve them with, exactly like
+    /// [`SequencePoint::document_path`]).
+    pub locals: Vec<Option<String>>,
+    /// The method body's pure IL code length in bytes (`body::AssembledBody::code_len`) — used as
+    /// [`PdbBuilder::build`]'s `LocalScope.Length`, covering the whole method as one flat scope.
+    pub code_len: u32,
 }
 
 /// Everything [`PdbBuilder::build`] needs about the *type-system* metadata (the `.dll`/`.exe`'s
@@ -261,7 +272,7 @@ impl PdbBuilder {
             }
         }
 
-        let strings = StringsHeap::default();
+        let mut strings = StringsHeap::default();
         let mut blobs = BlobHeap::default();
         let guids = GuidHeap::default();
         let user_strings = UserStringHeap::default();
@@ -285,28 +296,83 @@ impl PdbBuilder {
             })
             .collect();
 
-        let method_rows: Vec<MethodDebugInformationRow> = self
-            .methods
-            .into_iter()
-            .map(|method| {
-                let Some(method) = method else {
-                    return MethodDebugInformationRow::default();
-                };
-                if method.points.is_empty() {
-                    return MethodDebugInformationRow::default();
-                }
-                let document = single_document_id(&method.points, &document_ids).unwrap_or(0);
-                let sequence_points = encode_sequence_points(&method, &document_ids, document);
-                MethodDebugInformationRow {
-                    document,
-                    sequence_points: blobs.intern(&sequence_points),
-                }
-            })
-            .collect();
+        // `LocalScope`/`LocalVariable` (0x32/0x33) are built in the SAME RID-order pass as
+        // `MethodDebugInformation`, since both are keyed by `MethodDef` row and iterate
+        // `self.methods` identically (see `PdbBuilder::build`'s doc on why a method with named
+        // locals but no sequence points must still get a `LocalScope` row here). Built via an
+        // explicit loop rather than `.map()`/`.collect()` because a `LocalScope` row's
+        // `variable_list` must capture `local_variable_rows.len() + 1` (the owned-range
+        // run-start, mirroring `tables::MetadataBuilder::add_type_def`'s `field_list`/
+        // `method_list` pattern exactly) BEFORE this method's own `LocalVariable` rows are
+        // pushed — an inherently stateful, order-dependent step `.map()` can't express cleanly.
+        let mut method_rows: Vec<MethodDebugInformationRow> = Vec::with_capacity(self.methods.len());
+        let mut local_scope_rows: Vec<LocalScopeRow> = Vec::new();
+        let mut local_variable_rows: Vec<LocalVariableRow> = Vec::new();
+        for (idx, method) in self.methods.into_iter().enumerate() {
+            let rid = u32::try_from(idx + 1).expect("MethodDef rid exceeds u32");
+            let Some(method) = method else {
+                method_rows.push(MethodDebugInformationRow::default());
+                continue;
+            };
 
-        let widths =
-            PdbWidths::compute(&strings, &blobs, &guids, &user_strings, document_rows.len());
-        let tables_stream = pad4(&serialize_tables(&document_rows, &method_rows, &widths));
+            if method.locals.iter().any(Option::is_some) {
+                let variable_list = u32::try_from(local_variable_rows.len() + 1)
+                    .expect("LocalVariable table exceeded u32 rows");
+                local_scope_rows.push(LocalScopeRow {
+                    method: rid,
+                    import_scope: 0,
+                    variable_list,
+                    // `LocalConstant` (0x34) is never populated by this pass — always stamp the
+                    // current (permanently empty) cursor, same "zero-owned-rows still stamps the
+                    // run boundary" rule `add_type_def` documents for a class with zero fields.
+                    constant_list: 1,
+                    start_offset: 0,
+                    length: method.code_len,
+                });
+                for (slot, name) in method.locals.iter().enumerate() {
+                    let Some(name) = name else { continue };
+                    local_variable_rows.push(LocalVariableRow {
+                        attributes: 0,
+                        index: u16::try_from(slot).expect("local slot index exceeds u16"),
+                        name: strings.intern(name),
+                    });
+                }
+            }
+
+            if method.points.is_empty() {
+                method_rows.push(MethodDebugInformationRow::default());
+                continue;
+            }
+            let document = single_document_id(&method.points, &document_ids).unwrap_or(0);
+            let sequence_points = encode_sequence_points(&method, &document_ids, document);
+            method_rows.push(MethodDebugInformationRow {
+                document,
+                sequence_points: blobs.intern(&sequence_points),
+            });
+        }
+
+        let method_def_row_count = self
+            .type_system
+            .rows
+            .iter()
+            .find(|&&(table, _)| table == Token::TABLE_METHOD_DEF)
+            .map_or(0, |&(_, count)| count);
+        let widths = PdbWidths::compute(
+            &strings,
+            &blobs,
+            &guids,
+            &user_strings,
+            document_rows.len(),
+            method_def_row_count,
+            local_variable_rows.len(),
+        );
+        let tables_stream = pad4(&serialize_tables(
+            &document_rows,
+            &method_rows,
+            &local_scope_rows,
+            &local_variable_rows,
+            &widths,
+        ));
         let strings_stream = pad4(strings.as_bytes());
         let user_strings_stream = pad4(user_strings.as_bytes());
         let guid_stream = pad4(guids.as_bytes());
@@ -352,6 +418,8 @@ fn dedupe_same_offset_points(points: Vec<SequencePoint>) -> Vec<SequencePoint> {
 
 const TABLE_DOCUMENT: u32 = 0x30;
 const TABLE_METHOD_DEBUG_INFORMATION: u32 = 0x31;
+const TABLE_LOCAL_SCOPE: u32 = 0x32;
+const TABLE_LOCAL_VARIABLE: u32 = 0x33;
 const HIDDEN_LINE: u32 = 0x00FE_EFEE;
 
 #[derive(Debug, Clone)]
@@ -368,11 +436,72 @@ struct MethodDebugInformationRow {
     sequence_points: u32,
 }
 
+/// `LocalScope` (0x32, `PortablePdb-Metadata.md`): a run of `LocalVariable`/`LocalConstant` rows
+/// owned by one `MethodDef`, plus the IL range they're in scope for. This writer only ever emits
+/// ONE scope per method (the whole body, `start_offset = 0` / `length = code_len`) — nested
+/// block-scoped locals are a valid future refinement, not implemented here (see [`PdbBuilder::build`]'s
+/// doc on this table).
+#[derive(Debug, Clone)]
+struct LocalScopeRow {
+    /// Plain (non-coded) `MethodDef` RID — sized by the TYPE-SYSTEM assembly's own `MethodDef` row
+    /// count (`PdbWidths::method_def_wide`), since `MethodDef` isn't a table this standalone PDB
+    /// owns rows for itself.
+    method: u32,
+    /// Index into `ImportScope` (0x35) — always 0 (nil): this writer never populates that table.
+    import_scope: u32,
+    /// 1-based run-start index into [`LocalVariableRow`] — the owned-range pattern mirrors
+    /// `tables::MetadataBuilder::add_type_def`'s `field_list`/`method_list` columns exactly (see
+    /// that function's doc): the run's end is implicit, either the NEXT `LocalScope` row's
+    /// `variable_list`, or the end of the `LocalVariable` table for the last row.
+    variable_list: u32,
+    /// 1-based run-start index into `LocalConstant` (0x34) — always `1` (an empty, degenerate-but-
+    /// still-stamped range) since this pass never populates `LocalConstant`.
+    constant_list: u32,
+    /// IL offset this scope starts at — always `0` (the whole method is one flat scope).
+    start_offset: u32,
+    /// IL byte length this scope covers — the method body's total code length
+    /// (`MethodSequencePoints::code_len`), i.e. the whole method.
+    length: u32,
+}
+
+/// `LocalVariable` (0x33, `PortablePdb-Metadata.md`): one named local, keyed by its 0-based slot
+/// index in the owning method's `LocalVarSig` (`cilly::ir::method::LocalDef`'s declaration order —
+/// see [`PdbBuilder::build`]'s doc for why unnamed locals get NO row here, preserving index gaps).
+#[derive(Debug, Clone)]
+struct LocalVariableRow {
+    /// `0` for every row this writer emits (no `DebuggerHidden` (bit `0x1`) support needed — every
+    /// row here is a real, named Rust local by construction; see the skip rule above).
+    attributes: u16,
+    /// The local's 0-based slot index in the method's `LocalVarSig` — `LocalDef`'s position in the
+    /// full (including-unnamed) locals list, NOT a compacted "Nth named local" counter.
+    index: u16,
+    /// `#Strings` heap index of the local's name (NOT `#Blob`/`#US` — see [`PdbWidths::strings_wide`]'s
+    /// doc for why `#Strings` is the right heap here, matching how `Document`/`MethodDebugInformation`
+    /// already use `#Blob` for path/sequence-point data but plain `#Strings` is the natural heap for
+    /// a simple identifier).
+    name: u32,
+}
+
 struct PdbWidths {
     heap_sizes: u8,
     blob_wide: bool,
     guid_wide: bool,
     document_wide: bool,
+    /// Whether `LocalScope.Method` (a plain, uncoded `MethodDef` index) needs 4 bytes instead of
+    /// 2 — sized by the TYPE-SYSTEM assembly's own `MethodDef` row count (from
+    /// [`TypeSystemRowCounts::rows`]), NOT by any table this standalone PDB owns rows for itself
+    /// (mirrors how `document_wide` is sized by `document_rows.len()`, but `MethodDef` isn't a
+    /// row-count this builder maintains directly — it's read out of the type-system row counts
+    /// [`PdbBuilder::new`] was constructed with).
+    method_def_wide: bool,
+    /// Whether `LocalVariable.Name` (a `#Strings` heap index) needs 4 bytes instead of 2 — same
+    /// `> 0xFFFF` convention as `blob_wide`/`guid_wide`, just finally consuming the `strings` heap
+    /// this module always constructed but never used before this table existed.
+    strings_wide: bool,
+    /// Whether `LocalScope.VariableList` (a row index into `LocalVariable`) needs 4 bytes instead
+    /// of 2 — sized by the `LocalVariable` table's OWN row count, exactly like `document_wide` is
+    /// sized by `document_rows.len()` (a plain table-index width, unrelated to any heap size).
+    local_variable_wide: bool,
 }
 
 impl PdbWidths {
@@ -382,6 +511,8 @@ impl PdbWidths {
         guids: &GuidHeap,
         user_strings: &UserStringHeap,
         document_rows: usize,
+        method_def_row_count: u32,
+        local_variable_rows: usize,
     ) -> Self {
         let mut heap_sizes = 0u8;
         if strings.as_bytes().len() > 0xFFFF {
@@ -399,6 +530,9 @@ impl PdbWidths {
             blob_wide: blobs.as_bytes().len() > 0xFFFF,
             guid_wide: guids.as_bytes().len() > 0xFFFF,
             document_wide: document_rows > 0xFFFF,
+            method_def_wide: method_def_row_count > 0xFFFF,
+            strings_wide: strings.as_bytes().len() > 0xFFFF,
+            local_variable_wide: local_variable_rows > 0xFFFF,
         }
     }
 }
@@ -671,6 +805,8 @@ fn normalized_type_system_rows(type_system: &TypeSystemRowCounts) -> Vec<(u32, u
 fn serialize_tables(
     documents: &[DocumentRow],
     methods: &[MethodDebugInformationRow],
+    local_scopes: &[LocalScopeRow],
+    local_variables: &[LocalVariableRow],
     widths: &PdbWidths,
 ) -> Vec<u8> {
     let mut valid = 0u64;
@@ -680,6 +816,28 @@ fn serialize_tables(
     if !methods.is_empty() {
         valid |= 1u64 << TABLE_METHOD_DEBUG_INFORMATION;
     }
+    if !local_scopes.is_empty() {
+        valid |= 1u64 << TABLE_LOCAL_SCOPE;
+    }
+    if !local_variables.is_empty() {
+        valid |= 1u64 << TABLE_LOCAL_VARIABLE;
+    }
+
+    // `Sorted` bitmask (§II.24.2.6): `LocalScope` (0x32) is one of the tables the Portable PDB /
+    // ECMA-335 metadata reader requires to be sorted by its primary key (`Method`) — CoreCLR's
+    // `System.Reflection.Metadata` reader enforces this at load time (`LocalScopeTableReader`
+    // throws `BadImageFormatException("Metadata table LocalScope not sorted")` if the bit isn't
+    // set, confirmed empirically: a `LocalScope` table whose rows genuinely ARE in ascending
+    // `Method` RID order — exactly what this builder produces, since it iterates `self.methods`
+    // in RID order at row-construction time — was still REJECTED until this bit was set,
+    // matching the reader's binary-search-by-Method assumption, which depends on the header
+    // claiming sortedness, not just the rows happening to already be sorted). `Document`/
+    // `MethodDebugInformation`/`LocalVariable` have no such requirement (no runtime binary-searches
+    // them by a key column), so only bit `TABLE_LOCAL_SCOPE` is ever set here.
+    let mut sorted = 0u64;
+    if !local_scopes.is_empty() {
+        sorted |= 1u64 << TABLE_LOCAL_SCOPE;
+    }
 
     let mut out = Vec::new();
     out.extend_from_slice(&0u32.to_le_bytes());
@@ -688,12 +846,14 @@ fn serialize_tables(
     out.push(widths.heap_sizes);
     out.push(1);
     out.extend_from_slice(&valid.to_le_bytes());
-    out.extend_from_slice(&0u64.to_le_bytes());
+    out.extend_from_slice(&sorted.to_le_bytes());
     for table in 0..64u32 {
         if valid & (1u64 << table) != 0 {
             let count = match table {
                 TABLE_DOCUMENT => documents.len(),
                 TABLE_METHOD_DEBUG_INFORMATION => methods.len(),
+                TABLE_LOCAL_SCOPE => local_scopes.len(),
+                TABLE_LOCAL_VARIABLE => local_variables.len(),
                 _ => unreachable!(),
             };
             out.extend_from_slice(&(count as u32).to_le_bytes());
@@ -709,6 +869,19 @@ fn serialize_tables(
     for row in methods {
         write_heap_idx(&mut out, row.document, widths.document_wide);
         write_heap_idx(&mut out, row.sequence_points, widths.blob_wide);
+    }
+    for row in local_scopes {
+        write_heap_idx(&mut out, row.method, widths.method_def_wide);
+        write_heap_idx(&mut out, row.import_scope, false);
+        write_heap_idx(&mut out, row.variable_list, widths.local_variable_wide);
+        write_heap_idx(&mut out, row.constant_list, false);
+        out.extend_from_slice(&row.start_offset.to_le_bytes());
+        out.extend_from_slice(&row.length.to_le_bytes());
+    }
+    for row in local_variables {
+        out.extend_from_slice(&row.attributes.to_le_bytes());
+        out.extend_from_slice(&row.index.to_le_bytes());
+        write_heap_idx(&mut out, row.name, widths.strings_wide);
     }
     out
 }
@@ -1037,6 +1210,7 @@ mod tests {
     struct TestTablesHeader {
         heap_sizes: u8,
         valid: u64,
+        sorted: u64,
         counts: Vec<(u32, usize)>,
         row_data_offset: usize,
     }
@@ -1045,6 +1219,23 @@ mod tests {
     struct TestMethodDebugInformationRow {
         document: u32,
         sequence_points: u32,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestLocalScopeRow {
+        method: u32,
+        import_scope: u32,
+        variable_list: u32,
+        constant_list: u32,
+        start_offset: u32,
+        length: u32,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestLocalVariableRow {
+        attributes: u16,
+        index: u16,
+        name: u32,
     }
 
     impl<'a> TestPdbReader<'a> {
@@ -1128,6 +1319,7 @@ mod tests {
             assert_eq!(tables[7], 1);
             let heap_sizes = tables[6];
             let valid = u64::from_le_bytes(tables[8..16].try_into().unwrap());
+            let sorted = u64::from_le_bytes(tables[16..24].try_into().unwrap());
             let mut cursor = 24;
             let mut counts = Vec::new();
             for table in 0..64u32 {
@@ -1141,6 +1333,7 @@ mod tests {
             TestTablesHeader {
                 heap_sizes,
                 valid,
+                sorted,
                 counts,
                 row_data_offset: cursor,
             }
@@ -1154,16 +1347,34 @@ mod tests {
                 .map_or(0, |&(_, count)| count)
         }
 
-        fn row_width(table: u32, header: &TestTablesHeader) -> usize {
+        fn row_width(&self, table: u32, header: &TestTablesHeader) -> usize {
             let index = |wide| if wide { 4 } else { 2 };
             let blob = index(header.heap_sizes & 0x4 != 0);
             let guid = index(header.heap_sizes & 0x2 != 0);
+            let strings = index(header.heap_sizes & 0x1 != 0);
             match table {
                 TABLE_DOCUMENT => blob + guid + blob + guid,
                 TABLE_METHOD_DEBUG_INFORMATION => {
                     let doc_rows = Self::table_row_count(header, TABLE_DOCUMENT);
                     index(doc_rows > 0xFFFF) + blob
                 }
+                TABLE_LOCAL_SCOPE => {
+                    let (_, type_system_rows) = self.pdb_stream_rows();
+                    let method_def_rows = type_system_rows
+                        .iter()
+                        .find(|&&(id, _)| id == Token::TABLE_METHOD_DEF)
+                        .map_or(0, |&(_, count)| count);
+                    let local_variable_rows = Self::table_row_count(header, TABLE_LOCAL_VARIABLE);
+                    // Method(idx) + ImportScope(idx, always narrow, 0 rows) + VariableList(idx) +
+                    // ConstantList(idx, always narrow, 0 rows) + StartOffset(4) + Length(4).
+                    index(method_def_rows > 0xFFFF)
+                        + 2
+                        + index(local_variable_rows > 0xFFFF)
+                        + 2
+                        + 4
+                        + 4
+                }
+                TABLE_LOCAL_VARIABLE => 2 + 2 + strings,
                 other => panic!("unexpected test PDB table {other:#x}"),
             }
         }
@@ -1174,7 +1385,7 @@ mod tests {
                 if id == table {
                     return offset;
                 }
-                offset += count * Self::row_width(id, header);
+                offset += count * self.row_width(id, header);
             }
             panic!("table {table:#x} is not present");
         }
@@ -1264,6 +1475,76 @@ mod tests {
                 });
             }
             rows
+        }
+
+        fn local_scope_rows(&self) -> Vec<TestLocalScopeRow> {
+            let header = self.tables_header();
+            let count = Self::table_row_count(&header, TABLE_LOCAL_SCOPE);
+            if count == 0 {
+                return Vec::new();
+            }
+            let mut cursor = header.row_data_offset + self.table_offset(TABLE_LOCAL_SCOPE, &header);
+            let tables = self.stream("#~");
+            let (_, type_system_rows) = self.pdb_stream_rows();
+            let method_def_rows = type_system_rows
+                .iter()
+                .find(|&&(id, _)| id == Token::TABLE_METHOD_DEF)
+                .map_or(0, |&(_, count)| count);
+            let method_wide = method_def_rows > 0xFFFF;
+            let local_variable_wide = Self::table_row_count(&header, TABLE_LOCAL_VARIABLE) > 0xFFFF;
+            let mut rows = Vec::new();
+            for _ in 0..count {
+                let method = Self::read_index(tables, &mut cursor, method_wide);
+                let import_scope = Self::read_index(tables, &mut cursor, false);
+                let variable_list = Self::read_index(tables, &mut cursor, local_variable_wide);
+                let constant_list = Self::read_index(tables, &mut cursor, false);
+                let start_offset = u32::from_le_bytes(tables[cursor..cursor + 4].try_into().unwrap());
+                cursor += 4;
+                let length = u32::from_le_bytes(tables[cursor..cursor + 4].try_into().unwrap());
+                cursor += 4;
+                rows.push(TestLocalScopeRow {
+                    method,
+                    import_scope,
+                    variable_list,
+                    constant_list,
+                    start_offset,
+                    length,
+                });
+            }
+            rows
+        }
+
+        fn local_variable_rows(&self) -> Vec<TestLocalVariableRow> {
+            let header = self.tables_header();
+            let count = Self::table_row_count(&header, TABLE_LOCAL_VARIABLE);
+            if count == 0 {
+                return Vec::new();
+            }
+            let mut cursor =
+                header.row_data_offset + self.table_offset(TABLE_LOCAL_VARIABLE, &header);
+            let tables = self.stream("#~");
+            let strings_wide = header.heap_sizes & 0x1 != 0;
+            let mut rows = Vec::new();
+            for _ in 0..count {
+                let attributes = u16::from_le_bytes(tables[cursor..cursor + 2].try_into().unwrap());
+                cursor += 2;
+                let index = u16::from_le_bytes(tables[cursor..cursor + 2].try_into().unwrap());
+                cursor += 2;
+                let name = Self::read_index(tables, &mut cursor, strings_wide);
+                rows.push(TestLocalVariableRow { attributes, index, name });
+            }
+            rows
+        }
+
+        /// Reads a plain, NUL-terminated `#Strings` heap entry — NOT the `#Blob`-compressed-length
+        /// "document name" encoding [`Self::document_name`] uses (that's a `Document.Name`-specific
+        /// convention; `LocalVariable.Name` is an ordinary `#Strings` index like any other metadata
+        /// name column, e.g. `TypeDef.Name`).
+        fn string_at(&self, offset: u32) -> String {
+            let strings = self.stream("#Strings");
+            let start = offset as usize;
+            let end = strings[start..].iter().position(|&b| b == 0).unwrap() + start;
+            std::str::from_utf8(&strings[start..end]).unwrap().to_string()
         }
 
         fn decode_sequence_points(
@@ -1447,6 +1728,7 @@ mod tests {
             MethodSequencePoints {
                 local_signature: Some(Token::new(Token::TABLE_STAND_ALONE_SIG, 1)),
                 points: method1.clone(),
+                ..Default::default()
             },
         );
         builder.add_method(
@@ -1454,6 +1736,7 @@ mod tests {
             MethodSequencePoints {
                 local_signature: None,
                 points: method3.clone(),
+                ..Default::default()
             },
         );
         (builder, vec![method1, Vec::new(), method3])
@@ -1570,6 +1853,7 @@ mod tests {
                     end_col: 10,
                     is_hidden: false,
                 }],
+                ..Default::default()
             },
         );
         assert_eq!(builder.methods[1].as_ref().unwrap().points.len(), 1);
@@ -1602,6 +1886,7 @@ mod tests {
                     sp(5, "a.rs", 4, 1, 4, 2),
                     sp(9, "a.rs", 5, 1, 5, 2),
                 ],
+                ..Default::default()
             },
         );
         let stored = builder.methods[0].as_ref().unwrap().points.clone();
@@ -1646,6 +1931,7 @@ mod tests {
             MethodSequencePoints {
                 local_signature: None,
                 points: vec![degenerate],
+                ..Default::default()
             },
         );
 
@@ -1686,6 +1972,7 @@ mod tests {
             MethodSequencePoints {
                 local_signature: None,
                 points: vec![degenerate],
+                ..Default::default()
             },
         );
 
@@ -1783,6 +2070,7 @@ mod tests {
             MethodSequencePoints {
                 local_signature: None,
                 points: points.clone(),
+                ..Default::default()
             },
         );
         let (bytes, _) = builder.build();
@@ -1822,5 +2110,222 @@ mod tests {
             &bytes_a[reader.stream_offset("#Pdb")..reader.stream_offset("#Pdb") + 20],
             &id_a
         );
+    }
+
+    /// LocalScope (0x32) / LocalVariable (0x33) coverage: a method with 2 NAMED locals and 1
+    /// UNNAMED (compiler-temp) local sandwiched between them must get exactly 2 `LocalVariable`
+    /// rows, with `Index` reflecting the local's ABSOLUTE slot position in the method's
+    /// `LocalVarSig` (i.e. the unnamed local's slot leaves a gap — index 0 and index 2, not 0 and
+    /// 1), matching the recon brief's "iterate `enumerate()`, only push a row when `name.is_some()`"
+    /// rule. Also checks the `LocalScope` row's `VariableList` owned-range start.
+    #[test]
+    fn add_method_with_locals_emits_local_variable_rows_preserving_slot_index_gaps() {
+        let type_system = TypeSystemRowCounts {
+            rows: vec![(Token::TABLE_METHOD_DEF, 1)],
+            entry_point_token: 0,
+        };
+        let mut builder = PdbBuilder::new(type_system, 1);
+        let tok = Token::new(Token::TABLE_METHOD_DEF, 1);
+        builder.add_method(
+            tok,
+            MethodSequencePoints {
+                local_signature: None,
+                points: vec![sp(0, "src/main.rs", 1, 1, 1, 2)],
+                locals: vec![
+                    Some("mission_critical_value".to_string()),
+                    None, // compiler-generated temporary — must get NO LocalVariable row.
+                    Some("result".to_string()),
+                ],
+                code_len: 42,
+            },
+        );
+
+        let (bytes, _) = builder.build();
+        let reader = TestPdbReader::parse(&bytes);
+
+        // Regression test for a real bug caught by the task's mandated empirical verification
+        // (NOT by table-shape inspection alone): `System.Reflection.Metadata`'s reader REJECTS
+        // the whole PDB with `BadImageFormatException("Metadata table LocalScope not sorted")`
+        // unless the `#~` stream's `Sorted` bitmask (§II.24.2.6) has bit `TABLE_LOCAL_SCOPE` set —
+        // even when the rows themselves are already in ascending `Method` order (as they always
+        // are here, since `build()` iterates `self.methods` in RID order). A narrow structural/
+        // byte-shape check would NOT have caught this; only loading the PDB through the real
+        // runtime reader did.
+        let header = reader.tables_header();
+        assert_eq!(
+            header.sorted & (1u64 << TABLE_LOCAL_SCOPE),
+            1u64 << TABLE_LOCAL_SCOPE,
+            "LocalScope must be declared Sorted or System.Reflection.Metadata rejects the PDB"
+        );
+
+        let scopes = reader.local_scope_rows();
+        assert_eq!(scopes.len(), 1, "exactly one LocalScope row for the one method with locals");
+        assert_eq!(scopes[0].method, 1, "MethodDef RID 1");
+        assert_eq!(scopes[0].import_scope, 0, "no ImportScope support: always nil");
+        assert_eq!(scopes[0].variable_list, 1, "1-based run start into LocalVariable");
+        assert_eq!(scopes[0].constant_list, 1, "LocalConstant never populated: degenerate empty range");
+        assert_eq!(scopes[0].start_offset, 0, "whole-method flat scope");
+        assert_eq!(scopes[0].length, 42, "covers the method's full IL code length");
+
+        let vars = reader.local_variable_rows();
+        assert_eq!(vars.len(), 2, "only the 2 NAMED locals get rows; the unnamed temp gets none");
+        assert_eq!(vars[0].index, 0, "first named local is slot 0");
+        assert_eq!(vars[0].attributes, 0);
+        assert_eq!(reader.string_at(vars[0].name), "mission_critical_value");
+        assert_eq!(
+            vars[1].index, 2,
+            "second named local is slot 2 — the unnamed slot 1 leaves a gap, not compacted to 1"
+        );
+        assert_eq!(reader.string_at(vars[1].name), "result");
+    }
+
+    /// A method with ZERO named locals (either no locals at all, or locals that are all unnamed
+    /// compiler temporaries) must get NO `LocalScope` row — matching how real compilers hide
+    /// temporaries from the Locals panel entirely rather than emitting an empty scope for them.
+    #[test]
+    fn add_method_with_no_named_locals_gets_no_local_scope_row() {
+        let type_system = TypeSystemRowCounts {
+            rows: vec![(Token::TABLE_METHOD_DEF, 1)],
+            entry_point_token: 0,
+        };
+        let mut builder = PdbBuilder::new(type_system, 1);
+        let tok = Token::new(Token::TABLE_METHOD_DEF, 1);
+        builder.add_method(
+            tok,
+            MethodSequencePoints {
+                local_signature: None,
+                points: vec![sp(0, "src/main.rs", 1, 1, 1, 2)],
+                locals: vec![None, None], // only unnamed temporaries.
+                code_len: 10,
+            },
+        );
+
+        let (bytes, _) = builder.build();
+        let reader = TestPdbReader::parse(&bytes);
+        assert_eq!(reader.local_scope_rows().len(), 0);
+        assert_eq!(reader.local_variable_rows().len(), 0);
+        let header = reader.tables_header();
+        assert_eq!(
+            header.valid & (1u64 << TABLE_LOCAL_SCOPE),
+            0,
+            "LocalScope table must not even be marked Valid when it has zero rows"
+        );
+        assert_eq!(header.valid & (1u64 << TABLE_LOCAL_VARIABLE), 0);
+    }
+
+    /// A method with named locals but (implausibly) no sequence points must STILL get its
+    /// `LocalScope`/`LocalVariable` rows — these tables are keyed by `MethodDef` row, independent
+    /// of sequence-point presence (see `export.rs`'s `add_method` skip-guard, which only skips a
+    /// method with BOTH zero points AND zero named locals).
+    #[test]
+    fn add_method_with_locals_but_no_sequence_points_still_gets_local_scope() {
+        let type_system = TypeSystemRowCounts {
+            rows: vec![(Token::TABLE_METHOD_DEF, 1)],
+            entry_point_token: 0,
+        };
+        let mut builder = PdbBuilder::new(type_system, 1);
+        let tok = Token::new(Token::TABLE_METHOD_DEF, 1);
+        builder.add_method(
+            tok,
+            MethodSequencePoints {
+                local_signature: None,
+                points: Vec::new(),
+                locals: vec![Some("x".to_string())],
+                code_len: 7,
+            },
+        );
+
+        let (bytes, _) = builder.build();
+        let reader = TestPdbReader::parse(&bytes);
+        let scopes = reader.local_scope_rows();
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].length, 7);
+        let vars = reader.local_variable_rows();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(reader.string_at(vars[0].name), "x");
+    }
+
+    /// Multiple methods with locals: `LocalScope.VariableList` owned-range starts must be
+    /// contiguous and non-overlapping across methods, in RID order — mirrors
+    /// `tables::MetadataBuilder::add_type_def`'s `field_list`/`method_list` owned-range pattern
+    /// (see [`PdbBuilder::build`]'s doc / the `LocalScopeRow` doc for the exact mirrored shape).
+    #[test]
+    fn local_variable_owned_ranges_are_contiguous_across_multiple_methods() {
+        let type_system = TypeSystemRowCounts {
+            rows: vec![(Token::TABLE_METHOD_DEF, 2)],
+            entry_point_token: 0,
+        };
+        let mut builder = PdbBuilder::new(type_system, 2);
+        builder.add_method(
+            Token::new(Token::TABLE_METHOD_DEF, 1),
+            MethodSequencePoints {
+                local_signature: None,
+                points: vec![sp(0, "a.rs", 1, 1, 1, 2)],
+                locals: vec![Some("a0".to_string()), Some("a1".to_string())],
+                code_len: 5,
+            },
+        );
+        builder.add_method(
+            Token::new(Token::TABLE_METHOD_DEF, 2),
+            MethodSequencePoints {
+                local_signature: None,
+                points: vec![sp(0, "a.rs", 2, 1, 2, 2)],
+                locals: vec![Some("b0".to_string())],
+                code_len: 3,
+            },
+        );
+
+        let (bytes, _) = builder.build();
+        let reader = TestPdbReader::parse(&bytes);
+        let scopes = reader.local_scope_rows();
+        assert_eq!(scopes.len(), 2);
+        assert_eq!(scopes[0].method, 1);
+        assert_eq!(scopes[0].variable_list, 1, "method 1's variables start at row 1");
+        assert_eq!(scopes[1].method, 2);
+        assert_eq!(
+            scopes[1].variable_list, 3,
+            "method 2's variables start AFTER method 1's 2 locals, at row 3"
+        );
+
+        let vars = reader.local_variable_rows();
+        assert_eq!(vars.len(), 3);
+        assert_eq!(reader.string_at(vars[0].name), "a0");
+        assert_eq!(reader.string_at(vars[1].name), "a1");
+        assert_eq!(reader.string_at(vars[2].name), "b0");
+    }
+
+    /// Round-trip determinism, extended to cover the two new tables: re-building the identical
+    /// fixture twice must produce byte-identical PDBs (including `LocalScope`/`LocalVariable`
+    /// rows), and the tables read back must decode to the exact same named locals.
+    #[test]
+    fn pdb_build_is_deterministic_including_local_scope_and_local_variable_tables() {
+        fn fixture() -> PdbBuilder {
+            let type_system = TypeSystemRowCounts {
+                rows: vec![(Token::TABLE_METHOD_DEF, 1)],
+                entry_point_token: 0,
+            };
+            let mut builder = PdbBuilder::new(type_system, 1);
+            builder.add_method(
+                Token::new(Token::TABLE_METHOD_DEF, 1),
+                MethodSequencePoints {
+                    local_signature: None,
+                    points: vec![sp(0, "a.rs", 1, 1, 1, 2)],
+                    locals: vec![Some("mission_critical_value".to_string()), None],
+                    code_len: 11,
+                },
+            );
+            builder
+        }
+
+        let (bytes_a, id_a) = fixture().build();
+        let (bytes_b, id_b) = fixture().build();
+        assert_eq!(bytes_a, bytes_b);
+        assert_eq!(id_a, id_b);
+
+        let reader = TestPdbReader::parse(&bytes_a);
+        let vars = reader.local_variable_rows();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(reader.string_at(vars[0].name), "mission_critical_value");
+        assert_eq!(vars[0].index, 0);
     }
 }

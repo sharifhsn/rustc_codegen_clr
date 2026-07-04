@@ -24,6 +24,19 @@ fn middle_frame_for_pdb_probe() -> String {
     deep_leaf_for_pdb_probe()
 }
 
+/// LocalScope (0x32) / LocalVariable (0x33) acceptance probe: a handful of obviously-named,
+/// distinctly-valued locals a debugger's Locals/Variables panel should list by name (not just by
+/// slot number) when a breakpoint is set on the `println!` line below. `mission_critical_value`
+/// is the name this task's empirical-verification step greps/breakpoints for.
+#[inline(never)]
+fn compute_with_named_locals() -> i32 {
+    let mission_critical_value = 42;
+    let another_named_local = mission_critical_value * 2;
+    let sum = mission_critical_value + another_named_local; // <- set a breakpoint on this line
+    println!("sum = {sum}"); // breakpoint here to inspect locals in the panel
+    sum
+}
+
 fn main() {
     let asm = mycorrhiza::System::Reflection::Assembly::get_executing_assembly();
     let location = DotNetString::from_handle(asm.get_location()).to_rust_string();
@@ -40,4 +53,6 @@ fn main() {
         "names probe fn:       {}",
         trace.contains("deep_leaf_for_pdb_probe")
     );
+    let result = compute_with_named_locals();
+    println!("compute_with_named_locals() = {result}");
 }
