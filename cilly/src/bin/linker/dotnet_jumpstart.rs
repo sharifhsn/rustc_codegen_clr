@@ -60,16 +60,16 @@ fn main(){{
     }}
     if {has_pdb}{{
       if !pdb_file.exists() || requires_refresh{{
-          println!("creating the pdb file");
           let mut file = std::fs::File::create(pdb_file).expect("Could not create a file to provide the pdb debug info.");
           file.write_all(BUNDLED_PDB).expect("Could create a file to provide the pdb debug info.");
-      }}
-      else{{
-          println!("Not creating the pdb file");
       }}
     }}
     let args:Vec<String> = std::env::args().collect();
     let args = &args[1..];
-    std::process::Command::new("{jumpstart_cmd}").arg(dll_path).args(args).status().expect("Could not start the .NET runtime.");
+    let status = std::process::Command::new("{jumpstart_cmd}").arg(dll_path).args(args).status().expect("Could not start the .NET runtime.");
+    // The apphost is transparent: the program's exit code (a panic's 101, a process::exit N)
+    // must survive to the invoking shell. A signal death has no code — report the
+    // conventional 128+SIGABRT.
+    std::process::exit(status.code().unwrap_or(134));
 }}
 

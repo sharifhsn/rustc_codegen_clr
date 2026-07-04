@@ -96,8 +96,16 @@ pub fn apply(ctx: &Context) -> Result<()> {
     write_config(ctx, "")?;
     let lock_path = ctx.crate_dir.join("Cargo.lock");
     if !lock_path.is_file() {
-        let _ = Command::new(&ctx.cargo)
-            .current_dir(&ctx.crate_dir)
+        let mut lockfile_cmd = Command::new(&ctx.cargo);
+        lockfile_cmd.current_dir(&ctx.crate_dir);
+        // Pin the toolchain when installed, same as `base_cargo()` — otherwise this
+        // bare `cargo` resolves to rustup's default (stable) toolchain, which rejects
+        // `-Z` flags. Only matters on a fresh crate with no Cargo.lock yet (the common
+        // first-build case), which is why it can go unnoticed.
+        if let Some(tc) = &ctx.toolchain {
+            lockfile_cmd.env("RUSTUP_TOOLCHAIN", tc);
+        }
+        let _ = lockfile_cmd
             .arg("-Zjson-target-spec")
             .arg("generate-lockfile")
             .status();
@@ -144,7 +152,9 @@ pub fn apply(ctx: &Context) -> Result<()> {
 
     // STEP 3: regenerate .cargo/config.toml FROM SCRATCH with the filtered paths.
     write_config(ctx, &paths_lines)?;
-    eprintln!("==> regenerated .cargo/config.toml with dotnet_overlays paths override");
+    if ctx.flags.verbose {
+        eprintln!("==> regenerated .cargo/config.toml with dotnet_overlays paths override");
+    }
 
     // Verify each overlay's declared version against the locked version; warn loudly on
     // a REAL mismatch (cargo would silently ignore the override -> miscompile risk).

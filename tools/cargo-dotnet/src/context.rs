@@ -255,6 +255,18 @@ impl Context {
             Profile::Debug
         };
 
+        // `host::inner_cargo()` prefers `$CARGO` (the Book §External Tools convention,
+        // right when we want to reinvoke whichever cargo drove `cargo dotnet`). But
+        // `$CARGO` is a cargo subcommand's own outer cargo, resolved to a SPECIFIC
+        // toolchain's binary (e.g. `~/.rustup/toolchains/stable-.../bin/cargo`) — not
+        // the rustup shim. When we're about to pin a different toolchain via
+        // `RUSTUP_TOOLCHAIN` (installed mode), that env var only takes effect through
+        // the shim; a hardcoded toolchain binary ignores it outright, so `-Z` flags
+        // fail with "only accepted on the nightly channel" if `$CARGO` happens to be
+        // stable. Use a bare `cargo` (PATH-resolved, i.e. the shim) whenever we are
+        // pinning a toolchain; keep the `$CARGO` preference only when we are not.
+        let cargo = if toolchain.is_some() { "cargo".to_string() } else { host::inner_cargo() };
+
         Ok(Context {
             host,
             profile,
@@ -267,7 +279,7 @@ impl Context {
             crate_dir,
             paths,
             toolchain,
-            cargo: host::inner_cargo(),
+            cargo,
             ilasm,
             dotnet,
             dotnet_heal,

@@ -15,7 +15,7 @@
     <RustDotnetTarget Condition="'$(RustDotnetTarget)'==''">x86_64-unknown-dotnet</RustDotnetTarget>
 
     <!-- Target .NET runtime version for the Rust crate AND the consumer project: 8 or 9
-         (default 8). Threaded to `cargo dotnet build --dotnet $(RustDotnetVersion)` so the
+         (default 8). Threaded to `cargo dotnet build -\-dotnet $(RustDotnetVersion)` so the
          produced assembly's `.assembly extern .ver` + runtimeconfig match the runtime, and a
          consumer can set its own `<TargetFramework>net$(RustDotnetVersion).0</TargetFramework>`.
          NOTE: the Rust .dll path is version-independent, so switching versions needs a rebuild —

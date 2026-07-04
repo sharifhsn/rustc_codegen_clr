@@ -776,7 +776,9 @@ pub fn inject_all(ctx: &Ctx) -> Result<()> {
     let sys_dst = lib.join("std/src/sys");
     let std_dst = lib.join("std/src");
 
-    eprintln!("==> injecting dotnet PAL into rust-src ({})", sys_dst.display());
+    if ctx.flags.verbose {
+        eprintln!("==> injecting dotnet PAL into rust-src ({})", sys_dst.display());
+    }
 
     // 1) mirror the PAL trees (clean base each run).
     let pal_sys = ctx.paths.pal_root.join("sys");
@@ -784,14 +786,18 @@ pub fn inject_all(ctx: &Ctx) -> Result<()> {
         bail!("no PAL sys tree at {}", pal_sys.display());
     }
     let n = mirror_tree(&pal_sys, &sys_dst)?;
-    eprintln!("==> mirrored {n} dotnet_pal/sys files");
+    if ctx.flags.verbose {
+        eprintln!("==> mirrored {n} dotnet_pal/sys files");
+    }
 
     // os/dotnet platform tree -> std/src/os/dotnet.
     let pal_os_dotnet = ctx.paths.pal_root.join("os/dotnet");
     if pal_os_dotnet.is_dir() {
         let dst = std_dst.join("os/dotnet");
         let m = mirror_tree(&pal_os_dotnet, &dst)?;
-        eprintln!("==> mirrored {m} dotnet_pal/os/dotnet files");
+        if ctx.flags.verbose {
+            eprintln!("==> mirrored {m} dotnet_pal/os/dotnet files");
+        }
     }
 
     // panic_unwind/unwind doc-only markers.
@@ -835,7 +841,7 @@ pub fn inject_all(ctx: &Ctx) -> Result<()> {
     let pal_libc = ctx.paths.pal_root.join("libc/dotnet.rs");
     if pal_libc.is_file() {
         for d in find_libc_dirs(&lib) {
-            if patch_libc(&d, &pal_libc)? {
+            if patch_libc(&d, &pal_libc)? && ctx.flags.verbose {
                 eprintln!("==> patched libc: {}", d.display());
             }
         }

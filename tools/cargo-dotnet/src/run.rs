@@ -13,7 +13,9 @@ use crate::context::Context;
 pub fn run(art: &Artifact, prog_args: &[String], ctx: &Context) -> Result<i32> {
     match art {
         Artifact::Executable(exe) => {
-            eprintln!("== RUN {} ==", exe.display());
+            if ctx.flags.verbose {
+                eprintln!("== RUN {} ==", exe.display());
+            }
             let mut cmd = Command::new(exe);
             cmd.args(prog_args);
             // The apphost is a native launcher that finds the .NET runtime; self-heal
@@ -27,7 +29,9 @@ pub fn run(art: &Artifact, prog_args: &[String], ctx: &Context) -> Result<i32> {
                 .status()
                 .with_context(|| format!("failed to run apphost {}", exe.display()))?;
             let code = status.code().unwrap_or(1);
-            eprintln!("run exit: {code}");
+            if ctx.flags.verbose {
+                eprintln!("run exit: {code}");
+            }
             Ok(code)
         }
         Artifact::Library { dll, stem, .. } => {

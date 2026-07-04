@@ -71,7 +71,9 @@ pub fn build(ctx: &Context) -> Result<String> {
             eprintln!("{line}");
         }
     }
-    eprintln!("== build exit: {} ==", out.status.code().unwrap_or(-1));
+    if ctx.flags.verbose || !out.status.success() {
+        eprintln!("== build exit: {} ==", out.status.code().unwrap_or(-1));
+    }
     if !out.status.success() {
         bail!("inner cargo build failed (exit {})", out.status.code().unwrap_or(-1));
     }
@@ -115,7 +117,7 @@ fn patch_registry_libc(ctx: &Context) -> Result<()> {
         return Ok(());
     }
     for d in palinject::find_libc_dirs(&ctx.paths.registry_src) {
-        if palinject::patch_libc(&d, &pal_libc)? {
+        if palinject::patch_libc(&d, &pal_libc)? && ctx.flags.verbose {
             eprintln!("==> patched registry libc: {}", d.display());
         }
     }
