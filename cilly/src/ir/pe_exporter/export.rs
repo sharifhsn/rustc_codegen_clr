@@ -1023,7 +1023,11 @@ mod tests {
         };
         assert_eq!(guid, &pdb_id[0..16], "Debug Directory GUID must equal the PDB's own #Pdb-stream id[0..16]");
         let expected_stamp = u32::from_le_bytes([pdb_id[16], pdb_id[17], pdb_id[18], pdb_id[19]]);
-        assert_eq!(age, expected_stamp | 1, "Age mirrors DebugDirectoryEntry::from_pdb_id's stamp|1 derivation");
+        // `age` is ALWAYS the literal Roslyn-convention `1` (see `DebugDirectoryEntry::age`'s doc):
+        // a content-derived value silently fails `netcoredbg`'s `SymbolReader.
+        // TryOpenReaderFromCodeView`, which gates its GUID/stamp comparison behind `Age == 1` before
+        // even checking them, found empirically during this task's live-debugger verification.
+        assert_eq!(age, 1, "Age must be the literal Roslyn-convention 1, not a content-derived value");
         // THE critical check (root cause of a real Phase-2 acceptance bug — see
         // `pdb::DebugDirectoryEntry::stamp`'s doc): `System.Reflection.Metadata`'s
         // `PEReader.TryOpenCodeViewPortablePdb` matches the opened PDB's id against

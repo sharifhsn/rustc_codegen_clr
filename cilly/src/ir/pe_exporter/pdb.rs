@@ -1151,10 +1151,31 @@ pub struct DebugDirectoryEntry {
     /// The RSDS payload's `Age` field (conventionally starts at 1 and increments per PDB rebuild
     /// for the same GUID under the reference toolchain; this writer has no incremental-rebuild
     /// concept, so it is always `1` — content changes produce a new GUID instead, via
-    /// [`deterministic_pdb_id`]). **Cosmetic only** — confirmed via `System.Reflection.Metadata`'s
-    /// own decompiled source (`PEReader.TryOpenCodeViewPortablePdb`) that the runtime's PDB-match
-    /// check never reads this field; [`stamp`](Self::stamp) is what actually gates resolution (see
-    /// that field's doc — this was the root cause of a real Phase 2 acceptance-testing bug).
+    /// [`deterministic_pdb_id`]).
+    ///
+    /// **NOT cosmetic to every consumer** — `System.Reflection.Metadata`'s own
+    /// `PEReader.TryOpenAssociatedPortablePdb` never reads this field (only [`stamp`](Self::stamp)
+    /// gates that API's match), but at least one real symbol-loading consumer hardcodes an exact
+    /// `Age == 1` gate BEFORE it even compares GUID/stamp: `netcoredbg`'s managed `SymbolReader.
+    /// TryOpenReaderFromCodeView` (`src/managed/SymbolReader.cs`) reads:
+    /// ```csharp
+    /// if (data.Age == 1 && new BlobContentId(reader.DebugMetadataHeader.Id)
+    ///         == new BlobContentId(data.Guid, codeViewEntry.Stamp))
+    /// ```
+    /// Found empirically during this task's DAP/`netcoredbg` breakpoint-and-Locals-panel
+    /// verification: a from-scratch DAP session against a `cd_pdb`-built `.dll`/`.pdb` pair loaded
+    /// the module with `"symbolStatus": "Symbols not found."` and a pending breakpoint NEVER
+    /// resolved, even though the SAME PDB parsed perfectly (all `Document`/`MethodDebugInformation`/
+    /// `LocalScope`/`LocalVariable` rows, including the exact `mission_critical_value`/
+    /// `another_named_local` locals this task added) under a standalone
+    /// `System.Reflection.Metadata`-based reader harness and under `PEReader.
+    /// TryOpenAssociatedPortablePdb` directly — isolating the failure to netcoredbg's stricter,
+    /// GUID/stamp-first-only-if-`Age==1` gate. The previous `stamp | 1` value here produces some
+    /// odd 32-bit number (content-hash-derived), essentially never `1`, silently failing that gate
+    /// with no exception (the surrounding `try`/`catch` in `SymbolReader.cs` swallows everything).
+    /// Roslyn always emits `Age = 1` for a freshly-built (non-incremental) PDB — matching that
+    /// convention exactly, rather than deriving a "cosmetically nonzero" value from content, is
+    /// what makes both consumers happy at once.
     pub age: u32,
     /// Bytes `16..20` of the [`PdbId`], written VERBATIM into the `IMAGE_DEBUG_DIRECTORY` row's own
     /// `TimeDateStamp` field (`pe.rs`'s `write_debug_directory`) — **this, not [`age`](Self::age),
@@ -1177,10 +1198,12 @@ pub struct DebugDirectoryEntry {
 impl DebugDirectoryEntry {
     /// Builds the entry from a [`PdbId`] ([`PdbBuilder::build`]'s second return value) and the PDB
     /// file's on-disk name, splitting the 20 content-hash bytes into the CodeView GUID (bytes
-    /// `0..16`), the row `TimeDateStamp` (bytes `16..20`, VERBATIM — see [`stamp`](Self::stamp)'s
-    /// doc for why this exact value, not `age`, is the real match key), and a cosmetic RSDS `Age`
-    /// (`stamp | 1`, kept nonzero purely so `age == 0` — a valid but unusual value — never gets
-    /// confused with "field not set" while eyeballing a hex dump; the runtime never reads it).
+    /// `0..16`) and the row `TimeDateStamp` (bytes `16..20`, VERBATIM — see [`stamp`](Self::stamp)'s
+    /// doc for why this exact value is the real match key for `System.Reflection.Metadata`-based
+    /// consumers). `age` is always the literal `1` — see [`age`](Self::age)'s doc for why this
+    /// writer, which never does incremental PDB rebuilds, must still emit the exact conventional
+    /// value rather than any other nonzero placeholder: at least one real consumer (`netcoredbg`)
+    /// gates its GUID/stamp comparison behind `Age == 1` and silently rejects everything else.
     #[must_use]
     pub fn from_pdb_id(id: PdbId, pdb_path: String) -> Self {
         let mut guid = [0u8; 16];
@@ -1188,7 +1211,7 @@ impl DebugDirectoryEntry {
         let stamp = u32::from_le_bytes([id[16], id[17], id[18], id[19]]);
         Self {
             guid,
-            age: stamp | 1,
+            age: 1,
             stamp,
             pdb_path,
         }
@@ -1780,12 +1803,12 @@ mod tests {
             [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         );
         assert_eq!(entry.pdb_path, "foo.pdb");
-        // stamp bytes are [16,17,18,19] little-endian = 0x13121110; OR 1 keeps `age` nonzero (it
-        // already is here) without masking any bit we care about asserting.
-        assert_eq!(entry.age, 0x1312_1110 | 1);
+        // `age` is ALWAYS the literal Roslyn-convention `1`, regardless of PDB content — see
+        // `DebugDirectoryEntry::age`'s doc for why a content-derived value (this module's earlier
+        // `stamp | 1`) silently fails netcoredbg's `Age == 1` gate.
+        assert_eq!(entry.age, 1);
         // `stamp` (the field the runtime ACTUALLY matches against, per `stamp`'s doc) must be the
-        // RAW bytes[16..20] value, NOT OR'd with 1 like `age` — this is the whole point of having
-        // two separate fields.
+        // RAW bytes[16..20] value — stamp bytes are [16,17,18,19] little-endian = 0x13121110.
         assert_eq!(entry.stamp, 0x1312_1110);
     }
 
