@@ -168,6 +168,160 @@ impl Param {
     }
 }
 
+/// A typed, named .NET property/field on an entity `Root` — e.g. `Person::AGE: Field<Person, i32>`.
+///
+/// This is the ergonomic front door to the predicate-building machinery above: instead of hand-writing
+/// `Param::new(type_name, "p")` + `.expr().prop("Age")` + `Expr::const_i32(v)` + `TypedPredicate::new(..)`
+/// at every call site, a `Field<Root, Val>` constant (generated once, by `#[derive(DotnetEntity)]` in
+/// `dotnet_macros`) bundles the owning type's .NET name and the property's .NET name, and its methods
+/// (`.eq`/`.gt`/`.contains`/`.is_true`/…, added per `Val` below) go straight from a RAW Rust value to a
+/// finished `TypedPredicate<Root>` — no `Param`, `Expr`, or property-name string ever touched by a caller.
+///
+/// `Root`/`Val` are phantom type parameters (see `TypedPredicate`'s module doc) — `Field` itself carries
+/// no runtime payload beyond the two `&'static str`s, so it is `Copy` regardless of `Root`/`Val` (manual
+/// impls below, matching `TypedPredicate`'s own reasoning for not `#[derive]`ing).
+pub struct Field<Root, Val> {
+    /// The owning entity's .NET type spec, e.g. `"LinqDemo.Person, LinqDemo"` — fed to `Param::new`.
+    type_name: &'static str,
+    /// The .NET property/field name, e.g. `"Age"` — fed to `Expr::prop`.
+    prop_name: &'static str,
+    _root: PhantomData<fn() -> Root>,
+    _val: PhantomData<fn() -> Val>,
+}
+
+impl<Root, Val> Clone for Field<Root, Val> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<Root, Val> Copy for Field<Root, Val> {}
+
+impl<Root, Val> Field<Root, Val> {
+    /// Construct a field descriptor. Callers should not normally spell this out by hand — it is what
+    /// `#[derive(DotnetEntity)]` generates one of per struct field — but it is `pub const fn` so the
+    /// derive can emit it as an associated `const`.
+    #[must_use]
+    pub const fn new(type_name: &'static str, prop_name: &'static str) -> Self {
+        Field {
+            type_name,
+            prop_name,
+            _root: PhantomData,
+            _val: PhantomData,
+        }
+    }
+
+    /// Build the `Param` this field's property access is expressed over, plus the `x.Prop` member
+    /// access itself. A fixed lambda-parameter name (`"p"`) is fine even across independently-called
+    /// `Field` methods within one combined predicate — `TypedPredicate`'s `BitAnd`/`BitOr` already
+    /// detect and rebind mismatched `Param`s (see `combine` above), so two `Field` calls building two
+    /// separate `TypedPredicate<Root>`s that both happen to use `"p"` are handled exactly like any two
+    /// independently-authored predicates.
+    fn param_and_prop(self) -> (Param, Expr) {
+        let p = Param::new(self.type_name, "p");
+        let e = p.expr().prop(self.prop_name);
+        (p, e)
+    }
+
+    /// A trivially-true predicate over this field's entity type (`1 == 1`) — e.g. for a "no filter
+    /// applied" branch. Only needs `self` to know which `Root`/.NET type to build a `Param` against; the
+    /// field itself is otherwise irrelevant to the constant body, so (unlike the other `Field` methods)
+    /// this deliberately does NOT build the `x.Prop` member access — the .NET type need not actually
+    /// declare `self`'s property/field for `always`/`never` to work.
+    #[must_use]
+    pub fn always(self) -> TypedPredicate<Root> {
+        let p = Param::new(self.type_name, "p");
+        TypedPredicate::new(p, Expr::const_i32(1).eq(Expr::const_i32(1)))
+    }
+
+    /// A trivially-false predicate over this field's entity type (`1 == 0`).
+    #[must_use]
+    pub fn never(self) -> TypedPredicate<Root> {
+        let p = Param::new(self.type_name, "p");
+        TypedPredicate::new(p, Expr::const_i32(1).eq(Expr::const_i32(0)))
+    }
+}
+
+macro_rules! field_numeric_cmp {
+    ($ty:ty, $const_fn:ident) => {
+        impl<Root> Field<Root, $ty> {
+            fn cmp<const OP: &'static str>(self, v: $ty) -> TypedPredicate<Root> {
+                let (p, e) = self.param_and_prop();
+                TypedPredicate::new(p, binop::<OP>(e, Expr::$const_fn(v)))
+            }
+            /// `field == v`.
+            #[must_use]
+            pub fn eq(self, v: $ty) -> TypedPredicate<Root> {
+                self.cmp::<"Equal">(v)
+            }
+            /// `field > v`.
+            #[must_use]
+            pub fn gt(self, v: $ty) -> TypedPredicate<Root> {
+                self.cmp::<"GreaterThan">(v)
+            }
+            /// `field >= v`.
+            #[must_use]
+            pub fn ge(self, v: $ty) -> TypedPredicate<Root> {
+                self.cmp::<"GreaterThanOrEqual">(v)
+            }
+            /// `field < v`.
+            #[must_use]
+            pub fn lt(self, v: $ty) -> TypedPredicate<Root> {
+                self.cmp::<"LessThan">(v)
+            }
+            /// `field <= v`.
+            #[must_use]
+            pub fn le(self, v: $ty) -> TypedPredicate<Root> {
+                self.cmp::<"LessThanOrEqual">(v)
+            }
+        }
+    };
+}
+
+field_numeric_cmp!(i32, const_i32);
+field_numeric_cmp!(i64, const_i64);
+
+impl<Root> Field<Root, String> {
+    /// `field == v`.
+    #[must_use]
+    pub fn eq(self, v: &str) -> TypedPredicate<Root> {
+        let (p, e) = self.param_and_prop();
+        TypedPredicate::new(p, e.eq(Expr::const_str(v)))
+    }
+    /// `field.Contains(v)` — the standard EF-translatable substring filter (`LIKE '%v%'` in SQL).
+    #[must_use]
+    pub fn contains(self, v: &str) -> TypedPredicate<Root> {
+        let (p, e) = self.param_and_prop();
+        TypedPredicate::new(p, e.call1_same_type("Contains", Expr::const_str(v)))
+    }
+    /// `field.StartsWith(v)`.
+    #[must_use]
+    pub fn starts_with(self, v: &str) -> TypedPredicate<Root> {
+        let (p, e) = self.param_and_prop();
+        TypedPredicate::new(p, e.call1_same_type("StartsWith", Expr::const_str(v)))
+    }
+    /// `field.EndsWith(v)`.
+    #[must_use]
+    pub fn ends_with(self, v: &str) -> TypedPredicate<Root> {
+        let (p, e) = self.param_and_prop();
+        TypedPredicate::new(p, e.call1_same_type("EndsWith", Expr::const_str(v)))
+    }
+}
+
+impl<Root> Field<Root, bool> {
+    /// The field itself, as a predicate body — `p => p.Flag`.
+    #[must_use]
+    pub fn is_true(self) -> TypedPredicate<Root> {
+        let (p, e) = self.param_and_prop();
+        TypedPredicate::new(p, e)
+    }
+    /// The field's negation, as a predicate body — `p => !p.Flag`.
+    #[must_use]
+    pub fn is_false(self) -> TypedPredicate<Root> {
+        let (p, e) = self.param_and_prop();
+        TypedPredicate::new(p, e.not())
+    }
+}
+
 /// Build a `ConstantExpression` from a value-type literal boxed to `object` (the `box` primitive), then
 /// upcast to `Expression`. `Expression.Constant(object)` records `ConstantExpression.Type` as the
 /// runtime type of the boxed value, so an `int` boxes to a `System.Int32` constant.
@@ -498,6 +652,10 @@ impl<T> Clone for TypedPredicate<T> {
     }
 }
 impl<T> Copy for TypedPredicate<T> {}
+
+/// Cosmetic alias: `Filter<Person>` reads a little more like the thing it is (a reusable filter over an
+/// entity) than `TypedPredicate<Person>` — purely a naming convenience, identical type either way.
+pub type Filter<T> = TypedPredicate<T>;
 
 impl<T> TypedPredicate<T> {
     /// Build a predicate from a lambda body and the parameter it was constructed against — e.g.

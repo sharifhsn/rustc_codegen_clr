@@ -15,8 +15,8 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    parse_macro_input, punctuated::Punctuated, spanned::Spanned, FnArg, ImplItem, ItemFn, ItemImpl,
-    ItemStruct, LitBool, LitStr, MetaNameValue, ReturnType, Token, Type,
+    parse_macro_input, punctuated::Punctuated, spanned::Spanned, DeriveInput, FnArg, ImplItem, ItemFn,
+    ItemImpl, ItemStruct, LitBool, LitStr, MetaNameValue, ReturnType, Token, Type,
 };
 
 /// Split a `"[Assembly]Namespace.Type"` spec into `(assembly, type_name)`. An empty/`[]`-less spec
@@ -659,6 +659,180 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 let __ret = #call;
                 #ret_expr
             }
+        }
+    };
+    expanded.into()
+}
+
+// ============================================================================
+// #[derive(DotnetEntity)] — generate `mycorrhiza::linq::Field<Root, Val>` consts for LINQ predicate
+// building, one per struct field, so a caller never hand-types a .NET property-name string.
+// ============================================================================
+
+/// snake_case -> PascalCase, e.g. `is_active` -> `IsActive`, `age` -> `Age`. This is the DEFAULT .NET
+/// property-name convention a `#[derive(DotnetEntity)]` field maps to; `#[dotnet(rename = "...")]` on a
+/// field overrides it for cases where the convention doesn't match.
+fn to_pascal_case(snake: &str) -> String {
+    snake
+        .split('_')
+        .filter(|s| !s.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) => f.to_ascii_uppercase().to_string() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
+/// `#[derive(DotnetEntity)]` with a struct-level `#[dotnet(type_name = "...")]` attribute.
+///
+/// Generates, for each named field of the struct, an associated `const` of type
+/// `::mycorrhiza::linq::Field<Self, FieldTy>` named after the field's UPPERCASED identifier (e.g. a
+/// field `age: i32` becomes `Person::AGE: Field<Person, i32>`). The .NET property name each `Field`
+/// carries defaults to the PascalCase conversion of the Rust field name (`is_active` -> `IsActive`);
+/// override per-field with `#[dotnet(rename = "...")]` when the convention doesn't match.
+///
+/// ```ignore
+/// #[derive(DotnetEntity)]
+/// #[dotnet(type_name = "LinqDemo.Person, LinqDemo")]
+/// struct Person { id: i32, name: String, age: i32, is_active: bool }
+///
+/// // Generates (roughly):
+/// impl Person {
+///     pub const ID: ::mycorrhiza::linq::Field<Person, i32> = ::mycorrhiza::linq::Field::new("LinqDemo.Person, LinqDemo", "Id");
+///     pub const NAME: ::mycorrhiza::linq::Field<Person, String> = ::mycorrhiza::linq::Field::new("LinqDemo.Person, LinqDemo", "Name");
+///     pub const AGE: ::mycorrhiza::linq::Field<Person, i32> = ::mycorrhiza::linq::Field::new("LinqDemo.Person, LinqDemo", "Age");
+///     pub const IS_ACTIVE: ::mycorrhiza::linq::Field<Person, bool> = ::mycorrhiza::linq::Field::new("LinqDemo.Person, LinqDemo", "IsActive");
+/// }
+/// ```
+///
+/// This is pure compile-time constant generation — unlike `#[dotnet_class]`/`#[dotnet_methods]`/
+/// `#[dotnet_export]`, it does NOT touch the backend's comptime interpreter (no `rustc_codegen_clr_*`
+/// intrinsic calls, no `#[used]` DCE anchor): the derive only ever expands to an ordinary `impl` block
+/// of `const`s, which is why it needs none of that machinery.
+#[proc_macro_derive(DotnetEntity, attributes(dotnet))]
+pub fn derive_dotnet_entity(item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    let struct_name = &input.ident;
+    let span = struct_name.span();
+
+    // ---- struct-level `#[dotnet(type_name = "...")]` ----
+    let mut type_name: Option<String> = None;
+    for attr in &input.attrs {
+        if !attr.path().is_ident("dotnet") {
+            continue;
+        }
+        let syn::Meta::List(list) = &attr.meta else {
+            return syn::Error::new(
+                attr.span(),
+                "#[derive(DotnetEntity)]: expected `#[dotnet(type_name = \"...\")]`",
+            )
+            .to_compile_error()
+            .into();
+        };
+        let parser = Punctuated::<MetaNameValue, Token![,]>::parse_terminated;
+        let metas = match syn::parse::Parser::parse(parser, list.tokens.clone().into()) {
+            Ok(m) => m,
+            Err(e) => return e.to_compile_error().into(),
+        };
+        for m in metas {
+            if m.path.is_ident("type_name") {
+                if let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(s),
+                    ..
+                }) = &m.value
+                {
+                    type_name = Some(s.value());
+                }
+            }
+        }
+    }
+    let Some(type_name) = type_name else {
+        return syn::Error::new(
+            span,
+            "#[derive(DotnetEntity)]: missing required `#[dotnet(type_name = \"...\")]` struct attribute",
+        )
+        .to_compile_error()
+        .into();
+    };
+    let type_name_lit = LitStr::new(&type_name, span);
+
+    // ---- named fields only ----
+    let fields = match &input.data {
+        syn::Data::Struct(syn::DataStruct {
+            fields: syn::Fields::Named(named),
+            ..
+        }) => &named.named,
+        syn::Data::Struct(_) => {
+            return syn::Error::new(
+                span,
+                "#[derive(DotnetEntity)]: tuple structs and unit structs are not supported; use named fields",
+            )
+            .to_compile_error()
+            .into();
+        }
+        _ => {
+            return syn::Error::new(span, "#[derive(DotnetEntity)]: only structs are supported")
+                .to_compile_error()
+                .into();
+        }
+    };
+
+    let mut consts = Vec::new();
+    for f in fields {
+        let Some(fident) = &f.ident else {
+            continue;
+        };
+        let fname = fident.to_string();
+        let fspan = fident.span();
+
+        // Per-field `#[dotnet(rename = "...")]` escape hatch, defaulting to PascalCase(fname).
+        let mut prop_name = to_pascal_case(&fname);
+        for attr in &f.attrs {
+            if !attr.path().is_ident("dotnet") {
+                continue;
+            }
+            let syn::Meta::List(list) = &attr.meta else {
+                return syn::Error::new(
+                    attr.span(),
+                    "#[derive(DotnetEntity)]: expected `#[dotnet(rename = \"...\")]`",
+                )
+                .to_compile_error()
+                .into();
+            };
+            let parser = Punctuated::<MetaNameValue, Token![,]>::parse_terminated;
+            let metas = match syn::parse::Parser::parse(parser, list.tokens.clone().into()) {
+                Ok(m) => m,
+                Err(e) => return e.to_compile_error().into(),
+            };
+            for m in metas {
+                if m.path.is_ident("rename") {
+                    if let syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(s),
+                        ..
+                    }) = &m.value
+                    {
+                        prop_name = s.value();
+                    }
+                }
+            }
+        }
+
+        let const_ident = format_ident!("{}", fname.to_uppercase(), span = fspan);
+        let prop_name_lit = LitStr::new(&prop_name, fspan);
+        let fty = &f.ty;
+        consts.push(quote! {
+            pub const #const_ident: ::mycorrhiza::linq::Field<#struct_name, #fty> =
+                ::mycorrhiza::linq::Field::new(#type_name_lit, #prop_name_lit);
+        });
+    }
+
+    let expanded = quote! {
+        #[allow(non_upper_case_globals)]
+        impl #struct_name {
+            #(#consts)*
         }
     };
     expanded.into()
