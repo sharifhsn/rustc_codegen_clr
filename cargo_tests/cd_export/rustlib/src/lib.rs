@@ -65,3 +65,17 @@ pub fn version() -> &'static str {
 pub fn ping() {
     // Deliberately empty: proves a no-arg, unit-return export links and is callable from C#.
 }
+
+/// Deliberately panics with a runtime-computed message (not a literal — proves the payload text
+/// actually survives the seam, not just a hardcoded string). Proves the panic-safety of the
+/// `#[dotnet_export]`-generated shim: without a `catch_unwind` in the shim, this would unwind into
+/// the `extern "C"` boundary and hard-abort the whole process (`Environment.FailFast`); with it, the
+/// panic is caught inside the shim and re-raised as a genuine, catchable `System.Exception` carrying
+/// the extracted message, so a C# `try`/`catch` around the call sees an ordinary managed exception
+/// instead of the process dying.
+#[dotnet_export]
+pub fn boom(reason: &str) -> i32 {
+    panic!("boom: {reason}");
+    #[allow(unreachable_code)]
+    0
+}

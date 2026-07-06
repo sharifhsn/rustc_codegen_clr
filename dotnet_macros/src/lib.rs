@@ -649,15 +649,61 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // The generated seam shim. `#[no_mangle]` gives it the flat symbol `#fn_name`, which the
         // backend marks `Access::Extern` (a DCE root) and the exporter emits as a public static
         // method on the assembly's `MainModule` — so C# calls it as `MainModule::#fn_name`.
+        //
+        // The inner call is wrapped in `catch_unwind`: a plain `extern "C"` is a `nounwind` ABI
+        // boundary (the same rule as native Rust FFI — unwinding across it is UB), so an uncaught
+        // panic would otherwise reach the true edge and the runtime hard-aborts the whole process
+        // (`Environment.FailFast`) with no chance for the C# caller to recover. Catching it *inside*
+        // the shim and re-raising as a genuine managed `System.Exception`
+        // (`::mycorrhiza::error::throw_message`) turns an unrecoverable process abort into an ordinary
+        // `catch`-able error.
+        //
+        // The shim itself is declared `extern "C-unwind"`, not plain `extern "C"`. This is NOT
+        // optional: `throw_message`'s `ExceptionDispatchInfo::Throw()` call performs a genuine CIL
+        // `throw`, which this backend must (correctly) model as an operation that can unwind — and
+        // that call sits in the `Err` arm, OUTSIDE the `catch_unwind` closure (only `#call` is
+        // protected). A call that can unwind, sitting directly in a `nounwind extern "C"` function
+        // body with nothing downstream to catch it, is legitimately flagged by rustc's MIR builder as
+        // crossing a nounwind ABI boundary — the exact same analysis that would fire for a second bare
+        // `panic!()` placed right after `catch_unwind` in ordinary native Rust — and lowered to the
+        // same hard-abort landing pad as any other escaping unwind, silently defeating the whole
+        // point of this wrapper (verified empirically: with plain `extern "C"` the process still
+        // `FailFast`s on the managed throw, exactly as it did with no `catch_unwind` at all).
+        // `extern "C-unwind"` tells rustc this function's *outer* boundary itself may unwind, so the
+        // managed-throw call in the `Err` arm is no longer treated as escaping a nounwind frame; the
+        // backend's C-unwind lowering is what lets a genuine .NET exception (not a Rust unwind) leave
+        // the shim and reach the C# caller's `try`/`catch`, which is exactly the shape already proven
+        // out by `mycorrhiza::error`'s `extern "C-unwind"` try/catch trampolines. The non-panicking
+        // path is untouched: `catch_unwind` has no overhead on the `Ok` arm beyond the landing-pad
+        // setup the panic runtime already needs, and `extern "C-unwind"` vs `extern "C"` makes no
+        // difference to a call that never unwinds.
         #[doc(hidden)]
         #[allow(non_snake_case, unused_imports, clippy::useless_conversion)]
         mod #shim_mod {
             use super::*;
             #[no_mangle]
-            pub extern "C" fn #fn_name(#(#seam_params),*) #seam_ret {
+            pub extern "C-unwind" fn #fn_name(#(#seam_params),*) #seam_ret {
                 #(#pre_call)*
-                let __ret = #call;
-                #ret_expr
+                match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| #call)) {
+                    ::std::result::Result::Ok(__ret) => {
+                        #ret_expr
+                    }
+                    ::std::result::Result::Err(__panic_payload) => {
+                        let __msg: ::std::string::String =
+                            if let ::std::option::Option::Some(__s) =
+                                __panic_payload.downcast_ref::<&'static str>()
+                            {
+                                (*__s).to_string()
+                            } else if let ::std::option::Option::Some(__s) =
+                                __panic_payload.downcast_ref::<::std::string::String>()
+                            {
+                                __s.clone()
+                            } else {
+                                ::std::string::String::from("Rust panic (no message available)")
+                            };
+                        ::mycorrhiza::error::throw_message(&__msg)
+                    }
+                }
             }
         }
     };

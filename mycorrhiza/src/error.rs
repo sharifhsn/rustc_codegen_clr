@@ -232,3 +232,59 @@ impl<T, F: FnOnce() -> T> TryManaged<T> for F {
         try_managed(self)
     }
 }
+
+// ===========================================================================================
+// runtime-message managed throw
+// ===========================================================================================
+
+/// Raise a genuine, catchable `System.Exception` carrying a message computed **at run time**.
+///
+/// [`crate::intrinsics::rustc_clr_interop_throw`] (the backend-recognized `MANAGED_THROW` intrinsic)
+/// only accepts a **compile-time** message: its `MSG` parameter is a `const` generic, resolved by the
+/// backend straight off the callee's generic-argument list before any argument marshalling runs (see
+/// `garg_to_string` in `rustc_codegen_clr_type`), so it can never carry a `String`/`&str` value that
+/// is only known once the program is running (e.g. a formatted error, or a captured `panic!` payload).
+///
+/// This function is the *runtime* counterpart, built entirely out of the ordinary generic managed-call
+/// surface ([`RustcCLRInteropManagedClass::ctor1`]/[`RustcCLRInteropManagedClass::instance0`]/
+/// [`RustcCLRInteropManagedClass::static1`]) — no new backend intrinsic is needed. It:
+///
+/// 1. marshals `msg` to a real managed `System.String` ([`crate::system::DotNetString`]),
+/// 2. constructs a `System.Exception(string)` from it (`Exception::ctor1`),
+/// 3. and raises it via `System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex).Throw()`
+///    — an ordinary managed instance method whose *body* performs the CIL `throw`, so from codegen's
+///    point of view this is nothing more than a call returning `!`-shaped control flow; no `throw` IL
+///    opcode needs to be emitted directly by the backend.
+///
+/// The resulting exception is a genuine managed `System.Exception` — a C# `catch (Exception e)` around
+/// the call sees `e.Message == msg`, exactly like [`rustc_clr_interop_throw`]'s fixed-message form.
+///
+/// `ExceptionDispatchInfo.Throw()` preserves the *original* stack trace of `ex` (which, since `ex` was
+/// just constructed here, is simply "thrown from here") rather than resetting it the way a bare
+/// `throw ex;` would in C# — a harmless, arguably nicer property for this use, not something this
+/// function relies on.
+///
+/// **Caller ABI requirement**: if this is called from an `extern` function that is itself called
+/// directly from C# (e.g. a `#[dotnet_export]`-generated shim's `catch_unwind` `Err` arm), that
+/// function must be declared `extern "C-unwind"`, **not** plain `extern "C"`. `Throw()` performs a
+/// genuine CIL `throw`, which this backend correctly models as an operation that can unwind; a call
+/// that can unwind, sitting outside any protecting `catch_unwind` closure inside a plain `nounwind
+/// extern "C"` function, is exactly the shape rustc's MIR builder flags as escaping a nounwind ABI
+/// boundary — and it lowers to the *same* hard `Environment.FailFast` abort as an actual uncaught
+/// panic, silently defeating the point of calling this function at all. This was verified empirically
+/// (a minimal repro with `extern "C"` still aborted on the managed throw; switching only the ABI
+/// qualifier to `extern "C-unwind"` — no other change — made the exception reach the C# `try`/`catch`
+/// correctly). `#[dotnet_export]`'s generated shim already uses `extern "C-unwind"` for this reason.
+#[inline]
+pub fn throw_message(msg: &str) -> ! {
+    use crate::bindings::System::Exception;
+    use crate::bindings::System::Runtime::ExceptionServices::ExceptionDispatchInfo;
+    use crate::system::DotNetString;
+
+    let managed_msg = DotNetString::from(msg).handle();
+    let exception = Exception::ctor1::<crate::system::MString>(managed_msg);
+    ExceptionDispatchInfo::capture(exception).throw();
+    // `Throw()` never returns (it always raises), but its Rust-visible signature is `()`, not `!` —
+    // give the compiler the same terminal guarantee `rustc_clr_interop_throw` provides.
+    unreachable!("ExceptionDispatchInfo::Throw() does not return")
+}

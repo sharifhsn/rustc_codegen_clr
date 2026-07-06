@@ -41,6 +41,31 @@ public static class Program
         MainModule.ping();
         Check("ping() callable", true, true, ref pass, ref total);
 
+        // Panic-safety: a #[dotnet_export] fn that panics must surface as a genuine, catchable
+        // managed exception (NOT a process abort via Environment.FailFast), carrying the panic
+        // message, and the process must remain healthy afterward (a following call still works).
+        {
+            total++;
+            bool caught = false;
+            string message = null;
+            try
+            {
+                MainModule.boom("division safety check failed");
+            }
+            catch (Exception e)
+            {
+                caught = true;
+                message = e.Message;
+            }
+            bool ok = caught && message != null && message.Contains("boom: division safety check failed");
+            if (ok) pass++;
+            Console.WriteLine($"  [{(ok ? "OK" : "FAIL")}] boom(...) panics as catchable exception: caught={caught}, message=\"{message}\"");
+        }
+
+        // Process-health check: a normal call after the panic must still succeed (proves the panic
+        // didn't corrupt or abort the runtime — it took an ordinary managed-exception control path).
+        Check("add(2,3) after boom() panic", MainModule.add(2, 3), 5, ref pass, ref total);
+
         Console.WriteLine($"cd_export: {pass}/{total} checks passed");
         return pass == total ? 0 : 1;
     }
