@@ -400,6 +400,35 @@ impl BasicBlock {
         }
     }
 }
+/// Counts how many times `pattern` occurs (by node equality) inside `root`. Used to guard forward
+/// substitution below: `propagate_locals` inlines the *entire* producing expression tree at every
+/// syntactic read of the target local/arg/field it finds within the ONE statement immediately
+/// following its `StLoc`/`StArg` — including when that statement reads it more than once (e.g.
+/// `x * x`, `f(x, x)`). Without a use-count guard, a non-trivial multi-node tree gets duplicated once
+/// per read there, silently turning one shared computation into N re-evaluations of the same work.
+///
+/// NOTE: this guard is a narrower fix than the fractal-demo Mandelbrot perf investigation's initial
+/// hypothesis. That kernel's actual duplication (`zr = zr2 - zi2 + cr; zr2 = zr * zr;` re-evaluating
+/// `zr2-zi2+cr` twice) does NOT go through this single-statement path — MIR lowers `zr * zr` (a place
+/// read twice) as two independent, individually single-use `copy` temporaries, so a CHAIN of
+/// single-use substitutions each pass this guard's per-statement check while still fanning a shared
+/// value out to two call sites. Fixing that class needs whole-chain/value-numbering awareness, not a
+/// per-statement read count, and was left as a source-level (not backend) fix — see fractal-rs's
+/// `render_mandelbrot`. This guard still closes the real, narrower "one statement, N reads" case
+/// (e.g. `x * x` immediately after `x`'s own store), which the fractal-demo investigation confirmed
+/// occurs elsewhere in real code (caught while instrumenting the pass) and is worth guarding
+/// regardless.
+fn count_matches(root: &CILRoot, pattern: &CILNode, asm: &Assembly) -> usize {
+    CILIter::new(root.clone(), asm)
+        .filter(|elem| *elem == CILIterElem::Node(pattern.clone()))
+        .count()
+}
+/// A tree this small is always safe to duplicate regardless of use count: propagating it can only
+/// ever *shrink* the total instruction count (it replaces a `ldloc`/`ldarg` with something no larger),
+/// so the use-count guard in `propagate_roots` only needs to apply to bigger trees.
+fn is_trivially_duplicable(tree: Interned<CILNode>, asm: &Assembly) -> bool {
+    CILIter::new(asm.get_node(tree).clone(), asm).count() <= 1
+}
 fn propagate_roots(
     asm: &mut Assembly,
     root: &mut Interned<CILRoot>,
@@ -422,6 +451,14 @@ fn propagate_roots(
             // Check that it does not depend on itself
             if CILIter::new(asm.get_node(tree).clone(), asm)
                 .any(|node| node == CILIterElem::Node(CILNode::LdLoc(loc)))
+            {
+                return true;
+            }
+            // Don't duplicate real work: if the consumer reads this local more than once (e.g.
+            // `loc * loc`) and the producing tree is more than a single leaf node, propagating would
+            // re-evaluate the whole tree at each read site instead of the cheap `ldloc` it replaces.
+            if !is_trivially_duplicable(tree, asm)
+                && count_matches(&asm.get_root(*root).clone(), &CILNode::LdLoc(loc), asm) > 1
             {
                 return true;
             }
@@ -512,6 +549,12 @@ fn propagate_roots(
             // Check that it does not depend on itself
             if CILIter::new(asm.get_node(tree).clone(), asm)
                 .any(|node| node == CILIterElem::Node(CILNode::LdArg(arg)))
+            {
+                return true;
+            }
+            // Don't duplicate real work (see the analogous StLoc guard above).
+            if !is_trivially_duplicable(tree, asm)
+                && count_matches(&asm.get_root(*root).clone(), &CILNode::LdArg(arg), asm) > 1
             {
                 return true;
             }
