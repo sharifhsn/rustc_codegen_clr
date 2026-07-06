@@ -15,8 +15,13 @@ use mycorrhiza::system::DotNetString;
 /// exists on the .NET type it targets. `System.Exception` supplies both an `int` (`HResult`) and a
 /// `String` (`Message`) member with EXACTLY the PascalCase names these snake_case field names convert
 /// to, so the derive's default naming convention is exercised end-to-end against a real type.
+///
+/// Exercises the `namespace`/`assembly`/`name` escape hatches directly (each independently overriding
+/// its piece of the .NET type spec) rather than the crate-level `dotnet_namespace!` default -- BCL
+/// types don't live in this crate's own namespace/assembly, so every field here needs the override path
+/// anyway. The crate-level-default (zero-attribute) path is exercised separately below.
 #[derive(DotnetEntity)]
-#[dotnet(type_name = "System.Exception, System.Private.CoreLib")]
+#[dotnet(namespace = "System", assembly = "System.Private.CoreLib", name = "Exception")]
 struct Sample {
     #[dotnet(rename = "HResult")]
     id: i32,
@@ -29,10 +34,56 @@ struct Sample {
 /// (multi-word) -- exercises the derive's default naming convention against real backing members, and
 /// (having two fields on the SAME entity) lets `Field`-built predicates combine with `&`/`|`/`!`.
 #[derive(DotnetEntity)]
-#[dotnet(type_name = "System.Reflection.MethodInfo, System.Private.CoreLib")]
+#[dotnet(namespace = "System.Reflection", assembly = "System.Private.CoreLib", name = "MethodInfo")]
 struct MethodSample {
     is_static: bool,
     is_generic_method: bool,
+}
+
+// ---- `mycorrhiza::linq::dotnet_namespace!` crate-level default + escape hatches ----
+// Declared here (mid-file) deliberately, NOT at the top of the file, to prove the design point in its
+// own doc: ordinary Rust name resolution finds `crate::__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT`
+// regardless of where in the crate the declaring macro was invoked relative to its use sites above or
+// below -- this is not proc-macro-expansion-order-sensitive.
+//
+// `"System.Text.RegularExpressions"` is a REAL BCL namespace that ALSO happens to be its own
+// assembly's simple name (`System.Text.RegularExpressions.dll`) -- i.e. a real instance of the exact
+// "namespace == assembly" small-project convention `dotnet_namespace!` encodes, letting the
+// zero-attribute case below resolve to a genuinely real .NET type (not just "didn't throw").
+mycorrhiza::linq::dotnet_namespace!("System.Text.RegularExpressions");
+
+/// Zero-attribute case: no `#[dotnet(..)]` at all. Namespace AND assembly both resolve to the
+/// crate-level default: `"System.Text.RegularExpressions"`. Class name resolves to the struct's own
+/// Rust identifier verbatim: `"Regex"` -- a REAL BCL class in that namespace/assembly, with a real
+/// `bool` member (`RightToLeft`) whose PascalCase matches this struct's `right_to_left` field exactly,
+/// so the derive's fully-defaulted output resolves to a genuine, member-backed .NET type end-to-end
+/// (not merely "didn't crash").
+#[derive(DotnetEntity)]
+struct Regex {
+    right_to_left: bool,
+}
+
+/// Same zero-attribute default-namespace resolution, but with `#[dotnet(name = "...")]` overriding
+/// JUST the class name -- namespace/assembly still resolve to the crate-level default. Renames to a
+/// DIFFERENT real class in the same real namespace/assembly (`Match`, which has a real `bool` member
+/// `Success`), proving the `name` override composes correctly with the crate-level namespace/assembly
+/// default (not just with an explicit override of those too).
+#[derive(DotnetEntity)]
+#[dotnet(name = "Match")]
+struct MatchEntity {
+    success: bool,
+}
+
+/// All three explicit overrides given -- must work identically whether or not `dotnet_namespace!` was
+/// ever declared in the crate (no dependency on the crate-level const in this case). Targets a REAL
+/// type in a namespace/assembly pair that DIFFERS from the crate-level default declared above
+/// (`System.Reflection`/`System.Private.CoreLib`, vs. the crate default's
+/// `System.Text.RegularExpressions`), proving the overrides genuinely take priority rather than merely
+/// happening to agree with the default.
+#[derive(DotnetEntity)]
+#[dotnet(namespace = "System.Reflection", assembly = "System.Private.CoreLib", name = "MethodInfo")]
+struct FullyOverriddenEntity {
+    is_static: bool,
 }
 
 fn say(label: &str, s: &str) {
@@ -339,7 +390,7 @@ fn main() -> std::process::ExitCode {
     // whose derive targets `System.String` -- proves `Field::gt`/`le` don't just build well-formed
     // trees, they filter correctly at runtime, exactly like the old manual path.
     #[derive(DotnetEntity)]
-    #[dotnet(type_name = "System.String, System.Private.CoreLib")]
+    #[dotnet(namespace = "System", assembly = "System.Private.CoreLib", name = "String")]
     struct StrEntity {
         length: i32,
     }
@@ -366,14 +417,15 @@ fn main() -> std::process::ExitCode {
     let false_pred = MethodSample::IS_STATIC.is_false();
     chk!(false_pred.text().contains("Not"), true);
 
-    // `always()`/`never()` -- trivial constant predicates, replacing the old "no filter" workaround.
-    // Body shape is `1 == 1` / `1 == 0` regardless of `Root`'s .NET type, so this proves the tree is
-    // correctly constant-true/-false via `.text()` (can't `.call_i32`/`.call_str` here: `Sample`'s
-    // underlying parameter type is `System.Exception`, a reference type incompatible with either
-    // helper -- the MANDATORY end-to-end EXECUTION proof for `always`/`never` is covered separately
-    // below via `IntQuery`, which shares `System.Int32`'s parameter type with `Compiled::call_i32`).
-    let always_pred: TypedPredicate<Sample> = Sample::ID.always();
-    let never_pred: TypedPredicate<Sample> = Sample::ID.never();
+    // `TypedPredicate::<T>::always()`/`never()` -- trivial constant predicates, replacing the old
+    // ad-hoc "no filter" workaround. These are associated fns on `TypedPredicate` itself, generic
+    // purely over the phantom entity marker `T` -- no `Field`/column/entity-.NET-type argument
+    // involved at all (unlike the old, now-removed `Field::always`/`Field::never`, which confusingly
+    // required calling through an arbitrary, semantically-unrelated field). Body shape is `1 == 1` /
+    // `1 == 0` regardless of `T`, so this proves the tree is correctly constant-true/-false via
+    // `.text()`.
+    let always_pred: TypedPredicate<Sample> = TypedPredicate::<Sample>::always();
+    let never_pred: TypedPredicate<Sample> = TypedPredicate::<Sample>::never();
     say("always body", &always_pred.text());
     say("never body", &never_pred.text());
     chk!(always_pred.text().contains("1 == 1"), true);
@@ -381,23 +433,82 @@ fn main() -> std::process::ExitCode {
     chk!(always_pred.body().lambda(&[&always_pred.param()]).compiles(), true);
     chk!(never_pred.body().lambda(&[&never_pred.param()]).compiles(), true);
 
-    // The mandatory end-to-end EXECUTION proof for `always`/`never`, against `System.Int32` (so
-    // `Compiled::call_i32` applies directly). `always`/`never` don't touch the field's property name at
-    // all (see `mycorrhiza::linq::Field::always`'s doc) -- only `self.type_name` matters -- so this
-    // dummy field name need not exist on `System.Int32`.
-    #[derive(DotnetEntity)]
-    #[dotnet(type_name = "System.Int32, System.Private.CoreLib")]
-    struct IntEntity {
-        marker: i32,
-    }
-    let always_int = IntEntity::MARKER.always();
-    let never_int = IntEntity::MARKER.never();
-    let always_fn = always_int.body().lambda(&[&always_int.param()]).compile();
-    let never_fn = never_int.body().lambda(&[&never_int.param()]).compile();
+    // The mandatory end-to-end EXECUTION proof for `always`/`never`, standalone (no combination into a
+    // larger predicate): `TypedPredicate::<T>::always()`/`never()` build their internal `Param` against
+    // `System.Object` (always resolvable, regardless of `T`) -- proving a bare `always()`/`never()`
+    // compiles AND runs correctly on its own, not just when rebound into a combined predicate.
+    struct IntWidget; // phantom marker entity type; no real .NET type or `Field` involved at all.
+    let always_fn = TypedPredicate::<IntWidget>::always()
+        .body()
+        .lambda(&[&TypedPredicate::<IntWidget>::always().param()])
+        .compile();
+    let never_fn = TypedPredicate::<IntWidget>::never()
+        .body()
+        .lambda(&[&TypedPredicate::<IntWidget>::never().param()])
+        .compile();
     chk!(always_fn.call_i32(0), true); // always true, regardless of input
     chk!(always_fn.call_i32(999), true);
     chk!(never_fn.call_i32(0), false); // always false, regardless of input
     chk!(never_fn.call_i32(999), false);
+
+    // `always()`/`never()` combined with a REAL predicate via `&`/`|` -- proves the `System.Object`
+    // placeholder `Param` inside `always`/`never` rebinds correctly onto the other operand's real
+    // parameter (the `ParameterRebinder` fix doesn't care about the two operands' declared .NET
+    // types matching, only about reconciling `ParameterExpression` identity structurally).
+    let real_pred = build_age_pred(); // TypedPredicate<Widget>, built against a real System.Int32 Param
+    let always_combined = real_pred & TypedPredicate::<Widget>::always();
+    let always_combined_fn = always_combined
+        .body()
+        .lambda(&[&always_combined.param()])
+        .compile();
+    chk!(always_combined_fn.call_i32(20), true); // 20 >= 18 && true -> true
+    chk!(always_combined_fn.call_i32(5), false); // 5 >= 18? no && true -> false
+    let never_combined = real_pred | TypedPredicate::<Widget>::never();
+    let never_combined_fn = never_combined
+        .body()
+        .lambda(&[&never_combined.param()])
+        .compile();
+    chk!(never_combined_fn.call_i32(20), true); // 20 >= 18? yes || false -> true
+    chk!(never_combined_fn.call_i32(5), false); // 5 >= 18? no || false -> false
+
+    // ---- `dotnet_namespace!` crate-level default + escape hatches ----
+    // Zero-attribute case: namespace AND assembly both resolve to the crate-level default
+    // ("System.Text.RegularExpressions"), class name resolves to the struct's own Rust identifier
+    // verbatim ("Regex") -- a REAL BCL type. Executed end-to-end (not just `.text()`): `Regex.RightToLeft`
+    // is a real `bool` member, so `Field::is_false` against it produces a genuinely well-formed,
+    // COMPILABLE predicate over the fully-defaulted (zero-attribute) type spec.
+    let default_pred = Regex::RIGHT_TO_LEFT.is_false();
+    say("Regex::RIGHT_TO_LEFT body", &default_pred.text());
+    chk!(default_pred.text().contains("RightToLeft"), true); // PascalCase("right_to_left")
+    chk!(
+        default_pred.body().lambda(&[&default_pred.param()]).compiles(),
+        true // real backing member on a real, crate-default-resolved type -- genuinely compiles.
+    );
+
+    // `#[dotnet(name = "...")]` alone: class name overridden to a DIFFERENT real class ("Match") in the
+    // SAME namespace/assembly (still the crate-level default) -- `Match.Success` is a real `bool` member.
+    let renamed_pred = MatchEntity::SUCCESS.is_true();
+    say("MatchEntity::SUCCESS body", &renamed_pred.text());
+    chk!(renamed_pred.text().contains("Success"), true);
+    chk!(
+        renamed_pred.body().lambda(&[&renamed_pred.param()]).compiles(),
+        true
+    );
+
+    // All three overrides given explicitly (namespace/assembly/name all differ from the crate-level
+    // default) -- must work with no dependency on the crate-level const. `MethodInfo.IsStatic` is the
+    // same real member `MethodSample::IS_STATIC` above exercises, here reached via full manual overrides
+    // instead of the crate-default path.
+    let full_override_pred = FullyOverriddenEntity::IS_STATIC.is_false();
+    say("FullyOverriddenEntity::IS_STATIC body", &full_override_pred.text());
+    chk!(full_override_pred.text().contains("IsStatic"), true);
+    chk!(
+        full_override_pred
+            .body()
+            .lambda(&[&full_override_pred.param()])
+            .compiles(),
+        true
+    );
 
     // `Field<Root,_>` predicates combine with `&`/`|`/`!` exactly like manually-built `TypedPredicate`s
     // (same underlying type, no special-casing needed) -- reuses the parameter-rebinding path since

@@ -686,7 +686,16 @@ fn to_pascal_case(snake: &str) -> String {
         .collect()
 }
 
-/// `#[derive(DotnetEntity)]` with a struct-level `#[dotnet(type_name = "...")]` attribute.
+/// `#[derive(DotnetEntity)]` — by default resolves the .NET **class name** to the Rust struct's own
+/// name, and the .NET **namespace**/**assembly** to the crate-level default declared once via
+/// [`mycorrhiza::linq::dotnet_namespace!`](../mycorrhiza/linq/macro.dotnet_namespace.html) (namespace
+/// and assembly default to the SAME value — the common small-project convention that a project's
+/// namespace and its assembly name are identical). Each piece has an independent escape-hatch attribute:
+///
+/// - `#[dotnet(namespace = "...")]` — override just the namespace.
+/// - `#[dotnet(assembly = "...")]` — override just the assembly.
+/// - `#[dotnet(name = "...")]` — override just the class name (still uses the crate-level default for
+///   namespace/assembly unless those are ALSO given).
 ///
 /// Generates, for each named field of the struct, an associated `const` of type
 /// `::mycorrhiza::linq::Field<Self, FieldTy>` named after the field's UPPERCASED identifier (e.g. a
@@ -695,18 +704,27 @@ fn to_pascal_case(snake: &str) -> String {
 /// override per-field with `#[dotnet(rename = "...")]` when the convention doesn't match.
 ///
 /// ```ignore
+/// // Once, near the crate root:
+/// mycorrhiza::linq::dotnet_namespace!("LinqDemo");
+///
 /// #[derive(DotnetEntity)]
-/// #[dotnet(type_name = "LinqDemo.Person, LinqDemo")]
 /// struct Person { id: i32, name: String, age: i32, is_active: bool }
 ///
 /// // Generates (roughly):
 /// impl Person {
-///     pub const ID: ::mycorrhiza::linq::Field<Person, i32> = ::mycorrhiza::linq::Field::new("LinqDemo.Person, LinqDemo", "Id");
-///     pub const NAME: ::mycorrhiza::linq::Field<Person, String> = ::mycorrhiza::linq::Field::new("LinqDemo.Person, LinqDemo", "Name");
-///     pub const AGE: ::mycorrhiza::linq::Field<Person, i32> = ::mycorrhiza::linq::Field::new("LinqDemo.Person, LinqDemo", "Age");
-///     pub const IS_ACTIVE: ::mycorrhiza::linq::Field<Person, bool> = ::mycorrhiza::linq::Field::new("LinqDemo.Person, LinqDemo", "IsActive");
+///     pub const ID: ::mycorrhiza::linq::Field<Person, i32> =
+///         ::mycorrhiza::linq::Field::new(crate::__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT, "Person", crate::__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT, "Id");
+///     // ...NAME, AGE, IS_ACTIVE likewise.
 /// }
 /// ```
+///
+/// **Important**: this derive does NOT need to see the `dotnet_namespace!` invocation at
+/// macro-expansion time — it only emits a reference to the FIXED name `crate::__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT`
+/// (whenever no `namespace`/`assembly` override is given), and ordinary Rust name resolution finds it at
+/// the consuming crate's normal compile time, regardless of expansion order. If a struct provides
+/// neither an override nor a crate-level `dotnet_namespace!` declaration, the generated code fails with
+/// a plain "cannot find const `__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT` in this scope" — that is the
+/// correct, honest failure mode (no default to fall back to).
 ///
 /// This is pure compile-time constant generation — unlike `#[dotnet_class]`/`#[dotnet_methods]`/
 /// `#[dotnet_export]`, it does NOT touch the backend's comptime interpreter (no `rustc_codegen_clr_*`
@@ -718,8 +736,12 @@ pub fn derive_dotnet_entity(item: TokenStream) -> TokenStream {
     let struct_name = &input.ident;
     let span = struct_name.span();
 
-    // ---- struct-level `#[dotnet(type_name = "...")]` ----
-    let mut type_name: Option<String> = None;
+    // ---- struct-level `#[dotnet(namespace = "...", assembly = "...", name = "...")]` ----
+    // Each is independently optional; an absent one falls back to a `TokenStream` that references the
+    // crate-level default const (namespace/assembly) or the struct's own Rust name (class name).
+    let mut namespace_override: Option<String> = None;
+    let mut assembly_override: Option<String> = None;
+    let mut name_override: Option<String> = None;
     for attr in &input.attrs {
         if !attr.path().is_ident("dotnet") {
             continue;
@@ -727,7 +749,7 @@ pub fn derive_dotnet_entity(item: TokenStream) -> TokenStream {
         let syn::Meta::List(list) = &attr.meta else {
             return syn::Error::new(
                 attr.span(),
-                "#[derive(DotnetEntity)]: expected `#[dotnet(type_name = \"...\")]`",
+                "#[derive(DotnetEntity)]: expected `#[dotnet(namespace = \"...\", assembly = \"...\", name = \"...\")]`",
             )
             .to_compile_error()
             .into();
@@ -738,26 +760,54 @@ pub fn derive_dotnet_entity(item: TokenStream) -> TokenStream {
             Err(e) => return e.to_compile_error().into(),
         };
         for m in metas {
-            if m.path.is_ident("type_name") {
-                if let syn::Expr::Lit(syn::ExprLit {
+            let Some(s) = (match &m.value {
+                syn::Expr::Lit(syn::ExprLit {
                     lit: syn::Lit::Str(s),
                     ..
-                }) = &m.value
-                {
-                    type_name = Some(s.value());
-                }
+                }) => Some(s.value()),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if m.path.is_ident("namespace") {
+                namespace_override = Some(s);
+            } else if m.path.is_ident("assembly") {
+                assembly_override = Some(s);
+            } else if m.path.is_ident("name") {
+                name_override = Some(s);
+            } else if m.path.is_ident("type_name") {
+                return syn::Error::new(
+                    m.path.span(),
+                    "#[derive(DotnetEntity)]: `type_name` was replaced by separate `namespace`/\
+                     `assembly`/`name` attributes (each independently overridable; namespace/assembly \
+                     default to the crate-level `mycorrhiza::linq::dotnet_namespace!` declaration)",
+                )
+                .to_compile_error()
+                .into();
             }
         }
     }
-    let Some(type_name) = type_name else {
-        return syn::Error::new(
-            span,
-            "#[derive(DotnetEntity)]: missing required `#[dotnet(type_name = \"...\")]` struct attribute",
-        )
-        .to_compile_error()
-        .into();
+
+    // Namespace/assembly: an explicit override is a plain string literal; otherwise reference the
+    // crate-level default const BY NAME (resolved at ordinary Rust compile time, not here — see the
+    // derive's doc comment for why this needs no macro-expansion-order coordination).
+    let namespace_expr = match &namespace_override {
+        Some(s) => {
+            let lit = LitStr::new(s, span);
+            quote! { #lit }
+        }
+        None => quote! { crate::__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT },
     };
-    let type_name_lit = LitStr::new(&type_name, span);
+    let assembly_expr = match &assembly_override {
+        Some(s) => {
+            let lit = LitStr::new(s, span);
+            quote! { #lit }
+        }
+        None => quote! { crate::__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT },
+    };
+    // Class name: an explicit override, or the struct's own Rust identifier, verbatim.
+    let class_name = name_override.unwrap_or_else(|| struct_name.to_string());
+    let class_name_lit = LitStr::new(&class_name, span);
 
     // ---- named fields only ----
     let fields = match &input.data {
@@ -825,7 +875,7 @@ pub fn derive_dotnet_entity(item: TokenStream) -> TokenStream {
         let fty = &f.ty;
         consts.push(quote! {
             pub const #const_ident: ::mycorrhiza::linq::Field<#struct_name, #fty> =
-                ::mycorrhiza::linq::Field::new(#type_name_lit, #prop_name_lit);
+                ::mycorrhiza::linq::Field::new(#namespace_expr, #class_name_lit, #assembly_expr, #prop_name_lit);
         });
     }
 

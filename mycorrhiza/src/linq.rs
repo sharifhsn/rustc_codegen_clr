@@ -168,21 +168,80 @@ impl Param {
     }
 }
 
+/// Declare the crate-wide default .NET namespace (and, by the small-project convention documented on
+/// [`Field`]/`#[derive(DotnetEntity)]`, the default assembly name too) for every `#[derive(DotnetEntity)]`
+/// struct in this crate that doesn't override it explicitly. Invoke this ONCE, anywhere in the crate
+/// (typically near the crate root, e.g. the top of `lib.rs`/`main.rs`) — ordinary Rust name resolution
+/// makes the declaration visible to every module regardless of where it appears, exactly like any other
+/// crate-root `const` referenced from elsewhere in the same crate:
+///
+/// ```ignore
+/// mycorrhiza::linq::dotnet_namespace!("LinqDemo");
+///
+/// #[derive(DotnetEntity)]
+/// struct Person { id: i32, name: String, age: i32, is_active: bool }
+/// // -> class "Person", namespace "LinqDemo", assembly "LinqDemo" (namespace == assembly by convention)
+/// ```
+///
+/// Expands to exactly one item: `pub(crate) const __MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT: &str = <lit>;`
+/// — this fixed, reserved name is the ONLY contract between this macro and `#[derive(DotnetEntity)]`.
+/// The derive does not need to see this invocation at macro-expansion time (proc-macros have no
+/// cross-item visibility into other macro invocations); it just emits code that references
+/// `crate::__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT` BY NAME when a struct doesn't override its
+/// namespace/assembly, and ordinary Rust item resolution (at the consuming crate's normal compile time,
+/// long after either macro has expanded) finds this `const` no differently than it would find any other
+/// two independently-defined items referencing each other. There is no proc-macro-level global state
+/// involved.
+///
+/// If `#[derive(DotnetEntity)]` is used on a struct that has NEITHER a `#[dotnet(namespace = "...")]`
+/// NOR a `#[dotnet(assembly = "...")]` override, AND this macro was never invoked anywhere in the crate,
+/// the derive's generated code fails to compile with a plain "cannot find const
+/// `__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT` in this scope" error. That failure is correct and intended —
+/// it means the derive has no default namespace/assembly to fall back to and none was given explicitly.
+#[macro_export]
+macro_rules! dotnet_namespace {
+    ($ns:literal) => {
+        #[doc(hidden)]
+        pub(crate) const __MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT: &str = $ns;
+    };
+}
+// `#[macro_export]` places the macro at the CRATE ROOT (`mycorrhiza::dotnet_namespace!`) regardless of
+// where in the source tree it's defined — this re-export makes it ALSO reachable at
+// `mycorrhiza::linq::dotnet_namespace!`, matching this module's public surface (callers shouldn't need
+// to know the macro physically lives in `linq.rs` vs. some other module).
+pub use crate::dotnet_namespace;
+
 /// A typed, named .NET property/field on an entity `Root` — e.g. `Person::AGE: Field<Person, i32>`.
 ///
 /// This is the ergonomic front door to the predicate-building machinery above: instead of hand-writing
 /// `Param::new(type_name, "p")` + `.expr().prop("Age")` + `Expr::const_i32(v)` + `TypedPredicate::new(..)`
 /// at every call site, a `Field<Root, Val>` constant (generated once, by `#[derive(DotnetEntity)]` in
-/// `dotnet_macros`) bundles the owning type's .NET name and the property's .NET name, and its methods
-/// (`.eq`/`.gt`/`.contains`/`.is_true`/…, added per `Val` below) go straight from a RAW Rust value to a
-/// finished `TypedPredicate<Root>` — no `Param`, `Expr`, or property-name string ever touched by a caller.
+/// `dotnet_macros`) bundles the owning type's .NET namespace/class/assembly and the property's .NET
+/// name, and its methods (`.eq`/`.gt`/`.contains`/`.is_true`/…, added per `Val` below) go straight from a
+/// RAW Rust value to a finished `TypedPredicate<Root>` — no `Param`, `Expr`, or property-name string
+/// ever touched by a caller.
+///
+/// The owning type's `Type.GetType`-resolvable spec (`"Namespace.Class, Assembly"`, what [`Param::new`]
+/// wants) is assembled from three SEPARATE pieces — `namespace`, `class`, `assembly` — rather than
+/// stored pre-joined, because each piece is independently overridable via `#[derive(DotnetEntity)]`'s
+/// escape-hatch attributes (`#[dotnet(namespace = "...")]` / `#[dotnet(assembly = "...")]` /
+/// `#[dotnet(name = "...")]`), and joining three `&'static str` consts into one at Rust-const-eval time
+/// would need `concat!`, which only accepts literals — not references to another item's `const`. Since
+/// [`Param::new`] already takes a plain (non-const) `&str`, the join happens with an ordinary runtime
+/// `format!` inside [`Field::type_name_spec`], not at const-evaluation time; this keeps `Field::new`
+/// itself a `const fn` (so `#[derive(DotnetEntity)]` can still emit each `Field` as an associated
+/// `const`) while letting each piece resolve independently.
 ///
 /// `Root`/`Val` are phantom type parameters (see `TypedPredicate`'s module doc) — `Field` itself carries
-/// no runtime payload beyond the two `&'static str`s, so it is `Copy` regardless of `Root`/`Val` (manual
+/// no runtime payload beyond its `&'static str`s, so it is `Copy` regardless of `Root`/`Val` (manual
 /// impls below, matching `TypedPredicate`'s own reasoning for not `#[derive]`ing).
 pub struct Field<Root, Val> {
-    /// The owning entity's .NET type spec, e.g. `"LinqDemo.Person, LinqDemo"` — fed to `Param::new`.
-    type_name: &'static str,
+    /// The owning entity's .NET namespace, e.g. `"LinqDemo"`.
+    namespace: &'static str,
+    /// The owning entity's .NET class name (no namespace prefix), e.g. `"Person"`.
+    class: &'static str,
+    /// The owning entity's .NET assembly (simple) name, e.g. `"LinqDemo"`.
+    assembly: &'static str,
     /// The .NET property/field name, e.g. `"Age"` — fed to `Expr::prop`.
     prop_name: &'static str,
     _root: PhantomData<fn() -> Root>,
@@ -197,17 +256,31 @@ impl<Root, Val> Clone for Field<Root, Val> {
 impl<Root, Val> Copy for Field<Root, Val> {}
 
 impl<Root, Val> Field<Root, Val> {
-    /// Construct a field descriptor. Callers should not normally spell this out by hand — it is what
-    /// `#[derive(DotnetEntity)]` generates one of per struct field — but it is `pub const fn` so the
-    /// derive can emit it as an associated `const`.
+    /// Construct a field descriptor from its three .NET-identity pieces (namespace, bare class name,
+    /// assembly simple name) plus the .NET property/field name. Callers should not normally spell this
+    /// out by hand — it is what `#[derive(DotnetEntity)]` generates one of per struct field — but it is
+    /// `pub const fn` so the derive can emit it as an associated `const`.
     #[must_use]
-    pub const fn new(type_name: &'static str, prop_name: &'static str) -> Self {
+    pub const fn new(
+        namespace: &'static str,
+        class: &'static str,
+        assembly: &'static str,
+        prop_name: &'static str,
+    ) -> Self {
         Field {
-            type_name,
+            namespace,
+            class,
+            assembly,
             prop_name,
             _root: PhantomData,
             _val: PhantomData,
         }
+    }
+
+    /// The `Type.GetType`-resolvable spec for this field's owning entity — `"Namespace.Class, Assembly"`
+    /// — joined at ordinary runtime (see the type-level doc for why this can't be a `const` join).
+    fn type_name_spec(self) -> std::string::String {
+        format!("{}.{}, {}", self.namespace, self.class, self.assembly)
     }
 
     /// Build the `Param` this field's property access is expressed over, plus the `x.Prop` member
@@ -217,27 +290,9 @@ impl<Root, Val> Field<Root, Val> {
     /// separate `TypedPredicate<Root>`s that both happen to use `"p"` are handled exactly like any two
     /// independently-authored predicates.
     fn param_and_prop(self) -> (Param, Expr) {
-        let p = Param::new(self.type_name, "p");
+        let p = Param::new(&self.type_name_spec(), "p");
         let e = p.expr().prop(self.prop_name);
         (p, e)
-    }
-
-    /// A trivially-true predicate over this field's entity type (`1 == 1`) — e.g. for a "no filter
-    /// applied" branch. Only needs `self` to know which `Root`/.NET type to build a `Param` against; the
-    /// field itself is otherwise irrelevant to the constant body, so (unlike the other `Field` methods)
-    /// this deliberately does NOT build the `x.Prop` member access — the .NET type need not actually
-    /// declare `self`'s property/field for `always`/`never` to work.
-    #[must_use]
-    pub fn always(self) -> TypedPredicate<Root> {
-        let p = Param::new(self.type_name, "p");
-        TypedPredicate::new(p, Expr::const_i32(1).eq(Expr::const_i32(1)))
-    }
-
-    /// A trivially-false predicate over this field's entity type (`1 == 0`).
-    #[must_use]
-    pub fn never(self) -> TypedPredicate<Root> {
-        let p = Param::new(self.type_name, "p");
-        TypedPredicate::new(p, Expr::const_i32(1).eq(Expr::const_i32(0)))
     }
 }
 
@@ -673,6 +728,29 @@ impl<T> TypedPredicate<T> {
     #[must_use]
     pub fn param(self) -> Param {
         self.param
+    }
+
+    /// A trivially-true predicate (`1 == 1`) over entity type `T` — e.g. for a "no filter applied"
+    /// branch. `T` is purely a phantom Rust-level marker (see the module doc), so this needs no real
+    /// .NET type or `Field` to build against: the internal `Param` is built against `System.Object`
+    /// (always `Type.GetType`-resolvable, regardless of what `T` is) — sound because the body never
+    /// performs a member access on the parameter, and combining this predicate with a real one via
+    /// `&`/`|` rebinds parameter identity structurally (see [`Self::combine`]/`rebind_param`), never
+    /// relying on the two operands' parameters sharing a declared .NET type. Calling `.compile()`
+    /// directly on a bare `always()` (without combining it into anything) also works standalone —
+    /// `Func<object,bool>` is a perfectly real, executable delegate.
+    #[must_use]
+    pub fn always() -> Self {
+        let p = Param::new("System.Object", "p");
+        TypedPredicate::new(p, Expr::const_i32(1).eq(Expr::const_i32(1)))
+    }
+
+    /// A trivially-false predicate (`1 == 0`) over entity type `T` — see [`Self::always`] for why no
+    /// real .NET type is needed.
+    #[must_use]
+    pub fn never() -> Self {
+        let p = Param::new("System.Object", "p");
+        TypedPredicate::new(p, Expr::const_i32(1).eq(Expr::const_i32(0)))
     }
 
     /// The untyped lambda body — hand this (with [`Self::param`]) to a `Expression.Lambda<Func<T,bool>>`
