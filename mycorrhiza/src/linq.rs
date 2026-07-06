@@ -169,23 +169,24 @@ impl Param {
 }
 
 /// Declare the crate-wide default .NET namespace (and, by the small-project convention documented on
-/// [`Field`]/`#[derive(DotnetEntity)]`, the default assembly name too) for every `#[derive(DotnetEntity)]`
-/// struct in this crate that doesn't override it explicitly. Invoke this ONCE, anywhere in the crate
-/// (typically near the crate root, e.g. the top of `lib.rs`/`main.rs`) — ordinary Rust name resolution
-/// makes the declaration visible to every module regardless of where it appears, exactly like any other
+/// [`Field`]/`#[dotnet_entity]`, the default assembly name too) for every `#[dotnet_entity]` struct in
+/// this crate that doesn't override it explicitly. Invoke this ONCE, anywhere in the crate (typically
+/// near the crate root, e.g. the top of `lib.rs`/`main.rs`) — ordinary Rust name resolution makes the
+/// declaration visible to every module regardless of where it appears, exactly like any other
 /// crate-root `const` referenced from elsewhere in the same crate:
 ///
 /// ```ignore
 /// mycorrhiza::linq::dotnet_namespace!("LinqDemo");
 ///
-/// #[derive(DotnetEntity)]
+/// #[dotnet_entity]
 /// struct Person { id: i32, name: String, age: i32, is_active: bool }
 /// // -> class "Person", namespace "LinqDemo", assembly "LinqDemo" (namespace == assembly by convention)
+/// // -> a `person: Person` singleton is also generated; `person.age.ge(18)` reads it via real field access.
 /// ```
 ///
 /// Expands to exactly one item: `pub(crate) const __MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT: &str = <lit>;`
-/// — this fixed, reserved name is the ONLY contract between this macro and `#[derive(DotnetEntity)]`.
-/// The derive does not need to see this invocation at macro-expansion time (proc-macros have no
+/// — this fixed, reserved name is the ONLY contract between this macro and `#[dotnet_entity]`. The
+/// entity macro does not need to see this invocation at macro-expansion time (proc-macros have no
 /// cross-item visibility into other macro invocations); it just emits code that references
 /// `crate::__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT` BY NAME when a struct doesn't override its
 /// namespace/assembly, and ordinary Rust item resolution (at the consuming crate's normal compile time,
@@ -193,11 +194,11 @@ impl Param {
 /// two independently-defined items referencing each other. There is no proc-macro-level global state
 /// involved.
 ///
-/// If `#[derive(DotnetEntity)]` is used on a struct that has NEITHER a `#[dotnet(namespace = "...")]`
-/// NOR a `#[dotnet(assembly = "...")]` override, AND this macro was never invoked anywhere in the crate,
-/// the derive's generated code fails to compile with a plain "cannot find const
+/// If `#[dotnet_entity]` is used on a struct that has NEITHER a `#[dotnet(namespace = "...")]` NOR a
+/// `#[dotnet(assembly = "...")]` override, AND this macro was never invoked anywhere in the crate, the
+/// generated code fails to compile with a plain "cannot find const
 /// `__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT` in this scope" error. That failure is correct and intended —
-/// it means the derive has no default namespace/assembly to fall back to and none was given explicitly.
+/// it means there is no default namespace/assembly to fall back to and none was given explicitly.
 #[macro_export]
 macro_rules! dotnet_namespace {
     ($ns:literal) => {
@@ -211,26 +212,32 @@ macro_rules! dotnet_namespace {
 // to know the macro physically lives in `linq.rs` vs. some other module).
 pub use crate::dotnet_namespace;
 
-/// A typed, named .NET property/field on an entity `Root` — e.g. `Person::AGE: Field<Person, i32>`.
+/// A typed, named .NET property/field on an entity `Root` — e.g. `person.age: Field<Person, i32>` (a
+/// real struct field on the canonical `person: Person` singleton `#[dotnet_entity]` generates).
 ///
 /// This is the ergonomic front door to the predicate-building machinery above: instead of hand-writing
 /// `Param::new(type_name, "p")` + `.expr().prop("Age")` + `Expr::const_i32(v)` + `TypedPredicate::new(..)`
-/// at every call site, a `Field<Root, Val>` constant (generated once, by `#[derive(DotnetEntity)]` in
-/// `dotnet_macros`) bundles the owning type's .NET namespace/class/assembly and the property's .NET
-/// name, and its methods (`.eq`/`.gt`/`.contains`/`.is_true`/…, added per `Val` below) go straight from a
-/// RAW Rust value to a finished `TypedPredicate<Root>` — no `Param`, `Expr`, or property-name string
-/// ever touched by a caller.
+/// at every call site, a `Field<Root, Val>` value (generated once, by `#[dotnet_entity]` in
+/// `dotnet_macros`, as a RETYPED field on the entity struct plus one canonical singleton instance)
+/// bundles the owning type's .NET namespace/class/assembly and the property's .NET name, and its methods
+/// (`.eq`/`.gt`/`.contains`/`.is_true`/…, added per `Val` below) go straight from a RAW Rust value to a
+/// finished `TypedPredicate<Root>` — no `Param`, `Expr`, or property-name string ever touched by a
+/// caller. Because the singleton is a genuine value (not a type-level path), building a predicate reads
+/// as real Rust field access — `person.age.ge(18) & person.name.contains("a")` — rather than a
+/// `::`-qualified associated-const path (an earlier version of this API generated each `Field` as an
+/// associated const, e.g. `Person::AGE`, which forced `::` path syntax at every call site; that design
+/// is fully replaced by the retyped-field + singleton generation `#[dotnet_entity]` does now).
 ///
 /// The owning type's `Type.GetType`-resolvable spec (`"Namespace.Class, Assembly"`, what [`Param::new`]
 /// wants) is assembled from three SEPARATE pieces — `namespace`, `class`, `assembly` — rather than
-/// stored pre-joined, because each piece is independently overridable via `#[derive(DotnetEntity)]`'s
+/// stored pre-joined, because each piece is independently overridable via `#[dotnet_entity]`'s
 /// escape-hatch attributes (`#[dotnet(namespace = "...")]` / `#[dotnet(assembly = "...")]` /
 /// `#[dotnet(name = "...")]`), and joining three `&'static str` consts into one at Rust-const-eval time
 /// would need `concat!`, which only accepts literals — not references to another item's `const`. Since
 /// [`Param::new`] already takes a plain (non-const) `&str`, the join happens with an ordinary runtime
 /// `format!` inside [`Field::type_name_spec`], not at const-evaluation time; this keeps `Field::new`
-/// itself a `const fn` (so `#[derive(DotnetEntity)]` can still emit each `Field` as an associated
-/// `const`) while letting each piece resolve independently.
+/// itself a `const fn` (so `#[dotnet_entity]` can still emit the whole singleton, one `Field::new(..)`
+/// per field, as a single `const` value) while letting each piece resolve independently.
 ///
 /// `Root`/`Val` are phantom type parameters (see `TypedPredicate`'s module doc) — `Field` itself carries
 /// no runtime payload beyond its `&'static str`s, so it is `Copy` regardless of `Root`/`Val` (manual
@@ -258,8 +265,9 @@ impl<Root, Val> Copy for Field<Root, Val> {}
 impl<Root, Val> Field<Root, Val> {
     /// Construct a field descriptor from its three .NET-identity pieces (namespace, bare class name,
     /// assembly simple name) plus the .NET property/field name. Callers should not normally spell this
-    /// out by hand — it is what `#[derive(DotnetEntity)]` generates one of per struct field — but it is
-    /// `pub const fn` so the derive can emit it as an associated `const`.
+    /// out by hand — it is what `#[dotnet_entity]` generates one of per struct field, as an initializer
+    /// inside the generated singleton's `const` literal — but it is `pub const fn` so that singleton
+    /// itself can be a real `const`.
     #[must_use]
     pub const fn new(
         namespace: &'static str,

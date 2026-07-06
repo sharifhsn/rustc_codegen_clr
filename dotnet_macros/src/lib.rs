@@ -15,8 +15,8 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    parse_macro_input, punctuated::Punctuated, spanned::Spanned, DeriveInput, FnArg, ImplItem, ItemFn,
-    ItemImpl, ItemStruct, LitBool, LitStr, MetaNameValue, ReturnType, Token, Type,
+    parse_macro_input, punctuated::Punctuated, spanned::Spanned, FnArg, ImplItem, ItemFn, ItemImpl,
+    ItemStruct, LitBool, LitStr, MetaNameValue, ReturnType, Token, Type,
 };
 
 /// Split a `"[Assembly]Namespace.Type"` spec into `(assembly, type_name)`. An empty/`[]`-less spec
@@ -665,13 +665,14 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 // ============================================================================
-// #[derive(DotnetEntity)] — generate `mycorrhiza::linq::Field<Root, Val>` consts for LINQ predicate
-// building, one per struct field, so a caller never hand-types a .NET property-name string.
+// #[dotnet_entity] — retype an entity struct's fields to `mycorrhiza::linq::Field<Root, Val>` markers
+// and generate one canonical singleton instance, so predicate-building reads as real Rust field access
+// (`person.age.ge(18)`) instead of a `::`-qualified associated-const path (`Person::AGE.ge(18)`).
 // ============================================================================
 
 /// snake_case -> PascalCase, e.g. `is_active` -> `IsActive`, `age` -> `Age`. This is the DEFAULT .NET
-/// property-name convention a `#[derive(DotnetEntity)]` field maps to; `#[dotnet(rename = "...")]` on a
-/// field overrides it for cases where the convention doesn't match.
+/// property-name convention a `#[dotnet_entity]` field maps to; `#[dotnet(rename = "...")]` on a field
+/// overrides it for cases where the convention doesn't match.
 fn to_pascal_case(snake: &str) -> String {
     snake
         .split('_')
@@ -686,8 +687,32 @@ fn to_pascal_case(snake: &str) -> String {
         .collect()
 }
 
-/// `#[derive(DotnetEntity)]` — by default resolves the .NET **class name** to the Rust struct's own
-/// name, and the .NET **namespace**/**assembly** to the crate-level default declared once via
+/// PascalCase -> snake_case, e.g. `Person` -> `person`, `HTTPClient` -> `httpclient`. Used to name the
+/// singleton instance `#[dotnet_entity]` generates (see its doc comment) — a lowercase, non-colliding
+/// default derived from the struct's own name, so `struct Person` gets a `person: Person` singleton
+/// without any per-struct configuration. Not meant to be a general-purpose ident-casing utility (it
+/// does not split on internal acronym boundaries beyond lowercasing runs of caps together); good enough
+/// for ordinary `PascalCase` struct names, which is all `#[dotnet_entity]` sees.
+fn to_snake_case(pascal: &str) -> String {
+    let mut out = String::new();
+    let mut prev_lower_or_digit = false;
+    for ch in pascal.chars() {
+        if ch.is_ascii_uppercase() {
+            if prev_lower_or_digit && !out.is_empty() {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+            prev_lower_or_digit = false;
+        } else {
+            out.push(ch);
+            prev_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+        }
+    }
+    out
+}
+
+/// `#[dotnet_entity]` — by default resolves the .NET **class name** to the Rust struct's own name, and
+/// the .NET **namespace**/**assembly** to the crate-level default declared once via
 /// [`mycorrhiza::linq::dotnet_namespace!`](../mycorrhiza/linq/macro.dotnet_namespace.html) (namespace
 /// and assembly default to the SAME value — the common small-project convention that a project's
 /// namespace and its assembly name are identical). Each piece has an independent escape-hatch attribute:
@@ -697,29 +722,51 @@ fn to_pascal_case(snake: &str) -> String {
 /// - `#[dotnet(name = "...")]` — override just the class name (still uses the crate-level default for
 ///   namespace/assembly unless those are ALSO given).
 ///
-/// Generates, for each named field of the struct, an associated `const` of type
-/// `::mycorrhiza::linq::Field<Self, FieldTy>` named after the field's UPPERCASED identifier (e.g. a
-/// field `age: i32` becomes `Person::AGE: Field<Person, i32>`). The .NET property name each `Field`
-/// carries defaults to the PascalCase conversion of the Rust field name (`is_active` -> `IsActive`);
-/// override per-field with `#[dotnet(rename = "...")]` when the convention doesn't match.
+/// **This is an attribute macro, not a `derive`** — deliberately, because it needs to do something a
+/// `derive` structurally cannot: RETYPE the struct's own fields. Every named field `f: OrigTy` becomes
+/// `f: ::mycorrhiza::linq::Field<Self, OrigTy>`, and the macro additionally emits ONE canonical
+/// `pub(crate) const` singleton instance of the struct (named after the snake_case conversion of the
+/// struct's own name — e.g. `struct Person` gets a `person: Person` singleton), with each field
+/// initialized via `Field::new(..)` (which stays a `const fn`, so this singleton is itself a real
+/// `const`, buildable at zero runtime cost). This is what lets a caller write genuine Rust field-access
+/// syntax to build a predicate — `person.age.ge(min_age) & person.name.contains(name_contains)` — with
+/// real dot-chains, not a `::`-qualified associated-const path. (An earlier version of this API
+/// generated `Field` values as associated consts instead — `Person::AGE.ge(..)` — forcing `::` path
+/// syntax for every predicate; direct user feedback was "I would rather do `person.name.contains` than
+/// `Person::NAME.contains`", which this retyped-field + singleton design directly satisfies. That
+/// associated-const generation is fully replaced, not kept alongside this — see the module-level
+/// migration note below.)
+///
+/// The .NET property name each retyped field's `Field` carries defaults to the PascalCase conversion of
+/// the Rust field name (`is_active` -> `IsActive`); override per-field with `#[dotnet(rename = "...")]`
+/// when the convention doesn't match.
 ///
 /// ```ignore
 /// // Once, near the crate root:
 /// mycorrhiza::linq::dotnet_namespace!("LinqDemo");
 ///
-/// #[derive(DotnetEntity)]
+/// #[dotnet_entity]
 /// struct Person { id: i32, name: String, age: i32, is_active: bool }
 ///
 /// // Generates (roughly):
-/// impl Person {
-///     pub const ID: ::mycorrhiza::linq::Field<Person, i32> =
-///         ::mycorrhiza::linq::Field::new(crate::__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT, "Person", crate::__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT, "Id");
-///     // ...NAME, AGE, IS_ACTIVE likewise.
+/// struct Person {
+///     pub id: ::mycorrhiza::linq::Field<Person, i32>,
+///     pub name: ::mycorrhiza::linq::Field<Person, String>,
+///     pub age: ::mycorrhiza::linq::Field<Person, i32>,
+///     pub is_active: ::mycorrhiza::linq::Field<Person, bool>,
 /// }
+/// #[allow(non_upper_case_globals)]
+/// pub(crate) const person: Person = Person {
+///     id: ::mycorrhiza::linq::Field::new(crate::__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT, "Person", crate::__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT, "Id"),
+///     // ...name, age, is_active likewise.
+/// };
+///
+/// // Usage — real field access, no `::` path:
+/// let pred = person.age.ge(18) & person.name.contains("a");
 /// ```
 ///
-/// **Important**: this derive does NOT need to see the `dotnet_namespace!` invocation at
-/// macro-expansion time — it only emits a reference to the FIXED name `crate::__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT`
+/// **Important**: this macro does NOT need to see the `dotnet_namespace!` invocation at expansion time
+/// — it only emits a reference to the FIXED name `crate::__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT`
 /// (whenever no `namespace`/`assembly` override is given), and ordinary Rust name resolution finds it at
 /// the consuming crate's normal compile time, regardless of expansion order. If a struct provides
 /// neither an override nor a crate-level `dotnet_namespace!` declaration, the generated code fails with
@@ -728,11 +775,11 @@ fn to_pascal_case(snake: &str) -> String {
 ///
 /// This is pure compile-time constant generation — unlike `#[dotnet_class]`/`#[dotnet_methods]`/
 /// `#[dotnet_export]`, it does NOT touch the backend's comptime interpreter (no `rustc_codegen_clr_*`
-/// intrinsic calls, no `#[used]` DCE anchor): the derive only ever expands to an ordinary `impl` block
-/// of `const`s, which is why it needs none of that machinery.
-#[proc_macro_derive(DotnetEntity, attributes(dotnet))]
-pub fn derive_dotnet_entity(item: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(item as DeriveInput);
+/// intrinsic calls, no `#[used]` DCE anchor): the macro only ever expands to the retyped struct plus one
+/// `const` singleton, which is why it needs none of that machinery.
+#[proc_macro_attribute]
+pub fn dotnet_entity(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as ItemStruct);
     let struct_name = &input.ident;
     let span = struct_name.span();
 
@@ -749,7 +796,7 @@ pub fn derive_dotnet_entity(item: TokenStream) -> TokenStream {
         let syn::Meta::List(list) = &attr.meta else {
             return syn::Error::new(
                 attr.span(),
-                "#[derive(DotnetEntity)]: expected `#[dotnet(namespace = \"...\", assembly = \"...\", name = \"...\")]`",
+                "#[dotnet_entity]: expected `#[dotnet(namespace = \"...\", assembly = \"...\", name = \"...\")]`",
             )
             .to_compile_error()
             .into();
@@ -778,9 +825,9 @@ pub fn derive_dotnet_entity(item: TokenStream) -> TokenStream {
             } else if m.path.is_ident("type_name") {
                 return syn::Error::new(
                     m.path.span(),
-                    "#[derive(DotnetEntity)]: `type_name` was replaced by separate `namespace`/\
-                     `assembly`/`name` attributes (each independently overridable; namespace/assembly \
-                     default to the crate-level `mycorrhiza::linq::dotnet_namespace!` declaration)",
+                    "#[dotnet_entity]: `type_name` was replaced by separate `namespace`/`assembly`/\
+                     `name` attributes (each independently overridable; namespace/assembly default to \
+                     the crate-level `mycorrhiza::linq::dotnet_namespace!` declaration)",
                 )
                 .to_compile_error()
                 .into();
@@ -790,7 +837,7 @@ pub fn derive_dotnet_entity(item: TokenStream) -> TokenStream {
 
     // Namespace/assembly: an explicit override is a plain string literal; otherwise reference the
     // crate-level default const BY NAME (resolved at ordinary Rust compile time, not here — see the
-    // derive's doc comment for why this needs no macro-expansion-order coordination).
+    // macro's doc comment for why this needs no macro-expansion-order coordination).
     let namespace_expr = match &namespace_override {
         Some(s) => {
             let lit = LitStr::new(s, span);
@@ -810,27 +857,24 @@ pub fn derive_dotnet_entity(item: TokenStream) -> TokenStream {
     let class_name_lit = LitStr::new(&class_name, span);
 
     // ---- named fields only ----
-    let fields = match &input.data {
-        syn::Data::Struct(syn::DataStruct {
-            fields: syn::Fields::Named(named),
-            ..
-        }) => &named.named,
-        syn::Data::Struct(_) => {
+    let fields = match &input.fields {
+        syn::Fields::Named(named) => &named.named,
+        _ => {
             return syn::Error::new(
                 span,
-                "#[derive(DotnetEntity)]: tuple structs and unit structs are not supported; use named fields",
+                "#[dotnet_entity]: tuple structs and unit structs are not supported; use named fields",
             )
             .to_compile_error()
             .into();
         }
-        _ => {
-            return syn::Error::new(span, "#[derive(DotnetEntity)]: only structs are supported")
-                .to_compile_error()
-                .into();
-        }
     };
 
-    let mut consts = Vec::new();
+    // Two parallel outputs per field: the RETYPED field declaration (`pub name: Field<Self, OrigTy>`,
+    // replacing the struct's own field), and the singleton's initializer expression for that field
+    // (`name: Field::new(...)`). Built together since both need the same per-field namespace/prop-name
+    // resolution.
+    let mut retyped_fields = Vec::new();
+    let mut singleton_inits = Vec::new();
     for f in fields {
         let Some(fident) = &f.ident else {
             continue;
@@ -847,7 +891,7 @@ pub fn derive_dotnet_entity(item: TokenStream) -> TokenStream {
             let syn::Meta::List(list) = &attr.meta else {
                 return syn::Error::new(
                     attr.span(),
-                    "#[derive(DotnetEntity)]: expected `#[dotnet(rename = \"...\")]`",
+                    "#[dotnet_entity]: expected `#[dotnet(rename = \"...\")]`",
                 )
                 .to_compile_error()
                 .into();
@@ -870,20 +914,46 @@ pub fn derive_dotnet_entity(item: TokenStream) -> TokenStream {
             }
         }
 
-        let const_ident = format_ident!("{}", fname.to_uppercase(), span = fspan);
         let prop_name_lit = LitStr::new(&prop_name, fspan);
         let fty = &f.ty;
-        consts.push(quote! {
-            pub const #const_ident: ::mycorrhiza::linq::Field<#struct_name, #fty> =
-                ::mycorrhiza::linq::Field::new(#namespace_expr, #class_name_lit, #assembly_expr, #prop_name_lit);
+        let vis = &f.vis;
+        retyped_fields.push(quote! {
+            #vis #fident: ::mycorrhiza::linq::Field<#struct_name, #fty>
+        });
+        singleton_inits.push(quote! {
+            #fident: ::mycorrhiza::linq::Field::new(#namespace_expr, #class_name_lit, #assembly_expr, #prop_name_lit)
         });
     }
 
+    // The singleton's name: snake_case(struct name), e.g. `Person` -> `person`. Lowercase purely by
+    // convention (the user explicitly said case doesn't matter, only that `::` goes away) — documented
+    // here as the ONE fixed, non-configurable naming rule this macro applies.
+    let singleton_name = to_snake_case(&struct_name.to_string());
+    let singleton_ident = format_ident!("{}", singleton_name, span = span);
+
+    // Preserve the original struct's own attributes (other than the `#[dotnet(...)]` ones this macro
+    // itself consumes) and visibility/generics, retyping only the fields.
+    let other_attrs: Vec<_> = input
+        .attrs
+        .iter()
+        .filter(|a| !a.path().is_ident("dotnet"))
+        .collect();
+    let vis = &input.vis;
+    let generics = &input.generics;
+
     let expanded = quote! {
-        #[allow(non_upper_case_globals)]
-        impl #struct_name {
-            #(#consts)*
+        #(#other_attrs)*
+        #vis struct #struct_name #generics {
+            #(#retyped_fields),*
         }
+
+        /// The canonical singleton instance of this entity — real Rust field access
+        /// (`#singleton_ident.field.method(..)`) builds a predicate without any `::` path syntax.
+        /// Generated by `#[dotnet_entity]`; see its doc comment for the full design.
+        #[allow(non_upper_case_globals)]
+        pub(crate) const #singleton_ident: #struct_name = #struct_name {
+            #(#singleton_inits),*
+        };
     };
     expanded.into()
 }

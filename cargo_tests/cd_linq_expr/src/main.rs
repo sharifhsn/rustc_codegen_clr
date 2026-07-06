@@ -3,24 +3,28 @@
 // it (e.g. to SQL). So this proves the two things a provider needs: (1) the tree's structure is what we
 // intended (verified via `Expression.ToString()`), and (2) it is a semantically valid, JIT-compilable
 // predicate (verified via `LambdaExpression.Compile()` producing a real, non-null `Func<...>`).
-use dotnet_macros::DotnetEntity;
+use dotnet_macros::dotnet_entity;
 use mycorrhiza::linq::{Expr, Param, TypedPredicate};
 use mycorrhiza::system::console::Console;
 use mycorrhiza::system::DotNetString;
 
-/// Test entity for the `Field<Root, Val>` / `#[derive(DotnetEntity)]` ergonomics API. Unlike the plain
+/// Test entity for the `Field<Root, Val>` / `#[dotnet_entity]` ergonomics API. Unlike the plain
 /// `Param`/`Expr` checks above (which build trees over `System.Int32`/`System.String` params without a
 /// matching backing member), `Expression.PropertyOrField` VALIDATES eagerly against the target `Type` at
 /// build time (not just at `.compile()`), so every `Field` const below must name a member that REALLY
 /// exists on the .NET type it targets. `System.Exception` supplies both an `int` (`HResult`) and a
 /// `String` (`Message`) member with EXACTLY the PascalCase names these snake_case field names convert
-/// to, so the derive's default naming convention is exercised end-to-end against a real type.
+/// to, so the macro's default naming convention is exercised end-to-end against a real type.
 ///
 /// Exercises the `namespace`/`assembly`/`name` escape hatches directly (each independently overriding
 /// its piece of the .NET type spec) rather than the crate-level `dotnet_namespace!` default -- BCL
 /// types don't live in this crate's own namespace/assembly, so every field here needs the override path
 /// anyway. The crate-level-default (zero-attribute) path is exercised separately below.
-#[derive(DotnetEntity)]
+///
+/// Fields are retyped to `Field<Sample, _>` markers by `#[dotnet_entity]`, and a `sample: Sample`
+/// singleton is generated -- predicates below are built via `sample.id.eq(..)` / real field access, NOT
+/// a `Sample::ID` associated-const path (the old, now-fully-replaced design).
+#[dotnet_entity]
 #[dotnet(namespace = "System", assembly = "System.Private.CoreLib", name = "Exception")]
 struct Sample {
     #[dotnet(rename = "HResult")]
@@ -31,9 +35,9 @@ struct Sample {
 
 /// `System.Reflection.MethodInfo` supplies two real `bool` members whose PascalCase matches the Rust
 /// field names directly (no rename needed): `IsStatic` (single-word) and `IsGenericMethod`
-/// (multi-word) -- exercises the derive's default naming convention against real backing members, and
+/// (multi-word) -- exercises the macro's default naming convention against real backing members, and
 /// (having two fields on the SAME entity) lets `Field`-built predicates combine with `&`/`|`/`!`.
-#[derive(DotnetEntity)]
+#[dotnet_entity]
 #[dotnet(namespace = "System.Reflection", assembly = "System.Private.CoreLib", name = "MethodInfo")]
 struct MethodSample {
     is_static: bool,
@@ -56,9 +60,9 @@ mycorrhiza::linq::dotnet_namespace!("System.Text.RegularExpressions");
 /// crate-level default: `"System.Text.RegularExpressions"`. Class name resolves to the struct's own
 /// Rust identifier verbatim: `"Regex"` -- a REAL BCL class in that namespace/assembly, with a real
 /// `bool` member (`RightToLeft`) whose PascalCase matches this struct's `right_to_left` field exactly,
-/// so the derive's fully-defaulted output resolves to a genuine, member-backed .NET type end-to-end
+/// so the macro's fully-defaulted output resolves to a genuine, member-backed .NET type end-to-end
 /// (not merely "didn't crash").
-#[derive(DotnetEntity)]
+#[dotnet_entity]
 struct Regex {
     right_to_left: bool,
 }
@@ -68,7 +72,7 @@ struct Regex {
 /// DIFFERENT real class in the same real namespace/assembly (`Match`, which has a real `bool` member
 /// `Success`), proving the `name` override composes correctly with the crate-level namespace/assembly
 /// default (not just with an explicit override of those too).
-#[derive(DotnetEntity)]
+#[dotnet_entity]
 #[dotnet(name = "Match")]
 struct MatchEntity {
     success: bool,
@@ -80,7 +84,7 @@ struct MatchEntity {
 /// (`System.Reflection`/`System.Private.CoreLib`, vs. the crate default's
 /// `System.Text.RegularExpressions`), proving the overrides genuinely take priority rather than merely
 /// happening to agree with the default.
-#[derive(DotnetEntity)]
+#[dotnet_entity]
 #[dotnet(namespace = "System.Reflection", assembly = "System.Private.CoreLib", name = "MethodInfo")]
 struct FullyOverriddenEntity {
     is_static: bool,
@@ -332,31 +336,34 @@ fn main() -> std::process::ExitCode {
     chk!(raw_fn.call_i32(42), true); // 42 > 41
     chk!(raw_fn.call_i32(10), false); // 10 > 41 -> false
 
-    // ---- `Field<Root, Val>` / `#[derive(DotnetEntity)]` ergonomics API ----
+    // ---- `Field<Root, Val>` / `#[dotnet_entity]` ergonomics API ----
     // PascalCase conversion, checked via the .NET property name baked into each generated `Field`'s
     // built `Expression.PropertyOrField` text -- single-word (`id` -renamed-> `HResult`) and multi-word
     // (`display_name` -renamed-> `Message`, and unrenamed multi-word below) snake_case all convert
     // correctly. `System.Exception` is a resolvable real BCL type with both members, so
     // `Expression.PropertyOrField`'s eager validation succeeds.
-    let id_body = Sample::ID.eq(1).text();
-    say("Sample::ID body", &id_body);
+    //
+    // Real field access through the generated `sample`/`method_sample` singletons -- NOT a `Sample::ID`
+    // associated-const path (the fully-replaced old design).
+    let id_body = sample.id.eq(1).text();
+    say("sample.id body", &id_body);
     chk!(id_body.contains(".HResult"), true);
 
-    let name_body = Sample::DISPLAY_NAME.eq("x").text();
-    say("Sample::DISPLAY_NAME body", &name_body);
+    let name_body = sample.display_name.eq("x").text();
+    say("sample.display_name body", &name_body);
     chk!(name_body.contains(".Message"), true);
 
     // Unrenamed multi-word snake_case -> PascalCase, against a REAL member: `is_static` -> `IsStatic`.
-    let static_body = MethodSample::IS_STATIC.is_true().text();
-    say("MethodSample::IS_STATIC body", &static_body);
+    let static_body = method_sample.is_static.is_true().text();
+    say("method_sample.is_static body", &static_body);
     chk!(static_body.contains("IsStatic"), true);
 
     // A second, distinctly-shaped multi-word conversion: `is_generic_method` -> `IsGenericMethod`.
-    let generic_body = MethodSample::IS_GENERIC_METHOD.is_true().text();
-    say("MethodSample::IS_GENERIC_METHOD body", &generic_body);
+    let generic_body = method_sample.is_generic_method.is_true().text();
+    say("method_sample.is_generic_method body", &generic_body);
     chk!(generic_body.contains("IsGenericMethod"), true);
 
-    // `#[dotnet(rename = "...")]` escape hatch: `Sample::ID`'s .NET property name is "HResult" (the
+    // `#[dotnet(rename = "...")]` escape hatch: `sample.id`'s .NET property name is "HResult" (the
     // rename), NOT the PascalCase of the Rust field name ("Id").
     chk!(id_body.contains(".Id"), false);
     chk!(name_body.contains(".DisplayName"), false);
@@ -366,7 +373,7 @@ fn main() -> std::process::ExitCode {
     // check: same structural pieces (comparison operator, property name, operand), and it compiles.
     let manual_p = Param::new("System.Exception, System.Private.CoreLib", "p");
     let manual_body = manual_p.expr().prop("HResult").gt(Expr::const_i32(5));
-    let field_pred = Sample::ID.gt(5);
+    let field_pred = sample.id.gt(5);
     say("manual gt body", &manual_body.text());
     say("field gt body", &field_pred.text());
     // Both mention the same operator/property/constant -- the only difference is the lambda
@@ -387,14 +394,14 @@ fn main() -> std::process::ExitCode {
 
     // Execute a `Field<Root, i32>`-built predicate end-to-end against a REAL backing type/property:
     // `System.String.Length` (an `int` property every `System.String` has) via a Rust entity struct
-    // whose derive targets `System.String` -- proves `Field::gt`/`le` don't just build well-formed
+    // whose macro targets `System.String` -- proves `Field::gt`/`le` don't just build well-formed
     // trees, they filter correctly at runtime, exactly like the old manual path.
-    #[derive(DotnetEntity)]
+    #[dotnet_entity]
     #[dotnet(namespace = "System", assembly = "System.Private.CoreLib", name = "String")]
     struct StrEntity {
         length: i32,
     }
-    let len_pred = StrEntity::LENGTH.gt(5);
+    let len_pred = str_entity.length.gt(5);
     let len_fn = len_pred.body().lambda(&[&len_pred.param()]).compile();
     chk!(len_fn.call_str("hello!"), true); // 6 > 5
     chk!(len_fn.call_str("hi"), false); // 2 > 5
@@ -403,18 +410,18 @@ fn main() -> std::process::ExitCode {
     // `Expr::call1_same_type` above, reached through the ergonomic entry point, executed end-to-end
     // against the SAME real `System.String.Length`... no -- these need a `String`-typed member, so
     // reuse `StrEntity`-style entity, but targeting `System.Exception.Message` (a real `String` member)
-    // via `Sample::DISPLAY_NAME`.
-    let contains_pred = Sample::DISPLAY_NAME.contains("ell");
+    // via `sample.display_name`.
+    let contains_pred = sample.display_name.contains("ell");
     let contains_body = contains_pred.text();
     say("Field contains body", &contains_body);
     chk!(contains_body.contains("Contains"), true);
-    let sw_pred = Sample::DISPLAY_NAME.starts_with("he");
+    let sw_pred = sample.display_name.starts_with("he");
     chk!(sw_pred.text().contains("StartsWith"), true);
-    let ew_pred = Sample::DISPLAY_NAME.ends_with("lo");
+    let ew_pred = sample.display_name.ends_with("lo");
     chk!(ew_pred.text().contains("EndsWith"), true);
 
     // `Field<Root, bool>.is_false` -- negated body, against the real `MethodInfo.IsStatic` member.
-    let false_pred = MethodSample::IS_STATIC.is_false();
+    let false_pred = method_sample.is_static.is_false();
     chk!(false_pred.text().contains("Not"), true);
 
     // `TypedPredicate::<T>::always()`/`never()` -- trivial constant predicates, replacing the old
@@ -475,10 +482,11 @@ fn main() -> std::process::ExitCode {
     // Zero-attribute case: namespace AND assembly both resolve to the crate-level default
     // ("System.Text.RegularExpressions"), class name resolves to the struct's own Rust identifier
     // verbatim ("Regex") -- a REAL BCL type. Executed end-to-end (not just `.text()`): `Regex.RightToLeft`
-    // is a real `bool` member, so `Field::is_false` against it produces a genuinely well-formed,
-    // COMPILABLE predicate over the fully-defaulted (zero-attribute) type spec.
-    let default_pred = Regex::RIGHT_TO_LEFT.is_false();
-    say("Regex::RIGHT_TO_LEFT body", &default_pred.text());
+    // is a real `bool` member, so `Field::is_false` against it (via the generated `regex` singleton)
+    // produces a genuinely well-formed, COMPILABLE predicate over the fully-defaulted (zero-attribute)
+    // type spec.
+    let default_pred = regex.right_to_left.is_false();
+    say("regex.right_to_left body", &default_pred.text());
     chk!(default_pred.text().contains("RightToLeft"), true); // PascalCase("right_to_left")
     chk!(
         default_pred.body().lambda(&[&default_pred.param()]).compiles(),
@@ -487,8 +495,8 @@ fn main() -> std::process::ExitCode {
 
     // `#[dotnet(name = "...")]` alone: class name overridden to a DIFFERENT real class ("Match") in the
     // SAME namespace/assembly (still the crate-level default) -- `Match.Success` is a real `bool` member.
-    let renamed_pred = MatchEntity::SUCCESS.is_true();
-    say("MatchEntity::SUCCESS body", &renamed_pred.text());
+    let renamed_pred = match_entity.success.is_true();
+    say("match_entity.success body", &renamed_pred.text());
     chk!(renamed_pred.text().contains("Success"), true);
     chk!(
         renamed_pred.body().lambda(&[&renamed_pred.param()]).compiles(),
@@ -497,10 +505,10 @@ fn main() -> std::process::ExitCode {
 
     // All three overrides given explicitly (namespace/assembly/name all differ from the crate-level
     // default) -- must work with no dependency on the crate-level const. `MethodInfo.IsStatic` is the
-    // same real member `MethodSample::IS_STATIC` above exercises, here reached via full manual overrides
+    // same real member `method_sample.is_static` above exercises, here reached via full manual overrides
     // instead of the crate-default path.
-    let full_override_pred = FullyOverriddenEntity::IS_STATIC.is_false();
-    say("FullyOverriddenEntity::IS_STATIC body", &full_override_pred.text());
+    let full_override_pred = fully_overridden_entity.is_static.is_false();
+    say("fully_overridden_entity.is_static body", &full_override_pred.text());
     chk!(full_override_pred.text().contains("IsStatic"), true);
     chk!(
         full_override_pred
@@ -513,14 +521,14 @@ fn main() -> std::process::ExitCode {
     // `Field<Root,_>` predicates combine with `&`/`|`/`!` exactly like manually-built `TypedPredicate`s
     // (same underlying type, no special-casing needed) -- reuses the parameter-rebinding path since
     // each `Field` method call constructs its own fresh `Param` internally (here, two DIFFERENT
-    // `MethodSample` fields, so the two operands are genuinely built against different `Param`s).
-    let combined = MethodSample::IS_STATIC.is_true() & MethodSample::IS_GENERIC_METHOD.is_false();
+    // `method_sample` fields, so the two operands are genuinely built against different `Param`s).
+    let combined = method_sample.is_static.is_true() & method_sample.is_generic_method.is_false();
     say("Field combined", &combined.text());
     chk!(combined.text().contains("AndAlso"), true);
     chk!(combined.body().lambda(&[&combined.param()]).compiles(), true);
-    let or_combined = MethodSample::IS_STATIC.is_true() | MethodSample::IS_GENERIC_METHOD.is_false();
+    let or_combined = method_sample.is_static.is_true() | method_sample.is_generic_method.is_false();
     chk!(or_combined.body().lambda(&[&or_combined.param()]).compiles(), true);
-    let not_combined = !MethodSample::IS_STATIC.is_true();
+    let not_combined = !method_sample.is_static.is_true();
     chk!(not_combined.body().lambda(&[&not_combined.param()]).compiles(), true);
 
     Console::writeln_u64(pass as u64);
