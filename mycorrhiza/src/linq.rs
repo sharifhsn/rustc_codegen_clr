@@ -45,6 +45,7 @@ use crate::intrinsics::{
     RustcCLRInteropMethodGeneric,
 };
 use crate::system::{DotNetString, MString};
+use std::marker::PhantomData;
 
 // Managed-handle aliases for the types we touch. `Expression` and its subtypes live in the
 // `System.Linq.Expressions` assembly; `Type`/`Delegate` in CoreLib.
@@ -53,6 +54,8 @@ type CParam =
     RustcCLRInteropManagedClass<"System.Linq.Expressions", "System.Linq.Expressions.ParameterExpression">;
 type CBinary =
     RustcCLRInteropManagedClass<"System.Linq.Expressions", "System.Linq.Expressions.BinaryExpression">;
+type CUnary =
+    RustcCLRInteropManagedClass<"System.Linq.Expressions", "System.Linq.Expressions.UnaryExpression">;
 type CLambda =
     RustcCLRInteropManagedClass<"System.Linq.Expressions", "System.Linq.Expressions.LambdaExpression">;
 type CConst =
@@ -162,6 +165,14 @@ fn binop<const OP: &'static str>(a: Expr, b: Expr) -> Expr {
     }
 }
 
+/// Emit one `Expression.<Op>(a) -> UnaryExpression`, upcast to `Expression`.
+fn unop<const OP: &'static str>(a: Expr) -> Expr {
+    let un = CExpr::static1::<OP, CExpr, CUnary>(a.inner);
+    Expr {
+        inner: cast::<CExpr, CUnary>(un),
+    }
+}
+
 impl Expr {
     /// An `Int32` literal — `Expression.Constant((object)v)`. Boxes `v` to `System.Object`, so a real
     /// value-constant filter like `x.gt(Expr::const_i32(5))` (== `x => x > 5`) is expressible.
@@ -227,6 +238,12 @@ impl Expr {
     #[must_use]
     pub fn or(self, other: Expr) -> Expr {
         binop::<"OrElse">(self, other)
+    }
+
+    /// `!a` — `Expression.Not(a) -> UnaryExpression`.
+    #[must_use]
+    pub fn not(self) -> Expr {
+        unop::<"Not">(self)
     }
 
     /// The provider-visible rendering of this node (`Expression.ToString()`).
@@ -299,6 +316,200 @@ impl Predicate {
     pub fn text(self) -> std::string::String {
         let base = cast::<CExpr, CExprFuncIB>(self.inner);
         to_rust(base.virt0::<"ToString", MString>())
+    }
+}
+
+// ---- `TypedPredicate<T>` — combinable predicates via `&`/`|`/`!` (`PredicateBuilder`-equivalent) ----
+//
+// THE REAL C# PROBLEM THIS SOLVES: two independently-built `Expression<Func<T,bool>>` each carry their
+// OWN `ParameterExpression` instance for the lambda parameter (`Param::new` allocates a fresh one every
+// call). Naively combining their bodies with `Expression.AndAlso(a.Body, b.Body)` produces a tree that
+// references TWO DIFFERENT parameters — it's structurally broken: `LambdaExpression.Compile()` either
+// throws (`ParameterExpression not bound` style errors) or, when it does not throw, EF Core translates a
+// tree where one side's variable is never bound to a query source at all. This is real and well-known:
+// LINQKit's `PredicateBuilder` exists SOLELY to work around it, using a small `ExpressionVisitor`
+// (`ParameterRebinder`) that walks one tree and rewrites every occurrence of its parameter to the OTHER
+// tree's parameter before the two are combined. Hand-rolling this correctly is fiddly (most naive
+// attempts forget nested lambdas, or rebind the wrong side, or leak the mismatched-parameter tree through
+// `Compile()`/EF translation without erroring loudly) — so this module does it ONCE, here, and Rust
+// callers just write `pred_a & pred_b`.
+//
+// `TypedPredicate<T>` is NOT Rust-generic over the .NET element type in any deep sense — `T` is a phantom
+// marker distinguishing predicates meant for different entities at the Rust type level (so you can't
+// accidentally combine a `TypedPredicate<Person>` with a `TypedPredicate<Order>`). The actual .NET typing
+// of the final `Expression<Func<T,bool>>` (a nested-generic value keyed by a real CLR type, e.g.
+// `Func<Person,bool>`) is deferred to wherever the caller hands the built body+param off to a
+// `Expression.Lambda<Func<T,bool>>` construction site (mirrors `Expr::typed_pred`'s int-specialized
+// version, generalized by the caller for their own entity type) — this keeps `linq.rs` itself free of a
+// new const-generic type family per entity. `TypedPredicate` only carries the UNTYPED `Expr` body plus
+// the `Param` it was built against, which is exactly what the parameter-rebinding fix needs to operate on.
+
+/// The assembly name of the bundled `ParameterRebinder` helper (a ~15-line `ExpressionVisitor`
+/// subclass, the same pattern LINQKit's `PredicateBuilder` uses internally) that
+/// [`TypedPredicate`]'s `BitAnd`/`BitOr` combinators call to reconcile two predicates built against
+/// different `ParameterExpression` instances. This is a plain runtime dependency of whatever binary
+/// consumes `mycorrhiza::linq` (resolved the same way as any other .NET dependency DLL sitting next to
+/// the app — normal `AssemblyLoadContext` probing by simple name, no special plumbing) — mycorrhiza does
+/// not ship the C# source for it, only this name constant, matching the existing pattern of referencing
+/// BCL assemblies by name without embedding their sources. See `docs/PARAMETER_REBINDER.md` (or the
+/// consuming app's helper-assembly project) for the exact C# this name must resolve to:
+///
+/// ```csharp
+/// namespace Mycorrhiza.Linq;
+///
+/// public sealed class ParameterRebinder : ExpressionVisitor
+/// {
+///     private readonly ParameterExpression _from;
+///     private readonly ParameterExpression _to;
+///
+///     private ParameterRebinder(ParameterExpression from, ParameterExpression to)
+///     {
+///         _from = from;
+///         _to = to;
+///     }
+///
+///     public static Expression Rebind(Expression body, ParameterExpression from, ParameterExpression to)
+///         => new ParameterRebinder(from, to).Visit(body)!;
+///
+///     protected override Expression VisitParameter(ParameterExpression node)
+///         => ReferenceEquals(node, _from) ? _to : base.VisitParameter(node);
+/// }
+/// ```
+///
+/// Override with a different assembly if the consuming app names its helper assembly differently — this
+/// constant is the single point of configuration.
+pub const PARAMETER_REBINDER_ASSEMBLY: &str = "Mycorrhiza.Interop.Helpers";
+/// The fully-qualified class name of the bundled helper (see [`PARAMETER_REBINDER_ASSEMBLY`]).
+pub const PARAMETER_REBINDER_CLASS: &str = "Mycorrhiza.Linq.ParameterRebinder";
+
+/// Rewrite every occurrence of `from` inside `body` to `to` — `ParameterRebinder.Rebind(body, from, to)`.
+/// This is the one place parameter-identity is reconciled; everything above just needs to call it before
+/// combining two independently-built trees.
+fn rebind_param(body: Expr, from: Param, to: Param) -> Expr {
+    use crate::intrinsics::rustc_clr_interop_managed_call3_ as call3;
+    let inner: CExpr = call3::<
+        "Mycorrhiza.Interop.Helpers",
+        "Mycorrhiza.Linq.ParameterRebinder",
+        false,
+        "Rebind",
+        true,
+        CExpr,
+        CExpr,
+        CParam,
+        CParam,
+    >(body.inner, from.inner, to.inner);
+    Expr { inner }
+}
+
+/// A combinable, entity-typed predicate: the built lambda **body** ([`Expr`]) plus the [`Param`] it was
+/// built against. `T` is a phantom marker (see the module-level doc above) distinguishing predicates
+/// meant for different .NET entity types at the Rust type level — it carries no runtime representation.
+///
+/// Combine two predicates with ordinary Rust operators — `pred_a & pred_b`, `pred_a | pred_b`,
+/// `!pred_a` — regardless of whether they were built against the SAME or DIFFERENT [`Param`] instances.
+/// When different (the common case: two independently-authored builder functions each calling
+/// `Param::new` on their own), the combinator transparently rewrites the right-hand side's parameter
+/// references to the left-hand side's parameter (see [`rebind_param`]) before combining — this is the
+/// actual, LINQKit-equivalent fix for the "two `ParameterExpression` instances" problem, not a shortcut.
+pub struct TypedPredicate<T> {
+    body: Expr,
+    param: Param,
+    _marker: PhantomData<fn() -> T>,
+}
+
+// Manual `Clone`/`Copy` impls (not `#[derive]`d): `derive` would wrongly require `T: Clone + Copy`,
+// but `T` is a phantom marker only — the actual payload (`Expr`, `Param`) is `Copy` regardless of `T`.
+impl<T> Clone for TypedPredicate<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for TypedPredicate<T> {}
+
+impl<T> TypedPredicate<T> {
+    /// Build a predicate from a lambda body and the parameter it was constructed against — e.g.
+    /// `TypedPredicate::new(p, p.expr().prop("Age").ge(Expr::const_i32(18)))` for `p => p.Age >= 18`.
+    #[must_use]
+    pub fn new(param: Param, body: Expr) -> Self {
+        TypedPredicate {
+            body,
+            param,
+            _marker: PhantomData,
+        }
+    }
+
+    /// The parameter this predicate's body is expressed in terms of.
+    #[must_use]
+    pub fn param(self) -> Param {
+        self.param
+    }
+
+    /// The untyped lambda body — hand this (with [`Self::param`]) to a `Expression.Lambda<Func<T,bool>>`
+    /// construction site to produce the final strongly-typed `Expression<Func<T,bool>>` EF Core consumes
+    /// (mirrors [`Expr::typed_pred`]'s int-specialized version, generalized to the caller's own entity
+    /// type — see the module-level doc for why that final typing step is deliberately NOT done here).
+    #[must_use]
+    pub fn body(self) -> Expr {
+        self.body
+    }
+
+    /// The provider-visible rendering of the body (`Expression.ToString()`).
+    #[must_use]
+    pub fn text(self) -> std::string::String {
+        self.body.text()
+    }
+
+    /// Reference-compare two `ParameterExpression`s — `object.ReferenceEquals`. `Param::new` allocates a
+    /// fresh `ParameterExpression` on every call, so two predicates built independently (even with
+    /// identical `type_name`/`name` arguments) almost always have DISTINCT parameter identity; this is
+    /// exactly the condition `BitAnd`/`BitOr` must detect and correct for.
+    fn same_param(a: Param, b: Param) -> bool {
+        let a_obj = cast::<CObject, CParam>(a.inner);
+        let b_obj = cast::<CObject, CParam>(b.inner);
+        CObject::static2::<"ReferenceEquals", CObject, CObject, bool>(a_obj, b_obj)
+    }
+
+    /// Combine two predicates' bodies with `op`, first rewriting `rhs` onto `self`'s parameter if the two
+    /// were built against different `ParameterExpression` instances (the ParameterRebinder fix).
+    fn combine<const OP: &'static str>(self, rhs: Self) -> Self {
+        let rhs_body = if Self::same_param(self.param, rhs.param) {
+            rhs.body
+        } else {
+            rebind_param(rhs.body, rhs.param, self.param)
+        };
+        TypedPredicate {
+            body: binop::<OP>(self.body, rhs_body),
+            param: self.param,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T> std::ops::BitAnd for TypedPredicate<T> {
+    type Output = TypedPredicate<T>;
+    /// `self && rhs`, reconciling mismatched parameter identity first — see the type-level docs.
+    fn bitand(self, rhs: Self) -> Self::Output {
+        self.combine::<"AndAlso">(rhs)
+    }
+}
+
+impl<T> std::ops::BitOr for TypedPredicate<T> {
+    type Output = TypedPredicate<T>;
+    /// `self || rhs`, reconciling mismatched parameter identity first — see the type-level docs.
+    fn bitor(self, rhs: Self) -> Self::Output {
+        self.combine::<"OrElse">(rhs)
+    }
+}
+
+impl<T> std::ops::Not for TypedPredicate<T> {
+    type Output = TypedPredicate<T>;
+    /// `!self` — negates the body in place; no parameter rebinding needed (only one operand).
+    fn not(self) -> Self::Output {
+        TypedPredicate {
+            body: self.body.not(),
+            param: self.param,
+            _marker: PhantomData,
+        }
     }
 }
 

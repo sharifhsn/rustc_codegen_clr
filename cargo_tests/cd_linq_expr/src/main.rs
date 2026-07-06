@@ -155,6 +155,77 @@ fn main() -> std::process::ExitCode {
         .count();
     chk!(n3, 4);
 
+    // ---- TypedPredicate<T> combinator (BitAnd/BitOr/Not) + the ParameterRebinder fix ----
+    // THE REAL PROBLEM: two predicates built by two SEPARATE `Param::new` calls each carry their own
+    // distinct `ParameterExpression`. Naively splicing their bodies (`Expression.AndAlso(a.Body, b.Body)`)
+    // produces a tree that references two different parameters. `TypedPredicate`'s `&`/`|` transparently
+    // detect that and rebind one side onto the other's parameter before combining (see
+    // `mycorrhiza::linq::rebind_param` / the bundled `ParameterRebinder` C# helper).
+    use mycorrhiza::linq::TypedPredicate;
+
+    struct Widget; // phantom marker entity type for these predicates
+
+    // Two INDEPENDENT builder functions, each with its OWN `Param::new` — mirrors "authored in
+    // different files/by different people", the actual real-world scenario this fixes.
+    fn build_age_pred() -> TypedPredicate<Widget> {
+        let p = Param::new("System.Int32", "p");
+        TypedPredicate::new(p, p.expr().ge(Expr::const_i32(18)))
+    }
+    fn build_big_pred() -> TypedPredicate<Widget> {
+        let q = Param::new("System.Int32", "q"); // DIFFERENT ParameterExpression than `p` above
+        TypedPredicate::new(q, q.expr().gt(Expr::const_i32(100)))
+    }
+
+    let age_pred = build_age_pred();
+    let big_pred = build_big_pred();
+
+    // Sanity: the two predicates were indeed built against different Param instances.
+    say("age pred", &age_pred.text());
+    say("big pred", &big_pred.text());
+
+    // AND — combined tree must reference a SINGLE parameter (post-rebind), not two.
+    let and_combined = age_pred & big_pred;
+    say("and combined", &and_combined.text());
+    chk!(and_combined.text().contains("AndAlso"), true);
+    // The rebind must have unified variable identity: only `age_pred`'s original parameter name
+    // ("p") should remain in the combined tree's *rendered parameter list* -- `Expression.ToString()`
+    // on an AndAlso BinaryExpression renders both operand subtrees using whatever parameter object each
+    // references; after a correct rebind, both sides use the SAME ParameterExpression object, so the
+    // combined predicate must still COMPILE and EXECUTE correctly end-to-end, which is the strongest
+    // possible proof (a structurally-broken two-parameter tree throws on Lambda/Compile).
+    let and_lambda = and_combined.body().lambda(&[&and_combined.param()]);
+    chk!(and_lambda.compiles(), true);
+    let and_fn = and_lambda.compile();
+    chk!(and_fn.call_i32(200), true); // 200 >= 18 && 200 > 100
+    chk!(and_fn.call_i32(50), false); // 50 >= 18 && 50 > 100 -> false (fails second clause)
+    chk!(and_fn.call_i32(5), false); // fails both
+
+    // OR — same rebind path, different combinator.
+    let or_combined = build_age_pred() | build_big_pred();
+    say("or combined", &or_combined.text());
+    chk!(or_combined.text().contains("OrElse"), true);
+    let or_fn = or_combined.body().lambda(&[&or_combined.param()]).compile();
+    chk!(or_fn.call_i32(5), false); // 5 >= 18? no. 5 > 100? no -> false
+    chk!(or_fn.call_i32(20), true); // 20 >= 18? yes -> true
+    chk!(or_fn.call_i32(150), true); // 150 > 100? yes -> true
+
+    // NOT — single operand, no rebinding involved.
+    let not_pred = !build_age_pred();
+    say("not pred", &not_pred.text());
+    let not_fn = not_pred.body().lambda(&[&not_pred.param()]).compile();
+    chk!(not_fn.call_i32(20), false); // NOT(20 >= 18) -> NOT true -> false
+    chk!(not_fn.call_i32(5), true); // NOT(5 >= 18) -> NOT false -> true
+
+    // SAME-PARAM fast path: combining two predicates already built against the SAME Param must still
+    // work (no spurious rebind needed, but must not break anything either).
+    let shared = Param::new("System.Int32", "shared");
+    let pa = TypedPredicate::<Widget>::new(shared, shared.expr().gt(Expr::const_i32(0)));
+    let pb = TypedPredicate::<Widget>::new(shared, shared.expr().lt(Expr::const_i32(10)));
+    let same_and = pa & pb;
+    let same_fn = same_and.body().lambda(&[&same_and.param()]).compile();
+    chk!(same_fn.call_i32(5), true); // 0 < 5 < 10
+    chk!(same_fn.call_i32(50), false); // not < 10
+
     Console::writeln_u64(pass as u64);
     Console::writeln_u64(total as u64);
     if pass == total {
