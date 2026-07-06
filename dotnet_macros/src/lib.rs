@@ -666,8 +666,10 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 // ============================================================================
 // #[dotnet_entity] — retype an entity struct's fields to `mycorrhiza::linq::Field<Root, Val>` markers
-// and generate one canonical singleton instance, so predicate-building reads as real Rust field access
-// (`person.age.ge(18)`) instead of a `::`-qualified associated-const path (`Person::AGE.ge(18)`).
+// and generate an explicit `::new()` constructor (plus a `Default` impl delegating to it), so
+// predicate-building reads as real Rust field access on a value the CALLER constructs themselves
+// (`let person = Person::new(); person.age.ge(18)`) instead of a `::`-qualified associated-const path
+// (`Person::AGE.ge(18)`) or a hidden, auto-generated singleton the caller never wrote a binding for.
 // ============================================================================
 
 /// snake_case -> PascalCase, e.g. `is_active` -> `IsActive`, `age` -> `Age`. This is the DEFAULT .NET
@@ -687,30 +689,6 @@ fn to_pascal_case(snake: &str) -> String {
         .collect()
 }
 
-/// PascalCase -> snake_case, e.g. `Person` -> `person`, `HTTPClient` -> `httpclient`. Used to name the
-/// singleton instance `#[dotnet_entity]` generates (see its doc comment) — a lowercase, non-colliding
-/// default derived from the struct's own name, so `struct Person` gets a `person: Person` singleton
-/// without any per-struct configuration. Not meant to be a general-purpose ident-casing utility (it
-/// does not split on internal acronym boundaries beyond lowercasing runs of caps together); good enough
-/// for ordinary `PascalCase` struct names, which is all `#[dotnet_entity]` sees.
-fn to_snake_case(pascal: &str) -> String {
-    let mut out = String::new();
-    let mut prev_lower_or_digit = false;
-    for ch in pascal.chars() {
-        if ch.is_ascii_uppercase() {
-            if prev_lower_or_digit && !out.is_empty() {
-                out.push('_');
-            }
-            out.push(ch.to_ascii_lowercase());
-            prev_lower_or_digit = false;
-        } else {
-            out.push(ch);
-            prev_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
-        }
-    }
-    out
-}
-
 /// `#[dotnet_entity]` — by default resolves the .NET **class name** to the Rust struct's own name, and
 /// the .NET **namespace**/**assembly** to the crate-level default declared once via
 /// [`mycorrhiza::linq::dotnet_namespace!`](../mycorrhiza/linq/macro.dotnet_namespace.html) (namespace
@@ -724,18 +702,26 @@ fn to_snake_case(pascal: &str) -> String {
 ///
 /// **This is an attribute macro, not a `derive`** — deliberately, because it needs to do something a
 /// `derive` structurally cannot: RETYPE the struct's own fields. Every named field `f: OrigTy` becomes
-/// `f: ::mycorrhiza::linq::Field<Self, OrigTy>`, and the macro additionally emits ONE canonical
-/// `pub(crate) const` singleton instance of the struct (named after the snake_case conversion of the
-/// struct's own name — e.g. `struct Person` gets a `person: Person` singleton), with each field
-/// initialized via `Field::new(..)` (which stays a `const fn`, so this singleton is itself a real
-/// `const`, buildable at zero runtime cost). This is what lets a caller write genuine Rust field-access
-/// syntax to build a predicate — `person.age.ge(min_age) & person.name.contains(name_contains)` — with
-/// real dot-chains, not a `::`-qualified associated-const path. (An earlier version of this API
-/// generated `Field` values as associated consts instead — `Person::AGE.ge(..)` — forcing `::` path
-/// syntax for every predicate; direct user feedback was "I would rather do `person.name.contains` than
-/// `Person::NAME.contains`", which this retyped-field + singleton design directly satisfies. That
-/// associated-const generation is fully replaced, not kept alongside this — see the module-level
-/// migration note below.)
+/// `f: ::mycorrhiza::linq::Field<Self, OrigTy>`, and the macro additionally emits an explicit `impl
+/// Person { pub const fn new() -> Self { .. } }` constructor plus `impl Default for Person { fn
+/// default() -> Self { Self::new() } }`, with each field initialized via `Field::new(..)` (which stays a
+/// `const fn`, so `Person::new()` itself is usable in const contexts, buildable at zero runtime cost).
+/// This is what lets a caller write genuine Rust field-access syntax to build a predicate —
+/// `person.age.ge(min_age) & person.name.contains(name_contains)` — with real dot-chains, not a
+/// `::`-qualified associated-const path, while keeping the binding fully explicit and visible in the
+/// caller's own code:
+///
+/// ```ignore
+/// let person = Person::new(); // or Person::default()
+/// let pred = person.age.ge(18) & person.name.contains("a");
+/// ```
+///
+/// (An earlier version of this API generated `Field` values as associated consts — `Person::AGE.ge(..)`
+/// — forcing `::` path syntax for every predicate; user feedback replaced that with a hidden,
+/// auto-generated singleton `const` instance (`person: Person`) that appeared in scope with no visible
+/// declaration. Further feedback called THAT "too magical — `person` comes out of nowhere" and asked for
+/// an explicit constructor instead, which is what this version generates: no more hidden singleton, no
+/// more `#[allow(non_upper_case_globals)]` workaround — the caller writes `Person::new()` themselves.)
 ///
 /// The .NET property name each retyped field's `Field` carries defaults to the PascalCase conversion of
 /// the Rust field name (`is_active` -> `IsActive`); override per-field with `#[dotnet(rename = "...")]`
@@ -755,13 +741,20 @@ fn to_snake_case(pascal: &str) -> String {
 ///     pub age: ::mycorrhiza::linq::Field<Person, i32>,
 ///     pub is_active: ::mycorrhiza::linq::Field<Person, bool>,
 /// }
-/// #[allow(non_upper_case_globals)]
-/// pub(crate) const person: Person = Person {
-///     id: ::mycorrhiza::linq::Field::new(crate::__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT, "Person", crate::__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT, "Id"),
-///     // ...name, age, is_active likewise.
-/// };
+/// impl Person {
+///     pub const fn new() -> Self {
+///         Person {
+///             id: ::mycorrhiza::linq::Field::new(crate::__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT, "Person", crate::__MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT, "Id"),
+///             // ...name, age, is_active likewise.
+///         }
+///     }
+/// }
+/// impl Default for Person {
+///     fn default() -> Self { Self::new() }
+/// }
 ///
-/// // Usage — real field access, no `::` path:
+/// // Usage — explicit construction, then real field access, no `::` path:
+/// let person = Person::new();
 /// let pred = person.age.ge(18) & person.name.contains("a");
 /// ```
 ///
@@ -775,8 +768,8 @@ fn to_snake_case(pascal: &str) -> String {
 ///
 /// This is pure compile-time constant generation — unlike `#[dotnet_class]`/`#[dotnet_methods]`/
 /// `#[dotnet_export]`, it does NOT touch the backend's comptime interpreter (no `rustc_codegen_clr_*`
-/// intrinsic calls, no `#[used]` DCE anchor): the macro only ever expands to the retyped struct plus one
-/// `const` singleton, which is why it needs none of that machinery.
+/// intrinsic calls, no `#[used]` DCE anchor): the macro only ever expands to the retyped struct plus the
+/// `new`/`Default` impls, which is why it needs none of that machinery.
 #[proc_macro_attribute]
 pub fn dotnet_entity(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemStruct);
@@ -870,11 +863,11 @@ pub fn dotnet_entity(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // Two parallel outputs per field: the RETYPED field declaration (`pub name: Field<Self, OrigTy>`,
-    // replacing the struct's own field), and the singleton's initializer expression for that field
+    // replacing the struct's own field), and the constructor's initializer expression for that field
     // (`name: Field::new(...)`). Built together since both need the same per-field namespace/prop-name
     // resolution.
     let mut retyped_fields = Vec::new();
-    let mut singleton_inits = Vec::new();
+    let mut ctor_inits = Vec::new();
     for f in fields {
         let Some(fident) = &f.ident else {
             continue;
@@ -920,16 +913,10 @@ pub fn dotnet_entity(_attr: TokenStream, item: TokenStream) -> TokenStream {
         retyped_fields.push(quote! {
             #vis #fident: ::mycorrhiza::linq::Field<#struct_name, #fty>
         });
-        singleton_inits.push(quote! {
+        ctor_inits.push(quote! {
             #fident: ::mycorrhiza::linq::Field::new(#namespace_expr, #class_name_lit, #assembly_expr, #prop_name_lit)
         });
     }
-
-    // The singleton's name: snake_case(struct name), e.g. `Person` -> `person`. Lowercase purely by
-    // convention (the user explicitly said case doesn't matter, only that `::` goes away) — documented
-    // here as the ONE fixed, non-configurable naming rule this macro applies.
-    let singleton_name = to_snake_case(&struct_name.to_string());
-    let singleton_ident = format_ident!("{}", singleton_name, span = span);
 
     // Preserve the original struct's own attributes (other than the `#[dotnet(...)]` ones this macro
     // itself consumes) and visibility/generics, retyping only the fields.
@@ -947,13 +934,28 @@ pub fn dotnet_entity(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#retyped_fields),*
         }
 
-        /// The canonical singleton instance of this entity — real Rust field access
-        /// (`#singleton_ident.field.method(..)`) builds a predicate without any `::` path syntax.
-        /// Generated by `#[dotnet_entity]`; see its doc comment for the full design.
-        #[allow(non_upper_case_globals)]
-        pub(crate) const #singleton_ident: #struct_name = #struct_name {
-            #(#singleton_inits),*
-        };
+        impl #struct_name {
+            /// Construct this entity's field descriptors — a real, visible, explicitly-called
+            /// constructor (NOT a hidden singleton): `let #struct_name = ..; person.field.method(..)`.
+            /// Stays a `const fn` (`Field::new` already is one) so it costs nothing and remains usable
+            /// in const contexts. Generated by `#[dotnet_entity]`; see its doc comment for the full
+            /// design.
+            #[must_use]
+            #vis const fn new() -> Self {
+                #struct_name {
+                    #(#ctor_inits),*
+                }
+            }
+        }
+
+        impl ::std::default::Default for #struct_name {
+            /// Delegates to [`#struct_name::new`] — the ecosystem-standard spelling for callers who
+            /// prefer `Person::default()` over `Person::new()`. Not itself `const` (`Default::default`
+            /// isn't const in stable Rust); use `::new()` directly in a const context.
+            fn default() -> Self {
+                Self::new()
+            }
+        }
     };
     expanded.into()
 }

@@ -21,9 +21,11 @@ use mycorrhiza::system::DotNetString;
 /// types don't live in this crate's own namespace/assembly, so every field here needs the override path
 /// anyway. The crate-level-default (zero-attribute) path is exercised separately below.
 ///
-/// Fields are retyped to `Field<Sample, _>` markers by `#[dotnet_entity]`, and a `sample: Sample`
-/// singleton is generated -- predicates below are built via `sample.id.eq(..)` / real field access, NOT
-/// a `Sample::ID` associated-const path (the old, now-fully-replaced design).
+/// Fields are retyped to `Field<Sample, _>` markers by `#[dotnet_entity]`, which also generates an
+/// explicit `Sample::new()` constructor (plus `Default`) -- predicates below are built via
+/// `let sample = Sample::new(); sample.id.eq(..)` / real field access, NOT a `Sample::ID`
+/// associated-const path, and NOT a hidden auto-generated singleton either (both are old,
+/// now-fully-replaced designs).
 #[dotnet_entity]
 #[dotnet(namespace = "System", assembly = "System.Private.CoreLib", name = "Exception")]
 struct Sample {
@@ -343,8 +345,11 @@ fn main() -> std::process::ExitCode {
     // correctly. `System.Exception` is a resolvable real BCL type with both members, so
     // `Expression.PropertyOrField`'s eager validation succeeds.
     //
-    // Real field access through the generated `sample`/`method_sample` singletons -- NOT a `Sample::ID`
-    // associated-const path (the fully-replaced old design).
+    // Real field access through explicitly-constructed `Sample`/`MethodSample` values -- NOT a
+    // `Sample::ID` associated-const path, and NOT a hidden auto-generated singleton either (both are
+    // fully-replaced older designs); the caller writes the binding themselves.
+    let sample = Sample::new();
+    let method_sample = MethodSample::new();
     let id_body = sample.id.eq(1).text();
     say("sample.id body", &id_body);
     chk!(id_body.contains(".HResult"), true);
@@ -401,6 +406,7 @@ fn main() -> std::process::ExitCode {
     struct StrEntity {
         length: i32,
     }
+    let str_entity = StrEntity::new();
     let len_pred = str_entity.length.gt(5);
     let len_fn = len_pred.body().lambda(&[&len_pred.param()]).compile();
     chk!(len_fn.call_str("hello!"), true); // 6 > 5
@@ -482,9 +488,10 @@ fn main() -> std::process::ExitCode {
     // Zero-attribute case: namespace AND assembly both resolve to the crate-level default
     // ("System.Text.RegularExpressions"), class name resolves to the struct's own Rust identifier
     // verbatim ("Regex") -- a REAL BCL type. Executed end-to-end (not just `.text()`): `Regex.RightToLeft`
-    // is a real `bool` member, so `Field::is_false` against it (via the generated `regex` singleton)
-    // produces a genuinely well-formed, COMPILABLE predicate over the fully-defaulted (zero-attribute)
-    // type spec.
+    // is a real `bool` member, so `Field::is_false` against it (via an explicitly-constructed `Regex`
+    // value) produces a genuinely well-formed, COMPILABLE predicate over the fully-defaulted
+    // (zero-attribute) type spec.
+    let regex = Regex::new();
     let default_pred = regex.right_to_left.is_false();
     say("regex.right_to_left body", &default_pred.text());
     chk!(default_pred.text().contains("RightToLeft"), true); // PascalCase("right_to_left")
@@ -495,6 +502,7 @@ fn main() -> std::process::ExitCode {
 
     // `#[dotnet(name = "...")]` alone: class name overridden to a DIFFERENT real class ("Match") in the
     // SAME namespace/assembly (still the crate-level default) -- `Match.Success` is a real `bool` member.
+    let match_entity = MatchEntity::new();
     let renamed_pred = match_entity.success.is_true();
     say("match_entity.success body", &renamed_pred.text());
     chk!(renamed_pred.text().contains("Success"), true);
@@ -507,6 +515,7 @@ fn main() -> std::process::ExitCode {
     // default) -- must work with no dependency on the crate-level const. `MethodInfo.IsStatic` is the
     // same real member `method_sample.is_static` above exercises, here reached via full manual overrides
     // instead of the crate-default path.
+    let fully_overridden_entity = FullyOverriddenEntity::new();
     let full_override_pred = fully_overridden_entity.is_static.is_false();
     say("fully_overridden_entity.is_static body", &full_override_pred.text());
     chk!(full_override_pred.text().contains("IsStatic"), true);

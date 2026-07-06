@@ -181,7 +181,9 @@ impl Param {
 /// #[dotnet_entity]
 /// struct Person { id: i32, name: String, age: i32, is_active: bool }
 /// // -> class "Person", namespace "LinqDemo", assembly "LinqDemo" (namespace == assembly by convention)
-/// // -> a `person: Person` singleton is also generated; `person.age.ge(18)` reads it via real field access.
+/// // -> also generates `Person::new()` (a const fn constructor) + `impl Default for Person`; the
+/// //    caller writes `let person = Person::new();` themselves, then `person.age.ge(18)` reads it via
+/// //    real field access — no hidden, auto-generated singleton.
 /// ```
 ///
 /// Expands to exactly one item: `pub(crate) const __MYCORRHIZA_DOTNET_NAMESPACE_DEFAULT: &str = <lit>;`
@@ -213,20 +215,24 @@ macro_rules! dotnet_namespace {
 pub use crate::dotnet_namespace;
 
 /// A typed, named .NET property/field on an entity `Root` — e.g. `person.age: Field<Person, i32>` (a
-/// real struct field on the canonical `person: Person` singleton `#[dotnet_entity]` generates).
+/// real struct field on a `Person` value the caller constructs themselves via `Person::new()`, the
+/// explicit constructor `#[dotnet_entity]` generates).
 ///
 /// This is the ergonomic front door to the predicate-building machinery above: instead of hand-writing
 /// `Param::new(type_name, "p")` + `.expr().prop("Age")` + `Expr::const_i32(v)` + `TypedPredicate::new(..)`
 /// at every call site, a `Field<Root, Val>` value (generated once, by `#[dotnet_entity]` in
-/// `dotnet_macros`, as a RETYPED field on the entity struct plus one canonical singleton instance)
-/// bundles the owning type's .NET namespace/class/assembly and the property's .NET name, and its methods
-/// (`.eq`/`.gt`/`.contains`/`.is_true`/…, added per `Val` below) go straight from a RAW Rust value to a
-/// finished `TypedPredicate<Root>` — no `Param`, `Expr`, or property-name string ever touched by a
-/// caller. Because the singleton is a genuine value (not a type-level path), building a predicate reads
-/// as real Rust field access — `person.age.ge(18) & person.name.contains("a")` — rather than a
+/// `dotnet_macros`, as a RETYPED field on the entity struct, populated via that struct's generated
+/// `::new()`/`Default::default()`) bundles the owning type's .NET namespace/class/assembly and the
+/// property's .NET name, and its methods (`.eq`/`.gt`/`.contains`/`.is_true`/…, added per `Val` below) go
+/// straight from a RAW Rust value to a finished `TypedPredicate<Root>` — no `Param`, `Expr`, or
+/// property-name string ever touched by a caller. Because the value is constructed explicitly by the
+/// caller, building a predicate reads as real Rust field access on a visible binding —
+/// `let person = Person::new(); person.age.ge(18) & person.name.contains("a")` — rather than a
 /// `::`-qualified associated-const path (an earlier version of this API generated each `Field` as an
-/// associated const, e.g. `Person::AGE`, which forced `::` path syntax at every call site; that design
-/// is fully replaced by the retyped-field + singleton generation `#[dotnet_entity]` does now).
+/// associated const, e.g. `Person::AGE`, which forced `::` path syntax at every call site; a later
+/// version replaced that with a hidden, auto-generated singleton `const`, which user feedback found "too
+/// magical" since the binding appeared with no visible declaration — both are fully replaced by the
+/// explicit-constructor generation `#[dotnet_entity]` does now).
 ///
 /// The owning type's `Type.GetType`-resolvable spec (`"Namespace.Class, Assembly"`, what [`Param::new`]
 /// wants) is assembled from three SEPARATE pieces — `namespace`, `class`, `assembly` — rather than
