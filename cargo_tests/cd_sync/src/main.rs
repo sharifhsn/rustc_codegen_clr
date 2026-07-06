@@ -1,0 +1,220 @@
+// mycorrhiza::sync in action: Semaphore/SemaphorePermit, Signal (ManualResetEventSlim),
+// CountdownEvent, Barrier, and SharedLock — each wrapper's basic contract, on the real .NET backend,
+// with genuine OS threads (std::thread::spawn) so waits/releases/signals actually cross threads.
+//
+// Every result is checked in-Rust; `main` prints `pass` then `total` (a `9000000xx` marker flags any
+// failing check) and returns non-zero on any mismatch -- the cd_* harness convention.
+#![allow(dead_code)]
+
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::thread;
+use std::time::Duration;
+
+use mycorrhiza::sync::{Barrier, CountdownEvent, Semaphore, SharedLock, Signal};
+use mycorrhiza::system::console::Console;
+
+fn main() -> std::process::ExitCode {
+    let mut pass: u32 = 0;
+    let mut total: u32 = 0;
+    macro_rules! chk {
+        ($got:expr, $want:expr) => {{
+            total += 1;
+            if $got == $want {
+                pass += 1;
+            } else {
+                Console::writeln_u64(900_000_000 + total as u64);
+            }
+        }};
+    }
+
+    println!("== cd_sync start ==");
+
+    // ---------- 1. Semaphore: blocks until released ----------
+    // A binary semaphore starting at 0 permits: the spawned thread's `wait()` MUST block until the
+    // main thread releases it. We prove the block actually happened by having the waiter record a
+    // sequence number that must land strictly after the release's own sequence number.
+    {
+        let sem = Semaphore::new(0);
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        static RELEASE_SEQ: AtomicU32 = AtomicU32::new(0);
+        static WAIT_SEQ: AtomicU32 = AtomicU32::new(0);
+
+        let waiter = thread::spawn(move || {
+            sem.wait(); // must block here until the main thread releases
+            WAIT_SEQ.store(SEQ.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+        });
+
+        // Give the waiter thread a real chance to reach `wait()` and actually block.
+        thread::sleep(Duration::from_millis(50));
+        RELEASE_SEQ.store(SEQ.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+        sem.release();
+
+        waiter.join().unwrap();
+        // The release must have happened (sequenced) strictly before the post-wait store.
+        chk!((RELEASE_SEQ.load(Ordering::SeqCst) < WAIT_SEQ.load(Ordering::SeqCst)), true);
+        chk!(sem.current_count(), 0); // the single permit was consumed by wait()
+    }
+
+    // ---------- 2. Semaphore::acquire RAII releases on drop ----------
+    {
+        let sem = Semaphore::new(1);
+        {
+            let _permit = sem.acquire();
+            chk!(sem.current_count(), 0); // permit held
+        }
+        chk!(sem.current_count(), 1); // released on drop
+    }
+
+    // ---------- 3. Semaphore::acquire_async composes with task::block_on ----------
+    {
+        use mycorrhiza::task::block_on;
+        let sem = Semaphore::new(1);
+        let count_while_held = block_on(async {
+            let _permit = sem.acquire_async().await;
+            sem.current_count()
+        });
+        chk!(count_while_held, 0);
+        chk!(sem.current_count(), 1); // released once the guard dropped
+    }
+
+    // ---------- 4. Signal: wakes multiple waiters ----------
+    // Two waiter threads block on `wait()`; only after `set()` may either proceed. We prove both were
+    // actually blocked (not racing ahead) by checking neither incremented the counter before `set()`.
+    {
+        let signal = Signal::new();
+        chk!(signal.is_set(), false);
+        static WOKEN: AtomicI32 = AtomicI32::new(0);
+
+        let t1 = thread::spawn(move || {
+            signal.wait();
+            WOKEN.fetch_add(1, Ordering::SeqCst);
+        });
+        let t2 = thread::spawn(move || {
+            signal.wait();
+            WOKEN.fetch_add(1, Ordering::SeqCst);
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        chk!(WOKEN.load(Ordering::SeqCst), 0); // neither woken yet -- both genuinely blocked
+
+        signal.set();
+        t1.join().unwrap();
+        t2.join().unwrap();
+        chk!(WOKEN.load(Ordering::SeqCst), 2); // both woken by the single set()
+        chk!(signal.is_set(), true);
+
+        signal.reset();
+        chk!(signal.is_set(), false);
+    }
+
+    // ---------- 5. CountdownEvent: releases waiters exactly at zero ----------
+    {
+        let latch = CountdownEvent::new(3);
+        chk!(latch.current_count(), 3);
+        chk!(latch.is_set(), false);
+
+        let waiter = {
+            let latch = latch;
+            thread::spawn(move || {
+                latch.wait();
+            })
+        };
+
+        // Signal twice: must NOT release yet (count 3 -> 2 -> 1).
+        chk!(latch.signal(), false);
+        chk!(latch.current_count(), 2);
+        chk!(latch.signal(), false);
+        chk!(latch.current_count(), 1);
+        chk!(latch.is_set(), false);
+
+        // The third signal brings it to zero -- THIS call must report true, and only this one.
+        chk!(latch.signal(), true);
+        chk!(latch.current_count(), 0);
+        chk!(latch.is_set(), true);
+
+        waiter.join().unwrap(); // must not hang -- the waiter was released exactly at zero
+    }
+
+    // ---------- 6. Barrier: synchronizes N participants ----------
+    // 4 participant threads each push a per-phase marker into a shared counter, then
+    // `signal_and_wait()`. Every thread's "after barrier" observation of the counter must see ALL 4
+    // increments -- i.e. no thread can proceed past the barrier before every participant arrived.
+    {
+        let barrier = Barrier::new(4);
+        static ARRIVED: AtomicI32 = AtomicI32::new(0);
+        static SEEN_AT_RELEASE: [AtomicI32; 4] = [
+            AtomicI32::new(-1),
+            AtomicI32::new(-1),
+            AtomicI32::new(-1),
+            AtomicI32::new(-1),
+        ];
+        ARRIVED.store(0, Ordering::SeqCst);
+
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                thread::spawn(move || {
+                    // Stagger arrivals so the barrier is genuinely tested, not just a no-op.
+                    thread::sleep(Duration::from_millis(10 * i as u64));
+                    ARRIVED.fetch_add(1, Ordering::SeqCst);
+                    barrier.signal_and_wait();
+                    // By the time signal_and_wait() returns, ALL 4 must have arrived.
+                    SEEN_AT_RELEASE[i].store(ARRIVED.load(Ordering::SeqCst), Ordering::SeqCst);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        chk!(ARRIVED.load(Ordering::SeqCst), 4);
+        for i in 0..4 {
+            chk!(SEEN_AT_RELEASE[i].load(Ordering::SeqCst), 4);
+        }
+        chk!(barrier.participant_count(), 4);
+    }
+
+    // ---------- 7. SharedLock: mutual exclusion under real contention ----------
+    // Two threads each increment a shared (non-atomic-protected-by-lock) counter many times, guarded
+    // by the SAME SharedLock. If exclusion were fake, interleaved read-modify-write would lose updates
+    // and the final count would fall short of the expected total.
+    {
+        static mut COUNTER: i64 = 0;
+        let lock = SharedLock::new();
+        const ITERS: i64 = 200_000;
+
+        let l1 = lock;
+        let l2 = lock;
+        let t1 = thread::spawn(move || {
+            for _ in 0..ITERS {
+                let _g = l1.lock();
+                unsafe {
+                    let v = std::ptr::read(std::ptr::addr_of!(COUNTER));
+                    std::ptr::write(std::ptr::addr_of_mut!(COUNTER), v + 1);
+                }
+            }
+        });
+        let t2 = thread::spawn(move || {
+            for _ in 0..ITERS {
+                let _g = l2.lock();
+                unsafe {
+                    let v = std::ptr::read(std::ptr::addr_of!(COUNTER));
+                    std::ptr::write(std::ptr::addr_of_mut!(COUNTER), v + 1);
+                }
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+        let final_count = unsafe { std::ptr::read(std::ptr::addr_of!(COUNTER)) };
+        chk!(final_count, ITERS * 2);
+    }
+
+    println!("== cd_sync done ==");
+    println!("pass");
+    Console::writeln_u64(pass as u64);
+    println!("total");
+    Console::writeln_u64(total as u64);
+    if pass == total {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
+    }
+}

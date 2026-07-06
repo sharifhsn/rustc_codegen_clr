@@ -1783,6 +1783,11 @@ impl SemaphoreSlim {
     pub fn release(self) -> i32 { self.instance0::<"Release", i32>() }
     pub fn dispose(self) { self.virt0::<"Dispose", ()>() }
     pub fn new(a1: i32) -> Self { Self::ctor1(a1) }
+    /// `new SemaphoreSlim(int initialCount, int maxCount)` — the two-argument constructor (mirrors the
+    /// generated 1-arg [`SemaphoreSlim::new`]; kept as a distinct name since Rust has no overloading).
+    /// Used by [`crate::sync::SharedLock`], which always constructs a `SemaphoreSlim(1, 1)` (a binary
+    /// mutex-shaped semaphore) so it can be shared with C# as a genuine mutual-exclusion primitive.
+    pub fn new_with_max(a1: i32, a2: i32) -> Self { Self::ctor2(a1, a2) }
 }
 pub type SendOrPostCallback =  crate::intrinsics::RustcCLRInteropManagedClass<"System.Private.CoreLib","System.Threading.SendOrPostCallback">;
 use super::super::*;

@@ -64,6 +64,11 @@ pub mod linq;
 pub mod nullable;
 /// `System.Span<T>` / `ReadOnlySpan<T>` — zero-copy views over a Rust slice. See [`span::Span`].
 pub mod span;
+/// Cross-thread / cross-language synchronization primitives — `Semaphore`, `Signal`
+/// (`ManualResetEventSlim`), `CountdownEvent`, `Barrier`, and [`sync::SharedLock`] (a mutex-shaped
+/// `SemaphoreSlim` meant to be shared by reference with C#). See [`sync`] for the honest safety story
+/// on what does and doesn't cross the language boundary.
+pub mod sync;
 /// One-glance import surface — `use mycorrhiza::prelude::*;` pulls in the collections, the managed
 /// `DotNetString`, and the generic-bridge macros so interop code reads like `std`.
 pub mod prelude;
