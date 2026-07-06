@@ -226,6 +226,35 @@ fn main() -> std::process::ExitCode {
     chk!(same_fn.call_i32(5), true); // 0 < 5 < 10
     chk!(same_fn.call_i32(50), false); // not < 10
 
+    // `Expr::call1_same_type` — the substring-filter shape (`string.Contains(string)`), added for the
+    // rcc-linq-demo app (EF `Name.Contains(x)` predicate over a real, non-BCL entity type). Not itself a
+    // comparison, so it needs a real `Expression.Call` + reflection-based `MethodInfo` lookup on the
+    // operand's own static `.Type` — exercised here directly against a `System.String`-typed parameter.
+    let s = Param::new("System.String", "s");
+    let contains_body = s.expr().call1_same_type("Contains", Expr::const_str("ell"));
+    say("contains body", &contains_body.text());
+    chk!(contains_body.text().contains("Contains"), true);
+    let contains_lambda = contains_body.lambda(&[&s]);
+    chk!(contains_lambda.compiles(), true);
+    let contains_fn = contains_lambda.compile();
+    chk!(contains_fn.call_str("hello"), true); // "hello".Contains("ell") -> true
+    chk!(contains_fn.call_str("world"), false); // "world".Contains("ell") -> false
+
+    // `Expr::raw` / `Param::raw` — the escape-hatch accessors `TypedPredicate<T>`'s generalization to a
+    // caller's own entity type relies on (see `linq-rs` in rcc-linq-demo): the raw handles must round-trip
+    // through `Expression.Lambda(body, [param])`'s NON-generic factory (type inference from the raw
+    // `ParameterExpression`/`Expression` handles, no `Expr`/`Param` wrapper needed) and still compile+run.
+    let r = Param::new("System.Int32", "r");
+    let raw_body_expr = r.expr().gt(Expr::const_i32(41));
+    let raw_body = raw_body_expr.raw();
+    let raw_param = r.raw();
+    let _ = (raw_body, raw_param); // proves both `.raw()` accessors return usable managed handles
+    let raw_lambda = raw_body_expr.lambda(&[&r]);
+    chk!(raw_lambda.compiles(), true);
+    let raw_fn = raw_lambda.compile();
+    chk!(raw_fn.call_i32(42), true); // 42 > 41
+    chk!(raw_fn.call_i32(10), false); // 10 > 41 -> false
+
     Console::writeln_u64(pass as u64);
     Console::writeln_u64(total as u64);
     if pass == total {

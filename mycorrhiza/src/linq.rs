@@ -62,12 +62,19 @@ type CConst =
     RustcCLRInteropManagedClass<"System.Linq.Expressions", "System.Linq.Expressions.ConstantExpression">;
 type CMember =
     RustcCLRInteropManagedClass<"System.Linq.Expressions", "System.Linq.Expressions.MemberExpression">;
+type CMethodCall =
+    RustcCLRInteropManagedClass<"System.Linq.Expressions", "System.Linq.Expressions.MethodCallExpression">;
 type CType = RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Type">;
+type CMethodInfo = RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Reflection.MethodInfo">;
 type CDelegate = RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Delegate">;
 type CObject = RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Object">;
 type CConvert = RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Convert">;
 /// A managed `object[]` (`DynamicInvoke`'s argument array).
 type CObjArray = RustcCLRInteropManagedArray<CObject, 1>;
+/// A managed `Type[]` (for `GetMethod` argument-type lookups).
+type CTypeArr = RustcCLRInteropManagedArray<CType, 1>;
+/// A managed `Expression[]` (for `Expression.Call`'s arguments array).
+type CExprArr = RustcCLRInteropManagedArray<CExpr, 1>;
 
 // ---- Strongly-typed predicate types for the EF `IQueryable<int>.Where` path ----
 // `System.Func`2<int32,bool>` — a generic *delegate* instantiation.
@@ -143,6 +150,21 @@ impl Param {
         Expr {
             inner: cast::<CExpr, CParam>(self.inner),
         }
+    }
+
+    /// The raw `ParameterExpression` managed handle. An escape hatch for callers building interop
+    /// plumbing this module doesn't wrap directly (e.g. constructing `Expression.Lambda<Func<T,bool>>`
+    /// for a caller's own entity type `T`, as `TypedPredicate<T>`'s module doc describes) — spelled out
+    /// as the full `RustcCLRInteropManagedClass` instantiation (not the private `CParam` alias) so it's
+    /// nameable from outside this module.
+    #[must_use]
+    pub fn raw(
+        self,
+    ) -> crate::intrinsics::RustcCLRInteropManagedClass<
+        "System.Linq.Expressions",
+        "System.Linq.Expressions.ParameterExpression",
+    > {
+        self.inner
     }
 }
 
@@ -244,6 +266,57 @@ impl Expr {
     #[must_use]
     pub fn not(self) -> Expr {
         unop::<"Not">(self)
+    }
+
+    /// A one-argument instance-method call on this expression where BOTH operands share the same
+    /// static .NET type (e.g. `string.Contains(string)`) — `Expression.Call(self, method, [arg])` where
+    /// `method` is looked up via `self.Type.GetMethod(name, [self.Type])`. E.g.
+    /// `p.prop("Name").call1_same_type("Contains", Expr::const_str("a"))` builds `p.Name.Contains("a")`
+    /// — the standard EF-translatable substring-filter shape (`LIKE '%a%'` in SQL), which the
+    /// comparison-only combinators above (`gt`/`lt`/`eq`/...) can't express since it's a method call,
+    /// not an operator.
+    #[must_use]
+    pub fn call1_same_type(self, method_name: &str, arg: Expr) -> Expr {
+        // `self.Type` — the static CLR type this expression node evaluates to (e.g. `System.String`
+        // for `p.Name`), via the `Expression.Type` property every node has.
+        let ty: CType = self.inner.instance0::<"get_Type", CType>();
+        let type_args: CTypeArr = new_arr::<CType>(1);
+        set_elem::<CType>(type_args, 0, ty);
+        // Type.GetMethod(string, Type[]) -> MethodInfo
+        let method: CMethodInfo = ty.instance2::<"GetMethod", MString, CTypeArr, CMethodInfo>(
+            mstr(method_name),
+            type_args,
+        );
+        let args: CExprArr = new_arr::<CExpr>(1);
+        set_elem::<CExpr>(args, 0, arg.inner);
+        // Expression.Call(Expression instance, MethodInfo method, Expression[] arguments) ->
+        // MethodCallExpression — a 3-arg static call, within the raw intrinsics' max arity.
+        let call: CMethodCall = crate::intrinsics::rustc_clr_interop_managed_call3_::<
+            "System.Linq.Expressions",
+            "System.Linq.Expressions.Expression",
+            false,
+            "Call",
+            true,
+            CMethodCall,
+            CExpr,
+            CMethodInfo,
+            CExprArr,
+        >(self.inner, method, args);
+        Expr {
+            inner: cast::<CExpr, CMethodCall>(call),
+        }
+    }
+
+    /// The raw `Expression` managed handle. An escape hatch for callers building interop plumbing this
+    /// module doesn't wrap directly (see [`Param::raw`]).
+    #[must_use]
+    pub fn raw(
+        self,
+    ) -> crate::intrinsics::RustcCLRInteropManagedClass<
+        "System.Linq.Expressions",
+        "System.Linq.Expressions.Expression",
+    > {
+        self.inner
     }
 
     /// The provider-visible rendering of this node (`Expression.ToString()`).
