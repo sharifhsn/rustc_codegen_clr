@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use mycorrhiza::sync::{Barrier, CountdownEvent, Semaphore, SharedLock, Signal};
+use mycorrhiza::sync::{Barrier, CountdownEvent, Semaphore, SharedLock, SharedMutex, Signal};
 use mycorrhiza::system::console::Console;
 
 fn main() -> std::process::ExitCode {
@@ -205,6 +205,36 @@ fn main() -> std::process::ExitCode {
         t2.join().unwrap();
         let final_count = unsafe { std::ptr::read(std::ptr::addr_of!(COUNTER)) };
         chk!(final_count, ITERS * 2);
+    }
+
+    // ---------- 8. SharedMutex<T>: the same contention proof, with ZERO unsafe ----------
+    // Same shape as check #7 (N threads x M non-atomic-looking increments of a shared counter must
+    // land exactly, with no lost updates under real contention) but through `SharedMutex<T>` instead
+    // of a bare `SharedLock` + raw pointer: the counter lives inside the mutex's own `UnsafeCell`,
+    // reachable only via `SharedMutexGuard`'s `Deref`/`DerefMut`. No `unsafe` appears anywhere in this
+    // block -- that is the entire point of the wrapper over `SharedLock` alone.
+    {
+        let mutex = SharedMutex::new(0i64);
+        const ITERS: i64 = 200_000;
+
+        thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| {
+                    for _ in 0..ITERS {
+                        let mut guard = mutex.lock();
+                        *guard += 1;
+                    }
+                });
+            }
+        });
+
+        chk!(*mutex.lock(), ITERS * 2);
+
+        // get_mut()/into_inner() are lock-free (proven by the type system, not by a runtime check),
+        // but confirm they still observe the correct final value.
+        let mut mutex = mutex;
+        chk!(*mutex.get_mut(), ITERS * 2);
+        chk!(mutex.into_inner(), ITERS * 2);
     }
 
     println!("== cd_sync done ==");

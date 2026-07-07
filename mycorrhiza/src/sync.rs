@@ -4,6 +4,12 @@
 //! to C# as a genuine shared managed reference so Rust and C# can take turns inside the *same* critical
 //! section.
 //!
+//! On top of `SharedLock`, this module also provides data-owning, fully-safe wrappers for the
+//! all-Rust-side case: [`SharedMutex<T>`] (mutual exclusion, a `SharedLock` + `UnsafeCell<T>` in the
+//! exact shape of `std::sync::Mutex<T>`) and [`SharedRwLock<T>`] (reader/writer, over
+//! `ReaderWriterLockSlim`). Neither requires `unsafe` in calling code — see each type's docs for
+//! precisely what safety they do (and do not) extend to a C# caller that also holds the raw lock.
+//!
 //! This mirrors [`crate::task`]'s conventions: thin, `#[inline]` wrappers over the raw generated
 //! bindings in [`crate::bindings`], RAII guards for the acquire/release pairs, and (where a wait can be
 //! `.await`ed) composition with the [`crate::task`] Task↔Future bridge rather than a second bridge.
@@ -24,15 +30,18 @@
 //! synchronization (see the foreign-thread TLS/Mutex/Parker research this module follows from) — this
 //! module exists for the cases `std::sync` cannot cover: waiting on a **.NET-native** primitive
 //! directly (so a `WaitAsync()` composes with [`crate::task`], or so a C# caller can see the exact same
-//! managed wait object), and — via [`SharedLock`] — genuine cross-language mutual exclusion where a
-//! *managed* lock object is shared by reference between a Rust side and a C# side.
+//! managed wait object), and — via [`SharedLock`]/[`SharedMutex`]/[`SharedRwLock`] — genuine
+//! cross-language coordination where a *managed* lock object is shared by reference between a Rust
+//! side and a C# side.
 
 use crate::bindings::{
     System::Threading::{Barrier as RawBarrier, CountdownEvent as RawCountdownEvent,
         ManualResetEventSlim as RawManualResetEventSlim, SemaphoreSlim as RawSemaphoreSlim},
 };
 use crate::task::{await_unit, Task};
+use core::cell::UnsafeCell;
 use core::future::Future;
+use core::ops::{Deref, DerefMut};
 
 // =================================================================================================
 // Semaphore
@@ -446,5 +455,153 @@ impl Drop for SharedLockGuard {
     #[inline]
     fn drop(&mut self) {
         self.lock.h.release();
+    }
+}
+
+// =================================================================================================
+// SharedMutex<T> — a real, data-owning Mutex<T> built on SharedLock
+// =================================================================================================
+
+/// A data-owning mutex, shaped exactly like `std::sync::Mutex<T>`, built on top of [`SharedLock`]:
+/// one [`SharedLock`] plus one [`UnsafeCell<T>`], with the `UnsafeCell` written to (and read from)
+/// **only** while the lock is held — encapsulated once, correctly, in this module, and never exposed
+/// to callers. Unlike [`SharedLock`] alone, `SharedMutex<T>` gives ordinary Rust code the full
+/// `std::sync::Mutex<T>` deal: it is *impossible* to touch `T` without holding a
+/// [`SharedMutexGuard`], because the only way to reach `&T`/`&mut T` is through the guard's `Deref`/
+/// `DerefMut`, and the guard can only be produced by [`lock`](SharedMutex::lock) /
+/// [`lock_async`](SharedMutex::lock_async). No `unsafe` is needed anywhere outside this file to use
+/// it correctly — the same promise `std::sync::Mutex<T>` makes.
+///
+/// # What safety this does and does not extend to C#
+///
+/// **Fully safe, for pure-Rust use.** As long as *only Rust code* ever touches `value` through this
+/// wrapper, the guarantee is real and complete: the borrow checker enforces that `T` is reachable
+/// only through a live [`SharedMutexGuard`], exactly as with `std::sync::Mutex<T>`. There is no
+/// `unsafe` in any calling code, ever.
+///
+/// **What changes if the raw lock is also shared with C# (via [`shared_lock`](SharedMutex::shared_lock)):**
+/// the underlying `SemaphoreSlim` — and *only* the semaphore, not `T` — can be hitchhiked by a
+/// `#[dotnet_export]` that hands `shared_lock().raw()` to a C# caller. This is meaningfully different
+/// from the bare-[`SharedLock`] + raw-pointer pattern (see `cargo_tests/cd_sharedlock`): there,
+/// **C# reads and writes the exact same memory Rust does**, via a raw pointer the two sides agree on
+/// out of band, so unsafe on the Rust side is irreducible — the language boundary itself has no type
+/// system to enforce anything.
+///
+/// Here, `T` lives inside a private `UnsafeCell<T>` **owned by this Rust value**. There is no existing
+/// mechanism for C# to name that memory, cast into it, or read/write it directly — `T`'s field layout,
+/// address, and lifetime are never exposed across the interop boundary by this type. So even if C#
+/// holds the same `SemaphoreSlim` (via `shared_lock()`), it can only ever **coordinate timing** —
+/// `Wait()`/`Release()` on the shared semaphore — it cannot itself observe or mutate `T`. Concretely,
+/// that makes `SharedMutex<T>` the right tool when: **Rust owns and mutates `T`, and C# only needs to
+/// gate its own access to some *different*, C#-owned resource using the same lock** (e.g. a native
+/// buffer, a file handle, a piece of shared UI state) — not when C# needs typed access to `T` itself.
+/// If C# needs to see or change the protected data too, that is exactly the [`SharedLock`] +
+/// raw-pointer scenario, and it requires `unsafe`, honestly, on the Rust side.
+///
+/// Do not oversell this: handing out `shared_lock()` does not make `SharedMutex<T>` a safe
+/// cross-language `Mutex<T>`. It remains a safe *Rust-side* `Mutex<T>` whose lock object happens to
+/// also be nameable from C# for coordination purposes only.
+pub struct SharedMutex<T> {
+    lock: SharedLock,
+    data: UnsafeCell<T>,
+}
+
+// SAFETY: mirrors `std::sync::Mutex<T>`'s own bound. `SharedMutex<T>` only ever exposes `&T`/`&mut T`
+// through a `SharedMutexGuard` obtained while the underlying `SharedLock` is held, so concurrent
+// access from multiple threads is serialized exactly as `std::sync::Mutex<T>` serializes it — the
+// same reasoning that lets `std::sync::Mutex<T>: Sync` hold for any `T: Send` (not `T: Sync`: the
+// mutex itself supplies the missing synchronization).
+unsafe impl<T: Send> Sync for SharedMutex<T> {}
+
+impl<T> SharedMutex<T> {
+    /// Construct a fresh [`SharedLock`] (a new `SemaphoreSlim(1, 1)`) and wrap `value` behind it.
+    #[inline]
+    pub fn new(value: T) -> Self {
+        Self { lock: SharedLock::new(), data: UnsafeCell::new(value) }
+    }
+
+    /// Wrap a C#-supplied `SemaphoreSlim` handle as the mutex's lock, alongside a Rust-owned `value`.
+    /// Useful when C# has already created (or otherwise holds) the lock object and Rust is joining
+    /// it — e.g. the lock was constructed on the C# side and handed in via a `#[dotnet_export]`
+    /// parameter. As with [`SharedLock::from_raw`], there is no way to verify from Rust that
+    /// `lock_handle` is actually shaped `(1, 1)`; that is on the caller.
+    #[inline]
+    pub fn from_raw(lock_handle: RawSemaphoreSlim, value: T) -> Self {
+        Self { lock: SharedLock::from_raw(lock_handle), data: UnsafeCell::new(value) }
+    }
+
+    /// Expose *just* the raw lock — e.g. for a `#[dotnet_export]` to hand to C# so it can coordinate
+    /// timing with Rust's access to `value`. See the [`SharedMutex`] docs for exactly what this does
+    /// and does not let C# do: C# gets a real, shared `SemaphoreSlim` for `Wait()`/`Release()`
+    /// coordination, but no path to `value`'s memory.
+    #[inline]
+    pub fn shared_lock(&self) -> SharedLock {
+        self.lock
+    }
+
+    /// Blocking acquire — waits for the lock, then returns a [`SharedMutexGuard`] giving safe `&T`/
+    /// `&mut T` access via `Deref`/`DerefMut`, released automatically on drop.
+    #[inline]
+    pub fn lock(&self) -> SharedMutexGuard<'_, T> {
+        SharedMutexGuard { guard: self.lock.lock(), data: &self.data }
+    }
+
+    /// `.await`-adapted acquire, composing [`SharedLock::lock_async`] with the data guard — waits for
+    /// the lock without blocking the calling thread. Same caveat as [`SharedLock::lock_async`]: do not
+    /// hold the returned guard (or its underlying `Task`) across an `.await` *inside* a suspending
+    /// `async fn` state machine.
+    #[inline]
+    pub fn lock_async(&self) -> impl Future<Output = SharedMutexGuard<'_, T>> {
+        let data = &self.data;
+        async move { SharedMutexGuard { guard: self.lock.lock_async().await, data } }
+    }
+
+    /// Safe, lock-free access: `&mut self` already statically proves exclusive access (no other
+    /// reference to this `SharedMutex` can exist), so no acquire/release is needed at all — exactly
+    /// `std::sync::Mutex::get_mut`'s reasoning.
+    #[inline]
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
+    }
+
+    /// Consume the mutex, taking ownership of the protected value directly (by-value `self` already
+    /// proves no other reference can exist).
+    #[inline]
+    pub fn into_inner(self) -> T {
+        self.data.into_inner()
+    }
+}
+
+/// RAII guard returned by [`SharedMutex::lock`] / [`SharedMutex::lock_async`] — dereferences to `&T`/
+/// `&mut T` and releases the underlying [`SharedLock`] when dropped (via the held
+/// [`SharedLockGuard`]'s own `Drop`; no separate `Drop` impl is needed here). See [`SharedMutex`]'s
+/// docs for what this guard's safety does and does not extend to a C# caller holding the same raw
+/// lock handle.
+pub struct SharedMutexGuard<'a, T> {
+    // Never read directly -- held purely so its `Drop` (releasing the SharedLock) fires when this
+    // guard is dropped.
+    #[allow(dead_code)]
+    guard: SharedLockGuard,
+    data: &'a UnsafeCell<T>,
+}
+
+impl<T> Deref for SharedMutexGuard<'_, T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        // SAFETY: this guard is only constructed while `self.guard` (the SharedLock) is held, and the
+        // lock is the sole gate through which `SharedMutex` ever hands out a reference to `data` — so
+        // this is exactly as sound as `std::sync::MutexGuard`'s own `Deref`.
+        unsafe { &*self.data.get() }
+    }
+}
+
+impl<T> DerefMut for SharedMutexGuard<'_, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: see `Deref` above; `&mut self` here additionally proves no other live borrow of
+        // this guard exists, matching `std::sync::MutexGuard`'s own `DerefMut` reasoning.
+        unsafe { &mut *self.data.get() }
     }
 }
