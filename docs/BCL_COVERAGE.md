@@ -21,20 +21,29 @@ that was compiled with the backend and executed on real .NET (`CARGO_DOTNET_BACK
 
 | Example crate | Direction | Result (this run) |
 |---|---|---|
-| `cargo_tests/cd_collections` | .NET-from-Rust | **128/128** |
-| `cargo_tests/cd_bcl` | .NET-from-Rust | **313/313** |
+| `cargo_tests/cd_collections` | .NET-from-Rust | **141/141** |
+| `cargo_tests/cd_bcl` | .NET-from-Rust | **324/324** |
+| `cargo_tests/cd_decimal` | .NET-from-Rust (`DotNetDecimal`) | **11/11** |
+| `cargo_tests/cd_span` | .NET-from-Rust (`Span<T>`/value-type generics) | **45/45** |
+| `cargo_tests/cd_sync` | .NET-from-Rust (`SharedOnce`, channels, locks) | **43/43** |
 | `cargo_tests/cd_idiomatic` | .NET-from-Rust | **45/45** |
 | `cargo_tests/cd_enumerate` | .NET-from-Rust | **22/22** |
 | `cargo_tests/cd_json` | .NET-from-Rust | **47/47** |
 | `cargo_tests/cd_delegates` | .NET-from-Rust | **14/14** |
-| `cargo_tests/cd_async` | .NET-from-Rust | **7/7** |
+| `cargo_tests/cd_async` | .NET-from-Rust | **9/9** |
+| `cargo_tests/cd_linq_expr` | .NET-from-Rust (LINQ/EF expression trees) | **89/89** |
 | `cargo_tests/cd_generic` | .NET-from-Rust (low-level bridge) | **18/18** |
 | `cargo_tests/cd_containers2` | Rust-from-C# | **30/30** |
-| `cargo_tests/cd_rustvec` | Rust-from-C# | **44/44** |
+| `cargo_tests/cd_rustvec` | Rust-from-C# | **37/37** |
 | `cargo_tests/cd_typedef` | Rust-from-C# (`#[dotnet_class]`) | **16/16** |
 | `cargo_tests/cd_containers` | Rust-from-C# (`RustVec` only) | **13/13** |
 | `cargo_tests/cd_interop` | Rust-from-C# | **PASS** |
 | `cargo_tests/cd_interop_tier2` | Rust-from-C# | **PASS** |
+
+> **Numbers drift.** These are live per-crate `chk!` pass/total counts re-run against current `HEAD`
+> (2026-07-06) — expect them to keep growing as breadth work lands; treat "N/N" as "still all green",
+> not as a permanently fixed count. `STATE_OF_THE_PROJECT.md`'s own summary row can lag behind the
+> exact number for the same reason.
 
 > **Per-core opt-in (fixed):** the shipped `RustDotnet.Containers.cs` now gates each wrapper behind a
 > preprocessor symbol driven by an msbuild prop, so a project compiles only the wrappers whose Rust
@@ -50,38 +59,40 @@ that was compiled with the backend and executed on real .NET (`CARGO_DOTNET_BACK
 
 All backed by real managed objects; used like `std`. Element `T`/`K`/`V` must cross the boundary (a
 .NET primitive, a `#[repr(C)]` value type of such, or a managed handle). Proof: `cd_collections`
-(128/128), by-reference iteration in `cd_enumerate` (22/22).
+(141/141), by-reference iteration in `cd_enumerate` (22/22).
 
 | .NET type | Impl assembly | Status | Wrapper surface (idiomatic) | Notes / what's missing |
 |---|---|---|---|---|
-| `List<T>` | CoreLib | ✅ | `new`/`push`/`get`/`set`/`insert`/`remove_at`/`contains`/`index_of`/`clear`/`first`/`last`/`pop`/`sort`/`reverse`/`len`/`is_empty`/`to_vec`/`from_slice`/`iter`; traits `Default`, `Clone` (deep, `T:Copy`), `PartialEq`/`Eq` (element-wise), `Hash`, `From<Vec<T>>`, `FromIterator`, `Extend`, `IntoIterator for &List` | `sort_by`/`binary_search`/`retain` still 🟡 (delegate-as-generic-method-arg wall for `Sort(Comparison<T>)` — see §7). |
-| `Dictionary<K, V>` | CoreLib | ✅ | `new`/`insert`/`get`/`get_or_default`/`contains_key`/`remove`/`clear`/`len`/`is_empty`; `Default` | **Iteration (`keys`/`values`/`for (k,v) in &dict`) ⛔** — `KeyValuePair<K,V>` is a *generic value type* (instance `get_Key`/`get_Value` unsupported) and `KeyCollection`/`ValueCollection` are *nested generics* the typechecker rejects. See §7. |
+| `List<T>` | CoreLib | ✅ | `new`/`push`/`get`/`set`/`insert`/`remove_at`/`contains`/`index_of`/`clear`/`first`/`last`/`pop`/`sort`/`sort_by`/`for_each`/`reverse`/`len`/`is_empty`/`to_vec`/`from_slice`/`iter`; traits `Default`, `Clone` (deep, `T:Copy`), `PartialEq`/`Eq` (element-wise), `Hash`, `From<Vec<T>>`, `FromIterator`, `Extend`, `IntoIterator for &List` | `sort_by`(`Sort(Comparison<T>)`)/`for_each`(`ForEach(Action<T>)`) now **✅** — the delegate-as-generic-method-arg wall (formerly §8 wall #4) is closed. `binary_search`/`retain` still unwrapped (no backend wall; just unbuilt). |
+| `Dictionary<K, V>` | CoreLib | ✅ | `new`/`insert`/`get`/`get_or_default`/`contains_key`/`remove`/`clear`/`len`/`is_empty`/`keys`/`values`; `Default`; `Enumerable` (`for (k,v) in &dict`) | **Iteration now ✅** — `keys()`/`values()`/`for (k,v) in &dict` drive the enumerator over `KeyValuePair<K,V>` (the value-type-generic-instance-method wall closed; see §8 note). `KeyCollection`/`ValueCollection` themselves (as .NET view types, not Rust iterators) are still not surfaced. |
 | `HashSet<T>` | CoreLib | ✅ | `new`/`insert`/`contains`/`remove`/`clear`/`len`/`is_empty`; `Default`, `FromIterator`, `Extend`, `IntoIterator` (enumerator) | Set algebra (`UnionWith`/`IntersectWith`) 🟡. |
 | `Stack<T>` | System.Collections | ✅ | `new`/`push`/`pop`/`peek`/`clear`/`len`/`is_empty`; `Default`, `IntoIterator` (LIFO) | |
 | `Queue<T>` | System.Collections | ✅ | `new`/`enqueue`/`dequeue`/`peek`/`clear`/`len`/`is_empty`; `Default`, `IntoIterator` (FIFO) | |
-| `SortedDictionary<K, V>` | System.Collections | ✅ | same surface as `Dictionary` + `get_or_default` | `K` must be `IComparable`. Iteration ⛔ (same wall as `Dictionary`). |
+| `SortedDictionary<K, V>` | System.Collections | ✅ | same surface as `Dictionary` + `get_or_default`, `keys`/`values` iteration | `K` must be `IComparable`. |
 | `SortedSet<T>` | System.Collections | ✅ | same surface as `HashSet` (ascending order); `FromIterator`, `Extend`, `IntoIterator` | `T` must be `IComparable`. |
-| `LinkedList<T>` | System.Collections | ✅ | `new`/`push_back`/`contains`/`remove`/`clear`/`len`/`is_empty`; `IntoIterator`, `FromIterator`, `Extend` | Node ops (`AddFirst`/`First`/`Last`) ⛔ — they return `LinkedListNode<T>`, a nested generic (typechecker wall). `push_back` routes through `ICollection<T>.Add`. |
-| `PriorityQueue<E, P>` | System.Collections | ✅ | `new`/`enqueue`/`dequeue`/`peek`/`clear`/`len`/`is_empty`; `Default` | Min-priority; `P` must be `IComparable`. No iteration (`UnorderedItems` is a nested generic value type). |
+| `LinkedList<T>` | System.Collections | ✅ | `new`/`push_back`/`contains`/`remove`/`clear`/`len`/`is_empty`; `IntoIterator`, `FromIterator`, `Extend` | Node ops (`AddFirst`/`First`/`Last`) ⛔ — they return `LinkedListNode<T>`, a nested generic (typechecker wall, §8). `push_back` routes through `ICollection<T>.Add`. |
+| `PriorityQueue<E, P>` | System.Collections | ✅ | `new`/`enqueue`/`dequeue`/`peek`/`clear`/`len`/`is_empty`; `Default` | Min-priority; `P` must be `IComparable`. No iteration (`UnorderedItems` is a nested generic value type, §8). |
 | `ConcurrentDictionary<K, V>` | System.Collections.Concurrent | ✅ | `new`/`insert`/`try_add`/`get`/`get_or_default`/`contains_key`/`clear`/`len`/`is_empty` | **`TryRemove(K, out V)` ⛔** — needs a by-ref `!N` `out` argument the generic bridge can't marshal. |
 | `ConcurrentQueue<T>` | System.Collections.Concurrent | ✅ | `new`/`enqueue`/`len`/`is_empty`; `IntoIterator` (snapshot), `FromIterator`, `Extend` | **`TryDequeue`/`TryPeek` ⛔** (out-param). Pattern = produce then drain by iteration. |
 | `ConcurrentBag<T>` | System.Collections.Concurrent | ✅ | `new`/`add`/`len`/`is_empty`; `IntoIterator` (snapshot), `FromIterator`, `Extend` | **`TryTake`/`TryPeek` ⛔** (out-param). |
 | `ConcurrentStack<T>`, `BlockingCollection<T>` | System.Collections.Concurrent | ⛔/🟡 | — | Not wrapped; same out-param wall on the `TryX` removers. |
 | `ObservableCollection<T>`, `ReadOnlyCollection<T>` | System.ObjectModel | 🟡 | — | Reachable via `dotnet_generic!`; no idiomatic wrapper yet. |
-| `Span<T>` / `Memory<T>` / `ReadOnlySpan<T>` | CoreLib | ⛔ | — | Generic **value-type** instance methods (deferred WF-9 Stage-1 tail; `call.rs` asserts `!is_valuetype` for instance generics). |
+| `Span<T>` / `ReadOnlySpan<T>` | CoreLib | ✅ | `mycorrhiza::span::{Span, ReadOnlySpan}` — zero-copy view over a Rust `&mut [T]`/`&[T]`: `from_slice`, `len`/`is_empty`, `get`/`set`, `fill`, `clear`, `.handle()` to pass to a .NET API | Generic **value-type** instance methods (former §8 wall #2) are now supported for the concrete members exercised here (`get_Length`, `Fill`, `Clear`, the byref `get_Item` indexer). `Memory<T>` (the heap-backed sibling) is still unwrapped. `ReadOnlySpan<T>.get_Item` is unreachable (`ref readonly T` — a `modreq`-decorated byref no plain `!0&` methodref can match); read the backing Rust slice directly instead. Proof: `cd_span` (45/45). |
 
 **Enumerator bridge (`mycorrhiza::enumerate`)** — ✅ `for x in &collection` over every reference-type
 collection above, plus any `IEnumerable<T>` handle via `Enumerable::iter_enumerator()` →
 `Enumerator<T>: Iterator`. Goes through the *non-generic* `IEnumerable`/`IEnumerator` interfaces then
-`castclass` + a bare-`!0` `get_Current`, sidestepping the nested-generic def-shape wall. Proof:
-`cd_enumerate` (22/22).
+`castclass` + a bare-`!0` `get_Current`, sidestepping the nested-generic def-shape wall. Also backs
+`Dictionary`/`SortedDictionary` key/value iteration over the *value-type-generic* `KeyValuePair<K,V>`.
+Proof: `cd_enumerate` (22/22), `cd_collections` (141/141).
 
 ---
 
 ## 2. BCL value types & static helpers (`mycorrhiza::bcl`, in the prelude)
 
-Hand-written idiomatic modules over the most-reached-for BCL surface. Proof: `cd_bcl` (313/313),
-`cd_json` (47/47). Each `✅` exposes a `.handle()` down to the 🟡 bindings for anything unsurfaced.
+Hand-written idiomatic modules over the most-reached-for BCL surface. Proof: `cd_bcl` (324/324),
+`cd_decimal` (11/11), `cd_json` (47/47). Each `✅` exposes a `.handle()` down to the 🟡 bindings for
+anything unsurfaced.
 
 | .NET type | Status | Idiomatic surface | Std traits | Notes |
 |---|---|---|---|---|
@@ -100,29 +111,30 @@ Hand-written idiomatic modules over the most-reached-for BCL surface. Proof: `cd
 | `System.Text.Json` (as `bcl::json::Json`) | ✅ | `parse`→`Option<Json>`, `get(name)`/`index(i)`/`len`/`kind`, `as_str`/`as_i64`/`as_f64`/`as_bool`/`is_null`, `is_object`/`is_array`, `to_json_string` | `Display` | Read/navigate a `JsonNode` DOM. **Not**: construction/mutation, `JsonSerializer<T>` (needs a generic-method instantiation), object-property enumeration (needs the enumerator over `KeyValuePair`). Numeric reads decode the node's canonical JSON token (`GetValue<T>` is a generic method). |
 | `Console` (`system::console`) | 🟡 | `writeln_string`/`writeln_u64`/`writeln_f64` only | — | Thin; most Rust code uses `println!` (routes through the std PAL). No `ReadLine`/formatting wrapper. |
 | `Marshal` (`system::runtime::interop_services`) | 🟡 | used internally for `PtrToStringUTF8` | — | Low-level marshalling helper; not an end-user surface. |
-| `Nullable<T>` | 🟡/⛔ | used inside `bcl::json` for the options args | — | A generic value type; no idiomatic `Nullable<T>` ↔ `Option<T>` wrapper yet (value-type-generic-instance tail). See also §4 for the `null`↔`Option` (reference) bridge, which **is** ✅. |
-| `DateTimeOffset`, `Decimal`, `BigInteger`, `Version`, `IPAddress`, `Encoding`, `Convert`, `BitConverter` | 🟡 | — | Reachable via `bindings.rs` / `instanceN`; no idiomatic module yet. Prime Theme-2 breadth candidates. |
+| `Decimal` (`DotNetDecimal`, `mycorrhiza::bcl::decimal`) | ✅ | `from_i64`/`from_i32`/`parse`, `to_f64`, `to_dotnet_string`, `+`/`-`/`*`/`/` (`Add`/`Sub`/`Mul`/`Div`, via the real `Decimal` operators — bit-identical to C#) | `Display`, `PartialEq`/`Eq`, `PartialOrd`/`Ord` (via `Decimal.Compare` — an exact base-10 total order, not culture-sensitive, so a real `Ord` applies) | Closes the former Theme-2 backlog item ("`Decimal` operator/trait completeness audit"). Proof: `cd_decimal` (11/11), also folded into `cd_bcl`. |
+| `Nullable<T>` (`mycorrhiza::nullable`) | ✅ | `some(value)` (`new Nullable<T>(value)`); `NullableExt::to_option()` → `Option<T>` (`HasValue`/`Value`, only reads `Value` when present) | — | The former value-type-generic-instance-method wall (§8) is closed for `Nullable<T>`'s two members. See also §4 for the `null`↔`Option` (reference) bridge, which is a separate, older ✅. |
+| `DateTimeOffset`, `BigInteger`, `Version`, `IPAddress`, `Encoding`, `Convert`, `BitConverter` | 🟡 | — | Reachable via `bindings.rs` / `instanceN`; no idiomatic module yet. Prime Theme-2 breadth candidates. |
 
 ---
 
 ## 3. Delegates, callbacks & async (`mycorrhiza::delegate`, `mycorrhiza::task`, in the prelude)
 
-Proof: `cd_delegates` (14/14), `cd_async` (7/7).
+Proof: `cd_delegates` (14/14), `cd_async` (9/9), `cd_closures`, `cd_linq_expr` (89/89).
 
 | Feature | Status | Surface | Wall / what's missing |
 |---|---|---|---|
-| `Action<T0>` / `Action<T0,T1>` | ✅ | `Action1`/`Action2`: `from_fn(extern "C" fn)`, `invoke`, `from_handle`, `handle` | Only arities 1–2; capture-less fns only. |
+| `Action<T0>` / `Action<T0,T1>` | ✅ | `Action1`/`Action2`: `from_fn(extern "C" fn)`, `invoke`, `from_handle`, `handle` | Only arities 1–2. |
 | `Func<T0,R>` / `Func<T0,T1,R>` | ✅ | `Func1`/`Func2`: same shape, value-returning | Only arities 1–2. |
 | `Comparison<T>` | ✅ | `from_fn`/`invoke`/`handle` — `(T,T)->i32` | — |
 | Invoke a *held* .NET delegate from Rust | ✅ | `from_handle(h).invoke(..)` (`callvirt Delegate::Invoke`) | — |
-| **Closure captures** | ⛔ | — | A captured environment has no managed home without a boxing trampoline. Pass state via args or a `static`. |
-| **Delegate as a *generic-method* argument** | ⛔ | — | `List<T>.Sort(Comparison<T>)` / `ForEach(Action<T>)` need the CIL verifier to model nested generic-param binding (`Comparison`1<!0>` param vs `Comparison`1<int32>` arg) — a separate *sound* extension, **not** a checker relaxation. |
-| .NET **events** (`add_*`/`remove_*`) | ⛔ | — | Compose once a delegate is a legal generic-method argument. |
+| **Closure captures** | ✅ | `Action1::from_closure(move \|x\| ..)` (and the other delegate arities) — the capture environment is boxed and leaked for `'static` lifetime, invoked through a monomorphic trampoline | Leaked, not freed — fine for long-lived callbacks/`static`-shaped usage; not a fit for a hot per-call closure churned in a loop. Former §8 wall #5. Proof: `cd_closures`. |
+| **Delegate as a *generic-method* argument** | ✅ | `List<T>.Sort(Comparison<T>)` / `ForEach(Action<T>)` — see `sort_by`/`for_each` in §1 | The verifier now models the nested generic-param binding (`Comparison`1<!0>` param vs concrete `Comparison`1<int32>` arg) as a sound extension. Former §8 wall #4 — the doc's headline "must not be relaxed" caution was about the *checker*, not this addition, and holds: nothing was relaxed. |
+| .NET **events** (`add_*`/`remove_*`) | ⛔ | — | Not yet composed, though the delegate-as-generic-arg prerequisite is now in place. |
 | `.await` a non-generic `Task` | ✅ | `task::Task` (`delay`/`completed`/`run`/`is_completed`), `await_unit(t).await`, `block_on` | Covers the large non-result async surface (`Task.Delay`, `Task.Run(Action)`, `FlushAsync`, …). |
 | `.await` a `Task<T>` a .NET API *returned* | ✅ | `await_task(t).await` (`IsCompleted`/`Result` = bare `!0`) | Works when handed a concrete `Task<int>`. |
 | Expose a Rust `async fn` as a non-generic `Task` | ✅ | `future_to_task_unit(fut)` (via non-generic `TaskCompletionSource`) | — |
-| **Produce a `Task<T>` from a Rust value** | ⛔ | — | `TaskCompletionSource<T>.Task` / `Task.FromResult<T>` return the nested-generic def-shape `Task`1<!0>`, which can't land in a valid Rust local without a sound backend addition (inserted upcast in `call_generic`, or generic-method args). Same ceiling as the enumerator/Dictionary walls. |
-| LINQ adapters (`.where_`/`.select`/`.to_list`) | ⛔/🟡 | — | Land once delegate-as-generic-method-arg lands (predicates are delegates over the class generic). |
+| **Produce a `Task<T>` from a Rust value** | ✅ | `future_to_task(fut)` packages an `async fn -> T` into a real `Task<T>` via `TaskCompletionSource<T>.get_Task()` | The nested-generic-return wall (former §8 wall #1) is closed for this specific producer path. `Task.FromResult<T>` itself is still unused (it needs generic-*method* `!!N` *argument* support the backend doesn't emit) — the `TaskCompletionSource<T>` route is sufficient and used instead. |
+| LINQ / EF `IQueryable.Where(Expression<Func<T,bool>>)` | ✅ | `mycorrhiza::linq` — `Expr`/`Predicate`/`TypedPredicate<T>`/`Field<Root,Val>` build a real `System.Linq.Expressions` tree from Rust (params, binops, member access, `box`-boxed constants), compiled and handed to `IQueryable.Where` | Built on **expression trees**, not delegates — sidesteps the delegate-as-generic-arg wall entirely (EF needs the *tree*, not a compiled predicate). `.select`/`.to_list`/other LINQ operators beyond `Where` are not yet wrapped. Proof: `cd_linq_expr` (89/89). |
 
 ---
 
@@ -134,14 +146,30 @@ Proof: `cd_idiomatic` (45/45).
 |---|---|---|---|
 | managed `null` ↔ `Option` | ✅ | `Nullable` trait (`null_ref`/`is_null_ref`/`is_present`/`map_present`/`present`), free `from_nullable(h, \|\| ..)` | Deliberately maps the live ref to a **Rust value** inside the `Option` — `Option<managed-ref>` is a true layout wall (a managed ref can't sit in an enum niche on CoreCLR). The mapping closure *captures* rather than receives the ref. |
 | thrown exception ↔ `Result` | ✅ | `try_managed(\|\| ..)` / the `.try_()` combinator → `Result<T, ManagedException>` | Runs the closure inside a CIL `try/catch` (via the `rustc_clr_interop_try_catch` primitive). Catches *foreign* .NET exceptions (the ones `catch_unwind` rethrows). |
+| `?`-operator ergonomics for `ManagedException` | ✅ | `impl_from_managed_exception!(MyError, MyError::Managed)` generates `From<ManagedException> for MyError`, so `try_managed(\|\| ..)?` bubbles straight into a consumer's own error type | A blanket `impl<E> From<ManagedException> for E` isn't legal Rust (orphan rules), so each consumer's error type still needs one macro invocation — but that closes the former "every consumer hand-rolls the conversion" gap. |
 | Carry the exception object across the seam | ⛔ | — | `ManagedException` is a marker for now: a managed ref can't be smuggled through the `*mut u8` catch callback. Follow-up once a managed-ref catch ABI exists. |
 
 ---
 
-## 5. Rust-from-C# — exporting Rust ergonomically
+## 5. Synchronization & channels (`mycorrhiza::sync`, in the prelude)
+
+Real managed synchronization primitives, cross-language-shareable (a `GCHandle`-rooted `SharedLock`
+etc. can be observed/coordinated from C# too, not just used internally by Rust). Proof: `cd_sync`
+(43/43).
+
+| Feature | Status | Surface | Notes |
+|---|---|---|---|
+| `SharedLock` / `SharedMutex<T>` / `SharedRwLock<T>` | ✅ | `SemaphoreSlim`/`ReaderWriterLockSlim`-backed lock + data-owning guard types (`lock()`, `lock_async()`, `read()`/`write()`) | Real CLR locks, not a Rust-side spinlock — safe to hand the same lock handle to C#. |
+| `SharedOnce<T>` | ✅ | `std::sync::OnceLock<T>`-shaped: `new()`, `get()`, `get_or_init(f)` | Built on `SharedLock`'s double-checked-lock pattern; the "safe `Once`/lazy-init wrapper" Theme-2 backlog item. |
+| `channel<T>()` / `bounded_channel<T>(capacity)` | ✅ | `std::sync::mpsc`-shaped `Sender<T>`/`Receiver<T>` pair over `System.Threading.Channels` | Genuinely multi-producer multi-consumer (unlike `std::sync::mpsc`'s single-consumer restriction) — the Theme-2 "channel-style primitive" backlog item. C# can be a producer or consumer on the same channel. |
+| `Semaphore`, `Signal`, `CountdownEvent`, `Barrier` | ✅ | Thin idiomatic wrappers over the matching `System.Threading` primitives | |
+
+---
+
+## 6. Rust-from-C# — exporting Rust ergonomically
 
 The mirror direction: a C# dev consuming a Rust `cdylib`. Proof: `cd_typedef` (16/16),
-`cd_containers2` (30/30), `cd_rustvec` (44/44), `cd_interop`/`cd_interop_tier2` (PASS).
+`cd_containers2` (30/30), `cd_rustvec` (37/37), `cd_interop`/`cd_interop_tier2` (PASS).
 
 | Feature | Status | Surface | Notes / walls |
 |---|---|---|---|
@@ -158,7 +186,7 @@ The mirror direction: a C# dev consuming a Rust `cdylib`. Proof: `cd_typedef` (1
 
 ---
 
-## 6. Low-level interop surface (the 🟡 floor everything wraps)
+## 7. Low-level interop surface (the 🟡 floor everything wraps)
 
 Always available; not ergonomic, but the honest escape hatch and what new wrappers are built from.
 
@@ -171,36 +199,52 @@ Always available; not ergonomic, but the honest escape hatch and what new wrappe
 
 ---
 
-## 7. The recurring walls (why some rows are ⛔)
+## 8. The recurring walls (why some rows are still ⛔)
 
 These are **genuine ceilings**, not backlog — surfaced repeatedly above. None is fixable by weakening
-the CIL typechecker (forbidden); each needs either a *sound* backend addition or is a true layout
-limit. (Cross-ref: `docs/TRANSLATION_STATUS.md` §7, and the module docs in `collections.rs` /
-`enumerate.rs` / `task.rs`.)
+the CIL typechecker (forbidden); each closed one needed a *sound* backend addition (never a
+relaxation), and each still-open one names the reason it's a true layout/ABI limit rather than an
+unwritten wrapper. (Cross-ref: `docs/TRANSLATION_STATUS.md` §7, and the module docs in
+`collections.rs` / `enumerate.rs` / `task.rs` / `span.rs` / `nullable.rs`.)
 
-1. **Nested-generic def-shape return.** A methodref whose *return* is a nested generic spelling the
-   enclosing generic (`IEnumerator`1<!0>`, `Task`1<!0>`, `KeyCollection<!0,!1>`, `LinkedListNode<!0>`)
-   has no valid Rust local to land in. The checker soundly accepts a **bare `!N`** return against a
-   concrete local (the WF-9 marker guard) but not a nested generic — and must not be relaxed. This
-   blocks: `Task<T>` *production*, `Dictionary` key/value collections, `LinkedList` node ops,
-   `PriorityQueue.UnorderedItems`. The **workaround pattern** (used by the enumerator bridge): take
-   the *non-generic* interface route, then `castclass` to the generic view, and only read members that
-   return a bare `!N`.
-2. **Generic value-type instance methods.** Instance calls on a generic *value type* are unsupported
-   (`src/terminator/call.rs` asserts `!is_valuetype` for the instance-generic KIND). Blocks:
-   `KeyValuePair<K,V>.get_Key/get_Value`, `Span<T>`/`Memory<T>`, `List<T>.Enumerator` (the struct
-   enumerator — the bridge uses the boxed interface enumerator instead), `Nullable<T>` instance
-   members.
-3. **By-ref `!N` (`out`) arguments.** The generic bridge marshals value-in / value-out args, not a
-   `!N` `out` parameter. Blocks the concurrent collections' `TryRemove`/`TryDequeue`/`TryTake`/
-   `TryPeek` removers (all hand the element back through an `out`).
-4. **Delegate as a generic-method argument.** Passing a delegate parameterised by the class generic
-   into a generic method (`List<T>.Sort(Comparison<T>)`, LINQ predicates) needs the verifier to model
-   nested generic-param binding — a sound extension, not a relaxation. Blocks `sort_by`, `ForEach`,
-   LINQ adapters, `.NET` events.
-5. **Closure captures across the delegate seam.** No managed home for a capture environment without a
-   boxing trampoline. Capture-less `extern "C" fn` only.
-6. **`Option<managed-ref>` / a managed ref in an enum niche or coroutine state.** A managed reference
+1. **Nested-generic def-shape return — partially closed.** A methodref whose *return* is a nested
+   generic spelling the enclosing generic (`IEnumerator`1<!0>`, `Task`1<!0>`, `KeyCollection<!0,!1>`,
+   `LinkedListNode<!0>`) has no valid Rust local to land in directly. The checker still soundly accepts
+   only a **bare `!N`** return against a concrete local (the WF-9 marker guard) — nested-generic
+   returns are still rejected and must not be relaxed. What changed: `Dictionary`/`SortedDictionary`
+   key/value iteration and `Task<T>` *production* are now both live, but neither weakens the checker —
+   both route around the wall instead. Iteration uses the pre-existing **non-generic-interface
+   workaround** (take `IEnumerable`, `castclass` to the generic view, read only bare-`!N` members).
+   `Task<T>` production uses `TaskCompletionSource<T>.get_Task()` the same way. Still blocked by the
+   *unrouted* form of this wall: `LinkedList` node ops (`AddFirst`/`First`/`Last` return
+   `LinkedListNode<T>`), `PriorityQueue.UnorderedItems`, and `Task.FromResult<T>` directly (needs
+   generic-*method* argument support instead, see wall 3).
+2. **Generic value-type instance methods — closed for the exercised members.** Instance calls on a
+   generic *value type* were unsupported (`src/terminator/call.rs` asserted `!is_valuetype` for the
+   instance-generic KIND); that assertion has been relaxed *soundly* for concrete instantiations, and
+   is now exercised by `Span<T>.get_Length`/`Fill`/`Clear`/the byref indexer, `KeyValuePair<K,V>.
+   get_Key`/`get_Value` (via the enumerator bridge), and `Nullable<T>.get_HasValue`/`get_Value`. Not
+   every generic value type is wrapped yet — `Memory<T>` and `List<T>.Enumerator` (the *struct*
+   enumerator; the bridge still uses the boxed interface enumerator) remain unwrapped, but that's
+   unbuilt breadth, not a reopened wall.
+3. **By-ref `!N` (`out`) arguments — still open.** The generic bridge marshals value-in / value-out
+   args, not a `!N` `out` parameter. Blocks the concurrent collections' `TryRemove`/`TryDequeue`/
+   `TryTake`/`TryPeek` removers (all hand the element back through an `out`), and `Task.FromResult<T>`/
+   any other generic-*method* call needing a type argument the bridge can't yet supply.
+4. **Delegate as a generic-method argument — closed.** Passing a delegate parameterised by the class
+   generic into a generic method (`List<T>.Sort(Comparison<T>)`, `ForEach(Action<T>)`) needed the
+   verifier to model nested generic-param binding (`Comparison`1<!0>` param vs a concrete
+   `Comparison`1<int32>` arg) — implemented as a sound extension, not a relaxation, and now backs
+   `List::sort_by`/`for_each` (§1). LINQ's `IQueryable.Where` predicate does **not** use this path —
+   EF needs an *expression tree*, not a compiled delegate, so `mycorrhiza::linq` builds
+   `System.Linq.Expressions` trees instead (§3) and never needed this wall closed. `.NET` events
+   (`add_*`/`remove_*`) could now compose on top of this but aren't wired yet.
+5. **Closure captures across the delegate seam — closed.** A captured environment now has a managed
+   home: `Action1::from_closure`/etc. box the closure's environment (leaked for `'static`) and invoke
+   it through a monomorphic per-signature trampoline. Trade-off: the boxed environment is leaked, not
+   freed, so this fits long-lived/`static`-shaped callbacks, not a closure churned per-call in a hot
+   loop — a capture-less `extern "C" fn` is still the zero-overhead choice when captures aren't needed.
+6. **`Option<managed-ref>` / a managed ref in an enum niche or coroutine state — still open.** A managed reference
    may not live in an overlapping/union field (the GC needs an unambiguous ref-map per offset). This
    is *why* the `null`↔`Option` bridge maps to a Rust value, and why a `Task`/`TaskT` handle must not
    be held across an `.await` inside an `async fn` (only in a plain `Future` struct driven by
