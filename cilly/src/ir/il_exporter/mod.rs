@@ -1793,10 +1793,39 @@ fn is_bcl_assembly(name: &str) -> bool {
 fn simple_class_ref(cref: Interned<ClassRef>, asm: &Assembly) -> String {
     let cref = asm.class_ref(cref);
     let name = dotnet_class_name(&asm[cref.name()]);
-    if let Some(assembly) = cref.asm() {
-        format!("[{assembly}]'{name}'", assembly = ref_assembly_name(&asm[assembly]))
+    // Every `extends=`/`implements=` reference registered before the generic-interface intrinsic
+    // (`rustc_codegen_clr_add_generic_interface_impl`) always had empty `generics()`, so this arm
+    // was dead code until that feature existed — adding it here cannot change any previously
+    // passing case. A GENERIC reference (e.g. `IEquatable<int>`) needs the arity suffix
+    // (`` `1 ``) and the `<…>` instantiation list, exactly like `class_ref`'s own construction
+    // below, or ilasm parses it as a reference to a same-named non-generic type that doesn't
+    // exist (or worse, an unrelated one that happens to share the un-suffixed name).
+    if cref.generics().is_empty() {
+        if let Some(assembly) = cref.asm() {
+            format!("[{assembly}]'{name}'", assembly = ref_assembly_name(&asm[assembly]))
+        } else {
+            format!("'{name}'")
+        }
     } else {
-        format!("'{name}'")
+        let prefix = if cref.is_valuetype() { "valuetype" } else { "class" };
+        let generic_postfix = format!("`{}", cref.generics().len());
+        let generic_list = format!(
+            "<{generics}>",
+            generics = cref
+                .generics()
+                .iter()
+                .map(|tpe| type_il(tpe, asm))
+                .intersperse(",".to_string())
+                .collect::<String>()
+        );
+        if let Some(assembly) = cref.asm() {
+            format!(
+                "{prefix} [{assembly}]'{name}{generic_postfix}'{generic_list}",
+                assembly = ref_assembly_name_for_type(&asm[assembly], &asm[cref.name()])
+            )
+        } else {
+            format!("{prefix} '{name}{generic_postfix}'{generic_list}")
+        }
     }
 }
 pub(crate) fn class_ref(cref: Interned<ClassRef>, asm: &Assembly) -> String {

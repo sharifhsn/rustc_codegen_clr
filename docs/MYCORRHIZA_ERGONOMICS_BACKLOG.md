@@ -89,14 +89,12 @@ design decision before any code is written).
   (common in modern .NET APIs — EF Core, gRPC streaming) aren't. **Research first** (interacts
   with the same coroutine-layout wall documented in `mycorrhiza::task`). **Researched 2026-07-06,
   see findings below — blocked for the sugared `async fn` case; a hand-rolled non-overlapping
-  Stream-state struct is a viable Tier A follow-up. Attempted 2026-07-07: genuinely blocked one
-  layer earlier than expected — `#[dotnet_class(implements=...)]` cannot express a *generic*
-  interface instantiation (`IAsyncEnumerator<T>` for concrete `T`) at all today, since
-  `rustc_codegen_clr_add_interface_impl` (root `src/comptime.rs`) hardcodes empty generics on the
-  interface `ClassRef` with no macro-level way to inject one. This is a real, scoped, additive
-  `cilly/src`-adjacent gap (generalize that one intrinsic to accept generic args) that blocks BOTH
-  this item and Case C of the richer-export-return-types item below — worth fixing as its own small
-  Tier C spike before either.**
+  Stream-state struct is a viable Tier A follow-up. The blocking generic-interface-instantiation
+  gap noted here (2026-07-07) is now FIXED** (`rustc_codegen_clr_add_generic_interface_impl` +
+  `implements = "…<[Asm]Ns.Ty>"` / `"…<valuetype [Asm]Ns.Ty>"` syntax) — see the new Tier C
+  finding §8 below for the full story, including a real Roslyn bug isolated and worked around along
+  the way. The Stream-state-struct spike itself is still open (this only unblocked the interface
+  instantiation it needs).
 - ~~**A safe `Once`/lazy-init wrapper**~~ — **DONE** (`fa5ccbd`). `mycorrhiza::sync::SharedOnce<T>`,
   built on the existing `SharedLock` (double-checked locking over an `UnsafeCell<Option<T>>`), not
   `System.Lazy<T>` (which is CLR-generic over `T` with no way to bind an arbitrary Rust `T` through
@@ -418,3 +416,51 @@ term could unmask dependency-compile spam that was likely filtered deliberately 
 the addition to just the target crate's own name); the linker's unmasked `println!`s have no
 `==>`-style prefix matching `cargo-dotnet`'s own banner convention, so a small formatting pass is
 worth doing alongside to keep the UX coherent.
+
+### 8. Generic-interface-instantiation gap — FIXED (2026-07-07)
+
+**What shipped:** `#[dotnet_class(implements = "…")]` can now reference a *generic* managed
+interface bound to a concrete external type argument, e.g.
+`implements = "[System.Runtime]System.IEquatable<valuetype [System.Runtime]System.Int32>"`. New
+intrinsic `rustc_codegen_clr_add_generic_interface_impl` (mirrors the existing non-generic
+`rustc_codegen_clr_add_interface_impl`, arity-1 only — a multi-argument interface like
+`IDictionary<K,V>` still isn't expressible). The generic argument is a plain external-type
+reference, never derived from a Rust type, exactly like `extends=`'s own superclass reference — a
+`valuetype ` prefix marks a value-type argument (mirroring IL's own keyword) since there's no Rust
+type to infer it from.
+
+**A real, independent Roslyn bug was found and worked around along the way.** The first
+implementation (generic argument built as a plain `ClassRef`, `VALUETYPE <TypeRef>` encoding)
+produced metadata verified byte-correct via `System.Reflection.Metadata` (assembly refs, type
+refs, the `TypeSpec`'s `GENERICINST` blob, the `InterfaceImpl` row — all matched ECMA-335
+§II.23.2.12 exactly) under BOTH exporters, yet `csc` rejected it with `CS0648: '' is a type not
+supported by the language`. Isolated via a hand-assembled `ilasm` repro (bypassing this project's
+exporters entirely) that `System.IEquatable<int>` fails identically, while the *identical* shape
+with a reference-type argument (`System.IEquatable<string>`) compiles cleanly — pinning the failure
+to value-type PRIMITIVE arguments encoded via the generic `VALUETYPE <TypeRef>` form specifically.
+**Fix:** well-known CLR primitives (`Int32`, `Boolean`, `Double`, …) are now mapped to cilly's
+native `Type::Int`/`Type::Float`/`Type::Bool` variants (their dedicated ECMA-335 element-type byte,
+e.g. `ELEMENT_TYPE_I4`) instead of a generic `ClassRef`, in `well_known_primitive_type`
+(`src/comptime.rs`). Non-primitive value types (a user struct, `DateTime`, `Guid`, …) still use the
+`ClassRef`+`VALUETYPE` form, untested against this specific Roslyn behavior — flagged as an open
+question if one is ever used as a generic-interface argument this way.
+
+**Also fixed as a genuine prerequisite** (both exporters previously only ever built extends/
+implements references with empty generics, since nothing needed otherwise): `il_exporter::
+simple_class_ref` now emits the arity suffix + `<…>` instantiation list for a generic `extends`/
+`implements` reference (was dead code, correctly, until this feature existed); `pe_exporter::
+export_pe`'s extends/implements construction now routes through `MetadataBuilder::class_ref_token`
+(widened from `pub(super)`) instead of the coded-index-only `type_def_or_ref`, so a generic
+reference gets a real `TypeSpec`+`GENERICINST` row instead of a bare `TypeRef` to the unbound open
+generic (which the CLR rejects at load time as a `TypeLoadException` — a loud, not silent, failure
+mode, but wrong either way).
+
+**Verified:** new proof crate `cargo_tests/cd_generic_iface` (`IntBox` implements
+`System.IEquatable<int>`, upcast/polymorphic-call/`is`/`as` checks) — 7/7 under both `DIRECT_PE=1`
+(default) and `DIRECT_PE=0` (ilasm). Existing non-generic `implements=`/`extends=` consumers
+(`cd_iface` 9/9, `cd_export` 20/20, `cd_typedef` 16/16) unaffected under both exporter paths.
+`cilly` unit tests 199/199. Full Docker `::stable` gate run before commit (see commit message for
+the exact pass/fail tally).
+
+**Unblocks:** the `IAsyncEnumerable<T>` Stream-state-struct spike (finding §3) and Case C of the
+richer-export-return-types item (finding §6) — both were waiting on exactly this.

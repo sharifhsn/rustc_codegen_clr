@@ -34,6 +34,11 @@ rustc-ice-*.txt
 # the .cargo/config.toml (generated per-machine by cargo-dotnet), Cargo.lock, and target/ are
 # regenerated and MUST NOT be committed (machine-specific paths -> dirty trees / broken native).
 cargo_tests/**/target/
+# same for each crate's csharp/ consumer project's own MSBuild output (bin/obj were accidentally
+# staged once via a broad `git add .` on a new probe crate -- no other cargo_tests crate tracks
+# these either, so make the exclusion explicit instead of relying on care alone).
+cargo_tests/**/csharp/bin/
+cargo_tests/**/csharp/obj/
 # .NET runtime config emitted by cargo-dotnet / the linker into the run dir
 .runtimeconfig.json
 *.runtimeconfig.json

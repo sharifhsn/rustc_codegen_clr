@@ -1845,7 +1845,7 @@ impl MetadataBuilder {
     /// (§II.22.39) carrying the FULL `GENERICINST` blob instead — mirrors what `ilasm` builds
     /// under the hood whenever `il_exporter`'s textual `class 'Name'<T,…>` appears as a
     /// `newobj`/`MemberRef` operand.
-    fn class_ref_token(&mut self, asm: &mut Assembly, cref: Interned<ClassRef>) -> Token {
+    pub(super) fn class_ref_token(&mut self, asm: &mut Assembly, cref: Interned<ClassRef>) -> Token {
         if asm[cref].generics().is_empty() {
             let coded = self.type_def_or_ref(cref, asm);
             decode_type_def_or_ref(coded)

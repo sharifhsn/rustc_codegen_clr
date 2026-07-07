@@ -20,6 +20,7 @@ use cilly::{
     Access, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, FieldDesc, MethodDef, MethodImpl,
     MethodRef, Type,
 };
+use cilly::{Float, Int};
 use rustc_codegen_clr_call::CallInfo;
 use rustc_codegen_clr_ctx::{function_name, MethodCompileCtx};
 use rustc_codegen_clr_type::r#type::get_type;
@@ -44,9 +45,13 @@ struct PendingClass<'tcx> {
     /// `(managed_method_name, target_rust_fn)` — a `static` method aliasing the Rust fn (no receiver;
     /// the fn's signature is used verbatim).
     static_methods: Vec<(String, Instance<'tcx>)>,
-    /// `(interface_assembly, interface_name)` — managed interfaces this class implements. The virtual
-    /// methods above satisfy them by name+signature (implicit interface implementation).
-    interfaces: Vec<(String, String)>,
+    /// `(interface_assembly, interface_name, generic_args)` — managed interfaces this class
+    /// implements. The virtual methods above satisfy them by name+signature (implicit interface
+    /// implementation). `generic_args` is empty for a non-generic interface, or a single
+    /// `(assembly, type_name, is_valuetype)` external-type reference for the one-generic-parameter
+    /// case (see `rustc_codegen_clr_add_generic_interface_impl`) — never derived from a Rust type,
+    /// so `is_valuetype` must come from the caller (there is no Rust type to infer it from).
+    interfaces: Vec<(String, String, Vec<(String, String, bool)>)>,
     /// Synthesize a field-initializing primary ctor `.ctor(field0, field1, …)` (in field order) so a
     /// managed caller can `new <Name>(…)` and get an instance with its fields set.
     has_primary_ctor: bool,
@@ -193,13 +198,29 @@ pub fn interpret<'tcx>(
                         .expect("comptime: could not resolve static method target instance");
                     class.static_methods.push((method_name, target));
                     ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_add_generic_interface_impl") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    // Generics: <const IFACE_ASM, const IFACE, const GENERIC_ASM, const GENERIC_TYPE,
+                    // const GENERIC_IS_VALUETYPE>.
+                    let iface_asm = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
+                    let iface_name = garg_to_string(subst_ref[1], ctx.tcx()).replace("::", ".");
+                    let generic_asm = garg_to_string(subst_ref[2], ctx.tcx()).replace("::", ".");
+                    let generic_type = garg_to_string(subst_ref[3], ctx.tcx()).replace("::", ".");
+                    let generic_is_valuetype = garg_to_bool(subst_ref[4], ctx.tcx());
+                    class.interfaces.push((
+                        iface_asm,
+                        iface_name,
+                        vec![(generic_asm, generic_type, generic_is_valuetype)],
+                    ));
+                    ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_add_interface_impl") {
                     let src = operand_local(&args[0].node);
                     let mut class = locals[src].as_class().clone();
                     // Generics: <const IFACE_ASM, const IFACE>.
                     let iface_asm = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
                     let iface_name = garg_to_string(subst_ref[1], ctx.tcx()).replace("::", ".");
-                    class.interfaces.push((iface_asm, iface_name));
+                    class.interfaces.push((iface_asm, iface_name, vec![]));
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_add_primary_ctor") {
                     let src = operand_local(&args[0].node);
@@ -247,6 +268,43 @@ fn operand_local(op: &rustc_middle::mir::Operand<'_>) -> usize {
             .as_local()
             .expect("comptime: unsupported operand in interop type definition"),
     )
+}
+
+/// Maps a well-known CLR primitive's bare type name (e.g. `"System.Int32"`) to cilly's native
+/// [`Type`] variant, so it encodes via its dedicated ECMA-335 element-type code
+/// (`ELEMENT_TYPE_I4`, …) instead of the generic `VALUETYPE <TypeDefOrRef>`/`CLASS <TypeDefOrRef>`
+/// form a string-referenced external [`ClassRef`] produces by construction. Returns `None` for
+/// anything else (a user-defined struct/class, `DateTime`, `Guid`, …), which genuinely has no
+/// compact element-type code and must stay a `ClassRef`.
+///
+/// Only reachable from a generic-interface-argument position today (see
+/// `rustc_codegen_clr_add_generic_interface_impl`'s caller in `finish_type` below) — proven
+/// necessary there, not theoretical: a hand-assembled ilasm repro AND this exporter's own PE
+/// writer both independently produced spec-valid `implements class System.IEquatable`1<valuetype
+/// [System.Runtime]System.Int32>` metadata (confirmed correct via `System.Reflection.Metadata`,
+/// byte-for-byte matching ECMA-335 §II.23.2.12's `GenericInst` grammar) that a real `csc` rejects
+/// with `CS0648: '' is a type not supported by the language` — while the IDENTICAL shape with a
+/// REFERENCE-typed argument (`System.String`) compiles cleanly, isolating the failure to
+/// value-type PRIMITIVES specifically wrapped as `VALUETYPE <TypeRef>` rather than encoded via
+/// their dedicated element-type byte.
+fn well_known_primitive_type(name: &str) -> Option<Type> {
+    Some(match name {
+        "System.Boolean" => Type::Bool,
+        "System.Char" => Int::U16.into(),
+        "System.SByte" => Int::I8.into(),
+        "System.Byte" => Int::U8.into(),
+        "System.Int16" => Int::I16.into(),
+        "System.UInt16" => Int::U16.into(),
+        "System.Int32" => Int::I32.into(),
+        "System.UInt32" => Int::U32.into(),
+        "System.Int64" => Int::I64.into(),
+        "System.UInt64" => Int::U64.into(),
+        "System.IntPtr" => Int::ISize.into(),
+        "System.UIntPtr" => Int::USize.into(),
+        "System.Single" => Type::Float(Float::F32),
+        "System.Double" => Type::Float(Float::F64),
+        _ => return None,
+    })
 }
 
 /// Build and register the managed class, then attach its virtual methods (which alias the Rust fns).
@@ -310,14 +368,48 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
 
     // Attach implemented interfaces. Each is a ClassRef into the interface's declaring assembly; the
     // virtual methods emitted below satisfy them by name+signature (implicit interface implementation).
-    for (iface_asm, iface_name) in &class.interfaces {
+    // A non-empty `generic_args` builds one external-type ClassRef per arg (the same construction as
+    // the interface reference itself, never derived from a Rust type) and attaches it as the
+    // interface ClassRef's own generic argument list.
+    for (iface_asm, iface_name, generic_args) in &class.interfaces {
         let iface_cls = ctx.alloc_string(iface_name.clone());
         let iface_asm_ref = if iface_asm.is_empty() {
             None
         } else {
             Some(ctx.alloc_string(iface_asm.clone()))
         };
-        let iface_ref = ctx.alloc_class_ref(ClassRef::new(iface_cls, iface_asm_ref, false, [].into()));
+        let generics: Vec<Type> = generic_args
+            .iter()
+            .map(|(gen_asm, gen_name, gen_is_valuetype)| {
+                // Well-known CLR primitives (Int32, Boolean, …) MUST use their dedicated
+                // ECMA-335 element-type code (`ELEMENT_TYPE_I4`, …) even as a GENERICINST
+                // argument, not the generic `VALUETYPE <TypeDefOrRef>` encoding a string-named
+                // external ClassRef produces by construction — see `well_known_primitive_type`'s
+                // doc for the empirical proof (a hand-assembled ilasm repro AND this exporter's
+                // own PE writer both independently produced spec-valid `VALUETYPE
+                // [System.Runtime]System.Int32` metadata that a real `csc` rejects with CS0648
+                // for a class implementing `IEquatable<int>`, while the IDENTICAL shape with a
+                // REFERENCE-typed argument like `System.String` compiles fine — isolating the
+                // failure to the value-type-primitive case specifically).
+                if let Some(tpe) = well_known_primitive_type(gen_name) {
+                    return tpe;
+                }
+                let gen_cls = ctx.alloc_string(gen_name.clone());
+                let gen_asm_ref = if gen_asm.is_empty() {
+                    None
+                } else {
+                    Some(ctx.alloc_string(gen_asm.clone()))
+                };
+                Type::ClassRef(ctx.alloc_class_ref(ClassRef::new(
+                    gen_cls,
+                    gen_asm_ref,
+                    *gen_is_valuetype,
+                    [].into(),
+                )))
+            })
+            .collect();
+        let iface_ref =
+            ctx.alloc_class_ref(ClassRef::new(iface_cls, iface_asm_ref, false, generics.into()));
         ctx.class_mut(class_idx).add_interface(iface_ref);
     }
 

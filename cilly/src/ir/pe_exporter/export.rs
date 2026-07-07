@@ -54,7 +54,7 @@
 
 use super::body::{self, AssembledBody};
 use super::pe::{self, PeOptions};
-use super::sig::{self, TypeDefOrRefResolver};
+use super::sig;
 use super::tables::{MetadataBuilder, Token};
 use crate::ir::class::StaticFieldDef;
 use crate::ir::{Assembly, ClassRef, Const};
@@ -202,7 +202,7 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
         // rejected this milestone's `MainModule` with `BadImageFormatException` during
         // development.
         let extends = if let Some(parent) = class_def.extends() {
-            decode_type_def_or_ref(mb.type_def_or_ref(parent, asm))
+            mb.class_ref_token(asm, parent)
         } else if class_def.is_valuetype() {
             system_runtime_type_ref(&mut mb, "System.ValueType")
         } else {
@@ -214,10 +214,19 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
         // one `simple_class_ref` per `class_def.implements()` entry). `add_type_def`'s `implements`
         // parameter already builds sorted-by-Class `InterfaceImpl` rows internally (tested:
         // `interface_impl_rows_are_emitted_sorted_by_class`), so insertion order here doesn't matter.
+        //
+        // `class_ref_token` (not the plain `type_def_or_ref` coded-index helper) so a GENERIC
+        // interface reference (e.g. `IEquatable<int>` — see `rustc_codegen_clr_add_generic_
+        // interface_impl`) resolves to a real `TypeSpec` carrying the full `GENERICINST` blob,
+        // not a bare `TypeRef` to the unbound open generic definition (`IEquatable`1`) — a class
+        // cannot implement/extend an unbound generic type; using the wrong one is a real
+        // TypeLoadException at .NET load time, not a silent miscompilation, but wrong either way.
+        // Every existing non-generic `extends=`/`implements=` caller is unaffected: `class_ref_token`
+        // already falls back to the identical `type_def_or_ref` path whenever `generics()` is empty.
         let implements: Vec<Token> = class_def
             .implements()
             .iter()
-            .map(|&iface| decode_type_def_or_ref(mb.type_def_or_ref(iface, asm)))
+            .map(|&iface| mb.class_ref_token(asm, iface))
             .collect();
         let has_explicit_layout = class_def.explict_size().is_some()
             || class_def.fields().iter().any(|(_, _, offset)| offset.is_some());
@@ -865,26 +874,14 @@ impl super::sig::TypeDefOrRefResolver for SignatureOnlyResolver<'_> {
     }
 }
 
-/// Decodes a `TypeDefOrRef` coded index back into a [`Token`] — the same decode
-/// `tables.rs`'s private `decode_type_def_or_ref` performs, needed here for `extends` resolution
-/// while walking class defs (kept as its own copy rather than exposed from `tables.rs`, since the
-/// encoding is a fixed 2-bit-tag scheme documented in both places by ECMA-335 §II.24.2.6 directly,
-/// not an implementation detail `export.rs` should reach into `tables.rs`'s row storage for).
-fn decode_type_def_or_ref(coded: u32) -> Token {
-    let tag = coded & 0x3;
-    let rid = coded >> 2;
-    let table = match tag {
-        0 => Token::TABLE_TYPE_DEF,
-        1 => Token::TABLE_TYPE_REF,
-        2 => Token::TABLE_TYPE_SPEC,
-        _ => unreachable!("2-bit tag"),
-    };
-    Token::new(table, rid)
-}
-
-/// Encodes a [`Token`] into a `TypeDefOrRef` coded index (§II.24.2.6) — the inverse of
-/// [`decode_type_def_or_ref`], needed by [`SignatureOnlyResolver`]. Same local-copy convention as
-/// that function (`tables.rs`'s private `encode_type_def_or_ref_token` is the canonical twin).
+/// Encodes a [`Token`] into a `TypeDefOrRef` coded index (§II.24.2.6), needed by
+/// [`SignatureOnlyResolver`] (`tables.rs`'s private `encode_type_def_or_ref_token` is the
+/// canonical twin; kept as its own copy rather than exposed from `tables.rs`, since the encoding
+/// is a fixed 2-bit-tag scheme documented in both places by ECMA-335 §II.24.2.6 directly, not an
+/// implementation detail `export.rs` should reach into `tables.rs`'s row storage for). The former
+/// decode-direction twin (`decode_type_def_or_ref`) was removed once `extends`/`implements`
+/// resolution switched to `MetadataBuilder::class_ref_token` (which returns an already-decoded
+/// `Token` directly, needed for the generic-interface case — see that fn's doc).
 fn encode_type_def_or_ref_token(token: Token) -> u32 {
     let tag = match token.table() {
         Token::TABLE_TYPE_DEF => 0,

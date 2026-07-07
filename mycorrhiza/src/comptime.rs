@@ -123,6 +123,31 @@ pub fn rustc_codegen_clr_add_interface_impl<
     diverge!()
 }
 
+/// Like [`rustc_codegen_clr_add_interface_impl`], but for a *generic* managed interface with one
+/// generic parameter (e.g. `IEnumerator<T>`, `IAsyncEnumerator<T>`, `IEquatable<T>`) bound to a
+/// concrete external type `[GENERIC_ASM]GENERIC_TYPE` — referenced exactly like `IFACE_ASM`/`IFACE`
+/// or `extends=`'s own superclass reference, not derived from any Rust type. `GENERIC_IS_VALUETYPE`
+/// must be `true` for a BCL value type argument (`System.Int32`, a user struct, …) and `false` for
+/// a reference type (`System.String`, a user class, …) — since the argument is a plain string name
+/// with no backing Rust type to infer this from (unlike ordinary field/method types, which get it
+/// from `get_type`), an unbound generic argument's CLASS/VALUETYPE encoding must be supplied
+/// explicitly or the emitted `GENERICINST` signature blob tags it wrong. Only single-generic-
+/// parameter interfaces are expressible this way today (the overwhelmingly common arity in the
+/// BCL); a multi-argument interface (e.g. `IDictionary<K,V>`) isn't. Call once per interface.
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_codegen_clr_add_generic_interface_impl<
+    const IFACE_ASM: &'static str,
+    const IFACE: &'static str,
+    const GENERIC_ASM: &'static str,
+    const GENERIC_TYPE: &'static str,
+    const GENERIC_IS_VALUETYPE: bool,
+>(
+    class: ClassDef,
+) -> ClassDef {
+    diverge!()
+}
+
 /// Finish the class: register it (and its methods / primary ctor) into the assembly.
 #[allow(unused_variables)]
 #[inline(never)]

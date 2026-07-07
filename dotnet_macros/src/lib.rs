@@ -30,6 +30,22 @@ fn split_dotnet_ref(spec: &str) -> (String, String) {
     (String::new(), spec.to_string())
 }
 
+/// Detects a single-generic-argument suffix on a `.NET` type reference — e.g.
+/// `"Ns.IFace<[Asm]Ns.Ty>"` splits into `("Ns.IFace", Some("[Asm]Ns.Ty"))` — so `implements = "…"`
+/// can name a generic interface (`IEnumerator<T>`, `IAsyncEnumerator<T>`, …) bound to a concrete
+/// external type, mirroring `rustc_codegen_clr_add_generic_interface_impl`'s own doc: the generic
+/// argument is a plain `[Asm]Ns.Type` reference like any other, never derived from a Rust type.
+/// Returns `(spec, None)` unchanged if there's no such suffix. Only a single generic argument is
+/// supported (multi-argument interfaces like `IDictionary<K,V>` aren't expressible this way today).
+fn split_generic_suffix(spec: &str) -> (String, Option<String>) {
+    if let Some(open) = spec.find('<') {
+        if let Some(inner) = spec.strip_suffix('>') {
+            return (spec[..open].to_string(), Some(inner[open + 1..].to_string()));
+        }
+    }
+    (spec.to_string(), None)
+}
+
 /// Reject a `"[Assembly]Namespace.Type"` spec with an opened-but-unclosed `[` — a common typo
 /// (`"[Foo"` instead of `"[Foo]Foo.Bar"`) that `split_dotnet_ref` would otherwise silently treat as
 /// a bracket-less type name, registering a garbage assembly reference with no diagnostic at all.
@@ -141,6 +157,27 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                     if let Err(e) = validate_dotnet_ref(spec, m.value.span()) {
                         return e.to_compile_error().into();
                     }
+                    let (_, generic) = split_generic_suffix(spec);
+                    match generic {
+                        Some(inner) => {
+                            if let Err(e) = validate_dotnet_ref(&inner, m.value.span()) {
+                                return e.to_compile_error().into();
+                            }
+                        }
+                        None if spec.contains('<') => {
+                            return syn::Error::new(
+                                m.value.span(),
+                                format!(
+                                    "malformed generic interface reference `{spec}`: a `<...>` \
+                                     generic argument must be closed with `>` at the end, e.g. \
+                                     `\"Ns.IFace<[Asm]Ns.Ty>\"`"
+                                ),
+                            )
+                            .to_compile_error()
+                            .into();
+                        }
+                        None => {}
+                    }
                     specs.push(spec.to_string());
                 }
                 implements = specs;
@@ -169,11 +206,33 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
     let interface_calls: Vec<_> = implements
         .iter()
         .map(|spec| {
-            let (asm, iface) = split_dotnet_ref(spec);
+            let (asm, iface_raw) = split_dotnet_ref(spec);
             let asm_lit = LitStr::new(&asm, span);
+            let (iface, generic) = split_generic_suffix(&iface_raw);
             let iface_lit = LitStr::new(&iface, span);
-            quote! {
-                let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_interface_impl::<#asm_lit, #iface_lit>(class);
+            match generic {
+                None => quote! {
+                    let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_interface_impl::<#asm_lit, #iface_lit>(class);
+                },
+                Some(generic_spec) => {
+                    // A leading `valuetype ` marker (mirroring IL's own keyword) says the generic
+                    // argument is a .NET value type (`System.Int32`, a user struct, …) rather than
+                    // the default reference type (`System.String`, a user class, …) — see
+                    // `rustc_codegen_clr_add_generic_interface_impl`'s doc for why this can't be
+                    // inferred: the argument is a plain string with no backing Rust type.
+                    let (generic_spec, is_valuetype) =
+                        match generic_spec.strip_prefix("valuetype ") {
+                            Some(rest) => (rest.to_string(), true),
+                            None => (generic_spec, false),
+                        };
+                    let (gen_asm, gen_name) = split_dotnet_ref(&generic_spec);
+                    let gen_asm_lit = LitStr::new(&gen_asm, span);
+                    let gen_name_lit = LitStr::new(&gen_name, span);
+                    let is_valuetype_lit = LitBool::new(is_valuetype, span);
+                    quote! {
+                        let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_generic_interface_impl::<#asm_lit, #iface_lit, #gen_asm_lit, #gen_name_lit, #is_valuetype_lit>(class);
+                    }
+                }
             }
         })
         .collect();
