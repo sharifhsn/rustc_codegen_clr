@@ -333,6 +333,28 @@ pub fn dotnet_interface(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let handle_ident = format_ident!("{}Handle", trait_name);
     let entry_mod = format_ident!("__dotnet_interface_{}", trait_name);
 
+    // Reject the trait-level shapes this doesn't model yet — LOUDLY, rather than silently dropping
+    // the type parameters / supertraits and emitting a subtly-wrong non-generic / base-less
+    // interface. (Generic interfaces `IFoo<T>` and interface inheritance `IDerived : IBase` are
+    // real .NET features, just not wired through `#[dotnet_interface]` — see the surface audit.)
+    if !input.generics.params.is_empty() {
+        return syn::Error::new(
+            input.generics.span(),
+            "#[dotnet_interface]: generic interfaces (`trait IFoo<T>`) are not supported yet",
+        )
+        .to_compile_error()
+        .into();
+    }
+    if !input.supertraits.is_empty() {
+        return syn::Error::new(
+            input.supertraits.span(),
+            "#[dotnet_interface]: interface inheritance (`trait IDerived: IBase`) is not \
+             supported yet",
+        )
+        .to_compile_error()
+        .into();
+    }
+
     // One signature-carrier fn + one `add_abstract_method_def` call per trait method.
     let mut carriers = Vec::new();
     let mut method_calls = Vec::new();
@@ -350,6 +372,15 @@ pub fn dotnet_interface(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 m.span(),
                 "#[dotnet_interface]: interface methods must have no body (default interface \
                  methods aren't supported)",
+            )
+            .to_compile_error()
+            .into();
+        }
+        if !m.sig.generics.params.is_empty() {
+            return syn::Error::new(
+                m.sig.generics.span(),
+                "#[dotnet_interface]: generic interface methods (`fn foo<T>(&self)`) are not \
+                 supported yet",
             )
             .to_compile_error()
             .into();
