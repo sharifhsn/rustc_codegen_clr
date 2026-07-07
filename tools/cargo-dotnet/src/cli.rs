@@ -53,6 +53,10 @@ pub enum Cmd {
     Setup(SetupArgs),
     /// Build a crate's cdylib and produce a NuGet .nupkg of its .NET assembly.
     Pack(PackArgs),
+    /// Publish a C# host project with NativeAOT, producing a standalone native binary
+    /// that has the referenced Rust `<RustCrate>` compiled in (`dotnet publish
+    /// -p:PublishAot=true`). See `docs/PERF_GUIDANCE.md` §5 for the proven recipe this wraps.
+    Publish(PublishArgs),
 }
 
 /// Shared args for `build` and `run`. Declaration ORDER matters: the modelled flags
@@ -218,4 +222,33 @@ pub struct PackArgs {
     /// `DOTNET_VERSION` + ilasm and the NuGet TFM (`lib/<tfm>/`), which must agree with the dll.
     #[arg(long, value_name = "8|9", default_value = "8", env = "DOTNET_VERSION")]
     pub dotnet: String,
+}
+
+#[derive(clap::Args)]
+pub struct PublishArgs {
+    /// A C# host project: either its directory (containing exactly one `.csproj`) or
+    /// the `.csproj` file itself. Default `.`. The project must `<Import>`
+    /// `RustDotnet.targets` and declare its `<RustCrate>` (see any `cargo_tests/cd_*/csharp`
+    /// project, or scaffold one with `cargo dotnet new --app`) — `dotnet publish` builds
+    /// the referenced Rust crate as part of the same invocation via that import.
+    pub path: Option<PathBuf>,
+
+    /// Debug configuration (default: Release — NativeAOT publishing a Debug build is
+    /// supported by the SDK but rarely what you want).
+    #[arg(long)]
+    pub debug: bool,
+
+    /// Target runtime identifier (default: the host RID, e.g. `osx-arm64`, `linux-x64`).
+    /// Pass an explicit RID to cross-publish (the SDK's usual cross-compilation caveats
+    /// apply — NativeAOT generally needs platform-matching build tools).
+    #[arg(long)]
+    pub rid: Option<String>,
+
+    /// Unfiltered `dotnet publish` output (prints the invoked command line too).
+    #[arg(short, long)]
+    pub verbose: bool,
+
+    /// Extra flags forwarded verbatim to `dotnet publish` (e.g. `-p:InvariantGlobalization=true`).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub extra: Vec<String>,
 }

@@ -23,6 +23,7 @@ mod pack;
 mod palinject;
 mod passthrough;
 mod pipeline;
+mod publish;
 mod run;
 mod rustflags;
 mod scaffold;
@@ -65,6 +66,7 @@ fn main() -> ExitCode {
         Cmd::Test(args) => test::run(args),
         Cmd::Setup(args) => setup::run(args),
         Cmd::Pack(args) => pack::run(args),
+        Cmd::Publish(args) => publish::run(args),
     };
 
     match result {
@@ -97,11 +99,11 @@ fn split_program_args(argv: &mut Vec<OsString>) -> Vec<String> {
     }
 }
 
-/// Thread the pre-split program args into the parsed Build/Run args. (Setup/Pack take
-/// no program args.)
+/// Thread the pre-split program args into the parsed Build/Run args. (Setup/Pack/Publish
+/// take no program args.)
 fn inject_prog_args(cmd: &mut Cmd, prog_args: Vec<String>) {
     match cmd {
         Cmd::Build(args) | Cmd::Run(args) | Cmd::Test(args) => args.prog_args = prog_args,
-        Cmd::New(_) | Cmd::Doctor(_) | Cmd::Setup(_) | Cmd::Pack(_) => {}
+        Cmd::New(_) | Cmd::Doctor(_) | Cmd::Setup(_) | Cmd::Pack(_) | Cmd::Publish(_) => {}
     }
 }

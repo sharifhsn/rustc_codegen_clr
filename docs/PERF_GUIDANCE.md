@@ -118,10 +118,12 @@ Roslyn `__StaticArrayInitTypeSize` idiom). Lesson for AOT debugging: FieldRVA fi
 their data size — the JIT is forgiving, ILC is not.
 
 Tradeoffs: AOT changes the deployment model (self-contained native binary, faster startup, no JIT
-warm-up, larger artifact, no runtime codegen). With the const-data gap closed, a first-class
-`cargo dotnet publish --aot` is now a tooling task (wrap the `PublishAot` host generation); full I/O-PAL
-AOT-compatibility for a standalone Rust *binary* (vs the C#-host-consumes-Rust-lib path proven here) is
-the remaining frontier.
+warm-up, larger artifact, no runtime codegen). With the const-data gap closed, this recipe is wired
+as a first-class subcommand: `cargo dotnet publish <csproj-dir>` runs `dotnet publish -c Release
+-r <host-rid> --self-contained -p:PublishAot=true` against an existing `RustDotnet.targets`-importing
+C# host project (see `cargo_tests/cd_interop/csharp` for the shape) — the Rust crate builds as part
+of that same `dotnet publish` invocation. Full I/O-PAL AOT-compatibility for a standalone Rust
+*binary* (vs the C#-host-consumes-Rust-lib path proven here) is the remaining frontier.
 
 ## 6. Size-classed pool allocator (`POOL_ALLOC=1`) — PARKED, negative result
 

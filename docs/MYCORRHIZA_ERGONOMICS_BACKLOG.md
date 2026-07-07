@@ -99,8 +99,15 @@ design decision before any code is written).
 
 ## 4. Tooling / CLI (`cargo dotnet`)
 
-- **`cargo dotnet publish --aot`** — AOT is codegen-proven end-to-end but not wired as a
-  subcommand; today it's a manual recipe. **Pure library/tooling.**
+- ~~**`cargo dotnet publish --aot`**~~ — **DONE.** `cargo dotnet publish <csproj-dir>` runs
+  `dotnet publish -c Release -r <host-rid> --self-contained -p:PublishAot=true` against an
+  existing C# host project (one that imports `RustDotnet.targets` and declares its
+  `<RustCrate>` — the same shape as `cargo_tests/cd_*/csharp`, or `cargo dotnet new --app`).
+  The Rust crate build happens as part of the SAME `dotnet publish` invocation via that
+  existing MSBuild import, so this genuinely wraps the proven manual recipe rather than
+  reimplementing it. Verified end-to-end against `cargo_tests/cd_interop/csharp`: the
+  produced standalone native binary (no .NET runtime needed) reproduces the JIT path's
+  6/6 output byte-for-byte.
 - ~~**Proc-macro error message quality**~~ — **DONE, with one residual gap** (`fe8b28e`). Added
   span-accurate `compile_error!`s for unknown/malformed `#[dotnet_class]`/`#[dotnet_entity]`
   attribute keys, verified via a new `trybuild`-based `negative_ui` test suite (5/5). **Residual,
