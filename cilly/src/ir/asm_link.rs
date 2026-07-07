@@ -625,7 +625,7 @@ impl Assembly {
             .iter()
             .map(|arg| arg.map(|arg| self.alloc_string(source[arg].as_ref())))
             .collect();
-        MethodDef::new(
+        let mut translated = MethodDef::new(
             *def.access(),
             class,
             name,
@@ -633,7 +633,13 @@ impl Assembly {
             def.kind(),
             method_impl,
             arg_names,
-        )
+        );
+        if let Some(base) = def.overrides() {
+            let base_ref = self.translate_method_ref(source, &source[base]);
+            let base_ref = self.alloc_methodref(base_ref);
+            translated = translated.with_override(base_ref);
+        }
+        translated
     }
     pub(crate) fn translate_class_def(&mut self, source: &Assembly, def: &ClassDef) -> ClassDef {
         let name = self.alloc_string(source[def.name()].as_ref());

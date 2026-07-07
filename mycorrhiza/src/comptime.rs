@@ -66,6 +66,31 @@ pub fn rustc_codegen_clr_add_method_def<
     diverge!()
 }
 
+/// Marks the virtual method most recently added via [`rustc_codegen_clr_add_method_def`] (in this
+/// same comptime entrypoint's call sequence — must come immediately after that call, before any
+/// other `add_method_def`) as an explicit ECMA-335 `.override` of `[BASE_ASM]BASE_TYPE`'s
+/// same-named virtual — e.g. `System.Object.ToString()` — instead of relying on implicit
+/// name+signature binding (the mechanism `implements=` uses for interfaces, which has no
+/// pre-existing vtable slot to land in and so doesn't need this). Overriding a *base class*
+/// virtual must land in that exact slot, which implicit binding can silently get wrong (creating
+/// a new slot — a shadow method — instead of an override) if the signature doesn't match exactly.
+///
+/// Scoped intentionally narrow (see `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md`'s Tier C finding #1
+/// for the full discussion): proven for exactly one well-known, parameterless, unsealed base
+/// virtual (`System.Object.ToString()`). General base-class wrapping (a framework type with a
+/// non-trivial constructor, protected members, `sealed` methods the CLR would reject at load
+/// time) is a separate, larger, unaddressed problem — do not assume this covers it.
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_codegen_clr_mark_last_method_override<
+    const BASE_ASM: &'static str,
+    const BASE_TYPE: &'static str,
+>(
+    class: ClassDef,
+) -> ClassDef {
+    diverge!()
+}
+
 /// Add a `static` method `FNAME` aliasing the ordinary Rust fn `fn_type`. Unlike
 /// [`rustc_codegen_clr_add_method_def`], a static method has no receiver — its parameter list is the
 /// Rust fn's signature verbatim — so a managed caller invokes it as `<Class>.FNAME(…)`.

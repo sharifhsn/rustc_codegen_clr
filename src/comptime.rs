@@ -61,6 +61,14 @@ struct PendingClass<'tcx> {
     /// Also synthesize a `set_<field>(value)` mutator per field, paired with the `read_<field>`
     /// accessor.
     has_field_setters: bool,
+    /// `managed_method_name -> (base_asm, base_type)` — an explicit ECMA-335 `.override` target
+    /// for a virtual method already registered in `methods` above (see
+    /// `rustc_codegen_clr_mark_last_method_override`'s doc). The base method's own name is
+    /// assumed identical to the overriding method's name (the only shape this narrow spike
+    /// supports — see `MethodDef::with_override`'s doc for the intentionally small scope), and
+    /// its signature is assumed identical too (definitionally true for a valid override), so no
+    /// separate base-signature needs to be carried here.
+    method_overrides: std::collections::HashMap<String, (String, String)>,
 }
 
 #[derive(Clone)]
@@ -160,6 +168,7 @@ pub fn interpret<'tcx>(
                         has_primary_ctor: false,
                         has_default_ctor: false,
                         has_field_setters: false,
+                        method_overrides: std::collections::HashMap::new(),
                     })
                 } else if fname.contains("rustc_codegen_clr_add_field_def") {
                     let src = operand_local(&args[0].node);
@@ -182,6 +191,26 @@ pub fn interpret<'tcx>(
                         .expect("comptime: invalid method target")
                         .expect("comptime: could not resolve method target instance");
                     class.methods.push((method_name, target));
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_mark_last_method_override") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    // Generics: <const BASE_ASM, const BASE_TYPE>. Must follow the
+                    // `add_method_def` call for the overriding method in the same entrypoint's
+                    // MIR sequence (see `rustc_codegen_clr_mark_last_method_override`'s doc) — the
+                    // base method's own name is assumed identical to the last-registered virtual
+                    // method's name, the only shape this narrow spike supports.
+                    let base_asm = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
+                    let base_type = garg_to_string(subst_ref[1], ctx.tcx()).replace("::", ".");
+                    let (method_name, _) = class
+                        .methods
+                        .last()
+                        .expect(
+                            "comptime: rustc_codegen_clr_mark_last_method_override called with no \
+                             preceding add_method_def in this entrypoint",
+                        )
+                        .clone();
+                    class.method_overrides.insert(method_name, (base_asm, base_type));
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_add_static_method_def") {
                     let src = operand_local(&args[0].node);
@@ -431,7 +460,7 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         // an exported surface with no internal caller, so (like `#[no_mangle]` exports) its methods must
         // be roots or the whole class would be culled. The DCE also follows the `AliasFor` edge to keep
         // the target Rust fn alive (see `Assembly::eliminate_dead_fns`).
-        let mdef = MethodDef::new(
+        let mut mdef = MethodDef::new(
             Access::Extern,
             class_idx,
             mname,
@@ -440,6 +469,20 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             MethodImpl::AliasFor(target_ref),
             arg_names,
         );
+        if let Some((base_asm, base_type)) = class.method_overrides.get(method_name) {
+            let base_cls = ctx.alloc_string(base_type.clone());
+            let base_asm_ref = if base_asm.is_empty() {
+                None
+            } else {
+                Some(ctx.alloc_string(base_asm.clone()))
+            };
+            let base_class_ref =
+                ctx.alloc_class_ref(ClassRef::new(base_cls, base_asm_ref, false, [].into()));
+            let base_mref =
+                MethodRef::new(base_class_ref, mdef.name(), sig, MethodKind::Virtual, [].into());
+            let base_mref = ctx.alloc_methodref(base_mref);
+            mdef = mdef.with_override(base_mref);
+        }
         ctx.new_method(mdef);
     }
 

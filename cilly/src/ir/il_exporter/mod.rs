@@ -483,6 +483,18 @@ impl ILExporter {
             out,
             ".method {vis} hidebysig {kind} {pinvoke} {ret} '{name}'({inputs}) cil managed {aggrinline}{preservesig}{{// Method ID {method_id:?}"
         )?;
+        // Explicit ECMA-335 `.override` (§II.15.4.2.3) for a base-class virtual override (see
+        // `MethodDef::with_override`'s doc — distinct from ordinary `implements=` interface
+        // satisfaction, which binds implicitly by name+signature with no `.override` at all).
+        // Unlike a `call`/`callvirt` operand, `.override`'s target is named WITHOUT a return
+        // type or parameter list — just `<class>::<name>` — matching real ilasm output for
+        // explicit interface/base-class overrides.
+        if let Some(base) = method.overrides() {
+            let base_ref = &asm_mut[base];
+            let base_class = self.partitioned_class(base_ref.class(), base_ref.name(), asm_mut);
+            let base_name = &asm_mut[base_ref.name()];
+            writeln!(out, ".override {base_class}::'{base_name}'")?;
+        }
         debug_assert!(ensure_unqiue.insert(method_id));
         let stack_size = match method.resolved_implementation(asm_mut) {
             MethodImpl::MethodBody { blocks, .. } => blocks

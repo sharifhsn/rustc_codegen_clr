@@ -171,6 +171,16 @@ pub struct MethodDef {
     arg_names: Vec<Option<Interned<IString>>>,
     kind: MethodKind,
     implementation: MethodImpl,
+    /// An explicit ECMA-335 `.override` (§II.15.4.2.3, a `MethodImpl` metadata row) naming the
+    /// *base class* virtual method this one overrides — distinct from ordinary `MethodKind::
+    /// Virtual` implicit binding (used for `implements=` interface satisfaction, which CLR binds
+    /// by name+signature alone with no explicit override needed). Overriding a base class's
+    /// virtual must land in that base's exact vtable slot, which implicit binding can't guarantee
+    /// (a name/signature mismatch would silently create a NEW slot — a shadow method — instead of
+    /// an override). `None` for every method that existed before this field: this is additive,
+    /// no existing caller sets it. See `MethodDef::with_override`'s doc for the scope this was
+    /// built for (a single well-known-base-virtual spike, not general base-class wrapping).
+    overrides: Option<Interned<MethodRef>>,
 }
 
 impl MethodDef {
@@ -239,7 +249,31 @@ impl MethodDef {
             arg_names,
             kind,
             implementation,
+            overrides: None,
         }
+    }
+
+    /// Marks this method as an explicit ECMA-335 `.override` of `base` — the *base class's*
+    /// virtual method this one overrides (not an interface member; use `implements=`/`ClassDef::
+    /// add_interface` for that, which needs no explicit override). `self.kind()` must already be
+    /// `MethodKind::Virtual` for this to mean anything to an exporter; this method doesn't
+    /// enforce that itself (a narrow builder, not a validated state machine) — callers are
+    /// expected to already be emitting a virtual method.
+    ///
+    /// Scoped intentionally narrow: proven end-to-end for exactly one well-known, parameterless,
+    /// unsealed base virtual (`System.Object.ToString()`, see `cargo_tests/cd_override`). Real
+    /// base-class wrapping (a framework type with a non-trivial constructor, protected members,
+    /// `sealed` methods the CLR would reject at load time) is a larger, separate problem — see
+    /// `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md`'s Tier C finding #1 for the full scope discussion.
+    #[must_use]
+    pub fn with_override(mut self, base: Interned<MethodRef>) -> Self {
+        self.overrides = Some(base);
+        self
+    }
+
+    #[must_use]
+    pub fn overrides(&self) -> Option<Interned<MethodRef>> {
+        self.overrides
     }
 
     #[must_use]

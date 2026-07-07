@@ -210,7 +210,48 @@ design decision before any code is written).
 
 ## Tier C research findings (2026-07-06, read-only, no code written)
 
-### 1. `#[dotnet_class]` virtual-method overrides
+### 1. `#[dotnet_class]` virtual-method overrides — SHIPPED (2026-07-07, IL-exporter-only)
+
+**Done.** Implemented exactly the "smallest safe first step" scoped below: `MethodDef` gained an
+`overrides: Option<Interned<MethodRef>>` field (`with_override`/`overrides`), `il_exporter` emits
+the ECMA-335 `.override [Asm]Ns.BaseType::'Method'` clause (§II.15.4.2.3) right after the `.method`
+header, and a new `#[dotnet_override("[Asm]Ns.BaseType")]` attribute on a `#[dotnet_methods]` fn
+drives it end-to-end via a new comptime intrinsic
+(`rustc_codegen_clr_mark_last_method_override<BASE_ASM, BASE_TYPE>`, must immediately follow the
+overriding method's own registration in the entrypoint's MIR). Proven by `cargo_tests/cd_override`
+(`Greeter` overrides `System.Object.ToString()`; the decisive check —
+`((object)g).ToString()` returning the override's text, not the BCL default — passes 5/5) under
+`DIRECT_PE=0` (`il_exporter`).
+
+**`DIRECT_PE=1` (the default, `pe_exporter`) does NOT support `.override` yet** — there is no
+`MethodImpl` metadata table in `pe_exporter/tables.rs` at all, comparable in size to the
+`InterfaceImpl` work done for generic-interface instantiation (finding #8 below). Silently dropping
+the override there would emit an ordinary new-slot virtual instead of a genuine override — a real
+miscompilation, not a degradation — so `pe_exporter::export_pe` now has a loud
+`assert!(method.overrides().is_none(), …)` guard that fails the build with a clear message pointing
+at `DIRECT_PE=0` as the workaround, instead of silently emitting wrong code. Confirmed by testing
+both paths: `DIRECT_PE=0` → 5/5; `DIRECT_PE=1` → build fails loudly (exit 101) instead of silently
+regressing to 1/5 (which is what happened before the guard was correctly wired — see the bug below).
+
+**Real bug found and fixed en route:** the guard above did not fire on the first attempt even though
+the produced DLL clearly lacked the override — root cause was `Assembly::translate_method_def` in
+`cilly/src/ir/asm_link.rs` (the cross-rlib merge pass the **linker** binary runs to combine every
+crate's serialized `.bc` into one assembly), which rebuilds each `MethodDef` field-by-field and had
+never been updated to carry the new `overrides` field through the merge — so it silently reset to
+`None` for every method crossing that pass, including ones defined in the crate being linked
+itself. Fixed by translating `def.overrides()` through `translate_method_ref` and re-attaching it
+with `.with_override(...)`. This is a durable gotcha for future `MethodDef`/`ClassDef` field
+additions: `asm_link.rs`'s `translate_*` functions are a second, easy-to-forget reconstruction site
+that field-by-field `MethodDef::new(...)` call sites (there are ~30 across the codebase) can also
+silently regress if a field is added but not threaded through — grep for `MethodDef::new(` before
+trusting any newly-added field survives a real multi-crate `cargo build`, not just a single-file
+comptime-derived one.
+
+**Remaining scope, not started:** general base-constructor-chaining validation and
+non-virtual/protected member forwarding (needed for real WPF/ASP.NET base-class wrapping) — the
+Tier C verdict below on those specific points still stands.
+
+**Original Tier C verdict, for context:**
 
 **Verdict: feasible, but a genuinely different (larger) mechanism than `implements=`, not an
 extension of it.** `implements=` works today because CLR *interface* binding matches virtual

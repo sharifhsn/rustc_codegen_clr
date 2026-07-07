@@ -329,7 +329,7 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(item as ItemImpl);
+    let mut input = parse_macro_input!(item as ItemImpl);
 
     // The class name is the impl's self type (a plain path like `Counter`); its handle alias is
     // `<Name>Handle` (what an instance method takes as its receiver).
@@ -360,7 +360,7 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // non-fn impl items are rejected loudly.
     let mut method_calls = Vec::new();
     let mut keep_anchors = Vec::new();
-    for it in &input.items {
+    for it in &mut input.items {
         let ImplItem::Fn(f) = it else {
             return syn::Error::new(
                 it.span(),
@@ -369,6 +369,33 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
             .to_compile_error()
             .into();
         };
+        // `#[dotnet_override("[Asm]Ns.BaseType")]` — an explicit ECMA-335 `.override` of that base
+        // type's same-named virtual (see `rustc_codegen_clr_mark_last_method_override`'s doc for
+        // the intentionally narrow scope). Stripped from the method before `#input` is re-emitted
+        // below, since it isn't a real Rust attribute the compiler would otherwise accept.
+        let mut override_base: Option<String> = None;
+        for attr in &f.attrs {
+            if attr.path().is_ident("dotnet_override") {
+                let spec = match attr.parse_args::<syn::LitStr>() {
+                    Ok(lit) => lit.value(),
+                    Err(_) => {
+                        return syn::Error::new(
+                            attr.span(),
+                            "#[dotnet_override(\"[Asm]Ns.BaseType\")]: expected a single string \
+                             literal argument naming the base type",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                };
+                if let Err(e) = validate_dotnet_ref(&spec, attr.span()) {
+                    return e.to_compile_error().into();
+                }
+                override_base = Some(spec);
+            }
+        }
+        f.attrs.retain(|a| !a.path().is_ident("dotnet_override"));
+
         let fn_ident = &f.sig.ident;
         let fname_lit = LitStr::new(&fn_ident.to_string(), fn_ident.span());
 
@@ -419,7 +446,27 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     "pub", "virtual", #fname_lit, _,
                 >(class, #self_ty::#fn_ident);
             });
+            if let Some(spec) = override_base {
+                let (base_asm, base_type) = split_dotnet_ref(&spec);
+                let base_asm_lit = LitStr::new(&base_asm, fn_ident.span());
+                let base_type_lit = LitStr::new(&base_type, fn_ident.span());
+                method_calls.push(quote! {
+                    let class = ::mycorrhiza::comptime::rustc_codegen_clr_mark_last_method_override::<
+                        #base_asm_lit, #base_type_lit,
+                    >(class);
+                });
+            }
         } else {
+            if let Some(spec) = override_base {
+                let _ = spec;
+                return syn::Error::new(
+                    fn_ident.span(),
+                    "#[dotnet_override]: only supported on an instance (virtual) method — a \
+                     static method has no vtable slot to override",
+                )
+                .to_compile_error()
+                .into();
+            }
             // Static method: signature verbatim, no receiver.
             method_calls.push(quote! {
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_static_method_def::<

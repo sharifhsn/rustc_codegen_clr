@@ -438,6 +438,21 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
             // static).
             let is_ctor = method.kind() == crate::ir::cilnode::MethodKind::Constructor
                 || name == crate::ir::asm::CCTOR;
+            // An explicit ECMA-335 `.override` (`MethodDef::with_override`, e.g. via
+            // `#[dotnet_override]`) needs a `MethodImpl` table row (§II.22.27) this writer does
+            // not implement yet — only `il_exporter` (the ilasm-text path, `DIRECT_PE=0`) does.
+            // Silently dropping it would emit an ordinary new-slot virtual instead of a genuine
+            // override — a real miscompilation (the whole POINT of an explicit override is
+            // landing in a specific vtable slot), not an acceptable degradation. Fail loudly
+            // instead: see docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md's Tier C finding #1 for the
+            // follow-up scope to add real MethodImpl support here.
+            assert!(
+                method.overrides().is_none(),
+                "method '{name}' has an explicit .override, but the direct PE writer \
+                 (DIRECT_PE=1, the default) does not yet support the MethodImpl metadata row \
+                 this needs -- set DIRECT_PE=0 to use il_exporter (ilasm text) instead, which \
+                 does. See docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md's Tier C finding #1."
+            );
             // Resolve `MethodImpl::AliasFor` chains before deciding P/Invoke-ness — mirrors
             // `il_exporter`'s `method.resolved_implementation(asm_mut)` (mod.rs:477) and
             // `body.rs`'s own `resolved_implementation` call (the single source of truth for
