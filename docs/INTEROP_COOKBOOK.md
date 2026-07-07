@@ -640,6 +640,88 @@ directly usable when a caller's entity type doesn't fit the `#[dotnet_entity]` s
 
 ---
 
+## 14. Catch a codegen bug in *your own* crate early (differential testing)
+
+This backend is still experimental — an untested corner of your own code can hit a genuine
+miscompilation, not just a bug in your logic. This project's own regression net is built entirely
+on one trick, and it works just as well for a downstream consumer's crate as it does for this repo:
+**run the same program twice — once as plain native Rust, once through the backend — and diff the
+output.** Native Rust is the oracle; if the two disagree, you've isolated a codegen bug down to
+"this program" instead of "somewhere in my app."
+
+You don't need a test framework for this, and you don't need anything from `mycorrhiza` — it works
+for any Rust code, because the point is to compare the *same source* under two different codegen
+backends. The minimal version is two shell invocations and a `diff`:
+
+```rust
+// src/main.rs — no mycorrhiza dependency needed; this is pure Rust.
+fn checksum(xs: &[i32]) -> i64 {
+    xs.iter().map(|&x| x as i64 * x as i64).sum()
+}
+
+fn main() {
+    let data = [1, 2, 3, 4, 5, -6, 7, i32::MAX, i32::MIN];
+    println!("checksum = {}", checksum(&data));
+    for x in data {
+        println!("{x} -> {}", (x as i64) * (x as i64));
+    }
+}
+```
+
+```sh
+# 1. Native oracle first (see the ordering note below for why).
+cargo run --release --quiet > native.txt
+
+# 2. Same crate, same source, run through the .NET backend instead.
+CARGO_DOTNET_BACKEND=native cargo dotnet run > dotnet_full.txt
+# `cargo dotnet run`'s own build banner ("==> cargo dotnet: building ...", "Compiling core v0.0.0",
+# "Finished ...") goes to the same stream as your program's stdout, so strip it before diffing:
+grep -v -E '^(==>|   Compiling|    Finished)' dotnet_full.txt > dotnet.txt
+
+# 3. Diff. No output = byte-identical = the backend agrees with native Rust on this program.
+diff native.txt dotnet.txt && echo "IDENTICAL"
+```
+
+A real divergence looks exactly like an ordinary `diff` mismatch — e.g. an integer-overflow or
+niche/discriminant bug might show up as:
+
+```
+1c1
+< checksum = 9223372032559808653
+---
+> checksum = -9223372036854775808
+```
+
+That's your signal to minimize the input further (binary-search which value in `data` triggers it)
+and file/investigate before the bug hides inside a bigger program.
+
+**Ordering matters — run the native build first.** `cargo dotnet build`/`run` writes a generated
+`.cargo/config.toml` into the crate directory (`build.target` pointed at the `.NET` custom target
+JSON, plus a build-std `[unstable]` section) so the *next* `cargo dotnet` invocation reuses it.
+If you run `cargo dotnet run` before a plain `cargo run` in the same crate directory, that leftover
+config silently redirects the plain `cargo run` at the `.NET` target too, and it will fail to build
+(`error: `.json` target specs require -Zjson-target-spec ...`) instead of giving you a native
+baseline. Either run native first each time, or `rm -rf .cargo/config.toml` before the native leg —
+scaffolded crates already gitignore that file for this reason (see `.gitignore` in any
+`cargo_tests/cd_*` crate).
+
+For a harness that runs this in a loop over many inputs instead of one fixed array, wrap the same
+two invocations in a small script that (a) generates/varies the input, (b) captures both outputs to
+temp files, (c) diffs, and (d) reports pass/fail per case — that's exactly the shape of this
+project's own internal regression tests (e.g. `cargo_tests/cd_bcl`, `cargo_tests/cd_collections`):
+a `main()` that runs many small checks and prints a `pass/total` summary, so a one-line diff against
+a previous run (or against the same program's native build) catches a regression immediately. If
+your crate already has `#[test]`s, the same idea works one level up: `cargo test` (native) vs.
+`cargo dotnet test` (backend) should report the same pass count — a new backend-only failure is a
+codegen bug, not a test bug.
+
+If you hit a real divergence and suspect it's a backend bug rather than your own code, re-run with
+`OPTIMIZE_CIL=0` (disables the CIL optimizer, so generated IL maps 1:1 back to MIR — useful for
+narrowing where the divergence is introduced) and open an issue with the minimized repro plus both
+captured outputs.
+
+---
+
 ## What is *not* here (so you don't reach for it)
 
 These are honest gaps as of this writing — the natural next recipes, but not yet backed by working code:

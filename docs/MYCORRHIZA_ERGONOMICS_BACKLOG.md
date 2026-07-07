@@ -132,9 +132,14 @@ design decision before any code is written).
 
 - **`cargo dotnet test` `#[should_panic]`/`#[ignore]`/filtering support** — confirm parity with
   what `cargo test` normally supports, not just the happy path. **Pure library/tooling.**
-- **A documented, reusable differential-testing pattern** for external consumers (we use "native
-  Rust as oracle vs `CARGO_DOTNET_BACKEND=native`" internally; not written up for outside use).
-  **Pure docs.**
+- ~~**A documented, reusable differential-testing pattern** for external consumers~~ — **DONE.**
+  New §14 in `INTEROP_COOKBOOK.md` ("Catch a codegen bug in your own crate early") writes up the
+  native-Rust-as-oracle vs. `CARGO_DOTNET_BACKEND=native` pattern for outside use: a minimal
+  standalone example (no `mycorrhiza` dependency), the exact two shell invocations, how to strip
+  `cargo dotnet run`'s build banner before diffing, a worked example of what a real divergence looks
+  like, the `.cargo/config.toml`-clobber ordering footgun (run native first), and the `cargo test`
+  vs. `cargo dotnet test` one-level-up analogue. Verified by actually running both legs on the
+  example and confirming byte-identical output.
 
 ---
 
