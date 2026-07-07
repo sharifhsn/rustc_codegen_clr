@@ -6,8 +6,12 @@ using System;
 // the Interface+Abstract TypeDef correctly.
 class Parrot : ISpeaker
 {
+    int vol = 11;
     public void Speak() => Console.WriteLine("Squawk!");
-    public int Volume() => 11;
+    public int Volume() => vol;
+    public int SetVolume(int level) { vol = level; return vol; }
+    public int Mix(int a, int b) => a + b;
+    public string Describe() => "a parrot at volume " + vol;
 }
 
 class Program
@@ -26,6 +30,13 @@ class Program
         ISpeaker s = new Parrot();
         s.Speak();
         Check("interface dispatch: Volume() == 11", s.Volume() == 11);
+        // Parameterized member + mutation, still through the interface reference.
+        Check("SetVolume(42) returns 42", s.SetVolume(42) == 42);
+        Check("Volume() reflects the mutation (== 42)", s.Volume() == 42);
+        // Multiple parameters.
+        Check("Mix(3, 4) == 7", s.Mix(3, 4) == 7);
+        // Managed (System.String) return type through the interface.
+        Check("Describe() returns the right string", s.Describe() == "a parrot at volume 42");
         Check("`is ISpeaker` holds on the implementor", s is ISpeaker);
 
         // Reflection: the type really is an interface, and Parrot reports implementing it.

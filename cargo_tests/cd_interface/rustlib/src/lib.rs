@@ -11,11 +11,19 @@
 #![allow(internal_features, incomplete_features, dead_code, non_snake_case)]
 
 use dotnet_macros::dotnet_interface;
+use mycorrhiza::system::MString;
 
 #[dotnet_interface]
 pub trait ISpeaker {
-    /// C#: `void Speak();`
+    /// C#: `void Speak();` — no-arg void member.
     fn Speak(&self);
-    /// C#: `int Volume();`
+    /// C#: `int Volume();` — value return, no args.
     fn Volume(&self) -> i32;
+    /// C#: `int SetVolume(int level);` — a PARAMETERIZED member with a `&mut self` receiver,
+    /// exercising the non-`self` params + return path (not just no-arg methods).
+    fn SetVolume(&mut self, level: i32) -> i32;
+    /// C#: `int Mix(int a, int b);` — MULTIPLE parameters.
+    fn Mix(&self, a: i32, b: i32) -> i32;
+    /// C#: `string Describe();` — a MANAGED (`System.String`) return type, not just primitives.
+    fn Describe(&self) -> MString;
 }
