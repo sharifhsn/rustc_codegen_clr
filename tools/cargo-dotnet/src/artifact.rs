@@ -101,6 +101,11 @@ pub fn locate(json: &str, ctx: &Context) -> Result<Artifact> {
         fs::copy(&so, &dll)
             .with_context(|| format!("cp {} -> {}", so.display(), dll.display()))?;
         eprintln!("== lib PE: {} -> {} (assembly '{stem}') ==", so.display(), dll.display());
+        // Best-effort sidecar XML doc for `#[dotnet_export]` doc comments (see `xmldoc.rs`); never
+        // fails the build over doc generation.
+        if let Err(e) = crate::xmldoc::generate(&ctx.crate_dir, &stem, &dll) {
+            eprintln!("== xml docs: skipped ({e}) ==");
+        }
         return Ok(Artifact::Library { so, dll, stem });
     }
 

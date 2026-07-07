@@ -29,6 +29,7 @@ mod rustflags;
 mod scaffold;
 mod setup;
 mod test;
+mod xmldoc;
 
 use std::ffi::OsString;
 use std::process::ExitCode;

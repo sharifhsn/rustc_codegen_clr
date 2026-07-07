@@ -576,6 +576,133 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
     ))
 }
 
+/// Scrape `#[doc = "..."]` attrs off an `ItemFn` (i.e. `/// ...` doc comments, which desugar to
+/// `#[doc = "..."]` before the proc-macro ever sees them) and join them into one doc-comment body,
+/// trimming the single leading space rustdoc conventionally inserts after `///`.
+fn scrape_doc_comment(attrs: &[syn::Attribute]) -> Option<String> {
+    let mut lines = Vec::new();
+    for attr in attrs {
+        if !attr.path().is_ident("doc") {
+            continue;
+        }
+        if let syn::Meta::NameValue(MetaNameValue {
+            value: syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }),
+            ..
+        }) = &attr.meta
+        {
+            let line = s.value();
+            lines.push(line.strip_prefix(' ').unwrap_or(&line).to_string());
+        }
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+/// Map a `#[dotnet_export]`-supported Rust parameter/return type to the exact CLR metadata type
+/// name ECMA-334 member-ID strings use, or `None` if `ty` isn't one of the types that surface
+/// participates in (return `None` rather than guess — an XML-doc entry with a wrong parameter type
+/// silently fails to match at doc-lookup time, which is worse than skipping it).
+///
+/// `&str`/`String` are supported params of `dotnet_export` (marshalled to `MString`, which is a
+/// managed handle to a real `System.String`); everything else in the supported surface is one of
+/// the passthrough primitives, each of which XML-doc member-ID syntax spells with its full CLR
+/// name, not its C#/Rust keyword (`System.Int32`, not `int`/`i32`).
+fn clr_member_id_type_name(ty: &Type) -> Option<&'static str> {
+    if let Type::Reference(r) = ty {
+        if r.mutability.is_none() {
+            if let Type::Path(tp) = &*r.elem {
+                if tp.qself.is_none() && tp.path.is_ident("str") {
+                    return Some("System.String");
+                }
+            }
+        }
+        return None;
+    }
+    let name = simple_path_ident(ty)?;
+    Some(match name.as_str() {
+        "String" => "System.String",
+        "bool" => "System.Boolean",
+        "i8" => "System.SByte",
+        "i16" => "System.Int16",
+        "i32" => "System.Int32",
+        "i64" => "System.Int64",
+        "i128" => "System.Int128",
+        "u8" => "System.Byte",
+        "u16" => "System.UInt16",
+        "u32" => "System.UInt32",
+        "u64" => "System.UInt64",
+        "u128" => "System.UInt128",
+        "isize" => "System.IntPtr",
+        "usize" => "System.UIntPtr",
+        "f32" => "System.Single",
+        "f64" => "System.Double",
+        _ => return None,
+    })
+}
+
+/// Append one XML-doc entry for a `#[dotnet_export]`'d fn to a per-crate sidecar-doc scratch file,
+/// so `cargo-dotnet`'s packaging step can later assemble the standard ECMA-334 `<AssemblyName>.xml`
+/// doc file next to the built DLL. See `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md` ("Tier C research
+/// findings", item 4) for the design this implements.
+///
+/// The entry is keyed by the exact ECMA-334 member-ID this fn will resolve to at the C# call site:
+/// `M:MainModule.<fn_name>(<ParamType1>,<ParamType2>,...)` — `#[dotnet_export]`'d free functions are
+/// always emitted as public static methods directly on the assembly's `MainModule` class (see the
+/// `dotnet_export` doc comment above), with NO namespace/enclosing-type nesting, so this qualified
+/// name is exact for the whole supported parameter/return surface today (the seam only marshals
+/// short, non-generic, non-nested types) and needs no FNV-hash-shortening logic — that mechanism
+/// (`cilly::dotnet_class_name`) only triggers for *type* names exceeding .NET's 1023-char metadata
+/// limit, which a hand-written fn name can't realistically hit. If `MainModule` is ever partitioned
+/// across per-module classes for size (see `cilly/src/ir/il_exporter/partition.rs`), or exported fns
+/// gain a namespace/nesting option, this qualified-name derivation will need to track that — noted
+/// here as the known limitation for this first slice.
+///
+/// One line of newline-delimited JSON per entry (robust against arbitrary doc-comment text, e.g.
+/// embedded quotes/newlines) is appended to
+/// `<CARGO_MANIFEST_DIR>/target/dotnet_xmldoc/<crate_name>.xmldoc.jsonl`. The proc-macro runs once
+/// per fn at the consumer's compile time, so appending (not overwriting) is required; cargo-dotnet's
+/// build stage clears stale entries by deleting the file up front (see `xmldoc::collect`).
+fn emit_xmldoc_entry(fn_name: &syn::Ident, params: &[String], doc: &str) {
+    let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") else { return };
+    let Ok(crate_name) = std::env::var("CARGO_PKG_NAME") else { return };
+    let member_id = format!("M:MainModule.{}({})", fn_name, params.join(","));
+
+    let dir = std::path::Path::new(&manifest_dir).join("target").join("dotnet_xmldoc");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let file_path = dir.join(format!("{crate_name}.xmldoc.jsonl"));
+    let entry = serde_json_line(&member_id, doc);
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&file_path) {
+        let _ = writeln!(f, "{entry}");
+    }
+}
+
+/// Hand-rolled minimal JSON-object-line encoder (`{"member":"...","summary":"..."}`) so this crate
+/// doesn't need a `serde_json` dependency just for two escaped string fields.
+fn serde_json_line(member: &str, summary: &str) -> String {
+    fn escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+    format!("{{\"member\":\"{}\",\"summary\":\"{}\"}}", escape(member), escape(summary))
+}
+
 /// `#[dotnet_export]` on a free function — makes it callable from C# as a plain, typed method on
 /// `MainModule`, with no hand-written `(ptr, len)` buffer dance.
 ///
@@ -635,6 +762,7 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut seam_params = Vec::new(); // `#pname: #seam_ty` tokens for the shim signature.
     let mut pre_call = Vec::new(); // in-conversion statements (seam value → idiomatic Rust value).
     let mut call_args = Vec::new(); // expressions passed to the inner fn.
+    let mut doc_param_types = Vec::new(); // CLR type names, for the XML-doc member-ID (see below).
     for (idx, arg) in sig.inputs.iter().enumerate() {
         let pat_ty = match arg {
             FnArg::Receiver(r) => {
@@ -658,6 +786,9 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     .into();
             }
         };
+        if let Some(clr_name) = clr_member_id_type_name(&pat_ty.ty) {
+            doc_param_types.push(clr_name.to_string());
+        }
         let seam_ty = &marshal.seam_ty;
         seam_params.push(quote! { #pname: #seam_ty });
         match marshal.to_rust {
@@ -673,6 +804,13 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
             None => call_args.push(quote! { #pname }),
         }
+    }
+
+    // Scrape `#[doc]` attrs and, if present, record an XML-doc sidecar entry keyed by the exact
+    // ECMA-334 member-ID this fn resolves to as a `MainModule` static method. Best-effort: any
+    // failure to write is silently ignored (never fails the actual compile over doc generation).
+    if let Some(doc) = scrape_doc_comment(&func.attrs) {
+        emit_xmldoc_entry(&fn_name, &doc_param_types, &doc);
     }
 
     // Marshal the return type.
