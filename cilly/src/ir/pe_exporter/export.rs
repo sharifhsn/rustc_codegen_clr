@@ -56,8 +56,9 @@ use super::body::{self, AssembledBody};
 use super::pe::{self, PeOptions};
 use super::sig;
 use super::tables::{MetadataBuilder, Token};
+use super::tables::TokenSink;
 use crate::ir::class::StaticFieldDef;
-use crate::ir::{Assembly, ClassRef, Const};
+use crate::ir::{Assembly, ClassRef, Const, MethodDefIdx};
 use crate::Interned;
 
 // `pe::SECTION_ALIGNMENT`/`pe::CLI_HEADER_CB` (both `pub(super)`) are used directly below rather
@@ -193,53 +194,24 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
         std::collections::HashMap::with_capacity(class_def_ids.len());
     for &class_def_id in &class_def_ids {
         let class_def = asm[class_def_id].clone();
-        // A genuine ECMA-335 `interface` `TypeDef` (`ClassDef::with_interface`, e.g. from a
-        // Rust-trait-as-C#-interface spike) needs `Interface`+`Abstract` `TypeAttributes` and NO
-        // `Extends` row at all (§II.10.1.3) — this writer has neither: the code just below always
-        // computes and stamps a real `extends` (falling back to `System.Object`), which would
-        // silently emit an ORDINARY concrete class instead of an interface, with its abstract
-        // members' `MethodImpl::Missing` placeholder becoming a real throwing body (see
-        // `MethodDef::is_abstract`'s doc — that placeholder is only inert because `il_exporter`
-        // checks `is_abstract()` before ever reading it; this writer does not). Fail loudly instead
-        // of emitting a fake, wrong-shaped class — mirrors the `method.overrides()` guard below for
-        // the same "no PE-writer support yet" reason. See `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md`'s
-        // Tier C finding #2.
-        assert!(
-            !class_def.is_interface(),
-            "class '{}' is a genuine interface (ClassDef::with_interface), but the direct PE \
-             writer (DIRECT_PE=1, the default) does not yet support interface TypeDefs -- set \
-             DIRECT_PE=0 to use il_exporter (ilasm text) instead, which does. See \
-             docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md's Tier C finding #2.",
-            &asm[class_def.name()]
-        );
-        // `ClassDef::add_event` (§II.22.12/13/28's EventMap/Event/MethodSemantics rows) has no
-        // support in this writer at all — no code path here even reads `class_def.events()`, so
-        // silently dropping it would emit an ordinary class with plain public `add_`/`remove_`
-        // methods and no `event` C# can subscribe to with `+=`/`-=`. Same "no PE-writer support
-        // yet" reasoning as the two guards above. See docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md's
-        // Tier C finding #5.
-        assert!(
-            class_def.events().is_empty(),
-            "class '{}' declares a .NET event (ClassDef::add_event), but the direct PE writer \
-             (DIRECT_PE=1, the default) does not yet support Event/EventMap/MethodSemantics \
-             metadata rows -- set DIRECT_PE=0 to use il_exporter (ilasm text) instead, which \
-             does. See docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md's Tier C finding #5.",
-            &asm[class_def.name()]
-        );
-        // Every class needs an `Extends` row: `il_exporter::export_to_write` never leaves it NIL
-        // — an explicit `extends` clause wins, otherwise `[System.Runtime]System.ValueType` for a
-        // valuetype or `[System.Runtime]System.Object` for a reference type (mirrors that
-        // function's `let extends = if let Some(parent) = … { … } else if is_valuetype { … } else
-        // { … }` exactly). A NIL `Extends` is a real defect, not a harmless default: it makes the
-        // CLR loader treat the TypeDef as an interface-shaped type with no concrete base, which
-        // rejected this milestone's `MainModule` with `BadImageFormatException` during
-        // development.
-        let extends = if let Some(parent) = class_def.extends() {
-            mb.class_ref_token(asm, parent)
+        // A genuine ECMA-335 `interface` `TypeDef` (`ClassDef::with_interface`) must have NO
+        // `Extends` row (§II.10.1.3 — a non-NIL extends on an `Interface`-flagged type is a
+        // load-time rejection) and carry `Interface`+`Abstract` flags, stamped by
+        // `mark_type_def_interface` after `add_type_def` below. An ordinary class needs an
+        // `Extends` row: `il_exporter::export_to_write` never leaves it NIL — an explicit `extends`
+        // clause wins, otherwise `[System.Runtime]System.ValueType` for a valuetype or
+        // `[System.Runtime]System.Object` for a reference type (mirrors that function's `let
+        // extends = if let Some(parent) = … { … } else if is_valuetype { … } else { … }` exactly).
+        // A NIL `Extends` on an ORDINARY class is a real defect (`BadImageFormatException` — the
+        // loader treats it as an interface-shaped type with no concrete base).
+        let extends = if class_def.is_interface() {
+            None
+        } else if let Some(parent) = class_def.extends() {
+            Some(mb.class_ref_token(asm, parent))
         } else if class_def.is_valuetype() {
-            system_runtime_type_ref(&mut mb, "System.ValueType")
+            Some(system_runtime_type_ref(&mut mb, "System.ValueType"))
         } else {
-            system_runtime_type_ref(&mut mb, "System.Object")
+            Some(system_runtime_type_ref(&mut mb, "System.Object"))
         };
         // `implements I1, I2, …` (§II.22.23 `InterfaceImpl`): resolved the exact same way as
         // `extends` just above (each interface is itself a `ClassRef`, defined-in-assembly or
@@ -281,7 +253,10 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
         // `MetadataBuilder::find_type_def`'s doc for the paired lookup-side fix this requires.
         let raw_name = asm[class_def.name()].to_string();
         let (namespace, name) = super::tables::split_namespace(&raw_name);
-        let tok = mb.add_type_def(namespace, name, class_def.is_valuetype(), Some(extends), pack, size, &implements);
+        let tok = mb.add_type_def(namespace, name, class_def.is_valuetype(), extends, pack, size, &implements);
+        if class_def.is_interface() {
+            mb.mark_type_def_interface(tok);
+        }
         type_def_token_of.insert(class_def_id, tok);
     }
 
@@ -472,34 +447,16 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
             let is_ctor = method.kind() == crate::ir::cilnode::MethodKind::Constructor
                 || name == crate::ir::asm::CCTOR;
             // An explicit ECMA-335 `.override` (`MethodDef::with_override`, e.g. via
-            // `#[dotnet_override]`) needs a `MethodImpl` table row (§II.22.27) this writer does
-            // not implement yet — only `il_exporter` (the ilasm-text path, `DIRECT_PE=0`) does.
-            // Silently dropping it would emit an ordinary new-slot virtual instead of a genuine
-            // override — a real miscompilation (the whole POINT of an explicit override is
-            // landing in a specific vtable slot), not an acceptable degradation. Fail loudly
-            // instead: see docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md's Tier C finding #1 for the
-            // follow-up scope to add real MethodImpl support here.
-            assert!(
-                method.overrides().is_none(),
-                "method '{name}' has an explicit .override, but the direct PE writer \
-                 (DIRECT_PE=1, the default) does not yet support the MethodImpl metadata row \
-                 this needs -- set DIRECT_PE=0 to use il_exporter (ilasm text) instead, which \
-                 does. See docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md's Tier C finding #1."
-            );
-            // An abstract member (`MethodDef::is_abstract`, e.g. an interface method) has RVA=0
-            // and no real body — `implementation()` is only an inert `MethodImpl::Missing`
-            // placeholder for these (see that field's doc). This writer has no Abstract
-            // `MethodAttributes`/RVA=0 support and would read straight through to the placeholder,
-            // emitting a concrete method that THROWS at runtime instead of a genuine abstract slot
-            // — the same class of silent miscompilation the `overrides` guard above exists to
-            // prevent. See docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md's Tier C finding #2.
-            assert!(
-                !method.is_abstract(),
-                "method '{name}' is abstract (MethodDef::with_abstract), but the direct PE \
-                 writer (DIRECT_PE=1, the default) does not yet support Abstract/RVA=0 method \
-                 rows -- set DIRECT_PE=0 to use il_exporter (ilasm text) instead, which does. \
-                 See docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md's Tier C finding #2."
-            );
+            // `#[dotnet_override]`) is emitted as a `MethodImpl` row (§II.22.27) after this
+            // method's own `MethodDef` token exists — captured here, added below once `add_method`
+            // has returned the overriding method's token. Distinct from ordinary name+signature
+            // virtual binding: it lands the body in the base's exact vtable slot.
+            let override_base = method.overrides();
+            // An abstract member (`MethodDef::is_abstract`, e.g. an interface method) is emitted
+            // with the `Abstract` flag (0x400) and RVA=0 (no body), applied below after
+            // `add_method`. Its `implementation()` is only an inert `MethodImpl::Missing`
+            // placeholder (see that field's doc) which Pass 4 must NEVER assemble a body from.
+            let is_abstract = method.is_abstract();
             // Resolve `MethodImpl::AliasFor` chains before deciding P/Invoke-ness — mirrors
             // `il_exporter`'s `method.resolved_implementation(asm_mut)` (mod.rs:477) and
             // `body.rs`'s own `resolved_implementation` call (the single source of truth for
@@ -596,6 +553,21 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
                 aggressive_inline,
             );
             mb.register_method_def(method_id, tok);
+            // Abstract interface member (§II.22.26): stamp `Abstract`, leave RVA=0 (Pass 4 skips
+            // its body). `add_method` already set `Virtual | NewSlot` since `is_virtual` is true.
+            if is_abstract {
+                mb.mark_method_abstract(tok);
+            }
+            // Explicit `.override` (`MethodDef::with_override`): reuse the base's vtable slot (drop
+            // `NewSlot`, matching `il_exporter`'s `virtual instance` with no `newslot`) and bind
+            // this body to the base declaration via a `MethodImpl` row (§II.22.27).
+            if let Some(base_mref) = override_base {
+                mb.mark_method_reuse_slot(tok);
+                let class_tok = type_def_token_of[&class_def_id];
+                let generics = asm[base_mref].generics().to_vec();
+                let decl_tok = mb.method_token(asm, MethodDefIdx::from_raw(base_mref), &generics);
+                mb.add_method_impl(class_tok, tok, decl_tok);
+            }
             if name == "entrypoint" {
                 entry_point_token = Some(tok);
             }
@@ -605,6 +577,30 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
         mb.set_entry_point(tok);
     }
 
+    // --- Pass 3.5: `.NET` events (§II.22.12/13/28 EventMap/Event/MethodSemantics). Emitted after
+    // Pass 3 because an event's `add`/`remove` accessors are ordinary `MethodDef`s that must
+    // already be registered (they were, in Pass 3's per-class method loop). Iterated in the SAME
+    // `class_def_ids` order so each class's `EventMap` run-start is coherent (`add_event`'s doc).
+    // Neither table touches the `Field`/`Method` run-start cursors, so this is safe here.
+    for &class_def_id in &class_def_ids {
+        let class_def = asm[class_def_id].clone();
+        if class_def.events().is_empty() {
+            continue;
+        }
+        let class_tok = type_def_token_of[&class_def_id];
+        for ev in class_def.events() {
+            let name = asm[ev.name()].to_string();
+            let delegate_tok = mb.type_token(asm, ev.delegate());
+            let add_tok = mb
+                .method_def_token(MethodDefIdx::from_raw(ev.add()))
+                .expect("event add accessor must be a MethodDef registered in pass 3");
+            let remove_tok = mb
+                .method_def_token(MethodDefIdx::from_raw(ev.remove()))
+                .expect("event remove accessor must be a MethodDef registered in pass 3");
+            mb.add_event(class_tok, &name, delegate_tok, add_tok, remove_tok);
+        }
+    }
+
     // --- Pass 4: assemble every method body now that every method this milestone's inventory
     // subset can reference has a resolvable token (passes 1-3 already added every in-assembly
     // row a `TokenSink` query could need).
@@ -612,6 +608,14 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
     for &class_def_id in &class_def_ids {
         let class_def = asm[class_def_id].clone();
         for &method_id in class_def.methods() {
+            // An abstract member (interface method) has RVA=0 and NO body — its
+            // `implementation()` is only an inert `MethodImpl::Missing` placeholder (Pass 3 already
+            // stamped the `Abstract` flag). Assembling a body here would give it a nonzero RVA,
+            // the exact `TypeLoadException: Abstract method with non-zero RVA` shape §II.22.26
+            // forbids. Skip it — its `MethodDef.RVA` stays the 0 `add_method` initialized.
+            if asm[method_id].is_abstract() {
+                continue;
+            }
             let tok = mb
                 .method_def_token(method_id)
                 .expect("every method was registered in pass 3");

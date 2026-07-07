@@ -42,6 +42,10 @@ impl Token {
     pub const TABLE_CLASS_LAYOUT: u32 = 0x0F;
     pub const TABLE_FIELD_LAYOUT: u32 = 0x10;
     pub const TABLE_STAND_ALONE_SIG: u32 = 0x11;
+    pub const TABLE_EVENT_MAP: u32 = 0x12;
+    pub const TABLE_EVENT: u32 = 0x14;
+    pub const TABLE_METHOD_SEMANTICS: u32 = 0x18;
+    pub const TABLE_METHOD_IMPL: u32 = 0x19;
     pub const TABLE_MODULE_REF: u32 = 0x1A;
     pub const TABLE_TYPE_SPEC: u32 = 0x1B;
     pub const TABLE_IMPL_MAP: u32 = 0x1C;
@@ -244,6 +248,51 @@ struct StandAloneSigRow {
     signature: u32,
 }
 
+/// §II.22.27 `MethodImpl` — an explicit body-overrides-declaration binding (`.override` in ilasm),
+/// distinct from ordinary name+signature virtual binding. Sorted by `class`.
+struct MethodImplRow {
+    /// `Class` — simple `TypeDef` index of the class declaring the override.
+    class: u32,
+    /// `MethodBody` — `MethodDefOrRef` coded index of the overriding method (a `MethodDef` in
+    /// `class`).
+    method_body: u32,
+    /// `MethodDeclaration` — `MethodDefOrRef` coded index of the base method being overridden
+    /// (usually a `MemberRef` to an external base type's virtual).
+    method_declaration: u32,
+}
+
+/// §II.22.12 `EventMap` — one row per type that declares events, pointing at that type's first
+/// `Event` row (a table-position "run-start", exactly like `TypeDef.MethodList`). NOT sorted.
+struct EventMapRow {
+    /// `Parent` — simple `TypeDef` index of the event-declaring type.
+    parent: u32,
+    /// `EventList` — simple `Event` index of the first event this type owns (run continues to the
+    /// next `EventMap`'s `EventList`, or the end of the `Event` table).
+    event_list: u32,
+}
+
+/// §II.22.13 `Event` — a single event's name + delegate type. The `add`/`remove` accessor linkage
+/// lives in `MethodSemantics`, not here.
+struct EventRow {
+    /// `EventFlags` (§II.23.1.4) — 0 for an ordinary event (no `SpecialName`/`RTSpecialName`).
+    event_flags: u16,
+    /// `Name` — `#Strings` offset.
+    name: u32,
+    /// `EventType` — `TypeDefOrRef` coded index of the delegate type subscribers must match.
+    event_type: u32,
+}
+
+/// §II.22.28 `MethodSemantics` — links a `MethodDef` (an `add_`/`remove_`/getter/setter body) to
+/// the `Event`/`Property` it services. Sorted by `association`.
+struct MethodSemanticsRow {
+    /// `Semantics` (§II.23.1.12) — 0x8 `AddOn`, 0x10 `RemoveOn`, 0x20 `Fire`, 0x4 `Other`.
+    semantics: u16,
+    /// `Method` — simple `MethodDef` index of the accessor.
+    method: u32,
+    /// `Association` — `HasSemantics` coded index (0 = `Event`, 1 = `Property`).
+    association: u32,
+}
+
 /// Deferred `FieldRVA` bookkeeping: the row itself can't be built until the layout pass
 /// (`pe.rs`) hands back a real RVA for the queued blob, so `add_static_field` records enough to
 /// materialize it later via [`MetadataBuilder::set_field_rva`].
@@ -281,6 +330,10 @@ pub struct MetadataBuilder {
     assembly: Vec<AssemblyRow>,
     assembly_ref: Vec<AssemblyRefRow>,
     method_spec: Vec<MethodSpecRow>,
+    method_impl: Vec<MethodImplRow>,
+    event_map: Vec<EventMapRow>,
+    event: Vec<EventRow>,
+    method_semantics: Vec<MethodSemanticsRow>,
 
     /// Interned `TypeRef` rows, keyed on (resolution_scope token bits, namespace, name) so
     /// repeated references to the same external type share one row.
@@ -346,6 +399,10 @@ const SORTED_TABLES: &[u32] = &[
     Token::TABLE_FIELD_LAYOUT,
     Token::TABLE_FIELD_RVA,
     Token::TABLE_IMPL_MAP,
+    // §II.24.2.6: MethodSemantics is sorted by Association, MethodImpl by Class. EventMap and
+    // Event are NOT sorted tables (and are absent from this list on purpose).
+    Token::TABLE_METHOD_SEMANTICS,
+    Token::TABLE_METHOD_IMPL,
 ];
 
 impl MetadataBuilder {
@@ -923,6 +980,97 @@ impl MetadataBuilder {
         Token::new(Token::TABLE_INTERFACE_IMPL, rid)
     }
 
+    /// Adds a `MethodImpl` row (§II.22.27) — an explicit body-overrides-declaration binding, the
+    /// metadata `.override` in ilasm produces. `class` is the overriding class's `TypeDef`;
+    /// `body` is the overriding method (a `MethodDef` in that class); `declaration` is the base
+    /// method being overridden (a `MethodDef` or `MemberRef` — both are `MethodDefOrRef` members).
+    /// Retrofits the given `TypeDef` (must be the token `add_type_def` just returned) into a
+    /// genuine ECMA-335 `interface` (§II.23.1.15): sets `Interface` (0x20) + `Abstract` (0x80),
+    /// clears `Sealed` (an interface is never sealed), and NILs its `Extends` (interfaces have no
+    /// base type — a non-NIL extends on an `Interface`-flagged type is a load-time rejection). The
+    /// caller must have passed `extends = None` to `add_type_def`; this only enforces/asserts it.
+    pub fn mark_type_def_interface(&mut self, tok: Token) {
+        debug_assert_eq!(tok.table(), Token::TABLE_TYPE_DEF);
+        let row = &mut self.type_def[tok.rid() as usize - 1];
+        row.flags |= 0x20 | 0x80; // Interface | Abstract
+        row.flags &= !0x100; // never Sealed
+        row.extends = 0; // NIL
+    }
+
+    /// Clears the `NewSlot` (0x0100) flag on the given `MethodDef` (must be the token `add_method`
+    /// just returned). An explicit base-class override REUSES the inherited vtable slot rather than
+    /// allocating a new one — matching `il_exporter`'s `virtual instance` (no `newslot` keyword)
+    /// for `#[dotnet_override]` methods. Paired with a `MethodImpl` row (`add_method_impl`).
+    pub fn mark_method_reuse_slot(&mut self, method: Token) {
+        debug_assert_eq!(method.table(), Token::TABLE_METHOD_DEF);
+        self.method_def[method.rid() as usize - 1].flags &= !0x0100;
+    }
+
+    /// Marks the given `MethodDef` `Abstract` (0x0400) — no body, `RVA` stays 0 (§II.22.26). Used
+    /// for interface members (see `il_exporter`'s `newslot abstract virtual`). The method must have
+    /// been added with `is_virtual = true` (so it already carries `Virtual | NewSlot`) and must
+    /// never have a body assembled for it (see `export_pe`'s Pass 4 skip).
+    pub fn mark_method_abstract(&mut self, method: Token) {
+        debug_assert_eq!(method.table(), Token::TABLE_METHOD_DEF);
+        self.method_def[method.rid() as usize - 1].flags |= 0x0400;
+    }
+
+    pub fn add_method_impl(&mut self, class: Token, body: Token, declaration: Token) {
+        assert_eq!(class.table(), Token::TABLE_TYPE_DEF, "MethodImpl.Class must be a TypeDef");
+        self.method_impl.push(MethodImplRow {
+            class: class.rid(),
+            method_body: encode_method_def_or_ref(body),
+            method_declaration: encode_method_def_or_ref(declaration),
+        });
+    }
+
+    /// Adds one event (§II.22.13 `Event` + §II.22.28 `MethodSemantics` for its accessors) to the
+    /// most-recently-opened `TypeDef`'s event run. The FIRST event added to a given class also
+    /// creates that class's single §II.22.12 `EventMap` row (run-start into the `Event` table) —
+    /// so all of a class's events must be added contiguously, before any other class's, exactly
+    /// like the `Field`/`Method` run-start discipline (see [`MetadataBuilder::add_field`]).
+    ///
+    /// `class` is the declaring `TypeDef`; `name` the event name; `event_type` the delegate's
+    /// `TypeDefOrRef` token; `add`/`remove` the accessor `MethodDef` tokens (already added via
+    /// [`MetadataBuilder::add_method`]).
+    pub fn add_event(
+        &mut self,
+        class: Token,
+        name: &str,
+        event_type: Token,
+        add: Token,
+        remove: Token,
+    ) {
+        assert_eq!(class.table(), Token::TABLE_TYPE_DEF, "Event owner must be a TypeDef");
+        // First event for this class -> open its EventMap run at the next Event row.
+        let next_event_rid = u32::try_from(self.event.len() + 1).unwrap();
+        if !self.event_map.iter().any(|r| r.parent == class.rid()) {
+            self.event_map.push(EventMapRow {
+                parent: class.rid(),
+                event_list: next_event_rid,
+            });
+        }
+        let name_off = self.strings.intern(name);
+        self.event.push(EventRow {
+            event_flags: 0,
+            name: name_off,
+            event_type: encode_type_def_or_ref_token(event_type),
+        });
+        let event_rid = u32::try_from(self.event.len()).unwrap();
+        let association = encode_has_semantics(Token::new(Token::TABLE_EVENT, event_rid));
+        // §II.23.1.12 MethodSemantics.Semantics: 0x8 AddOn, 0x10 RemoveOn.
+        self.method_semantics.push(MethodSemanticsRow {
+            semantics: 0x8,
+            method: add.rid(),
+            association,
+        });
+        self.method_semantics.push(MethodSemanticsRow {
+            semantics: 0x10,
+            method: remove.rid(),
+            association,
+        });
+    }
+
     /// Emits the **only** custom attribute this backend produces: a bare
     /// `[ThreadStaticAttribute]` (`System.ThreadStaticAttribute::.ctor()`) on a static field,
     /// mirroring `il_exporter`'s `.custom instance void
@@ -1138,6 +1286,10 @@ impl MetadataBuilder {
             (Token::TABLE_CLASS_LAYOUT, sizes.class_layout),
             (Token::TABLE_FIELD_LAYOUT, sizes.field_layout),
             (Token::TABLE_STAND_ALONE_SIG, sizes.standalone_sig),
+            (Token::TABLE_EVENT_MAP, sizes.event_map),
+            (Token::TABLE_EVENT, sizes.event),
+            (Token::TABLE_METHOD_SEMANTICS, sizes.method_semantics),
+            (Token::TABLE_METHOD_IMPL, sizes.method_impl),
             (Token::TABLE_MODULE_REF, sizes.module_ref),
             (Token::TABLE_TYPE_SPEC, sizes.type_spec),
             (Token::TABLE_IMPL_MAP, sizes.impl_map),
@@ -1173,13 +1325,17 @@ impl MetadataBuilder {
             assembly: self.assembly.len(),
             assembly_ref: self.assembly_ref.len(),
             method_spec: self.method_spec.len(),
+            method_impl: self.method_impl.len(),
+            event_map: self.event_map.len(),
+            event: self.event.len(),
+            method_semantics: self.method_semantics.len(),
         }
     }
 
     fn serialize_tables(&self, sizes: &RowCounts, widths: &Widths) -> Vec<u8> {
         // Every table this backend can ever emit, in ascending table-id order (§II.24.2.6
         // requires tables be written in table-id order regardless of population order).
-        let table_rowcounts: [(u32, usize); 19] = [
+        let table_rowcounts: [(u32, usize); 23] = [
             (Token::TABLE_MODULE, sizes.module),
             (Token::TABLE_TYPE_REF, sizes.type_ref),
             (Token::TABLE_TYPE_DEF, sizes.type_def),
@@ -1192,6 +1348,10 @@ impl MetadataBuilder {
             (Token::TABLE_CLASS_LAYOUT, sizes.class_layout),
             (Token::TABLE_FIELD_LAYOUT, sizes.field_layout),
             (Token::TABLE_STAND_ALONE_SIG, sizes.standalone_sig),
+            (Token::TABLE_EVENT_MAP, sizes.event_map),
+            (Token::TABLE_EVENT, sizes.event),
+            (Token::TABLE_METHOD_SEMANTICS, sizes.method_semantics),
+            (Token::TABLE_METHOD_IMPL, sizes.method_impl),
             (Token::TABLE_MODULE_REF, sizes.module_ref),
             (Token::TABLE_TYPE_SPEC, sizes.type_spec),
             (Token::TABLE_IMPL_MAP, sizes.impl_map),
@@ -1243,6 +1403,10 @@ impl MetadataBuilder {
         self.write_class_layout_rows(&mut out, widths);
         self.write_field_layout_rows(&mut out, widths);
         self.write_standalone_sig_rows(&mut out, widths);
+        self.write_event_map_rows(&mut out, widths);
+        self.write_event_rows(&mut out, widths);
+        self.write_method_semantics_rows(&mut out, widths);
+        self.write_method_impl_rows(&mut out, widths);
         self.write_module_ref_rows(&mut out, widths);
         self.write_type_spec_rows(&mut out, widths);
         self.write_impl_map_rows(&mut out, widths);
@@ -1326,6 +1490,47 @@ impl MetadataBuilder {
             write_coded_idx(out, row.class, w.member_ref_parent_wide);
             write_heap_idx(out, row.name, w.str_wide);
             write_heap_idx(out, row.signature, w.blob_wide);
+        }
+    }
+
+    fn write_event_map_rows(&self, out: &mut Vec<u8>, w: &Widths) {
+        // §II.22.12: NOT a sorted table — insertion order (which is class-def iteration order, so
+        // Parent is de-facto ascending anyway) is fine.
+        for row in &self.event_map {
+            write_simple_idx(out, row.parent, w.type_def_wide);
+            write_simple_idx(out, row.event_list, w.event_wide);
+        }
+    }
+
+    fn write_event_rows(&self, out: &mut Vec<u8>, w: &Widths) {
+        for row in &self.event {
+            out.extend_from_slice(&row.event_flags.to_le_bytes());
+            write_heap_idx(out, row.name, w.str_wide);
+            write_coded_idx(out, row.event_type, w.type_def_or_ref_wide);
+        }
+    }
+
+    fn write_method_semantics_rows(&self, out: &mut Vec<u8>, w: &Widths) {
+        let mut rows: Vec<&MethodSemanticsRow> = self.method_semantics.iter().collect();
+        // Sorted by Association (§II.22.28) — the coded HasSemantics index. `sort_by_key` is
+        // stable, so the add-then-remove insertion order is preserved within one event.
+        rows.sort_by_key(|r| r.association);
+        for row in rows {
+            out.extend_from_slice(&row.semantics.to_le_bytes());
+            write_simple_idx(out, row.method, w.method_def_wide);
+            write_coded_idx(out, row.association, w.has_semantics_wide);
+        }
+    }
+
+    fn write_method_impl_rows(&self, out: &mut Vec<u8>, w: &Widths) {
+        let mut rows: Vec<&MethodImplRow> = self.method_impl.iter().collect();
+        // Sorted by Class (§II.22.27) — a simple TypeDef row index.
+        rows.sort_by_key(|r| r.class);
+        debug_assert!(rows.windows(2).all(|w| w[0].class <= w[1].class));
+        for row in rows {
+            write_simple_idx(out, row.class, w.type_def_wide);
+            write_coded_idx(out, row.method_body, w.method_def_or_ref_wide);
+            write_coded_idx(out, row.method_declaration, w.method_def_or_ref_wide);
         }
     }
 
@@ -1619,6 +1824,16 @@ fn encode_member_forwarded(token: Token) -> u32 {
     (token.rid() << 1) | tag
 }
 
+/// `HasSemantics` (1 tag bit): 0 = Event, 1 = Property. Targets a `MethodSemantics.Association`.
+/// This backend only emits event semantics (no properties), so only the `Event` tag (0) appears.
+fn encode_has_semantics(token: Token) -> u32 {
+    let tag = match token.table() {
+        Token::TABLE_EVENT => 0,
+        other => panic!("{other:#x} is not a HasSemantics member this backend emits"),
+    };
+    (token.rid() << 1) | tag
+}
+
 // ---------------------------------------------------------------------------------------------
 // Row-count-dependent widths (§II.24.2.6).
 // ---------------------------------------------------------------------------------------------
@@ -1644,6 +1859,10 @@ struct RowCounts {
     assembly: usize,
     assembly_ref: usize,
     method_spec: usize,
+    method_impl: usize,
+    event_map: usize,
+    event: usize,
+    method_semantics: usize,
 }
 
 /// Whether a *simple* index (one target table, no tag bits) needs 4 bytes: §II.24.2.6, "iff the
@@ -1679,6 +1898,7 @@ struct Widths {
     method_def_wide: bool,
     param_wide: bool,
     module_ref_wide: bool,
+    event_wide: bool,
 
     type_def_or_ref_wide: bool,
     resolution_scope_wide: bool,
@@ -1687,6 +1907,7 @@ struct Widths {
     has_custom_attribute_wide: bool,
     custom_attribute_type_wide: bool,
     member_forwarded_wide: bool,
+    has_semantics_wide: bool,
 }
 
 impl Widths {
@@ -1740,6 +1961,8 @@ impl Widths {
             .max(sizes.type_spec);
         let custom_attribute_type_max = sizes.method_def.max(sizes.member_ref);
         let member_forwarded_max = sizes.field.max(sizes.method_def);
+        // `HasSemantics` targets Event + Property (§II.24.2.6); this backend only emits Event.
+        let has_semantics_max = sizes.event;
 
         Self {
             heap_sizes,
@@ -1752,6 +1975,7 @@ impl Widths {
             method_def_wide: simple_wide(sizes.method_def),
             param_wide: simple_wide(sizes.param),
             module_ref_wide: simple_wide(sizes.module_ref),
+            event_wide: simple_wide(sizes.event),
             type_def_or_ref_wide: coded_wide(2, type_def_or_ref_max),
             resolution_scope_wide: coded_wide(2, resolution_scope_max),
             member_ref_parent_wide: coded_wide(3, member_ref_parent_max),
@@ -1759,6 +1983,7 @@ impl Widths {
             has_custom_attribute_wide: coded_wide(5, has_custom_attribute_max),
             custom_attribute_type_wide: coded_wide(3, custom_attribute_type_max),
             member_forwarded_wide: coded_wide(1, member_forwarded_max),
+            has_semantics_wide: coded_wide(1, has_semantics_max),
         }
     }
 }
@@ -2264,6 +2489,83 @@ mod tests {
         assert_eq!(a.len(), 16);
     }
 
+    /// The PE writer emits a `ClassDef::with_interface` class as a genuine ECMA-335 `interface`
+    /// `TypeDef` (§II.23.1.15: `Interface`+`Abstract` flags, NIL `Extends`) and its
+    /// `MethodDef::with_abstract` member with `Abstract` set and RVA=0 (§II.22.26). Structural
+    /// readback of the actual serialized bytes `export_pe` produces (the CoreCLR-loadability of
+    /// this exact shape is separately proven via the `il_exporter` path + a hand-verified C#
+    /// `Parrot : ISpeaker` consumer — see `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md` finding #2).
+    #[test]
+    fn interface_type_def_and_abstract_method_are_emitted_by_pe_writer() {
+        use crate::ir::{ClassDef, ClassRef, MethodDef, MethodImpl, Type};
+
+        let mut asm = crate::ir::Assembly::default();
+        let iname = asm.alloc_string("ISpeaker");
+        let cdef = ClassDef::new(
+            iname, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+        )
+        .with_interface();
+        let cidx = asm.class_def(cdef).unwrap();
+        let self_ty = Type::ClassRef(*cidx);
+        let mname = asm.alloc_string("Speak");
+        let msig = asm.sig([self_ty], Type::Void);
+        let mdef = MethodDef::new(
+            Access::Public,
+            cidx,
+            mname,
+            msig,
+            MethodKind::Virtual,
+            MethodImpl::Missing,
+            vec![None],
+        )
+        .with_abstract();
+        asm.new_method(mdef);
+
+        let options = super::super::export::ExportOptions {
+            is_dll: true,
+            assembly_name: "pe_iface".to_string(),
+            module_name: "pe_iface.dll".to_string(),
+            pdb_file_name: String::new(),
+        };
+        let (image, _pdb) = super::super::export::export_pe(&mut asm, &options);
+
+        // `MetadataReader` parses a bare BSJB metadata root; slice it out of the full PE image
+        // (the root is contiguous, and the reader indexes by offset relative to its start, so
+        // trailing PE bytes after the metadata are harmless).
+        let bsjb = image
+            .windows(4)
+            .position(|w| w == b"BSJB")
+            .expect("PE image must contain a BSJB metadata root");
+        let reader = MetadataReader::parse(&image[bsjb..]);
+        let header = reader.tables_header();
+        let row_bytes = &reader.stream("#~")[header.row_data_offset..];
+        let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
+
+        // --- ISpeaker's TypeDef row (rid 2 — `<Module>` occupies rid 1). Flags are the first 4
+        // bytes of the row, independent of heap-index widths.
+        let td_start = reader.table_offset(Token::TABLE_TYPE_DEF, &header);
+        let td_w = MetadataReader::row_width(Token::TABLE_TYPE_DEF, &header);
+        let iface_row = td_start + td_w; // rid 2 == index 1
+        let flags = u32_at(iface_row);
+        assert_ne!(flags & 0x20, 0, "TypeDef must have Interface (0x20) flag; flags={flags:#x}");
+        assert_ne!(flags & 0x80, 0, "TypeDef must have Abstract (0x80) flag; flags={flags:#x}");
+        assert_eq!(flags & 0x100, 0, "interface TypeDef must NOT be Sealed (0x100); flags={flags:#x}");
+        // Extends sits after Flags(4) + Name + Namespace (two `#Strings` indices).
+        let str_w = if header.heap_sizes & 0x1 != 0 { 4 } else { 2 };
+        let extends_off = iface_row + 4 + 2 * str_w;
+        let extends = if str_w == 4 { u32_at(extends_off) } else { u16_at(extends_off) as u32 };
+        assert_eq!(extends, 0, "interface TypeDef must have NIL Extends; got {extends:#x}");
+
+        // --- Speak's MethodDef row (rid 1, the only method). RVA is the first 4 bytes; Flags is a
+        // u16 at offset 6 (after RVA(4) + ImplFlags(2)), both in the fixed-width prefix.
+        let md_start = reader.table_offset(Token::TABLE_METHOD_DEF, &header);
+        assert_eq!(u32_at(md_start), 0, "abstract method must have RVA=0");
+        let m_flags = u16_at(md_start + 6);
+        assert_ne!(m_flags & 0x400, 0, "abstract method must have Abstract (0x400) flag; flags={m_flags:#x}");
+        assert_ne!(m_flags & 0x40, 0, "abstract method must still be Virtual (0x40); flags={m_flags:#x}");
+    }
+
     // ---------------------------------------------------------------------------------------
     // (a) A tiny module (one TypeDef, one MethodDef, one MemberRef, one string) round-trips
     // through a hand-rolled reader that parses the metadata root back apart.
@@ -2387,6 +2689,24 @@ mod tests {
                 Token::TABLE_CLASS_LAYOUT => 2 + 4 + simple_w(count(Token::TABLE_TYPE_DEF)),
                 Token::TABLE_FIELD_LAYOUT => 4 + simple_w(count(Token::TABLE_FIELD)),
                 Token::TABLE_STAND_ALONE_SIG => blob_w,
+                Token::TABLE_EVENT_MAP => {
+                    simple_w(count(Token::TABLE_TYPE_DEF)) + simple_w(count(Token::TABLE_EVENT))
+                }
+                Token::TABLE_EVENT => {
+                    let tdor_max = count(Token::TABLE_TYPE_DEF)
+                        .max(count(Token::TABLE_TYPE_REF))
+                        .max(count(Token::TABLE_TYPE_SPEC));
+                    2 + str_w + coded_w(2, tdor_max)
+                }
+                Token::TABLE_METHOD_SEMANTICS => {
+                    // Association is a `HasSemantics` coded index (Event | Property, 1 tag bit);
+                    // this backend only emits Event, so its max row count bounds the width.
+                    2 + simple_w(count(Token::TABLE_METHOD_DEF)) + coded_w(1, count(Token::TABLE_EVENT))
+                }
+                Token::TABLE_METHOD_IMPL => {
+                    let mdor_max = count(Token::TABLE_METHOD_DEF).max(count(Token::TABLE_MEMBER_REF));
+                    simple_w(count(Token::TABLE_TYPE_DEF)) + 2 * coded_w(1, mdor_max)
+                }
                 Token::TABLE_MODULE_REF => str_w,
                 Token::TABLE_TYPE_SPEC => blob_w,
                 Token::TABLE_IMPL_MAP => {

@@ -210,6 +210,25 @@ design decision before any code is written).
 
 ## Tier C research findings (2026-07-06, read-only, no code written)
 
+> **UPDATE (2026-07-07) — the `pe_exporter` / `DIRECT_PE=1` gaps in findings #1, #2 and #5 are now
+> CLOSED.** All three features (virtual-method overrides, interface export, `.NET` events) work on
+> the **default** hand-rolled PE-writer path — the individual "IL-exporter-only / `DIRECT_PE=1` not
+> supported / loud assert guard" notes below are HISTORICAL. `pe_exporter/tables.rs` gained the
+> `MethodImpl` (§II.22.27), `EventMap`/`Event`/`MethodSemantics` (§II.22.12/13/28) tables plus
+> `Interface`/`Abstract` `TypeDef` flags and abstract-method RVA=0 handling; `pe_exporter/export.rs`
+> wires them from the IR (`ClassDef::with_interface`/`add_event`, `MethodDef::with_override`/
+> `with_abstract`), and the loud asserts were removed. **This was the right call per the project's
+> own direction** (`docs/PE_EMISSION_PLAN.md`: the PE writer is the default precisely to get `ilasm`
+> out of the loop) — and it also **dissolved the Mono-`ilasm`-at-scale event blocker** described in
+> finding #5's earlier update: under `DIRECT_PE=1` no `ilasm` runs at all, so the ~500K-line `.il`
+> that Mono choked on is never produced. Proven end-to-end under the default path:
+> `cargo_tests/cd_override` 5/5 (incl. the decisive `((object)g).ToString()` base-slot dispatch) and
+> `cargo_tests/cd_event` 4/4 (`+=`/`-=` + `GetEvent` reflection), both built with zero `ilasm`; plus
+> a `pe_exporter` structural-readback unit test for the interface `TypeDef`
+> (`interface_type_def_and_abstract_method_are_emitted_by_pe_writer`). Interface-export still lacks
+> a macro surface (a Rust `trait` → interface), so it has no cargo-crate proof yet — that macro
+> wiring is the only remaining item for these three.
+
 ### 1. `#[dotnet_class]` virtual-method overrides — SHIPPED (2026-07-07, IL-exporter-only)
 
 **Done.** Implemented exactly the "smallest safe first step" scoped below: `MethodDef` gained an
