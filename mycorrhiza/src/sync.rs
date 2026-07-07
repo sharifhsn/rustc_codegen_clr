@@ -12,6 +12,11 @@
 //! require `unsafe` in calling code — see each type's docs for precisely what safety they do (and do
 //! not) extend to a C# caller that also holds the raw lock.
 //!
+//! Separately, [`channel`]/[`bounded_channel`] give a `std::sync::mpsc`-shaped [`Sender<T>`]/
+//! [`Receiver<T>`] pair over `System.Threading.Channels` — genuinely multi-producer multi-consumer
+//! (both handles are `Copy`), with blocking, non-blocking (`try_*`), and `.await`-able forms of
+//! send/receive. See [`channel`]'s docs for its own cross-language nuance.
+//!
 //! This mirrors [`crate::task`]'s conventions: thin, `#[inline]` wrappers over the raw generated
 //! bindings in [`crate::bindings`], RAII guards for the acquire/release pairs, and (where a wait can be
 //! `.await`ed) composition with the [`crate::task`] Task↔Future bridge rather than a second bridge.
@@ -41,7 +46,14 @@ use crate::bindings::{
         ManualResetEventSlim as RawManualResetEventSlim, ReaderWriterLockSlim as RawReaderWriterLockSlim,
         SemaphoreSlim as RawSemaphoreSlim},
 };
-use crate::task::{await_unit, Task};
+use crate::intrinsics::{
+    rustc_clr_interop_generic_call1, rustc_clr_interop_generic_call2, rustc_clr_interop_generic_call3,
+    rustc_clr_interop_generic_method_call0, rustc_clr_interop_generic_method_call1,
+    RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric,
+    RustcCLRInteropManagedGenericStruct, RustcCLRInteropManagedStruct, RustcCLRInteropMethodGeneric,
+    RustcCLRInteropTypeGeneric,
+};
+use crate::task::{await_task, await_unit, Task, TaskT};
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::ops::{Deref, DerefMut};
@@ -876,4 +888,427 @@ impl<T> Default for SharedOnce<T> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// =================================================================================================
+// Channel<T> — an mpsc/mpmc queue over System.Threading.Channels, real from both sides
+// =================================================================================================
+//
+// `System.Threading.Channels` is the .NET analog of `std::sync::mpsc`, but it is genuinely
+// **multi-producer multi-consumer** (any number of `ChannelWriter<T>`/`ChannelReader<T>` handles may
+// send/receive concurrently — [`Sender`]/[`Receiver`] here are `Copy`, unlike `std::sync::mpsc`'s
+// single-consumer-only, non-`Clone` `Receiver`), and every operation has both a synchronous,
+// non-blocking form (`TryWrite`/`TryRead`) and a `Task`-returning asynchronous form
+// (`WriteAsync`/`ReadAsync`), which this module exposes as blocking and `.await`-able Rust APIs
+// respectively via the existing [`crate::task`] Task↔Future bridge — no second bridge is built here.
+//
+// `Channel.CreateBounded<T>`/`CreateUnbounded<T>` are STATIC GENERIC METHODS on the non-generic
+// `Channel` class, returning the class-generic `Channel<T>` (whose `.Reader`/`.Writer` properties are
+// themselves generic-instance accesses) — this is the WF-9 generic-method-returning-nested-generic
+// path `linq.rs`'s `Expression.Lambda<T>`/`Queryable.AsQueryable<T>` already exercises, applied here to
+// a completely different BCL surface.
+
+const CHANNELS_ASM: &str = "System.Threading.Channels";
+const CHANNEL: &str = "System.Threading.Channels.Channel";
+const CHANNEL_READER: &str = "System.Threading.Channels.ChannelReader";
+const CHANNEL_WRITER: &str = "System.Threading.Channels.ChannelWriter";
+
+/// A managed `ChannelReader<T>` handle.
+type RawReader<T> = RustcCLRInteropManagedGeneric<CHANNELS_ASM, CHANNEL_READER, (T,)>;
+/// A managed `ChannelWriter<T>` handle.
+type RawWriter<T> = RustcCLRInteropManagedGeneric<CHANNELS_ASM, CHANNEL_WRITER, (T,)>;
+/// The def-shape (`!0`) reader/writer handles a `Channel<T>` `.Reader`/`.Writer` getter returns,
+/// before the class generic is bound to the caller's concrete `T`.
+type ReaderMG = RustcCLRInteropManagedGeneric<CHANNELS_ASM, CHANNEL_READER, (RustcCLRInteropTypeGeneric<0>,)>;
+type WriterMG = RustcCLRInteropManagedGeneric<CHANNELS_ASM, CHANNEL_WRITER, (RustcCLRInteropTypeGeneric<0>,)>;
+/// A managed `Channel<T>` handle (the pair-holding object `.Reader`/`.Writer` are read off).
+type RawChannel<T> = RustcCLRInteropManagedGeneric<CHANNELS_ASM, CHANNEL, (T,)>;
+/// The def-shape (`!!0`, a METHOD generic — `Channel.CreateBounded`/`CreateUnbounded` are static
+/// methods on the non-generic `Channel` class, so their own type parameter is a *method* generic,
+/// not a class generic) `Channel<!!0>` the two factories return.
+type ChannelMethodGen = RustcCLRInteropManagedGeneric<CHANNELS_ASM, CHANNEL, (RustcCLRInteropMethodGeneric<0>,)>;
+
+const CORELIB: &str = "System.Private.CoreLib";
+const CANCELLATION_TOKEN: &str = "System.Threading.CancellationToken";
+/// `System.Threading.CancellationToken` is a one-field (`CancellationTokenSource? _source`) managed
+/// value type; like `Nullable<T>`/`Span<T>` elsewhere in this crate, `SIZE` is a Rust-side placeholder
+/// the backend never reads — the CLR alone knows and uses the real layout.
+const CANCELLATION_TOKEN_SIZE: usize = core::mem::size_of::<usize>();
+type RawCancellationToken = RustcCLRInteropManagedStruct<CORELIB, CANCELLATION_TOKEN, CANCELLATION_TOKEN_SIZE>;
+
+/// `CancellationToken.None` (the static property getter) — every `*Async` call below passes this
+/// rather than hand-constructing a zeroed value type, so the CLR itself builds the value.
+#[inline]
+fn no_cancellation() -> RawCancellationToken {
+    RawCancellationToken::vt_static0::<"get_None", RawCancellationToken>()
+}
+
+/// `Channel.CreateUnbounded<T>()` — a static generic method (`!!0 = T`), zero real arguments, on the
+/// non-generic `Channel` class, returning `Channel<!!0>` (bound to `Channel<T>` at this call site).
+fn create_unbounded<T>() -> RawChannel<T> {
+    rustc_clr_interop_generic_method_call0::<
+        CHANNELS_ASM, CHANNEL, false, "CreateUnbounded", 0u8, (), (T,), (ChannelMethodGen,), RawChannel<T>,
+    >()
+}
+
+/// `Channel.CreateBounded<T>(capacity)` — same static-generic-method shape as [`create_unbounded`],
+/// with one real `int capacity` argument.
+fn create_bounded<T>(capacity: i32) -> RawChannel<T> {
+    rustc_clr_interop_generic_method_call1::<
+        CHANNELS_ASM, CHANNEL, false, "CreateBounded", 0u8, (), (T,), (ChannelMethodGen, i32), RawChannel<T>, i32,
+    >(capacity)
+}
+
+/// `Channel<T>.Reader` — instance getter, `callvirt`, nested-generic def-shape return `ChannelReader<!0>`.
+fn channel_reader<T>(ch: RawChannel<T>) -> RawReader<T> {
+    rustc_clr_interop_generic_call1::<
+        CHANNELS_ASM, CHANNEL, false, "get_Reader", 2, (T,), (ReaderMG,), RawReader<T>, RawChannel<T>,
+    >(ch)
+}
+/// `Channel<T>.Writer` — instance getter, same shape as [`channel_reader`].
+fn channel_writer<T>(ch: RawChannel<T>) -> RawWriter<T> {
+    rustc_clr_interop_generic_call1::<
+        CHANNELS_ASM, CHANNEL, false, "get_Writer", 2, (T,), (WriterMG,), RawWriter<T>, RawChannel<T>,
+    >(ch)
+}
+
+/// `ChannelWriter<T>.TryWrite(item)` — non-blocking; `false` if the channel is full (bounded, no room)
+/// or already completed.
+fn writer_try_write<T>(w: RawWriter<T>, item: T) -> bool {
+    rustc_clr_interop_generic_call2::<
+        CHANNELS_ASM, CHANNEL_WRITER, false, "TryWrite", 2, (T,),
+        (bool, RustcCLRInteropTypeGeneric<0>), bool, RawWriter<T>, T,
+    >(w, item)
+}
+
+/// `System.Threading.Tasks.ValueTask` — the non-generic value type `ChannelWriter<T>.WriteAsync`
+/// returns. As with `CancellationToken` above, `SIZE` is a Rust-side placeholder; the CLR knows the
+/// real layout (an `object`, a `short`, and a `bool`).
+const VALUE_TASK: &str = "System.Threading.Tasks.ValueTask";
+type RawValueTask = RustcCLRInteropManagedStruct<CORELIB, VALUE_TASK, { core::mem::size_of::<usize>() * 2 }>;
+/// `System.Threading.Tasks.ValueTask<T>` — the generic-value-type counterpart `ChannelReader<T>.ReadAsync`
+/// returns, reached through [`RustcCLRInteropManagedGenericStruct`] (the value-type-generic marker, same
+/// role as [`crate::nullable::Nullable`]).
+type RawValueTaskT<T> = RustcCLRInteropManagedGenericStruct<CORELIB, VALUE_TASK, { core::mem::size_of::<usize>() * 2 }, (T,)>;
+/// The def-shape `ValueTask<!0>` a `ReadAsync` methodref return spells before `T` is bound.
+type ValueTaskMG = RustcCLRInteropManagedGenericStruct<CORELIB, VALUE_TASK, { core::mem::size_of::<usize>() * 2 }, (RustcCLRInteropTypeGeneric<0>,)>;
+const TASK_CLASS: &str = "System.Threading.Tasks.Task";
+type RawTaskHandle = RustcCLRInteropManagedClass<CORELIB, TASK_CLASS>;
+
+/// `ChannelWriter<T>.WriteAsync(item, CancellationToken)` — returns `ValueTask`; here converted to a
+/// plain `Task` via `.AsTask()` immediately, so the rest of this module reuses [`crate::task`]'s
+/// existing Task↔Future bridge rather than adding a second one for `ValueTask`.
+fn writer_write_async<T>(w: RawWriter<T>, item: T) -> Task {
+    let vt: RawValueTask = rustc_clr_interop_generic_call3::<
+        CHANNELS_ASM, CHANNEL_WRITER, false, "WriteAsync", 2, (T,),
+        (RawValueTask, RustcCLRInteropTypeGeneric<0>, RawCancellationToken),
+        RawValueTask, RawWriter<T>, T, RawCancellationToken,
+    >(w, item, no_cancellation());
+    Task::from_raw(vt.vt_instance0::<"AsTask", RawTaskHandle>())
+}
+/// `ChannelWriter<T>.TryComplete(Exception?)` — signal no more items will be written; `null` means a
+/// normal (non-faulted) completion. Returns `false` if already completed.
+fn writer_try_complete<T>(w: RawWriter<T>) -> bool {
+    type CException = RustcCLRInteropManagedClass<CORELIB, "System.Exception">;
+    rustc_clr_interop_generic_call2::<
+        CHANNELS_ASM, CHANNEL_WRITER, false, "TryComplete", 2, (T,),
+        (bool, CException), bool, RawWriter<T>, CException,
+    >(w, crate::intrinsics::rustc_clr_interop_managed_ld_null::<CException>())
+}
+
+/// `ChannelReader<T>.TryRead(out item)` — non-blocking. `TryRead`'s `out` parameter is a managed byref,
+/// which this bridge represents with [`crate::intrinsics::RustcCLRInteropByRef`] in the `Sig` slot and
+/// a plain raw pointer to a Rust local as the actual runtime argument (the same shape `span.rs`'s
+/// `get_Item` byref-return uses, just as an argument here rather than a return).
+fn reader_try_read<T>(r: RawReader<T>) -> Option<T> {
+    use crate::intrinsics::RustcCLRInteropByRef;
+    let mut slot = core::mem::MaybeUninit::<T>::uninit();
+    let ok = rustc_clr_interop_generic_call2::<
+        CHANNELS_ASM, CHANNEL_READER, false, "TryRead", 2, (T,),
+        (bool, RustcCLRInteropByRef<RustcCLRInteropTypeGeneric<0>>),
+        bool, RawReader<T>, *mut T,
+    >(r, slot.as_mut_ptr());
+    if ok {
+        // SAFETY: `TryRead` returning `true` means the CLR wrote a live `T` through the byref before
+        // returning, so `slot` is now initialized.
+        Some(unsafe { slot.assume_init() })
+    } else {
+        None
+    }
+}
+/// `ChannelReader<T>.ReadAsync(CancellationToken)` — returns `ValueTask<T>`, converted to `Task<T>`
+/// via `.AsTask()` so it composes with [`crate::task::await_task`]. `AsTask` on a value-type-generic
+/// receiver needs `IS_VALUETYPE = true` and `KIND = 1` (`call instance`), exactly like
+/// [`crate::nullable`]'s `get_Value`/`get_HasValue`.
+fn reader_read_async<T>(r: RawReader<T>) -> TaskT<T> {
+    let vt: RawValueTaskT<T> = rustc_clr_interop_generic_call2::<
+        CHANNELS_ASM, CHANNEL_READER, false, "ReadAsync", 2, (T,),
+        (ValueTaskMG, RawCancellationToken),
+        RawValueTaskT<T>, RawReader<T>, RawCancellationToken,
+    >(r, no_cancellation());
+    // `AsTask()` is a value-type instance call (`IS_VALUETYPE = true`) — the receiver must be passed
+    // by managed reference (`&vt`), exactly as `vt_instance0`/`nullable.rs`'s `has_value`/`get_Value`
+    // take their value-type receiver.
+    rustc_clr_interop_generic_call1::<
+        CORELIB, VALUE_TASK, true, "AsTask", 1, (T,),
+        (RustcCLRInteropManagedGeneric<CORELIB, TASK_CLASS, (RustcCLRInteropTypeGeneric<0>,)>,),
+        TaskT<T>, &RawValueTaskT<T>,
+    >(&vt)
+}
+/// `ChannelReader<T>.Completion` — a `Task` that completes once the channel is both marked complete
+/// (`TryComplete`) and fully drained.
+fn reader_completion<T>(r: RawReader<T>) -> Task {
+    Task::from_raw(rustc_clr_interop_generic_call1::<
+        CHANNELS_ASM, CHANNEL_READER, false, "get_Completion", 2, (T,),
+        (RawTaskHandle,), RawTaskHandle, RawReader<T>,
+    >(r))
+}
+
+/// The sending half of a [channel]/[bounded_channel] — a thin, `Copy`, `Send`+`Sync` wrapper over a
+/// real managed `ChannelWriter<T>`.
+///
+/// **Multi-producer, by design.** Unlike `std::sync::mpsc::Sender`, this `Sender<T>` requires no
+/// `.clone()` gymnastics to hand out to multiple producer threads — `ChannelWriter<T>` itself supports
+/// concurrent callers, so this wrapper is `Copy` outright (it is exactly one managed reference).
+#[derive(Clone, Copy)]
+pub struct Sender<T> {
+    h: RawWriter<T>,
+}
+
+// SAFETY: `ChannelWriter<T>`/`ChannelReader<T>` are documented by the BCL to be safe for concurrent
+// use by multiple threads (that is the entire reason `System.Threading.Channels` exists over a bare
+// queue) — this wrapper adds no additional state, so it inherits that guarantee whenever `T: Send`
+// (a value crossing threads must itself be `Send`; the wrapper needs no `T: Sync` since no `&T` is
+// ever shared, only `T` moved through the channel).
+unsafe impl<T: Send> Send for Sender<T> {}
+unsafe impl<T: Send> Sync for Sender<T> {}
+
+impl<T> Sender<T> {
+    /// Wrap a raw managed `ChannelWriter<T>` handle — e.g. one received from C#, so Rust can join a
+    /// channel C# created (see the [`channel`] docs' cross-language nuance).
+    #[inline]
+    pub fn from_raw(h: RawWriter<T>) -> Self {
+        Self { h }
+    }
+
+    /// Non-blocking send — `ChannelWriter<T>.TryWrite(item)`. Returns `Err(item)` (giving the value
+    /// back, like `std::sync::mpsc::TrySendError`'s payload) if the channel is full (a bounded channel
+    /// at capacity) or already closed.
+    #[inline]
+    pub fn try_send(self, item: T) -> Result<(), T>
+    where
+        T: Copy,
+    {
+        if writer_try_write(self.h, item) {
+            Ok(())
+        } else {
+            Err(item)
+        }
+    }
+
+    /// Blocking send — waits (spinning the calling thread via [`crate::task::block_on`] over the real
+    /// `WriteAsync`) until the item is accepted or the channel is observed closed. Mirrors
+    /// `std::sync::mpsc::Sender::send`'s blocking contract, built on the .NET-native async primitive
+    /// rather than a second hand-rolled wait loop.
+    #[inline]
+    pub fn send_blocking(self, item: T) {
+        // Precompute the `Task` BEFORE constructing the `async move` block, so the coroutine itself
+        // only ever captures a non-generic [`crate::task::Task`] handle across its `.await` — never
+        // the generic `ChannelWriter<T>` handle directly. See [`send_async`]'s docs for why that
+        // distinction matters (a generic managed handle living in coroutine state, as opposed to
+        // `Task`, hits the backend's overlapping-storage layout check).
+        let task = writer_write_async(self.h, item);
+        crate::task::block_on(async move { await_unit(task).await });
+    }
+
+    /// `.await`-adapted send — `ChannelWriter<T>.WriteAsync(item).AsTask()`, driven through
+    /// [`crate::task::await_unit`]. Same caveat as the rest of [`crate::task`]: do not hold the
+    /// returned future's `Task` across an `.await` *inside* a suspending `async fn` — drive it with
+    /// [`crate::task::block_on`] instead.
+    #[inline]
+    pub fn send_async(self, item: T) -> impl Future<Output = ()> {
+        await_unit(writer_write_async(self.h, item))
+    }
+
+    /// `ChannelWriter<T>.TryComplete(null)` — mark the channel closed for writing (no more items will
+    /// be sent). Idempotent from Rust's point of view: a second call returns `false` and is otherwise a
+    /// no-op. Mirrors what dropping `std::sync::mpsc::Sender` does implicitly; here it must be called
+    /// explicitly since the managed `ChannelWriter<T>` has no Rust-visible destructor to hook.
+    #[inline]
+    pub fn close(self) -> bool {
+        writer_try_complete(self.h)
+    }
+
+    /// The raw managed `ChannelWriter<T>` handle — hand this directly to C#, or to any .NET API
+    /// expecting one. See the [module docs](self) for what sharing it means.
+    #[inline]
+    pub fn raw(self) -> RawWriter<T> {
+        self.h
+    }
+}
+
+/// The receiving half of a [channel]/[bounded_channel] — a thin, `Copy`, `Send`+`Sync` wrapper over a
+/// real managed `ChannelReader<T>`.
+///
+/// **Multi-consumer, by design** — unlike `std::sync::mpsc::Receiver` (single-consumer, not `Clone`),
+/// `ChannelReader<T>` supports concurrent readers competing for items (each item still goes to exactly
+/// one reader), so this wrapper is `Copy`.
+#[derive(Clone, Copy)]
+pub struct Receiver<T> {
+    h: RawReader<T>,
+}
+
+// SAFETY: see `Sender<T>`'s identical justification — `ChannelReader<T>` is BCL-documented safe for
+// concurrent multi-threaded use.
+unsafe impl<T: Send> Send for Receiver<T> {}
+unsafe impl<T: Send> Sync for Receiver<T> {}
+
+impl<T> Receiver<T> {
+    /// Wrap a raw managed `ChannelReader<T>` handle — e.g. one received from C#, so Rust can join a
+    /// channel C# created (see the [`channel`] docs' cross-language nuance).
+    #[inline]
+    pub fn from_raw(h: RawReader<T>) -> Self {
+        Self { h }
+    }
+
+    /// Non-blocking receive — `ChannelReader<T>.TryRead(out item)`. `None` if the channel is currently
+    /// empty (whether or not it is closed); use [`recv_blocking`](Receiver::recv_blocking) /
+    /// [`recv_async`](Receiver::recv_async) to block/`.await` until either an item arrives or the
+    /// channel is definitely, permanently drained.
+    #[inline]
+    pub fn try_recv(self) -> Option<T> {
+        reader_try_read(self.h)
+    }
+
+    /// Blocking receive — a spin-poll (via [`crate::task::block_on`]) that alternates the
+    /// non-blocking `TryRead` with the real `ReadAsync` wait, so it never touches
+    /// `ChannelClosedException` — `ReadAsync` on an already-closed-and-drained channel throws, but
+    /// [`recv_async`](Receiver::recv_async) checks [`Receiver::is_definitely_drained`] first and
+    /// short-circuits to `None` instead. Returns `None` once the channel is closed and fully drained
+    /// (mirroring `std::sync::mpsc::Receiver::recv`'s `Err` on a disconnected sender).
+    #[inline]
+    pub fn recv_blocking(self) -> Option<T>
+    where
+        T: Copy,
+    {
+        if let Some(v) = self.try_recv() {
+            return Some(v);
+        }
+        if self.is_definitely_drained() {
+            return None;
+        }
+        crate::task::block_on(self.recv_async())
+    }
+
+    /// `.await`-adapted receive — `ChannelReader<T>.ReadAsync().AsTask()`, driven through
+    /// [`crate::task::await_task`]. Resolves to `None` once the channel is closed and drained,
+    /// checked via [`Receiver::is_definitely_drained`] *before* issuing `ReadAsync` (which would
+    /// otherwise throw `ChannelClosedException` at that point rather than signalling emptiness the
+    /// way `TryRead` does).
+    ///
+    /// This returns a hand-written [`Future`] combinator ([`RecvFuture`]), NOT an `async fn`/
+    /// `async move { … }` block. That is deliberate, for a reason [`crate::task`] documents: any
+    /// **generic** managed handle (`TaskT<T>`/`ChannelReader<T>`/`ChannelWriter<T>` — anything shaped
+    /// like [`crate::intrinsics::RustcCLRInteropManagedGeneric`]) that an `async fn` coroutine's
+    /// desugaring captures *across* a suspension point lands in the coroutine's overlapping variant
+    /// storage, which the backend's layout checker rejects outright for any GC reference (this is
+    /// unconditional — it is not weakened here or anywhere in this crate). A hand-written struct
+    /// implementing [`Future`] directly has no such restriction: the generic handle is an ordinary
+    /// struct field, exactly how [`crate::task::TaskFuture`] itself holds `TaskT<T>`. So
+    /// [`RecvFuture`] simply wraps a [`crate::task::TaskFuture`] and maps its output through `Some`.
+    ///
+    /// Same caveat as the rest of [`crate::task`]: do not hold this future across an `.await` *inside*
+    /// a suspending `async fn` — drive it with [`crate::task::block_on`] instead.
+    #[inline]
+    pub fn recv_async(self) -> RecvFuture<T> {
+        RecvFuture { inner: await_task(reader_read_async(self.h)) }
+    }
+
+    /// `true` once the channel is closed (writer-side [`Sender::close`]d) AND fully drained — the
+    /// definitive "no more items will ever arrive" signal. Checked before [`recv_blocking`]/
+    /// [`recv_async`] would otherwise wait on `ReadAsync`, which throws `ChannelClosedException` at
+    /// that point instead of signalling emptiness the way `TryRead` does.
+    #[inline]
+    pub fn is_definitely_drained(self) -> bool {
+        reader_completion(self.h).is_completed()
+    }
+
+    /// The raw managed `ChannelReader<T>` handle — hand this directly to C#, or to any .NET API
+    /// expecting one.
+    #[inline]
+    pub fn raw(self) -> RawReader<T> {
+        self.h
+    }
+}
+
+/// The [`Receiver::recv_async`] future — a hand-written [`Future`] impl (see that method's docs for
+/// why this cannot be an `async fn`/`async move` block) that wraps a [`crate::task::TaskFuture`] and
+/// maps its resolved value through `Some`.
+pub struct RecvFuture<T> {
+    inner: crate::task::TaskFuture<T>,
+}
+
+impl<T> Future for RecvFuture<T> {
+    type Output = Option<T>;
+    fn poll(self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> core::task::Poll<Option<T>> {
+        // SAFETY: projecting `Pin<&mut RecvFuture<T>>` to `Pin<&mut TaskFuture<T>>` is sound — this
+        // struct has exactly one field, is never `Unpin`-relevant (like `TaskFuture` itself, it holds
+        // only a plain `Copy` handle, no address-sensitive data), and `RecvFuture` is never moved out
+        // of after being pinned.
+        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.inner) };
+        // Two racing `recv_blocking`/`recv_async` callers can both pass the pre-close `TryRead`/
+        // `is_definitely_drained` checks and then both issue a real `ReadAsync` — that race is
+        // inherent to `System.Threading.Channels` itself (`Completion` finishing and the last item
+        // being drained are two separate, not-jointly-atomic observations), and the LOSER's
+        // `ReadAsync` throws `ChannelClosedException`, faulting its `Task<T>`. `TaskFuture::poll`
+        // would otherwise re-throw that as a Rust panic (its documented behavior for any faulted
+        // Task) — which would abort here, since a panic cannot unwind across a thread this backend's
+        // spawned-thread trampoline can't propagate through. So this checks `is_faulted` FIRST and
+        // treats it as the same "channel is closed and drained" signal `try_recv`/
+        // `is_definitely_drained` already use, resolving to `None` instead of propagating the
+        // exception — the graceful close semantics [`Receiver::recv_blocking`]/
+        // [`Receiver::recv_async`] promise.
+        if inner.is_faulted() {
+            return core::task::Poll::Ready(None);
+        }
+        inner.poll(cx).map(Some)
+    }
+}
+
+/// Create an **unbounded** channel — `Channel.CreateUnbounded<T>()`. Never blocks a sender (backed by
+/// an unbounded internal queue); use [`bounded_channel`] when producers must be rate-limited by slow
+/// consumers.
+///
+/// # The cross-language nuance (read this before treating a raw handle as Rust-only)
+///
+/// Exactly like [`SharedLock`], the point of [`Sender::raw`]/[`Receiver::raw`] is that **the same
+/// managed `ChannelWriter<T>`/`ChannelReader<T>` object can be handed to C#**, which can genuinely
+/// produce into or consume from it via the ordinary `System.Threading.Channels` API — this is not an
+/// illusion or a one-way FFI shim: a `#[dotnet_export]` that returns `Sender::raw()`/`Receiver::raw()`
+/// gives a C# caller a first-class `ChannelWriter<T>`/`ChannelReader<T>` it can call `TryWrite`/
+/// `WriteAsync`/`TryRead`/`ReadAsync` on directly, fully interoperating with whatever Rust does on its
+/// side of the same channel.
+///
+/// **Unlike [`SharedLock`]**, there is no analogous "discipline, not proof" caveat to spell out here
+/// beyond the usual "`T` must be a boundary-crossing type" rule [`crate::collections`] already
+/// documents: a channel carries values through an already-thread-safe managed queue, not a shared
+/// mutable cell — passing an item through it *is* the synchronization (the .NET runtime guarantees
+/// each item is observed by exactly one reader, exactly once), so there is no `UnsafeCell`-style
+/// aliasing hazard for a C# producer/consumer to violate the way there is with [`SharedMutex<T>`]'s
+/// protected data. `Channel<T>` is strictly simpler to share cross-language than `SharedMutex<T>`:
+/// both sides get a genuinely equal, genuinely safe producer/consumer relationship to the same queue.
+#[inline]
+pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+    let ch = create_unbounded::<T>();
+    (Sender { h: channel_writer(ch) }, Receiver { h: channel_reader(ch) })
+}
+
+/// Create a **bounded** channel with room for `capacity` buffered items — `Channel.CreateBounded<T>(capacity)`.
+/// Once full, [`Sender::try_send`] returns `Err` and [`Sender::send_blocking`]/[`Sender::send_async`]
+/// wait for a consumer to make room — the backpressure `std::sync::mpsc::sync_channel` provides. See
+/// [`channel`]'s docs for the cross-language sharing nuance, which applies identically here.
+#[inline]
+pub fn bounded_channel<T>(capacity: i32) -> (Sender<T>, Receiver<T>) {
+    let ch = create_bounded::<T>(capacity);
+    (Sender { h: channel_writer(ch) }, Receiver { h: channel_reader(ch) })
 }
