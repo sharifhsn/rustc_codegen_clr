@@ -36,7 +36,8 @@
 
 use crate::bindings::{
     System::Threading::{Barrier as RawBarrier, CountdownEvent as RawCountdownEvent,
-        ManualResetEventSlim as RawManualResetEventSlim, SemaphoreSlim as RawSemaphoreSlim},
+        ManualResetEventSlim as RawManualResetEventSlim, ReaderWriterLockSlim as RawReaderWriterLockSlim,
+        SemaphoreSlim as RawSemaphoreSlim},
 };
 use crate::task::{await_unit, Task};
 use core::cell::UnsafeCell;
@@ -603,5 +604,159 @@ impl<T> DerefMut for SharedMutexGuard<'_, T> {
         // SAFETY: see `Deref` above; `&mut self` here additionally proves no other live borrow of
         // this guard exists, matching `std::sync::MutexGuard`'s own `DerefMut` reasoning.
         unsafe { &mut *self.data.get() }
+    }
+}
+
+// =================================================================================================
+// SharedRwLock<T> — a real, data-owning RwLock<T> built on ReaderWriterLockSlim
+// =================================================================================================
+
+/// A data-owning reader/writer lock, shaped like `std::sync::RwLock<T>`, built directly on
+/// `System.Threading.ReaderWriterLockSlim` (there is no bare `SharedLock`-style intermediate type for
+/// the reader/writer case — `ReaderWriterLockSlim` is not usefully "shared as a bare handle" the way a
+/// binary `SemaphoreSlim` is, so this wraps the raw BCL type directly, one
+/// [`RawReaderWriterLockSlim`] plus one [`UnsafeCell<T>`], written to (and read from) only while the
+/// appropriate lock is held.
+///
+/// # Why this and not `std::sync::RwLock`
+///
+/// This is **not** a redundant reimplementation of `std::sync::RwLock<T>` — `std::sync::RwLock`
+/// already works correctly for pure-Rust reader/writer synchronization on the dotnet PAL. `SharedRwLock<T>`
+/// exists for exactly the same reason [`SharedMutex<T>`] exists alongside `std::sync::Mutex`: the
+/// underlying lock object is a **.NET-native** `ReaderWriterLockSlim`, reachable via
+/// [`SharedRwLock`]-adjacent raw accessors for cross-language coordination, `WaitAsync`-free async
+/// composition with the rest of this module's .NET-native primitives, or simply so a C# caller
+/// inspecting the same process can see genuine BCL reader/writer state (`IsReadLockHeld`,
+/// `CurrentReadCount`, etc. — exposed on [`RawReaderWriterLockSlim`] directly, since those are queries
+/// on the raw handle rather than something `SharedRwLock<T>`'s safe surface needs to re-expose). Pick
+/// `std::sync::RwLock<T>` for ordinary pure-Rust code; pick `SharedRwLock<T>` when a .NET-native
+/// reader/writer object (or its cross-language coordination story) specifically matters.
+///
+/// # What safety this does and does not extend to C#
+///
+/// Exactly the same nuance as [`SharedMutex<T>`], restated for the reader/writer shape: **fully safe,
+/// complete, and requires zero `unsafe` in calling code, for pure-Rust use.** The only way to reach
+/// `&T` is through a live [`SharedRwLockReadGuard`], and the only way to reach `&mut T` is through a
+/// live [`SharedRwLockWriteGuard`] — both producible only via [`read`](SharedRwLock::read) /
+/// [`write`](SharedRwLock::write), which route through the real `ReaderWriterLockSlim`. If this type
+/// is ever extended with a raw-handle accessor for C# to coordinate on, the same limit applies as
+/// `SharedMutex::shared_lock`: C# could observe/drive the *lock's* state (enter/exit read or write),
+/// never `T`'s memory, since `T` lives in a private `UnsafeCell<T>` this Rust value owns and never
+/// exposes across the interop boundary.
+pub struct SharedRwLock<T> {
+    lock: RawReaderWriterLockSlim,
+    data: UnsafeCell<T>,
+}
+
+// SAFETY: mirrors `std::sync::RwLock<T>`'s own bound — `Sync` additionally requires `T: Sync` (unlike
+// `Mutex<T>`, which only needs `T: Send`), because `SharedRwLockReadGuard` allows *multiple* concurrent
+// `&T` borrows (via separate `read()` calls, possibly from separate threads) to be live at once. `T:
+// Send` is required because a value written from one thread may be read by another when the lock
+// changes hands. `SharedRwLock<T>` only ever exposes `&T` through a read guard (behaviour: many
+// concurrent) or `&mut T` through a write guard (behaviour: exclusive of everything else), so access
+// is serialized/shared exactly as `ReaderWriterLockSlim` itself serializes/shares it.
+unsafe impl<T: Send + Sync> Sync for SharedRwLock<T> {}
+
+impl<T> SharedRwLock<T> {
+    /// `new ReaderWriterLockSlim()` (default constructor — `LockRecursionPolicy.NoRecursion`) wrapping
+    /// `value`.
+    #[inline]
+    pub fn new(value: T) -> Self {
+        Self { lock: RawReaderWriterLockSlim::new(), data: UnsafeCell::new(value) }
+    }
+
+    /// Blocking acquire of a **read** (shared) lock — `EnterReadLock()`, then returns a
+    /// [`SharedRwLockReadGuard`] giving safe `&T` access via `Deref`. Any number of readers may hold
+    /// the lock concurrently, as long as no writer holds it.
+    #[inline]
+    pub fn read(&self) -> SharedRwLockReadGuard<'_, T> {
+        self.lock.enter_read_lock();
+        SharedRwLockReadGuard { lock: &self.lock, data: &self.data }
+    }
+
+    /// Blocking acquire of the **write** (exclusive) lock — `EnterWriteLock()`, then returns a
+    /// [`SharedRwLockWriteGuard`] giving safe `&T`/`&mut T` access via `Deref`/`DerefMut`. Excludes
+    /// every reader and every other writer until dropped.
+    #[inline]
+    pub fn write(&self) -> SharedRwLockWriteGuard<'_, T> {
+        self.lock.enter_write_lock();
+        SharedRwLockWriteGuard { lock: &self.lock, data: &self.data }
+    }
+
+    /// Safe, lock-free access: `&mut self` already statically proves exclusive access, so no
+    /// enter/exit call is needed at all — exactly `std::sync::RwLock::get_mut`'s reasoning.
+    #[inline]
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
+    }
+
+    /// Consume the lock, taking ownership of the protected value directly (by-value `self` already
+    /// proves no other reference can exist).
+    #[inline]
+    pub fn into_inner(self) -> T {
+        self.data.into_inner()
+    }
+}
+
+/// RAII guard returned by [`SharedRwLock::read`] — dereferences to `&T` and calls `ExitReadLock()` on
+/// the underlying `ReaderWriterLockSlim` when dropped. See [`SharedRwLock`]'s docs for the honest
+/// safety story relative to a C# caller.
+pub struct SharedRwLockReadGuard<'a, T> {
+    lock: &'a RawReaderWriterLockSlim,
+    data: &'a UnsafeCell<T>,
+}
+
+impl<T> Deref for SharedRwLockReadGuard<'_, T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        // SAFETY: this guard is only constructed while `self.lock`'s read lock is held, and
+        // `SharedRwLock` never hands out `&mut T` (via a write guard) while any read guard could be
+        // live — `ReaderWriterLockSlim` itself guarantees a writer excludes all readers — so this is
+        // exactly as sound as `std::sync::RwLockReadGuard`'s own `Deref`.
+        unsafe { &*self.data.get() }
+    }
+}
+
+impl<T> Drop for SharedRwLockReadGuard<'_, T> {
+    #[inline]
+    fn drop(&mut self) {
+        self.lock.exit_read_lock();
+    }
+}
+
+/// RAII guard returned by [`SharedRwLock::write`] — dereferences to `&T`/`&mut T` and calls
+/// `ExitWriteLock()` on the underlying `ReaderWriterLockSlim` when dropped. See [`SharedRwLock`]'s
+/// docs for the honest safety story relative to a C# caller.
+pub struct SharedRwLockWriteGuard<'a, T> {
+    lock: &'a RawReaderWriterLockSlim,
+    data: &'a UnsafeCell<T>,
+}
+
+impl<T> Deref for SharedRwLockWriteGuard<'_, T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        // SAFETY: this guard is only constructed while `self.lock`'s write lock is held, which
+        // `ReaderWriterLockSlim` guarantees is exclusive of every reader and every other writer.
+        unsafe { &*self.data.get() }
+    }
+}
+
+impl<T> DerefMut for SharedRwLockWriteGuard<'_, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: see `Deref` above; the write lock's exclusivity is exactly what makes handing out
+        // `&mut T` sound here, matching `std::sync::RwLockWriteGuard`'s own `DerefMut` reasoning.
+        unsafe { &mut *self.data.get() }
+    }
+}
+
+impl<T> Drop for SharedRwLockWriteGuard<'_, T> {
+    #[inline]
+    fn drop(&mut self) {
+        self.lock.exit_write_lock();
     }
 }

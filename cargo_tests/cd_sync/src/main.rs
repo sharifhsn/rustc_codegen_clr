@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use mycorrhiza::sync::{Barrier, CountdownEvent, Semaphore, SharedLock, SharedMutex, Signal};
+use mycorrhiza::sync::{
+    Barrier, CountdownEvent, Semaphore, SharedLock, SharedMutex, SharedRwLock, Signal,
+};
 use mycorrhiza::system::console::Console;
 
 fn main() -> std::process::ExitCode {
@@ -235,6 +237,86 @@ fn main() -> std::process::ExitCode {
         let mut mutex = mutex;
         chk!(*mutex.get_mut(), ITERS * 2);
         chk!(mutex.into_inner(), ITERS * 2);
+    }
+
+    // ---------- 9. SharedRwLock<T>: writers serialize exactly like SharedMutex ----------
+    // Same contention shape as check #8 but through `write()` instead of `lock()` -- proves the
+    // exclusive side of the reader/writer lock genuinely excludes every other writer (and, since no
+    // reader is active concurrently here, this alone would already catch a broken ReaderWriterLockSlim
+    // wiring). Zero unsafe.
+    {
+        let rwlock = SharedRwLock::new(0i64);
+        const ITERS: i64 = 200_000;
+
+        thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| {
+                    for _ in 0..ITERS {
+                        let mut guard = rwlock.write();
+                        *guard += 1;
+                    }
+                });
+            }
+        });
+
+        chk!(*rwlock.read(), ITERS * 2);
+    }
+
+    // ---------- 10. SharedRwLock<T>: readers are genuinely concurrent ----------
+    // N threads each take a `read()` guard and hold it across a barrier-style rendezvous: every
+    // reader records that it observed the OTHERS' "I'm holding my read guard" flags all set *while its
+    // own read guard was still held*. That is only possible if the read locks truly overlap in time --
+    // a lock that (incorrectly) serialized readers would deadlock this rendezvous instead (each thread
+    // would block forever in `read()` waiting for a reader that is itself waiting to see all N flags).
+    {
+        const READERS: usize = 4;
+        let rwlock = SharedRwLock::new(123i64);
+        let holding: Vec<AtomicI32> = (0..READERS).map(|_| AtomicI32::new(0)).collect();
+        let all_saw_full_overlap = AtomicI32::new(1);
+
+        thread::scope(|s| {
+            for i in 0..READERS {
+                let rwlock = &rwlock;
+                let holding = &holding;
+                let all_saw_full_overlap = &all_saw_full_overlap;
+                s.spawn(move || {
+                    let guard = rwlock.read();
+                    holding[i].store(1, Ordering::SeqCst);
+
+                    // Poll (bounded) until every reader has announced it is holding its guard, or give
+                    // up -- a broken (serializing) implementation would never reach "all held" while
+                    // this guard is still live, since it would block acquiring THIS read lock until
+                    // whichever other "reader" (actually serialized) released first.
+                    let mut saw_all = false;
+                    for _ in 0..2000 {
+                        if holding.iter().all(|h| h.load(Ordering::SeqCst) == 1) {
+                            saw_all = true;
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    if !saw_all {
+                        all_saw_full_overlap.store(0, Ordering::SeqCst);
+                    }
+                    // Confirm the data is still readable/correct while N-way concurrent.
+                    let v = *guard;
+                    if v != 123 {
+                        all_saw_full_overlap.store(0, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+
+        chk!(all_saw_full_overlap.load(Ordering::SeqCst), 1);
+        chk!(*rwlock.read(), 123);
+    }
+
+    // ---------- 11. SharedRwLock<T>: get_mut()/into_inner() are lock-free and correct ----------
+    {
+        let mut rwlock = SharedRwLock::new(7i64);
+        chk!(*rwlock.get_mut(), 7);
+        *rwlock.get_mut() += 1;
+        chk!(rwlock.into_inner(), 8);
     }
 
     println!("== cd_sync done ==");
