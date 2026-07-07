@@ -91,6 +91,38 @@ pub fn rustc_codegen_clr_mark_last_method_override<
     diverge!()
 }
 
+/// Marks the virtual method most recently added via [`rustc_codegen_clr_add_method_def`] as the
+/// `add_*` half of a `.NET` event named `EVENT_NAME` (e.g. `event_name = "Changed"` for a C#
+/// `event Action<T> Changed`). Must come immediately after that call, before any other
+/// `add_method_def`. Pair with [`rustc_codegen_clr_mark_last_method_event_remove`] on the matching
+/// `remove_*` method — both must be present for the event to be emitted (see
+/// `EventDef`'s doc in `cilly` for the exact shape). The delegate type is inferred from the
+/// method's own second parameter (the value being subscribed/unsubscribed), not from a string —
+/// there is nothing to spell out separately.
+///
+/// Scoped intentionally narrow (see `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md`'s Tier C finding #5):
+/// the synthesized `add_`/`remove_` bodies are ordinary methods you write yourself (typically
+/// calling `Delegate.Combine`/`Delegate.Remove` on a backing delegate-typed field) — this
+/// intrinsic only links their names into the event metadata, it does not synthesize thread-safe
+/// (`Interlocked.CompareExchange`-based) bodies for you.
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_codegen_clr_mark_last_method_event_add<const EVENT_NAME: &'static str>(
+    class: ClassDef,
+) -> ClassDef {
+    diverge!()
+}
+
+/// The `remove_*` counterpart to [`rustc_codegen_clr_mark_last_method_event_add`] — see that
+/// function's doc.
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_codegen_clr_mark_last_method_event_remove<const EVENT_NAME: &'static str>(
+    class: ClassDef,
+) -> ClassDef {
+    diverge!()
+}
+
 /// Add a `static` method `FNAME` aliasing the ordinary Rust fn `fn_type`. Unlike
 /// [`rustc_codegen_clr_add_method_def`], a static method has no receiver — its parameter list is the
 /// Rust fn's signature verbatim — so a managed caller invokes it as `<Class>.FNAME(…)`.

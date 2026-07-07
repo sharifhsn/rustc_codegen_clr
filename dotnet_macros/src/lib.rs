@@ -396,6 +396,51 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         f.attrs.retain(|a| !a.path().is_ident("dotnet_override"));
 
+        // `#[dotnet_event("Name")]` — links this method into a `.NET` event's `add_*`/`remove_*`
+        // half (see `rustc_codegen_clr_mark_last_method_event_add`'s doc). Which half is decided
+        // by the fn's own name prefix (`add_`/`remove_`), matching the real C# codegen convention
+        // for events — not a separate attribute argument, since the method already has to be named
+        // that way for the pair to link up on the .NET side regardless.
+        let mut event_name: Option<String> = None;
+        for attr in &f.attrs {
+            if attr.path().is_ident("dotnet_event") {
+                let spec = match attr.parse_args::<syn::LitStr>() {
+                    Ok(lit) => lit.value(),
+                    Err(_) => {
+                        return syn::Error::new(
+                            attr.span(),
+                            "#[dotnet_event(\"Name\")]: expected a single string literal \
+                             argument naming the event",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                };
+                event_name = Some(spec);
+            }
+        }
+        f.attrs.retain(|a| !a.path().is_ident("dotnet_event"));
+        let event_role = match &event_name {
+            Some(_) => {
+                let fn_name = f.sig.ident.to_string();
+                if fn_name.starts_with("add_") {
+                    Some(true)
+                } else if fn_name.starts_with("remove_") {
+                    Some(false)
+                } else {
+                    return syn::Error::new(
+                        f.sig.ident.span(),
+                        "#[dotnet_event(\"Name\")]: the method name must start with `add_` or \
+                         `remove_` (matching the real C# event codegen convention) so its role \
+                         is unambiguous",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+            }
+            None => None,
+        };
+
         let fn_ident = &f.sig.ident;
         let fname_lit = LitStr::new(&fn_ident.to_string(), fn_ident.span());
 
@@ -456,6 +501,17 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     >(class);
                 });
             }
+            if let (Some(name), Some(is_add)) = (&event_name, event_role) {
+                let name_lit = LitStr::new(name, fn_ident.span());
+                let intrinsic = if is_add {
+                    quote! { rustc_codegen_clr_mark_last_method_event_add }
+                } else {
+                    quote! { rustc_codegen_clr_mark_last_method_event_remove }
+                };
+                method_calls.push(quote! {
+                    let class = ::mycorrhiza::comptime::#intrinsic::<#name_lit>(class);
+                });
+            }
         } else {
             if let Some(spec) = override_base {
                 let _ = spec;
@@ -463,6 +519,15 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     fn_ident.span(),
                     "#[dotnet_override]: only supported on an instance (virtual) method — a \
                      static method has no vtable slot to override",
+                )
+                .to_compile_error()
+                .into();
+            }
+            if event_name.is_some() {
+                return syn::Error::new(
+                    fn_ident.span(),
+                    "#[dotnet_event]: only supported on an instance method (add_*/remove_* take \
+                     the subscriber as a parameter) — a static method can't back a .NET event",
                 )
                 .to_compile_error()
                 .into();

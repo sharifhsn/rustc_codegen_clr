@@ -434,11 +434,56 @@ code path reaches them yet outside hand-built test assemblies) but all three clo
 whoever wires the next layer.
 
 **What could go wrong** (unchanged from the original research, still applies to the un-shipped
-`pe_exporter`/macro-wiring work): MethodSemantics/EventMap row-ordering bugs in the PE writer; the
-`add_`/`remove_` bodies need genuine thread-safety (`Interlocked.CompareExchange`-based) for real
+`pe_exporter` work): MethodSemantics/EventMap row-ordering bugs in the PE writer; the `add_`/
+`remove_` bodies need genuine thread-safety (`Interlocked.CompareExchange`-based) for real
 concurrent-subscription correctness — the shipped spike's bodies are deliberately trivial/
 non-thread-safe, matching the "smallest safe first step" scope, not a production-ready event; and a
-naming-scheme decision for the backing delegate field once this reaches macro/comptime wiring.
+naming-scheme decision for the backing delegate field once this reaches production use.
+
+**UPDATE (2026-07-07): macro/comptime wiring done, TWO real bugs found and fixed, one real
+end-to-end blocker discovered and NOT yet resolved.** `#[dotnet_event("Name")]` on a pair of
+`add_*`/`remove_*` methods in a `#[dotnet_methods]` impl now drives `ClassDef::add_event` through
+new `mycorrhiza::comptime::rustc_codegen_clr_mark_last_method_event_add`/`_remove` intrinsics — the
+delegate type is inferred from the method's own second parameter (the subscriber value), never a
+separately-spelled string. Two real `il_exporter` bugs were found and fixed while wiring this up
+(both were invisible to the earlier hand-built-`ClassDef` spike, which happened to construct
+self-consistent metadata by hand):
+1. The `.event`/`.addon`/`.removeon` block used the wrong type-formatting helper (the body-position
+   `non_void_type_il`, not the declaration-position `non_void_type_il_signature` the `.method`
+   header itself uses) — produced a real assembly-qualifier mismatch (`[System.Private.CoreLib]`
+   vs `[System.Runtime]` for the identical delegate type) that `ilasm` correctly rejected with
+   "Invalid Add method of event".
+2. The `add_`/`remove_` methods themselves weren't marked `specialname` — `ilasm` requires this on
+   event accessors (confirmed by a hand-written `.il` file that worked WITH `specialname` and one
+   that failed without it). Fixed via a class-events lookup in `il_exporter::emit_one_method`
+   (checking whether this `MethodDefIdx` is referenced as an `add`/`remove` in its own class's
+   `EventDef`s) rather than a new `MethodDef` flag, since `MethodDefIdx` already IS the method's
+   own `Interned<MethodRef>` — no new state needs threading through the linker's merge pass.
+
+Both fixes are proven correct via `cilly::ir::asm::export_event` (still passes) AND two independent
+hand-assembled `.il` repros (a minimal `Notifier` class with the exact emitted shape, PLUS the same
+class prefixed with the real generated assembly's full 26-entry `.assembly extern` list) — both
+assemble cleanly with `ilasm`.
+
+**However, the actual end-to-end proof crate (`cargo_tests/cd_event`, since removed) still fails
+to build under `DIRECT_PE=0`** with the SAME "Invalid Add method of event" error, even after both
+fixes — despite the emitted `Notifier` class being byte-for-byte structurally identical (modulo
+irrelevant `.line` debug directives) to the two isolated repros that DO assemble cleanly. The
+difference is scale: the real crate's generated `.il` is ~500K lines (the entire monomorphized
+std library gets baked in even for a ~15-line Rust program, a known pre-existing characteristic of
+this backend, not something the events work caused) versus a ~30-line hand-built repro. This
+strongly suggests a genuine Mono `ilasm` limitation/bug at extreme file scale (tested against both
+Mono ilasm 6.14.1.0 locally on macOS and 6.8.0.105 inside the project's own Docker dev image — same
+symptom on both), analogous in kind (though not mechanism) to the Roslyn CS0648 bug found earlier
+in this campaign for generic interface instantiation — i.e., a third-party tool limitation, not
+necessarily a defect in this project's emitted metadata. **Not yet resolved** — candidate next
+steps: try CoreCLR's `ilasm` instead of Mono's (this project already has version-gated CoreCLR
+ilasm plumbing for other reasons, per `cargo-dotnet --dotnet` version selection); try shrinking the
+demo crate's std footprint (a `#![no_std]`-adjacent minimal build, if this backend's PAL supports
+one); or investigate whether `DIRECT_PE=1` (the default `pe_exporter` path) sidesteps `ilasm`
+entirely once it gains real Event/EventMap/MethodSemantics table support (see the `pe_exporter` gap
+noted below — it currently has NO code path that reads `ClassDef::events()` at all, so it silently
+drops any event's metadata rather than emitting it, wrong OR right).
 
 **Original Tier C verdict, for context:**
 

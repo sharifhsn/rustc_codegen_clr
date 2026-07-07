@@ -2965,7 +2965,7 @@ fn export_event() {
         class_idx,
         add_name,
         add_sig,
-        MethodKind::Instance,
+        MethodKind::Virtual,
         MethodImpl::MethodBody {
             blocks: vec![bb.clone()],
             locals: vec![],
@@ -2983,7 +2983,7 @@ fn export_event() {
         class_idx,
         remove_name,
         remove_sig,
-        MethodKind::Instance,
+        MethodKind::Virtual,
         MethodImpl::MethodBody {
             blocks: vec![bb],
             locals: vec![],

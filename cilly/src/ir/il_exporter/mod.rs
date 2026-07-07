@@ -397,7 +397,15 @@ impl ILExporter {
             // PE writer has no equivalent yet (see `ClassDef::add_event`'s doc for scope).
             for ev in class_def.events() {
                 let ev_name = asm_mut[ev.name()].to_string();
-                let delegate_ty = non_void_type_il(&ev.delegate(), asm_mut);
+                // `_signature` variant (not the plain `non_void_type_il` body-position path): a
+                // C#-consumer-visible declaration shape, exactly like the `.method` header itself
+                // (see that variant's doc) — using the body-position helper here produced a real
+                // bug: the event's declared delegate type and the add/remove `.method` header's
+                // own parameter type disagreed on assembly qualifier (`[System.Private.CoreLib]`
+                // vs `[System.Runtime]` for the identical type), which `ilasm` correctly rejected
+                // with "Invalid Add method of event" even though both resolve to the same runtime
+                // type via assembly forwarding.
+                let delegate_ty = non_void_type_il_signature(&ev.delegate(), asm_mut);
                 let add_text = self.method_ref_operand_text(asm_mut, ev.add());
                 let remove_text = self.method_ref_operand_text(asm_mut, ev.remove());
                 writeln!(
@@ -412,8 +420,16 @@ impl ILExporter {
     }
     /// Builds the `<class>::'<name>'(<params>)` text ECMA-335 uses to reference a method by full
     /// signature (as opposed to `.override`'s bare `<class>::<name>`) — the shape `.addon`/
-    /// `.removeon` need. Factored out of `export_node`'s `CILNode::Call` arm, which builds the
-    /// identical text for a `call`/`callvirt` operand (just prefixed with the call opcode there).
+    /// `.removeon` need. Modeled on `export_node`'s `CILNode::Call` arm, which builds nearly
+    /// identical text for a `call`/`callvirt` operand (prefixed with the call opcode there) — but
+    /// unlike a call operand (a body-position use, the plain impl-assembly-qualified `type_il`/
+    /// `non_void_type_il` path), `.addon`/`.removeon` are C#-consumer-visible DECLARATION shapes,
+    /// exactly like a `.method` header's own parameter list — so this uses the `_signature`
+    /// variants. Using the body-position helper here was a real bug: it made the referenced
+    /// method's param type text disagree with that same method's own `.method` header (different
+    /// assembly qualifier for the identical type, e.g. `[System.Private.CoreLib]` here vs
+    /// `[System.Runtime]` there), which `ilasm` correctly rejects with "Invalid Add method of
+    /// event" even though both resolve to the same runtime type via assembly forwarding.
     fn method_ref_operand_text(
         &self,
         asm: &mut super::Assembly,
@@ -421,7 +437,7 @@ impl ILExporter {
     ) -> String {
         let mref = &asm[mref];
         let sig = &asm[mref.sig()];
-        let output = type_il(sig.output(), asm);
+        let output = type_il_signature(sig.output(), asm);
         let inputs = match mref.kind() {
             crate::cilnode::MethodKind::Static => sig.inputs(),
             crate::cilnode::MethodKind::Instance
@@ -430,7 +446,7 @@ impl ILExporter {
         };
         let inputs: String = inputs
             .iter()
-            .map(|tpe| non_void_type_il(tpe, asm))
+            .map(|tpe| non_void_type_il_signature(tpe, asm))
             .intersperse(",".to_owned())
             .collect();
         let name = &asm[mref.name()];
@@ -465,6 +481,19 @@ impl ILExporter {
                 crate::Access::Private => "private",
             }
         };
+        // True if this method is the `add`/`remove` half of one of its own class's events (see
+        // `ClassDef::add_event`'s doc) — checked by identity against the class's `EventDef`s
+        // rather than a dedicated `MethodDef` flag, since `MethodDefIdx` already IS the method's
+        // own `Interned<MethodRef>` (`MethodDefIdx(pub Interned<MethodRef>)`), so no extra state
+        // needs threading through the linker's merge pass for this. `ilasm` requires an event's
+        // accessor methods to carry `specialname` — omitting it produced a genuine "Invalid Add
+        // method of event" rejection even though every other part of the shape (signature,
+        // assembly-qualifier agreement) was correct.
+        let is_event_accessor = asm
+            .get_class_def(method.class())
+            .events()
+            .iter()
+            .any(|ev| ev.add() == method_id.0 || ev.remove() == method_id.0);
         let kind = match method.kind() {
             crate::cilnode::MethodKind::Static => "static",
             crate::cilnode::MethodKind::Instance => "instance",
@@ -473,6 +502,9 @@ impl ILExporter {
             // an existing vtable slot, `abstract` because it has no body (RVA=0, §II.15.4.2.2).
             crate::cilnode::MethodKind::Virtual if method.is_abstract() => {
                 "newslot abstract virtual instance"
+            }
+            crate::cilnode::MethodKind::Virtual if is_event_accessor => {
+                "specialname virtual instance"
             }
             crate::cilnode::MethodKind::Virtual => "virtual instance",
             // A constructor is an instance method (the `instance` calling-convention keyword
@@ -2098,9 +2130,12 @@ fn non_void_type_il_signature(tpe: &Type, asm: &Assembly) -> String {
 /// signatures, field declarations, locals), which are either invisible to a C# compiler (bodies are
 /// never read) or would be genuinely JIT-rejected if re-qualified this way (a real CoreLib
 /// `System.String`/`System.Object` instance method resolved via `[System.Runtime]` inside a body is
-/// "Bad IL format" — see `class_ref`'s doc comment). This function must therefore be called ONLY from
-/// the two call sites that emit a method's declared signature, never from a body/calli/field/locals
-/// position.
+/// "Bad IL format" — see `class_ref`'s doc comment). This function must therefore be called ONLY
+/// from call sites that emit a genuine C#-visible DECLARATION shape — a `.method` header's own
+/// signature, `.event`'s delegate type, or `.addon`/`.removeon`'s full method-reference text (the
+/// event ones must agree with the referenced method's own `.method` header, or `ilasm` rejects
+/// the mismatch as "Invalid Add method of event" even though both forms resolve to the same
+/// runtime type) — never from a body/calli/field/locals position.
 ///
 /// Only `Type::ClassRef` differs from [`type_il`]; every other arm recurses back into the plain
 /// `type_il`/`non_void_type_il` (nested types inside a signature, e.g. an array element or generic

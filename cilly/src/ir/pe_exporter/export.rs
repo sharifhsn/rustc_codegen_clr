@@ -212,6 +212,20 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
              docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md's Tier C finding #2.",
             &asm[class_def.name()]
         );
+        // `ClassDef::add_event` (§II.22.12/13/28's EventMap/Event/MethodSemantics rows) has no
+        // support in this writer at all — no code path here even reads `class_def.events()`, so
+        // silently dropping it would emit an ordinary class with plain public `add_`/`remove_`
+        // methods and no `event` C# can subscribe to with `+=`/`-=`. Same "no PE-writer support
+        // yet" reasoning as the two guards above. See docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md's
+        // Tier C finding #5.
+        assert!(
+            class_def.events().is_empty(),
+            "class '{}' declares a .NET event (ClassDef::add_event), but the direct PE writer \
+             (DIRECT_PE=1, the default) does not yet support Event/EventMap/MethodSemantics \
+             metadata rows -- set DIRECT_PE=0 to use il_exporter (ilasm text) instead, which \
+             does. See docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md's Tier C finding #5.",
+            &asm[class_def.name()]
+        );
         // Every class needs an `Extends` row: `il_exporter::export_to_write` never leaves it NIL
         // — an explicit `extends` clause wins, otherwise `[System.Runtime]System.ValueType` for a
         // valuetype or `[System.Runtime]System.Object` for a reference type (mirrors that

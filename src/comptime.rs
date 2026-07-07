@@ -17,8 +17,8 @@
 
 use cilly::cilnode::MethodKind;
 use cilly::{
-    Access, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, FieldDesc, MethodDef, MethodImpl,
-    MethodRef, Type,
+    Access, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, FieldDesc, Interned, MethodDef,
+    MethodImpl, MethodRef, Type,
 };
 use cilly::{Float, Int};
 use rustc_codegen_clr_call::CallInfo;
@@ -69,6 +69,12 @@ struct PendingClass<'tcx> {
     /// its signature is assumed identical too (definitionally true for a valid override), so no
     /// separate base-signature needs to be carried here.
     method_overrides: std::collections::HashMap<String, (String, String)>,
+    /// `managed_method_name -> (event_name, is_add)` — links a virtual method already registered
+    /// in `methods` above to a `.NET` event's `add_*`/`remove_*` half (see
+    /// `rustc_codegen_clr_mark_last_method_event_add`'s doc). `is_add = true` for the `add_*`
+    /// method, `false` for `remove_*`. Both halves of the same `event_name` must be present by the
+    /// time `finish_type` runs, or building the `EventDef` panics with a clear message.
+    event_bindings: std::collections::HashMap<String, (String, bool)>,
 }
 
 #[derive(Clone)]
@@ -169,6 +175,7 @@ pub fn interpret<'tcx>(
                         has_default_ctor: false,
                         has_field_setters: false,
                         method_overrides: std::collections::HashMap::new(),
+                        event_bindings: std::collections::HashMap::new(),
                     })
                 } else if fname.contains("rustc_codegen_clr_add_field_def") {
                     let src = operand_local(&args[0].node);
@@ -211,6 +218,34 @@ pub fn interpret<'tcx>(
                         )
                         .clone();
                     class.method_overrides.insert(method_name, (base_asm, base_type));
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_mark_last_method_event_add") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    let event_name = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
+                    let (method_name, _) = class
+                        .methods
+                        .last()
+                        .expect(
+                            "comptime: rustc_codegen_clr_mark_last_method_event_add called with \
+                             no preceding add_method_def in this entrypoint",
+                        )
+                        .clone();
+                    class.event_bindings.insert(method_name, (event_name, true));
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_mark_last_method_event_remove") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    let event_name = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
+                    let (method_name, _) = class
+                        .methods
+                        .last()
+                        .expect(
+                            "comptime: rustc_codegen_clr_mark_last_method_event_remove called \
+                             with no preceding add_method_def in this entrypoint",
+                        )
+                        .clone();
+                    class.event_bindings.insert(method_name, (event_name, false));
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_add_static_method_def") {
                     let src = operand_local(&args[0].node);
@@ -442,6 +477,15 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         ctx.class_mut(class_idx).add_interface(iface_ref);
     }
 
+    // Accumulates each event's `add`/`remove` `MethodRef` + delegate `Type` as the method loop
+    // below encounters them (in whatever order `class.methods` happens to hold them) — see
+    // `rustc_codegen_clr_mark_last_method_event_add`'s doc. Built into real `EventDef`s once the
+    // loop finishes and every event has both halves.
+    let mut pending_events: std::collections::HashMap<
+        String,
+        (Option<Interned<MethodRef>>, Option<Interned<MethodRef>>, Option<Type>),
+    > = std::collections::HashMap::new();
+
     // Each virtual method aliases an ordinary Rust fn (codegen'd separately). The Rust fn takes the
     // receiver as its first explicit arg, so its signature matches the virtual method's.
     for (method_name, target) in &class.methods {
@@ -483,7 +527,33 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             let base_mref = ctx.alloc_methodref(base_mref);
             mdef = mdef.with_override(base_mref);
         }
+        if let Some((event_name, is_add)) = class.event_bindings.get(method_name) {
+            // The delegate type is the method's own second signature input (index 0 is the
+            // receiver) — the value being subscribed/unsubscribed — never a separately-spelled
+            // string (see `rustc_codegen_clr_mark_last_method_event_add`'s doc).
+            let delegate_ty = ctx[sig].inputs()[1];
+            let mref = ctx.alloc_methodref(mdef.ref_to());
+            let entry = pending_events.entry(event_name.clone()).or_insert((None, None, None));
+            if *is_add {
+                entry.0 = Some(mref);
+            } else {
+                entry.1 = Some(mref);
+            }
+            entry.2 = Some(delegate_ty);
+        }
         ctx.new_method(mdef);
+    }
+    for (event_name, (add, remove, delegate_ty)) in pending_events {
+        let add = add.unwrap_or_else(|| {
+            panic!("comptime: event '{event_name}' has a remove_* method but no add_* — both halves are required")
+        });
+        let remove = remove.unwrap_or_else(|| {
+            panic!("comptime: event '{event_name}' has an add_* method but no remove_* — both halves are required")
+        });
+        let delegate_ty = delegate_ty.expect("comptime: event delegate type unset (unreachable — set alongside add/remove)");
+        let name = ctx.alloc_string(event_name);
+        ctx.class_mut(class_idx)
+            .add_event(cilly::class::EventDef::new(name, delegate_ty, add, remove));
     }
 
     // Each static method aliases an ordinary Rust fn, but unlike a virtual it has NO receiver — its
