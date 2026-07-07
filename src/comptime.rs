@@ -75,6 +75,14 @@ struct PendingClass<'tcx> {
     /// method, `false` for `remove_*`. Both halves of the same `event_name` must be present by the
     /// time `finish_type` runs, or building the `EventDef` panics with a clear message.
     event_bindings: std::collections::HashMap<String, (String, bool)>,
+    /// This class is a genuine ECMA-335 `interface` `TypeDef` (from `#[dotnet_interface]` on a Rust
+    /// trait), not an ordinary class — registered via `ClassDef::with_interface()`. Its members are
+    /// all in `abstract_methods` (never `methods`), and it has no base type / no ctors.
+    is_interface: bool,
+    /// `(managed_method_name, signature_carrier_fn)` — abstract (no-body) interface members. The
+    /// carrier is used ONLY to extract the member's signature (like `methods`' targets), but it is
+    /// NOT aliased: the emitted `MethodDef` is `MethodImpl::Missing` + `.with_abstract()` (RVA=0).
+    abstract_methods: Vec<(String, Instance<'tcx>)>,
 }
 
 #[derive(Clone)]
@@ -176,6 +184,8 @@ pub fn interpret<'tcx>(
                         has_field_setters: false,
                         method_overrides: std::collections::HashMap::new(),
                         event_bindings: std::collections::HashMap::new(),
+                        is_interface: false,
+                        abstract_methods: vec![],
                     })
                 } else if fname.contains("rustc_codegen_clr_add_field_def") {
                     let src = operand_local(&args[0].node);
@@ -198,6 +208,23 @@ pub fn interpret<'tcx>(
                         .expect("comptime: invalid method target")
                         .expect("comptime: could not resolve method target instance");
                     class.methods.push((method_name, target));
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_add_abstract_method_def") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    // Generics: <const FNAME, FnType> — so FNAME is [0], the signature-carrier fn
+                    // type is [1]. The carrier is resolved to an `Instance` only to read its
+                    // signature (like `add_method_def`), never aliased/codegen'd.
+                    let method_name = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
+                    let fn_ty = ctx.monomorphize(subst_ref[1].as_type().unwrap());
+                    let TyKind::FnDef(fdef, fsubst) = fn_ty.kind() else {
+                        panic!("comptime: abstract method signature carrier is not a function definition");
+                    };
+                    let fsubst = ctx.monomorphize(*fsubst);
+                    let carrier = Instance::try_resolve(ctx.tcx(), env, *fdef, fsubst)
+                        .expect("comptime: invalid abstract method signature carrier")
+                        .expect("comptime: could not resolve abstract method signature carrier instance");
+                    class.abstract_methods.push((method_name, carrier));
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_mark_last_method_override") {
                     let src = operand_local(&args[0].node);
@@ -300,6 +327,11 @@ pub fn interpret<'tcx>(
                     let src = operand_local(&args[0].node);
                     let mut class = locals[src].as_class().clone();
                     class.has_field_setters = true;
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_mark_interface") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    class.is_interface = true;
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_finish_type") {
                     let src = operand_local(&args[0].node);
@@ -414,7 +446,7 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         }
         existing
     } else {
-        let def = ClassDef::new(
+        let mut def = ClassDef::new(
             name,
             class.is_value_type,
             0,
@@ -426,6 +458,13 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             None,
             true,
         );
+        // `#[dotnet_interface]`: a genuine ECMA-335 `interface` TypeDef (no base, Interface+Abstract
+        // flags). An interface is always registered fresh here (a trait is defined by exactly one
+        // entrypoint — no `#[dotnet_methods]`-style re-opening), so the idempotent-reuse branch
+        // above never applies to it.
+        if class.is_interface {
+            def = def.with_interface();
+        }
         ctx.class_def(def)
             .expect("comptime: layout error registering interop class")
     };
@@ -554,6 +593,30 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         let name = ctx.alloc_string(event_name);
         ctx.class_mut(class_idx)
             .add_event(cilly::class::EventDef::new(name, delegate_ty, add, remove));
+    }
+
+    // Abstract (no-body) interface members (`#[dotnet_interface]`). The signature comes from a
+    // carrier fn (like a virtual method's target), but the member is emitted as `MethodImpl::
+    // Missing` + `.with_abstract()` — NO `AliasFor`, so nothing is codegen'd for it and its
+    // `MethodDef.RVA` stays 0 (§II.22.26). The receiver is the carrier's first input (the interface
+    // handle), sliced off in the C#-visible declared signature exactly like a virtual method.
+    for (method_name, carrier) in &class.abstract_methods {
+        let call_info = CallInfo::sig_from_instance_(*carrier, ctx);
+        let fn_sig = call_info.sig().clone();
+        let arg_names = vec![None; fn_sig.inputs().len()];
+        let sig = ctx.alloc_sig(fn_sig);
+        let mname = ctx.alloc_string(method_name.clone());
+        let mdef = MethodDef::new(
+            Access::Extern,
+            class_idx,
+            mname,
+            sig,
+            MethodKind::Virtual,
+            MethodImpl::Missing,
+            arg_names,
+        )
+        .with_abstract();
+        ctx.new_method(mdef);
     }
 
     // Each static method aliases an ordinary Rust fn, but unlike a virtual it has NO receiver — its

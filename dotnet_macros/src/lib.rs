@@ -16,7 +16,7 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
     parse_macro_input, punctuated::Punctuated, spanned::Spanned, FnArg, ImplItem, ItemFn, ItemImpl,
-    ItemStruct, LitBool, LitStr, MetaNameValue, ReturnType, Token, Type,
+    ItemStruct, ItemTrait, LitBool, LitStr, MetaNameValue, ReturnType, Token, TraitItem, Type,
 };
 
 /// Split a `"[Assembly]Namespace.Type"` spec into `(assembly, type_name)`. An empty/`[]`-less spec
@@ -292,6 +292,145 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_primary_ctor(class);
                 #default_ctor_call
                 #field_setters_call
+                ::mycorrhiza::comptime::rustc_codegen_clr_finish_type(class);
+            }
+        }
+    };
+    expanded.into()
+}
+
+// ============================================================================
+// #[dotnet_interface] — turn a Rust trait into a C#-consumable .NET interface.
+// ============================================================================
+
+/// `#[dotnet_interface]` on a Rust `trait` emits a genuine ECMA-335 `interface` `TypeDef` (via the
+/// PE writer on the default `DIRECT_PE=1` path) whose members are the trait's methods, each an
+/// abstract (no-body) instance method. A C# consumer can then implement it (`class Foo :
+/// IMyInterface { … }`) and use it polymorphically, and a Rust `#[dotnet_class]` can implement it
+/// via `implements = "IMyInterface"`.
+///
+/// Each trait method must take `&self` (or `&mut self`) as its first parameter — it becomes the
+/// interface's implicit `this` receiver — and must have NO default body (default interface methods
+/// aren't supported). The other parameters and the return type map straight through:
+///
+/// ```ignore
+/// #[dotnet_interface]
+/// pub trait ISpeaker {
+///     fn Speak(&self);              // C#: void Speak();
+///     fn Volume(&self) -> i32;      // C#: int Volume();
+/// }
+/// ```
+///
+/// The macro also emits an `<Name>Handle` managed-handle alias (a Rust-side reference to the
+/// interface type). The trait itself is re-emitted unchanged — it is a declaration vehicle only
+/// (nothing needs to `impl` it in Rust; managed types satisfy the interface by name+signature).
+#[proc_macro_attribute]
+pub fn dotnet_interface(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as ItemTrait);
+    let trait_name = input.ident.clone();
+    let span = trait_name.span();
+    let name_lit = LitStr::new(&trait_name.to_string(), span);
+    let handle_ident = format_ident!("{}Handle", trait_name);
+    let entry_mod = format_ident!("__dotnet_interface_{}", trait_name);
+
+    // One signature-carrier fn + one `add_abstract_method_def` call per trait method.
+    let mut carriers = Vec::new();
+    let mut method_calls = Vec::new();
+    for it in &input.items {
+        let TraitItem::Fn(m) = it else {
+            return syn::Error::new(
+                it.span(),
+                "#[dotnet_interface]: only `fn` members are supported in the trait",
+            )
+            .to_compile_error()
+            .into();
+        };
+        if m.default.is_some() {
+            return syn::Error::new(
+                m.span(),
+                "#[dotnet_interface]: interface methods must have no body (default interface \
+                 methods aren't supported)",
+            )
+            .to_compile_error()
+            .into();
+        }
+        let fn_ident = &m.sig.ident;
+        let fname_lit = LitStr::new(&fn_ident.to_string(), fn_ident.span());
+        let carrier_ident = format_ident!("__iface_sig_{}", fn_ident);
+
+        // Build the carrier's parameter list: the leading `&self`/`self` receiver becomes an
+        // explicit `_this: <Name>Handle` (the interface's own managed handle — the receiver an
+        // instance method carries at signature-input 0); every other parameter is kept verbatim.
+        let mut carrier_inputs: Punctuated<FnArg, Token![,]> = Punctuated::new();
+        match m.sig.inputs.first() {
+            Some(FnArg::Receiver(_)) => {
+                let recv: FnArg = syn::parse_quote!(_this: #handle_ident);
+                carrier_inputs.push(recv);
+            }
+            _ => {
+                return syn::Error::new(
+                    fn_ident.span(),
+                    format!(
+                        "#[dotnet_interface]: method `{fn_ident}` must take `&self` as its first \
+                         parameter — interface members are instance methods"
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
+        }
+        for arg in m.sig.inputs.iter().skip(1) {
+            match arg {
+                FnArg::Typed(pt) => carrier_inputs.push(FnArg::Typed(pt.clone())),
+                FnArg::Receiver(r) => {
+                    return syn::Error::new(
+                        r.span(),
+                        "#[dotnet_interface]: `self` is only allowed as the first parameter",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+            }
+        }
+        let output = &m.sig.output;
+        carriers.push(quote! {
+            fn #carrier_ident(#carrier_inputs) #output { ::core::unimplemented!() }
+        });
+        method_calls.push(quote! {
+            let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_abstract_method_def::<
+                #fname_lit, _,
+            >(class, #carrier_ident);
+        });
+    }
+
+    let expanded = quote! {
+        // The trait, unchanged — a declaration vehicle only.
+        #input
+
+        /// Managed handle to this Rust-defined .NET interface (Rust-side references; C# refers to
+        /// the interface by its plain name).
+        #[allow(non_camel_case_types, dead_code)]
+        pub type #handle_ident =
+            ::mycorrhiza::intrinsics::RustcCLRInteropManagedClass<"", #name_lit>;
+
+        #[allow(non_snake_case, dead_code, unused_variables, internal_features, clippy::diverging_sub_expression)]
+        mod #entry_mod {
+            use super::*;
+            // Signature-only carriers: named ONLY in the interpreted entrypoint below, so the
+            // mono-collector never codegens them (an abstract interface member has no body).
+            #(#carriers)*
+            // The comptime interpreter only *reads* this fn's MIR; a `#[used]` root keeps it (and
+            // the interface) from being dropped as dead code.
+            #[used]
+            static PREVENT_DCE: fn() = rustc_codegen_clr_comptime_entrypoint;
+            #[inline(never)]
+            pub fn rustc_codegen_clr_comptime_entrypoint() {
+                // An interface has no base type -> empty superclass args.
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_new_typedef::<
+                    #name_lit, false, "", "",
+                >();
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_mark_interface(class);
+                #(#method_calls)*
                 ::mycorrhiza::comptime::rustc_codegen_clr_finish_type(class);
             }
         }

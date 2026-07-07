@@ -225,9 +225,21 @@ design decision before any code is written).
 > `cargo_tests/cd_override` 5/5 (incl. the decisive `((object)g).ToString()` base-slot dispatch) and
 > `cargo_tests/cd_event` 4/4 (`+=`/`-=` + `GetEvent` reflection), both built with zero `ilasm`; plus
 > a `pe_exporter` structural-readback unit test for the interface `TypeDef`
-> (`interface_type_def_and_abstract_method_are_emitted_by_pe_writer`). Interface-export still lacks
-> a macro surface (a Rust `trait` → interface), so it has no cargo-crate proof yet — that macro
-> wiring is the only remaining item for these three.
+> (`interface_type_def_and_abstract_method_are_emitted_by_pe_writer`).
+>
+> **UPDATE (2026-07-07, follow-up) — interface-export now has its macro surface too, so ALL THREE
+> features are fully Rust-facing and fully PE-writer-emitted.** `#[dotnet_interface]` on a Rust
+> `trait` (each method `fn Foo(&self, …) -> …`, no body) synthesizes a genuine C# interface via two
+> new comptime intrinsics (`rustc_codegen_clr_mark_interface` + `rustc_codegen_clr_add_abstract_
+> method_def`, whose signature-carrier fns are never codegen'd — abstract members have no body) →
+> `PendingClass.is_interface`/`abstract_methods` → `ClassDef::with_interface()` + abstract
+> `MethodDef::with_abstract()`. Proven end-to-end on the default `DIRECT_PE=1` path by
+> `cargo_tests/cd_interface` 4/4: a Rust `trait ISpeaker { fn Speak(&self); fn Volume(&self) -> i32; }`
+> is implemented by a C# `class Parrot : ISpeaker` (which only COMPILES against a real interface),
+> used polymorphically through the interface, and reflects as `typeof(ISpeaker).IsInterface == true`
+> with `Parrot.GetInterfaces()` listing it — zero `ilasm`. Nothing remains for these three features
+> at the shipped scope (deeper items — base-ctor-chaining for overrides, thread-safe event bodies,
+> default interface methods — stay explicitly out of scope, see each finding).
 
 ### 1. `#[dotnet_class]` virtual-method overrides — SHIPPED (2026-07-07, IL-exporter-only)
 

@@ -1,0 +1,20 @@
+[package]
+name = "cd_interface"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# A .NET class library: `cargo dotnet build` emits `cd_interface.dll` containing a genuine
+# ECMA-335 interface synthesized from a Rust trait via `#[dotnet_interface]`. Under the default
+# DIRECT_PE=1 path the hand-rolled PE writer emits the Interface+Abstract TypeDef directly (no ilasm).
+crate-type = ["cdylib"]
+
+[dependencies]
+mycorrhiza = { path = "../../../mycorrhiza" }
+dotnet_macros = { path = "../../../dotnet_macros" }
+
+# Under the repo workspace root -> needs a bare `[workspace]` (the cd_pure footgun).
+[workspace]
+
+[profile.release.build-override]
+codegen-units = 1
