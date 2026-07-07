@@ -639,6 +639,9 @@ impl Assembly {
             let base_ref = self.alloc_methodref(base_ref);
             translated = translated.with_override(base_ref);
         }
+        if def.is_abstract() {
+            translated = translated.with_abstract();
+        }
         translated
     }
     pub(crate) fn translate_class_def(&mut self, source: &Assembly, def: &ClassDef) -> ClassDef {
@@ -690,6 +693,9 @@ impl Assembly {
             def.align(),
             def.has_nonveralpping_layout(),
         );
+        if def.is_interface() {
+            translated = translated.with_interface();
+        }
         // Carry the implemented-interface set across the assembly boundary.
         for iface in def.implements() {
             let iface = self.translate_class_ref(source, *iface);

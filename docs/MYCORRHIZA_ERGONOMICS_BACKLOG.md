@@ -270,7 +270,45 @@ ToString()`) — add an explicit `.override` MethodImpl-row capability, IL-expor
 the concrete type and an `Object`-typed reference. Do not attempt general ctor-chaining or
 protected-member forwarding in that first step.
 
-### 2. Export Rust traits as C# interfaces (reverse of `implements=`)
+### 2. Export Rust traits as C# interfaces (reverse of `implements=`) — SPIKE DONE (2026-07-07)
+
+**Smallest-safe-first-step spike shipped, exactly as scoped below — `cilly`-only, IL-exporter-only,
+no macro/comptime/typechecker/PE-writer work.** `ClassDef::with_interface()` (new bool flag,
+default `false`, additive) marks a `ClassDef` as a genuine ECMA-335 `interface` `TypeDef`;
+`MethodDef::with_abstract()` (same pattern) marks a member as `Abstract`/`NewSlot`/no-body
+(RVA=0). `il_exporter` emits `.class {vis} interface abstract ansi '{name}'{implements}{{` with
+**no** `extends` clause at all (even the usual implicit `[System.Runtime]System.Object` is illegal
+for an `Interface`-flagged `TypeDef` — CoreCLR rejects it at load time), and
+`newslot abstract virtual instance` + an empty `{}` body (no `.maxstack`, no `.entrypoint` — both
+are body-only directives `ilasm` rejects on an abstract method) for each abstract member.
+
+Proven with `cilly/src/ir/asm::export_interface` (a `#[test]`, part of the persisted `cargo test -p
+cilly` suite) hand-building an `Assembly` with one interface `ISpeaker` and one abstract member
+`Speak()`, exported through the real `il_exporter` + `ilasm` — `ilasm` accepts the emitted IL
+without error. **Also hand-verified the actual ask from this finding** (CoreCLR genuinely treating
+it as an implementable interface, not just something `ilasm` tolerates): a scratch C# console app
+implementing `ISpeaker` on a `Parrot` class, called through the interface type, reports
+`is ISpeaker: True` and `typeof(Parrot).GetInterfaces()` correctly lists `ISpeaker` — a real,
+consumable interface, verified via reflection and a virtual dispatch, not just a load-time check.
+
+**Same lesson as the virtual-override work applies and was pre-empted this time:** both new fields
+are threaded through `asm_link.rs`'s `translate_method_def`/`translate_class_def` (the linker's
+cross-rlib merge pass) up front, plus a `merge_defs` assert requiring `is_interface()` to agree
+across re-opened class definitions — this was the exact class of bug (a field silently dropped by
+that merge pass) found and fixed for the override feature, so it's handled proactively here instead
+of needing a second debugging pass.
+
+**Remaining scope, not started (this was intentionally just the spike):** wiring this into
+`#[dotnet_class]`/`dotnet_macros`/`src/comptime.rs` so an actual Rust `trait` synthesizes one of
+these (a genuine comptime-intrepreter + macro-attribute addition, comparable in size to the
+`implements=` machinery itself); `pe_exporter` support (no `Interface`/`Abstract` `TypeDef` flags
+or abstract-method RVA=0 handling exist there yet — same `DIRECT_PE=1` gap class as the
+virtual-override work, needs its own loud guard before this is wired into macros); default
+interface methods, static interface members, and interface-to-interface `extends` (an interface
+CAN implement other interfaces via the ordinary `implements` clause — untested here). The original
+Tier C verdict below still describes the honest size of the FULL feature.
+
+**Original Tier C verdict, for context:**
 
 **Verdict: feasible without weakening the typechecker, but requires new `cilly/src` capability
 that doesn't exist today — a genuine Tier C item, not a quick follow-on.** `implements=` only ever

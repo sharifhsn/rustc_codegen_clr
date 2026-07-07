@@ -181,6 +181,19 @@ pub struct MethodDef {
     /// no existing caller sets it. See `MethodDef::with_override`'s doc for the scope this was
     /// built for (a single well-known-base-virtual spike, not general base-class wrapping).
     overrides: Option<Interned<MethodRef>>,
+    /// Marks this method as an ECMA-335 abstract member (§II.15.4.2.2: `Abstract` flag, RVA=0, no
+    /// body) — used for synthesizing a real C# `interface` from a Rust trait (see `ClassDef::
+    /// with_interface`'s doc). Distinct from every existing `MethodImpl` variant: `Missing` looks
+    /// like a candidate but is NOT one — it gives a real body that throws at runtime, so reusing it
+    /// for an abstract slot would silently produce a concrete throwing method instead of a genuine
+    /// abstract member (a miscompilation class, not a clean failure). Kept as a plain bool flag
+    /// (like `overrides`) rather than a new `MethodImpl` variant so this doesn't force an exhaustive
+    /// match update across the ~30 `MethodImpl` match sites outside `il_exporter` that don't need to
+    /// know about it yet — `implementation` is still set to `MethodImpl::Missing` as an unused
+    /// placeholder body for an abstract method (never read: `il_exporter` checks `is_abstract()`
+    /// before ever looking at `implementation`). `false` for every method that existed before this
+    /// field: additive, no existing caller sets it.
+    is_abstract: bool,
 }
 
 impl MethodDef {
@@ -250,6 +263,7 @@ impl MethodDef {
             kind,
             implementation,
             overrides: None,
+            is_abstract: false,
         }
     }
 
@@ -274,6 +288,22 @@ impl MethodDef {
     #[must_use]
     pub fn overrides(&self) -> Option<Interned<MethodRef>> {
         self.overrides
+    }
+
+    /// Marks this method as an ECMA-335 abstract member with no body (§II.15.4.2.2) — the shape a
+    /// real C# `interface` member (or an abstract base-class member) needs. See the `is_abstract`
+    /// field's doc for why this is a bool flag rather than a new `MethodImpl` variant. Scoped
+    /// intentionally narrow, matching `ClassDef::with_interface`'s scope: proven for a single
+    /// no-argument interface member via `cargo_tests/cd_interface_export`, IL-exporter-only.
+    #[must_use]
+    pub fn with_abstract(mut self) -> Self {
+        self.is_abstract = true;
+        self
+    }
+
+    #[must_use]
+    pub fn is_abstract(&self) -> bool {
+        self.is_abstract
     }
 
     #[must_use]

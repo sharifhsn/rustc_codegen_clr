@@ -585,6 +585,17 @@ pub struct ClassDef {
     explict_size: Option<NonZeroU32>,
     align: Option<NonZeroU32>,
     has_nonveralpping_layout: bool,
+    /// Marks this `ClassDef` as a genuine ECMA-335 `interface` `TypeDef` (§II.10.1.3: `Interface`+
+    /// `Abstract` flags, no `extends` clause, every member `Abstract`+`Virtual`+`NewSlot`) rather
+    /// than an ordinary class — for synthesizing a real C#-consumable interface from a Rust trait.
+    /// Every method attached to an interface `ClassDef` must have `MethodDef::is_abstract()` set
+    /// (see that method's doc for why abstract-ness is a separate flag rather than folded into
+    /// this one — a `ClassDef` doesn't know its own methods' bodies). `false` for every class that
+    /// existed before this field: additive, no existing caller sets it. Scoped intentionally
+    /// narrow, matching `MethodDef::with_abstract`'s scope — see `docs/MYCORRHIZA_ERGONOMICS_
+    /// BACKLOG.md`'s Tier C finding #2 for the full scope discussion (no ctor synthesis, no
+    /// default interface methods, no static interface members).
+    is_interface: bool,
 }
 impl ClassDef {
     /// Checks if this class defition has a with the name and type.
@@ -637,7 +648,21 @@ impl ClassDef {
             explict_size,
             align,
             has_nonveralpping_layout,
+            is_interface: false,
         }
+    }
+
+    /// Marks this `ClassDef` as a genuine ECMA-335 `interface` `TypeDef`. See the `is_interface`
+    /// field's doc for the exact shape this implies and its scope.
+    #[must_use]
+    pub fn with_interface(mut self) -> Self {
+        self.is_interface = true;
+        self
+    }
+
+    #[must_use]
+    pub fn is_interface(&self) -> bool {
+        self.is_interface
     }
 
     /// The `.NET` interfaces this class implements (see the `implements` field). Usually empty.
@@ -746,6 +771,9 @@ impl ClassDef {
         assert_eq!(self.generics(), translated.generics());
         // Check inheretence matches
         assert_eq!(self.extends(), translated.extends());
+        // Check interface-ness matches (a class re-opened by several entrypoints must agree on
+        // whether it's a genuine ECMA-335 interface `TypeDef` — see `with_interface`'s doc).
+        assert_eq!(self.is_interface(), translated.is_interface());
 
         // Union the implemented interfaces (a class re-opened by several entrypoints may accumulate
         // its `implements` set across them, exactly like fields/methods).

@@ -182,10 +182,21 @@ impl ILExporter {
             let main_partitioned =
                 asm[class_def.name()] == *super::asm::MAIN_MODULE && self.partition.borrow().is_some();
             let field_vis = if main_partitioned { "public " } else { "" };
-            writeln!(
-                out,
-                ".class {vis} ansi {sealed} {explicit} '{name}' extends {extends}{implements}{{"
-            )?;
+            // A genuine ECMA-335 interface `TypeDef` (§II.10.1.3) must NOT have an `extends`
+            // clause at all — even the implicit `[System.Runtime]System.Object` this branch would
+            // otherwise emit is illegal for `Interface`-flagged types and CoreCLR rejects it at
+            // load time. See `ClassDef::with_interface`'s doc for the exact scope this covers.
+            if class_def.is_interface() {
+                writeln!(
+                    out,
+                    ".class {vis} interface abstract ansi '{name}'{implements}{{"
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    ".class {vis} ansi {sealed} {explicit} '{name}' extends {extends}{implements}{{"
+                )?;
+            }
             // Export size
             if let Some(size) = class_def.explict_size() {
                 writeln!(out, ".size {size}", size = size.get())?;
@@ -405,6 +416,12 @@ impl ILExporter {
         let kind = match method.kind() {
             crate::cilnode::MethodKind::Static => "static",
             crate::cilnode::MethodKind::Instance => "instance",
+            // An interface member (`MethodDef::is_abstract`) needs the `newslot abstract` flags
+            // ahead of `virtual instance` — `newslot` because an interface member never overrides
+            // an existing vtable slot, `abstract` because it has no body (RVA=0, §II.15.4.2.2).
+            crate::cilnode::MethodKind::Virtual if method.is_abstract() => {
+                "newslot abstract virtual instance"
+            }
             crate::cilnode::MethodKind::Virtual => "virtual instance",
             // A constructor is an instance method (the `instance` calling-convention keyword
             // must come LAST, right before the return type — like `virtual instance` above —
@@ -496,6 +513,15 @@ impl ILExporter {
             writeln!(out, ".override {base_class}::'{base_name}'")?;
         }
         debug_assert!(ensure_unqiue.insert(method_id));
+        // An abstract member (`MethodDef::is_abstract`, e.g. a synthesized interface method) has
+        // RVA=0 and NO body at all (§II.15.4.2.2) — not even `.maxstack`/`.entrypoint`, which are
+        // body-only directives ilasm rejects on an abstract method. `implementation()` is an
+        // unused `MethodImpl::Missing` placeholder for these (see that field's doc), so it must
+        // never be read here.
+        if method.is_abstract() {
+            writeln!(out, "}}")?;
+            return Ok(());
+        }
         let stack_size = match method.resolved_implementation(asm_mut) {
             MethodImpl::MethodBody { blocks, .. } => blocks
                 .iter()

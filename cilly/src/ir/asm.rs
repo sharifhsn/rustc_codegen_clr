@@ -2864,6 +2864,55 @@ fn export2() {
     #[cfg(not(miri))]
     asm.export("/tmp/export2.exe", ILExporter::new(*ILASM_FLAVOUR, false, None));
 }
+/// Smallest-safe-first-step spike for `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md`'s Tier C finding
+/// #2 (exporting Rust traits as C# interfaces): hand-build a genuine ECMA-335 `interface`
+/// `TypeDef` (`ClassDef::with_interface`) with one abstract, no-body member
+/// (`MethodDef::with_abstract`) and run it through the real IL-text exporter + `ilasm`. Proves
+/// `ilasm` accepts the shape (a real `.dll` with an `Interface`+`Abstract`-flagged `TypeDef` and a
+/// zero-RVA `newslot abstract virtual` member) at the `cilly` layer, before any typechecker/PE
+/// writer/macro work — exactly the scope that finding recommends for a first spike. Runtime
+/// consumption from C# (CoreCLR actually treating this as `: ISpeaker`-implementable) is
+/// hand-verified separately, not by this test — see the finding's follow-up note.
+#[test]
+fn export_interface() {
+    use super::il_exporter::*;
+
+    let mut asm = Assembly::default();
+    let name = asm.alloc_string("ISpeaker");
+    let class_def = ClassDef::new(
+        name,
+        false,
+        0,
+        None,
+        vec![],
+        vec![],
+        Access::Public,
+        None,
+        None,
+        true,
+    )
+    .with_interface();
+    let class_idx = asm.class_def(class_def).unwrap();
+    let self_type = Type::ClassRef(*class_idx);
+    let method_name = asm.alloc_string("Speak");
+    let sig = asm.sig([self_type], Type::Void);
+    let mdef = MethodDef::new(
+        Access::Public,
+        class_idx,
+        method_name,
+        sig,
+        MethodKind::Virtual,
+        MethodImpl::Missing,
+        vec![None],
+    )
+    .with_abstract();
+    asm.new_method(mdef);
+    #[cfg(not(miri))]
+    asm.export(
+        "/tmp/export_interface.dll",
+        ILExporter::new(*ILASM_FLAVOUR, true, None),
+    );
+}
 #[test]
 fn link() {
     use super::il_exporter::*;
