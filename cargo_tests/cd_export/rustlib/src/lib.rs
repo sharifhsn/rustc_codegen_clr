@@ -79,3 +79,44 @@ pub fn boom(reason: &str) -> i32 {
     #[allow(unreachable_code)]
     0
 }
+
+// ---- Case A: `Task`/`TaskT<T>` returns (docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md Tier C §6) ----------
+//
+// A plain, non-`async` fn that itself constructs and returns a `mycorrhiza::task::Task` /
+// `TaskT<T>` passes straight through the seam as an ordinary managed handle — no new marshalling
+// code, `async fn` sugar stays rejected (unrelated, larger follow-up).
+
+/// `Task delayed_ping()` — a non-generic `Task` a C# caller can `await`; completes synchronously
+/// (the work — none, here — is already done by the time the Task is constructed).
+#[dotnet_export]
+pub fn delayed_ping() -> mycorrhiza::task::Task {
+    mycorrhiza::task::future_to_task_unit(async {})
+}
+
+/// `Task<int> compute_answer()` — a result-bearing `Task<T>`, produced via
+/// `mycorrhiza::task::future_to_task`. C# `await`s it and gets back the `int`.
+#[dotnet_export]
+pub fn compute_answer() -> mycorrhiza::task::TaskT<i32> {
+    mycorrhiza::task::future_to_task(async { 42 })
+}
+
+// ---- Case B: `Vec<T>` -> `RustVec<T>` returns (docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md Tier C §6) ---
+//
+// A `Vec<T>` return for a passthrough-primitive `T` marshals to a `RustVec<T>` handle at the seam.
+// Requires `mycorrhiza::export_rust_containers!()` once at the crate root (below) so the `rcl_vec_*`
+// core this arm calls into actually exists in this crate.
+mycorrhiza::export_rust_containers!();
+
+/// `RustVec<int> range(int, int)` — builds a `Vec<i32>` in ordinary Rust and returns it; C# receives
+/// a `RustVec<int>` it can `foreach`/LINQ over exactly like `cd_rustvec`'s hand-built one.
+#[dotnet_export]
+pub fn range(start: i32, end: i32) -> Vec<i32> {
+    (start..end).collect()
+}
+
+/// `RustVec<long> squares(int)` — a second `Vec<T>` element type (`i64`), proving the arm isn't
+/// hardcoded to `i32`.
+#[dotnet_export]
+pub fn squares(n: i32) -> Vec<i64> {
+    (0..n as i64).map(|x| x * x).collect()
+}

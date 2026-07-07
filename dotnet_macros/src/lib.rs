@@ -419,11 +419,25 @@ struct Marshal {
     /// The type the `#[no_mangle] extern "C"` shim uses at the seam (what C# sees).
     seam_ty: proc_macro2::TokenStream,
     /// Given a binding `#id` of `seam_ty`, produce an expression of the idiomatic Rust type to pass
-    /// to the inner fn. `None` means "pass `#id` through unchanged" (identity marshalling).
-    to_rust: Option<fn(&syn::Ident) -> proc_macro2::TokenStream>,
+    /// to the inner fn. `None` means "pass `#id` through unchanged" (identity marshalling). A boxed
+    /// closure (not a bare `fn` pointer) so arms that need to close over data derived from the source
+    /// type (e.g. the `Vec<T>` arm closing over `T`'s own tokens) can do so.
+    to_rust: Option<Box<dyn Fn(&syn::Ident) -> proc_macro2::TokenStream>>,
     /// Given a binding `#id` of the idiomatic Rust return type, produce an expression of `seam_ty`.
     /// `None` means "return `#id` unchanged".
-    from_rust: Option<fn(&syn::Ident) -> proc_macro2::TokenStream>,
+    from_rust: Option<Box<dyn Fn(&syn::Ident) -> proc_macro2::TokenStream>>,
+    /// `true` if the **return** type itself is (or directly embeds) a managed object reference
+    /// (`RustcCLRInteropManagedClass`/`RustcCLRInteropManagedGeneric`-shaped) — e.g.
+    /// `mycorrhiza::task::Task`/`TaskT<T>`. Such a value must NOT be threaded through
+    /// `catch_unwind`'s `Result<T, Box<dyn Any + Send>>` return: that `Result` is an enum with
+    /// overlapping variant storage, and `cilly`'s `ClassDef::layout_check` correctly rejects ANY
+    /// managed reference in an overlapping field (the same GC-soundness rule `mycorrhiza::task`'s own
+    /// docs describe for coroutine state) — so `catch_unwind::<F, T>` would need a `ClassDef` for
+    /// `Result<T, ..>` with a GC-ref `Ok` payload placed in overlapping storage, which is unsound and
+    /// correctly refused, surfacing as a `ManagedRefInOverlapingField` compiler panic. The shim
+    /// generator (`dotnet_export`) checks this flag to route such returns through a raw-pointer
+    /// out-slot instead (see its body), keeping the `catch_unwind` payload a plain `()`.
+    returns_managed_handle: bool,
 }
 
 /// The set of primitive types passed across the seam unchanged (they are already `ManagedSafe` and
@@ -462,6 +476,42 @@ fn simple_path_ident(ty: &Type) -> Option<String> {
     None
 }
 
+/// If `ty` is a single-segment generic path `Name<Arg>` (exactly one angle-bracketed type argument,
+/// e.g. `Vec<i32>` or `TaskT<i32>`) — regardless of any leading path qualification (`mycorrhiza::
+/// task::TaskT<T>` matches on `TaskT`) — returns `(Name, &Arg)`. `None` for anything else (no
+/// generics, more than one argument, a lifetime/const argument, a qualified `Self` path, …).
+fn single_generic_arg(ty: &Type) -> Option<(String, &Type)> {
+    let Type::Path(tp) = ty else { return None };
+    if tp.qself.is_some() {
+        return None;
+    }
+    let seg = tp.path.segments.last()?;
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    if args.args.len() != 1 {
+        return None;
+    }
+    let syn::GenericArgument::Type(inner) = &args.args[0] else {
+        return None;
+    };
+    Some((seg.ident.to_string(), inner))
+}
+
+/// True if `ty` is a plain (possibly path-qualified) reference to `mycorrhiza::task::Task` — the
+/// non-generic managed `Task` handle. Matched by trailing ident only (like [`type_last_ident_is`]),
+/// so both `mycorrhiza::task::Task` and a locally `use`d bare `Task` resolve.
+fn is_task_type(ty: &Type) -> bool {
+    type_last_ident_is(ty, "Task")
+}
+
+/// If `ty` is `mycorrhiza::task::TaskT<T>` (the generic, result-bearing Task handle — named `TaskT`
+/// precisely to avoid colliding with the non-generic `Task`), returns `T`. `None` otherwise.
+fn task_t_inner(ty: &Type) -> Option<&Type> {
+    let (name, inner) = single_generic_arg(ty)?;
+    (name == "TaskT").then_some(inner)
+}
+
 /// Resolve how a **parameter** type is marshalled, or `Err(message)` if unsupported.
 fn marshal_param(ty: &Type) -> Result<Marshal, String> {
     // `&str` (shared ref to a `str`) → managed `System.String` inbound.
@@ -471,13 +521,14 @@ fn marshal_param(ty: &Type) -> Result<Marshal, String> {
                 if tp.qself.is_none() && tp.path.is_ident("str") {
                     return Ok(Marshal {
                         seam_ty: quote! { ::mycorrhiza::system::MString },
-                        to_rust: Some(|id| {
+                        to_rust: Some(Box::new(|id| {
                             quote! {
                                 let #id: ::std::string::String =
                                     ::mycorrhiza::system::DotNetString::from_handle(#id).to_rust_string();
                             }
-                        }),
+                        })),
                         from_rust: None,
+                        returns_managed_handle: false,
                     });
                 }
             }
@@ -493,13 +544,14 @@ fn marshal_param(ty: &Type) -> Result<Marshal, String> {
         if name == "String" {
             return Ok(Marshal {
                 seam_ty: quote! { ::mycorrhiza::system::MString },
-                to_rust: Some(|id| {
+                to_rust: Some(Box::new(|id| {
                     quote! {
                         let #id: ::std::string::String =
                             ::mycorrhiza::system::DotNetString::from_handle(#id).to_rust_string();
                     }
-                }),
+                })),
                 from_rust: None,
+                returns_managed_handle: false,
             });
         }
         if is_passthrough_primitive(&name) {
@@ -507,6 +559,7 @@ fn marshal_param(ty: &Type) -> Result<Marshal, String> {
                 seam_ty: quote! { #ty },
                 to_rust: None,
                 from_rust: None,
+                returns_managed_handle: false,
             });
         }
         return Err(format!(
@@ -532,9 +585,10 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
                     return Ok(Marshal {
                         seam_ty: quote! { ::mycorrhiza::system::MString },
                         to_rust: None,
-                        from_rust: Some(|id| {
+                        from_rust: Some(Box::new(|id| {
                             quote! { ::mycorrhiza::system::DotNetString::from(#id).handle() }
-                        }),
+                        })),
+                        returns_managed_handle: false,
                     });
                 }
             }
@@ -546,14 +600,43 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
         ));
     }
 
+    // `mycorrhiza::task::Task` — the idiomatic non-generic managed `Task` wrapper. NOTE: unlike
+    // `TaskT<T>` below, `task::Task` is NOT itself a bare alias for `RustcCLRInteropManagedClass` —
+    // it's a genuine newtype struct (`struct Task { h: RawTask }`, see `mycorrhiza/src/task.rs`)
+    // kept distinct from `bindings::Task` so the module can carry its own inherent methods. The
+    // backend's magic-type recognition matches `RustcCLRInteropManagedClass`/`RustcCLRInteropManaged
+    // Generic` BY NAME, so a bare `Task` local would lower to an ordinary (wrong) managed class
+    // `mycorrhiza.task.Task`, not the real `System.Threading.Tasks.Task` C# expects — unwrap it via
+    // `.raw()` to the real handle alias `mycorrhiza::System::Threading::Tasks::Task` at the seam
+    // (re-exported at that path by `mycorrhiza`'s crate-root `pub use bindings::*;` — the same path
+    // `mycorrhiza::task` itself uses internally, e.g. `crate::System::Threading::Tasks::
+    // TaskCompletionSource`), which round-trips through `Task::from_raw`/`Task::raw` (both
+    // `#[inline]`, zero-cost). This intentionally does NOT
+    // accept `async fn` sugar (rejected earlier in `dotnet_export`, independent of this arm): the fn
+    // body must itself construct the `Task` (typically via `mycorrhiza::task::future_to_task_unit`)
+    // and return it, exactly like any other ordinary, non-async `#[dotnet_export]` fn. Checked BEFORE
+    // `simple_path_ident` (which only matches single-segment paths) because callers typically spell
+    // this as the multi-segment `mycorrhiza::task::Task`. `returns_managed_handle: true` routes the
+    // shim generator around `catch_unwind`'s `Result<T, _>` payload (see that field's doc comment) —
+    // the *seam* type here is the raw handle, which is exactly as GC-ref-bearing as `TaskT<T>`.
+    if is_task_type(ty) {
+        return Ok(Marshal {
+            seam_ty: quote! { ::mycorrhiza::System::Threading::Tasks::Task },
+            to_rust: None,
+            from_rust: Some(Box::new(|id| quote! { #id.raw() })),
+            returns_managed_handle: true,
+        });
+    }
+
     if let Some(name) = simple_path_ident(ty) {
         if name == "String" {
             return Ok(Marshal {
                 seam_ty: quote! { ::mycorrhiza::system::MString },
                 to_rust: None,
-                from_rust: Some(|id| {
+                from_rust: Some(Box::new(|id| {
                     quote! { ::mycorrhiza::system::DotNetString::from(#id.as_str()).handle() }
-                }),
+                })),
+                returns_managed_handle: false,
             });
         }
         if is_passthrough_primitive(&name) {
@@ -561,17 +644,85 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
                 seam_ty: quote! { #ty },
                 to_rust: None,
                 from_rust: None,
+                returns_managed_handle: false,
             });
         }
         return Err(format!(
             "#[dotnet_export]: unsupported return type `{name}`. Supported: the integer/float \
-             primitives, `bool`, `&str`, `String`, and `()`."
+             primitives, `bool`, `&str`, `String`, `()`, `mycorrhiza::task::Task`, \
+             `mycorrhiza::task::TaskT<T>`, and `Vec<T>` of a passthrough primitive `T`."
         ));
+    }
+
+    // `mycorrhiza::task::TaskT<T>` — the generic, result-bearing managed `Task<T>` handle
+    // (`RustcCLRInteropManagedGeneric`). Its layout is a single `object_ref: usize` plus a
+    // zero-sized `PhantomData<T>` — identical regardless of `T` — so, like the non-generic `Task`
+    // above, it is already FFI-safe across the seam and passes through unchanged for ANY `T`; the
+    // element type never affects the handle's own layout. The fn must construct the `TaskT<T>`
+    // itself (typically via `mycorrhiza::task::future_to_task`) — `async fn` sugar stays rejected.
+    // Also `returns_managed_handle: true` — same `catch_unwind` hazard as non-generic `Task` above.
+    if task_t_inner(ty).is_some() {
+        return Ok(Marshal {
+            seam_ty: quote! { #ty },
+            to_rust: None,
+            from_rust: None,
+            returns_managed_handle: true,
+        });
+    }
+
+    // `Vec<T>` of a passthrough primitive `T` -> `RustVec<T>` at the seam (a `usize` opaque handle
+    // into a size-erased Rust-owned buffer). Requires the consuming crate to have called
+    // `mycorrhiza::export_rust_containers!()` once at its crate root (same requirement as any other
+    // `RustVec<T>` consumer) so the `rcl_vec_*` core functions exist in this crate to call into.
+    // Only primitive `T` is supported for this first slice (skips `String`/managed-handle elements —
+    // narrower `RustBoxVec`/GCHandle-boxed marshalling is a separate follow-up, not attempted here).
+    if let Some((name, elem_ty)) = single_generic_arg(ty) {
+        if name == "Vec" {
+            if let Some(elem_name) = simple_path_ident(elem_ty) {
+                if is_passthrough_primitive(&elem_name) {
+                    let elem_ty = elem_ty.clone();
+                    return Ok(Marshal {
+                        seam_ty: quote! { ::core::primitive::usize },
+                        to_rust: None,
+                        from_rust: Some(Box::new(move |id| {
+                            quote! {
+                                {
+                                    let __elems: ::std::vec::Vec<#elem_ty> = #id;
+                                    let __handle: ::core::primitive::usize =
+                                        crate::rcl_vec_new(::core::mem::size_of::<#elem_ty>());
+                                    for __elem in __elems.iter() {
+                                        unsafe {
+                                            crate::rcl_vec_push(
+                                                __handle,
+                                                (__elem as *const #elem_ty) as *const u8,
+                                            );
+                                        }
+                                    }
+                                    __handle
+                                }
+                            }
+                        })),
+                        returns_managed_handle: false,
+                    });
+                }
+                return Err(format!(
+                    "#[dotnet_export]: unsupported `Vec<{elem_name}>` return element type. Only the \
+                     integer/float primitives and `bool` are supported as `Vec<T>` elements today \
+                     (this marshals to a `RustVec<T>`, whose C# side is `T : unmanaged`)."
+                ));
+            }
+            return Err(format!(
+                "#[dotnet_export]: unsupported `Vec<{}>` return element type. Only the integer/float \
+                 primitives and `bool` are supported as `Vec<T>` elements today.",
+                quote! { #elem_ty }
+            ));
+        }
     }
 
     Err(format!(
         "#[dotnet_export]: unsupported return type `{}`. Supported: the integer/float primitives, \
-         `bool`, `&str`, `String`, and `()`.",
+         `bool`, `&str`, `String`, `()`, `mycorrhiza::task::Task`, `mycorrhiza::task::TaskT<T>`, and \
+         `Vec<T>` of a passthrough primitive `T`.",
         quote! { #ty }
     ))
 }
@@ -813,9 +964,10 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
         emit_xmldoc_entry(&fn_name, &doc_param_types, &doc);
     }
 
-    // Marshal the return type.
-    let (seam_ret, ret_expr) = match &sig.output {
-        ReturnType::Default => (quote! {}, quote! { __ret }), // `-> ()`; identity.
+    // Marshal the return type. `returns_managed_handle` (Task/TaskT<T>) picks a different
+    // `catch_unwind` shape below — see that field's doc comment on `Marshal` for why.
+    let (seam_ret, ret_expr, ret_ty_for_slot, returns_managed_handle) = match &sig.output {
+        ReturnType::Default => (quote! {}, quote! { __ret }, None, false), // `-> ()`; identity.
         ReturnType::Type(_, ty) => {
             let marshal = match marshal_return(ty) {
                 Ok(m) => m,
@@ -829,11 +981,92 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 Some(conv) => conv(&ret_ident),
                 None => quote! { #ret_ident },
             };
-            (quote! { -> #seam_ty }, expr)
+            (
+                quote! { -> #seam_ty },
+                expr,
+                Some((**ty).clone()),
+                marshal.returns_managed_handle,
+            )
         }
     };
 
     let call = quote! { super::#fn_name(#(#call_args),*) };
+
+    // The shared panic-message-extraction arm both `catch_unwind` shapes below raise through.
+    let throw_arm = quote! {
+        let __msg: ::std::string::String =
+            if let ::std::option::Option::Some(__s) =
+                __panic_payload.downcast_ref::<&'static str>()
+            {
+                (*__s).to_string()
+            } else if let ::std::option::Option::Some(__s) =
+                __panic_payload.downcast_ref::<::std::string::String>()
+            {
+                __s.clone()
+            } else {
+                ::std::string::String::from("Rust panic (no message available)")
+            };
+        ::mycorrhiza::error::throw_message(&__msg)
+    };
+
+    // The inner call is wrapped in `catch_unwind`: a plain `extern "C"` is a `nounwind` ABI
+    // boundary (the same rule as native Rust FFI — unwinding across it is UB), so an uncaught
+    // panic would otherwise reach the true edge and the runtime hard-aborts the whole process
+    // (`Environment.FailFast`) with no chance for the C# caller to recover. Catching it *inside*
+    // the shim and re-raising as a genuine managed `System.Exception`
+    // (`::mycorrhiza::error::throw_message`) turns an unrecoverable process abort into an ordinary
+    // `catch`-able error.
+    //
+    // Two shapes, chosen by `returns_managed_handle`:
+    //
+    // * The common case: `catch_unwind`'s `Result<RetTy, _>` carries the value straight through the
+    //   `Ok` arm. Fine for primitives/`MString`/`usize` — none of those are managed object
+    //   references, so `Result<RetTy, Box<dyn Any + Send>>`'s (correctly) overlapping-variant
+    //   layout never has to hold a GC reference.
+    // * `returns_managed_handle` (Task/TaskT<T>): `Result<RetTy, _>` would instead place a managed
+    //   reference directly in that overlapping storage, which `cilly`'s `ClassDef::layout_check`
+    //   correctly refuses (a real GC-soundness rule, not a bug to route around) — surfacing as a
+    //   `ManagedRefInOverlapingField` compiler panic. So this arm keeps `catch_unwind`'s payload a
+    //   plain `()`: the closure writes the call's result through a raw pointer into an
+    //   already-allocated `MaybeUninit<RetTy>` local (never itself living inside the `Result`), and
+    //   the `Ok(())` arm reads it back out afterward. `RetTy` is `Copy` here (Task/TaskT<T> are
+    //   `#[repr(C)]`/`Copy` handles), so writing through the raw pointer and reading the
+    //   `MaybeUninit` back out is sound.
+    let body = if returns_managed_handle {
+        let ret_ty = ret_ty_for_slot.expect("returns_managed_handle implies a return type");
+        quote! {
+            let mut __slot: ::core::mem::MaybeUninit<#ret_ty> = ::core::mem::MaybeUninit::uninit();
+            let __slot_ptr: *mut #ret_ty = __slot.as_mut_ptr();
+            match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                let __v = #call;
+                // SAFETY: `__slot_ptr` points at `__slot`'s own storage, valid for the duration of
+                // this closure call; written at most once, before `catch_unwind` returns, and read
+                // back only from the `Ok` arm below (i.e. only once initialized).
+                unsafe { __slot_ptr.write(__v) };
+            })) {
+                ::std::result::Result::Ok(()) => {
+                    // SAFETY: the closure above wrote a valid `#ret_ty` on its only non-unwinding
+                    // path, which is exactly the path that reaches this arm.
+                    let __ret: #ret_ty = unsafe { __slot.assume_init() };
+                    #ret_expr
+                }
+                ::std::result::Result::Err(__panic_payload) => {
+                    #throw_arm
+                }
+            }
+        }
+    } else {
+        quote! {
+            match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| #call)) {
+                ::std::result::Result::Ok(__ret) => {
+                    #ret_expr
+                }
+                ::std::result::Result::Err(__panic_payload) => {
+                    #throw_arm
+                }
+            }
+        }
+    };
 
     let expanded = quote! {
         // The user's function, verbatim — still callable from Rust with its idiomatic signature.
@@ -841,20 +1074,14 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // The generated seam shim. `#[no_mangle]` gives it the flat symbol `#fn_name`, which the
         // backend marks `Access::Extern` (a DCE root) and the exporter emits as a public static
-        // method on the assembly's `MainModule` — so C# calls it as `MainModule::#fn_name`.
-        //
-        // The inner call is wrapped in `catch_unwind`: a plain `extern "C"` is a `nounwind` ABI
-        // boundary (the same rule as native Rust FFI — unwinding across it is UB), so an uncaught
-        // panic would otherwise reach the true edge and the runtime hard-aborts the whole process
-        // (`Environment.FailFast`) with no chance for the C# caller to recover. Catching it *inside*
-        // the shim and re-raising as a genuine managed `System.Exception`
-        // (`::mycorrhiza::error::throw_message`) turns an unrecoverable process abort into an ordinary
-        // `catch`-able error.
+        // method on the assembly's `MainModule` — so C# calls it as `MainModule::#fn_name`. See
+        // `body`'s construction above for the two `catch_unwind` shapes and why a second one is
+        // needed.
         //
         // The shim itself is declared `extern "C-unwind"`, not plain `extern "C"`. This is NOT
         // optional: `throw_message`'s `ExceptionDispatchInfo::Throw()` call performs a genuine CIL
         // `throw`, which this backend must (correctly) model as an operation that can unwind — and
-        // that call sits in the `Err` arm, OUTSIDE the `catch_unwind` closure (only `#call` is
+        // that call sits in the `Err` arm, OUTSIDE the `catch_unwind` closure (only the call/write is
         // protected). A call that can unwind, sitting directly in a `nounwind extern "C"` function
         // body with nothing downstream to catch it, is legitimately flagged by rustc's MIR builder as
         // crossing a nounwind ABI boundary — the exact same analysis that would fire for a second bare
@@ -877,26 +1104,7 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #[no_mangle]
             pub extern "C-unwind" fn #fn_name(#(#seam_params),*) #seam_ret {
                 #(#pre_call)*
-                match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| #call)) {
-                    ::std::result::Result::Ok(__ret) => {
-                        #ret_expr
-                    }
-                    ::std::result::Result::Err(__panic_payload) => {
-                        let __msg: ::std::string::String =
-                            if let ::std::option::Option::Some(__s) =
-                                __panic_payload.downcast_ref::<&'static str>()
-                            {
-                                (*__s).to_string()
-                            } else if let ::std::option::Option::Some(__s) =
-                                __panic_payload.downcast_ref::<::std::string::String>()
-                            {
-                                __s.clone()
-                            } else {
-                                ::std::string::String::from("Rust panic (no message available)")
-                            };
-                        ::mycorrhiza::error::throw_message(&__msg)
-                    }
-                }
+                #body
             }
         }
     };
