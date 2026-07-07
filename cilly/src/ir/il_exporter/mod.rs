@@ -1568,7 +1568,9 @@ fn assemble_file(exe_out: &Path, il_path: &Path, is_lib: bool) {
             // Limit the memory usage of mono
             cmd.env("MONO_GC_PARAMS", "soft-heap-limit=500m");
         }
+        let ilasm_start = std::time::Instant::now();
         let out = cmd.output().unwrap();
+        println!("==> ilasm in {:?}", ilasm_start.elapsed());
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         (cmd, stdout, stderr)
@@ -1607,7 +1609,9 @@ fn assemble_file(exe_out: &Path, il_path: &Path, is_lib: bool) {
         // Limit the memory usage of mono
         cmd.env("MONO_GC_PARAMS", "soft-heap-limit=500m");
     }
+    let ilasm_start = std::time::Instant::now();
     let out = cmd.output().unwrap();
+    println!("==> ilasm in {:?}", ilasm_start.elapsed());
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -1629,7 +1633,9 @@ fn assemble_file(exe_out: &Path, il_path: &Path, is_lib: bool) {
         // Limit the memory usage of mono
         cmd.env("MONO_GC_PARAMS", "soft-heap-limit=500m");
     }
+    let ilasm_start = std::time::Instant::now();
     let out = cmd.output().unwrap();
+    println!("==> ilasm in {:?}", ilasm_start.elapsed());
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

@@ -57,7 +57,7 @@ pub fn load_assemblies(
     raw_files: &[&String],
     archives: &[String],
 ) -> (cilly::Assembly, Vec<LinkableFile>) {
-    println!("Preparing to load assmeblies");
+    println!("==> Preparing to load assmeblies");
     let mut final_assembly = cilly::Assembly::default();
     let mut linkables = Vec::new();
     for asm_path in raw_files {
@@ -79,6 +79,6 @@ pub fn load_assemblies(
         final_assembly = final_assembly.link(asm);
         linkables.extend(linkable);
     }
-    println!("Loaded assmeblies");
+    println!("==> Loaded assmeblies");
     (final_assembly, linkables)
 }

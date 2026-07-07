@@ -832,9 +832,25 @@ if [ "${CD_VERBOSE:-0}" = 1 ]; then
   cargo -Zjson-target-spec build "${CARGOFLAGS[@]}" 2>&1 | tee "$CD_LASTBUILD_LOG"
   rc=${PIPESTATUS[0]}
 else
+  # Target crate's own name, so its "Compiling <name>" line can be allow-listed
+  # below without unmasking dependency-compile spam (a blanket "Compiling "
+  # would let hundreds of dependency lines back in — deliberately not done).
+  # Cheap TOML-line scrape, not `cargo metadata` (avoids a second cargo
+  # invocation before the build even starts). Falls back to the dir name,
+  # matching the bin-fallback pattern used later in this script.
+  cd_target_name=$(awk -F'"' '/^\[package\]/{p=1} p && /^name[[:space:]]*=/{print $2; exit}' Cargo.toml)
+  [ -n "$cd_target_name" ] || cd_target_name="$(basename "$(pwd)")"
+  # NOTE on "linker stdout": rustc wraps the linker's own stdout (our stage/timing
+  # println!s) in a `warning: linker stdout: <first line>` message, with EVERY
+  # subsequent line emitted as a plain whitespace-indented continuation (no
+  # `warning:`/`==>` prefix survives rustc's re-indentation) — so a `^==>` anchor
+  # only ever matches the first stage line. Match "linker stdout" itself (pulls the
+  # intro line through) plus indented continuation lines generically (leading
+  # whitespace then non-"= note"/pipe filler); the `= note:` line that always
+  # follows the block is deliberately left out (it's boilerplate, not signal).
   cargo -Zjson-target-spec build "${CARGOFLAGS[@]}" 2>&1 | tee "$CD_LASTBUILD_LOG" \
     | grep -vE 'discirminant' \
-    | grep -E '^error|error\[|could not compile|warning: unused|Compiling (std|core|alloc) |Finished' | head -60
+    | grep -E "^error|error\[|could not compile|warning: unused|Compiling (std|core|alloc|${cd_target_name}) |Finished|linker stdout|^ +==>" | head -60
   rc=${PIPESTATUS[0]}
 fi
 echo "== build exit: $rc =="

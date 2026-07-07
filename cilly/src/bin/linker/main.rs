@@ -501,11 +501,15 @@ fn main() {
     add_mandatory_statics(&mut final_assembly);
 
     if *DEAD_CODE_ELIMINATION {
-        println!("Eliminating dead code");
+        println!("==> Eliminating dead code");
+        let dce_start = std::time::Instant::now();
         final_assembly.eliminate_dead_code();
+        println!("==> Eliminating dead code in {:?}", dce_start.elapsed());
     }
     let mut fuel = final_assembly.fuel_from_env().fraction(0.25);
+    let opt_start = std::time::Instant::now();
     final_assembly.opt(&mut fuel);
+    println!("==> Optimizing in {:?}", opt_start.elapsed());
     final_assembly.eliminate_dead_code();
     final_assembly.fix_aligement();
     final_assembly
