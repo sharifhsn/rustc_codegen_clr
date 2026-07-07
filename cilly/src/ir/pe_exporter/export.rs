@@ -193,6 +193,25 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
         std::collections::HashMap::with_capacity(class_def_ids.len());
     for &class_def_id in &class_def_ids {
         let class_def = asm[class_def_id].clone();
+        // A genuine ECMA-335 `interface` `TypeDef` (`ClassDef::with_interface`, e.g. from a
+        // Rust-trait-as-C#-interface spike) needs `Interface`+`Abstract` `TypeAttributes` and NO
+        // `Extends` row at all (§II.10.1.3) — this writer has neither: the code just below always
+        // computes and stamps a real `extends` (falling back to `System.Object`), which would
+        // silently emit an ORDINARY concrete class instead of an interface, with its abstract
+        // members' `MethodImpl::Missing` placeholder becoming a real throwing body (see
+        // `MethodDef::is_abstract`'s doc — that placeholder is only inert because `il_exporter`
+        // checks `is_abstract()` before ever reading it; this writer does not). Fail loudly instead
+        // of emitting a fake, wrong-shaped class — mirrors the `method.overrides()` guard below for
+        // the same "no PE-writer support yet" reason. See `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md`'s
+        // Tier C finding #2.
+        assert!(
+            !class_def.is_interface(),
+            "class '{}' is a genuine interface (ClassDef::with_interface), but the direct PE \
+             writer (DIRECT_PE=1, the default) does not yet support interface TypeDefs -- set \
+             DIRECT_PE=0 to use il_exporter (ilasm text) instead, which does. See \
+             docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md's Tier C finding #2.",
+            &asm[class_def.name()]
+        );
         // Every class needs an `Extends` row: `il_exporter::export_to_write` never leaves it NIL
         // — an explicit `extends` clause wins, otherwise `[System.Runtime]System.ValueType` for a
         // valuetype or `[System.Runtime]System.Object` for a reference type (mirrors that
@@ -452,6 +471,20 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
                  (DIRECT_PE=1, the default) does not yet support the MethodImpl metadata row \
                  this needs -- set DIRECT_PE=0 to use il_exporter (ilasm text) instead, which \
                  does. See docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md's Tier C finding #1."
+            );
+            // An abstract member (`MethodDef::is_abstract`, e.g. an interface method) has RVA=0
+            // and no real body — `implementation()` is only an inert `MethodImpl::Missing`
+            // placeholder for these (see that field's doc). This writer has no Abstract
+            // `MethodAttributes`/RVA=0 support and would read straight through to the placeholder,
+            // emitting a concrete method that THROWS at runtime instead of a genuine abstract slot
+            // — the same class of silent miscompilation the `overrides` guard above exists to
+            // prevent. See docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md's Tier C finding #2.
+            assert!(
+                !method.is_abstract(),
+                "method '{name}' is abstract (MethodDef::with_abstract), but the direct PE \
+                 writer (DIRECT_PE=1, the default) does not yet support Abstract/RVA=0 method \
+                 rows -- set DIRECT_PE=0 to use il_exporter (ilasm text) instead, which does. \
+                 See docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md's Tier C finding #2."
             );
             // Resolve `MethodImpl::AliasFor` chains before deciding P/Invoke-ness — mirrors
             // `il_exporter`'s `method.resolved_implementation(asm_mut)` (mod.rs:477) and

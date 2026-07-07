@@ -386,7 +386,61 @@ Visual Studio silently shows no docs with no error — needs a differential chec
 emitted metadata name, not just "the C# compiles." (Update 2026-07-07: this half shipped, see §4's
 DONE entry — `ca74a46`.)
 
-### 5. .NET events (`add_*`/`remove_*`) on exported classes
+### 5. .NET events (`add_*`/`remove_*`) on exported classes — SHIPPED (2026-07-07, IL-exporter-only)
+
+**Both the hand-written-ilasm spike AND a real `cilly` capability shipped, exactly as scoped
+below.** Step 1 (hand-written `.il`, zero `cilly` involvement): a `.event`/`.addon`/`.removeon`
+block for a `Notifier.Changed` event with genuine `Delegate.Combine`/`Delegate.Remove` bodies,
+assembled with `ilasm` and hand-verified against a real C# consumer — `+=`/`-=`, multi-subscriber
+fan-out via `Delegate.Combine`, and `typeof(Notifier).GetEvent("Changed")` reflection are all
+correct, confirming CoreCLR treats hand-rolled event metadata as a genuine `event`, not just
+something `ilasm` tolerates.
+
+Step 2 (real `cilly` capability, `il_exporter`-only): `ClassDef::add_event` + a new `EventDef`
+struct (name, delegate `Type`, `add`/`remove` `MethodRef`s — the `add_`/`remove_` bodies are
+*ordinary* `MethodDef`s already emitted by the normal per-method loop; `EventDef` only links their
+names into the Event-shaped IL block, exactly as predicted — no new invocation semantics). New
+`il_exporter::method_ref_operand_text` helper (factored out of the existing `CILNode::Call` operand
+builder, which needs the identical `<class>::'<name>'(<params>)` full-signature text) builds the
+`.addon`/`.removeon` operands. Proven by `cilly::ir::asm::export_event` (persisted unit test,
+hand-builds one `Notifier`/`Changed` event with trivial `ret`-only bodies — its job is to prove the
+*metadata linking* is well-formed IL `ilasm` accepts, not to re-prove the runtime semantics already
+covered by Step 1's C# consumer).
+
+**`pe_exporter`/`c_exporter` support does not exist** — same `DIRECT_PE=1` gap class as virtual
+overrides and interface export. No EventMap/Event/MethodSemantics tables were added to
+`pe_exporter/tables.rs` (would need the exact row-sorting care this finding's "what could go wrong"
+section originally called out). `EventDef` currently has no assert-guard in either exporter (there
+is no event-emission code path there AT ALL yet to guard — `ClassDef::events()` is simply never
+read outside `il_exporter`), but this is a live gap: once events are wired past `cilly` (macro/
+comptime work), both `pe_exporter::export_pe` and `c_exporter::export_class` need the same loud
+`assert!(class_def.events().is_empty(), ...)` guard pattern used for `is_interface`/`overrides`
+before this can ship past the spike stage.
+
+**Adversarial review caught a real asymmetry** (see [[mycorrhiza-ergonomics-backlog-campaign]] for
+the reviewing session's full findings): the virtual-override commit added a loud
+`pe_exporter`/`c_exporter` guard the moment `MethodDef::with_override` was added, but the
+interface-export commit (`63804ee`) did NOT add the equivalent guard for `is_interface`/
+`is_abstract` — a real gap since `pe_exporter` is the DEFAULT export path (`DIRECT_PE=1`). Fixed
+retroactively (same commit as the events work): `pe_exporter::export_pe` now asserts
+`!class_def.is_interface()` and `!method.is_abstract()`; `c_exporter::export_class`/
+`export_method_def` assert the same plus `def.overrides().is_none()` (C mode has no override/
+interface concept either — this exporter had NO guards for `overrides` before this fix, a gap
+missed in the original override commit). Also added: an `il_exporter` guard rejecting instance
+fields on an interface `ClassDef` (ECMA-335 forbids them, nothing enforced it before), and a guard
+rejecting the nonsensical `is_abstract() && overrides().is_some()` combination (an abstract member
+has no body for a `.override`'s `MethodImpl` row to attach to). None of these were live bugs (no
+code path reaches them yet outside hand-built test assemblies) but all three close latent traps for
+whoever wires the next layer.
+
+**What could go wrong** (unchanged from the original research, still applies to the un-shipped
+`pe_exporter`/macro-wiring work): MethodSemantics/EventMap row-ordering bugs in the PE writer; the
+`add_`/`remove_` bodies need genuine thread-safety (`Interlocked.CompareExchange`-based) for real
+concurrent-subscription correctness — the shipped spike's bodies are deliberately trivial/
+non-thread-safe, matching the "smallest safe first step" scope, not a production-ready event; and a
+naming-scheme decision for the backing delegate field once this reaches macro/comptime wiring.
+
+**Original Tier C verdict, for context:**
 
 **Verdict: feasible without weakening the typechecker, and smaller than the interface-export or
 virtual-override items — but genuinely new `cilly/src` metadata capability, not a pure-library

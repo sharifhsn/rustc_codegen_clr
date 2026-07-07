@@ -596,6 +596,66 @@ pub struct ClassDef {
     /// BACKLOG.md`'s Tier C finding #2 for the full scope discussion (no ctor synthesis, no
     /// default interface methods, no static interface members).
     is_interface: bool,
+    /// `.NET` events (ECMA-335 §II.22.13, the `add_*`/`remove_*` shape the C# `event` keyword
+    /// compiles to) declared on this class. Empty for the vast majority of classes. See
+    /// `EventDef`'s doc for what a single entry needs.
+    events: Vec<EventDef>,
+}
+/// One ECMA-335 event (§II.22.13 Event + §II.22.28 MethodSemantics `AddOn`/`RemoveOn`): a name, the
+/// delegate type subscribers must match, and the two *ordinary* instance methods (already emitted
+/// as regular `MethodDef`s by their owning class — this struct only LINKS their names into the
+/// Event-shaped IL block, it introduces no new invocation semantics) that back `+=`/`-=`. The real
+/// `add_`/`remove_` method bodies are expected to call `Delegate.Combine`/`Delegate.Remove` on a
+/// backing delegate-typed field — exactly the pattern `mycorrhiza::delegate` already proves works
+/// as a plain method call.
+///
+/// Scoped intentionally narrow (see `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md`'s Tier C finding #5):
+/// proven for a single delegate-typed field with non-thread-safe `add`/`remove` bodies (no
+/// `Interlocked.CompareExchange`-based synchronization — a real C# `event` needs that for
+/// concurrent-subscription correctness, which this spike does not attempt) via a hand-written
+/// `.il` file assembled with `ilasm` directly (bypassing this struct and `il_exporter` entirely)
+/// plus this struct's own `il_exporter` wiring, both hand-verified against a real C# consumer
+/// (`+=`/`-=`/multi-subscriber fan-out/`GetEvent` reflection all correct). `pe_exporter` has no
+/// EventMap/Event/MethodSemantics table support at all yet — same `DIRECT_PE=1` gap class as
+/// virtual overrides and interface export.
+#[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
+pub struct EventDef {
+    name: Interned<IString>,
+    delegate: Type,
+    add: Interned<MethodRef>,
+    remove: Interned<MethodRef>,
+}
+impl EventDef {
+    #[must_use]
+    pub fn new(
+        name: Interned<IString>,
+        delegate: Type,
+        add: Interned<MethodRef>,
+        remove: Interned<MethodRef>,
+    ) -> Self {
+        Self {
+            name,
+            delegate,
+            add,
+            remove,
+        }
+    }
+    #[must_use]
+    pub fn name(&self) -> Interned<IString> {
+        self.name
+    }
+    #[must_use]
+    pub fn delegate(&self) -> Type {
+        self.delegate
+    }
+    #[must_use]
+    pub fn add(&self) -> Interned<MethodRef> {
+        self.add
+    }
+    #[must_use]
+    pub fn remove(&self) -> Interned<MethodRef> {
+        self.remove
+    }
 }
 impl ClassDef {
     /// Checks if this class defition has a with the name and type.
@@ -619,6 +679,8 @@ impl ClassDef {
             // Pull each implemented interface's assembly into the `.assembly extern` table (avoids
             // CS0012 when the interface lives in a third assembly, e.g. a consumer's own library).
             .chain(self.implements.iter().map(|cref| Type::ClassRef(*cref)))
+            // Same CS0012-avoidance reasoning for each event's delegate type.
+            .chain(self.events.iter().map(EventDef::delegate))
     }
     #[allow(clippy::too_many_arguments)]
     #[must_use]
@@ -649,6 +711,7 @@ impl ClassDef {
             align,
             has_nonveralpping_layout,
             is_interface: false,
+            events: vec![],
         }
     }
 
@@ -678,6 +741,19 @@ impl ClassDef {
         if !self.implements.contains(&iface) {
             self.implements.push(iface);
         }
+    }
+
+    /// The `.NET` events declared on this class (see `EventDef`'s doc). Usually empty.
+    #[must_use]
+    pub fn events(&self) -> &[EventDef] {
+        &self.events
+    }
+
+    /// Declare an event on this class. The `add`/`remove` methods it names must already exist as
+    /// ordinary `MethodDef`s on this class — this only links their names into the Event-shaped IL
+    /// block (see `EventDef`'s doc).
+    pub fn add_event(&mut self, ev: EventDef) {
+        self.events.push(ev);
     }
 
     pub(crate) fn ref_to(&self) -> ClassRef {
@@ -779,6 +855,13 @@ impl ClassDef {
         // its `implements` set across them, exactly like fields/methods).
         for iface in translated.implements() {
             self.add_interface(*iface);
+        }
+
+        // Union the declared events, deduplicating by name (same reasoning as `implements` above).
+        for ev in translated.events() {
+            if !self.events.iter().any(|existing| existing.name() == ev.name()) {
+                self.events.push(ev.clone());
+            }
         }
 
         // Merge the static fields, removing duplicates

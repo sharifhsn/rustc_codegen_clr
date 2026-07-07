@@ -2913,6 +2913,101 @@ fn export_interface() {
         ILExporter::new(*ILASM_FLAVOUR, true, None),
     );
 }
+/// Smallest-safe-first-step spike for `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md`'s Tier C finding
+/// #5 (`.NET` events): hand-build a `ClassDef` with a delegate-typed field and `add_Changed`/
+/// `remove_Changed` methods linked via `ClassDef::add_event`, then run it through the real
+/// IL-text exporter + `ilasm` — proving the `.event`/`.addon`/`.removeon` metadata block
+/// `il_exporter` emits is well-formed ECMA-335 IL `ilasm` accepts. The `add`/`remove` bodies here
+/// are trivial (`ret`, ignoring the incoming delegate) — this test's job is to prove the metadata
+/// LINKING is correct (event name, delegate type, full method-reference signature text for both
+/// `.addon`/`.removeon`), not to exercise a real `Delegate.Combine`/`Delegate.Remove` subscriber
+/// list; that runtime behavior (plus `+=`/`-=`/multi-subscriber fan-out/`GetEvent` reflection) was
+/// hand-verified separately against a real C# consumer using an equivalent hand-written `.il` file
+/// with genuine `Delegate.Combine`/`Remove` bodies — see the finding's writeup.
+#[test]
+fn export_event() {
+    use super::il_exporter::*;
+
+    let mut asm = Assembly::default();
+    let name = asm.alloc_string("Notifier");
+    let class_def = ClassDef::new(
+        name,
+        false,
+        0,
+        None,
+        vec![],
+        vec![],
+        Access::Public,
+        None,
+        None,
+        true,
+    );
+    let class_idx = asm.class_def(class_def).unwrap();
+    let self_type = Type::ClassRef(*class_idx);
+
+    let action_name = asm.alloc_string("System.Action");
+    let action_asm = asm.alloc_string("System.Runtime");
+    let action_ref = asm.alloc_class_ref(ClassRef::new(
+        action_name,
+        Some(action_asm),
+        false,
+        vec![].into(),
+    ));
+    let action_type = Type::ClassRef(action_ref);
+
+    let ret = vec![asm.alloc_root(CILRoot::VoidRet)];
+    let bb = super::BasicBlock::new(ret, 0, None);
+
+    let add_name = asm.alloc_string("add_Changed");
+    let add_sig = asm.sig([self_type, action_type], Type::Void);
+    let add_def = MethodDef::new(
+        Access::Public,
+        class_idx,
+        add_name,
+        add_sig,
+        MethodKind::Instance,
+        MethodImpl::MethodBody {
+            blocks: vec![bb.clone()],
+            locals: vec![],
+        },
+        vec![None, None],
+    );
+    let add_idx = asm.new_method(add_def);
+    let add_mref = asm[add_idx].ref_to();
+    let add_mref = asm.alloc_methodref(add_mref);
+
+    let remove_name = asm.alloc_string("remove_Changed");
+    let remove_sig = asm.sig([self_type, action_type], Type::Void);
+    let remove_def = MethodDef::new(
+        Access::Public,
+        class_idx,
+        remove_name,
+        remove_sig,
+        MethodKind::Instance,
+        MethodImpl::MethodBody {
+            blocks: vec![bb],
+            locals: vec![],
+        },
+        vec![None, None],
+    );
+    let remove_idx = asm.new_method(remove_def);
+    let remove_mref = asm[remove_idx].ref_to();
+    let remove_mref = asm.alloc_methodref(remove_mref);
+
+    let event_name = asm.alloc_string("Changed");
+    asm.class_mut(class_idx).add_event(super::class::EventDef::new(
+        event_name,
+        action_type,
+        add_mref,
+        remove_mref,
+    ));
+
+    #[cfg(not(miri))]
+    asm.export(
+        "/tmp/export_event.dll",
+        ILExporter::new(*ILASM_FLAVOUR, true, None),
+    );
+}
 #[test]
 fn link() {
     use super::il_exporter::*;

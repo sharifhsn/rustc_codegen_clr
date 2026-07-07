@@ -1084,6 +1084,22 @@ impl CExporter {
         }
         let method_name = mref_to_name(&def.ref_to(), asm);
         let output = c_tpe(def.ref_to().output(asm), asm);
+        // Neither an explicit `.override` (`MethodDef::with_override`) nor an abstract member
+        // (`MethodDef::with_abstract`, e.g. an interface method) has an equivalent in generated C
+        // — there is no vtable-slot-override or interface concept in the C output at all. Silently
+        // falling through to the `MethodImpl::Missing` arm below would emit a concrete function
+        // that aborts at runtime instead of failing the build, the same class of silent
+        // miscompilation the `pe_exporter` guards exist to prevent (see those guards' docs and
+        // docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md's Tier C findings #1/#2).
+        assert!(
+            def.overrides().is_none(),
+            "method '{mname}' has an explicit .override, which C_MODE does not support."
+        );
+        assert!(
+            !def.is_abstract(),
+            "method '{mname}' is abstract (MethodDef::with_abstract), which C_MODE does not \
+             support."
+        );
         match def.resolved_implementation(asm) {
             MethodImpl::MethodBody { blocks, locals } => (),
             MethodImpl::Extern {
@@ -1287,6 +1303,17 @@ impl CExporter {
         extrn: bool,
     ) -> std::io::Result<()> {
         let class = asm[defid].clone();
+        // A genuine ECMA-335 `interface` `TypeDef` (`ClassDef::with_interface`) has no C
+        // equivalent (C has no interface/vtable-dispatch concept at this layer) — this exporter
+        // would otherwise silently emit it as an ordinary `struct`, the same class of silent
+        // wrong-shaped-output the `pe_exporter` guard exists to prevent. See
+        // docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md's Tier C finding #2.
+        assert!(
+            !class.is_interface(),
+            "class '{}' is a genuine interface (ClassDef::with_interface), which C_MODE does \
+             not support.",
+            &asm[class.name()]
+        );
         // Checks if this def needs to be delayed, if one of its fields is not yet defined
         if !class
             .fields()

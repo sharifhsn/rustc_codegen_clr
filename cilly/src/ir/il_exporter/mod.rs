@@ -187,6 +187,15 @@ impl ILExporter {
             // otherwise emit is illegal for `Interface`-flagged types and CoreCLR rejects it at
             // load time. See `ClassDef::with_interface`'s doc for the exact scope this covers.
             if class_def.is_interface() {
+                // An interface `TypeDef` cannot carry instance fields (§II.10.1.3) — nothing
+                // upstream enforces this (`ClassDef::with_interface` is a bare flag, see its doc),
+                // so guard it here instead of emitting invalid IL that only CoreCLR would reject
+                // at load time.
+                assert!(
+                    class_def.fields().is_empty(),
+                    "interface '{name}' (ClassDef::with_interface) has instance fields, which \
+                     ECMA-335 forbids on an interface TypeDef."
+                );
                 writeln!(
                     out,
                     ".class {vis} interface abstract ansi '{name}'{implements}{{"
@@ -380,10 +389,53 @@ impl ILExporter {
             for method_id in class_def.methods() {
                 self.emit_one_method(asm, asm_mut, out, *method_id, &mut ensure_unqiue)?;
             }
+            // `.event`/`.addon`/`.removeon` (ECMA-335 §II.22.13/§II.15.4.3): the `add_`/`remove_`
+            // bodies are ordinary instance methods (already emitted above by the per-method loop —
+            // an `EventDef` only links their names into an Event/MethodSemantics-shaped IL block,
+            // it doesn't introduce new invocation semantics). `ilasm` computes the real
+            // EventMap/Event/MethodSemantics metadata rows itself from this text; the hand-rolled
+            // PE writer has no equivalent yet (see `ClassDef::add_event`'s doc for scope).
+            for ev in class_def.events() {
+                let ev_name = asm_mut[ev.name()].to_string();
+                let delegate_ty = non_void_type_il(&ev.delegate(), asm_mut);
+                let add_text = self.method_ref_operand_text(asm_mut, ev.add());
+                let remove_text = self.method_ref_operand_text(asm_mut, ev.remove());
+                writeln!(
+                    out,
+                    ".event {delegate_ty} '{ev_name}' {{ .addon {add_text} .removeon {remove_text} }}"
+                )?;
+            }
             writeln!(out, "}}")?;
         }
 
         Ok(())
+    }
+    /// Builds the `<class>::'<name>'(<params>)` text ECMA-335 uses to reference a method by full
+    /// signature (as opposed to `.override`'s bare `<class>::<name>`) — the shape `.addon`/
+    /// `.removeon` need. Factored out of `export_node`'s `CILNode::Call` arm, which builds the
+    /// identical text for a `call`/`callvirt` operand (just prefixed with the call opcode there).
+    fn method_ref_operand_text(
+        &self,
+        asm: &mut super::Assembly,
+        mref: Interned<super::MethodRef>,
+    ) -> String {
+        let mref = &asm[mref];
+        let sig = &asm[mref.sig()];
+        let output = type_il(sig.output(), asm);
+        let inputs = match mref.kind() {
+            crate::cilnode::MethodKind::Static => sig.inputs(),
+            crate::cilnode::MethodKind::Instance
+            | crate::cilnode::MethodKind::Virtual
+            | crate::cilnode::MethodKind::Constructor => &sig.inputs()[1..],
+        };
+        let inputs: String = inputs
+            .iter()
+            .map(|tpe| non_void_type_il(tpe, asm))
+            .intersperse(",".to_owned())
+            .collect();
+        let name = &asm[mref.name()];
+        let class = self.partitioned_class(mref.class(), mref.name(), asm);
+        format!("instance {output} {class}::'{name}'({inputs})")
     }
     /// Emit one `.method … { … }` definition. Factored out of the class loop so an over-large
     /// `MainModule` can spread its methods across several partition classes (see [`partition`]).
@@ -507,6 +559,16 @@ impl ILExporter {
         // type or parameter list — just `<class>::<name>` — matching real ilasm output for
         // explicit interface/base-class overrides.
         if let Some(base) = method.overrides() {
+            // An abstract member has no body a `.override`'s MethodImpl row could attach to
+            // (§II.22.27 requires the overriding method to have a real implementation) — neither
+            // `with_override` nor `with_abstract` validates against the other being set (see both
+            // docs), so guard the combination here instead of emitting self-contradictory IL.
+            assert!(
+                !method.is_abstract(),
+                "method '{name}' is both abstract (MethodDef::with_abstract) and has an explicit \
+                 .override (MethodDef::with_override) -- an abstract member has no body for a \
+                 MethodImpl row to attach to."
+            );
             let base_ref = &asm_mut[base];
             let base_class = self.partitioned_class(base_ref.class(), base_ref.name(), asm_mut);
             let base_name = &asm_mut[base_ref.name()];

@@ -701,6 +701,16 @@ impl Assembly {
             let iface = self.translate_class_ref(source, *iface);
             translated.add_interface(iface);
         }
+        // Carry declared events across the assembly boundary (same reasoning as `implements`).
+        for ev in def.events() {
+            let name = self.alloc_string(source[ev.name()].as_ref());
+            let delegate = self.translate_type(source, ev.delegate());
+            let add = self.translate_method_ref(source, &source[ev.add()]);
+            let add = self.alloc_methodref(add);
+            let remove = self.translate_method_ref(source, &source[ev.remove()]);
+            let remove = self.alloc_methodref(remove);
+            translated.add_event(super::class::EventDef::new(name, delegate, add, remove));
+        }
         let class_ref = self.alloc_class_ref(translated.ref_to());
         let (defs_mut, _) = self.class_defs_mut_strings();
         match defs_mut.entry(ClassDefIdx(class_ref)) {
