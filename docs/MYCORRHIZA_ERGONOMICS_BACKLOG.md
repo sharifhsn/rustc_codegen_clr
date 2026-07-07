@@ -16,6 +16,22 @@ commits, `fa5ccbd`..`b9e683f`; no `cilly/src` touched; full workspace rebuild + 
 Tier C items were researched read-only in parallel (no code written) — findings appended at the
 end of this doc.
 
+**2026-07-07 round 2 update:** 7 of 8 remaining Tier A/B items shipped (`cargo dotnet publish
+--aot`, `doctor` workspace-wiring lints, `cargo dotnet test` libtest-parity probe, real NuGet
+metadata in `pack`, sidecar XML docs for `#[dotnet_export]`, the rustdoc landing-page pass, the
+differential-testing writeup) — commits `b16eab5`..`8d8de7a`, no `cilly/src` touched, consolidated
+re-verification post-merge all green (`cd_test_harness` new probe 6/1-ignored, `cargo-dotnet`'s own
+suite 34/34, `cd_export`/`cd_typedef` unaffected 13/13 + 16/16, `publish --aot` end-to-end on
+`cd_interop` byte-identical to the JIT path). The 8th item (hand-rolled `IAsyncEnumerable<T>`
+Tier A slice) hit a genuine, correctly-reported blocker: `#[dotnet_class(implements=...)]` cannot
+express a *generic* interface instantiation today (`rustc_codegen_clr_add_interface_impl` in root
+`src/comptime.rs` hardcodes empty generics on the interface `ClassRef`) — this is now folded into
+the Tier C findings below rather than attempted as a workaround. The 4 newly-researched items
+(`.NET events`, richer `#[dotnet_export]` return types, C# source generators, incremental-build
+feedback) turned up two more small Tier A wins (`Task<T>` export returns, `Vec<T>`→`RustVec<T>`
+export returns) and one closed non-issue (the source-generator premise is already solved by
+generics) — findings appended below.
+
 This doc is the **next layer** of ergonomics work, organized by interface/surface rather than by
 theme, so it's easy to tell which items are pure-library (safe, mycorrhiza-only, cheap to verify)
 vs. which need backend research first (touch `cilly/src`, need the full `::stable` gate, or need a
@@ -30,7 +46,9 @@ design decision before any code is written).
   program against a Rust-defined contract, not just a concrete exported type. **Research first.**
 - **.NET events (`add_*`/`remove_*`)** on exported classes — delegates work as fields/params, but
   idiomatic `event EventHandler Foo` isn't wired. **Research first** (small backend surface,
-  unclear size until scoped).
+  unclear size until scoped). **Researched 2026-07-07, see findings below — feasible without
+  weakening the typechecker, comparable in size to the interface-export item; genuinely new
+  `cilly/src` metadata tables (EventMap/Event/MethodSemantics), not an extension of existing ones.**
 - ~~**`IEnumerable<T>` over `RustVec<T>`**~~ — **DONE.** `RustVec<T>` and `RustBoxVec<T>`
   (`msbuild/RustDotnet.Containers.cs`, plus the inline copy in `cargo_tests/cd_rustvec/csharp/Program.cs`)
   now implement `IEnumerable<T>` via an allocation-free struct `Enumerator`, so both `foreach` and LINQ
@@ -39,7 +57,10 @@ design decision before any code is written).
 - **Richer `#[dotnet_export]` return types** — `Task<T>` and `IEnumerable<T>`/`IAsyncEnumerable<T>`
   as direct return types from an exported fn, to close the loop with async/enumerator work already
   done in the other direction. **Research first** (interacts with the Task<T>-production ceiling
-  documented in `mycorrhiza::task`'s own module docs).
+  documented in `mycorrhiza::task`'s own module docs). **Researched 2026-07-07 — three cases of
+  wildly different size, see findings below: `Task<T>` return and `Vec<T>`→`RustVec<T>` return are
+  both small Tier A follow-ons riding on already-shipped backend capability; true incremental
+  `IAsyncEnumerable<T>` production is blocked on the sibling item's coroutine-layout wall.**
 - **C# nullable/XML-doc annotation emission** on generated signatures — exported methods carry no
   `?` nullable-reference annotations and don't forward Rust doc comments as C# `///` XML docs, so
   IntelliSense on the C# side is blind to both. **Research first** — design proposal, since it
@@ -68,7 +89,14 @@ design decision before any code is written).
   (common in modern .NET APIs — EF Core, gRPC streaming) aren't. **Research first** (interacts
   with the same coroutine-layout wall documented in `mycorrhiza::task`). **Researched 2026-07-06,
   see findings below — blocked for the sugared `async fn` case; a hand-rolled non-overlapping
-  Stream-state struct is a viable Tier A follow-up.**
+  Stream-state struct is a viable Tier A follow-up. Attempted 2026-07-07: genuinely blocked one
+  layer earlier than expected — `#[dotnet_class(implements=...)]` cannot express a *generic*
+  interface instantiation (`IAsyncEnumerator<T>` for concrete `T`) at all today, since
+  `rustc_codegen_clr_add_interface_impl` (root `src/comptime.rs`) hardcodes empty generics on the
+  interface `ClassRef` with no macro-level way to inject one. This is a real, scoped, additive
+  `cilly/src`-adjacent gap (generalize that one intrinsic to accept generic args) that blocks BOTH
+  this item and Case C of the richer-export-return-types item below — worth fixing as its own small
+  Tier C spike before either.**
 - ~~**A safe `Once`/lazy-init wrapper**~~ — **DONE** (`fa5ccbd`). `mycorrhiza::sync::SharedOnce<T>`,
   built on the existing `SharedLock` (double-checked locking over an `UnsafeCell<Option<T>>`), not
   `System.Lazy<T>` (which is CLR-generic over `T` with no way to bind an arbitrary Rust `T` through
@@ -93,9 +121,13 @@ design decision before any code is written).
 - **NuGet package metadata audit** — does `cargo dotnet pack`'s `.nupkg` carry a proper README,
   license, repo URL, version, and TFM set fit for publishing (not just in-repo consumption)?
   **Pure library/tooling**, mostly a `pack.rs` metadata fill-in.
-- **Source-generator-driven C# boilerplate** (e.g. auto-generating a typed wrapper class around a
-  raw `RustVec<T>` handle) — currently hand-written by the consumer. **Research first** (bigger
-  scope, needs a design for what a C#-side source generator would own).
+- ~~**Source-generator-driven C# boilerplate**~~ — **CLOSED, non-issue.** Researched 2026-07-07: the
+  motivating example (a typed wrapper per `RustVec<T>` instantiation) is already solved by real CLR
+  generics — `RustVec<T>`/`RustHashMap<K,V>` are single, size-erased, fully generic C# types, so
+  there is no per-`T` boilerplate for a source generator to eliminate. No `Microsoft.CodeAnalysis`
+  dependency exists anywhere in the tree; a real Roslyn generator would be a new, heavier mechanism
+  (netstandard2.0 analyzer package, separate versioning axis) with no current concrete payoff. Full
+  finding below for the record, in case a genuinely per-consumer generation need surfaces later.
 
 ## 4. Tooling / CLI (`cargo dotnet`)
 
@@ -115,12 +147,20 @@ design decision before any code is written).
   in the crate currently compiles silently — detecting that needs whole-crate visibility a single
   attribute-macro invocation can't see without a larger registry-based design; flagged as a future
   item rather than attempted here to avoid scope creep into "exhaustive macro rewrite."
-- **`cargo dotnet doctor` breadth** — currently checks toolchain/.NET presence; could also lint
-  missing `RustCrate` csproj wiring, TFM/`--dotnet`-flag mismatches, stale generated bindings.
-  **Pure library/tooling.**
-- **Incremental-build feedback** — no progress/timing signal during a large crate's MIR→CIL→PE
-  pipeline. **Deferred** — needs profiling against a genuinely large crate first to know if it's
-  even a real problem before investing in UX for it.
+- ~~**`cargo dotnet doctor` breadth**~~ — **DONE, with one explicitly-skipped check** (`6d4a7be`).
+  Added workspace-wiring lints: missing `<RustCrate>` references for sibling Rust crates, and
+  `TargetFramework`/`RustDotnetVersion` TFM mismatches. **Skipped:** "stale generated bindings" —
+  `mycorrhiza/src/bindings.rs` and `cargo_tests/spinacz/out.rs` are one-time hand-committed
+  `spinacz` output with no existing hash/timestamp staleness signal to check against; adding one
+  would be inventing new infrastructure, out of scope for a lint pass.
+- ~~**Incremental-build feedback**~~ — **CONFIRMED REAL, fix scoped, not yet implemented.**
+  Researched 2026-07-07 by measuring a real regex-scale crate: 10-12 seconds of complete terminal
+  silence during the MIR→CIL→link→PE pipeline in default (non-verbose) mode, because
+  `feasibility/_cargo_dotnet_core.sh`'s log-filtering grep allow-lists `Compiling std/core/alloc`
+  but not the target crate's own `Compiling` line or any of the linker's existing stage
+  `println!`s — the signal already exists and is silently thrown away, not missing. See findings
+  below for the two small, additive, no-typechecker-risk edits that fix it (grep allow-list +
+  timing instrumentation) — not yet implemented, next up.
 
 ## 5. Documentation & discoverability
 
@@ -132,13 +172,19 @@ design decision before any code is written).
   *combination* of shipped features together. **Deferred** — significant standalone effort, do
   after the above lands so the flagship reflects the improved ergonomics rather than the current
   ones.
-- **`mycorrhiza` rustdoc landing-page pass** — confirm `cargo doc -p mycorrhiza` has a top-level
-  narrative pointing a newcomer at `prelude`, not just a flat module list. **Pure docs.**
+- ~~**`mycorrhiza` rustdoc landing-page pass**~~ — **DONE** (`c812463`). `lib.rs`'s top-level doc
+  comment now has a what-is-this intro, points to `mycorrhiza::prelude` as the recommended start,
+  and a categorized module tour. Verified zero new rustdoc warnings vs. before the change.
 
 ## 6. Testing ergonomics (for external consumers, not just us)
 
-- **`cargo dotnet test` `#[should_panic]`/`#[ignore]`/filtering support** — confirm parity with
-  what `cargo test` normally supports, not just the happy path. **Pure library/tooling.**
+- ~~**`cargo dotnet test` `#[should_panic]`/`#[ignore]`/filtering support**~~ — **DONE, already
+  worked** (`8d8de7a`). Confirmed empirically (new permanent `cargo_tests/cd_test_harness` probe)
+  that all three already work correctly via the standard libtest harness running through the
+  backend unmodified — no code fix needed for the feature itself. Found and fixed one real,
+  unrelated toolchain-drift bug while verifying: a `palinject.rs` manifest literal had drifted out
+  of sync with the current nightly's reindentation of `os::unix::io::null_fd()`, hard-erroring PAL
+  injection for every `cargo dotnet` invocation.
 - ~~**A documented, reusable differential-testing pattern** for external consumers~~ — **DONE.**
   New §14 in `INTEROP_COOKBOOK.md` ("Catch a codegen bug in your own crate early") writes up the
   native-Rust-as-oracle vs. `CARGO_DOTNET_BACKEND=native` pattern for outside use: a minimal
@@ -260,4 +306,115 @@ changes, fully reversible, validates real IntelliSense pickup before investing i
 nullable-annotation work. **Watch for:** XML docs are keyed by an exact ECMA-334 member-ID string
 that must match `dotnet_class_name`'s existing >1023-char FNV-hash-shortened output exactly, or
 Visual Studio silently shows no docs with no error — needs a differential check against the actual
-emitted metadata name, not just "the C# compiles."
+emitted metadata name, not just "the C# compiles." (Update 2026-07-07: this half shipped, see §4's
+DONE entry — `ca74a46`.)
+
+### 5. .NET events (`add_*`/`remove_*`) on exported classes
+
+**Verdict: feasible without weakening the typechecker, and smaller than the interface-export or
+virtual-override items — but genuinely new `cilly/src` metadata capability, not a pure-library
+follow-on.** Confirmed there is currently zero Event/EventMap support anywhere in the codebase:
+`ClassDef` (`cilly/src/ir/class.rs`) models only `fields`/`static_fields`/`methods`/`implements` —
+no event *or* property concept at all, so this would be the first semantic (non-field/method) CLR
+member kind added to the IR. What ECMA-335 needs: an **EventMap** table row (§II.22.12, one per
+type declaring events), an **Event** table row (§II.22.13, name + delegate type), and
+**MethodSemantics** rows (§II.22.28) tagging ordinary `MethodDef`s as `AddOn`/`RemoveOn` for an
+Event row. Crucially, an event's `add_`/`remove_` bodies are *ordinary* instance methods calling
+`Delegate.Combine`/`Delegate.Remove` on a backing delegate field — exactly the pattern
+`mycorrhiza::delegate` already proves works as a plain method call — so this is a pure
+metadata-linking problem, not new invocation semantics; nothing here touches IL-verification rules.
+The IL-exporter (ilasm text) side is easy (a templated `.event`/`.addon`/`.removeon` directive,
+ilasm computes the tables itself); the hand-rolled PE writer is the harder half, needing to emit
+correctly-sorted EventMap/Event/MethodSemantics rows itself — this exact class of "silent-until-
+CoreCLR-loads-garbage" table-ordering bug is a previously-seen hazard in this codebase's PE-emission
+work. **Smallest safe first step:** skip the PE writer for the first spike — hand-build one
+`ClassDef` with a delegate-typed field and `add_Changed`/`remove_Changed` methods, hand-write the
+`.event`/`.addon`/`.removeon` ilasm text directly (bypassing macro/exporter plumbing entirely) to
+confirm CoreCLR accepts hand-rolled event metadata and a C# consumer's `obj.Changed += handler;`
+actually fires it, before touching `il_exporter/mod.rs` templating, `dotnet_macros` attribute
+wiring, or the PE writer's new tables. **What could go wrong:** MethodSemantics/EventMap row-
+ordering bugs in the PE writer (a real, previously-documented hazard class here); the synthesized
+`add_`/`remove_` bodies need genuine thread-safety (`Interlocked.CompareExchange`-based, matching
+what the real C# `event` keyword compiles to) or the feature would be subtly wrong under concurrent
+subscription while looking correct; and a naming-scheme decision is needed so a delegate-typed
+backing field doesn't collide with the existing field-accessor-generation machinery.
+
+### 6. Richer `#[dotnet_export]` return types: `Task<T>` and `IEnumerable<T>`/`IAsyncEnumerable<T>`
+
+**Verdict: three cases of wildly different size.** `#[dotnet_export]` currently hard-rejects
+`async fn` unconditionally and `marshal_return` only recognizes `&str`/`String`/`()`/primitives —
+no container or `Task` arm exists at all.
+
+- **Case A — `Task<T>` return (small, Tier A-adjacent):** the hard part this item worried about —
+  producing a result-bearing `Task<T>` at all — is *not actually a wall anymore*: `future_to_task`
+  in `mycorrhiza::task` already works end-to-end via the WF-9 nested-generic-binding unlock (its own
+  comments call this "the former wall — now unblocked"). What's missing is purely a
+  `marshal_return` arm recognizing `Task`/`TaskT<T>` as pass-through FFI-safe handle types (they
+  already are, same shape as any other managed handle the macro threads through) plus scoping
+  `async fn` rejection to keep rejecting the *sugar* while letting a plain non-async fn that
+  explicitly constructs and returns a `Task`/`TaskT<T>` pass straight through. No `cilly/src`
+  touch, rides entirely on already-shipped capability.
+- **Case B — `IEnumerable<T>` return, materialized collection (small, Tier A):** achievable today
+  by direct analogy with the already-DONE `RustVec<T>`/`IEnumerable<T>` item, which was implemented
+  entirely C#-side (a hand-written wrapper around a concrete exported handle, not a synthesized
+  bare interface value). The same shape applies: teach `marshal_return` a `Vec<T>` → `RustVec<T>`
+  arm (for primitive `T` first), and the *existing* C#-side `IEnumerable<T>` implementation already
+  makes the result `foreach`/LINQ-able. Zero `cilly/src` involvement.
+- **Case C — `IAsyncEnumerable<T>`, true incremental producer (blocked):** identical wall to the
+  sibling `IAsyncEnumerable<T>` bridge finding above — fully tied to that item's fate, not an
+  independent problem. Do not attempt separately; it would either re-derive the same coroutine-
+  layout wall or tempt a fully-buffered shortcut that silently breaks the backpressure semantics a
+  .NET consumer would reasonably assume from the type.
+
+**Recommended sequencing:** ship Case A and Case B as two small, independent `dotnet_macros`
+changes riding on already-shipped backend capability; leave Case C blocked until the sibling
+Stream-state-struct spike lands (and, per that finding above, until the `implements=`
+generic-interface-instantiation gap is fixed first).
+
+### 7. Source-generator-driven C# boilerplate — CLOSED, non-issue
+
+**Verdict: the motivating premise no longer exists — real generics already solved it.** The item's
+example (a typed wrapper per `RustVec<T>` instantiation) described a per-`T` codegen problem that
+doesn't exist in this codebase: `RustVec<T>`/`RustHashMap<K,V>` are single, size-erased Rust cores
+with a single hand-written, fully generic C# wrapper (already `IEnumerable<T>`-capable) — a
+consumer never hand-writes anything per their own `T`, the CLR's real generics handle every
+instantiation. There is no `Microsoft.CodeAnalysis`/Roslyn-generator dependency anywhere in the
+tree, and every existing "C#-facing codegen" mechanism (the `#[dotnet_export]`/`#[dotnet_class]`
+proc-macros, the `xmldoc.rs` sidecar-file post-processor) works at the Rust-compile or MSBuild
+layer, never as a C# compiler plugin. A real Roslyn Source Generator would be justified only for a
+genuinely *per-consumer-project* generation need (not per-Rust-type) — no concrete example of that
+exists today, and building the machinery speculatively would add a second, heavier C#-generation
+mechanism (netstandard2.0 analyzer packaging, a new debugging surface, a new versioning axis)
+alongside the existing simple one with no net capability gain. **Recommendation:** treat this
+backlog line as closed/re-scoped rather than pursued; if a genuine per-consumer need surfaces later
+(plausibly from the flagship end-to-end example app item), the first real step would be a
+throwaway standalone `IIncrementalGenerator` proof-of-concept validating the packaging mechanics,
+not an integration design done in the abstract.
+
+### 8. Incremental-build feedback — confirmed real, fix scoped
+
+**Verdict: a genuine, now-measured UX problem with a small, additive, zero-typechecker-risk fix —
+not a hypothetical concern.** Measured on a real regex-scale crate (`cargo_tests/soak_regex`, 17MB
+serialized IR): default (non-verbose) `cargo dotnet build` goes **completely silent for 10-12
+seconds** between the config-regeneration line and `Finished`, with no indication anything is
+happening. Root cause, read from source: `feasibility/_cargo_dotnet_core.sh`'s default-mode log
+filter allow-lists `Compiling std/core/alloc` but not the target crate's own `Compiling` line, and
+allow-lists *no* linker output at all — even though the linker already has stage `println!`s
+(`Preparing to load assmeblies`/`Loaded assmeblies`/`Eliminating dead code` in
+`cilly/src/bin/linker/{load.rs,main.rs}`) that are silently thrown away by the grep in the exact
+mode most users run in. The signal already exists; it's being filtered out, not missing. Separately,
+even in verbose mode there is *no timing instrumentation anywhere* in the linker (`.opt()`,
+`.typecheck()`, the three `ilasm` `Command::new` invocations each currently run with zero markers),
+so which sub-stage actually dominates the 10s window is unknown. **Smallest safe first step (not
+yet implemented):** (1) a one-line grep-allowlist edit in `_cargo_dotnet_core.sh` to pass through
+the target crate's own `Compiling` line and the linker's existing stage text; (2) wrap `.opt()`,
+`.typecheck()`, and the `ilasm` invocations with `Instant::now()`/`elapsed()` timing `println!`s
+matching the linker's existing style. Explicitly **do not** build a progress bar yet — there's no
+cheap per-item counter available (opt/typecheck/ilasm are each one opaque call over the whole
+assembly), so a real progress bar needs materially bigger internal-instrumentation work than coarse
+per-stage timing; that's a possible follow-up only once the timing breakdown shows one stage
+dominating badly enough to justify it. **What could go wrong:** the broadened `Compiling ` grep
+term could unmask dependency-compile spam that was likely filtered deliberately (verify or scope
+the addition to just the target crate's own name); the linker's unmasked `println!`s have no
+`==>`-style prefix matching `cargo-dotnet`'s own banner convention, so a small formatting pass is
+worth doing alongside to keep the UX coherent.
