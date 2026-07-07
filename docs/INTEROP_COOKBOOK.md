@@ -52,7 +52,7 @@ assert!(!set.insert(5));               // false = already present
 ```
 
 `T` must be a type that crosses the boundary: a .NET primitive, a `#[repr(C)]` value-type struct, or a
-managed handle. **Runnable:** `cargo_tests/cd_collections` (38 checks).
+managed handle. **Runnable:** `cargo_tests/cd_collections` (128 checks).
 
 ### Iterate one with `for` (the enumerator bridge)
 
@@ -73,6 +73,32 @@ let set: HashSet<i32> = vec![1, 2, 2, 3].into_iter().collect();      // dedups �
 ```
 
 `Stack` enumerates LIFO (top first), `Queue` FIFO (front first). **Runnable:** `cargo_tests/cd_enumerate`.
+
+### Iterate a `Dictionary<K, V>` as `(K, V)` pairs
+
+`for (k, v) in &dict` drives the real `KeyValuePair<K,V>` enumerator (a *value-type generic* — this
+was the WF-9 backend unlock); `.iter()` gives the same pairs and composes with adapters:
+
+```rust
+use mycorrhiza::prelude::*;
+
+let mut dm: Dictionary<i32, i64> = Dictionary::new();
+dm.insert(1, 100);
+dm.insert(2, 200);
+dm.insert(3, 300);
+
+let (mut ksum, mut vsum) = (0i32, 0i64);
+for (k, v) in &dm {
+    ksum += k;
+    vsum += v;
+}
+assert_eq!((ksum, vsum), (6, 600));
+
+assert_eq!(dm.iter().map(|(_, v)| v).sum::<i64>(), 600);
+assert_eq!(dm.iter().find(|&(k, _)| k == 2).map(|(_, v)| v), Some(200));
+```
+
+**Runnable:** `cargo_tests/cd_collections` (`Dictionary entry iteration` section, part of its 128 checks).
 
 ---
 
@@ -384,8 +410,49 @@ assert_eq!(held.invoke(7), 14);
 ```
 
 `Action1`/`Action2` are void-returning; `Func1`/`Func2` return a value; `Comparison<T>` is the
-`(T,T) -> i32` comparator shape. The callbacks are capture-less top-level `extern "C" fn`s — thread
-state through a `static` (e.g. an `AtomicI32`). **Runnable:** `cargo_tests/cd_delegates`.
+`(T,T) -> i32` comparator shape. **Runnable:** `cargo_tests/cd_delegates`.
+
+**Capturing closures** are also shipped — a `move` closure over local state becomes a managed
+`Action`/`Func` via `::from_closure`, no need to thread state through a `static`:
+
+```rust
+use mycorrhiza::prelude::*;
+
+let factor = 10;
+let mut sum = 0i32;
+let f = Func1::<i32, i32>::from_closure(move |x| x * factor);
+assert_eq!(f.invoke(5), 50);
+
+// A second closure with a different capture — independent environment, no interference.
+let base = 1000;
+let g = Func1::<i32, i32>::from_closure(move |x| x * 2 + base);
+assert_eq!(g.invoke(5), 1010);
+assert_eq!(f.invoke(1), 10);   // f still uses its own `factor`
+```
+
+**Runnable:** `cargo_tests/cd_closures`.
+
+**Delegate as a generic-method argument** — passing a `Comparison<T>`/`Action<T>` *into* a .NET
+generic method (`List<T>.Sort(Comparison<T>)`, `List<T>.ForEach(Action<T>)`) is wired via
+`mycorrhiza::collections::List`'s `.sort_by(...)` / `.for_each(...)`:
+
+```rust
+use mycorrhiza::prelude::*;
+
+extern "C" fn cmp_i32(a: i32, b: i32) -> i32 { a - b }
+extern "C" fn accum(x: i32) { /* ... */ }
+
+let mut sl: List<i32> = List::new();
+sl.push(30);
+sl.push(10);
+sl.push(20);
+sl.sort_by(cmp_i32);                 // List<int>.Sort(Comparison<int>) — ascending
+assert_eq!(sl.get(0), Some(10));
+
+sl.for_each(accum);                  // List<int>.ForEach(Action<int>) drives the Rust callback
+```
+
+**Runnable:** `cargo_tests/cd_collections` (`sort_by`/`for_each` section).
 
 **Async callbacks / `Task`.** You can `.await` a real .NET `Task` from Rust and hand a Rust `async fn`
 back to .NET as a `Task` (`mycorrhiza::task`): `block_on`, `await_unit(Task::delay(20))`,
@@ -394,10 +461,182 @@ Constraint: a managed `Task` handle must not be held *across* an `.await` inside
 reference can't live in the coroutine's overlapping saved state) — await it via a plain `Future`
 (`await_unit`) and keep only primitives across suspend points; the examples show the shape.
 
-**Not yet shipped:** closure *captures* in a delegate (only capture-less `extern "C" fn`s today),
-delegate-as-a-generic-method-argument (e.g. `List<T>.Sort(Comparison<T>)`), and **.NET event
-subscription** (`obj.SomeEvent += handler`, i.e. the `add_*`/`remove_*` accessors). These are the
-documented Theme-3 follow-ups — don't write a recipe that subscribes to a .NET event; it isn't wired.
+**Not yet shipped: .NET event subscription** (`obj.SomeEvent += handler`, i.e. the `add_*`/`remove_*`
+accessors). Delegates work fine as plain fields/params/args (including generic-method args, above) —
+it's specifically the idiomatic `event EventHandler Foo` subscription syntax that isn't wired. Don't
+write a recipe that subscribes to a .NET event; it isn't wired.
+
+---
+
+## 9. Read/write .NET memory with `Span<T>` — zero-copy over a Rust slice
+
+`mycorrhiza::span::{Span, ReadOnlySpan}` wraps a real `System.Span<T>`/`ReadOnlySpan<T>` over a Rust
+slice's own memory — a .NET API that fills/reads the span mutates the Rust buffer directly, no copy:
+
+```rust
+use mycorrhiza::span::{ReadOnlySpan, Span};
+
+let mut data = [1i32, 2, 3, 4];
+let mut sp = Span::from_slice(&mut data);
+assert_eq!(sp.len(), 4);
+assert_eq!(sp.get(2), Some(3));
+sp.set(0, 100);
+sp.fill(0);          // a .NET Fill call, writing straight into `data`
+sp.set(3, 42);
+drop(sp);
+assert_eq!(data, [0, 0, 0, 42]);
+
+let ro = [7i32, 8, 9];
+let ros = ReadOnlySpan::from_slice(&ro);
+assert_eq!(ros.len(), 3);
+assert!(!ros.is_empty());
+let _handle = ros.handle();   // escape hatch: hand the raw Span to a .NET API expecting one
+```
+
+`Span<T>`/`ReadOnlySpan<T>` are `ref struct`s (stack-only, generic value types) — this works because
+of the WF-9 value-type-generic-instance-method unlock. **Runnable:** `cargo_tests/cd_span`
+(`mycorrhiza::span` section).
+
+---
+
+## 10. Bridge `Nullable<T>` ⇄ `Option<T>`
+
+`mycorrhiza::nullable` gives a real `System.Nullable<T>` an idiomatic `Option<T>` conversion:
+
+```rust
+use mycorrhiza::nullable::NullableExt;
+
+let n = mycorrhiza::nullable::some(7i32);
+assert_eq!(n.to_option(), Some(7));
+```
+
+This is the same value-type-generic unlock `Span<T>` (§9) and dictionary iteration (§1) rest on —
+`Nullable<T>` is a generic value type, and its `HasValue`/`Value` are value-type instance methods.
+**Runnable:** `cargo_tests/cd_vtgen` (`Ergonomic Nullable<T> -> Option<T>` section).
+
+---
+
+## 11. Call a .NET *generic method* (`Foo<T>(...)`, not just a generic type)
+
+A method that itself takes type arguments — `Activator.CreateInstance<T>()`, `Enum.GetName<TEnum>(v)`,
+the shape behind DI's `GetService<T>()` / `JsonSerializer.Deserialize<T>()` — is reachable through the
+`rustc_clr_interop_generic_method_call*` intrinsics in `mycorrhiza::intrinsics`. This is lower-level
+than the `mycorrhiza::bcl`/`collections` wrappers (no idiomatic face is generated for you), but it is
+real and proven end-to-end, including enum round-trips via `dotnet_enum!`:
+
+```rust
+#![feature(adt_const_params, unsized_const_params)]
+use mycorrhiza::intrinsics::{
+    rustc_clr_interop_generic_method_call0, RustcCLRInteropManagedClass, RustcCLRInteropMethodGeneric,
+};
+
+const CORELIB: &str = "System.Private.CoreLib";
+type MSB = RustcCLRInteropManagedClass<CORELIB, "System.Text.StringBuilder">;
+
+// Activator.CreateInstance<StringBuilder>() -> !!0  (a static generic method).
+fn create_sb() -> MSB {
+    rustc_clr_interop_generic_method_call0::<
+        CORELIB, "System.Activator", false, "CreateInstance", 0, (), (MSB,),
+        (RustcCLRInteropMethodGeneric<0>,), MSB,
+    >()
+}
+```
+
+Also ships an ergonomic enum bridge, `mycorrhiza::dotnet_enum!`, for round-tripping a C# enum (an
+int-backed value type) as a native Rust `enum`:
+
+```rust
+mycorrhiza::dotnet_enum! {
+    pub enum Dow = ["System.Private.CoreLib"] "System.DayOfWeek" (i32, 4) {
+        Sunday = 0, Monday = 1, Tuesday = 2, Wednesday = 3, Thursday = 4, Friday = 5, Saturday = 6,
+    }
+}
+// Dow::Friday.to_handle() / Dow::from_handle(handle) round-trip through the real .NET enum.
+```
+
+**Runnable:** `cargo_tests/cd_gmethod`.
+
+---
+
+## 12. Implement a .NET interface from Rust
+
+`#[dotnet_class(implements = "[Assembly]Namespace.IContract")]` makes the synthesized managed class
+implement an interface defined in another (even C#) assembly — the CLR binds the interface's members
+implicitly as long as the method names/signatures on the `#[dotnet_methods]` block match:
+
+```rust
+#![feature(adt_const_params, unsized_const_params)]
+use dotnet_macros::{dotnet_class, dotnet_methods};
+use mycorrhiza::system::{DotNetString, MString};
+
+#[dotnet_class(implements = "[Contracts]Contracts.IGreeter")]
+pub struct Greeter { base_priority: i32 }
+
+#[dotnet_methods]
+impl Greeter {
+    pub fn Greet(this: GreeterHandle, name: MString) -> MString {
+        let name = DotNetString::from_handle(name).to_rust_string();
+        DotNetString::from(format!("Hello, {name}!").as_str()).handle()
+    }
+    pub fn Priority(this: GreeterHandle) -> i32 { this.instance0::<"read_base_priority", i32>() + 1 }
+}
+```
+
+A C# consumer then programs against `Greeter` **only through `IGreeter`** — the shape needed to drop a
+Rust implementation behind an existing C# codebase's DI/strategy/plugin interface. **Runnable:**
+`cargo_tests/cd_iface` (9/9).
+
+---
+
+## 13. Build a LINQ / EF `IQueryable` predicate from Rust (Expression trees)
+
+`mycorrhiza::linq` builds real `System.Linq.Expressions` trees from Rust — the shape an `IQueryable`
+provider (EF Core, etc.) *walks* to translate to SQL, rather than a compiled delegate it just calls.
+Both the in-memory path (`Enumerable`-style, compile-and-run) and the EF-style handoff
+(`Queryable.Where<T>(Expression<Func<T,bool>>)`) are shipped.
+
+The ergonomic entry point is `#[dotnet_entity]`, which turns a plain Rust struct into a set of typed
+`Field<Root, Val>` columns bound to a real .NET type's members:
+
+```rust
+use dotnet_macros::dotnet_entity;
+use mycorrhiza::linq::{Expr, IntQuery, Param};
+
+#[dotnet_entity]
+#[dotnet(namespace = "System", assembly = "System.Private.CoreLib", name = "Exception")]
+struct Sample {
+    #[dotnet(rename = "HResult")]
+    id: i32,
+    #[dotnet(rename = "Message")]
+    display_name: String,
+}
+
+let sample = Sample::new();
+let pred = sample.id.gt(5) & sample.display_name.contains("oops");  // combinable via &/|/!
+assert!(pred.text().contains("AndAlso"));
+
+// The EF handoff: filter a query with the predicate TREE (Queryable.Where translates it,
+// it does not run it in-process). This filter is over a plain int Param, not `Sample`.
+let a = Param::new("System.Int32", "a");
+let n = IntQuery::range(1, 10)
+    .where_(a.expr().gt(Expr::const_i32(5)).typed_pred(&a))
+    .count();
+assert_eq!(n, 5);   // keeps {6,7,8,9,10}
+```
+
+Snake_case field names convert to PascalCase .NET member names automatically (`display_name` →
+`DisplayName`), with `#[dotnet(rename = "...")]` as the escape hatch when they don't match (as above,
+`Message`/`HResult`). `Field<Root, i32>` supports `.eq`/`.gt`/`.ge`/`.lt`/`.le`; `Field<Root, String>`
+adds `.contains`/`.starts_with`/`.ends_with`; `Field<Root, bool>` adds `.is_true`/`.is_false`.
+`TypedPredicate::<T>::always()`/`never()` give trivial constant predicates. Two predicates built from
+*independent* `Param`s (e.g. authored in different functions) combine correctly via `&`/`|`/`!` — the
+combinator transparently rebinds parameter identity (`mycorrhiza::linq::rebind_param`) so the combined
+tree still compiles and executes.
+
+Lower-level building blocks (`Param::new`, `Expr::const_i32`/`const_str`, `.prop("Name")`,
+`.call1_same_type("Contains", ...)`, `.lambda(&[...])`, `.compile()`, `.typed_pred(&param)`) are also
+directly usable when a caller's entity type doesn't fit the `#[dotnet_entity]` shape. **Runnable:**
+`cargo_tests/cd_linq_expr` (30/30) and `cargo_tests/cd_linq` (in-memory LINQ).
 
 ---
 
@@ -406,11 +645,16 @@ documented Theme-3 follow-ups — don't write a recipe that subscribes to a .NET
 These are honest gaps as of this writing — the natural next recipes, but not yet backed by working code:
 
 - **Idiomatic `HttpClient`** — use `std::net` by hand (§4) for now.
-- **.NET event subscription** (`+=` on an event) and **capturing closures as delegates** (§8).
-- **Delegate as a generic-method argument** (`Sort(Comparison<T>)`) — needs a nested-generic-binding
-  typecheck extension, not a checker relaxation.
+- **.NET event subscription** (`+=` on an event, i.e. `add_*`/`remove_*` accessors) — §8.
+- **`#[dotnet_class]` overriding a *base class's* virtual method** — implementing an *interface*
+  (§12) works; re-opening a class to override a virtual member does not.
+- **Exporting a Rust trait as a C# interface** (the reverse of §12's `implements=`) — a C# consumer
+  can use an exported concrete type, but can't yet program against a Rust-defined contract type.
+- **`IEnumerable<T>` over a C#-exported `RustVec<T>`** — it's indexable from C# but not `foreach`-able.
 - **A `serde` ⇄ `System.Text.Json` adapter** — the JSON bridge (§2) is a standalone DOM today.
 - **`#[dotnet_export]` of `Vec<T>` / slices / `Option` / `Result` / `char`** — primitives + strings only.
 
 For the capability map and the genuine ceilings, see
-[TRANSLATION_STATUS.md](TRANSLATION_STATUS.md); for the DX backlog, [ERGONOMICS_ROADMAP.md](ERGONOMICS_ROADMAP.md).
+[TRANSLATION_STATUS.md](TRANSLATION_STATUS.md) and [STATE_OF_THE_PROJECT.md](STATE_OF_THE_PROJECT.md)
+(the authoritative dated snapshot); for the DX backlog,
+[MYCORRHIZA_ERGONOMICS_BACKLOG.md](MYCORRHIZA_ERGONOMICS_BACKLOG.md).
