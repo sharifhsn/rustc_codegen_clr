@@ -96,6 +96,26 @@ pub fn run(args: &DoctorArgs) -> Result<i32> {
         }
     }
     print!("{out}");
+
+    // Workspace-wiring lints: sibling Rust crates missing a <RustCrate> reference, and
+    // TFM/RustDotnetVersion mismatches. Best-effort — scan errors are reported as a single
+    // soft warning rather than aborting the whole `doctor` run.
+    let wiring_checks = workspace_wiring_checks(&args.workspace);
+    if !wiring_checks.is_empty() {
+        let mut wout = String::new();
+        wout.push_str(&format!(
+            "\ncargo dotnet doctor — workspace wiring ({}):\n\n",
+            args.workspace.display()
+        ));
+        for c in &wiring_checks {
+            c.render(&mut wout);
+            if !c.ok && c.hard {
+                hard_failures += 1;
+            }
+        }
+        print!("{wout}");
+    }
+
     if hard_failures == 0 {
         println!("\nAll required checks passed. You should be able to `cargo dotnet run`.");
         Ok(0)
@@ -248,6 +268,275 @@ fn file_check(label: &str, path: &Path, hard: bool) -> Check {
             format!("missing: {} (only needed for the C# consumer flow)", path.display()),
         )
     }
+}
+
+// ---------------------------------------------------------------------------------
+// Workspace wiring lints (RustCrate csproj wiring + TFM/RustDotnetVersion mismatches).
+//
+// These are static-text scans, not MSBuild evaluation: they look for the `<RustCrate
+// Include="...">` item and `<RustDotnetVersion>`/`<TargetFramework>` properties by simple
+// XML string matching, which is good enough to catch the common mistakes (a sibling Rust
+// crate nobody references; a hardcoded TargetFramework that has drifted from
+// RustDotnetVersion) without pulling in a full MSBuild evaluator.
+//
+// NOTE on the third lint the backlog item asked about — "stale generated bindings": there
+// is no existing per-project generated-bindings artifact with a staleness signal to check.
+// `mycorrhiza/src/bindings.rs` is a hand-committed, one-time `spinacz`-generated file (see
+// its module doc), not something rebuilt per project with a hash/timestamp marker; the only
+// other "generated bindings" in the tree is `cargo_tests/spinacz/out.rs`, a one-off demo
+// output with the same lack of a freshness marker. Inventing a new hashing/timestamp scheme
+// here would be new infrastructure, which the task instructions say to skip rather than add.
+// So only checks (1) and (2) are implemented.
+// ---------------------------------------------------------------------------------
+
+/// Directory names never worth descending into while scanning a workspace.
+const SKIP_DIRS: &[&str] = &[
+    "target", ".git", "node_modules", "bin", "obj", ".vs", ".idea", "graphify-out",
+];
+
+fn workspace_wiring_checks(root: &Path) -> Vec<Check> {
+    if !root.is_dir() {
+        return vec![Check::warn(
+            "workspace wiring scan",
+            format!("--workspace {} is not a directory; skipping", root.display()),
+        )];
+    }
+
+    let mut cargo_tomls = Vec::new();
+    let mut csprojs = Vec::new();
+    walk(root, 0, &mut cargo_tomls, &mut csprojs);
+
+    let mut checks = Vec::new();
+
+    // Read each csproj once: (path, contents, RustCrate Include paths (resolved absolute),
+    // RustDotnetVersion property value if present, TargetFramework property value if present).
+    struct CsProjFacts {
+        path: PathBuf,
+        rust_crate_dirs: Vec<PathBuf>,
+        rust_dotnet_version: Option<String>,
+        target_framework: Option<String>,
+    }
+    let mut csproj_facts = Vec::new();
+    for csproj in &csprojs {
+        let Ok(text) = std::fs::read_to_string(csproj) else { continue };
+        let proj_dir = csproj.parent().unwrap_or(Path::new("."));
+        let rust_crate_dirs = extract_rust_crate_includes(&text)
+            .into_iter()
+            .map(|rel| normalize(&proj_dir.join(rel)))
+            .collect();
+        csproj_facts.push(CsProjFacts {
+            path: csproj.clone(),
+            rust_crate_dirs,
+            rust_dotnet_version: extract_property(&text, "RustDotnetVersion"),
+            target_framework: extract_property(&text, "TargetFramework"),
+        });
+    }
+
+    // (1) Missing RustCrate wiring: a sibling dir with a Cargo.toml (a Rust crate) that is
+    // not named by ANY csproj's <RustCrate Include> anywhere in the scanned tree, and that
+    // itself is not a C# project dir (no .csproj alongside it — that would just be the
+    // Rust-only cargo_tests probe crates that have no C# consumer by design, e.g. rust-on-.NET
+    // "app" style crates). We only flag a Rust crate that sits NEXT TO a .csproj sibling
+    // (same parent dir) — the strongest signal that it was meant to be consumed by it.
+    let referenced: std::collections::HashSet<PathBuf> =
+        csproj_facts.iter().flat_map(|f| f.rust_crate_dirs.iter().cloned()).collect();
+    for crate_dir in &cargo_tomls {
+        let crate_dir = crate_dir.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let norm = normalize(&crate_dir);
+        if referenced.contains(&norm) {
+            continue;
+        }
+        // Only flag if a sibling .csproj exists in the same small "project family" — either
+        // directly in the parent directory, or one level down (the repo convention is
+        // `<name>/rustlib` + `<name>/csharp/*.csproj`, i.e. the csproj's OWN parent is a
+        // sibling of the crate dir). The parent itself must NOT be the scan root (a large
+        // directory holding many unrelated crates, like `cargo_tests/`) — otherwise every
+        // crate in a big flat probe-crate tree would spuriously match some unrelated csproj
+        // living two levels down elsewhere in that same tree. Otherwise this is plausibly a
+        // Rust-only crate never meant to be referenced from C#.
+        let Some(parent) = norm.parent() else { continue };
+        let parent_is_scan_root = normalize(parent) == normalize(root);
+        let has_sibling_csproj = !parent_is_scan_root
+            && (has_csproj_under(parent)
+                || csprojs.iter().any(|c| {
+                    c.parent()
+                        .and_then(Path::parent)
+                        .map(|gp| normalize(gp) == normalize(parent))
+                        .unwrap_or(false)
+                }));
+        if has_sibling_csproj {
+            checks.push(Check::warn(
+                format!("RustCrate wiring: {}", norm.display()),
+                format!(
+                    "a Rust crate exists here with a sibling C# project, but no <RustCrate \
+                     Include=\"...\"/> in any scanned .csproj resolves to it — add \
+                     `<RustCrate Include=\"{}\" />` to the consuming .csproj, or it will never \
+                     be built/referenced.",
+                    pretty_relative(&norm, root)
+                ),
+            ));
+        }
+    }
+
+    // (2) TFM / RustDotnetVersion mismatches per csproj.
+    for f in &csproj_facts {
+        let rdv = f.rust_dotnet_version.as_deref();
+        let tfm = f.target_framework.as_deref();
+        match (rdv, tfm) {
+            (Some(rdv), Some(tfm)) => {
+                let expected = format!("net{rdv}.0");
+                // TargetFramework is allowed to literally be "net$(RustDotnetVersion).0" (the
+                // scaffolded template) — that is not a hardcoded value, so nothing to compare.
+                if tfm.contains("$(RustDotnetVersion)") {
+                    continue;
+                }
+                if tfm != expected {
+                    checks.push(Check::fail(
+                        format!("TFM/RustDotnetVersion: {}", f.path.display()),
+                        format!(
+                            "<RustDotnetVersion>{rdv}</RustDotnetVersion> implies \
+                             <TargetFramework>{expected}</TargetFramework>, but the csproj \
+                             hardcodes <TargetFramework>{tfm}</TargetFramework> — the Rust \
+                             assembly's `.assembly extern .ver` / runtimeconfig will target {rdv} \
+                             while the consumer runs on a different TFM. Either set \
+                             TargetFramework to net$(RustDotnetVersion).0, or align \
+                             RustDotnetVersion with {tfm}."
+                        ),
+                    ));
+                }
+            }
+            (None, Some(tfm)) if !tfm.contains("$(RustDotnetVersion)") => {
+                // No explicit RustDotnetVersion → RustDotnet.props defaults it to "8". Flag
+                // only if the hardcoded TFM disagrees with that default (net9.0, net10.0, …),
+                // since that is the actual failure mode (dotnet build targets a runtime the
+                // Rust side wasn't built for).
+                if tfm != "net8.0" {
+                    checks.push(Check::warn(
+                        format!("TFM/RustDotnetVersion: {}", f.path.display()),
+                        format!(
+                            "<TargetFramework>{tfm}</TargetFramework> is set but \
+                             <RustDotnetVersion> is not — RustDotnet.props defaults it to \"8\" \
+                             (net8.0), which disagrees with {tfm}. Set \
+                             <RustDotnetVersion>{}</RustDotnetVersion> explicitly (matching {tfm}), \
+                             or change TargetFramework to net$(RustDotnetVersion).0.",
+                            tfm.trim_start_matches("net").trim_end_matches(".0")
+                        ),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if checks.is_empty() {
+        checks.push(Check::pass(
+            "workspace wiring",
+            format!("no RustCrate/TFM issues found under {}", root.display()),
+        ));
+    }
+    checks
+}
+
+/// Recursively collect `Cargo.toml` and `*.csproj` paths under `dir`, skipping build/VCS dirs.
+fn walk(dir: &Path, depth: u32, cargo_tomls: &mut Vec<PathBuf>, csprojs: &mut Vec<PathBuf>) {
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) {
+                continue;
+            }
+            walk(&path, depth + 1, cargo_tomls, csprojs);
+        } else if name == "Cargo.toml" {
+            cargo_tomls.push(path);
+        } else if name.ends_with(".csproj") {
+            csprojs.push(path);
+        }
+    }
+}
+
+/// Whether any `.csproj` exists directly inside `dir` (non-recursive).
+fn has_csproj_under(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|it| {
+            it.flatten()
+                .any(|e| e.path().extension().map(|x| x == "csproj").unwrap_or(false))
+        })
+        .unwrap_or(false)
+}
+
+fn normalize(p: &Path) -> PathBuf {
+    // Best-effort lexical normalization (no filesystem canonicalize, so this still works for
+    // paths that don't exist yet / across symlink quirks): resolve `.` and `..` components.
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn pretty_relative(p: &Path, root: &Path) -> String {
+    p.strip_prefix(&normalize(root)).unwrap_or(p).display().to_string()
+}
+
+/// Extract every `<RustCrate Include="...">` path (attribute-order-agnostic, simple regex-free
+/// scan — good enough for the hand-written csproj files this tool targets).
+fn extract_rust_crate_includes(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(tag_start) = rest.find("<RustCrate") {
+        let after = &rest[tag_start..];
+        let tag_end = after.find('>').unwrap_or(after.len());
+        let tag = &after[..tag_end];
+        if let Some(inc) = extract_attr(tag, "Include") {
+            out.push(inc);
+        }
+        rest = &after[tag_end.min(after.len())..];
+        if rest.is_empty() {
+            break;
+        }
+        rest = &rest[1..]; // skip past the '>' we just consumed
+    }
+    out
+}
+
+/// Extract `<PropName>value</PropName>` (first occurrence), trimmed.
+fn extract_property(xml: &str, prop: &str) -> Option<String> {
+    let open = format!("<{prop}>");
+    let close = format!("</{prop}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    let val = xml[start..end].trim();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val.to_string())
+    }
+}
+
+/// Extract `Attr="value"` or `Attr='value'` from a tag's inner text.
+fn extract_attr(tag: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=");
+    let pos = tag.find(&needle)? + needle.len();
+    let rest = &tag[pos..];
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let rest = &rest[1..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
 }
 
 // ---------------------------------------------------------------------------------
@@ -470,5 +759,111 @@ mod tests {
             "TypeLoadException: ... Queue ... later ... MissingMethodException: ...",
         );
         assert_eq!(hints.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------------
+    // Workspace wiring lints.
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn extracts_rust_crate_include_paths() {
+        let xml = r#"<ItemGroup>
+            <RustCrate Include="../rustlib" />
+            <RustCrate Include='../other' Configuration="Debug" />
+        </ItemGroup>"#;
+        assert_eq!(extract_rust_crate_includes(xml), vec!["../rustlib", "../other"]);
+    }
+
+    #[test]
+    fn extracts_property_value() {
+        let xml = "<PropertyGroup><RustDotnetVersion>9</RustDotnetVersion></PropertyGroup>";
+        assert_eq!(extract_property(xml, "RustDotnetVersion").as_deref(), Some("9"));
+        assert_eq!(extract_property(xml, "TargetFramework"), None);
+    }
+
+    fn write(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cargo_dotnet_doctor_test_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn clean_workspace_reports_ok() {
+        let root = tmp_dir("clean");
+        write(&root.join("good/rustlib/Cargo.toml"), "[package]\nname = \"probe\"\n");
+        write(
+            &root.join("good/csharp/probe_cs.csproj"),
+            r#"<Project><PropertyGroup>
+                <RustDotnetVersion>8</RustDotnetVersion>
+                <TargetFramework>net$(RustDotnetVersion).0</TargetFramework>
+            </PropertyGroup>
+            <ItemGroup><RustCrate Include="../rustlib" /></ItemGroup></Project>"#,
+        );
+        let checks = workspace_wiring_checks(&root);
+        assert!(checks.iter().all(|c| c.ok), "expected a clean report, got a flagged check");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detects_missing_rust_crate_wiring() {
+        let root = tmp_dir("missing");
+        write(&root.join("proj/rustlib/Cargo.toml"), "[package]\nname = \"probe\"\n");
+        write(
+            &root.join("proj/csharp/probe_cs.csproj"),
+            "<Project><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>",
+        );
+        let checks = workspace_wiring_checks(&root);
+        assert!(
+            checks.iter().any(|c| !c.ok && c.label.contains("RustCrate wiring")),
+            "expected a RustCrate-wiring warning, got: {:?}",
+            checks.iter().map(|c| &c.label).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detects_tfm_version_mismatch() {
+        let root = tmp_dir("tfm");
+        write(&root.join("proj/rustlib/Cargo.toml"), "[package]\nname = \"probe\"\n");
+        write(
+            &root.join("proj/csharp/probe_cs.csproj"),
+            r#"<Project><PropertyGroup>
+                <RustDotnetVersion>9</RustDotnetVersion>
+                <TargetFramework>net8.0</TargetFramework>
+            </PropertyGroup>
+            <ItemGroup><RustCrate Include="../rustlib" /></ItemGroup></Project>"#,
+        );
+        let checks = workspace_wiring_checks(&root);
+        assert!(
+            checks.iter().any(|c| !c.ok && c.hard && c.label.contains("TFM/RustDotnetVersion")),
+            "expected a hard TFM mismatch failure, got: {:?}",
+            checks.iter().map(|c| &c.label).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn does_not_flag_unrelated_crates_under_a_large_scan_root() {
+        // Regression test: a flat directory holding many unrelated Rust-only crates AND
+        // separate, unrelated csproj-having crates (like this repo's `cargo_tests/`) must
+        // not cause every crate to be flagged just because *some* csproj exists somewhere
+        // else two levels down from the scan root.
+        let root = tmp_dir("largeroot");
+        write(&root.join("standalone_a/Cargo.toml"), "[package]\nname = \"a\"\n");
+        write(&root.join("standalone_b/Cargo.toml"), "[package]\nname = \"b\"\n");
+        write(
+            &root.join("unrelated_consumer/unrelated.csproj"),
+            "<Project><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>",
+        );
+        let checks = workspace_wiring_checks(&root);
+        assert!(checks.iter().all(|c| c.ok), "expected no false positives, got: {:?}",
+            checks.iter().map(|c| (&c.label, c.ok)).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

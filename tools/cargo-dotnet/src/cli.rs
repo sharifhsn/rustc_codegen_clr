@@ -178,6 +178,12 @@ pub struct DoctorArgs {
     /// itself. If omitted, and stdin is piped, the piped text is diagnosed; otherwise a
     /// full toolchain/backend-install environment check runs.
     pub input: Option<String>,
+
+    /// Directory to scan for workspace-wiring issues (sibling Rust crates missing a
+    /// `<RustCrate>` reference, TFM/`RustDotnetVersion` mismatches). Default: `.`. Only
+    /// consulted in environment-check mode (ignored when translating a failure).
+    #[arg(long, default_value = ".")]
+    pub workspace: PathBuf,
 }
 
 #[derive(clap::Args)]
