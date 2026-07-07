@@ -7,15 +7,13 @@
 //
 // Two further return-type arms (docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md Tier C §6):
 //   * Case A: `Task`/`Task<T>` returns — `rustlib/src/lib.rs`'s `delayed_ping()`/`compute_answer()`
-//     build and emit the correct CIL (`System.Threading.Tasks.Task`/`Task<int>`, verified via
-//     monodis/ilspycmd against the produced cd_export.dll), but the C# SIDE below is left
-//     UNEXERCISED for now: a separate, pre-existing gap in `cilly/src/ir/il_exporter/mod.rs`'s
-//     `ref_assembly_name_for_type` (the CS0012 ref-vs-impl-assembly table) doesn't cover
-//     `System.Threading.Tasks.Task`/`Task<T>` the way it already does for `System.Threading`'s
-//     `SemaphoreSlim`/etc., so a separately-compiled C# project sees `CS0012` on these two exports.
-//     Fixing that table is a `cilly/src` change outside this macro work's scope — left as a follow-up
-//     rather than forced. See the task's final report for detail; do not re-enable an `await` call on
-//     `delayed_ping`/`compute_answer` here until that lands (it will make this project fail to build).
+//     build and emit the correct CIL (`System.Threading.Tasks.Task`/`Task<int>`). Consuming them
+//     from this separately-compiled C# project used to hit CS0012 (a pre-existing gap in the
+//     exporters' `ref_assembly_name_for_type` ref-vs-impl-assembly table, which covered
+//     `System.Threading`'s `SemaphoreSlim`/etc. but not `System.Threading.Tasks.Task`/`Task<T>`) —
+//     fixed in both `il_exporter` and `pe_exporter` (a `System.Threading.Tasks.Task` ->
+//     `System.Threading.Tasks` entry, confirmed against the real net8.0 ref-pack DLL), so both
+//     exports are now `await`ed directly below like any other async C# call.
 //   * Case B: `Vec<T>` -> `RustVec<T>` returns — `range()`/`squares()` below, consumed via
 //     `foreach`/LINQ `.Sum()` exactly like the hand-built `cd_rustvec` wrapper. Fully verified.
 
@@ -160,21 +158,14 @@ public static class Program
         // didn't corrupt or abort the runtime — it took an ordinary managed-exception control path).
         Check("add(2,3) after boom() panic", MainModule.add(2, 3), 5, ref pass, ref total);
 
-        // ---- Case A: Task/Task<T> returns — NOT YET EXERCISED here, see the file-header comment ---
+        // ---- Case A: Task/Task<T> returns --------------------------------------------------------
         //
-        // `MainModule.delayed_ping()` / `MainModule.compute_answer()` exist and build correctly on
-        // the Rust side (confirmed via metadata inspection: the shims' declared return types really
-        // are `System.Threading.Tasks.Task` / `Task<int>`), but calling them from this separately-
-        // compiled C# project currently hits CS0012 — a pre-existing gap in the exporter's ref-vs-
-        // impl-assembly table (`cilly/src/ir/il_exporter/mod.rs`'s `ref_assembly_name_for_type`,
-        // which already covers `System.Threading`'s `SemaphoreSlim`/etc. but not `System.Threading.
-        // Tasks.Task`/`Task<T>`). That's a `cilly/src` fix, out of scope for this macro-only change —
-        // left as a documented follow-up rather than forced. Uncomment once it lands:
-        //
-        // await MainModule.delayed_ping();
-        // int got = await MainModule.compute_answer();
-        // Check("await compute_answer()", got, 42, ref pass, ref total);
-        await Task.CompletedTask; // keep `await` reachable so MainAsync stays a real async method.
+        // The CS0012 gap noted above is now fixed: `ref_assembly_name_for_type` (both exporters)
+        // has a `System.Threading.Tasks.Task` -> `System.Threading.Tasks` entry alongside the
+        // existing `System.Threading` ones, confirmed against the real net8.0 ref-pack DLL.
+        await MainModule.delayed_ping();
+        int got = await MainModule.compute_answer();
+        Check("await compute_answer()", got, 42, ref pass, ref total);
 
         // ---- Case B: Vec<T> -> RustVec<T> returns — foreach/LINQ over an exported Rust Vec<T> -----
 

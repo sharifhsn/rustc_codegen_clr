@@ -1770,6 +1770,11 @@ fn ref_assembly_name_for_type<'a>(assembly: &'a str, type_name: &str) -> &'a str
             | "System.Threading.ManualResetEventSlim"
             | "System.Threading.CountdownEvent"
             | "System.Threading.Barrier" => return "System.Threading",
+            // `Task`/`Task<T>` (this table's key is the bare name; the `\`N` generic-arity
+            // suffix is appended separately by the caller, so one entry covers both) are
+            // genuine TypeDefs in `System.Threading.Tasks.dll`, confirmed by scanning the real
+            // net8.0 ref-pack (`System.Runtime.dll` does not define or forward either).
+            "System.Threading.Tasks.Task" => return "System.Threading.Tasks",
             _ => {}
         }
     }

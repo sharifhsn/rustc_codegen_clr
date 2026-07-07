@@ -813,6 +813,9 @@ fn ref_assembly_name_for_type<'a>(assembly: &'a str, type_name: &str) -> &'a str
             | "System.Threading.ManualResetEventSlim"
             | "System.Threading.CountdownEvent"
             | "System.Threading.Barrier" => return "System.Threading",
+            // See il_exporter::ref_assembly_name_for_type's twin entry: Task/Task<T> are real
+            // TypeDefs in System.Threading.Tasks.dll, not forwarded through System.Runtime.
+            "System.Threading.Tasks.Task" => return "System.Threading.Tasks",
             _ => {}
         }
     }
