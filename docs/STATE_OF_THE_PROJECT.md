@@ -61,7 +61,7 @@ run on the **real .NET backend**, `CARGO_DOTNET_BACKEND=native`) and/or the Dock
 | Threads/sync | Real `Thread`/`Mutex`(SemaphoreSlim)/TLS(`ThreadLocal<nint>`)/**Parker** → rayon/parking_lot-class unblocked | `pal_threads` + compat Class D fix |
 | Full-I/O PAL | fs (copy/set_len/canonicalize/permissions), net (TCP/UDP/UDS), process `status()` **and** `output()` capture | `pal_*` probes all green (only `hard_link` open) |
 | async | Rust async/await + tokio core on the PAL; `mycorrhiza::task` bridges .NET `Task` both directions (incl. `Task<T>` production) | `pal_tokio_net`, `cd_async` 7/7 |
-| Generics interop | Rust→generic .NET (`List<T>`, `Dictionary<K,V>`), value-type generic instance methods (dict iteration, `Span<T>`, `Nullable<T>`), generic **methods** `!!N`, C#→generic Rust (`RustVec<T>`/`RustBoxVec<T>` any `T`) | `cd_generic` 18/18, `cd_rustvec` 37/37, `cd_collections` 128/128 |
+| Generics interop | Rust→generic .NET (`List<T>`, `Dictionary<K,V>`), value-type generic instance methods (dict iteration, `Span<T>`, `Nullable<T>`), generic **methods** `!!N`, C#→generic Rust (`RustVec<T>`/`RustBoxVec<T>` any `T`) | `cd_generic` 18/18, `cd_rustvec` 44/44, `cd_collections` 128/128 |
 | Delegates/closures | `extern fn` **and capturing closures** → `Action`/`Func`; delegates as generic-method args (`sort_by`) | `cd_delegates` 14/14, `cd_closures` |
 | Interfaces | **Rust type implements a .NET interface** (`#[dotnet_class(implements=…)]`), consumed polymorphically from C# (DI-shaped) | `cd_iface` 9/9 |
 | LINQ / EF | Expression trees built from Rust (parameters, binops, member access, constants via the new `box` primitive), compiled+executed, and handed to `Queryable.Where<T>(Expression<Func<T,bool>>)` | `cd_linq_expr` 30/30 |

@@ -11,10 +11,19 @@
 // (which §9.5 forbids).
 
 using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.InteropServices;
 
 /// A growable list of unmanaged `T`, backed by a single size-erased Rust vector.
-public unsafe struct RustVec<T> : IDisposable where T : unmanaged
+///
+/// Implements `IEnumerable<T>` (via a struct `Enumerator`, so a plain `foreach` allocates nothing)
+/// so it can be consumed idiomatically from C# instead of manual `Count`/`Get(i)` indexing. This is
+/// the same shape shipped in `msbuild/RustDotnet.Containers.cs`'s `RustDotnet.RustVec<T>` — this
+/// project keeps its own inline copy (no `UseRustDotnetContainers`) to stay a minimal, dependency-free
+/// probe, but the two should be kept in sync.
+public unsafe struct RustVec<T> : IDisposable, IEnumerable<T> where T : unmanaged
 {
     private nuint _handle;
 
@@ -50,6 +59,48 @@ public unsafe struct RustVec<T> : IDisposable where T : unmanaged
             _handle = 0;
         }
     }
+
+    public Enumerator GetEnumerator() => new Enumerator(this);
+
+    IEnumerator<T> IEnumerable<T>.GetEnumerator() => GetEnumerator();
+
+    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+
+    public struct Enumerator : IEnumerator<T>
+    {
+        private RustVec<T> _vec;
+        private int _index;
+        private T _current;
+
+        internal Enumerator(RustVec<T> vec)
+        {
+            _vec = vec;
+            _index = -1;
+            _current = default;
+        }
+
+        public T Current => _current;
+
+        object IEnumerator.Current => _current;
+
+        public bool MoveNext()
+        {
+            int next = _index + 1;
+            if (next >= _vec.Count)
+                return false;
+            _current = _vec.Get(next);
+            _index = next;
+            return true;
+        }
+
+        public void Reset()
+        {
+            _index = -1;
+            _current = default;
+        }
+
+        public void Dispose() { }
+    }
 }
 
 /// A growable list of ANY `T` (managed reference types, structs holding references, anything),
@@ -59,7 +110,7 @@ public unsafe struct RustVec<T> : IDisposable where T : unmanaged
 /// element (vs `RustVec<T : unmanaged>`'s near-zero-cost byte copy). Rust never sees the object — only
 /// the opaque handle — so the same Rust monomorphization serves both modes. Reference identity is
 /// preserved: `Get` returns the very object that was `Push`ed.
-public unsafe struct RustBoxVec<T> : IDisposable
+public unsafe struct RustBoxVec<T> : IDisposable, IEnumerable<T>
 {
     private nuint _handle;
 
@@ -111,6 +162,48 @@ public unsafe struct RustBoxVec<T> : IDisposable
             _handle = 0;
         }
     }
+
+    public Enumerator GetEnumerator() => new Enumerator(this);
+
+    IEnumerator<T> IEnumerable<T>.GetEnumerator() => GetEnumerator();
+
+    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+
+    public struct Enumerator : IEnumerator<T>
+    {
+        private RustBoxVec<T> _vec;
+        private int _index;
+        private T _current;
+
+        internal Enumerator(RustBoxVec<T> vec)
+        {
+            _vec = vec;
+            _index = -1;
+            _current = default;
+        }
+
+        public T Current => _current;
+
+        object IEnumerator.Current => _current;
+
+        public bool MoveNext()
+        {
+            int next = _index + 1;
+            if (next >= _vec.Count)
+                return false;
+            _current = _vec.Get(next);
+            _index = next;
+            return true;
+        }
+
+        public void Reset()
+        {
+            _index = -1;
+            _current = default;
+        }
+
+        public void Dispose() { }
+    }
 }
 
 public struct Point
@@ -153,6 +246,17 @@ public static class Program
             Check("int[1] after Set", vi.Get(1), 99, ref pass, ref total);
             // Rust does real work over the stored bytes: 10 + 99 + 30 = 139.
             Check("Rust sum_i32", vi.RustSumI32(), 139L, ref pass, ref total);
+
+            // ---- foreach (IEnumerable<T>) over RustVec<int> ----
+            var seen = new List<int>();
+            foreach (var x in vi)
+                seen.Add(x);
+            Check("foreach count", seen.Count, 3, ref pass, ref total);
+            Check("foreach values", string.Join(",", seen), "10,99,30", ref pass, ref total);
+
+            // ---- LINQ over RustVec<int>, proving it's a real IEnumerable<T>, not just duck-typed ----
+            Check("LINQ Sum", vi.Sum(), 139, ref pass, ref total);
+            Check("LINQ Where/ToList", string.Join(",", vi.Where(x => x > 15)), "99,30", ref pass, ref total);
         }
 
         // ---- RustVec<Point>: an 8-byte C#-defined struct Rust never saw ----
@@ -259,6 +363,14 @@ public static class Program
             vt.Set(0, t2); // overwrite (frees t0's GCHandle)
             Check("Thing[0].Id after Set", vt.Get(0).Id, 2, ref pass, ref total);
             Check("Thing[0] identity after Set", ReferenceEquals(vt.Get(0), t2), true, ref pass, ref total);
+
+            // ---- foreach (IEnumerable<T>) over RustBoxVec<Thing> — GCHandle-boxed elements ----
+            var names = new List<string>();
+            foreach (var thing in vt)
+                names.Add(thing.Name);
+            Check("RustBoxVec foreach count", names.Count, 2, ref pass, ref total);
+            Check("RustBoxVec foreach values", string.Join(",", names), "two,one", ref pass, ref total);
+            Check("RustBoxVec LINQ Select", string.Join(",", vt.Select(t => t.Id)), "2,1", ref pass, ref total);
         }
 
         // ---- RustBoxVec<int[]>: a managed ARRAY element — identity + contents ----

@@ -29,6 +29,8 @@
 //         <UseRustDotnetString>     -> RUSTDOTNET_STRING (RustString).
 
 using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -39,7 +41,7 @@ namespace RustDotnet
     /// A growable list of unmanaged <typeparamref name="T"/>, backed by a single size-erased Rust
     /// vector. Near-zero-cost: each element is memcpy'd to/from the Rust buffer by its raw bytes.
     /// </summary>
-    public unsafe struct RustVec<T> : IDisposable where T : unmanaged
+    public unsafe struct RustVec<T> : IDisposable, IEnumerable<T> where T : unmanaged
     {
         private nuint _handle;
 
@@ -78,6 +80,55 @@ namespace RustDotnet
                 _handle = 0;
             }
         }
+
+        /// <summary>
+        /// Enumerate the elements by index (each <c>Get</c> re-reads the Rust-owned buffer, so this
+        /// is safe against growth via <c>Push</c> made *before* the enumerator was created, but — like
+        /// <c>List&lt;T&gt;</c> — mutating the count mid-iteration is not a supported pattern).
+        /// A struct enumerator, so a plain `foreach` over a `RustVec&lt;T&gt;` allocates nothing.
+        /// </summary>
+        public Enumerator GetEnumerator() => new Enumerator(this);
+
+        IEnumerator<T> IEnumerable<T>.GetEnumerator() => GetEnumerator();
+
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+
+        /// <summary>Allocation-free struct enumerator for <see cref="RustVec{T}"/>.</summary>
+        public struct Enumerator : IEnumerator<T>
+        {
+            private RustVec<T> _vec;
+            private int _index;
+            private T _current;
+
+            internal Enumerator(RustVec<T> vec)
+            {
+                _vec = vec;
+                _index = -1;
+                _current = default;
+            }
+
+            public T Current => _current;
+
+            object IEnumerator.Current => _current;
+
+            public bool MoveNext()
+            {
+                int next = _index + 1;
+                if (next >= _vec.Count)
+                    return false;
+                _current = _vec.Get(next);
+                _index = next;
+                return true;
+            }
+
+            public void Reset()
+            {
+                _index = -1;
+                _current = default;
+            }
+
+            public void Dispose() { }
+        }
     }
 
     /// <summary>
@@ -88,7 +139,7 @@ namespace RustDotnet
     /// <see cref="Get"/> returns the very object that was <see cref="Push"/>ed. Costs a box + GC root
     /// per element (vs <see cref="RustVec{T}"/>'s raw byte copy).
     /// </summary>
-    public unsafe struct RustBoxVec<T> : IDisposable
+    public unsafe struct RustBoxVec<T> : IDisposable, IEnumerable<T>
     {
         private nuint _handle;
 
@@ -143,6 +194,54 @@ namespace RustDotnet
                 global::MainModule.rcl_vec_free(_handle);
                 _handle = 0;
             }
+        }
+
+        /// <summary>
+        /// Enumerate the elements by index (each step resolves the element's <see cref="GCHandle"/>
+        /// back to its managed object). A struct enumerator, so a plain `foreach` allocates nothing
+        /// beyond what <see cref="Get"/> itself does.
+        /// </summary>
+        public Enumerator GetEnumerator() => new Enumerator(this);
+
+        IEnumerator<T> IEnumerable<T>.GetEnumerator() => GetEnumerator();
+
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+
+        /// <summary>Allocation-free struct enumerator for <see cref="RustBoxVec{T}"/>.</summary>
+        public struct Enumerator : IEnumerator<T>
+        {
+            private RustBoxVec<T> _vec;
+            private int _index;
+            private T _current;
+
+            internal Enumerator(RustBoxVec<T> vec)
+            {
+                _vec = vec;
+                _index = -1;
+                _current = default;
+            }
+
+            public T Current => _current;
+
+            object IEnumerator.Current => _current;
+
+            public bool MoveNext()
+            {
+                int next = _index + 1;
+                if (next >= _vec.Count)
+                    return false;
+                _current = _vec.Get(next);
+                _index = next;
+                return true;
+            }
+
+            public void Reset()
+            {
+                _index = -1;
+                _current = default;
+            }
+
+            public void Dispose() { }
         }
     }
 #endif // RUSTDOTNET_VEC

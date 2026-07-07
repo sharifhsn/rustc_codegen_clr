@@ -30,7 +30,7 @@ that was compiled with the backend and executed on real .NET (`CARGO_DOTNET_BACK
 | `cargo_tests/cd_async` | .NET-from-Rust | **7/7** |
 | `cargo_tests/cd_generic` | .NET-from-Rust (low-level bridge) | **18/18** |
 | `cargo_tests/cd_containers2` | Rust-from-C# | **30/30** |
-| `cargo_tests/cd_rustvec` | Rust-from-C# | **37/37** |
+| `cargo_tests/cd_rustvec` | Rust-from-C# | **44/44** |
 | `cargo_tests/cd_typedef` | Rust-from-C# (`#[dotnet_class]`) | **16/16** |
 | `cargo_tests/cd_containers` | Rust-from-C# (`RustVec` only) | **13/13** |
 | `cargo_tests/cd_interop` | Rust-from-C# | **PASS** |
@@ -141,7 +141,7 @@ Proof: `cd_idiomatic` (45/45).
 ## 5. Rust-from-C# — exporting Rust ergonomically
 
 The mirror direction: a C# dev consuming a Rust `cdylib`. Proof: `cd_typedef` (16/16),
-`cd_containers2` (30/30), `cd_rustvec` (37/37), `cd_interop`/`cd_interop_tier2` (PASS).
+`cd_containers2` (30/30), `cd_rustvec` (44/44), `cd_interop`/`cd_interop_tier2` (PASS).
 
 | Feature | Status | Surface | Notes / walls |
 |---|---|---|---|
