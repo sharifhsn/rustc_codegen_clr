@@ -59,6 +59,18 @@ pub fn run(args: &PackArgs) -> Result<i32> {
     if ver.is_empty() {
         bail!("pack: could not determine crate version (pass --version)");
     }
+    // ---- real metadata sourced from the crate's own Cargo.toml, not placeholders ----
+    let authors = if pkg.authors.is_empty() {
+        "cargo dotnet".to_string()
+    } else {
+        pkg.authors.join(", ")
+    };
+    let description = pkg.description.clone().unwrap_or_else(|| {
+        format!("Rust crate '{name}' compiled to a .NET assembly by rustc_codegen_clr (cargo dotnet pack).")
+    });
+    let license = pkg.license.clone();
+    let repository = pkg.repository.clone();
+    let readme_path = pkg.readme().map(|p| p.into_std_path_buf());
     eprintln!("== cargo dotnet pack: {name} {ver} ({}) ==", ctx.profile.dir());
 
     // ---- build the cdylib via the SAME native pipeline ----
@@ -88,7 +100,15 @@ pub fn run(args: &PackArgs) -> Result<i32> {
     let _ = fs::remove_file(&nupkg);
 
     let dll_bytes = fs::read(&dll).with_context(|| format!("read {}", dll.display()))?;
-    write_nupkg(&nupkg, &name, &ver, &dll_bytes, ctx.dotnet.tfm())?;
+    let readme_bytes = readme_path.as_ref().and_then(|p| fs::read(p).ok());
+    let meta = NuspecMeta {
+        authors: &authors,
+        description: &description,
+        license: license.as_deref(),
+        repository: repository.as_deref(),
+        has_readme: readme_bytes.is_some(),
+    };
+    write_nupkg(&nupkg, &name, &ver, &dll_bytes, ctx.dotnet.tfm(), &meta, readme_bytes.as_deref())?;
 
     eprintln!();
     eprintln!("== packed: {} ==", nupkg.display());
@@ -110,10 +130,31 @@ pub fn run(args: &PackArgs) -> Result<i32> {
     Ok(0)
 }
 
+/// Real NuGet metadata sourced from the crate's own `Cargo.toml` (see `pack::run`), as
+/// opposed to the hardcoded placeholders this used to ship. `authors`/`description`
+/// always have a value (falling back to a generic default); `license`/`repository`
+/// are omitted from the `.nuspec` entirely when absent, since NuGet clients treat a
+/// present-but-empty `<license>`/`<repository>` element as a hard validation error.
+struct NuspecMeta<'a> {
+    authors: &'a str,
+    description: &'a str,
+    license: Option<&'a str>,
+    repository: Option<&'a str>,
+    has_readme: bool,
+}
+
 /// Write the OPC `.nupkg` with the zip crate. `[Content_Types].xml` is written FIRST
 /// (strict OPC readers expect it as the first entry), then the rest. Stored (no
 /// compression) for the small XML parts; the dll is deflated.
-fn write_nupkg(nupkg: &PathBuf, name: &str, ver: &str, dll: &[u8], tfm: &str) -> Result<()> {
+fn write_nupkg(
+    nupkg: &PathBuf,
+    name: &str,
+    ver: &str,
+    dll: &[u8],
+    tfm: &str,
+    meta: &NuspecMeta<'_>,
+    readme: Option<&[u8]>,
+) -> Result<()> {
     let guid = random_hex_guid();
     let file = File::create(nupkg)
         .with_context(|| format!("create {}", nupkg.display()))?;
@@ -130,6 +171,7 @@ fn write_nupkg(nupkg: &PathBuf, name: &str, ver: &str, dll: &[u8], tfm: &str) ->
   <Default Extension=\"nuspec\" ContentType=\"application/octet\" />
   <Default Extension=\"psmdcp\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\" />
   <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\" />
+  <Default Extension=\"md\" ContentType=\"text/markdown\" />
 </Types>
 ";
     add_entry(&mut zip, "[Content_Types].xml", content_types.as_bytes(), stored)?;
@@ -149,12 +191,14 @@ fn write_nupkg(nupkg: &PathBuf, name: &str, ver: &str, dll: &[u8], tfm: &str) ->
     let core_props = format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>
 <coreProperties xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\">
-  <dc:creator>cargo dotnet</dc:creator>
-  <dc:description>Rust crate '{name}' as a .NET assembly.</dc:description>
+  <dc:creator>{authors}</dc:creator>
+  <dc:description>{description}</dc:description>
   <dc:identifier>{name}</dc:identifier>
   <version>{ver}</version>
 </coreProperties>
-"
+",
+        authors = xml_escape(meta.authors),
+        description = xml_escape(meta.description),
     );
     add_entry(
         &mut zip,
@@ -163,23 +207,46 @@ fn write_nupkg(nupkg: &PathBuf, name: &str, ver: &str, dll: &[u8], tfm: &str) ->
         stored,
     )?;
 
-    // <id>.nuspec
+    // <id>.nuspec — real metadata from the crate's own Cargo.toml (see `NuspecMeta`),
+    // not hardcoded placeholders. `<license>`/`<repository>`/`<readme>` are each
+    // omitted when the source field is absent, per NuGet's nuspec schema (an empty
+    // element is a validation error, not a no-op).
+    let license_elem = meta
+        .license
+        .map(|l| format!("\n    <license type=\"expression\">{}</license>", xml_escape(l)))
+        .unwrap_or_default();
+    let repository_elem = meta
+        .repository
+        .map(|r| format!("\n    <repository type=\"git\" url=\"{}\" />", xml_escape(r)))
+        .unwrap_or_default();
+    let readme_elem = if meta.has_readme {
+        "\n    <readme>README.md</readme>"
+    } else {
+        ""
+    };
     let nuspec = format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>
 <package xmlns=\"http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd\">
   <metadata>
     <id>{name}</id>
     <version>{ver}</version>
-    <authors>cargo dotnet</authors>
-    <description>Rust crate '{name}' compiled to a .NET assembly by rustc_codegen_clr (cargo dotnet pack). Managed CIL — call its exported functions as ordinary .NET methods.</description>
+    <authors>{authors}</authors>
+    <description>{description}</description>{license_elem}{repository_elem}{readme_elem}
     <dependencies>
       <group targetFramework=\"{tfm}\" />
     </dependencies>
   </metadata>
 </package>
-"
+",
+        authors = xml_escape(meta.authors),
+        description = xml_escape(meta.description),
     );
     add_entry(&mut zip, &format!("{name}.nuspec"), nuspec.as_bytes(), stored)?;
+
+    // README.md, if the crate declares one — surfaced on nuget.org / VS package manager UIs.
+    if let Some(bytes) = readme {
+        add_entry(&mut zip, "README.md", bytes, deflated)?;
+    }
 
     // build/<id>.targets — explicit <Reference> + copy-local for build/-convention consumers.
     let targets = format!(
@@ -202,6 +269,16 @@ fn write_nupkg(nupkg: &PathBuf, name: &str, ver: &str, dll: &[u8], tfm: &str) ->
 
     zip.finish().context("finalize .nupkg zip")?;
     Ok(())
+}
+
+/// Minimal XML text-content escaping for values sourced from free-text `Cargo.toml`
+/// fields (description/authors/license/repository) that land inside XML elements.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 fn add_entry(
