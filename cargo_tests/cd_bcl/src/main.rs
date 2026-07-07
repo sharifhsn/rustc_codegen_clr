@@ -70,6 +70,15 @@ fn main() -> std::process::ExitCode {
     chk!(DotNetTimeSpan::from_seconds(5.0).negate().total_seconds(), -5.0);
     chk!(DotNetTimeSpan::zero().total_seconds(), 0.0);
     chk!(std::format!("{u}").is_empty(), false);
+    // Ord (via TimeSpan.CompareTo): sort a Vec<TimeSpan> and check ascending numeric order.
+    let ts_a = DotNetTimeSpan::from_seconds(5.0);
+    let ts_b = DotNetTimeSpan::from_seconds(1.0);
+    let ts_c = DotNetTimeSpan::from_minutes(2.0); // 120s
+    let mut tss = std::vec![ts_a, ts_b, ts_c];
+    tss.sort();
+    chk!(tss[0].total_seconds(), 1.0);
+    chk!(tss[1].total_seconds(), 5.0);
+    chk!(tss[2].total_seconds(), 120.0);
 
     // ---------- Guid ----------
     let a = Guid::new_v4();
@@ -84,6 +93,17 @@ fn main() -> std::process::ExitCode {
     chk!(a_str.len(), 36);
     let parsed = Guid::parse(MString::from(a_str.as_str()));
     chk!((parsed == a), true);
+    // Ord (via Guid.CompareTo): sorting must produce a stable ascending order matching CompareTo
+    // pairwise, and round-trip the same multiset of values.
+    let g_lo = Guid::parse(MString::from("00000000-0000-0000-0000-000000000001"));
+    let g_mid = Guid::parse(MString::from("00000000-0000-0000-0000-000000000002"));
+    let g_hi = Guid::parse(MString::from("ffffffff-0000-0000-0000-000000000000"));
+    let mut gs = std::vec![g_hi, g_lo, g_mid];
+    gs.sort();
+    chk!((gs[0] == g_lo), true);
+    chk!((gs[1] == g_mid), true);
+    chk!((gs[2] == g_hi), true);
+    chk!((g_lo < g_mid && g_mid < g_hi), true);
 
     // ---------- Uri ----------
     let uri = Uri::new("https://user@example.com:8443/path/page?q=1#frag");
@@ -207,6 +227,19 @@ fn main() -> std::process::ExitCode {
     let mut sb3 = StringBuilder::new();
     let _ = write!(sb3, "n={}", 42);
     chk!(sb3.to_rust_string().as_str(), "n=42");
+
+    // ---------- Decimal ----------
+    // Eq/Ord (via Decimal.op_Equality/Decimal.Compare): exact base-10 numeric comparison, not
+    // textual/culture-sensitive, so a real total order. Sort a Vec<DotNetDecimal> and check order.
+    let d_a = DotNetDecimal::parse("10.50");
+    let d_b = DotNetDecimal::parse("-3.25");
+    let d_c = DotNetDecimal::parse("10.5"); // same numeric value as d_a
+    chk!((d_a == d_c), true);
+    let mut ds = std::vec![d_a, d_b, d_c];
+    ds.sort();
+    chk!(ds[0].to_f64(), -3.25);
+    chk!((ds[1] == d_a && ds[2] == d_a), true); // the two 10.5-valued entries sort together
+    chk!((d_b < d_a), true);
 
     // ---------- Environment ----------
     chk!(Environment::machine_name().is_empty(), false);
