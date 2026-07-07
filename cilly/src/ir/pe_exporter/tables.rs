@@ -695,6 +695,7 @@ impl MetadataBuilder {
     /// rows (§II.22.33, one per named argument — mirrors `MethodDef::arg_names()`). The body RVA
     /// is unknown until `body.rs` assembles bytes and `pe.rs` lays them out, so it starts at 0
     /// and must be patched via [`MetadataBuilder::set_method_body_rva`] before `serialize()`.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_method(
         &mut self,
         name: &str,
@@ -704,6 +705,7 @@ impl MetadataBuilder {
         is_virtual: bool,
         is_ctor: bool,
         pinvoke: Option<(&str, bool)>,
+        aggressive_inline: bool,
     ) -> Token {
         // §II.23.1.10 `MethodAttributes`: the low 3 bits are `MemberAccessMask`, numbered
         // identically to `FieldAttributes::FieldAccessMask` (see `add_field`'s doc) —
@@ -742,7 +744,17 @@ impl MetadataBuilder {
         // §II.23.1.11 `MethodImplAttributes`: 0x0 Managed/IL, except a `pinvokeimpl` method
         // which is unmanaged-forwarded and marked `PreserveSig` (0x80) to match `il_exporter`'s
         // `pinvokeimpl` + `preservesig` pairing (native calling convention, no HRESULT wrapping).
-        let impl_flags: u16 = if pinvoke.is_some() { 0x80 } else { 0x0 };
+        // `0x100` is `AggressiveInlining` — mirrors `il_exporter`'s JIT hint (mod.rs:462-471) for
+        // small, single-block, handler-free bodies; see `add_method`'s caller (`export.rs`) for
+        // the heuristic that computes `aggressive_inline`. This was a real, documented parity gap
+        // (`pdb.rs`'s module doc, "Phase-0 probe" section, gap (a)): under `DIRECT_PE=1` no
+        // `AggressiveInlining` bit was ever written, so RyuJIT could not inline tiny leaf helpers
+        // (e.g. the `cast_f64_u32`-style saturating float->int cast helpers) into hot callers —
+        // pure JIT hint, cannot affect correctness.
+        let mut impl_flags: u16 = if pinvoke.is_some() { 0x80 } else { 0x0 };
+        if aggressive_inline {
+            impl_flags |= 0x100;
+        }
         let name_off = self.strings.intern(name);
         let param_list = u32::try_from(self.param.len() + 1).unwrap();
         self.method_def.push(MethodDefRow {
@@ -2466,7 +2478,7 @@ mod tests {
             out.push(0x01); // void
             mb.blobs.intern(&out)
         };
-        let method_tok = mb.add_method("DoIt", sig_blob, &[], true, false, false, None);
+        let method_tok = mb.add_method("DoIt", sig_blob, &[], true, false, false, None, false);
         assert_eq!(method_tok.table(), Token::TABLE_METHOD_DEF);
         assert_eq!(method_tok.rid(), 1);
 
@@ -2656,6 +2668,7 @@ mod tests {
             false,
             false,
             None,
+            false,
         );
         assert_eq!(method_tok.rid(), 1);
 
@@ -3058,7 +3071,7 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "Owner", false, None, None, None, &[]);
-        let m = mb.add_method("Foo", sig_blob, &[], true, false, false, None);
+        let m = mb.add_method("Foo", sig_blob, &[], true, false, false, None, false);
         assert_eq!(m.table(), Token::TABLE_METHOD_DEF);
 
         let ext = mb.assembly_ref("Other", AssemblyRefTarget::NameOnly);
@@ -3139,7 +3152,7 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "Extern", false, None, None, None, &[]);
-        let _m = mb.add_method("libc_call", sig_blob, &[], true, false, false, Some(("libc", true)));
+        let _m = mb.add_method("libc_call", sig_blob, &[], true, false, false, Some(("libc", true)), false);
         assert_eq!(mb.impl_map.len(), 1);
         assert_eq!(mb.module_ref.len(), 1);
         assert_eq!(mb.impl_map[0].mapping_flags & 0x40, 0x40, "SupportsLastError set");
@@ -3209,8 +3222,8 @@ mod tests {
         };
         mb.set_type_def_method_list(a);
         mb.set_type_def_method_list(b);
-        mb.add_method("b_m0", method_sig, &[], true, false, false, None);
-        mb.add_method("b_m1", method_sig, &[], true, false, false, None);
+        mb.add_method("b_m0", method_sig, &[], true, false, false, None, false);
+        mb.add_method("b_m1", method_sig, &[], true, false, false, None, false);
 
         let a_row = &mb.type_def[(a.rid() - 1) as usize];
         let b_row = &mb.type_def[(b.rid() - 1) as usize];
@@ -3610,7 +3623,7 @@ mod tests {
         let _t = mb.add_type_def("", "MainModule", false, None, None, None, &[]);
         // Mirrors `export.rs`'s call for `.cctor`: MethodKind is Static, but the reserved-name
         // check must still route `is_ctor = true` into `add_method`.
-        let tok = mb.add_method(".cctor", sig_blob, &[], true, false, true, None);
+        let tok = mb.add_method(".cctor", sig_blob, &[], true, false, true, None, false);
         let row = &mb.method_def[(tok.rid() - 1) as usize];
         assert_eq!(
             row.flags & (0x1000 | 0x0800),
@@ -3635,7 +3648,7 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "MainModule", false, None, None, None, &[]);
-        let tok = mb.add_method(".tcctor", sig_blob, &[], true, false, false, None);
+        let tok = mb.add_method(".tcctor", sig_blob, &[], true, false, false, None, false);
         let row = &mb.method_def[(tok.rid() - 1) as usize];
         assert_eq!(row.flags & (0x1000 | 0x0800), 0);
     }
@@ -3661,7 +3674,7 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "Start", false, None, None, None, &[]);
-        let tok = mb.add_method("Start", sig_blob, &[], false, true, false, None);
+        let tok = mb.add_method("Start", sig_blob, &[], false, true, false, None, false);
         let row = &mb.method_def[(tok.rid() - 1) as usize];
         const NEW_SLOT: u16 = 0x0100;
         const ABSTRACT: u16 = 0x0400;
@@ -3675,6 +3688,57 @@ mod tests {
             0,
             "a virtual method with a real body must NOT carry Abstract (0x0400) — CoreCLR's \
              native type loader rejects Abstract+nonzero-RVA as malformed at type-load time"
+        );
+    }
+
+    /// Regression test for the `pe_exporter` `AggressiveInlining` parity gap documented in
+    /// `pdb.rs`'s module doc (Phase-0 probe, gap (a)): `il_exporter` hints RyuJIT to inline small,
+    /// single-block, handler-free leaf bodies via `MethodImplOptions.AggressiveInlining` in its
+    /// emitted `.il` text, but under `DIRECT_PE=1` the `MethodDefRow.impl_flags` never carried the
+    /// `0x100` `AggressiveInlining` bit (§II.23.1.11) — confirmed on the real fractal-rs demo's
+    /// hot `render_mandelbrot` kernel, whose 3 saturating-float-to-int `cast_f64_*` helper calls
+    /// per pixel (`cilly::ir::builtins::casts::insert_casts`) went through non-inlined calls only
+    /// under the direct-PE path. `add_method`'s new `aggressive_inline: bool` parameter is the
+    /// fix's plumbing; `export.rs` computes it from the same shape `il_exporter` checks.
+    #[test]
+    fn add_method_aggressive_inline_true_sets_the_impl_attributes_bit() {
+        let mut mb = MetadataBuilder::new();
+        let sig_blob = {
+            let mut out = Vec::new();
+            out.push(sig::SIG_DEFAULT);
+            write_compressed_u32(&mut out, 0);
+            out.push(0x01); // void
+            mb.blobs.intern(&out)
+        };
+        let _t = mb.add_type_def("", "MainModule", false, None, None, None, &[]);
+        let tok = mb.add_method("Leaf", sig_blob, &[], true, false, false, None, true);
+        let row = &mb.method_def[(tok.rid() - 1) as usize];
+        const AGGRESSIVE_INLINING: u16 = 0x0100;
+        assert_eq!(
+            row.impl_flags & AGGRESSIVE_INLINING,
+            AGGRESSIVE_INLINING,
+            "aggressive_inline=true must set MethodImplAttributes.AggressiveInlining (0x100) in \
+             impl_flags"
+        );
+    }
+
+    #[test]
+    fn add_method_aggressive_inline_false_leaves_impl_attributes_at_managed_default() {
+        let mut mb = MetadataBuilder::new();
+        let sig_blob = {
+            let mut out = Vec::new();
+            out.push(sig::SIG_DEFAULT);
+            write_compressed_u32(&mut out, 0);
+            out.push(0x01);
+            mb.blobs.intern(&out)
+        };
+        let _t = mb.add_type_def("", "MainModule", false, None, None, None, &[]);
+        let tok = mb.add_method("NotInlined", sig_blob, &[], true, false, false, None, false);
+        let row = &mb.method_def[(tok.rid() - 1) as usize];
+        assert_eq!(
+            row.impl_flags, 0,
+            "aggressive_inline=false (the default for large/multi-block/handler-bearing bodies) \
+             must leave impl_flags at Managed/IL (0x0), matching il_exporter's non-hinted methods"
         );
     }
 }

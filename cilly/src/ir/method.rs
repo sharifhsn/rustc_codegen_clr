@@ -569,6 +569,54 @@ impl MethodImpl {
     pub fn is_extern(&self) -> bool {
         matches!(self, Self::Extern { .. })
     }
+
+    /// Shared `AggressiveInlining` (§II.23.1.11, `0x100`) hint heuristic, used identically by both
+    /// `il_exporter` (as a `.method ... aggressiveinlining` keyword) and `pe_exporter` (as the
+    /// `MethodDefRow.impl_flags` bit) so the two exporters never again drift out of parity on this
+    /// (see `pe_exporter/pdb.rs`'s module doc, "Phase-0 probe" gap (a), for the history: `pe_exporter`
+    /// silently never wrote this bit until that gap was closed).
+    ///
+    /// Originally scoped to single-block, handler-free, <=24-root bodies (small straight-line
+    /// leaves — monomorphized closure/iterator-adapter wrappers). Widened (fractal-rs perf
+    /// investigation, 2026-07) to also cover small, branchy-but-loop-free, call-free leaves like
+    /// `cilly::ir::builtins::casts`'s saturating float->int cast helpers (4 blocks: a NaN check
+    /// plus overflow/underflow clamps, no internal calls, ~7 roots total) — confirmed empirically
+    /// that hinting a 4-block leaf like this DOES get RyuJIT to inline it (a standalone repro
+    /// showed `fcvtzu` emitted inline at every call site, replacing what was otherwise 3 `blr`
+    /// indirect calls per escaping pixel in the real kernel). The call-free requirement keeps this
+    /// conservative: it never asks RyuJIT to inline a body that itself contains a call (no
+    /// unbounded call-graph expansion risk), and the block/root caps bound JIT/codegen cost. Pure
+    /// JIT hint — cannot affect correctness (verified: no typecheck/codegen semantics change).
+    #[must_use]
+    pub fn should_hint_aggressive_inline(&self, asm: &Assembly) -> bool {
+        let Self::MethodBody { blocks, .. } = self else {
+            return false;
+        };
+        if blocks.is_empty() || blocks.len() > 8 {
+            return false;
+        }
+        let total_roots: usize = blocks.iter().map(|b| b.roots().len()).sum();
+        if total_roots > 24 {
+            return false;
+        }
+        if blocks.iter().any(|b| b.handler().is_some()) {
+            return false;
+        }
+        // No block may (transitively) contain a Call/CallVirt/CallI — keeps this conservative (no
+        // call-graph expansion risk) and matches the single-block case, which (being a leaf as a
+        // consequence of the old scoping) never had internal calls either.
+        !blocks.iter().any(|block| {
+            block.roots().iter().any(|root| {
+                super::CILIter::new(asm.get_root(*root).clone(), asm).any(|elem| {
+                    matches!(
+                        elem,
+                        CILIterElem::Node(CILNode::Call(_) | CILNode::CallI(_))
+                            | CILIterElem::Root(CILRoot::Call(_))
+                    )
+                })
+            })
+        })
+    }
     // While this function is a bit long, this is not an issue.
     #[allow(clippy::too_many_lines)]
     pub(crate) fn merge_cctor_impls(&mut self, implementation: &MethodImpl, asm: &Assembly) {
@@ -937,4 +985,114 @@ fn cil() {
         .map(|iter| iter.count()),
         None,
     );
+}
+/// Regression test for the `pe_exporter`/`il_exporter` `AggressiveInlining` parity gap +
+/// widening (fractal-rs perf investigation, 2026-07 — see `should_hint_aggressive_inline`'s doc).
+/// A small, branchy-but-loop-free, call-free multi-block leaf — the exact shape
+/// `cilly::ir::builtins::casts`'s saturating float->int cast helpers produce (a NaN-check block
+/// plus 3 single-`Ret` blocks) — must be hinted even though it is NOT single-block.
+#[test]
+fn should_hint_aggressive_inline_true_for_a_small_multi_block_call_free_leaf() {
+    let mut asm = Assembly::default();
+    let zero = asm.alloc_node(crate::Const::I32(0));
+    let one = asm.alloc_node(crate::Const::I32(1));
+    let ret0 = asm.alloc_root(CILRoot::Ret(zero));
+    let ret1 = asm.alloc_root(CILRoot::Ret(one));
+    // 4 blocks total (mirrors casts.rs's `float_to_int` generator shape), no calls anywhere,
+    // well under the root/block caps.
+    let blocks = vec![
+        BasicBlock::new(vec![ret0], 0, None),
+        BasicBlock::new(vec![ret1], 1, None),
+        BasicBlock::new(vec![ret0], 2, None),
+        BasicBlock::new(vec![ret1], 3, None),
+    ];
+    let mimpl = MethodImpl::MethodBody {
+        blocks,
+        locals: vec![],
+    };
+    assert!(
+        mimpl.should_hint_aggressive_inline(&asm),
+        "a small, call-free, handler-free, loop-free multi-block leaf must be hinted"
+    );
+}
+/// Negative case: a body containing a `Call` anywhere must NOT be hinted — keeps the widened
+/// heuristic conservative (no call-graph-expansion risk from asking RyuJIT to inline a body that
+/// itself calls out).
+#[test]
+fn should_hint_aggressive_inline_false_when_the_body_contains_a_call() {
+    let mut asm = Assembly::default();
+    let main_module = asm.main_module();
+    let void_sig = asm.sig([], Type::Void);
+    let callee_name = asm.alloc_string("SomeCallee");
+    let mref = MethodRef::new(
+        *main_module,
+        callee_name,
+        void_sig,
+        MethodKind::Static,
+        vec![].into(),
+    );
+    let mref = asm.alloc_methodref(mref);
+    let call_root = asm.alloc_root(CILRoot::Call(Box::new((mref, vec![].into(), IsPure::NOT))));
+    let void_ret = asm.alloc_root(CILRoot::VoidRet);
+    let blocks = vec![BasicBlock::new(vec![call_root, void_ret], 0, None)];
+    let mimpl = MethodImpl::MethodBody {
+        blocks,
+        locals: vec![],
+    };
+    assert!(
+        !mimpl.should_hint_aggressive_inline(&asm),
+        "a body containing a Call must never be hinted, regardless of size"
+    );
+}
+/// Negative case: a body with a handler (try/catch) must NOT be hinted, matching the original
+/// single-block heuristic's handler-free requirement.
+#[test]
+fn should_hint_aggressive_inline_false_when_a_block_has_a_handler() {
+    let mut asm = Assembly::default();
+    let void_ret = asm.alloc_root(CILRoot::VoidRet);
+    let handler_block = BasicBlock::new(vec![void_ret], 1, None);
+    let blocks = vec![BasicBlock::new(
+        vec![void_ret],
+        0,
+        Some(vec![handler_block]),
+    )];
+    let mimpl = MethodImpl::MethodBody {
+        blocks,
+        locals: vec![],
+    };
+    assert!(
+        !mimpl.should_hint_aggressive_inline(&asm),
+        "a block with a handler must never be hinted"
+    );
+}
+/// Negative case: too many blocks (beyond the small-leaf cap) must NOT be hinted, bounding
+/// JIT/codegen cost the same way the original 24-root cap did for the single-block case.
+#[test]
+fn should_hint_aggressive_inline_false_when_too_many_blocks() {
+    let mut asm = Assembly::default();
+    let void_ret = asm.alloc_root(CILRoot::VoidRet);
+    let blocks: Vec<_> = (0..9)
+        .map(|id| BasicBlock::new(vec![void_ret], id, None))
+        .collect();
+    let mimpl = MethodImpl::MethodBody {
+        blocks,
+        locals: vec![],
+    };
+    assert!(
+        !mimpl.should_hint_aggressive_inline(&asm),
+        "a leaf with more than the small-body block cap must not be hinted"
+    );
+}
+/// Non-`MethodBody` implementations (`Extern`/`AliasFor`/`Missing`) must never be hinted — there
+/// is no IL body to attach the hint to.
+#[test]
+fn should_hint_aggressive_inline_false_for_non_method_body_impls() {
+    let mut asm = Assembly::default();
+    let lib_name = asm.alloc_string("libsomething.so");
+    assert!(!MethodImpl::Extern {
+        lib: lib_name,
+        preserve_errno: false,
+    }
+    .should_hint_aggressive_inline(&asm));
+    assert!(!MethodImpl::Missing.should_hint_aggressive_inline(&asm));
 }

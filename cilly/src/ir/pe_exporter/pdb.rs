@@ -48,15 +48,27 @@
 //!
 //! `docs/PE_EMISSION_PLAN.md`'s Phase 0 section (`§Phasing`, "Phase 0 — harvest the latent PDB")
 //! names three gaps future Phase-2 work must close or explicitly accept:
-//! * **(a) missing frames** — `il_exporter`'s `aggressiveinlining` heuristic
-//!   (`il_exporter/mod.rs:462-471`, scoped to single-block/handler-free/<=24-root bodies) lets
-//!   RyuJIT inline user `#[inline(never)]` frames out of managed stack traces. Confirmed **not
-//!   ported** to the direct-PE path: `pe_exporter/tables.rs`'s `MethodDefRow.impl_flags`
-//!   (`tables.rs:153,745-750`) only ever sets the pinvoke-impl bit (`0x80`); no
-//!   `MethodImplAttributes.AggressiveInlining` (`0x100`) bit is written anywhere in
-//!   `pe_exporter/`. So under `DIRECT_PE=1` this specific gap does not yet exist — nothing to
-//!   flag-gate here today; worth a regression test once/if an equivalent JIT hint is ever added
-//!   to this writer.
+//! * **(a) missing frames** — **CLOSED** (fractal-rs perf investigation, 2026-07): `il_exporter`'s
+//!   `aggressiveinlining` heuristic lets RyuJIT inline tiny leaf helpers (and, as a side effect,
+//!   user `#[inline(never)]` frames) out of managed stack traces. This was confirmed NOT ported to
+//!   the direct-PE path and, worse, a measurable perf gap: `MethodDefRow.impl_flags`
+//!   (`tables.rs:153,745-758`) only ever set the pinvoke-impl bit (`0x80`), so under `DIRECT_PE=1`
+//!   RyuJIT never got the `AggressiveInlining` (`0x100`) hint for e.g. the saturating
+//!   float->int `cast_f64_*` helpers (`cilly::ir::builtins::casts::insert_casts`) a hot per-pixel
+//!   Mandelbrot kernel calls 3x/pixel. `add_method` now takes an `aggressive_inline: bool`
+//!   (`export.rs` computes it) and ORs `0x100` into `impl_flags` — see
+//!   `add_method_aggressive_inline_*` in `tables.rs`'s test module. The heuristic itself now lives
+//!   in one place, `MethodImpl::should_hint_aggressive_inline` (`ir/method.rs`), shared by BOTH
+//!   exporters so they can't drift again, and was WIDENED beyond the original single-block
+//!   requirement: it now also hints small, branchy-but-loop-free, call-free multi-block leaves
+//!   (<=8 blocks, <=24 roots total, no handler, no internal Call/CallI anywhere) — exactly the
+//!   shape the `cast_f64_*` helpers have (a NaN-check block + 3 single-`Ret` blocks), empirically
+//!   confirmed to get RyuJIT to actually inline them (a standalone repro showed the helper's
+//!   `fcvtzu` emitted inline at each call site instead of 3 `blr` indirect calls per escaping
+//!   pixel). Still true: this reintroduces the same missing-frames tradeoff `il_exporter` already
+//!   accepts (suppressed via `PDB_FRAMES=1`, wired identically here), so nothing about the
+//!   PDB-quality bar itself changed — the parity gap is just closed, and the hint now reaches
+//!   the actual hot-path helpers it was meant for.
 //! * **(b) wrong attribution under MIR inlining** — `span_source_info`
 //!   (`src/assembly.rs:586-616`) records whatever span the calling MIR-statement site carries;
 //!   when that statement was itself produced by MIR inlining, the span can point into the

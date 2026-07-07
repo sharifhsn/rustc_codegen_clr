@@ -427,7 +427,16 @@ impl ILExporter {
         };
         let name = &asm[method.name()];
         let sig = &asm[method.sig()];
-        let ret = type_il(sig.output(), asm);
+        // `_signature` variants: this `.method` header line is the ONE place a method's own
+        // return/parameter types are declared — C#-visible metadata a separately-compiled consumer
+        // resolves a call against, exactly like the `extends`/`.assembly extern` cases
+        // `ref_assembly_name` already covers (see that fn's doc). Every other `type_il`/
+        // `non_void_type_il` call site in this file (body instructions, calli signatures, field
+        // declarations, locals) stays on the plain impl-assembly-qualified path: those are either
+        // invisible to a C# compiler (bodies are never read) or would be genuinely rejected by the
+        // JIT if impl-assembly types like `System.String`/`System.Object` were re-qualified there
+        // (see `class_ref`'s doc comment on why body positions must keep the impl-assembly name).
+        let ret = type_il_signature(sig.output(), asm);
         assert_eq!(method.arg_names().len(), sig.inputs().len(), "{name:?}");
         let inputs = match method.kind() {
             crate::cilnode::MethodKind::Static => sig.inputs(),
@@ -441,9 +450,9 @@ impl ILExporter {
             .zip(method.arg_names())
             .map(|(tpe, name)| match name {
                 Some(name) => {
-                    format!("{} '{}'", non_void_type_il(tpe, asm_mut), &asm_mut[*name])
+                    format!("{} '{}'", non_void_type_il_signature(tpe, asm_mut), &asm_mut[*name])
                 }
-                None => non_void_type_il(tpe, asm_mut),
+                None => non_void_type_il_signature(tpe, asm_mut),
             })
             .intersperse(",".to_string())
             .collect();
@@ -454,23 +463,21 @@ impl ILExporter {
         };
         // Layer 3 (help RyuJIT): hint the JIT to inline small, straight-line leaf methods — the
         // monomorphized closure bodies / iterator-adapter `next`/`fold` wrappers that Rust's
-        // zero-cost abstractions lower to. RyuJIT won't inline across these by default (struct-by-value
-        // returns + its size heuristic), so the per-element call survives; `aggressiveinlining`
-        // (MethodImplOptions.AggressiveInlining) tells it to. Scoped to single-block, handler-free,
-        // small bodies so we don't bloat the JIT or hint methods it can't inline anyway. Pure JIT
-        // hint — cannot affect correctness. `PDB_FRAMES=1` suppresses only this hint so debug/PDB
-        // runs can keep user frames visible in managed stack traces; default-off preserves current
-        // RyuJIT behaviour.
-        let aggrinline = match method.implementation() {
-            MethodImpl::MethodBody { blocks, .. }
-                if !*crate::PDB_FRAMES
-                    && blocks.len() == 1
-                    && blocks[0].handler().is_none()
-                    && blocks[0].roots().len() <= 24 =>
-            {
-                "aggressiveinlining "
-            }
-            _ => "",
+        // zero-cost abstractions lower to, plus small branchy-but-call-free leaves like the
+        // saturating float->int cast helpers. RyuJIT won't inline across these by default
+        // (struct-by-value returns + its size heuristic), so the per-element call survives;
+        // `aggressiveinlining` (MethodImplOptions.AggressiveInlining) tells it to. Heuristic shared
+        // with `pe_exporter` via `MethodImpl::should_hint_aggressive_inline` (see that method's doc)
+        // so the two exporters can't drift out of parity on this again. Pure JIT hint — cannot
+        // affect correctness. `PDB_FRAMES=1` suppresses only this hint so debug/PDB runs can keep
+        // user frames visible in managed stack traces; default-off preserves current RyuJIT
+        // behaviour.
+        let aggrinline = if !*crate::PDB_FRAMES
+            && method.implementation().should_hint_aggressive_inline(asm_mut)
+        {
+            "aggressiveinlining "
+        } else {
+            ""
         };
         writeln!(
             out,
@@ -1735,6 +1742,33 @@ fn ref_assembly_name(name: &str) -> &str {
         other => other,
     }
 }
+/// Like [`ref_assembly_name`], but for the (much rarer) case where the impl-assembly name alone
+/// isn't enough: `System.Private.CoreLib` type-forwards `Object`/`String`/`Exception`/… through
+/// the umbrella `System.Runtime` reference assembly, but NOT every CoreLib type — some (e.g. the
+/// `System.Threading` synchronization primitives `SemaphoreSlim`/`ManualResetEventSlim`/
+/// `CountdownEvent`/`Barrier`) are genuine `TypeDef`s in a DIFFERENT, more specific reference
+/// assembly instead (confirmed by scanning the actual net8.0 ref-pack DLLs: `System.Threading.dll`
+/// defines all four, `System.Runtime.dll` does not forward them). A blanket
+/// CoreLib -> `System.Runtime` substitution is simply wrong for these — C# reports `CS7069`
+/// ("claims it is defined in 'System.Runtime', but it could not be found"), not CS0012.
+///
+/// This is a small, explicit, closed table of the types this backend's mycorrhiza bindings
+/// actually expose across a C#-visible signature position today — NOT a general BCL
+/// type-forwarding resolver (that would need to scan the ref-pack metadata at build time, a much
+/// larger undertaking out of scope here). Extend it if/when another such type needs to cross a
+/// signature boundary; falls back to [`ref_assembly_name`] for everything else.
+fn ref_assembly_name_for_type<'a>(assembly: &'a str, type_name: &str) -> &'a str {
+    if matches!(assembly, "System.Private.CoreLib" | "mscorlib") {
+        match type_name {
+            "System.Threading.SemaphoreSlim"
+            | "System.Threading.ManualResetEventSlim"
+            | "System.Threading.CountdownEvent"
+            | "System.Threading.Barrier" => return "System.Threading",
+            _ => {}
+        }
+    }
+    ref_assembly_name(assembly)
+}
 /// Whether an external assembly name is part of the .NET base class library (so its `.assembly extern`
 /// header carries the runtime `.ver` + the shared ECMA public-key token). Everything else is treated as
 /// a consumer-supplied assembly, referenced by simple name only (no version/token) so it binds against
@@ -1902,6 +1936,81 @@ fn type_il(tpe: &Type, asm: &Assembly) -> String {
         }
         Type::PlatformString => "string".into(),
         Type::PlatformObject => "object".into(),
+    }
+}
+
+/// Like [`non_void_type_il`], but for a method's OWN declared return/parameter types (the `.method`
+/// header line) rather than a body-instruction operand, a `calli` signature, a field declaration, or a
+/// locals entry. See [`type_il_signature`] for why this split exists and why it must stay narrow.
+fn non_void_type_il_signature(tpe: &Type, asm: &Assembly) -> String {
+    match tpe {
+        Type::Void => "valuetype RustVoid".into(),
+        _ => type_il_signature(tpe, asm),
+    }
+}
+
+/// Like [`type_il`], but renders a `Type::ClassRef`'s assembly qualifier through
+/// [`ref_assembly_name`] — the same CoreLib-impl -> `System.Runtime`-ref substitution already applied
+/// to the `.assembly extern` table and base-type `extends` clauses (see that fn's doc comment for the
+/// full rationale). A method's own `.method {ret} 'name'(...)` header line is C#-visible metadata a
+/// separately-compiled consumer resolves a call against — exactly like those two cases, and unlike
+/// every other `type_il`/`non_void_type_il` call site in this file (body instructions, `calli`
+/// signatures, field declarations, locals), which are either invisible to a C# compiler (bodies are
+/// never read) or would be genuinely JIT-rejected if re-qualified this way (a real CoreLib
+/// `System.String`/`System.Object` instance method resolved via `[System.Runtime]` inside a body is
+/// "Bad IL format" — see `class_ref`'s doc comment). This function must therefore be called ONLY from
+/// the two call sites that emit a method's declared signature, never from a body/calli/field/locals
+/// position.
+///
+/// Only `Type::ClassRef` differs from [`type_il`]; every other arm recurses back into the plain
+/// `type_il`/`non_void_type_il` (nested types inside a signature, e.g. an array element or generic
+/// argument, are exceedingly unlikely to be a cross-assembly-forwarded BCL type in this codebase's
+/// supported surface, and doing so keeps this function's diff minimal and easy to audit against
+/// `type_il` — a full recursive parallel copy would double the maintenance surface for no currently
+/// exercised case).
+fn type_il_signature(tpe: &Type, asm: &Assembly) -> String {
+    match tpe {
+        Type::ClassRef(cref) => {
+            let cr = asm.class_ref(*cref);
+            if !cr.is_valuetype() && cr.generics().is_empty() {
+                match &asm[cr.name()] {
+                    "System.Object" => return "object".into(),
+                    "System.String" => return "string".into(),
+                    _ => {}
+                }
+            }
+            let raw_cref = asm.class_ref(*cref);
+            let name = dotnet_class_name(&asm[raw_cref.name()]);
+            let prefix = if raw_cref.is_valuetype() { "valuetype" } else { "class" };
+            let generic_list = if raw_cref.generics().is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<{generics}>",
+                    generics = raw_cref
+                        .generics()
+                        .iter()
+                        .map(|tpe| type_il(tpe, asm))
+                        .intersperse(",".to_string())
+                        .collect::<String>()
+                )
+            };
+            let generic_postfix = if raw_cref.generics().is_empty() {
+                String::new()
+            } else {
+                format!("`{}", raw_cref.generics().len())
+            };
+            if let Some(assembly) = raw_cref.asm() {
+                let raw_name = &asm[raw_cref.name()];
+                format!(
+                    "{prefix} [{assembly}]'{name}{generic_postfix}'{generic_list}",
+                    assembly = ref_assembly_name_for_type(&asm[assembly], raw_name)
+                )
+            } else {
+                format!("{prefix} '{name}{generic_postfix}'{generic_list}")
+            }
+        }
+        _ => type_il(tpe, asm),
     }
 }
 

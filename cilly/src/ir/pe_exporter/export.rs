@@ -57,7 +57,8 @@ use super::pe::{self, PeOptions};
 use super::sig::{self, TypeDefOrRefResolver};
 use super::tables::{MetadataBuilder, Token};
 use crate::ir::class::StaticFieldDef;
-use crate::ir::{Assembly, Const};
+use crate::ir::{Assembly, ClassRef, Const};
+use crate::Interned;
 
 // `pe::SECTION_ALIGNMENT`/`pe::CLI_HEADER_CB` (both `pub(super)`) are used directly below rather
 // than duplicated here — an earlier version of this file kept its own copies "since the RVA
@@ -468,7 +469,20 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
             } else {
                 crate::ir::FnSig::new(sig.inputs()[1..].to_vec(), *sig.output())
             };
-            sig::encode_method_sig(convention, 0, &encode_sig, asm, &mut mb, &mut blob);
+            // `SignatureOnlyResolver`, not `&mut mb` directly: this is the method's OWN declared
+            // signature (C#-visible metadata a separately-compiled consumer resolves a call
+            // against), the exact analog of `il_exporter`'s `type_il_signature` split at its
+            // `.method` header line — see that resolver's doc for why every other
+            // `TypeDefOrRefResolver` call site in this exporter (bodies, `extends`, `calli`,
+            // fields) must stay on the shared, impl-assembly-qualified `MetadataBuilder` path.
+            sig::encode_method_sig(
+                convention,
+                0,
+                &encode_sig,
+                asm,
+                &mut SignatureOnlyResolver { mb: &mut mb },
+                &mut blob,
+            );
             let sig_off = mb.blobs.intern(&blob);
             // Named `Param` rows: `method.arg_names()` is parallel to the FULL `sig.inputs()`
             // (including the implicit `this` slot at index 0 for instance/virtual/ctor kinds), but
@@ -485,7 +499,31 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
                 .map(|n| n.map(|interned| &asm[interned]))
                 .collect();
             let pinvoke_ref = pinvoke_owned.as_ref().map(|(lib, preserve)| (lib.as_str(), *preserve));
-            let tok = mb.add_method(&name, sig_off, &param_names, is_static, is_virtual, is_ctor, pinvoke_ref);
+            // Mirrors `il_exporter`'s `aggressiveinlining` JIT hint (mod.rs:455-469): small leaf
+            // bodies (e.g. the `cast_f64_u32`-style saturating float->int cast helpers
+            // `cilly::ir::builtins::casts` synthesizes, or monomorphized closure/iterator-adapter
+            // wrappers) get `MethodImplAttributes.AggressiveInlining` so RyuJIT inlines the
+            // per-call overhead out of hot callers. Heuristic shared with `il_exporter` via
+            // `MethodImpl::should_hint_aggressive_inline` (see that method's doc — this is the
+            // exact call-free/block-count/root-count shape empirically confirmed to get RyuJIT to
+            // inline a small branchy leaf) so the two exporters can't drift out of parity on this
+            // again. `PDB_FRAMES=1` suppresses it, same as `il_exporter`, so debug/PDB runs keep
+            // these frames visible. Pure JIT hint — cannot affect correctness (verified: no
+            // typecheck/codegen semantics change).
+            let aggressive_inline = !*crate::PDB_FRAMES
+                && method
+                    .resolved_implementation(asm)
+                    .should_hint_aggressive_inline(asm);
+            let tok = mb.add_method(
+                &name,
+                sig_off,
+                &param_names,
+                is_static,
+                is_virtual,
+                is_ctor,
+                pinvoke_ref,
+                aggressive_inline,
+            );
             mb.register_method_def(method_id, tok);
             if name == "entrypoint" {
                 entry_point_token = Some(tok);
@@ -733,6 +771,97 @@ fn system_runtime_type_ref(mb: &mut MetadataBuilder, type_name: &str) -> Token {
     mb.type_ref(Some(scope), "System", &type_name["System.".len()..])
 }
 
+/// Local port of `il_exporter::ref_assembly_name` (kept private/duplicated rather than imported,
+/// per the hard constraint that `pe_exporter` code must not depend on `il_exporter` — same
+/// convention as this file's `is_bcl_assembly`/`split_namespace` ports). Maps an
+/// IMPLEMENTATION-assembly name to the public REFERENCE assembly a C# compiler resolves against:
+/// `System.Object`/`ValueType`/`String`/`Exception`/`SemaphoreSlim`/… physically live in
+/// `System.Private.CoreLib` but are type-forwarded from `System.Runtime`. A separately-compiled
+/// C# project only references the ref assembly, so any CoreLib name surviving into a method's OWN
+/// declared signature fails to resolve with CS0012 the moment a consumer references that method.
+///
+/// Applied ONLY at [`SignatureOnlyResolver`]'s external-type branch (a method's declared
+/// return/parameter types — C#-visible metadata a separately-compiled consumer resolves a call
+/// against), never to the shared [`MetadataBuilder`]'s own `type_def_or_ref` (used for body
+/// instructions, `extends`, and every other `TypeDefOrRef` resolution in this exporter): a
+/// `call`/`callvirt` `MemberRef` scoped to `[System.Runtime]System.String` is genuine "Bad IL
+/// format" against a real CoreLib `String` instance method (see `il_exporter::class_ref`'s doc for
+/// the empirical root cause) — only the outer *declaration* of a method's own signature is
+/// C#-visible metadata that needs the substitution; nothing that resolves a call INTO a type
+/// (including a call into `SemaphoreSlim` itself) may use it.
+fn ref_assembly_name(name: &str) -> &str {
+    match name {
+        "System.Private.CoreLib" | "mscorlib" => "System.Runtime",
+        other => other,
+    }
+}
+
+/// Local port of `il_exporter::ref_assembly_name_for_type` (same duplication convention as
+/// [`ref_assembly_name`] above). A blanket CoreLib -> `System.Runtime` substitution is wrong for
+/// types that aren't actually forwarded through the `System.Runtime` umbrella facade: confirmed by
+/// scanning the real net8.0 ref-pack DLLs, `SemaphoreSlim`/`ManualResetEventSlim`/
+/// `CountdownEvent`/`Barrier` are genuine `TypeDef`s in `System.Threading.dll`, not forwards from
+/// `System.Runtime.dll` — using `System.Runtime` for them fails with `CS7069` ("claims it is
+/// defined in 'System.Runtime', but it could not be found"), not CS0012. This is a small, explicit,
+/// closed table of the types this backend's mycorrhiza bindings actually expose across a
+/// C#-visible signature position today, not a general BCL type-forwarding resolver — extend it if
+/// another such type needs to cross a signature boundary.
+fn ref_assembly_name_for_type<'a>(assembly: &'a str, type_name: &str) -> &'a str {
+    if matches!(assembly, "System.Private.CoreLib" | "mscorlib") {
+        match type_name {
+            "System.Threading.SemaphoreSlim"
+            | "System.Threading.ManualResetEventSlim"
+            | "System.Threading.CountdownEvent"
+            | "System.Threading.Barrier" => return "System.Threading",
+            _ => {}
+        }
+    }
+    ref_assembly_name(assembly)
+}
+
+/// [`super::sig::TypeDefOrRefResolver`] used ONLY for encoding a method's OWN declared signature
+/// (`export_pe`'s `sig::encode_method_sig` call, the exact analog of `il_exporter`'s
+/// `type_il_signature`/`non_void_type_il_signature` split at its `.method` header line — see
+/// those functions' doc for the full rationale, mirrored here for the hand-rolled PE writer).
+///
+/// Defers to the shared [`MetadataBuilder`] unchanged for types DEFINED in this assembly (a
+/// `TypeDef` — never a BCL forwarding concern) and for the CACHED path (`class_token_cache` is
+/// deliberately NOT reused here: sharing it would leak a ref-assembly-qualified token back into
+/// body/call-site resolution, which must keep the impl-assembly name). For an EXTERNAL type, it
+/// creates its OWN independent `TypeRef` — deduplicated via `MetadataBuilder::type_ref`'s own
+/// `(scope, namespace, name)` cache, so repeated signature-position references to the same type
+/// still share one row — scoped through [`ref_assembly_name_for_type`] instead of the raw impl
+/// name.
+struct SignatureOnlyResolver<'a> {
+    mb: &'a mut MetadataBuilder,
+}
+
+impl super::sig::TypeDefOrRefResolver for SignatureOnlyResolver<'_> {
+    fn type_def_or_ref(&mut self, cref: Interned<ClassRef>, asm: &mut Assembly) -> u32 {
+        let class_ref = asm.class_ref(cref).clone();
+        if asm.class_ref_to_def(cref).is_some() {
+            // Defined in this assembly: no BCL forwarding concern, and the shared resolver
+            // already knows how to find its `TypeDef` row — reuse it verbatim.
+            return self.mb.type_def_or_ref(cref, asm);
+        }
+        let raw_name = &asm[class_ref.name()];
+        let scope = class_ref
+            .asm()
+            .map(|asm_name_id| {
+                let name = ref_assembly_name_for_type(&asm[asm_name_id], raw_name).to_string();
+                self.mb.find_or_create_assembly_ref(&name)
+            });
+        let full_name = if class_ref.generics().is_empty() {
+            raw_name.to_string()
+        } else {
+            format!("{raw_name}`{}", class_ref.generics().len())
+        };
+        let (namespace, name) = super::tables::split_namespace(&full_name);
+        let tok = self.mb.type_ref(scope, namespace, name);
+        encode_type_def_or_ref_token(tok)
+    }
+}
+
 /// Decodes a `TypeDefOrRef` coded index back into a [`Token`] — the same decode
 /// `tables.rs`'s private `decode_type_def_or_ref` performs, needed here for `extends` resolution
 /// while walking class defs (kept as its own copy rather than exposed from `tables.rs`, since the
@@ -748,6 +877,19 @@ fn decode_type_def_or_ref(coded: u32) -> Token {
         _ => unreachable!("2-bit tag"),
     };
     Token::new(table, rid)
+}
+
+/// Encodes a [`Token`] into a `TypeDefOrRef` coded index (§II.24.2.6) — the inverse of
+/// [`decode_type_def_or_ref`], needed by [`SignatureOnlyResolver`]. Same local-copy convention as
+/// that function (`tables.rs`'s private `encode_type_def_or_ref_token` is the canonical twin).
+fn encode_type_def_or_ref_token(token: Token) -> u32 {
+    let tag = match token.table() {
+        Token::TABLE_TYPE_DEF => 0,
+        Token::TABLE_TYPE_REF => 1,
+        Token::TABLE_TYPE_SPEC => 2,
+        other => panic!("{other:#x} is not a TypeDefOrRef member"),
+    };
+    (token.rid() << 2) | tag
 }
 
 #[cfg(test)]
