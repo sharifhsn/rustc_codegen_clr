@@ -1,7 +1,63 @@
-//! Mycorrhiza is a Rust .NET interop framework. It is part of the `rustc_codegen_clr` project, and allows you to interact with the .NET runtime directly.
-//! One of aims of the `rustc_codegen_clr` is to reuse existing Rust features and syntax to allow semless integration between Rust and the .NET runtime
-//! Mycorrhiza must "look" like a normal crate from the outside, even tough it deeply interacts with `rustc_codegen_clr`. It also should be possible to
-//! implement an equivalent APIs in standard Rust.
+//! Mycorrhiza is the Rust ↔ .NET interop framework for [`rustc_codegen_clr`](https://github.com/FractalFir/rustc_codegen_clr),
+//! a `rustc` codegen backend that compiles Rust straight to .NET assemblies. Ordinary Rust running
+//! under that backend can create, call, and be called by real managed objects — `List<T>`,
+//! `Dictionary<K, V>`, `Task<T>`, exceptions, delegates, LINQ expression trees — without hand-written
+//! FFI shims or a separate IDL. One of the project's aims is to reuse existing Rust syntax and
+//! features (traits, `?`, iterators, `async`/`.await`) for that integration, so interop code still
+//! *reads* like ordinary Rust rather than a foreign-function binding layer. Mycorrhiza must "look"
+//! like a normal crate from the outside, even though it deeply interacts with `rustc_codegen_clr`'s
+//! codegen; it should also be possible, in principle, to implement equivalent APIs in standard Rust.
+//!
+//! **Start with [`prelude`]** — `use mycorrhiza::prelude::*;` pulls in the collection wrappers, the
+//! managed string, the Task/error/nullable bridges, and the generic-bridge macros, which covers most
+//! day-to-day interop code. Reach into the specific module paths below only when you need something
+//! the prelude doesn't re-export, or the raw handle underneath an idiomatic wrapper.
+//!
+//! # A tour of the major modules
+//!
+//! **Collections & synchronization**
+//! - [`collections`] — `List<T>`, `Dictionary<K, V>`, `HashSet<T>`, `Stack<T>`, `Queue<T>`, and more,
+//!   backed by real managed objects and used like `std`.
+//! - [`sync`] — cross-thread/cross-language primitives (`Semaphore`, `Signal`, `Barrier`,
+//!   [`sync::SharedLock`], [`sync::SharedOnce`]) plus MPMC channels over
+//!   `System.Threading.Channels`.
+//! - [`enumerate`] — wraps any .NET `IEnumerator<T>` as a Rust `impl Iterator<Item = T>`; backs
+//!   `for x in &list`-style iteration over the collection wrappers.
+//! - [`span`] — `Span<T>` / `ReadOnlySpan<T>`, zero-copy views over a Rust slice.
+//! - [`nullable`] — `System.Nullable<T>` (a generic value type) ↔ Rust `Option<T>`.
+//!
+//! **BCL wrappers**
+//! - [`bcl`] — idiomatic wrappers over the most-used Base Class Library types and statics
+//!   (`DateTime`, `TimeSpan`, `Guid`, `Uri`, `Regex`, `Random`, `Stopwatch`, `StringBuilder`,
+//!   `Environment`, `Math`, `DotNetDecimal`) — used like normal Rust types, no CLR-interop knowledge
+//!   required at the call site.
+//! - [`system`] — the managed `System.String` wrapper ([`system::DotNetString`]) and its raw handle.
+//!
+//! **LINQ & expression trees**
+//! - [`linq`] — builds `System.Linq.Expressions` trees, the shape `IQueryable`/EF Core consumes, so
+//!   Rust code can construct real LINQ predicates and queries.
+//!
+//! **Async / task bridge**
+//! - [`task`] — `.await` a .NET `Task`/`Task<T>` from Rust, and expose a Rust `async fn` as a .NET
+//!   `Task`/`Task<T>` in return; see [`task::await_task`] / [`task::future_to_task`] for the two
+//!   directions, and the module docs for the documented coroutine-layout limits.
+//! - [`delegate`] — wrap a Rust `extern "C" fn` as a managed `Action<..>`/`Func<.., R>` delegate,
+//!   invoke a held .NET delegate, and pass delegates to .NET APIs/events.
+//!
+//! **Error handling**
+//! - [`error`] — managed `null` ↔ [`Option`] and a thrown .NET exception ↔ [`Result`] via the
+//!   interop `try`/`catch` primitive ([`error::try_managed`] / the `.try_()` combinator), plus
+//!   `?`-operator ergonomics for [`error::ManagedException`].
+//!
+//! **Defining/exporting your own types**
+//! - [`comptime`] — comptime type-export intrinsics for defining a managed .NET class from Rust;
+//!   backs the `dotnet_macros::dotnet_class` proc-macro and the declarative `dotnet_typedef!`.
+//! - [`enums`] — mirrors a C# enum as a `#[repr(..)]` Rust enum via the [`dotnet_enum!`] macro.
+//! - [`containers`] — the reusable C#→Rust generic container ([`containers::export_rust_containers!`]),
+//!   backing the shipped C# `RustDotnet.RustVec<T>` / `RustBoxVec<T>`.
+//! - [`generic_bridge`] — the lower-level WF-9 generic-interop macros (`dotnet_generic!` /
+//!   `dotnet_generic_impl!` / `gen!`) that the above idiomatic wrappers are themselves built on.
+//! - [`intrinsics`] — very low-level interop primitives. Don't use unless you need to.
 
 #![allow(internal_features, incomplete_features)]
 #![feature(
