@@ -514,8 +514,8 @@ fn std_targets() -> Vec<Target> {
         Target {
             rel: "os/unix/io/mod.rs",
             injections: vec![Injection::Replace {
-                find: "let null_dev = crate::fs::OpenOptions::new().read(true).write(true).open(\"/dev/null\")?;\n        Ok(null_dev.into())".to_string(),
-                with: "// dotnet: StdioExt null_fd unsupported (fs::File not fd-backed)\n        Err(io::Error::UNSUPPORTED_PLATFORM)".to_string(),
+                find: "let null_dev = crate::fs::OpenOptions::new().read(true).write(true).open(\"/dev/null\")?;\n    Ok(null_dev.into())".to_string(),
+                with: "// dotnet: StdioExt null_fd unsupported (fs::File not fd-backed)\n    Err(io::Error::UNSUPPORTED_PLATFORM)".to_string(),
                 marker: "dotnet: StdioExt null_fd unsupported".to_string(),
             }],
         },

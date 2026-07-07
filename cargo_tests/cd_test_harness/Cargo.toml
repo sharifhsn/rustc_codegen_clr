@@ -1,0 +1,10 @@
+# Probe crate for `cargo dotnet test` libtest-parity: #[should_panic], #[ignore],
+# and test-name filtering. See docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md section 6.
+[package]
+name = "cd_test_harness"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[workspace]
