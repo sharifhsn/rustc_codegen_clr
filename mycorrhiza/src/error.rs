@@ -12,6 +12,10 @@
 //!   (or the [`TryManaged::try_`] combinator on a closure). This catches *foreign* .NET/BCL
 //!   exceptions — the ones a Rust `catch_unwind` deliberately rethrows because they are not a
 //!   `RustException`.
+//! * **`?` into your own error type** — [`impl_from_managed_exception!`] generates a
+//!   `From<ManagedException>` impl for a consumer's own error type (a blanket impl isn't legal Rust
+//!   here — orphan rules), so `?` bubbles a [`try_managed`] failure straight into it without a
+//!   hand-rolled `From` at every call site.
 //!
 //! ```ignore
 //! use mycorrhiza::prelude::*;
@@ -231,6 +235,49 @@ impl<T, F: FnOnce() -> T> TryManaged<T> for F {
     fn try_(self) -> Result<T, ManagedException> {
         try_managed(self)
     }
+}
+
+/// Give a consumer's own error type a `From<ManagedException>` impl, so `?` can bubble a
+/// [`try_managed`] (or [`TryManaged::try_`]) failure straight into it without a hand-rolled
+/// conversion at every call site.
+///
+/// A blanket `impl<E> From<ManagedException> for E` is not legal Rust here (orphan rules — neither
+/// `ManagedException` nor a downstream `E` is local to this crate), so each consumer's error type
+/// needs its own `impl`. This macro generates exactly that `impl`, wrapping the caught exception in
+/// whichever variant/constructor you name.
+///
+/// Syntax: `impl_from_managed_exception!(<ErrorType>, <Variant-or-fn-path>)`, where the second
+/// argument is anything callable as `path(ManagedException) -> ErrorType` — typically a tuple-variant
+/// path like `MyError::Managed`, but any `fn(ManagedException) -> MyError` works too (e.g. a helper
+/// constructor).
+///
+/// ```ignore
+/// use mycorrhiza::prelude::*;
+///
+/// #[derive(Debug)]
+/// enum MyError {
+///     Managed(ManagedException),
+///     Other(String),
+/// }
+///
+/// impl_from_managed_exception!(MyError, MyError::Managed);
+///
+/// fn parse_guid(s: MString) -> Result<Guid, MyError> {
+///     // `?` now converts a `ManagedException` into `MyError::Managed(..)` automatically.
+///     let g = try_managed(|| Guid::parse(s))?;
+///     Ok(g)
+/// }
+/// ```
+#[macro_export]
+macro_rules! impl_from_managed_exception {
+    ($Err:ty, $ctor:expr) => {
+        impl ::core::convert::From<$crate::error::ManagedException> for $Err {
+            #[inline]
+            fn from(e: $crate::error::ManagedException) -> $Err {
+                $ctor(e)
+            }
+        }
+    };
 }
 
 // ===========================================================================================
