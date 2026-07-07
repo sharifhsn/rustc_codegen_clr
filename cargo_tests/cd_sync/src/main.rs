@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use mycorrhiza::sync::{
-    Barrier, CountdownEvent, Semaphore, SharedLock, SharedMutex, SharedRwLock, Signal,
+    Barrier, CountdownEvent, Semaphore, SharedLock, SharedMutex, SharedOnce, SharedRwLock, Signal,
 };
 use mycorrhiza::system::console::Console;
 
@@ -317,6 +317,61 @@ fn main() -> std::process::ExitCode {
         chk!(*rwlock.get_mut(), 7);
         *rwlock.get_mut() += 1;
         chk!(rwlock.into_inner(), 8);
+    }
+
+    // ---------- 12. SharedOnce<T>: get()/get_or_init() basic contract ----------
+    {
+        let once: SharedOnce<i64> = SharedOnce::new();
+        chk!(once.get().is_some(), false);
+
+        let v = *once.get_or_init(|| 42);
+        chk!(v, 42);
+        chk!(*once.get().unwrap(), 42);
+
+        // A second get_or_init call must NOT re-run the initializer -- it must observe the same value.
+        let v2 = *once.get_or_init(|| 999);
+        chk!(v2, 42);
+    }
+
+    // ---------- 13. SharedOnce<T>: concurrent-initialization race -- exactly one initializer runs ----------
+    // N threads all call get_or_init() at (as close to) the same instant, each with a closure that
+    // increments a shared counter before producing its value. If the double-checked lock were broken
+    // (e.g. missing the second check under the lock, or no lock at all), multiple closures could run
+    // concurrently and the counter would end up > 1. Every thread must also observe the SAME final
+    // value, proving they all got the winner's result, not their own.
+    {
+        static INIT_RUNS: AtomicI32 = AtomicI32::new(0);
+        let once: std::sync::Arc<SharedOnce<i64>> = std::sync::Arc::new(SharedOnce::new());
+        const THREADS: usize = 16;
+        let start_gate = std::sync::Arc::new(SharedRwLock::new(()));
+        // Hold the gate's write lock so every spawned thread blocks at the same starting line,
+        // maximizing the chance they all race into get_or_init() together.
+        let gate_guard = start_gate.write();
+
+        let results: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let once = once.clone();
+                let start_gate = start_gate.clone();
+                thread::spawn(move || {
+                    let _ = start_gate.read(); // blocks until the main thread releases the write lock
+                    *once.get_or_init(|| {
+                        INIT_RUNS.fetch_add(1, Ordering::SeqCst);
+                        // Give any wrongly-concurrent second initializer a real window to run.
+                        thread::sleep(Duration::from_millis(5));
+                        (i as i64) + 1000
+                    })
+                })
+            })
+            .collect();
+
+        thread::sleep(Duration::from_millis(20)); // let all threads reach the gate
+        drop(gate_guard); // release -- every thread races into get_or_init() now
+
+        let values: Vec<i64> = results.into_iter().map(|h| h.join().unwrap()).collect();
+        chk!(INIT_RUNS.load(Ordering::SeqCst), 1); // exactly one initializer ran
+        let first = values[0];
+        chk!(values.iter().all(|v| *v == first), true); // every thread saw the SAME winning value
+        chk!(*once.get().unwrap(), first);
     }
 
     println!("== cd_sync done ==");

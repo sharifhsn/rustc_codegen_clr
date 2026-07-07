@@ -6,9 +6,11 @@
 //!
 //! On top of `SharedLock`, this module also provides data-owning, fully-safe wrappers for the
 //! all-Rust-side case: [`SharedMutex<T>`] (mutual exclusion, a `SharedLock` + `UnsafeCell<T>` in the
-//! exact shape of `std::sync::Mutex<T>`) and [`SharedRwLock<T>`] (reader/writer, over
-//! `ReaderWriterLockSlim`). Neither requires `unsafe` in calling code — see each type's docs for
-//! precisely what safety they do (and do not) extend to a C# caller that also holds the raw lock.
+//! exact shape of `std::sync::Mutex<T>`), [`SharedRwLock<T>`] (reader/writer, over
+//! `ReaderWriterLockSlim`), and [`SharedOnce<T>`] (lazy one-time initialization, the
+//! `std::sync::OnceLock<T>` shape, over a `SharedLock`-guarded double-checked-lock). None of these
+//! require `unsafe` in calling code — see each type's docs for precisely what safety they do (and do
+//! not) extend to a C# caller that also holds the raw lock.
 //!
 //! This mirrors [`crate::task`]'s conventions: thin, `#[inline]` wrappers over the raw generated
 //! bindings in [`crate::bindings`], RAII guards for the acquire/release pairs, and (where a wait can be
@@ -758,5 +760,120 @@ impl<T> Drop for SharedRwLockWriteGuard<'_, T> {
     #[inline]
     fn drop(&mut self) {
         self.lock.exit_write_lock();
+    }
+}
+
+// =================================================================================================
+// SharedOnce<T> — a real, data-owning OnceLock<T> built on SharedLock
+// =================================================================================================
+
+/// A lazy one-time-initialization cell, shaped like `std::sync::OnceLock<T>`: built on top of
+/// [`SharedLock`] guarding an `UnsafeCell<Option<T>>`, exactly the same "one lock + one cell,
+/// encapsulated once, correctly, in this module" pattern as [`SharedMutex<T>`] and
+/// [`SharedRwLock<T>`].
+///
+/// # Why a hand-rolled double-checked lock, not `System.Lazy<T>`
+///
+/// .NET's own `System.Lazy<T>` was the obvious first candidate, but it does not fit here: `Lazy<T>`
+/// is *generic over `T`*, and a `T` living purely on the Rust side (a Rust struct, a non-`unsafe`
+/// value type with Rust-only layout) has no way to be named as a CLR generic type argument through
+/// this project's interop surface — the same generic-instantiation-of-Rust-types ceiling documented
+/// throughout `mycorrhiza`. Building `SharedOnce<T>` directly on [`SharedLock`] (already a
+/// non-generic, real, shared `SemaphoreSlim`) plus a private `UnsafeCell<Option<T>>` sidesteps that
+/// entirely: the lock is .NET-native and (optionally) cross-language-shareable via
+/// [`shared_lock`](SharedOnce::shared_lock), while `T` stays exactly where [`SharedMutex<T>`] keeps
+/// it — owned by this Rust value, never named across the interop boundary.
+///
+/// The double-checked-lock pattern itself is the standard, correct shape: an uncontended
+/// [`get`](SharedOnce::get) or already-initialized [`get_or_init`](SharedOnce::get_or_init) reads a
+/// snapshot without ever touching the lock; only the *first* initializer actually acquires it, and
+/// every other concurrent caller blocks on that same acquire, then observes the now-initialized
+/// value once it lets go — so the closure passed to `get_or_init` runs **at most once**, no matter
+/// how many threads (Rust or, via the raw lock, C#) call it concurrently.
+///
+/// # What safety this does and does not extend to C#
+///
+/// Exactly the same nuance as [`SharedMutex<T>`] and [`SharedRwLock<T>`]: **fully safe, complete,
+/// and requires zero `unsafe` in calling code, for pure-Rust use.** The only way to reach `&T` is
+/// through [`get`](SharedOnce::get) / [`get_or_init`](SharedOnce::get_or_init), both of which route
+/// through the real `SemaphoreSlim`-backed [`SharedLock`]. If the raw lock is also shared with C# via
+/// [`shared_lock`](SharedOnce::shared_lock), C# can coordinate timing on that same semaphore, but has
+/// no path to `T`'s memory — `T` lives in a private `UnsafeCell<Option<T>>` this Rust value owns and
+/// never exposes across the interop boundary.
+pub struct SharedOnce<T> {
+    lock: SharedLock,
+    // `None` until initialized, `Some(_)` forever after -- read/written only while `lock` is held,
+    // except for the lock-free fast-path snapshot read in `get`/`get_or_init` (see their docs).
+    data: UnsafeCell<Option<T>>,
+}
+
+// SAFETY: mirrors `std::sync::OnceLock<T>`'s own bound. `SharedOnce<T>` only ever writes `data`
+// once, under the `SharedLock`, and only ever hands out `&T` (read-only, after that single write) --
+// so concurrent access from multiple threads is exactly as sound as `OnceLock<T>: Sync` requires
+// `T: Send + Sync` for (the value may be produced on one thread and observed on another, and once
+// initialized is read concurrently by any number of threads without further synchronization).
+unsafe impl<T: Send + Sync> Sync for SharedOnce<T> {}
+
+impl<T> SharedOnce<T> {
+    /// An empty cell, not yet initialized — construct a fresh [`SharedLock`] (a new
+    /// `SemaphoreSlim(1, 1)`) to guard the one-time write. Mirrors `OnceLock::new()`.
+    #[inline]
+    pub fn new() -> Self {
+        Self { lock: SharedLock::new(), data: UnsafeCell::new(None) }
+    }
+
+    /// Expose *just* the raw lock — e.g. for a `#[dotnet_export]` to hand to C# so it can coordinate
+    /// timing with Rust's initialization of the cell. See the [`SharedOnce`] docs for exactly what
+    /// this does and does not let C# do: a real, shared `SemaphoreSlim` for `Wait()`/`Release()`
+    /// coordination, but no path to `T`'s memory.
+    #[inline]
+    pub fn shared_lock(&self) -> SharedLock {
+        self.lock
+    }
+
+    /// Returns `&T` if the cell has already been initialized, `None` otherwise. Never blocks and
+    /// never touches the lock: this is a plain snapshot read of the `Option<T>`, which is sound
+    /// because after the single initializing write (always lock-protected) the value only ever moves
+    /// from `None` to a permanently-fixed `Some(_)` — a torn read is impossible since `data` itself
+    /// is never mutated again once `Some`. Mirrors `OnceLock::get`.
+    #[inline]
+    pub fn get(&self) -> Option<&T> {
+        // SAFETY: `data` is written at most once (inside `get_or_init`, under `self.lock`) and, once
+        // `Some`, is never written again -- so an unsynchronized read here can only ever observe
+        // either `None` or the final, fully-initialized `Some(_)`, never a partial write. This is the
+        // same reasoning `std::sync::OnceLock::get` relies on for its fast, lock-free read path.
+        unsafe { (*self.data.get()).as_ref() }
+    }
+
+    /// Returns `&T`, initializing it by calling `f` if the cell is currently empty. If multiple
+    /// threads (Rust-side; see [`shared_lock`](SharedOnce::shared_lock) for the C#-coordination case)
+    /// call `get_or_init` concurrently, **exactly one** call to `f` actually runs — every other
+    /// caller blocks on the same [`SharedLock`], then observes the value the winner produced. Mirrors
+    /// `OnceLock::get_or_init`.
+    #[inline]
+    pub fn get_or_init(&self, f: impl FnOnce() -> T) -> &T {
+        // Fast path: already initialized -- no lock needed at all (sound per `get`'s safety note).
+        if let Some(v) = self.get() {
+            return v;
+        }
+        // Slow path: acquire the lock, then check AGAIN (double-checked locking) -- another thread
+        // may have finished initializing between the fast-path check above and taking the lock.
+        let _guard = self.lock.lock();
+        // SAFETY: `self.lock` is held here, and it is the sole gate through which `data` is ever
+        // written, so no other thread can be concurrently writing (or reading-while-writing) it.
+        let slot = unsafe { &mut *self.data.get() };
+        if slot.is_none() {
+            *slot = Some(f());
+        }
+        // SAFETY: `slot` is now guaranteed `Some` (either already was, or just set above), and no
+        // other writer can run concurrently while `_guard` is held.
+        slot.as_ref().unwrap()
+    }
+}
+
+impl<T> Default for SharedOnce<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
     }
 }
