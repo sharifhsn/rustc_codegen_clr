@@ -39,3 +39,5 @@ cargo_tests/**/target/
 *.runtimeconfig.json
 # macOS debug-symbol bundles from running compiled test binaries
 *.dSYM/
+# bench_rs_vs_cs benchmark artifacts (rebuildable, not source)
+cargo_tests/bench_rs_vs_cs/binaries/
