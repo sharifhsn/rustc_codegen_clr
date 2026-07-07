@@ -1,0 +1,5 @@
+error: malformed .NET type reference `[BadSpec`: an opening `[` must be matched by a closing `]`, e.g. `"[System.Runtime]System.Object"`
+ --> tests/ui/dotnet_class_malformed_ref.rs:6:29
+  |
+6 | #[dotnet_class(implements = "[BadSpec")]
+  |                             ^^^^^^^^^^

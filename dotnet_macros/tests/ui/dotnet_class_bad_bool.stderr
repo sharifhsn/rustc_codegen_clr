@@ -1,0 +1,5 @@
+error: expected a bool literal, `true` or `false`
+ --> tests/ui/dotnet_class_bad_bool.rs:5:29
+  |
+5 | #[dotnet_class(value_type = "yes")]
+  |                             ^^^^^

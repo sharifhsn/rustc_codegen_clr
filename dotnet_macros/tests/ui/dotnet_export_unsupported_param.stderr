@@ -1,0 +1,5 @@
+error: #[dotnet_export]: unsupported parameter type `Vec < i32 >`. Supported: the integer/float primitives, `bool`, `&str`, and `String`.
+ --> tests/ui/dotnet_export_unsupported_param.rs:6:22
+  |
+6 | pub fn bad_export(x: Vec<i32>) -> i32 {
+  |                      ^^^^^^^^

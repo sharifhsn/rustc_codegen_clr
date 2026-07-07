@@ -30,6 +30,57 @@ fn split_dotnet_ref(spec: &str) -> (String, String) {
     (String::new(), spec.to_string())
 }
 
+/// Reject a `"[Assembly]Namespace.Type"` spec with an opened-but-unclosed `[` — a common typo
+/// (`"[Foo"` instead of `"[Foo]Foo.Bar"`) that `split_dotnet_ref` would otherwise silently treat as
+/// a bracket-less type name, registering a garbage assembly reference with no diagnostic at all.
+fn validate_dotnet_ref(spec: &str, span: proc_macro2::Span) -> syn::Result<()> {
+    if spec.starts_with('[') && !spec.contains(']') {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "malformed .NET type reference `{spec}`: an opening `[` must be matched by a closing \
+                 `]`, e.g. `\"[System.Runtime]System.Object\"`"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Extract a string-literal value from an attribute's `= value` expression, or a precise error at
+/// the value's own span if it isn't one (instead of silently keeping the field's prior/default
+/// value, which is what a plain `if let` match-and-ignore would do).
+fn str_lit_value(expr: &syn::Expr) -> syn::Result<String> {
+    if let syn::Expr::Lit(syn::ExprLit {
+        lit: syn::Lit::Str(s),
+        ..
+    }) = expr
+    {
+        Ok(s.value())
+    } else {
+        Err(syn::Error::new(
+            expr.span(),
+            "expected a string literal, e.g. `\"...\"`",
+        ))
+    }
+}
+
+/// Extract a bool-literal value from an attribute's `= value` expression, or a precise error at the
+/// value's own span if it isn't one.
+fn bool_lit_value(expr: &syn::Expr) -> syn::Result<bool> {
+    if let syn::Expr::Lit(syn::ExprLit {
+        lit: syn::Lit::Bool(LitBool { value, .. }),
+        ..
+    }) = expr
+    {
+        Ok(*value)
+    } else {
+        Err(syn::Error::new(
+            expr.span(),
+            "expected a bool literal, `true` or `false`",
+        ))
+    }
+}
+
 /// `#[dotnet_class(extends = "[System.Runtime]System.Object", value_type = false)]` on a struct.
 ///
 /// Emits: the original struct (unchanged); a `<Name>Handle` managed-handle alias (a method receiver /
@@ -56,51 +107,55 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         for m in metas {
             if m.path.is_ident("extends") {
-                if let syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Str(s),
-                    ..
-                }) = &m.value
-                {
-                    extends = s.value();
+                match str_lit_value(&m.value) {
+                    Ok(s) => {
+                        if let Err(e) = validate_dotnet_ref(&s, m.value.span()) {
+                            return e.to_compile_error().into();
+                        }
+                        extends = s;
+                    }
+                    Err(e) => return e.to_compile_error().into(),
                 }
             } else if m.path.is_ident("value_type") {
-                if let syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Bool(LitBool { value, .. }),
-                    ..
-                }) = &m.value
-                {
-                    value_type = *value;
+                match bool_lit_value(&m.value) {
+                    Ok(v) => value_type = v,
+                    Err(e) => return e.to_compile_error().into(),
                 }
             } else if m.path.is_ident("default_ctor") {
-                if let syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Bool(LitBool { value, .. }),
-                    ..
-                }) = &m.value
-                {
-                    default_ctor = *value;
+                match bool_lit_value(&m.value) {
+                    Ok(v) => default_ctor = v,
+                    Err(e) => return e.to_compile_error().into(),
                 }
             } else if m.path.is_ident("field_setters") {
-                if let syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Bool(LitBool { value, .. }),
-                    ..
-                }) = &m.value
-                {
-                    field_setters = *value;
+                match bool_lit_value(&m.value) {
+                    Ok(v) => field_setters = v,
+                    Err(e) => return e.to_compile_error().into(),
                 }
             } else if m.path.is_ident("implements") {
-                if let syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Str(s),
-                    ..
-                }) = &m.value
-                {
-                    implements = s
-                        .value()
-                        .split(';')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .collect();
+                let s = match str_lit_value(&m.value) {
+                    Ok(s) => s,
+                    Err(e) => return e.to_compile_error().into(),
+                };
+                let mut specs = Vec::new();
+                for spec in s.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                    if let Err(e) = validate_dotnet_ref(spec, m.value.span()) {
+                        return e.to_compile_error().into();
+                    }
+                    specs.push(spec.to_string());
                 }
+                implements = specs;
+            } else {
+                let path = &m.path;
+                return syn::Error::new(
+                    m.path.span(),
+                    format!(
+                        "#[dotnet_class]: unknown attribute key `{}`; expected one of `extends`, \
+                         `value_type`, `default_ctor`, `field_setters`, `implements`",
+                        quote! { #path }
+                    ),
+                )
+                .to_compile_error()
+                .into();
             }
         }
     }
@@ -846,22 +901,7 @@ pub fn dotnet_entity(_attr: TokenStream, item: TokenStream) -> TokenStream {
             Err(e) => return e.to_compile_error().into(),
         };
         for m in metas {
-            let Some(s) = (match &m.value {
-                syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Str(s),
-                    ..
-                }) => Some(s.value()),
-                _ => None,
-            }) else {
-                continue;
-            };
-            if m.path.is_ident("namespace") {
-                namespace_override = Some(s);
-            } else if m.path.is_ident("assembly") {
-                assembly_override = Some(s);
-            } else if m.path.is_ident("name") {
-                name_override = Some(s);
-            } else if m.path.is_ident("type_name") {
+            if m.path.is_ident("type_name") {
                 return syn::Error::new(
                     m.path.span(),
                     "#[dotnet_entity]: `type_name` was replaced by separate `namespace`/`assembly`/\
@@ -870,6 +910,31 @@ pub fn dotnet_entity(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 )
                 .to_compile_error()
                 .into();
+            }
+            if !m.path.is_ident("namespace") && !m.path.is_ident("assembly") && !m.path.is_ident("name")
+            {
+                let path = &m.path;
+                return syn::Error::new(
+                    m.path.span(),
+                    format!(
+                        "#[dotnet_entity]: unknown attribute key `{}`; expected one of `namespace`, \
+                         `assembly`, `name`",
+                        quote! { #path }
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
+            let s = match str_lit_value(&m.value) {
+                Ok(s) => s,
+                Err(e) => return e.to_compile_error().into(),
+            };
+            if m.path.is_ident("namespace") {
+                namespace_override = Some(s);
+            } else if m.path.is_ident("assembly") {
+                assembly_override = Some(s);
+            } else if m.path.is_ident("name") {
+                name_override = Some(s);
             }
         }
     }
@@ -941,14 +1006,21 @@ pub fn dotnet_entity(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 Err(e) => return e.to_compile_error().into(),
             };
             for m in metas {
-                if m.path.is_ident("rename") {
-                    if let syn::Expr::Lit(syn::ExprLit {
-                        lit: syn::Lit::Str(s),
-                        ..
-                    }) = &m.value
-                    {
-                        prop_name = s.value();
-                    }
+                if !m.path.is_ident("rename") {
+                    let path = &m.path;
+                    return syn::Error::new(
+                        m.path.span(),
+                        format!(
+                            "#[dotnet_entity]: unknown field attribute key `{}`; expected `rename`",
+                            quote! { #path }
+                        ),
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                match str_lit_value(&m.value) {
+                    Ok(s) => prop_name = s,
+                    Err(e) => return e.to_compile_error().into(),
                 }
             }
         }

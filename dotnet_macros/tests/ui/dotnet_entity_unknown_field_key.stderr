@@ -1,0 +1,5 @@
+error: #[dotnet_entity]: unknown field attribute key `renam`; expected `rename`
+ --> tests/ui/dotnet_entity_unknown_field_key.rs:7:14
+  |
+7 |     #[dotnet(renam = "Age")]
+  |              ^^^^^
