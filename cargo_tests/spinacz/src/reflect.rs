@@ -634,20 +634,37 @@ impl Namespace {
             depth,
         }
     }
-    /// `emit_upcasts`: whether to emit `impl From<Derived> for Base` blocks. This is a Rust
-    /// ORPHAN-RULE call, not a style choice: `RustcCLRInteropManagedClass<..>` is defined in
-    /// `mycorrhiza`, so `impl From<X> for Y` (both X and Y being instantiations of that same
-    /// foreign struct) only satisfies coherence when the `impl` is textually written INSIDE the
-    /// `mycorrhiza` crate itself (spinacz's own BCL output becomes `mycorrhiza/src/bindings.rs`
-    /// verbatim — true there). A third-party package's bindings live in a SEPARATE consumer
-    /// crate (see `tools/cargo-dotnet/src/nuget.rs`), where the same `impl` is an E0117 orphan
-    /// violation — `false` there; base-type access still works via
-    /// `rustc_clr_interop_managed_checked_cast::<Base, Derived>(v)` directly, just without the
-    /// `.into()` sugar.
-    pub fn export(&self, out: &mut impl Write, emit_upcasts: bool) {
+    /// `in_mycorrhiza`: whether this output becomes PART of `mycorrhiza` itself (spinacz's BCL
+    /// sweep — true) or lives in a SEPARATE external consumer crate (`add-nuget` — false). Drives
+    /// two ORPHAN-RULE calls, not style choices:
+    ///
+    ///   * Base-type upcasts. `impl From<Derived> for Base` needs the `impl` written inside the
+    ///     crate that OWNS the type both aliases resolve to
+    ///     (`RustcCLRInteropManagedClass<..>`, defined in `mycorrhiza`) — satisfied when
+    ///     `in_mycorrhiza`. Outside, `From` is a FOREIGN trait and both `Derived`/`Base` are
+    ///     foreign types, so neither orphan-rule escape hatch ("a LOCAL trait for any type" / "a
+    ///     foreign trait for a LOCAL type") applies. Rust's local-trait escape hatch still gets
+    ///     us there: `impl UpcastTo<Base> for Derived { fn upcast(self) -> Base { .. } }`, where
+    ///     `UpcastTo` is a trait DEFINED IN THIS GENERATED FILE (see `export_root`) — legal for
+    ///     ANY `Self`, foreign or not, because the trait itself is local. `.upcast()` instead of
+    ///     `.into()`, otherwise identical.
+    ///   * Callable wrappers. An INHERENT `impl <Name> { .. }` needs `<Name>` (any
+    ///     `RustcCLRInteropManagedClass<..>` instantiation) to be local — true only inside
+    ///     `mycorrhiza`; no const-generic parameterization changes that, since orphan rules look
+    ///     through type aliases to the concrete type. The SAME local-trait escape hatch fixes
+    ///     this too (see `export_methods`'s doc) — and because trait methods support real
+    ///     `self`/`Self` sugar once the (necessarily concrete, inside `impl _ for <Name>`) `Self`
+    ///     is known, external consumers get the EXACT SAME call syntax as `mycorrhiza`'s own
+    ///     bindings (`instance.method(..)`, `<Name>::static_method(..)`, `<Name>::new(..)`), as
+    ///     long as the trait is in scope — a blanket `use <generated_module>::*;` brings every
+    ///     such trait in for free. This is strictly better than an earlier free-function-module
+    ///     design (superseded): that needed a `_methods`-suffixed call site AND its own
+    ///     `use super::*;` glue, because a `pub mod` is a real module for path resolution and an
+    ///     `impl` — inherent or trait — is not.
+    pub fn export(&self, out: &mut impl Write, in_mycorrhiza: bool) {
         writeln!(out, "pub mod {name}{{", name = self.name).unwrap();
         for (_, inner) in &self.inner {
-            inner.export(out, emit_upcasts);
+            inner.export(out, in_mycorrhiza);
         }
         for tpe in &self.types {
             if !tpe.is_valuetype {
@@ -664,21 +681,28 @@ impl Namespace {
                     );
                 }
 
-                if emit_upcasts
-                    && !tpe.inherits.is_empty()
+                if !tpe.inherits.is_empty()
                     && !(tpe.inherits.contains("`")
                         || tpe.inherits.contains("+")
                         || tpe.inherits.contains("<"))
                 {
-                    writeln!(
-                        out,
-                        "impl From<{name}> for {inherits_path} {{\n fn from(v:{name})->{inherits_path}{{\nmycorrhiza::intrinsics::rustc_clr_interop_managed_checked_cast::<{inherits_path},{name}>(v)\n}}}} ",
-                        inherits_path = tpe.inherits.replace(".", "::")
-                    )
-                    .unwrap();
+                    let inherits_path = tpe.inherits.replace(".", "::");
+                    if in_mycorrhiza {
+                        writeln!(
+                            out,
+                            "impl From<{name}> for {inherits_path} {{\n fn from(v:{name})->{inherits_path}{{\nmycorrhiza::intrinsics::rustc_clr_interop_managed_checked_cast::<{inherits_path},{name}>(v)\n}}}} ",
+                        )
+                        .unwrap();
+                    } else {
+                        writeln!(
+                            out,
+                            "impl UpcastTo<{inherits_path}> for {name} {{\n fn upcast(self)->{inherits_path}{{\nmycorrhiza::intrinsics::rustc_clr_interop_managed_checked_cast::<{inherits_path},{name}>(self)\n}}}} ",
+                        )
+                        .unwrap();
+                    }
                 }
 
-                Self::export_methods(out, name, &tpe.methods, emit_upcasts);
+                Self::export_methods(out, name, &tpe.methods, in_mycorrhiza);
             }
         }
         writeln!(out, "}}").unwrap();
@@ -689,76 +713,134 @@ impl Namespace {
     /// matching the existing bindings.rs layout. The root never holds types directly (every BCL
     /// type has at least one namespace segment), but we still emit any just in case.
     ///
-    /// `emit_upcasts`: see `export`'s doc.
-    pub fn export_root(&self, out: &mut impl Write, emit_upcasts: bool) {
+    /// `in_mycorrhiza`: see `export`'s doc.
+    pub fn export_root(&self, out: &mut impl Write, in_mycorrhiza: bool) {
+        // The local upcast-trait escape hatch (see `export`'s doc) — declared EXACTLY ONCE per
+        // generated file, generic over the target type, so every per-type `impl UpcastTo<Base>
+        // for Derived` throughout this file's namespace tree shares it.
+        if !in_mycorrhiza {
+            writeln!(
+                out,
+                "pub trait UpcastTo<T> {{ fn upcast(self) -> T; }}"
+            )
+            .unwrap();
+        }
         for (_, inner) in &self.inner {
-            inner.export(out, emit_upcasts);
+            inner.export(out, in_mycorrhiza);
         }
         for tpe in &self.types {
             if !tpe.is_valuetype {
                 let name = tpe.full_name.split('.').last().unwrap();
                 writeln!(out,"pub type {name} =  mycorrhiza::intrinsics::RustcCLRInteropManagedClass<{tpe_asm:?},{full_name:?}>;",tpe_asm = tpe.asm,full_name = tpe.full_name ).unwrap();
-                Self::export_methods(out, name, &tpe.methods, emit_upcasts);
+                Self::export_methods(out, name, &tpe.methods, in_mycorrhiza);
             }
         }
     }
 
     /// Emit the callable wrappers for `name`, either as an inherent `impl <name> { .. }` block
     /// (mirroring the hand-written `staticN`/`instanceN`/`virt0`/`ctorN` helpers in
-    /// `mycorrhiza::intrinsics` — `emit_upcasts == true`, i.e. this output lives INSIDE
-    /// `mycorrhiza`) or, when generating for an EXTERNAL consumer crate, as a
-    /// `pub mod <name>_methods { .. }` of FREE functions instead. The latter is not a style
-    /// choice: an inherent `impl` on a `pub type` alias of a foreign generic struct (any
-    /// `RustcCLRInteropManagedClass<..>` instantiation) is an E0116 orphan violation outside
-    /// `mycorrhiza` — no const-generic parameterization changes that, since orphan rules look
-    /// through type aliases to the concrete type, and const generics don't count as a "local
-    /// type" for the usual blanket-impl exception. Free functions have NO such restriction —
-    /// BUT the wrapping module can't reuse the bare `<name>` either: modules and type aliases
-    /// share Rust's TYPE namespace (unlike a module vs. a function, which don't collide), so
-    /// `pub type Foo` + `pub mod Foo` in the same scope is an E0428 "defined multiple times",
-    /// not the "separate namespaces, no clash" case an `impl` would be. Hence the `_methods`
-    /// suffix — `<name>_methods::method(..)` instead of `<name>::method(..)`, the one place the
-    /// external-consumer call syntax genuinely differs from `mycorrhiza`'s own bindings.
-    fn export_methods(out: &mut impl Write, name: &str, methods: &[DotNetMethodDef], emit_upcasts: bool) {
+    /// `mycorrhiza::intrinsics` — `in_mycorrhiza == true`) or, for an EXTERNAL consumer crate, as
+    /// a matched pair `pub trait <name>_Methods { fn method(..); .. }` +
+    /// `impl <name>_Methods for <name> { fn method(..) { .. } }` — a LOCAL trait implemented for
+    /// the (foreign) type alias, sidestepping the orphan rule an inherent `impl` would hit (see
+    /// `export`'s doc). The trait can't reuse the bare `<name>` either: modules/traits and type
+    /// aliases share Rust's TYPE namespace, so `pub type Foo` + `pub trait Foo` in the same scope
+    /// would be an E0428 "defined multiple times" — hence the `_Methods` suffix on the TRAIT's
+    /// own name. This is purely an internal identifier, though: because trait methods use real
+    /// `self`/`Self` sugar, call sites never spell `_Methods` — `<name>::method(..)` resolves via
+    /// ordinary trait method lookup once the trait is in scope (a blanket
+    /// `use <generated_module>::*;` is enough), identical to `mycorrhiza`'s own bindings.
+    fn export_methods(out: &mut impl Write, name: &str, methods: &[DotNetMethodDef], in_mycorrhiza: bool) {
         if methods.is_empty() {
             return;
         }
-        let self_ty = if emit_upcasts { None } else { Some(name) };
-        let (keyword, mod_name) = if emit_upcasts {
-            ("impl".to_string(), name.to_string())
+        if in_mycorrhiza {
+            writeln!(out, "impl {name} {{").unwrap();
+            for def in methods {
+                // Inherent impl: methods need an explicit `pub` (their own visibility, not
+                // inherited from anything).
+                let Some(body) = render_wrapper(def, "pub ") else {
+                    continue;
+                };
+                writeln!(out, "{body}").unwrap();
+            }
+            writeln!(out, "}}").unwrap();
         } else {
-            ("pub mod".to_string(), format!("{name}_methods"))
-        };
-        writeln!(out, "{keyword} {mod_name} {{").unwrap();
-        if !emit_upcasts {
-            // `pub mod` is a REAL module — unlike `impl` (which is not a module for path
-            // resolution purposes, so method signatures see the enclosing namespace module's
-            // glob import for free), paths like `Newtonsoft::Json::Foo`/`System::Object` used in
-            // a wrapper's signature need this module's OWN glob import reaching back to the
-            // enclosing namespace module's scope (which already has everything visible via ITS
-            // own `use super::super::super::*;`).
-            writeln!(out, "use super::*;").unwrap();
+            let trait_name = format!("{name}_Methods");
+            writeln!(out, "pub trait {trait_name} {{").unwrap();
+            for def in methods {
+                let Some(sig) = render_signature(def) else {
+                    continue;
+                };
+                writeln!(out, "{sig};").unwrap();
+            }
+            writeln!(out, "}}").unwrap();
+            writeln!(out, "impl {trait_name} for {name} {{").unwrap();
+            for def in methods {
+                // Trait impl: methods must NOT have an explicit `pub` (E0449 — visibility is
+                // inherited from the trait).
+                let Some(body) = render_wrapper(def, "") else {
+                    continue;
+                };
+                writeln!(out, "{body}").unwrap();
+            }
+            writeln!(out, "}}").unwrap();
         }
-        for def in methods {
-            // Resolve every param + return to a concrete Rust spelling. A `None` here
-            // means a `Skip` slipped through; drop the wrapper defensively.
-            let Some(body) = render_wrapper(def, self_ty) else {
-                continue;
-            };
-            writeln!(out, "{body}").unwrap();
-        }
-        writeln!(out, "}}").unwrap();
     }
 }
 
-/// Render the full `pub fn ...` text for one wrapper, or `None` if it can't be spelled.
-///
-/// `self_ty`: `None` renders the ORIGINAL `impl`-block form (`Self`/an implicit `self`
-/// receiver) — used when this becomes part of `mycorrhiza` itself. `Some(name)` renders a FREE
-/// function instead (the literal type name in place of `Self`, and an explicit `self_: {name}`
-/// parameter in place of `self`) — used for an external consumer, where an inherent `impl`
-/// would violate the orphan rule (see `export_methods`'s doc).
-fn render_wrapper(def: &DotNetMethodDef, self_ty: Option<&str>) -> Option<String> {
+/// Render a wrapper's SIGNATURE only (no body), for the `<name>_Methods` trait DECLARATION half
+/// of the external-consumer form (see `export_methods`'s doc) — `Self`/`self` throughout, same
+/// as `render_wrapper`, since a trait declaration doesn't need (and can't use) a concrete type
+/// name. Kept in sync with `render_wrapper`'s per-`MethodKind` shapes by construction; `None`
+/// under the exact same conditions (an unspellable param/return type).
+fn render_signature(def: &DotNetMethodDef) -> Option<String> {
+    let (params, ret) = &def.sig;
+    let mut param_tys: Vec<String> = Vec::new();
+    for p in params {
+        param_tys.push(p.rust_ty()?);
+    }
+    let argc = param_tys.len();
+    let arg_decls: String = (0..argc)
+        .map(|i| format!("a{}: {}", i + 1, param_tys[i]))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match def.kind {
+        MethodKind::Ctor => Some(format!("    fn new({arg_decls}) -> Self")),
+        MethodKind::Static => {
+            let ret_ty = ret.rust_ty()?;
+            let ret_sig = if ret_ty == "()" {
+                String::new()
+            } else {
+                format!(" -> {ret_ty}")
+            };
+            Some(format!("    fn {rn}({arg_decls}){ret_sig}", rn = def.rust_name))
+        }
+        MethodKind::Instance | MethodKind::Virtual => {
+            let ret_ty = ret.rust_ty()?;
+            let ret_sig = if ret_ty == "()" {
+                String::new()
+            } else {
+                format!(" -> {ret_ty}")
+            };
+            let self_decls = if argc == 0 {
+                "self".to_string()
+            } else {
+                format!("self, {arg_decls}")
+            };
+            Some(format!("    fn {rn}({self_decls}){ret_sig}", rn = def.rust_name))
+        }
+    }
+}
+
+/// Render the full `pub fn ...`/`fn ...` text for one wrapper, or `None` if it can't be spelled.
+/// `Self`/`self` throughout — valid whether this ends up inside an INHERENT `impl <name> { .. }`
+/// (`in_mycorrhiza`) or a TRAIT `impl <name>_Methods for <name> { .. }` (external consumer):
+/// both are `impl` blocks with a concrete `Self`, so both resolve `Self::ctorN`/`self.instanceN`
+/// etc. identically (those are mycorrhiza's own pre-existing blanket generic inherent methods on
+/// `RustcCLRInteropManagedClass<..>` — CALLING them has no orphan-rule concern at all; only
+/// DEFINING a new per-type inherent impl does, which is exactly what the trait form avoids).
+fn render_wrapper(def: &DotNetMethodDef, pub_kw: &str) -> Option<String> {
     let (params, ret) = &def.sig;
     // Param Rust types.
     let mut param_tys: Vec<String> = Vec::new();
@@ -777,21 +859,15 @@ fn render_wrapper(def: &DotNetMethodDef, self_ty: Option<&str>) -> Option<String
         .collect::<Vec<_>>()
         .join(", ");
 
-    // `Self`/`self` inside an `impl` block; the literal type name / an explicit `self_` param
-    // as a free fn (see `render_wrapper`'s doc).
-    let self_path = self_ty.unwrap_or("Self");
     match def.kind {
         MethodKind::Ctor => {
-            // impl form:  pub fn new(a1:A1,..) -> Self { Self::ctorN(a1,..) }
-            // free-fn form: pub fn new(a1:A1,..) -> {Ty} { {Ty}::ctorN(a1,..) }
-            let ret_ty = self_ty.unwrap_or("Self");
+            // pub fn new(a1:A1,..) -> Self { Self::ctorN(a1,..) }
             Some(format!(
-                "    pub fn new({arg_decls}) -> {ret_ty} {{ {self_path}::ctor{argc}({arg_names}) }}"
+                "    {pub_kw}fn new({arg_decls}) -> Self {{ Self::ctor{argc}({arg_names}) }}"
             ))
         }
         MethodKind::Static => {
-            // impl form:  pub fn name(a1:A1,..) -> R { Self::staticN::<"M", A1,.., R>(a1,..) }
-            // free-fn form: pub fn name(a1:A1,..) -> R { {Ty}::staticN::<"M", A1,.., R>(a1,..) }
+            // pub fn name(a1:A1,..) -> R { Self::staticN::<"M", A1,.., R>(a1,..) }
             let ret_ty = ret.rust_ty()?;
             let turbofish = call_turbofish(&def.dotnet_name, &param_tys, &ret_ty);
             let ret_sig = if ret_ty == "()" {
@@ -800,7 +876,7 @@ fn render_wrapper(def: &DotNetMethodDef, self_ty: Option<&str>) -> Option<String
                 format!(" -> {ret_ty}")
             };
             Some(format!(
-                "    pub fn {rn}({arg_decls}){ret_sig} {{ {self_path}::static{argc}::<{turbofish}>({arg_names}) }}",
+                "    {pub_kw}fn {rn}({arg_decls}){ret_sig} {{ Self::static{argc}::<{turbofish}>({arg_names}) }}",
                 rn = def.rust_name
             ))
         }
@@ -811,17 +887,10 @@ fn render_wrapper(def: &DotNetMethodDef, self_ty: Option<&str>) -> Option<String
             } else {
                 format!(" -> {ret_ty}")
             };
-            // impl form: an implicit `self` receiver. Free-fn form: an explicit `self_: {Ty}`
-            // first parameter (calls the SAME generic `instanceN`/`virt0` helper, unaffected —
-            // those are mycorrhiza's own blanket inherent impl over every `RustcCLRInterop-
-            // ManagedClass<..>` instantiation, so CALLING them from anywhere is always fine;
-            // only DEFINING a new per-type impl is the orphan-rule violation).
-            let recv = self_ty.map(|ty| format!("self_: {ty}")).unwrap_or_else(|| "self".to_string());
-            let recv_use = if self_ty.is_some() { "self_" } else { "self" };
             let self_decls = if argc == 0 {
-                recv
+                "self".to_string()
             } else {
-                format!("{recv}, {arg_decls}")
+                format!("self, {arg_decls}")
             };
             // virtual + 0 args -> virt0 (covers property getters get_X); otherwise a
             // non-virtual instanceN call (no virtN>0 helper exists).
@@ -834,7 +903,7 @@ fn render_wrapper(def: &DotNetMethodDef, self_ty: Option<&str>) -> Option<String
             // Turbofish: instance/virt helpers take <"M", Arg1.., Ret> (receiver implicit).
             let turbofish = call_turbofish(&def.dotnet_name, &param_tys, &ret_ty);
             Some(format!(
-                "    pub fn {rn}({self_decls}){ret_sig} {{ {recv_use}.{helper}::<{turbofish}>({arg_names}) }}",
+                "    {pub_kw}fn {rn}({self_decls}){ret_sig} {{ self.{helper}::<{turbofish}>({arg_names}) }}",
                 rn = def.rust_name
             ))
         }
