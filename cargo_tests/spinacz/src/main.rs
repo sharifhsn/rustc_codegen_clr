@@ -46,6 +46,11 @@ fn main() {
     let mut out = std::fs::File::create("out.rs").unwrap();
     let mut total_types: i32 = 0;
 
+    // The BCL set is closed under itself (every type any of these assemblies exposes is, in
+    // turn, declared in one of these same assemblies), so `known` is exactly `BCL_ASSEMBLIES` —
+    // see `reflect_assembly`'s doc for what this gates.
+    let known: Vec<String> = BCL_ASSEMBLIES.iter().map(|s| (*s).to_string()).collect();
+
     let asm_len = BCL_ASSEMBLIES.len();
     // NOTE: no `eprintln!`/`println!` for progress — std's `print*`/`eprint*` route through a
     // `dyn Write` + `core::fmt::write` path that faults under the current .NET PAL. The product is
@@ -57,9 +62,11 @@ fn main() {
         ai += 1;
         let mstr: MString = asm_name_str.into();
         let asm = Assembly::static1::<"Load", MString, Assembly>(mstr);
-        reflect_assembly(asm, &mut root_asm, &mut total_types);
+        reflect_assembly(asm, &mut root_asm, &mut total_types, &known);
     }
-    root_asm.export_root(&mut out);
+    // `true`: this output becomes `mycorrhiza/src/bindings.rs` verbatim, satisfying the orphan
+    // rule for the `impl From<Derived> for Base` upcasts (see `Namespace::export`'s doc).
+    root_asm.export_root(&mut out, true);
     out.flush().unwrap();
     // Final progress signal via the managed Console (the std print path faults under the PAL).
     mycorrhiza::system::console::Console::writeln_u64(total_types as u64);

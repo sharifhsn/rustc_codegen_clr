@@ -18,7 +18,21 @@ use std::io::Write;
 /// (how `asm` got loaded — `Assembly.Load(name)` for a BCL/already-resolvable assembly vs.
 /// `Assembly.LoadFrom(path)` for an arbitrary third-party dll) happens in the CALLER; this fn
 /// only needs the resulting `Assembly` handle.
-pub fn reflect_assembly(asm: Assembly, root_asm: &mut Namespace, total_types: &mut i32) {
+/// `known` is the set of assembly SIMPLE NAMES (e.g. `"System.Runtime"`) whose types are safe to
+/// reference in generated bindings — either because `reflect_assembly` has ALSO been (or will
+/// be) called on them this run, or because the consumer is known to already have them bound
+/// (see `known_declaring_assembly`'s doc). Any reference-type param/return/base-type whose
+/// DECLARING assembly is NOT in this set is `DType::Skip` — a method one of whose types we can't
+/// safely name is dropped whole, not emitted with a dangling path. This is what stops e.g.
+/// Newtonsoft.Json's rarer surface (its own optional `System.Xml`/`System.ComponentModel`/
+/// `System.Runtime.Serialization` touchpoints) from producing bindings that reference BCL types
+/// spinacz's own default `BCL_ASSEMBLIES` list never reflects.
+pub fn reflect_assembly(
+    asm: Assembly,
+    root_asm: &mut Namespace,
+    total_types: &mut i32,
+    known: &[String],
+) {
     let types = Assembly::virt0::<"GetTypes", RustcCLRInteropManagedArray<Type, 1>>(asm);
     let types_len = types.len();
     let mut idx = 0;
@@ -36,7 +50,11 @@ pub fn reflect_assembly(asm: Assembly, root_asm: &mut Namespace, total_types: &m
         }
         let tpe_asm = type_asm_string(tpe);
         let inherits = Type::virt0::<"get_BaseType", Type>(tpe);
-        let inherits: String = if inherits.is_null() {
+        // Same discipline as `DType::from_tpe`: a base type outside `known` has no resolvable
+        // path anywhere reachable, so the `impl From<X> for <base>` this feeds (see
+        // `Namespace::export`) would be dangling — drop it (no base-type upcast emitted for
+        // this type) rather than emit unresolvable code.
+        let inherits: String = if inherits.is_null() || (!known.is_empty() && !known_declaring_assembly(inherits, known)) {
             "".into()
         } else {
             mstring_to_string(Type::virt0::<"get_FullName", MString>(inherits))
@@ -45,7 +63,7 @@ pub fn reflect_assembly(asm: Assembly, root_asm: &mut Namespace, total_types: &m
         // Reflect the (public) methods + constructors of this type into callable wrapper
         // definitions. Anything we can't faithfully express (generics, ref/out, pointers,
         // varargs, unbound types, unsupported arity) is dropped inside `reflect_methods`.
-        let methods = reflect_methods(tpe, is_valuetype);
+        let methods = reflect_methods(tpe, is_valuetype, known);
         root_asm.add_tpe(
             DotNetClassDef {
                 asm: tpe_asm,
@@ -65,6 +83,12 @@ fn type_asm_string(tpe: Type) -> String {
     mstring_to_string(AssemblyName::virt0::<"get_Name", MString>(
         Assembly::virt0::<"GetName", AssemblyName>(Type::virt0::<"get_Assembly", Assembly>(tpe)),
     ))
+}
+/// True if `tpe`'s declaring assembly's simple name is in `known` (see `reflect_assembly`'s
+/// doc for what this gates).
+fn known_declaring_assembly(tpe: Type, known: &[String]) -> bool {
+    let asm = type_asm_string(tpe);
+    known.iter().any(|k| *k == asm)
 }
 fn mstring_to_string(mstr: MString) -> String {
     use mycorrhiza::system::runtime::interop_services::Marshal;
@@ -105,7 +129,7 @@ impl DType {
     /// Map a reflected `System.Type` to the Rust type used in a wrapper.
     ///
     /// Returns `Skip` for by-ref/out, pointer, generic, nested, and unbound types.
-    pub fn from_tpe(tpe: Type) -> Self {
+    pub fn from_tpe(tpe: Type, known: &[String]) -> Self {
         // ref/out (`T&`) and pointer (`T*`) params need the not-yet-built marshalling
         // bridge (WF-9) -> skip the whole method.
         if Type::virt0::<"get_IsByRef", bool>(tpe) || Type::virt0::<"get_IsPointer", bool>(tpe) {
@@ -142,6 +166,13 @@ impl DType {
         // Value types other than the recognised primitives have no generated alias
         // (the exporter only emits aliases for reference types), so we can't name them.
         if Type::virt0::<"get_IsValueType", bool>(tpe) {
+            return Self::Skip;
+        }
+        // A reference type whose declaring assembly we haven't reflected (this run OR a known
+        // consumer-side set) has no generated `pub type` alias anywhere reachable — naming it
+        // would emit a dangling path. Skip (drops the whole method), rather than gambling that
+        // some OTHER binding surface happens to already cover it.
+        if !known.is_empty() && !known_declaring_assembly(tpe, known) {
             return Self::Skip;
         }
         Self::Class(name.replace('.', "::"))
@@ -208,7 +239,7 @@ struct DotNetClassDef {
 /// Enumerate the public, declared methods + constructors of `tpe` and lower the ones we
 /// can faithfully wrap into `DotNetMethodDef`s. Value types currently get no wrappers
 /// (instance calls would need a by-ref receiver shape we don't emit yet).
-fn reflect_methods(tpe: Type, is_valuetype: bool) -> Vec<DotNetMethodDef> {
+fn reflect_methods(tpe: Type, is_valuetype: bool, known: &[String]) -> Vec<DotNetMethodDef> {
     // METHOD-WRAPPER GATE (residual WF-3 codegen blocker):
     //
     // Emitting per-method/constructor wrappers requires the `reflect_params` path, which calls
@@ -260,7 +291,7 @@ fn reflect_methods(tpe: Type, is_valuetype: bool) -> Vec<DotNetMethodDef> {
         if !decl.equality(tpe) {
             continue;
         }
-        reflect_one_method(mi, &mut out, &mut seen);
+        reflect_one_method(mi, &mut out, &mut seen, known);
     }
 
     // --- Constructors -------------------------------------------------------
@@ -277,7 +308,7 @@ fn reflect_methods(tpe: Type, is_valuetype: bool) -> Vec<DotNetMethodDef> {
         if !decl.equality(tpe) {
             continue;
         }
-        reflect_one_ctor(ci, &mut out, &mut seen);
+        reflect_one_ctor(ci, &mut out, &mut seen, known);
     }
     out
 }
@@ -307,6 +338,7 @@ fn reflect_one_method(
     mi: MethodInfo,
     out: &mut Vec<DotNetMethodDef>,
     seen: &mut Vec<String>,
+    known: &[String],
 ) {
     // Generic methods (own type params) need the generic bridge (WF-9) -> skip.
     if MethodInfo::virt0::<"get_IsGenericMethod", bool>(mi)
@@ -325,15 +357,17 @@ fn reflect_one_method(
     let is_abstract = MethodInfo::virt0::<"get_IsAbstract", bool>(mi);
     let dotnet_name = mstring_to_string(MethodInfo::virt0::<"get_Name", MString>(mi));
 
-    let (params, ok) = reflect_params(MethodInfo::instance0::<
-        "GetParameters",
-        RustcCLRInteropManagedArray<ParameterInfo, 1>,
-    >(mi));
+    let (params, ok) = reflect_params(
+        MethodInfo::instance0::<"GetParameters", RustcCLRInteropManagedArray<ParameterInfo, 1>>(
+            mi,
+        ),
+        known,
+    );
     if !ok {
         return;
     }
     let ret_tpe = MethodInfo::virt0::<"get_ReturnType", Type>(mi);
-    let ret = DType::from_tpe(ret_tpe);
+    let ret = DType::from_tpe(ret_tpe, known);
     if matches!(ret, DType::Skip) {
         return;
     }
@@ -378,6 +412,7 @@ fn reflect_one_ctor(
     ci: ConstructorInfo,
     out: &mut Vec<DotNetMethodDef>,
     seen: &mut Vec<String>,
+    known: &[String],
 ) {
     // Skip the static type initializer (`.cctor`), which is static.
     if ConstructorInfo::virt0::<"get_IsStatic", bool>(ci) {
@@ -385,10 +420,12 @@ fn reflect_one_ctor(
     }
     // (No `get_CallingConvention` varargs check — see the note in `reflect_one_method`; the getter
     // returns the unbound `CallingConventions` enum.)
-    let (params, ok) = reflect_params(ConstructorInfo::instance0::<
-        "GetParameters",
-        RustcCLRInteropManagedArray<ParameterInfo, 1>,
-    >(ci));
+    let (params, ok) = reflect_params(
+        ConstructorInfo::instance0::<"GetParameters", RustcCLRInteropManagedArray<ParameterInfo, 1>>(
+            ci,
+        ),
+        known,
+    );
     if !ok {
         return;
     }
@@ -414,7 +451,10 @@ fn reflect_one_ctor(
 /// Returns `(Vec, bool)` rather than `Option<Vec<DType>>`: extracting a `Vec` out of a
 /// niche-optimized `Option<Vec<_>>` in the caller made the codegen emit IL the .NET JIT rejected
 /// as "Bad IL format". A plain tuple sidesteps the niche.
-fn reflect_params(params: RustcCLRInteropManagedArray<ParameterInfo, 1>) -> (Vec<DType>, bool) {
+fn reflect_params(
+    params: RustcCLRInteropManagedArray<ParameterInfo, 1>,
+    known: &[String],
+) -> (Vec<DType>, bool) {
     let n = params.len();
     let mut out = Vec::new();
     let mut i = 0;
@@ -423,7 +463,7 @@ fn reflect_params(params: RustcCLRInteropManagedArray<ParameterInfo, 1>) -> (Vec
         i += 1;
         let ptpe = ParameterInfo::virt0::<"get_ParameterType", Type>(pi);
         // `out`/`in`/`ref` is encoded as a by-ref ParameterType; `from_tpe` skips those.
-        let dt = DType::from_tpe(ptpe);
+        let dt = DType::from_tpe(ptpe, known);
         if matches!(dt, DType::Skip) {
             return (Vec::new(), false);
         }
@@ -594,10 +634,20 @@ impl Namespace {
             depth,
         }
     }
-    pub fn export(&self, out: &mut impl Write) {
+    /// `emit_upcasts`: whether to emit `impl From<Derived> for Base` blocks. This is a Rust
+    /// ORPHAN-RULE call, not a style choice: `RustcCLRInteropManagedClass<..>` is defined in
+    /// `mycorrhiza`, so `impl From<X> for Y` (both X and Y being instantiations of that same
+    /// foreign struct) only satisfies coherence when the `impl` is textually written INSIDE the
+    /// `mycorrhiza` crate itself (spinacz's own BCL output becomes `mycorrhiza/src/bindings.rs`
+    /// verbatim — true there). A third-party package's bindings live in a SEPARATE consumer
+    /// crate (see `tools/cargo-dotnet/src/nuget.rs`), where the same `impl` is an E0117 orphan
+    /// violation — `false` there; base-type access still works via
+    /// `rustc_clr_interop_managed_checked_cast::<Base, Derived>(v)` directly, just without the
+    /// `.into()` sugar.
+    pub fn export(&self, out: &mut impl Write, emit_upcasts: bool) {
         writeln!(out, "pub mod {name}{{", name = self.name).unwrap();
         for (_, inner) in &self.inner {
-            inner.export(out);
+            inner.export(out, emit_upcasts);
         }
         for tpe in &self.types {
             if !tpe.is_valuetype {
@@ -614,7 +664,8 @@ impl Namespace {
                     );
                 }
 
-                if !tpe.inherits.is_empty()
+                if emit_upcasts
+                    && !tpe.inherits.is_empty()
                     && !(tpe.inherits.contains("`")
                         || tpe.inherits.contains("+")
                         || tpe.inherits.contains("<"))
@@ -627,7 +678,7 @@ impl Namespace {
                     .unwrap();
                 }
 
-                Self::export_methods(out, name, &tpe.methods);
+                Self::export_methods(out, name, &tpe.methods, emit_upcasts);
             }
         }
         writeln!(out, "}}").unwrap();
@@ -637,31 +688,61 @@ impl Namespace {
     /// begins directly with the top-level namespaces (`pub mod System`, `pub mod Microsoft`, …),
     /// matching the existing bindings.rs layout. The root never holds types directly (every BCL
     /// type has at least one namespace segment), but we still emit any just in case.
-    pub fn export_root(&self, out: &mut impl Write) {
+    ///
+    /// `emit_upcasts`: see `export`'s doc.
+    pub fn export_root(&self, out: &mut impl Write, emit_upcasts: bool) {
         for (_, inner) in &self.inner {
-            inner.export(out);
+            inner.export(out, emit_upcasts);
         }
         for tpe in &self.types {
             if !tpe.is_valuetype {
                 let name = tpe.full_name.split('.').last().unwrap();
                 writeln!(out,"pub type {name} =  mycorrhiza::intrinsics::RustcCLRInteropManagedClass<{tpe_asm:?},{full_name:?}>;",tpe_asm = tpe.asm,full_name = tpe.full_name ).unwrap();
-                Self::export_methods(out, name, &tpe.methods);
+                Self::export_methods(out, name, &tpe.methods, emit_upcasts);
             }
         }
     }
 
-    /// Emit an inherent `impl <name> { .. }` block of callable wrappers, mirroring the
-    /// hand-written `staticN`/`instanceN`/`virt0`/`ctorN` helpers in
-    /// `mycorrhiza::intrinsics`.
-    fn export_methods(out: &mut impl Write, name: &str, methods: &[DotNetMethodDef]) {
+    /// Emit the callable wrappers for `name`, either as an inherent `impl <name> { .. }` block
+    /// (mirroring the hand-written `staticN`/`instanceN`/`virt0`/`ctorN` helpers in
+    /// `mycorrhiza::intrinsics` — `emit_upcasts == true`, i.e. this output lives INSIDE
+    /// `mycorrhiza`) or, when generating for an EXTERNAL consumer crate, as a
+    /// `pub mod <name>_methods { .. }` of FREE functions instead. The latter is not a style
+    /// choice: an inherent `impl` on a `pub type` alias of a foreign generic struct (any
+    /// `RustcCLRInteropManagedClass<..>` instantiation) is an E0116 orphan violation outside
+    /// `mycorrhiza` — no const-generic parameterization changes that, since orphan rules look
+    /// through type aliases to the concrete type, and const generics don't count as a "local
+    /// type" for the usual blanket-impl exception. Free functions have NO such restriction —
+    /// BUT the wrapping module can't reuse the bare `<name>` either: modules and type aliases
+    /// share Rust's TYPE namespace (unlike a module vs. a function, which don't collide), so
+    /// `pub type Foo` + `pub mod Foo` in the same scope is an E0428 "defined multiple times",
+    /// not the "separate namespaces, no clash" case an `impl` would be. Hence the `_methods`
+    /// suffix — `<name>_methods::method(..)` instead of `<name>::method(..)`, the one place the
+    /// external-consumer call syntax genuinely differs from `mycorrhiza`'s own bindings.
+    fn export_methods(out: &mut impl Write, name: &str, methods: &[DotNetMethodDef], emit_upcasts: bool) {
         if methods.is_empty() {
             return;
         }
-        writeln!(out, "impl {name} {{").unwrap();
+        let self_ty = if emit_upcasts { None } else { Some(name) };
+        let (keyword, mod_name) = if emit_upcasts {
+            ("impl".to_string(), name.to_string())
+        } else {
+            ("pub mod".to_string(), format!("{name}_methods"))
+        };
+        writeln!(out, "{keyword} {mod_name} {{").unwrap();
+        if !emit_upcasts {
+            // `pub mod` is a REAL module — unlike `impl` (which is not a module for path
+            // resolution purposes, so method signatures see the enclosing namespace module's
+            // glob import for free), paths like `Newtonsoft::Json::Foo`/`System::Object` used in
+            // a wrapper's signature need this module's OWN glob import reaching back to the
+            // enclosing namespace module's scope (which already has everything visible via ITS
+            // own `use super::super::super::*;`).
+            writeln!(out, "use super::*;").unwrap();
+        }
         for def in methods {
             // Resolve every param + return to a concrete Rust spelling. A `None` here
             // means a `Skip` slipped through; drop the wrapper defensively.
-            let Some(body) = render_wrapper(def) else {
+            let Some(body) = render_wrapper(def, self_ty) else {
                 continue;
             };
             writeln!(out, "{body}").unwrap();
@@ -671,7 +752,13 @@ impl Namespace {
 }
 
 /// Render the full `pub fn ...` text for one wrapper, or `None` if it can't be spelled.
-fn render_wrapper(def: &DotNetMethodDef) -> Option<String> {
+///
+/// `self_ty`: `None` renders the ORIGINAL `impl`-block form (`Self`/an implicit `self`
+/// receiver) — used when this becomes part of `mycorrhiza` itself. `Some(name)` renders a FREE
+/// function instead (the literal type name in place of `Self`, and an explicit `self_: {name}`
+/// parameter in place of `self`) — used for an external consumer, where an inherent `impl`
+/// would violate the orphan rule (see `export_methods`'s doc).
+fn render_wrapper(def: &DotNetMethodDef, self_ty: Option<&str>) -> Option<String> {
     let (params, ret) = &def.sig;
     // Param Rust types.
     let mut param_tys: Vec<String> = Vec::new();
@@ -690,15 +777,21 @@ fn render_wrapper(def: &DotNetMethodDef) -> Option<String> {
         .collect::<Vec<_>>()
         .join(", ");
 
+    // `Self`/`self` inside an `impl` block; the literal type name / an explicit `self_` param
+    // as a free fn (see `render_wrapper`'s doc).
+    let self_path = self_ty.unwrap_or("Self");
     match def.kind {
         MethodKind::Ctor => {
-            // pub fn new(a1:A1,..) -> Self { Self::ctorN(a1,..) }
+            // impl form:  pub fn new(a1:A1,..) -> Self { Self::ctorN(a1,..) }
+            // free-fn form: pub fn new(a1:A1,..) -> {Ty} { {Ty}::ctorN(a1,..) }
+            let ret_ty = self_ty.unwrap_or("Self");
             Some(format!(
-                "    pub fn new({arg_decls}) -> Self {{ Self::ctor{argc}({arg_names}) }}"
+                "    pub fn new({arg_decls}) -> {ret_ty} {{ {self_path}::ctor{argc}({arg_names}) }}"
             ))
         }
         MethodKind::Static => {
-            // pub fn name(a1:A1,..) -> R { Self::staticN::<"M", A1,.., R>(a1,..) }
+            // impl form:  pub fn name(a1:A1,..) -> R { Self::staticN::<"M", A1,.., R>(a1,..) }
+            // free-fn form: pub fn name(a1:A1,..) -> R { {Ty}::staticN::<"M", A1,.., R>(a1,..) }
             let ret_ty = ret.rust_ty()?;
             let turbofish = call_turbofish(&def.dotnet_name, &param_tys, &ret_ty);
             let ret_sig = if ret_ty == "()" {
@@ -707,7 +800,7 @@ fn render_wrapper(def: &DotNetMethodDef) -> Option<String> {
                 format!(" -> {ret_ty}")
             };
             Some(format!(
-                "    pub fn {rn}({arg_decls}){ret_sig} {{ Self::static{argc}::<{turbofish}>({arg_names}) }}",
+                "    pub fn {rn}({arg_decls}){ret_sig} {{ {self_path}::static{argc}::<{turbofish}>({arg_names}) }}",
                 rn = def.rust_name
             ))
         }
@@ -718,10 +811,17 @@ fn render_wrapper(def: &DotNetMethodDef) -> Option<String> {
             } else {
                 format!(" -> {ret_ty}")
             };
+            // impl form: an implicit `self` receiver. Free-fn form: an explicit `self_: {Ty}`
+            // first parameter (calls the SAME generic `instanceN`/`virt0` helper, unaffected —
+            // those are mycorrhiza's own blanket inherent impl over every `RustcCLRInterop-
+            // ManagedClass<..>` instantiation, so CALLING them from anywhere is always fine;
+            // only DEFINING a new per-type impl is the orphan-rule violation).
+            let recv = self_ty.map(|ty| format!("self_: {ty}")).unwrap_or_else(|| "self".to_string());
+            let recv_use = if self_ty.is_some() { "self_" } else { "self" };
             let self_decls = if argc == 0 {
-                "self".to_string()
+                recv
             } else {
-                format!("self, {arg_decls}")
+                format!("{recv}, {arg_decls}")
             };
             // virtual + 0 args -> virt0 (covers property getters get_X); otherwise a
             // non-virtual instanceN call (no virtN>0 helper exists).
@@ -734,7 +834,7 @@ fn render_wrapper(def: &DotNetMethodDef) -> Option<String> {
             // Turbofish: instance/virt helpers take <"M", Arg1.., Ret> (receiver implicit).
             let turbofish = call_turbofish(&def.dotnet_name, &param_tys, &ret_ty);
             Some(format!(
-                "    pub fn {rn}({self_decls}){ret_sig} {{ self.{helper}::<{turbofish}>({arg_names}) }}",
+                "    pub fn {rn}({self_decls}){ret_sig} {{ {recv_use}.{helper}::<{turbofish}>({arg_names}) }}",
                 rn = def.rust_name
             ))
         }

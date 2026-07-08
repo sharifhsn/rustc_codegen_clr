@@ -57,6 +57,10 @@ pub enum Cmd {
     /// that has the referenced Rust `<RustCrate>` compiled in (`dotnet publish
     /// -p:PublishAot=true`). See `docs/PERF_GUIDANCE.md` §5 for the proven recipe this wraps.
     Publish(PublishArgs),
+    /// Fetch a NuGet package and generate Rust bindings for its public API (reflection-based,
+    /// the same mechanism spinacz uses for the BCL), then wire the package's .dll into this
+    /// crate's runtime output. Consuming the generated bindings needs no further ceremony.
+    AddNuget(AddNugetArgs),
 }
 
 /// Shared args for `build` and `run`. Declaration ORDER matters: the modelled flags
@@ -228,6 +232,24 @@ pub struct PackArgs {
     /// `DOTNET_VERSION` + ilasm and the NuGet TFM (`lib/<tfm>/`), which must agree with the dll.
     #[arg(long, value_name = "8|9", default_value = "8", env = "DOTNET_VERSION")]
     pub dotnet: String,
+}
+
+#[derive(clap::Args)]
+pub struct AddNugetArgs {
+    /// The NuGet package id, e.g. `Newtonsoft.Json`.
+    pub id: String,
+    /// The exact package version, e.g. `13.0.3`. NuGet's version-range resolution is not
+    /// supported — pin an exact version (matches the reproducibility the rest of this tool's
+    /// vendoring/overlay mechanisms assume).
+    pub version: String,
+    /// The consumer crate dir to wire the generated bindings + runtime asset into (default `.`).
+    pub path: Option<PathBuf>,
+    /// Re-fetch and re-generate even if this exact (id, version) is already cached.
+    #[arg(long)]
+    pub force: bool,
+    /// Unfiltered build log for the bindgen step.
+    #[arg(short, long)]
+    pub verbose: bool,
 }
 
 #[derive(clap::Args)]

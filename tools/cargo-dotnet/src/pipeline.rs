@@ -15,7 +15,7 @@ use crate::artifact::Artifact;
 use crate::cli::BuildArgs;
 use crate::context::Context;
 use crate::mode::Backend;
-use crate::{artifact, buildstd, docker, overlays, palinject, run, xmldoc};
+use crate::{artifact, buildstd, docker, nuget, overlays, palinject, run, xmldoc};
 
 /// Run `build` or `run`. `is_run` selects the run-the-apphost behaviour.
 pub fn run(args: &BuildArgs, is_run: bool) -> Result<i32> {
@@ -50,6 +50,17 @@ fn run_native(ctx: &Context, prog_args: &[String]) -> Result<i32> {
     let json = buildstd::build(ctx)?;
     // 4. Locate the produced artifact.
     let art = artifact::locate(&json, ctx)?;
+    // 4.5. Copy any `add-nuget`-fetched runtime dlls alongside the output (a no-op for crates
+    // that never ran `add-nuget` — see `nuget::copy_runtime_assets`'s doc for why this is the
+    // only wiring a third-party NuGet dependency needs at consumer build time).
+    let out_dir = match &art {
+        Artifact::Executable(exe) => exe.parent(),
+        Artifact::Library { so, .. } => so.parent(),
+        Artifact::None => None,
+    };
+    if let Some(out_dir) = out_dir {
+        nuget::copy_runtime_assets(&ctx.crate_dir, out_dir)?;
+    }
     // 5. Run it, or report.
     if ctx.flags.run {
         run::run(&art, prog_args, ctx)

@@ -18,6 +18,7 @@ mod doctor;
 mod docker;
 mod host;
 mod mode;
+mod nuget;
 mod overlays;
 mod pack;
 mod palinject;
@@ -68,6 +69,7 @@ fn main() -> ExitCode {
         Cmd::Setup(args) => setup::run(args),
         Cmd::Pack(args) => pack::run(args),
         Cmd::Publish(args) => publish::run(args),
+        Cmd::AddNuget(args) => nuget::run(args),
     };
 
     match result {
@@ -105,6 +107,11 @@ fn split_program_args(argv: &mut Vec<OsString>) -> Vec<String> {
 fn inject_prog_args(cmd: &mut Cmd, prog_args: Vec<String>) {
     match cmd {
         Cmd::Build(args) | Cmd::Run(args) | Cmd::Test(args) => args.prog_args = prog_args,
-        Cmd::New(_) | Cmd::Doctor(_) | Cmd::Setup(_) | Cmd::Pack(_) | Cmd::Publish(_) => {}
+        Cmd::New(_)
+        | Cmd::Doctor(_)
+        | Cmd::Setup(_)
+        | Cmd::Pack(_)
+        | Cmd::Publish(_)
+        | Cmd::AddNuget(_) => {}
     }
 }
