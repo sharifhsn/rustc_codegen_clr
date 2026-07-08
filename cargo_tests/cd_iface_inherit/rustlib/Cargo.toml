@@ -1,0 +1,21 @@
+[package]
+name = "cd_iface_inherit"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# A .NET class library: `cargo dotnet build` emits `cd_iface_inherit.dll` proving INTERFACE
+# INHERITANCE — `#[dotnet_interface] trait IPet: IAnimal + ILoud` emits `InterfaceImpl` rows on
+# IPet's own interface TypeDef (§II.10.1.3), so C# sees `interface IPet : IAnimal, ILoud`. Under
+# the default DIRECT_PE=1 path the hand-rolled PE writer emits everything directly (no ilasm).
+crate-type = ["cdylib"]
+
+[dependencies]
+mycorrhiza = { path = "../../../mycorrhiza" }
+dotnet_macros = { path = "../../../dotnet_macros" }
+
+# Under the repo workspace root -> needs a bare `[workspace]` (the cd_pure footgun).
+[workspace]
+
+[profile.release.build-override]
+codegen-units = 1

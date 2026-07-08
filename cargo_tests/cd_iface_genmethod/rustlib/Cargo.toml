@@ -1,0 +1,23 @@
+[package]
+name = "cd_iface_genmethod"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# A .NET class library: `cargo dotnet build` emits `cd_iface_genmethod.dll` containing genuine
+# GENERIC METHOD DEFINITIONS on interfaces (`T Echo<T>(T value)` — SIG_GENERIC sig blobs +
+# method-owned ECMA-335 GenericParam rows) synthesized from Rust `fn Echo<T>(&self, …)` trait
+# methods. Under the default DIRECT_PE=1 path the hand-rolled PE writer emits everything
+# directly (no ilasm). The METHOD-generic dual of `cd_iface_generic`, which defines a generic
+# INTERFACE (`IBox<T>` — type-owned GenericParam rows).
+crate-type = ["cdylib"]
+
+[dependencies]
+mycorrhiza = { path = "../../../mycorrhiza" }
+dotnet_macros = { path = "../../../dotnet_macros" }
+
+# Under the repo workspace root -> needs a bare `[workspace]` (the cd_pure footgun).
+[workspace]
+
+[profile.release.build-override]
+codegen-units = 1

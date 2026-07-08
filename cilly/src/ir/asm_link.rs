@@ -642,6 +642,26 @@ impl Assembly {
         if def.is_abstract() {
             translated = translated.with_abstract();
         }
+        // `[out]` param flags are plain data (no interned handles to translate) but MUST be
+        // re-applied here: this field-wise reconstruction would otherwise silently drop them
+        // exactly when a `.bc` crosses the linker — i.e. in every real build (the cd_interface
+        // `IsOut` reflection check exists to catch this).
+        if !def.out_params().is_empty() {
+            translated = translated.with_out_params(def.out_params().to_vec());
+        }
+        // Generic-method-definition parameter NAMES (`MethodDef::generic_params`): interned
+        // strings, re-alloc'd into the target assembly. Same silent-drop hazard as `out_params`
+        // just above — this field-wise reconstruction runs in every real build (the `.bc` crosses
+        // the linker), so forgetting it here would strip `SIG_GENERIC`/`GenericParam` rows from
+        // every linked output while unit tests (no linker) kept passing.
+        if !def.generic_params().is_empty() {
+            let names = def
+                .generic_params()
+                .iter()
+                .map(|n| self.alloc_string(source[*n].as_ref()))
+                .collect();
+            translated = translated.with_generic_params(names);
+        }
         translated
     }
     pub(crate) fn translate_class_def(&mut self, source: &Assembly, def: &ClassDef) -> ClassDef {
@@ -710,6 +730,36 @@ impl Assembly {
             let remove = self.translate_method_ref(source, &source[ev.remove()]);
             let remove = self.alloc_methodref(remove);
             translated.add_event(super::class::EventDef::new(name, delegate, add, remove));
+        }
+        // Carry declared properties across the assembly boundary (same silent-drop hazard as
+        // `events`/`out_params`: this field-wise reconstruction runs in every real build — a
+        // `.bc` always crosses the linker — so forgetting it here would strip every
+        // Property/PropertyMap/MethodSemantics row from linked output while unit tests, which
+        // have no linker, kept passing).
+        for prop in def.properties() {
+            let name = self.alloc_string(source[prop.name()].as_ref());
+            let tpe = self.translate_type(source, prop.tpe());
+            let getter = prop.getter().map(|g| {
+                let mref = self.translate_method_ref(source, &source[g]);
+                self.alloc_methodref(mref)
+            });
+            let setter = prop.setter().map(|s| {
+                let mref = self.translate_method_ref(source, &source[s]);
+                self.alloc_methodref(mref)
+            });
+            translated.add_property(super::class::PropertyDef::new(name, tpe, getter, setter));
+        }
+        // Carry a generic type DEFINITION's declared parameter names across the assembly
+        // boundary (re-interned into THIS assembly's string heap). Must run BEFORE `ref_to()`
+        // below: a nonzero-arity def without its names fails `ref_to`'s consistency assert —
+        // deliberately loud, so a missed translation can never silently drop `GenericParam` rows.
+        if !def.generic_names().is_empty() {
+            let names = def
+                .generic_names()
+                .iter()
+                .map(|n| self.alloc_string(source[*n].as_ref()))
+                .collect();
+            translated = translated.with_type_generic_names(names);
         }
         let class_ref = self.alloc_class_ref(translated.ref_to());
         let (defs_mut, _) = self.class_defs_mut_strings();

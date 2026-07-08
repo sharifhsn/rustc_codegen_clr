@@ -27,3 +27,22 @@ pub trait ISpeaker {
     /// C#: `string Describe();` — a MANAGED (`System.String`) return type, not just primitives.
     fn Describe(&self) -> MString;
 }
+
+/// `ref`/`out` parameters: a `&mut T` (thin, sized `T`) non-receiver parameter maps to a managed
+/// byref (`ELEMENT_TYPE_BYREF` — C# `ref T`), and `#[dotnet_out]` additionally stamps
+/// `ParamAttributes.Out` (0x0002) on its `Param` row so C# sees `out T`. The C# `Cell : IRefCell`
+/// implementor compiling with `ref`/`out` keywords (instead of demanding unsafe `int*`) is the
+/// first proof; writes through the byref observed by the caller are the runtime proof.
+#[dotnet_interface]
+pub trait IRefCell {
+    /// C#: `void Fill(ref int slot);` — plain `&mut T` => `ref T` (byref, Param Flags == 0).
+    fn Fill(&self, slot: &mut i32);
+    /// C#: `void FillOut(out int slot);` — same byref, plus `ParamAttributes.Out` => `out T`.
+    fn FillOut(&self, #[dotnet_out] slot: &mut i32);
+    /// C#: `int AddInto(int a, ref int acc);` — by-value and byref params mix freely.
+    fn AddInto(&self, a: i32, acc: &mut i32) -> i32;
+    /// C#: `static abstract void Reset(ref int v);` — byref on a `static abstract` member too
+    /// (the C# implementor writes `public static void Reset(ref int v)`; dispatched generically
+    /// via `T.Reset(ref v)` under `where T : IRefCell`).
+    fn Reset(v: &mut i32);
+}

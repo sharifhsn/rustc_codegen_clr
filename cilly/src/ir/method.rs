@@ -194,6 +194,32 @@ pub struct MethodDef {
     /// before ever looking at `implementation`). `false` for every method that existed before this
     /// field: additive, no existing caller sets it.
     is_abstract: bool,
+    /// 1-based `Param` **Sequence** numbers (§II.22.33 — the receiver-stripped, caller-visible
+    /// argument positions) whose `Param` row gets `ParamAttributes.Out` (0x0002, §II.23.1.13).
+    /// Combined with an `ELEMENT_TYPE_BYREF` parameter type in the signature blob this is exactly
+    /// what makes C# surface the parameter as `out T` instead of `ref T` (a BYREF param with
+    /// `Flags == 0` reads back as `ref`; csc sets no other bit and no modreq for `out`). Used by
+    /// `#[dotnet_interface]`'s `#[dotnet_out]` parameter marker; empty for every method that
+    /// existed before this field (additive — like `overrides`/`is_abstract`, `new()` never sets
+    /// it, only `with_out_params`). NOTE: changing this struct changes the serialized (postcard)
+    /// `.bc` IR format — rebuild dylib + linker together and `cargo clean` consumers (the
+    /// build-std fingerprint trap).
+    out_params: Vec<u16>,
+    /// The DECLARED generic type-parameter names of a generic method DEFINITION (`T Echo<T>(T
+    /// value)` on an interface, from `#[dotnet_interface]`'s `fn Echo<T>(&self, value: T) -> T`),
+    /// in declaration order — arity = `len()`. Non-empty means the PE writer stamps the method's
+    /// signature blob with `SIG_GENERIC` (0x10) + a compressed `GenParamCount` (§II.23.2.1) and
+    /// emits one method-owned `GenericParam` row (§II.22.20, coded `TypeOrMethodDef` owner tag 1)
+    /// per name; the signature's `Type::PlatformGeneric(N, GenericKind::CallGeneric)` markers
+    /// (`ELEMENT_TYPE_MVAR`, `!!N`) must all satisfy `N < len()` (asserted in `export.rs` Pass 3).
+    /// The METHOD-definition analogue of `ClassDef::generic_names` (a generic TYPE definition's
+    /// parameter names) — and a different axis from `MethodRef::generics`, which is a CALL SITE's
+    /// concrete instantiation arguments (`MethodSpec`). Empty for every method that existed
+    /// before this field (additive — like `overrides`/`out_params`, `new()` never sets it, only
+    /// `with_generic_params`). NOTE: changing this struct changes the serialized (postcard) `.bc`
+    /// IR format — rebuild dylib + linker together and `cargo clean` consumers (the build-std
+    /// fingerprint trap).
+    generic_params: Vec<Interned<IString>>,
 }
 
 impl MethodDef {
@@ -264,6 +290,8 @@ impl MethodDef {
             implementation,
             overrides: None,
             is_abstract: false,
+            out_params: vec![],
+            generic_params: vec![],
         }
     }
 
@@ -304,6 +332,44 @@ impl MethodDef {
     #[must_use]
     pub fn is_abstract(&self) -> bool {
         self.is_abstract
+    }
+
+    /// Marks the given 1-based, receiver-stripped parameter Sequence numbers as `[out]`
+    /// (`ParamAttributes.Out`, §II.23.1.13) — see the `out_params` field's doc. The caller is
+    /// responsible for each named position's signature type being `Type::Ref` (BYREF): `Out` on a
+    /// non-BYREF param is metadata C# cannot consume as `out` (the comptime layer validates this
+    /// before calling — `src/comptime.rs`'s abstract-member loop).
+    #[must_use]
+    pub fn with_out_params(mut self, out_params: Vec<u16>) -> Self {
+        self.out_params = out_params;
+        self
+    }
+
+    /// The 1-based, receiver-stripped parameter Sequence numbers flagged `[out]` — empty for
+    /// almost every method (see the `out_params` field's doc).
+    #[must_use]
+    pub fn out_params(&self) -> &[u16] {
+        &self.out_params
+    }
+
+    /// Declares this method as a generic method DEFINITION with the given ordered type-parameter
+    /// names (see the `generic_params` field's doc). The caller is responsible for every
+    /// `Type::PlatformGeneric(N, GenericKind::CallGeneric)` (`!!N`) marker in the signature
+    /// satisfying `N < names.len()` — an out-of-range `ELEMENT_TYPE_MVAR`, or a `GenParamCount`
+    /// that disagrees with the emitted `GenericParam` row count, is exactly the malformed shape
+    /// CoreCLR's type loader rejects at load time (`export.rs` Pass 3 asserts this loudly at
+    /// export instead).
+    #[must_use]
+    pub fn with_generic_params(mut self, names: Vec<Interned<IString>>) -> Self {
+        self.generic_params = names;
+        self
+    }
+
+    /// The declared generic type-parameter names of a generic method definition, in declaration
+    /// order — empty for every non-generic method (see the `generic_params` field's doc).
+    #[must_use]
+    pub fn generic_params(&self) -> &[Interned<IString>] {
+        &self.generic_params
     }
 
     #[must_use]

@@ -1,0 +1,21 @@
+[package]
+name = "cd_dim"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# A .NET class library: `cargo dotnet build` emits `cd_dim.dll` containing an interface with
+# DEFAULT INTERFACE METHODS (DIM, CoreCLR 3.0+) synthesized from a Rust trait's default bodies via
+# `#[dotnet_interface]`. Under the default DIRECT_PE=1 path the hand-rolled PE writer emits the
+# virtual, non-abstract MethodDefs (RVA != 0) on the interface TypeDef directly (no ilasm).
+crate-type = ["cdylib"]
+
+[dependencies]
+mycorrhiza = { path = "../../../mycorrhiza" }
+dotnet_macros = { path = "../../../dotnet_macros" }
+
+# Under the repo workspace root -> needs a bare `[workspace]` (the cd_pure footgun).
+[workspace]
+
+[profile.release.build-override]
+codegen-units = 1

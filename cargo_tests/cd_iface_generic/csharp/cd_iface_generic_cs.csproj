@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RustDotnetVersion Condition="'$(RustDotnetVersion)'==''">8</RustDotnetVersion>
+    <TargetFramework>net$(RustDotnetVersion).0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>cd_iface_generic_cs</AssemblyName>
+  </PropertyGroup>
+
+  <!-- AUTO-BUILD the Rust crate and reference its `cd_iface_generic.dll` (which DEFINES the
+       generic IBox<T> interface synthesized from a Rust trait via #[dotnet_interface]). -->
+  <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
+  <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'=='' and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+  <Import Project="$(MSBuildThisFileDirectory)../../../msbuild/RustDotnet.targets"
+          Condition="!Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets') and !Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+
+  <ItemGroup>
+    <RustCrate Include="../rustlib" />
+  </ItemGroup>
+</Project>

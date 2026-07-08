@@ -240,6 +240,71 @@ design decision before any code is written).
 > with `Parrot.GetInterfaces()` listing it — zero `ilasm`. Nothing remains for these three features
 > at the shipped scope (deeper items — base-ctor-chaining for overrides, thread-safe event bodies,
 > default interface methods — stay explicitly out of scope, see each finding).
+>
+> **UPDATE (2026-07-07, ref/out parameters)** — a `#[dotnet_interface]` member's `&mut T`
+> (thin, sized `T`) parameter now maps to a managed byref (`ELEMENT_TYPE_BYREF` → C# `ref T`)
+> instead of the frontend's uniform `T*` lowering, and `#[dotnet_out]` on such a parameter stamps
+> `ParamAttributes.Out` (0x0002) on its `Param` row (→ C# `out T`). Implemented as a TARGETED
+> comptime-layer rewrite of the sig-carrier's lowered signature (`byref_interface_sig` in
+> `src/comptime.rs`, driven by the carrier's Rust-level `TyKind::Ref(_,_,Mut)` so it works through
+> type aliases), NOT a `get_type` change; `MethodDef` gained `out_params: Vec<u16>` (serialized-IR
+> format change — fingerprint trap applies) re-applied across `asm_link` and consumed by
+> `pe_exporter`'s Param-row loop (+ il_exporter `[out]` parity). Applies to instance AND
+> `static abstract` members. Proven by `cargo_tests/cd_interface` 15/15 (C# `Cell : IRefCell`
+> implements `void Fill(ref int)`, `void FillOut(out int)`, mixed params, static-abstract
+> `Reset(ref int)` via `T.Reset`, plus `IsByRef`/`IsOut` reflection through the linker).
+> Loud rejects: shared `&T` (C# `in` needs `modreq(InAttribute)`), reference returns,
+> `#[dotnet_out]` on non-`&mut`/static/event params (macro, `syn::Error`), `&mut str`/`&mut [T]`/
+> `&mut dyn` even alias-hidden (comptime panic). **Known wall (documented escape hatch respected):
+> Rust-side IMPLEMENTORS are out of scope** — `#[dotnet_methods]` class virtuals still lower
+> `&mut T` to `T*`, so a Rust `#[dotnet_class]` naming a byref-parameter interface in
+> `implements=` fails LOUDLY at CLR type load (`TypeLoadException` naming the member), never
+> silently wrong; the natural follow-up is applying the same rewrite to class-virtual DECLARED
+> sigs while the `AliasFor` target keeps `Ptr` (byref/ptr agree at `ldind`/`stind` level), but
+> that changes every existing `#[dotnet_methods]` `&mut` surface, so it is explicitly deferred.
+> `*mut T`/`*const T` still emit `T*` everywhere (unchanged escape hatch).
+>
+> **UPDATE (2026-07-07, default interface methods)** — an *instance* `#[dotnet_interface]` trait
+> fn WITH a default body is now a genuine .NET **default interface method** (DIM, CoreCLR 3.0+):
+> a virtual, NON-abstract `MethodDef` with a real IL body (RVA != 0) on the interface `TypeDef`,
+> inherited by a C# class that omits the member and beaten by one that defines it. The PE writer
+> needed ZERO changes (Pass 3 already stamps `Virtual|NewSlot` without `Abstract`; Pass 4
+> assembles the `AliasFor` body — same pipeline as `#[dotnet_class]` virtuals, just interface-
+> owned). The macro LIFTS the default body into a free fn (`__iface_dim_<M>` + `#[used]` KEEP
+> anchor): `self` becomes the explicit interface handle and every `self.<trait_method>(…)` call is
+> rewritten to `this.instanceN::<"M", …>(…)` — a `callvirt` through the handle, so an inner
+> self-call dispatches to the implementing CLASS's definition (proven). New intrinsic
+> `rustc_codegen_clr_add_default_method_def` → `PendingClass.default_methods` → a
+> `MethodKind::Virtual + MethodImpl::AliasFor` member with no `.with_abstract()`. Proven by
+> `cargo_tests/cd_dim` 10/10 (DIM runs; inner self-call hits `Minimal.Base`; args; self-free;
+> DIM-calls-DIM; class override wins; inherited DIM dispatches into `Overrider`'s members;
+> `!IsAbstract && IsVirtual` reflection; abstract sibling unharmed) + a `pe_exporter` readback
+> unit test (`default_interface_method_gets_body_and_stays_nonabstract`). Loud rejects (all
+> macro-level `syn::Error`, spot-verified): `self`/`Self` in any un-lowerable shape (macro bodies
+> like `println!("{}", self.x())` — a token-scan BACKSTOP behind the AST rewriter), self-calls to
+> non-trait/supertrait members, >2-argument self-calls (`instanceN` ladder), turbofish, default
+> bodies on `static` (receiver-less) members (non-abstract static virtuals aren't emitted) or
+> `#[dotnet_event]` members, and reference (`&T`/`&mut T`) parameters on a defaulted method
+> (byref declared surface vs raw-pointer lifted body would mismatch) — including self-CALLS to
+> byref-parameter members from inside a DIM. `HideBySig` is still omitted (0x146 vs Roslyn's
+> 0x1C6) — proven tolerated, same as abstract members/events.
+>
+> **Hardening pass (2026-07-07, post-adversarial-review).** The macro-level rejects above are
+> SYNTACTIC, so a type alias (`type Slot<'a> = &'a mut i32;`) used to slip past them and ship a
+> silently-wrong assembly (verified: a DIM self-call to an alias-hidden byref member exported a
+> phantom non-abstract `Fill(int32*)` next to the real `Fill(ref int32)` — `AmbiguousMatchException`
+> on reflection, runtime throw on call). Now closed with three fail-loudly backstops, none of which
+> touch the typechecker: (1) **linker** (`asm.rs` `patch_missing_methods`): an in-assembly
+> `MethodRef` that matches no `MethodDef` on an *interface* TypeDef panics at link time (naming the
+> member and the likely alias/generic cause) instead of materializing a `Missing` stub — this
+> catches the whole dangling-interface-ref defect class; (2) **comptime** (`src/comptime.rs`):
+> the `default_methods` loop rejects reference params/returns from the target's RUST-level types
+> (authoritative through aliases), and `byref_interface_sig` now also panics on alias-hidden shared
+> `&T` params and reference returns (literal spellings were already macro-rejected); (3) **macro**:
+> DIM self-calls to GENERIC members are rejected loudly (a shadowing concrete type used to make
+> `self.Conv(Meters(3))` compile into a phantom member; a non-shadowed `T` produced a confusing
+> E0425), and `async fn`/`const fn` interface members are rejected (an `async fn` used to silently
+> emit a synchronous member instead of anything `Task`-shaped).
 
 ### 1. `#[dotnet_class]` virtual-method overrides — SHIPPED (2026-07-07, IL-exporter-only)
 
@@ -328,6 +393,31 @@ cross-rlib merge pass) up front, plus a `merge_defs` assert requiring `is_interf
 across re-opened class definitions — this was the exact class of bug (a field silently dropped by
 that merge pass) found and fixed for the override feature, so it's handled proactively here instead
 of needing a second debugging pass.
+
+**Update (2026-07-07, generic interfaces SHIPPED, PE-writer-first):** `#[dotnet_interface]` now
+accepts a plain type-parameter list — `trait IBox<T>` emits a genuine GENERIC interface
+DEFINITION: the TypeDef is named with the CLS backtick-arity suffix (`IBox`1`), one ECMA-335
+`GenericParam` row (§II.22.20, new table 0x2A in `pe_exporter/tables.rs`, sorted by
+Owner/Number) per parameter, and a bare `T` in a member's parameter/return position lowers via
+the pre-existing `RustcCLRInteropTypeGeneric<N>` marker to `ELEMENT_TYPE_VAR N` (no
+`SIG_GENERIC` convention bit — that is generic-METHOD-only). The macro also emits a
+PARAMETERIZED `IBoxHandle<T>` alias (over `RustcCLRInteropManagedGeneric`), and the PE writer
+gained in-assembly open-generic resolution (`find_open_generic_def`): an instantiated reference
+to the assembly's OWN generic type (e.g. an exported fn taking `IBoxHandle<i32>`, or
+`#[dotnet_class(implements = "IBox<…>")]` against the local definition) resolves to a `TypeSpec`
+over the local TypeDef instead of a dangling external `TypeRef` with a doubled arity postfix.
+Proven by `cargo_tests/cd_iface_generic` (9/9: open-definition reflection incl. the `T` name,
+`IBox<int>` AND `IBox<string>` implementors — two instantiations = genuine genericity — generic
+C# helper dispatch, and C# calling an exported Rust fn typed `IBox<int>`). Loudly rejected
+(macro errors, all negative-tested): lifetime/const params, defaults, bounds/`where` clauses (no
+`GenericParamConstraint` emission — a bound would be silently-dropped metadata), `T` anywhere
+but a bare param/return position, default bodies on generic traits (the lifted DIM free fn can't
+scope `T`), and a generic param as an event delegate. Generic CLASS definitions remain walled
+(comptime assert — the no-explicit-layout-on-generics ban applies to classes, not interfaces),
+and Rust-side CALLING through `IBox<int>` (constrained dispatch on the local generic interface)
+is untested stretch surface. NOTE: `ClassDef` gained a serialized `generic_names` field —
+postcard `.bc` format change (the documented fingerprint trap: rebuild dylib+linker together,
+clean consumers).
 
 **Remaining scope, not started (this was intentionally just the spike):** wiring this into
 `#[dotnet_class]`/`dotnet_macros`/`src/comptime.rs` so an actual Rust `trait` synthesizes one of
@@ -673,3 +763,37 @@ the exact pass/fail tally).
 
 **Unblocks:** the `IAsyncEnumerable<T>` Stream-state-struct spike (finding §3) and Case C of the
 richer-export-return-types item (finding §6) — both were waiting on exactly this.
+
+### 9. Generic METHODS on `#[dotnet_interface]` (`fn Echo<T>(&self, value: T) -> T`) — SHIPPED (2026-07-07, PE-writer default path)
+
+**What shipped:** a plain type-parameter list on an *instance* trait method inside
+`#[dotnet_interface]` now emits a genuine ECMA-335 generic method DEFINITION on the interface's
+TypeDef: the member's `MethodDefSig` blob carries `SIG_GENERIC` (0x10) + a compressed
+`GenParamCount` (§II.23.2.1), one METHOD-owned `GenericParam` row (§II.22.20, coded
+`TypeOrMethodDef` owner tag 1) is emitted per declared parameter (reusing the table
+infrastructure the generic-interfaces feature landed for TYPE-owned rows), and a bare `T` in a
+parameter/return position lowers to `ELEMENT_TYPE_MVAR N` (`!!N`) via the pre-existing
+`RustcCLRInteropMethodGeneric<N>` marker (`GenericKind::CallGeneric`). C# implements and calls
+it as an ordinary generic interface method — proven at value AND reference instantiations, two
+parameters (`fn First<K, V>`), reflection round-trip (`IsGenericMethodDefinition`,
+parameter-name readback, `MakeGenericMethod(typeof(int)).Invoke(...)` — full loader validation),
+and MIXED with a generic owning interface (`trait IPicker<T> { fn Pick<U>(&self, a: T, b: U) ->
+U; }` — `!0` and `!!0` in one signature). Plumbing: `MethodDef::generic_params`
+(serialized-IR change — fingerprint trap applies), linker field re-application in
+`asm_link.rs`, `export.rs` Pass 3 (SIG_GENERIC + rows + loud in-range asserts for every
+`!!N`/`!N` marker), intrinsic `rustc_codegen_clr_add_generic_abstract_method_def`
+(`;`-separated name list, substring-dispatch audited), il_exporter `<T, U>` header parity.
+Proof crate: `cargo_tests/cd_iface_genmethod` (13/13).
+
+**Walls kept loud (macro-level `syn::Error`, all verified firing):** bounds (`fn f<T: Clone>`)
+and `where` clauses (no `GenericParamConstraint` emission — a constraint would be silently
+dropped metadata), lifetime/const parameters, parameter defaults, composite uses of a parameter
+(`&T`, `Vec<T>`, tuples — only bare `x: T` / `-> T` positions lower), generic parameters on a
+`#[dotnet_event]` member (accessors have a fixed `void (Delegate)` shape), on a default-body
+(DIM) member (the lifted body would need a generic IL body — a generic MethodBody the backend
+doesn't emit), and on a static (receiver-less) member (generic `static abstract` needs the
+static-virtual flag combination plus generic-def support in one member — deferred). Like
+`static abstract`s, a generic member is declaration-only surface from Rust: calling it through
+the handle would need the `!!N` call-site infra pointed at an interface `callvirt` +
+`constrained.`-free dispatch — the existing `call_gmethod` path can already bind a `MethodSpec`
+to an in-assembly MethodDef, so this is feasible follow-up work, not a wall.

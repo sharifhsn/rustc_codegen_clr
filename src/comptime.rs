@@ -25,7 +25,7 @@ use rustc_codegen_clr_call::CallInfo;
 use rustc_codegen_clr_ctx::{function_name, MethodCompileCtx};
 use rustc_codegen_clr_type::r#type::get_type;
 use rustc_codegen_clr_type::utilis::garg_to_string;
-use rustc_middle::mir::{Rvalue, StatementKind, TerminatorKind};
+use rustc_middle::mir::{Mutability, Rvalue, StatementKind, TerminatorKind};
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{Instance, TyKind, TypingEnv};
 
@@ -75,14 +75,50 @@ struct PendingClass<'tcx> {
     /// method, `false` for `remove_*`. Both halves of the same `event_name` must be present by the
     /// time `finish_type` runs, or building the `EventDef` panics with a clear message.
     event_bindings: std::collections::HashMap<String, (String, bool)>,
+    /// `accessor_method_name -> (property_name, is_getter)` — links an abstract interface member
+    /// already registered in `abstract_methods` below to a `.NET` property's getter/setter half
+    /// (see `rustc_codegen_clr_mark_last_abstract_property_get`'s doc). The property's value
+    /// type is inferred from the accessor's own carrier signature at `finish_type` (getter:
+    /// return type; setter: the single non-receiver parameter) — the two must agree or
+    /// `finish_type` panics. Only valid on `is_interface` classes.
+    property_bindings: std::collections::HashMap<String, (String, bool)>,
     /// This class is a genuine ECMA-335 `interface` `TypeDef` (from `#[dotnet_interface]` on a Rust
     /// trait), not an ordinary class — registered via `ClassDef::with_interface()`. Its members are
     /// all in `abstract_methods` (never `methods`), and it has no base type / no ctors.
     is_interface: bool,
-    /// `(managed_method_name, signature_carrier_fn)` — abstract (no-body) interface members. The
-    /// carrier is used ONLY to extract the member's signature (like `methods`' targets), but it is
-    /// NOT aliased: the emitted `MethodDef` is `MethodImpl::Missing` + `.with_abstract()` (RVA=0).
-    abstract_methods: Vec<(String, Instance<'tcx>)>,
+    /// `(managed_method_name, signature_carrier_fn, out_param_sequences, generic_param_names)` —
+    /// abstract (no-body) interface members. The carrier is used ONLY to extract the member's
+    /// signature (like `methods`' targets), but it is NOT aliased: the emitted `MethodDef` is
+    /// `MethodImpl::Missing` + `.with_abstract()` (RVA=0). `out_param_sequences` holds the
+    /// 1-based, receiver-stripped positions of `#[dotnet_out]`-marked parameters (see
+    /// `rustc_codegen_clr_mark_last_abstract_method_out_params`) — empty for most members.
+    /// `generic_param_names` is the declared type-parameter name list of a generic method
+    /// DEFINITION (`fn Echo<T>(&self, value: T) -> T` via
+    /// `rustc_codegen_clr_add_generic_abstract_method_def` — the METHOD-generic dual of
+    /// `type_generics` below; the carrier spells each `T` position as the
+    /// `RustcCLRInteropMethodGeneric<N>` / `!!N` marker) — empty for non-generic members.
+    abstract_methods: Vec<(String, Instance<'tcx>, Vec<u16>, Vec<String>)>,
+    /// `(managed_method_name, target_rust_fn)` — **default interface methods** (DIM, CoreCLR
+    /// 3.0+): virtual, NON-abstract interface members with a real body. Unlike
+    /// `abstract_methods`' signature-only carriers, the target here is a REAL codegen'd fn (the
+    /// lifted default body from `#[dotnet_interface]`) that the member aliases exactly like a
+    /// class virtual in `methods` — `MethodKind::Virtual` + `MethodImpl::AliasFor`, no
+    /// `.with_abstract()`, so Pass 4 of the PE writer assembles a body and the member's RVA is
+    /// non-zero. Only valid on `is_interface` classes.
+    default_methods: Vec<(String, Instance<'tcx>)>,
+    /// `(managed_method_name, signature_carrier_fn)` — **`static abstract`** interface members
+    /// (.NET 7+ static virtual members in interfaces, from a `#[dotnet_interface]` trait fn with
+    /// no `self` receiver). Like `abstract_methods` the carrier is signature-only, but it carries
+    /// NO receiver: the emitted `MethodDef` is `MethodKind::Static` + `MethodImpl::Missing` +
+    /// `.with_abstract()` (RVA=0, sig used verbatim). Only valid on `is_interface` classes.
+    static_abstract_methods: Vec<(String, Instance<'tcx>)>,
+    /// The declared generic-parameter names (`["T"]`, `["K", "V"]`, …) of a GENERIC type
+    /// definition, in declaration order — from `rustc_codegen_clr_set_type_generics` (emitted by
+    /// `#[dotnet_interface]` on a `trait IFoo<T>`, whose `name` above already carries the CLS
+    /// backtick-arity suffix `IFoo`1`). Empty for every non-generic type. Only valid on
+    /// `is_interface` classes (asserted in `finish_type` — generic CLASS definitions stay
+    /// walled: the no-explicit-layout-on-.NET-generics ban applies to classes, not interfaces).
+    type_generics: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -184,8 +220,12 @@ pub fn interpret<'tcx>(
                         has_field_setters: false,
                         method_overrides: std::collections::HashMap::new(),
                         event_bindings: std::collections::HashMap::new(),
+                        property_bindings: std::collections::HashMap::new(),
                         is_interface: false,
                         abstract_methods: vec![],
+                        default_methods: vec![],
+                        static_abstract_methods: vec![],
+                        type_generics: vec![],
                     })
                 } else if fname.contains("rustc_codegen_clr_add_field_def") {
                     let src = operand_local(&args[0].node);
@@ -224,7 +264,149 @@ pub fn interpret<'tcx>(
                     let carrier = Instance::try_resolve(ctx.tcx(), env, *fdef, fsubst)
                         .expect("comptime: invalid abstract method signature carrier")
                         .expect("comptime: could not resolve abstract method signature carrier instance");
-                    class.abstract_methods.push((method_name, carrier));
+                    class.abstract_methods.push((method_name, carrier, vec![], vec![]));
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_add_generic_abstract_method_def") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    // Generics: <const FNAME, const GENERIC_PARAMS, FnType> — the abstract-member
+                    // shape of `add_abstract_method_def` plus the declared type-parameter NAME
+                    // list of a generic method DEFINITION (`;`-separated, declaration order —
+                    // the same `;`-list convention as `set_type_generics`). Substring-dispatch
+                    // safety: "add_generic_abstract_method_def" neither contains nor is contained
+                    // by "add_method_def", "add_abstract_method_def", "add_static_method_def",
+                    // "add_static_abstract_method_def", "add_default_method_def",
+                    // "add_generic_interface_impl", or "set_type_generics" (the
+                    // `generic_abstract_` infix breaks every containment; audited against the
+                    // whole chain), so the chain order cannot misdispatch.
+                    let method_name = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
+                    let names_arg = garg_to_string(subst_ref[1], ctx.tcx());
+                    let generic_names: Vec<String> = names_arg
+                        .split(';')
+                        .map(str::trim)
+                        .map(String::from)
+                        .collect();
+                    assert!(
+                        !generic_names.is_empty() && generic_names.iter().all(|n| !n.is_empty()),
+                        "comptime: rustc_codegen_clr_add_generic_abstract_method_def for `{method_name}` \
+                         got a malformed GENERIC_PARAMS list ({names_arg:?}) — a generic method \
+                         definition must declare at least one non-empty parameter name \
+                         (unreachable from the #[dotnet_interface] macro, which builds the list \
+                         from parsed idents)"
+                    );
+                    let fn_ty = ctx.monomorphize(subst_ref[2].as_type().unwrap());
+                    let TyKind::FnDef(fdef, fsubst) = fn_ty.kind() else {
+                        panic!("comptime: generic abstract method signature carrier is not a function definition");
+                    };
+                    let fsubst = ctx.monomorphize(*fsubst);
+                    let carrier = Instance::try_resolve(ctx.tcx(), env, *fdef, fsubst)
+                        .expect("comptime: invalid generic abstract method signature carrier")
+                        .expect("comptime: could not resolve generic abstract method signature carrier instance");
+                    class
+                        .abstract_methods
+                        .push((method_name, carrier, vec![], generic_names));
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_mark_last_abstract_method_out_params") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    // Generics: <const OUT_PARAMS: &'static str> — a CSV of 1-based,
+                    // receiver-stripped parameter positions (e.g. "1,3"). Marks the LAST-added
+                    // abstract member (same "mark the LAST member" contract as
+                    // `mark_last_method_override`). Substring-dispatch safety: this needle
+                    // neither contains nor is contained by any sibling intrinsic's
+                    // (`mark_last_abstract_method` vs `mark_last_method_*` — the `abstract_`
+                    // infix breaks every containment; audited against the whole chain).
+                    let csv = garg_to_string(subst_ref[0], ctx.tcx());
+                    let out_params: Vec<u16> = csv
+                        .split(',')
+                        .map(|s| {
+                            s.trim().parse::<u16>().unwrap_or_else(|_| {
+                                panic!(
+                                    "comptime: rustc_codegen_clr_mark_last_abstract_method_out_params \
+                                     got a malformed OUT_PARAMS entry {s:?} (expected a CSV of \
+                                     1-based positions like \"1,3\")"
+                                )
+                            })
+                        })
+                        .collect();
+                    let last = class.abstract_methods.last_mut().expect(
+                        "comptime: rustc_codegen_clr_mark_last_abstract_method_out_params called \
+                         with no preceding add_abstract_method_def in this entrypoint",
+                    );
+                    last.2 = out_params;
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_mark_last_abstract_property_get") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    // Generics: <const PROP_NAME: &'static str>. Marks the LAST-added ABSTRACT
+                    // member as this property's getter (same "mark the LAST member" contract as
+                    // `mark_last_abstract_method_out_params`). Substring-dispatch safety:
+                    // `mark_last_abstract_property_get` neither contains nor is contained by any
+                    // sibling needle (`…_method_out_params` diverges at `method_`/`property_`;
+                    // `mark_last_method_*` diverges at `abstract_`; `_get` vs `_set` diverge at
+                    // the final token; audited against the whole chain).
+                    let prop_name = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
+                    let (method_name, ..) = class.abstract_methods.last().expect(
+                        "comptime: rustc_codegen_clr_mark_last_abstract_property_get called with \
+                         no preceding add_abstract_method_def in this entrypoint",
+                    );
+                    class
+                        .property_bindings
+                        .insert(method_name.clone(), (prop_name, true));
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_mark_last_abstract_property_set") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    let prop_name = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
+                    let (method_name, ..) = class.abstract_methods.last().expect(
+                        "comptime: rustc_codegen_clr_mark_last_abstract_property_set called with \
+                         no preceding add_abstract_method_def in this entrypoint",
+                    );
+                    class
+                        .property_bindings
+                        .insert(method_name.clone(), (prop_name, false));
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_add_default_method_def") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    // Generics: <const FNAME, FnType> — same shape as `add_abstract_method_def`,
+                    // but the resolved fn is a REAL codegen'd target (the lifted default body)
+                    // the member will alias, not a signature-only carrier. Substring-dispatch
+                    // safety: "add_default_method_def" neither contains nor is contained by
+                    // "add_method_def", "add_abstract_method_def", "add_static_method_def",
+                    // "add_static_abstract_method_def", or "add_default_ctor" (the `default_`
+                    // infix / `method_def` tail break every containment; audited against the
+                    // whole chain), so the chain order cannot misdispatch.
+                    let method_name = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
+                    let fn_ty = ctx.monomorphize(subst_ref[1].as_type().unwrap());
+                    let TyKind::FnDef(fdef, fsubst) = fn_ty.kind() else {
+                        panic!("comptime: default interface method target is not a function definition");
+                    };
+                    let fsubst = ctx.monomorphize(*fsubst);
+                    let target = Instance::try_resolve(ctx.tcx(), env, *fdef, fsubst)
+                        .expect("comptime: invalid default interface method target")
+                        .expect("comptime: could not resolve default interface method target instance");
+                    class.default_methods.push((method_name, target));
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_add_static_abstract_method_def") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    // Generics: <const FNAME, FnType> — same shape as `add_abstract_method_def`,
+                    // but the carrier has NO receiver (a `static abstract` member's signature is
+                    // its C#-visible parameter list verbatim). Substring-dispatch safety: this
+                    // name neither contains nor is contained by `…add_method_def`,
+                    // `…add_abstract_method_def`, or `…add_static_method_def` (the `static_`
+                    // infix breaks every containment), so the chain order cannot misdispatch.
+                    let method_name = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
+                    let fn_ty = ctx.monomorphize(subst_ref[1].as_type().unwrap());
+                    let TyKind::FnDef(fdef, fsubst) = fn_ty.kind() else {
+                        panic!("comptime: static abstract method signature carrier is not a function definition");
+                    };
+                    let fsubst = ctx.monomorphize(*fsubst);
+                    let carrier = Instance::try_resolve(ctx.tcx(), env, *fdef, fsubst)
+                        .expect("comptime: invalid static abstract method signature carrier")
+                        .expect("comptime: could not resolve static abstract method signature carrier instance");
+                    class.static_abstract_methods.push((method_name, carrier));
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_mark_last_method_override") {
                     let src = operand_local(&args[0].node);
@@ -250,28 +432,33 @@ pub fn interpret<'tcx>(
                     let src = operand_local(&args[0].node);
                     let mut class = locals[src].as_class().clone();
                     let event_name = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
-                    let (method_name, _) = class
-                        .methods
-                        .last()
-                        .expect(
-                            "comptime: rustc_codegen_clr_mark_last_method_event_add called with \
-                             no preceding add_method_def in this entrypoint",
-                        )
-                        .clone();
+                    // On an interface (`#[dotnet_interface]` + `#[dotnet_event]`) the accessor was
+                    // just pushed by `add_abstract_method_def` (interface members have no bodies);
+                    // on a class, by `add_method_def`. Same "mark the LAST-added method" contract.
+                    let method_name = if class.is_interface {
+                        class.abstract_methods.last().map(|(name, ..)| name.clone())
+                    } else {
+                        class.methods.last().map(|(name, _)| name.clone())
+                    }
+                    .expect(
+                        "comptime: rustc_codegen_clr_mark_last_method_event_add called with no \
+                         preceding add_method_def/add_abstract_method_def in this entrypoint",
+                    );
                     class.event_bindings.insert(method_name, (event_name, true));
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_mark_last_method_event_remove") {
                     let src = operand_local(&args[0].node);
                     let mut class = locals[src].as_class().clone();
                     let event_name = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
-                    let (method_name, _) = class
-                        .methods
-                        .last()
-                        .expect(
-                            "comptime: rustc_codegen_clr_mark_last_method_event_remove called \
-                             with no preceding add_method_def in this entrypoint",
-                        )
-                        .clone();
+                    let method_name = if class.is_interface {
+                        class.abstract_methods.last().map(|(name, ..)| name.clone())
+                    } else {
+                        class.methods.last().map(|(name, _)| name.clone())
+                    }
+                    .expect(
+                        "comptime: rustc_codegen_clr_mark_last_method_event_remove called with \
+                         no preceding add_method_def/add_abstract_method_def in this entrypoint",
+                    );
                     class.event_bindings.insert(method_name, (event_name, false));
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_add_static_method_def") {
@@ -332,6 +519,27 @@ pub fn interpret<'tcx>(
                     let src = operand_local(&args[0].node);
                     let mut class = locals[src].as_class().clone();
                     class.is_interface = true;
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_set_type_generics") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    // Generics: <const NAMES: &'static str> — `;`-separated declared parameter
+                    // names in declaration order (`"T"`, `"K;V"`), same separator convention as
+                    // `implements=`. Substring-dispatch safety: "set_type_generics" neither
+                    // contains nor is contained by any sibling intrinsic's needle (audited
+                    // against the whole contains() chain).
+                    let names = garg_to_string(subst_ref[0], ctx.tcx());
+                    class.type_generics = names
+                        .split(';')
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect();
+                    assert!(
+                        !class.type_generics.is_empty(),
+                        "comptime: rustc_codegen_clr_set_type_generics got an empty NAMES list \
+                         ({names:?}) — a generic type definition must declare at least one \
+                         parameter name"
+                    );
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_finish_type") {
                     let src = operand_local(&args[0].node);
@@ -403,6 +611,87 @@ fn well_known_primitive_type(name: &str) -> Option<Type> {
     })
 }
 
+/// Rewrites an interface-member signature carrier's lowered signature so every Rust `&mut T`
+/// parameter becomes a **managed byref** (`Type::Ref` => `ELEMENT_TYPE_BYREF`, C# `ref T`/`out T`)
+/// instead of the raw pointer (`Type::Ptr` => `T*`, C# `int*` — unsafe-only, and NOT
+/// name+signature-matched by a C# `void M(ref int)` implementor) that the frontend's uniform
+/// `TyKind::Ref | TyKind::RawPtr => nptr` lowering produces.
+///
+/// Deliberately a TARGETED comptime-layer rewrite of the carrier's already-lowered signature, not
+/// a change to `get_type` (which would alter every `&mut` in all of codegen): the decision is
+/// driven by the carrier's **Rust-level** parameter types (`TyKind::Ref(_, _, Mut)`), so it is
+/// authoritative even through type aliases the `#[dotnet_interface]` macro can't see
+/// syntactically. Raw pointers (`*mut T`/`*const T`) are untouched — they keep today's `T*`
+/// meaning as the documented escape hatch. Shared `&T` parameters and reference RETURNS are
+/// rejected here with a panic: the macro already rejects both when spelled literally, so reaching
+/// this code with one means it was hidden behind a type alias — emitting the frontend's `T*`
+/// lowering there would be a silently-different surface than the documented reject (C# `in T`
+/// would need `modreq(InAttribute)`; `ref`-returns are a different metadata shape), so fail
+/// loudly instead.
+///
+/// `skip` is the number of leading signature inputs that are NOT user-visible parameters (1 for
+/// an instance member's `_this` receiver handle, 0 for a `static abstract` member).
+///
+/// A `&mut` to an UNSIZED pointee (`&mut str`/`&mut [T]`/`&mut dyn Trait`) lowers to a fat-ptr
+/// struct, not `Type::Ptr` — no managed-byref equivalent exists, so it panics loudly (the
+/// fail-loudly comptime idiom; the macro can't catch alias-hidden cases, this backstop can).
+fn byref_interface_sig<'tcx>(
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    method_name: &str,
+    carrier: Instance<'tcx>,
+    mut sig: cilly::FnSig,
+    skip: usize,
+) -> cilly::FnSig {
+    let tcx = ctx.tcx();
+    let fn_ty = carrier.ty(tcx, TypingEnv::fully_monomorphized());
+    let rust_sig = tcx.instantiate_bound_regions_with_erased(fn_ty.fn_sig(tcx));
+    let rust_inputs = rust_sig.inputs();
+    // The carrier is a plain (non-`rust_call`) fn generated by `#[dotnet_interface]`, so its
+    // Rust-level inputs are 1:1 parallel with the lowered signature's.
+    assert_eq!(
+        rust_inputs.len(),
+        sig.inputs().len(),
+        "comptime: interface member `{method_name}`'s carrier signature is not parallel to its \
+         lowered signature — unsupported carrier shape"
+    );
+    let mut inputs = sig.inputs().to_vec();
+    for (i, input) in inputs.iter_mut().enumerate().skip(skip) {
+        match rust_inputs[i].kind() {
+            TyKind::Ref(_, _, Mutability::Mut) => (),
+            // The macro rejects a literally-spelled `&T`; only a type alias can smuggle one this
+            // far. Emitting `T*` here would silently contradict that documented reject.
+            TyKind::Ref(_, _, Mutability::Not) => panic!(
+                "comptime: interface member `{method_name}`, parameter {i}: shared-reference \
+                 (`&T`) parameters are not supported on `#[dotnet_interface]` members (C# `in T` \
+                 would need `modreq(InAttribute)`) — this one is hidden behind a type alias, \
+                 which the macro cannot see. Use `&mut T` (C# `ref T`), pass by value, or use a \
+                 raw pointer (`*const T` => C# `T*`)"
+            ),
+            _ => continue,
+        }
+        match input {
+            Type::Ptr(inner) => *input = Type::Ref(*inner),
+            _ => panic!(
+                "comptime: interface member `{method_name}`, parameter {i}: `&mut` to an unsized \
+                 type (`&mut str`, `&mut [T]`, `&mut dyn Trait`, …) has no managed-byref (`ref`) \
+                 equivalent and is not supported on `#[dotnet_interface]` members — pass a thin \
+                 `&mut T` or a raw pointer instead"
+            ),
+        }
+    }
+    // Reference RETURNS: the macro rejects `-> &T`/`-> &mut T` spelled literally; an alias-hidden
+    // one would otherwise ship the frontend's `T*` return (C# `ref`-returns are a different
+    // metadata shape than anything emitted here). Same fail-loudly backstop as the params above.
+    assert!(
+        !matches!(rust_sig.output().kind(), TyKind::Ref(..)),
+        "comptime: interface member `{method_name}`: reference returns (`-> &T` / `-> &mut T`) \
+         are not supported on `#[dotnet_interface]` members — this one is hidden behind a type \
+         alias, which the macro cannot see"
+    );
+    sig.set_inputs(inputs);
+    sig
+}
+
 /// Build and register the managed class, then attach its virtual methods (which alias the Rust fns).
 fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<'tcx>) {
     // Superclass reference (e.g. [System.Runtime]System.Object).
@@ -446,10 +735,24 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         }
         existing
     } else {
+        // Generic type DEFINITIONS (`rustc_codegen_clr_set_type_generics`, from
+        // `#[dotnet_interface] trait IFoo<T>`) are interface-only: an interface has no layout,
+        // so the historical no-explicit-layout-on-.NET-generics ban does not apply — but it DOES
+        // apply to classes, which stay walled loudly here rather than emitting a generic class
+        // TypeDef whose layout the CLR controls.
+        assert!(
+            class.type_generics.is_empty() || class.is_interface,
+            "comptime: type generics are only supported on #[dotnet_interface] interfaces \
+             (class '{}' declares {:?})",
+            class.name,
+            class.type_generics
+        );
+        let generics = u32::try_from(class.type_generics.len())
+            .expect("comptime: generic arity over u32");
         let mut def = ClassDef::new(
             name,
             class.is_value_type,
-            0,
+            generics,
             extends,
             fields,
             vec![],
@@ -464,6 +767,14 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         // above never applies to it.
         if class.is_interface {
             def = def.with_interface();
+        }
+        if !class.type_generics.is_empty() {
+            let names = class
+                .type_generics
+                .iter()
+                .map(|n| ctx.alloc_string(n.clone()))
+                .collect();
+            def = def.with_type_generic_names(names);
         }
         ctx.class_def(def)
             .expect("comptime: layout error registering interop class")
@@ -516,14 +827,16 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         ctx.class_mut(class_idx).add_interface(iface_ref);
     }
 
-    // Accumulates each event's `add`/`remove` `MethodRef` + delegate `Type` as the method loop
-    // below encounters them (in whatever order `class.methods` happens to hold them) — see
-    // `rustc_codegen_clr_mark_last_method_event_add`'s doc. Built into real `EventDef`s once the
-    // loop finishes and every event has both halves.
-    let mut pending_events: std::collections::HashMap<
+    // Accumulates each event's `add`/`remove` `MethodRef` + delegate `Type` as the method loops
+    // below encounter them (in whatever order `class.methods`/`class.abstract_methods` happen to
+    // hold them) — see `rustc_codegen_clr_mark_last_method_event_add`'s doc. Built into real
+    // `EventDef`s once the loops finish and every event has both halves. A `BTreeMap` (NOT
+    // `HashMap`) so a multi-event class emits its `Event` rows in a deterministic (name-sorted)
+    // order — the PE writer requires deterministic row emission.
+    let mut pending_events: std::collections::BTreeMap<
         String,
         (Option<Interned<MethodRef>>, Option<Interned<MethodRef>>, Option<Type>),
-    > = std::collections::HashMap::new();
+    > = std::collections::BTreeMap::new();
 
     // Each virtual method aliases an ordinary Rust fn (codegen'd separately). The Rust fn takes the
     // receiver as its first explicit arg, so its signature matches the virtual method's.
@@ -582,6 +895,284 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         }
         ctx.new_method(mdef);
     }
+
+    // Accumulates each property's accessor `MethodRef`s + value `Type` as the abstract-member
+    // loop below encounters them — see `rustc_codegen_clr_mark_last_abstract_property_get`'s
+    // doc. A declaration-ordered Vec, NOT a HashMap: the PE writer requires deterministic row
+    // emission (MVID/output stability), and a hash-ordered iteration here would reorder
+    // `Property` rows between builds. Built into real `PropertyDef`s once the loop finishes.
+    // (getter_tpe/setter_tpe are kept separately so the type-agreement check below can name
+    // both sides in its panic message.)
+    #[allow(clippy::type_complexity)]
+    let mut pending_properties: Vec<(
+        String,
+        (
+            Option<(Interned<MethodRef>, Type)>, // getter + its return type
+            Option<(Interned<MethodRef>, Type)>, // setter + its value-parameter type
+        ),
+    )> = Vec::new();
+    assert!(
+        class.property_bindings.is_empty() || class.is_interface,
+        "comptime: properties are only supported on a #[dotnet_interface] (class '{}' is not an \
+         interface)",
+        class.name
+    );
+
+    // Abstract (no-body) interface members (`#[dotnet_interface]`). The signature comes from a
+    // carrier fn (like a virtual method's target), but the member is emitted as `MethodImpl::
+    // Missing` + `.with_abstract()` — NO `AliasFor`, so nothing is codegen'd for it and its
+    // `MethodDef.RVA` stays 0 (§II.22.26). The receiver is the carrier's first input (the interface
+    // handle), sliced off in the C#-visible declared signature exactly like a virtual method.
+    for (method_name, carrier, out_params, generic_names) in &class.abstract_methods {
+        let call_info = CallInfo::sig_from_instance_(*carrier, ctx);
+        // `&mut T` parameters => managed byrefs (C# `ref T`) — see `byref_interface_sig`'s doc.
+        // `skip = 1`: input 0 is the `_this` receiver handle.
+        let fn_sig =
+            byref_interface_sig(ctx, method_name, *carrier, call_info.sig().clone(), 1);
+        // `#[dotnet_out]` positions (1-based among the receiver-stripped params, so sequence `s`
+        // is signature input `s` here — the receiver occupies index 0). The macro already
+        // guarantees each is a `&mut T` parameter; this is the backend's defense-in-depth assert,
+        // not a user-facing error.
+        for seq in out_params {
+            let input = fn_sig.inputs().get(usize::from(*seq));
+            assert!(
+                matches!(input, Some(Type::Ref(_))),
+                "comptime: interface member `{method_name}`'s `#[dotnet_out]` parameter {seq} \
+                 did not lower to a managed byref (got {input:?}) — unreachable from the \
+                 `#[dotnet_interface]` macro, which only accepts `#[dotnet_out]` on `&mut T`"
+            );
+        }
+        let arg_names = vec![None; fn_sig.inputs().len()];
+        let sig = ctx.alloc_sig(fn_sig);
+        let mname = ctx.alloc_string(method_name.clone());
+        let mut mdef = MethodDef::new(
+            Access::Extern,
+            class_idx,
+            mname,
+            sig,
+            MethodKind::Virtual,
+            MethodImpl::Missing,
+            arg_names,
+        )
+        .with_abstract();
+        if !out_params.is_empty() {
+            mdef = mdef.with_out_params(out_params.clone());
+        }
+        // A generic method DEFINITION (`rustc_codegen_clr_add_generic_abstract_method_def`):
+        // attach the declared type-parameter names — the PE writer (export.rs Pass 3) stamps
+        // `SIG_GENERIC` + `GenParamCount` on the signature blob, emits one method-owned
+        // `GenericParam` row per name, and asserts every `!!N` marker in the signature is in
+        // range of this list.
+        if !generic_names.is_empty() {
+            mdef = mdef.with_generic_params(
+                generic_names.iter().map(|n| ctx.alloc_string(n.clone())).collect(),
+            );
+        }
+        // An abstract accessor of an INTERFACE event (`#[dotnet_event]` inside
+        // `#[dotnet_interface]`) — same binding block as the virtual (class) loop above: the
+        // delegate type is the accessor's own second signature input (index 0 is the receiver).
+        if let Some((event_name, is_add)) = class.event_bindings.get(method_name) {
+            let inputs = ctx[sig].inputs();
+            assert_eq!(
+                inputs.len(),
+                2,
+                "comptime: interface event accessor `{method_name}` must take exactly (receiver, \
+                 delegate) — the `#[dotnet_interface]` macro guarantees this shape"
+            );
+            let delegate_ty = inputs[1];
+            let mref = ctx.alloc_methodref(mdef.ref_to());
+            let entry = pending_events.entry(event_name.clone()).or_insert((None, None, None));
+            if *is_add {
+                entry.0 = Some(mref);
+            } else {
+                entry.1 = Some(mref);
+            }
+            entry.2 = Some(delegate_ty);
+        }
+        // An abstract accessor of an INTERFACE property (`#[dotnet_property]` inside
+        // `#[dotnet_interface]`): the property's value type comes from the accessor's own
+        // signature — getter: the return type; setter: the single non-receiver parameter
+        // (index 0 is the receiver). The macro guarantees the accessor shapes; the asserts here
+        // are the backend's defense-in-depth for a hand-rolled entrypoint, phrased loudly.
+        if let Some((prop_name, is_getter)) = class.property_bindings.get(method_name) {
+            let accessor_sig = &ctx[sig];
+            let (mref_tpe, slot_is_getter) = if *is_getter {
+                let tpe = *accessor_sig.output();
+                assert!(
+                    tpe != Type::Void,
+                    "comptime: property '{prop_name}' getter `{method_name}` returns void — a \
+                     property getter must return the property's value"
+                );
+                (tpe, true)
+            } else {
+                assert_eq!(
+                    accessor_sig.inputs().len(),
+                    2,
+                    "comptime: property '{prop_name}' setter `{method_name}` must take exactly \
+                     (receiver, value) — got {} signature input(s)",
+                    accessor_sig.inputs().len()
+                );
+                (accessor_sig.inputs()[1], false)
+            };
+            let mref = ctx.alloc_methodref(mdef.ref_to());
+            let entry = match pending_properties
+                .iter_mut()
+                .find(|(name, _)| name == prop_name)
+            {
+                Some((_, entry)) => entry,
+                None => {
+                    pending_properties.push((prop_name.clone(), (None, None)));
+                    &mut pending_properties
+                        .last_mut()
+                        .expect("just pushed")
+                        .1
+                }
+            };
+            let slot = if slot_is_getter { &mut entry.0 } else { &mut entry.1 };
+            assert!(
+                slot.is_none(),
+                "comptime: property '{prop_name}' declares two {}s — unreachable from the \
+                 #[dotnet_interface] macro, which rejects duplicate accessor names",
+                if slot_is_getter { "getter" } else { "setter" }
+            );
+            *slot = Some((mref, mref_tpe));
+        }
+        ctx.new_method(mdef);
+    }
+
+    // Build the accumulated property halves into real `PropertyDef`s, in declaration order.
+    // Fail-loudly boundary (the loud comptime-failure precedent is the event both-halves panic
+    // below): a getter/setter TYPE disagreement and a write-only property are both clean panics
+    // naming the property, never silently-wrong metadata.
+    for (prop_name, (getter, setter)) in pending_properties {
+        if let (Some((_, get_tpe)), Some((_, set_tpe))) = (&getter, &setter) {
+            assert!(
+                get_tpe == set_tpe,
+                "comptime: property '{prop_name}' getter returns {get_tpe:?} but its setter \
+                 takes {set_tpe:?} — both accessors must agree on the property's value type"
+            );
+        }
+        let (tpe, getter_ref, setter_ref) = match (getter, setter) {
+            (Some((g, tpe)), setter) => (tpe, Some(g), setter.map(|(s, _)| s)),
+            (None, Some(_)) => panic!(
+                "comptime: property '{prop_name}' has a set_* accessor but no get_* — \
+                 write-only properties are not supported; add get_{prop_name}"
+            ),
+            (None, None) => unreachable!("a pending property always has at least one accessor"),
+        };
+        let name = ctx.alloc_string(prop_name);
+        ctx.class_mut(class_idx)
+            .add_property(cilly::class::PropertyDef::new(name, tpe, getter_ref, setter_ref));
+    }
+
+    // `static abstract` interface members (.NET 7+ static virtual members in interfaces, from a
+    // `#[dotnet_interface]` trait fn with no `self` receiver). Same `MethodImpl::Missing` +
+    // `.with_abstract()` no-body shape as the instance loop above, but `MethodKind::Static`: the
+    // carrier has NO receiver, so its signature is used VERBATIM (nothing to slice), and the PE
+    // writer stamps Roslyn's exact `Public|Static|Virtual|HideBySig|Abstract` (0x4D6) flags — see
+    // `MetadataBuilder::mark_method_static_abstract`.
+    assert!(
+        class.is_interface || class.static_abstract_methods.is_empty(),
+        "comptime: static abstract members are only valid on a #[dotnet_interface] (class '{}' \
+         is not an interface)",
+        class.name
+    );
+    for (method_name, carrier) in &class.static_abstract_methods {
+        let call_info = CallInfo::sig_from_instance_(*carrier, ctx);
+        // `&mut T` parameters => managed byrefs, exactly like the instance loop above — a static
+        // abstract's C# implementor writes `public static … M(ref T x)` and the CLR matches it by
+        // name+signature, so the byref mapping must be consistent across both member kinds.
+        // `skip = 0`: a static carrier has no receiver input.
+        let fn_sig =
+            byref_interface_sig(ctx, method_name, *carrier, call_info.sig().clone(), 0);
+        let arg_names = vec![None; fn_sig.inputs().len()];
+        let sig = ctx.alloc_sig(fn_sig);
+        let mname = ctx.alloc_string(method_name.clone());
+        let mdef = MethodDef::new(
+            Access::Extern,
+            class_idx,
+            mname,
+            sig,
+            MethodKind::Static,
+            MethodImpl::Missing,
+            arg_names,
+        )
+        .with_abstract();
+        ctx.new_method(mdef);
+    }
+
+    // **Default interface methods** (DIM, CoreCLR 3.0+): virtual, NON-abstract members with a
+    // real body, on the interface `TypeDef` itself. Byte-for-byte the same emission as a class
+    // virtual in the `methods` loop above (`MethodKind::Virtual` + `MethodImpl::AliasFor` a
+    // MainModule static — the lifted default body), minus override/event handling (the macro
+    // rejects both on a defaulted member): Pass 3 of the PE writer stamps `Virtual|NewSlot`
+    // WITHOUT `Abstract`, and Pass 4 assembles the alias target's body, so the member's RVA is
+    // non-zero — exactly Roslyn's DIM shape (§II.23.1.10 permits non-abstract virtual bodies on
+    // an interface; the CLR dispatches to them when the implementing class omits the member).
+    assert!(
+        class.default_methods.is_empty() || class.is_interface,
+        "comptime: default interface methods are only valid on a #[dotnet_interface] (class \
+         '{}' is not an interface)",
+        class.name
+    );
+    for (method_name, target) in &class.default_methods {
+        // SEMANTIC backstop behind the macro's syntactic reject of reference parameters/returns
+        // on defaulted members: the macro only sees spelled-out `&`/`&mut` types, so an alias
+        // (`type Slot<'a> = &'a mut i32;`) slips past it. The declared member would then carry
+        // the frontend's `T*` lowering — inconsistent with the managed-byref (`ref T`) surface
+        // an identically-typed ABSTRACT sibling gets from `byref_interface_sig`, and a violation
+        // of the documented "no reference params on a default body" contract. Decide from the
+        // lifted fn's RUST-level types (authoritative through aliases) and fail loudly.
+        {
+            let tcx = ctx.tcx();
+            let fn_ty = target.ty(tcx, TypingEnv::fully_monomorphized());
+            let rust_sig = tcx.instantiate_bound_regions_with_erased(fn_ty.fn_sig(tcx));
+            // Input 0 is the `this: <Name>Handle` receiver the macro synthesized — never a Ref.
+            for (i, input) in rust_sig.inputs().iter().enumerate().skip(1) {
+                assert!(
+                    !matches!(input.kind(), TyKind::Ref(..)),
+                    "comptime: default interface method `{method_name}`, parameter {i}: \
+                     reference parameters (`&T`/`&mut T`) are not supported on a method with a \
+                     default body — this one is hidden behind a type alias, which the \
+                     `#[dotnet_interface]` macro cannot see. Pass by value or drop the default \
+                     body"
+                );
+            }
+            assert!(
+                !matches!(rust_sig.output().kind(), TyKind::Ref(..)),
+                "comptime: default interface method `{method_name}`: reference returns \
+                 (`-> &T` / `-> &mut T`) are not supported — this one is hidden behind a type \
+                 alias, which the `#[dotnet_interface]` macro cannot see"
+            );
+        }
+        let call_info = CallInfo::sig_from_instance_(*target, ctx);
+        let fn_sig = call_info.sig().clone();
+        let arg_names = vec![None; fn_sig.inputs().len()];
+        let sig = ctx.alloc_sig(fn_sig);
+        let target_name = function_name(ctx.tcx().symbol_name(*target));
+        let target_name = ctx.alloc_string(target_name);
+        let main_module = *ctx.main_module();
+        let target_mref =
+            MethodRef::new(main_module, target_name, sig, MethodKind::Static, [].into());
+        let target_ref = ctx.alloc_methodref(target_mref);
+        let mname = ctx.alloc_string(method_name.clone());
+        // `Access::Extern` = DCE root, and the `AliasFor` edge keeps the lifted Rust fn alive —
+        // same rationale as the class-virtual loop.
+        let mdef = MethodDef::new(
+            Access::Extern,
+            class_idx,
+            mname,
+            sig,
+            MethodKind::Virtual,
+            MethodImpl::AliasFor(target_ref),
+            arg_names,
+        );
+        ctx.new_method(mdef);
+    }
+
+    // Build the accumulated event halves (from BOTH loops above — class virtuals and interface
+    // abstracts) into real `EventDef`s. Both halves are required; the macros make a lone half
+    // unrepresentable, so a panic here means a hand-rolled entrypoint got it wrong.
     for (event_name, (add, remove, delegate_ty)) in pending_events {
         let add = add.unwrap_or_else(|| {
             panic!("comptime: event '{event_name}' has a remove_* method but no add_* — both halves are required")
@@ -593,30 +1184,6 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         let name = ctx.alloc_string(event_name);
         ctx.class_mut(class_idx)
             .add_event(cilly::class::EventDef::new(name, delegate_ty, add, remove));
-    }
-
-    // Abstract (no-body) interface members (`#[dotnet_interface]`). The signature comes from a
-    // carrier fn (like a virtual method's target), but the member is emitted as `MethodImpl::
-    // Missing` + `.with_abstract()` — NO `AliasFor`, so nothing is codegen'd for it and its
-    // `MethodDef.RVA` stays 0 (§II.22.26). The receiver is the carrier's first input (the interface
-    // handle), sliced off in the C#-visible declared signature exactly like a virtual method.
-    for (method_name, carrier) in &class.abstract_methods {
-        let call_info = CallInfo::sig_from_instance_(*carrier, ctx);
-        let fn_sig = call_info.sig().clone();
-        let arg_names = vec![None; fn_sig.inputs().len()];
-        let sig = ctx.alloc_sig(fn_sig);
-        let mname = ctx.alloc_string(method_name.clone());
-        let mdef = MethodDef::new(
-            Access::Extern,
-            class_idx,
-            mname,
-            sig,
-            MethodKind::Virtual,
-            MethodImpl::Missing,
-            arg_names,
-        )
-        .with_abstract();
-        ctx.new_method(mdef);
     }
 
     // Each static method aliases an ordinary Rust fn, but unlike a virtual it has NO receiver — its

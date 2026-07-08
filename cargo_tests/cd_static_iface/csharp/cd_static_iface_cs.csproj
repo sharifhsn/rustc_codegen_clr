@@ -5,11 +5,11 @@
     <TargetFramework>net$(RustDotnetVersion).0</TargetFramework>
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
-    <AssemblyName>cd_generic_iface_cs</AssemblyName>
+    <AssemblyName>cd_static_iface_cs</AssemblyName>
   </PropertyGroup>
 
-  <!-- AUTO-BUILD the Rust crate and reference its `cd_generic_iface.dll` (which `implements`
-       System.IEquatable<int>). -->
+  <!-- AUTO-BUILD the Rust crate and reference its `cd_static_iface.dll` (which defines the IParse
+       interface with STATIC ABSTRACT members synthesized from a Rust trait via #[dotnet_interface]). -->
   <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
           Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
   <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"

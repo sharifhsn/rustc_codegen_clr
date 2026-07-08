@@ -48,6 +48,8 @@ pub const SIG_DEFAULT: u8 = 0x00;
 pub const SIG_FIELD: u8 = 0x06;
 /// Local-variable-signature marker (§II.23.2.6).
 pub const SIG_LOCALS: u8 = 0x07;
+/// Property-signature marker (§II.23.2.5) — ORed with [`SIG_HASTHIS`] for an instance property.
+pub const SIG_PROPERTY: u8 = 0x08;
 /// MethodSpec instantiation marker (§II.23.2.15).
 pub const SIG_GENERICINST_METHOD: u8 = 0x0A;
 
@@ -282,6 +284,30 @@ pub fn encode_field_sig(
 ) {
     out.push(SIG_FIELD);
     encode_non_void_type(tpe, asm, resolver, out);
+}
+
+/// A `PropertySig` (§II.23.2.5): `PROPERTY (0x08) [| HASTHIS (0x20)]`, compressed `ParamCount`,
+/// the property's value `Type`, then the indexer parameter types. This backend only emits
+/// NON-INDEXER properties (`#[dotnet_property]` scope), so `ParamCount` is always 0 and no
+/// parameter types follow. The value type is encoded with the RAW encoder ([`encode_type`]),
+/// byte-matching the getter's return-type encoding — the two blobs must agree for csc's
+/// `PEPropertySymbol` accessor-shape validation; a `void`-typed property is rejected upstream
+/// (macro + comptime), so no `RustVoid` substitution question arises here.
+pub fn encode_property_sig(
+    has_this: bool,
+    tpe: Type,
+    asm: &mut Assembly,
+    resolver: &mut impl TypeDefOrRefResolver,
+    out: &mut Vec<u8>,
+) {
+    let convention = if has_this {
+        SIG_PROPERTY | SIG_HASTHIS
+    } else {
+        SIG_PROPERTY
+    };
+    out.push(convention);
+    write_compressed_u32(out, 0); // ParamCount — non-indexer only at shipped scope.
+    encode_type(tpe, asm, resolver, out);
 }
 
 /// A local-variable signature (§II.23.2.6), stored via `StandAloneSig` and referenced by fat
@@ -539,6 +565,28 @@ mod tests {
         let mut out = Vec::new();
         encode_method_spec_sig(&[Type::Int(Int::I32)], &mut asm, &mut StubResolver, &mut out);
         assert_eq!(out, [SIG_GENERICINST_METHOD, 1, ET_I4]);
+    }
+
+    /// §II.23.2.5: an instance `int Volume` property's signature blob is exactly
+    /// `[PROPERTY|HASTHIS, 0 params, ET_I4]` = `[0x28, 0x00, 0x08]` — the byte triple a real
+    /// Roslyn-compiled `int Volume { get; set; }` interface property carries.
+    #[test]
+    fn property_sig_encodes_property_hasthis_paramcount_and_type() {
+        let mut asm = Assembly::default();
+        let mut out = Vec::new();
+        encode_property_sig(true, Type::Int(Int::I32), &mut asm, &mut StubResolver, &mut out);
+        assert_eq!(out, [SIG_PROPERTY | SIG_HASTHIS, 0x00, ET_I4]);
+
+        // A managed-typed (System.String) property uses the dedicated ET_STRING element type.
+        let mut out = Vec::new();
+        encode_property_sig(true, Type::PlatformString, &mut asm, &mut StubResolver, &mut out);
+        assert_eq!(out, [SIG_PROPERTY | SIG_HASTHIS, 0x00, ET_STRING]);
+
+        // The (currently-unreached) static shape omits HASTHIS — pinned so a future static
+        // property doesn't silently ship the instance convention byte.
+        let mut out = Vec::new();
+        encode_property_sig(false, Type::Bool, &mut asm, &mut StubResolver, &mut out);
+        assert_eq!(out, [SIG_PROPERTY, 0x00, ET_BOOLEAN]);
     }
 
     #[test]

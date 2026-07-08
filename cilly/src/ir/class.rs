@@ -600,6 +600,23 @@ pub struct ClassDef {
     /// compiles to) declared on this class. Empty for the vast majority of classes. See
     /// `EventDef`'s doc for what a single entry needs.
     events: Vec<EventDef>,
+    /// The declared names of this type's generic parameters (`T`, `U`, …), in declaration order —
+    /// one `GenericParam` row each (§II.22.20) in the PE writer. NON-EMPTY only for a genuine
+    /// generic type DEFINITION (today: `#[dotnet_interface] trait IFoo<T>` — a generic
+    /// *interface*, which has no layout, so the historical "no explicit layout on .NET generics"
+    /// ban does not apply). Must satisfy `generic_names.len() == generics as usize` whenever
+    /// non-empty (enforced by [`ClassDef::with_type_generic_names`], the only setter). Empty for
+    /// every class that existed before this field: additive, `ClassDef::new` never sets it.
+    /// NOTE: adding this field changed the postcard-serialized `.bc` format (the documented
+    /// build-std fingerprint trap — rebuild dylib+linker together and clean consumers).
+    generic_names: Vec<Interned<IString>>,
+    /// `.NET` properties (ECMA-335 §II.22.34 Property + §II.22.35 PropertyMap + §II.22.28
+    /// MethodSemantics `Getter`/`Setter` — the shape C#'s `int Volume { get; set; }` compiles
+    /// to) declared on this class. Empty for the vast majority of classes; today populated only
+    /// for `#[dotnet_property]` members inside a `#[dotnet_interface]` trait. See `PropertyDef`'s
+    /// doc for what a single entry needs. NOTE: adding this field changed the
+    /// postcard-serialized `.bc` format (the same fingerprint trap as `generic_names` above).
+    properties: Vec<PropertyDef>,
 }
 /// One ECMA-335 event (§II.22.13 Event + §II.22.28 MethodSemantics `AddOn`/`RemoveOn`): a name, the
 /// delegate type subscribers must match, and the two *ordinary* instance methods (already emitted
@@ -657,6 +674,63 @@ impl EventDef {
         self.remove
     }
 }
+/// One ECMA-335 property (§II.22.34 `Property` + §II.22.28 `MethodSemantics` `Getter`(0x2)/
+/// `Setter`(0x1)): a name, the property's value type, and up to two *ordinary* accessor methods
+/// (already emitted as regular `MethodDef`s by their owning class — this struct only LINKS them
+/// into the Property-shaped metadata, it introduces no new invocation semantics). At least one
+/// accessor must be present (`new` asserts it): a get-only property has `setter == None`;
+/// write-only properties are not representable (rejected upstream at the `#[dotnet_property]`
+/// macro level — C# has no idiomatic write-only-property surface worth emitting).
+///
+/// Scoped intentionally narrow, matching `EventDef`'s scope discipline: non-indexer (`ParamCount
+/// == 0` in the §II.23.2.5 `PropertySig`), instance-membered, proven for `#[dotnet_property]`
+/// accessors on a `#[dotnet_interface]` trait (abstract `get_X`/`set_X` `MethodDef`s, RVA=0).
+#[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
+pub struct PropertyDef {
+    name: Interned<IString>,
+    tpe: Type,
+    getter: Option<Interned<MethodRef>>,
+    setter: Option<Interned<MethodRef>>,
+}
+impl PropertyDef {
+    /// # Panics
+    /// If BOTH accessors are `None` — a property with no accessors is malformed metadata
+    /// (nothing for `MethodSemantics` to associate), fail at construction rather than emit it.
+    #[must_use]
+    pub fn new(
+        name: Interned<IString>,
+        tpe: Type,
+        getter: Option<Interned<MethodRef>>,
+        setter: Option<Interned<MethodRef>>,
+    ) -> Self {
+        assert!(
+            getter.is_some() || setter.is_some(),
+            "PropertyDef::new: a property needs at least one accessor"
+        );
+        Self {
+            name,
+            tpe,
+            getter,
+            setter,
+        }
+    }
+    #[must_use]
+    pub fn name(&self) -> Interned<IString> {
+        self.name
+    }
+    #[must_use]
+    pub fn tpe(&self) -> Type {
+        self.tpe
+    }
+    #[must_use]
+    pub fn getter(&self) -> Option<Interned<MethodRef>> {
+        self.getter
+    }
+    #[must_use]
+    pub fn setter(&self) -> Option<Interned<MethodRef>> {
+        self.setter
+    }
+}
 impl ClassDef {
     /// Checks if this class defition has a with the name and type.
     #[must_use]
@@ -681,6 +755,8 @@ impl ClassDef {
             .chain(self.implements.iter().map(|cref| Type::ClassRef(*cref)))
             // Same CS0012-avoidance reasoning for each event's delegate type.
             .chain(self.events.iter().map(EventDef::delegate))
+            // And for each property's value type (the `Type` inside the §II.23.2.5 PropertySig).
+            .chain(self.properties.iter().map(PropertyDef::tpe))
     }
     #[allow(clippy::too_many_arguments)]
     #[must_use]
@@ -712,6 +788,8 @@ impl ClassDef {
             has_nonveralpping_layout,
             is_interface: false,
             events: vec![],
+            generic_names: vec![],
+            properties: vec![],
         }
     }
 
@@ -721,6 +799,33 @@ impl ClassDef {
     pub fn with_interface(mut self) -> Self {
         self.is_interface = true;
         self
+    }
+
+    /// Attaches the declared generic-parameter names of a generic type DEFINITION (see the
+    /// `generic_names` field's doc). `names.len()` must equal the `generics` arity this def was
+    /// constructed with — a mismatched def is a construction bug, failed loudly here rather than
+    /// as malformed `GenericParam` metadata.
+    ///
+    /// # Panics
+    /// If `names.len() != self.generics()`.
+    #[must_use]
+    pub fn with_type_generic_names(mut self, names: Vec<Interned<IString>>) -> Self {
+        assert_eq!(
+            names.len(),
+            self.generics as usize,
+            "ClassDef::with_type_generic_names: {} name(s) for a generic arity of {}",
+            names.len(),
+            self.generics
+        );
+        self.generic_names = names;
+        self
+    }
+
+    /// The declared generic-parameter names of a generic type definition (empty for every
+    /// non-generic class — see the `generic_names` field's doc).
+    #[must_use]
+    pub fn generic_names(&self) -> &[Interned<IString>] {
+        &self.generic_names
     }
 
     #[must_use]
@@ -756,8 +861,33 @@ impl ClassDef {
         self.events.push(ev);
     }
 
+    /// The `.NET` properties declared on this class (see `PropertyDef`'s doc). Usually empty.
+    #[must_use]
+    pub fn properties(&self) -> &[PropertyDef] {
+        &self.properties
+    }
+
+    /// Declare a property on this class. The accessor methods it names must already exist as
+    /// ordinary `MethodDef`s on this class — this only links them into the Property-shaped
+    /// metadata (see `PropertyDef`'s doc).
+    pub fn add_property(&mut self, prop: PropertyDef) {
+        self.properties.push(prop);
+    }
+
     pub(crate) fn ref_to(&self) -> ClassRef {
-        assert_eq!(self.generics, 0);
+        // A generic type DEFINITION's canonical identity is its OPEN shape (bare name, no
+        // argument list) — exactly what every registration/lookup site (`Assembly::class_def`,
+        // `asm_link`) keys on — so the open `ClassRef` below is correct for the generic case
+        // too. The invariant enforced here is def-construction consistency, NOT a typechecker
+        // rule: a nonzero arity is only valid with matching declared parameter names
+        // (`with_type_generic_names`), otherwise the PE writer would emit an arity with no
+        // `GenericParam` rows.
+        assert!(
+            self.generics == 0 || self.generics as usize == self.generic_names.len(),
+            "ClassDef::ref_to: generic arity {} but {} declared generic parameter name(s)",
+            self.generics,
+            self.generic_names.len()
+        );
         ClassRef::new(self.name, None, self.is_valuetype, vec![].into())
     }
     pub fn layout_check(&self, asm: &Assembly) -> Result<(), LayoutError> {
@@ -845,6 +975,10 @@ impl ClassDef {
         assert_eq!(self.is_valuetype(), translated.is_valuetype());
         // Check generic count matches
         assert_eq!(self.generics(), translated.generics());
+        // Check declared generic-parameter names match (interned in the SAME assembly by the
+        // time merge runs — `asm_link::translate_class_def` re-interns them before merging, so
+        // a missed translation site fails THIS assert loudly instead of silently dropping rows).
+        assert_eq!(self.generic_names(), translated.generic_names());
         // Check inheretence matches
         assert_eq!(self.extends(), translated.extends());
         // Check interface-ness matches (a class re-opened by several entrypoints must agree on
@@ -861,6 +995,17 @@ impl ClassDef {
         for ev in translated.events() {
             if !self.events.iter().any(|existing| existing.name() == ev.name()) {
                 self.events.push(ev.clone());
+            }
+        }
+
+        // Union the declared properties, deduplicating by name (same reasoning as events above).
+        for prop in translated.properties() {
+            if !self
+                .properties
+                .iter()
+                .any(|existing| existing.name() == prop.name())
+            {
+                self.properties.push(prop.clone());
             }
         }
 

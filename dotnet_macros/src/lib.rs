@@ -303,62 +303,678 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
 // #[dotnet_interface] — turn a Rust trait into a C#-consumable .NET interface.
 // ============================================================================
 
+/// One self-callable instance member of a `#[dotnet_interface]` trait, as seen by the
+/// default-interface-method body rewriter ([`DimRewriter`]): the signature a `self.<name>(…)`
+/// call inside a default body must be lowered against. Types are cloned VERBATIM from the trait
+/// signature so the rewritten call's `MethodRef` signature is token-identical to the interface
+/// member's own declared signature (in-assembly method resolution is by exact interning match).
+struct DimCallee {
+    /// Non-receiver parameter types, verbatim from the trait signature.
+    arg_tys: Vec<Type>,
+    /// Return type (`None` = unit), verbatim from the trait signature.
+    ret_ty: Option<Type>,
+    /// The member has a reference (`&`/`&mut`) parameter. Such members are declared as managed
+    /// byrefs (`ref T`) on the interface, but a rewritten self-call would lower its argument as a
+    /// raw pointer (`T*`) — a signature MISMATCH that would resolve to a dangling `MemberRef`
+    /// instead of the interface's own `MethodDef`. No sound lowering exists today, so the
+    /// rewriter rejects self-calls to these loudly. (This detection is SYNTACTIC — a type alias
+    /// hiding the reference defeats it; the linker's interface missing-method backstop catches
+    /// that case at build time.)
+    byref: bool,
+    /// The member declares method-level generic parameters (`fn Echo<T>(…)`). Its `arg_tys`/
+    /// `ret_ty` are then spelled in terms of `T`, which has no meaning inside the lifted DIM
+    /// free fn: cloning them into the rewritten call either fails to resolve (confusing E0425
+    /// deep in generated code) or — worse — silently resolves to an in-scope CONCRETE type of
+    /// the same name, interning a `MethodRef` that matches no interface member. The rewriter
+    /// rejects self-calls to generic members loudly.
+    generic: bool,
+}
+
+/// Rewrites a default interface method's Rust body so it can be lifted out of the trait into a
+/// free fn (the DIM's real, codegen'd body): `self.<trait_method>(args…)` becomes
+/// `this.instanceN::<"<Method>", ArgTys…, Ret>(args…)` — a `callvirt` through the interface
+/// handle (see `call_managed`'s reference-type branch in `src/terminator/call.rs`), so genuine
+/// virtual dispatch: an implementing class's own definition wins even when called from inside the
+/// DIM. Any remaining bare `self` path is rewritten to `this` (the handle IS the receiver, and is
+/// `Copy`). Everything `self`-shaped that has NO faithful lowering is recorded as an error —
+/// unknown/supertrait methods, >2-argument calls (the `instanceN` ladder tops out at
+/// `managed_call3_` = receiver + 2), turbofish, byref-parameter members. The AST visitor cannot
+/// see into macro-invocation token streams (`println!("{}", self.x())`), so the caller must ALSO
+/// run [`tokens_contain_self_ident`] over the rewritten body as a backstop.
+struct DimRewriter<'a> {
+    callees: &'a std::collections::HashMap<String, DimCallee>,
+    errors: Vec<syn::Error>,
+}
+
+impl syn::visit_mut::VisitMut for DimRewriter<'_> {
+    fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
+        // `self.M(args…)` — handled BEFORE the default child traversal: the receiver `self` is
+        // consumed by this rewrite, and letting the default traversal see it first would turn it
+        // into a bare `this` and break the pattern match.
+        if let syn::Expr::MethodCall(mc) = expr {
+            let receiver_is_self = matches!(
+                &*mc.receiver,
+                syn::Expr::Path(p) if p.qself.is_none() && p.path.is_ident("self")
+            );
+            if receiver_is_self {
+                // The arguments may themselves contain self-calls / bare `self` — rewrite them
+                // first (the receiver is deliberately NOT visited).
+                for arg in mc.args.iter_mut() {
+                    self.visit_expr_mut(arg);
+                }
+                let mname = mc.method.to_string();
+                let Some(callee) = self.callees.get(&mname) else {
+                    self.errors.push(syn::Error::new_spanned(
+                        &mc.method,
+                        format!(
+                            "#[dotnet_interface]: this default body calls `self.{mname}(…)`, \
+                             which is not an instance method of this trait — only self-calls on \
+                             the trait's own instance members can be lowered to .NET interface \
+                             dispatch (supertrait members aren't supported yet)"
+                        ),
+                    ));
+                    return;
+                };
+                if callee.generic {
+                    self.errors.push(syn::Error::new_spanned(
+                        &mc.method,
+                        format!(
+                            "#[dotnet_interface]: default body cannot call `self.{mname}(…)` — \
+                             `{mname}` is a generic method (`fn {mname}<T>(…)`), and its \
+                             `T`-spelled signature has no meaning inside the lifted default \
+                             body (the rewritten call would either fail to resolve or silently \
+                             bind `T` to an unrelated in-scope type of the same name); self-calls \
+                             to generic members are not supported"
+                        ),
+                    ));
+                    return;
+                }
+                if mc.turbofish.is_some() {
+                    self.errors.push(syn::Error::new_spanned(
+                        &mc.method,
+                        format!(
+                            "#[dotnet_interface]: `self.{mname}::<…>(…)` — turbofish on a \
+                             self-call in a default body is not supported (the rewritten call's \
+                             signature comes verbatim from the trait declaration, so there is \
+                             nothing a turbofish could parameterize)"
+                        ),
+                    ));
+                    return;
+                }
+                if callee.byref {
+                    self.errors.push(syn::Error::new_spanned(
+                        &mc.method,
+                        format!(
+                            "#[dotnet_interface]: default body cannot call `self.{mname}(…)` — \
+                             `{mname}` has a reference (`&mut T`) parameter, declared as a \
+                             managed byref (`ref T`) on the interface, and a rewritten self-call \
+                             would mismatch that signature (raw-pointer lowering); byref \
+                             self-calls are not supported yet"
+                        ),
+                    ));
+                    return;
+                }
+                if mc.args.len() != callee.arg_tys.len() {
+                    self.errors.push(syn::Error::new_spanned(
+                        &mc.method,
+                        format!(
+                            "#[dotnet_interface]: `self.{mname}(…)` passes {} argument(s) but \
+                             the trait declares {} — argument count must match the trait \
+                             signature exactly",
+                            mc.args.len(),
+                            callee.arg_tys.len()
+                        ),
+                    ));
+                    return;
+                }
+                if callee.arg_tys.len() > 2 {
+                    self.errors.push(syn::Error::new_spanned(
+                        &mc.method,
+                        format!(
+                            "#[dotnet_interface]: `self.{mname}(…)` takes {} arguments, but \
+                             self-calls in a default body support at most 2 (the mycorrhiza \
+                             `instanceN` call ladder tops out at receiver + 2 — extending it is \
+                             a mechanical follow-up)",
+                            callee.arg_tys.len()
+                        ),
+                    ));
+                    return;
+                }
+                let method_lit = LitStr::new(&mname, mc.method.span());
+                let instance_n = format_ident!("instance{}", callee.arg_tys.len());
+                let arg_tys = &callee.arg_tys;
+                let ret_tokens = match &callee.ret_ty {
+                    Some(t) => quote! { #t },
+                    None => quote! { () },
+                };
+                let args = std::mem::take(&mut mc.args);
+                *expr = syn::parse_quote!(
+                    this.#instance_n::<#method_lit, #(#arg_tys,)* #ret_tokens>(#args)
+                );
+                return;
+            }
+        }
+        syn::visit_mut::visit_expr_mut(self, expr);
+        // Any remaining bare `self` (e.g. passed as an argument) becomes the handle — sound
+        // because the handle IS the receiver and is `Copy`.
+        if let syn::Expr::Path(p) = expr {
+            if p.qself.is_none() && p.path.is_ident("self") {
+                *expr = syn::parse_quote!(this);
+            }
+        }
+    }
+}
+
+/// Recursively scans a token stream for any ident spelled `self` or `Self` — the load-bearing
+/// BACKSTOP behind [`DimRewriter`]: the AST visitor cannot see into macro-invocation bodies
+/// (`println!("{}", self.x())`) or shapes it doesn't model, and a residual `self` in the lifted
+/// fn would produce a confusing rustc error deep in macro-generated code (or worse). Anything
+/// this finds after rewriting is rejected loudly by the caller.
+fn tokens_contain_self_ident(ts: proc_macro2::TokenStream) -> bool {
+    ts.into_iter().any(|tt| match tt {
+        proc_macro2::TokenTree::Ident(i) => i == "self" || i == "Self",
+        proc_macro2::TokenTree::Group(g) => tokens_contain_self_ident(g.stream()),
+        _ => false,
+    })
+}
+
+/// If `ty` is EXACTLY a bare generic-parameter path — a single unqualified path segment with no
+/// arguments whose ident is one of the trait's declared type parameters — returns that
+/// parameter's declaration index (`T`->0, `U`->1, …). This is the ONLY position a generic
+/// parameter may occupy in a `#[dotnet_interface]` member signature: the carrier rewrites it to
+/// the `RustcCLRInteropTypeGeneric<N>` marker, which the backend lowers to `ELEMENT_TYPE_VAR N`
+/// (the `!N` the member's .NET signature needs). Composite uses (`&T`, `Vec<T>`, `(T,)`, …) have
+/// no faithful lowering and are rejected via [`first_generic_param_mention`].
+fn bare_generic_param(
+    ty: &syn::Type,
+    params: &std::collections::HashMap<String, usize>,
+) -> Option<usize> {
+    let syn::Type::Path(tp) = ty else { return None };
+    if tp.qself.is_some() || tp.path.segments.len() != 1 {
+        return None;
+    }
+    let seg = tp.path.segments.first()?;
+    if !seg.arguments.is_empty() {
+        return None;
+    }
+    params.get(&seg.ident.to_string()).copied()
+}
+
+/// Token-scans `ts` for any ident that names one of the trait's declared generic parameters,
+/// returning the first hit. Run AFTER [`bare_generic_param`] replacement: any survivor means the
+/// parameter appears inside a composite type (`&T`, `Vec<T>`, `[T; N]`, a nested generic, …) —
+/// shapes with no faithful `ELEMENT_TYPE_VAR` lowering — and the member must be rejected loudly
+/// rather than emitting a signature that silently treats `T` as an unrelated Rust type.
+fn first_generic_param_mention(
+    ts: proc_macro2::TokenStream,
+    params: &std::collections::HashMap<String, usize>,
+) -> Option<String> {
+    ts.into_iter().find_map(|tt| match tt {
+        proc_macro2::TokenTree::Ident(i) => {
+            let name = i.to_string();
+            params.contains_key(&name).then_some(name)
+        }
+        proc_macro2::TokenTree::Group(g) => first_generic_param_mention(g.stream(), params),
+        _ => None,
+    })
+}
+
 /// `#[dotnet_interface]` on a Rust `trait` emits a genuine ECMA-335 `interface` `TypeDef` (via the
 /// PE writer on the default `DIRECT_PE=1` path) whose members are the trait's methods, each an
 /// abstract (no-body) instance method. A C# consumer can then implement it (`class Foo :
 /// IMyInterface { … }`) and use it polymorphically, and a Rust `#[dotnet_class]` can implement it
 /// via `implements = "IMyInterface"`.
 ///
-/// Each trait method must take `&self` (or `&mut self`) as its first parameter — it becomes the
-/// interface's implicit `this` receiver — and must have NO default body (default interface methods
-/// aren't supported). The other parameters and the return type map straight through:
+/// A trait method taking `&self` (or `&mut self`) as its first parameter becomes an **instance**
+/// member — the receiver becomes the interface's implicit `this`. A trait fn with NO `self`
+/// receiver becomes a **`static abstract`** member (.NET 7+ *static virtual members in
+/// interfaces*, the `INumber<T>` generic-math shape): C# implements it as `public static …` and
+/// dispatches generically via `T.Member(…)` under a `where T : IFace` constraint. Both kinds mix
+/// freely in one trait. Parameters and return types map straight through:
 ///
 /// ```ignore
 /// #[dotnet_interface]
 /// pub trait ISpeaker {
 ///     fn Speak(&self);              // C#: void Speak();
 ///     fn Volume(&self) -> i32;      // C#: int Volume();
+///     fn Make() -> i32;             // C#: static abstract int Make();
 /// }
 /// ```
+///
+/// A `static abstract` member is declaration-only surface from the Rust side: Rust code cannot
+/// *call* it (that would need a `constrained.` generic call the backend doesn't emit) — the C#
+/// consumer implements and dispatches it.
+///
+/// **Default interface methods (DIM)**: an *instance* trait method WITH a default body becomes a
+/// genuine .NET default interface method (CoreCLR 3.0+) — a virtual, non-abstract member with a
+/// real IL body on the interface itself. A C# class that omits the member inherits the default;
+/// a class that defines it wins over the default (ordinary virtual dispatch):
+///
+/// ```ignore
+/// #[dotnet_interface]
+/// pub trait ICalc {
+///     fn Base(&self) -> i32;                       // C#: int Base();  (abstract — must implement)
+///     fn Doubled(&self) -> i32 { self.Base() * 2 } // C#: DIM — `self.Base()` dispatches virtually,
+///                                                  // so the implementing class's Base() is called
+/// }
+/// ```
+///
+/// The default body is ordinary Rust, restricted to shapes with a faithful .NET-dispatch lowering:
+/// `self.<trait_method>(…)` calls on the trait's OWN instance members (rewritten to a `callvirt`
+/// through the interface handle — at most 2 arguments, no byref-parameter members) plus self-free
+/// Rust code. Any other use of `self`/`Self` — a macro body like `println!("{}", self.x())`,
+/// calls on supertrait members, `Self::`-qualified paths — is rejected with a compile error rather
+/// than emitting a subtly-wrong body. Default bodies are not supported on `static` (receiver-less)
+/// members, `#[dotnet_event]` members, or methods with reference (`&T`/`&mut T`) parameters.
+///
+/// A trait fn marked `#[dotnet_event]` declares a `.NET` **event on the interface** instead of a
+/// plain method: the fn name is the event name, its single non-receiver parameter is the delegate
+/// type subscribers must match, and the abstract `add_<Name>`/`remove_<Name>` accessor pair (plus
+/// the `Event`/`EventMap`/`MethodSemantics` metadata rows) is synthesized from that one
+/// declaration. C# then implements it field-like (`class X : IButton { public event Action
+/// Clicked; }`) and subscribes through the interface reference:
+///
+/// ```ignore
+/// #[dotnet_interface]
+/// pub trait IButton {
+///     fn Id(&self) -> i32;
+///     #[dotnet_event]
+///     fn Clicked(&self, handler: ActionHandle);   // C#: event Action Clicked;
+/// }
+/// ```
+///
+/// (Note this deliberately differs from the class-side `#[dotnet_event("Name")]` pair form: class
+/// accessors have two distinct Rust bodies; interface accessors have none, so a single declaration
+/// makes a missing/mismatched half impossible by construction.)
+///
+/// A trait fn marked `#[dotnet_property]` declares a **.NET property accessor** on the interface:
+/// the fn MUST be named `get_<Prop>` (the getter — `&self`, no other parameters, returns the
+/// property's value) or `set_<Prop>` (the setter — `&mut self`/`&self` plus exactly ONE by-value
+/// parameter, no return). The pair (or a lone getter, for a get-only property) becomes ONE
+/// §II.22.34 `Property` row named `<Prop>` with `MethodSemantics` `Getter`/`Setter` rows over the
+/// abstract accessors, so C# sees and implements `int Volume { get; set; }` — including
+/// field-like auto-properties — and `typeof(I).GetProperty("Volume")` works:
+///
+/// ```ignore
+/// #[dotnet_interface]
+/// pub trait IVolume {
+///     #[dotnet_property]
+///     fn get_Volume(&self) -> i32;          // C#: int Volume { get; … }
+///     #[dotnet_property]
+///     fn set_Volume(&mut self, value: i32); //     …          { …; set; }
+///     #[dotnet_property]
+///     fn get_Name(&self) -> MString;        // C#: string Name { get; } (get-only)
+/// }
+/// ```
+///
+/// Loudly rejected (compile errors, never silently-wrong metadata): a marked fn not named
+/// `get_*`/`set_*`; a getter with parameters or without a return type (indexers/parameterized
+/// properties — C# `this[…]` — are not supported); a setter with any arity but one or with a
+/// return type; a setter whose value is passed by reference (`&T`/`&mut T` — a property's value
+/// travels by value); `#[dotnet_out]` on an accessor parameter; a `set_<Prop>` with no matching
+/// `get_<Prop>` (write-only properties); combining `#[dotnet_property]` with `#[dotnet_event]`,
+/// a default body, generic method parameters, or a static (receiver-less) member; a property
+/// whose VALUE type is a trait generic parameter (`-> T`); and an UNMARKED trait fn whose name
+/// collides with a property's reserved accessor slot (a plain `fn set_Volume` next to a get-only
+/// `Volume` property). A getter/setter TYPE disagreement is caught by the backend's comptime
+/// pass with a clean error naming the property. Rust-side callers still see plain
+/// `get_*`/`set_*` trait methods — the property surface is for the C# consumer.
+///
+/// **Interface inheritance**: the trait's supertrait list IS the .NET base-interface list — each
+/// supertrait becomes an `InterfaceImpl` row on this interface's own `TypeDef` (§II.10.1.3 — that,
+/// not `Extends`, is how ECMA-335 models `interface IDerived : IBase`), so C# sees the inheritance
+/// and the CLR computes the transitive closure (`impl is IBase` holds through `IDerived`):
+///
+/// ```ignore
+/// #[dotnet_interface]
+/// pub trait IPet: IAnimal + ILoud {   // C#: interface IPet : IAnimal, ILoud
+///     fn Cuteness(&self) -> i32;
+/// }
+/// ```
+///
+/// **Contract**: every supertrait must itself be a `#[dotnet_interface]` trait compiled into the
+/// same final assembly (the .NET name is the supertrait's last path segment). Anything else —
+/// `Clone`, `Send`, a plain Rust trait — fails LOUDLY at export/link time with an error naming
+/// both types (the macro cannot know which idents are .NET interfaces). For an EXTERNAL .NET base
+/// interface use the attribute form, same `[Assembly]Ns.Name` convention as `#[dotnet_class]`:
+///
+/// ```ignore
+/// #[dotnet_interface(implements = "[System.Runtime]System.IDisposable")]
+/// pub trait IManagedResource { fn Poke(&self); }
+/// ```
+///
+/// **Generic interfaces**: a plain type parameter list maps to a genuine generic .NET interface
+/// definition — the metadata name carries the CLS backtick-arity suffix (`IBox`1`), one
+/// `GenericParam` row per parameter, and a bare `T` in a member's parameter/return position
+/// becomes `ELEMENT_TYPE_VAR` (C#'s `T`). C# implements any instantiation (`class IntBox :
+/// IBox<int>`), and the parameterized `IBoxHandle<T>` alias lets Rust signatures reference an
+/// instantiation (e.g. `IBoxHandle<i32>` = `IBox<int>` in a `#[dotnet_export]` fn):
+///
+/// ```ignore
+/// #[dotnet_interface]
+/// pub trait IBox<T> {
+///     fn Get(&self) -> T;           // C#: T Get();
+///     fn Put(&mut self, value: T);  // C#: void Put(T value);
+///     fn Count(&self) -> i32;       // C#: int Count();  (non-generic members mix freely)
+/// }
+/// ```
+///
+/// Loudly rejected on a generic trait (compile errors, never silently-wrong metadata): lifetime
+/// or const parameters, parameter defaults (`<T = i32>`), bounds/`where` clauses (no
+/// `GenericParamConstraint` emission), `T` anywhere except a bare parameter/return position
+/// (`&T`, `Vec<T>`, `(T,)`, …), default method bodies, and a generic parameter as an event's
+/// delegate type.
+///
+/// **Generic methods**: a plain type-parameter list on an *instance* trait method maps to a
+/// genuine generic .NET method DEFINITION — the member's signature carries `SIG_GENERIC` + a
+/// `GenParamCount`, one method-owned `GenericParam` row is emitted per parameter (§II.22.20),
+/// and a bare `T` in a parameter/return position becomes `ELEMENT_TYPE_MVAR` (C#'s method-level
+/// `T`, `!!N`). C# implements and calls it as an ordinary generic interface method, including
+/// via reflection (`GetMethod("Echo").MakeGenericMethod(typeof(int))`). Method- and trait-level
+/// parameters mix freely on a generic trait (`trait IBox<T> { fn Pick<U>(&self, a: T, b: U) ->
+/// U; }` — `U Pick<U>(T a, U b)`):
+///
+/// ```ignore
+/// #[dotnet_interface]
+/// pub trait IConverter {
+///     fn Echo<T>(&self, value: T) -> T;             // C#: T Echo<T>(T value);
+///     fn First<K, V>(&self, key: K, value: V) -> K; // C#: K First<K, V>(K key, V value);
+/// }
+/// ```
+///
+/// Loudly rejected on a generic method (same rules as the trait-level list): bounds
+/// (`fn f<T: Clone>`), `where` clauses, lifetime/const parameters, defaults, and a parameter
+/// used anywhere except a bare parameter/return position. Also rejected: generic parameters on
+/// a `#[dotnet_event]` member, on a method with a default body (the lifted DIM body would need
+/// a generic IL body), and on a static (receiver-less) member (generic `static abstract` isn't
+/// emitted yet). Like a `static abstract`, a generic member is declaration-only surface from
+/// the Rust side: Rust code cannot *call* it through the handle yet (the trait is a declaration
+/// vehicle); the C# consumer implements and dispatches it.
+///
+/// **`ref`/`out` parameters**: a `&mut T` (thin, sized `T`) parameter maps to a managed byref —
+/// C# sees `ref T` — and marking it `#[dotnet_out]` additionally stamps `ParamAttributes.Out`
+/// so C# sees `out T`:
+///
+/// ```ignore
+/// #[dotnet_interface]
+/// pub trait IRefCell {
+///     fn Fill(&self, slot: &mut i32);                  // C#: void Fill(ref int slot);
+///     fn FillOut(&self, #[dotnet_out] slot: &mut i32); // C#: void FillOut(out int slot);
+/// }
+/// ```
+///
+/// The mapping is byref-only for `&mut`: shared `&T` parameters are rejected (C# `in T` would
+/// need `modreq(InAttribute)`), as are reference RETURNS and `&mut` to unsized types
+/// (`&mut str`/`&mut [T]`/`&mut dyn`, which have no managed-byref equivalent — alias-hidden cases
+/// are caught by the backend). Raw pointers keep their meaning: `*mut T`/`*const T` still emit
+/// C# `T*` (the unsafe escape hatch). NOTE: the byref mapping applies to `#[dotnet_interface]`
+/// members only — a Rust `#[dotnet_class]`/`#[dotnet_methods]` implementor still lowers `&mut T`
+/// to `T*`, so a Rust class named in `implements =` for a byref-parameter interface fails LOUDLY
+/// at CLR type load (`TypeLoadException` naming the unimplemented member); implement such
+/// interfaces from C# for now (see `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md`).
 ///
 /// The macro also emits an `<Name>Handle` managed-handle alias (a Rust-side reference to the
 /// interface type). The trait itself is re-emitted unchanged — it is a declaration vehicle only
 /// (nothing needs to `impl` it in Rust; managed types satisfy the interface by name+signature).
 #[proc_macro_attribute]
-pub fn dotnet_interface(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(item as ItemTrait);
+pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut input = parse_macro_input!(item as ItemTrait);
     let trait_name = input.ident.clone();
     let span = trait_name.span();
-    let name_lit = LitStr::new(&trait_name.to_string(), span);
     let handle_ident = format_ident!("{}Handle", trait_name);
     let entry_mod = format_ident!("__dotnet_interface_{}", trait_name);
 
-    // Reject the trait-level shapes this doesn't model yet — LOUDLY, rather than silently dropping
-    // the type parameters / supertraits and emitting a subtly-wrong non-generic / base-less
-    // interface. (Generic interfaces `IFoo<T>` and interface inheritance `IDerived : IBase` are
-    // real .NET features, just not wired through `#[dotnet_interface]` — see the surface audit.)
-    if !input.generics.params.is_empty() {
-        return syn::Error::new(
-            input.generics.span(),
-            "#[dotnet_interface]: generic interfaces (`trait IFoo<T>`) are not supported yet",
-        )
-        .to_compile_error()
-        .into();
-    }
-    if !input.supertraits.is_empty() {
-        return syn::Error::new(
-            input.supertraits.span(),
-            "#[dotnet_interface]: interface inheritance (`trait IDerived: IBase`) is not \
-             supported yet",
-        )
-        .to_compile_error()
-        .into();
+    // ---- attribute args: implements = "[Assembly]Ns.IExternal" (`;`-separated for several) ----
+    // External .NET base interfaces, same `[Assembly]Ns.Name` convention as `#[dotnet_class]`'s
+    // `implements`. Same-assembly Rust bases use the supertrait list instead (below).
+    let mut extern_bases: Vec<(String, String)> = Vec::new();
+    if !attr.is_empty() {
+        let parser = Punctuated::<MetaNameValue, Token![,]>::parse_terminated;
+        let metas = match syn::parse::Parser::parse(parser, attr) {
+            Ok(m) => m,
+            Err(e) => return e.to_compile_error().into(),
+        };
+        for m in metas {
+            if m.path.is_ident("implements") {
+                let s = match str_lit_value(&m.value) {
+                    Ok(s) => s,
+                    Err(e) => return e.to_compile_error().into(),
+                };
+                for spec in s.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                    if let Err(e) = validate_dotnet_ref(spec, m.value.span()) {
+                        return e.to_compile_error().into();
+                    }
+                    if spec.contains('<') {
+                        return syn::Error::new(
+                            m.value.span(),
+                            format!(
+                                "#[dotnet_interface]: generic base interfaces \
+                                 (`{spec}`) are not supported yet"
+                            ),
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                    extern_bases.push(split_dotnet_ref(spec));
+                }
+            } else {
+                let path = &m.path;
+                return syn::Error::new(
+                    m.path.span(),
+                    format!(
+                        "#[dotnet_interface]: unknown attribute key `{}`; expected `implements`",
+                        quote! { #path }
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
+        }
     }
 
-    // One signature-carrier fn + one `add_abstract_method_def` call per trait method.
+    // ---- generic type parameters (`trait IBox<T>`) -> a genuine generic .NET interface ----
+    // Plain type parameters map to ECMA-335 `GenericParam` rows (§II.22.20) on the interface's
+    // own TypeDef; every OTHER generic shape is rejected LOUDLY — `GenericParamConstraint`
+    // (0x2C) rows are not emitted, so a bound/where-clause would be silently dropped metadata
+    // (a lie to the C# consumer), and lifetimes/const params have no .NET representation.
+    let mut type_params: Vec<syn::Ident> = Vec::new();
+    for gp in &input.generics.params {
+        match gp {
+            syn::GenericParam::Type(tp) => {
+                if tp.default.is_some() {
+                    return syn::Error::new(
+                        tp.span(),
+                        "#[dotnet_interface]: type-parameter defaults (`<T = i32>`) are not \
+                         supported — .NET generic parameters have no default arguments",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                if !tp.bounds.is_empty() {
+                    return syn::Error::new(
+                        tp.bounds.span(),
+                        "#[dotnet_interface]: type-parameter bounds (`<T: Clone>`) are not \
+                         supported — `GenericParamConstraint` metadata is not emitted, so a \
+                         bound would be silently dropped rather than enforced on the C# side",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                type_params.push(tp.ident.clone());
+            }
+            syn::GenericParam::Lifetime(lt) => {
+                return syn::Error::new(
+                    lt.span(),
+                    "#[dotnet_interface]: lifetime parameters (`trait IFoo<'a>`) are not \
+                     supported — .NET generics have no lifetime concept",
+                )
+                .to_compile_error()
+                .into();
+            }
+            syn::GenericParam::Const(cp) => {
+                return syn::Error::new(
+                    cp.span(),
+                    "#[dotnet_interface]: const parameters (`<const N: usize>`) are not \
+                     supported — .NET generics are type-parameter-only",
+                )
+                .to_compile_error()
+                .into();
+            }
+        }
+    }
+    if let Some(wc) = &input.generics.where_clause {
+        return syn::Error::new(
+            wc.span(),
+            "#[dotnet_interface]: `where` clauses are not supported — \
+             `GenericParamConstraint` metadata is not emitted, so a constraint would be \
+             silently dropped rather than enforced on the C# side",
+        )
+        .to_compile_error()
+        .into();
+    }
+    // Declaration-order index of each generic parameter (`T`->0, `U`->1, …) — the `!N`
+    // (`ELEMENT_TYPE_VAR`) position a bare `T` in a member signature lowers to.
+    let param_index: std::collections::HashMap<String, usize> = type_params
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.to_string(), i))
+        .collect();
+    // The interface's .NET metadata name carries the CLS backtick-arity suffix (`IBox`1`) —
+    // what Roslyn requires to surface the type as `IBox<T>`.
+    let dotnet_name = if type_params.is_empty() {
+        trait_name.to_string()
+    } else {
+        format!("{trait_name}`{}", type_params.len())
+    };
+    let name_lit = LitStr::new(&dotnet_name, span);
+    // Supertraits: each becomes a .NET base interface (`interface IDerived : IBase` — an
+    // `InterfaceImpl` row on this interface's TypeDef). Only a plain, non-generic trait path is
+    // representable; every other bound shape is rejected loudly. The .NET name is the LAST path
+    // segment, and the supertrait must itself be a `#[dotnet_interface]` trait in the same
+    // assembly — an unresolvable name (e.g. `: Clone`) fails loudly at export/link time with an
+    // error naming it (the macro cannot know which idents are .NET interfaces).
+    let mut base_calls = Vec::new();
+    for bound in &input.supertraits {
+        match bound {
+            syn::TypeParamBound::Trait(tb) => {
+                if !matches!(tb.modifier, syn::TraitBoundModifier::None) {
+                    return syn::Error::new(
+                        bound.span(),
+                        "#[dotnet_interface]: `?Trait` supertrait bounds are not supported",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                if tb.lifetimes.is_some() {
+                    return syn::Error::new(
+                        bound.span(),
+                        "#[dotnet_interface]: higher-ranked (`for<…>`) supertrait bounds are \
+                         not supported",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                let seg = tb
+                    .path
+                    .segments
+                    .last()
+                    .expect("a trait bound path always has at least one segment");
+                if !seg.arguments.is_empty() {
+                    return syn::Error::new(
+                        bound.span(),
+                        "#[dotnet_interface]: generic supertraits (`trait IDerived: IBase<T>`) \
+                         are not supported yet",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                base_calls.push((String::new(), seg.ident.to_string()));
+            }
+            syn::TypeParamBound::Lifetime(_) => {
+                return syn::Error::new(
+                    bound.span(),
+                    "#[dotnet_interface]: lifetime bounds are not supported on \
+                     #[dotnet_interface] traits",
+                )
+                .to_compile_error()
+                .into();
+            }
+            other => {
+                return syn::Error::new(
+                    other.span(),
+                    "#[dotnet_interface]: unsupported supertrait bound — only plain, non-generic \
+                     trait paths (`trait IDerived: IBase`) are supported",
+                )
+                .to_compile_error()
+                .into();
+            }
+        }
+    }
+    base_calls.extend(extern_bases);
+    let base_iface_calls: Vec<_> = base_calls
+        .iter()
+        .map(|(asm_name, iface_name)| {
+            let asm_lit = LitStr::new(asm_name, span);
+            let iface_lit = LitStr::new(iface_name, span);
+            quote! {
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_interface_impl::<
+                    #asm_lit, #iface_lit,
+                >(class);
+            }
+        })
+        .collect();
+
+    // ---- Pre-pass: the trait's self-callable instance-member surface, for default-body
+    // (`self.<method>(…)`) rewriting. Built from the UNMODIFIED items before the main loop
+    // mutates them; events and static (receiver-less) members are excluded — a default body
+    // cannot dispatch to either.
+    let mut dim_callees: std::collections::HashMap<String, DimCallee> =
+        std::collections::HashMap::new();
+    for it in &input.items {
+        let TraitItem::Fn(m) = it else { continue };
+        if m.attrs.iter().any(|a| a.path().is_ident("dotnet_event")) {
+            continue;
+        }
+        if !matches!(m.sig.inputs.first(), Some(FnArg::Receiver(_))) {
+            continue;
+        }
+        let mut arg_tys = Vec::new();
+        let mut byref = false;
+        for arg in m.sig.inputs.iter().skip(1) {
+            if let FnArg::Typed(pt) = arg {
+                if matches!(&*pt.ty, Type::Reference(_)) {
+                    byref = true;
+                }
+                arg_tys.push((*pt.ty).clone());
+            }
+        }
+        let ret_ty = match &m.sig.output {
+            ReturnType::Default => None,
+            ReturnType::Type(_, ty) => Some((**ty).clone()),
+        };
+        let generic = !m.sig.generics.params.is_empty();
+        dim_callees.insert(m.sig.ident.to_string(), DimCallee { arg_tys, ret_ty, byref, generic });
+    }
+
+    // One signature-carrier fn + one `add_abstract_method_def` call per trait method — or, for a
+    // `#[dotnet_event]` member, ONE shared carrier (add/remove have identical signatures) + the
+    // abstract `add_<Name>`/`remove_<Name>` accessor pair with their event-binding marks — or,
+    // for a method WITH a default body, a lifted real fn + an `add_default_method_def` call (a
+    // .NET default interface method).
     let mut carriers = Vec::new();
     let mut method_calls = Vec::new();
-    for it in &input.items {
+    // Every .NET member name this interface declares (plain methods AND synthesized event
+    // accessors). A duplicate would silently emit two identically-named `MethodDef`s — reject it
+    // loudly instead (the synthesized `add_`/`remove_` names are the non-obvious collision).
+    let mut member_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // The `get_`/`set_` halves each `#[dotnet_property]` declares, keyed by property name in
+    // DECLARATION order (a Vec, not a HashMap — validation errors below must fire
+    // deterministically). Each half records the accessor fn's span for error placement. Validated
+    // as a whole after the member loop: a setter without a getter (write-only property) and an
+    // UNMARKED member squatting on a property's name or reserved accessor names are rejected.
+    let mut property_members: Vec<(String, (Option<proc_macro2::Span>, Option<proc_macro2::Span>))> =
+        Vec::new();
+    for it in &mut input.items {
         let TraitItem::Fn(m) = it else {
             return syn::Error::new(
                 it.span(),
@@ -367,52 +983,482 @@ pub fn dotnet_interface(_attr: TokenStream, item: TokenStream) -> TokenStream {
             .to_compile_error()
             .into();
         };
-        if m.default.is_some() {
+        // `async fn` has NO faithful interface lowering: the signature carrier is built from the
+        // declared inputs/output only, so the emitted member would be a *synchronous* `void`/`T`
+        // shape while the author expects a `Task`-returning one — reject loudly (the same axis
+        // `#[dotnet_export]` rejects; the Task/async bridge in `mycorrhiza::task` is a separate,
+        // explicit surface). `const fn` likewise has no .NET meaning.
+        if let Some(a) = &m.sig.asyncness {
+            return syn::Error::new(
+                a.span(),
+                "#[dotnet_interface]: `async fn` interface members are not supported — the \
+                 emitted .NET member would be a synchronous signature (`void`/`T`), not a \
+                 `Task`; declare a synchronous member, or use the mycorrhiza Task/async bridge \
+                 explicitly",
+            )
+            .to_compile_error()
+            .into();
+        }
+        if let Some(c) = &m.sig.constness {
+            return syn::Error::new(
+                c.span(),
+                "#[dotnet_interface]: `const fn` interface members are not supported — .NET \
+                 interface members have no const-evaluation concept",
+            )
+            .to_compile_error()
+            .into();
+        }
+        // `#[dotnet_event]` on a trait fn: the fn NAME is the event name, and the abstract
+        // `add_<Name>`/`remove_<Name>` accessor pair is synthesized from this single declaration
+        // (deliberately different from the class-side `#[dotnet_event("Name")]` pair form: class
+        // accessors have two distinct Rust bodies, interface accessors have none — one declaration
+        // makes a missing/mismatched half impossible by construction).
+        let mut is_event = false;
+        for attr in &m.attrs {
+            if attr.path().is_ident("dotnet_event") {
+                if !matches!(attr.meta, syn::Meta::Path(_)) {
+                    return syn::Error::new(
+                        attr.span(),
+                        "#[dotnet_interface]: on an interface, `#[dotnet_event]` takes no argument \
+                         — the fn name is the event name and the `add_`/`remove_` accessor pair is \
+                         synthesized from this single declaration (the class-side \
+                         `#[dotnet_event(\"Name\")]` pair form doesn't apply here)",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                is_event = true;
+            }
+        }
+        // Strip the marker so the re-emitted trait doesn't reference an unregistered attribute —
+        // the same idiom as `#[dotnet_methods]`'s per-method markers.
+        m.attrs.retain(|a| !a.path().is_ident("dotnet_event"));
+        // `#[dotnet_property]` on a `get_<Prop>`/`set_<Prop>` trait fn: the fn becomes an ordinary
+        // abstract accessor `MethodDef` (registered exactly like a plain method below), PLUS a
+        // `rustc_codegen_clr_mark_last_abstract_property_get`/`_set` call binding it into a
+        // §II.22.34 `Property` row named `<Prop>`. See the macro's top doc for the full contract.
+        let mut property_name: Option<(String, bool)> = None;
+        for attr in &m.attrs {
+            if attr.path().is_ident("dotnet_property") {
+                if !matches!(attr.meta, syn::Meta::Path(_)) {
+                    return syn::Error::new(
+                        attr.span(),
+                        "#[dotnet_interface]: `#[dotnet_property]` takes no argument",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                let fname_str = m.sig.ident.to_string();
+                let (prop, is_getter) = if let Some(rest) = fname_str.strip_prefix("get_") {
+                    (rest, true)
+                } else if let Some(rest) = fname_str.strip_prefix("set_") {
+                    (rest, false)
+                } else {
+                    return syn::Error::new(
+                        m.sig.ident.span(),
+                        format!(
+                            "#[dotnet_interface]: `#[dotnet_property]` fn `{fname_str}` must be \
+                             named `get_<Prop>` or `set_<Prop>`"
+                        ),
+                    )
+                    .to_compile_error()
+                    .into();
+                };
+                if prop.is_empty() {
+                    return syn::Error::new(
+                        m.sig.ident.span(),
+                        "#[dotnet_interface]: `#[dotnet_property]` accessor is missing the \
+                         property name after `get_`/`set_`",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                property_name = Some((prop.to_string(), is_getter));
+            }
+        }
+        m.attrs.retain(|a| !a.path().is_ident("dotnet_property"));
+        if property_name.is_some() && is_event {
+            return syn::Error::new(
+                m.sig.ident.span(),
+                "#[dotnet_interface]: `#[dotnet_property]` cannot be combined with \
+                 `#[dotnet_event]`",
+            )
+            .to_compile_error()
+            .into();
+        }
+        // A default body turns the member into a .NET *default interface method* (DIM) — handled
+        // in the emission branch below, after the shared parameter validation.
+        let has_default = m.default.is_some();
+        // On a GENERIC trait a default body has no sound lowering: the lifted DIM is a free fn
+        // where the trait's type parameters are not in scope (a `T`-typed value has no Rust
+        // representation there — the carrier-side `RustcCLRInteropTypeGeneric<N>` marker is a
+        // signature-only ZST, never a runtime value), and even a `T`-free body's `self.<m>(…)`
+        // rewrite would clone `T`-spelled types into the free fn. Reject loudly.
+        if has_default && !type_params.is_empty() {
             return syn::Error::new(
                 m.span(),
-                "#[dotnet_interface]: interface methods must have no body (default interface \
-                 methods aren't supported)",
+                "#[dotnet_interface]: default method bodies are not supported on generic \
+                 interfaces (`trait IFoo<T>`) yet — declare the member without a body and \
+                 implement it on the C# side",
             )
             .to_compile_error()
             .into();
         }
-        if !m.sig.generics.params.is_empty() {
+        if has_default && is_event {
+            return syn::Error::new(
+                m.span(),
+                "#[dotnet_interface]: a `#[dotnet_event]` declaration must have no body — the \
+                 accessor pair is synthesized, there is nothing a default body could attach to",
+            )
+            .to_compile_error()
+            .into();
+        }
+        if has_default && property_name.is_some() {
+            return syn::Error::new(
+                m.span(),
+                "#[dotnet_interface]: `#[dotnet_property]` accessors cannot have a default body \
+                 — declare them without a body and implement on the C# side",
+            )
+            .to_compile_error()
+            .into();
+        }
+        // ---- method-level generic parameters (`fn Echo<T>(&self, value: T) -> T`) -> a genuine
+        // generic .NET method DEFINITION: the member's signature blob carries `SIG_GENERIC` + a
+        // `GenParamCount`, one METHOD-owned ECMA-335 `GenericParam` row (§II.22.20) is emitted
+        // per parameter, and a bare `T` in a parameter/return position becomes
+        // `ELEMENT_TYPE_MVAR` (`!!N` — C#'s method-level `T`). Same acceptance rules as the
+        // trait-level list above: plain, unbounded, undefaulted type parameters only — every
+        // other shape is rejected LOUDLY (`GenericParamConstraint` rows are not emitted, so a
+        // bound would be silently-dropped metadata; lifetimes/consts have no .NET form).
+        let mut method_type_params: Vec<syn::Ident> = Vec::new();
+        for gp in &m.sig.generics.params {
+            match gp {
+                syn::GenericParam::Type(tp) => {
+                    if tp.default.is_some() {
+                        return syn::Error::new(
+                            tp.span(),
+                            "#[dotnet_interface]: type-parameter defaults (`fn f<T = i32>`) are \
+                             not supported — .NET generic parameters have no default arguments",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                    if !tp.bounds.is_empty() {
+                        return syn::Error::new(
+                            tp.bounds.span(),
+                            "#[dotnet_interface]: type-parameter bounds (`fn f<T: Clone>`) are \
+                             not supported on interface methods — `GenericParamConstraint` \
+                             metadata is not emitted, so a bound would be silently dropped \
+                             rather than enforced on the C# side; unconstrained type parameters \
+                             only",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                    method_type_params.push(tp.ident.clone());
+                }
+                syn::GenericParam::Lifetime(lt) => {
+                    return syn::Error::new(
+                        lt.span(),
+                        "#[dotnet_interface]: lifetime parameters (`fn f<'a>`) are not supported \
+                         on interface methods — .NET generics have no lifetime concept",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                syn::GenericParam::Const(cp) => {
+                    return syn::Error::new(
+                        cp.span(),
+                        "#[dotnet_interface]: const parameters (`fn f<const N: usize>`) are not \
+                         supported on interface methods — .NET generics are type-parameter-only",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+            }
+        }
+        if let Some(wc) = &m.sig.generics.where_clause {
+            return syn::Error::new(
+                wc.span(),
+                "#[dotnet_interface]: `where` clauses are not supported on interface methods — \
+                 `GenericParamConstraint` metadata is not emitted, so a constraint would be \
+                 silently dropped rather than enforced on the C# side",
+            )
+            .to_compile_error()
+            .into();
+        }
+        if is_event && !method_type_params.is_empty() {
             return syn::Error::new(
                 m.sig.generics.span(),
-                "#[dotnet_interface]: generic interface methods (`fn foo<T>(&self)`) are not \
-                 supported yet",
+                "#[dotnet_interface]: a `#[dotnet_event]` declaration cannot take generic \
+                 parameters — the synthesized `add_`/`remove_` accessors have a fixed \
+                 `void (DelegateType)` shape",
             )
             .to_compile_error()
             .into();
         }
-        let fn_ident = &m.sig.ident;
-        let fname_lit = LitStr::new(&fn_ident.to_string(), fn_ident.span());
-        let carrier_ident = format_ident!("__iface_sig_{}", fn_ident);
-
-        // Build the carrier's parameter list: the leading `&self`/`self` receiver becomes an
-        // explicit `_this: <Name>Handle` (the interface's own managed handle — the receiver an
-        // instance method carries at signature-input 0); every other parameter is kept verbatim.
-        let mut carrier_inputs: Punctuated<FnArg, Token![,]> = Punctuated::new();
-        match m.sig.inputs.first() {
-            Some(FnArg::Receiver(_)) => {
-                let recv: FnArg = syn::parse_quote!(_this: #handle_ident);
-                carrier_inputs.push(recv);
-            }
-            _ => {
-                return syn::Error::new(
-                    fn_ident.span(),
-                    format!(
-                        "#[dotnet_interface]: method `{fn_ident}` must take `&self` as its first \
-                         parameter — interface members are instance methods"
-                    ),
-                )
-                .to_compile_error()
-                .into();
-            }
+        if has_default && !method_type_params.is_empty() {
+            return syn::Error::new(
+                m.sig.generics.span(),
+                "#[dotnet_interface]: default method bodies are not supported on generic \
+                 methods (`fn f<T>(…) { … }`) — the lifted DIM body would need a generic IL \
+                 body, which this backend doesn't emit; declare the member without a body and \
+                 implement it on the C# side",
+            )
+            .to_compile_error()
+            .into();
         }
-        for arg in m.sig.inputs.iter().skip(1) {
+        // Declaration-order index of each METHOD generic parameter (`T`->0, `U`->1, …) — the
+        // `!!N` (`ELEMENT_TYPE_MVAR`) position a bare `T` lowers to. Disjoint from the
+        // trait-level `param_index` by construction: rustc rejects a method generic parameter
+        // shadowing the trait's (E0403) before this macro's output ever compiles.
+        let method_param_index: std::collections::HashMap<String, usize> = method_type_params
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.to_string(), i))
+            .collect();
+        // The union of both generic namespaces, for the residual-mention scan: after the bare
+        // substitutions below, ANY surviving mention of either kind of parameter is a composite
+        // use with no faithful lowering.
+        let all_param_index: std::collections::HashMap<String, usize> = param_index
+            .iter()
+            .chain(method_param_index.iter())
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        // Owned clone (not `&m.sig.ident`): the parameter loop below needs `&mut m.sig.inputs`
+        // to strip `#[dotnet_out]` markers in place, which a live shared borrow would block.
+        let fn_ident = m.sig.ident.clone();
+        let fname_lit = LitStr::new(&fn_ident.to_string(), fn_ident.span());
+        let carrier_ident = if is_event {
+            format_ident!("__iface_sig_event_{}", fn_ident)
+        } else {
+            format_ident!("__iface_sig_{}", fn_ident)
+        };
+
+        // Build the carrier's parameter list. A leading `&self`/`self` receiver marks an INSTANCE
+        // member: it becomes an explicit `_this: <Name>Handle` (the interface's own managed handle
+        // — the receiver an instance method carries at signature-input 0). NO receiver marks a
+        // **`static abstract`** member (.NET 7+ static virtual members in interfaces): the carrier
+        // takes the parameter list verbatim, with no `_this` at all. Every non-receiver parameter
+        // is kept verbatim in both cases.
+        let is_static = !matches!(m.sig.inputs.first(), Some(FnArg::Receiver(_)));
+        if property_name.is_some() && !method_type_params.is_empty() {
+            return syn::Error::new(
+                m.sig.generics.span(),
+                "#[dotnet_interface]: `#[dotnet_property]` accessors cannot be generic",
+            )
+            .to_compile_error()
+            .into();
+        }
+        if property_name.is_some() && is_static {
+            return syn::Error::new(
+                m.sig.ident.span(),
+                "#[dotnet_interface]: `#[dotnet_property]` accessors must take `&self`/`&mut \
+                 self` — static (receiver-less) properties are not supported",
+            )
+            .to_compile_error()
+            .into();
+        }
+        if is_static && !method_type_params.is_empty() {
+            return syn::Error::new(
+                m.sig.generics.span(),
+                "#[dotnet_interface]: generic parameters are not supported on static \
+                 (receiver-less) interface members yet — a generic `static abstract` \
+                 (`static abstract T Create<T>()`) is a metadata shape this backend doesn't \
+                 emit; take `&self` or drop the generic parameters",
+            )
+            .to_compile_error()
+            .into();
+        }
+        if has_default && is_static {
+            return syn::Error::new(
+                m.span(),
+                "#[dotnet_interface]: default bodies are only supported on instance (`&self`) \
+                 members — a `static` (receiver-less) member with a body would be a *non-abstract \
+                 static virtual*, a metadata shape this backend doesn't emit yet",
+            )
+            .to_compile_error()
+            .into();
+        }
+        let mut carrier_inputs: Punctuated<FnArg, Token![,]> = Punctuated::new();
+        if !is_static {
+            // On a GENERIC trait the public `<Name>Handle<T,…>` alias is itself parameterized —
+            // a carrier can't name it without arguments, so carriers use the module-private
+            // NON-generic `__IfaceDefHandle` alias instead (declared in the entry module below,
+            // pointing at the backtick-arity .NET name). The receiver is signature-input 0,
+            // which every exporter STRIPS before encoding (`export.rs` Pass 3 / `method_token`),
+            // so its exact shape is inert — it only needs to lower to a `ClassRef` of the
+            // interface's own def so the comptime layer can thread it.
+            let recv: FnArg = if type_params.is_empty() {
+                syn::parse_quote!(_this: #handle_ident)
+            } else {
+                syn::parse_quote!(_this: __IfaceDefHandle)
+            };
+            carrier_inputs.push(recv);
+        }
+        // 1-based positions (among the C#-visible, receiver-stripped parameters — exactly the
+        // emitted `Param` row Sequence numbers) of `#[dotnet_out]`-marked `&mut T` parameters.
+        let mut out_sequences: Vec<u16> = Vec::new();
+        let mut param_seq: u16 = 0;
+        for arg in m.sig.inputs.iter_mut().skip(usize::from(!is_static)) {
             match arg {
-                FnArg::Typed(pt) => carrier_inputs.push(FnArg::Typed(pt.clone())),
+                FnArg::Typed(pt) => {
+                    param_seq += 1;
+                    // `#[dotnet_out]` parameter marker: BYREF + `ParamAttributes.Out` => C# `out`.
+                    // Detect, validate its form, then STRIP it from the trait we re-emit AND from
+                    // the carrier clone below (it is not a real registered attribute — leaving it
+                    // in would be a "cannot find attribute" error; the same strip idiom as
+                    // `#[dotnet_event]` above).
+                    let mut is_out = false;
+                    for attr in &pt.attrs {
+                        if attr.path().is_ident("dotnet_out") {
+                            if !matches!(attr.meta, syn::Meta::Path(_)) {
+                                return syn::Error::new(
+                                    attr.span(),
+                                    "#[dotnet_interface]: `#[dotnet_out]` takes no arguments — \
+                                     write `#[dotnet_out] name: &mut T`",
+                                )
+                                .to_compile_error()
+                                .into();
+                            }
+                            is_out = true;
+                        }
+                    }
+                    pt.attrs.retain(|a| !a.path().is_ident("dotnet_out"));
+                    // Reference-typed parameters: `&mut T` maps to a managed byref (C# `ref T` /
+                    // `out T`); everything else reference-shaped is rejected loudly.
+                    if let syn::Type::Reference(r) = &*pt.ty {
+                        if has_default {
+                            return syn::Error::new(
+                                pt.ty.span(),
+                                "#[dotnet_interface]: reference parameters (`&T`/`&mut T`) are \
+                                 not supported on a method with a default body — the lifted DIM \
+                                 body compiles with raw-pointer lowering, which would not match \
+                                 the interface's managed-byref (`ref T`) surface; pass by value \
+                                 or drop the default body",
+                            )
+                            .to_compile_error()
+                            .into();
+                        }
+                        if is_event {
+                            return syn::Error::new(
+                                pt.ty.span(),
+                                format!(
+                                    "#[dotnet_interface]: event `{fn_ident}`'s parameter must be \
+                                     the subscriber delegate handle by value, not a reference"
+                                ),
+                            )
+                            .to_compile_error()
+                            .into();
+                        }
+                        if r.mutability.is_none() {
+                            return syn::Error::new(
+                                pt.ty.span(),
+                                "#[dotnet_interface]: shared-reference parameters (`&T`) are not \
+                                 supported on interface methods — C# `in T` would need \
+                                 `modreq(InAttribute)`. Use `&mut T` (C# `ref T`), pass by value, \
+                                 or use a raw pointer (`*const T` => C# `T*`)",
+                            )
+                            .to_compile_error()
+                            .into();
+                        }
+                    }
+                    if is_out {
+                        if is_event {
+                            return syn::Error::new(
+                                pt.span(),
+                                format!(
+                                    "#[dotnet_interface]: `#[dotnet_out]` is not valid on event \
+                                     `{fn_ident}`'s parameter — event accessor signatures are \
+                                     synthesized"
+                                ),
+                            )
+                            .to_compile_error()
+                            .into();
+                        }
+                        if is_static {
+                            return syn::Error::new(
+                                pt.span(),
+                                "#[dotnet_interface]: `#[dotnet_out]` is not supported on static \
+                                 (receiver-less) interface members yet — use plain `&mut T` \
+                                 (C# `ref T`) instead",
+                            )
+                            .to_compile_error()
+                            .into();
+                        }
+                        if !matches!(&*pt.ty, syn::Type::Reference(r) if r.mutability.is_some()) {
+                            return syn::Error::new(
+                                pt.span(),
+                                "#[dotnet_interface]: `#[dotnet_out]` is only valid on a \
+                                 `&mut T` parameter (spelled literally — an alias hiding the \
+                                 reference is not accepted)",
+                            )
+                            .to_compile_error()
+                            .into();
+                        }
+                        out_sequences.push(param_seq);
+                    }
+                    // GENERIC trait and/or GENERIC method: a parameter typed EXACTLY as a bare
+                    // generic parameter (`x: T`) becomes the matching signature marker in the
+                    // carrier — the METHOD's own parameters take priority-by-namespace (they are
+                    // disjoint from the trait's, see `method_param_index`'s comment) and map to
+                    // `RustcCLRInteropMethodGeneric<N>` (lowered to `ELEMENT_TYPE_MVAR N`, the
+                    // member's `!!N` position); the TRAIT's map to `RustcCLRInteropTypeGeneric
+                    // <N>` (`ELEMENT_TYPE_VAR N`, `!N`). Any OTHER use of either kind of
+                    // parameter (`&T`, `Vec<T>`, `(T,)`, …) has no faithful lowering and is
+                    // rejected loudly below (after these replacements, any surviving mention IS
+                    // such a use). The re-emitted trait keeps the original spelling — only the
+                    // carrier clone is rewritten.
+                    let mut carrier_pt = pt.clone();
+                    if !all_param_index.is_empty() {
+                        if let Some(idx) =
+                            bare_generic_param(&carrier_pt.ty, &method_param_index)
+                        {
+                            // `is_event && !method_type_params.is_empty()` was rejected above —
+                            // a method-generic marker can't reach an event's carrier.
+                            let idx_lit = proc_macro2::Literal::usize_unsuffixed(idx);
+                            carrier_pt.ty = Box::new(syn::parse_quote!(
+                                ::mycorrhiza::intrinsics::RustcCLRInteropMethodGeneric<#idx_lit>
+                            ));
+                        } else if let Some(idx) = bare_generic_param(&carrier_pt.ty, &param_index)
+                        {
+                            if is_event {
+                                return syn::Error::new(
+                                    pt.ty.span(),
+                                    format!(
+                                        "#[dotnet_interface]: event `{fn_ident}`'s parameter \
+                                         must be a concrete delegate handle — a generic \
+                                         parameter (`{}`) cannot be an event's delegate type",
+                                        type_params[idx]
+                                    ),
+                                )
+                                .to_compile_error()
+                                .into();
+                            }
+                            let idx_lit = proc_macro2::Literal::usize_unsuffixed(idx);
+                            carrier_pt.ty = Box::new(syn::parse_quote!(
+                                ::mycorrhiza::intrinsics::RustcCLRInteropTypeGeneric<#idx_lit>
+                            ));
+                        } else if let Some(bad) = first_generic_param_mention(
+                            quote::ToTokens::to_token_stream(&carrier_pt.ty),
+                            &all_param_index,
+                        ) {
+                            return syn::Error::new(
+                                pt.ty.span(),
+                                format!(
+                                    "#[dotnet_interface]: generic parameter `{bad}` may only \
+                                     appear as a BARE parameter or return type on an interface \
+                                     member (`x: {bad}` / `-> {bad}`) — composite uses \
+                                     (`&{bad}`, `Vec<{bad}>`, tuples, nested generics, …) have \
+                                     no .NET signature lowering here"
+                                ),
+                            )
+                            .to_compile_error()
+                            .into();
+                        }
+                    }
+                    carrier_inputs.push(FnArg::Typed(carrier_pt));
+                }
                 FnArg::Receiver(r) => {
                     return syn::Error::new(
                         r.span(),
@@ -423,32 +1469,514 @@ pub fn dotnet_interface(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
         }
+        // Byref returns (`fn f(&self) -> &mut i32`) have no supported mapping (C# `ref` returns
+        // are a different metadata shape than we emit) — reject loudly rather than emit `T*`.
+        if let ReturnType::Type(_, ty) = &m.sig.output {
+            if matches!(&**ty, syn::Type::Reference(_)) {
+                return syn::Error::new(
+                    ty.span(),
+                    "#[dotnet_interface]: reference returns (`-> &T` / `-> &mut T`) are not \
+                     supported on interface methods",
+                )
+                .to_compile_error()
+                .into();
+            }
+        }
         let output = &m.sig.output;
-        carriers.push(quote! {
-            fn #carrier_ident(#carrier_inputs) #output { ::core::unimplemented!() }
-        });
-        method_calls.push(quote! {
-            let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_abstract_method_def::<
-                #fname_lit, _,
-            >(class, #carrier_ident);
-        });
+        // The CARRIER's return type: a bare `-> T` naming a METHOD generic parameter becomes
+        // the `RustcCLRInteropMethodGeneric<N>` marker (`!!N`); one naming a TRAIT parameter
+        // becomes `RustcCLRInteropTypeGeneric<N>` (`!N`) — same rewrite + same loud
+        // composite-use reject as the parameter loop above; everything else passes through
+        // verbatim.
+        let carrier_output: ReturnType = match &m.sig.output {
+            ReturnType::Default => ReturnType::Default,
+            ReturnType::Type(arrow, ty) => {
+                if let Some(idx) = bare_generic_param(ty, &method_param_index) {
+                    let idx_lit = proc_macro2::Literal::usize_unsuffixed(idx);
+                    ReturnType::Type(
+                        *arrow,
+                        Box::new(syn::parse_quote!(
+                            ::mycorrhiza::intrinsics::RustcCLRInteropMethodGeneric<#idx_lit>
+                        )),
+                    )
+                } else if let Some(idx) = bare_generic_param(ty, &param_index) {
+                    let idx_lit = proc_macro2::Literal::usize_unsuffixed(idx);
+                    ReturnType::Type(
+                        *arrow,
+                        Box::new(syn::parse_quote!(
+                            ::mycorrhiza::intrinsics::RustcCLRInteropTypeGeneric<#idx_lit>
+                        )),
+                    )
+                } else if let Some(bad) = first_generic_param_mention(
+                    quote::ToTokens::to_token_stream(ty),
+                    &all_param_index,
+                ) {
+                    return syn::Error::new(
+                        ty.span(),
+                        format!(
+                            "#[dotnet_interface]: generic parameter `{bad}` may only appear as \
+                             a BARE parameter or return type on an interface member (`x: {bad}` \
+                             / `-> {bad}`) — composite uses (`&{bad}`, `Vec<{bad}>`, tuples, \
+                             nested generics, …) have no .NET signature lowering here"
+                        ),
+                    )
+                    .to_compile_error()
+                    .into();
+                } else {
+                    ReturnType::Type(*arrow, ty.clone())
+                }
+            }
+        };
+
+        // `#[dotnet_property]` accessor shape: a getter takes ONLY `&self` and returns the
+        // property's value; a setter takes `&self`/`&mut self` plus exactly ONE BY-VALUE
+        // parameter (no other .NET property setter shape exists in C#) and returns nothing.
+        // Bookkept in `property_members` (declaration order, NOT a HashMap — the write-only
+        // check below must fire deterministically) for the post-loop write-only-property check;
+        // a duplicate half (two getters/two setters for the same property) is rejected here.
+        if let Some((prop_name, is_getter)) = &property_name {
+            if *is_getter {
+                if carrier_inputs.len() != 1 {
+                    return syn::Error::new(
+                        m.sig.span(),
+                        format!(
+                            "#[dotnet_interface]: property getter `{fn_ident}` must take only \
+                             `&self` — no other parameters"
+                        ),
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                if matches!(m.sig.output, ReturnType::Default) {
+                    return syn::Error::new(
+                        m.sig.span(),
+                        format!(
+                            "#[dotnet_interface]: property getter `{fn_ident}` must return the \
+                             property's value"
+                        ),
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+            } else {
+                if carrier_inputs.len() != 2 {
+                    return syn::Error::new(
+                        m.sig.span(),
+                        format!(
+                            "#[dotnet_interface]: property setter `{fn_ident}` must take exactly \
+                             one parameter besides the receiver — the property's new value"
+                        ),
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                if !matches!(m.sig.output, ReturnType::Default) {
+                    return syn::Error::new(
+                        m.sig.output.span(),
+                        format!(
+                            "#[dotnet_interface]: property setter `{fn_ident}` must not return a \
+                             value"
+                        ),
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                // The general per-parameter loop above allows a `&mut T` parameter through
+                // (it becomes a C# `ref`/`out` parameter on an ordinary method) — but no C#
+                // property setter can be `ref`/`out`-valued, so reject it here explicitly rather
+                // than silently emitting an unimplementable property.
+                if let Some(FnArg::Typed(pt)) = m.sig.inputs.iter().nth(1) {
+                    if matches!(&*pt.ty, syn::Type::Reference(_)) {
+                        return syn::Error::new(
+                            pt.ty.span(),
+                            format!(
+                                "#[dotnet_interface]: property setter `{fn_ident}`'s value \
+                                 parameter must be passed by value, not by reference"
+                            ),
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                }
+            }
+            let slot_idx = property_members.iter().position(|(name, _)| name == prop_name);
+            let idx = slot_idx.unwrap_or_else(|| {
+                property_members.push((prop_name.clone(), (None, None)));
+                property_members.len() - 1
+            });
+            let (getter_span, setter_span) = &mut property_members[idx].1;
+            if *is_getter {
+                if getter_span.is_some() {
+                    return syn::Error::new(
+                        fn_ident.span(),
+                        format!(
+                            "#[dotnet_interface]: property `{prop_name}` declares two getters"
+                        ),
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                *getter_span = Some(fn_ident.span());
+            } else {
+                if setter_span.is_some() {
+                    return syn::Error::new(
+                        fn_ident.span(),
+                        format!(
+                            "#[dotnet_interface]: property `{prop_name}` declares two setters"
+                        ),
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                *setter_span = Some(fn_ident.span());
+            }
+        }
+
+        // Record the .NET member names this item declares, rejecting duplicates loudly.
+        let mut declare_member = |name: String, what: String| -> Option<TokenStream> {
+            if let Some(prev) = member_names.insert(name.clone(), what.clone()) {
+                let cur = &member_names[&name];
+                return Some(
+                    syn::Error::new(
+                        fn_ident.span(),
+                        format!(
+                            "#[dotnet_interface]: interface member name `{name}` is declared \
+                             twice: {prev} and {cur} — rename one of them"
+                        ),
+                    )
+                    .to_compile_error()
+                    .into(),
+                );
+            }
+            None
+        };
+
+        if is_event {
+            // Interface events are INSTANCE members: their accessors dispatch through an object
+            // reference (`obj.Clicked += …`). A "static abstract event" is technically legal in
+            // .NET 7+ metadata but has no consumer story here — reject it loudly rather than
+            // synthesize accessors of the wrong kind.
+            if is_static {
+                return syn::Error::new(
+                    fn_ident.span(),
+                    format!(
+                        "#[dotnet_interface]: event `{fn_ident}` must take `&self` as its first \
+                         parameter — static abstract events are not supported"
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
+            // Event shape guards: exactly ONE non-receiver parameter (the subscriber delegate)
+            // and no return value — the synthesized `add_`/`remove_` accessors are
+            // `void (DelegateType)`, so anything else cannot be represented.
+            if carrier_inputs.len() != 2 {
+                return syn::Error::new(
+                    m.sig.span(),
+                    format!(
+                        "#[dotnet_interface]: event `{fn_ident}` must take exactly one parameter \
+                         besides `&self` — the subscriber delegate, e.g. \
+                         `fn {fn_ident}(&self, handler: ActionHandle)`"
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
+            if !matches!(m.sig.output, ReturnType::Default) {
+                return syn::Error::new(
+                    m.sig.output.span(),
+                    format!(
+                        "#[dotnet_interface]: event `{fn_ident}` must not declare a return type — \
+                         event accessors are `void`"
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
+            let event_name = fn_ident.to_string();
+            let add_lit = LitStr::new(&format!("add_{event_name}"), fn_ident.span());
+            let remove_lit = LitStr::new(&format!("remove_{event_name}"), fn_ident.span());
+            for accessor in [format!("add_{event_name}"), format!("remove_{event_name}")] {
+                if let Some(err) = declare_member(
+                    accessor.clone(),
+                    format!("the `{accessor}` accessor synthesized for event `{event_name}`"),
+                ) {
+                    return err;
+                }
+            }
+            // ONE shared signature carrier: `add` and `remove` have identical signatures, and
+            // `rustc_codegen_clr_add_abstract_method_def` only READS the carrier's signature
+            // (never aliases/codegens it), so a single carrier serves both accessors.
+            carriers.push(quote! {
+                fn #carrier_ident(#carrier_inputs) { ::core::unimplemented!() }
+            });
+            method_calls.push(quote! {
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_abstract_method_def::<
+                    #add_lit, _,
+                >(class, #carrier_ident);
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_mark_last_method_event_add::<
+                    #fname_lit,
+                >(class);
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_abstract_method_def::<
+                    #remove_lit, _,
+                >(class, #carrier_ident);
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_mark_last_method_event_remove::<
+                    #fname_lit,
+                >(class);
+            });
+        } else if has_default {
+            // ---- Default interface method (DIM). The body is LIFTED out of the trait into a
+            // real, codegen'd free fn: `self` becomes the explicit `this` handle, and every
+            // `self.<trait_method>(…)` call is rewritten to a `callvirt` through that handle
+            // (see `DimRewriter`). The interface member is then a virtual, NON-abstract
+            // `MethodDef` aliasing this fn — same pipeline as a `#[dotnet_class]` virtual, just
+            // owned by an interface `TypeDef`. The trait itself is re-emitted verbatim (original
+            // body intact), so Rust-side trait semantics are unchanged.
+            if let Some(err) =
+                declare_member(fn_ident.to_string(), format!("method `{fn_ident}`"))
+            {
+                return err;
+            }
+            let dim_ident = format_ident!("__iface_dim_{}", fn_ident);
+            // The lifted fn's parameters: the carrier list with the receiver renamed `_this` →
+            // `this` (the DIM body actually USES it).
+            let mut dim_inputs = carrier_inputs.clone();
+            *dim_inputs
+                .first_mut()
+                .expect("instance member: carrier_inputs always starts with the receiver") =
+                syn::parse_quote!(this: #handle_ident);
+            let mut body = m
+                .default
+                .clone()
+                .expect("has_default was just checked");
+            let mut rewriter = DimRewriter { callees: &dim_callees, errors: Vec::new() };
+            syn::visit_mut::VisitMut::visit_block_mut(&mut rewriter, &mut body);
+            if let Some(err) = rewriter.errors.into_iter().reduce(|mut a, b| {
+                a.combine(b);
+                a
+            }) {
+                return err.to_compile_error().into();
+            }
+            // BACKSTOP: the AST rewrite cannot see into macro-invocation token streams
+            // (`println!("{}", self.x())`) or shapes it doesn't model — any `self`/`Self` ident
+            // still in the rewritten body means an unsupported use, rejected loudly here rather
+            // than as a confusing rustc error deep inside macro-generated code.
+            if tokens_contain_self_ident(quote::ToTokens::to_token_stream(&body)) {
+                return syn::Error::new(
+                    m.span(),
+                    format!(
+                        "#[dotnet_interface]: `{fn_ident}`'s default body uses `self`/`Self` in \
+                         a form that can't be lowered to .NET interface dispatch — only \
+                         `self.<trait_method>(…)` calls (at most 2 arguments) and passing `self` \
+                         to handle-taking helpers are supported; `self` inside a macro invocation \
+                         (e.g. `println!(\"{{}}\", self.x())`) must be hoisted to a `let` binding \
+                         first"
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
+            // `#[used]` fn-pointer anchor: the lifted fn has a REAL body the mono-collector must
+            // codegen (nothing calls it — the entrypoint only NAMES it and is interpreted, not
+            // codegen'd; without this the `AliasFor` edge would dangle). Exact idiom of
+            // `#[dotnet_methods]`' KEEP anchors.
+            let in_tys: Vec<Type> = dim_inputs
+                .iter()
+                .map(|arg| match arg {
+                    FnArg::Typed(pt) => (*pt.ty).clone(),
+                    FnArg::Receiver(_) => unreachable!("dim_inputs holds no receiver"),
+                })
+                .collect();
+            let out_tokens = match output {
+                ReturnType::Default => quote! { () },
+                ReturnType::Type(_, ty) => quote! { #ty },
+            };
+            let keep_ident = format_ident!("KEEP_DIM_{}", fn_ident);
+            carriers.push(quote! {
+                fn #dim_ident(#dim_inputs) #output #body
+                #[used]
+                static #keep_ident: fn(#(#in_tys),*) -> #out_tokens = #dim_ident;
+            });
+            method_calls.push(quote! {
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_default_method_def::<
+                    #fname_lit, _,
+                >(class, #dim_ident);
+            });
+        } else {
+            if let Some(err) =
+                declare_member(fn_ident.to_string(), format!("method `{fn_ident}`"))
+            {
+                return err;
+            }
+            carriers.push(quote! {
+                fn #carrier_ident(#carrier_inputs) #carrier_output { ::core::unimplemented!() }
+            });
+            if is_static {
+                // No `self` receiver -> a `static abstract` interface member (.NET 7+ static
+                // virtual members in interfaces). The carrier has no `_this`; its signature is
+                // the member's C#-visible parameter list verbatim.
+                method_calls.push(quote! {
+                    let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_static_abstract_method_def::<
+                        #fname_lit, _,
+                    >(class, #carrier_ident);
+                });
+            } else if !method_type_params.is_empty() {
+                // A generic method DEFINITION: the declared type-parameter names ride as a
+                // `;`-separated list (declaration order — the same `;`-list convention as
+                // `set_type_generics`) so the backend emits `SIG_GENERIC` + method-owned
+                // `GenericParam` rows. Instance-only by the guards above (no events, no
+                // defaults, no statics).
+                let gparams_csv = method_type_params
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(";");
+                let gparams_lit = LitStr::new(&gparams_csv, fn_ident.span());
+                method_calls.push(quote! {
+                    let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_generic_abstract_method_def::<
+                        #fname_lit, #gparams_lit, _,
+                    >(class, #carrier_ident);
+                });
+            } else {
+                method_calls.push(quote! {
+                    let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_abstract_method_def::<
+                        #fname_lit, _,
+                    >(class, #carrier_ident);
+                });
+                // `#[dotnet_property]`: bind the abstract member just registered above as a
+                // property getter/setter (`rustc_codegen_clr_mark_last_abstract_property_get`/
+                // `_set` — the same "mark the LAST member" contract as `#[dotnet_out]` below).
+                // Guarded above to only reach here as a plain (non-static, non-generic) instance
+                // member.
+                if let Some((prop_name, is_getter)) = &property_name {
+                    let prop_lit = LitStr::new(prop_name, fn_ident.span());
+                    if *is_getter {
+                        method_calls.push(quote! {
+                            let class = ::mycorrhiza::comptime::rustc_codegen_clr_mark_last_abstract_property_get::<
+                                #prop_lit,
+                            >(class);
+                        });
+                    } else {
+                        method_calls.push(quote! {
+                            let class = ::mycorrhiza::comptime::rustc_codegen_clr_mark_last_abstract_property_set::<
+                                #prop_lit,
+                            >(class);
+                        });
+                    }
+                }
+            }
+            // `#[dotnet_out]` positions ride as a CSV of 1-based (receiver-stripped) parameter
+            // positions in a `&'static str` const generic, marking the member the
+            // `add_abstract_method_def`/`add_generic_abstract_method_def` call directly above
+            // just registered (the same "mark the LAST member" contract as
+            // `#[dotnet_override]`/`#[dotnet_event]`; both intrinsics push to the same
+            // `abstract_methods` list the marker mutates). Always empty for a static member —
+            // the parameter loop rejects `#[dotnet_out]` there.
+            if !out_sequences.is_empty() {
+                let csv = out_sequences
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let out_lit = LitStr::new(&csv, fn_ident.span());
+                method_calls.push(quote! {
+                    let class = ::mycorrhiza::comptime::rustc_codegen_clr_mark_last_abstract_method_out_params::<
+                        #out_lit,
+                    >(class);
+                });
+            }
+        }
     }
+
+    // A `#[dotnet_property]` setter with no matching getter is a write-only property — C# has
+    // no idiomatic write-only-property surface, so reject it loudly here (a macro-level
+    // frontstop; `src/comptime.rs`'s `finish_type` carries the same check as a backstop for a
+    // hand-rolled entrypoint).
+    for (prop_name, (getter_span, setter_span)) in &property_members {
+        if getter_span.is_none() {
+            let span = setter_span.expect("a property entry always has at least one accessor");
+            return syn::Error::new(
+                span,
+                format!(
+                    "#[dotnet_interface]: property `{prop_name}` has a `set_{prop_name}` \
+                     accessor but no `get_{prop_name}` — write-only properties are not \
+                     supported; add `#[dotnet_property] fn get_{prop_name}(&self) -> ...`"
+                ),
+            )
+            .to_compile_error()
+            .into();
+        }
+    }
+
+    // The public managed-handle alias. Non-generic: a plain `RustcCLRInteropManagedClass`
+    // reference (unchanged surface). Generic: a PARAMETERIZED alias over
+    // `RustcCLRInteropManagedGeneric` — `IBoxHandle<i32>` lowers to the instantiated
+    // `ClassRef("IBox`1", None, [int32])`, usable in `#[dotnet_export]` signatures etc. (the
+    // trailing comma makes the type-argument tuple `(T,)` well-formed at arity 1).
+    let handle_alias = if type_params.is_empty() {
+        quote! {
+            /// Managed handle to this Rust-defined .NET interface (Rust-side references; C#
+            /// refers to the interface by its plain name).
+            #[allow(non_camel_case_types, dead_code)]
+            pub type #handle_ident =
+                ::mycorrhiza::intrinsics::RustcCLRInteropManagedClass<"", #name_lit>;
+        }
+    } else {
+        quote! {
+            /// Managed handle to an INSTANTIATION of this Rust-defined generic .NET interface
+            /// (e.g. `IBoxHandle<i32>` = `IBox<int>`). C# refers to the interface by its plain
+            /// generic name.
+            #[allow(non_camel_case_types, dead_code)]
+            pub type #handle_ident<#(#type_params),*> =
+                ::mycorrhiza::intrinsics::RustcCLRInteropManagedGeneric<
+                    "", #name_lit, (#(#type_params,)*),
+                >;
+        }
+    };
+    // Generic traits: (a) carriers need a NON-generic receiver alias (the public handle alias
+    // is parameterized — see the receiver comment above); (b) the entrypoint declares the
+    // parameter names via `set_type_generics` (`;`-separated, declaration order).
+    let iface_def_handle_alias = if type_params.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            /// The open interface definition's own handle — carrier-receiver use only (stripped
+            /// as signature-input 0 by every exporter).
+            #[allow(non_camel_case_types, dead_code)]
+            type __IfaceDefHandle =
+                ::mycorrhiza::intrinsics::RustcCLRInteropManagedClass<"", #name_lit>;
+        }
+    };
+    let set_generics_call = if type_params.is_empty() {
+        quote! {}
+    } else {
+        let names_csv = type_params
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(";");
+        let names_lit = LitStr::new(&names_csv, span);
+        quote! {
+            let class = ::mycorrhiza::comptime::rustc_codegen_clr_set_type_generics::<
+                #names_lit,
+            >(class);
+        }
+    };
 
     let expanded = quote! {
         // The trait, unchanged — a declaration vehicle only.
         #input
 
-        /// Managed handle to this Rust-defined .NET interface (Rust-side references; C# refers to
-        /// the interface by its plain name).
-        #[allow(non_camel_case_types, dead_code)]
-        pub type #handle_ident =
-            ::mycorrhiza::intrinsics::RustcCLRInteropManagedClass<"", #name_lit>;
+        #handle_alias
 
         #[allow(non_snake_case, dead_code, unused_variables, internal_features, clippy::diverging_sub_expression)]
         mod #entry_mod {
             use super::*;
-            // Signature-only carriers: named ONLY in the interpreted entrypoint below, so the
-            // mono-collector never codegens them (an abstract interface member has no body).
+            #iface_def_handle_alias
+            // Signature-only carriers (named ONLY in the interpreted entrypoint below, so the
+            // mono-collector never codegens them — an abstract interface member has no body),
+            // plus, for default interface methods, the LIFTED real bodies with their `#[used]`
+            // KEEP anchors (those MUST be codegen'd — the interface member aliases them).
             #(#carriers)*
             // The comptime interpreter only *reads* this fn's MIR; a `#[used]` root keeps it (and
             // the interface) from being dropped as dead code.
@@ -461,6 +1989,12 @@ pub fn dotnet_interface(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     #name_lit, false, "", "",
                 >();
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_mark_interface(class);
+                // Generic interface (`trait IFoo<T>`): declare the parameter names — one
+                // ECMA-335 `GenericParam` row each on this TypeDef.
+                #set_generics_call
+                // Base interfaces (supertraits + external `implements = "…"`): one
+                // `InterfaceImpl` row each on this interface's TypeDef (§II.10.1.3).
+                #(#base_iface_calls)*
                 #(#method_calls)*
                 ::mycorrhiza::comptime::rustc_codegen_clr_finish_type(class);
             }

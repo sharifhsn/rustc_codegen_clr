@@ -213,26 +213,16 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
         } else {
             Some(system_runtime_type_ref(&mut mb, "System.Object"))
         };
-        // `implements I1, I2, …` (§II.22.23 `InterfaceImpl`): resolved the exact same way as
-        // `extends` just above (each interface is itself a `ClassRef`, defined-in-assembly or
-        // external), mirroring `il_exporter::export_to_write`'s `implements` clause (mod.rs:167-177,
-        // one `simple_class_ref` per `class_def.implements()` entry). `add_type_def`'s `implements`
-        // parameter already builds sorted-by-Class `InterfaceImpl` rows internally (tested:
-        // `interface_impl_rows_are_emitted_sorted_by_class`), so insertion order here doesn't matter.
-        //
-        // `class_ref_token` (not the plain `type_def_or_ref` coded-index helper) so a GENERIC
-        // interface reference (e.g. `IEquatable<int>` — see `rustc_codegen_clr_add_generic_
-        // interface_impl`) resolves to a real `TypeSpec` carrying the full `GENERICINST` blob,
-        // not a bare `TypeRef` to the unbound open generic definition (`IEquatable`1`) — a class
-        // cannot implement/extend an unbound generic type; using the wrong one is a real
-        // TypeLoadException at .NET load time, not a silent miscompilation, but wrong either way.
-        // Every existing non-generic `extends=`/`implements=` caller is unaffected: `class_ref_token`
-        // already falls back to the identical `type_def_or_ref` path whenever `generics()` is empty.
-        let implements: Vec<Token> = class_def
-            .implements()
-            .iter()
-            .map(|&iface| mb.class_ref_token(asm, iface))
-            .collect();
+        // `implements I1, I2, …` is NOT resolved here — see Pass 1.5 below. Resolving an
+        // interface `ClassRef` inside this loop was a latent forward-reference panic: a
+        // SAME-ASSEMBLY interface (`#[dotnet_class(implements = "IRustIface")]`, or interface
+        // inheritance `#[dotnet_interface] trait IDerived: IBase`) resolves via
+        // `class_ref_token` -> `find_type_def`, which panics unless the interface's own TypeDef
+        // row already exists — and `class_def_ids` is a hash-order snapshot, so whether the
+        // implementING type is walked before or after the implemenTED interface is arbitrary.
+        // `add_type_def` keeps its `implements` parameter (tables.rs's own unit tests drive it
+        // directly); this caller just always passes the empty slice and emits every
+        // `InterfaceImpl` row after ALL TypeDef rows exist.
         let has_explicit_layout = class_def.explict_size().is_some()
             || class_def.fields().iter().any(|(_, _, offset)| offset.is_some());
         let (pack, size) = if has_explicit_layout {
@@ -253,11 +243,103 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
         // `MetadataBuilder::find_type_def`'s doc for the paired lookup-side fix this requires.
         let raw_name = asm[class_def.name()].to_string();
         let (namespace, name) = super::tables::split_namespace(&raw_name);
-        let tok = mb.add_type_def(namespace, name, class_def.is_valuetype(), extends, pack, size, &implements);
+        let tok = mb.add_type_def(namespace, name, class_def.is_valuetype(), extends, pack, size, &[]);
         if class_def.is_interface() {
             mb.mark_type_def_interface(tok);
         }
+        // A generic type DEFINITION (`ClassDef::with_type_generic_names`, today only a
+        // `#[dotnet_interface] trait IFoo<T>` interface): one `GenericParam` row (§II.22.20) per
+        // declared parameter, in declaration order. Deterministic (Vec order within the
+        // class-def iteration), and naturally sorted by (Owner, Number) since owners are
+        // ascending TypeDef rids — `write_generic_param_rows` re-sorts at serialize time as
+        // belt-and-braces anyway. Member signatures referencing these parameters encode
+        // `ET_VAR <N>` (`Type::PlatformGeneric(N, TypeGeneric)`) and need NO `SIG_GENERIC`
+        // convention bit — that is generic-METHOD-definition-only (§II.23.2.1), so Pass 3 is
+        // already correct unchanged.
+        for (i, name_id) in class_def.generic_names().iter().enumerate() {
+            mb.add_generic_param(tok, u16::try_from(i).expect("generic arity over u16"), &asm[*name_id]);
+        }
         type_def_token_of.insert(class_def_id, tok);
+    }
+
+    // --- Pass 1.5: `implements I1, I2, …` (§II.22.23 `InterfaceImpl`) for every class def,
+    // emitted only now that EVERY TypeDef row exists (see Pass 1's `implements` note) so a
+    // same-assembly interface reference resolves to its TypeDef token no matter where the
+    // interface landed in `class_def_ids`' hash-order snapshot. This is also how INTERFACE
+    // INHERITANCE is modeled: ECMA-335 §II.10.1.3/§II.22.23 puts an interface's base interfaces
+    // in `InterfaceImpl` rows on the interface's own TypeDef (its `Extends` stays NIL — see
+    // `mark_type_def_interface`), so `#[dotnet_interface] trait IDerived: IBase` rides this exact
+    // loop; the CLR computes the transitive closure at load time (a class listing only
+    // `InterfaceImpl(IDerived)` still satisfies `is IBase`).
+    //
+    // `class_ref_token` (not the plain `type_def_or_ref` coded-index helper) so a GENERIC
+    // interface reference (e.g. `IEquatable<int>` — see `rustc_codegen_clr_add_generic_
+    // interface_impl`) resolves to a real `TypeSpec` carrying the full `GENERICINST` blob,
+    // not a bare `TypeRef` to the unbound open generic definition (`IEquatable`1`) — a class
+    // cannot implement/extend an unbound generic type; using the wrong one is a real
+    // TypeLoadException at .NET load time, not a silent miscompilation, but wrong either way.
+    // Every non-generic `extends=`/`implements=` shape is unaffected: `class_ref_token` already
+    // falls back to the identical `type_def_or_ref` path whenever `generics()` is empty.
+    // `write_interface_impl_rows` sorts by Class at serialize time (tested:
+    // `interface_impl_rows_are_emitted_sorted_by_class`), so emission order here doesn't matter.
+    for &class_def_id in &class_def_ids {
+        let class_tok = type_def_token_of[&class_def_id];
+        let implements: Vec<_> = asm[class_def_id].implements().to_vec();
+        for iface in implements {
+            // Fail-loudly validation for a SAME-ASSEMBLY, non-generic interface reference (the
+            // shape `#[dotnet_interface]` supertraits and same-assembly `implements = "…"` lower
+            // to): it must resolve to a class def registered in this assembly, and that def must
+            // actually be an interface. Anything else would otherwise become a dangling
+            // module-scope `TypeRef` (or a load-time `TypeLoadException` for a class target) —
+            // turn both into a named compile/export-time error instead. External (`asm()` set)
+            // and generic (`TypeSpec`) references are unaffected: they resolve outside this
+            // assembly's def table by construction.
+            let iface_ref = asm[iface].clone();
+            if iface_ref.asm().is_none() && iface_ref.generics().is_empty() {
+                let iface_name = asm[iface_ref.name()].to_string();
+                let cls_name = asm[asm[class_def_id].name()].to_string();
+                match asm.class_ref_to_def(iface) {
+                    None => panic!(
+                        "`{cls_name}` implements `{iface_name}`, which is not a type defined in \
+                         this assembly — if `{iface_name}` is a Rust trait it must itself be \
+                         `#[dotnet_interface]` (marker/std supertraits like Send/Clone/Sized are \
+                         not supported); for an external .NET interface use the \
+                         `[Assembly]Ns.Name` form"
+                    ),
+                    Some(def_idx) => assert!(
+                        asm[def_idx].is_interface(),
+                        "`{cls_name}` implements `{iface_name}`, but `{iface_name}` is a class, \
+                         not an interface — a type can only implement/extend interfaces here"
+                    ),
+                }
+            } else if iface_ref.asm().is_none() {
+                // SAME-ASSEMBLY *generic* interface reference (`#[dotnet_class(implements =
+                // "IBox<[System.Runtime]System.Int32>")]` against this crate's own
+                // `#[dotnet_interface] trait IBox<T>`): must resolve to a registered OPEN generic
+                // def (arity-checked inside `find_open_generic_def`) that is an interface —
+                // otherwise `class_ref_token` below would mint a dangling module-scope `TypeSpec`
+                // that only fails at CLR load time. Same fail-loudly conversion as the
+                // non-generic arm above.
+                let iface_name = asm[iface_ref.name()].to_string();
+                let cls_name = asm[asm[class_def_id].name()].to_string();
+                match super::tables::find_open_generic_def(asm, iface) {
+                    None => panic!(
+                        "`{cls_name}` implements the generic interface `{iface_name}` (arity {}), \
+                         which is not a generic type defined in this assembly — declare it with \
+                         `#[dotnet_interface] trait {iface_name}<…>` in this crate, or use the \
+                         `[Assembly]Ns.Name<…>` form for an external .NET interface",
+                        iface_ref.generics().len()
+                    ),
+                    Some(def_idx) => assert!(
+                        asm[def_idx].is_interface(),
+                        "`{cls_name}` implements `{iface_name}`, but `{iface_name}` is a generic \
+                         class, not an interface — a type can only implement/extend interfaces here"
+                    ),
+                }
+            }
+            let itok = mb.class_ref_token(asm, iface);
+            mb.interface_impl(class_tok, itok);
+        }
     }
 
     // Every `FieldRVA` blob (§II.22.18) queued for `.sdata` placement, in the order queued —
@@ -480,7 +562,20 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
                 _ => None,
             };
             let mut blob = Vec::new();
-            let convention = if is_static { sig::SIG_DEFAULT } else { sig::SIG_HASTHIS };
+            // Generic method DEFINITION (`MethodDef::generic_params`, e.g. `T Echo<T>(T value)`
+            // on a `#[dotnet_interface]`): the declared type-parameter names. Non-empty means
+            // (a) the signature blob carries `SIG_GENERIC` + a compressed `GenParamCount`
+            // (§II.23.2.1 — `encode_method_sig`'s own debug_assert ties the two), and (b) one
+            // method-owned `GenericParam` row per name is emitted after `add_method` returns the
+            // owner token below. A different axis from a call SITE's instantiation
+            // (`MethodRef::generics` -> `MethodSpec`, handled in `method_token`).
+            let generic_names = method.generic_params();
+            let generic_count =
+                u32::try_from(generic_names.len()).expect("generic-method arity over u32");
+            let mut convention = if is_static { sig::SIG_DEFAULT } else { sig::SIG_HASTHIS };
+            if generic_count > 0 {
+                convention |= sig::SIG_GENERIC;
+            }
             // `sig.inputs()` carries the IMPLICIT receiver (`this`) at index 0 for every
             // non-static kind (Instance/Virtual/Constructor) — matches `method.arg_names()`'s
             // "parallel to the FULL sig.inputs()" contract documented just below, and
@@ -503,9 +598,31 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
             // `.method` header line — see that resolver's doc for why every other
             // `TypeDefOrRefResolver` call site in this exporter (bodies, `extends`, `calli`,
             // fields) must stay on the shared, impl-assembly-qualified `MetadataBuilder` path.
+            // Soundness gate for a generic method DEFINITION's declared signature: every
+            // `!!N` (`ELEMENT_TYPE_MVAR`, `GenericKind::CallGeneric`) marker must name one of
+            // this method's OWN declared parameters (`N < generic_count`), and every `!N`
+            // (`ELEMENT_TYPE_VAR`, `TypeGeneric`/`MethodGeneric`) must name one of the OWNING
+            // TYPE's declared parameters (`N < class arity`). An out-of-range index — or a
+            // `GenParamCount` that disagrees with the owned `GenericParam` row count — is
+            // exactly the malformed metadata CoreCLR's type loader rejects with a
+            // `TypeLoadException` far from the defect; panic here, naming the method, instead.
+            // Scoped to methods that declare generics: a non-generic method's signature is
+            // untouched (whatever marker misuse was possible before this feature still fails
+            // the same way it always did, at the same place).
+            if generic_count > 0 {
+                for tpe in encode_sig.iter_types() {
+                    assert_generic_indices_in_range(
+                        asm,
+                        tpe,
+                        generic_count,
+                        class_def.generics(),
+                        &name,
+                    );
+                }
+            }
             sig::encode_method_sig(
                 convention,
-                0,
+                generic_count,
                 &encode_sig,
                 asm,
                 &mut SignatureOnlyResolver { mb: &mut mb },
@@ -542,10 +659,14 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
                 && method
                     .resolved_implementation(asm)
                     .should_hint_aggressive_inline(asm);
+            // `[out]` Param flags (`MethodDef::out_params`, from `#[dotnet_out]`): 1-based
+            // Sequence numbers among the receiver-stripped `param_names`, exactly the numbering
+            // `add_method`'s Param-row loop uses — no re-indexing needed.
             let tok = mb.add_method(
                 &name,
                 sig_off,
                 &param_names,
+                method.out_params(),
                 is_static,
                 is_virtual,
                 is_ctor,
@@ -553,10 +674,31 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
                 aggressive_inline,
             );
             mb.register_method_def(method_id, tok);
+            // One method-owned `GenericParam` row (§II.22.20, coded `TypeOrMethodDef` owner tag
+            // 1 = MethodDef) per declared parameter name, in declaration order — the METHOD
+            // analogue of Pass 1's type-owned rows for `ClassDef::generic_names`. Deterministic:
+            // `generic_params` is a `Vec` iterated inside the `class_def_ids` loop;
+            // `write_generic_param_rows` re-sorts by (coded Owner, Number) at serialize time as
+            // §II.24.2.6 requires.
+            for (i, name_id) in generic_names.iter().enumerate() {
+                mb.add_generic_param(
+                    tok,
+                    u16::try_from(i).expect("generic-method arity over u16"),
+                    &asm[*name_id],
+                );
+            }
             // Abstract interface member (§II.22.26): stamp `Abstract`, leave RVA=0 (Pass 4 skips
-            // its body). `add_method` already set `Virtual | NewSlot` since `is_virtual` is true.
+            // its body). An INSTANCE abstract: `add_method` already set `Virtual | NewSlot` since
+            // `is_virtual` is true. A STATIC abstract (.NET 7+ static virtual interface member,
+            // `MethodKind::Static` + `is_abstract`): `add_method` set `Public | Static` only, and
+            // `mark_method_static_abstract` adds `Virtual | HideBySig | Abstract` WITHOUT
+            // `NewSlot` — byte-matching Roslyn's own `0x4D6` emission (see that fn's doc).
             if is_abstract {
-                mb.mark_method_abstract(tok);
+                if is_static {
+                    mb.mark_method_static_abstract(tok);
+                } else {
+                    mb.mark_method_abstract(tok);
+                }
             }
             // Explicit `.override` (`MethodDef::with_override`): reuse the base's vtable slot (drop
             // `NewSlot`, matching `il_exporter`'s `virtual instance` with no `newslot`) and bind
@@ -598,6 +740,44 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
                 .method_def_token(MethodDefIdx::from_raw(ev.remove()))
                 .expect("event remove accessor must be a MethodDef registered in pass 3");
             mb.add_event(class_tok, &name, delegate_tok, add_tok, remove_tok);
+        }
+    }
+
+    // --- Pass 3.6: `.NET` properties (§II.22.34/35 + §II.22.28 Property/PropertyMap/
+    // MethodSemantics Getter/Setter). The exact sibling of Pass 3.5: emitted after Pass 3
+    // because a property's accessors are ordinary (abstract) `MethodDef`s that must already be
+    // registered; iterated in the SAME `class_def_ids` order so each class's `PropertyMap`
+    // run-start is coherent (`add_property`'s doc). Neither table touches the `Field`/`Method`
+    // run-start cursors.
+    for &class_def_id in &class_def_ids {
+        let class_def = asm[class_def_id].clone();
+        if class_def.properties().is_empty() {
+            continue;
+        }
+        let class_tok = type_def_token_of[&class_def_id];
+        for prop in class_def.properties() {
+            let name = asm[prop.name()].to_string();
+            // `SignatureOnlyResolver`, not `&mut mb` directly: a property's declared value type
+            // is C#-visible DECLARED metadata a separately-compiled consumer resolves against —
+            // the exact analog of Pass 3's method-signature split (see the comment there).
+            let mut blob = Vec::new();
+            sig::encode_property_sig(
+                /*has_this*/ true,
+                prop.tpe(),
+                asm,
+                &mut SignatureOnlyResolver { mb: &mut mb },
+                &mut blob,
+            );
+            let sig_off = mb.blobs.intern(&blob);
+            let getter_tok = prop.getter().map(|g| {
+                mb.method_def_token(MethodDefIdx::from_raw(g))
+                    .expect("property getter must be a MethodDef registered in pass 3")
+            });
+            let setter_tok = prop.setter().map(|s| {
+                mb.method_def_token(MethodDefIdx::from_raw(s))
+                    .expect("property setter must be a MethodDef registered in pass 3")
+            });
+            mb.add_property(class_tok, &name, sig_off, getter_tok, setter_tok);
         }
     }
 
@@ -835,6 +1015,75 @@ fn check_main_module_method_count(method_count: usize) {
     );
 }
 
+/// Recursively asserts every generic-parameter marker inside `tpe` (a type appearing in a
+/// generic method DEFINITION's declared signature — `MethodDef::generic_params` non-empty) is in
+/// range: a `!!N` (`ELEMENT_TYPE_MVAR`, `GenericKind::CallGeneric`) must satisfy
+/// `N < method_generic_count` (the method's own declared arity), and a `!N`
+/// (`ELEMENT_TYPE_VAR`, `TypeGeneric`/`MethodGeneric` — see `sig.rs`'s naming-crossover note)
+/// must satisfy `N < class_generic_count` (the owning type's declared arity — 0 for a
+/// non-generic owner, so ANY `!N` on one is rejected: no class generic context exists).
+/// Recurses through pointer/byref pointees, array elements, `ClassRef` instantiation arguments,
+/// and fn-pointer signatures — everywhere `sig.rs`'s encoder can reach a nested
+/// `Type::PlatformGeneric`. Called from Pass 3 only for methods that declare generics (see the
+/// call-site comment for why non-generic methods are left untouched).
+fn assert_generic_indices_in_range(
+    asm: &Assembly,
+    tpe: crate::ir::Type,
+    method_generic_count: u32,
+    class_generic_count: u32,
+    method_name: &str,
+) {
+    use crate::ir::tpe::GenericKind;
+    match tpe {
+        crate::ir::Type::PlatformGeneric(n, GenericKind::CallGeneric) => assert!(
+            n < method_generic_count,
+            "generic method definition `{method_name}` declares {method_generic_count} generic \
+             parameter(s) but its signature references `!!{n}` (ELEMENT_TYPE_MVAR index {n}) — \
+             out-of-range metadata CoreCLR's type loader would reject at load time"
+        ),
+        crate::ir::Type::PlatformGeneric(n, GenericKind::TypeGeneric | GenericKind::MethodGeneric) => {
+            assert!(
+                n < class_generic_count,
+                "generic method definition `{method_name}`'s signature references the owning \
+                 type's generic parameter `!{n}` (ELEMENT_TYPE_VAR index {n}), but the owning \
+                 type declares {class_generic_count} generic parameter(s)"
+            );
+        }
+        crate::ir::Type::Ptr(inner)
+        | crate::ir::Type::Ref(inner)
+        | crate::ir::Type::PlatformArray { elem: inner, .. } => assert_generic_indices_in_range(
+            asm,
+            asm[inner],
+            method_generic_count,
+            class_generic_count,
+            method_name,
+        ),
+        crate::ir::Type::ClassRef(cref) => {
+            for &garg in asm[cref].generics() {
+                assert_generic_indices_in_range(
+                    asm,
+                    garg,
+                    method_generic_count,
+                    class_generic_count,
+                    method_name,
+                );
+            }
+        }
+        crate::ir::Type::FnPtr(fnsig) => {
+            for inner in asm[fnsig].iter_types() {
+                assert_generic_indices_in_range(
+                    asm,
+                    inner,
+                    method_generic_count,
+                    class_generic_count,
+                    method_name,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Finds-or-creates a `TypeRef` to `System.Runtime`-scoped `type_name` (`System.Object` /
 /// `System.ValueType` — the two implicit base types every class needs, see the Pass 1 comment
 /// above). Uses [`MetadataBuilder::find_or_create_assembly_ref`] (not the always-inserts
@@ -917,7 +1166,14 @@ struct SignatureOnlyResolver<'a> {
 impl super::sig::TypeDefOrRefResolver for SignatureOnlyResolver<'_> {
     fn type_def_or_ref(&mut self, cref: Interned<ClassRef>, asm: &mut Assembly) -> u32 {
         let class_ref = asm.class_ref(cref).clone();
-        if asm.class_ref_to_def(cref).is_some() {
+        if asm.class_ref_to_def(cref).is_some()
+            // An INSTANTIATED reference to a generic type this assembly itself defines (e.g. an
+            // `IBoxHandle<i32>` parameter of a `#[dotnet_export]` fn, where `IBox`1` is this
+            // crate's own `#[dotnet_interface] trait IBox<T>`) — same in-assembly-TypeDef
+            // resolution, reached through the open-def lookup since the instantiated handle
+            // never maps to a def directly. See `tables::find_open_generic_def`'s doc.
+            || super::tables::find_open_generic_def(asm, cref).is_some()
+        {
             // Defined in this assembly: no BCL forwarding concern, and the shared resolver
             // already knows how to find its `TypeDef` row — reuse it verbatim.
             return self.mb.type_def_or_ref(cref, asm);

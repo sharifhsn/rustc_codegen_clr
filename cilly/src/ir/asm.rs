@@ -1192,6 +1192,34 @@ impl Assembly {
 
                 continue;
             }
+            // FAIL-LOUDLY BACKSTOP: an in-assembly `MethodRef` that resolves to NO `MethodDef` on
+            // an *interface* we define is always a bug, never something to patch. Interface defs
+            // (`#[dotnet_interface]`) declare every member up front, so a dangling ref means a
+            // call site was lowered with a signature that mismatches the interface's declared
+            // member (e.g. a default-body self-call to a member whose `&mut T` parameter is
+            // hidden behind a type alias — declared `ref T`, called as `T*` — or a self-call
+            // whose generic parameter name was shadowed by a concrete type). Materializing the
+            // usual `MethodImpl::Missing` stub here would inject a SECOND, non-abstract member
+            // onto the interface: reflection then sees two same-named members
+            // (`AmbiguousMatchException`) and the call throws at runtime. Panic at link time
+            // instead, naming the member.
+            if let Some(class_def) = self.class_defs.get(&ClassDefIdx(mref.class())) {
+                if class_def.is_interface() {
+                    let sig = self[mref.sig()].clone();
+                    panic!(
+                        "linker: call to `{iface}::{name}` does not match any member declared on \
+                         interface `{iface}` (signature {sig:?}). This usually means a \
+                         `#[dotnet_interface]` default body calls a member whose declared \
+                         signature differs from the call's lowering — e.g. a `&mut T` parameter \
+                         hidden behind a type alias (declared as managed byref `ref T`, but the \
+                         self-call lowers it as `T*`), or a generic member called with its type \
+                         parameter shadowed by a concrete type. Refusing to inject a phantom \
+                         member onto the interface.",
+                        iface = self.class_ref(mref.class()).display(self),
+                        name = &self[mref.name()],
+                    );
+                }
+            }
             let name = rustc_demangle::demangle(&self[mref.name()]).to_string();
             let name = self.alloc_string(name.split("::").last().unwrap());
             if let Some(overrider) = override_methods.get(&name) {

@@ -186,6 +186,21 @@ impl ILExporter {
             // clause at all — even the implicit `[System.Runtime]System.Object` this branch would
             // otherwise emit is illegal for `Interface`-flagged types and CoreCLR rejects it at
             // load time. See `ClassDef::with_interface`'s doc for the exact scope this covers.
+            // Generic type DEFINITION (`ClassDef::with_type_generic_names`, today only a
+            // `#[dotnet_interface] trait IFoo<T>` interface): render the `<T, U>` type-parameter
+            // list after the (already backtick-arity-suffixed) class name — the same
+            // `.class … 'IBox`1'<T>` shape ilasm round-trips into a `GenericParam` row per name.
+            let generic_params = if class_def.generic_names().is_empty() {
+                String::new()
+            } else {
+                let list: String = class_def
+                    .generic_names()
+                    .iter()
+                    .map(|n| asm[*n].to_string())
+                    .intersperse(", ".to_string())
+                    .collect();
+                format!("<{list}>")
+            };
             if class_def.is_interface() {
                 // An interface `TypeDef` cannot carry instance fields (§II.10.1.3) — nothing
                 // upstream enforces this (`ClassDef::with_interface` is a bare flag, see its doc),
@@ -198,9 +213,17 @@ impl ILExporter {
                 );
                 writeln!(
                     out,
-                    ".class {vis} interface abstract ansi '{name}'{implements}{{"
+                    ".class {vis} interface abstract ansi '{name}'{generic_params}{implements}{{"
                 )?;
             } else {
+                // A generic CLASS definition has no emission story anywhere in this backend
+                // (the explicit-layout-on-generics ban applies to classes; only generic
+                // INTERFACES are supported) — never emit a silently non-generic class.
+                assert!(
+                    class_def.generic_names().is_empty(),
+                    "il_exporter: generic type-parameter names on a non-interface class \
+                     ('{name}') are not supported"
+                );
                 writeln!(
                     out,
                     ".class {vis} ansi {sealed} {explicit} '{name}' extends {extends}{implements}{{"
@@ -413,6 +436,30 @@ impl ILExporter {
                     ".event {delegate_ty} '{ev_name}' {{ .addon {add_text} .removeon {remove_text} }}"
                 )?;
             }
+            // `.property`/`.get`/`.set` (ECMA-335 §II.22.34/§II.17): same linking-only shape as
+            // `.event` above — the accessors are ordinary (here: abstract) methods already
+            // emitted by the per-method loop; `ilasm` computes the PropertyMap/Property/
+            // MethodSemantics rows from this text. Parity mirror of the PE writer's Pass 3.6
+            // (the DIRECT_PE=1 default path is the primary, tested surface).
+            for prop in class_def.properties() {
+                let prop_name = asm_mut[prop.name()].to_string();
+                // `_signature` variant for the same declared-metadata reason as `.event`'s
+                // delegate type above.
+                let prop_ty = non_void_type_il_signature(&prop.tpe(), asm_mut);
+                let mut accessors = String::new();
+                if let Some(g) = prop.getter() {
+                    let get_text = self.method_ref_operand_text(asm_mut, g);
+                    accessors.push_str(&format!(".get {get_text} "));
+                }
+                if let Some(s) = prop.setter() {
+                    let set_text = self.method_ref_operand_text(asm_mut, s);
+                    accessors.push_str(&format!(".set {set_text} "));
+                }
+                writeln!(
+                    out,
+                    ".property instance {prop_ty} '{prop_name}'() {{ {accessors}}}"
+                )?;
+            }
             writeln!(out, "}}")?;
         }
 
@@ -494,12 +541,38 @@ impl ILExporter {
             .events()
             .iter()
             .any(|ev| ev.add() == method_id.0 || ev.remove() == method_id.0);
+        // Same identity check for a property's `get_*`/`set_*` accessors (`ClassDef::
+        // add_property`): `ilasm` requires `specialname` on them exactly like event accessors
+        // (§II.22.34's accessor discipline — how csc/reflection tell accessors from ordinary
+        // methods).
+        let is_property_accessor = asm
+            .get_class_def(method.class())
+            .properties()
+            .iter()
+            .any(|p| p.getter() == Some(method_id.0) || p.setter() == Some(method_id.0));
         let kind = match method.kind() {
+            // A STATIC ABSTRACT interface member (.NET 7+ static virtual members in interfaces):
+            // `abstract virtual static` with NO `newslot`, matching the PE writer's
+            // `mark_method_static_abstract` flags (Roslyn emits 0x4D6 — Virtual WITHOUT NewSlot,
+            // unlike an instance abstract). NOTE: Mono ilasm predates .NET 7 static virtuals and
+            // may reject this keyword combination — acceptable, `il_exporter` is only exercised
+            // at `DIRECT_PE=0` (parity is nice-to-have; the PE writer is the default path).
+            crate::cilnode::MethodKind::Static if method.is_abstract() => {
+                "abstract virtual static"
+            }
             crate::cilnode::MethodKind::Static => "static",
             crate::cilnode::MethodKind::Instance => "instance",
             // An interface member (`MethodDef::is_abstract`) needs the `newslot abstract` flags
             // ahead of `virtual instance` — `newslot` because an interface member never overrides
             // an existing vtable slot, `abstract` because it has no body (RVA=0, §II.15.4.2.2).
+            // An abstract EVENT/PROPERTY accessor (interface `#[dotnet_event]`/
+            // `#[dotnet_property]`) additionally carries `specialname`, matching the PE writer's
+            // `mark_method_special_name` stamping in `add_event`/`add_property`.
+            crate::cilnode::MethodKind::Virtual
+                if method.is_abstract() && (is_event_accessor || is_property_accessor) =>
+            {
+                "specialname newslot abstract virtual instance"
+            }
             crate::cilnode::MethodKind::Virtual if method.is_abstract() => {
                 "newslot abstract virtual instance"
             }
@@ -549,11 +622,29 @@ impl ILExporter {
         let inputs: String = inputs
             .iter()
             .zip(method.arg_names())
-            .map(|(tpe, name)| match name {
-                Some(name) => {
-                    format!("{} '{}'", non_void_type_il_signature(tpe, asm_mut), &asm_mut[*name])
+            .enumerate()
+            .map(|(i, (tpe, name))| {
+                // `[out]` parity with the PE writer's `ParamAttributes.Out` (`MethodDef::
+                // out_params` — 1-based, receiver-stripped Sequence numbers, matching this
+                // enumerate's `i + 1` since `inputs` is already receiver-sliced above).
+                let out = if method
+                    .out_params()
+                    .contains(&u16::try_from(i + 1).expect("more than u16::MAX params"))
+                {
+                    "[out] "
+                } else {
+                    ""
+                };
+                match name {
+                    Some(name) => {
+                        format!(
+                            "{out}{} '{}'",
+                            non_void_type_il_signature(tpe, asm_mut),
+                            &asm_mut[*name]
+                        )
+                    }
+                    None => format!("{out}{}", non_void_type_il_signature(tpe, asm_mut)),
                 }
-                None => non_void_type_il_signature(tpe, asm_mut),
             })
             .intersperse(",".to_string())
             .collect();
@@ -580,9 +671,27 @@ impl ILExporter {
         } else {
             ""
         };
+        // Generic method DEFINITION (`MethodDef::generic_params`, e.g. an interface's
+        // `T Echo<T>(T value)` from `#[dotnet_interface]`): ilasm declares the type-parameter
+        // list after the method name — `.method … !!0 'Echo'<T>(!!0 'value')` (`type_il` already
+        // renders `GenericKind::CallGeneric` as `!!N`). Parity with the PE writer's
+        // `SIG_GENERIC` + method-owned `GenericParam` rows (`export.rs` Pass 3).
+        let gen_params = if method.generic_params().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<{}>",
+                method
+                    .generic_params()
+                    .iter()
+                    .map(|n| asm[*n].to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         writeln!(
             out,
-            ".method {vis} hidebysig {kind} {pinvoke} {ret} '{name}'({inputs}) cil managed {aggrinline}{preservesig}{{// Method ID {method_id:?}"
+            ".method {vis} hidebysig {kind} {pinvoke} {ret} '{name}'{gen_params}({inputs}) cil managed {aggrinline}{preservesig}{{// Method ID {method_id:?}"
         )?;
         // Explicit ECMA-335 `.override` (§II.15.4.2.3) for a base-class virtual override (see
         // `MethodDef::with_override`'s doc — distinct from ordinary `implements=` interface

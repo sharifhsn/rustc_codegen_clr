@@ -44,6 +44,8 @@ impl Token {
     pub const TABLE_STAND_ALONE_SIG: u32 = 0x11;
     pub const TABLE_EVENT_MAP: u32 = 0x12;
     pub const TABLE_EVENT: u32 = 0x14;
+    pub const TABLE_PROPERTY_MAP: u32 = 0x15;
+    pub const TABLE_PROPERTY: u32 = 0x17;
     pub const TABLE_METHOD_SEMANTICS: u32 = 0x18;
     pub const TABLE_METHOD_IMPL: u32 = 0x19;
     pub const TABLE_MODULE_REF: u32 = 0x1A;
@@ -52,6 +54,7 @@ impl Token {
     pub const TABLE_FIELD_RVA: u32 = 0x1D;
     pub const TABLE_ASSEMBLY: u32 = 0x20;
     pub const TABLE_ASSEMBLY_REF: u32 = 0x23;
+    pub const TABLE_GENERIC_PARAM: u32 = 0x2A;
     pub const TABLE_METHOD_SPEC: u32 = 0x2B;
     /// The `#US` (User String) heap's "table id" (§II.22.2) — not a real metadata table, but
     /// `ldstr` tokens are shaped identically (`0x70 << 24 | offset`), so [`Token`] represents
@@ -282,6 +285,30 @@ struct EventRow {
     event_type: u32,
 }
 
+/// §II.22.35 `PropertyMap` — one row per type that declares properties, pointing at that type's
+/// first `Property` row (a table-position "run-start", exactly like `EventMap.EventList` /
+/// `TypeDef.MethodList`). NOT sorted (same §II.24.2.6 status as `EventMap`).
+struct PropertyMapRow {
+    /// `Parent` — simple `TypeDef` index of the property-declaring type.
+    parent: u32,
+    /// `PropertyList` — simple `Property` index of the first property this type owns (run
+    /// continues to the next `PropertyMap`'s `PropertyList`, or the end of the `Property` table).
+    property_list: u32,
+}
+
+/// §II.22.34 `Property` — a single property's name + `PropertySig` blob. The getter/setter
+/// accessor linkage lives in `MethodSemantics`, not here. NOTE the spec's column named "Type" is
+/// a `#Blob` index holding a §II.23.2.5 `PropertySig`, NOT a `TypeDefOrRef` — a spec misnomer.
+struct PropertyRow {
+    /// `Flags` (§II.23.1.14 `PropertyAttributes`) — 0 for an ordinary property (no
+    /// `SpecialName`/`RTSpecialName`/`HasDefault`).
+    flags: u16,
+    /// `Name` — `#Strings` offset.
+    name: u32,
+    /// `Type` — `#Blob` offset of the `PropertySig` (see the struct doc's misnomer note).
+    signature: u32,
+}
+
 /// §II.22.28 `MethodSemantics` — links a `MethodDef` (an `add_`/`remove_`/getter/setter body) to
 /// the `Event`/`Property` it services. Sorted by `association`.
 struct MethodSemanticsRow {
@@ -291,6 +318,25 @@ struct MethodSemanticsRow {
     method: u32,
     /// `Association` — `HasSemantics` coded index (0 = `Event`, 1 = `Property`).
     association: u32,
+}
+
+/// §II.22.20 `GenericParam` — one declared generic parameter of a generic type or method
+/// DEFINITION (`interface IBox<T>` gets one row: `{Number: 0, Flags: 0, Owner: IBox`1's TypeDef,
+/// Name: "T"}`). SORTED by `owner` (the coded `TypeOrMethodDef` index) then `number`
+/// (§II.24.2.6's sorted-table list includes it — primary key Owner, secondary Number).
+struct GenericParamRow {
+    /// `Number` — the parameter's 0-based ordinal in the declaration order (`T`=0, `U`=1, …).
+    number: u16,
+    /// `Flags` (§II.23.1.7 `GenericParamAttributes`) — always 0 here: no variance
+    /// (`in`/`out`) and no special constraints (`class`/`struct`/`new()`); constrained/variant
+    /// parameters are a macro-level loud reject, never silently-dropped metadata.
+    flags: u16,
+    /// `Owner` — `TypeOrMethodDef` coded index (§II.24.2.6, 1 tag bit: TypeDef=0, MethodDef=1)
+    /// of the generic type/method definition declaring this parameter.
+    owner: u32,
+    /// `Name` — `#Strings` offset of the declared parameter name (purely reflective metadata,
+    /// but Roslyn surfaces it — `typeof(IBox<>).GetGenericArguments()[0].Name`).
+    name: u32,
 }
 
 /// Deferred `FieldRVA` bookkeeping: the row itself can't be built until the layout pass
@@ -333,7 +379,10 @@ pub struct MetadataBuilder {
     method_impl: Vec<MethodImplRow>,
     event_map: Vec<EventMapRow>,
     event: Vec<EventRow>,
+    property_map: Vec<PropertyMapRow>,
+    property: Vec<PropertyRow>,
     method_semantics: Vec<MethodSemanticsRow>,
+    generic_param: Vec<GenericParamRow>,
 
     /// Interned `TypeRef` rows, keyed on (resolution_scope token bits, namespace, name) so
     /// repeated references to the same external type share one row.
@@ -403,6 +452,8 @@ const SORTED_TABLES: &[u32] = &[
     // Event are NOT sorted tables (and are absent from this list on purpose).
     Token::TABLE_METHOD_SEMANTICS,
     Token::TABLE_METHOD_IMPL,
+    // §II.24.2.6: GenericParam is sorted by Owner (coded TypeOrMethodDef) then Number.
+    Token::TABLE_GENERIC_PARAM,
 ];
 
 impl MetadataBuilder {
@@ -752,12 +803,21 @@ impl MetadataBuilder {
     /// rows (§II.22.33, one per named argument — mirrors `MethodDef::arg_names()`). The body RVA
     /// is unknown until `body.rs` assembles bytes and `pe.rs` lays them out, so it starts at 0
     /// and must be patched via [`MetadataBuilder::set_method_body_rva`] before `serialize()`.
+    ///
+    /// `out_params` — 1-based Param **Sequence** numbers (positions among `param_names`, which are
+    /// already receiver-stripped) whose `Param` row gets `ParamAttributes.Out` (0x0002,
+    /// §II.23.1.13). Paired with an `ELEMENT_TYPE_BYREF` type in `signature_blob` this is what
+    /// makes C# see `out T`; a BYREF param whose row stays `Flags == 0` reads back as `ref T`
+    /// (byte-matching csc, which sets no other bit and no modreq for `out`). Empty for every
+    /// method today except `#[dotnet_interface]` members carrying `#[dotnet_out]`
+    /// (`MethodDef::out_params`).
     #[allow(clippy::too_many_arguments)]
     pub fn add_method(
         &mut self,
         name: &str,
         signature_blob: u32,
         param_names: &[Option<&str>],
+        out_params: &[u16],
         is_static: bool,
         is_virtual: bool,
         is_ctor: bool,
@@ -768,8 +828,8 @@ impl MetadataBuilder {
         // identically to `FieldAttributes::FieldAccessMask` (see `add_field`'s doc) —
         // CompilerControlled=0x0, Private=0x1, FamANDAssem=0x2, Assembly=0x3, Family=0x4,
         // FamORAssem=0x5, **Public=0x6**. 0x10 Static, 0x40 Virtual, **0x100 NewSlot** (paired with
-        // Virtual so it doesn't try to override a base slot), 0x1000 SpecialName | 0x800
-        // RTSpecialName (ctors only), 0x2000 PInvokeImpl.
+        // Virtual so it doesn't try to override a base slot), 0x0800 SpecialName | 0x1000
+        // RTSpecialName (both together, ctors only), 0x2000 PInvokeImpl.
         //
         // BUG FIX (was `0x0400`, which is `Abstract`, NOT `NewSlot` — a real off-by-one-hex-digit
         // confusion between adjacent flag bits): this previously stamped `Abstract` on EVERY
@@ -827,8 +887,11 @@ impl MetadataBuilder {
         for (i, pname) in param_names.iter().enumerate() {
             let sequence = u16::try_from(i + 1).unwrap();
             let name_off = pname.map_or(0, |n| self.strings.intern(n));
+            // §II.23.1.13 `ParamAttributes`: 0x0002 `Out` — the only flag this exporter ever sets
+            // (see `add_method`'s doc; `In`/`Optional` are never needed for the shapes we emit).
+            let flags = if out_params.contains(&sequence) { 0x0002 } else { 0 };
             self.param.push(ParamRow {
-                flags: 0,
+                flags,
                 sequence,
                 name: name_off,
             });
@@ -1015,6 +1078,54 @@ impl MetadataBuilder {
         self.method_def[method.rid() as usize - 1].flags |= 0x0400;
     }
 
+    /// Marks the given `MethodDef` a **static abstract** interface member (.NET 7+ static virtual
+    /// members in interfaces — the `INumber<T>` generic-math shape). Roslyn ground truth (net8
+    /// csc, verified via a `System.Reflection.Metadata` dump of a compiled
+    /// `static abstract int Make();`): flags = `0x4D6` = `Public | Static | Virtual | HideBySig |
+    /// Abstract` — `Virtual` **without** `NewSlot` (an INSTANCE abstract member is
+    /// `Virtual | NewSlot | Abstract` instead, and the CoreCLR static-virtual loader path is
+    /// stricter about the difference). The signature stays `SIG_DEFAULT` (no `HASTHIS`), exactly
+    /// what `add_method`'s static path already encoded; RVA stays 0 (§II.22.26 — no body). The
+    /// method must have been added with `is_static = true, is_virtual = false` (so it carries
+    /// `Public | Static = 0x16` and no `NewSlot` to clear).
+    pub fn mark_method_static_abstract(&mut self, method: Token) {
+        debug_assert_eq!(method.table(), Token::TABLE_METHOD_DEF);
+        let row = &mut self.method_def[method.rid() as usize - 1];
+        debug_assert!(row.flags & 0x10 != 0, "must have been added with is_static = true");
+        debug_assert_eq!(row.flags & 0x100, 0, "a static virtual must NOT be NewSlot");
+        row.flags |= 0x40 | 0x80 | 0x400; // Virtual | HideBySig | Abstract
+    }
+
+    /// ORs `SpecialName` (0x0800, §II.23.1.10) into the given `MethodDef`'s flags. §II.10.4 /
+    /// §II.22.13 require an event's `add_*`/`remove_*` accessors to carry `SpecialName` (Roslyn
+    /// emits its own accessors that way — e.g. an interface event's accessors are
+    /// `Public|HideBySig|NewSlot|SpecialName|Abstract|Virtual`); [`MetadataBuilder::add_event`]
+    /// stamps it on both accessors. NOT `RTSpecialName` (0x1000) — that is reserved for
+    /// runtime-recognized names (`.ctor`/`.cctor`, see `add_method`'s ctor flag pair).
+    pub fn mark_method_special_name(&mut self, method: Token) {
+        debug_assert_eq!(method.table(), Token::TABLE_METHOD_DEF);
+        self.method_def[method.rid() as usize - 1].flags |= 0x0800;
+    }
+
+    /// Adds a `GenericParam` row (§II.22.20) declaring generic parameter number `number` (0-based)
+    /// named `name` on the generic type/method definition `owner` (a `TypeDef` or `MethodDef`
+    /// token). Flags are always 0 — no variance, no special constraints (constrained parameters
+    /// are rejected loudly at the macro level; `GenericParamConstraint` (0x2C) is not emitted).
+    /// Rows are sorted by (coded Owner, Number) at serialize time (`write_generic_param_rows`),
+    /// so callers may emit in any order — though the natural Pass-1 emission (ascending TypeDef
+    /// rid, ascending number) is already sorted.
+    pub fn add_generic_param(&mut self, owner: Token, number: u16, name: &str) -> Token {
+        let name_off = self.strings.intern(name);
+        self.generic_param.push(GenericParamRow {
+            number,
+            flags: 0,
+            owner: encode_type_or_method_def(owner),
+            name: name_off,
+        });
+        let rid = u32::try_from(self.generic_param.len()).unwrap();
+        Token::new(Token::TABLE_GENERIC_PARAM, rid)
+    }
+
     pub fn add_method_impl(&mut self, class: Token, body: Token, declaration: Token) {
         assert_eq!(class.table(), Token::TABLE_TYPE_DEF, "MethodImpl.Class must be a TypeDef");
         self.method_impl.push(MethodImplRow {
@@ -1042,9 +1153,31 @@ impl MetadataBuilder {
         remove: Token,
     ) {
         assert_eq!(class.table(), Token::TABLE_TYPE_DEF, "Event owner must be a TypeDef");
+        // §II.10.4/§II.22.13: event accessors shall be `SpecialName` — how Roslyn (and reflection's
+        // accessor filtering) distinguish `add_X`/`remove_X` accessor pairs from ordinary methods
+        // (load-bearing for a C# consumer *implementing* an interface event: without it csc treats
+        // the accessors as ordinary unimplemented abstract members).
+        self.mark_method_special_name(add);
+        self.mark_method_special_name(remove);
         // First event for this class -> open its EventMap run at the next Event row.
         let next_event_rid = u32::try_from(self.event.len() + 1).unwrap();
-        if !self.event_map.iter().any(|r| r.parent == class.rid()) {
+        if self.event_map.iter().any(|r| r.parent == class.rid()) {
+            // The class already has an EventMap run. §II.22.12 runs are CONTIGUOUS slices of the
+            // Event table delimited by the NEXT EventMap row's `event_list`, so appending another
+            // Event row is only sound while this class's run is still the OPEN TAIL run — i.e.
+            // the most recently pushed EventMap row is this class's. Anything else means a caller
+            // interleaved classes (A, B, A again): the new Event row would land inside another
+            // class's run and reflection/csc would silently attribute it to that class. Fail
+            // loudly instead of writing a silently-wrong assembly.
+            assert_eq!(
+                self.event_map.last().map(|r| r.parent),
+                Some(class.rid()),
+                "add_event: non-contiguous event addition — TypeDef rid {} already has a closed \
+                 EventMap run (another class's events were added after its), so event `{name}` \
+                 cannot be appended to it. All of a class's events must be added contiguously.",
+                class.rid(),
+            );
+        } else {
             self.event_map.push(EventMapRow {
                 parent: class.rid(),
                 event_list: next_event_rid,
@@ -1069,6 +1202,90 @@ impl MetadataBuilder {
             method: remove.rid(),
             association,
         });
+    }
+
+    /// Adds one property (§II.22.34 `Property` + §II.22.28 `MethodSemantics` for its accessors)
+    /// to the given `TypeDef`'s property run. The FIRST property added to a given class also
+    /// creates that class's single §II.22.35 `PropertyMap` row (run-start into the `Property`
+    /// table) — so all of a class's properties must be added contiguously, before any other
+    /// class's, exactly like [`MetadataBuilder::add_event`]'s run-start discipline (this method
+    /// fails loudly on interleaving, same as `add_event`).
+    ///
+    /// `class` is the declaring `TypeDef`; `name` the property name; `sig_blob` a §II.23.2.5
+    /// `PropertySig` `#Blob` offset (see [`super::sig::encode_property_sig`]); `getter`/`setter`
+    /// the accessor `MethodDef` tokens (already added via [`MetadataBuilder::add_method`]) — at
+    /// least one must be present. Both accessors get `SpecialName` (0x0800) stamped, matching
+    /// Roslyn's own `get_*`/`set_*` emission (csc's `PEPropertySymbol` reads properties back, so
+    /// matching the reference compiler's accessor flags removes the only consumer-tolerance
+    /// unknown — same reasoning as `add_event`'s accessor stamping).
+    ///
+    /// # Panics
+    /// If `class` is not a `TypeDef` token, if both accessors are `None`, or on a
+    /// non-contiguous per-class property run (see above).
+    pub fn add_property(
+        &mut self,
+        class: Token,
+        name: &str,
+        sig_blob: u32,
+        getter: Option<Token>,
+        setter: Option<Token>,
+    ) {
+        assert_eq!(class.table(), Token::TABLE_TYPE_DEF, "Property owner must be a TypeDef");
+        assert!(
+            getter.is_some() || setter.is_some(),
+            "add_property: property `{name}` has no accessors — nothing for MethodSemantics to \
+             associate"
+        );
+        for accessor in [getter, setter].into_iter().flatten() {
+            self.mark_method_special_name(accessor);
+        }
+        // First property for this class -> open its PropertyMap run at the next Property row.
+        let next_property_rid = u32::try_from(self.property.len() + 1).unwrap();
+        if self.property_map.iter().any(|r| r.parent == class.rid()) {
+            // §II.22.35 runs are CONTIGUOUS slices of the Property table delimited by the NEXT
+            // PropertyMap row's `property_list` — appending is only sound while this class's run
+            // is still the OPEN TAIL run. Anything else means a caller interleaved classes and
+            // the new Property row would silently land inside another class's run. Fail loudly
+            // instead of writing a silently-wrong assembly (the exact `add_event` idiom).
+            assert_eq!(
+                self.property_map.last().map(|r| r.parent),
+                Some(class.rid()),
+                "add_property: non-contiguous property addition — TypeDef rid {} already has a \
+                 closed PropertyMap run (another class's properties were added after its), so \
+                 property `{name}` cannot be appended to it. All of a class's properties must be \
+                 added contiguously.",
+                class.rid(),
+            );
+        } else {
+            self.property_map.push(PropertyMapRow {
+                parent: class.rid(),
+                property_list: next_property_rid,
+            });
+        }
+        let name_off = self.strings.intern(name);
+        self.property.push(PropertyRow {
+            flags: 0,
+            name: name_off,
+            signature: sig_blob,
+        });
+        let property_rid = u32::try_from(self.property.len()).unwrap();
+        let association =
+            encode_has_semantics(Token::new(Token::TABLE_PROPERTY, property_rid));
+        // §II.23.1.12 MethodSemantics.Semantics: 0x2 Getter, 0x1 Setter.
+        if let Some(g) = getter {
+            self.method_semantics.push(MethodSemanticsRow {
+                semantics: 0x2,
+                method: g.rid(),
+                association,
+            });
+        }
+        if let Some(s) = setter {
+            self.method_semantics.push(MethodSemanticsRow {
+                semantics: 0x1,
+                method: s.rid(),
+                association,
+            });
+        }
     }
 
     /// Emits the **only** custom attribute this backend produces: a bare
@@ -1288,6 +1505,8 @@ impl MetadataBuilder {
             (Token::TABLE_STAND_ALONE_SIG, sizes.standalone_sig),
             (Token::TABLE_EVENT_MAP, sizes.event_map),
             (Token::TABLE_EVENT, sizes.event),
+            (Token::TABLE_PROPERTY_MAP, sizes.property_map),
+            (Token::TABLE_PROPERTY, sizes.property),
             (Token::TABLE_METHOD_SEMANTICS, sizes.method_semantics),
             (Token::TABLE_METHOD_IMPL, sizes.method_impl),
             (Token::TABLE_MODULE_REF, sizes.module_ref),
@@ -1296,6 +1515,7 @@ impl MetadataBuilder {
             (Token::TABLE_FIELD_RVA, sizes.field_rva),
             (Token::TABLE_ASSEMBLY, sizes.assembly),
             (Token::TABLE_ASSEMBLY_REF, sizes.assembly_ref),
+            (Token::TABLE_GENERIC_PARAM, sizes.generic_param),
             (Token::TABLE_METHOD_SPEC, sizes.method_spec),
         ]
         .into_iter()
@@ -1328,14 +1548,17 @@ impl MetadataBuilder {
             method_impl: self.method_impl.len(),
             event_map: self.event_map.len(),
             event: self.event.len(),
+            property_map: self.property_map.len(),
+            property: self.property.len(),
             method_semantics: self.method_semantics.len(),
+            generic_param: self.generic_param.len(),
         }
     }
 
     fn serialize_tables(&self, sizes: &RowCounts, widths: &Widths) -> Vec<u8> {
         // Every table this backend can ever emit, in ascending table-id order (§II.24.2.6
         // requires tables be written in table-id order regardless of population order).
-        let table_rowcounts: [(u32, usize); 23] = [
+        let table_rowcounts: [(u32, usize); 26] = [
             (Token::TABLE_MODULE, sizes.module),
             (Token::TABLE_TYPE_REF, sizes.type_ref),
             (Token::TABLE_TYPE_DEF, sizes.type_def),
@@ -1350,6 +1573,8 @@ impl MetadataBuilder {
             (Token::TABLE_STAND_ALONE_SIG, sizes.standalone_sig),
             (Token::TABLE_EVENT_MAP, sizes.event_map),
             (Token::TABLE_EVENT, sizes.event),
+            (Token::TABLE_PROPERTY_MAP, sizes.property_map),
+            (Token::TABLE_PROPERTY, sizes.property),
             (Token::TABLE_METHOD_SEMANTICS, sizes.method_semantics),
             (Token::TABLE_METHOD_IMPL, sizes.method_impl),
             (Token::TABLE_MODULE_REF, sizes.module_ref),
@@ -1358,6 +1583,7 @@ impl MetadataBuilder {
             (Token::TABLE_FIELD_RVA, sizes.field_rva),
             (Token::TABLE_ASSEMBLY, sizes.assembly),
             (Token::TABLE_ASSEMBLY_REF, sizes.assembly_ref),
+            (Token::TABLE_GENERIC_PARAM, sizes.generic_param),
             (Token::TABLE_METHOD_SPEC, sizes.method_spec),
         ];
 
@@ -1405,6 +1631,8 @@ impl MetadataBuilder {
         self.write_standalone_sig_rows(&mut out, widths);
         self.write_event_map_rows(&mut out, widths);
         self.write_event_rows(&mut out, widths);
+        self.write_property_map_rows(&mut out, widths);
+        self.write_property_rows(&mut out, widths);
         self.write_method_semantics_rows(&mut out, widths);
         self.write_method_impl_rows(&mut out, widths);
         self.write_module_ref_rows(&mut out, widths);
@@ -1413,6 +1641,7 @@ impl MetadataBuilder {
         self.write_field_rva_rows(&mut out, widths);
         self.write_assembly_rows(&mut out, widths);
         self.write_assembly_ref_rows(&mut out, widths);
+        self.write_generic_param_rows(&mut out, widths);
         self.write_method_spec_rows(&mut out, widths);
         out
     }
@@ -1507,6 +1736,23 @@ impl MetadataBuilder {
             out.extend_from_slice(&row.event_flags.to_le_bytes());
             write_heap_idx(out, row.name, w.str_wide);
             write_coded_idx(out, row.event_type, w.type_def_or_ref_wide);
+        }
+    }
+
+    fn write_property_map_rows(&self, out: &mut Vec<u8>, w: &Widths) {
+        // §II.22.35: NOT a sorted table — insertion order (class-def iteration order, so Parent
+        // is de-facto ascending anyway), exactly like `write_event_map_rows`.
+        for row in &self.property_map {
+            write_simple_idx(out, row.parent, w.type_def_wide);
+            write_simple_idx(out, row.property_list, w.property_wide);
+        }
+    }
+
+    fn write_property_rows(&self, out: &mut Vec<u8>, w: &Widths) {
+        for row in &self.property {
+            out.extend_from_slice(&row.flags.to_le_bytes());
+            write_heap_idx(out, row.name, w.str_wide);
+            write_heap_idx(out, row.signature, w.blob_wide);
         }
     }
 
@@ -1634,6 +1880,23 @@ impl MetadataBuilder {
             write_heap_idx(out, row.name, w.str_wide);
             write_heap_idx(out, row.culture, w.str_wide);
             write_heap_idx(out, row.hash_value, w.blob_wide);
+        }
+    }
+
+    fn write_generic_param_rows(&self, out: &mut Vec<u8>, w: &Widths) {
+        let mut rows: Vec<&GenericParamRow> = self.generic_param.iter().collect();
+        // Sorted by Owner (the coded TypeOrMethodDef index) then Number (§II.24.2.6). Pass 1's
+        // natural emission order (ascending TypeDef rid, ascending number) is already sorted —
+        // the sort here is belt-and-braces, the debug_assert the tripwire.
+        rows.sort_by_key(|r| (r.owner, r.number));
+        debug_assert!(rows
+            .windows(2)
+            .all(|w| (w[0].owner, w[0].number) <= (w[1].owner, w[1].number)));
+        for row in rows {
+            out.extend_from_slice(&row.number.to_le_bytes());
+            out.extend_from_slice(&row.flags.to_le_bytes());
+            write_coded_idx(out, row.owner, w.type_or_method_def_wide);
+            write_heap_idx(out, row.name, w.str_wide);
         }
     }
 
@@ -1824,12 +2087,25 @@ fn encode_member_forwarded(token: Token) -> u32 {
     (token.rid() << 1) | tag
 }
 
+/// `TypeOrMethodDef` (1 tag bit): 0 = TypeDef, 1 = MethodDef. Targets a `GenericParam.Owner`
+/// (§II.24.2.6). This backend only emits type-owned generic parameters today (generic *method*
+/// definitions don't exist anywhere in the IR), but the encoder accepts both members so a future
+/// generic-method-def feature isn't blocked here.
+fn encode_type_or_method_def(token: Token) -> u32 {
+    let tag = match token.table() {
+        Token::TABLE_TYPE_DEF => 0,
+        Token::TABLE_METHOD_DEF => 1,
+        other => panic!("{other:#x} is not a TypeOrMethodDef member"),
+    };
+    (token.rid() << 1) | tag
+}
+
 /// `HasSemantics` (1 tag bit): 0 = Event, 1 = Property. Targets a `MethodSemantics.Association`.
-/// This backend only emits event semantics (no properties), so only the `Event` tag (0) appears.
 fn encode_has_semantics(token: Token) -> u32 {
     let tag = match token.table() {
         Token::TABLE_EVENT => 0,
-        other => panic!("{other:#x} is not a HasSemantics member this backend emits"),
+        Token::TABLE_PROPERTY => 1,
+        other => panic!("{other:#x} is not a HasSemantics member"),
     };
     (token.rid() << 1) | tag
 }
@@ -1862,7 +2138,10 @@ struct RowCounts {
     method_impl: usize,
     event_map: usize,
     event: usize,
+    property_map: usize,
+    property: usize,
     method_semantics: usize,
+    generic_param: usize,
 }
 
 /// Whether a *simple* index (one target table, no tag bits) needs 4 bytes: §II.24.2.6, "iff the
@@ -1899,6 +2178,7 @@ struct Widths {
     param_wide: bool,
     module_ref_wide: bool,
     event_wide: bool,
+    property_wide: bool,
 
     type_def_or_ref_wide: bool,
     resolution_scope_wide: bool,
@@ -1908,6 +2188,7 @@ struct Widths {
     custom_attribute_type_wide: bool,
     member_forwarded_wide: bool,
     has_semantics_wide: bool,
+    type_or_method_def_wide: bool,
 }
 
 impl Widths {
@@ -1958,11 +2239,33 @@ impl Widths {
             .max(sizes.module)
             .max(sizes.assembly)
             .max(sizes.assembly_ref)
-            .max(sizes.type_spec);
+            .max(sizes.type_spec)
+            // `GenericParam` is `HasCustomAttribute` tag 19 (§II.24.2.6). This backend never
+            // attributes one, but the coded-index WIDTH universe is computed from the row counts
+            // of every table in the target list — readers do the same computation, so omitting a
+            // populated target table here would make our narrow encoding disagree with their
+            // width expectation once `GenericParam` outgrows the 2^(16-5) threshold.
+            .max(sizes.generic_param)
+            // Same rule for the remaining `HasCustomAttribute` target tables this backend can
+            // populate: `Event` (tag 10), `StandAloneSig` (tag 11), `ModuleRef` (tag 12) and
+            // `MethodSpec` (tag 21). None is ever attributed here either, but each counts toward
+            // the width computation — `MethodSpec` in particular grows per generic-method
+            // *instantiation* (the WF-9 `call_gmethod` path), so it can cross the 2^11 threshold
+            // while every other table stays small. `Property` (tag 9) counts too now that
+            // `add_property` populates it. The tables NOT listed (DeclSecurity, File,
+            // ExportedType, ManifestResource, GenericParamConstraint) have no writer in this
+            // backend at all, so their row counts are structurally zero.
+            .max(sizes.event)
+            .max(sizes.property)
+            .max(sizes.standalone_sig)
+            .max(sizes.module_ref)
+            .max(sizes.method_spec);
         let custom_attribute_type_max = sizes.method_def.max(sizes.member_ref);
         let member_forwarded_max = sizes.field.max(sizes.method_def);
-        // `HasSemantics` targets Event + Property (§II.24.2.6); this backend only emits Event.
-        let has_semantics_max = sizes.event;
+        // `HasSemantics` targets Event + Property (§II.24.2.6).
+        let has_semantics_max = sizes.event.max(sizes.property);
+        // `TypeOrMethodDef` (GenericParam.Owner) targets TypeDef + MethodDef.
+        let type_or_method_def_max = sizes.type_def.max(sizes.method_def);
 
         Self {
             heap_sizes,
@@ -1976,6 +2279,7 @@ impl Widths {
             param_wide: simple_wide(sizes.param),
             module_ref_wide: simple_wide(sizes.module_ref),
             event_wide: simple_wide(sizes.event),
+            property_wide: simple_wide(sizes.property),
             type_def_or_ref_wide: coded_wide(2, type_def_or_ref_max),
             resolution_scope_wide: coded_wide(2, resolution_scope_max),
             member_ref_parent_wide: coded_wide(3, member_ref_parent_max),
@@ -1984,6 +2288,7 @@ impl Widths {
             custom_attribute_type_wide: coded_wide(3, custom_attribute_type_max),
             member_forwarded_wide: coded_wide(1, member_forwarded_max),
             has_semantics_wide: coded_wide(1, has_semantics_max),
+            type_or_method_def_wide: coded_wide(1, type_or_method_def_max),
         }
     }
 }
@@ -2018,13 +2323,30 @@ impl TypeDefOrRefResolver for MetadataBuilder {
             return encode_type_def_or_ref_token(tok);
         }
         let class_ref = asm.class_ref(cref).clone();
-        let raw_name = &asm[class_ref.name()];
+        let raw_name = asm[class_ref.name()].to_string();
         let tok = if asm.class_ref_to_def(cref).is_some() {
             // Defined in this assembly: the corresponding TypeDef row must already have been
             // added by `add_type_def` (population walks class defs before any signature needs
             // to resolve one) — if not, this is a caller-ordering bug, not a spec question.
-            self.find_type_def(raw_name).unwrap_or_else(|| {
+            self.find_type_def(&raw_name).unwrap_or_else(|| {
                 panic!("ClassRef {raw_name:?} resolves to a class def not yet added via add_type_def")
+            })
+        } else if let Some(def_id) = find_open_generic_def(asm, cref) {
+            // An in-assembly INSTANTIATED generic reference (e.g. `IBox`1<int32>` where `IBox`1`
+            // is this assembly's own `#[dotnet_interface] trait IBox<T>`): the interned handle
+            // never maps to a def (defs register under the OPEN shape, empty generics), so the
+            // plain branch above misses it — and the external fallback below would mint a bogus
+            // module-scope `TypeRef` with a DOUBLED arity postfix (`IBox`1`1`). Resolve to the
+            // open definition's own TypeDef row instead; `sig::encode_class` has already opened
+            // the `GENERICINST` wrapper around this coded index, so the open TypeDef is exactly
+            // the §II.23.2.12 "open type" position. Gated on `asm() == None` + non-empty
+            // generics + a registered matching def, so no external type can ever take this path.
+            let def_name = asm[asm[def_id].name()].to_string();
+            self.find_type_def(&def_name).unwrap_or_else(|| {
+                panic!(
+                    "open generic def {def_name:?} (instantiated as {raw_name:?}) not yet added \
+                     via add_type_def"
+                )
             })
         } else {
             // External: a TypeRef, scoped by its declaring assembly's AssemblyRef (or a
@@ -2052,6 +2374,51 @@ impl TypeDefOrRefResolver for MetadataBuilder {
         self.class_token_cache.insert(cref, tok);
         encode_type_def_or_ref_token(tok)
     }
+}
+
+/// If `cref` is an INSTANTIATED reference to a generic type this assembly itself DEFINES —
+/// `asm() == None` (no external assembly), non-empty `generics`, and an OPEN `ClassRef` of the
+/// same name maps to a registered class def — returns that open definition's `ClassDefIdx`.
+/// Returns `None` for every other shape (non-generic, external, or genuinely-unknown), leaving
+/// the caller's pre-existing resolution behavior untouched.
+///
+/// Two candidate open names are tried: the reference's own name verbatim (the
+/// `#[dotnet_interface]`-emitted `IBoxHandle<T>` alias already spells the CLS backtick-arity name
+/// `IBox`1`), and — when the name carries no backtick — the `` `arity ``-postfixed form (the
+/// `#[dotnet_class(implements = "IBox<…>")]` surface spells the bare `IBox`). SOUNDNESS: only a
+/// def registered in THIS assembly can ever match (external types carry `asm() == Some(_)` and
+/// are gated out up front), and a matched def whose declared arity disagrees with the
+/// instantiation's argument count fails loudly rather than emitting a `GENERICINST` the CLR
+/// would reject far less legibly at load time.
+pub(super) fn find_open_generic_def(
+    asm: &mut Assembly,
+    cref: Interned<ClassRef>,
+) -> Option<crate::ir::class::ClassDefIdx> {
+    let class_ref = asm.class_ref(cref).clone();
+    if class_ref.asm().is_some() || class_ref.generics().is_empty() {
+        return None;
+    }
+    let arity = class_ref.generics().len();
+    let raw_name = asm[class_ref.name()].to_string();
+    let mut candidates = vec![raw_name.clone()];
+    if !raw_name.contains('`') {
+        candidates.push(format!("{raw_name}`{arity}"));
+    }
+    for candidate in candidates {
+        let name_id = asm.alloc_string(candidate);
+        let open = ClassRef::new(name_id, None, class_ref.is_valuetype(), [].into());
+        let open_id = asm.alloc_class_ref(open);
+        if let Some(def_id) = asm.class_ref_to_def(open_id) {
+            let declared = asm[def_id].generics();
+            assert_eq!(
+                declared as usize, arity,
+                "generic type `{raw_name}` is instantiated with {arity} argument(s) but its \
+                 definition declares {declared} generic parameter(s)"
+            );
+            return Some(def_id);
+        }
+    }
+    None
 }
 
 impl MetadataBuilder {
@@ -2566,6 +2933,1100 @@ mod tests {
         assert_ne!(m_flags & 0x40, 0, "abstract method must still be Virtual (0x40); flags={m_flags:#x}");
     }
 
+    /// §II.22.12 `EventMap` runs are contiguous Event-table slices delimited by the NEXT row's
+    /// `event_list`, so re-opening a class's events after ANOTHER class started its run would
+    /// silently file the late Event row under the other class. [`MetadataBuilder::add_event`]
+    /// must fail loudly on that misuse instead of masking it.
+    #[test]
+    #[should_panic(expected = "non-contiguous event addition")]
+    fn add_event_rejects_non_contiguous_per_class_event_runs() {
+        let mut mb = MetadataBuilder::new();
+        let class_a = mb.add_type_def("", "A", false, None, None, None, &[]);
+        let class_b = mb.add_type_def("", "B", false, None, None, None, &[]);
+        // Six accessor methods (an add/remove pair per event). The signature blob's shape is
+        // irrelevant here — `add_event` only flips accessor flags and appends event rows.
+        let sig = mb.blobs.intern(&[0x20, 0x00, 0x01]);
+        let m: Vec<Token> = (0..6)
+            .map(|i| {
+                mb.add_method(&format!("acc{i}"), sig, &[], &[], false, true, false, None, false)
+            })
+            .collect();
+        let delegate = class_a; // any TypeDefOrRef-encodable token works as the event type
+        mb.add_event(class_a, "E1", delegate, m[0], m[1]);
+        mb.add_event(class_b, "E2", delegate, m[2], m[3]);
+        // Class A's run is closed (B's is the open tail) — this must panic, not silently append
+        // an Event row that decodes as belonging to B.
+        mb.add_event(class_a, "E3", delegate, m[4], m[5]);
+    }
+
+    /// A **`static abstract`** interface member (.NET 7+ static virtual members in interfaces —
+    /// the `INumber<T>` generic-math shape): the PE writer must emit its `MethodDef` with Roslyn's
+    /// exact flags `0x4D6` = `Public|Static|Virtual|HideBySig|Abstract` (critically **no
+    /// `NewSlot`** — an INSTANCE abstract member has it, a static virtual must not, per a
+    /// `System.Reflection.Metadata` dump of real net8 csc output), RVA=0, and a `SIG_DEFAULT`
+    /// (no-`HASTHIS`) signature blob. Structural readback of `export_pe`'s actual bytes, same
+    /// pattern as `interface_type_def_and_abstract_method_are_emitted_by_pe_writer`.
+    #[test]
+    fn static_abstract_interface_member_is_emitted_by_pe_writer() {
+        use crate::ir::{ClassDef, MethodDef, MethodImpl, Type};
+
+        let mut asm = crate::ir::Assembly::default();
+        let iname = asm.alloc_string("IParse");
+        let cdef = ClassDef::new(
+            iname, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+        )
+        .with_interface();
+        let cidx = asm.class_def(cdef).unwrap();
+        // `static abstract int Make();` — NO receiver input (a static sig carries none).
+        let mname = asm.alloc_string("Make");
+        let msig = asm.sig([], Type::Int(Int::I32));
+        let mdef = MethodDef::new(
+            Access::Public,
+            cidx,
+            mname,
+            msig,
+            MethodKind::Static,
+            MethodImpl::Missing,
+            vec![],
+        )
+        .with_abstract();
+        asm.new_method(mdef);
+
+        let options = super::super::export::ExportOptions {
+            is_dll: true,
+            assembly_name: "pe_static_iface".to_string(),
+            module_name: "pe_static_iface.dll".to_string(),
+            pdb_file_name: String::new(),
+        };
+        let (image, _pdb) = super::super::export::export_pe(&mut asm, &options);
+
+        let bsjb = image
+            .windows(4)
+            .position(|w| w == b"BSJB")
+            .expect("PE image must contain a BSJB metadata root");
+        let reader = MetadataReader::parse(&image[bsjb..]);
+        let header = reader.tables_header();
+        let row_bytes = &reader.stream("#~")[header.row_data_offset..];
+        let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
+
+        // --- Make's MethodDef row (rid 1, the only method). Row layout: RVA(4) + ImplFlags(2) +
+        // Flags(2) + Name(str) + Signature(blob) + ParamList(simple).
+        let md_start = reader.table_offset(Token::TABLE_METHOD_DEF, &header);
+        assert_eq!(u32_at(md_start), 0, "static abstract member must have RVA=0");
+        assert_eq!(u16_at(md_start + 4), 0, "ImplFlags must be 0");
+        let m_flags = u16_at(md_start + 6);
+        assert_eq!(
+            m_flags, 0x4D6,
+            "static abstract member flags must byte-match Roslyn's \
+             Public|Static|Virtual|HideBySig|Abstract (0x4D6, no NewSlot); flags={m_flags:#x}"
+        );
+
+        // --- The signature blob: `SIG_DEFAULT` (0x00, NO `HASTHIS`), 0 params, ELEMENT_TYPE_I4.
+        let str_w = if header.heap_sizes & 0x1 != 0 { 4usize } else { 2 };
+        let blob_w = if header.heap_sizes & 0x4 != 0 { 4usize } else { 2 };
+        let sig_col = md_start + 8 + str_w;
+        let sig_off = if blob_w == 4 { u32_at(sig_col) } else { u32::from(u16_at(sig_col)) } as usize;
+        let blob_heap = reader.stream("#Blob");
+        // Small blob (< 0x80 bytes): a single compressed-length byte, then the blob data.
+        let blob_len = blob_heap[sig_off] as usize;
+        let sig_blob = &blob_heap[sig_off + 1..sig_off + 1 + blob_len];
+        assert_eq!(
+            sig_blob,
+            &[0x00, 0x00, 0x08],
+            "sig must be SIG_DEFAULT (no HASTHIS), 0 params, ELEMENT_TYPE_I4"
+        );
+    }
+
+    /// A **property on an interface** (`#[dotnet_property]` inside `#[dotnet_interface]` —
+    /// `ClassDef::add_property`): the PE writer must emit (a) one §II.22.35 `PropertyMap` row
+    /// (Parent = the interface TypeDef, PropertyList = 1, a run-start), (b) one §II.22.34
+    /// `Property` row per property with Flags=0 and a §II.23.2.5 `PropertySig` blob
+    /// (`PROPERTY|HASTHIS, 0 params, <type>`), (c) `MethodSemantics` rows with Getter=0x2/
+    /// Setter=0x1 whose `Association` carries the `HasSemantics` Property tag (1), and (d)
+    /// accessor `MethodDef`s flagged `Virtual|NewSlot|Abstract|SpecialName` with RVA=0.
+    /// Structural readback of `export_pe`'s actual bytes, same pattern as
+    /// `interface_type_def_and_abstract_method_are_emitted_by_pe_writer`. Includes a GET-ONLY
+    /// second property (setter absent — exactly one MethodSemantics row).
+    #[test]
+    fn interface_property_emits_property_map_property_and_method_semantics_rows() {
+        use crate::ir::class::PropertyDef;
+        use crate::ir::{ClassDef, MethodDef, MethodImpl, Type};
+
+        let mut asm = crate::ir::Assembly::default();
+        let iname = asm.alloc_string("ISpeaker");
+        let cdef = ClassDef::new(
+            iname, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+        )
+        .with_interface();
+        let cidx = asm.class_def(cdef).unwrap();
+        let self_ty = Type::ClassRef(*cidx);
+
+        // `int Volume { get; set; }` — abstract get_Volume/set_Volume accessors (MethodDef rids
+        // 1 and 2) + one PropertyDef linking them.
+        let get_name = asm.alloc_string("get_Volume");
+        let get_sig = asm.sig([self_ty], Type::Int(Int::I32));
+        let get_def = MethodDef::new(
+            Access::Public,
+            cidx,
+            get_name,
+            get_sig,
+            MethodKind::Virtual,
+            MethodImpl::Missing,
+            vec![None],
+        )
+        .with_abstract();
+        let get_mref = asm.alloc_methodref(get_def.ref_to());
+        asm.new_method(get_def);
+        let set_name = asm.alloc_string("set_Volume");
+        let set_sig = asm.sig([self_ty, Type::Int(Int::I32)], Type::Void);
+        let set_def = MethodDef::new(
+            Access::Public,
+            cidx,
+            set_name,
+            set_sig,
+            MethodKind::Virtual,
+            MethodImpl::Missing,
+            vec![None, None],
+        )
+        .with_abstract();
+        let set_mref = asm.alloc_methodref(set_def.ref_to());
+        asm.new_method(set_def);
+        // `string Name { get; }` — a GET-ONLY managed-typed property (MethodDef rid 3).
+        let getname_name = asm.alloc_string("get_Name");
+        let getname_sig = asm.sig([self_ty], Type::PlatformString);
+        let getname_def = MethodDef::new(
+            Access::Public,
+            cidx,
+            getname_name,
+            getname_sig,
+            MethodKind::Virtual,
+            MethodImpl::Missing,
+            vec![None],
+        )
+        .with_abstract();
+        let getname_mref = asm.alloc_methodref(getname_def.ref_to());
+        asm.new_method(getname_def);
+
+        let vol_name = asm.alloc_string("Volume");
+        asm.class_mut(cidx).add_property(PropertyDef::new(
+            vol_name,
+            Type::Int(Int::I32),
+            Some(get_mref),
+            Some(set_mref),
+        ));
+        let nm_name = asm.alloc_string("Name");
+        asm.class_mut(cidx).add_property(PropertyDef::new(
+            nm_name,
+            Type::PlatformString,
+            Some(getname_mref),
+            None,
+        ));
+
+        let options = super::super::export::ExportOptions {
+            is_dll: true,
+            assembly_name: "pe_iface_prop".to_string(),
+            module_name: "pe_iface_prop.dll".to_string(),
+            pdb_file_name: String::new(),
+        };
+        let (image, _pdb) = super::super::export::export_pe(&mut asm, &options);
+
+        let bsjb = image
+            .windows(4)
+            .position(|w| w == b"BSJB")
+            .expect("PE image must contain a BSJB metadata root");
+        let reader = MetadataReader::parse(&image[bsjb..]);
+        let header = reader.tables_header();
+        let row_bytes = &reader.stream("#~")[header.row_data_offset..];
+        let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
+        let count =
+            |id: u32| header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c);
+
+        // Both new tables are Valid; neither is in the Sorted bitmask (§II.24.2.6 — same
+        // NOT-sorted status as EventMap/Event); MethodSemantics keeps its Sorted bit.
+        assert_eq!(count(Token::TABLE_PROPERTY_MAP), 1);
+        assert_eq!(count(Token::TABLE_PROPERTY), 2);
+        assert_eq!(count(Token::TABLE_METHOD_SEMANTICS), 3);
+        assert_eq!(header.sorted & (1 << Token::TABLE_PROPERTY_MAP), 0);
+        assert_eq!(header.sorted & (1 << Token::TABLE_PROPERTY), 0);
+        assert_ne!(header.sorted & (1 << Token::TABLE_METHOD_SEMANTICS), 0);
+
+        // Everything in this tiny image is narrow (2-byte) indices.
+        let str_w = if header.heap_sizes & 0x1 != 0 { 4usize } else { 2 };
+        let blob_w = if header.heap_sizes & 0x4 != 0 { 4usize } else { 2 };
+        assert_eq!((str_w, blob_w), (2, 2), "tiny image should have narrow heaps");
+
+        // --- PropertyMap row: Parent = ISpeaker's TypeDef rid (2 — `<Module>` is rid 1),
+        // PropertyList = 1 (the run starts at the first Property row).
+        let pm_start = reader.table_offset(Token::TABLE_PROPERTY_MAP, &header);
+        assert_eq!(u16_at(pm_start), 2, "PropertyMap.Parent must be ISpeaker's TypeDef rid");
+        assert_eq!(u16_at(pm_start + 2), 1, "PropertyMap.PropertyList must open the run at 1");
+
+        // --- Property rows: Flags=0, Name, PropertySig blob.
+        let p_start = reader.table_offset(Token::TABLE_PROPERTY, &header);
+        let p_w = MetadataReader::row_width(Token::TABLE_PROPERTY, &header);
+        let blob_heap = reader.stream("#Blob");
+        let prop_blob = |row: usize| {
+            let sig_off = u16_at(p_start + row * p_w + 2 + str_w) as usize;
+            let len = blob_heap[sig_off] as usize; // small blob: 1-byte compressed length
+            &blob_heap[sig_off + 1..sig_off + 1 + len]
+        };
+        assert_eq!(u16_at(p_start), 0, "Property.Flags must be 0");
+        assert_eq!(
+            reader.strings_at(u16_at(p_start + 2).into()),
+            "Volume",
+            "Property row 1 must be named Volume"
+        );
+        assert_eq!(
+            prop_blob(0),
+            &[0x28, 0x00, 0x08],
+            "Volume's PropertySig must be PROPERTY|HASTHIS, 0 params, ELEMENT_TYPE_I4"
+        );
+        assert_eq!(reader.strings_at(u16_at(p_start + p_w + 2).into()), "Name");
+        assert_eq!(
+            prop_blob(1),
+            &[0x28, 0x00, 0x0E],
+            "Name's PropertySig must be PROPERTY|HASTHIS, 0 params, ELEMENT_TYPE_STRING"
+        );
+
+        // --- MethodSemantics rows (sorted by Association; both Volume rows share association
+        // `(1 << 1) | 1 = 3`, Name's is `(2 << 1) | 1 = 5`): Getter(0x2)+Setter(0x1) for Volume
+        // (MethodDef rids 1/2), Getter for Name (rid 3). The stable sort preserves the
+        // getter-then-setter insertion order within one property.
+        let ms_start = reader.table_offset(Token::TABLE_METHOD_SEMANTICS, &header);
+        let ms_w = MetadataReader::row_width(Token::TABLE_METHOD_SEMANTICS, &header);
+        let sem_row = |i: usize| {
+            (
+                u16_at(ms_start + i * ms_w),
+                u16_at(ms_start + i * ms_w + 2),
+                u16_at(ms_start + i * ms_w + 4),
+            )
+        };
+        assert_eq!(sem_row(0), (0x2, 1, 3), "Getter(get_Volume) associated to Property rid 1");
+        assert_eq!(sem_row(1), (0x1, 2, 3), "Setter(set_Volume) associated to Property rid 1");
+        assert_eq!(sem_row(2), (0x2, 3, 5), "Getter(get_Name) associated to Property rid 2");
+
+        // --- Accessor MethodDef rows: RVA=0 and Public|Virtual|NewSlot|Abstract|SpecialName.
+        let md_start = reader.table_offset(Token::TABLE_METHOD_DEF, &header);
+        let md_w = MetadataReader::row_width(Token::TABLE_METHOD_DEF, &header);
+        for rid in 1..=3usize {
+            let row = md_start + (rid - 1) * md_w;
+            assert_eq!(u32_at(row), 0, "accessor rid {rid} must have RVA=0");
+            let flags = u16_at(row + 6);
+            assert_eq!(
+                flags,
+                0x6 | 0x40 | 0x100 | 0x400 | 0x800,
+                "accessor rid {rid} must be Public|Virtual|NewSlot|Abstract|SpecialName; \
+                 flags={flags:#x}"
+            );
+        }
+    }
+
+    /// §II.22.35 `PropertyMap` runs are contiguous Property-table slices — interleaving two
+    /// classes' property additions must fail loudly, exactly like
+    /// `add_event_rejects_non_contiguous_per_class_event_runs`.
+    #[test]
+    #[should_panic(expected = "non-contiguous property addition")]
+    fn add_property_rejects_non_contiguous_per_class_property_runs() {
+        let mut mb = MetadataBuilder::new();
+        let class_a = mb.add_type_def("", "A", false, None, None, None, &[]);
+        let class_b = mb.add_type_def("", "B", false, None, None, None, &[]);
+        let msig = mb.blobs.intern(&[0x20, 0x00, 0x08]);
+        let psig = mb.blobs.intern(&[0x28, 0x00, 0x08]);
+        let m: Vec<Token> = (0..3)
+            .map(|i| {
+                mb.add_method(&format!("get_P{i}"), msig, &[], &[], false, true, false, None, false)
+            })
+            .collect();
+        mb.add_property(class_a, "P0", psig, Some(m[0]), None);
+        mb.add_property(class_b, "P1", psig, Some(m[1]), None);
+        // Class A's run is closed (B's is the open tail) — must panic.
+        mb.add_property(class_a, "P2", psig, Some(m[2]), None);
+    }
+
+    /// A **generic interface definition** (`#[dotnet_interface] trait IBox<T>` —
+    /// `ClassDef::with_type_generic_names`): the PE writer must emit (a) the backtick-arity
+    /// TypeDef name (`IBox`1`), (b) exactly one `GenericParam` row (§II.22.20) with
+    /// `{Number=0, Flags=0, Owner=coded TypeOrMethodDef of the TypeDef, Name="T"}`, (c) the
+    /// `Sorted` bitmask bit for table 0x2A, and (d) member signatures whose `T` positions are
+    /// `ELEMENT_TYPE_VAR 0` with NO `SIG_GENERIC` convention bit (that is generic-METHOD-only,
+    /// §II.23.2.1). Structural readback of `export_pe`'s actual bytes, same pattern as
+    /// `interface_type_def_and_abstract_method_are_emitted_by_pe_writer`.
+    #[test]
+    fn generic_interface_type_def_emits_generic_param_rows() {
+        use crate::ir::tpe::GenericKind;
+        use crate::ir::{ClassDef, MethodDef, MethodImpl, Type};
+
+        let mut asm = crate::ir::Assembly::default();
+        let iname = asm.alloc_string("IBox`1");
+        let tname = asm.alloc_string("T");
+        let cdef = ClassDef::new(
+            iname, false, 1, None, vec![], vec![], Access::Public, None, None, true,
+        )
+        .with_interface()
+        .with_type_generic_names(vec![tname]);
+        let cidx = asm.class_def(cdef).unwrap();
+        let self_ty = Type::ClassRef(*cidx);
+        // `T Roundtrip(T value);` — the generic parameter in BOTH param and return position.
+        let t_var = Type::PlatformGeneric(0, GenericKind::TypeGeneric);
+        let mname = asm.alloc_string("Roundtrip");
+        let msig = asm.sig([self_ty, t_var], t_var);
+        let mdef = MethodDef::new(
+            Access::Public,
+            cidx,
+            mname,
+            msig,
+            MethodKind::Virtual,
+            MethodImpl::Missing,
+            vec![None, None],
+        )
+        .with_abstract();
+        asm.new_method(mdef);
+
+        let options = super::super::export::ExportOptions {
+            is_dll: true,
+            assembly_name: "pe_generic_iface".to_string(),
+            module_name: "pe_generic_iface.dll".to_string(),
+            pdb_file_name: String::new(),
+        };
+        let (image, _pdb) = super::super::export::export_pe(&mut asm, &options);
+
+        let bsjb = image
+            .windows(4)
+            .position(|w| w == b"BSJB")
+            .expect("PE image must contain a BSJB metadata root");
+        let reader = MetadataReader::parse(&image[bsjb..]);
+        let header = reader.tables_header();
+        let row_bytes = &reader.stream("#~")[header.row_data_offset..];
+        let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
+        let count =
+            |id: u32| header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c);
+        let str_w = if header.heap_sizes & 0x1 != 0 { 4usize } else { 2 };
+        let blob_w = if header.heap_sizes & 0x4 != 0 { 4usize } else { 2 };
+        let str_at = |o: usize| -> u32 {
+            if str_w == 4 { u32_at(o) } else { u32::from(u16_at(o)) }
+        };
+
+        // (d) IBox`1's TypeDef row (rid 2 — `<Module>` is rid 1): the Name column (after the
+        // 4-byte Flags) must be the backtick-arity string, with an Interface-flagged row.
+        let td_start = reader.table_offset(Token::TABLE_TYPE_DEF, &header);
+        let td_w = MetadataReader::row_width(Token::TABLE_TYPE_DEF, &header);
+        let iface_row = td_start + td_w; // rid 2
+        let flags = u32_at(iface_row);
+        assert_ne!(flags & 0x20, 0, "TypeDef must have Interface (0x20); flags={flags:#x}");
+        assert_eq!(reader.strings_at(str_at(iface_row + 4)), "IBox`1");
+
+        // (b) Exactly one GenericParam row: Number(2) + Flags(2) + Owner(coded TypeOrMethodDef,
+        // 1 tag bit; TypeDef rid 2 -> (2 << 1) | 0) + Name -> "T".
+        assert_eq!(count(Token::TABLE_GENERIC_PARAM), 1);
+        let gp_start = reader.table_offset(Token::TABLE_GENERIC_PARAM, &header);
+        assert_eq!(u16_at(gp_start), 0, "Number must be 0 (the first declared parameter)");
+        assert_eq!(u16_at(gp_start + 2), 0, "Flags must be 0 (no variance/constraints)");
+        let tomd_max = count(Token::TABLE_TYPE_DEF).max(count(Token::TABLE_METHOD_DEF));
+        let owner_wide = tomd_max >= (1usize << 15);
+        let owner = if owner_wide { u32_at(gp_start + 4) } else { u32::from(u16_at(gp_start + 4)) };
+        assert_eq!(owner, (2 << 1) | 0, "Owner must be coded TypeOrMethodDef(TypeDef rid 2)");
+        let owner_w = if owner_wide { 4 } else { 2 };
+        assert_eq!(reader.strings_at(str_at(gp_start + 4 + owner_w)), "T");
+
+        // (c) The `Sorted` bitmask must claim table 0x2A (GenericParam is a sorted table).
+        assert_ne!(
+            header.sorted & (1u64 << Token::TABLE_GENERIC_PARAM),
+            0,
+            "Sorted bit for GenericParam (0x2A) must be set"
+        );
+
+        // (a) Roundtrip's MethodDefSig blob: HASTHIS (0x20, and critically NOT SIG_GENERIC 0x10
+        // — that bit is for generic METHOD definitions), 1 param, return ET_VAR 0, param
+        // ET_VAR 0 — the receiver is implicit, never a parameter.
+        let md_start = reader.table_offset(Token::TABLE_METHOD_DEF, &header);
+        let sig_col = md_start + 8 + str_w;
+        let sig_off = if blob_w == 4 { u32_at(sig_col) } else { u32::from(u16_at(sig_col)) } as usize;
+        let blob_heap = reader.stream("#Blob");
+        let blob_len = blob_heap[sig_off] as usize;
+        let sig_blob = &blob_heap[sig_off + 1..sig_off + 1 + blob_len];
+        assert_eq!(
+            sig_blob,
+            &[0x20, 0x01, 0x13, 0x00, 0x13, 0x00],
+            "sig must be HASTHIS (no SIG_GENERIC), 1 param, ET_VAR 0 return, ET_VAR 0 param"
+        );
+    }
+
+    /// A **generic method definition** on a non-generic interface (`#[dotnet_interface]`'s
+    /// `fn Echo<T>(&self, value: T) -> T` — `MethodDef::with_generic_params`): the PE writer
+    /// must emit (a) exactly one METHOD-owned `GenericParam` row (§II.22.20) with
+    /// `{Number=0, Flags=0, Owner=coded TypeOrMethodDef(MethodDef, tag 1), Name="T"}`,
+    /// (b) a `MethodDefSig` blob whose convention is `HASTHIS|SIG_GENERIC` (0x30) followed by a
+    /// compressed `GenParamCount` of 1 (§II.23.2.1), with the `T` positions encoded
+    /// `ELEMENT_TYPE_MVAR 0` (`!!0` — `GenericKind::CallGeneric`, per `sig.rs`'s
+    /// naming-crossover note), and (c) the abstract-member flags of any other interface member.
+    /// The method-owner dual of `generic_interface_type_def_emits_generic_param_rows` above.
+    #[test]
+    fn generic_method_def_emits_method_owned_generic_param_row() {
+        use crate::ir::tpe::GenericKind;
+        use crate::ir::{ClassDef, MethodDef, MethodImpl, Type};
+
+        let mut asm = crate::ir::Assembly::default();
+        let iname = asm.alloc_string("IConverter");
+        let cdef = ClassDef::new(
+            iname, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+        )
+        .with_interface();
+        let cidx = asm.class_def(cdef).unwrap();
+        let self_ty = Type::ClassRef(*cidx);
+        // `T Echo<T>(T value);` — the method's own parameter in BOTH param and return position.
+        let t_mvar = Type::PlatformGeneric(0, GenericKind::CallGeneric);
+        let mname = asm.alloc_string("Echo");
+        let tname = asm.alloc_string("T");
+        let msig = asm.sig([self_ty, t_mvar], t_mvar);
+        let mdef = MethodDef::new(
+            Access::Public,
+            cidx,
+            mname,
+            msig,
+            MethodKind::Virtual,
+            MethodImpl::Missing,
+            vec![None, None],
+        )
+        .with_abstract()
+        .with_generic_params(vec![tname]);
+        asm.new_method(mdef);
+
+        let options = super::super::export::ExportOptions {
+            is_dll: true,
+            assembly_name: "pe_generic_method".to_string(),
+            module_name: "pe_generic_method.dll".to_string(),
+            pdb_file_name: String::new(),
+        };
+        let (image, _pdb) = super::super::export::export_pe(&mut asm, &options);
+
+        let bsjb = image
+            .windows(4)
+            .position(|w| w == b"BSJB")
+            .expect("PE image must contain a BSJB metadata root");
+        let reader = MetadataReader::parse(&image[bsjb..]);
+        let header = reader.tables_header();
+        let row_bytes = &reader.stream("#~")[header.row_data_offset..];
+        let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
+        let count =
+            |id: u32| header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c);
+        let str_w = if header.heap_sizes & 0x1 != 0 { 4usize } else { 2 };
+        let blob_w = if header.heap_sizes & 0x4 != 0 { 4usize } else { 2 };
+        let str_at = |o: usize| -> u32 {
+            if str_w == 4 { u32_at(o) } else { u32::from(u16_at(o)) }
+        };
+
+        // (a) Exactly one GenericParam row, owned by Echo's MethodDef (rid 1 — the only method
+        // in this assembly): Owner = (1 << 1) | 1 (coded TypeOrMethodDef, MethodDef tag).
+        assert_eq!(count(Token::TABLE_GENERIC_PARAM), 1);
+        let gp_start = reader.table_offset(Token::TABLE_GENERIC_PARAM, &header);
+        assert_eq!(u16_at(gp_start), 0, "Number must be 0 (the first declared parameter)");
+        assert_eq!(u16_at(gp_start + 2), 0, "Flags must be 0 (no variance/constraints)");
+        let tomd_max = count(Token::TABLE_TYPE_DEF).max(count(Token::TABLE_METHOD_DEF));
+        let owner_wide = tomd_max >= (1usize << 15);
+        let owner = if owner_wide { u32_at(gp_start + 4) } else { u32::from(u16_at(gp_start + 4)) };
+        assert_eq!(owner, (1 << 1) | 1, "Owner must be coded TypeOrMethodDef(MethodDef rid 1)");
+        let owner_w = if owner_wide { 4 } else { 2 };
+        assert_eq!(reader.strings_at(str_at(gp_start + 4 + owner_w)), "T");
+
+        // (c) Echo's MethodDef row (rid 1): abstract virtual interface-member flags, and (b) its
+        // sig blob: HASTHIS|SIG_GENERIC (0x30), GenParamCount 1, 1 param, return ET_MVAR 0,
+        // param ET_MVAR 0 — the receiver stays implicit, exactly like a non-generic member.
+        let md_start = reader.table_offset(Token::TABLE_METHOD_DEF, &header);
+        let flags = u16_at(md_start + 6);
+        assert_ne!(flags & 0x400, 0, "MethodDef must be Abstract (0x400); flags={flags:#x}");
+        assert_ne!(flags & 0x40, 0, "MethodDef must be Virtual (0x40); flags={flags:#x}");
+        let sig_col = md_start + 8 + str_w;
+        let sig_off = if blob_w == 4 { u32_at(sig_col) } else { u32::from(u16_at(sig_col)) } as usize;
+        let blob_heap = reader.stream("#Blob");
+        let blob_len = blob_heap[sig_off] as usize;
+        let sig_blob = &blob_heap[sig_off + 1..sig_off + 1 + blob_len];
+        assert_eq!(
+            sig_blob,
+            &[0x30, 0x01, 0x01, 0x1E, 0x00, 0x1E, 0x00],
+            "sig must be HASTHIS|SIG_GENERIC, GenParamCount 1, 1 param, ET_MVAR 0 return, \
+             ET_MVAR 0 param"
+        );
+    }
+
+    /// An in-assembly INSTANTIATED reference to this assembly's own generic interface (e.g. an
+    /// `IBoxHandle<i32>` parameter — `ClassRef("IBox`1", None, [int32])`): the signature encoder
+    /// must resolve the open-type position to the definition's own **TypeDef** token via
+    /// `find_open_generic_def`, NOT mint a dangling module-scope `TypeRef` with a doubled arity
+    /// postfix (`IBox`1`1` — the pre-existing external-fallback behavior for unknown generic
+    /// refs). Expected blob: `GENERICINST CLASS <TypeDef-coded> 1 I4` (§II.23.2.12).
+    #[test]
+    fn instantiated_in_assembly_generic_interface_resolves_to_its_type_def() {
+        use crate::ir::{BasicBlock, CILRoot, ClassDef, ClassRef, MethodDef, MethodImpl, Type};
+
+        let mut asm = crate::ir::Assembly::default();
+        let iname = asm.alloc_string("IBox`1");
+        let tname = asm.alloc_string("T");
+        let cdef = ClassDef::new(
+            iname, false, 1, None, vec![], vec![], Access::Public, None, None, true,
+        )
+        .with_interface()
+        .with_type_generic_names(vec![tname]);
+        let cidx = asm.class_def(cdef).unwrap();
+        // `static void UseBox(IBox<int> box)` — a plain static (interfaces may carry static
+        // non-virtual methods with bodies), so the interface stays the only TypeDef (rid 2,
+        // deterministic — class-def iteration is hash-ordered with 2+ classes).
+        let inst =
+            asm.alloc_class_ref(ClassRef::new(iname, None, false, [Type::Int(Int::I32)].into()));
+        let mname = asm.alloc_string("UseBox");
+        let msig = asm.sig([Type::ClassRef(inst)], Type::Void);
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        let mdef = MethodDef::new(
+            Access::Public,
+            cidx,
+            mname,
+            msig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            },
+            vec![None],
+        );
+        asm.new_method(mdef);
+
+        let options = super::super::export::ExportOptions {
+            is_dll: true,
+            assembly_name: "pe_generic_iface_inst".to_string(),
+            module_name: "pe_generic_iface_inst.dll".to_string(),
+            pdb_file_name: String::new(),
+        };
+        let (image, _pdb) = super::super::export::export_pe(&mut asm, &options);
+
+        let bsjb = image
+            .windows(4)
+            .position(|w| w == b"BSJB")
+            .expect("PE image must contain a BSJB metadata root");
+        let reader = MetadataReader::parse(&image[bsjb..]);
+        let header = reader.tables_header();
+        let row_bytes = &reader.stream("#~")[header.row_data_offset..];
+        let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
+        let count =
+            |id: u32| header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c);
+        let str_w = if header.heap_sizes & 0x1 != 0 { 4usize } else { 2 };
+        let blob_w = if header.heap_sizes & 0x4 != 0 { 4usize } else { 2 };
+
+        // The tell-tale failure shape would be a module-scope TypeRef named `IBox`1`1` — the
+        // fixed resolver never creates ANY TypeRef for this reference. This minimal image
+        // (interface-only, no extends bootstrap) carries NO TypeRef rows at all; guard the scan
+        // since `table_offset` panics on an absent table.
+        if count(Token::TABLE_TYPE_REF) > 0 {
+            let tr_start = reader.table_offset(Token::TABLE_TYPE_REF, &header);
+            let tr_w = MetadataReader::row_width(Token::TABLE_TYPE_REF, &header);
+            let scope_max = count(Token::TABLE_MODULE)
+                .max(count(Token::TABLE_MODULE_REF))
+                .max(count(Token::TABLE_ASSEMBLY_REF))
+                .max(count(Token::TABLE_TYPE_REF));
+            let scope_w: usize = if scope_max >= (1usize << 14) { 4 } else { 2 };
+            for rid0 in 0..count(Token::TABLE_TYPE_REF) {
+                let name_col = tr_start + rid0 * tr_w + scope_w;
+                let name_off =
+                    if str_w == 4 { u32_at(name_col) } else { u32::from(u16_at(name_col)) };
+                assert!(
+                    !reader.strings_at(name_off).contains('`'),
+                    "no TypeRef may carry a backtick arity here — the instantiated in-assembly \
+                     generic must resolve to the open def's TypeDef, got TypeRef {:?}",
+                    reader.strings_at(name_off)
+                );
+            }
+        }
+
+        // UseBox's MethodDefSig blob: SIG_DEFAULT (static), 1 param, void return, then
+        // `GENERICINST CLASS <coded TypeDef rid 2 = (2<<2)|0 = 0x08> argc=1 ET_I4`.
+        let md_start = reader.table_offset(Token::TABLE_METHOD_DEF, &header);
+        let sig_col = md_start + 8 + str_w;
+        let sig_off = if blob_w == 4 { u32_at(sig_col) } else { u32::from(u16_at(sig_col)) } as usize;
+        let blob_heap = reader.stream("#Blob");
+        let blob_len = blob_heap[sig_off] as usize;
+        let sig_blob = &blob_heap[sig_off + 1..sig_off + 1 + blob_len];
+        assert_eq!(
+            sig_blob,
+            &[0x00, 0x01, 0x01, 0x15, 0x12, 0x08, 0x01, 0x08],
+            "sig must encode GENERICINST CLASS <TypeDef IBox`1> <int32>"
+        );
+    }
+
+    /// A **default interface method** (DIM, CoreCLR 3.0+ — `#[dotnet_interface]` trait fn with a
+    /// default body): a virtual, NON-abstract `MethodDef` with a real IL body on the interface
+    /// `TypeDef`. The PE writer must emit it with `Virtual` (0x40) and `NewSlot` (0x100) set,
+    /// `Abstract` (0x400) CLEAR, and a non-zero RVA (Roslyn's DIM shape is 0x1C6 =
+    /// `Public|Virtual|HideBySig|NewSlot`; we emit 0x146 — HideBySig omission is proven-tolerated
+    /// for our abstract members and events) — while an abstract sibling on the same interface
+    /// keeps `Abstract` set and RVA=0. Structural readback of `export_pe`'s actual bytes, same
+    /// pattern as `interface_type_def_and_abstract_method_are_emitted_by_pe_writer`.
+    #[test]
+    fn default_interface_method_gets_body_and_stays_nonabstract() {
+        use crate::ir::{
+            BasicBlock, CILNode, CILRoot, ClassDef, Const, MethodDef, MethodImpl, Type,
+        };
+
+        let mut asm = crate::ir::Assembly::default();
+        let iname = asm.alloc_string("ICalc");
+        let cdef = ClassDef::new(
+            iname, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+        )
+        .with_interface();
+        let cidx = asm.class_def(cdef).unwrap();
+        let self_ty = Type::ClassRef(*cidx);
+
+        // Row 1: `int Base();` — an ordinary ABSTRACT member (the sibling that must stay RVA=0).
+        let base_name = asm.alloc_string("Base");
+        let msig = asm.sig([self_ty], Type::Int(Int::I32));
+        let base_def = MethodDef::new(
+            Access::Public,
+            cidx,
+            base_name,
+            msig,
+            MethodKind::Virtual,
+            MethodImpl::Missing,
+            vec![None],
+        )
+        .with_abstract();
+        asm.new_method(base_def);
+
+        // Row 2: `int Fixed() => 7;` — the DIM: Virtual, NOT abstract, with a real body.
+        let dim_name = asm.alloc_string("Fixed");
+        let seven = asm.alloc_node(CILNode::Const(Box::new(Const::I32(7))));
+        let ret = asm.alloc_root(CILRoot::Ret(seven));
+        let dim_def = MethodDef::new(
+            Access::Public,
+            cidx,
+            dim_name,
+            msig,
+            MethodKind::Virtual,
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            },
+            vec![None],
+        );
+        asm.new_method(dim_def);
+
+        let options = super::super::export::ExportOptions {
+            is_dll: true,
+            assembly_name: "pe_dim".to_string(),
+            module_name: "pe_dim.dll".to_string(),
+            pdb_file_name: String::new(),
+        };
+        let (image, _pdb) = super::super::export::export_pe(&mut asm, &options);
+
+        let bsjb = image
+            .windows(4)
+            .position(|w| w == b"BSJB")
+            .expect("PE image must contain a BSJB metadata root");
+        let reader = MetadataReader::parse(&image[bsjb..]);
+        let header = reader.tables_header();
+        let row_bytes = &reader.stream("#~")[header.row_data_offset..];
+        let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
+
+        // MethodDef rows: RVA(4) + ImplFlags(2) + Flags(2) + …; rid 1 = Base, rid 2 = Fixed
+        // (insertion order).
+        let md_start = reader.table_offset(Token::TABLE_METHOD_DEF, &header);
+        let md_w = MetadataReader::row_width(Token::TABLE_METHOD_DEF, &header);
+
+        // Abstract sibling: RVA=0, Abstract set — unharmed by the DIM next to it.
+        assert_eq!(u32_at(md_start), 0, "abstract sibling must keep RVA=0");
+        let base_flags = u16_at(md_start + 6);
+        assert_ne!(base_flags & 0x400, 0, "abstract sibling must keep Abstract (0x400); flags={base_flags:#x}");
+
+        // The DIM: a real body (RVA != 0), Virtual|NewSlot, NOT Abstract.
+        let dim_row = md_start + md_w;
+        assert_ne!(u32_at(dim_row), 0, "DIM must have a non-zero RVA (a real IL body)");
+        let dim_flags = u16_at(dim_row + 6);
+        assert_eq!(dim_flags & 0x400, 0, "DIM must NOT be Abstract (0x400); flags={dim_flags:#x}");
+        assert_ne!(dim_flags & 0x40, 0, "DIM must be Virtual (0x40); flags={dim_flags:#x}");
+        assert_ne!(dim_flags & 0x100, 0, "DIM must be NewSlot (0x100); flags={dim_flags:#x}");
+    }
+
+    /// A `ref`/`out` parameter on an abstract interface member (`#[dotnet_interface]` + `&mut T`
+    /// / `#[dotnet_out]`): the PE writer must encode the parameter as `ELEMENT_TYPE_BYREF` (0x10)
+    /// in the `MethodDefSig` blob (§II.23.2.10 `Param ::= [BYREF] Type`) and stamp
+    /// `ParamAttributes.Out` (0x0002, §II.23.1.13) on the `Param` row named by
+    /// `MethodDef::out_params` — the exact metadata shape csc reads back as `out T` (BYREF with
+    /// `Flags == 0` reads back as `ref T`). Structural readback of `export_pe`'s actual bytes,
+    /// same pattern as `interface_type_def_and_abstract_method_are_emitted_by_pe_writer`.
+    #[test]
+    fn byref_out_param_on_abstract_member_is_emitted_by_pe_writer() {
+        use crate::ir::{ClassDef, MethodDef, MethodImpl, Type};
+
+        let mut asm = crate::ir::Assembly::default();
+        let iname = asm.alloc_string("IRefCell");
+        let cdef = ClassDef::new(
+            iname, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+        )
+        .with_interface();
+        let cidx = asm.class_def(cdef).unwrap();
+        let self_ty = Type::ClassRef(*cidx);
+        // `void FillOut(out int slot);` — receiver + one byref-int param flagged `[out]`.
+        let byref_i32 = asm.nref(Type::Int(Int::I32));
+        let mname = asm.alloc_string("FillOut");
+        let msig = asm.sig([self_ty, byref_i32], Type::Void);
+        let mdef = MethodDef::new(
+            Access::Public,
+            cidx,
+            mname,
+            msig,
+            MethodKind::Virtual,
+            MethodImpl::Missing,
+            vec![None, None],
+        )
+        .with_abstract()
+        .with_out_params(vec![1]);
+        asm.new_method(mdef);
+
+        let options = super::super::export::ExportOptions {
+            is_dll: true,
+            assembly_name: "pe_byref_out".to_string(),
+            module_name: "pe_byref_out.dll".to_string(),
+            pdb_file_name: String::new(),
+        };
+        let (image, _pdb) = super::super::export::export_pe(&mut asm, &options);
+
+        let bsjb = image
+            .windows(4)
+            .position(|w| w == b"BSJB")
+            .expect("PE image must contain a BSJB metadata root");
+        let reader = MetadataReader::parse(&image[bsjb..]);
+        let header = reader.tables_header();
+        let row_bytes = &reader.stream("#~")[header.row_data_offset..];
+        let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
+
+        // --- FillOut's MethodDef row (rid 1, the only method). Row layout: RVA(4) + ImplFlags(2)
+        // + Flags(2) + Name(str) + Signature(blob) + ParamList(simple).
+        let md_start = reader.table_offset(Token::TABLE_METHOD_DEF, &header);
+        assert_eq!(u32_at(md_start), 0, "abstract member must have RVA=0");
+        let str_w = if header.heap_sizes & 0x1 != 0 { 4usize } else { 2 };
+        let blob_w = if header.heap_sizes & 0x4 != 0 { 4usize } else { 2 };
+        let sig_col = md_start + 8 + str_w;
+        let sig_off =
+            if blob_w == 4 { u32_at(sig_col) } else { u32::from(u16_at(sig_col)) } as usize;
+        let blob_heap = reader.stream("#Blob");
+        // Small blob (< 0x80 bytes): a single compressed-length byte, then the blob data.
+        let blob_len = blob_heap[sig_off] as usize;
+        let sig_blob = &blob_heap[sig_off + 1..sig_off + 1 + blob_len];
+        assert_eq!(
+            sig_blob,
+            &[0x20, 0x01, 0x01, 0x10, 0x08],
+            "sig must be HASTHIS (0x20), 1 param, ELEMENT_TYPE_VOID ret (0x01), then \
+             ELEMENT_TYPE_BYREF (0x10) ELEMENT_TYPE_I4 (0x08)"
+        );
+
+        // --- The Param row (rid 1, the only param): Flags(2) + Sequence(2) + Name(str).
+        let p_start = reader.table_offset(Token::TABLE_PARAM, &header);
+        assert_eq!(
+            u16_at(p_start),
+            0x0002,
+            "the `#[dotnet_out]` Param row must carry ParamAttributes.Out (0x0002)"
+        );
+        assert_eq!(u16_at(p_start + 2), 1, "Param Sequence must be 1");
+    }
+
+    /// An EVENT declared on an interface (`#[dotnet_interface]` + `#[dotnet_event]`): the PE
+    /// writer must emit the interface's abstract `add_*`/`remove_*` accessor `MethodDef`s
+    /// (Abstract|Virtual|SpecialName, RVA=0) plus the §II.22.12/13/28 `EventMap`/`Event`/
+    /// `MethodSemantics` rows binding them — structural readback of `export_pe`'s actual bytes,
+    /// same pattern as `interface_type_def_and_abstract_method_are_emitted_by_pe_writer`.
+    #[test]
+    fn interface_event_rows_are_emitted_by_pe_writer() {
+        use crate::ir::class::EventDef;
+        use crate::ir::{ClassDef, ClassRef, MethodDef, MethodImpl, Type};
+
+        let mut asm = crate::ir::Assembly::default();
+        let iname = asm.alloc_string("IButton");
+        let cdef = ClassDef::new(
+            iname, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+        )
+        .with_interface();
+        let cidx = asm.class_def(cdef).unwrap();
+        let self_ty = Type::ClassRef(*cidx);
+        // The delegate type subscribers must match — an EXTERNAL class ref (becomes a TypeRef).
+        let action_name = asm.alloc_string("System.Action");
+        let sysrt = asm.alloc_string("System.Runtime");
+        let action = asm.alloc_class_ref(ClassRef::new(action_name, Some(sysrt), false, [].into()));
+        let delegate_ty = Type::ClassRef(action);
+        let acc_sig = asm.sig([self_ty, delegate_ty], Type::Void);
+        // Both accessors: abstract virtual instance members (no bodies, RVA stays 0).
+        let add_name = asm.alloc_string("add_Clicked");
+        let add_def = MethodDef::new(
+            Access::Public,
+            cidx,
+            add_name,
+            acc_sig,
+            MethodKind::Virtual,
+            MethodImpl::Missing,
+            vec![None, None],
+        )
+        .with_abstract();
+        let add_mref = asm.alloc_methodref(add_def.ref_to());
+        asm.new_method(add_def);
+        let remove_name = asm.alloc_string("remove_Clicked");
+        let remove_def = MethodDef::new(
+            Access::Public,
+            cidx,
+            remove_name,
+            acc_sig,
+            MethodKind::Virtual,
+            MethodImpl::Missing,
+            vec![None, None],
+        )
+        .with_abstract();
+        let remove_mref = asm.alloc_methodref(remove_def.ref_to());
+        asm.new_method(remove_def);
+        let ev_name = asm.alloc_string("Clicked");
+        asm.class_mut(cidx)
+            .add_event(EventDef::new(ev_name, delegate_ty, add_mref, remove_mref));
+
+        let options = super::super::export::ExportOptions {
+            is_dll: true,
+            assembly_name: "pe_iface_event".to_string(),
+            module_name: "pe_iface_event.dll".to_string(),
+            pdb_file_name: String::new(),
+        };
+        let (image, _pdb) = super::super::export::export_pe(&mut asm, &options);
+
+        let bsjb = image
+            .windows(4)
+            .position(|w| w == b"BSJB")
+            .expect("PE image must contain a BSJB metadata root");
+        let reader = MetadataReader::parse(&image[bsjb..]);
+        let header = reader.tables_header();
+        let row_bytes = &reader.stream("#~")[header.row_data_offset..];
+        let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
+        let count = |id: u32| {
+            header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c)
+        };
+        let str_w = if header.heap_sizes & 0x1 != 0 { 4 } else { 2 };
+        let idx_at = |o: usize, wide: bool| if wide { u32_at(o) } else { u32::from(u16_at(o)) };
+
+        // --- The accessor MethodDef rows (rids 1 and 2 — the only methods in the assembly).
+        // RVA is the first 4 bytes; Flags is a u16 at offset 6 (after RVA(4) + ImplFlags(2)).
+        let md_start = reader.table_offset(Token::TABLE_METHOD_DEF, &header);
+        let md_w = MetadataReader::row_width(Token::TABLE_METHOD_DEF, &header);
+        assert_eq!(count(Token::TABLE_METHOD_DEF), 2, "exactly the two accessors");
+        for (rid0, which) in [(0usize, "add_Clicked"), (1usize, "remove_Clicked")] {
+            let row = md_start + rid0 * md_w;
+            assert_eq!(u32_at(row), 0, "{which}: abstract accessor must have RVA=0");
+            let flags = u16_at(row + 6);
+            assert_ne!(flags & 0x400, 0, "{which}: Abstract (0x400) missing; flags={flags:#x}");
+            assert_ne!(flags & 0x40, 0, "{which}: Virtual (0x40) missing; flags={flags:#x}");
+            assert_ne!(
+                flags & 0x800,
+                0,
+                "{which}: event accessors must be SpecialName (0x800, §II.10.4); flags={flags:#x}"
+            );
+        }
+
+        // --- EventMap: one row, parent = IButton's TypeDef (rid 2 — `<Module>` is rid 1),
+        // run-start = Event rid 1. Columns: Parent (TypeDef simple index) + EventList (Event
+        // simple index), both narrow here.
+        assert_eq!(count(Token::TABLE_EVENT_MAP), 1);
+        let em_start = reader.table_offset(Token::TABLE_EVENT_MAP, &header);
+        let td_wide = count(Token::TABLE_TYPE_DEF) > 0xFFFF;
+        let ev_wide = count(Token::TABLE_EVENT) > 0xFFFF;
+        let em_parent = idx_at(em_start, td_wide);
+        assert_eq!(em_parent, 2, "EventMap.Parent must be IButton's TypeDef rid");
+        let em_list = idx_at(em_start + if td_wide { 4 } else { 2 }, ev_wide);
+        assert_eq!(em_list, 1, "EventMap.EventList must open the run at Event rid 1");
+
+        // --- Event: one row: EventFlags(u16)=0, Name -> "Clicked", EventType = TypeDefOrRef
+        // coded index with the TypeRef tag (1) — the System.Action delegate is external.
+        assert_eq!(count(Token::TABLE_EVENT), 1);
+        let e_start = reader.table_offset(Token::TABLE_EVENT, &header);
+        assert_eq!(u16_at(e_start), 0, "EventFlags must be 0 (ordinary event)");
+        let name_off = idx_at(e_start + 2, str_w == 4);
+        assert_eq!(reader.strings_at(name_off), "Clicked");
+        let tdor_max = count(Token::TABLE_TYPE_DEF)
+            .max(count(Token::TABLE_TYPE_REF))
+            .max(count(Token::TABLE_TYPE_SPEC));
+        let tdor_wide = tdor_max >= (1usize << 14);
+        let event_type = idx_at(e_start + 2 + str_w, tdor_wide);
+        assert_eq!(event_type & 0x3, 1, "EventType must carry the TypeRef tag (delegate is external)");
+
+        // --- MethodSemantics: two rows, sorted by Association (both share the one Event, so
+        // insertion order add-then-remove is preserved): Semantics(u16) + Method (MethodDef
+        // simple index) + Association (HasSemantics coded: Event rid 1, tag 0 -> 0b10 == 2).
+        assert_eq!(count(Token::TABLE_METHOD_SEMANTICS), 2);
+        let ms_start = reader.table_offset(Token::TABLE_METHOD_SEMANTICS, &header);
+        let ms_w = MetadataReader::row_width(Token::TABLE_METHOD_SEMANTICS, &header);
+        let md_wide = count(Token::TABLE_METHOD_DEF) > 0xFFFF;
+        for (i, (sem, acc_rid, which)) in [
+            (0usize, (0x8u16, 1u32, "AddOn->add_Clicked")),
+            (1, (0x10, 2, "RemoveOn->remove_Clicked")),
+        ] {
+            let row = ms_start + i * ms_w;
+            assert_eq!(u16_at(row), sem, "{which}: wrong Semantics value");
+            let method = idx_at(row + 2, md_wide);
+            assert_eq!(method, acc_rid, "{which}: wrong accessor MethodDef rid");
+            let assoc = idx_at(row + 2 + if md_wide { 4 } else { 2 }, false);
+            assert_eq!(assoc, 2, "{which}: Association must be Event rid 1 (coded 0b10)");
+        }
+    }
+
+    /// INTERFACE INHERITANCE (`#[dotnet_interface] trait IDerived: IBase`): ECMA-335 models
+    /// `interface IDerived : IBase` as an `InterfaceImpl` row (§II.22.23) on IDerived's own
+    /// interface `TypeDef` (its `Extends` stays NIL, §II.10.1.3). Both types live in the SAME
+    /// assembly, so the row's `Interface` coded index must resolve to IBase's `TypeDef` (tag 0),
+    /// not a `TypeRef` — this exercises `export_pe`'s Pass 1.5 (all TypeDef rows exist before any
+    /// `implements` is resolved, making the same-assembly forward reference order-independent).
+    #[test]
+    fn interface_inheritance_emits_interface_impl_on_the_interface_type_def() {
+        use crate::ir::{ClassDef, Type};
+
+        let mut asm = crate::ir::Assembly::default();
+        let base_name = asm.alloc_string("IBase");
+        let base_idx = asm
+            .class_def(
+                ClassDef::new(base_name, false, 0, None, vec![], vec![], Access::Public, None, None, true)
+                    .with_interface(),
+            )
+            .unwrap();
+        let derived_name = asm.alloc_string("IDerived");
+        let derived_idx = asm
+            .class_def(
+                ClassDef::new(derived_name, false, 0, None, vec![], vec![], Access::Public, None, None, true)
+                    .with_interface(),
+            )
+            .unwrap();
+        // The base-interface reference is the SAME-ASSEMBLY ClassRef IBase's own def registered.
+        asm.class_mut(derived_idx).add_interface(*base_idx);
+
+        let options = super::super::export::ExportOptions {
+            is_dll: true,
+            assembly_name: "pe_iface_inherit".to_string(),
+            module_name: "pe_iface_inherit.dll".to_string(),
+            pdb_file_name: String::new(),
+        };
+        let (image, _pdb) = super::super::export::export_pe(&mut asm, &options);
+
+        let bsjb = image
+            .windows(4)
+            .position(|w| w == b"BSJB")
+            .expect("PE image must contain a BSJB metadata root");
+        let reader = MetadataReader::parse(&image[bsjb..]);
+        let header = reader.tables_header();
+        let row_bytes = &reader.stream("#~")[header.row_data_offset..];
+        let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
+        let count =
+            |id: u32| header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c);
+        let idx_at = |o: usize, wide: bool| if wide { u32_at(o) } else { u32::from(u16_at(o)) };
+        let str_w = if header.heap_sizes & 0x1 != 0 { 4usize } else { 2 };
+
+        // Map TypeDef rids to names (`class_def_ids` is a hash-order snapshot, so whether IBase
+        // or IDerived gets the lower rid is arbitrary — resolve by name, don't assume).
+        let td_start = reader.table_offset(Token::TABLE_TYPE_DEF, &header);
+        let td_w = MetadataReader::row_width(Token::TABLE_TYPE_DEF, &header);
+        let td_count = count(Token::TABLE_TYPE_DEF);
+        let td_name = |rid: u32| {
+            let row = td_start + (rid as usize - 1) * td_w;
+            reader.strings_at(idx_at(row + 4, str_w == 4))
+        };
+        let rid_of = |name: &str| {
+            (1..=td_count as u32)
+                .find(|&rid| td_name(rid) == name)
+                .unwrap_or_else(|| panic!("no TypeDef named {name}"))
+        };
+        let base_rid = rid_of("IBase");
+        let derived_rid = rid_of("IDerived");
+
+        // Exactly ONE InterfaceImpl row: Class = IDerived's TypeDef rid, Interface = a
+        // TypeDefOrRef coded index with the TypeDef tag (0) decoding to IBase's rid.
+        assert_eq!(count(Token::TABLE_INTERFACE_IMPL), 1);
+        let ii_start = reader.table_offset(Token::TABLE_INTERFACE_IMPL, &header);
+        let td_wide = td_count > 0xFFFF;
+        let class = idx_at(ii_start, td_wide);
+        assert_eq!(class, derived_rid, "InterfaceImpl.Class must be IDerived's TypeDef rid");
+        let tdor_max = count(Token::TABLE_TYPE_DEF)
+            .max(count(Token::TABLE_TYPE_REF))
+            .max(count(Token::TABLE_TYPE_SPEC));
+        let tdor_wide = tdor_max >= (1usize << 14);
+        let iface = idx_at(ii_start + if td_wide { 4 } else { 2 }, tdor_wide);
+        assert_eq!(iface & 0x3, 0, "Interface must carry the TypeDef tag (same assembly)");
+        assert_eq!(iface >> 2, base_rid, "Interface must decode to IBase's TypeDef rid");
+
+        // Both TypeDefs are genuine interfaces; IDerived's Extends stays NIL despite the base.
+        for rid in [base_rid, derived_rid] {
+            let row = td_start + (rid as usize - 1) * td_w;
+            let flags = u32_at(row);
+            assert_ne!(flags & 0x20, 0, "{}: Interface flag missing", td_name(rid));
+            let extends = idx_at(row + 4 + 2 * str_w, tdor_wide);
+            assert_eq!(extends, 0, "{}: interface Extends must be NIL", td_name(rid));
+        }
+    }
+
+    /// Pass 1.5's fail-loudly validation: a SAME-ASSEMBLY, non-generic `implements` target that
+    /// resolves to no registered class def (e.g. `#[dotnet_interface] trait X: Clone` — `Clone`
+    /// is not a .NET interface) must be an export-time panic naming both types, never a dangling
+    /// module-scope `TypeRef`.
+    #[test]
+    #[should_panic(expected = "not a type defined in this assembly")]
+    fn same_assembly_implements_of_an_unregistered_type_panics() {
+        use crate::ir::{ClassDef, ClassRef};
+
+        let mut asm = crate::ir::Assembly::default();
+        let cls_name = asm.alloc_string("Foo");
+        let cls_idx = asm
+            .class_def(ClassDef::new(
+                cls_name, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+            ))
+            .unwrap();
+        let missing_name = asm.alloc_string("Clone");
+        let missing = asm.alloc_class_ref(ClassRef::new(missing_name, None, false, [].into()));
+        asm.class_mut(cls_idx).add_interface(missing);
+
+        let options = super::super::export::ExportOptions {
+            is_dll: true,
+            assembly_name: "pe_iface_missing".to_string(),
+            module_name: "pe_iface_missing.dll".to_string(),
+            pdb_file_name: String::new(),
+        };
+        let _ = super::super::export::export_pe(&mut asm, &options);
+    }
+
+    /// Pass 1.5's fail-loudly validation, second arm: an `implements` target that resolves to a
+    /// registered class def which is NOT `is_interface` would be a CLR load-time
+    /// `TypeLoadException` — turn it into an export-time panic instead.
+    #[test]
+    #[should_panic(expected = "is a class, not an interface")]
+    fn same_assembly_implements_of_a_non_interface_class_panics() {
+        use crate::ir::ClassDef;
+
+        let mut asm = crate::ir::Assembly::default();
+        let base_name = asm.alloc_string("NotAnIface");
+        let base_idx = asm
+            .class_def(ClassDef::new(
+                base_name, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+            ))
+            .unwrap();
+        let cls_name = asm.alloc_string("Foo");
+        let cls_idx = asm
+            .class_def(ClassDef::new(
+                cls_name, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+            ))
+            .unwrap();
+        asm.class_mut(cls_idx).add_interface(*base_idx);
+
+        let options = super::super::export::ExportOptions {
+            is_dll: true,
+            assembly_name: "pe_iface_notiface".to_string(),
+            module_name: "pe_iface_notiface.dll".to_string(),
+            pdb_file_name: String::new(),
+        };
+        let _ = super::super::export::export_pe(&mut asm, &options);
+    }
+
     // ---------------------------------------------------------------------------------------
     // (a) A tiny module (one TypeDef, one MethodDef, one MemberRef, one string) round-trips
     // through a hand-rolled reader that parses the metadata root back apart.
@@ -2672,6 +4133,8 @@ mod tests {
                     coded_w(3, mrp_max) + str_w + blob_w
                 }
                 Token::TABLE_CUSTOM_ATTRIBUTE => {
+                    // Must mirror `Widths::new`'s `has_custom_attribute_max` universe — every
+                    // `HasCustomAttribute` target table this backend can populate (§II.24.2.6).
                     let hca_max = count(Token::TABLE_METHOD_DEF)
                         .max(count(Token::TABLE_FIELD))
                         .max(count(Token::TABLE_TYPE_REF))
@@ -2682,7 +4145,13 @@ mod tests {
                         .max(count(Token::TABLE_MODULE))
                         .max(count(Token::TABLE_ASSEMBLY))
                         .max(count(Token::TABLE_ASSEMBLY_REF))
-                        .max(count(Token::TABLE_TYPE_SPEC));
+                        .max(count(Token::TABLE_TYPE_SPEC))
+                        .max(count(Token::TABLE_GENERIC_PARAM))
+                        .max(count(Token::TABLE_EVENT))
+                        .max(count(Token::TABLE_PROPERTY))
+                        .max(count(Token::TABLE_STAND_ALONE_SIG))
+                        .max(count(Token::TABLE_MODULE_REF))
+                        .max(count(Token::TABLE_METHOD_SPEC));
                     let cat_max = count(Token::TABLE_METHOD_DEF).max(count(Token::TABLE_MEMBER_REF));
                     coded_w(5, hca_max) + coded_w(3, cat_max) + blob_w
                 }
@@ -2698,10 +4167,18 @@ mod tests {
                         .max(count(Token::TABLE_TYPE_SPEC));
                     2 + str_w + coded_w(2, tdor_max)
                 }
+                Token::TABLE_PROPERTY_MAP => {
+                    simple_w(count(Token::TABLE_TYPE_DEF)) + simple_w(count(Token::TABLE_PROPERTY))
+                }
+                Token::TABLE_PROPERTY => 2 + str_w + blob_w,
                 Token::TABLE_METHOD_SEMANTICS => {
                     // Association is a `HasSemantics` coded index (Event | Property, 1 tag bit);
-                    // this backend only emits Event, so its max row count bounds the width.
-                    2 + simple_w(count(Token::TABLE_METHOD_DEF)) + coded_w(1, count(Token::TABLE_EVENT))
+                    // the larger of the two target tables bounds the width.
+                    2 + simple_w(count(Token::TABLE_METHOD_DEF))
+                        + coded_w(
+                            1,
+                            count(Token::TABLE_EVENT).max(count(Token::TABLE_PROPERTY)),
+                        )
                 }
                 Token::TABLE_METHOD_IMPL => {
                     let mdor_max = count(Token::TABLE_METHOD_DEF).max(count(Token::TABLE_MEMBER_REF));
@@ -2714,11 +4191,20 @@ mod tests {
                     2 + coded_w(1, mf_max) + str_w + simple_w(count(Token::TABLE_MODULE_REF))
                 }
                 Token::TABLE_FIELD_RVA => 4 + simple_w(count(Token::TABLE_FIELD)),
-                Token::TABLE_ASSEMBLY => 4 + 2 * 4 + blob_w + 2 * str_w,
+                // HashAlgId(4) + 4×Version(2) + Flags(4) + PublicKey(blob) + Name/Culture(str).
+                // The Flags u32 was MISSING here (a latent reader-only bug: no prior test ever
+                // read a table sorted AFTER Assembly in an image carrying an Assembly row —
+                // GenericParam, 0x2A, is the first).
+                Token::TABLE_ASSEMBLY => 4 + 4 * 2 + 4 + blob_w + 2 * str_w,
                 Token::TABLE_ASSEMBLY_REF => 2 * 4 + 4 + blob_w + 2 * str_w + blob_w,
                 Token::TABLE_METHOD_SPEC => {
                     let mdor_max = count(Token::TABLE_METHOD_DEF).max(count(Token::TABLE_MEMBER_REF));
                     coded_w(1, mdor_max) + blob_w
+                }
+                Token::TABLE_GENERIC_PARAM => {
+                    // Number (u16) + Flags (u16) + Owner (TypeOrMethodDef, 1 tag bit) + Name.
+                    let tomd_max = count(Token::TABLE_TYPE_DEF).max(count(Token::TABLE_METHOD_DEF));
+                    2 + 2 + coded_w(1, tomd_max) + str_w
                 }
                 other => panic!("row_width: unhandled table {other:#x}"),
             }
@@ -2798,7 +4284,7 @@ mod tests {
             out.push(0x01); // void
             mb.blobs.intern(&out)
         };
-        let method_tok = mb.add_method("DoIt", sig_blob, &[], true, false, false, None, false);
+        let method_tok = mb.add_method("DoIt", sig_blob, &[], &[], true, false, false, None, false);
         assert_eq!(method_tok.table(), Token::TABLE_METHOD_DEF);
         assert_eq!(method_tok.rid(), 1);
 
@@ -2984,6 +4470,7 @@ mod tests {
             "Mixed",
             sig_blob,
             &[Some("x"), None],
+            &[],
             true,
             false,
             false,
@@ -3391,7 +4878,7 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "Owner", false, None, None, None, &[]);
-        let m = mb.add_method("Foo", sig_blob, &[], true, false, false, None, false);
+        let m = mb.add_method("Foo", sig_blob, &[], &[], true, false, false, None, false);
         assert_eq!(m.table(), Token::TABLE_METHOD_DEF);
 
         let ext = mb.assembly_ref("Other", AssemblyRefTarget::NameOnly);
@@ -3472,7 +4959,7 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "Extern", false, None, None, None, &[]);
-        let _m = mb.add_method("libc_call", sig_blob, &[], true, false, false, Some(("libc", true)), false);
+        let _m = mb.add_method("libc_call", sig_blob, &[], &[], true, false, false, Some(("libc", true)), false);
         assert_eq!(mb.impl_map.len(), 1);
         assert_eq!(mb.module_ref.len(), 1);
         assert_eq!(mb.impl_map[0].mapping_flags & 0x40, 0x40, "SupportsLastError set");
@@ -3542,8 +5029,8 @@ mod tests {
         };
         mb.set_type_def_method_list(a);
         mb.set_type_def_method_list(b);
-        mb.add_method("b_m0", method_sig, &[], true, false, false, None, false);
-        mb.add_method("b_m1", method_sig, &[], true, false, false, None, false);
+        mb.add_method("b_m0", method_sig, &[], &[], true, false, false, None, false);
+        mb.add_method("b_m1", method_sig, &[], &[], true, false, false, None, false);
 
         let a_row = &mb.type_def[(a.rid() - 1) as usize];
         let b_row = &mb.type_def[(b.rid() - 1) as usize];
@@ -3916,7 +5403,8 @@ mod tests {
 
     /// Regression for the SIGSEGV-on-first-virtual-dispatch bug found bisecting cd_collections
     /// under `DIRECT_PE=1`: `add_method`'s `is_ctor` flag is the ONLY thing that sets
-    /// `SpecialName (0x1000) | RTSpecialName (0x0800)` (§II.23.1.10) on a `MethodDef` row. The
+    /// `SpecialName (0x0800) | RTSpecialName (0x1000)` (§II.23.1.10) TOGETHER on a `MethodDef` row
+    /// (`add_event` stamps bare `SpecialName` on event accessors, never `RTSpecialName`). The
     /// assembly-wide static initializer built by `Assembly::cctor()` (asm.rs) is a
     /// `MethodKind::Static` method literally named `.cctor` — NOT `MethodKind::Constructor` — so
     /// a caller that derives `is_ctor` purely from `MethodKind::Constructor` (as `export.rs`'s
@@ -3943,7 +5431,7 @@ mod tests {
         let _t = mb.add_type_def("", "MainModule", false, None, None, None, &[]);
         // Mirrors `export.rs`'s call for `.cctor`: MethodKind is Static, but the reserved-name
         // check must still route `is_ctor = true` into `add_method`.
-        let tok = mb.add_method(".cctor", sig_blob, &[], true, false, true, None, false);
+        let tok = mb.add_method(".cctor", sig_blob, &[], &[], true, false, true, None, false);
         let row = &mb.method_def[(tok.rid() - 1) as usize];
         assert_eq!(
             row.flags & (0x1000 | 0x0800),
@@ -3968,7 +5456,7 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "MainModule", false, None, None, None, &[]);
-        let tok = mb.add_method(".tcctor", sig_blob, &[], true, false, false, None, false);
+        let tok = mb.add_method(".tcctor", sig_blob, &[], &[], true, false, false, None, false);
         let row = &mb.method_def[(tok.rid() - 1) as usize];
         assert_eq!(row.flags & (0x1000 | 0x0800), 0);
     }
@@ -3994,7 +5482,7 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "Start", false, None, None, None, &[]);
-        let tok = mb.add_method("Start", sig_blob, &[], false, true, false, None, false);
+        let tok = mb.add_method("Start", sig_blob, &[], &[], false, true, false, None, false);
         let row = &mb.method_def[(tok.rid() - 1) as usize];
         const NEW_SLOT: u16 = 0x0100;
         const ABSTRACT: u16 = 0x0400;
@@ -4031,7 +5519,7 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "MainModule", false, None, None, None, &[]);
-        let tok = mb.add_method("Leaf", sig_blob, &[], true, false, false, None, true);
+        let tok = mb.add_method("Leaf", sig_blob, &[], &[], true, false, false, None, true);
         let row = &mb.method_def[(tok.rid() - 1) as usize];
         const AGGRESSIVE_INLINING: u16 = 0x0100;
         assert_eq!(
@@ -4053,7 +5541,7 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "MainModule", false, None, None, None, &[]);
-        let tok = mb.add_method("NotInlined", sig_blob, &[], true, false, false, None, false);
+        let tok = mb.add_method("NotInlined", sig_blob, &[], &[], true, false, false, None, false);
         let row = &mb.method_def[(tok.rid() - 1) as usize];
         assert_eq!(
             row.impl_flags, 0,

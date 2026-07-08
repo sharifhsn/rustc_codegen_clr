@@ -1,0 +1,22 @@
+[package]
+name = "cd_iface_generic"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# A .NET class library: `cargo dotnet build` emits `cd_iface_generic.dll` containing a genuine
+# GENERIC ECMA-335 interface DEFINITION (`IBox`1` + a GenericParam row) synthesized from a Rust
+# `#[dotnet_interface] trait IBox<T>`. Under the default DIRECT_PE=1 path the hand-rolled PE
+# writer emits everything directly (no ilasm). Distinct from `cd_generic_iface`, which
+# *implements* an EXTERNAL generic BCL interface (`IEquatable<int>`) — this crate *defines* one.
+crate-type = ["cdylib"]
+
+[dependencies]
+mycorrhiza = { path = "../../../mycorrhiza" }
+dotnet_macros = { path = "../../../dotnet_macros" }
+
+# Under the repo workspace root -> needs a bare `[workspace]` (the cd_pure footgun).
+[workspace]
+
+[profile.release.build-override]
+codegen-units = 1
