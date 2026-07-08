@@ -2,6 +2,10 @@
 name = "cd_interop"
 edition = "2021"
 version = "0.1.0"
+# Required for a GitHub Packages NuGet push (§ Direction B validation): GH Packages rejects a
+# push whose .nuspec has no <repository> pointing at a repo the pushing account can write to.
+# `cargo dotnet pack` reads this straight from cargo_metadata into the .nuspec.
+repository = "https://github.com/sharifhsn/rustc_codegen_clr"
 
 [lib]
 # A .NET class library: `cargo dotnet build` emits this cdylib as a referenceable

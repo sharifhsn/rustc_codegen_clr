@@ -227,13 +227,31 @@ The `.nupkg` bundles the produced `.dll` (and the shipped `RustDotnet` C# wrappe
 containers). See [INTEROP_CSHARP.md §4](INTEROP_CSHARP.md) for the full flow and the NuGet cache
 footgun (`dotnet nuget locals global-packages --clear` after a rebuild at the same version).
 
-**Consume a *third-party* NuGet BCL type from Rust.** There is no automatic "add a NuGet dep to a Rust
-crate" mechanism. What works today: any type the runtime resolves (the whole BCL, plus assemblies the
-host app already references) is reachable through the low-level `mycorrhiza::bindings` surface or the
-`dotnet_generic!` / `dotnet_generic_impl!` macros (see `cargo_tests/cd_generic` for that machinery).
-Idiomatic wrappers exist for the common BCL types (`mycorrhiza::bcl` — §6); an arbitrary NuGet package's
-types would need a hand-written wrapper following the same pattern. There is **no** first-class
-"reference NuGet package `Foo` from `Cargo.toml`" feature — don't imply one.
+**Consume a *third-party* NuGet package from Rust.** `cargo dotnet add-nuget <id> <version>` fetches the
+package, generates Rust bindings for its public API via runtime reflection (the same mechanism that
+produces `mycorrhiza::bindings` for the BCL, generalized to an arbitrary assembly), and wires the
+resolved `.dll` into the consumer crate's build output — no hand-written wrapper needed for a package
+that fits spinacz's usual reflection constraints (public, non-generic, non-nested surface; no ref/out
+params; see `cargo_tests/spinacz/src/reflect.rs`'s doc for the exact rules).
+
+```
+cargo dotnet add-nuget Newtonsoft.Json 13.0.3
+```
+
+writes `src/nuget/newtonsoft_json.rs` (add `mod nuget;` to your crate root the first time) and copies
+`Newtonsoft.Json.dll` into a crate-local `.cargo-dotnet-nuget-assets/` marker that every subsequent
+`build`/`run` copies alongside the compiled output automatically. Call syntax matches `mycorrhiza`'s own
+bindings exactly (`JsonConvert::serialize_object(x)`, `instance.method(..)`) once you glob-import the
+generated module — the underlying mechanism is a per-type LOCAL trait implemented for the (foreign)
+type alias (`pub trait JsonConvert_Methods { .. } impl JsonConvert_Methods for JsonConvert { .. }`),
+sidestepping the Rust orphan rule an inherent `impl` would hit outside `mycorrhiza`; see
+`Namespace::export`'s doc in `reflect.rs` for the full rationale. Base-type upcasts use the same trick
+via a generic `UpcastTo<T>` trait (`.upcast()` instead of `.into()`).
+
+For a type the runtime already resolves without a package add (the whole BCL, or an assembly the host
+app already references) — same low-level `mycorrhiza::bindings` surface / `dotnet_generic!` machinery
+as before (see `cargo_tests/cd_generic`). Idiomatic hand-wrappers still exist for the most common BCL
+types (`mycorrhiza::bcl` — §6).
 
 ---
 

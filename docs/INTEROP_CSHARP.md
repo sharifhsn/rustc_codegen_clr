@@ -255,8 +255,14 @@ dotnet run --project path/to/csharp_nupkg    # restores the local .nupkg, refere
 ```
 
 The worked example is [`cargo_tests/cd_interop/csharp_nupkg/`](../cargo_tests/cd_interop/csharp_nupkg)
-(verified: all six marshalling checks pass, exit 0). `nuget.org` publish is out of scope — this is the
-local-feed path.
+(verified: all six marshalling checks pass, exit 0). This local-feed path is the in-repo/dev-loop
+convenience; the package is a genuine `.nupkg` and works identically from a **real** feed — verified by
+publishing `cd_interop` to a private GitHub Packages NuGet feed (`dotnet nuget push .. --source
+github-sharifhsn`) and consuming it from a *fresh, out-of-tree* `dotnet new console` project via a plain
+`<PackageReference>`, no local-feed fallback in the csproj (`RepositoryUrl` in `Cargo.toml` is required
+— GitHub Packages rejects a push whose `.nuspec` has no `<repository>` the pushing account can write
+to). `nuget.org` publish itself is still out of scope (a name-squatting concern for a solo-maintainer
+project, not a mechanism limitation).
 
 > **Cache footgun.** NuGet pins `<crate> <version>` in `~/.nuget/packages`. After changing the Rust and
 > re-packing the **same** version, the **stale cached copy** is served. Bump `--version`, or clear the
