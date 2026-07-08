@@ -7,8 +7,10 @@ edition = "2021"
 mycorrhiza = {path = "../../mycorrhiza"}
 [workspace]
 
-# `abort` drops the unwinding/backtrace machinery (gimli/addr2line/object), which both shrinks
-# the build-std assembly massively and avoids the SIMD-heavy DWARF-parsing code paths that
-# stress the IL exporter.
-[profile.release]
-panic = "abort"
+# `panic = "abort"` used to live here to shrink the build-std assembly and dodge SIMD-heavy
+# DWARF-parsing code paths that stressed the IL exporter. It now triggers a DIFFERENT, newer
+# backend bug instead: `alloc::string::SpecExtendStr::spec_extend_into` gets rejected by the
+# typechecker as a `FieldOwnerMismatch` under `panic=abort` specifically (reproduces on a
+# trivial `fn main()` hello-world too — not code-specific to spinacz). Dropped in favor of the
+# default `panic=unwind` (same as `hello_world`/`std_hello_world`, which build cleanly); revisit
+# if the original DWARF/unwind-machinery cost becomes a problem again.
