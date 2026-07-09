@@ -214,6 +214,35 @@ fn main() -> std::process::ExitCode {
         chk(45, ros2.try_copy_to(&mut small2_span) as i64, 0);
     }
 
+    // ---- Unsafe fast path: get_unchecked/set_unchecked match the checked path for in-bounds indices ----
+    {
+        use mycorrhiza::span::Span;
+
+        let mut data = [1i32, 2, 3, 4, 5];
+        let mut sp = Span::from_slice(&mut data);
+        // get_unchecked must match get() for every valid index.
+        for i in 0..sp.len() {
+            let checked = sp.get(i).unwrap();
+            let unchecked = unsafe { sp.get_unchecked(i) };
+            chk(46 + i as u32, unchecked as i64, checked as i64);
+        }
+
+        // set_unchecked must match set()'s effect for every valid index.
+        let mut a = [0i32; 5];
+        let mut b = [0i32; 5];
+        let mut sp_a = Span::from_slice(&mut a);
+        let mut sp_b = Span::from_slice(&mut b);
+        for i in 0..sp_a.len() {
+            sp_a.set(i, (i + 1) * 10);
+            unsafe { sp_b.set_unchecked(i, (i + 1) * 10) };
+        }
+        drop(sp_a);
+        drop(sp_b);
+        chk(51, a[0] as i64, b[0] as i64);
+        chk(52, a[4] as i64, b[4] as i64);
+        chk(53, b[2] as i64, 30);
+    }
+
     unsafe {
         Console::writeln_u64(PASS as u64);
         Console::writeln_u64(TOTAL as u64);

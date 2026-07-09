@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RustDotnetVersion Condition="'$(RustDotnetVersion)'==''">8</RustDotnetVersion>
+    <TargetFramework>net$(RustDotnetVersion).0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>cd_efcore_async_cs</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
+  <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'=='' and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+  <Import Project="$(MSBuildThisFileDirectory)../../../msbuild/RustDotnet.targets"
+          Condition="!Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets') and !Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+
+  <ItemGroup>
+    <RustCrate Include="../rustlib" />
+  </ItemGroup>
+
+  <!-- cd_efcore_async.dll's IL references EfHelper.dll (the C# EF Core helper, see
+       cargo_tests/cd_efcore/csharp_helper/) and, transitively, EF Core's own assemblies. None of
+       that is visible in this project's C# source (the seam signature is a bare Task<int>), but
+       the CLR still needs to resolve those assemblies at runtime, so they must land in bin/ next to
+       cd_efcore_async_cs.dll. Reference EfHelper.dll directly (copies it) and pull in the SAME EF
+       Core NuGet packages EfHelper.csproj uses (so their dependency closure is copied too). -->
+  <ItemGroup>
+    <Reference Include="EfHelper">
+      <HintPath>../rustlib/.cargo-dotnet-nuget-assets/EfHelper.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="8.0.10" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.10" />
+  </ItemGroup>
+
+</Project>

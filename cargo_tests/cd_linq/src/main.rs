@@ -41,7 +41,7 @@ fn main() -> std::process::ExitCode {
 
     let mut list: List<i32> = List::new();
     for v in [1, 2, 3, 4, 5, 6] { list.push(v); }
-    let src: IEnum<i32> = unsafe { mycorrhiza::enumerate::as_enumerable_handle::<_, i32>(list.handle()) };
+    let src: IEnum<i32> = mycorrhiza::enumerate::as_enum_handle::<_, i32>(list.handle());
 
     // Count over the whole thing.
     chk!(linq_count(src), 6);

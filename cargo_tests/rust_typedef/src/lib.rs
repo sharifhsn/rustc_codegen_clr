@@ -64,6 +64,10 @@ pub fn rustc_codegen_clr_new_typedef<
     const IS_VALUETYPE: bool,
     const INHERITS_ASM: &'static str,
     const INHERITS: &'static str,
+    // `dotnet_typedef!` is single-entrypoint (no `#[dotnet_methods]`-style re-opening exists for
+    // it), so its `IS_VALUETYPE` is always an authoritative opinion — see
+    // `mycorrhiza::comptime::rustc_codegen_clr_new_typedef`'s doc for why this flag exists.
+    const HAS_TYPE_KIND_OPINION: bool,
 >() -> ClassDef {
     black_box(());
     loop {
@@ -122,7 +126,7 @@ macro_rules! dotnet_typedef {
                 const SUPER_CLASS: &str = stringify!($superclass);
                 const SUPER_ASM: &str = stringify!($superasm);
                 let mut class =
-                    $crate::rustc_codegen_clr_new_typedef::<NAME, false, SUPER_ASM, SUPER_CLASS>();
+                    $crate::rustc_codegen_clr_new_typedef::<NAME, false, SUPER_ASM, SUPER_CLASS, true>();
                 typedef_fields!(class, $($inner)*);
                 $crate::rustc_codegen_clr_finish_type(class);
             }

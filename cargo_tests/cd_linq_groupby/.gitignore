@@ -1,0 +1,10 @@
+/target
+/.cargo/config.toml
+Cargo.lock
+rustc-ice-*.txt
+/csharp_helper/publish_out
+bin/
+obj/
+publish_out/
+.cargo-dotnet-nuget-assets/
+*.db

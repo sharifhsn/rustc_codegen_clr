@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RustDotnetVersion Condition="'$(RustDotnetVersion)'==''">8</RustDotnetVersion>
+    <TargetFramework>net$(RustDotnetVersion).0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>cd_mvc_cs</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!-- AUTO-BUILD: a single `dotnet run` also runs `cargo dotnet build ../rustlib`, references the
+       produced `cd_mvc.dll` (the #[dotnet_export] fns + the #[dotnet_class] Calculator type), and
+       copies it into bin/ (see cd_export for the full explanation). -->
+  <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
+  <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'=='' and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+  <Import Project="$(MSBuildThisFileDirectory)../../../msbuild/RustDotnet.targets"
+          Condition="!Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets') and !Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+
+  <ItemGroup>
+    <RustCrate Include="../rustlib" />
+  </ItemGroup>
+</Project>

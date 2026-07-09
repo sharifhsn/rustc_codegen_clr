@@ -1,0 +1,20 @@
+[package]
+name = "cd_ef_rust_entity"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# A .NET class library: `cargo dotnet build` emits `cd_ef_rust_entity.dll` containing the managed
+# class `Widget` that the `#[dotnet_class]` proc-macro declares — an attempt at an EF-Core-shaped
+# entity DEFINED IN RUST (not C#). See src/lib.rs for the investigation this crate exists to run.
+crate-type = ["cdylib"]
+
+[dependencies]
+mycorrhiza = { path = "../../../mycorrhiza" }
+dotnet_macros = { path = "../../../dotnet_macros" }
+
+# Under the repo workspace root -> needs a bare `[workspace]` (the cd_pure footgun).
+[workspace]
+
+[profile.release.build-override]
+codegen-units = 1

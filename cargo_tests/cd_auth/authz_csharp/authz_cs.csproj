@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>authz_cs</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!-- Reuse the angle-1 JwtHelper facade (build+validate real JWTs) rather than re-deriving it. -->
+  <ItemGroup>
+    <ProjectReference Include="../csharp_helper/JwtHelper.csproj" />
+  </ItemGroup>
+
+  <!-- AUTO-BUILD the Rust crate and reference its `cd_auth_authz.dll` (contains `RustAuthHandler`,
+       a #[dotnet_class] implementing Microsoft.AspNetCore.Authorization.IAuthorizationHandler). -->
+  <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
+  <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'=='' and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+  <Import Project="$(MSBuildThisFileDirectory)../../../msbuild/RustDotnet.targets"
+          Condition="!Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets') and !Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+
+  <ItemGroup>
+    <RustCrate Include="../authz_rustlib" />
+  </ItemGroup>
+
+</Project>

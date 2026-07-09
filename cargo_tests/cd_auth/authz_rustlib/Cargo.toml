@@ -1,0 +1,22 @@
+[package]
+name = "cd_auth_authz"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# A .NET class library: `cargo dotnet build` emits `cd_auth_authz.dll` containing a managed class
+# `RustAuthHandler` (declared by `#[dotnet_class]`) which IMPLEMENTS
+# `Microsoft.AspNetCore.Authorization.IAuthorizationHandler` directly (angle 2 of the auth
+# investigation: participating in ASP.NET Core's real `[Authorize]`/`.RequireAuthorization()`
+# pipeline, not just calling a BCL/NuGet API from Rust).
+crate-type = ["cdylib"]
+
+[dependencies]
+mycorrhiza = { path = "../../../mycorrhiza" }
+dotnet_macros = { path = "../../../dotnet_macros" }
+
+# Under the repo workspace root -> needs a bare `[workspace]` (the cd_pure footgun).
+[workspace]
+
+[profile.release.build-override]
+codegen-units = 1

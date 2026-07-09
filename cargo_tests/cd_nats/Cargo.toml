@@ -1,0 +1,10 @@
+[package]
+name = "cd_nats"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mycorrhiza = { path = "../../mycorrhiza" }
+# NOTE: do NOT set the abort panic strategy — the native build-std has no
+# panic_abort crate; the default unwinding profile is what the backend expects.
+[workspace]

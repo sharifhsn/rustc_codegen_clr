@@ -1,0 +1,8 @@
+/target
+Cargo.lock
+/.cargo/config.toml
+bin/
+obj/
+publish_out/
+.cargo-dotnet-nuget-assets/
+*.db
