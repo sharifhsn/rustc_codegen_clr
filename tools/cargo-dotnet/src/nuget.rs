@@ -24,17 +24,65 @@
 //! on every subsequent `build`/`run` — no explicit `Assembly.LoadFrom` call needed in the
 //! generated bindings themselves.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context as _, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::artifact::{self, Artifact};
 use crate::cli::{AddNugetArgs, BuildArgs};
 use crate::context::Context;
 use crate::{buildstd, mode, overlays, palinject};
+
+/// The filename of the per-crate `add-nuget` dependency manifest — see [`record_dependency`].
+const DEPS_MANIFEST_FILE: &str = ".cargo-dotnet-nuget-deps.json";
+
+/// `{package id: version}` for every `add-nuget` package this crate has ever added — read by
+/// `pack` to populate the produced `.nuspec`'s real `<dependency>` entries. A plain JSON map
+/// (not the `.cargo-dotnet-nuget-assets/` dll dir) so it survives independently of whatever dlls
+/// happen to be cached, and so `nuget::copy_assets`'s "copy every file in assets_dir next to the
+/// build output" loop never has to know to skip it.
+#[derive(Default, Serialize, Deserialize)]
+struct DepsManifest {
+    #[serde(flatten)]
+    deps: BTreeMap<String, String>,
+}
+
+/// Upsert `{id: version}` into `<crate_dir>/.cargo-dotnet-nuget-deps.json`, creating it if this is
+/// the crate's first `add-nuget` call. Last-write-wins per id, mirroring how re-running `add-nuget
+/// <id> <newer-version>` already overwrites that id's cached dll.
+fn record_dependency(crate_dir: &Path, id: &str, version: &str) -> Result<()> {
+    let path = crate_dir.join(DEPS_MANIFEST_FILE);
+    let mut manifest: DepsManifest = if path.is_file() {
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&text).unwrap_or_default()
+    } else {
+        DepsManifest::default()
+    };
+    manifest.deps.insert(id.to_string(), version.to_string());
+    let text = serde_json::to_string_pretty(&manifest)?;
+    fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Read back every `{id: version}` an `add-nuget` crate has recorded — `Vec::new()` (not an
+/// error) if the crate never ran `add-nuget`. Used by `pack` to populate real `.nuspec`
+/// `<dependency>` entries instead of bundling raw dlls (see that module's doc for why).
+pub fn recorded_dependencies(crate_dir: &Path) -> Result<Vec<(String, String)>> {
+    let path = crate_dir.join(DEPS_MANIFEST_FILE);
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let manifest: DepsManifest = serde_json::from_str(&text)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    Ok(manifest.deps.into_iter().collect())
+}
 
 /// spinacz's reflection core, embedded at COMPILE TIME of `cargo-dotnet` itself. Written out
 /// verbatim into the ephemeral bindgen crate at RUN time (see the module doc's "why not a
@@ -174,6 +222,13 @@ pub fn run(args: &AddNugetArgs) -> Result<i32> {
         let dest = assets_dir.join(extra.file_name().context("add-nuget: dependency dll has no filename")?);
         fs::copy(extra, &dest)?;
     }
+    // Record {id: version} so `pack` (which does NOT bundle .cargo-dotnet-nuget-assets/, see its
+    // own doc) can instead emit a real `<dependency>` in the produced .nuspec — the idiomatic
+    // NuGet path, which gets RID-specific native assets (e.g. SQLitePCLRaw's native SQLite driver)
+    // and transitive version negotiation right in a way bundling raw dlls never could. Stored as a
+    // SIBLING of assets_dir, not inside it, so `copy_assets`'s "copy every file" loop below doesn't
+    // also ship this bookkeeping file next to the compiled build output.
+    record_dependency(&crate_dir, &args.id, &args.version)?;
 
     eprintln!("== cargo dotnet add-nuget: wrote {} ==", dest_file.display());
     eprintln!(

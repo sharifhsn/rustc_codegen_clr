@@ -9,9 +9,20 @@
 //!
 //! Output: `<crate>/target/nupkg/<id>.<version>.nupkg` (override with `--out`).
 //!
-//! Only embeds the crate's own cdylib — unlike `build`/`run`, this does NOT read
-//! `.cargo-dotnet-nuget-assets/` (see [`nuget`]), so a dependency wired in via
-//! `add-nuget` is silently absent from the produced package.
+//! **Runtime completeness for a consumer who never runs `cargo dotnet`** (a plain
+//! `dotnet add package`/`<PackageReference>`, exactly as if this were any other C# library):
+//!   * `add-nuget`-consumed .NET dependencies are declared as REAL `.nuspec` `<dependency>`
+//!     entries (`nuget::recorded_dependencies`), not bundled as raw dlls. This is the idiomatic
+//!     NuGet path and, critically, the only one that gets RID-specific native assets right (e.g.
+//!     `Microsoft.EntityFrameworkCore.Sqlite`'s SQLitePCLRaw native driver) — bundling flat dlls
+//!     ourselves has no way to replicate NuGet's own `runtimes/<rid>/native/...` targeting, and
+//!     would risk shipping a second, conflicting copy of an assembly the consumer's own project
+//!     already references transitively (e.g. `Microsoft.Extensions.*`).
+//!   * `mycorrhiza::linq`'s `&`/`|` combinators and `mycorrhiza::dynamic` need
+//!     `Mycorrhiza.Interop.Helpers.dll` at runtime — NOT a published NuGet package anywhere, so it
+//!     can't be a `<dependency>`; it's bundled directly into `lib/<tfm>/` alongside the crate's own
+//!     assembly instead (`interop_helpers::dll_bytes_if_needed`, gated on the crate depending on
+//!     `mycorrhiza` at all, same criterion `build`/`run` already use).
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -25,7 +36,7 @@ use zip::{CompressionMethod, ZipWriter};
 use crate::artifact::{self, Artifact};
 use crate::cli::{BuildArgs, PackArgs};
 use crate::context::Context;
-use crate::{buildstd, overlays, palinject};
+use crate::{buildstd, interop_helpers, nuget, overlays, palinject};
 
 pub fn run(args: &PackArgs) -> Result<i32> {
     // Build a BuildArgs view so we reuse the same Context resolution + stage pipeline.
@@ -112,7 +123,35 @@ pub fn run(args: &PackArgs) -> Result<i32> {
         repository: repo.as_deref(),
         has_readme: readme_bytes.is_some(),
     };
-    write_nupkg(&nupkg, &name, &ver, &dll_bytes, ctx.dotnet.tfm(), &meta, readme_bytes.as_deref())?;
+
+    // Real transitive NuGet dependencies for anything this crate pulled in via `add-nuget` — see
+    // the module doc for why this is a `<dependency>` and not a bundled dll.
+    let dependencies = nuget::recorded_dependencies(&ctx.crate_dir)?;
+    for (id, ver) in &dependencies {
+        eprintln!("== cargo dotnet pack: declaring NuGet dependency {id} {ver} ==");
+    }
+
+    // The interop-helpers companion assembly, IFF this crate depends on `mycorrhiza` — see the
+    // module doc. `Ok(None)` (not an error) for a crate that doesn't need it.
+    let helper_dll = interop_helpers::dll_bytes_if_needed(&ctx)?;
+    if helper_dll.is_some() {
+        eprintln!(
+            "== cargo dotnet pack: bundling {} (mycorrhiza dependency detected) ==",
+            interop_helpers::HELPER_DLL_NAME
+        );
+    }
+
+    write_nupkg(
+        &nupkg,
+        &name,
+        &ver,
+        &dll_bytes,
+        ctx.dotnet.tfm(),
+        &meta,
+        readme_bytes.as_deref(),
+        &dependencies,
+        helper_dll.as_deref().map(|b| (interop_helpers::HELPER_DLL_NAME, b)),
+    )?;
 
     eprintln!();
     eprintln!("== packed: {} ==", nupkg.display());
@@ -158,6 +197,8 @@ fn write_nupkg(
     tfm: &str,
     meta: &NuspecMeta<'_>,
     readme: Option<&[u8]>,
+    dependencies: &[(String, String)],
+    extra_assembly: Option<(&str, &[u8])>,
 ) -> Result<()> {
     let guid = random_hex_guid();
     let file = File::create(nupkg)
@@ -228,6 +269,25 @@ fn write_nupkg(
     } else {
         ""
     };
+    // Real `<dependency>` entries for anything this crate pulled in via `add-nuget` — see the
+    // module doc for why this beats bundling raw dlls. Self-closing `<group .../>` when empty
+    // (the common case, a crate that made no `add-nuget` calls) matches the original shape rather
+    // than an open/close tag around whitespace-only content.
+    let deps_group = if dependencies.is_empty() {
+        format!("<group targetFramework=\"{tfm}\" />")
+    } else {
+        let entries: String = dependencies
+            .iter()
+            .map(|(id, ver)| {
+                format!(
+                    "\n        <dependency id=\"{}\" version=\"{}\" />",
+                    xml_escape(id),
+                    xml_escape(ver)
+                )
+            })
+            .collect();
+        format!("<group targetFramework=\"{tfm}\">{entries}\n      </group>")
+    };
     let nuspec = format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>
 <package xmlns=\"http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd\">
@@ -237,7 +297,7 @@ fn write_nupkg(
     <authors>{authors}</authors>
     <description>{description}</description>{license_elem}{repo_elem}{readme_elem}
     <dependencies>
-      <group targetFramework=\"{tfm}\" />
+      {deps_group}
     </dependencies>
   </metadata>
 </package>
@@ -253,6 +313,20 @@ fn write_nupkg(
     }
 
     // build/<id>.targets — explicit <Reference> + copy-local for build/-convention consumers.
+    // Also references `extra_assembly` (the mycorrhiza interop-helpers dll), when present, so a
+    // legacy non-SDK-style consumer gets it too — an SDK-style project already auto-references
+    // every dll placed under `lib/<tfm>/` in the package without needing this at all.
+    let extra_name = extra_assembly.map(|(n, _)| n.trim_end_matches(".dll"));
+    let extra_reference = extra_name
+        .map(|n| {
+            format!(
+                "\n    <Reference Include=\"{n}\">
+      <HintPath>$(MSBuildThisFileDirectory)../lib/{tfm}/{n}.dll</HintPath>
+      <Private>true</Private>
+    </Reference>"
+            )
+        })
+        .unwrap_or_default();
     let targets = format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>
 <!-- Auto-generated by `cargo dotnet pack` for the Rust .NET assembly '{name}'. -->
@@ -261,7 +335,7 @@ fn write_nupkg(
     <Reference Include=\"{name}\">
       <HintPath>$(MSBuildThisFileDirectory)../lib/{tfm}/{name}.dll</HintPath>
       <Private>true</Private>
-    </Reference>
+    </Reference>{extra_reference}
   </ItemGroup>
 </Project>
 "
@@ -270,6 +344,15 @@ fn write_nupkg(
 
     // lib/<tfm>/<id>.dll — the assembly (deflated).
     add_entry(&mut zip, &format!("lib/{tfm}/{name}.dll"), dll, deflated)?;
+
+    // lib/<tfm>/<extra>.dll — the mycorrhiza interop-helpers companion assembly, bundled directly
+    // (not a `<dependency>`: it isn't published anywhere, see the module doc) whenever this crate
+    // depends on `mycorrhiza` at all. An SDK-style consumer auto-references every dll under
+    // lib/<tfm>/ in a referenced package, so this alone is enough for the common case; the
+    // build/<id>.targets entry above additionally covers legacy non-SDK-style projects.
+    if let Some((extra_filename, extra_bytes)) = extra_assembly {
+        add_entry(&mut zip, &format!("lib/{tfm}/{extra_filename}"), extra_bytes, deflated)?;
+    }
 
     zip.finish().context("finalize .nupkg zip")?;
     Ok(())

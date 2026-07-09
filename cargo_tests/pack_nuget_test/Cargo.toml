@@ -1,0 +1,11 @@
+[package]
+name = "pack_nuget_test"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mycorrhiza = { path = "../../mycorrhiza" }
+[workspace]

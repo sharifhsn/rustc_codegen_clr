@@ -29,7 +29,7 @@ use crate::context::Context;
 
 /// Must match `mycorrhiza::linq::PARAMETER_REBINDER_ASSEMBLY` and the helper project's
 /// `<AssemblyName>` exactly.
-const HELPER_DLL_NAME: &str = "Mycorrhiza.Interop.Helpers.dll";
+pub(crate) const HELPER_DLL_NAME: &str = "Mycorrhiza.Interop.Helpers.dll";
 
 /// Build (if needed) the bundled interop-helpers project and copy its output dll into `out_dir`,
 /// IFF this crate's locked dependency graph includes `mycorrhiza`. A silent no-op otherwise, and
@@ -37,20 +37,40 @@ const HELPER_DLL_NAME: &str = "Mycorrhiza.Interop.Helpers.dll";
 /// (e.g. an older Installed-mode home predating this feature) — mirrors `nuget::copy_assets`'s
 /// "never fatal for a crate that doesn't need it" shape.
 pub fn ensure_and_copy(ctx: &Context, out_dir: &Path) -> Result<()> {
-    let root = &ctx.paths.interop_helpers_root;
-    if !root.is_dir() {
+    let Some(dll) = ensure_built(ctx)? else {
         return Ok(());
-    }
-    if !depends_on_mycorrhiza(ctx) {
-        return Ok(());
-    }
-    let dll = build(root, ctx.flags.verbose)?;
+    };
     let dest = out_dir.join(HELPER_DLL_NAME);
     fs::copy(&dll, &dest).with_context(|| format!("cp {} -> {}", dll.display(), dest.display()))?;
     if ctx.flags.verbose {
         eprintln!("==> copied {} -> {}", HELPER_DLL_NAME, dest.display());
     }
     Ok(())
+}
+
+/// Same gating as [`ensure_and_copy`], but returns the built dll's raw bytes instead of copying
+/// it to a directory — for `pack`, which assembles its `.nupkg` in-memory rather than through a
+/// staging directory. `Ok(None)` for the same "doesn't need it" cases `ensure_and_copy` no-ops on.
+pub fn dll_bytes_if_needed(ctx: &Context) -> Result<Option<Vec<u8>>> {
+    let Some(dll) = ensure_built(ctx)? else {
+        return Ok(None);
+    };
+    let bytes = fs::read(&dll).with_context(|| format!("reading {}", dll.display()))?;
+    Ok(Some(bytes))
+}
+
+/// Shared gate + build step behind both [`ensure_and_copy`] and [`dll_bytes_if_needed`]: `Ok(None)`
+/// if this crate doesn't depend on `mycorrhiza` or the helper project isn't present in this
+/// install, else `Ok(Some(built_dll_path))`.
+fn ensure_built(ctx: &Context) -> Result<Option<PathBuf>> {
+    let root = &ctx.paths.interop_helpers_root;
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    if !depends_on_mycorrhiza(ctx) {
+        return Ok(None);
+    }
+    Ok(Some(build(root, ctx.flags.verbose)?))
 }
 
 /// Cheap dependency check: does this crate's `Cargo.lock` list a `mycorrhiza` package? Good enough
