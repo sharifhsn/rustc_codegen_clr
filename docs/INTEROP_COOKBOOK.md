@@ -606,7 +606,33 @@ Rust implementation behind an existing C# codebase's DI/strategy/plugin interfac
 
 ---
 
-## 13. Build a LINQ / EF `IQueryable` predicate from Rust (Expression trees)
+## 13. Export a Rust trait as a C# interface
+
+The reverse of §12: `#[dotnet_interface]` on a Rust `trait` emits a genuine `TypeDef`-`Interface`
+(abstract methods, no body) that a C# consumer can `implement` or program against polymorphically —
+`typeof(ISpeaker).IsInterface` is true. Each method takes `&self`/`&mut self` as the implicit
+receiver; `&mut T` non-receiver params map to `ref T` (`#[dotnet_out]` adds `out T`).
+
+```rust
+use dotnet_macros::dotnet_interface;
+use mycorrhiza::system::MString;
+
+#[dotnet_interface]
+pub trait ISpeaker {
+    fn Speak(&self);
+    fn Volume(&self) -> i32;
+    fn SetVolume(&mut self, level: i32) -> i32;
+    fn Describe(&self) -> MString;
+}
+```
+
+Also covers inheritance, statics, default-interface-methods, generics, and events/properties on the
+interface. **Runnable:** `cargo_tests/cd_interface`, `cd_iface_inherit`, `cd_iface_event`,
+`cd_iface_generic`, `cd_dim`, `cd_static_iface`, `cd_iface_prop`, `cd_iface_genmethod`.
+
+---
+
+## 14. Build a LINQ / EF `IQueryable` predicate from Rust (Expression trees)
 
 `mycorrhiza::linq` builds real `System.Linq.Expressions` trees from Rust — the shape an `IQueryable`
 provider (EF Core, etc.) *walks* to translate to SQL, rather than a compiled delegate it just calls.
@@ -658,7 +684,7 @@ directly usable when a caller's entity type doesn't fit the `#[dotnet_entity]` s
 
 ---
 
-## 14. Catch a codegen bug in *your own* crate early (differential testing)
+## 15. Catch a codegen bug in *your own* crate early (differential testing)
 
 This backend is still experimental — an untested corner of your own code can hit a genuine
 miscompilation, not just a bug in your logic. This project's own regression net is built entirely
@@ -748,8 +774,6 @@ These are honest gaps as of this writing — the natural next recipes, but not y
 - **.NET event subscription** (`+=` on an event, i.e. `add_*`/`remove_*` accessors) — §8.
 - **`#[dotnet_class]` overriding a *base class's* virtual method** — implementing an *interface*
   (§12) works; re-opening a class to override a virtual member does not.
-- **Exporting a Rust trait as a C# interface** (the reverse of §12's `implements=`) — a C# consumer
-  can use an exported concrete type, but can't yet program against a Rust-defined contract type.
 - **`IEnumerable<T>` over a C#-exported `RustVec<T>`** — it's indexable from C# but not `foreach`-able.
 - **A `serde` ⇄ `System.Text.Json` adapter** — the JSON bridge (§2) is a standalone DOM today.
 - **`#[dotnet_export]` of `Vec<T>` / slices / `Option` / `Result` / `char`** — primitives + strings only.

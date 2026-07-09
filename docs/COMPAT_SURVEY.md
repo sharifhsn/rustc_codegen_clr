@@ -143,7 +143,7 @@ chacha20, sha1, flume, aho-corasick, jiff, json5, quick-xml), 0 regression:
 - **B** — `field_address` passes the pointee, not `nptr(pointee)`, to `cast_ptr` (Weak<dyn>::drop).
 - **C1/C2** — the 128-bit multiply-overflow-check builtins compared the div-back to `rhs` not `lhs`
   (a **broad** latent miscompile: every `i128`/`u128` checked multiply wrongly overflowed).
-- **C3** — `place_address_raw`'s single-Deref fast-path is gated on `pointer_to_is_fat` (the quick-xml
+- **C3** — `place_address_raw`'s single-Deref fast-path is gated on `ptr_is_fat` (the quick-xml
   memory-corruption miscompile).
 
 **Residual second-layer bugs** (separate, exposed by the above; tracked): **A2** ed25519-dalek + nalgebra

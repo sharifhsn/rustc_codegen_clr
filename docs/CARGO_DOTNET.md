@@ -23,7 +23,11 @@ injects the dotnet PAL into `rust-src` (a declarative, anchor-based, unit-tested
 [`dotnet_overlays`](../dotnet_overlays/README.md) registry (typed `toml`), patches the libc registry,
 runs `build-std`, locates the artifact (typed `serde_json`), and runs the apphost or assembles a NuGet
 `.nupkg` (the `zip` crate). It shells out only to the *external tools* it must — `cargo`/`rustc`,
-`ilasm`, the `dotnet` apphost, the cilly linker — exactly as any build tool does.
+the `dotnet` apphost, the cilly linker — exactly as any build tool does. **`ilasm` is not one of
+them**: the linker's default `DIRECT_PE=1` path writes the PE directly (see
+[ARCHITECTURE.md](ARCHITECTURE.md#4-the-custom-linker-does-the-heavy-lifting)); `ilasm` is only
+needed if you opt into the `DIRECT_PE=0` fallback (§2's prerequisites below describe that opt-in
+tool, not a hard requirement of this pipeline).
 
 > **The native path needs NO bash core.** Earlier the Rust binary shelled out to a shared bash pipeline
 > (`feasibility/_cargo_dotnet_core.sh` / `$CARGO_DOTNET_HOME/core.sh`) for the inner steps. That is gone
@@ -73,9 +77,10 @@ That single fact is what makes both the run-on-.NET and the call-from-C# stories
 ## 2. Prerequisites & setup
 
 The build runs inside the project's reproducible Docker harness (the `rcc-dev` image), which ships the
-pinned nightly + `rustc-dev`/`rust-src`, the .NET 8 SDK, and `ilasm` (via Mono). The project is only
-tested on **Linux x86_64 / .NET 8 CoreCLR**, and the harness pins that environment so results don't
-depend on your host (macOS/arm64 is doubly off-path: wrong OS *and* wrong arch).
+pinned nightly + `rustc-dev`/`rust-src` and the .NET 8 SDK. The project is only tested on **Linux
+x86_64 / .NET 8 CoreCLR**, and the harness pins that environment so results don't depend on your host
+(macOS/arm64 is doubly off-path: wrong OS *and* wrong arch). The image also ships `ilasm` (via Mono)
+for the `DIRECT_PE=0` fallback, but the default build (`DIRECT_PE=1`) never invokes it.
 
 ```bash
 # One-time: build the harness image (also the "does it still compile on nightly?" check).
@@ -97,12 +102,12 @@ feasibility/cargo-dotnet run cargo_tests/cd_pure   # Docker dev driver (CARGO_DO
 ```
 
 You need a running Docker daemon. That is the **only** host dependency — the image carries `dotnet`
-and `ilasm`.
+(`ilasm` too, but only the `DIRECT_PE=0` fallback path touches it).
 
 > **The Docker-vs-native seam.** `cargo-dotnet` dispatches on `CARGO_DOTNET_BACKEND` (default
 > `docker`). A **native** (non-Docker) driver (`CARGO_DOTNET_BACKEND=native`) runs the *same*
 > pipeline core directly on the host — no container — against the host's real repo path and
-> `command -v rustc cargo dotnet` + a CoreCLR `ilasm`. The UX and pipeline are unchanged; only the
+> `command -v rustc cargo dotnet`. The UX and pipeline are unchanged; only the
 > host-specific paths/tools differ (supplied to the shared core as `CD_*` env vars whose defaults
 > reproduce the container layout, so the Docker path is byte-for-byte unchanged). See
 > **[§2b Native (no Docker)](#2b-native-no-docker)** below and
@@ -145,7 +150,10 @@ This flow is verified end-to-end on macOS arm64 (J1/J2/J3 all pass, zero Docker)
    curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 8.0 --install-dir "$HOME/.dotnet"
    export PATH="$HOME/.dotnet:$PATH"; export DOTNET_ROOT="$HOME/.dotnet"
    ```
-3. **`ilasm` — use the CoreCLR ILAsm, NOT Mono.** Mono's `ilasm` only emits PE32/i386 images, which
+3. **`ilasm` (optional — only for the `DIRECT_PE=0` fallback).** The default build never invokes
+   `ilasm` (`DIRECT_PE=1`'s hand-rolled PE writer, see [ARCHITECTURE.md](ARCHITECTURE.md)). Skip this
+   step unless you're debugging with `DIRECT_PE=0`. If you do need it: use the CoreCLR ILAsm, NOT
+   Mono. Mono's `ilasm` only emits PE32/i386 images, which
    the native (macOS arm64 / Windows) CoreCLR loader **rejects** (`FileLoadException 0x8007000C`). The
    CoreCLR ILAsm from NuGet emits a PE the host CoreCLR loads:
    ```bash
@@ -194,11 +202,12 @@ Prereqs (user-local where possible):
   `--component rust-src --component rustc-dev`. (The MSVC host toolchain + the Build Tools' linker
   environment are required to build the backend and the native launcher.)
 - **.NET 8 SDK** on PATH (`dotnet.exe`).
-- **`ilasm`**: the CoreCLR ILAsm tool for win-x64 — NuGet
+- **`ilasm` (optional — only for the `DIRECT_PE=0` fallback):** the default build (`DIRECT_PE=1`)
+  never calls `ilasm`. If you do fall back to `DIRECT_PE=0`: the CoreCLR ILAsm tool for win-x64 — NuGet
   `runtime.win-x64.Microsoft.NETCore.ILAsm` (8.0.x). Place its `ilasm.exe` at
   `%USERPROFILE%\.dotnet\ilasm-tool\ilasm.exe` (Git Bash sees this as `$HOME/.dotnet/ilasm-tool/ilasm.exe`
-  and the native driver auto-discovers it), or set `ILASM_PATH` to it. **Setting a CoreCLR `ilasm` is
-  effectively mandatory on Windows**: if `ILASM_PATH` is unset, the cilly linker's Windows default
+  and the native driver auto-discovers it), or set `ILASM_PATH` to it. Under `DIRECT_PE=0` with
+  `ILASM_PATH` unset, the cilly linker's Windows default
   (`cilly/src/ir/asm.rs::get_default_ilasm`, `#[cfg(target_os = "windows")]`) probes a bare `ilasm`
   on PATH and then the **legacy .NET Framework** assembler under `C:\Windows\Microsoft.NET\Framework`
   — a different, much older ilasm whose output the CoreCLR loader may reject (and which panics if no
@@ -274,9 +283,10 @@ satisfied (or re-done with `--force`):
    toolchain per-build via `RUSTUP_TOOLCHAIN` instead.
 2. **.NET 8 SDK** — installs to `$HOME/.dotnet` (via `dotnet-install.sh`) if neither `$HOME/.dotnet/dotnet`
    nor a PATH `dotnet` is present.
-3. **CoreCLR `ilasm`** — installs the host-RID `runtime.<rid>.Microsoft.NETCore.ILAsm` (8.0.0) NuGet
-   package's `ilasm` to `$HOME/.dotnet/ilasm-tool/ilasm` (**not** Mono — Mono's PE32 output is rejected
-   by the native CoreCLR loader; see §2b).
+3. **CoreCLR `ilasm`** (provisioned for the `DIRECT_PE=0` fallback; the default build doesn't call it)
+   — installs the host-RID `runtime.<rid>.Microsoft.NETCore.ILAsm` (8.0.0) NuGet package's `ilasm` to
+   `$HOME/.dotnet/ilasm-tool/ilasm` (**not** Mono — Mono's PE32 output is rejected by the native
+   CoreCLR loader; see §2b).
 4. **Backend + install home** — builds the backend dylib + `linker` (`cargo +<toolchain> build --release`)
    from the checkout and copies them, the `dotnet_pal/` + `dotnet_overlays/` trees, the target spec, and a
    copy of the pipeline core into `CARGO_DOTNET_HOME`.

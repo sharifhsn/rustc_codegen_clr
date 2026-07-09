@@ -90,6 +90,53 @@ path is unit-tested). `ALLOW_MISCOMPILATIONS` now **defaults to `false`** — th
 first ill-typed method. The canonical Docker `::stable` gate stays green under the fatal checker
 (428 pass / 12 known-baseline fail, **zero** new failures, **zero** fatal aborts).
 
+**CORRECTION (post-delivery, two later sessions) — "sound to zero false positives" above was true of
+that corpus but was NOT a completeness claim, and the checker's false-negative side had a real gap.**
+The `tc_tests` false-negative audit at delivery time exercised only a handful of hand-picked shapes
+(float-into-int store, i64-where-f64 call arg, isinst/castclass-on-int); it did not audit every
+`Type`-classification helper the checker leans on for its *correctness*, and two such helpers turned
+out to be shallow rather than structurally recursive:
+
+- **`Type::is_gcref` shallowness (found+fixed).** `is_gcref` (`cilly/src/ir/tpe/mod.rs`) only asked
+  "is the outer type itself a GC reference?" — for a `ClassRef` it checked the class's own
+  valuetype-ness and stopped, never looking at that value-type's *own fields*. A value-type struct
+  that nests a real managed handle in a field (`mycorrhiza::task::TaskFuture<T>`, wrapping a raw
+  `Task<T>` object reference) therefore reported `is_gcref == false` even though it transitively
+  carries a GC reference. `ClassDef::layout_check` used `is_gcref` to decide whether a field placed in
+  a coroutine's *overlapping* (union-style) variant storage was safe — so a `TaskFuture<T>` captured
+  across an `.await` point could sit in overlapping storage UNCHECKED, and CoreCLR's class loader
+  rejects that shape at type-load time (`TypeLoadException` — a safe refusal-to-load, not a silent
+  miscompile, but a real checker completeness gap all the same). Fixed by a new recursive
+  `Type::contains_gcref` (bounded-depth traversal into a value-type `ClassRef`'s own fields), which
+  `layout_check` now uses instead. Regression-proven by `cargo_tests/cd_persisted_async` /
+  `cargo_tests/cd_efcore_async` on real CoreCLR.
+- **`PtrCast`'s `ManagedPtrCast` check, same shallowness, sibling gap (found+fixed).** `CILNode::PtrCast`
+  is supposed to reject any cast into/out of an *unmanaged* pointer (`Type::Ptr`) whose pointee is a
+  GC reference — an unmanaged, GC-untracked pointer must never address managed memory. That check
+  (`cilly/src/ir/typecheck.rs`) also called the shallow `is_gcref` on the pointee/result type, so a
+  `PtrCast` of `*mut Wrapper` — where `Wrapper` is a value-type struct nesting a managed-object field,
+  the exact same shape as the `TaskFuture<T>` case above — was silently ACCEPTED by the checker: a real
+  false negative, structurally identical to the `is_gcref` gap, just reached through a different
+  checker rule. Fixed by switching both `PtrCast` arms (the source pointee check and the destination
+  type check) to `contains_gcref`. Proven via `cilly/src/ir/typecheck.rs::tc_tests::
+  ptrcast_nested_gcref_struct_is_rejected`, which demonstrates the old-shallow-checker-accepts /
+  new-deep-checker-rejects transition directly (a minimal value-type `ClassDef` nesting one
+  non-valuetype `ClassRef` field, `PtrCast`ed from `*mut Wrapper` to `*mut u8` — accepted before this
+  fix, rejected after). `cilly`'s own unit suite went from 216 to 217 passing (the one new test), zero
+  regressions; `cargo check --workspace` and a `::stable`-gate spot-check stay green.
+- **Audited and ruled out (no further siblings found).** Every other coarse `Type` classification in
+  the checker/layout path was reviewed for the same "does it recurse through nested value-type
+  composition?" failure mode: `Type::is_assignable_to`'s leaf arms, the `Box` valuetype-ness closure
+  in `typecheck.rs`, `enum_`/`union_`/`closure_typedef`/`coroutine_typedef`'s `ClassDef` construction
+  in `rustc_codegen_clr_type/src/type.rs` (the coroutine/enum overlapping-storage paths both already
+  route through the now-fixed `layout_check`, so the fix's benefit is not coroutine-only), and every
+  `match`/`if let` arm over `Type`'s variants in `typecheck.rs`/`class.rs`/`tpe/mod.rs` (a wildcard
+  sweep: the ones present are all fail-closed rejections — safe by construction against a future
+  `Type` variant — not permissive fallthroughs). No further gap of this shape was found; the honest
+  read is that `is_gcref`/`PtrCast` were the two live instances of one root cause (a shallow
+  outer-type-only classification helper reused at multiple checker call sites), not a systemic pattern
+  across the whole checker.
+
 5. **`ilverify` — DEFERRED (env-available, not yet a sound gate).** `dotnet-ilverify` 8.0.0 installs
    and runs, but over an emitted assembly it reports ~34k errors dominated by `UnmanagedPointer`,
    `InitLocals`, `StackByRef`, `StackUnexpected`, `Unverifiable` — i.e. the backend's *intentional*

@@ -129,6 +129,8 @@ debugging) remain a documented stretch item; a manual VS Code step-through has n
 | COMPAT_SURVEY Class D | "rayon/parking_lot/dashmap blocked on parker/futex/TLS" | Parker keystone + generic sync routing **landed**; class unblocked |
 | GAPS.md WF-F deferred list | "Condvar/RwLock/Once still no_threads" | Routed to std's generic queue-based impls over the real Parker/Mutex |
 | TRANSLATION_STATUS §6 | ".NET→Rust ergonomic tail = managed-String/Result/NuGet remaining" | All shipped (WF-8 + ergonomics campaign); see ledger above |
+| ARCHITECTURE.md §3 | "live V1 tree IR → V2 interned IR split (`cil_node.rs`/`cil_root.rs` → `cilly/src/v2/`, `Assembly::from_v1`)" | **Collapsed** into a single interned IR under `cilly/src/ir/`; no V1/V2 split, `from_v1` doesn't exist |
+| INTEROP_COOKBOOK.md "not here" list | "Exporting a Rust trait as a C# interface" not yet possible | **Shipped** (8a05a7a `#[dotnet_interface]`) — events/inheritance/statics/byref/DIM/generics/properties, 8 passing test crates; cookbook §13 |
 
 ## In-flight roadmap (2026-07)
 

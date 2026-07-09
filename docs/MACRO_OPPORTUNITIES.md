@@ -37,7 +37,7 @@ project-specific reasons it is the wrong tool here:
    rest of the crate is compiled for the .NET target) is a large tax on a layer
    whose whole value is being small and obvious. The interop magic-fn names are
    matched by the backend *by substring* (`argc_from_fn_name` /
-   `is_function_magic`), so they must be spelled **literally** — a proc-macro
+   `is_magic_fn`), so they must be spelled **literally** — a proc-macro
    that built them with `concat!`/`paste!` would actively break the contract.
    The declarative `interop_magic_fn!` arity-ladder
    ([mycorrhiza/src/intrinsics.rs](../mycorrhiza/src/intrinsics.rs)) keeps every

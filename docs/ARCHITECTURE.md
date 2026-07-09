@@ -21,7 +21,9 @@ code disagree, the **code wins** — the project moves fast and some articles pr
   and the WIP `dotnet_typedef!` macro for defining .NET classes in Rust). *(v0.2.0, v0.2.1)*
 - The IR (`cilly`) is deliberately **backend-agnostic**: the same IR is lowered to .NET CIL, C, and
   (experimentally) JVM/JS. This is why C support cost only ~1–2K LOC — "pretend C is a very weird
-  .NET runtime." *(v0.1.2)* See the exporters under `cilly/src/v2/{il_exporter,c_exporter,java_exporter}`.
+  .NET runtime." *(v0.1.2)* See the exporters under `cilly/src/ir/{pe_exporter,il_exporter,c_exporter,java_exporter}`.
+  For .NET output the linker's **default** path is the hand-rolled `pe_exporter` (writes a PE directly,
+  no external tools); `il_exporter` (ilasm-based) is only the `DIRECT_PE=0` fallback. *(see docs/PE_EMISSION_PLAN.md)*
 
 ## 2. Two guiding principles (these explain most of the code's shape)
 
@@ -38,11 +40,12 @@ code disagree, the **code wins** — the project moves fast and some articles pr
 > generic function once (pre-monomorphization) saves re-optimizing every monomorphized instance.
 > MIR opts are limited because they must hold for all `T`. *(v0.2.1)*
 
-## 3. The CIL-trees IR and the V1 → V2 split
+## 3. The CIL-trees IR
 
 - **CIL "trees" (`CILNode` / `CILRoot`).** Early CIL was a flat array of stack ops; the relationships
   between ops were implicit, making optimization/validation hard. It was rewritten into a **tree**
-  where each node references its inputs. *(v0.1.1)* This is the `cil_node.rs` / `cil_root.rs` IR.
+  where each node references its inputs. *(v0.1.1)* This is the `cilly/src/ir/cilnode.rs` /
+  `cilroot.rs` IR.
   - **`CILNode`** = a pure, value-producing node (one output). Every node except `Call` has a *fixed*
     arity, validated at construction — you structurally *cannot* build a malformed `mul` with 3 inputs.
   - **`CILRoot`** = a side-effecting statement; **only a root may write** to a local/address
@@ -50,17 +53,19 @@ code disagree, the **code wins** — the project moves fast and some articles pr
   - Tree limitations, by design: **no `dup`** (1 input / 2 outputs can't be a tree — re-introduced
     only after optimization, "flattening"); **no branch-join stack values**. Both sacrificed as minor
     micro-opts. *(v0.1.1)*
-- **V1 → V2.** The backend emits the **V1** tree IR (`cilly::cil_node::V1Node`, `cil_root::V1Root`).
-  `Assembly::from_v1` converts it to the **V2** IR under `cilly/src/v2/` — an **interned / hash-consed**
-  representation addressed by `Interned<T>` handles into a `BiMap`. Optimization (`v2/opt/`), the
-  typechecker (`v2/typecheck.rs`) and all exporters operate on V2, and V2 is what gets serialized
-  (postcard) into the `.bc`/`.rlib`. (See `join_codegen` in `src/lib.rs`: `from_v1` → `opt` → `typecheck`.)
+- **Single interned IR.** The tree IR lives directly under `cilly/src/ir/` — addressed by
+  `Interned<T>` handles into a `BiMap`. There is no separate V1/tree-vs-interned split anymore (an
+  earlier V1→V2 two-generation design was collapsed into this one IR); optimization (`ir/opt/`), the
+  typechecker (`ir/typecheck.rs`) and all exporters operate on it directly, and it's what gets
+  serialized (postcard) into the `.bc`/`.rlib`. (See `join_codegen` in `src/lib.rs`: build → `opt` →
+  `typecheck`.)
 
 ## 4. The custom linker does the heavy lifting
 
-Set via `-C linker=` (binary in `cilly/src/bin/linker/`). It loads the serialized V2 assemblies from
+Set via `-C linker=` (binary in `cilly/src/bin/linker/`). It loads the serialized assemblies from
 rlibs, merges them, patches in libc / intrinsic implementations, and emits the final .NET executable
-or C output (AOT path in `aot.rs`). Things that live here rather than in the compiler:
+(`pe_exporter`, the default, or `il_exporter`+ilasm under `DIRECT_PE=0`) or C output (AOT path in
+`aot.rs`). Things that live here rather than in the compiler:
 
 - **Cross-crate dead-code elimination** (a copying-GC-style reachability pass) — rustc's frontend DCE
   can't see across crates and must keep all public `std` functions. DCE roughly halved assembly size;
@@ -143,8 +148,8 @@ or C output (AOT path in `aot.rs`). Things that live here rather than in the com
 ---
 
 ### Terminology cheat-sheet (appears in the code)
-`CILNode` / `CILRoot` (pure node vs side-effecting root); V1 vs V2 IR; `Interned`/`BiMap` (hash-consing);
-`from_v1`; `TyCache`; `subst` + `DefID`, `Gn` (generics by index); `FnSig` vs `FnAbi`; `_tag`/`v_<Variant>`/`m_<n>`
+`CILNode` / `CILRoot` (pure node vs side-effecting root); `Interned`/`BiMap` (hash-consing);
+`TyCache`; `subst` + `DefID`, `Gn` (generics by index); `FnSig` vs `FnAbi`; `_tag`/`v_<Variant>`/`m_<n>`
 (enum layout); `DATA_PTR`/`METADATA`/`ENUM_TAG`; `TyKind::Foreign` (thin-ptr unsized); ZST / `Type::Void`;
 `RustModule` + `.cctor`; `leave` / cleanup-block duplication; `MAX_BASIC_BLOCKS` (JIT inline limit);
 `IlasmFlavour`; config flags `OPTIMIZE_CIL`, `NO_UNWIND`, `C_MODE`, `ASCI_IDENT`, `TRACE_CIL_OPS`, `NATIVE_PASSTROUGH`.
