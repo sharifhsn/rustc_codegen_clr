@@ -547,7 +547,7 @@ The benchmark decomposes into 6 layers → workflows:
 | 3 Rust→.NET calls | WF-3 | ✅ **DONE** (full BCL, 4256 methods) |
 | 4 errors/panics cross cleanly | WF-6 | ✅ **DONE** (throw-bridge; catch_unwind works) |
 | 5 .NET→Rust export (call Rust from C#) | **WF-7** | ✅ **DONE** (C# calls a Rust *library*; string marshalling; Rust *defines* managed classes) |
-| 6 ergonomic packaged library | **WF-8** | 🟢 **a–e DONE** (direct typed calls; ctors; managed-`String` return; **de-mangled names + struct marshalling**; **slices + `Result`→exception both ways**); **MSBuild auto-build (`RustDotnet.targets`) + NuGet (`cargo dotnet pack`) DONE (G2)**; `Option`→nullable + managed-`T[]` return remain |
+| 6 ergonomic packaged library | **WF-8** | 🟢 **a–f DONE** (direct typed calls; ctors; managed-`String` return; **de-mangled names + struct marshalling**; **slices + `Result`→exception both ways**; **`Option`→`Nullable<T>` + managed `T[]` return**); **MSBuild auto-build (`RustDotnet.targets`) + NuGet (`cargo dotnet pack`) DONE (G2)**; only self `.assembly .ver` remains |
 
 **Layers 1–4 done + WF-7 P1** — the entire Rust→.NET half, error-crossing, AND the core of the reverse
 direction (C# imports a Rust library and calls its functions, §6). What remains: WF-7 P2 (marshalling
@@ -597,8 +597,17 @@ direction (C# imports a Rust library and calls its functions, §6). What remains
   a `Result`'s `Ok` value crosses unwrapped (`checked_div`), and the **error direction now works**: a new
   `rustc_clr_interop_throw` intrinsic raises a managed `System.Exception` via a real `throw` IL op (not a
   Rust `panic!`, which faults reaching a managed frame), so `try_div(1,0)` is caught by C# `try`/`catch`
-  (`cargo_tests/rust_export_cs`, 15/15 on .NET). **Remaining:** `Option`→nullable; managed-`T[]`/`Span`
-  *return* (needs a `newarr`/`stelem` IR op) + self `.assembly .ver`. The **cargo↔MSBuild build glue is
+  (`cargo_tests/rust_export_cs`, 15/15 on .NET — **NOTE:** a regression unrelated to this feature's own
+  code has since broken check 15 specifically, `try_div(1,0)`'s exception-crossing path; see the
+  Tier-0-adjacent bug tracked separately, not yet root-caused). **WF-8f DONE**: `Option<T>` return ->
+  `System.Nullable<T>`/`T?` (an exported fn computes an ordinary `Option<T>` and calls `.into()` at the
+  boundary — `mycorrhiza::nullable::Nullable<T>` was already a real, already-FFI-safe `Nullable<T>`
+  wrapper, just never wired into `#[dotnet_export]`'s return path) and managed `T[]` return (an exported
+  fn builds a real array via `rustc_clr_interop_managed_new_arr`/`_set_elem`, already-existing intrinsics
+  cilly's `NewArr`/`StElem` IR already backed — the "needs a `newarr`/`stelem` IR op" note below was
+  stale, nothing new was needed at the IR layer). Both verified via `cargo_tests/cd_export_wf8`, 8/8 on
+  .NET, LINQ-usable directly (`.Sum()` on the returned array). **Remaining:** self `.assembly .ver`. The
+  **cargo↔MSBuild build glue is
   DONE (G2)**: `msbuild/RustDotnet.targets` makes `dotnet build`/`dotnet run` on a C# project auto-build a
   declared `<RustCrate>` via the installed `cargo dotnet` and reference its assembly (incremental, zero
   manual steps), and `cargo dotnet pack` emits a NuGet `.nupkg` a C# project `<PackageReference>`s from a
