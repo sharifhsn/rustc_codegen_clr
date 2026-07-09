@@ -15,7 +15,7 @@ use crate::artifact::Artifact;
 use crate::cli::BuildArgs;
 use crate::context::Context;
 use crate::mode::Backend;
-use crate::{artifact, buildstd, docker, nuget, overlays, palinject, run, xmldoc};
+use crate::{artifact, buildstd, docker, interop_helpers, nuget, overlays, palinject, run, xmldoc};
 
 /// Run `build` or `run`. `is_run` selects the run-the-apphost behaviour.
 pub fn run(args: &BuildArgs, is_run: bool) -> Result<i32> {
@@ -51,7 +51,7 @@ fn run_native(ctx: &Context, prog_args: &[String]) -> Result<i32> {
     // 4. Locate the produced artifact.
     let art = artifact::locate(&json, ctx)?;
     // 4.5. Copy any `add-nuget`-fetched runtime dlls alongside the output (a no-op for crates
-    // that never ran `add-nuget` — see `nuget::copy_runtime_assets`'s doc for why this is the
+    // that never ran `add-nuget` — see `nuget::copy_assets`'s doc for why this is the
     // only wiring a third-party NuGet dependency needs at consumer build time).
     let out_dir = match &art {
         Artifact::Executable(exe) => exe.parent(),
@@ -59,7 +59,11 @@ fn run_native(ctx: &Context, prog_args: &[String]) -> Result<i32> {
         Artifact::None => None,
     };
     if let Some(out_dir) = out_dir {
-        nuget::copy_runtime_assets(&ctx.crate_dir, out_dir)?;
+        nuget::copy_assets(&ctx.crate_dir, out_dir)?;
+        // 4.6. Copy the bundled `Mycorrhiza.Interop.Helpers` companion dll (building it first if
+        // needed) for any crate that depends on `mycorrhiza` — see `interop_helpers`'s doc comment
+        // for why this is unconditional rather than gated on a marker directory like 4.5 above.
+        interop_helpers::ensure_and_copy(ctx, out_dir)?;
     }
     // 5. Run it, or report.
     if ctx.flags.run {

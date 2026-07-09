@@ -94,7 +94,73 @@ pub fn run(args: &SetupArgs) -> Result<i32> {
         eprintln!("!! PAL warm skipped/failed (non-fatal at setup; will retry on first build): {e:#}");
     }
 
+    // ---- provision the bundled mycorrhiza_interop_helpers C# project into the Installed
+    // home ----
+    // `interop_helpers::ensure_and_copy` (called on every `cargo dotnet build`/`run`) looks for
+    // this project at `Context::paths.interop_helpers_root`, which in Installed mode resolves to
+    // `<home>/mycorrhiza_interop_helpers` — but nothing else populates that path, so without this
+    // step every real `cargo dotnet` user (anyone NOT running from a dev checkout) silently never
+    // gets `Mycorrhiza.Interop.Helpers.dll`, and `mycorrhiza::linq`'s `&`/`|` predicate combinators
+    // throw `FileNotFoundException` at runtime. Bash setup already populated `home`, so it's safe
+    // to write into it now; non-fatal on failure (mirrors `warm_pal`'s treatment), since a crate
+    // that never uses the `&`/`|` combinators is unaffected either way.
+    if let Err(e) = provision_interop_helpers(&from_repo, &args.home) {
+        eprintln!(
+            "!! could not provision mycorrhiza_interop_helpers into the install home (non-fatal; \
+             `mycorrhiza::linq`'s `&`/`|` combinators will fail until this is fixed): {e:#}"
+        );
+    }
+
     Ok(0)
+}
+
+/// Copy `<from_repo>/mycorrhiza_interop_helpers` to `<home>/mycorrhiza_interop_helpers`,
+/// overwriting any existing copy (so re-running `setup --force` picks up C# source changes).
+fn provision_interop_helpers(from_repo: &Path, home_override: &Option<PathBuf>) -> Result<()> {
+    let src = from_repo.join("mycorrhiza_interop_helpers");
+    if !src.is_dir() {
+        // An older checkout predating this feature — nothing to provision, not an error.
+        return Ok(());
+    }
+    let home = match home_override {
+        Some(h) => h.clone(),
+        None => crate::mode::cargo_dotnet_home()?,
+    };
+    let dest = home.join("mycorrhiza_interop_helpers");
+    copy_dir_overwrite(&src, &dest)
+        .with_context(|| format!("copying {} -> {}", src.display(), dest.display()))?;
+    println!(
+        "==> provisioned mycorrhiza_interop_helpers -> {}",
+        dest.display()
+    );
+    Ok(())
+}
+
+/// Recursively copy `src` into `dest`, skipping `bin`/`obj` (build artifacts, regenerated on
+/// first use) and any existing `dest` contents that would otherwise linger after a source file is
+/// removed upstream (`dest` is removed first, then repopulated).
+fn copy_dir_overwrite(src: &Path, dest: &Path) -> Result<()> {
+    if dest.exists() {
+        std::fs::remove_dir_all(dest)
+            .with_context(|| format!("removing stale {}", dest.display()))?;
+    }
+    std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
+    for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "bin" || name == "obj" {
+            continue;
+        }
+        let src_path = entry.path();
+        let dest_path = dest.join(&name);
+        if entry.file_type()?.is_dir() {
+            copy_dir_overwrite(&src_path, &dest_path)?;
+        } else {
+            std::fs::copy(&src_path, &dest_path)
+                .with_context(|| format!("copying {}", src_path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Run the native PAL injection once (the warm step). Setup runs from a repo checkout,
