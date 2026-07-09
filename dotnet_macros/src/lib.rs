@@ -63,6 +63,50 @@ fn validate_dotnet_ref(spec: &str, span: proc_macro2::Span) -> syn::Result<()> {
 }
 
 // ============================================================================
+// `extends = "..."` — allowlisted base classes for `#[dotnet_class]`.
+// ============================================================================
+
+/// Base classes proven safe for `#[dotnet_class(extends = "...")]`, by real end-to-end test (compiles,
+/// loads, runs, no crash) — not by inspection. Unlike the `attr(...)` denylist above, this is an
+/// ALLOWlist, and deliberately so: a malformed custom-attribute blob fails safely (a catchable
+/// reflection exception), but subclassing an arbitrary CLR base class does not. CoreCLR's loader has
+/// private expectations about a base class's field layout, vtable slot count, and constructor
+/// contract that a Rust caller has no way to inspect or prove correct from the type signature alone —
+/// getting it wrong crashes the *loader*, not just the call (this is exactly what T0-2 root-caused:
+/// see `cilly::ir::class::ClassDef::set_extends`'s doc and `cargo_tests/cd_bgservice`'s investigation).
+/// So each entry here was proven individually, the way `BackgroundService` was proven in
+/// `cargo_tests/cd_bgservice/rustlib_bgtest` (subclass + override `ExecuteAsync` + run under a real
+/// `IHostBuilder` lifecycle, no crash) before being added. `System.Object` is always safe (it's the
+/// universal base every class already implicitly extends) and isn't optional.
+///
+/// To subclass anything else without adding it here first, set `ALLOW_UNVERIFIED_BASE=1` in the
+/// environment at Rust compile time — an explicit, loud, debug-only opt-out (matching this project's
+/// `config!`-macro env-var culture: `OPTIMIZE_CIL`, `ALLOW_MISCOMPILATIONS`, etc.), not a public
+/// unsafe API, since the underlying invariant genuinely cannot be discharged by the caller.
+const EXTENDS_ALLOWLIST: &[&str] = &[
+    "[System.Runtime]System.Object",
+    "[Microsoft.Extensions.Hosting.Abstractions]Microsoft.Extensions.Hosting.BackgroundService",
+];
+
+/// `Some(reason)` if `base` isn't allowlisted and `ALLOW_UNVERIFIED_BASE` isn't set; `None` if the
+/// extends is OK to proceed (either allowlisted, or the escape hatch is active).
+fn unverified_base_reason(base: &str) -> Option<String> {
+    if EXTENDS_ALLOWLIST.contains(&base) {
+        return None;
+    }
+    if std::env::var("ALLOW_UNVERIFIED_BASE").is_ok() {
+        return None;
+    }
+    Some(format!(
+        "#[dotnet_class]: `{base}` is not on the proven-safe `extends` allowlist ({EXTENDS_ALLOWLIST:?}). \
+         Subclassing an arbitrary CLR base class risks a CoreCLR loader crash (private layout/vtable \
+         expectations the backend cannot verify from the Rust side) rather than a catchable error — see \
+         `EXTENDS_ALLOWLIST`'s doc in dotnet_macros. Either prove this base class safe end-to-end and add \
+         it to the allowlist, or set `ALLOW_UNVERIFIED_BASE=1` to bypass this check at your own risk."
+    ))
+}
+
+// ============================================================================
 // `attr(...)` — general `#[dotnet_class(attr(...))]` custom-attribute surface.
 // ============================================================================
 
@@ -355,6 +399,11 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Ok(s) => {
                         if let Err(e) = validate_dotnet_ref(&s, m.value.span()) {
                             return e.to_compile_error().into();
+                        }
+                        if let Some(reason) = unverified_base_reason(&s) {
+                            return syn::Error::new(m.value.span(), reason)
+                                .to_compile_error()
+                                .into();
                         }
                         extends = s;
                     }

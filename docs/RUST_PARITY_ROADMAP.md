@@ -158,11 +158,22 @@ These aren't missing features, they're defects in things that otherwise work. Or
   all correct, call counts exact).
 - **Background services**: `IHostedService` implemented directly from Rust, invoked by a real
   `Host.CreateDefaultBuilder()` lifecycle; long-running work via a blocking `std::thread::spawn` loop
-  (sidesteps the async ceiling entirely — a legitimate pattern, not just a workaround).
+  (sidesteps the async ceiling entirely — a legitimate pattern, not just a workaround). Subclassing the
+  abstract `Microsoft.Extensions.Hosting.BackgroundService` itself and overriding its `ExecuteAsync` also
+  now works end-to-end (proven in `cargo_tests/cd_bgservice/rustlib_bgtest`, no crash under a real
+  `IHostBuilder` lifecycle) — see the escape-hatch entry below.
 - **Hosting**: Rust logic called from a real ASP.NET Core minimal-API host works end-to-end over live
   HTTP. (Rust *as* the route-handler delegate blocked by Tier 0 item 4; Rust-defined MVC controllers
-  correctly out of scope — needs both arbitrary base-class subclassing, Tier 0 item 2, and custom
-  attribute emission, which doesn't exist at all.)
+  correctly out of scope — needs custom attribute emission for `[ApiController]`/`[Route]`, which now
+  exists (see below) but hasn't been exercised for MVC specifically.)
+- **Escape hatches for advanced/unsafe interop** (all backed by real proof crates): custom .NET attribute
+  emission (`#[dotnet_class(attr(...))]`, denylists CoreCLR layout-affecting namespaces), an ALLOWlisted
+  `extends = "..."` base-class set for `#[dotnet_class]` (`System.Object` + `BackgroundService` proven
+  end-to-end so far; anything else needs `ALLOW_UNVERIFIED_BASE=1` — subclassing an arbitrary CLR base
+  isn't provably safe from the Rust side, so this is opt-in per class, not a blanket bypass — see
+  `EXTENDS_ALLOWLIST` in `dotnet_macros/src/lib.rs`), raw dynamic reflection invoke
+  (`mycorrhiza::dynamic::invoke_dynamicN[_checked]`), and unchecked span/slice access
+  (`Span::{get,set}_unchecked`).
 - **NATS**: works via the older synchronous `NATS.Client`, real pub/sub round-trip against a live
   server. The *modern* `NATS.Net` is async-only end-to-end — unreachable until Tier 0 item 1 closes,
   a genuinely useful data point on how much the async work matters in practice.
