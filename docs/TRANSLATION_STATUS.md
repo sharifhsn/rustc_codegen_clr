@@ -603,8 +603,14 @@ direction (C# imports a Rust library and calls its functions, §6). What remains
   declared `<RustCrate>` via the installed `cargo dotnet` and reference its assembly (incremental, zero
   manual steps), and `cargo dotnet pack` emits a NuGet `.nupkg` a C# project `<PackageReference>`s from a
   local feed. Worked: `cargo_tests/cd_interop/csharp` (auto-build) + `…/csharp_nupkg` (NuGet), both 6/6.
-- **WF-9** Generic-interop bridge — `RustGeneric<T>` ↔ C# (size-parameterized for `T: unmanaged`,
-  boxed/`GCHandle` for managed T; §7). Needed iff the module's public API uses generic containers.
+- **WF-9** Generic-interop bridge — **DONE, both directions and modes** (superseding the "needed iff
+  generic" framing below, which predates this work): Rust→generic .NET (`List<T>`/`Dictionary<K,V>`)
+  AND C#→generic Rust, both an unmanaged `RustVec<T>` (any `T: unmanaged`, cd_rustvec 37/37) and a
+  managed `RustBoxVec<T>` over `GCHandle` (any `T`, ref-identity preserved). A codegen
+  binding-consistency guard (`check_generic_marker`) makes the type-checker relaxation this needed
+  precisely sound rather than trusting CoreCLR's own (unverified-context) generic checks. `cd_generic`
+  18/18, `cd_rustvec` 37/37, no regression on the rest of the gate. Only ergonomics/auto-generation of
+  the wrapper boilerplate remains, not a capability gap.
 - **WF-10 (open-ended)** Real-crate soak / hardening — **DONE for breadth**: ~74 real crates driven
   through `cargo dotnet` on the dotnet PAL under the flip, **73/74 pass** (the one non-pass, `regex`, is
   a deep allocator issue, not a class-level gap); 11+ class-level codegen fixes landed over the campaign.
