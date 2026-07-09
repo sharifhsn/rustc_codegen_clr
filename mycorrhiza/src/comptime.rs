@@ -85,6 +85,24 @@ pub fn rustc_codegen_clr_add_static_field_def<T, const FNAME: &'static str>(
     diverge!()
 }
 
+/// Declare one positional argument `T` that the base class's constructor requires — repeat once
+/// per argument, in order. Without this, `finish_type` always chains to a PARAMETERLESS base
+/// `.ctor()` (see `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md`'s Tier-C note on `extends=`: general
+/// base-class wrapping with a non-trivial constructor was flagged as unaddressed), which rejects
+/// at CLR load time for any base class without its own parameterless ctor (e.g. `DbContext`, or a
+/// hand-written C# base requiring config). Each declared arg becomes a LEADING parameter on this
+/// class's own synthesized ctor(s) (both the primary field-initializing ctor and the default
+/// ctor, if either exists) and is forwarded verbatim into `base::.ctor(arg0, arg1, …)` — the
+/// managed caller supplies the base-ctor values when constructing the derived instance; there is
+/// no way to compute them dynamically from Rust code inside the ctor (see this fn's module doc
+/// for why: comptime class-shape intrinsics only describe static metadata, they don't carry an
+/// interpretable expression body).
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_codegen_clr_add_base_ctor_arg<T>(class: ClassDef) -> ClassDef {
+    diverge!()
+}
+
 /// Add a virtual (instance) method `FNAME` aliasing the ordinary Rust fn `fn_type` (which takes the
 /// receiver as its first explicit argument).
 #[allow(unused_variables)]

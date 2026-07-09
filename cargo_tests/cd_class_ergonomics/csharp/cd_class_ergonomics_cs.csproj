@@ -17,5 +17,6 @@
 
   <ItemGroup>
     <RustCrate Include="../rustlib" />
+    <ProjectReference Include="../basecs/basecs.csproj" />
   </ItemGroup>
 </Project>

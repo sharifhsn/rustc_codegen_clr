@@ -39,6 +39,8 @@ cargo_tests/**/target/
 # these either, so make the exclusion explicit instead of relying on care alone).
 cargo_tests/**/csharp/bin/
 cargo_tests/**/csharp/obj/
+cargo_tests/**/basecs/bin/
+cargo_tests/**/basecs/obj/
 # .NET runtime config emitted by cargo-dotnet / the linker into the run dir
 .runtimeconfig.json
 *.runtimeconfig.json

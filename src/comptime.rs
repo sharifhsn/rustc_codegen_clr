@@ -53,6 +53,10 @@ struct PendingClass<'tcx> {
     /// separate list from `fields` above: static state is per-TYPE, not per-instance, so it never
     /// participates in the primary ctor's field-init parameter list.
     static_fields: Vec<(Type, String)>,
+    /// Positional argument types the base class's `.ctor` requires, in order
+    /// (`rustc_codegen_clr_add_base_ctor_arg`) — see that intrinsic's doc. Empty means "chain to a
+    /// parameterless base `.ctor()`", the historical default.
+    base_ctor_arg_types: Vec<Type>,
     /// `(managed_method_name, target_rust_fn)` — the virtual method aliases the Rust fn.
     methods: Vec<(String, Instance<'tcx>)>,
     /// `(managed_method_name, target_rust_fn)` — a `static` method aliasing the Rust fn (no receiver;
@@ -383,6 +387,7 @@ pub fn interpret<'tcx>(
                         superclass,
                         fields: vec![],
                         static_fields: vec![],
+                        base_ctor_arg_types: vec![],
                         methods: vec![],
                         static_methods: vec![],
                         interfaces: vec![],
@@ -419,6 +424,13 @@ pub fn interpret<'tcx>(
                     let tpe = get_type(field_ty, ctx);
                     let field_name = garg_to_string(subst_ref[1], ctx.tcx());
                     class.static_fields.push((tpe, field_name));
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_add_base_ctor_arg") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    let arg_ty = ctx.monomorphize(subst_ref[0].as_type().unwrap());
+                    let tpe = get_type(arg_ty, ctx);
+                    class.base_ctor_arg_types.push(tpe);
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_add_method_def") {
                     let src = operand_local(&args[0].node);
@@ -1610,7 +1622,14 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             // is `call instance void <base>::.ctor()`; typing the param as the derived type just lets
             // the inheritance-unaware CIL checker accept the `this` argument, which is a sound upcast
             // (a derived reference IS-A base reference).
-            let base_ctor_sig = ctx.sig([self_ty], Type::Void);
+            // `base_ctor_arg_types` (`rustc_codegen_clr_add_base_ctor_arg`, empty by default) makes
+            // the base ctor's signature `(this, arg0, arg1, …)` instead of just `(this)` — see that
+            // intrinsic's doc. Each declared arg becomes a LEADING parameter on every ctor this
+            // class synthesizes below, forwarded verbatim into the base call.
+            let n_base_args = class.base_ctor_arg_types.len();
+            let mut base_ctor_inputs = vec![self_ty];
+            base_ctor_inputs.extend(class.base_ctor_arg_types.iter().copied());
+            let base_ctor_sig = ctx.sig(base_ctor_inputs.clone(), Type::Void);
             let base_ctor_name = ctx.alloc_string(".ctor");
             let base_ctor = ctx.alloc_methodref(MethodRef::new(
                 base,
@@ -1620,22 +1639,30 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                 [].into(),
             ));
 
-            // Field-initializing primary ctor: `.ctor(this, field0, field1, …)`:
-            // `ldarg.0; call base::.ctor(); [ldarg.0; ldarg.{i+1}; stfld field_i;]* ret`.
+            // Field-initializing primary ctor: `.ctor(this, base_arg0…, field0, field1, …)`:
+            // `ldarg.0; call base::.ctor(base_args); [ldarg.0; ldarg.{i}; stfld field_i;]* ret`.
             if class.has_primary_ctor {
                 let mut inputs = vec![self_ty];
+                inputs.extend(class.base_ctor_arg_types.iter().copied());
                 inputs.extend(class.fields.iter().map(|(tpe, _)| *tpe));
                 let n_inputs = inputs.len();
                 let ctor_sig = ctx.sig(inputs, Type::Void);
-                let this = ctx.alloc_node(CILNode::LdArg(0));
-                let call_base = ctx.alloc_root(CILRoot::call(base_ctor, [this]));
+                // `this` plus `ldarg.{1..=n_base_args}`, forwarding the leading base-ctor-arg params.
+                let mut base_args = vec![ctx.alloc_node(CILNode::LdArg(0))];
+                for i in 0..n_base_args {
+                    base_args.push(ctx.alloc_node(CILNode::LdArg(
+                        u32::try_from(i + 1).expect("comptime: too many base ctor args"),
+                    )));
+                }
+                let call_base = ctx.alloc_root(CILRoot::call(base_ctor, base_args));
                 let mut roots = vec![call_base];
                 for (idx, (tpe, fname)) in class.fields.iter().enumerate() {
                     let fname = ctx.alloc_string(fname.clone());
                     let fdesc = ctx.alloc_field(FieldDesc::new(*class_idx, fname, *tpe));
                     let obj = ctx.alloc_node(CILNode::LdArg(0));
                     let value = ctx.alloc_node(CILNode::LdArg(
-                        u32::try_from(idx + 1).expect("comptime: too many ctor fields"),
+                        u32::try_from(n_base_args + idx + 1)
+                            .expect("comptime: too many ctor fields"),
                     ));
                     roots.push(ctx.alloc_root(CILRoot::SetField(Box::new((fdesc, obj, value)))));
                 }
@@ -1656,13 +1683,32 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                 ctx.new_method(ctor_def);
             }
 
-            // Parameterless default ctor `.ctor(this)`: `ldarg.0; call base::.ctor(); ret`. Emitted
-            // when explicitly requested, or implicitly whenever no primary ctor exists (so every
-            // reference class has at least one ctor). When BOTH exist they overload by arity.
+            // Default ctor `.ctor(this, base_arg0…)`: `ldarg.0; call base::.ctor(base_args); ret`.
+            // Not actually parameterless once `base_ctor_arg_types` is non-empty — the name is
+            // historical (it still means "no field-init params", just base-forwarding ones).
+            // Emitted when explicitly requested, or implicitly whenever no primary ctor exists (so
+            // every reference class has at least one ctor). When BOTH exist they overload by arity
+            // — UNLESS `n_base_args > 0` and `class.fields` is empty, in which case they'd collide
+            // (identical signatures); that combination is rejected below with a clear panic rather
+            // than silently emitting an invalid duplicate `.ctor`.
             if class.has_default_ctor || !class.has_primary_ctor {
-                let ctor_sig = ctx.sig([self_ty], Type::Void);
-                let this = ctx.alloc_node(CILNode::LdArg(0));
-                let call_base = ctx.alloc_root(CILRoot::call(base_ctor, [this]));
+                if class.has_primary_ctor && class.fields.is_empty() && n_base_args > 0 {
+                    panic!(
+                        "comptime: `{}` requests both a primary ctor and a default ctor, but with \
+                         `base_ctor_arg_types` set and no instance fields the primary ctor's \
+                         signature `(base_args…)` is identical to the default ctor's — drop one of \
+                         `has_default_ctor`/`has_primary_ctor`, or add at least one field",
+                        class.name
+                    );
+                }
+                let ctor_sig = ctx.sig(base_ctor_inputs, Type::Void);
+                let mut base_args = vec![ctx.alloc_node(CILNode::LdArg(0))];
+                for i in 0..n_base_args {
+                    base_args.push(ctx.alloc_node(CILNode::LdArg(
+                        u32::try_from(i + 1).expect("comptime: too many base ctor args"),
+                    )));
+                }
+                let call_base = ctx.alloc_root(CILRoot::call(base_ctor, base_args));
                 let ret = ctx.alloc_root(CILRoot::VoidRet);
                 let ctor_name = ctx.alloc_string(".ctor");
                 let ctor_def = MethodDef::new(
@@ -1675,7 +1721,7 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                         blocks: vec![BasicBlock::new(vec![call_base, ret], 0, None)],
                         locals: vec![],
                     },
-                    vec![None],
+                    vec![None; 1 + n_base_args],
                 );
                 ctx.new_method(ctor_def);
             }

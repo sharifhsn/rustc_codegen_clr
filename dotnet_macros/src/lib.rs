@@ -374,6 +374,11 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut attr_specs: Vec<AttrSpec> = Vec::new();
     // Static fields, one `static_field(NAME: Type)` entry each — see `StaticFieldSpec`'s doc.
     let mut static_field_specs: Vec<StaticFieldSpec> = Vec::new();
+    // `base_ctor_args(Type1, Type2, ...)` — positional types the base class's `.ctor` requires, in
+    // order. See `rustc_codegen_clr_add_base_ctor_arg`'s doc for why these are types only (no
+    // values): a comptime class-shape entrypoint describes static metadata, it can't carry an
+    // interpretable expression for "what value to pass" — the managed caller supplies the values.
+    let mut base_ctor_arg_types: Vec<Type> = Vec::new();
     if !attr.is_empty() {
         let parser = Punctuated::<syn::Meta, Token![,]>::parse_terminated;
         let metas = match syn::parse::Parser::parse(parser, attr) {
@@ -409,11 +414,19 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                     continue;
                 }
+                syn::Meta::List(list) if list.path.is_ident("base_ctor_args") => {
+                    match list.parse_args_with(Punctuated::<Type, Token![,]>::parse_terminated) {
+                        Ok(types) => base_ctor_arg_types.extend(types),
+                        Err(e) => return e.to_compile_error().into(),
+                    }
+                    continue;
+                }
                 _ => {
                     return syn::Error::new(
                         meta.span(),
                         "#[dotnet_class]: expected `key = \"...\"`, `attr(\"[Asm]Ns.Type\", \
-                         args(...), props(...))`, or `static_field(NAME: Type)`",
+                         args(...), props(...))`, `static_field(NAME: Type)`, or \
+                         `base_ctor_args(Type, ...)`",
                     )
                     .to_compile_error()
                     .into();
@@ -581,6 +594,13 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     });
 
+    // One `add_base_ctor_arg::<Type>` per `base_ctor_args(...)` entry, in declared order.
+    let base_ctor_arg_calls = base_ctor_arg_types.iter().map(|ty| {
+        quote! {
+            let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_base_ctor_arg::<#ty>(class);
+        }
+    });
+
     // Optional extras, gated on the attribute flags: a parameterless default ctor (overloading the
     // primary ctor) and a `set_<field>` mutator per field (paired with the `read_<field>` accessor).
     let default_ctor_call = if default_ctor {
@@ -630,6 +650,7 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                 >();
                 #(#field_calls)*
                 #(#static_field_calls)*
+                #(#base_ctor_arg_calls)*
                 #(#interface_calls)*
                 #(#attr_calls)*
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_primary_ctor(class);

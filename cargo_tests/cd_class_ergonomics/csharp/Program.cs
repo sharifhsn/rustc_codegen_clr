@@ -1,6 +1,7 @@
-// C# consumes two new #[dotnet_class] capabilities: real static fields, and real operator
-// overloads (SpecialName-bound +/==/!=).
+// C# consumes three new #[dotnet_class] capabilities: real static fields, real operator
+// overloads (SpecialName-bound +/==/!=), and base constructors that take arguments.
 using System;
+using CdClassErgonomicsBase;
 
 public static class Program
 {
@@ -33,6 +34,11 @@ public static class Program
         Check("a == c (real == syntax)", a == c, true);
         Check("a != b (real != syntax)", a != b, true);
         Check("a == b", a == b, false);
+
+        // ---- Base constructors that take arguments ----
+        Gadget g = Gadget.make_gadget(42, 7);
+        Check("Gadget(42, 7).Seed (forwarded to Widget's base ctor)", ((Widget)g).Seed, 42);
+        Check("Gadget(42, 7).get_tag() (own field)", g.get_tag(), 7);
 
         Console.WriteLine(pass == total ? "PASS" : $"FAIL ({pass}/{total})");
         return pass == total ? 0 : 1;

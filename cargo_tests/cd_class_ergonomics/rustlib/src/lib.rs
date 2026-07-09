@@ -1,10 +1,13 @@
-//! Proof for two new `#[dotnet_class]` capabilities:
+//! Proof for three new `#[dotnet_class]` capabilities:
 //!   1. Real `static` fields (`static_field(NAME: Type)`) — a genuine public `.NET` static field,
 //!      directly visible from C# as `ClassName.Name`, plus synthesized `get_Name`/`set_Name`
 //!      static methods so Rust code can read/write it too.
 //!   2. Real operator overloads (`op_Addition`, `op_Equality`, …) — a `#[dotnet_methods]` static
 //!      method with one of the reserved CLR operator names now gets `SpecialName` stamped, so C#
 //!      binds `+`/`==` syntax to it (not just the literal `X.op_Addition(a, b)` call).
+//!   3. Base constructors that take arguments (`base_ctor_args(Type, ...)`) — subclassing a base
+//!      whose `.ctor` isn't parameterless, chaining the caller-supplied values through instead of
+//!      always calling a parameterless `base()`.
 #![feature(adt_const_params, unsized_const_params)]
 #![allow(internal_features, incomplete_features)]
 
@@ -70,5 +73,28 @@ impl Vector2 {
     /// `a != b` — C# requires both `op_Equality`/`op_Inequality` together when either is defined.
     pub fn op_Inequality(a: Vector2Handle, b: Vector2Handle) -> bool {
         !Self::op_Equality(a, b)
+    }
+}
+
+// ---- 3. Base constructors that take arguments ----
+
+/// Extends `Widget(int seed)` — a base class with NO parameterless `.ctor` — via
+/// `base_ctor_args(i32)`. The primary ctor becomes `.ctor(seed, tag)`, forwarding `seed` into
+/// `base(seed)` and storing `tag` in its own field, proving both halves compose.
+#[dotnet_class(
+    extends = "[cd_class_ergonomics_basecs]CdClassErgonomicsBase.Widget",
+    base_ctor_args(i32)
+)]
+pub struct Gadget {
+    tag: i32,
+}
+
+#[dotnet_methods]
+impl Gadget {
+    pub fn make_gadget(seed: i32, tag: i32) -> GadgetHandle {
+        GadgetHandle::ctor2::<i32, i32>(seed, tag)
+    }
+    pub fn get_tag(this: GadgetHandle) -> i32 {
+        this.instance0::<"read_tag", i32>()
     }
 }
