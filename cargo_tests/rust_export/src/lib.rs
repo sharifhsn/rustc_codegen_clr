@@ -171,3 +171,21 @@ pub extern "C" fn try_div(a: i32, b: i32) -> i32 {
         None => mycorrhiza::intrinsics::rustc_clr_interop_throw::<"try_div: division by zero">(),
     }
 }
+
+/// A *different* magic fn than `try_div`'s `rustc_clr_interop_throw` — this one raises via an ordinary
+/// `castclass` (`rustc_clr_interop_managed_checked_cast`), not an explicit `throw`. Forces a real
+/// `System.String` to be cast to `System.Exception`, which the CLR legitimately rejects with
+/// `InvalidCastException`. Proves the FailFast-vs-propagate fix generalizes across magic-fn *families*,
+/// not just the one (`MANAGED_THROW`) it was first found and fixed on.
+#[no_mangle]
+pub extern "C" fn bad_cast() -> i32 {
+    let s: mycorrhiza::system::MString = "hello".into();
+    let obj: mycorrhiza::bindings::System::Object =
+        mycorrhiza::intrinsics::rustc_clr_interop_managed_checked_cast(s);
+    let bad: mycorrhiza::intrinsics::RustcCLRInteropManagedClass<
+        "System.Private.CoreLib",
+        "System.Exception",
+    > = mycorrhiza::intrinsics::rustc_clr_interop_managed_checked_cast(obj);
+    // Force the cast to be observed so the optimizer can't DCE it away.
+    bad.instance0::<"GetHashCode", i32>()
+}

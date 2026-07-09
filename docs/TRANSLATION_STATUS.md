@@ -601,9 +601,20 @@ direction (C# imports a Rust library and calls its functions, §6). What remains
   rustc's MIR builder attaches an `UnwindAction::Terminate` edge to this call site (an ordinary Rust fn
   call, as far as rustc knows, inside a nounwind `extern "C"` fn), and `basic_block.rs` was wrapping it
   in the same FailFast catch-guard a genuinely escaped panic needs — exactly backwards for a call the
-  backend substitutes with an intentional managed `throw`. Fixed by exempting `rustc_clr_interop_throw`
-  specifically from that guard; back to 15/15, `cargo_tests/term_abort`'s genuine-panic-abort case
-  confirmed unaffected). **WF-8f DONE**: `Option<T>` return ->
+  backend substitutes with an intentional managed `throw`. First fixed narrowly (exempting
+  `rustc_clr_interop_throw` specifically), then confirmed the bug generalizes to *every* magic interop
+  fn — `rustc_clr_interop_managed_checked_cast`'s legitimate `InvalidCastException` FailFast'd the same
+  way inside a raw `extern "C" fn` — and fixed for all of them at once by classifying the call via the
+  same canonical `classify_magic_fn` (see below) instead of one hand-picked name. `cargo_tests/rust_export_cs`
+  now 16/16 (added a `bad_cast` check exercising `_managed_checked_cast`), `cargo_tests/term_abort`'s
+  genuine-panic-abort case confirmed unaffected, `cd_generic`/`cd_delegates` unaffected (18/18, 14/14)).
+  Also, while investigating: consolidated the "magic fn" recognition mechanism (previously three
+  independently hand-copied name lists — one of which, `is_magic_fn`'s codegen-skip gate, had already
+  drifted out of sync, missing 9 of 18 families — and substring-matched against the mangled call-site
+  symbol name, which required careful check-ordering to avoid false collisions) into one canonical
+  `classify_magic_fn(tcx, def_id)` in `src/utilis/mod.rs`, matched by exact `DefId`/declaration-path
+  instead. `assembly.rs`'s skip-gate, `call.rs`'s substitution dispatch, and `basic_block.rs`'s
+  unwind-boundary guard all consume it now. **WF-8f DONE**: `Option<T>` return ->
   `System.Nullable<T>`/`T?` (an exported fn computes an ordinary `Option<T>` and calls `.into()` at the
   boundary — `mycorrhiza::nullable::Nullable<T>` was already a real, already-FFI-safe `Nullable<T>`
   wrapper, just never wired into `#[dotnet_export]`'s return path) and managed `T[]` return (an exported

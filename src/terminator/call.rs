@@ -2,12 +2,8 @@ use crate::{
     assembly::MethodCompileCtx,
     interop::AssemblyRef,
     utilis::{
-        garg_to_bool, CTOR_FN_NAME, DELEGATE_CLOSURE_FN_NAME, DELEGATE_FN_NAME, GENERIC_CALL_FN_NAME,
-        GENERIC_METHOD_CALL_FN_NAME, GENERIC_CTOR_FN_NAME,
-        MANAGED_BOX, MANAGED_CALL_FN_NAME, MANAGED_CALL_VIRT_FN_NAME, MANAGED_CHECKED_CAST,
-        MANAGED_IS_INST, MANAGED_LD_ELEM_REF, MANAGED_LD_LEN, MANAGED_LD_NULL, MANAGED_NEW_ARR,
-        MANAGED_SET_ELEM,
-        MANAGED_THROW, MANAGED_TRY_CATCH,
+        classify_magic_fn, garg_to_bool, MagicFn, CTOR_FN_NAME, MANAGED_CALL_FN_NAME,
+        MANAGED_CALL_VIRT_FN_NAME,
     },
 };
 use cilly::{
@@ -1146,12 +1142,11 @@ pub fn call_closure<'tcx>(
     }
 }
 /// Dispatches a resolved MIR call: vtable calls for `InstanceKind::Virtual`, no-ops for drop
-/// glue on types with nothing to drop, then plain function calls — except when `function_name`
-/// contains one of the magic markers imported from `utilis` (`MANAGED_CALL_FN_NAME`,
-/// `GENERIC_CALL_FN_NAME`, `DELEGATE_FN_NAME`, `GENERIC_CTOR_FN_NAME`, ...), each of which is a
-/// distinct hand-written call shape for a mycorrhiza/interop intrinsic rather than a real MIR
-/// function; those are matched by substring on the mangled name, so branch order here matters
-/// where one marker is a substring of another (see the ordering comments at each `contains` check).
+/// glue on types with nothing to drop, then plain function calls — except when `instance` is one of
+/// the magic interop fns [`classify_magic_fn`] recognizes, each of which is a distinct hand-written
+/// call shape for a mycorrhiza/interop intrinsic rather than a real MIR function. Classification is by
+/// exact `DefId`, not by matching the mangled call-site name, so (unlike the old substring-based
+/// dispatch) branch order here no longer matters.
 pub fn call_inner<'tcx>(
     fn_type: Ty<'tcx>,
     instance: Instance<'tcx>,
@@ -1287,205 +1282,228 @@ pub fn call_inner<'tcx>(
         );
     }
     let mut signature = call_info.sig().clone();
-    // Checks if function is "magic"
-    if function_name.contains(GENERIC_CTOR_FN_NAME) {
-        assert!(
-            !call_info.split_last_tuple(),
-            "Generic constructors may not use the `rust_call` calling convention!"
-        );
-        // WF-9: `new List<i32>()` and friends.
-        return vec![ctor_generic(instance.args, args, destination, ctx)];
-    } else if function_name.contains(GENERIC_METHOD_CALL_FN_NAME) {
-        // Checked BEFORE `GENERIC_CALL_FN_NAME` for clarity (the names don't actually collide —
-        // `_generic_method_call` doesn't contain `_generic_call`).
-        assert!(
-            !call_info.split_last_tuple(),
-            "Generic method calls may not use the `rust_call` calling convention!"
-        );
-        // WF-9: `Activator.CreateInstance<T>()`, `Deserialize<T>(…)`, `GetService<T>()` and friends.
-        return vec![call_gmethod(instance.args, args, destination, ctx)];
-    } else if function_name.contains(GENERIC_CALL_FN_NAME) {
-        assert!(
-            !call_info.split_last_tuple(),
-            "Generic managed calls may not use the `rust_call` calling convention!"
-        );
-        // WF-9: `List<i32>::Add(…)` and friends.
-        return vec![call_generic(instance.args, args, destination, ctx)];
-    } else if function_name.contains(DELEGATE_CLOSURE_FN_NAME) {
-        // Checked BEFORE `DELEGATE_FN_NAME` — `delegate_closure` CONTAINS `delegate`.
-        assert!(
-            !call_info.split_last_tuple(),
-            "Closure delegate construction may not use the `rust_call` calling convention!"
-        );
-        return vec![delegate_from_closure(instance.args, args, destination, ctx)];
-    } else if function_name.contains(DELEGATE_FN_NAME) {
-        assert!(
-            !call_info.split_last_tuple(),
-            "Delegate construction may not use the `rust_call` calling convention!"
-        );
-        // Delegates & callbacks: wrap a Rust `extern` fn pointer into a managed `Action`/`Func`.
-        return vec![delegate_from_fnptr(instance.args, args, destination, ctx)];
-    } else if function_name.contains(MANAGED_THROW) {
-        // `rustc_clr_interop_throw::<MSG>()` raises a managed `System.Exception(MSG)` directly (via the
-        // `throw` IL op), so a .NET caller can `catch` it. Unlike a Rust `panic!` — which goes through
-        // the unwinder and faults when it reaches a managed frame — this is an ordinary managed throw.
-        // The fn returns `!`, so there is no destination; `throw` is a terminal op (the caller appends
-        // the usual "diverging call returned" guard after it, exactly as for `panic!`).
-        let msg = garg_to_string(instance.args[0], ctx.tcx());
-        return vec![ctx.throw_msg(&msg)];
-    } else if function_name.contains(CTOR_FN_NAME) {
-        assert!(
-            !call_info.split_last_tuple(),
-            "Constructors may not use the `rust_call` calling convention!"
-        );
-        // Constructor
-        return vec![call_ctor(
-            instance.args,
-            &function_name,
-            args,
-            destination,
-            ctx,
-        )];
-    } else if function_name.contains(MANAGED_CALL_VIRT_FN_NAME) {
-        assert!(
-            !call_info.split_last_tuple(),
-            "Managed virtual calls may not use the `rust_call` calling convention!"
-        );
-        // Virtual (for interop)
-        return vec![callvirt_managed(
-            instance.args,
-            &function_name,
-            args,
-            destination,
-            instance,
-            ctx,
-        )];
-    } else if function_name.contains(MANAGED_CALL_FN_NAME) {
-        assert!(
-            !call_info.split_last_tuple(),
-            "Managed calls may not use the `rust_call` calling convention!"
-        );
-        // Not-Virtual (for interop)
-        return vec![call_managed(
-            instance.args,
-            &function_name,
-            args,
-            destination,
-            instance,
-            ctx,
-        )];
-    } else if function_name.contains(MANAGED_LD_LEN) {
-        assert!(
-            !call_info.split_last_tuple(),
-            "Managed calls may not use the `rust_call` calling convention!"
-        );
-        // Not-Virtual (for interop)
-        let arr = handle_operand(&args[0].node, ctx);
-        let len = ctx.ld_len(arr);
-        return vec![place_set(destination, len, ctx)];
-    } else if function_name.contains(MANAGED_LD_NULL) {
-        assert!(
-            !call_info.split_last_tuple(),
-            "Managed calls may not use the `rust_call` calling convention!"
-        );
-        // Not-Virtual (for interop)
-        let tpe = ctx
-            .type_from_cache(instance.args[0].as_type().unwrap())
-            .as_class_ref()
-            .unwrap();
+    // Checks if function is "magic" — classified by exact `DefId`, not by matching the mangled
+    // `function_name`; see `classify_magic_fn`'s doc comment for why that's the safer mechanism.
+    // `function_name` is still threaded into several arms below (`call_ctor`, `callvirt_managed`,
+    // `call_managed`) because *those* still parse the concrete arity digit back out of it via
+    // `argc_from_fn_name` — that's a self-contained detail of decoding a compiler-mangled name, not a
+    // magic-fn-identification hazard.
+    if let Some(magic) = classify_magic_fn(ctx.tcx(), instance.def_id()) {
+        match magic {
+            MagicFn::GenericCtor => {
+                assert!(
+                    !call_info.split_last_tuple(),
+                    "Generic constructors may not use the `rust_call` calling convention!"
+                );
+                // WF-9: `new List<i32>()` and friends.
+                return vec![ctor_generic(instance.args, args, destination, ctx)];
+            }
+            MagicFn::GenericMethodCall => {
+                assert!(
+                    !call_info.split_last_tuple(),
+                    "Generic method calls may not use the `rust_call` calling convention!"
+                );
+                // WF-9: `Activator.CreateInstance<T>()`, `Deserialize<T>(…)`, `GetService<T>()` and friends.
+                return vec![call_gmethod(instance.args, args, destination, ctx)];
+            }
+            MagicFn::GenericCall => {
+                assert!(
+                    !call_info.split_last_tuple(),
+                    "Generic managed calls may not use the `rust_call` calling convention!"
+                );
+                // WF-9: `List<i32>::Add(…)` and friends.
+                return vec![call_generic(instance.args, args, destination, ctx)];
+            }
+            MagicFn::DelegateClosure => {
+                assert!(
+                    !call_info.split_last_tuple(),
+                    "Closure delegate construction may not use the `rust_call` calling convention!"
+                );
+                return vec![delegate_from_closure(instance.args, args, destination, ctx)];
+            }
+            MagicFn::Delegate => {
+                assert!(
+                    !call_info.split_last_tuple(),
+                    "Delegate construction may not use the `rust_call` calling convention!"
+                );
+                // Delegates & callbacks: wrap a Rust `extern` fn pointer into a managed `Action`/`Func`.
+                return vec![delegate_from_fnptr(instance.args, args, destination, ctx)];
+            }
+            MagicFn::Throw => {
+                // `rustc_clr_interop_throw::<MSG>()` raises a managed `System.Exception(MSG)` directly (via
+                // the `throw` IL op), so a .NET caller can `catch` it. Unlike a Rust `panic!` — which goes
+                // through the unwinder and faults when it reaches a managed frame — this is an ordinary
+                // managed throw. The fn returns `!`, so there is no destination; `throw` is a terminal op
+                // (the caller appends the usual "diverging call returned" guard after it, as for `panic!`).
+                let msg = garg_to_string(instance.args[0], ctx.tcx());
+                return vec![ctx.throw_msg(&msg)];
+            }
+            MagicFn::Ctor => {
+                assert!(
+                    !call_info.split_last_tuple(),
+                    "Constructors may not use the `rust_call` calling convention!"
+                );
+                // Constructor
+                return vec![call_ctor(
+                    instance.args,
+                    &function_name,
+                    args,
+                    destination,
+                    ctx,
+                )];
+            }
+            MagicFn::ManagedCallVirt => {
+                assert!(
+                    !call_info.split_last_tuple(),
+                    "Managed virtual calls may not use the `rust_call` calling convention!"
+                );
+                // Virtual (for interop)
+                return vec![callvirt_managed(
+                    instance.args,
+                    &function_name,
+                    args,
+                    destination,
+                    instance,
+                    ctx,
+                )];
+            }
+            MagicFn::ManagedCall => {
+                assert!(
+                    !call_info.split_last_tuple(),
+                    "Managed calls may not use the `rust_call` calling convention!"
+                );
+                // Not-Virtual (for interop)
+                return vec![call_managed(
+                    instance.args,
+                    &function_name,
+                    args,
+                    destination,
+                    instance,
+                    ctx,
+                )];
+            }
+            MagicFn::LdLen => {
+                assert!(
+                    !call_info.split_last_tuple(),
+                    "Managed calls may not use the `rust_call` calling convention!"
+                );
+                // Not-Virtual (for interop)
+                let arr = handle_operand(&args[0].node, ctx);
+                let len = ctx.ld_len(arr);
+                return vec![place_set(destination, len, ctx)];
+            }
+            MagicFn::LdNull => {
+                assert!(
+                    !call_info.split_last_tuple(),
+                    "Managed calls may not use the `rust_call` calling convention!"
+                );
+                // Not-Virtual (for interop)
+                let tpe = ctx
+                    .type_from_cache(instance.args[0].as_type().unwrap())
+                    .as_class_ref()
+                    .unwrap();
 
-        let node = ctx.alloc_node(Const::Null(tpe));
-        return vec![place_set(destination, node, ctx)];
-    } else if function_name.contains(MANAGED_CHECKED_CAST) {
-        let tpe = ctx
-            .type_from_cache(instance.args[0].as_type().unwrap())
-            .as_class_ref()
-            .unwrap();
-        let input = handle_operand(&args[0].node, ctx);
-        // Not-Virtual (for interop)
-        let node = ctx.checked_cast(input, tpe);
-        return vec![place_set(destination, node, ctx)];
-    } else if function_name.contains(MANAGED_IS_INST) {
-        let tpe = ctx
-            .type_from_cache(instance.args[0].as_type().unwrap())
-            .as_class_ref()
-            .unwrap();
-        let input = handle_operand(&args[0].node, ctx);
-        // Not-Virtual (for interop)
-        let node = ctx.is_inst(input, tpe);
-        return vec![place_set(destination, node, ctx)];
-    } else if function_name.contains(MANAGED_BOX) {
-        // Boxes the value of type `T` (the intrinsic's type generic) into `System.Object` (`box T`).
-        // The typechecker enforces that `T` is a value type.
-        let tpe = ctx.type_from_cache(instance.args[0].as_type().unwrap());
-        let tpe = ctx.alloc_type(tpe);
-        let value = handle_operand(&args[0].node, ctx);
-        let node = ctx.box_value(value, tpe);
-        return vec![place_set(destination, node, ctx)];
-    } else if function_name.contains(MANAGED_LD_ELEM_REF) {
-        assert!(
-            !call_info.split_last_tuple(),
-            "Managed calls may not use the `rust_call` calling convention!"
-        );
-        // Not-Virtual (for interop)
-        let arr = handle_operand(&args[0].node, ctx);
-        let idx = handle_operand(&args[1].node, ctx);
-        let node = ctx.ld_elem_ref(arr, idx);
-        return vec![place_set(destination, node, ctx)];
-    } else if function_name.contains(MANAGED_NEW_ARR) {
-        assert!(
-            !call_info.split_last_tuple(),
-            "Managed calls may not use the `rust_call` calling convention!"
-        );
-        // Allocates a managed 1-D array of the (primitive) element type `T` with `len` elements.
-        // The element type is the first generic argument of the intrinsic.
-        let elem = ctx.type_from_cache(instance.args[0].as_type().unwrap());
-        let elem = ctx.alloc_type(elem);
-        let len = handle_operand(&args[0].node, ctx);
-        let node = ctx.new_arr(elem, len);
-        return vec![place_set(destination, node, ctx)];
-    } else if function_name.contains(MANAGED_SET_ELEM) {
-        assert!(
-            !call_info.split_last_tuple(),
-            "Managed calls may not use the `rust_call` calling convention!"
-        );
-        // Stores `val` into managed array `arr` at `idx`. Side-effecting; destination is unit.
-        let elem = ctx.type_from_cache(instance.args[0].as_type().unwrap());
-        let elem = ctx.alloc_type(elem);
-        let arr = handle_operand(&args[0].node, ctx);
-        let idx = handle_operand(&args[1].node, ctx);
-        let val = handle_operand(&args[2].node, ctx);
-        let root = ctx.st_elem(arr, idx, val, elem);
-        let root = ctx.alloc_root(root);
-        return vec![root];
-    } else if function_name.contains(MANAGED_TRY_CATCH) {
-        assert!(
-            !call_info.split_last_tuple(),
-            "Managed calls may not use the `rust_call` calling convention!"
-        );
-        // `try_catch(try_fn, data, catch_fn) -> i32`: run `try_fn(data)` inside a CIL
-        // try/catch that catches *any* .NET exception (the `interop_try_catch` builtin),
-        // returning 0 on normal completion and 1 if an exception was caught (after running
-        // `catch_fn(data)`). Unlike `catch_unwind`, this catches foreign/BCL exceptions.
-        let try_fn = handle_operand(&args[0].node, ctx);
-        let data_ptr = handle_operand(&args[1].node, ctx);
-        let catch_fn = handle_operand(&args[2].node, ctx);
-        let uint8_ptr = ctx.nptr(Type::Int(Int::U8));
-        let try_ptr = ctx.sig([uint8_ptr], Type::Void);
-        let catch_ptr = ctx.sig([uint8_ptr], Type::Void);
-        let try_catch = MethodRef::new(
-            *ctx.main_module(),
-            ctx.alloc_string("interop_try_catch"),
-            ctx.sig(
-                [Type::FnPtr(try_ptr), uint8_ptr, Type::FnPtr(catch_ptr)],
-                Type::Int(Int::I32),
-            ),
-            MethodKind::Static,
-            vec![].into(),
-        );
-        let try_catch = ctx.alloc_methodref(try_catch);
-        let node = ctx.call(try_catch, &[try_fn, data_ptr, catch_fn], IsPure::NOT);
-        return vec![place_set(destination, node, ctx)];
+                let node = ctx.alloc_node(Const::Null(tpe));
+                return vec![place_set(destination, node, ctx)];
+            }
+            MagicFn::CheckedCast => {
+                let tpe = ctx
+                    .type_from_cache(instance.args[0].as_type().unwrap())
+                    .as_class_ref()
+                    .unwrap();
+                let input = handle_operand(&args[0].node, ctx);
+                // Not-Virtual (for interop)
+                let node = ctx.checked_cast(input, tpe);
+                return vec![place_set(destination, node, ctx)];
+            }
+            MagicFn::IsInst => {
+                let tpe = ctx
+                    .type_from_cache(instance.args[0].as_type().unwrap())
+                    .as_class_ref()
+                    .unwrap();
+                let input = handle_operand(&args[0].node, ctx);
+                // Not-Virtual (for interop)
+                let node = ctx.is_inst(input, tpe);
+                return vec![place_set(destination, node, ctx)];
+            }
+            MagicFn::Box => {
+                // Boxes the value of type `T` (the intrinsic's type generic) into `System.Object` (`box T`).
+                // The typechecker enforces that `T` is a value type.
+                let tpe = ctx.type_from_cache(instance.args[0].as_type().unwrap());
+                let tpe = ctx.alloc_type(tpe);
+                let value = handle_operand(&args[0].node, ctx);
+                let node = ctx.box_value(value, tpe);
+                return vec![place_set(destination, node, ctx)];
+            }
+            MagicFn::LdElemRef => {
+                assert!(
+                    !call_info.split_last_tuple(),
+                    "Managed calls may not use the `rust_call` calling convention!"
+                );
+                // Not-Virtual (for interop)
+                let arr = handle_operand(&args[0].node, ctx);
+                let idx = handle_operand(&args[1].node, ctx);
+                let node = ctx.ld_elem_ref(arr, idx);
+                return vec![place_set(destination, node, ctx)];
+            }
+            MagicFn::NewArr => {
+                assert!(
+                    !call_info.split_last_tuple(),
+                    "Managed calls may not use the `rust_call` calling convention!"
+                );
+                // Allocates a managed 1-D array of the (primitive) element type `T` with `len` elements.
+                // The element type is the first generic argument of the intrinsic.
+                let elem = ctx.type_from_cache(instance.args[0].as_type().unwrap());
+                let elem = ctx.alloc_type(elem);
+                let len = handle_operand(&args[0].node, ctx);
+                let node = ctx.new_arr(elem, len);
+                return vec![place_set(destination, node, ctx)];
+            }
+            MagicFn::SetElem => {
+                assert!(
+                    !call_info.split_last_tuple(),
+                    "Managed calls may not use the `rust_call` calling convention!"
+                );
+                // Stores `val` into managed array `arr` at `idx`. Side-effecting; destination is unit.
+                let elem = ctx.type_from_cache(instance.args[0].as_type().unwrap());
+                let elem = ctx.alloc_type(elem);
+                let arr = handle_operand(&args[0].node, ctx);
+                let idx = handle_operand(&args[1].node, ctx);
+                let val = handle_operand(&args[2].node, ctx);
+                let root = ctx.st_elem(arr, idx, val, elem);
+                let root = ctx.alloc_root(root);
+                return vec![root];
+            }
+            MagicFn::TryCatch => {
+                assert!(
+                    !call_info.split_last_tuple(),
+                    "Managed calls may not use the `rust_call` calling convention!"
+                );
+                // `try_catch(try_fn, data, catch_fn) -> i32`: run `try_fn(data)` inside a CIL
+                // try/catch that catches *any* .NET exception (the `interop_try_catch` builtin),
+                // returning 0 on normal completion and 1 if an exception was caught (after running
+                // `catch_fn(data)`). Unlike `catch_unwind`, this catches foreign/BCL exceptions.
+                let try_fn = handle_operand(&args[0].node, ctx);
+                let data_ptr = handle_operand(&args[1].node, ctx);
+                let catch_fn = handle_operand(&args[2].node, ctx);
+                let uint8_ptr = ctx.nptr(Type::Int(Int::U8));
+                let try_ptr = ctx.sig([uint8_ptr], Type::Void);
+                let catch_ptr = ctx.sig([uint8_ptr], Type::Void);
+                let try_catch = MethodRef::new(
+                    *ctx.main_module(),
+                    ctx.alloc_string("interop_try_catch"),
+                    ctx.sig(
+                        [Type::FnPtr(try_ptr), uint8_ptr, Type::FnPtr(catch_ptr)],
+                        Type::Int(Int::I32),
+                    ),
+                    MethodKind::Static,
+                    vec![].into(),
+                );
+                let try_catch = ctx.alloc_methodref(try_catch);
+                let node = ctx.call(try_catch, &[try_fn, data_ptr, catch_fn], IsPure::NOT);
+                return vec![place_set(destination, node, ctx)];
+            }
+        }
     }
     if call_info.split_last_tuple() {
         return vec![call_closure(

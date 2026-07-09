@@ -76,6 +76,13 @@ public static class Program
         catch (Exception) { threw = true; }
         Check("try_div(1,0) -> C# catch", threw, true, ref pass, ref total);
 
+        // A DIFFERENT magic fn (checked_cast, not throw) legitimately raising InvalidCastException —
+        // must ALSO propagate as a catchable exception, not FailFast the whole process.
+        bool castThrew = false;
+        try { MainModule.bad_cast(); }
+        catch (InvalidCastException) { castThrew = true; }
+        Check("bad_cast() -> C# catch InvalidCastException", castThrew, true, ref pass, ref total);
+
         Console.WriteLine(pass == total ? "PASS" : $"FAIL ({pass}/{total})");
         return pass == total ? 0 : 1;
     }

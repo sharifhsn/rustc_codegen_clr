@@ -6,53 +6,124 @@ use rustc_middle::ty::{
 };
 
 pub mod adt;
+/// The common prefix of `rustc_clr_interop_managed_ctor{0,1,2,3}_` — still needed (unlike every other
+/// magic-fn name constant this module used to export) because `call_ctor` parses the arity digit back
+/// out of the mangled call-site symbol via [`crate::terminator::call::argc_from_fn_name`]. Recognizing
+/// *which* fn is magic no longer goes through this constant — see [`classify_magic_fn`].
 pub const CTOR_FN_NAME: &str = "rustc_clr_interop_managed_ctor";
+/// See [`CTOR_FN_NAME`] — same reason (`call_managed`'s arity parsing), same caveat.
 pub const MANAGED_CALL_FN_NAME: &str = "rustc_clr_interop_managed_call";
+/// See [`CTOR_FN_NAME`] — same reason (`callvirt_managed`'s arity parsing), same caveat.
 pub const MANAGED_CALL_VIRT_FN_NAME: &str = "rustc_clr_interop_managed_call_virt";
-pub const MANAGED_LD_LEN: &str = "rustc_clr_interop_managed_ld_len";
-pub const MANAGED_LD_NULL: &str = "rustc_clr_interop_managed_ld_null";
-pub const MANAGED_CHECKED_CAST: &str = "rustc_clr_interop_managed_checked_cast";
-pub const MANAGED_IS_INST: &str = "rustc_clr_interop_managed_is_inst";
-pub const MANAGED_LD_ELEM_REF: &str = "rustc_clr_interop_managed_ld_elem_ref";
-pub const MANAGED_NEW_ARR: &str = "rustc_clr_interop_managed_new_arr";
-pub const MANAGED_SET_ELEM: &str = "rustc_clr_interop_managed_set_elem";
-/// Boxes a value type into `System.Object` (the .NET `box` instruction).
-pub const MANAGED_BOX: &str = "rustc_clr_interop_box";
-pub const MANAGED_TRY_CATCH: &str = "rustc_clr_interop_try_catch";
-/// Calls a method on a *generic* .NET instantiation (e.g. `List<i32>::Add`). Unlike the
-/// `rustc_clr_interop_managed_*` family, the target class carries concrete generic arguments and the
-/// method signature is described in its *definition* shape (`!N`/`!!N` markers) — see WF-9.
-pub const GENERIC_CALL_FN_NAME: &str = "rustc_clr_interop_generic_call";
-/// Constructs a managed object of a *generic* .NET instantiation (e.g. `new List<i32>()`).
-pub const GENERIC_CTOR_FN_NAME: &str = "rustc_clr_interop_generic_ctor";
-/// Calls a *generic method* (`!!N`) — a method that itself takes type arguments, e.g.
-/// `Activator.CreateInstance<T>()`, `JsonSerializer.Deserialize<T>(s)`, `provider.GetService<T>()`.
-/// Unlike [`GENERIC_CALL_FN_NAME`] (a method on a generic *type*), the type arguments live on the
-/// method: the emitted methodref carries them (`Method<int32>`) and the signature uses `!!N` markers.
-/// (Note: does NOT collide with the `_generic_call` substring — `_generic_method_call` differs.)
-pub const GENERIC_METHOD_CALL_FN_NAME: &str = "rustc_clr_interop_generic_method_call";
-/// Raises a managed `System.Exception` directly (so a .NET caller can `catch` it) — distinct from a
-/// Rust `panic!`, which goes through the unwinder and does not propagate cleanly out to managed callers.
-pub const MANAGED_THROW: &str = "rustc_clr_interop_throw";
-/// Wraps a Rust `extern` fn pointer into a managed .NET **delegate** instance (e.g. `Action<T>` /
-/// `Func<T, R>`), so a Rust callback can be handed to any .NET API that takes a delegate (LINQ,
-/// `List.ForEach`, a sort comparator, an event `add_*`). The pointer is a plain native `FnPtr` by the
-/// time it reaches the call site (a capture-less closure / `fn` item is coerced to one), so the
-/// backend builds a small managed *shim* class holding the pointer whose `Invoke` `calli`s it, then
-/// `newobj`s the real generic delegate over `ldftn shim::Invoke`. See `delegate_from_fnptr`.
-pub const DELEGATE_FN_NAME: &str = "rustc_clr_interop_delegate";
-/// Like [`DELEGATE_FN_NAME`] but for a **capturing** closure: the shim holds a boxed-environment
-/// pointer AND a trampoline fn pointer, and `Invoke` prepends the env before the `calli`. NOTE: the
-/// name CONTAINS `rustc_clr_interop_delegate`, so the dispatch must check this substring FIRST.
-pub const DELEGATE_CLOSURE_FN_NAME: &str = "rustc_clr_interop_delegate_closure";
-pub fn is_magic_fn(name: &str) -> bool {
-    name.contains(CTOR_FN_NAME)
-        || name.contains(MANAGED_CALL_FN_NAME)
-        || name.contains(MANAGED_THROW)
-        || name.contains(GENERIC_CALL_FN_NAME)
-        || name.contains(GENERIC_METHOD_CALL_FN_NAME)
-        || name.contains(GENERIC_CTOR_FN_NAME)
-        || name.contains(DELEGATE_FN_NAME)
+
+/// The canonical, exhaustive classification of every "magic" interop fn the backend recognizes and
+/// substitutes real CIL for (see [`classify_magic_fn`]). One variant per *dispatch shape* in
+/// `src/terminator/call.rs::call_inner`, not one per concrete arity-ladder function — e.g. `Ctor`
+/// covers `rustc_clr_interop_managed_ctor{0,1,2,3}_` uniformly, since the callee (`call_ctor`) already
+/// reads the concrete arity back out of the mangled name itself via `argc_from_fn_name`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MagicFn {
+    /// `rustc_clr_interop_managed_ctor{0..=3}_` → `newobj`.
+    Ctor,
+    /// `rustc_clr_interop_managed_call{0..=4}_` → `call` (static or instance).
+    ManagedCall,
+    /// `rustc_clr_interop_managed_call_virt{0..=2}_` → `callvirt`.
+    ManagedCallVirt,
+    /// `rustc_clr_interop_managed_ld_len` → `ldlen`.
+    LdLen,
+    /// `rustc_clr_interop_managed_ld_null` → `ldnull`.
+    LdNull,
+    /// `rustc_clr_interop_managed_checked_cast` → `castclass`.
+    CheckedCast,
+    /// `rustc_clr_interop_managed_is_inst` → `isinst`.
+    IsInst,
+    /// `rustc_clr_interop_managed_ld_elem_ref` → `ldelem.ref`.
+    LdElemRef,
+    /// `rustc_clr_interop_managed_new_arr` → `newarr`.
+    NewArr,
+    /// `rustc_clr_interop_managed_set_elem` → `stelem`.
+    SetElem,
+    /// `rustc_clr_interop_box` → `box` (a value type into `System.Object`).
+    Box,
+    /// `rustc_clr_interop_try_catch` → a CIL try/catch region catching any .NET exception.
+    TryCatch,
+    /// `rustc_clr_interop_generic_call{0..=3}` (WF-9) — a method on a generic .NET instantiation.
+    GenericCall,
+    /// `rustc_clr_interop_generic_ctor{0..=2}` (WF-9) — `newobj` on a generic .NET instantiation.
+    GenericCtor,
+    /// `rustc_clr_interop_generic_method_call{0..=5}` (WF-9) — a generic *method* (`!!N`) call.
+    GenericMethodCall,
+    /// `rustc_clr_interop_throw` → `throw` (a managed exception a .NET caller can `catch`, distinct
+    /// from a Rust `panic!`).
+    Throw,
+    /// `rustc_clr_interop_delegate` — wraps a capture-less fn pointer into a managed delegate.
+    Delegate,
+    /// `rustc_clr_interop_delegate_closure` — wraps a **capturing** closure into a managed delegate.
+    DelegateClosure,
+}
+
+/// Classifies `def_id` as one of the interop "magic" fns, or `None` for an ordinary function.
+///
+/// This is the **single canonical list** every call site now shares — the codegen-skip gate
+/// (`assembly::add_fn`), the CIL-substitution dispatch (`terminator::call::call_inner`), and the
+/// unwind-boundary exception guard (`basic_block::handler_for_block`) all call this instead of each
+/// keeping their own hand-copied name list. There used to be three: the skip-gate's list had already
+/// drifted out of sync with the dispatch list (missing 9 of 18 families — those fns' dummy
+/// `core::intrinsics::abort()` bodies were harmlessly but needlessly being monomorphized and codegen'd,
+/// since their call sites still dispatched correctly), which is exactly the failure mode duplicated
+/// lists invite.
+///
+/// This also matches differently than the old mechanism did: it compares the **exact** source
+/// identifier from `tcx.def_path_str(def_id)` (the item's declaration path — independent of mangling
+/// and monomorphization) against a fixed set of literal names, instead of substring-searching the
+/// mangled *symbol name* of the call site. Two consequences: (1) there is no substring-collision or
+/// check-ordering hazard — matching a mangled symbol name required careful ordering (`_delegate_closure`
+/// contains `_delegate`; `_generic_method_call` had to be checked before `_generic_call`) that an exact
+/// match doesn't need at all; (2) an ordinary user function can never be accidentally misclassified as
+/// magic just because its mangled name happens to contain one of these strings as a substring.
+pub fn classify_magic_fn(tcx: TyCtxt, def_id: DefId) -> Option<MagicFn> {
+    let path = tcx.def_path_str(def_id);
+    let name = path.rsplit("::").next().unwrap_or(path.as_str());
+    Some(match name {
+        "rustc_clr_interop_managed_ctor0_"
+        | "rustc_clr_interop_managed_ctor1_"
+        | "rustc_clr_interop_managed_ctor2_"
+        | "rustc_clr_interop_managed_ctor3_" => MagicFn::Ctor,
+        "rustc_clr_interop_managed_call_virt0_"
+        | "rustc_clr_interop_managed_call_virt1_"
+        | "rustc_clr_interop_managed_call_virt2_" => MagicFn::ManagedCallVirt,
+        "rustc_clr_interop_managed_call0_"
+        | "rustc_clr_interop_managed_call1_"
+        | "rustc_clr_interop_managed_call2_"
+        | "rustc_clr_interop_managed_call3_"
+        | "rustc_clr_interop_managed_call4_" => MagicFn::ManagedCall,
+        "rustc_clr_interop_managed_ld_len" => MagicFn::LdLen,
+        "rustc_clr_interop_managed_ld_null" => MagicFn::LdNull,
+        "rustc_clr_interop_managed_checked_cast" => MagicFn::CheckedCast,
+        "rustc_clr_interop_managed_is_inst" => MagicFn::IsInst,
+        "rustc_clr_interop_managed_ld_elem_ref" => MagicFn::LdElemRef,
+        "rustc_clr_interop_managed_new_arr" => MagicFn::NewArr,
+        "rustc_clr_interop_managed_set_elem" => MagicFn::SetElem,
+        "rustc_clr_interop_box" => MagicFn::Box,
+        "rustc_clr_interop_try_catch" => MagicFn::TryCatch,
+        "rustc_clr_interop_throw" => MagicFn::Throw,
+        "rustc_clr_interop_generic_call0"
+        | "rustc_clr_interop_generic_call1"
+        | "rustc_clr_interop_generic_call2"
+        | "rustc_clr_interop_generic_call3" => MagicFn::GenericCall,
+        "rustc_clr_interop_generic_ctor0"
+        | "rustc_clr_interop_generic_ctor1"
+        | "rustc_clr_interop_generic_ctor2" => MagicFn::GenericCtor,
+        "rustc_clr_interop_generic_method_call0"
+        | "rustc_clr_interop_generic_method_call1"
+        | "rustc_clr_interop_generic_method_call2"
+        | "rustc_clr_interop_generic_method_call3"
+        | "rustc_clr_interop_generic_method_call4"
+        | "rustc_clr_interop_generic_method_call5" => MagicFn::GenericMethodCall,
+        "rustc_clr_interop_delegate" => MagicFn::Delegate,
+        "rustc_clr_interop_delegate_closure" => MagicFn::DelegateClosure,
+        _ => return None,
+    })
 }
 
 // WARNING: this is *wrong*: For some reason, `Instance::try_resolve` should not operate on structs(why?), and this just silences the newly introduced warning.

@@ -1,7 +1,7 @@
 use crate::{
     basic_block::handler_for_block,
     codegen_error::{CodegenError, MethodCodegenError},
-    utilis::is_magic_fn,
+    utilis::classify_magic_fn,
     IString,
 };
 use cilly::{
@@ -252,7 +252,7 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
         crate::comptime::interpret(ctx, mir);
         return Ok(());
     }
-    if is_magic_fn(name) {
+    if classify_magic_fn(ctx.tcx(), ctx.instance().def_id()).is_some() {
         println!(
             "fn item {instance:?} is magic and is being skiped.",
             instance = ctx.instance()

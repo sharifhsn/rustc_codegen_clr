@@ -1,3 +1,4 @@
+use crate::utilis::classify_magic_fn;
 use rustc_codegen_clr_type::utilis::monomorphize;
 use rustc_middle::mir::{Terminator, UnwindAction, UnwindTerminateReason};
 use rustc_middle::mir::{BasicBlock, BasicBlockData};
@@ -6,20 +7,22 @@ use rustc_middle::{
     ty::{Instance, InstanceKind, TyCtxt},
 };
 
-/// True if `term` is a `Call` whose callee is `mycorrhiza::intrinsics::rustc_clr_interop_throw` —
-/// the "magic" fn `src/terminator/call.rs`'s `MANAGED_THROW` branch recognizes by name and replaces
-/// with a direct managed `throw` IL op, never actually invoking the (unbodied) Rust fn. Matched via
-/// `Operand::const_fn_def`'s `DefId` (stable across monomorphizations of the `MSG` const generic —
-/// the substitution doesn't depend on which message string is passed) rather than a symbol-name
-/// substring check, since this runs before `MethodCompileCtx`/`fn_name` mangling is available here.
-fn is_managed_throw_call(term: &Terminator, tcx: TyCtxt) -> bool {
+/// True if `term` is a `Call` whose callee is one of the "magic" interop fns
+/// [`classify_magic_fn`] recognizes (`rustc_clr_interop_throw`, `_managed_checked_cast`, every
+/// `_managed_call*`/`_call_virt*`/`_ctor*`, …) — none of which are ever actually invoked. The
+/// backend recognizes the call by `DefId` and substitutes real CIL (`throw`, `castclass`, `call`,
+/// `newobj`, …) directly at the call site instead. Matched via `Operand::const_fn_def`'s `DefId`
+/// (stable across monomorphization of any const-generic parameters — the substitution never depends
+/// on which concrete generics are instantiated) rather than a symbol-name check, since this runs
+/// before `MethodCompileCtx`/`fn_name` mangling is available here.
+fn is_magic_fn_call(term: &Terminator, tcx: TyCtxt) -> bool {
     let TerminatorKind::Call { func, .. } = &term.kind else {
         return false;
     };
     let Some((def_id, _)) = func.const_fn_def() else {
         return false;
     };
-    tcx.def_path_str(def_id).ends_with("rustc_clr_interop_throw")
+    classify_magic_fn(tcx, def_id).is_some()
 }
 
 /// Returns the *unresolved* exception-handler block id of a MIR block, if any. Consumed by
@@ -42,21 +45,32 @@ pub(crate) fn handler_for_block<'tcx>(
     // an abort Rust guarantees is uncatchable. Short-circuited BEFORE `simplify_handler`, which only
     // understands real MIR block indices.
     if let UnwindAction::Terminate(reason) = unwind {
-        // `rustc_clr_interop_throw::<MSG>()` (the magic fn backing `MANAGED_THROW` in
-        // `src/terminator/call.rs`) is never actually invoked — the backend recognizes the call by
-        // name and substitutes a direct managed `throw` IL op instead. rustc's own MIR builder has
-        // no idea about that substitution: it sees an ordinary Rust call that could conceivably
-        // unwind, and since the call site sits inside a `extern "C"` (nounwind-by-default) fn, it
-        // attaches `UnwindAction::Terminate` — "abort if this call's hypothetical Rust unwind
-        // escapes". But the substituted CIL never unwinds as a Rust unwind; it's a genuine,
-        // intentional `throw` a .NET caller means to `catch` (see `rustc_clr_interop_throw`'s own
-        // doc — "the C#-catchable error direction"). Wrapping that throw in the FailFast catch-guard
-        // a Terminate edge would otherwise install turns every intentional error-crossing throw into
-        // a hard abort, exactly backwards — this is what broke `cargo_tests/rust_export_cs`'s
-        // `try_div(1,0)` check (root-caused via `ikdasm` on the emitted PE: the `throw` IL was
-        // correct, but sat inside a synthetic `.try { .. } catch { FailFast; rethrow }` this fn
-        // installed around it).
-        if is_managed_throw_call(term, tcx) {
+        // None of the "magic" interop fns (`rustc_clr_interop_throw`, `_managed_checked_cast`, every
+        // `_managed_call*`/`_call_virt*`/`_ctor*`/etc — see `classify_magic_fn`) are ever actually
+        // invoked: the backend recognizes the call by `DefId` and substitutes real managed CIL
+        // (`throw`, `castclass`, `call`, `newobj`, …) directly at the call site instead. rustc's own
+        // MIR builder has no idea about any of these substitutions: it sees an ordinary Rust call
+        // that could conceivably unwind, and since the call site sits inside an `extern "C"`
+        // (nounwind-by-default) fn, it attaches `UnwindAction::Terminate` — "abort if this call's
+        // hypothetical Rust unwind escapes". But none of the substituted CIL ever unwinds as a *Rust*
+        // unwind — at best it's a genuine, intentional `throw` a .NET caller means to `catch` (e.g.
+        // `rustc_clr_interop_throw`'s own doc, "the C#-catchable error direction"); at worst it's an
+        // ordinary managed exception any call into arbitrary .NET code can raise (`InvalidCastException`
+        // from `_managed_checked_cast`, or literally anything from `_managed_call`/`_call_virt`, which
+        // invoke arbitrary user-supplied C# methods). Wrapping any of that in the FailFast catch-guard
+        // a Terminate edge would otherwise install turns an ordinary catchable managed exception into a
+        // hard, uncatchable process abort — exactly backwards. This was first caught narrowly (only
+        // `rustc_clr_interop_throw`, `try_div(1,0)` via `cargo_tests/rust_export_cs`, root-caused via
+        // `ikdasm` on the emitted PE) and confirmed to generalize to every magic fn via a
+        // `_managed_checked_cast`/`InvalidCastException` repro before being widened here.
+        //
+        // Note this is scoped to the `Terminate` edge only — the exact case where rustc has already
+        // determined "this crosses a boundary that can't propagate a Rust unwind, abort if it tries."
+        // It does not touch the ordinary `Cleanup` path below (`handler_from_action`/
+        // `simplify_handler`), so local `Drop` glue still runs normally when a magic-fn exception
+        // propagates through an *ordinary* (non-FFI-boundary) Rust function — only the
+        // FFI-boundary FailFast-or-not decision changes.
+        if is_magic_fn_call(term, tcx) {
             return None;
         }
         // A `Terminate` edge on a CLEANUP block whose terminator is a `Drop` is now handled by an
