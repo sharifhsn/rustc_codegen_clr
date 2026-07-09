@@ -781,6 +781,22 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
         }
     }
 
+    // --- Pass 3.7: general `CustomAttribute` rows (§II.21/§II.22.10/§II.23.3) attached to a
+    // TYPE — the generalization of the hardcoded `ThreadStaticAttribute` special case
+    // (`add_static_field`'s `is_thread_static`). Doesn't need to run after Passes 3.5/3.6 for any
+    // ordering reason (a type-level attribute names no method/accessor), but is kept here to
+    // group every "extra metadata attached to an already-registered TypeDef" pass together.
+    for &class_def_id in &class_def_ids {
+        let class_def = asm[class_def_id].clone();
+        if class_def.custom_attributes().is_empty() {
+            continue;
+        }
+        let class_tok = type_def_token_of[&class_def_id];
+        for attr in class_def.custom_attributes() {
+            mb.add_custom_attribute(asm, class_tok, attr);
+        }
+    }
+
     // --- Pass 4: assemble every method body now that every method this milestone's inventory
     // subset can reference has a resolvable token (passes 1-3 already added every in-assembly
     // row a `TokenSink` query could need).
@@ -1097,7 +1113,7 @@ fn system_runtime_type_ref(mb: &mut MetadataBuilder, type_name: &str) -> Token {
 
 /// Local port of `il_exporter::ref_assembly_name` (kept private/duplicated rather than imported,
 /// per the hard constraint that `pe_exporter` code must not depend on `il_exporter` — same
-/// convention as this file's `is_bcl_assembly`/`split_namespace` ports). Maps an
+/// convention as this file's `bcl_public_key_token`/`split_namespace` ports). Maps an
 /// IMPLEMENTATION-assembly name to the public REFERENCE assembly a C# compiler resolves against:
 /// `System.Object`/`ValueType`/`String`/`Exception`/`SemaphoreSlim`/… physically live in
 /// `System.Private.CoreLib` but are type-forwarded from `System.Runtime`. A separately-compiled

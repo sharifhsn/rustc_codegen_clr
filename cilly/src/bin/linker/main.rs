@@ -1,3 +1,10 @@
+//! The `linker` binary (invoked as `-C linker=` by the rustc backend): loads each crate's
+//! serialized `cilly` `Assembly` from its rlib (`load.rs`), merges them into one program via
+//! `asm_link`, patches in libc/intrinsic implementations referenced but never defined by
+//! rustc-generated code via a `MissingMethodPatcher` (`patch.rs`), optionally runs Native AOT
+//! (`aot.rs`), then hands the result to an `Exporter` (`il_exporter`/`c_exporter`) to emit the
+//! final `.NET` executable or C source. `native_passtrough.rs` is WIP support for passing
+//! calls through to the platform C runtime instead of reimplementing them (not yet wired in).
 #![deny(unused_must_use)]
 #![allow(clippy::module_name_repetitions)]
 use cilly::{
@@ -201,7 +208,7 @@ fn main() {
         link_backup_std(&to_link[..], &mut ar_to_link, backup_std);
     }
     //ar_to_link.extend(link_dir_files(args));
-    let output_file_path = get_out_path(args);
+    let out_path = get_out_path(args);
     // Configs
 
     let cargo_support = args.iter().any(|arg| arg.contains("--cargo-support"));
@@ -225,11 +232,11 @@ fn main() {
            final_assembly.add_cctor(&[stat]);
        }
     */
-    let path: std::path::PathBuf = output_file_path.into();
+    let path: std::path::PathBuf = out_path.into();
 
-    let is_lib = output_file_path.contains(".dll")
-        || output_file_path.contains(".so")
-        || output_file_path.contains(".o");
+    let is_lib = out_path.contains(".dll")
+        || out_path.contains(".so")
+        || out_path.contains(".o");
 
     let mut externs: FxHashMap<_, _> = LIBC_FNS
         .iter()
@@ -548,7 +555,7 @@ fn main() {
                 .arg("-O")
                 .arg(bootstrap_path)
                 .arg("-o")
-                .arg(output_file_path)
+                .arg(out_path)
                 .env_remove("RUSTFLAGS")
                 .env_remove("CARGO_ENCODED_RUSTFLAGS")
                 .output()
@@ -683,7 +690,7 @@ fn main() {
                 .arg("-O")
                 .arg(bootstrap_path)
                 .arg("-o")
-                .arg(output_file_path)
+                .arg(out_path)
                 .env_remove("RUSTFLAGS")
                 .env_remove("CARGO_ENCODED_RUSTFLAGS")
                 .output()
@@ -733,7 +740,7 @@ fn main() {
                 .arg("-O")
                 .arg(bootstrap_path)
                 .arg("-o")
-                .arg(output_file_path)
+                .arg(out_path)
                 .env_remove("RUSTFLAGS")
                 .env_remove("CARGO_ENCODED_RUSTFLAGS")
                 .output()

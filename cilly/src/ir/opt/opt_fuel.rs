@@ -1,3 +1,8 @@
+/// A budget of abstract "work units" threaded through every optimization pass, consumed
+/// per rewrite attempt (`consume(1)` for a cheap check, larger costs like `consume(15)` for
+/// passes that themselves iterate to a fixpoint). Exists to bound optimizer compile time on
+/// large/pathological methods: once exhausted, passes stop rewriting and return the input
+/// unchanged rather than risk unbounded fixpoint iteration.
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct OptFuel(u32);
 impl OptFuel {

@@ -55,15 +55,15 @@ fn main() {
             }
             "simptypes" => {
                 let start = std::time::Instant::now();
-                let mut simplify_candidates = FxHashSet::default();
+                let mut candidates = FxHashSet::default();
                 for (id, def) in asm.class_defs() {
                     if def.fields().len() == 1 && def.methods().is_empty() {
-                        simplify_candidates.insert(id);
+                        candidates.insert(id);
                     }
                 }
                 eprintln!(
                     "Found {} simplificaiton candiates in {} ns. Total types:{}",
-                    simplify_candidates.len(),
+                    candidates.len(),
                     start.elapsed().as_nanos(),
                     asm.class_defs().len()
                 );
@@ -180,7 +180,7 @@ fn main() {
                     eprintln!("Invalid method!");
                     continue;
                 };
-                asm.modify_methodef(
+                asm.edit_methodef(
                     |_, method| *method.implementation_mut() = MethodImpl::Missing,
                     id,
                 );
@@ -236,7 +236,7 @@ fn main() {
                     eprintln!("Invalid method!");
                     continue;
                 };
-                asm.modify_methodef(|_, method| method.set_access(access), id);
+                asm.edit_methodef(|_, method| method.set_access(access), id);
             }
             "" => continue,
             "misolate" => {
@@ -331,7 +331,7 @@ fn misolate(asm: &mut Assembly, isolate_id: Interned<MethodRef>) {
         .copied()
         .collect();
     for extern_id in externs {
-        asm.modify_methodef(|_, method| method.set_access(Access::Public), extern_id);
+        asm.edit_methodef(|_, method| method.set_access(Access::Public), extern_id);
     }
 
     let main_module = asm.main_module();

@@ -8,26 +8,26 @@ use super::{block_with_id, blockid_from_jump, OptFuel, SideEffectInfoCache};
 fn block_gc(blocks: &mut Vec<BasicBlock>, asm: &Assembly) {
     //debug_assert!(is_sorted(bbs.iter(),|a,b|a.id + 1 == b.id));
     let mut alive: FxHashSet<u32> = FxHashSet::default();
-    let mut resurecting = FxHashSet::default();
-    let mut to_resurect = FxHashSet::default();
-    to_resurect.insert(blocks[0].block_id());
-    while !to_resurect.is_empty() {
-        alive.extend(&resurecting);
-        resurecting.clear();
-        resurecting.extend(&to_resurect);
-        to_resurect.clear();
-        for target in resurecting
+    let mut wave = FxHashSet::default();
+    let mut next_wave = FxHashSet::default();
+    next_wave.insert(blocks[0].block_id());
+    while !next_wave.is_empty() {
+        alive.extend(&wave);
+        wave.clear();
+        wave.extend(&next_wave);
+        next_wave.clear();
+        for target in wave
             .iter()
             .filter_map(|bb| block_with_id(blocks, *bb))
             .flat_map(|bb| bb.targets(asm).collect::<Vec<_>>())
         {
             //eprintln!("Block {target} is alive.");
-            if !alive.contains(&target) && !resurecting.contains(&target) {
-                to_resurect.insert(target);
+            if !alive.contains(&target) && !wave.contains(&target) {
+                next_wave.insert(target);
             }
         }
     }
-    alive.extend(&resurecting);
+    alive.extend(&wave);
     *blocks = blocks
         .iter()
         .filter(|bb| alive.contains(&bb.block_id()))

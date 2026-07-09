@@ -1,4 +1,6 @@
-// This exporter is WIP.
+//! The C-source `Exporter` — a first-class alternate target alongside `il_exporter`, not an
+//! experiment: `C_MODE=1 cargo test ::stable` runs it on every CI PR, and the `linker`
+//! binary constructs it unconditionally for `C_MODE` builds the same way it does `ILExporter`.
 #![allow(dead_code, unused_imports, unused_variables, clippy::let_unit_value)]
 use fxhash::{hash64, FxHashSet, FxHasher};
 use std::{collections::HashSet, io::Write, num::NonZero, path::Path};

@@ -844,8 +844,14 @@ impl CILNode {
                 let arg = asm.get_node(*arg).clone();
                 let arg_tpe = arg.typecheck(sig, locals, asm)?;
                 match arg_tpe {
+                    // Deep check (`contains_gcref`, not the shallow `is_gcref`): a Ptr/Ref whose
+                    // pointee is a value-type struct that merely NESTS a gcref field (e.g. the
+                    // `TaskFuture<T>`-over-`RustcCLRInteropManagedGeneric` shape) must be rejected
+                    // exactly like a pointee that IS a gcref outright — an unmanaged pointer/relabel
+                    // must never be allowed to erase-away the fact that GC-tracked memory sits behind
+                    // it. See `Type::contains_gcref`'s doc for the motivating bug.
                     Type::Ptr(inner) | Type::Ref(inner) => {
-                        if asm[inner].is_gcref(asm) {
+                        if asm[inner].contains_gcref(asm) {
                             return Err(TypeCheckError::ManagedPtrCast {
                                 src: arg_tpe.mangle(asm),
                                 dst: res.as_ref().as_type().mangle(asm),
@@ -859,7 +865,7 @@ impl CILNode {
                         got: arg_tpe,
                     })?,
                 };
-                if res.as_ref().as_type().is_gcref(asm) {
+                if res.as_ref().as_type().contains_gcref(asm) {
                     return Err(TypeCheckError::ManagedPtrCast {
                         src: arg_tpe.mangle(asm),
                         dst: res.as_ref().as_type().mangle(asm),
@@ -1709,5 +1715,58 @@ mod tc_tests {
     fn assembly_typecheck_fatal_aborts() {
         let mut asm = asm_with_one_broken_method();
         let _ = asm.typecheck_with_policy(/*enabled=*/ true, /*fatal=*/ true);
+    }
+
+    /// FALSE-NEGATIVE AUDIT (`PtrCast` / gcref-completeness sibling to the `is_gcref` shallowness
+    /// bug — see `Type::contains_gcref`'s doc). `PtrCast` is supposed to reject any cast into/out of
+    /// an *unmanaged* pointer (`Type::Ptr`) whose pointee is a GC reference — a raw, GC-untracked
+    /// pointer must never address managed memory. Before this fix the check used the SHALLOW
+    /// `Type::is_gcref`, which only looks at the outer type: a value-type struct that nests a real
+    /// managed handle in one of its OWN fields (the exact `TaskFuture<T>`-over-`RustcCLRInteropManagedGeneric`
+    /// shape that motivated `contains_gcref`) reports `is_gcref == false`, so a `PtrCast` of
+    /// `*mut Wrapper` (where `Wrapper` is a value-type struct with a nested managed-object field) was
+    /// silently ACCEPTED — an unmanaged pointer to GC-tracked memory the checker is supposed to
+    /// forbid. Builds a minimal value-type `ClassDef` with one non-valuetype `ClassRef` field (mirrors
+    /// `TaskFuture<T>`'s `task: Task` field) and asserts a `PtrCast` FROM a `*Wrapper` is rejected.
+    #[test]
+    fn ptrcast_nested_gcref_struct_is_rejected() {
+        use crate::ir::Access;
+        let mut asm = Assembly::default();
+        // A non-valuetype ClassRef stand-in for a real managed handle (any reference class works).
+        let gcref_class = ClassRef::exception(&mut asm);
+        // `struct Wrapper { inner: Exception }` — value-type, nests a gcref in its own field.
+        let wrapper_name = asm.alloc_string("Wrapper");
+        let field_name = asm.alloc_string("inner");
+        let wrapper_cref = asm.alloc_class_ref(ClassRef::new(wrapper_name, None, true, [].into()));
+        let def = crate::ir::ClassDef::new(
+            wrapper_name,
+            true,
+            0,
+            None,
+            vec![(Type::ClassRef(gcref_class), field_name, None)],
+            vec![],
+            Access::Public,
+            None,
+            None,
+            true,
+        );
+        asm.class_def(def).unwrap();
+
+        // `*mut Wrapper` local, PtrCast to `*mut u8` — an unmanaged pointer erasure of a struct that
+        // transitively contains a real GC reference. Must be rejected.
+        let wrapper_ty = asm.alloc_type(Type::ClassRef(wrapper_cref));
+        let ptr_wrapper = asm.nptr(wrapper_ty);
+        let ptr_wrapper = asm.alloc_type(ptr_wrapper);
+        let locals: Vec<LocalDef> = vec![(None, ptr_wrapper)];
+        let addr = asm.alloc_node(CILNode::LdLoc(0));
+        let u8_ty = asm.alloc_type(Type::Int(Int::U8));
+        let node = CILNode::PtrCast(addr, Box::new(PtrCastRes::Ptr(u8_ty)));
+        let sig = asm.sig([], Type::Void);
+        assert!(
+            node.typecheck(sig, &locals, &mut asm).is_err(),
+            "PtrCast of *mut Wrapper (a value-type nesting a real gcref field) to *mut u8 must be \
+             rejected — an unmanaged pointer must never address GC-tracked memory, even when the \
+             gcref is hidden inside a struct's own field rather than being the outer type itself"
+        );
     }
 }

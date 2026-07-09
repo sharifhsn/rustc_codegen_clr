@@ -5,6 +5,15 @@ use serde::{Deserialize, Serialize};
 use std::{num::NonZeroU32, ops::Deref};
 #[derive(Debug)]
 pub enum LayoutError {
+    /// A GC-tracked field sits inside overlapping (`[FieldOffset]`-style union) storage at a
+    /// byte offset another overlapping variant uses for a differently-shaped field — the CLR GC
+    /// can't consistently interpret that byte range (an object reference in one variant, raw data
+    /// or a different reference shape in another), so CoreCLR's class loader rejects it. Hit this
+    /// by e.g. trying to hold a raw managed handle (or a struct nesting one, like
+    /// `mycorrhiza::task::TaskFuture<T>`) inside an enum payload or an async fn's captured state
+    /// at an offset another variant reuses incompatibly; fix by using a GCHandle-backed newtype
+    /// (`mycorrhiza::class::Class<..>`, which has no gcref field at all) instead, or ensure the
+    /// same gcref-shaped field is reused consistently across every overlapping variant.
     ManagedRefInOverlapingField {
         owner: String,
         field: String,
@@ -570,6 +579,18 @@ impl PartialEq for StaticFieldDef {
 pub struct ClassDef {
     name: Interned<IString>,
     is_valuetype: bool,
+    /// Whether `is_valuetype` above has been set by an AUTHORITATIVE comptime entrypoint
+    /// (`#[dotnet_class]`'s own `value_type = ...` attribute, or `#[dotnet_interface]`, always
+    /// fresh) as opposed to still holding a placeholder from a re-opening `#[dotnet_methods]`
+    /// entrypoint (which always registers a FRESH `ClassDef` with `is_valuetype = false` if it
+    /// happens to run before the authoritative entrypoint — see `finish_type`'s doc). `false` by
+    /// construction (`ClassDef::new` never sets it); [`Self::with_valuetype_authoritative`] flips
+    /// it once, and [`Self::set_is_valuetype`] uses it to distinguish "correct a placeholder" from
+    /// "assert a real conflict" — see that method's doc, `set_extends`'s sibling for a field a
+    /// bare bool can't spell "no opinion" for on its own. NOTE: adding this field changed the
+    /// postcard-serialized `.bc` format (the same documented fingerprint trap as `generic_names`/
+    /// `properties` above — rebuild dylib+linker together and clean consumers).
+    is_valuetype_authoritative: bool,
     generics: u32,
     extends: Option<Interned<ClassRef>>,
     /// `.NET` interfaces this class implements (`implements` clause). Empty for the vast majority of
@@ -584,6 +605,13 @@ pub struct ClassDef {
     access: Access,
     explict_size: Option<NonZeroU32>,
     align: Option<NonZeroU32>,
+    /// `false` for any class using overlapping/union storage (enum variant payloads,
+    /// compiler-generated async-fn state machines). `layout_check` rejects a gcref-shaped field
+    /// here whenever it would collide (at the same starting offset) with a differently-typed
+    /// field from another overlapping variant, since the CLR GC can't consistently interpret that
+    /// byte range — see `LayoutError::ManagedRefInOverlapingField` and `layout_check`'s own doc
+    /// for exactly what is/isn't allowed (a gcref-shaped field reused identically across
+    /// variants is fine and is relied on by real code).
     has_nonveralpping_layout: bool,
     /// Marks this `ClassDef` as a genuine ECMA-335 `interface` `TypeDef` (§II.10.1.3: `Interface`+
     /// `Abstract` flags, no `extends` clause, every member `Abstract`+`Virtual`+`NewSlot`) rather
@@ -617,6 +645,89 @@ pub struct ClassDef {
     /// doc for what a single entry needs. NOTE: adding this field changed the
     /// postcard-serialized `.bc` format (the same fingerprint trap as `generic_names` above).
     properties: Vec<PropertyDef>,
+    /// General ECMA-335 `CustomAttribute` rows (§II.21/§II.23.3) attached to this TYPE (not its
+    /// members — method/param-level attributes are a separate, not-yet-implemented surface).
+    /// Populated by `#[dotnet_class(attr(...))]` via `comptime::finish_type`. Empty for every
+    /// class that existed before this field: additive, `ClassDef::new` never sets it. See
+    /// `CustomAttrDef`'s own doc for the exact argument shapes supported and why a raw-bytes
+    /// escape hatch is deliberately not offered. NOTE: adding this field changed the
+    /// postcard-serialized `.bc` format (the same fingerprint trap as `generic_names`/
+    /// `properties` above — rebuild dylib+linker together and clean consumers).
+    custom_attributes: Vec<CustomAttrDef>,
+}
+
+/// One constructor-argument or named-argument value inside a `CustomAttribute` blob (§II.23.3).
+/// Deliberately restricted to the handful of shapes that are *mechanically* well-formed by
+/// construction — no raw-bytes escape hatch: ECMA-335's fixed-arg encoding is one of {primitive,
+/// `string`, `Type`, boxed primitive, single-dim array of one of those}; this enum covers the
+/// primitive/string subset (the overwhelming majority of real-world attribute usages — MVC route
+/// attributes, `JsonPropertyName`, Swashbuckle metadata, …). `Type`/boxed/array/enum arguments are
+/// NOT supported yet (a real gap, not a soundness concern: the builder simply can't express them,
+/// so there's nothing unsound to reject) — see `CustomAttrDef`'s doc for the full scope note.
+#[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
+pub enum CustomAttrArg {
+    /// `ELEMENT_TYPE_STRING` (0x0E): a UTF-8 `SerString` (§II.23.3), never boxed.
+    Str(Interned<IString>),
+    /// `ELEMENT_TYPE_BOOLEAN` (0x02): one byte, 0/1.
+    Bool(bool),
+    /// `ELEMENT_TYPE_I4` (0x08): four bytes, little-endian.
+    I32(i32),
+    /// `ELEMENT_TYPE_I8` (0x0A): eight bytes, little-endian.
+    I64(i64),
+}
+
+/// One ECMA-335 `CustomAttribute` row (§II.22.10) attached to a type: the attribute TYPE (its
+/// `.ctor` is resolved from this at export time via the same `ClassRef`→`TypeRef`/`TypeDef`
+/// machinery `extends`/`implements` already use — see `pe_exporter::tables::class_ref_token`),
+/// positional constructor arguments (in declaration order, matching the ctor overload this
+/// implies), and named PROPERTY arguments (§II.23.3 `NamedArg` — field-targeted named args are
+/// not supported, matching how virtually every real .NET attribute exposes its named-arg surface
+/// as settable properties, not public fields).
+///
+/// SAFETY NOTE (this is why the API is safe, not `unsafe`): because every `CustomAttrArg` is one
+/// of a small set of mechanically well-formed shapes, [`CustomAttrDef`] can only ever produce a
+/// syntactically valid `CustomAttribute` blob — there is no way to construct a malformed one
+/// through this type. A malformed attribute TYPE reference (e.g. a typo'd class name) still fails
+/// safely: .NET reflection parses `CustomAttribute` blobs LAZILY, so a bad reference surfaces as a
+/// catchable `TypeLoadException`/`CustomAttributeFormatException` when a consumer actually asks
+/// for the attribute — never a loader-level crash. The one real risk this type does NOT protect
+/// against on its own is attaching a *runtime-semantic* attribute (one CoreCLR's own loader/JIT
+/// interprets to change layout or calling convention, e.g. `InlineArrayAttribute`,
+/// `UnmanagedCallersOnlyAttribute`, `StructLayoutAttribute`) — callers MUST run
+/// `pe_exporter::custom_attr_denylist::check` (or the `dotnet_macros` compile-time twin) before
+/// constructing one of these from user input; this type itself has no opinion on WHICH attribute
+/// type is being attached.
+#[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
+pub struct CustomAttrDef {
+    attr_type: Interned<ClassRef>,
+    ctor_args: Vec<CustomAttrArg>,
+    named_args: Vec<(Interned<IString>, CustomAttrArg)>,
+}
+impl CustomAttrDef {
+    #[must_use]
+    pub fn new(
+        attr_type: Interned<ClassRef>,
+        ctor_args: Vec<CustomAttrArg>,
+        named_args: Vec<(Interned<IString>, CustomAttrArg)>,
+    ) -> Self {
+        Self {
+            attr_type,
+            ctor_args,
+            named_args,
+        }
+    }
+    #[must_use]
+    pub fn attr_type(&self) -> Interned<ClassRef> {
+        self.attr_type
+    }
+    #[must_use]
+    pub fn ctor_args(&self) -> &[CustomAttrArg] {
+        &self.ctor_args
+    }
+    #[must_use]
+    pub fn named_args(&self) -> &[(Interned<IString>, CustomAttrArg)] {
+        &self.named_args
+    }
 }
 /// One ECMA-335 event (§II.22.13 Event + §II.22.28 MethodSemantics `AddOn`/`RemoveOn`): a name, the
 /// delegate type subscribers must match, and the two *ordinary* instance methods (already emitted
@@ -757,6 +868,10 @@ impl ClassDef {
             .chain(self.events.iter().map(EventDef::delegate))
             // And for each property's value type (the `Type` inside the §II.23.2.5 PropertySig).
             .chain(self.properties.iter().map(PropertyDef::tpe))
+            // And for each custom attribute's TYPE (pulls a third-party attribute assembly, e.g.
+            // `Microsoft.AspNetCore.Mvc`, into `.assembly extern` — same CS0012-avoidance
+            // reasoning as `implements`/events/properties above).
+            .chain(self.custom_attributes.iter().map(|a| Type::ClassRef(a.attr_type())))
     }
     #[allow(clippy::too_many_arguments)]
     #[must_use]
@@ -776,6 +891,7 @@ impl ClassDef {
         Self {
             name,
             is_valuetype,
+            is_valuetype_authoritative: false,
             generics,
             extends,
             implements: vec![],
@@ -790,7 +906,18 @@ impl ClassDef {
             events: vec![],
             generic_names: vec![],
             properties: vec![],
+            custom_attributes: vec![],
         }
+    }
+
+    /// Marks the `is_valuetype` this `ClassDef` was constructed with as AUTHORITATIVE (see the
+    /// `is_valuetype_authoritative` field's doc) — call right after [`Self::new`] when the
+    /// constructing comptime entrypoint had a real opinion (`#[dotnet_class]`/
+    /// `#[dotnet_interface]`), never for a `#[dotnet_methods]`-style re-opening placeholder.
+    #[must_use]
+    pub fn with_valuetype_authoritative(mut self) -> Self {
+        self.is_valuetype_authoritative = true;
+        self
     }
 
     /// Marks this `ClassDef` as a genuine ECMA-335 `interface` `TypeDef`. See the `is_interface`
@@ -857,8 +984,22 @@ impl ClassDef {
     /// Declare an event on this class. The `add`/`remove` methods it names must already exist as
     /// ordinary `MethodDef`s on this class — this only links their names into the Event-shaped IL
     /// block (see `EventDef`'s doc).
+    ///
+    /// Deduplicates by name (first-registration wins, silently skipping a later same-named call):
+    /// a class can be re-opened by more than one comptime entrypoint (multiple `#[dotnet_methods]`
+    /// impl blocks touching the same class), and each entrypoint's `finish_type` call builds its
+    /// OWN local `pending_events` map from only ITS OWN methods — it has no visibility into an
+    /// event a DIFFERENT entrypoint already registered. Without this dedup, two entrypoints that
+    /// happen to declare the same event name (e.g. an authoring mistake, or the same event
+    /// re-declared across a split impl) would silently produce TWO `Event` metadata rows with an
+    /// identical name under one class — ambiguous ECMA-335 metadata, not a clean error. Mirrors
+    /// the dedup `ClassDef::merge_defs` already applies when combining events across SEPARATE
+    /// assemblies at link time; this closes the same gap for the same-assembly,
+    /// multiple-comptime-entrypoint case.
     pub fn add_event(&mut self, ev: EventDef) {
-        self.events.push(ev);
+        if !self.events.iter().any(|existing| existing.name() == ev.name()) {
+            self.events.push(ev);
+        }
     }
 
     /// The `.NET` properties declared on this class (see `PropertyDef`'s doc). Usually empty.
@@ -870,8 +1011,31 @@ impl ClassDef {
     /// Declare a property on this class. The accessor methods it names must already exist as
     /// ordinary `MethodDef`s on this class — this only links them into the Property-shaped
     /// metadata (see `PropertyDef`'s doc).
+    ///
+    /// Deduplicates by name, for the same reason as [`Self::add_event`] (see its doc): a
+    /// multiple-comptime-entrypoint class must not accumulate two same-named `Property` rows just
+    /// because two entrypoints happened to both declare one.
     pub fn add_property(&mut self, prop: PropertyDef) {
-        self.properties.push(prop);
+        if !self.properties.iter().any(|existing| existing.name() == prop.name()) {
+            self.properties.push(prop);
+        }
+    }
+
+    /// The general `CustomAttribute` rows attached to this TYPE (see `CustomAttrDef`'s doc).
+    /// Usually empty.
+    #[must_use]
+    pub fn custom_attributes(&self) -> &[CustomAttrDef] {
+        &self.custom_attributes
+    }
+
+    /// Attach a custom attribute to this class. Deduplicates by full equality (a class re-opened
+    /// by several comptime entrypoints must not accumulate the identical attribute twice) — two
+    /// DIFFERENT attributes of the same TYPE (e.g. two `[Route("...")]` with different literal
+    /// args) are both legitimate and both kept.
+    pub fn add_custom_attribute(&mut self, attr: CustomAttrDef) {
+        if !self.custom_attributes.contains(&attr) {
+            self.custom_attributes.push(attr);
+        }
     }
 
     pub(crate) fn ref_to(&self) -> ClassRef {
@@ -890,15 +1054,61 @@ impl ClassDef {
         );
         ClassRef::new(self.name, None, self.is_valuetype, vec![].into())
     }
+    /// Rejects GC-ref-*shaped* fields sitting in overlapping (`[FieldOffset]`-style union /
+    /// coroutine variant) storage whenever CoreCLR's class loader would reject them too.
+    ///
+    /// A field "contains a gcref" if [`Type::contains_gcref`] says so — this recurses into
+    /// value-type struct fields (unlike the shallow [`Type::is_gcref`]), since a plain-looking
+    /// struct field (e.g. `mycorrhiza::task::TaskFuture<T>`) can nest a real managed reference.
+    ///
+    /// Empirically (`cargo_tests/cd_persisted_async`, proven on real CoreCLR), the CLR does NOT
+    /// blanket-reject every gcref in overlapping storage — it only rejects a byte offset whose
+    /// *interpretation disagrees* across the overlapping occupants: an object reference in one
+    /// coroutine variant and something else (a raw primitive, or a differently-shaped reference)
+    /// in another. Roslyn's own async state-machine lowering relies on the same allowance (a
+    /// single object-typed slot reused, unambiguously, across suspend points). So this check
+    /// groups fields by their starting offset and only rejects a group that mixes a
+    /// gcref-containing field with ANY other field whose exact type differs — a solo occupant, or
+    /// several occupants that all agree on the exact same type, is left alone.
+    ///
+    /// This differs from (and supersedes) a blanket "any gcref anywhere in overlapping storage is
+    /// illegal" rule: that rule is unsound-by-omission (it happened to pass `TaskFuture<T>` only
+    /// because of `is_gcref`'s shallowness, not because the pattern is actually always illegal on
+    /// CoreCLR) — seeing the SAME gcref-shaped field reused consistently across variants is a
+    /// legitimate, CoreCLR-accepted pattern this project already depends on.
     pub fn layout_check(&self, asm: &Assembly) -> Result<(), LayoutError> {
         if !self.has_nonveralpping_layout() {
-            for (t, name, _offset) in self.fields() {
-                if t.is_gcref(asm) {
-                    return Err(LayoutError::ManagedRefInOverlapingField {
-                        owner: asm[self.name()].into(),
-                        field: t.mangle(asm),
-                        name: asm[*name].into(),
-                    });
+            let mut by_offset: std::collections::HashMap<u32, Vec<(&Type, Interned<IString>)>> =
+                std::collections::HashMap::new();
+            for (t, name, offset) in self.fields() {
+                let Some(off) = offset else {
+                    // No offset recorded at all (shouldn't happen for a coroutine/enum's
+                    // overlapping-storage fields, which always carry one) — fall back to the
+                    // original unconditional rejection rather than silently skip the check.
+                    if t.contains_gcref(asm) {
+                        return Err(LayoutError::ManagedRefInOverlapingField {
+                            owner: asm[self.name()].into(),
+                            field: t.mangle(asm),
+                            name: asm[*name].into(),
+                        });
+                    }
+                    continue;
+                };
+                by_offset.entry(*off).or_default().push((t, *name));
+            }
+            for group in by_offset.values() {
+                if !group.iter().any(|(t, _)| t.contains_gcref(asm)) {
+                    continue;
+                }
+                let (first_ty, _) = group[0];
+                for (t, name) in group {
+                    if *t != first_ty {
+                        return Err(LayoutError::ManagedRefInOverlapingField {
+                            owner: asm[self.name()].into(),
+                            field: t.mangle(asm),
+                            name: asm[*name].into(),
+                        });
+                    }
                 }
             }
         }
@@ -931,6 +1141,69 @@ impl ClassDef {
     #[must_use]
     pub fn extends(&self) -> Option<Interned<ClassRef>> {
         self.extends
+    }
+
+    /// Overwrites the base-class reference this `TypeDef` will `extends` (`None` = default to
+    /// `System.Object`/`System.ValueType` at export time, see `pe_exporter::export_pe`'s /
+    /// `il_exporter`'s identical fallback).
+    ///
+    /// Needed because a class can be described by MULTIPLE comptime entrypoints (the
+    /// `#[dotnet_class]` struct declaration, which knows the real `extends = "..."`, and each
+    /// `#[dotnet_methods]` impl block re-opening it, which does NOT — it has no access to the
+    /// original struct's attributes and used to hardcode a `System.Object` "superclass" on its
+    /// own `rustc_codegen_clr_new_typedef` call). Comptime entrypoint order is NOT guaranteed
+    /// (rustc's mono-item collection order), so whichever entrypoint happened to register the
+    /// `ClassDef` FIRST used to permanently decide `extends` — if that was a re-opening
+    /// `#[dotnet_methods]` block, the class silently got `extends = System.Object` regardless of
+    /// what `#[dotnet_class(extends = "...")]` said, an inconsistency invisible in IL text (the
+    /// `.override`/base-ctor-chain call sites still correctly named the real base) but fatal at
+    /// CLR type-load time: an explicit `.override` `MethodImpl` naming a base method that isn't
+    /// anywhere in the ACTUAL (wrongly-Object-rooted) hierarchy makes CoreCLR's
+    /// `MethodTableBuilder::FindDeclMethodOnClassInHierarchy` walk off the end and dereference a
+    /// null `MethodTable*` — a hard segfault, not a graceful `TypeLoadException`. Confirmed via
+    /// `cargo_tests/cd_bgservice/rustlib_bgtest` and a minimal isolate-probe (plain non-abstract
+    /// override of a simple user-compiled base with one private field) — BOTH crashed identically
+    /// until `finish_type`'s re-opening path started calling this setter.
+    pub fn set_extends(&mut self, extends: Option<Interned<ClassRef>>) {
+        self.extends = extends;
+    }
+
+    /// Overwrites whether this `TypeDef` is a `.NET` value type (struct) or reference type
+    /// (class) from an AUTHORITATIVE comptime entrypoint's opinion.
+    ///
+    /// This is `set_extends`'s sibling, closing the SAME multi-comptime-entrypoint hazard for a
+    /// second field: a `#[dotnet_methods]` impl block re-opening a class has no access to the
+    /// original struct's `#[dotnet_class(value_type = ...)]` attribute, so it has no real opinion
+    /// on `IS_VALUETYPE` — but unlike `extends` (which has a natural "no opinion" value, `None`),
+    /// a bare `bool` can't spell that, so a re-opening entrypoint that happens to register the
+    /// class FIRST still writes a placeholder `is_valuetype = false` into a genuinely fresh
+    /// `ClassDef` (see `finish_type`'s doc). This setter is therefore only ever called by an
+    /// AUTHORITATIVE entrypoint, and behaves like `set_extends`'s `None -> Some` correction:
+    /// * if no authoritative opinion has been recorded yet (`is_valuetype_authoritative == false`
+    ///   — i.e. the current value is just such a placeholder, or this is the type's first real
+    ///   opinion), this ADOPTS `new_value` and marks the def authoritative.
+    /// * if an authoritative opinion is already recorded, a disagreement is a genuine authoring
+    ///   conflict (e.g. two `#[dotnet_class]` declarations of the same name disagreeing on
+    ///   `value_type`), not ordering noise — fail loudly rather than silently keep whichever one
+    ///   happened to register first, which used to produce a phantom second `ClassDef` under the
+    ///   same name at the wrong identity (see `finish_type`'s doc for the exact
+    ///   CLR-metadata-corruption shape this closes).
+    ///
+    /// # Panics
+    /// If an authoritative opinion is already recorded and `new_value` disagrees with it.
+    pub fn set_is_valuetype(&mut self, new_value: bool) {
+        if self.is_valuetype_authoritative {
+            assert_eq!(
+                self.is_valuetype, new_value,
+                "comptime: class {:?} re-declares a different `value_type` across its comptime \
+                 entrypoints (`#[dotnet_class]`/`#[dotnet_interface]`) — this is a real conflict, \
+                 not codegen-unit ordering noise",
+                self.name
+            );
+        } else {
+            self.is_valuetype = new_value;
+            self.is_valuetype_authoritative = true;
+        }
     }
 
     pub(crate) fn has_explicit_layout(&self) -> bool {
@@ -1007,6 +1280,12 @@ impl ClassDef {
             {
                 self.properties.push(prop.clone());
             }
+        }
+
+        // Union the custom attributes, deduplicating by full equality (same reasoning as
+        // `add_custom_attribute`'s own dedup — see its doc).
+        for attr in translated.custom_attributes() {
+            self.add_custom_attribute(attr.clone());
         }
 
         // Merge the static fields, removing duplicates

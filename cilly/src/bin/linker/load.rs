@@ -21,7 +21,7 @@ impl LinkableFile {
     }
 }
 fn load_ar(r: &mut impl std::io::Read) -> std::io::Result<(cilly::Assembly, Vec<LinkableFile>)> {
-    let mut final_assembly = cilly::Assembly::default();
+    let mut merged = cilly::Assembly::default();
     let mut archive = Archive::new(r);
     let mut linkables = Vec::new();
     // Iterate over all entries in the archive:
@@ -40,7 +40,7 @@ fn load_ar(r: &mut impl std::io::Read) -> std::io::Result<(cilly::Assembly, Vec<
                 .expect("ERROR: Could not load the assembly file!");
             let assembly = postcard::from_bytes(&asm_bytes)
                 .unwrap_or_else(|e| panic!("ERROR:Could not decode the assembly file {name}! err={e:?} bytes={}", asm_bytes.len()));
-            final_assembly = final_assembly.link(assembly);
+            merged = merged.link(assembly);
         } else if ext.contains("o") {
             let mut file_bytes = Vec::with_capacity(0x100);
             entry
@@ -51,14 +51,14 @@ fn load_ar(r: &mut impl std::io::Read) -> std::io::Result<(cilly::Assembly, Vec<
             eprintln!("shr:{name}");
         }
     }
-    Ok((final_assembly, linkables))
+    Ok((merged, linkables))
 }
 pub fn load_assemblies(
     raw_files: &[&String],
     archives: &[String],
 ) -> (cilly::Assembly, Vec<LinkableFile>) {
     println!("==> Preparing to load assmeblies");
-    let mut final_assembly = cilly::Assembly::default();
+    let mut merged = cilly::Assembly::default();
     let mut linkables = Vec::new();
     for asm_path in raw_files {
         let mut asm_file =
@@ -70,15 +70,15 @@ pub fn load_assemblies(
         let asm: cilly::Assembly =
             postcard::from_bytes(&asm_bytes).expect("ERROR:Could not decode the assembly file!");
 
-        final_assembly = final_assembly.link(asm);
+        merged = merged.link(asm);
     }
     for asm_path in archives {
         let mut asm_file =
             std::fs::File::open(asm_path).expect("ERROR: Could not open the assembly file!");
         let (asm, linkable) = load_ar(&mut asm_file).expect("Could not open archive");
-        final_assembly = final_assembly.link(asm);
+        merged = merged.link(asm);
         linkables.extend(linkable);
     }
     println!("==> Loaded assmeblies");
-    (final_assembly, linkables)
+    (merged, linkables)
 }

@@ -35,31 +35,31 @@ fn main(){{
     // right next to `dll_path` on disk but under the WRONG filename, so CoreCLR's stack-trace
     // resolver silently found no PDB at all.
     let pdb_file = dll_path.with_extension("pdb");
-    let mut requires_refresh = false;
+    let mut needs_refresh = false;
     if dll_path.exists() {{
     	let ondisk_len = std::fs::File::open(dll_path.clone()).expect("Could not create a file to unpack the .NET assembly").metadata().unwrap().len();
     	// If the length on disk is != expected, write the new file TODO: this can very rarely not detect if an update is needed. Check assembly GUID too, to ensure recompilation works.
     	if ondisk_len != DOTNET_ASSEMBLY.len() as u64{{
-    		requires_refresh = true;
+    		needs_refresh = true;
     	}}
     }}
-    if !dll_path.exists() || requires_refresh {{
+    if !dll_path.exists() || needs_refresh {{
         let mut file = std::fs::File::create(dll_path.clone()).expect("Could not create a file to unpack the .NET assembly");
         file.write_all(DOTNET_ASSEMBLY).expect("Could not unpack the .NET assembly");
     }}
-    if !config.exists() ||requires_refresh {{
+    if !config.exists() ||needs_refresh {{
         let mut file = std::fs::File::create(config).expect("Could not create a file to save .NET runtime settings.");
         file.write_all(RUNTIME_COFIG).expect("Could not save .NET runtime settings");
     }}
     if {has_native_companion} {{
-      if !std::path::Path::new("{native_companion_file}").exists() || requires_refresh{{
+      if !std::path::Path::new("{native_companion_file}").exists() || needs_refresh{{
           let mut file = std::fs::File::create("{native_companion_file}").expect("Could not create a file to provide the native companion.");
           file.write_all(BUNDLED_SHARED_LIB).expect("Could create a file to provide the native companion");
       }}
   
     }}
     if {has_pdb}{{
-      if !pdb_file.exists() || requires_refresh{{
+      if !pdb_file.exists() || needs_refresh{{
           let mut file = std::fs::File::create(pdb_file).expect("Could not create a file to provide the pdb debug info.");
           file.write_all(BUNDLED_PDB).expect("Could create a file to provide the pdb debug info.");
       }}

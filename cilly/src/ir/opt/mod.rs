@@ -1,3 +1,9 @@
+//! Per-method V2 IR optimization. `MethodDef::optimize` is the entry point and documents pass
+//! ordering inline (scalar-replacement first, then copy-prop/dead-store elimination to
+//! fixpoint, then root dedup/simplification) — see its body comments for why that order
+//! matters. Every pass is metered by an `OptFuel` budget so a pathological method can't blow
+//! up compile time chasing a fixpoint; see `opt_fuel.rs`.
+
 use root::root_opt;
 
 #[cfg(test)]

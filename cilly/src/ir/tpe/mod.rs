@@ -54,6 +54,46 @@ impl Type {
             | Type::SIMDVector(_) => false,
         }
     }
+    /// Like [`Type::is_gcref`], but recurses into value-type `ClassRef` fields to catch a
+    /// managed reference *nested* inside an outer struct/newtype — e.g.
+    /// `mycorrhiza::task::TaskFuture<T>` is itself a plain (non-overlapping) struct wrapping a
+    /// raw `Task<T>` object handle (`RustcCLRInteropManagedGeneric`, a genuine gcref) in its
+    /// `task` field. `is_gcref` only looks at the outer type's own valuetype-ness, so it reports
+    /// `false` for `TaskFuture<T>` even though it transitively carries a real GC reference —
+    /// [`super::class::ClassDef::layout_check`] needs this deeper check to reason about whether a
+    /// field placed in a coroutine's overlapping variant storage is safe. Bounded recursion depth
+    /// guards against a malformed/cyclic type graph; an unresolved valuetype `ClassRef` (no
+    /// `ClassDef` registered — e.g. `System.Runtime.InteropServices.GCHandle`, an external BCL
+    /// struct cilly never defines fields for) is treated as gcref-free, same as `is_gcref`.
+    pub fn contains_gcref(&self, asm: &Assembly) -> bool {
+        self.contains_gcref_impl(asm, 0)
+    }
+    fn contains_gcref_impl(&self, asm: &Assembly, depth: u32) -> bool {
+        if depth > 64 {
+            // Pathological nesting — conservatively assume it could hide a gcref rather than
+            // risk unbounded recursion on a cyclic/malformed type graph.
+            return true;
+        }
+        match self {
+            Type::ClassRef(c) => {
+                let cref = &asm[*c];
+                if !cref.is_valuetype() {
+                    return true;
+                }
+                match asm
+                    .class_ref_to_def(*c)
+                    .and_then(|idx| asm.class_defs().get(&idx))
+                {
+                    Some(def) => def
+                        .fields()
+                        .iter()
+                        .any(|(t, _, _)| t.contains_gcref_impl(asm, depth + 1)),
+                    None => false,
+                }
+            }
+            _ => self.is_gcref(asm),
+        }
+    }
     pub fn iter_class_refs<'a, 'asm: 'a>(
         &'a self,
         asm: &'asm Assembly,

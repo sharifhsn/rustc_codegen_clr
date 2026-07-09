@@ -80,22 +80,32 @@ impl Token {
 }
 
 /// A resolved `.NET` assembly reference target for [`MetadataBuilder::assembly_ref`]: either a
-/// versioned BCL assembly (mirrors `il_exporter`'s `.assembly extern '<name>' { .ver …
-/// .publickeytoken = (…) }` for `is_bcl_assembly` names, lines ~87-105) or a bare name-only
-/// reference (mirrors the `else` arm, lines ~96-104, used for a consumer's own non-BCL library).
+/// versioned BCL/framework assembly (mirrors `il_exporter`'s `.assembly extern '<name>' { .ver …
+/// .publickeytoken = (…) }` for `bcl_public_key_token`-matched names) or a bare name-only
+/// reference (mirrors the `else` arm, used for a consumer's own non-BCL library).
 pub enum AssemblyRefTarget<'a> {
-    /// A BCL assembly: `.ver` triplet (from `dotnet_version().assembly_ver()`) + the shared ECMA
-    /// public-key token (`B0 3F 5F 7F 11 D5 0A 3A`).
-    Bcl { version: (u16, u16, u16, u16) },
+    /// A BCL/framework assembly: `.ver` triplet (from `dotnet_version().assembly_ver()`) + the
+    /// real public-key token for that assembly's signing family (see `bcl_public_key_token`) —
+    /// NOT always the ECMA token; `Microsoft.Extensions.*`/`Microsoft.AspNetCore.*`/
+    /// `Microsoft.EntityFrameworkCore*` carry a different one.
+    Bcl {
+        version: (u16, u16, u16, u16),
+        token: [u8; 8],
+    },
     /// A consumer-supplied assembly, referenced by simple name only — no version, no token.
     NameOnly,
     #[doc(hidden)]
     _Marker(std::marker::PhantomData<&'a ()>),
 }
 
-/// The fixed ECMA public-key token every BCL assembly reference carries (§II.22.5), matching
-/// `il_exporter`'s `B0 3F 5F 7F 11 D5 0A 3A` literal.
+/// The fixed ECMA public-key token every real `System.*`/CoreLib assembly reference carries
+/// (§II.22.5), matching `il_exporter`'s `B0 3F 5F 7F 11 D5 0A 3A` literal.
 const ECMA_PUBLIC_KEY_TOKEN: [u8; 8] = [0xB0, 0x3F, 0x5F, 0x7F, 0x11, 0xD5, 0x0A, 0x3A];
+
+/// The public-key token Microsoft's "extensions/aspnetcore" signing family carries — a DIFFERENT
+/// key from [`ECMA_PUBLIC_KEY_TOKEN`], matching `il_exporter`'s `AD B9 79 38 29 DD AE 60` literal.
+/// See `bcl_public_key_token`'s doc for how this was verified.
+const EXTENSIONS_PUBLIC_KEY_TOKEN: [u8; 8] = [0xAD, 0xB9, 0x79, 0x38, 0x29, 0xDD, 0xAE, 0x60];
 
 /// The maximum class-name length the CoreCLR `ilasm` accepts ("Full class name too long
 /// (N characters, 1023 allowed)"); ported from `il_exporter::ILASM_MAX_CLASS_NAME` so `tables.rs`
@@ -456,6 +466,42 @@ const SORTED_TABLES: &[u32] = &[
     Token::TABLE_GENERIC_PARAM,
 ];
 
+// ---- §II.23.3 CustomAttrib element-type tags used by `MetadataBuilder::add_custom_attribute` ----
+// These match the corresponding `ELEMENT_TYPE_*` codes (§II.23.1.16) for every arg shape
+// `crate::ir::class::CustomAttrArg` can express; the custom-attribute blob format reuses them
+// directly for primitive/string FixedArgs and NamedArg FieldOrPropTypes (no boxing needed since
+// this backend never emits an `Object`-typed ctor/property parameter).
+const ATTR_ELEM_BOOLEAN: u8 = 0x02;
+const ATTR_ELEM_I4: u8 = 0x08;
+const ATTR_ELEM_I8: u8 = 0x0A;
+const ATTR_ELEM_STRING: u8 = 0x0E;
+/// §II.23.3 `NamedArg` kind discriminator: `0x54` PROPERTY. `0x53` FIELD is not emitted — see
+/// `CustomAttrDef`'s doc for why field-targeted named args are out of scope.
+const ATTR_NAMED_PROPERTY: u8 = 0x54;
+
+fn write_u16_le(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+/// Encodes one `CustomAttrArg`'s value as a §II.23.3 `FixedArg` (this exact same shape is reused
+/// for both a positional ctor `FixedArg` and a `NamedArg`'s trailing value — the two are
+/// byte-identical, only the surrounding named-arg header differs). A UTF-8 `SerString`
+/// (compressed length + raw bytes, §II.23.2) for strings; the primitive's raw little-endian bytes
+/// otherwise. Every shape has a fixed, unambiguous length, so this can never desynchronize the
+/// blob — see `CustomAttrDef`'s doc.
+fn encode_custom_attr_fixed_arg(out: &mut Vec<u8>, v: &crate::ir::class::CustomAttrArg, asm: &Assembly) {
+    match v {
+        crate::ir::class::CustomAttrArg::Str(s) => {
+            let text = asm[*s].to_string();
+            write_compressed_u32(out, u32::try_from(text.len()).unwrap());
+            out.extend_from_slice(text.as_bytes());
+        }
+        crate::ir::class::CustomAttrArg::Bool(b) => out.push(u8::from(*b)),
+        crate::ir::class::CustomAttrArg::I32(i) => out.extend_from_slice(&i.to_le_bytes()),
+        crate::ir::class::CustomAttrArg::I64(i) => out.extend_from_slice(&i.to_le_bytes()),
+    }
+}
+
 impl MetadataBuilder {
     /// Builds a fresh, empty builder — already seeded with the mandatory `<Module>` pseudo-`TypeDef`
     /// (§II.22.37: "The first row of the TypeDef table represents the pseudo class that acts as
@@ -495,13 +541,14 @@ impl MetadataBuilder {
 
     /// Interns an `AssemblyRef` row (§II.22.5), returning its token. `name` is the `.NET`
     /// assembly identity (e.g. `"System.Runtime"`); `target` selects the BCL-versioned vs.
-    /// name-only shape per `il_exporter`'s `is_bcl_assembly` split (lines ~87-105).
+    /// name-only shape per `il_exporter`'s `bcl_public_key_token` split.
     pub fn assembly_ref(&mut self, name: &str, target: AssemblyRefTarget<'_>) -> Token {
         let name_off = self.strings.intern(name);
         let (major, minor, build, revision, public_key_or_token) = match target {
             AssemblyRefTarget::Bcl {
                 version: (maj, min, bui, rev),
-            } => (maj, min, bui, rev, self.blobs.intern(&ECMA_PUBLIC_KEY_TOKEN)),
+                token,
+            } => (maj, min, bui, rev, self.blobs.intern(&token)),
             AssemblyRefTarget::NameOnly => (0, 0, 0, 0, 0),
             AssemblyRefTarget::_Marker(_) => unreachable!("hidden marker variant"),
         };
@@ -1314,6 +1361,73 @@ impl MetadataBuilder {
         Token::new(Token::TABLE_CUSTOM_ATTRIBUTE, rid)
     }
 
+    /// The general `CustomAttribute` (§II.21/§II.22.10/§II.23.3) emitter — everything
+    /// `thread_static_attribute` above hardcodes for one specific attribute, generalized to any
+    /// [`crate::ir::class::CustomAttrDef`]: resolves the attribute's TYPE via the same
+    /// `ClassRef`→`TypeRef`/`TypeDef` machinery `extends`/`implements` already use
+    /// ([`MetadataBuilder::class_ref_token`]), finds-or-creates the matching `.ctor`
+    /// `MemberRef` (a HASTHIS signature shaped by `attr.ctor_args()`'s element types), and
+    /// assembles a well-formed `CustomAttrib` blob (prolog `0x0001`, one `FixedArg` per ctor arg
+    /// in order, `NumNamed`, then one `NamedArg` per named property arg) per §II.23.3. `parent` is
+    /// the target row's own token (`HasCustomAttribute` coded index, §II.24.2.6) — a `TypeDef` for
+    /// the type-level attributes this is wired up for today, though [`encode_has_custom_attribute`]
+    /// accepts several other target kinds too.
+    ///
+    /// Every arg shape [`crate::ir::class::CustomAttrArg`] can express (`Str`/`Bool`/`I32`/`I64`)
+    /// encodes to a FIXED number of bytes with no length ambiguity, so this function can never
+    /// produce a malformed blob by construction — see `CustomAttrDef`'s doc for the full safety
+    /// argument (this is why the surface is a safe API, not `unsafe`).
+    pub fn add_custom_attribute(
+        &mut self,
+        asm: &mut Assembly,
+        parent: Token,
+        attr: &crate::ir::class::CustomAttrDef,
+    ) -> Token {
+        let attr_type_tok = self.class_ref_token(asm, attr.attr_type());
+        let arg_kind = |v: &crate::ir::class::CustomAttrArg| -> u8 {
+            match v {
+                crate::ir::class::CustomAttrArg::Str(_) => ATTR_ELEM_STRING,
+                crate::ir::class::CustomAttrArg::Bool(_) => ATTR_ELEM_BOOLEAN,
+                crate::ir::class::CustomAttrArg::I32(_) => ATTR_ELEM_I4,
+                crate::ir::class::CustomAttrArg::I64(_) => ATTR_ELEM_I8,
+            }
+        };
+        // ---- ctor MemberRef: HASTHIS, one param per ctor arg, VOID return ----
+        let mut sig = Vec::new();
+        sig.push(sig::SIG_HASTHIS);
+        write_compressed_u32(&mut sig, u32::try_from(attr.ctor_args().len()).unwrap());
+        sig.push(0x01); // ELEMENT_TYPE_VOID
+        for a in attr.ctor_args() {
+            sig.push(arg_kind(a));
+        }
+        let sig_off = self.blobs.intern(&sig);
+        let ctor = self.member_ref(attr_type_tok, ".ctor", sig_off);
+
+        // ---- CustomAttrib blob (§II.23.3) ----
+        let mut blob = Vec::new();
+        write_u16_le(&mut blob, 0x0001); // Prolog
+        for a in attr.ctor_args() {
+            encode_custom_attr_fixed_arg(&mut blob, a, asm);
+        }
+        write_u16_le(&mut blob, u16::try_from(attr.named_args().len()).unwrap());
+        for (name, val) in attr.named_args() {
+            blob.push(ATTR_NAMED_PROPERTY); // §II.23.3: 0x54 PROPERTY (only shape supported)
+            blob.push(arg_kind(val));
+            let name_str = asm[*name].to_string();
+            write_compressed_u32(&mut blob, u32::try_from(name_str.len()).unwrap());
+            blob.extend_from_slice(name_str.as_bytes());
+            encode_custom_attr_fixed_arg(&mut blob, val, asm);
+        }
+        let value = self.blobs.intern(&blob);
+        self.custom_attribute.push(CustomAttributeRow {
+            parent: encode_has_custom_attribute(parent),
+            ctor: encode_custom_attribute_type(ctor),
+            value,
+        });
+        let rid = u32::try_from(self.custom_attribute.len()).unwrap();
+        Token::new(Token::TABLE_CUSTOM_ATTRIBUTE, rid)
+    }
+
     /// Finds-or-creates the `MemberRef` to `System.ThreadStaticAttribute::.ctor()`, resolving
     /// through a `System.Runtime`-scoped `TypeRef` (no `AssemblyRef` row is created here — the
     /// caller is expected to have already registered `System.Runtime` via
@@ -1356,6 +1470,7 @@ impl MetadataBuilder {
         let target = if self.is_lib {
             AssemblyRefTarget::Bcl {
                 version: crate::ir::dotnet_version().assembly_ver_tuple(),
+                token: ECMA_PUBLIC_KEY_TOKEN,
             }
         } else {
             AssemblyRefTarget::NameOnly
@@ -2049,15 +2164,28 @@ fn encode_method_def_or_ref(token: Token) -> u32 {
 /// any token whose table appears in the spec's ordering so future callers (e.g. attaching one to
 /// a `MethodDef`) aren't blocked.
 fn encode_has_custom_attribute(token: Token) -> u32 {
+    // §II.24.2.6's canonical `HasCustomAttribute` tag order: MethodDef=0, Field=1, TypeRef=2,
+    // TypeDef=3, Param=4, InterfaceImpl=5, MemberRef=6, Module=7, Permission=8, Property=9,
+    // Event=10, StandAloneSig=11, ModuleRef=12, TypeSpec=13, Assembly=14, AssemblyRef=15, …
+    // PRIOR BUG (found wiring the general `CustomAttribute` emitter — `add_custom_attribute` —
+    // to a `TypeDef` parent for the first time): this match used to assign TypeRef=3/TypeDef=4/
+    // Param=5/InterfaceImpl=6/MemberRef=7/Module=8 — each off by one from the spec, shifted up to
+    // (accidentally) leave a gap at tag 2. It was never caught because the ONLY parent kind ever
+    // passed through here before was `Field` (tag 1, correct by construction), so `.field
+    // ThreadStaticAttribute` rows happened to decode fine; a `TypeDef` parent decoded as `Param`
+    // instead (`monodis --customattr` showing `Param: <field token>` for a class-level attribute
+    // was the tell). `TypeSpec`(13)/`Assembly`(14)/`AssemblyRef`(15) were already correct since
+    // this backend never emits a custom attribute on any of the tags in between, so the gap never
+    // surfaced there either.
     let tag = match token.table() {
         Token::TABLE_METHOD_DEF => 0,
         Token::TABLE_FIELD => 1,
-        Token::TABLE_TYPE_REF => 3,
-        Token::TABLE_TYPE_DEF => 4,
-        Token::TABLE_PARAM => 5,
-        Token::TABLE_INTERFACE_IMPL => 6,
-        Token::TABLE_MEMBER_REF => 7,
-        Token::TABLE_MODULE => 8,
+        Token::TABLE_TYPE_REF => 2,
+        Token::TABLE_TYPE_DEF => 3,
+        Token::TABLE_PARAM => 4,
+        Token::TABLE_INTERFACE_IMPL => 5,
+        Token::TABLE_MEMBER_REF => 6,
+        Token::TABLE_MODULE => 7,
         Token::TABLE_ASSEMBLY => 14,
         Token::TABLE_ASSEMBLY_REF => 15,
         Token::TABLE_TYPE_SPEC => 13,
@@ -2486,25 +2614,26 @@ impl MetadataBuilder {
     }
 
     /// Finds-or-creates an `AssemblyRef` row for `name`, applying the same BCL-vs-consumer split
-    /// as `il_exporter`'s `is_bcl_assembly` (this local port avoids depending on `il_exporter`,
-    /// per the hard constraint that `pe_exporter` may not import it). Public so other `pe_exporter`
-    /// modules (e.g. `export::export_pe`, bootstrapping a `System.Object`/`System.ValueType`
-    /// `TypeRef`) share the same deduplicated row instead of calling the always-inserts
-    /// [`MetadataBuilder::assembly_ref`] directly and creating duplicate rows for repeated
-    /// bootstrap references.
+    /// as `il_exporter`'s `bcl_public_key_token` (this local port avoids depending on
+    /// `il_exporter`, per the hard constraint that `pe_exporter` may not import it). Public so
+    /// other `pe_exporter` modules (e.g. `export::export_pe`, bootstrapping a
+    /// `System.Object`/`System.ValueType` `TypeRef`) share the same deduplicated row instead of
+    /// calling the always-inserts [`MetadataBuilder::assembly_ref`] directly and creating
+    /// duplicate rows for repeated bootstrap references.
     pub fn find_or_create_assembly_ref(&mut self, name: &str) -> Token {
         for (i, row) in self.assembly_ref.iter().enumerate() {
             if self.strings_eq(row.name, name) {
                 return Token::new(Token::TABLE_ASSEMBLY_REF, u32::try_from(i + 1).unwrap());
             }
         }
-        let target = if is_bcl_assembly(name) && self.is_lib {
+        let target = if let (Some(token), true) = (bcl_public_key_token(name), self.is_lib) {
             // Same single source of truth as `system_runtime_assembly_ref`: `dotnet_version()` is
             // reachable here with zero threading (free fn, same crate) — mirrors `il_exporter`'s
             // `dv_ver`. Also gated on `self.is_lib` for the same reason `system_runtime_assembly_ref`
             // is — see `MetadataBuilder::is_lib`'s doc.
             AssemblyRefTarget::Bcl {
                 version: crate::ir::dotnet_version().assembly_ver_tuple(),
+                token,
             }
         } else {
             AssemblyRefTarget::NameOnly
@@ -2513,12 +2642,33 @@ impl MetadataBuilder {
     }
 }
 
-/// Local port of `il_exporter::is_bcl_assembly` (kept private/duplicated rather than imported,
-/// per the hard constraint that `pe_exporter` code must not depend on `il_exporter`).
-fn is_bcl_assembly(name: &str) -> bool {
-    name.starts_with("System")
-        || name.starts_with("Microsoft")
-        || matches!(name, "mscorlib" | "netstandard" | "WindowsBase")
+/// The public-key token an external assembly's `AssemblyRef` row should carry, or `None` if it's a
+/// consumer-supplied assembly that should be referenced by simple name only (no version/token).
+///
+/// Local port of `il_exporter::bcl_public_key_token` (kept private/duplicated rather than
+/// imported, per the hard constraint that `pe_exporter` code must not depend on `il_exporter`; see
+/// that function's doc comment for the full rationale and how the two non-ECMA tokens were
+/// verified — this used to be a single `is_bcl_assembly(name) -> bool` that wrongly treated every
+/// `Microsoft`-prefixed name as CoreLib-signed).
+fn bcl_public_key_token(name: &str) -> Option<[u8; 8]> {
+    if name.starts_with("System") || matches!(name, "mscorlib" | "netstandard" | "WindowsBase") {
+        return Some(ECMA_PUBLIC_KEY_TOKEN);
+    }
+    const EXTENSIONS_FAMILY_PREFIXES: &[&str] = &[
+        "Microsoft.AspNetCore",
+        "Microsoft.Extensions",
+        "Microsoft.EntityFrameworkCore",
+        "Microsoft.OpenApi",
+        "Microsoft.JSInterop",
+        "Microsoft.Net.Http.Headers",
+    ];
+    if EXTENSIONS_FAMILY_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        return Some(EXTENSIONS_PUBLIC_KEY_TOKEN);
+    }
+    None
 }
 
 /// Splits an EXTERNAL type's dotted name into a metadata `TypeNamespace`/`TypeName` pair
@@ -4292,6 +4442,7 @@ mod tests {
             "System.Runtime",
             AssemblyRefTarget::Bcl {
                 version: (8, 0, 0, 0),
+                token: ECMA_PUBLIC_KEY_TOKEN,
             },
         );
         let console_ref = mb.type_ref(Some(ext_scope), "System", "Console");
@@ -4732,6 +4883,7 @@ mod tests {
             "System.Runtime",
             AssemblyRefTarget::Bcl {
                 version: (8, 0, 0, 0),
+                token: ECMA_PUBLIC_KEY_TOKEN,
             },
         );
         let name_only = mb.assembly_ref("MyLib", AssemblyRefTarget::NameOnly);
@@ -4825,6 +4977,64 @@ mod tests {
         let bytes = mb.blobs.as_bytes();
         // length-prefix(1) + the 4 fixed bytes.
         assert_eq!(&bytes[value_off as usize..value_off as usize + 5], &[4, 0x01, 0x00, 0x00, 0x00]);
+    }
+
+    /// The general `add_custom_attribute` emitter, attached to a `TypeDef` — the exact shape
+    /// `#[dotnet_class(attr(...))]` uses. Regression-guards a real bug this test would have
+    /// caught: `encode_has_custom_attribute`'s tag table was off-by-one for `TypeRef`/`TypeDef`/
+    /// `Param` (only `Field`, tag 1, had ever been exercised before this general emitter existed),
+    /// so a `TypeDef`-parented `CustomAttribute` row decoded as a bogus `Param`-parented one —
+    /// caught empirically via `monodis --customattr` showing `Param: <token>` instead of
+    /// `TypeDef: <token>` for a class-level attribute.
+    #[test]
+    fn add_custom_attribute_on_a_typedef_parent_decodes_as_typedef() {
+        let mut mb = MetadataBuilder::new();
+        let mut asm = Assembly::default();
+        let class_tok = mb.add_type_def("", "Widget", false, None, None, None, &[]);
+
+        let attr_name = asm.alloc_string("FooAttribute".to_string());
+        let attr_asm = asm.alloc_string("SomeAssembly".to_string());
+        let attr_type =
+            asm.alloc_class_ref(ClassRef::new(attr_name, Some(attr_asm), false, [].into()));
+        let prop_name = asm.alloc_string("Bar".to_string());
+        let ctor_arg = asm.alloc_string("hello".to_string());
+        let attr_def = crate::ir::class::CustomAttrDef::new(
+            attr_type,
+            vec![crate::ir::class::CustomAttrArg::Str(ctor_arg)],
+            vec![(prop_name, crate::ir::class::CustomAttrArg::I32(7))],
+        );
+
+        let attr_tok = mb.add_custom_attribute(&mut asm, class_tok, &attr_def);
+        assert_eq!(attr_tok.table(), Token::TABLE_CUSTOM_ATTRIBUTE);
+        assert_eq!(mb.custom_attribute.len(), 1);
+
+        // The `parent` coded index must decode back to the ORIGINAL `TypeDef` token — this is
+        // exactly the bug: it used to decode as `Param` instead.
+        let row = &mb.custom_attribute[0];
+        let parent_tag = row.parent & 0x1F; // 5 tag bits (§II.24.2.6 HasCustomAttribute)
+        assert_eq!(parent_tag, 3, "TypeDef must be HasCustomAttribute tag 3 per §II.24.2.6");
+        assert_eq!(row.parent >> 5, class_tok.rid());
+
+        // One MemberRef `.ctor` row, with a HASTHIS/1-param/VOID-return/STRING-param signature.
+        assert_eq!(mb.member_ref.len(), 1);
+
+        // Blob: prolog(2) + FixedArg string "hello" (1-byte len + 5 bytes) + NumNamed(2) +
+        // NamedArg(PROPERTY tag + I4 type + name SerString + 4-byte i32 value).
+        let bytes = mb.blobs.as_bytes();
+        // `+1`: the blob heap itself prefixes every entry with its own compressed length
+        // (§II.24.2.4) — `row.value` points at THAT prefix, not the raw `CustomAttrib` bytes
+        // (mirrors `thread_static_attribute_uses_fixed_blob`'s identical `+1`-shaped skip, there
+        // spelled as a literal leading `4` in its expected slice).
+        let off = row.value as usize + 1;
+        assert_eq!(&bytes[off..off + 2], &[0x01, 0x00], "prolog");
+        assert_eq!(bytes[off + 2], 5, "ctor string arg length prefix");
+        assert_eq!(&bytes[off + 3..off + 8], b"hello");
+        assert_eq!(&bytes[off + 8..off + 10], &[0x01, 0x00], "NumNamed = 1");
+        assert_eq!(bytes[off + 10], 0x54, "NamedArg kind = PROPERTY");
+        assert_eq!(bytes[off + 11], 0x08, "NamedArg type = ELEMENT_TYPE_I4");
+        assert_eq!(bytes[off + 12], 3, "property name length prefix");
+        assert_eq!(&bytes[off + 13..off + 16], b"Bar");
+        assert_eq!(&bytes[off + 16..off + 20], &7i32.to_le_bytes());
     }
 
     /// `StaticFieldDef::is_const` (Cluster C item 3's `initonly` case) sets `FieldAttributes`

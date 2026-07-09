@@ -15,7 +15,11 @@ pub struct MethodRef {
     class: Interned<ClassRef>,
     name: Interned<IString>,
     sig: Interned<FnSig>,
+    /// Static/instance/virtual/constructor — which ECMA-335 calling convention and dispatch
+    /// (`call` vs `callvirt`) this reference requires.
     kind: MethodKind,
+    /// Generic arguments bound at the call site for this *method* (`!!N`), distinct from
+    /// `class`'s own generic arguments (`!N`) — the two tiers are bound independently.
     generics: Box<[Type]>,
 }
 impl IntoAsmIndex<Interned<MethodRef>> for MethodRef {

@@ -13,6 +13,9 @@ use fxhash::{hash64, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::{any::type_name, ops::Index};
 
+/// Maps a method name to a closure that synthesizes its `MethodImpl` on demand. Populated
+/// and consumed at link time (not codegen time) by the `linker` binary (`bin/linker/patch.rs`)
+/// to fill in libc/intrinsic shims referenced but never defined by rustc-generated code.
 pub type MissingMethodPatcher =
     FxHashMap<Interned<IString>, Box<dyn Fn(Interned<MethodRef>, &mut Assembly) -> MethodImpl>>;
 type StringMap = BiMap<IString>;
@@ -331,7 +334,7 @@ impl Assembly {
             .filter(move |(id, def)| filter(self, **id, def))
     }
     /// Modifies the method deifinition by running the closure on it
-    pub fn modify_methodef(
+    pub fn edit_methodef(
         &mut self,
         modify: impl FnOnce(&mut Self, &mut MethodDef),
         def_id: MethodDefIdx,
@@ -371,7 +374,7 @@ impl Assembly {
                 }
             })
     }
-    pub fn get_prealllocated_string(
+    pub fn get_prealloc_string(
         &self,
         string: impl Into<IString>,
     ) -> Option<Interned<IString>> {
@@ -753,7 +756,7 @@ impl Assembly {
         ))
     }
     fn has_builtin(&self, name: &str, input: impl Into<Box<[Type]>>, output: Type) -> bool {
-        let Some(main_module) = self.get_prealllocated_string(MAIN_MODULE) else {
+        let Some(main_module) = self.get_prealloc_string(MAIN_MODULE) else {
             return false;
         };
         let class_def = ClassDef::new(
@@ -769,7 +772,7 @@ impl Assembly {
             true,
         );
 
-        let Some(cref) = self.get_prealllocated_class_ref(class_def.ref_to()) else {
+        let Some(cref) = self.get_prealloc_class_ref(class_def.ref_to()) else {
             return false;
         };
         // Check if that definition already exists
@@ -779,14 +782,14 @@ impl Assembly {
             return false;
         };
 
-        let Some(user_init) = self.get_prealllocated_string(name) else {
+        let Some(user_init) = self.get_prealloc_string(name) else {
             return false;
         };
 
-        let Some(ctor_sig) = self.get_prealllocated_sig(FnSig::new(input.into(), output)) else {
+        let Some(ctor_sig) = self.get_prealloc_sig(FnSig::new(input.into(), output)) else {
             return false;
         };
-        let Some(cctor) = self.get_prealllocated_methodref(MethodRef::new(
+        let Some(cctor) = self.get_prealloc_methodref(MethodRef::new(
             *main_module,
             user_init,
             ctor_sig,
@@ -804,13 +807,13 @@ impl Assembly {
     pub fn has_tcctor(&self) -> bool {
         self.has_builtin(TCCTOR, [], Type::Void)
     }
-    pub fn get_prealllocated_class_ref(&self, cref: ClassRef) -> Option<Interned<ClassRef>> {
+    pub fn get_prealloc_class_ref(&self, cref: ClassRef) -> Option<Interned<ClassRef>> {
         self.class_refs.1.get(&cref).copied()
     }
-    pub fn get_prealllocated_sig(&self, sig: FnSig) -> Option<Interned<FnSig>> {
+    pub fn get_prealloc_sig(&self, sig: FnSig) -> Option<Interned<FnSig>> {
         self.sigs.1.get(&sig).copied()
     }
-    pub fn get_prealllocated_methodref(&self, mref: MethodRef) -> Option<Interned<MethodRef>> {
+    pub fn get_prealloc_methodref(&self, mref: MethodRef) -> Option<Interned<MethodRef>> {
         self.method_refs.1.get(&mref).copied()
     }
     /// Returns a reference to the static initializer
@@ -982,13 +985,13 @@ impl Assembly {
     }
     pub(crate) fn eliminate_dead_fns(&mut self, only_imports: bool) {
         // 1st. Collect all "extern" method definitons, since those are always alive.
-        let mut previosly_ressurected: FxHashSet<MethodDefIdx> = self
+        let mut wave: FxHashSet<MethodDefIdx> = self
             .method_defs
             .iter()
             .filter(|(_, def)| def.access().is_extern())
             .map(|(idx, _)| *idx)
             .collect();
-        let mut to_resurrect: FxHashSet<MethodDefIdx> = FxHashSet::default();
+        let mut next_wave: FxHashSet<MethodDefIdx> = FxHashSet::default();
         let mut alive: FxHashSet<MethodDefIdx> = FxHashSet::default();
         // If only cleaning up imports, assume all non-import fns are alive.
         if only_imports {
@@ -999,8 +1002,8 @@ impl Assembly {
                     .map(|(id, _)| *id),
             );
         }
-        while !previosly_ressurected.is_empty() {
-            for def in previosly_ressurected
+        while !wave.is_empty() {
+            for def in wave
                 .iter()
                 .map(|def: &MethodDefIdx| self.method_defs.get(def).unwrap())
             {
@@ -1010,7 +1013,7 @@ impl Assembly {
                 if let MethodImpl::AliasFor(target) = def.implementation() {
                     let tdef = MethodDefIdx::from_raw(*target);
                     if self.method_defs.contains_key(&tdef) && !alive.contains(&tdef) {
-                        to_resurrect.insert(tdef);
+                        next_wave.insert(tdef);
                     }
                 }
                 // Iterate torugh the cil of this method, if present
@@ -1038,16 +1041,16 @@ impl Assembly {
                             }
                         })
                 });
-                to_resurrect.extend(defids);
+                next_wave.extend(defids);
             }
-            alive.extend(previosly_ressurected);
-            previosly_ressurected = to_resurrect;
-            to_resurrect = FxHashSet::default();
+            alive.extend(wave);
+            wave = next_wave;
+            next_wave = FxHashSet::default();
         }
 
         // Some cheap sanity checks
-        assert!(previosly_ressurected.is_empty());
-        assert!(to_resurrect.is_empty());
+        assert!(wave.is_empty());
+        assert!(next_wave.is_empty());
         // Set the method set to only include alive methods
         self.method_defs = alive
             .iter()
@@ -1064,14 +1067,14 @@ impl Assembly {
         self.eliminate_dead_types();
     }
     pub(crate) fn eliminate_dead_types(&mut self) {
-        let mut previosly_ressurected: FxHashSet<ClassDefIdx> = self
+        let mut wave: FxHashSet<ClassDefIdx> = self
             .method_defs()
             .values()
             .flat_map(|method| method.iter_types(self))
             .flat_map(|tpe| tpe.iter_class_refs(self).collect::<Vec<_>>())
             .filter_map(|cref| self.class_ref_to_def(cref))
             .collect();
-        previosly_ressurected.extend(self.class_defs().iter().filter_map(|(defid, def)| {
+        wave.extend(self.class_defs().iter().filter_map(|(defid, def)| {
             if def.access().is_extern() {
                 Some(defid)
             } else {
@@ -1081,18 +1084,18 @@ impl Assembly {
         let rust_void = self.alloc_string("RustVoid");
         let rust_void = self.alloc_class_ref(ClassRef::new(rust_void, None, true, vec![].into()));
         if let Some(cref) = self.class_ref_to_def(rust_void) {
-            previosly_ressurected.insert(cref);
+            wave.insert(cref);
         }
         let f128 = self.alloc_string("f128");
         let f128 = self.alloc_class_ref(ClassRef::new(f128, None, true, vec![].into()));
         if let Some(cref) = self.class_ref_to_def(f128) {
-            previosly_ressurected.insert(cref);
+            wave.insert(cref);
         }
 
-        let mut to_resurrect: FxHashSet<ClassDefIdx> = FxHashSet::default();
+        let mut next_wave: FxHashSet<ClassDefIdx> = FxHashSet::default();
         let mut alive: FxHashSet<ClassDefIdx> = FxHashSet::default();
-        while !previosly_ressurected.is_empty() {
-            for def in &previosly_ressurected {
+        while !wave.is_empty() {
+            for def in &wave {
                 let defids: FxHashSet<ClassDefIdx> = self.class_defs[def]
                     .iter_types()
                     .flat_map(|tpe| tpe.iter_class_refs(self).collect::<Vec<_>>())
@@ -1100,15 +1103,15 @@ impl Assembly {
                     .filter(|refid| !alive.contains(refid))
                     .collect();
 
-                to_resurrect.extend(defids);
+                next_wave.extend(defids);
             }
-            alive.extend(previosly_ressurected);
-            previosly_ressurected = to_resurrect;
-            to_resurrect = FxHashSet::default();
+            alive.extend(wave);
+            wave = next_wave;
+            next_wave = FxHashSet::default();
         }
         // Some cheap sanity checks
-        assert!(previosly_ressurected.is_empty());
-        assert!(to_resurrect.is_empty());
+        assert!(wave.is_empty());
+        assert!(next_wave.is_empty());
         // Set the class_defs to only include alive classes
         self.class_defs = alive
             .iter()
@@ -1318,6 +1321,28 @@ impl Assembly {
         } else {
             None
         }
+    }
+
+    /// Finds a registered class definition by NAME ALONE, ignoring the `is_valuetype`/`asm`/
+    /// `generics` that are baked into a `ClassRef`'s own identity (and therefore into
+    /// [`Self::class_ref_to_def`]'s lookup key).
+    ///
+    /// Needed by the comptime interpreter's `finish_type` (`src/comptime.rs`): a class can be
+    /// described by MULTIPLE comptime entrypoints (a `#[dotnet_class]` struct declaration plus
+    /// each `#[dotnet_methods]` impl block re-opening it), and a re-opening entrypoint has no
+    /// access to the original struct's `value_type = ...` attribute, so it cannot honestly
+    /// construct the SAME `ClassRef` the authoritative entrypoint registered under. Looking the
+    /// existing def up by name-only decouples "is this the same class" from "does this
+    /// entrypoint happen to agree on is_valuetype" — the latter is reconciled explicitly via
+    /// [`ClassDef::set_is_valuetype`] once the def is found, instead of silently registering a
+    /// second, phantom same-named `ClassDef` at a different (wrong) `ClassRef` identity, which
+    /// `class_ref_to_def`'s exact-`ClassRef`-match lookup would not have caught.
+    #[must_use]
+    pub fn class_def_by_name(&self, name: Interned<IString>) -> Option<ClassDefIdx> {
+        self.class_defs
+            .iter()
+            .find(|(_, def)| def.name() == name)
+            .map(|(idx, _)| *idx)
     }
 
     #[must_use]

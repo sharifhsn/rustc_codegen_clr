@@ -1,3 +1,12 @@
+//! The default, production `Exporter`: prints CIL as textual IL and shells out to an
+//! external `ilasm` to assemble it into a `.dll`/`.exe` (unlike `pe_exporter`, which writes
+//! PE bytes in-process). `il_exporter` remains the default until `pe_exporter` survives the
+//! full `::stable` gate — see `docs/PE_EMISSION_PLAN.md`. `IlasmFlavour` (in `asm.rs`)
+//! selects which `ilasm` implementation's quirks to target (Mono vs. CoreCLR); `partition`
+//! exists as a submodule because CoreCLR caps the number of methods a single .NET type can
+//! hold (65,535), so large whole-program builds must be split across multiple classes
+//! before assembling — see that module's own doc for the bin-packing strategy.
+
 use crate::{
     branch_cond_to_name,
     utilis::{assert_unique, encode},
@@ -85,10 +94,11 @@ impl ILExporter {
             externs.sort();
             externs.dedup();
             for ext in externs {
-                if is_bcl_assembly(ext) {
+                if let Some(token) = bcl_public_key_token(ext) {
                     // CoreLib/mscorlib are now normalized to System.Runtime, so they fall through to
-                    // `_`. All BCL assemblies share the ECMA public-key token and the runtime `.ver`.
-                    let (ver, token) = (dv_ver, "B0 3F 5F 7F 11 D5 0A 3A");
+                    // the ECMA-token arm of `bcl_public_key_token`. Non-CoreLib families (the
+                    // ASP.NET Core / Microsoft.Extensions signing family) get their own real token.
+                    let ver = dv_ver;
                     writeln!(
                         out,
                         ".assembly extern '{ext}' {{ .ver {ver} .publickeytoken = ({token}) }}"
@@ -2021,15 +2031,47 @@ fn ref_assembly_name_for_type<'a>(assembly: &'a str, type_name: &str) -> &'a str
     }
     ref_assembly_name(assembly)
 }
-/// Whether an external assembly name is part of the .NET base class library (so its `.assembly extern`
-/// header carries the runtime `.ver` + the shared ECMA public-key token). Everything else is treated as
-/// a consumer-supplied assembly, referenced by simple name only (no version/token) so it binds against
-/// a plain `dotnet build` output. The `::stable` suite references only `System.*`/`Microsoft.*`/CoreLib
-/// assemblies, so its externs are unaffected.
-fn is_bcl_assembly(name: &str) -> bool {
-    name.starts_with("System")
-        || name.starts_with("Microsoft")
-        || matches!(name, "mscorlib" | "netstandard" | "WindowsBase")
+/// The public-key token an external assembly's `.assembly extern` header should carry, or `None`
+/// if it's a consumer-supplied assembly that should be referenced by simple name only (no
+/// version/token) so it binds against a plain `dotnet build` output.
+///
+/// This used to be a single `is_bcl_assembly(name) -> bool` that treated ANY `Microsoft`-prefixed
+/// name as CoreLib-signed and stamped it with CoreLib's own ECMA token — WRONG. Plenty of
+/// `Microsoft.*`-named NuGet packages (the whole `Microsoft.Extensions.*`/`Microsoft.AspNetCore.*`/
+/// `Microsoft.EntityFrameworkCore*` family) are signed with a DIFFERENT key. Confirmed via a live
+/// reflection probe of the real net8/net9 ref packs and NuGet-cached DLLs (see
+/// `cargo_tests/cd_bgservice/csharp/Program.cs`'s investigation comment and
+/// `docs/RUST_PARITY_ROADMAP.md` Tier-0 item 3): `Microsoft.Extensions.Hosting.Abstractions`,
+/// `Microsoft.AspNetCore.Authorization`, and `Microsoft.EntityFrameworkCore` all carry
+/// `PublicKeyToken=adb9793829ddae60` — Microsoft's "extensions/aspnetcore" signing key — regardless
+/// of whether the DLL came from the in-box shared framework or a NuGet restore, because Microsoft's
+/// build pipeline signs this whole family with one key. That's a DIFFERENT key from the ECMA token
+/// (`b03f5f7f11d50a3a`) real `System.*`/CoreLib assemblies carry.
+///
+/// This is still a name-prefix table, not per-assembly detection (see the Tier-0 item 3 writeup for
+/// why full plumbing was out of scope), but it is now a small, curated, verified table instead of a
+/// blanket `starts_with("Microsoft")` — a third-party NuGet package that merely happens to be named
+/// `Microsoft.Foo` (not in either family below) now correctly falls through to `None` (name-only
+/// extern) instead of being mis-stamped with a key it was never signed with.
+fn bcl_public_key_token(name: &str) -> Option<&'static str> {
+    if name.starts_with("System") || matches!(name, "mscorlib" | "netstandard" | "WindowsBase") {
+        return Some("B0 3F 5F 7F 11 D5 0A 3A");
+    }
+    const EXTENSIONS_FAMILY_PREFIXES: &[&str] = &[
+        "Microsoft.AspNetCore",
+        "Microsoft.Extensions",
+        "Microsoft.EntityFrameworkCore",
+        "Microsoft.OpenApi",
+        "Microsoft.JSInterop",
+        "Microsoft.Net.Http.Headers",
+    ];
+    if EXTENSIONS_FAMILY_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        return Some("AD B9 79 38 29 DD AE 60");
+    }
+    None
 }
 fn simple_class_ref(cref: Interned<ClassRef>, asm: &Assembly) -> String {
     let cref = asm.class_ref(cref);

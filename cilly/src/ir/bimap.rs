@@ -5,6 +5,9 @@ use std::{
     ops::Index,
 };
 
+/// Hash-conses `Value`s: `alloc` structurally dedups by value equality, so two equal
+/// `Value`s always yield the same `Interned<Value>` key. This is load-bearing for the
+/// optimizer (e.g. dedup passes rely on identical nodes already sharing one id).
 #[derive(Serialize, Deserialize, Clone)]
 pub struct BiMap<Value: Eq + Hash>(pub Vec<Value>, pub FxHashMap<Value, Interned<Value>>);
 impl<Value: Eq + Hash + Clone> Default for BiMap<Value> {
@@ -97,6 +100,10 @@ fn bimap_alloc() {
     assert_eq!(map.len(), 2);
     assert!(!map.is_empty());
 }
+/// A 1-based index into a `BiMap<T>`, tagged with `T` only via `PhantomData` — there is
+/// no run-time type check, so an `Interned<A>` and `Interned<B>` sharing a bit pattern are
+/// only distinguishable by which `BiMap` you index with them. `Copy` regardless of whether
+/// `T` is, since it carries no `T` value, just the index.
 #[derive(Hash, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Interned<T: ?Sized> {
     pd: PhantomData<T>,

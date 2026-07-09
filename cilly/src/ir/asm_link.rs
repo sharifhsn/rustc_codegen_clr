@@ -664,6 +664,24 @@ impl Assembly {
         }
         translated
     }
+    /// Re-interns one `CustomAttrArg` from `source`'s heaps into `self`'s — a `Str` payload needs
+    /// re-allocation (its `Interned<IString>` handle is only valid within `source`); every other
+    /// variant is `Copy` data with no cross-assembly identity to translate.
+    fn translate_custom_attr_arg(
+        &mut self,
+        source: &Assembly,
+        arg: &super::class::CustomAttrArg,
+    ) -> super::class::CustomAttrArg {
+        match arg {
+            super::class::CustomAttrArg::Str(s) => {
+                super::class::CustomAttrArg::Str(self.alloc_string(source[*s].as_ref()))
+            }
+            super::class::CustomAttrArg::Bool(b) => super::class::CustomAttrArg::Bool(*b),
+            super::class::CustomAttrArg::I32(i) => super::class::CustomAttrArg::I32(*i),
+            super::class::CustomAttrArg::I64(i) => super::class::CustomAttrArg::I64(*i),
+        }
+    }
+
     pub(crate) fn translate_class_def(&mut self, source: &Assembly, def: &ClassDef) -> ClassDef {
         let name = self.alloc_string(source[def.name()].as_ref());
         let extends = def
@@ -749,6 +767,26 @@ impl Assembly {
             });
             translated.add_property(super::class::PropertyDef::new(name, tpe, getter, setter));
         }
+        // Carry attached custom attributes across the assembly boundary (same silent-drop hazard
+        // documented on `events`/`properties` above — a real build always crosses the linker, so
+        // skipping this would strip every `CustomAttribute` row from linked output while unit
+        // tests, which never link, kept passing).
+        for attr in def.custom_attributes() {
+            let attr_type = self.translate_class_ref(source, attr.attr_type());
+            let mut ctor_args = Vec::with_capacity(attr.ctor_args().len());
+            for arg in attr.ctor_args() {
+                ctor_args.push(self.translate_custom_attr_arg(source, arg));
+            }
+            let mut named_args = Vec::with_capacity(attr.named_args().len());
+            for (name, arg) in attr.named_args() {
+                let name = self.alloc_string(source[*name].as_ref());
+                let arg = self.translate_custom_attr_arg(source, arg);
+                named_args.push((name, arg));
+            }
+            translated.add_custom_attribute(super::class::CustomAttrDef::new(
+                attr_type, ctor_args, named_args,
+            ));
+        }
         // Carry a generic type DEFINITION's declared parameter names across the assembly
         // boundary (re-interned into THIS assembly's string heap). Must run BEFORE `ref_to()`
         // below: a nonzero-arity def without its names fails `ref_to`'s consistency assert —
@@ -773,37 +811,37 @@ impl Assembly {
         }
 
         def.methods().iter().for_each(|mdef| {
-            let mut method_definition = self.translate_method_def(source, source.method_def(*mdef));
-            let method_ref = self.alloc_methodref(method_definition.ref_to());
+            let mut method_def = self.translate_method_def(source, source.method_def(*mdef));
+            let method_ref = self.alloc_methodref(method_def.ref_to());
             // 1st Take the orignal method, if it exists(we need this to be able to mutate methods)
             let original = self.method_defs().get(&MethodDefIdx(method_ref));
-            let method_definition = match original {
+            let method_def = match original {
                 Some(original) => {
-                    assert_eq!(method_definition.name(), original.name());
+                    assert_eq!(method_def.name(), original.name());
                     // Check if this method has a special name, and needs merging.
-                    let name = &self[method_definition.name()];
+                    let name = &self[method_def.name()];
                     if SPECIAL_METHOD_NAMES.iter().any(|val| **val == *name) {
                         // Needs special handling.
-                        assert_eq!(method_definition.access(), original.access());
-                        assert_eq!(method_definition.class(), original.class());
-                        assert_eq!(method_definition.sig(), original.sig());
-                        assert_eq!(method_definition.kind(), original.kind());
-                        method_definition
+                        assert_eq!(method_def.access(), original.access());
+                        assert_eq!(method_def.class(), original.class());
+                        assert_eq!(method_def.sig(), original.sig());
+                        assert_eq!(method_def.kind(), original.kind());
+                        method_def
                             .implementation_mut()
                             .merge_cctor_impls(original.implementation(), self);
-                        method_definition
+                        method_def
                     } else {
                         // Not special, proly does not need merging, so we can check if it matches and go on our merry way.
-                        assert_eq!(method_definition.access(), original.access());
-                        assert_eq!(method_definition.class(), original.class());
-                        assert_eq!(method_definition.sig(), original.sig());
-                        assert_eq!(method_definition.kind(), original.kind());
-                        method_definition
+                        assert_eq!(method_def.access(), original.access());
+                        assert_eq!(method_def.class(), original.class());
+                        assert_eq!(method_def.sig(), original.sig());
+                        assert_eq!(method_def.kind(), original.kind());
+                        method_def
                     }
                 }
-                None => method_definition,
+                None => method_def,
             };
-            self.new_method(method_definition);
+            self.new_method(method_def);
         });
         translated
     }

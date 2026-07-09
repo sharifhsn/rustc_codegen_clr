@@ -207,12 +207,12 @@ impl BasicBlock {
     /// ```
     #[must_use]
     pub fn is_direct_jump(&self, asm: &Assembly) -> Option<(BlockId, BlockId)> {
-        let mut meningfull_root = self.meaningfull_roots(asm);
-        let root = meningfull_root.next()?;
+        let mut roots = self.meaningfull_roots(asm);
+        let root = roots.next()?;
         let CILRoot::Branch(binfo) = asm.get_root(root) else {
             return None;
         };
-        if opt::is_branch_unconditional(binfo) && meningfull_root.next().is_none() {
+        if opt::is_branch_unconditional(binfo) && roots.next().is_none() {
             Some((binfo.0, binfo.1))
         } else {
             None
@@ -234,11 +234,11 @@ impl BasicBlock {
     /// ```
     #[must_use]
     pub fn is_only_rethrow(&self, asm: &Assembly) -> bool {
-        let mut meningfull_root = self.meaningfull_roots(asm);
-        let Some(root) = meningfull_root.next() else {
+        let mut roots = self.meaningfull_roots(asm);
+        let Some(root) = roots.next() else {
             return false;
         };
-        CILRoot::ReThrow == *asm.get_root(root) && meningfull_root.next().is_none()
+        CILRoot::ReThrow == *asm.get_root(root) && roots.next().is_none()
     }
     /// Returns a list of all roots, excluding NOPs and SFI.
     pub fn meaningfull_roots<'s, 'asm: 's>(
