@@ -597,9 +597,13 @@ direction (C# imports a Rust library and calls its functions, §6). What remains
   a `Result`'s `Ok` value crosses unwrapped (`checked_div`), and the **error direction now works**: a new
   `rustc_clr_interop_throw` intrinsic raises a managed `System.Exception` via a real `throw` IL op (not a
   Rust `panic!`, which faults reaching a managed frame), so `try_div(1,0)` is caught by C# `try`/`catch`
-  (`cargo_tests/rust_export_cs`, 15/15 on .NET — **NOTE:** a regression unrelated to this feature's own
-  code has since broken check 15 specifically, `try_div(1,0)`'s exception-crossing path; see the
-  Tier-0-adjacent bug tracked separately, not yet root-caused). **WF-8f DONE**: `Option<T>` return ->
+  (`cargo_tests/rust_export_cs`, 15/15 on .NET — a later regression briefly broke check 15 specifically:
+  rustc's MIR builder attaches an `UnwindAction::Terminate` edge to this call site (an ordinary Rust fn
+  call, as far as rustc knows, inside a nounwind `extern "C"` fn), and `basic_block.rs` was wrapping it
+  in the same FailFast catch-guard a genuinely escaped panic needs — exactly backwards for a call the
+  backend substitutes with an intentional managed `throw`. Fixed by exempting `rustc_clr_interop_throw`
+  specifically from that guard; back to 15/15, `cargo_tests/term_abort`'s genuine-panic-abort case
+  confirmed unaffected). **WF-8f DONE**: `Option<T>` return ->
   `System.Nullable<T>`/`T?` (an exported fn computes an ordinary `Option<T>` and calls `.into()` at the
   boundary — `mycorrhiza::nullable::Nullable<T>` was already a real, already-FFI-safe `Nullable<T>`
   wrapper, just never wired into `#[dotnet_export]`'s return path) and managed `T[]` return (an exported
