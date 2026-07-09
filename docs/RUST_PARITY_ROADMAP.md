@@ -120,29 +120,54 @@ These aren't missing features, they're defects in things that otherwise work. Or
    `setup` now copies `mycorrhiza_interop_helpers/` into the install home as part of provisioning.
    Verified end-to-end through the real installed binary, from a clean `target/`: `cd_linq_expr` 89/89,
    `cd_linq_groupby` 17/17 (regression), `cargo check --workspace` clean.
-10. **PARTIALLY FIXED — the fat-pointer/raw-pointer-cast GC-erasure class.** Deepening `PtrCast`'s check
-    (item above, `contains_gcref`) surfaced a real, previously-silent codegen bug, in three independent
-    manifestations found the same day: (a) `write!`/`writeln!`'s default `dyn Write` coercion erasing a
-    GC-tracked pointee to raw `void*` (`cargo_tests/cd_bcl`, fixed narrowly — `StringBuilder::write_fmt`
-    now avoids the trait-object coercion entirely, library-level workaround, 324/324); (b) an analogous
-    hazard hit independently while building the raw-dynamic-reflection-invoke feature, iterating a
-    `&[T]` slice of managed handles (worked around with a fixed-arity call ladder instead of a loop);
-    (c) `Box<CoroutineState>::drop`'s *compiler-generated* deallocation glue doing the same erasure via
-    `NonNull::cast` (`src/rvalue.rs::ptr_to_ptr`) — this one can't be worked around at the library level.
-    Root-caused precisely: `ptr_to_ptr` unconditionally types a raw-pointer-cast destination as
-    `Type::Ptr(u8)`/void regardless of whether the pointee is GC-tracked. This function backs
-    essentially every raw pointer cast in `core`/`alloc`/`std` — far bigger blast radius than the
-    `fat_ptr_to`/unsizing path originally suspected, and NOT fixed this campaign (an agent investigated
-    and correctly declined to force a same-session change into code that widely shared without a full
-    audit of every consumer). **A genuine prerequisite was found underneath it**: `mycorrhiza::task`'s
-    `TaskUnitFuture`/`TaskFuture<T>` hold a RAW (non-`GCHandle`) managed `Task` reference, and this
-    backend's `Box` allocator uses genuinely unmanaged, GC-invisible memory — so a coroutine suspended
-    while holding one of these has a real, uncorralled GC-safety hazard (not just a checker
-    false-positive) if the GC compacts between polls. Fixing `task.rs` to use the `Class<..>`/`GCHandle`
-    pattern (item 1's own fix, ironically) is the right sequencing before touching `ptr_to_ptr` broadly
-    — closes the actual hazard `cd_persisted_async` was hitting without a wide-blast-radius codegen
-    change. The general `ptr_to_ptr` fix remains open for whatever other cases don't route through
-    `mycorrhiza::task` specifically.
+10. **RESOLVED (downgraded from soundness gap to feature gap) — the fat-pointer/raw-pointer-cast
+    GC-erasure class.** Deepening `PtrCast`'s check (item above, `contains_gcref`) surfaced a real,
+    previously-silent codegen bug, in four independent manifestations found across this campaign: (a)
+    `write!`/`writeln!`'s default `dyn Write` coercion erasing a GC-tracked pointee to raw `void*`
+    (`cargo_tests/cd_bcl`, fixed narrowly — `StringBuilder::write_fmt` now avoids the trait-object
+    coercion entirely, library-level workaround, 324/324); (b) an analogous hazard hit independently
+    while building the raw-dynamic-reflection-invoke feature, iterating a `&[T]` slice of managed
+    handles (worked around with a fixed-arity call ladder instead of a loop); (c) `Box<CoroutineState>::drop`'s
+    *compiler-generated* deallocation glue doing the same erasure via `NonNull::cast`
+    (`src/rvalue.rs::ptr_to_ptr`); (d) `#[dotnet_export]`'s `MaybeUninit<RetTy>`-based return-value
+    extraction inside `catch_unwind` hitting the identical pattern for async fns returning a managed
+    handle (`cargo_tests/cd_efcore_async`, fixed by switching to `Option<RetTy>`, no raw-pointer
+    round-trip needed).
+
+    **Follow-up investigation (this session, no code change needed):** the original write-up flagged
+    `ptr_to_ptr`'s unconditional `Type::Ptr`-typing of raw-pointer-cast destinations as backing
+    "essentially every raw pointer cast in `core`/`alloc`/`std`" — a large, unscoped blast radius. Direct
+    testing shows this concern doesn't hold: `PtrCast`'s `contains_gcref` check (added for item above)
+    is architecturally a universal chokepoint, not a narrow one. Two fresh, independent repros beyond
+    the four instances above were built specifically to stress-test this: (1) `Box::new` + `drop` of an
+    ordinary struct wrapping a `mycorrhiza` managed handle field (exercises the exact
+    `Box<T>::drop`-generic-glue pattern this item worried about, with a genuinely arbitrary user type,
+    not just the coroutine-state case already fixed) — **rejected at compile time** with `CIL
+    type-verifier rejected method ...: ManagedPtrCast { ... }. Refusing to emit ill-typed CIL
+    (ALLOW_MISCOMPILATIONS=0). This is invariant I1 of the absolute-correctness plan.`; (2) a `[T; 20]`
+    array-repeat of a `Copy` managed-handle type (exercises `src/rvalue.rs::repeat`'s `cp_blk`
+    raw-byte-blit tail for arrays over `SIMPLE_REPEAT_CAP`, a code path `typecheck.rs` never directly
+    inspects) — **also rejected**, because obtaining the raw pointer `cp_blk` operates on requires
+    first crossing a `PtrCast`/`RefToPtr`-checked conversion out of managed storage. In both cases the
+    failure is loud (a compile-time reject citing I1) and immediate, not a silent miscompile. `RefToPtr`
+    itself (`cilly/src/ir/typecheck.rs`, the "take the address of a place" primitive underlying nearly
+    all internal address computation) has no `contains_gcref` check of its own — but this is correct,
+    not a gap: unlike `PtrCast`, `RefToPtr` never relabels a pointee's type, so it cannot itself erase
+    GC-tracking information; the danger is specifically in a *subsequent* type-changing cast, which is
+    exactly what `PtrCast` guards.
+
+    **Conclusion**: there is no remaining *silent*-miscompile risk in this bug class — the checker is a
+    sound, general backstop for it, verified beyond the four instances already fixed. What remains is a
+    **feature gap**: a handful of legitimate Rust patterns (boxing/repeating a type that transitively
+    holds a managed handle) fail to compile today rather than being lowered through a safe
+    (`GCHandle`-mediated) codegen path, and the failure surfaces as a raw rustc ICE with a stack trace
+    rather than a clean, actionable diagnostic — poor UX for something that is actually an intentional
+    safety rejection, not a real compiler bug. A future pass could either (a) teach the relevant
+    generic-glue/array-fill lowering to route gcref-containing types through the same `GCHandle`
+    idiom `mycorrhiza::task` already uses (a real codegen feature, scoped per-callsite rather than a
+    blanket `ptr_to_ptr` rewrite), or (b) at minimum, catch this specific checker rejection and re-emit
+    it as a normal rustc `span_err` pointing at the `GCHandle`-wrapper pattern instead of a bare panic.
+    Neither is a launch blocker.
 
 ## Tier 1 — proven this campaign, ready to build on
 
