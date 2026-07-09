@@ -570,6 +570,12 @@ impl ILExporter {
             crate::cilnode::MethodKind::Static if method.is_abstract() => {
                 "abstract virtual static"
             }
+            // `MethodDef::is_special_name` (a CLR operator-overload method, e.g. `op_Addition` —
+            // see that field's doc): `specialname` is what makes Roslyn bind `+`/`==`/etc. syntax
+            // to it, matching the PE writer's own `mark_method_special_name` call for the same flag.
+            crate::cilnode::MethodKind::Static if method.is_special_name() => {
+                "specialname static"
+            }
             crate::cilnode::MethodKind::Static => "static",
             crate::cilnode::MethodKind::Instance => "instance",
             // An interface member (`MethodDef::is_abstract`) needs the `newslot abstract` flags

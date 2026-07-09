@@ -1,0 +1,19 @@
+[package]
+name = "cd_class_ergonomics"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# A .NET class library exercising two new #[dotnet_class]/#[dotnet_methods] capabilities: real
+# static fields, and real operator overloads (SpecialName).
+crate-type = ["cdylib"]
+
+[dependencies]
+mycorrhiza = { path = "../../../mycorrhiza" }
+dotnet_macros = { path = "../../../dotnet_macros" }
+
+# Under the repo workspace root -> needs a bare `[workspace]` (the cd_pure footgun).
+[workspace]
+
+[profile.release.build-override]
+codegen-units = 1

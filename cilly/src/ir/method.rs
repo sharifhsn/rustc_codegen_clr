@@ -224,6 +224,18 @@ pub struct MethodDef {
     /// IR format — rebuild dylib + linker together and `cargo clean` consumers (the build-std
     /// fingerprint trap).
     generic_params: Vec<Interned<IString>>,
+    /// Marks this method as an ECMA-335 `SpecialName` (§II.23.1.10, 0x0800) member OUTSIDE the
+    /// event/property-accessor cases (those are detected by identity against the owning
+    /// `ClassDef`'s `EventDef`/`PropertyDef` lists instead — see `il_exporter`'s
+    /// `is_event_accessor`/`is_property_accessor` — so they don't need this flag). Used for CLR
+    /// operator-overload methods (`op_Addition`, `op_Equality`, …): Roslyn requires `SpecialName`
+    /// on these for `+`/`==`/etc. syntax to bind to them — without it the method is only callable
+    /// by its literal name (`X.op_Addition(a, b)`), never via the operator. `false` for every
+    /// method that existed before this field: additive, `new()` never sets it, only
+    /// `with_special_name`. NOTE: changing this struct changes the serialized (postcard) `.bc` IR
+    /// format — rebuild dylib + linker together and `cargo clean` consumers (the build-std
+    /// fingerprint trap).
+    is_special_name: bool,
 }
 
 impl MethodDef {
@@ -296,6 +308,7 @@ impl MethodDef {
             is_abstract: false,
             out_params: vec![],
             generic_params: vec![],
+            is_special_name: false,
         }
     }
 
@@ -336,6 +349,20 @@ impl MethodDef {
     #[must_use]
     pub fn is_abstract(&self) -> bool {
         self.is_abstract
+    }
+
+    /// Marks this method `SpecialName` (§II.23.1.10) — see the `is_special_name` field's doc.
+    /// Used for CLR operator-overload methods (`op_Addition`, …), which Roslyn requires this on
+    /// to bind `+`/`==`/etc. syntax to them.
+    #[must_use]
+    pub fn with_special_name(mut self) -> Self {
+        self.is_special_name = true;
+        self
+    }
+
+    #[must_use]
+    pub fn is_special_name(&self) -> bool {
+        self.is_special_name
     }
 
     /// Marks the given 1-based, receiver-stripped parameter Sequence numbers as `[out]`

@@ -335,6 +335,22 @@ fn bool_lit_value(expr: &syn::Expr) -> syn::Result<bool> {
     }
 }
 
+/// One `static_field(NAME: Type)` entry inside `#[dotnet_class(static_field(...), ...)]` — a
+/// genuine `.NET` `static` field (see `rustc_codegen_clr_add_static_field_def`'s doc), distinct
+/// from the struct's own (instance) fields. Repeatable, one call per field.
+struct StaticFieldSpec {
+    name: syn::Ident,
+    ty: Type,
+}
+impl syn::parse::Parse for StaticFieldSpec {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let name: syn::Ident = input.parse()?;
+        input.parse::<Token![:]>()?;
+        let ty: Type = input.parse()?;
+        Ok(StaticFieldSpec { name, ty })
+    }
+}
+
 /// `#[dotnet_class(extends = "[System.Runtime]System.Object", value_type = false)]` on a struct.
 ///
 /// Emits: the original struct (unchanged); a `<Name>Handle` managed-handle alias (a method receiver /
@@ -356,6 +372,8 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut implements: Vec<String> = Vec::new();
     // General custom attributes, one `attr(...)` entry per attribute — see `AttrSpec`'s doc.
     let mut attr_specs: Vec<AttrSpec> = Vec::new();
+    // Static fields, one `static_field(NAME: Type)` entry each — see `StaticFieldSpec`'s doc.
+    let mut static_field_specs: Vec<StaticFieldSpec> = Vec::new();
     if !attr.is_empty() {
         let parser = Punctuated::<syn::Meta, Token![,]>::parse_terminated;
         let metas = match syn::parse::Parser::parse(parser, attr) {
@@ -384,11 +402,18 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                     continue;
                 }
+                syn::Meta::List(list) if list.path.is_ident("static_field") => {
+                    match list.parse_args::<StaticFieldSpec>() {
+                        Ok(spec) => static_field_specs.push(spec),
+                        Err(e) => return e.to_compile_error().into(),
+                    }
+                    continue;
+                }
                 _ => {
                     return syn::Error::new(
                         meta.span(),
-                        "#[dotnet_class]: expected `key = \"...\"` or `attr(\"[Asm]Ns.Type\", \
-                         args(...), props(...))`",
+                        "#[dotnet_class]: expected `key = \"...\"`, `attr(\"[Asm]Ns.Type\", \
+                         args(...), props(...))`, or `static_field(NAME: Type)`",
                     )
                     .to_compile_error()
                     .into();
@@ -470,7 +495,7 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                     format!(
                         "#[dotnet_class]: unknown attribute key `{}`; expected one of `extends`, \
                          `value_type`, `default_ctor`, `field_setters`, `properties`, \
-                         `implements`, `attr(...)`",
+                         `implements`, `attr(...)`, `static_field(...)`",
                         quote! { #path }
                     ),
                 )
@@ -547,6 +572,15 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     });
 
+    // One `add_static_field_def::<FieldTy, "NAME">` per `static_field(NAME: Type)` entry.
+    let static_field_calls = static_field_specs.iter().map(|s| {
+        let fname_lit = LitStr::new(&s.name.to_string(), s.name.span());
+        let fty = &s.ty;
+        quote! {
+            let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_static_field_def::<#fty, #fname_lit>(class);
+        }
+    });
+
     // Optional extras, gated on the attribute flags: a parameterless default ctor (overloading the
     // primary ctor) and a `set_<field>` mutator per field (paired with the `read_<field>` accessor).
     let default_ctor_call = if default_ctor {
@@ -595,6 +629,7 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #name_lit, #value_type, #super_asm_lit, #super_name_lit, true,
                 >();
                 #(#field_calls)*
+                #(#static_field_calls)*
                 #(#interface_calls)*
                 #(#attr_calls)*
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_primary_ctor(class);
@@ -2319,6 +2354,42 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
 // #[dotnet_methods] — attach static / instance methods to a `#[dotnet_class]` type.
 // ============================================================================
 
+/// The full C# spec (§14.10.2) / ECMA-335 set of CLR operator-overload method names — the exact
+/// same list `src/comptime.rs::CLR_OPERATOR_METHOD_NAMES` carries (duplicated here deliberately,
+/// matching the precedent `ATTR_DENYLIST_NAMESPACES` already sets for `dotnet_class`'s custom-attr
+/// denylist: this crate has no dependency on the backend, so the two lists are kept in sync by
+/// hand rather than shared). Used to force operator-named methods to dispatch as STATIC (see
+/// `is_operator_name` below) regardless of their first parameter's shape.
+const CLR_OPERATOR_METHOD_NAMES: &[&str] = &[
+    "op_Decrement",
+    "op_Increment",
+    "op_UnaryNegation",
+    "op_UnaryPlus",
+    "op_LogicalNot",
+    "op_OnesComplement",
+    "op_True",
+    "op_False",
+    "op_Addition",
+    "op_Subtraction",
+    "op_Multiply",
+    "op_Division",
+    "op_Modulus",
+    "op_ExclusiveOr",
+    "op_BitwiseAnd",
+    "op_BitwiseOr",
+    "op_LeftShift",
+    "op_RightShift",
+    "op_UnsignedRightShift",
+    "op_Equality",
+    "op_GreaterThan",
+    "op_LessThan",
+    "op_Inequality",
+    "op_GreaterThanOrEqual",
+    "op_LessThanOrEqual",
+    "op_Implicit",
+    "op_Explicit",
+];
+
 /// `#[dotnet_methods]` on an inherent `impl <Name> { … }` block attaches the block's functions to the
 /// managed class `<Name>` that a `#[dotnet_class] struct <Name>` declared. It emits a *second* comptime
 /// entrypoint that re-opens `<Name>` (the backend's `finish_type` is idempotent — it reuses the
@@ -2326,7 +2397,11 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 ///   * a `fn` whose FIRST parameter is `<Name>Handle` (the managed-handle alias `#[dotnet_class]` emits)
 ///     becomes a **virtual instance** method `<Name>.method(this, …)` — C# calls `obj.method(…)`;
-///   * any other `fn` becomes a **static** method `<Name>.method(…)` — C# calls `<Name>.method(…)`.
+///   * any other `fn` becomes a **static** method `<Name>.method(…)` — C# calls `<Name>.method(…)`;
+///   * a fn named after a CLR operator (`op_Addition`, `op_Equality`, …, see
+///     `CLR_OPERATOR_METHOD_NAMES`) is ALWAYS static and gets `SpecialName` stamped, so C# binds
+///     the real `+`/`==`/etc. syntax to it — even though its params look instance-shaped (a binary
+///     operator's operands are typically both `<Name>Handle`).
 ///
 /// The functions are ordinary Rust code (still callable from Rust), codegen'd separately; the managed
 /// method *aliases* the Rust fn, so its signature must match (the receiver, for an instance method, is
@@ -2389,6 +2464,24 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
             .to_compile_error()
             .into();
         };
+        // `async fn` has no faithful lowering here: the method is aliased (or shimmed) with its
+        // ordinary Rust signature, which for an `async fn` is a compiler-generated coroutine type,
+        // not the `Task`/`Task<T>`-returning shape a managed caller would expect — same rejection
+        // axis `#[dotnet_export]`/`#[dotnet_interface]` already apply (the `mycorrhiza::task`
+        // Task/async bridge is the separate, explicit surface for this). Previously unchecked here,
+        // so an `async fn` silently fell through to a confusing failure deep in codegen instead of
+        // this clear compile-time error.
+        if let Some(a) = &f.sig.asyncness {
+            return syn::Error::new(
+                a.span(),
+                "#[dotnet_methods]: `async fn` methods are not supported — the emitted .NET \
+                 member would alias the compiler-generated coroutine type, not a `Task`/`Task<T>`-\
+                 returning method. Build a `Task`/`TaskT<T>` yourself (see `mycorrhiza::task`) and \
+                 return it from an ordinary (non-`async`) method instead.",
+            )
+            .to_compile_error()
+            .into();
+        }
         // `#[dotnet_override("[Asm]Ns.BaseType")]` — an explicit ECMA-335 `.override` of that base
         // type's same-named virtual (see `rustc_codegen_clr_mark_last_method_override`'s doc for
         // the intentionally narrow scope). Stripped from the method before `#input` is re-emitted
@@ -2475,10 +2568,16 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
             .to_compile_error()
             .into();
         }
-        let first_is_handle = matches!(
-            f.sig.inputs.first(),
-            Some(FnArg::Typed(pt)) if type_last_ident_is(&pt.ty, &handle_name)
-        );
+        // A CLR operator-overload name (`op_Addition`, `op_Equality`, …) is ALWAYS static in .NET —
+        // never dispatch it as instance just because its first param happens to be `<Name>Handle`
+        // (a binary operator's left-hand operand naturally has that shape, e.g. `op_Addition(a:
+        // Vector2Handle, b: Vector2Handle)`). Checked BEFORE the handle-shape heuristic so it wins.
+        let is_operator_name = CLR_OPERATOR_METHOD_NAMES.contains(&fn_ident.to_string().as_str());
+        let first_is_handle = !is_operator_name
+            && matches!(
+                f.sig.inputs.first(),
+                Some(FnArg::Typed(pt)) if type_last_ident_is(&pt.ty, &handle_name)
+            );
 
         // Run every param/return through the SAME marshalling table `#[dotnet_export]` uses
         // (`marshal_param`/`marshal_return`), so a `#[dotnet_methods]` instance/static method can

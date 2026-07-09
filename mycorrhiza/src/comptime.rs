@@ -64,6 +64,27 @@ pub fn rustc_codegen_clr_add_field_def<T, const FNAME: &'static str>(class: Clas
     diverge!()
 }
 
+/// Add a **static** field `FNAME: T` to the class — a genuine ECMA-335 `static` `Field` row
+/// (§II.23.1.5: `Public | Static`, zero/`default(T)`-initialized, no `.cctor` needed — the CLR's
+/// own beforefieldinit zero-init covers it), so a managed caller sees `ClassName.FNAME` directly,
+/// no accessor method needed (unlike instance fields, which stay private behind `read_*`/`set_*`).
+/// Also emits `static T get_FNAME()` / `static void set_FNAME(T)` so Rust code can read/write it
+/// too — call them the same way any other static method on this class is called (`<Name>Handle::
+/// static0::<"get_FNAME", T>()` / `static1::<"set_FNAME", T, ()>(value)`), no separate intrinsic
+/// needed. Unlike `rustc_codegen_clr_add_field_def`, this is NOT part of the primary-ctor's field
+/// list — a static field is per-TYPE state, not per-instance.
+///
+/// Scoped to a PLAIN mutable static (not `const`, not `[ThreadStatic]`) — `cilly::StaticFieldDef`
+/// already models both (`is_const`/`is_tls`), so extending this intrinsic to accept them is a
+/// natural, low-risk follow-up; this first cut covers the common "shared/global state" case.
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_codegen_clr_add_static_field_def<T, const FNAME: &'static str>(
+    class: ClassDef,
+) -> ClassDef {
+    diverge!()
+}
+
 /// Add a virtual (instance) method `FNAME` aliasing the ordinary Rust fn `fn_type` (which takes the
 /// receiver as its first explicit argument).
 #[allow(unused_variables)]

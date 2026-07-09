@@ -662,6 +662,19 @@ impl Assembly {
                 .collect();
             translated = translated.with_generic_params(names);
         }
+        // `MethodDef::is_special_name` (e.g. a CLR operator-overload method — see that field's
+        // doc): plain data, no interned handles to translate, but MUST be re-applied here for the
+        // exact same reason as `out_params`/`generic_params` above — this field-wise
+        // reconstruction runs in every real build (the `.bc` crosses the linker), so forgetting it
+        // here silently drops `SpecialName` from every operator method in a linked output, even
+        // though `MethodDef::with_special_name` was correctly applied on the ORIGINAL def before
+        // it ever reached this translation. Found via a reflection probe (`IsSpecialName` read
+        // back `false` after linking despite the backend stamping `true` before serialization) —
+        // the same silent-drop hazard class the two comments above already document, now hit a
+        // third time.
+        if def.is_special_name() {
+            translated = translated.with_special_name();
+        }
         translated
     }
     /// Re-interns one `CustomAttrArg` from `source`'s heaps into `self`'s — a `Str` payload needs

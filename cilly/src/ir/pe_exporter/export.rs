@@ -710,6 +710,14 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
                 let decl_tok = mb.method_token(asm, MethodDefIdx::from_raw(base_mref), &generics);
                 mb.add_method_impl(class_tok, tok, decl_tok);
             }
+            // `MethodDef::is_special_name` (e.g. a CLR operator-overload method like
+            // `op_Addition`, set by `#[dotnet_methods]`'s name-based detection): reuses the same
+            // `SpecialName` (0x0800) mechanism `add_event`/`add_property` already stamp on their
+            // own accessors, just applied here to an ordinary Pass-1 method instead of one those
+            // two helpers create themselves.
+            if method.is_special_name() {
+                mb.mark_method_special_name(tok);
+            }
             if name == "entrypoint" {
                 entry_point_token = Some(tok);
             }

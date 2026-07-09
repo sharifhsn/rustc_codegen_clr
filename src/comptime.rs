@@ -49,6 +49,10 @@ struct PendingClass<'tcx> {
     superclass: Option<(String, String)>,
     /// `(field_type, field_name)`.
     fields: Vec<(Type, String)>,
+    /// `(field_type, field_name)` — STATIC fields (`rustc_codegen_clr_add_static_field_def`), a
+    /// separate list from `fields` above: static state is per-TYPE, not per-instance, so it never
+    /// participates in the primary ctor's field-init parameter list.
+    static_fields: Vec<(Type, String)>,
     /// `(managed_method_name, target_rust_fn)` — the virtual method aliases the Rust fn.
     methods: Vec<(String, Instance<'tcx>)>,
     /// `(managed_method_name, target_rust_fn)` — a `static` method aliasing the Rust fn (no receiver;
@@ -378,6 +382,7 @@ pub fn interpret<'tcx>(
                         has_type_kind_opinion,
                         superclass,
                         fields: vec![],
+                        static_fields: vec![],
                         methods: vec![],
                         static_methods: vec![],
                         interfaces: vec![],
@@ -402,6 +407,18 @@ pub fn interpret<'tcx>(
                     let tpe = get_type(field_ty, ctx);
                     let field_name = garg_to_string(subst_ref[1], ctx.tcx());
                     class.fields.push((tpe, field_name));
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_add_static_field_def") {
+                    // Substring-dispatch safety: "add_static_field_def" neither contains nor is
+                    // contained by "add_field_def" (the `static_` infix breaks containment either
+                    // way), so checking this arm before or after that one is equivalent — kept
+                    // here for readability (grouped with its instance-field sibling).
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    let field_ty = ctx.monomorphize(subst_ref[0].as_type().unwrap());
+                    let tpe = get_type(field_ty, ctx);
+                    let field_name = garg_to_string(subst_ref[1], ctx.tcx());
+                    class.static_fields.push((tpe, field_name));
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_add_method_def") {
                     let src = operand_local(&args[0].node);
@@ -760,6 +777,43 @@ fn operand_local(op: &rustc_middle::mir::Operand<'_>) -> usize {
     )
 }
 
+/// The full C# spec (§14.10.2) / ECMA-335 set of CLR operator-overload method names. A
+/// `#[dotnet_methods]` static method with one of these EXACT names is stamped `SpecialName`
+/// (`MethodDef::with_special_name`) so Roslyn binds the corresponding operator syntax (`+`, `==`,
+/// implicit/explicit conversion, …) to it, instead of it being callable only by its literal name.
+/// Detected by name alone (like `#[dotnet_event]`'s `add_`/`remove_` prefix convention elsewhere in
+/// this same file) — deliberately not an opt-in attribute, since these names are reserved by
+/// convention and a user wouldn't spell one by accident for an unrelated method.
+const CLR_OPERATOR_METHOD_NAMES: &[&str] = &[
+    "op_Decrement",
+    "op_Increment",
+    "op_UnaryNegation",
+    "op_UnaryPlus",
+    "op_LogicalNot",
+    "op_OnesComplement",
+    "op_True",
+    "op_False",
+    "op_Addition",
+    "op_Subtraction",
+    "op_Multiply",
+    "op_Division",
+    "op_Modulus",
+    "op_ExclusiveOr",
+    "op_BitwiseAnd",
+    "op_BitwiseOr",
+    "op_LeftShift",
+    "op_RightShift",
+    "op_UnsignedRightShift",
+    "op_Equality",
+    "op_GreaterThan",
+    "op_LessThan",
+    "op_Inequality",
+    "op_GreaterThanOrEqual",
+    "op_LessThanOrEqual",
+    "op_Implicit",
+    "op_Explicit",
+];
+
 /// Maps a well-known CLR primitive's bare type name (e.g. `"System.Int32"`) to cilly's native
 /// [`Type`] variant, so it encodes via its dedicated ECMA-335 element-type code
 /// (`ELEMENT_TYPE_I4`, …) instead of the generic `VALUETYPE <TypeDefOrRef>`/`CLASS <TypeDefOrRef>`
@@ -1020,6 +1074,58 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         ctx.class_def(def)
             .expect("comptime: layout error registering interop class")
     };
+
+    // Static fields (`rustc_codegen_clr_add_static_field_def`): register each as a genuine
+    // public static `Field` row via `Assembly::add_static` — the same general mechanism an
+    // ordinary Rust `static`/`#[thread_local]` item already goes through (`false`/`None`/`false`
+    // here: not thread-local, no compile-time default, not `const` — see that intrinsic's doc for
+    // why this first cut is scoped to a plain mutable static). Then synthesize `static T
+    // get_<Name>()` / `static void set_<Name>(T)` so Rust code can read/write it the same way it
+    // already calls any other static method on this class (`<Name>Handle::static0::<"get_<Name>",
+    // T>()` / `static1::<"set_<Name>", T, ()>(value)`) — no separate cross-boundary intrinsic
+    // needed, since the class is now a genuine managed type the existing generic-call bridge
+    // already knows how to target. C# sees the field directly (`ClassName.Name`, no accessor
+    // needed — `add_static_field` stamps `Public`, unlike instance fields which stay private).
+    for (tpe, fname) in &class.static_fields {
+        let sfield = ctx.add_static(*tpe, fname.clone(), false, class_idx, None, false);
+
+        let load = ctx.load_static(sfield);
+        let ret = ctx.alloc_root(CILRoot::Ret(load));
+        let getter_sig = ctx.sig(Vec::new(), *tpe);
+        let getter_name = ctx.alloc_string(format!("get_{fname}"));
+        let getter_def = MethodDef::new(
+            Access::Extern,
+            class_idx,
+            getter_name,
+            getter_sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            },
+            vec![],
+        );
+        ctx.new_method(getter_def);
+
+        let value = ctx.alloc_node(CILNode::LdArg(0));
+        let store = ctx.set_static_field(sfield, value);
+        let set_ret = ctx.alloc_root(CILRoot::VoidRet);
+        let setter_sig = ctx.sig(vec![*tpe], Type::Void);
+        let setter_name = ctx.alloc_string(format!("set_{fname}"));
+        let setter_def = MethodDef::new(
+            Access::Extern,
+            class_idx,
+            setter_name,
+            setter_sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![store, set_ret], 0, None)],
+                locals: vec![],
+            },
+            vec![None],
+        );
+        ctx.new_method(setter_def);
+    }
 
     // Attach implemented interfaces. Each is a ClassRef into the interface's declaring assembly; the
     // virtual methods emitted below satisfy them by name+signature (implicit interface implementation).
@@ -1470,7 +1576,7 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         let target_mref = MethodRef::new(main_module, target_name, sig, MethodKind::Static, [].into());
         let target_ref = ctx.alloc_methodref(target_mref);
         let mname = ctx.alloc_string(method_name.clone());
-        let mdef = MethodDef::new(
+        let mut mdef = MethodDef::new(
             Access::Extern,
             class_idx,
             mname,
@@ -1479,6 +1585,12 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             MethodImpl::AliasFor(target_ref),
             arg_names,
         );
+        // A CLR operator-overload name (`op_Addition`, `op_Equality`, …, see
+        // `CLR_OPERATOR_METHOD_NAMES`'s doc) — stamp `SpecialName` so Roslyn binds the operator
+        // syntax to it, not just the literal method-call name.
+        if CLR_OPERATOR_METHOD_NAMES.contains(&method_name.as_str()) {
+            mdef = mdef.with_special_name();
+        }
         ctx.new_method(mdef);
     }
 
