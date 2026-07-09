@@ -2376,6 +2376,10 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // non-fn impl items are rejected loudly.
     let mut method_calls = Vec::new();
     let mut keep_anchors = Vec::new();
+    // Generated marshalling shims (see the `needs_shim` block below) — free fns emitted at the SAME
+    // top level as `#input`/`mod #entry_mod` (not inside either), so `entry_mod`'s `use super::*;`
+    // brings them into scope by name, and each shim's body can plainly call `#self_ty::#fn_ident`.
+    let mut shim_items = Vec::new();
     for it in &mut input.items {
         let ImplItem::Fn(f) = it else {
             return syn::Error::new(
@@ -2460,30 +2464,6 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let fn_ident = &f.sig.ident;
         let fname_lit = LitStr::new(&fn_ident.to_string(), fn_ident.span());
 
-        // A `#[used]` anchor holding the reified fn pointer forces rustc's own mono-collector to
-        // codegen this method (a plain `pub fn` on a cdylib type is otherwise pruned as unreachable —
-        // nothing *calls* it; the comptime entrypoint only names it, and that entrypoint is
-        // interpreted, not codegen'd). Without this the managed method's `AliasFor` edge would dangle
-        // (`method_def_from_ref` → None → "alias for an extern function" panic at typecheck time).
-        // Build the fn-pointer type `fn(<in-types>) -> <out>` from the method's signature (dropping
-        // the parameter *patterns*, keeping just the types), so the anchor is a `Sync`, const-eval-OK
-        // `static` — `*const ()`/`usize` casts fail in const-eval, but a fn-pointer static is fine
-        // (this is the same anchor shape the older `dotnet_typedef!` used).
-        let in_types = f.sig.inputs.iter().map(|arg| match arg {
-            FnArg::Typed(pt) => (*pt.ty).clone(),
-            // `self` was already rejected above; unreachable, but keep the map total.
-            FnArg::Receiver(_) => syn::parse_quote! { () },
-        });
-        let out_ty = match &f.sig.output {
-            ReturnType::Default => quote! { () },
-            ReturnType::Type(_, ty) => quote! { #ty },
-        };
-        let keep_ident = format_ident!("KEEP_{}", fn_ident);
-        keep_anchors.push(quote! {
-            #[used]
-            static #keep_ident: fn(#(#in_types),*) -> #out_ty = #self_ty::#fn_ident;
-        });
-
         // Decide static vs instance by the first parameter's type. A `self` receiver is rejected — the
         // alias must target a static symbol, so instance methods take the handle explicitly.
         if let Some(FnArg::Receiver(r)) = f.sig.inputs.first() {
@@ -2500,12 +2480,135 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
             Some(FnArg::Typed(pt)) if type_last_ident_is(&pt.ty, &handle_name)
         );
 
+        // Run every param/return through the SAME marshalling table `#[dotnet_export]` uses
+        // (`marshal_param`/`marshal_return`), so a `#[dotnet_methods]` instance/static method can
+        // ALSO take idiomatic `&str`/`String`/`Option<T>`/`Vec<T>` instead of requiring the class
+        // author to hand-marshal `MString`/`Nullable<T>`/a `RustVec<T>` handle themselves — the same
+        // gap `#[dotnet_export]` closed for free functions.
+        //
+        // UNLIKE `#[dotnet_export]` (which hard-errors on any type it doesn't recognize — every
+        // exported free function's types must cross the seam SOMEHOW), an unrecognized type here
+        // falls back to PASSTHROUGH (unchanged) rather than a compile error: `#[dotnet_methods]` has
+        // never restricted its type surface to an allowlist — the receiver (`<Name>Handle`) and any
+        // other interop-representable type (another class's handle, a raw primitive, …) already work
+        // today via direct aliasing, and must keep working exactly as before. So this is purely
+        // ADDITIVE ergonomic sugar, never a narrowing.
+        struct ParamPlan {
+            /// Bare seam type (no name) — used for both the shim's parameter list and the `KEEP_`
+            /// anchor's fn-pointer type.
+            seam_ty: proc_macro2::TokenStream,
+            pname: syn::Ident,
+            /// `Some` if this param needs an in-conversion statement (e.g. `MString` → `String`).
+            pre_call: Option<proc_macro2::TokenStream>,
+            /// The expression passed to the real (original) method at the call site inside the shim.
+            call_arg: proc_macro2::TokenStream,
+            marshalled: bool,
+        }
+        let mut param_plans: Vec<ParamPlan> = Vec::new();
+        for (idx, arg) in f.sig.inputs.iter().enumerate() {
+            let FnArg::Typed(pt) = arg else {
+                continue; // `self` already rejected above.
+            };
+            let pname = format_ident!("__arg{}", idx);
+            match marshal_param(&pt.ty) {
+                Ok(m) => {
+                    let seam_ty = m.seam_ty.clone();
+                    let call_arg = if m.to_rust.is_some() && matches!(&*pt.ty, Type::Reference(_)) {
+                        quote! { &#pname }
+                    } else {
+                        quote! { #pname }
+                    };
+                    param_plans.push(ParamPlan {
+                        seam_ty,
+                        pre_call: m.to_rust.map(|conv| conv(&pname)),
+                        call_arg,
+                        pname,
+                        marshalled: true,
+                    });
+                }
+                Err(_) => {
+                    let orig_ty = (*pt.ty).clone();
+                    param_plans.push(ParamPlan {
+                        seam_ty: quote! { #orig_ty },
+                        pre_call: None,
+                        call_arg: quote! { #pname },
+                        pname,
+                        marshalled: false,
+                    });
+                }
+            }
+        }
+        let (ret_seam_ty, ret_seam_arrow, ret_expr, ret_marshalled) = match &f.sig.output {
+            ReturnType::Default => (quote! { () }, quote! {}, quote! { __ret }, false),
+            ReturnType::Type(_, ty) => match marshal_return(ty) {
+                Ok(m) => {
+                    let seam_ty = m.seam_ty.clone();
+                    let expr = match m.from_rust {
+                        Some(conv) => conv(&format_ident!("__ret")),
+                        None => quote! { __ret },
+                    };
+                    (seam_ty.clone(), quote! { -> #seam_ty }, expr, true)
+                }
+                Err(_) => (quote! { #ty }, quote! { -> #ty }, quote! { __ret }, false),
+            },
+        };
+        let needs_shim = param_plans.iter().any(|p| p.marshalled) || ret_marshalled;
+
+        // The identity actually aliased into the managed method: either the original method
+        // (unmarshalled — today's exact behavior, byte-identical codegen) or a generated shim that
+        // converts seam-typed args to idiomatic ones, calls the original, and converts the result
+        // back. Both are plain free-fn *values*, so everything downstream (the `KEEP_` anchor, the
+        // `add_method_def`/`add_static_method_def` call) treats them uniformly.
+        let alias_target = if needs_shim {
+            let shim_ident = format_ident!("__dotnet_methods_shim_{}", fn_ident);
+            let seam_params: Vec<_> = param_plans
+                .iter()
+                .map(|p| {
+                    let (pname, ty) = (&p.pname, &p.seam_ty);
+                    quote! { #pname: #ty }
+                })
+                .collect();
+            let pre_call: Vec<_> = param_plans.iter().filter_map(|p| p.pre_call.clone()).collect();
+            let call_args: Vec<_> = param_plans.iter().map(|p| p.call_arg.clone()).collect();
+            shim_items.push(quote! {
+                #[inline(never)]
+                #[allow(non_snake_case, clippy::too_many_arguments)]
+                fn #shim_ident(#(#seam_params),*) #ret_seam_arrow {
+                    #(#pre_call)*
+                    let __ret = #self_ty::#fn_ident(#(#call_args),*);
+                    #ret_expr
+                }
+            });
+            quote! { #shim_ident }
+        } else {
+            quote! { #self_ty::#fn_ident }
+        };
+
+        // A `#[used]` anchor holding the reified fn pointer forces rustc's own mono-collector to
+        // codegen the aliased fn (a plain `pub fn` on a cdylib type is otherwise pruned as
+        // unreachable — nothing *calls* it directly; the comptime entrypoint only names it, and that
+        // entrypoint is interpreted, not codegen'd — EXCEPT when a shim is generated: the shim itself
+        // is what needs anchoring, and it naturally keeps the ORIGINAL method alive too, since the
+        // shim's body genuinely calls it). Without this the managed method's `AliasFor` edge would
+        // dangle (`method_def_from_ref` → None → "alias for an extern function" panic at typecheck
+        // time). A `fn(...) -> ...` pointer static is used (not `*const ()`/`usize`) because only a
+        // fn-pointer-typed const initializer is legal in const-eval (this is the same anchor shape the
+        // older `dotnet_typedef!` used) — so its type must exactly match whatever's aliased, hence
+        // being built from the (possibly shim-adjusted) seam types above rather than the original
+        // signature unconditionally.
+        let seam_in_types: Vec<_> = param_plans.iter().map(|p| p.seam_ty.clone()).collect();
+        let keep_ident = format_ident!("KEEP_{}", fn_ident);
+        keep_anchors.push(quote! {
+            #[used]
+            static #keep_ident: fn(#(#seam_in_types),*) -> #ret_seam_ty = #alias_target;
+        });
+
         if first_is_handle {
             // Instance (virtual) method: signature includes the receiver as arg 0.
             method_calls.push(quote! {
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_method_def::<
                     "pub", "virtual", #fname_lit, _,
-                >(class, #self_ty::#fn_ident);
+                >(class, #alias_target);
             });
             if let Some(spec) = override_base {
                 let (base_asm, base_type) = split_dotnet_ref(&spec);
@@ -2552,7 +2655,7 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
             method_calls.push(quote! {
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_static_method_def::<
                     #fname_lit, _,
-                >(class, #self_ty::#fn_ident);
+                >(class, #alias_target);
             });
         }
     }
@@ -2560,6 +2663,10 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         // The user's impl block, verbatim — the methods remain ordinary callable Rust functions.
         #input
+
+        // Marshalling shims generated for any method with an ergonomic-sugar param/return type (see
+        // `needs_shim` above) — plain free fns, private to this module.
+        #(#shim_items)*
 
         #[allow(non_snake_case, dead_code, unused_variables, internal_features, non_upper_case_globals)]
         mod #entry_mod {
@@ -2828,13 +2935,104 @@ fn marshal_param(ty: &Type) -> Result<Marshal, String> {
         }
         return Err(format!(
             "#[dotnet_export]: unsupported parameter type `{name}`. Supported: the integer/float \
-             primitives, `bool`, `&str`, and `String`."
+             primitives, `bool`, `&str`, `String`, `Option<T>`, and `Vec<T>` (the last two for a \
+             passthrough primitive `T`)."
         ));
+    }
+
+    // `Option<T>` of a passthrough primitive `T` -> a real `System.Nullable<T>`/`T?` inbound. The
+    // ergonomic mirror of `marshal_return`'s `Option<T>` arm: the caller writes idiomatic `Option<T>`,
+    // not the wrapper type — the seam carries `Nullable<T>` (already FFI-safe, see that module's doc)
+    // and the conversion (`NullableExt::to_option`) happens automatically. Only a primitive `T` is
+    // supported: `Nullable<T>` requires `T: struct` on the .NET side, which the passthrough
+    // primitives already map to 1:1; a non-primitive `T` has no defined `Nullable<T>` shape to
+    // marshal into (yet — see that arm's doc for why this specific slice was chosen first).
+    if let Some((name, inner)) = single_generic_arg(ty) {
+        if name == "Option" {
+            if let Some(inner_name) = simple_path_ident(inner) {
+                if is_passthrough_primitive(&inner_name) {
+                    let inner = inner.clone();
+                    return Ok(Marshal {
+                        seam_ty: quote! { ::mycorrhiza::nullable::Nullable<#inner> },
+                        to_rust: Some(Box::new(move |id| {
+                            quote! {
+                                let #id: ::core::option::Option<#inner> =
+                                    ::mycorrhiza::nullable::NullableExt::to_option(&#id);
+                            }
+                        })),
+                        from_rust: None,
+                        returns_managed_handle: false,
+                    });
+                }
+                return Err(format!(
+                    "#[dotnet_export]: unsupported `Option<{inner_name}>` parameter element type. \
+                     Only the integer/float primitives and `bool` are supported as `Option<T>` \
+                     parameters today."
+                ));
+            }
+            return Err(format!(
+                "#[dotnet_export]: unsupported `Option<{}>` parameter element type. Only the \
+                 integer/float primitives and `bool` are supported as `Option<T>` parameters today.",
+                quote! { #inner }
+            ));
+        }
+        // `Vec<T>` of a passthrough primitive `T` -> a `RustVec<T>` handle inbound: the caller passes
+        // the opaque `usize` handle a C#-side `RustVec<T>`/`RustBoxVec<T>` already carries, and this
+        // reconstructs an owned `Vec<T>` by walking it via the SAME `rcl_vec_len`/`rcl_vec_get` core
+        // functions the return-side `Vec<T>` arm below uses in the opposite direction (`rcl_vec_new`/
+        // `rcl_vec_push`). Same requirement as that arm: the consuming crate must have called
+        // `mycorrhiza::export_rust_containers!()` once at its crate root.
+        if name == "Vec" {
+            if let Some(elem_name) = simple_path_ident(inner) {
+                if is_passthrough_primitive(&elem_name) {
+                    let elem_ty = inner.clone();
+                    return Ok(Marshal {
+                        seam_ty: quote! { ::core::primitive::usize },
+                        to_rust: Some(Box::new(move |id| {
+                            quote! {
+                                let #id: ::std::vec::Vec<#elem_ty> = {
+                                    let __len: ::core::primitive::usize =
+                                        unsafe { crate::rcl_vec_len(#id) };
+                                    let mut __out: ::std::vec::Vec<#elem_ty> =
+                                        ::std::vec::Vec::with_capacity(__len);
+                                    for __i in 0..__len {
+                                        let mut __elem: #elem_ty = ::core::default::Default::default();
+                                        unsafe {
+                                            crate::rcl_vec_get(
+                                                #id,
+                                                __i,
+                                                (&mut __elem as *mut #elem_ty)
+                                                    as *mut ::core::primitive::u8,
+                                            );
+                                        }
+                                        __out.push(__elem);
+                                    }
+                                    __out
+                                };
+                            }
+                        })),
+                        from_rust: None,
+                        returns_managed_handle: false,
+                    });
+                }
+                return Err(format!(
+                    "#[dotnet_export]: unsupported `Vec<{elem_name}>` parameter element type. Only \
+                     the integer/float primitives and `bool` are supported as `Vec<T>` parameters \
+                     today (this expects a `RustVec<T>` handle, whose C# side is `T : unmanaged`)."
+                ));
+            }
+            return Err(format!(
+                "#[dotnet_export]: unsupported `Vec<{}>` parameter element type. Only the \
+                 integer/float primitives and `bool` are supported as `Vec<T>` parameters today.",
+                quote! { #inner }
+            ));
+        }
     }
 
     Err(format!(
         "#[dotnet_export]: unsupported parameter type `{}`. Supported: the integer/float primitives, \
-         `bool`, `&str`, and `String`.",
+         `bool`, `&str`, `String`, `Option<T>`, and `Vec<T>` (the last two for a passthrough \
+         primitive `T`).",
         quote! { #ty }
     ))
 }
@@ -2914,7 +3112,7 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
         return Err(format!(
             "#[dotnet_export]: unsupported return type `{name}`. Supported: the integer/float \
              primitives, `bool`, `&str`, `String`, `()`, `mycorrhiza::task::Task`, \
-             `mycorrhiza::task::TaskT<T>`, and `Vec<T>` of a passthrough primitive `T`."
+             `mycorrhiza::task::TaskT<T>`, `Option<T>`, and `Vec<T>` of a passthrough primitive `T`."
         ));
     }
 
@@ -2949,6 +3147,36 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
             from_rust: None,
             returns_managed_handle: false,
         });
+    }
+
+    // `Option<T>` of a passthrough primitive `T` — the ergonomic counterpart to the arm just above,
+    // and the return-side mirror of `marshal_param`'s `Option<T>` arm: return idiomatic `Option<T>`
+    // directly instead of manually building a `Nullable<T>` and `.into()`-ing it yourself (the arm
+    // above is kept as-is for that explicit spelling, and for the day a non-primitive `T` is
+    // supported). Converts via the same `Nullable<T>: From<Option<T>>` impl that arm's doc documents.
+    if let Some((name, inner)) = single_generic_arg(ty) {
+        if name == "Option" {
+            if let Some(inner_name) = simple_path_ident(inner) {
+                if is_passthrough_primitive(&inner_name) {
+                    let inner = inner.clone();
+                    return Ok(Marshal {
+                        seam_ty: quote! { ::mycorrhiza::nullable::Nullable<#inner> },
+                        to_rust: None,
+                        from_rust: Some(Box::new(move |id| {
+                            quote! {
+                                ::core::convert::Into::<::mycorrhiza::nullable::Nullable<#inner>>::into(#id)
+                            }
+                        })),
+                        returns_managed_handle: false,
+                    });
+                }
+                return Err(format!(
+                    "#[dotnet_export]: unsupported `Option<{inner_name}>` return element type. Only \
+                     the integer/float primitives and `bool` are supported as `Option<T>` returns \
+                     today."
+                ));
+            }
+        }
     }
 
     // `mycorrhiza::intrinsics::RustcCLRInteropManagedArray<T, 1>` — a real managed 1-D array handle
@@ -3018,8 +3246,8 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
 
     Err(format!(
         "#[dotnet_export]: unsupported return type `{}`. Supported: the integer/float primitives, \
-         `bool`, `&str`, `String`, `()`, `mycorrhiza::task::Task`, `mycorrhiza::task::TaskT<T>`, and \
-         `Vec<T>` of a passthrough primitive `T`.",
+         `bool`, `&str`, `String`, `()`, `mycorrhiza::task::Task`, `mycorrhiza::task::TaskT<T>`, \
+         `Option<T>`, and `Vec<T>` of a passthrough primitive `T`.",
         quote! { #ty }
     ))
 }
