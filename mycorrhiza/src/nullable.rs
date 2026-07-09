@@ -18,6 +18,16 @@ const NULLABLE: &str = "System.Nullable";
 /// to a `ClassRef` and the CLR knows the real size — so one fixed size works for every `T`.
 pub type Nullable<T> = RustcCLRInteropManagedGenericStruct<CORELIB, NULLABLE, 16, (T,)>;
 
+/// `default(Nullable<T>)` — an *absent* nullable (`HasValue == false`). A real `System.Nullable<T>`'s
+/// all-zero-bytes representation IS its default/no-value state (the CLR itself relies on this — e.g.
+/// zero-initialized array elements), so a zeroed buffer is exact, not an approximation.
+pub fn none<T>() -> Nullable<T> {
+    // SAFETY: `Nullable<T>`'s only field is `size_hint: [u8; 16]` (see the struct's own doc) — an
+    // all-zero byte buffer is a valid value for any `T`, and the CLR's own `default(Nullable<T>)` is
+    // exactly this same all-zero representation.
+    unsafe { core::mem::zeroed() }
+}
+
 /// `new Nullable<T>(value)` — a *present* nullable wrapping `value`.
 pub fn some<T>(value: T) -> Nullable<T> {
     rustc_clr_interop_generic_ctor1::<
@@ -72,6 +82,21 @@ impl<T> NullableExt<T> for Nullable<T> {
             Some(get_value::<T>(self))
         } else {
             None
+        }
+    }
+}
+
+/// `Option<T>` -> `Nullable<T>` — the ergonomic escape hatch for `#[dotnet_export]` return values.
+/// A bare Rust `Option<T>` can't cross the export seam directly (its layout is whatever niche/tag
+/// encoding rustc picked for this specific `T`, not `System.Nullable<T>`'s fixed `{bool,T}` layout —
+/// see `docs/RUST_PARITY_ROADMAP.md`'s WF-8 writeup), so an exported fn computing an `Option<T>`
+/// internally converts at the boundary: `.into()` (or `Nullable::from(opt)`), then returns the
+/// `Nullable<T>` — which `#[dotnet_export]` DOES marshal, straight through to a real C# `T?`.
+impl<T> From<Option<T>> for Nullable<T> {
+    fn from(opt: Option<T>) -> Nullable<T> {
+        match opt {
+            Some(v) => some(v),
+            None => none(),
         }
     }
 }

@@ -2726,6 +2726,56 @@ fn task_t_inner(ty: &Type) -> Option<&Type> {
     (name == "TaskT").then_some(inner)
 }
 
+/// If `ty` is `mycorrhiza::nullable::Nullable<T>` (a real `System.Nullable<T>` handle — already
+/// FFI-safe, see that module's doc), returns `T`. `None` otherwise. Matched by trailing ident only,
+/// like [`task_t_inner`].
+fn nullable_inner(ty: &Type) -> Option<&Type> {
+    let (name, inner) = single_generic_arg(ty)?;
+    (name == "Nullable").then_some(inner)
+}
+
+/// If `ty` is `mycorrhiza::intrinsics::RustcCLRInteropManagedArray<T, N>` (a real managed 1-D array
+/// handle — already FFI-safe), returns `T`, requiring the const dimension argument `N` to be the
+/// literal `1` (the only arity this marshals today). `None` if the type isn't this array handle at
+/// all; `Err` (via the caller) if it names 2+ dimensions, so that case fails loudly with a clear
+/// message rather than silently mismarshalling.
+fn managed_array_elem(ty: &Type) -> Option<Result<&Type, String>> {
+    let Type::Path(tp) = ty else { return None };
+    if tp.qself.is_some() {
+        return None;
+    }
+    let seg = tp.path.segments.last()?;
+    if seg.ident != "RustcCLRInteropManagedArray" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    let mut type_args = args.args.iter().filter_map(|a| match a {
+        syn::GenericArgument::Type(t) => Some(t),
+        _ => None,
+    });
+    let elem = type_args.next()?;
+    let dims_ok = args.args.iter().any(|a| {
+        matches!(
+            a,
+            syn::GenericArgument::Const(syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Int(n),
+                ..
+            })) if n.base10_digits() == "1"
+        )
+    });
+    if dims_ok {
+        Some(Ok(elem))
+    } else {
+        Some(Err(
+            "#[dotnet_export]: RustcCLRInteropManagedArray<T, N> is only marshalled for N = 1 \
+             (a 1-D array) today."
+                .to_string(),
+        ))
+    }
+}
+
 /// Resolve how a **parameter** type is marshalled, or `Err(message)` if unsupported.
 fn marshal_param(ty: &Type) -> Result<Marshal, String> {
     // `&str` (shared ref to a `str`) → managed `System.String` inbound.
@@ -2876,6 +2926,39 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
     // itself (typically via `mycorrhiza::task::future_to_task`) — `async fn` sugar stays rejected.
     // Also `returns_managed_handle: true` — same `catch_unwind` hazard as non-generic `Task` above.
     if task_t_inner(ty).is_some() {
+        return Ok(Marshal {
+            seam_ty: quote! { #ty },
+            to_rust: None,
+            from_rust: None,
+            returns_managed_handle: true,
+        });
+    }
+
+    // `mycorrhiza::nullable::Nullable<T>` — a real `System.Nullable<T>` value (a fixed-size inline
+    // byte buffer, NOT a managed reference — see that module's doc), already FFI-safe across the
+    // seam for any `T`. This is the answer to "how do I return an Option<T>": a bare Rust `Option<T>`
+    // can't cross directly (its layout is whatever niche/tag encoding rustc picked for this specific
+    // `T`, not Nullable<T>'s fixed `{bool,T}` layout), so an exported fn computes an `Option<T>`
+    // internally and converts with `.into()` at the boundary (`Nullable<T>: From<Option<T>>`) before
+    // returning. `returns_managed_handle: false` — unlike Task/TaskT<T>, this is an inline value type
+    // with no gcref field, so it has none of the catch_unwind-hazard those two need.
+    if nullable_inner(ty).is_some() {
+        return Ok(Marshal {
+            seam_ty: quote! { #ty },
+            to_rust: None,
+            from_rust: None,
+            returns_managed_handle: false,
+        });
+    }
+
+    // `mycorrhiza::intrinsics::RustcCLRInteropManagedArray<T, 1>` — a real managed 1-D array handle
+    // (a single `object_ref: usize` under a `PhantomData<T>`, like Task/TaskT<T> above), already
+    // FFI-safe across the seam. The fn constructs it itself via `rustc_clr_interop_managed_new_arr`/
+    // `_set_elem` (both already Rust-callable, used in mycorrhiza::linq/dynamic today) and returns
+    // the handle — C# receives a genuine `T[]`, not the opaque `RustVec<T>` indexer-wrapper the
+    // `Vec<T>` arm below produces. `returns_managed_handle: true` — same reason as Task/TaskT<T>.
+    if let Some(elem) = managed_array_elem(ty) {
+        let _elem = elem?;
         return Ok(Marshal {
             seam_ty: quote! { #ty },
             to_rust: None,
