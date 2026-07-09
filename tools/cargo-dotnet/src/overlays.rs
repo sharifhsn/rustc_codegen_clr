@@ -96,16 +96,16 @@ pub fn apply(ctx: &Context) -> Result<()> {
     write_config(ctx, "")?;
     let lock_path = ctx.crate_dir.join("Cargo.lock");
     if !lock_path.is_file() {
-        let mut lockfile_cmd = Command::new(&ctx.cargo);
-        lockfile_cmd.current_dir(&ctx.crate_dir);
+        let mut lock_cmd = Command::new(&ctx.cargo);
+        lock_cmd.current_dir(&ctx.crate_dir);
         // Pin the toolchain when installed, same as `base_cargo()` — otherwise this
         // bare `cargo` resolves to rustup's default (stable) toolchain, which rejects
         // `-Z` flags. Only matters on a fresh crate with no Cargo.lock yet (the common
         // first-build case), which is why it can go unnoticed.
         if let Some(tc) = &ctx.toolchain {
-            lockfile_cmd.env("RUSTUP_TOOLCHAIN", tc);
+            lock_cmd.env("RUSTUP_TOOLCHAIN", tc);
         }
-        let _ = lockfile_cmd
+        let _ = lock_cmd
             .arg("-Zjson-target-spec")
             .arg("generate-lockfile")
             .status();
@@ -138,12 +138,12 @@ pub fn apply(ctx: &Context) -> Result<()> {
         }
         let multi = name_count.get(ov.name.as_str()).copied().unwrap_or(1) > 1;
         if multi {
-            let version_locked = locked.as_ref().is_some_and(|l| {
+            let locked = locked.as_ref().is_some_and(|l| {
                 l.package
                     .iter()
                     .any(|p| p.name == ov.name && p.version == ov.version)
             });
-            if !version_locked {
+            if !locked {
                 continue; // a non-locked major of a multi-version name — skip its dir.
             }
         }

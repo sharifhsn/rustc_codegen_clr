@@ -8,6 +8,10 @@
 //! dependency-free in-memory OPC build is the deterministic route.
 //!
 //! Output: `<crate>/target/nupkg/<id>.<version>.nupkg` (override with `--out`).
+//!
+//! Only embeds the crate's own cdylib — unlike `build`/`run`, this does NOT read
+//! `.cargo-dotnet-nuget-assets/` (see [`nuget`]), so a dependency wired in via
+//! `add-nuget` is silently absent from the produced package.
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -65,11 +69,11 @@ pub fn run(args: &PackArgs) -> Result<i32> {
     } else {
         pkg.authors.join(", ")
     };
-    let description = pkg.description.clone().unwrap_or_else(|| {
+    let desc = pkg.description.clone().unwrap_or_else(|| {
         format!("Rust crate '{name}' compiled to a .NET assembly by rustc_codegen_clr (cargo dotnet pack).")
     });
     let license = pkg.license.clone();
-    let repository = pkg.repository.clone();
+    let repo = pkg.repository.clone();
     let readme_path = pkg.readme().map(|p| p.into_std_path_buf());
     eprintln!("== cargo dotnet pack: {name} {ver} ({}) ==", ctx.profile.dir());
 
@@ -103,9 +107,9 @@ pub fn run(args: &PackArgs) -> Result<i32> {
     let readme_bytes = readme_path.as_ref().and_then(|p| fs::read(p).ok());
     let meta = NuspecMeta {
         authors: &authors,
-        description: &description,
+        description: &desc,
         license: license.as_deref(),
-        repository: repository.as_deref(),
+        repository: repo.as_deref(),
         has_readme: readme_bytes.is_some(),
     };
     write_nupkg(&nupkg, &name, &ver, &dll_bytes, ctx.dotnet.tfm(), &meta, readme_bytes.as_deref())?;
@@ -215,7 +219,7 @@ fn write_nupkg(
         .license
         .map(|l| format!("\n    <license type=\"expression\">{}</license>", xml_escape(l)))
         .unwrap_or_default();
-    let repository_elem = meta
+    let repo_elem = meta
         .repository
         .map(|r| format!("\n    <repository type=\"git\" url=\"{}\" />", xml_escape(r)))
         .unwrap_or_default();
@@ -231,7 +235,7 @@ fn write_nupkg(
     <id>{name}</id>
     <version>{ver}</version>
     <authors>{authors}</authors>
-    <description>{description}</description>{license_elem}{repository_elem}{readme_elem}
+    <description>{description}</description>{license_elem}{repo_elem}{readme_elem}
     <dependencies>
       <group targetFramework=\"{tfm}\" />
     </dependencies>

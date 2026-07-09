@@ -67,6 +67,10 @@ pub struct Paths {
     pub pal_root: PathBuf,
     /// `root/dotnet_overlays`.
     pub overlays_root: PathBuf,
+    /// `root/mycorrhiza_interop_helpers` — the bundled `Mycorrhiza.Interop.Helpers` C# companion
+    /// project (currently just `ParameterRebinder`, see `mycorrhiza::linq`). Built and copied
+    /// alongside any consumer's build output by `interop_helpers::ensure_and_copy`.
+    pub interop_helpers_root: PathBuf,
     pub lastbuild_log: PathBuf,
 }
 
@@ -109,6 +113,7 @@ impl Paths {
                     registry_src,
                     pal_root: home.join("dotnet_pal"),
                     overlays_root: home.join("dotnet_overlays"),
+                    interop_helpers_root: home.join("mycorrhiza_interop_helpers"),
                     lastbuild_log: home.join("_lastbuild.log"),
                 })
             }
@@ -142,6 +147,7 @@ impl Paths {
                     registry_src,
                     pal_root: repo_root.join("dotnet_pal"),
                     overlays_root: repo_root.join("dotnet_overlays"),
+                    interop_helpers_root: repo_root.join("mycorrhiza_interop_helpers"),
                     lastbuild_log: repo_root.join("feasibility/_lastbuild.log"),
                 })
             }
@@ -232,7 +238,7 @@ impl Context {
 
         // host preflight (rustc/cargo present; dotnet reachable; ilasm resolved).
         host::ensure_rust_toolchain()?;
-        let dotnet_heal = host::dotnet_env_additions();
+        let dotnet_heal = host::dotnet_env_adds();
         host::ensure_dotnet(&dotnet_heal)?;
         let dotnet: DotnetVersion = args.dotnet.parse().map_err(anyhow::Error::msg)?;
         let ilasm = host::resolve_ilasm(&host, dotnet)?;

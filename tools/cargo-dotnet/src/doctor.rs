@@ -88,11 +88,11 @@ pub fn run(args: &DoctorArgs) -> Result<i32> {
     let checks = environment_checks();
     let mut out = String::new();
     out.push_str("cargo dotnet doctor — environment:\n\n");
-    let mut hard_failures = 0u32;
+    let mut fails = 0u32;
     for c in &checks {
         c.render(&mut out);
         if !c.ok && c.hard {
-            hard_failures += 1;
+            fails += 1;
         }
     }
     print!("{out}");
@@ -110,18 +110,18 @@ pub fn run(args: &DoctorArgs) -> Result<i32> {
         for c in &wiring_checks {
             c.render(&mut wout);
             if !c.ok && c.hard {
-                hard_failures += 1;
+                fails += 1;
             }
         }
         print!("{wout}");
     }
 
-    if hard_failures == 0 {
+    if fails == 0 {
         println!("\nAll required checks passed. You should be able to `cargo dotnet run`.");
         Ok(0)
     } else {
         println!(
-            "\n{hard_failures} required check(s) failed — most are fixed by `cargo dotnet setup` \
+            "\n{fails} required check(s) failed — most are fixed by `cargo dotnet setup` \
              (from a repo checkout, or with --from-repo <path>)."
         );
         Ok(1)
@@ -146,7 +146,7 @@ fn environment_checks() -> Vec<Check> {
     checks.push(check_pinned_toolchain());
 
     // dotnet.
-    let heal = host::dotnet_env_additions();
+    let heal = host::dotnet_env_adds();
     checks.push(match host::ensure_dotnet(&heal) {
         Ok(()) => Check::pass("dotnet runtime reachable", ""),
         Err(e) => Check::fail("dotnet runtime reachable", e.to_string()),

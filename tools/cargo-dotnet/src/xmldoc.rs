@@ -125,14 +125,14 @@ pub fn generate(crate_dir: &Path, crate_name: &str, dll_path: &Path) -> Result<(
         return Ok(());
     }
 
-    let assembly_name = dll_path
+    let asm_name = dll_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or(crate_name);
 
     let mut xml = String::new();
     xml.push_str("<?xml version=\"1.0\"?>\n<doc>\n");
-    xml.push_str(&format!("<assembly>\n<name>{}</name>\n</assembly>\n", xml_escape(assembly_name)));
+    xml.push_str(&format!("<assembly>\n<name>{}</name>\n</assembly>\n", xml_escape(asm_name)));
     xml.push_str("<members>\n");
     for e in &entries {
         xml.push_str(&format!(

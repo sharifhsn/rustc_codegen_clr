@@ -5,7 +5,8 @@
 //! pure Rust — CLI + cargo-subcommand convention + standard-flag passthrough, plus the
 //! inner build/run/pack: PAL injection into rust-src ([`palinject`]), the
 //! [`dotnet_overlays`] apply ([`overlays`]), `build-std` ([`buildstd`]), artifact
-//! location ([`artifact`]), run ([`run`]) and NuGet packing ([`pack`]). It shells out
+//! location ([`artifact`]), run ([`run`]), NuGet packing ([`pack`]) and consuming a
+//! third-party NuGet package via reflection-generated bindings ([`nuget`]). It shells out
 //! only to the external tools any build tool must (cargo/rustc/ilasm/dotnet/the linker)
 //! — never to a bash pipeline core. The DOCKER backend (dev-only) still delegates to the
 //! in-repo bash front-end, which owns the container mount model.
@@ -17,6 +18,7 @@ mod context;
 mod doctor;
 mod docker;
 mod host;
+mod interop_helpers;
 mod mode;
 mod nuget;
 mod overlays;

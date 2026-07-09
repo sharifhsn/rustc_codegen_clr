@@ -103,6 +103,12 @@ pub fn run(args: &AddNugetArgs) -> Result<i32> {
     }
     fs::write(&dll_marker, dll.to_string_lossy().as_bytes())?;
 
+    // Fetch (one level of) transitive dependencies BEFORE reflecting — see
+    // `fetch_transitive_deps`'s doc for why: reflection throws on any type referencing an
+    // unresolved dependency assembly, not just types that use it. A no-op (empty Vec) for
+    // packages with no non-framework dependencies (the common case).
+    let extra_dlls = fetch_transitive_deps(&args.id, &args.version, &cache_root)?;
+
     let asm_name = dll
         .file_stem()
         .and_then(|s| s.to_str())
@@ -116,7 +122,7 @@ pub fn run(args: &AddNugetArgs) -> Result<i32> {
 
     let out_rs = if args.force || !bindings_marker.is_file() {
         let bindgen_dir = cache_root.join("bindgen");
-        generate_bindings(&dll, &bindgen_dir, args.verbose)?;
+        generate_bindings(&dll, &bindgen_dir, args.verbose, &extra_dlls)?;
         let produced = bindgen_dir.join("out.rs");
         fs::copy(&produced, &bindings_marker).with_context(|| {
             format!("add-nuget: bindgen ran but produced no out.rs at {}", produced.display())
@@ -161,6 +167,13 @@ pub fn run(args: &AddNugetArgs) -> Result<i32> {
     fs::create_dir_all(&assets_dir)?;
     let dest_dll = assets_dir.join(dll.file_name().context("add-nuget: dll has no filename")?);
     fs::copy(&dll, &dest_dll)?;
+    // Transitive dependency dlls (see `fetch_transitive_deps`) are just as much a runtime
+    // requirement for the CONSUMER program as they were for reflection — copy them alongside
+    // the primary dll so `pipeline.rs`'s `copy_assets` ships them next to the final build output.
+    for extra in &extra_dlls {
+        let dest = assets_dir.join(extra.file_name().context("add-nuget: dependency dll has no filename")?);
+        fs::copy(extra, &dest)?;
+    }
 
     eprintln!("== cargo dotnet add-nuget: wrote {} ==", dest_file.display());
     eprintln!(
@@ -178,7 +191,7 @@ pub fn run(args: &AddNugetArgs) -> Result<i32> {
 /// Copy every file in `<crate_dir>/.cargo-dotnet-nuget-assets/` (if any) into `out_dir` (the
 /// directory holding the just-built artifact). Called from `pipeline.rs` after `artifact::locate`,
 /// before `run`/`report` — a no-op (and silent) for crates that never ran `add-nuget`.
-pub fn copy_runtime_assets(crate_dir: &Path, out_dir: &Path) -> Result<()> {
+pub fn copy_assets(crate_dir: &Path, out_dir: &Path) -> Result<()> {
     let assets_dir = crate_dir.join(".cargo-dotnet-nuget-assets");
     if !assets_dir.is_dir() {
         return Ok(());
@@ -228,9 +241,19 @@ fn fetch_and_extract(id: &str, version: &str, dest_dir: &Path) -> Result<PathBuf
 
     // Find the best TFM's primary dll: `lib/<tfm>/<Name>.dll` where <Name> matches the package
     // id's simple name convention (most packages' primary dll is named after the package, but we
-    // don't assume — just take the FIRST .dll under the best-matching lib/<tfm>/ dir, which
-    // covers the common single-assembly-per-package case; multi-assembly packages need a
-    // follow-up, not attempted here).
+    // don't assume — just take the FIRST .dll DIRECTLY under the best-matching lib/<tfm>/ dir).
+    //
+    // Two things a naive "first .dll under the prefix" search gets wrong, both observed on real
+    // packages (e.g. `PdfSharpCore`, which ships localized satellite assemblies):
+    //   1. Satellite/localization resource assemblies live one level deeper, at
+    //      `lib/<tfm>/<locale>/<Name>.resources.dll` (e.g. `lib/net8.0/de/PdfSharpCore.resources.dll`)
+    //      — these still match a bare `starts_with("lib/<tfm>/")` prefix check and often sort
+    //      BEFORE the real assembly in the zip's physical entry order, so the naive search picked
+    //      an (empty, locale-only) resources dll as the "primary" dll, reflecting zero types.
+    //      Filtered out here by requiring no further `/` after the `lib/<tfm>/` prefix.
+    //   2. Multiple real dlls can sit directly under `lib/<tfm>/` (multi-assembly packages) — prefer
+    //      the one whose file stem matches the package id (case-insensitively), which is the
+    //      overwhelmingly common convention, before falling back to "first one found".
     let names: Vec<String> = (0..zip.len())
         .map(|i| zip.by_index(i).map(|f| f.name().to_string()))
         .collect::<Result<_, _>>()?;
@@ -238,10 +261,20 @@ fn fetch_and_extract(id: &str, version: &str, dest_dir: &Path) -> Result<PathBuf
     let mut chosen: Option<(String, &str)> = None;
     for tfm in TFM_CANDIDATES {
         let prefix = format!("lib/{tfm}/");
-        if let Some(name) = names
-            .iter()
-            .find(|n| n.starts_with(&prefix) && n.to_lowercase().ends_with(".dll"))
-        {
+        let mut candidates = names.iter().filter(|n| {
+            n.starts_with(&prefix)
+                && n.to_lowercase().ends_with(".dll")
+                && !n[prefix.len()..].contains('/')
+        });
+        let simple_name = id.rsplit('.').next().unwrap_or(id).to_lowercase();
+        let best = candidates.clone().find(|n| {
+            Path::new(n.as_str())
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_lowercase() == simple_name || s.to_lowercase() == id_lower)
+                .unwrap_or(false)
+        });
+        if let Some(name) = best.or_else(|| candidates.next()) {
             chosen = Some((name.clone(), tfm));
             break;
         }
@@ -267,12 +300,143 @@ fn fetch_and_extract(id: &str, version: &str, dest_dir: &Path) -> Result<PathBuf
     Ok(dest_dll)
 }
 
+/// Package-id prefixes that are always framework-/runtime-provided (already on the shared
+/// framework the apphost runs against) — never worth fetching as a separate .nupkg even if a
+/// `.nuspec` lists them as a `<dependency>`.
+const FRAMEWORK_DEP_PREFIXES: &[&str] =
+    &["System.", "Microsoft.NETCore.", "Microsoft.CSharp", "NETStandard.Library", "Microsoft.Win32."];
+
+/// Read the (single, since a `.nupkg` bundles at most one) `.nuspec` out of an already-downloaded
+/// `.nupkg` and return the DISTINCT `<dependency id="..." version="...">` pairs it declares,
+/// across every `<group>` (TFM-specific dependency groups aren't disambiguated — we just union
+/// them and dedupe by id, keeping the first version seen for each; over-fetching a dependency
+/// that isn't actually needed for our TFM is harmless, just a wasted download).
+///
+/// Hand-rolled scanning rather than a real XML parser (no XML dep in this crate, and `.nuspec`
+/// `<dependency>` elements are a very regular self-closed-tag shape) — tolerant of attribute
+/// order (`id`/`version` can appear in either order) but assumes well-formed, non-CDATA-escaped
+/// attribute values, which every published `.nuspec` satisfies in practice.
+fn nuspec_dependencies(nupkg_path: &Path) -> Result<Vec<(String, String)>> {
+    let file = File::open(nupkg_path)
+        .with_context(|| format!("opening {}", nupkg_path.display()))?;
+    let mut zip = zip::ZipArchive::new(file)
+        .with_context(|| format!("{} is not a valid .nupkg (zip)", nupkg_path.display()))?;
+    let nuspec_name = (0..zip.len())
+        .map(|i| zip.by_index(i).map(|f| f.name().to_string()))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .find(|n| !n.contains('/') && n.to_lowercase().ends_with(".nuspec"));
+    let Some(nuspec_name) = nuspec_name else {
+        return Ok(Vec::new());
+    };
+    let mut text = String::new();
+    zip.by_name(&nuspec_name)?.read_to_string(&mut text)?;
+
+    let mut deps: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for tag_start in find_all(&text, "<dependency ") {
+        let Some(tag_end_rel) = text[tag_start..].find('>') else { continue };
+        let tag = &text[tag_start..tag_start + tag_end_rel];
+        let (Some(id), Some(version)) = (attr_value(tag, "id"), attr_value(tag, "version")) else {
+            continue;
+        };
+        if FRAMEWORK_DEP_PREFIXES.iter().any(|p| id.starts_with(p)) {
+            continue;
+        }
+        let key = id.to_lowercase();
+        if seen.insert(key) {
+            deps.push((id, version));
+        }
+    }
+    Ok(deps)
+}
+
+/// Every byte offset in `haystack` where `needle` starts (non-overlapping, left to right).
+fn find_all(haystack: &str, needle: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        out.push(start + pos);
+        start += pos + needle.len();
+    }
+    out
+}
+
+/// Extract `name="value"` (or `name='value'`) from a self-closed XML tag's inner text.
+fn attr_value(tag: &str, name: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let pat = format!("{name}={quote}");
+        if let Some(start) = tag.find(&pat) {
+            let val_start = start + pat.len();
+            if let Some(end_rel) = tag[val_start..].find(quote) {
+                return Some(tag[val_start..val_start + end_rel].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Fetch every (non-framework) transitive dependency listed in `id`/`version`'s `.nuspec` —
+/// ONE level deep only (a dependency's own further dependencies aren't followed; good enough for
+/// the common case of a package with a shallow, framework-adjacent dependency tree, and avoids
+/// building general NuGet dependency-graph resolution). Returns the fetched dlls' paths.
+///
+/// WHY THIS EXISTS: reflection (`Assembly.LoadFrom` + `Module.GetTypes()`) throws
+/// `FileNotFoundException`/`ReflectionTypeLoadException` for ANY type that references a
+/// dependency assembly the CLR can't resolve — even types that don't touch that dependency at
+/// all can be silently dropped from `GetTypes()`'s result. `PdfSharpCore` (depends on
+/// `SixLabors.ImageSharp`/`SixLabors.Fonts`/`SharpZipLib` for its image support) reflects ZERO
+/// types without this — see the task report this shipped with for the full diagnosis.
+fn fetch_transitive_deps(id: &str, version: &str, cache_root: &Path) -> Result<Vec<PathBuf>> {
+    let id_lower = id.to_lowercase();
+    let nupkg_path = cache_root.join(format!("{id_lower}.{version}.nupkg"));
+    if !nupkg_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let deps = nuspec_dependencies(&nupkg_path)
+        .with_context(|| format!("add-nuget: reading dependencies from {}", nupkg_path.display()))?;
+    if deps.is_empty() {
+        return Ok(Vec::new());
+    }
+    eprintln!(
+        "== cargo dotnet add-nuget: {id} {version} depends on {} — fetching for reflection ==",
+        deps.iter().map(|(i, v)| format!("{i} {v}")).collect::<Vec<_>>().join(", ")
+    );
+    let mut out = Vec::new();
+    for (dep_id, dep_version) in deps {
+        let dep_dir = cache_root.join("deps").join(dep_id.to_lowercase()).join(&dep_version);
+        let marker = dep_dir.join(".dll_path");
+        let dll = if marker.is_file() {
+            PathBuf::from(fs::read_to_string(&marker)?.trim())
+        } else {
+            fs::create_dir_all(&dep_dir)?;
+            match fetch_and_extract(&dep_id, &dep_version, &dep_dir) {
+                Ok(dll) => {
+                    fs::write(&marker, dll.to_string_lossy().as_bytes())?;
+                    dll
+                }
+                Err(e) => {
+                    // A missing/unfetchable transitive dep shouldn't hard-fail the whole
+                    // command — reflection may still succeed for the types that don't touch it.
+                    eprintln!(
+                        "== cargo dotnet add-nuget: WARNING: could not fetch transitive \
+                         dependency {dep_id} {dep_version} ({e}); reflection may be incomplete =="
+                    );
+                    continue;
+                }
+            }
+        };
+        out.push(dll);
+    }
+    Ok(out)
+}
+
 /// Generate + build + run an ephemeral bindgen crate at `bindgen_dir`: copies `reflect.rs`
 /// verbatim, writes a one-assembly `main.rs` that `Assembly.LoadFrom(dll)`s + calls
 /// `reflect_assembly`, builds it through the SAME native stage pipeline `pack.rs` uses, then
 /// runs the produced apphost with `bindgen_dir` as its working directory (so `out.rs` lands
 /// where we expect it, mirroring how spinacz writes `out.rs` to its own cwd when run directly).
-fn generate_bindings(dll: &Path, bindgen_dir: &Path, verbose: bool) -> Result<()> {
+fn generate_bindings(dll: &Path, bindgen_dir: &Path, verbose: bool, extra_dlls: &[PathBuf]) -> Result<()> {
     fs::create_dir_all(bindgen_dir.join("src"))?;
     fs::write(
         bindgen_dir.join("Cargo.toml"),
@@ -285,7 +449,7 @@ fn generate_bindings(dll: &Path, bindgen_dir: &Path, verbose: bool) -> Result<()
     // The dll path is baked in as a compile-time string literal (the same reason spinacz's own
     // BCL list is a compile-time const, not a CLI arg: `std::env::args()` is unusable under
     // this backend's PAL).
-    let dll_path_escaped = dll.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    let dll_path_esc = dll.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
     let asm_name = dll
         .file_stem()
         .and_then(|s| s.to_str())
@@ -298,7 +462,7 @@ fn generate_bindings(dll: &Path, bindgen_dir: &Path, verbose: bool) -> Result<()
     // `System.Xml`/`System.ComponentModel`/`System.Runtime.Serialization` touchpoints) gets
     // dropped by `reflect_assembly`'s `known`-gate rather than emitting a dangling path — see
     // its doc in reflect.rs. Keep this list in sync with spinacz's own `BCL_ASSEMBLIES`.
-    let known_literal = KNOWN_BCL_ASSEMBLIES
+    let known_lit = KNOWN_BCL_ASSEMBLIES
         .iter()
         .map(|s| format!("{s:?}.to_string()"))
         .collect::<Vec<_>>()
@@ -312,10 +476,10 @@ use reflect::{{reflect_assembly, Namespace}};
 use std::io::Write;
 
 fn main() {{
-    let mut known: Vec<String> = vec![{known_literal}];
+    let mut known: Vec<String> = vec![{known_lit}];
     known.push("{asm_name}".to_string());
 
-    let path: MString = "{dll_path_escaped}".into();
+    let path: MString = "{dll_path_esc}".into();
     let asm = Assembly::static1::<"LoadFrom", MString, Assembly>(path);
     let mut root = Namespace::new(String::new(), 0);
     let mut total: i32 = 0;
@@ -356,6 +520,21 @@ fn main() {{
     let Artifact::Executable(exe) = art else {
         bail!("add-nuget: bindgen crate did not produce a runnable apphost (got {art:?})");
     };
+
+    // Any transitive dependency dlls (see `fetch_transitive_deps`'s doc) must sit next to the
+    // apphost itself — that's where the CLR's default probing looks, NOT `bindgen_dir` (the
+    // `cmd.current_dir` below is the ephemeral crate's SOURCE dir, unrelated to assembly
+    // probing). Without this, `Assembly.LoadFrom(dll)` + `Module.GetTypes()` throws
+    // `ReflectionTypeLoadException`/`FileNotFoundException` for any type that references an
+    // unresolved dependency assembly, even one reflection never otherwise touches.
+    if let Some(exe_dir) = exe.parent() {
+        for extra in extra_dlls {
+            let dest = exe_dir.join(extra.file_name().context("add-nuget: dependency dll has no filename")?);
+            fs::copy(extra, &dest).with_context(|| {
+                format!("add-nuget: copying dependency dll {} -> {}", extra.display(), dest.display())
+            })?;
+        }
+    }
 
     eprintln!("== cargo dotnet add-nuget: running bindgen (reflecting {}) ==", dll.display());
     let mut cmd = Command::new(&exe);

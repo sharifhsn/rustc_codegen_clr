@@ -71,7 +71,7 @@ fn on_path(cmd: &str) -> bool {
 /// Returns the `(PATH, DOTNET_ROOT)` env additions needed to reach `dotnet` if it is
 /// not already on PATH but `$HOME/.dotnet/dotnet` exists (the documented self-heal in
 /// `ensure_dotnet_on_path`). The caller applies these to the child env.
-pub fn dotnet_env_additions() -> Option<(PathBuf, PathBuf)> {
+pub fn dotnet_env_adds() -> Option<(PathBuf, PathBuf)> {
     if on_path("dotnet") {
         return None;
     }
@@ -85,7 +85,7 @@ pub fn dotnet_env_additions() -> Option<(PathBuf, PathBuf)> {
 }
 
 /// Require `dotnet` to be reachable (after the self-heal), else a helpful error.
-/// `heal` is the result of [`dotnet_env_additions`] — `Some` means a self-heal path
+/// `heal` is the result of [`dotnet_env_adds`] — `Some` means a self-heal path
 /// was found, so dotnet is reachable.
 pub fn ensure_dotnet(heal: &Option<(PathBuf, PathBuf)>) -> Result<()> {
     if on_path("dotnet") || heal.is_some() {
