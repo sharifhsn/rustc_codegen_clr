@@ -1,10 +1,26 @@
 use rustc_codegen_clr_type::utilis::monomorphize;
-use rustc_middle::mir::{UnwindAction, UnwindTerminateReason};
+use rustc_middle::mir::{Terminator, UnwindAction, UnwindTerminateReason};
 use rustc_middle::mir::{BasicBlock, BasicBlockData};
 use rustc_middle::{
     mir::{BasicBlocks, Body, TerminatorKind},
     ty::{Instance, InstanceKind, TyCtxt},
 };
+
+/// True if `term` is a `Call` whose callee is `mycorrhiza::intrinsics::rustc_clr_interop_throw` —
+/// the "magic" fn `src/terminator/call.rs`'s `MANAGED_THROW` branch recognizes by name and replaces
+/// with a direct managed `throw` IL op, never actually invoking the (unbodied) Rust fn. Matched via
+/// `Operand::const_fn_def`'s `DefId` (stable across monomorphizations of the `MSG` const generic —
+/// the substitution doesn't depend on which message string is passed) rather than a symbol-name
+/// substring check, since this runs before `MethodCompileCtx`/`fn_name` mangling is available here.
+fn is_managed_throw_call(term: &Terminator, tcx: TyCtxt) -> bool {
+    let TerminatorKind::Call { func, .. } = &term.kind else {
+        return false;
+    };
+    let Some((def_id, _)) = func.const_fn_def() else {
+        return false;
+    };
+    tcx.def_path_str(def_id).ends_with("rustc_clr_interop_throw")
+}
 
 /// Returns the *unresolved* exception-handler block id of a MIR block, if any. Consumed by
 /// `BasicBlock::new_raw` / `resolve_exception_handlers`.
@@ -26,6 +42,23 @@ pub(crate) fn handler_for_block<'tcx>(
     // an abort Rust guarantees is uncatchable. Short-circuited BEFORE `simplify_handler`, which only
     // understands real MIR block indices.
     if let UnwindAction::Terminate(reason) = unwind {
+        // `rustc_clr_interop_throw::<MSG>()` (the magic fn backing `MANAGED_THROW` in
+        // `src/terminator/call.rs`) is never actually invoked — the backend recognizes the call by
+        // name and substitutes a direct managed `throw` IL op instead. rustc's own MIR builder has
+        // no idea about that substitution: it sees an ordinary Rust call that could conceivably
+        // unwind, and since the call site sits inside a `extern "C"` (nounwind-by-default) fn, it
+        // attaches `UnwindAction::Terminate` — "abort if this call's hypothetical Rust unwind
+        // escapes". But the substituted CIL never unwinds as a Rust unwind; it's a genuine,
+        // intentional `throw` a .NET caller means to `catch` (see `rustc_clr_interop_throw`'s own
+        // doc — "the C#-catchable error direction"). Wrapping that throw in the FailFast catch-guard
+        // a Terminate edge would otherwise install turns every intentional error-crossing throw into
+        // a hard abort, exactly backwards — this is what broke `cargo_tests/rust_export_cs`'s
+        // `try_div(1,0)` check (root-caused via `ikdasm` on the emitted PE: the `throw` IL was
+        // correct, but sat inside a synthetic `.try { .. } catch { FailFast; rethrow }` this fn
+        // installed around it).
+        if is_managed_throw_call(term, tcx) {
+            return None;
+        }
         // A `Terminate` edge on a CLEANUP block whose terminator is a `Drop` is now handled by an
         // inline `TerminateRegion` abort guard wrapping the drop call itself (see
         // `terminator::handle_terminator`'s `Drop` arm). Returning a synthetic handler id here would
