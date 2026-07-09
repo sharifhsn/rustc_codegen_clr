@@ -1,3 +1,4 @@
 {
-  "CsvHelper": "30.0.1"
+  "CsvHelper": "30.0.1",
+  "HtmlAgilityPack": "1.11.72"
 }
