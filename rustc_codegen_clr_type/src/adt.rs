@@ -4,7 +4,7 @@ use rustc_abi::{FieldIdx, FieldsShape, Layout, LayoutData, VariantIdx, Variants}
 use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_middle::ty::List;
 use rustc_middle::ty::{AdtDef, CoroutineArgsExt, GenericArg, Ty, TyKind};
-pub fn enum_variant_offsets(_: AdtDef, layout: Layout, vidix: VariantIdx) -> FieldOffsetIterator {
+pub fn variant_offsets(_: AdtDef, layout: Layout, vidix: VariantIdx) -> FieldOffsetIterator {
     FieldOffsetIterator::fields(get_variant_at_index(vidix, (*layout.0).clone()))
 }
 
@@ -138,14 +138,14 @@ fn primitive_to_type(primitive: rustc_abi::Primitive, asm: &mut Assembly) -> Typ
     }
 }
 pub fn get_variant_at_index(
-    variant_index: VariantIdx,
+    vidx: VariantIdx,
     layout: LayoutData<FieldIdx, rustc_abi::VariantIdx>,
 ) -> LayoutData<FieldIdx, rustc_abi::VariantIdx> {
     match layout.variants {
         Variants::Single { .. } => layout,
         // `Variants::Multiple.variants` now stores reduced `VariantLayout`s rather than full
         // `LayoutData`s; `LayoutData::for_variant` reconstructs the full per-variant layout.
-        Variants::Multiple { .. } => LayoutData::for_variant(&layout, variant_index),
+        Variants::Multiple { .. } => LayoutData::for_variant(&layout, vidx),
         Variants::Empty => todo!("Empty variants have no variants."),
     }
 }
@@ -236,7 +236,7 @@ pub fn coroutine_field_descriptor<'tcx>(
 /// and coroutines lower to `Variants::Multiple` and are accessed through `PlaceTy::EnumVariant`
 /// (an enum/coroutine Downcast followed by a Field), so the place-handling code shares this one
 /// entry point.
-pub fn variant_field_descriptor<'tcx>(
+pub fn variant_field_desc<'tcx>(
     owner_ty: Ty<'tcx>,
     field_idx: u32,
     variant_idx: u32,

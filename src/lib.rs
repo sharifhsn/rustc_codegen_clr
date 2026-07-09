@@ -111,7 +111,9 @@ mod call_info;
 mod casts;
 /// Runtime errors and utlity functions/macros related to them
 mod codegen_error;
-/// Test harnesses.
+/// Test harnesses — four non-interchangeable strategies (`compare_tests!` diffs output against
+/// native rustc; `run_test!` only checks the .NET run produced no stderr; `test_lib!`/`cargo_test!`
+/// only compile, never execute). See each macro's doc comment before picking one for a new test.
 pub mod compile_test;
 /// Implementation of compiletime features neccessary for interop.
 mod comptime;

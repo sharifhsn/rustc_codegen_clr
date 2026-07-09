@@ -12,7 +12,7 @@ use cilly::{
 type Root = Interned<cilly::ir::CILRoot>;
 use rustc_codegen_clr_call::CallInfo;
 pub use rustc_codegen_clr_ctx::MethodCompileCtx;
-use rustc_codegen_clr_ctx::function_name;
+use rustc_codegen_clr_ctx::fn_name;
 use rustc_codegen_clr_type::{GetTypeExt, align_of, r#type::fixed_array};
 use rustc_hir::def::DefKind;
 use rustc_middle::{
@@ -108,7 +108,7 @@ pub fn add_static(def_id: DefId, ctx: &mut MethodCompileCtx<'_, '_>) -> Interned
     // inside `allocation_initializer_method`, so a visited-set must not live on
     // the ctx.
     let name = ctx.alloc_string(symbol.clone());
-    let already_present = ctx.class_mut(main_module_id).has_static_field(name, tpe);
+    let present = ctx.class_mut(main_module_id).has_static_field(name, tpe);
     let sfld = ctx.add_static(
         tpe,
         symbol.clone(),
@@ -119,7 +119,7 @@ pub fn add_static(def_id: DefId, ctx: &mut MethodCompileCtx<'_, '_>) -> Interned
     );
     let ptr = ctx.alloc_node(CILNode::LdStaticFieldAddress(sfld));
     let ptr = ctx.cast_ptr(ptr, Int::U8);
-    if already_present {
+    if present {
         // The field (and its initializer) were registered by an earlier call;
         // return the same U8-ptr address node every call site expects, without
         // re-evaluating the initializer or recursing again.
@@ -248,7 +248,7 @@ pub fn add_allocation(
     // API and to keep call sites self-documenting.
     let _ = tpe;
     let main_module_id = ctx.main_module();
-    let const_allocation = match ctx
+    let const_alloc = match ctx
         .tcx()
         .global_alloc(AllocId(alloc_id.try_into().expect("0 alloc id?")))
     {
@@ -284,7 +284,7 @@ pub fn add_allocation(
             // constant.rs) instead of returning a null `f_{id}` static, closing the latent
             // null for any direct `add_allocation(Function)` caller.
             let call_info = CallInfo::sig_from_instance_(instance, ctx);
-            let function_name = function_name(ctx.tcx().symbol_name(instance));
+            let function_name = fn_name(ctx.tcx().symbol_name(instance));
             let mref = MethodRef::new(
                 *ctx.main_module(),
                 ctx.alloc_string(function_name),
@@ -304,16 +304,16 @@ pub fn add_allocation(
         GlobalAlloc::TypeId { .. } => return ctx.alloc_node(Const::USize(0)),
     };
 
-    let const_allocation = const_allocation.inner();
+    let const_alloc = const_alloc.inner();
 
     let bytes: &[u8] =
-        const_allocation.inspect_with_uninit_and_ptr_outside_interpreter(0..const_allocation.len());
-    let align = const_allocation.align.bytes().max(1);
-    if const_allocation.len() == 0 {
+        const_alloc.inspect_with_uninit_and_ptr_outside_interpreter(0..const_alloc.len());
+    let align = const_alloc.align.bytes().max(1);
+    if const_alloc.len() == 0 {
         return ctx.alloc_node(Const::USize(align));
     }
     // Check if const literal can be used
-    if const_allocation.provenance().ptrs().is_empty() && align <= 1 {
+    if const_alloc.provenance().ptrs().is_empty() && align <= 1 {
         return ctx.bytebuffer(bytes, Int::U8);
     }
     // Alloc ids are *not* unique across all crates. Adding the hash here ensures we don't overwrite allocations during linking
@@ -321,7 +321,7 @@ pub fn add_allocation(
     let byte_hash = calculate_hash(&bytes);
     match (align, bytes.len()) {
         _ => {
-            // The initializer `cpblk`s the *full* `const_allocation.len()` bytes (see
+            // The initializer `cpblk`s the *full* `const_alloc.len()` bytes (see
             // `allocation_initializer_method`), so the backing field MUST be at least
             // that large. The caller-supplied `tpe` is frequently pointer-sized — e.g. a
             // `&T` const, or the `USize` that `alloc_default_type` returns for the
@@ -340,7 +340,7 @@ pub fn add_allocation(
                 _ => Int::U64,
             };
             let elem_size = elem.size().unwrap_or(8) as u64;
-            let len = const_allocation.len() as u64;
+            let len = const_alloc.len() as u64;
             // .NET does NOT guarantee >8-byte alignment for a value-type *static* field (a
             // `[FieldOffset]`/classlayout `.pack` controls *instance* layout, not where the runtime
             // places the static's storage), so an OVER-aligned const allocation — e.g. a
@@ -374,19 +374,19 @@ pub fn add_allocation(
             // duplicates. The relocation targets are part of the fingerprint so two byte-identical
             // allocations pointing at DIFFERENT functions/statics never wrongly merge. MUTABLE
             // statics must stay distinct, so they keep the unique `AllocId` in the name.
-            let alloc_name = if const_allocation.mutability == rustc_middle::mir::Mutability::Not {
-                let relocs: Vec<(u32, u64)> = const_allocation
+            let alloc_name = if const_alloc.mutability == rustc_middle::mir::Mutability::Not {
+                let relocs: Vec<(u32, u64)> = const_alloc
                     .provenance()
                     .ptrs()
                     .iter()
                     .map(|(off, prov)| (off.bytes_usize() as u32, prov.alloc_id().0.get()))
                     .collect();
-                let content_hash = calculate_hash(&(bytes, align, const_allocation.len(), relocs));
+                let content_hash = calculate_hash(&(bytes, align, const_alloc.len(), relocs));
                 format!(
                     "ro_{}_{}_{}",
                     encode(content_hash),
                     encode(field_tpe_idx.inner().into()),
-                    const_allocation.len()
+                    const_alloc.len()
                 )
             } else {
                 format!(
@@ -394,7 +394,7 @@ pub fn add_allocation(
                     encode(alloc_id),
                     encode(byte_hash),
                     encode(field_tpe_idx.inner().into()),
-                    const_allocation.len()
+                    const_alloc.len()
                 )
             };
             let name = ctx.alloc_string(alloc_name.clone());
@@ -415,7 +415,7 @@ pub fn add_allocation(
             let ptr = ctx.cast_ptr(buf, Int::U8);
 
             let initialzer: MethodDefIdx =
-                allocation_initializer_method(const_allocation, &alloc_name, ctx, ptr.into(), true);
+                allocation_initializer_method(const_alloc, &alloc_name, ctx, ptr.into(), true);
 
             // Calls the static initialzer, and sets the static field to the returned pointer.
             let root = ctx.alloc_root(cilly::CILRoot::call(*initialzer, []));
@@ -475,24 +475,24 @@ fn allocation_initializer_method(
         for (offset, prov) in ptrs.iter() {
             let offset = u32::try_from(offset.bytes_usize()).unwrap();
             // Check if this allocation is a function
-            let reloc_target_alloc = ctx.tcx().global_alloc(prov.alloc_id());
+            let target_alloc = ctx.tcx().global_alloc(prov.alloc_id());
             // `TypeId` provenance is opaque and has no real address: the pointer's
             // offset (already written into the raw bytes copied above by `CpBlk`) is
             // a segment of the 128-bit type-id hash. Leaving the raw bytes in place
             // (base address 0 + offset == hash fragment) keeps `TypeId::of::<T>()`
             // self-consistent for equality, which is all the program can observe.
-            if matches!(reloc_target_alloc, GlobalAlloc::TypeId { .. }) {
+            if matches!(target_alloc, GlobalAlloc::TypeId { .. }) {
                 continue;
             }
             if let GlobalAlloc::Function {
                 instance: finstance,
-            } = reloc_target_alloc
+            } = target_alloc
             {
                 // If it is a function, patch its pointer up.
                 let mut ctx = MethodCompileCtx::new(ctx.tcx(), None, finstance, ctx);
                 let call_info = CallInfo::sig_from_instance_(finstance, &mut ctx);
                 let keep_zst_sig = call_info.sig().clone();
-                let function_name = function_name(ctx.tcx().symbol_name(finstance));
+                let function_name = fn_name(ctx.tcx().symbol_name(finstance));
                 let mref = MethodRef::new(
                     *ctx.main_module(),
                     ctx.alloc_string(function_name),

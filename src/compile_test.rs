@@ -142,6 +142,9 @@ fn test_lib(args: &[&str], test_name: &str) {
         panic!("stdout:\n{stdout}\nstderr:\n{stderr}");
     }
 }
+/// Compiles `$test_name` with both the backend and native rustc, runs both binaries, and
+/// byte-diffs stdout. The only macro here that actually proves output-correctness against
+/// native Rust — `run_test!`/`cargo_test!` do not compare output at all.
 macro_rules! compare_tests {
     ($prefix:ident,$test_name:ident,$is_stable:ident) => {
         mod $test_name {
@@ -325,6 +328,8 @@ macro_rules! compare_tests {
     };
 }
 
+/// Compiles `$test_name` with `--crate-type=lib` via the backend and never runs it — only
+/// proves the crate compiles, not that any code in it behaves correctly.
 macro_rules! test_lib {
     // Inner arm: emits one test fn `$fname`. `$($opt:literal,)*` is the leading
     // optimization flag (`"-O",` for release, empty for debug); the rest of the rustc
@@ -389,6 +394,9 @@ fn compiler(test_name: &str, test_dir: &str, release: bool) -> std::process::Com
     cmd.arg("-Ctarget-feature=+x87+sse");
     cmd
 }
+/// Compiles `$test_name` with the backend and runs the .NET (or C) output, asserting only that
+/// the process exits without producing stderr — it does NOT compare output against native
+/// rustc, so a pass here does not prove correctness (use `compare_tests!` for that).
 macro_rules! run_test {
     ($prefix:ident,$test_name:ident,$is_stable:ident) => {
         mod $test_name {
@@ -473,6 +481,9 @@ macro_rules! run_test {
         }
     };
 }
+/// Runs `cargo build` (debug and release) for a `cargo_tests/` crate through the backend —
+/// never executes the resulting binary, so this only proves the crate compiles, not that it
+/// runs or produces correct output.
 macro_rules! cargo_test {
     ($test_name:ident,$is_stable:ident) => {
         mod $test_name { mod $is_stable{
@@ -557,6 +568,8 @@ macro_rules! cargo_test {
         }}
     };
 }
+/// Same as `cargo_test!` (build-only, no execution) but `#[ignore]`d — for crates too slow or
+/// unreliable to run in the default test pass.
 macro_rules! cargo_test_ignored {
     ($test_name:ident) => {
         mod $test_name {

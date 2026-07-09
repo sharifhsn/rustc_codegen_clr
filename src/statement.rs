@@ -58,8 +58,8 @@ pub fn handle_statement<'tcx>(
                 let root = ctx.init_obj(addr, tpe);
                 return vec![root];
             }
-            let (mut trees, value_calc) = crate::rvalue::handle_rvalue(rvalue, &place, ctx);
-            trees.push(place_set(&place, value_calc, ctx));
+            let (mut trees, val) = crate::rvalue::handle_rvalue(rvalue, &place, ctx);
+            trees.push(place_set(&place, val, ctx));
             trees
         }
         StatementKind::Intrinsic(non_diverging_intirinsic) => {

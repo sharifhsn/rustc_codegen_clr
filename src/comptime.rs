@@ -3,7 +3,8 @@
 //! `dotnet_typedef!` (see `test/types/interop_typedef.rs`) expands to a function
 //! `rustc_codegen_clr_comptime_entrypoint` that, at the MIR level, calls four "magic" intrinsics in
 //! sequence to describe a .NET class:
-//!   * `rustc_codegen_clr_new_typedef::<NAME, IS_VALUETYPE, INHERITS_ASM, INHERITS>() -> ClassDef`
+//!   * `rustc_codegen_clr_new_typedef::<NAME, IS_VALUETYPE, INHERITS_ASM, INHERITS,
+//!     HAS_TYPE_KIND_OPINION>() -> ClassDef`
 //!   * `rustc_codegen_clr_add_field_def::<FieldTy, FNAME>(class) -> ClassDef`
 //!   * `rustc_codegen_clr_add_method_def::<VIS, MODIFIERS, FNAME, FnTy>(class, fnptr) -> ClassDef`
 //!   * `rustc_codegen_clr_finish_type(class)`
@@ -22,7 +23,7 @@ use cilly::{
 };
 use cilly::{Float, Int};
 use rustc_codegen_clr_call::CallInfo;
-use rustc_codegen_clr_ctx::{function_name, MethodCompileCtx};
+use rustc_codegen_clr_ctx::{fn_name, MethodCompileCtx};
 use rustc_codegen_clr_type::r#type::get_type;
 use rustc_codegen_clr_type::utilis::garg_to_string;
 use rustc_middle::mir::{Mutability, Rvalue, StatementKind, TerminatorKind};
@@ -36,6 +37,14 @@ use crate::utilis::garg_to_bool;
 struct PendingClass<'tcx> {
     name: String,
     is_value_type: bool,
+    /// Whether `is_value_type` above is an AUTHORITATIVE opinion (`#[dotnet_class]`'s own
+    /// `value_type = ...` attribute, or `#[dotnet_interface]`'s always-`false`) or a placeholder
+    /// from a re-opening entrypoint that has no access to the original declaration
+    /// (`#[dotnet_methods]`, which always passes `false` regardless of the real class kind — see
+    /// `rustc_codegen_clr_new_typedef`'s doc). `finish_type` only reconciles/asserts on
+    /// `is_value_type` when this is `true`; see `ClassDef::set_is_valuetype`'s doc for why a
+    /// bare bool can't encode "no opinion" on its own.
+    has_type_kind_opinion: bool,
     /// `(assembly, class_name)` of the superclass, if any.
     superclass: Option<(String, String)>,
     /// `(field_type, field_name)`.
@@ -61,6 +70,14 @@ struct PendingClass<'tcx> {
     /// Also synthesize a `set_<field>(value)` mutator per field, paired with the `read_<field>`
     /// accessor.
     has_field_setters: bool,
+    /// Also synthesize a `get_<Field>`/`set_<Field>` accessor pair per field, linked into a real
+    /// §II.22.34 `Property` row (`SpecialName` + `MethodSemantics`) — so reflection-based consumers
+    /// that scan `Type.GetProperties()` (e.g. EF Core's default entity-type discovery convention)
+    /// see a genuine `.NET` property. Deliberately separate from `has_field_setters`: once a method
+    /// is linked as a property accessor, C# rejects calling it explicitly by name (`CS0571`), so
+    /// `has_field_setters`'s `read_<field>`/`set_<field>` accessors (which existing consumers call
+    /// explicitly, e.g. `cd_typedef`) are never touched by this flag.
+    has_properties: bool,
     /// `managed_method_name -> (base_asm, base_type)` — an explicit ECMA-335 `.override` target
     /// for a virtual method already registered in `methods` above (see
     /// `rustc_codegen_clr_mark_last_method_override`'s doc). The base method's own name is
@@ -119,6 +136,153 @@ struct PendingClass<'tcx> {
     /// `is_interface` classes (asserted in `finish_type` — generic CLASS definitions stay
     /// walled: the no-explicit-layout-on-.NET-generics ban applies to classes, not interfaces).
     type_generics: Vec<String>,
+    /// General ECMA-335 `CustomAttribute`s attached to this TYPE, decoded from each
+    /// `rustc_codegen_clr_add_custom_attr::<SPEC>` call's packed `SPEC` string (see that
+    /// intrinsic's doc for the encoding) via [`decode_custom_attr_spec`]. Order-preserving —
+    /// `#[dotnet_class(attr(...), attr(...), ...)]` emits one entry per `attr(...)`, in source
+    /// order.
+    custom_attrs: Vec<PendingCustomAttr>,
+}
+
+/// One decoded `rustc_codegen_clr_add_custom_attr::<SPEC>` call: the attribute's `(assembly,
+/// full_type_name)` reference (same shape as `PendingClass::superclass`/`interfaces`), its
+/// positional constructor args, and its named PROPERTY args.
+#[derive(Clone, Debug)]
+struct PendingCustomAttr {
+    asm: String,
+    type_name: String,
+    ctor_args: Vec<PendingAttrArg>,
+    named_args: Vec<(String, PendingAttrArg)>,
+}
+
+#[derive(Clone, Debug)]
+enum PendingAttrArg {
+    Str(String),
+    Bool(bool),
+    I32(i32),
+    I64(i64),
+}
+
+/// A curated denylist of attribute types CoreCLR's own loader/JIT treats as **runtime-semantic**
+/// — attaching one through this general mechanism could silently change layout or calling
+/// convention the backend's codegen already depends on (the risk class this whole feature's
+/// safety argument is scoped around — see `CustomAttrDef`'s doc in `cilly`). Matched against the
+/// fully-qualified type name (namespace + type, no assembly). `dotnet_macros` carries the exact
+/// same list at proc-macro time (the PRIMARY check — it turns this into a Rust compile error
+/// instead of a backend panic); this is defense-in-depth for any spec that reaches the
+/// interpreter some other way.
+///
+/// Deliberately a blanket per-NAMESPACE deny for `System.Runtime.CompilerServices` and
+/// `System.Runtime.InteropServices` (rather than an enumerated list of "the ones we thought of")
+/// — that family is exactly where the CLR's own layout/marshalling/ABI-affecting attributes live,
+/// so a newly-added BCL attribute in either namespace is denied by default rather than silently
+/// slipping through an incomplete allowlist-shaped list.
+const ATTR_DENYLIST_NAMESPACES: &[&str] = &[
+    "System.Runtime.CompilerServices.",
+    "System.Runtime.InteropServices.",
+];
+
+/// Returns `Some(reason)` if `full_type_name` (namespace + type, e.g.
+/// `"System.Runtime.CompilerServices.InlineArrayAttribute"`) is denylisted, else `None`. See
+/// `ATTR_DENYLIST_NAMESPACES`'s doc for why this is a namespace-blanket check.
+fn denylisted_attr_reason(full_type_name: &str) -> Option<String> {
+    for ns in ATTR_DENYLIST_NAMESPACES {
+        if full_type_name.starts_with(ns) {
+            return Some(format!(
+                "`{full_type_name}` is in `{ns}` — attributes in this namespace are runtime-\
+                 semantic (CoreCLR's own loader/JIT interprets them to change layout or calling \
+                 convention, e.g. InlineArrayAttribute/UnmanagedCallersOnlyAttribute/\
+                 StructLayoutAttribute) and cannot be attached via the general `#[dotnet_class(\
+                 attr(...))]` mechanism"
+            ));
+        }
+    }
+    None
+}
+
+/// Decodes one `rustc_codegen_clr_add_custom_attr::<SPEC>` packed string into a
+/// [`PendingCustomAttr`]. See `rustc_codegen_clr_add_custom_attr`'s doc (in `mycorrhiza::comptime`)
+/// for the exact wire format this is the authoritative decoder for: top-level fields separated by
+/// `\x1E`, list items by `\x1D`, a named arg's name/value by `\x1C`; each arg tagged `s:`/`b:`/
+/// `i:`/`l:`.
+fn decode_custom_attr_spec(spec: &str) -> PendingCustomAttr {
+    let mut fields = spec.split('\u{1E}');
+    let asm = fields.next().unwrap_or_default().to_string();
+    let type_name = fields.next().unwrap_or_default().to_string();
+    let ctor_raw = fields.next().unwrap_or_default();
+    let named_raw = fields.next().unwrap_or_default();
+    assert!(
+        fields.next().is_none(),
+        "comptime: malformed custom-attr SPEC (too many top-level fields): {spec:?}"
+    );
+
+    let decode_val = |tagged: &str| -> PendingAttrArg {
+        let (tag, val) = tagged
+            .split_once(':')
+            .unwrap_or_else(|| panic!("comptime: malformed custom-attr arg (no tag): {tagged:?}"));
+        match tag {
+            "s" => PendingAttrArg::Str(val.to_string()),
+            "b" => PendingAttrArg::Bool(
+                val.parse()
+                    .unwrap_or_else(|_| panic!("comptime: malformed bool custom-attr arg: {val:?}")),
+            ),
+            "i" => PendingAttrArg::I32(
+                val.parse()
+                    .unwrap_or_else(|_| panic!("comptime: malformed i32 custom-attr arg: {val:?}")),
+            ),
+            "l" => PendingAttrArg::I64(
+                val.parse()
+                    .unwrap_or_else(|_| panic!("comptime: malformed i64 custom-attr arg: {val:?}")),
+            ),
+            other => panic!("comptime: unknown custom-attr arg tag {other:?} in {tagged:?}"),
+        }
+    };
+
+    let ctor_args = if ctor_raw.is_empty() {
+        vec![]
+    } else {
+        ctor_raw.split('\u{1D}').map(decode_val).collect()
+    };
+    let named_args = if named_raw.is_empty() {
+        vec![]
+    } else {
+        named_raw
+            .split('\u{1D}')
+            .map(|entry| {
+                let (name, val) = entry.split_once('\u{1C}').unwrap_or_else(|| {
+                    panic!("comptime: malformed named custom-attr entry: {entry:?}")
+                });
+                (name.to_string(), decode_val(val))
+            })
+            .collect()
+    };
+
+    if let Some(reason) = denylisted_attr_reason(&type_name) {
+        panic!("comptime: denylisted custom attribute type — {reason}");
+    }
+
+    PendingCustomAttr {
+        asm,
+        type_name,
+        ctor_args,
+        named_args,
+    }
+}
+
+/// Lowers one decoded [`PendingAttrArg`] to the `cilly` IR's `CustomAttrArg`, interning any
+/// string payload into `ctx`'s assembly. A free fn (not a closure) so callers can invoke it twice
+/// per attribute (once for ctor args, once for named args) without fighting the borrow checker
+/// over two closures each wanting their own mutable capture of `ctx`.
+fn pending_attr_arg_to_cilly<'tcx>(
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    v: &PendingAttrArg,
+) -> cilly::class::CustomAttrArg {
+    match v {
+        PendingAttrArg::Str(s) => cilly::class::CustomAttrArg::Str(ctx.alloc_string(s.clone())),
+        PendingAttrArg::Bool(b) => cilly::class::CustomAttrArg::Bool(*b),
+        PendingAttrArg::I32(i) => cilly::class::CustomAttrArg::I32(*i),
+        PendingAttrArg::I64(i) => cilly::class::CustomAttrArg::I64(*i),
+    }
 }
 
 #[derive(Clone)]
@@ -191,7 +355,7 @@ pub fn interpret<'tcx>(
                 let call_instance = Instance::try_resolve(ctx.tcx(), env, *def_id, subst_ref)
                     .expect("comptime: invalid function def")
                     .expect("comptime: could not resolve callee instance");
-                let fname = function_name(ctx.tcx().symbol_name(call_instance));
+                let fname = fn_name(ctx.tcx().symbol_name(call_instance));
 
                 let dest_local = destination
                     .as_local()
@@ -202,6 +366,7 @@ pub fn interpret<'tcx>(
                     let is_value_type = garg_to_bool(subst_ref[1], ctx.tcx());
                     let superclass_asm = garg_to_string(subst_ref[2], ctx.tcx()).replace("::", ".");
                     let superclass_name = garg_to_string(subst_ref[3], ctx.tcx()).replace("::", ".");
+                    let has_type_kind_opinion = garg_to_bool(subst_ref[4], ctx.tcx());
                     let superclass = if superclass_name.is_empty() {
                         None
                     } else {
@@ -210,6 +375,7 @@ pub fn interpret<'tcx>(
                     ComptimeLocalVar::Class(PendingClass {
                         name,
                         is_value_type,
+                        has_type_kind_opinion,
                         superclass,
                         fields: vec![],
                         methods: vec![],
@@ -218,6 +384,7 @@ pub fn interpret<'tcx>(
                         has_primary_ctor: false,
                         has_default_ctor: false,
                         has_field_setters: false,
+                        has_properties: false,
                         method_overrides: std::collections::HashMap::new(),
                         event_bindings: std::collections::HashMap::new(),
                         property_bindings: std::collections::HashMap::new(),
@@ -226,6 +393,7 @@ pub fn interpret<'tcx>(
                         default_methods: vec![],
                         static_abstract_methods: vec![],
                         type_generics: vec![],
+                        custom_attrs: vec![],
                     })
                 } else if fname.contains("rustc_codegen_clr_add_field_def") {
                     let src = operand_local(&args[0].node);
@@ -500,6 +668,15 @@ pub fn interpret<'tcx>(
                     let iface_name = garg_to_string(subst_ref[1], ctx.tcx()).replace("::", ".");
                     class.interfaces.push((iface_asm, iface_name, vec![]));
                     ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_add_custom_attr") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    // Generics: <const SPEC> — one packed string, NOT `::`-normalized like the
+                    // other string consts here: it carries literal (possibly user-authored) arg
+                    // text verbatim, not a Rust path. See `decode_custom_attr_spec`'s doc.
+                    let spec = garg_to_string(subst_ref[0], ctx.tcx());
+                    class.custom_attrs.push(decode_custom_attr_spec(&spec));
+                    ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_add_primary_ctor") {
                     let src = operand_local(&args[0].node);
                     let mut class = locals[src].as_class().clone();
@@ -514,6 +691,15 @@ pub fn interpret<'tcx>(
                     let src = operand_local(&args[0].node);
                     let mut class = locals[src].as_class().clone();
                     class.has_field_setters = true;
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_add_field_properties") {
+                    // Substring-dispatch safety (see the `contains()` chain doc convention used
+                    // throughout this match): "add_field_properties" neither contains nor is
+                    // contained by "add_field_setters" or "add_field_def" — the `properties`/
+                    // `setters`/`def` tails all diverge.
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    class.has_properties = true;
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_mark_interface") {
                     let src = operand_local(&args[0].node);
@@ -722,8 +908,29 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
     // only those not already present). This keeps field/method emission order-independent: whichever
     // entrypoint runs last, the final classdef has every field, so the `read_*`/`set_*` accessors
     // typecheck.
-    let self_cref = ctx.alloc_class_ref(ClassRef::new(name, None, class.is_value_type, [].into()));
-    let class_idx = if let Some(existing) = ctx.class_ref_to_def(self_cref) {
+    //
+    // `extends` needs the SAME reconciliation, and used to get NONE: a re-opening
+    // `#[dotnet_methods]` entrypoint has no access to the original `#[dotnet_class(extends =
+    // "...")]` spelling (it only sees the `impl` block), so its own `rustc_codegen_clr_new_typedef`
+    // call carries an empty (`""`) INHERITS — `PendingClass.superclass` decodes that as `None`,
+    // meaning "no opinion, don't touch extends" (see `ClassDef::set_extends`'s doc for the full
+    // segfault this used to cause when the re-opening entrypoint ran FIRST and its old hardcoded
+    // `"System.Object"` "opinion" silently won). Apply THIS entrypoint's extends only when it
+    // actually has one; a real conflict between two entrypoints that both name a real (different)
+    // superclass is a genuine authoring error, not an ordering artifact, so it panics loudly rather
+    // than silently picking one.
+    // Looked up BY NAME ALONE (not via a `ClassRef` that bakes in `is_valuetype`): a re-opening
+    // `#[dotnet_methods]` entrypoint has no real opinion on `is_valuetype` either (see
+    // `PendingClass::has_type_kind_opinion`'s doc) and so cannot honestly construct the exact
+    // `ClassRef` the authoritative entrypoint registered under. Looking up by the interned
+    // `ClassRef` (name + is_valuetype together) would silently MISS an already-registered class
+    // whenever the two entrypoints' `is_valuetype` opinions differ (one real, one a `false`
+    // placeholder) and fall into the "register fresh" branch below — producing a second,
+    // phantom `ClassDef` under the SAME name but a DIFFERENT identity, invisible to
+    // `class_def`'s own duplicate-name panic (which keys on the same is_valuetype-baked
+    // `ClassRef`). See `ClassDef::set_is_valuetype`'s doc for the exact hazard this closes —
+    // `set_extends`'s sibling fix, for a field a bare bool can't spell "no opinion" for.
+    let class_idx = if let Some(existing) = ctx.class_def_by_name(name) {
         if !fields.is_empty() {
             let def = ctx.class_mut(existing);
             let existing_fields = def.fields_mut();
@@ -733,8 +940,34 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                 }
             }
         }
+        if let Some(new_extends) = extends {
+            let def = ctx.class_mut(existing);
+            match def.extends() {
+                None => def.set_extends(Some(new_extends)),
+                Some(prev_extends) => assert_eq!(
+                    prev_extends, new_extends,
+                    "comptime: class '{}' re-declares a different `extends` base across its                      comptime entrypoints (`#[dotnet_class]` vs `#[dotnet_methods]`) — this is a                      real conflict, not codegen-unit ordering noise",
+                    class.name
+                ),
+            }
+        }
+        // `is_valuetype` reconciliation: only an AUTHORITATIVE entrypoint (`#[dotnet_class]`/
+        // `#[dotnet_interface]`) gets a say — a re-opening `#[dotnet_methods]` entrypoint's
+        // `is_value_type` is a meaningless placeholder (always `false`) and must not be allowed
+        // to either overwrite or be asserted against the real value.
+        if class.has_type_kind_opinion {
+            ctx.class_mut(existing).set_is_valuetype(class.is_value_type);
+        }
         existing
     } else {
+        // No existing class found: either this is the FIRST comptime entrypoint to touch this
+        // name (could be the authoritative `#[dotnet_class]`/`#[dotnet_interface]` declaration,
+        // OR — codegen-unit ordering is NOT guaranteed — a re-opening `#[dotnet_methods]` block
+        // that happens to run before it). In the latter case this registers a class with a
+        // placeholder `is_value_type = false` (`has_type_kind_opinion = false`, so NOT marked
+        // authoritative below); the authoritative entrypoint, whenever it runs, finds this same
+        // class via the name-only lookup above and corrects `is_valuetype` through
+        // `set_is_valuetype` rather than colliding with it.
         // Generic type DEFINITIONS (`rustc_codegen_clr_set_type_generics`, from
         // `#[dotnet_interface] trait IFoo<T>`) are interface-only: an interface has no layout,
         // so the historical no-explicit-layout-on-.NET-generics ban does not apply — but it DOES
@@ -761,6 +994,14 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             None,
             true,
         );
+        // Record whether THIS entrypoint's `is_value_type` is an authoritative opinion (see
+        // `ClassDef::set_is_valuetype`'s doc) — a re-opening `#[dotnet_methods]` entrypoint that
+        // happens to register the class FIRST writes a placeholder here, which the authoritative
+        // `#[dotnet_class]`/`#[dotnet_interface]` entrypoint corrects later via `set_is_valuetype`
+        // in the reuse branch above.
+        if class.has_type_kind_opinion {
+            def = def.with_valuetype_authoritative();
+        }
         // `#[dotnet_interface]`: a genuine ECMA-335 `interface` TypeDef (no base, Interface+Abstract
         // flags). An interface is always registered fresh here (a trait is defined by exactly one
         // entrypoint — no `#[dotnet_methods]`-style re-opening), so the idempotent-reuse branch
@@ -827,6 +1068,34 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         ctx.class_mut(class_idx).add_interface(iface_ref);
     }
 
+    // Attach general custom attributes (see `PendingCustomAttr`'s doc). The attribute TYPE is
+    // referenced exactly like an implemented interface / superclass — a plain external `ClassRef`,
+    // never derived from a Rust type — and resolved to a real `TypeRef`/`MemberRef` by the PE
+    // writer at export time (`pe_exporter::tables::class_ref_token` + the ctor `MemberRef`
+    // machinery `implements`/`extends` already share).
+    for attr in &class.custom_attrs {
+        let type_cls = ctx.alloc_string(attr.type_name.clone());
+        let type_asm = if attr.asm.is_empty() {
+            None
+        } else {
+            Some(ctx.alloc_string(attr.asm.clone()))
+        };
+        let attr_type = ctx.alloc_class_ref(ClassRef::new(type_cls, type_asm, false, [].into()));
+        let ctor_args: Vec<_> = attr
+            .ctor_args
+            .iter()
+            .map(|v| pending_attr_arg_to_cilly(ctx, v))
+            .collect();
+        let named_args: Vec<_> = attr
+            .named_args
+            .iter()
+            .map(|(name, v)| (ctx.alloc_string(name.clone()), pending_attr_arg_to_cilly(ctx, v)))
+            .collect();
+        ctx.class_mut(class_idx).add_custom_attribute(
+            cilly::class::CustomAttrDef::new(attr_type, ctor_args, named_args),
+        );
+    }
+
     // Accumulates each event's `add`/`remove` `MethodRef` + delegate `Type` as the method loops
     // below encounter them (in whatever order `class.methods`/`class.abstract_methods` happen to
     // hold them) — see `rustc_codegen_clr_mark_last_method_event_add`'s doc. Built into real
@@ -844,9 +1113,9 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         let call_info = CallInfo::sig_from_instance_(*target, ctx);
         let fn_sig = call_info.sig().clone();
         // The exporter requires one arg name per signature input (the receiver included for a virtual).
-        let arg_names = vec![None; fn_sig.inputs().len()];
+        let arg_names = crate::assembly::carrier_arg_names(*target, 0, fn_sig.inputs().len(), ctx);
         let sig = ctx.alloc_sig(fn_sig);
-        let target_name = function_name(ctx.tcx().symbol_name(*target));
+        let target_name = fn_name(ctx.tcx().symbol_name(*target));
         let target_name = ctx.alloc_string(target_name);
         let main_module = *ctx.main_module();
         let target_mref = MethodRef::new(main_module, target_name, sig, MethodKind::Static, [].into());
@@ -942,7 +1211,7 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                  `#[dotnet_interface]` macro, which only accepts `#[dotnet_out]` on `&mut T`"
             );
         }
-        let arg_names = vec![None; fn_sig.inputs().len()];
+        let arg_names = crate::assembly::carrier_arg_names(*carrier, 1, fn_sig.inputs().len(), ctx);
         let sig = ctx.alloc_sig(fn_sig);
         let mname = ctx.alloc_string(method_name.clone());
         let mut mdef = MethodDef::new(
@@ -1085,7 +1354,7 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         // `skip = 0`: a static carrier has no receiver input.
         let fn_sig =
             byref_interface_sig(ctx, method_name, *carrier, call_info.sig().clone(), 0);
-        let arg_names = vec![None; fn_sig.inputs().len()];
+        let arg_names = crate::assembly::carrier_arg_names(*carrier, 0, fn_sig.inputs().len(), ctx);
         let sig = ctx.alloc_sig(fn_sig);
         let mname = ctx.alloc_string(method_name.clone());
         let mdef = MethodDef::new(
@@ -1147,9 +1416,9 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         }
         let call_info = CallInfo::sig_from_instance_(*target, ctx);
         let fn_sig = call_info.sig().clone();
-        let arg_names = vec![None; fn_sig.inputs().len()];
+        let arg_names = crate::assembly::carrier_arg_names(*target, 0, fn_sig.inputs().len(), ctx);
         let sig = ctx.alloc_sig(fn_sig);
-        let target_name = function_name(ctx.tcx().symbol_name(*target));
+        let target_name = fn_name(ctx.tcx().symbol_name(*target));
         let target_name = ctx.alloc_string(target_name);
         let main_module = *ctx.main_module();
         let target_mref =
@@ -1193,9 +1462,9 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
     for (method_name, target) in &class.static_methods {
         let call_info = CallInfo::sig_from_instance_(*target, ctx);
         let fn_sig = call_info.sig().clone();
-        let arg_names = vec![None; fn_sig.inputs().len()];
+        let arg_names = crate::assembly::carrier_arg_names(*target, 0, fn_sig.inputs().len(), ctx);
         let sig = ctx.alloc_sig(fn_sig);
-        let target_name = function_name(ctx.tcx().symbol_name(*target));
+        let target_name = fn_name(ctx.tcx().symbol_name(*target));
         let target_name = ctx.alloc_string(target_name);
         let main_module = *ctx.main_module();
         let target_mref = MethodRef::new(main_module, target_name, sig, MethodKind::Static, [].into());
@@ -1352,6 +1621,86 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                         vec![None, None],
                     );
                     ctx.new_method(setter_def);
+                }
+            }
+
+            // Field-backed PROPERTIES: `get_<field>(this) -> field_ty` / `set_<field>(this, value)` —
+            // structurally identical bodies to the `read_<field>`/`set_<field>` accessors above, but
+            // ALSO linked into a real §II.22.34 `Property` row (via `add_property`, which stamps
+            // `SpecialName` on both accessor `MethodDef`s and emits the `MethodSemantics`
+            // Getter/Setter rows) — so reflection-based consumers that specifically scan
+            // `Type.GetProperties()` (e.g. EF Core's default entity-type discovery convention) see a
+            // genuine `.NET` property, not just two same-shaped ordinary methods.
+            //
+            // Deliberately a SEPARATE opt-in from `has_field_setters` (`properties = true`, not a
+            // `field_setters` variant): once a method is linked as a property accessor via
+            // `MethodSemantics`, C#/Roslyn REJECTS explicitly calling it by name (`CS0571: cannot
+            // explicitly call operator or accessor`) — confirmed empirically, not merely a metadata
+            // nicety. `cd_typedef`'s `Counter` calls `read_value()`/`set_value(42)` by explicit
+            // method-call syntax and MUST keep working, so `has_field_setters`'s `read_*`/`set_*`
+            // accessors are never linked into a `PropertyDef`; a class that wants real properties
+            // opts in separately (and gets `get_*`/`set_*` accessors instead, matching Roslyn's own
+            // naming for `{ get; set; }`).
+            if class.has_properties {
+                for (tpe, fname) in &class.fields {
+                    let fname_str = ctx.alloc_string(fname.clone());
+                    let fdesc = ctx.alloc_field(FieldDesc::new(*class_idx, fname_str, *tpe));
+
+                    let this = ctx.alloc_node(CILNode::LdArg(0));
+                    let load = ctx.ld_field(this, fdesc);
+                    let ret = ctx.alloc_root(CILRoot::Ret(load));
+                    let getter_sig = ctx.sig([self_ty], *tpe);
+                    let getter_name = ctx.alloc_string(format!("get_{fname}"));
+                    let getter_def = MethodDef::new(
+                        Access::Extern,
+                        class_idx,
+                        getter_name,
+                        getter_sig,
+                        MethodKind::Virtual,
+                        MethodImpl::MethodBody {
+                            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+                            locals: vec![],
+                        },
+                        vec![None],
+                    );
+                    let getter_ref = ctx.alloc_methodref(getter_def.ref_to());
+                    ctx.new_method(getter_def);
+
+                    let obj = ctx.alloc_node(CILNode::LdArg(0));
+                    let value = ctx.alloc_node(CILNode::LdArg(1));
+                    let store = ctx.alloc_root(CILRoot::SetField(Box::new((fdesc, obj, value))));
+                    let set_ret = ctx.alloc_root(CILRoot::VoidRet);
+                    let setter_sig = ctx.sig([self_ty, *tpe], Type::Void);
+                    let setter_name = ctx.alloc_string(format!("set_{fname}"));
+                    let setter_def = MethodDef::new(
+                        Access::Extern,
+                        class_idx,
+                        setter_name,
+                        setter_sig,
+                        MethodKind::Virtual,
+                        MethodImpl::MethodBody {
+                            blocks: vec![BasicBlock::new(vec![store, set_ret], 0, None)],
+                            locals: vec![],
+                        },
+                        vec![None, None],
+                    );
+                    let setter_ref = ctx.alloc_methodref(setter_def.ref_to());
+                    ctx.new_method(setter_def);
+
+                    // Property name: the field name, capitalized (`id` -> `Id`) — Roslyn's own
+                    // convention for an auto-property backing a lowerCamelCase field, and what a C#
+                    // consumer expects to write (`w.Id`, not `w.id`).
+                    let mut prop_name_str = fname.clone();
+                    if let Some(first) = prop_name_str.get_mut(0..1) {
+                        first.make_ascii_uppercase();
+                    }
+                    let prop_name = ctx.alloc_string(prop_name_str);
+                    ctx.class_mut(class_idx).add_property(cilly::class::PropertyDef::new(
+                        prop_name,
+                        *tpe,
+                        Some(getter_ref),
+                        Some(setter_ref),
+                    ));
                 }
             }
         }

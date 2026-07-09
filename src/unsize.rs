@@ -158,9 +158,9 @@ fn unsized_info<'tcx>(
             }
 
             // trait upcasting coercion
-            let vptr_entry_idx = ctx.tcx().supertrait_vtable_slot((source, target));
+            let vslot_idx = ctx.tcx().supertrait_vtable_slot((source, target));
 
-            if let Some(entry_idx) = vptr_entry_idx {
+            if let Some(entry_idx) = vslot_idx {
                 let entry_idx = u32::try_from(entry_idx).unwrap();
                 let entry_idx = ctx.alloc_node(entry_idx);
                 let size = ctx.size_of(Int::USize).into_idx(ctx);

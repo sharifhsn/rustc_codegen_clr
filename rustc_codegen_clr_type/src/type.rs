@@ -3,9 +3,9 @@ use crate::utilis::{
     INTEROP_ARR_TPE_NAME, INTEROP_CHR_TPE_NAME, INTEROP_CLASS_TPE_NAME,
     INTEROP_BYREF_TPE_NAME, INTEROP_GENERIC_STRUCT_TPE_NAME, INTEROP_GENERIC_TPE_NAME,
     INTEROP_METHOD_GENERIC_TPE_NAME, INTEROP_STRUCT_TPE_NAME, INTEROP_TYPE_GENERIC_TPE_NAME, is_zst,
-    try_resolve_const_size,
+    resolve_const_size,
 };
-use crate::utilis::{garg_to_usize, garg_to_string, pointer_to_is_fat, tuple_name};
+use crate::utilis::{garg_to_usize, garg_to_string, ptr_is_fat, tuple_name};
 use crate::{
     GetTypeExt,
     utilis::{adt_name, stable_adt_name},
@@ -222,7 +222,7 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
         TyKind::Uint(int) => from_uint(int),
         TyKind::Never => Type::Void,
         TyKind::RawPtr(inner, _) | TyKind::Ref(_, inner, _) => {
-            if pointer_to_is_fat(*inner, ctx.tcx(), ctx.instance()) {
+            if ptr_is_fat(*inner, ctx.tcx(), ctx.instance()) {
                 let inner = match inner.kind() {
                     TyKind::Slice(inner) => ctx.monomorphize(*inner),
                     TyKind::Str => Ty::new_uint(ctx.tcx(), UintTy::U8),
@@ -460,7 +460,7 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
         TyKind::Array(element, length) => {
             // Get the lenght of thid array
             let length = ctx.monomorphize(*length);
-            let length: usize = try_resolve_const_size(length).unwrap();
+            let length: usize = resolve_const_size(length).unwrap();
             // Get the element of the array
             let element = ctx.monomorphize(*element);
             let element = get_type(element, ctx);
@@ -813,6 +813,23 @@ fn coroutine_typedef<'tcx>(
     // Per-variant saved-local fields. `state_tys` yields one inner iterator per coroutine
     // variant (outer index = `VariantIdx`); the reserved Unresumed/Returned/Panicked variants
     // have no saved locals, so their inner iterators are empty and are naturally skipped.
+    //
+    // rustc's own coroutine layout is free to reuse the same byte offset across DIFFERENT
+    // variants with DIFFERENT saved-local types (only one variant is ever live at a time, so
+    // native code has no problem with the reuse). CoreCLR's class loader is pickier: reusing a
+    // byte offset for a gcref-shaped field (e.g. `mycorrhiza::task::TaskFuture<T>`, which nests a
+    // real managed `Task<T>` reference) in one variant and something else (a raw primitive, or a
+    // differently-shaped field) in another produces "object field at offset N is incorrectly
+    // aligned or overlapped by a non-object field" at type-LOAD time — `cilly`'s own
+    // `ClassDef::layout_check` now catches this pattern at compile time (see its doc comment for
+    // exactly what it allows: identical-typed reuse is fine, this is not). Rather than merely
+    // rejecting the compile, give any field that would create such a collision its own private,
+    // non-overlapping slot appended after the coroutine's natural extent — cheap (this is
+    // strictly additional memory that only exists on the CoreCLR side, never observed by Rust
+    // code, which never `size_of`s a coroutine) and keeps the fast, fully-overlapping layout for
+    // every other (safe) field.
+    let mut extra_end: u64 = layout.size().bytes();
+    let mut extra_align: u64 = layout.align().abi.bytes();
     let variant_state_tys: Vec<Vec<Ty<'tcx>>> = coroutine_args
         .state_tys(def_id, ctx.tcx())
         .map(|variant| variant.collect())
@@ -826,7 +843,8 @@ fn coroutine_typedef<'tcx>(
             ));
         for (field_idx, (sty, offset)) in variant_field_tys.into_iter().zip(offset_iter).enumerate()
         {
-            let fty = get_type(ctx.monomorphize(sty), ctx);
+            let mono_sty = ctx.monomorphize(sty);
+            let fty = get_type(mono_sty, ctx);
             // Parity with closure/enum field handling: ZST-typed fields have no .NET slot.
             if fty == Type::Void {
                 continue;
@@ -835,9 +853,30 @@ fn coroutine_typedef<'tcx>(
                 "{vname}_{field_idx}",
                 vname = crate::adt::coroutine_variant_name(var)
             ));
-            fields.push((fty, fname, Some(offset)));
+            // Would placing this field at its natural (rustc-computed) offset create a
+            // loader-unsafe collision with a field already placed there by an earlier variant?
+            // Mirrors `ClassDef::layout_check`'s own grouping criterion exactly: unsafe iff the
+            // types differ AND at least one side carries a real gcref.
+            let unsafe_collision = fields.iter().any(|(ot, _, ooff)| {
+                *ooff == Some(offset)
+                    && *ot != fty
+                    && (ot.contains_gcref(&*ctx) || fty.contains_gcref(&*ctx))
+            });
+            let final_offset = if unsafe_collision {
+                let field_layout = ctx.layout_of(mono_sty);
+                let f_align = field_layout.layout.align().abi.bytes().max(1);
+                let f_size = field_layout.layout.size().bytes();
+                let start = extra_end.next_multiple_of(f_align);
+                extra_end = start + f_size;
+                extra_align = extra_align.max(f_align);
+                u32::try_from(start).expect("Coroutine relocated-field offset exceeds 2^32")
+            } else {
+                offset
+            };
+            fields.push((fty, fname, Some(final_offset)));
         }
     }
+    let total_size = extra_end.max(layout.size().bytes());
     // Coroutine variants overlap in memory (like enum variants), so the layout is NOT
     // non-overlapping — `closure_typedef`'s upvar-only uniqueness check would wrongly report
     // `true` once overlapping variant fields are present, so force `false` here.
@@ -849,20 +888,10 @@ fn coroutine_typedef<'tcx>(
         fields,
         vec![],
         Access::Public,
+        Some(NonZeroU32::new(total_size.try_into().expect("Coroutine size exceeds 2^32")).unwrap()),
         Some(
-            NonZeroU32::new(layout.size().bytes().try_into().expect("Coroutine size exceeds 2^32"))
+            NonZeroU32::new(extra_align.try_into().expect("Coroutine alignment exceeds 2^32"))
                 .unwrap(),
-        ),
-        Some(
-            NonZeroU32::new(
-                layout
-                    .align()
-                    .abi
-                    .bytes()
-                    .try_into()
-                    .expect("Coroutine alignment exceeds 2^32"),
-            )
-            .unwrap(),
         ),
         false,
     )
@@ -1069,7 +1098,7 @@ fn dump_enum_layout<'tcx>(adt_ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>
             if let Some(adt) = adt_ty.ty_adt_def() {
                 for (vidx, _v) in adt.variants().iter_enumerated() {
                     let voff: Vec<u32> =
-                        crate::adt::enum_variant_offsets(adt, layout.layout, vidx).collect();
+                        crate::adt::variant_offsets(adt, layout.layout, vidx).collect();
                     out += &format!("  variant {vidx:?} field_offsets={voff:?}\n");
                 }
             }
@@ -1154,7 +1183,7 @@ fn enum_<'tcx>(
     for (vidx, variant) in adt.variants().iter_enumerated() {
         let variant_name = variant.name.to_string();
         let mut variant_fields = vec![];
-        let field_offset_iter = crate::adt::enum_variant_offsets(adt, layout.layout, vidx);
+        let field_offset_iter = crate::adt::variant_offsets(adt, layout.layout, vidx);
 
         for (field, offset) in variant.fields.iter().zip(field_offset_iter) {
             let name = format!(

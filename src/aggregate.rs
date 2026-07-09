@@ -11,7 +11,7 @@ use rustc_codegen_clr_place::{place_address, place_get, place_set};
 use rustc_codegen_clr_type::{
     adt::{enum_tag_info, field_descrptor},
     r#type::{escape_field_name, get_type},
-    utilis::{is_zst, pointer_to_is_fat, simple_tuple},
+    utilis::{is_zst, ptr_is_fat, simple_tuple},
     GetTypeExt,
 };
 use rustc_codgen_clr_operand::{handle_operand, is_uninit};
@@ -24,10 +24,10 @@ use rustc_middle::{
 type Node = Interned<cilly::ir::CILNode>;
 type Root = Interned<cilly::ir::CILRoot>;
 
-/// Returns the CIL ops to create the aggreagate value specifed by `aggregate_kind` at `target_location`. Uses indivlidual values specifed by `value_index`
+/// Returns the CIL ops to create the aggreagate value specifed by `aggregate_kind` at `dst_place`. Uses indivlidual values specifed by `value_index`
 pub fn handle_aggregate<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    target_location: &Place<'tcx>,
+    dst_place: &Place<'tcx>,
     aggregate_kind: &AggregateKind<'tcx>,
     value_index: &IndexVec<FieldIdx, Operand<'tcx>>,
 ) -> (Vec<Root>, Node) {
@@ -55,7 +55,7 @@ pub fn handle_aggregate<'tcx>(
             };
             aggregate_adt(
                 ctx,
-                target_location,
+                dst_place,
                 *adt_def,
                 adt_type,
                 subst,
@@ -68,12 +68,12 @@ pub fn handle_aggregate<'tcx>(
             // Check if this array is made up from uninit values
             if is_uninit(&value_index[FieldIdx::from_usize(0)], ctx) {
                 // This array is created from uninitalized data, so it itsefl is uninitialzed, so we can skip initializing it.
-                return (vec![], place_get(target_location, ctx));
+                return (vec![], place_get(dst_place, ctx));
             }
             let element = ctx.monomorphize(*element);
             let element = ctx.type_from_cache(element);
             let array_type = ClassRef::fixed_array(element, value_index.len() as u64, ctx);
-            let array_getter = place_address(target_location, ctx);
+            let array_getter = place_address(dst_place, ctx);
             let sig = FnSig::new(
                 [ctx.nref(array_type), Type::Int(Int::USize), element],
                 Type::Void,
@@ -92,10 +92,10 @@ pub fn handle_aggregate<'tcx>(
                 let root = ctx.call_root(site, &[array_getter, idx, value.1], IsPure::NOT);
                 sub_trees.push(root);
             }
-            (sub_trees, (place_get(target_location, ctx)))
+            (sub_trees, (place_get(dst_place, ctx)))
         }
         AggregateKind::Tuple => {
-            let tuple_getter = place_address(target_location, ctx);
+            let tuple_getter = place_address(dst_place, ctx);
             let types: Vec<_> = value_index
                 .iter()
                 .map(|operand| {
@@ -121,15 +121,15 @@ pub fn handle_aggregate<'tcx>(
                 let root = ctx.set_field(desc, tuple_getter, field.1);
                 sub_trees.push(root);
             }
-            (sub_trees, (place_get(target_location, ctx)))
+            (sub_trees, (place_get(dst_place, ctx)))
         }
         AggregateKind::Closure(_def_id, _args) => {
             let closure_ty = ctx
-                .monomorphize(target_location.ty(ctx.body(), ctx.tcx()))
+                .monomorphize(dst_place.ty(ctx.body(), ctx.tcx()))
                 .ty;
             let closure_type = get_type(closure_ty, ctx);
             let closure_dotnet = closure_type.as_class_ref().expect("Invalid closure type!");
-            let closure_getter = place_address(target_location, ctx);
+            let closure_getter = place_address(dst_place, ctx);
             let mut sub_trees = vec![];
             for (index, value) in value_index.iter_enumerated() {
                 let field_ty = ctx.monomorphize(value.ty(ctx.body(), ctx.tcx()));
@@ -144,17 +144,17 @@ pub fn handle_aggregate<'tcx>(
                 sub_trees.push(root);
             }
 
-            (sub_trees, (place_get(target_location, ctx)))
+            (sub_trees, (place_get(dst_place, ctx)))
         }
         AggregateKind::Coroutine(_def_id, _args) => {
             let coroutine_ty = ctx
-                .monomorphize(target_location.ty(ctx.body(), ctx.tcx()))
+                .monomorphize(dst_place.ty(ctx.body(), ctx.tcx()))
                 .ty;
             let coroutine_type = get_type(coroutine_ty, ctx);
             let closure_dotnet = coroutine_type
                 .as_class_ref()
                 .expect("Invalid closure type!");
-            let closure_getter = place_address(target_location, ctx);
+            let closure_getter = place_address(dst_place, ctx);
             let mut sub_trees = vec![];
             for (index, value) in value_index.iter_enumerated() {
                 let field_ty = ctx.monomorphize(value.ty(ctx.body(), ctx.tcx()));
@@ -180,7 +180,7 @@ pub fn handle_aggregate<'tcx>(
                     ctx,
                 ));
             }
-            (sub_trees, (place_get(target_location, ctx)))
+            (sub_trees, (place_get(dst_place, ctx)))
         }
         AggregateKind::RawPtr(pointee, mutability) => {
             let pointee = ctx.monomorphize(*pointee);
@@ -189,11 +189,11 @@ pub fn handle_aggregate<'tcx>(
             };
             let fat_ptr = Ty::new_ptr(ctx.tcx(), pointee, *mutability);
             // Get the addres of the initialized structure
-            let init_addr = place_address(target_location, ctx);
+            let init_addr = place_address(dst_place, ctx);
             let meta_ty = ctx.monomorphize(meta.ty(ctx.body(), ctx.tcx()));
             let data_ty = ctx.monomorphize(data.ty(ctx.body(), ctx.tcx()));
             let fat_ptr_type = ctx.type_from_cache(fat_ptr);
-            if !pointer_to_is_fat(pointee, ctx.tcx(), ctx.instance()) {
+            if !ptr_is_fat(pointee, ctx.tcx(), ctx.instance()) {
                 // Double-check the pointer is REALLY thin
                 assert!(fat_ptr_type.as_class_ref().is_none());
                 assert!(
@@ -215,11 +215,11 @@ pub fn handle_aggregate<'tcx>(
                 // already-correct fat-ptr DATA_PTR arm below. Surfaced by alloctests `thin_box`.
                 let data = ctx.cast_ptr_to(data, ptr);
                 return (
-                    [place_set(target_location, data, ctx)].into(),
-                    (place_get(target_location, ctx)),
+                    [place_set(dst_place, data, ctx)].into(),
+                    (place_get(dst_place, ctx)),
                 );
             }
-            assert!(pointer_to_is_fat(pointee,ctx.tcx(), ctx.instance()), "A pointer to {pointee:?} is not fat, but its metadata is {meta_ty:?}, and not a zst:{is_meta_zst}",is_meta_zst = is_zst(meta_ty,  ctx.tcx()));
+            assert!(ptr_is_fat(pointee,ctx.tcx(), ctx.instance()), "A pointer to {pointee:?} is not fat, but its metadata is {meta_ty:?}, and not a zst:{is_meta_zst}",is_meta_zst = is_zst(meta_ty,  ctx.tcx()));
             let fat_ptr_type = get_type(fat_ptr, ctx);
             // Assign the components
             let data_ptr_name = ctx.alloc_string(crate::DATA_PTR);
@@ -250,7 +250,7 @@ pub fn handle_aggregate<'tcx>(
 
             (
                 [assign_ptr, assign_metadata].into(),
-                (place_get(target_location, ctx)),
+                (place_get(dst_place, ctx)),
             )
         }
         AggregateKind::CoroutineClosure(..) => {
@@ -258,10 +258,10 @@ pub fn handle_aggregate<'tcx>(
         }
     }
 }
-/// Builds an Algebraic Data Type (struct,enum,union) at location `target_location`, with fields set using ops in `fields`.
+/// Builds an Algebraic Data Type (struct,enum,union) at location `dst_place`, with fields set using ops in `fields`.
 fn aggregate_adt<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    target_location: &Place<'tcx>,
+    dst_place: &Place<'tcx>,
     adt: AdtDef<'tcx>,
     adt_type: Ty<'tcx>,
     subst: &'tcx List<GenericArg<'tcx>>,
@@ -285,7 +285,7 @@ fn aggregate_adt<'tcx>(
     if let Type::SIMDVector(simd) = adt_cil {
         if fields.len() as u64 == u64::from(simd.count()) {
             let elem: Type = simd.elem().into();
-            let addr = place_address(target_location, ctx);
+            let addr = place_address(dst_place, ctx);
             let elem_ptr = ctx.cast_ptr(addr, elem);
             let mut roots = Vec::new();
             for (lane, value) in fields {
@@ -295,7 +295,7 @@ fn aggregate_adt<'tcx>(
                     slot, value, elem, false,
                 )))));
             }
-            return (roots, place_get(target_location, ctx));
+            return (roots, place_get(dst_place, ctx));
         }
         // The modern stdlib shape `struct Simd<T,N>([T;N])` has a single inner-array field
         // whose value IS the whole vector (the array `[T;N]` and the `SIMDVector` are
@@ -313,8 +313,8 @@ fn aggregate_adt<'tcx>(
             let field_ty = ctx.monomorphize(field_ty);
             let field_cil = ctx.type_from_cache(field_ty);
             let as_vec = ctx.transmute_on_stack(field_cil, adt_cil, value);
-            let root = place_set(target_location, as_vec, ctx);
-            return (vec![root], place_get(target_location, ctx));
+            let root = place_set(dst_place, as_vec, ctx);
+            return (vec![root], place_get(dst_place, ctx));
         }
     }
     let adt_type_ref = adt_cil
@@ -322,7 +322,7 @@ fn aggregate_adt<'tcx>(
         .unwrap_or_else(|| panic!("Type {adt_type:?} is not a valuetype."));
     match adt.adt_kind() {
         AdtKind::Struct => {
-            let obj_getter = place_address(target_location, ctx);
+            let obj_getter = place_address(dst_place, ctx);
 
             let mut sub_trees = Vec::new();
             for field in fields {
@@ -342,10 +342,10 @@ fn aggregate_adt<'tcx>(
                 let root = ctx.set_field(field_desc, obj_getter, field.1);
                 sub_trees.push(root);
             }
-            (sub_trees, (place_get(target_location, ctx)))
+            (sub_trees, (place_get(dst_place, ctx)))
         }
         AdtKind::Enum => {
-            let adt_address_ops = place_address(target_location, ctx);
+            let adt_address_ops = place_address(dst_place, ctx);
 
             let variant_name = variant_name(adt_type, variant_idx);
 
@@ -385,10 +385,10 @@ fn aggregate_adt<'tcx>(
                 ));
             }
 
-            (sub_trees, (place_get(target_location, ctx)))
+            (sub_trees, (place_get(dst_place, ctx)))
         }
         AdtKind::Union => {
-            let obj_getter = place_address(target_location, ctx);
+            let obj_getter = place_address(dst_place, ctx);
 
             let mut sub_trees = Vec::new();
             let active_field = active_field.unwrap();
@@ -402,7 +402,7 @@ fn aggregate_adt<'tcx>(
             let field_type = get_type(field_ty, ctx);
             // Seting a void field is a no-op.
             if field_type == cilly::Type::Void {
-                return (vec![], place_get(target_location, ctx));
+                return (vec![], place_get(dst_place, ctx));
             }
 
             let field_name = field_name(adt_type, active_field.as_u32());
@@ -411,7 +411,7 @@ fn aggregate_adt<'tcx>(
             let desc = ctx.alloc_field(desc);
             let root = ctx.set_field(desc, obj_getter, fields[0].1);
             sub_trees.push(root);
-            (sub_trees, (place_get(target_location, ctx)))
+            (sub_trees, (place_get(dst_place, ctx)))
         }
     }
 }

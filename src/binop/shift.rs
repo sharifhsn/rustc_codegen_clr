@@ -1,4 +1,4 @@
-use crate::{assembly::MethodCompileCtx, utilis::compiletime_sizeof};
+use crate::{assembly::MethodCompileCtx, utilis::const_sizeof};
 use cilly::{
     cilnode::{ExtendKind, IsPure, MethodKind},
     BinOp, Int, Interned, Type,
@@ -84,7 +84,7 @@ pub fn shr_checked<'tcx>(
     ops_b: Node,
 ) -> Node {
     let type_b = ctx.type_from_cache(shift_type);
-    let bit_cap = u32::try_from(compiletime_sizeof(value_type, ctx.tcx()) * 8)
+    let bit_cap = u32::try_from(const_sizeof(value_type, ctx.tcx()) * 8)
         .expect("Intiger size over 2^32 bits.");
     match value_type.kind() {
         TyKind::Uint(UintTy::U128) => {
@@ -165,7 +165,7 @@ pub fn shl_checked<'tcx>(
     ops_b: Node,
 ) -> Node {
     let type_b = ctx.type_from_cache(shift_type);
-    let bit_cap = u32::try_from(compiletime_sizeof(value_type, ctx.tcx()) * 8)
+    let bit_cap = u32::try_from(const_sizeof(value_type, ctx.tcx()) * 8)
         .expect("Intiger has over 2^32 bits.");
     match value_type.kind() {
         TyKind::Uint(UintTy::U128) => {

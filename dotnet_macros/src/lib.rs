@@ -62,6 +62,200 @@ fn validate_dotnet_ref(spec: &str, span: proc_macro2::Span) -> syn::Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// `attr(...)` — general `#[dotnet_class(attr(...))]` custom-attribute surface.
+// ============================================================================
+
+/// The same denylist `src/comptime.rs`'s `denylisted_attr_reason` carries (kept as an independent
+/// copy — this crate has no dependency on the backend — so a bad attribute type is rejected here,
+/// at ordinary Rust compile time, with a real `syn::Error`, rather than surfacing only as a
+/// backend panic during codegen). See that fn's doc for why this is a NAMESPACE-blanket deny
+/// rather than an enumerated list: `System.Runtime.CompilerServices`/`System.Runtime.
+/// InteropServices` is exactly where CoreCLR's own layout/marshalling/ABI-affecting attributes
+/// live, so a BCL attribute added to either namespace later is denied by default.
+const ATTR_DENYLIST_NAMESPACES: &[&str] = &[
+    "System.Runtime.CompilerServices.",
+    "System.Runtime.InteropServices.",
+];
+
+fn denylisted_attr_reason(full_type_name: &str) -> Option<String> {
+    for ns in ATTR_DENYLIST_NAMESPACES {
+        if full_type_name.starts_with(ns) {
+            return Some(format!(
+                "#[dotnet_class]: `{full_type_name}` cannot be attached via `attr(...)` — it is \
+                 in `{ns}`, a namespace CoreCLR's own loader/JIT treats as runtime-semantic \
+                 (layout- or calling-convention-affecting, e.g. InlineArrayAttribute/\
+                 UnmanagedCallersOnlyAttribute/StructLayoutAttribute). This safety check exists \
+                 because a malformed attribute TYPE reference fails safely (a catchable \
+                 reflection exception), but a runtime-semantic attribute silently changing layout \
+                 the backend depends on would not."
+            ));
+        }
+    }
+    None
+}
+
+/// One literal constructor/named argument inside an `attr(...)` entry — `args(...)`/`props(...)`
+/// accept exactly these four Rust literal kinds (a plain string, bool, `i32`-range integer, or
+/// `i64`-range integer), matching the shapes `cilly::class::CustomAttrArg` can express. No other
+/// literal kind (float, char, byte-string, …) is accepted — see that enum's doc for the full
+/// "well-formed by construction" rationale this mirrors at the macro-syntax level.
+enum AttrArgLit {
+    Str(String),
+    Bool(bool),
+    I32(i32),
+    I64(i64),
+}
+impl AttrArgLit {
+    /// `s:`/`b:`/`i:`/`l:` + the literal's text — the wire format `src/comptime.rs`'s
+    /// `decode_custom_attr_spec` is the authoritative decoder for. Panics (via `assert!`, at
+    /// macro-expansion time — never reachable with user-controlled content because the literal
+    /// value itself, not user runtime input, is what's encoded) if the text contains one of the
+    /// reserved delimiter control characters; see `validate_no_delims`, called before this at
+    /// parse time, for the real (spanned) diagnostic.
+    fn encode(&self) -> String {
+        match self {
+            AttrArgLit::Str(s) => format!("s:{s}"),
+            AttrArgLit::Bool(b) => format!("b:{b}"),
+            AttrArgLit::I32(i) => format!("i:{i}"),
+            AttrArgLit::I64(i) => format!("l:{i}"),
+        }
+    }
+}
+
+/// Reserved wire-format delimiters (see `AttrSpec::encode`'s doc) — a string literal (the only
+/// arg kind that can contain arbitrary text) containing one of these is rejected at parse time
+/// with a real diagnostic, rather than silently desyncing the packed spec's fields.
+const RESERVED_DELIMS: [char; 3] = ['\u{1E}', '\u{1D}', '\u{1C}'];
+
+fn validate_no_delims(s: &str, span: proc_macro2::Span) -> syn::Result<()> {
+    if s.contains(RESERVED_DELIMS) {
+        return Err(syn::Error::new(
+            span,
+            "string literal contains a reserved control character (U+001C/U+001D/U+001E) used \
+             internally to encode `attr(...)` — this is vanishingly unlikely to be intentional; \
+             remove it",
+        ));
+    }
+    Ok(())
+}
+
+fn lit_to_arg(lit: &syn::Lit) -> syn::Result<AttrArgLit> {
+    match lit {
+        syn::Lit::Str(s) => {
+            validate_no_delims(&s.value(), s.span())?;
+            Ok(AttrArgLit::Str(s.value()))
+        }
+        syn::Lit::Bool(b) => Ok(AttrArgLit::Bool(b.value)),
+        syn::Lit::Int(i) => {
+            if let Ok(v) = i.base10_parse::<i32>() {
+                Ok(AttrArgLit::I32(v))
+            } else {
+                i.base10_parse::<i64>().map(AttrArgLit::I64)
+            }
+        }
+        other => Err(syn::Error::new(
+            other.span(),
+            "expected a string, bool, or integer literal",
+        )),
+    }
+}
+
+fn expr_to_arg(expr: &syn::Expr) -> syn::Result<AttrArgLit> {
+    if let syn::Expr::Lit(syn::ExprLit { lit, .. }) = expr {
+        lit_to_arg(lit)
+    } else {
+        Err(syn::Error::new(
+            expr.span(),
+            "expected a string, bool, or integer literal",
+        ))
+    }
+}
+
+/// One `attr("[Assembly]Namespace.AttrType", args(1, "x", true), props(Name = "Foo", Order = 1))`
+/// entry: the attribute's `.NET` type reference (same `"[Asm]Ns.Type"` spelling as `extends`/
+/// `implements`), its positional constructor arguments in `args(...)` (empty/omitted for a
+/// no-arg ctor), and its named PROPERTY arguments in `props(...)` (field-targeted named args are
+/// not supported — see `cilly::class::CustomAttrDef`'s doc for why: virtually every real
+/// attribute's named-arg surface is settable properties, not public fields).
+struct AttrSpec {
+    type_name: String,
+    ctor_args: Vec<AttrArgLit>,
+    named_args: Vec<(String, AttrArgLit)>,
+}
+impl AttrSpec {
+    /// Packs this spec into the single `&'static str` `rustc_codegen_clr_add_custom_attr::<SPEC>`
+    /// carries: `<asm>\x1E<type>\x1E<ctor_args>\x1E<named_args>`, where `ctor_args` is a `\x1D`-
+    /// joined list of `AttrArgLit::encode()` outputs and `named_args` is a `\x1D`-joined list of
+    /// `<name>\x1C<AttrArgLit::encode()>` entries. `\x1C`/`\x1D`/`\x1E` are ASCII-reserved
+    /// (Unit/Group/Record Separator) control characters chosen specifically because ordinary
+    /// source text can't contain them — `validate_no_delims` rejects any string literal that
+    /// does, so this packing can never desynchronize. `src/comptime.rs`'s `decode_custom_attr_spec`
+    /// is the authoritative decoder.
+    fn encode(&self) -> String {
+        let (asm, type_name) = split_dotnet_ref(&self.type_name);
+        let ctor = self
+            .ctor_args
+            .iter()
+            .map(AttrArgLit::encode)
+            .collect::<Vec<_>>()
+            .join("\u{1D}");
+        let named = self
+            .named_args
+            .iter()
+            .map(|(name, v)| format!("{name}\u{1C}{}", v.encode()))
+            .collect::<Vec<_>>()
+            .join("\u{1D}");
+        format!("{asm}\u{1E}{type_name}\u{1E}{ctor}\u{1E}{named}")
+    }
+}
+impl syn::parse::Parse for AttrSpec {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let type_lit: LitStr = input.parse()?;
+        let type_name = type_lit.value();
+        validate_dotnet_ref(&type_name, type_lit.span())?;
+        validate_no_delims(&type_name, type_lit.span())?;
+        let mut ctor_args = Vec::new();
+        let mut named_args = Vec::new();
+        while input.peek(Token![,]) {
+            input.parse::<Token![,]>()?;
+            if input.is_empty() {
+                break; // trailing comma
+            }
+            let ident: syn::Ident = input.parse()?;
+            let content;
+            syn::parenthesized!(content in input);
+            if ident == "args" {
+                let lits = Punctuated::<syn::Lit, Token![,]>::parse_terminated(&content)?;
+                for l in lits {
+                    ctor_args.push(lit_to_arg(&l)?);
+                }
+            } else if ident == "props" {
+                let nvs = Punctuated::<MetaNameValue, Token![,]>::parse_terminated(&content)?;
+                for nv in nvs {
+                    let name = nv
+                        .path
+                        .get_ident()
+                        .ok_or_else(|| syn::Error::new(nv.path.span(), "expected a property name"))?
+                        .to_string();
+                    validate_no_delims(&name, nv.path.span())?;
+                    named_args.push((name, expr_to_arg(&nv.value)?));
+                }
+            } else {
+                return Err(syn::Error::new(
+                    ident.span(),
+                    format!("attr(...): unknown key `{ident}`; expected `args` or `props`"),
+                ));
+            }
+        }
+        Ok(AttrSpec {
+            type_name,
+            ctor_args,
+            named_args,
+        })
+    }
+}
+
 /// Extract a string-literal value from an attribute's `= value` expression, or a precise error at
 /// the value's own span if it isn't one (instead of silently keeping the field's prior/default
 /// value, which is what a plain `if let` match-and-ignore would do).
@@ -107,21 +301,55 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemStruct);
 
     // ---- attribute args: extends = "...", value_type = bool, default_ctor = bool,
-    //      field_setters = bool ----
+    //      field_setters = bool, properties = bool, attr(...) (repeatable) ----
     let mut extends = "[System.Runtime]System.Object".to_string();
     let mut value_type = false;
     let mut default_ctor = false;
     let mut field_setters = false;
+    let mut properties = false;
     // Managed interfaces this class implements, `;`-separated in one string (usually just one), e.g.
     // `implements = "[MyLib]MyLib.IService"` or `"[A]A.I1;[B]B.I2"`. See the interface `add_*` intrinsic.
     let mut implements: Vec<String> = Vec::new();
+    // General custom attributes, one `attr(...)` entry per attribute — see `AttrSpec`'s doc.
+    let mut attr_specs: Vec<AttrSpec> = Vec::new();
     if !attr.is_empty() {
-        let parser = Punctuated::<MetaNameValue, Token![,]>::parse_terminated;
+        let parser = Punctuated::<syn::Meta, Token![,]>::parse_terminated;
         let metas = match syn::parse::Parser::parse(parser, attr) {
             Ok(m) => m,
             Err(e) => return e.to_compile_error().into(),
         };
-        for m in metas {
+        for meta in metas {
+            let m = match &meta {
+                syn::Meta::NameValue(nv) => nv,
+                syn::Meta::List(list) if list.path.is_ident("attr") => {
+                    match list.parse_args::<AttrSpec>() {
+                        Ok(spec) => {
+                            // Check the BARE type name (namespace + type, no `[Assembly]`
+                            // prefix) — `spec.type_name` still carries the bracketed assembly,
+                            // which would never match `ATTR_DENYLIST_NAMESPACES`'s
+                            // `starts_with` and silently let every denylisted attribute through.
+                            let (_, bare_name) = split_dotnet_ref(&spec.type_name);
+                            if let Some(reason) = denylisted_attr_reason(&bare_name) {
+                                return syn::Error::new(list.span(), reason)
+                                    .to_compile_error()
+                                    .into();
+                            }
+                            attr_specs.push(spec);
+                        }
+                        Err(e) => return e.to_compile_error().into(),
+                    }
+                    continue;
+                }
+                _ => {
+                    return syn::Error::new(
+                        meta.span(),
+                        "#[dotnet_class]: expected `key = \"...\"` or `attr(\"[Asm]Ns.Type\", \
+                         args(...), props(...))`",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+            };
             if m.path.is_ident("extends") {
                 match str_lit_value(&m.value) {
                     Ok(s) => {
@@ -145,6 +373,11 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
             } else if m.path.is_ident("field_setters") {
                 match bool_lit_value(&m.value) {
                     Ok(v) => field_setters = v,
+                    Err(e) => return e.to_compile_error().into(),
+                }
+            } else if m.path.is_ident("properties") {
+                match bool_lit_value(&m.value) {
+                    Ok(v) => properties = v,
                     Err(e) => return e.to_compile_error().into(),
                 }
             } else if m.path.is_ident("implements") {
@@ -187,7 +420,8 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                     m.path.span(),
                     format!(
                         "#[dotnet_class]: unknown attribute key `{}`; expected one of `extends`, \
-                         `value_type`, `default_ctor`, `field_setters`, `implements`",
+                         `value_type`, `default_ctor`, `field_setters`, `properties`, \
+                         `implements`, `attr(...)`",
                         quote! { #path }
                     ),
                 )
@@ -236,6 +470,17 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         })
         .collect();
+    // One `add_custom_attr::<"packed spec">` per `attr(...)` entry — see `AttrSpec::encode`'s doc
+    // for the packed wire format `rustc_codegen_clr_add_custom_attr` decodes.
+    let attr_calls: Vec<_> = attr_specs
+        .iter()
+        .map(|spec| {
+            let packed = LitStr::new(&spec.encode(), span);
+            quote! {
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_custom_attr::<#packed>(class);
+            }
+        })
+        .collect();
     let handle_ident = format_ident!("{}Handle", name);
     let entry_mod = format_ident!("__dotnet_class_{}", name);
     let name_lit = LitStr::new(&name.to_string(), span);
@@ -265,6 +510,16 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! {}
     };
+    // `properties = true`: a `get_<Field>`/`set_<Field>` accessor pair per field, linked into a
+    // real `.NET` property — a SEPARATE opt-in from `field_setters` (see
+    // `rustc_codegen_clr_add_field_properties`'s doc for why: once linked as a property accessor,
+    // C# rejects calling the method explicitly, so this must not touch `field_setters`' `read_*`/
+    // `set_*` accessors, which existing consumers call directly).
+    let properties_call = if properties {
+        quote! { let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_field_properties(class); }
+    } else {
+        quote! {}
+    };
 
     let expanded = quote! {
         #input
@@ -284,14 +539,19 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
             static PREVENT_DCE: fn() = rustc_codegen_clr_comptime_entrypoint;
             #[inline(never)]
             pub fn rustc_codegen_clr_comptime_entrypoint() {
+                // `HAS_TYPE_KIND_OPINION = true`: this IS the authoritative `#[dotnet_class]`
+                // declaration — `#value_type` is the real `value_type = ...` attribute value, not
+                // a re-opening placeholder (see `rustc_codegen_clr_new_typedef`'s doc).
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_new_typedef::<
-                    #name_lit, #value_type, #super_asm_lit, #super_name_lit,
+                    #name_lit, #value_type, #super_asm_lit, #super_name_lit, true,
                 >();
                 #(#field_calls)*
                 #(#interface_calls)*
+                #(#attr_calls)*
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_primary_ctor(class);
                 #default_ctor_call
                 #field_setters_call
+                #properties_call
                 ::mycorrhiza::comptime::rustc_codegen_clr_finish_type(class);
             }
         }
@@ -1984,9 +2244,12 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
             static PREVENT_DCE: fn() = rustc_codegen_clr_comptime_entrypoint;
             #[inline(never)]
             pub fn rustc_codegen_clr_comptime_entrypoint() {
-                // An interface has no base type -> empty superclass args.
+                // An interface has no base type -> empty superclass args. `HAS_TYPE_KIND_OPINION
+                // = true`: an interface is always registered fresh by exactly one entrypoint (no
+                // `#[dotnet_methods]`-style re-opening), so `false` here is a real, authoritative
+                // opinion, not a placeholder.
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_new_typedef::<
-                    #name_lit, false, "", "",
+                    #name_lit, false, "", "", true,
                 >();
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_mark_interface(class);
                 // Generic interface (`trait IFoo<T>`): declare the parameter names — one
@@ -2260,10 +2523,37 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#keep_anchors)*
             #[inline(never)]
             pub fn rustc_codegen_clr_comptime_entrypoint() {
-                // Re-open the class: same name/super/value-type as the `#[dotnet_class]` decl, so the
-                // idempotent `finish_type` finds the already-registered class and appends these methods.
+                // Re-open the class by name so `finish_type`'s idempotent registration finds the
+                // already-registered `ClassDef` (from the `#[dotnet_class]` struct decl) and
+                // appends these methods to it. `INHERITS` is deliberately EMPTY, not
+                // `"System.Object"`: this `impl` block has no access to the original struct's
+                // `#[dotnet_class(extends = "...")]` attribute, so it must declare "no opinion"
+                // about the base class (`""` decodes to `superclass = None` in
+                // `PendingClass`/`finish_type`, which then leaves the existing class's `extends`
+                // untouched) rather than asserting a specific one. This used to hardcode
+                // `"System.Object"` as if that were always a safe default -- it wasn't: on
+                // codegen-unit orderings where THIS entrypoint's `new_typedef` call ran before the
+                // struct decl's, that false "System.Object" opinion won permanently (the decl's
+                // real `extends=` was silently dropped by the old merge-only-fields reuse path),
+                // producing a `TypeDef` whose actual base was `System.Object` even though every
+                // `.override`/base-ctor-chain call site still correctly named the real base --
+                // fatal at CLR type-load time (see `cilly::ir::class::ClassDef::set_extends`'s doc
+                // for the exact CoreCLR native-crash mechanism this caused, confirmed via
+                // `cargo_tests/cd_bgservice`).
+                //
+                // The SAME "no real opinion" reasoning applies to `IS_VALUETYPE` (the `false`
+                // above): this impl block also has no access to the original struct's
+                // `#[dotnet_class(value_type = ...)]` attribute. Unlike `INHERITS`, a bare `bool`
+                // can't spell "no opinion" on its own, so `HAS_TYPE_KIND_OPINION = false` marks
+                // this `false` as a non-authoritative placeholder — `finish_type` looks the class
+                // up by name alone (never by an is_valuetype-baked `ClassRef`) and only lets an
+                // authoritative entrypoint's opinion stick (see
+                // `cilly::ir::class::ClassDef::set_is_valuetype`'s doc for the mirrored hazard
+                // this closes: a `value_type = true` class whose `#[dotnet_methods]` block ran
+                // first used to silently register a second, phantom `is_valuetype = false`
+                // `ClassDef` under the same name).
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_new_typedef::<
-                    #name_lit, false, "System.Runtime", "System.Object",
+                    #name_lit, false, "", "", false,
                 >();
                 #(#method_calls)*
                 ::mycorrhiza::comptime::rustc_codegen_clr_finish_type(class);
@@ -2881,7 +3171,7 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
             } else {
                 ::std::string::String::from("Rust panic (no message available)")
             };
-        ::mycorrhiza::error::throw_message(&__msg)
+        ::mycorrhiza::error::throw_msg(&__msg)
     };
 
     // The inner call is wrapped in `catch_unwind`: a plain `extern "C"` is a `nounwind` ABI
@@ -2889,7 +3179,7 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // panic would otherwise reach the true edge and the runtime hard-aborts the whole process
     // (`Environment.FailFast`) with no chance for the C# caller to recover. Catching it *inside*
     // the shim and re-raising as a genuine managed `System.Exception`
-    // (`::mycorrhiza::error::throw_message`) turns an unrecoverable process abort into an ordinary
+    // (`::mycorrhiza::error::throw_msg`) turns an unrecoverable process abort into an ordinary
     // `catch`-able error.
     //
     // Two shapes, chosen by `returns_managed_handle`:
@@ -2910,19 +3200,42 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let body = if returns_managed_handle {
         let ret_ty = ret_ty_for_slot.expect("returns_managed_handle implies a return type");
         quote! {
-            let mut __slot: ::core::mem::MaybeUninit<#ret_ty> = ::core::mem::MaybeUninit::uninit();
-            let __slot_ptr: *mut #ret_ty = __slot.as_mut_ptr();
+            // `#ret_ty` (`Task`/`TaskT<T>`) carries a real .NET object reference, so it can't live
+            // in `catch_unwind`'s own `Result<RetTy, _>` (a genuine gcref in the `Err` variant's
+            // overlapping storage — `cilly`'s `ClassDef::layout_check` correctly refuses that, see
+            // the module note above). The ORIGINAL fix for this routed the value out through a raw
+            // pointer into a `MaybeUninit<RetTy>` slot instead — but `MaybeUninit`'s own write/read
+            // (`as_mut_ptr`, and even the "safe" `write`/`assume_init`, which still lower to
+            // `self as *mut Self as *mut T` internally) is itself a CIL `PtrCast` reinterpreting a
+            // possibly-uninitialized location as a live gcref — exactly the hazard `Type::
+            // contains_gcref`'s (correctly) deepened check now also catches. It slipped through for
+            // the simplest `#[dotnet_export]` bodies only because rustc's own optimizer proved the
+            // `MaybeUninit` dance redundant and elided the cast before our backend ever saw it; a
+            // bigger fn body (e.g. one driving a real multi-`.await` coroutine through
+            // `future_to_task`) keeps the cast in the final MIR and the verifier correctly rejects
+            // it (`ManagedPtrCast`).
+            //
+            // Fix: use a plain `Option<RetTy>` out-slot instead of `MaybeUninit<RetTy>`. Writing
+            // `*out = Some(__v)` is an ordinary tagged-enum construction (`aggregate.rs`), not a
+            // storage reinterpretation, and reading it back is an ordinary `match` (a normal field
+            // read off the `Some` variant) — neither lowers to a `PtrCast`, so `contains_gcref`
+            // never enters the picture. The slot itself is captured by the closure as `&mut
+            // Option<RetTy>` (a managed byref field in the closure's environment, not a `RetTy`
+            // value), so it still never sits inside `catch_unwind`'s own `Result`.
+            let mut __slot: ::core::option::Option<#ret_ty> = ::core::option::Option::None;
             match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
                 let __v = #call;
-                // SAFETY: `__slot_ptr` points at `__slot`'s own storage, valid for the duration of
-                // this closure call; written at most once, before `catch_unwind` returns, and read
-                // back only from the `Ok` arm below (i.e. only once initialized).
-                unsafe { __slot_ptr.write(__v) };
+                __slot = ::core::option::Option::Some(__v);
             })) {
                 ::std::result::Result::Ok(()) => {
-                    // SAFETY: the closure above wrote a valid `#ret_ty` on its only non-unwinding
-                    // path, which is exactly the path that reaches this arm.
-                    let __ret: #ret_ty = unsafe { __slot.assume_init() };
+                    // The closure above set `__slot` on its only non-unwinding path, which is
+                    // exactly the path that reaches this arm.
+                    let __ret: #ret_ty = match __slot {
+                        ::core::option::Option::Some(__v) => __v,
+                        ::core::option::Option::None => unreachable!(
+                            "dotnet_export: catch_unwind returned Ok without the closure setting __slot"
+                        ),
+                    };
                     #ret_expr
                 }
                 ::std::result::Result::Err(__panic_payload) => {
@@ -2954,7 +3267,7 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // needed.
         //
         // The shim itself is declared `extern "C-unwind"`, not plain `extern "C"`. This is NOT
-        // optional: `throw_message`'s `ExceptionDispatchInfo::Throw()` call performs a genuine CIL
+        // optional: `throw_msg`'s `ExceptionDispatchInfo::Throw()` call performs a genuine CIL
         // `throw`, which this backend must (correctly) model as an operation that can unwind — and
         // that call sits in the `Err` arm, OUTSIDE the `catch_unwind` closure (only the call/write is
         // protected). A call that can unwind, sitting directly in a `nounwind extern "C"` function

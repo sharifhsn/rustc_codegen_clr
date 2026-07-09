@@ -1,6 +1,6 @@
 use crate::{
     assembly::MethodCompileCtx,
-    utilis::{adt::get_discr, compiletime_sizeof},
+    utilis::{adt::get_discr, const_sizeof},
 };
 use cilly::{
     cilnode::{ExtendKind, IsPure, MethodKind},
@@ -10,12 +10,12 @@ use cilly::{
 type Node = Interned<cilly::ir::CILNode>;
 type Root = Interned<cilly::ir::CILRoot>;
 use rustc_codegen_clr_call::CallInfo;
-use rustc_codegen_clr_ctx::function_name;
+use rustc_codegen_clr_ctx::fn_name;
 use rustc_codegen_clr_place::{place_address, place_get};
 use rustc_codegen_clr_type::{
     adt::enum_tag_info,
     r#type::get_type,
-    utilis::pointer_to_is_fat,
+    utilis::ptr_is_fat,
     GetTypeExt,
 };
 use rustc_codgen_clr_operand::{
@@ -93,7 +93,7 @@ fn single_variant_discr<'tcx>(
 }
 pub fn handle_rvalue<'tcx>(
     rvalue: &Rvalue<'tcx>,
-    target_location: &Place<'tcx>,
+    dst_place: &Place<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> (Vec<Root>, Node) {
     match rvalue {
@@ -122,7 +122,7 @@ pub fn handle_rvalue<'tcx>(
             dst,
         ) => (vec![], ptr_to_ptr(ctx, operand, *dst)),
         Rvalue::Cast(CastKind::PointerCoercion(PointerCoercion::Unsize, _), operand, target) => {
-            crate::unsize::unsize(ctx, operand, *target, *target_location)
+            crate::unsize::unsize(ctx, operand, *target, *dst_place)
         }
         Rvalue::BinaryOp(binop, operands) => (
             vec![],
@@ -149,7 +149,7 @@ pub fn handle_rvalue<'tcx>(
         // and UbChecks/ContractChecks are now `Operand::RuntimeChecks` (handled in the operand crate).
         Rvalue::Aggregate(aggregate_kind, field_index) => crate::aggregate::handle_aggregate(
             ctx,
-            target_location,
+            dst_place,
             aggregate_kind.as_ref(),
             field_index,
         ),
@@ -168,7 +168,7 @@ pub fn handle_rvalue<'tcx>(
                 );
                 let call_info = CallInfo::sig_from_instance_(instance, ctx);
 
-                let function_name = function_name(ctx.tcx().symbol_name(instance));
+                let function_name = fn_name(ctx.tcx().symbol_name(instance));
                 let fn_ptr_sig = ctx.alloc_sig(call_info.sig().clone());
                 let call_site = MethodRef::new(
                     *ctx.main_module(),
@@ -309,7 +309,7 @@ pub fn handle_rvalue<'tcx>(
             } else {
                 todo!("Trying to call a type which is not a function definition!");
             };
-            let function_name = function_name(ctx.tcx().symbol_name(instance));
+            let function_name = fn_name(ctx.tcx().symbol_name(instance));
             let function_sig = crate::function_sig::sig_from_instance_(instance, ctx)
                 .expect("Could not get function signature when trying to get a function pointer!");
             //FIXME: properly handle `#[track_caller]`
@@ -367,7 +367,7 @@ pub fn handle_rvalue<'tcx>(
                 )
             }
         }
-        Rvalue::Repeat(operand, times) => repeat(rvalue, ctx, operand, *times, target_location),
+        Rvalue::Repeat(operand, times) => repeat(rvalue, ctx, operand, *times, dst_place),
         Rvalue::ThreadLocalRef(def_id) => {
             if !def_id.is_local() && ctx.tcx().needs_thread_local_shim(*def_id) {
                 // Cross-crate `#[thread_local]` shim. UNREACHABLE from safe/stable Rust on the
@@ -411,7 +411,7 @@ fn repeat<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     element: &Operand<'tcx>,
     times: rustc_middle::ty::Const<'tcx>,
-    target_location: &Place<'tcx>,
+    dst_place: &Place<'tcx>,
 ) -> (Vec<Root>, Node) {
     // Get the type of the operand
     let element_ty = ctx.monomorphize(element.ty(ctx.body(), ctx.tcx()));
@@ -427,18 +427,18 @@ fn repeat<'tcx>(
     let array = ctx.type_from_cache(array);
     let array_dotnet = array.clone().as_class_ref().expect("Invalid array type.");
     // Check if the element is byte sized. If so, use initblk to quickly initialize this array.
-    if compiletime_sizeof(element_ty, ctx.tcx()) == 1 {
-        let place_address = place_address(target_location, ctx);
+    if const_sizeof(element_ty, ctx.tcx()) == 1 {
+        let place_address = place_address(dst_place, ctx);
         let val = ctx.transmute_on_stack(element_type, Type::Int(Int::U8), element);
         let u8_ptr = ctx.nptr(Type::Int(Int::U8));
         let dst = ctx.cast_ptr(place_address, u8_ptr);
         let count = ctx.alloc_node(Const::USize(times));
         let init = ctx.init_blk(dst, val, count);
-        return (vec![init], place_get(target_location, ctx));
+        return (vec![init], place_get(dst_place, ctx));
     }
     // Check if there are more than SIMPLE_REPEAT_CAP elements. If so, use mecmpy to accelerate initialzation
     if times > SIMPLE_REPEAT_CAP {
-        let place_address = place_address(target_location, ctx);
+        let place_address = place_address(dst_place, ctx);
         let mut branches = Vec::new();
         let arr_ref = ctx.nref(array);
         let mref = MethodRef::new(
@@ -472,7 +472,7 @@ fn repeat<'tcx>(
             branches.push(root);
             curr_len *= 2;
         }
-        (branches, place_get(target_location, ctx))
+        (branches, place_get(dst_place, ctx))
     } else {
         let mut branches = Vec::new();
         let arr_ref = ctx.nref(array);
@@ -483,14 +483,14 @@ fn repeat<'tcx>(
             MethodKind::Instance,
             vec![].into(),
         );
-        let place_address = place_address(target_location, ctx);
+        let place_address = place_address(dst_place, ctx);
         let mref = ctx.alloc_methodref(mref);
         for idx in 0..times {
             let idx = ctx.alloc_node(Const::USize(idx));
             let root = ctx.call_root(mref, &[place_address, idx, element], IsPure::NOT);
             branches.push(root);
         }
-        (branches, place_get(target_location, ctx))
+        (branches, place_get(dst_place, ctx))
     }
 }
 fn ptr_to_ptr<'tcx>(
@@ -513,8 +513,8 @@ fn ptr_to_ptr<'tcx>(
     let source_type = ctx.type_from_cache(source);
     let target_type = ctx.type_from_cache(target);
 
-    let src_fat = pointer_to_is_fat(source_pointed_to, ctx.tcx(), ctx.instance());
-    let target_fat = pointer_to_is_fat(*target_pointed_to, ctx.tcx(), ctx.instance());
+    let src_fat = ptr_is_fat(source_pointed_to, ctx.tcx(), ctx.instance());
+    let target_fat = ptr_is_fat(*target_pointed_to, ctx.tcx(), ctx.instance());
     match (src_fat, target_fat) {
         (true, true) => {
             let val = handle_operand(operand, ctx);

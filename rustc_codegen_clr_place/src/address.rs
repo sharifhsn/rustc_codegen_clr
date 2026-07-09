@@ -1,5 +1,5 @@
 use super::PlaceTy;
-use crate::pointer_to_is_fat;
+use crate::ptr_is_fat;
 use cilly::{
     Assembly, BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, MethodRef, Type,
     cilnode::{ExtendKind, MethodKind},
@@ -7,7 +7,7 @@ use cilly::{
 use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_type::{
     GetTypeExt,
-    adt::{FieldOffsetIterator, field_descrptor, variant_field_descriptor},
+    adt::{FieldOffsetIterator, field_descrptor, variant_field_desc},
     r#type::{fat_ptr_to, get_type},
 };
 use rustc_middle::{
@@ -54,8 +54,8 @@ pub fn address_last_dereference<'tcx>(
     let target_type = ctx.type_from_cache(target_ty);
 
     match (
-        pointer_to_is_fat(curr_points_to, ctx.tcx(), ctx.instance()),
-        pointer_to_is_fat(target_ty, ctx.tcx(), ctx.instance()),
+        ptr_is_fat(curr_points_to, ctx.tcx(), ctx.instance()),
+        ptr_is_fat(target_ty, ctx.tcx(), ctx.instance()),
     ) {
         (true, false) => {
             let data_ptr_name = ctx.alloc_string(cilly::DATA_PTR);
@@ -78,7 +78,7 @@ fn field_address<'a>(
     curr_type: super::PlaceTy<'a>,
     ctx: &mut MethodCompileCtx<'a, '_>,
     addr_calc: Interned<cilly::ir::CILNode>,
-    field_index: u32,
+    field_idx: u32,
     field_type: Ty<'a>,
 ) -> Interned<cilly::ir::CILNode> {
     match curr_type {
@@ -86,8 +86,8 @@ fn field_address<'a>(
             let curr_type = ctx.monomorphize(curr_type);
             let field_ty = ctx.monomorphize(field_type);
             match (
-                pointer_to_is_fat(curr_type, ctx.tcx(), ctx.instance()),
-                pointer_to_is_fat(field_ty, ctx.tcx(), ctx.instance()),
+                ptr_is_fat(curr_type, ctx.tcx(), ctx.instance()),
+                ptr_is_fat(field_ty, ctx.tcx(), ctx.instance()),
             ) {
                 (false, false) => {
                     // A ZST field is ELIDED from the .NET struct (type.rs skips `Void` fields — .NET
@@ -103,13 +103,13 @@ fn field_address<'a>(
                         let offset = FieldOffsetIterator::fields(
                             ctx.layout_of(curr_type).layout.0.0.clone(),
                         )
-                        .nth(field_index as usize)
+                        .nth(field_idx as usize)
                         .expect("Field index not in field offset iterator");
                         let base = ctx.cast_ptr(addr_calc, Type::Int(Int::U8));
                         let base = ctx.biop(base, Const::USize(u64::from(offset)), BinOp::Add);
                         return ctx.cast_ptr(base, Type::Void);
                     }
-                    let field_desc = field_descrptor(curr_type, field_index, ctx);
+                    let field_desc = field_descrptor(curr_type, field_idx, ctx);
                     ctx.ld_field_addr(addr_calc, field_desc)
                 }
                 (false, true) => panic!(
@@ -119,7 +119,7 @@ fn field_address<'a>(
                     let mut explicit_offset_iter =
                         FieldOffsetIterator::fields(ctx.layout_of(curr_type).layout.0.0.clone());
                     let offset = explicit_offset_iter
-                        .nth(field_index as usize)
+                        .nth(field_idx as usize)
                         .expect("Field index not in field offset iterator");
                     let curr_type_fat_ptr = ctx.type_from_cache(Ty::new_ptr(
                         ctx.tcx(),
@@ -149,7 +149,7 @@ fn field_address<'a>(
                     let mut explicit_offset_iter =
                         FieldOffsetIterator::fields(ctx.layout_of(curr_type).layout.0.0.clone());
                     let offset = explicit_offset_iter
-                        .nth(field_index as usize)
+                        .nth(field_idx as usize)
                         .expect("Field index not in field offset iterator");
                     let curr_type_fat_ptr = ctx.type_from_cache(Ty::new_ptr(
                         ctx.tcx(),
@@ -222,7 +222,7 @@ fn field_address<'a>(
         }
         super::PlaceTy::EnumVariant(enm, var_idx) => {
             let owner = ctx.monomorphize(enm);
-            let field_desc = variant_field_descriptor(owner, field_index, var_idx, ctx);
+            let field_desc = variant_field_desc(owner, field_idx, var_idx, ctx);
             ctx.ld_field_addr(addr_calc, field_desc)
         }
     }
@@ -238,8 +238,8 @@ pub fn place_elem_address<'tcx>(
 
     match place_elem {
         PlaceElem::Deref => address_last_dereference(place_ty, curr_type, ctx, addr_calc),
-        PlaceElem::Field(field_index, field_ty) => {
-            field_address(curr_type, ctx, addr_calc, field_index.as_u32(), *field_ty)
+        PlaceElem::Field(field_idx, field_ty) => {
+            field_address(curr_type, ctx, addr_calc, field_idx.as_u32(), *field_ty)
         }
         PlaceElem::Index(index) => {
             let curr_ty = curr_type

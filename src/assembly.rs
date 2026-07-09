@@ -1,7 +1,7 @@
 use crate::{
     basic_block::handler_for_block,
     codegen_error::{CodegenError, MethodCodegenError},
-    utilis::is_function_magic,
+    utilis::is_magic_fn,
     IString,
 };
 use cilly::{
@@ -15,7 +15,7 @@ use cilly::{
 
 type Root = Interned<cilly::ir::CILRoot>;
 use rustc_codegen_clr_call::CallInfo;
-use rustc_codegen_clr_ctx::function_name;
+use rustc_codegen_clr_ctx::fn_name;
 pub use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_type::{adt::field_descrptor, r#type::get_type, utilis::is_zst, GetTypeExt};
 use rustc_codgen_clr_operand::static_data::add_static;
@@ -79,6 +79,49 @@ fn locals_from_mir<'tcx>(
         }
     }
     (arg_names, local_types)
+}
+
+/// Real Rust-source parameter names for a comptime-lifted "carrier" fn's `Param` rows
+/// (docs/RUST_PARITY_ROADMAP.md Tier 0 item 4). `src/comptime.rs`'s `PendingClass::methods` /
+/// `static_methods` / `abstract_methods` / `static_abstract_methods` / `default_methods` loops each
+/// build a `MethodDef` that aliases (or, for an abstract interface member, only borrows the signature
+/// of) an ordinary, separately-typechecked Rust fn `carrier` -- but unlike `add_fn`'s normal path
+/// (`locals_from_mir` above, which threads `var_debug_info` into the `Param` names it emits), those
+/// loops never looked at `carrier`'s MIR debug info at all and passed an all-`None` name list, so the
+/// exported class member's `Param` table rows carried a signature but no name -- confirmed via
+/// reflection (`ParameterInfo.Name == ""`), which broke ASP.NET Core's `RequestDelegateFactory` (keys
+/// its parameter-binding dictionary by name; 2+ unnamed params collide) the moment a Rust-defined
+/// static method was passed directly as a route-handler delegate (`cargo_tests/cd_mvc`).
+///
+/// `count` is the number of `Param` rows the caller is about to emit (i.e. `fn_sig.inputs().len()`
+/// after any receiver-slicing/byref conversion already applied to the caller's `fn_sig`); `skip` is
+/// how many of `carrier`'s OWN leading MIR args (1-based locals) were dropped to get there (1 for an
+/// instance member's receiver, 0 for a static one) -- mirrors the skip each comptime.rs call site
+/// already applies when deriving `fn_sig` itself, so the two stay index-consistent.
+pub fn carrier_arg_names<'tcx>(
+    carrier: rustc_middle::ty::Instance<'tcx>,
+    skip: usize,
+    count: usize,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> ArgsDebugInfo {
+    use rustc_middle::mir::VarDebugInfoContents;
+    let mir = ctx.tcx().instance_mir(carrier.def);
+    let mut arg_names: Vec<Option<Interned<IString>>> = (0..count).map(|_| None).collect();
+    for var in &mir.var_debug_info {
+        let mir_local = match var.value {
+            VarDebugInfoContents::Place(place) => {
+                if !place.projection.is_empty() {
+                    continue;
+                }
+                place.local.as_usize()
+            }
+            VarDebugInfoContents::Const(_) => continue,
+        };
+        if mir_local > skip && mir_local <= skip + count {
+            arg_names[mir_local - skip - 1] = Some(var.name.to_string().into_idx(ctx));
+        }
+    }
+    arg_names
 }
 
 /// Turns a terminator into ops, if `ABORT_ON_ERROR` set to false, will handle and recover from errors.
@@ -209,7 +252,7 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
         crate::comptime::interpret(ctx, mir);
         return Ok(());
     }
-    if is_function_magic(name) {
+    if is_magic_fn(name) {
         println!(
             "fn item {instance:?} is magic and is being skiped.",
             instance = ctx.instance()
@@ -227,7 +270,7 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     // (`eliminate_dead_fns`). This is what lets a **library** crate keep its public API: a library has
     // no entrypoint to root the call graph, so without this every method would be eliminated. (For a
     // binary it is a no-op beyond keeping unused `#[no_mangle]` fns, which is the correct semantics.)
-    let access_modifier = if attrs
+    let access = if attrs
         .flags
         .contains(rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::NO_MANGLE)
     {
@@ -259,10 +302,10 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
         // Prepare for repacking the argument tuple, by allocating a local
         let repacked = u32::try_from(locals.len()).expect("More than 2^32 arguments of a function");
         let repacked_ty: rustc_middle::ty::Ty = ctx.monomorphize(mir.local_decls[spread_arg].ty);
-        let repacked_type = get_type(repacked_ty, ctx);
+        let repacked_tpe = get_type(repacked_ty, ctx);
         locals.push((
             Some("repacked_arg".into_idx(ctx)),
-            ctx.alloc_type(repacked_type),
+            ctx.alloc_type(repacked_tpe),
         ));
         let mut repack_cil: Vec<Root> = Vec::new();
         // For each element of the tuple, get the argument spread_arg + n
@@ -439,7 +482,7 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
 
     let main_module = ctx.main_module();
     let mut method = MethodDef::from_blocks(
-        access_modifier,
+        access,
         main_module,
         name,
         sig_idx,
@@ -488,14 +531,14 @@ pub fn add_item<'tcx>(
 ) -> Result<(), CodegenError> {
     match item {
         MonoItem::Fn(instance) => {
-            let symbol_name: IString = function_name(item.symbol_name(tcx)).into();
+            let symbol_name: IString = fn_name(item.symbol_name(tcx)).into();
             let mut ctx = MethodCompileCtx::new(tcx, None, instance, asm);
-            let function_compile_timer = tcx
+            let fn_timer = tcx
                 .prof
                 .generic_activity_with_arg("compile function", item.symbol_name(tcx).to_string());
             rustc_middle::ty::print::with_no_trimmed_paths! {checked_add_fn(  &mut ctx,&symbol_name,)
             .expect("Could not add function!")};
-            drop(function_compile_timer);
+            drop(fn_timer);
             Ok(())
         }
         MonoItem::GlobalAsm(asm) => {
@@ -503,7 +546,7 @@ pub fn add_item<'tcx>(
             Ok(())
         }
         MonoItem::Static(stotic) => {
-            let static_compile_timer = tcx.prof.generic_activity_with_arg(
+            let static_timer = tcx.prof.generic_activity_with_arg(
                 "compile static initializer",
                 item.symbol_name(tcx).to_string(),
             );
@@ -533,7 +576,7 @@ pub fn add_item<'tcx>(
                         let mut ctx = MethodCompileCtx::new(tcx, None, finstance, &mut ctx);
                         // If it is a function, patch its pointer up.
                         let call_info = CallInfo::sig_from_instance_(finstance, &mut ctx);
-                        let function_name = function_name(tcx.symbol_name(finstance));
+                        let function_name = fn_name(tcx.symbol_name(finstance));
                         MethodRef::new(
                             *ctx.main_module(),
                             ctx.alloc_string(function_name),
@@ -576,7 +619,7 @@ pub fn add_item<'tcx>(
 
             add_static(stotic, &mut ctx);
 
-            drop(static_compile_timer);
+            drop(static_timer);
 
             Ok(())
         }

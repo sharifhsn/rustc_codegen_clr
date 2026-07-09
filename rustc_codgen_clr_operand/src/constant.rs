@@ -22,19 +22,19 @@ use rustc_span::def_id::DefId;
 
 use crate::static_data::add_allocation;
 pub fn handle_constant<'tcx>(
-    constant_op: &ConstOperand<'tcx>,
+    const_op: &ConstOperand<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Interned<CILNode> {
-    let constant = constant_op.const_;
+    let constant = const_op.const_;
     let constant = ctx.monomorphize(constant);
-    let evaluated = constant
+    let val = constant
         .eval(
             ctx.tcx(),
             rustc_middle::ty::TypingEnv::fully_monomorphized(),
-            constant_op.span,
+            const_op.span,
         )
         .expect("Could not evaluate constant!");
-    load_const_value(evaluated, constant.ty(), ctx)
+    load_const_value(val, constant.ty(), ctx)
 }
 
 /// Returns the ops neceasry to create constant value of type `ty` with byte values matching the ones in the allocation
@@ -49,10 +49,10 @@ fn create_const_from_data<'tcx>(
     let tpe_idx = ctx.alloc_type(tpe);
     // Optimization - check if this can be replaced by a scalar.
     if let GlobalAlloc::Memory(alloc) = ctx.tcx().global_alloc(alloc_id) {
-        let const_allocation = alloc.inner();
-        let align = const_allocation.align.bytes().max(1);
-        let mut bytes: Vec<u8> = const_allocation
-            .inspect_with_uninit_and_ptr_outside_interpreter(0..const_allocation.len())
+        let const_alloc = alloc.inner();
+        let align = const_alloc.align.bytes().max(1);
+        let mut bytes: Vec<u8> = const_alloc
+            .inspect_with_uninit_and_ptr_outside_interpreter(0..const_alloc.len())
             .into();
         // Right aligment, fits, and has no pointers - can be a scalar. ONLY at offset 0: this path
         // materializes the WHOLE allocation, so a nonzero offset (a const pointing into the MIDDLE of a
@@ -62,7 +62,7 @@ fn create_const_from_data<'tcx>(
         if offset_bytes == 0
             && align <= 8
             && bytes.len() <= 16
-            && const_allocation.provenance().ptrs().is_empty()
+            && const_alloc.provenance().ptrs().is_empty()
         {
             while bytes.len() < 16 {
                 bytes.push(0);
@@ -264,7 +264,7 @@ fn load_scalar_ptr(
             // If it is a function, patch its pointer up.
             let call_info = CallInfo::sig_from_instance_(finstance, ctx);
             let function_name =
-                rustc_codegen_clr_ctx::function_name(ctx.tcx().symbol_name(finstance));
+                rustc_codegen_clr_ctx::fn_name(ctx.tcx().symbol_name(finstance));
             let mref = MethodRef::new(
                 *ctx.main_module(),
                 ctx.alloc_string(function_name),

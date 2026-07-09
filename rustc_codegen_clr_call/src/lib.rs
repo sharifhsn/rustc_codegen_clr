@@ -8,6 +8,11 @@ use rustc_abi::{CanonAbi, ExternAbi as TargetAbi};
 use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_type::r#type::get_type;
 use rustc_middle::ty::{Instance, List, PseudoCanonicalInput, TyKind};
+/// A resolved function signature plus the ABI-level call-site adjustments the caller must apply.
+/// `sig` is the plain CIL signature; `split_last_tuple` is set when the source ABI is `RustCall`
+/// (used for closures), whose last argument is a tuple that Rust's calling convention spreads
+/// across individual argument registers/slots rather than passing as one aggregate — the CIL
+/// call site must likewise unpack that tuple into separate arguments matching `sig`.
 pub struct CallInfo {
     sig: FnSig,
     split_last_tuple: bool,
@@ -119,6 +124,8 @@ impl CallInfo {
         &self.sig
     }
 
+    /// When true, the call site must split `sig`'s last (tuple) argument into its individual
+    /// fields — see the `CallInfo` doc comment for why (`RustCall`/closure ABI).
     pub fn split_last_tuple(&self) -> bool {
         self.split_last_tuple
     }

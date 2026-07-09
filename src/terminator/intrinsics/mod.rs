@@ -120,6 +120,12 @@ macro_rules! simd_passthrough {
     }};
 }
 
+/// Dispatches a `#[rustc_intrinsic]` by its bare (unmangled) symbol name — only reachable from
+/// `call_inner` when `instance.def` is `InstanceKind::Intrinsic`, never for a normal MIR call.
+/// An unmatched name falls through to `intrinsic_slow`, which demangles `fn_name` and either
+/// re-enters here with the demangled stem (handles intrinsics rustc mangles, e.g. via a real
+/// symbol path) or, if demangling was a no-op, `span_bug!`s at codegen time if the intrinsic is
+/// marked `must_be_overridden` — otherwise it is treated as a plain function call.
 pub fn handle_intrinsic<'tcx>(
     fn_name: &str,
     args: &[Spanned<Operand<'tcx>>],
@@ -218,14 +224,14 @@ pub fn handle_intrinsic<'tcx>(
         | "atomic_load_unordered"
         | "volatile_load" => vec![volitale_load(args, destination, ctx)],
         "volatile_store" => {
-            let pointed_type = ctx.monomorphize(
+            let pointed_tpe = ctx.monomorphize(
                 call_instance.args[0]
                     .as_type()
                     .expect("needs_drop works only on types!"),
             );
             let addr_calc = handle_operand(&args[0].node, ctx);
             let value_calc = handle_operand(&args[1].node, ctx);
-            let st = ptr_set_op(pointed_type.into(), ctx, addr_calc, value_calc);
+            let st = ptr_set_op(pointed_tpe.into(), ctx, addr_calc, value_calc);
             vec![ctx.make_store_volatile(st)]
         }
         "atomic_store" => {
@@ -875,8 +881,8 @@ pub fn handle_intrinsic<'tcx>(
             let name = ctx.alloc_string("simd_get_most_significant_bits");
             let main_module = ctx.main_module();
             let main_module = ctx[*main_module].clone();
-            let most_significant_bits = main_module.static_mref(&[vec], Type::Int(int), name, ctx);
-            let value = ctx.call(most_significant_bits, &[lhs], IsPure::NOT);
+            let msb_mref = main_module.static_mref(&[vec], Type::Int(int), name, ctx);
+            let value = ctx.call(msb_mref, &[lhs], IsPure::NOT);
             vec![place_set(destination, value, ctx)]
         }
         // Unary `(vec) -> vec` ops, each served by a per-lane builtin of the same name. `simd_neg`

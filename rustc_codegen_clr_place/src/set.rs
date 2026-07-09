@@ -1,9 +1,9 @@
 use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_type::{
     GetTypeExt,
-    adt::{field_descrptor, variant_field_descriptor},
+    adt::{field_descrptor, variant_field_desc},
     r#type::fat_ptr_to,
-    utilis::pointer_to_is_fat,
+    utilis::ptr_is_fat,
 };
 
 use crate::{PlaceTy, pointed_type};
@@ -64,7 +64,7 @@ pub fn place_elem_set<'a>(
                 // offset, and store through that address. (The fat-tail field — `(true, true)` — is
                 // itself unsized and cannot be assigned through a place-set, so only the sized-field
                 // `(true, false)` case is handled here.)
-                if pointer_to_is_fat(curr_type, ctx.tcx(), ctx.instance()) {
+                if ptr_is_fat(curr_type, ctx.tcx(), ctx.instance()) {
                     let field_type = ctx.monomorphize(*field_type);
                     let offset = rustc_codegen_clr_type::adt::FieldOffsetIterator::fields(
                         ctx.layout_of(curr_type).layout.0.0.clone(),
@@ -97,7 +97,7 @@ pub fn place_elem_set<'a>(
             }
             super::PlaceTy::EnumVariant(enm, var_idx) => {
                 let enm = ctx.monomorphize(enm);
-                let field_desc = variant_field_descriptor(enm, field_index.as_u32(), var_idx, ctx);
+                let field_desc = variant_field_desc(enm, field_index.as_u32(), var_idx, ctx);
 
                 ctx.set_field(field_desc, addr_calc, value_calc)
             }
@@ -300,7 +300,7 @@ pub fn ptr_set_op<'tcx>(
                 ctx.st_ind(addr_calc, value_calc, pointed_type, false)
             }
             TyKind::Ref(_, inner, _) => {
-                if pointer_to_is_fat(*inner, ctx.tcx(), ctx.instance()) {
+                if ptr_is_fat(*inner, ctx.tcx(), ctx.instance()) {
                     let tpe = ctx.type_from_cache(pointed_type);
                     ctx.st_ind(addr_calc, value_calc, tpe, false)
                 } else {
@@ -310,7 +310,7 @@ pub fn ptr_set_op<'tcx>(
                 }
             }
             TyKind::RawPtr(ty, _) => {
-                if pointer_to_is_fat(*ty, ctx.tcx(), ctx.instance()) {
+                if ptr_is_fat(*ty, ctx.tcx(), ctx.instance()) {
                     let tpe = ctx.type_from_cache(pointed_type);
                     ctx.st_ind(addr_calc, value_calc, tpe, false)
                 } else {

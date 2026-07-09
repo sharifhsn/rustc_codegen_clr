@@ -17,7 +17,7 @@ use cilly::{
 use cilly::tpe::GenericKind;
 use cilly::{MethodRef, Type};
 use rustc_codegen_clr_call::CallInfo;
-use rustc_codegen_clr_ctx::function_name;
+use rustc_codegen_clr_ctx::fn_name;
 use rustc_codegen_clr_place::place_set;
 use rustc_codegen_clr_type::{
     utilis::{garg_to_usize, garg_to_string},
@@ -79,10 +79,10 @@ fn call_managed<'tcx>(
     fn_instance: Instance<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Root {
-    let argument_count = argc_from_fn_name(function_name, MANAGED_CALL_FN_NAME);
+    let argc = argc_from_fn_name(function_name, MANAGED_CALL_FN_NAME);
     //FIXME: figure out the proper argc.
     //assert!(subst_ref.len() as u32 == argc + 3 || subst_ref.len() as u32 == argc + 4);
-    assert!(args.len() == argument_count as usize);
+    assert!(args.len() == argc as usize);
     let InteropHeader {
         asm,
         class_name,
@@ -95,7 +95,7 @@ fn call_managed<'tcx>(
     let signature = crate::function_sig::sig_from_instance_(fn_instance, ctx)
         .expect("Can't get the function signature");
 
-    if argument_count == 0 {
+    if argc == 0 {
         // Use the REAL return type, not Void. A zero-arg managed getter (e.g. a static `get_Default`
         // returning a managed reference) must produce a value of its declared type; hardcoding Void
         // here made the call node Void, so storing it into the (correctly-typed) destination failed
@@ -164,11 +164,9 @@ fn callvirt_managed<'tcx>(
     fn_instance: Instance<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Root {
-    let argument_count = argc_from_fn_name(function_name, MANAGED_CALL_VIRT_FN_NAME);
+    let argc = argc_from_fn_name(function_name, MANAGED_CALL_VIRT_FN_NAME);
     //assert!(subst_ref.len() as u32 == argc + 3 || subst_ref.len() as u32 == argc + 4);
-    assert!(
-        u32::try_from(args.len()).expect("More than 2^32 function arguments.") == argument_count
-    );
+    assert!(u32::try_from(args.len()).expect("More than 2^32 function arguments.") == argc);
     let InteropHeader {
         asm,
         class_name,
@@ -182,7 +180,7 @@ fn callvirt_managed<'tcx>(
     let tpe = ClassRef::new(class_name, asm, is_valuetype, [].into());
     let signature = crate::function_sig::sig_from_instance_(fn_instance, ctx)
         .expect("Can't get the function signature");
-    if argument_count == 0 {
+    if argc == 0 {
         // Use the REAL return type, not Void (see `call_managed`'s 0-arg branch) — a zero-arg managed
         // getter returning a managed reference was being typed Void, failing the destination store.
         let ret = *signature.output();
@@ -1021,11 +1019,11 @@ fn call_ctor<'tcx>(
     destination: &Place<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Root {
-    let argument_count = argc_from_fn_name(function_name, CTOR_FN_NAME);
+    let argc = argc_from_fn_name(function_name, CTOR_FN_NAME);
     // Check that there are enough function path and argument specifers
-    assert!(subst_ref.len() == argument_count as usize + 3);
+    assert!(subst_ref.len() == argc as usize + 3);
     // Check that a proper number of arguments is used
-    assert!(args.len() == argument_count as usize);
+    assert!(args.len() == argc as usize);
     // Decode the `<assembly, class path, is-valuetype>` header (subst[0..3]):
     // - the assembly the constructed object resides in,
     // - the name of the constructed object,
@@ -1038,7 +1036,7 @@ fn call_ctor<'tcx>(
     let tpe = ClassRef::new(class_name, asm, is_valuetype, [].into());
     let tpe = ctx.alloc_class_ref(tpe);
     // If no arguments, inputs don't have to be handled, so a simpler call handling is used.
-    if argument_count == 0 {
+    if argc == 0 {
         let mref = MethodRef::new(
             tpe,
             ctx.alloc_string(".ctor"),
@@ -1147,6 +1145,13 @@ pub fn call_closure<'tcx>(
         place_set(destination, node, ctx)
     }
 }
+/// Dispatches a resolved MIR call: vtable calls for `InstanceKind::Virtual`, no-ops for drop
+/// glue on types with nothing to drop, then plain function calls — except when `function_name`
+/// contains one of the magic markers imported from `utilis` (`MANAGED_CALL_FN_NAME`,
+/// `GENERIC_CALL_FN_NAME`, `DELEGATE_FN_NAME`, `GENERIC_CTOR_FN_NAME`, ...), each of which is a
+/// distinct hand-written call shape for a mycorrhiza/interop intrinsic rather than a real MIR
+/// function; those are matched by substring on the mangled name, so branch order here matters
+/// where one marker is a substring of another (see the ordering comments at each `contains` check).
 pub fn call_inner<'tcx>(
     fn_type: Ty<'tcx>,
     instance: Instance<'tcx>,
@@ -1270,7 +1275,7 @@ pub fn call_inner<'tcx>(
     }
     let call_info = CallInfo::sig_from_instance_(instance, ctx);
 
-    let function_name = function_name(ctx.tcx().symbol_name(instance));
+    let function_name = fn_name(ctx.tcx().symbol_name(instance));
     if matches!(instance.def, InstanceKind::Intrinsic(_)) {
         return super::intrinsics::handle_intrinsic(
             &function_name,
@@ -1539,7 +1544,9 @@ pub fn call_inner<'tcx>(
         vec![place_set(destination, res_calc, ctx)]
     }
 }
-/// Calls `fn_type` with `args`, placing the return value in destination.
+/// Resolves `fn_type` to an `Instance` and hands off to `call_inner` for the actual dispatch
+/// (virtual/interop/plain-call branching). Entry point for MIR `Call` terminators; intrinsics
+/// are routed separately, before reaching here, via `handle_intrinsic`.
 pub fn call<'tcx>(
     fn_type: Ty<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,

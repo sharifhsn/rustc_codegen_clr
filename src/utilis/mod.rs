@@ -45,7 +45,7 @@ pub const DELEGATE_FN_NAME: &str = "rustc_clr_interop_delegate";
 /// pointer AND a trampoline fn pointer, and `Invoke` prepends the env before the `calli`. NOTE: the
 /// name CONTAINS `rustc_clr_interop_delegate`, so the dispatch must check this substring FIRST.
 pub const DELEGATE_CLOSURE_FN_NAME: &str = "rustc_clr_interop_delegate_closure";
-pub fn is_function_magic(name: &str) -> bool {
+pub fn is_magic_fn(name: &str) -> bool {
     name.contains(CTOR_FN_NAME)
         || name.contains(MANAGED_CALL_FN_NAME)
         || name.contains(MANAGED_THROW)
@@ -117,7 +117,7 @@ pub fn garg_to_bool<'tcx>(garg: GenericArg<'tcx>, _ctx: TyCtxt<'tcx>) -> bool {
     }
 }
 /// This function returns the size of a type at the compile time. This should be used ONLY for handling constants. It currently assumes a 64 bit env
-pub fn compiletime_sizeof<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> u64 {
+pub fn const_sizeof<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> u64 {
     let layout = tcx
         .layout_of(PseudoCanonicalInput {
             typing_env: rustc_middle::ty::TypingEnv::fully_monomorphized(),

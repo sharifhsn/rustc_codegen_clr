@@ -4,9 +4,9 @@ use cilly::{BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, Type};
 use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_type::{
     GetTypeExt,
-    adt::{FieldOffsetIterator, field_descrptor, variant_field_descriptor},
+    adt::{FieldOffsetIterator, field_descrptor, variant_field_desc},
     r#type::fat_ptr_to,
-    utilis::pointer_to_is_fat,
+    utilis::ptr_is_fat,
 };
 use rustc_middle::mir::{Local, PlaceElem};
 use rustc_middle::ty::{Ty, TyKind};
@@ -25,27 +25,27 @@ pub fn local_body<'tcx>(
 fn body_field<'a>(
     curr_type: super::PlaceTy<'a>,
     ctx: &mut MethodCompileCtx<'a, '_>,
-    field_index: u32,
+    field_idx: u32,
     field_ty: Ty<'a>,
-    parrent_node: Interned<cilly::ir::CILNode>,
+    node: Interned<cilly::ir::CILNode>,
 ) -> (PlaceTy<'a>, Interned<cilly::ir::CILNode>) {
     match curr_type {
         super::PlaceTy::Ty(curr_type) => {
             let curr_type = ctx.monomorphize(curr_type);
             let field_type = ctx.monomorphize(field_ty);
             match (
-                pointer_to_is_fat(curr_type, ctx.tcx(), ctx.instance()),
-                pointer_to_is_fat(field_type, ctx.tcx(), ctx.instance()),
+                ptr_is_fat(curr_type, ctx.tcx(), ctx.instance()),
+                ptr_is_fat(field_type, ctx.tcx(), ctx.instance()),
             ) {
                 (false, false) => {
-                    let field_desc = field_descrptor(curr_type, field_index, ctx);
+                    let field_desc = field_descrptor(curr_type, field_idx, ctx);
                     if body_ty_is_by_address(field_type, ctx) {
                         (
                             (field_type).into(),
-                            ctx.ld_field_addr(parrent_node, field_desc),
+                            ctx.ld_field_addr(node, field_desc),
                         )
                     } else {
-                        ((field_type).into(), ctx.ld_field(parrent_node, field_desc))
+                        ((field_type).into(), ctx.ld_field(node, field_desc))
                     }
                 }
                 (false, true) => panic!(
@@ -55,7 +55,7 @@ fn body_field<'a>(
                     let mut explicit_offset_iter =
                         FieldOffsetIterator::fields(ctx.layout_of(curr_type).layout.0.0.clone());
                     let offset = explicit_offset_iter
-                        .nth(field_index as usize)
+                        .nth(field_idx as usize)
                         .expect("Field index not in field offset iterator");
                     let curr_type_fat_ptr = ctx.type_from_cache(Ty::new_ptr(
                         ctx.tcx(),
@@ -68,7 +68,7 @@ fn body_field<'a>(
                         ctx.nptr(Type::Void),
                     );
                     // Get the address of the unsized object.
-                    let obj_addr = ctx.ld_field(parrent_node, addr_descr);
+                    let obj_addr = ctx.ld_field(node, addr_descr);
                     let obj = ctx.type_from_cache(field_type);
                     // Add the offset to the object.
                     let field_addr =
@@ -87,12 +87,12 @@ fn body_field<'a>(
                     //   data     = parent.DATA_PTR + offset_of(field)
                     //   metadata = parent.METADATA   (the tail shares the enclosing DST's metadata)
                     // The previous code only handled an unsized field at field index 0 (offset 0)
-                    // via `assert_eq!(field_index, 0)`, which rejected every DST with a sized
+                    // via `assert_eq!(field_idx, 0)`, which rejected every DST with a sized
                     // prefix before the tail.
                     let offset = FieldOffsetIterator::fields(
                         ctx.layout_of(curr_type).layout.0.0.clone(),
                     )
-                    .nth(field_index as usize)
+                    .nth(field_idx as usize)
                     .expect("Field index not in field offset iterator");
                     let curr_type_fat_ptr = ctx
                         .type_from_cache(Ty::new_ptr(
@@ -113,8 +113,8 @@ fn body_field<'a>(
                         ctx.alloc_string(cilly::METADATA),
                         Type::Int(Int::USize),
                     );
-                    let metadata = ctx.ld_field(parrent_node, metadata_descr);
-                    let data = ctx.ld_field(parrent_node, data_descr);
+                    let metadata = ctx.ld_field(node, metadata_descr);
+                    let data = ctx.ld_field(node, data_descr);
                     let data = if offset == 0 {
                         data
                     } else {
@@ -130,15 +130,15 @@ fn body_field<'a>(
         }
         super::PlaceTy::EnumVariant(enm, var_idx) => {
             let owner = ctx.monomorphize(enm);
-            let field_desc = variant_field_descriptor(owner, field_index, var_idx, ctx);
-            (field_ty.into(), ctx.ld_field_addr(parrent_node, field_desc))
+            let field_desc = variant_field_desc(owner, field_idx, var_idx, ctx);
+            (field_ty.into(), ctx.ld_field_addr(node, field_desc))
         }
     }
 }
 pub fn place_elem_body_index<'tcx>(
     curr_ty: Ty<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    parrent_node: Interned<cilly::ir::CILNode>,
+    node: Interned<cilly::ir::CILNode>,
     index: rustc_middle::mir::Local,
 ) -> (PlaceTy<'tcx>, Interned<cilly::ir::CILNode>) {
     let index = crate::local_get(index.as_usize(), ctx.body(), ctx);
@@ -160,7 +160,7 @@ pub fn place_elem_body_index<'tcx>(
                 extend: cilly::cilnode::ExtendKind::ZeroExtend,
             });
             let offset = ctx.biop(index, size, cilly::BinOp::Mul);
-            let addr = ctx.ld_field(parrent_node, desc);
+            let addr = ctx.ld_field(node, desc);
             let addr = ctx.cast_ptr(addr, inner_type);
             let addr = ctx.biop(addr, offset, BinOp::Add);
 
@@ -180,8 +180,8 @@ pub fn place_elem_body_index<'tcx>(
                 extend: cilly::cilnode::ExtendKind::ZeroExtend,
             });
             let element_tpe = ctx.type_from_cache(*element);
-            let parrent_node = ctx.cast_ptr(parrent_node, element_tpe);
-            let addr = ctx.offset(parrent_node, index, element_tpe);
+            let node = ctx.cast_ptr(node, element_tpe);
+            let addr = ctx.offset(node, index, element_tpe);
             if body_ty_is_by_address(*element, ctx) {
                 ((*element).into(), addr)
             } else {
@@ -197,7 +197,7 @@ pub fn place_elem_body<'tcx>(
     place_elem: &PlaceElem<'tcx>,
     curr_type: PlaceTy<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    parrent_node: Interned<cilly::ir::CILNode>,
+    node: Interned<cilly::ir::CILNode>,
 ) -> (PlaceTy<'tcx>, Interned<cilly::ir::CILNode>) {
     let curr_ty = match curr_type {
         PlaceTy::Ty(ty) => PlaceTy::Ty(ctx.monomorphize(ty)),
@@ -207,17 +207,17 @@ pub fn place_elem_body<'tcx>(
         PlaceElem::Deref => {
             let pointed = pointed_type(curr_ty);
             if body_ty_is_by_address(pointed, ctx) {
-                (pointed.into(), parrent_node)
+                (pointed.into(), node)
             } else {
-                (pointed.into(), deref_op(pointed.into(), ctx, parrent_node))
+                (pointed.into(), deref_op(pointed.into(), ctx, node))
             }
         }
-        PlaceElem::Field(field_index, field_ty) => body_field(
+        PlaceElem::Field(field_idx, field_ty) => body_field(
             curr_type,
             ctx,
-            field_index.as_u32(),
+            field_idx.as_u32(),
             *field_ty,
-            parrent_node,
+            node,
         ),
         PlaceElem::Downcast(_, variant) => {
             let curr_type = curr_ty
@@ -228,17 +228,17 @@ pub fn place_elem_body<'tcx>(
             // (a suspend point or one of the reserved Unresumed/Returned/Panicked variants),
             // exactly like an enum Downcast. Re-tag the place as an `EnumVariant` so the
             // following `Field` projection resolves through the variant-field path. This is a
-            // pure type-level re-tag — no CIL is emitted, `parrent_node` passes through.
+            // pure type-level re-tag — no CIL is emitted, `node` passes through.
             let variant_type = PlaceTy::EnumVariant(curr_type, variant.as_u32());
 
-            (variant_type, parrent_node)
+            (variant_type, node)
         }
         PlaceElem::Index(index) => place_elem_body_index(
             curr_type
                 .as_ty()
                 .expect("INVALID PLACE: Indexing into enum variant???"),
             ctx,
-            parrent_node,
+            node,
             *index,
         ),
       
@@ -268,13 +268,13 @@ pub fn place_elem_body<'tcx>(
                     // `from_end` slice tail-patterns (e.g. `let [.., x] = ..`) index
                     // relative to the slice length: index = len - offset.
                     let index = if *from_end {
-                        let len_fld = ctx.ld_field(parrent_node, metadata);
+                        let len_fld = ctx.ld_field(node, metadata);
                         ctx.biop(len_fld, Const::USize(*offset), BinOp::Sub)
                     } else {
                         ctx.alloc_node(Const::USize(*offset))
                     };
 
-                    let addr = ctx.ld_field(parrent_node, desc);
+                    let addr = ctx.ld_field(node, desc);
                     let addr = ctx.cast_ptr(addr, inner_type);
                     let addr = ctx.offset(addr, index, inner_type);
 
@@ -294,16 +294,16 @@ pub fn place_elem_body<'tcx>(
                     let index = ctx.alloc_node(Const::USize(*offset));
                     let element_tpe = ctx.type_from_cache(*element);
                     if body_ty_is_by_address(*element, ctx) {
-                        let parrent_node = ctx.cast_ptr(parrent_node, element_tpe);
-                        let addr = ctx.offset(parrent_node, index, element_tpe);
+                        let node = ctx.cast_ptr(node, element_tpe);
+                        let addr = ctx.offset(node, index, element_tpe);
                         if body_ty_is_by_address(*element, ctx) {
                             ((*element).into(), addr)
                         } else {
                             ((*element).into(), ctx.load(addr, element_tpe))
                         }
                     } else {
-                        let parrent_node = ctx.cast_ptr(parrent_node, element_tpe);
-                        let addr = ctx.offset(parrent_node, index, element_tpe);
+                        let node = ctx.cast_ptr(node, element_tpe);
+                        let addr = ctx.offset(node, index, element_tpe);
                         if body_ty_is_by_address(*element, ctx) {
                             ((*element).into(), addr)
                         } else {

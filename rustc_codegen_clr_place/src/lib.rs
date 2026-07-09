@@ -7,7 +7,7 @@ use cilly::Interned;
 use cilly::Const;
 use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_type::GetTypeExt;
-use rustc_codegen_clr_type::utilis::pointer_to_is_fat;
+use rustc_codegen_clr_type::utilis::ptr_is_fat;
 
 use rustc_middle::mir::Place;
 
@@ -62,7 +62,7 @@ fn body_ty_is_by_address<'tcx>(last_ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tc
         | TyKind::Char
         | TyKind::FnPtr(..) => false,
         TyKind::Ref(_, ty, _) | TyKind::RawPtr(ty, _) => {
-            pointer_to_is_fat(ty, ctx.tcx(), ctx.instance())
+            ptr_is_fat(ty, ctx.tcx(), ctx.instance())
         }
         _ => todo!(
             "TODO: body_ty_is_by_address does not support type {last_ty:?} kind:{kind:?}",
@@ -71,16 +71,16 @@ fn body_ty_is_by_address<'tcx>(last_ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tc
     }
 }
 
-/// Given a type `derefed_type`, it retuns a set of instructions to get a value behind a pointer to `derefed_type`.
+/// Given a type `deref_ty`, it retuns a set of instructions to get a value behind a pointer to `deref_ty`.
 pub fn deref_op<'tcx>(
-    derefed_type: PlaceTy<'tcx>,
+    deref_ty: PlaceTy<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     ptr: Interned<cilly::ir::CILNode>,
 ) -> Interned<cilly::ir::CILNode> {
     let ptr = Box::new(ptr);
-    let res = if let PlaceTy::Ty(derefed_type) = derefed_type {
-        let derefed_type = ctx.type_from_cache(derefed_type);
-        ctx.load(*ptr, derefed_type)
+    let res = if let PlaceTy::Ty(deref_ty) = deref_ty {
+        let deref_ty = ctx.type_from_cache(deref_ty);
+        ctx.load(*ptr, deref_ty)
     } else {
         todo!("Can't dereference enum variants!")
     };
@@ -112,7 +112,7 @@ pub fn place_address<'a>(
             return ctx.cast_ptr(node, place_type);
         }
         let loc_ty = ctx.monomorphize(ctx.body().local_decls[place.local].ty);
-        if pointer_to_is_fat(loc_ty, ctx.tcx(), ctx.instance()) {
+        if ptr_is_fat(loc_ty, ctx.tcx(), ctx.instance()) {
             local_get(place.local.as_usize(), ctx.body(), ctx)
         } else {
             local_address(place.local.as_usize(), ctx.body(), ctx)
@@ -174,7 +174,7 @@ pub fn place_address_raw<'a>(
             slice_head(place.projection).0,
             rustc_middle::mir::PlaceElem::Deref
         )
-        && pointer_to_is_fat(place_ty, ctx.tcx(), ctx.instance())
+        && ptr_is_fat(place_ty, ctx.tcx(), ctx.instance())
     {
         // The deref'd place is *itself* unsized (a DST), so a pointer to it is fat.
         // `place_address_raw`'s contract is to hand back the address of the fat-pointer
@@ -219,6 +219,11 @@ pub fn place_set<'tcx>(
         place_elem_set(head, ty, ctx, addr_calc, value_calc)
     }
 }
+/// The type of a place mid-projection-chain-walk. `EnumVariant` is not a general "this place
+/// holds an enum" marker — it is a transient re-tag produced only by a `PlaceElem::Downcast`
+/// projection (see `body.rs`) and meant to be consumed only by the `Field` projection that
+/// immediately follows it, narrowing field lookup to that variant's layout. Elsewhere it is
+/// opaque and unprojectable: `as_ty` returns `None` rather than a usable type for it.
 #[derive(Debug, Clone, Copy)]
 pub enum PlaceTy<'tcx> {
     Ty(Ty<'tcx>),

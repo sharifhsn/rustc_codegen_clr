@@ -5,7 +5,7 @@ use cilly::{
 };
 
 type Root = Interned<cilly::ir::CILRoot>;
-use rustc_codegen_clr_ctx::function_name;
+use rustc_codegen_clr_ctx::fn_name;
 use rustc_codegen_clr_place::{place_address, place_set};
 use rustc_codegen_clr_type::GetTypeExt;
 use rustc_middle::mir::AssertKind;
@@ -132,7 +132,7 @@ fn call_panic_lang_item<'tcx>(
     );
     let call_info = rustc_codegen_clr_call::CallInfo::sig_from_instance_(instance, ctx);
     let signature = call_info.sig().clone();
-    let name = function_name(ctx.tcx().symbol_name(instance));
+    let name = fn_name(ctx.tcx().symbol_name(instance));
     let mut call_args: Vec<Interned<CILNode>> = args.to_vec();
     // The lang item is `#[track_caller]`: rustc appends an implicit `&core::panic::Location` param
     // that the call site must supply (FnSig ≠ FnAbi). Supply the correct caller location — forwarded
@@ -454,13 +454,13 @@ fn emit_call_into<'tycxt>(
             for arg in args {
                 arg_operands.push(handle_operand(&arg.node, ctx));
             }
-            let called_operand = handle_operand(func, ctx);
+            let callee = handle_operand(func, ctx);
             let sig_idx = ctx.alloc_sig(sig.clone());
             if *sig.output() == cilly::Type::Void {
-                let root = ctx.call_indirect_root(sig_idx, called_operand, arg_operands);
+                let root = ctx.call_indirect_root(sig_idx, callee, arg_operands);
                 trees.push(root);
             } else {
-                let call = ctx.call_indirect(sig_idx, called_operand, arg_operands);
+                let call = ctx.call_indirect(sig_idx, callee, arg_operands);
                 let root = place_set(destination, call, ctx);
                 trees.push(root);
             }
@@ -469,7 +469,7 @@ fn emit_call_into<'tycxt>(
     }
     trees
 }
-pub fn handle_call_terminator<'tycxt>(
+pub fn handle_call<'tycxt>(
     terminator: &Terminator<'tycxt>,
     ctx: &mut MethodCompileCtx<'tycxt, '_>,
     args: &[Spanned<Operand<'tycxt>>],
@@ -507,7 +507,7 @@ pub fn handle_terminator<'tcx>(
             unwind: _,
             call_source: _,
             fn_span: _,
-        } => handle_call_terminator(terminator, ctx, args, destination, func, *target),
+        } => handle_call(terminator, ctx, args, destination, func, *target),
         // `become f(args)` (the unstable `explicit_tail_calls` feature) is semantically
         // `return f(args)`: rustc guarantees the callee's return type matches the current
         // function's. We lower it as a normal `call` into the return place `_0` followed by a
@@ -722,7 +722,7 @@ pub fn handle_terminator<'tcx>(
                     _ => {
                         let sig =
                             crate::function_sig::sig_from_instance_(drop_instance, ctx).unwrap();
-                        let function_name = function_name(ctx.tcx().symbol_name(drop_instance));
+                        let function_name = fn_name(ctx.tcx().symbol_name(drop_instance));
                         let mref = MethodRef::new(
                             *ctx.main_module(),
                             ctx.alloc_string(function_name),

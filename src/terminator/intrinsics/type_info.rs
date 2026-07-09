@@ -4,7 +4,7 @@ use cilly::{
 };
 use rustc_codegen_clr_place::place_set;
 use rustc_codegen_clr_type::{
-    utilis::{is_zst, pointer_to_is_fat},
+    utilis::{is_zst, ptr_is_fat},
     GetTypeExt,
 };
 use rustc_codgen_clr_operand::operand_address;
@@ -52,7 +52,7 @@ pub fn size_of_val<'tcx>(
         let value_calc: Node = ctx.alloc_node(Const::USize(0));
         return place_set(destination, value_calc, ctx);
     }
-    if pointer_to_is_fat(pointed_ty, ctx.tcx(), ctx.instance()) {
+    if ptr_is_fat(pointed_ty, ctx.tcx(), ctx.instance()) {
         let ptr_ty = ctx.monomorphize(args[0].node.ty(ctx.body(), ctx.tcx()));
         // Discriminate dyn-vs-slice/str on the *struct tail* of the fat pointee, not on the
         // pointee's own `TyKind`. A DST-tailed struct (e.g. `ArcInner<[u8]>`) has `kind() == Adt`
@@ -165,7 +165,7 @@ pub fn align_of_val<'tcx>(
     // *struct tail* (not the pointee's own `TyKind`): a slice/str-tailed struct like `ArcInner<[u8]>`
     // has `kind() == Adt` but a statically-known alignment, and must NOT be routed to the vtable path
     // (which would deref the slice length as a vtable pointer -> NullReferenceException).
-    let tail_is_dyn = pointer_to_is_fat(pointed_ty, ctx.tcx(), ctx.instance())
+    let tail_is_dyn = ptr_is_fat(pointed_ty, ctx.tcx(), ctx.instance())
         && matches!(
             ctx.tcx()
                 .struct_tail_for_codegen(

@@ -38,14 +38,14 @@ config_flag! {NO_UNWIND,false,"Tells the codegen to never emmit try/catch statem
 
 config_flag! {INLINE_SIMPLE_FUNCTIONS,false,"Allows the optimizer to inline very simple functions. It is buggy."}
 config_flag! {REMOVE_UNSUED_LOCALS,false,"Turns on the local removal optimization."}
-config_flag! {CHECK_ALLOCATIONS,false,"Turns on allocation checks/debug info."}
+config_flag! {CHECK_ALLOCATIONS,false,"Turns on allocation checks/debug info. Currently unread outside this definition — a no-op."}
 config_flag! {VERIFY_METHODS,false,"Typechecks all methods"}
 
-config_flag! {SPLIT_LOCAL_STRUCTS,false,"Turns on the struct spliting optimzation."}
+config_flag! {SPLIT_LOCAL_STRUCTS,false,"Turns on the struct spliting optimzation. Currently unread outside this definition — a no-op."}
 config_flag! {ALLOW_MISCOMPILATIONS,false,"If true, codegen continues after a type-verifier violation (historical advisory behaviour). If false (default — Phase P1 / invariant I1 of docs/ABSOLUTE_CORRECTNESS_PLAN.md), a violation ABORTS the build so an ill-typed method is never emitted. Mirrors cilly's flag of the same name (the linker reads cilly's). Set =1 to opt back into advisory mode."}
 config_flag! {INSERT_MIR_DEBUG_COMMENTS,false,"Tells the codegen to insert comments containing the MIR statemtens after each one of them."}
 config_flag! {PRINT_LOCAL_TYPES,false,"Prints local types of all compiled MIR functions."}
-config_flag! {VALIDTE_VALUES,false,"Tells the codegen to insert additional checks on each variable asigement."}
+config_flag! {VALIDTE_VALUES,false,"Tells the codegen to insert additional checks on each variable asigement. Currently unread outside this definition — a no-op."}
 config_flag! {OPTIMIZE_CIL,true,"Tells the codegen to optmize the emiited CIL."}
 
 config_flag! {NEW_UNSIZE,false,"Turns out the new unsizing code"}
@@ -61,9 +61,9 @@ config_flag! {C_SANITIZE,false,"Tells the codegen sanitize C."}
 config_flag! {RANDOMIZE_LAYOUT,false,"Tells the codegen to randomize TEST type layout."}
 config_flag! {NATIVE_PASSTROUGH,false,"Tells the codegen compile linked static libraries into a shared library, which will be bundled with the .NET executable."}
 
-config_flag! {ENFORCE_CIL_VALID,false,"Tells the codegen to preform additonal checks before saving the ."}
+config_flag! {ENFORCE_CIL_VALID,false,"Tells the codegen to preform additonal checks before saving the assembly. Currently unread outside this definition — a no-op."}
 
-config_flag! {CHECK_REFS,false,"Tells codegen to check if references it assigns are valid."}
+config_flag! {CHECK_REFS,false,"Tells codegen to check if references it assigns are valid. Currently unread outside this definition — a no-op."}
 
 config_flag! {TYPECHECK_CIL,false,"Checks the geneareted CIL for type safety."}
 

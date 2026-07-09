@@ -5,9 +5,9 @@ use cilly::{
 use rustc_codegen_clr_ctx::MethodCompileCtx;
 use rustc_codegen_clr_type::{
     GetTypeExt,
-    adt::{FieldOffsetIterator, field_descrptor, variant_field_descriptor},
+    adt::{FieldOffsetIterator, field_descrptor, variant_field_desc},
     r#type::fat_ptr_to,
-    utilis::pointer_to_is_fat,
+    utilis::ptr_is_fat,
 };
 use rustc_middle::{
     mir::{Place, PlaceElem},
@@ -69,7 +69,7 @@ fn get_field<'a>(
     curr_type: super::PlaceTy<'a>,
     ctx: &mut MethodCompileCtx<'a, '_>,
     addr_calc: Interned<cilly::ir::CILNode>,
-    field_index: u32,
+    field_idx: u32,
     field_type: Ty<'a>,
 ) -> Interned<cilly::ir::CILNode> {
     match curr_type {
@@ -77,11 +77,11 @@ fn get_field<'a>(
             let curr_type = ctx.monomorphize(curr_type);
             let field_type = ctx.monomorphize(field_type);
             match (
-                pointer_to_is_fat(curr_type, ctx.tcx(), ctx.instance()),
-                pointer_to_is_fat(field_type, ctx.tcx(), ctx.instance()),
+                ptr_is_fat(curr_type, ctx.tcx(), ctx.instance()),
+                ptr_is_fat(field_type, ctx.tcx(), ctx.instance()),
             ) {
                 (false, false) => {
-                    let field_desc = field_descrptor(curr_type, field_index, ctx);
+                    let field_desc = field_descrptor(curr_type, field_idx, ctx);
                     ctx.ld_field(addr_calc, field_desc)
                 }
                 (false, true) => panic!(
@@ -91,7 +91,7 @@ fn get_field<'a>(
                     let mut explicit_offset_iter =
                         FieldOffsetIterator::fields(ctx.layout_of(curr_type).layout.0.0.clone());
                     let offset = explicit_offset_iter
-                        .nth(field_index as usize)
+                        .nth(field_idx as usize)
                         .expect("Field index not in field offset iterator");
                     let curr_type_fat_ptr = ctx.type_from_cache(Ty::new_ptr(
                         ctx.tcx(),
@@ -118,7 +118,7 @@ fn get_field<'a>(
         }
         super::PlaceTy::EnumVariant(enm, var_idx) => {
             let owner = ctx.monomorphize(enm);
-            let field_desc = variant_field_descriptor(owner, field_index, var_idx, ctx);
+            let field_desc = variant_field_desc(owner, field_idx, var_idx, ctx);
             ctx.ld_field(addr_calc, field_desc)
         }
     }
@@ -131,8 +131,8 @@ fn place_elem_get<'a>(
 ) -> Interned<cilly::ir::CILNode> {
     match place_elem {
         PlaceElem::Deref => super::deref_op(super::pointed_type(curr_type).into(), ctx, addr_calc),
-        PlaceElem::Field(field_index, field_type) => {
-            get_field(curr_type, ctx, addr_calc, field_index.as_u32(), *field_type)
+        PlaceElem::Field(field_idx, field_type) => {
+            get_field(curr_type, ctx, addr_calc, field_idx.as_u32(), *field_type)
         }
         PlaceElem::Index(index) => {
             let curr_ty = curr_type

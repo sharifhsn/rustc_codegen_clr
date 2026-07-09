@@ -141,7 +141,7 @@ pub fn garg_to_string<'tcx>(garg: GenericArg<'tcx>, ctx: TyCtxt<'tcx>) -> String
     }
 }
 #[must_use]
-pub fn pointer_to_is_fat<'tcx>(
+pub fn ptr_is_fat<'tcx>(
     pointed_type: Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
     method: rustc_middle::ty::Instance<'tcx>,
@@ -243,6 +243,12 @@ pub fn stable_adt_name<'tcx>(
     Some(escape_class_name(&qualified))
 }
 // WARNING: this is *wrong*: For some reason, `Instance::try_resolve` should not operate on structs(why?), and this just silences the newly introduced warning.
+// Root cause not understood — this is a `.unwrap().unwrap()` around `resolve_instance_raw`
+// wrapping what should probably be a non-panicking / non-Instance query for ADTs. It sits on
+// the mangled-name path used for every non-`stable_adt_name`-eligible ADT (see `adt_name`
+// below, and the `instance_try_resolve` call sites in `src/aggregate.rs`/`src/binop/mod.rs`),
+// so a wrong resolution here can corrupt name mangling or panic on legitimate structs whose
+// resolution doesn't fit whatever `Instance::try_resolve` actually expects.
 pub fn instance_try_resolve<'tcx>(
     adt: DefId,
     tcx: TyCtxt<'tcx>,
@@ -256,7 +262,7 @@ pub fn instance_try_resolve<'tcx>(
     .unwrap()
 }
 /// Tries to get the value of Const `size` as usize.
-pub fn try_resolve_const_size(size: Const) -> Result<usize, &'static str> {
+pub fn resolve_const_size(size: Const) -> Result<usize, &'static str> {
     let value = match size.try_to_value() {
         Some(value) => Ok(value),
         None => Err("Can't resolve scalar array size!"),

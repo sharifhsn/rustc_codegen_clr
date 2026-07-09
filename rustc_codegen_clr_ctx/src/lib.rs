@@ -16,6 +16,11 @@ pub struct MethodCompileCtx<'tcx, 'asm> {
     span: Option<Span>,
 }
 
+// `Target` is `&'asm mut Assembly`, not `Assembly`: `asm` is itself a borrow with its own
+// lifetime `'asm` outliving `self`, so deref'ing to `Assembly` directly would tie the result
+// to `self`'s (shorter) lifetime. Going through the extra reference indirection lets `*ctx`
+// reborrow `asm` for `'asm`, e.g. via `asm_mut`/`asm` below which return `&'a mut Assembly`
+// detached from `&self`.
 impl std::ops::DerefMut for MethodCompileCtx<'_, '_> {
     #[allow(clippy::mut_mut)]
     fn deref_mut(&mut self) -> &mut Self::Target {
@@ -119,6 +124,12 @@ impl<'tcx, 'asm> MethodCompileCtx<'tcx, 'asm> {
         self.asm
     }
 
+    /// Alignment assumed for constant/static allocations embedded as raw byte buffers, not
+    /// `tcx.data_layout()`'s real alignment. Kept at a conservative floor of 1 because the
+    /// .NET side has no way to request over-aligned static data placement; anything requiring
+    /// alignment above this value is routed by callers (see `alloc_ptr`/`alloc_ptr_unaligned`
+    /// in rustc_codgen_clr_operand's constant.rs, and static_data.rs) down an "unaligned" path
+    /// with an explicit fixup instead of being embedded directly.
     pub fn const_align(&self) -> u64 {
         1
     }
@@ -139,7 +150,7 @@ impl<'tcx> HasTypingEnv<'tcx> for MethodCompileCtx<'tcx, '_> {
     }
 }
 /// Escapes the name of a function
-pub fn function_name(name: SymbolName) -> String {
+pub fn fn_name(name: SymbolName) -> String {
     let name: String = name.to_string();
     /*// Name TOO long
     if *crate::config::ESCAPE_NAMES {
@@ -148,7 +159,11 @@ pub fn function_name(name: SymbolName) -> String {
     if name.len() > 1000 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        //TODO: make hashes consitant!
+        // TODO: make hashes consitant! `DefaultHasher::new()` uses fixed keys, so the hash
+        // is deterministic within one rustc/std version, but that's not guaranteed across
+        // toolchain versions — a symbol name truncated+hashed by one compiler could collide
+        // or mismatch one hashed by another, breaking the linker's cross-crate name matching
+        // (see `stable_adt_name`'s "pure function of identity" requirement).
         fn calculate_hash<T: Hash>(t: &T) -> u64 {
             let mut s = DefaultHasher::new();
             t.hash(&mut s);
