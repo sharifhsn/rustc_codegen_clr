@@ -88,6 +88,11 @@ fn get_current<T>(en: IEnumeratorGeneric<T>) -> T {
 ///
 /// `T` is the element type (a boundary-crossing .NET type — a primitive, a `#[repr(C)]` value-type
 /// struct, or a managed handle). The enumerator holds a managed reference, so `T` need not be `Copy`.
+///
+/// Never `Dispose()`d — unlike a C# `foreach`, which the compiler wraps in `try/finally` to dispose
+/// even on early `break`. Dropping this without disposing is fine for the common in-memory BCL
+/// enumerators (a no-op `Dispose`), but an enumerator backed by a real resource (a lock, a stream) will
+/// leak that resource until GC if iteration stops early.
 pub struct Enumerator<T> {
     /// The non-generic enumerator, used for `MoveNext()`.
     base: IEnumeratorNonGeneric,
@@ -175,17 +180,46 @@ pub trait EnumerableEntries<K, V>: Enumerable<KeyValuePair<K, V>> {
 }
 impl<K, V, C: Enumerable<KeyValuePair<K, V>>> EnumerableEntries<K, V> for C {}
 
+/// Marker asserting that every live value of handle type `H` is a managed reference whose .NET class
+/// genuinely implements `IEnumerable<T>` — i.e. `H` is a legal `castclass` source for
+/// [`IEnumerable<T>`]. This is what makes [`as_enum_handle`]'s upcast infallible, and it turns that
+/// upcast into a **safe** function: the invariant is proven once, where the handle type is defined
+/// (typically right next to the `dotnet_generic!` alias for a BCL collection, which is documented to
+/// implement the interface), rather than re-asserted with `unsafe` at every call site. This mirrors the
+/// [`crate::ManagedSafe`] / [`crate::StackOnly`] marker-trait pattern used elsewhere in this crate.
+///
+/// # Safety
+/// Implement this only for a handle type you know — from BCL documentation or your own binding's class
+/// declaration — corresponds to a .NET type implementing `System.Collections.Generic.IEnumerable<T>`
+/// for this exact `T`. Getting it wrong turns the `castclass` in `as_enum_handle` into a runtime
+/// `InvalidCastException` the first time the resulting `IEnumerable<T>` is used.
+pub unsafe trait ImplementsIEnumerable<T> {}
+
 /// Upcast a collection's raw managed handle (its `RustcCLRInteropManagedGeneric<…, (T,)>`) to the
 /// generic `IEnumerable<T>` interface via a real `castclass` (NOT a bare reinterpretation — a
-/// managed-reference `transmute` is ill-typed CIL and the verifier rejects it). Every BCL collection
-/// implements `IEnumerable<T>`, so the cast is infallible. This is the helper each
-/// [`crate::collections`] wrapper uses to satisfy [`Enumerable::enumerable_handle`].
+/// managed-reference `transmute` is ill-typed CIL and the verifier rejects it). Safe: the
+/// [`ImplementsIEnumerable<T>`] bound is the caller's proof (checked once, at the `unsafe impl`, not at
+/// every call site) that `H`'s .NET class implements `IEnumerable<T>`, so the cast is infallible. This
+/// is the helper each [`crate::collections`] wrapper uses to satisfy [`Enumerable::enumerable_handle`].
+#[inline(always)]
+pub fn as_enum_handle<H: ImplementsIEnumerable<T>, T>(handle: H) -> IEnumerable<T> {
+    // The `ImplementsIEnumerable<T>` bound is exactly the invariant this cast needs; the callee
+    // itself is a plain (safe) generic cast helper, so no `unsafe` block is needed here.
+    crate::intrinsics::rustc_clr_interop_managed_checked_cast::<IEnumerable<T>, H>(handle)
+}
+
+/// The unchecked escape hatch for a handle type that doesn't (yet) implement
+/// [`ImplementsIEnumerable<T>`] — e.g. a one-off cast in application code that doesn't want to wire the
+/// marker impl. Prefer implementing [`ImplementsIEnumerable<T>`] for your handle type and calling the
+/// safe [`as_enum_handle`] instead; that pays the safety proof once instead of at every call site.
 ///
 /// # Safety
 /// `handle` must be a live managed object reference that implements `IEnumerable<T>` for this `T`
 /// (i.e. any BCL collection handle whose element type is `T`).
 #[inline(always)]
-pub unsafe fn as_enumerable_handle<H, T>(handle: H) -> IEnumerable<T> {
+pub unsafe fn as_enum_handle_unchecked<H, T>(handle: H) -> IEnumerable<T> {
+    // SAFETY (of the *unsafe fn contract*, not any operation below): forwarded to the caller of this
+    // function per its doc; the callee itself is a plain (safe) generic cast helper.
     crate::intrinsics::rustc_clr_interop_managed_checked_cast::<IEnumerable<T>, H>(handle)
 }
 

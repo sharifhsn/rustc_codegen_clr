@@ -19,6 +19,11 @@ pub type MString =
 pub type MObject =
     crate::intrinsics::RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Object">;
 
+/// Construct a managed `System.String` from a Rust string slice in one call —
+/// `let s: MString = "hi".into();` — no `StringBuilder` needed for a literal or already-formatted
+/// `&str`/`String`. Reach for [`crate::bcl::StringBuilder`] only when you actually need mutable,
+/// incremental construction (e.g. building up a string across a loop); for anything you already
+/// hold as a Rust string, this `From` impl is the direct path.
 impl From<&str> for MString {
     fn from(val: &str) -> Self {
         Marshal::static2::<"PtrToStringUTF8", isize, i32, MString>(

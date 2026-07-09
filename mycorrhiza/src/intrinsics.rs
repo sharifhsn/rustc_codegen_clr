@@ -2,6 +2,24 @@ use std::ptr::null;
 
 use crate::ManagedSafe;
 
+/// A handle to a managed reference type, identified *only* by its `(ASSEMBLY, CLASS_PATH)` const
+/// generic parameters — there is no other field that distinguishes one instantiation from another.
+///
+/// **This means type identity is structural, not nominal.** Two `pub type` aliases in *different*
+/// files — one hand-written (e.g. [`crate::system::MString`]), one `spinacz`-generated (e.g.
+/// `bindings::System::String`) — are the *same Rust type* whenever they name the same
+/// `(ASSEMBLY, CLASS_PATH)` pair, even though nothing textually links the two definitions. Before
+/// writing a manual cast between two handle types, check whether their alias definitions already
+/// resolve to identical const-generic arguments; if they do, they're interchangeable with **no**
+/// conversion at all (not even `.into()` — a value of one *is* a value of the other), and any
+/// `impl` on one (traits, inherent methods, `From`) applies to both.
+///
+/// **Prefer `.into()` over [`rustc_clr_interop_managed_checked_cast`]** for upcasts. `spinacz`
+/// generates an `impl From<Derived> for Base` for every reflected type with a resolvable .NET base
+/// class (see `bindings.rs`), so casting a bound/reflected managed value up its inheritance chain is
+/// almost always already a `From` impl — grep `bindings.rs` for `impl From<` before reaching for the
+/// low-level intrinsic. Reserve `rustc_clr_interop_managed_checked_cast` for downcasts (checked
+/// `castclass`) or cross-hierarchy casts that have no generated `From` impl.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct RustcCLRInteropManagedClass<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str>
@@ -66,6 +84,33 @@ impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str>
         rustc_clr_interop_managed_call2_::<ASSEMBLY, CLASS_PATH, false, METHOD, true, Ret, Arg1, Arg2>(
             arg1, arg2,
         )
+    }
+    /// A four-explicit-arg **static** call. Added specifically for
+    /// [`crate::dynamic::invoke_dynamic`] (`Mycorrhiza.Reflection.DynamicInvoker.InvokeStatic` takes
+    /// `(assemblyName, typeName, methodName, args)`) -- nothing else in the tree currently needs a
+    /// static call past three explicit args, but the underlying `call4_` magic-fn family and the
+    /// backend's `call_managed` dispatch are fully generic over arity (`argc_from_fn_name` reads the
+    /// digit out of the name and the arg list is threaded straight from the actual call), so this is a
+    /// mechanical extra rung, not a special case.
+    #[inline(always)]
+    pub fn static4<const METHOD: &'static str, Arg1, Arg2, Arg3, Arg4, Ret>(
+        arg1: Arg1,
+        arg2: Arg2,
+        arg3: Arg3,
+        arg4: Arg4,
+    ) -> Ret {
+        rustc_clr_interop_managed_call4_::<
+            ASSEMBLY,
+            CLASS_PATH,
+            false,
+            METHOD,
+            true,
+            Ret,
+            Arg1,
+            Arg2,
+            Arg3,
+            Arg4,
+        >(arg1, arg2, arg3, arg4)
     }
     #[inline(always)]
     pub fn instance1<const METHOD: &'static str, Arg1, Ret>(self, arg1: Arg1) -> Ret {
@@ -132,7 +177,7 @@ pub struct RustcCLRInteropManagedArray<T, const DIMENSIONS: usize> {
 /// `rustc_clr_interop_generic_call*` / `_generic_ctor*` families is the same shape: a `pub fn` whose
 /// body is `core::intrinsics::abort();` and which differs *only* by how many `ArgN` type params /
 /// `argN` value params it declares. They are never actually run — the codegen backend recognizes them
-/// by *name* (see `is_function_magic` / the call-site dispatch in `src/terminator/call.rs`) and lowers
+/// by *name* (see `is_magic_fn` / the call-site dispatch in `src/terminator/call.rs`) and lowers
 /// the call directly to a managed `call`/`callvirt`/`newobj`/etc.
 ///
 /// **The function name is load-bearing and must be byte-identical.** The backend matches on name
@@ -210,6 +255,11 @@ interop_magic_fn! {
     [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const IS_STATIC: bool, Ret]
     (arg1: Arg1, arg2: Arg2, arg3: Arg3) -> Ret
 }
+interop_magic_fn! {
+    rustc_clr_interop_managed_call4_
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const IS_STATIC: bool, Ret]
+    (arg1: Arg1, arg2: Arg2, arg3: Arg3, arg4: Arg4) -> Ret
+}
 //VCalls
 interop_magic_fn! {
     rustc_clr_interop_managed_call_virt0_
@@ -245,6 +295,14 @@ pub fn rustc_clr_interop_managed_ld_null<T>() -> T {
 pub fn rustc_clr_interop_throw<const MSG: &'static str>() -> ! {
     core::intrinsics::abort();
 }
+/// Low-level checked cast (a CIL `castclass`) between two managed handle types — throws
+/// `InvalidCastException` at runtime if `src` isn't actually an instance of `DST`.
+///
+/// Before calling this directly: if `DST` is a *base* of `SRC`'s reflected/bound type, `spinacz`
+/// has almost certainly already generated `impl From<SRC> for DST` (see `bindings.rs`) — use
+/// `src.into()` instead, it's the same cast with no turbofish required. See the type-identity note
+/// on [`RustcCLRInteropManagedClass`] for when two differently-named handle types need no cast at
+/// all. Reach for this function directly only for downcasts or hierarchy jumps with no `From` impl.
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_checked_cast<DST, SRC>(src: SRC) -> DST {
@@ -447,6 +505,27 @@ interop_magic_fn! {
     rustc_clr_interop_generic_method_call2
     [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const KIND: u8, ClassGenerics, MethodGenerics, Sig, Ret]
     (arg1: Arg1, arg2: Arg2) -> Ret
+}
+interop_magic_fn! {
+    rustc_clr_interop_generic_method_call3
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const KIND: u8, ClassGenerics, MethodGenerics, Sig, Ret]
+    (arg1: Arg1, arg2: Arg2, arg3: Arg3) -> Ret
+}
+interop_magic_fn! {
+    rustc_clr_interop_generic_method_call4
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const KIND: u8, ClassGenerics, MethodGenerics, Sig, Ret]
+    (arg1: Arg1, arg2: Arg2, arg3: Arg3, arg4: Arg4) -> Ret
+}
+// `Queryable.Join<TOuter,TInner,TKey,TResult>(outer, inner, outerKeySelector, innerKeySelector,
+// resultSelector)` is the motivating case for this arity rung — the first WF-9 generic-method call
+// site with more than 2 runtime arguments (`mycorrhiza::linq::join`). `call_gmethod`
+// (`src/terminator/call.rs`) already reads argument count from the actual call args / `Sig` tuple
+// length rather than from this fn name's digit, so no backend change was needed — only this
+// mechanical arity-ladder rung.
+interop_magic_fn! {
+    rustc_clr_interop_generic_method_call5
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const KIND: u8, ClassGenerics, MethodGenerics, Sig, Ret]
+    (arg1: Arg1, arg2: Arg2, arg3: Arg3, arg4: Arg4, arg5: Arg5) -> Ret
 }
 interop_magic_fn! {
     rustc_clr_interop_generic_ctor0

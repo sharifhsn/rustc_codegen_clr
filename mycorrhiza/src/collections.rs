@@ -91,6 +91,8 @@ mod list {
     }
 
     dotnet_generic!(Handle<T> = [CORELIB] "System.Collections.Generic.List" < (T,) >);
+    // SAFETY-BEARING: `Handle<..>` really is a .NET class implementing `IEnumerable<..>` (the BCL type this alias names), so `as_enum_handle` on it is sound.
+    unsafe impl<T> crate::enumerate::ImplementsIEnumerable<T> for Handle<T> {}
     dotnet_generic_impl! {
         Handle<T> = [CORELIB] "System.Collections.Generic.List" < (T,) > ;
         ctor fn raw_ctor();
@@ -338,7 +340,7 @@ mod list {
     // `IEnumerator<T>` (`GetEnumerator`/`MoveNext`/`Current`) rather than an index loop.
     impl<T> crate::enumerate::Enumerable<T> for List<T> {
         fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
-            unsafe { crate::enumerate::as_enumerable_handle(self.h) }
+            crate::enumerate::as_enum_handle(self.h)
         }
     }
     impl<'a, T> IntoIterator for &'a List<T> {
@@ -380,6 +382,8 @@ mod dictionary {
     use crate::{dotnet_generic, dotnet_generic_impl, gen};
 
     dotnet_generic!(Handle<K, V> = [CORELIB] "System.Collections.Generic.Dictionary" < (K, V) >);
+    // SAFETY-BEARING: `Handle<..>` really is a .NET class implementing `IEnumerable<..>` (the BCL type this alias names), so `as_enum_handle` on it is sound.
+    unsafe impl<K, V> crate::enumerate::ImplementsIEnumerable<crate::enumerate::KeyValuePair<K, V>> for Handle<K, V> {}
     dotnet_generic_impl! {
         Handle<K, V> = [CORELIB] "System.Collections.Generic.Dictionary" < (K, V) > ;
         ctor fn raw_ctor();
@@ -478,7 +482,7 @@ mod dictionary {
         fn enumerable_handle(
             &self,
         ) -> crate::enumerate::IEnumerable<crate::enumerate::KeyValuePair<K, V>> {
-            unsafe { crate::enumerate::as_enumerable_handle::<_, crate::enumerate::KeyValuePair<K, V>>(self.h) }
+            crate::enumerate::as_enum_handle::<_, crate::enumerate::KeyValuePair<K, V>>(self.h)
         }
     }
     impl<'a, K, V> IntoIterator for &'a Dictionary<K, V> {
@@ -501,6 +505,8 @@ mod hash_set {
     use crate::{dotnet_generic, dotnet_generic_impl, gen};
 
     dotnet_generic!(Handle<T> = [CORELIB] "System.Collections.Generic.HashSet" < (T,) >);
+    // SAFETY-BEARING: `Handle<..>` really is a .NET class implementing `IEnumerable<..>` (the BCL type this alias names), so `as_enum_handle` on it is sound.
+    unsafe impl<T> crate::enumerate::ImplementsIEnumerable<T> for Handle<T> {}
     dotnet_generic_impl! {
         Handle<T> = [CORELIB] "System.Collections.Generic.HashSet" < (T,) > ;
         ctor fn raw_ctor();
@@ -560,7 +566,7 @@ mod hash_set {
     // Iteration via the enumerator bridge (order is the .NET set's internal order, as in C#).
     impl<T> crate::enumerate::Enumerable<T> for HashSet<T> {
         fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
-            unsafe { crate::enumerate::as_enumerable_handle(self.h) }
+            crate::enumerate::as_enum_handle(self.h)
         }
     }
     impl<'a, T> IntoIterator for &'a HashSet<T> {
@@ -600,6 +606,8 @@ mod stack {
     const ASM: &str = "System.Collections";
 
     dotnet_generic!(Handle<T> = [ASM] "System.Collections.Generic.Stack" < (T,) >);
+    // SAFETY-BEARING: `Handle<..>` really is a .NET class implementing `IEnumerable<..>` (the BCL type this alias names), so `as_enum_handle` on it is sound.
+    unsafe impl<T> crate::enumerate::ImplementsIEnumerable<T> for Handle<T> {}
     dotnet_generic_impl! {
         Handle<T> = [ASM] "System.Collections.Generic.Stack" < (T,) > ;
         ctor fn raw_ctor();
@@ -667,7 +675,7 @@ mod stack {
     // Iteration via the enumerator bridge. `Stack<T>` enumerates LIFO (top first), matching C#.
     impl<T> crate::enumerate::Enumerable<T> for Stack<T> {
         fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
-            unsafe { crate::enumerate::as_enumerable_handle(self.h) }
+            crate::enumerate::as_enum_handle(self.h)
         }
     }
     impl<'a, T> IntoIterator for &'a Stack<T> {
@@ -687,6 +695,8 @@ mod queue {
     const ASM: &str = "System.Collections";
 
     dotnet_generic!(Handle<T> = [ASM] "System.Collections.Generic.Queue" < (T,) >);
+    // SAFETY-BEARING: `Handle<..>` really is a .NET class implementing `IEnumerable<..>` (the BCL type this alias names), so `as_enum_handle` on it is sound.
+    unsafe impl<T> crate::enumerate::ImplementsIEnumerable<T> for Handle<T> {}
     dotnet_generic_impl! {
         Handle<T> = [ASM] "System.Collections.Generic.Queue" < (T,) > ;
         ctor fn raw_ctor();
@@ -754,7 +764,7 @@ mod queue {
     // Iteration via the enumerator bridge. `Queue<T>` enumerates FIFO (front first), matching C#.
     impl<T> crate::enumerate::Enumerable<T> for Queue<T> {
         fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
-            unsafe { crate::enumerate::as_enumerable_handle(self.h) }
+            crate::enumerate::as_enum_handle(self.h)
         }
     }
     impl<'a, T> IntoIterator for &'a Queue<T> {
@@ -863,6 +873,8 @@ mod sorted_set {
     const ASM: &str = "System.Collections";
 
     dotnet_generic!(Handle<T> = [ASM] "System.Collections.Generic.SortedSet" < (T,) >);
+    // SAFETY-BEARING: `Handle<..>` really is a .NET class implementing `IEnumerable<..>` (the BCL type this alias names), so `as_enum_handle` on it is sound.
+    unsafe impl<T> crate::enumerate::ImplementsIEnumerable<T> for Handle<T> {}
     dotnet_generic_impl! {
         Handle<T> = [ASM] "System.Collections.Generic.SortedSet" < (T,) > ;
         ctor fn raw_ctor();
@@ -925,7 +937,7 @@ mod sorted_set {
     // Iteration via the enumerator bridge — yields elements in ascending sorted order (as in C#).
     impl<T> crate::enumerate::Enumerable<T> for SortedSet<T> {
         fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
-            unsafe { crate::enumerate::as_enumerable_handle(self.h) }
+            crate::enumerate::as_enum_handle(self.h)
         }
     }
     impl<'a, T> IntoIterator for &'a SortedSet<T> {
@@ -983,6 +995,8 @@ mod linked_list {
     }
 
     dotnet_generic!(Handle<T> = [ASM] "System.Collections.Generic.LinkedList" < (T,) >);
+    // SAFETY-BEARING: `Handle<..>` really is a .NET class implementing `IEnumerable<..>` (the BCL type this alias names), so `as_enum_handle` on it is sound.
+    unsafe impl<T> crate::enumerate::ImplementsIEnumerable<T> for Handle<T> {}
     // `ICollection<T>` — the interface view used to append (`Add` == `AddLast` for a linked list).
     // `LinkedList<T>.AddLast(T)` returns a `LinkedListNode<T>` (a nested generic reference type whose
     // definition-shape return the CIL typechecker cannot accept against a concrete local — see the
@@ -1025,11 +1039,9 @@ mod linked_list {
         }
         /// Append `item` at the end (`AddLast`, reached through `ICollection<T>.Add`).
         pub fn push_back(&mut self, item: T) {
-            let ic = unsafe {
-                crate::intrinsics::rustc_clr_interop_managed_checked_cast::<ICollection<T>, Handle<T>>(
-                    self.h,
-                )
-            };
+            let ic = crate::intrinsics::rustc_clr_interop_managed_checked_cast::<ICollection<T>, Handle<T>>(
+                self.h,
+            );
             raw_icoll_add::<T>(ic, item)
         }
         /// Prepend `item` at the front (`AddFirst`). The `LinkedListNode<T>` it returns is discarded.
@@ -1063,7 +1075,7 @@ mod linked_list {
     // Iteration via the enumerator bridge — front-to-back order (as in C#).
     impl<T> crate::enumerate::Enumerable<T> for LinkedList<T> {
         fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
-            unsafe { crate::enumerate::as_enumerable_handle(self.h) }
+            crate::enumerate::as_enum_handle(self.h)
         }
     }
     impl<'a, T> IntoIterator for &'a LinkedList<T> {
@@ -1268,6 +1280,8 @@ mod concurrent_queue {
     const ASM: &str = "System.Collections.Concurrent";
 
     dotnet_generic!(Handle<T> = [ASM] "System.Collections.Concurrent.ConcurrentQueue" < (T,) >);
+    // SAFETY-BEARING: `Handle<..>` really is a .NET class implementing `IEnumerable<..>` (the BCL type this alias names), so `as_enum_handle` on it is sound.
+    unsafe impl<T> crate::enumerate::ImplementsIEnumerable<T> for Handle<T> {}
     dotnet_generic_impl! {
         Handle<T> = [ASM] "System.Collections.Concurrent.ConcurrentQueue" < (T,) > ;
         ctor fn raw_ctor();
@@ -1319,7 +1333,7 @@ mod concurrent_queue {
     // Iteration via the enumerator bridge — a moment-in-time snapshot, front-to-back (as in C#).
     impl<T> crate::enumerate::Enumerable<T> for ConcurrentQueue<T> {
         fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
-            unsafe { crate::enumerate::as_enumerable_handle(self.h) }
+            crate::enumerate::as_enum_handle(self.h)
         }
     }
     impl<'a, T> IntoIterator for &'a ConcurrentQueue<T> {
@@ -1357,6 +1371,8 @@ mod concurrent_bag {
     const ASM: &str = "System.Collections.Concurrent";
 
     dotnet_generic!(Handle<T> = [ASM] "System.Collections.Concurrent.ConcurrentBag" < (T,) >);
+    // SAFETY-BEARING: `Handle<..>` really is a .NET class implementing `IEnumerable<..>` (the BCL type this alias names), so `as_enum_handle` on it is sound.
+    unsafe impl<T> crate::enumerate::ImplementsIEnumerable<T> for Handle<T> {}
     dotnet_generic_impl! {
         Handle<T> = [ASM] "System.Collections.Concurrent.ConcurrentBag" < (T,) > ;
         ctor fn raw_ctor();
@@ -1408,7 +1424,7 @@ mod concurrent_bag {
     // Iteration via the enumerator bridge — a moment-in-time snapshot, unordered (as in C#).
     impl<T> crate::enumerate::Enumerable<T> for ConcurrentBag<T> {
         fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
-            unsafe { crate::enumerate::as_enumerable_handle(self.h) }
+            crate::enumerate::as_enum_handle(self.h)
         }
     }
     impl<'a, T> IntoIterator for &'a ConcurrentBag<T> {

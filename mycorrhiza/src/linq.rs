@@ -39,10 +39,10 @@
 
 use crate::intrinsics::{
     rustc_clr_interop_box as box_value, rustc_clr_interop_generic_method_call1 as gmethod1,
-    rustc_clr_interop_generic_method_call2 as gmethod2, rustc_clr_interop_managed_checked_cast as cast,
-    rustc_clr_interop_managed_new_arr as new_arr, rustc_clr_interop_managed_set_elem as set_elem,
-    RustcCLRInteropManagedArray, RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric,
-    RustcCLRInteropMethodGeneric,
+    rustc_clr_interop_generic_method_call2 as gmethod2, rustc_clr_interop_generic_method_call5 as gmethod5,
+    rustc_clr_interop_managed_checked_cast as cast, rustc_clr_interop_managed_new_arr as new_arr,
+    rustc_clr_interop_managed_set_elem as set_elem, RustcCLRInteropManagedArray, RustcCLRInteropManagedClass,
+    RustcCLRInteropManagedGeneric, RustcCLRInteropMethodGeneric,
 };
 use crate::system::{DotNetString, MString};
 use std::marker::PhantomData;
@@ -503,12 +503,12 @@ impl Expr {
         // `self.Type` — the static CLR type this expression node evaluates to (e.g. `System.String`
         // for `p.Name`), via the `Expression.Type` property every node has.
         let ty: CType = self.inner.instance0::<"get_Type", CType>();
-        let type_args: CTypeArr = new_arr::<CType>(1);
-        set_elem::<CType>(type_args, 0, ty);
+        let targs: CTypeArr = new_arr::<CType>(1);
+        set_elem::<CType>(targs, 0, ty);
         // Type.GetMethod(string, Type[]) -> MethodInfo
         let method: CMethodInfo = ty.instance2::<"GetMethod", MString, CTypeArr, CMethodInfo>(
             mstr(method_name),
-            type_args,
+            targs,
         );
         let args: CExprArr = new_arr::<CExpr>(1);
         set_elem::<CExpr>(args, 0, arg.inner);
@@ -974,4 +974,193 @@ impl Compiled {
             .instance1::<"DynamicInvoke", CObjArray, CObject>(args);
         CConvert::static1::<"ToBoolean", CObject, bool>(res)
     }
+}
+
+// ===========================================================================================
+// `GroupBy` / `Join` / `SelectMany` — the three `Queryable` shapes beyond `Where`/`Count` that
+// [`IntQuery`] covers. Unlike `IntQuery` (hardcoded to `int`), these are Rust-GENERIC over the
+// caller's own .NET element-type handles (mirrors how `cd_efcore`'s `typed_pred_investor` free
+// function generalizes [`Expr::typed_pred`] to `Investor` — that same "caller supplies its own
+// concrete handle types, this module supplies the WF-9 def-shape machinery" split is used here,
+// just promoted into reusable generic functions instead of being duplicated per test crate).
+//
+// Every operator below is a THIN wrapper around `rustc_clr_interop_generic_method_call{2,5}`: it
+// supplies the fixed `(ASSEMBLY, CLASS_PATH, METHOD, KIND, ClassGenerics)` header and the
+// definition-shape `Sig` tuple (built from the markers below), while the caller's own concrete
+// `TSource`/`TKey`/… handle types flow through as ordinary Rust generic parameters — exactly the
+// `!!N`-binds-to-`MethodGenerics[N]` contract `check_generic_marker` enforces (see
+// `src/terminator/call.rs`). `Join` needed a new arity rung
+// ([`crate::intrinsics::rustc_clr_interop_generic_method_call5`]) since it has five runtime
+// arguments (`outer, inner, outerKeySelector, innerKeySelector, resultSelector`) — the backend's
+// `call_gmethod` already reads arity from the call's argument count / `Sig` tuple length, so no
+// change was needed there, only the new arity-ladder rung in `intrinsics.rs`.
+// ===========================================================================================
+
+/// Definition-shape marker: `System.Linq.IQueryable\`1<!!N>` — an `IQueryable` over method-generic
+/// slot `N`. Generalizes this module's `CIQueryMG` (which is hardcoded to method-generic slot 0).
+pub type QueryableMarker<const N: usize> =
+    RustcCLRInteropManagedGeneric<"System.Linq.Expressions", "System.Linq.IQueryable", (RustcCLRInteropMethodGeneric<N>,)>;
+
+/// Definition-shape marker: `System.Collections.Generic.IEnumerable\`1<!!N>`.
+pub type EnumerableMarker<const N: usize> = RustcCLRInteropManagedGeneric<
+    "System.Private.CoreLib",
+    "System.Collections.Generic.IEnumerable",
+    (RustcCLRInteropMethodGeneric<N>,),
+>;
+
+/// Definition-shape marker: `System.Linq.IGrouping\`2<!!K,!!V>` — the element `GroupBy` produces
+/// (`IGrouping<TKey,TSource>`, key first).
+pub type GroupingMarker<const K: usize, const V: usize> = RustcCLRInteropManagedGeneric<
+    "System.Linq",
+    "System.Linq.IGrouping",
+    (RustcCLRInteropMethodGeneric<K>, RustcCLRInteropMethodGeneric<V>),
+>;
+
+/// Definition-shape marker: `System.Linq.Expressions.Expression\`1<System.Func\`2<!!A,!!B>>` — a
+/// single-parameter selector (key selector / collection selector) from method-generic `A` to `B`.
+/// Generalizes this module's `CExprFuncMG` (which hardcodes the result to `bool`).
+pub type SelectorMarker<const A: usize, const B: usize> = RustcCLRInteropManagedGeneric<
+    "System.Linq.Expressions",
+    "System.Linq.Expressions.Expression",
+    (RustcCLRInteropManagedGeneric<"System.Private.CoreLib", "System.Func", (RustcCLRInteropMethodGeneric<A>, RustcCLRInteropMethodGeneric<B>)>,),
+>;
+
+/// Definition-shape marker: `Expression\`1<Func\`3<!!A,!!B,!!C>>` — a two-parameter `resultSelector`
+/// (`Join`'s last argument), from method-generics `A,B` to `C`.
+pub type ResultSelectorMarker<const A: usize, const B: usize, const C: usize> = RustcCLRInteropManagedGeneric<
+    "System.Linq.Expressions",
+    "System.Linq.Expressions.Expression",
+    (RustcCLRInteropManagedGeneric<"System.Private.CoreLib", "System.Func", (RustcCLRInteropMethodGeneric<A>, RustcCLRInteropMethodGeneric<B>, RustcCLRInteropMethodGeneric<C>)>,),
+>;
+
+/// Generalized version of [`Expr::typed_pred`]: wrap `body` into a strongly-typed
+/// `Expression<TDelegate>` over `params`, via the generic `Expression.Lambda<TDelegate>(body,
+/// ParameterExpression[])` method. Unlike `typed_pred` (hardcoded to `Func<int,bool>`), the
+/// delegate/expression types are Rust generic parameters, so this works for ANY selector shape —
+/// `Func<TSource,TKey>` (a `GroupBy`/`SelectMany` key/collection selector), `Func<TOuter,TInner,
+/// TResult>` (a `Join` result selector, over TWO parameters — `Expression.Lambda`'s own arity is
+/// always 2 runtime args, `(body, ParameterExpression[])`, regardless of how many parameters the
+/// produced delegate has), or any other `Expression<Func<..>>` a caller needs. Mirrors what
+/// `cd_efcore::typed_pred_investor` hand-rolled for one concrete entity type, generalized here so
+/// callers no longer need to hand-roll it themselves.
+#[must_use]
+pub fn typed_lambda<TDelegate, TExprDelegate>(body: Expr, params: &[&Param]) -> TExprDelegate {
+    let arr: CParamArr = new_arr::<CParam>(params.len() as i32);
+    let mut i = 0i32;
+    for p in params {
+        set_elem::<CParam>(arr, i, p.inner);
+        i += 1;
+    }
+    gmethod2::<
+        "System.Linq.Expressions",
+        "System.Linq.Expressions.Expression",
+        false,
+        "Lambda",
+        0,
+        (),
+        (TDelegate,),
+        (CExprMethGen0, CExpr, CParamArr),
+        TExprDelegate,
+        CExpr,
+        CParamArr,
+    >(body.inner, arr)
+}
+
+/// `Queryable.GroupBy<TSource,TKey>(source, keySelector) -> IQueryable<IGrouping<TKey,TSource>>`.
+/// `TSource`/`TKey` are the caller's concrete .NET handle types for the method generics (e.g. a
+/// `SubscriptionHandle` / `MString`); `QSource`/`QResult` are the concrete `IQueryable<..>` handle
+/// types for the source and the produced `IQueryable<IGrouping<TKey,TSource>>`; `KeySelector` is the
+/// concrete `Expression<Func<TSource,TKey>>` handle (built via [`typed_lambda`]).
+#[must_use]
+pub fn group_by<TSource, TKey, QSource, QResult, KeySelector>(source: QSource, key_selector: KeySelector) -> QResult {
+    gmethod2::<
+        "System.Linq.Queryable",
+        "System.Linq.Queryable",
+        false,
+        "GroupBy",
+        0,
+        (),
+        (TSource, TKey),
+        (GroupingQueryMarker<1, 0>, QueryableMarker<0>, SelectorMarker<0, 1>),
+        QResult,
+        QSource,
+        KeySelector,
+    >(source, key_selector)
+}
+
+/// Definition-shape marker: `IQueryable\`1<IGrouping\`2<!!K,!!V>>` — `GroupBy`'s return shape.
+/// Written as its own alias (rather than inlined at the `group_by` call site) purely for
+/// readability — `GroupingQueryMarker<K, V>` reads as "a queryable of groupings" the way the doc
+/// comment above describes it.
+pub type GroupingQueryMarker<const K: usize, const V: usize> =
+    RustcCLRInteropManagedGeneric<"System.Linq.Expressions", "System.Linq.IQueryable", (GroupingMarker<K, V>,)>;
+
+/// `Queryable.SelectMany<TSource,TResult>(source, selector) -> IQueryable<TResult>`, flattening a
+/// one-to-many navigation (`selector: Expression<Func<TSource,IEnumerable<TResult>>>`). `TSource`/
+/// `TResult` are the caller's concrete method-generic handle types; `QSource`/`QResult` the concrete
+/// `IQueryable<..>` handles; `Selector` the concrete selector expression handle.
+#[must_use]
+pub fn select_many<TSource, TResult, QSource, QResult, Selector>(source: QSource, selector: Selector) -> QResult {
+    gmethod2::<
+        "System.Linq.Queryable",
+        "System.Linq.Queryable",
+        false,
+        "SelectMany",
+        0,
+        (),
+        (TSource, TResult),
+        (
+            QueryableMarker<1>,
+            QueryableMarker<0>,
+            RustcCLRInteropManagedGeneric<
+                "System.Linq.Expressions",
+                "System.Linq.Expressions.Expression",
+                (RustcCLRInteropManagedGeneric<"System.Private.CoreLib", "System.Func", (RustcCLRInteropMethodGeneric<0>, EnumerableMarker<1>)>,),
+            >,
+        ),
+        QResult,
+        QSource,
+        Selector,
+    >(source, selector)
+}
+
+/// `Queryable.Join<TOuter,TInner,TKey,TResult>(outer, inner, outerKeySelector, innerKeySelector,
+/// resultSelector) -> IQueryable<TResult>` — the EXPLICIT LINQ-join shape (unlike `Include`, it
+/// needs no pre-declared navigation property; the two key selectors are built purely from Rust).
+/// `TOuter,TInner,TKey,TResult` are the caller's concrete method-generic handle types; `QOuter`/
+/// `IInner`/`QResult` the concrete `IQueryable<TOuter>`/`IEnumerable<TInner>`/`IQueryable<TResult>`
+/// handles; `KeyOuter`/`KeyInner`/`ResultSel` the concrete selector-expression handles (built via
+/// [`typed_lambda`]). Uses [`crate::intrinsics::rustc_clr_interop_generic_method_call5`] — the new
+/// arity rung this module's `Join` support needed (see the section doc above).
+#[must_use]
+pub fn join<TOuter, TInner, TKey, TResult, QOuter, IInner, KeyOuter, KeyInner, ResultSel, QResult>(
+    outer: QOuter,
+    inner: IInner,
+    outer_key_selector: KeyOuter,
+    inner_key_selector: KeyInner,
+    result_selector: ResultSel,
+) -> QResult {
+    gmethod5::<
+        "System.Linq.Queryable",
+        "System.Linq.Queryable",
+        false,
+        "Join",
+        0,
+        (),
+        (TOuter, TInner, TKey, TResult),
+        (
+            QueryableMarker<3>,
+            QueryableMarker<0>,
+            EnumerableMarker<1>,
+            SelectorMarker<0, 2>,
+            SelectorMarker<1, 2>,
+            ResultSelectorMarker<0, 1, 3>,
+        ),
+        QResult,
+        QOuter,
+        IInner,
+        KeyOuter,
+        KeyInner,
+        ResultSel,
+    >(outer, inner, outer_key_selector, inner_key_selector, result_selector)
 }

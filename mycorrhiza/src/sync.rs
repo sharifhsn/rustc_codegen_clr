@@ -138,9 +138,9 @@ impl Semaphore {
     /// [`crate::task::block_on`] instead.
     #[inline]
     pub fn acquire_async(self) -> impl Future<Output = SemaphorePermit> {
-        let wait_task = Task::from_raw(self.h.wait_async());
+        let wtask = Task::from_raw(self.h.wait_async());
         async move {
-            await_unit(wait_task).await;
+            await_unit(wtask).await;
             SemaphorePermit { sem: self }
         }
     }
@@ -443,9 +443,9 @@ impl SharedLock {
     /// acquired.
     #[inline]
     pub fn lock_async(self) -> impl Future<Output = SharedLockGuard> {
-        let wait_task = Task::from_raw(self.h.wait_async());
+        let wtask = Task::from_raw(self.h.wait_async());
         async move {
-            await_unit(wait_task).await;
+            await_unit(wtask).await;
             SharedLockGuard { lock: self }
         }
     }

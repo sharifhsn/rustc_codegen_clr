@@ -235,4 +235,32 @@ impl core::fmt::Write for StringBuilder {
         self.append_char(c);
         Ok(())
     }
+
+    // `core::fmt::Write::write_fmt`'s *default* provided body is `core::fmt::write(self, args)`,
+    // where the free fn `write` takes `&mut dyn Write` -- so the default forces an unsizing
+    // coercion of `&mut Self` to a `&mut dyn Write` trait object at every `write!(sb, ..)` call
+    // site. That coercion builds a fat pointer whose "data" half is type-erased to a raw `void*`
+    // (see `src/unsize.rs`, `fat_ptr_to` in `rustc_codegen_clr_type`). `StringBuilder` is a thin
+    // newtype directly over a managed `System.Text.StringBuilder` handle -- a real GC-tracked
+    // object reference -- so a pointer into it is itself GC-relevant memory; erasing that into an
+    // untracked `void*` field would let the CLR's compacting GC relocate/collect the referent out
+    // from under a stale, untracked address. The CIL type-verifier's `PtrCast` check correctly
+    // refuses to emit that cast (`ManagedPtrCast`, invariant I1 of the absolute-correctness plan)
+    // -- it is not a false positive, it is catching a genuine unsoundness in the generic fat-pointer
+    // erasure path when the pointee transitively carries a managed reference (the same class of gap
+    // documented for `Type::contains_gcref`; a general, sound fix needs a first-class
+    // GC-tracked/byref-like fat-pointer representation, which is a larger architectural change
+    // outside this fix's scope).
+    //
+    // The fix here: override `write_fmt` so `StringBuilder` never needs a `dyn Write` trait object
+    // at all. Format into a plain `std::string::String` (an ordinary, gcref-free `Write` sink --
+    // its own `write_fmt` goes through the very same default-provided coercion, but that is sound
+    // because `String` contains no managed reference), then forward the fully rendered text with a
+    // single direct (non-virtual) `append` call.
+    fn write_fmt(&mut self, args: core::fmt::Arguments<'_>) -> core::fmt::Result {
+        let mut buf = std::string::String::new();
+        buf.write_fmt(args)?;
+        self.append(&buf);
+        Ok(())
+    }
 }

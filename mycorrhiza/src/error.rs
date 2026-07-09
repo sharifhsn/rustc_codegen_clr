@@ -193,7 +193,9 @@ fn catch_trampoline<F, T>(data: *mut u8) {
     // The closure was `ManuallyDrop::take`n only on the success path; if the exception was thrown
     // *before* `func` ran (the common case — the throwing call *is* `func`), `func` was still taken
     // (the throw happens inside it). We conservatively do not drop it here to avoid a double-drop or
-    // dropping a moved-out value; `F` is typically a trivial closure with no `Drop` glue.
+    // dropping a moved-out value; `F` is typically a trivial closure with no `Drop` glue. For an `F`
+    // that does capture something with real `Drop` glue, this is a genuine leak on the throw path —
+    // see the note on `try_managed`.
 }
 
 /// Run a possibly-throwing managed call and surface its outcome as a [`Result`].
@@ -202,6 +204,10 @@ fn catch_trampoline<F, T>(data: *mut u8) {
 /// normally, you get [`Ok`] with its value; if a managed exception is thrown, you get
 /// [`Err`]`(`[`ManagedException`]`)`. This is the *foreign-exception* counterpart to
 /// [`std::panic::catch_unwind`] (which rethrows non-Rust exceptions).
+///
+/// On the throw path, `f`'s captured state is **not** dropped (see `catch_trampoline`) — avoid
+/// capturing anything with real `Drop` glue (an owned `Vec`/`String`/`Box`, ...), or it leaks whenever
+/// the managed call throws.
 ///
 /// ```ignore
 /// let n = try_managed(|| some_bcl_call_that_might_throw())?;
@@ -323,14 +329,14 @@ macro_rules! impl_from_managed_exception {
 /// qualifier to `extern "C-unwind"` — no other change — made the exception reach the C# `try`/`catch`
 /// correctly). `#[dotnet_export]`'s generated shim already uses `extern "C-unwind"` for this reason.
 #[inline]
-pub fn throw_message(msg: &str) -> ! {
+pub fn throw_msg(msg: &str) -> ! {
     use crate::bindings::System::Exception;
     use crate::bindings::System::Runtime::ExceptionServices::ExceptionDispatchInfo;
     use crate::system::DotNetString;
 
-    let managed_msg = DotNetString::from(msg).handle();
-    let exception = Exception::ctor1::<crate::system::MString>(managed_msg);
-    ExceptionDispatchInfo::capture(exception).throw();
+    let mmsg = DotNetString::from(msg).handle();
+    let exc = Exception::ctor1::<crate::system::MString>(mmsg);
+    ExceptionDispatchInfo::capture(exc).throw();
     // `Throw()` never returns (it always raises), but its Rust-visible signature is `()`, not `!` —
     // give the compiler the same terminal guarantee `rustc_clr_interop_throw` provides.
     unreachable!("ExceptionDispatchInfo::Throw() does not return")

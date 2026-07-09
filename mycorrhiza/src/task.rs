@@ -30,12 +30,30 @@
 //! delegate, which the delegate bridge does not yet support (only capture-less `extern "C" fn`). For a
 //! `block_on`-style executor (what async programs on this PAL use) polling is exactly right.
 //!
-//! **Important — do not `.await` a managed Task handle *inside* an `async fn`.** A managed object
-//! reference may not live in a coroutine's saved state (an `async fn` state machine is laid out with
-//! *overlapping* variant storage, like an enum, and .NET forbids a GC reference in an overlapping
-//! field). So hold the handle across an `.await` only in a *plain* [`Future`] struct (as [`TaskFuture`]
-//! itself does) driven by [`block_on`] — never capture a `TaskT`/`Task` in an `async fn` body that
-//! suspends. See [`TaskFuture`].
+//! **Do not `.await` a RAW managed Task handle *inside* an `async fn`** — i.e. never hold a bare
+//! `TaskT`/`Task`/`RustcCLRInteropManagedClass<..>` in a local across a suspend point. A managed
+//! object reference may not live in a coroutine's saved state (an `async fn` state machine is laid
+//! out with *overlapping* variant storage, like an enum, and .NET forbids a GC reference in an
+//! overlapping field — `cilly::ir::class`'s `layout_check`, `ManagedRefInOverlapingField`). So a raw
+//! handle must be awaited via a *plain* [`Future`] struct (as [`TaskFuture`] itself does) driven by
+//! [`block_on`], never captured directly in a suspending `async fn` body. See [`TaskFuture`].
+//!
+//! **This IS solvable, though, for the common case of holding a managed reference across an
+//! `.await`** — not by weakening `layout_check` (never done), but by never putting a gcref in the
+//! coroutine state in the first place. [`crate::class::Class`] wraps the target object in a
+//! `System.Runtime.InteropServices.GCHandle` (`GCHandle.Alloc`/`.Free`), and `GCHandle` is itself a
+//! .NET *value type* over a plain `IntPtr` — not a gcref. A `Class<ASSEMBLY, CLASS_PATH>` value
+//! therefore has no gcref field at all, so `layout_check` never rejects it, and it is legal to
+//! declare one *before* an `.await` and use it again *after* — including across more than one
+//! suspend point in the same `async fn` body. `cargo_tests/cd_persisted_async` proves this end to
+//! end: a `Class<..>`-wrapped `System.Text.StringBuilder` is built, appended to, held across TWO
+//! `.await`s, appended to again after each, and read back correctly. (Fixed as part of this proof:
+//! `Class::get_naked_ref` was calling `GCHandle.get_Target()` with the concrete handle type as the
+//! declared return, but `get_Target` is declared `object Target { get; }` — its real signature
+//! return is always `System.Object`; the fix reads it as `System.Object` then `castclass`es down,
+//! matching `from_naked_ref`'s upcast in reverse.) This newtype needed **no backend change** — it is
+//! a pure `mycorrhiza`-level pattern, reusable for any class-typed value a coroutine needs to keep
+//! live across a suspend point.
 //!
 //! ## Exposing a Rust `async fn` as a .NET `Task` (Future → Task)
 //!
@@ -143,21 +161,13 @@ fn task_result<T>(t: TaskT<T>) -> T {
     >(t)
 }
 
-// ---- The `Task<T>` producer wall (why `future_to_task_unit` is non-generic) --------------------
+// ---- Why `future_to_task_unit` is non-generic (not a producer wall — see `tcs_get_task` below) --
 //
-// Creating a *result-bearing* `Task<T>` from a Rust value would go through
-// `TaskCompletionSource<T>.get_Task()` (or `Task.FromResult<T>`). Both return the **def-shape** nested
-// generic `Task`1<!0>` (resp. `Task`1<!!0>`). A methodref can carry that (`!0` binds to the parent's
-// generic), but the returned value must land in a Rust local — and there is NO valid local type for it:
-//   * a `Task`1<!0>` local is invalid IL (`!0` is unbound in a non-generic method);
-//   * producing it as concrete `Task`1<T>` or upcast `System.Object` is rejected by the CIL type
-//     verifier (nested-generic def-shape ≠ concrete; no ClassRef→ClassRef/Object subtyping on `stloc`),
-//     and weakening the verifier is forbidden.
-// `Task.FromResult<T>` additionally needs generic-*method* argument support the backend doesn't emit.
-// This is the same "nested-generic def-shape return" ceiling the enumerator bridge documents. So the
-// Future→Task direction here produces the **non-generic** `Task` (via the non-generic
-// `TaskCompletionSource`), which is fully supported; `Task<T>` production is a follow-up (it needs a
-// small, sound backend addition — an inserted upcast in `call_generic`, or generic-method args).
+// `future_to_task_unit` goes through the non-generic `TaskCompletionSource` (`new()`/`SetResult()`/
+// `get_Task()`, no def-shape return involved) rather than `TaskCompletionSource<T>.get_Task()`.
+// Producing a result-bearing `Task<T>` — once thought to need the def-shape `Task`1<!0>` return to
+// bind against a concrete `Task<T>` local, which the WF-9 nested-generic-binding fix later made
+// possible — is implemented further down; see `tcs_get_task`/`future_to_task`.
 
 // ---- Task → Future: `.await` a .NET Task<T> ----------------------------------------------------
 
@@ -175,13 +185,21 @@ fn task_result<T>(t: TaskT<T>) -> T {
 /// for a *successful* completion; a faulted/canceled Task resolves to a panic via [`task_result`]'s
 /// managed throw — matching how `.await` on a faulted Task surfaces in C# (an exception at the await).
 pub struct TaskFuture<T> {
-    task: TaskT<T>,
+    // Held via `GenericClass` (a `GCHandle`-backed value type — see the module docs above), NOT the
+    // raw `TaskT<T>` handle directly: `TaskFuture` is a plain struct (not a coroutine), so a raw gcref
+    // field here is fine on its own, but `TaskFuture` values themselves get boxed and suspended inside
+    // OTHER coroutines' saved state (e.g. `RecvFuture` in `crate::sync`, or any `async fn` that awaits
+    // through `await_task`) — see `docs/…` / the `layout_check` note above. Wrapping the handle here
+    // once means every caller gets the safety for free instead of having to know to re-wrap it.
+    task: crate::class::GenericClass<{ CORELIB }, { TASK_GEN }, (T,)>,
 }
 
 impl<T> Future for TaskFuture<T> {
     type Output = T;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
-        let task = self.task;
+        // SAFETY: the naked ref is used transiently within this call only (passed straight to the
+        // two call wrappers below), never stored — satisfies `get_naked_ref`'s contract.
+        let task = unsafe { self.task.get_naked_ref() };
         if task_is_completed(task) {
             Poll::Ready(task_result(task))
         } else {
@@ -197,20 +215,22 @@ impl<T> TaskFuture<T> {
     /// Wrap a managed `Task<T>` handle directly.
     #[inline]
     pub fn new(task: TaskT<T>) -> Self {
-        Self { task }
+        Self { task: crate::class::GenericClass::from_naked_ref(task) }
     }
 
     /// `true` if the wrapped Task faulted (ended by throwing). Useful to check before `.await` if you
     /// want to avoid the managed exception surfacing.
     #[inline]
     pub fn is_faulted(&self) -> bool {
-        task_is_faulted(self.task)
+        // SAFETY: transient use only, see `poll` above.
+        task_is_faulted(unsafe { self.task.get_naked_ref() })
     }
 
     /// `true` if the wrapped Task was canceled.
     #[inline]
     pub fn is_canceled(&self) -> bool {
-        task_is_canceled(self.task)
+        // SAFETY: transient use only, see `poll` above.
+        task_is_canceled(unsafe { self.task.get_naked_ref() })
     }
 }
 
@@ -298,13 +318,20 @@ impl Task {
 /// polling model as [`TaskFuture`]). A plain struct (not a coroutine), so holding the managed `Task`
 /// handle here is fine.
 pub struct TaskUnitFuture {
-    task: Task,
+    // Held via `Class` (a `GCHandle`-backed value type), not a raw `Task`/`RawTask` — same rationale
+    // as `TaskFuture<T>` above: `TaskUnitFuture` values get boxed and suspended inside other
+    // coroutines' saved state (any `async fn` awaiting through `await_unit`), so the raw managed
+    // reference must not live in this struct.
+    task: crate::class::Class<{ CORELIB }, { TASK_GEN }>,
 }
 
 impl Future for TaskUnitFuture {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.task.is_completed() {
+        // SAFETY: the naked ref is used transiently within this call only, via `Task::from_raw` +
+        // `is_completed`, never stored — satisfies `get_naked_ref`'s contract.
+        let task = Task::from_raw(unsafe { self.task.get_naked_ref() });
+        if task.is_completed() {
             Poll::Ready(())
         } else {
             cx.waker().wake_by_ref();
@@ -317,7 +344,7 @@ impl TaskUnitFuture {
     /// Wrap a non-generic managed [`Task`].
     #[inline]
     pub fn new(task: Task) -> Self {
-        Self { task }
+        Self { task: crate::class::Class::from_naked_ref(task.raw()) }
     }
 }
 
@@ -367,8 +394,7 @@ pub fn block_on<F: Future>(fut: F) -> F::Output {
 ///
 /// Uses the **non-generic** `System.Threading.Tasks.TaskCompletionSource` (whose `Task` property
 /// returns a non-generic `Task`), so it involves no generic-return handling and is fully supported.
-/// The result-bearing counterpart (`async fn -> T` ⇒ `Task<T>`) needs a `Task<T>` *producer*, which is
-/// currently walled — see the module docs.
+/// The result-bearing counterpart (`async fn -> T` ⇒ `Task<T>`) is [`future_to_task`], below.
 pub fn future_to_task_unit<F>(fut: F) -> Task
 where
     F: Future<Output = ()>,

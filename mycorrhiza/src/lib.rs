@@ -37,6 +37,12 @@
 //! - [`linq`] — builds `System.Linq.Expressions` trees, the shape `IQueryable`/EF Core consumes, so
 //!   Rust code can construct real LINQ predicates and queries.
 //!
+//! **Dynamic reflection**
+//! - [`dynamic`] — the `unsafe` late-bound escape hatch: call a `.NET` method whose
+//!   `(assembly, type, method, args)` isn't known until runtime, via `System.Reflection`. Everything
+//!   else in this crate is static binding; reach for this only when the target truly can't be known
+//!   at Rust-compile time.
+//!
 //! **Async / task bridge**
 //! - [`task`] — `.await` a .NET `Task`/`Task<T>` from Rust, and expose a Rust `async fn` as a .NET
 //!   `Task`/`Task<T>` in return; see [`task::await_task`] / [`task::future_to_task`] for the two
@@ -92,6 +98,11 @@ pub mod collections;
 /// [`intrinsics::rustc_clr_interop_delegate`] magic fn + the WF-9 generic bridge; no CLR-interop
 /// knowledge required at the call site.
 pub mod delegate;
+/// Raw dynamic (late-bound) reflection invoke -- call a `.NET` method whose
+/// `(assembly, type, method, args)` isn't known until runtime, via `System.Reflection`. See
+/// [`dynamic::invoke_dynamic1`] / [`dynamic::invoke_dynamic1_checked`] (and their 0/2/3/4-arity
+/// siblings) and the module docs for the `unsafe` contract.
+pub mod dynamic;
 /// The reusable C#→Rust generic container: [`export_rust_containers!`] emits a size-erased byte
 /// vector into your `cdylib`, backing the shipped C# `RustDotnet.RustVec<T>` / `RustBoxVec<T>`.
 pub mod containers;

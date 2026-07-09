@@ -186,6 +186,38 @@ impl<'a, T> Span<'a, T> {
             false
         }
     }
+    /// The element at `i`, **without** the bounds check [`get`](Self::get) performs.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee `0 <= i < self.len()`. This mirrors `std::slice::get_unchecked`,
+    /// but the stakes are the same as that method's, not weaker: the read goes through the byref
+    /// `Span<T>` indexer (`get_Item(int) -> ref T`, taken as a raw pointer and dereferenced), and the
+    /// backing memory is *not necessarily* a Rust-owned allocation — a `Span` can also view .NET-owned
+    /// or pinned memory depending on how it was constructed. An out-of-bounds `i` therefore reads past
+    /// the end of whatever buffer actually backs this span (Rust or .NET), which is real undefined
+    /// behavior — the .NET runtime's own bounds check is exactly what this method skips, so nothing
+    /// downstream catches an out-of-range index for you. Only use this once the index is proven
+    /// in-bounds by construction (e.g. the loop bound is `self.len()` itself), for the redundant-check
+    /// perf win `std::slice`'s own `get_unchecked` exists for.
+    pub unsafe fn get_unchecked(&self, i: i32) -> T
+    where
+        T: Copy,
+    {
+        *span_get_ref::<T>(&self.handle(), i)
+    }
+    /// Overwrite the element at `i`, **without** the bounds check [`set`](Self::set) performs.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee `0 <= i < self.len()`. See [`get_unchecked`](Self::get_unchecked) for
+    /// why this is genuine memory-unsafety (not just a framework-level footgun): an out-of-bounds `i`
+    /// writes past the end of whatever buffer backs this span — Rust-owned or .NET-owned/pinned — via
+    /// the raw byref indexer pointer, with no bounds check anywhere in the path. Mirrors
+    /// `std::slice::get_unchecked_mut`.
+    pub unsafe fn set_unchecked(&mut self, i: i32, value: T) {
+        *span_get_ref::<T>(&self.handle(), i) = value;
+    }
     /// A sub-span `[start, start + len)` of this span, still viewing the same underlying Rust memory
     /// (`Span<T>.Slice(int, int)`, zero-copy — writes through the sub-span are visible in the original
     /// buffer and vice versa). Panics (via the .NET `Slice` bounds check surfacing as a managed

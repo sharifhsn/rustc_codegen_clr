@@ -31,7 +31,20 @@ macro_rules! diverge {
     }};
 }
 
-/// Begin a new managed class `NAME : [INHERITS_ASM]INHERITS` (`IS_VALUETYPE` selects struct vs class).
+/// Begin a new managed class `NAME : [INHERITS_ASM]INHERITS` (`IS_VALUETYPE` selects struct vs
+/// class).
+///
+/// `HAS_TYPE_KIND_OPINION` distinguishes an AUTHORITATIVE `IS_VALUETYPE` (from `#[dotnet_class]`'s
+/// own `value_type = ...` attribute, or `#[dotnet_interface]`'s always-`false`) from a re-opening
+/// entrypoint that has NO real opinion (`#[dotnet_methods]`'s impl-block entrypoint has no access
+/// to the original struct's `value_type` attribute — same reasoning as `INHERITS` being emptyable
+/// for "no opinion" on the base class; a bare `bool` has no null value, so this needs its own
+/// flag). The backend's `finish_type` looks up an existing class BY NAME ALONE (never by an
+/// is_valuetype-baked `ClassRef`) precisely so a no-opinion `IS_VALUETYPE=false` placeholder from a
+/// re-opening entrypoint can never desync the lookup key from a `value_type = true` class's real
+/// identity and silently register a second, phantom same-named `ClassDef` — see
+/// `cilly::ir::class::ClassDef::set_is_valuetype`'s doc for the exact hazard this mirrors
+/// (`set_extends`'s sibling).
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_codegen_clr_new_typedef<
@@ -39,6 +52,7 @@ pub fn rustc_codegen_clr_new_typedef<
     const IS_VALUETYPE: bool,
     const INHERITS_ASM: &'static str,
     const INHERITS: &'static str,
+    const HAS_TYPE_KIND_OPINION: bool,
 >() -> ClassDef {
     diverge!()
 }
@@ -166,6 +180,27 @@ pub fn rustc_codegen_clr_add_field_setters(class: ClassDef) -> ClassDef {
     diverge!()
 }
 
+/// Request that each declared field also gets a `get_<Field>`/`set_<Field>` accessor pair linked
+/// into a real `.NET` property (§II.22.34 `Property` + `SpecialName` + `MethodSemantics` — the same
+/// shape [`rustc_codegen_clr_mark_last_abstract_property_get`]/`_set` build for an interface, but for
+/// an ordinary field-backed concrete class): reflection-based consumers that specifically scan
+/// `Type.GetProperties()` (e.g. EF Core's default entity-type discovery convention, which needs a
+/// genuine `PropertyInfo` to map a column) see a real property, not just a same-shaped pair of
+/// ordinary methods. The property name is the field name, capitalized (`id` -> `Id`).
+///
+/// Deliberately a SEPARATE opt-in from [`rustc_codegen_clr_add_field_setters`], not a variant of it:
+/// once a method is linked as a property accessor via `MethodSemantics`, C#/Roslyn REJECTS
+/// explicitly calling it by name (`CS0571: cannot explicitly call operator or accessor`) — so a
+/// class whose `read_<field>`/`set_<field>` accessors existing consumers already call explicitly
+/// (e.g. `cd_typedef`'s `Counter`) must keep using `add_field_setters` alone; this intrinsic instead
+/// emits its own `get_<Field>`/`set_<Field>` pair, distinct methods a caller reaches only through
+/// the property (`widget.Id`, not `widget.get_Id()`). (The backend synthesizes the bodies.)
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_codegen_clr_add_field_properties(class: ClassDef) -> ClassDef {
+    diverge!()
+}
+
 /// Declare that this class implements the managed interface `[IFACE_ASM]IFACE` (an `implements` clause).
 /// The class must expose a public virtual method matching each interface member by name+signature —
 /// those are the ordinary `rustc_codegen_clr_add_method_def` aliases — and CLR binds them implicitly,
@@ -212,6 +247,30 @@ pub fn rustc_codegen_clr_add_generic_interface_impl<
 >(
     class: ClassDef,
 ) -> ClassDef {
+    diverge!()
+}
+
+/// Attach one general ECMA-335 `CustomAttribute` (§II.21/§II.23.3) to the class-under-construction
+/// — the general mechanism `#[dotnet_class(attr(...))]` lowers to, one call per attribute. `SPEC`
+/// is a single encoded string (built by the `dotnet_macros` proc-macro at compile time — never
+/// hand-written) carrying the attribute type reference, positional constructor args, and named
+/// property args in one packed field, using ASCII control-character delimiters (`\x1E` record
+/// separator between top-level fields, `\x1D` group separator between list items, `\x1C` between a
+/// named arg's name and value) — chosen specifically because they can never appear in ordinary
+/// source text, so no escaping is needed; `dotnet_macros` rejects any literal that contains one.
+/// Each arg is tagged `s:`/`b:`/`i:`/`l:` (string/bool/i32/i64) — see `src/comptime.rs`'s decoder
+/// for the authoritative format. This indirection (one packed `&'static str` instead of N
+/// differently-shaped const generics) exists because a single intrinsic's generic arity is fixed,
+/// but a real attribute can carry any number of args of any of these types.
+///
+/// A denylisted attribute TYPE (one CoreCLR's own loader/JIT treats as runtime-semantic — layout
+/// or calling-convention affecting, e.g. `InlineArrayAttribute`, `UnmanagedCallersOnlyAttribute`,
+/// `StructLayoutAttribute` — see `dotnet_macros`' `ATTR_DENYLIST`) is rejected as a Rust COMPILE
+/// error by `#[dotnet_class]` itself, before this intrinsic is ever emitted; the backend
+/// interpreter re-checks the same denylist as defense-in-depth (`src/comptime.rs`).
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_codegen_clr_add_custom_attr<const SPEC: &'static str>(class: ClassDef) -> ClassDef {
     diverge!()
 }
 
