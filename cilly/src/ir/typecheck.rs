@@ -15,6 +15,16 @@ pub enum TypeCheckError {
     InvalidExceptionRegion {
         reason: String,
     },
+    /// A local load references a slot outside the method's local table.
+    LocalOutOfRange {
+        local: u32,
+        locals: usize,
+    },
+    /// An argument load references a slot outside the method signature.
+    ArgumentOutOfRange {
+        argument: u32,
+        inputs: usize,
+    },
     /// CIL contains a binop with incorrect arguments
     WrongBinopArgs {
         /// The type of the left argument of this op
@@ -733,10 +743,37 @@ impl CILNode {
                     }),
                 }
             }
-            CILNode::LdLoc(loc) => Ok(asm[locals[*loc as usize].1]),
-            CILNode::LdLocA(loc) => Ok(asm.nref(asm[locals[*loc as usize].1])),
-            CILNode::LdArg(arg) => Ok(asm[sig].inputs()[*arg as usize]),
-            CILNode::LdArgA(arg) => Ok(asm.nref(asm[sig].inputs()[*arg as usize])),
+            CILNode::LdLoc(loc) => locals
+                .get(*loc as usize)
+                .map(|local| asm[local.1])
+                .ok_or(TypeCheckError::LocalOutOfRange {
+                    local: *loc,
+                    locals: locals.len(),
+                }),
+            CILNode::LdLocA(loc) => locals
+                .get(*loc as usize)
+                .map(|local| asm.nref(asm[local.1]))
+                .ok_or(TypeCheckError::LocalOutOfRange {
+                    local: *loc,
+                    locals: locals.len(),
+                }),
+            CILNode::LdArg(arg) => asm[sig]
+                .inputs()
+                .get(*arg as usize)
+                .copied()
+                .ok_or(TypeCheckError::ArgumentOutOfRange {
+                    argument: *arg,
+                    inputs: asm[sig].inputs().len(),
+                }),
+            CILNode::LdArgA(arg) => asm[sig]
+                .inputs()
+                .get(*arg as usize)
+                .copied()
+                .map(|input| asm.nref(input))
+                .ok_or(TypeCheckError::ArgumentOutOfRange {
+                    argument: *arg,
+                    inputs: asm[sig].inputs().len(),
+                }),
             CILNode::Call(call_info) => {
                 let (mref, args, _is_pure) = call_info.as_ref();
                 let mref = asm[*mref].clone();
@@ -1523,6 +1560,34 @@ mod tc_tests {
             ),
             "storing an f64 into a usize local must be rejected"
         );
+    }
+
+    #[test]
+    fn out_of_range_local_load_is_a_structured_error() {
+        let mut asm = Assembly::default();
+        let sig = asm.sig([], Type::Void);
+        let error = CILNode::LdLoc(0).typecheck(sig, &[], &mut asm).unwrap_err();
+        assert!(matches!(
+            error,
+            TypeCheckError::LocalOutOfRange {
+                local: 0,
+                locals: 0,
+            }
+        ));
+    }
+
+    #[test]
+    fn out_of_range_argument_load_is_a_structured_error() {
+        let mut asm = Assembly::default();
+        let sig = asm.sig([Type::Int(Int::U8)], Type::Void);
+        let error = CILNode::LdArg(1).typecheck(sig, &[], &mut asm).unwrap_err();
+        assert!(matches!(
+            error,
+            TypeCheckError::ArgumentOutOfRange {
+                argument: 1,
+                inputs: 1,
+            }
+        ));
     }
 
     /// Build a single-`StInd` root storing `value` (a pre-allocated node) through an address local

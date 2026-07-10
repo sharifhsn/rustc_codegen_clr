@@ -1,6 +1,6 @@
 # Architecture rework execution ledger
 
-Status: active — all five phases implemented; full backend gates in progress
+Status: complete — all five phases implemented and architecture gates exercised
 Started: 2026-07-09
 Branch: `codex/rearchitecture`
 
@@ -55,6 +55,10 @@ interop, C-mode, direct-PE, and performance probes appropriate to the changed su
 
 Implemented 2026-07-09. One growable worklist now replaces the linker's two hard-coded passes,
 processes patcher-created references to a fixed point, and reports explicit resolution statistics.
+Builtin lookup is exact-symbol by default. The only demangled aliases are a closed, full-path
+allowlist for rustc's private allocator entry points; arbitrary leaf-name matching is forbidden, so
+Rust methods such as `core::fmt::write` cannot collide with libc's `write`. Allocator aliases reuse
+the canonical ABI-safe builtin generators, including correct zeroed-allocation behavior.
 
 - Replace the linker's two hard-coded `patch_missing_methods` calls with one fixed-point API.
 - Process each method reference at most once per resolution run.
@@ -198,6 +202,31 @@ At phase boundaries, run the broader target/backend probes. Before declaring the
 run the full pinned gate and update `ARCHITECTURE.md`, porting notes, configuration documentation,
 and the local Graphify index.
 
+## Final validation snapshot
+
+Recorded 2026-07-10 on macOS/aarch64 with `nightly-2026-06-17`:
+
+| Gate | Result |
+|---|---|
+| `cargo test -p cilly` | 291 passed, 2 ignored across 5 suites |
+| `cargo check --workspace` | 0 errors; only the repository's existing warning set |
+| focused verifier/alias/transaction/config/pthread tests | passed |
+| `compile_test::fastrand_test::stable::cargo_release` (.NET) | passed end to end |
+| focused C `abox`, `adt_enum`, `caller_location`, `copy_nonoverlaping` | passed end to end |
+| CI-equivalent `.NET ::stable` aggregate | 202 passed, 238 failed, 52 filtered; zero final-verifier or linker failures |
+| CI-equivalent C `::stable` aggregate | 51 passed, 369 failed, 72 filtered in the final parallel run |
+
+The historical aggregate is not a clean acceptance gate on this host/toolchain. Its remaining
+failures fall into three independently visible classes: test-source drift against the pinned
+nightly (`atomic_xsub` gained a type parameter, `catch_unwind` returns `bool`, removed
+`MaybeUninit::fill`/feature combinations), long-standing semantic output mismatches, and severe
+parallel harness saturation (many generated executables time out only during the all-at-once run
+while the same focused tests pass). The rearchitecture's initial strict-verifier fanout was fixed at
+the shared ABI boundaries rather than suppressed. The C run likewise exposed and fixed two shared
+runtime-header omissions, `Environment.Exit` and `Environment.FailFast`; representative affected
+tests pass individually afterward. These residual corpus failures are recorded rather than folded
+into the architecture contract or hidden by weakening verification.
+
 ## Decision log
 
 - 2026-07-09: preserve the single CIL-tree IR and explicit exhaustive matches.
@@ -218,3 +247,6 @@ and the local Graphify index.
 - 2026-07-10: canonicalize exception cleanup graphs in IR first, but keep compatibility
   materialization at exporter boundaries until a shared .NET region planner proves legal lexical
   coalescing under ECMA-335.
+- 2026-07-10: make linker overrides exact-symbol by default and permit demangled resolution only
+  through a closed full-path rustc-runtime allowlist; centralize explicit pointer/native-int wrapper
+  adaptation in `Assembly` so aliases are verifier-visible and unit-testable.

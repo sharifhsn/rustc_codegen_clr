@@ -13,11 +13,35 @@ use fxhash::{hash64, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::{any::type_name, ops::Index};
 
-/// Maps a method name to a closure that synthesizes its `MethodImpl` on demand. Populated
+/// Maps an exact emitted method symbol to a closure that synthesizes its `MethodImpl` on demand. Populated
 /// and consumed at link time (not codegen time) by the `linker` binary (`bin/linker/patch.rs`)
 /// to fill in libc/intrinsic shims referenced but never defined by rustc-generated code.
 pub type MissingMethodPatcher =
     FxHashMap<Interned<IString>, Box<dyn Fn(Interned<MethodRef>, &mut Assembly) -> MethodImpl>>;
+
+/// Maps rustc's private, mangled allocator entry points onto the canonical
+/// linker builtins. This is deliberately a closed allowlist over the complete
+/// demangled path: generic "last path segment" matching made unrelated Rust
+/// functions such as `core::fmt::write` collide with libc shims.
+fn rustc_runtime_builtin_alias(emitted_symbol: &str) -> Option<&'static str> {
+    match format!("{:#}", rustc_demangle::demangle(emitted_symbol)).as_str() {
+        "__rustc::__rust_alloc" => Some("__rust_alloc"),
+        "__rustc::__rust_alloc_zeroed" => Some("__rust_alloc_zeroed"),
+        "__rustc::__rust_dealloc" => Some("__rust_dealloc"),
+        "__rustc::__rust_realloc" => Some("__rust_realloc"),
+        _ => None,
+    }
+}
+
+fn is_rustc_no_alloc_marker(emitted_symbol: &str) -> bool {
+    matches!(
+        format!("{:#}", rustc_demangle::demangle(emitted_symbol)).as_str(),
+        "__rustc::__rust_no_alloc_shim_is_unstable"
+            | "__rustc::__rust_no_alloc_shim_is_unstable_v2"
+            | "__rust_no_alloc_shim_is_unstable"
+            | "__rust_no_alloc_shim_is_unstable_v2"
+    )
+}
 
 /// Summary of one fixed-point missing-method resolution pass.
 ///
@@ -1438,9 +1462,17 @@ impl Assembly {
                     );
                 }
             }
-            let name = rustc_demangle::demangle(&self[mref.name()]).to_string();
-            let name = self.alloc_string(name.split("::").last().unwrap());
-            if let Some(overrider) = override_methods.get(&name) {
+            // Patch exact linker symbols, plus the closed rustc-runtime alias set above. Matching
+            // arbitrary demangled leaf names is forbidden: `core::fmt::write` must never resolve
+            // to the POSIX `write` builtin merely because both end in the same word.
+            let emitted_name = self[mref.name()].to_string();
+            let runtime_alias = rustc_runtime_builtin_alias(&emitted_name);
+            let override_key = if override_methods.contains_key(&mref.name()) {
+                Some(mref.name())
+            } else {
+                runtime_alias.map(|name| self.alloc_string(name))
+            };
+            if let Some(overrider) = override_key.and_then(|key| override_methods.get(&key)) {
                 let mref = mref.clone();
                 let implementation = overrider(mref_idx, self);
                 // `Access::Public`, not `Private`: these patched helpers live on `MainModule`
@@ -1451,6 +1483,9 @@ impl Assembly {
                 // culled; intra-class callers (the `::stable` executables) are unaffected.
                 self.new_method(mref.into_def(implementation, Access::Public, self));
                 stats.overrides_applied += 1;
+                if runtime_alias.is_some() {
+                    stats.allocator_shims_synthesized += 1;
+                }
                 continue;
             }
 
@@ -1486,20 +1521,13 @@ impl Assembly {
             let arg_names = (0..(self[mref.sig()].inputs().len()))
                 .map(|_| None)
                 .collect();
-            let name = &self[mref.name()];
-            let is_alloc =
-                name.contains("__rust_alloc") && !name.contains("__rust_alloc_error_handler");
             // `__rust_no_alloc_shim_is_unstable[_v2]` is a marker the alloc shim references purely to
             // keep the global allocator symbols linked; it has no effect. Recent rustc emits it as a
             // (mangled) *function* call rather than the old `u8` static, so provide a no-op body
             // (a bare return) — otherwise it resolves to `MethodImpl::Missing` and throws at runtime
             // (`box_new_uninit` -> alloc -> missing method) the moment anything allocates.
-            let is_noalloc_shim = name.contains("__rust_no_alloc_shim_is_unstable");
-            let imp = if is_alloc {
-                let alloc = MethodRef::aligned_alloc(self);
-                stats.allocator_shims_synthesized += 1;
-                MethodImpl::wrapper(self.alloc_methodref(alloc), &mref, self)
-            } else if is_noalloc_shim {
+            let is_noalloc_shim = is_rustc_no_alloc_marker(&emitted_name);
+            let imp = if is_noalloc_shim {
                 stats.no_alloc_shims_synthesized += 1;
                 MethodImpl::MethodBody {
                     blocks: vec![super::BasicBlock::new(
@@ -2019,6 +2047,135 @@ impl Assembly {
         let mref = self.new_methodref(main_module, "transmute", sig, MethodKind::Static, vec![]);
         self.call(mref, &[val], IsPure::PURE)
     }
+
+    /// Adapts one wrapper argument from its emitted signature to the signature
+    /// of the method it delegates to. All permitted conversions are explicit
+    /// in the IR so final verification sees the same types the exporter will.
+    pub fn adapt_call_argument(
+        &mut self,
+        argument: u32,
+        source: Type,
+        target: Type,
+    ) -> Interned<CILNode> {
+        if source == target {
+            return self.alloc_node(CILNode::LdArg(argument));
+        }
+
+        match (target, source) {
+            (
+                Type::Ptr(_) | Type::Int(Int::ISize | Int::USize) | Type::FnPtr(_),
+                Type::ClassRef(_),
+            ) => {
+                let address = self.alloc_node(CILNode::LdArgA(argument));
+                let target = self.alloc_type(target);
+                let address =
+                    self.alloc_node(CILNode::PtrCast(address, Box::new(PtrCastRes::Ptr(target))));
+                self.alloc_node(CILNode::LdInd {
+                    addr: address,
+                    tpe: target,
+                    volatile: false,
+                })
+            }
+            (
+                Type::Ptr(_) | Type::Int(Int::ISize | Int::USize),
+                Type::Int(Int::U64),
+            ) => {
+                let input = self.alloc_node(CILNode::LdArg(argument));
+                self.alloc_node(CILNode::IntCast {
+                    input,
+                    target: Int::USize,
+                    extend: ExtendKind::ZeroExtend,
+                })
+            }
+            (
+                Type::Int(target @ (Int::ISize | Int::USize)),
+                Type::Int(Int::ISize | Int::USize),
+            ) => {
+                let input = self.alloc_node(CILNode::LdArg(argument));
+                self.alloc_node(CILNode::IntCast {
+                    input,
+                    target,
+                    extend: ExtendKind::ZeroExtend,
+                })
+            }
+            (
+                Type::Ptr(target),
+                Type::Ptr(_) | Type::Int(Int::ISize | Int::USize) | Type::FnPtr(_),
+            ) => {
+                let input = self.alloc_node(CILNode::LdArg(argument));
+                self.alloc_node(CILNode::PtrCast(input, Box::new(PtrCastRes::Ptr(target))))
+            }
+            (
+                Type::FnPtr(target),
+                Type::Ptr(_) | Type::Int(Int::ISize | Int::USize) | Type::FnPtr(_),
+            ) => {
+                let input = self.alloc_node(CILNode::LdArg(argument));
+                self.alloc_node(CILNode::PtrCast(
+                    input,
+                    Box::new(PtrCastRes::FnPtr(target)),
+                ))
+            }
+            (
+                Type::Int(target @ (Int::ISize | Int::USize)),
+                Type::Ptr(_) | Type::FnPtr(_),
+            ) => {
+                let input = self.alloc_node(CILNode::LdArg(argument));
+                self.alloc_node(CILNode::IntCast {
+                    input,
+                    target,
+                    extend: ExtendKind::ZeroExtend,
+                })
+            }
+            (Type::Int(Int::I64), Type::Int(Int::U64)) => {
+                self.alloc_node(CILNode::LdArg(argument))
+            }
+            _ => panic!(
+                "cannot adapt wrapper argument {argument} from {source:?} to {target:?}"
+            ),
+        }
+    }
+
+    /// Adapts a delegated call's result back to the wrapper's emitted return
+    /// type. This is the return-side counterpart of [`Self::adapt_call_argument`].
+    pub fn adapt_call_result(
+        &mut self,
+        value: Interned<CILNode>,
+        source: Type,
+        target: Type,
+    ) -> Interned<CILNode> {
+        if source == target {
+            return value;
+        }
+
+        match (target, source) {
+            (
+                Type::Ptr(target),
+                Type::Ptr(_) | Type::Int(Int::ISize | Int::USize) | Type::FnPtr(_),
+            ) => self.alloc_node(CILNode::PtrCast(
+                value,
+                Box::new(PtrCastRes::Ptr(target)),
+            )),
+            (
+                Type::FnPtr(target),
+                Type::Ptr(_) | Type::Int(Int::ISize | Int::USize) | Type::FnPtr(_),
+            ) => self.alloc_node(CILNode::PtrCast(
+                value,
+                Box::new(PtrCastRes::FnPtr(target)),
+            )),
+            (
+                Type::Int(target @ (Int::ISize | Int::USize)),
+                Type::Ptr(_) | Type::FnPtr(_),
+            ) => self.alloc_node(CILNode::IntCast {
+                input: value,
+                target,
+                extend: ExtendKind::ZeroExtend,
+            }),
+            (Type::Int(Int::I64), Type::Int(Int::U64))
+            | (Type::Int(Int::U64), Type::Int(Int::I64)) => value,
+            _ => panic!("cannot adapt wrapper return from {source:?} to {target:?}"),
+        }
+    }
+
     /// Returns a reference to a `static` method of the assembly's main module
     /// (the synthetic `RustModule` class that holds the backend's builtins),
     /// with the given `name`, parameter types `inputs`, and return type `output`.
@@ -3094,6 +3251,82 @@ fn missing_method_resolution_reaches_fixed_point() {
         asm[asm.method_ref_to_def(first).unwrap()].implementation(),
         MethodImpl::MethodBody { .. }
     ));
+}
+
+#[test]
+fn missing_method_resolution_only_aliases_allowlisted_rustc_runtime_symbols() {
+    fn void_body(asm: &mut Assembly) -> MethodImpl {
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(
+                vec![asm.alloc_root(CILRoot::VoidRet)],
+                0,
+                None,
+            )],
+            locals: vec![],
+        }
+    }
+
+    let mut asm = Assembly::default();
+    let mangled_alloc = "_RNvCsk5I9pfA249o_7___rustc12___rust_alloc";
+    assert_eq!(
+        rustc_runtime_builtin_alias(mangled_alloc),
+        Some("__rust_alloc"),
+        "unexpected demangling: {}",
+        rustc_demangle::demangle(mangled_alloc)
+    );
+    let alloc_ref = Interned::<MethodRef>::builtin(&mut asm, mangled_alloc, &[], Type::Void);
+    let posix_write = Interned::<MethodRef>::builtin(&mut asm, "write", &[], Type::Void);
+    let rust_write =
+        Interned::<MethodRef>::builtin(&mut asm, "core::fmt::write", &[], Type::Void);
+
+    let alloc_name = asm.alloc_string("__rust_alloc");
+    let write_name = asm.alloc_string("write");
+    let mut overrides = MissingMethodPatcher::default();
+    overrides.insert(alloc_name, Box::new(|_, asm| void_body(asm)));
+    overrides.insert(write_name, Box::new(|_, asm| void_body(asm)));
+
+    let stats = asm.resolve_missing_methods(
+        &FxHashMap::default(),
+        &FxHashSet::default(),
+        &overrides,
+    );
+
+    assert_eq!(stats.overrides_applied, 2);
+    assert_eq!(stats.allocator_shims_synthesized, 1);
+    assert!(matches!(
+        asm[asm.method_ref_to_def(alloc_ref).unwrap()].implementation(),
+        MethodImpl::MethodBody { .. }
+    ));
+    assert!(matches!(
+        asm[asm.method_ref_to_def(posix_write).unwrap()].implementation(),
+        MethodImpl::MethodBody { .. }
+    ));
+    assert!(matches!(
+        asm[asm.method_ref_to_def(rust_write).unwrap()].implementation(),
+        MethodImpl::Missing
+    ));
+}
+
+#[test]
+fn call_alias_adapter_explicitly_converts_pointer_and_native_int_boundaries() {
+    let mut asm = Assembly::default();
+    let void_ptr = asm.nptr(Type::Void);
+    let sig = asm.sig([void_ptr], void_ptr);
+
+    let argument = asm.adapt_call_argument(0, void_ptr, Type::Int(Int::USize));
+    let argument = asm[argument].clone();
+    assert_eq!(
+        argument.typecheck(sig, &[], &mut asm).unwrap(),
+        Type::Int(Int::USize)
+    );
+
+    let native_int = asm.alloc_node(Const::USize(1));
+    let result = asm.adapt_call_result(native_int, Type::Int(Int::USize), void_ptr);
+    let result = asm[result].clone();
+    assert_eq!(
+        result.typecheck(sig, &[], &mut asm).unwrap(),
+        void_ptr
+    );
 }
 
 #[test]

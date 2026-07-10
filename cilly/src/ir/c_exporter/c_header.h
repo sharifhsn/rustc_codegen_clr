@@ -853,6 +853,11 @@ extern int argc;
 extern char **argv;
 #endif
 static inline char **System_Environment_GetCommandLineArgsa1st() { return argv; }
+static inline void System_Environment_Exiti32v(int32_t code) { exit(code); }
+static inline void System_Environment_FailFaststv(const char *message) {
+    (void)message;
+    abort();
+}
 static inline uintptr_t ld_len(void *arr)
 {
     void **elem = (void **)arr;

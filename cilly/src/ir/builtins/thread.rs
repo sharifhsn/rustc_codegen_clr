@@ -56,7 +56,15 @@ fn handle_to_obj(asm: &mut Assembly, _: &mut MissingMethodPatcher) {
 fn insert_pthread_attr_setstacksize(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("pthread_attr_setstacksize");
     let generator = move |_, asm: &mut Assembly| {
+        // libc spells `size_t` as `u64` on some hosts while the backend's
+        // pointer-width scalar is `usize`; make that ABI equivalence explicit
+        // before storing through the pthread-attribute buffer.
         let ldarg_1 = asm.alloc_node(CILNode::LdArg(1));
+        let ldarg_1 = asm.alloc_node(CILNode::IntCast {
+            input: ldarg_1,
+            target: Int::USize,
+            extend: ExtendKind::ZeroExtend,
+        });
 
         let three = asm.alloc_node(Const::I32(2));
         let usize_tpe = asm.alloc_type(Int::USize);
@@ -197,10 +205,11 @@ fn insert_pthread_join(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
             .virtual_mref(&[], Type::Void, join, asm);
         let join = asm.alloc_root(CILRoot::call(join, [joined_thread]));
         // Check if result_ptr == null. If so, jump to ret.
+        let result_ptr_word = asm.cast_ptr_to(result_ptr, Type::Int(Int::USize));
         let check_res_nonnull = asm.alloc_root(CILRoot::Branch(Box::new((
             1,
             0,
-            Some(BranchCond::False(result_ptr)),
+            Some(BranchCond::False(result_ptr_word)),
         ))));
         // Get the thread result from the thread result dictionary, and set (*result_ptr) = thread_res.
         let thread_id = asm.alloc_string("get_ManagedThreadId");
@@ -348,7 +357,6 @@ fn insert_pthread_create(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
         let const_0 = asm.alloc_node(Const::I32(0));
         let ret = asm.alloc_root(CILRoot::Ret(const_0));
         let thread_type = asm.alloc_type(Type::ClassRef(thread_type));
-        let unmanaged_thread_start = asm.alloc_class_ref(unmanaged_thread_start);
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(
                 vec![
@@ -365,7 +373,7 @@ fn insert_pthread_create(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             )],
             locals: vec![
                 (None, thread_type),
-                (None, asm.alloc_type(Type::ClassRef(unmanaged_thread_start))),
+                (None, thread_start_type),
                 (None, start_fn_ptr_type),
             ],
         }

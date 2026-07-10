@@ -5,11 +5,11 @@ use super::{
     asm_link::{RelocateCtx, RelocateValue},
     basic_block::BlockId,
     bimap::Interned,
-    cilnode::{IsPure, MethodKind},
+    cilnode::MethodKind,
     class::ClassDefIdx,
     Access, Assembly, BasicBlock, CILIterElem, CILNode, ClassRef, FnSig, Int, IntoAsmIndex, Type,
 };
-use crate::{cilnode::PtrCastRes, iter::TpeIter};
+use crate::iter::TpeIter;
 use crate::{CILRoot, IString};
 pub type LocalId = u32;
 #[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
@@ -1435,41 +1435,6 @@ impl MethodImpl {
         std::mem::swap(locals, new_locals.get_mut().unwrap());
     }
 
-    pub(crate) fn wrapper(
-        alloc: Interned<MethodRef>,
-        mref: &MethodRef,
-        asm: &mut Assembly,
-    ) -> MethodImpl {
-        let sig = asm[asm[alloc].sig()].clone();
-        let args = sig
-            .inputs()
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| asm.alloc_node(CILNode::LdArg(idx.try_into().unwrap())))
-            .collect();
-        let roots = if asm.sizeof_type(*sig.output()) == 0 {
-            let call = asm.alloc_root(CILRoot::Call(Box::new((alloc, args, IsPure::NOT))));
-            vec![call, asm.alloc_root(CILRoot::VoidRet)]
-        } else {
-            let val = asm.alloc_node(CILNode::Call(Box::new((alloc, args, IsPure::NOT))));
-            if asm[mref.sig()].output() != sig.output() {
-                match (asm[mref.sig()].output(), sig.output()) {
-                    (Type::Ptr(a), Type::Ptr(_)) => {
-                        let val =
-                            asm.alloc_node(CILNode::PtrCast(val, Box::new(PtrCastRes::Ptr(*a))));
-                        vec![asm.alloc_root(CILRoot::Ret(val))]
-                    }
-                    _ => todo!(),
-                }
-            } else {
-                vec![asm.alloc_root(CILRoot::Ret(val))]
-            }
-        };
-        MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(roots, 0, None)],
-            locals: vec![].into(),
-        }
-    }
 }
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct MethodDefIdx(pub Interned<MethodRef>);
@@ -1688,7 +1653,11 @@ fn should_hint_aggressive_inline_false_when_the_body_contains_a_call() {
         vec![].into(),
     );
     let mref = asm.alloc_methodref(mref);
-    let call_root = asm.alloc_root(CILRoot::Call(Box::new((mref, vec![].into(), IsPure::NOT))));
+    let call_root = asm.alloc_root(CILRoot::Call(Box::new((
+        mref,
+        vec![].into(),
+        crate::cilnode::IsPure::NOT,
+    ))));
     let void_ret = asm.alloc_root(CILRoot::VoidRet);
     let blocks = vec![BasicBlock::new(vec![call_root, void_ret], 0, None)];
     let mimpl = MethodImpl::MethodBody {
