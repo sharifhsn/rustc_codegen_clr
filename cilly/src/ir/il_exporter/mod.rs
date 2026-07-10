@@ -123,13 +123,18 @@ impl ILExporter {
         // a value-type sized to each distinct blob length (the Roslyn `__StaticArrayInitTypeSize`
         // idiom) and type the field with it, so ILC keeps the full blob. Consumers take `&c_X`
         // (`ldsflda`), so the field type is otherwise transparent.
-        let mut blob_sizes: Vec<usize> = asm.const_data.1.keys().map(|d| d.len().max(1)).collect();
+        let mut blob_sizes: Vec<usize> = asm
+            .const_data
+            .values()
+            .iter()
+            .map(|data| data.len().max(1))
+            .collect();
         blob_sizes.sort_unstable();
         blob_sizes.dedup();
         for n in &blob_sizes {
             writeln!(out, ".class private explicit ansi sealed '__rcl_const_blob_{n}' extends [System.Runtime]System.ValueType {{ .pack 1 .size {n} }}")?;
         }
-        for (const_data, idx) in asm.const_data.1.iter() {
+        for (idx, const_data) in asm.const_data.iter() {
             let encoded = encode(idx.inner() as u64);
             let n = const_data.len().max(1);
             let data: String = const_data.iter().map(|u| format!("{u:x} ")).collect();

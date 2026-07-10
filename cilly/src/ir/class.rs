@@ -1,4 +1,8 @@
-use super::{bimap::Interned, Assembly, Const, MethodDefIdx, MethodRef, Type};
+use super::{
+    asm_link::{RelocateCtx, RelocateValue},
+    bimap::Interned,
+    Assembly, Const, MethodDefIdx, MethodRef, Type,
+};
 use crate::Access;
 use crate::{utilis::assert_unique, IString};
 use serde::{Deserialize, Serialize};
@@ -22,9 +26,12 @@ pub enum LayoutError {
 }
 #[derive(Hash, PartialEq, Eq, Copy, Clone, Debug, Serialize, Deserialize)]
 pub struct ClassDefIdx(pub Interned<ClassRef>);
-impl ClassDefIdx {
-    pub(crate) fn from_raw(class: Interned<ClassRef>) -> ClassDefIdx {
-        ClassDefIdx(class)
+impl RelocateValue for ClassDefIdx {
+    type Output = Self;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
+        let Self(class) = self;
+        Self(ctx.class_ref(destination, class))
     }
 }
 impl Deref for ClassDefIdx {
@@ -46,6 +53,28 @@ pub struct ClassRef {
     asm: Option<Interned<IString>>,
     is_valuetype: bool,
     generics: Box<[Type]>,
+}
+
+impl RelocateValue for ClassRef {
+    type Output = Self;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
+        let Self {
+            name,
+            asm,
+            is_valuetype,
+            generics,
+        } = self;
+        Self {
+            name: ctx.string(destination, name),
+            asm: asm.map(|name| ctx.string(destination, name)),
+            is_valuetype,
+            generics: generics
+                .iter()
+                .map(|tpe| destination.translate_type(ctx, *tpe))
+                .collect(),
+        }
+    }
 }
 
 impl ClassRef {
@@ -576,6 +605,27 @@ impl PartialEq for StaticFieldDef {
             && self.is_const == other.is_const
     }
 }
+impl RelocateValue for StaticFieldDef {
+    type Output = Self;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
+        let Self {
+            tpe,
+            name,
+            is_tls,
+            default_value,
+            is_const,
+        } = self;
+        Self {
+            tpe: destination.translate_type(ctx, tpe),
+            name: ctx.string(destination, name),
+            is_tls,
+            default_value: default_value
+                .map(|value| destination.translate_const(ctx, &value)),
+            is_const,
+        }
+    }
+}
 #[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
 pub struct ClassDef {
     name: Interned<IString>,
@@ -677,6 +727,19 @@ pub enum CustomAttrArg {
     I64(i64),
 }
 
+impl RelocateValue for CustomAttrArg {
+    type Output = Self;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
+        match self {
+            Self::Str(value) => Self::Str(ctx.string(destination, value)),
+            Self::Bool(value) => Self::Bool(value),
+            Self::I32(value) => Self::I32(value),
+            Self::I64(value) => Self::I64(value),
+        }
+    }
+}
+
 /// One ECMA-335 `CustomAttribute` row (§II.22.10) attached to a type: the attribute TYPE (its
 /// `.ctor` is resolved from this at export time via the same `ClassRef`→`TypeRef`/`TypeDef`
 /// machinery `extends`/`implements` already use — see `pe_exporter::tables::class_ref_token`),
@@ -703,6 +766,33 @@ pub struct CustomAttrDef {
     attr_type: Interned<ClassRef>,
     ctor_args: Vec<CustomAttrArg>,
     named_args: Vec<(Interned<IString>, CustomAttrArg)>,
+}
+impl RelocateValue for CustomAttrDef {
+    type Output = Self;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
+        let Self {
+            attr_type,
+            ctor_args,
+            named_args,
+        } = self;
+        Self {
+            attr_type: ctx.class_ref(destination, attr_type),
+            ctor_args: ctor_args
+                .into_iter()
+                .map(|arg| arg.relocate(ctx, destination))
+                .collect(),
+            named_args: named_args
+                .into_iter()
+                .map(|(name, arg)| {
+                    (
+                        ctx.string(destination, name),
+                        arg.relocate(ctx, destination),
+                    )
+                })
+                .collect(),
+        }
+    }
 }
 impl CustomAttrDef {
     #[must_use]
@@ -754,6 +844,24 @@ pub struct EventDef {
     add: Interned<MethodRef>,
     remove: Interned<MethodRef>,
 }
+impl RelocateValue for EventDef {
+    type Output = Self;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
+        let Self {
+            name,
+            delegate,
+            add,
+            remove,
+        } = self;
+        Self {
+            name: ctx.string(destination, name),
+            delegate: destination.translate_type(ctx, delegate),
+            add: ctx.method_ref(destination, add),
+            remove: ctx.method_ref(destination, remove),
+        }
+    }
+}
 impl EventDef {
     #[must_use]
     pub fn new(
@@ -804,6 +912,24 @@ pub struct PropertyDef {
     getter: Option<Interned<MethodRef>>,
     setter: Option<Interned<MethodRef>>,
 }
+impl RelocateValue for PropertyDef {
+    type Output = Self;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
+        let Self {
+            name,
+            tpe,
+            getter,
+            setter,
+        } = self;
+        Self {
+            name: ctx.string(destination, name),
+            tpe: destination.translate_type(ctx, tpe),
+            getter: getter.map(|method| ctx.method_ref(destination, method)),
+            setter: setter.map(|method| ctx.method_ref(destination, method)),
+        }
+    }
+}
 impl PropertyDef {
     /// # Panics
     /// If BOTH accessors are `None` — a property with no accessors is malformed metadata
@@ -843,6 +969,94 @@ impl PropertyDef {
         self.setter
     }
 }
+
+/// Relocated class metadata plus the source method-definition ids that must be merged separately.
+///
+/// Methods are intentionally not installed in `definition`: special initializers can already
+/// exist in the destination and retain their established merge semantics in `asm_link`.
+pub(crate) struct RelocatedClassDef {
+    pub(crate) definition: ClassDef,
+    pub(crate) source_methods: Vec<MethodDefIdx>,
+}
+
+impl RelocateValue for ClassDef {
+    type Output = RelocatedClassDef;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self::Output {
+        let Self {
+            name,
+            is_valuetype,
+            is_valuetype_authoritative,
+            generics,
+            extends,
+            implements,
+            fields,
+            static_fields,
+            methods,
+            access,
+            explict_size,
+            align,
+            has_nonveralpping_layout,
+            is_interface,
+            events,
+            generic_names,
+            properties,
+            custom_attributes,
+        } = self;
+        let definition = Self {
+            name: ctx.string(destination, name),
+            is_valuetype,
+            is_valuetype_authoritative,
+            generics,
+            extends: extends.map(|class| ctx.class_ref(destination, class)),
+            implements: implements
+                .into_iter()
+                .map(|class| ctx.class_ref(destination, class))
+                .collect(),
+            fields: fields
+                .into_iter()
+                .map(|(tpe, name, offset)| {
+                    (
+                        destination.translate_type(ctx, tpe),
+                        ctx.string(destination, name),
+                        offset,
+                    )
+                })
+                .collect(),
+            static_fields: static_fields
+                .into_iter()
+                .map(|field| field.relocate(ctx, destination))
+                .collect(),
+            methods: Vec::new(),
+            access,
+            explict_size,
+            align,
+            has_nonveralpping_layout,
+            is_interface,
+            events: events
+                .into_iter()
+                .map(|event| event.relocate(ctx, destination))
+                .collect(),
+            generic_names: generic_names
+                .into_iter()
+                .map(|name| ctx.string(destination, name))
+                .collect(),
+            properties: properties
+                .into_iter()
+                .map(|property| property.relocate(ctx, destination))
+                .collect(),
+            custom_attributes: custom_attributes
+                .into_iter()
+                .map(|attribute| attribute.relocate(ctx, destination))
+                .collect(),
+        };
+        RelocatedClassDef {
+            definition,
+            source_methods: methods,
+        }
+    }
+}
+
 impl ClassDef {
     /// Checks if this class defition has a with the name and type.
     #[must_use]
@@ -1137,13 +1351,6 @@ impl ClassDef {
     #[must_use]
     pub fn is_valuetype(&self) -> bool {
         self.is_valuetype
-    }
-
-    /// Returns whether this definition's value/reference-type classification came from an
-    /// authoritative declaration rather than a methods-only reopening placeholder.
-    #[must_use]
-    pub(crate) fn is_valuetype_authoritative(&self) -> bool {
-        self.is_valuetype_authoritative
     }
 
     #[must_use]

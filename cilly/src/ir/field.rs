@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use crate::IString;
 
 use super::bimap::Interned;
+use super::asm_link::{RelocateCtx, RelocateValue};
 use super::Type;
-use super::{ClassRef, Int, IntoAsmIndex};
+use super::{Assembly, ClassRef, Int, IntoAsmIndex};
 
 impl Interned<FieldDesc> {
     pub fn data_ptr(asm: &mut super::Assembly, res: Interned<ClassRef>) -> Interned<FieldDesc> {
@@ -34,6 +35,19 @@ pub struct FieldDesc {
     tpe: Type,
 }
 
+impl RelocateValue for FieldDesc {
+    type Output = Self;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
+        let Self { owner, name, tpe } = self;
+        Self {
+            owner: ctx.class_ref(destination, owner),
+            name: ctx.string(destination, name),
+            tpe: destination.translate_type(ctx, tpe),
+        }
+    }
+}
+
 impl FieldDesc {
     #[must_use]
     pub fn new(owner: Interned<ClassRef>, name: Interned<IString>, tpe: Type) -> Self {
@@ -61,6 +75,18 @@ pub struct StaticFieldDesc {
     owner: Interned<ClassRef>,
     name: Interned<IString>,
     tpe: Type,
+}
+impl RelocateValue for StaticFieldDesc {
+    type Output = Self;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
+        let Self { owner, name, tpe } = self;
+        Self {
+            owner: ctx.class_ref(destination, owner),
+            name: ctx.string(destination, name),
+            tpe: destination.translate_type(ctx, tpe),
+        }
+    }
 }
 impl IntoAsmIndex<Interned<StaticFieldDesc>> for StaticFieldDesc {
     fn into_idx(self, asm: &mut super::Assembly) -> Interned<StaticFieldDesc> {

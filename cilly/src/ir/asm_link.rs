@@ -1,21 +1,284 @@
 use super::{
     asm::{CCTOR, TCCTOR, USER_INIT},
     bimap::Interned,
-    class::{ClassDefIdx, StaticFieldDef},
-    Assembly, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, Const, FieldDesc, FnSig, MethodDef,
-    MethodDefIdx, MethodRef, StaticFieldDesc, Type,
+    class::ClassDefIdx,
+    Assembly, CILNode, CILRoot, ClassDef, ClassRef, Const, FieldDesc, FnSig, MethodDefIdx,
+    MethodRef, StaticFieldDesc, Type,
 };
+
+/// Per-arena work performed while relocating one assembly into another.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ArenaRelocationStats {
+    /// Distinct source ids whose values were translated.
+    pub unique_visits: usize,
+    /// Repeated source-id lookups satisfied by the dense relocation map.
+    pub cache_hits: usize,
+}
+
+/// Summary of a single [`Assembly::link_with_stats`] relocation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RelocationStats {
+    pub strings: ArenaRelocationStats,
+    pub types: ArenaRelocationStats,
+    pub class_refs: ArenaRelocationStats,
+    pub nodes: ArenaRelocationStats,
+    pub roots: ArenaRelocationStats,
+    pub signatures: ArenaRelocationStats,
+    pub method_refs: ArenaRelocationStats,
+    pub fields: ArenaRelocationStats,
+    pub statics: ArenaRelocationStats,
+    pub const_data: ArenaRelocationStats,
+}
+
+/// Relocates one owned IR value from a source assembly into a destination assembly.
+///
+/// Implementations live beside the value's private fields so adding metadata forces an exhaustive
+/// destructuring update at compile time.
+pub(crate) trait RelocateValue: Sized {
+    type Output;
+
+    fn relocate(
+        self,
+        ctx: &mut RelocateCtx<'_>,
+        destination: &mut Assembly,
+    ) -> Self::Output;
+}
+
+struct DenseRelocationMap<T> {
+    slots: Vec<Option<Interned<T>>>,
+}
+
+impl<T> Default for DenseRelocationMap<T> {
+    fn default() -> Self {
+        Self { slots: Vec::new() }
+    }
+}
+
+impl<T> DenseRelocationMap<T> {
+    fn get(&self, source: Interned<T>) -> Option<Interned<T>> {
+        self.slots
+            .get(source.inner() as usize - 1)
+            .copied()
+            .flatten()
+    }
+
+    fn insert(&mut self, source: Interned<T>, destination: Interned<T>) {
+        let index = source.inner() as usize - 1;
+        if self.slots.len() <= index {
+            self.slots.resize(index + 1, None);
+        }
+        assert!(
+            self.slots[index].replace(destination).is_none(),
+            "source id was relocated more than once"
+        );
+    }
+}
+
+/// Memoized, per-source-assembly relocation state.
+pub(crate) struct RelocateCtx<'source> {
+    source: &'source Assembly,
+    strings: DenseRelocationMap<crate::IString>,
+    types: DenseRelocationMap<Type>,
+    class_refs: DenseRelocationMap<ClassRef>,
+    nodes: DenseRelocationMap<CILNode>,
+    roots: DenseRelocationMap<CILRoot>,
+    signatures: DenseRelocationMap<FnSig>,
+    method_refs: DenseRelocationMap<MethodRef>,
+    fields: DenseRelocationMap<FieldDesc>,
+    statics: DenseRelocationMap<StaticFieldDesc>,
+    const_data: DenseRelocationMap<Box<[u8]>>,
+    stats: RelocationStats,
+}
+
+impl<'source> RelocateCtx<'source> {
+    fn new(source: &'source Assembly) -> Self {
+        Self {
+            source,
+            strings: DenseRelocationMap::default(),
+            types: DenseRelocationMap::default(),
+            class_refs: DenseRelocationMap::default(),
+            nodes: DenseRelocationMap::default(),
+            roots: DenseRelocationMap::default(),
+            signatures: DenseRelocationMap::default(),
+            method_refs: DenseRelocationMap::default(),
+            fields: DenseRelocationMap::default(),
+            statics: DenseRelocationMap::default(),
+            const_data: DenseRelocationMap::default(),
+            stats: RelocationStats::default(),
+        }
+    }
+
+    pub(crate) fn string(
+        &mut self,
+        destination: &mut Assembly,
+        source: Interned<crate::IString>,
+    ) -> Interned<crate::IString> {
+        if let Some(relocated) = self.strings.get(source) {
+            self.stats.strings.cache_hits += 1;
+            return relocated;
+        }
+        let relocated = destination.alloc_string(&self.source[source]);
+        self.strings.insert(source, relocated);
+        self.stats.strings.unique_visits += 1;
+        relocated
+    }
+
+    pub(crate) fn type_id(
+        &mut self,
+        destination: &mut Assembly,
+        source: Interned<Type>,
+    ) -> Interned<Type> {
+        if let Some(relocated) = self.types.get(source) {
+            self.stats.types.cache_hits += 1;
+            return relocated;
+        }
+        let value = self.source[source];
+        let value = destination.translate_type(self, value);
+        let relocated = destination.alloc_type(value);
+        self.types.insert(source, relocated);
+        self.stats.types.unique_visits += 1;
+        relocated
+    }
+
+    pub(crate) fn class_ref(
+        &mut self,
+        destination: &mut Assembly,
+        source: Interned<ClassRef>,
+    ) -> Interned<ClassRef> {
+        if let Some(relocated) = self.class_refs.get(source) {
+            self.stats.class_refs.cache_hits += 1;
+            return relocated;
+        }
+        let class_ref = self
+            .source
+            .class_ref(source)
+            .clone()
+            .relocate(self, destination);
+        let relocated = destination.alloc_class_ref(class_ref);
+        self.class_refs.insert(source, relocated);
+        self.stats.class_refs.unique_visits += 1;
+        relocated
+    }
+
+    pub(crate) fn signature(
+        &mut self,
+        destination: &mut Assembly,
+        source: Interned<FnSig>,
+    ) -> Interned<FnSig> {
+        if let Some(relocated) = self.signatures.get(source) {
+            self.stats.signatures.cache_hits += 1;
+            return relocated;
+        }
+        let signature = self.source[source].clone().relocate(self, destination);
+        let relocated = destination.alloc_sig(signature);
+        self.signatures.insert(source, relocated);
+        self.stats.signatures.unique_visits += 1;
+        relocated
+    }
+
+    pub(crate) fn method_ref(
+        &mut self,
+        destination: &mut Assembly,
+        source: Interned<MethodRef>,
+    ) -> Interned<MethodRef> {
+        if let Some(relocated) = self.method_refs.get(source) {
+            self.stats.method_refs.cache_hits += 1;
+            return relocated;
+        }
+        let method = self.source[source].clone().relocate(self, destination);
+        let relocated = destination.alloc_methodref(method);
+        self.method_refs.insert(source, relocated);
+        self.stats.method_refs.unique_visits += 1;
+        relocated
+    }
+
+    pub(crate) fn field(
+        &mut self,
+        destination: &mut Assembly,
+        source: Interned<FieldDesc>,
+    ) -> Interned<FieldDesc> {
+        if let Some(relocated) = self.fields.get(source) {
+            self.stats.fields.cache_hits += 1;
+            return relocated;
+        }
+        let field = (*self.source.get_field(source)).relocate(self, destination);
+        let relocated = destination.alloc_field(field);
+        self.fields.insert(source, relocated);
+        self.stats.fields.unique_visits += 1;
+        relocated
+    }
+
+    pub(crate) fn static_field(
+        &mut self,
+        destination: &mut Assembly,
+        source: Interned<StaticFieldDesc>,
+    ) -> Interned<StaticFieldDesc> {
+        if let Some(relocated) = self.statics.get(source) {
+            self.stats.statics.cache_hits += 1;
+            return relocated;
+        }
+        let field = (*self.source.get_static_field(source)).relocate(self, destination);
+        let relocated = destination.alloc_sfld(field);
+        self.statics.insert(source, relocated);
+        self.stats.statics.unique_visits += 1;
+        relocated
+    }
+
+    pub(crate) fn const_data(
+        &mut self,
+        destination: &mut Assembly,
+        source: Interned<Box<[u8]>>,
+    ) -> Interned<Box<[u8]>> {
+        if let Some(relocated) = self.const_data.get(source) {
+            self.stats.const_data.cache_hits += 1;
+            return relocated;
+        }
+        let relocated = destination.alloc_const_data(&self.source.const_data[source]);
+        self.const_data.insert(source, relocated);
+        self.stats.const_data.unique_visits += 1;
+        relocated
+    }
+
+    pub(crate) fn node(
+        &mut self,
+        destination: &mut Assembly,
+        source: Interned<CILNode>,
+    ) -> Interned<CILNode> {
+        if let Some(relocated) = self.nodes.get(source) {
+            self.stats.nodes.cache_hits += 1;
+            return relocated;
+        }
+        let node = self.source.get_node(source).clone();
+        let node = destination.translate_node(self, node);
+        let relocated = destination.alloc_node(node);
+        self.nodes.insert(source, relocated);
+        self.stats.nodes.unique_visits += 1;
+        relocated
+    }
+
+    pub(crate) fn root(
+        &mut self,
+        destination: &mut Assembly,
+        source: Interned<CILRoot>,
+    ) -> Interned<CILRoot> {
+        if let Some(relocated) = self.roots.get(source) {
+            self.stats.roots.cache_hits += 1;
+            return relocated;
+        }
+        let root = self.source.get_root(source).clone();
+        let root = destination.translate_root(self, root);
+        let relocated = destination.alloc_root(root);
+        self.roots.insert(source, relocated);
+        self.stats.roots.unique_visits += 1;
+        relocated
+    }
+}
+
 impl Assembly {
-    pub(crate) fn translate_type(&mut self, source: &Self, tpe: Type) -> Type {
+    pub(crate) fn translate_type(&mut self, ctx: &mut RelocateCtx<'_>, tpe: Type) -> Type {
         match tpe {
-            Type::Ptr(inner) => {
-                let inner = self.translate_type(source, source[inner]);
-                self.nptr(inner)
-            }
-            Type::Ref(inner) => {
-                let inner = self.translate_type(source, source[inner]);
-                self.nref(inner)
-            }
+            Type::Ptr(inner) => Type::Ptr(ctx.type_id(self, inner)),
+            Type::Ref(inner) => Type::Ref(ctx.type_id(self, inner)),
             Type::Int(_)
             | Type::Float(_)
             | Type::PlatformString
@@ -25,92 +288,27 @@ impl Assembly {
             | Type::PlatformObject
             | Type::PlatformGeneric(_, _)
             | Type::SIMDVector(_) => tpe,
-            Type::ClassRef(class_ref) => {
-                Type::ClassRef(self.translate_class_ref(source, class_ref))
-            }
+            Type::ClassRef(class_ref) => Type::ClassRef(ctx.class_ref(self, class_ref)),
             Type::PlatformArray { elem, dims } => {
-                let elem = self.translate_type(source, source[elem]);
-                let elem = self.alloc_type(elem);
-                Type::PlatformArray { elem, dims }
+                Type::PlatformArray {
+                    elem: ctx.type_id(self, elem),
+                    dims,
+                }
             }
-            Type::FnPtr(sig) => {
-                let sig = self.translate_sig(source, &source[sig]);
-                Type::FnPtr(self.alloc_sig(sig))
-            }
+            Type::FnPtr(sig) => Type::FnPtr(ctx.signature(self, sig)),
         }
     }
-    pub(crate) fn translate_class_ref(
-        &mut self,
-        source: &Assembly,
-        class_ref: Interned<ClassRef>,
-    ) -> Interned<ClassRef> {
-        let cref = source.class_ref(class_ref);
-
-        let name = self.alloc_string(&source[cref.name()]);
-
-        let asm = cref
-            .asm()
-            .map(|asm_name| self.alloc_string(&source[asm_name]));
-        let generics = cref
-            .generics()
-            .iter()
-            .map(|tpe| self.translate_type(source, *tpe))
-            .collect();
-        self.alloc_class_ref(ClassRef::new(name, asm, cref.is_valuetype(), generics))
-    }
-    pub(crate) fn translate_sig(&mut self, source: &Assembly, sig: &FnSig) -> FnSig {
-        FnSig::new(
-            sig.inputs()
-                .iter()
-                .map(|tpe| self.translate_type(source, *tpe))
-                .collect::<Box<_>>(),
-            self.translate_type(source, *sig.output()),
-        )
-    }
-    pub(crate) fn translate_field(&mut self, source: &Assembly, field: FieldDesc) -> FieldDesc {
-        let name = self.alloc_string(source[field.name()].as_ref());
-        let owner = self.translate_class_ref(source, field.owner());
-        let tpe = self.translate_type(source, field.tpe());
-        FieldDesc::new(owner, name, tpe)
-    }
-    pub(crate) fn translate_static_field(
-        &mut self,
-        source: &Assembly,
-        field: StaticFieldDesc,
-    ) -> StaticFieldDesc {
-        let name = self.alloc_string(source[field.name()].as_ref());
-        let owner = self.translate_class_ref(source, field.owner());
-        let tpe = self.translate_type(source, field.tpe());
-        StaticFieldDesc::new(owner, name, tpe)
-    }
-    pub(crate) fn translate_method_ref(
-        &mut self,
-        source: &Assembly,
-        method_ref: &MethodRef,
-    ) -> MethodRef {
-        let class = self.translate_class_ref(source, method_ref.class());
-        let name = self.alloc_string(source[method_ref.name()].as_ref());
-        let sig = self.translate_sig(source, &source[method_ref.sig()]);
-        let sig = self.alloc_sig(sig);
-        let generics = method_ref
-            .generics()
-            .iter()
-            .map(|tpe| self.translate_type(source, *tpe))
-            .collect();
-        MethodRef::new(class, name, sig, method_ref.kind(), generics)
-    }
-    pub(crate) fn translate_const(&mut self, source: &Assembly, cst: &Const) -> Const {
+    pub(crate) fn translate_const(&mut self, ctx: &mut RelocateCtx<'_>, cst: &Const) -> Const {
         match cst {
             super::Const::PlatformString(pstr) => {
-                super::Const::PlatformString(self.alloc_string(source[*pstr].as_ref()))
+                super::Const::PlatformString(ctx.string(self, *pstr))
             }
 
-            super::Const::Null(cref) => super::Const::Null(self.translate_class_ref(source, *cref)),
+            super::Const::Null(cref) => super::Const::Null(ctx.class_ref(self, *cref)),
             super::Const::ByteBuffer { data, tpe } => {
-                let tpe = self.translate_type(source, source[*tpe]);
                 super::Const::ByteBuffer {
-                    data: self.alloc_const_data(&source.const_data[*data]),
-                    tpe: self.alloc_type(tpe),
+                    data: ctx.const_data(self, *data),
+                    tpe: ctx.type_id(self, *tpe),
                 }
             }
             _ => cst.clone(),
@@ -118,30 +316,18 @@ impl Assembly {
     }
     // The complexity of this function is unavoidable.
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn translate_node(&mut self, source: &Assembly, node: CILNode) -> CILNode {
+    pub(crate) fn translate_node(&mut self, ctx: &mut RelocateCtx<'_>, node: CILNode) -> CILNode {
         match &node {
             CILNode::LdLoc(_) | CILNode::LdLocA(_) | CILNode::LdArg(_) | CILNode::LdArgA(_) => node,
-            CILNode::Const(cst) => CILNode::Const(Box::new(self.translate_const(source, cst))),
+            CILNode::Const(cst) => CILNode::Const(Box::new(self.translate_const(ctx, cst))),
             CILNode::BinOp(a, b, op) => {
-                let a = self.translate_node(source, source.get_node(*a).clone());
-                let b = self.translate_node(source, source.get_node(*b).clone());
-                CILNode::BinOp(self.alloc_node(a), self.alloc_node(b), *op)
+                CILNode::BinOp(ctx.node(self, *a), ctx.node(self, *b), *op)
             }
-            CILNode::UnOp(a, op) => {
-                let a = self.translate_node(source, source.get_node(*a).clone());
-                CILNode::UnOp(self.alloc_node(a), op.clone())
-            }
+            CILNode::UnOp(a, op) => CILNode::UnOp(ctx.node(self, *a), op.clone()),
             CILNode::Call(call_arg) => {
                 let (mref, args, pure) = call_arg.as_ref();
-                let method_ref = self.translate_method_ref(source, &source[*mref]);
-                let mref = self.alloc_methodref(method_ref);
-                let args = args
-                    .iter()
-                    .map(|arg| {
-                        let arg = self.translate_node(source, source.get_node(*arg).clone());
-                        self.alloc_node(arg)
-                    })
-                    .collect();
+                let mref = ctx.method_ref(self, *mref);
+                let args = args.iter().map(|arg| ctx.node(self, *arg)).collect();
                 CILNode::Call(Box::new((mref, args, *pure)))
             }
             CILNode::IntCast {
@@ -149,10 +335,8 @@ impl Assembly {
                 target,
                 extend,
             } => {
-                let input = self.translate_node(source, source.get_node(*input).clone());
-                let input = self.alloc_node(input);
                 CILNode::IntCast {
-                    input,
+                    input: ctx.node(self, *input),
                     target: *target,
                     extend: *extend,
                 }
@@ -162,34 +346,24 @@ impl Assembly {
                 target,
                 is_signed,
             } => {
-                let input = self.translate_node(source, source.get_node(*input).clone());
-                let input = self.alloc_node(input);
                 CILNode::FloatCast {
-                    input,
+                    input: ctx.node(self, *input),
                     target: *target,
                     is_signed: *is_signed,
                 }
             }
-            CILNode::RefToPtr(input) => {
-                let input = self.translate_node(source, source.get_node(*input).clone());
-                let input = self.alloc_node(input);
-                CILNode::RefToPtr(input)
-            }
+            CILNode::RefToPtr(input) => CILNode::RefToPtr(ctx.node(self, *input)),
             CILNode::PtrCast(input, cast_res) => {
-                let input = self.translate_node(source, source.get_node(*input).clone());
-                let input = self.alloc_node(input);
+                let input = ctx.node(self, *input);
                 let cast_res = match cast_res.as_ref() {
                     crate::cilnode::PtrCastRes::Ptr(inner) => {
-                        let inner = self.translate_type(source, source[*inner]);
-                        crate::cilnode::PtrCastRes::Ptr(self.alloc_type(inner))
+                        crate::cilnode::PtrCastRes::Ptr(ctx.type_id(self, *inner))
                     }
                     crate::cilnode::PtrCastRes::Ref(inner) => {
-                        let inner = self.translate_type(source, source[*inner]);
-                        crate::cilnode::PtrCastRes::Ref(self.alloc_type(inner))
+                        crate::cilnode::PtrCastRes::Ref(ctx.type_id(self, *inner))
                     }
                     crate::cilnode::PtrCastRes::FnPtr(sig) => {
-                        let sig = self.translate_sig(source, &source[*sig]);
-                        crate::cilnode::PtrCastRes::FnPtr(self.alloc_sig(sig))
+                        crate::cilnode::PtrCastRes::FnPtr(ctx.signature(self, *sig))
                     }
                     crate::cilnode::PtrCastRes::USize | crate::cilnode::PtrCastRes::ISize => {
                         *cast_res.clone()
@@ -198,221 +372,137 @@ impl Assembly {
                 CILNode::PtrCast(input, Box::new(cast_res))
             }
             CILNode::LdFieldAddress { addr, field } => {
-                let field = self.translate_field(source, *source.get_field(*field));
-                let field = self.alloc_field(field);
-                let addr = self.translate_node(source, source.get_node(*addr).clone());
-                let addr = self.alloc_node(addr);
-                CILNode::LdFieldAddress { addr, field }
+                CILNode::LdFieldAddress {
+                    addr: ctx.node(self, *addr),
+                    field: ctx.field(self, *field),
+                }
             }
             CILNode::LdField { addr, field } => {
-                let field = self.translate_field(source, *source.get_field(*field));
-                let field = self.alloc_field(field);
-                let addr = self.translate_node(source, source.get_node(*addr).clone());
-                let addr = self.alloc_node(addr);
-                CILNode::LdField { addr, field }
+                CILNode::LdField {
+                    addr: ctx.node(self, *addr),
+                    field: ctx.field(self, *field),
+                }
             }
             CILNode::LdInd {
                 addr,
                 tpe,
                 volatile: volitale,
             } => {
-                let addr = self.translate_node(source, source.get_node(*addr).clone());
-                let addr = self.alloc_node(addr);
-                let tpe = self.translate_type(source, source[*tpe]);
-                let tpe = self.alloc_type(tpe);
                 CILNode::LdInd {
-                    addr,
-                    tpe,
+                    addr: ctx.node(self, *addr),
+                    tpe: ctx.type_id(self, *tpe),
                     volatile: *volitale,
                 }
             }
-            CILNode::SizeOf(tpe) => {
-                let tpe = self.translate_type(source, source[*tpe]);
-                let tpe = self.alloc_type(tpe);
-                CILNode::SizeOf(tpe)
-            }
+            CILNode::SizeOf(tpe) => CILNode::SizeOf(ctx.type_id(self, *tpe)),
             CILNode::GetException => CILNode::GetException,
             CILNode::IsInst(object, tpe) => {
-                let object = self.translate_node(source, source.get_node(*object).clone());
-                let object = self.alloc_node(object);
-                let tpe = self.translate_type(source, source[*tpe]);
-                let tpe = self.alloc_type(tpe);
-                CILNode::IsInst(object, tpe)
+                CILNode::IsInst(ctx.node(self, *object), ctx.type_id(self, *tpe))
             }
             CILNode::CheckedCast(object, tpe) => {
-                let object = self.translate_node(source, source.get_node(*object).clone());
-                let object = self.alloc_node(object);
-                let tpe = self.translate_type(source, source[*tpe]);
-                let tpe = self.alloc_type(tpe);
-                CILNode::CheckedCast(object, tpe)
+                CILNode::CheckedCast(ctx.node(self, *object), ctx.type_id(self, *tpe))
             }
             CILNode::CallI(args) => {
                 let (fnptr, sig, args) = args.as_ref();
-                let fnptr = self.translate_node(source, source.get_node(*fnptr).clone());
-                let fnptr = self.alloc_node(fnptr);
-                let sig = self.translate_sig(source, &source[*sig]);
-                let sig = self.alloc_sig(sig);
-                let args = args
-                    .iter()
-                    .map(|arg| {
-                        let arg = self.translate_node(source, source.get_node(*arg).clone());
-                        self.alloc_node(arg)
-                    })
-                    .collect();
+                let fnptr = ctx.node(self, *fnptr);
+                let sig = ctx.signature(self, *sig);
+                let args = args.iter().map(|arg| ctx.node(self, *arg)).collect();
                 CILNode::CallI(Box::new((fnptr, sig, args)))
             }
-            CILNode::LocAlloc { size } => {
-                let size = self.translate_node(source, source.get_node(*size).clone());
-                let size = self.alloc_node(size);
-                CILNode::LocAlloc { size }
-            }
-            CILNode::LdStaticField(sfld) => {
-                let sfld = self.translate_static_field(source, *source.get_static_field(*sfld));
-                let sfld = self.alloc_sfld(sfld);
-                CILNode::LdStaticField(sfld)
-            }
+            CILNode::LocAlloc { size } => CILNode::LocAlloc {
+                size: ctx.node(self, *size),
+            },
+            CILNode::LdStaticField(sfld) => CILNode::LdStaticField(ctx.static_field(self, *sfld)),
             CILNode::LdStaticFieldAddress(sfld) => {
-                let sfld = self.translate_static_field(source, *source.get_static_field(*sfld));
-                let sfld = self.alloc_sfld(sfld);
-                CILNode::LdStaticFieldAddress(sfld)
+                CILNode::LdStaticFieldAddress(ctx.static_field(self, *sfld))
             }
-            CILNode::LdFtn(mref) => {
-                let method_ref = self.translate_method_ref(source, &source[*mref]);
-                let mref = self.alloc_methodref(method_ref);
-                CILNode::LdFtn(mref)
-            }
-            CILNode::LdTypeToken(tpe) => {
-                let tpe = self.translate_type(source, source[*tpe]);
-                let tpe = self.alloc_type(tpe);
-                CILNode::LdTypeToken(tpe)
-            }
-            CILNode::LdLen(len) => {
-                let len = self.translate_node(source, source.get_node(*len).clone());
-                let len = self.alloc_node(len);
-                CILNode::LdLen(len)
-            }
+            CILNode::LdFtn(mref) => CILNode::LdFtn(ctx.method_ref(self, *mref)),
+            CILNode::LdTypeToken(tpe) => CILNode::LdTypeToken(ctx.type_id(self, *tpe)),
+            CILNode::LdLen(len) => CILNode::LdLen(ctx.node(self, *len)),
             CILNode::LocAllocAlgined { tpe, align } => {
-                let tpe = self.translate_type(source, source[*tpe]);
-                let tpe = self.alloc_type(tpe);
-                CILNode::LocAllocAlgined { tpe, align: *align }
+                CILNode::LocAllocAlgined {
+                    tpe: ctx.type_id(self, *tpe),
+                    align: *align,
+                }
             }
             CILNode::LdElelemRef { array, index } => {
-                let array = self.translate_node(source, source.get_node(*array).clone());
-                let array = self.alloc_node(array);
-                let index = self.translate_node(source, source.get_node(*index).clone());
-                let index = self.alloc_node(index);
-                CILNode::LdElelemRef { array, index }
+                CILNode::LdElelemRef {
+                    array: ctx.node(self, *array),
+                    index: ctx.node(self, *index),
+                }
             }
             CILNode::UnboxAny { object, tpe } => {
-                let object = self.translate_node(source, source.get_node(*object).clone());
-                let object = self.alloc_node(object);
-                let tpe = self.translate_type(source, source[*tpe]);
-                let tpe = self.alloc_type(tpe);
-                CILNode::UnboxAny { object, tpe }
+                CILNode::UnboxAny {
+                    object: ctx.node(self, *object),
+                    tpe: ctx.type_id(self, *tpe),
+                }
             }
             CILNode::Box { value, tpe } => {
-                let value = self.translate_node(source, source.get_node(*value).clone());
-                let value = self.alloc_node(value);
-                let tpe = self.translate_type(source, source[*tpe]);
-                let tpe = self.alloc_type(tpe);
-                CILNode::Box { value, tpe }
+                CILNode::Box {
+                    value: ctx.node(self, *value),
+                    tpe: ctx.type_id(self, *tpe),
+                }
             }
             CILNode::NewArr { elem, len } => {
-                let elem = self.translate_type(source, source[*elem]);
-                let elem = self.alloc_type(elem);
-                let len = self.translate_node(source, source.get_node(*len).clone());
-                let len = self.alloc_node(len);
-                CILNode::NewArr { elem, len }
+                CILNode::NewArr {
+                    elem: ctx.type_id(self, *elem),
+                    len: ctx.node(self, *len),
+                }
             }
         }
     }
     // The complexity of this function is unavoidable.
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn translate_root(&mut self, source: &Assembly, root: CILRoot) -> CILRoot {
+    pub(crate) fn translate_root(&mut self, ctx: &mut RelocateCtx<'_>, root: CILRoot) -> CILRoot {
         match root {
-            CILRoot::Unreachable(str) => {
-                let str = self.alloc_string(&source[str]);
-                CILRoot::Unreachable(str)
-            }
-            CILRoot::StLoc(loc, node) => {
-                let node = self.translate_node(source, source.get_node(node).clone());
-                let node = self.alloc_node(node);
-                CILRoot::StLoc(loc, node)
-            }
-            CILRoot::StArg(loc, node) => {
-                let node = self.translate_node(source, source.get_node(node).clone());
-                let node = self.alloc_node(node);
-                CILRoot::StArg(loc, node)
-            }
-            CILRoot::Ret(node) => {
-                let node = self.translate_node(source, source.get_node(node).clone());
-                let node = self.alloc_node(node);
-                CILRoot::Ret(node)
-            }
-            CILRoot::Pop(node) => {
-                let node = self.translate_node(source, source.get_node(node).clone());
-                let node = self.alloc_node(node);
-                CILRoot::Pop(node)
-            }
-            CILRoot::Throw(node) => {
-                let node = self.translate_node(source, source.get_node(node).clone());
-                let node = self.alloc_node(node);
-                CILRoot::Throw(node)
-            }
+            CILRoot::Unreachable(str) => CILRoot::Unreachable(ctx.string(self, str)),
+            CILRoot::StLoc(loc, node) => CILRoot::StLoc(loc, ctx.node(self, node)),
+            CILRoot::StArg(loc, node) => CILRoot::StArg(loc, ctx.node(self, node)),
+            CILRoot::Ret(node) => CILRoot::Ret(ctx.node(self, node)),
+            CILRoot::Pop(node) => CILRoot::Pop(ctx.node(self, node)),
+            CILRoot::Throw(node) => CILRoot::Throw(ctx.node(self, node)),
             CILRoot::Branch(branch) => {
                 let (target, sub_target, cond) = branch.as_ref();
                 let cond = cond.as_ref().map(|cond| match cond {
                     super::cilroot::BranchCond::True(cond) => {
-                        let cond = self.translate_node(source, source.get_node(*cond).clone());
-                        let cond = self.alloc_node(cond);
-                        super::cilroot::BranchCond::True(cond)
+                        super::cilroot::BranchCond::True(ctx.node(self, *cond))
                     }
                     super::cilroot::BranchCond::False(cond) => {
-                        let cond = self.translate_node(source, source.get_node(*cond).clone());
-                        let cond = self.alloc_node(cond);
-                        super::cilroot::BranchCond::False(cond)
+                        super::cilroot::BranchCond::False(ctx.node(self, *cond))
                     }
                     super::cilroot::BranchCond::Eq(a, b) => {
-                        let a = self.translate_node(source, source.get_node(*a).clone());
-                        let a = self.alloc_node(a);
-                        let b = self.translate_node(source, source.get_node(*b).clone());
-                        let b = self.alloc_node(b);
-                        super::cilroot::BranchCond::Eq(a, b)
+                        super::cilroot::BranchCond::Eq(ctx.node(self, *a), ctx.node(self, *b))
                     }
                     super::cilroot::BranchCond::Ne(a, b) => {
-                        let a = self.translate_node(source, source.get_node(*a).clone());
-                        let a = self.alloc_node(a);
-                        let b = self.translate_node(source, source.get_node(*b).clone());
-                        let b = self.alloc_node(b);
-                        super::cilroot::BranchCond::Ne(a, b)
+                        super::cilroot::BranchCond::Ne(ctx.node(self, *a), ctx.node(self, *b))
                     }
                     super::cilroot::BranchCond::Lt(a, b, cmp_kind) => {
-                        let a = self.translate_node(source, source.get_node(*a).clone());
-                        let a = self.alloc_node(a);
-                        let b = self.translate_node(source, source.get_node(*b).clone());
-                        let b = self.alloc_node(b);
-                        super::cilroot::BranchCond::Lt(a, b, cmp_kind.clone())
+                        super::cilroot::BranchCond::Lt(
+                            ctx.node(self, *a),
+                            ctx.node(self, *b),
+                            cmp_kind.clone(),
+                        )
                     }
                     super::cilroot::BranchCond::Gt(a, b, cmp_kind) => {
-                        let a = self.translate_node(source, source.get_node(*a).clone());
-                        let a = self.alloc_node(a);
-                        let b = self.translate_node(source, source.get_node(*b).clone());
-                        let b = self.alloc_node(b);
-                        super::cilroot::BranchCond::Gt(a, b, cmp_kind.clone())
+                        super::cilroot::BranchCond::Gt(
+                            ctx.node(self, *a),
+                            ctx.node(self, *b),
+                            cmp_kind.clone(),
+                        )
                     }
                     super::cilroot::BranchCond::Le(a, b, cmp_kind) => {
-                        let a = self.translate_node(source, source.get_node(*a).clone());
-                        let a = self.alloc_node(a);
-                        let b = self.translate_node(source, source.get_node(*b).clone());
-                        let b = self.alloc_node(b);
-                        super::cilroot::BranchCond::Le(a, b, cmp_kind.clone())
+                        super::cilroot::BranchCond::Le(
+                            ctx.node(self, *a),
+                            ctx.node(self, *b),
+                            cmp_kind.clone(),
+                        )
                     }
                     super::cilroot::BranchCond::Ge(a, b, cmp_kind) => {
-                        let a = self.translate_node(source, source.get_node(*a).clone());
-                        let a = self.alloc_node(a);
-                        let b = self.translate_node(source, source.get_node(*b).clone());
-                        let b = self.alloc_node(b);
-                        super::cilroot::BranchCond::Ge(a, b, cmp_kind.clone())
+                        super::cilroot::BranchCond::Ge(
+                            ctx.node(self, *a),
+                            ctx.node(self, *b),
+                            cmp_kind.clone(),
+                        )
                     }
                 });
                 CILRoot::Branch(Box::new((*target, *sub_target, cond)))
@@ -425,99 +515,68 @@ impl Assembly {
                 col_len,
                 file,
             } => {
-                let file = self.alloc_string(source[file].as_ref());
                 CILRoot::SourceFileInfo {
                     line_start,
                     line_len,
                     col_start,
                     col_len,
-                    file,
+                    file: ctx.string(self, file),
                 }
             }
             CILRoot::SetField(info) => {
                 let (field, addr, val) = info.as_ref();
-                let field = self.translate_field(source, *source.get_field(*field));
-                let field = self.alloc_field(field);
-                let addr = self.translate_node(source, source.get_node(*addr).clone());
-                let addr = self.alloc_node(addr);
-                let val = self.translate_node(source, source.get_node(*val).clone());
-                let val = self.alloc_node(val);
-                CILRoot::SetField(Box::new((field, addr, val)))
+                CILRoot::SetField(Box::new((
+                    ctx.field(self, *field),
+                    ctx.node(self, *addr),
+                    ctx.node(self, *val),
+                )))
             }
             CILRoot::Call(call_arg) => {
                 let (mref, args, pure) = call_arg.as_ref();
-                let method_ref = self.translate_method_ref(source, &source[*mref]);
-                let mref = self.alloc_methodref(method_ref);
-                let args = args
-                    .iter()
-                    .map(|arg| {
-                        let arg = self.translate_node(source, source.get_node(*arg).clone());
-                        self.alloc_node(arg)
-                    })
-                    .collect();
+                let mref = ctx.method_ref(self, *mref);
+                let args = args.iter().map(|arg| ctx.node(self, *arg)).collect();
                 CILRoot::Call(Box::new((mref, args, *pure)))
             }
             CILRoot::StInd(info) => {
                 let (addr, val, tpe, volitile) = info.as_ref();
-                let addr = self.translate_node(source, source.get_node(*addr).clone());
-                let addr = self.alloc_node(addr);
-                let val = self.translate_node(source, source.get_node(*val).clone());
-                let val = self.alloc_node(val);
-                let tpe = self.translate_type(source, *tpe);
-                CILRoot::StInd(Box::new((addr, val, tpe, *volitile)))
+                CILRoot::StInd(Box::new((
+                    ctx.node(self, *addr),
+                    ctx.node(self, *val),
+                    self.translate_type(ctx, *tpe),
+                    *volitile,
+                )))
             }
             CILRoot::CpObj { src, dst, tpe } => {
-                let src = self.translate_node(source, source.get_node(src).clone());
-                let src = self.alloc_node(src);
-                let dst = self.translate_node(source, source.get_node(dst).clone());
-                let dst = self.alloc_node(dst);
-                let tpe = self.translate_type(source, source[tpe]);
                 CILRoot::CpObj {
-                    src,
-                    dst,
-                    tpe: self.alloc_type(tpe),
+                    src: ctx.node(self, src),
+                    dst: ctx.node(self, dst),
+                    tpe: ctx.type_id(self, tpe),
                 }
             }
             CILRoot::InitObj(src, tpe) => {
-                let addr = self.translate_node(source, source.get_node(src).clone());
-                let addr = self.alloc_node(addr);
-
-                let tpe = self.translate_type(source, source[tpe]);
-                CILRoot::InitObj(addr, self.alloc_type(tpe))
+                CILRoot::InitObj(ctx.node(self, src), ctx.type_id(self, tpe))
             }
             CILRoot::InitBlk(info) => {
                 let (dst, val, count) = info.as_ref();
-                let dst = self.translate_node(source, source.get_node(*dst).clone());
-                let dst = self.alloc_node(dst);
-                let val = self.translate_node(source, source.get_node(*val).clone());
-                let val = self.alloc_node(val);
-                let count = self.translate_node(source, source.get_node(*count).clone());
-                let count = self.alloc_node(count);
-                CILRoot::InitBlk(Box::new((dst, val, count)))
+                CILRoot::InitBlk(Box::new((
+                    ctx.node(self, *dst),
+                    ctx.node(self, *val),
+                    ctx.node(self, *count),
+                )))
             }
             CILRoot::CpBlk(info) => {
                 let (dst, src, len) = info.as_ref();
-                let dst = self.translate_node(source, source.get_node(*dst).clone());
-                let dst = self.alloc_node(dst);
-                let src = self.translate_node(source, source.get_node(*src).clone());
-                let src = self.alloc_node(src);
-                let len = self.translate_node(source, source.get_node(*len).clone());
-                let len = self.alloc_node(len);
-                CILRoot::CpBlk(Box::new((dst, src, len)))
+                CILRoot::CpBlk(Box::new((
+                    ctx.node(self, *dst),
+                    ctx.node(self, *src),
+                    ctx.node(self, *len),
+                )))
             }
             CILRoot::CallI(args) => {
                 let (fnptr, sig, args) = args.as_ref();
-                let fnptr = self.translate_node(source, source.get_node(*fnptr).clone());
-                let fnptr = self.alloc_node(fnptr);
-                let sig = self.translate_sig(source, &source[*sig]);
-                let sig = self.alloc_sig(sig);
-                let args = args
-                    .iter()
-                    .map(|arg| {
-                        let arg = self.translate_node(source, source.get_node(*arg).clone());
-                        self.alloc_node(arg)
-                    })
-                    .collect();
+                let fnptr = ctx.node(self, *fnptr);
+                let sig = ctx.signature(self, *sig);
+                let args = args.iter().map(|arg| ctx.node(self, *arg)).collect();
                 CILRoot::CallI(Box::new((fnptr, sig, args)))
             }
             CILRoot::ExitSpecialRegion { target, source } => {
@@ -526,16 +585,14 @@ impl Assembly {
             CILRoot::TerminateRegion { protected, reason } => {
                 // The protected child root is NOT in any block's root list (only the region and the
                 // continuation `goto` are), so it must be translated + re-interned here explicitly.
-                let inner = self.translate_root(source, source.get_root(protected).clone());
-                let protected = self.alloc_root(inner);
+                let protected = ctx.root(self, protected);
                 CILRoot::TerminateRegion { protected, reason }
             }
             CILRoot::SetStaticField { field, val } => {
-                let val = self.translate_node(source, source.get_node(val).clone());
-                let val = self.alloc_node(val);
-                let field = self.translate_static_field(source, *source.get_static_field(field));
-                let field = self.alloc_sfld(field);
-                CILRoot::SetStaticField { field, val }
+                CILRoot::SetStaticField {
+                    field: ctx.static_field(self, field),
+                    val: ctx.node(self, val),
+                }
             }
             CILRoot::StElem {
                 array,
@@ -543,284 +600,24 @@ impl Assembly {
                 value,
                 elem,
             } => {
-                let array = self.translate_node(source, source.get_node(array).clone());
-                let array = self.alloc_node(array);
-                let index = self.translate_node(source, source.get_node(index).clone());
-                let index = self.alloc_node(index);
-                let value = self.translate_node(source, source.get_node(value).clone());
-                let value = self.alloc_node(value);
-                let elem = self.translate_type(source, source[elem]);
-                let elem = self.alloc_type(elem);
                 CILRoot::StElem {
-                    array,
-                    index,
-                    value,
-                    elem,
+                    array: ctx.node(self, array),
+                    index: ctx.node(self, index),
+                    value: ctx.node(self, value),
+                    elem: ctx.type_id(self, elem),
                 }
             }
         }
     }
-    pub(crate) fn translate_block(&mut self, source: &Assembly, block: &BasicBlock) -> BasicBlock {
-        let roots = block
-            .roots()
-            .iter()
-            .map(|root| {
-                let root = self.translate_root(source, source.get_root(*root).clone());
-                self.alloc_root(root)
-            })
-            .collect();
-        let handler = block.handler().map(|blocks| {
-            blocks
-                .iter()
-                .map(|block| self.translate_block(source, block))
-                .collect()
-        });
-        match handler {
-            Some(handler) => {
-                debug_assert!(block.handler_id().is_none());
-                BasicBlock::new(roots, block.block_id(), Some(handler))
-            }
-            None => BasicBlock::new_raw(roots, block.block_id(), block.handler_id()),
-        }
-    }
-    pub(crate) fn translate_method_def(&mut self, source: &Assembly, def: &MethodDef) -> MethodDef {
-        let class = self.translate_class_ref(source, *def.class());
-
-        // OK, becuase our caller translates the parrent of this class too.
-        let class = ClassDefIdx::from_raw(class);
-        let name = self.alloc_string(source[def.name()].as_ref());
-        let sig = self.translate_sig(source, &source[def.sig()]);
-        let sig = self.alloc_sig(sig);
-        let method_impl = match def.implementation() {
-            super::MethodImpl::MethodBody { blocks, locals } => {
-                let blocks = blocks
-                    .iter()
-                    .map(|block| self.translate_block(source, block))
-                    .collect();
-                let locals = locals
-                    .iter()
-                    .map(|(name, tpe)| {
-                        let tpe = self.translate_type(source, source[*tpe]);
-                        (
-                            name.map(|name| self.alloc_string(source[name].as_ref())),
-                            self.alloc_type(tpe),
-                        )
-                    })
-                    .collect();
-                super::MethodImpl::MethodBody { blocks, locals }
-            }
-            super::MethodImpl::Extern {
-                lib,
-                preserve_errno,
-            } => {
-                let lib = self.alloc_string(source[*lib].as_ref());
-                super::MethodImpl::Extern {
-                    lib,
-                    preserve_errno: *preserve_errno,
-                }
-            }
-            super::MethodImpl::AliasFor(mref) => {
-                let method_ref = self.translate_method_ref(source, &source[*mref]);
-                let mref = self.alloc_methodref(method_ref);
-                super::MethodImpl::AliasFor(mref)
-            }
-            super::MethodImpl::Missing => super::MethodImpl::Missing,
-        };
-        let arg_names = def
-            .arg_names()
-            .iter()
-            .map(|arg| arg.map(|arg| self.alloc_string(source[arg].as_ref())))
-            .collect();
-        let mut translated = MethodDef::new(
-            *def.access(),
-            class,
-            name,
-            sig,
-            def.kind(),
-            method_impl,
-            arg_names,
-        );
-        if let Some(base) = def.overrides() {
-            let base_ref = self.translate_method_ref(source, &source[base]);
-            let base_ref = self.alloc_methodref(base_ref);
-            translated = translated.with_override(base_ref);
-        }
-        if def.is_abstract() {
-            translated = translated.with_abstract();
-        }
-        // `[out]` param flags are plain data (no interned handles to translate) but MUST be
-        // re-applied here: this field-wise reconstruction would otherwise silently drop them
-        // exactly when a `.bc` crosses the linker — i.e. in every real build (the cd_interface
-        // `IsOut` reflection check exists to catch this).
-        if !def.out_params().is_empty() {
-            translated = translated.with_out_params(def.out_params().to_vec());
-        }
-        // Generic-method-definition parameter NAMES (`MethodDef::generic_params`): interned
-        // strings, re-alloc'd into the target assembly. Same silent-drop hazard as `out_params`
-        // just above — this field-wise reconstruction runs in every real build (the `.bc` crosses
-        // the linker), so forgetting it here would strip `SIG_GENERIC`/`GenericParam` rows from
-        // every linked output while unit tests (no linker) kept passing.
-        if !def.generic_params().is_empty() {
-            let names = def
-                .generic_params()
-                .iter()
-                .map(|n| self.alloc_string(source[*n].as_ref()))
-                .collect();
-            translated = translated.with_generic_params(names);
-        }
-        // `MethodDef::is_special_name` (e.g. a CLR operator-overload method — see that field's
-        // doc): plain data, no interned handles to translate, but MUST be re-applied here for the
-        // exact same reason as `out_params`/`generic_params` above — this field-wise
-        // reconstruction runs in every real build (the `.bc` crosses the linker), so forgetting it
-        // here silently drops `SpecialName` from every operator method in a linked output, even
-        // though `MethodDef::with_special_name` was correctly applied on the ORIGINAL def before
-        // it ever reached this translation. Found via a reflection probe (`IsSpecialName` read
-        // back `false` after linking despite the backend stamping `true` before serialization) —
-        // the same silent-drop hazard class the two comments above already document, now hit a
-        // third time.
-        if def.is_special_name() {
-            translated = translated.with_special_name();
-        }
-        translated
-    }
-    /// Re-interns one `CustomAttrArg` from `source`'s heaps into `self`'s — a `Str` payload needs
-    /// re-allocation (its `Interned<IString>` handle is only valid within `source`); every other
-    /// variant is `Copy` data with no cross-assembly identity to translate.
-    fn translate_custom_attr_arg(
+    pub(crate) fn translate_class_def(
         &mut self,
-        source: &Assembly,
-        arg: &super::class::CustomAttrArg,
-    ) -> super::class::CustomAttrArg {
-        match arg {
-            super::class::CustomAttrArg::Str(s) => {
-                super::class::CustomAttrArg::Str(self.alloc_string(source[*s].as_ref()))
-            }
-            super::class::CustomAttrArg::Bool(b) => super::class::CustomAttrArg::Bool(*b),
-            super::class::CustomAttrArg::I32(i) => super::class::CustomAttrArg::I32(*i),
-            super::class::CustomAttrArg::I64(i) => super::class::CustomAttrArg::I64(*i),
-        }
-    }
-
-    pub(crate) fn translate_class_def(&mut self, source: &Assembly, def: &ClassDef) -> ClassDef {
-        let name = self.alloc_string(source[def.name()].as_ref());
-        let extends = def
-            .extends()
-            .map(|cref| self.translate_class_ref(source, cref));
-        let fields = def
-            .fields()
-            .iter()
-            .map(|(tpe, name, offset)| {
-                let tpe = self.translate_type(source, *tpe);
-                let name = self.alloc_string(source[*name].as_ref());
-                (tpe, name, *offset)
-            })
-            .collect();
-        let static_fields = def
-            .static_fields()
-            .iter()
-            .map(
-                |StaticFieldDef {
-                     tpe,
-                     name,
-                     is_tls,
-                     default_value,
-                     is_const,
-                 }| {
-                    let tpe = self.translate_type(source, *tpe);
-                    let name = self.alloc_string(source[*name].as_ref());
-                    StaticFieldDef {
-                        tpe,
-                        name,
-                        is_tls: *is_tls,
-                        default_value: default_value.map(|cst| self.translate_const(source, &cst)),
-                        is_const: *is_const,
-                    }
-                },
-            )
-            .collect();
-        let mut translated = ClassDef::new(
-            name,
-            def.is_valuetype(),
-            def.generics(),
-            extends,
-            fields,
-            static_fields,
-            *def.access(),
-            def.explict_size(),
-            def.align(),
-            def.has_nonveralpping_layout(),
-        );
-        if def.is_valuetype_authoritative() {
-            translated = translated.with_valuetype_authoritative();
-        }
-        if def.is_interface() {
-            translated = translated.with_interface();
-        }
-        // Carry the implemented-interface set across the assembly boundary.
-        for iface in def.implements() {
-            let iface = self.translate_class_ref(source, *iface);
-            translated.add_interface(iface);
-        }
-        // Carry declared events across the assembly boundary (same reasoning as `implements`).
-        for ev in def.events() {
-            let name = self.alloc_string(source[ev.name()].as_ref());
-            let delegate = self.translate_type(source, ev.delegate());
-            let add = self.translate_method_ref(source, &source[ev.add()]);
-            let add = self.alloc_methodref(add);
-            let remove = self.translate_method_ref(source, &source[ev.remove()]);
-            let remove = self.alloc_methodref(remove);
-            translated.add_event(super::class::EventDef::new(name, delegate, add, remove));
-        }
-        // Carry declared properties across the assembly boundary (same silent-drop hazard as
-        // `events`/`out_params`: this field-wise reconstruction runs in every real build — a
-        // `.bc` always crosses the linker — so forgetting it here would strip every
-        // Property/PropertyMap/MethodSemantics row from linked output while unit tests, which
-        // have no linker, kept passing).
-        for prop in def.properties() {
-            let name = self.alloc_string(source[prop.name()].as_ref());
-            let tpe = self.translate_type(source, prop.tpe());
-            let getter = prop.getter().map(|g| {
-                let mref = self.translate_method_ref(source, &source[g]);
-                self.alloc_methodref(mref)
-            });
-            let setter = prop.setter().map(|s| {
-                let mref = self.translate_method_ref(source, &source[s]);
-                self.alloc_methodref(mref)
-            });
-            translated.add_property(super::class::PropertyDef::new(name, tpe, getter, setter));
-        }
-        // Carry attached custom attributes across the assembly boundary (same silent-drop hazard
-        // documented on `events`/`properties` above — a real build always crosses the linker, so
-        // skipping this would strip every `CustomAttribute` row from linked output while unit
-        // tests, which never link, kept passing).
-        for attr in def.custom_attributes() {
-            let attr_type = self.translate_class_ref(source, attr.attr_type());
-            let mut ctor_args = Vec::with_capacity(attr.ctor_args().len());
-            for arg in attr.ctor_args() {
-                ctor_args.push(self.translate_custom_attr_arg(source, arg));
-            }
-            let mut named_args = Vec::with_capacity(attr.named_args().len());
-            for (name, arg) in attr.named_args() {
-                let name = self.alloc_string(source[*name].as_ref());
-                let arg = self.translate_custom_attr_arg(source, arg);
-                named_args.push((name, arg));
-            }
-            translated.add_custom_attribute(super::class::CustomAttrDef::new(
-                attr_type, ctor_args, named_args,
-            ));
-        }
-        // Carry a generic type DEFINITION's declared parameter names across the assembly
-        // boundary (re-interned into THIS assembly's string heap). Must run BEFORE `ref_to()`
-        // below: a nonzero-arity def without its names fails `ref_to`'s consistency assert —
-        // deliberately loud, so a missed translation can never silently drop `GenericParam` rows.
-        if !def.generic_names().is_empty() {
-            let names = def
-                .generic_names()
-                .iter()
-                .map(|n| self.alloc_string(source[*n].as_ref()))
-                .collect();
-            translated = translated.with_type_generic_names(names);
-        }
+        ctx: &mut RelocateCtx<'_>,
+        def: &ClassDef,
+    ) -> ClassDef {
+        let super::class::RelocatedClassDef {
+            definition: translated,
+            source_methods,
+        } = def.clone().relocate(ctx, self);
         let class_ref = self.alloc_class_ref(translated.ref_to());
         let (defs_mut, _) = self.class_defs_mut_strings();
         match defs_mut.entry(ClassDefIdx(class_ref)) {
@@ -832,18 +629,16 @@ impl Assembly {
             }
         }
 
-        def.methods().iter().for_each(|mdef| {
-            let mut method_def = self.translate_method_def(source, source.method_def(*mdef));
+        for source_method in source_methods {
+            let source_method = ctx.source.method_def(source_method).clone();
+            let mut method_def = source_method.relocate(ctx, self);
             let method_ref = self.alloc_methodref(method_def.ref_to());
-            // 1st Take the orignal method, if it exists(we need this to be able to mutate methods)
             let original = self.method_defs().get(&MethodDefIdx(method_ref));
             let method_def = match original {
                 Some(original) => {
                     assert_eq!(method_def.name(), original.name());
-                    // Check if this method has a special name, and needs merging.
                     let name = &self[method_def.name()];
                     if SPECIAL_METHOD_NAMES.iter().any(|val| **val == *name) {
-                        // Needs special handling.
                         assert_eq!(method_def.access(), original.access());
                         assert_eq!(method_def.class(), original.class());
                         assert_eq!(method_def.sig(), original.sig());
@@ -853,7 +648,6 @@ impl Assembly {
                             .merge_cctor_impls(original.implementation(), self);
                         method_def
                     } else {
-                        // Not special, proly does not need merging, so we can check if it matches and go on our merry way.
                         assert_eq!(method_def.access(), original.access());
                         assert_eq!(method_def.class(), original.class());
                         assert_eq!(method_def.sig(), original.sig());
@@ -864,16 +658,52 @@ impl Assembly {
                 None => method_def,
             };
             self.new_method(method_def);
-        });
+        }
         translated
     }
 }
 const SPECIAL_METHOD_NAMES: &[&str] = &[CCTOR, TCCTOR, USER_INIT];
 
+pub(crate) fn relocate_assembly(
+    mut destination: Assembly,
+    source: &Assembly,
+) -> (Assembly, RelocationStats) {
+    source.assert_relocation_arena_coverage();
+    destination.assert_relocation_arena_coverage();
+    let original_str = destination.alloc_string(super::asm::MAIN_MODULE);
+    let mut class_ids: Vec<_> = source.iter_class_def_ids().copied().collect();
+    class_ids.sort_unstable_by_key(|class_id| class_id.0.inner());
+    let mut ctx = RelocateCtx::new(source);
+    for class_id in class_ids {
+        let def = source
+            .class_defs()
+            .get(&class_id)
+            .expect("snapshotted source class definition");
+        let translated = destination.translate_class_def(&mut ctx, def);
+        let class_ref = destination.alloc_class_ref(translated.ref_to());
+        let (class_defs, _) = destination.class_defs_mut_strings();
+        match class_defs.entry(ClassDefIdx(class_ref)) {
+            std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                occupied.get_mut().merge_defs(translated);
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                vacant.insert(translated);
+            }
+        }
+    }
+    assert_eq!(destination.alloc_string(super::asm::MAIN_MODULE), original_str);
+    (destination, ctx.stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ir::cilnode::MethodKind, Access, Const, IString, Int, MethodImpl, Type};
+    use crate::{
+        ir::cilnode::{BinOp, MethodKind},
+        ir::class::{CustomAttrArg, CustomAttrDef, EventDef, PropertyDef, StaticFieldDef},
+        Access, BasicBlock, Const, IString, Int, MethodDef, MethodImpl, Type,
+    };
+    use std::num::NonZeroU32;
 
     fn add_void_method(
         asm: &mut Assembly,
@@ -987,13 +817,508 @@ mod tests {
             .expect("linked authoritative type");
         assert_ne!(authoritative.name().inner(), authoritative_name.inner());
         assert!(authoritative.is_valuetype());
-        assert!(authoritative.is_valuetype_authoritative());
+        let mut authoritative = authoritative.clone();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            authoritative.set_is_valuetype(false);
+        }))
+        .is_err());
 
         let placeholder = linked
             .class_defs()
             .values()
             .find(|def| &linked[def.name()] == "NonAuthoritativePlaceholder")
             .expect("linked placeholder type");
-        assert!(!placeholder.is_valuetype_authoritative());
+        let mut placeholder = placeholder.clone();
+        placeholder.set_is_valuetype(true);
+        assert!(placeholder.is_valuetype());
+    }
+
+    #[test]
+    fn link_relocates_shared_node_dag_once() {
+        const DEPTH: usize = 20;
+
+        let mut destination = Assembly::default();
+        seed_destination_ids(&mut destination);
+
+        let mut source = Assembly::default();
+        let mut top = source.alloc_node(Const::I32(11));
+        for _ in 0..DEPTH {
+            top = source.alloc_node(CILNode::BinOp(top, top, BinOp::Add));
+        }
+        let source_top = top;
+        let pop = source.alloc_root(CILRoot::Pop(top));
+        let ret = source.alloc_root(CILRoot::VoidRet);
+        add_void_method(
+            &mut source,
+            "source_with_shared_node_dag",
+            vec![BasicBlock::new(vec![pop, pop, ret], 0, None)],
+        );
+
+        let (linked, stats) = destination.link_with_stats(source);
+        let method = linked
+            .method_defs()
+            .values()
+            .find(|method| &linked[method.name()] == "source_with_shared_node_dag")
+            .expect("linked source method");
+        let MethodImpl::MethodBody { blocks, .. } = method.implementation() else {
+            panic!("source method must keep its body");
+        };
+        assert_eq!(blocks[0].roots()[0], blocks[0].roots()[1]);
+        let CILRoot::Pop(relocated_top) = linked.get_root(blocks[0].roots()[0]) else {
+            panic!("source method must keep its pop root");
+        };
+        assert_ne!(relocated_top.inner(), source_top.inner());
+        assert_eq!(stats.nodes.unique_visits, DEPTH + 1);
+        assert_eq!(stats.nodes.cache_hits, DEPTH);
+        assert_eq!(stats.roots.unique_visits, 2);
+        assert_eq!(stats.roots.cache_hits, 1);
+    }
+
+    #[test]
+    fn link_orders_class_definitions_by_source_id() {
+        let mut source = Assembly::default();
+        let mut class_ids = Vec::new();
+        for name in ["Alpha", "Beta", "Gamma"] {
+            let name = source.alloc_string(name);
+            class_ids.push(
+                source
+                    .class_def(ClassDef::new(
+                        name,
+                        false,
+                        0,
+                        None,
+                        vec![],
+                        vec![],
+                        Access::Public,
+                        None,
+                        None,
+                        true,
+                    ))
+                    .unwrap(),
+            );
+        }
+
+        let mut reordered = source.clone();
+        let (defs, _) = reordered.class_defs_mut_strings();
+        let mut removed: Vec<_> = class_ids
+            .iter()
+            .map(|id| (*id, defs.remove(id).expect("source class definition")))
+            .collect();
+        for (id, def) in removed.drain(..).rev() {
+            defs.insert(id, def);
+        }
+
+        let linked = Assembly::default().link(source);
+        let reordered_linked = Assembly::default().link(reordered);
+        assert_eq!(
+            postcard::to_allocvec(&linked).unwrap(),
+            postcard::to_allocvec(&reordered_linked).unwrap()
+        );
+
+        let mut linked_classes: Vec<_> = linked
+            .class_defs()
+            .iter()
+            .map(|(id, def)| (id.0.inner(), linked[def.name()].to_string()))
+            .collect();
+        linked_classes.sort_unstable_by_key(|(id, _)| *id);
+        assert_eq!(
+            linked_classes
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["Alpha", "Beta", "Gamma"]
+        );
+    }
+
+    #[test]
+    fn compact_keeps_live_graph_and_removes_unreachable_arena_values() {
+        let mut asm = Assembly::default();
+        let owner = asm.main_module();
+
+        let live_type = asm.alloc_type(Type::Int(Int::U32));
+        let live_data = asm.alloc_const_data(&[1, 2, 3, 4]);
+        let live_buffer = asm.alloc_node(Const::ByteBuffer {
+            data: live_data,
+            tpe: live_type,
+        });
+        let live_field_name = asm.alloc_string("live_field");
+        let live_field = asm.alloc_field(FieldDesc::new(
+            *owner,
+            live_field_name,
+            Type::Int(Int::I32),
+        ));
+        let live_addr = asm.alloc_node(Const::Null(*owner));
+        let live_field_load = asm.alloc_node(CILNode::LdField {
+            addr: live_addr,
+            field: live_field,
+        });
+        let live_static_name = asm.alloc_string("live_static");
+        let live_static = asm.alloc_sfld(StaticFieldDesc::new(
+            *owner,
+            live_static_name,
+            Type::Int(Int::I32),
+        ));
+        let live_static_load = asm.alloc_node(CILNode::LdStaticField(live_static));
+
+        let shared_root = asm.alloc_root(CILRoot::Pop(live_buffer));
+        let field_root = asm.alloc_root(CILRoot::Pop(live_field_load));
+        let static_root = asm.alloc_root(CILRoot::Pop(live_static_load));
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        add_void_method(
+            &mut asm,
+            "live_method",
+            vec![BasicBlock::new(
+                vec![shared_root, shared_root, field_root, static_root, ret],
+                0,
+                None,
+            )],
+        );
+        asm.add_section("compaction-test", [9, 8, 7]);
+
+        let junk_string = asm.alloc_string("unreachable");
+        let junk_type = asm.alloc_type(Type::Int(Int::U16));
+        let junk_class = asm.alloc_class_ref(ClassRef::new(
+            junk_string,
+            None,
+            false,
+            vec![].into(),
+        ));
+        let junk_sig = asm.sig([Type::Int(Int::U8)], Type::Int(Int::U8));
+        let _junk_method = asm.alloc_methodref(MethodRef::new(
+            junk_class,
+            junk_string,
+            junk_sig,
+            MethodKind::Static,
+            vec![].into(),
+        ));
+        let _junk_field = asm.alloc_field(FieldDesc::new(
+            junk_class,
+            junk_string,
+            Type::Int(Int::U8),
+        ));
+        let _junk_static = asm.alloc_sfld(StaticFieldDesc::new(
+            junk_class,
+            junk_string,
+            Type::Int(Int::U8),
+        ));
+        let junk_data = asm.alloc_const_data(&[0xde, 0xad]);
+        let junk_node = asm.alloc_node(Const::ByteBuffer {
+            data: junk_data,
+            tpe: junk_type,
+        });
+        let _junk_root = asm.alloc_root(CILRoot::Pop(junk_node));
+
+        let (compacted, stats) = asm.compact();
+        for (arena, before, after) in [
+            ("strings", stats.before.strings, stats.after.strings),
+            ("types", stats.before.types, stats.after.types),
+            (
+                "class refs",
+                stats.before.class_refs,
+                stats.after.class_refs,
+            ),
+            ("nodes", stats.before.nodes, stats.after.nodes),
+            ("roots", stats.before.roots, stats.after.roots),
+            (
+                "signatures",
+                stats.before.signatures,
+                stats.after.signatures,
+            ),
+            (
+                "method refs",
+                stats.before.method_refs,
+                stats.after.method_refs,
+            ),
+            ("fields", stats.before.fields, stats.after.fields),
+            ("statics", stats.before.statics, stats.after.statics),
+            (
+                "const data",
+                stats.before.const_data,
+                stats.after.const_data,
+            ),
+        ] {
+            assert_eq!(before, after + 1, "unexpected {arena} compaction");
+        }
+        assert_eq!(stats.before.class_defs, stats.after.class_defs);
+        assert_eq!(stats.before.method_defs, stats.after.method_defs);
+        assert_eq!(stats.before.sections, stats.after.sections);
+        assert!(stats.relocation.roots.cache_hits >= 1);
+        assert_eq!(compacted.get_section("compaction-test"), Some(&vec![9, 8, 7]));
+
+        let method = compacted
+            .method_defs()
+            .values()
+            .find(|method| &compacted[method.name()] == "live_method")
+            .expect("live method survives compaction");
+        let MethodImpl::MethodBody { blocks, .. } = method.implementation() else {
+            panic!("live method must keep its body");
+        };
+        assert_eq!(blocks[0].roots()[0], blocks[0].roots()[1]);
+
+        let once_bytes = postcard::to_allocvec(&compacted).unwrap();
+        let (compacted_twice, second_stats) = compacted.compact();
+        assert_eq!(second_stats.before, second_stats.after);
+        assert_eq!(once_bytes, postcard::to_allocvec(&compacted_twice).unwrap());
+    }
+
+    #[test]
+    fn link_relocates_all_owned_metadata_with_offset_ids() {
+        let mut destination = Assembly::default();
+        seed_destination_ids(&mut destination);
+
+        let mut source = Assembly::default();
+        let class_name = source.alloc_string("KitchenSink");
+        let generic_name = source.alloc_string("TClass");
+        let field_name = source.alloc_string("payload");
+        let static_name = source.alloc_string("StaticText");
+        let default_text = source.alloc_string("default-value");
+        let base_name = source.alloc_string("KitchenBase");
+        let base = source.alloc_class_ref(ClassRef::new(base_name, None, false, vec![].into()));
+        let interface_name = source.alloc_string("IKitchen");
+        let interface = source.alloc_class_ref(ClassRef::new(
+            interface_name,
+            None,
+            false,
+            vec![].into(),
+        ));
+        let mut class = ClassDef::new(
+            class_name,
+            true,
+            1,
+            Some(base),
+            vec![(Type::Int(Int::I32), field_name, Some(4))],
+            vec![StaticFieldDef {
+                tpe: Type::PlatformString,
+                name: static_name,
+                is_tls: true,
+                default_value: Some(Const::PlatformString(default_text)),
+                is_const: true,
+            }],
+            Access::Public,
+            NonZeroU32::new(32),
+            NonZeroU32::new(8),
+            false,
+        )
+        .with_valuetype_authoritative()
+        .with_interface()
+        .with_type_generic_names(vec![generic_name]);
+        class.add_interface(interface);
+        let class_id = source.class_def(class).unwrap();
+
+        let accessor_sig = source.sig([], Type::Void);
+        let add = source.new_methodref(
+            *class_id,
+            "add_Changed",
+            accessor_sig,
+            MethodKind::Virtual,
+            vec![],
+        );
+        let remove = source.new_methodref(
+            *class_id,
+            "remove_Changed",
+            accessor_sig,
+            MethodKind::Virtual,
+            vec![],
+        );
+        let getter = source.new_methodref(
+            *class_id,
+            "get_Value",
+            accessor_sig,
+            MethodKind::Virtual,
+            vec![],
+        );
+        let setter = source.new_methodref(
+            *class_id,
+            "set_Value",
+            accessor_sig,
+            MethodKind::Virtual,
+            vec![],
+        );
+        let delegate_name = source.alloc_string("KitchenDelegate");
+        let delegate = source.alloc_class_ref(ClassRef::new(
+            delegate_name,
+            None,
+            false,
+            vec![].into(),
+        ));
+        let property_inner = source.alloc_type(Type::Int(Int::I16));
+        let event_name = source.alloc_string("Changed");
+        let property_name = source.alloc_string("Value");
+        source.class_mut(class_id).add_event(EventDef::new(
+            event_name,
+            Type::ClassRef(delegate),
+            add,
+            remove,
+        ));
+        source.class_mut(class_id).add_property(PropertyDef::new(
+            property_name,
+            Type::Ref(property_inner),
+            Some(getter),
+            Some(setter),
+        ));
+
+        let attr_name = source.alloc_string("KitchenAttribute");
+        let attr_type = source.alloc_class_ref(ClassRef::new(
+            attr_name,
+            None,
+            false,
+            vec![].into(),
+        ));
+        let ctor_text = source.alloc_string("ctor-text");
+        let named_name = source.alloc_string("NamedText");
+        let named_text = source.alloc_string("named-text");
+        source
+            .class_mut(class_id)
+            .add_custom_attribute(CustomAttrDef::new(
+                attr_type,
+                vec![
+                    CustomAttrArg::Str(ctor_text),
+                    CustomAttrArg::Bool(true),
+                    CustomAttrArg::I32(17),
+                    CustomAttrArg::I64(29),
+                ],
+                vec![(named_name, CustomAttrArg::Str(named_text))],
+            ));
+
+        let argument_inner = source.alloc_type(Type::Int(Int::I32));
+        let method_sig = source.sig([Type::Ref(argument_inner)], Type::Void);
+        let override_name = source.alloc_string("BaseVirtual");
+        let override_method = source.alloc_methodref(MethodRef::new(
+            base,
+            override_name,
+            method_sig,
+            MethodKind::Virtual,
+            vec![].into(),
+        ));
+        let local_name = source.alloc_string("local_value");
+        let local_type = source.alloc_type(Type::Int(Int::U64));
+        let argument_name = source.alloc_string("output");
+        let method_generic = source.alloc_string("TMethod");
+        let method_name = source.alloc_string("KitchenMethod");
+        let ret = source.alloc_root(CILRoot::VoidRet);
+        source.new_method(
+            MethodDef::new(
+                Access::Public,
+                class_id,
+                method_name,
+                method_sig,
+                MethodKind::Virtual,
+                MethodImpl::MethodBody {
+                    blocks: vec![BasicBlock::new_raw(vec![ret], 7, Some(41))],
+                    locals: vec![(Some(local_name), local_type)],
+                },
+                vec![Some(argument_name)],
+            )
+            .with_override(override_method)
+            .with_abstract()
+            .with_out_params(vec![1])
+            .with_generic_params(vec![method_generic])
+            .with_special_name(),
+        );
+
+        let linked = destination.link(source);
+        let (linked_class_id, linked_class) = linked
+            .class_defs()
+            .iter()
+            .find(|(_, class)| &linked[class.name()] == "KitchenSink")
+            .expect("linked kitchen-sink class");
+        assert_ne!(linked_class.name().inner(), class_name.inner());
+        assert!(linked_class.is_valuetype());
+        assert!(linked_class.is_interface());
+        assert_eq!(linked_class.generics(), 1);
+        assert_eq!(&linked[linked_class.generic_names()[0]], "TClass");
+        assert_eq!(*linked_class.access(), Access::Public);
+        assert_eq!(linked_class.explict_size(), NonZeroU32::new(32));
+        assert_eq!(linked_class.align(), NonZeroU32::new(8));
+        assert!(!linked_class.has_nonveralpping_layout());
+        let mut authority_probe = linked_class.clone();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            authority_probe.set_is_valuetype(false);
+        }))
+        .is_err());
+
+        let extends = linked_class.extends().expect("relocated base class");
+        assert_eq!(&linked[linked.class_ref(extends).name()], "KitchenBase");
+        assert_eq!(linked_class.implements().len(), 1);
+        assert_eq!(
+            &linked[linked.class_ref(linked_class.implements()[0]).name()],
+            "IKitchen"
+        );
+        assert_eq!(linked_class.fields().len(), 1);
+        assert_eq!(linked_class.fields()[0].0, Type::Int(Int::I32));
+        assert_eq!(&linked[linked_class.fields()[0].1], "payload");
+        assert_eq!(linked_class.fields()[0].2, Some(4));
+        let static_field = &linked_class.static_fields()[0];
+        assert_eq!(static_field.tpe, Type::PlatformString);
+        assert_eq!(&linked[static_field.name], "StaticText");
+        assert!(static_field.is_tls);
+        assert!(static_field.is_const);
+        let Some(Const::PlatformString(default_text)) = static_field.default_value else {
+            panic!("static default must remain a platform string");
+        };
+        assert_eq!(&linked[default_text], "default-value");
+
+        let event = &linked_class.events()[0];
+        assert_eq!(&linked[event.name()], "Changed");
+        let Type::ClassRef(delegate) = event.delegate() else {
+            panic!("event delegate must remain a class reference");
+        };
+        assert_eq!(&linked[linked.class_ref(delegate).name()], "KitchenDelegate");
+        assert_eq!(&linked[linked[event.add()].name()], "add_Changed");
+        assert_eq!(&linked[linked[event.remove()].name()], "remove_Changed");
+
+        let property = &linked_class.properties()[0];
+        assert_eq!(&linked[property.name()], "Value");
+        let Type::Ref(property_inner) = property.tpe() else {
+            panic!("property type must remain a managed reference");
+        };
+        assert_eq!(linked[property_inner], Type::Int(Int::I16));
+        let getter = property.getter().expect("property getter");
+        let setter = property.setter().expect("property setter");
+        assert_eq!(&linked[linked[getter].name()], "get_Value");
+        assert_eq!(&linked[linked[setter].name()], "set_Value");
+
+        let attribute = &linked_class.custom_attributes()[0];
+        assert_eq!(
+            &linked[linked.class_ref(attribute.attr_type()).name()],
+            "KitchenAttribute"
+        );
+        assert!(matches!(attribute.ctor_args()[0], CustomAttrArg::Str(value) if &linked[value] == "ctor-text"));
+        assert_eq!(attribute.ctor_args()[1], CustomAttrArg::Bool(true));
+        assert_eq!(attribute.ctor_args()[2], CustomAttrArg::I32(17));
+        assert_eq!(attribute.ctor_args()[3], CustomAttrArg::I64(29));
+        assert_eq!(&linked[attribute.named_args()[0].0], "NamedText");
+        assert!(matches!(attribute.named_args()[0].1, CustomAttrArg::Str(value) if &linked[value] == "named-text"));
+
+        let method = linked
+            .method_defs()
+            .values()
+            .find(|method| &linked[method.name()] == "KitchenMethod")
+            .expect("linked kitchen-sink method");
+        assert_ne!(method.name().inner(), method_name.inner());
+        assert_eq!(method.class(), *linked_class_id);
+        assert_eq!(*method.access(), Access::Public);
+        assert_eq!(method.kind(), MethodKind::Virtual);
+        assert_eq!(&linked[method.arg_names()[0].expect("argument name")], "output");
+        assert!(method.is_abstract());
+        assert!(method.is_special_name());
+        assert_eq!(method.out_params(), [1]);
+        assert_eq!(&linked[method.generic_params()[0]], "TMethod");
+        let override_method = method.overrides().expect("explicit override");
+        assert_eq!(&linked[linked[override_method].name()], "BaseVirtual");
+        let signature = &linked[method.sig()];
+        let Type::Ref(argument_inner) = signature.inputs()[0] else {
+            panic!("method argument must remain a managed reference");
+        };
+        assert_eq!(linked[argument_inner], Type::Int(Int::I32));
+        assert_eq!(*signature.output(), Type::Void);
+        let MethodImpl::MethodBody { blocks, locals } = method.implementation() else {
+            panic!("method body metadata must survive linking");
+        };
+        assert_eq!(blocks[0].block_id(), 7);
+        assert_eq!(blocks[0].handler_id(), Some(41));
+        assert_eq!(linked.get_root(blocks[0].roots()[0]), &CILRoot::VoidRet);
+        assert_eq!(&linked[locals[0].0.expect("local name")], "local_value");
+        assert_eq!(linked[locals[0].1], Type::Int(Int::U64));
     }
 }

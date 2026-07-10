@@ -5292,7 +5292,7 @@ mod tests {
 
     /// Two distinct blob sizes must land as two distinct `TypeDef`/`ClassLayout` row pairs (each
     /// `n` needs its own carrier type — `il_exporter` dedups by exact size via a sorted+deduped
-    /// `Vec<usize>` over `asm.const_data.1.keys()`, mod.rs:116-121). This module doesn't dedupe
+    /// `Vec<usize>` over `asm.const_data.values()`, mod.rs:116-121). This module doesn't dedupe
     /// internally (the caller is expected to, same as `il_exporter`'s explicit dedup step) — this
     /// test documents that contract so a future caller doesn't assume dedup happens for free.
     #[test]

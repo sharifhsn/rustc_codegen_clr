@@ -8,10 +8,12 @@ use crate::Assembly;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Prefix identifying a versioned `cilly` assembly artifact.
-pub const ASSEMBLY_ARTIFACT_MAGIC: &[u8; 8] = b"CILLYART";
+/// Prefix identifying the current, schema-v2 `cilly` assembly artifact before payload decoding.
+pub const ASSEMBLY_ARTIFACT_MAGIC: &[u8; 8] = b"CILLYAR2";
+/// Magic emitted by schema-v1 artifacts, whose `BiMap` payload duplicated value storage.
+const ASSEMBLY_ARTIFACT_V1_MAGIC: &[u8; 8] = b"CILLYART";
 /// Current serialization-envelope version.
-pub const ASSEMBLY_ARTIFACT_VERSION: u16 = 1;
+pub const ASSEMBLY_ARTIFACT_VERSION: u16 = 2;
 
 /// Output target whose linker/runtime semantics the artifact was generated for.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -530,6 +532,12 @@ impl DecodedAssemblyArtifact {
 pub fn decode_assembly_artifact(
     encoded: &[u8],
 ) -> Result<DecodedAssemblyArtifact, ArtifactDecodeError> {
+    if encoded.starts_with(ASSEMBLY_ARTIFACT_V1_MAGIC) {
+        return Err(ArtifactDecodeError::UnsupportedVersion {
+            found: 1,
+            supported: ASSEMBLY_ARTIFACT_VERSION,
+        });
+    }
     if let Some(payload) = encoded.strip_prefix(ASSEMBLY_ARTIFACT_MAGIC) {
         let artifact: AssemblyArtifact =
             postcard::from_bytes(payload).map_err(ArtifactDecodeError::InvalidVersionedEnvelope)?;
@@ -568,7 +576,8 @@ impl std::fmt::Display for ArtifactDecodeError {
         match self {
             Self::UnsupportedVersion { found, supported } => write!(
                 f,
-                "unsupported cilly artifact version {found}; this linker supports version {supported}"
+                "unsupported cilly artifact version {found}; this linker requires schema version \
+                 {supported}. Rebuild all input crates/artifacts with the current backend"
             ),
             Self::InvalidVersionedEnvelope(error) => {
                 write!(f, "invalid versioned cilly artifact envelope: {error}")
@@ -664,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn magic_prefixed_unsupported_version_never_falls_back_to_legacy() {
+    fn magic_prefixed_unsupported_payload_version_never_falls_back_to_legacy() {
         let mut artifact = AssemblyArtifact::new(Assembly::default(), BuildConfig::default());
         artifact.version = ASSEMBLY_ARTIFACT_VERSION + 1;
         let encoded = artifact.encode().unwrap();
@@ -673,10 +682,26 @@ mod tests {
         assert!(matches!(
             error,
             ArtifactDecodeError::UnsupportedVersion {
-                found: 2,
-                supported: 1
+                found: 3,
+                supported: 2
             }
         ));
+    }
+
+    #[test]
+    fn v1_header_is_rejected_before_deserializing_its_old_bimap_shape() {
+        let mut encoded = ASSEMBLY_ARTIFACT_V1_MAGIC.to_vec();
+        encoded.extend_from_slice(b"payload shape intentionally irrelevant");
+
+        let error = decode_assembly_artifact(&encoded).err().unwrap();
+        assert!(matches!(
+            error,
+            ArtifactDecodeError::UnsupportedVersion {
+                found: 1,
+                supported: 2
+            }
+        ));
+        assert!(error.to_string().contains("Rebuild all input crates"));
     }
 
     #[test]

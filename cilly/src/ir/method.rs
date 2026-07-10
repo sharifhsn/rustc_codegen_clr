@@ -2,6 +2,7 @@ use fxhash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use super::{
+    asm_link::{RelocateCtx, RelocateValue},
     bimap::Interned,
     cilnode::{IsPure, MethodKind},
     class::ClassDefIdx,
@@ -21,6 +22,29 @@ pub struct MethodRef {
     /// Generic arguments bound at the call site for this *method* (`!!N`), distinct from
     /// `class`'s own generic arguments (`!N`) — the two tiers are bound independently.
     generics: Box<[Type]>,
+}
+impl RelocateValue for MethodRef {
+    type Output = Self;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
+        let Self {
+            class,
+            name,
+            sig,
+            kind,
+            generics,
+        } = self;
+        Self {
+            class: ctx.class_ref(destination, class),
+            name: ctx.string(destination, name),
+            sig: ctx.signature(destination, sig),
+            kind,
+            generics: generics
+                .iter()
+                .map(|tpe| destination.translate_type(ctx, *tpe))
+                .collect(),
+        }
+    }
 }
 impl IntoAsmIndex<Interned<MethodRef>> for MethodRef {
     fn into_idx(self, asm: &mut Assembly) -> Interned<MethodRef> {
@@ -236,6 +260,47 @@ pub struct MethodDef {
     /// format — rebuild dylib + linker together and `cargo clean` consumers (the build-std
     /// fingerprint trap).
     is_special_name: bool,
+}
+
+impl RelocateValue for MethodDef {
+    type Output = Self;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
+        let Self {
+            access,
+            class,
+            name,
+            sig,
+            arg_names,
+            kind,
+            implementation,
+            overrides,
+            is_abstract,
+            out_params,
+            generic_params,
+            is_special_name,
+        } = self;
+        Self {
+            access,
+            class: class.relocate(ctx, destination),
+            name: ctx.string(destination, name),
+            sig: ctx.signature(destination, sig),
+            arg_names: arg_names
+                .into_iter()
+                .map(|name| name.map(|name| ctx.string(destination, name)))
+                .collect(),
+            kind,
+            implementation: implementation.relocate(ctx, destination),
+            overrides: overrides.map(|method| ctx.method_ref(destination, method)),
+            is_abstract,
+            out_params,
+            generic_params: generic_params
+                .into_iter()
+                .map(|name| ctx.string(destination, name))
+                .collect(),
+            is_special_name,
+        }
+    }
 }
 
 impl MethodDef {
@@ -699,6 +764,38 @@ pub enum MethodImpl {
     AliasFor(Interned<MethodRef>),
     Missing,
 }
+impl RelocateValue for MethodImpl {
+    type Output = Self;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
+        match self {
+            Self::MethodBody { blocks, locals } => Self::MethodBody {
+                blocks: blocks
+                    .into_iter()
+                    .map(|block| block.relocate(ctx, destination))
+                    .collect(),
+                locals: locals
+                    .into_iter()
+                    .map(|(name, tpe)| {
+                        (
+                            name.map(|name| ctx.string(destination, name)),
+                            ctx.type_id(destination, tpe),
+                        )
+                    })
+                    .collect(),
+            },
+            Self::Extern {
+                lib,
+                preserve_errno,
+            } => Self::Extern {
+                lib: ctx.string(destination, lib),
+                preserve_errno,
+            },
+            Self::AliasFor(method) => Self::AliasFor(ctx.method_ref(destination, method)),
+            Self::Missing => Self::Missing,
+        }
+    }
+}
 impl MethodImpl {
     pub fn root_count(&self) -> usize {
         match self {
@@ -986,6 +1083,14 @@ impl MethodImpl {
 }
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct MethodDefIdx(pub Interned<MethodRef>);
+impl RelocateValue for MethodDefIdx {
+    type Output = Self;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
+        let Self(method) = self;
+        Self(ctx.method_ref(destination, method))
+    }
+}
 impl MethodDefIdx {
     pub(crate) fn from_raw(method: Interned<MethodRef>) -> MethodDefIdx {
         Self(method)

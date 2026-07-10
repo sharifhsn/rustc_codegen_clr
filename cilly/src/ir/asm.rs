@@ -40,6 +40,66 @@ pub struct MissingMethodResolutionStats {
     pub unresolved_missing_methods: usize,
 }
 
+/// Stable size snapshot of every assembly-owned interning arena and definition collection.
+///
+/// The definition and section counts are included alongside the arenas so compaction diagnostics
+/// can distinguish removed backing values from accidentally removed program structure.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AssemblyArenaCounts {
+    pub strings: usize,
+    pub types: usize,
+    pub class_refs: usize,
+    pub nodes: usize,
+    pub roots: usize,
+    pub signatures: usize,
+    pub method_refs: usize,
+    pub fields: usize,
+    pub statics: usize,
+    pub const_data: usize,
+    pub class_defs: usize,
+    pub method_defs: usize,
+    pub sections: usize,
+}
+
+/// Before/after accounting for one whole-assembly compaction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompactionStats {
+    pub before: AssemblyArenaCounts,
+    pub after: AssemblyArenaCounts,
+    pub relocation: super::asm_link::RelocationStats,
+}
+
+impl std::fmt::Display for CompactionStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        macro_rules! arena {
+            ($name:literal, $field:ident) => {
+                write!(
+                    f,
+                    concat!($name, " {}->{} "),
+                    self.before.$field, self.after.$field
+                )?
+            };
+        }
+        arena!("strings", strings);
+        arena!("types", types);
+        arena!("class-refs", class_refs);
+        arena!("nodes", nodes);
+        arena!("roots", roots);
+        arena!("signatures", signatures);
+        arena!("method-refs", method_refs);
+        arena!("fields", fields);
+        arena!("statics", statics);
+        arena!("const-data", const_data);
+        arena!("class-defs", class_defs);
+        arena!("method-defs", method_defs);
+        write!(
+            f,
+            "sections {}->{}",
+            self.before.sections, self.after.sections
+        )
+    }
+}
+
 impl std::fmt::Display for MissingMethodResolutionStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -504,7 +564,7 @@ impl Assembly {
         pat: P,
     ) -> impl Iterator<Item = Interned<IString>> + 'a {
         self.strings
-            .0
+            .values()
             .iter()
             .enumerate()
             .filter_map(move |(idx, str)| {
@@ -517,11 +577,8 @@ impl Assembly {
                 }
             })
     }
-    pub fn get_prealloc_string(
-        &self,
-        string: impl Into<IString>,
-    ) -> Option<Interned<IString>> {
-        self.strings.1.get(&(string.into())).copied()
+    pub fn get_prealloc_string(&self, string: impl Into<IString>) -> Option<Interned<IString>> {
+        self.strings.get_id(&string.into())
     }
     pub fn class_mut(&mut self, id: ClassDefIdx) -> &mut ClassDef {
         self.class_defs.get_mut(&id).unwrap()
@@ -951,13 +1008,13 @@ impl Assembly {
         self.has_builtin(TCCTOR, [], Type::Void)
     }
     pub fn get_prealloc_class_ref(&self, cref: ClassRef) -> Option<Interned<ClassRef>> {
-        self.class_refs.1.get(&cref).copied()
+        self.class_refs.get_id(&cref)
     }
     pub fn get_prealloc_sig(&self, sig: FnSig) -> Option<Interned<FnSig>> {
-        self.sigs.1.get(&sig).copied()
+        self.sigs.get_id(&sig)
     }
     pub fn get_prealloc_methodref(&self, mref: MethodRef) -> Option<Interned<MethodRef>> {
-        self.method_refs.1.get(&mref).copied()
+        self.method_refs.get_id(&mref)
     }
     /// Returns a reference to the static initializer
     pub fn cctor(&mut self) -> MethodDefIdx {
@@ -1301,7 +1358,7 @@ impl Assembly {
         modifies_errno: &FxHashSet<&str>,
         override_methods: &MissingMethodPatcher,
     ) -> MissingMethodResolutionStats {
-        let initial_mref_count = self.method_refs.0.len();
+        let initial_mref_count = self.method_refs.len();
         let mut stats = MissingMethodResolutionStats::default();
         let externs: FxHashMap<_, _> = externs
             .iter()
@@ -1317,10 +1374,19 @@ impl Assembly {
             .map(|fn_name| self.alloc_string(*fn_name))
             .collect();
         let mut index = 0;
-        while index < self.method_refs.0.len() {
+        while index < self.method_refs.len() {
             stats.method_refs_processed += 1;
             // Get the full method refernce
-            let mref = self.method_refs.0[index].clone();
+            let mref_idx = Interned::from_index(
+                std::num::NonZeroU32::new(
+                    u32::try_from(index)
+                        .expect("MethodRef index exceeds u32")
+                        .checked_add(1)
+                        .expect("MethodRef index overflow"),
+                )
+                .unwrap(),
+            );
+            let mref = self.method_refs.get(mref_idx).clone();
             index += 1;
             // Check if this method reference's class has an assembly. If it has, then the method is extern. If it has not, then it is defined in this assembly
             // and must have some kind of implementation
@@ -1331,7 +1397,6 @@ impl Assembly {
                 stats.external_method_refs += 1;
                 continue;
             }
-            let mref_idx = Interned::from_index(std::num::NonZeroU32::new(index as u32).unwrap());
             // Check if this method already has an implementation.
             if self
                 .method_defs
@@ -1463,7 +1528,7 @@ impl Assembly {
 
             self.new_method(method_def);
         }
-        stats.method_refs_added = self.method_refs.0.len() - initial_mref_count;
+        stats.method_refs_added = self.method_refs.len() - initial_mref_count;
         stats.unresolved_missing_methods = self
             .method_defs
             .values()
@@ -1503,24 +1568,80 @@ impl Assembly {
             .map(|(idx, _)| *idx)
     }
 
+    /// Returns stable counts for every assembly-owned arena and definition collection.
     #[must_use]
-    pub fn link(mut self, other: Self) -> Self {
-        let original_str = self.alloc_string(MAIN_MODULE);
-        for def in other.iter_class_defs() {
-            let translated = self.translate_class_def(&other, def);
-            let class_ref = self.alloc_class_ref(translated.ref_to());
-            match self.class_defs.entry(ClassDefIdx(class_ref)) {
-                std::collections::hash_map::Entry::Occupied(mut occupied) => {
-                    occupied.get_mut().merge_defs(translated);
-                }
-                std::collections::hash_map::Entry::Vacant(vacant) => {
-                    vacant.insert(translated);
-                }
-            }
+    pub fn arena_counts(&self) -> AssemblyArenaCounts {
+        AssemblyArenaCounts {
+            strings: self.strings.len(),
+            types: self.types.len(),
+            class_refs: self.class_refs.len(),
+            nodes: self.nodes.len(),
+            roots: self.roots.len(),
+            signatures: self.sigs.len(),
+            method_refs: self.method_refs.len(),
+            fields: self.fields.len(),
+            statics: self.statics.len(),
+            const_data: self.const_data.len(),
+            class_defs: self.class_defs.len(),
+            method_defs: self.method_defs.len(),
+            sections: self.sections.len(),
         }
-        assert_eq!(self.alloc_string(MAIN_MODULE), original_str);
-        self.sections.extend(other.sections);
-        self
+    }
+
+    /// Compile-time coverage fence for assembly-owned relocation state.
+    ///
+    /// Adding an arena or definition collection makes this destructure fail to compile until the
+    /// relocation design explicitly accounts for the new field.
+    pub(crate) fn assert_relocation_arena_coverage(&self) {
+        let Self {
+            strings: _,
+            types: _,
+            class_refs: _,
+            class_defs: _,
+            nodes: _,
+            roots: _,
+            sigs: _,
+            method_refs: _,
+            fields: _,
+            statics: _,
+            method_defs: _,
+            sections: _,
+            const_data: _,
+        } = self;
+    }
+
+    /// Rebuilds the assembly from its surviving class and method definitions.
+    ///
+    /// Only interned values reachable while translating those definitions are copied. Opaque
+    /// sections are preserved verbatim because they do not contain assembly-local interned ids.
+    #[must_use]
+    pub fn compact(mut self) -> (Self, CompactionStats) {
+        let before = self.arena_counts();
+        let sections = std::mem::take(&mut self.sections);
+        let (mut compacted, relocation) =
+            super::asm_link::relocate_assembly(Self::default(), &self);
+        compacted.sections = sections;
+        let after = compacted.arena_counts();
+        (
+            compacted,
+            CompactionStats {
+                before,
+                after,
+                relocation,
+            },
+        )
+    }
+
+    #[must_use]
+    pub fn link(self, other: Self) -> Self {
+        self.link_with_stats(other).0
+    }
+
+    #[must_use]
+    pub fn link_with_stats(self, other: Self) -> (Self, super::asm_link::RelocationStats) {
+        let (mut linked, stats) = super::asm_link::relocate_assembly(self, &other);
+        linked.sections.extend(other.sections);
+        (linked, stats)
     }
 
     pub fn method_defs(&self) -> &FxHashMap<MethodDefIdx, MethodDef> {
@@ -1530,7 +1651,7 @@ impl Assembly {
     /// Checks if this assembly contains a reference [`ClassRef`]
     #[must_use]
     pub fn contains_ref(&self, cref: &ClassRef) -> bool {
-        self.class_refs.1.contains_key(cref)
+        self.class_refs.contains_value(cref)
     }
 
     pub(crate) fn class_defs_mut_strings(
@@ -1540,11 +1661,11 @@ impl Assembly {
     }
     /// Iteates trough *all the nodes* in this assembly
     pub fn iter_nodes(&self) -> impl Iterator<Item = &CILNode> {
-        self.nodes.0.iter()
+        self.nodes.values().iter()
     }
     /// Iterates trough *all the roots* in this assembly
     pub fn iter_roots(&self) -> impl Iterator<Item = &CILRoot> {
-        self.roots.0.iter()
+        self.roots.values().iter()
     }
     pub fn remove_dead_statics(&mut self) {
         /*// Check which statics are referenced by real code.
@@ -1637,7 +1758,8 @@ impl Assembly {
                 | CILRoot::ExitSpecialRegion { .. }
                 | CILRoot::ReThrow
                 // `protected` is interned in the same root bimap, so this `iter_roots` over
-                // `self.roots.0` already visits it directly — the region itself holds no MethodRef.
+                // `self.roots.values()` already visits it directly — the region itself holds no
+                // MethodRef.
                 | CILRoot::TerminateRegion { .. }
                 | CILRoot::SetStaticField { .. }
                 | CILRoot::CpObj { .. }

@@ -1,7 +1,11 @@
 use fxhash::{FxBuildHasher, FxHashSet};
 use serde::{Deserialize, Serialize};
 
-use super::{bimap::Interned, opt, Assembly, CILNode, CILRoot};
+use super::{
+    asm_link::{RelocateCtx, RelocateValue},
+    bimap::Interned,
+    opt, Assembly, CILNode, CILRoot,
+};
 pub type BlockId = u32;
 #[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
 /// A basic block - sequence of roots, protected by a handler, identified by a unique, per-method id.
@@ -15,6 +19,33 @@ pub struct BasicBlock {
     /// `None` for blocks with no handler or already-resolved handlers.
     #[serde(default)]
     handler_id: Option<BlockId>,
+}
+
+impl RelocateValue for BasicBlock {
+    type Output = Self;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
+        let Self {
+            roots,
+            block_id,
+            handler,
+            handler_id,
+        } = self;
+        Self {
+            roots: roots
+                .into_iter()
+                .map(|root| ctx.root(destination, root))
+                .collect(),
+            block_id,
+            handler: handler.map(|blocks| {
+                blocks
+                    .into_iter()
+                    .map(|block| block.relocate(ctx, destination))
+                    .collect()
+            }),
+            handler_id,
+        }
+    }
 }
 
 impl BasicBlock {
@@ -45,7 +76,7 @@ impl BasicBlock {
     /// The handler will start executing at the first block in the handler, regardless of its id.
     /// ```
     /// # use cilly::BasicBlock;
-    /// # use cilly::Interned<CILRoot>;
+    /// # use cilly::{CILRoot, Interned};
     /// # let roots = vec![];
     /// # let handler_roots = vec![];
     /// // Create a block
@@ -57,7 +88,7 @@ impl BasicBlock {
     /// ```
     /// ```should_panic
     /// # use cilly::BasicBlock;
-    /// # use cilly::Interned<CILRoot>;
+    /// # use cilly::{CILRoot, Interned};
     /// # let roots = vec![];
     /// # let handler_roots = vec![];
     /// # let handlerer_roots = vec![];
@@ -113,7 +144,7 @@ impl BasicBlock {
     /// Retrives the id of this block.
     /// ```
     /// # use cilly::BasicBlock;
-    /// # use cilly::Interned<CILRoot>;
+    /// # use cilly::{CILRoot, Interned};
     /// # let roots = vec![];
     /// let bb = BasicBlock::new(roots, 0, None);
     /// assert_eq!(bb.block_id(), 0);

@@ -1521,7 +1521,7 @@ impl CExporter {
         let mut defined_types: FxHashSet<ClassDefIdx> = FxHashSet::default();
         let mut delayed_defs: FxHashSet<ClassDefIdx> = asm.iter_class_def_ids().cloned().collect();
         let mut delayed_defs_copy: FxHashSet<ClassDefIdx> = FxHashSet::default();
-        for (const_data, idx) in asm.const_data.1.iter() {
+        for (idx, const_data) in asm.const_data.iter() {
             let data: String = match str::from_utf8(const_data) {
                 Ok(s)
                     if asm.char_is_u8()

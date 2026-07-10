@@ -1,10 +1,28 @@
 use serde::{Deserialize, Serialize};
 
-use super::Type;
+use super::{
+    asm_link::{RelocateCtx, RelocateValue},
+    Assembly, Type,
+};
 #[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
 pub struct FnSig {
     inputs: Box<[Type]>,
     output: Type,
+}
+
+impl RelocateValue for FnSig {
+    type Output = Self;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
+        let Self { inputs, output } = self;
+        Self {
+            inputs: inputs
+                .iter()
+                .map(|tpe| destination.translate_type(ctx, *tpe))
+                .collect(),
+            output: destination.translate_type(ctx, output),
+        }
+    }
 }
 
 impl FnSig {

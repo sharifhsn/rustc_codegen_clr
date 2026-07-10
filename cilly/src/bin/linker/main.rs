@@ -553,11 +553,15 @@ fn main() {
     final_assembly.opt(&mut fuel);
     println!("==> Optimizing in {:?}", opt_start.elapsed());
     final_assembly.eliminate_dead_code();
+    let (mut final_assembly, compaction) = final_assembly.compact();
+    if std::env::var("RCL_LINK_STATS").as_deref() == Ok("1") {
+        println!("==> Compaction: {compaction}");
+    }
     final_assembly.fix_aligement();
     let final_assembly = final_assembly.verify_for_export().unwrap_or_else(|error| {
         panic!(
-            "final post-link verification failed after patching, DCE, optimization, and alignment: \
-             {error}"
+            "final post-link verification failed after patching, DCE, optimization, compaction, \
+             and alignment: {error}"
         )
     });
     final_assembly

@@ -8,8 +8,8 @@ use std::path::Path;
 
 pub use crate::Access;
 pub use asm::{
-    dotnet_version, Assembly, DotnetVersion, ExportReadyAssembly, IlasmFlavour,
-    VerificationFailure,
+    dotnet_version, Assembly, AssemblyArenaCounts, CompactionStats, DotnetVersion,
+    ExportReadyAssembly, IlasmFlavour, VerificationFailure,
 };
 pub use basic_block::BasicBlock;
 pub use bimap::BiMap;
