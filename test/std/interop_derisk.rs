@@ -7,7 +7,7 @@
 //   B2) GCHandle store-across-GC round-trip          -> WORKS (prints 3001 then 3999). Getting here
 //      surfaced + fixed TWO real codegen bugs: (1) managed value types
 //      (RustcCLRInteropManagedStruct<ASM,CLASS,SIZE>) wrongly required 2 generics in
-//      rustc_codegen_clr_type/src/type.rs (fixed -> 3); (2) `System.Object`/`System.String` were
+//      src/type/mod.rs (fixed -> 3); (2) `System.Object`/`System.String` were
 //      emitted as `class [System.Runtime]System.Object` (ELEMENT_TYPE_CLASS) instead of the
 //      canonical `object`/`string` element type, so `GCHandle.Alloc(object)` failed to bind
 //      (MissingMethodException). Fixed in cilly/.../il_exporter/mod.rs `type_il`.
@@ -22,7 +22,7 @@
 include!("../common.rs"); // provides: rustc_clr_interop_managed_call{0,1,2}_, the Put trait, lang items
 
 // Managed reference / value types — the codegen recognizes these by name
-// (`name.contains("RustcCLRInteropManaged")`, see rustc_codegen_clr_type/src/utilis.rs).
+// (`name.contains("RustcCLRInteropManaged")`, see src/type/utilis.rs).
 #[derive(Clone, Copy)]
 struct RustcCLRInteropManagedClass<const ASM: &'static str, const CLASS: &'static str> {
     _obj_ref: usize,

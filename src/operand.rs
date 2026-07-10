@@ -1,1 +1,143 @@
+pub mod constant;
+pub mod static_data;
+use cilly::Type;
+use cilly::{Interned, ir::CILNode};
+use crate::fn_ctx::MethodCompileCtx;
+use crate::place::{place_address, place_get};
+use crate::r#type::GetTypeExt;
+use rustc_middle::mir::interpret::Scalar;
+use rustc_middle::mir::{ConstValue, Operand};
+pub fn handle_operand<'tcx>(
+    operand: &Operand<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Interned<CILNode> {
+    let res = ctx.type_from_cache(ctx.monomorphize(operand.ty(ctx.body(), ctx.tcx())));
+    if res == Type::Void {
+        return ctx.uninit_val(Type::Void);
+    }
+    match operand {
+        Operand::Copy(place) | Operand::Move(place) => place_get(place, ctx),
+        Operand::Constant(const_val) => crate::operand::constant::handle_constant(const_val, ctx),
+        // A compile-time query of a session flag (UB/overflow checks) -> a bool const.
+        Operand::RuntimeChecks(checks) => {
+            let value = checks.value(ctx.tcx().sess);
+            ctx.alloc_node(value)
+        }
+    }
+}
+pub fn operand_address<'tcx>(
+    operand: &Operand<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Interned<CILNode> {
+    match operand {
+        Operand::Copy(place) | Operand::Move(place) => place_address(place, ctx),
+        Operand::Constant(const_val) => {
+            let local_type = ctx.type_from_cache(operand.ty(ctx.body(), ctx.tcx()));
+            let constant = crate::operand::constant::handle_constant(const_val, ctx);
+            let ptr = ctx.stack_addr(constant);
+            ctx.load(ptr, local_type)
+        }
+        Operand::RuntimeChecks(checks) => {
+            let value = checks.value(ctx.tcx().sess);
+            let local_type = ctx.type_from_cache(operand.ty(ctx.body(), ctx.tcx()));
+            let constant = ctx.alloc_node(value);
+            let ptr = ctx.stack_addr(constant);
+            ctx.load(ptr, local_type)
+        }
+    }
+}
+/// Checks if this operand is uninitialzed, and assigements using it can safely be skipped.
+pub fn is_uninit<'tcx>(operand: &Operand<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> bool {
+    match operand {
+        Operand::Copy(_) | Operand::Move(_) => false,
+        // A runtime-check flag is a concrete compile-time bool: always initialized.
+        Operand::RuntimeChecks(_) => false,
+        Operand::Constant(const_val) => {
+            let constant = const_val.const_;
+            let constant = ctx.monomorphize(constant);
+            let evaluated = constant
+                .eval(
+                    ctx.tcx(),
+                    rustc_middle::ty::TypingEnv::fully_monomorphized(),
+                    const_val.span,
+                )
+                .expect("Could not evaluate constant!");
+            match evaluated {
+                ConstValue::Scalar(_) => false, // Scalars are never uninitialized.
+                ConstValue::ZeroSized => {
+                    // ZeroSized has no data, so I guess it has no initialized data, so assiments using it could propably be safely skipped.
+                    true
+                }
+                ConstValue::Slice { alloc_id, meta: _ } => {
+                    // SUS
+                      let data = ctx.tcx().global_alloc(alloc_id).unwrap_memory();
+                    let mask = data.inner().init_mask();
+                    let mut chunks =
+                        mask.range_as_init_chunks(rustc_const_eval::interpret::AllocRange {
+                            start: rustc_abi::Size::ZERO,
+                            size: data.0.size(),
+                        });
+                    let Some(only) = chunks.next() else {
+                        return false;
+                    };
+                    // If this is not the only chunk, then the init mask must not be fully uninitialized
+                    if chunks.next().is_some() {
+                        return false;
+                    }
+                    !only.is_init()
+                }
+                ConstValue::Indirect { alloc_id, .. } => {
+                    let data = ctx.tcx().global_alloc(alloc_id);
+                    let rustc_middle::mir::interpret::GlobalAlloc::Memory(data) = data else {
+                        return false;
+                    };
+                    let mask = data.0.init_mask();
+                    let mut chunks =
+                        mask.range_as_init_chunks(rustc_const_eval::interpret::AllocRange {
+                            start: rustc_abi::Size::ZERO,
+                            size: data.0.size(),
+                        });
+                    let Some(only) = chunks.next() else {
+                        return false;
+                    };
+                    // If this is not the only chunk, then the init mask must not be fully uninitialized
+                    if chunks.next().is_some() {
+                        return false;
+                    }
+                    !only.is_init()
+                }
+            }
+        }
+    }
+}
 
+pub fn is_const_zero<'tcx>(operand: &Operand<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> bool {
+    match operand {
+        // Copy / Moves are not constants.
+        Operand::Copy(_) | Operand::Move(_) => false,
+        // Known at compile time: zero iff the checked flag is disabled.
+        Operand::RuntimeChecks(checks) => !checks.value(ctx.tcx().sess),
+        Operand::Constant(const_val) => {
+            let constant = const_val.const_;
+            let constant = ctx.monomorphize(constant);
+            let evaluated = constant
+                .eval(
+                    ctx.tcx(),
+                    rustc_middle::ty::TypingEnv::fully_monomorphized(),
+                    const_val.span,
+                )
+                .expect("Could not evaluate constant!");
+            match evaluated {
+                ConstValue::Scalar(scalar) => match scalar {
+                    Scalar::Int(int) => int.is_null(),
+                    Scalar::Ptr(_, _) => false,
+                }, // Scalars are never uninitialized.
+                ConstValue::ZeroSized => {
+                    // ZeroSized has no data, so it has only 0 values
+                    true
+                }
+                ConstValue::Slice { .. } | ConstValue::Indirect { .. } => false,
+            }
+        }
+    }
+}

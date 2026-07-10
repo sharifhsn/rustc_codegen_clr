@@ -1,7 +1,7 @@
 use crate::assembly::MethodCompileCtx;
 use cilly::Interned;
-use rustc_codegen_clr_place::place_set;
-use rustc_codgen_clr_operand::constant::load_const_value;
+use crate::operand::constant::load_const_value;
+use crate::place::place_set;
 use rustc_middle::{mir::Place, ty::Instance};
 use rustc_span::Span;
 

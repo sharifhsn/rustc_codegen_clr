@@ -5,7 +5,7 @@ use cilly::{
 use rustc_abi::{FieldIdx, FieldsShape, Layout, LayoutData, TagEncoding, VariantIdx, Variants};
 use rustc_middle::ty::Ty;
 
-use rustc_codegen_clr_ctx::MethodCompileCtx;
+use crate::fn_ctx::MethodCompileCtx;
 
 #[derive(Clone, Debug)]
 pub(crate) enum FieldOffsetIterator {

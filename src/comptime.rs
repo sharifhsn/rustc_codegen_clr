@@ -22,10 +22,10 @@ use cilly::{
     MethodImpl, MethodRef, Type,
 };
 use cilly::{Float, Int};
-use rustc_codegen_clr_call::CallInfo;
-use rustc_codegen_clr_ctx::{fn_name, MethodCompileCtx};
-use rustc_codegen_clr_type::r#type::get_type;
-use rustc_codegen_clr_type::utilis::garg_to_string;
+use crate::call_info::CallInfo;
+use crate::fn_ctx::{fn_name, MethodCompileCtx};
+use crate::r#type::get_type;
+use crate::r#type::utilis::garg_to_string;
 use rustc_middle::mir::{Mutability, Rvalue, StatementKind, TerminatorKind};
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{Instance, TyKind, TypingEnv};

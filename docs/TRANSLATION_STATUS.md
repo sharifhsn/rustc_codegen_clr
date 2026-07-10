@@ -61,7 +61,7 @@ north-star), documented for the average user in [docs/CARGO_DOTNET.md](CARGO_DOT
 ---
 
 ## 1. Type lowering — ~90% complete, faithful
-`rustc_codegen_clr_type/src/type.rs` (`get_type`), `…/src/adt.rs`.
+`src/type/mod.rs` (`get_type`), `src/type/adt.rs`.
 
 **Solid:** all scalars incl. **i128/u128** (→ .NET `Int128`/`UInt128`), `f32`/`f64`, Bool/Char,
 tuples/structs/unions, thin & **fat pointers/DSTs** (`{DATA_PTR@0, METADATA@8}`), **ZSTs** (→ `Void`,
@@ -141,7 +141,7 @@ the real 128-bit constant instead of the `GetHashCode` shortcut. Sub-word/weak a
 word emulation (the 1-byte `cxchg` is a real bug — §10).
 
 ## 3. Calls / dispatch / unwinding
-`rustc_codegen_clr_call/`, `src/terminator/`, `cilly/src/ir/basic_block.rs` (EH), `…/builtins/`.
+`src/call_info.rs`, `src/terminator/`, `cilly/src/ir/basic_block.rs` (EH), `…/builtins/`.
 
 **Solid:** static, indirect/fn-pointer (`calli`), **virtual dispatch via vtables**, closures/
 `rust_call` tuple-splitting, drop glue. ABI handling is permissive and sound (CIL is
@@ -492,7 +492,7 @@ The sibling `cast_ptr_to` (takes the full pointer type) is the correct helper. S
   launcher** (`cilly/src/ir/il_exporter/mod.rs`, `bin/linker/main.rs`). Assembly named after the crate
   (was `_`). `#[no_mangle]` → `Access::Extern` (`src/assembly.rs`) so exports are DCE **roots** (a
   library has no entrypoint root). See §6.
-- ✅ **`gettid` weak static** (`rustc_codgen_clr_operand/src/constant.rs::get_fn_from_static_name`): was
+- ✅ **`gettid` weak static** (`src/operand/constant.rs::get_fn_from_static_name`): was
   an unsupported `todo!`; added an arm + `LIBC_FNS` entry (PInvoke to host libc), like `pidfd_getpid`.
   NOTE: a tail of sibling `import_linkage` weak statics remains (`posix_spawn_file_actions_addchdir`,
   …); for a **library** these are unreachable from the export roots, so the per-method panic-recovery

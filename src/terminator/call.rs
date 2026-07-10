@@ -12,14 +12,14 @@ use cilly::{
 };
 use cilly::tpe::GenericKind;
 use cilly::{MethodRef, Type};
-use rustc_codegen_clr_call::CallInfo;
-use rustc_codegen_clr_ctx::fn_name;
-use rustc_codegen_clr_place::place_set;
-use rustc_codegen_clr_type::{
+use crate::call_info::CallInfo;
+use crate::fn_ctx::fn_name;
+use crate::operand::{handle_operand, operand_address};
+use crate::place::place_set;
+use crate::r#type::{
     utilis::{garg_to_usize, garg_to_string},
     GetTypeExt,
 };
-use rustc_codgen_clr_operand::{handle_operand, operand_address};
 use rustc_middle::ty::InstanceKind;
 use rustc_middle::{
     mir::{Operand, Place},

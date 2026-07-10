@@ -96,7 +96,7 @@ rlibs, merges them, patches in libc / intrinsic implementations, and emits the f
   code paths almost for free. *(v0.2.0)*
 - **`#[track_caller]`** injects a hidden `&'static Location` argument invisible in MIR — which is why
   **`FnSig` ≠ `FnAbi`** and their argument *counts* can differ. Must be threaded through everywhere
-  (especially fn pointers). *(v0.1.0, v0.2.2)* This is `rustc_codegen_clr_call`'s `CallInfo` territory.
+  (especially fn pointers). *(v0.1.0, v0.2.2)* This is `src/call_info.rs`'s `CallInfo` territory.
 - **ZSTs:** .NET has no zero-sized types (every type ≥ 1 byte), a recurring bug source — a size-0
   trailing field can become size-1 and clobber an adjacent byte on copy. *(v0.1.1)* (`Type::Void` is special-cased throughout.)
 - **Atomics** → `System.Threading.Interlocked` + inserted memory fences; **8/16-bit atomics**

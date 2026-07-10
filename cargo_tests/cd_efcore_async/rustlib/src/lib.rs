@@ -18,7 +18,7 @@
 //!
 //! **Root cause (isolated by dumping the coroutine's actual field/offset list and diffing it
 //! against the WORKING `cd_persisted_async` coroutine — see `cilly/src/ir/class.rs`,
-//! `ClassDef::layout_check`, and `rustc_codegen_clr_type/src/type.rs`, `coroutine_typedef`):**
+//! `ClassDef::layout_check`, and `src/type/mod.rs`, `coroutine_typedef`):**
 //! `Type::is_gcref` (`cilly/src/ir/tpe/mod.rs`) is *shallow* — for a `ClassRef` it only asked
 //! "is this a valuetype", never recursing into the struct's own fields. `mycorrhiza::task::
 //! TaskFuture<T>` (the `Future` that `await_task(..).await` produces, and which the coroutine
@@ -35,7 +35,7 @@
 //! `cd_persisted_async` (which ALSO nests a real gcref inside `TaskFuture<i32>` in overlapping
 //! coroutine storage) still passes 4/4, because its offsets never collided in the first place.
 //!
-//! **The fix** (two parts, both in the `cilly`/`rustc_codegen_clr_type` layer, no weakening of
+//! **The fix** (two parts, both in the `cilly`/root type-lowering layer, no weakening of
 //! `layout_check`'s protections — see their doc comments for the full reasoning):
 //!   1. `Type::contains_gcref` (`cilly/src/ir/tpe/mod.rs`) — a *recursive* gcref check that looks
 //!      inside value-type `ClassRef` fields (bounded depth), closing the false-negative that let
@@ -46,7 +46,7 @@
 //!      allows (proven by `cd_persisted_async`'s existing passing tests, which rely on exactly
 //!      this "same gcref-shaped field reused across variants" pattern) rather than a blanket
 //!      "no gcref in overlapping storage, ever" rule that would reject that legitimate case too.
-//!   3. `coroutine_typedef` (`rustc_codegen_clr_type/src/type.rs`) now runs the SAME
+//!   3. `coroutine_typedef` (`src/type/mod.rs`) now runs the SAME
 //!      collision-detection while building a coroutine's field list; when it would place a field
 //!      at an unsafe (loader-rejected) offset, it instead appends that field at a freshly
 //!      allocated, non-overlapping offset past the coroutine's natural extent (growing the

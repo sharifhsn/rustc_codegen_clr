@@ -1,7 +1,7 @@
 # Architecture rework execution ledger
 
-Status: active — Phase 1 implemented; Phase 2 in progress  
-Started: 2026-07-09  
+Status: active — Phases 1–4 implemented; Phase 5 in progress
+Started: 2026-07-09
 Branch: `codex/rearchitecture`
 
 This document is the execution contract for a staged rework of the compiler and `cilly`
@@ -97,10 +97,12 @@ Gate: configuration round-trip, mismatch rejection, and codegen/linker parity te
 
 ### 2A. Memoized relocation
 
-In progress. Before switching implementations, regressions were added for two confirmed silent
-losses in the old constructor-based translator: unresolved `BasicBlock::handler_id` and
-`ClassDef::is_valuetype_authoritative`. Both are now preserved by the existing linker as a safety
-floor for the memoized replacement.
+Implemented 2026-07-10. `RelocateCtx` carries dense maps for all ten interned arenas, so a shared
+DAG value is translated once. Metadata relocation lives beside its owning types and exhaustively
+destructures without `..`; an exhaustive `Assembly` field fence makes a new arena fail compilation
+until relocation accounts for it. Class traversal is sorted by source ID for deterministic output.
+The depth-20 shared-DAG regression visits 21 unique nodes with 20 cache hits; the old recursive
+shape would perform roughly 2.1 million node visits.
 
 - Introduce a relocation context with source-to-destination maps for every interned arena.
 - Exhaustively relocate all fields in method/class definitions and custom metadata.
@@ -112,6 +114,12 @@ names.
 
 ### 2B. Hardened interning and compaction
 
+Implemented 2026-07-10. `BiMap<T>` now owns one canonical `Vec<T>` and indexes it with a
+`hashbrown::HashTable<Interned<T>>`; ordinary interning no longer clones `T`, and values-only serde
+rebuilds and validates the index. Artifact schema v2 is identifiable before payload decoding, so
+v1 receives a precise rebuild diagnostic. Final-link compaction rebuilds all ten arenas from live
+definitions after the second DCE and is byte-identical when applied twice.
+
 - Store each interned value once; indices in the hash table point into canonical storage.
 - Preserve deterministic IDs within a serialized assembly.
 - Reuse relocation to compact all reachable arenas after final DCE.
@@ -120,6 +128,12 @@ names.
 Gate: interner property tests, deterministic serialization, and no regression in linker fixtures.
 
 ## Phase 3 — transactional and parallel codegen
+
+The serial transactional boundary was implemented 2026-07-10. Every mono item builds in a fresh
+assembly shard, successful items commit to a CGU shard, and successful CGUs commit to the crate in
+rustc's existing deterministic order. Error and panic tests prove parent arena counts and postcard
+bytes remain unchanged. Parallel scheduling remains deliberately deferred until a serial-vs-parallel
+semantic/byte equivalence harness exists.
 
 - Build a method or codegen unit in isolated state and commit it only after local validation.
 - Merge codegen-unit shards deterministically through the relocation API.
@@ -130,6 +144,11 @@ and representative backend execution tests.
 
 ## Phase 4 — rustc-facing boundary consolidation
 
+Implemented 2026-07-10. The five helper packages were folded into private root modules, reducing
+six rustc-facing packages to one and removing fourteen internal package edges. `cilly` remains a
+standalone non-`rustc_private` crate. Three repeated warm root checks averaged 0.749 s versus the
+0.96 s pre-migration baseline (22% faster), while workspace metadata/check gates stayed green.
+
 - Keep `cilly` independent of `rustc_private`.
 - Consolidate the tightly coupled context/type/place/operand/call ladder where doing so reduces
   nightly-port and API surface cost.
@@ -139,6 +158,13 @@ and representative backend execution tests.
 Gate: package graph check, nightly-port documentation update, and unchanged backend behavior.
 
 ## Phase 5 — exception-region representation
+
+Design audit complete; implementation in progress. The confirmed duplication point is per-block
+`resolve_exception_handlers`, which clones each reachable cleanup CFG into `BasicBlock.handler`.
+Measured panic-heavy artifacts spend 60–68% of ordinary handler text on duplicate normalized
+handlers in two representative cases. Canonical method-scope cleanup storage is the first target;
+exporter-time physical sharing is a separate optimization because ECMA-335 forbids arbitrary
+overlap between distinct exception clauses.
 
 - Represent protected regions and cleanup entry points once at method scope.
 - Initially lower the new representation to byte-equivalent existing handler shapes.
@@ -172,3 +198,10 @@ and the local Graphify index.
   an explicit legacy path while allowing the inner IR schema to evolve deliberately.
 - 2026-07-09: sequence relocation before the single-storage interner so every identity/storage
   change goes through one exhaustive, memoized mapping boundary.
+- 2026-07-10: consolidate the full rustc-facing helper ladder into root modules; the measured warm
+  check improved rather than regressed, so the fallback frontend package is unnecessary.
+- 2026-07-10: keep CGU scheduling serial until isolated shard output has a serial-vs-parallel
+  equivalence harness; transactions and concurrency are separate correctness changes.
+- 2026-07-10: canonicalize exception cleanup graphs in IR first, but keep compatibility
+  materialization at exporter boundaries until a shared .NET region planner proves legal lexical
+  coalescing under ECMA-335.

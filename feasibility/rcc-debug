@@ -15,7 +15,7 @@
 #   rcc-debug layout <crate_dir> <type_substr>    # dump the backend's computed enum/niche layout (DUMP_LAYOUT)
 #   rcc-debug vendor <crate> <version> [dst]      # vendor a registry crate for instrumentation (see below)
 #
-# DUMP_LAYOUT=<substr> (rustc_codegen_clr_type handle_tag) appends the backend's enum layout — tag
+# DUMP_LAYOUT=<substr> (root type module handle_tag) appends the backend's enum layout — tag
 # encoding (Direct/Niche), tag type + byte offset, per-variant field offsets, and rustc's
 # untagged_variant/niche_variants/niche_start — to a file, for any enum whose type name contains
 # <substr>. This is the introspection that root-caused the regex `get_discr` 128-bit-niche bug

@@ -21,7 +21,7 @@ These aren't missing features, they're defects in things that otherwise work. Or
    offset-consistency across overlapping variants (a gcref-shaped field reused identically across
    variants — the pattern `cargo_tests/cd_persisted_async` already relies on and is proven safe on
    real CoreCLR — is allowed; a colliding DIFFERENT type at the same offset is rejected), and (3)
-   `coroutine_typedef` (`rustc_codegen_clr_type/src/type.rs`) now relocates a colliding field to a
+   `coroutine_typedef` (`src/type/mod.rs`) now relocates a colliding field to a
    freshly-appended, non-overlapping offset instead of reusing the unsafe one, so the workflow
    actually runs (not just fails cleanly). Verified end-to-end on real CoreCLR: `run_investor_workflow()`
    returns `2001` as expected; `cd_persisted_async` 4/4, `cd_async` 9/9, `cd_delegates` 14/14,

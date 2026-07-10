@@ -14,11 +14,11 @@ use cilly::{
 };
 
 type Root = Interned<cilly::ir::CILRoot>;
-use rustc_codegen_clr_call::CallInfo;
-use rustc_codegen_clr_ctx::fn_name;
-pub use rustc_codegen_clr_ctx::MethodCompileCtx;
-use rustc_codegen_clr_type::{adt::field_descrptor, r#type::get_type, utilis::is_zst, GetTypeExt};
-use rustc_codgen_clr_operand::static_data::add_static;
+use crate::call_info::CallInfo;
+use crate::fn_ctx::fn_name;
+pub use crate::fn_ctx::MethodCompileCtx;
+use crate::operand::static_data::add_static;
+use crate::r#type::{adt::field_descrptor, get_type, utilis::is_zst, GetTypeExt};
 use rustc_hir::attrs::Linkage;
 use rustc_middle::{
     mir::{interpret::GlobalAlloc, Local, LocalDecl, Statement, Terminator},

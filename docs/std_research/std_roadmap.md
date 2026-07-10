@@ -64,7 +64,7 @@ of (work-type × tier) and the runtime-LOC column give the estimate.
 
 | | Codegen-side LOC | Runtime/PAL-side LOC | Effort | Confidence |
 |---|---|---|---|---|
-| **Horizon 1 — restore surrogate std** | ~100–500 (mostly `rustc_codegen_clr_type`, `typecheck`, `unsize`, `aggregate`) | ~0 | **2–6 weeks** (debugging-dominated, not typing) | medium-high — it's bit-rot in two known-fragile areas, same family as fixes already shipped this session (pattern_type, c_char, the v0_1_3 `FatPtrg` fix) |
+| **Horizon 1 — restore surrogate std** | ~100–500 (mostly root `type`, `typecheck`, `unsize`, `aggregate`) | ~0 | **2–6 weeks** (debugging-dominated, not typing) | medium-high — it's bit-rot in two known-fragile areas, same family as fixes already shipped this session (pattern_type, c_char, the v0_1_3 `FatPtrg` fix) |
 | **Horizon 2 — proper .NET std PAL** | ~1–3k (target spec, intrinsic gaps, ABI/atomics) | ~3–6k (a `std::sys` PAL ≈ 2.5–3.5k by the unix/sgx reference, + `mycorrhiza` growth over today's 14k) | **months** + upstream process | low-medium — depends on upstream cooperation and how much BCL reuse vs P/Invoke |
 
 Anchors: cg_clr is already ~55k LOC (src 12.5k, `cilly` 24.5k, `mycorrhiza` 14k); cranelift 14k /

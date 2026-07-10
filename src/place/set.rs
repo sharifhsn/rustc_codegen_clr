@@ -1,12 +1,12 @@
-use rustc_codegen_clr_ctx::MethodCompileCtx;
-use rustc_codegen_clr_type::{
+use crate::fn_ctx::MethodCompileCtx;
+use crate::r#type::{
     GetTypeExt,
     adt::{field_descrptor, variant_field_desc},
-    r#type::fat_ptr_to,
+    fat_ptr_to,
     utilis::ptr_is_fat,
 };
 
-use crate::{PlaceTy, pointed_type};
+use crate::place::{PlaceTy, pointed_type};
 use cilly::{
     Assembly, BinOp, Const, Interned, IntoAsmIndex, Type,
     cilnode::{ExtendKind, IsPure},
@@ -22,8 +22,9 @@ pub fn local_set(
     tree: Interned<cilly::ir::CILNode>,
     asm: &mut Assembly,
 ) -> Interned<cilly::ir::CILRoot> {
-    if let Some(spread_arg) = method.spread_arg
-        && local == spread_arg.as_usize()
+    if method
+        .spread_arg
+        .is_some_and(|spread_arg| local == spread_arg.as_usize())
     {
         return asm.st_loc(
             (method.local_decls.len() - method.arg_count)
@@ -66,7 +67,7 @@ pub fn place_elem_set<'a>(
                 // `(true, false)` case is handled here.)
                 if ptr_is_fat(curr_type, ctx.tcx(), ctx.instance()) {
                     let field_type = ctx.monomorphize(*field_type);
-                    let offset = rustc_codegen_clr_type::adt::FieldOffsetIterator::fields(
+                    let offset = crate::r#type::adt::FieldOffsetIterator::fields(
                         ctx.layout_of(curr_type).layout.0.0.clone(),
                     )
                     .nth(field_index.as_usize())
@@ -106,7 +107,7 @@ pub fn place_elem_set<'a>(
             let curr_ty = curr_type
                 .as_ty()
                 .expect("INVALID PLACE: Indexing into enum variant???");
-            let index = crate::get::local_get(index.as_usize(), ctx.body(), ctx);
+            let index = crate::place::get::local_get(index.as_usize(), ctx.body(), ctx);
 
             match curr_ty.kind() {
                 TyKind::Slice(inner) => {

@@ -1,14 +1,14 @@
 use crate::assembly::MethodCompileCtx;
 use crate::rvalue::is_rvalue_unint;
 use crate::utilis::adt::set_discr;
-use rustc_codegen_clr_place::{place_address, place_get, place_set};
-use rustc_codegen_clr_type::utilis::is_zst;
-use rustc_codegen_clr_type::GetTypeExt;
+use crate::place::{place_address, place_get, place_set};
+use crate::r#type::utilis::is_zst;
+use crate::r#type::GetTypeExt;
 
 use cilly::cilnode::ExtendKind;
 use cilly::{BinOp, Int, Interned};
 
-use rustc_codgen_clr_operand::handle_operand;
+use crate::operand::handle_operand;
 use rustc_middle::mir::{CopyNonOverlapping, NonDivergingIntrinsic, Statement, StatementKind};
 
 type Root = Interned<cilly::ir::CILRoot>;

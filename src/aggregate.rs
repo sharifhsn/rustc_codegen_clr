@@ -7,14 +7,14 @@ use cilly::{
     ClassRef, Const, FieldDesc, FnSig, Int, Interned, MethodRef, Type,
 };
 use rustc_abi::FieldIdx;
-use rustc_codegen_clr_place::{place_address, place_get, place_set};
-use rustc_codegen_clr_type::{
+use crate::operand::{handle_operand, is_uninit};
+use crate::place::{place_address, place_get, place_set};
+use crate::r#type::{
     adt::{enum_tag_info, field_descrptor},
-    r#type::{escape_field_name, get_type},
+    escape_field_name, get_type,
     utilis::{is_zst, ptr_is_fat, simple_tuple},
     GetTypeExt,
 };
-use rustc_codgen_clr_operand::{handle_operand, is_uninit};
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{AggregateKind, Operand, Place},

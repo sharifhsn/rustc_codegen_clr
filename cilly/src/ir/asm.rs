@@ -2104,7 +2104,7 @@ impl Assembly {
     }
     /// Builds a fat-pointer value of class `slice_tpe` (a `FatPtr*` / slice class, as produced by
     /// [`crate::r#type::fat_ptr_to`]) from a thin data `ptr` and `metadata`, via the `create_slice`
-    /// builtin. Used by the place pipeline (`rustc_codegen_clr_place`'s `body.rs`).
+    /// builtin. Used by the place pipeline (`src/place/body.rs`).
     pub fn create_slice(
         &mut self,
         slice_tpe: Interned<ClassRef>,

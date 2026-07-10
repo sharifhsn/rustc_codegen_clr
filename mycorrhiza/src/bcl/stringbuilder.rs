@@ -240,7 +240,7 @@ impl core::fmt::Write for StringBuilder {
     // where the free fn `write` takes `&mut dyn Write` -- so the default forces an unsizing
     // coercion of `&mut Self` to a `&mut dyn Write` trait object at every `write!(sb, ..)` call
     // site. That coercion builds a fat pointer whose "data" half is type-erased to a raw `void*`
-    // (see `src/unsize.rs`, `fat_ptr_to` in `rustc_codegen_clr_type`). `StringBuilder` is a thin
+    // (see `src/unsize.rs` and the backend's `fat_ptr_to`). `StringBuilder` is a thin
     // newtype directly over a managed `System.Text.StringBuilder` handle -- a real GC-tracked
     // object reference -- so a pointer into it is itself GC-relevant memory; erasing that into an
     // untracked `void*` field would let the CLR's compacting GC relocate/collect the referent out

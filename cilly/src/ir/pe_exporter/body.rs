@@ -737,7 +737,7 @@ impl<'a> Emitter<'a> {
     }
     fn emit_int128_ctor(&mut self, cref: Interned<ClassRef>) {
         // Every `Constructor`-kind `MethodRef`'s stored `FnSig` carries the owning type as an
-        // IMPLICIT receiver at `inputs()[0]` — the same convention `rustc_codegen_clr_call`'s
+        // IMPLICIT receiver at `inputs()[0]` — the same convention the backend's call lowering
         // `MethodRef::new(... MethodKind::Constructor ...)` call sites always follow (`this` is
         // prepended before the explicit ctor args), and which `TokenSink::method_token`
         // (`tables.rs`) / `il_exporter`'s own MemberRef-rendering (`mod.rs` `&sig.inputs()[1..]`)
@@ -1756,7 +1756,7 @@ mod tests {
     /// `cargo_tests/cd_collections`: `emit_int128_ctor` built the `.ctor` signature as EXACTLY
     /// `[uint64, uint64] -> void`, but `MetadataBuilder::method_token` (the real `TokenSink`, NOT
     /// `StubSink`) unconditionally treats `inputs()[0]` as an implicit `this` placeholder for any
-    /// non-static `MethodKind` (matching `rustc_codegen_clr_call`'s own `MethodRef::new(...,
+    /// non-static `MethodKind` (matching the backend call lowering's own `MethodRef::new(...,
     /// MethodKind::Constructor, ...)` call sites, which always prepend the owning class as
     /// `inputs()[0]` — see `src/terminator/call.rs`) and strips it before encoding the
     /// `MethodRefSig` blob. Without a leading `this`-type slot, that strip ate a REAL argument,

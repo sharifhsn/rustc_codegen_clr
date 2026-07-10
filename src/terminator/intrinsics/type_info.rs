@@ -2,12 +2,12 @@ use crate::assembly::MethodCompileCtx;
 use cilly::{
     cilnode::ExtendKind, BinOp, Const, Int, Interned, Type, {FieldDesc},
 };
-use rustc_codegen_clr_place::place_set;
-use rustc_codegen_clr_type::{
+use crate::operand::operand_address;
+use crate::place::place_set;
+use crate::r#type::{
     utilis::{is_zst, ptr_is_fat},
     GetTypeExt,
 };
-use rustc_codgen_clr_operand::operand_address;
 use rustc_middle::{
     mir::{Operand, Place},
     ty::{Instance, TyKind},
@@ -196,7 +196,7 @@ pub fn align_of_val<'tcx>(
         let value_calc: Node = ctx.load(align_ptr, Type::Int(Int::USize));
         return place_set(destination, value_calc, ctx);
     }
-    let align = rustc_codegen_clr_type::align_of(pointed_ty, ctx.tcx());
+    let align = crate::r#type::align_of(pointed_ty, ctx.tcx());
     let align = ctx.alloc_node(align);
     let value_calc = ctx.int_cast(align, Int::USize, ExtendKind::ZeroExtend);
     place_set(destination, value_calc, ctx)

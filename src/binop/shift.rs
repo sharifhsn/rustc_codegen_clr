@@ -5,7 +5,7 @@ use cilly::{
     {ClassRef, MethodRef},
 };
 
-use rustc_codegen_clr_type::GetTypeExt;
+use crate::r#type::GetTypeExt;
 
 use rustc_middle::ty::{IntTy, Ty, TyKind, UintTy};
 

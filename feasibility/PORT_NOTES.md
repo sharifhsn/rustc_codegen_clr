@@ -12,13 +12,13 @@ break the build. This file records the changes made to compile on **`nightly-202
 3. For each error, **read the real signature** in the local rustc sources rather than guessing:
    `$(rustc --print sysroot)/lib/rustlib/rustc-src/rust/compiler/…`
    (the `rustc-dev` component ships these — `rustc_middle`, `rustc_abi`, `rustc_codegen_ssa`).
-4. Fix crate-by-crate in dependency order: `cilly` → `…_ctx` → `…_type` → `…_place` /
-   `…_operand` / `…_call` → root `rustc_codegen_clr`. cargo only surfaces a crate's errors once
-   its dependencies compile, so expect new batches as you clear each layer.
+4. Fix in dependency order: standalone `cilly` first, then the root `rustc_codegen_clr` crate.
+   The former `ctx → type → place/call → operand` helper packages were consolidated into root
+   modules in July 2026, so nightly drift is now surfaced in one rustc-facing compiler pass.
 5. Keep fixes **faithful** — adapt to renamed/moved/reshaped APIs, don't change codegen semantics.
 
 Encouragingly, the `cilly` IR crate (the bulk of the codebase) needed **no** changes — only the
-thin rustc-facing crates rot. Most fixes are mechanical renames.
+root rustc-facing modules rot. Most fixes are mechanical renames.
 
 ## Changes applied for nightly-2026-06-17
 

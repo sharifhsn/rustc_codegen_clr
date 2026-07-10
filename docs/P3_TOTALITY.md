@@ -171,11 +171,11 @@ Scoped like P2 slices: one focused fix + a differential/compile regression crate
 ---
 
 **Files of record (absolute paths):**
-- `/Users/sharif/Code/rustc_codegen_clr/rustc_codgen_clr_operand/src/static_data.rs` — §2#1/#2/#8, P3-S1/S5 (VTable arm `:231`, Function `:243`, over-align `:185`/`:290`)
+- `/Users/sharif/Code/rustc_codegen_clr/src/operand/static_data.rs` — §2#1/#2/#8, P3-S1/S5
 - `/Users/sharif/Code/rustc_codegen_clr/src/unsize.rs` — §2#7 (`:96` copy-paste bug, **confirmed dead guard**)
 - `/Users/sharif/Code/rustc_codegen_clr/src/statement.rs` — §3#1, P3-S2 (`:103`)
 - `/Users/sharif/Code/rustc_codegen_clr/src/terminator/intrinsics/mod.rs` + `atomic.rs` — §3#2/#3, P3-S2 (`:104`, `atomic.rs:86`)
-- `/Users/sharif/Code/rustc_codegen_clr/rustc_codegen_clr_place/src/set.rs` + `lib.rs` — §3#4, P3-S3 (`set.rs:322`, `lib.rs:59`)
-- `/Users/sharif/Code/rustc_codegen_clr/src/terminator/mod.rs` + `src/function_sig.rs` + `rustc_codegen_clr_call/src/lib.rs` — §2#4/§3#5, P3-S3/S5
-- `/Users/sharif/Code/rustc_codegen_clr/rustc_codegen_clr_type/src/type.rs` + `adt.rs` — §2#5/#6, P3-S4
+- `/Users/sharif/Code/rustc_codegen_clr/src/place/set.rs` + `src/place/mod.rs` — §3#4, P3-S3
+- `/Users/sharif/Code/rustc_codegen_clr/src/terminator/mod.rs` + `src/function_sig.rs` + `src/call_info.rs` — §2#4/§3#5, P3-S3/S5
+- `/Users/sharif/Code/rustc_codegen_clr/src/type/mod.rs` + `src/type/adt.rs` — §2#5/#6, P3-S4
 - `/Users/sharif/Code/rustc_codegen_clr/cilly/src/ir/typecheck.rs` + `il_exporter/mod.rs` + `c_exporter/mod.rs` — §2#3/#10/#11, §3#6/#10/#11, P3-S5/S6

@@ -295,7 +295,7 @@ macro_rules! impl_from_managed_exception {
 /// [`crate::intrinsics::rustc_clr_interop_throw`] (the backend-recognized `MANAGED_THROW` intrinsic)
 /// only accepts a **compile-time** message: its `MSG` parameter is a `const` generic, resolved by the
 /// backend straight off the callee's generic-argument list before any argument marshalling runs (see
-/// `garg_to_string` in `rustc_codegen_clr_type`), so it can never carry a `String`/`&str` value that
+/// `garg_to_string` in the backend's type lowering), so it can never carry a `String`/`&str` value that
 /// is only known once the program is running (e.g. a formatted error, or a captured `panic!` payload).
 ///
 /// This function is the *runtime* counterpart, built entirely out of the ordinary generic managed-call

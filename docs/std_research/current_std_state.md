@@ -39,13 +39,13 @@ almost certainly **bit-rot from the port**, in two known-fragile areas:
   only when the pointee's class at a field-access site ≠ the field's declared owner class.
   Class *identity* is the demangled symbol name (incl. generic hash) from
   `rustc_symbol_mangling::symbol_name_for_instance_in_crate` via `adt_name`
-  (`rustc_codegen_clr_type/src/utilis.rs:242`), feeding the owner in `adt.rs:174-179`/`252-257`.
+  (`src/type/utilis.rs`), feeding the owner in `src/type/adt.rs`.
   If the nightly renamed std internals (historically `RcBox`→`RcInner`; `ArcInner`; the
   `Atomic<T>` wrapper) or changed mangling/generic-hash inputs, the access-site class and the
   field-owner class resolve to *different* `Interned<ClassRef>` for the same logical type — a
   one-digit hash difference is enough to reject the access. **Identity mismatch, not a modelling gap.**
 - **`CallArgTypeWrong` = fat-pointer-nesting drift.** Fat pointers are built in
-  `rustc_codegen_clr_type/src/type.rs` (`fat_ptr_to`, a 16-byte `{DATA_PTR, METADATA}`) and
+  `src/type/mod.rs` (`fat_ptr_to`, a 16-byte `{DATA_PTR, METADATA}`) and
   consumed in `src/unsize.rs`/`src/aggregate.rs`. A by-ref/DST-metadata decision is adding or
   dropping one indirection level versus the nightly's new monomorphized `String::push_str`
   signature. This is the **same bug family** as the v0_1_3 `FatPtrg` foreign-type fix (a wrong

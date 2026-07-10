@@ -7,9 +7,8 @@ use cilly::{
     {Float, Int},
 };
 use cmp::{eq_unchecked, gt_unchecked, lt_unchecked, ne_unchecked};
-use rustc_codegen_clr_type::{utilis::instance_try_resolve, GetTypeExt};
-
-use rustc_codgen_clr_operand::handle_operand;
+use crate::operand::handle_operand;
+use crate::r#type::{utilis::instance_try_resolve, GetTypeExt};
 use rustc_hir::lang_items::LangItem;
 use rustc_middle::{
     mir::{BinOp, Operand},

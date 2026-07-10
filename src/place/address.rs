@@ -1,14 +1,14 @@
 use super::PlaceTy;
-use crate::ptr_is_fat;
+use crate::place::ptr_is_fat;
 use cilly::{
     Assembly, BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, MethodRef, Type,
     cilnode::{ExtendKind, MethodKind},
 };
-use rustc_codegen_clr_ctx::MethodCompileCtx;
-use rustc_codegen_clr_type::{
+use crate::fn_ctx::MethodCompileCtx;
+use crate::r#type::{
     GetTypeExt,
     adt::{FieldOffsetIterator, field_descrptor, variant_field_desc},
-    r#type::{fat_ptr_to, get_type},
+    fat_ptr_to, get_type,
 };
 use rustc_middle::{
     mir::PlaceElem,
@@ -19,8 +19,9 @@ pub fn local_address(
     method: &rustc_middle::mir::Body,
     asm: &mut Assembly,
 ) -> Interned<cilly::ir::CILNode> {
-    let local = if let Some(spread_arg) = method.spread_arg
-        && local == spread_arg.as_usize()
+    let local = if method
+        .spread_arg
+        .is_some_and(|spread_arg| local == spread_arg.as_usize())
     {
         cilly::CILNode::LdLocA(
             (method.local_decls.len() - method.arg_count)
@@ -245,7 +246,7 @@ pub fn place_elem_address<'tcx>(
             let curr_ty = curr_type
                 .as_ty()
                 .expect("INVALID PLACE: Indexing into enum variant???");
-            let index = crate::local_get(index.as_usize(), ctx.body(), ctx);
+            let index = crate::place::local_get(index.as_usize(), ctx.body(), ctx);
             match curr_ty.kind() {
                 TyKind::Slice(inner) => {
                     let inner = ctx.monomorphize(*inner);

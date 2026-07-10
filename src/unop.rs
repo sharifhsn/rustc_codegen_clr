@@ -4,9 +4,9 @@ use cilly::cilnode::{ExtendKind, IsPure, MethodKind};
 use cilly::{BinOp, Interned, Type};
 use cilly::{ClassRef, FieldDesc, Int, MethodRef};
 
-use rustc_codegen_clr_type::r#type::get_type;
+use crate::r#type::get_type;
 
-use rustc_codgen_clr_operand::handle_operand;
+use crate::operand::handle_operand;
 use rustc_middle::mir::Rvalue;
 use rustc_middle::mir::{Operand, UnOp};
 use rustc_middle::ty::{IntTy, TyKind, UintTy};

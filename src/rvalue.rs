@@ -9,16 +9,16 @@ use cilly::{
 
 type Node = Interned<cilly::ir::CILNode>;
 type Root = Interned<cilly::ir::CILRoot>;
-use rustc_codegen_clr_call::CallInfo;
-use rustc_codegen_clr_ctx::fn_name;
-use rustc_codegen_clr_place::{place_address, place_get};
-use rustc_codegen_clr_type::{
+use crate::call_info::CallInfo;
+use crate::fn_ctx::fn_name;
+use crate::place::{place_address, place_get};
+use crate::r#type::{
     adt::enum_tag_info,
-    r#type::get_type,
+    get_type,
     utilis::ptr_is_fat,
     GetTypeExt,
 };
-use rustc_codgen_clr_operand::{
+use crate::operand::{
     handle_operand, is_const_zero, is_uninit, operand_address, static_data::add_allocation,
 };
 use rustc_middle::{
@@ -35,7 +35,7 @@ macro_rules! cast {
         $cast_name(
             src,
             target,
-            rustc_codgen_clr_operand::handle_operand($operand, $ctx),
+            crate::operand::handle_operand($operand, $ctx),
             $asm,
         )
     }};

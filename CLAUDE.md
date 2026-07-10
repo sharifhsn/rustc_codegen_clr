@@ -114,27 +114,23 @@ almost the entire codebase, and why a .NET bugfix usually fixes C too.
 
 ### Workspace crates
 
-The codegen is split across small crates so the heavy `rustc_private` dependencies are isolated:
+The nightly-sensitive MIR lowering now lives in one root crate. This removes the old serial
+`ctx → type → place/call → operand → root` repair chain while keeping `cilly` independent of
+`rustc_private`:
 
 | Crate | Role |
 |-------|------|
-| `rustc_codegen_clr` (root, `src/`) | The rustc backend plugin: MIR → V1 CIL, assembly assembly. |
+| `rustc_codegen_clr` (root, `src/`) | The rustc backend plugin and all rustc-facing lowering: `fn_ctx`, `type`, `place`, `call_info`, `operand`, MIR → CIL, and assembly construction. |
 | `cilly` | The IR itself + optimizer + typechecker + exporters + the `linker` binary. Standalone, no rustc dep. The heart of the project. |
-| `rustc_codegen_clr_ctx` | `MethodCompileCtx` — per-method compilation context wrapping `TyCtxt` + `Assembly`. Threaded everywhere. |
-| `rustc_codegen_clr_type` | Rust `Ty` → cilly `Type`, ADT layout, and the `TyCache`. |
-| `rustc_codegen_clr_place` | MIR `Place` handling (address / get / set). |
-| `rustc_codgen_clr_operand` | MIR `Operand` and constant handling. **Note: the crate name is misspelled (missing the second `e`) — this is intentional, do not "fix" it.** |
-| `rustc_codegen_clr_call` | Function signatures and call ABI (`CallInfo`). |
 | `mycorrhiza` | Rust/.NET interop layer — Rust-side wrappers for managed types (StringBuilder, Console, …). |
 | `dotnet_aot` | Native AOT support helpers. |
 | `AssemblyUtilis` | C# helper code (`.csproj`) for assembly building / managed handles. |
 
 ### Design principles (these explain non-obvious code choices)
 
-- **Functional / pure**: each MIR element is handled by a pure function taking immutable inputs and returning
-  a translated item. This makes panic recovery trivial (no half-mutated state) — important because the backend
-  expects to hit unsupported code. The notable exception is the mutable `TyCache`, reused per codegen unit and
-  resettable after a panic.
+- **Functional / transactional**: MIR helpers return translated values, while each mono item and codegen unit
+  builds into an isolated `Assembly` shard. Only successful shards are linked into their parent, so an error or
+  unwind cannot leak partially interned state into the crate assembly.
 - **Faithful-to-MIR then optimize**: V1 translation is deliberately precise-but-inefficient — every MIR
   statement maps to a fixed, isolated block of CIL ops, so malformed CIL traces straight back to one MIR
   statement. Reordering/eliminating ops is the optimizer's job (V2 `opt`). When chasing a bug, set

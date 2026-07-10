@@ -4,7 +4,7 @@ use cilly::{
     BinOp, Interned, Type,
     {ClassRef, Int, MethodRef},
 };
-use rustc_codegen_clr_type::GetTypeExt;
+use crate::r#type::GetTypeExt;
 use rustc_middle::span_bug;
 use rustc_middle::ty::{IntTy, Ty, TyKind, UintTy};
 

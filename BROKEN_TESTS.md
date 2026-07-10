@@ -513,7 +513,7 @@ crates added; gate 428/12 under the fatal checker.
    `#[rustc_inherit_overflow_checks]` helper (`<u8 as Add>::add`) inlined into a release crate now WRAPS
    (300 → 44) instead of panicking. Regression: `cargo_tests/overflow_elision` (native 44 == backend 44).
 
-2. **FIXED (Slice C) — `ConstValue::Indirect { offset != 0 }`.** `rustc_codgen_clr_operand/src/constant.rs`
+2. **FIXED (Slice C) — `ConstValue::Indirect { offset != 0 }`.** `src/operand/constant.rs`
    `create_const_from_data` no longer discards `offset_bytes` (`let _ = offset_bytes;` removed): the
    scalar fast-path is gated on `offset == 0` (it materializes the whole alloc), and the by-ref paths add
    the byte offset to the pointer (`biop(ptr, Const::USize(offset), Add)`), mirroring `load_scalar_ptr`. A

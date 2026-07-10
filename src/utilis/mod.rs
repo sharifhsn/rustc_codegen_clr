@@ -1,5 +1,5 @@
 use rustc_abi::VariantIdx;
-use rustc_codegen_clr_type::r#type::escape_field_name;
+use crate::r#type::escape_field_name;
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{
     ConstKind, GenericArg, Instance, List, PseudoCanonicalInput, Ty, TyCtxt, TyKind,

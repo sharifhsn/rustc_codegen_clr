@@ -1,11 +1,11 @@
 use super::{PlaceTy, pointed_type};
-use crate::{body_ty_is_by_address, deref_op};
+use crate::place::{body_ty_is_by_address, deref_op};
 use cilly::{BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, Type};
-use rustc_codegen_clr_ctx::MethodCompileCtx;
-use rustc_codegen_clr_type::{
+use crate::fn_ctx::MethodCompileCtx;
+use crate::r#type::{
     GetTypeExt,
     adt::{FieldOffsetIterator, field_descrptor, variant_field_desc},
-    r#type::fat_ptr_to,
+    fat_ptr_to,
     utilis::ptr_is_fat,
 };
 use rustc_middle::mir::{Local, PlaceElem};
@@ -141,7 +141,7 @@ pub fn place_elem_body_index<'tcx>(
     node: Interned<cilly::ir::CILNode>,
     index: rustc_middle::mir::Local,
 ) -> (PlaceTy<'tcx>, Interned<cilly::ir::CILNode>) {
-    let index = crate::local_get(index.as_usize(), ctx.body(), ctx);
+    let index = crate::place::local_get(index.as_usize(), ctx.body(), ctx);
     match curr_ty.kind() {
         TyKind::Slice(inner) => {
             let inner = ctx.monomorphize(*inner);

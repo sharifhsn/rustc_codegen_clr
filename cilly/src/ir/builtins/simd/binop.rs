@@ -60,7 +60,7 @@ binop!(simd_mul, "Multiply", BinOp::Mul);
 /// Recover `(element, lane count)` for a SIMD operand whose lowered type is EITHER a
 /// `Type::SIMDVector` (the managed-vector case for 64/128/256/512-bit widths) OR the fixed-array
 /// fallback used for unsupported sizes — sub-64-bit (`Simd<i8,4>`), >512-bit, or non-power-of-two
-/// (see `rustc_codegen_clr_type::r#type::get_type`). The array fallback is a class with a single
+/// (see the backend's `type::get_type`). The array fallback is a class with a single
 /// field `f0` of the element type, sized to hold `count` contiguous elements, so the lane count is
 /// `byte_size / sizeof(element)`. The two reps share an identical contiguous memory layout, which
 /// is exactly why the spill-and-index per-lane body below works unchanged on either.

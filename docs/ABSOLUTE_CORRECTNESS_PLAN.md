@@ -128,7 +128,7 @@ out to be shallow rather than structurally recursive:
   the checker/layout path was reviewed for the same "does it recurse through nested value-type
   composition?" failure mode: `Type::is_assignable_to`'s leaf arms, the `Box` valuetype-ness closure
   in `typecheck.rs`, `enum_`/`union_`/`closure_typedef`/`coroutine_typedef`'s `ClassDef` construction
-  in `rustc_codegen_clr_type/src/type.rs` (the coroutine/enum overlapping-storage paths both already
+  in `src/type/mod.rs` (the coroutine/enum overlapping-storage paths both already
   route through the now-fixed `layout_check`, so the fix's benefit is not coroutine-only), and every
   `match`/`if let` arm over `Type`'s variants in `typecheck.rs`/`class.rs`/`tpe/mod.rs` (a wildcard
   sweep: the ones present are all fail-closed rejections — safe by construction against a future
@@ -198,7 +198,7 @@ stderr-shape question). Fixes + findings:
   cause is NOT in the call/intrinsic/Assert terminator codegen** — instrumentation proved
   `caller_location` never reaches those paths for these programs; the wrong `Location` is materialized
   upstream as a **`ConstOperand`** (the const-`Location` value baked by rustc's MIR/const-eval), so the
-  divergence is in const-`Location` materialization (`rustc_codgen_clr_operand`), not the
+  divergence is in const-`Location` materialization (`src/operand`), not the
   `#[track_caller]` threading. Program *logic* (catch → `is_err()`, `Err`, exit code) is fully correct;
   only the diagnostic `file:line:col` diverges. Tractable but a distinct, deeper fix — left for a
   follow-up slice. (A unifying `materialize_caller_location` helper mirroring rustc's
@@ -301,7 +301,7 @@ isolated worktrees landed on a stale pre-V1→V2-flip base whose diffs don't app
 `src/terminator/mod.rs` Assert arm elides an optional overflow assert when `!sess.overflow_checks() &&
 msg.is_optional_overflow_check()` (mirrors `codegen_assert_terminator`), so a `#[rustc_inherit_overflow_checks]`
 helper inlined into a release crate WRAPS (300→44) instead of panicking. **C** —
-`rustc_codgen_clr_operand/src/constant.rs` `create_const_from_data` stops discarding `offset_bytes`
+`src/operand/constant.rs` `create_const_from_data` stops discarding `offset_bytes`
 (gates the whole-alloc scalar path on `offset==0`; adds the byte offset to the pointer in the by-ref
 paths like `load_scalar_ptr`), so a const into the middle of a larger alloc (`ARR[2]`) reads the right
 sub-object. **D** — three loud-ICE arms: signed `atomic_max`/`atomic_min` (wired to the sign-aware
@@ -397,7 +397,7 @@ documented). 6 work slices proposed (silent-wrong first).
 
 - **P3-S4/S5/S6 — P3 COMPLETE.** The last silent-mis-layout class and the checker-totality gaps are closed.
   - **S4 (size/layout clamp-and-continue → fatal):** the three *silent* over-size arms in
-    `rustc_codegen_clr_type/src/type.rs` — `struct_` size (clamped to `u32::MAX`), `Array` >4GiB
+    `src/type/mod.rs` — `struct_` size (clamped to `u32::MAX`), `Array` >4GiB
     (`eprintln` + `return Type::Void`, the ZST slot place-ops then read/write = a silent miscompile), and
     SIMD >4GiB (bare `return Type::Void`) — now `ctx.tcx().dcx().span_fatal(...)` with a clear message
     (returns `!`, so no Void slot is produced). Plus a width-assert on `constant.rs` `transmute_scalar_to`

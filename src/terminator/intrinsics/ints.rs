@@ -4,9 +4,9 @@ use cilly::{
     Assembly, BinOp, Int, Interned, Type,
     {cilnode::MethodKind, ClassRef, MethodRef},
 };
-use rustc_codegen_clr_place::place_set;
-use rustc_codegen_clr_type::GetTypeExt;
-use rustc_codgen_clr_operand::handle_operand;
+use crate::operand::handle_operand;
+use crate::place::place_set;
+use crate::r#type::GetTypeExt;
 use rustc_middle::{
     mir::{Operand, Place},
     ty::Instance,

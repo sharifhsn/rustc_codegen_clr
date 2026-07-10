@@ -468,7 +468,7 @@ would defeat the entire point of async streaming (no backpressure, fully buffere
 managed handle across a suspend, until the coroutine-layout wall is lifted — this is a flat block
 for the sugared case, not a workaround-away situation.** The sound fix (hoisting GC-ref-typed
 saved-locals out of overlapping union storage into their own always-present fields) is a multi-week
-`cilly/src` + `rustc_codegen_clr_type` project requiring the full Docker gate and new
+`cilly/src` + root `src/type` work requiring the full Docker gate and new
 coroutine/gcref test coverage, given the GC-soundness stakes. **Smallest safe first step (ships
 value without touching `cilly/src`):** a `mycorrhiza`-only pattern — a hand-authored, non-
 overlapping Stream-state struct via `#[dotnet_class]`/`#[dotnet_methods]` (`implements =
@@ -488,8 +488,8 @@ rules — the "this came from an `Option`" fact is erased before `cilly` ever se
 `#[dotnet_export]`'s marshalling doesn't handle `Option<T>` at all today. A real fix needs a new,
 non-erased nullability signal threaded from the one place that still has the pre-erasure Rust type
 available (`dotnet_macros`'s `marshal_param`/`marshal_return`, for the `#[dotnet_export]` surface
-only — the general MIR-codegen path has no such signal without new `rustc_codegen_clr_type`/
-`rustc_codegen_clr_call` plumbing) down through a new field on `cilly::ir::method::Method`/`FnSig`
+only — the general MIR-codegen path has no such signal without new root `type`/`call_info`
+plumbing) down through a new field on `cilly::ir::method::Method`/`FnSig`
 and into both exporters' signature emission. Realistically 1-2 focused PRs, and note the real scope
 is narrower than the backlog title suggests: "nullable annotations for the `#[dotnet_export]`/
 `#[dotnet_class]` proc-macro surface," not "for all Rust-to-.NET exported functions." Nothing here

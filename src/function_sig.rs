@@ -1,8 +1,8 @@
 use crate::codegen_error::CodegenError;
 use cilly::{FnSig, Type};
-use rustc_codegen_clr_call::CallInfo;
-use rustc_codegen_clr_ctx::MethodCompileCtx;
-use rustc_codegen_clr_type::r#type::get_type;
+use crate::call_info::CallInfo;
+use crate::fn_ctx::MethodCompileCtx;
+use crate::r#type::get_type;
 use rustc_middle::ty::{Instance, Ty, TyCtxt};
 
 /// Creates a `FnSig` from ` `. May not match the result of `sig_from_instance_`!

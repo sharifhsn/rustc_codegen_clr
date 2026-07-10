@@ -5,7 +5,7 @@
 //! `niche_start == 0`. The buggy decoder compared the tag against the variant *index* (1) instead
 //! of the niche *value* (0), so `Err` was read as `Ok`. (For `Option`, niche_start==index==0, which
 //! is why it was invisible.) Any regression here flips an assert below. See src/utilis/adt.rs
-//! get_discr and rustc_codegen_clr_type's DUMP_LAYOUT introspection.
+//! get_discr and the backend type module's DUMP_LAYOUT introspection.
 use std::hint::black_box;
 use std::num::NonZeroU128;
 

@@ -147,7 +147,7 @@ property for a cosmetic line-count win.
   `Const`.** The IR is a closed set of enums and exhaustiveness is the project's
   primary **miscompilation guard**: adding a variant *must* fail to compile at
   every site that has to handle it. The big matches live in the type lowering
-  ([rustc_codegen_clr_type/src/type.rs](../rustc_codegen_clr_type/src/type.rs)),
+  ([src/type/mod.rs](../src/type/mod.rs)),
   the typechecker ([cilly/src/ir/typecheck.rs](../cilly/src/ir/typecheck.rs)),
   and the exporters. A macro that generated those arms would let a new variant
   slip through as a silent fallthrough — converting a compiler error into a
@@ -172,7 +172,7 @@ property for a cosmetic line-count win.
   declarative-or-procedural macro models it better than the code does.
 
 - **Keep `get_type` / ADT layout explicit.** Rust `Ty` → cilly `Type` lowering
-  in [rustc_codegen_clr_type/src/type.rs](../rustc_codegen_clr_type/src/type.rs)
+  in [src/type/mod.rs](../src/type/mod.rs)
   is a dense exhaustive `match` on `TyKind` carrying the project's hardest-won
   knowledge (fat-ptr/DST layout, `TyKind::Foreign` thin pointers, ZSTs, enum
   `[FieldOffset]` tagging). It is exactly the exhaustiveness-guarded surface

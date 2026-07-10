@@ -324,7 +324,7 @@ impl Type {
             // Fat-pointer (DST) layout equivalence — a PROVEN false-positive fix (Phase P1 / WF-TC).
             //
             // Every `FatPtr<T>` class emitted by the backend (see `fat_ptr_to` in
-            // `rustc_codegen_clr_type/src/type.rs`) has the *identical* on-stack layout regardless of
+            // `src/type/mod.rs`) has the *identical* on-stack layout regardless of
             // the pointee `T`: field 0 is a type-erased `void*` data pointer at offset 0, field 1 is
             // a `usize` metadata word at offset 8, with explicit size 16 / align 8. The data pointer
             // is erased to `void*` in *all* of them. Therefore `FatPtr<u8>` and
@@ -473,7 +473,7 @@ mod fat_ptr_assignability_tests {
     use crate::ir::{Access, ClassDef};
     use std::num::NonZeroU32;
 
-    /// Mirror `rustc_codegen_clr_type::type::fat_ptr_to`: a value-type class named `FatPtr<elem>`
+    /// Mirror the backend's `type::fat_ptr_to`: a value-type class named `FatPtr<elem>`
     /// with a type-erased `void*` data pointer @0 and a `usize` metadata word @8, size 16 / align 8.
     fn make_fat_ptr(asm: &mut Assembly, elem_mangled: &str) -> Interned<ClassRef> {
         let name = asm.alloc_string(format!("FatPtr{elem_mangled}"));

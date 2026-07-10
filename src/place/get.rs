@@ -1,12 +1,9 @@
-use cilly::{
-    Assembly, BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, MethodRef, Type,
-    cilnode::MethodKind,
-};
-use rustc_codegen_clr_ctx::MethodCompileCtx;
-use rustc_codegen_clr_type::{
+use cilly::{Assembly, BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, Type};
+use crate::fn_ctx::MethodCompileCtx;
+use crate::r#type::{
     GetTypeExt,
     adt::{FieldOffsetIterator, field_descrptor, variant_field_desc},
-    r#type::fat_ptr_to,
+    fat_ptr_to,
     utilis::ptr_is_fat,
 };
 use rustc_middle::{
@@ -20,8 +17,9 @@ pub(super) fn local_get(
     asm: &mut Assembly,
 ) -> Interned<cilly::ir::CILNode> {
     asm.alloc_node(
-        if let Some(spread_arg) = method.spread_arg
-            && local == spread_arg.as_usize()
+        if method
+            .spread_arg
+            .is_some_and(|spread_arg| local == spread_arg.as_usize())
         {
             cilly::CILNode::LdLoc(
                 (method.local_decls.len() - method.arg_count)
@@ -138,7 +136,7 @@ fn place_elem_get<'a>(
             let curr_ty = curr_type
                 .as_ty()
                 .expect("INVALID PLACE: Indexing into enum variant???");
-            let index = crate::local_get(index.as_usize(), ctx.body(), ctx);
+            let index = crate::place::local_get(index.as_usize(), ctx.body(), ctx);
             match curr_ty.kind() {
                 TyKind::Slice(inner) => {
                     let inner = ctx.monomorphize(*inner);
@@ -259,22 +257,4 @@ fn place_elem_get<'a>(
         }
         _ => todo!("Can't handle porojection {place_elem:?} in get"),
     }
-}
-pub fn array_get_item<'tcx>(
-    ctx: &mut MethodCompileCtx<'tcx, '_>,
-    element: Ty<'tcx>,
-    curr_ty: Ty<'tcx>,
-) -> MethodRef {
-    let element = ctx.monomorphize(element);
-    let element = ctx.type_from_cache(element);
-    let array_type = ctx.type_from_cache(curr_ty);
-    let array_dotnet = array_type.as_class_ref().expect("Non array type");
-    let arr_ref = ctx.nref(array_type);
-    MethodRef::new(
-        array_dotnet,
-        ctx.alloc_string("get_Item"),
-        ctx.sig([arr_ref, Type::Int(Int::USize)], element),
-        MethodKind::Instance,
-        vec![].into(),
-    )
 }

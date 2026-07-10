@@ -3,10 +3,10 @@ use cilly::{
     cilnode::{ExtendKind, IsPure, MethodKind},
     ClassRef, Int, Interned, MethodRef, Type,
 };
-use rustc_codegen_clr_place::{place_address, place_set};
-use rustc_codegen_clr_type::adt::field_descrptor;
-use rustc_codegen_clr_type::GetTypeExt;
-use rustc_codgen_clr_operand::handle_operand;
+use crate::operand::handle_operand;
+use crate::place::{place_address, place_set};
+use crate::r#type::adt::field_descrptor;
+use crate::r#type::GetTypeExt;
 use rustc_middle::mir::{Operand, Place};
 use rustc_span::Spanned;
 

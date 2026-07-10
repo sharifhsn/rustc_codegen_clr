@@ -1,13 +1,8 @@
-#![feature(rustc_private)]
-extern crate rustc_abi;
-extern crate rustc_driver;
-extern crate rustc_hir;
-extern crate rustc_middle;
 use cilly::Interned;
 use cilly::Const;
-use rustc_codegen_clr_ctx::MethodCompileCtx;
-use rustc_codegen_clr_type::GetTypeExt;
-use rustc_codegen_clr_type::utilis::ptr_is_fat;
+use crate::fn_ctx::MethodCompileCtx;
+use crate::r#type::GetTypeExt;
+use crate::r#type::utilis::ptr_is_fat;
 
 use rustc_middle::mir::Place;
 
@@ -245,14 +240,6 @@ impl<'tcx> PlaceTy<'tcx> {
         match self {
             Self::Ty(inner) => Some(*inner),
             Self::EnumVariant(..) => None,
-        }
-    }
-    /// Returns the kind of the underlyting Ty.
-    pub fn kind(&self) -> &TyKind<'tcx> {
-        match self {
-            Self::Ty(ty) => ty.kind(),
-            //TODO: find a better way to get the emum variant!
-            Self::EnumVariant(ty, _variant) => ty.kind(),
         }
     }
 }

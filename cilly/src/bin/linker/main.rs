@@ -534,7 +534,7 @@ fn main() {
     let resolution = final_assembly.resolve_missing_methods(&externs, &modifies_errno, &overrides);
     println!("==> Missing-method resolution: {resolution}");
     if resolution.unresolved_missing_methods != 0 {
-        eprintln!(
+        println!(
             "linker: preserving {} unresolved non-abstract MethodImpl::Missing runtime stub(s)",
             resolution.unresolved_missing_methods
         );

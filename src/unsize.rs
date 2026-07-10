@@ -5,12 +5,12 @@ use cilly::{BinOp, Const, IntoAsmIndex, Type};
 use cilly::{FieldDesc, Int, Interned};
 use rustc_abi::FieldIdx;
 use rustc_abi::FIRST_VARIANT;
-use rustc_codegen_clr_place::place_address_raw;
-use rustc_codegen_clr_type::r#type::fat_ptr_to;
-use rustc_codegen_clr_type::utilis::is_fat_ptr;
-use rustc_codegen_clr_type::GetTypeExt;
-use rustc_codgen_clr_operand::constant::get_vtable;
-use rustc_codgen_clr_operand::{handle_operand, operand_address};
+use crate::operand::constant::get_vtable;
+use crate::operand::{handle_operand, operand_address};
+use crate::place::place_address_raw;
+use crate::r#type::fat_ptr_to;
+use crate::r#type::utilis::is_fat_ptr;
+use crate::r#type::GetTypeExt;
 use rustc_middle::{
     mir::{Operand, Place},
     ty::{layout::TyAndLayout, Ty, TyKind, UintTy},

@@ -4,9 +4,9 @@ use cilly::{
     Const, FieldDesc, Interned, MethodRef, Type, {ClassRef, Float, Int},
 };
 use ints::{ctlz, rotate_left, rotate_right};
-use rustc_codegen_clr_place::{place_address, place_set, ptr_set_op};
-use rustc_codegen_clr_type::GetTypeExt;
-use rustc_codgen_clr_operand::{constant::load_const_value, handle_operand, operand_address};
+use crate::operand::{constant::load_const_value, handle_operand, operand_address};
+use crate::place::{place_address, place_set, ptr_set_op};
+use crate::r#type::GetTypeExt;
 use rustc_middle::ty::TypingEnv;
 use rustc_middle::{
     mir::{Operand, Place},

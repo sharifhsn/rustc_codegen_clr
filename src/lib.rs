@@ -1,4 +1,5 @@
 #![feature(rustc_private)]
+#![feature(f16)]
 #![feature(alloc_error_hook)]
 #![warn(clippy::pedantic)]
 // Used for handling some configs. Will be refactored later.
@@ -39,8 +40,10 @@
 //! This does have its drawbacks(it makes allocating additional local variables harder than it needs to be), but its benefits outhgweight the issues it brings,
 //! at least at this point in time.
 //!
-//! One notable exeception to this rule is the [`crate::type::tycache::TyCache`] - a structure used for caching type translations. Since it needs to perform some expensive work(eg. find `core::ptr::metadata::PtrComponents`)
-//! upfront, reusing the `TyCache` for a whole codegen unit is needed. Thus, it is passed by a mutable reference. `TyCache` can be easily reset after a panic, ensuirng panic recovery is safe.
+//! Mutable IR construction is isolated transactionally: every mono item builds into a fresh
+//! [`cilly::Assembly`] shard, successful items are committed to a codegen-unit shard, and successful
+//! codegen units are committed to the crate assembly in rustc's deterministic order. A panic or
+//! error before commit therefore cannot leak partially interned state into its parent assembly.
 //!
 //! ## Faithful to MIR
 //!
@@ -96,12 +99,12 @@ extern crate rustc_symbol_mangling;
 extern crate rustc_target;
 extern crate rustc_ty_utils;
 
-pub use rustc_codegen_clr_place::*;
 // Modules
 /// Code handling the creation of aggreate values (Arrays, enums,structs,tuples,etc.)
 mod aggregate;
 /// Representation of a .NET assembly
 pub mod assembly;
+mod assembly_transaction;
 /// Moudle containing defintion of basic blocks and method operating on them.
 pub mod basic_block;
 /// Code handling binary operations
@@ -126,6 +129,8 @@ mod interop;
 pub mod native_pastrough;
 /// Handles a MIR operand.
 mod operand;
+/// Handles MIR places and projections.
+mod place;
 /// Converts righthandside of a MIR statement into CIL ops.
 mod rvalue;
 /// Code dealing with truning an individual MIR statement into CIL ops.
@@ -147,7 +152,11 @@ use cilly::{
     Assembly, AssemblyArtifact, BuildConfig,
     {cilnode::MethodKind, MethodRef},
 };
-use rustc_codegen_clr_ctx::MethodCompileCtx;
+use crate::{
+    assembly_transaction::assembly_transaction,
+    codegen_error::panic_payload_msg,
+    fn_ctx::MethodCompileCtx,
+};
 use rustc_codegen_ssa::{
     back::archive::{ArArchiveBuilder, ArchiveBuilder, ArchiveBuilderBuilder},
     traits::CodegenBackend,
@@ -174,6 +183,51 @@ pub type AString = std::sync::Arc<Box<str>>;
 struct MyBackend {
     build_config: BuildConfig,
 }
+
+fn add_item_transactionally<'tcx>(
+    parent: &mut Assembly,
+    item: rustc_middle::mono::MonoItem<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) {
+    let item_name = match item {
+        rustc_middle::mono::MonoItem::Fn(_) | rustc_middle::mono::MonoItem::Static(_) => {
+            item.symbol_name(tcx).to_string()
+        }
+        rustc_middle::mono::MonoItem::GlobalAsm(_) => "<global asm>".to_owned(),
+    };
+
+    if *config::ABORT_ON_ERROR {
+        // Deliberately do not catch this branch: an uncaught panic must resume with its original
+        // payload after the uncommitted shard is dropped.
+        assembly_transaction(parent, |shard| assembly::add_item(shard, item, tcx))
+            .unwrap_or_else(|error| panic!("Could not add item `{item_name}`: {error:?}"));
+        return;
+    }
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assembly_transaction(parent, |shard| assembly::add_item(shard, item, tcx))
+    }));
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!(
+            "could not compile item `{item_name}`: {error:?}; discarded its assembly shard"
+        ),
+        Err(payload) => {
+            if let Some(message) = panic_payload_msg(payload.as_ref()) {
+                eprintln!(
+                    "could not compile item `{item_name}`: codegen panicked with {message:?}; \
+                     discarded its assembly shard"
+                );
+            } else {
+                eprintln!(
+                    "could not compile item `{item_name}`: codegen panicked with a non-string \
+                     payload; discarded its assembly shard"
+                );
+            }
+        }
+    }
+}
+
 impl CodegenBackend for MyBackend {
     fn name(&self)->&'static str{
         "cg_clr"
@@ -193,11 +247,20 @@ impl CodegenBackend for MyBackend {
      
         let _ = cilly::utilis::get_environ(&mut asm);
 
+        // Keep CGUs and their MonoItems serial and commit them in rustc's existing iteration order.
+        // Transactional isolation is the prerequisite for parallel codegen, but serial equivalence
+        // is the gate: changing both ownership and scheduling at once would make an ordering or
+        // relocation regression impossible to distinguish from a concurrency bug.
         for cgu in cgus.codegen_units {
-            //println!("codegen {} has {} items.", cgu.name(), cgu.items().len());
-            for (item, _data) in cgu.items() {
-                assembly::add_item(&mut asm, *item, tcx).expect("Could not add function");
-            }
+            let result: Result<(), std::convert::Infallible> =
+                assembly_transaction(&mut asm, |cgu_asm| {
+                    //println!("codegen {} has {} items.", cgu.name(), cgu.items().len());
+                    for (item, _data) in cgu.items() {
+                        add_item_transactionally(cgu_asm, *item, tcx);
+                    }
+                    Ok(())
+                });
+            result.expect("a CGU transaction cannot return an error");
         }
 
         if let Some((entrypoint_did, kind)) = tcx.entry_fn(()) {

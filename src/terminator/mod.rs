@@ -5,12 +5,12 @@ use cilly::{
 };
 
 type Root = Interned<cilly::ir::CILRoot>;
-use rustc_codegen_clr_ctx::fn_name;
-use rustc_codegen_clr_place::{place_address, place_set};
-use rustc_codegen_clr_type::GetTypeExt;
+use crate::fn_ctx::fn_name;
+use crate::place::{place_address, place_set};
+use crate::r#type::GetTypeExt;
 use rustc_middle::mir::AssertKind;
 
-use rustc_codgen_clr_operand::{
+use crate::operand::{
     constant::{load_const_int, load_const_uint},
     handle_operand,
 };
@@ -90,7 +90,7 @@ pub(crate) fn get_caller_location<'tcx>(
     let tcx = ctx.tcx();
     // rustc appends exactly one implicit `&Location` to the `FnAbi` of every track_caller fn, so it
     // is the last CIL argument. MIR arg locals `_1..=arg_count` map to `LdArg(0..arg_count-1)` (see
-    // `rustc_codegen_clr_place::get::local_get`), so the implicit trailing arg is at `LdArg(arg_count)`.
+    // `crate::place::get::local_get`), so the implicit trailing arg is at `LdArg(arg_count)`.
     let own_caller_location = if ctx.instance().def.requires_caller_location(tcx) {
         let idx = u32::try_from(ctx.body().arg_count).expect("arg_count exceeds u32");
         Some(ctx.alloc_node(CILNode::LdArg(idx)))
@@ -103,7 +103,7 @@ pub(crate) fn get_caller_location<'tcx>(
     body.caller_location_span(source_info, own_caller_location, tcx, |span| {
         let caller_loc = tcx.span_as_caller_location(span);
         let caller_loc_ty = tcx.caller_location_ty();
-        rustc_codgen_clr_operand::constant::load_const_value(caller_loc, caller_loc_ty, ctx)
+        crate::operand::constant::load_const_value(caller_loc, caller_loc_ty, ctx)
     })
 }
 
@@ -130,7 +130,7 @@ fn call_panic_lang_item<'tcx>(
         rustc_middle::ty::List::empty(),
         span,
     );
-    let call_info = rustc_codegen_clr_call::CallInfo::sig_from_instance_(instance, ctx);
+    let call_info = crate::call_info::CallInfo::sig_from_instance_(instance, ctx);
     let signature = call_info.sig().clone();
     let name = fn_name(ctx.tcx().symbol_name(instance));
     let mut call_args: Vec<Interned<CILNode>> = args.to_vec();

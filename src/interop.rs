@@ -1,5 +1,5 @@
 use crate::IString;
-use rustc_codegen_clr_type::utilis::garg_to_string;
+use crate::r#type::utilis::garg_to_string;
 use rustc_middle::ty::{GenericArg, TyCtxt};
 pub struct AssemblyRef {
     name: IString,

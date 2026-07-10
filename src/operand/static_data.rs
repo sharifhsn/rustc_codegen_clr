@@ -1,6 +1,6 @@
 
 
-use crate::constant::{get_vtable, static_ty};
+use crate::operand::constant::{get_vtable, static_ty};
 use cilly::{
     Access, CILRoot, Const, FnSig, Int, Interned, MethodDef, MethodDefIdx, MethodRef,
     StaticFieldDesc, Type,
@@ -10,10 +10,10 @@ use cilly::{
 };
 
 type Root = Interned<cilly::ir::CILRoot>;
-use rustc_codegen_clr_call::CallInfo;
-pub use rustc_codegen_clr_ctx::MethodCompileCtx;
-use rustc_codegen_clr_ctx::fn_name;
-use rustc_codegen_clr_type::{GetTypeExt, align_of, r#type::fixed_array};
+use crate::call_info::CallInfo;
+pub use crate::fn_ctx::MethodCompileCtx;
+use crate::fn_ctx::fn_name;
+use crate::r#type::{GetTypeExt, align_of, fixed_array};
 use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::interpret::{AllocId, Allocation, GlobalAlloc},
@@ -424,28 +424,6 @@ pub fn add_allocation(
             buf
         }
     }
-}
-pub fn add_const_value(asm: &mut cilly::Assembly, bytes: u128) -> StaticFieldDesc {
-    let uint8_ptr = Type::Int(Int::U128);
-    let main_module_id = asm.main_module();
-    let alloc_fld = format!("a_{bytes:x}");
-    let alloc_fld_name = asm.alloc_string(alloc_fld.clone());
-
-    let field_desc = StaticFieldDesc::new(*asm.main_module(), alloc_fld_name, Type::Int(Int::U128));
-
-    let main_module = asm.class_mut(main_module_id);
-    if main_module.has_static_field(alloc_fld_name, field_desc.tpe()) {
-        return field_desc;
-    }
-    asm.add_static(uint8_ptr, alloc_fld, false, main_module_id, None, false);
-
-    let field = asm.alloc_sfld(field_desc);
-    let val = asm.alloc_node(Const::U128(bytes));
-    let set = asm.alloc_root(cilly::CILRoot::SetStaticField { field, val });
-
-    asm.add_cctor(&[set]);
-
-    field_desc
 }
 fn allocation_initializer_method(
     const_allocation: &Allocation,

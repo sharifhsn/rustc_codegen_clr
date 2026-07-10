@@ -6,9 +6,9 @@ use cilly::{
     cilnode::{IsPure, MethodKind},
     hashable::{HashableF32, HashableF64},
 };
-use rustc_codegen_clr_call::CallInfo;
-use rustc_codegen_clr_ctx::MethodCompileCtx;
-use rustc_codegen_clr_type::{GetTypeExt, r#type::fixed_array, utilis::is_fat_ptr};
+use crate::call_info::CallInfo;
+use crate::fn_ctx::MethodCompileCtx;
+use crate::r#type::{GetTypeExt, fixed_array, utilis::is_fat_ptr};
 use rustc_middle::ty::ExistentialTraitRef;
 use rustc_middle::{
     mir::{
@@ -20,7 +20,7 @@ use rustc_middle::{
 };
 use rustc_span::def_id::DefId;
 
-use crate::static_data::add_allocation;
+use crate::operand::static_data::add_allocation;
 pub fn handle_constant<'tcx>(
     const_op: &ConstOperand<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
@@ -146,7 +146,7 @@ pub fn load_const_value<'tcx>(
         ConstValue::ZeroSized => {
             let tpe = ctx.monomorphize(const_ty);
             assert!(
-                rustc_codegen_clr_type::utilis::is_zst(tpe, ctx.tcx()),
+                crate::r#type::utilis::is_zst(tpe, ctx.tcx()),
                 "Zero sized const with a non-zero size. It is {tpe:?}"
             );
             let tpe = ctx.type_from_cache(tpe);
@@ -264,7 +264,7 @@ fn load_scalar_ptr(
             // If it is a function, patch its pointer up.
             let call_info = CallInfo::sig_from_instance_(finstance, ctx);
             let function_name =
-                rustc_codegen_clr_ctx::fn_name(ctx.tcx().symbol_name(finstance));
+                crate::fn_ctx::fn_name(ctx.tcx().symbol_name(finstance));
             let mref = MethodRef::new(
                 *ctx.main_module(),
                 ctx.alloc_string(function_name),
