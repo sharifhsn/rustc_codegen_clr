@@ -14,8 +14,8 @@ use cilly::{
     {
         asm::{MissingMethodPatcher, ILASM_FLAVOUR},
         cilnode::MethodKind,
-        Assembly, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, Const, IlasmFlavour, Int,
-        MethodImpl, Type,
+        Assembly, BasicBlock, BuildConfig, BuildConfigMismatch, CILNode, CILRoot, ClassDef,
+        ClassRef, Const, IlasmFlavour, Int, MethodImpl, Type,
     },
 };
 mod load;
@@ -30,6 +30,19 @@ use std::{
     path::{Path, PathBuf},
 };
 mod aot;
+
+fn effective_build_config(
+    artifact_config: Option<BuildConfig>,
+    linker_config: BuildConfig,
+) -> Result<BuildConfig, BuildConfigMismatch> {
+    match artifact_config {
+        Some(artifact_config) => {
+            artifact_config.ensure_compatible(&linker_config)?;
+            Ok(artifact_config)
+        }
+        None => Ok(linker_config),
+    }
+}
 
 fn add_mandatory_statics(asm: &mut cilly::Assembly) {
     let main_module = asm.main_module();
@@ -189,6 +202,8 @@ fn extract_dirs(args: &[String]) -> Vec<String> {
 }
 
 fn main() {
+    let linker_build_config = BuildConfig::capture()
+        .unwrap_or_else(|error| panic!("invalid linker build configuration: {error}"));
     // Parse command line arguments
 
     let args: Vec<String> = env::args().collect();
@@ -215,7 +230,21 @@ fn main() {
 
     // Load assemblies from files
 
-    let (mut final_assembly, _) = load::load_assemblies(to_link.as_slice(), ar_to_link.as_slice());
+    let loaded = load::load_assemblies_with_config(to_link.as_slice(), ar_to_link.as_slice());
+    let (mut final_assembly, artifact_build_config, _, _) = loaded.into_parts();
+    let effective_build_config = effective_build_config(artifact_build_config, linker_build_config)
+        .unwrap_or_else(|error| {
+            panic!(
+                "linker process configuration does not match the serialized artifact contract: \
+                 {error}"
+            )
+        });
+    println!("==> Build configuration: {effective_build_config}");
+    // This first contract slice intentionally leaves the existing linker/config LazyLocks in
+    // place. They read the same process environment captured above; for versioned inputs, the
+    // field-by-field equality gate proves that environment agrees with codegen before any builtin
+    // synthesis or optimization begins. A follow-up migration will route consumers directly
+    // through `effective_build_config` and retire the duplicate environment readers.
     /*
        {
            let msg = final_assembly.alloc_string("Starting constant initialization");
@@ -472,8 +501,8 @@ fn main() {
         // thread-local errno + the bare POSIX C-ABI symbol cluster (socket/read/
         // epoll_*/…), each re-packaging an existing rcl_dotnet_* body. .NET-only;
         // additive (os=dotnet symbols + overrides), so ::stable is untouched. The
-        // fd-table MethodDefs are defined here; the two patch_missing_methods passes
-        // below resolve the wrappers' forward refs to them. See
+        // fd-table MethodDefs are defined here; fixed-point missing-method resolution below
+        // resolves the wrappers' forward refs to them. See
         // cilly/src/ir/builtins/posix.rs and docs/LIBC_SHIM_SCOPE.md.
         cilly::builtins::posix::insert_posix_shim(&mut final_assembly, &mut overrides);
     }
@@ -502,8 +531,14 @@ fn main() {
         ))
         .unwrap();
 
-    final_assembly.patch_missing_methods(&externs, &modifies_errno, &overrides);
-    final_assembly.patch_missing_methods(&externs, &modifies_errno, &overrides);
+    let resolution = final_assembly.resolve_missing_methods(&externs, &modifies_errno, &overrides);
+    println!("==> Missing-method resolution: {resolution}");
+    if resolution.unresolved_missing_methods != 0 {
+        eprintln!(
+            "linker: preserving {} unresolved non-abstract MethodImpl::Missing runtime stub(s)",
+            resolution.unresolved_missing_methods
+        );
+    }
 
     add_mandatory_statics(&mut final_assembly);
 
@@ -519,6 +554,12 @@ fn main() {
     println!("==> Optimizing in {:?}", opt_start.elapsed());
     final_assembly.eliminate_dead_code();
     final_assembly.fix_aligement();
+    let final_assembly = final_assembly.verify_for_export().unwrap_or_else(|error| {
+        panic!(
+            "final post-link verification failed after patching, DCE, optimization, and alignment: \
+             {error}"
+        )
+    });
     final_assembly
         .save_tmp(&mut std::fs::File::create(path.with_extension("cilly2")).unwrap())
         .unwrap();
@@ -654,15 +695,15 @@ fn main() {
                 .map(|s| format!("{s}.pdb"))
                 .unwrap_or_else(|| format!("{module_name}.pdb")),
         };
-        let (bytes, pdb_bytes) = cilly::pe_exporter::export::export_pe(
-            &mut final_assembly,
-            &cilly::pe_exporter::export::ExportOptions {
-                is_dll: is_lib,
-                assembly_name: asm_name,
-                module_name,
-                pdb_file_name: pdb_file_name.clone(),
-            },
-        );
+        let pe_options = cilly::pe_exporter::export::ExportOptions {
+            is_dll: is_lib,
+            assembly_name: asm_name,
+            module_name,
+            pdb_file_name: pdb_file_name.clone(),
+        };
+        let (bytes, pdb_bytes) = final_assembly
+            .render_pe(&pe_options)
+            .unwrap_or_else(|error| panic!("direct-PE post-render verification failed: {error}"));
         std::fs::write(&exe_out, bytes).unwrap();
         if !pdb_bytes.is_empty() {
             std::fs::write(exe_out.with_file_name(&pdb_file_name), pdb_bytes).unwrap();
@@ -837,3 +878,51 @@ config!(
      named-failure set vs the ilasm baseline). Escape hatch: set DIRECT_PE=0 to fall back to the \
      ilasm path (il_exporter) if a PE-writer regression is suspected."
 );
+
+#[cfg(test)]
+mod build_config_tests {
+    use super::*;
+    use cilly::{DotnetRuntime, OutputTarget};
+
+    #[test]
+    fn versioned_artifact_config_must_match_linker_process() {
+        let artifact = BuildConfig::default();
+        let linker = BuildConfig::new(
+            OutputTarget::C,
+            DotnetRuntime::Net9,
+            true,
+            false,
+            8,
+            16,
+            false,
+            false,
+            false,
+        );
+
+        let error = effective_build_config(Some(artifact), linker).unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("target: expected DotNet, found C"));
+        assert!(diagnostic.contains("dotnet_runtime: expected Net8, found Net9"));
+        assert!(diagnostic.contains("no_unwind: expected false, found true"));
+    }
+
+    #[test]
+    fn all_legacy_inputs_use_the_linker_process_snapshot() {
+        let linker = BuildConfig::new(
+            OutputTarget::Java,
+            DotnetRuntime::Net9,
+            true,
+            true,
+            16,
+            32,
+            true,
+            true,
+            true,
+        );
+
+        assert_eq!(
+            effective_build_config(None, linker.clone()).unwrap(),
+            linker
+        );
+    }
+}

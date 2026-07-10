@@ -119,7 +119,7 @@ pub struct ExportOptions {
 /// # Panics / `todo!()`
 /// On any construct outside the Phase 1a inventory — see the module doc.
 #[must_use]
-pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u8>) {
+pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u8>) {
     let mut mb = MetadataBuilder::new();
     // Must happen before ANY `AssemblyRef` row is created (every class's implicit
     // `System.Object`/`System.ValueType` base pulls in `System.Runtime`) — see
@@ -154,10 +154,10 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
     // `__rcl_const_blob_4.entrypoint()` — the method itself had moved). Creating every carrier
     // TypeDef here, before Pass 1 adds any real class's TypeDef row, keeps them permanently ahead
     // of every class's `MethodList`/`FieldList` range in table order, matching `il_exporter`.
-    let const_blob_carrier_type_of: std::collections::HashMap<usize, Token> = if asm.const_data.0.is_empty() {
+    let const_blob_carrier_type_of: std::collections::HashMap<usize, Token> = if asm.const_data.is_empty() {
         std::collections::HashMap::new()
     } else {
-        let mut blob_sizes: Vec<usize> = asm.const_data.0.iter().map(|d| d.len().max(1)).collect();
+        let mut blob_sizes: Vec<usize> = asm.const_data.values().iter().map(|d| d.len().max(1)).collect();
         blob_sizes.sort_unstable();
         blob_sizes.dedup();
         let value_type_ref = system_runtime_type_ref(&mut mb, "System.ValueType");
@@ -422,14 +422,10 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
 
         // Const-data statics: only for `MainModule`, only once, immediately after its own static
         // fields above — see this loop's doc comment for why position (not a separate pass) matters.
-        if class_def_id == main_module_id && !asm.const_data.0.is_empty() {
+        if class_def_id == main_module_id && !asm.const_data.is_empty() {
             // `const_data` blobs are keyed by `Interned<Box<[u8]>>`, independent of any `ClassDef`,
-            // so this reads `asm.const_data.0` (the BiMap's forward `Vec`) directly rather than
-            // anything on `class_def`. Sorted by `Interned` index (1-based position in `.0`) for
-            // determinism — `il_exporter` iterates the `HashMap` side (`.1.iter()`) directly and so
-            // is NOT itself order-deterministic across runs, but this writer's "no wall-clock/
-            // randomness anywhere" determinism contract (see `pe.rs`'s module doc) is worth the
-            // extra sort here.
+            // so this reads the BiMap in stable interned-id order rather than anything on
+            // `class_def`.
             //
             // **Ownership + naming are load-bearing, not a free choice**: `body.rs`'s
             // `const_blob_field_token` (the `Const::ByteBuffer` node-emission arm) independently
@@ -441,10 +437,8 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
             // a missing `StaticFieldDesc` lookup, or silently aliases some other field.
             let mut entries: Vec<(usize, u32, Vec<u8>)> = asm
                 .const_data
-                .0
                 .iter()
-                .enumerate()
-                .map(|(zero_based, data)| {
+                .map(|(idx, data)| {
                     let n = data.len().max(1);
                     // `n` (the `__rcl_const_blob_N` carrier's declared, ALWAYS-nonzero size — a
                     // zero-sized .NET valuetype is illegal, hence the `.max(1)` above) must equal
@@ -468,7 +462,7 @@ pub fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u
                     // "declared type width == blob length" invariant just above.
                     let mut bytes = data.to_vec();
                     bytes.resize(n, 0);
-                    (n, u32::try_from(zero_based + 1).unwrap(), bytes)
+                    (n, idx.inner(), bytes)
                 })
                 .collect();
             entries.sort_by_key(|&(_, idx_inner, _)| idx_inner);

@@ -38,6 +38,12 @@ impl Access {
 pub mod entrypoint;
 pub mod libc_fns;
 
+pub mod artifact;
+pub use artifact::{
+    decode_assembly_artifact, ArtifactDecodeError, ArtifactFormat, AssemblyArtifact, BuildConfig,
+    BuildConfigCaptureError, BuildConfigDifference, BuildConfigMismatch, DecodedAssemblyArtifact,
+    DotnetRuntime, OutputTarget, ASSEMBLY_ARTIFACT_MAGIC, ASSEMBLY_ARTIFACT_VERSION,
+};
 pub mod utilis;
 pub mod ir;
 /// The metadata of a slice

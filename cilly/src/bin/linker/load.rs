@@ -1,6 +1,9 @@
 use ar::Archive;
 
-use cilly::IString;
+use cilly::{
+    decode_assembly_artifact, ArtifactDecodeError, ArtifactFormat, Assembly, BuildConfig,
+    BuildConfigMismatch, DecodedAssemblyArtifact, IString,
+};
 use std::io::Read;
 pub struct LinkableFile {
     name: IString,
@@ -20,8 +23,111 @@ impl LinkableFile {
         &self.file
     }
 }
-fn load_ar(r: &mut impl std::io::Read) -> std::io::Result<(cilly::Assembly, Vec<LinkableFile>)> {
-    let mut merged = cilly::Assembly::default();
+
+/// Assemblies and their validated immutable build contract loaded for one link.
+pub struct LoadedAssemblies {
+    assembly: Assembly,
+    build_config: Option<BuildConfig>,
+    linkables: Vec<LinkableFile>,
+    legacy_artifacts: usize,
+}
+
+impl LoadedAssemblies {
+    /// Consumes all loaded state for the linker pipeline.
+    pub fn into_parts(self) -> (Assembly, Option<BuildConfig>, Vec<LinkableFile>, usize) {
+        (
+            self.assembly,
+            self.build_config,
+            self.linkables,
+            self.legacy_artifacts,
+        )
+    }
+}
+
+#[derive(Default)]
+struct AssemblyAccumulator {
+    assembly: Assembly,
+    build_config: Option<BuildConfig>,
+    legacy_artifacts: usize,
+}
+
+impl AssemblyAccumulator {
+    fn merge_encoded(&mut self, encoded: &[u8], source: &str) -> Result<(), ArtifactLoadError> {
+        let decoded =
+            decode_assembly_artifact(encoded).map_err(|error| ArtifactLoadError::Decode {
+                source: source.to_owned(),
+                error,
+            })?;
+        self.merge_decoded(decoded, source)
+    }
+
+    fn merge_decoded(
+        &mut self,
+        decoded: DecodedAssemblyArtifact,
+        source: &str,
+    ) -> Result<(), ArtifactLoadError> {
+        let (assembly, config, format) = decoded.into_parts();
+        if let Some(config) = config {
+            if let Some(expected) = &self.build_config {
+                expected.ensure_compatible(&config).map_err(|error| {
+                    ArtifactLoadError::IncompatibleBuildConfig {
+                        source: source.to_owned(),
+                        error,
+                    }
+                })?;
+            } else {
+                self.build_config = Some(config);
+            }
+        }
+        if format == ArtifactFormat::LegacyRawAssembly {
+            self.legacy_artifacts += 1;
+        }
+        self.assembly = std::mem::take(&mut self.assembly).link(assembly);
+        Ok(())
+    }
+
+    fn finish(self, linkables: Vec<LinkableFile>) -> LoadedAssemblies {
+        LoadedAssemblies {
+            assembly: self.assembly,
+            build_config: self.build_config,
+            linkables,
+            legacy_artifacts: self.legacy_artifacts,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ArtifactLoadError {
+    Decode {
+        source: String,
+        error: ArtifactDecodeError,
+    },
+    IncompatibleBuildConfig {
+        source: String,
+        error: BuildConfigMismatch,
+    },
+}
+
+impl std::fmt::Display for ArtifactLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Decode { source, error } => {
+                write!(f, "could not decode cilly artifact {source:?}: {error}")
+            }
+            Self::IncompatibleBuildConfig { source, error } => write!(
+                f,
+                "cilly artifact {source:?} cannot be linked with earlier inputs: {error}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ArtifactLoadError {}
+
+fn load_ar(
+    r: &mut impl std::io::Read,
+    merged: &mut AssemblyAccumulator,
+) -> std::io::Result<Vec<LinkableFile>> {
     let mut archive = Archive::new(r);
     let mut linkables = Vec::new();
     // Iterate over all entries in the archive:
@@ -38,9 +144,9 @@ fn load_ar(r: &mut impl std::io::Read) -> std::io::Result<(cilly::Assembly, Vec<
             entry
                 .read_to_end(&mut asm_bytes)
                 .expect("ERROR: Could not load the assembly file!");
-            let assembly = postcard::from_bytes(&asm_bytes)
-                .unwrap_or_else(|e| panic!("ERROR:Could not decode the assembly file {name}! err={e:?} bytes={}", asm_bytes.len()));
-            merged = merged.link(assembly);
+            merged.merge_encoded(&asm_bytes, &name).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            })?;
         } else if ext.contains("o") {
             let mut file_bytes = Vec::with_capacity(0x100);
             entry
@@ -51,14 +157,13 @@ fn load_ar(r: &mut impl std::io::Read) -> std::io::Result<(cilly::Assembly, Vec<
             eprintln!("shr:{name}");
         }
     }
-    Ok((merged, linkables))
+    Ok(linkables)
 }
-pub fn load_assemblies(
-    raw_files: &[&String],
-    archives: &[String],
-) -> (cilly::Assembly, Vec<LinkableFile>) {
+
+/// Loads, validates, and merges all assembly artifacts while retaining their build contract.
+pub fn load_assemblies_with_config(raw_files: &[&String], archives: &[String]) -> LoadedAssemblies {
     println!("==> Preparing to load assmeblies");
-    let mut merged = cilly::Assembly::default();
+    let mut merged = AssemblyAccumulator::default();
     let mut linkables = Vec::new();
     for asm_path in raw_files {
         let mut asm_file =
@@ -67,18 +172,74 @@ pub fn load_assemblies(
         asm_file
             .read_to_end(&mut asm_bytes)
             .expect("ERROR: Could not load the assembly file!");
-        let asm: cilly::Assembly =
-            postcard::from_bytes(&asm_bytes).expect("ERROR:Could not decode the assembly file!");
-
-        merged = merged.link(asm);
+        merged
+            .merge_encoded(&asm_bytes, asm_path)
+            .unwrap_or_else(|error| panic!("ERROR: {error}"));
     }
     for asm_path in archives {
         let mut asm_file =
             std::fs::File::open(asm_path).expect("ERROR: Could not open the assembly file!");
-        let (asm, linkable) = load_ar(&mut asm_file).expect("Could not open archive");
-        merged = merged.link(asm);
-        linkables.extend(linkable);
+        linkables.extend(
+            load_ar(&mut asm_file, &mut merged)
+                .unwrap_or_else(|error| panic!("Could not load archive {asm_path:?}: {error}")),
+        );
+    }
+    if merged.legacy_artifacts != 0 {
+        eprintln!(
+            "linker: loaded {} legacy raw-Assembly artifact(s); build-configuration compatibility \
+             could not be validated for those inputs",
+            merged.legacy_artifacts
+        );
     }
     println!("==> Loaded assmeblies");
-    (merged, linkables)
+    merged.finish(linkables)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cilly::{AssemblyArtifact, DotnetRuntime, OutputTarget};
+
+    #[test]
+    fn accumulator_rejects_field_level_config_mismatch_before_linking() {
+        let expected = BuildConfig::default();
+        let found = BuildConfig::new(
+            OutputTarget::C,
+            DotnetRuntime::Net9,
+            true,
+            false,
+            8,
+            16,
+            false,
+            false,
+            false,
+        );
+        let first = AssemblyArtifact::new(Assembly::default(), expected)
+            .encode()
+            .unwrap();
+        let second = AssemblyArtifact::new(Assembly::default(), found)
+            .encode()
+            .unwrap();
+        let mut accumulator = AssemblyAccumulator::default();
+        accumulator.merge_encoded(&first, "first.bc").unwrap();
+
+        let error = accumulator.merge_encoded(&second, "second.bc").unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("second.bc"));
+        assert!(diagnostic.contains("target: expected DotNet, found C"));
+        assert!(diagnostic.contains("dotnet_runtime: expected Net8, found Net9"));
+        assert!(diagnostic.contains("no_unwind: expected false, found true"));
+    }
+
+    #[test]
+    fn accumulator_accepts_legacy_artifact_but_marks_config_as_unvalidated() {
+        let legacy = postcard::to_stdvec(&Assembly::default()).unwrap();
+        let mut accumulator = AssemblyAccumulator::default();
+        accumulator.merge_encoded(&legacy, "legacy.bc").unwrap();
+        let loaded = accumulator.finish(Vec::new());
+        let (_, config, _, legacy_artifacts) = loaded.into_parts();
+
+        assert_eq!(legacy_artifacts, 1);
+        assert!(config.is_none());
+    }
 }

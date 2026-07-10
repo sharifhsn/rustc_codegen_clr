@@ -149,7 +149,13 @@ fn main() {
                 let start = Instant::now();
                 println!("Preparing to export the assembly");
                 #[cfg(not(miri))]
-                asm.export(path, ILExporter::new(cilly::IlasmFlavour::Clasic, true, None));
+                match asm.clone().verify_for_export() {
+                    Ok(ready) => ready.export(
+                        path,
+                        ILExporter::new(cilly::IlasmFlavour::Clasic, true, None),
+                    ),
+                    Err(error) => eprintln!("Refusing to export invalid CIL: {error}"),
+                }
                 println!(
                     "Exported the assembly in {} ms",
                     start.elapsed().as_millis()
@@ -161,7 +167,10 @@ fn main() {
                 let start = Instant::now();
                 println!("Preparing to export the assembly");
                 #[cfg(not(miri))]
-                asm.export(path, CExporter::new(false, vec![], vec![]));
+                match asm.clone().verify_for_export() {
+                    Ok(ready) => ready.export(path, CExporter::new(false, vec![], vec![])),
+                    Err(error) => eprintln!("Refusing to export invalid CIL: {error}"),
+                }
                 println!(
                     "Exported the assembly in {} ms",
                     start.elapsed().as_millis()
@@ -172,7 +181,10 @@ fn main() {
                 let path = path.trim().trim_matches('\'').trim();
                 println!("Preparing to export the assembly");
                 #[cfg(not(miri))]
-                asm.export(path, CillyIRExpoter::default())
+                match asm.clone().verify_for_export() {
+                    Ok(ready) => ready.export(path, CillyIRExpoter::default()),
+                    Err(error) => eprintln!("Refusing to export invalid CIL: {error}"),
+                }
             }
             "mmakemissing" => {
                 let id = parse_id(body, &asm);
@@ -312,10 +324,13 @@ fn is_valid_c(asm: &Assembly, id: u32) -> bool {
     #[cfg(not(miri))]
     {
         catch_unwind(|| {
-            asm.export(
-                format!("/tmp/test{id}.out"),
-                CExporter::new(false, vec![], vec![]),
-            )
+            asm.clone()
+                .verify_for_export()
+                .unwrap()
+                .export(
+                    format!("/tmp/test{id}.out"),
+                    CExporter::new(false, vec![], vec![]),
+                )
         })
         .is_ok()
     }

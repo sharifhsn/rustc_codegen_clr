@@ -144,7 +144,7 @@ pub mod config;
 mod unsize;
 // rustc functions used here.
 use cilly::{
-    Assembly,
+    Assembly, AssemblyArtifact, BuildConfig,
     {cilnode::MethodKind, MethodRef},
 };
 use rustc_codegen_clr_ctx::MethodCompileCtx;
@@ -171,7 +171,9 @@ pub type IString = cilly::IString;
 pub type AString = std::sync::Arc<Box<str>>;
 
 /// An instance of the codegen.
-struct MyBackend;
+struct MyBackend {
+    build_config: BuildConfig,
+}
 impl CodegenBackend for MyBackend {
     fn name(&self)->&'static str{
         "cg_clr"
@@ -385,9 +387,11 @@ impl CodegenBackend for MyBackend {
             // the first ill-typed method; in the default advisory mode it returns the violation
             // count, which we intentionally drop here (per-method warnings are already emitted).
             let _typecheck_violations = prepared.typecheck();
+            let artifact = AssemblyArtifact::new(prepared, self.build_config.clone());
             asm_out
                 .write_all(
-                    &postcard::to_stdvec(&prepared)
+                    &artifact
+                        .encode()
                         .expect("Could not serialize the tmp assembly file!"),
                 )
                 .expect("Could not save the tmp assembly file!");
@@ -456,7 +460,9 @@ impl ArchiveBuilderBuilder for RlibArchiveBuilder {
 /// Entrypoint of the codegen. This function starts the backend up, and returns a reference to it to rustc.
 pub extern "Rust" fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
     std::alloc::set_alloc_error_hook(custom_alloc_error_hook);
-    Box::new(MyBackend)
+    let build_config = BuildConfig::capture()
+        .unwrap_or_else(|error| panic!("invalid build configuration: {error}"));
+    Box::new(MyBackend { build_config })
 }
 pub use cilly::{DATA_PTR, ENUM_TAG, METADATA};
 use std::alloc::Layout;

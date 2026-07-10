@@ -1051,7 +1051,9 @@ fn opt_mag() {
 
     asm.opt(&mut fuel);
     #[cfg(not(miri))]
-    asm.export("/tmp/opt_mag.exe", ILExporter::new(*ILASM_FLAVOUR, false, None));
+    asm.verify_for_export()
+        .unwrap()
+        .export("/tmp/opt_mag.exe", ILExporter::new(*ILASM_FLAVOUR, false, None));
 }
 
 #[test]

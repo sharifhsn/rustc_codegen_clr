@@ -3,8 +3,8 @@ use super::{
     cilnode::{BinOp, ExtendKind, IsPure, MethodKind, PtrCastRes, UnOp},
     class::{ClassDefIdx, LayoutError, StaticFieldDef},
     opt::{OptFuel, SideEffectInfoCache},
-    Access, CILNode, CILRoot, ClassDef, ClassRef, Const, Exporter, FieldDesc, FnSig, Int,
-    IntoAsmIndex, MethodDef, MethodDefIdx, MethodRef, StaticFieldDesc, Type,
+    typecheck::TypeCheckError, Access, CILNode, CILRoot, ClassDef, ClassRef, Const, Exporter,
+    FieldDesc, FnSig, Int, IntoAsmIndex, MethodDef, MethodDefIdx, MethodRef, StaticFieldDesc, Type,
 };
 use crate::{config, utilis::assert_unique, IString};
 use crate::{utilis::encode, MethodImpl};
@@ -18,6 +18,46 @@ use std::{any::type_name, ops::Index};
 /// to fill in libc/intrinsic shims referenced but never defined by rustc-generated code.
 pub type MissingMethodPatcher =
     FxHashMap<Interned<IString>, Box<dyn Fn(Interned<MethodRef>, &mut Assembly) -> MethodImpl>>;
+
+/// Summary of one fixed-point missing-method resolution pass.
+///
+/// `method_refs_processed` counts every [`MethodRef`] that existed at the start of the pass or was
+/// interned by a patcher while the pass was running. Each reference is processed exactly once.
+/// `unresolved_missing_methods` counts non-abstract definitions that still intentionally use the
+/// runtime-throwing [`MethodImpl::Missing`] implementation after resolution; abstract methods use
+/// `Missing` only as an exporter-ignored placeholder and are not included.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MissingMethodResolutionStats {
+    pub method_refs_processed: usize,
+    pub method_refs_added: usize,
+    pub external_method_refs: usize,
+    pub already_defined: usize,
+    pub overrides_applied: usize,
+    pub externs_synthesized: usize,
+    pub allocator_shims_synthesized: usize,
+    pub no_alloc_shims_synthesized: usize,
+    pub missing_stubs_synthesized: usize,
+    pub unresolved_missing_methods: usize,
+}
+
+impl std::fmt::Display for MissingMethodResolutionStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "processed {} method refs ({} discovered during resolution): {} overrides, {} externs, \
+             {} allocator shims, {} no-alloc shims, {} missing stubs; {} unresolved non-abstract \
+             MethodImpl::Missing definitions remain",
+            self.method_refs_processed,
+            self.method_refs_added,
+            self.overrides_applied,
+            self.externs_synthesized,
+            self.allocator_shims_synthesized,
+            self.no_alloc_shims_synthesized,
+            self.missing_stubs_synthesized,
+            self.unresolved_missing_methods,
+        )
+    }
+}
 type StringMap = BiMap<IString>;
 type TypeMap = BiMap<Type>;
 #[derive(Default, Serialize, Deserialize, Clone)]
@@ -39,6 +79,84 @@ pub struct Assembly {
     /// A list of all buffers within this assembly.
     pub(crate) const_data: BiMap<Box<[u8]>>,
 }
+
+/// The first method rejected by the unconditional final-emission verifier.
+#[derive(Debug)]
+pub struct VerificationFailure {
+    pub method: MethodDefIdx,
+    pub method_name: String,
+    pub error: TypeCheckError,
+}
+
+impl std::fmt::Display for VerificationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CIL type-verifier rejected method `{}` ({:?}): {:?}",
+            self.method_name, self.method, self.error
+        )
+    }
+}
+
+impl std::error::Error for VerificationFailure {}
+
+/// An assembly that passed the unconditional verifier after its final mutation.
+///
+/// The inner [`Assembly`] is deliberately private and this type does not implement `DerefMut`:
+/// callers can inspect it and export it, but cannot reopen it for mutation.
+pub struct ExportReadyAssembly {
+    inner: Assembly,
+}
+
+impl std::ops::Deref for ExportReadyAssembly {
+    type Target = Assembly;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl ExportReadyAssembly {
+    /// Serializes the verified assembly without reopening it for mutation.
+    pub fn save_tmp<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        self.inner.save_tmp(w)
+    }
+
+    /// Emits the verified assembly through an immutable exporter.
+    #[cfg(not(miri))]
+    pub fn export(&self, out: impl AsRef<std::path::Path>, mut exporter: impl Exporter) {
+        if *LINKER_RECOVER {
+            eprintln!("{:?}", exporter.export(&self.inner, out.as_ref()));
+        } else {
+            exporter.export(&self.inner, out.as_ref()).unwrap();
+        }
+    }
+
+    /// Renders the direct-PE output, then re-verifies the assembly before any bytes can escape.
+    ///
+    /// The direct PE renderer still interns a handful of helper references while lowering. Keeping
+    /// that mutable access private to this consuming method means those mutations cannot invalidate
+    /// the original verification certificate: the returned bytes are released only after a second,
+    /// unconditional verification succeeds.
+    pub fn render_pe(
+        self,
+        options: &super::pe_exporter::export::ExportOptions,
+    ) -> Result<(Vec<u8>, Vec<u8>), VerificationFailure> {
+        self.render_with_reverification(|asm| {
+            super::pe_exporter::export::export_pe(asm, options)
+        })
+    }
+
+    fn render_with_reverification<T>(
+        mut self,
+        render: impl FnOnce(&mut Assembly) -> T,
+    ) -> Result<T, VerificationFailure> {
+        let output = render(&mut self.inner);
+        self.inner.verify_for_export()?;
+        Ok(output)
+    }
+}
+
 impl Index<Interned<IString>> for Assembly {
     type Output = str;
 
@@ -253,6 +371,31 @@ impl Assembly {
             };
         }
         violations
+    }
+
+    /// Consumes this assembly and seals it for final emission.
+    ///
+    /// Unlike [`Self::typecheck`], this gate is unconditional: the diagnostic/escape-hatch
+    /// environment flags used by earlier per-crate checks cannot skip the final post-link check.
+    /// The only successful result is an [`ExportReadyAssembly`] whose inner assembly is no longer
+    /// available through a mutable reference.
+    pub fn verify_for_export(mut self) -> Result<ExportReadyAssembly, VerificationFailure> {
+        self.sanity_check();
+        let method_def_idxs: Box<[_]> = self.method_defs.keys().copied().collect();
+        for method in method_def_idxs {
+            let mut tmp_method = self.method_def(method).clone();
+            if let Err(error) = tmp_method.typecheck(&mut self) {
+                let method_name = self[self[method].name()].to_string();
+                let dump = crate::ir::dump::dump_method(&tmp_method, &mut self);
+                eprintln!("{dump}");
+                return Err(VerificationFailure {
+                    method,
+                    method_name,
+                    error,
+                });
+            }
+        }
+        Ok(ExportReadyAssembly { inner: self })
     }
     #[must_use]
     pub fn class_defs(&self) -> &FxHashMap<ClassDefIdx, ClassDef> {
@@ -945,14 +1088,6 @@ impl Assembly {
             assert_unique(class.methods(), class.ref_to().display(self));
         });
     }
-    #[cfg(not(miri))]
-    pub fn export(&self, out: impl AsRef<std::path::Path>, mut exporter: impl Exporter) {
-        if *LINKER_RECOVER {
-            eprintln!("{:?}", exporter.export(self, out.as_ref()));
-        } else {
-            exporter.export(self, out.as_ref()).unwrap();
-        }
-    }
     pub fn memory_info(&self) {
         let mut stats = vec![
             encoded_stats(self),
@@ -1152,13 +1287,22 @@ impl Assembly {
         self.roots = new_roots;
     }
 
-    pub fn patch_missing_methods(
+    /// Resolves every in-assembly [`MethodRef`] that has no definition, including references
+    /// synthesized by an override while this method is running.
+    ///
+    /// The growable `method_refs` arena is the worklist: the cursor advances monotonically while
+    /// patchers may append new references. Consequently resolution reaches a fixed point without
+    /// rescanning old references, and every interned reference is processed at most once per
+    /// invocation.
+    #[must_use]
+    pub fn resolve_missing_methods(
         &mut self,
         externs: &FxHashMap<&str, String>,
         modifies_errno: &FxHashSet<&str>,
         override_methods: &MissingMethodPatcher,
-    ) {
-        let mref_count = self.method_refs.0.len();
+    ) -> MissingMethodResolutionStats {
+        let initial_mref_count = self.method_refs.0.len();
+        let mut stats = MissingMethodResolutionStats::default();
         let externs: FxHashMap<_, _> = externs
             .iter()
             .map(|(fn_name, lib_name)| {
@@ -1172,27 +1316,29 @@ impl Assembly {
             .iter()
             .map(|fn_name| self.alloc_string(*fn_name))
             .collect();
-        for index in 0..mref_count {
+        let mut index = 0;
+        while index < self.method_refs.0.len() {
+            stats.method_refs_processed += 1;
             // Get the full method refernce
             let mref = self.method_refs.0[index].clone();
+            index += 1;
             // Check if this method reference's class has an assembly. If it has, then the method is extern. If it has not, then it is defined in this assembly
             // and must have some kind of implementation
             let class = self.class_ref(mref.class());
 
             if class.asm().is_some() {
                 // Is extern, skip
-
+                stats.external_method_refs += 1;
                 continue;
             }
-            let mref_idx =
-                Interned::from_index(std::num::NonZeroU32::new(index as u32 + 1).unwrap());
+            let mref_idx = Interned::from_index(std::num::NonZeroU32::new(index as u32).unwrap());
             // Check if this method already has an implementation.
             if self
                 .method_defs
                 .contains_key(&MethodDefIdx::from_raw(mref_idx))
             {
                 // A method defintion already present, so we don't need to do anyting, so skip.
-
+                stats.already_defined += 1;
                 continue;
             }
             // FAIL-LOUDLY BACKSTOP: an in-assembly `MethodRef` that resolves to NO `MethodDef` on
@@ -1235,6 +1381,7 @@ impl Assembly {
                 // `MethodAccessException`. Public is not a DCE root, so unused helpers are still
                 // culled; intra-class callers (the `::stable` executables) are unaffected.
                 self.new_method(mref.into_def(implementation, Access::Public, self));
+                stats.overrides_applied += 1;
                 continue;
             }
 
@@ -1261,6 +1408,7 @@ impl Assembly {
                 );
 
                 self.new_method(method_def);
+                stats.externs_synthesized += 1;
 
                 continue;
             }
@@ -1280,8 +1428,10 @@ impl Assembly {
             let is_noalloc_shim = name.contains("__rust_no_alloc_shim_is_unstable");
             let imp = if is_alloc {
                 let alloc = MethodRef::aligned_alloc(self);
+                stats.allocator_shims_synthesized += 1;
                 MethodImpl::wrapper(self.alloc_methodref(alloc), &mref, self)
             } else if is_noalloc_shim {
+                stats.no_alloc_shims_synthesized += 1;
                 MethodImpl::MethodBody {
                     blocks: vec![super::BasicBlock::new(
                         vec![self.alloc_root(CILRoot::VoidRet)],
@@ -1291,6 +1441,7 @@ impl Assembly {
                     locals: vec![],
                 }
             } else {
+                stats.missing_stubs_synthesized += 1;
                 MethodImpl::Missing
             };
             let method_def = MethodDef::new(
@@ -1312,6 +1463,13 @@ impl Assembly {
 
             self.new_method(method_def);
         }
+        stats.method_refs_added = self.method_refs.0.len() - initial_mref_count;
+        stats.unresolved_missing_methods = self
+            .method_defs
+            .values()
+            .filter(|def| !def.is_abstract() && matches!(def.implementation(), MethodImpl::Missing))
+            .count();
+        stats
     }
 
     #[must_use]
@@ -2816,6 +2974,197 @@ fn add_user_init() {
     ];
     asm.add_user_init(&roots);
 }
+
+#[cfg(test)]
+fn add_deliberately_ill_typed_method(asm: &mut Assembly) -> MethodDefIdx {
+    let local_ty = asm.alloc_type(Type::Int(Int::USize));
+    let value = asm.alloc_node(Const::F64(super::hashable::HashableF64(1.0)));
+    let bad_store = asm.alloc_root(CILRoot::StLoc(0, value));
+    let main = asm.main_module();
+    let name = asm.alloc_string("deliberately_ill_typed");
+    let sig = asm.sig([], Type::Void);
+    asm.new_method(MethodDef::new(
+        Access::Private,
+        main,
+        name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(vec![bad_store], 0, None)],
+            locals: vec![(None, local_ty)],
+        },
+        vec![],
+    ))
+}
+
+#[test]
+fn final_export_verification_accepts_clean_assembly() {
+    assert!(Assembly::default().prepared().verify_for_export().is_ok());
+}
+
+#[test]
+fn final_export_verification_returns_structured_failure() {
+    let mut asm = Assembly::default().prepared();
+    let bad_method = add_deliberately_ill_typed_method(&mut asm);
+    let Err(error) = asm.verify_for_export() else {
+        panic!("an ill-typed method must not receive an export-ready seal");
+    };
+    assert_eq!(error.method, bad_method);
+    assert_eq!(error.method_name, "deliberately_ill_typed");
+    assert!(matches!(
+        error.error,
+        TypeCheckError::LocalAssigementWrong { .. }
+    ));
+}
+
+#[test]
+fn direct_pe_render_reverifies_before_releasing_artifacts() {
+    let ready = Assembly::default()
+        .prepared()
+        .verify_for_export()
+        .unwrap();
+    let result = ready.render_with_reverification(|asm| {
+        add_deliberately_ill_typed_method(asm);
+        (vec![0x4d, 0x5a], Vec::<u8>::new())
+    });
+    assert!(result.is_err(), "post-render invalidation must discard PE bytes");
+}
+
+#[test]
+fn missing_method_resolution_reaches_fixed_point() {
+    use std::{cell::Cell, rc::Rc};
+
+    fn void_body(asm: &mut Assembly, before_return: Option<Interned<CILRoot>>) -> MethodImpl {
+        let mut roots = Vec::new();
+        roots.extend(before_return);
+        roots.push(asm.alloc_root(CILRoot::VoidRet));
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(roots, 0, None)],
+            locals: vec![],
+        }
+    }
+
+    let mut asm = Assembly::default();
+    let first = Interned::<MethodRef>::builtin(&mut asm, "first", &[], Type::Void);
+    let first_name = asm.alloc_string("first");
+    let second_name = asm.alloc_string("second");
+    let third_name = asm.alloc_string("third");
+    let first_calls = Rc::new(Cell::new(0));
+    let second_calls = Rc::new(Cell::new(0));
+    let third_calls = Rc::new(Cell::new(0));
+
+    let mut overrides = MissingMethodPatcher::default();
+    let calls = Rc::clone(&first_calls);
+    overrides.insert(
+        first_name,
+        Box::new(move |_, asm| {
+            calls.set(calls.get() + 1);
+            let second = Interned::<MethodRef>::builtin(asm, "second", &[], Type::Void);
+            let call = asm.call_root(second, &[] as &[Interned<CILNode>], IsPure::NOT);
+            void_body(asm, Some(call))
+        }),
+    );
+    let calls = Rc::clone(&second_calls);
+    overrides.insert(
+        second_name,
+        Box::new(move |_, asm| {
+            calls.set(calls.get() + 1);
+            let third = Interned::<MethodRef>::builtin(asm, "third", &[], Type::Void);
+            let call = asm.call_root(third, &[] as &[Interned<CILNode>], IsPure::NOT);
+            void_body(asm, Some(call))
+        }),
+    );
+    let calls = Rc::clone(&third_calls);
+    overrides.insert(
+        third_name,
+        Box::new(move |_, asm| {
+            calls.set(calls.get() + 1);
+            void_body(asm, None)
+        }),
+    );
+
+    let externs: FxHashMap<&str, String> = FxHashMap::default();
+    let modifies_errno: FxHashSet<&str> = FxHashSet::default();
+    let stats = asm.resolve_missing_methods(&externs, &modifies_errno, &overrides);
+
+    assert_eq!(stats.method_refs_processed, 3);
+    assert_eq!(stats.method_refs_added, 2);
+    assert_eq!(stats.overrides_applied, 3);
+    assert_eq!(stats.unresolved_missing_methods, 0);
+    assert_eq!(first_calls.get(), 1);
+    assert_eq!(second_calls.get(), 1);
+    assert_eq!(third_calls.get(), 1);
+    assert!(matches!(
+        asm[asm.method_ref_to_def(first).unwrap()].implementation(),
+        MethodImpl::MethodBody { .. }
+    ));
+}
+
+#[test]
+fn missing_method_resolution_reports_runtime_stubs_but_not_abstract_placeholders() {
+    let mut asm = Assembly::default();
+    let missing = Interned::<MethodRef>::builtin(&mut asm, "unresolved", &[], Type::Void);
+
+    let main_module = asm.main_module();
+    let abstract_name = asm.alloc_string("AbstractPlaceholder");
+    let abstract_sig = asm.sig([], Type::Void);
+    asm.new_method(
+        MethodDef::new(
+            Access::Public,
+            main_module,
+            abstract_name,
+            abstract_sig,
+            MethodKind::Static,
+            MethodImpl::Missing,
+            vec![],
+        )
+        .with_abstract(),
+    );
+
+    let externs: FxHashMap<&str, String> = FxHashMap::default();
+    let modifies_errno: FxHashSet<&str> = FxHashSet::default();
+    let stats =
+        asm.resolve_missing_methods(&externs, &modifies_errno, &MissingMethodPatcher::default());
+
+    assert_eq!(stats.missing_stubs_synthesized, 1);
+    assert_eq!(stats.unresolved_missing_methods, 1);
+    assert!(matches!(
+        asm[asm.method_ref_to_def(missing).unwrap()].implementation(),
+        MethodImpl::Missing
+    ));
+}
+
+#[test]
+#[should_panic(expected = "Refusing to inject a phantom member onto the interface")]
+fn missing_method_resolution_rejects_dangling_interface_refs() {
+    let mut asm = Assembly::default();
+    let interface_name = asm.alloc_string("ITest");
+    let interface = asm
+        .class_def(
+            ClassDef::new(
+                interface_name,
+                false,
+                0,
+                None,
+                vec![],
+                vec![],
+                Access::Public,
+                None,
+                None,
+                true,
+            )
+            .with_interface(),
+        )
+        .unwrap();
+    let sig = asm.sig([], Type::Void);
+    asm.new_methodref(*interface, "MissingMember", sig, MethodKind::Virtual, []);
+
+    let externs: FxHashMap<&str, String> = FxHashMap::default();
+    let modifies_errno: FxHashSet<&str> = FxHashSet::default();
+    let _ =
+        asm.resolve_missing_methods(&externs, &modifies_errno, &MissingMethodPatcher::default());
+}
+
 #[test]
 fn export() {
     use super::il_exporter::*;
@@ -2854,7 +3203,9 @@ fn export() {
         vec![None],
     ));
     #[cfg(not(miri))]
-    asm.export("/tmp/export.exe", ILExporter::new(*ILASM_FLAVOUR, false, None));
+    asm.verify_for_export()
+        .unwrap()
+        .export("/tmp/export.exe", ILExporter::new(*ILASM_FLAVOUR, false, None));
 }
 #[test]
 fn export2() {
@@ -2915,7 +3266,9 @@ fn export2() {
     asm.eliminate_dead_code();
     asm.realloc_roots();
     #[cfg(not(miri))]
-    asm.export("/tmp/export2.exe", ILExporter::new(*ILASM_FLAVOUR, false, None));
+    asm.verify_for_export()
+        .unwrap()
+        .export("/tmp/export2.exe", ILExporter::new(*ILASM_FLAVOUR, false, None));
 }
 /// Smallest-safe-first-step spike for `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md`'s Tier C finding
 /// #2 (exporting Rust traits as C# interfaces): hand-build a genuine ECMA-335 `interface`
@@ -2961,7 +3314,7 @@ fn export_interface() {
     .with_abstract();
     asm.new_method(mdef);
     #[cfg(not(miri))]
-    asm.export(
+    asm.verify_for_export().unwrap().export(
         "/tmp/export_interface.dll",
         ILExporter::new(*ILASM_FLAVOUR, true, None),
     );
@@ -3056,7 +3409,7 @@ fn export_event() {
     ));
 
     #[cfg(not(miri))]
-    asm.export(
+    asm.verify_for_export().unwrap().export(
         "/tmp/export_event.dll",
         ILExporter::new(*ILASM_FLAVOUR, true, None),
     );
@@ -3125,6 +3478,8 @@ fn link() {
     asm.eliminate_dead_code();
     asm.realloc_roots();
     #[cfg(not(miri))]
-    asm.export("/tmp/link_test.exe", ILExporter::new(*ILASM_FLAVOUR, false, None));
+    asm.verify_for_export()
+        .unwrap()
+        .export("/tmp/link_test.exe", ILExporter::new(*ILASM_FLAVOUR, false, None));
 }
 config! {LINKER_RECOVER,bool,false}

@@ -59,11 +59,49 @@ impl<Value: Eq + Hash + Clone + Debug> BiMap<Value> {
         self.0.is_empty()
     }
 
-    pub fn contais_val(&self, def: Value) -> bool {
-        self.1.contains_key(&def)
+    /// Returns the values in stable, interned-id order.
+    #[must_use]
+    pub fn values(&self) -> &[Value] {
+        &self.0
     }
+
+    /// Looks up the interned id for an already-allocated value.
+    #[must_use]
+    pub fn get_id(&self, value: &Value) -> Option<Interned<Value>> {
+        self.1.get(value).copied()
+    }
+
+    /// Returns whether `value` has already been interned.
+    #[must_use]
+    pub fn contains_value(&self, value: &Value) -> bool {
+        self.1.contains_key(value)
+    }
+
+    pub fn contais_val(&self, def: Value) -> bool {
+        self.contains_value(&def)
+    }
+
+    /// Iterates over every allocated id in ascending, stable id order.
+    pub fn ids(&self) -> impl ExactSizeIterator<Item = Interned<Value>> + DoubleEndedIterator {
+        (0..self.0.len()).map(|zero_based| {
+            let one_based = u32::try_from(zero_based)
+                .expect("Interned<Value> ID out of range")
+                .checked_add(1)
+                .expect("Interned<Value> ID overflow");
+            Interned::from_index(NonZeroU32::new(one_based).unwrap())
+        })
+    }
+
+    /// Iterates over every `(id, value)` pair in ascending, stable id order.
+    pub fn iter(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (Interned<Value>, &Value)> + DoubleEndedIterator {
+        self.ids().zip(self.values())
+    }
+
+    /// Backwards-compatible name for [`Self::ids`].
     pub fn iter_keys(&self) -> impl Iterator<Item = Interned<Value>> {
-        (1..(self.0.len() as u32)).map(|key| Interned::from_index(NonZeroU32::new(key).unwrap()))
+        self.ids()
     }
 
     pub fn map_values(&mut self, map: impl Fn(&mut Value)) {
@@ -99,6 +137,62 @@ fn bimap_alloc() {
     assert_eq!(**map.get(bob), *"Bob");
     assert_eq!(map.len(), 2);
     assert!(!map.is_empty());
+}
+
+#[test]
+fn bimap_ids_values_and_iter_cover_every_entry() {
+    let mut map = BiMap::<u32>::default();
+    assert_eq!(map.ids().count(), 0);
+    assert_eq!(map.iter().count(), 0);
+
+    let ids: Vec<_> = [11, 22, 33]
+        .into_iter()
+        .map(|value| map.alloc(value))
+        .collect();
+
+    assert_eq!(map.ids().collect::<Vec<_>>(), ids);
+    assert_eq!(map.iter_keys().collect::<Vec<_>>(), ids);
+    assert_eq!(map.values(), &[11, 22, 33]);
+    assert_eq!(
+        map.iter()
+            .map(|(id, value)| (id, *value))
+            .collect::<Vec<_>>(),
+        ids.iter()
+            .copied()
+            .zip([11, 22, 33])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(map.get_id(&22), Some(ids[1]));
+    assert_eq!(map.get_id(&44), None);
+    assert!(map.contains_value(&33));
+    assert!(!map.contains_value(&44));
+}
+
+#[test]
+fn bimap_accessors_preserve_dedup_and_postcard_roundtrip() {
+    let mut map = BiMap::<u32>::default();
+    let mut first_ids = FxHashMap::default();
+    for value in (0..128).map(|idx| (idx * 37) % 23) {
+        let id = map.alloc(value);
+        assert_eq!(*first_ids.entry(value).or_insert(id), id);
+    }
+
+    assert_eq!(map.len(), 23);
+    for (id, value) in map.iter() {
+        assert_eq!(map.get(id), value);
+        assert_eq!(map.get_id(value), Some(id));
+    }
+
+    let bytes = postcard::to_allocvec(&map).unwrap();
+    let decoded: BiMap<u32> = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.values(), map.values());
+    assert_eq!(
+        decoded.ids().collect::<Vec<_>>(),
+        map.ids().collect::<Vec<_>>()
+    );
+    for (id, value) in decoded.iter() {
+        assert_eq!(decoded.get_id(value), Some(id));
+    }
 }
 /// A 1-based index into a `BiMap<T>`, tagged with `T` only via `PhantomData` — there is
 /// no run-time type check, so an `Interned<A>` and `Interned<B>` sharing a bit pattern are

@@ -575,7 +575,13 @@ impl Assembly {
                 .map(|block| self.translate_block(source, block))
                 .collect()
         });
-        BasicBlock::new(roots, block.block_id(), handler)
+        match handler {
+            Some(handler) => {
+                debug_assert!(block.handler_id().is_none());
+                BasicBlock::new(roots, block.block_id(), Some(handler))
+            }
+            None => BasicBlock::new_raw(roots, block.block_id(), block.handler_id()),
+        }
     }
     pub(crate) fn translate_method_def(&mut self, source: &Assembly, def: &MethodDef) -> MethodDef {
         let class = self.translate_class_ref(source, *def.class());
@@ -744,6 +750,9 @@ impl Assembly {
             def.align(),
             def.has_nonveralpping_layout(),
         );
+        if def.is_valuetype_authoritative() {
+            translated = translated.with_valuetype_authoritative();
+        }
         if def.is_interface() {
             translated = translated.with_interface();
         }
@@ -860,3 +869,131 @@ impl Assembly {
     }
 }
 const SPECIAL_METHOD_NAMES: &[&str] = &[CCTOR, TCCTOR, USER_INIT];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ir::cilnode::MethodKind, Access, Const, IString, Int, MethodImpl, Type};
+
+    fn add_void_method(
+        asm: &mut Assembly,
+        name: &str,
+        blocks: Vec<BasicBlock>,
+    ) -> Interned<IString> {
+        let owner = asm.main_module();
+        let name = asm.alloc_string(name);
+        let sig = asm.sig([], Type::Void);
+        asm.new_method(MethodDef::new(
+            Access::Public,
+            owner,
+            name,
+            sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks,
+                locals: vec![],
+            },
+            vec![],
+        ));
+        name
+    }
+
+    fn seed_destination_ids(asm: &mut Assembly) {
+        let _ = asm.alloc_string("destination-only-string");
+        let _ = asm.alloc_type(Type::Int(Int::U16));
+        let node = asm.alloc_node(Const::I32(7));
+        let _ = asm.alloc_root(CILRoot::Pop(node));
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        add_void_method(
+            asm,
+            "destination_only_method",
+            vec![BasicBlock::new(vec![ret], 0, None)],
+        );
+    }
+
+    #[test]
+    fn link_preserves_unresolved_basic_block_handler_id() {
+        let mut destination = Assembly::default();
+        seed_destination_ids(&mut destination);
+
+        let mut source = Assembly::default();
+        let ret = source.alloc_root(CILRoot::VoidRet);
+        let source_name = add_void_method(
+            &mut source,
+            "source_with_unresolved_handler",
+            vec![BasicBlock::new_raw(vec![ret], 17, Some(91))],
+        );
+
+        let linked = destination.link(source);
+        let method = linked
+            .method_defs()
+            .values()
+            .find(|method| &linked[method.name()] == "source_with_unresolved_handler")
+            .expect("linked source method");
+        assert_ne!(method.name().inner(), source_name.inner());
+        let MethodImpl::MethodBody { blocks, .. } = method.implementation() else {
+            panic!("source method must keep its body");
+        };
+        assert_eq!(blocks[0].block_id(), 17);
+        assert_eq!(blocks[0].handler_id(), Some(91));
+        assert!(blocks[0].handler().is_none());
+    }
+
+    #[test]
+    fn link_preserves_valuetype_authority_with_relocated_ids() {
+        let mut destination = Assembly::default();
+        seed_destination_ids(&mut destination);
+
+        let mut source = Assembly::default();
+        let authoritative_name = source.alloc_string("AuthoritativeValueType");
+        source
+            .class_def(
+                ClassDef::new(
+                    authoritative_name,
+                    true,
+                    0,
+                    None,
+                    vec![],
+                    vec![],
+                    Access::Public,
+                    None,
+                    None,
+                    true,
+                )
+                .with_valuetype_authoritative(),
+            )
+            .unwrap();
+        let placeholder_name = source.alloc_string("NonAuthoritativePlaceholder");
+        source
+            .class_def(ClassDef::new(
+                placeholder_name,
+                false,
+                0,
+                None,
+                vec![],
+                vec![],
+                Access::Public,
+                None,
+                None,
+                true,
+            ))
+            .unwrap();
+
+        let linked = destination.link(source);
+        let authoritative = linked
+            .class_defs()
+            .values()
+            .find(|def| &linked[def.name()] == "AuthoritativeValueType")
+            .expect("linked authoritative type");
+        assert_ne!(authoritative.name().inner(), authoritative_name.inner());
+        assert!(authoritative.is_valuetype());
+        assert!(authoritative.is_valuetype_authoritative());
+
+        let placeholder = linked
+            .class_defs()
+            .values()
+            .find(|def| &linked[def.name()] == "NonAuthoritativePlaceholder")
+            .expect("linked placeholder type");
+        assert!(!placeholder.is_valuetype_authoritative());
+    }
+}

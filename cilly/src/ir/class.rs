@@ -572,6 +572,7 @@ impl PartialEq for StaticFieldDef {
         self.tpe == other.tpe
             && self.name == other.name
             && self.is_tls == other.is_tls
+            && self.default_value == other.default_value
             && self.is_const == other.is_const
     }
 }
@@ -1138,6 +1139,13 @@ impl ClassDef {
         self.is_valuetype
     }
 
+    /// Returns whether this definition's value/reference-type classification came from an
+    /// authoritative declaration rather than a methods-only reopening placeholder.
+    #[must_use]
+    pub(crate) fn is_valuetype_authoritative(&self) -> bool {
+        self.is_valuetype_authoritative
+    }
+
     #[must_use]
     pub fn extends(&self) -> Option<Interned<ClassRef>> {
         self.extends
@@ -1339,6 +1347,36 @@ fn test_into_unique() {
     let mut v = vec![2, 1, 1];
     make_unique::<u32>(&mut v);
     assert_eq!(v.len(), 2);
+}
+
+#[test]
+fn static_field_default_value_participates_in_equality_and_hash() {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let mut asm = Assembly::default();
+    let name = asm.alloc_string("VALUE");
+    let first = StaticFieldDef {
+        tpe: Type::Int(super::Int::I32),
+        name,
+        is_tls: false,
+        default_value: Some(Const::I32(1)),
+        is_const: true,
+    };
+    let same = first.clone();
+    let different_default = StaticFieldDef {
+        default_value: Some(Const::I32(2)),
+        ..first.clone()
+    };
+
+    assert_eq!(first, same);
+    assert_ne!(first, different_default);
+
+    let hash = |value: &StaticFieldDef| {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    };
+    assert_eq!(hash(&first), hash(&same));
 }
 #[test]
 fn has_explicit_layout() {
