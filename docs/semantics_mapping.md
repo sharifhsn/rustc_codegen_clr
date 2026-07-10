@@ -27,13 +27,13 @@ aren't trivially obvious.
 3. **Survey the .NET candidates.** Find the BCL methods / IL opcodes that could implement it.
    For floats the relevant surface is the generic-math statics on `System.Single`/`Double`/`Half`
    (`Max`, `Min`, `MaxNumber`, `MinNumber`, `Abs`, …) — these are what `Float::class()` targets
-   in [cilly/src/v2/tpe/float.rs](../cilly/src/v2/tpe/float.rs). Read their docs for the *same*
+   in [cilly/src/ir/tpe/float.rs](../cilly/src/ir/tpe/float.rs). Read their docs for the *same*
    edge cases. .NET's generic-math methods are specified against IEEE 754:2019, which is exactly
    the spec Rust's float intrinsics cite — so they usually line up, but verify.
 
 4. **Decide: direct map or emulate.** Pick the .NET method whose edge-case behaviour matches the
    Rust oracle. If none matches exactly, emulate (e.g. an explicit NaN check, or a helper method
-   synthesised by the linker's `MissingMethodPatcher` — see `cilly/src/v2/builtins/`).
+   synthesised by the linker's `MissingMethodPatcher` — see `cilly/src/ir/builtins/`).
 
 5. **Verify on .NET, against the oracle.** The chosen mapping is a *hypothesis* until the codegen
    output is diffed against the Rust ground truth. Add a test that runs the operation over the

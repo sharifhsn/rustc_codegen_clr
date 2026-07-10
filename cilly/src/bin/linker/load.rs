@@ -1,8 +1,7 @@
 use ar::Archive;
 
 use cilly::{
-    decode_assembly_artifact, ArtifactDecodeError, ArtifactFormat, Assembly, BuildConfig,
-    BuildConfigMismatch, DecodedAssemblyArtifact, IString,
+    decode_assembly_artifact, ArtifactAbiConfig, ArtifactAbiConfigMismatch, ArtifactDecodeError, ArtifactFormat, Assembly, DecodedAssemblyArtifact, IString,
 };
 use std::io::Read;
 pub struct LinkableFile {
@@ -24,20 +23,22 @@ impl LinkableFile {
     }
 }
 
-/// Assemblies and their validated immutable build contract loaded for one link.
+/// Assemblies and their validated immutable artifact ABI loaded for one link.
 pub struct LoadedAssemblies {
     assembly: Assembly,
-    build_config: Option<BuildConfig>,
+    abi_config: Option<ArtifactAbiConfig>,
     linkables: Vec<LinkableFile>,
     legacy_artifacts: usize,
 }
 
 impl LoadedAssemblies {
     /// Consumes all loaded state for the linker pipeline.
-    pub fn into_parts(self) -> (Assembly, Option<BuildConfig>, Vec<LinkableFile>, usize) {
+    pub fn into_parts(self,
+    ) -> (Assembly, Option<ArtifactAbiConfig>, Vec<LinkableFile>, usize,
+    ) {
         (
             self.assembly,
-            self.build_config,
+            self.abi_config,
             self.linkables,
             self.legacy_artifacts,
         )
@@ -47,7 +48,7 @@ impl LoadedAssemblies {
 #[derive(Default)]
 struct AssemblyAccumulator {
     assembly: Assembly,
-    build_config: Option<BuildConfig>,
+    abi_config: Option<ArtifactAbiConfig>,
     legacy_artifacts: usize,
 }
 
@@ -68,15 +69,15 @@ impl AssemblyAccumulator {
     ) -> Result<(), ArtifactLoadError> {
         let (assembly, config, format) = decoded.into_parts();
         if let Some(config) = config {
-            if let Some(expected) = &self.build_config {
+            if let Some(expected) = &self.abi_config {
                 expected.ensure_compatible(&config).map_err(|error| {
-                    ArtifactLoadError::IncompatibleBuildConfig {
+                    ArtifactLoadError::IncompatibleAbiConfig {
                         source: source.to_owned(),
                         error,
                     }
                 })?;
             } else {
-                self.build_config = Some(config);
+                self.abi_config = Some(config);
             }
         }
         if format == ArtifactFormat::LegacyRawAssembly {
@@ -89,7 +90,7 @@ impl AssemblyAccumulator {
     fn finish(self, linkables: Vec<LinkableFile>) -> LoadedAssemblies {
         LoadedAssemblies {
             assembly: self.assembly,
-            build_config: self.build_config,
+            abi_config: self.abi_config,
             linkables,
             legacy_artifacts: self.legacy_artifacts,
         }
@@ -102,9 +103,9 @@ enum ArtifactLoadError {
         source: String,
         error: ArtifactDecodeError,
     },
-    IncompatibleBuildConfig {
+    IncompatibleAbiConfig {
         source: String,
-        error: BuildConfigMismatch,
+        error: ArtifactAbiConfigMismatch,
     },
 }
 
@@ -114,7 +115,7 @@ impl std::fmt::Display for ArtifactLoadError {
             Self::Decode { source, error } => {
                 write!(f, "could not decode cilly artifact {source:?}: {error}")
             }
-            Self::IncompatibleBuildConfig { source, error } => write!(
+            Self::IncompatibleAbiConfig { source, error } => write!(
                 f,
                 "cilly artifact {source:?} cannot be linked with earlier inputs: {error}"
             ),
@@ -160,7 +161,7 @@ fn load_ar(
     Ok(linkables)
 }
 
-/// Loads, validates, and merges all assembly artifacts while retaining their build contract.
+/// Loads, validates, and merges all assembly artifacts while retaining their ABI contract.
 pub fn load_assemblies_with_config(raw_files: &[&String], archives: &[String]) -> LoadedAssemblies {
     println!("==> Preparing to load assmeblies");
     let mut merged = AssemblyAccumulator::default();
@@ -186,7 +187,7 @@ pub fn load_assemblies_with_config(raw_files: &[&String], archives: &[String]) -
     }
     if merged.legacy_artifacts != 0 {
         eprintln!(
-            "linker: loaded {} legacy raw-Assembly artifact(s); build-configuration compatibility \
+            "linker: loaded {} legacy raw-Assembly artifact(s); artifact ABI compatibility \
              could not be validated for those inputs",
             merged.legacy_artifacts
         );
@@ -198,22 +199,14 @@ pub fn load_assemblies_with_config(raw_files: &[&String], archives: &[String]) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cilly::{AssemblyArtifact, DotnetRuntime, OutputTarget};
+    use cilly::{ArtifactAbiConfig, AssemblyArtifact, DotnetRuntime};
 
     #[test]
     fn accumulator_rejects_field_level_config_mismatch_before_linking() {
-        let expected = BuildConfig::default();
-        let found = BuildConfig::new(
-            OutputTarget::C,
-            DotnetRuntime::Net9,
-            true,
-            false,
-            8,
-            16,
-            false,
-            false,
-            false,
-        );
+        let expected = ArtifactAbiConfig::default();
+        let found = ArtifactAbiConfig::default()
+            .with_dotnet_runtime(DotnetRuntime::Net9)
+            .with_no_unwind(true);
         let first = AssemblyArtifact::new(Assembly::default(), expected)
             .encode()
             .unwrap();
@@ -226,7 +219,6 @@ mod tests {
         let error = accumulator.merge_encoded(&second, "second.bc").unwrap_err();
         let diagnostic = error.to_string();
         assert!(diagnostic.contains("second.bc"));
-        assert!(diagnostic.contains("target: expected DotNet, found C"));
         assert!(diagnostic.contains("dotnet_runtime: expected Net8, found Net9"));
         assert!(diagnostic.contains("no_unwind: expected false, found true"));
     }

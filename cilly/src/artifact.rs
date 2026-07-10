@@ -1,6 +1,6 @@
 //! Versioned serialization envelope for linkable `cilly` assemblies.
 //!
-//! The [`Assembly`] postcard representation remains unchanged inside the envelope. A short magic
+//! The [`Assembly`] postcard representation is schema-versioned inside the envelope. A short magic
 //! prefix distinguishes new artifacts from the historical raw-`Assembly` format, allowing the
 //! decoder to retain an explicit legacy path without guessing after a versioned decode failure.
 
@@ -8,14 +8,16 @@ use crate::Assembly;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Prefix identifying the current, schema-v2 `cilly` assembly artifact before payload decoding.
-pub const ASSEMBLY_ARTIFACT_MAGIC: &[u8; 8] = b"CILLYAR2";
+/// Prefix identifying the current, schema-v3 `cilly` assembly artifact before payload decoding.
+pub const ASSEMBLY_ARTIFACT_MAGIC: &[u8; 8] = b"CILLYAR3";
+/// Magic emitted by schema-v2 artifacts, before canonical method-scope exception regions.
+const ASSEMBLY_ARTIFACT_V2_MAGIC: &[u8; 8] = b"CILLYAR2";
 /// Magic emitted by schema-v1 artifacts, whose `BiMap` payload duplicated value storage.
 const ASSEMBLY_ARTIFACT_V1_MAGIC: &[u8; 8] = b"CILLYART";
 /// Current serialization-envelope version.
-pub const ASSEMBLY_ARTIFACT_VERSION: u16 = 2;
+pub const ASSEMBLY_ARTIFACT_VERSION: u16 = 3;
 
-/// Output target whose linker/runtime semantics the artifact was generated for.
+/// Final output target selected by a backend or linker process.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum OutputTarget {
     /// .NET CIL/PE output.
@@ -38,18 +40,62 @@ impl std::fmt::Display for OutputTarget {
 }
 
 /// .NET runtime surface available to generated code and linker-provided builtins.
-///
-/// This is the serde-stable artifact counterpart of the existing runtime-only
-/// [`crate::DotnetVersion`]. The follow-up configuration-consumer migration should collapse the
-/// duplicate by making `DotnetVersion` derive serde or by replacing its environment-backed global
-/// with this contract value.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
 pub enum DotnetRuntime {
     /// .NET 8 API surface.
     #[default]
     Net8,
     /// .NET 9 API surface.
     Net9,
+}
+
+impl DotnetRuntime {
+    /// Target-framework moniker for `runtimeconfig.json` / `.nuspec`.
+    #[must_use]
+    pub const fn tfm(self) -> &'static str {
+        match self {
+            Self::Net8 => "net8.0",
+            Self::Net9 => "net9.0",
+        }
+    }
+
+    /// The `.ver` triplet for a BCL `.assembly extern` stamp.
+    #[must_use]
+    pub const fn assembly_ver(self) -> &'static str {
+        match self {
+            Self::Net8 => "8:0:0:0",
+            Self::Net9 => "9:0:0:0",
+        }
+    }
+
+    /// The parsed `.ver` tuple used by the direct PE exporter's `AssemblyRef` rows.
+    #[must_use]
+    pub const fn assembly_ver_tuple(self) -> (u16, u16, u16, u16) {
+        match self {
+            Self::Net8 => (8, 0, 0, 0),
+            Self::Net9 => (9, 0, 0, 0),
+        }
+    }
+
+    /// `Microsoft.NETCore.App` framework-version floor for `runtimeconfig.json`.
+    #[must_use]
+    pub const fn framework_version(self) -> &'static str {
+        match self {
+            Self::Net8 => "8.0.0",
+            Self::Net9 => "9.0.0",
+        }
+    }
+
+    /// Runtime major version.
+    #[must_use]
+    pub const fn major(self) -> u32 {
+        match self {
+            Self::Net8 => 8,
+            Self::Net9 => 9,
+        }
+    }
 }
 
 impl std::fmt::Display for DotnetRuntime {
@@ -61,98 +107,50 @@ impl std::fmt::Display for DotnetRuntime {
     }
 }
 
-/// Immutable subset of build configuration that changes generated IR or link semantics.
+/// Immutable ABI choices that affect the IR emitted independently by each rustc process.
 ///
-/// Debugging, verification, optimizer-fuel, and final-emitter controls deliberately do not live
-/// here: artifacts produced with different values for those controls remain link-compatible.
+/// Final-link and emitter settings deliberately do not live here: one V2 assembly can be exported
+/// to multiple targets, and allocator/emitter policy can be selected after all inputs are loaded.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct BuildConfig {
-    target: OutputTarget,
+pub struct ArtifactAbiConfig {
     dotnet_runtime: DotnetRuntime,
     no_unwind: bool,
-    abort_on_error: bool,
-    guaranteed_align: u8,
-    max_static_size: u64,
-    pool_alloc: bool,
-    panic_managed_backtrace: bool,
-    native_passthrough: bool,
 }
 
-impl Default for BuildConfig {
+impl Default for ArtifactAbiConfig {
     fn default() -> Self {
         Self {
-            target: OutputTarget::DotNet,
             dotnet_runtime: DotnetRuntime::Net8,
             no_unwind: false,
-            abort_on_error: false,
-            guaranteed_align: 8,
-            max_static_size: 16,
-            pool_alloc: false,
-            panic_managed_backtrace: false,
-            native_passthrough: false,
         }
     }
 }
 
-impl BuildConfig {
-    /// Constructs an immutable build contract from already parsed values.
+impl ArtifactAbiConfig {
+    /// Selects the runtime surface used while lowering this artifact.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub const fn new(
-        target: OutputTarget,
-        dotnet_runtime: DotnetRuntime,
-        no_unwind: bool,
-        abort_on_error: bool,
-        guaranteed_align: u8,
-        max_static_size: u64,
-        pool_alloc: bool,
-        panic_managed_backtrace: bool,
-        native_passthrough: bool,
-    ) -> Self {
-        Self {
-            target,
-            dotnet_runtime,
-            no_unwind,
-            abort_on_error,
-            guaranteed_align,
-            max_static_size,
-            pool_alloc,
-            panic_managed_backtrace,
-            native_passthrough,
-        }
+    pub const fn with_dotnet_runtime(mut self, runtime: DotnetRuntime) -> Self {
+        self.dotnet_runtime = runtime;
+        self
     }
 
-    /// Captures all contract-relevant environment variables from one immutable environment
-    /// snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Returns a precise error for invalid values or mutually exclusive output modes.
-    pub fn capture() -> Result<Self, BuildConfigCaptureError> {
-        let environment: HashMap<String, String> = std::env::vars().collect();
-        Self::from_environment(&environment)
+    /// Selects whether Rust unwind cleanup regions are omitted from this artifact.
+    #[must_use]
+    pub const fn with_no_unwind(mut self,
+        no_unwind: bool) -> Self {
+        self.no_unwind = no_unwind;
+        self
     }
 
-    fn from_environment(
+    /// Constructs the ABI contract from a caller-provided immutable environment snapshot.
+    pub fn from_environment(
         environment: &HashMap<String, String>,
-    ) -> Result<Self, BuildConfigCaptureError> {
-        let c_mode = parse_bool(environment, "C_MODE", false)?;
-        let java_mode = parse_bool(environment, "JAVA_MODE", false)?;
-        let target = match (c_mode, java_mode) {
-            (false, false) => OutputTarget::DotNet,
-            (true, false) => OutputTarget::C,
-            (false, true) => OutputTarget::Java,
-            (true, true) => {
-                return Err(BuildConfigCaptureError::ConflictingOutputModes {
-                    enabled: vec!["C_MODE", "JAVA_MODE"],
-                });
-            }
-        };
+    ) -> Result<Self, ArtifactAbiConfigCaptureError> {
         let dotnet_runtime = match environment.get("DOTNET_VERSION").map(String::as_str) {
             None | Some("8" | "net8" | "net8.0") => DotnetRuntime::Net8,
             Some("9" | "net9" | "net9.0") => DotnetRuntime::Net9,
             Some(value) => {
-                return Err(BuildConfigCaptureError::InvalidValue {
+                return Err(ArtifactAbiConfigCaptureError::InvalidValue {
                     variable: "DOTNET_VERSION",
                     value: value.to_owned(),
                     expected: "8 or 9 (also net8, net8.0, net9, or net9.0)",
@@ -161,22 +159,9 @@ impl BuildConfig {
         };
 
         Ok(Self {
-            target,
             dotnet_runtime,
             no_unwind: parse_bool(environment, "NO_UNWIND", false)?,
-            abort_on_error: parse_bool(environment, "ABORT_ON_ERROR", false)?,
-            guaranteed_align: parse_number(environment, "GUARANTEED_ALIGN", 8)?,
-            max_static_size: parse_number(environment, "MAX_STATIC_SIZE", 16)?,
-            pool_alloc: parse_bool(environment, "POOL_ALLOC", false)?,
-            panic_managed_backtrace: parse_bool(environment, "PANIC_MANAGED_BT", false)?,
-            native_passthrough: parse_bool(environment, "NATIVE_PASSTROUGH", false)?,
         })
-    }
-
-    /// Output target selected for this artifact.
-    #[must_use]
-    pub const fn target(&self) -> OutputTarget {
-        self.target
     }
 
     /// .NET runtime API surface selected for this artifact.
@@ -191,52 +176,16 @@ impl BuildConfig {
         self.no_unwind
     }
 
-    /// Whether unsupported codegen operations abort instead of producing recovery stubs.
-    #[must_use]
-    pub const fn abort_on_error(&self) -> bool {
-        self.abort_on_error
-    }
-
-    /// Minimum alignment assumed for generated values.
-    #[must_use]
-    pub const fn guaranteed_align(&self) -> u8 {
-        self.guaranteed_align
-    }
-
-    /// Largest static value size handled by the inline/static path.
-    #[must_use]
-    pub const fn max_static_size(&self) -> u64 {
-        self.max_static_size
-    }
-
-    /// Whether linker-provided allocator shims use the experimental pool.
-    #[must_use]
-    pub const fn pool_alloc(&self) -> bool {
-        self.pool_alloc
-    }
-
-    /// Whether panic shims preserve managed backtraces.
-    #[must_use]
-    pub const fn panic_managed_backtrace(&self) -> bool {
-        self.panic_managed_backtrace
-    }
-
-    /// Whether native libraries are bundled through the native-pass-through path.
-    #[must_use]
-    pub const fn native_passthrough(&self) -> bool {
-        self.native_passthrough
-    }
-
-    /// Verifies that another artifact was produced with the same link-semantic contract.
+    /// Verifies that another artifact was produced with the same ABI contract.
     ///
     /// All differing fields are reported together so the operator does not have to fix one
     /// environment variable at a time.
-    pub fn ensure_compatible(&self, found: &Self) -> Result<(), BuildConfigMismatch> {
+    pub fn ensure_compatible(&self, found: &Self) -> Result<(), ArtifactAbiConfigMismatch> {
         let mut differences = Vec::new();
         macro_rules! compare {
             ($field:ident) => {
                 if self.$field != found.$field {
-                    differences.push(BuildConfigDifference {
+                    differences.push(ArtifactAbiConfigDifference {
                         field: stringify!($field),
                         expected: format!("{:?}", self.$field),
                         found: format!("{:?}", found.$field),
@@ -244,39 +193,23 @@ impl BuildConfig {
                 }
             };
         }
-        compare!(target);
         compare!(dotnet_runtime);
         compare!(no_unwind);
-        compare!(abort_on_error);
-        compare!(guaranteed_align);
-        compare!(max_static_size);
-        compare!(pool_alloc);
-        compare!(panic_managed_backtrace);
-        compare!(native_passthrough);
 
         if differences.is_empty() {
             Ok(())
         } else {
-            Err(BuildConfigMismatch { differences })
+            Err(ArtifactAbiConfigMismatch { differences })
         }
     }
 }
 
-impl std::fmt::Display for BuildConfig {
+impl std::fmt::Display for ArtifactAbiConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "target={}, runtime={}, no_unwind={}, abort_on_error={}, guaranteed_align={}, \
-             max_static_size={}, pool_alloc={}, panic_managed_backtrace={}, native_passthrough={}",
-            self.target,
-            self.dotnet_runtime,
-            self.no_unwind,
-            self.abort_on_error,
-            self.guaranteed_align,
-            self.max_static_size,
-            self.pool_alloc,
-            self.panic_managed_backtrace,
-            self.native_passthrough,
+            "runtime={}, no_unwind={}",
+            self.dotnet_runtime, self.no_unwind,
         )
     }
 }
@@ -285,12 +218,12 @@ fn parse_bool(
     environment: &HashMap<String, String>,
     variable: &'static str,
     default: bool,
-) -> Result<bool, BuildConfigCaptureError> {
+) -> Result<bool, ArtifactAbiConfigCaptureError> {
     match environment.get(variable).map(String::as_str) {
         None => Ok(default),
         Some("0" | "false" | "False" | "FALSE") => Ok(false),
         Some("1" | "true" | "True" | "TRUE") => Ok(true),
-        Some(value) => Err(BuildConfigCaptureError::InvalidValue {
+        Some(value) => Err(ArtifactAbiConfigCaptureError::InvalidValue {
             variable,
             value: value.to_owned(),
             expected: "a boolean (0, 1, false, or true)",
@@ -298,29 +231,9 @@ fn parse_bool(
     }
 }
 
-fn parse_number<T>(
-    environment: &HashMap<String, String>,
-    variable: &'static str,
-    default: T,
-) -> Result<T, BuildConfigCaptureError>
-where
-    T: std::str::FromStr,
-{
-    match environment.get(variable) {
-        None => Ok(default),
-        Some(value) => value
-            .parse()
-            .map_err(|_| BuildConfigCaptureError::InvalidValue {
-                variable,
-                value: value.clone(),
-                expected: "a non-negative integer in range",
-            }),
-    }
-}
-
-/// Failure to parse a build contract from the environment snapshot.
+/// Failure to parse an artifact ABI contract from an environment snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum BuildConfigCaptureError {
+pub enum ArtifactAbiConfigCaptureError {
     /// A variable had an unsupported value.
     InvalidValue {
         /// Environment-variable name.
@@ -330,14 +243,9 @@ pub enum BuildConfigCaptureError {
         /// Human-readable accepted shape.
         expected: &'static str,
     },
-    /// More than one mutually exclusive output mode was selected.
-    ConflictingOutputModes {
-        /// Enabled mode variables.
-        enabled: Vec<&'static str>,
-    },
 }
 
-impl std::fmt::Display for BuildConfigCaptureError {
+impl std::fmt::Display for ArtifactAbiConfigCaptureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidValue {
@@ -348,26 +256,21 @@ impl std::fmt::Display for BuildConfigCaptureError {
                 f,
                 "{variable} has invalid value {value:?}; expected {expected}"
             ),
-            Self::ConflictingOutputModes { enabled } => write!(
-                f,
-                "conflicting output modes: {}; enable at most one",
-                enabled.join(", ")
-            ),
         }
     }
 }
 
-impl std::error::Error for BuildConfigCaptureError {}
+impl std::error::Error for ArtifactAbiConfigCaptureError {}
 
-/// One field that differs between two linked build contracts.
+/// One field that differs between two linked artifact ABI contracts.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BuildConfigDifference {
+pub struct ArtifactAbiConfigDifference {
     field: &'static str,
     expected: String,
     found: String,
 }
 
-impl BuildConfigDifference {
+impl ArtifactAbiConfigDifference {
     /// Name of the incompatible field.
     #[must_use]
     pub const fn field(&self) -> &'static str {
@@ -389,21 +292,21 @@ impl BuildConfigDifference {
 
 /// Field-level report for incompatible linked artifact configurations.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BuildConfigMismatch {
-    differences: Vec<BuildConfigDifference>,
+pub struct ArtifactAbiConfigMismatch {
+    differences: Vec<ArtifactAbiConfigDifference>,
 }
 
-impl BuildConfigMismatch {
+impl ArtifactAbiConfigMismatch {
     /// All differences, in stable contract-field order.
     #[must_use]
-    pub fn differences(&self) -> &[BuildConfigDifference] {
+    pub fn differences(&self) -> &[ArtifactAbiConfigDifference] {
         &self.differences
     }
 }
 
-impl std::fmt::Display for BuildConfigMismatch {
+impl std::fmt::Display for ArtifactAbiConfigMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "incompatible build configuration")?;
+        write!(f, "incompatible artifact ABI configuration")?;
         for difference in &self.differences {
             write!(
                 f,
@@ -415,23 +318,23 @@ impl std::fmt::Display for BuildConfigMismatch {
     }
 }
 
-impl std::error::Error for BuildConfigMismatch {}
+impl std::error::Error for ArtifactAbiConfigMismatch {}
 
 /// Versioned payload stored after [`ASSEMBLY_ARTIFACT_MAGIC`].
 #[derive(Clone, Deserialize, Serialize)]
 pub struct AssemblyArtifact {
     version: u16,
-    build_config: BuildConfig,
+    abi_config: ArtifactAbiConfig,
     assembly: Assembly,
 }
 
 impl AssemblyArtifact {
-    /// Wraps an assembly in the current artifact version and immutable build contract.
+    /// Wraps an assembly in the current artifact version and immutable ABI contract.
     #[must_use]
-    pub const fn new(assembly: Assembly, build_config: BuildConfig) -> Self {
+    pub const fn new(assembly: Assembly, abi_config: ArtifactAbiConfig) -> Self {
         Self {
             version: ASSEMBLY_ARTIFACT_VERSION,
-            build_config,
+            abi_config,
             assembly,
         }
     }
@@ -442,10 +345,10 @@ impl AssemblyArtifact {
         self.version
     }
 
-    /// Immutable build contract serialized with the assembly.
+    /// Immutable artifact ABI contract serialized with the assembly.
     #[must_use]
-    pub const fn build_config(&self) -> &BuildConfig {
-        &self.build_config
+    pub const fn abi_config(&self) -> &ArtifactAbiConfig {
+        &self.abi_config
     }
 
     /// Serialized assembly payload.
@@ -454,10 +357,10 @@ impl AssemblyArtifact {
         &self.assembly
     }
 
-    /// Consumes the envelope into its build contract and assembly.
+    /// Consumes the envelope into its ABI contract and assembly.
     #[must_use]
-    pub fn into_parts(self) -> (BuildConfig, Assembly) {
-        (self.build_config, self.assembly)
+    pub fn into_parts(self) -> (ArtifactAbiConfig, Assembly) {
+        (self.abi_config, self.assembly)
     }
 
     /// Serializes this envelope with its identifying magic prefix.
@@ -487,7 +390,7 @@ pub enum ArtifactFormat {
 pub enum DecodedAssemblyArtifact {
     /// Current magic-prefixed artifact.
     Versioned(AssemblyArtifact),
-    /// Legacy raw `Assembly`; no build contract was serialized with it.
+    /// Legacy raw `Assembly`; no ABI contract was serialized with it.
     Legacy(Assembly),
 }
 
@@ -501,18 +404,18 @@ impl DecodedAssemblyArtifact {
         }
     }
 
-    /// Serialized build contract, absent for legacy raw assemblies.
+    /// Serialized ABI contract, absent for legacy raw assemblies.
     #[must_use]
-    pub fn build_config(&self) -> Option<&BuildConfig> {
+    pub fn abi_config(&self) -> Option<&ArtifactAbiConfig> {
         match self {
-            Self::Versioned(artifact) => Some(artifact.build_config()),
+            Self::Versioned(artifact) => Some(artifact.abi_config()),
             Self::Legacy(_) => None,
         }
     }
 
-    /// Consumes the decoded value into assembly, optional build contract, and format.
+    /// Consumes the decoded value into assembly, optional ABI contract, and format.
     #[must_use]
-    pub fn into_parts(self) -> (Assembly, Option<BuildConfig>, ArtifactFormat) {
+    pub fn into_parts(self) -> (Assembly, Option<ArtifactAbiConfig>, ArtifactFormat) {
         match self {
             Self::Versioned(artifact) => {
                 let (config, assembly) = artifact.into_parts();
@@ -535,6 +438,12 @@ pub fn decode_assembly_artifact(
     if encoded.starts_with(ASSEMBLY_ARTIFACT_V1_MAGIC) {
         return Err(ArtifactDecodeError::UnsupportedVersion {
             found: 1,
+            supported: ASSEMBLY_ARTIFACT_VERSION,
+        });
+    }
+    if encoded.starts_with(ASSEMBLY_ARTIFACT_V2_MAGIC) {
+        return Err(ArtifactDecodeError::UnsupportedVersion {
+            found: 2,
             supported: ASSEMBLY_ARTIFACT_VERSION,
         });
     }
@@ -603,18 +512,17 @@ impl std::error::Error for ArtifactDecodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::{
+        cilnode::MethodKind, Access, BasicBlock, CILRoot, ExceptionRegion, MethodDef, MethodImpl,
+        Type,
+    };
     #[test]
-    fn versioned_artifact_round_trips_config_and_assembly() {
+    fn versioned_artifact_round_trips_abi_config_and_assembly() {
         let mut assembly = Assembly::default();
         assembly.main_module();
-        let config = BuildConfig {
-            target: OutputTarget::C,
-            dotnet_runtime: DotnetRuntime::Net9,
-            no_unwind: true,
-            pool_alloc: true,
-            ..BuildConfig::default()
-        };
+        let config = ArtifactAbiConfig::default()
+            .with_dotnet_runtime(DotnetRuntime::Net9)
+            .with_no_unwind(true);
         let encoded = AssemblyArtifact::new(assembly, config.clone())
             .encode()
             .unwrap();
@@ -622,38 +530,80 @@ mod tests {
 
         let decoded = decode_assembly_artifact(&encoded).unwrap();
         assert_eq!(decoded.format(), ArtifactFormat::Versioned);
-        assert_eq!(decoded.build_config(), Some(&config));
+        assert_eq!(decoded.abi_config(), Some(&config));
         let (assembly, decoded_config, _) = decoded.into_parts();
         assert_eq!(decoded_config, Some(config));
         assert_eq!(assembly.class_defs().len(), 1);
     }
 
     #[test]
-    fn build_config_mismatch_reports_every_differing_field() {
-        let expected = BuildConfig::default();
-        let found = BuildConfig {
-            target: OutputTarget::Java,
-            dotnet_runtime: DotnetRuntime::Net9,
-            no_unwind: true,
-            max_static_size: 32,
-            ..BuildConfig::default()
+    fn versioned_artifact_round_trips_canonical_exception_regions() {
+        let mut assembly = Assembly::default();
+        let owner = assembly.main_module();
+        let sig = assembly.sig([], Type::Void);
+        let name = assembly.alloc_string("artifact_region_body");
+        let normal_root = assembly.alloc_root(CILRoot::Nop);
+        let cleanup_root = assembly.alloc_root(CILRoot::ReThrow);
+        assembly.new_method(MethodDef::new(
+            Access::Public,
+            owner,
+            name,
+            sig,
+            MethodKind::Static,
+            MethodImpl::RegionBody {
+                blocks: vec![BasicBlock::new(vec![normal_root], 0, None)],
+                cleanup_blocks: vec![BasicBlock::new(vec![cleanup_root], 10, None)],
+                exception_regions: vec![ExceptionRegion::new(0, 10)],
+                locals: vec![],
+            },
+            vec![],
+        ));
+
+        let encoded = AssemblyArtifact::new(assembly, ArtifactAbiConfig::default())
+            .encode()
+            .unwrap();
+        let decoded = decode_assembly_artifact(&encoded).unwrap();
+        let (assembly, _, _) = decoded.into_parts();
+        let method = assembly
+            .method_defs()
+            .values()
+            .find(|method| &assembly[method.name()] == "artifact_region_body")
+            .unwrap();
+        let MethodImpl::RegionBody {
+            blocks,
+            cleanup_blocks,
+            exception_regions,
+            ..
+        } = method.implementation()
+        else {
+            panic!("canonical region body did not round-trip")
         };
+        assert_eq!(blocks[0].block_id(), 0);
+        assert_eq!(cleanup_blocks[0].block_id(), 10);
+        assert_eq!(exception_regions, &[ExceptionRegion::new(0, 10)]);
+    }
+
+    #[test]
+    fn abi_config_mismatch_reports_every_differing_field() {
+        let expected = ArtifactAbiConfig::default();
+        let found = ArtifactAbiConfig::default()
+            .with_dotnet_runtime(DotnetRuntime::Net9)
+            .with_no_unwind(true);
 
         let error = expected.ensure_compatible(&found).unwrap_err();
         let fields: Vec<_> = error
             .differences()
             .iter()
-            .map(BuildConfigDifference::field)
+            .map(ArtifactAbiConfigDifference::field)
             .collect();
         assert_eq!(
             fields,
-            ["target", "dotnet_runtime", "no_unwind", "max_static_size"]
+            ["dotnet_runtime", "no_unwind"]
         );
         assert_eq!(
             error.to_string(),
-            "incompatible build configuration; target: expected DotNet, found Java; \
-             dotnet_runtime: expected Net8, found Net9; no_unwind: expected false, found true; \
-             max_static_size: expected 16, found 32"
+            "incompatible artifact ABI configuration; dotnet_runtime: expected Net8, found Net9; \
+             no_unwind: expected false, found true"
         );
     }
 
@@ -665,7 +615,7 @@ mod tests {
 
         let decoded = decode_assembly_artifact(&encoded).unwrap();
         assert_eq!(decoded.format(), ArtifactFormat::LegacyRawAssembly);
-        assert_eq!(decoded.build_config(), None);
+        assert_eq!(decoded.abi_config(), None);
         let (assembly, config, format) = decoded.into_parts();
         assert_eq!(config, None);
         assert_eq!(format, ArtifactFormat::LegacyRawAssembly);
@@ -674,7 +624,7 @@ mod tests {
 
     #[test]
     fn magic_prefixed_unsupported_payload_version_never_falls_back_to_legacy() {
-        let mut artifact = AssemblyArtifact::new(Assembly::default(), BuildConfig::default());
+        let mut artifact = AssemblyArtifact::new(Assembly::default(), ArtifactAbiConfig::default());
         artifact.version = ASSEMBLY_ARTIFACT_VERSION + 1;
         let encoded = artifact.encode().unwrap();
 
@@ -682,8 +632,8 @@ mod tests {
         assert!(matches!(
             error,
             ArtifactDecodeError::UnsupportedVersion {
-                found: 3,
-                supported: 2
+                found: 4,
+                supported: 3
             }
         ));
     }
@@ -698,26 +648,38 @@ mod tests {
             error,
             ArtifactDecodeError::UnsupportedVersion {
                 found: 1,
-                supported: 2
+                supported: 3
             }
         ));
         assert!(error.to_string().contains("Rebuild all input crates"));
     }
 
     #[test]
-    fn environment_snapshot_rejects_conflicting_targets() {
+    fn v2_header_is_rejected_before_deserializing_its_pre_region_body_shape() {
+        let mut encoded = ASSEMBLY_ARTIFACT_V2_MAGIC.to_vec();
+        encoded.extend_from_slice(b"payload shape intentionally irrelevant");
+
+        let error = decode_assembly_artifact(&encoded).err().unwrap();
+        assert!(matches!(
+            error,
+            ArtifactDecodeError::UnsupportedVersion {
+                found: 2,
+                supported: 3
+            }
+        ));
+        assert!(error.to_string().contains("Rebuild all input crates"));
+    }
+
+    #[test]
+    fn environment_snapshot_contains_only_abi_settings() {
         let environment = HashMap::from([
-            ("C_MODE".to_owned(), "1".to_owned()),
-            ("JAVA_MODE".to_owned(), "true".to_owned()),
-            ("DUMP_FN".to_owned(), "ignored-debug-setting".to_owned()),
+            ("DOTNET_VERSION".to_owned(), "net9.0".to_owned()),
+            ("NO_UNWIND".to_owned(), "true".to_owned()),
+            ("C_MODE".to_owned(), "ignored-linker-setting".to_owned()),
         ]);
 
-        let error = BuildConfig::from_environment(&environment).unwrap_err();
-        assert_eq!(
-            error,
-            BuildConfigCaptureError::ConflictingOutputModes {
-                enabled: vec!["C_MODE", "JAVA_MODE"]
-            }
-        );
+        let config = ArtifactAbiConfig::from_environment(&environment).unwrap();
+        assert_eq!(config.dotnet_runtime(), DotnetRuntime::Net9);
+        assert!(config.no_unwind());
     }
 }

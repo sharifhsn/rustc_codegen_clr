@@ -39,9 +39,7 @@ pub(crate) trait RelocateValue: Sized {
 
     fn relocate(
         self,
-        ctx: &mut RelocateCtx<'_>,
-        destination: &mut Assembly,
-    ) -> Self::Output;
+        ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self::Output;
 }
 
 struct DenseRelocationMap<T> {
@@ -289,12 +287,10 @@ impl Assembly {
             | Type::PlatformGeneric(_, _)
             | Type::SIMDVector(_) => tpe,
             Type::ClassRef(class_ref) => Type::ClassRef(ctx.class_ref(self, class_ref)),
-            Type::PlatformArray { elem, dims } => {
-                Type::PlatformArray {
-                    elem: ctx.type_id(self, elem),
-                    dims,
-                }
-            }
+            Type::PlatformArray { elem, dims } => Type::PlatformArray {
+                elem: ctx.type_id(self, elem),
+                dims,
+            },
             Type::FnPtr(sig) => Type::FnPtr(ctx.signature(self, sig)),
         }
     }
@@ -305,12 +301,10 @@ impl Assembly {
             }
 
             super::Const::Null(cref) => super::Const::Null(ctx.class_ref(self, *cref)),
-            super::Const::ByteBuffer { data, tpe } => {
-                super::Const::ByteBuffer {
+            super::Const::ByteBuffer { data, tpe } => super::Const::ByteBuffer {
                     data: ctx.const_data(self, *data),
                     tpe: ctx.type_id(self, *tpe),
-                }
-            }
+                },
             _ => cst.clone(),
         }
     }
@@ -320,9 +314,7 @@ impl Assembly {
         match &node {
             CILNode::LdLoc(_) | CILNode::LdLocA(_) | CILNode::LdArg(_) | CILNode::LdArgA(_) => node,
             CILNode::Const(cst) => CILNode::Const(Box::new(self.translate_const(ctx, cst))),
-            CILNode::BinOp(a, b, op) => {
-                CILNode::BinOp(ctx.node(self, *a), ctx.node(self, *b), *op)
-            }
+            CILNode::BinOp(a, b, op) => CILNode::BinOp(ctx.node(self, *a), ctx.node(self, *b), *op),
             CILNode::UnOp(a, op) => CILNode::UnOp(ctx.node(self, *a), op.clone()),
             CILNode::Call(call_arg) => {
                 let (mref, args, pure) = call_arg.as_ref();
@@ -334,24 +326,20 @@ impl Assembly {
                 input,
                 target,
                 extend,
-            } => {
-                CILNode::IntCast {
-                    input: ctx.node(self, *input),
-                    target: *target,
-                    extend: *extend,
-                }
-            }
+            } => CILNode::IntCast {
+                input: ctx.node(self, *input),
+                target: *target,
+                extend: *extend,
+            },
             CILNode::FloatCast {
                 input,
                 target,
                 is_signed,
-            } => {
-                CILNode::FloatCast {
-                    input: ctx.node(self, *input),
-                    target: *target,
-                    is_signed: *is_signed,
-                }
-            }
+            } => CILNode::FloatCast {
+                input: ctx.node(self, *input),
+                target: *target,
+                is_signed: *is_signed,
+            },
             CILNode::RefToPtr(input) => CILNode::RefToPtr(ctx.node(self, *input)),
             CILNode::PtrCast(input, cast_res) => {
                 let input = ctx.node(self, *input);
@@ -371,29 +359,23 @@ impl Assembly {
                 };
                 CILNode::PtrCast(input, Box::new(cast_res))
             }
-            CILNode::LdFieldAddress { addr, field } => {
-                CILNode::LdFieldAddress {
-                    addr: ctx.node(self, *addr),
-                    field: ctx.field(self, *field),
-                }
-            }
-            CILNode::LdField { addr, field } => {
-                CILNode::LdField {
-                    addr: ctx.node(self, *addr),
-                    field: ctx.field(self, *field),
-                }
-            }
+            CILNode::LdFieldAddress { addr, field } => CILNode::LdFieldAddress {
+                addr: ctx.node(self, *addr),
+                field: ctx.field(self, *field),
+            },
+            CILNode::LdField { addr, field } => CILNode::LdField {
+                addr: ctx.node(self, *addr),
+                field: ctx.field(self, *field),
+            },
             CILNode::LdInd {
                 addr,
                 tpe,
                 volatile: volitale,
-            } => {
-                CILNode::LdInd {
-                    addr: ctx.node(self, *addr),
-                    tpe: ctx.type_id(self, *tpe),
-                    volatile: *volitale,
-                }
-            }
+            } => CILNode::LdInd {
+                addr: ctx.node(self, *addr),
+                tpe: ctx.type_id(self, *tpe),
+                volatile: *volitale,
+            },
             CILNode::SizeOf(tpe) => CILNode::SizeOf(ctx.type_id(self, *tpe)),
             CILNode::GetException => CILNode::GetException,
             CILNode::IsInst(object, tpe) => {
@@ -419,36 +401,26 @@ impl Assembly {
             CILNode::LdFtn(mref) => CILNode::LdFtn(ctx.method_ref(self, *mref)),
             CILNode::LdTypeToken(tpe) => CILNode::LdTypeToken(ctx.type_id(self, *tpe)),
             CILNode::LdLen(len) => CILNode::LdLen(ctx.node(self, *len)),
-            CILNode::LocAllocAlgined { tpe, align } => {
-                CILNode::LocAllocAlgined {
-                    tpe: ctx.type_id(self, *tpe),
-                    align: *align,
-                }
-            }
-            CILNode::LdElelemRef { array, index } => {
-                CILNode::LdElelemRef {
-                    array: ctx.node(self, *array),
-                    index: ctx.node(self, *index),
-                }
-            }
-            CILNode::UnboxAny { object, tpe } => {
-                CILNode::UnboxAny {
-                    object: ctx.node(self, *object),
-                    tpe: ctx.type_id(self, *tpe),
-                }
-            }
-            CILNode::Box { value, tpe } => {
-                CILNode::Box {
-                    value: ctx.node(self, *value),
-                    tpe: ctx.type_id(self, *tpe),
-                }
-            }
-            CILNode::NewArr { elem, len } => {
-                CILNode::NewArr {
-                    elem: ctx.type_id(self, *elem),
-                    len: ctx.node(self, *len),
-                }
-            }
+            CILNode::LocAllocAlgined { tpe, align } => CILNode::LocAllocAlgined {
+                tpe: ctx.type_id(self, *tpe),
+                align: *align,
+            },
+            CILNode::LdElelemRef { array, index } => CILNode::LdElelemRef {
+                array: ctx.node(self, *array),
+                index: ctx.node(self, *index),
+            },
+            CILNode::UnboxAny { object, tpe } => CILNode::UnboxAny {
+                object: ctx.node(self, *object),
+                tpe: ctx.type_id(self, *tpe),
+            },
+            CILNode::Box { value, tpe } => CILNode::Box {
+                value: ctx.node(self, *value),
+                tpe: ctx.type_id(self, *tpe),
+            },
+            CILNode::NewArr { elem, len } => CILNode::NewArr {
+                elem: ctx.type_id(self, *elem),
+                len: ctx.node(self, *len),
+            },
         }
     }
     // The complexity of this function is unavoidable.
@@ -514,15 +486,13 @@ impl Assembly {
                 col_start,
                 col_len,
                 file,
-            } => {
-                CILRoot::SourceFileInfo {
+            } => CILRoot::SourceFileInfo {
                     line_start,
                     line_len,
                     col_start,
                     col_len,
                     file: ctx.string(self, file),
-                }
-            }
+                },
             CILRoot::SetField(info) => {
                 let (field, addr, val) = info.as_ref();
                 CILRoot::SetField(Box::new((
@@ -546,13 +516,11 @@ impl Assembly {
                     *volitile,
                 )))
             }
-            CILRoot::CpObj { src, dst, tpe } => {
-                CILRoot::CpObj {
+            CILRoot::CpObj { src, dst, tpe } => CILRoot::CpObj {
                     src: ctx.node(self, src),
                     dst: ctx.node(self, dst),
                     tpe: ctx.type_id(self, tpe),
-                }
-            }
+                },
             CILRoot::InitObj(src, tpe) => {
                 CILRoot::InitObj(ctx.node(self, src), ctx.type_id(self, tpe))
             }
@@ -588,25 +556,21 @@ impl Assembly {
                 let protected = ctx.root(self, protected);
                 CILRoot::TerminateRegion { protected, reason }
             }
-            CILRoot::SetStaticField { field, val } => {
-                CILRoot::SetStaticField {
+            CILRoot::SetStaticField { field, val } => CILRoot::SetStaticField {
                     field: ctx.static_field(self, field),
                     val: ctx.node(self, val),
-                }
-            }
+                },
             CILRoot::StElem {
                 array,
                 index,
                 value,
                 elem,
-            } => {
-                CILRoot::StElem {
+            } => CILRoot::StElem {
                     array: ctx.node(self, array),
                     index: ctx.node(self, index),
                     value: ctx.node(self, value),
                     elem: ctx.type_id(self, elem),
-                }
-            }
+                },
         }
     }
     pub(crate) fn translate_class_def(
@@ -701,7 +665,7 @@ mod tests {
     use crate::{
         ir::cilnode::{BinOp, MethodKind},
         ir::class::{CustomAttrArg, CustomAttrDef, EventDef, PropertyDef, StaticFieldDef},
-        Access, BasicBlock, Const, IString, Int, MethodDef, MethodImpl, Type,
+        Access, BasicBlock, Const, ExceptionRegion, IString, Int, MethodDef, MethodImpl, Type,
     };
     use std::num::NonZeroU32;
 
@@ -767,6 +731,59 @@ mod tests {
         assert_eq!(blocks[0].block_id(), 17);
         assert_eq!(blocks[0].handler_id(), Some(91));
         assert!(blocks[0].handler().is_none());
+    }
+
+    #[test]
+    fn link_relocates_canonical_region_body_without_changing_cfg_ids() {
+        let mut destination = Assembly::default();
+        seed_destination_ids(&mut destination);
+
+        let mut source = Assembly::default();
+        let owner = source.main_module();
+        let sig = source.sig([], Type::Void);
+        let name = source.alloc_string("source_region_body");
+        let local_name = source.alloc_string("region_local");
+        let local_type = source.alloc_type(Type::Int(Int::I64));
+        let value = source.alloc_node(Const::I32(99));
+        let normal_root = source.alloc_root(CILRoot::Pop(value));
+        let cleanup_root = source.alloc_root(CILRoot::ReThrow);
+        source.new_method(MethodDef::new(
+            Access::Public,
+            owner,
+            name,
+            sig,
+            MethodKind::Static,
+            MethodImpl::RegionBody {
+                blocks: vec![BasicBlock::new(vec![normal_root], 7, None)],
+                cleanup_blocks: vec![BasicBlock::new(vec![cleanup_root], 41, None)],
+                exception_regions: vec![ExceptionRegion::new(7, 41)],
+                locals: vec![(Some(local_name), local_type)],
+            },
+            vec![],
+        ));
+
+        let linked = destination.link(source);
+        let method = linked
+            .method_defs()
+            .values()
+            .find(|method| &linked[method.name()] == "source_region_body")
+            .expect("linked region method");
+        let MethodImpl::RegionBody {
+            blocks,
+            cleanup_blocks,
+            exception_regions,
+            locals,
+        } = method.implementation()
+        else {
+            panic!("canonical region body must survive linking")
+        };
+        assert_eq!(blocks[0].block_id(), 7);
+        assert_eq!(cleanup_blocks[0].block_id(), 41);
+        assert_eq!(exception_regions, &[ExceptionRegion::new(7, 41)]);
+        assert!(matches!(linked[blocks[0].roots()[0]], CILRoot::Pop(_)));
+        assert_eq!(linked[cleanup_blocks[0].roots()[0]], CILRoot::ReThrow);
+        assert_eq!(&linked[locals[0].0.expect("local name")], "region_local");
+        assert_eq!(linked[locals[0].1], Type::Int(Int::I64));
     }
 
     #[test]
@@ -945,8 +962,7 @@ mod tests {
         let live_field = asm.alloc_field(FieldDesc::new(
             *owner,
             live_field_name,
-            Type::Int(Int::I32),
-        ));
+            Type::Int(Int::I32)));
         let live_addr = asm.alloc_node(Const::Null(*owner));
         let live_field_load = asm.alloc_node(CILNode::LdField {
             addr: live_addr,
@@ -981,8 +997,7 @@ mod tests {
             junk_string,
             None,
             false,
-            vec![].into(),
-        ));
+            vec![].into()));
         let junk_sig = asm.sig([Type::Int(Int::U8)], Type::Int(Int::U8));
         let _junk_method = asm.alloc_methodref(MethodRef::new(
             junk_class,
@@ -994,8 +1009,7 @@ mod tests {
         let _junk_field = asm.alloc_field(FieldDesc::new(
             junk_class,
             junk_string,
-            Type::Int(Int::U8),
-        ));
+            Type::Int(Int::U8)));
         let _junk_static = asm.alloc_sfld(StaticFieldDesc::new(
             junk_class,
             junk_string,
@@ -1079,8 +1093,7 @@ mod tests {
             interface_name,
             None,
             false,
-            vec![].into(),
-        ));
+            vec![].into()));
         let mut class = ClassDef::new(
             class_name,
             true,
@@ -1139,8 +1152,7 @@ mod tests {
             delegate_name,
             None,
             false,
-            vec![].into(),
-        ));
+            vec![].into()));
         let property_inner = source.alloc_type(Type::Int(Int::I16));
         let event_name = source.alloc_string("Changed");
         let property_name = source.alloc_string("Value");
@@ -1162,8 +1174,7 @@ mod tests {
             attr_name,
             None,
             false,
-            vec![].into(),
-        ));
+            vec![].into()));
         let ctor_text = source.alloc_string("ctor-text");
         let named_name = source.alloc_string("NamedText");
         let named_text = source.alloc_string("named-text");

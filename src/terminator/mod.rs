@@ -1,7 +1,8 @@
 use crate::assembly::MethodCompileCtx;
 use cilly::{
-    cilnode::{IsPure, MethodKind}, BinOp,
-    BranchCond, CILNode, CILRoot, ClassRef, Const, FieldDesc, FnSig, Int, Interned, MethodRef, Type,
+    cilnode::{IsPure, MethodKind},
+    BinOp, BranchCond, CILNode, CILRoot, ClassRef, Const, FieldDesc, FnSig, Int, Interned,
+    MethodRef, Type,
 };
 
 type Root = Interned<cilly::ir::CILRoot>;
@@ -228,7 +229,10 @@ fn lower_inline_asm<'tcx>(
     // makes std_detect see no features (max_basic_leaf < 1 early-returns the empty feature set),
     // so the portable/scalar backend is selected everywhere. Strictly safe — can only force the
     // safe scalar path.
-    if str_pieces.iter().any(|s| s.trim().eq_ignore_ascii_case("cpuid")) {
+    if str_pieces
+        .iter()
+        .any(|s| s.trim().eq_ignore_ascii_case("cpuid"))
+    {
         let mut roots = Vec::new();
         for op in operands {
             let out = match op {
@@ -635,7 +639,8 @@ pub fn handle_terminator<'tcx>(
             // is the InCleanup-edge counterpart to the P2-S4 synthetic-handler route used for
             // `Terminate(Abi)` edges on NORMAL blocks (which is deliberately left untouched, gated
             // on `is_cleanup_block`). No-op under NO_UNWIND (no cleanup blocks/handlers exist then).
-            let terminate_reason: Option<u8> = if is_cleanup_block && !*crate::config::NO_UNWIND {
+            let terminate_reason: Option<u8> =
+                if is_cleanup_block && !crate::config::current().no_unwind() {
                 match unwind {
                     rustc_middle::mir::UnwindAction::Terminate(
                         UnwindTerminateReason::InCleanup,
@@ -817,10 +822,7 @@ pub fn handle_terminator<'tcx>(
         ),
     };
     // Every terminator must produce at least one root.
-    assert!(
-        !res.is_empty(),
-        "A terminator did not produce any roots!."
-    );
+    assert!(!res.is_empty(), "A terminator did not produce any roots!.");
     res
 }
 
@@ -835,18 +837,16 @@ fn handle_switch<'tcx>(
     // sees — a niche/enum tag) for any function whose (mangled) name contains <substr>. This is the
     // direct answer to "what value does the miscompiled branch read?" that the static `.il` can't give.
     // Pairs with TRACE_FN (block trace). Greppable via ">>V". See feasibility/rcc-debug.
-    if let Ok(filter) = std::env::var("TRACE_VAL") {
-        if !filter.is_empty() {
-            let sym = ctx.tcx().symbol_name(ctx.instance()).name.to_string();
-            if sym.contains(filter.as_str()) {
-                let tail: String = sym.chars().rev().take(40).collect::<String>();
-                let tail: String = tail.chars().rev().collect();
-                let tag = ctx.debug_msg(&format!(">>V switch {tail} ="));
-                trees.push(tag);
-                let signed = matches!(ty.kind(), TyKind::Int(_));
-                let pv = ctx.debug_val(discr, signed);
-                trees.push(pv);
-            }
+    if let Some(filter) = crate::config::current().trace_val() {
+        let sym = ctx.tcx().symbol_name(ctx.instance()).name.to_string();
+        if sym.contains(filter) {
+            let tail: String = sym.chars().rev().take(40).collect::<String>();
+            let tail: String = tail.chars().rev().collect();
+            let tag = ctx.debug_msg(&format!(">>V switch {tail} ="));
+            trees.push(tag);
+            let signed = matches!(ty.kind(), TyKind::Int(_));
+            let pv = ctx.debug_val(discr, signed);
+            trees.push(pv);
         }
     }
     for (value, target) in switch.iter() {

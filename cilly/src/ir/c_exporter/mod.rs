@@ -742,7 +742,7 @@ impl CExporter {
                 "ld_len({arr})",
                 arr = Self::node_to_string(asm[node_idx].clone(), asm, locals, inputs, sig)?
             ),
-            // TODO: loc alloc aligned does not respect the aligement ATM.
+            // TODO: loc alloc aligned does not respect the alignment yet.
             CILNode::LocAllocAlgined { tpe, align } => {
                 format!(
                     "({tpe}*)(alloca(sizeof({tpe})))",
@@ -1103,7 +1103,7 @@ impl CExporter {
              support."
         );
         match def.resolved_implementation(asm) {
-            MethodImpl::MethodBody { blocks, locals } => (),
+            MethodImpl::MethodBody { .. } | MethodImpl::RegionBody { .. } => (),
             MethodImpl::Extern {
                 lib,
                 preserve_errno,
@@ -1177,7 +1177,8 @@ impl CExporter {
             .intersperse(",".into())
             .collect::<String>();
         writeln!(method_defs, "{output} {method_name}({inputs}){{")?;
-        let locals: Vec<_> = def.iter_locals(asm).copied().collect();
+        let (blocks, locals) = def.resolved_implementation(asm).clone().materialize_legacy_body(asm)
+            .expect("C exporter expected a method body");
         for (idx, (lname, local_type)) in locals.iter().enumerate() {
             // If the name of this local is found multiple times, use the L form.
 
@@ -1188,7 +1189,6 @@ impl CExporter {
                 local_type = nonvoid_c_type(asm[*local_type], asm),
             )?;
         }
-        let blocks = def.blocks(asm).unwrap().to_vec();
         // Prepare allocas, if needed.
         for root in blocks[0].roots() {
             let CILRoot::StLoc(loc, node) = asm[*root] else {
@@ -1789,4 +1789,72 @@ pub fn class_to_mangled(class: &super::ClassRef, asm: &Assembly) -> String {
         None => "",
     };
     format!("{assembly}{name}", name = escape_ident(&asm[class.name()]))
+}
+
+#[cfg(test)]
+mod region_body_compat_tests {
+    use super::*;
+    use crate::ir::{Access, BasicBlock, ExceptionRegion};
+
+    #[test]
+    fn region_body_uses_the_exact_legacy_c_handler_shape() {
+        let mut asm = Assembly::default();
+        let owner = asm.main_module();
+        let sig = asm.sig([], Type::Void);
+        let name = asm.alloc_string("region_c_compat");
+        let to_next = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        let rethrow = asm.alloc_root(CILRoot::ReThrow);
+        let cleanup = vec![BasicBlock::new(vec![rethrow], 10, None)];
+
+        let mut legacy_protected = BasicBlock::new_raw(vec![to_next], 0, Some(10));
+        legacy_protected.resolve_exception_handlers(&cleanup, &mut asm);
+        let legacy = MethodDef::new(
+            Access::Private,
+            owner,
+            name,
+            sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![legacy_protected, BasicBlock::new(vec![ret], 1, None)],
+                locals: vec![],
+            },
+            vec![],
+        );
+        let canonical = MethodDef::new(
+            Access::Private,
+            owner,
+            name,
+            sig,
+            MethodKind::Static,
+            MethodImpl::RegionBody {
+                blocks: vec![
+                    BasicBlock::new(vec![to_next], 0, None),
+                    BasicBlock::new(vec![ret], 1, None),
+                ],
+                cleanup_blocks: cleanup,
+                exception_regions: vec![ExceptionRegion::new(0, 10)],
+                locals: vec![],
+            },
+            vec![],
+        );
+
+        let mut legacy_defs = Vec::new();
+        let mut legacy_decls = Vec::new();
+        CExporter::new(false, vec![], vec![])
+            .export_method_def(&mut asm, &legacy, &mut legacy_defs, &mut legacy_decls)
+            .unwrap();
+        let mut canonical_defs = Vec::new();
+        let mut canonical_decls = Vec::new();
+        CExporter::new(false, vec![], vec![])
+            .export_method_def(
+                &mut asm,
+                &canonical,
+                &mut canonical_defs,
+                &mut canonical_decls,
+            )
+            .unwrap();
+        assert_eq!(canonical_defs, legacy_defs);
+        assert_eq!(canonical_decls, legacy_decls);
+    }
 }

@@ -8,7 +8,7 @@ use std::path::Path;
 
 pub use crate::Access;
 pub use asm::{
-    dotnet_version, Assembly, AssemblyArenaCounts, CompactionStats, DotnetVersion,
+    Assembly, AssemblyArenaCounts, CompactionStats,
     ExportReadyAssembly, IlasmFlavour, VerificationFailure,
 };
 pub use basic_block::BasicBlock;
@@ -20,7 +20,7 @@ pub use cst::Const;
 pub use field::{FieldDesc, StaticFieldDesc};
 pub use fnsig::FnSig;
 pub use iter::{CILIter, CILIterElem};
-pub use method::{MethodDef, MethodDefIdx, MethodImpl, MethodRef};
+pub use method::{ExceptionRegion, MethodDef, MethodDefIdx, MethodImpl, MethodRef};
 
 pub use tpe::float::Float;
 pub use tpe::int::Int;
@@ -47,15 +47,15 @@ pub mod cilroot;
 pub mod class;
 /// IR constant
 pub mod cst;
+/// Deterministic, type-annotated human-readable IR dump for a single method (debug tooling, gated by
+/// the `DUMP_FN` env var). See [`dump::dump_method`].
+pub mod dump;
 /// IR field
 pub mod field;
 /// IR functions signature
 pub mod fnsig;
 /// Defines hashable and equable floating point types. All NaNs are compared by bits, and -0.0 != 0.0.
 pub mod hashable;
-/// Deterministic, type-annotated human-readable IR dump for a single method (debug tooling, gated by
-/// the `DUMP_FN` env var). See [`dump::dump_method`].
-pub mod dump;
 /// Exports IR to .NET bytecode
 pub mod il_exporter;
 /// IR iterator

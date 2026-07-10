@@ -6,11 +6,11 @@ use crate::{
 };
 use cilly::{
     cilnode::{MethodKind, PtrCastRes},
-    utilis::{self},
     ir::method::LocalDef,
     ir::BasicBlock,
-    Access, Assembly, CILRoot, Int, Interned, IntoAsmIndex, MethodDef, MethodRef, StaticFieldDesc,
-    Type,
+    utilis::{self},
+    Access, Assembly, CILRoot, ExceptionRegion, Int, Interned, IntoAsmIndex, MethodDef, MethodRef,
+    StaticFieldDesc, Type,
 };
 
 type Root = Interned<cilly::ir::CILRoot>;
@@ -46,7 +46,7 @@ fn locals_from_mir<'tcx>(
     for (local_id, local) in locals.iter().enumerate() {
         if local_id == 0 || local_id > argc {
             let ty = ctx.monomorphize(local.ty);
-            if *crate::config::PRINT_LOCAL_TYPES {
+            if crate::config::current().print_local_types() {
                 println!(
                     "Local type {ty:?},non-morphic: {non_morph}",
                     non_morph = local.ty
@@ -132,7 +132,7 @@ pub fn terminator_to_ops<'tcx>(
     // a `Drop` carrying an `UnwindAction::Terminate` edge can be wrapped in an inline abort guard.
     is_cleanup_block: bool,
 ) -> Result<Vec<Root>, CodegenError> {
-    let terminator = if *crate::config::ABORT_ON_ERROR {
+    let terminator = if crate::config::current().abort_on_error() {
         crate::terminator::handle_terminator(term, ctx, is_cleanup_block)
     } else {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -164,7 +164,7 @@ pub fn statement_to_ops<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Result<Vec<Root>, CodegenError> {
     ctx.set_span(statement.source_info.span);
-    if *crate::config::ABORT_ON_ERROR {
+    if crate::config::current().abort_on_error() {
         Ok(crate::statement::handle_statement(statement, ctx))
     } else {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -212,15 +212,14 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     // the monomorphized `instance_mir` is otherwise hard to obtain (library generics like
     // `Vec::<u32>::extend_with` are instantiated at codegen, not emitted by `--emit=mir`). Pairs with
     // `INSERT_MIR_DEBUG_COMMENTS=1` (which annotates the emitted CIL with these same statements).
-    if let Ok(filter) = std::env::var("DUMP_MIR") {
-        if !filter.is_empty() && name.contains(filter.as_str()) {
+    if let Some(filter) = crate::config::current().dump_mir() {
+        if name.contains(filter) {
             use std::fmt::Write as _;
             use std::io::Write as _;
             // APPEND to a file (default /tmp/dump_mir.txt, override DUMP_MIR_OUT) rather than stderr:
             // cargo-dotnet codegens std/alloc in a discarded warm pass, so library generics like
             // `Vec::<u32>::extend_with` would be lost from stderr. A file survives every pass.
-            let path =
-                std::env::var("DUMP_MIR_OUT").unwrap_or_else(|_| "/tmp/dump_mir.txt".to_string());
+            let path = crate::config::current().dump_mir_out();
             let mut out = format!("\n===DUMP_MIR_BEGIN {name}\n");
             for (local, decl) in mir.local_decls.iter_enumerated() {
                 let _ = writeln!(out, "  let {local:?}: {:?};", decl.ty);
@@ -235,7 +234,11 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
                 }
             }
             let _ = writeln!(out, "===DUMP_MIR_END {name}");
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
                 let _ = f.write_all(out.as_bytes());
             }
         }
@@ -292,6 +295,7 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     let blocks = &mir.basic_blocks;
     let mut normal_bbs = Vec::new();
     let mut cleanup_bbs = Vec::new();
+    let mut exception_regions = Vec::new();
     // Synthetic terminate-handler ids (one/two past the last MIR block) referenced by
     // `UnwindAction::Terminate` edges; the matching `FailFast` cleanup blocks are materialized after
     // the loop (see `basic_block::terminate_handler_id` / `terminator::emit_terminate`).
@@ -342,11 +346,18 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     // runs), this fires at *runtime*, so it reveals the actually-executed control-flow path — exactly the
     // static→runtime gap that defeats hand-reading the `.il`. Output is greppable via the ">>T" prefix.
     // Keep the filter narrow (one type/fn) to avoid flooding hot loops. See feasibility/rcc-debug.
-    let trace_this_fn = std::env::var("TRACE_FN")
-        .ok()
-        .is_some_and(|f| !f.is_empty() && name.contains(f.as_str()));
+    let trace_this_fn = crate::config::current()
+        .trace_fn()
+        .is_some_and(|filter| name.contains(filter));
     // Compact, stable per-function tag for trace lines (tail of the mangled name fits the symbol identity).
-    let trace_tag: String = name.chars().rev().take(48).collect::<String>().chars().rev().collect();
+    let trace_tag: String = name
+        .chars()
+        .rev()
+        .take(48)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
     // Used for type-checking the CIL to ensure its validity.
     for (last_bb_id, block_data) in blocks.into_iter().enumerate() {
         let mut trees: Vec<Root> = Vec::new();
@@ -355,7 +366,7 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
             trees.push(dbg);
         }
         for statement in &block_data.statements {
-            if *crate::config::INSERT_MIR_DEBUG_COMMENTS {
+            if crate::config::current().insert_mir_debug_comments() {
                 let msg = rustc_middle::ty::print::with_no_trimmed_paths!(format!("{statement:?}"));
                 let dbg = ctx.debug_msg(&msg);
                 trees.push(dbg);
@@ -395,7 +406,7 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
             trees.extend(statement_tree);
         }
         if let Some(term) = &block_data.terminator {
-            if *crate::config::INSERT_MIR_DEBUG_COMMENTS {
+            if crate::config::current().insert_mir_debug_comments() {
                 let msg = rustc_middle::ty::print::with_no_trimmed_paths!(format!("{term:?}"));
                 let dbg = ctx.debug_msg(&msg);
                 trees.push(dbg);
@@ -431,10 +442,14 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
                 used_terminate.insert(h);
             }
         }
-        let bb = BasicBlock::new_raw(trees, u32::try_from(last_bb_id).unwrap(), handler_id);
+        let block_id = u32::try_from(last_bb_id).unwrap();
+        let bb = BasicBlock::new(trees, block_id, None);
         if block_data.is_cleanup {
             cleanup_bbs.push(bb);
         } else {
+            if let Some(handler_entry) = handler_id {
+                exception_regions.push(ExceptionRegion::new(block_id, handler_entry));
+            }
             normal_bbs.push(bb);
         }
         //ops.extend(trees.iter().flat_map(|tree| tree.flatten()))
@@ -463,31 +478,24 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
         let throw = ctx.throw_msg(&reason);
         normal_bbs = vec![BasicBlock::new(vec![throw], 0, None)];
         cleanup_bbs = Vec::new();
+        exception_regions = Vec::new();
         repack_cil = Vec::new();
     }
-
-    // Resolve exception handlers on the blocks. `resolve_exception_handlers`
-    // needs `&mut Assembly`, so we drain the blocks, resolve each against the cleanup blocks, and collect.
-    let mut resolved_bbs = Vec::with_capacity(normal_bbs.len());
-    for mut bb in normal_bbs {
-        bb.resolve_exception_handlers(&cleanup_bbs, ctx);
-        bb.sheed_trees();
-        resolved_bbs.push(bb);
-    }
-    let mut normal_bbs = resolved_bbs;
     // Get the first bb, and append repack_cil at its start
     let first_bb: &mut BasicBlock = &mut normal_bbs[0];
     repack_cil.append(first_bb.roots_mut());
     *first_bb.roots_mut() = repack_cil;
 
     let main_module = ctx.main_module();
-    let mut method = MethodDef::from_blocks(
+    let mut method = MethodDef::from_region_blocks(
         access,
         main_module,
         name,
         sig_idx,
         MethodKind::Static,
         normal_bbs,
+        cleanup_bbs,
+        exception_regions,
         locals,
         arg_names,
         ctx,

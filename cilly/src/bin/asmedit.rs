@@ -205,8 +205,35 @@ fn main() {
                 };
                 let def = asm.method_def(id);
                 let name = &asm[def.name()];
-                let (blocks, locals) = match def.resolved_implementation(&asm) {
-                    MethodImpl::MethodBody { blocks, locals } => (blocks, locals),
+                let (block_count, local_count, root_count, node_count) = match def.resolved_implementation(&asm) {
+                    MethodImpl::MethodBody { blocks, locals } => (blocks.len(), locals.len(),
+                            blocks.iter().flat_map(|block| block.iter_roots()).count(),
+                            blocks
+                                .iter()
+                                .flat_map(|block| block.iter_roots())
+                                .flat_map(|root| CILIter::new(asm.get_root(root).clone(), &asm))
+                                .count(),
+                        ),
+                        MethodImpl::RegionBody {
+                            blocks,
+                            cleanup_blocks,
+                            locals,
+                            ..
+                        } => (
+                            blocks.len() + cleanup_blocks.len(),
+                            locals.len(),
+                            blocks
+                                .iter()
+                                .chain(cleanup_blocks)
+                                .flat_map(|block| block.iter_roots())
+                                .count(),
+                            blocks
+                                .iter()
+                                .chain(cleanup_blocks)
+                                .flat_map(|block| block.iter_roots())
+                                .flat_map(|root| CILIter::new(asm.get_root(root).clone(), &asm))
+                                .count(),
+                        ),
                     MethodImpl::Extern {
                         lib,
                         preserve_errno,
@@ -225,10 +252,10 @@ fn main() {
                 };
                 eprintln!(
                     "Method {name} has {locals} locals and {blocks} blocks.\n It has {roots} roots and {nodes} elements(roots + nodes).",
-                    locals = locals.len(),
-                    blocks = blocks.len(),
-                    roots = blocks.iter().flat_map(|block|block.iter_roots()).count(),
-                    nodes = blocks.iter().flat_map(|block|block.iter_roots()).flat_map(|root|CILIter::new(asm.get_root(root).clone(),&asm)).count(),
+                    locals = local_count,
+                    blocks = block_count,
+                    roots = root_count,
+                    nodes = node_count,
                 );
             }
             "msetaccess" => {

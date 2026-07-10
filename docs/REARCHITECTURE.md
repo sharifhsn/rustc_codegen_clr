@@ -1,6 +1,6 @@
 # Architecture rework execution ledger
 
-Status: active — Phases 1–4 implemented; Phase 5 in progress
+Status: active — all five phases implemented; full backend gates in progress
 Started: 2026-07-09
 Branch: `codex/rearchitecture`
 
@@ -79,15 +79,17 @@ Gate: negative test proving a post-link mutation cannot reach an exporter withou
 
 ### 1C. Immutable build contract
 
-Implemented 2026-07-09 as the first consumer-complete slice. Codegen captures one immutable
-`BuildConfig`, serializes it in a magic/version artifact envelope, and the linker rejects both
-cross-artifact and artifact/process mismatches before builtin synthesis. Legacy raw assemblies use
-an explicit decoder path and warning. Remaining configuration `LazyLock` consumers are temporarily
-safe because the linker proves their process environment equal to the serialized contract; routing
-them directly through the value is follow-up cleanup.
+Implemented 2026-07-09 and completed 2026-07-10. Codegen captures one immutable `BackendConfig`;
+only `ArtifactAbiConfig { dotnet_runtime, no_unwind }` is serialized in the schema-v3 artifact
+envelope. The linker captures one typed `LinkerConfig`, validates its process ABI against every
+versioned input, then uses the validated artifact ABI as the authority for runtime/unwind behavior.
+Target selection, alignment repair, allocator policy, managed panic backtraces, native pass-through,
+and emitter selection remain local final-link choices, so compatible cached artifacts can be reused
+across them. Runtime and alignment are threaded explicitly through exporters and final repair rather
+than re-read from globals. Legacy raw assemblies use an explicit decoder path and warning.
 
 - Replace duplicated environment reads with one parsed configuration value.
-- Serialize target-affecting configuration into codegen artifacts.
+- Serialize only configuration that changes independently generated per-crate IR.
 - Reject incompatible input artifacts at link time.
 - Retire or fail on no-op flags; make optimizer disabling use one documented mechanism.
 
@@ -132,8 +134,10 @@ Gate: interner property tests, deterministic serialization, and no regression in
 The serial transactional boundary was implemented 2026-07-10. Every mono item builds in a fresh
 assembly shard, successful items commit to a CGU shard, and successful CGUs commit to the crate in
 rustc's existing deterministic order. Error and panic tests prove parent arena counts and postcard
-bytes remain unchanged. Parallel scheduling remains deliberately deferred until a serial-vs-parallel
-semantic/byte equivalence harness exists.
+bytes remain unchanged. The pinned rustc concurrency audit found `rustc_data_structures::sync::par_map`
+safe for isolated CGU work, but default parallelism remains blocked: raw rustc `AllocId` discovery
+order still leaks into emitted static names and allocation fingerprints. The measured design,
+two-process byte-equivalence harness, and promotion criteria are in [CGU_PARALLELISM.md](CGU_PARALLELISM.md).
 
 - Build a method or codegen unit in isolated state and commit it only after local validation.
 - Merge codegen-unit shards deterministically through the relocation API.
@@ -159,12 +163,19 @@ Gate: package graph check, nightly-port documentation update, and unchanged back
 
 ## Phase 5 — exception-region representation
 
-Design audit complete; implementation in progress. The confirmed duplication point is per-block
-`resolve_exception_handlers`, which clones each reachable cleanup CFG into `BasicBlock.handler`.
-Measured panic-heavy artifacts spend 60–68% of ordinary handler text on duplicate normalized
-handlers in two representative cases. Canonical method-scope cleanup storage is the first target;
-exporter-time physical sharing is a separate optimization because ECMA-335 forbids arbitrary
-overlap between distinct exception clauses.
+Implemented 2026-07-10. `MethodImpl::RegionBody` stores normal blocks, one canonical cleanup graph,
+method-scope `ExceptionRegion` associations, and shared locals. MIR lowering no longer clones a
+reachable cleanup CFG into every protected `BasicBlock`; traversal, optimization, typechecking,
+relocation, DCE, alignment repair, and local compaction visit canonical cleanup roots exactly once.
+A structural verifier rejects duplicate/missing/cross-partition region edges before an assembly can
+become export-ready. Methods without a protected region retain compact legacy `MethodBody` storage.
+
+IL, direct PE, and C call one shared compatibility materializer, preserving the previous physical
+handler shape while the serialized/link-time IR avoids the duplication. `RegionBody` was appended as
+postcard enum tag 4 and the artifact envelope moved to schema v3, which rejects schema v2 before
+payload decoding. Measured panic-heavy artifacts previously spent 60–68% of ordinary handler text on
+duplicate normalized handlers in two representative cases; exporter-time physical sharing remains a
+separate optimization because ECMA-335 forbids arbitrary overlap between distinct exception clauses.
 
 - Represent protected regions and cleanup entry points once at method scope.
 - Initially lower the new representation to byte-equivalent existing handler shapes.
@@ -178,7 +189,7 @@ IL equivalence, IL-size measurements, RyuJIT inlining observations, and the perf
 Every slice:
 
 1. focused unit tests;
-2. `cargo fmt --all -- --check`;
+2. `git diff --check`, plus stable rustfmt only where it does not reflow unrelated legacy files;
 3. `cargo test -p cilly --lib` when `cilly` changes;
 4. `cargo check -p rustc_codegen_clr` when rustc-facing code changes;
 5. a scoped commit with no unrelated formatting or generated artifacts.
@@ -198,6 +209,8 @@ and the local Graphify index.
   an explicit legacy path while allowing the inner IR schema to evolve deliberately.
 - 2026-07-09: sequence relocation before the single-storage interner so every identity/storage
   change goes through one exhaustive, memoized mapping boundary.
+- 2026-07-10: split serialized artifact ABI from process-local backend/linker policy; keep output
+  targets and emitter policy out of cross-artifact compatibility.
 - 2026-07-10: consolidate the full rustc-facing helper ladder into root modules; the measured warm
   check improved rather than regressed, so the fallback frontend package is unnecessary.
 - 2026-07-10: keep CGU scheduling serial until isolated shard output has a serial-vs-parallel

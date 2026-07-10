@@ -22,9 +22,9 @@ pub use side_effect::*;
 mod hoist;
 mod inline;
 mod opt_fuel;
-mod scalarize;
 mod opt_node;
 mod root;
+mod scalarize;
 mod side_effect;
 mod simplify_handlers;
 mod test;
@@ -312,8 +312,7 @@ impl CILNode {
             }
             CILNode::Box {
                 value,
-                tpe: boxtpe,
-            } => {
+                tpe: boxtpe } => {
                 let value = asm.get_node(*value).clone();
                 let value = value.propagate_locals(asm, idx, tpe, new_node, fuel);
                 let value = asm.alloc_node(value);
@@ -609,13 +608,10 @@ fn propagate_root(
 }
 impl MethodImpl {
     pub fn remove_duplicate_sfi(&mut self, asm: &mut Assembly) {
-        // Optimization only suported for methods with locals
-        let MethodImpl::MethodBody { blocks, .. } = self else {
+        let Some(blocks) = self.all_blocks_mut() else {
             return;
         };
-        blocks
-            .iter_mut()
-            .for_each(|block| block.remove_duplicate_sfi(asm));
+        blocks.for_each(|block| block.remove_duplicate_sfi(asm));
     }
     /// Propagates writes to local variables.
     pub fn propagate_locals(
@@ -626,12 +622,18 @@ impl MethodImpl {
         sig: Interned<FnSig>,
     ) {
         // Optimization only suported for methods with locals
-        let MethodImpl::MethodBody { blocks, locals } = self else {
+        let Some((blocks, mut cleanup_blocks, locals)) = self.body_parts_mut() else {
             return;
         };
 
         blocks
             .iter_mut()
+            .chain(
+                cleanup_blocks
+                    .as_deref_mut()
+                    .into_iter()
+                    .flat_map(|blocks| blocks.iter_mut()),
+            )
             .for_each(|block| block.local_opt(asm, locals, cache, fuel, sig));
     }
     /// Replaces writes to locals, which are never read, with pops.
@@ -642,7 +644,7 @@ impl MethodImpl {
         fuel: &mut OptFuel,
     ) {
         // Optimization only suported for methods with locals
-        let MethodImpl::MethodBody { blocks, locals } = self else {
+        let Some((blocks, mut cleanup_blocks, locals)) = self.body_parts_mut() else {
             return;
         };
         // Check if each local is ever read or its address is taken
@@ -654,6 +656,12 @@ impl MethodImpl {
         }
         for node in blocks
             .iter()
+            .chain(
+                cleanup_blocks
+                    .as_deref()
+                    .into_iter()
+                    .flat_map(|blocks| blocks.iter()),
+            )
             .flat_map(super::basic_block::BasicBlock::iter_roots)
             .flat_map(|root| CILIter::new(asm.get_root(root).clone(), asm))
         {
@@ -671,6 +679,12 @@ impl MethodImpl {
         // Remove writes to those dead locals
         for root in blocks
             .iter_mut()
+            .chain(
+                cleanup_blocks
+                    .as_deref_mut()
+                    .into_iter()
+                    .flat_map(|blocks| blocks.iter_mut()),
+            )
             .flat_map(super::basic_block::BasicBlock::iter_roots_mut)
         {
             match asm.get_root(*root) {
@@ -712,11 +726,11 @@ impl MethodImpl {
     }
     pub fn remove_nops(&mut self, asm: &mut Assembly) {
         // Optimization only suported for methods with locals
-        let MethodImpl::MethodBody { blocks, .. } = self else {
+        let Some(blocks) = self.all_blocks_mut() else {
             return;
         };
         // Remove Nops
-        for block in blocks.iter_mut() {
+        for block in blocks {
             block
                 .roots_mut()
                 .retain(|root| !matches!(asm.get_root(*root), CILRoot::Nop));
@@ -733,11 +747,11 @@ impl MethodImpl {
 }
 
 impl MethodDef {
-    pub fn iter_roots_mut(&mut self) -> Option<impl Iterator<Item = &mut Interned<CILRoot>>> {
-        self.implementation_mut().blocks_mut().map(|blocks| {
-            blocks
-                .iter_mut()
-                .flat_map(super::basic_block::BasicBlock::iter_roots_mut)
+    pub fn iter_roots_mut(&mut self,
+    ) -> Option<Box<dyn Iterator<Item = &mut Interned<CILRoot>> + '_>> {
+        self.implementation_mut().all_blocks_mut().map(|blocks| {
+            Box::new(blocks.flat_map(super::basic_block::BasicBlock::iter_roots_mut))
+                as Box<dyn Iterator<Item = &mut Interned<CILRoot>> + '_>
         })
     }
     pub fn map_roots(
@@ -754,6 +768,9 @@ impl MethodDef {
         }
     }
     pub fn typecheck(&mut self, asm: &mut Assembly) -> Result<(), TypeCheckError> {
+        self.implementation()
+            .verify_exception_regions(asm)
+            .map_err(|reason| TypeCheckError::InvalidExceptionRegion { reason })?;
         let sig = self.sig();
         let locals = self.iter_locals(asm).cloned().collect::<Vec<_>>();
         if let Some(roots) = self.iter_roots_mut() {
@@ -1053,7 +1070,8 @@ fn opt_mag() {
     #[cfg(not(miri))]
     asm.verify_for_export()
         .unwrap()
-        .export("/tmp/opt_mag.exe", ILExporter::new(*ILASM_FLAVOUR, false, None));
+        .export("/tmp/opt_mag.exe", ILExporter::new(*ILASM_FLAVOUR, false, None),
+    );
 }
 
 #[test]

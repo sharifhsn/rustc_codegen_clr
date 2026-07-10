@@ -1,12 +1,12 @@
 use crate::assembly::MethodCompileCtx;
-use cilly::{
-    cilnode::{ExtendKind, IsPure, MethodKind},
-    ClassRef, Int, Interned, MethodRef, Type,
-};
 use crate::operand::handle_operand;
 use crate::place::{place_address, place_set};
 use crate::r#type::adt::field_descrptor;
 use crate::r#type::GetTypeExt;
+use cilly::{
+    cilnode::{ExtendKind, IsPure, MethodKind},
+    ClassRef, Int, Interned, MethodRef, Type,
+};
 use rustc_middle::mir::{Operand, Place};
 use rustc_span::Spanned;
 
@@ -40,10 +40,10 @@ pub fn xchg<'tcx>(
         vec![].into(),
     );
     match src_type {
-        // On .NET 9 (`DOTNET9`), all sub-word ints fall through to the general
+        // On .NET 9 (`config::dotnet9()`), all sub-word ints fall through to the general
         // `Interlocked.Exchange(ref T, T)` arm below (native byte/sbyte/short/ushort overloads,
         // no masked-word emulation). U8 otherwise uses the dedicated `atomic_xchng_u8` builtin.
-        Type::Int(Int::U8) if !*crate::config::DOTNET9 => {
+        Type::Int(Int::U8) if !crate::config::dotnet9() => {
             let xchng = ctx.alloc_methodref(xchng);
             let call = ctx.call(xchng, &[dst, new], IsPure::NOT);
             return place_set(destination, call, ctx);
@@ -65,10 +65,10 @@ pub fn xchg<'tcx>(
             let call = ctx.cast_ptr_to(call, src_type);
             return place_set(destination, call, ctx);
         }
-        Type::Int(int @ (Int::I8 | Int::U16 | Int::I16)) if !*crate::config::DOTNET9 => {
+        Type::Int(int @ (Int::I8 | Int::U16 | Int::I16)) if !crate::config::dotnet9() => {
             // Sub-word exchange via a masked 32-bit CAS loop (see `emulate_subword_xchng`).
             // U8 keeps its existing `atomic_xchng_u8` builtin (handled above).
-            // (Under `DOTNET9` this arm is skipped → native `Interlocked.Exchange` below.)
+            // (On .NET 9 this arm is skipped → native `Interlocked.Exchange` below.)
             let width = int.size().expect("sub-word int has a known size");
             let src_ref = ctx.nref(src_type);
             let call = ctx.call_static(
@@ -88,7 +88,7 @@ pub fn xchg<'tcx>(
         // here for Bool) is a plain volatile-ld/volatile-st with no CAS — it is NOT atomic against
         // a racing writer of the same byte on .NET 8 (lost-update race). This is a known, disclosed
         // residual; see docs/MEMORY_MODEL.md §7/§8. Do not reintroduce an "unreachable" claim here.
-        Type::Bool if !*crate::config::DOTNET9 => {
+        Type::Bool if !crate::config::dotnet9() => {
             let xchng = ctx.alloc_methodref(xchng);
             let u8_ref = ctx.nref(Type::Int(Int::U8));
             let dst = ctx.cast_ptr_to(dst, u8_ref);
@@ -168,7 +168,7 @@ pub fn cxchg<'tcx>(
             let call = ctx.call(call_site, &[dst, value, comparand], IsPure::NOT);
             ctx.cast_ptr_to(call, src_type)
         }
-        // .NET 9 has a native sub-word `Interlocked.CompareExchange(ref T, T, T)`; with `DOTNET9`
+        // .NET 9 has a native sub-word `Interlocked.CompareExchange(ref T, T, T)`; on that runtime
         // set, the sub-word ints fall through to the general arm below, which emits exactly that
         // (no masking, no pointer arithmetic on the managed byref → none of the emulation's
         // page-boundary hazard).
@@ -178,7 +178,7 @@ pub fn cxchg<'tcx>(
         // (cilly::ir::builtins::atomics) check the comparand *inside* the loop and never write on a
         // mismatch, returning the real old sub-word — so `cxchng_res_val`'s `old == expected` is exact.
         // LE-only + page-boundary caveats documented on the builtin.
-        Type::Int(int @ (Int::U8 | Int::I8 | Int::U16 | Int::I16)) if !*crate::config::DOTNET9 => {
+        Type::Int(int @ (Int::U8 | Int::I8 | Int::U16 | Int::I16)) if !crate::config::dotnet9() => {
             let width = int.size().expect("sub-word int has a known size");
             let src_ref = ctx.nref(src_type);
             let call_site = ctx.static_mref(

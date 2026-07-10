@@ -11,6 +11,10 @@ use super::{
 #[derive(Debug)]
 /// Signals that a piece of CIL is not valid.
 pub enum TypeCheckError {
+    /// Method-scope exception-region metadata or its normal/cleanup CFG partition is malformed.
+    InvalidExceptionRegion {
+        reason: String,
+    },
     /// CIL contains a binop with incorrect arguments
     WrongBinopArgs {
         /// The type of the left argument of this op
@@ -1121,11 +1125,8 @@ impl CILNode {
                 let len_tpe = asm.get_node(*len).clone().typecheck(sig, locals, asm)?;
                 match len_tpe {
                     Type::Int(Int::I32 | Int::U32 | Int::I64 | Int::USize | Int::ISize) => (),
-                    _ => {
-                        return Err(TypeCheckError::ArrIndexInvalidType {
-                            index_tpe: len_tpe,
-                        })
-                    }
+                    _ => return Err(TypeCheckError::ArrIndexInvalidType {
+                            index_tpe: len_tpe }),
                 }
                 Ok(Type::PlatformArray {
                     elem: *elem,
@@ -1407,7 +1408,8 @@ impl CILRoot {
                 let arr_tpe = asm.get_node(*array).clone().typecheck(sig, locals, asm)?;
                 let index_tpe = asm.get_node(*index).clone().typecheck(sig, locals, asm)?;
                 let value_tpe = asm.get_node(*value).clone().typecheck(sig, locals, asm)?;
-                let Type::PlatformArray { elem: arr_elem, dims } = arr_tpe else {
+                let Type::PlatformArray { elem: arr_elem, dims,
+                } = arr_tpe else {
                     return Err(TypeCheckError::LdLenArgNotArray { got: arr_tpe });
                 };
                 if dims.get() != 1 {
@@ -1483,7 +1485,8 @@ mod tc_tests {
 
     /// Build a single-local, single-`StLoc` method body and return the typecheck result of that
     /// `StLoc` root. `value` is a node index that has already been allocated in `asm`.
-    fn check_stloc(asm: &mut Assembly, local_ty: Type, value: Interned<CILNode>) -> Result<(), TypeCheckError> {
+    fn check_stloc(asm: &mut Assembly, local_ty: Type, value: Interned<CILNode>,
+    ) -> Result<(), TypeCheckError> {
         let local_ty = asm.alloc_type(local_ty);
         let locals: Vec<LocalDef> = vec![(None, local_ty)];
         let sig = asm.sig([], Type::Void);
@@ -1511,7 +1514,8 @@ mod tc_tests {
     #[test]
     fn stloc_float_into_int_is_rejected() {
         let mut asm = Assembly::default();
-        let f = asm.alloc_node(CILNode::Const(Box::new(Const::F64(super::super::hashable::HashableF64(1.0)))));
+        let f = asm.alloc_node(CILNode::Const(Box::new(Const::F64(super::super::hashable::HashableF64(1.0),
+        ))));
         assert!(
             matches!(
                 check_stloc(&mut asm, Type::Int(Int::USize), f),
@@ -1591,7 +1595,8 @@ mod tc_tests {
         let callee = asm.new_methodref(*main, "takes_f64", callee_sig, MethodKind::Static, vec![]);
         // Caller passes an i64 const where an f64 is expected.
         let bad_arg = asm.alloc_node(CILNode::Const(Box::new(Const::I64(7))));
-        let call = CILRoot::Call(Box::new((callee, [bad_arg].into(), crate::ir::cilnode::IsPure::NOT)));
+        let call = CILRoot::Call(Box::new((callee, [bad_arg].into(), crate::ir::cilnode::IsPure::NOT,
+        )));
         let sig = asm.sig([], Type::Void);
         let locals: Vec<LocalDef> = vec![];
         assert!(
@@ -1668,11 +1673,12 @@ mod tc_tests {
     /// Build an `Assembly` containing exactly one method whose body stores an `f64` into a `usize`
     /// local — a deliberate, real type error — and register it so `Assembly::typecheck` walks it.
     fn asm_with_one_broken_method() -> Assembly {
-        use crate::ir::{Access, BasicBlock};
         use crate::ir::method::MethodImpl;
+        use crate::ir::{Access, BasicBlock};
         let mut asm = Assembly::default();
         let usize_ty = asm.alloc_type(Type::Int(Int::USize));
-        let f = asm.alloc_node(CILNode::Const(Box::new(Const::F64(super::super::hashable::HashableF64(1.0)))));
+        let f = asm.alloc_node(CILNode::Const(Box::new(Const::F64(super::super::hashable::HashableF64(1.0),
+        ))));
         let bad = asm.alloc_root(CILRoot::StLoc(0, f));
         let block = BasicBlock::new(vec![bad], 0, None);
         let main = asm.main_module();
@@ -1683,7 +1689,8 @@ mod tc_tests {
             asm.alloc_string("broken"),
             sig,
             MethodKind::Static,
-            MethodImpl::MethodBody { blocks: vec![block], locals: vec![(None, usize_ty)] },
+            MethodImpl::MethodBody { blocks: vec![block], locals: vec![(None, usize_ty)],
+            },
             vec![],
         );
         asm.new_method(def);

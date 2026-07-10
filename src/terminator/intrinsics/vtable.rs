@@ -1,14 +1,14 @@
 use crate::assembly::MethodCompileCtx;
-use cilly::{cilnode::ExtendKind, BinOp, Int, Interned, Type};
 use crate::operand::handle_operand;
 use crate::place::place_set;
+use cilly::{cilnode::ExtendKind, BinOp, Int, Interned, Type};
 use rustc_middle::mir::{Operand, Place};
 use rustc_span::Spanned;
 
 type Node = Interned<cilly::ir::CILNode>;
 type Root = Interned<cilly::ir::CILRoot>;
 
-/// Gets the aligement of a dynamic object from a fat pointer, by looking it up from the vtable.
+/// Gets the alignment of a dynamic object from a fat pointer by looking it up in the vtable.
 pub fn vtable_align<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,

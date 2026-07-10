@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     asm_link::{RelocateCtx, RelocateValue},
+    basic_block::BlockId,
     bimap::Interned,
     cilnode::{IsPure, MethodKind},
     class::ClassDefIdx,
@@ -326,14 +327,25 @@ impl MethodDef {
     pub fn iter_cil<'asm: 'method, 'method>(
         &'method self,
         asm: &'asm Assembly,
-    ) -> Option<impl Iterator<Item = CILIterElem> + 'method> {
+    ) -> Option<Box<dyn Iterator<Item = CILIterElem> + 'method>> {
         match self.resolved_implementation(asm) {
-            MethodImpl::MethodBody { blocks, .. } => Some(
+            MethodImpl::MethodBody { blocks, .. } => Some(Box::new(
                 blocks
                     .iter()
                     .flat_map(super::basic_block::BasicBlock::iter_roots)
                     .flat_map(|root| super::CILIter::new(asm.get_root(root).clone(), asm)),
-            ),
+            )),
+            MethodImpl::RegionBody {
+                blocks,
+                cleanup_blocks,
+                ..
+            } => Some(Box::new(
+                blocks
+                    .iter()
+                    .chain(cleanup_blocks)
+                    .flat_map(super::basic_block::BasicBlock::iter_roots)
+                    .flat_map(|root| super::CILIter::new(asm.get_root(root).clone(), asm)),
+            )),
             MethodImpl::Extern { .. } => None,
             MethodImpl::AliasFor(_) => {
                 panic!("Unresolved alias returned by MethodDef::resolved_implementation")
@@ -498,9 +510,8 @@ impl MethodDef {
         asm: &'asm Assembly,
     ) -> &'method MethodImpl {
         match self.implementation {
-            MethodImpl::MethodBody { .. } | MethodImpl::Extern { .. } | MethodImpl::Missing => {
-                &self.implementation
-            }
+            MethodImpl::MethodBody { .. } | MethodImpl::RegionBody { .. }
+            | MethodImpl::Extern { .. } | MethodImpl::Missing => &self.implementation,
             MethodImpl::AliasFor(method) => asm
                 .method_def_from_ref(method)
                 .expect("ERROR: a method is an alias for an extern function")
@@ -568,6 +579,48 @@ impl MethodDef {
         MethodDef::new(access, class, name, sig, kind, implementation, arg_names)
     }
 
+    /// Builds a canonical exception-region body while reusing `from_blocks`' debug-name and
+    /// argument reconciliation logic.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn from_region_blocks(
+        access: Access,
+        class: ClassDefIdx,
+        name: &str,
+        sig: Interned<FnSig>,
+        kind: MethodKind,
+        blocks: Vec<BasicBlock>,
+        cleanup_blocks: Vec<BasicBlock>,
+        exception_regions: Vec<ExceptionRegion>,
+        locals: Vec<LocalDef>,
+        arg_names: Vec<Option<Interned<IString>>>,
+        asm: &mut Assembly,
+    ) -> Self {
+        // Cleanup blocks have no ordinary CFG predecessor; without a protected-region edge they
+        // are unreachable. Preserve the compact legacy body for the overwhelmingly common
+        // no-unwind method and avoid exporter-time cloning of every such method.
+        if exception_regions.is_empty() {
+            return Self::from_blocks(
+                access, class, name, sig, kind, blocks, locals, arg_names, asm,
+            );
+        }
+        let mut method = Self::from_blocks(
+            access, class, name, sig, kind, blocks, locals, arg_names, asm,
+        );
+        let MethodImpl::MethodBody { blocks, locals } =
+            std::mem::replace(method.implementation_mut(), MethodImpl::Missing)
+        else {
+            unreachable!()
+        };
+        *method.implementation_mut() = MethodImpl::RegionBody {
+            blocks,
+            cleanup_blocks,
+            exception_regions,
+            locals,
+        };
+        method
+    }
+
     #[must_use]
     pub fn access(&self) -> &Access {
         &self.access
@@ -583,7 +636,8 @@ impl MethodDef {
         asm: &'a Assembly,
     ) -> impl Iterator<Item = &'a (Option<Interned<IString>>, Interned<Type>)> {
         match self.resolved_implementation(asm) {
-            MethodImpl::MethodBody { blocks: _, locals } => locals.iter(),
+            MethodImpl::MethodBody { blocks: _, locals }
+            | MethodImpl::RegionBody { locals, .. } => locals.iter(),
             MethodImpl::Extern { .. } | MethodImpl::Missing => [].iter(),
             MethodImpl::AliasFor(_) => panic!(),
         }
@@ -610,8 +664,8 @@ impl MethodDef {
             .blocks()
             .map(|vec| vec.as_ref())
     }
-    pub fn adjust_aligement(&mut self, asm: &mut Assembly) {
-        let MethodImpl::MethodBody { blocks, locals } = self.implementation_mut() else {
+    pub fn adjust_alignment(&mut self, asm: &mut Assembly, guaranteed_align: u8) {
+        let Some((blocks, mut cleanup_blocks, locals)) = self.implementation_mut().body_parts_mut() else {
             return;
         };
         assert!(!blocks.is_empty());
@@ -624,6 +678,12 @@ impl MethodDef {
         let mut local_address_of = vec![false; locals.len()];
         for node in blocks
             .iter()
+            .chain(
+                cleanup_blocks
+                    .as_deref()
+                    .into_iter()
+                    .flat_map(|blocks| blocks.iter()),
+            )
             .flat_map(super::basic_block::BasicBlock::iter_roots)
             .flat_map(|root| super::CILIter::new(asm.get_root(root).clone(), asm))
             .filter_map(super::iter::CILIterElem::as_node)
@@ -634,7 +694,7 @@ impl MethodDef {
         }
         let mut preamble = vec![];
         for (local_id, (_, tpe_idx, align)) in to_map {
-            if align <= asm.guaranted_align() as u64 {
+            if align <= u64::from(guaranteed_align) {
                 // Aligement guanrateed by .NET, skip.
                 continue;
             }
@@ -656,6 +716,12 @@ impl MethodDef {
             // Map all usages of this local, to ensure it is propely alligned.
             blocks
                 .iter_mut()
+                .chain(
+                    cleanup_blocks
+                        .as_deref_mut()
+                        .into_iter()
+                        .flat_map(|blocks| blocks.iter_mut()),
+                )
                 .flat_map(|block| block.roots_mut())
                 .for_each(|root_idx| {
                     let root = asm[*root_idx].clone();
@@ -688,6 +754,65 @@ impl MethodDef {
     }
 
     pub(crate) fn remove_dead_blocks(&mut self, asm: &Assembly) {
+        if let MethodImpl::RegionBody {
+            blocks,
+            cleanup_blocks,
+            exception_regions,
+            ..
+        } = self.implementation_mut()
+        {
+            if blocks.is_empty() {
+                exception_regions.clear();
+                cleanup_blocks.clear();
+                return;
+            }
+
+            // Preserve the legacy normal-CFG policy, then make the method-level unwind edges
+            // explicit: regions protecting removed normal blocks are removed, and the canonical
+            // cleanup graph is retained only when reachable from a remaining handler entry.
+            let mut alive_normal: FxHashSet<_> =
+                blocks.iter().flat_map(|block| block.targets(asm)).collect();
+            alive_normal.insert(blocks[0].block_id());
+            blocks.retain(|block| alive_normal.contains(&block.block_id()));
+            exception_regions.retain(|region| alive_normal.contains(&region.protected()));
+
+            let cleanup_ids: FxHashSet<_> =
+                cleanup_blocks.iter().map(BasicBlock::block_id).collect();
+            let mut alive_cleanup = FxHashSet::default();
+            let mut pending: Vec<_> = exception_regions
+                .iter()
+                .map(|region| region.handler_entry())
+                .collect();
+            while let Some(block_id) = pending.pop() {
+                assert!(
+                    cleanup_ids.contains(&block_id),
+                    "exception region references missing cleanup block {block_id}"
+                );
+                if !alive_cleanup.insert(block_id) {
+                    continue;
+                }
+                let block = cleanup_blocks
+                    .iter()
+                    .find(|block| block.block_id() == block_id)
+                    .expect("cleanup id set and cleanup block vector disagree");
+                for (target, sub_target) in block.targets_with_sub(asm) {
+                    assert_eq!(
+                        sub_target, 0,
+                        "canonical cleanup blocks cannot contain handler subtargets"
+                    );
+                    assert!(
+                        cleanup_ids.contains(&target),
+                        "cleanup block {block_id} branches outside the cleanup graph to {target}"
+                    );
+                    if !alive_cleanup.contains(&target) {
+                        pending.push(target);
+                    }
+                }
+            }
+            cleanup_blocks.retain(|block| alive_cleanup.contains(&block.block_id()));
+            return;
+        }
+
         // This opt only makes sense if this method has an impl
         let Some(blocks) = self.implementation().blocks() else {
             return;
@@ -731,10 +856,12 @@ impl MethodDef {
     }
 
     pub(crate) fn locals(&self) -> Option<&[LocalDef]> {
-        let MethodImpl::MethodBody { blocks: _, locals } = self.implementation() else {
-            return None;
-        };
-        Some(locals)
+        match self.implementation() {
+            MethodImpl::MethodBody { locals, .. } | MethodImpl::RegionBody { locals, .. } => {
+                Some(locals)
+            }
+            _ => None,
+        }
     }
 
     pub fn accesses_statics(&self, asm: &Assembly) -> bool {
@@ -751,6 +878,38 @@ impl MethodDef {
     }
 }
 pub type LocalDef = (Option<Interned<IString>>, Interned<Type>);
+/// A method-scope catch-all unwind association. `protected` identifies a normal CFG block and
+/// `handler_entry` identifies the entry block in `MethodImpl::RegionBody::cleanup_blocks`.
+///
+/// The staged representation deliberately keeps associations singleton. Exporters materialize
+/// the historical one-try-per-block shape today; a later lexical-region planner may coalesce
+/// compatible associations without changing this canonical cleanup graph.
+#[derive(Hash, PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ExceptionRegion {
+    protected: BlockId,
+    handler_entry: BlockId,
+}
+
+impl ExceptionRegion {
+    #[must_use]
+    pub const fn new(protected: BlockId, handler_entry: BlockId) -> Self {
+        Self {
+            protected,
+            handler_entry,
+        }
+    }
+
+    #[must_use]
+    pub const fn protected(self) -> BlockId {
+        self.protected
+    }
+
+    #[must_use]
+    pub const fn handler_entry(self) -> BlockId {
+        self.handler_entry
+    }
+}
+
 #[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
 pub enum MethodImpl {
     MethodBody {
@@ -763,6 +922,15 @@ pub enum MethodImpl {
     },
     AliasFor(Interned<MethodRef>),
     Missing,
+    /// Canonical method body with cleanup CFG storage shared by every protected block that refers
+    /// to it. Appended after all legacy variants so prefixless legacy postcard assemblies retain
+    /// their historical enum discriminants during the schema-v3 transition.
+    RegionBody {
+        blocks: Vec<BasicBlock>,
+        cleanup_blocks: Vec<BasicBlock>,
+        exception_regions: Vec<ExceptionRegion>,
+        locals: Vec<LocalDef>,
+    },
 }
 impl RelocateValue for MethodImpl {
     type Output = Self;
@@ -774,6 +942,31 @@ impl RelocateValue for MethodImpl {
                     .into_iter()
                     .map(|block| block.relocate(ctx, destination))
                     .collect(),
+                locals: locals
+                    .into_iter()
+                    .map(|(name, tpe)| {
+                        (
+                            name.map(|name| ctx.string(destination, name)),
+                            ctx.type_id(destination, tpe),
+                        )
+                    })
+                    .collect(),
+            },
+            Self::RegionBody {
+                blocks,
+                cleanup_blocks,
+                exception_regions,
+                locals,
+            } => Self::RegionBody {
+                blocks: blocks
+                    .into_iter()
+                    .map(|block| block.relocate(ctx, destination))
+                    .collect(),
+                cleanup_blocks: cleanup_blocks
+                    .into_iter()
+                    .map(|block| block.relocate(ctx, destination))
+                    .collect(),
+                exception_regions,
                 locals: locals
                     .into_iter()
                     .map(|(name, tpe)| {
@@ -797,11 +990,53 @@ impl RelocateValue for MethodImpl {
     }
 }
 impl MethodImpl {
+    pub(crate) fn all_blocks_mut(
+        &mut self,
+    ) -> Option<Box<dyn Iterator<Item = &mut BasicBlock> + '_>> {
+        match self {
+            Self::MethodBody { blocks, .. } => Some(Box::new(blocks.iter_mut())),
+            Self::RegionBody {
+                blocks,
+                cleanup_blocks,
+                ..
+            } => Some(Box::new(blocks.iter_mut().chain(cleanup_blocks))),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn body_parts_mut(
+        &mut self,
+    ) -> Option<(
+        &mut Vec<BasicBlock>,
+        Option<&mut Vec<BasicBlock>>,
+        &mut Vec<LocalDef>,
+    )> {
+        match self {
+            Self::MethodBody { blocks, locals } => Some((blocks, None, locals)),
+            Self::RegionBody {
+                blocks,
+                cleanup_blocks,
+                locals,
+                ..
+            } => Some((blocks, Some(cleanup_blocks), locals)),
+            _ => None,
+        }
+    }
+
     pub fn root_count(&self) -> usize {
         match self {
             MethodImpl::MethodBody { blocks, .. } => {
                 blocks.iter().map(|block| block.roots().len()).sum()
             }
+            MethodImpl::RegionBody {
+                blocks,
+                cleanup_blocks,
+                ..
+            } => blocks
+                .iter()
+                .chain(cleanup_blocks)
+                .map(|block| block.roots().len())
+                .sum(),
             MethodImpl::Extern { .. } => 0,
             MethodImpl::AliasFor(_) => 0,
             MethodImpl::Missing => 3,
@@ -809,15 +1044,164 @@ impl MethodImpl {
     }
     pub fn blocks_mut(&mut self) -> Option<&mut Vec<BasicBlock>> {
         match self {
-            Self::MethodBody { blocks, .. } => Some(blocks),
+            Self::MethodBody { blocks, .. } | Self::RegionBody { blocks, .. } => Some(blocks),
             _ => None,
         }
     }
     pub fn blocks(&self) -> Option<&Vec<BasicBlock>> {
         match self {
-            Self::MethodBody { blocks, .. } => Some(blocks),
+            Self::MethodBody { blocks, .. } | Self::RegionBody { blocks, .. } => Some(blocks),
             _ => None,
         }
+    }
+
+    /// Returns canonical cleanup blocks for a region body. Legacy bodies embed handlers in their
+    /// normal blocks and therefore return `None`.
+    #[must_use]
+    pub fn cleanup_blocks(&self) -> Option<&[BasicBlock]> {
+        match self {
+            Self::RegionBody { cleanup_blocks, .. } => Some(cleanup_blocks),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn exception_regions(&self) -> Option<&[ExceptionRegion]> {
+        match self {
+            Self::RegionBody {
+                exception_regions, ..
+            } => Some(exception_regions),
+            _ => None,
+        }
+    }
+
+    /// Produces the exact legacy per-block handler representation used by all current exporters.
+    /// The canonical body is never mutated; only this scratch clone receives jumpstarters,
+    /// `ExitSpecialRegion` pads, source-specific branches, and cloned reachable cleanup blocks.
+    #[must_use]
+    pub fn materialize_legacy_body(
+        &self,
+        asm: &mut Assembly,
+    ) -> Option<(Vec<BasicBlock>, Vec<LocalDef>)> {
+        match self {
+            Self::MethodBody { blocks, locals } => Some((blocks.clone(), locals.clone())),
+            Self::RegionBody {
+                blocks,
+                cleanup_blocks,
+                exception_regions,
+                locals,
+            } => {
+                let mut by_protected = FxHashMap::default();
+                for region in exception_regions {
+                    assert!(
+                        by_protected
+                            .insert(region.protected(), region.handler_entry())
+                            .is_none(),
+                        "normal block {} has more than one exception region",
+                        region.protected()
+                    );
+                }
+                let mut materialized = blocks.clone();
+                for block in &mut materialized {
+                    if let Some(handler_entry) = by_protected.remove(&block.block_id()) {
+                        block.resolve_exception_handler(handler_entry, cleanup_blocks, asm);
+                    }
+                }
+                assert!(
+                    by_protected.is_empty(),
+                    "exception region protects a missing normal block"
+                );
+                Some((materialized, locals.clone()))
+            }
+            Self::Extern { .. } | Self::AliasFor(_) | Self::Missing => None,
+        }
+    }
+
+    pub(crate) fn verify_exception_regions(&self, asm: &Assembly) -> Result<(), String> {
+        let Self::RegionBody {
+            blocks,
+            cleanup_blocks,
+            exception_regions,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+
+        let normal_ids: FxHashSet<_> = blocks.iter().map(BasicBlock::block_id).collect();
+        let cleanup_ids: FxHashSet<_> = cleanup_blocks.iter().map(BasicBlock::block_id).collect();
+        if normal_ids.len() != blocks.len() || cleanup_ids.len() != cleanup_blocks.len() {
+            return Err("duplicate block id within a canonical normal or cleanup CFG".into());
+        }
+        if normal_ids.iter().any(|id| cleanup_ids.contains(id)) {
+            return Err("normal and cleanup CFG block ids overlap".into());
+        }
+
+        let mut protected = FxHashSet::default();
+        for region in exception_regions {
+            if !normal_ids.contains(&region.protected()) {
+                return Err(format!(
+                    "exception region protects missing normal block {}",
+                    region.protected()
+                ));
+            }
+            if !cleanup_ids.contains(&region.handler_entry()) {
+                return Err(format!(
+                    "exception region references missing cleanup entry {}",
+                    region.handler_entry()
+                ));
+            }
+            if !protected.insert(region.protected()) {
+                return Err(format!(
+                    "normal block {} has multiple exception regions",
+                    region.protected()
+                ));
+            }
+        }
+
+        for (is_cleanup, block, ids) in blocks
+            .iter()
+            .map(|block| (false, block, &normal_ids))
+            .chain(
+                cleanup_blocks
+                    .iter()
+                    .map(|block| (true, block, &cleanup_ids)),
+            )
+        {
+            if block.handler().is_some() || block.handler_id().is_some() {
+                return Err(format!(
+                    "canonical {} block {} contains legacy handler state",
+                    if is_cleanup { "cleanup" } else { "normal" },
+                    block.block_id()
+                ));
+            }
+            for (target, sub_target) in block.targets_with_sub(asm) {
+                if sub_target != 0 {
+                    return Err(format!(
+                        "canonical block {} contains legacy handler subtarget {sub_target}",
+                        block.block_id()
+                    ));
+                }
+                if !ids.contains(&target) {
+                    return Err(format!(
+                        "canonical {} block {} branches across the CFG partition to {target}",
+                        if is_cleanup { "cleanup" } else { "normal" },
+                        block.block_id()
+                    ));
+                }
+            }
+            if block
+                .roots()
+                .iter()
+                .any(|root| matches!(asm.get_root(*root), CILRoot::ExitSpecialRegion { .. }))
+            {
+                return Err(format!(
+                    "canonical block {} contains legacy ExitSpecialRegion",
+                    block.block_id()
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Returns `true` if the method impl is [`Extern`].
@@ -981,22 +1365,28 @@ impl MethodImpl {
             }
 
             (MethodImpl::Missing, MethodImpl::Missing) => MethodImpl::Missing,
+            (MethodImpl::Missing, MethodImpl::RegionBody { .. }) => (*implementation).clone(),
+            (MethodImpl::RegionBody { .. }, MethodImpl::Missing) => (*self).clone(),
+            (MethodImpl::RegionBody { .. }, _) | (_, MethodImpl::RegionBody { .. }) => {
+                panic!("Unmergable method impl: canonical exception-region bodies cannot be merged")
+            }
         };
         *self = tmp;
     }
 
     pub(crate) fn realloc_locals(&mut self, asm: &mut Assembly) {
         // Optimization only suported for methods with locals
-        let MethodImpl::MethodBody {
-            blocks,
-            ref mut locals,
-        } = self
-        else {
+        let Some((blocks, mut cleanup_blocks, locals)) = self.body_parts_mut() else {
             return;
         };
         let mut new_locals = std::sync::Mutex::new(Vec::new());
         let local_map = std::sync::Mutex::new(FxHashMap::default());
-        for block in blocks.iter_mut() {
+        for block in blocks.iter_mut().chain(
+            cleanup_blocks
+                .as_deref_mut()
+                .into_iter()
+                .flat_map(|blocks| blocks.iter_mut()),
+        ) {
             block.map_roots(
                 asm,
                 &mut |root, _| match root {
@@ -1361,4 +1751,274 @@ fn should_hint_aggressive_inline_false_for_non_method_body_impls() {
     }
     .should_hint_aggressive_inline(&asm));
     assert!(!MethodImpl::Missing.should_hint_aggressive_inline(&asm));
+}
+
+#[cfg(test)]
+fn region_body_fixture(asm: &mut Assembly) -> MethodImpl {
+    let normal_root = asm.alloc_root(CILRoot::Nop);
+    let cleanup_root = asm.alloc_root(CILRoot::ReThrow);
+    MethodImpl::RegionBody {
+        blocks: vec![BasicBlock::new(vec![normal_root], 0, None)],
+        cleanup_blocks: vec![BasicBlock::new(vec![cleanup_root], 10, None)],
+        exception_regions: vec![ExceptionRegion::new(0, 10)],
+        locals: vec![],
+    }
+}
+
+#[test]
+fn region_builder_keeps_methods_without_protected_regions_compact() {
+    let mut asm = Assembly::default();
+    let class = asm.main_module();
+    let sig = asm.alloc_sig(FnSig::new([], Type::Void));
+    let ret = asm.alloc_root(CILRoot::VoidRet);
+    let method = MethodDef::from_region_blocks(
+        Access::Extern,
+        class,
+        "no_regions",
+        sig,
+        MethodKind::Static,
+        vec![BasicBlock::new(vec![ret], 0, None)],
+        vec![BasicBlock::new(vec![], 10, None)],
+        vec![],
+        vec![],
+        vec![],
+        &mut asm,
+    );
+    assert!(matches!(
+        method.implementation(),
+        MethodImpl::MethodBody { .. }
+    ));
+}
+
+#[test]
+fn canonical_region_body_materializes_exactly_like_legacy_resolution() {
+    let mut asm = Assembly::default();
+    let leave_normal = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
+    let cleanup_next = asm.alloc_root(CILRoot::Branch(Box::new((11, 0, None))));
+    let rethrow = asm.alloc_root(CILRoot::ReThrow);
+    let cleanup = vec![
+        BasicBlock::new(vec![cleanup_next], 10, None),
+        BasicBlock::new(vec![rethrow], 11, None),
+    ];
+
+    let mut legacy = BasicBlock::new_raw(vec![leave_normal], 0, Some(10));
+    legacy.resolve_exception_handlers(&cleanup, &mut asm);
+
+    let canonical = MethodImpl::RegionBody {
+        blocks: vec![BasicBlock::new(vec![leave_normal], 0, None)],
+        cleanup_blocks: cleanup,
+        exception_regions: vec![ExceptionRegion::new(0, 10)],
+        locals: vec![],
+    };
+    let (materialized, locals) = canonical.materialize_legacy_body(&mut asm).unwrap();
+    assert!(locals.is_empty());
+    assert_eq!(materialized, vec![legacy]);
+}
+
+#[test]
+fn canonical_region_body_postcard_round_trip_and_enum_tags_are_stable() {
+    let mut asm = Assembly::default();
+    let region = region_body_fixture(&mut asm);
+    let encoded = postcard::to_stdvec(&region).unwrap();
+    assert_eq!(
+        encoded[0], 4,
+        "RegionBody must remain appended after legacy tags"
+    );
+    let decoded: MethodImpl = postcard::from_bytes(&encoded).unwrap();
+    assert_eq!(decoded, region);
+
+    let legacy = MethodImpl::MethodBody {
+        blocks: vec![],
+        locals: vec![],
+    };
+    assert_eq!(postcard::to_stdvec(&legacy).unwrap()[0], 0);
+    let lib = asm.alloc_string("legacy-lib");
+    assert_eq!(
+        postcard::to_stdvec(&MethodImpl::Extern {
+            lib,
+            preserve_errno: false,
+        })
+        .unwrap()[0],
+        1
+    );
+    let owner = asm.main_module();
+    let sig = asm.sig([], Type::Void);
+    let alias_name = asm.alloc_string("legacy-alias");
+    let alias = asm.alloc_methodref(MethodRef::new(
+        *owner,
+        alias_name,
+        sig,
+        MethodKind::Static,
+        vec![].into(),
+    ));
+    assert_eq!(
+        postcard::to_stdvec(&MethodImpl::AliasFor(alias)).unwrap()[0],
+        2
+    );
+    assert_eq!(postcard::to_stdvec(&MethodImpl::Missing).unwrap()[0], 3);
+}
+
+#[test]
+fn canonical_region_roots_are_mapped_and_typechecked_once() {
+    let mut asm = Assembly::default();
+    let owner = asm.main_module();
+    let sig = asm.sig([], Type::Void);
+    let name = asm.alloc_string("region_visit_once");
+    let mut method = MethodDef::new(
+        Access::Public,
+        owner,
+        name,
+        sig,
+        MethodKind::Static,
+        region_body_fixture(&mut asm),
+        vec![],
+    );
+    let mut visits = 0;
+    method.map_roots(
+        &mut asm,
+        &mut |root, _| {
+            visits += 1;
+            root
+        },
+        &mut |node, _| node,
+    );
+    assert_eq!(
+        visits, 2,
+        "normal and canonical cleanup roots are each visited once"
+    );
+    method.typecheck(&mut asm).unwrap();
+}
+
+#[test]
+fn typechecker_rejects_an_invalid_canonical_cleanup_root() {
+    let mut asm = Assembly::default();
+    let owner = asm.main_module();
+    let sig = asm.sig([], Type::Void);
+    let name = asm.alloc_string("invalid_cleanup_root");
+    let normal = asm.alloc_root(CILRoot::Nop);
+    let wrong_value = asm.alloc_node(crate::Const::I32(7));
+    let invalid_cleanup = asm.alloc_root(CILRoot::StLoc(0, wrong_value));
+    let local_type = asm.alloc_type(Type::Float(crate::Float::F32));
+    let mut method = MethodDef::new(
+        Access::Public,
+        owner,
+        name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::RegionBody {
+            blocks: vec![BasicBlock::new(vec![normal], 0, None)],
+            cleanup_blocks: vec![BasicBlock::new(vec![invalid_cleanup], 10, None)],
+            exception_regions: vec![ExceptionRegion::new(0, 10)],
+            locals: vec![(None, local_type)],
+        },
+        vec![],
+    );
+    assert!(method.typecheck(&mut asm).is_err());
+}
+
+#[test]
+fn malformed_exception_region_is_rejected_by_export_verification() {
+    let mut asm = Assembly::default();
+    let owner = asm.main_module();
+    let sig = asm.sig([], Type::Void);
+    let name = asm.alloc_string("invalid_region");
+    let mut body = region_body_fixture(&mut asm);
+    let MethodImpl::RegionBody {
+        exception_regions, ..
+    } = &mut body
+    else {
+        unreachable!()
+    };
+    exception_regions.push(ExceptionRegion::new(0, 10));
+    asm.new_method(MethodDef::new(
+        Access::Public,
+        owner,
+        name,
+        sig,
+        MethodKind::Static,
+        body,
+        vec![],
+    ));
+    let error = asm
+        .verify_for_export()
+        .err()
+        .expect("invalid region must fail");
+    assert!(matches!(
+        error.error,
+        crate::ir::typecheck::TypeCheckError::InvalidExceptionRegion { .. }
+    ));
+}
+
+#[test]
+fn structural_region_verifier_rejects_each_noncanonical_shape() {
+    let mut asm = Assembly::default();
+    let handler_root = asm.alloc_root(CILRoot::ReThrow);
+
+    let mut duplicate_ids = region_body_fixture(&mut asm);
+    let MethodImpl::RegionBody { cleanup_blocks, .. } = &mut duplicate_ids else {
+        unreachable!()
+    };
+    cleanup_blocks.push(BasicBlock::new(vec![handler_root], 10, None));
+    assert!(duplicate_ids.verify_exception_regions(&asm).is_err());
+
+    let mut duplicate_normal_ids = region_body_fixture(&mut asm);
+    let MethodImpl::RegionBody { blocks, .. } = &mut duplicate_normal_ids else {
+        unreachable!()
+    };
+    blocks.push(BasicBlock::new(vec![], 0, None));
+    assert!(duplicate_normal_ids.verify_exception_regions(&asm).is_err());
+
+    let mut overlapping_ids = region_body_fixture(&mut asm);
+    let MethodImpl::RegionBody { cleanup_blocks, .. } = &mut overlapping_ids else {
+        unreachable!()
+    };
+    cleanup_blocks[0] = BasicBlock::new(vec![handler_root], 0, None);
+    assert!(overlapping_ids.verify_exception_regions(&asm).is_err());
+
+    let mut missing_protected = region_body_fixture(&mut asm);
+    let MethodImpl::RegionBody {
+        exception_regions, ..
+    } = &mut missing_protected
+    else {
+        unreachable!()
+    };
+    exception_regions[0] = ExceptionRegion::new(99, 10);
+    assert!(missing_protected.verify_exception_regions(&asm).is_err());
+
+    let mut missing_handler = region_body_fixture(&mut asm);
+    let MethodImpl::RegionBody {
+        exception_regions, ..
+    } = &mut missing_handler
+    else {
+        unreachable!()
+    };
+    exception_regions[0] = ExceptionRegion::new(0, 99);
+    assert!(missing_handler.verify_exception_regions(&asm).is_err());
+
+    let mut embedded_handler = region_body_fixture(&mut asm);
+    let MethodImpl::RegionBody { blocks, .. } = &mut embedded_handler else {
+        unreachable!()
+    };
+    blocks[0] = BasicBlock::new(
+        blocks[0].roots().to_vec(),
+        0,
+        Some(vec![BasicBlock::new(vec![handler_root], 10, None)]),
+    );
+    assert!(embedded_handler.verify_exception_regions(&asm).is_err());
+
+    let mut invalid_subtarget = region_body_fixture(&mut asm);
+    let branch = asm.alloc_root(CILRoot::Branch(Box::new((10, 11, None))));
+    let MethodImpl::RegionBody { cleanup_blocks, .. } = &mut invalid_subtarget else {
+        unreachable!()
+    };
+    cleanup_blocks[0] = BasicBlock::new(vec![branch], 10, None);
+    assert!(invalid_subtarget.verify_exception_regions(&asm).is_err());
+
+    let mut cross_partition = region_body_fixture(&mut asm);
+    let branch = asm.alloc_root(CILRoot::Branch(Box::new((0, 0, None))));
+    let MethodImpl::RegionBody { cleanup_blocks, .. } = &mut cross_partition else {
+        unreachable!()
+    };
+    cleanup_blocks[0] = BasicBlock::new(vec![branch], 10, None);
+    assert!(cross_partition.verify_exception_regions(&asm).is_err());
 }

@@ -1,7 +1,7 @@
-use crate::utilis::classify_magic_fn;
 use crate::r#type::utilis::monomorphize;
-use rustc_middle::mir::{Terminator, UnwindAction, UnwindTerminateReason};
+use crate::utilis::classify_magic_fn;
 use rustc_middle::mir::{BasicBlock, BasicBlockData};
+use rustc_middle::mir::{Terminator, UnwindAction, UnwindTerminateReason};
 use rustc_middle::{
     mir::{BasicBlocks, Body, TerminatorKind},
     ty::{Instance, InstanceKind, TyCtxt},
@@ -36,7 +36,7 @@ pub(crate) fn handler_for_block<'tcx>(
 ) -> Option<u32> {
     let term = block_data.terminator.as_ref()?;
     let unwind = term.unwind()?;
-    if *crate::config::NO_UNWIND {
+    if crate::config::current().no_unwind() {
         return None;
     }
     // `UnwindAction::Terminate` has no MIR cleanup block to point at; route it to a SYNTHETIC
@@ -83,10 +83,7 @@ pub(crate) fn handler_for_block<'tcx>(
         // `Terminate(Abi)` edge (P2-S4) is left byte-identical: it keeps the synthetic-handler
         // route. We gate strictly on `is_cleanup` + `Drop` so no other Terminate edge is affected.
         if block_data.is_cleanup
-            && matches!(
-                term.kind,
-                rustc_middle::mir::TerminatorKind::Drop { .. }
-            )
+            && matches!(term.kind, rustc_middle::mir::TerminatorKind::Drop { .. })
         {
             return None;
         }
@@ -119,7 +116,7 @@ fn simplify_handler<'tcx>(
     method_instance: &Instance<'tcx>,
     method: &Body<'tcx>,
 ) -> Option<u32> {
-    if *crate::config::NO_UNWIND {
+    if crate::config::current().no_unwind() {
         return None;
     }
     let handler = handler?;

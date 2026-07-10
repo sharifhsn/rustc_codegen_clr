@@ -35,7 +35,7 @@ root rustc-facing modules rot. Most fixes are mechanical renames.
 
 ### MIR (`rustc_middle::mir`)
 - `Operand` gained `RuntimeChecks(RuntimeChecks)` — a compile-time bool (`checks.value(sess)`), e.g.
-  UB/overflow-check flags. Emit it as a bool const node: `V1Node::V2(ctx.alloc_node(value))`.
+  UB/overflow-check flags. Emit it directly as a bool const node: `ctx.alloc_node(value)`.
 - `Rvalue::Use(Operand)` → `Use(Operand, WithRetag)` (add `, _` to patterns).
 - `Rvalue::NullaryOp` **removed** — `size_of`/`align_of`/`offset_of` are now const intrinsics
   (arrive as `Operand::Constant`); `UbChecks`/`ContractChecks` are now `Operand::RuntimeChecks`.

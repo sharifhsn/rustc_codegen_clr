@@ -27,7 +27,7 @@ impl DerefMut for MethodBuilder<'_> {
 impl MethodBuilder<'_> {
     pub fn new_block(&mut self) -> BlockId {
         let MethodImpl::MethodBody { blocks, locals: _ } = self.def.implementation_mut() else {
-            panic!("Attempted to add a new basic block to a method with an invalid or unresolved body:{:?},",self.def.implementation());
+            panic!("MethodBuilder cannot append blocks to a canonical RegionBody: cleanup block ids and exception-region associations require explicit construction. Body: {:?}",self.def.implementation());
         };
         let block_id: BlockId = blocks.len().try_into().expect("Block cap exceeded!");
         blocks.push(BasicBlock::new(vec![], block_id, None));
@@ -41,8 +41,9 @@ impl MethodBuilder<'_> {
     ) -> LocalId {
         let name = name.map(|inner| inner.into_idx(self));
         let tpe = tpe.into_idx(self);
-        let MethodImpl::MethodBody { blocks: _, locals } = self.def.implementation_mut() else {
-            panic!("Attempted to add a local variable a method with an invalid or unresolved body:{:?},",self.def.implementation());
+        let locals = match self.def.implementation_mut() {
+            MethodImpl::MethodBody { locals, .. } | MethodImpl::RegionBody { locals, .. } => locals,
+            _ => panic!("Attempted to add a local variable a method with an invalid or unresolved body:{:?},",self.def.implementation()),
         };
         let new_local = locals.len();
         locals.push((name, tpe));

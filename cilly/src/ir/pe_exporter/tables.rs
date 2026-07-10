@@ -19,6 +19,7 @@
 use super::heaps::{write_compressed_u32, BlobHeap, GuidHeap, StringsHeap, UserStringHeap};
 use super::sig::{self, TypeDefOrRefResolver};
 use crate::ir::{Assembly, ClassRef, FieldDesc, Interned, MethodDefIdx, StaticFieldDesc, Type};
+use crate::DotnetRuntime;
 use std::collections::HashMap;
 
 /// A metadata token (§II.22.1.8): high byte is the table id, low 3 bytes are the 1-based row
@@ -84,7 +85,7 @@ impl Token {
 /// .publickeytoken = (…) }` for `bcl_public_key_token`-matched names) or a bare name-only
 /// reference (mirrors the `else` arm, used for a consumer's own non-BCL library).
 pub enum AssemblyRefTarget<'a> {
-    /// A BCL/framework assembly: `.ver` triplet (from `dotnet_version().assembly_ver()`) + the
+    /// A BCL/framework assembly: runtime-selected `.ver` triplet + the
     /// real public-key token for that assembly's signing family (see `bcl_public_key_token`) —
     /// NOT always the ECMA token; `Microsoft.Extensions.*`/`Microsoft.AspNetCore.*`/
     /// `Microsoft.EntityFrameworkCore*` carry a different one.
@@ -447,6 +448,11 @@ pub struct MetadataBuilder {
     /// `.exe` for the same source (whose `AssemblyRef` rows are all `0.0.0.0`, confirmed via a
     /// from-scratch metadata reader) against this exporter's `8.0.0.0`-stamped output.
     is_lib: bool,
+
+    /// Runtime surface used to version BCL/framework assembly references. Defaults to .NET 8 so
+    /// hand-built tests preserve their historical output; production export sets it explicitly
+    /// before creating any `AssemblyRef` rows.
+    runtime: DotnetRuntime,
 }
 
 /// The 64-bit `Valid`/`Sorted` bitmask position for each table id (§II.24.2.6: bit `N` set iff
@@ -489,7 +495,8 @@ fn write_u16_le(out: &mut Vec<u8>, v: u16) {
 /// (compressed length + raw bytes, §II.23.2) for strings; the primitive's raw little-endian bytes
 /// otherwise. Every shape has a fixed, unambiguous length, so this can never desynchronize the
 /// blob — see `CustomAttrDef`'s doc.
-fn encode_custom_attr_fixed_arg(out: &mut Vec<u8>, v: &crate::ir::class::CustomAttrArg, asm: &Assembly) {
+fn encode_custom_attr_fixed_arg(out: &mut Vec<u8>, v: &crate::ir::class::CustomAttrArg, asm: &Assembly,
+) {
     match v {
         crate::ir::class::CustomAttrArg::Str(s) => {
             let text = asm[*s].to_string();
@@ -539,6 +546,11 @@ impl MetadataBuilder {
         self.is_lib = is_lib;
     }
 
+    /// Sets the runtime surface used by subsequently created framework `AssemblyRef` rows.
+    pub fn set_runtime(&mut self, runtime: DotnetRuntime) {
+        self.runtime = runtime;
+    }
+
     /// Interns an `AssemblyRef` row (§II.22.5), returning its token. `name` is the `.NET`
     /// assembly identity (e.g. `"System.Runtime"`); `target` selects the BCL-versioned vs.
     /// name-only shape per `il_exporter`'s `bcl_public_key_token` split.
@@ -572,7 +584,12 @@ impl MetadataBuilder {
     /// assembly (`resolution_scope` is the token of the owning `AssemblyRef`/`ModuleRef`, or
     /// `None` for a nested/self-module reference). Mirrors `simple_class_ref`/`class_ref` in
     /// `il_exporter` (the `[assembly]'Name'` rendering).
-    pub fn type_ref(&mut self, resolution_scope: Option<Token>, namespace: &str, name: &str) -> Token {
+    pub fn type_ref(
+        &mut self,
+        resolution_scope: Option<Token>,
+        namespace: &str,
+        name: &str,
+    ) -> Token {
         let scope_bits = resolution_scope.map_or(0, |t| t.0);
         let key = (scope_bits, Box::from(namespace), Box::from(name));
         if let Some(&tok) = self.type_ref_cache.get(&key) {
@@ -788,8 +805,7 @@ impl MetadataBuilder {
         if let Some(offset) = offset {
             self.field_layout.push(FieldLayoutRow {
                 offset,
-                field: rid,
-            });
+                field: rid });
         }
         tok
     }
@@ -1457,10 +1473,8 @@ impl MetadataBuilder {
                 return Token::new(Token::TABLE_ASSEMBLY_REF, u32::try_from(i + 1).unwrap());
             }
         }
-        // `crate::ir::dotnet_version()` is a free function in this same crate (cilly), so no
-        // threading is needed — mirrors `il_exporter`'s `dv_ver = dotnet_version().assembly_ver()`
-        // (mod.rs:74). Uses the tuple sibling since `AssemblyRefRow`'s columns are raw `u16`s
-        // (§II.22.5), not the `"8:0:0:0"` string il_exporter interpolates into IL text.
+        // Uses the tuple form since `AssemblyRefRow`'s columns are raw `u16`s (§II.22.5), not the
+        // `"8:0:0:0"` string the textual exporter interpolates into IL.
         //
         // Gated on `self.is_lib` exactly like `il_exporter`'s `if self.is_lib { … }` (mod.rs:70):
         // an executable gets a name-only (`0.0.0.0`) reference — mirrors ilasm's own inferred-extern
@@ -1469,7 +1483,7 @@ impl MetadataBuilder {
         // `MetadataBuilder::is_lib`'s doc for the concrete `FileLoadException` this fixes.
         let target = if self.is_lib {
             AssemblyRefTarget::Bcl {
-                version: crate::ir::dotnet_version().assembly_ver_tuple(),
+                version: self.runtime.assembly_ver_tuple(),
                 token: ECMA_PUBLIC_KEY_TOKEN,
             }
         } else {
@@ -1521,7 +1535,8 @@ impl MetadataBuilder {
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
         let sizes = self.row_counts();
-        let widths = Widths::compute(&sizes, &self.strings, &self.blobs, &self.guids, &self.user_strings);
+        let widths = Widths::compute(&sizes, &self.strings, &self.blobs, &self.guids, &self.user_strings,
+        );
 
         let tables_bytes = self.serialize_tables(&sizes, &widths);
         let strings_bytes = pad4(self.strings.as_bytes());
@@ -2565,7 +2580,8 @@ impl MetadataBuilder {
     /// (§II.22.39) carrying the FULL `GENERICINST` blob instead — mirrors what `ilasm` builds
     /// under the hood whenever `il_exporter`'s textual `class 'Name'<T,…>` appears as a
     /// `newobj`/`MemberRef` operand.
-    pub(super) fn class_ref_token(&mut self, asm: &mut Assembly, cref: Interned<ClassRef>) -> Token {
+    pub(super) fn class_ref_token(&mut self, asm: &mut Assembly, cref: Interned<ClassRef>,
+    ) -> Token {
         if asm[cref].generics().is_empty() {
             let coded = self.type_def_or_ref(cref, asm);
             decode_type_def_or_ref(coded)
@@ -2607,7 +2623,8 @@ impl MetadataBuilder {
         let shortened = dotnet_class_name(name);
         for (i, row) in self.type_def.iter().enumerate() {
             if self.strings_eq(row.name, &shortened) && self.strings_eq(row.namespace, namespace) {
-                return Some(Token::new(Token::TABLE_TYPE_DEF, u32::try_from(i + 1).unwrap()));
+                return Some(Token::new(Token::TABLE_TYPE_DEF, u32::try_from(i + 1).unwrap(),
+                ));
             }
         }
         None
@@ -2627,12 +2644,10 @@ impl MetadataBuilder {
             }
         }
         let target = if let (Some(token), true) = (bcl_public_key_token(name), self.is_lib) {
-            // Same single source of truth as `system_runtime_assembly_ref`: `dotnet_version()` is
-            // reachable here with zero threading (free fn, same crate) — mirrors `il_exporter`'s
-            // `dv_ver`. Also gated on `self.is_lib` for the same reason `system_runtime_assembly_ref`
-            // is — see `MetadataBuilder::is_lib`'s doc.
+            // Same explicitly selected runtime as `system_runtime_assembly_ref`. Also gated on
+            // `self.is_lib` for the same reason — see `MetadataBuilder::is_lib`'s doc.
             AssemblyRefTarget::Bcl {
-                version: crate::ir::dotnet_version().assembly_ver_tuple(),
+                version: self.runtime.assembly_ver_tuple(),
                 token,
             }
         } else {
@@ -2807,7 +2822,8 @@ impl TokenSink for MetadataBuilder {
             } else {
                 crate::ir::FnSig::new(fnsig.inputs()[1..].to_vec(), *fnsig.output())
             };
-            sig::encode_method_sig(convention, generic_param_count, &encode_sig, asm, self, &mut blob);
+            sig::encode_method_sig(convention, generic_param_count, &encode_sig, asm, self, &mut blob,
+            );
             let sig_off = self.blobs.intern(&blob);
             self.member_ref(class_tok, &name, sig_off)
         };
@@ -2840,7 +2856,8 @@ impl TokenSink for MetadataBuilder {
         self.member_ref(class_tok, &name, sig_off)
     }
 
-    fn static_field_token(&mut self, asm: &mut Assembly, field: Interned<StaticFieldDesc>) -> Token {
+    fn static_field_token(&mut self, asm: &mut Assembly, field: Interned<StaticFieldDesc>,
+    ) -> Token {
         let desc = asm[field];
         let owner_in_asm = asm.class_ref_to_def(desc.owner()).is_some();
         if owner_in_asm {
@@ -3039,6 +3056,7 @@ mod tests {
         asm.new_method(mdef);
 
         let options = super::super::export::ExportOptions {
+            runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_iface".to_string(),
             module_name: "pe_iface.dll".to_string(),
@@ -3098,7 +3116,8 @@ mod tests {
         let sig = mb.blobs.intern(&[0x20, 0x00, 0x01]);
         let m: Vec<Token> = (0..6)
             .map(|i| {
-                mb.add_method(&format!("acc{i}"), sig, &[], &[], false, true, false, None, false)
+                mb.add_method(&format!("acc{i}"), sig, &[], &[], false, true, false, None, false,
+                )
             })
             .collect();
         let delegate = class_a; // any TypeDefOrRef-encodable token works as the event type
@@ -3143,6 +3162,7 @@ mod tests {
         asm.new_method(mdef);
 
         let options = super::super::export::ExportOptions {
+            runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_static_iface".to_string(),
             module_name: "pe_static_iface.dll".to_string(),
@@ -3274,6 +3294,7 @@ mod tests {
         ));
 
         let options = super::super::export::ExportOptions {
+            runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_iface_prop".to_string(),
             module_name: "pe_iface_prop.dll".to_string(),
@@ -3291,7 +3312,9 @@ mod tests {
         let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
         let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
         let count =
-            |id: u32| header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c);
+            |id: u32| {
+            header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c)
+        };
 
         // Both new tables are Valid; neither is in the Sorted bitmask (§II.24.2.6 — same
         // NOT-sorted status as EventMap/Event); MethodSemantics keeps its Sorted bit.
@@ -3386,7 +3409,8 @@ mod tests {
         let psig = mb.blobs.intern(&[0x28, 0x00, 0x08]);
         let m: Vec<Token> = (0..3)
             .map(|i| {
-                mb.add_method(&format!("get_P{i}"), msig, &[], &[], false, true, false, None, false)
+                mb.add_method(&format!("get_P{i}"), msig, &[], &[], false, true, false, None, false,
+                )
             })
             .collect();
         mb.add_property(class_a, "P0", psig, Some(m[0]), None);
@@ -3435,6 +3459,7 @@ mod tests {
         asm.new_method(mdef);
 
         let options = super::super::export::ExportOptions {
+            runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_generic_iface".to_string(),
             module_name: "pe_generic_iface.dll".to_string(),
@@ -3452,7 +3477,9 @@ mod tests {
         let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
         let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
         let count =
-            |id: u32| header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c);
+            |id: u32| {
+            header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c)
+        };
         let str_w = if header.heap_sizes & 0x1 != 0 { 4usize } else { 2 };
         let blob_w = if header.heap_sizes & 0x4 != 0 { 4usize } else { 2 };
         let str_at = |o: usize| -> u32 {
@@ -3545,6 +3572,7 @@ mod tests {
         asm.new_method(mdef);
 
         let options = super::super::export::ExportOptions {
+            runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_generic_method".to_string(),
             module_name: "pe_generic_method.dll".to_string(),
@@ -3562,7 +3590,9 @@ mod tests {
         let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
         let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
         let count =
-            |id: u32| header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c);
+            |id: u32| {
+            header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c)
+        };
         let str_w = if header.heap_sizes & 0x1 != 0 { 4usize } else { 2 };
         let blob_w = if header.heap_sizes & 0x4 != 0 { 4usize } else { 2 };
         let str_at = |o: usize| -> u32 {
@@ -3625,7 +3655,8 @@ mod tests {
         // non-virtual methods with bodies), so the interface stays the only TypeDef (rid 2,
         // deterministic — class-def iteration is hash-ordered with 2+ classes).
         let inst =
-            asm.alloc_class_ref(ClassRef::new(iname, None, false, [Type::Int(Int::I32)].into()));
+            asm.alloc_class_ref(ClassRef::new(iname, None, false, [Type::Int(Int::I32)].into(),
+        ));
         let mname = asm.alloc_string("UseBox");
         let msig = asm.sig([Type::ClassRef(inst)], Type::Void);
         let ret = asm.alloc_root(CILRoot::VoidRet);
@@ -3644,6 +3675,7 @@ mod tests {
         asm.new_method(mdef);
 
         let options = super::super::export::ExportOptions {
+            runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_generic_iface_inst".to_string(),
             module_name: "pe_generic_iface_inst.dll".to_string(),
@@ -3661,7 +3693,9 @@ mod tests {
         let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
         let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
         let count =
-            |id: u32| header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c);
+            |id: u32| {
+            header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c)
+        };
         let str_w = if header.heap_sizes & 0x1 != 0 { 4usize } else { 2 };
         let blob_w = if header.heap_sizes & 0x4 != 0 { 4usize } else { 2 };
 
@@ -3762,6 +3796,7 @@ mod tests {
         asm.new_method(dim_def);
 
         let options = super::super::export::ExportOptions {
+            runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_dim".to_string(),
             module_name: "pe_dim.dll".to_string(),
@@ -3835,6 +3870,7 @@ mod tests {
         asm.new_method(mdef);
 
         let options = super::super::export::ExportOptions {
+            runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_byref_out".to_string(),
             module_name: "pe_byref_out.dll".to_string(),
@@ -3938,6 +3974,7 @@ mod tests {
             .add_event(EventDef::new(ev_name, delegate_ty, add_mref, remove_mref));
 
         let options = super::super::export::ExportOptions {
+            runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_iface_event".to_string(),
             module_name: "pe_iface_event.dll".to_string(),
@@ -3958,7 +3995,10 @@ mod tests {
             header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c)
         };
         let str_w = if header.heap_sizes & 0x1 != 0 { 4 } else { 2 };
-        let idx_at = |o: usize, wide: bool| if wide { u32_at(o) } else { u32::from(u16_at(o)) };
+        let idx_at = |o: usize, wide: bool| {
+            if wide { u32_at(o) } else { u32::from(u16_at(o))
+            }
+        };
 
         // --- The accessor MethodDef rows (rids 1 and 2 — the only methods in the assembly).
         // RVA is the first 4 bytes; Flags is a u16 at offset 6 (after RVA(4) + ImplFlags(2)).
@@ -4038,14 +4078,16 @@ mod tests {
         let base_name = asm.alloc_string("IBase");
         let base_idx = asm
             .class_def(
-                ClassDef::new(base_name, false, 0, None, vec![], vec![], Access::Public, None, None, true)
+                ClassDef::new(base_name, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+                )
                     .with_interface(),
             )
             .unwrap();
         let derived_name = asm.alloc_string("IDerived");
         let derived_idx = asm
             .class_def(
-                ClassDef::new(derived_name, false, 0, None, vec![], vec![], Access::Public, None, None, true)
+                ClassDef::new(derived_name, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+                )
                     .with_interface(),
             )
             .unwrap();
@@ -4053,6 +4095,7 @@ mod tests {
         asm.class_mut(derived_idx).add_interface(*base_idx);
 
         let options = super::super::export::ExportOptions {
+            runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_iface_inherit".to_string(),
             module_name: "pe_iface_inherit.dll".to_string(),
@@ -4070,8 +4113,13 @@ mod tests {
         let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
         let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
         let count =
-            |id: u32| header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c);
-        let idx_at = |o: usize, wide: bool| if wide { u32_at(o) } else { u32::from(u16_at(o)) };
+            |id: u32| {
+            header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c)
+        };
+        let idx_at = |o: usize, wide: bool| {
+            if wide { u32_at(o) } else { u32::from(u16_at(o))
+            }
+        };
         let str_w = if header.heap_sizes & 0x1 != 0 { 4usize } else { 2 };
 
         // Map TypeDef rids to names (`class_def_ids` is a hash-order snapshot, so whether IBase
@@ -4137,6 +4185,7 @@ mod tests {
         asm.class_mut(cls_idx).add_interface(missing);
 
         let options = super::super::export::ExportOptions {
+            runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_iface_missing".to_string(),
             module_name: "pe_iface_missing.dll".to_string(),
@@ -4169,6 +4218,7 @@ mod tests {
         asm.class_mut(cls_idx).add_interface(*base_idx);
 
         let options = super::super::export::ExportOptions {
+            runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_iface_notiface".to_string(),
             module_name: "pe_iface_notiface.dll".to_string(),
@@ -4210,12 +4260,17 @@ mod tests {
 
             let mut streams = HashMap::new();
             for _ in 0..n_streams {
-                let offset = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-                let size = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+                let offset =
+                    u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+                let size =
+                    u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
                 cursor += 8;
                 let name_start = cursor;
-                let name_end = bytes[name_start..].iter().position(|&b| b == 0).unwrap() + name_start;
-                let name = std::str::from_utf8(&bytes[name_start..name_end]).unwrap().to_string();
+                let name_end =
+                    bytes[name_start..].iter().position(|&b| b == 0).unwrap() + name_start;
+                let name = std::str::from_utf8(&bytes[name_start..name_end])
+                    .unwrap()
+                    .to_string();
                 let mut name_len = name_end - name_start + 1;
                 while name_len % 4 != 0 {
                     name_len += 1;
@@ -4241,7 +4296,9 @@ mod tests {
             let str_w = w(hs & 0x1 != 0);
             let blob_w = w(hs & 0x4 != 0);
             let guid_w = w(hs & 0x2 != 0);
-            let count = |id: u32| header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c);
+            let count = |id: u32| {
+                header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c)
+            };
             let simple_w = |rows: usize| w(rows > 0xFFFF);
             // Mirrors this module's own `coded_wide` exactly (§II.24.2.6: `>=`, not `>` — see its
             // doc comment for why the threshold row count itself already needs a wide column).
@@ -4266,7 +4323,9 @@ mod tests {
                         + simple_w(count(Token::TABLE_METHOD_DEF))
                 }
                 Token::TABLE_FIELD => 2 + str_w + blob_w,
-                Token::TABLE_METHOD_DEF => 4 + 2 + 2 + str_w + blob_w + simple_w(count(Token::TABLE_PARAM)),
+                Token::TABLE_METHOD_DEF => {
+                    4 + 2 + 2 + str_w + blob_w + simple_w(count(Token::TABLE_PARAM))
+                }
                 Token::TABLE_PARAM => 2 + 2 + str_w,
                 Token::TABLE_INTERFACE_IMPL => {
                     let tdor_max = count(Token::TABLE_TYPE_DEF)
@@ -4460,7 +4519,10 @@ mod tests {
 
         let reader = MetadataReader::parse(&bytes);
         let header = reader.tables_header();
-        assert_eq!(header.heap_sizes, 0, "small tables: no wide heap indices needed");
+        assert_eq!(
+            header.heap_sizes, 0,
+            "small tables: no wide heap indices needed"
+        );
 
         let expected_valid_tables = [
             Token::TABLE_MODULE,
@@ -4471,9 +4533,15 @@ mod tests {
             Token::TABLE_ASSEMBLY_REF,
         ];
         for id in expected_valid_tables {
-            assert!(header.valid & (1u64 << id) != 0, "table {id:#x} should be Valid");
+            assert!(
+                header.valid & (1u64 << id) != 0,
+                "table {id:#x} should be Valid"
+            );
         }
-        assert_eq!(header.sorted, 0, "no sorted tables populated in this tiny module");
+        assert_eq!(
+            header.sorted, 0,
+            "no sorted tables populated in this tiny module"
+        );
 
         let counts: HashMap<u32, usize> = header.counts.into_iter().collect();
         assert_eq!(counts[&Token::TABLE_MODULE], 1);
@@ -4496,7 +4564,8 @@ mod tests {
         let type_ref_start = 10;
         // TypeRef: ResolutionScope(2, coded) + Name(2) + Namespace(2) = 6 bytes.
         let type_ref_name_off =
-            u16::from_le_bytes(row_bytes[type_ref_start + 2..type_ref_start + 4].try_into().unwrap());
+            u16::from_le_bytes(row_bytes[type_ref_start + 2..type_ref_start + 4].try_into().unwrap(),
+        );
         assert_eq!(reader.strings_at(u32::from(type_ref_name_off)), "Console");
 
         // TypeDef rows come after TypeRef (1 row * 6 bytes). Row 1 (the `<Module>` pseudo-type)
@@ -4505,11 +4574,13 @@ mod tests {
         // TypeDef: Flags(4) + Name(2) + Namespace(2) + Extends(2, coded) + FieldList(2) +
         // MethodList(2) = 14 bytes.
         let module_pseudo_type_name_off =
-            u16::from_le_bytes(row_bytes[type_def_start + 4..type_def_start + 6].try_into().unwrap());
+            u16::from_le_bytes(row_bytes[type_def_start + 4..type_def_start + 6].try_into().unwrap(),
+        );
         assert_eq!(reader.strings_at(u32::from(module_pseudo_type_name_off)), "<Module>");
         let my_type_start = type_def_start + 14;
         let type_def_name_off =
-            u16::from_le_bytes(row_bytes[my_type_start + 4..my_type_start + 6].try_into().unwrap());
+            u16::from_le_bytes(row_bytes[my_type_start + 4..my_type_start + 6].try_into().unwrap(),
+        );
         assert_eq!(reader.strings_at(u32::from(type_def_name_off)), "MyType");
         let method_list = u16::from_le_bytes(
             row_bytes[my_type_start + 10..my_type_start + 12]
@@ -4580,7 +4651,8 @@ mod tests {
         // Assembly: HashAlgId(4) + MajorVersion(2) + MinorVersion(2) + BuildNumber(2) +
         // RevisionNumber(2) + Flags(4) + PublicKey(2, blob) + Name(2) = offset 18 for Name.
         let assembly_name_off =
-            u16::from_le_bytes(row_bytes[assembly_start + 18..assembly_start + 20].try_into().unwrap());
+            u16::from_le_bytes(row_bytes[assembly_start + 18..assembly_start + 20].try_into().unwrap(),
+        );
         assert_eq!(
             reader.strings_at(u32::from(assembly_name_off)),
             "_",
@@ -4894,23 +4966,14 @@ mod tests {
         assert_eq!(mb.assembly_ref[1].public_key_or_token, 0, "name-only ref carries no token");
     }
 
-    /// `system_runtime_assembly_ref` (the bootstrap `System.Runtime` ref backing
-    /// `thread_static_ctor_ref`/`system_runtime_type_ref`) and `find_or_create_assembly_ref`'s
-    /// BCL branch both stamp the `AssemblyRef.MajorVersion..RevisionNumber` columns from
-    /// `crate::ir::dotnet_version()` — the single source of truth `il_exporter` also reads
-    /// (`dv_ver = dotnet_version().assembly_ver()`, mod.rs:74) — rather than a crate-local
-    /// hardcoded `(8, 0, 0, 0)` literal, WHEN `is_lib` is set (mirrors `il_exporter`'s `if
-    /// self.is_lib { … }` gate — an executable gets name-only/`0.0.0.0` refs instead, see
-    /// `MetadataBuilder::is_lib`'s doc). This asserts the threading, not a specific version
-    /// number: the test process has no `DOTNET_VERSION` env var set, so `dotnet_version()`
-    /// resolves to the `Net8` default, and both call sites must agree with whatever that
-    /// resolves to (proving they consult it, rather than merely happening to match by
-    /// coincidence with a stale literal).
+    /// Both BCL-reference paths must consume the builder's explicit runtime rather than a process
+    /// global or a hardcoded .NET 8 literal.
     #[test]
-    fn bcl_assembly_refs_are_stamped_from_dotnet_version_not_a_hardcoded_literal() {
-        let expected = crate::ir::dotnet_version().assembly_ver_tuple();
+    fn bcl_assembly_refs_are_stamped_from_the_explicit_runtime() {
+        let expected = DotnetRuntime::Net9.assembly_ver_tuple();
 
         let mut mb = MetadataBuilder::new();
+        mb.set_runtime(DotnetRuntime::Net9);
         mb.set_is_lib(true);
         let sys_runtime_tok = mb.find_or_create_assembly_ref("System.Runtime");
         let row = &mb.assembly_ref[(sys_runtime_tok.rid() - 1) as usize];
@@ -4919,6 +4982,7 @@ mod tests {
         // A second, distinct BCL name via the same helper must agree too (not a fluke of caching
         // the first lookup).
         let mut mb2 = MetadataBuilder::new();
+        mb2.set_runtime(DotnetRuntime::Net9);
         mb2.set_is_lib(true);
         let intrinsics_tok = mb2.find_or_create_assembly_ref("System.Runtime.Intrinsics");
         let row2 = &mb2.assembly_ref[(intrinsics_tok.rid() - 1) as usize];
@@ -4929,6 +4993,7 @@ mod tests {
         // static field, which routes through `thread_static_attribute` -> `thread_static_ctor_ref`
         // -> `system_runtime_assembly_ref`.
         let mut mb3 = MetadataBuilder::new();
+        mb3.set_runtime(DotnetRuntime::Net9);
         mb3.set_is_lib(true);
         let field = mb3.add_static_field("TLS", 0, None, true, false);
         let _ = field;
@@ -4938,7 +5003,7 @@ mod tests {
     }
 
     /// The `is_lib` gate itself (not just that the version, when stamped, comes from
-    /// `dotnet_version()`): an executable-shaped builder (`is_lib` left at its `false` default)
+    /// runtime): an executable-shaped builder (`is_lib` left at its `false` default)
     /// must produce NAME-ONLY/`0.0.0.0` `AssemblyRef` rows for BCL assemblies too — mirrors
     /// `il_exporter`'s executable path, which emits no `.assembly extern` headers at all and lets
     /// `ilasm` infer unversioned externs. This is the regression test for the concrete
@@ -5120,7 +5185,8 @@ mod tests {
         let owner_name = asm.alloc_string("Foo");
         let owner = asm.alloc_class_ref(ClassRef::new(owner_name, None, false, [].into()));
         let method_name = asm.alloc_string("Bar");
-        let fn_sig = asm.sig([Type::ClassRef(owner), Type::Int(crate::ir::Int::I32)], Type::Bool);
+        let fn_sig = asm.sig([Type::ClassRef(owner), Type::Int(crate::ir::Int::I32)], Type::Bool,
+        );
         let mref = asm.alloc_methodref(crate::ir::MethodRef::new(
             owner,
             method_name,
@@ -5169,7 +5235,8 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "Extern", false, None, None, None, &[]);
-        let _m = mb.add_method("libc_call", sig_blob, &[], &[], true, false, false, Some(("libc", true)), false);
+        let _m = mb.add_method("libc_call", sig_blob, &[], &[], true, false, false, Some(("libc", true)), false,
+        );
         assert_eq!(mb.impl_map.len(), 1);
         assert_eq!(mb.module_ref.len(), 1);
         assert_eq!(mb.impl_map[0].mapping_flags & 0x40, 0x40, "SupportsLastError set");
@@ -5239,8 +5306,10 @@ mod tests {
         };
         mb.set_type_def_method_list(a);
         mb.set_type_def_method_list(b);
-        mb.add_method("b_m0", method_sig, &[], &[], true, false, false, None, false);
-        mb.add_method("b_m1", method_sig, &[], &[], true, false, false, None, false);
+        mb.add_method("b_m0", method_sig, &[], &[], true, false, false, None, false,
+        );
+        mb.add_method("b_m1", method_sig, &[], &[], true, false, false, None, false,
+        );
 
         let a_row = &mb.type_def[(a.rid() - 1) as usize];
         let b_row = &mb.type_def[(b.rid() - 1) as usize];
@@ -5533,7 +5602,8 @@ mod tests {
         let iqueryable_of_mvar0 =
             asm.alloc_class_ref(ClassRef::new(iqueryable_name, None, false, [mvar0].into()));
         let method_name = asm.alloc_string("Count");
-        let fn_sig = asm.sig([Type::ClassRef(iqueryable_of_mvar0)], Type::Int(crate::ir::Int::I32));
+        let fn_sig = asm.sig([Type::ClassRef(iqueryable_of_mvar0)], Type::Int(crate::ir::Int::I32),
+        );
         let mref = asm.alloc_methodref(crate::ir::MethodRef::new(
             owner,
             method_name,
@@ -5544,7 +5614,8 @@ mod tests {
 
         // The call site's instantiation: `Count<int32>`.
         let generic_args = [Type::Int(crate::ir::Int::I32)];
-        let tok = TokenSink::method_token(&mut mb, &mut asm, MethodDefIdx::from_raw(mref), &generic_args);
+        let tok = TokenSink::method_token(&mut mb, &mut asm, MethodDefIdx::from_raw(mref), &generic_args,
+        );
         assert_eq!(tok.table(), Token::TABLE_METHOD_SPEC, "call site wraps the base in a MethodSpec");
 
         // Unwrap the MethodSpec to inspect the base MemberRef's OWN signature (not the
@@ -5666,7 +5737,8 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "MainModule", false, None, None, None, &[]);
-        let tok = mb.add_method(".tcctor", sig_blob, &[], &[], true, false, false, None, false);
+        let tok = mb.add_method(".tcctor", sig_blob, &[], &[], true, false, false, None, false,
+        );
         let row = &mb.method_def[(tok.rid() - 1) as usize];
         assert_eq!(row.flags & (0x1000 | 0x0800), 0);
     }
@@ -5751,7 +5823,8 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "MainModule", false, None, None, None, &[]);
-        let tok = mb.add_method("NotInlined", sig_blob, &[], &[], true, false, false, None, false);
+        let tok = mb.add_method("NotInlined", sig_blob, &[], &[], true, false, false, None, false,
+        );
         let row = &mb.method_def[(tok.rid() - 1) as usize];
         assert_eq!(
             row.impl_flags, 0,

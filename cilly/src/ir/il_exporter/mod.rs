@@ -32,6 +32,7 @@ mod partition;
 pub struct ILExporter {
     flavour: IlasmFlavour,
     is_lib: bool,
+    runtime: crate::DotnetRuntime,
     /// The .NET assembly name to emit in the `.assembly` directive. `None` keeps the legacy `_`
     /// placeholder (used for executables, where the assembly is loaded by file path via the native
     /// launcher and the name is irrelevant). A library passes its crate name here so C# can reference
@@ -56,10 +57,18 @@ impl ILExporter {
         Self {
             flavour,
             is_lib,
+            runtime: crate::DotnetRuntime::Net8,
             asm_name,
             terminate_region_label: std::cell::Cell::new(0),
             partition: std::cell::RefCell::new(None),
         }
+    }
+
+    /// Selects the .NET runtime surface stamped into emitted framework references.
+    #[must_use]
+    pub fn with_runtime(mut self, runtime: crate::DotnetRuntime) -> Self {
+        self.runtime = runtime;
+        self
     }
 
     fn export_to_write(&self, asm: &super::Assembly, out: &mut impl Write) -> std::io::Result<()> {
@@ -79,8 +88,8 @@ impl ILExporter {
         if self.is_lib {
             // The BCL `.ver` triplet tracks the target .NET version (8:0:0:0 / 9:0:0:0); the
             // public-key tokens are version-INVARIANT (verified identical on 8 and 9), and mscorlib
-            // keeps its legacy 4:0:0:0. Single source: `DotnetVersion::assembly_ver`.
-            let dv_ver = crate::ir::dotnet_version().assembly_ver();
+            // keeps its legacy 4:0:0:0. Single source: `DotnetRuntime::assembly_ver`.
+            let dv_ver = self.runtime.assembly_ver();
             // Normalize each extern name to its public REFERENCE assembly (CoreLib/mscorlib ->
             // System.Runtime) BEFORE stamping, and de-dup so a CoreLib entry collapses into the
             // single `System.Runtime` extern instead of emitting both a phantom CoreLib header and
@@ -572,15 +581,11 @@ impl ILExporter {
             // unlike an instance abstract). NOTE: Mono ilasm predates .NET 7 static virtuals and
             // may reject this keyword combination — acceptable, `il_exporter` is only exercised
             // at `DIRECT_PE=0` (parity is nice-to-have; the PE writer is the default path).
-            crate::cilnode::MethodKind::Static if method.is_abstract() => {
-                "abstract virtual static"
-            }
+            crate::cilnode::MethodKind::Static if method.is_abstract() => "abstract virtual static",
             // `MethodDef::is_special_name` (a CLR operator-overload method, e.g. `op_Addition` —
             // see that field's doc): `specialname` is what makes Roslyn bind `+`/`==`/etc. syntax
             // to it, matching the PE writer's own `mark_method_special_name` call for the same flag.
-            crate::cilnode::MethodKind::Static if method.is_special_name() => {
-                "specialname static"
-            }
+            crate::cilnode::MethodKind::Static if method.is_special_name() => "specialname static",
             crate::cilnode::MethodKind::Static => "static",
             crate::cilnode::MethodKind::Instance => "instance",
             // An interface member (`MethodDef::is_abstract`) needs the `newslot abstract` flags
@@ -756,6 +761,19 @@ impl ILExporter {
                 })
                 .max()
                 .unwrap_or(0),
+            MethodImpl::RegionBody {
+                blocks,
+                cleanup_blocks,
+                ..
+            } => blocks
+                .iter()
+                .chain(cleanup_blocks)
+                .flat_map(|block| block.roots().iter())
+                .map(|root| {
+                    crate::CILIter::new(asm_mut.get_root(*root).clone(), asm_mut).count() + 10
+                })
+                .max()
+                .unwrap_or(0),
             MethodImpl::Extern { .. } => 0,
             MethodImpl::AliasFor(_) => todo!(),
             MethodImpl::Missing => 3,
@@ -801,6 +819,13 @@ impl ILExporter {
         name: &str,
         sig: Interned<FnSig>,
     ) -> std::io::Result<()> {
+        if matches!(mimpl, MethodImpl::RegionBody { .. }) {
+            let (blocks, locals) = mimpl
+                .materialize_legacy_body(asm)
+                .expect("region body must materialize");
+            let legacy = MethodImpl::MethodBody { blocks, locals };
+            return self.export_method_imp(asm, out, &legacy, name, sig);
+        }
         match  mimpl{
             MethodImpl::MethodBody { blocks, locals } => {
                 let locals_string:String = locals.iter().map(|(name,tpe)|match name {
@@ -846,6 +871,7 @@ impl ILExporter {
                 panic!("resolved_implementation returned `AliasFor`")
             }
             MethodImpl::Missing =>writeln!(out,"ldstr \"missing methiod {name}\"\n newobj void [System.Runtime] System.Exception::.ctor(string)\n throw")?,
+            MethodImpl::RegionBody { .. } => unreachable!(),
         };
         Ok(())
     }
@@ -2351,33 +2377,11 @@ fn type_il_signature(tpe: &Type, asm: &Assembly) -> String {
     }
 }
 
-/// Cached runtime configuration string, obtained from calling the .NET runtime.
+/// Builds a runtime configuration for an explicitly selected .NET runtime surface.
 #[must_use]
-pub fn get_runtime_config() -> &'static str {
-    RUNTIME_CONFIG.as_ref()
-}
-
-/// Cached runtime configuration file, obtained from calling the .NET runtime.
-static RUNTIME_CONFIG: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    let info = std::process::Command::new("dotnet")
-        .arg("--info")
-        .output()
-        .expect("Could not run `dotnet --info`");
-    if !info.stderr.is_empty() {
-        let stderr = std::str::from_utf8(&info.stderr).expect("Error message not utf8");
-        panic!("dotnet --info panicked with {stderr}")
-    }
-    let info = std::str::from_utf8(&info.stdout).expect("Error message not utf8");
-    let version_start = info.find("Host:").unwrap_or_default();
-    let version_start = version_start + info[version_start..].find("Version:").unwrap();
-    let version_start = version_start + "Version:".len();
-    let version_end = info.find("Architecture:").unwrap();
-    let version = &info[version_start..version_end].trim();
-    // TFM tracks the target .NET version (default net8.0); the framework version stays the live
-    // host scrape — this config feeds the `::stable` test harness (compile_test.rs), which always
-    // runs the default Net8, so this is byte-identical there. (The cargo-dotnet *bin* path uses the
-    // linker's jumpstart runtimeconfig, which is version-parameterised separately.)
-    let tfm = crate::ir::dotnet_version().tfm();
+pub fn get_runtime_config(runtime: crate::DotnetRuntime) -> String {
+    let tfm = runtime.tfm();
+    let version = runtime.framework_version();
     format!(
         "{{
         \"runtimeOptions\": {{
@@ -2393,4 +2397,73 @@ static RUNTIME_CONFIG: std::sync::LazyLock<String> = std::sync::LazyLock::new(||
         }}
       }}"
     )
-});
+}
+
+/// Cached default `.NET 8` runtime configuration for legacy callers and small tools.
+#[must_use]
+pub fn get_default_runtime_config() -> &'static str {
+    DEFAULT_RUNTIME_CONFIG.as_str()
+}
+
+static DEFAULT_RUNTIME_CONFIG: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| get_runtime_config(crate::DotnetRuntime::Net8));
+
+#[cfg(test)]
+mod region_body_compat_tests {
+    use super::*;
+    use crate::ir::{BasicBlock, ExceptionRegion, MethodImpl};
+
+    #[test]
+    fn exporter_runtime_defaults_to_net8_and_can_be_overridden() {
+        let exporter = ILExporter::new(IlasmFlavour::Clasic, true, None);
+        assert_eq!(exporter.runtime, crate::DotnetRuntime::Net8);
+        assert_eq!(
+            exporter.with_runtime(crate::DotnetRuntime::Net9).runtime,
+            crate::DotnetRuntime::Net9
+        );
+    }
+
+    #[test]
+    fn runtime_config_uses_the_explicit_runtime() {
+        let config = get_runtime_config(crate::DotnetRuntime::Net9);
+        assert!(config.contains("\"tfm\": \"net9.0\""));
+        assert!(config.contains("\"version\": \"9.0.0\""));
+    }
+
+    #[test]
+    fn region_body_uses_the_exact_legacy_il_handler_shape() {
+        let mut asm = Assembly::default();
+        let sig = asm.sig([], Type::Void);
+        let to_next = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        let rethrow = asm.alloc_root(CILRoot::ReThrow);
+        let cleanup = vec![BasicBlock::new(vec![rethrow], 10, None)];
+
+        let mut legacy_protected = BasicBlock::new_raw(vec![to_next], 0, Some(10));
+        legacy_protected.resolve_exception_handlers(&cleanup, &mut asm);
+        let legacy = MethodImpl::MethodBody {
+            blocks: vec![legacy_protected, BasicBlock::new(vec![ret], 1, None)],
+            locals: vec![],
+        };
+        let canonical = MethodImpl::RegionBody {
+            blocks: vec![
+                BasicBlock::new(vec![to_next], 0, None),
+                BasicBlock::new(vec![ret], 1, None),
+            ],
+            cleanup_blocks: cleanup,
+            exception_regions: vec![ExceptionRegion::new(0, 10)],
+            locals: vec![],
+        };
+
+        let exporter = ILExporter::new(IlasmFlavour::Clasic, true, None);
+        let mut legacy_il = Vec::new();
+        exporter
+            .export_method_imp(&mut asm, &mut legacy_il, &legacy, "compat", sig)
+            .unwrap();
+        let mut canonical_il = Vec::new();
+        exporter
+            .export_method_imp(&mut asm, &mut canonical_il, &canonical, "compat", sig)
+            .unwrap();
+        assert_eq!(canonical_il, legacy_il);
+    }
+}

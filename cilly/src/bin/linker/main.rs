@@ -8,14 +8,13 @@
 #![deny(unused_must_use)]
 #![allow(clippy::module_name_repetitions)]
 use cilly::{
-    config,
     libc_fns::{self, LIBC_FNS, LIBC_MODIFIES_ERRNO},
     DEAD_CODE_ELIMINATION,
     {
         asm::{MissingMethodPatcher, ILASM_FLAVOUR},
         cilnode::MethodKind,
-        Assembly, BasicBlock, BuildConfig, BuildConfigMismatch, CILNode, CILRoot, ClassDef,
-        ClassRef, Const, IlasmFlavour, Int, MethodImpl, Type,
+        ArtifactAbiConfig, ArtifactAbiConfigMismatch, Assembly, BasicBlock, CILNode, CILRoot, ClassDef,
+        ClassRef, Const, DotnetRuntime, IlasmFlavour, Int, MethodImpl, OutputTarget, Type,
     },
 };
 mod load;
@@ -24,24 +23,177 @@ mod patch;
 use fxhash::FxHashMap;
 use patch::call_alias;
 use std::{
+    collections::HashMap,
     env,
+    ffi::{OsStr, OsString},
     io::Write,
     num::NonZeroU32,
     path::{Path, PathBuf},
 };
 mod aot;
 
-fn effective_build_config(
-    artifact_config: Option<BuildConfig>,
-    linker_config: BuildConfig,
-) -> Result<BuildConfig, BuildConfigMismatch> {
+fn effective_abi_config(
+    artifact_config: Option<ArtifactAbiConfig>,
+    process_config: ArtifactAbiConfig,
+) -> Result<ArtifactAbiConfig, ArtifactAbiConfigMismatch> {
     match artifact_config {
         Some(artifact_config) => {
-            artifact_config.ensure_compatible(&linker_config)?;
+            artifact_config.ensure_compatible(&process_config)?;
             Ok(artifact_config)
         }
-        None => Ok(linker_config),
+        None => Ok(process_config),
     }
+}
+
+/// Process-local final-link policy, parsed once and never serialized into crate artifacts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LinkerConfig {
+    process_abi: ArtifactAbiConfig,
+    target: OutputTarget,
+    guaranteed_align: u8,
+    pool_alloc: bool,
+    panic_managed_backtrace: bool,
+    native_passthrough: bool,
+    direct_pe: bool,
+}
+
+impl LinkerConfig {
+    fn capture() -> Result<Self, String> {
+        const SETTINGS: &[&str] = &[
+            "ASCI_IDENT",
+            "C_MODE",
+            "DIRECT_PE",
+            "DOTNET_VERSION",
+            "GUARANTEED_ALIGN",
+            "JAVA_MODE",
+            "JS_MODE",
+            "MAX_STATIC_SIZE",
+            "NATIVE_PASSTHROUGH",
+            "NATIVE_PASSTROUGH",
+            "NO_UNWIND",
+            "PANIC_MANAGED_BT",
+            "POOL_ALLOC",
+        ];
+        let snapshot: HashMap<OsString, OsString> = std::env::vars_os().collect();
+        let environment: HashMap<String, String> = SETTINGS
+            .iter()
+            .filter_map(|name| snapshot.get(OsStr::new(name)).map(|value| (*name, value)))
+            .map(|(name, value)| {
+                value
+                    .to_str()
+                    .map(|value| (name.to_owned(), value.to_owned()))
+                    .ok_or_else(|| format!("environment setting {name} is not valid Unicode"))
+            })
+            .collect::<Result<_, _>>()?;
+        Self::from_environment(&environment)
+    }
+
+    fn from_environment(environment: &HashMap<String, String>) -> Result<Self, String> {
+        for (retired, replacement) in [
+            ("ASCI_IDENT", Some("ASCII_IDENTS")),
+            ("JS_MODE", Some("JAVA_MODE")),
+            ("MAX_STATIC_SIZE", None),
+        ] {
+            if environment.contains_key(retired) {
+                return Err(match replacement {
+                    Some(replacement) => {
+                        format!("retired setting {retired}; use {replacement} instead")
+                    }
+                    None => format!("retired no-op setting {retired}; remove it"),
+                });
+            }
+        }
+
+        let c_mode = linker_bool(environment, "C_MODE", false)?;
+        let java_mode = linker_bool(environment, "JAVA_MODE", false)?;
+        let target = match (c_mode, java_mode) {
+            (false, false) => OutputTarget::DotNet,
+            (true, false) => OutputTarget::C,
+            (false, true) => OutputTarget::Java,
+            (true, true) => {
+                return Err(
+                    "conflicting output modes: C_MODE and JAVA_MODE; enable at most one".into(),
+                );
+            }
+        };
+
+        let native_passthrough = linker_bool_alias(
+            environment,
+            "NATIVE_PASSTHROUGH",
+            "NATIVE_PASSTROUGH",
+            false,
+        )?;
+        let guaranteed_align = linker_number(environment, "GUARANTEED_ALIGN", 8_u8)?;
+        if !guaranteed_align.is_power_of_two() {
+            return Err(format!(
+                "GUARANTEED_ALIGN must be a nonzero power of two, found {guaranteed_align}"
+            ));
+        }
+
+        Ok(Self {
+            process_abi: ArtifactAbiConfig::from_environment(environment)
+                .map_err(|error| error.to_string())?,
+            target,
+            guaranteed_align,
+            pool_alloc: linker_bool(environment, "POOL_ALLOC", false)?,
+            panic_managed_backtrace: linker_bool(environment, "PANIC_MANAGED_BT", false)?,
+            native_passthrough,
+            direct_pe: linker_bool(environment, "DIRECT_PE", true)?,
+        })
+    }
+}
+
+fn linker_bool(
+    environment: &HashMap<String, String>,
+    variable: &'static str,
+    default: bool,
+) -> Result<bool, String> {
+    match environment.get(variable).map(String::as_str) {
+        None => Ok(default),
+        Some("0" | "false" | "False" | "FALSE") => Ok(false),
+        Some("1" | "true" | "True" | "TRUE") => Ok(true),
+        Some(value) => Err(format!(
+            "boolean environment setting {variable} has invalid value {value:?}; expected 0/1 or false/true"
+        )),
+    }
+}
+
+fn linker_bool_alias(
+    environment: &HashMap<String, String>,
+    canonical: &'static str,
+    legacy: &'static str,
+    default: bool,
+) -> Result<bool, String> {
+    let canonical_value = environment
+        .contains_key(canonical)
+        .then(|| linker_bool(environment, canonical, default))
+        .transpose()?;
+    let legacy_value = environment
+        .contains_key(legacy)
+        .then(|| linker_bool(environment, legacy, default))
+        .transpose()?;
+    match (canonical_value, legacy_value) {
+        (Some(left), Some(right)) if left != right => Err(format!(
+            "{canonical} and legacy alias {legacy} disagree; set only {canonical}"
+        )),
+        (Some(value), _) | (_, Some(value)) => Ok(value),
+        (None, None) => Ok(default),
+    }
+}
+
+fn linker_number<T>(
+    environment: &HashMap<String, String>,
+    variable: &'static str,
+    default: T,
+) -> Result<T, String>
+where
+    T: std::str::FromStr,
+{
+    environment.get(variable).map_or(Ok(default), |value| {
+        value
+            .parse()
+            .map_err(|_| format!("environment setting {variable} has invalid value {value:?}"))
+    })
 }
 
 fn add_mandatory_statics(asm: &mut cilly::Assembly) {
@@ -202,8 +354,8 @@ fn extract_dirs(args: &[String]) -> Vec<String> {
 }
 
 fn main() {
-    let linker_build_config = BuildConfig::capture()
-        .unwrap_or_else(|error| panic!("invalid linker build configuration: {error}"));
+    let linker_config = LinkerConfig::capture()
+        .unwrap_or_else(|error| panic!("invalid linker configuration: {error}"));
     // Parse command line arguments
 
     let args: Vec<String> = env::args().collect();
@@ -231,20 +383,22 @@ fn main() {
     // Load assemblies from files
 
     let loaded = load::load_assemblies_with_config(to_link.as_slice(), ar_to_link.as_slice());
-    let (mut final_assembly, artifact_build_config, _, _) = loaded.into_parts();
-    let effective_build_config = effective_build_config(artifact_build_config, linker_build_config)
-        .unwrap_or_else(|error| {
-            panic!(
-                "linker process configuration does not match the serialized artifact contract: \
+    let (mut final_assembly, artifact_abi_config, _, _) = loaded.into_parts();
+    let effective_abi_config =
+        effective_abi_config(artifact_abi_config, linker_config.process_abi.clone())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "linker process ABI does not match the serialized artifact contract: \
                  {error}"
-            )
-        });
-    println!("==> Build configuration: {effective_build_config}");
-    // This first contract slice intentionally leaves the existing linker/config LazyLocks in
-    // place. They read the same process environment captured above; for versioned inputs, the
-    // field-by-field equality gate proves that environment agrees with codegen before any builtin
-    // synthesis or optimization begins. A follow-up migration will route consumers directly
-    // through `effective_build_config` and retire the duplicate environment readers.
+                )
+            });
+    println!("==> Artifact ABI: {effective_abi_config}");
+    println!("==> Linker configuration: {linker_config:?}");
+    let c_mode = matches!(linker_config.target, OutputTarget::C);
+    let java_mode = matches!(linker_config.target, OutputTarget::Java);
+    let no_unwind = effective_abi_config.no_unwind();
+    let pool_alloc = linker_config.pool_alloc;
+    let panic_managed_backtrace = linker_config.panic_managed_backtrace;
     /*
        {
            let msg = final_assembly.alloc_string("Starting constant initialization");
@@ -263,9 +417,7 @@ fn main() {
     */
     let path: std::path::PathBuf = out_path.into();
 
-    let is_lib = out_path.contains(".dll")
-        || out_path.contains(".so")
-        || out_path.contains(".o");
+    let is_lib = out_path.contains(".dll") || out_path.contains(".so") || out_path.contains(".o");
 
     let mut externs: FxHashMap<_, _> = LIBC_FNS
         .iter()
@@ -308,13 +460,13 @@ fn main() {
             }
         }),
     );
-    if *NO_UNWIND {
+    if no_unwind {
         cilly::builtins::insert_exeception_stub(&mut final_assembly, &mut overrides);
     } else {
         cilly::builtins::insert_exception(&mut final_assembly, &mut overrides);
     };
     // Override allocator
-    if !*C_MODE {
+    if !c_mode {
         // Get the marshal class
         let marshal = ClassRef::marshal(&mut final_assembly);
         // Overrides calls to malloc
@@ -360,10 +512,10 @@ fn main() {
     // `RustException` (the catch side is `insert_exception`/`insert_catch_unwind` above). Only for the
     // .NET path and only when unwinding is enabled — `NO_UNWIND` installs the ctor-less exception stub,
     // and C mode has its own setjmp/longjmp bridge.
-    if !*PANIC_MANAGED_BT && !*C_MODE && !*NO_UNWIND {
+    if !panic_managed_backtrace && !c_mode && !no_unwind {
         cilly::builtins::unwind::raise_exception(&mut final_assembly, &mut overrides);
     }
-    if !*C_MODE {
+    if !c_mode {
         overrides.insert(
             final_assembly.alloc_string("_Unwind_Backtrace"),
             Box::new(|mref, asm| {
@@ -429,13 +581,13 @@ fn main() {
     cilly::builtins::unaligned_read(&mut final_assembly, &mut overrides);
 
     cilly::builtins::casts::insert_casts(&mut final_assembly, &mut overrides);
-    cilly::builtins::insert_heap(&mut final_assembly, &mut overrides, *C_MODE, *POOL_ALLOC);
+    cilly::builtins::insert_heap(&mut final_assembly, &mut overrides, c_mode, pool_alloc);
     cilly::builtins::rust_assert(&mut final_assembly, &mut overrides);
-    cilly::builtins::int128::generate_int128_ops(&mut final_assembly, &mut overrides, *C_MODE);
+    cilly::builtins::int128::generate_int128_ops(&mut final_assembly, &mut overrides, c_mode);
     cilly::builtins::int128::i128_mul_ovf_check(&mut final_assembly, &mut overrides);
     cilly::builtins::int128::u128_mul_ovf_check(&mut final_assembly, &mut overrides);
     cilly::builtins::int128::generate_x86_wide_carry(&mut final_assembly, &mut overrides);
-    cilly::builtins::f16::generate_f16_ops(&mut final_assembly, &mut overrides, *C_MODE);
+    cilly::builtins::f16::generate_f16_ops(&mut final_assembly, &mut overrides, c_mode);
     cilly::builtins::atomics::generate_all_atomics(&mut final_assembly, &mut overrides);
     cilly::builtins::transmute(&mut final_assembly, &mut overrides);
     cilly::builtins::create_slice(&mut final_assembly, &mut overrides);
@@ -444,7 +596,7 @@ fn main() {
 
     cilly::builtins::math::bitreverse(&mut final_assembly, &mut overrides);
 
-    if *C_MODE {
+    if c_mode {
         externs.insert("__dso_handle", LIBC.clone());
         externs.insert("_mm_malloc", LIBC.clone());
         externs.insert("_mm_free", LIBC.clone());
@@ -492,11 +644,7 @@ fn main() {
         cilly::builtins::argc_argv_init(&mut final_assembly, &mut overrides);
         // .NET PAL BCL bindings (rcl_dotnet_alloc / _free / _write) used by the
         // std-side dotnet PAL. .NET-only: they emit calls into the BCL.
-        cilly::builtins::dotnet::insert_dotnet_pal(
-            &mut final_assembly,
-            &mut overrides,
-            *POOL_ALLOC,
-        );
+        cilly::builtins::dotnet::insert_dotnet_pal(&mut final_assembly, &mut overrides, pool_alloc);
         // POSIX/libc-over-.NET shim (the proof slice): int-fd⇄GCHandle fd-table +
         // thread-local errno + the bare POSIX C-ABI symbol cluster (socket/read/
         // epoll_*/…), each re-packaging an existing rcl_dotnet_* body. .NET-only;
@@ -557,7 +705,7 @@ fn main() {
     if std::env::var("RCL_LINK_STATS").as_deref() == Ok("1") {
         println!("==> Compaction: {compaction}");
     }
-    final_assembly.fix_aligement();
+    final_assembly.fix_alignment(linker_config.guaranteed_align);
     let final_assembly = final_assembly.verify_for_export().unwrap_or_else(|error| {
         panic!(
             "final post-link verification failed after patching, DCE, optimization, compaction, \
@@ -572,11 +720,11 @@ fn main() {
     if *FORCE_FAIL {
         panic!("FORCE_FAIL");
     }
-    if *C_MODE {
+    if c_mode {
         let cexport = cilly::c_exporter::CExporter::new(is_lib, libs, dirs);
 
         final_assembly.export(&path, cexport);
-    } else if *JAVA_MODE {
+    } else if java_mode {
         final_assembly.export(&path, cilly::java_exporter::JavaExporter::new(is_lib));
         if cargo_support {
             let bootstrap = bootstrap_source(
@@ -584,6 +732,8 @@ fn main() {
                 path.to_str().unwrap(),
                 "java",
                 None,
+                effective_abi_config.dotnet_runtime(),
+                linker_config.native_passthrough,
             );
             let bootstrap_path = path.with_extension("rs");
             let mut bootstrap_file = std::fs::File::create(&bootstrap_path).unwrap();
@@ -611,7 +761,7 @@ fn main() {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-    } else if *DIRECT_PE {
+    } else if linker_config.direct_pe {
         // Hand-rolled ECMA-335 PE writer (`cilly::pe_exporter`) — bypasses `ilasm` entirely. See
         // `docs/PE_EMISSION_PLAN.md`. `il_exporter`'s own `Exporter::export` (the `else` branch
         // below) is left byte-for-byte untouched; this is a parallel call site, not a
@@ -704,6 +854,7 @@ fn main() {
             assembly_name: asm_name,
             module_name,
             pdb_file_name: pdb_file_name.clone(),
+            runtime: effective_abi_config.dotnet_runtime(),
         };
         let (bytes, pdb_bytes) = final_assembly
             .render_pe(&pe_options)
@@ -725,6 +876,8 @@ fn main() {
                 path.to_str().unwrap(),
                 "dotnet",
                 Some(&pdb_file_name),
+                effective_abi_config.dotnet_runtime(),
+                linker_config.native_passthrough,
             );
             let bootstrap_path = path.with_extension("rs");
             let mut bootstrap_file = std::fs::File::create(&bootstrap_path).unwrap();
@@ -759,7 +912,8 @@ fn main() {
         };
         final_assembly.export(
             &path,
-            cilly::il_exporter::ILExporter::new(*ILASM_FLAVOUR, is_lib, asm_name),
+            cilly::il_exporter::ILExporter::new(*ILASM_FLAVOUR, is_lib, asm_name)
+                .with_runtime(effective_abi_config.dotnet_runtime()),
         );
         // A library has no entrypoint to launch, so it needs no native launcher — the .NET assembly
         // emitted at `path` (above) IS the artifact. Only executables get the launcher.
@@ -769,6 +923,8 @@ fn main() {
                 path.to_str().unwrap(),
                 "dotnet",
                 None,
+                effective_abi_config.dotnet_runtime(),
+                linker_config.native_passthrough,
             );
             let bootstrap_path = path.with_extension("rs");
             let mut bootstrap_file = std::fs::File::create(&bootstrap_path).unwrap();
@@ -810,6 +966,8 @@ fn bootstrap_source(
     output_file_path: &str,
     jumpstart_cmd: &str,
     pdb_file_override: Option<&str>,
+    runtime: DotnetRuntime,
+    native_passthrough: bool,
 ) -> String {
     if let Err(err) = std::fs::remove_file(output_file_path) {
         match err.kind() {
@@ -837,19 +995,19 @@ fn bootstrap_source(
     format!(
         include_str!("dotnet_jumpstart.rs"),
         jumpstart_cmd = jumpstart_cmd,
-        // The launcher's runtimeconfig targets the DOTNET_VERSION runtime (default net8.0). The
-        // linker is a SEPARATE process from the codegen dylib, so it reads DOTNET_VERSION itself.
-        tfm = cilly::dotnet_version().tfm(),
-        framework_version = cilly::dotnet_version().framework_version(),
+        // The launcher consumes the same immutable contract that was validated against every
+        // input artifact before link-time mutation began.
+        tfm = runtime.tfm(),
+        framework_version = runtime.framework_version(),
         exec_file = fpath.file_name().unwrap().to_string_lossy(),
-        has_native_companion = *NATIVE_PASSTROUGH,
+        has_native_companion = native_passthrough,
         has_pdb = has_pdb,
         pdb_file = if *ILASM_FLAVOUR == IlasmFlavour::Clasic {
             String::new()
         } else {
             pdb_file
         },
-        native_companion_file = if *NATIVE_PASSTROUGH {
+        native_companion_file = if native_passthrough {
             format!(
                 "rust_native_{output_file_path}.so",
                 output_file_path = file_stem(output_file_path)
@@ -859,74 +1017,68 @@ fn bootstrap_source(
         }
     )
 }
-config!(NATIVE_PASSTROUGH, bool, false);
-config!(ABORT_ON_ERROR, bool, false);
-config!(C_MODE, bool, false);
-config!(NO_UNWIND, bool, false);
-config!(JAVA_MODE, bool, false);
-config!(PANIC_MANAGED_BT, bool, false);
-config!(
-    POOL_ALLOC,
-    bool,
-    false,
-    "Enable the experimental per-thread size-classed unmanaged allocation pool for Rust allocator \
-     shims. Default OFF preserves the direct NativeMemory allocator path."
-);
-config!(
-    DIRECT_PE,
-    bool,
-    true,
-    "Emit the .NET assembly via the hand-rolled ECMA-335 PE writer (cilly::pe_exporter) instead \
-     of going through ilasm. Default ON as of PE-emission Phase 1 (docs/PE_EMISSION_PLAN.md): the \
-     writer passed the full ::stable gate under an A/B differential (serial run byte-identical \
-     named-failure set vs the ilasm baseline). Escape hatch: set DIRECT_PE=0 to fall back to the \
-     ilasm path (il_exporter) if a PE-writer regression is suspected."
-);
 
 #[cfg(test)]
-mod build_config_tests {
+mod linker_config_tests {
     use super::*;
-    use cilly::{DotnetRuntime, OutputTarget};
 
     #[test]
-    fn versioned_artifact_config_must_match_linker_process() {
-        let artifact = BuildConfig::default();
-        let linker = BuildConfig::new(
-            OutputTarget::C,
-            DotnetRuntime::Net9,
-            true,
-            false,
-            8,
-            16,
-            false,
-            false,
-            false,
-        );
+    fn versioned_artifact_abi_must_match_linker_process() {
+        let artifact = ArtifactAbiConfig::default();
+        let process = ArtifactAbiConfig::default()
+            .with_dotnet_runtime(DotnetRuntime::Net9)
+            .with_no_unwind(true);
 
-        let error = effective_build_config(Some(artifact), linker).unwrap_err();
+        let error = effective_abi_config(Some(artifact), process).unwrap_err();
         let diagnostic = error.to_string();
-        assert!(diagnostic.contains("target: expected DotNet, found C"));
         assert!(diagnostic.contains("dotnet_runtime: expected Net8, found Net9"));
         assert!(diagnostic.contains("no_unwind: expected false, found true"));
     }
 
     #[test]
     fn all_legacy_inputs_use_the_linker_process_snapshot() {
-        let linker = BuildConfig::new(
-            OutputTarget::Java,
-            DotnetRuntime::Net9,
-            true,
-            true,
-            16,
-            32,
-            true,
-            true,
-            true,
-        );
+        let process = ArtifactAbiConfig::default()
+            .with_dotnet_runtime(DotnetRuntime::Net9)
+            .with_no_unwind(true);
 
         assert_eq!(
-            effective_build_config(None, linker.clone()).unwrap(),
-            linker
+            effective_abi_config(None, process.clone()).unwrap(),
+            process
         );
     }
+
+    #[test]
+    fn final_link_settings_are_not_part_of_artifact_compatibility() {
+        let environment = HashMap::from([
+            ("C_MODE".to_owned(), "1".to_owned()),
+            ("GUARANTEED_ALIGN".to_owned(), "16".to_owned()),
+            ("POOL_ALLOC".to_owned(), "true".to_owned()),
+            ("DIRECT_PE".to_owned(), "0".to_owned()),
+        ]);
+        let config = LinkerConfig::from_environment(&environment).unwrap();
+        assert_eq!(config.target, OutputTarget::C);
+        assert_eq!(config.guaranteed_align, 16);
+        assert!(config.pool_alloc);
+        assert!(!config.direct_pe);
+        assert_eq!(config.process_abi, ArtifactAbiConfig::default());
+    }
+
+    #[test]
+    fn canonical_native_passthrough_alias_is_supported() {
+        let environment = HashMap::from([("NATIVE_PASSTHROUGH".to_owned(), "true".to_owned())]);
+        assert!(
+            LinkerConfig::from_environment(&environment)
+                .unwrap()
+                .native_passthrough
+        );
+    }
+
+    #[test]
+    fn guaranteed_align_must_be_a_nonzero_power_of_two() {
+        for invalid in ["0", "3"] {
+            let environment = HashMap::from([("GUARANTEED_ALIGN".to_owned(), invalid.to_owned())]);
+            let error = LinkerConfig::from_environment(&environment).unwrap_err();
+            assert!(error.contains("nonzero power of two"), "{error}");
+    }
+}
 }

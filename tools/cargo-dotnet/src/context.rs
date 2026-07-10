@@ -158,7 +158,7 @@ impl Paths {
 /// The target .NET runtime version selected by `--dotnet` (env `DOTNET_VERSION`). The front-end is
 /// the *producer* of the version: it exports `DOTNET_VERSION` to the inner cargo (so both the codegen
 /// backend and the cilly linker see it) and selects the matching CoreCLR ilasm. It deliberately does
-/// NOT know per-version BCL tokens / `.ver` strings — those live in cilly (`cilly::DotnetVersion`).
+/// NOT know per-version BCL tokens / `.ver` strings — those live in cilly (`cilly::DotnetRuntime`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum DotnetVersion {
     /// .NET 8 (default).

@@ -40,12 +40,12 @@ pub mod libc_fns;
 
 pub mod artifact;
 pub use artifact::{
-    decode_assembly_artifact, ArtifactDecodeError, ArtifactFormat, AssemblyArtifact, BuildConfig,
-    BuildConfigCaptureError, BuildConfigDifference, BuildConfigMismatch, DecodedAssemblyArtifact,
+    decode_assembly_artifact, ArtifactAbiConfig, ArtifactAbiConfigCaptureError,
+    ArtifactAbiConfigDifference, ArtifactAbiConfigMismatch, ArtifactDecodeError, ArtifactFormat, AssemblyArtifact, DecodedAssemblyArtifact,
     DotnetRuntime, OutputTarget, ASSEMBLY_ARTIFACT_MAGIC, ASSEMBLY_ARTIFACT_VERSION,
 };
-pub mod utilis;
 pub mod ir;
+pub mod utilis;
 /// The metadata of a slice
 pub const METADATA: &str = "m";
 /// The data pointer of a slice
@@ -115,6 +115,12 @@ macro_rules! config {
     };
 }
 config! {DEAD_CODE_ELIMINATION,bool,true}
+config! {
+    OPTIMIZE_CIL,
+    bool,
+    true,
+    "Run the CIL optimizer. Set OPTIMIZE_CIL=0 for faithful MIR-to-CIL debugging; OPT_FUEL only bounds work when optimization is enabled."
+}
 
 /// Debug tooling: when set, every method whose mangled **or** demangled name contains this substring
 /// is printed as a deterministic, type-annotated IR dump during the type-verifier pass (see
@@ -129,11 +135,9 @@ pub fn dump_fn_filter() -> Option<&'static str> {
 }
 
 // --- Type-verifier wiring (Phase P1 of docs/ABSOLUTE_CORRECTNESS_PLAN.md) -------------------------
-// These three flags gate `Assembly::typecheck` (cilly/src/ir/asm.rs). They mirror the same-named
-// flags in the backend's `src/config.rs`; cilly reads the env directly because the typecheck runs in
-// both the backend (`join_codegen`) and the `linker` process. Defaults are chosen to preserve the
-// historical behaviour exactly — run the checker, but only *warn* — so wiring them in is a no-op
-// until the operator opts into stricter modes (or the project flips `ALLOW_MISCOMPILATIONS` off).
+// These three process-local diagnostics gate `Assembly::typecheck` (cilly/src/ir/asm.rs). They are
+// deliberately not part of ArtifactAbiConfig: verifier policy can differ without making two
+// already-emitted assemblies ABI-incompatible.
 config! {TYPECHECK_CIL,bool,true,"Run the CIL type-verifier over every emitted method. Default on."}
 config! {VERIFY_METHODS,bool,true,"Alias-style enable for the per-method type-verifier. Default on; either this or TYPECHECK_CIL being set runs the checker."}
 config! {ALLOW_MISCOMPILATIONS,bool,false,"If true, a type-verifier violation is a warning and codegen continues. If false (default — Phase P1 of the absolute-correctness plan, invariant I1), any violation ABORTS the build: an ill-typed method is never emitted. The default was flipped to false once the verifier was proven sound (zero false positives across the full ::stable build + std/probe/soak corpus) and the gate stayed green under the fatal checker. Set ALLOW_MISCOMPILATIONS=1 to opt back into the historical advisory behaviour."}

@@ -1,20 +1,20 @@
 use core::f16;
 
-use cilly::{
-    Assembly, CILNode, ClassRef, Const, Float, Int, Interned, IntoAsmIndex, MethodRef,
-    StaticFieldDesc, Type,
-    cilnode::{IsPure, MethodKind},
-    hashable::{HashableF32, HashableF64},
-};
 use crate::call_info::CallInfo;
 use crate::fn_ctx::MethodCompileCtx;
-use crate::r#type::{GetTypeExt, fixed_array, utilis::is_fat_ptr};
+use crate::r#type::{fixed_array, utilis::is_fat_ptr, GetTypeExt};
+use cilly::{
+    cilnode::{IsPure, MethodKind},
+    hashable::{HashableF32, HashableF64},
+    Assembly, CILNode, ClassRef, Const, Float, Int, Interned, IntoAsmIndex, MethodRef,
+    StaticFieldDesc, Type,
+};
 use rustc_middle::ty::ExistentialTraitRef;
 use rustc_middle::{
     mir::{
-        ConstOperand, ConstValue,
         interpret::Scalar,
         interpret::{AllocId, GlobalAlloc},
+        ConstOperand, ConstValue,
     },
     ty::{FloatTy, IntTy, Ty, TyCtxt, TyKind, UintTy},
 };
@@ -105,7 +105,7 @@ fn alloc_align_size(alloc_id: u64, ctx: &mut MethodCompileCtx<'_, '_>) -> (u64, 
         .tcx()
         .global_alloc(AllocId(alloc_id.try_into().expect("0 alloc id?")));
     match global_alloc {
-        GlobalAlloc::Memory(alloc) => (alloc.0.0.align.bytes(), alloc.0.len() as u64),
+        GlobalAlloc::Memory(alloc) => (alloc.0 .0.align.bytes(), alloc.0.len() as u64),
         _ => todo!(),
     }
 }
@@ -124,7 +124,12 @@ fn const_slice_backer_type<'tcx>(
                 "DSTs in slice constants must have exactly one field!"
             );
             let fld = def.all_fields().next().unwrap();
-            return const_slice_backer_type(fld.ty(ctx.tcx(), generics).skip_normalization(), ctx, alloc_id, meta);
+            return const_slice_backer_type(
+                fld.ty(ctx.tcx(), generics).skip_normalization(),
+                ctx,
+                alloc_id,
+                meta,
+            );
         }
         TyKind::Slice(elem) => ctx.type_from_cache(*elem),
         _ => todo!("Unhandled const {const_ty:?}"),
@@ -152,9 +157,9 @@ pub fn load_const_value<'tcx>(
             let tpe = ctx.type_from_cache(tpe);
             ctx.uninit_val(tpe)
         }
-        ConstValue::Slice {  meta,alloc_id } => {
-              // SUS
-                      let data = ctx.tcx().global_alloc(alloc_id).unwrap_memory();
+        ConstValue::Slice { meta, alloc_id } => {
+            // SUS
+            let data = ctx.tcx().global_alloc(alloc_id).unwrap_memory();
             let slice_type = ctx.type_from_cache(const_ty);
             let slice_dotnet = slice_type.as_class_ref().expect("Slice type invalid!");
 
@@ -185,14 +190,16 @@ pub fn load_const_value<'tcx>(
     }
 }
 pub fn static_ty<'tcx>(def_id: DefId, tcx: TyCtxt<'tcx>) -> Ty<'tcx> {
-    tcx.type_of(def_id).instantiate_identity().skip_normalization()
+    tcx.type_of(def_id)
+        .instantiate_identity()
+        .skip_normalization()
 }
 fn load_scalar_ptr(
     ctx: &mut MethodCompileCtx<'_, '_>,
     ptr: rustc_middle::mir::interpret::Pointer,
     tpe: Interned<Type>,
 ) -> Interned<CILNode> {
-    let (alloc_id, offset) = ptr. into_raw_parts();
+    let (alloc_id, offset) = ptr.into_raw_parts();
     let global_alloc = ctx.tcx().global_alloc(alloc_id.alloc_id());
     let u8_ptr = ctx.nptr(Type::Int(Int::U8));
     let u8_ptr_ptr = ctx.nptr(u8_ptr);
@@ -263,8 +270,7 @@ fn load_scalar_ptr(
             assert_eq!(offset.bytes(), 0);
             // If it is a function, patch its pointer up.
             let call_info = CallInfo::sig_from_instance_(finstance, ctx);
-            let function_name =
-                crate::fn_ctx::fn_name(ctx.tcx().symbol_name(finstance));
+            let function_name = crate::fn_ctx::fn_name(ctx.tcx().symbol_name(finstance));
             let mref = MethodRef::new(
                 *ctx.main_module(),
                 ctx.alloc_string(function_name),
@@ -303,14 +309,14 @@ fn alloc_ptr<'tcx>(
     tpe: Interned<Type>,
 ) -> Interned<CILNode> {
     let (ptr, align) = alloc_ptr_unaligned(alloc_id, const_alloc, ctx, tpe);
-    // If aligement is small enough to be *guaranteed*, and no pointers are present.
+    // If alignment is small enough to be *guaranteed*, and no pointers are present.
     if align.is_some_and(|align| align <= ctx.const_align()) {
         add_allocation(alloc_id.0.into(), ctx, tpe)
     } else {
         ptr
     }
 }
-/// Returns a pointer to an immutable buffer, representing a given allocation. Pointer may be underaligned, aligement of `u64::MAX` signals that the pointer
+/// Returns a pointer to an immutable buffer, representing a given allocation. Pointer may be underaligned; alignment of `u64::MAX` signals that the pointer
 /// will be sufficently aligned for `const_alloc`.
 fn alloc_ptr_unaligned<'tcx>(
     alloc_id: AllocId,
@@ -319,7 +325,7 @@ fn alloc_ptr_unaligned<'tcx>(
     tpe: Interned<Type>,
 ) -> (Interned<CILNode>, Option<u64>) {
     let const_alloc = const_alloc.inner();
-    // If aligement is small enough to be *guaranteed*, and no pointers are present.
+    // If alignment is small enough to be *guaranteed*, and no pointers are present.
     if const_alloc.provenance().ptrs().is_empty() {
         if const_alloc.align.bytes() <= ctx.const_align() {
             (

@@ -202,9 +202,7 @@ impl ExportReadyAssembly {
         self,
         options: &super::pe_exporter::export::ExportOptions,
     ) -> Result<(Vec<u8>, Vec<u8>), VerificationFailure> {
-        self.render_with_reverification(|asm| {
-            super::pe_exporter::export::export_pe(asm, options)
-        })
+        self.render_with_reverification(|asm| super::pe_exporter::export::export_pe(asm, options))
     }
 
     fn render_with_reverification<T>(
@@ -475,6 +473,9 @@ impl Assembly {
     }
     #[must_use]
     pub fn fuel_from_env(&self) -> OptFuel {
+        if !*crate::OPTIMIZE_CIL {
+            return OptFuel::new(0);
+        }
         match std::env::var("OPT_FUEL") {
             Ok(fuel) => match fuel.parse::<u32>() {
                 Ok(fuel) => OptFuel::new(fuel),
@@ -1319,8 +1320,11 @@ impl Assembly {
         for block in self
             .method_defs
             .values_mut()
-            .filter_map(|def| def.implementation_mut().blocks_mut())
+            .flat_map(|def| {
+            def.implementation_mut().all_blocks_mut()
+                .into_iter()
             .flatten()
+        })
         {
             let (handler, roots) = block.handler_and_root_mut();
             for root in roots.iter_mut().chain(
@@ -1841,11 +1845,11 @@ impl Assembly {
         empty = empty.link_gc();
         empty
     }
-    pub fn fix_aligement(&mut self) {
+    pub fn fix_alignment(&mut self, guaranteed_align: u8) {
         let method_def_idxs: Box<[_]> = self.method_defs.keys().copied().collect();
         for method in method_def_idxs {
             let mut tmp_method = self.borrow_methoddef(method);
-            tmp_method.adjust_aligement(self);
+            tmp_method.adjust_alignment(self, guaranteed_align);
             self.return_methoddef(method, tmp_method);
         }
     }
@@ -1942,14 +1946,6 @@ impl Assembly {
 
     pub(crate) fn get_section(&self, arg: &str) -> Option<&Vec<u8>> {
         self.sections.get(arg)
-    }
-
-    pub(crate) fn guaranted_align(&self) -> u8 {
-        *GUARANTEED_ALIGN
-    }
-
-    pub fn max_static_size(&self) -> usize {
-        *MAX_STATIC_SIZE
     }
 
     pub(crate) fn global_void(&mut self) -> Interned<StaticFieldDesc> {
@@ -2168,8 +2164,7 @@ impl Assembly {
     /// Reinterprets a managed reference as a raw pointer.
     pub fn ref_to_ptr(
         &mut self,
-        val: impl IntoAsmIndex<Interned<CILNode>>,
-    ) -> Interned<CILNode> {
+        val: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILNode> {
         let val = val.into_idx(self);
         self.alloc_node(CILNode::RefToPtr(val))
     }
@@ -2177,8 +2172,7 @@ impl Assembly {
     /// Loads a pointer to the function `mref`.
     pub fn ld_ftn(
         &mut self,
-        mref: impl IntoAsmIndex<Interned<MethodRef>>,
-    ) -> Interned<CILNode> {
+        mref: impl IntoAsmIndex<Interned<MethodRef>>) -> Interned<CILNode> {
         let mref = mref.into_idx(self);
         self.alloc_node(CILNode::LdFtn(mref))
     }
@@ -2307,8 +2301,7 @@ impl Assembly {
     /// Loads the length of a platform array `arr`.
     pub fn ld_len(
         &mut self,
-        arr: impl IntoAsmIndex<Interned<CILNode>>,
-    ) -> Interned<CILNode> {
+        arr: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILNode> {
         let arr = arr.into_idx(self);
         self.alloc_node(CILNode::LdLen(arr))
     }
@@ -2380,8 +2373,7 @@ impl Assembly {
     /// Allocates `size` bytes from the local (per-call) pool.
     pub fn loc_alloc(
         &mut self,
-        size: impl IntoAsmIndex<Interned<CILNode>>,
-    ) -> Interned<CILNode> {
+        size: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILNode> {
         let size = size.into_idx(self);
         self.alloc_node(CILNode::LocAlloc { size })
     }
@@ -2399,8 +2391,7 @@ impl Assembly {
     /// Loads a "type token" for `tpe`.
     pub fn ld_type_token(
         &mut self,
-        tpe: impl IntoAsmIndex<Interned<Type>>,
-    ) -> Interned<CILNode> {
+        tpe: impl IntoAsmIndex<Interned<Type>>) -> Interned<CILNode> {
         let tpe = tpe.into_idx(self);
         self.alloc_node(CILNode::LdTypeToken(tpe))
     }
@@ -2670,8 +2661,7 @@ impl Assembly {
     /// Allocates an anonymous static initialized to `val` and loads its address.
     pub fn stack_addr(
         &mut self,
-        val: impl IntoAsmIndex<Interned<CILNode>>,
-    ) -> Interned<CILNode> {
+        val: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILNode> {
         let val = val.into_idx(self);
         let sfld = self.annon_const(val);
         self.alloc_node(CILNode::LdStaticFieldAddress(sfld))
@@ -2827,8 +2817,6 @@ impl Assembly {
         self.throw(exception)
     }
 }
-config!(GUARANTEED_ALIGN, u8, 8);
-config!(MAX_STATIC_SIZE, usize, 16);
 /// An initializer, which runs before everything else. By convention, it is used to initialize static / const data. Should not execute any user code
 pub const CCTOR: &str = ".cctor";
 /// An thread-local initializer. Runs before each thread starts. By convention, it is used to initialize thread local data. Should not execute any user code.
@@ -2909,120 +2897,6 @@ pub static ILASM_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(||
         })
         .unwrap_or(get_default_ilasm())
 });
-
-/// The target .NET runtime version. Single source of truth for every version-specific string the
-/// backend emits (`runtimeconfig.json` TFM, `.assembly extern` `.ver` stamps) and for version-gated
-/// codegen (e.g. native sub-word `Interlocked` overloads, added in .NET 9). Read once from the
-/// `DOTNET_VERSION` env var via [`dotnet_version`]; defaults to [`DotnetVersion::Net8`] so an
-/// unconfigured build keeps the historical .NET 8 behaviour.
-///
-/// Declaration order is load-bearing: `Net8 < Net9`, so feature gates read `version >= Net9`
-/// (and a future `Net10` auto-takes the newer path with no edit).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash, Default)]
-pub enum DotnetVersion {
-    /// .NET 8 (the default / primary CI target).
-    #[default]
-    Net8,
-    /// .NET 9.
-    Net9,
-}
-impl DotnetVersion {
-    /// Target-framework moniker for `runtimeconfig.json` / `.nuspec` (`net8.0` / `net9.0`).
-    #[must_use]
-    pub fn tfm(self) -> &'static str {
-        match self {
-            DotnetVersion::Net8 => "net8.0",
-            DotnetVersion::Net9 => "net9.0",
-        }
-    }
-    /// The `.ver` triplet for a BCL `.assembly extern` stamp (`8:0:0:0` / `9:0:0:0`).
-    ///
-    /// NOTE: the public-key *tokens* are version-INVARIANT (verified identical on 8 and 9) — only
-    /// this triplet changes — so there is deliberately no token accessor.
-    #[must_use]
-    pub fn assembly_ver(self) -> &'static str {
-        match self {
-            DotnetVersion::Net8 => "8:0:0:0",
-            DotnetVersion::Net9 => "9:0:0:0",
-        }
-    }
-    /// The same `.ver` triplet as [`DotnetVersion::assembly_ver`], pre-parsed into the
-    /// `(major, minor, build, revision)` tuple shape `pe_exporter`'s raw `AssemblyRefRow` wants
-    /// (§II.22.5 `AssemblyRef` columns `MajorVersion`/`MinorVersion`/`BuildNumber`/`RevisionNumber`,
-    /// each a `u16`). Kept as a thin sibling of the string accessor rather than replacing it, since
-    /// `il_exporter` interpolates the string form directly into `.ver` IL text.
-    #[must_use]
-    pub fn assembly_ver_tuple(self) -> (u16, u16, u16, u16) {
-        match self {
-            DotnetVersion::Net8 => (8, 0, 0, 0),
-            DotnetVersion::Net9 => (9, 0, 0, 0),
-        }
-    }
-    /// A `Microsoft.NETCore.App` framework-version floor for `runtimeconfig.json` (`8.0.0` / `9.0.0`),
-    /// paired with roll-forward to the latest installed patch.
-    #[must_use]
-    pub fn framework_version(self) -> &'static str {
-        match self {
-            DotnetVersion::Net8 => "8.0.0",
-            DotnetVersion::Net9 => "9.0.0",
-        }
-    }
-    /// The major version number (`8` / `9`).
-    #[must_use]
-    pub fn major(self) -> u32 {
-        match self {
-            DotnetVersion::Net8 => 8,
-            DotnetVersion::Net9 => 9,
-        }
-    }
-}
-impl std::str::FromStr for DotnetVersion {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "8" | "net8" | "net8.0" => Ok(DotnetVersion::Net8),
-            "9" | "net9" | "net9.0" => Ok(DotnetVersion::Net9),
-            other => Err(format!(
-                "DOTNET_VERSION has invalid value {other:?}; expected 8 or 9 (or net8.0/net9.0)"
-            )),
-        }
-    }
-}
-/// The target .NET version for this process, read once from the `DOTNET_VERSION` env var (default
-/// [`DotnetVersion::Net8`]). Both the codegen backend and the (separate-process) linker read this,
-/// so a build must set `DOTNET_VERSION` in BOTH environments.
-pub static DOTNET_VERSION: std::sync::LazyLock<DotnetVersion> = std::sync::LazyLock::new(|| {
-    match std::env::var("DOTNET_VERSION") {
-        Ok(val) => val.parse().unwrap_or_else(|e| panic!("{e}")),
-        Err(_) => DotnetVersion::default(),
-    }
-});
-/// Convenience accessor for [`DOTNET_VERSION`] — the target .NET version of this build.
-#[must_use]
-pub fn dotnet_version() -> DotnetVersion {
-    *DOTNET_VERSION
-}
-
-#[cfg(test)]
-mod dotnet_version_tests {
-    use super::DotnetVersion;
-    #[test]
-    fn parse_and_order() {
-        assert_eq!("8".parse(), Ok(DotnetVersion::Net8));
-        assert_eq!("9".parse(), Ok(DotnetVersion::Net9));
-        assert_eq!("net9.0".parse(), Ok(DotnetVersion::Net9));
-        assert_eq!(DotnetVersion::default(), DotnetVersion::Net8);
-        assert!(DotnetVersion::Net9 > DotnetVersion::Net8);
-        assert!(!(DotnetVersion::Net8 >= DotnetVersion::Net9));
-        assert!("7".parse::<DotnetVersion>().is_err());
-        assert!("".parse::<DotnetVersion>().is_err());
-        assert_eq!(DotnetVersion::Net8.tfm(), "net8.0");
-        assert_eq!(DotnetVersion::Net9.assembly_ver(), "9:0:0:0");
-        assert_eq!(DotnetVersion::Net9.major(), 9);
-        assert_eq!(DotnetVersion::Net8.assembly_ver_tuple(), (8, 0, 0, 0));
-        assert_eq!(DotnetVersion::Net9.assembly_ver_tuple(), (9, 0, 0, 0));
-    }
-}
 
 #[cfg(not(target_os = "windows"))]
 /// Finds the default instance of the IL assembler.
@@ -3114,7 +2988,7 @@ fn add_deliberately_ill_typed_method(asm: &mut Assembly) -> MethodDefIdx {
         MethodImpl::MethodBody {
             blocks: vec![super::BasicBlock::new(vec![bad_store], 0, None)],
             locals: vec![(None, local_ty)],
-        },
+},
         vec![],
     ))
 }
@@ -3141,15 +3015,15 @@ fn final_export_verification_returns_structured_failure() {
 
 #[test]
 fn direct_pe_render_reverifies_before_releasing_artifacts() {
-    let ready = Assembly::default()
-        .prepared()
-        .verify_for_export()
-        .unwrap();
+    let ready = Assembly::default().prepared().verify_for_export().unwrap();
     let result = ready.render_with_reverification(|asm| {
         add_deliberately_ill_typed_method(asm);
         (vec![0x4d, 0x5a], Vec::<u8>::new())
     });
-    assert!(result.is_err(), "post-render invalidation must discard PE bytes");
+    assert!(
+        result.is_err(),
+        "post-render invalidation must discard PE bytes"
+    );
 }
 
 #[test]
@@ -3265,8 +3139,7 @@ fn missing_method_resolution_rejects_dangling_interface_refs() {
         .class_def(
             ClassDef::new(
                 interface_name,
-                false,
-                0,
+                false, 0,
                 None,
                 vec![],
                 vec![],
@@ -3325,9 +3198,10 @@ fn export() {
         vec![None],
     ));
     #[cfg(not(miri))]
-    asm.verify_for_export()
-        .unwrap()
-        .export("/tmp/export.exe", ILExporter::new(*ILASM_FLAVOUR, false, None));
+    asm.verify_for_export().unwrap().export(
+        "/tmp/export.exe",
+        ILExporter::new(*ILASM_FLAVOUR, false, None),
+    );
 }
 #[test]
 fn export2() {
@@ -3388,9 +3262,10 @@ fn export2() {
     asm.eliminate_dead_code();
     asm.realloc_roots();
     #[cfg(not(miri))]
-    asm.verify_for_export()
-        .unwrap()
-        .export("/tmp/export2.exe", ILExporter::new(*ILASM_FLAVOUR, false, None));
+    asm.verify_for_export().unwrap().export(
+        "/tmp/export2.exe",
+        ILExporter::new(*ILASM_FLAVOUR, false, None),
+    );
 }
 /// Smallest-safe-first-step spike for `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md`'s Tier C finding
 /// #2 (exporting Rust traits as C# interfaces): hand-build a genuine ECMA-335 `interface`
@@ -3602,6 +3477,7 @@ fn link() {
     #[cfg(not(miri))]
     asm.verify_for_export()
         .unwrap()
-        .export("/tmp/link_test.exe", ILExporter::new(*ILASM_FLAVOUR, false, None));
+        .export("/tmp/link_test.exe", ILExporter::new(*ILASM_FLAVOUR, false, None),
+    );
 }
 config! {LINKER_RECOVER,bool,false}

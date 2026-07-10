@@ -11,7 +11,8 @@ miscompilations and crashes are expected, and that informs much of the design (s
 
 > **Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) first.** It is a codebase-oriented digest of the
 > author's (FractalFir's) blog series explaining *why* the project is built the way it is — the
-> CIL-trees IR, the V1→V2 split, how Rust constructs map to .NET, panics/unwinding, and the many
+> single interned CIL-tree IR, its historical V1→V2 collapse, how Rust constructs map to .NET,
+> panics/unwinding, and the many
 > .NET-mapping gotchas. The articles themselves are archived locally in
 > [docs/fractalfir_articles/](docs/fractalfir_articles/) ([index](docs/fractalfir_articles/README.md)).
 > The summary below is the quick reference; ARCHITECTURE.md is the deeper context.
@@ -67,16 +68,22 @@ runtime). C mode needs a C compiler (GCC/Clang fully supported; tcc/sdcc partial
 
 ## Configuration via environment variables
 
-Behavior is controlled by env-var flags defined with the `config!` macro in [src/config.rs](src/config.rs)
-(and `cilly`'s own `config`). The important ones:
+The backend captures environment configuration once into an immutable typed value. Only the two
+per-crate ABI choices (`DOTNET_VERSION` and `NO_UNWIND`) are serialized into `.cilly` artifacts;
+the linker rejects incompatible inputs before mutation. Output selection and final-link policy stay
+local to the linker, so the same IR remains reusable across exporters. The important controls are:
 
-- `C_MODE=1` — emit C source instead of .NET CIL. `JS_MODE=1` / (JVM exporter) are other backends.
+- `C_MODE=1` — emit C source instead of .NET CIL. `JAVA_MODE=1` selects the experimental JVM exporter.
 - `OPTIMIZE_CIL=0` — **disable the CIL optimizer.** Do this first when debugging a miscompilation: it makes
-  the generated CIL map 1:1 back to MIR statements (see "Design principles").
+  the generated CIL map 1:1 back to MIR statements (see "Design principles"). `OPT_FUEL` only bounds
+  work while optimization is enabled.
 - `TEST_WITH_MONO=1` — also run tests under Mono. `DRY_RUN=1` — compile only, don't link/execute.
 - `ABORT_ON_ERROR`, `ALLOW_MISCOMPILATIONS`, `VERIFY_METHODS`/`TYPECHECK_CIL`, `INSERT_MIR_DEBUG_COMMENTS`,
-  `PRINT_LOCAL_TYPES`, `TRACE_CIL_OPS` — debugging/strictness knobs.
-- `ASCI_IDENT` — force ASCII-only symbol names (needed for compilers that reject mangled Unicode idents).
+  and `PRINT_LOCAL_TYPES` are debugging/strictness knobs.
+- `ASCII_IDENTS=1` — force ASCII-only C identifiers (needed for compilers that reject mangled Unicode idents).
+
+Historical no-op or renamed settings now fail with a removal or replacement diagnostic instead of
+being silently accepted; the retired list lives in [src/config.rs](src/config.rs).
 
 ## Architecture
 
@@ -88,28 +95,33 @@ Behavior is controlled by env-var flags defined with the `config!` macro in [src
    not really in `lib.rs`, which is mostly rustc plumbing (receiving MIR, serializing, linking).
 3. `add_fn` walks MIR: each statement goes through `handle_statement` ([src/statement.rs](src/statement.rs))
    and each block terminator through `handle_terminator` ([src/terminator/](src/terminator/)), producing CIL.
-4. `join_codegen` converts the produced IR with `cilly::Assembly::from_v1`, runs `.opt()` and `.typecheck()`,
-   and serializes the result (postcard) into a `.bc`, bundled into an `.rlib`.
+4. Each mono item and CGU builds in a transactional assembly shard. `join_codegen` runs optimization
+   and verification, then serializes the schema-versioned assembly artifact into a `.bc` bundled in
+   an `.rlib`.
 5. The **`linker`** binary (set via `-C linker=`) loads the serialized assemblies from rlibs, merges them,
    patches in libc/intrinsic implementations, and emits the final `.NET` executable or C output.
 
-### Two-level IR (this is the key concept)
+### Single interned CIL-tree IR (this is the key concept)
 
-The `cilly` crate defines the IR. There are two generations:
+The `cilly` crate defines one IR under [cilly/src/ir/](cilly/src/ir/):
 
-- **V1 IR** — a "CIL trees" tree IR: pure value-producing `CILNode`s and side-effecting `CILRoot`s
-  ([cilly/src/cil_node.rs](cilly/src/cil_node.rs), [cilly/src/cil_root.rs](cilly/src/cil_root.rs)).
+- **CIL trees** use pure value-producing `CILNode`s and side-effecting `CILRoot`s
+  ([cilly/src/ir/cilnode.rs](cilly/src/ir/cilnode.rs), [cilly/src/ir/cilroot.rs](cilly/src/ir/cilroot.rs)).
   Only a root may write to a local/address; non-`Call` nodes have fixed arity validated at construction,
-  so malformed ops are structurally impossible. This is what the rustc backend produces directly.
-- **V2 IR** — an **interned / hash-consed** IR under [cilly/src/v2/](cilly/src/v2/), addressed by
-  `Interned<T>` handles into a `BiMap`. `Assembly::from_v1` converts V1→V2; optimization
-  ([cilly/src/v2/opt/](cilly/src/v2/opt/)), type checking ([cilly/src/v2/typecheck.rs](cilly/src/v2/typecheck.rs)),
-  and all exporters operate on V2. V2 is what gets serialized.
+  so malformed ops are structurally impossible.
+- Nodes, roots, types, signatures, and references are **interned / hash-consed** directly through
+  `Interned<T>` handles into single-storage `BiMap`s. Optimization ([cilly/src/ir/opt/](cilly/src/ir/opt/)),
+  typechecking ([cilly/src/ir/typecheck.rs](cilly/src/ir/typecheck.rs)), linking, and exporters all
+  operate on this same representation. `RelocateCtx` memoizes identity translation when assemblies
+  merge, and compaction rebuilds all ten arenas after DCE.
+- `MethodImpl::RegionBody` stores a cleanup CFG once with explicit exception-region associations;
+  IL, PE, and C share one compatibility materializer for the current physical handler shape.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §3 for why the IR became trees and the V1/V2 rationale.
+The earlier tree-plus-interned V1→V2 generations were collapsed; do not reintroduce that boundary.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §3 for the rationale.
 
-Exporters live under `cilly/src/v2/`: `il_exporter` (.NET CIL via ilasm), `c_exporter` (C source),
-`java_exporter` (JVM bytecode). The same V2 assembly drives all targets — this is why C support reuses
+Exporters live under `cilly/src/ir/`: `pe_exporter` (direct .NET PE), `il_exporter` (ilasm fallback),
+`c_exporter` (C source), and `java_exporter` (JVM bytecode). The same assembly drives all targets — this is why C support reuses
 almost the entire codebase, and why a .NET bugfix usually fixes C too.
 
 ### Workspace crates
@@ -131,9 +143,9 @@ The nightly-sensitive MIR lowering now lives in one root crate. This removes the
 - **Functional / transactional**: MIR helpers return translated values, while each mono item and codegen unit
   builds into an isolated `Assembly` shard. Only successful shards are linked into their parent, so an error or
   unwind cannot leak partially interned state into the crate assembly.
-- **Faithful-to-MIR then optimize**: V1 translation is deliberately precise-but-inefficient — every MIR
+- **Faithful-to-MIR then optimize**: initial translation is deliberately precise-but-inefficient — every MIR
   statement maps to a fixed, isolated block of CIL ops, so malformed CIL traces straight back to one MIR
-  statement. Reordering/eliminating ops is the optimizer's job (V2 `opt`). When chasing a bug, set
+  statement. Reordering/eliminating ops is the optimizer's job. When chasing a bug, set
   `OPTIMIZE_CIL=0` to keep that 1:1 mapping.
 
 ### How Rust constructs map to .NET, and the gotchas

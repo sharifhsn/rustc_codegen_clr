@@ -35,7 +35,7 @@ OS it mimics, and each extern fn needs per-OS signature + errno data.
 std was ~95% functional before the 8-month nightly jump we just ported across, so these are
 almost certainly **bit-rot from the port**, in two known-fragile areas:
 
-- **`FieldOwnerMismatch` = type-identity drift.** It fires in `cilly/src/v2/typecheck.rs`
+- **`FieldOwnerMismatch` = type-identity drift.** It fires in `cilly/src/ir/typecheck.rs`
   only when the pointee's class at a field-access site ≠ the field's declared owner class.
   Class *identity* is the demangled symbol name (incl. generic hash) from
   `rustc_symbol_mangling::symbol_name_for_instance_in_crate` via `adt_name`

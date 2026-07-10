@@ -34,7 +34,9 @@ code disagree, the **code wins** — the project moves fast and some articles pr
    → When debugging a miscompilation, set `OPTIMIZE_CIL=0` to keep the 1:1 mapping.
 2. **Pure / functional translation.** Each MIR element is handled by a pure function over immutable
    inputs, which makes panic-recovery trivial (the backend *expects* to hit unsupported code). The
-   notable mutable exception is the per-codegen-unit `TyCache`, resettable after a panic. *(see `src/lib.rs` rustdoc)*
+   mutable assembly boundary is transactional: every mono item builds in an isolated shard, and a
+   failed or panicking item is discarded without changing its parent CGU; CGUs then commit in rustc's
+   deterministic order. *(see `src/assembly_transaction.rs`)*
 
 > Why optimize MIR at all? Not for faster output — to make *compilation* faster: optimizing a
 > generic function once (pre-monomorphization) saves re-optimizing every monomorphized instance.
@@ -72,12 +74,13 @@ rlibs, merges them, patches in libc / intrinsic implementations, and emits the f
   the remainder is mostly *types* and *static data*. *(v0.1.1)*
 - **Command-line arguments** — the single hardest GSoC task; Rust uses the GNU `.init` section to grab
   argv, emulated via .NET static constructors (`.cctor`) on the `RustModule` class. *(v0.1.2, v0.2.0)*
-- **Native-library P/Invoke** generation (`native_passtrough.rs`, gated by `NATIVE_PASSTROUGH`). *(v0.1.1)*
+- **Native-library P/Invoke** generation (`native_passtrough.rs`, gated by
+  `NATIVE_PASSTHROUGH`; the historical misspelling remains an alias). *(v0.1.1)*
 
 ## 5. How Rust constructs map to .NET (and the gotchas)
 
 - **Functions** → static .NET methods; **Rust name mangling is preserved** in symbols
-  (`_ZN…E`, with `$u7b$`/`$u7d$` escapes). `ASCI_IDENT` forces ASCII-only names for stricter compilers. *(v0.0.1, v0.2.1)*
+  (`_ZN…E`, with `$u7b$`/`$u7d$` escapes). `ASCII_IDENTS` forces ASCII-only C identifiers for stricter compilers. *(v0.0.1, v0.2.1)*
 - **Generics are monomorphized.** rustc gives a `subst` (concrete type args, indexed `G0,G1,…` — MIR
   stores them by index, not name) + a `DefID` recipe. Mapping Rust generics onto *real* .NET generics
   was **tried and abandoned**: .NET forbids `LayoutKind.Explicit` on generic types (the GC can't tell
@@ -111,8 +114,8 @@ rlibs, merges them, patches in libc / intrinsic implementations, and emits the f
 - **Float→int casts: Rust saturates, .NET wraps** (and constant-folds differently again). The backend
   emits explicit range-checking cast helpers. Found via fuzzing. *(v0.1.1)*
 - `conv.r.un` yields an unspecified-width float ("F" type) → must follow with `conv.r8`. *(v0.1.2)*
-- `calli` on a null pointer crashes the runtime silently (no exception) — motivates the per-op
-  trace/console-logging debug modes (`TRACE_CIL_OPS`, and historically `TRACE_STATEMENTS`). *(v0.1.2)*
+- `calli` on a null pointer crashes the runtime silently (no exception) — use the scoped
+  `TRACE_FN`, `TRACE_VAL`, and IR dump controls to narrow the generated operation. *(v0.1.2)*
 - Two **ILASM flavours** (Mono vs CoreCLR) differ in `.line` debug-info syntax and quoting of nested
   type paths (`'A'/'B'` vs `'A/B'`); `IlasmFlavour` handles this. *(v0.1.3)*
 
@@ -120,10 +123,12 @@ rlibs, merges them, patches in libc / intrinsic implementations, and emits the f
 
 - **Panicking** (the language feature) is currently implemented via **unwinding** (the mechanism), but
   the two are distinct. *(v0.2.1)* Only MIR **terminators** can panic, so cleanup handling is per-terminator.
-- Rust **cleanup blocks** → **.NET exception handlers** (`try`/`catch`/`leave`). Central mismatch:
-  MIR cleanup blocks can jump into one another, but .NET handlers cannot → **cleanup blocks are
-  duplicated into each handler**, the main source of CIL bloat. You exit a protected region only via
-  the **`leave`** instruction (branch to an inside label, then `leave`). *(v0.1.1, v0.2.1)*
+- Rust **cleanup blocks** → **.NET exception handlers** (`try`/`catch`/`leave`). MIR cleanup blocks
+  can jump into one another, but .NET handlers cannot. `MethodImpl::RegionBody` therefore stores the
+  cleanup CFG once with explicit protected-block associations; one shared exporter compatibility
+  materializer currently expands it into the legacy per-handler shape. The serialized/link-time IR
+  avoids duplicated traversal and storage even though final CIL still duplicates physical handlers.
+  You exit a protected region only via **`leave`** (branch to an inside label, then `leave`).
 - Empty drop glue (`InstanceKind::DropGlue(_, None)`, e.g. dropping an `i64`) lowers to just a
   `CILRoot::GoTo` — hence decompiled handlers that look like empty `catch { … throw; }` ("ghost drops"). *(v0.2.1)*
 - **Performance:** Rust-on-.NET is typically 1.5–2× native (≤5× common; pathological iterators up to
@@ -152,4 +157,6 @@ rlibs, merges them, patches in libc / intrinsic implementations, and emits the f
 `TyCache`; `subst` + `DefID`, `Gn` (generics by index); `FnSig` vs `FnAbi`; `_tag`/`v_<Variant>`/`m_<n>`
 (enum layout); `DATA_PTR`/`METADATA`/`ENUM_TAG`; `TyKind::Foreign` (thin-ptr unsized); ZST / `Type::Void`;
 `RustModule` + `.cctor`; `leave` / cleanup-block duplication; `MAX_BASIC_BLOCKS` (JIT inline limit);
-`IlasmFlavour`; config flags `OPTIMIZE_CIL`, `NO_UNWIND`, `C_MODE`, `ASCI_IDENT`, `TRACE_CIL_OPS`, `NATIVE_PASSTROUGH`.
+`IlasmFlavour`; serialized artifact ABI settings `NO_UNWIND`, `DOTNET_VERSION`; linker-local output
+and policy settings `C_MODE`, `JAVA_MODE`, `NATIVE_PASSTHROUGH`; diagnostic controls
+`OPTIMIZE_CIL`, `OPT_FUEL`, `ASCII_IDENTS`.

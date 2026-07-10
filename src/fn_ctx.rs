@@ -1,6 +1,6 @@
 use cilly::Assembly;
-use rustc_middle::ty::SymbolName;
 use rustc_middle::ty::layout::HasTypingEnv;
+use rustc_middle::ty::SymbolName;
 use rustc_middle::ty::{Instance, PseudoCanonicalInput, TyCtxt};
 use rustc_span::Span;
 pub struct MethodCompileCtx<'tcx, 'asm> {
@@ -147,10 +147,6 @@ impl<'tcx> HasTypingEnv<'tcx> for MethodCompileCtx<'tcx, '_> {
 /// Escapes the name of a function
 pub fn fn_name(name: SymbolName) -> String {
     let name: String = name.to_string();
-    /*// Name TOO long
-    if *crate::config::ESCAPE_NAMES {
-        name = name.replace('.', "_dot_").replace('$', "_ds_");
-    }*/
     if name.len() > 1000 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};

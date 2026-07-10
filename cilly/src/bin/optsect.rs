@@ -21,7 +21,7 @@ fn asm_with_fuel(asm: &Assembly, path: &Path, fuel: u32) {
     eprintln!("Exported in {} ms", export_time.elapsed().as_millis());
     let mut config_path = path.to_owned();
     config_path.set_extension("runtimeconfig.json");
-    let cfg = cilly::il_exporter::get_runtime_config();
+    let cfg = cilly::il_exporter::get_default_runtime_config();
     std::fs::File::create(config_path)
         .unwrap()
         .write_all(cfg.as_bytes())

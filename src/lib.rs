@@ -148,14 +148,13 @@ mod utilis;
 pub mod config;
 mod unsize;
 // rustc functions used here.
-use cilly::{
-    Assembly, AssemblyArtifact, BuildConfig,
-    {cilnode::MethodKind, MethodRef},
-};
 use crate::{
-    assembly_transaction::assembly_transaction,
-    codegen_error::panic_payload_msg,
+    assembly_transaction::assembly_transaction, codegen_error::panic_payload_msg,
     fn_ctx::MethodCompileCtx,
+};
+use cilly::{
+    Assembly, AssemblyArtifact,
+    {cilnode::MethodKind, MethodRef},
 };
 use rustc_codegen_ssa::{
     back::archive::{ArArchiveBuilder, ArchiveBuilder, ArchiveBuilderBuilder},
@@ -164,10 +163,7 @@ use rustc_codegen_ssa::{
 };
 
 use rustc_metadata::EncodedMetadata;
-use rustc_middle::{
-    dep_graph::WorkProductMap,
-    ty::TyCtxt,
-};
+use rustc_middle::{dep_graph::WorkProductMap, ty::TyCtxt};
 use rustc_session::{
     config::{OutputFilenames, OutputType},
     Session,
@@ -181,13 +177,14 @@ pub type AString = std::sync::Arc<Box<str>>;
 
 /// An instance of the codegen.
 struct MyBackend {
-    build_config: BuildConfig,
+    config: &'static config::BackendConfig,
 }
 
 fn add_item_transactionally<'tcx>(
     parent: &mut Assembly,
     item: rustc_middle::mono::MonoItem<'tcx>,
     tcx: TyCtxt<'tcx>,
+    abort_on_error: bool,
 ) {
     let item_name = match item {
         rustc_middle::mono::MonoItem::Fn(_) | rustc_middle::mono::MonoItem::Static(_) => {
@@ -196,7 +193,7 @@ fn add_item_transactionally<'tcx>(
         rustc_middle::mono::MonoItem::GlobalAsm(_) => "<global asm>".to_owned(),
     };
 
-    if *config::ABORT_ON_ERROR {
+    if abort_on_error {
         // Deliberately do not catch this branch: an uncaught panic must resume with its original
         // payload after the uncommitted shard is dropped.
         assembly_transaction(parent, |shard| assembly::add_item(shard, item, tcx))
@@ -229,22 +226,18 @@ fn add_item_transactionally<'tcx>(
 }
 
 impl CodegenBackend for MyBackend {
-    fn name(&self)->&'static str{
+    fn name(&self) -> &'static str {
         "cg_clr"
     }
     fn target_cpu(&self, sess: &Session) -> String {
         sess.target.cpu.to_string()
     }
     /// Compiles a crate, and returns its in-memory representaion as a .NET assembly.
-    fn codegen_crate<'a>(
-        &self,
-        tcx: TyCtxt<'_>,
-
-    ) -> Box<dyn Any> {
+    fn codegen_crate<'a>(&self, tcx: TyCtxt<'_>) -> Box<dyn Any> {
         let cgus = tcx.collect_and_partition_mono_items(());
 
         let mut asm = Assembly::default();
-     
+
         let _ = cilly::utilis::get_environ(&mut asm);
 
         // Keep CGUs and their MonoItems serial and commit them in rustc's existing iteration order.
@@ -256,7 +249,7 @@ impl CodegenBackend for MyBackend {
                 assembly_transaction(&mut asm, |cgu_asm| {
                     //println!("codegen {} has {} items.", cgu.name(), cgu.items().len());
                     for (item, _data) in cgu.items() {
-                        add_item_transactionally(cgu_asm, *item, tcx);
+                        add_item_transactionally(cgu_asm, *item, tcx, self.config.abort_on_error());
                     }
                     Ok(())
                 });
@@ -312,8 +305,10 @@ impl CodegenBackend for MyBackend {
             if needs_lang_start {
                 let rustc_session::config::EntryFnType::Main { sigpipe } = kind;
                 let main_ret_ty = entrypoint.ty(tcx, penv).fn_sig(tcx).output().skip_binder();
-                let start_did = tcx
-                    .require_lang_item(rustc_hir::lang_items::LangItem::Start, rustc_span::DUMMY_SP);
+                let start_did = tcx.require_lang_item(
+                    rustc_hir::lang_items::LangItem::Start,
+                    rustc_span::DUMMY_SP,
+                );
                 let start_inst = rustc_middle::ty::Instance::expect_resolve(
                     tcx,
                     penv,
@@ -345,9 +340,7 @@ impl CodegenBackend for MyBackend {
             }
         }
 
-        let ffi_compile_timer = tcx
-            .prof
-            .generic_activity("insert .NET FFI functions/types");
+        let ffi_compile_timer = tcx.prof.generic_activity("insert .NET FFI functions/types");
         //builtin::insert_ffi_functions(&mut asm, tcx);
         drop(ffi_compile_timer);
         let name: IString = cgus
@@ -371,7 +364,6 @@ impl CodegenBackend for MyBackend {
         let target_features = if sess.target.arch == Arch::X86_64 && sess.target.os != Os::None {
             // x86_64 mandates SSE2 support and rustc requires the x87 feature to be enabled
             vec![
-
                 sym::sse,
                 //sym::sse2,
                 rustc_span::Symbol::intern("x87"),
@@ -413,7 +405,7 @@ impl CodegenBackend for MyBackend {
         // unexpectedly panicked" survives), and `cargo dotnet` buffers stderr. Mirror every panic's
         // location+message to /tmp/rcl_ice.txt so a swallowed codegen panic is recoverable. Chains
         // the previous (rustc ICE) hook so normal diagnostics are unaffected. Gated on RCL_ICE_LOG.
-        if std::env::var_os("RCL_ICE_LOG").is_some() {
+        if self.config.rcl_ice_log() {
             use std::sync::Once;
             static ICE_HOOK: Once = Once::new();
             ICE_HOOK.call_once(|| {
@@ -437,8 +429,7 @@ impl CodegenBackend for MyBackend {
                 .downcast::<(IString, Assembly)>()
                 .expect("in join_codegen: ongoing_codegen is not an Assembly");
             let asm_name = "";
-            let serialized_asm_path =
-                outputs.temp_path_for_cgu(OutputType::Bitcode, asm_name);
+            let serialized_asm_path = outputs.temp_path_for_cgu(OutputType::Bitcode, asm_name);
             //std::fs::create_dir_all(&serialized_asm_path).expect("Could not create the directory temporary files are supposed to be in.");
 
             let mut asm_out = std::fs::File::create(&serialized_asm_path).expect(
@@ -450,7 +441,7 @@ impl CodegenBackend for MyBackend {
             // the first ill-typed method; in the default advisory mode it returns the violation
             // count, which we intentionally drop here (per-method warnings are already emitted).
             let _typecheck_violations = prepared.typecheck();
-            let artifact = AssemblyArtifact::new(prepared, self.build_config.clone());
+            let artifact = AssemblyArtifact::new(prepared, self.config.artifact_abi().clone());
             asm_out
                 .write_all(
                     &artifact
@@ -523,9 +514,10 @@ impl ArchiveBuilderBuilder for RlibArchiveBuilder {
 /// Entrypoint of the codegen. This function starts the backend up, and returns a reference to it to rustc.
 pub extern "Rust" fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
     std::alloc::set_alloc_error_hook(custom_alloc_error_hook);
-    let build_config = BuildConfig::capture()
-        .unwrap_or_else(|error| panic!("invalid build configuration: {error}"));
-    Box::new(MyBackend { build_config })
+    let backend_config = config::BackendConfig::capture()
+        .unwrap_or_else(|error| panic!("invalid backend configuration: {error}"));
+    let config = config::install(backend_config);
+    Box::new(MyBackend { config })
 }
 pub use cilly::{DATA_PTR, ENUM_TAG, METADATA};
 use std::alloc::Layout;

@@ -349,6 +349,25 @@ impl BasicBlock {
         let Some(handler_id) = self.handler_id else {
             return;
         };
+        self.resolve_exception_handler(handler_id, handler_bbs, asm);
+    }
+
+    /// Materializes one explicit method-level exception-region association into the legacy
+    /// per-block handler shape consumed by the current exporters.
+    ///
+    /// Unlike [`Self::resolve_exception_handlers`], this does not read `self.handler_id`; canonical
+    /// region bodies keep that association at method scope and call this only on an exporter-local
+    /// scratch clone.
+    pub fn resolve_exception_handler(
+        &mut self,
+        handler_id: BlockId,
+        handler_bbs: &[Self],
+        asm: &mut Assembly,
+    ) {
+        assert!(
+            self.handler.is_none(),
+            "canonical exception-region block already has a materialized handler"
+        );
         // Get alive handler blocks.
         let mut handler = block_gc(handler_id, handler_bbs, asm);
         // Fix up handler jumps.

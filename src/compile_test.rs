@@ -3,7 +3,7 @@ use std::path::PathBuf;
 #[must_use]
 pub fn test_dotnet_executable(file_path: &str, test_dir: &str) -> String {
     use std::io::Write;
-    if *crate::config::DRY_RUN {
+    if crate::config::current().dry_run() {
         return String::new();
     }
     #[cfg(not(target_os = "windows"))]
@@ -15,7 +15,7 @@ pub fn test_dotnet_executable(file_path: &str, test_dir: &str) -> String {
     #[cfg(target_os = "windows")]
     let exec_path = &std::fs::canonicalize(format!("{test_dir}//{exec_path}")).unwrap();
     let mut stdout = String::new();
-    if *crate::config::C_MODE {
+    if crate::config::current().c_mode() {
         let out = std::process::Command::new("timeout")
             .current_dir(test_dir)
             .arg("-v")
@@ -44,7 +44,10 @@ pub fn test_dotnet_executable(file_path: &str, test_dir: &str) -> String {
         let mut file = std::fs::File::create(&config_path).unwrap_or_else(|err| {
             panic!("Could not create runtime config file at {config_path:?} due to {err:?}")
         });
-        file.write_all(cilly::il_exporter::get_runtime_config().as_bytes())
+        let runtime_config = cilly::il_exporter::get_runtime_config(
+            crate::config::current().artifact_abi().dotnet_runtime(),
+        );
+        file.write_all(runtime_config.as_bytes())
             .expect("Could not write runtime config");
         //RUNTIME_CONFIG
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -74,7 +77,7 @@ pub fn test_dotnet_executable(file_path: &str, test_dir: &str) -> String {
         );
         stdout = String::from_utf8_lossy(&out.stdout).to_string();
     }
-    if *IS_MONO_PRESENT && *crate::config::TEST_WITH_MONO {
+    if *IS_MONO_PRESENT && crate::config::current().test_with_mono() {
         // Execute the test assembly
         let out = std::process::Command::new("mono")
             .current_dir(test_dir)
@@ -184,7 +187,7 @@ macro_rules! compare_tests {
                             should_panic = true;
                         }
                     }
-                    if *crate::config::DRY_RUN {
+                    if crate::config::current().dry_run() {
                         return;
                     }
                     #[cfg(not(target_os = "windows"))]
@@ -276,7 +279,7 @@ macro_rules! compare_tests {
                     drop(lock);
                     //super::peverify(exec_path, test_dir);
                     eprintln!("Prepating to test with .NET");
-                    if *crate::config::DRY_RUN {
+                    if crate::config::current().dry_run() {
                         return;
                     }
                     let dotnet_out = super::super::test_dotnet_executable(exec_path, test_dir);
@@ -388,7 +391,7 @@ fn compiler(test_name: &str, test_dir: &str, release: bool) -> std::process::Com
     } else {
         cmd.arg(format!("./debug_{test_name}.exe"));
     }
-    if *crate::config::DRY_RUN {
+    if crate::config::current().dry_run() {
         cmd.args(["-Z", "no-codegen"]);
     }
     cmd.arg("-Ctarget-feature=+x87+sse");
@@ -1060,7 +1063,7 @@ static RUSTC_CODEGEN_CLR_LINKER: std::sync::LazyLock<PathBuf> = std::sync::LazyL
 /// A list of arguments needed for invoking `rustc` with this backend included.
 #[must_use]
 pub fn rustc_args() -> Box<[String]> {
-    if *crate::config::RANDOMIZE_LAYOUT {
+    if crate::config::current().randomize_layout() {
         [
             "-Z".to_owned(),
             backend_path(),
@@ -1092,7 +1095,7 @@ pub fn cargo_build_env() -> String {
     let backend = backend.display().to_string();
     let linker = RUSTC_CODEGEN_CLR_LINKER.display().to_string();
     let link_args = "--cargo-support";
-    let radomize_layout = if *crate::config::RANDOMIZE_LAYOUT {
+    let radomize_layout = if crate::config::current().randomize_layout() {
         "-Z randomize-layout"
     } else {
         ""
