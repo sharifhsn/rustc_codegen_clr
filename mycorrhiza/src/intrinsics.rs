@@ -85,6 +85,24 @@ impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str>
             arg1, arg2,
         )
     }
+    #[inline(always)]
+    pub fn static3<const METHOD: &'static str, Arg1, Arg2, Arg3, Ret>(
+        arg1: Arg1,
+        arg2: Arg2,
+        arg3: Arg3,
+    ) -> Ret {
+        rustc_clr_interop_managed_call3_::<
+            ASSEMBLY,
+            CLASS_PATH,
+            false,
+            METHOD,
+            true,
+            Ret,
+            Arg1,
+            Arg2,
+            Arg3,
+        >(arg1, arg2, arg3)
+    }
     /// A four-explicit-arg **static** call. Added specifically for
     /// [`crate::dynamic::invoke_dynamic`] (`Mycorrhiza.Reflection.DynamicInvoker.InvokeStatic` takes
     /// `(assemblyName, typeName, methodName, args)`) -- nothing else in the tree currently needs a

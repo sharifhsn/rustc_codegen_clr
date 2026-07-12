@@ -129,11 +129,19 @@ jobs:
       - name: Run product acceptance smoke
         env:
           RCL_MATRIX_PROFILES: release
-          RCL_MATRIX_CASES: soak_ahash cd_pure cd_export_ergonomics
+          RCL_MATRIX_CASES: soak_ahash cd_pure cd_subword_atomics cd_net10_bcl cd_export_ergonomics
           RCL_MATRIX_SUMMARY: ${{ runner.temp }}/product-acceptance.tsv
           RCL_MATRIX_LOG_DIR: ${{ runner.temp }}/product-acceptance-logs
           RCL_MATRIX_NATIVE_TARGET_ROOT: ${{ runner.temp }}/product-acceptance-native
         run: bash feasibility/e2e_matrix.sh
+      - name: Publish and run .NET 10 NativeAOT interop host
+        env:
+          CARGO_DOTNET_BACKEND: native
+          DOTNET_VERSION: "10"
+        run: |
+          tools/cargo-dotnet/target/release/cargo-dotnet dotnet publish cargo_tests/cd_interop/csharp --rid linux-x64
+          cargo_tests/cd_interop/csharp/bin/Release/net10.0/linux-x64/publish/cd_interop_cs | tee "$RUNNER_TEMP/nativeaot-net10.log"
+          grep -Fxq PASS "$RUNNER_TEMP/nativeaot-net10.log"
       - name: Run MSBuild integration acceptance
         env:
           RCL_MSBUILD_LOG_DIR: ${{ runner.temp }}/msbuild-acceptance-logs

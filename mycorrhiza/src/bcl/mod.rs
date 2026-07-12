@@ -29,6 +29,7 @@ pub mod datetime;
 pub mod decimal;
 pub mod environment;
 pub mod guid;
+pub mod isoweek;
 pub mod json;
 pub mod mathf;
 pub mod random;

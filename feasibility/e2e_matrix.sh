@@ -32,7 +32,7 @@ native_diff_cases=(
 # Managed-only probes cannot be compiled natively. Each must print its exact
 # completion marker only after its internal assertions/pass-count checks succeed.
 managed_selfcheck_cases=(
-    cd_bcl cd_collections cd_decimal cd_span cd_sync cd_idiomatic cd_enumerate cd_json
+    cd_bcl cd_collections cd_decimal cd_span cd_sync cd_idiomatic cd_enumerate cd_json cd_net10_bcl
     cd_delegates cd_async cd_generic cd_fatptr cd_fpfam cd_dynamic_invoke cd_pure
     cd_persisted_async cd_channel cd_tokio cd_static_field_offset cd_subword_atomics
     cd_htmlagility cd_linq_expr cd_efcore cd_linq_groupby cd_pdb cd_pdfsharp
