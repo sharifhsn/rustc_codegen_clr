@@ -67,7 +67,7 @@ run on the **real .NET backend**, `CARGO_DOTNET_BACKEND=native`) and/or the Dock
 | LINQ / EF | Expression trees built from Rust (parameters, binops, member access, constants via the new `box` primitive), compiled+executed, and handed to `Queryable.Where<T>(Expression<Func<T,bool>>)` | `cd_linq_expr` 30/30 |
 | .NET→Rust | `#[dotnet_export]` auto-marshal, `#[dotnet_class]` (ctors/statics/fields/managed fields), reusable containers, NuGet | `cd_export` 11/11, `cd_typedef` 16/16, `cd_containers*` |
 | BCL breadth | collections/DateTime/Guid/Regex/Json/… idiomatic wrappers | `cd_bcl` 313/313, `cd_json` 47/47 |
-| Tooling | `cargo dotnet` full pipeline, dual-mode (installed/DEV), macOS-ARM native + Docker Linux, `--dotnet 8|9`, MSBuild `RustDotnet.targets`, `pack`→`.nupkg` | scaffolds + cd_* consumers build hands-free |
+| Tooling | `cargo dotnet` full pipeline, dual-mode (installed/DEV), macOS/Linux/experimental Windows native, `--dotnet 8|9|10` (10 default), MSBuild `RustDotnet.targets`, `pack`→`.nupkg` | scaffolds + cd_* consumers build hands-free |
 | Perf | MIR-layer inlining + SROA + const-hoist: `iter_sum` 1764→156 ms, `iter_zip` 2765→216 ms; **whole-program NativeAOT proven** (FieldRVA sizing fixed), AOT 1.6–3.5× over JIT | `bench_rs_vs_cs`, perf docs |
 | Direct PE + PDB writer | Hand-rolled ECMA-335 PE writer is the **default** linker path, no `ilasm`; hand-rolled Portable PDB writer emits `foo.pdb`, stack traces resolve `file.rs:line` | `cargo test -p cilly --lib pe_exporter` 119/0, `cd_pdb` probe, `docs/PE_EMISSION_PLAN.md` |
 

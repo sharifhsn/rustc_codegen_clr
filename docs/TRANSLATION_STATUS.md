@@ -658,31 +658,22 @@ flow (managed-`String`/`Result` return), WF-9 (only if the consumed module's API
 The backend is fundamentally **version-agnostic** (it emits standard MSIL); everything .NET-version-
 specific is concentrated at the edges and now flows through one abstraction:
 
-- **`cilly::DotnetRuntime`** (`cilly/src/artifact.rs`) — a `Net8 < Net9` enum captured once into
-  `ArtifactAbiConfig` (default `Net8`) and serialized with every crate. Its `tfm()`,
+- **`cilly::DotnetRuntime`** (`cilly/src/artifact.rs`) — a `Net8 < Net9 < Net10` enum captured once
+  into `ArtifactAbiConfig` (default `Net10`) and serialized with every crate. Its `tfm()`,
   `assembly_ver()`, `framework_version()`, and `major()` helpers are explicitly threaded through
-  IL, PE, and runtimeconfig emission. `crate::config::dotnet9()` derives the atomic-lowering gate
-  from that immutable snapshot, so codegen and the separate linker cannot drift.
+  IL, PE, and runtimeconfig emission. Capability methods such as
+  `supports_subword_interlocked()` derive lowering gates from that immutable snapshot, so a feature
+  introduced in .NET 9 remains enabled on .NET 10 and codegen cannot drift from the linker.
 - **Edges parameterised by it:** the codegen gate (sub-word atomics → native `Interlocked` on ≥ Net9),
   the `.assembly extern .ver` stamps + runtimeconfig TFM (`il_exporter`), the launcher runtimeconfig
   (`linker/dotnet_jumpstart.rs` + `main.rs`), the fuzz-harness runtimeconfig, and the NuGet TFM
   (`cargo-dotnet pack`). **Public-key tokens are version-INVARIANT** (verified identical on 8 and 9) —
   only the `.ver` triplet flips; there is deliberately no token accessor.
-- **Front-end:** `cargo dotnet --dotnet <8|9>` (env `DOTNET_VERSION`) sets the version for the codegen
+- **Front-end:** `cargo dotnet --dotnet <8|9|10>` (env `DOTNET_VERSION`) sets the version for the codegen
   backend **and** the (separate-process) linker via one inner-cargo env seam, and selects the *matching*
-  CoreCLR ilasm (`$HOME/.dotnet/ilasm-tool` vs `ilasm9-tool` — each runtime rejects the other's PE,
-  `0x8007000C`).
-- **Verified both ways, all three paths:** the .NET 8 Docker `::stable` gate stays **426/12** (default
-  `Net8` byte-identical); `cargo dotnet run pal_panic --dotnet 9` runs to completion on the .NET 9
-  runtime **natively** AND **in Docker** (native sub-word CAS; the default-panic-hook hazard gone); and
-  `cargo_tests/cd_interop` is consumed from C# on **both** net8 + net9 (a net9 Rust lib `.ver 9:0:0:0`
-  loads from a net9 C# project, via `RustDotnetVersion` in the msbuild auto-build).
-- **Docker net9 (done):** the rcc-dev image carries the net9 runtime side-by-side + its matching
-  CoreCLR ilasm (arch-aware, placed after the rust layer so that cache survives); the bash front-end's
-  `--dotnet 9` `-e`-passes `DOTNET_VERSION` + the net9 ilasm into the container. `cargo dotnet setup`
-  fetches the net9 ilasm for clean native machines too. The net8 docker path is untouched (Mono ilasm).
-- **Floor/ceiling:** the practical floor is .NET 6 (`NativeMemory.AlignedAlloc`); forward versions
-  (10, 11, …) are additive (a new `DotnetRuntime` arm + the matching ilasm). **Remaining (minor):** the
-  other helper csproj (`rust_export_cs`, `rust_typedef_cs`, the nupkg consumer) + `validate.sh` are left
-  fixed-net8 — they only matter for dual-version variants of those specific probes (`cd_interop` is the
-  worked dual-version example).
+  matching CoreCLR ilasm (`ilasm-tool`, `ilasm9-tool`, or `ilasm10-tool`).
+- **Verified profiles:** .NET 8 retains the compatibility lowering; .NET 9 and 10 use native sub-word
+  `Interlocked` operations. .NET 10 is exercised by executable Rust, C#-consumes-Rust, and NativeAOT
+  acceptance, with `cd_net10_bcl` additionally proving a BCL API absent from earlier contracts.
+- **Floor/ceiling:** .NET 8 is the supported compatibility floor. Forward versions remain additive:
+  add one runtime-profile arm, its matching tools, and capability gates for genuinely new behavior.
