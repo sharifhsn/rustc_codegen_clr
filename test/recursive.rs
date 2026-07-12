@@ -16,7 +16,7 @@ pub struct BetterDoubleLinkedListNode<T>{
     prev:Option<*mut Self>,
     val:T,
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub fn get_nth(curr:*mut LinkedListNode<usize>,nth:usize)->Option<usize>{
     if nth == 0{
         Some(unsafe{(*curr).val})
@@ -31,7 +31,7 @@ pub fn get_nth(curr:*mut LinkedListNode<usize>,nth:usize)->Option<usize>{
          }
     }
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub fn get_nth_b(curr:*mut BetterLinkedList<usize>,nth:usize)->Option<usize>{
     if nth == 0{
         Some(unsafe{(*curr).val})
@@ -46,7 +46,7 @@ pub fn get_nth_b(curr:*mut BetterLinkedList<usize>,nth:usize)->Option<usize>{
          }
     }
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub fn get_nth_d(curr:*mut DoubleLinkedListNode<usize>,nth:usize)->Option<usize>{
     if nth == 0{
         Some(unsafe{(*curr).val})
@@ -61,7 +61,7 @@ pub fn get_nth_d(curr:*mut DoubleLinkedListNode<usize>,nth:usize)->Option<usize>
          }
     }
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub fn get_nth_back_d(curr:*mut DoubleLinkedListNode<usize>,nth:usize)->Option<usize>{
     if nth == 0{
         Some(unsafe{(*curr).val})
@@ -76,7 +76,7 @@ pub fn get_nth_back_d(curr:*mut DoubleLinkedListNode<usize>,nth:usize)->Option<u
          }
     }
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub fn get_nth_db(curr:*mut BetterDoubleLinkedListNode<usize>,nth:usize)->Option<usize>{
     if nth == 0{
         Some(unsafe{(*curr).val})
@@ -91,7 +91,7 @@ pub fn get_nth_db(curr:*mut BetterDoubleLinkedListNode<usize>,nth:usize)->Option
          }
     }
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub fn get_nth_back_db(curr:*mut BetterDoubleLinkedListNode<usize>,nth:usize)->Option<usize>{
     if nth == 0{
         Some(unsafe{(*curr).val})

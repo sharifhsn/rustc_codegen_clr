@@ -9,13 +9,13 @@
 #![allow(internal_features, incomplete_features, unused_variables, dead_code)]
 #[allow(dead_code)]
 include!("../common.rs");
-extern "C"{
+unsafe extern "C"{
     fn ldexp(x: f64, exp: i32) -> f64;
 }
 pub fn ldexp_f64(x: f64, mut exp: i32) -> f64 {
     unsafe{ldexp(x,exp)}
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub fn estimate_scaling_factor(mant: u64, exp: i16) -> i16 {
     // 2^(nbits-1) < mant <= 2^nbits if mant > 0
     let nbits = 64 - (mant - 1).leading_zeros() as i64;

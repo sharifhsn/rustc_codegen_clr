@@ -95,7 +95,7 @@ impl RNG {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn init_10body() -> [AstronomicalBody; 4] {
     let mut boides = [
         AstronomicalBody::default(),
@@ -121,7 +121,7 @@ pub extern "C" fn init_10body() -> [AstronomicalBody; 4] {
     //println!("DONE!");
     boides
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn tick_10body(boides: &mut [AstronomicalBody; 4], mut tick_count: usize) {
     let mut a_body_idx = 0;
     let mut b_body_idx = 0;

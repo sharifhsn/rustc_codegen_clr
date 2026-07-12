@@ -77,7 +77,7 @@ fn complex_function2(arg1: &CustomEnum) -> i32 {
         }
     }
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub fn return_maybeuinint_array() -> [core::mem::MaybeUninit<i32>; 16] {
     [core::mem::MaybeUninit::uninit(); 16]

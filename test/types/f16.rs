@@ -1,5 +1,6 @@
 #![feature(
     lang_items,
+    adt_const_params,
     associated_type_defaults,
     core_intrinsics,
     unsized_const_params,

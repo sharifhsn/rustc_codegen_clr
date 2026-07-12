@@ -18,7 +18,7 @@ use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::Ordering::SeqCst;
 include!("../common.rs");
 extern crate core;
-extern "C" {
+unsafe extern "C" {
     fn atomic_xor_u32(addr: &mut u32, xorand: u32) -> u32;
     fn atomic_nand_u32(addr: &mut u32, xorand: u32) -> u32;
     fn atomic_nand_u16(addr: &mut u16, xorand: u16) -> u16;
@@ -30,7 +30,7 @@ use core::ptr::addr_of_mut;
 fn main() {
     let mut u: u32 = black_box(20);
     let sub_old = unsafe {
-        core::intrinsics::atomic_xsub::<_, { AtomicOrdering::SeqCst }>(addr_of_mut!(u), 10)
+        core::intrinsics::atomic_xsub::<_, _, { AtomicOrdering::SeqCst }>(addr_of_mut!(u), 10)
     };
     unsafe { printf(c"sub_old:%lx\n".as_ptr(), sub_old) };
     test_eq!(sub_old, 20);
@@ -140,7 +140,7 @@ fn add_data() {
     test_eq!(atom.fetch_byte_sub(1, SeqCst).addr(), 1);
     test_eq!(atom.load(SeqCst).addr(), 0);
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn ptr_add_data() {
     let num = 0i64;
     let n = &num as *const i64 as *mut _;
@@ -164,7 +164,7 @@ fn ptr_add_data() {
     test_eq!(atom.fetch_byte_sub(5, SeqCst), bytes_from_n(5));
     test_eq!(atom.load(SeqCst), n);
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn int_and() {
     use std::sync::atomic::AtomicIsize;
     let x = AtomicIsize::new(0xf731);

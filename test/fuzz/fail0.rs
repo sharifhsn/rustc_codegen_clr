@@ -21,7 +21,7 @@ pub struct Adt47 {
     fld3: i8,
     ptr: (*mut i8,),
     fld5: ((isize,), [bool; 5]),
-}#[no_mangle]
+}#[unsafe(no_mangle)]
 fn problem_cast()->u128{
     core::hint::black_box(-7.000000) as u128
 }

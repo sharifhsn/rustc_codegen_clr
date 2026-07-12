@@ -25,7 +25,7 @@ macro_rules! split_off_tests {
     (ty: $ty:ty, slice: $slice:expr, method: $method:ident, $(($test_name:ident, ($($args:expr),*), $output:expr, $remaining:expr),)*) => {
         $(
             #[inline(never)]
-            #[no_mangle]
+            #[unsafe(no_mangle)]
             fn $test_name() {
                 let mut slice: $ty = $slice;
                 test_eq!($output, slice.$method($($args)*));
@@ -38,7 +38,7 @@ macro_rules! split_off_tests {
 }
 
 #[inline(never)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn split_off_first_nonempty() {
     let mut slice = &[1, 2][..];
     let original = &slice[0] as *const _;
@@ -240,10 +240,9 @@ impl<T: ?Sized> MockRc<T> {
         &self.t
     }
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn test_mockrc() {
     let rc = MockRc::new([0_u8; 16]);
     let rc = &rc as &MockRc<[u8]>;
     test_eq!(rc.get_t().len(), 16);
 }
-

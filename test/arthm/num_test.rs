@@ -15,18 +15,18 @@
 )]
 use core::num::NonZero;
 include!("../common.rs");
-extern "C" {
+unsafe extern "C" {
     fn ldexpf(arg: f32, exp: i32) -> f32;
 }
 #[inline(never)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn check_float_nan() {
     test_eq!((-9.0_f32).max(f32::NAN), -9.0);
     //test_eq!((-9.0_f64).max(f64::NAN), -9.0);
 }
 #[allow(unpredictable_function_pointer_comparisons)]
 pub fn test_variadic_fnptr() {
-    extern "C" {
+    unsafe extern "C" {
         // This needs to use the correct function signature even though it isn't called as some
         // codegen backends make it UB to declare a function with multiple conflicting signatures
         // (like LLVM) while others straight up return an error (like Cranelift).
@@ -37,19 +37,19 @@ pub fn test_variadic_fnptr() {
     test_eq!(p, q);
     test!(!(p < q));
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn cmad(a:u32,b:u32,c:u32,d:u32,e:u32,f:u32){
     let (a,b) = core::intrinsics::carrying_mul_add(a,b,c,d);
     test_eq!(a,e);
     test_eq!(b,f);
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn cmadw(a:u64,b:u64,c:u64,d:u64,e:u64,f:u64){
     let (a,b) = core::intrinsics::carrying_mul_add(a,b,c,d);
     test_eq!(a,e);
     test_eq!(b,f);
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn cmadi(a:i32,b:i32,c:i32,d:i32,e:u32,f:i32){
     let (a,b) = core::intrinsics::carrying_mul_add(a,b,c,d);
     test_eq!(a,e);
@@ -224,7 +224,7 @@ fn test_leading_trailing_ones() {
     test_eq!(x.leading_ones(), 0);
     test_eq!(x.trailing_ones(), 0);
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 fn checked_mul() {
     //test_eq!(2_i8.checked_mul(black_box(2_i8)), Some(4_i8));
@@ -416,7 +416,7 @@ pub fn checked_next_multiple_of(lhs: i8, rhs: i8) -> Option<i8> {
     }
 }
 #[inline(never)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub fn add_signed(a: i8, b: i8) -> bool {
     a.checked_add(b).is_none()
 }
@@ -451,7 +451,7 @@ fn isqrt_test() {
             .unwrap_or(true));
     }
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern fn cst_f64()->f64{
     core::hint::black_box(2_i32) as f64
 }

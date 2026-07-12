@@ -408,7 +408,7 @@ pub fn futex_wait(futex: &AtomicU32, expected: u32, timeout: Option<Duration>) -
     }
 }
 fn errno() -> i32 {
-    extern "C" {
+    unsafe extern "C" {
         fn errno() -> i32;
     }
     unsafe{errno()}
@@ -416,7 +416,7 @@ fn errno() -> i32 {
 const FUTEX_PRIVATE_FLAG:i32 = 128;
 const FUTEX_WAIT_BITSET:i32 = 9;
 const CLOCK_MONOTONIC:i32 = 1;
-extern "C" {
+unsafe extern "C" {
     fn futexw_syscall(
         call: i32,
         uaddr: *const AtomicU32,
@@ -432,7 +432,7 @@ pub fn futex_wake_all(futex: &AtomicU32) {
     let ptr = futex as *const AtomicU32;
     let op = FUTEX_WAKE | FUTEX_PRIVATE_FLAG;
     unsafe {
-        extern "C"{
+        unsafe extern "C"{
             fn syscall(scallid:i32,val:*const AtomicU32,op:i32,tout:i32);
         }
         syscall(SYS_futex, ptr, op, i32::MAX);
@@ -442,7 +442,7 @@ const SYS_futex:i32 = 202;
 const FUTEX_WAKE:i32 = 1;
 
 pub fn futex_wake(futex: &AtomicU32) -> bool {
-    extern "C"{
+    unsafe extern "C"{
         fn syscall(scallid:i32,val:*const AtomicU32,op:i32,tout:i32)->i32;
     }
     let ptr = futex as *const AtomicU32;

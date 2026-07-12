@@ -1,5 +1,5 @@
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern fn seven_if_even(input:i32)->i8{
     if input % 2 == 0{
         7
@@ -8,7 +8,7 @@ pub extern fn seven_if_even(input:i32)->i8{
         0
     }
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern fn test_match(pi_digit:i32)->i32{
     match pi_digit{
         0=>3,
@@ -26,7 +26,7 @@ pub extern fn test_match(pi_digit:i32)->i32{
         _=>9,
     }
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern fn sum(mut iterations:i64)->i64{
     let mut sum = 0;
     while iterations > 0{

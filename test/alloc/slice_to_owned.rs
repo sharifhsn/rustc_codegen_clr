@@ -228,7 +228,7 @@ impl Layout {
     }
 }
 #[allow(dead_code)]
-extern "C" {
+unsafe extern "C" {
     fn puts(msg: *const u8);
     fn malloc(size: usize) -> *mut core::ffi::c_void;
     fn free(ptr: *mut core::ffi::c_void);

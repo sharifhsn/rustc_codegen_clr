@@ -8,7 +8,7 @@
 #![allow(internal_features, incomplete_features, unused_variables, dead_code)]
 #[allow(dead_code)]
 include!("../common.rs");
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn u128max_ovf_check() {
     test!(std::hint::black_box(2_i128).checked_pow(2).is_some());
     test!(
@@ -17,14 +17,14 @@ fn u128max_ovf_check() {
             .1
     );
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 fn option_const() {
     const OPTION: Option<usize> = Some(32);
     const REF: Option<&usize> = OPTION.as_ref();
     assert_eq!(REF, Some(&32));
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 fn const_opt() {
     const OPTION: Option<usize> = Some(32);
@@ -34,7 +34,7 @@ fn const_opt() {
     test_eq!(*Some(&32).unwrap(), 32);
     test_eq!(REF, Some(&32));
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn test_isqrt() {
     let res = sqrts::u128(<u128>::MAX);
     unsafe { printf(c"res:%lx%lx\n".as_ptr(), res as u64, (res >> 64) as u64) };
@@ -145,7 +145,7 @@ macro_rules! last_stage {
         s
     }};
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn test() {
     test_isqrt();
     let mut n: u128 = 0;
@@ -189,7 +189,7 @@ fn isqrt_consistency_check(n: u128) {
         );
     }
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn max_ones() {
     test_eq!(u128::MAX.count_ones(), u128::BITS);
 }

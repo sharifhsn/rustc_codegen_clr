@@ -1,6 +1,6 @@
 # Architecture rework execution ledger
 
-Status: complete — all five phases implemented and architecture gates exercised
+Status: architecture implementation complete; post-Edition-2024 verification in progress
 Started: 2026-07-09
 Branch: `codex/rearchitecture`
 
@@ -15,7 +15,8 @@ starts.
 2. Replace ad-hoc cross-assembly reconstruction with exhaustive, memoized relocation.
 3. Parse build configuration once and carry one immutable contract through codegen and linking.
 4. Resolve generated builtin dependencies to a fixed point instead of relying on a pass count.
-5. Make method/codegen-unit construction transactional, then use the isolation for parallel codegen.
+5. Make method/codegen-unit construction transactional and prove serial/parallel equivalence before
+   enabling parallel codegen scheduling.
 6. Reduce the nightly-sensitive rustc-facing crate surface without weakening the `cilly` boundary.
 7. Represent exception regions without eagerly copying cleanup CFGs, then optimize their final
    lowering only after equivalence is proven.
@@ -84,7 +85,7 @@ Gate: negative test proving a post-link mutation cannot reach an exporter withou
 ### 1C. Immutable build contract
 
 Implemented 2026-07-09 and completed 2026-07-10. Codegen captures one immutable `BackendConfig`;
-only `ArtifactAbiConfig { dotnet_runtime, no_unwind }` is serialized in the schema-v3 artifact
+only `ArtifactAbiConfig { dotnet_runtime, no_unwind }` is serialized in the versioned artifact
 envelope. The linker captures one typed `LinkerConfig`, validates its process ABI against every
 versioned input, then uses the validated artifact ABI as the authority for runtime/unwind behavior.
 Target selection, alignment repair, allocator policy, managed panic backtraces, native pass-through,
@@ -176,8 +177,9 @@ become export-ready. Methods without a protected region retain compact legacy `M
 
 IL, direct PE, and C call one shared compatibility materializer, preserving the previous physical
 handler shape while the serialized/link-time IR avoids the duplication. `RegionBody` was appended as
-postcard enum tag 4 and the artifact envelope moved to schema v3, which rejects schema v2 before
-payload decoding. Measured panic-heavy artifacts previously spent 60–68% of ordinary handler text on
+postcard enum tag 4 and the artifact envelope moved to schema v3 at this phase, which rejected schema
+v2 before payload decoding. The later fixed-array layout hardening moved the current envelope to
+schema v4. Measured panic-heavy artifacts previously spent 60–68% of ordinary handler text on
 duplicate normalized handlers in two representative cases; exporter-time physical sharing remains a
 separate optimization because ECMA-335 forbids arbitrary overlap between distinct exception clauses.
 
@@ -187,6 +189,24 @@ separate optimization because ECMA-335 forbids arbitrary overlap between distinc
 
 Gate: unwind differential tests, `catch_unwind`, nounwind/double-panic abort behavior, direct-PE vs
 IL equivalence, IL-size measurements, RyuJIT inlining observations, and the performance corpus.
+
+## Post-phase hardening from the expanded campaign
+
+The broader end-to-end campaign found three correctness boundaries that were not visible in the
+original phase gates. They were fixed at shared architectural boundaries and covered by regressions:
+
+- Fixed-array classes now carry serialized `FixedArrayLayout` provenance: semantic element type,
+  semantic total size, length, and managed representation type. `Assembly` validates this metadata
+  after artifacts are linked and again before export. Link-order tests cover both ownership orders,
+  and representation-expanded element arrays are rejected with a precise assembly-invariant error
+  instead of inheriting a shard-local or CLR `sizeof(T)` stride. This wire-format change introduced
+  schema v4 (`CILLYAR4`); v1, v2, and v3 inputs receive explicit compatibility diagnostics.
+- Current rustc permits `atomic_xsub<T, U>` with a source operand type different from the atomic
+  destination type. Lowering now selects the operation from `T`, casts `U` to `T`, performs negation
+  in `T`, and adapts the raw pointer to the builtin's by-reference ABI explicitly.
+- C emission now uses its explicit-layout exception stub, supplies the terminate-path string-concat
+  shim, and preserves native-integer-to-pointer casts at pointer/ref local-store boundaries. These
+  fixes address shared exporter/runtime contracts rather than test-specific output.
 
 ## Validation cadence
 
@@ -208,24 +228,41 @@ Recorded 2026-07-10 on macOS/aarch64 with `nightly-2026-06-17`:
 
 | Gate | Result |
 |---|---|
-| `cargo test -p cilly` | 291 passed, 2 ignored across 5 suites |
-| `cargo check --workspace` | 0 errors; only the repository's existing warning set |
-| focused verifier/alias/transaction/config/pthread tests | passed |
-| `compile_test::fastrand_test::stable::cargo_release` (.NET) | passed end to end |
-| focused C `abox`, `adt_enum`, `caller_location`, `copy_nonoverlaping` | passed end to end |
-| CI-equivalent `.NET ::stable` aggregate | 202 passed, 238 failed, 52 filtered; zero final-verifier or linker failures |
-| CI-equivalent C `::stable` aggregate | 51 passed, 369 failed, 72 filtered in the final parallel run |
+| `cargo test -p cilly` | 324 passed, 2 ignored, 0 failed |
+| `cargo check --workspace --target aarch64-apple-darwin` | 0 errors; only the repository's existing warning set |
+| `cargo test --manifest-path tools/cargo-dotnet/Cargo.toml` | 39 passed, 0 failed |
+| expanded affected Rust/.NET matrix | 67/67 passed in serialized debug/release execution with zero diagnostics |
+| focused fixed-array regressions | ZST iteration, ADT-name collision, fixed-array layout identity, and SIMD layout premises passed in debug/release |
+| Direct PE vs textual IL | C# export ergonomics (6/6), `catch_panic`, abort, and double-panic behavior matched |
+| focused C regressions | `adt_enum`, atomics, and fixed-array layout identity passed in debug/release |
 
-The historical aggregate is not a clean acceptance gate on this host/toolchain. Its remaining
-failures fall into three independently visible classes: test-source drift against the pinned
-nightly (`atomic_xsub` gained a type parameter, `catch_unwind` returns `bool`, removed
-`MaybeUninit::fill`/feature combinations), long-standing semantic output mismatches, and severe
-parallel harness saturation (many generated executables time out only during the all-at-once run
-while the same focused tests pass). The rearchitecture's initial strict-verifier fanout was fixed at
-the shared ABI boundaries rather than suppressed. The C run likewise exposed and fixed two shared
-runtime-header omissions, `Environment.Exit` and `Environment.FailFast`; representative affected
-tests pass individually afterward. These residual corpus failures are recorded rather than folded
-into the architecture contract or hidden by weakening verification.
+The repository-wide parallel aggregate is not a clean acceptance gate on this host/toolchain. The
+most recent standalone .NET observation was 206 passed, 238 failed, and 63 filtered; the most recent
+C observation was 60 passed, 364 failed, and 83 filtered. Both aggregate observations predate some
+of the fixes above, so they are diagnostic history, not final acceptance evidence. Their failures
+mixed test-source drift against the pinned nightly, long-standing semantic output mismatches, and
+severe parallel harness saturation (many generated executables time out only during the all-at-once
+run while the same focused tests pass). Source drift in `atomic_xsub`, `catch_unwind`,
+`MaybeUninit`, f16 features, and JSON target-spec handling was repaired; focused regressions pass
+afterward. Remaining aggregate failures are recorded rather than hidden by weakening verification.
+
+Rerun 2026-07-11 after completing the Edition-2024 test-source migration (the drift sweep had missed
+~40 direct-rustc fixtures still carrying bare `extern "C"` blocks, a hard error under
+`--edition 2024` — including 11 fuzz files grep classified as binary): the .NET aggregate is now
+222 passed / 222 failed / 63 filtered with ZERO compile-infrastructure failures. The machine-local
+pre-rearchitecture baseline on the identical skip set was 204 passed / 244 failed, so the campaign
+plus the completed migration is a net local improvement, not a regression. Every remaining aggregate
+failure is attributed: ~208 are the fuzz differential corpus, which mass-fails on this macOS/aarch64
+host with the same runtime trace-mismatch signature BEFORE the rearchitecture (Linux CI keeps them
+green; a separate platform investigation, not campaign fallout), and the rest are the `fail*`
+load-sensitive family plus `arg_test` — the latter proven pre-existing by rebuilding a
+pre-rearchitecture worktree (`c17a0f4a`) and reproducing the identical `Called abort!` there.
+End-to-end interop was re-verified through the new stack: the four-wall
+`cd_class_ergonomics` suite passes 11/11 (static fields, SpecialName operators, base-ctor
+forwarding) after re-syncing `~/.cargo-dotnet` via `cargo dotnet setup --from-repo` — note that
+copying only the dylib+linker is no longer sufficient when the target spec (`env: gnu`), overlays,
+or `cargo-dotnet` itself changed; the stale-home failure signature is `libc` failing with
+`E0432 unresolved import pthread/unistd`.
 
 ## Decision log
 
@@ -250,3 +287,6 @@ into the architecture contract or hidden by weakening verification.
 - 2026-07-10: make linker overrides exact-symbol by default and permit demangled resolution only
   through a closed full-path rustc-runtime allowlist; centralize explicit pointer/native-int wrapper
   adaptation in `Assembly` so aliases are verifier-visible and unit-testable.
+- 2026-07-10: version fixed-array semantic layout provenance in schema v4 and validate it after
+  linking and before export; reject representation-expanded element layouts rather than allowing
+  CLR physical size to silently replace Rust pointer-arithmetic semantics.

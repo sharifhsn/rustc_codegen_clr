@@ -41,7 +41,7 @@ fn dump_var(
         printf(c"\n".as_ptr());
     }
 }
-extern "C" {
+unsafe extern "C" {
     fn printf(fmt: *const c_char, ...) -> c_int;
 }
 trait PrintFDebug {

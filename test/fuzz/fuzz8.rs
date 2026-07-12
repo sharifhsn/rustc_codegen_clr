@@ -6,7 +6,7 @@
 
     use std::ffi::{c_char, c_int};
 
-    extern "C" {
+    unsafe extern "C" {
         fn printf(fmt: *const c_char, ...) -> c_int;
     }
     trait PrintFDebug{
@@ -5627,4 +5627,3 @@ fld1: (u8, [i64; 6]),
 fld2: i16,
 
 }}
-

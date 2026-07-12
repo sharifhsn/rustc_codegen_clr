@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicIsize, AtomicPtr, Ordering};
 // strings, which allows the code in this file to be very simple.
 static ARGC: AtomicIsize = AtomicIsize::new(0);
 static ARGV: AtomicPtr<*const u8> = AtomicPtr::new(ptr::null_mut());
-extern "C" {
+unsafe extern "C" {
     fn fork() -> i32;
     static mut environ: *mut *mut i8;
 }
@@ -64,7 +64,7 @@ static ARGV_INIT_ARRAY: extern "C" fn(core::ffi::c_int, *const *const u8, *const
     init_wrapper
 };
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn load_environ() -> *mut *mut i8 {
     unsafe { environ }
 }

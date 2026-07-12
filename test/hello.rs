@@ -1,7 +1,7 @@
 #![feature(lang_items)]
 #![allow(internal_features)]
 #![feature(core_intrinsics)]
-extern "C" {
+unsafe extern "C" {
     fn puts(string:*const u8);
     fn malloc(size:usize)->*mut ();
     fn free(ptr:*const ());

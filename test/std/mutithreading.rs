@@ -31,7 +31,7 @@ fn thread_start(data: *mut ()) {
     unsafe { printf(c"Hello from a launched thread!\n".as_ptr()) };
 }
 
-extern "C" {
+unsafe extern "C" {
 
     fn pthread_create(
         __newthread: *mut pthread_t,
@@ -58,7 +58,7 @@ pub union pthread_attr_t {
     pub __size: [core::ffi::c_char; 56],
     pub __align: core::ffi::c_long,
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn thread1(mut arg: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
     printf(c"Hi from a thread".as_ptr());
     c"Very secret message".as_ptr() as *mut core::ffi::c_void

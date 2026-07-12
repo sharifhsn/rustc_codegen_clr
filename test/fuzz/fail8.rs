@@ -9,7 +9,7 @@
 #![allow(dead_code, unused_imports, unused_mut)]
 use std::ffi::{c_char, c_int};
 use std::intrinsics::mir::*;
-extern "C" {
+unsafe extern "C" {
     fn printf(fmt: *const c_char, ...) -> c_int;
 }
 trait PrintFDebug {

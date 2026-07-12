@@ -11,7 +11,7 @@
 
 use std::autodiff::autodiff;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[autodiff(df, Reverse, Active, Active, Active)]
 fn primal(x: f32, y: f32) -> f64 {
     (x * x * y) as f64

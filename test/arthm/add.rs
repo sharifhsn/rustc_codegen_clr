@@ -9,7 +9,7 @@
 #[allow(dead_code)]
 include!("../common.rs");
 #[inline(never)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn mag(x: f32, y: f32) -> f32 {
     x * x + y * y
 }

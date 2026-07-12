@@ -373,7 +373,7 @@ fn layout_round_up_to_align_edge_cases() {
     }
    
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn do_nothing(a:u32)->u32{
     a
 }
@@ -384,7 +384,7 @@ struct Vec3{
     z:f32,
     }
 #[inline(never)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn vec3_add(a:Vec3,b:Vec3)->Vec3{
     return Vec3{x: a.x + b.x, y: a.y + b.y, z: a.z + b.z};
 }

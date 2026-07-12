@@ -12,6 +12,32 @@
 include!("../common.rs");
 fn main() {
     use std::fmt::Debug;
+    use std::ops::{Index, IndexMut};
+
+    struct ZeroDim([usize; 0]);
+
+    impl Index<usize> for ZeroDim {
+        type Output = usize;
+
+        #[inline(never)]
+        fn index(&self, index: usize) -> &Self::Output {
+            &self.0[index]
+        }
+    }
+
+    impl IndexMut<usize> for ZeroDim {
+        #[inline(never)]
+        fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+            &mut self.0[index]
+        }
+    }
+
+    // Merely taking these method addresses forces codegen of the same intermediate-ZST projection
+    // used by ndarray's `Dim<[usize; 0]>` Index/IndexMut impls. Calling either method would correctly
+    // panic for every index; the regression is that lowering the unreachable element access must not
+    // ICE and replace the method with a backend-generated throwing stub.
+    std::hint::black_box(<ZeroDim as Index<usize>>::index);
+    std::hint::black_box(<ZeroDim as IndexMut<usize>>::index_mut);
 
     fn test<T: Copy + Debug + PartialEq>(x: T) {
         let v: &[T] = &[x, x, x];
@@ -136,7 +162,7 @@ fn main() {
     test_mut([0u32; 0]); // ZST with alignment > 0*/
 }
 #[inline(never)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn zst_issue(){
     let v: &[()] = &[()];
     test_eq!(v.iter().nth(1), None);

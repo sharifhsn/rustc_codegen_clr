@@ -49,6 +49,25 @@ cp target/release/linker ~/.cargo-dotnet/bin/linker
 Then rebuild the target crate with `--clean` at least once to rule out stale `.bc` (see the build-std
 fingerprint trap in memory / `docs/GAPS.md`).
 
+**Copying dylib+linker is NOT enough when the target spec, overlays, or `cargo-dotnet` itself changed**
+(post-rearchitecture footgun, hit 2026-07-11): `~/.cargo-dotnet` also holds the target JSON
+(`target/x86_64-unknown-dotnet.json` — now `env: "gnu"`), the `dotnet_overlays/` registry copy, and the
+PAL-injected rust-src. If any of those drift from the repo, `build-std` fails INSIDE `libc` with
+`E0432 unresolved import pthread/unistd` + ``fpos64_t` is ambiguous`` — that error signature means
+"installed home is a different generation than the repo," not a code bug. Fix by re-syncing everything:
+
+```bash
+cargo install --path tools/cargo-dotnet
+cargo dotnet setup --from-repo /path/to/rustc_codegen_clr   # do NOT prefix PATH with the raw
+                                                            # toolchain bin — setup invokes
+                                                            # `cargo +nightly-...`, which needs the
+                                                            # rustup shim first on PATH
+```
+
+Serialized-artifact schema bumps (the envelope is `CILLYAR4` as of the 2026-07 rearchitecture) are at
+least loud now: a stale `.bc` gets a precise "unsupported cilly artifact version" diagnostic instead of
+a deep postcard error, but you still need `--clean` to actually regenerate it.
+
 **`ALLOW_UNVERIFIED_BASE=1`**: `#[dotnet_class(extends = "...")]` only accepts bases on a small
 proven-safe allowlist (`dotnet_macros/src/lib.rs::EXTENDS_ALLOWLIST` — currently just `System.Object`
 and `BackgroundService`). To subclass anything else (like the Wall-4 test's `Widget`), set this env var
@@ -60,18 +79,19 @@ wrongly applies the custom .NET backend to HOST-side build-script compilation to
 `missing methiod ... getenv`. Always use `cargo dotnet build <path>` (unset RUSTFLAGS) for any crate
 using `dotnet_macros` — never hand-export RUSTFLAGS for these.
 
-**`cargo test ::stable` currently shows ~244 failures — this is PRE-EXISTING, not something to chase.**
-Root cause, confirmed via a strict A/B `git stash` comparison (identical failures with and without this
-session's changes): every `cargo_tests/*` directory carries a stale, gitignored `.cargo/config.toml`
-(left over from earlier `cargo-dotnet` sessions) that forces a JSON custom target spec
-(`~/.cargo-dotnet/target/x86_64-unknown-dotnet.json`) which a newer nightly cargo now rejects with
-`` `.json` target specs require -Zjson-target-spec ``. This only affects the `compile_test.rs` harness's
-own `cargo build`/`std`-dependent test variants (names containing `cargo_release`/`cargo_debug`, or
-`run_test!{std, ...}` entries like `once_lock_test`/`uninit_fill`) — NOT the direct-rustc-invoked bulk of
-the suite. Sanity-checked: 106/125 non-fuzz, non-cargo, non-build-std tests pass with zero new failure
-categories. **Do not "fix" this by deleting the stale configs repo-wide without understanding whether
-some other in-flight workflow depends on them** — flag it to the user first; it's a `cargo-dotnet`
-tooling-generation conflict, not a code bug.
+**The `` `.json` target specs require -Zjson-target-spec `` harness failure is FIXED** (it caused ~244
+apparent `::stable` failures pre-2026-07-11, confirmed pre-existing via a strict A/B `git stash`
+comparison): the gitignored `.cargo/config.toml` each `cargo_tests/*` dir carries forces a JSON custom
+target spec that newer nightly cargo rejects without the flag. The rearchitecture's verification pass
+added `-Zjson-target-spec` at all four `compile_test.rs` cargo-invocation sites, so the harness's
+`cargo_release`/`cargo_debug`/`run_test!{std,...}` variants build again. If you see that error string
+anywhere else (e.g. hand-running `cargo build` inside a `cargo_tests/*` dir), add the flag — don't
+delete the config files; `cargo dotnet` regenerates them and other workflows depend on them.
+
+**Local aggregate `::stable` numbers are noisy under parallel load** — generated executables time out
+under the all-at-once run while the same tests pass focused (documented in `docs/REARCHITECTURE.md`'s
+validation snapshot). `.github/scripts/gate.sh` now retries each initial failure in isolation and only
+fails on reproducing failures; use that (or focused runs) rather than trusting one aggregate count.
 
 ---
 
@@ -120,9 +140,11 @@ raw `initobj`/default-value pattern elsewhere) before designing the ctor surface
 `is_abstract` (method-level, for interface members) but `ClassDef` has nothing for "this whole class is
 abstract/sealed" at the TYPE level. Needs: a new `ClassDef` field + a `TypeAttributes` flag write in the
 PE exporter (`cilly/src/ir/pe_exporter/export.rs`) + macro surface (`sealed = true`/`abstract = true` on
-`#[dotnet_class]`). Moderate, well-scoped, same shape as Wall 1. **If you add this field, remember §5's
-`asm_link.rs` landmine — the class-level equivalent of `translate_method_def` for `ClassDef` must also be
-checked for the same field-loss risk.**
+`#[dotnet_class]`). Moderate, well-scoped, same shape as Wall 1. Adding the field is now
+compile-fenced: the 2026-07 rearchitecture replaced the old field-by-field reconstruction with
+exhaustive `RelocateValue` destructures (no `..`), so `ClassDef::relocate` in `cilly/src/ir/class.rs`
+will refuse to compile until the new field is explicitly handled — the silent-drop landmine §5
+originally warned about is structurally closed.
 
 **Wall 7 — generic `#[dotnet_class]` classes.** `PendingClass.type_generics` is ALREADY tracked and
 threaded through for `#[dotnet_interface]` (generic interfaces work — see WF-9 unlock in memory). The
@@ -182,36 +204,25 @@ exact-DefId enum replacing three independently hand-copied substring-matched lis
 `c8a7680b` from earlier this campaign). `comptime.rs` is the one remaining place using the old style.
 Low risk, mechanical, same pattern to copy.
 
-**Fix 2 — `cilly/src/ir/asm_link.rs::translate_method_def`'s field-by-field `MethodDef` reconstruction
-is a proven, REPEAT-OFFENDING landmine.** This function is the linker's cross-assembly `MethodDef`
-merge step (runs every time a `.bc` crosses the linker — i.e. every real build). It rebuilds via
-`MethodDef::new()` (defaults every additive field to `false`/empty) then manually re-applies ONLY the
-fields someone remembered to list: `overrides`, `is_abstract`, `out_params`, `generic_params`. **This
-session's Wall 2 bug was exactly this class of bug for the THIRD time** — `is_special_name` was added to
-`MethodDef` but not added to this re-application list, so it silently vanished on every real (linked)
-build while unit tests kept passing. The existing code even has doc comments on the neighboring
-`out_params`/`generic_params` blocks warning about this exact hazard — the warning didn't stop it from
-happening again.
-
-The structural fix: since almost every field on `MethodDef` is either plain data (needs blind
-re-application) or an interned handle (needs explicit retranslation anyway), switch from
-"`MethodDef::new()` + growing whitelist" to an **exhaustive destructure with no `..` catch-all**:
-```rust
-let MethodDef { name, sig, overrides, is_abstract, out_params, generic_params, is_special_name, /* every field, no .. */ } = def;
-```
-This turns "a new field was added to `MethodDef` but not threaded through the linker" from a **silent
-runtime bug** into a **compile error** (the destructure won't compile until the new field is explicitly
-handled). This is the single highest-value structural fix available before Wall 6 (which needs a new
-`ClassDef`-level field with the identical class of risk) or any future `MethodDef` field is added.
-Small diff, no behavior change for existing fields, pure safety-net.
+**Fix 2 — the linker's field-by-field `MethodDef` reconstruction landmine: IMPLEMENTED** (by the
+2026-07 `codex/rearchitecture` campaign, Phase 2A — see `docs/REARCHITECTURE.md`). History for context:
+the old `asm_link.rs::translate_method_def` rebuilt `MethodDef` via `MethodDef::new()` + a manually
+maintained re-application whitelist, and silently dropped a newly added field THREE times
+(`out_params`, `generic_params`, and Wall 2's `is_special_name` — the last one root-caused in this
+campaign). The rearchitecture replaced that function entirely with `RelocateValue` impls that
+exhaustively destructure with **no `..` catch-all** (`MethodDef::relocate` in `cilly/src/ir/method.rs`,
+`ClassDef`/`StaticFieldDef` in `cilly/src/ir/class.rs`), plus an exhaustive `Assembly` arena fence and
+an `is_special_name` round-trip regression test in `asm_link.rs`. A new `MethodDef`/`ClassDef` field now
+FAILS COMPILATION until relocation handles it — verified 2026-07-11 by running this doc's
+`cd_class_ergonomics` suite (11/11, including SpecialName operators) through the new linker.
 
 ---
 
 ## 6. Where to start
 
 1. Read this doc fully before touching code — it front-loads every footgun that cost time this session.
-2. If continuing wall-closing: apply Fix 1 and Fix 2 above FIRST (small, mechanical, de-risks everything
-   downstream), then work Wall 10 → 6 → 8 → 9 → 5 → 7 in that order.
+2. If continuing wall-closing: apply Fix 1 above FIRST (Fix 2 is already done — see §5), then work
+   Wall 10 → 6 → 8 → 9 → 5 → 7 in that order.
 3. Every wall needs the same rhythm that worked for 1-4: implement (macro + intrinsic + comptime.rs
    dispatch + `finish_type` wiring) → rebuild backend+linker → reinstall to `~/.cargo-dotnet/bin/` →
    extend `cargo_tests/cd_class_ergonomics` with a real C# consumer check → run it → only then commit.

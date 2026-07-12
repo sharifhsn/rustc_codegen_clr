@@ -19,7 +19,7 @@ use std::ops::Mul;
 use std::ops::Neg;
 use std::ops::Div;
 use std::mem::MaybeUninit;
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 fn ub(){
     let res = FullDecoded::Finite(Decoded {
@@ -258,7 +258,7 @@ pub enum FullDecoded {
     Finite(Decoded),
 }
 impl FullDecoded{
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     fn print(&self){
         let discr = std::mem::discriminant(self);
         unsafe{printf(c"%x %lu\n".as_ptr(), self as *const _,std::mem::transmute::<_,u64>(discr))};

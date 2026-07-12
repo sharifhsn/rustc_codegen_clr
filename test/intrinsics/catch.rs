@@ -66,7 +66,7 @@ pub unsafe fn r#try<R, F: FnOnce() -> R>(f: F) -> Result<R, ()> {
     // - `do_catch`, the second argument, can be called with the `data_ptr` as well.
     // See their safety preconditions for more information
     unsafe {
-        return if core::intrinsics::catch_unwind(do_call::<F, R>, data_ptr, do_catch::<F, R>) == 0 {
+        return if !core::intrinsics::catch_unwind(do_call::<F, R>, data_ptr, do_catch::<F, R>) {
             Ok(ManuallyDrop::into_inner(data.r))
         } else {
             Err(ManuallyDrop::into_inner(data.p))

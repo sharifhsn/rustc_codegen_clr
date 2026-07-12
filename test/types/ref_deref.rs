@@ -7,7 +7,7 @@
 )]
 #![allow(internal_features, incomplete_features, unused_variables, dead_code)]
 include!("../common.rs");
-extern "C" {
+unsafe extern "C" {
     static __rust_no_alloc_shim_is_unstable: u8;
 }
 

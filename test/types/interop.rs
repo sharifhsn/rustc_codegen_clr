@@ -45,7 +45,7 @@ struct RustcCLRInteropManagedCustomClassDef_CustomTypedef {
     total_happy: RustcCLRInteropFieldDef<usize, PUBLIC, true>,
 }
 /*
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern fn tydef_custom_typedef(_:&RustcCLRInteropManagedCustomClassDef_CustomTypedef){}*/
 /*
 fn is_happy()->MString{
@@ -73,7 +73,7 @@ struct RustcCLRInteropManagedArray<T, const DIMENSIONS: usize> {
 }
 impl From<char> for RustcCLRInteropManagedChar {
     fn from(c: char) -> RustcCLRInteropManagedChar {
-        extern "C" {
+        unsafe extern "C" {
             fn managed_char_from_utf8(c: char) -> RustcCLRInteropManagedChar;
         }
         unsafe { managed_char_from_utf8(c) }

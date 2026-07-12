@@ -161,14 +161,14 @@ for i in iter {
     }
 }
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn last(s:&[u8])->&u8{
     let [.., last] = s else {
         unsafe{std::hint::unreachable_unchecked()};
     };
     last
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn get_last(s:&[u8])->u8{
     let [.., last] = s else {
         unsafe{std::hint::unreachable_unchecked()};

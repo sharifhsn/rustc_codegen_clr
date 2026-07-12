@@ -9,7 +9,7 @@
 extern crate core;
 use core::intrinsics::mir::*;
 use std::ffi::{c_char, c_int};
-extern "C" {
+unsafe extern "C" {
     fn printf(fmt: *const c_char, ...) -> c_int;
 }
 trait PrintFDebug {

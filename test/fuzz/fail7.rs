@@ -16,7 +16,7 @@ Return()
 }
 }
 }
-extern "C" {
+unsafe extern "C" {
     fn printf(fmt: *const c_char, ...) -> c_int;
 }
 trait PrintFDebug{

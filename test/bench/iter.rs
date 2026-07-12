@@ -1,7 +1,7 @@
 use std::ffi::c_char;
 use std::ffi::c_int;
 use std::hint::black_box;
-extern "C" {
+unsafe extern "C" {
     fn printf(fmt: *const c_char, ...) -> c_int;
 }
 fn bench_for_each_chain_fold<const BIG: u32>() -> u32 {

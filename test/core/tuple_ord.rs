@@ -11,7 +11,7 @@
 #![allow(internal_features, incomplete_features, unused_variables, dead_code)]
 include!("../common.rs");
 #[inline(never)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn assert_ne(a:f64,b:f64){
     test!(!((a,) <= (b,)));
 }
