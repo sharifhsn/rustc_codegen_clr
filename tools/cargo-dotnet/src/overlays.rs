@@ -198,7 +198,9 @@ pub fn apply(ctx: &Context) -> Result<()> {
                 continue; // a non-locked major of a multi-version name — skip its dir.
             }
         }
-        paths_lines.push_str(&format!("    \"{}\",\n", dir.display()));
+        // Path's Debug representation is a quoted, escaped string suitable for TOML on both Unix
+        // and Windows. Display would emit `D:\...` with unescaped backslashes.
+        paths_lines.push_str(&format!("    {dir:?},\n"));
     }
 
     // STEP 3: regenerate the explicit build-local config with the filtered paths.
