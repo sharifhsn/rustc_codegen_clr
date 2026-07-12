@@ -330,6 +330,10 @@ pub struct PublishArgs {
     /// the referenced Rust crate as part of the same invocation via that import.
     pub path: Option<PathBuf>,
 
+    /// Target .NET runtime profile. Controls the Rust contract, host TFM, and reported output.
+    #[arg(long, value_name = "8|9|10", default_value = "10", env = "DOTNET_VERSION")]
+    pub dotnet: String,
+
     /// Debug configuration (default: Release — NativeAOT publishing a Debug build is
     /// supported by the SDK but rarely what you want).
     #[arg(long)]

@@ -31,6 +31,7 @@ use std::process::Command;
 use anyhow::{Context as _, Result, bail};
 
 use crate::cli::PublishArgs;
+use crate::context::DotnetVersion;
 use crate::host::{self, HostFacts};
 
 pub fn run(args: &PublishArgs) -> Result<i32> {
@@ -39,6 +40,7 @@ pub fn run(args: &PublishArgs) -> Result<i32> {
         .with_context(|| format!("no such directory: {}", proj_dir.display()))?;
 
     let csproj = find_csproj(&proj_dir)?;
+    let dotnet: DotnetVersion = args.dotnet.parse().map_err(anyhow::Error::msg)?;
 
     // host preflight: dotnet reachable (self-healing from $HOME/.dotnet, same as the
     // build/run path). NativeAOT publish additionally needs a native C toolchain
@@ -69,12 +71,14 @@ pub fn run(args: &PublishArgs) -> Result<i32> {
         .arg(&rid)
         .arg("--self-contained")
         .arg("-p:PublishAot=true")
+        .arg(format!("-p:RustDotnetVersion={}", dotnet.as_env()))
         // Trimming/single-file are ILC defaults under PublishAot; explicit for clarity
         // and so a consumer's csproj doesn't need to restate them.
         .arg("-p:PublishTrimmed=true");
     for extra in &args.extra {
         cmd.arg(extra);
     }
+    cmd.env("DOTNET_VERSION", dotnet.as_env());
     if let Some((path_add, dotnet_root)) = &dotnet_heal {
         let cur = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{}:{}", path_add.display(), cur));
@@ -97,6 +101,7 @@ pub fn run(args: &PublishArgs) -> Result<i32> {
     if let Some(bin) = locate_published_binary(
         csproj.parent().expect("a csproj always has a parent"),
         profile,
+        dotnet.tfm(),
         &rid,
     ) {
         eprintln!("== published native binary: {} ==", bin.display());
@@ -143,22 +148,18 @@ fn find_csproj(dir: &std::path::Path) -> Result<PathBuf> {
 fn locate_published_binary(
     proj_dir: &std::path::Path,
     profile: &str,
+    tfm: &str,
     rid: &str,
 ) -> Option<PathBuf> {
-    let bin_dir = proj_dir.join("bin").join(profile);
-    // Multiple TFMs can coexist under `bin/<profile>`. Select the newest native output rather
-    // than the first directory entry, which can report a stale net8 binary after a net10 publish.
-    std::fs::read_dir(&bin_dir)
+    let publish_dir = proj_dir
+        .join("bin")
+        .join(profile)
+        .join(tfm)
+        .join(rid)
+        .join("publish");
+    std::fs::read_dir(&publish_dir)
         .ok()?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|tfm_dir| tfm_dir.is_dir())
-        .flat_map(|tfm_dir| {
-            std::fs::read_dir(tfm_dir.join(rid).join("publish"))
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-        })
         .filter(|path| {
             path.is_file()
                 && !matches!(
