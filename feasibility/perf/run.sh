@@ -16,6 +16,11 @@ REPO="$(cd "$HERE/../.." && pwd)"
 RUST="$HERE/rust"; CS="$HERE/csharp"
 OUT="${PERF_OUT:-$HERE/results}"; mkdir -p "$OUT"
 KNOBS=0; [ "${1:-}" = "--knobs" ] && KNOBS=1
+DOTNET_VERSION="${DOTNET_VERSION:-10}"
+case "$DOTNET_VERSION" in
+  8|9|10) ;;
+  *) echo "DOTNET_VERSION must be 8, 9, or 10" >&2; exit 2 ;;
+esac
 
 export PATH="$HOME/.rustup/toolchains/nightly-2026-06-17-aarch64-apple-darwin/bin:/opt/homebrew/opt/rustup/bin:$HOME/.dotnet:$PATH"
 export DOTNET_ROOT="$HOME/.dotnet"
@@ -24,7 +29,7 @@ export CD_LINKER="$REPO/target/release/linker"
 export CD_BACKEND_DYLIB="$REPO/target/release/librustc_codegen_clr.dylib"
 
 run_backend() { # $1=outfile ; extra env via caller
-  ( cd "$REPO" && feasibility/cargo-dotnet run "$RUST" --release 2>/dev/null ) | grep '^RESULT' > "$1"
+  ( cd "$REPO" && feasibility/cargo-dotnet run "$RUST" --release --dotnet "$DOTNET_VERSION" 2>/dev/null ) | grep '^RESULT' > "$1"
 }
 
 echo "== [1/3] native Rust (host, upper bound) =="
@@ -33,12 +38,12 @@ rm -f "$RUST/.cargo/config.toml"          # ensure host target (cargo-dotnet reg
   && ./target/release/perf_rs 2>/dev/null ) | grep '^RESULT' > "$OUT/native.txt"
 echo "   $(wc -l < "$OUT/native.txt") workloads"
 
-echo "== [2/3] Rust via rustc_codegen_clr (.NET) =="
+echo "== [2/3] Rust via rustc_codegen_clr (.NET $DOTNET_VERSION) =="
 run_backend "$OUT/backend.txt"
 echo "   $(wc -l < "$OUT/backend.txt") workloads"
 
-echo "== [3/3] C# (.NET, peer ceiling) =="
-( cd "$CS" && dotnet run -c Release 2>/dev/null ) | grep '^RESULT' > "$OUT/csharp.txt"
+echo "== [3/3] C# (.NET $DOTNET_VERSION, peer ceiling) =="
+( cd "$CS" && dotnet run -c Release -f "net${DOTNET_VERSION}.0" 2>/dev/null ) | grep '^RESULT' > "$OUT/csharp.txt"
 echo "   $(wc -l < "$OUT/csharp.txt") workloads"
 
 if [ "$KNOBS" = 1 ]; then

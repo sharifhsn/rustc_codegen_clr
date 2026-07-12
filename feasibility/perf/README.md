@@ -14,7 +14,12 @@ Builds and runs the same workloads three ways and prints one comparison table:
 ```bash
 feasibility/perf/run.sh            # the table
 feasibility/perf/run.sh --knobs    # + OPTIMIZE_CIL=0 / NO_UNWIND=1 deltas on the backend
+DOTNET_VERSION=8 PERF_OUT=feasibility/perf/results/net8 feasibility/perf/run.sh
+DOTNET_VERSION=10 PERF_OUT=feasibility/perf/results/net10 feasibility/perf/run.sh
 ```
+
+The harness defaults to .NET 10. `DOTNET_VERSION` selects both the backend runtime profile and the
+C# comparison target, so the two commands above produce a like-for-like runtime comparison.
 
 Each workload is **self-timed** (warmup + best-of-K around a fixed amount of work) and prints
 `RESULT <name> <ns> <m1> <m2>`. The Rust side carries a **counting global allocator** so the
