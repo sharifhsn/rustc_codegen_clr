@@ -112,7 +112,18 @@ run_native_diff() {
     remove_generated_config "$case_dir" || return 1
 
     tr -d '\r' < "$prefix.native.stdout" > "$prefix.native.normalized"
-    tr -d '\r' < "$prefix.dotnet.stdout" > "$prefix.dotnet.normalized"
+    tr -d '\r' < "$prefix.dotnet.stdout" > "$prefix.dotnet.raw-normalized"
+    # The linker invokes MSBuild helpers before the managed program and their standard
+    # "Build succeeded" banner is tool output, not program output. Anchor the managed stream at
+    # the native program's first non-empty line so the differential oracle compares only the two
+    # executions while preserving every subsequent byte and line.
+    first_native_line="$(awk 'NF { print; exit }' "$prefix.native.normalized")"
+    if [[ -n "$first_native_line" ]]; then
+        awk -v first="$first_native_line" '$0 == first { seen=1 } seen' \
+            "$prefix.dotnet.raw-normalized" > "$prefix.dotnet.normalized"
+    else
+        cp "$prefix.dotnet.raw-normalized" "$prefix.dotnet.normalized"
+    fi
     if cmp -s "$prefix.native.normalized" "$prefix.dotnet.normalized"; then
         stdout_match=yes
     else
