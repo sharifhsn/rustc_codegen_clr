@@ -264,7 +264,7 @@ fn ambient_cargo_home_for(cargo_home: &Path) -> Option<std::path::PathBuf> {
     let home = std::env::var_os("CARGO_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cargo"))
+            crate::host::home_dir().map(|home| home.join(".cargo"))
         })?;
     (home != cargo_home).then_some(home)
 }

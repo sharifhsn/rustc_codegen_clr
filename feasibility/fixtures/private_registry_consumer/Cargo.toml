@@ -1,7 +1,7 @@
 [package]
 name = "rcl-private-registry-consumer"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 rcl-private-registry-probe = { version = "0.1.0", registry = "rcl-private" }

@@ -61,8 +61,9 @@ pub fn cargo_dotnet_home() -> Result<PathBuf> {
             return Ok(PathBuf::from(h));
         }
     }
-    let home = env::var("HOME").context("HOME is not set (needed to locate ~/.cargo-dotnet)")?;
-    Ok(PathBuf::from(home).join(".cargo-dotnet"))
+    let home = crate::host::home_dir()
+        .context("neither HOME nor USERPROFILE is set (needed to locate cargo-dotnet home)")?;
+    Ok(home.join(".cargo-dotnet"))
 }
 
 /// Locate an in-repo checkout relative to the running binary, if any. Recognised by

@@ -69,8 +69,10 @@ pub fn ensure_supported(facts: &HostFacts) -> Result<()> {
     }
 }
 
-fn home_dir() -> Option<PathBuf> {
-    env::var_os("HOME").map(PathBuf::from)
+pub fn home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 fn on_path(cmd: &str) -> bool {

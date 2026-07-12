@@ -4,9 +4,9 @@
 //! test controls are local to the rustc process and never make otherwise-compatible artifacts
 //! reject one another.
 
-use cilly::{ArtifactAbiConfig, ArtifactAbiConfigCaptureError, OutputTarget};
 #[cfg(test)]
 use cilly::DotnetRuntime;
+use cilly::{ArtifactAbiConfig, ArtifactAbiConfigCaptureError, OutputTarget};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::sync::OnceLock;

@@ -94,7 +94,11 @@ pub fn run(args: &PublishArgs) -> Result<i32> {
     }
 
     // Report the produced native binary path: bin/<profile>/<tfm>/<rid>/publish/<AssemblyName>.
-    if let Some(bin) = locate_published_binary(&proj_dir, profile, &rid) {
+    if let Some(bin) = locate_published_binary(
+        csproj.parent().expect("a csproj always has a parent"),
+        profile,
+        &rid,
+    ) {
         eprintln!("== published native binary: {} ==", bin.display());
     } else {
         eprintln!(
@@ -142,26 +146,25 @@ fn locate_published_binary(
     rid: &str,
 ) -> Option<PathBuf> {
     let bin_dir = proj_dir.join("bin").join(profile);
-    let tfm_dir = std::fs::read_dir(&bin_dir)
+    // Multiple TFMs can coexist under `bin/<profile>`. Select the newest native output rather
+    // than the first directory entry, which can report a stale net8 binary after a net10 publish.
+    std::fs::read_dir(&bin_dir)
         .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())?;
-    let publish_dir = tfm_dir.join(rid).join("publish");
-    if !publish_dir.is_dir() {
-        return None;
-    }
-    // The produced binary is the AssemblyName with no extension (macOS/Linux) or .exe
-    // (Windows); pick the first executable, non-.dll/.pdb/.json file.
-    std::fs::read_dir(&publish_dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| {
-            p.is_file()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|tfm_dir| tfm_dir.is_dir())
+        .flat_map(|tfm_dir| {
+            std::fs::read_dir(tfm_dir.join(rid).join("publish"))
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+        })
+        .filter(|path| {
+            path.is_file()
                 && !matches!(
-                    p.extension().and_then(|e| e.to_str()),
+                    path.extension().and_then(|extension| extension.to_str()),
                     Some("dll") | Some("pdb") | Some("json") | Some("dSYM")
                 )
         })
+        .max_by_key(|path| path.metadata().and_then(|metadata| metadata.modified()).ok())
 }

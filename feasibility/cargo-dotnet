@@ -321,6 +321,7 @@ cd_setup(){
   ( cd "$FROM_REPO/cilly" && cargo "+$TOOLCHAIN" build --release ) || die "setup: cilly build failed"
   ( cd "$FROM_REPO" && cargo "+$TOOLCHAIN" build --release -p rustc_codegen_clr ) || die "setup: codegen dylib build failed"
   local dylib="$FROM_REPO/target/release/librustc_codegen_clr.$dylib_ext"
+  [ "$host_os" = windows ] && dylib="$FROM_REPO/target/release/rustc_codegen_clr.dll"
   local linker="$FROM_REPO/target/release/linker$exe_ext"
   [ -f "$dylib" ]  || die "setup: backend dylib not produced: $dylib"
   [ -f "$linker" ] || die "setup: linker not produced: $linker"

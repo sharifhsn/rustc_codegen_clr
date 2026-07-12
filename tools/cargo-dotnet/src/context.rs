@@ -117,8 +117,12 @@ impl Paths {
                         home.display()
                     );
                 }
-                let backend_dylib =
-                    home.join(format!("bin/librustc_codegen_clr.{}", facts.dylib_ext));
+                let backend_name = if facts.os == "windows" {
+                    "rustc_codegen_clr.dll".to_string()
+                } else {
+                    format!("librustc_codegen_clr.{}", facts.dylib_ext)
+                };
+                let backend_dylib = home.join("bin").join(backend_name);
                 let linker = home.join(format!("bin/linker{}", facts.exe_ext));
                 let target_spec = home.join("target/x86_64-unknown-dotnet.json");
                 if !backend_dylib.is_file() {
@@ -150,10 +154,12 @@ impl Paths {
                 })
             }
             Mode::Dev { repo_root } => {
-                let backend_dylib = repo_root.join(format!(
-                    "target/release/librustc_codegen_clr.{}",
-                    facts.dylib_ext
-                ));
+                let backend_name = if facts.os == "windows" {
+                    "rustc_codegen_clr.dll".to_string()
+                } else {
+                    format!("librustc_codegen_clr.{}", facts.dylib_ext)
+                };
+                let backend_dylib = repo_root.join("target/release").join(backend_name);
                 let linker = repo_root.join(format!("target/release/linker{}", facts.exe_ext));
                 let target_spec = repo_root.join("x86_64-unknown-dotnet.json");
                 if !backend_dylib.is_file() {
@@ -649,9 +655,9 @@ pub(crate) fn cargo_dotnet_cache_home() -> Result<PathBuf> {
     {
         return Ok(PathBuf::from(path));
     }
-    let home =
-        std::env::var_os("HOME").context("HOME is not set (needed for cargo-dotnet cache)")?;
-    Ok(PathBuf::from(home).join(".cargo-dotnet/cache"))
+    let home = crate::host::home_dir()
+        .context("neither HOME nor USERPROFILE is set (needed for cargo-dotnet cache)")?;
+    Ok(home.join(".cargo-dotnet/cache"))
 }
 
 /// Stable namespace for mutable state owned by one consumer crate. Cargo registry sources are

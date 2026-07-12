@@ -63,6 +63,13 @@ jobs:
         with:
           dotnet-version: 10.0.x
       - uses: Swatinem/rust-cache@v2
+      - name: Install .NET 10 CoreCLR ILAsm
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://www.nuget.org/api/v2/package/runtime.win-x64.microsoft.netcore.ilasm/10.0.0" -OutFile "$env:RUNNER_TEMP\ilasm10.zip"
+          Expand-Archive "$env:RUNNER_TEMP\ilasm10.zip" -DestinationPath "$env:RUNNER_TEMP\ilasm10"
+          New-Item -ItemType Directory -Force "$env:USERPROFILE\.dotnet\ilasm10-tool" | Out-Null
+          Copy-Item "$env:RUNNER_TEMP\ilasm10\runtimes\win-x64\native\ilasm.exe" "$env:USERPROFILE\.dotnet\ilasm10-tool\ilasm.exe"
       - name: Build and test compiler on Windows
         run: |
           cargo test -p cilly
@@ -77,6 +84,14 @@ jobs:
         run: |
           cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet doctor
           dotnet --info
+      - name: Build and run Rust on Windows CoreCLR
+        shell: pwsh
+        env:
+          CARGO_DOTNET_EXPERIMENTAL_WINDOWS: "1"
+          CARGO_DOTNET_BACKEND: native
+          DOTNET_VERSION: "10"
+        run: |
+          cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet run cargo_tests/cd_pure --backend native --dotnet 10 --clean
   product_acceptance_smoke:
     # One release case per decisive product oracle. The full matrix remains a manual/release gate.
     runs-on: ubuntu-22.04
@@ -104,6 +119,13 @@ jobs:
         run: |
           cargo build --manifest-path tools/cargo-dotnet/Cargo.toml --release
           cargo build --release --workspace
+      - name: Install .NET 10 CoreCLR ILAsm
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/ilasm10.zip" "https://www.nuget.org/api/v2/package/runtime.linux-x64.microsoft.netcore.ilasm/10.0.0"
+          unzip -qo "$RUNNER_TEMP/ilasm10.zip" -d "$RUNNER_TEMP/ilasm10"
+          mkdir -p "$HOME/.dotnet/ilasm10-tool"
+          cp "$RUNNER_TEMP/ilasm10/runtimes/linux-x64/native/ilasm" "$HOME/.dotnet/ilasm10-tool/ilasm"
+          chmod +x "$HOME/.dotnet/ilasm10-tool/ilasm"
       - name: Run product acceptance smoke
         env:
           RCL_MATRIX_PROFILES: release

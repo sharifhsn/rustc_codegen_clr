@@ -91,8 +91,8 @@ fn store_root() -> Result<PathBuf> {
     if let Some(home) = std::env::var_os("CARGO_DOTNET_HOME").filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(home).join("sysroots"));
     }
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".cargo-dotnet/sysroots"))
+    let home = crate::host::home_dir().context("neither HOME nor USERPROFILE is set")?;
+    Ok(home.join(".cargo-dotnet/sysroots"))
 }
 
 fn snapshot_key(ctx: &Context, ambient: &Path) -> Result<String> {
