@@ -417,10 +417,7 @@ impl std::error::Error for BackendConfigInstallError {}
 /// Whether the target runtime is .NET 9+.
 #[must_use]
 pub fn dotnet9() -> bool {
-    matches!(
-        current().artifact_abi().dotnet_runtime(),
-        DotnetRuntime::Net9
-    )
+    current().artifact_abi().dotnet_runtime().major() >= 9
 }
 
 #[cfg(test)]
