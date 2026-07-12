@@ -61,6 +61,7 @@ pub const UNSUPPORTED_WINDOWS_HOST: &str = "Windows hosts are not supported by t
 pub fn ensure_supported(facts: &HostFacts) -> Result<()> {
     match facts.os {
         "linux" | "macos" => Ok(()),
+        "windows" if env::var_os("CARGO_DOTNET_EXPERIMENTAL_WINDOWS").is_some() => Ok(()),
         "windows" => bail!(UNSUPPORTED_WINDOWS_HOST),
         other => bail!(
             "{other} hosts are not supported by this cargo-dotnet release; use Linux or macOS."

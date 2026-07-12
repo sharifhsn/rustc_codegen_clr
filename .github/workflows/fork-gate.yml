@@ -49,14 +49,30 @@ jobs:
       - name: Run strict ::stable gate (isolated flaky retry)
         run: bash .github/scripts/gate.sh
   windows_build:
-    # best-effort: backend must keep COMPILING on Windows; tests are Linux-canonical
+    # Experimental Windows acceptance. Keep the public support guard unless this matrix is green.
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
       - uses: Swatinem/rust-cache@v2
-      - name: Build on Windows
-        run: cargo build --release --workspace
+      - name: Build and test compiler on Windows
+        run: |
+          cargo test -p cilly
+          cargo build --release --workspace
+      - name: Build and test cargo-dotnet on Windows
+        run: cargo test --manifest-path tools/cargo-dotnet/Cargo.toml
+      - name: Probe experimental Windows CLI on .NET 10
+        shell: pwsh
+        env:
+          CARGO_DOTNET_EXPERIMENTAL_WINDOWS: "1"
+          DOTNET_VERSION: "10"
+        run: |
+          cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet doctor
+          dotnet --info
   product_acceptance_smoke:
     # One release case per decisive product oracle. The full matrix remains a manual/release gate.
     runs-on: ubuntu-22.04

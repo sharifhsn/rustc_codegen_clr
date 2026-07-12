@@ -107,10 +107,10 @@ pub struct BuildArgs {
     /// Execution backend: `native` (default installed) or `docker` (in-repo dev).
     #[arg(long, env = "CARGO_DOTNET_BACKEND")]
     pub backend: Option<String>,
-    /// Target .NET runtime version: `8` or `9` (default 8). Selects the matching CoreCLR ilasm,
+    /// Target .NET runtime version: `8`, `9`, or `10` (default 10).
     /// sets `DOTNET_VERSION` for the codegen backend + linker, and stamps the runtimeconfig / TFM /
     /// `.assembly extern .ver`.
-    #[arg(long, value_name = "8|9", default_value = "8", env = "DOTNET_VERSION")]
+    #[arg(long, value_name = "8|9|10", default_value = "10", env = "DOTNET_VERSION")]
     pub dotnet: String,
 
     // ---- standard cargo flag groups (clap-cargo) — forwarded to the inner cargo ----
@@ -265,9 +265,9 @@ pub struct PackArgs {
     /// Expected SHA-256 signer certificate fingerprint (hex, separators ignored).
     #[arg(long, value_name = "SHA256", requires = "sign_certificate")]
     pub signer_fingerprint: Option<String>,
-    /// Target .NET runtime version for the package: `8` or `9` (default 8). Sets the build's
+    /// Target .NET runtime version for the package: `8`, `9`, or `10` (default 10).
     /// `DOTNET_VERSION` + ilasm and the NuGet TFM (`lib/<tfm>/`), which must agree with the dll.
-    #[arg(long, value_name = "8|9", default_value = "8", env = "DOTNET_VERSION")]
+    #[arg(long, value_name = "8|9|10", default_value = "10", env = "DOTNET_VERSION")]
     pub dotnet: String,
 }
 

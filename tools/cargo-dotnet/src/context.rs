@@ -195,11 +195,13 @@ impl Paths {
 /// NOT know per-version BCL tokens / `.ver` strings — those live in cilly (`cilly::DotnetRuntime`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum DotnetVersion {
-    /// .NET 8 (default).
-    #[default]
+    /// .NET 8.
     Net8,
     /// .NET 9.
     Net9,
+    /// .NET 10 (default).
+    #[default]
+    Net10,
 }
 impl DotnetVersion {
     /// Target-framework moniker for NuGet packaging (`net8.0` / `net9.0`).
@@ -208,6 +210,7 @@ impl DotnetVersion {
         match self {
             DotnetVersion::Net8 => "net8.0",
             DotnetVersion::Net9 => "net9.0",
+            DotnetVersion::Net10 => "net10.0",
         }
     }
     /// The `DOTNET_VERSION` value the cilly/backend parser expects (canonical bare major).
@@ -216,6 +219,7 @@ impl DotnetVersion {
         match self {
             DotnetVersion::Net8 => "8",
             DotnetVersion::Net9 => "9",
+            DotnetVersion::Net10 => "10",
         }
     }
     /// The matching CoreCLR ilasm tool dir under `$HOME/.dotnet` (each runtime needs its own — a
@@ -225,6 +229,7 @@ impl DotnetVersion {
         match self {
             DotnetVersion::Net8 => "ilasm-tool",
             DotnetVersion::Net9 => "ilasm9-tool",
+            DotnetVersion::Net10 => "ilasm10-tool",
         }
     }
 }
@@ -234,8 +239,9 @@ impl std::str::FromStr for DotnetVersion {
         match s.trim() {
             "8" | "net8" | "net8.0" => Ok(DotnetVersion::Net8),
             "9" | "net9" | "net9.0" => Ok(DotnetVersion::Net9),
+            "10" | "net10" | "net10.0" => Ok(DotnetVersion::Net10),
             other => Err(format!(
-                "--dotnet: invalid value {other:?}; expected 8 or 9"
+                "--dotnet: invalid value {other:?}; expected 8, 9, or 10"
             )),
         }
     }

@@ -47,10 +47,12 @@ impl std::fmt::Display for OutputTarget {
 )]
 pub enum DotnetRuntime {
     /// .NET 8 API surface.
-    #[default]
     Net8,
     /// .NET 9 API surface.
     Net9,
+    /// .NET 10 API surface.
+    #[default]
+    Net10,
 }
 
 impl DotnetRuntime {
@@ -60,6 +62,7 @@ impl DotnetRuntime {
         match self {
             Self::Net8 => "net8.0",
             Self::Net9 => "net9.0",
+            Self::Net10 => "net10.0",
         }
     }
 
@@ -69,6 +72,7 @@ impl DotnetRuntime {
         match self {
             Self::Net8 => "8:0:0:0",
             Self::Net9 => "9:0:0:0",
+            Self::Net10 => "10:0:0:0",
         }
     }
 
@@ -78,6 +82,7 @@ impl DotnetRuntime {
         match self {
             Self::Net8 => (8, 0, 0, 0),
             Self::Net9 => (9, 0, 0, 0),
+            Self::Net10 => (10, 0, 0, 0),
         }
     }
 
@@ -87,6 +92,7 @@ impl DotnetRuntime {
         match self {
             Self::Net8 => "8.0.0",
             Self::Net9 => "9.0.0",
+            Self::Net10 => "10.0.0",
         }
     }
 
@@ -96,6 +102,7 @@ impl DotnetRuntime {
         match self {
             Self::Net8 => 8,
             Self::Net9 => 9,
+            Self::Net10 => 10,
         }
     }
 }
@@ -105,6 +112,7 @@ impl std::fmt::Display for DotnetRuntime {
         match self {
             Self::Net8 => f.write_str(".NET 8"),
             Self::Net9 => f.write_str(".NET 9"),
+            Self::Net10 => f.write_str(".NET 10"),
         }
     }
 }
@@ -122,7 +130,7 @@ pub struct ArtifactAbiConfig {
 impl Default for ArtifactAbiConfig {
     fn default() -> Self {
         Self {
-            dotnet_runtime: DotnetRuntime::Net8,
+            dotnet_runtime: DotnetRuntime::Net10,
             no_unwind: false,
         }
     }
@@ -148,13 +156,14 @@ impl ArtifactAbiConfig {
         environment: &HashMap<String, String>,
     ) -> Result<Self, ArtifactAbiConfigCaptureError> {
         let dotnet_runtime = match environment.get("DOTNET_VERSION").map(String::as_str) {
-            None | Some("8" | "net8" | "net8.0") => DotnetRuntime::Net8,
+            None | Some("10" | "net10" | "net10.0") => DotnetRuntime::Net10,
+            Some("8" | "net8" | "net8.0") => DotnetRuntime::Net8,
             Some("9" | "net9" | "net9.0") => DotnetRuntime::Net9,
             Some(value) => {
                 return Err(ArtifactAbiConfigCaptureError::InvalidValue {
                     variable: "DOTNET_VERSION",
                     value: value.to_owned(),
-                    expected: "8 or 9 (also net8, net8.0, net9, or net9.0)",
+                    expected: "8, 9, or 10 (also net8.0, net9.0, or net10.0)",
                 });
             }
         };
@@ -665,7 +674,7 @@ mod tests {
         assert_eq!(fields, ["dotnet_runtime", "no_unwind"]);
         assert_eq!(
             error.to_string(),
-            "incompatible artifact ABI configuration; dotnet_runtime: expected Net8, found Net9; \
+            "incompatible artifact ABI configuration; dotnet_runtime: expected Net10, found Net9; \
              no_unwind: expected false, found true"
         );
     }
