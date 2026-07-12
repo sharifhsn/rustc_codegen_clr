@@ -1,10 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <!-- The consumer's TFM follows RustDotnetVersion (default 8) so the C# project and the Rust lib
+    <!-- The consumer's TFM follows RustDotnetVersion (default 10) so the C# project and the Rust lib
          it auto-builds (RustDotnet.targets passes the matching dotnet-version flag) target the SAME
          runtime. Dual-version: dotnet run -p:RustDotnetVersion=9 -p:RustDotnetForceBuild=true . -->
-    <RustDotnetVersion Condition="'$(RustDotnetVersion)'==''">8</RustDotnetVersion>
+    <RustDotnetVersion Condition="'$(RustDotnetVersion)'==''">10</RustDotnetVersion>
     <TargetFramework>net$(RustDotnetVersion).0</TargetFramework>
     <!-- byte*/int* (ptr, len) string + slice marshalling crosses with `fixed` + raw pointers. -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>

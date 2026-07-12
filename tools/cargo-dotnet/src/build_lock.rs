@@ -54,7 +54,9 @@ fn lock_path(scope: &str) -> Result<PathBuf> {
     if let Some(home) = std::env::var_os("CARGO_DOTNET_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(home).join(format!("locks/{scope}.lock")));
     }
-    let home = std::env::var_os("HOME").context("HOME is not set for cargo-dotnet build lock")?;
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .context("neither HOME nor USERPROFILE is set for cargo-dotnet build lock")?;
     Ok(PathBuf::from(home).join(format!(".cargo-dotnet/locks/{scope}.lock")))
 }
 

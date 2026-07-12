@@ -304,6 +304,9 @@ pub struct AddNugetArgs {
     /// the resulting runtime/native/resource paths and provenance in its asset manifest.
     #[arg(long)]
     pub rid: Option<String>,
+    /// Target framework used for SDK restore and the reflection bindgen executable.
+    #[arg(long, value_name = "8|9|10", default_value = "10", env = "DOTNET_VERSION")]
+    pub dotnet: String,
     /// Unfiltered build log for the bindgen step.
     #[arg(short, long)]
     pub verbose: bool,

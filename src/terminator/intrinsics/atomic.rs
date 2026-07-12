@@ -98,6 +98,29 @@ pub fn xchg<'tcx>(
             let call = ctx.transmute_on_stack(Type::Int(Int::U8), Type::Bool, call);
             return place_set(destination, call, ctx);
         }
+        Type::Bool | Type::PlatformChar if crate::config::dotnet9() => {
+            // Interlocked exposes byte/ushort overloads, not Bool/Char overloads. Preserve the
+            // exact bits while selecting the native sub-word overload available on .NET 9+.
+            let backing = match src_type {
+                Type::Bool => Type::Int(Int::U8),
+                Type::PlatformChar => Type::Int(Int::U16),
+                _ => unreachable!(),
+            };
+            let backing_ref = ctx.nref(backing);
+            let call_site = MethodRef::new(
+                interlocked,
+                ctx.alloc_string("Exchange"),
+                ctx.sig([backing_ref, backing], backing),
+                MethodKind::Static,
+                vec![].into(),
+            );
+            let call_site = ctx.alloc_methodref(call_site);
+            let dst = ctx.cast_ptr_to(dst, backing_ref);
+            let new = ctx.transmute_on_stack(src_type, backing, new);
+            let call = ctx.call(call_site, &[dst, new], IsPure::NOT);
+            let call = ctx.transmute_on_stack(backing, src_type, call);
+            return place_set(destination, call, ctx);
+        }
         // `PlatformChar` is a 2-byte interop char with no native sub-word `Interlocked.Exchange`
         // overload before .NET 9 and no width-correct emulation wired for it; routing it through
         // the 1-byte `atomic_xchng_u8` builtin would truncate it (a miscompile), so refuse loudly.
@@ -188,6 +211,27 @@ pub fn cxchg<'tcx>(
             );
             // builtin arg order: (addr, comparand, new)
             ctx.call(call_site, &[dst, comparand, value], IsPure::NOT)
+        }
+        Type::Bool | Type::PlatformChar if crate::config::dotnet9() => {
+            let backing = match src_type {
+                Type::Bool => Type::Int(Int::U8),
+                Type::PlatformChar => Type::Int(Int::U16),
+                _ => unreachable!(),
+            };
+            let backing_ref = ctx.nref(backing);
+            let call_site = MethodRef::new(
+                interlocked,
+                ctx.alloc_string("CompareExchange"),
+                ctx.sig([backing_ref, backing, backing], backing),
+                MethodKind::Static,
+                vec![].into(),
+            );
+            let call_site = ctx.alloc_methodref(call_site);
+            let dst = ctx.cast_ptr_to(dst, backing_ref);
+            let value = ctx.transmute_on_stack(src_type, backing, value);
+            let comparand = ctx.transmute_on_stack(src_type, backing, comparand);
+            let call = ctx.call(call_site, &[dst, value, comparand], IsPure::NOT);
+            ctx.transmute_on_stack(backing, src_type, call)
         }
         _ => {
             let src_ref = ctx.nref(src_type);

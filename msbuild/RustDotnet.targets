@@ -327,7 +327,7 @@
       <_ProfileFlag Condition="'$(_OneProfile)'=='debug'">--debug</_ProfileFlag>
       <_ProfileFlag Condition="'$(_OneProfile)'!='debug'">--release</_ProfileFlag>
       <_CleanFlag Condition="'$(_OneClean)'=='true'">--clean</_CleanFlag>
-      <!-- Target .NET version (default 8): builds the crate's `.ver`/runtimeconfig + selects the
+      <!-- Target .NET version (default 10): builds the crate's `.ver`/runtimeconfig + selects the
            matching CoreCLR ilasm so the produced assembly loads on the consumer's runtime. -->
       <_DotnetFlag Condition="'$(_OneDotnet)'!=''">--dotnet $(_OneDotnet)</_DotnetFlag>
     </PropertyGroup>

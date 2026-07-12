@@ -429,6 +429,9 @@ fn workspace_wiring_checks(root: &Path) -> Vec<Check> {
 
     // (2) TFM / RustDotnetVersion mismatches per csproj.
     for f in &csproj_facts {
+        if f.rust_crate_dirs.is_empty() {
+            continue;
+        }
         let rdv = f.rust_dotnet_version.as_deref();
         let tfm = f.target_framework.as_deref();
         match (rdv, tfm) {
@@ -455,17 +458,17 @@ fn workspace_wiring_checks(root: &Path) -> Vec<Check> {
                 }
             }
             (None, Some(tfm)) if !tfm.contains("$(RustDotnetVersion)") => {
-                // No explicit RustDotnetVersion → RustDotnet.props defaults it to "8". Flag
+                // No explicit RustDotnetVersion → RustDotnet.props defaults it to "10". Flag
                 // only if the hardcoded TFM disagrees with that default (net9.0, net10.0, …),
                 // since that is the actual failure mode (dotnet build targets a runtime the
                 // Rust side wasn't built for).
-                if tfm != "net8.0" {
+                if tfm != "net10.0" {
                     checks.push(Check::warn(
                         format!("TFM/RustDotnetVersion: {}", f.path.display()),
                         format!(
                             "<TargetFramework>{tfm}</TargetFramework> is set but \
-                             <RustDotnetVersion> is not — RustDotnet.props defaults it to \"8\" \
-                             (net8.0), which disagrees with {tfm}. Set \
+                             <RustDotnetVersion> is not — RustDotnet.props defaults it to \"10\" \
+                             (net10.0), which disagrees with {tfm}. Set \
                              <RustDotnetVersion>{}</RustDotnetVersion> explicitly (matching {tfm}), \
                              or change TargetFramework to net$(RustDotnetVersion).0.",
                             tfm.trim_start_matches("net").trim_end_matches(".0")

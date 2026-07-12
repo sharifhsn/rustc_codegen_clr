@@ -14,13 +14,13 @@
          "x86_64" is rustc's layout model for the dotnet output, not the host arch). -->
     <RustDotnetTarget Condition="'$(RustDotnetTarget)'==''">x86_64-unknown-dotnet</RustDotnetTarget>
 
-    <!-- Target .NET runtime version for the Rust crate AND the consumer project: 8 or 9
-         (default 8). Threaded to `cargo dotnet build -\-dotnet $(RustDotnetVersion)` so the
+    <!-- Target .NET runtime version for the Rust crate AND the consumer project: 8, 9, or 10
+         (default 10). Threaded to `cargo dotnet build -\-dotnet $(RustDotnetVersion)` so the
          produced assembly's `.assembly extern .ver` + runtimeconfig match the runtime, and a
          consumer can set its own `<TargetFramework>net$(RustDotnetVersion).0</TargetFramework>`.
          NOTE: the Rust .dll path is version-independent, so switching versions needs a rebuild —
          pass `-p:RustDotnetForceBuild=true` (or `<RustCrate Clean="true">`) when flipping. -->
-    <RustDotnetVersion Condition="'$(RustDotnetVersion)'==''">8</RustDotnetVersion>
+    <RustDotnetVersion Condition="'$(RustDotnetVersion)'==''">10</RustDotnetVersion>
 
     <!-- Force a `cargo dotnet build` even if MSBuild's Inputs/Outputs up-to-date check
          says the produced .dll is newer than the Rust sources. -->

@@ -23,7 +23,11 @@ jobs:
       - name: Setup dotnet
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 8.0.x
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - name: Install test tooling
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
       - name: Ensure ilasm (mono)
         run: |
           ilasm --version 2>/dev/null || {
@@ -82,7 +86,11 @@ jobs:
       - name: Setup dotnet
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 8.0.x
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - name: Install test tooling
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
       - name: Ensure ilasm (mono)
         run: |
           ilasm --version 2>/dev/null || {

@@ -149,6 +149,7 @@ const KNOWN_BCL_ASSEMBLIES: &[&str] = &[
 ];
 
 pub fn run(args: &AddNugetArgs) -> Result<i32> {
+    let dotnet: crate::context::DotnetVersion = args.dotnet.parse().map_err(anyhow::Error::msg)?;
     let crate_dir = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
     let crate_dir = fs::canonicalize(&crate_dir)
         .with_context(|| format!("add-nuget: no such directory: {}", crate_dir.display()))?;
@@ -171,8 +172,13 @@ pub fn run(args: &AddNugetArgs) -> Result<i32> {
     // unchanged, while reparsing project.assets.json prevents the old `.dll_path` cache from
     // silently discarding transitive assets on later invocations.
     fs::create_dir_all(&cache_root)?;
-    let resolved =
-        nuget_assets::restore(&args.id, &args.version, &cache_root, args.rid.as_deref())?;
+    let resolved = nuget_assets::restore(
+        &args.id,
+        &args.version,
+        &cache_root,
+        args.rid.as_deref(),
+        dotnet.tfm(),
+    )?;
     let (dll, compile_dlls, runtime_dlls) = (
         resolved.primary_dll,
         resolved.compile_dlls,
@@ -213,7 +219,7 @@ pub fn run(args: &AddNugetArgs) -> Result<i32> {
 
     let out_rs = if args.force || !bindings_marker.is_file() {
         let bindgen_dir = cache_root.join("bindgen");
-        generate_bindings(&dll, &bindgen_dir, args.verbose, &extra_dlls)?;
+        generate_bindings(&dll, &bindgen_dir, args.verbose, &extra_dlls, dotnet)?;
         let produced = bindgen_dir.join("out.rs");
         fs::copy(&produced, &bindings_marker).with_context(|| {
             format!(
@@ -319,6 +325,7 @@ fn generate_bindings(
     bindgen_dir: &Path,
     verbose: bool,
     extra_dlls: &[PathBuf],
+    dotnet: crate::context::DotnetVersion,
 ) -> Result<()> {
     fs::create_dir_all(bindgen_dir.join("src"))?;
     fs::write(
@@ -391,7 +398,7 @@ fn main() {{
         clean: false,
         verbose,
         backend: None,
-        dotnet: "8".to_string(),
+        dotnet: dotnet.as_env().to_string(),
         features: clap_cargo::Features::default(),
         manifest: clap_cargo::Manifest::default(),
         workspace: clap_cargo::Workspace::default(),

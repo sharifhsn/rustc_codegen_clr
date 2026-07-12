@@ -63,6 +63,7 @@ pub(super) fn restore(
     version: &str,
     cache_root: &Path,
     rid: Option<&str>,
+    tfm: &str,
 ) -> Result<ResolvedAssets> {
     let restore_dir = cache_root.join("restore");
     let packages_dir = cache_root.join("packages");
@@ -72,9 +73,10 @@ pub(super) fn restore(
     fs::write(
         &project,
         format!(
-            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework>\
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>{}</TargetFramework>\
              <RestorePackagesPath>{}</RestorePackagesPath>{}</PropertyGroup><ItemGroup>\
              <PackageReference Include=\"{}\" Version=\"{}\" /></ItemGroup></Project>",
+            xml_escape(tfm),
             xml_escape(&packages_dir.to_string_lossy()),
             rid.map(|rid| format!("<RuntimeIdentifier>{}</RuntimeIdentifier>", xml_escape(rid)))
                 .unwrap_or_default(),
@@ -87,7 +89,7 @@ pub(super) fn restore(
         .args(["restore", "--nologo", "--verbosity", "quiet"])
         .arg(&project)
         .status()
-        .context("add-nuget: failed to spawn `dotnet restore` (is the .NET 8 SDK installed?)")?;
+        .with_context(|| format!("add-nuget: failed to spawn `dotnet restore` (is the {tfm} SDK installed?)"))?;
     if !status.success() {
         bail!("add-nuget: `dotnet restore` failed for {id} {version}");
     }
@@ -858,7 +860,10 @@ mod tests {
                 .as_nanos()
         ));
         let packages = temp.join("packages");
-        let text = fixture_text(name).replace("__PACKAGE_ROOT__", &packages.to_string_lossy());
+        // The placeholder appears inside a JSON string. Windows paths contain backslashes, so
+        // inject their JSON-escaped representation rather than raw `D:\...` text.
+        let package_root = packages.to_string_lossy().replace('\\', "\\\\");
+        let text = fixture_text(name).replace("__PACKAGE_ROOT__", &package_root);
         let fixture: serde_json::Value = serde_json::from_str(&text).unwrap();
         let target = fixture["targets"]
             .as_object()
