@@ -4,7 +4,9 @@
 //! test controls are local to the rustc process and never make otherwise-compatible artifacts
 //! reject one another.
 
-use cilly::{ArtifactAbiConfig, ArtifactAbiConfigCaptureError, DotnetRuntime, OutputTarget};
+use cilly::{ArtifactAbiConfig, ArtifactAbiConfigCaptureError, OutputTarget};
+#[cfg(test)]
+use cilly::DotnetRuntime;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::sync::OnceLock;
@@ -414,10 +416,13 @@ impl std::fmt::Display for BackendConfigInstallError {
 
 impl std::error::Error for BackendConfigInstallError {}
 
-/// Whether the target runtime is .NET 9+.
+/// Whether the selected runtime has native sub-word Interlocked overloads.
 #[must_use]
-pub fn dotnet9() -> bool {
-    current().artifact_abi().dotnet_runtime().major() >= 9
+pub fn native_subword_atomics() -> bool {
+    current()
+        .artifact_abi()
+        .dotnet_runtime()
+        .supports_subword_interlocked()
 }
 
 #[cfg(test)]

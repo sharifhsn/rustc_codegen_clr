@@ -43,7 +43,7 @@ pub fn xchg<'tcx>(
         // On .NET 9 (`config::dotnet9()`), all sub-word ints fall through to the general
         // `Interlocked.Exchange(ref T, T)` arm below (native byte/sbyte/short/ushort overloads,
         // no masked-word emulation). U8 otherwise uses the dedicated `atomic_xchng_u8` builtin.
-        Type::Int(Int::U8) if !crate::config::dotnet9() => {
+        Type::Int(Int::U8) if !crate::config::native_subword_atomics() => {
             let xchng = ctx.alloc_methodref(xchng);
             let call = ctx.call(xchng, &[dst, new], IsPure::NOT);
             return place_set(destination, call, ctx);
@@ -65,7 +65,9 @@ pub fn xchg<'tcx>(
             let call = ctx.cast_ptr_to(call, src_type);
             return place_set(destination, call, ctx);
         }
-        Type::Int(int @ (Int::I8 | Int::U16 | Int::I16)) if !crate::config::dotnet9() => {
+        Type::Int(int @ (Int::I8 | Int::U16 | Int::I16))
+            if !crate::config::native_subword_atomics() =>
+        {
             // Sub-word exchange via a masked 32-bit CAS loop (see `emulate_subword_xchng`).
             // U8 keeps its existing `atomic_xchng_u8` builtin (handled above).
             // (On .NET 9 this arm is skipped → native `Interlocked.Exchange` below.)
@@ -88,7 +90,7 @@ pub fn xchg<'tcx>(
         // here for Bool) is a plain volatile-ld/volatile-st with no CAS — it is NOT atomic against
         // a racing writer of the same byte on .NET 8 (lost-update race). This is a known, disclosed
         // residual; see docs/MEMORY_MODEL.md §7/§8. Do not reintroduce an "unreachable" claim here.
-        Type::Bool if !crate::config::dotnet9() => {
+        Type::Bool if !crate::config::native_subword_atomics() => {
             let xchng = ctx.alloc_methodref(xchng);
             let u8_ref = ctx.nref(Type::Int(Int::U8));
             let dst = ctx.cast_ptr_to(dst, u8_ref);
@@ -98,7 +100,7 @@ pub fn xchg<'tcx>(
             let call = ctx.transmute_on_stack(Type::Int(Int::U8), Type::Bool, call);
             return place_set(destination, call, ctx);
         }
-        Type::Bool | Type::PlatformChar if crate::config::dotnet9() => {
+        Type::Bool | Type::PlatformChar if crate::config::native_subword_atomics() => {
             // Interlocked exposes byte/ushort overloads, not Bool/Char overloads. Preserve the
             // exact bits while selecting the native sub-word overload available on .NET 9+.
             let backing = match src_type {
@@ -201,7 +203,9 @@ pub fn cxchg<'tcx>(
         // (cilly::ir::builtins::atomics) check the comparand *inside* the loop and never write on a
         // mismatch, returning the real old sub-word — so `cxchng_res_val`'s `old == expected` is exact.
         // LE-only + page-boundary caveats documented on the builtin.
-        Type::Int(int @ (Int::U8 | Int::I8 | Int::U16 | Int::I16)) if !crate::config::dotnet9() => {
+        Type::Int(int @ (Int::U8 | Int::I8 | Int::U16 | Int::I16))
+            if !crate::config::native_subword_atomics() =>
+        {
             let width = int.size().expect("sub-word int has a known size");
             let src_ref = ctx.nref(src_type);
             let call_site = ctx.static_mref(
@@ -212,7 +216,7 @@ pub fn cxchg<'tcx>(
             // builtin arg order: (addr, comparand, new)
             ctx.call(call_site, &[dst, comparand, value], IsPure::NOT)
         }
-        Type::Bool | Type::PlatformChar if crate::config::dotnet9() => {
+        Type::Bool | Type::PlatformChar if crate::config::native_subword_atomics() => {
             let backing = match src_type {
                 Type::Bool => Type::Int(Int::U8),
                 Type::PlatformChar => Type::Int(Int::U16),

@@ -105,6 +105,12 @@ impl DotnetRuntime {
             Self::Net10 => 10,
         }
     }
+
+    /// Whether this runtime exposes native byte/sbyte/short/ushort Interlocked overloads.
+    #[must_use]
+    pub const fn supports_subword_interlocked(self) -> bool {
+        self.major() >= 9
+    }
 }
 
 impl std::fmt::Display for DotnetRuntime {
