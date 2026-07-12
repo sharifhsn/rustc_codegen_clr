@@ -121,13 +121,17 @@ const TARGET_SYSROOT_MARKER: &str = ".rustdotnet-private-sysroot";
 
 fn cargo_target_dir(ctx: &Context, sysroot: &PrivateSysroot) -> Result<PathBuf> {
     let output = base_cargo(ctx, sysroot)
+        .arg("-Zjson-target-spec")
         .arg("metadata")
         .arg("--no-deps")
         .arg("--format-version=1")
         .output()
         .context("query Cargo target directory")?;
     if !output.status.success() {
-        bail!("cargo metadata failed while locating the target directory");
+        bail!(
+            "cargo metadata failed while locating the target directory:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     let path = metadata

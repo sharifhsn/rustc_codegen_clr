@@ -51,7 +51,7 @@ pub unsafe fn init(_argc: isize, _argv: *const *const u8) {
 /// This allows `std::env::args` to work even in a `cdylib`, as it does on macOS and Windows.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[used]
-#[link_section = ".init_array.00099"]
+#[unsafe(link_section = ".init_array.00099")]
 static ARGV_INIT_ARRAY: extern "C" fn(core::ffi::c_int, *const *const u8, *const *const u8) = {
     extern "C" fn init_wrapper(
         argc: core::ffi::c_int,
