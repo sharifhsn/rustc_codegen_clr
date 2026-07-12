@@ -83,6 +83,10 @@ pub fn build_with_sysroot(ctx: &Context, sysroot: &PrivateSysroot) -> Result<Str
             eprintln!("{line}");
         }
     }
+    if !out.status.success() && !ctx.flags.verbose {
+        eprintln!("== full inner build log after failure ==");
+        eprint!("{log}");
+    }
     if ctx.flags.verbose || !out.status.success() {
         eprintln!("== build exit: {} ==", out.status.code().unwrap_or(-1));
     }
