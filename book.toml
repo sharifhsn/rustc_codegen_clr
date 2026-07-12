@@ -1,0 +1,16 @@
+[book]
+title = "Rust on .NET"
+description = "Build Rust applications and libraries for .NET with rustc_codegen_clr"
+authors = ["rustc_codegen_clr contributors"]
+language = "en"
+src = "book/src"
+
+[build]
+build-dir = "book/book"
+
+[output.html]
+git-repository-url = "https://github.com/FractalFir/rustc_codegen_clr"
+edit-url-template = "https://github.com/FractalFir/rustc_codegen_clr/edit/master/{path}"
+site-url = "/rustc_codegen_clr/"
+default-theme = "rust"
+preferred-dark-theme = "ayu"
