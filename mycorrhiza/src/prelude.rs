@@ -27,7 +27,9 @@ pub use crate::collections::{
 // The idiomatic BCL type wrappers — used like normal Rust types (`DateTime::now()`, `Guid::new_v4()`,
 // `Regex::new(..)`, `Math::sqrt(..)`, …). `TimeSpan` is re-exported under its idiomatic name (the
 // module type is `DotNetTimeSpan` to avoid colliding with `std::time`-flavoured expectations).
+pub use crate::bcl::dateonly::DateOnly;
 pub use crate::bcl::datetime::DateTime;
+pub use crate::bcl::decimal::Decimal;
 pub use crate::bcl::decimal::DotNetDecimal;
 pub use crate::bcl::environment::Environment;
 pub use crate::bcl::guid::Guid;
@@ -52,8 +54,8 @@ pub use crate::delegate::{Action1, Action2, Func1, Func2};
 // Rust `async fn` as a .NET `Task` (`future_to_task_unit`), and block a Rust future on the PAL
 // (`block_on`). `Task` is the non-generic managed Task handle; `TaskT<T>` the result-bearing one.
 pub use crate::task::{
-    await_task, await_unit, block_on, future_to_task, future_to_task_unit, Task, TaskFuture, TaskT,
-    TaskUnitFuture,
+    Task, TaskFuture, TaskT, TaskUnitFuture, await_task, await_unit, block_on, future_to_task,
+    future_to_task_unit,
 };
 
 // The idiomatic managed `System.String` wrapper (Display / == / Hash) and the raw handle alias.
@@ -61,7 +63,7 @@ pub use crate::system::{DotNetString, MString};
 
 // Idiomatic error/optional-value bridges: `null` ↔ `Option` (`Nullable::map_present` / `from_nullable`)
 // and a thrown .NET exception ↔ `Result` (`try_managed` / the `.try_()` combinator).
-pub use crate::error::{from_nullable, try_managed, ManagedException, Nullable, TryManaged};
+pub use crate::error::{ManagedException, Nullable, TryManaged, from_nullable, try_managed};
 
 // `System.Nullable<T>` (a generic *value type*, distinct from managed-reference `null`) ↔ `Option<T>`:
 // `.to_option()` on a `.NET`-produced nullable. The `Nullable<T>` type lives at `mycorrhiza::nullable`.
@@ -76,4 +78,4 @@ pub use crate::DotNetChar;
 
 // The WF-9 generic-interop macros, for hand-rolling a wrapper over any other generic .NET type.
 // (`#[macro_export]`ed, so they also live at the crate root; re-exported here for discoverability.)
-pub use crate::{dotnet_generic, dotnet_generic_impl, gen};
+pub use crate::{dotnet_generic, dotnet_generic_impl, r#gen};

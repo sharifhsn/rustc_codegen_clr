@@ -1,7 +1,7 @@
 [package]
 name = "soak_rand"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 [dependencies]
 # rand -> rand_core -> getrandom 0.2 transitively; the dotnet_overlays/getrandom-0.2
 # overlay supplies the PAL CSPRNG backend, so NO getrandom wiring is needed (no

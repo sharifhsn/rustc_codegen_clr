@@ -5,11 +5,11 @@
 //! mask convention and no BCL vector intrinsic, the same body is correct on both the .NET and C
 //! targets, so they are all registered in `register_value_lane_ops`.
 use crate::{
+    Assembly, BasicBlock, BinOp, CILNode, CILRoot, ClassRef, Const, Float, Int, Interned,
+    MethodImpl, MethodRef, Type,
     asm::MissingMethodPatcher,
     cilnode::{ExtendKind, IsPure, MethodKind},
     tpe::simd::SIMDElem,
-    Assembly, BasicBlock, BinOp, CILNode, CILRoot, ClassRef, Const, Float, Int, Interned,
-    MethodImpl, MethodRef, Type,
 };
 
 /// Generic per-lane *unary* SIMD generator: `(vec) -> vec` where output lane `i` is
@@ -120,7 +120,11 @@ fn ctlz_lane(asm: &mut Assembly, lane: Interned<CILNode>, elem: SIMDElem) -> Int
     };
     let bit_ops = ClassRef::bit_operations(asm);
     let lane_bits = int.bits().unwrap_or(64) as i32;
-    let (wide, wide_bits) = if lane_bits > 32 { (Int::U64, 64i32) } else { (Int::U32, 32i32) };
+    let (wide, wide_bits) = if lane_bits > 32 {
+        (Int::U64, 64i32)
+    } else {
+        (Int::U32, 32i32)
+    };
     let widened = asm.int_cast(lane, wide, ExtendKind::ZeroExtend);
     let raw = static_call(
         asm,
@@ -151,7 +155,11 @@ fn cttz_lane(asm: &mut Assembly, lane: Interned<CILNode>, elem: SIMDElem) -> Int
     };
     let bit_ops = ClassRef::bit_operations(asm);
     let lane_bits = int.bits().unwrap_or(64) as u32;
-    let (wide, wide_bits) = if lane_bits > 32 { (Int::U64, 64u32) } else { (Int::U32, 32u32) };
+    let (wide, wide_bits) = if lane_bits > 32 {
+        (Int::U64, 64u32)
+    } else {
+        (Int::U32, 32u32)
+    };
     let widened = asm.int_cast(lane, wide, ExtendKind::ZeroExtend);
     let raw = static_call(
         asm,
@@ -208,7 +216,11 @@ fn bswap_lane(asm: &mut Assembly, lane: Interned<CILNode>, elem: SIMDElem) -> In
 /// (`u8`/`u16`) widen to `u32`, reverse the full 32-bit word, then logical-shift right by the padding
 /// (`32 - lane_bits`) to bring the reversed lane bits into the low end — exactly the standard
 /// sub-word bit-reverse. Reinterprets back to the lane's signedness afterwards.
-fn bitreverse_lane(asm: &mut Assembly, lane: Interned<CILNode>, elem: SIMDElem) -> Interned<CILNode> {
+fn bitreverse_lane(
+    asm: &mut Assembly,
+    lane: Interned<CILNode>,
+    elem: SIMDElem,
+) -> Interned<CILNode> {
     let SIMDElem::Int(int) = elem else {
         todo!("simd_bitreverse on a float lane {elem:?}")
     };
@@ -431,12 +443,42 @@ pub(super) fn register_tail_ops(asm: &mut Assembly, patcher: &mut MissingMethodP
     simd_unary(bswap_lane, "simd_bswap", asm, patcher);
     simd_unary(bitreverse_lane, "simd_bitreverse", asm, patcher);
     // Per-lane float transcendentals / rounding (also used as the C fallback for floor/ceil/sqrt).
-    simd_unary(|a, l, e| float_unop_lane(a, l, e, "Sqrt"), "simd_fsqrt", asm, patcher);
-    simd_unary(|a, l, e| float_unop_lane(a, l, e, "Floor"), "simd_floor", asm, patcher);
-    simd_unary(|a, l, e| float_unop_lane(a, l, e, "Ceiling"), "simd_ceil", asm, patcher);
-    simd_unary(|a, l, e| float_unop_lane(a, l, e, "Truncate"), "simd_trunc", asm, patcher);
-    simd_unary(|a, l, e| round_lane(a, l, e, true), "simd_round", asm, patcher);
-    simd_unary(|a, l, e| round_lane(a, l, e, false), "simd_round_ties_even", asm, patcher);
+    simd_unary(
+        |a, l, e| float_unop_lane(a, l, e, "Sqrt"),
+        "simd_fsqrt",
+        asm,
+        patcher,
+    );
+    simd_unary(
+        |a, l, e| float_unop_lane(a, l, e, "Floor"),
+        "simd_floor",
+        asm,
+        patcher,
+    );
+    simd_unary(
+        |a, l, e| float_unop_lane(a, l, e, "Ceiling"),
+        "simd_ceil",
+        asm,
+        patcher,
+    );
+    simd_unary(
+        |a, l, e| float_unop_lane(a, l, e, "Truncate"),
+        "simd_trunc",
+        asm,
+        patcher,
+    );
+    simd_unary(
+        |a, l, e| round_lane(a, l, e, true),
+        "simd_round",
+        asm,
+        patcher,
+    );
+    simd_unary(
+        |a, l, e| round_lane(a, l, e, false),
+        "simd_round_ties_even",
+        asm,
+        patcher,
+    );
     // Per-lane fused multiply-add.
     simd_fma("simd_fma", asm, patcher);
     simd_fma("simd_relaxed_fma", asm, patcher);

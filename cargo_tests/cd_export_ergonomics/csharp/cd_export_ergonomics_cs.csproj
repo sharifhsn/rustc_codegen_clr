@@ -5,10 +5,11 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RustProfile Condition="'$(RustProfile)' == ''">release</RustProfile>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="cd_export_ergonomics">
-      <HintPath>../target/x86_64-unknown-dotnet/release/cd_export_ergonomics.dll</HintPath>
+      <HintPath>../target/x86_64-unknown-dotnet/$(RustProfile)/cd_export_ergonomics.dll</HintPath>
     </Reference>
   </ItemGroup>
 </Project>

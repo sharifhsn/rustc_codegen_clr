@@ -2,19 +2,19 @@ use core::f16;
 
 use crate::call_info::CallInfo;
 use crate::fn_ctx::MethodCompileCtx;
-use crate::r#type::{fixed_array, utilis::is_fat_ptr, GetTypeExt};
+use crate::r#type::{GetTypeExt, utilis::is_fat_ptr};
 use cilly::{
-    cilnode::{IsPure, MethodKind},
-    hashable::{HashableF32, HashableF64},
     Assembly, CILNode, ClassRef, Const, Float, Int, Interned, IntoAsmIndex, MethodRef,
     StaticFieldDesc, Type,
+    cilnode::{IsPure, MethodKind},
+    hashable::{HashableF32, HashableF64},
 };
 use rustc_middle::ty::ExistentialTraitRef;
 use rustc_middle::{
     mir::{
+        ConstOperand, ConstValue,
         interpret::Scalar,
         interpret::{AllocId, GlobalAlloc},
-        ConstOperand, ConstValue,
     },
     ty::{FloatTy, IntTy, Ty, TyCtxt, TyKind, UintTy},
 };
@@ -46,7 +46,6 @@ fn create_const_from_data<'tcx>(
 ) -> Interned<CILNode> {
     let ty = ctx.monomorphize(ty);
     let tpe = ctx.type_from_cache(ty);
-    let tpe_idx = ctx.alloc_type(tpe);
     // Optimization - check if this can be replaced by a scalar.
     if let GlobalAlloc::Memory(alloc) = ctx.tcx().global_alloc(alloc_id) {
         let const_alloc = alloc.inner();
@@ -71,7 +70,7 @@ fn create_const_from_data<'tcx>(
                 Scalar::from_u128(u128::from_ne_bytes(bytes.as_slice().try_into().unwrap()));
             return load_const_scalar(scalar, ty, ctx).into();
         }
-        let (ptr, align) = alloc_ptr_unaligned(alloc_id, &alloc, ctx, tpe_idx);
+        let (ptr, align) = alloc_ptr_unaligned(alloc_id, &alloc, ctx);
         // Apply the byte offset on the raw pointer (CIL `add` is byte arithmetic), mirroring
         // `load_scalar_ptr`'s `GlobalAlloc::Memory` arm.
         let ptr = if offset_bytes != 0 {
@@ -91,7 +90,7 @@ fn create_const_from_data<'tcx>(
         }
     }
 
-    let ptr = add_allocation(alloc_id.0.into(), ctx, tpe_idx);
+    let ptr = add_allocation(alloc_id.0.into(), ctx);
     let ptr = if offset_bytes != 0 {
         ctx.biop(ptr, cilly::Const::USize(offset_bytes), cilly::BinOp::Add)
     } else {
@@ -99,47 +98,6 @@ fn create_const_from_data<'tcx>(
     };
     let ptr = ctx.cast_ptr(ptr, tpe);
     return ctx.load(ptr, tpe);
-}
-fn alloc_align_size(alloc_id: u64, ctx: &mut MethodCompileCtx<'_, '_>) -> (u64, u64) {
-    let global_alloc = ctx
-        .tcx()
-        .global_alloc(AllocId(alloc_id.try_into().expect("0 alloc id?")));
-    match global_alloc {
-        GlobalAlloc::Memory(alloc) => (alloc.0 .0.align.bytes(), alloc.0.len() as u64),
-        _ => todo!(),
-    }
-}
-fn const_slice_backer_type<'tcx>(
-    const_ty: Ty<'tcx>,
-    ctx: &mut MethodCompileCtx<'tcx, '_>,
-    alloc_id: u64,
-    meta: u64,
-) -> Type {
-    let elem = match const_ty.kind() {
-        TyKind::Str => Type::Int(Int::U8),
-        TyKind::Adt(def, generics) => {
-            assert_eq!(
-                def.all_fields().count(),
-                1,
-                "DSTs in slice constants must have exactly one field!"
-            );
-            let fld = def.all_fields().next().unwrap();
-            return const_slice_backer_type(
-                fld.ty(ctx.tcx(), generics).skip_normalization(),
-                ctx,
-                alloc_id,
-                meta,
-            );
-        }
-        TyKind::Slice(elem) => ctx.type_from_cache(*elem),
-        _ => todo!("Unhandled const {const_ty:?}"),
-    };
-    if meta == 1 {
-        return elem;
-    }
-    let (align, arr_size) = alloc_align_size(alloc_id, ctx);
-    let arr_tpe = fixed_array(ctx, elem, meta, arr_size, align);
-    Type::ClassRef(arr_tpe)
 }
 pub fn load_const_value<'tcx>(
     const_val: ConstValue,
@@ -168,16 +126,7 @@ pub fn load_const_value<'tcx>(
             let ptr = if meta == 0 {
                 ctx.alloc_node(Const::USize(1 << 30))
             } else {
-                let arr_type = const_slice_backer_type(
-                    const_ty.builtin_deref(true).unwrap(),
-                    ctx,
-                    alloc_id.0.get(),
-                    meta,
-                );
-
-                let arr_tpe = ctx.alloc_type(arr_type);
-
-                alloc_ptr(alloc_id, &data, ctx, arr_tpe)
+                alloc_ptr(alloc_id, &data, ctx)
             };
             let ptr = ctx.cast_ptr(ptr, Type::Void);
             let meta = ctx.alloc_node(Const::USize(meta));
@@ -197,7 +146,6 @@ pub fn static_ty<'tcx>(def_id: DefId, tcx: TyCtxt<'tcx>) -> Ty<'tcx> {
 fn load_scalar_ptr(
     ctx: &mut MethodCompileCtx<'_, '_>,
     ptr: rustc_middle::mir::interpret::Pointer,
-    tpe: Interned<Type>,
 ) -> Interned<CILNode> {
     let (alloc_id, offset) = ptr.into_raw_parts();
     let global_alloc = ctx.tcx().global_alloc(alloc_id.alloc_id());
@@ -254,10 +202,10 @@ fn load_scalar_ptr(
             //def_id.ty();
             let _memory = ctx.tcx().reserve_and_set_memory_alloc(alloc);
             let alloc_id = alloc_id.alloc_id().0.into();
-            add_allocation(alloc_id, ctx, tpe)
+            add_allocation(alloc_id, ctx)
         }
         GlobalAlloc::Memory(const_allocation) => {
-            let ptr = alloc_ptr(alloc_id.alloc_id(), &const_allocation, ctx, tpe);
+            let ptr = alloc_ptr(alloc_id.alloc_id(), &const_allocation, ctx);
             if offset.bytes() != 0 {
                 ctx.biop(ptr, cilly::Const::USize(offset.bytes()), cilly::BinOp::Add)
             } else {
@@ -306,12 +254,11 @@ fn alloc_ptr<'tcx>(
     alloc_id: AllocId,
     const_alloc: &rustc_middle::mir::interpret::ConstAllocation,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    tpe: Interned<Type>,
 ) -> Interned<CILNode> {
-    let (ptr, align) = alloc_ptr_unaligned(alloc_id, const_alloc, ctx, tpe);
+    let (ptr, align) = alloc_ptr_unaligned(alloc_id, const_alloc, ctx);
     // If alignment is small enough to be *guaranteed*, and no pointers are present.
     if align.is_some_and(|align| align <= ctx.const_align()) {
-        add_allocation(alloc_id.0.into(), ctx, tpe)
+        add_allocation(alloc_id.0.into(), ctx)
     } else {
         ptr
     }
@@ -322,7 +269,6 @@ fn alloc_ptr_unaligned<'tcx>(
     alloc_id: AllocId,
     const_alloc: &rustc_middle::mir::interpret::ConstAllocation,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-    tpe: Interned<Type>,
 ) -> (Interned<CILNode>, Option<u64>) {
     let const_alloc = const_alloc.inner();
     // If alignment is small enough to be *guaranteed*, and no pointers are present.
@@ -348,7 +294,7 @@ fn alloc_ptr_unaligned<'tcx>(
             )
         }
     } else {
-        (add_allocation(alloc_id.0.into(), ctx, tpe), None)
+        (add_allocation(alloc_id.0.into(), ctx), None)
     }
 }
 /// Load a scalar integer constant of `byte_size` bytes (its value already in `bits`), then
@@ -401,7 +347,7 @@ fn load_const_scalar<'tcx>(
                 .map(|ty| ctx.type_from_cache(ty))
                 .unwrap_or(Int::USize.into());
             let const_type_idx = ctx.alloc_type(const_type);
-            let ptr = load_scalar_ptr(ctx, ptr, const_type_idx);
+            let ptr = load_scalar_ptr(ctx, ptr);
 
             if matches!(scalar_type, Type::Ptr(_)) {
                 return ctx.cast_ptr(ptr, const_type_idx);
@@ -666,26 +612,7 @@ pub fn get_vtable<'tcx>(
     let ty = fx.monomorphize(ty);
 
     let alloc_id = fx.tcx().vtable_allocation((ty, trait_ref));
-    let vtable_len = match trait_ref {
-        Some(trait_ref) => fx
-            .tcx()
-            .vtable_entries(trait_ref.with_self_ty(fx.tcx(), ty))
-            .len(),
-        // A principal-less trait object — `dyn Send`, `dyn Send + Sync`, … (only auto-traits, no
-        // principal trait, reachable via trait-object "principal upcasting" like
-        // `Box<dyn Any + Send>` -> `Box<dyn Send>`) — has no method entries. Its vtable holds only
-        // the three common entries: drop_in_place, size, align. `vtable_allocation` already built
-        // the matching allocation above; `vtable_entries` requires a principal, so use the common
-        // count directly instead of unwrapping `None`.
-        None => rustc_middle::ty::TyCtxt::COMMON_VTABLE_ENTRIES.len(),
-    };
-    let tpe = fixed_array(
-        fx,
-        cilly::Type::Int(Int::USize),
-        vtable_len.try_into().unwrap(),
-        vtable_len as u64 * 8,
-        8,
-    );
-    let tpe = fx.alloc_type(Type::ClassRef(tpe));
-    add_allocation(alloc_id.0.get(), fx, tpe)
+    // `vtable_allocation` has already materialized the exact self-describing memory allocation;
+    // `add_allocation` derives its field size/alignment and relocations directly from that source.
+    add_allocation(alloc_id.0.get(), fx)
 }

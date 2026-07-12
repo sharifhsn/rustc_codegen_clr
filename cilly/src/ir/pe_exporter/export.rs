@@ -57,10 +57,10 @@ use super::pe::{self, PeOptions};
 use super::sig;
 use super::tables::TokenSink;
 use super::tables::{MetadataBuilder, Token};
-use crate::ir::class::StaticFieldDef;
-use crate::ir::{Assembly, ClassRef, Const, MethodDefIdx};
 use crate::DotnetRuntime;
 use crate::Interned;
+use crate::ir::class::StaticFieldDef;
+use crate::ir::{Assembly, ClassRef, Const, MethodDefIdx};
 
 // `pe::SECTION_ALIGNMENT`/`pe::CLI_HEADER_CB` (both `pub(super)`) are used directly below rather
 // than duplicated here — an earlier version of this file kept its own copies "since the RVA
@@ -83,6 +83,10 @@ pub struct ExportOptions {
     /// identity). NOT the same thing as `module_name` — see that field's doc for why conflating
     /// them broke `Assembly.Load`.
     pub assembly_name: String,
+    /// Optional public metadata name for the internal `MainModule` sentinel. The IR remains
+    /// unchanged so const-data ownership and method/field self references keep using the sentinel;
+    /// only the emitted TypeDef and its metadata lookups are projected.
+    pub public_module_full_name: Option<String>,
     /// The `Module` table's own name (§II.22.30's `Name` column), independent of
     /// `assembly_name`. `ilasm` (given no explicit `.module` directive, which `il_exporter` never
     /// emits) defaults this to the `-output:` file's own basename — e.g.
@@ -124,6 +128,7 @@ pub struct ExportOptions {
 #[must_use]
 pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u8>) {
     let mut mb = MetadataBuilder::new();
+    mb.set_public_module_full_name(options.public_module_full_name.as_deref());
     mb.set_runtime(options.runtime);
     // Must happen before ANY `AssemblyRef` row is created (every class's implicit
     // `System.Object`/`System.ValueType` base pulls in `System.Runtime`) — see
@@ -140,7 +145,10 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
     // "Assembly table's library identity" `todo!()` note for the `.dll` case).
     mb.set_assembly(&options.assembly_name, (0, 0, 0, 0));
 
-    let class_def_ids: Vec<_> = asm.iter_class_def_ids().copied().collect();
+    // FxHashMap iteration depends on insertion/capacity history. Metadata row order is observable
+    // in the PE and must be stable for byte-reproducible NuGet packages.
+    let mut class_def_ids: Vec<_> = asm.iter_class_def_ids().copied().collect();
+    class_def_ids.sort_unstable_by_key(|id| asm[asm[*id].name()].to_string());
 
     // --- Pass 0: const-data carrier TypeDefs (`__rcl_const_blob_N`), one per DISTINCT blob length
     // present in `asm.const_data` — mirrors `il_exporter::export_to_write`'s ordering exactly:
@@ -158,22 +166,31 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
     // `__rcl_const_blob_4.entrypoint()` — the method itself had moved). Creating every carrier
     // TypeDef here, before Pass 1 adds any real class's TypeDef row, keeps them permanently ahead
     // of every class's `MethodList`/`FieldList` range in table order, matching `il_exporter`.
-    let const_blob_carrier_type_of: std::collections::HashMap<usize, Token> = if asm.const_data.is_empty() {
-        std::collections::HashMap::new()
-    } else {
-        let mut blob_sizes: Vec<usize> = asm.const_data.values().iter().map(|d| d.len().max(1)).collect();
-        blob_sizes.sort_unstable();
-        blob_sizes.dedup();
-        let value_type_ref = system_runtime_type_ref(&mut mb, "System.ValueType");
-        blob_sizes
-            .into_iter()
-            .map(|n| {
-                let tok = mb.add_blob_sized_valuetype(&format!("__rcl_const_blob_{n}"), value_type_ref, u32::try_from(n).unwrap(),
+    let const_blob_carrier_type_of: std::collections::HashMap<usize, Token> =
+        if asm.const_data.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            let mut blob_sizes: Vec<usize> = asm
+                .const_data
+                .values()
+                .iter()
+                .map(|d| d.len().max(1))
+                .collect();
+            blob_sizes.sort_unstable();
+            blob_sizes.dedup();
+            let value_type_ref = system_runtime_type_ref(&mut mb, "System.ValueType");
+            blob_sizes
+                .into_iter()
+                .map(|n| {
+                    let tok = mb.add_blob_sized_valuetype(
+                        &format!("__rcl_const_blob_{n}"),
+                        value_type_ref,
+                        u32::try_from(n).unwrap(),
                     );
-                (n, tok)
-            })
-            .collect()
-    };
+                    (n, tok)
+                })
+                .collect()
+        };
 
     // --- Pass 1: a TypeDef row for every class def, in assembly iteration order. Signature
     // encoding (reached from field/method population below) resolves a `ClassRef` to a TypeDef
@@ -229,9 +246,14 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
         // directly); this caller just always passes the empty slice and emits every
         // `InterfaceImpl` row after ALL TypeDef rows exist.
         let has_explicit_layout = class_def.explict_size().is_some()
-            || class_def.fields().iter().any(|(_, _, offset)| offset.is_some());
+            || class_def
+                .fields()
+                .iter()
+                .any(|(_, _, offset)| offset.is_some());
         let (pack, size) = if has_explicit_layout {
-            (Some(1u16), class_def.explict_size().map(std::num::NonZeroU32::get),
+            (
+                Some(1u16),
+                class_def.explict_size().map(std::num::NonZeroU32::get),
             )
         } else {
             (None, None)
@@ -248,8 +270,23 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
         // be found` the moment a C# consumer referenced a namespaced Rust-exported type — see
         // `MetadataBuilder::find_type_def`'s doc for the paired lookup-side fix this requires.
         let raw_name = asm[class_def.name()].to_string();
+        let raw_name = if raw_name == crate::ir::asm::MAIN_MODULE {
+            options
+                .public_module_full_name
+                .as_deref()
+                .unwrap_or(&raw_name)
+        } else {
+            &raw_name
+        };
         let (namespace, name) = super::tables::split_namespace(&raw_name);
-        let tok = mb.add_type_def(namespace, name, class_def.is_valuetype(), extends, pack, size, &[],
+        let tok = mb.add_type_def(
+            namespace,
+            name,
+            class_def.is_valuetype(),
+            extends,
+            pack,
+            size,
+            &[],
         );
         if class_def.is_interface() {
             mb.mark_type_def_interface(tok);
@@ -264,7 +301,10 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
         // convention bit — that is generic-METHOD-definition-only (§II.23.2.1), so Pass 3 is
         // already correct unchanged.
         for (i, name_id) in class_def.generic_names().iter().enumerate() {
-            mb.add_generic_param(tok, u16::try_from(i).expect("generic arity over u16"), &asm[*name_id],
+            mb.add_generic_param(
+                tok,
+                u16::try_from(i).expect("generic arity over u16"),
+                &asm[*name_id],
             );
         }
         type_def_token_of.insert(class_def_id, tok);
@@ -422,7 +462,12 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
                     // since `bytes_for_scalar_const` derives the blob straight from the same
                     // `Const` variant whose width `sig::encode_field_sig` just encoded as `tpe`.
                     let bytes = bytes_for_scalar_const(cst);
-                    let tok = mb.add_static_field(&name_str, sig_off, Some(bytes.clone()), *is_tls, *is_const,
+                    let tok = mb.add_static_field(
+                        &name_str,
+                        sig_off,
+                        Some(bytes.clone()),
+                        *is_tls,
+                        *is_const,
                     );
                     pending_field_rva.push((tok, bytes));
                 }
@@ -479,7 +524,8 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
                 let carrier_tok = const_blob_carrier_type_of[&n];
                 let sig_off = mb.field_sig_for_valuetype_token(carrier_tok);
                 let field_name = format!("c_{}", crate::utilis::encode(u64::from(idx_inner)));
-                let tok = mb.add_static_field(&field_name, sig_off, Some(bytes.clone()), false, false);
+                let tok =
+                    mb.add_static_field(&field_name, sig_off, Some(bytes.clone()), false, false);
                 pending_field_rva.push((tok, bytes));
             }
         }
@@ -495,6 +541,29 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
     if let Some(main_class) = class_def_ids.iter().find(|&&id| id == main_module_id) {
         check_main_module_method_count(asm[*main_class].methods().len());
     }
+    let ordered_methods: std::collections::HashMap<_, Vec<_>> = class_def_ids
+        .iter()
+        .map(|&class_id| {
+            let mut methods = asm[class_id].methods().to_vec();
+            methods.sort_unstable_by_key(|&method_id| {
+                let method = &asm[method_id];
+                let sig = &asm[method.sig()];
+                let inputs = sig
+                    .inputs()
+                    .iter()
+                    .map(|input| input.mangle(asm))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "{}({inputs})->{}:{}",
+                    &asm[method.name()],
+                    sig.output().mangle(asm),
+                    method.generic_params().len()
+                )
+            });
+            (class_id, methods)
+        })
+        .collect();
     let mut entry_point_token: Option<Token> = None;
     for &class_def_id in &class_def_ids {
         let class_def = asm[class_def_id].clone();
@@ -502,7 +571,7 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
         // instead of `FieldList` — see Pass 1's doc comment; `add_method`'s own doc documents
         // the identical "most recently added TypeDef" assumption this call satisfies.
         mb.set_type_def_method_list(type_def_token_of[&class_def_id]);
-        for &method_id in class_def.methods() {
+        for &method_id in &ordered_methods[&class_def_id] {
             let method = asm[method_id].clone();
             let name = asm[method.name()].to_string();
             let sig = asm[method.sig()].clone();
@@ -559,7 +628,9 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
             // hook, whose aliasing wrapper hit this exact path with `codegen-units = 1`, which changes
             // whether the alias or its target gets visited first by `patch_missing_methods`).
             let pinvoke_owned = match method.resolved_implementation(asm) {
-                crate::ir::MethodImpl::Extern { lib, preserve_errno,
+                crate::ir::MethodImpl::Extern {
+                    lib,
+                    preserve_errno,
                 } => Some((asm[*lib].to_string(), *preserve_errno)),
                 _ => None,
             };
@@ -574,7 +645,11 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
             let generic_names = method.generic_params();
             let generic_count =
                 u32::try_from(generic_names.len()).expect("generic-method arity over u32");
-            let mut convention = if is_static { sig::SIG_DEFAULT } else { sig::SIG_HASTHIS };
+            let mut convention = if is_static {
+                sig::SIG_DEFAULT
+            } else {
+                sig::SIG_HASTHIS
+            };
             if generic_count > 0 {
                 convention |= sig::SIG_GENERIC;
             }
@@ -640,12 +715,18 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
             // `add_method` already accepts `&[Option<&str>]` and pushes one Param row per entry.
             let skip = usize::from(!is_static);
             let arg_names = method.arg_names();
-            debug_assert_eq!(arg_names.len(), sig.inputs().len(), "arg_names must be parallel to sig.inputs()");
+            debug_assert_eq!(
+                arg_names.len(),
+                sig.inputs().len(),
+                "arg_names must be parallel to sig.inputs()"
+            );
             let param_names: Vec<Option<&str>> = arg_names[skip.min(arg_names.len())..]
                 .iter()
                 .map(|n| n.map(|interned| &asm[interned]))
                 .collect();
-            let pinvoke_ref = pinvoke_owned.as_ref().map(|(lib, preserve)| (lib.as_str(), *preserve));
+            let pinvoke_ref = pinvoke_owned
+                .as_ref()
+                .map(|(lib, preserve)| (lib.as_str(), *preserve));
             // Mirrors `il_exporter`'s `aggressiveinlining` JIT hint (mod.rs:455-469): small leaf
             // bodies (e.g. the `cast_f64_u32`-style saturating float->int cast helpers
             // `cilly::ir::builtins::casts` synthesizes, or monomorphized closure/iterator-adapter
@@ -812,8 +893,7 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
     // row a `TokenSink` query could need).
     let mut bodies: Vec<(Token, AssembledBody)> = Vec::new();
     for &class_def_id in &class_def_ids {
-        let class_def = asm[class_def_id].clone();
-        for &method_id in class_def.methods() {
+        for &method_id in &ordered_methods[&class_def_id] {
             // An abstract member (interface method) has RVA=0 and NO body — its
             // `implementation()` is only an inert `MethodImpl::Missing` placeholder (Pass 3 already
             // stamped the `Abstract` flag). Assembling a body here would give it a nonzero RVA,
@@ -852,8 +932,10 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
     // that function's doc for the real bug this indirection prevents: a hardcoded `0` here once
     // silently shifted every method body 8 bytes short of where `MethodDef.RVA` said it was).
     let text_header_len = pe::text_header_len(entry_point_token.is_some());
-    let bodies_start_rva =
-        pe::SECTION_ALIGNMENT + text_header_len + pe::CLI_HEADER_CB + u32::try_from(metadata_len_probe).unwrap();
+    let bodies_start_rva = pe::SECTION_ALIGNMENT
+        + text_header_len
+        + pe::CLI_HEADER_CB
+        + u32::try_from(metadata_len_probe).unwrap();
     let mut method_bodies_bytes = Vec::new();
     let mut cursor = bodies_start_rva;
     for (tok, assembled) in &bodies {
@@ -910,8 +992,7 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
             // no sequence points must NOT be skipped here: `LocalScope`/`LocalVariable` rows are
             // keyed by `MethodDef` row, independent of sequence-point presence, so skipping would
             // silently drop its locals from the PDB.
-            if assembled.sequence_points.is_empty()
-                && assembled.locals.iter().all(Option::is_none)
+            if assembled.sequence_points.is_empty() && assembled.locals.iter().all(Option::is_none)
             {
                 continue;
             }
@@ -931,12 +1012,11 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
         // entry (not just CodeView/RSDS) turned out to be required for CoreCLR's runtime
         // `StackTraceSymbols` provider to trust the PDB at all.
         let checksum = super::pdb::PdbChecksumEntry::from_pdb_bytes(&pdb_bytes);
-        let debug_dir_entry = super::pdb::DebugDirectoryEntry::from_pdb_id(pdb_id, options.pdb_file_name.clone());
+        let debug_dir_entry =
+            super::pdb::DebugDirectoryEntry::from_pdb_id(pdb_id, options.pdb_file_name.clone());
         Some((pdb_bytes, debug_dir_entry, checksum))
     };
-    let debug_dir_len = debug_directory
-        .as_ref()
-        .map_or(0, |(_, entry, checksum)| {
+    let debug_dir_len = debug_directory.as_ref().map_or(0, |(_, entry, checksum)| {
         pe::debug_directory_len(entry, Some(checksum))
     });
 
@@ -971,14 +1051,20 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
         "patching RVAs into already-sized rows must not change the metadata's serialized length"
     );
 
-    let pdb_bytes = debug_directory.as_ref().map_or_else(Vec::new, |(bytes, _, _)| bytes.clone());
+    let pdb_bytes = debug_directory
+        .as_ref()
+        .map_or_else(Vec::new, |(bytes, _, _)| bytes.clone());
     let pe_options = PeOptions {
         is_dll: options.is_dll,
         entry_point: entry_point_token.map(|t| t.0),
         debug_directory: debug_directory.as_ref().map(|(_, entry, _)| entry.clone()),
         pdb_checksum: debug_directory.map(|(_, _, checksum)| checksum),
     };
-    let image = pe::write_pe(&metadata, &method_bodies_bytes, &field_rva_bytes, &pe_options,
+    let image = pe::write_pe(
+        &metadata,
+        &method_bodies_bytes,
+        &field_rva_bytes,
+        &pe_options,
     );
     (image, pdb_bytes)
 }
@@ -1072,7 +1158,9 @@ fn assert_generic_indices_in_range(
              parameter(s) but its signature references `!!{n}` (ELEMENT_TYPE_MVAR index {n}) — \
              out-of-range metadata CoreCLR's type loader would reject at load time"
         ),
-        crate::ir::Type::PlatformGeneric(n, GenericKind::TypeGeneric | GenericKind::MethodGeneric,
+        crate::ir::Type::PlatformGeneric(
+            n,
+            GenericKind::TypeGeneric | GenericKind::MethodGeneric,
         ) => {
             assert!(
                 n < class_generic_count,
@@ -1211,12 +1299,10 @@ impl super::sig::TypeDefOrRefResolver for SignatureOnlyResolver<'_> {
             return self.mb.type_def_or_ref(cref, asm);
         }
         let raw_name = &asm[class_ref.name()];
-        let scope = class_ref
-            .asm()
-            .map(|asm_name_id| {
-                let name = ref_assembly_name_for_type(&asm[asm_name_id], raw_name).to_string();
-                self.mb.find_or_create_assembly_ref(&name)
-            });
+        let scope = class_ref.asm().map(|asm_name_id| {
+            let name = ref_assembly_name_for_type(&asm[asm_name_id], raw_name).to_string();
+            self.mb.find_or_create_assembly_ref(&name)
+        });
         let full_name = if class_ref.generics().is_empty() {
             raw_name.to_string()
         } else {
@@ -1286,12 +1372,16 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "export_pe_smoke".to_string(),
+            public_module_full_name: None,
             module_name: "export_pe_smoke.exe".to_string(),
             pdb_file_name: String::new(),
         };
         let (image, _pdb) = export_pe(&mut asm, &options);
         assert_eq!(&image[0..2], b"MZ", "must start with the DOS signature");
-        assert!(image.len() > 0x200, "must be at least one FileAlignment block");
+        assert!(
+            image.len() > 0x200,
+            "must be at least one FileAlignment block"
+        );
     }
 
     /// Builds the tiny two-method assembly the Phase 1a milestone acceptance check
@@ -1315,7 +1405,10 @@ mod tests {
 
         let msg = asm.alloc_string("PE writer E2E OK");
         let ldstr = asm.alloc_node(CILNode::Const(Box::new(Const::PlatformString(msg))));
-        let call = asm.alloc_root(CILRoot::Call(Box::new((write_line, vec![ldstr].into(), IsPure::NOT,
+        let call = asm.alloc_root(CILRoot::Call(Box::new((
+            write_line,
+            vec![ldstr].into(),
+            IsPure::NOT,
         ))));
         let ret = asm.alloc_root(CILRoot::VoidRet);
         let block = BasicBlock::new(vec![call, ret], 0, None);
@@ -1345,6 +1438,7 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: false,
             assembly_name: "pe_e2e_hello".to_string(),
+            public_module_full_name: None,
             module_name: "pe_e2e_hello.exe".to_string(),
             pdb_file_name: String::new(),
         };
@@ -1381,7 +1475,8 @@ mod tests {
                 break;
             }
         }
-        let cli_file_off = cli_file_off.expect("CLI header RVA must fall inside a section") as usize;
+        let cli_file_off =
+            cli_file_off.expect("CLI header RVA must fall inside a section") as usize;
         let entry_point_token = u32_at(cli_file_off + 20);
         assert_eq!(
             entry_point_token,
@@ -1428,7 +1523,10 @@ mod tests {
         });
         let msg = asm.alloc_string("PE writer E2E OK");
         let ldstr = asm.alloc_node(CILNode::Const(Box::new(Const::PlatformString(msg))));
-        let call = asm.alloc_root(CILRoot::Call(Box::new((write_line, vec![ldstr].into(), IsPure::NOT,
+        let call = asm.alloc_root(CILRoot::Call(Box::new((
+            write_line,
+            vec![ldstr].into(),
+            IsPure::NOT,
         ))));
         let ret = asm.alloc_root(CILRoot::VoidRet);
         let block = BasicBlock::new(vec![source_info, call, ret], 0, None);
@@ -1441,7 +1539,9 @@ mod tests {
             entry_name,
             entry_sig,
             MethodKind::Static,
-            MethodImpl::MethodBody { blocks: vec![block], locals: vec![],
+            MethodImpl::MethodBody {
+                blocks: vec![block],
+                locals: vec![],
             },
             vec![],
         );
@@ -1451,11 +1551,15 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: false,
             assembly_name: "pe_e2e_pdb".to_string(),
+            public_module_full_name: None,
             module_name: "pe_e2e_pdb.exe".to_string(),
             pdb_file_name: "pe_e2e_pdb.pdb".to_string(),
         };
         let (image, pdb) = export_pe(&mut asm, &options);
-        assert!(!pdb.is_empty(), "a non-empty pdb_file_name must produce non-empty PDB bytes");
+        assert!(
+            !pdb.is_empty(),
+            "a non-empty pdb_file_name must produce non-empty PDB bytes"
+        );
 
         // Read back the .dll's Debug Directory RSDS payload the same way `pe.rs`'s own
         // `debug_directory_round_trips_through_write_pe` test does, but via raw offsets here
@@ -1469,7 +1573,10 @@ mod tests {
         let opt = coff + 20;
         let dir_base = opt + 96;
         let debug_dir_rva = u32_at(dir_base + 6 * 8); // DataDirectory[6] = Debug.
-        assert_ne!(debug_dir_rva, 0, "Debug Directory must be populated when pdb_file_name is non-empty");
+        assert_ne!(
+            debug_dir_rva, 0,
+            "Debug Directory must be populated when pdb_file_name is non-empty"
+        );
 
         let sec_table = opt + opt_header_size;
         let mut debug_dir_file_off = None;
@@ -1484,13 +1591,17 @@ mod tests {
                 break;
             }
         }
-        let debug_dir_file_off = debug_dir_file_off.expect("Debug Directory RVA must fall inside a section") as usize;
+        let debug_dir_file_off =
+            debug_dir_file_off.expect("Debug Directory RVA must fall inside a section") as usize;
         // IMAGE_DEBUG_DIRECTORY: Characteristics(4) TimeDateStamp(4) MajorVersion(2)
         // MinorVersion(2) Type(4) SizeOfData(4) AddressOfRawData(4) PointerToRawData(4).
         let debug_type = u32_at(debug_dir_file_off + 12);
         assert_eq!(debug_type, 2, "IMAGE_DEBUG_TYPE_CODEVIEW");
         let pointer_to_raw_data = u32_at(debug_dir_file_off + 24) as usize;
-        assert_eq!(&image[pointer_to_raw_data..pointer_to_raw_data + 4], b"RSDS");
+        assert_eq!(
+            &image[pointer_to_raw_data..pointer_to_raw_data + 4],
+            b"RSDS"
+        );
         let guid = &image[pointer_to_raw_data + 4..pointer_to_raw_data + 20];
         let age = u32_at(pointer_to_raw_data + 20);
 
@@ -1506,7 +1617,8 @@ mod tests {
             cursor += 2;
             let mut pdb_stream_offset = None;
             for _ in 0..stream_count {
-                let offset = u32::from_le_bytes(pdb[cursor..cursor + 4].try_into().unwrap()) as usize;
+                let offset =
+                    u32::from_le_bytes(pdb[cursor..cursor + 4].try_into().unwrap()) as usize;
                 cursor += 8; // offset(4) + size(4)
                 let name_start = cursor;
                 let name_end = pdb[name_start..].iter().position(|&b| b == 0).unwrap() + name_start;
@@ -1523,13 +1635,20 @@ mod tests {
             let off = pdb_stream_offset.expect("#Pdb stream must be present");
             <[u8; 20]>::try_from(&pdb[off..off + 20]).unwrap()
         };
-        assert_eq!(guid, &pdb_id[0..16], "Debug Directory GUID must equal the PDB's own #Pdb-stream id[0..16]");
+        assert_eq!(
+            guid,
+            &pdb_id[0..16],
+            "Debug Directory GUID must equal the PDB's own #Pdb-stream id[0..16]"
+        );
         let expected_stamp = u32::from_le_bytes([pdb_id[16], pdb_id[17], pdb_id[18], pdb_id[19]]);
         // `age` is ALWAYS the literal Roslyn-convention `1` (see `DebugDirectoryEntry::age`'s doc):
         // a content-derived value silently fails `netcoredbg`'s `SymbolReader.
         // TryOpenReaderFromCodeView`, which gates its GUID/stamp comparison behind `Age == 1` before
         // even checking them, found empirically during this task's live-debugger verification.
-        assert_eq!(age, 1, "Age must be the literal Roslyn-convention 1, not a content-derived value");
+        assert_eq!(
+            age, 1,
+            "Age must be the literal Roslyn-convention 1, not a content-derived value"
+        );
         // THE critical check (root cause of a real Phase-2 acceptance bug — see
         // `pdb::DebugDirectoryEntry::stamp`'s doc): `System.Reflection.Metadata`'s
         // `PEReader.TryOpenCodeViewPortablePdb` matches the opened PDB's id against
@@ -1545,7 +1664,11 @@ mod tests {
 
         // Decode the PDB's own #Pdb stream EntryPointToken and cross-check it against the .dll's
         // CLI header EntryPointToken (both should be `entrypoint`'s MethodDef token).
-        assert_eq!(&pdb[0..4], b"BSJB", "standalone PDB must start with the BSJB signature");
+        assert_eq!(
+            &pdb[0..4],
+            b"BSJB",
+            "standalone PDB must start with the BSJB signature"
+        );
         let cli_rva = u32_at(dir_base + 14 * 8);
         let mut cli_file_off = None;
         for i in 0..num_sections {
@@ -1559,18 +1682,26 @@ mod tests {
                 break;
             }
         }
-        let cli_file_off = cli_file_off.expect("CLI header RVA must fall inside a section") as usize;
+        let cli_file_off =
+            cli_file_off.expect("CLI header RVA must fall inside a section") as usize;
         let dll_entry_point_token = u32_at(cli_file_off + 20);
-        assert_eq!(dll_entry_point_token, Token::new(Token::TABLE_METHOD_DEF, 1).0);
+        assert_eq!(
+            dll_entry_point_token,
+            Token::new(Token::TABLE_METHOD_DEF, 1).0
+        );
     }
 
     /// Path to the real `dotnet` host on this machine, or `None` if not present — every E2E test
     /// below shares this guard (`eprintln!` + early return, not a failure, so the suite stays
     /// green on a machine with no .NET SDK installed, per the task's original guard).
     fn dotnet_host() -> Option<(String, String)> {
-        let dotnet_root = std::env::var("HOME").map(|h| format!("{h}/.dotnet")).unwrap_or_default();
+        let dotnet_root = std::env::var("HOME")
+            .map(|h| format!("{h}/.dotnet"))
+            .unwrap_or_default();
         let dotnet_bin = format!("{dotnet_root}/dotnet");
-        std::path::Path::new(&dotnet_bin).exists().then_some((dotnet_root, dotnet_bin))
+        std::path::Path::new(&dotnet_bin)
+            .exists()
+            .then_some((dotnet_root, dotnet_bin))
     }
 
     /// Writes `image` (+ a minimal net8.0 `runtimeconfig.json`, mirroring
@@ -1590,9 +1721,13 @@ mod tests {
         run_under_dotnet_impl(image, Some(pdb), name)
     }
 
-    fn run_under_dotnet_impl(image: &[u8], pdb: Option<&[u8]>, name: &str,
+    fn run_under_dotnet_impl(
+        image: &[u8],
+        pdb: Option<&[u8]>,
+        name: &str,
     ) -> (String, String, bool) {
-        let (dotnet_root, dotnet_bin) = dotnet_host().expect("caller must guard with dotnet_host()");
+        let (dotnet_root, dotnet_bin) =
+            dotnet_host().expect("caller must guard with dotnet_host()");
         let scratch = std::env::temp_dir().join("pe_e2e");
         std::fs::create_dir_all(&scratch).expect("create scratch dir");
         let exe_path = scratch.join(format!("{name}.dll")); // apphost-less: `dotnet <path>.dll` runs it directly.
@@ -1639,13 +1774,17 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: false,
             assembly_name: "pe_e2e_hello".to_string(),
+            public_module_full_name: None,
             module_name: "pe_e2e_hello.exe".to_string(),
             pdb_file_name: String::new(),
         };
         let (image, _pdb) = export_pe(&mut asm, &options);
 
         let (stdout, stderr, success) = run_under_dotnet(&image, "pe_e2e_hello");
-        assert!(success, "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            success,
+            "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
         assert!(
             stdout.contains("PE writer E2E OK"),
             "expected stdout to contain the WriteLine output; got:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -1669,7 +1808,9 @@ mod tests {
     #[test]
     fn e2e_unhandled_exception_resolves_file_line_through_our_pdb() {
         if dotnet_host().is_none() {
-            eprintln!("skipping e2e_unhandled_exception_resolves_file_line_through_our_pdb: no dotnet host");
+            eprintln!(
+                "skipping e2e_unhandled_exception_resolves_file_line_through_our_pdb: no dotnet host"
+            );
             return;
         }
 
@@ -1703,10 +1844,16 @@ mod tests {
             MethodKind::Constructor,
             vec![].into(),
         ));
-        let new_exc = asm.alloc_node(CILNode::Call(Box::new((exc_ctor, vec![exc_ldstr].into(), IsPure::NOT,
+        let new_exc = asm.alloc_node(CILNode::Call(Box::new((
+            exc_ctor,
+            vec![exc_ldstr].into(),
+            IsPure::NOT,
         ))));
         let throw_root = asm.alloc_root(CILRoot::Throw(new_exc));
-        let block = BasicBlock::new(vec![source_info, nop, throw_source_info, throw_root], 0, None,
+        let block = BasicBlock::new(
+            vec![source_info, nop, throw_source_info, throw_root],
+            0,
+            None,
         );
 
         let entry_sig = asm.sig([], Type::Void);
@@ -1717,7 +1864,9 @@ mod tests {
             entry_name,
             entry_sig,
             MethodKind::Static,
-            MethodImpl::MethodBody { blocks: vec![block], locals: vec![],
+            MethodImpl::MethodBody {
+                blocks: vec![block],
+                locals: vec![],
             },
             vec![],
         );
@@ -1727,6 +1876,7 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: false,
             assembly_name: "pe_e2e_pdb_throw".to_string(),
+            public_module_full_name: None,
             module_name: "pe_e2e_pdb_throw.exe".to_string(),
             pdb_file_name: "pe_e2e_pdb_throw.pdb".to_string(),
         };
@@ -1734,7 +1884,10 @@ mod tests {
         assert!(!pdb.is_empty());
 
         let (stdout, stderr, success) = run_under_dotnet_with_pdb(&image, &pdb, "pe_e2e_pdb_throw");
-        assert!(!success, "the process must exit non-zero on an unhandled exception");
+        assert!(
+            !success,
+            "the process must exit non-zero on an unhandled exception"
+        );
         assert!(
             stderr.contains("pe_e2e_pdb unhandled exception"),
             "expected the unhandled exception message in stderr; got:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -1788,7 +1941,10 @@ mod tests {
             tpe: i32_ty,
             volatile: false,
         });
-        let call = asm.alloc_root(CILRoot::Call(Box::new((write_line, vec![value].into(), IsPure::NOT,
+        let call = asm.alloc_root(CILRoot::Call(Box::new((
+            write_line,
+            vec![value].into(),
+            IsPure::NOT,
         ))));
         let ret = asm.alloc_root(CILRoot::VoidRet);
         let block = BasicBlock::new(vec![call, ret], 0, None);
@@ -1813,13 +1969,17 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: false,
             assembly_name: "pe_e2e_const_data".to_string(),
+            public_module_full_name: None,
             module_name: "pe_e2e_const_data.exe".to_string(),
             pdb_file_name: String::new(),
         };
         let (image, _pdb) = export_pe(&mut asm, &options);
 
         let (stdout, stderr, success) = run_under_dotnet(&image, "pe_e2e_const_data");
-        assert!(success, "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            success,
+            "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
         assert!(
             stdout.trim() == "733",
             "expected the const-data readback to print 733; got:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -1844,7 +2004,9 @@ mod tests {
     #[test]
     fn e2e_two_const_data_statics_do_not_alias_when_the_first_is_empty() {
         if dotnet_host().is_none() {
-            eprintln!("skipping e2e_two_const_data_statics_do_not_alias_when_the_first_is_empty: no dotnet host");
+            eprintln!(
+                "skipping e2e_two_const_data_statics_do_not_alias_when_the_first_is_empty: no dotnet host"
+            );
             return;
         }
 
@@ -1873,7 +2035,10 @@ mod tests {
             tpe: u8_ty,
             volatile: false,
         });
-        let empty_val = asm.int_cast(empty_val, crate::ir::Int::I32, crate::ir::cilnode::ExtendKind::ZeroExtend,
+        let empty_val = asm.int_cast(
+            empty_val,
+            crate::ir::Int::I32,
+            crate::ir::cilnode::ExtendKind::ZeroExtend,
         );
 
         // Buffer 2: a real 4-byte `i32` payload — if buffer 1 failed to advance the `.sdata`
@@ -1887,9 +2052,15 @@ mod tests {
             volatile: false,
         });
 
-        let print_empty = asm.alloc_root(CILRoot::Call(Box::new((write_line, vec![empty_val].into(), IsPure::NOT,
+        let print_empty = asm.alloc_root(CILRoot::Call(Box::new((
+            write_line,
+            vec![empty_val].into(),
+            IsPure::NOT,
         ))));
-        let print_value = asm.alloc_root(CILRoot::Call(Box::new((write_line, vec![value].into(), IsPure::NOT,
+        let print_value = asm.alloc_root(CILRoot::Call(Box::new((
+            write_line,
+            vec![value].into(),
+            IsPure::NOT,
         ))));
         let ret = asm.alloc_root(CILRoot::VoidRet);
         let block = BasicBlock::new(vec![print_empty, print_value, ret], 0, None);
@@ -1914,13 +2085,17 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: false,
             assembly_name: "pe_e2e_no_alias".to_string(),
+            public_module_full_name: None,
             module_name: "pe_e2e_no_alias.exe".to_string(),
             pdb_file_name: String::new(),
         };
         let (image, _pdb) = export_pe(&mut asm, &options);
 
         let (stdout, stderr, success) = run_under_dotnet(&image, "pe_e2e_no_alias");
-        assert!(success, "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            success,
+            "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
         let lines: Vec<&str> = stdout.lines().collect();
         assert_eq!(
             lines,
@@ -1984,7 +2159,11 @@ mod tests {
         // while its ACTUAL bytes are appended much later in the buffer. The result: `entrypoint`
         // below JITs whatever bytes truly sit at the stale RVA (garbage / `second`'s tail),
         // never reaching its real, correctly-assembled-but-wrongly-addressed body.
-        let libc_name = asm.alloc_string(if cfg!(target_os = "macos") { "libSystem.B.dylib" } else { "libc.so.6" });
+        let libc_name = asm.alloc_string(if cfg!(target_os = "macos") {
+            "libSystem.B.dylib"
+        } else {
+            "libc.so.6"
+        });
         let strlen_name = asm.alloc_string("strlen");
         let u8_ptr = asm.nptr(Type::Int(crate::ir::Int::U8));
         let strlen_sig = asm.sig([u8_ptr], Type::Int(crate::ir::Int::USize));
@@ -2026,26 +2205,40 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: false,
             assembly_name: "pe_e2e_no_pinvoke_alias".to_string(),
+            public_module_full_name: None,
             module_name: "pe_e2e_no_pinvoke_alias.exe".to_string(),
             pdb_file_name: String::new(),
         };
         let (image, _pdb) = export_pe(&mut asm, &options);
 
-        // `strlen` is the 2nd `MethodDef` row added (`second`, `strlen`, `entrypoint` — 1-based
-        // RID 2), and its RVA must read back as exactly `0` (§II.22.26: bodyless methods MUST
+        // MethodDef rows are emitted in canonical method order, not insertion order:
+        // `entrypoint`, `second`, `strlen`. The P/Invoke therefore has RID 3, and its RVA must
+        // read back as exactly `0` (§II.22.26: bodyless methods MUST
         // have RVA 0) — Pass 5, pre-fix, stamped it with the (bogus, nonzero) layout cursor
         // instead.
-        let rva = read_method_def_rva(&image, 2 /* RID of `strlen` */);
-        assert_eq!(rva, 0, "a bodyless (P/Invoke) MethodDef row's RVA column must stay 0, not the Pass 5 layout cursor");
+        let rva = read_method_def_rva(&image, 3 /* RID of `strlen` */);
+        assert_eq!(
+            rva, 0,
+            "a bodyless (P/Invoke) MethodDef row's RVA column must stay 0, not the Pass 5 layout cursor"
+        );
 
         // The two REAL-bodied methods (`second` RID 1, `entrypoint` RID 3) must each have their
         // OWN distinct, nonzero RVA — proving Pass 5's `continue` for the bodyless row in between
         // didn't also skip (or double-assign) either of theirs.
-        let second_rva = read_method_def_rva(&image, 1);
-        let entry_rva = read_method_def_rva(&image, 3);
-        assert_ne!(second_rva, 0, "`second` has a real body; its RVA must be nonzero");
-        assert_ne!(entry_rva, 0, "`entrypoint` has a real body; its RVA must be nonzero");
-        assert_ne!(second_rva, entry_rva, "two distinct method bodies must not share an RVA");
+        let second_rva = read_method_def_rva(&image, 2);
+        let entry_rva = read_method_def_rva(&image, 1);
+        assert_ne!(
+            second_rva, 0,
+            "`second` has a real body; its RVA must be nonzero"
+        );
+        assert_ne!(
+            entry_rva, 0,
+            "`entrypoint` has a real body; its RVA must be nonzero"
+        );
+        assert_ne!(
+            second_rva, entry_rva,
+            "two distinct method bodies must not share an RVA"
+        );
     }
 
     /// Reads `MethodDef` row `rid`'s (1-based) `RVA` column (§II.22.26) straight out of a
@@ -2066,7 +2259,8 @@ mod tests {
         let cli_off = rva_to_file_offset(image, pe::SECTION_ALIGNMENT + 8);
         let md_rva = u32::from_le_bytes(image[cli_off + 8..cli_off + 12].try_into().unwrap());
         let md_off = rva_to_file_offset(image, md_rva);
-        let version_len = u32::from_le_bytes(image[md_off + 12..md_off + 16].try_into().unwrap()) as usize;
+        let version_len =
+            u32::from_le_bytes(image[md_off + 12..md_off + 16].try_into().unwrap()) as usize;
         let mut p = md_off + 16 + version_len + 2 /* Flags */;
         let n_streams = u16::from_le_bytes(image[p..p + 2].try_into().unwrap());
         p += 2;
@@ -2101,7 +2295,10 @@ mod tests {
         }
         let simple_w = |rows: u32| if rows > 0xFFFF { 4usize } else { 2usize };
         let coded_w_2tag = |max_rows: u32| {
-            if max_rows as usize >= (1usize << 14) { 4usize } else { 2usize
+            if max_rows as usize >= (1usize << 14) {
+                4usize
+            } else {
+                2usize
             }
         };
         // Table row widths for JUST the tables that precede `MethodDef` (id 0x06) in the fixed
@@ -2110,11 +2307,20 @@ mod tests {
         // offset, only its OWN row stride (computed separately below).
         let module_w = 2 + str_w + 3 * 2; // this reader's test images always have a tiny (narrow) #GUID heap.
         let type_or_ref_max = row_counts[0x02].max(row_counts[0x01]);
-        let typeref_w = coded_w_2tag(row_counts[0x00].max(row_counts[0x1A]).max(row_counts[0x23])) + 2 * str_w;
-        let typedef_w = 4 + 2 * str_w + coded_w_2tag(type_or_ref_max) + simple_w(row_counts[0x04]) + simple_w(row_counts[0x06]);
+        let typeref_w =
+            coded_w_2tag(row_counts[0x00].max(row_counts[0x1A]).max(row_counts[0x23])) + 2 * str_w;
+        let typedef_w = 4
+            + 2 * str_w
+            + coded_w_2tag(type_or_ref_max)
+            + simple_w(row_counts[0x04])
+            + simple_w(row_counts[0x06]);
         let field_w = 2 + str_w + blob_w;
         let mut table_off = rp;
-        for (id, width) in [(0x00u32, module_w), (0x01, typeref_w), (0x02, typedef_w), (0x04, field_w),
+        for (id, width) in [
+            (0x00u32, module_w),
+            (0x01, typeref_w),
+            (0x02, typedef_w),
+            (0x04, field_w),
         ] {
             table_off += row_counts[id as usize] as usize * width;
         }
@@ -2151,7 +2357,9 @@ mod tests {
     #[test]
     fn e2e_static_field_default_value_read_back_at_runtime() {
         if dotnet_host().is_none() {
-            eprintln!("skipping e2e_static_field_default_value_read_back_at_runtime: no dotnet host");
+            eprintln!(
+                "skipping e2e_static_field_default_value_read_back_at_runtime: no dotnet host"
+            );
             return;
         }
 
@@ -2178,7 +2386,10 @@ mod tests {
             true,
         );
         let value = asm.alloc_node(CILNode::LdStaticField(sfld));
-        let call = asm.alloc_root(CILRoot::Call(Box::new((write_line, vec![value].into(), IsPure::NOT,
+        let call = asm.alloc_root(CILRoot::Call(Box::new((
+            write_line,
+            vec![value].into(),
+            IsPure::NOT,
         ))));
         let ret = asm.alloc_root(CILRoot::VoidRet);
         let block = BasicBlock::new(vec![call, ret], 0, None);
@@ -2203,13 +2414,17 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: false,
             assembly_name: "pe_e2e_static_default".to_string(),
+            public_module_full_name: None,
             module_name: "pe_e2e_static_default.exe".to_string(),
             pdb_file_name: String::new(),
         };
         let (image, _pdb) = export_pe(&mut asm, &options);
 
         let (stdout, stderr, success) = run_under_dotnet(&image, "pe_e2e_static_default");
-        assert!(success, "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            success,
+            "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
         assert!(
             stdout.trim() == "733",
             "expected the static-default readback to print 733; got:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -2231,7 +2446,11 @@ mod tests {
         // A real BCL interface reference — no method body needed for a metadata-shape check.
         let idisposable_name = asm.alloc_string("System.IDisposable");
         let idisposable_asm = asm.alloc_string("System.Runtime");
-        let idisposable = asm.alloc_class_ref(crate::ir::ClassRef::new(idisposable_name, Some(idisposable_asm), false, [].into(),
+        let idisposable = asm.alloc_class_ref(crate::ir::ClassRef::new(
+            idisposable_name,
+            Some(idisposable_asm),
+            false,
+            [].into(),
         ));
         asm.class_mut(main).add_interface(idisposable);
 
@@ -2239,6 +2458,7 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "export_pe_implements".to_string(),
+            public_module_full_name: None,
             module_name: "export_pe_implements.exe".to_string(),
             pdb_file_name: String::new(),
         };
@@ -2267,7 +2487,9 @@ mod tests {
     #[test]
     fn e2e_explicit_layout_struct_with_nonzero_offsets_round_trips_at_runtime() {
         if dotnet_host().is_none() {
-            eprintln!("skipping e2e_explicit_layout_struct_with_nonzero_offsets_round_trips_at_runtime: no dotnet host");
+            eprintln!(
+                "skipping e2e_explicit_layout_struct_with_nonzero_offsets_round_trips_at_runtime: no dotnet host"
+            );
             return;
         }
 
@@ -2313,7 +2535,8 @@ mod tests {
         let set_x = asm.alloc_root(CILRoot::SetField(Box::new((x_field, loc_addr, ten))));
         let loc_addr2 = asm.alloc_node(CILNode::LdLocA(0));
         let thirty_two = asm.alloc_node(CILNode::Const(Box::new(Const::I32(32))));
-        let set_y = asm.alloc_root(CILRoot::SetField(Box::new((y_field, loc_addr2, thirty_two,
+        let set_y = asm.alloc_root(CILRoot::SetField(Box::new((
+            y_field, loc_addr2, thirty_two,
         ))));
 
         let loc_val_for_x = asm.alloc_node(CILNode::LdLoc(0));
@@ -2327,7 +2550,10 @@ mod tests {
             field: y_field,
         });
         let sum = asm.alloc_node(CILNode::BinOp(get_x, get_y, crate::ir::BinOp::Add));
-        let call = asm.alloc_root(CILRoot::Call(Box::new((write_line, vec![sum].into(), IsPure::NOT,
+        let call = asm.alloc_root(CILRoot::Call(Box::new((
+            write_line,
+            vec![sum].into(),
+            IsPure::NOT,
         ))));
         let ret = asm.alloc_root(CILRoot::VoidRet);
         let block = BasicBlock::new(vec![set_x, set_y, call, ret], 0, None);
@@ -2352,13 +2578,17 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: false,
             assembly_name: "pe_e2e_layout".to_string(),
+            public_module_full_name: None,
             module_name: "pe_e2e_layout.exe".to_string(),
             pdb_file_name: String::new(),
         };
         let (image, _pdb) = export_pe(&mut asm, &options);
 
         let (stdout, stderr, success) = run_under_dotnet(&image, "pe_e2e_layout");
-        assert!(success, "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            success,
+            "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
         assert!(
             stdout.trim() == "42",
             "expected x(10)+y(32) read back through explicit offsets to print 42; got:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -2387,7 +2617,9 @@ mod tests {
     #[test]
     fn e2e_fnptr_field_store_then_calli_round_trips_at_runtime() {
         if dotnet_host().is_none() {
-            eprintln!("skipping e2e_fnptr_field_store_then_calli_round_trips_at_runtime: no dotnet host");
+            eprintln!(
+                "skipping e2e_fnptr_field_store_then_calli_round_trips_at_runtime: no dotnet host"
+            );
             return;
         }
 
@@ -2438,7 +2670,9 @@ mod tests {
         // explicit-layout struct storing a type-erased function pointer).
         let holder_name = asm.alloc_string("Holder");
         let fp_name = asm.alloc_string("fp");
-        let erased_sig = asm.sig([Type::Int(crate::ir::Int::USize)], Type::Int(crate::ir::Int::I32),
+        let erased_sig = asm.sig(
+            [Type::Int(crate::ir::Int::USize)],
+            Type::Int(crate::ir::Int::I32),
         );
         let fnptr_ty = Type::FnPtr(erased_sig);
         let holder_def = crate::ir::class::ClassDef::new(
@@ -2455,7 +2689,10 @@ mod tests {
         );
         let holder_idx = asm.class_def(holder_def).expect("Holder layout check");
         let holder_cref = holder_idx.0;
-        let fp_field = asm.alloc_field(crate::ir::field::FieldDesc::new(holder_cref, fp_name, fnptr_ty,
+        let fp_field = asm.alloc_field(crate::ir::field::FieldDesc::new(
+            holder_cref,
+            fp_name,
+            fnptr_ty,
         ));
 
         let console = crate::ir::ClassRef::console(&mut asm);
@@ -2486,7 +2723,10 @@ mod tests {
             erased_sig,
             vec![forty_one].into(),
         ))));
-        let call = asm.alloc_root(CILRoot::Call(Box::new((write_line, vec![call_result].into(), IsPure::NOT,
+        let call = asm.alloc_root(CILRoot::Call(Box::new((
+            write_line,
+            vec![call_result].into(),
+            IsPure::NOT,
         ))));
         let ret = asm.alloc_root(CILRoot::VoidRet);
         let block = BasicBlock::new(vec![set_fp, call, ret], 0, None);
@@ -2511,13 +2751,17 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: false,
             assembly_name: "pe_e2e_fnptr_field".to_string(),
+            public_module_full_name: None,
             module_name: "pe_e2e_fnptr_field.exe".to_string(),
             pdb_file_name: String::new(),
         };
         let (image, _pdb) = export_pe(&mut asm, &options);
 
         let (stdout, stderr, success) = run_under_dotnet(&image, "pe_e2e_fnptr_field");
-        assert!(success, "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            success,
+            "dotnet run failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
         assert!(
             stdout.trim() == "42",
             "expected callee(41)=42 read back through a stored/reloaded fnptr field; got:\nstdout:\n{stdout}\nstderr:\n{stderr}"

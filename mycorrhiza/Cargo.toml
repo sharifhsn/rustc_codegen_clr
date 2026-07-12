@@ -1,7 +1,7 @@
 [package]
 name = "mycorrhiza"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FractalFir/rustc_codegen_clr"
 description = "Rust/.NET interop layer"

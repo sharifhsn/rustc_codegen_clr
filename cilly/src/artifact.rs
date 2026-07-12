@@ -8,14 +8,16 @@ use crate::Assembly;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Prefix identifying the current, schema-v3 `cilly` assembly artifact before payload decoding.
-pub const ASSEMBLY_ARTIFACT_MAGIC: &[u8; 8] = b"CILLYAR3";
+/// Prefix identifying the current, schema-v4 `cilly` assembly artifact before payload decoding.
+pub const ASSEMBLY_ARTIFACT_MAGIC: &[u8; 8] = b"CILLYAR4";
+/// Magic emitted by schema-v3 artifacts, before fixed-array layout provenance.
+const ASSEMBLY_ARTIFACT_V3_MAGIC: &[u8; 8] = b"CILLYAR3";
 /// Magic emitted by schema-v2 artifacts, before canonical method-scope exception regions.
 const ASSEMBLY_ARTIFACT_V2_MAGIC: &[u8; 8] = b"CILLYAR2";
 /// Magic emitted by schema-v1 artifacts, whose `BiMap` payload duplicated value storage.
 const ASSEMBLY_ARTIFACT_V1_MAGIC: &[u8; 8] = b"CILLYART";
 /// Current serialization-envelope version.
-pub const ASSEMBLY_ARTIFACT_VERSION: u16 = 3;
+pub const ASSEMBLY_ARTIFACT_VERSION: u16 = 4;
 
 /// Final output target selected by a backend or linker process.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -136,8 +138,7 @@ impl ArtifactAbiConfig {
 
     /// Selects whether Rust unwind cleanup regions are omitted from this artifact.
     #[must_use]
-    pub const fn with_no_unwind(mut self,
-        no_unwind: bool) -> Self {
+    pub const fn with_no_unwind(mut self, no_unwind: bool) -> Self {
         self.no_unwind = no_unwind;
         self
     }
@@ -447,6 +448,12 @@ pub fn decode_assembly_artifact(
             supported: ASSEMBLY_ARTIFACT_VERSION,
         });
     }
+    if encoded.starts_with(ASSEMBLY_ARTIFACT_V3_MAGIC) {
+        return Err(ArtifactDecodeError::UnsupportedVersion {
+            found: 3,
+            supported: ASSEMBLY_ARTIFACT_VERSION,
+        });
+    }
     if let Some(payload) = encoded.strip_prefix(ASSEMBLY_ARTIFACT_MAGIC) {
         let artifact: AssemblyArtifact =
             postcard::from_bytes(payload).map_err(ArtifactDecodeError::InvalidVersionedEnvelope)?;
@@ -513,8 +520,8 @@ impl std::error::Error for ArtifactDecodeError {
 mod tests {
     use super::*;
     use crate::{
-        cilnode::MethodKind, Access, BasicBlock, CILRoot, ExceptionRegion, MethodDef, MethodImpl,
-        Type,
+        Access, BasicBlock, CILRoot, ClassDef, ClassRef, ExceptionRegion, MethodDef, MethodImpl,
+        Type, cilnode::MethodKind, class::FixedArrayLayout,
     };
     #[test]
     fn versioned_artifact_round_trips_abi_config_and_assembly() {
@@ -534,6 +541,65 @@ mod tests {
         let (assembly, decoded_config, _) = decoded.into_parts();
         assert_eq!(decoded_config, Some(config));
         assert_eq!(assembly.class_defs().len(), 1);
+    }
+
+    #[test]
+    fn versioned_artifact_round_trips_fixed_array_layout_provenance() {
+        let mut assembly = Assembly::default();
+        let element_name = assembly.alloc_string("SerializedExpandedElement");
+        let element = assembly.alloc_class_ref(ClassRef::new(element_name, None, true, [].into()));
+        assembly
+            .class_def(ClassDef::new(
+                element_name,
+                true,
+                0,
+                None,
+                vec![],
+                vec![],
+                Access::Public,
+                std::num::NonZeroU32::new(24),
+                std::num::NonZeroU32::new(8),
+                false,
+            ))
+            .unwrap();
+        let array =
+            ClassRef::fixed_array_with_layout(Type::ClassRef(element), 2, 32, 8, &mut assembly);
+        let array_name = assembly.class_ref(array).name();
+        assembly
+            .class_def(
+                ClassDef::new(
+                    array_name,
+                    true,
+                    0,
+                    None,
+                    vec![],
+                    vec![],
+                    Access::Public,
+                    std::num::NonZeroU32::new(32),
+                    std::num::NonZeroU32::new(8),
+                    true,
+                )
+                .with_fixed_array_layout(FixedArrayLayout::new(
+                    Type::ClassRef(element),
+                    2,
+                    32,
+                    32,
+                    8,
+                )),
+            )
+            .unwrap();
+
+        let encoded = AssemblyArtifact::new(assembly, ArtifactAbiConfig::default())
+            .encode()
+            .unwrap();
+        let decoded = decode_assembly_artifact(&encoded).unwrap();
+        let (assembly, _, _) = decoded.into_parts();
+        assert!(
+            assembly
+                .validate_fixed_array_layouts()
+                .unwrap_err()
+                .contains("representation-expanded element")
+        );
     }
 
     #[test]
@@ -596,10 +662,7 @@ mod tests {
             .iter()
             .map(ArtifactAbiConfigDifference::field)
             .collect();
-        assert_eq!(
-            fields,
-            ["dotnet_runtime", "no_unwind"]
-        );
+        assert_eq!(fields, ["dotnet_runtime", "no_unwind"]);
         assert_eq!(
             error.to_string(),
             "incompatible artifact ABI configuration; dotnet_runtime: expected Net8, found Net9; \
@@ -632,8 +695,8 @@ mod tests {
         assert!(matches!(
             error,
             ArtifactDecodeError::UnsupportedVersion {
-                found: 4,
-                supported: 3
+                found: 5,
+                supported: 4
             }
         ));
     }
@@ -648,7 +711,7 @@ mod tests {
             error,
             ArtifactDecodeError::UnsupportedVersion {
                 found: 1,
-                supported: 3
+                supported: 4
             }
         ));
         assert!(error.to_string().contains("Rebuild all input crates"));
@@ -664,7 +727,23 @@ mod tests {
             error,
             ArtifactDecodeError::UnsupportedVersion {
                 found: 2,
-                supported: 3
+                supported: 4
+            }
+        ));
+        assert!(error.to_string().contains("Rebuild all input crates"));
+    }
+
+    #[test]
+    fn v3_header_is_rejected_before_deserializing_pre_layout_provenance() {
+        let mut encoded = ASSEMBLY_ARTIFACT_V3_MAGIC.to_vec();
+        encoded.extend_from_slice(b"payload shape intentionally irrelevant");
+
+        let error = decode_assembly_artifact(&encoded).err().unwrap();
+        assert!(matches!(
+            error,
+            ArtifactDecodeError::UnsupportedVersion {
+                found: 3,
+                supported: 4
             }
         ));
         assert!(error.to_string().contains("Rebuild all input crates"));

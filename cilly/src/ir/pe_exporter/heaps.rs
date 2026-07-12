@@ -158,10 +158,9 @@ impl UserStringHeap {
         let utf16: Vec<u16> = s.encode_utf16().collect();
         // §II.24.2.4: the trailing byte is 1 iff any UTF-16 unit needs "special handling"
         // (>= 0x100, or one of the control/format code points listed by the spec).
-        let special = utf16.iter().any(|&u| {
-            u >= 0x100
-                || matches!(u, 0x01..=0x08 | 0x0E..=0x1F | 0x27 | 0x2D | 0x7F)
-        });
+        let special = utf16
+            .iter()
+            .any(|&u| u >= 0x100 || matches!(u, 0x01..=0x08 | 0x0E..=0x1F | 0x27 | 0x2D | 0x7F));
         let byte_len = u32::try_from(utf16.len() * 2 + 1).expect("user string exceeds u32");
         let off = u32::try_from(self.data.len()).expect("#US heap exceeded 4 GiB");
         write_compressed_u32(&mut self.data, byte_len);

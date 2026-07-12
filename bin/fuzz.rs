@@ -112,7 +112,7 @@ pub fn rustc_args() -> Box<[String]> {
             "-Z".to_owned(),
             "randomize-layout".to_owned(),
             "--edition".to_owned(),
-            "2021".to_owned(),
+            "2024".to_owned(),
         ]
         .into()
     } else {
@@ -122,7 +122,7 @@ pub fn rustc_args() -> Box<[String]> {
             "-C".to_owned(),
             format!("linker={}", RUSTC_CODEGEN_CLR_LINKER.display()),
             "--edition".to_owned(),
-            "2021".to_owned(),
+            "2024".to_owned(),
         ]
         .into()
     }
@@ -395,7 +395,7 @@ fn run_test_impl(test_id: u64, is_release: bool) -> Option<f64> {
         "-o",
         &native_exec,
         "--edition",
-        "2021",
+        "2024",
     ]);
     let out = cmd.output().expect("failed to execute process");
     // If stderr is not empty, then something went wrong, so print the stdout and stderr for debuging.

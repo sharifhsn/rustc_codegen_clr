@@ -38,12 +38,16 @@ pub fn run(art: &Artifact, prog_args: &[String], ctx: &Context) -> Result<i32> {
             println!(
                 "cargo dotnet run: '{stem}' is a LIBRARY (no entrypoint) — reference {} \
                  from a C# project (see docs/INTEROP_CSHARP.md)",
-                dll.file_name().and_then(|s| s.to_str()).unwrap_or("the .dll")
+                dll.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("the .dll")
             );
             Ok(0)
         }
         Artifact::None => {
-            eprintln!("!! cargo dotnet run: no runnable apphost found (looked for an executable artifact)");
+            eprintln!(
+                "!! cargo dotnet run: no runnable apphost found (looked for an executable artifact)"
+            );
             Ok(3)
         }
     }

@@ -15,9 +15,9 @@
 //! payload round-trips unchanged.
 
 use crate::{
+    BasicBlock, CILNode, CILRoot, ClassRef, Int, MethodImpl, MethodRef, Type,
     asm::MissingMethodPatcher,
     cilnode::{IsPure, MethodKind},
-    BasicBlock, CILNode, CILRoot, ClassRef, Int, MethodImpl, MethodRef, Type,
 };
 
 use super::super::Assembly;
@@ -27,7 +27,7 @@ use super::super::Assembly;
 /// the `RustException` class + its `.ctor(usize)`) to have run first.
 pub fn raise_exception(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("_Unwind_RaiseException");
-    let generator = move |_, asm: &mut Assembly| {
+    let generator = move |mref: crate::Interned<MethodRef>, asm: &mut Assembly| {
         // Reference the linker-defined `RustException` class (same-assembly, so `None` asm name —
         // matching how the catch side in `insert_catch_unwind` refers to it).
         let rust_exception_name = asm.alloc_string("RustException");
@@ -50,6 +50,8 @@ pub fn raise_exception(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         // (native pointer ≡ native int in CIL). The catch side passes it back to the catch closure,
         // which decodes it with `__rust_panic_cleanup`.
         let exception_ptr = asm.alloc_node(CILNode::LdArg(0));
+        let input_type = asm[asm[mref].sig()].inputs()[0];
+        let exception_ptr = asm.adapt_call_value(exception_ptr, input_type, Type::Int(Int::USize));
         let exception = asm.call(ctor, &[exception_ptr], IsPure::NOT);
         let throw = asm.alloc_root(CILRoot::Throw(exception));
         // `throw` ends the path; `_Unwind_RaiseException` only "returns" on failure, which never

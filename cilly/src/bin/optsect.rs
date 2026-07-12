@@ -3,7 +3,7 @@ use std::{
     path::Path,
 };
 
-use cilly::{asm::ILASM_FLAVOUR, il_exporter::ILExporter, opt::OptFuel, Assembly};
+use cilly::{Assembly, asm::ILASM_FLAVOUR, il_exporter::ILExporter, opt::OptFuel};
 fn asm_with_fuel(asm: &Assembly, path: &Path, fuel: u32) {
     let mut asm = asm.clone();
     let opt_time = std::time::Instant::now();

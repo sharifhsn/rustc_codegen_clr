@@ -1,11 +1,11 @@
 [package]
 name = "cd_rustvec"
-edition = "2021"
+edition = "2024"
 version = "0.1.0"
 
 [lib]
 # A .NET class library (cdylib): `cargo dotnet build` emits `cd_rustvec.dll`, whose
-# `#[no_mangle] pub extern "C"` functions are `public static` methods on `MainModule`.
+# `#[unsafe(no_mangle)] pub extern "C"` functions are `public static` methods on `MainModule`.
 # This is the *type-erased core* of the WF-9 Stage-2 generic bridge: ONE Rust
 # monomorphization (keyed by element size, operating on raw bytes) backs a C# generic
 # `RustVec<T>` for any `T: unmanaged`.

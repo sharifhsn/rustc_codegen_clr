@@ -1,13 +1,11 @@
 use crate::assembly::MethodCompileCtx;
-use cilly::{
-    cilnode::ExtendKind, BinOp, Const, Int, Interned, Type, {FieldDesc},
-};
 use crate::operand::operand_address;
 use crate::place::place_set;
 use crate::r#type::{
-    utilis::{is_zst, ptr_is_fat},
     GetTypeExt,
+    utilis::{is_zst, ptr_is_fat},
 };
+use cilly::{BinOp, Const, FieldDesc, Int, Interned, Type, cilnode::ExtendKind};
 use rustc_middle::{
     mir::{Operand, Place},
     ty::{Instance, TyKind},
@@ -58,9 +56,10 @@ pub fn size_of_val<'tcx>(
         // pointee's own `TyKind`. A DST-tailed struct (e.g. `ArcInner<[u8]>`) has `kind() == Adt`
         // but its tail is `[u8]`/`str`; matching on the pointee kind would route it to the `dyn`
         // vtable path and dereference the slice *length* as a vtable pointer (NullReferenceException).
-        let tail = ctx
-            .tcx()
-            .struct_tail_for_codegen(pointed_ty, rustc_middle::ty::TypingEnv::fully_monomorphized());
+        let tail = ctx.tcx().struct_tail_for_codegen(
+            pointed_ty,
+            rustc_middle::ty::TypingEnv::fully_monomorphized(),
+        );
         match tail.kind() {
             TyKind::Slice(_) | TyKind::Str => {
                 // size = align_up(prefix + len * stride, align), where:

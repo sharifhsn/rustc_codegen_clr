@@ -1,7 +1,7 @@
 [package]
 name = "cd_iface_genmethod"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [lib]
 # A .NET class library: `cargo dotnet build` emits `cd_iface_genmethod.dll` containing genuine

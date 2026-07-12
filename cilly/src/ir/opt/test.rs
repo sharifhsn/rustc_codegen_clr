@@ -1,9 +1,9 @@
 #[cfg(test)]
-use crate::{Assembly, BasicBlock, BinOp, CILRoot};
-#[cfg(test)]
 use super::{
-    propagate_roots, CILIter, CILIterElem, CILNode, Float, OptFuel, SideEffectInfoCache, Type,
+    CILIter, CILIterElem, CILNode, Float, OptFuel, SideEffectInfoCache, Type, propagate_roots,
 };
+#[cfg(test)]
+use crate::{Assembly, BasicBlock, BinOp, CILRoot};
 
 #[test]
 fn sfi_dedup() {
@@ -73,7 +73,9 @@ fn propagate_locals_does_not_duplicate_multi_use_expr() {
     let sig = asm.sig([], Type::Void);
     let mut cache = SideEffectInfoCache::default();
     let mut fuel = OptFuel::new(u32::MAX);
-    propagate_roots(&mut asm, &mut root, prev_root, &mut cache, &locals, sig, &mut fuel);
+    propagate_roots(
+        &mut asm, &mut root, prev_root, &mut cache, &locals, sig, &mut fuel,
+    );
 
     // Count how many times the `Sub` node (zr2 - zi2) appears in the resulting root. If the guard
     // is doing its job, propagation into the multi-read statement is skipped entirely, so the tree

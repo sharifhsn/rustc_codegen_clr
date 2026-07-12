@@ -7,8 +7,8 @@
 //! [`some`].
 
 use crate::intrinsics::{
-    rustc_clr_interop_generic_call1, rustc_clr_interop_generic_ctor1,
     RustcCLRInteropManagedGenericStruct, RustcCLRInteropTypeGeneric,
+    rustc_clr_interop_generic_call1, rustc_clr_interop_generic_ctor1,
 };
 
 const CORELIB: &str = "System.Private.CoreLib";

@@ -23,23 +23,15 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::context::Context;
+use crate::context::{Context, ManagedIdentity};
 
-/// Delete the whole `<crate_dir>/target/dotnet_xmldoc/` scratch dir before a build.
+/// Preserve proc-macro scratch across incremental builds.
 ///
-/// `dotnet_macros::emit_xmldoc_entry` can only ever APPEND (a proc-macro invocation has no way to
-/// know about, or clear, entries from a previous compiler run). Clearing here means the scratch
-/// dir always reflects exactly the fns that get (re-)expanded on THIS build; entries never
-/// accumulate duplicates across repeated builds. Best-effort: a missing dir is not an error, and a
-/// failure to remove it is only reported, never fatal (this must not block an actual build).
-pub fn clear_scratch(ctx: &Context) {
-    let dir = ctx.crate_dir.join("target").join("dotnet_xmldoc");
-    if dir.is_dir() {
-        if let Err(e) = fs::remove_dir_all(&dir) {
-            eprintln!("== xml docs: could not clear stale scratch dir {}: {e} ==", dir.display());
-        }
-    }
-}
+/// Cargo may reuse a fully compiled crate without invoking `#[dotnet_export]` again. Deleting the
+/// scratch before such a no-op build produced an empty XML contract. `generate` de-duplicates by
+/// member ID, so retaining the append-only inventory is safe for unchanged builds and clean release
+/// builds recreate it from an empty target directory.
+pub fn clear_scratch(_ctx: &Context) {}
 
 /// One scraped doc entry: an exact ECMA-334 member-ID plus its doc-comment body.
 struct Entry {
@@ -92,17 +84,19 @@ fn xml_escape(s: &str) -> String {
 }
 
 /// Read `<crate_dir>/target/dotnet_xmldoc/<crate_name>.xmldoc.jsonl` (if present) and write the
-/// ECMA-334 sidecar `<dll_stem>.xml` beside `dll_path`. No-op (not an error) if no scratch file
-/// exists — most crates don't use `#[dotnet_export]` doc comments, and this must never fail a
-/// build over doc generation.
-pub fn generate(crate_dir: &Path, crate_name: &str, dll_path: &Path) -> Result<()> {
+/// ECMA-334 sidecar `<dll_stem>.xml` beside `dll_path`. Crates without exported documentation get
+/// a valid empty `<members>` inventory so release packages always carry a documentation contract.
+pub fn generate(
+    crate_dir: &Path,
+    crate_name: &str,
+    dll_path: &Path,
+    managed_identity: Option<&ManagedIdentity>,
+) -> Result<()> {
     let scratch = crate_dir
         .join("target")
         .join("dotnet_xmldoc")
         .join(format!("{crate_name}.xmldoc.jsonl"));
-    let Ok(contents) = fs::read_to_string(&scratch) else {
-        return Ok(());
-    };
+    let contents = fs::read_to_string(&scratch).unwrap_or_default();
 
     // De-duplicate by member-ID, keeping the LAST occurrence. `cargo-dotnet`'s own pipeline runs
     // the inner `cargo build` twice per invocation (a human-readable pass, then a
@@ -115,16 +109,15 @@ pub fn generate(crate_dir: &Path, crate_name: &str, dll_path: &Path) -> Result<(
     // the macro for a given fn.
     let mut entries: Vec<Entry> = Vec::new();
     for e in contents.lines().filter_map(parse_line) {
-        if let Some(existing) = entries.iter_mut().find(|x: &&mut Entry| x.member == e.member) {
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|x: &&mut Entry| x.member == e.member)
+        {
             *existing = e;
         } else {
             entries.push(e);
         }
     }
-    if entries.is_empty() {
-        return Ok(());
-    }
-
     let asm_name = dll_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -132,12 +125,22 @@ pub fn generate(crate_dir: &Path, crate_name: &str, dll_path: &Path) -> Result<(
 
     let mut xml = String::new();
     xml.push_str("<?xml version=\"1.0\"?>\n<doc>\n");
-    xml.push_str(&format!("<assembly>\n<name>{}</name>\n</assembly>\n", xml_escape(asm_name)));
+    xml.push_str(&format!(
+        "<assembly>\n<name>{}</name>\n</assembly>\n",
+        xml_escape(asm_name)
+    ));
     xml.push_str("<members>\n");
+    let public_type = managed_identity
+        .and_then(ManagedIdentity::module_full_name)
+        .unwrap_or_else(|| "MainModule".to_string());
     for e in &entries {
+        let member = e.member.strip_prefix("M:MainModule.").map_or_else(
+            || e.member.clone(),
+            |suffix| format!("M:{public_type}.{suffix}"),
+        );
         xml.push_str(&format!(
             "<member name=\"{}\">\n<summary>{}</summary>\n</member>\n",
-            xml_escape(&e.member),
+            xml_escape(&member),
             xml_escape(&e.summary)
         ));
     }

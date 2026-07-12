@@ -260,7 +260,7 @@ mod custom {
     // This implementation uses current timestamp as a PRNG seed.
     //
     // WARNING: this custom implementation is for testing purposes ONLY!
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     unsafe extern "Rust" fn __getrandom_v03_custom(dest: *mut u8, len: usize) -> Result<(), Error> {
         use std::time::{SystemTime, UNIX_EPOCH};
 

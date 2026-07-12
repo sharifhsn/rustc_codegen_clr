@@ -1,6 +1,8 @@
 use crate::{
-    intrinsics::{RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric, RustcCLRInteropManagedStruct},
     FromManagedSafe, IntoManagedSafe, ManagedSafe,
+    intrinsics::{
+        RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric, RustcCLRInteropManagedStruct,
+    },
 };
 type GCHandle = RustcCLRInteropManagedStruct<
     "System.Runtime",
@@ -142,7 +144,8 @@ impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str> Clone
 /// `ManagedRefInOverlapingField` the same way a non-generic handle does; wrapping it in a
 /// `GenericClass` (a plain `GCHandle`/`IntPtr` value type, no gcref field) fixes it identically to
 /// [`Class`].
-pub struct GenericClass<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, ClassGenerics> {
+pub struct GenericClass<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, ClassGenerics>
+{
     handle: GCHandle,
     pd: core::marker::PhantomData<ClassGenerics>,
 }
@@ -167,7 +170,10 @@ impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, ClassGenerics
         let obj: RustcCLRInteropManagedClass<"System.Runtime", "System.Object"> =
             crate::intrinsics::rustc_clr_interop_managed_checked_cast(naked);
         let h = GCHandle::static1::<"Alloc", _, _>(obj);
-        Self { handle: h, pd: core::marker::PhantomData }
+        Self {
+            handle: h,
+            pd: core::marker::PhantomData,
+        }
     }
 }
 impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, ClassGenerics> Drop

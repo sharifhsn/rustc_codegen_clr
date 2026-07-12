@@ -1,0 +1,5 @@
+error: #[dotnet_export]: unsupported return type `PositionDto`. Supported: the integer/float primitives, `bool`, `&str`, `String`, `()`, `mycorrhiza::task::Task`, `mycorrhiza::task::TaskT<T>`, `Option<T>`, and `Vec<T>` of a passthrough primitive `T`.
+ --> tests/ui/dotnet_export_unsupported_return.rs:8:24
+  |
+8 | pub fn bad_return() -> PositionDto {
+  |                        ^^^^^^^^^^^

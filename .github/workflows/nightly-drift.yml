@@ -26,7 +26,15 @@ jobs:
       - name: cargo check against current nightly (pin overridden)
         id: check
         run: |
+          # Preserve cargo's status rather than the status of the final `tail` process. Without
+          # this, a rustc-API drift failure is reported as a successful canary and the issue step
+          # below never runs.
+          set -o pipefail
+          set +e
           RUSTUP_TOOLCHAIN=nightly cargo check --workspace 2>&1 | tee /tmp/drift.log | tail -60
+          cargo_status=${PIPESTATUS[0]}
+          set -e
+          exit "$cargo_status"
       - name: File / update drift issue
         if: failure()
         env:

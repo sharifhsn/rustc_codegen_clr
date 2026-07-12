@@ -71,6 +71,8 @@
   <!--    If none exists -> actionable <Error>.                                -->
   <!-- ====================================================================== -->
   <Target Name="FindCargoDotnet">
+    <Error Condition="$([MSBuild]::IsOSPlatform('Windows'))"
+           Text="Windows hosts are not supported by this cargo-dotnet release; use Linux or macOS. Windows support will be enabled after Windows build, test, packaging, and MSBuild acceptance exists." />
     <PropertyGroup>
       <_CdHome>$(CARGO_DOTNET_HOME)</_CdHome>
       <_CdHome Condition="'$(_CdHome)'==''">$(HOME)/.cargo-dotnet</_CdHome>
@@ -89,6 +91,43 @@
     <Message Importance="low" Text="RustDotnet: using cargo-dotnet at $(_CargoDotnetExe)" />
   </Target>
 
+  <!-- A host can reference several Rust crates, while cargo-dotnet builds each one in a
+       separate process. Validate the whole reference set before any build so duplicate CLR
+       assembly simple names or projected public type names cannot reach Roslyn ambiguously. -->
+  <Target Name="ValidateRustCrateIdentities"
+          DependsOnTargets="FindCargoDotnet;ValidateRustDotnetArchitecture"
+          Condition="'@(RustCrate)'!=''">
+    <Exec Command="&quot;$(_CargoDotnetExe)&quot; validate-managed-identities @(RustCrate->'&quot;$(MSBuildProjectDirectory)/%(Identity)&quot;', ' ')" />
+    <!-- A broken validator is still a failed requested Rust build. If the caller explicitly
+         forced/cleaned the build, invalidate the old assembly before propagating the error. -->
+    <OnError ExecuteTargets="_InvalidateRustArtifactsAfterIdentityFailure"
+             Condition="'$(RustDotnetForceBuild)'=='true' or '@(RustCrate->'%(Clean)')'=='true'" />
+  </Target>
+
+  <Target Name="ValidateRustDotnetArchitecture" Condition="'@(RustCrate)'!=''">
+    <Error Condition="'$(PlatformTarget)'=='x86' or '$(Prefer32Bit)'=='true' or $([System.Text.RegularExpressions.Regex]::IsMatch('$(RuntimeIdentifier)', '(^|-)x86($|-)'))"
+           Text="RustDotnet: x86/32-bit consumers are unsupported by x86_64-unknown-dotnet. Use a 64-bit process target (x64, arm64, or 64-bit AnyCPU)." />
+  </Target>
+
+  <Target Name="_InvalidateRustArtifactsAfterIdentityFailure">
+    <ItemGroup>
+      <_RustCrateToInvalidate Include="@(RustCrate)">
+        <_Dir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/%(RustCrate.Identity)'))</_Dir>
+        <_Profile Condition="'%(RustCrate.Configuration)'=='Debug'">debug</_Profile>
+        <_Profile Condition="'%(RustCrate.Configuration)'!='Debug'">release</_Profile>
+        <_MetaName>%(RustCrate.CrateName)</_MetaName>
+        <_Clean>%(RustCrate.Clean)</_Clean>
+      </_RustCrateToInvalidate>
+    </ItemGroup>
+    <!-- _ResolveOneRustCrate deletes forced/clean outputs before asking cargo-dotnet for metadata.
+         ContinueOnError is intentional: the validator executable is already known to be broken. -->
+    <MSBuild Projects="$(MSBuildProjectFullPath)"
+             Targets="_ResolveOneCrate"
+             BuildInParallel="false"
+             ContinueOnError="WarnAndContinue"
+             Properties="_OneDir=%(_RustCrateToInvalidate._Dir);_OneProfile=%(_RustCrateToInvalidate._Profile);_OneMetaName=%(_RustCrateToInvalidate._MetaName);_OneClean=%(_RustCrateToInvalidate._Clean);CargoDotnet=$(_CargoDotnetExe);RustDotnetForceBuild=$(RustDotnetForceBuild)" />
+  </Target>
+
   <!-- ====================================================================== -->
   <!-- 2. BuildRustCrates — for each <RustCrate>, build it (serial) and add a  -->
   <!--    <Reference> to its produced assembly. Runs BEFORE reference          -->
@@ -96,8 +135,13 @@
   <!-- ====================================================================== -->
   <Target Name="BuildRustCrates"
           BeforeTargets="ResolveAssemblyReferences;ResolveReferences;BeforeCompile"
-          DependsOnTargets="FindCargoDotnet"
+          DependsOnTargets="FindCargoDotnet;ValidateRustCrateIdentities"
           Condition="'@(RustCrate)'!=''">
+
+    <!-- The current Rust target has 64-bit pointer/layout semantics even though its managed PE can
+         otherwise look AnyCPU. Reject explicit 32-bit consumers before loading or referencing it. -->
+    <Error Condition="'$(PlatformTarget)'=='x86' or '$(Prefer32Bit)'=='true' or $([System.Text.RegularExpressions.Regex]::IsMatch('$(RuntimeIdentifier)', '(^|-)x86($|-)'))"
+           Text="RustDotnet: x86/32-bit consumers are unsupported by x86_64-unknown-dotnet. Use a 64-bit process target (x64, arm64, or 64-bit AnyCPU)." />
 
     <!-- Derive the absolute crate dir + profile per item. GetFullPath resolves the
          Include path relative to the .csproj dir. _CrateName / _Dll are resolved INSIDE
@@ -119,14 +163,15 @@
       </_RustCrate>
     </ItemGroup>
 
-    <!-- Build each crate SERIALLY (BuildInParallel=false): `cargo dotnet` mutates the
-         shared toolchain rust-src on every build, so concurrent builds would race. The
+    <!-- Build independent crates in parallel. cargo-dotnet isolates mutable Cargo homes and
+         target outputs by canonical crate identity, while narrowly locking private-sysroot
+         publication and the shared interop helper project. The
          MSBuild task re-enters THIS project's _BuildOneRustCrate target per crate; that
          inner target resolves the crate name + .dll path, carries the Inputs/Outputs
          incremental check, runs the build, and RETURNS the produced .dll path. -->
     <MSBuild Projects="$(MSBuildProjectFullPath)"
              Targets="_BuildOneRustCrate"
-             BuildInParallel="false"
+             BuildInParallel="true"
              Properties="_OneDir=%(_RustCrate._Dir);_OneProfile=%(_RustCrate._Profile);_OneMetaName=%(_RustCrate._MetaName);_OnePrivate=%(_RustCrate._Private);_OneClean=%(_RustCrate._Clean);_OneDotnet=$(RustDotnetVersion);_CargoDotnetExe=$(_CargoDotnetExe)">
       <Output TaskParameter="TargetOutputs" ItemName="_RustCrateDll" />
     </MSBuild>
@@ -147,7 +192,7 @@
 
   <!-- ====================================================================== -->
   <!-- 3a. _ResolveOneCrate — compute, for ONE crate (global props _OneDir/…): -->
-  <!--     _OneCrateName  : CrateName metadata > [package] name from Cargo.toml -->
+  <!--     _OneCrateName  : CrateName metadata > managed assembly-name > Cargo name -->
   <!--                      > crate dir leaf name.                              -->
   <!--     _OneDll        : <dir>/target/<target>/<profile>/<name>.dll          -->
   <!--     @(_OneRustSources) : the crate's src/**/*.rs (incremental Inputs).   -->
@@ -164,18 +209,74 @@
       <_CargoNameLine Include="@(_CargoTomlLine)"
                       Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('%(_CargoTomlLine.Identity)', '^\s*name\s*=\s*&quot;[^&quot;]+&quot;'))" />
     </ItemGroup>
+    <!-- On an explicit rebuild, invalidate every prior managed-name variant before calling the
+         selected tool. This keeps stale-artifact safety even when that tool is broken and a prior
+         build used a custom assembly-name that cannot be rediscovered. -->
+    <ItemGroup Condition="'$(RustDotnetForceBuild)'=='true' or '$(_OneClean)'=='true'">
+      <_PriorManagedArtifact Include="$(_OneDir)/target/$(RustDotnetTarget)/$(_OneProfile)/*.dll" />
+      <_PriorManagedArtifact Include="$(_OneDir)/target/$(RustDotnetTarget)/$(_OneProfile)/*.dll.rustdotnet.receipt.json" />
+      <_PriorManagedArtifact Include="$(_OneDir)/target/$(RustDotnetTarget)/$(_OneProfile)/*.dll.rustdotnet.stamp" />
+    </ItemGroup>
+    <Delete Files="@(_PriorManagedArtifact)" />
+    <Exec Command="&quot;$(_CargoDotnetExe)&quot; managed-assembly-name &quot;$(_OneDir)&quot;"
+          ConsoleToMSBuild="true" ContinueOnError="WarnAndContinue">
+      <Output TaskParameter="ConsoleOutput" ItemName="_ManagedAssemblyNameLine" />
+      <Output TaskParameter="ExitCode" PropertyName="_ManagedAssemblyNameExitCode" />
+    </Exec>
     <PropertyGroup>
       <_FirstNameLine>@(_CargoNameLine)</_FirstNameLine>
       <!-- Split on ';' (item-list join) and take the first matched line. -->
       <_FirstNameLine>$(_FirstNameLine.Split(';')[0])</_FirstNameLine>
       <_TomlCrateName>$([System.Text.RegularExpressions.Regex]::Match('$(_FirstNameLine)', '&quot;([^&quot;]+)&quot;').Groups[1].Value)</_TomlCrateName>
+      <_ManagedAssemblyName Condition="'$(_ManagedAssemblyNameExitCode)'=='0'">@(_ManagedAssemblyNameLine)</_ManagedAssemblyName>
 
       <_OneCrateName Condition="'$(_OneMetaName)'!=''">$(_OneMetaName)</_OneCrateName>
+      <_OneCrateName Condition="'$(_OneCrateName)'=='' and '$(_ManagedAssemblyName)'!=''">$(_ManagedAssemblyName)</_OneCrateName>
       <_OneCrateName Condition="'$(_OneCrateName)'=='' and '$(_TomlCrateName)'!=''">$(_TomlCrateName)</_OneCrateName>
       <_OneCrateName Condition="'$(_OneCrateName)'==''">$([System.IO.Path]::GetFileName('$(_OneDir)'))</_OneCrateName>
 
       <_OneDll>$(_OneDir)/target/$(RustDotnetTarget)/$(_OneProfile)/$(_OneCrateName).dll</_OneDll>
+      <_OneReceipt>$(_OneDll).rustdotnet.receipt.json</_OneReceipt>
+      <_OneStamp>$(_OneDll).rustdotnet.stamp</_OneStamp>
+      <_OneConfigStamp>$(_OneDir)/target/$(RustDotnetTarget)/$(_OneProfile)/.rustdotnet-msbuild-config</_OneConfigStamp>
+      <!-- This is generated by `cargo-dotnet metadata-inputs` before Inputs/Outputs are
+           evaluated. It records Cargo's complete *local* package closure (workspace/path
+           dependencies plus ordinary build-script-owned files), not merely this crate's
+           src glob. The helper writes only when the sorted closure changes. -->
+      <_OneMetadataInputs>$(_OneDir)/target/$(RustDotnetTarget)/$(_OneProfile)/.rustdotnet-cargo-inputs</_OneMetadataInputs>
     </PropertyGroup>
+
+    <MakeDir Directories="$([System.IO.Path]::GetDirectoryName('$(_OneConfigStamp)'))" />
+    <WriteLinesToFile File="$(_OneConfigStamp)"
+                      Lines="target=$(RustDotnetTarget);profile=$(_OneProfile);dotnet=$(_OneDotnet);cargo=$(_CargoDotnetExe)"
+                      Overwrite="true" WriteOnlyWhenDifferent="true" />
+
+    <!-- A forced/clean request declares the existing artifact ineligible before any
+         metadata or compiler command runs. This preserves the stale-artifact safety
+         contract even if the selected cargo-dotnet executable is itself broken and
+         therefore cannot produce the metadata manifest. -->
+    <Delete Files="$(_OneDll);$(_OneReceipt);$(_OneStamp)"
+            Condition="'$(RustDotnetForceBuild)'=='true' or '$(_OneClean)'=='true'" />
+
+    <!-- Cargo, rather than MSBuild, owns the dependency graph. Ask the installed tool for
+         its deterministic local-file closure on every evaluation; the generated manifest's
+         timestamp only moves when membership changes, while the listed files below supply
+         normal content timestamp invalidation. This deliberately complements (rather than
+         replaces) explicit @(RustDotnetInput), which remains the escape hatch for inputs
+         outside Cargo package roots. -->
+    <Exec Command="&quot;$(_CargoDotnetExe)&quot; metadata-inputs &quot;$(_OneDir)&quot; --output &quot;$(_OneMetadataInputs)&quot;"
+          ContinueOnError="WarnAndContinue">
+      <Output TaskParameter="ExitCode" PropertyName="_MetadataInputsExitCode" />
+    </Exec>
+    <!-- Metadata failure is fatal and invalidates prior evidence. Otherwise a stale DLL could
+         remain eligible after Cargo's dependency graph became unreadable. -->
+    <Delete Files="$(_OneDll);$(_OneReceipt);$(_OneStamp)"
+            Condition="'$(_MetadataInputsExitCode)' != '0'" />
+    <Error Condition="'$(_MetadataInputsExitCode)' != '0'"
+           Text="RustDotnet: cargo metadata input discovery failed for $(_OneDir); prior Rust artifacts were invalidated." />
+    <ReadLinesFromFile File="$(_OneMetadataInputs)">
+      <Output TaskParameter="Lines" ItemName="_CargoMetadataInputLine" />
+    </ReadLinesFromFile>
 
     <!-- Build the incremental Input set: the crate's Rust sources + ONLY the manifest
          files that EXIST. A non-existent file in MSBuild Inputs makes the up-to-date
@@ -189,7 +290,22 @@
       <_OneInputs Include="$(_OneDir)/Cargo.toml" Condition="Exists('$(_OneDir)/Cargo.toml')" />
       <_OneInputs Include="$(_OneDir)/Cargo.lock" Condition="Exists('$(_OneDir)/Cargo.lock')" />
       <_OneInputs Include="$(_OneDir)/build.rs" Condition="Exists('$(_OneDir)/build.rs')" />
+      <_OneInputs Include="$(_OneDir)/rust-toolchain.toml" Condition="Exists('$(_OneDir)/rust-toolchain.toml')" />
+      <_OneInputs Include="$(_OneDir)/rust-toolchain" Condition="Exists('$(_OneDir)/rust-toolchain')" />
+      <!-- Cargo-derived workspace/path-dependency/build-script closure. -->
+      <_OneInputs Include="@(_CargoMetadataInputLine)" />
+      <_OneInputs Include="$(_OneMetadataInputs)" />
+      <!-- Consumers may still declare generated files or external inputs that Cargo cannot
+           discover, for example a build.rs input outside every local package root. -->
+      <_OneInputs Include="@(RustDotnetInput)" />
+      <!-- Changes to the integration logic itself invalidate produced Rust assemblies. -->
+      <_OneInputs Include="$(MSBuildThisFileFullPath)" />
+      <_OneInputs Include="$(_CargoDotnetExe)" Condition="Exists('$(_CargoDotnetExe)')" />
+      <_OneInputs Include="$(_OneConfigStamp)" />
+      <_OneInputs Include="$(_OneDir)/__rustdotnet_missing_dll__" Condition="!Exists('$(_OneDll)')" />
+      <_OneInputs Include="$(_OneDir)/__rustdotnet_missing_receipt__" Condition="!Exists('$(_OneReceipt)')" />
       <_OneInputs Include="$(_OneDir)/__rustdotnet_force_rebuild__" Condition="'$(RustDotnetForceBuild)'=='true'" />
+      <_OneInputs Include="$(_OneDir)/__rustdotnet_clean_rebuild__" Condition="'$(_OneClean)'=='true'" />
     </ItemGroup>
   </Target>
 
@@ -204,7 +320,7 @@
   <Target Name="_BuildOneRustCrate"
           DependsOnTargets="_ResolveOneCrate"
           Inputs="@(_OneInputs)"
-          Outputs="$(_OneDll)"
+          Outputs="$(_OneStamp)"
           Returns="@(_OneBuiltDll)">
 
     <PropertyGroup>
@@ -219,6 +335,10 @@
     <Message Importance="high"
              Text="RustDotnet: building Rust crate $(_OneCrateName) ($(_OneProfile)) via cargo dotnet -> $(_OneDll)" />
 
+    <!-- Once MSBuild has decided this crate is stale, the previous assembly is ineligible. Remove
+         it before cargo-dotnet so a failed requested rebuild cannot leave a stale DLL behind. -->
+    <Delete Files="$(_OneDll);$(_OneReceipt);$(_OneStamp)" />
+
     <!-- Run the installed cargo-dotnet. PATH is the INHERITED PATH with the tool dirs
          prepended (so the tool's internal cargo/rustc/dotnet + any cargo rustc-wrapper
          resolve under MSBuild's non-interactive env). DOTNET_ROOT points the linker at
@@ -229,6 +349,9 @@
 
     <Error Condition="!Exists('$(_OneDll)')"
            Text="RustDotnet: cargo dotnet build succeeded but the expected assembly was not found: $(_OneDll). Check that the crate's [lib] crate-type = [&quot;cdylib&quot;] and that the resolved assembly name ('$(_OneCrateName)') matches the crate's [package] name (override with &lt;RustCrate CrateName=&quot;...&quot;&gt;)." />
+    <Error Condition="!Exists('$(_OneReceipt)')"
+           Text="RustDotnet: cargo dotnet produced $(_OneDll) without its required identity receipt $(_OneReceipt). Reinstall or rebuild cargo-dotnet so MSBuild never references an unreceipted artifact." />
+    <Touch Files="$(_OneStamp)" AlwaysCreate="true" />
   </Target>
 
   <!-- _ComputeBuiltDll — populate the Returns item (.dll path + CrateName/Private as

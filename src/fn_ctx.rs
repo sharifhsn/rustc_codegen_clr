@@ -1,6 +1,6 @@
-use cilly::Assembly;
-use rustc_middle::ty::layout::HasTypingEnv;
+use cilly::{Assembly, CILNode, Const, Interned, IntoAsmIndex, Type};
 use rustc_middle::ty::SymbolName;
+use rustc_middle::ty::layout::HasTypingEnv;
 use rustc_middle::ty::{Instance, PseudoCanonicalInput, TyCtxt};
 use rustc_span::Span;
 pub struct MethodCompileCtx<'tcx, 'asm> {
@@ -117,6 +117,26 @@ impl<'tcx, 'asm> MethodCompileCtx<'tcx, 'asm> {
     #[must_use]
     pub fn asm<'s: 'a, 'a>(&'s self) -> &'a Assembly {
         self.asm
+    }
+
+    /// Emits Rust's semantic `size_of`, which can differ from the CLR storage size.
+    ///
+    /// Most lowered types use the CLR `sizeof` instruction directly. Rust enums/coroutines with
+    /// managed-reference payloads are the exception: their GC-bearing fields are hoisted into
+    /// non-overlapping CLR sidecar slots, growing physical storage while Rust's language-level size
+    /// and pointer stride remain the rustc layout. Those types are registered on the assembly and
+    /// become a native-width constant here before serialization.
+    pub fn size_of(&mut self, tpe: impl IntoAsmIndex<Interned<Type>>) -> Interned<CILNode> {
+        let tpe = tpe.into_idx(self.asm);
+        let semantic_size = match self.asm[tpe] {
+            Type::ClassRef(class) => self.asm.rust_semantic_size(class),
+            _ => None,
+        };
+        if let Some(size) = semantic_size {
+            self.asm.alloc_node(Const::USize(size))
+        } else {
+            self.asm.size_of(tpe)
+        }
     }
 
     /// Alignment assumed for constant/static allocations embedded as raw byte buffers, not

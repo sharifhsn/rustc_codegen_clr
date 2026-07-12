@@ -15,7 +15,9 @@ use crate::artifact::Artifact;
 use crate::cli::BuildArgs;
 use crate::context::Context;
 use crate::mode::Backend;
-use crate::{artifact, buildstd, docker, interop_helpers, nuget, overlays, palinject, run, xmldoc};
+use crate::{
+    artifact, buildstd, docker, interop_helpers, nuget, overlays, private_sysroot, run, xmldoc,
+};
 
 /// Run `build` or `run`. `is_run` selects the run-the-apphost behaviour.
 pub fn run(args: &BuildArgs, is_run: bool) -> Result<i32> {
@@ -34,9 +36,12 @@ pub fn run(args: &BuildArgs, is_run: bool) -> Result<i32> {
 
 /// The ordered, pure-Rust native stage pipeline.
 fn run_native(ctx: &Context, prog_args: &[String]) -> Result<i32> {
-    // 1. PAL inject into rust-src (idempotent, re-runnable).
-    palinject::inject_all(ctx)?;
-    // 2. Apply the dotnet_overlays paths-override (regenerates .cargo/config.toml).
+    // Same-crate invocations share target output, XML scratch, and receipts. Distinct crates have
+    // isolated mutable Cargo homes and may execute this pipeline concurrently.
+    let _crate_lock = crate::build_lock::BuildLock::acquire_crate(ctx)?;
+    // 1. PAL inject into a private snapshot; rustup's rust-src remains immutable.
+    let private_sysroot = private_sysroot::prepare(ctx)?;
+    // 2. Apply the dotnet_overlays paths override through a build-local Cargo config.
     overlays::apply(ctx)?;
     // 2.5. Clear stale `#[dotnet_export]` XML-doc scratch entries. `dotnet_macros` APPENDS one
     // entry per fn at proc-macro-expansion time (it can only ever append, never knows about
@@ -47,7 +52,9 @@ fn run_native(ctx: &Context, prog_args: &[String]) -> Result<i32> {
     // last time — never a duplicated one).
     xmldoc::clear_scratch(ctx);
     // 3. build-std with the backend; returns the JSON message stream.
-    let json = buildstd::build(ctx)?;
+    let build_trace = crate::parallel_trace::StageGuard::enter(ctx, "build")?;
+    let json = buildstd::build_with_sysroot(ctx, &private_sysroot)?;
+    drop(build_trace);
     // 4. Locate the produced artifact.
     let art = artifact::locate(&json, ctx)?;
     // 4.5. Copy any `add-nuget`-fetched runtime dlls alongside the output (a no-op for crates
@@ -65,6 +72,9 @@ fn run_native(ctx: &Context, prog_args: &[String]) -> Result<i32> {
         // for why this is unconditional rather than gated on a marker directory like 4.5 above.
         interop_helpers::ensure_and_copy(ctx, out_dir)?;
     }
+    if let Some(receipt) = crate::receipt::write(ctx, &art, &private_sysroot)? {
+        eprintln!("== artifact receipt: {} ==", receipt.display());
+    }
     // 5. Run it, or report.
     if ctx.flags.run {
         run::run(&art, prog_args, ctx)
@@ -80,7 +90,9 @@ fn report(art: &Artifact) {
         Artifact::Library { so, dll, .. } => eprintln!(
             "== built lib: {} (referenceable as {}) ==",
             so.display(),
-            dll.file_name().and_then(|s| s.to_str()).unwrap_or("the .dll")
+            dll.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("the .dll")
         ),
         Artifact::None => eprintln!("== built: <no bin artifact> =="),
     }

@@ -28,7 +28,7 @@
 //!   exactly [`SharedMutex`]'s documented sweet spot: Rust owns and mutates the data; C# is a caller,
 //!   not a co-mutator.
 //!
-//! No entrypoint: this is a `cdylib`. `#[no_mangle]` (hand-written here, since the exported functions
+//! No entrypoint: this is a `cdylib`. `#[unsafe(no_mangle)]` (hand-written here, since the exported functions
 //! need to pass/return a raw managed `SemaphoreSlim` handle — a shape `#[dotnet_export]`'s marshalling
 //! table does not (yet) cover; see the crate-level dotnet_macros doc comment) roots each export against
 //! dead-code elimination.
@@ -59,19 +59,19 @@ fn bump_counter() {
 /// Create a new `SharedLock` (a `SemaphoreSlim(1, 1)`) and hand its raw managed handle to C#. This is a
 /// genuine typed managed reference — no P/Invoke, no serialization: the returned `SemaphoreSlim` IS the
 /// same object `SharedLock::from_raw` will wrap on the Rust side.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn sharedlock_new() -> SemaphoreSlim {
     SharedLock::new().raw()
 }
 
 /// Reset the shared counter to zero. Call this before starting a round of concurrent increments.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn sharedlock_reset_counter() {
     COUNTER.store(0, Ordering::Relaxed);
 }
 
 /// Read the shared counter's current value.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn sharedlock_get_counter() -> i64 {
     COUNTER.load(Ordering::Relaxed)
 }
@@ -83,7 +83,7 @@ pub extern "C" fn sharedlock_get_counter() -> i64 {
 /// the proof genuine: if C#'s `Wait()`/`Release()` were not actually excluding the concurrent Rust
 /// worker (i.e. if the handle sharing were fake), interleaved calls to this unlocked bump would lose
 /// updates.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn sharedlock_bump_counter_unlocked() {
     bump_counter();
 }
@@ -96,7 +96,7 @@ pub extern "C" fn sharedlock_bump_counter_unlocked() {
 ///
 /// # Safety
 /// `handle` must be a valid `SemaphoreSlim` reference (e.g. one produced by [`sharedlock_new`]).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn sharedlock_spawn_rust_worker(handle: SemaphoreSlim, iters: i64) {
     let lock = SharedLock::from_raw(handle);
     let worker = thread::spawn(move || {
@@ -122,7 +122,7 @@ pub extern "C" fn sharedlock_spawn_rust_worker(handle: SemaphoreSlim, iters: i64
 /// back and forth across the FFI boundary as an opaque `isize` -- there is no managed object to hand to
 /// C# here (unlike scenario (a)'s `SemaphoreSlim`), because the whole point is that C# gets NO handle
 /// onto the protected data, only an opaque token it passes back to Rust-side entry points.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn sharedmutex_new(initial: i64) -> isize {
     let boxed = Box::new(SharedMutex::new(initial));
     Box::into_raw(boxed) as isize
@@ -133,7 +133,7 @@ pub extern "C" fn sharedmutex_new(initial: i64) -> isize {
 ///
 /// # Safety
 /// `handle` must be a live pointer produced by `sharedmutex_new` and not yet freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn sharedmutex_get(handle: isize) -> i64 {
     let mutex = unsafe { &*(handle as *const SharedMutex<i64>) };
     *mutex.lock()
@@ -142,13 +142,13 @@ pub extern "C" fn sharedmutex_get(handle: isize) -> i64 {
 /// Spawn TWO real Rust OS threads, each incrementing the mutex-protected counter `iters` times via
 /// `SharedMutex::lock()` -- zero `unsafe` inside this function body itself (the pointer dereference to
 /// reach the shared `SharedMutex<i64>` from the opaque FFI handle is the only unsafe, isolated to the
-/// FFI seam, not to any data-race-prone access -- exactly the same shape every `#[no_mangle] extern "C"`
+/// FFI seam, not to any data-race-prone access -- exactly the same shape every `#[unsafe(no_mangle)] extern "C"`
 /// entry point in this file already needs to cross the boundary at all). Blocks the calling (C#) thread
 /// until both Rust workers finish.
 ///
 /// # Safety
 /// `handle` must be a live pointer produced by `sharedmutex_new` and not yet freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn sharedmutex_spawn_two_workers(handle: isize, iters: i64) {
     let mutex = unsafe { &*(handle as *const SharedMutex<i64>) };
     thread::scope(|s| {
@@ -168,7 +168,7 @@ pub extern "C" fn sharedmutex_spawn_two_workers(handle: isize, iters: i64) {
 /// # Safety
 /// `handle` must be a live pointer produced by `sharedmutex_new`, not yet freed, and not used again
 /// afterward.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn sharedmutex_free(handle: isize) {
     unsafe {
         drop(Box::from_raw(handle as *mut SharedMutex<i64>));

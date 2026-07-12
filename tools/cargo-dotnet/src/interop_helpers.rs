@@ -23,7 +23,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 
 use crate::context::Context;
 
@@ -87,8 +87,24 @@ fn depends_on_mycorrhiza(ctx: &Context) -> bool {
 /// `dotnet build -c Release` the helper project — a fast no-op on `dotnet`'s own incremental cache
 /// when the source hasn't changed since the last build — and return the produced dll's path.
 fn build(root: &Path, verbose: bool) -> Result<PathBuf> {
+    // The bundled project has one shared obj/bin tree even when several consumer crates build in
+    // parallel. Only this quick incremental helper build needs serialization.
+    let _helper_lock = crate::build_lock::BuildLock::acquire_scope("interop-helpers")?;
     let mut cmd = Command::new("dotnet");
-    cmd.arg("build").arg(root).arg("-c").arg("Release").arg("--nologo");
+    cmd.arg("build")
+        .arg(root)
+        .arg("-c")
+        .arg("Release")
+        .arg("--nologo")
+        .arg("-p:Deterministic=true")
+        .arg("-p:ContinuousIntegrationBuild=true")
+        .arg("-p:DebugType=None")
+        .arg("-p:DebugSymbols=false")
+        .arg(format!(
+            "-p:PathMap={}={}",
+            root.display(),
+            "/_/mycorrhiza-interop-helpers"
+        ));
     if !verbose {
         cmd.arg("-v").arg("quiet");
     }

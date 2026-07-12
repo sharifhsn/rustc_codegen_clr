@@ -1,12 +1,10 @@
-
-
 use crate::operand::constant::{get_vtable, static_ty};
 use cilly::{
     Access, CILRoot, Const, FnSig, Int, Interned, MethodDef, MethodDefIdx, MethodRef,
     StaticFieldDesc, Type,
     cilnode::MethodKind,
-    utilis::encode,
     ir::{BasicBlock, CILNode},
+    utilis::encode,
 };
 
 type Root = Interned<cilly::ir::CILRoot>;
@@ -54,6 +52,7 @@ fn nested_static_blob_type(alloc: &Allocation, ctx: &mut MethodCompileCtx<'_, '_
         ctx,
         Type::Int(elem),
         len.div_ceil(elem_size),
+        len.next_multiple_of(elem_size),
         len.next_multiple_of(elem_size),
         elem_size,
     );
@@ -141,72 +140,6 @@ pub fn add_static(def_id: DefId, ctx: &mut MethodCompileCtx<'_, '_>) -> Interned
 
     ptr
 }
-fn alloc_default_type(alloc_id: u64, ctx: &mut MethodCompileCtx<'_, '_>) -> Type {
-    let alloc = match ctx
-        .tcx()
-        .global_alloc(AllocId(alloc_id.try_into().expect("0 alloc id?")))
-    {
-        GlobalAlloc::Memory(alloc) => alloc,
-        GlobalAlloc::Static(def_id) => {
-            // A nested/anonymous static (`static X: &[T] = &[..]`) is untyped — its
-            // `type_of` ICEs (`Node::Synthetic`). Derive the type from the allocation
-            // instead, the way `add_static` and the Memory arm already do; only
-            // top-level named statics have a `type_of` to use.
-            if static_is_nested(ctx.tcx(), def_id) {
-                let alloc = ctx.tcx().eval_static_initializer(def_id).unwrap();
-                return nested_static_blob_type(&alloc.0, ctx);
-            }
-            return ctx.type_from_cache(static_ty(def_id, ctx.tcx()));
-        }
-        // A VTable alloc has no readable backing memory (`Size::ZERO`); its slots
-        // (drop-glue ptr, size, align, method ptrs) are materialized by codegen, not
-        // copied from raw bytes. The matching `add_allocation` arm emits a single
-        // pointer-sized static and ignores the type returned here, so a pointer-sized
-        // type is all that is required to keep the relocation path well-typed.
-        GlobalAlloc::VTable(..) => return Type::Int(Int::USize),
-        // A function alloc materializes a function pointer (pointer-sized). The
-        // function-provenance branch of `allocation_initializer_method` intercepts
-        // these before this is reached; this arm only exists so a stray
-        // function-typed relocation target can no longer ICE.
-        GlobalAlloc::Function { .. } => return Type::Int(Int::USize),
-        // A `TypeId` alloc is opaque: it has no backing memory. The pointer's
-        // *offset* is one pointer-sized segment of the 128-bit type-id hash, and
-        // that value is already present in the raw allocation bytes. We therefore
-        // give it a zero-sized type and (in `allocation_initializer_method`) skip
-        // the relocation patch, leaving the raw hash fragment in place. See the
-        // `GlobalAlloc::TypeId` arm there for the rationale.
-        GlobalAlloc::TypeId { .. } => return Type::Void,
-    };
-    let tpe = match alloc.0.0.align.bytes() {
-        ..1 => Int::U8,
-        ..2 => Int::U16,
-        ..4 => Int::U32,
-        ..8 => Int::U64,
-        _ => {
-            ctx.tcx().dcx().span_warn(
-                ctx.span(),
-                format!(
-                    "Alloc of align {} required, but that can't be guranteed!",
-                    alloc.0.0.align.bytes()
-                ),
-            );
-            Int::U64
-        }
-    };
-    let arr_size = alloc.0.len() as u64;
-    if arr_size == 0 {
-        return Type::Void;
-    }
-    let size = tpe.size().unwrap_or(8) as u64;
-    let tpe = fixed_array(
-        ctx,
-        Type::Int(tpe),
-        arr_size.div_ceil(size),
-        arr_size.next_multiple_of(size),
-        tpe.size().unwrap_or(8) as u64,
-    );
-    Type::ClassRef(tpe)
-}
 /// Returns a pointer to the backing buffer of a const-allocation static, rounded up to `align` at
 /// runtime when the allocation is over-aligned (`over_aligned == align > elem_size`).
 ///
@@ -234,19 +167,51 @@ fn aligned_static_buf(
     let u8_ptr = ctx.nptr(Int::U8);
     ctx.cast_ptr_to(aligned, u8_ptr)
 }
+
+/// Chooses the inline field shape that backs one raw allocation.
+///
+/// The CLR guarantees at most the natural alignment of the largest scalar field we use (`u64`).
+/// For a stricter Rust alignment, reserve one extra alignment quantum; [`aligned_static_buf`]
+/// selects an aligned interior address at runtime. Keeping this calculation pure makes the
+/// over-alignment guarantee independently testable without a rustc context.
+fn static_storage_shape(len: u64, align: u64) -> (Int, u64, bool) {
+    let elem = match align {
+        ..=1 => Int::U8,
+        ..=2 => Int::U16,
+        ..=4 => Int::U32,
+        _ => Int::U64,
+    };
+    let elem_size = u64::from(elem.size().unwrap_or(8));
+    let over_aligned = align > elem_size;
+    let padding = if over_aligned { align } else { 0 };
+    let storage_size = (len + padding).next_multiple_of(elem_size);
+    (elem, storage_size, over_aligned)
+}
+
+#[cfg(test)]
+mod alignment_tests {
+    use super::static_storage_shape;
+    use cilly::Int;
+
+    #[test]
+    fn naturally_aligned_storage_needs_no_runtime_padding() {
+        assert_eq!(static_storage_shape(17, 8), (Int::U64, 24, false));
+    }
+
+    #[test]
+    fn over_aligned_storage_reserves_room_for_an_aligned_interior_pointer() {
+        assert_eq!(static_storage_shape(32, 16), (Int::U64, 48, true));
+        assert_eq!(static_storage_shape(1, 64), (Int::U64, 72, true));
+    }
+}
+
 /// Adds a static field and initialized for allocation represented by `alloc_id`.
-pub fn add_allocation(
-    alloc_id: u64,
-    ctx: &mut MethodCompileCtx<'_, '_>,
-    tpe: Interned<Type>,
-) -> Interned<CILNode> {
-    // `tpe` is the caller's *expected* type for the allocation, but it is frequently
-    // pointer-sized (a `&T` const, or the `USize` `alloc_default_type` hands back for
-    // VTable/Function reloc targets) and would under-size the backing field. The Memory
-    // arm below now derives the field's storage type from the allocation's real len+align
-    // instead, so this hint is intentionally unused. Kept in the signature for the stable
-    // API and to keep call sites self-documenting.
-    let _ = tpe;
+///
+/// Every [`GlobalAlloc`] variant is self-describing here: memory supplies its byte length and
+/// alignment, statics supply their `DefId`, and function/vtable/type-id allocations have dedicated
+/// lowering. A use-site type hint would be both redundant and unsafe for interior pointers, so this
+/// API intentionally accepts only the allocation identity.
+pub fn add_allocation(alloc_id: u64, ctx: &mut MethodCompileCtx<'_, '_>) -> Interned<CILNode> {
     let main_module_id = ctx.main_module();
     let const_alloc = match ctx
         .tcx()
@@ -272,8 +237,7 @@ pub fn add_allocation(
             return get_vtable(
                 ctx,
                 ty,
-                polyref
-                    .map(|principal| ctx.tcx().instantiate_bound_regions_with_erased(principal)),
+                polyref.map(|principal| ctx.tcx().instantiate_bound_regions_with_erased(principal)),
             );
         }
         GlobalAlloc::Function { instance } => {
@@ -321,25 +285,9 @@ pub fn add_allocation(
     let byte_hash = calculate_hash(&bytes);
     match (align, bytes.len()) {
         _ => {
-            // The initializer `cpblk`s the *full* `const_alloc.len()` bytes (see
-            // `allocation_initializer_method`), so the backing field MUST be at least
-            // that large. The caller-supplied `tpe` is frequently pointer-sized — e.g. a
-            // `&T` const, or the `USize` that `alloc_default_type` returns for the
-            // `VTable`/`Function` relocation-target arms — which would under-size the
-            // field and let the `cpblk` overrun into whatever static the linker happens
-            // to place next (the corrupted `DECIMAL_PAIRS` -> `__fmt_inner`
-            // NullReferenceException). Build a correctly-sized blob value-type from the
-            // allocation's real len+align and declare the field with *that*, ignoring the
-            // (possibly undersized) incoming `tpe`. Every consumer `cast_ptr`s the address
-            // we return, so widening the storage type is transparent — only the size grows
-            // to be correct.
-            let elem = match align {
-                ..1 => Int::U8,
-                ..2 => Int::U16,
-                ..4 => Int::U32,
-                _ => Int::U64,
-            };
-            let elem_size = elem.size().unwrap_or(8) as u64;
+            // The initializer `cpblk`s the full allocation, so derive storage exclusively from
+            // the allocation's own length/alignment. Use-site pointer types routinely describe a
+            // subobject rather than this backing blob and must never participate in sizing it.
             let len = const_alloc.len() as u64;
             // .NET does NOT guarantee >8-byte alignment for a value-type *static* field (a
             // `[FieldOffset]`/classlayout `.pack` controls *instance* layout, not where the runtime
@@ -351,13 +299,13 @@ pub fn add_allocation(
             // Fix it at RUNTIME: when `align > elem_size`, over-allocate the field by `align` bytes
             // and return an interior pointer rounded up to `align` (see `aligned_static_buf`). For
             // the overwhelmingly common `align <= 8` case nothing changes — no padding, no rounding.
-            let over_aligned = align > elem_size;
-            let pad = if over_aligned { align } else { 0 };
-            let arr_size = (len + pad).next_multiple_of(elem_size);
+            let (elem, arr_size, over_aligned) = static_storage_shape(len, align);
+            let elem_size = u64::from(elem.size().unwrap_or(8));
             let blob_arr = fixed_array(
                 ctx,
                 Type::Int(elem),
                 arr_size / elem_size,
+                arr_size,
                 arr_size,
                 elem_size,
             );
@@ -510,9 +458,7 @@ fn allocation_initializer_method(
                     false,
                 )))));
             } else {
-                let tpe = alloc_default_type(prov.alloc_id().0.into(), ctx);
-                let tpe = ctx.alloc_type(tpe);
-                let ptr_alloc = add_allocation(prov.alloc_id().0.into(), ctx, tpe);
+                let ptr_alloc = add_allocation(prov.alloc_id().0.into(), ctx);
 
                 // A provenance pointer embedded in this static stores its offset INTO the
                 // target allocation inline in the raw bytes (already copied by the `CpBlk`

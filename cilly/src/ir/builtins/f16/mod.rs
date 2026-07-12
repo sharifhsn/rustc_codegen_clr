@@ -1,6 +1,6 @@
 use crate::{
-    asm::MissingMethodPatcher, cilnode::MethodKind, Assembly, BasicBlock, BinOp, CILNode, CILRoot,
-    ClassRef, Float, Interned, MethodImpl, MethodRef, Type,
+    Assembly, BasicBlock, BinOp, CILNode, CILRoot, ClassRef, Float, Interned, MethodImpl,
+    MethodRef, Type, asm::MissingMethodPatcher, cilnode::MethodKind,
 };
 
 /// Converts `input` (a 16-bit float, `System.Half`) to the wider float `target` (`f32`/`f64`),

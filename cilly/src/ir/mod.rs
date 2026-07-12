@@ -8,8 +8,8 @@ use std::path::Path;
 
 pub use crate::Access;
 pub use asm::{
-    Assembly, AssemblyArenaCounts, CompactionStats,
-    ExportReadyAssembly, IlasmFlavour, VerificationFailure,
+    Assembly, AssemblyArenaCounts, CompactionStats, ExportReadyAssembly, IlasmFlavour,
+    VerificationFailure,
 };
 pub use basic_block::BasicBlock;
 pub use bimap::BiMap;
@@ -22,9 +22,9 @@ pub use fnsig::FnSig;
 pub use iter::{CILIter, CILIterElem};
 pub use method::{ExceptionRegion, MethodDef, MethodDefIdx, MethodImpl, MethodRef};
 
+pub use tpe::Type;
 pub use tpe::float::Float;
 pub use tpe::int::Int;
-pub use tpe::Type;
 
 use crate::IString;
 /// Assembly

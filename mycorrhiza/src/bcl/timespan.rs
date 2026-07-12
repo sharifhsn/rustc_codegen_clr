@@ -211,7 +211,8 @@ impl Default for DotNetTimeSpan {
 impl core::fmt::Display for DotNetTimeSpan {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // `TimeSpan.ToString()` yields the invariant `[-][d.]hh:mm:ss[.fffffff]` form.
-        let s = crate::system::DotNetString::from_handle(self.0.vt_instance0::<"ToString", MString>());
+        let s =
+            crate::system::DotNetString::from_handle(self.0.vt_instance0::<"ToString", MString>());
         core::fmt::Display::fmt(&s, f)
     }
 }

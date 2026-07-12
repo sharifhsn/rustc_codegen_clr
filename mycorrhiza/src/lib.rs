@@ -62,7 +62,7 @@
 //! - [`containers`] — the reusable C#→Rust generic container ([`containers::export_rust_containers!`]),
 //!   backing the shipped C# `RustDotnet.RustVec<T>` / `RustBoxVec<T>`.
 //! - [`generic_bridge`] — the lower-level WF-9 generic-interop macros (`dotnet_generic!` /
-//!   `dotnet_generic_impl!` / `gen!`) that the above idiomatic wrappers are themselves built on.
+//!   `dotnet_generic_impl!` / `r#gen!`) that the above idiomatic wrappers are themselves built on.
 //! - [`intrinsics`] — very low-level interop primitives. Don't use unless you need to.
 
 #![allow(internal_features, incomplete_features)]
@@ -93,6 +93,12 @@ pub mod class;
 /// `Dictionary<K, V>`, `HashSet<T>`, `Stack<T>`, `Queue<T>`) — backed by real managed objects, used
 /// like `std`. Built on [`generic_bridge`]; no CLR-interop knowledge required at the call site.
 pub mod collections;
+/// Comptime type-export intrinsics — defining a managed .NET class from Rust (used by the
+/// `dotnet_macros::dotnet_class` proc-macro and the declarative `dotnet_typedef!`).
+pub mod comptime;
+/// The reusable C#→Rust generic container: [`export_rust_containers!`] emits a size-erased byte
+/// vector into your `cdylib`, backing the shipped C# `RustDotnet.RustVec<T>` / `RustBoxVec<T>`.
+pub mod containers;
 /// Delegates & callbacks — wrap a Rust `extern "C" fn` as a managed `Action<..>`/`Func<.., R>`
 /// delegate, invoke a held .NET delegate, and pass delegates to .NET APIs / events. Built on the
 /// [`intrinsics::rustc_clr_interop_delegate`] magic fn + the WF-9 generic bridge; no CLR-interop
@@ -103,12 +109,6 @@ pub mod delegate;
 /// [`dynamic::invoke_dynamic1`] / [`dynamic::invoke_dynamic1_checked`] (and their 0/2/3/4-arity
 /// siblings) and the module docs for the `unsafe` contract.
 pub mod dynamic;
-/// The reusable C#→Rust generic container: [`export_rust_containers!`] emits a size-erased byte
-/// vector into your `cdylib`, backing the shipped C# `RustDotnet.RustVec<T>` / `RustBoxVec<T>`.
-pub mod containers;
-/// Comptime type-export intrinsics — defining a managed .NET class from Rust (used by the
-/// `dotnet_macros::dotnet_class` proc-macro and the declarative `dotnet_typedef!`).
-pub mod comptime;
 /// The enumerator bridge — wrap any .NET `IEnumerator<T>` as a Rust `impl Iterator<Item = T>`. This
 /// is what backs by-reference iteration (`for x in &list`) over the [`collections`] wrappers.
 pub mod enumerate;
@@ -119,7 +119,7 @@ pub mod enums;
 /// thrown .NET exception ↔ [`Result`](core::result::Result) via the interop `try/catch` primitive
 /// (`try_managed` / the `.try_()` combinator).
 pub mod error;
-/// WF-9 generic-interop ergonomics macros (`dotnet_generic!` / `dotnet_generic_impl!` / `gen!`),
+/// WF-9 generic-interop ergonomics macros (`dotnet_generic!` / `dotnet_generic_impl!` / `r#gen!`),
 /// which remove the hand-written `rustc_clr_interop_generic_*` turbofish boilerplate. The macros are
 /// `#[macro_export]`ed, so they are also reachable at the crate root (`mycorrhiza::dotnet_generic!`).
 pub mod generic_bridge;
@@ -129,6 +129,9 @@ pub mod intrinsics;
 pub mod linq;
 /// `System.Nullable<T>` ↔ Rust `Option<T>` bridge (a generic value type). See [`nullable::NullableExt`].
 pub mod nullable;
+/// One-glance import surface — `use mycorrhiza::prelude::*;` pulls in the collections, the managed
+/// `DotNetString`, and the generic-bridge macros so interop code reads like `std`.
+pub mod prelude;
 /// `System.Span<T>` / `ReadOnlySpan<T>` — zero-copy views over a Rust slice. See [`span::Span`].
 pub mod span;
 /// Cross-thread / cross-language synchronization primitives — `Semaphore`, `Signal`
@@ -136,9 +139,6 @@ pub mod span;
 /// `SemaphoreSlim` meant to be shared by reference with C#). See [`sync`] for the honest safety story
 /// on what does and doesn't cross the language boundary.
 pub mod sync;
-/// One-glance import surface — `use mycorrhiza::prelude::*;` pulls in the collections, the managed
-/// `DotNetString`, and the generic-bridge macros so interop code reads like `std`.
-pub mod prelude;
 /// The Task ↔ Future bridge — `.await` a .NET `Task<T>` from Rust (poll `IsCompleted` / read
 /// `Result`) and expose a Rust `async fn` as a .NET `Task<T>` (drive to completion into a
 /// `TaskCompletionSource<T>`). Built on the WF-9 generic bridge; async coroutine lowering already

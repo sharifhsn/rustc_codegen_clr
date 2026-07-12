@@ -359,7 +359,6 @@ impl CILNode {
         let alloc = asm.alloc_node(CILNode::call(alloc, [arg]));
         CILNode::call(op_explict, [alloc])
     }
-
 }
 impl CILNode {
     /// Changes the node by applying the `map` closure to each node. This process is

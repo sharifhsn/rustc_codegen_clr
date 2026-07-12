@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{bimap::Interned, IntoAsmIndex};
+use crate::{IntoAsmIndex, bimap::Interned};
 
 use super::super::{
+    Assembly, CILNode, ClassRef, Const, MethodRef, Type,
     cilnode::MethodKind,
     hashable::{HashableF32, HashableF64},
-    Assembly, CILNode, ClassRef, Const, MethodRef, Type,
 };
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]

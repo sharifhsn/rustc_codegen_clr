@@ -36,5 +36,7 @@ fn main() {
     // miscompiled, this would panic (non-zero exit) instead of printing the line.
     assert_eq!(sq, 385);
     assert_eq!(f, 6765);
+    assert_eq!(joined, "item-1, item-2, item-3");
     println!("cd_pure: all checks passed");
+    println!("== cd_pure done ==");
 }

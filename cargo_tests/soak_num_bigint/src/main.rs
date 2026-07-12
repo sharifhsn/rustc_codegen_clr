@@ -18,4 +18,5 @@ fn main() {
     println!("shl={}", &n << 40);
     println!("pow3={}", n.pow(3u32));
     println!("gcd-ish={}", BigInt::from(123456789u64).pow(7u32) % BigInt::from(97u32));
+    println!("== soak_num_bigint done ==");
 }

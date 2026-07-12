@@ -14,7 +14,7 @@
 [package]
 name = "cd_tokio"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 # A perfectly ordinary tokio dependency — exactly what a real user writes. NO

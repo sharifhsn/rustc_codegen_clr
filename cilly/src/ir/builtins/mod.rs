@@ -1,14 +1,14 @@
-use std::num::{NonZeroU32, NonZeroU8};
+use std::num::{NonZeroU8, NonZeroU32};
 
-use crate::{utilis::mstring_to_utf8ptr, StaticFieldDesc};
+use crate::{StaticFieldDesc, utilis::mstring_to_utf8ptr};
 
 use super::{
+    Access, Assembly, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, Const, FieldDesc, Int,
+    MethodDef, MethodImpl, MethodRef, Type,
     asm::MissingMethodPatcher,
     bimap::Interned,
     cilnode::{MethodKind, PtrCastRes},
     cilroot::BranchCond,
-    Access, Assembly, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, Const, FieldDesc, Int,
-    MethodDef, MethodImpl, MethodRef, Type,
 };
 
 pub mod atomics;
@@ -27,6 +27,51 @@ pub mod f16;
 pub use f16::*;
 pub mod simd;
 pub mod unwind;
+
+/// Converts a pointer-like runtime result to the exact return type of the Rust method being
+/// synthesized. ECMA-335 pointer types are verifier-visible: returning `void*` from a method
+/// declared as `u8*` is not valid merely because both have the same machine representation.
+/// Transparent Rust wrappers are handled by the same size-checked stack transmute used elsewhere.
+pub(super) fn adapt_runtime_result(
+    mref: Interned<MethodRef>,
+    value: Interned<CILNode>,
+    source: Type,
+    asm: &mut Assembly,
+) -> Interned<CILNode> {
+    let output = *asm[asm[mref].sig()].output();
+    asm.adapt_call_result(value, source, output)
+}
+
+#[cfg(test)]
+mod runtime_result_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_void_pointer_is_adapted_to_the_declared_pointer_type() {
+        let mut asm = Assembly::default();
+        let source = asm.nptr(Type::Void);
+        let output = asm.nptr(Type::Int(Int::U8));
+        let sig = asm.sig([], output);
+        let method = MethodRef::new(
+            *asm.main_module(),
+            asm.alloc_string("returns_u8_ptr"),
+            sig,
+            MethodKind::Static,
+            [].into(),
+        );
+        let method = asm.alloc_methodref(method);
+        let value = asm.alloc_node(Const::USize(0));
+
+        let adapted = adapt_runtime_result(method, value, source, &mut asm);
+        let CILNode::PtrCast(_, result) = &asm[adapted] else {
+            panic!("runtime pointer result was not explicitly retagged");
+        };
+        let PtrCastRes::Ptr(pointee) = **result else {
+            panic!("runtime pointer result was adapted to a non-pointer type");
+        };
+        assert_eq!(asm[pointee], Type::Int(Int::U8));
+    }
+}
 
 pub fn insert_swap_at_generic(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("swap_at_generic");
@@ -135,7 +180,7 @@ fn insert_rust_alloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, use
         return;
     }
     let name = asm.alloc_string("__rust_alloc");
-    let generator = move |_, asm: &mut Assembly| {
+    let generator = move |mref, asm: &mut Assembly| {
         let size = asm.alloc_node(CILNode::LdArg(0));
         let align = load_align_usize(asm, 1);
         let void_ptr = asm.nptr(Type::Void);
@@ -150,6 +195,7 @@ fn insert_rust_alloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, use
             [].into(),
         ));
         let alloc = asm.alloc_node(CILNode::call(call_method, [size, align]));
+        let alloc = adapt_runtime_result(mref, alloc, void_ptr, asm);
         let ret = asm.alloc_root(CILRoot::Ret(alloc));
         let cap = asm.alloc_node(Const::USize(ALLOC_CAP));
         let check = asm.alloc_root(CILRoot::Branch(Box::new((
@@ -162,6 +208,7 @@ fn insert_rust_alloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, use
             )),
         ))));
         let zero = asm.alloc_node(Const::USize(0));
+        let zero = adapt_runtime_result(mref, zero, Type::Int(Int::USize), asm);
         let ret_zero = CILRoot::Ret(zero);
 
         let throw = asm.alloc_root(ret_zero);
@@ -185,7 +232,7 @@ fn insert_rust_alloc_zeroed(
         return;
     }
     let name = asm.alloc_string("__rust_alloc_zeroed");
-    let generator = move |_, asm: &mut Assembly| {
+    let generator = move |mref, asm: &mut Assembly| {
         let size = asm.alloc_node(CILNode::LdArg(0));
         let align = load_align_usize(asm, 1);
         let void_ptr = asm.nptr(Type::Void);
@@ -220,6 +267,7 @@ fn insert_rust_alloc_zeroed(
         let zero = asm.alloc_node(Const::U8(0));
         let alloc_val = asm.alloc_node(CILNode::LdLoc(0));
         let zero = asm.alloc_root(CILRoot::InitBlk(Box::new((alloc_val, zero, size))));
+        let alloc_val = adapt_runtime_result(mref, alloc_val, void_ptr, asm);
         let ret = asm.alloc_root(CILRoot::Ret(alloc_val));
         MethodImpl::MethodBody {
             blocks: vec![
@@ -314,7 +362,7 @@ fn insert_rust_realloc(
 ) {
     let name = asm.alloc_string("__rust_realloc");
     if use_libc {
-        let generator = move |_, asm: &mut Assembly| {
+        let generator = move |mref, asm: &mut Assembly| {
             let ptr = load_ptr_arg(asm, 0);
             let align = load_align_usize(asm, 2);
             let new_size = asm.alloc_node(CILNode::LdArg(3));
@@ -357,6 +405,7 @@ fn insert_rust_realloc(
                 [].into(),
             ));
             let call_aligned_free = asm.alloc_root(CILRoot::call(aligned_free, [ptr]));
+            let buff = adapt_runtime_result(mref, buff, void_ptr, asm);
             let ret = asm.alloc_root(CILRoot::Ret(buff));
             MethodImpl::MethodBody {
                 blocks: vec![BasicBlock::new(
@@ -371,7 +420,7 @@ fn insert_rust_realloc(
     } else if use_pool_alloc {
         pool_alloc::insert_rust_realloc(asm, patcher);
     } else {
-        let generator = move |_, asm: &mut Assembly| {
+        let generator = move |mref, asm: &mut Assembly| {
             // realloc = AlignedAlloc + copy + AlignedFree, NOT `NativeMemory.AlignedRealloc`.
             // `AlignedRealloc` THROWS `OutOfMemoryException` when the requested size is unsatisfiable
             // (e.g. a `Vec<u8>` grown to `isize::MAX` bytes), which aborts the process; `AlignedAlloc`
@@ -456,10 +505,12 @@ fn insert_rust_realloc(
             let goto_ok = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
             // block 1: success -> return the new block.
             let ret_buff = asm.alloc_node(CILNode::LdLoc(0));
+            let ret_buff = adapt_runtime_result(mref, ret_buff, void_ptr, asm);
             let ret_ok = asm.alloc_root(CILRoot::Ret(ret_buff));
             // block 2: failure (cap exceeded or AlignedAlloc returned NULL) -> return NULL; the old
             // block is left allocated, as `GlobalAlloc::realloc` requires.
             let null = asm.alloc_node(Const::USize(0));
+            let null = adapt_runtime_result(mref, null, Type::Int(Int::USize), asm);
             let ret_null = asm.alloc_root(CILRoot::Ret(null));
             MethodImpl::MethodBody {
                 blocks: vec![
@@ -616,6 +667,7 @@ pub fn insert_heap(
     insert_rust_realloc(asm, patcher, use_libc, use_pool_alloc);
     insert_rust_dealloc(asm, patcher, use_libc, use_pool_alloc);
     insert_pause(asm, patcher);
+    insert_prefetch(asm, patcher);
 }
 
 fn insert_pause(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
@@ -628,6 +680,66 @@ fn insert_pause(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         }
     };
     patcher.insert(name, Box::new(generator));
+}
+
+/// LLVM's prefetch intrinsic is a performance hint only: it cannot change Rust-visible behavior,
+/// and the CLR exposes no architecture-neutral equivalent with the same cache-locality contract.
+/// Preserve its semantics by lowering it to an explicit no-op instead of leaving a live missing
+/// method that aborts when vectorized libraries (for example Blake3) reach their hot path.
+fn insert_prefetch(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("llvm.prefetch");
+    let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {
+        assert_eq!(
+            *asm[asm[mref].sig()].output(),
+            Type::Void,
+            "llvm.prefetch must have a void return type"
+        );
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
+}
+
+#[cfg(test)]
+mod processor_hint_tests {
+    use super::*;
+
+    #[test]
+    fn llvm_prefetch_is_registered_as_a_void_noop() {
+        let mut asm = Assembly::default();
+        let mut patcher = MissingMethodPatcher::default();
+        insert_prefetch(&mut asm, &mut patcher);
+        let name = asm.alloc_string("llvm.prefetch");
+        let pointer = asm.nptr(Type::Int(Int::I8));
+        let sig = asm.sig(
+            [
+                pointer,
+                Type::Int(Int::I32),
+                Type::Int(Int::I32),
+                Type::Int(Int::I32),
+            ],
+            Type::Void,
+        );
+        let main_module = *asm.main_module();
+        let method = asm.alloc_methodref(MethodRef::new(
+            main_module,
+            name,
+            sig,
+            MethodKind::Static,
+            [].into(),
+        ));
+
+        let body = patcher.get(&name).unwrap()(method, &mut asm);
+        let MethodImpl::MethodBody { blocks, locals } = body else {
+            panic!("llvm.prefetch did not lower to a method body")
+        };
+        assert!(locals.is_empty());
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(asm[blocks[0].roots()[0]], CILRoot::VoidRet);
+    }
 }
 pub fn rust_assert(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     fn assert(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, name: &str) {
@@ -749,6 +861,7 @@ fn insert_catch_unwind(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
             addr: cast_exception,
             field: ptr_field,
         });
+        let exception_ptr = asm.adapt_call_value(exception_ptr, Type::Int(Int::USize), uint8_ptr);
         let calli_catch = asm.alloc_root(CILRoot::CallI(Box::new((
             ldarg_2,
             catch_sig,
@@ -811,7 +924,7 @@ fn insert_interop_try_catch(asm: &mut Assembly, patcher: &mut MissingMethodPatch
         let ldarg_0 = asm.alloc_node(CILNode::LdArg(0)); // try_fn
         let ldarg_1 = asm.alloc_node(CILNode::LdArg(1)); // data
         let ldarg_2 = asm.alloc_node(CILNode::LdArg(2)); // catch_fn
-                                                         // try region: call try_fn(data); on success leave to the "ok" block (2).
+        // try region: call try_fn(data); on success leave to the "ok" block (2).
         let calli_try = asm.alloc_root(CILRoot::CallI(Box::new((
             ldarg_0,
             try_sig,

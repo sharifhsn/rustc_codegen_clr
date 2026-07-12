@@ -1,4 +1,3 @@
-use cilly::{Assembly, BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, Type};
 use crate::fn_ctx::MethodCompileCtx;
 use crate::r#type::{
     GetTypeExt,
@@ -6,6 +5,7 @@ use crate::r#type::{
     fat_ptr_to,
     utilis::ptr_is_fat,
 };
+use cilly::{Assembly, BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, Type};
 use rustc_middle::{
     mir::{Place, PlaceElem},
     ty::Ty,
@@ -226,7 +226,7 @@ fn place_elem_get<'a>(
                 }
             }
         }
-       
+
         // A `Subslice` projection read by value. Only a SIZED result can be loaded: on an array base
         // `[T; N]` the projection `arr[from..to]` (from_end == false) has type `[T; to - from]`, a
         // fixed-size sub-array. A slice base (`[T]`) is unsized and only ever appears under a `Ref`

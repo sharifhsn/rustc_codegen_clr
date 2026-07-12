@@ -135,6 +135,7 @@
 //! own binding.
 
 use super::UNMANAGED_THREAD_START;
+use crate::Assembly;
 use crate::cilnode::{ExtendKind, MethodKind, PtrCastRes};
 use crate::ir::asm::MissingMethodPatcher;
 use crate::ir::cilroot::BranchCond;
@@ -143,7 +144,6 @@ use crate::ir::{
     BasicBlock, BinOp, CILNode, CILRoot, ClassRef, Const, Int, Interned, MethodImpl, MethodRef,
     StaticFieldDesc, Type,
 };
-use crate::Assembly;
 use std::num::NonZeroU8;
 
 /// Declarative registration of a `MissingMethodPatcher` builtin.
@@ -177,6 +177,12 @@ use std::num::NonZeroU8;
 ///       static_getter ClassRef::stopwatch, "GetTimestamp" -> Type::Int(Int::I64));
 ///   ```
 macro_rules! dotnet_hook {
+    // ---- generic body with access to the original method reference ----
+    ($asm:expr, $patcher:expr, $sym:literal, |$body_mref:ident, $body_asm:ident| $body:block) => {{
+        let name = $asm.alloc_string($sym);
+        let generator = move |$body_mref, $body_asm: &mut $crate::Assembly| $body;
+        $patcher.insert(name, Box::new(generator));
+    }};
     // ---- generic body: an arbitrary generator closure body ----
     ($asm:expr, $patcher:expr, $sym:literal, |$body_asm:ident| $body:block) => {{
         let name = $asm.alloc_string($sym);
@@ -190,8 +196,10 @@ macro_rules! dotnet_hook {
         dotnet_hook!($asm, $patcher, $sym, |asm| {
             let class = $class(asm);
             let method_name = asm.alloc_string($method);
-            let method =
-                asm.class_ref(class).clone().static_mref(&[], $ret, method_name, asm);
+            let method = asm
+                .class_ref(class)
+                .clone()
+                .static_mref(&[], $ret, method_name, asm);
             let value = asm.alloc_node(CILNode::call(method, []));
             let ret = asm.alloc_root(CILRoot::Ret(value));
             MethodImpl::MethodBody {
@@ -200,6 +208,68 @@ macro_rules! dotnet_hook {
             }
         });
     };
+}
+
+/// Retag an ABI `i32` as its exact int-backed BCL enum value type. The bits are unchanged, but
+/// ECMA-335 method signatures distinguish `int32` from `SeekOrigin`/`SocketType`/etc.; making the
+/// reinterpret explicit keeps both cilly's verifier and CoreCLR's method resolution honest.
+fn i32_to_bcl_enum(
+    value: Interned<CILNode>,
+    enum_type: Type,
+    asm: &mut Assembly,
+) -> Interned<CILNode> {
+    debug_assert!(matches!(enum_type, Type::ClassRef(_)));
+    asm.transmute_on_stack(Type::Int(Int::I32), enum_type, value)
+}
+
+pub(super) fn bcl_enum_to_i32(
+    value: Interned<CILNode>,
+    enum_type: Type,
+    asm: &mut Assembly,
+) -> Interned<CILNode> {
+    debug_assert!(matches!(enum_type, Type::ClassRef(_)));
+    asm.transmute_on_stack(enum_type, Type::Int(Int::I32), value)
+}
+
+#[cfg(test)]
+mod enum_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn int_backed_bcl_enum_boundary_is_explicitly_retyped_both_ways() {
+        let mut asm = Assembly::default();
+        let seek_origin = Type::ClassRef(ClassRef::seek_origin(&mut asm));
+        let value = asm.alloc_node(Const::I32(2));
+        let adapted = i32_to_bcl_enum(value, seek_origin, &mut asm);
+        let CILNode::Call(call) = &asm[adapted] else {
+            panic!("BCL enum boundary did not use a typed reinterpret");
+        };
+        let sig = &asm[asm[call.0].sig()];
+        assert_eq!(sig.inputs(), &[Type::Int(Int::I32)]);
+        assert_eq!(*sig.output(), seek_origin);
+
+        let round_trip = bcl_enum_to_i32(adapted, seek_origin, &mut asm);
+        let CILNode::Call(call) = &asm[round_trip] else {
+            panic!("BCL enum return did not use a typed reinterpret");
+        };
+        let sig = &asm[asm[call.0].sig()];
+        assert_eq!(sig.inputs(), &[seek_origin]);
+        assert_eq!(*sig.output(), Type::Int(Int::I32));
+    }
+
+    #[test]
+    fn fs_stat_symlink_flag_is_a_verifier_clean_i32() {
+        let mut asm = Assembly::default();
+        let path_ty = asm.alloc_type(Type::PlatformString);
+        let locals = vec![(None, path_ty)];
+        let sig = asm.sig([], Type::Void);
+        let flag = dotnet_path_is_symlink_i32(&mut asm, 0);
+
+        assert_eq!(
+            asm[flag].clone().typecheck(sig, &locals, &mut asm).unwrap(),
+            Type::Int(Int::I32),
+        );
+    }
 }
 
 /// Registers all `rcl_dotnet_*` BCL bindings in `patcher`.
@@ -285,12 +355,10 @@ fn insert_dotnet_process(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             let r_fn = asm.alloc_root(CILRoot::call(set_file_name, [psi0, prog]));
             // psi.UseShellExecute = false
             let set_use = asm.alloc_string("set_UseShellExecute");
-            let set_use_shell = asm.class_ref(psi_cr).clone().instance(
-                &[Type::Bool],
-                Type::Void,
-                set_use,
-                asm,
-            );
+            let set_use_shell =
+                asm.class_ref(psi_cr)
+                    .clone()
+                    .instance(&[Type::Bool], Type::Void, set_use, asm);
             let psi1 = asm.alloc_node(CILNode::LdLoc(0));
             let false_c = asm.alloc_node(false);
             let r_use = asm.alloc_root(CILRoot::call(set_use_shell, [psi1, false_c]));
@@ -345,12 +413,10 @@ fn insert_dotnet_process(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             for setter in ["set_RedirectStandardOutput", "set_RedirectStandardError"] {
                 let psi = handle_to_class(asm, 0, psi_cr);
                 let sname = asm.alloc_string(setter);
-                let set = asm.class_ref(psi_cr).clone().instance(
-                    &[Type::Bool],
-                    Type::Void,
-                    sname,
-                    asm,
-                );
+                let set =
+                    asm.class_ref(psi_cr)
+                        .clone()
+                        .instance(&[Type::Bool], Type::Void, sname, asm);
                 let true_c = asm.alloc_node(true);
                 roots.push(asm.alloc_root(CILRoot::call(set, [psi, true_c])));
             }
@@ -390,7 +456,11 @@ fn insert_dotnet_process(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             let ret = asm.alloc_root(CILRoot::Ret(handle));
             let proc_local = asm.alloc_type(Type::ClassRef(proc_cr));
             MethodImpl::MethodBody {
-                blocks: vec![BasicBlock::new(vec![store_p, store_gch, free, ret], 0, None)],
+                blocks: vec![BasicBlock::new(
+                    vec![store_p, store_gch, free, ret],
+                    0,
+                    None,
+                )],
                 locals: vec![
                     (Some(asm.alloc_string("p")), proc_local),
                     (Some(asm.alloc_string("gch")), gc_handle_ty),
@@ -407,12 +477,17 @@ fn insert_dotnet_process(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             let proc_cr = ClassRef::process(asm);
             let p = handle_to_class(asm, 0, proc_cr);
             let wfe_name = asm.alloc_string("WaitForExit");
-            let wfe = asm.class_ref(proc_cr).clone().instance(&[], Type::Void, wfe_name, asm);
+            let wfe = asm
+                .class_ref(proc_cr)
+                .clone()
+                .instance(&[], Type::Void, wfe_name, asm);
             let r_wait = asm.alloc_root(CILRoot::call(wfe, [p]));
             let p2 = handle_to_class(asm, 0, proc_cr);
             let ec_name = asm.alloc_string("get_ExitCode");
             let get_ec =
-                asm.class_ref(proc_cr).clone().instance(&[], Type::Int(Int::I32), ec_name, asm);
+                asm.class_ref(proc_cr)
+                    .clone()
+                    .instance(&[], Type::Int(Int::I32), ec_name, asm);
             let code = asm.alloc_node(CILNode::call(get_ec, [p2]));
             let ret = asm.alloc_root(CILRoot::Ret(code));
             MethodImpl::MethodBody {
@@ -431,7 +506,10 @@ fn insert_dotnet_process(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             let proc_cr = ClassRef::process(asm);
             let p = handle_to_class(asm, 0, proc_cr);
             let gname = asm.alloc_string(getter.as_str());
-            let get = asm.class_ref(proc_cr).clone().instance(&[], Type::Int(ret), gname, asm);
+            let get = asm
+                .class_ref(proc_cr)
+                .clone()
+                .instance(&[], Type::Int(ret), gname, asm);
             let v = asm.alloc_node(CILNode::call(get, [p]));
             let ret_root = asm.alloc_root(CILRoot::Ret(v));
             MethodImpl::MethodBody {
@@ -450,7 +528,10 @@ fn insert_dotnet_process(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             let proc_cr = ClassRef::process(asm);
             let p = handle_to_class(asm, 0, proc_cr);
             let he_name = asm.alloc_string("get_HasExited");
-            let get = asm.class_ref(proc_cr).clone().instance(&[], Type::Bool, he_name, asm);
+            let get = asm
+                .class_ref(proc_cr)
+                .clone()
+                .instance(&[], Type::Bool, he_name, asm);
             let b = asm.alloc_node(CILNode::call(get, [p]));
             let v = asm.int_cast(b, Int::I32, ExtendKind::ZeroExtend);
             let ret_root = asm.alloc_root(CILRoot::Ret(v));
@@ -469,7 +550,10 @@ fn insert_dotnet_process(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             let proc_cr = ClassRef::process(asm);
             let p = handle_to_class(asm, 0, proc_cr);
             let kill_name = asm.alloc_string("Kill");
-            let kill = asm.class_ref(proc_cr).clone().instance(&[], Type::Void, kill_name, asm);
+            let kill = asm
+                .class_ref(proc_cr)
+                .clone()
+                .instance(&[], Type::Void, kill_name, asm);
             let r_kill = asm.alloc_root(CILRoot::call(kill, [p]));
             let ret = asm.alloc_root(CILRoot::VoidRet);
             MethodImpl::MethodBody {
@@ -498,11 +582,17 @@ fn insert_dotnet_process(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             let stream_ty = Type::ClassRef(stream_cr);
             let p = handle_to_class(asm, 0, proc_cr);
             let gname = asm.alloc_string(getter.as_str());
-            let get_std = asm.class_ref(proc_cr).clone().instance(&[], rw_ty, gname, asm);
+            let get_std = asm
+                .class_ref(proc_cr)
+                .clone()
+                .instance(&[], rw_ty, gname, asm);
             let rw = asm.alloc_node(CILNode::call(get_std, [p]));
             let store_rw = asm.alloc_root(CILRoot::StLoc(0, rw));
             let bs_name = asm.alloc_string("get_BaseStream");
-            let get_bs = asm.class_ref(rw_cr).clone().instance(&[], stream_ty, bs_name, asm);
+            let get_bs = asm
+                .class_ref(rw_cr)
+                .clone()
+                .instance(&[], stream_ty, bs_name, asm);
             let rw_load = asm.alloc_node(CILNode::LdLoc(0));
             let stream = asm.alloc_node(CILNode::call(get_bs, [rw_load]));
             let store_s = asm.alloc_root(CILRoot::StLoc(1, stream));
@@ -559,12 +649,10 @@ fn insert_dotnet_process(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             let s = handle_to_class(asm, 0, stream_cr);
             let (span, span_ty) = build_byte_span(asm, 1, 2, true);
             let write_name = asm.alloc_string("Write");
-            let write = asm.class_ref(stream_cr).clone().instance(
-                &[span_ty],
-                Type::Void,
-                write_name,
-                asm,
-            );
+            let write =
+                asm.class_ref(stream_cr)
+                    .clone()
+                    .instance(&[span_ty], Type::Void, write_name, asm);
             let r_write = asm.alloc_root(CILRoot::call(write, [s, span]));
             let len = asm.alloc_node(CILNode::LdArg(2));
             let len = asm.int_cast(len, Int::I32, ExtendKind::ZeroExtend);
@@ -585,7 +673,9 @@ fn insert_dotnet_process(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             let s = handle_to_class(asm, 0, stream_cr);
             let dispose_name = asm.alloc_string("Dispose");
             let dispose =
-                asm.class_ref(stream_cr).clone().instance(&[], Type::Void, dispose_name, asm);
+                asm.class_ref(stream_cr)
+                    .clone()
+                    .instance(&[], Type::Void, dispose_name, asm);
             let r_disp = asm.alloc_root(CILRoot::call(dispose, [s]));
             let (store_gch, free, gc_handle_ty) = free_handle_roots(asm, 0, 0);
             let ret = asm.alloc_root(CILRoot::VoidRet);
@@ -605,7 +695,9 @@ fn insert_dotnet_process(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             let p = handle_to_class(asm, 0, proc_cr);
             let dispose_name = asm.alloc_string("Dispose");
             let dispose =
-                asm.class_ref(proc_cr).clone().instance(&[], Type::Void, dispose_name, asm);
+                asm.class_ref(proc_cr)
+                    .clone()
+                    .instance(&[], Type::Void, dispose_name, asm);
             let r_disp = asm.alloc_root(CILRoot::call(dispose, [p]));
             let (store_gch, free, gc_handle_ty) = free_handle_roots(asm, 0, 0);
             let ret = asm.alloc_root(CILRoot::VoidRet);
@@ -642,7 +734,11 @@ fn insert_dotnet_instant_freq(asm: &mut Assembly, patcher: &mut MissingMethodPat
     dotnet_hook!(asm, patcher, "rcl_dotnet_instant_freq", |asm| {
         let stopwatch = ClassRef::stopwatch(asm);
         let freq_name = asm.alloc_string("Frequency");
-        let freq_fld = asm.alloc_sfld(StaticFieldDesc::new(stopwatch, freq_name, Type::Int(Int::I64)));
+        let freq_fld = asm.alloc_sfld(StaticFieldDesc::new(
+            stopwatch,
+            freq_name,
+            Type::Int(Int::I64),
+        ));
         let freq = asm.alloc_node(CILNode::LdStaticField(freq_fld));
         let ret = asm.alloc_root(CILRoot::Ret(freq));
         MethodImpl::MethodBody {
@@ -716,11 +812,13 @@ fn insert_dotnet_alloc(
     use_pool_alloc: bool,
 ) {
     if use_pool_alloc {
-        dotnet_hook!(asm, patcher, "rcl_dotnet_alloc", |asm| {
+        dotnet_hook!(asm, patcher, "rcl_dotnet_alloc", |mref, asm| {
             let size = asm.alloc_node(CILNode::LdArg(0));
             let align = asm.alloc_node(CILNode::LdArg(1));
             let alloc_mref = super::pool_alloc::pool_alloc_mref(asm);
             let alloc = asm.alloc_node(CILNode::call(alloc_mref, [size, align]));
+            let void_ptr = asm.nptr(Type::Void);
+            let alloc = super::adapt_runtime_result(mref, alloc, void_ptr, asm);
             let ret = asm.alloc_root(CILRoot::Ret(alloc));
             MethodImpl::MethodBody {
                 blocks: vec![BasicBlock::new(vec![ret], 0, None)],
@@ -729,7 +827,7 @@ fn insert_dotnet_alloc(
         });
         return;
     }
-    dotnet_hook!(asm, patcher, "rcl_dotnet_alloc", |asm| {
+    dotnet_hook!(asm, patcher, "rcl_dotnet_alloc", |mref, asm| {
         let size = asm.alloc_node(CILNode::LdArg(0));
         let align = asm.alloc_node(CILNode::LdArg(1));
         let void_ptr = asm.nptr(Type::Void);
@@ -744,8 +842,7 @@ fn insert_dotnet_alloc(
             [].into(),
         ));
         let alloc = asm.alloc_node(CILNode::call(call_method, [size, align]));
-        // Result type is *mut u8; AlignedAlloc returns void*, which is
-        // pointer-compatible, so a plain return suffices.
+        let alloc = super::adapt_runtime_result(mref, alloc, void_ptr, asm);
         let ret = asm.alloc_root(CILRoot::Ret(alloc));
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![ret], 0, None)],
@@ -937,7 +1034,6 @@ fn insert_dotnet_write(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     patcher.insert(name, Box::new(generator));
 }
 
-
 /// `rcl_dotnet_random_fill(ptr: *mut u8, len: usize)`
 ///   => `RandomNumberGenerator.Fill(new Span<byte>((void*)ptr, (int)len))`.
 ///
@@ -1078,10 +1174,12 @@ fn insert_dotnet_thread_spawn(asm: &mut Assembly, patcher: &mut MissingMethodPat
         // park forever and are never joined). Joined threads (pal_threads) are unaffected: `Join`
         // still waits for a background thread.
         let set_is_background = asm.alloc_string("set_IsBackground");
-        let set_bg_mref = asm
-            .class_ref(thread)
-            .clone()
-            .virtual_mref(&[Type::Bool], Type::Void, set_is_background, asm);
+        let set_bg_mref = asm.class_ref(thread).clone().virtual_mref(
+            &[Type::Bool],
+            Type::Void,
+            set_is_background,
+            asm,
+        );
         let ld_thread_bg = asm.alloc_node(CILNode::LdLoc(0));
         let true_const = asm.alloc_node(Const::Bool(true));
         let set_bg = asm.alloc_root(CILRoot::call(set_bg_mref, [ld_thread_bg, true_const]));
@@ -1109,7 +1207,10 @@ fn insert_dotnet_thread_spawn(asm: &mut Assembly, patcher: &mut MissingMethodPat
             )],
             locals: vec![
                 (Some(asm.alloc_string("thread")), thread_ty),
-                (Some(asm.alloc_string("thread_start")), thread_start_local_ty),
+                (
+                    Some(asm.alloc_string("thread_start")),
+                    thread_start_local_ty,
+                ),
             ],
         }
     };
@@ -1171,12 +1272,10 @@ fn insert_dotnet_thread_join(asm: &mut Assembly, patcher: &mut MissingMethodPatc
         let gch = asm.alloc_node(CILNode::call(from_int_ptr, [handle_isize2]));
         let store_gch = asm.alloc_root(CILRoot::StLoc(1, gch));
         let free = asm.alloc_string("Free");
-        let free = asm.class_ref(gc_handle).clone().instance(
-            &[],
-            Type::Void,
-            free,
-            asm,
-        );
+        let free = asm
+            .class_ref(gc_handle)
+            .clone()
+            .instance(&[], Type::Void, free, asm);
         let gch_addr = asm.alloc_node(CILNode::LdLocA(1));
         let free = asm.alloc_root(CILRoot::call(free, [gch_addr]));
 
@@ -1204,10 +1303,10 @@ fn insert_dotnet_thread_yield(asm: &mut Assembly, patcher: &mut MissingMethodPat
     dotnet_hook!(asm, patcher, "rcl_dotnet_thread_yield", |asm| {
         let thread = ClassRef::thread(asm);
         let yield_now = asm.alloc_string("Yield");
-        let yield_now =
-            asm.class_ref(thread)
-                .clone()
-                .static_mref(&[], Type::Bool, yield_now, asm);
+        let yield_now = asm
+            .class_ref(thread)
+            .clone()
+            .static_mref(&[], Type::Bool, yield_now, asm);
         let yielded = asm.alloc_node(CILNode::call(yield_now, []));
         let pop = asm.alloc_root(CILRoot::Pop(yielded));
         let ret = asm.alloc_root(CILRoot::VoidRet);
@@ -1721,7 +1820,7 @@ fn recover_thread_local(asm: &mut Assembly) -> Interned<CILNode> {
 /// the CALLING THREAD's slot (per-thread by construction). Backs the dotnet PAL
 /// `key::get`.
 fn insert_dotnet_tls_get(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    dotnet_hook!(asm, patcher, "rcl_dotnet_tls_get", |asm| {
+    dotnet_hook!(asm, patcher, "rcl_dotnet_tls_get", |mref, asm| {
         let tl = recover_thread_local(asm);
         let tl_class = ClassRef::thread_local(asm, Type::Int(Int::ISize));
         let get_value = asm.alloc_string("get_Value");
@@ -1732,18 +1831,24 @@ fn insert_dotnet_tls_get(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
         // mirroring how `ConcurrentDictionary<K,V>.get_Item` is referenced.
         let get_value = asm.class_ref(tl_class).clone().instance(
             &[],
-            Type::PlatformGeneric(0, GenericKind::MethodGeneric),
+            Type::PlatformGeneric(0, GenericKind::TypeGeneric),
             get_value,
             asm,
         );
         let val = asm.alloc_node(CILNode::call(get_value, [tl]));
-        // nint -> *mut u8
-        let void = asm.alloc_type(Type::Void);
-        let val = asm.alloc_node(CILNode::PtrCast(val, Box::new(PtrCastRes::Ptr(void))));
+        // Materialize the bound class generic into its concrete `nint` local before converting it
+        // to a native pointer. A PtrCast directly from the open `!0` marker is ill-typed even though
+        // this ThreadLocal instantiation binds `!0 = nint`.
+        let store = asm.alloc_root(CILRoot::StLoc(0, val));
+        let val = asm.alloc_node(CILNode::LdLoc(0));
+        let val = super::adapt_runtime_result(mref, val, Type::Int(Int::ISize), asm);
         let ret = asm.alloc_root(CILRoot::Ret(val));
         MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
-            locals: vec![],
+            blocks: vec![BasicBlock::new(vec![store, ret], 0, None)],
+            locals: vec![(
+                Some(asm.alloc_string("value")),
+                asm.alloc_type(Type::Int(Int::ISize)),
+            )],
         }
     });
 }
@@ -1761,7 +1866,7 @@ fn insert_dotnet_tls_set(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
         // `ThreadLocal<T>.set_Value(T)` takes the CLASS generic `!0` (here `nint`),
         // not a concrete `IntPtr` — same exact-signature-match reason as the getter.
         let set_value = asm.class_ref(tl_class).clone().instance(
-            &[Type::PlatformGeneric(0, GenericKind::MethodGeneric)],
+            &[Type::PlatformGeneric(0, GenericKind::TypeGeneric)],
             Type::Void,
             set_value,
             asm,
@@ -1805,11 +1910,48 @@ fn insert_dotnet_available_parallelism(asm: &mut Assembly, patcher: &mut Missing
 ///
 /// Backs `sys::process::getpid` on the dotnet PAL (a genuine process id, unlike
 /// `spawn`'s synthetic-pid wall). `ProcessId` is an `int` static getter
-/// (`get_ProcessId`); the symbol's return type is `u32`, and the value is always
-/// non-negative, so a plain widen-free reinterpret suffices.
+/// (`get_ProcessId`); the symbol's return type is `u32`, so the BCL boundary must
+/// explicitly retag the same-width stack value for cilly's signedness-aware IR.
+fn dotnet_process_id_u32(asm: &mut Assembly) -> Interned<CILNode> {
+    let env = ClassRef::enviroment(asm);
+    let get_process_id_name = asm.alloc_string("get_ProcessId");
+    let get_process_id =
+        asm.class_ref(env)
+            .clone()
+            .static_mref(&[], Type::Int(Int::I32), get_process_id_name, asm);
+    let process_id = asm.alloc_node(CILNode::call(get_process_id, []));
+    asm.int_cast(process_id, Int::U32, ExtendKind::ZeroExtend)
+}
+
 fn insert_dotnet_getpid(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    dotnet_hook!(asm, patcher, "rcl_dotnet_getpid",
-        static_getter ClassRef::enviroment, "get_ProcessId" -> Type::Int(Int::I32));
+    dotnet_hook!(asm, patcher, "rcl_dotnet_getpid", |asm| {
+        let process_id = dotnet_process_id_u32(asm);
+        let ret = asm.alloc_root(CILRoot::Ret(process_id));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    });
+}
+
+#[cfg(test)]
+mod process_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn process_id_is_retyped_to_the_rust_u32_contract() {
+        let mut asm = Assembly::default();
+        let process_id = dotnet_process_id_u32(&mut asm);
+        let sig = asm.sig([], Type::Void);
+
+        assert_eq!(
+            asm[process_id]
+                .clone()
+                .typecheck(sig, &[], &mut asm)
+                .unwrap(),
+            Type::Int(Int::U32),
+        );
+    }
 }
 
 /// `exit(code: c_int) -> !` => `System.Environment.Exit((int)code)`.
@@ -1833,10 +1975,12 @@ fn insert_dotnet_exit(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         // Environment.Exit((int)arg0) — static void Exit(int).
         let env = ClassRef::enviroment(asm);
         let exit_name = asm.alloc_string("Exit");
-        let exit =
-            asm.class_ref(env)
-                .clone()
-                .static_mref(&[Type::Int(Int::I32)], Type::Void, exit_name, asm);
+        let exit = asm.class_ref(env).clone().static_mref(
+            &[Type::Int(Int::I32)],
+            Type::Void,
+            exit_name,
+            asm,
+        );
         let code = asm.alloc_node(CILNode::LdArg(0));
         let code = asm.int_cast(code, Int::I32, ExtendKind::SignExtend);
         let call = asm.alloc_root(CILRoot::call(exit, [code]));
@@ -1923,12 +2067,10 @@ fn insert_dotnet_paths(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let u8_ptr = asm.nptr(Type::Int(Int::U8));
         let dir = ClassRef::directory(asm);
         let get_cwd = asm.alloc_string("GetCurrentDirectory");
-        let get_cwd = asm.class_ref(dir).clone().static_mref(
-            &[],
-            Type::PlatformString,
-            get_cwd,
-            asm,
-        );
+        let get_cwd =
+            asm.class_ref(dir)
+                .clone()
+                .static_mref(&[], Type::PlatformString, get_cwd, asm);
         let s = asm.alloc_node(CILNode::call(get_cwd, []));
         let to_utf8 = string_to_utf8(asm);
         let buf = asm.alloc_node(CILNode::call(to_utf8, [s]));
@@ -1947,12 +2089,10 @@ fn insert_dotnet_paths(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let u8_ptr = asm.nptr(Type::Int(Int::U8));
         let path = ClassRef::path_io(asm);
         let get_temp = asm.alloc_string("GetTempPath");
-        let get_temp = asm.class_ref(path).clone().static_mref(
-            &[],
-            Type::PlatformString,
-            get_temp,
-            asm,
-        );
+        let get_temp =
+            asm.class_ref(path)
+                .clone()
+                .static_mref(&[], Type::PlatformString, get_temp, asm);
         let s = asm.alloc_node(CILNode::call(get_temp, []));
         let to_utf8 = string_to_utf8(asm);
         let buf = asm.alloc_node(CILNode::call(to_utf8, [s]));
@@ -1973,12 +2113,10 @@ fn insert_dotnet_paths(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let string_class = ClassRef::string(asm);
         let env = ClassRef::enviroment(asm);
         let get_path = asm.alloc_string("get_ProcessPath");
-        let get_path = asm.class_ref(env).clone().static_mref(
-            &[],
-            Type::PlatformString,
-            get_path,
-            asm,
-        );
+        let get_path =
+            asm.class_ref(env)
+                .clone()
+                .static_mref(&[], Type::PlatformString, get_path, asm);
         let s = asm.alloc_node(CILNode::call(get_path, []));
         let store_s = asm.alloc_root(CILRoot::StLoc(0, s));
         // Block 0: if (s == null) goto 1 else goto 2.
@@ -2362,46 +2500,87 @@ fn insert_dotnet_env(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         // Method references.
         let get_env_vars = {
             let n = asm.alloc_string("GetEnvironmentVariables");
-            asm.class_ref(env).clone().static_mref(&[], Type::ClassRef(i_dictionary), n, asm)
+            asm.class_ref(env)
+                .clone()
+                .static_mref(&[], Type::ClassRef(i_dictionary), n, asm)
         };
         let get_enum = {
             let n = asm.alloc_string("GetEnumerator");
-            asm.class_ref(i_dictionary).clone().virtual_mref(&[], Type::ClassRef(dict_iter), n, asm)
+            asm.class_ref(i_dictionary)
+                .clone()
+                .virtual_mref(&[], Type::ClassRef(dict_iter), n, asm)
         };
         let move_next = {
             let n = asm.alloc_string("MoveNext");
-            asm.class_ref(i_enumerator).clone().virtual_mref(&[], Type::Bool, n, asm)
+            asm.class_ref(i_enumerator)
+                .clone()
+                .virtual_mref(&[], Type::Bool, n, asm)
         };
         let get_current = {
             let n = asm.alloc_string("get_Current");
-            asm.class_ref(i_enumerator).clone().virtual_mref(&[], Type::PlatformObject, n, asm)
+            asm.class_ref(i_enumerator)
+                .clone()
+                .virtual_mref(&[], Type::PlatformObject, n, asm)
         };
         let entry_ref = asm.nref(Type::ClassRef(dict_entry));
         let get_key = {
             let n = asm.alloc_string("get_Key");
             let sig = asm.sig([entry_ref], Type::PlatformObject);
-            asm.alloc_methodref(MethodRef::new(dict_entry, n, sig, MethodKind::Instance, [].into()))
+            asm.alloc_methodref(MethodRef::new(
+                dict_entry,
+                n,
+                sig,
+                MethodKind::Instance,
+                [].into(),
+            ))
         };
         let get_value = {
             let n = asm.alloc_string("get_Value");
             let sig = asm.sig([entry_ref], Type::PlatformObject);
-            asm.alloc_methodref(MethodRef::new(dict_entry, n, sig, MethodKind::Instance, [].into()))
+            asm.alloc_methodref(MethodRef::new(
+                dict_entry,
+                n,
+                sig,
+                MethodKind::Instance,
+                [].into(),
+            ))
         };
         let concat2 = {
             let n = asm.alloc_string("Concat");
             asm.class_ref(string_cls).clone().static_mref(
-                &[Type::PlatformString, Type::PlatformString], Type::PlatformString, n, asm)
+                &[Type::PlatformString, Type::PlatformString],
+                Type::PlatformString,
+                n,
+                asm,
+            )
         };
         let concat4 = {
             let n = asm.alloc_string("Concat");
             asm.class_ref(string_cls).clone().static_mref(
-                &[Type::PlatformString, Type::PlatformString, Type::PlatformString, Type::PlatformString],
-                Type::PlatformString, n, asm)
+                &[
+                    Type::PlatformString,
+                    Type::PlatformString,
+                    Type::PlatformString,
+                    Type::PlatformString,
+                ],
+                Type::PlatformString,
+                n,
+                asm,
+            )
         };
         let to_utf8 = string_to_utf8(asm);
-        let empty = { let s = asm.ldstr(""); asm.alloc_node(s) };
-        let eq_str = { let s = asm.ldstr("="); asm.alloc_node(s) };
-        let nl_str = { let s = asm.ldstr("\n"); asm.alloc_node(s) };
+        let empty = {
+            let s = asm.ldstr("");
+            asm.alloc_node(s)
+        };
+        let eq_str = {
+            let s = asm.ldstr("=");
+            asm.alloc_node(s)
+        };
+        let nl_str = {
+            let s = asm.ldstr("\n");
+            asm.alloc_node(s)
+        };
 
         const L_ACC: u32 = 0;
         const L_ITER: u32 = 1;
@@ -2417,7 +2596,11 @@ fn insert_dotnet_env(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         // Block 1 (loop head): if !iter.MoveNext() goto 3 else goto 2.
         let iter_l1 = asm.alloc_node(CILNode::LdLoc(L_ITER));
         let has_next = asm.alloc_node(CILNode::call(move_next, [iter_l1]));
-        let br_end = asm.alloc_root(CILRoot::Branch(Box::new((3, 0, Some(BranchCond::False(has_next))))));
+        let br_end = asm.alloc_root(CILRoot::Branch(Box::new((
+            3,
+            0,
+            Some(BranchCond::False(has_next)),
+        ))));
         let goto2 = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None))));
 
         // Block 2 (body): entry = (DictionaryEntry)iter.get_Current;
@@ -2618,6 +2801,8 @@ fn insert_dotnet_fs_open(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
         let file_stream = ClassRef::file_stream(asm);
         let file_mode = Type::ClassRef(ClassRef::file_mode(asm));
         let file_access = Type::ClassRef(ClassRef::file_access(asm));
+        let mode = i32_to_bcl_enum(mode, file_mode, asm);
+        let access = i32_to_bcl_enum(access, file_access, asm);
         let ctor = asm
             .class_ref(file_stream)
             .clone()
@@ -2632,7 +2817,10 @@ fn insert_dotnet_fs_open(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
         let handle = asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::Ptr(void))));
         let store_ok = asm.alloc_root(CILRoot::StLoc(1, handle));
         // try { build stream; result = handle; leave -> 2 }
-        let leave_ok = asm.alloc_root(CILRoot::ExitSpecialRegion { target: 2, source: 0 });
+        let leave_ok = asm.alloc_root(CILRoot::ExitSpecialRegion {
+            target: 2,
+            source: 0,
+        });
         // catch (block 1): errno = rcl_errno_from_exception(GetException);
         //                  result = null; leave -> 2.
         let get_exn = asm.alloc_node(CILNode::GetException);
@@ -2649,7 +2837,10 @@ fn insert_dotnet_fs_open(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
         let zero_addr = asm.int_cast(zero_addr, Int::ISize, ExtendKind::ZeroExtend);
         let nullp = asm.cast_ptr(zero_addr, void_ptr);
         let store_null = asm.alloc_root(CILRoot::StLoc(1, nullp));
-        let leave_catch = asm.alloc_root(CILRoot::ExitSpecialRegion { target: 2, source: 1 });
+        let leave_catch = asm.alloc_root(CILRoot::ExitSpecialRegion {
+            target: 2,
+            source: 1,
+        });
         // block 2: ret result.
         let ld_result = asm.alloc_node(CILNode::LdLoc(1));
         let ret = asm.alloc_root(CILRoot::Ret(ld_result));
@@ -2711,12 +2902,10 @@ fn insert_dotnet_fs_write(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
         let stream = handle_to_class(asm, 0, file_stream);
         let (span, span_ty) = build_byte_span(asm, 1, 2, true);
         let write_name = asm.alloc_string("Write");
-        let write = asm.class_ref(file_stream).clone().instance(
-            &[span_ty],
-            Type::Void,
-            write_name,
-            asm,
-        );
+        let write =
+            asm.class_ref(file_stream)
+                .clone()
+                .instance(&[span_ty], Type::Void, write_name, asm);
         let write = asm.alloc_root(CILRoot::call(write, [stream, span]));
         let len = asm.alloc_node(CILNode::LdArg(2));
         let len = asm.int_cast(len, Int::ISize, ExtendKind::ZeroExtend);
@@ -2732,10 +2921,7 @@ fn insert_dotnet_fs_write(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
 /// `SafeFileHandle` via the `FileStream.SafeFileHandle` instance getter — the
 /// `this` `System.IO.RandomAccess.{Read,Write}` need. Returns the SFH node and
 /// its type. Shared by the `read_at`/`write_at` hooks (B2 Piece 3).
-fn filestream_safe_handle(
-    asm: &mut Assembly,
-    handle_arg: u32,
-) -> (Interned<CILNode>, Type) {
+fn filestream_safe_handle(asm: &mut Assembly, handle_arg: u32) -> (Interned<CILNode>, Type) {
     let file_stream = ClassRef::file_stream(asm);
     let safe_handle = ClassRef::safe_file_handle(asm);
     let sfh_ty = Type::ClassRef(safe_handle);
@@ -2843,7 +3029,11 @@ fn insert_dotnet_fs_symlink(asm: &mut Assembly, patcher: &mut MissingMethodPatch
         let ret = asm.alloc_root(CILRoot::Ret(zero));
         let string_ty = asm.alloc_type(Type::PlatformString);
         MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![store_link, store_target, call, ret], 0, None)],
+            blocks: vec![BasicBlock::new(
+                vec![store_link, store_target, call, ret],
+                0,
+                None,
+            )],
             locals: vec![
                 (Some(asm.alloc_string("link")), string_ty),
                 (Some(asm.alloc_string("target")), string_ty),
@@ -2901,12 +3091,10 @@ fn insert_dotnet_fs_readlink(asm: &mut Assembly, patcher: &mut MissingMethodPatc
 
         // Block 2: s = info.FullName; return (u8*)StringToCoTaskMemUTF8(s).
         let get_full_name = asm.alloc_string("get_FullName");
-        let get_full = asm.class_ref(fsi).clone().instance(
-            &[],
-            Type::PlatformString,
-            get_full_name,
-            asm,
-        );
+        let get_full =
+            asm.class_ref(fsi)
+                .clone()
+                .instance(&[], Type::PlatformString, get_full_name, asm);
         let info_load2 = asm.alloc_node(CILNode::LdLoc(1));
         let s = asm.alloc_node(CILNode::call(get_full, [info_load2]));
         let to_utf8 = string_to_utf8(asm);
@@ -2945,6 +3133,7 @@ fn insert_dotnet_fs_seek(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
         // FileStream.Seek(long, SeekOrigin) — the second param is the int-backed
         // SeekOrigin enum value type (an int32 is binary compatible on the stack).
         let seek_origin = Type::ClassRef(ClassRef::seek_origin(asm));
+        let origin = i32_to_bcl_enum(origin, seek_origin, asm);
         let seek = asm.class_ref(file_stream).clone().instance(
             &[Type::Int(Int::I64), seek_origin],
             Type::Int(Int::I64),
@@ -2966,12 +3155,10 @@ fn insert_dotnet_fs_flush(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
         let file_stream = ClassRef::file_stream(asm);
         let stream = handle_to_class(asm, 0, file_stream);
         let flush_name = asm.alloc_string("Flush");
-        let flush = asm.class_ref(file_stream).clone().instance(
-            &[],
-            Type::Void,
-            flush_name,
-            asm,
-        );
+        let flush = asm
+            .class_ref(file_stream)
+            .clone()
+            .instance(&[], Type::Void, flush_name, asm);
         let flush = asm.alloc_root(CILRoot::call(flush, [stream]));
         let ret = asm.alloc_root(CILRoot::VoidRet);
         MethodImpl::MethodBody {
@@ -2988,17 +3175,19 @@ fn insert_dotnet_fs_close(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
         let file_stream = ClassRef::file_stream(asm);
         let stream = handle_to_class(asm, 0, file_stream);
         let dispose_name = asm.alloc_string("Dispose");
-        let dispose = asm.class_ref(file_stream).clone().instance(
-            &[],
-            Type::Void,
-            dispose_name,
-            asm,
-        );
+        let dispose =
+            asm.class_ref(file_stream)
+                .clone()
+                .instance(&[], Type::Void, dispose_name, asm);
         let dispose = asm.alloc_root(CILRoot::call(dispose, [stream]));
         let (store_gch, free, gc_handle_ty) = free_handle_roots(asm, 0, 0);
         let ret = asm.alloc_root(CILRoot::VoidRet);
         MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![dispose, store_gch, free, ret], 0, None)],
+            blocks: vec![BasicBlock::new(
+                vec![dispose, store_gch, free, ret],
+                0,
+                None,
+            )],
             locals: vec![(Some(asm.alloc_string("gch")), gc_handle_ty)],
         }
     });
@@ -3172,7 +3361,7 @@ fn insert_dotnet_fs_set_readonly(asm: &mut Assembly, patcher: &mut MissingMethod
         // Block 1 (readonly): SetAttributes(path, (FileAttributes)1); return 0.
         let p1 = asm.alloc_node(CILNode::LdLoc(0));
         let one = asm.alloc_node(1_i32);
-        let one_fa = asm.transmute_on_stack(Type::Int(Int::I32), fattr_ty, one);
+        let one_fa = i32_to_bcl_enum(one, fattr_ty, asm);
         let call1 = asm.alloc_root(CILRoot::call(set_attrs, [p1, one_fa]));
         let z1 = asm.alloc_node(0_i32);
         let ret1 = asm.alloc_root(CILRoot::Ret(z1));
@@ -3180,7 +3369,7 @@ fn insert_dotnet_fs_set_readonly(asm: &mut Assembly, patcher: &mut MissingMethod
         // Block 2 (not readonly): SetAttributes(path, (FileAttributes)128 /*Normal*/); return 0.
         let p2 = asm.alloc_node(CILNode::LdLoc(0));
         let n128 = asm.alloc_node(128_i32);
-        let n128_fa = asm.transmute_on_stack(Type::Int(Int::I32), fattr_ty, n128);
+        let n128_fa = i32_to_bcl_enum(n128, fattr_ty, asm);
         let call2 = asm.alloc_root(CILRoot::call(set_attrs, [p2, n128_fa]));
         let z2 = asm.alloc_node(0_i32);
         let ret2 = asm.alloc_root(CILRoot::Ret(z2));
@@ -3297,12 +3486,13 @@ fn dotnet_path_is_symlink_i32(asm: &mut Assembly, path_local: u32) -> Interned<C
     let path = asm.alloc_node(CILNode::LdLoc(path_local));
     let attrs = asm.alloc_node(CILNode::call(get_attrs, [path]));
     // (int)attrs & ReparsePoint  — the enum is int-backed, so the `and` is on i32.
-    let attrs_i = asm.int_cast(attrs, Int::I32, ExtendKind::ZeroExtend);
+    let attrs_i = bcl_enum_to_i32(attrs, fa_ty, asm);
     let reparse = asm.alloc_node(DOTNET_FILE_ATTR_REPARSE_POINT);
     let masked = asm.alloc_node(CILNode::BinOp(attrs_i, reparse, BinOp::And));
     // (masked != 0) as i32 — `Eq` yields 1/0; negate via `1 - (masked == 0)`.
     let zero = asm.alloc_node(0_i32);
     let is_zero = asm.alloc_node(CILNode::BinOp(masked, zero, BinOp::Eq));
+    let is_zero = asm.int_cast(is_zero, Int::I32, ExtendKind::ZeroExtend);
     let one = asm.alloc_node(1_i32);
     asm.alloc_node(CILNode::BinOp(one, is_zero, BinOp::Sub))
 }
@@ -3357,8 +3547,7 @@ fn insert_dotnet_fs_stat(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
         // *out_mtime/atime/ctime = File.GetLast{Write,Access}TimeUtc /
         // GetCreationTimeUtc(path), rebased to Unix seconds. The static File
         // getters work for directories too (no FileInfo/DirectoryInfo split).
-        let (store_mt1, mt1) =
-            dotnet_path_time_unix_secs(asm, 0, "GetLastWriteTimeUtc", 2);
+        let (store_mt1, mt1) = dotnet_path_time_unix_secs(asm, 0, "GetLastWriteTimeUtc", 2);
         let out_mt1 = asm.alloc_node(CILNode::LdArg(4));
         let st_mt1 = asm.alloc_root(CILRoot::StInd(Box::new((
             out_mt1,
@@ -3366,8 +3555,7 @@ fn insert_dotnet_fs_stat(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             Type::Int(Int::I64),
             false,
         ))));
-        let (store_at1, at1) =
-            dotnet_path_time_unix_secs(asm, 0, "GetLastAccessTimeUtc", 3);
+        let (store_at1, at1) = dotnet_path_time_unix_secs(asm, 0, "GetLastAccessTimeUtc", 3);
         let out_at1 = asm.alloc_node(CILNode::LdArg(5));
         let st_at1 = asm.alloc_root(CILRoot::StInd(Box::new((
             out_at1,
@@ -3375,8 +3563,7 @@ fn insert_dotnet_fs_stat(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             Type::Int(Int::I64),
             false,
         ))));
-        let (store_ct1, ct1) =
-            dotnet_path_time_unix_secs(asm, 0, "GetCreationTimeUtc", 4);
+        let (store_ct1, ct1) = dotnet_path_time_unix_secs(asm, 0, "GetCreationTimeUtc", 4);
         let out_ct1 = asm.alloc_node(CILNode::LdArg(6));
         let st_ct1 = asm.alloc_root(CILRoot::StInd(Box::new((
             out_ct1,
@@ -3423,12 +3610,10 @@ fn insert_dotnet_fs_stat(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
         let fi = asm.alloc_node(CILNode::call(fi_ctor, [path3]));
         let store_fi = asm.alloc_root(CILRoot::StLoc(1, fi));
         let get_len_name = asm.alloc_string("get_Length");
-        let get_len = asm.class_ref(file_info).clone().instance(
-            &[],
-            Type::Int(Int::I64),
-            get_len_name,
-            asm,
-        );
+        let get_len =
+            asm.class_ref(file_info)
+                .clone()
+                .instance(&[], Type::Int(Int::I64), get_len_name, asm);
         let ld_fi = asm.alloc_node(CILNode::LdLoc(1));
         let size_i64 = asm.alloc_node(CILNode::call(get_len, [ld_fi]));
         let size_u64 = asm.int_cast(size_i64, Int::U64, ExtendKind::ZeroExtend);
@@ -3448,8 +3633,7 @@ fn insert_dotnet_fs_stat(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             false,
         ))));
         // *out_mtime/atime/ctime + *out_is_symlink (same as the dir block).
-        let (store_mt3, mt3) =
-            dotnet_path_time_unix_secs(asm, 0, "GetLastWriteTimeUtc", 2);
+        let (store_mt3, mt3) = dotnet_path_time_unix_secs(asm, 0, "GetLastWriteTimeUtc", 2);
         let out_mt3 = asm.alloc_node(CILNode::LdArg(4));
         let st_mt3 = asm.alloc_root(CILRoot::StInd(Box::new((
             out_mt3,
@@ -3457,8 +3641,7 @@ fn insert_dotnet_fs_stat(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             Type::Int(Int::I64),
             false,
         ))));
-        let (store_at3, at3) =
-            dotnet_path_time_unix_secs(asm, 0, "GetLastAccessTimeUtc", 3);
+        let (store_at3, at3) = dotnet_path_time_unix_secs(asm, 0, "GetLastAccessTimeUtc", 3);
         let out_at3 = asm.alloc_node(CILNode::LdArg(5));
         let st_at3 = asm.alloc_root(CILRoot::StInd(Box::new((
             out_at3,
@@ -3466,8 +3649,7 @@ fn insert_dotnet_fs_stat(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             Type::Int(Int::I64),
             false,
         ))));
-        let (store_ct3, ct3) =
-            dotnet_path_time_unix_secs(asm, 0, "GetCreationTimeUtc", 4);
+        let (store_ct3, ct3) = dotnet_path_time_unix_secs(asm, 0, "GetCreationTimeUtc", 4);
         let out_ct3 = asm.alloc_node(CILNode::LdArg(6));
         let st_ct3 = asm.alloc_root(CILRoot::StInd(Box::new((
             out_ct3,
@@ -3864,10 +4046,10 @@ pub(crate) fn build_endpoint(
     let port = asm.alloc_node(CILNode::LdArg(port_arg));
     let port = asm.int_cast(port, Int::I32, ExtendKind::ZeroExtend);
     let ip_endpoint = ClassRef::ip_endpoint(asm);
-    let ep_ctor = asm.class_ref(ip_endpoint).clone().ctor(
-        &[Type::ClassRef(ip_address), Type::Int(Int::I32)],
-        asm,
-    );
+    let ep_ctor = asm
+        .class_ref(ip_endpoint)
+        .clone()
+        .ctor(&[Type::ClassRef(ip_address), Type::Int(Int::I32)], asm);
     asm.alloc_node(CILNode::call(ep_ctor, [addr, port]))
 }
 
@@ -3876,7 +4058,10 @@ pub(crate) fn build_endpoint(
 /// `Connect` / `SendTo`. Needed because the cilly typechecker does not model
 /// class inheritance, so an `IPEndPoint`-typed arg would not match an `EndPoint`
 /// param, and the BCL only exposes those methods on the `EndPoint` base.
-pub(crate) fn endpoint_as_base(asm: &mut Assembly, ip_endpoint_node: Interned<CILNode>) -> Interned<CILNode> {
+pub(crate) fn endpoint_as_base(
+    asm: &mut Assembly,
+    ip_endpoint_node: Interned<CILNode>,
+) -> Interned<CILNode> {
     let endpoint_base = ClassRef::endpoint(asm);
     let base_ty = asm.alloc_type(Type::ClassRef(endpoint_base));
     asm.alloc_node(CILNode::CheckedCast(ip_endpoint_node, base_ty))
@@ -3911,6 +4096,8 @@ pub(crate) fn build_socket(
     let socket = ClassRef::socket(asm);
     let socket_type = Type::ClassRef(ClassRef::socket_type(asm));
     let protocol_type = Type::ClassRef(ClassRef::protocol_type(asm));
+    let sock_type = i32_to_bcl_enum(sock_type, socket_type, asm);
+    let proto = i32_to_bcl_enum(proto, protocol_type, asm);
     let sock_ctor = asm.class_ref(socket).clone().ctor(
         &[Type::ClassRef(address_family), socket_type, protocol_type],
         asm,
@@ -3971,12 +4158,10 @@ pub(crate) fn write_endpoint_out(
     let ep0 = asm.alloc_node(CILNode::LdLoc(ep_local));
     let addr = asm.alloc_node(CILNode::call(get_addr, [ep0]));
     let get_bytes_name = asm.alloc_string("GetAddressBytes");
-    let get_bytes = asm.class_ref(ip_address).clone().instance(
-        &[],
-        byte_arr,
-        get_bytes_name,
-        asm,
-    );
+    let get_bytes = asm
+        .class_ref(ip_address)
+        .clone()
+        .instance(&[], byte_arr, get_bytes_name, asm);
     let bytes = asm.alloc_node(CILNode::call(get_bytes, [addr]));
     let store_bytes = asm.alloc_root(CILRoot::StLoc(bytes_local, bytes));
 
@@ -3996,7 +4181,12 @@ pub(crate) fn write_endpoint_out(
     let marshal = ClassRef::marshal(asm);
     let copy_name = asm.alloc_string("Copy");
     let copy = asm.class_ref(marshal).clone().static_mref(
-        &[byte_arr, Type::Int(Int::I32), Type::Int(Int::ISize), Type::Int(Int::I32)],
+        &[
+            byte_arr,
+            Type::Int(Int::I32),
+            Type::Int(Int::ISize),
+            Type::Int(Int::I32),
+        ],
         Type::Void,
         copy_name,
         asm,
@@ -4012,12 +4202,10 @@ pub(crate) fn write_endpoint_out(
 
     // *out_port = (ushort)ep.get_Port().
     let get_port_name = asm.alloc_string("get_Port");
-    let get_port = asm.class_ref(ip_endpoint).clone().instance(
-        &[],
-        Type::Int(Int::I32),
-        get_port_name,
-        asm,
-    );
+    let get_port =
+        asm.class_ref(ip_endpoint)
+            .clone()
+            .instance(&[], Type::Int(Int::I32), get_port_name, asm);
     let ep1 = asm.alloc_node(CILNode::LdLoc(ep_local));
     let port = asm.alloc_node(CILNode::call(get_port, [ep1]));
     let port_u16 = asm.int_cast(port, Int::U16, ExtendKind::ZeroExtend);
@@ -4042,8 +4230,18 @@ fn insert_dotnet_net(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     insert_dotnet_net_send(asm, patcher);
     insert_dotnet_net_recv_from(asm, patcher);
     insert_dotnet_net_send_to(asm, patcher);
-    insert_dotnet_net_addr(asm, patcher, "rcl_dotnet_net_local_addr", "get_LocalEndPoint");
-    insert_dotnet_net_addr(asm, patcher, "rcl_dotnet_net_peer_addr", "get_RemoteEndPoint");
+    insert_dotnet_net_addr(
+        asm,
+        patcher,
+        "rcl_dotnet_net_local_addr",
+        "get_LocalEndPoint",
+    );
+    insert_dotnet_net_addr(
+        asm,
+        patcher,
+        "rcl_dotnet_net_peer_addr",
+        "get_RemoteEndPoint",
+    );
     insert_dotnet_net_udp_connect(asm, patcher);
     insert_dotnet_net_shutdown(asm, patcher);
     insert_dotnet_net_set_nonblocking(asm, patcher);
@@ -4052,6 +4250,7 @@ fn insert_dotnet_net(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     insert_dotnet_net_close(asm, patcher);
     insert_dotnet_socket_poll(asm, patcher);
     insert_dotnet_eventfd(asm, patcher);
+    insert_dotnet_pipe_pair(asm, patcher);
 }
 
 /// `rcl_dotnet_net_tcp_connect(family, ip_ptr, ip_len, port) -> *mut u8`
@@ -4118,6 +4317,9 @@ fn insert_dotnet_net_socket(asm: &mut Assembly, patcher: &mut MissingMethodPatch
         let af = asm.alloc_node(CILNode::LdArg(0));
         let st = asm.alloc_node(CILNode::LdArg(1));
         let proto = asm.alloc_node(CILNode::LdArg(2));
+        let af = i32_to_bcl_enum(af, Type::ClassRef(address_family), asm);
+        let st = i32_to_bcl_enum(st, socket_type, asm);
+        let proto = i32_to_bcl_enum(proto, protocol_type, asm);
         let sock_ctor = asm.class_ref(socket).clone().ctor(
             &[Type::ClassRef(address_family), socket_type, protocol_type],
             asm,
@@ -4193,7 +4395,11 @@ fn insert_dotnet_net_bind(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
         let br_done = asm.alloc_root(CILRoot::Branch(Box::new((
             5,
             0,
-            Some(BranchCond::Lt(backlog3, zero3, crate::ir::cilroot::CmpKind::Signed)),
+            Some(BranchCond::Lt(
+                backlog3,
+                zero3,
+                crate::ir::cilroot::CmpKind::Signed,
+            )),
         ))));
         let goto_listen = asm.alloc_root(CILRoot::Branch(Box::new((4, 0, None))));
 
@@ -4243,12 +4449,10 @@ fn insert_dotnet_net_accept(asm: &mut Assembly, patcher: &mut MissingMethodPatch
         // c = s.Accept(); store c in local 0.
         let s = handle_to_socket(asm, 0);
         let accept_name = asm.alloc_string("Accept");
-        let accept = asm.class_ref(socket).clone().instance(
-            &[],
-            Type::ClassRef(socket),
-            accept_name,
-            asm,
-        );
+        let accept =
+            asm.class_ref(socket)
+                .clone()
+                .instance(&[], Type::ClassRef(socket), accept_name, asm);
         let conn = asm.alloc_node(CILNode::call(accept, [s]));
         let store_conn = asm.alloc_root(CILRoot::StLoc(0, conn));
 
@@ -4301,12 +4505,10 @@ fn insert_dotnet_net_recv(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
         let s = handle_to_socket(asm, 0);
         let (span, span_ty) = build_byte_span(asm, 1, 2, false);
         let recv_name = asm.alloc_string("Receive");
-        let recv = asm.class_ref(socket).clone().instance(
-            &[span_ty],
-            Type::Int(Int::I32),
-            recv_name,
-            asm,
-        );
+        let recv =
+            asm.class_ref(socket)
+                .clone()
+                .instance(&[span_ty], Type::Int(Int::I32), recv_name, asm);
         let count = asm.alloc_node(CILNode::call(recv, [s, span]));
         let count = asm.int_cast(count, Int::ISize, ExtendKind::SignExtend);
         // WouldBlock fix: a non-blocking Socket.Receive after Socket.Poll says
@@ -4329,12 +4531,10 @@ fn insert_dotnet_net_send(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
         let s = handle_to_socket(asm, 0);
         let (span, span_ty) = build_byte_span(asm, 1, 2, true);
         let send_name = asm.alloc_string("Send");
-        let send = asm.class_ref(socket).clone().instance(
-            &[span_ty],
-            Type::Int(Int::I32),
-            send_name,
-            asm,
-        );
+        let send =
+            asm.class_ref(socket)
+                .clone()
+                .instance(&[span_ty], Type::Int(Int::I32), send_name, asm);
         let count = asm.alloc_node(CILNode::call(send, [s, span]));
         let count = asm.int_cast(count, Int::ISize, ExtendKind::SignExtend);
         let ret = asm.alloc_root(CILRoot::Ret(count));
@@ -4363,10 +4563,10 @@ fn insert_dotnet_net_recv_from(asm: &mut Assembly, patcher: &mut MissingMethodPa
         // seed: EndPoint ep = new IPEndPoint(0L, 0); store in local 0.
         let zero_addr = asm.alloc_node(0_i64);
         let zero_port = asm.alloc_node(0_i32);
-        let ep_ctor = asm.class_ref(ip_endpoint).clone().ctor(
-            &[Type::Int(Int::I64), Type::Int(Int::I32)],
-            asm,
-        );
+        let ep_ctor = asm
+            .class_ref(ip_endpoint)
+            .clone()
+            .ctor(&[Type::Int(Int::I64), Type::Int(Int::I32)], asm);
         let seed = asm.alloc_node(CILNode::call(ep_ctor, [zero_addr, zero_port]));
         // ep local is typed as the base EndPoint (the `ref EndPoint` param type).
         let ep_base_ty = asm.alloc_type(Type::ClassRef(endpoint_base));
@@ -4547,6 +4747,7 @@ fn insert_dotnet_net_shutdown(asm: &mut Assembly, patcher: &mut MissingMethodPat
         let socket_shutdown = Type::ClassRef(ClassRef::socket_shutdown(asm));
         let s = handle_to_socket(asm, 0);
         let how = asm.alloc_node(CILNode::LdArg(1));
+        let how = i32_to_bcl_enum(how, socket_shutdown, asm);
         let shutdown_name = asm.alloc_string("Shutdown");
         let shutdown = asm.class_ref(socket).clone().instance(
             &[socket_shutdown],
@@ -4626,12 +4827,10 @@ fn insert_dotnet_net_nodelay(asm: &mut Assembly, patcher: &mut MissingMethodPatc
         let socket = ClassRef::socket(asm);
         let s = handle_to_socket(asm, 0);
         let get_nodelay_name = asm.alloc_string("get_NoDelay");
-        let get_nodelay = asm.class_ref(socket).clone().instance(
-            &[],
-            Type::Bool,
-            get_nodelay_name,
-            asm,
-        );
+        let get_nodelay =
+            asm.class_ref(socket)
+                .clone()
+                .instance(&[], Type::Bool, get_nodelay_name, asm);
         let v = asm.alloc_node(CILNode::call(get_nodelay, [s]));
         // bool -> i32 (0/1).
         let v = asm.int_cast(v, Int::I32, ExtendKind::ZeroExtend);
@@ -4649,17 +4848,19 @@ fn insert_dotnet_net_close(asm: &mut Assembly, patcher: &mut MissingMethodPatche
         let socket = ClassRef::socket(asm);
         let s = handle_to_socket(asm, 0);
         let dispose_name = asm.alloc_string("Dispose");
-        let dispose = asm.class_ref(socket).clone().instance(
-            &[],
-            Type::Void,
-            dispose_name,
-            asm,
-        );
+        let dispose = asm
+            .class_ref(socket)
+            .clone()
+            .instance(&[], Type::Void, dispose_name, asm);
         let dispose = asm.alloc_root(CILRoot::call(dispose, [s]));
         let (store_gch, free, gc_handle_ty) = free_handle_roots(asm, 0, 0);
         let ret = asm.alloc_root(CILRoot::VoidRet);
         MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![dispose, store_gch, free, ret], 0, None)],
+            blocks: vec![BasicBlock::new(
+                vec![dispose, store_gch, free, ret],
+                0,
+                None,
+            )],
             locals: vec![(Some(asm.alloc_string("gch")), gc_handle_ty)],
         }
     });
@@ -4681,6 +4882,7 @@ fn insert_dotnet_socket_poll(asm: &mut Assembly, patcher: &mut MissingMethodPatc
         let s = handle_to_socket(asm, 0);
         let micros = asm.alloc_node(CILNode::LdArg(1));
         let mode = asm.alloc_node(CILNode::LdArg(2));
+        let mode = i32_to_bcl_enum(mode, select_mode, asm);
         let poll_name = asm.alloc_string("Poll");
         let poll = asm.class_ref(socket).clone().instance(
             &[Type::Int(Int::I32), select_mode],
@@ -4733,6 +4935,9 @@ fn insert_dotnet_eventfd(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
         let af = asm.alloc_node(2_i32); // AddressFamily.InterNetwork
         let st = asm.alloc_node(2_i32); // SocketType.Dgram
         let proto = asm.alloc_node(NET_PROTO_UDP);
+        let af = i32_to_bcl_enum(af, Type::ClassRef(address_family), asm);
+        let st = i32_to_bcl_enum(st, socket_type, asm);
+        let proto = i32_to_bcl_enum(proto, protocol_type, asm);
         let sock_ctor = asm.class_ref(socket).clone().ctor(
             &[Type::ClassRef(address_family), socket_type, protocol_type],
             asm,
@@ -4743,10 +4948,10 @@ fn insert_dotnet_eventfd(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
         // s.Bind(new IPEndPoint(0x0100007F /*127.0.0.1*/, 0)).
         let loopback = asm.alloc_node(0x0100_007F_i64); // 127.0.0.1 (IPAddress long)
         let zero_port = asm.alloc_node(0_i32);
-        let ep_ctor = asm.class_ref(ip_endpoint).clone().ctor(
-            &[Type::Int(Int::I64), Type::Int(Int::I32)],
-            asm,
-        );
+        let ep_ctor = asm
+            .class_ref(ip_endpoint)
+            .clone()
+            .ctor(&[Type::Int(Int::I64), Type::Int(Int::I32)], asm);
         let bind_ep = asm.alloc_node(CILNode::call(ep_ctor, [loopback, zero_port]));
         let bind_ep = endpoint_as_base(asm, bind_ep);
         let bind_name = asm.alloc_string("Bind");
@@ -4804,4 +5009,185 @@ fn insert_dotnet_eventfd(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
             locals: vec![(Some(asm.alloc_string("socket")), sock_ty)],
         }
     });
+}
+
+/// `rcl_dotnet_pipe_pair(out_read, out_write) -> i32` — construct two distinct
+/// non-blocking UDP sockets connected to each other over loopback. This is the
+/// managed transport behind POSIX `pipe`/`pipe2`: unlike duplicating one GCHandle,
+/// each fd owns and closes its own Socket while writes on one endpoint become
+/// readable on the other.
+fn insert_dotnet_pipe_pair(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    dotnet_hook!(asm, patcher, "rcl_dotnet_pipe_pair", |asm| {
+        let socket = ClassRef::socket(asm);
+        let address_family = ClassRef::address_family(asm);
+        let socket_type = Type::ClassRef(ClassRef::socket_type(asm));
+        let protocol_type = Type::ClassRef(ClassRef::protocol_type(asm));
+        let ip_endpoint = ClassRef::ip_endpoint(asm);
+        let endpoint_base = ClassRef::endpoint(asm);
+        let void_ptr = asm.nptr(Type::Void);
+
+        let sock_ctor = asm.class_ref(socket).clone().ctor(
+            &[Type::ClassRef(address_family), socket_type, protocol_type],
+            asm,
+        );
+        let make_socket = |asm: &mut Assembly| {
+            let af = asm.alloc_node(2_i32);
+            let st = asm.alloc_node(2_i32);
+            let proto = asm.alloc_node(NET_PROTO_UDP);
+            let af = i32_to_bcl_enum(af, Type::ClassRef(address_family), asm);
+            let st = i32_to_bcl_enum(st, socket_type, asm);
+            let proto = i32_to_bcl_enum(proto, protocol_type, asm);
+            asm.alloc_node(CILNode::call(sock_ctor, [af, st, proto]))
+        };
+        let first = make_socket(asm);
+        let store_first = asm.alloc_root(CILRoot::StLoc(0, first));
+        let second = make_socket(asm);
+        let store_second = asm.alloc_root(CILRoot::StLoc(1, second));
+
+        let ep_ctor = asm
+            .class_ref(ip_endpoint)
+            .clone()
+            .ctor(&[Type::Int(Int::I64), Type::Int(Int::I32)], asm);
+        let bind_name = asm.alloc_string("Bind");
+        let bind = asm.class_ref(socket).clone().instance(
+            &[Type::ClassRef(endpoint_base)],
+            Type::Void,
+            bind_name,
+            asm,
+        );
+        let bind_socket = |asm: &mut Assembly, local| {
+            let loopback = asm.alloc_node(0x0100_007F_i64);
+            let zero_port = asm.alloc_node(0_i32);
+            let endpoint = asm.alloc_node(CILNode::call(ep_ctor, [loopback, zero_port]));
+            let endpoint = endpoint_as_base(asm, endpoint);
+            let socket = asm.alloc_node(CILNode::LdLoc(local));
+            asm.alloc_root(CILRoot::call(bind, [socket, endpoint]))
+        };
+        let bind_first = bind_socket(asm, 0);
+        let bind_second = bind_socket(asm, 1);
+
+        let get_local_name = asm.alloc_string("get_LocalEndPoint");
+        let get_local = asm.class_ref(socket).clone().instance(
+            &[],
+            Type::ClassRef(endpoint_base),
+            get_local_name,
+            asm,
+        );
+        let connect_name = asm.alloc_string("Connect");
+        let connect = asm.class_ref(socket).clone().instance(
+            &[Type::ClassRef(endpoint_base)],
+            Type::Void,
+            connect_name,
+            asm,
+        );
+        let connect_to = |asm: &mut Assembly, socket_local, peer_local| {
+            let peer = asm.alloc_node(CILNode::LdLoc(peer_local));
+            let peer_endpoint = asm.alloc_node(CILNode::call(get_local, [peer]));
+            let socket = asm.alloc_node(CILNode::LdLoc(socket_local));
+            asm.alloc_root(CILRoot::call(connect, [socket, peer_endpoint]))
+        };
+        let connect_first = connect_to(asm, 0, 1);
+        let connect_second = connect_to(asm, 1, 0);
+
+        let set_blocking_name = asm.alloc_string("set_Blocking");
+        let set_blocking = asm.class_ref(socket).clone().instance(
+            &[Type::Bool],
+            Type::Void,
+            set_blocking_name,
+            asm,
+        );
+        let set_nonblocking = |asm: &mut Assembly, local| {
+            let socket = asm.alloc_node(CILNode::LdLoc(local));
+            let no = asm.alloc_node(false);
+            asm.alloc_root(CILRoot::call(set_blocking, [socket, no]))
+        };
+        let nonblocking_first = set_nonblocking(asm, 0);
+        let nonblocking_second = set_nonblocking(asm, 1);
+
+        let out_type = asm.alloc_type(void_ptr);
+        let out_first = asm.alloc_node(CILNode::LdArg(0));
+        let out_first = asm.alloc_node(CILNode::PtrCast(
+            out_first,
+            Box::new(PtrCastRes::Ptr(out_type)),
+        ));
+        let first_handle = socket_local_to_handle(asm, 0);
+        let write_first = asm.alloc_root(CILRoot::StInd(Box::new((
+            out_first,
+            first_handle,
+            void_ptr,
+            false,
+        ))));
+        let out_second = asm.alloc_node(CILNode::LdArg(1));
+        let out_second = asm.alloc_node(CILNode::PtrCast(
+            out_second,
+            Box::new(PtrCastRes::Ptr(out_type)),
+        ));
+        let second_handle = socket_local_to_handle(asm, 1);
+        let write_second = asm.alloc_root(CILRoot::StInd(Box::new((
+            out_second,
+            second_handle,
+            void_ptr,
+            false,
+        ))));
+        let zero = asm.alloc_node(0_i32);
+        let ret = asm.alloc_root(CILRoot::Ret(zero));
+        let socket_type = asm.alloc_type(Type::ClassRef(socket));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(
+                vec![
+                    store_first,
+                    store_second,
+                    bind_first,
+                    bind_second,
+                    connect_first,
+                    connect_second,
+                    nonblocking_first,
+                    nonblocking_second,
+                    write_first,
+                    write_second,
+                    ret,
+                ],
+                0,
+                None,
+            )],
+            locals: vec![(None, socket_type), (None, socket_type)],
+        }
+    });
+}
+
+#[cfg(test)]
+mod pipe_pair_tests {
+    use super::*;
+    use crate::{Access, MethodDef};
+
+    #[test]
+    fn connected_socket_pair_helper_is_verifier_clean() {
+        let mut asm = Assembly::default();
+        let mut patcher = MissingMethodPatcher::default();
+        insert_dotnet_pipe_pair(&mut asm, &mut patcher);
+
+        let name = asm.alloc_string("rcl_dotnet_pipe_pair");
+        let void_ptr = asm.nptr(Type::Void);
+        let sig = asm.sig([void_ptr, void_ptr], Type::Int(Int::I32));
+        let main_module = *asm.main_module();
+        let mref = asm.new_methodref(
+            main_module,
+            "rcl_dotnet_pipe_pair",
+            sig,
+            MethodKind::Static,
+            vec![],
+        );
+        let body = patcher.get(&name).unwrap()(mref, &mut asm);
+        asm.new_method(MethodDef::new(
+            Access::Public,
+            crate::class::ClassDefIdx(main_module),
+            name,
+            sig,
+            MethodKind::Static,
+            body,
+            vec![None, None],
+        ));
+
+        assert_eq!(asm.typecheck(), 0);
+    }
 }

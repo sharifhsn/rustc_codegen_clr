@@ -1,8 +1,8 @@
-use cilly::Interned;
-use cilly::Const;
 use crate::fn_ctx::MethodCompileCtx;
 use crate::r#type::GetTypeExt;
+use crate::r#type::adt::FieldOffsetIterator;
 use crate::r#type::utilis::ptr_is_fat;
+use cilly::{BinOp, Const, Int, Interned, Type};
 
 use rustc_middle::mir::Place;
 
@@ -56,14 +56,42 @@ fn body_ty_is_by_address<'tcx>(last_ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tc
         | TyKind::Bool
         | TyKind::Char
         | TyKind::FnPtr(..) => false,
-        TyKind::Ref(_, ty, _) | TyKind::RawPtr(ty, _) => {
-            ptr_is_fat(ty, ctx.tcx(), ctx.instance())
-        }
+        TyKind::Ref(_, ty, _) | TyKind::RawPtr(ty, _) => ptr_is_fat(ty, ctx.tcx(), ctx.instance()),
         _ => todo!(
             "TODO: body_ty_is_by_address does not support type {last_ty:?} kind:{kind:?}",
             kind = last_ty.kind()
         ),
     }
+}
+
+/// Computes the address of a projected struct field from rustc's physical layout.
+///
+/// Zero-sized Rust fields have no corresponding CIL field: [`crate::r#type::get_type`] lowers them
+/// to [`Type::Void`] and struct lowering deliberately omits them. A projection may still need the
+/// field's address, both as its final result (`&owner.zst`) and as an intermediate place
+/// (`owner.zst_array[index]`). Those cases must use the Rust layout offset rather than manufacture a
+/// [`cilly::FieldDesc`] for a field that cannot exist in metadata.
+fn projected_field_address<'tcx>(
+    owner_ty: Ty<'tcx>,
+    field_ty: Ty<'tcx>,
+    field_idx: u32,
+    base: Interned<cilly::ir::CILNode>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Interned<cilly::ir::CILNode> {
+    let owner_ty = ctx.monomorphize(owner_ty);
+    let field_ty = ctx.monomorphize(field_ty);
+    let layout = ctx.layout_of(owner_ty);
+    let offset = FieldOffsetIterator::fields((*layout.layout.0).clone())
+        .nth(field_idx as usize)
+        .expect("Field index not in field offset iterator");
+    let byte_ptr = ctx.cast_ptr(base, Type::Int(Int::U8));
+    let at_field = if offset == 0 {
+        byte_ptr
+    } else {
+        ctx.biop(byte_ptr, Const::USize(u64::from(offset)), BinOp::Add)
+    };
+    let lowered_field = ctx.type_from_cache(field_ty);
+    ctx.cast_ptr(at_field, lowered_field)
 }
 
 /// Given a type `deref_ty`, it retuns a set of instructions to get a value behind a pointer to `deref_ty`.

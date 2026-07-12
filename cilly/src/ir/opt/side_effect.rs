@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{bimap::Interned, cilnode::IsPure, Assembly, CILNode};
+use crate::{Assembly, CILNode, bimap::Interned, cilnode::IsPure};
 #[derive(Default)]
 pub struct SideEffectInfoCache {
     side_effects: HashMap<Interned<CILNode>, bool>,
@@ -64,8 +64,8 @@ impl SideEffectInfoCache {
 #[test]
 fn const_no_side_effect() {
     use crate::{
-        hashable::{HashableF32, HashableF64},
         Const,
+        hashable::{HashableF32, HashableF64},
     };
     let consts = [
         true.into(),

@@ -1,7 +1,7 @@
 [package]
 name = "rust_export"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [lib]
 # A .NET class library: the backend emits this as a referenceable .NET assembly (no entrypoint).

@@ -12,7 +12,7 @@ use mycorrhiza::linq::{Expr, Param, TypedPredicate};
 
 struct Dummy;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn linq_combinator_smoke() -> i32 {
     // Each predicate built with its OWN Param::new call -> distinct ParameterExpression
     // instances, exactly the case rebind_param (and thus ParameterRebinder.cs) must handle.

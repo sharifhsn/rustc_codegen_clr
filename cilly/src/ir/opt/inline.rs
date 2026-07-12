@@ -1,7 +1,7 @@
 use super::OptFuel;
 use crate::{
-    bimap::Interned, cilnode::MethodKind, Assembly, CILIter, CILIterElem, CILNode, CILRoot,
-    MethodDef, MethodImpl, MethodRef,
+    Assembly, CILIter, CILIterElem, CILNode, CILRoot, MethodDef, MethodImpl, MethodRef,
+    bimap::Interned, cilnode::MethodKind,
 };
 #[cfg(test)]
 use crate::{BasicBlock, Type};
@@ -168,41 +168,45 @@ fn test_inline() {
     let mut fuel = OptFuel::new(0);
     let val = asm.alloc_node(false);
     let ret = asm.alloc_root(CILRoot::Ret(val));
-    assert!(trivial_inline_node(
-        &MethodDef::new(
-            crate::Access::Extern,
-            asm.main_module(),
-            asm.alloc_string("Hi"),
-            asm.sig([], Type::Void),
-            MethodKind::Static,
-            MethodImpl::MethodBody {
-                blocks: vec![BasicBlock::new(vec![ret], 0, None)],
-                locals: vec![],
-            },
-            vec![],
-        ),
-        &[],
-        &mut fuel,
-        &mut asm,
-    )
-    .is_none());
+    assert!(
+        trivial_inline_node(
+            &MethodDef::new(
+                crate::Access::Extern,
+                asm.main_module(),
+                asm.alloc_string("Hi"),
+                asm.sig([], Type::Void),
+                MethodKind::Static,
+                MethodImpl::MethodBody {
+                    blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+                    locals: vec![],
+                },
+                vec![],
+            ),
+            &[],
+            &mut fuel,
+            &mut asm,
+        )
+        .is_none()
+    );
     let mut fuel = OptFuel::new(1000);
-    assert!(trivial_inline_node(
-        &MethodDef::new(
-            crate::Access::Extern,
-            asm.main_module(),
-            asm.alloc_string("Hi"),
-            asm.sig([], Type::Void),
-            MethodKind::Static,
-            MethodImpl::MethodBody {
-                blocks: vec![BasicBlock::new(vec![ret], 0, None)],
-                locals: vec![],
-            },
-            vec![],
-        ),
-        &[],
-        &mut fuel,
-        &mut asm,
-    )
-    .is_some());
+    assert!(
+        trivial_inline_node(
+            &MethodDef::new(
+                crate::Access::Extern,
+                asm.main_module(),
+                asm.alloc_string("Hi"),
+                asm.sig([], Type::Void),
+                MethodKind::Static,
+                MethodImpl::MethodBody {
+                    blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+                    locals: vec![],
+                },
+                vec![],
+            ),
+            &[],
+            &mut fuel,
+            &mut asm,
+        )
+        .is_some()
+    );
 }

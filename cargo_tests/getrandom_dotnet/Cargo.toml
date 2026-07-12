@@ -1,7 +1,7 @@
 [package]
 name = "getrandom_dotnet"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 # A tiny, reusable shim that forwards `getrandom`'s custom backend to the
 # dotnet PAL's CSPRNG (`rcl_dotnet_random_fill` ->

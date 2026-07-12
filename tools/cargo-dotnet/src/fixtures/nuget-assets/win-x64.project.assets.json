@@ -1,0 +1,51 @@
+{
+  "version": 3,
+  "targets": {
+    "net8.0/win-x64": {
+      "Example.Root/1.0.0": {
+        "type": "package",
+        "dependencies": { "Example.Dependency": "2.0.0" },
+        "compile": { "ref/net8.0/Example.Root.dll": {} },
+        "runtime": { "lib/net8.0/Example.Root.dll": {} },
+        "runtimeTargets": {
+          "runtimes/win-x64/lib/net8.0/Example.Root.dll": { "rid": "win-x64", "assetType": "runtime" },
+          "runtimes/win-x64/native/shared.dll": { "rid": "win-x64", "assetType": "native" },
+          "runtimes/win-x64/lib/net8.0/fr/Shared.resources.dll": { "rid": "win-x64", "assetType": "resources" }
+        }
+      },
+      "Example.Dependency/2.0.0": {
+        "type": "package",
+        "compile": { "ref/net8.0/Example.Dependency.dll": {} },
+        "runtime": { "lib/net8.0/Example.Dependency.dll": {} },
+        "runtimeTargets": {
+          "runtimes/win-x64/native/shared.dll": { "rid": "win-x64", "assetType": "native" },
+          "runtimes/win-x64/lib/net8.0/fr/Shared.resources.dll": { "rid": "win-x64", "assetType": "resources" }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "Example.Root/1.0.0": { "type": "package", "path": "example.root/1.0.0" },
+    "Example.Dependency/2.0.0": { "type": "package", "path": "example.dependency/2.0.0" }
+  },
+  "packageFolders": { "__PACKAGE_ROOT__/": {} },
+  "runtimes": { "win-x64": [ "win", "any" ] },
+  "cargoDotnetExpected": {
+    "requestedRid": "win-x64",
+    "assets": [
+      { "owner": "Example.Root/1.0.0", "kind": "compile", "path": "ref/net8.0/Example.Root.dll" },
+      { "owner": "Example.Root/1.0.0", "kind": "runtime", "path": "lib/net8.0/Example.Root.dll" },
+      { "owner": "Example.Root/1.0.0", "kind": "runtime", "rid": "win-x64", "path": "runtimes/win-x64/lib/net8.0/Example.Root.dll" },
+      { "owner": "Example.Root/1.0.0", "kind": "native", "rid": "win-x64", "path": "runtimes/win-x64/native/shared.dll" },
+      { "owner": "Example.Root/1.0.0", "kind": "resource", "rid": "win-x64", "path": "runtimes/win-x64/lib/net8.0/fr/Shared.resources.dll" },
+      { "owner": "Example.Dependency/2.0.0", "kind": "compile", "path": "ref/net8.0/Example.Dependency.dll" },
+      { "owner": "Example.Dependency/2.0.0", "kind": "runtime", "path": "lib/net8.0/Example.Dependency.dll" },
+      { "owner": "Example.Dependency/2.0.0", "kind": "native", "rid": "win-x64", "path": "runtimes/win-x64/native/shared.dll" },
+      { "owner": "Example.Dependency/2.0.0", "kind": "resource", "rid": "win-x64", "path": "runtimes/win-x64/lib/net8.0/fr/Shared.resources.dll" }
+    ],
+    "collisions": [
+      { "path": "runtimes/win-x64/native/shared.dll", "owners": [ "Example.Root/1.0.0", "Example.Dependency/2.0.0" ] },
+      { "path": "runtimes/win-x64/lib/net8.0/fr/Shared.resources.dll", "owners": [ "Example.Root/1.0.0", "Example.Dependency/2.0.0" ] }
+    ]
+  }
+}

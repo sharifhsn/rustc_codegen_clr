@@ -35,5 +35,12 @@ Check("g.greet(\"World\")", g.greet("World"), "Hi, World! Hi, World! ");
 Check("g.add_bonus(5)", g.add_bonus(5), 7);
 Check("g.add_bonus(null)", g.add_bonus(null), 2);
 
-Console.WriteLine(pass == total ? "PASS" : $"FAIL ({pass}/{total})");
-return pass == total ? 0 : 1;
+if (pass == 6 && total == 6)
+{
+    Console.WriteLine("PASS");
+    Console.WriteLine("== cd_export_ergonomics done ==");
+    return 0;
+}
+
+Console.WriteLine($"FAIL ({pass}/{total}, expected 6/6)");
+return 1;

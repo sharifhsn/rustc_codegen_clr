@@ -236,7 +236,7 @@ is gone for generated methods.)
 to *managed* CIL, calling Rust from C# is **not** native FFI — a Rust fn is already a `public static`
 method on the `MainModule` class. WF-7 made a Rust **library** crate (`crate-type=["cdylib"]`) emit a
 real **.NET class-library assembly** (named after the crate, no entrypoint), so C# references it and
-calls its `#[no_mangle]` functions as ordinary managed methods. Proven end-to-end:
+calls its `#[unsafe(no_mangle)]` functions as ordinary managed methods. Proven end-to-end:
 `cargo_tests/rust_export` (a Rust lib) + `cargo_tests/rust_export_cs` (a C# program) — C# calls
 `rust_add`/`rust_mul`/`rust_fib`/`rust_add_f64` on .NET, all correct.
 
@@ -274,7 +274,7 @@ byte-identical to before, leaving `interop_method_sample` (Rust→.NET String in
 `::stable` gate (426/12 baseline, no regressions).
 Consumer guide: `docs/INTEROP_CSHARP.md`. Zero backend code changed for J3 — only `feasibility/` shell
 (the `cargo dotnet` lib-artifact branch) + the new probe crate. The enabling backend changes (from WF-7):
-- `#[no_mangle]` → `Access::Extern` (`src/assembly.rs`), making exports **dead-code-elimination roots**
+- `#[unsafe(no_mangle)]` → `Access::Extern` (`src/assembly.rs`), making exports **dead-code-elimination roots**
   — essential, since a library has no entrypoint to root the call graph (without it the whole API is
   eliminated).
 - Library output (`cilly/src/ir/il_exporter/mod.rs` + `bin/linker/main.rs`): for `is_lib`, the .NET
@@ -490,7 +490,7 @@ The sibling `cast_ptr_to` (takes the full pointer type) is the correct helper. S
 - ✅ **Library crate-type emits a .NET assembly** (was native ELF). For `is_lib`, `ILExporter::export`
   writes the assembly to the requested `-o` path (not `<stem>.exe`) and the linker builds **no native
   launcher** (`cilly/src/ir/il_exporter/mod.rs`, `bin/linker/main.rs`). Assembly named after the crate
-  (was `_`). `#[no_mangle]` → `Access::Extern` (`src/assembly.rs`) so exports are DCE **roots** (a
+  (was `_`). `#[unsafe(no_mangle)]` → `Access::Extern` (`src/assembly.rs`) so exports are DCE **roots** (a
   library has no entrypoint root). See §6.
 - ✅ **`gettid` weak static** (`src/operand/constant.rs::get_fn_from_static_name`): was
   an unsupported `todo!`; added an arm + `LIBC_FNS` entry (PInvoke to host libc), like `pidfd_getpid`.
@@ -571,7 +571,7 @@ direction (C# imports a Rust library and calls its functions, §6). What remains
   `UnwindTerminate`→`FailFast`; real `#[track_caller]` location. Managed-frames-only per §7.
 - **WF-7** `.NET→Rust` direction — *the linchpin.* **P1+P2+P3-core DONE.** P1 (`rust_export[_cs]`): a
   Rust **library** crate compiles to a referenceable .NET class-library assembly, C# calls its
-  `#[no_mangle]` functions as managed methods. P2: **string marshalling** both ways (UTF-8 `(ptr,len)`).
+  `#[unsafe(no_mangle)]` functions as managed methods. P2: **string marshalling** both ways (UTF-8 `(ptr,len)`).
   **P3 (`rust_typedef`): `dotnet_typedef!` + the revived `src/comptime.rs` now make a Rust declaration
   emit a real managed class** (field + inheritance + virtual method aliasing a Rust fn — verified by
   `ikdasm`, §6). The reframe — Rust→managed-CIL means this is *not* native FFI — collapsed most of the

@@ -1,13 +1,13 @@
 use super::{PlaceTy, pointed_type};
-use crate::place::{body_ty_is_by_address, deref_op};
-use cilly::{BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, Type};
 use crate::fn_ctx::MethodCompileCtx;
+use crate::place::{body_ty_is_by_address, deref_op};
 use crate::r#type::{
     GetTypeExt,
     adt::{FieldOffsetIterator, field_descrptor, variant_field_desc},
     fat_ptr_to,
     utilis::ptr_is_fat,
 };
+use cilly::{BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, Type};
 use rustc_middle::mir::{Local, PlaceElem};
 use rustc_middle::ty::{Ty, TyKind};
 pub fn local_body<'tcx>(
@@ -38,12 +38,21 @@ fn body_field<'a>(
                 ptr_is_fat(field_type, ctx.tcx(), ctx.instance()),
             ) {
                 (false, false) => {
+                    // A ZST owner/field has no physical CIL ClassDef/field. This can occur in the
+                    // middle of a projection, e.g. `Dim<[usize; 0]>.0[index]`: preserve the place as
+                    // its layout-derived address so the following projection can continue without
+                    // asking `field_descrptor` to turn `Type::Void` into a class owner.
+                    let owner_type = ctx.type_from_cache(curr_type);
+                    let lowered_field = ctx.type_from_cache(field_type);
+                    if owner_type == Type::Void || lowered_field == Type::Void {
+                        let addr = super::projected_field_address(
+                            curr_type, field_type, field_idx, node, ctx,
+                        );
+                        return (field_type.into(), addr);
+                    }
                     let field_desc = field_descrptor(curr_type, field_idx, ctx);
                     if body_ty_is_by_address(field_type, ctx) {
-                        (
-                            (field_type).into(),
-                            ctx.ld_field_addr(node, field_desc),
-                        )
+                        ((field_type).into(), ctx.ld_field_addr(node, field_desc))
                     } else {
                         ((field_type).into(), ctx.ld_field(node, field_desc))
                     }
@@ -89,11 +98,10 @@ fn body_field<'a>(
                     // The previous code only handled an unsized field at field index 0 (offset 0)
                     // via `assert_eq!(field_idx, 0)`, which rejected every DST with a sized
                     // prefix before the tail.
-                    let offset = FieldOffsetIterator::fields(
-                        ctx.layout_of(curr_type).layout.0.0.clone(),
-                    )
-                    .nth(field_idx as usize)
-                    .expect("Field index not in field offset iterator");
+                    let offset =
+                        FieldOffsetIterator::fields(ctx.layout_of(curr_type).layout.0.0.clone())
+                            .nth(field_idx as usize)
+                            .expect("Field index not in field offset iterator");
                     let curr_type_fat_ptr = ctx
                         .type_from_cache(Ty::new_ptr(
                             ctx.tcx(),
@@ -212,13 +220,9 @@ pub fn place_elem_body<'tcx>(
                 (pointed.into(), deref_op(pointed.into(), ctx, node))
             }
         }
-        PlaceElem::Field(field_idx, field_ty) => body_field(
-            curr_type,
-            ctx,
-            field_idx.as_u32(),
-            *field_ty,
-            node,
-        ),
+        PlaceElem::Field(field_idx, field_ty) => {
+            body_field(curr_type, ctx, field_idx.as_u32(), *field_ty, node)
+        }
         PlaceElem::Downcast(_, variant) => {
             let curr_type = curr_ty
                 .as_ty()
@@ -241,7 +245,7 @@ pub fn place_elem_body<'tcx>(
             node,
             *index,
         ),
-      
+
         PlaceElem::ConstantIndex {
             offset,
             min_length: _,

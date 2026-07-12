@@ -360,7 +360,10 @@ impl std::fmt::Display for BackendConfigError {
                 "boolean environment variable {variable} has invalid value `{value}`; expected 0/1 or false/true"
             ),
             Self::InvalidUnicode { variable } => {
-                write!(formatter, "environment setting {variable} is not valid Unicode")
+                write!(
+                    formatter,
+                    "environment setting {variable} is not valid Unicode"
+                )
             }
             Self::ConflictingOutputModes { enabled } => write!(
                 formatter,

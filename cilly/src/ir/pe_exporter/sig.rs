@@ -395,8 +395,12 @@ mod tests {
 
         let string_name = asm.alloc_string("System.String");
         let string_asm = asm.alloc_string("System.Runtime");
-        let string_cref =
-            asm.alloc_class_ref(ClassRef::new(string_name, Some(string_asm), false, [].into()));
+        let string_cref = asm.alloc_class_ref(ClassRef::new(
+            string_name,
+            Some(string_asm),
+            false,
+            [].into(),
+        ));
         assert_eq!(
             encode(Type::ClassRef(string_cref), &mut asm),
             [ET_STRING],
@@ -404,8 +408,12 @@ mod tests {
         );
 
         let object_name = asm.alloc_string("System.Object");
-        let object_cref =
-            asm.alloc_class_ref(ClassRef::new(object_name, Some(string_asm), false, [].into()));
+        let object_cref = asm.alloc_class_ref(ClassRef::new(
+            object_name,
+            Some(string_asm),
+            false,
+            [].into(),
+        ));
         assert_eq!(
             encode(Type::ClassRef(object_cref), &mut asm),
             [ET_OBJECT],
@@ -415,10 +423,18 @@ mod tests {
         // A DIFFERENT class named "System.String" nowhere near the real BCL type (e.g. a
         // VALUETYPE, or one with generics) must NOT collapse — the fallback is scoped to
         // `!is_valuetype && generics().is_empty()`, matching `il_exporter`'s own guard exactly.
-        let valuetype_string_cref =
-            asm.alloc_class_ref(ClassRef::new(string_name, Some(string_asm), true, [].into()));
+        let valuetype_string_cref = asm.alloc_class_ref(ClassRef::new(
+            string_name,
+            Some(string_asm),
+            true,
+            [].into(),
+        ));
         let encoded = encode(Type::ClassRef(valuetype_string_cref), &mut asm);
-        assert_ne!(encoded, vec![ET_STRING], "a VALUETYPE must not collapse to ET_STRING");
+        assert_ne!(
+            encoded,
+            vec![ET_STRING],
+            "a VALUETYPE must not collapse to ET_STRING"
+        );
         assert_eq!(encoded[0], ET_VALUETYPE);
     }
 
@@ -430,10 +446,7 @@ mod tests {
         let void = asm.alloc_type(Type::Void);
         assert_eq!(encode(Type::Ptr(void), &mut asm), [ET_PTR, ET_VOID]);
         let ptr = asm.alloc_type(Type::Ptr(inner));
-        assert_eq!(
-            encode(Type::Ref(ptr), &mut asm),
-            [ET_BYREF, ET_PTR, ET_U1]
-        );
+        assert_eq!(encode(Type::Ref(ptr), &mut asm), [ET_BYREF, ET_PTR, ET_U1]);
     }
 
     #[test]
@@ -494,7 +507,10 @@ mod tests {
 
         let mut second = Vec::new();
         encode_type(Type::SIMDVector(vec2xi64), &mut asm, &mut mb, &mut second);
-        assert_eq!(first, second, "the resolver's cache must dedupe the repeat lookup");
+        assert_eq!(
+            first, second,
+            "the resolver's cache must dedupe the repeat lookup"
+        );
     }
 
     #[test]
@@ -505,7 +521,10 @@ mod tests {
             [ET_VAR, 0]
         );
         assert_eq!(
-            encode(Type::PlatformGeneric(1, GenericKind::MethodGeneric), &mut asm),
+            encode(
+                Type::PlatformGeneric(1, GenericKind::MethodGeneric),
+                &mut asm
+            ),
             [ET_VAR, 1],
             "MethodGeneric renders as !N (VAR) — the type_il naming crossover"
         );
@@ -563,7 +582,12 @@ mod tests {
         assert_eq!(out, [SIG_LOCALS, 2, ET_I4, ET_STRING]);
 
         let mut out = Vec::new();
-        encode_method_spec_sig(&[Type::Int(Int::I32)], &mut asm, &mut StubResolver, &mut out);
+        encode_method_spec_sig(
+            &[Type::Int(Int::I32)],
+            &mut asm,
+            &mut StubResolver,
+            &mut out,
+        );
         assert_eq!(out, [SIG_GENERICINST_METHOD, 1, ET_I4]);
     }
 
@@ -574,12 +598,24 @@ mod tests {
     fn property_sig_encodes_property_hasthis_paramcount_and_type() {
         let mut asm = Assembly::default();
         let mut out = Vec::new();
-        encode_property_sig(true, Type::Int(Int::I32), &mut asm, &mut StubResolver, &mut out);
+        encode_property_sig(
+            true,
+            Type::Int(Int::I32),
+            &mut asm,
+            &mut StubResolver,
+            &mut out,
+        );
         assert_eq!(out, [SIG_PROPERTY | SIG_HASTHIS, 0x00, ET_I4]);
 
         // A managed-typed (System.String) property uses the dedicated ET_STRING element type.
         let mut out = Vec::new();
-        encode_property_sig(true, Type::PlatformString, &mut asm, &mut StubResolver, &mut out);
+        encode_property_sig(
+            true,
+            Type::PlatformString,
+            &mut asm,
+            &mut StubResolver,
+            &mut out,
+        );
         assert_eq!(out, [SIG_PROPERTY | SIG_HASTHIS, 0x00, ET_STRING]);
 
         // The (currently-unreached) static shape omits HASTHIS — pinned so a future static

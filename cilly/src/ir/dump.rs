@@ -147,12 +147,7 @@ pub fn dump_method(def: &MethodDef, asm: &mut Assembly) -> String {
         let nm = lname
             .map(|n| format!("  // {}", &asm[n]))
             .unwrap_or_default();
-        let _ = writeln!(
-            out,
-            "║   L{i}: {}{}",
-            type_readable(asm[*ltpe], asm),
-            nm
-        );
+        let _ = writeln!(out, "║   L{i}: {}{}", type_readable(asm[*ltpe], asm), nm);
     }
     // Body
     let Some(blocks) = def.blocks(asm).map(<[_]>::to_vec) else {

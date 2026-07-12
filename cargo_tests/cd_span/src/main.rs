@@ -7,7 +7,7 @@
 #![feature(adt_const_params, unsized_const_params)]
 #![allow(internal_features, incomplete_features, dead_code)]
 
-use mycorrhiza::gen;
+use mycorrhiza::r#gen;
 use mycorrhiza::intrinsics::{
     rustc_clr_interop_generic_call1, rustc_clr_interop_generic_call2,
     rustc_clr_interop_generic_ctor2, RustcCLRInteropByRef, RustcCLRInteropManagedGenericStruct, RustcCLRInteropTypeGeneric,
@@ -38,7 +38,7 @@ fn span_len(s: &SpanI32) -> i32 {
 // Span<T>.Fill(T value) -> void — value-type instance method taking `!0`.
 fn span_fill(s: &SpanI32, value: i32) {
     rustc_clr_interop_generic_call2::<
-        CORELIB, SPAN, true, "Fill", 1, (i32,), ((), gen!(0)), (), &SpanI32, i32,
+        CORELIB, SPAN, true, "Fill", 1, (i32,), ((), r#gen!(0)), (), &SpanI32, i32,
     >(s, value)
 }
 // Span<T>.Clear() -> void — zero every element.
@@ -247,6 +247,7 @@ fn main() -> std::process::ExitCode {
         Console::writeln_u64(PASS as u64);
         Console::writeln_u64(TOTAL as u64);
         if PASS == TOTAL {
+            println!("== cd_span done ==");
             std::process::ExitCode::SUCCESS
         } else {
             std::process::ExitCode::FAILURE

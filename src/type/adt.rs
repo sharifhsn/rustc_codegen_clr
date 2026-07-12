@@ -1,7 +1,7 @@
+use crate::fn_ctx::MethodCompileCtx;
 use crate::r#type::{GetTypeExt, utilis::simple_tuple};
 use cilly::{Assembly, FieldDesc, Float, Int, Type, bimap::Interned};
 use rustc_abi::{FieldIdx, FieldsShape, Layout, LayoutData, VariantIdx, Variants};
-use crate::fn_ctx::MethodCompileCtx;
 use rustc_middle::ty::List;
 use rustc_middle::ty::{AdtDef, CoroutineArgsExt, GenericArg, Ty, TyKind};
 pub fn variant_offsets(_: AdtDef, layout: Layout, vidix: VariantIdx) -> FieldOffsetIterator {

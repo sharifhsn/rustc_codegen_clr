@@ -1,0 +1,10 @@
+[package]
+name = "rcl-private-registry-probe"
+version = "0.1.0"
+edition = "2021"
+publish = true
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]

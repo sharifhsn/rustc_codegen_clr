@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 use crate::IString;
 
 use super::{
+    CILNode, ClassRef, Float, Int, Type,
     bimap::Interned,
     hashable::{HashableF32, HashableF64},
-    CILNode, ClassRef, Float, Int, Type,
 };
 
 #[derive(PartialEq, Eq, Copy, Clone, Debug, Hash, Serialize, Deserialize)]

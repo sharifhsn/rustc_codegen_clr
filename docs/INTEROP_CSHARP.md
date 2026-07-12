@@ -47,13 +47,13 @@ produces a `.nupkg` you can `<PackageReference>` from a local feed. See
 
 ## 1. Write the Rust library
 
-Make a `cdylib` crate. Export functions with `#[no_mangle] pub extern "C"`:
+Make a `cdylib` crate. Export functions with `#[unsafe(no_mangle)] pub extern "C"`:
 
 ```toml
 # Cargo.toml
 [package]
 name = "cd_interop"
-edition = "2021"            # 2021, not 2024 (the pinned nightly's default for this flow)
+edition = "2024"
 version = "0.1.0"
 
 [lib]
@@ -64,11 +64,11 @@ crate-type = ["cdylib"]     # tells cargo dotnet to emit a referenceable assembl
 
 ```rust
 // src/lib.rs
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn rust_add(a: i32, b: i32) -> i32 { a + b }
 ```
 
-Why `#[no_mangle]`: it gives each export a **stable, un-mangled name** AND (via the backend) marks it
+Why `#[unsafe(no_mangle)]`: it gives each export a **stable, un-mangled name** AND (via the backend) marks it
 `Access::Extern`, which makes it a dead-code-elimination *root*. A library has no entrypoint to keep
 its API alive, so without this the exports would be stripped. No `main` also means the `std` runtime
 tail (`lang_start`) is unreachable and is DCE'd — which is why an I/O-free, panic-free library emits

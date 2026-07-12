@@ -1,6 +1,6 @@
 use cilly::{
     IString,
-    {asm::MissingMethodPatcher, Assembly, CILNode, CILRoot, MethodRef, Type},
+    {Assembly, CILNode, CILRoot, MethodRef, Type, asm::MissingMethodPatcher},
 };
 
 pub fn call_alias(
@@ -14,8 +14,7 @@ pub fn call_alias(
         Box::new(move |original, asm| {
             let method_ref = asm.alloc_methodref(call.clone());
             let inputs: Box<[_]> = asm[call.sig()].inputs().into();
-            let original_inputs: Box<[_]> =
-                asm[asm[original].sig()].inputs().into();
+            let original_inputs: Box<[_]> = asm[asm[original].sig()].inputs().into();
             assert_eq!(
                 inputs.len(),
                 original_inputs.len(),

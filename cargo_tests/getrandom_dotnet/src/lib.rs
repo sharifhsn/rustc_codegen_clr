@@ -43,7 +43,7 @@
 //!
 //! ```ignore
 //! /// getrandom 0.3/0.4 custom backend -> dotnet PAL CSPRNG.
-//! #[no_mangle]
+//! #[unsafe(no_mangle)]
 //! unsafe extern "Rust" fn __getrandom_v03_custom(
 //!     dest: *mut u8,
 //!     len: usize,

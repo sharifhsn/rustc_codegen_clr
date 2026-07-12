@@ -3,8 +3,8 @@ use std::ops::{Deref, DerefMut};
 use crate::IString;
 
 use super::{
-    basic_block::BlockId, bimap::Interned, method::LocalId, Assembly, BasicBlock, IntoAsmIndex,
-    MethodDef, MethodImpl, Type,
+    Assembly, BasicBlock, IntoAsmIndex, MethodDef, MethodImpl, Type, basic_block::BlockId,
+    bimap::Interned, method::LocalId,
 };
 
 pub struct MethodBuilder<'asm> {
@@ -27,7 +27,10 @@ impl DerefMut for MethodBuilder<'_> {
 impl MethodBuilder<'_> {
     pub fn new_block(&mut self) -> BlockId {
         let MethodImpl::MethodBody { blocks, locals: _ } = self.def.implementation_mut() else {
-            panic!("MethodBuilder cannot append blocks to a canonical RegionBody: cleanup block ids and exception-region associations require explicit construction. Body: {:?}",self.def.implementation());
+            panic!(
+                "MethodBuilder cannot append blocks to a canonical RegionBody: cleanup block ids and exception-region associations require explicit construction. Body: {:?}",
+                self.def.implementation()
+            );
         };
         let block_id: BlockId = blocks.len().try_into().expect("Block cap exceeded!");
         blocks.push(BasicBlock::new(vec![], block_id, None));
@@ -43,7 +46,10 @@ impl MethodBuilder<'_> {
         let tpe = tpe.into_idx(self);
         let locals = match self.def.implementation_mut() {
             MethodImpl::MethodBody { locals, .. } | MethodImpl::RegionBody { locals, .. } => locals,
-            _ => panic!("Attempted to add a local variable a method with an invalid or unresolved body:{:?},",self.def.implementation()),
+            _ => panic!(
+                "Attempted to add a local variable a method with an invalid or unresolved body:{:?},",
+                self.def.implementation()
+            ),
         };
         let new_local = locals.len();
         locals.push((name, tpe));

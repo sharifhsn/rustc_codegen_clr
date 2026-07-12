@@ -1,7 +1,7 @@
-use cilly::FnSig;
-use rustc_abi::{CanonAbi, ExternAbi as TargetAbi};
 use crate::fn_ctx::MethodCompileCtx;
 use crate::r#type::get_type;
+use cilly::FnSig;
+use rustc_abi::{CanonAbi, ExternAbi as TargetAbi};
 use rustc_middle::ty::{Instance, List, PseudoCanonicalInput, TyKind};
 /// A resolved function signature plus the ABI-level call-site adjustments the caller must apply.
 /// `sig` is the plain CIL signature; `split_last_tuple` is set when the source ABI is `RustCall`
@@ -27,9 +27,9 @@ impl CallInfo {
             // Bind and surface the layout/ABI error instead of swallowing it — `fn_abi_of_instance`
             // only fails on a layout-computation error (`FnAbiError::Layout`), which should be a
             // loud, informative compiler-internal abort, not a bare `todo!()`.
-            Err(error) => rustc_middle::bug!(
-                "`fn_abi_of_instance` failed for {function:?}: {error:?}"
-            ),
+            Err(error) => {
+                rustc_middle::bug!("`fn_abi_of_instance` failed for {function:?}: {error:?}")
+            }
         };
         let conv = fn_abi.conv;
         // CIL is calling-convention-agnostic: every call lowers to a CIL `call`/`callvirt` using

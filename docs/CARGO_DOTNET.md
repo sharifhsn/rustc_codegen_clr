@@ -10,6 +10,11 @@ the codegen backend internals — those live in [docs/ARCHITECTURE.md](ARCHITECT
 > command supplies the .NET target, `build-std` with the real .NET PAL, the codegen backend + linker,
 > and auto-applies the crate-overlay registry so syscall-using deps (`mio`/`socket2`/`tokio`) just work.
 
+> **Host support:** this release supports cargo-dotnet on Linux and macOS. Operational commands fail
+> before setup/build/test/package/publish work on Windows, pending Windows acceptance. This is a
+> host-tooling boundary only; it does not assert a target or managed-runtime restriction. Help,
+> version, scaffolding, diagnostics, and read-only metadata behavior remain available.
+
 ---
 
 ## 1. What it is
@@ -18,9 +23,11 @@ the codegen backend internals — those live in [docs/ARCHITECTURE.md](ARCHITECT
 once it is on `PATH`, `cargo dotnet …` works. It is a **`cargo install`-able clap Rust binary**
 ([`tools/cargo-dotnet/`](../tools/cargo-dotnet)) that owns the **entire native pipeline in pure Rust** —
 the CLI + cargo-subcommand convention + standard-flag passthrough, AND the inner build/run/pack: it
-injects the dotnet PAL into `rust-src` (a declarative, anchor-based, unit-tested injection engine — see
+provisions a content-addressed private sysroot and injects the dotnet PAL into its private
+`rust-src` (a declarative, anchor-based, unit-tested injection engine — see
 [`src/palinject.rs`](../tools/cargo-dotnet/src/palinject.rs)), sets the backend RUSTFLAGS, applies the
-[`dotnet_overlays`](../dotnet_overlays/README.md) registry (typed `toml`), patches the libc registry,
+[`dotnet_overlays`](../dotnet_overlays/README.md) registry through an explicit build-local Cargo
+config (typed `toml`), patches libc only in cargo-dotnet's private Cargo home,
 runs `build-std`, locates the artifact (typed `serde_json`), and runs the apphost or assembles a NuGet
 `.nupkg` (the `zip` crate). It shells out only to the *external tools* it must — `cargo`/`rustc`,
 the `dotnet` apphost, the cilly linker — exactly as any build tool does. **`ilasm` is not one of
@@ -294,8 +301,9 @@ satisfied (or re-done with `--force`):
    to `~/.cargo/bin/cargo-dotnet`, so `cargo dotnet …` works as a cargo subcommand. (It falls back to
    copying the bash script only if the crate or a host cargo is unavailable.) The binary is self-contained
    and survives the repo being moved/deleted; it self-locates `CARGO_DOTNET_HOME` for everything else.
-6. **rust-src PAL injection** — runs the per-toolchain `rust-src` PAL injection once, sourced from the
-   install home, to fail-fast (verifies `rust-src` is writable and every arm applies).
+6. **Private sysroot PAL injection** — provisions the content-addressed private sysroot, sourced from
+   the install home, and applies every PAL arm there as a fail-fast setup check. Rustup's ambient
+   `rust-src` remains unchanged.
 
 Flags: `--from-repo <path>` (default: the checkout `setup` is run from), `--home <dir>`
 (default `CARGO_DOTNET_HOME`), `--toolchain <name>`, `--skip-toolchain` / `--skip-dotnet` /
@@ -317,17 +325,19 @@ $CARGO_DOTNET_HOME/
   bin/
     librustc_codegen_clr.<dylib|so|dll>  # the codegen backend (host-native)
     linker[.exe]                         # the cilly linker
-  target/x86_64-unknown-dotnet.json      # the target spec (CIL is arch-agnostic — unchanged)
-  dotnet_pal/                            # copy of the repo PAL arms (the rust-src injection source)
+  target/x86_64-unknown-dotnet.json      # target spec; current layout contract is 64-bit
+  dotnet_pal/                            # copy of the repo PAL arms (private-sysroot injection source)
   dotnet_overlays/                       # copy of the overlay registry (mio/socket2/tokio + REGISTRY.toml)
 ```
 
 The installed front-end self-locates the home, detects host OS (`.dylib`/`.so`/`.dll`), self-heals
 `dotnet` onto PATH from `$HOME/.dotnet` if needed, and runs the **pure-Rust native pipeline** against the
-current crate dir — **the default backend is `native`** (no Docker, no bash core). Every path (the
-generated `.cargo/config.toml`, the backend dylib, the PAL source) resolves into `CARGO_DOTNET_HOME`,
-never the repo. (Verified: with both the repo AND `feasibility/_cargo_dotnet_core.sh` physically absent,
-an external crate still builds, runs, and packs.)
+current crate dir — **the default backend is `native`** (no Docker, no bash core). Generated overlay
+configuration lives under cargo-dotnet's private Cargo cache and is passed via Cargo's `--config`;
+user-owned `.cargo/config.toml` is preserved. Private sysroots live under
+`$CARGO_DOTNET_HOME/sysroots/` and the isolated registry lives under the cargo-dotnet cache. (Verified:
+with both the repo AND `feasibility/_cargo_dotnet_core.sh` physically absent, an external crate still
+builds, runs, and packs.)
 
 > **No `CD_*` env seam.** The old design threaded ~13 `CD_*` environment variables (CD_REPO,
 > CD_BACKEND_DYLIB, CD_LINKER, CD_TARGET_SPEC, …) from the Rust front-end into the bash core. Those are
@@ -355,11 +365,10 @@ tools see it too.)
   self-contained `target_os="dotnet"` backend arm that calls the PAL CSPRNG). So `rand`/`uuid`/`ahash`
   and any getrandom user just build — no custom symbol/macro/feature, no `getrandom_dotnet` dep, and
   no `--cfg getrandom_backend="custom"` RUSTFLAG (removed). See `dotnet_overlays/README.md`.
-- **rust-src is a shared, per-toolchain mutation.** The PAL injection patches the *toolchain's*
-  `rust-src` in place. Every arm is `#[cfg(target_os = "dotnet")]`-gated, so it is inert for any
-  non-dotnet build under that nightly — but it **is** a global side effect (the install is not fully
-  hermetic; it depends on and writes into the rustup toolchain). This is pre-existing repo behaviour,
-  not new to the installed tool.
+- **Private build stores.** Native builds compile against a content-addressed private sysroot and a
+  cargo-dotnet-owned Cargo home. They do not patch rustup's ambient `rust-src` or the user's ambient
+  Cargo registry. A cross-process lock remains as a conservative migration barrier while cache
+  corruption/parallel-build testing is expanded.
 - **After a repo update**, re-run `cargo dotnet setup --from-repo <path> --force` to rebuild the
   backend and refresh the install home.
 
@@ -380,7 +389,7 @@ Write a normal crate — a `Cargo.toml` and a `src/main.rs`, nothing else:
 [package]
 name = "hello_dotnet"
 version = "0.1.0"
-edition = "2021"            # 2021, not 2024 (the pinned nightly's default for this flow)
+edition = "2024"
 
 [dependencies]
 
@@ -446,9 +455,11 @@ upstream-byte-identical except the lines marked `// DOTNET PAL`.
 
 **Auto-apply (you do nothing):** on each build, the pipeline core reads `dotnet_overlays/REGISTRY.toml`,
 finds every overlay whose crate name + version appears in your `Cargo.lock` (direct *or* transitive),
-and regenerates your project's `.cargo/config.toml` with a top-level `paths = [ … ]` override pointing
-at the overlay dirs. `paths` is keyed by crate **name** and is graph-wide, so one entry covers both a
-direct `mio` and `mio`-under-`tokio`. It needs **zero** edits to your tracked `Cargo.toml`. On a
+and writes a build-local Cargo config under cargo-dotnet's private cache with a top-level
+`paths = [ … ]` override pointing at the overlay dirs. The config is passed explicitly with
+`--config`; a user-owned `.cargo/config.toml` is never replaced. `paths` is keyed by crate
+**name** and is graph-wide, so one entry covers both a direct `mio` and `mio`-under-`tokio`. It
+needs **zero** edits to your tracked `Cargo.toml`. On a
 name-match with a version *mismatch*, it warns loudly and skips (no silent "overlay didn't apply →
 miscompile" footgun).
 
@@ -501,7 +512,7 @@ any external project:
 ```
 
 **Manual (fallback).** A C# project can also reference a pre-built `.dll` with a bare assembly
-`<Reference>` + `<HintPath>` (no `ProjectReference`). Exported `#[no_mangle] pub extern "C"` functions
+`<Reference>` + `<HintPath>` (no `ProjectReference`). Exported `#[unsafe(no_mangle)] pub extern "C"` functions
 are `public static` methods on `MainModule`; de-mangled `#[repr(C)]` structs appear under their clean
 `Crate.Type` name with a synthesized ctor + per-field getters.
 

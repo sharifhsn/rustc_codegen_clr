@@ -1,27 +1,27 @@
 use crate::{
+    IString,
     basic_block::handler_for_block,
     codegen_error::{CodegenError, MethodCodegenError},
     utilis::classify_magic_fn,
-    IString,
 };
 use cilly::{
-    cilnode::{MethodKind, PtrCastRes},
-    ir::method::LocalDef,
-    ir::BasicBlock,
-    utilis::{self},
     Access, Assembly, CILRoot, ExceptionRegion, Int, Interned, IntoAsmIndex, MethodDef, MethodRef,
     StaticFieldDesc, Type,
+    cilnode::{MethodKind, PtrCastRes},
+    ir::BasicBlock,
+    ir::method::LocalDef,
+    utilis::{self},
 };
 
 type Root = Interned<cilly::ir::CILRoot>;
 use crate::call_info::CallInfo;
-use crate::fn_ctx::fn_name;
 pub use crate::fn_ctx::MethodCompileCtx;
+use crate::fn_ctx::fn_name;
 use crate::operand::static_data::add_static;
-use crate::r#type::{adt::field_descrptor, get_type, utilis::is_zst, GetTypeExt};
+use crate::r#type::{GetTypeExt, adt::field_descrptor, get_type, utilis::is_zst};
 use rustc_hir::attrs::Linkage;
 use rustc_middle::{
-    mir::{interpret::GlobalAlloc, Local, LocalDecl, Statement, Terminator},
+    mir::{Local, LocalDecl, Statement, Terminator, interpret::GlobalAlloc},
     mono::MonoItem,
     ty::{TyCtxt, TyKind},
 };
@@ -146,7 +146,9 @@ pub fn terminator_to_ops<'tcx>(
                     rustc_middle::ty::print::with_no_trimmed_paths! {
                     format!("Tried to execute terminator {term:?} whose compialtion message {msg:?}!")}
                 } else {
-                    eprintln!("handle_terminator panicked with a non-string message when trying to compile {term:?} !");
+                    eprintln!(
+                        "handle_terminator panicked with a non-string message when trying to compile {term:?} !"
+                    );
                     rustc_middle::ty::print::with_no_trimmed_paths! {
                     format!("Tried to execute terminator {term:?} whose compialtion failed with a no-string message!")
                     }
@@ -268,15 +270,13 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     // FIXME: figure out the source of the bug causing visibility to not be read propely.
     // let access_modifier = Access::from_visibility(tcx.visibility(instance.def_id()));
     let attrs = ctx.tcx().codegen_fn_attrs(ctx.instance().def_id());
-    // `#[no_mangle]` marks a function as an *export* — externally referenceable (e.g. callable from
-    // C#). Map those to `Access::Extern`, which the linker's dead-code pass treats as a ROOT
+    // `#[unsafe(no_mangle)]` and `#[unsafe(export_name = "...")]` mark a function as an *export* —
+    // externally referenceable (e.g. callable from C#). Map those to `Access::Extern`, which the
+    // linker's dead-code pass treats as a ROOT
     // (`eliminate_dead_fns`). This is what lets a **library** crate keep its public API: a library has
     // no entrypoint to root the call graph, so without this every method would be eliminated. (For a
-    // binary it is a no-op beyond keeping unused `#[no_mangle]` fns, which is the correct semantics.)
-    let access = if attrs
-        .flags
-        .contains(rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::NO_MANGLE)
-    {
+    // binary it is a no-op beyond keeping unused exports, which is the correct semantics.)
+    let access = if attrs.contains_extern_indicator() {
         Access::Extern
     } else {
         linkage_to_access(attrs.linkage)

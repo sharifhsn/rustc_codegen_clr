@@ -1,6 +1,6 @@
 use crate::{
-    asm::MissingMethodPatcher, tpe::simd::SIMDElem, Assembly, BasicBlock, BinOp, CILNode, CILRoot,
-    Const, Int, Interned, MethodImpl, MethodRef, Type,
+    Assembly, BasicBlock, BinOp, CILNode, CILRoot, Const, Int, Interned, MethodImpl, MethodRef,
+    Type, asm::MissingMethodPatcher, tpe::simd::SIMDElem,
 };
 macro_rules! binop {
     ($op_name:ident,$op_dotnet:literal,$binop:expr) => {
@@ -98,7 +98,13 @@ pub(super) fn simd_lane_info(tpe: Type, asm: &Assembly) -> Option<(SIMDElem, u64
 pub(super) fn lane_binop_body(
     mref: Interned<MethodRef>,
     asm: &mut Assembly,
-    op: &dyn Fn(&mut Assembly, Interned<CILNode>, Interned<CILNode>, SIMDElem, Type) -> Interned<CILNode>,
+    op: &dyn Fn(
+        &mut Assembly,
+        Interned<CILNode>,
+        Interned<CILNode>,
+        SIMDElem,
+        Type,
+    ) -> Interned<CILNode>,
 ) -> MethodImpl {
     let sig = asm[asm[mref].sig()].clone();
     let res = *sig.output();
@@ -242,7 +248,9 @@ pub(super) fn lane_cmp_body(
         // `cmp01` is 0/1 (i32). Widen to the mask lane width, then negate: 0 -> 0, 1 -> all-ones.
         let widened = asm.int_cast(
             cmp01,
-            res_elem.as_int().expect("simd mask element must be an integer"),
+            res_elem
+                .as_int()
+                .expect("simd mask element must be an integer"),
             crate::cilnode::ExtendKind::ZeroExtend,
         );
         asm.neg(widened)
@@ -306,8 +314,14 @@ pub(super) fn lane_all_any_body(
 }
 
 fn simd_binop(
-    op: impl Fn(&mut Assembly, Interned<CILNode>, Interned<CILNode>, SIMDElem, Type) -> Interned<CILNode>
-        + 'static,
+    op: impl Fn(
+        &mut Assembly,
+        Interned<CILNode>,
+        Interned<CILNode>,
+        SIMDElem,
+        Type,
+    ) -> Interned<CILNode>
+    + 'static,
     name: &str,
     asm: &mut Assembly,
     patcher: &mut MissingMethodPatcher,
@@ -318,6 +332,7 @@ fn simd_binop(
     patcher.insert(name, Box::new(generator));
 }
 pub fn fallback_simd(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    super::bitmask::register_most_significant_bits(asm, patcher);
     simd_binop(
         |asm, lhs, rhs, _, res_tpe| {
             let res = asm.biop(lhs, rhs, BinOp::Lt);
@@ -505,10 +520,34 @@ pub(super) fn register_value_lane_ops(asm: &mut Assembly, patcher: &mut MissingM
     // `simd_select` (mask-driven blend) and the `simd_reduce_*` horizontal reductions are per-lane
     // and target-agnostic, so they live on both the .NET and C builtin sets.
     simd_select(asm, patcher);
-    simd_reduce("simd_reduce_add_ordered", ReduceKind::Add, true, asm, patcher);
-    simd_reduce("simd_reduce_add_unordered", ReduceKind::Add, false, asm, patcher);
-    simd_reduce("simd_reduce_mul_ordered", ReduceKind::Mul, true, asm, patcher);
-    simd_reduce("simd_reduce_mul_unordered", ReduceKind::Mul, false, asm, patcher);
+    simd_reduce(
+        "simd_reduce_add_ordered",
+        ReduceKind::Add,
+        true,
+        asm,
+        patcher,
+    );
+    simd_reduce(
+        "simd_reduce_add_unordered",
+        ReduceKind::Add,
+        false,
+        asm,
+        patcher,
+    );
+    simd_reduce(
+        "simd_reduce_mul_ordered",
+        ReduceKind::Mul,
+        true,
+        asm,
+        patcher,
+    );
+    simd_reduce(
+        "simd_reduce_mul_unordered",
+        ReduceKind::Mul,
+        false,
+        asm,
+        patcher,
+    );
     simd_reduce("simd_reduce_and", ReduceKind::And, false, asm, patcher);
     simd_reduce("simd_reduce_or", ReduceKind::Or, false, asm, patcher);
     simd_reduce("simd_reduce_xor", ReduceKind::Xor, false, asm, patcher);
@@ -718,8 +757,11 @@ fn simd_cast(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
                     let has_builtin = matches!(src_float, crate::Float::F32 | crate::Float::F64)
                         && !matches!(dst_int, Int::I128 | Int::U128);
                     if has_builtin {
-                        let name =
-                            asm.alloc_string(format!("cast_{}_{}", src_float.name(), dst_int.name()));
+                        let name = asm.alloc_string(format!(
+                            "cast_{}_{}",
+                            src_float.name(),
+                            dst_int.name()
+                        ));
                         let main_module = *asm.main_module();
                         let cast_mref = asm.class_ref(main_module).clone().static_mref(
                             &[src_elem_tpe],

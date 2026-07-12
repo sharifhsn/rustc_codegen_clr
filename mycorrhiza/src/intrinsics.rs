@@ -126,6 +126,19 @@ impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str>
         >(self, arg1)
     }
     #[inline(always)]
+    pub fn virt1<const METHOD: &'static str, Arg1, Ret>(self, arg1: Arg1) -> Ret {
+        rustc_clr_interop_managed_call_virt2_::<
+            ASSEMBLY,
+            CLASS_PATH,
+            false,
+            METHOD,
+            false,
+            Ret,
+            Self,
+            Arg1,
+        >(self, arg1)
+    }
+    #[inline(always)]
     pub fn instance2<const METHOD: &'static str, Arg1, Arg2, Ret>(
         self,
         arg1: Arg1,
@@ -318,7 +331,9 @@ pub fn rustc_clr_interop_managed_is_inst<DST, SRC>(src: SRC) -> bool {
 /// reference type is rejected by the CIL typechecker.
 #[allow(unused_variables)]
 #[inline(never)]
-pub fn rustc_clr_interop_box<T>(val: T) -> RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Object"> {
+pub fn rustc_clr_interop_box<T>(
+    val: T,
+) -> RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Object"> {
     core::intrinsics::abort();
 }
 interop_magic_fn! {
@@ -425,12 +440,11 @@ impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const SIZE: u
 {
 }
 unsafe impl<
-        const ASSEMBLY: &'static str,
-        const CLASS_PATH: &'static str,
-        const SIZE: usize,
-        ClassGenerics,
-    > ManagedSafe
-    for RustcCLRInteropManagedGenericStruct<ASSEMBLY, CLASS_PATH, SIZE, ClassGenerics>
+    const ASSEMBLY: &'static str,
+    const CLASS_PATH: &'static str,
+    const SIZE: usize,
+    ClassGenerics,
+> ManagedSafe for RustcCLRInteropManagedGenericStruct<ASSEMBLY, CLASS_PATH, SIZE, ClassGenerics>
 {
 }
 
@@ -605,7 +619,9 @@ impl RustcCLRInteropManagedChar {
     #[inline(always)]
     pub fn as_u16(self) -> u16 {
         unsafe {
-            core::mem::transmute::<RustcCLRInteropManagedChar, u16>(core::intrinsics::black_box(self))
+            core::mem::transmute::<RustcCLRInteropManagedChar, u16>(core::intrinsics::black_box(
+                self,
+            ))
         }
     }
     pub fn single_codepoint_unchecked(value: char) -> Self {
@@ -730,15 +746,8 @@ impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const SIZE: u
     /// (`Decimal.op_Addition(Decimal, Decimal)`, `Decimal.Compare(Decimal, Decimal)`, …).
     #[inline(always)]
     pub fn vt_static2<const METHOD: &'static str, Arg1, Arg2, Ret>(arg1: Arg1, arg2: Arg2) -> Ret {
-        rustc_clr_interop_managed_call2_::<
-            ASSEMBLY,
-            CLASS_PATH,
-            true,
-            METHOD,
-            true,
-            Ret,
-            Arg1,
-            Arg2,
-        >(arg1, arg2)
+        rustc_clr_interop_managed_call2_::<ASSEMBLY, CLASS_PATH, true, METHOD, true, Ret, Arg1, Arg2>(
+            arg1, arg2,
+        )
     }
 }

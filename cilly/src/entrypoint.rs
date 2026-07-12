@@ -1,9 +1,11 @@
 use std::num::NonZeroU8;
 
 use crate::{
-    cilnode::ExtendKind, cilroot::BranchCond, Access, BasicBlock, CILNode, CILRoot, ClassRef,
-    Const, MethodDef, MethodDefIdx, MethodImpl, Type,
-    {cilnode::MethodKind, Assembly, Int, MethodRef},
+    Access, BasicBlock, CILNode, CILRoot, ClassRef, Const, MethodDef, MethodDefIdx, MethodImpl,
+    Type,
+    cilnode::ExtendKind,
+    cilroot::BranchCond,
+    {Assembly, Int, MethodRef, cilnode::MethodKind},
 };
 
 /// Entry wrapper for a `fn main() -> T where T: Termination` (e.g. `-> Result<_, _>` / `-> ExitCode`).
@@ -61,9 +63,10 @@ pub fn wrapper_lang_start(
     // `PtrCast(_, Ptr(pointee))` yields `*pointee == argv_ty` (mirrors `wrapper`'s C-main argv).
     let argv = asm.alloc_node(Const::ISize(0));
     let argv = match argv_ty {
-        Type::Ptr(pointee) => {
-            asm.alloc_node(CILNode::PtrCast(argv, Box::new(crate::cilnode::PtrCastRes::Ptr(pointee))))
-        }
+        Type::Ptr(pointee) => asm.alloc_node(CILNode::PtrCast(
+            argv,
+            Box::new(crate::cilnode::PtrCastRes::Ptr(pointee)),
+        )),
         _ => argv,
     };
     let sigpipe = asm.alloc_node(Const::U8(sigpipe));
@@ -72,10 +75,10 @@ pub fn wrapper_lang_start(
     // System.Environment.Exit((int)code) — propagate main's exit code to the OS.
     let env = ClassRef::enviroment(asm);
     let exit_name = asm.alloc_string("Exit");
-    let exit = asm
-        .class_ref(env)
-        .clone()
-        .static_mref(&[Type::Int(Int::I32)], Type::Void, exit_name, asm);
+    let exit =
+        asm.class_ref(env)
+            .clone()
+            .static_mref(&[Type::Int(Int::I32)], Type::Void, exit_name, asm);
     let code = asm.int_cast(code, Int::I32, ExtendKind::SignExtend);
     let exit_call = asm.alloc_root(CILRoot::call(exit, [code]));
 
@@ -186,10 +189,10 @@ pub fn wrapper_catch_and_exit(entrypoint: MethodRef, asm: &mut Assembly) -> Meth
     // by std before the throw, so just exit(101), matching native's panic exit code.
     let env = ClassRef::enviroment(asm);
     let exit_name = asm.alloc_string("Exit");
-    let exit = asm
-        .class_ref(env)
-        .clone()
-        .static_mref(&[Type::Int(Int::I32)], Type::Void, exit_name, asm);
+    let exit =
+        asm.class_ref(env)
+            .clone()
+            .static_mref(&[Type::Int(Int::I32)], Type::Void, exit_name, asm);
     let exit_code = asm.alloc_node(Const::I32(101));
     let exit_call = asm.alloc_root(CILRoot::call(exit, [exit_code]));
     let exit_try_failure = asm.alloc_root(CILRoot::ExitSpecialRegion {

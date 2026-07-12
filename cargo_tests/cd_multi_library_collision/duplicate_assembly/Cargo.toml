@@ -1,0 +1,17 @@
+[package]
+name = "collision_alpha"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.dotnet]
+identity-schema = 1
+package-id = "Collision.DuplicateAssembly"
+assembly-name = "collision_alpha"
+root-namespace = "Collision.DuplicateAssembly"
+module-type = "Exports"
+legacy-main-module = false
+
+[workspace]

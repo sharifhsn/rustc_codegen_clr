@@ -342,9 +342,7 @@ pub fn rustc_codegen_clr_mark_interface(class: ClassDef) -> ClassDef {
 /// chain — no other intrinsic contains `set_type` or `type_generics`).
 #[allow(unused_variables)]
 #[inline(never)]
-pub fn rustc_codegen_clr_set_type_generics<const NAMES: &'static str>(
-    class: ClassDef,
-) -> ClassDef {
+pub fn rustc_codegen_clr_set_type_generics<const NAMES: &'static str>(class: ClassDef) -> ClassDef {
     diverge!()
 }
 

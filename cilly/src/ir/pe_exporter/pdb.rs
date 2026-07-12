@@ -317,7 +317,8 @@ impl PdbBuilder {
         // run-start, mirroring `tables::MetadataBuilder::add_type_def`'s `field_list`/
         // `method_list` pattern exactly) BEFORE this method's own `LocalVariable` rows are
         // pushed — an inherently stateful, order-dependent step `.map()` can't express cleanly.
-        let mut method_rows: Vec<MethodDebugInformationRow> = Vec::with_capacity(self.methods.len());
+        let mut method_rows: Vec<MethodDebugInformationRow> =
+            Vec::with_capacity(self.methods.len());
         let mut local_scope_rows: Vec<LocalScopeRow> = Vec::new();
         let mut local_variable_rows: Vec<LocalVariableRow> = Vec::new();
         for (idx, method) in self.methods.into_iter().enumerate() {
@@ -1036,17 +1037,20 @@ pub fn deterministic_pdb_id(content: &[u8]) -> PdbId {
 #[must_use]
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
     ];
     let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
     ];
 
     let mut msg = data.to_vec();
@@ -1533,7 +1537,8 @@ mod tests {
                 let import_scope = Self::read_index(tables, &mut cursor, false);
                 let variable_list = Self::read_index(tables, &mut cursor, local_variable_wide);
                 let constant_list = Self::read_index(tables, &mut cursor, false);
-                let start_offset = u32::from_le_bytes(tables[cursor..cursor + 4].try_into().unwrap());
+                let start_offset =
+                    u32::from_le_bytes(tables[cursor..cursor + 4].try_into().unwrap());
                 cursor += 4;
                 let length = u32::from_le_bytes(tables[cursor..cursor + 4].try_into().unwrap());
                 cursor += 4;
@@ -1566,7 +1571,11 @@ mod tests {
                 let index = u16::from_le_bytes(tables[cursor..cursor + 2].try_into().unwrap());
                 cursor += 2;
                 let name = Self::read_index(tables, &mut cursor, strings_wide);
-                rows.push(TestLocalVariableRow { attributes, index, name });
+                rows.push(TestLocalVariableRow {
+                    attributes,
+                    index,
+                    name,
+                });
             }
             rows
         }
@@ -1579,7 +1588,9 @@ mod tests {
             let strings = self.stream("#Strings");
             let start = offset as usize;
             let end = strings[start..].iter().position(|&b| b == 0).unwrap() + start;
-            std::str::from_utf8(&strings[start..end]).unwrap().to_string()
+            std::str::from_utf8(&strings[start..end])
+                .unwrap()
+                .to_string()
         }
 
         fn decode_sequence_points(
@@ -1847,7 +1858,11 @@ mod tests {
         let entry = PdbChecksumEntry::from_pdb_bytes(b"pretend pdb bytes");
         let payload = entry.payload_bytes();
         assert_eq!(&payload[0..7], b"SHA256\0", "NUL-terminated algorithm name");
-        assert_eq!(payload.len(), 7 + 32, "algorithm name + 32-byte digest, no extra padding");
+        assert_eq!(
+            payload.len(),
+            7 + 32,
+            "algorithm name + 32-byte digest, no extra padding"
+        );
         assert_eq!(&payload[7..], &sha256(b"pretend pdb bytes"));
     }
 
@@ -1904,7 +1919,10 @@ mod tests {
     #[test]
     fn add_method_collapses_same_il_offset_runs_keeping_the_last_point() {
         let mut builder = PdbBuilder::new(
-            TypeSystemRowCounts { rows: vec![(Token::TABLE_METHOD_DEF, 1)], entry_point_token: 0 },
+            TypeSystemRowCounts {
+                rows: vec![(Token::TABLE_METHOD_DEF, 1)],
+                entry_point_token: 0,
+            },
             1,
         );
         let tok = Token::new(Token::TABLE_METHOD_DEF, 1);
@@ -1927,7 +1945,11 @@ mod tests {
         let stored = builder.methods[0].as_ref().unwrap().points.clone();
         assert_eq!(
             stored,
-            [sp(0, "a.rs", 1, 1, 1, 2), sp(5, "a.rs", 4, 1, 4, 2), sp(9, "a.rs", 5, 1, 5, 2)],
+            [
+                sp(0, "a.rs", 1, 1, 1, 2),
+                sp(5, "a.rs", 4, 1, 4, 2),
+                sp(9, "a.rs", 5, 1, 5, 2)
+            ],
             "same-offset run at il_offset=5 collapses to its LAST entry (line 4), not the first"
         );
 
@@ -1954,7 +1976,10 @@ mod tests {
     #[test]
     fn add_method_accepts_degenerate_same_line_zero_width_column_span() {
         let mut builder = PdbBuilder::new(
-            TypeSystemRowCounts { rows: vec![(Token::TABLE_METHOD_DEF, 1)], entry_point_token: 0 },
+            TypeSystemRowCounts {
+                rows: vec![(Token::TABLE_METHOD_DEF, 1)],
+                entry_point_token: 0,
+            },
             1,
         );
         let tok = Token::new(Token::TABLE_METHOD_DEF, 1);
@@ -1984,7 +2009,10 @@ mod tests {
             "widened to a non-empty column span instead of panicking or silently going hidden: {:?}",
             decoded[0]
         );
-        assert!(!decoded[0].is_hidden, "a real span should stay visible, not collapse to hidden");
+        assert!(
+            !decoded[0].is_hidden,
+            "a real span should stay visible, not collapse to hidden"
+        );
         // `col` was already at the u16 ceiling (65535), so the widen must shrink `col` backwards
         // (not grow `end_col`, which cannot legally exceed 65535 either).
         assert_eq!(decoded[0].col, 65534);
@@ -1997,7 +2025,10 @@ mod tests {
     #[test]
     fn add_method_widens_degenerate_span_forward_when_col_is_not_at_the_ceiling() {
         let mut builder = PdbBuilder::new(
-            TypeSystemRowCounts { rows: vec![(Token::TABLE_METHOD_DEF, 1)], entry_point_token: 0 },
+            TypeSystemRowCounts {
+                rows: vec![(Token::TABLE_METHOD_DEF, 1)],
+                entry_point_token: 0,
+            },
             1,
         );
         let tok = Token::new(Token::TABLE_METHOD_DEF, 1);
@@ -2194,16 +2225,36 @@ mod tests {
         );
 
         let scopes = reader.local_scope_rows();
-        assert_eq!(scopes.len(), 1, "exactly one LocalScope row for the one method with locals");
+        assert_eq!(
+            scopes.len(),
+            1,
+            "exactly one LocalScope row for the one method with locals"
+        );
         assert_eq!(scopes[0].method, 1, "MethodDef RID 1");
-        assert_eq!(scopes[0].import_scope, 0, "no ImportScope support: always nil");
-        assert_eq!(scopes[0].variable_list, 1, "1-based run start into LocalVariable");
-        assert_eq!(scopes[0].constant_list, 1, "LocalConstant never populated: degenerate empty range");
+        assert_eq!(
+            scopes[0].import_scope, 0,
+            "no ImportScope support: always nil"
+        );
+        assert_eq!(
+            scopes[0].variable_list, 1,
+            "1-based run start into LocalVariable"
+        );
+        assert_eq!(
+            scopes[0].constant_list, 1,
+            "LocalConstant never populated: degenerate empty range"
+        );
         assert_eq!(scopes[0].start_offset, 0, "whole-method flat scope");
-        assert_eq!(scopes[0].length, 42, "covers the method's full IL code length");
+        assert_eq!(
+            scopes[0].length, 42,
+            "covers the method's full IL code length"
+        );
 
         let vars = reader.local_variable_rows();
-        assert_eq!(vars.len(), 2, "only the 2 NAMED locals get rows; the unnamed temp gets none");
+        assert_eq!(
+            vars.len(),
+            2,
+            "only the 2 NAMED locals get rows; the unnamed temp gets none"
+        );
         assert_eq!(vars[0].index, 0, "first named local is slot 0");
         assert_eq!(vars[0].attributes, 0);
         assert_eq!(reader.string_at(vars[0].name), "mission_critical_value");
@@ -2315,7 +2366,10 @@ mod tests {
         let scopes = reader.local_scope_rows();
         assert_eq!(scopes.len(), 2);
         assert_eq!(scopes[0].method, 1);
-        assert_eq!(scopes[0].variable_list, 1, "method 1's variables start at row 1");
+        assert_eq!(
+            scopes[0].variable_list, 1,
+            "method 1's variables start at row 1"
+        );
         assert_eq!(scopes[1].method, 2);
         assert_eq!(
             scopes[1].variable_list, 3,

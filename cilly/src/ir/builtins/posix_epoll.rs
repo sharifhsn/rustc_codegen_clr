@@ -485,9 +485,7 @@ fn insert_epoll_wait(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let evbase = asm.alloc_node(CILNode::LdArg(1));
         let ev_isize_w = asm.alloc_node(CILNode::PtrCast(evbase, Box::new(PtrCastRes::ISize)));
         let count_l = asm.alloc_node(CILNode::LdLoc(L_COUNT));
-        let count_i64 = asm.int_cast(count_l, Int::I64, ExtendKind::SignExtend);
-        let stride = asm.alloc_node(Const::I64(EPOLL_EVENT_STRIDE));
-        let off = asm.alloc_node(CILNode::BinOp(count_i64, stride, BinOp::Mul));
+        let off = epoll_event_offset(asm, count_l);
         let base = asm.alloc_node(CILNode::BinOp(ev_isize_w, off, BinOp::Add));
         let store_base = asm.alloc_root(CILRoot::StLoc(L_H, base)); // reuse L_H as scratch base
         // events@0 = reg.events (u32).
@@ -592,6 +590,34 @@ fn insert_epoll_wait(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         }
     };
     patcher.insert(name, Box::new(generator));
+}
+
+/// Computes the byte offset of one `epoll_event` slot in the same native integer width used by
+/// pointer arithmetic. Keeping this conversion at the boundary prevents `isize + i64` IR on
+/// 64-bit targets and remains correct if the backend gains a 32-bit .NET target.
+fn epoll_event_offset(asm: &mut Assembly, count: Interned<CILNode>) -> Interned<CILNode> {
+    let count = asm.int_cast(count, Int::ISize, ExtendKind::SignExtend);
+    let stride = asm.alloc_node(Const::ISize(EPOLL_EVENT_STRIDE));
+    asm.alloc_node(CILNode::BinOp(count, stride, BinOp::Mul))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn epoll_event_offsets_are_native_width() {
+        let mut asm = Assembly::default();
+        let sig = asm.sig([Type::Int(Int::I32)], Type::Void);
+        let count = asm.alloc_node(CILNode::LdArg(0));
+        let offset = epoll_event_offset(&mut asm, count);
+        let offset = asm[offset].clone();
+
+        assert_eq!(
+            offset.typecheck(sig, &[], &mut asm).unwrap(),
+            Type::Int(Int::ISize)
+        );
+    }
 }
 
 /// `eventfd(initval, flags) -> i32` — the mio Waker primitive (tokio's I/O driver

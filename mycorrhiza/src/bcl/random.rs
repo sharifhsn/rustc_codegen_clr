@@ -42,10 +42,8 @@ use crate::system::MString;
 
 /// The raw managed-handle alias for `System.Random` (from the generated BCL bindings). A `Random`
 /// wraps one of these; [`Random::handle`] hands it back for lower-level BCL calls.
-pub type MRandom = crate::intrinsics::RustcCLRInteropManagedClass<
-    "System.Private.CoreLib",
-    "System.Random",
->;
+pub type MRandom =
+    crate::intrinsics::RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Random">;
 
 /// A managed `System.Random` — a pseudo-random number generator on the CLR heap.
 ///

@@ -19,11 +19,11 @@
 
 use core::marker::PhantomData;
 
-use crate::gen;
+use crate::r#gen;
 use crate::intrinsics::{
-    rustc_clr_interop_generic_call1, rustc_clr_interop_generic_call2, rustc_clr_interop_generic_call3,
-    rustc_clr_interop_generic_ctor2, RustcCLRInteropByRef, RustcCLRInteropManagedGenericStruct,
-    RustcCLRInteropTypeGeneric,
+    RustcCLRInteropByRef, RustcCLRInteropManagedGenericStruct, RustcCLRInteropTypeGeneric,
+    rustc_clr_interop_generic_call1, rustc_clr_interop_generic_call2,
+    rustc_clr_interop_generic_call3, rustc_clr_interop_generic_ctor2,
 };
 
 const CORELIB: &str = "System.Private.CoreLib";
@@ -36,33 +36,86 @@ type RawRoSpan<T> = RustcCLRInteropManagedGenericStruct<CORELIB, "System.ReadOnl
 // ---- raw Span<T> members (generic over the element type) --------------------------------------
 fn span_from_ptr<T>(ptr: *mut (), len: i32) -> RawSpan<T> {
     rustc_clr_interop_generic_ctor2::<
-        CORELIB, "System.Span", true, (T,), ((), *mut (), i32), RawSpan<T>, *mut (), i32,
+        CORELIB,
+        "System.Span",
+        true,
+        (T,),
+        ((), *mut (), i32),
+        RawSpan<T>,
+        *mut (),
+        i32,
     >(ptr, len)
 }
 fn span_len<T>(s: &RawSpan<T>) -> i32 {
-    rustc_clr_interop_generic_call1::<CORELIB, "System.Span", true, "get_Length", 1, (T,), (i32,), i32, &RawSpan<T>>(s)
+    rustc_clr_interop_generic_call1::<
+        CORELIB,
+        "System.Span",
+        true,
+        "get_Length",
+        1,
+        (T,),
+        (i32,),
+        i32,
+        &RawSpan<T>,
+    >(s)
 }
 fn span_fill<T>(s: &RawSpan<T>, value: T) {
-    rustc_clr_interop_generic_call2::<CORELIB, "System.Span", true, "Fill", 1, (T,), ((), gen!(0)), (), &RawSpan<T>, T>(s, value)
+    rustc_clr_interop_generic_call2::<
+        CORELIB,
+        "System.Span",
+        true,
+        "Fill",
+        1,
+        (T,),
+        ((), r#gen!(0)),
+        (),
+        &RawSpan<T>,
+        T,
+    >(s, value)
 }
 fn span_clear<T>(s: &RawSpan<T>) {
-    rustc_clr_interop_generic_call1::<CORELIB, "System.Span", true, "Clear", 1, (T,), ((),), (), &RawSpan<T>>(s)
+    rustc_clr_interop_generic_call1::<
+        CORELIB,
+        "System.Span",
+        true,
+        "Clear",
+        1,
+        (T,),
+        ((),),
+        (),
+        &RawSpan<T>,
+    >(s)
 }
 // get_Item(int) -> ref T : the byref indexer. Returns a managed byref (`!0&`) taken as a raw pointer.
 fn span_get_ref<T>(s: &RawSpan<T>, idx: i32) -> *mut T {
     rustc_clr_interop_generic_call2::<
-        CORELIB, "System.Span", true, "get_Item", 1, (T,),
+        CORELIB,
+        "System.Span",
+        true,
+        "get_Item",
+        1,
+        (T,),
         (RustcCLRInteropByRef<RustcCLRInteropTypeGeneric<0>>, i32),
-        *mut T, &RawSpan<T>, i32,
+        *mut T,
+        &RawSpan<T>,
+        i32,
     >(s, idx)
 }
 // Span<T>.Slice(int start, int length) -> Span<T> : def-shape nested-generic self-return (`Span<!0>`)
 // binds against the concrete `RawSpan<T>` local — same proven pattern as `TaskCompletionSource<T>.get_Task`.
 fn span_slice<T>(s: &RawSpan<T>, start: i32, len: i32) -> RawSpan<T> {
     rustc_clr_interop_generic_call3::<
-        CORELIB, "System.Span", true, "Slice", 1, (T,),
+        CORELIB,
+        "System.Span",
+        true,
+        "Slice",
+        1,
+        (T,),
         (RawSpan<RustcCLRInteropTypeGeneric<0>>, i32, i32),
-        RawSpan<T>, &RawSpan<T>, i32, i32,
+        RawSpan<T>,
+        &RawSpan<T>,
+        i32,
+        i32,
     >(s, start, len)
 }
 // Span<T>.CopyTo(Span<T> destination) -> void : the destination is passed by value (a `ref struct` is
@@ -70,52 +123,105 @@ fn span_slice<T>(s: &RawSpan<T>, start: i32, len: i32) -> RawSpan<T> {
 // `Slice` return, just in parameter position).
 fn span_copy_to<T>(src: &RawSpan<T>, dst: RawSpan<T>) {
     rustc_clr_interop_generic_call2::<
-        CORELIB, "System.Span", true, "CopyTo", 1, (T,),
+        CORELIB,
+        "System.Span",
+        true,
+        "CopyTo",
+        1,
+        (T,),
         ((), RawSpan<RustcCLRInteropTypeGeneric<0>>),
-        (), &RawSpan<T>, RawSpan<T>,
+        (),
+        &RawSpan<T>,
+        RawSpan<T>,
     >(src, dst)
 }
 // Span<T>.TryCopyTo(Span<T> destination) -> bool : non-throwing CopyTo, `false` if destination too short.
 fn span_try_copy_to<T>(src: &RawSpan<T>, dst: RawSpan<T>) -> bool {
     rustc_clr_interop_generic_call2::<
-        CORELIB, "System.Span", true, "TryCopyTo", 1, (T,),
+        CORELIB,
+        "System.Span",
+        true,
+        "TryCopyTo",
+        1,
+        (T,),
         (bool, RawSpan<RustcCLRInteropTypeGeneric<0>>),
-        bool, &RawSpan<T>, RawSpan<T>,
+        bool,
+        &RawSpan<T>,
+        RawSpan<T>,
     >(src, dst)
 }
 
 fn rospan_from_ptr<T>(ptr: *const (), len: i32) -> RawRoSpan<T> {
     rustc_clr_interop_generic_ctor2::<
-        CORELIB, "System.ReadOnlySpan", true, (T,), ((), *const (), i32), RawRoSpan<T>, *const (), i32,
+        CORELIB,
+        "System.ReadOnlySpan",
+        true,
+        (T,),
+        ((), *const (), i32),
+        RawRoSpan<T>,
+        *const (),
+        i32,
     >(ptr, len)
 }
 fn rospan_len<T>(s: &RawRoSpan<T>) -> i32 {
-    rustc_clr_interop_generic_call1::<CORELIB, "System.ReadOnlySpan", true, "get_Length", 1, (T,), (i32,), i32, &RawRoSpan<T>>(s)
+    rustc_clr_interop_generic_call1::<
+        CORELIB,
+        "System.ReadOnlySpan",
+        true,
+        "get_Length",
+        1,
+        (T,),
+        (i32,),
+        i32,
+        &RawRoSpan<T>,
+    >(s)
 }
 // ReadOnlySpan<T>.Slice(int start, int length) -> ReadOnlySpan<T> : same def-shape nested-generic
 // self-return pattern as `Span<T>.Slice`.
 fn rospan_slice<T>(s: &RawRoSpan<T>, start: i32, len: i32) -> RawRoSpan<T> {
     rustc_clr_interop_generic_call3::<
-        CORELIB, "System.ReadOnlySpan", true, "Slice", 1, (T,),
+        CORELIB,
+        "System.ReadOnlySpan",
+        true,
+        "Slice",
+        1,
+        (T,),
         (RawRoSpan<RustcCLRInteropTypeGeneric<0>>, i32, i32),
-        RawRoSpan<T>, &RawRoSpan<T>, i32, i32,
+        RawRoSpan<T>,
+        &RawRoSpan<T>,
+        i32,
+        i32,
     >(s, start, len)
 }
 // ReadOnlySpan<T>.CopyTo(Span<T> destination) -> void : the destination is a *writable* `Span<T>`,
 // distinct from the receiver's own `ReadOnlySpan<T>` — mirrors `Span<T>.CopyTo`.
 fn rospan_copy_to<T>(src: &RawRoSpan<T>, dst: RawSpan<T>) {
     rustc_clr_interop_generic_call2::<
-        CORELIB, "System.ReadOnlySpan", true, "CopyTo", 1, (T,),
+        CORELIB,
+        "System.ReadOnlySpan",
+        true,
+        "CopyTo",
+        1,
+        (T,),
         ((), RawSpan<RustcCLRInteropTypeGeneric<0>>),
-        (), &RawRoSpan<T>, RawSpan<T>,
+        (),
+        &RawRoSpan<T>,
+        RawSpan<T>,
     >(src, dst)
 }
 // ReadOnlySpan<T>.TryCopyTo(Span<T> destination) -> bool.
 fn rospan_try_copy_to<T>(src: &RawRoSpan<T>, dst: RawSpan<T>) -> bool {
     rustc_clr_interop_generic_call2::<
-        CORELIB, "System.ReadOnlySpan", true, "TryCopyTo", 1, (T,),
+        CORELIB,
+        "System.ReadOnlySpan",
+        true,
+        "TryCopyTo",
+        1,
+        (T,),
         (bool, RawSpan<RustcCLRInteropTypeGeneric<0>>),
-        bool, &RawRoSpan<T>, RawSpan<T>,
+        bool,
+        &RawRoSpan<T>,
+        RawSpan<T>,
     >(src, dst)
 }
 // NOTE: `ReadOnlySpan<T>.get_Item` returns `ref readonly T` — a `modreq(In)`-decorated byref that a
@@ -204,7 +310,7 @@ impl<'a, T> Span<'a, T> {
     where
         T: Copy,
     {
-        *span_get_ref::<T>(&self.handle(), i)
+        unsafe { *span_get_ref::<T>(&self.handle(), i) }
     }
     /// Overwrite the element at `i`, **without** the bounds check [`set`](Self::set) performs.
     ///
@@ -216,7 +322,7 @@ impl<'a, T> Span<'a, T> {
     /// the raw byref indexer pointer, with no bounds check anywhere in the path. Mirrors
     /// `std::slice::get_unchecked_mut`.
     pub unsafe fn set_unchecked(&mut self, i: i32, value: T) {
-        *span_get_ref::<T>(&self.handle(), i) = value;
+        unsafe { *span_get_ref::<T>(&self.handle(), i) = value };
     }
     /// A sub-span `[start, start + len)` of this span, still viewing the same underlying Rust memory
     /// (`Span<T>.Slice(int, int)`, zero-copy — writes through the sub-span are visible in the original

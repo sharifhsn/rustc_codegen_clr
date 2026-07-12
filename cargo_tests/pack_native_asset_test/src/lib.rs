@@ -16,7 +16,7 @@ use nuget::microsoft_data_sqlite_core::Microsoft::Data::Sqlite::{
     SqliteCommand, SqliteCommand_Methods, SqliteConnection, SqliteConnection_Methods,
 };
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn sqlite_native_smoke() -> i32 {
     let conn = SqliteConnection::new();
     conn.set_connection_string(MString::from("Data Source=:memory:"));

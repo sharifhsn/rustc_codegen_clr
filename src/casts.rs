@@ -1,5 +1,5 @@
-use cilly::cilnode::{ExtendKind, IsPure, MethodKind};
 use cilly::Type;
+use cilly::cilnode::{ExtendKind, IsPure, MethodKind};
 use cilly::{Assembly, ClassRef, Float, Int, Interned, MethodRef};
 
 type Node = Interned<cilly::ir::CILNode>;

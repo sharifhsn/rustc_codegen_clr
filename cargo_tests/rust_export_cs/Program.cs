@@ -2,7 +2,7 @@
 //
 // `rust_export.dll` is the .NET class-library assembly produced from the Rust `cdylib` crate
 // `rust_export`. It is named after its crate AND (WF-8a) emits proper `.assembly extern` BCL
-// identities, so C# references it directly and calls its `#[no_mangle]` functions as ordinary static
+// identities, so C# references it directly and calls its `#[unsafe(no_mangle)]` functions as ordinary static
 // methods on `MainModule` — no P/Invoke, no marshalling attributes, no reflection. They are managed
 // calls, because the Rust was compiled to managed CIL.
 //

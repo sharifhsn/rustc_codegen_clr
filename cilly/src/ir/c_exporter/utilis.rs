@@ -1,8 +1,8 @@
 use crate::utilis::encode;
 
-use super::super::{asm::MAIN_MODULE, method::LocalDef, Assembly, Float, Int, MethodRef, Type};
+use super::super::{Assembly, Float, Int, MethodRef, Type, asm::MAIN_MODULE, method::LocalDef};
 
-use fxhash::{hash64, FxHashSet, FxHasher};
+use fxhash::{FxHashSet, FxHasher, hash64};
 /// Finds the name of this local
 pub(super) fn local_name(locals: &[LocalDef], asm: &Assembly, loc: u32) -> String {
     // If the name of this local repeats, use the L form.
@@ -85,6 +85,22 @@ pub(super) fn c_tpe(field_tpe: Type, asm: &Assembly) -> String {
             Int::ISize => "intptr_t".into(),
         },
         Type::ClassRef(class_ref_idx) => {
+            // The CLR spells 128-bit integers as BCL value types, while the C
+            // backend represents the same semantic types with the compiler's
+            // native integer extensions.  Pointer casts and indirect stores
+            // can retain the BCL spelling even when their values have already
+            // been normalized to `Type::Int`; keep both spellings identical at
+            // the C type boundary instead of inventing an undefined union.
+            let class_ref = &asm[class_ref_idx];
+            if class_ref.is_valuetype()
+                && class_ref.asm().map(|name| asm[name].as_ref()) == Some("System.Runtime")
+            {
+                match asm[class_ref.name()].as_ref() {
+                    "System.Int128" => return "__int128".into(),
+                    "System.UInt128" => return "__uint128_t".into(),
+                    _ => {}
+                }
+            }
             if asm.class_ref_to_def(class_ref_idx).is_some_and(|def| {
                 asm[def].has_nonveralpping_layout() && asm[def].explict_size().is_some()
             }) {
@@ -118,6 +134,22 @@ pub(super) fn c_tpe(field_tpe: Type, asm: &Assembly) -> String {
                 count = vec.count()
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::ClassRef;
+
+    #[test]
+    fn bcl_int128_class_refs_share_the_native_c_spelling() {
+        let mut asm = Assembly::default();
+        let i128 = ClassRef::int_128(&mut asm);
+        let u128 = ClassRef::uint_128(&mut asm);
+
+        assert_eq!(c_tpe(Type::ClassRef(i128), &asm), "__int128");
+        assert_eq!(c_tpe(Type::ClassRef(u128), &asm), "__uint128_t");
     }
 }
 /// Gets the name of a given method, wiht special handling for intriniscs.

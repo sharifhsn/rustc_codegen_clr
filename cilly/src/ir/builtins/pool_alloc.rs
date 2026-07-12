@@ -7,6 +7,7 @@
 use crate::Access;
 
 use super::ALLOC_CAP;
+use crate::Assembly;
 use crate::ir::asm::MissingMethodPatcher;
 use crate::ir::cilnode::{ExtendKind, MethodKind};
 use crate::ir::cilroot::{BranchCond, CmpKind};
@@ -14,7 +15,6 @@ use crate::ir::{
     BasicBlock, BinOp, CILNode, CILRoot, ClassRef, Const, Int, MethodDef, MethodImpl, MethodRef,
     StaticFieldDesc, Type,
 };
-use crate::Assembly;
 
 const SIZE_CLASSES: [u64; 11] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
 const SLAB_SIZE: u64 = 1024 * 1024;
@@ -85,11 +85,13 @@ pub(super) fn pool_realloc_mref(asm: &mut Assembly) -> crate::Interned<MethodRef
 
 pub(super) fn insert_rust_alloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("__rust_alloc");
-    let generator = move |_, asm: &mut Assembly| {
+    let generator = move |mref, asm: &mut Assembly| {
         let size = asm.alloc_node(CILNode::LdArg(0));
         let align = super::load_align_usize(asm, 1);
         let alloc_mref = pool_alloc_mref(asm);
         let alloc = asm.alloc_node(CILNode::call(alloc_mref, [size, align]));
+        let void_ptr = asm.nptr(Type::Void);
+        let alloc = super::adapt_runtime_result(mref, alloc, void_ptr, asm);
         let ret = asm.alloc_root(CILRoot::Ret(alloc));
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![ret], 0, None)],
@@ -101,7 +103,7 @@ pub(super) fn insert_rust_alloc(asm: &mut Assembly, patcher: &mut MissingMethodP
 
 pub(super) fn insert_rust_alloc_zeroed(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("__rust_alloc_zeroed");
-    let generator = move |_, asm: &mut Assembly| {
+    let generator = move |mref, asm: &mut Assembly| {
         let size = asm.alloc_node(CILNode::LdArg(0));
         let align = super::load_align_usize(asm, 1);
         let alloc_mref = pool_alloc_mref(asm);
@@ -117,11 +119,13 @@ pub(super) fn insert_rust_alloc_zeroed(asm: &mut Assembly, patcher: &mut Missing
         let zero = asm.alloc_node(Const::U8(0));
         let alloc_ld = asm.alloc_node(CILNode::LdLoc(0));
         let zero = asm.alloc_root(CILRoot::InitBlk(Box::new((alloc_ld, zero, size))));
+        let void_ptr = asm.nptr(Type::Void);
         let alloc_ld = asm.alloc_node(CILNode::LdLoc(0));
+        let alloc_ld = super::adapt_runtime_result(mref, alloc_ld, void_ptr, asm);
         let ret = asm.alloc_root(CILRoot::Ret(alloc_ld));
         let null = asm.alloc_node(Const::USize(0));
+        let null = super::adapt_runtime_result(mref, null, Type::Int(Int::USize), asm);
         let ret_null = asm.alloc_root(CILRoot::Ret(null));
-        let void_ptr = asm.nptr(Type::Void);
         MethodImpl::MethodBody {
             blocks: vec![
                 BasicBlock::new(vec![st_alloc, null_check, zero, ret], 0, None),
@@ -135,7 +139,7 @@ pub(super) fn insert_rust_alloc_zeroed(asm: &mut Assembly, patcher: &mut Missing
 
 pub(super) fn insert_rust_realloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("__rust_realloc");
-    let generator = move |_, asm: &mut Assembly| {
+    let generator = move |mref, asm: &mut Assembly| {
         let ptr = super::load_ptr_arg(asm, 0);
         let old_size = asm.alloc_node(CILNode::LdArg(1));
         let old_size = asm.alloc_node(CILNode::IntCast {
@@ -155,6 +159,8 @@ pub(super) fn insert_rust_realloc(asm: &mut Assembly, patcher: &mut MissingMetho
             realloc_mref,
             [ptr, old_size, align, new_size],
         ));
+        let void_ptr = asm.nptr(Type::Void);
+        let realloc = super::adapt_runtime_result(mref, realloc, void_ptr, asm);
         let ret = asm.alloc_root(CILRoot::Ret(realloc));
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![ret], 0, None)],

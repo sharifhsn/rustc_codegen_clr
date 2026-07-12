@@ -1,16 +1,16 @@
 use super::{
     super::{
-        asm::MissingMethodPatcher, cilnode::MethodKind, Access, Assembly, BasicBlock, CILNode,
-        CILRoot, ClassDef, ClassRef, Const, FieldDesc, Int, MethodDef, MethodImpl, Type,
+        Access, Assembly, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, Const, FieldDesc, Int,
+        MethodDef, MethodImpl, Type, asm::MissingMethodPatcher, cilnode::MethodKind,
     },
     UNMANAGED_THREAD_START,
 };
 use crate::{
+    BinOp, StaticFieldDesc,
     bimap::Interned,
     cilnode::{ExtendKind, PtrCastRes},
     cilroot::BranchCond,
     tpe::GenericKind,
-    BinOp, StaticFieldDesc,
 };
 fn handle_to_obj(asm: &mut Assembly, _: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("handle_to_obj");
@@ -50,6 +50,45 @@ fn handle_to_obj(asm: &mut Assembly, _: &mut MissingMethodPatcher) {
         sig,
         MethodKind::Static,
         mimpl,
+        vec![None],
+    ));
+}
+
+/// Frees an opaque `GCHandle` token after a managed-box value has been copied out.
+fn handle_free(asm: &mut Assembly, _: &mut MissingMethodPatcher) {
+    let name = asm.alloc_string("handle_free");
+    let main_module = asm.main_module();
+    let gc_handle = ClassRef::gc_handle(asm);
+    let handle = asm.alloc_node(CILNode::LdArg(0));
+    let from_int_ptr_name = asm.alloc_string("FromIntPtr");
+    let from_int_ptr = asm.class_ref(gc_handle).clone().static_mref(
+        &[Type::Int(Int::ISize)],
+        Type::ClassRef(gc_handle),
+        from_int_ptr_name,
+        asm,
+    );
+    let handle = asm.alloc_node(CILNode::call(from_int_ptr, [handle]));
+    let store = asm.alloc_root(CILRoot::StLoc(0, handle));
+    let free_name = asm.alloc_string("Free");
+    let free = asm
+        .class_ref(gc_handle)
+        .clone()
+        .instance(&[], Type::Void, free_name, asm);
+    let handle_addr = asm.alloc_node(CILNode::LdLocA(0));
+    let free = asm.alloc_root(CILRoot::call(free, [handle_addr]));
+    let ret = asm.alloc_root(CILRoot::VoidRet);
+    let body = MethodImpl::MethodBody {
+        blocks: vec![BasicBlock::new(vec![store, free, ret], 0, None)],
+        locals: vec![(None, asm.alloc_type(Type::ClassRef(gc_handle)))],
+    };
+    let sig = asm.sig([Type::Int(Int::ISize)], Type::Void);
+    asm.new_method(MethodDef::new(
+        Access::Public,
+        main_module,
+        name,
+        sig,
+        MethodKind::Static,
+        body,
         vec![None],
     ));
 }
@@ -333,10 +372,12 @@ fn insert_pthread_create(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
         // Background thread (mirror rcl_dotnet_thread_spawn): an unjoined pthread must not keep the
         // process alive at exit — matches Rust process-exit semantics. `Join` still waits for it.
         let set_is_background = asm.alloc_string("set_IsBackground");
-        let set_bg_mref = asm
-            .class_ref(thread_type)
-            .clone()
-            .virtual_mref(&[Type::Bool], Type::Void, set_is_background, asm);
+        let set_bg_mref = asm.class_ref(thread_type).clone().virtual_mref(
+            &[Type::Bool],
+            Type::Void,
+            set_is_background,
+            asm,
+        );
         let ld_thread_bg = asm.alloc_node(CILNode::LdLoc(0));
         let true_const = asm.alloc_node(Const::Bool(true));
         let set_bg = asm.alloc_root(CILRoot::call(set_bg_mref, [ld_thread_bg, true_const]));
@@ -432,6 +473,7 @@ pub fn instert_threading(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
     insert_pthread_key_create(asm, patcher);
     insert_pthread_setspecific(asm, patcher);
     handle_to_obj(asm, patcher);
+    handle_free(asm, patcher);
 
     let uts = asm.alloc_string(UNMANAGED_THREAD_START);
     let object = ClassRef::object(asm);

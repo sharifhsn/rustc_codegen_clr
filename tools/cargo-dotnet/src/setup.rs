@@ -8,16 +8,16 @@
 //!
 //! Two parts ARE native: (1) `cargo install --path tools/cargo-dotnet` installs THIS
 //! Rust binary to `~/.cargo/bin` (the real clap front-end, not a bash copy); and (2)
-//! the rust-src PAL warm now runs the Rust [`palinject::inject_all`] engine directly
-//! (no `CD_INJECT_ONLY` bash hook), so the same fail-fast injection the build uses is
-//! verified once at setup.
+//! the private-sysroot PAL warm runs the Rust injection engine directly (no `CD_INJECT_ONLY`
+//! bash hook), so the same fail-fast injection the build uses is verified once at setup without
+//! modifying ambient rust-src.
 //!
 //! Ports `feasibility/cargo-dotnet:170-382`, with the front-end install + PAL warm native.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::cli::SetupArgs;
 use crate::mode::Mode;
@@ -70,7 +70,9 @@ pub fn run(args: &SetupArgs) -> Result<i32> {
     // the real clap binary.
     let crate_dir = from_repo.join("tools/cargo-dotnet");
     if crate_dir.join("Cargo.toml").is_file() {
-        println!("==> installing the Rust cargo-dotnet binary (cargo install --path tools/cargo-dotnet)");
+        println!(
+            "==> installing the Rust cargo-dotnet binary (cargo install --path tools/cargo-dotnet)"
+        );
         match cargo_install(&crate_dir) {
             Ok(true) => println!("==> installed cargo-dotnet (Rust) -> ~/.cargo/bin/cargo-dotnet"),
             Ok(false) => eprintln!(
@@ -91,7 +93,9 @@ pub fn run(args: &SetupArgs) -> Result<i32> {
     // against the freshly-populated home and run the same `inject_all` the build uses,
     // so a broken rust-src / drifted anchor surfaces at setup, not on first build.
     if let Err(e) = warm_pal(args) {
-        eprintln!("!! PAL warm skipped/failed (non-fatal at setup; will retry on first build): {e:#}");
+        eprintln!(
+            "!! PAL warm skipped/failed (non-fatal at setup; will retry on first build): {e:#}"
+        );
     }
 
     // ---- provision the bundled mycorrhiza_interop_helpers C# project into the Installed
@@ -111,7 +115,29 @@ pub fn run(args: &SetupArgs) -> Result<i32> {
         );
     }
 
+    if let Err(e) = provision_sdk_crates(&from_repo, &args.home) {
+        eprintln!("!! could not provision SDK Rust crates: {e:#}");
+    }
+
     Ok(0)
+}
+
+fn provision_sdk_crates(from_repo: &Path, home_override: &Option<PathBuf>) -> Result<()> {
+    let home = match home_override {
+        Some(h) => h.clone(),
+        None => crate::mode::cargo_dotnet_home()?,
+    };
+    let root = home.join("crates");
+    for name in ["mycorrhiza", "dotnet_macros"] {
+        let src = from_repo.join(name);
+        if !src.is_dir() {
+            bail!("SDK crate source is missing: {}", src.display());
+        }
+        copy_dir_overwrite(&src, &root.join(name))
+            .with_context(|| format!("provisioning SDK crate {name}"))?;
+    }
+    println!("==> provisioned SDK Rust crates -> {}", root.display());
+    Ok(())
 }
 
 /// Copy `<from_repo>/mycorrhiza_interop_helpers` to `<home>/mycorrhiza_interop_helpers`,
@@ -195,8 +221,12 @@ fn warm_pal(_args: &SetupArgs) -> Result<()> {
         prog_args: Vec::new(),
     };
     let ctx = Context::resolve(&build_args, false)?;
-    crate::palinject::inject_all(&ctx)?;
-    eprintln!("== PAL injection warmed (native) ==");
+    let _build_lock = crate::build_lock::BuildLock::acquire_crate(&ctx)?;
+    let private_sysroot = crate::private_sysroot::prepare(&ctx)?;
+    eprintln!(
+        "== private PAL sysroot warmed: {} ==",
+        private_sysroot.root.display()
+    );
     Ok(())
 }
 

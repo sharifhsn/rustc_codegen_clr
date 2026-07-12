@@ -52,7 +52,7 @@ The escape hatch is `getrandom`'s official **custom backend**, selected per majo
 
 | getrandom major | Selector | Symbol the application must provide | Where it must live |
 |---|---|---|---|
-| 0.3 / 0.4 (identical) | `--cfg getrandom_backend="custom"` (a RUSTFLAGS / `.cargo/config.toml` *cfg*, **not** a Cargo feature) | `#[no_mangle] unsafe extern "Rust" fn __getrandom_v03_custom(dest: *mut u8, len: usize) -> Result<(), getrandom::Error>` | "MUST be defined only once for your project … ideally … in the root crate, e.g. `main.rs`"; "upstream library crates SHOULD NOT define it outside of tests and benchmarks." |
+| 0.3 / 0.4 (identical) | `--cfg getrandom_backend="custom"` (a RUSTFLAGS / `.cargo/config.toml` *cfg*, **not** a Cargo feature) | `#[unsafe(no_mangle)] unsafe extern "Rust" fn __getrandom_v03_custom(dest: *mut u8, len: usize) -> Result<(), getrandom::Error>` | "MUST be defined only once for your project … ideally … in the root crate, e.g. `main.rs`"; "upstream library crates SHOULD NOT define it outside of tests and benchmarks." |
 | 0.2 | Cargo **feature** `custom` (the `getrandom_backend` cfg is a 0.3+ invention 0.2 ignores) + the `register_custom_getrandom!(fn)` macro; registered fn is `fn(&mut [u8]) -> Result<(), getrandom::Error>` | macro expands to `__getrandom_custom` | "Functions can only be registered in the root binary crate. Attempting to register a function in a non-root crate will result in a linker error" — explicitly likened to `#[panic_handler]` / `#[global_allocator]`. |
 
 The 0.2 symbol (`__getrandom_custom`) and the 0.3/0.4 symbol (`__getrandom_v03_custom`) are
@@ -119,7 +119,7 @@ glue" is a known-good pattern. Mechanics:
 
 1. After resolution, detect whether `getrandom` is in the graph and which **major(s)** (0.2 / 0.3 / 0.4).
 2. For **0.3/0.4**: the cfg is already set (core line 640). The only missing piece is the symbol, and
-   because it is a plain global `#[no_mangle]`, it can technically be defined by **any** crate in the
+   because it is a plain global `#[unsafe(no_mangle)]`, it can technically be defined by **any** crate in the
    link, not only root — the "root crate / defined once" guidance is *collision-avoidance*, not a hard
    language rule for 0.3/0.4. So generate a tiny shim crate (e.g. `__cargo_dotnet_getrandom_shim`)
    pinned to the **locked** getrandom version (so `getrandom::Error` resolves correctly), defining
@@ -165,7 +165,7 @@ would make `rand`/`uuid::new_v4` fail at runtime), but `cargo dotnet` could expo
 * **Do not** pursue the linker-builtin route for ≥0.3 (Error-type ABI is not constructible by cilly).
 
 **Limits, stated honestly:**
-1. The generated-symbol approach relies on `#[no_mangle]` being global; it must **guard against a
+1. The generated-symbol approach relies on `#[unsafe(no_mangle)]` being global; it must **guard against a
    user already defining it** (duplicate-symbol).
 2. It only has a legal injection target when the build produces a **binary**. A pure-**library** build
    that transitively needs getrandom has no root to carry the symbol — that case must remain

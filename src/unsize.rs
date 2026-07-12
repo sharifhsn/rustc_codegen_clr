@@ -1,19 +1,19 @@
 use crate::assembly::MethodCompileCtx;
 
-use cilly::cilnode::ExtendKind;
-use cilly::{BinOp, Const, IntoAsmIndex, Type};
-use cilly::{FieldDesc, Int, Interned};
-use rustc_abi::FieldIdx;
-use rustc_abi::FIRST_VARIANT;
 use crate::operand::constant::get_vtable;
 use crate::operand::{handle_operand, operand_address};
 use crate::place::place_address_raw;
+use crate::r#type::GetTypeExt;
 use crate::r#type::fat_ptr_to;
 use crate::r#type::utilis::is_fat_ptr;
-use crate::r#type::GetTypeExt;
+use cilly::cilnode::ExtendKind;
+use cilly::{BinOp, Const, IntoAsmIndex, Type};
+use cilly::{FieldDesc, Int, Interned};
+use rustc_abi::FIRST_VARIANT;
+use rustc_abi::FieldIdx;
 use rustc_middle::{
     mir::{Operand, Place},
-    ty::{layout::TyAndLayout, Ty, TyKind, UintTy},
+    ty::{Ty, TyKind, UintTy, layout::TyAndLayout},
 };
 
 type Node = Interned<cilly::ir::CILNode>;
@@ -146,10 +146,7 @@ fn unsized_info<'tcx>(
                 .expect("Could not eval array length.");
             ctx.alloc_node(Const::USize(len))
         }
-        (
-            &TyKind::Dynamic(data_a, _),
-            &TyKind::Dynamic(data_b, _),
-        ) => {
+        (&TyKind::Dynamic(data_a, _), &TyKind::Dynamic(data_b, _)) => {
             let old_info =
                 old_info.expect("unsized_info: missing old info for trait upcasting coercion");
             if data_a.principal_def_id() == data_b.principal_def_id() {

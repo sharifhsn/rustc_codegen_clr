@@ -88,7 +88,7 @@ From C#: `new Counter(5, 100)`, `c.read_value()`, `c.read_step()`. Runnable: `ca
 
 ## 2. Call Rust from C#
 
-Your Rust crate becomes a **.NET class library**. Its `#[no_mangle] pub extern "C"` functions are
+Your Rust crate becomes a **.NET class library**. Its `#[unsafe(no_mangle)] pub extern "C"` functions are
 `public static` methods on `MainModule`; a C# project references the produced `.dll` and calls them as
 ordinary managed methods.
 
@@ -102,7 +102,7 @@ crate-type = ["cdylib"]
 
 ```rust
 // rustlib/src/lib.rs
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn rust_add(a: i32, b: i32) -> i32 { a + b }
 ```
 
@@ -176,7 +176,7 @@ string g = MainModule.greet("World");   // -> "Hello, World, from Rust!"
 ```
 
 The macro leaves your function untouched (still callable from Rust) and emits a hidden
-`#[no_mangle] extern "C"` shim that marshals the managed seam: `&str`/`String` cross as a real managed
+`#[unsafe(no_mangle)] extern "C"` shim that marshals the managed seam: `&str`/`String` cross as a real managed
 `System.String` (so C# sees `string`, **not** a pointer pair — no buffer, no free, no re-decode), and
 the numeric/`bool` primitives pass through unchanged. **No C#-side glue is needed at all** — the shim
 already presents a clean `string`/`int`/`double`/`bool` signature on `MainModule`.

@@ -536,78 +536,55 @@ if [ -f "$UWSRC/lib.rs" ]; then
       { print }' "$UWSRC/lib.rs" > "$UWSRC/lib.rs.__t" && mv "$UWSRC/lib.rs.__t" "$UWSRC/lib.rs"
   fi
 fi
-# The `libc` crate (vendor/libc-0.2.*) is linked into dotnet std (its Cargo dep is
-# gated on not(all(windows, msvc)), which includes dotnet), and std's std::os::fd
-# files (os/fd/raw.rs, owned.rs) reference a small fixed set of `libc::` symbols
-# (close/fcntl/STD*_FILENO/F_DUPFD*). But libc 0.2 has NO module for
-# target_os="dotnet": its top-level cfg_if! falls through to an empty `else {}`.
-# So with os::fd enabled for dotnet (the unified fd-backed net Socket capstone),
-# those `libc::` refs are E0425. Inject a minimal dotnet libc module (extern "C"
-# decls the cilly POSIX shim resolves + the consts) into that empty else block.
-# os=dotnet-only (the else only fires for unsupported OSes). The PAL file lives at
-# dotnet_pal/libc/dotnet.rs. Idempotent (guarded on the dotnet string).
-LIBC_PAL="$CD_REPO/dotnet_pal/libc"
+# libc's public surface is part of the target ABI, not a list of symbols each survey
+# crate happens to need. Route os=dotnet through libc's canonical Linux GNU x86_64
+# module tree; the managed PAL resolves the referenced C ABI symbols by name. This
+# avoids a permanently drifting hand-maintained facade while still keeping rustix on
+# its libc backend (no linux-raw syscalls are selected for target_os=dotnet).
 # build-std resolves libc from the cargo REGISTRY copy (…/.cargo/registry/src/…/
 # libc-0.2.*), NOT the rust-src vendor tree — and the registry copy only exists
 # AFTER a build extracts it, so it may not be present on the first invocation
 # (handled by the cargo-build-time patch step further down). Patch EVERY libc
 # lib.rs we can find (rust-src vendor + registry) so whichever one build-std picks
 # is covered. Idempotent (guarded on the dotnet string).
+widen_dotnet_linux_tree() { # $1 = source subtree whose Linux ABI dotnet shares
+  local tree="$1"
+  [ -d "$tree" ] || return 0
+  find "$tree" -type f -name '*.rs' | while IFS= read -r f; do
+    sed_i 's/any(target_os = "linux", target_os = "dotnet")/target_os = "linux"/g' "$f"
+    sed_i 's/target_os = "linux"/any(target_os = "linux", target_os = "dotnet")/g' "$f"
+  done
+}
 inject_libc() { # $1 = libc src dir
   local d="$1"
   [ -f "$d/lib.rs" ] || return 0
-  [ -f "$LIBC_PAL/dotnet.rs" ] || return 0
-  cp "$LIBC_PAL/dotnet.rs" "$d/dotnet.rs"
-  # PACKAGE A — under the `target-family=["unix"]` flip, `cfg(unix)` is now TRUE
-  # for os=dotnet, so libc 0.2 stops falling into its empty `else{}` and instead
-  # selects its REAL unix module tree (lib.rs `else if #[cfg(unix)]` -> `mod unix`,
-  # plus new/common/posix's `unistd`/`pthread`). That collides with the appended
-  # dotnet arm: both glob-export `c_int`/`c_long`/... (263× E0659) and `unistd`
-  # re-exports a module not wired for this config (1× E0432). The dotnet arm is
-  # the SINGLE intended libc face (LIBC_SHIM_SCOPE / cap2-outcome), so SUPPRESS
-  # libc's own unix/posix arms for os=dotnet by excluding dotnet from their cfgs;
-  # libc then falls back to the empty `else{}` and the dotnet arm is sole. These
-  # three sed patches are the make-or-break AMBER fix and mirror the existing
-  # `not(target_os="dotnet")` exclusions in os/fd. Idempotent (the patterns no
-  # longer match once rewritten). os=dotnet-only effect (no other target's libc
-  # cfg matches the BARE `unix`/`target_family="unix"` predicates we narrow here).
-  # 1) lib.rs top-level: `else if #[cfg(unix)]` (the unix module selector).
-  sed_i 's/} else if #\[cfg(unix)\] {/} else if #[cfg(all(unix, not(target_os = "dotnet")))] {/' "$d/lib.rs"
-  # 2) new/mod.rs per-family headers: `cfg(all(target_family="unix", not(qurt)))`.
+  # Migrate sources touched by the old standalone dotnet.rs facade.
+  sed_i 's/} else if #\[cfg(all(unix, not(target_os = "dotnet")))\] {/} else if #[cfg(unix)] {/' "$d/lib.rs"
   if [ -f "$d/new/mod.rs" ]; then
-    sed_i 's/if #\[cfg(all(target_family = "unix", not(target_os = "qurt")))\] {/if #[cfg(all(target_family = "unix", not(target_os = "qurt"), not(target_os = "dotnet")))] {/' "$d/new/mod.rs"
+    sed_i 's/if #\[cfg(all(target_family = "unix", not(target_os = "qurt"), not(target_os = "dotnet")))\] {/if #[cfg(all(target_family = "unix", not(target_os = "qurt")))] {/' "$d/new/mod.rs"
+    sed_i 's/} else if #\[cfg(target_os = "linux")\] {/} else if #[cfg(any(target_os = "linux", target_os = "dotnet"))] {/' "$d/new/mod.rs"
   fi
-  # 3) new/common/mod.rs: `#[cfg(target_family = "unix")] pub(crate) mod posix;`.
   if [ -f "$d/new/common/mod.rs" ]; then
-    sed_i 's/#\[cfg(target_family = "unix")\]/#[cfg(all(target_family = "unix", not(target_os = "dotnet")))]/' "$d/new/common/mod.rs"
+    sed_i 's/#\[cfg(all(target_family = "unix", not(target_os = "dotnet")))\]/#[cfg(target_family = "unix")]/' "$d/new/common/mod.rs"
   fi
-  grep -qF 'mod dotnet;' "$d/lib.rs" && return 0
-  # Declare the dotnet module at the libc crate ROOT (outside the big arch/os
-  # cfg_if!), cfg-gated on os=dotnet. Appending after the cfg_if avoids any
-  # macro-hygiene quirk of declaring `mod` inside cfg_if's `else` body; the glob
-  # re-export then makes `libc::{close, read, c_int, …}` resolve for dotnet.
-  #
-  # B1: libc is the SINGLE dotnet libc face for BOTH std::os::fd AND mio. Under
-  # the `target-family=["unix"]` flip, cfg(unix) is true so libc 0.2 would pick
-  # its REAL unix module tree, which collides with the appended dotnet arm (263×
-  # E0659 glob dupes + an unwired `unistd` re-export). So libc's own unix/posix
-  # arms are SUPPRESSED for os=dotnet (the three flip-suppression seds above), and
-  # the dotnet arm stays ON for EVERY libc build, declaring the full epoll/socket/
-  # sockaddr surface mio imports (dotnet_pal/libc/dotnet.rs); the POSIX shim
-  # resolves the bodies by bare C-ABI name. Gate is plain target_os="dotnet".
-  {
-    echo ''
-    echo '// DOTNET PAL: the single libc face for os=dotnet (see dotnet_pal/libc/dotnet.rs).'
-    echo '// libc 0.2 has no module for target_os="dotnet" (its top-level cfg_if! falls'
-    echo '// through to an empty else{}); std::os::fd references libc::{close,fcntl,...} and'
-    echo '// (Cap-2.5) near-unmodified mio references libc::{epoll_*,socket,sockaddr_*,...}.'
-    echo '// One dotnet arm serves both; the mio-scoped wrapper re-cfgs ONLY mio, not libc.'
-    echo '#[cfg(target_os = "dotnet")]'
-    echo 'mod dotnet;'
-    echo '#[cfg(target_os = "dotnet")]'
-    echo 'pub use crate::dotnet::*;'
-  } >> "$d/lib.rs"
-  echo "==> injected dotnet libc module ($d)"
+  widen_dotnet_linux_tree "$d/new"
+  if grep -qF '// DOTNET PAL: the single libc face for os=dotnet' "$d/lib.rs"; then
+    awk '/^\/\/ DOTNET PAL: the single libc face for os=dotnet/{exit} {print}' "$d/lib.rs" > "$d/lib.rs.__t" && mv "$d/lib.rs.__t" "$d/lib.rs"
+  fi
+  # A legacy injection also copied the facade beside lib.rs. Remove only a file carrying our
+  # distinctive old header; never claim a future upstream dotnet.rs by filename alone.
+  if [ -f "$d/dotnet.rs" ] && grep -qF 'SINGLE libc face for' "$d/dotnet.rs"; then
+    rm -f "$d/dotnet.rs"
+  fi
+
+  # Widen the upstream platform cascades without copying any ABI definitions.
+  if ! grep -qF '        target_os = "dotnet",' "$d/unix/mod.rs"; then
+    awk '{if (prev == "        target_os = \"linux\"," && $0 == "        target_os = \"l4re\",") print "        target_os = \"dotnet\","; print; prev=$0}' "$d/unix/mod.rs" > "$d/unix/mod.rs.__t" && mv "$d/unix/mod.rs.__t" "$d/unix/mod.rs"
+  fi
+  sed_i 's/} else if #\[cfg(target_os = "linux")\] {/} else if #[cfg(any(target_os = "linux", target_os = "dotnet"))] {/' "$d/unix/linux_like/mod.rs"
+  sed_i 's/} else if #\[cfg(target_env = "gnu")\] {/} else if #[cfg(any(target_env = "gnu", target_os = "dotnet"))] {/' "$d/unix/linux_like/linux/mod.rs"
+  widen_dotnet_linux_tree "$d/unix/linux_like/linux"
+  echo "==> routed dotnet through canonical Linux GNU libc ($d)"
 }
 # Patch any libc copies present now (rust-src vendor + already-extracted registry).
 for d in $(find "$SRC/../../.." "$CD_REGISTRY_SRC" -path '*libc-0.2*/src/lib.rs' 2>/dev/null); do
@@ -739,14 +716,14 @@ apply_overlays() { # cwd = the project dir; reads $CD_REPO/dotnet_overlays/REGIS
   # dir is emitted — single-version-per-name). A name with no lock yet (no Cargo.lock)
   # falls back to emitting all single-overlay names only.
   local paths_lines="" n v d count
-  # count overlays per name (to detect multi-version names).
-  declare -A name_count=()
-  while IFS= read -r n; do [ -n "$n" ] && name_count["$n"]=$(( ${name_count["$n"]:-0} + 1 )); done <<< "$names"
   # iterate the three parallel arrays in lock-step.
   paste <(echo "$names") <(echo "$vers") <(echo "$dirs") | while IFS=$'\t' read -r n v d; do
     [ -n "$n" ] || continue
     [ -d "$CD_REPO/dotnet_overlays/$d" ] || { echo "!! overlay dir missing: $CD_REPO/dotnet_overlays/$d"; continue; }
-    count="${name_count["$n"]:-1}"
+    # macOS still ships Bash 3.2, which has no associative arrays. Count the
+    # (small) overlay list portably instead of requiring `declare -A` merely to
+    # distinguish the versioned getrandom overlays from singletons.
+    count="$(printf '%s\n' "$names" | awk -v want="$n" '$0 == want { count++ } END { print count + 0 }')"
     if [ "$count" -gt 1 ] && [ -f Cargo.lock ]; then
       # Multi-version name: emit ONLY if this exact version is locked.
       if ! locked_versions "$n" | grep -qxF "$v"; then continue; fi
@@ -826,6 +803,18 @@ apply_overlays
 cargo -Zjson-target-spec fetch >/dev/null 2>&1 || true
 for d in $(find "$CD_REGISTRY_SRC" -path '*libc-0.2*/src/lib.rs' 2>/dev/null); do
   inject_libc "$(dirname "$d")"
+done
+for d in $(find "$CD_REGISTRY_SRC" -path '*rustix-*/build.rs' 2>/dev/null); do
+  crate_dir="$(dirname "$d")"
+  sed_i 's/if os == "linux" || os == "l4re" || os == "android" || os == "emscripten" {/if os == "linux" || os == "dotnet" || os == "l4re" || os == "android" || os == "emscripten" {/' "$d"
+  sed_i 's/if os == "android" || os == "linux" {/if os == "android" || os == "linux" || os == "dotnet" {/' "$d"
+  widen_dotnet_linux_tree "$crate_dir/src"
+done
+for d in $(find "$CD_REGISTRY_SRC" -path '*async-fs-*/src/lib.rs' 2>/dev/null); do
+  awk '{line[NR]=$0} END {for(i=1;i<=NR;i++){if(line[i]=="#[cfg(unix)]" && (line[i+1] ~ /^impl std::os::unix::io::AsRawFd for File/ || line[i+1] ~ /^impl From<std::os::unix::io::OwnedFd> for File/ || line[i+1] ~ /^impl std::os::unix::io::AsFd for File/)) print "#[cfg(all(unix, not(target_os = \"dotnet\")))]"; else print line[i]}}' "$d" > "$d.__t" && mv "$d.__t" "$d"
+done
+for d in $(find "$CD_REGISTRY_SRC" -path '*polling-*/src/lib.rs' 2>/dev/null); do
+  widen_dotnet_linux_tree "$(dirname "$d")"
 done
 # Build. Filter the log like dev.sh unless CD_VERBOSE=1 (errors always shown).
 if [ "${CD_VERBOSE:-0}" = 1 ]; then

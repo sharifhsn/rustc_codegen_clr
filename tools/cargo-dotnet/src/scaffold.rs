@@ -21,7 +21,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::cli::{NewArgs, Template};
 
@@ -31,7 +31,12 @@ pub fn run(args: &NewArgs) -> Result<i32> {
     let name = resolve_name(args)?;
     let dir = target_dir(args, &name)?;
 
-    if dir.exists() && dir.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false) {
+    if dir.exists()
+        && dir
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+    {
         bail!(
             "target directory is not empty: {} (pass a fresh path, or remove it first)",
             dir.display()
@@ -69,7 +74,8 @@ fn valid_crate_name(name: &str) -> bool {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
         _ => return false,
     }
-    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Resolve the crate name: explicit `--name`, else the final component of the path.
@@ -132,15 +138,20 @@ fn app_files(name: &str) -> Vec<File> {
                  edition = \"2021\"\n\
                  \n\
                  [dependencies]\n\
-                 mycorrhiza = {{ path = \"{MYCORRHIZA_PATH}\" }}\n\
+                 mycorrhiza = \"0.0.0\"\n\
                  # NOTE: do NOT set the abort panic strategy — the native build-std has no\n\
                  # panic_abort crate; the default unwinding profile is what the backend expects.\n\
                  [workspace]\n",
-                MYCORRHIZA_PATH = mycorrhiza_path_hint(),
             ),
         },
-        File { rel: ".gitignore", body: GITIGNORE_RUST.to_string() },
-        File { rel: "src/main.rs", body: APP_MAIN.to_string() },
+        File {
+            rel: ".gitignore",
+            body: GITIGNORE_RUST.to_string(),
+        },
+        File {
+            rel: "src/main.rs",
+            body: APP_MAIN.to_string(),
+        },
     ]
 }
 
@@ -165,16 +176,21 @@ fn lib_files(name: &str) -> Vec<File> {
                  crate-type = [\"cdylib\"]\n\
                  \n\
                  [dependencies]\n\
-                 mycorrhiza = {{ path = \"{MYCORRHIZA_PATH}\" }}\n\
+                 mycorrhiza = \"0.0.0\"\n\
                  [workspace]\n\
                  \n\
                  [profile.release.build-override]\n\
                  codegen-units = 1\n",
-                MYCORRHIZA_PATH = mycorrhiza_lib_path_hint(),
             ),
         },
-        File { rel: "rustlib/.gitignore", body: GITIGNORE_RUSTLIB.to_string() },
-        File { rel: "rustlib/src/lib.rs", body: LIB_RUST.to_string() },
+        File {
+            rel: "rustlib/.gitignore",
+            body: GITIGNORE_RUSTLIB.to_string(),
+        },
+        File {
+            rel: "rustlib/src/lib.rs",
+            body: LIB_RUST.to_string(),
+        },
         File {
             rel: "csharp/Program.cs",
             body: LIB_CS_PROGRAM.replace("__CRATE__", name),
@@ -183,7 +199,10 @@ fn lib_files(name: &str) -> Vec<File> {
             rel: &leak_str(format!("csharp/{cs_name}.csproj")),
             body: csproj_containers(&cs_name),
         },
-        File { rel: "csharp/.gitignore", body: GITIGNORE_CS.to_string() },
+        File {
+            rel: "csharp/.gitignore",
+            body: GITIGNORE_CS.to_string(),
+        },
     ]
 }
 
@@ -208,18 +227,22 @@ fn plugin_files(name: &str) -> Vec<File> {
                  crate-type = [\"cdylib\"]\n\
                  \n\
                  [dependencies]\n\
-                 mycorrhiza = {{ path = \"{MYCORRHIZA_PATH}\" }}\n\
-                 dotnet_macros = {{ path = \"{DOTNET_MACROS_PATH}\" }}\n\
+                 mycorrhiza = \"0.0.0\"\n\
+                 dotnet_macros = \"0.1.0\"\n\
                  [workspace]\n\
                  \n\
                  [profile.release.build-override]\n\
                  codegen-units = 1\n",
-                MYCORRHIZA_PATH = mycorrhiza_lib_path_hint(),
-                DOTNET_MACROS_PATH = dotnet_macros_path_hint(),
             ),
         },
-        File { rel: "rustlib/.gitignore", body: GITIGNORE_RUSTLIB.to_string() },
-        File { rel: "rustlib/src/lib.rs", body: PLUGIN_RUST.to_string() },
+        File {
+            rel: "rustlib/.gitignore",
+            body: GITIGNORE_RUSTLIB.to_string(),
+        },
+        File {
+            rel: "rustlib/src/lib.rs",
+            body: PLUGIN_RUST.to_string(),
+        },
         File {
             rel: "csharp/Program.cs",
             body: PLUGIN_CS_PROGRAM.to_string(),
@@ -228,12 +251,16 @@ fn plugin_files(name: &str) -> Vec<File> {
             rel: &leak_str(format!("csharp/{cs_name}.csproj")),
             body: csproj_plain(&cs_name),
         },
-        File { rel: "csharp/.gitignore", body: GITIGNORE_CS.to_string() },
+        File {
+            rel: "csharp/.gitignore",
+            body: GITIGNORE_CS.to_string(),
+        },
     ]
 }
 
 // ---------------------------------------------------------------------------------
-// Path hints for the mycorrhiza / dotnet_macros path dependencies.
+// SDK crates are ordinary version dependencies in portable manifests. cargo-dotnet's
+// private build config redirects them to the copies installed under CARGO_DOTNET_HOME.
 // ---------------------------------------------------------------------------------
 //
 // A scaffolded project needs `mycorrhiza = { path = ... }`. Outside the repo there is
@@ -242,23 +269,6 @@ fn plugin_files(name: &str) -> Vec<File> {
 // example crates use `../../mycorrhiza`; we cannot know the scaffold's depth, so we emit
 // the env-anchored path and rely on the printed note.
 
-fn mycorrhiza_path_hint() -> &'static str {
-    // For an --app scaffolded at <cwd>/<name>, the repo layout the examples use is two
-    // levels up (cargo_tests/cd_*/ -> ../../mycorrhiza). We keep that as the DEFAULT and
-    // tell the user to adjust if they scaffolded elsewhere.
-    "../../mycorrhiza"
-}
-
-fn mycorrhiza_lib_path_hint() -> &'static str {
-    // For --lib/--plugin the Rust crate lives one level deeper (<name>/rustlib), so the
-    // examples use ../../../mycorrhiza.
-    "../../../mycorrhiza"
-}
-
-fn dotnet_macros_path_hint() -> &'static str {
-    "../../../dotnet_macros"
-}
-
 // ---------------------------------------------------------------------------------
 // csproj rendering.
 // ---------------------------------------------------------------------------------
@@ -266,9 +276,10 @@ fn dotnet_macros_path_hint() -> &'static str {
 /// The C#-consumer csproj for `--lib`: opts into the shipped RustVec<T>/RustBoxVec<T>
 /// wrappers and auto-builds the Rust crate via RustDotnet.targets.
 fn csproj_containers(cs_name: &str) -> String {
-    CSPROJ_TEMPLATE
-        .replace("__ASSEMBLY__", cs_name)
-        .replace("__CONTAINERS_PROP__", "\n    <UseRustDotnetContainers>true</UseRustDotnetContainers>")
+    CSPROJ_TEMPLATE.replace("__ASSEMBLY__", cs_name).replace(
+        "__CONTAINERS_PROP__",
+        "\n    <UseRustDotnetContainers>true</UseRustDotnetContainers>",
+    )
 }
 
 /// The C#-host csproj for `--plugin`: no containers, just auto-builds the Rust crate.
@@ -284,25 +295,26 @@ fn csproj_plain(cs_name: &str) -> String {
 
 fn print_next_steps(template: Template, name: &str, dir: &Path) {
     let d = dir.display();
-    println!("== scaffolded {} project '{name}' at {d} ==", template.label());
+    println!(
+        "== scaffolded {} project '{name}' at {d} ==",
+        template.label()
+    );
     println!();
     match template {
         Template::App => {
             println!("Next:");
             println!("  cd {d}");
-            println!("  # adjust the `mycorrhiza` path dependency in Cargo.toml if needed");
             println!("  cargo dotnet run");
         }
         Template::Lib | Template::Plugin => {
             println!("Next:");
             println!("  cd {d}/csharp");
-            println!("  # adjust the `mycorrhiza` path dependency in ../rustlib/Cargo.toml if needed");
-            println!("  # ensure CARGO_DOTNET_HOME points at your install (or ~/.cargo-dotnet exists)");
+            println!(
+                "  # ensure CARGO_DOTNET_HOME points at your install (or ~/.cargo-dotnet exists)"
+            );
             println!("  dotnet run -c Release");
         }
     }
-    println!();
-    println!("(the `mycorrhiza` path deps default to the in-repo layout; run `cargo dotnet doctor` if a build fails)");
 }
 
 // ---------------------------------------------------------------------------------
@@ -435,7 +447,7 @@ const PLUGIN_RUST: &str = r#"//! A Rust cdylib that DEFINES a managed .NET class
 //!
 //! The annotated struct becomes a real managed reference type with a parameterized primary
 //! constructor and a `read_<field>()` accessor per field. A C# host can `new Counter(5, 100)` and
-//! call `read_value()` / `read_step()` — no `#[no_mangle]`, no marshalling boilerplate.
+//! call `read_value()` / `read_step()` — no `#[unsafe(no_mangle)]`, no marshalling boilerplate.
 #![feature(adt_const_params, unsized_const_params)]
 #![allow(internal_features, incomplete_features, dead_code)]
 
@@ -549,22 +561,34 @@ mod tests {
         let rels: Vec<&str> = files.iter().map(|f| f.rel).collect();
         assert!(rels.contains(&"rustlib/Cargo.toml"));
         assert!(rels.contains(&"rustlib/src/lib.rs"));
-        assert!(rels.iter().any(|r| r.starts_with("csharp/") && r.ends_with(".csproj")));
+        assert!(
+            rels.iter()
+                .any(|r| r.starts_with("csharp/") && r.ends_with(".csproj"))
+        );
         assert!(rels.contains(&"csharp/Program.cs"));
         // csproj name derives from the crate name.
-        let csproj = files
-            .iter()
-            .find(|f| f.rel.ends_with(".csproj"))
-            .unwrap();
+        let csproj = files.iter().find(|f| f.rel.ends_with(".csproj")).unwrap();
         assert_eq!(csproj.rel, "csharp/mylib_cs.csproj");
-        assert!(csproj.body.contains("<AssemblyName>mylib_cs</AssemblyName>"));
+        assert!(
+            csproj
+                .body
+                .contains("<AssemblyName>mylib_cs</AssemblyName>")
+        );
         // containers opt-in present for --lib.
         assert!(csproj.body.contains("UseRustDotnetContainers"));
         // Rust side exports the container core.
-        let lib = &files.iter().find(|f| f.rel == "rustlib/src/lib.rs").unwrap().body;
+        let lib = &files
+            .iter()
+            .find(|f| f.rel == "rustlib/src/lib.rs")
+            .unwrap()
+            .body;
         assert!(lib.contains("export_rust_containers!()"));
         // Program.cs got the crate name interpolated into its banner.
-        let prog = &files.iter().find(|f| f.rel == "csharp/Program.cs").unwrap().body;
+        let prog = &files
+            .iter()
+            .find(|f| f.rel == "csharp/Program.cs")
+            .unwrap()
+            .body;
         assert!(prog.contains("mylib:"));
         assert!(!prog.contains("__CRATE__"));
     }
@@ -584,7 +608,11 @@ mod tests {
             .body;
         assert!(cargo.contains("dotnet_macros"));
         // Rust side uses #[dotnet_class].
-        let lib = &files.iter().find(|f| f.rel == "rustlib/src/lib.rs").unwrap().body;
+        let lib = &files
+            .iter()
+            .find(|f| f.rel == "rustlib/src/lib.rs")
+            .unwrap()
+            .body;
         assert!(lib.contains("#[dotnet_class]"));
         // plugin csproj does NOT opt into containers.
         let csproj = files.iter().find(|f| f.rel.ends_with(".csproj")).unwrap();

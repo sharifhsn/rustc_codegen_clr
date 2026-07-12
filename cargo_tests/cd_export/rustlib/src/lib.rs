@@ -2,12 +2,12 @@
 //!
 //! Each `#[dotnet_export]` fn below is written as ordinary, idiomatic Rust — `&str`/`String`
 //! parameters and returns, plain primitives. The macro leaves the function untouched (still callable
-//! from Rust) and emits a hidden `#[no_mangle] extern "C"` shim that marshals the managed seam: the
+//! from Rust) and emits a hidden `#[unsafe(no_mangle)] extern "C"` shim that marshals the managed seam: the
 //! string types cross as a real managed `System.String`, so the C# consumer calls
 //! `MainModule.greet("World")` and gets back a `string` — with NO hand-written `(ptr, len)` buffer
 //! dance (contrast `cargo_tests/cd_interop`, which spells that dance out by hand).
 //!
-//! No entrypoint: this is a `cdylib`. `#[no_mangle]` (emitted by the macro) roots each export against
+//! No entrypoint: this is a `cdylib`. `#[unsafe(no_mangle)]` (emitted by the macro) roots each export against
 //! dead-code elimination, so the library's API survives even without a `main`.
 
 use dotnet_macros::dotnet_export;
@@ -78,6 +78,15 @@ pub fn boom(reason: &str) -> i32 {
     panic!("boom: {reason}");
     #[allow(unreachable_code)]
     0
+}
+
+/// `Result<T, E>` is resolved inside the generated shim: `Ok(T)` returns `T`, while `Err(E)`
+/// becomes a managed exception carrying `E`'s `Display` text. The `Result` itself never crosses the
+/// managed seam or becomes the payload of the shim's `catch_unwind`.
+#[dotnet_export(error = "exception")]
+pub fn checked_answer(ok: bool) -> Result<i32, String> {
+    ok.then_some(42)
+        .ok_or_else(|| "checked answer failed".to_string())
 }
 
 // ---- Case A: `Task`/`TaskT<T>` returns (docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md Tier C §6) ----------

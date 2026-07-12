@@ -16,8 +16,8 @@ possible intended.
 """
 keywords      = ["io", "socket", "network"]
 categories    = ["api-bindings", "network-programming"]
-edition       = "2021"
-rust-version  = "1.70"
+edition       = "2024"
+rust-version  = "1.85"
 include       = [
   "Cargo.toml",
   "LICENSE-APACHE",

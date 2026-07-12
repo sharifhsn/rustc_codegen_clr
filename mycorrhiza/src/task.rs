@@ -78,8 +78,9 @@ use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::intrinsics::{
-    rustc_clr_interop_generic_call1, rustc_clr_interop_generic_call2, rustc_clr_interop_generic_ctor0,
     RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric, RustcCLRInteropTypeGeneric,
+    rustc_clr_interop_generic_call1, rustc_clr_interop_generic_call2,
+    rustc_clr_interop_generic_ctor0,
 };
 
 /// `Task` / `Task<T>` / `TaskCompletionSource<T>` all live in the core implementation assembly
@@ -93,8 +94,7 @@ const TASK_GEN: &str = "System.Threading.Tasks.Task";
 /// `TaskT` (not `Task`) so it doesn't collide with the non-generic [`crate::bindings::Task`]. `T` must
 /// be a boundary-crossing .NET type (a primitive, a `#[repr(C)]` value type, or a managed handle),
 /// exactly as for [`crate::collections`].
-pub type TaskT<T> =
-    RustcCLRInteropManagedGeneric<{ CORELIB }, { TASK_GEN }, (T,)>;
+pub type TaskT<T> = RustcCLRInteropManagedGeneric<{ CORELIB }, { TASK_GEN }, (T,)>;
 
 /// The raw non-generic managed `System.Threading.Tasks.Task` handle (same underlying type as
 /// [`crate::bindings::Task`]). Wrapped by [`Task`] so this module can carry its own inherent methods
@@ -115,7 +115,11 @@ type ActionHandle = RustcCLRInteropManagedGeneric<{ CORELIB }, { "System.Action"
 #[inline]
 fn task_is_completed<T>(t: TaskT<T>) -> bool {
     rustc_clr_interop_generic_call1::<
-        { CORELIB }, { TASK_GEN }, false, "get_IsCompleted", 2u8,
+        { CORELIB },
+        { TASK_GEN },
+        false,
+        "get_IsCompleted",
+        2u8,
         (T,),
         (bool,),
         bool,
@@ -127,7 +131,11 @@ fn task_is_completed<T>(t: TaskT<T>) -> bool {
 #[inline]
 fn task_is_faulted<T>(t: TaskT<T>) -> bool {
     rustc_clr_interop_generic_call1::<
-        { CORELIB }, { TASK_GEN }, false, "get_IsFaulted", 2u8,
+        { CORELIB },
+        { TASK_GEN },
+        false,
+        "get_IsFaulted",
+        2u8,
         (T,),
         (bool,),
         bool,
@@ -139,7 +147,11 @@ fn task_is_faulted<T>(t: TaskT<T>) -> bool {
 #[inline]
 fn task_is_canceled<T>(t: TaskT<T>) -> bool {
     rustc_clr_interop_generic_call1::<
-        { CORELIB }, { TASK_GEN }, false, "get_IsCanceled", 2u8,
+        { CORELIB },
+        { TASK_GEN },
+        false,
+        "get_IsCanceled",
+        2u8,
         (T,),
         (bool,),
         bool,
@@ -153,7 +165,11 @@ fn task_is_canceled<T>(t: TaskT<T>) -> bool {
 #[inline]
 fn task_result<T>(t: TaskT<T>) -> T {
     rustc_clr_interop_generic_call1::<
-        { CORELIB }, { TASK_GEN }, false, "get_Result", 2u8,
+        { CORELIB },
+        { TASK_GEN },
+        false,
+        "get_Result",
+        2u8,
         (T,),
         (RustcCLRInteropTypeGeneric<0>,),
         T,
@@ -215,7 +231,9 @@ impl<T> TaskFuture<T> {
     /// Wrap a managed `Task<T>` handle directly.
     #[inline]
     pub fn new(task: TaskT<T>) -> Self {
-        Self { task: crate::class::GenericClass::from_naked_ref(task) }
+        Self {
+            task: crate::class::GenericClass::from_naked_ref(task),
+        }
     }
 
     /// `true` if the wrapped Task faulted (ended by throwing). Useful to check before `.await` if you
@@ -304,9 +322,11 @@ impl Task {
     #[inline]
     pub fn run(f: extern "C" fn()) -> Task {
         let action: ActionHandle = crate::intrinsics::rustc_clr_interop_delegate::<
-            { CORELIB }, { "System.Action" }, false,
-            (),        // Action has no generic args
-            ((),),     // shim `calli` sig: () -> void
+            { CORELIB },
+            { "System.Action" },
+            false,
+            (),    // Action has no generic args
+            ((),), // shim `calli` sig: () -> void
             extern "C" fn(),
         >(f);
         Self::from_raw(RawTask::static1::<"Run", ActionHandle, RawTask>(action))
@@ -344,7 +364,9 @@ impl TaskUnitFuture {
     /// Wrap a non-generic managed [`Task`].
     #[inline]
     pub fn new(task: Task) -> Self {
-        Self { task: crate::class::Class::from_naked_ref(task.raw()) }
+        Self {
+            task: crate::class::Class::from_naked_ref(task.raw()),
+        }
     }
 }
 
@@ -424,7 +446,9 @@ type TaskCompletionSourceT<T> = RustcCLRInteropManagedGeneric<{ CORELIB }, { TCS
 #[inline]
 fn tcs_new<T>() -> TaskCompletionSourceT<T> {
     rustc_clr_interop_generic_ctor0::<
-        { CORELIB }, { TCS_GEN }, false,
+        { CORELIB },
+        { TCS_GEN },
+        false,
         (T,),
         ((),),
         TaskCompletionSourceT<T>,
@@ -434,7 +458,11 @@ fn tcs_new<T>() -> TaskCompletionSourceT<T> {
 #[inline]
 fn tcs_set_result<T>(tcs: TaskCompletionSourceT<T>, value: T) {
     rustc_clr_interop_generic_call2::<
-        { CORELIB }, { TCS_GEN }, false, "SetResult", 2u8,
+        { CORELIB },
+        { TCS_GEN },
+        false,
+        "SetResult",
+        2u8,
         (T,),
         ((), RustcCLRInteropTypeGeneric<0>),
         (),
@@ -447,7 +475,11 @@ fn tcs_set_result<T>(tcs: TaskCompletionSourceT<T>, value: T) {
 #[inline]
 fn tcs_get_task<T>(tcs: TaskCompletionSourceT<T>) -> TaskT<T> {
     rustc_clr_interop_generic_call1::<
-        { CORELIB }, { TCS_GEN }, false, "get_Task", 2u8,
+        { CORELIB },
+        { TCS_GEN },
+        false,
+        "get_Task",
+        2u8,
         (T,),
         (TaskT<RustcCLRInteropTypeGeneric<0>>,), // Sig return: `Task<!0>` (def shape)
         TaskT<T>,

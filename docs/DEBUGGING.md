@@ -66,7 +66,8 @@ use); the step where native stays correct but the backend flips is the miscompil
   (the reliable source of emitted CIL; works where `DUMP_MIR` misses bin-CU/strategy fns).
 - `DUMP_MIR=<substr>` (`src/assembly.rs`) — dump the optimized MIR the backend received, for MIR↔CIL
   alignment. Blind to fns codegen'd in passes that don't carry the env; prefer `cil` + runtime traces.
-- `OPT_FUEL=0` fully disables the optimizer (note: `OPTIMIZE_CIL=0` does NOT — the linker always opts).
+- `OPTIMIZE_CIL=0` fully disables the optimizer. `OPT_FUEL` only bounds work while optimization
+  remains enabled.
 
 ## Method (what worked on regex)
 1. `rcc-debug stack` → the crash is in `create_cache`, **not** `drop` as assumed. (Corrected the whole diagnosis.)

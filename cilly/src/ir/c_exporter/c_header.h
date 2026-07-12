@@ -209,14 +209,28 @@ void* aligned_alloc(size_t align, size_t size){
 	return malloc(size);
 }
 #endif
-static inline void* System_Runtime_InteropServices_NativeMemory_AlignedAllocusizeusizepv(size_t size,size_t align) {
-    if (align > (0x10000))pal_internal_error();
+static inline void* rcl_aligned_alloc(size_t size, size_t align) {
+    /* Rust layouts permit alignments below sizeof(void*), while the host C
+       allocator generally does not. C11 also requires size to be an exact
+       multiple of alignment; NativeMemory.AlignedAlloc and Rust's allocator
+       ABI impose no such restriction on callers. Adapt those contracts here. */
+    if (align < sizeof(void*)) align = sizeof(void*);
+    if ((align & (align - 1)) != 0 || align > 0x10000) {
+        pal_internal_error();
+        return NULL;
+    }
+    if (size > SIZE_MAX - (align - 1)) return NULL;
+    size = (size + (align - 1)) & ~(align - 1);
+    if (size == 0) size = align;
     return aligned_alloc(align, size);
+}
+static inline void* System_Runtime_InteropServices_NativeMemory_AlignedAllocusizeusizepv(size_t size,size_t align) {
+    return rcl_aligned_alloc(size, align);
 }
 #define System_Runtime_InteropServices_NativeMemory_AlignedFreepvv free
 static inline void *System_Runtime_InteropServices_NativeMemory_AlignedReallocpvusizeuspv(void *ptr, uintptr_t size, uintptr_t align)
 {
-    void *new_buff = aligned_alloc(align, size);
+    void *new_buff = rcl_aligned_alloc(size, align);
     memcpy(new_buff, ptr, size);
     free(ptr);
     return new_buff;
@@ -308,24 +322,41 @@ void abort(){
 #define System_UInt128_op_Expliciti64u128(val) (__uint128_t)(val)
 #define System_Int128_op_Expliciti128u128(val) (__uint128_t)(val)
 #ifndef NO_FLOAT
+/*
+ * Rust float-to-integer casts saturate and map NaN to zero.  A direct C cast
+ * is undefined for NaN and out-of-range values, so guard the conversion while
+ * the value is still floating point.  Use powers of two as the upper bounds:
+ * unlike `(long double)MAX`, these are exact and keep the actual cast strictly
+ * inside C's representable range.
+ */
+static inline __uint128_t rust_float_to_u128(long double val) {
+    if (isnan(val) || val <= 0.0L) return 0;
+    if (val >= ldexpl(1.0L, 128)) return ~(__uint128_t)0;
+    return (__uint128_t)val;
+}
+static inline __int128_t rust_float_to_i128(long double val) {
+    const __uint128_t sign_bit = (__uint128_t)1 << 127;
+    const __int128_t max = (__int128_t)(sign_bit - 1);
+    const __int128_t min = -max - 1;
+    const long double limit = ldexpl(1.0L, 127);
+    if (isnan(val)) return 0;
+    if (val <= -limit) return min;
+    if (val >= limit) return max;
+    return (__int128_t)val;
+}
 static inline __uint128_t System_UInt128_op_Explicitf32u128(float val) {
-    if(val < 0.0){
-        return 0;
-    }else{
-        return (__uint128_t)val;
-    }
+    return rust_float_to_u128((long double)val);
 }
 static inline __uint128_t System_UInt128_op_Explicitf64u128(double val) {
-    if(val < 0.0){
-        return 0;
-    }else{
-        return (__uint128_t)val;
-    }
+    return rust_float_to_u128((long double)val);
+}
+static inline __int128_t System_Int128_op_Explicitf32i128(float val) {
+    return rust_float_to_i128((long double)val);
+}
+static inline __int128_t System_Int128_op_Explicitf64i128(double val) {
+    return rust_float_to_i128((long double)val);
 }
 #endif
-
-#define System_Int128_op_Explicitf64i128(val) (__int128_t)(val)
-#define System_Int128_op_Explicitf32i128(val) (__int128_t)(val)
 
 #define System_Int128_op_Impliciti8i128(val) (__int128_t)(val)
 #define System_Int128_op_Implicitu8i128(val) (__int128_t)(val)
@@ -344,8 +375,12 @@ static inline __uint128_t System_UInt128_op_Explicitf64u128(double val) {
 #define System_UInt128_op_Implicitu64u128(val) (__uint128_t)(val)
 #define System_UInt128_op_Implicitusizeu128(val) (__uint128_t)(val)
 
-#define System_Int128_op_OnesComplementi128i128(val) ~val
-#define System_UInt128_op_OnesComplementu128u128(val) ~val
+static inline __int128_t System_Int128_op_OnesComplementi128i128(__int128_t val) {
+    return ~val;
+}
+static inline __uint128_t System_UInt128_op_OnesComplementu128u128(__uint128_t val) {
+    return ~val;
+}
 
 #define System_Buffers_Binary_BinaryPrimitives_ReverseEndiannessi128i128(val) (__int128_t) __builtin_bswap128((__uint128_t)val)
 #define System_Buffers_Binary_BinaryPrimitives_ReverseEndiannessu128u128 __builtin_bswap128
@@ -396,6 +431,10 @@ static inline __uint128_t System_UInt128_PopCountu128u128(__uint128_t val) {
 #define System_String_Concatststst(a, b) a b
 #define System_String_Concatstststst(a, b, c) a b c
 #define System_String_Concatststststst(a, b, c, d) a b c d
+// Managed terminate handlers prepend the caught exception object to a static diagnostic. C mode
+// has no managed object/stringification surface, so preserve the actionable static message and
+// deliberately discard the synthetic exception value.
+#define System_String_Concatoost(exception, message) (message)
 static inline void System_Console_WriteLineu64v(uint64_t arg)
 {
     printf("%lu\n", arg);
@@ -479,6 +518,40 @@ static inline double System_Double_MinNumberf64f64f64(double a, double b)
     else
         return b;
 }
+/*
+ * System.Single/Double Min and Max implement IEEE 754 minimum/maximum, unlike
+ * C's fmin/fmax: they propagate NaNs and order -0.0 below +0.0.  Keep these
+ * semantics in one runtime shim instead of approximating them at each call
+ * site in generated C.
+ */
+static inline float System_Single_Maxf32f32f32(float a, float b)
+{
+    if (isnan(a)) return a;
+    if (isnan(b)) return b;
+    if (a == 0.0f && b == 0.0f) return signbit(a) ? b : a;
+    return a > b ? a : b;
+}
+static inline double System_Double_Maxf64f64f64(double a, double b)
+{
+    if (isnan(a)) return a;
+    if (isnan(b)) return b;
+    if (a == 0.0 && b == 0.0) return signbit(a) ? b : a;
+    return a > b ? a : b;
+}
+static inline float System_Single_Minf32f32f32(float a, float b)
+{
+    if (isnan(a)) return a;
+    if (isnan(b)) return b;
+    if (a == 0.0f && b == 0.0f) return signbit(a) ? a : b;
+    return a < b ? a : b;
+}
+static inline double System_Double_Minf64f64f64(double a, double b)
+{
+    if (isnan(a)) return a;
+    if (isnan(b)) return b;
+    if (a == 0.0 && b == 0.0) return signbit(a) ? a : b;
+    return a < b ? a : b;
+}
 static inline float System_Single_FusedMultiplyAddf32f32f32f32(float left, float right, float addend)
 {
     return left * right + addend;
@@ -524,13 +597,12 @@ BUILTIN_UNSUPORTED(__atomic_compare_exchange_4,uint32_t,(uint32_t *ptr, uint32_t
 BUILTIN_UNSUPORTED(__atomic_compare_exchange_8,uint64_t,(uint64_t *ptr, uint64_t *expected, uint64_t desired, bool weak, int success_memorder, int failure_memorder))
 BUILTIN_UNSUPORTED(__atomic_compare_exchange_n,uintptr_t,(uintptr_t *ptr, uintptr_t *expected, uintptr_t desired, bool weak, int success_memorder, int failure_memorder))
 #endif
-double fabsf64(double val);
 #define System_Single_Cosf32f32(x) ((float)cos(x))
 #define System_Double_Cosf64f64 cos
 #define System_Single_Sinf32f32(x) ((float)sin(x))
 #define System_Double_Sinf64f64 sin
-#define System_Double_Absf64f64 fabsf64
-#define System_Single_Absf32f32 fabsf32
+#define System_Double_Absf64f64 fabs
+#define System_Single_Absf32f32 fabsf
 #define System_Single_Sqrtf32f32(x) (float)sqrt((double)x)
 #define System_MathF_Sqrtf32f32(x) (float)sqrt((double)x)
 #define System_Double_Sqrtf64f64 sqrt
@@ -877,7 +949,6 @@ static inline intptr_t System_Runtime_InteropServices_Marshal_StringToCoTaskMemU
     return len;
 }
 #endif
-float fabsf32(float input);
 #ifdef FLT16_MIN
 #define System_Half_op_Explicitf32f2(f)(_Float16)(f)
 #endif

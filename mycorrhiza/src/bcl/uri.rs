@@ -153,8 +153,10 @@ impl Uri {
     /// Reverse [`Uri::escape_data_string`] — decode `%XX` sequences back to their characters
     /// (`Uri.UnescapeDataString`).
     pub fn unescape_data_string(value: &str) -> std::string::String {
-        DotNetString::from_handle(MUri::unescape_data_string(DotNetString::from(value).handle()))
-            .to_rust_string()
+        DotNetString::from_handle(MUri::unescape_data_string(
+            DotNetString::from(value).handle(),
+        ))
+        .to_rust_string()
     }
 }
 

@@ -1,7 +1,8 @@
 use ar::Archive;
 
 use cilly::{
-    decode_assembly_artifact, ArtifactAbiConfig, ArtifactAbiConfigMismatch, ArtifactDecodeError, ArtifactFormat, Assembly, DecodedAssemblyArtifact, IString,
+    ArtifactAbiConfig, ArtifactAbiConfigMismatch, ArtifactDecodeError, ArtifactFormat, Assembly,
+    DecodedAssemblyArtifact, IString, decode_assembly_artifact,
 };
 use std::io::Read;
 pub struct LinkableFile {
@@ -33,8 +34,13 @@ pub struct LoadedAssemblies {
 
 impl LoadedAssemblies {
     /// Consumes all loaded state for the linker pipeline.
-    pub fn into_parts(self,
-    ) -> (Assembly, Option<ArtifactAbiConfig>, Vec<LinkableFile>, usize,
+    pub fn into_parts(
+        self,
+    ) -> (
+        Assembly,
+        Option<ArtifactAbiConfig>,
+        Vec<LinkableFile>,
+        usize,
     ) {
         (
             self.assembly,

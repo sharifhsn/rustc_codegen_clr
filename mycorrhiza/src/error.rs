@@ -78,11 +78,7 @@ pub trait Nullable: Copy {
     /// Capture the reference in the closure: `s.map_present(|| DotNetString::from_handle(s).len_utf16())`.
     #[inline(always)]
     fn map_present<R>(self, f: impl FnOnce() -> R) -> Option<R> {
-        if self.is_null_ref() {
-            None
-        } else {
-            Some(f())
-        }
+        if self.is_null_ref() { None } else { Some(f()) }
     }
     /// `null` → [`None`], otherwise [`Some(())`] — just the presence bit, when you only need to branch
     /// on "was there a value?" and don't want to move the reference at all.
@@ -156,11 +152,7 @@ impl core::fmt::Display for ManagedException {
 // triggers a `FailFast` ("unwinding crossed a nounwind ABI boundary") before the IL catch ever runs.
 #[allow(unused_variables)]
 #[inline(never)]
-fn rustc_clr_interop_try_catch(
-    try_fn: fn(*mut u8),
-    data: *mut u8,
-    catch_fn: fn(*mut u8),
-) -> i32 {
+fn rustc_clr_interop_try_catch(try_fn: fn(*mut u8), data: *mut u8, catch_fn: fn(*mut u8)) -> i32 {
     core::intrinsics::abort();
 }
 
@@ -220,7 +212,8 @@ pub fn try_managed<T, F: FnOnce() -> T>(f: F) -> Result<T, ManagedException> {
         caught: false,
     };
     let data = (&raw mut state) as *mut u8;
-    let caught = rustc_clr_interop_try_catch(try_trampoline::<F, T>, data, catch_trampoline::<F, T>);
+    let caught =
+        rustc_clr_interop_try_catch(try_trampoline::<F, T>, data, catch_trampoline::<F, T>);
     if caught != 0 || state.caught {
         Err(ManagedException::new())
     } else {

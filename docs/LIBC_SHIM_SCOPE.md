@@ -451,23 +451,22 @@ three source touches are forced, real walls — documented inline as `// DOTNET 
   the leaky AF_UNIX surface the libc-shim avoids and the dotnet std PAL does not provide. Gated
   `not(target_os="dotnet")`; pal_mio uses only TCP/UDP.
 
-**libc-once-for-both — the reconciliation (CORRECTED from the §4.2 premise).** The §4.2 plan assumed
-the wrapper would give the *single* libc build its real **linux/gnu module** (a "strict superset").
-That premise is **false** and was abandoned: forcing libc's linux module while `target_os="dotnet"`
-is *also* active makes libc 0.2's `new/` module tree inconsistent (the gnu-gated `pub use
-net::route::*` + the `prelude!()` base-type imports `c_int`/... fail — verified `E0433`/`E0432`),
-because `target_os` cannot be *unset* via `--cfg`, only added. The clean resolution: the wrapper
-does **not** re-cfg libc at all. libc stays on its **dotnet arm** for *every* build, and that single
-arm (`dotnet_pal/libc/dotnet.rs`) is the superset declaring the surface for **both** faces —
-`std::os::fd`'s `close`/`fcntl`/`F_DUPFD*` **and** mio's `epoll_*`/`socket`/`bind`/`connect`/
-`accept`/`accept4`/`setsockopt`/`getsockopt` + `epoll_event`/`sockaddr*`/`EPOLL*`/`AF_*`/`SOCK_*`/
-`SO_*` consts. The function **bodies** are resolved at link time by the cilly POSIX shim
-(`posix.rs`/`posix_symbols.rs`/`posix_epoll.rs`) by bare C-ABI symbol name, independent of which libc
-Rust module is in scope. Struct/const layouts mirror Linux x86_64 (the shim hardcodes that numbering:
-`epoll_event` `#[repr(C,packed)]` events:u32@0/data:u64@4 stride 12; `sockaddr_in` family@0/port@2
-net-order/addr@4). So **libc-once-for-both = libc-once, period** — one dotnet arm, no multi-OS
-module conflict, no symbol collision, no std breakage. The `inject_libc` gate is plain
-`target_os="dotnet"`.
+**libc-once-for-both — the reconciliation (updated after the broad crate campaign).** Adding a
+second `target_os="linux"` cfg beside `target_os="dotnet"` was the wrong mechanism: libc 0.2's
+`new/` module tree then selected inconsistent arms. The final implementation does not add a second
+OS and does not maintain a copied binding module. `patch_libc` mechanically widens upstream libc's
+own selection predicates so dotnet follows `unix -> linux_like -> linux -> gnu`; the target spec's
+`env="gnu"` supplies the ABI variant. The same canonical upstream definitions therefore serve
+`std::os::fd`, mio, socket2, rustix's libc backend, and the rest of the dependency graph without a
+surface that grows one declaration at a time.
+
+The function **bodies** are still resolved at link time by the cilly POSIX shim
+(`posix.rs`/`posix_symbols.rs`/`posix_epoll.rs`) by bare C-ABI symbol name. Struct and constant
+layouts come directly from libc's Linux x86_64 GNU modules, matching the numbering/layout assumed
+by that shim (`epoll_event` is packed events:u32@0/data:u64@4, stride 12; `sockaddr_in` is
+family@0/port@2 net-order/addr@4). `patch_libc` also recognizes and removes the old appended dotnet
+arm when upgrading an already-warmed toolchain. So **libc-once-for-both = upstream libc once**: no
+multi-OS cfg, copied façade, symbol collision, or per-crate declaration drift.
 
 **WouldBlock determinism (the other Cap-2.5 fix).** pal_mio was pre-existing ~50% flaky: a
 non-blocking `Socket.Receive` after `Socket.Poll` says ready can still race and throw

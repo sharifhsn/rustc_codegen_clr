@@ -43,9 +43,9 @@ impl Backend {
         match flag {
             Some("native") => Ok(Backend::Native),
             Some("docker") => Ok(Backend::Docker),
-            Some(other) => anyhow::bail!(
-                "unknown CARGO_DOTNET_BACKEND='{other}' (expected: native | docker)"
-            ),
+            Some(other) => {
+                anyhow::bail!("unknown CARGO_DOTNET_BACKEND='{other}' (expected: native | docker)")
+            }
             None => Ok(match mode {
                 Mode::Installed { .. } => Backend::Native,
                 Mode::Dev { .. } => Backend::Docker,

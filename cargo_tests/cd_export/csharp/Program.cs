@@ -158,6 +158,21 @@ public static class Program
         // didn't corrupt or abort the runtime — it took an ordinary managed-exception control path).
         Check("add(2,3) after boom() panic", MainModule.add(2, 3), 5, ref pass, ref total);
 
+        Check("checked_answer(true)", MainModule.checked_answer(true), 42, ref pass, ref total);
+        {
+            total++;
+            try
+            {
+                MainModule.checked_answer(false);
+                Console.WriteLine("  [FAIL] checked_answer(false) throws");
+            }
+            catch (Exception e)
+            {
+                bool ok = e.Message.Contains("checked answer failed");
+                if (ok) pass++;
+                Console.WriteLine($"  [{(ok ? "OK" : "FAIL")}] checked_answer(false) throws: {e.Message}");
+            }
+        }
         // ---- Case A: Task/Task<T> returns --------------------------------------------------------
         //
         // The CS0012 gap noted above is now fixed: `ref_assembly_name_for_type` (both exporters)

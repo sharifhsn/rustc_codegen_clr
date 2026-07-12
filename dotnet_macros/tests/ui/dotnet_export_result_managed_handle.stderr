@@ -1,0 +1,5 @@
+error: #[dotnet_export]: `error = "exception"` cannot be used with a managed-handle success type: the original Rust `Result<T, E>` would place a managed reference in overlapping enum storage before the generated shim can unwrap it
+ --> tests/ui/dotnet_export_result_managed_handle.rs:6:27
+  |
+6 | pub fn fallible_task() -> Result<TaskT<i32>, String> {
+  |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,7 +1,7 @@
 use crate::{assembly::MethodCompileCtx, utilis::const_sizeof};
 use cilly::{
-    cilnode::{ExtendKind, IsPure, MethodKind},
     BinOp, Int, Interned, Type,
+    cilnode::{ExtendKind, IsPure, MethodKind},
     {ClassRef, MethodRef},
 };
 

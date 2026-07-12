@@ -2,12 +2,13 @@ use fxhash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use super::{
+    Access, Assembly, BasicBlock, CILIter, CILIterElem, CILNode, ClassRef, FnSig, Int,
+    IntoAsmIndex, Type,
     asm_link::{RelocateCtx, RelocateValue},
     basic_block::BlockId,
     bimap::Interned,
     cilnode::MethodKind,
     class::ClassDefIdx,
-    Access, Assembly, BasicBlock, CILIterElem, CILNode, ClassRef, FnSig, Int, IntoAsmIndex, Type,
 };
 use crate::iter::TpeIter;
 use crate::{CILRoot, IString};
@@ -510,8 +511,10 @@ impl MethodDef {
         asm: &'asm Assembly,
     ) -> &'method MethodImpl {
         match self.implementation {
-            MethodImpl::MethodBody { .. } | MethodImpl::RegionBody { .. }
-            | MethodImpl::Extern { .. } | MethodImpl::Missing => &self.implementation,
+            MethodImpl::MethodBody { .. }
+            | MethodImpl::RegionBody { .. }
+            | MethodImpl::Extern { .. }
+            | MethodImpl::Missing => &self.implementation,
             MethodImpl::AliasFor(method) => asm
                 .method_def_from_ref(method)
                 .expect("ERROR: a method is an alias for an extern function")
@@ -521,7 +524,6 @@ impl MethodDef {
     pub fn implementation_mut(&mut self) -> &mut MethodImpl {
         &mut self.implementation
     }
-
 
     /// Builds a `MethodDef` directly from already-lowered, interned `BasicBlock`s. Performs
     /// debug-name uniquing on argument/local names and argument-count reconciliation against the
@@ -665,7 +667,8 @@ impl MethodDef {
             .map(|vec| vec.as_ref())
     }
     pub fn adjust_alignment(&mut self, asm: &mut Assembly, guaranteed_align: u8) {
-        let Some((blocks, mut cleanup_blocks, locals)) = self.implementation_mut().body_parts_mut() else {
+        let Some((blocks, mut cleanup_blocks, locals)) = self.implementation_mut().body_parts_mut()
+        else {
             return;
         };
         assert!(!blocks.is_empty());
@@ -932,6 +935,68 @@ pub enum MethodImpl {
         locals: Vec<LocalDef>,
     },
 }
+
+/// Turns the CLR's implicit catch-entry stack value into an ordinary local before exporters see
+/// the body. A caught exception cannot safely remain on the evaluation stack across handler
+/// control flow: in particular, every `leave` (including the one emitted by `TerminateRegion`)
+/// empties the stack. Keeping `GetException` as a zero-byte pseudo-load therefore loses the value
+/// before a later block can consume it and produces unverifiable IL.
+///
+/// One hidden local is shared by all catches in a method. Catch handlers cannot execute
+/// concurrently, and each entry stores its own exception before running handler code.
+fn spill_caught_exceptions(
+    blocks: &mut [BasicBlock],
+    locals: &mut Vec<LocalDef>,
+    asm: &mut Assembly,
+) {
+    fn uses_get_exception(handler: &[BasicBlock], asm: &Assembly) -> bool {
+        handler.iter().flat_map(BasicBlock::roots).any(|root| {
+            CILIter::new(asm.get_root(*root).clone(), asm)
+                .any(|elem| matches!(elem, CILIterElem::Node(CILNode::GetException)))
+        })
+    }
+
+    if !blocks
+        .iter()
+        .filter_map(BasicBlock::handler)
+        .any(|handler| uses_get_exception(handler, asm))
+    {
+        return;
+    }
+
+    let exception_local = locals.len() as LocalId;
+    // Preserve the IR type exposed by `CILNode::GetException`'s typechecker. Besides keeping
+    // materialization type-stable, this makes later LdLoc nodes indistinguishable from the
+    // pseudo-node they replace to all verifier and optimization passes.
+    let exception = Type::ClassRef(ClassRef::exception(asm));
+    let exception = asm.alloc_type(exception);
+    locals.push((None, exception));
+
+    for handler in blocks.iter_mut().filter_map(BasicBlock::handler_mut) {
+        if !uses_get_exception(handler, asm) {
+            continue;
+        }
+
+        for block in handler.iter_mut() {
+            block.map_roots(asm, &mut |root, _| root, &mut |node, _| match node {
+                CILNode::GetException => CILNode::LdLoc(exception_local),
+                node => node,
+            });
+        }
+
+        // Insert this after rewriting so the sole remaining GetException is the catch-entry value
+        // consumed immediately by stloc. Both IL exporters can keep their existing zero-byte
+        // GetException lowering, while all semantic uses are now explicit ldloc instructions.
+        let caught = asm.alloc_node(CILNode::GetException);
+        let capture = asm.alloc_root(CILRoot::StLoc(exception_local, caught));
+        handler
+            .first_mut()
+            .expect("a handler using GetException must contain an entry block")
+            .roots_mut()
+            .insert(0, capture);
+    }
+}
+
 impl RelocateValue for MethodImpl {
     type Output = Self;
 
@@ -1083,8 +1148,8 @@ impl MethodImpl {
         &self,
         asm: &mut Assembly,
     ) -> Option<(Vec<BasicBlock>, Vec<LocalDef>)> {
-        match self {
-            Self::MethodBody { blocks, locals } => Some((blocks.clone(), locals.clone())),
+        let (mut blocks, mut locals) = match self {
+            Self::MethodBody { blocks, locals } => (blocks.clone(), locals.clone()),
             Self::RegionBody {
                 blocks,
                 cleanup_blocks,
@@ -1111,10 +1176,13 @@ impl MethodImpl {
                     by_protected.is_empty(),
                     "exception region protects a missing normal block"
                 );
-                Some((materialized, locals.clone()))
+                (materialized, locals.clone())
             }
-            Self::Extern { .. } | Self::AliasFor(_) | Self::Missing => None,
-        }
+            Self::Extern { .. } | Self::AliasFor(_) | Self::Missing => return None,
+        };
+
+        spill_caught_exceptions(&mut blocks, &mut locals, asm);
+        Some((blocks, locals))
     }
 
     pub(crate) fn verify_exception_regions(&self, asm: &Assembly) -> Result<(), String> {
@@ -1434,7 +1502,6 @@ impl MethodImpl {
         // Swap new and locals
         std::mem::swap(locals, new_locals.get_mut().unwrap());
     }
-
 }
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct MethodDefIdx(pub Interned<MethodRef>);
@@ -1514,18 +1581,22 @@ fn locals() {
 }
 #[test]
 fn test_extern() {
-    assert!(!MethodImpl::MethodBody {
-        blocks: vec![],
-        locals: vec![],
-    }
-    .is_extern());
+    assert!(
+        !MethodImpl::MethodBody {
+            blocks: vec![],
+            locals: vec![],
+        }
+        .is_extern()
+    );
     let mut asm = Assembly::default();
     let name: Interned<IString> = asm.alloc_string("libsomething.so");
-    assert!(MethodImpl::Extern {
-        lib: name,
-        preserve_errno: false,
-    }
-    .is_extern())
+    assert!(
+        MethodImpl::Extern {
+            lib: name,
+            preserve_errno: false,
+        }
+        .is_extern()
+    )
 }
 #[test]
 fn cil() {
@@ -1714,11 +1785,13 @@ fn should_hint_aggressive_inline_false_when_too_many_blocks() {
 fn should_hint_aggressive_inline_false_for_non_method_body_impls() {
     let mut asm = Assembly::default();
     let lib_name = asm.alloc_string("libsomething.so");
-    assert!(!MethodImpl::Extern {
-        lib: lib_name,
-        preserve_errno: false,
-    }
-    .should_hint_aggressive_inline(&asm));
+    assert!(
+        !MethodImpl::Extern {
+            lib: lib_name,
+            preserve_errno: false,
+        }
+        .should_hint_aggressive_inline(&asm)
+    );
     assert!(!MethodImpl::Missing.should_hint_aggressive_inline(&asm));
 }
 
@@ -1782,6 +1855,61 @@ fn canonical_region_body_materializes_exactly_like_legacy_resolution() {
     let (materialized, locals) = canonical.materialize_legacy_body(&mut asm).unwrap();
     assert!(locals.is_empty());
     assert_eq!(materialized, vec![legacy]);
+}
+
+#[test]
+fn materialization_spills_a_caught_exception_before_handler_control_flow() {
+    let mut asm = Assembly::default();
+    let protected_nop = asm.alloc_root(CILRoot::Nop);
+    let second_protected_nop = asm.alloc_root(CILRoot::Nop);
+    let terminate_nop = asm.alloc_root(CILRoot::Nop);
+    let terminate = asm.alloc_root(CILRoot::TerminateRegion {
+        protected: terminate_nop,
+        reason: 1,
+    });
+    let to_use = asm.alloc_root(CILRoot::Branch(Box::new((0, 2, None))));
+    let get_exception = asm.alloc_node(CILNode::GetException);
+    let consume = asm.alloc_root(CILRoot::Pop(get_exception));
+    let leave = asm.alloc_root(CILRoot::ExitSpecialRegion {
+        target: 1,
+        source: 0,
+    });
+    let handler = vec![
+        BasicBlock::new(vec![terminate, to_use], 3, None),
+        BasicBlock::new(vec![consume, leave], 2, None),
+    ];
+    let body = MethodImpl::MethodBody {
+        blocks: vec![
+            BasicBlock::new(vec![protected_nop], 0, Some(handler.clone())),
+            BasicBlock::new(vec![second_protected_nop], 4, Some(handler)),
+            BasicBlock::new(vec![asm.alloc_root(CILRoot::VoidRet)], 1, None),
+        ],
+        locals: vec![],
+    };
+
+    let (blocks, locals) = body.materialize_legacy_body(&mut asm).unwrap();
+    assert_eq!(
+        locals.len(),
+        1,
+        "all catches share one hidden exception local"
+    );
+    let exception_type = Type::ClassRef(ClassRef::exception(&mut asm));
+    assert_eq!(asm[locals[0].1], exception_type);
+
+    let handler = blocks[0].handler().unwrap();
+    let CILRoot::StLoc(0, caught) = asm.get_root(handler[0].roots()[0]) else {
+        panic!("handler entry must capture its implicit exception before any control flow")
+    };
+    assert!(matches!(asm.get_node(*caught), CILNode::GetException));
+
+    let CILRoot::Pop(reloaded) = asm.get_root(handler[1].roots()[0]) else {
+        panic!("the later handler block must retain its exception consumer")
+    };
+    assert!(matches!(asm.get_node(*reloaded), CILNode::LdLoc(0)));
+    assert!(matches!(
+        asm.get_root(blocks[1].handler().unwrap()[0].roots()[0]),
+        CILRoot::StLoc(0, _)
+    ));
 }
 
 #[test]
@@ -1912,8 +2040,11 @@ fn malformed_exception_region_is_rejected_by_export_verification() {
         .verify_for_export()
         .err()
         .expect("invalid region must fail");
+    let crate::VerificationFailure::Method { error, .. } = error else {
+        panic!("expected a method verification failure")
+    };
     assert!(matches!(
-        error.error,
+        error,
         crate::ir::typecheck::TypeCheckError::InvalidExceptionRegion { .. }
     ));
 }

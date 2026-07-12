@@ -2,9 +2,10 @@ use fxhash::{FxBuildHasher, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use super::{
+    Assembly, CILNode, CILRoot,
     asm_link::{RelocateCtx, RelocateValue},
     bimap::Interned,
-    opt, Assembly, CILNode, CILRoot,
+    opt,
 };
 pub type BlockId = u32;
 #[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
@@ -103,9 +104,11 @@ impl BasicBlock {
         block_id: BlockId,
         handler: Option<Vec<Self>>,
     ) -> Self {
-        debug_assert!(handler
-            .as_ref()
-            .is_none_or(|handler| handler.iter().all(|h| h.handler.is_none())));
+        debug_assert!(
+            handler
+                .as_ref()
+                .is_none_or(|handler| handler.iter().all(|h| h.handler.is_none()))
+        );
         Self {
             roots,
             block_id,
@@ -398,6 +401,31 @@ impl BasicBlock {
         // Change branches to use launching pads.
         self.fix_for_exception_handler(id, asm);
 
+        // Every CLR catch handler must transfer control explicitly; falling through the end of a
+        // handler is invalid IL and CoreCLR rejects the whole method at JIT time. These handlers
+        // model Rust cleanup-only unwind paths, so a terminal cleanup block that has performed its
+        // side effects but has no explicit transfer must resume the current exception.
+        let terminal = handler
+            .last_mut()
+            .expect("a reachable exception-handler entry must materialize at least one block");
+        let ends_with_transfer =
+            terminal
+                .meaningfull_roots(asm)
+                .last()
+                .is_some_and(|root| match asm.get_root(root) {
+                    CILRoot::ReThrow
+                    | CILRoot::Throw(_)
+                    | CILRoot::Ret(_)
+                    | CILRoot::VoidRet
+                    | CILRoot::Unreachable(_)
+                    | CILRoot::ExitSpecialRegion { .. } => true,
+                    CILRoot::Branch(info) => opt::is_branch_unconditional(info),
+                    _ => false,
+                });
+        if !ends_with_transfer {
+            terminal.roots.push(asm.alloc_root(CILRoot::ReThrow));
+        }
+
         self.handler = Some(handler);
         self.handler_id = None;
     }
@@ -460,4 +488,20 @@ fn is_only_rethrow() {
     let block = BasicBlock::new(vec![rethrow, dbg_break], 0, None);
     // A dbf break has side effects, this should return false
     assert!(!block.is_only_rethrow(asm));
+}
+
+#[test]
+fn materialized_handler_rethrows_after_side_effecting_terminal_cleanup() {
+    let asm = &mut Assembly::default();
+    let side_effect = asm.alloc_root(CILRoot::Break);
+    let cleanup = [BasicBlock::new(vec![side_effect], 10, None)];
+    let mut protected = BasicBlock::new_raw(vec![], 0, Some(10));
+
+    protected.resolve_exception_handlers(&cleanup, asm);
+
+    let terminal = protected.handler().unwrap().last().unwrap();
+    let meaningful: Vec<_> = terminal.meaningfull_roots(asm).collect();
+    assert_eq!(meaningful.len(), 2);
+    assert_eq!(*asm.get_root(meaningful[0]), CILRoot::Break);
+    assert_eq!(*asm.get_root(meaningful[1]), CILRoot::ReThrow);
 }

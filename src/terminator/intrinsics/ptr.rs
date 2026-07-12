@@ -1,8 +1,8 @@
 use crate::assembly::MethodCompileCtx;
-use cilly::{cilnode::ExtendKind, Int, Interned, Type};
 use crate::operand::handle_operand;
 use crate::place::place_set;
 use crate::r#type::GetTypeExt;
+use cilly::{Int, Interned, Type, cilnode::ExtendKind};
 use rustc_middle::{
     mir::{Operand, Place},
     ty::Instance,
@@ -51,7 +51,9 @@ pub fn ptr_offset_from_unsigned<'tcx>(
     let tpe = ctx.type_from_cache(ty);
     // This is UB, so we can do whatever.
     if ctx.layout_of(ty).is_zst() {
-        return ctx.throw_msg(&format!("ptr_offset_from_unsigned called with zst type:{ty}"));
+        return ctx.throw_msg(&format!(
+            "ptr_offset_from_unsigned called with zst type:{ty}"
+        ));
     }
     let a = handle_operand(&args[0].node, ctx);
     let b = handle_operand(&args[1].node, ctx);

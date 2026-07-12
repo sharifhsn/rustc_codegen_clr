@@ -1,4 +1,4 @@
-error: #[dotnet_class]: unknown attribute key `extendz`; expected one of `extends`, `value_type`, `default_ctor`, `field_setters`, `implements`
+error: #[dotnet_class]: unknown attribute key `extendz`; expected one of `extends`, `value_type`, `default_ctor`, `field_setters`, `properties`, `implements`, `attr(...)`, `static_field(...)`
  --> tests/ui/dotnet_class_unknown_key.rs:5:16
   |
 5 | #[dotnet_class(extendz = "[System.Runtime]System.Object")]

@@ -19,18 +19,18 @@ miscompilations and crashes are expected, and that informs much of the design (s
 
 ## Toolchain
 
-The project pins a specific **nightly** (`rust-toolchain.toml`, currently bare `channel = "nightly"`)
+The project pins a specific **nightly** (`nightly-2026-06-17` in `rust-toolchain.toml`)
 and uses internal compiler crates (`rustc_private`, `rustc-dev`, `rust-src`). It only compiles against
 a narrow window of nightly versions — if `cargo check` fails with rustc internal errors, the cause is
-almost always rustc-internal API drift, not your environment. Because `rust-toolchain.toml` is unpinned,
-a fresh checkout grabs *today's* nightly, so the project bit-rots if left untouched; updating to a new
-rustc version is a recurring maintenance task (see git log: "Updated rustc version").
+almost always rustc-internal API drift, not your environment. Updating the pinned nightly remains a
+recurring maintenance task (see git log: "Updated rustc version").
 
 This tree has been ported to compile on **`nightly-2026-06-17`** (it had drifted ~8 months). The exact
 rustc-API changes and a re-port playbook are in [feasibility/PORT_NOTES.md](feasibility/PORT_NOTES.md);
 [feasibility/](feasibility/) also has a Dockerfile + harness that builds the workspace in the on-path
-Linux env. Key insight for maintenance: only the thin rustc-facing crates (`…_type`, `…_operand`,
-root `src/`) rot — the `cilly` IR core compiles unchanged across nightly gaps. Read PORT_NOTES before
+Linux env. Key insight for maintenance: almost all nightly drift is isolated to the root `src/`
+rustc-facing compiler pass; the former helper crates were consolidated in July 2026 and the `cilly`
+IR core compiles unchanged across nightly gaps. Read PORT_NOTES before
 the next bump; most fixes are mechanical renames you can resolve against the local `rustc-src`
 (`$(rustc --print sysroot)/lib/rustlib/rustc-src`).
 
@@ -62,8 +62,9 @@ separate `C_MODE=1` run. The project is primarily tested on **Linux x86_64 / .NE
 
 ## Requirements for running tests
 
-.NET mode needs both the **.NET runtime** (`dotnet`) and an **IL assembler** (`ilasm`, easiest via the Mono
-runtime). C mode needs a C compiler (GCC/Clang fully supported; tcc/sdcc partial). On a machine without
+.NET mode needs the **.NET runtime** (`dotnet`). The default direct-PE exporter does not require an IL
+assembler; textual-IL fallback (`DIRECT_PE=0`) needs `ilasm`, easiest via Mono. C mode needs a C compiler
+(GCC/Clang fully supported; tcc/sdcc partial). On a machine without
 .NET, set `DRY_RUN=1` to compile without linking/executing.
 
 ## Configuration via environment variables

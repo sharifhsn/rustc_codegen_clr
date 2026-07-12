@@ -1,7 +1,7 @@
 //! Reusable C#→Rust generic container — the Rust half of the WF-9 Stage-2 bridge, shipped so you
 //! don't hand-write it per project.
 //!
-//! [`export_rust_containers!`] emits a size-erased byte vector as `#[no_mangle] extern "C"` functions
+//! [`export_rust_containers!`] emits a size-erased byte vector as `#[unsafe(no_mangle)] extern "C"` functions
 //! (`rcl_vec_*`) into *your* `cdylib`. The C# half — `RustDotnet.RustVec<T>` (near-zero-cost, for
 //! `T : unmanaged`) and `RustDotnet.RustBoxVec<T>` (a `GCHandle`-boxed list for **any** managed `T`) —
 //! lives in `RustDotnet.Containers.cs` and is auto-included in a C# project that sets
@@ -33,7 +33,7 @@
 //!   Rust-owned UTF-8 buffer that marshals to/from a managed `System.String`.
 
 /// Emit the size-erased container core (`rcl_vec_new`/`push`/`get`/`set`/`len`/`free`) as
-/// `#[no_mangle] pub extern "C"` functions in the invoking crate. Call it **once**, at the crate
+/// `#[unsafe(no_mangle)] pub extern "C"` functions in the invoking crate. Call it **once**, at the crate
 /// root of your `cdylib` — the functions must be defined in *your* crate (not a dependency) so they
 /// land in your assembly's `MainModule`, where the C# wrappers look for them.
 #[macro_export]
@@ -50,7 +50,7 @@ macro_rules! export_rust_containers {
 
         /// `new RustVec<T>()` — an empty vector whose element is `elem_size` bytes. Returns an opaque
         /// handle (a boxed pointer as `usize`); `0` is never a valid handle.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn rcl_vec_new(elem_size: usize) -> usize {
             ::std::boxed::Box::into_raw(::std::boxed::Box::new(RclRustVec {
                 elem_size,
@@ -63,7 +63,7 @@ macro_rules! export_rust_containers {
         ///
         /// # Safety
         /// `handle` must be a live handle from `rcl_vec_new`; `elem` must point to `elem_size` bytes.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rcl_vec_push(handle: usize, elem: *const u8) {
             let v = &mut *(handle as *mut RclRustVec);
             let es = v.elem_size;
@@ -78,7 +78,7 @@ macro_rules! export_rust_containers {
         ///
         /// # Safety
         /// `handle` must be live; `out` must point to `elem_size` writable bytes.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rcl_vec_get(handle: usize, idx: usize, out: *mut u8) -> bool {
             let v = &*(handle as *const RclRustVec);
             if idx >= v.len {
@@ -94,7 +94,7 @@ macro_rules! export_rust_containers {
         ///
         /// # Safety
         /// `handle` must be live; `elem` must point to `elem_size` bytes.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rcl_vec_set(handle: usize, idx: usize, elem: *const u8) -> bool {
             let v = &mut *(handle as *mut RclRustVec);
             if idx >= v.len {
@@ -109,7 +109,7 @@ macro_rules! export_rust_containers {
         ///
         /// # Safety
         /// `handle` must be a live handle from `rcl_vec_new`.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rcl_vec_len(handle: usize) -> usize {
             (*(handle as *const RclRustVec)).len
         }
@@ -118,7 +118,7 @@ macro_rules! export_rust_containers {
         ///
         /// # Safety
         /// `handle` must be a live handle from `rcl_vec_new`, freed at most once.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rcl_vec_free(handle: usize) {
             drop(::std::boxed::Box::from_raw(handle as *mut RclRustVec));
         }
@@ -126,7 +126,7 @@ macro_rules! export_rust_containers {
 }
 
 /// Emit the size-erased hash-map core (`rcl_map_new`/`insert`/`get`/`remove`/`contains`/`len`/`free`)
-/// as `#[no_mangle] pub extern "C"` functions in the invoking crate. Backs the shipped
+/// as `#[unsafe(no_mangle)] pub extern "C"` functions in the invoking crate. Backs the shipped
 /// `RustDotnet.RustHashMap<K, V>` C# wrapper (both `K` and `V` are `unmanaged`, stored as their raw
 /// bytes). Call it **once**, at the crate root of your `cdylib` — same rule as
 /// [`export_rust_containers!`].
@@ -146,7 +146,7 @@ macro_rules! export_rust_hashmap {
 
         /// `new RustHashMap<K, V>()` — an empty map whose key is `key_size` bytes and value is
         /// `val_size` bytes. Returns an opaque handle (`0` is never valid).
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn rcl_map_new(key_size: usize, val_size: usize) -> usize {
             ::std::boxed::Box::into_raw(::std::boxed::Box::new(RclRustMap {
                 key_size,
@@ -159,7 +159,7 @@ macro_rules! export_rust_hashmap {
         ///
         /// # Safety
         /// `handle` must be live; `key`/`val` must point to `key_size`/`val_size` bytes respectively.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rcl_map_insert(
             handle: usize,
             key: *const u8,
@@ -177,7 +177,7 @@ macro_rules! export_rust_hashmap {
         /// # Safety
         /// `handle` must be live; `key` must point to `key_size` bytes; `out` to `val_size` writable
         /// bytes.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rcl_map_get(handle: usize, key: *const u8, out: *mut u8) -> bool {
             let m = &*(handle as *const RclRustMap);
             let k = ::std::slice::from_raw_parts(key, m.key_size);
@@ -194,7 +194,7 @@ macro_rules! export_rust_hashmap {
         ///
         /// # Safety
         /// `handle` must be live; `key` must point to `key_size` bytes.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rcl_map_contains(handle: usize, key: *const u8) -> bool {
             let m = &*(handle as *const RclRustMap);
             let k = ::std::slice::from_raw_parts(key, m.key_size);
@@ -205,7 +205,7 @@ macro_rules! export_rust_hashmap {
         ///
         /// # Safety
         /// `handle` must be live; `key` must point to `key_size` bytes.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rcl_map_remove(handle: usize, key: *const u8) -> bool {
             let m = &mut *(handle as *mut RclRustMap);
             let k = ::std::slice::from_raw_parts(key, m.key_size);
@@ -216,7 +216,7 @@ macro_rules! export_rust_hashmap {
         ///
         /// # Safety
         /// `handle` must be a live handle from `rcl_map_new`.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rcl_map_len(handle: usize) -> usize {
             (*(handle as *const RclRustMap)).map.len()
         }
@@ -225,7 +225,7 @@ macro_rules! export_rust_hashmap {
         ///
         /// # Safety
         /// `handle` must be a live handle from `rcl_map_new`, freed at most once.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rcl_map_free(handle: usize) {
             drop(::std::boxed::Box::from_raw(handle as *mut RclRustMap));
         }
@@ -233,7 +233,7 @@ macro_rules! export_rust_hashmap {
 }
 
 /// Emit the Rust-owned UTF-8 string core (`rcl_str_new`/`push_bytes`/`len`/`copy_to`/`free`) as
-/// `#[no_mangle] pub extern "C"` functions in the invoking crate. Backs the shipped
+/// `#[unsafe(no_mangle)] pub extern "C"` functions in the invoking crate. Backs the shipped
 /// `RustDotnet.RustString` C# wrapper (a mutable, Rust-owned UTF-8 buffer that marshals to/from a
 /// managed `System.String` as UTF-8). Call it **once**, at the crate root of your `cdylib`.
 ///
@@ -248,7 +248,7 @@ macro_rules! export_rust_string {
         }
 
         /// `new RustString()` — an empty string. Returns an opaque handle (`0` is never valid).
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn rcl_str_new() -> usize {
             ::std::boxed::Box::into_raw(::std::boxed::Box::new(RclRustString {
                 buf: ::std::vec::Vec::new(),
@@ -259,7 +259,7 @@ macro_rules! export_rust_string {
         ///
         /// # Safety
         /// `handle` must be live; `bytes` must point to `len` readable bytes of valid UTF-8.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rcl_str_push_bytes(handle: usize, bytes: *const u8, len: usize) {
             let s = &mut *(handle as *mut RclRustString);
             let src = ::std::slice::from_raw_parts(bytes, len);
@@ -270,7 +270,7 @@ macro_rules! export_rust_string {
         ///
         /// # Safety
         /// `handle` must be a live handle from `rcl_str_new`.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rcl_str_len(handle: usize) -> usize {
             (*(handle as *const RclRustString)).buf.len()
         }
@@ -280,7 +280,7 @@ macro_rules! export_rust_string {
         ///
         /// # Safety
         /// `handle` must be live; `out` must point to at least `rcl_str_len(handle)` writable bytes.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rcl_str_copy_to(handle: usize, out: *mut u8) {
             let s = &*(handle as *const RclRustString);
             ::core::ptr::copy_nonoverlapping(s.buf.as_ptr(), out, s.buf.len());
@@ -290,7 +290,7 @@ macro_rules! export_rust_string {
         ///
         /// # Safety
         /// `handle` must be a live handle from `rcl_str_new`.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rcl_str_clear(handle: usize) {
             (*(handle as *mut RclRustString)).buf.clear();
         }
@@ -299,7 +299,7 @@ macro_rules! export_rust_string {
         ///
         /// # Safety
         /// `handle` must be a live handle from `rcl_str_new`, freed at most once.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rcl_str_free(handle: usize) {
             drop(::std::boxed::Box::from_raw(handle as *mut RclRustString));
         }

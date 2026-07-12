@@ -1,6 +1,6 @@
 use crate::{
-    asm::MissingMethodPatcher, cilnode::ExtendKind, Assembly, BasicBlock, BinOp, BranchCond,
-    CILNode, CILRoot, ClassRef, Const, FieldDesc, Int, Interned, MethodImpl, MethodRef, Type,
+    Assembly, BasicBlock, BinOp, BranchCond, CILNode, CILRoot, ClassRef, Const, FieldDesc, Int,
+    Interned, MethodImpl, MethodRef, Type, asm::MissingMethodPatcher, cilnode::ExtendKind,
 };
 
 fn op_direct(
@@ -164,12 +164,7 @@ fn u64_to_u128(asm: &mut Assembly, input: Interned<CILNode>, src: Int) -> Intern
     let u128_class = ClassRef::uint_128(asm);
     let u128_classref = asm[u128_class].clone();
     let op_implicit = asm.alloc_string("op_Implicit");
-    let mref = u128_classref.static_mref(
-        &[Type::Int(src)],
-        Type::Int(Int::U128),
-        op_implicit,
-        asm,
-    );
+    let mref = u128_classref.static_mref(&[Type::Int(src)], Type::Int(Int::U128), op_implicit, asm);
     asm.alloc_node(CILNode::call(mref, [input]))
 }
 /// Narrows a `System.UInt128` to `dst` (`u64`/`u8`) via its explicit conversion
@@ -178,12 +173,7 @@ fn u128_to_int(asm: &mut Assembly, input: Interned<CILNode>, dst: Int) -> Intern
     let u128_class = ClassRef::uint_128(asm);
     let u128_classref = asm[u128_class].clone();
     let op_explicit = asm.alloc_string("op_Explicit");
-    let mref = u128_classref.static_mref(
-        &[Type::Int(Int::U128)],
-        Type::Int(dst),
-        op_explicit,
-        asm,
-    );
+    let mref = u128_classref.static_mref(&[Type::Int(Int::U128)], Type::Int(dst), op_explicit, asm);
     asm.alloc_node(CILNode::call(mref, [input]))
 }
 /// Calls a binary `System.UInt128` operator (`op_Addition`/`op_Subtraction`)

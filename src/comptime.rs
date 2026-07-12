@@ -16,16 +16,16 @@
 //! Methods can only be attached to a class that is already registered, so we accumulate the class shape
 //! as plain data while walking the MIR and build + register everything in one shot at `finish_type`.
 
+use crate::call_info::CallInfo;
+use crate::fn_ctx::{MethodCompileCtx, fn_name};
+use crate::r#type::get_type;
+use crate::r#type::utilis::garg_to_string;
 use cilly::cilnode::MethodKind;
 use cilly::{
     Access, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, FieldDesc, Interned, MethodDef,
     MethodImpl, MethodRef, Type,
 };
 use cilly::{Float, Int};
-use crate::call_info::CallInfo;
-use crate::fn_ctx::{fn_name, MethodCompileCtx};
-use crate::r#type::get_type;
-use crate::r#type::utilis::garg_to_string;
 use rustc_middle::mir::{Mutability, Rvalue, StatementKind, TerminatorKind};
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{Instance, TyKind, TypingEnv};
@@ -224,27 +224,25 @@ fn decode_custom_attr_spec(spec: &str) -> PendingCustomAttr {
         "comptime: malformed custom-attr SPEC (too many top-level fields): {spec:?}"
     );
 
-    let decode_val = |tagged: &str| -> PendingAttrArg {
-        let (tag, val) = tagged
-            .split_once(':')
-            .unwrap_or_else(|| panic!("comptime: malformed custom-attr arg (no tag): {tagged:?}"));
-        match tag {
-            "s" => PendingAttrArg::Str(val.to_string()),
-            "b" => PendingAttrArg::Bool(
-                val.parse()
-                    .unwrap_or_else(|_| panic!("comptime: malformed bool custom-attr arg: {val:?}")),
-            ),
-            "i" => PendingAttrArg::I32(
-                val.parse()
-                    .unwrap_or_else(|_| panic!("comptime: malformed i32 custom-attr arg: {val:?}")),
-            ),
-            "l" => PendingAttrArg::I64(
-                val.parse()
-                    .unwrap_or_else(|_| panic!("comptime: malformed i64 custom-attr arg: {val:?}")),
-            ),
-            other => panic!("comptime: unknown custom-attr arg tag {other:?} in {tagged:?}"),
-        }
-    };
+    let decode_val =
+        |tagged: &str| -> PendingAttrArg {
+            let (tag, val) = tagged.split_once(':').unwrap_or_else(|| {
+                panic!("comptime: malformed custom-attr arg (no tag): {tagged:?}")
+            });
+            match tag {
+                "s" => PendingAttrArg::Str(val.to_string()),
+                "b" => PendingAttrArg::Bool(val.parse().unwrap_or_else(|_| {
+                    panic!("comptime: malformed bool custom-attr arg: {val:?}")
+                })),
+                "i" => PendingAttrArg::I32(val.parse().unwrap_or_else(|_| {
+                    panic!("comptime: malformed i32 custom-attr arg: {val:?}")
+                })),
+                "l" => PendingAttrArg::I64(val.parse().unwrap_or_else(|_| {
+                    panic!("comptime: malformed i64 custom-attr arg: {val:?}")
+                })),
+                other => panic!("comptime: unknown custom-attr arg tag {other:?} in {tagged:?}"),
+            }
+        };
 
     let ctor_args = if ctor_raw.is_empty() {
         vec![]
@@ -330,10 +328,9 @@ pub fn interpret<'tcx>(
             if let StatementKind::Assign(bx) = &statement.kind {
                 let (target, rvalue) = bx.as_ref();
                 if let Rvalue::Use(src, _) = rvalue {
-                    if let (Some(src_local), Some(tgt_local)) = (
-                        src.place().and_then(|p| p.as_local()),
-                        target.as_local(),
-                    ) {
+                    if let (Some(src_local), Some(tgt_local)) =
+                        (src.place().and_then(|p| p.as_local()), target.as_local())
+                    {
                         locals[usize::from(tgt_local)] = locals[usize::from(src_local)].clone();
                     }
                 }
@@ -373,7 +370,8 @@ pub fn interpret<'tcx>(
                     let name = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
                     let is_value_type = garg_to_bool(subst_ref[1], ctx.tcx());
                     let superclass_asm = garg_to_string(subst_ref[2], ctx.tcx()).replace("::", ".");
-                    let superclass_name = garg_to_string(subst_ref[3], ctx.tcx()).replace("::", ".");
+                    let superclass_name =
+                        garg_to_string(subst_ref[3], ctx.tcx()).replace("::", ".");
                     let has_type_kind_opinion = garg_to_bool(subst_ref[4], ctx.tcx());
                     let superclass = if superclass_name.is_empty() {
                         None
@@ -455,13 +453,17 @@ pub fn interpret<'tcx>(
                     let method_name = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
                     let fn_ty = ctx.monomorphize(subst_ref[1].as_type().unwrap());
                     let TyKind::FnDef(fdef, fsubst) = fn_ty.kind() else {
-                        panic!("comptime: abstract method signature carrier is not a function definition");
+                        panic!(
+                            "comptime: abstract method signature carrier is not a function definition"
+                        );
                     };
                     let fsubst = ctx.monomorphize(*fsubst);
                     let carrier = Instance::try_resolve(ctx.tcx(), env, *fdef, fsubst)
                         .expect("comptime: invalid abstract method signature carrier")
                         .expect("comptime: could not resolve abstract method signature carrier instance");
-                    class.abstract_methods.push((method_name, carrier, vec![], vec![]));
+                    class
+                        .abstract_methods
+                        .push((method_name, carrier, vec![], vec![]));
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_add_generic_abstract_method_def") {
                     let src = operand_local(&args[0].node);
@@ -493,7 +495,9 @@ pub fn interpret<'tcx>(
                     );
                     let fn_ty = ctx.monomorphize(subst_ref[2].as_type().unwrap());
                     let TyKind::FnDef(fdef, fsubst) = fn_ty.kind() else {
-                        panic!("comptime: generic abstract method signature carrier is not a function definition");
+                        panic!(
+                            "comptime: generic abstract method signature carrier is not a function definition"
+                        );
                     };
                     let fsubst = ctx.monomorphize(*fsubst);
                     let carrier = Instance::try_resolve(ctx.tcx(), env, *fdef, fsubst)
@@ -577,12 +581,16 @@ pub fn interpret<'tcx>(
                     let method_name = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
                     let fn_ty = ctx.monomorphize(subst_ref[1].as_type().unwrap());
                     let TyKind::FnDef(fdef, fsubst) = fn_ty.kind() else {
-                        panic!("comptime: default interface method target is not a function definition");
+                        panic!(
+                            "comptime: default interface method target is not a function definition"
+                        );
                     };
                     let fsubst = ctx.monomorphize(*fsubst);
                     let target = Instance::try_resolve(ctx.tcx(), env, *fdef, fsubst)
                         .expect("comptime: invalid default interface method target")
-                        .expect("comptime: could not resolve default interface method target instance");
+                        .expect(
+                            "comptime: could not resolve default interface method target instance",
+                        );
                     class.default_methods.push((method_name, target));
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_add_static_abstract_method_def") {
@@ -597,7 +605,9 @@ pub fn interpret<'tcx>(
                     let method_name = garg_to_string(subst_ref[0], ctx.tcx()).replace("::", ".");
                     let fn_ty = ctx.monomorphize(subst_ref[1].as_type().unwrap());
                     let TyKind::FnDef(fdef, fsubst) = fn_ty.kind() else {
-                        panic!("comptime: static abstract method signature carrier is not a function definition");
+                        panic!(
+                            "comptime: static abstract method signature carrier is not a function definition"
+                        );
                     };
                     let fsubst = ctx.monomorphize(*fsubst);
                     let carrier = Instance::try_resolve(ctx.tcx(), env, *fdef, fsubst)
@@ -623,7 +633,9 @@ pub fn interpret<'tcx>(
                              preceding add_method_def in this entrypoint",
                         )
                         .clone();
-                    class.method_overrides.insert(method_name, (base_asm, base_type));
+                    class
+                        .method_overrides
+                        .insert(method_name, (base_asm, base_type));
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_mark_last_method_event_add") {
                     let src = operand_local(&args[0].node);
@@ -656,7 +668,9 @@ pub fn interpret<'tcx>(
                         "comptime: rustc_codegen_clr_mark_last_method_event_remove called with \
                          no preceding add_method_def/add_abstract_method_def in this entrypoint",
                     );
-                    class.event_bindings.insert(method_name, (event_name, false));
+                    class
+                        .event_bindings
+                        .insert(method_name, (event_name, false));
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_add_static_method_def") {
                     let src = operand_local(&args[0].node);
@@ -1022,7 +1036,8 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         // `is_value_type` is a meaningless placeholder (always `false`) and must not be allowed
         // to either overwrite or be asserted against the real value.
         if class.has_type_kind_opinion {
-            ctx.class_mut(existing).set_is_valuetype(class.is_value_type);
+            ctx.class_mut(existing)
+                .set_is_valuetype(class.is_value_type);
         }
         existing
     } else {
@@ -1046,8 +1061,8 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             class.name,
             class.type_generics
         );
-        let generics = u32::try_from(class.type_generics.len())
-            .expect("comptime: generic arity over u32");
+        let generics =
+            u32::try_from(class.type_generics.len()).expect("comptime: generic arity over u32");
         let mut def = ClassDef::new(
             name,
             class.is_value_type,
@@ -1181,8 +1196,12 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                 )))
             })
             .collect();
-        let iface_ref =
-            ctx.alloc_class_ref(ClassRef::new(iface_cls, iface_asm_ref, false, generics.into()));
+        let iface_ref = ctx.alloc_class_ref(ClassRef::new(
+            iface_cls,
+            iface_asm_ref,
+            false,
+            generics.into(),
+        ));
         ctx.class_mut(class_idx).add_interface(iface_ref);
     }
 
@@ -1207,11 +1226,17 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         let named_args: Vec<_> = attr
             .named_args
             .iter()
-            .map(|(name, v)| (ctx.alloc_string(name.clone()), pending_attr_arg_to_cilly(ctx, v)))
+            .map(|(name, v)| {
+                (
+                    ctx.alloc_string(name.clone()),
+                    pending_attr_arg_to_cilly(ctx, v),
+                )
+            })
             .collect();
-        ctx.class_mut(class_idx).add_custom_attribute(
-            cilly::class::CustomAttrDef::new(attr_type, ctor_args, named_args),
-        );
+        ctx.class_mut(class_idx)
+            .add_custom_attribute(cilly::class::CustomAttrDef::new(
+                attr_type, ctor_args, named_args,
+            ));
     }
 
     // Accumulates each event's `add`/`remove` `MethodRef` + delegate `Type` as the method loops
@@ -1222,7 +1247,11 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
     // order — the PE writer requires deterministic row emission.
     let mut pending_events: std::collections::BTreeMap<
         String,
-        (Option<Interned<MethodRef>>, Option<Interned<MethodRef>>, Option<Type>),
+        (
+            Option<Interned<MethodRef>>,
+            Option<Interned<MethodRef>>,
+            Option<Type>,
+        ),
     > = std::collections::BTreeMap::new();
 
     // Each virtual method aliases an ordinary Rust fn (codegen'd separately). The Rust fn takes the
@@ -1236,11 +1265,12 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         let target_name = fn_name(ctx.tcx().symbol_name(*target));
         let target_name = ctx.alloc_string(target_name);
         let main_module = *ctx.main_module();
-        let target_mref = MethodRef::new(main_module, target_name, sig, MethodKind::Static, [].into());
+        let target_mref =
+            MethodRef::new(main_module, target_name, sig, MethodKind::Static, [].into());
         let target_ref = ctx.alloc_methodref(target_mref);
         let mname = ctx.alloc_string(method_name.clone());
         // `Access::Extern` marks this as a dead-code-elimination ROOT — a Rust-defined managed class is
-        // an exported surface with no internal caller, so (like `#[no_mangle]` exports) its methods must
+        // an exported surface with no internal caller, so (like `#[unsafe(no_mangle)]` exports) its methods must
         // be roots or the whole class would be culled. The DCE also follows the `AliasFor` edge to keep
         // the target Rust fn alive (see `Assembly::eliminate_dead_fns`).
         let mut mdef = MethodDef::new(
@@ -1261,8 +1291,13 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             };
             let base_class_ref =
                 ctx.alloc_class_ref(ClassRef::new(base_cls, base_asm_ref, false, [].into()));
-            let base_mref =
-                MethodRef::new(base_class_ref, mdef.name(), sig, MethodKind::Virtual, [].into());
+            let base_mref = MethodRef::new(
+                base_class_ref,
+                mdef.name(),
+                sig,
+                MethodKind::Virtual,
+                [].into(),
+            );
             let base_mref = ctx.alloc_methodref(base_mref);
             mdef = mdef.with_override(base_mref);
         }
@@ -1272,7 +1307,9 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             // string (see `rustc_codegen_clr_mark_last_method_event_add`'s doc).
             let delegate_ty = ctx[sig].inputs()[1];
             let mref = ctx.alloc_methodref(mdef.ref_to());
-            let entry = pending_events.entry(event_name.clone()).or_insert((None, None, None));
+            let entry = pending_events
+                .entry(event_name.clone())
+                .or_insert((None, None, None));
             if *is_add {
                 entry.0 = Some(mref);
             } else {
@@ -1314,8 +1351,7 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         let call_info = CallInfo::sig_from_instance_(*carrier, ctx);
         // `&mut T` parameters => managed byrefs (C# `ref T`) — see `byref_interface_sig`'s doc.
         // `skip = 1`: input 0 is the `_this` receiver handle.
-        let fn_sig =
-            byref_interface_sig(ctx, method_name, *carrier, call_info.sig().clone(), 1);
+        let fn_sig = byref_interface_sig(ctx, method_name, *carrier, call_info.sig().clone(), 1);
         // `#[dotnet_out]` positions (1-based among the receiver-stripped params, so sequence `s`
         // is signature input `s` here — the receiver occupies index 0). The macro already
         // guarantees each is a `&mut T` parameter; this is the backend's defense-in-depth assert,
@@ -1352,7 +1388,10 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         // range of this list.
         if !generic_names.is_empty() {
             mdef = mdef.with_generic_params(
-                generic_names.iter().map(|n| ctx.alloc_string(n.clone())).collect(),
+                generic_names
+                    .iter()
+                    .map(|n| ctx.alloc_string(n.clone()))
+                    .collect(),
             );
         }
         // An abstract accessor of an INTERFACE event (`#[dotnet_event]` inside
@@ -1368,7 +1407,9 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             );
             let delegate_ty = inputs[1];
             let mref = ctx.alloc_methodref(mdef.ref_to());
-            let entry = pending_events.entry(event_name.clone()).or_insert((None, None, None));
+            let entry = pending_events
+                .entry(event_name.clone())
+                .or_insert((None, None, None));
             if *is_add {
                 entry.0 = Some(mref);
             } else {
@@ -1409,13 +1450,14 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                 Some((_, entry)) => entry,
                 None => {
                     pending_properties.push((prop_name.clone(), (None, None)));
-                    &mut pending_properties
-                        .last_mut()
-                        .expect("just pushed")
-                        .1
+                    &mut pending_properties.last_mut().expect("just pushed").1
                 }
             };
-            let slot = if slot_is_getter { &mut entry.0 } else { &mut entry.1 };
+            let slot = if slot_is_getter {
+                &mut entry.0
+            } else {
+                &mut entry.1
+            };
             assert!(
                 slot.is_none(),
                 "comptime: property '{prop_name}' declares two {}s — unreachable from the \
@@ -1449,7 +1491,9 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         };
         let name = ctx.alloc_string(prop_name);
         ctx.class_mut(class_idx)
-            .add_property(cilly::class::PropertyDef::new(name, tpe, getter_ref, setter_ref));
+            .add_property(cilly::class::PropertyDef::new(
+                name, tpe, getter_ref, setter_ref,
+            ));
     }
 
     // `static abstract` interface members (.NET 7+ static virtual members in interfaces, from a
@@ -1470,8 +1514,7 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         // abstract's C# implementor writes `public static … M(ref T x)` and the CLR matches it by
         // name+signature, so the byref mapping must be consistent across both member kinds.
         // `skip = 0`: a static carrier has no receiver input.
-        let fn_sig =
-            byref_interface_sig(ctx, method_name, *carrier, call_info.sig().clone(), 0);
+        let fn_sig = byref_interface_sig(ctx, method_name, *carrier, call_info.sig().clone(), 0);
         let arg_names = crate::assembly::carrier_arg_names(*carrier, 0, fn_sig.inputs().len(), ctx);
         let sig = ctx.alloc_sig(fn_sig);
         let mname = ctx.alloc_string(method_name.clone());
@@ -1567,7 +1610,8 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         let remove = remove.unwrap_or_else(|| {
             panic!("comptime: event '{event_name}' has an add_* method but no remove_* — both halves are required")
         });
-        let delegate_ty = delegate_ty.expect("comptime: event delegate type unset (unreachable — set alongside add/remove)");
+        let delegate_ty = delegate_ty
+            .expect("comptime: event delegate type unset (unreachable — set alongside add/remove)");
         let name = ctx.alloc_string(event_name);
         ctx.class_mut(class_idx)
             .add_event(cilly::class::EventDef::new(name, delegate_ty, add, remove));
@@ -1585,7 +1629,8 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         let target_name = fn_name(ctx.tcx().symbol_name(*target));
         let target_name = ctx.alloc_string(target_name);
         let main_module = *ctx.main_module();
-        let target_mref = MethodRef::new(main_module, target_name, sig, MethodKind::Static, [].into());
+        let target_mref =
+            MethodRef::new(main_module, target_name, sig, MethodKind::Static, [].into());
         let target_ref = ctx.alloc_methodref(target_mref);
         let mname = ctx.alloc_string(method_name.clone());
         let mut mdef = MethodDef::new(
@@ -1803,12 +1848,20 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                 for (tpe, fname) in &class.fields {
                     let fname_str = ctx.alloc_string(fname.clone());
                     let fdesc = ctx.alloc_field(FieldDesc::new(*class_idx, fname_str, *tpe));
+                    // Accessor names follow the public CLR property, not the private backing field:
+                    // `firmNumber` -> `get_FirmNumber` / `set_FirmNumber`. This is Roslyn's metadata
+                    // convention and lets Rust call a schema-stable accessor without exposing or
+                    // colliding with the backing field.
+                    let mut prop_name_str = fname.clone();
+                    if let Some(first) = prop_name_str.get_mut(0..1) {
+                        first.make_ascii_uppercase();
+                    }
 
                     let this = ctx.alloc_node(CILNode::LdArg(0));
                     let load = ctx.ld_field(this, fdesc);
                     let ret = ctx.alloc_root(CILRoot::Ret(load));
                     let getter_sig = ctx.sig([self_ty], *tpe);
-                    let getter_name = ctx.alloc_string(format!("get_{fname}"));
+                    let getter_name = ctx.alloc_string(format!("get_{prop_name_str}"));
                     let getter_def = MethodDef::new(
                         Access::Extern,
                         class_idx,
@@ -1829,7 +1882,7 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                     let store = ctx.alloc_root(CILRoot::SetField(Box::new((fdesc, obj, value))));
                     let set_ret = ctx.alloc_root(CILRoot::VoidRet);
                     let setter_sig = ctx.sig([self_ty, *tpe], Type::Void);
-                    let setter_name = ctx.alloc_string(format!("set_{fname}"));
+                    let setter_name = ctx.alloc_string(format!("set_{prop_name_str}"));
                     let setter_def = MethodDef::new(
                         Access::Extern,
                         class_idx,
@@ -1848,17 +1901,14 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                     // Property name: the field name, capitalized (`id` -> `Id`) — Roslyn's own
                     // convention for an auto-property backing a lowerCamelCase field, and what a C#
                     // consumer expects to write (`w.Id`, not `w.id`).
-                    let mut prop_name_str = fname.clone();
-                    if let Some(first) = prop_name_str.get_mut(0..1) {
-                        first.make_ascii_uppercase();
-                    }
                     let prop_name = ctx.alloc_string(prop_name_str);
-                    ctx.class_mut(class_idx).add_property(cilly::class::PropertyDef::new(
-                        prop_name,
-                        *tpe,
-                        Some(getter_ref),
-                        Some(setter_ref),
-                    ));
+                    ctx.class_mut(class_idx)
+                        .add_property(cilly::class::PropertyDef::new(
+                            prop_name,
+                            *tpe,
+                            Some(getter_ref),
+                            Some(setter_ref),
+                        ));
                 }
             }
         }

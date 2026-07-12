@@ -3,7 +3,7 @@
 // `cd_interop.dll` is the .NET class-library assembly produced from the Rust `cdylib` crate
 // `cd_interop` (target_os=dotnet, build-std with panic_unwind). It is named after its crate AND
 // emits proper `.assembly extern` BCL identities, so C# references it directly and calls its
-// `#[no_mangle] pub extern "C"` functions as ordinary static methods on `MainModule` — no P/Invoke,
+// `#[unsafe(no_mangle)] pub extern "C"` functions as ordinary static methods on `MainModule` — no P/Invoke,
 // no marshalling attributes, no reflection. They are managed calls, because the Rust was compiled to
 // managed CIL.
 //

@@ -3,27 +3,22 @@ use crate::{
     utilis::{adt::get_discr, const_sizeof},
 };
 use cilly::{
-    cilnode::{ExtendKind, IsPure, MethodKind},
     BinOp, Const, FieldDesc, Float, Int, Interned, MethodRef, Type,
+    cilnode::{ExtendKind, IsPure, MethodKind},
 };
 
 type Node = Interned<cilly::ir::CILNode>;
 type Root = Interned<cilly::ir::CILRoot>;
 use crate::call_info::CallInfo;
 use crate::fn_ctx::fn_name;
-use crate::place::{place_address, place_get};
-use crate::r#type::{
-    adt::enum_tag_info,
-    get_type,
-    utilis::ptr_is_fat,
-    GetTypeExt,
-};
 use crate::operand::{
     handle_operand, is_const_zero, is_uninit, operand_address, static_data::add_allocation,
 };
+use crate::place::{place_address, place_get};
+use crate::r#type::{GetTypeExt, adt::enum_tag_info, get_type, utilis::ptr_is_fat};
 use rustc_middle::{
     mir::{CastKind, Operand, Place, Rvalue},
-    ty::{adjustment::PointerCoercion, Instance, Ty, TyKind},
+    ty::{Instance, Ty, TyKind, adjustment::PointerCoercion},
 };
 macro_rules! cast {
     ($ctx:ident,$operand:ident,$target:ident,$cast_name:path,$asm:expr) => {{
@@ -85,8 +80,9 @@ fn single_variant_discr<'tcx>(
         Type::Int(Int::U128) => ctx.alloc_node(discr_val),
         Type::Int(Int::I128) => ctx.alloc_node(discr_val as i128),
         _ => {
-            let v = ctx
-                .alloc_node(u64::try_from(discr_val).expect("single-variant discriminant fits in u64"));
+            let v = ctx.alloc_node(
+                u64::try_from(discr_val).expect("single-variant discriminant fits in u64"),
+            );
             crate::casts::int_to_int(Type::Int(Int::U64), target, v, ctx)
         }
     }
@@ -97,7 +93,6 @@ pub fn handle_rvalue<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> (Vec<Root>, Node) {
     match rvalue {
-       
         Rvalue::Use(operand, _) => (vec![], handle_operand(operand, ctx)),
         // TODO: check the exact semantics of `WrapUnsafeBinder` once it has some documentation.
         Rvalue::WrapUnsafeBinder(operand, _unknown_ty) => (vec![], handle_operand(operand, ctx)),
@@ -147,16 +142,13 @@ pub fn handle_rvalue<'tcx>(
         // MIR for this rustc version. SizeOf/AlignOf/OffsetOf are now const intrinsics that are
         // fully const-evaluated before reaching the backend (they arrive as `Operand::Constant`),
         // and UbChecks/ContractChecks are now `Operand::RuntimeChecks` (handled in the operand crate).
-        Rvalue::Aggregate(aggregate_kind, field_index) => crate::aggregate::handle_aggregate(
-            ctx,
-            dst_place,
-            aggregate_kind.as_ref(),
-            field_index,
-        ),
+        Rvalue::Aggregate(aggregate_kind, field_index) => {
+            crate::aggregate::handle_aggregate(ctx, dst_place, aggregate_kind.as_ref(), field_index)
+        }
 
         Rvalue::Cast(
             CastKind::PointerCoercion(PointerCoercion::ClosureFnPointer(_), _),
-            ref operand,
+            operand,
             to_ty,
         ) => match ctx.monomorphize(operand.ty(ctx.body(), ctx.tcx())).kind() {
             TyKind::Closure(def_id, args) => {
@@ -277,7 +269,9 @@ pub fn handle_rvalue<'tcx>(
                 // f16 -> f16 is a no-op.
                 (Type::Float(Float::F16), Type::Float(Float::F16)) => (),
                 (Type::Float(Float::F128), _) | (_, Type::Float(Float::F128)) => {
-                    todo!("f128 FloatToFloat casts are unsupported: .NET has no quadruple-precision float type, so this needs softfloat emulation (src:{src:?} target:{target:?})")
+                    todo!(
+                        "f128 FloatToFloat casts are unsupported: .NET has no quadruple-precision float type, so this needs softfloat emulation (src:{src:?} target:{target:?})"
+                    )
                 }
                 (_, Type::Float(Float::F32)) => ops = ctx.float_cast(ops, Float::F32, true),
                 (_, Type::Float(Float::F64)) => ops = ctx.float_cast(ops, Float::F64, true),
@@ -387,7 +381,7 @@ pub fn handle_rvalue<'tcx>(
                 let rvalue_ty = rvalue.ty(ctx.body(), ctx.tcx());
                 let rvalue_type = ctx.type_from_cache(rvalue_ty);
                 let tpe = ctx.alloc_type(rvalue_type);
-                let ptr = add_allocation(alloc_id.0.into(), ctx, tpe);
+                let ptr = add_allocation(alloc_id.0.into(), ctx);
                 let tpe = ctx[tpe].pointed_to().unwrap();
                 (vec![], ctx.cast_ptr(ptr, tpe))
             }

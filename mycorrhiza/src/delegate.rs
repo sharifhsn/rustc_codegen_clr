@@ -45,7 +45,7 @@
 //! (everything here) is fully supported.
 
 use crate::intrinsics::{
-    rustc_clr_interop_delegate, RustcCLRInteropManagedGeneric, RustcCLRInteropTypeGeneric,
+    RustcCLRInteropManagedGeneric, RustcCLRInteropTypeGeneric, rustc_clr_interop_delegate,
 };
 
 // Delegates live in the core implementation assembly (a ref assembly forwards + throws at JIT).
@@ -193,9 +193,17 @@ impl<T> Comparison<T> {
     #[inline]
     pub fn invoke(&self, a0: T, a1: T) -> i32 {
         crate::intrinsics::rustc_clr_interop_generic_call3::<
-            { CORELIB }, { COMPARISON }, false, { INVOKE }, 2u8,
+            { CORELIB },
+            { COMPARISON },
+            false,
+            { INVOKE },
+            2u8,
             (T,),
-            (i32, RustcCLRInteropTypeGeneric<0>, RustcCLRInteropTypeGeneric<0>),
+            (
+                i32,
+                RustcCLRInteropTypeGeneric<0>,
+                RustcCLRInteropTypeGeneric<0>,
+            ),
             i32,
             RustcCLRInteropManagedGeneric<{ CORELIB }, { COMPARISON }, (T,)>,
             T,
@@ -207,7 +215,7 @@ impl<T> Comparison<T> {
 // The `invoke` methods call the delegate's own `Invoke` through the WF-9 generic bridge. `Invoke`'s
 // definition-shape signature uses the delegate's class generics: an `Action<T..>`'s `Invoke(!0, !1, …)`
 // returns void; a `Func<T.., R>`'s `Invoke(!0, …)` returns the LAST class generic (`!N`). We spell
-// those with the `gen!`-style `RustcCLRInteropTypeGeneric<N>` markers, exactly as a hand-written WF-9
+// those with the `r#gen!`-style `RustcCLRInteropTypeGeneric<N>` markers, exactly as a hand-written WF-9
 // wrapper would. (Kept out of the macro so the `!N` indices read explicitly per arity.)
 
 impl<T0> Action1<T0> {
@@ -215,7 +223,11 @@ impl<T0> Action1<T0> {
     #[inline]
     pub fn invoke(&self, a0: T0) {
         crate::intrinsics::rustc_clr_interop_generic_call2::<
-            { CORELIB }, { ACTION }, false, { INVOKE }, 2u8,
+            { CORELIB },
+            { ACTION },
+            false,
+            { INVOKE },
+            2u8,
             (T0,),
             ((), RustcCLRInteropTypeGeneric<0>),
             (),
@@ -229,9 +241,17 @@ impl<T0, T1> Action2<T0, T1> {
     #[inline]
     pub fn invoke(&self, a0: T0, a1: T1) {
         crate::intrinsics::rustc_clr_interop_generic_call3::<
-            { CORELIB }, { ACTION }, false, { INVOKE }, 2u8,
+            { CORELIB },
+            { ACTION },
+            false,
+            { INVOKE },
+            2u8,
             (T0, T1),
-            ((), RustcCLRInteropTypeGeneric<0>, RustcCLRInteropTypeGeneric<1>),
+            (
+                (),
+                RustcCLRInteropTypeGeneric<0>,
+                RustcCLRInteropTypeGeneric<1>,
+            ),
             (),
             RustcCLRInteropManagedGeneric<{ CORELIB }, { ACTION }, (T0, T1)>,
             T0,
@@ -244,7 +264,11 @@ impl<T0, R> Func1<T0, R> {
     #[inline]
     pub fn invoke(&self, a0: T0) -> R {
         crate::intrinsics::rustc_clr_interop_generic_call2::<
-            { CORELIB }, { FUNC }, false, { INVOKE }, 2u8,
+            { CORELIB },
+            { FUNC },
+            false,
+            { INVOKE },
+            2u8,
             (T0, R),
             (RustcCLRInteropTypeGeneric<1>, RustcCLRInteropTypeGeneric<0>),
             R,
@@ -258,9 +282,17 @@ impl<T0, T1, R> Func2<T0, T1, R> {
     #[inline]
     pub fn invoke(&self, a0: T0, a1: T1) -> R {
         crate::intrinsics::rustc_clr_interop_generic_call3::<
-            { CORELIB }, { FUNC }, false, { INVOKE }, 2u8,
+            { CORELIB },
+            { FUNC },
+            false,
+            { INVOKE },
+            2u8,
             (T0, T1, R),
-            (RustcCLRInteropTypeGeneric<2>, RustcCLRInteropTypeGeneric<0>, RustcCLRInteropTypeGeneric<1>),
+            (
+                RustcCLRInteropTypeGeneric<2>,
+                RustcCLRInteropTypeGeneric<0>,
+                RustcCLRInteropTypeGeneric<1>,
+            ),
             R,
             RustcCLRInteropManagedGeneric<{ CORELIB }, { FUNC }, (T0, T1, R)>,
             T0,

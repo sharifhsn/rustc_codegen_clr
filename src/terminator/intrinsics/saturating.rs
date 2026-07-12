@@ -1,10 +1,11 @@
 use crate::assembly::MethodCompileCtx;
-use cilly::{
-    cilnode::{IsPure, MethodKind},
-    Interned, MethodRef, Type, {ClassRef, Int},
-};
 use crate::place::place_set;
 use crate::r#type::GetTypeExt;
+use cilly::{
+    Interned, MethodRef, Type,
+    cilnode::{IsPure, MethodKind},
+    {ClassRef, Int},
+};
 
 use crate::operand::handle_operand;
 use rustc_middle::{
@@ -36,9 +37,7 @@ pub fn saturating_add<'tcx>(
         ),
     );
     let calc = match a_type {
-        Type::Int(
-            int @ (Int::USize | Int::U128 | Int::U64 | Int::U32 | Int::U16 | Int::U8),
-        ) => {
+        Type::Int(int @ (Int::USize | Int::U128 | Int::U64 | Int::U32 | Int::U16 | Int::U8)) => {
             let sum = crate::binop::add_unchecked(a_ty, a_ty, ctx, a, b);
             let or = crate::binop::bitop::bit_or_unchecked(a_ty, a_ty, ctx, a, b);
             let flag = crate::binop::cmp::lt_unchecked(a_ty, sum, or, ctx);
@@ -68,7 +67,11 @@ pub fn saturating_add<'tcx>(
             let min = ctx.alloc_node(i64::from(i32::MIN));
             let max = ctx.alloc_node(i64::from(i32::MAX));
             let diff_capped = ctx.call(clamp, &[diff, min, max], IsPure::NOT);
-            ctx.int_cast(diff_capped, Int::I32, cilly::cilnode::ExtendKind::SignExtend)
+            ctx.int_cast(
+                diff_capped,
+                Int::I32,
+                cilly::cilnode::ExtendKind::SignExtend,
+            )
         }
 
         Type::Int(Int::I64) => {
@@ -174,7 +177,11 @@ pub fn saturating_add<'tcx>(
             let min = ctx.alloc_node(i32::from(i16::MIN));
             let max = ctx.alloc_node(i32::from(i16::MAX));
             let diff_capped = ctx.call(mref, &[diff, min, max], IsPure::NOT);
-            ctx.int_cast(diff_capped, Int::I16, cilly::cilnode::ExtendKind::SignExtend)
+            ctx.int_cast(
+                diff_capped,
+                Int::I16,
+                cilly::cilnode::ExtendKind::SignExtend,
+            )
         }
         Type::Int(Int::I8) => {
             let a = ctx.int_cast(a, Int::I32, cilly::cilnode::ExtendKind::SignExtend);
@@ -347,7 +354,11 @@ pub fn saturating_sub<'tcx>(
             let min = ctx.alloc_node(i64::from(i32::MIN));
             let max = ctx.alloc_node(i64::from(i32::MAX));
             let diff_capped = ctx.call(clamp, &[diff, min, max], IsPure::NOT);
-            ctx.int_cast(diff_capped, Int::I32, cilly::cilnode::ExtendKind::SignExtend)
+            ctx.int_cast(
+                diff_capped,
+                Int::I32,
+                cilly::cilnode::ExtendKind::SignExtend,
+            )
         }
         Type::Int(Int::I16) => {
             let a = ctx.int_cast(a, Int::I32, cilly::cilnode::ExtendKind::SignExtend);
@@ -371,7 +382,11 @@ pub fn saturating_sub<'tcx>(
             let min = ctx.alloc_node(i32::from(i16::MIN));
             let max = ctx.alloc_node(i32::from(i16::MAX));
             let diff_capped = ctx.call(clamp, &[diff, min, max], IsPure::NOT);
-            ctx.int_cast(diff_capped, Int::I16, cilly::cilnode::ExtendKind::SignExtend)
+            ctx.int_cast(
+                diff_capped,
+                Int::I16,
+                cilly::cilnode::ExtendKind::SignExtend,
+            )
         }
         Type::Int(Int::I8) => {
             let a = ctx.int_cast(a, Int::I32, cilly::cilnode::ExtendKind::SignExtend);

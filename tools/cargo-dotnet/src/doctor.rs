@@ -14,7 +14,7 @@
 //!       * `TypeLoadException: … Stack` / `Queue` → the impl-assembly gotcha (those live
 //!         in `System.Collections`, not `System.Private.CoreLib`).
 //!       * `MissingMethodException` / `EntryPointNotFoundException: rcl_vec_*` →
-//!         "did you `export_rust_containers!()` / mark the fn `#[no_mangle]`?".
+//!         "did you `export_rust_containers!()` / mark the fn `#[unsafe(no_mangle)]`?".
 //!     The same matcher powers both the file/arg mode and (future) an auto-hint on a
 //!     failed run.
 
@@ -40,13 +40,28 @@ struct Check {
 
 impl Check {
     fn pass(label: impl Into<String>, detail: impl Into<String>) -> Self {
-        Check { ok: true, hard: true, label: label.into(), detail: detail.into() }
+        Check {
+            ok: true,
+            hard: true,
+            label: label.into(),
+            detail: detail.into(),
+        }
     }
     fn fail(label: impl Into<String>, detail: impl Into<String>) -> Self {
-        Check { ok: false, hard: true, label: label.into(), detail: detail.into() }
+        Check {
+            ok: false,
+            hard: true,
+            label: label.into(),
+            detail: detail.into(),
+        }
     }
     fn warn(label: impl Into<String>, detail: impl Into<String>) -> Self {
-        Check { ok: false, hard: false, label: label.into(), detail: detail.into() }
+        Check {
+            ok: false,
+            hard: false,
+            label: label.into(),
+            detail: detail.into(),
+        }
     }
     fn render(&self, out: &mut String) {
         let mark = if self.ok {
@@ -69,8 +84,10 @@ pub fn run(args: &DoctorArgs) -> Result<i32> {
         let hints = diagnose_failure(&input);
         if hints.is_empty() {
             println!("cargo dotnet doctor: no known interop failure signature matched.");
-            println!("  (recognised: TypeLoadException, MissingMethod/EntryPointNotFound, \
-                      DllNotFound, BadImageFormat, and the Mono-ilasm PE mismatch)");
+            println!(
+                "  (recognised: TypeLoadException, MissingMethod/EntryPointNotFound, \
+                      DllNotFound, BadImageFormat, and the Mono-ilasm PE mismatch)"
+            );
             return Ok(0);
         }
         println!("cargo dotnet doctor — interop failure analysis:\n");
@@ -153,11 +170,13 @@ fn environment_checks() -> Vec<Check> {
     });
 
     // A CoreCLR (not Mono) ilasm.
-    checks.push(match host::resolve_ilasm(&facts, crate::context::DotnetVersion::Net8) {
-        Ok(Some(p)) => Check::pass("CoreCLR ilasm", format!("using {}", p.display())),
-        Ok(None) => Check::pass("CoreCLR ilasm", "a non-Mono ilasm on PATH".to_string()),
-        Err(e) => Check::fail("CoreCLR ilasm", e.to_string()),
-    });
+    checks.push(
+        match host::resolve_ilasm(&facts, crate::context::DotnetVersion::Net8) {
+            Ok(Some(p)) => Check::pass("CoreCLR ilasm", format!("using {}", p.display())),
+            Ok(None) => Check::pass("CoreCLR ilasm", "a non-Mono ilasm on PATH".to_string()),
+            Err(e) => Check::fail("CoreCLR ilasm", e.to_string()),
+        },
+    );
 
     // The backend install (dylib + linker + target spec + msbuild targets).
     checks.extend(check_backend_install(&facts));
@@ -233,7 +252,10 @@ fn check_backend_install(facts: &HostFacts) -> Vec<Check> {
         ),
         Ok(Mode::Dev { repo_root }) => (
             format!("dev checkout {}", repo_root.display()),
-            repo_root.join(format!("target/release/librustc_codegen_clr.{}", facts.dylib_ext)),
+            repo_root.join(format!(
+                "target/release/librustc_codegen_clr.{}",
+                facts.dylib_ext
+            )),
             repo_root.join(format!("target/release/linker{}", facts.exe_ext)),
             repo_root.join("x86_64-unknown-dotnet.json"),
             repo_root.join("msbuild/RustDotnet.targets"),
@@ -247,10 +269,18 @@ fn check_backend_install(facts: &HostFacts) -> Vec<Check> {
     checks.push(Check::pass("backend layout", root_label));
     checks.push(file_check("backend dylib", &dylib, true));
     checks.push(file_check("linker binary", &linker, true));
-    checks.push(file_check("target spec (x86_64-unknown-dotnet.json)", &target_spec, true));
+    checks.push(file_check(
+        "target spec (x86_64-unknown-dotnet.json)",
+        &target_spec,
+        true,
+    ));
     // RustDotnet.targets is only needed for the C#-consumes-Rust (--lib/--plugin) flow, so a
     // soft warning rather than a hard failure.
-    checks.push(file_check("msbuild/RustDotnet.targets (C# consumer)", &targets, false));
+    checks.push(file_check(
+        "msbuild/RustDotnet.targets (C# consumer)",
+        &targets,
+        false,
+    ));
     checks
 }
 
@@ -265,7 +295,10 @@ fn file_check(label: &str, path: &Path, hard: bool) -> Check {
     } else {
         Check::warn(
             label.to_string(),
-            format!("missing: {} (only needed for the C# consumer flow)", path.display()),
+            format!(
+                "missing: {} (only needed for the C# consumer flow)",
+                path.display()
+            ),
         )
     }
 }
@@ -291,14 +324,24 @@ fn file_check(label: &str, path: &Path, hard: bool) -> Check {
 
 /// Directory names never worth descending into while scanning a workspace.
 const SKIP_DIRS: &[&str] = &[
-    "target", ".git", "node_modules", "bin", "obj", ".vs", ".idea", "graphify-out",
+    "target",
+    ".git",
+    "node_modules",
+    "bin",
+    "obj",
+    ".vs",
+    ".idea",
+    "graphify-out",
 ];
 
 fn workspace_wiring_checks(root: &Path) -> Vec<Check> {
     if !root.is_dir() {
         return vec![Check::warn(
             "workspace wiring scan",
-            format!("--workspace {} is not a directory; skipping", root.display()),
+            format!(
+                "--workspace {} is not a directory; skipping",
+                root.display()
+            ),
         )];
     }
 
@@ -318,7 +361,9 @@ fn workspace_wiring_checks(root: &Path) -> Vec<Check> {
     }
     let mut csproj_facts = Vec::new();
     for csproj in &csprojs {
-        let Ok(text) = std::fs::read_to_string(csproj) else { continue };
+        let Ok(text) = std::fs::read_to_string(csproj) else {
+            continue;
+        };
         let proj_dir = csproj.parent().unwrap_or(Path::new("."));
         let rust_crate_dirs = extract_rust_crate_includes(&text)
             .into_iter()
@@ -338,8 +383,10 @@ fn workspace_wiring_checks(root: &Path) -> Vec<Check> {
     // Rust-only cargo_tests probe crates that have no C# consumer by design, e.g. rust-on-.NET
     // "app" style crates). We only flag a Rust crate that sits NEXT TO a .csproj sibling
     // (same parent dir) — the strongest signal that it was meant to be consumed by it.
-    let referenced: std::collections::HashSet<PathBuf> =
-        csproj_facts.iter().flat_map(|f| f.rust_crate_dirs.iter().cloned()).collect();
+    let referenced: std::collections::HashSet<PathBuf> = csproj_facts
+        .iter()
+        .flat_map(|f| f.rust_crate_dirs.iter().cloned())
+        .collect();
     for crate_dir in &cargo_tomls {
         let crate_dir = crate_dir.parent().unwrap_or(Path::new(".")).to_path_buf();
         let norm = normalize(&crate_dir);
@@ -354,7 +401,9 @@ fn workspace_wiring_checks(root: &Path) -> Vec<Check> {
         // crate in a big flat probe-crate tree would spuriously match some unrelated csproj
         // living two levels down elsewhere in that same tree. Otherwise this is plausibly a
         // Rust-only crate never meant to be referenced from C#.
-        let Some(parent) = norm.parent() else { continue };
+        let Some(parent) = norm.parent() else {
+            continue;
+        };
         let parent_is_scan_root = normalize(parent) == normalize(root);
         let has_sibling_csproj = !parent_is_scan_root
             && (has_csproj_under(parent)
@@ -442,7 +491,9 @@ fn walk(dir: &Path, depth: u32, cargo_tomls: &mut Vec<PathBuf>, csprojs: &mut Ve
     if depth > 8 {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name();
@@ -487,7 +538,10 @@ fn normalize(p: &Path) -> PathBuf {
 }
 
 fn pretty_relative(p: &Path, root: &Path) -> String {
-    p.strip_prefix(&normalize(root)).unwrap_or(p).display().to_string()
+    p.strip_prefix(&normalize(root))
+        .unwrap_or(p)
+        .display()
+        .to_string()
 }
 
 /// Extract every `<RustCrate Include="...">` path (attribute-order-agnostic, simple regex-free
@@ -575,7 +629,7 @@ fn read_failure_input(args: &DoctorArgs) -> Result<Option<String>> {
 #[cfg(unix)]
 fn is_stdin_tty() -> bool {
     // Avoid an extra dependency: check via isatty on fd 0.
-    extern "C" {
+    unsafe extern "C" {
         fn isatty(fd: i32) -> i32;
     }
     unsafe { isatty(0) == 1 }
@@ -614,7 +668,10 @@ pub fn diagnose_failure(text: &str) -> Vec<Hint> {
             "Fix: correct the impl-assembly string on the wrapper (mycorrhiza/src/collections.rs)."
                 .to_string(),
         );
-        hints.push(Hint { title: "TypeLoadException → impl-assembly mismatch".to_string(), body });
+        hints.push(Hint {
+            title: "TypeLoadException → impl-assembly mismatch".to_string(),
+            body,
+        });
     }
 
     // 2. Missing method / entry point — usually a not-exported Rust fn.
@@ -628,7 +685,7 @@ pub fn diagnose_failure(text: &str) -> Vec<Hint> {
             "Common causes:".to_string(),
             "  • the Rust side did not `mycorrhiza::export_rust_containers!()` (no rcl_vec_* exported)"
                 .to_string(),
-            "  • the exported fn is missing `#[no_mangle]` (so its symbol was mangled away)".to_string(),
+            "  • the exported fn is missing `#[unsafe(no_mangle)]` (so its symbol was mangled away)".to_string(),
             "  • a signature mismatch between the C# P/Invoke and the Rust `extern` fn".to_string(),
         ];
         if lower.contains("rcl_vec") {
@@ -712,18 +769,32 @@ mod tests {
         assert_eq!(hints.len(), 1);
         assert!(hints[0].title.contains("impl-assembly"));
         // The Stack-specific sharpening fired.
-        assert!(hints[0].body.iter().any(|l| l.contains("System.Collections")));
-        assert!(hints[0].body.iter().any(|l| l.contains("names Stack/Queue")));
+        assert!(
+            hints[0]
+                .body
+                .iter()
+                .any(|l| l.contains("System.Collections"))
+        );
+        assert!(
+            hints[0]
+                .body
+                .iter()
+                .any(|l| l.contains("names Stack/Queue"))
+        );
     }
 
     #[test]
     fn missing_method_maps_to_export() {
-        let hints = diagnose_failure(
-            "System.MissingMethodException: Method not found: rcl_vec_new",
-        );
+        let hints =
+            diagnose_failure("System.MissingMethodException: Method not found: rcl_vec_new");
         assert_eq!(hints.len(), 1);
         assert!(hints[0].title.contains("un-exported"));
-        assert!(hints[0].body.iter().any(|l| l.contains("export_rust_containers")));
+        assert!(
+            hints[0]
+                .body
+                .iter()
+                .any(|l| l.contains("export_rust_containers"))
+        );
     }
 
     #[test]
@@ -771,13 +842,19 @@ mod tests {
             <RustCrate Include="../rustlib" />
             <RustCrate Include='../other' Configuration="Debug" />
         </ItemGroup>"#;
-        assert_eq!(extract_rust_crate_includes(xml), vec!["../rustlib", "../other"]);
+        assert_eq!(
+            extract_rust_crate_includes(xml),
+            vec!["../rustlib", "../other"]
+        );
     }
 
     #[test]
     fn extracts_property_value() {
         let xml = "<PropertyGroup><RustDotnetVersion>9</RustDotnetVersion></PropertyGroup>";
-        assert_eq!(extract_property(xml, "RustDotnetVersion").as_deref(), Some("9"));
+        assert_eq!(
+            extract_property(xml, "RustDotnetVersion").as_deref(),
+            Some("9")
+        );
         assert_eq!(extract_property(xml, "TargetFramework"), None);
     }
 
@@ -787,7 +864,10 @@ mod tests {
     }
 
     fn tmp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("cargo_dotnet_doctor_test_{name}_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "cargo_dotnet_doctor_test_{name}_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -796,7 +876,10 @@ mod tests {
     #[test]
     fn clean_workspace_reports_ok() {
         let root = tmp_dir("clean");
-        write(&root.join("good/rustlib/Cargo.toml"), "[package]\nname = \"probe\"\n");
+        write(
+            &root.join("good/rustlib/Cargo.toml"),
+            "[package]\nname = \"probe\"\n",
+        );
         write(
             &root.join("good/csharp/probe_cs.csproj"),
             r#"<Project><PropertyGroup>
@@ -806,21 +889,29 @@ mod tests {
             <ItemGroup><RustCrate Include="../rustlib" /></ItemGroup></Project>"#,
         );
         let checks = workspace_wiring_checks(&root);
-        assert!(checks.iter().all(|c| c.ok), "expected a clean report, got a flagged check");
+        assert!(
+            checks.iter().all(|c| c.ok),
+            "expected a clean report, got a flagged check"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn detects_missing_rust_crate_wiring() {
         let root = tmp_dir("missing");
-        write(&root.join("proj/rustlib/Cargo.toml"), "[package]\nname = \"probe\"\n");
+        write(
+            &root.join("proj/rustlib/Cargo.toml"),
+            "[package]\nname = \"probe\"\n",
+        );
         write(
             &root.join("proj/csharp/probe_cs.csproj"),
             "<Project><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>",
         );
         let checks = workspace_wiring_checks(&root);
         assert!(
-            checks.iter().any(|c| !c.ok && c.label.contains("RustCrate wiring")),
+            checks
+                .iter()
+                .any(|c| !c.ok && c.label.contains("RustCrate wiring")),
             "expected a RustCrate-wiring warning, got: {:?}",
             checks.iter().map(|c| &c.label).collect::<Vec<_>>()
         );
@@ -830,7 +921,10 @@ mod tests {
     #[test]
     fn detects_tfm_version_mismatch() {
         let root = tmp_dir("tfm");
-        write(&root.join("proj/rustlib/Cargo.toml"), "[package]\nname = \"probe\"\n");
+        write(
+            &root.join("proj/rustlib/Cargo.toml"),
+            "[package]\nname = \"probe\"\n",
+        );
         write(
             &root.join("proj/csharp/probe_cs.csproj"),
             r#"<Project><PropertyGroup>
@@ -841,7 +935,9 @@ mod tests {
         );
         let checks = workspace_wiring_checks(&root);
         assert!(
-            checks.iter().any(|c| !c.ok && c.hard && c.label.contains("TFM/RustDotnetVersion")),
+            checks
+                .iter()
+                .any(|c| !c.ok && c.hard && c.label.contains("TFM/RustDotnetVersion")),
             "expected a hard TFM mismatch failure, got: {:?}",
             checks.iter().map(|c| &c.label).collect::<Vec<_>>()
         );
@@ -855,15 +951,24 @@ mod tests {
         // not cause every crate to be flagged just because *some* csproj exists somewhere
         // else two levels down from the scan root.
         let root = tmp_dir("largeroot");
-        write(&root.join("standalone_a/Cargo.toml"), "[package]\nname = \"a\"\n");
-        write(&root.join("standalone_b/Cargo.toml"), "[package]\nname = \"b\"\n");
+        write(
+            &root.join("standalone_a/Cargo.toml"),
+            "[package]\nname = \"a\"\n",
+        );
+        write(
+            &root.join("standalone_b/Cargo.toml"),
+            "[package]\nname = \"b\"\n",
+        );
         write(
             &root.join("unrelated_consumer/unrelated.csproj"),
             "<Project><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>",
         );
         let checks = workspace_wiring_checks(&root);
-        assert!(checks.iter().all(|c| c.ok), "expected no false positives, got: {:?}",
-            checks.iter().map(|c| (&c.label, c.ok)).collect::<Vec<_>>());
+        assert!(
+            checks.iter().all(|c| c.ok),
+            "expected no false positives, got: {:?}",
+            checks.iter().map(|c| (&c.label, c.ok)).collect::<Vec<_>>()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

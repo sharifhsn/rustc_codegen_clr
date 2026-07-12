@@ -265,8 +265,9 @@ Fully specified in **`feasibility/PACKAGE_A_OS_UNIX_PLAN.md`** (do not duplicate
   `PermissionsExt::{mode,set_mode,from_mode}`, `FileType::is(mode)` + libc `S_IF*`,
   `DirEntryExt::{ino,file_name_os_str}`, `DirBuilderExt::set_mode`, and the platform `MetadataExt`
   st_* synthesized from `FileAttr`. ~1.2 wu.
-- **net AF_UNIX (MED, compile-stub):** add `sockaddr_un` + `AF_UNIX=1` + `MSG_NOSIGNAL` + `MSG_PEEK`
-  to `[pal] libc/dotnet.rs`; add `Socket::new`/`new_pair` (Err-Unsupported) to dotnet sys::net. The
+- **net AF_UNIX (MED, compile-stub):** `sockaddr_un`, `AF_UNIX`, `MSG_NOSIGNAL`, and `MSG_PEEK` now
+  come from the canonical upstream Linux GNU libc tree selected for dotnet; add `Socket::new`/
+  `new_pair` (Err-Unsupported) to dotnet sys::net. The
   genuinely-impossible AF_UNIX pieces (abstract namespace, SCM_RIGHTS, ucred) are linux/bsd-cfg'd and
   DROP for dotnet — they never compile. ~0.4 wu. Real runtime (AddressFamily.Unix) deferred.
 - **process/thread exts (MED/LOW):** CommandExt/ExitStatusExt resolve via process_unsupported (the

@@ -79,5 +79,10 @@ fn main() -> std::process::ExitCode {
 
     Console::writeln_u64(pass as u64);
     Console::writeln_u64(total as u64);
-    if pass == total { std::process::ExitCode::SUCCESS } else { std::process::ExitCode::FAILURE }
+    if pass == total {
+        println!("== cd_decimal done ==");
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
+    }
 }

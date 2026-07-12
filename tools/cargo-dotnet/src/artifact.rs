@@ -96,14 +96,27 @@ pub fn locate(json: &str, ctx: &Context) -> Result<Artifact> {
         // filename: derive the stem (strip dir / the cargo `lib` prefix / the ext) and
         // copy beside the .so so a C# <Reference HintPath=<stem>.dll> resolves it.
         let file = so.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-        let stem = file.strip_prefix("lib").unwrap_or(file).to_string();
+        let cargo_stem = file.strip_prefix("lib").unwrap_or(file).to_string();
+        let stem = ctx
+            .managed_identity
+            .as_ref()
+            .map(|identity| identity.assembly_name.clone())
+            .unwrap_or_else(|| cargo_stem.clone());
         let dll = so.with_file_name(format!("{stem}.dll"));
-        fs::copy(&so, &dll)
-            .with_context(|| format!("cp {} -> {}", so.display(), dll.display()))?;
-        eprintln!("== lib PE: {} -> {} (assembly '{stem}') ==", so.display(), dll.display());
+        fs::copy(&so, &dll).with_context(|| format!("cp {} -> {}", so.display(), dll.display()))?;
+        eprintln!(
+            "== lib PE: {} -> {} (assembly '{stem}') ==",
+            so.display(),
+            dll.display()
+        );
         // Best-effort sidecar XML doc for `#[dotnet_export]` doc comments (see `xmldoc.rs`); never
         // fails the build over doc generation.
-        if let Err(e) = crate::xmldoc::generate(&ctx.crate_dir, &stem, &dll) {
+        if let Err(e) = crate::xmldoc::generate(
+            &ctx.crate_dir,
+            &cargo_stem,
+            &dll,
+            ctx.managed_identity.as_ref(),
+        ) {
             eprintln!("== xml docs: skipped ({e}) ==");
         }
         return Ok(Artifact::Library { so, dll, stem });

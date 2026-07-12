@@ -1,0 +1,9 @@
+[package]
+name = "rcl-private-registry-consumer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rcl-private-registry-probe = { version = "0.1.0", registry = "rcl-private" }
+
+[workspace]

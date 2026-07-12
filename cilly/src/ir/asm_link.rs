@@ -1,9 +1,9 @@
 use super::{
+    Assembly, CILNode, CILRoot, ClassDef, ClassRef, Const, FieldDesc, FnSig, MethodDefIdx,
+    MethodRef, StaticFieldDesc, Type,
     asm::{CCTOR, TCCTOR, USER_INIT},
     bimap::Interned,
     class::ClassDefIdx,
-    Assembly, CILNode, CILRoot, ClassDef, ClassRef, Const, FieldDesc, FnSig, MethodDefIdx,
-    MethodRef, StaticFieldDesc, Type,
 };
 
 /// Per-arena work performed while relocating one assembly into another.
@@ -37,9 +37,7 @@ pub struct RelocationStats {
 pub(crate) trait RelocateValue: Sized {
     type Output;
 
-    fn relocate(
-        self,
-        ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self::Output;
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self::Output;
 }
 
 struct DenseRelocationMap<T> {
@@ -75,6 +73,11 @@ impl<T> DenseRelocationMap<T> {
 /// Memoized, per-source-assembly relocation state.
 pub(crate) struct RelocateCtx<'source> {
     source: &'source Assembly,
+    /// Optional final-link projection for the compiler's internal `MainModule` sentinel.
+    ///
+    /// It is intentionally applied while relocating rather than changing codegen: old serialized
+    /// artifacts remain readable and all definition/reference arenas are rewritten together.
+    main_module_name: Option<&'source str>,
     strings: DenseRelocationMap<crate::IString>,
     types: DenseRelocationMap<Type>,
     class_refs: DenseRelocationMap<ClassRef>,
@@ -90,8 +93,16 @@ pub(crate) struct RelocateCtx<'source> {
 
 impl<'source> RelocateCtx<'source> {
     fn new(source: &'source Assembly) -> Self {
+        Self::with_main_module_name(source, None)
+    }
+
+    fn with_main_module_name(
+        source: &'source Assembly,
+        main_module_name: Option<&'source str>,
+    ) -> Self {
         Self {
             source,
+            main_module_name,
             strings: DenseRelocationMap::default(),
             types: DenseRelocationMap::default(),
             class_refs: DenseRelocationMap::default(),
@@ -115,7 +126,12 @@ impl<'source> RelocateCtx<'source> {
             self.stats.strings.cache_hits += 1;
             return relocated;
         }
-        let relocated = destination.alloc_string(&self.source[source]);
+        let source_value = &self.source[source];
+        let relocated = if *source_value == *super::asm::MAIN_MODULE {
+            destination.alloc_string(self.main_module_name.unwrap_or(source_value))
+        } else {
+            destination.alloc_string(source_value)
+        };
         self.strings.insert(source, relocated);
         self.stats.strings.unique_visits += 1;
         relocated
@@ -302,9 +318,9 @@ impl Assembly {
 
             super::Const::Null(cref) => super::Const::Null(ctx.class_ref(self, *cref)),
             super::Const::ByteBuffer { data, tpe } => super::Const::ByteBuffer {
-                    data: ctx.const_data(self, *data),
-                    tpe: ctx.type_id(self, *tpe),
-                },
+                data: ctx.const_data(self, *data),
+                tpe: ctx.type_id(self, *tpe),
+            },
             _ => cst.clone(),
         }
     }
@@ -487,12 +503,12 @@ impl Assembly {
                 col_len,
                 file,
             } => CILRoot::SourceFileInfo {
-                    line_start,
-                    line_len,
-                    col_start,
-                    col_len,
-                    file: ctx.string(self, file),
-                },
+                line_start,
+                line_len,
+                col_start,
+                col_len,
+                file: ctx.string(self, file),
+            },
             CILRoot::SetField(info) => {
                 let (field, addr, val) = info.as_ref();
                 CILRoot::SetField(Box::new((
@@ -517,10 +533,10 @@ impl Assembly {
                 )))
             }
             CILRoot::CpObj { src, dst, tpe } => CILRoot::CpObj {
-                    src: ctx.node(self, src),
-                    dst: ctx.node(self, dst),
-                    tpe: ctx.type_id(self, tpe),
-                },
+                src: ctx.node(self, src),
+                dst: ctx.node(self, dst),
+                tpe: ctx.type_id(self, tpe),
+            },
             CILRoot::InitObj(src, tpe) => {
                 CILRoot::InitObj(ctx.node(self, src), ctx.type_id(self, tpe))
             }
@@ -557,39 +573,56 @@ impl Assembly {
                 CILRoot::TerminateRegion { protected, reason }
             }
             CILRoot::SetStaticField { field, val } => CILRoot::SetStaticField {
-                    field: ctx.static_field(self, field),
-                    val: ctx.node(self, val),
-                },
+                field: ctx.static_field(self, field),
+                val: ctx.node(self, val),
+            },
             CILRoot::StElem {
                 array,
                 index,
                 value,
                 elem,
             } => CILRoot::StElem {
-                    array: ctx.node(self, array),
-                    index: ctx.node(self, index),
-                    value: ctx.node(self, value),
-                    elem: ctx.type_id(self, elem),
-                },
+                array: ctx.node(self, array),
+                index: ctx.node(self, index),
+                value: ctx.node(self, value),
+                elem: ctx.type_id(self, elem),
+            },
         }
     }
-    pub(crate) fn translate_class_def(
-        &mut self,
-        ctx: &mut RelocateCtx<'_>,
-        def: &ClassDef,
-    ) -> ClassDef {
+    pub(crate) fn translate_class_def(&mut self, ctx: &mut RelocateCtx<'_>, def: &ClassDef) {
         let super::class::RelocatedClassDef {
             definition: translated,
             source_methods,
         } = def.clone().relocate(ctx, self);
         let class_ref = self.alloc_class_ref(translated.ref_to());
+        if let Some(existing_def) = self.class_defs().get(&ClassDefIdx(class_ref)) {
+            for incoming @ (_, incoming_name, _) in translated.fields() {
+                if let Some(existing) = existing_def
+                    .fields()
+                    .iter()
+                    .find(|(_, existing_name, _)| existing_name == incoming_name)
+                {
+                    if existing != incoming {
+                        let existing_type = existing.0.mangle(self);
+                        let incoming_type = incoming.0.mangle(self);
+                        panic!(
+                            "class field differs across codegen shards: class={}, field={}, \
+                             existing={existing:?} ({existing_type}), incoming={incoming:?} \
+                             ({incoming_type})",
+                            &self[translated.name()],
+                            &self[*incoming_name]
+                        );
+                    }
+                }
+            }
+        }
         let (defs_mut, _) = self.class_defs_mut_strings();
         match defs_mut.entry(ClassDefIdx(class_ref)) {
             std::collections::hash_map::Entry::Occupied(mut occupied) => {
-                occupied.get_mut().merge_defs(translated.clone());
+                occupied.get_mut().merge_defs(translated);
             }
             std::collections::hash_map::Entry::Vacant(vacant) => {
-                vacant.insert(translated.clone());
+                vacant.insert(translated);
             }
         }
 
@@ -623,7 +656,6 @@ impl Assembly {
             };
             self.new_method(method_def);
         }
-        translated
     }
 }
 const SPECIAL_METHOD_NAMES: &[&str] = &[CCTOR, TCCTOR, USER_INIT];
@@ -643,19 +675,42 @@ pub(crate) fn relocate_assembly(
             .class_defs()
             .get(&class_id)
             .expect("snapshotted source class definition");
-        let translated = destination.translate_class_def(&mut ctx, def);
-        let class_ref = destination.alloc_class_ref(translated.ref_to());
-        let (class_defs, _) = destination.class_defs_mut_strings();
-        match class_defs.entry(ClassDefIdx(class_ref)) {
-            std::collections::hash_map::Entry::Occupied(mut occupied) => {
-                occupied.get_mut().merge_defs(translated);
-            }
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                vacant.insert(translated);
-            }
-        }
+        // `translate_class_def` owns the complete class relocation transaction: it inserts or
+        // merges the translated definition and then relocates its methods. Re-merging the returned
+        // snapshot here was redundant for identical layouts and actively wrong when a definition
+        // had already been normalized in the destination, because the second merge compared the
+        // same logical field through two physical-offset snapshots.
+        destination.translate_class_def(&mut ctx, def);
     }
-    assert_eq!(destination.alloc_string(super::asm::MAIN_MODULE), original_str);
+    assert_eq!(
+        destination.alloc_string(super::asm::MAIN_MODULE),
+        original_str
+    );
+    (destination, ctx.stats)
+}
+
+/// Rebuild an assembly while projecting the internal `MainModule` sentinel to one public CLR type.
+///
+/// This is a final-link operation: every class/method/field/type reference is relocated through one
+/// mapping, so a definition and all of its call sites stay coherent. It deliberately does not alter
+/// artifacts that did not opt into a managed identity.
+pub(crate) fn relocate_assembly_with_main_module_name(
+    mut destination: Assembly,
+    source: &Assembly,
+    main_module_name: &str,
+) -> (Assembly, RelocationStats) {
+    source.assert_relocation_arena_coverage();
+    destination.assert_relocation_arena_coverage();
+    let mut class_ids: Vec<_> = source.iter_class_def_ids().copied().collect();
+    class_ids.sort_unstable_by_key(|class_id| class_id.0.inner());
+    let mut ctx = RelocateCtx::with_main_module_name(source, Some(main_module_name));
+    for class_id in class_ids {
+        let def = source
+            .class_defs()
+            .get(&class_id)
+            .expect("snapshotted source class definition");
+        destination.translate_class_def(&mut ctx, def);
+    }
     (destination, ctx.stats)
 }
 
@@ -663,9 +718,9 @@ pub(crate) fn relocate_assembly(
 mod tests {
     use super::*;
     use crate::{
+        Access, BasicBlock, Const, ExceptionRegion, IString, Int, MethodDef, MethodImpl, Type,
         ir::cilnode::{BinOp, MethodKind},
         ir::class::{CustomAttrArg, CustomAttrDef, EventDef, PropertyDef, StaticFieldDef},
-        Access, BasicBlock, Const, ExceptionRegion, IString, Int, MethodDef, MethodImpl, Type,
     };
     use std::num::NonZeroU32;
 
@@ -703,6 +758,105 @@ mod tests {
             "destination_only_method",
             vec![BasicBlock::new(vec![ret], 0, None)],
         );
+    }
+
+    #[test]
+    fn linking_partial_class_definitions_preserves_instance_fields() {
+        let mut destination = Assembly::default();
+        let destination_name = destination.alloc_string("ShardDefinedType");
+        destination
+            .class_def(ClassDef::new(
+                destination_name,
+                true,
+                0,
+                None,
+                vec![],
+                vec![],
+                Access::Public,
+                None,
+                None,
+                true,
+            ))
+            .unwrap();
+
+        let mut source = Assembly::default();
+        let source_name = source.alloc_string("ShardDefinedType");
+        let payload = source.alloc_string("payload");
+        source
+            .class_def(ClassDef::new(
+                source_name,
+                true,
+                0,
+                None,
+                vec![(Type::Int(Int::I32), payload, Some(0))],
+                vec![],
+                Access::Public,
+                NonZeroU32::new(4),
+                NonZeroU32::new(4),
+                true,
+            ))
+            .unwrap();
+
+        let linked = destination.link(source);
+        let definition = linked
+            .class_defs()
+            .values()
+            .find(|definition| &linked[definition.name()] == "ShardDefinedType")
+            .expect("linked partial class definition");
+        assert_eq!(definition.fields().len(), 1);
+        assert_eq!(definition.fields()[0].0, Type::Int(Int::I32));
+        assert_eq!(&linked[definition.fields()[0].1], "payload");
+        assert_eq!(definition.fields()[0].2, Some(0));
+        assert_eq!(definition.explict_size(), NonZeroU32::new(4));
+        assert_eq!(definition.align(), NonZeroU32::new(4));
+    }
+
+    #[test]
+    fn linking_partial_class_definitions_adopts_relocated_base() {
+        let mut destination = Assembly::default();
+        let destination_name = destination.alloc_string("ShardDerivedType");
+        destination
+            .class_def(ClassDef::new(
+                destination_name,
+                false,
+                0,
+                None,
+                vec![],
+                vec![],
+                Access::Public,
+                None,
+                None,
+                true,
+            ))
+            .unwrap();
+
+        let mut source = Assembly::default();
+        let source_name = source.alloc_string("ShardDerivedType");
+        let base_name = source.alloc_string("ManagedBase");
+        let base = source.alloc_class_ref(ClassRef::new(base_name, None, false, [].into()));
+        source
+            .class_def(ClassDef::new(
+                source_name,
+                false,
+                0,
+                Some(base),
+                vec![],
+                vec![],
+                Access::Public,
+                None,
+                None,
+                true,
+            ))
+            .unwrap();
+
+        let linked = destination.link(source);
+        let definition = linked
+            .class_defs()
+            .values()
+            .find(|definition| &linked[definition.name()] == "ShardDerivedType")
+            .expect("linked partial class definition");
+        let base = definition.extends().expect("authoritative base was lost");
+        assert_eq!(&linked[linked[base].name()], "ManagedBase");
     }
 
     #[test]
@@ -835,10 +989,12 @@ mod tests {
         assert_ne!(authoritative.name().inner(), authoritative_name.inner());
         assert!(authoritative.is_valuetype());
         let mut authoritative = authoritative.clone();
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            authoritative.set_is_valuetype(false);
-        }))
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                authoritative.set_is_valuetype(false);
+            }))
+            .is_err()
+        );
 
         let placeholder = linked
             .class_defs()
@@ -959,10 +1115,8 @@ mod tests {
             tpe: live_type,
         });
         let live_field_name = asm.alloc_string("live_field");
-        let live_field = asm.alloc_field(FieldDesc::new(
-            *owner,
-            live_field_name,
-            Type::Int(Int::I32)));
+        let live_field =
+            asm.alloc_field(FieldDesc::new(*owner, live_field_name, Type::Int(Int::I32)));
         let live_addr = asm.alloc_node(Const::Null(*owner));
         let live_field_load = asm.alloc_node(CILNode::LdField {
             addr: live_addr,
@@ -993,11 +1147,8 @@ mod tests {
 
         let junk_string = asm.alloc_string("unreachable");
         let junk_type = asm.alloc_type(Type::Int(Int::U16));
-        let junk_class = asm.alloc_class_ref(ClassRef::new(
-            junk_string,
-            None,
-            false,
-            vec![].into()));
+        let junk_class =
+            asm.alloc_class_ref(ClassRef::new(junk_string, None, false, vec![].into()));
         let junk_sig = asm.sig([Type::Int(Int::U8)], Type::Int(Int::U8));
         let _junk_method = asm.alloc_methodref(MethodRef::new(
             junk_class,
@@ -1006,10 +1157,8 @@ mod tests {
             MethodKind::Static,
             vec![].into(),
         ));
-        let _junk_field = asm.alloc_field(FieldDesc::new(
-            junk_class,
-            junk_string,
-            Type::Int(Int::U8)));
+        let _junk_field =
+            asm.alloc_field(FieldDesc::new(junk_class, junk_string, Type::Int(Int::U8)));
         let _junk_static = asm.alloc_sfld(StaticFieldDesc::new(
             junk_class,
             junk_string,
@@ -1057,7 +1206,10 @@ mod tests {
         assert_eq!(stats.before.method_defs, stats.after.method_defs);
         assert_eq!(stats.before.sections, stats.after.sections);
         assert!(stats.relocation.roots.cache_hits >= 1);
-        assert_eq!(compacted.get_section("compaction-test"), Some(&vec![9, 8, 7]));
+        assert_eq!(
+            compacted.get_section("compaction-test"),
+            Some(&vec![9, 8, 7])
+        );
 
         let method = compacted
             .method_defs()
@@ -1089,11 +1241,8 @@ mod tests {
         let base_name = source.alloc_string("KitchenBase");
         let base = source.alloc_class_ref(ClassRef::new(base_name, None, false, vec![].into()));
         let interface_name = source.alloc_string("IKitchen");
-        let interface = source.alloc_class_ref(ClassRef::new(
-            interface_name,
-            None,
-            false,
-            vec![].into()));
+        let interface =
+            source.alloc_class_ref(ClassRef::new(interface_name, None, false, vec![].into()));
         let mut class = ClassDef::new(
             class_name,
             true,
@@ -1148,11 +1297,8 @@ mod tests {
             vec![],
         );
         let delegate_name = source.alloc_string("KitchenDelegate");
-        let delegate = source.alloc_class_ref(ClassRef::new(
-            delegate_name,
-            None,
-            false,
-            vec![].into()));
+        let delegate =
+            source.alloc_class_ref(ClassRef::new(delegate_name, None, false, vec![].into()));
         let property_inner = source.alloc_type(Type::Int(Int::I16));
         let event_name = source.alloc_string("Changed");
         let property_name = source.alloc_string("Value");
@@ -1170,11 +1316,8 @@ mod tests {
         ));
 
         let attr_name = source.alloc_string("KitchenAttribute");
-        let attr_type = source.alloc_class_ref(ClassRef::new(
-            attr_name,
-            None,
-            false,
-            vec![].into()));
+        let attr_type =
+            source.alloc_class_ref(ClassRef::new(attr_name, None, false, vec![].into()));
         let ctor_text = source.alloc_string("ctor-text");
         let named_name = source.alloc_string("NamedText");
         let named_text = source.alloc_string("named-text");
@@ -1243,10 +1386,12 @@ mod tests {
         assert_eq!(linked_class.align(), NonZeroU32::new(8));
         assert!(!linked_class.has_nonveralpping_layout());
         let mut authority_probe = linked_class.clone();
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            authority_probe.set_is_valuetype(false);
-        }))
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                authority_probe.set_is_valuetype(false);
+            }))
+            .is_err()
+        );
 
         let extends = linked_class.extends().expect("relocated base class");
         assert_eq!(&linked[linked.class_ref(extends).name()], "KitchenBase");
@@ -1274,7 +1419,10 @@ mod tests {
         let Type::ClassRef(delegate) = event.delegate() else {
             panic!("event delegate must remain a class reference");
         };
-        assert_eq!(&linked[linked.class_ref(delegate).name()], "KitchenDelegate");
+        assert_eq!(
+            &linked[linked.class_ref(delegate).name()],
+            "KitchenDelegate"
+        );
         assert_eq!(&linked[linked[event.add()].name()], "add_Changed");
         assert_eq!(&linked[linked[event.remove()].name()], "remove_Changed");
 
@@ -1294,12 +1442,16 @@ mod tests {
             &linked[linked.class_ref(attribute.attr_type()).name()],
             "KitchenAttribute"
         );
-        assert!(matches!(attribute.ctor_args()[0], CustomAttrArg::Str(value) if &linked[value] == "ctor-text"));
+        assert!(
+            matches!(attribute.ctor_args()[0], CustomAttrArg::Str(value) if &linked[value] == "ctor-text")
+        );
         assert_eq!(attribute.ctor_args()[1], CustomAttrArg::Bool(true));
         assert_eq!(attribute.ctor_args()[2], CustomAttrArg::I32(17));
         assert_eq!(attribute.ctor_args()[3], CustomAttrArg::I64(29));
         assert_eq!(&linked[attribute.named_args()[0].0], "NamedText");
-        assert!(matches!(attribute.named_args()[0].1, CustomAttrArg::Str(value) if &linked[value] == "named-text"));
+        assert!(
+            matches!(attribute.named_args()[0].1, CustomAttrArg::Str(value) if &linked[value] == "named-text")
+        );
 
         let method = linked
             .method_defs()
@@ -1310,7 +1462,10 @@ mod tests {
         assert_eq!(method.class(), *linked_class_id);
         assert_eq!(*method.access(), Access::Public);
         assert_eq!(method.kind(), MethodKind::Virtual);
-        assert_eq!(&linked[method.arg_names()[0].expect("argument name")], "output");
+        assert_eq!(
+            &linked[method.arg_names()[0].expect("argument name")],
+            "output"
+        );
         assert!(method.is_abstract());
         assert!(method.is_special_name());
         assert_eq!(method.out_params(), [1]);

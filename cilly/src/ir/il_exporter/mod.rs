@@ -8,23 +8,22 @@
 //! before assembling — see that module's own doc for the bin-packing strategy.
 
 use crate::{
-    branch_cond_to_name,
+    MethodImpl, branch_cond_to_name,
     utilis::{assert_unique, encode},
-    MethodImpl,
 };
 
 use std::{io::Write, path::Path};
 
 use super::{
-    asm::{IlasmFlavour, ILASM_FLAVOUR, ILASM_PATH},
+    Assembly, BinOp, CILIter, CILIterElem, CILNode, CILRoot, ClassRef, Const, Exporter, FnSig, Int,
+    MethodDefIdx, Type,
+    asm::{ILASM_FLAVOUR, ILASM_PATH, IlasmFlavour},
     bimap::Interned,
     cilnode::{ExtendKind, UnOp},
     cilroot::BranchCond,
     class::StaticFieldDef,
     method::LocalDef,
     tpe::simd::SIMDElem,
-    Assembly, BinOp, CILIter, CILIterElem, CILNode, CILRoot, ClassRef, Const, Exporter, FnSig, Int,
-    MethodDefIdx, Type,
 };
 
 mod partition;
@@ -141,13 +140,19 @@ impl ILExporter {
         blob_sizes.sort_unstable();
         blob_sizes.dedup();
         for n in &blob_sizes {
-            writeln!(out, ".class private explicit ansi sealed '__rcl_const_blob_{n}' extends [System.Runtime]System.ValueType {{ .pack 1 .size {n} }}")?;
+            writeln!(
+                out,
+                ".class private explicit ansi sealed '__rcl_const_blob_{n}' extends [System.Runtime]System.ValueType {{ .pack 1 .size {n} }}"
+            )?;
         }
         for (idx, const_data) in asm.const_data.iter() {
             let encoded = encode(idx.inner() as u64);
             let n = const_data.len().max(1);
             let data: String = const_data.iter().map(|u| format!("{u:x} ")).collect();
-            writeln!(out, " .data cil I_{encoded} = bytearray ({data})\n.field assembly static valuetype '__rcl_const_blob_{n}' c_{encoded} at I_{encoded}")?;
+            writeln!(
+                out,
+                " .data cil I_{encoded} = bytearray ({data})\n.field assembly static valuetype '__rcl_const_blob_{n}' c_{encoded} at I_{encoded}"
+            )?;
         }
         let mut c = 0;
         // If `MainModule` is too large for a single .NET type (CoreCLR caps a type at ~65k methods),
@@ -203,8 +208,8 @@ impl ILExporter {
             // When `MainModule` is split across partition classes, its static fields are read by
             // methods that now live in sibling classes — widen them to `public` so the cross-class
             // `ldsfld`/`stsfld` is legal (default field accessibility is `private`).
-            let main_partitioned =
-                asm[class_def.name()] == *super::asm::MAIN_MODULE && self.partition.borrow().is_some();
+            let main_partitioned = asm[class_def.name()] == *super::asm::MAIN_MODULE
+                && self.partition.borrow().is_some();
             let field_vis = if main_partitioned { "public " } else { "" };
             // A genuine ECMA-335 interface `TypeDef` (§II.10.1.3) must NOT have an `extends`
             // clause at all — even the implicit `[System.Runtime]System.Object` this branch would
@@ -395,7 +400,10 @@ impl ILExporter {
                     ".field {field_vis}static {is_const} {tpe} '{name}'{default_value}"
                 )?;
                 if *is_tls {
-                    writeln!(out,".custom instance void [System.Runtime]System.ThreadStaticAttribute::.ctor() = (01 00 00 00)")?;
+                    writeln!(
+                        out,
+                        ".custom instance void [System.Runtime]System.ThreadStaticAttribute::.ctor() = (01 00 00 00)"
+                    )?;
                 };
             }
             // Debug check
@@ -406,7 +414,9 @@ impl ILExporter {
             // Export all methods. When `MainModule` overflows a single .NET type, split its
             // methods across per-module partition classes (see `partition`); otherwise emit the one
             // class as before. Assignment keys on the method NAME, matching the reference redirect.
-            if &asm[class_def.name()] == super::asm::MAIN_MODULE && self.partition.borrow().is_some() {
+            if &asm[class_def.name()] == super::asm::MAIN_MODULE
+                && self.partition.borrow().is_some()
+            {
                 let (residual, extras): (Vec<MethodDefIdx>, Vec<(String, Vec<MethodDefIdx>)>) = {
                     let guard = self.partition.borrow();
                     let part = guard.as_ref().unwrap();
@@ -691,7 +701,9 @@ impl ILExporter {
         // user frames visible in managed stack traces; default-off preserves current RyuJIT
         // behaviour.
         let aggrinline = if !*crate::PDB_FRAMES
-            && method.implementation().should_hint_aggressive_inline(asm_mut)
+            && method
+                .implementation()
+                .should_hint_aggressive_inline(asm_mut)
         {
             "aggressiveinlining "
         } else {
@@ -756,8 +768,7 @@ impl ILExporter {
                 .iter()
                 .flat_map(|block| block.roots().iter())
                 .map(|root| {
-                    crate::CILIter::new(asm_mut.get_root(*root).clone(), asm_mut).count()
-                        + 10
+                    crate::CILIter::new(asm_mut.get_root(*root).clone(), asm_mut).count() + 10
                 })
                 .max()
                 .unwrap_or(0),
@@ -819,50 +830,68 @@ impl ILExporter {
         name: &str,
         sig: Interned<FnSig>,
     ) -> std::io::Result<()> {
-        if matches!(mimpl, MethodImpl::RegionBody { .. }) {
-            let (blocks, locals) = mimpl
-                .materialize_legacy_body(asm)
-                .expect("region body must materialize");
-            let legacy = MethodImpl::MethodBody { blocks, locals };
-            return self.export_method_imp(asm, out, &legacy, name, sig);
-        }
-        match  mimpl{
-            MethodImpl::MethodBody { blocks, locals } => {
-                let locals_string:String = locals.iter().map(|(name,tpe)|match name {
-                    Some(name) => {
-                        format!("\n  {} '{}'", non_void_type_il(&asm[*tpe], asm), &asm[*name])
-                    }
-                    None => format!("\n  {}",non_void_type_il(&asm[*tpe], asm)),
-                }).intersperse(",".to_owned()).collect();
-                writeln!(out," .locals ({locals_string})")?;
+        match mimpl {
+            MethodImpl::MethodBody { .. } | MethodImpl::RegionBody { .. } => {
+                let (blocks, locals) = mimpl
+                    .materialize_legacy_body(asm)
+                    .expect("managed method body must materialize");
+                let locals_string: String = locals
+                    .iter()
+                    .map(|(name, tpe)| match name {
+                        Some(name) => {
+                            format!(
+                                "\n  {} '{}'",
+                                non_void_type_il(&asm[*tpe], asm),
+                                &asm[*name]
+                            )
+                        }
+                        None => format!("\n  {}", non_void_type_il(&asm[*tpe], asm)),
+                    })
+                    .intersperse(",".to_owned())
+                    .collect();
+                writeln!(out, " .locals ({locals_string})")?;
                 let mut blocks_iter = blocks.iter().peekable();
                 //let mut is_in_multiblock_handler = false;
-                while let Some(block) = blocks_iter.next(){
-                    if block.handler().is_some() { //&& !is_in_multiblock_handler
-                        writeln!(out,".try{{")?;
+                while let Some(block) = blocks_iter.next() {
+                    if block.handler().is_some() {
+                        //&& !is_in_multiblock_handler
+                        writeln!(out, ".try{{")?;
                     }
                     //DEBUG REMOVE THIS
-                    writeln!(out,"// targets:{}",block.targets(asm).count())?;
-                    writeln!(out," bb{}:",block.block_id())?;
-                    for root in block.roots(){
-                        self.export_root(asm,out,*root,false, block.handler().is_some(),sig,locals)?;
+                    writeln!(out, "// targets:{}", block.targets(asm).count())?;
+                    writeln!(out, " bb{}:", block.block_id())?;
+                    for root in block.roots() {
+                        self.export_root(
+                            asm,
+                            out,
+                            *root,
+                            false,
+                            block.handler().is_some(),
+                            sig,
+                            &locals,
+                        )?;
                     }
-                    if let Some(handler) = block.handler(){
-                        if Some(handler) == blocks_iter.peek().and_then(|block|block.handler()){
+                    if let Some(handler) = block.handler() {
+                        if Some(handler) == blocks_iter.peek().and_then(|block| block.handler()) {
                             eprintln!("Multiblock handler candiate");
                         }
-                        writeln!(out,"}} catch [System.Runtime]System.Object{{")?;
+                        writeln!(out, "}} catch [System.Runtime]System.Object{{")?;
                         // Check for the GetException intrinsic. If it is not used, put a pop here.
-                        if !handler.iter().flat_map(super::basic_block::BasicBlock::roots).flat_map(|root|CILIter::new(asm.get_root(*root).clone(),asm)).any(|elem|matches!(elem,CILIterElem::Node(CILNode::GetException))){
-                            writeln!(out,"pop")?;
+                        if !handler
+                            .iter()
+                            .flat_map(super::basic_block::BasicBlock::roots)
+                            .flat_map(|root| CILIter::new(asm.get_root(*root).clone(), asm))
+                            .any(|elem| matches!(elem, CILIterElem::Node(CILNode::GetException)))
+                        {
+                            writeln!(out, "pop")?;
                         }
-                        for hblock in handler{
-                            writeln!(out," h{}_{}:",block.block_id(),hblock.block_id())?;
-                            for root in hblock.roots(){
-                                self.export_root(asm,out,*root,true,false,sig,locals)?;
+                        for hblock in handler {
+                            writeln!(out, " h{}_{}:", block.block_id(), hblock.block_id())?;
+                            for root in hblock.roots() {
+                                self.export_root(asm, out, *root, true, false, sig, &locals)?;
                             }
                         }
-                        writeln!(out,"}}")?;
+                        writeln!(out, "}}")?;
                     }
                 }
             }
@@ -870,8 +899,10 @@ impl ILExporter {
             MethodImpl::AliasFor(_) => {
                 panic!("resolved_implementation returned `AliasFor`")
             }
-            MethodImpl::Missing =>writeln!(out,"ldstr \"missing methiod {name}\"\n newobj void [System.Runtime] System.Exception::.ctor(string)\n throw")?,
-            MethodImpl::RegionBody { .. } => unreachable!(),
+            MethodImpl::Missing => writeln!(
+                out,
+                "ldstr \"missing methiod {name}\"\n newobj void [System.Runtime] System.Exception::.ctor(string)\n throw"
+            )?,
         };
         Ok(())
     }
@@ -887,11 +918,15 @@ impl ILExporter {
         let node = asm.get_node(node).clone();
         match node {
             CILNode::Const(cst) => match cst.as_ref() {
-                super::Const::ByteBuffer { data, tpe:_ }=>{
+                super::Const::ByteBuffer { data, tpe: _ } => {
                     // Must match the FieldRVA field's declared type (a blob-sized value-type, so ILC
                     // preserves the full blob under AOT — see the const_data emission above).
                     let n = asm.const_data[*data].len().max(1);
-                    writeln!(out,"ldsflda valuetype '__rcl_const_blob_{n}' c_{}", encode(data.inner() as u64))
+                    writeln!(
+                        out,
+                        "ldsflda valuetype '__rcl_const_blob_{n}' c_{}",
+                        encode(data.inner() as u64)
+                    )
                 }
                 super::Const::Null(_) => writeln!(out, "ldnull"),
                 super::Const::I8(val) => match val {
@@ -921,20 +956,40 @@ impl ILExporter {
                     _ => writeln!(out, "ldc.i8 {val}"),
                 },
                 super::Const::I128(val) => match val {
-                    -1 => writeln!(out, "ldc.i4.m1 call valuetype [System.Runtime]System.Int128 [System.Runtime]System.Int128::op_Implicit(int32)"),
-                    0..=8 => writeln!(out, "ldc.i4.{val} call valuetype [System.Runtime]System.Int128 [System.Runtime]System.Int128::op_Implicit(int32)"),
-                    9..=127 => writeln!(out, "ldc.i4.s {val} call valuetype [System.Runtime]System.Int128 [System.Runtime]System.Int128::op_Implicit(int32)"),
+                    -1 => writeln!(
+                        out,
+                        "ldc.i4.m1 call valuetype [System.Runtime]System.Int128 [System.Runtime]System.Int128::op_Implicit(int32)"
+                    ),
+                    0..=8 => writeln!(
+                        out,
+                        "ldc.i4.{val} call valuetype [System.Runtime]System.Int128 [System.Runtime]System.Int128::op_Implicit(int32)"
+                    ),
+                    9..=127 => writeln!(
+                        out,
+                        "ldc.i4.s {val} call valuetype [System.Runtime]System.Int128 [System.Runtime]System.Int128::op_Implicit(int32)"
+                    ),
                     -2_147_483_648i128..0 | 128..=2_147_483_647i128 => {
-                        writeln!(out, "ldc.i4 {val} call valuetype [System.Runtime]System.Int128 [System.Runtime]System.Int128::op_Implicit(int32)")
+                        writeln!(
+                            out,
+                            "ldc.i4 {val} call valuetype [System.Runtime]System.Int128 [System.Runtime]System.Int128::op_Implicit(int32)"
+                        )
                     }
-                    -9_223_372_036_854_775_808_i128..-2_147_483_648i128 | 2_147_483_648i128..=9_223_372_036_854_775_807i128 => {
-                        writeln!(out, "ldc.i8 {val} call valuetype [System.Runtime]System.Int128 [System.Runtime]System.Int128::op_Implicit(int64)")
+                    -9_223_372_036_854_775_808_i128..-2_147_483_648i128
+                    | 2_147_483_648i128..=9_223_372_036_854_775_807i128 => {
+                        writeln!(
+                            out,
+                            "ldc.i8 {val} call valuetype [System.Runtime]System.Int128 [System.Runtime]System.Int128::op_Implicit(int64)"
+                        )
                     }
                     _ => {
-                        let low =  u64::try_from((*val as u128) & u128::from(u64::MAX)).expect("trucating cast error");
+                        let low = u64::try_from((*val as u128) & u128::from(u64::MAX))
+                            .expect("trucating cast error");
                         let high = ((*val as u128) >> 64) as u64;
-                        writeln!(out, "ldc.i8 {high} ldc.i8 {low} newobj instance void valuetype [System.Runtime]System.Int128::.ctor(uint64,uint64)")
-                    },
+                        writeln!(
+                            out,
+                            "ldc.i8 {high} ldc.i8 {low} newobj instance void valuetype [System.Runtime]System.Int128::.ctor(uint64,uint64)"
+                        )
+                    }
                 },
                 super::Const::ISize(val) => match val {
                     -1 => writeln!(out, "ldc.i4.m1 conv.i"),
@@ -972,17 +1027,33 @@ impl ILExporter {
                     128..=2_147_483_647u64 => writeln!(out, "ldc.i4 {val} conv.u"),
                     _ => writeln!(out, "ldc.i8 {val} conv.u"),
                 },
-                super::Const::U128(val)=>match val {
-                    0..=8 => writeln!(out, "ldc.i4.{val} call valuetype [System.Runtime]System.UInt128 [System.Runtime]System.UInt128::op_Implicit(uint32)"),
-                    9..=127 => writeln!(out, "ldc.i4.s {val} call valuetype [System.Runtime]System.UInt128 [System.Runtime]System.UInt128::op_Implicit(uint32)"),
-                    128..=4_294_967_295u128 => writeln!(out, "ldc.i4 {val} call valuetype [System.Runtime]System.UInt128 [System.Runtime]System.UInt128::op_Implicit(uint32)"),
-                    4_294_967_296u128..=18_446_744_073_709_551_615u128 => writeln!(out, "ldc.i8 {val} call valuetype [System.Runtime]System.UInt128 [System.Runtime]System.UInt128::op_Implicit(uint64)"),
+                super::Const::U128(val) => match val {
+                    0..=8 => writeln!(
+                        out,
+                        "ldc.i4.{val} call valuetype [System.Runtime]System.UInt128 [System.Runtime]System.UInt128::op_Implicit(uint32)"
+                    ),
+                    9..=127 => writeln!(
+                        out,
+                        "ldc.i4.s {val} call valuetype [System.Runtime]System.UInt128 [System.Runtime]System.UInt128::op_Implicit(uint32)"
+                    ),
+                    128..=4_294_967_295u128 => writeln!(
+                        out,
+                        "ldc.i4 {val} call valuetype [System.Runtime]System.UInt128 [System.Runtime]System.UInt128::op_Implicit(uint32)"
+                    ),
+                    4_294_967_296u128..=18_446_744_073_709_551_615u128 => writeln!(
+                        out,
+                        "ldc.i8 {val} call valuetype [System.Runtime]System.UInt128 [System.Runtime]System.UInt128::op_Implicit(uint64)"
+                    ),
                     _ => {
-                        let low =  u64::try_from({ *val } & u128::from(u64::MAX)).expect("trucating cast error");
+                        let low = u64::try_from({ *val } & u128::from(u64::MAX))
+                            .expect("trucating cast error");
                         let high = ({ *val } >> 64) as u64;
-                        writeln!(out, "ldc.i8 {high} ldc.i8 {low} newobj instance void valuetype [System.Runtime]System.UInt128::.ctor(uint64,uint64)")
-                    },
-                }
+                        writeln!(
+                            out,
+                            "ldc.i8 {high} ldc.i8 {low} newobj instance void valuetype [System.Runtime]System.UInt128::.ctor(uint64,uint64)"
+                        )
+                    }
+                },
                 super::Const::PlatformString(msg) => {
                     let msg = &asm[*msg];
                     writeln!(out, "ldstr {msg:?}")
@@ -1243,10 +1314,7 @@ impl ILExporter {
                             "volatile. ldobj valuetype [System.Runtime]System.Int128"
                         ),
                         (Int::I128, false) => {
-                            writeln!(
-                                out,
-                                "ldobj valuetype [System.Runtime]System.Int128"
-                            )
+                            writeln!(out, "ldobj valuetype [System.Runtime]System.Int128")
                         }
                         (Int::ISize, true) => writeln!(out, "volatile. ldind.i"),
                         (Int::ISize, false) => writeln!(out, "ldind.i"),
@@ -1304,11 +1372,12 @@ impl ILExporter {
             }
             CILNode::SizeOf(tpe) => {
                 let tpe = asm[tpe];
-                if tpe == Type::Void{
-                    eprintln!("WARNING: attempted to calc size_of(void). This is UB: not all targets support ZSTs. Please use Const::I32(0) instead. Continuing anyway.");
+                if tpe == Type::Void {
+                    eprintln!(
+                        "WARNING: attempted to calc size_of(void). This is UB: not all targets support ZSTs. Please use Const::I32(0) instead. Continuing anyway."
+                    );
                     writeln!(out, "ldc.i4.0")
-                }
-                else{
+                } else {
                     writeln!(out, "sizeof {}", type_il(&tpe, asm))
                 }
             }
@@ -1391,7 +1460,11 @@ impl ILExporter {
                 writeln!(out, "ldlen")
             }
             CILNode::LocAllocAlgined { tpe, align } => {
-                writeln!(out, "sizeof {tpe} ldc.i8 {align} conv.i add localloc dup ldc.i8 {align} add ldc.i8 {align} rem sub ldc.i8 {align} add conv.u", tpe = type_il(&asm[tpe], asm))
+                writeln!(
+                    out,
+                    "sizeof {tpe} ldc.i8 {align} conv.i add localloc dup ldc.i8 {align} add ldc.i8 {align} rem sub ldc.i8 {align} add conv.u",
+                    tpe = type_il(&asm[tpe], asm)
+                )
             }
             CILNode::LdElelemRef { array, index } => {
                 self.export_node(asm, out, array, sig, locals)?;
@@ -1713,10 +1786,13 @@ impl ILExporter {
                     Type::PlatformChar => writeln!(out, "{is_volitale} stind.i2"),
                     Type::PlatformGeneric(_, _) => todo!(),
                     Type::Bool => writeln!(out, "{is_volitale} stind.i1"),
-                    Type::Void => writeln!(out, "pop pop ldstr \"Attempted to wrtie to a zero-sized type(void).\" newobj void [System.Runtime]System.Exception::.ctor(string) throw"), // TODO: forbid this, since this is NEVER valid.
+                    Type::Void => writeln!(
+                        out,
+                        "pop pop ldstr \"Attempted to wrtie to a zero-sized type(void).\" newobj void [System.Runtime]System.Exception::.ctor(string) throw"
+                    ), // TODO: forbid this, since this is NEVER valid.
                     Type::PlatformArray { .. } => writeln!(out, "{is_volitale} stind.ref"),
                     Type::FnPtr(_) => writeln!(out, "{is_volitale} stind.i"),
-                    Type::SIMDVector(_)=>writeln!(out, "stobj {}", type_il(&tpe, asm)),
+                    Type::SIMDVector(_) => writeln!(out, "stobj {}", type_il(&tpe, asm)),
                 }
             }
             super::CILRoot::InitBlk(blk) => {
@@ -1845,7 +1921,10 @@ fn assemble_file(exe_out: &Path, il_path: &Path, is_lib: bool) {
     let run = |debug: bool| {
         let mut cmd = std::process::Command::new(ILASM_PATH.clone());
         cmd.arg(il_path)
-            .arg(format!("-output:{exe_out}", exe_out = exe_out.to_string_lossy()))
+            .arg(format!(
+                "-output:{exe_out}",
+                exe_out = exe_out.to_string_lossy()
+            ))
             .arg("-OPTIMIZE")
             .arg(asm_type);
         // .arg("-FOLD") saves up on space, consider enabling.
@@ -2122,12 +2201,19 @@ fn simple_class_ref(cref: Interned<ClassRef>, asm: &Assembly) -> String {
     // exist (or worse, an unrelated one that happens to share the un-suffixed name).
     if cref.generics().is_empty() {
         if let Some(assembly) = cref.asm() {
-            format!("[{assembly}]'{name}'", assembly = ref_assembly_name(&asm[assembly]))
+            format!(
+                "[{assembly}]'{name}'",
+                assembly = ref_assembly_name(&asm[assembly])
+            )
         } else {
             format!("'{name}'")
         }
     } else {
-        let prefix = if cref.is_valuetype() { "valuetype" } else { "class" };
+        let prefix = if cref.is_valuetype() {
+            "valuetype"
+        } else {
+            "class"
+        };
         let generic_postfix = format!("`{}", cref.generics().len());
         let generic_list = format!(
             "<{generics}>",
@@ -2165,11 +2251,7 @@ pub(crate) fn class_ref(cref: Interned<ClassRef>, asm: &Assembly) -> String {
     // applies to the System.Runtime-qualified BCL names, never to user/Rust types.
     let is_bcl_valuetype = matches!(
         raw_name,
-        "System.Double"
-            | "System.Single"
-            | "System.Half"
-            | "System.Int128"
-            | "System.UInt128"
+        "System.Double" | "System.Single" | "System.Half" | "System.Int128" | "System.UInt128"
     );
     let prefix = if cref.is_valuetype() || is_bcl_valuetype {
         "valuetype"
@@ -2225,7 +2307,9 @@ fn type_il(tpe: &Type, asm: &Assembly) -> String {
                 SIMDElem::Int(int) => type_il(&Type::Int(int), asm),
                 SIMDElem::Float(float) => type_il(&Type::Float(float), asm),
             };
-            format!("valuetype [System.Runtime.Intrinsics]System.Runtime.Intrinsics.Vector{vec_bits}`1<{elem}>")
+            format!(
+                "valuetype [System.Runtime.Intrinsics]System.Runtime.Intrinsics.Vector{vec_bits}`1<{elem}>"
+            )
         }
         Type::Ptr(inner) => format!("{}*", type_il(&asm[*inner], asm)),
         Type::Ref(inner) => format!("{}&", type_il(&asm[*inner], asm)),
@@ -2344,7 +2428,11 @@ fn type_il_signature(tpe: &Type, asm: &Assembly) -> String {
             }
             let raw_cref = asm.class_ref(*cref);
             let name = dotnet_class_name(&asm[raw_cref.name()]);
-            let prefix = if raw_cref.is_valuetype() { "valuetype" } else { "class" };
+            let prefix = if raw_cref.is_valuetype() {
+                "valuetype"
+            } else {
+                "class"
+            };
             let generic_list = if raw_cref.generics().is_empty() {
                 String::new()
             } else {
@@ -2465,5 +2553,56 @@ mod region_body_compat_tests {
             .export_method_imp(&mut asm, &mut canonical_il, &canonical, "compat", sig)
             .unwrap();
         assert_eq!(canonical_il, legacy_il);
+    }
+
+    #[test]
+    fn handler_exception_is_spilled_before_a_nested_terminate_region() {
+        let mut asm = Assembly::default();
+        let sig = asm.sig([], Type::Void);
+        let protected_nop = asm.alloc_root(CILRoot::Nop);
+        let inner_nop = asm.alloc_root(CILRoot::Nop);
+        let terminate = asm.alloc_root(CILRoot::TerminateRegion {
+            protected: inner_nop,
+            reason: 1,
+        });
+        let to_use = asm.alloc_root(CILRoot::Branch(Box::new((0, 2, None))));
+        let get_exception = asm.alloc_node(CILNode::GetException);
+        let consume = asm.alloc_root(CILRoot::Pop(get_exception));
+        let leave = asm.alloc_root(CILRoot::ExitSpecialRegion {
+            target: 1,
+            source: 0,
+        });
+        let handler = vec![
+            BasicBlock::new(vec![terminate, to_use], 3, None),
+            BasicBlock::new(vec![consume, leave], 2, None),
+        ];
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        let body = MethodImpl::MethodBody {
+            blocks: vec![
+                BasicBlock::new(vec![protected_nop], 0, Some(handler)),
+                BasicBlock::new(vec![ret], 1, None),
+            ],
+            locals: vec![],
+        };
+
+        let exporter = ILExporter::new(IlasmFlavour::Clasic, true, None);
+        let mut output = Vec::new();
+        exporter
+            .export_method_imp(&mut asm, &mut output, &body, "spill_exception", sig)
+            .unwrap();
+        let il = String::from_utf8(output).unwrap();
+        let catch = il.find("catch [System.Runtime]System.Object").unwrap();
+        let handler_il = &il[catch..];
+        let capture = handler_il.find("stloc.0").unwrap();
+        let nested_try = handler_il.find(".try{").unwrap();
+        let reload = handler_il.rfind("ldloc.0").unwrap();
+        assert!(
+            capture < nested_try && nested_try < reload,
+            "the exception must be captured before nested leave empties the stack and reloaded afterward:\n{handler_il}"
+        );
+        assert!(
+            il.contains("class [System.Runtime]'System.Exception'"),
+            "the hidden local must preserve GetException's verifier-visible type:\n{il}"
+        );
     }
 }

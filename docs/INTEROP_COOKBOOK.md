@@ -357,9 +357,9 @@ Supported param/return types: the integer/float primitives, `bool`, `&str`, `Str
 Anything else is a **clear compile error** (marshalling is never faked) — richer types are the backlog.
 **Runnable:** `cargo_tests/cd_export`.
 
-### 7c. A raw `#[no_mangle] extern "C"` fn (full control)
+### 7c. A raw `#[unsafe(no_mangle)] extern "C"` fn (full control)
 
-A `#[no_mangle] pub extern "C" fn` becomes a `public static` on `MainModule`. Primitives and `#[repr(C)]`
+A `#[unsafe(no_mangle)] pub extern "C" fn` becomes a `public static` on `MainModule`. Primitives and `#[repr(C)]`
 value-type structs cross directly; strings/slices cross as a UTF-8 / element `(ptr, len)` pair you
 marshal by hand (this is what `#[dotnet_export]` automates):
 
@@ -367,10 +367,10 @@ marshal by hand (this is what `#[dotnet_export]` automates):
 #[repr(C)]
 pub struct Point { pub x: i32, pub y: i32 }     // C# sees value-type `cd_interop.Point`
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn make_point(x: i32, y: i32) -> Point { Point { x, y } }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn point_sum(p: Point) -> i32 { p.x + p.y }
 ```
 

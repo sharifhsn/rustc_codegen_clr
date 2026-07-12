@@ -1,9 +1,9 @@
 use crate::{
-    asm::MissingMethodPatcher, bimap::Interned, Assembly, BasicBlock, CILNode, CILRoot, MethodImpl,
-    MethodRef, Type,
+    Assembly, BasicBlock, CILNode, CILRoot, MethodImpl, MethodRef, Type, asm::MissingMethodPatcher,
+    bimap::Interned,
 };
 
-use super::binop::{lane_all_any_body, lane_cmp_body, CmpKind};
+use super::binop::{CmpKind, lane_all_any_body, lane_cmp_body};
 use super::dotnet_vec_cast;
 pub(super) fn simd_eq(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("simd_eq");
@@ -148,7 +148,6 @@ pub(super) fn simd_eq_all(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
     let name = asm.alloc_string("simd_eq_all");
     let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {
         let sig = asm[asm[mref].sig()].clone();
-        let result = sig.output();
         let Some(comparands) = sig.inputs()[0].as_simdvector() else {
             // Array fallback (unsupported vector size): fold per lane.
             return lane_all_any_body(mref, asm, true);
@@ -189,7 +188,6 @@ pub(super) fn simd_eq_any(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
     let name = asm.alloc_string("simd_eq_any");
     let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {
         let sig = asm[asm[mref].sig()].clone();
-        let result = sig.output();
         let Some(comparands) = sig.inputs()[0].as_simdvector() else {
             // Array fallback (unsupported vector size): fold per lane.
             return lane_all_any_body(mref, asm, false);

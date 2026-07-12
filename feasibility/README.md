@@ -132,7 +132,7 @@ identity is `<crate>` regardless of the `.so` name). `cargo dotnet run` on a
 library prints a "reference the .dll from C#" note and exits 0 (no entrypoint).
 
 A C# project references it with a bare assembly `<Reference>` + `<HintPath>` (no
-P/Invoke, no NuGet) and calls the `#[no_mangle] pub extern "C"` exports as
+P/Invoke, no NuGet) and calls the `#[unsafe(no_mangle)] pub extern "C"` exports as
 `public static MainModule.<fn>` — ordinary managed calls, because the Rust is
 compiled to managed CIL. De-mangled `#[repr(C)]` structs appear under their clean
 `Crate.Type` name with synthesized ctor + getters. The worked example is

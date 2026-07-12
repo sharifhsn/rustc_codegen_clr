@@ -5,8 +5,8 @@ use std::io::Write;
 use crate::MethodImpl;
 
 use super::{
-    bimap::Interned, cilroot::BranchCond, Assembly, CILIter, CILIterElem, CILNode, ClassRef,
-    Exporter, Type,
+    Assembly, CILIter, CILIterElem, CILNode, ClassRef, Exporter, Type, bimap::Interned,
+    cilroot::BranchCond,
 };
 
 #[doc = "Specifies the path to the java bytecode assembler."]
@@ -53,7 +53,11 @@ impl JavaExporter {
             writeln!(out, ".class {vis} {sealed} {name}\n.super {extends}")?;
             // Export size
             if let Some(size) = class_def.explict_size() {
-                writeln!(out, ".method public static sizeof : ()J\n.code stack 1 locals 0\nldc {size}\nlreturn\n.end code\n.end method", size = size.get())?;
+                writeln!(
+                    out,
+                    ".method public static sizeof : ()J\n.code stack 1 locals 0\nldc {size}\nlreturn\n.end code\n.end method",
+                    size = size.get()
+                )?;
             }
             // Export all fields
             for (tpe, name, offset) in class_def.fields() {

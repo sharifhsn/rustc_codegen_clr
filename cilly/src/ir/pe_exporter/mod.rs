@@ -31,10 +31,10 @@
 //!   plus the PE-side Debug Directory (CodeView/RSDS) hook. *(Phase 2: interface-pinning stub —
 //!   see that module's doc for the parity bar against `il_exporter`'s `.line` + `ilasm -debug`.)*
 
+pub mod body;
+pub mod export;
 pub mod heaps;
+pub mod pdb;
+pub mod pe;
 pub mod sig;
 pub mod tables;
-pub mod body;
-pub mod pe;
-pub mod export;
-pub mod pdb;

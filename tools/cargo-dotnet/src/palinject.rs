@@ -30,7 +30,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::context::Context as Ctx;
 
@@ -59,10 +59,7 @@ pub enum Injection {
     },
     /// Insert a `#[cfg(target_os="dotnet")] #[stable] pub fn dotnet_raw_handle(...)`
     /// inherent method right after the `impl X {` line. (The mio handle accessor.)
-    Method {
-        impl_anchor: String,
-        marker: String,
-    },
+    Method { impl_anchor: String, marker: String },
     /// Insert verbatim `lines` immediately BEFORE the first line containing `before`.
     LineInsert {
         before: String,
@@ -120,7 +117,10 @@ pub fn apply_one_str(text: &str, inj: &Injection) -> Result<(String, Applied)> {
     }
     let out = match inj {
         Injection::CfgArm { anchor, body, .. } => splice_cfg_arm(text, anchor, body)?,
-        Injection::Method { impl_anchor, marker } => splice_method(text, impl_anchor, marker)?,
+        Injection::Method {
+            impl_anchor,
+            marker,
+        } => splice_method(text, impl_anchor, marker)?,
         Injection::LineInsert { before, lines, .. } => splice_line_insert(text, before, lines)?,
         Injection::Replace { find, with, .. } => splice_replace(text, find, with)?,
     };
@@ -181,7 +181,9 @@ fn find_cfg_select(lines: &[&str], anchor: &Anchor) -> Result<usize> {
                     }
                 }
             }
-            bail!("PAL inject: cfg_select! ordinal {n} not found (only {blk} present — rustc-src drift?)")
+            bail!(
+                "PAL inject: cfg_select! ordinal {n} not found (only {blk} present — rustc-src drift?)"
+            )
         }
     }
 }
@@ -192,7 +194,9 @@ fn splice_method(text: &str, impl_anchor: &str, marker: &str) -> Result<String> 
     let idx = lines
         .iter()
         .position(|l| l.contains(impl_anchor))
-        .with_context(|| format!("PAL inject: impl anchor {impl_anchor:?} not found (rustc-src drift?)"))?;
+        .with_context(|| {
+            format!("PAL inject: impl anchor {impl_anchor:?} not found (rustc-src drift?)")
+        })?;
     let mut out: Vec<String> = Vec::with_capacity(lines.len() + 5);
     for (i, line) in lines.iter().enumerate() {
         out.push((*line).to_string());
@@ -216,7 +220,9 @@ fn splice_line_insert(text: &str, before: &str, ins: &[String]) -> Result<String
     let idx = lines
         .iter()
         .position(|l| l.contains(before))
-        .with_context(|| format!("PAL inject: line-insert anchor {before:?} not found (rustc-src drift?)"))?;
+        .with_context(|| {
+            format!("PAL inject: line-insert anchor {before:?} not found (rustc-src drift?)")
+        })?;
     let mut out: Vec<String> = Vec::with_capacity(lines.len() + ins.len());
     for (i, line) in lines.iter().enumerate() {
         if i == idx {
@@ -252,8 +258,8 @@ fn join_preserving_trailing_newline(orig: &str, lines: &[String]) -> String {
 pub fn apply_one(file: &Path, inj: &Injection) -> Result<Applied> {
     let text = fs::read_to_string(file)
         .with_context(|| format!("PAL inject: cannot read {}", file.display()))?;
-    let (out, applied) = apply_one_str(&text, inj)
-        .with_context(|| format!("PAL inject into {}", file.display()))?;
+    let (out, applied) =
+        apply_one_str(&text, inj).with_context(|| format!("PAL inject into {}", file.display()))?;
     if applied == Applied::Inserted {
         atomic_write(file, &out)?;
     }
@@ -264,7 +270,8 @@ pub fn apply_one(file: &Path, inj: &Injection) -> Result<Applied> {
 fn atomic_write(file: &Path, content: &str) -> Result<()> {
     let tmp = file.with_extension("__cd_tmp");
     fs::write(&tmp, content).with_context(|| format!("PAL inject: write {}", tmp.display()))?;
-    fs::rename(&tmp, file).with_context(|| format!("PAL inject: rename onto {}", file.display()))?;
+    fs::rename(&tmp, file)
+        .with_context(|| format!("PAL inject: rename onto {}", file.display()))?;
     Ok(())
 }
 
@@ -450,6 +457,149 @@ fn sys_targets() -> Vec<Target> {
 /// The std crate-root manifest (`Root::Std`). `rel` is relative to `…/std/src`.
 fn std_targets() -> Vec<Target> {
     vec![
+        // A spawned closure may contain genuine managed references. Native `Box<F>` storage is not
+        // visible to CoreCLR's GC, so the dotnet target CLR-boxes and GCHandle-roots the concrete F
+        // before std erases it to `dyn FnOnce`. The opaque token crosses the PAL ABI; `init_dotnet`
+        // takes the typed value back out and frees the root on the new thread.
+        Target {
+            rel: "thread/lifecycle.rs",
+            injections: vec![
+                Injection::Replace {
+                    find: r#"    let rust_start = unsafe {
+        let ptr = Box::into_raw(Box::new(rust_start));
+        let ptr = crate::mem::transmute::<
+            *mut (dyn FnOnce() + Send + '_),
+            *mut (dyn FnOnce() + Send + 'static),
+        >(ptr);
+        Box::from_raw(ptr)
+    };
+
+    let init = Box::new(ThreadInit { handle: thread.clone(), rust_start });"#.to_string(),
+                    with: r#"    #[cfg(not(target_os = "dotnet"))]
+    let rust_start = unsafe {
+        let ptr = Box::into_raw(Box::new(rust_start));
+        let ptr = crate::mem::transmute::<
+            *mut (dyn FnOnce() + Send + '_),
+            *mut (dyn FnOnce() + Send + 'static),
+        >(ptr);
+        Box::from_raw(ptr)
+    };
+
+    #[cfg(not(target_os = "dotnet"))]
+    let init = Box::new(ThreadInit { handle: thread.clone(), rust_start });
+    #[cfg(target_os = "dotnet")]
+    let init = dotnet_managed_thread_init(thread.clone(), rust_start);"#.to_string(),
+                    marker: "dotnet_managed_thread_init(thread.clone(), rust_start)".to_string(),
+                },
+                Injection::LineInsert {
+                    before: "pub(crate) struct ThreadInit {".to_string(),
+                    lines: r#"#[cfg(target_os = "dotnet")]
+#[inline(never)]
+fn rustc_clr_interop_managed_box_new<T>(_value: T) -> *mut u8 {
+    core::intrinsics::abort()
+}
+
+#[cfg(target_os = "dotnet")]
+#[inline(never)]
+unsafe fn rustc_clr_interop_managed_box_take<T>(_handle: *mut u8) -> T {
+    core::intrinsics::abort()
+}
+
+#[cfg(target_os = "dotnet")]
+fn dotnet_managed_thread_init<F: FnOnce() + Send>(handle: Thread, rust_start: F) -> Box<ThreadInit> {
+    unsafe fn run<F: FnOnce() + Send>(token: *mut u8) {
+        let start = unsafe { rustc_clr_interop_managed_box_take::<F>(token) };
+        start();
+    }
+    unsafe fn drop_token<F: FnOnce() + Send>(token: *mut u8) {
+        drop(unsafe { rustc_clr_interop_managed_box_take::<F>(token) });
+    }
+    Box::new(ThreadInit {
+        handle,
+        rust_start_handle: rustc_clr_interop_managed_box_new(rust_start),
+        rust_start_fn: run::<F>,
+        rust_start_drop: drop_token::<F>,
+    })
+}
+"#
+                    .lines()
+                    .map(str::to_string)
+                    .collect(),
+                    marker: "fn dotnet_managed_thread_init<F".to_string(),
+                },
+                // Migration for a PAL tree warmed by the first managed-box injection. Magic
+                // stubs must never be MIR-inlined, or optimized builds can inline the abort body
+                // before the codegen backend sees and substitutes the call.
+                Injection::Replace {
+                    find: "#[cfg(target_os = \"dotnet\")]\nfn rustc_clr_interop_managed_box_new<T>"
+                        .to_string(),
+                    with: "#[cfg(target_os = \"dotnet\")]\n#[inline(never)]\nfn rustc_clr_interop_managed_box_new<T>"
+                        .to_string(),
+                    marker: "#[inline(never)]\nfn rustc_clr_interop_managed_box_new<T>".to_string(),
+                },
+                Injection::Replace {
+                    find: "#[cfg(target_os = \"dotnet\")]\nunsafe fn rustc_clr_interop_managed_box_take<T>"
+                        .to_string(),
+                    with: "#[cfg(target_os = \"dotnet\")]\n#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_take<T>"
+                        .to_string(),
+                    marker: "#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_take<T>"
+                        .to_string(),
+                },
+                Injection::Replace {
+                    find: r#"pub(crate) struct ThreadInit {
+    pub handle: Thread,
+    pub rust_start: Box<dyn FnOnce() + Send>,
+}"#.to_string(),
+                    with: r#"pub(crate) struct ThreadInit {
+    pub handle: Thread,
+    #[cfg(not(target_os = "dotnet"))]
+    pub rust_start: Box<dyn FnOnce() + Send>,
+    #[cfg(target_os = "dotnet")]
+    rust_start_handle: *mut u8,
+    #[cfg(target_os = "dotnet")]
+    rust_start_fn: unsafe fn(*mut u8),
+    #[cfg(target_os = "dotnet")]
+    rust_start_drop: unsafe fn(*mut u8),
+}"#.to_string(),
+                    marker: "rust_start_handle: *mut u8".to_string(),
+                },
+                Injection::Replace {
+                    find: "    pub fn init(self: Box<Self>) -> Box<dyn FnOnce() + Send> {".to_string(),
+                    with: "    #[cfg(not(target_os = \"dotnet\"))]\n    pub fn init(self: Box<Self>) -> Box<dyn FnOnce() + Send> {".to_string(),
+                    marker: "#[cfg(not(target_os = \"dotnet\"))]\n    pub fn init".to_string(),
+                },
+                Injection::Replace {
+                    find: "        self.rust_start\n    }\n}".to_string(),
+                    with: r#"        self.rust_start
+    }
+
+    #[cfg(target_os = "dotnet")]
+    pub fn init_dotnet(mut self: Box<Self>) {
+        if let Err(_thread) = set_current(self.handle.clone()) {
+            rtabort!("current thread handle already set during thread spawn");
+        }
+        if let Some(name) = self.handle.cname() {
+            imp::set_name(name);
+        }
+        let token = crate::mem::replace(&mut self.rust_start_handle, crate::ptr::null_mut());
+        let run = self.rust_start_fn;
+        unsafe { run(token) };
+    }
+}
+
+#[cfg(target_os = "dotnet")]
+impl Drop for ThreadInit {
+    fn drop(&mut self) {
+        if !self.rust_start_handle.is_null() {
+            unsafe { (self.rust_start_drop)(self.rust_start_handle) };
+            self.rust_start_handle = crate::ptr::null_mut();
+        }
+    }
+}"#.to_string(),
+                    marker: "pub fn init_dotnet".to_string(),
+                },
+            ],
+        },
         // net/tcp.rs + net/udp.rs: the mio dotnet_raw_handle accessor (forwards the
         // inner sys handle on the PUBLIC std::net wrappers). #[stable] so it shadows
         // mio's own trait method without forcing a feature gate.
@@ -566,22 +716,8 @@ pub fn manifest() -> Vec<(Root, Vec<Target>)> {
 }
 
 // ===========================================================================
-// rust-src LOCATION + the two os-specific passes (fd gate widen, fd-impl defer).
+// The two os-specific passes (fd gate widen, fd-impl defer).
 // ===========================================================================
-
-/// Resolve the toolchain's rust-src `library` dir via the configured rustc.
-fn rust_src_library(ctx: &Ctx) -> Result<PathBuf> {
-    let sysroot = ctx.rustc_sysroot()?;
-    let lib = sysroot.join("lib/rustlib/src/rust/library");
-    if !lib.is_dir() {
-        bail!(
-            "rust-src not found at {} — install it: rustup component add rust-src --toolchain {}",
-            lib.display(),
-            ctx.toolchain.as_deref().unwrap_or("<active>")
-        );
-    }
-    Ok(lib)
-}
 
 fn root_dir(lib: &Path, root: Root) -> PathBuf {
     match root {
@@ -596,8 +732,7 @@ fn root_dir(lib: &Path, root: Root) -> PathBuf {
 /// disjunct of the `#[cfg(any( … ))]` directly above `pub mod fd;`. Robust to the
 /// disjunct set drifting (keys on the unique `pub mod fd;` line, like the bash awk).
 fn widen_fd_gate(os_mod: &Path) -> Result<Applied> {
-    let text = fs::read_to_string(os_mod)
-        .with_context(|| format!("read {}", os_mod.display()))?;
+    let text = fs::read_to_string(os_mod).with_context(|| format!("read {}", os_mod.display()))?;
     // Idempotency: if the gate already lists dotnet near `pub mod fd`, skip. We mark by
     // a fixed comment-free heuristic: presence of the dotnet disjunct anywhere in the
     // file's `pub mod fd` gate region. Simpler + safe: skip if the inserted exact line
@@ -675,52 +810,136 @@ fn defer_fd_impls(file: &Path) -> Result<Applied> {
 // libc patch (rust-src-shaped, reused across rust-src vendor + every registry copy).
 // ===========================================================================
 
-/// Patch one libc-0.2 source dir: copy the dotnet face, suppress libc's own unix/posix
-/// arms for os=dotnet (3 narrows), and append the dotnet module declaration. Idempotent
-/// (guarded on the dotnet string). The PAL face is `dotnet_pal/libc/dotnet.rs`.
-pub fn patch_libc(libc_dir: &Path, pal_dotnet_rs: &Path) -> Result<bool> {
+/// Patch one libc-0.2 source dir so `target_os="dotnet"` reuses libc's canonical Linux GNU
+/// x86_64 module tree. The .NET PAL deliberately implements the Linux C ABI by symbol name;
+/// keeping a second hand-maintained libc facade inevitably drifts as dependencies exercise more
+/// of libc. This only widens libc's platform-selection cascades. It does not enable rustix's
+/// linux-raw backend or emit host syscalls.
+pub fn patch_libc(libc_dir: &Path) -> Result<bool> {
     let lib_rs = libc_dir.join("lib.rs");
-    if !lib_rs.is_file() || !pal_dotnet_rs.is_file() {
+    if !lib_rs.is_file() {
         return Ok(false);
     }
-    // copy the dotnet face beside lib.rs (idempotent overwrite).
-    fs::copy(pal_dotnet_rs, libc_dir.join("dotnet.rs"))
-        .with_context(|| format!("cp libc dotnet face into {}", libc_dir.display()))?;
-
-    // 1) lib.rs top-level: `else if #[cfg(unix)]` -> exclude dotnet.
+    // Migrate installations patched by the former standalone `dotnet.rs` facade back to libc's
+    // normal Unix/posix roots. Each replacement is also a no-op on a pristine libc checkout.
     replace_in_file(
         &lib_rs,
-        "} else if #[cfg(unix)] {",
         "} else if #[cfg(all(unix, not(target_os = \"dotnet\")))] {",
+        "} else if #[cfg(unix)] {",
     )?;
-    // 2) new/mod.rs per-family header.
     let new_mod = libc_dir.join("new/mod.rs");
     if new_mod.is_file() {
         replace_in_file(
             &new_mod,
-            "if #[cfg(all(target_family = \"unix\", not(target_os = \"qurt\")))] {",
             "if #[cfg(all(target_family = \"unix\", not(target_os = \"qurt\"), not(target_os = \"dotnet\")))] {",
+            "if #[cfg(all(target_family = \"unix\", not(target_os = \"qurt\")))] {",
+        )?;
+        replace_all_in_file(
+            &new_mod,
+            "} else if #[cfg(target_os = \"linux\")] {",
+            "} else if #[cfg(any(target_os = \"linux\", target_os = \"dotnet\"))] {",
         )?;
     }
-    // 3) new/common/mod.rs: `#[cfg(target_family = "unix")] pub(crate) mod posix;`.
     let new_common = libc_dir.join("new/common/mod.rs");
     if new_common.is_file() {
         replace_in_file(
             &new_common,
-            "#[cfg(target_family = \"unix\")]",
             "#[cfg(all(target_family = \"unix\", not(target_os = \"dotnet\")))]",
+            "#[cfg(target_family = \"unix\")]",
         )?;
     }
+    widen_dotnet_as_linux_in_tree(&libc_dir.join("new"))?;
 
-    // append the dotnet module declaration at the crate root (idempotent).
+    // The old facade was always appended at EOF. Remove it before selecting the upstream tree, or
+    // its glob export would collide with the canonical Unix definitions.
     let lib_text = fs::read_to_string(&lib_rs)?;
-    if lib_text.contains("mod dotnet;") {
-        return Ok(true);
+    if let Some(marker) = lib_text.find("\n// DOTNET PAL: the single libc face for os=dotnet") {
+        atomic_write(&lib_rs, &lib_text[..marker])?;
     }
-    let appended = format!(
-        "{lib_text}\n// DOTNET PAL: the single libc face for os=dotnet (see dotnet_pal/libc/dotnet.rs).\n#[cfg(target_os = \"dotnet\")]\nmod dotnet;\n#[cfg(target_os = \"dotnet\")]\npub use crate::dotnet::*;\n"
-    );
-    atomic_write(&lib_rs, &appended)?;
+    // Old installations also copied the facade beside `lib.rs`. It is unreferenced after the
+    // appended module is removed, but clean it up when its distinctive header proves ownership.
+    // Do not delete an arbitrary future upstream `dotnet.rs` merely because the name matches.
+    let legacy_face = libc_dir.join("dotnet.rs");
+    if legacy_face.is_file() && fs::read_to_string(&legacy_face)?.contains("SINGLE libc face for") {
+        fs::remove_file(&legacy_face)
+            .with_context(|| format!("remove legacy libc facade {}", legacy_face.display()))?;
+    }
+
+    // Route dotnet through unix -> linux_like -> linux -> gnu. The target spec declares
+    // `env="gnu"`; spelling dotnet in the final branch too makes the intended ABI explicit and
+    // keeps this source transformation self-describing.
+    replace_in_file(
+        &libc_dir.join("unix/mod.rs"),
+        "        target_os = \"linux\",\n        target_os = \"l4re\",",
+        "        target_os = \"linux\",\n        target_os = \"dotnet\",\n        target_os = \"l4re\",",
+    )?;
+    replace_in_file(
+        &libc_dir.join("unix/linux_like/mod.rs"),
+        "    } else if #[cfg(target_os = \"linux\")] {",
+        "    } else if #[cfg(any(target_os = \"linux\", target_os = \"dotnet\"))] {",
+    )?;
+    replace_in_file(
+        &libc_dir.join("unix/linux_like/linux/mod.rs"),
+        "    } else if #[cfg(target_env = \"gnu\")] {",
+        "    } else if #[cfg(any(target_env = \"gnu\", target_os = \"dotnet\"))] {",
+    )?;
+    widen_dotnet_as_linux_in_tree(&libc_dir.join("unix/linux_like/linux"))?;
+    Ok(true)
+}
+
+/// Keep rustix on its libc backend while making its ABI cfgs agree with the canonical Linux GNU
+/// libc ABI surface selected for dotnet. The build.rs `libc` decision remains unchanged (`dotnet !=
+/// linux`), so this never enables rustix's linux-raw syscall backend.
+pub fn patch_rustix(crate_dir: &Path) -> Result<bool> {
+    let build_rs = crate_dir.join("build.rs");
+    let src = crate_dir.join("src");
+    if !build_rs.is_file() || !src.is_dir() {
+        return Ok(false);
+    }
+    replace_in_file(
+        &build_rs,
+        "if os == \"linux\" || os == \"l4re\" || os == \"android\" || os == \"emscripten\" {",
+        "if os == \"linux\" || os == \"dotnet\" || os == \"l4re\" || os == \"android\" || os == \"emscripten\" {",
+    )?;
+    replace_in_file(
+        &build_rs,
+        "if os == \"android\" || os == \"linux\" {",
+        "if os == \"android\" || os == \"linux\" || os == \"dotnet\" {",
+    )?;
+    widen_dotnet_as_linux_in_tree(&src)?;
+    Ok(true)
+}
+
+/// async-fs exposes raw-fd conversions under broad `cfg(unix)`. Dotnet's managed `std::fs::File`
+/// intentionally is not fd-backed, so gate only those optional conversions.
+pub fn patch_async_fs(crate_dir: &Path) -> Result<bool> {
+    let lib_rs = crate_dir.join("src/lib.rs");
+    if !lib_rs.is_file() {
+        return Ok(false);
+    }
+    for impl_head in [
+        "impl std::os::unix::io::AsRawFd for File",
+        "impl From<std::os::unix::io::OwnedFd> for File",
+        "impl std::os::unix::io::AsFd for File",
+    ] {
+        replace_in_file(
+            &lib_rs,
+            &format!("#[cfg(unix)]\n{impl_head}"),
+            &format!("#[cfg(all(unix, not(target_os = \"dotnet\")))]\n{impl_head}"),
+        )?;
+    }
+    Ok(true)
+}
+
+/// Route polling through its epoll backend on dotnet. The POSIX shim already owns
+/// epoll_create1/ctl/wait over managed sockets; leaving polling on its generic Unix
+/// fallback would emit host `pipe2`/`ppoll` P/Invokes instead.
+pub fn patch_polling(crate_dir: &Path) -> Result<bool> {
+    let src = crate_dir.join("src");
+    if !src.is_dir() {
+        return Ok(false);
+    }
+    widen_dotnet_as_linux_in_tree(&src)?;
     Ok(true)
 }
 
@@ -734,6 +953,41 @@ fn replace_in_file(file: &Path, find: &str, with: &str) -> Result<()> {
         return Ok(());
     }
     atomic_write(file, &text.replacen(find, with, 1))
+}
+
+/// Replace every occurrence of a platform-selection arm, preserving idempotence.
+fn replace_all_in_file(file: &Path, find: &str, with: &str) -> Result<()> {
+    let text = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+    if text.contains(with) || !text.contains(find) {
+        return Ok(());
+    }
+    atomic_write(file, &text.replace(find, with))
+}
+
+/// libc's in-progress `new/` tree repeats Linux cfg predicates across its UAPI, glibc, pthread,
+/// and common-header modules. Normalize our own prior widening before applying it, which makes
+/// the mechanical ABI alias idempotent without carrying a fork of those definitions.
+fn widen_dotnet_as_linux_in_tree(dir: &Path) -> Result<()> {
+    let linux = "target_os = \"linux\"";
+    let linux_or_dotnet = "any(target_os = \"linux\", target_os = \"dotnet\")";
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.is_dir() {
+            widen_dotnet_as_linux_in_tree(&path)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            let text = fs::read_to_string(&path)?;
+            let widened = text
+                .replace(linux_or_dotnet, linux)
+                .replace(linux, linux_or_dotnet);
+            if widened != text {
+                atomic_write(&path, &widened)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Find every `libc-0.2*/src` dir under `root` that has a `lib.rs` (rust-src vendor or
@@ -765,19 +1019,47 @@ fn find_libc_rec(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Find extracted registry crate roots by directory-name prefix.
+pub fn find_registry_crate_dirs(root: &Path, prefix: &str) -> Vec<PathBuf> {
+    fn visit(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<PathBuf>) {
+        if depth > 8 {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if name.starts_with(prefix) && path.join("Cargo.toml").is_file() {
+                out.push(path.clone());
+            }
+            visit(&path, prefix, depth + 1, out);
+        }
+    }
+
+    let mut out = Vec::new();
+    visit(root, prefix, 0, &mut out);
+    out
+}
+
 // ===========================================================================
 // THE DRIVER — mirror PAL trees, drive the manifest, patch rust-src vendor libc.
 // ===========================================================================
 
-/// Run the full PAL injection over the toolchain's rust-src. Idempotent + re-runnable.
-/// (The registry-libc pass happens in `buildstd` after `cargo fetch`.)
-pub fn inject_all(ctx: &Ctx) -> Result<()> {
-    let lib = rust_src_library(ctx)?;
+/// Run PAL injection against an explicitly provisioned rust-src library root.
+pub fn inject_all_at(ctx: &Ctx, lib: &Path) -> Result<()> {
     let sys_dst = lib.join("std/src/sys");
     let std_dst = lib.join("std/src");
 
     if ctx.flags.verbose {
-        eprintln!("==> injecting dotnet PAL into rust-src ({})", sys_dst.display());
+        eprintln!(
+            "==> injecting dotnet PAL into rust-src ({})",
+            sys_dst.display()
+        );
     }
 
     // 1) mirror the PAL trees (clean base each run).
@@ -809,7 +1091,7 @@ pub fn inject_all(ctx: &Ctx) -> Result<()> {
 
     // 2) drive the manifest.
     for (root, targets) in manifest() {
-        let base = root_dir(&lib, root);
+        let base = root_dir(lib, root);
         for t in targets {
             let file = base.join(t.rel);
             if !file.is_file() {
@@ -838,12 +1120,9 @@ pub fn inject_all(ctx: &Ctx) -> Result<()> {
     }
 
     // 4) patch the rust-src VENDOR libc copies (the registry pass is in buildstd).
-    let pal_libc = ctx.paths.pal_root.join("libc/dotnet.rs");
-    if pal_libc.is_file() {
-        for d in find_libc_dirs(&lib) {
-            if patch_libc(&d, &pal_libc)? && ctx.flags.verbose {
-                eprintln!("==> patched libc: {}", d.display());
-            }
+    for d in find_libc_dirs(lib) {
+        if patch_libc(&d)? && ctx.flags.verbose {
+            eprintln!("==> patched libc: {}", d.display());
         }
     }
 
@@ -872,7 +1151,10 @@ pub mod thing {
         // dotnet arm must be the FIRST arm (right after the cfg_select! line).
         let body_pos = out.find("mod dotnet; pub use dotnet::*;").unwrap();
         let linux_pos = out.find("mod linux;").unwrap();
-        assert!(body_pos < linux_pos, "dotnet arm must precede the linux arm");
+        assert!(
+            body_pos < linux_pos,
+            "dotnet arm must precede the linux arm"
+        );
         assert!(out.contains("target_os = \"dotnet\" => {"));
     }
 
@@ -936,7 +1218,10 @@ pub fn exit(code: i32) -> ! {
         // must be inside the SECOND cfg_select! (after `pub fn exit`), not the first.
         let arm_pos = out.find("rcl_dotnet_exit(code)").unwrap();
         let exit_pos = out.find("pub fn exit").unwrap();
-        assert!(arm_pos > exit_pos, "ordinal-2 arm must land in the exit() block");
+        assert!(
+            arm_pos > exit_pos,
+            "ordinal-2 arm must land in the exit() block"
+        );
     }
 
     // ---- Method ----
@@ -984,7 +1269,10 @@ pub mod aix;
         assert_eq!(applied, Applied::Inserted);
         let dotnet_pos = out.find("pub mod dotnet;").unwrap();
         let aix_pos = out.find("pub mod aix;").unwrap();
-        assert!(dotnet_pos < aix_pos, "dotnet decl must precede the aix block");
+        assert!(
+            dotnet_pos < aix_pos,
+            "dotnet decl must precede the aix block"
+        );
     }
 
     // ---- Replace ----
@@ -992,7 +1280,8 @@ pub mod aix;
     fn replace_single_occurrence() {
         let inj = Injection::Replace {
             find: "#[cfg(all(unix, not(target_os = \"vxworks\")))]".to_string(),
-            with: "#[cfg(all(unix, not(target_os = \"vxworks\"), not(target_os = \"dotnet\")))]".to_string(),
+            with: "#[cfg(all(unix, not(target_os = \"vxworks\"), not(target_os = \"dotnet\")))]"
+                .to_string(),
             marker: "not(target_os = \"vxworks\"), not(target_os = \"dotnet\")".to_string(),
         };
         let input = "#[cfg(all(unix, not(target_os = \"vxworks\")))]\nfn set_perms() {}\n";
@@ -1003,6 +1292,69 @@ pub mod aix;
         let (twice, applied2) = apply_one_str(&out, &inj).unwrap();
         assert_eq!(applied2, Applied::Skipped);
         assert_eq!(out, twice);
+    }
+
+    #[test]
+    fn thread_lifecycle_managed_box_rewrite_is_complete_and_idempotent() {
+        let mut lifecycle = r#"fn spawn_unchecked() {
+    let rust_start = unsafe {
+        let ptr = Box::into_raw(Box::new(rust_start));
+        let ptr = crate::mem::transmute::<
+            *mut (dyn FnOnce() + Send + '_),
+            *mut (dyn FnOnce() + Send + 'static),
+        >(ptr);
+        Box::from_raw(ptr)
+    };
+
+    let init = Box::new(ThreadInit { handle: thread.clone(), rust_start });
+}
+
+pub(crate) struct ThreadInit {
+    pub handle: Thread,
+    pub rust_start: Box<dyn FnOnce() + Send>,
+}
+
+impl ThreadInit {
+    pub fn init(self: Box<Self>) -> Box<dyn FnOnce() + Send> {
+        if let Err(_thread) = set_current(self.handle.clone()) {
+            rtabort!("current thread handle already set during thread spawn");
+        }
+        if let Some(name) = self.handle.cname() {
+            imp::set_name(name);
+        }
+        self.rust_start
+    }
+}
+"#
+        .to_string();
+        let target = std_targets()
+            .into_iter()
+            .find(|target| target.rel == "thread/lifecycle.rs")
+            .expect("thread lifecycle target");
+
+        for injection in &target.injections {
+            let (rewritten, applied) = apply_one_str(&lifecycle, injection).unwrap();
+            if applied == Applied::Skipped {
+                assert!(lifecycle.contains(injection_marker(injection)));
+            }
+            lifecycle = rewritten;
+        }
+        assert!(lifecycle.contains("rustc_clr_interop_managed_box_new(rust_start)"));
+        assert!(lifecycle.contains("rustc_clr_interop_managed_box_take::<F>(token)"));
+        assert!(lifecycle.contains("#[inline(never)]\nfn rustc_clr_interop_managed_box_new<T>"));
+        assert!(
+            lifecycle.contains("#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_take<T>")
+        );
+        assert!(lifecycle.contains("pub fn init_dotnet(mut self: Box<Self>)"));
+        assert!(lifecycle.contains("impl Drop for ThreadInit"));
+
+        let once = lifecycle.clone();
+        for injection in &target.injections {
+            let (rewritten, applied) = apply_one_str(&lifecycle, injection).unwrap();
+            assert_eq!(applied, Applied::Skipped);
+            lifecycle = rewritten;
+        }
+        assert_eq!(lifecycle, once);
     }
 
     // ---- anchor-missing errors loudly (surfaces nightly drift) ----
@@ -1038,49 +1390,197 @@ pub mod aix;
         assert!(format!("{err}").contains("not found"));
     }
 
-    // ---- libc 3-narrow + append, idempotent (via a temp dir) ----
+    // ---- canonical Linux libc routing + legacy-facade migration ----
     #[test]
-    fn patch_libc_narrows_and_appends_idempotently() {
+    fn patch_libc_reuses_canonical_linux_tree_idempotently() {
         let dir = std::env::temp_dir().join(format!("cd_libc_test_{}", std::process::id()));
         let src = dir.join("libc-0.2.99/src");
         let new = src.join("new");
         let common = new.join("common");
+        let linux_like = src.join("unix/linux_like");
+        let linux = linux_like.join("linux");
         fs::create_dir_all(&common).unwrap();
+        fs::create_dir_all(&linux).unwrap();
         fs::write(
             src.join("lib.rs"),
-            "cfg_if! {\n} else if #[cfg(unix)] {\n    mod unix;\n}\n",
+            "cfg_if! {\n} else if #[cfg(all(unix, not(target_os = \"dotnet\")))] {\n    mod unix;\n}\n\n// DOTNET PAL: the single libc face for os=dotnet\n#[cfg(target_os = \"dotnet\")]\nmod dotnet;\n#[cfg(target_os = \"dotnet\")]\npub use crate::dotnet::*;\n",
         )
         .unwrap();
         fs::write(
             new.join("mod.rs"),
-            "if #[cfg(all(target_family = \"unix\", not(target_os = \"qurt\")))] {\n}\n",
+            "if #[cfg(all(target_family = \"unix\", not(target_os = \"qurt\"), not(target_os = \"dotnet\")))] {\n}\n} else if #[cfg(target_os = \"linux\")] {\n    mod linux_uapi;\n}\n} else if #[cfg(target_os = \"linux\")] {\n    pub use linux::*;\n}\n",
         )
         .unwrap();
         fs::write(
             common.join("mod.rs"),
-            "#[cfg(target_family = \"unix\")]\npub(crate) mod posix;\n",
+            "#[cfg(all(target_family = \"unix\", not(target_os = \"dotnet\")))]\npub(crate) mod posix;\n",
         )
         .unwrap();
-        let face = dir.join("dotnet_face.rs");
-        fs::write(&face, "// dotnet libc face\n").unwrap();
+        fs::write(
+            src.join("unix/mod.rs"),
+            "cfg_if! {\n    if #[cfg(any(\n        target_os = \"linux\",\n        target_os = \"l4re\",\n    ))] { mod linux_like; }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            linux_like.join("mod.rs"),
+            "cfg_if! {\n    } else if #[cfg(target_os = \"linux\")] {\n        mod linux;\n    }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            linux.join("mod.rs"),
+            "cfg_if! {\n    } else if #[cfg(target_env = \"gnu\")] {\n        mod gnu;\n    }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            linux.join("abi.rs"),
+            "#[cfg(target_os = \"linux\")]\npub const ABI: u32 = 1;\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("dotnet.rs"),
+            "//! libc bindings for dotnet — the SINGLE libc face for legacy installs\n",
+        )
+        .unwrap();
 
-        let ok = patch_libc(&src, &face).unwrap();
+        let ok = patch_libc(&src).unwrap();
         assert!(ok);
         let lib = fs::read_to_string(src.join("lib.rs")).unwrap();
-        assert!(lib.contains("all(unix, not(target_os = \"dotnet\"))"));
-        assert!(lib.contains("mod dotnet;"));
-        assert!(lib.contains("pub use crate::dotnet::*;"));
+        assert!(lib.contains("else if #[cfg(unix)]"));
+        assert!(!lib.contains("mod dotnet;"));
+        assert!(!src.join("dotnet.rs").exists());
         let nm = fs::read_to_string(new.join("mod.rs")).unwrap();
-        assert!(nm.contains("not(target_os = \"qurt\"), not(target_os = \"dotnet\")"));
+        assert!(!nm.contains("not(target_os = \"dotnet\")"));
+        assert_eq!(
+            nm.matches("any(target_os = \"linux\", target_os = \"dotnet\")")
+                .count(),
+            2
+        );
         let cm = fs::read_to_string(common.join("mod.rs")).unwrap();
-        assert!(cm.contains("all(target_family = \"unix\", not(target_os = \"dotnet\"))"));
+        assert!(cm.contains("#[cfg(target_family = \"unix\")]"));
+        assert!(
+            fs::read_to_string(src.join("unix/mod.rs"))
+                .unwrap()
+                .contains("target_os = \"dotnet\"")
+        );
+        assert!(
+            fs::read_to_string(linux_like.join("mod.rs"))
+                .unwrap()
+                .contains("any(target_os = \"linux\", target_os = \"dotnet\")")
+        );
+        assert!(
+            fs::read_to_string(linux.join("mod.rs"))
+                .unwrap()
+                .contains("any(target_env = \"gnu\", target_os = \"dotnet\")")
+        );
+        assert!(
+            fs::read_to_string(linux.join("abi.rs"))
+                .unwrap()
+                .contains("any(target_os = \"linux\", target_os = \"dotnet\")")
+        );
 
-        // idempotent: second run must not double-append.
-        patch_libc(&src, &face).unwrap();
+        // Idempotent: rerunning must not duplicate cascade arms.
+        patch_libc(&src).unwrap();
         let lib2 = fs::read_to_string(src.join("lib.rs")).unwrap();
         assert_eq!(lib, lib2, "patch_libc must be idempotent");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn registry_portability_patches_are_narrow_and_idempotent() {
+        let dir =
+            std::env::temp_dir().join(format!("cd_registry_patch_test_{}", std::process::id()));
+        let rustix = dir.join("rustix-1.0.0");
+        fs::create_dir_all(rustix.join("src/backend")).unwrap();
+        fs::write(
+            rustix.join("build.rs"),
+            "if os == \"linux\" || os == \"l4re\" || os == \"android\" || os == \"emscripten\" {\n}\nif os == \"android\" || os == \"linux\" {\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            rustix.join("src/backend/mod.rs"),
+            "#[cfg(target_os = \"linux\")]\nmod abi;\n",
+        )
+        .unwrap();
+
+        let async_fs = dir.join("async-fs-2.0.0");
+        fs::create_dir_all(async_fs.join("src")).unwrap();
+        let async_source = "#[cfg(unix)]\nimpl std::os::unix::io::AsRawFd for File {}\n#[cfg(unix)]\nimpl From<std::os::unix::io::OwnedFd> for File {}\n#[cfg(unix)]\nimpl std::os::unix::io::AsFd for File {}\n";
+        fs::write(async_fs.join("src/lib.rs"), async_source).unwrap();
+
+        let polling = dir.join("polling-3.0.0");
+        fs::create_dir_all(polling.join("src")).unwrap();
+        fs::write(
+            polling.join("src/lib.rs"),
+            "#[cfg(any(target_os = \"linux\", target_os = \"android\"))]\nmod epoll;\n",
+        )
+        .unwrap();
+
+        assert!(patch_rustix(&rustix).unwrap());
+        assert!(patch_async_fs(&async_fs).unwrap());
+        assert!(patch_polling(&polling).unwrap());
+        let rustix_build = fs::read_to_string(rustix.join("build.rs")).unwrap();
+        let rustix_source = fs::read_to_string(rustix.join("src/backend/mod.rs")).unwrap();
+        let async_patched = fs::read_to_string(async_fs.join("src/lib.rs")).unwrap();
+        let polling_patched = fs::read_to_string(polling.join("src/lib.rs")).unwrap();
+        assert!(rustix_build.contains("os == \"dotnet\""));
+        assert!(rustix_source.contains("target_os = \"dotnet\""));
+        assert_eq!(
+            async_patched.matches("not(target_os = \"dotnet\")").count(),
+            3
+        );
+        assert!(polling_patched.contains("target_os = \"dotnet\""));
+
+        patch_rustix(&rustix).unwrap();
+        patch_async_fs(&async_fs).unwrap();
+        patch_polling(&polling).unwrap();
+        assert_eq!(
+            rustix_build,
+            fs::read_to_string(rustix.join("build.rs")).unwrap()
+        );
+        assert_eq!(
+            rustix_source,
+            fs::read_to_string(rustix.join("src/backend/mod.rs")).unwrap()
+        );
+        assert_eq!(
+            async_patched,
+            fs::read_to_string(async_fs.join("src/lib.rs")).unwrap()
+        );
+        assert_eq!(
+            polling_patched,
+            fs::read_to_string(polling.join("src/lib.rs")).unwrap()
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dotnet_target_declares_the_linux_gnu_abi() {
+        let target = include_str!("../../../x86_64-unknown-dotnet.json");
+        assert!(target.contains("\"llvm-target\": \"x86_64-unknown-linux-gnu\""));
+        assert!(target.contains("\"env\": \"gnu\""));
+    }
+
+    #[test]
+    fn dotnet_fs_file_type_uses_canonical_libc_mode_type() {
+        let fs_pal = include_str!("../../../dotnet_pal/sys/fs/dotnet.rs");
+        assert!(fs_pal.contains("pub fn is(&self, mode: libc::mode_t) -> bool"));
+        assert!(fs_pal.contains("mode & libc::S_IFMT == synthetic"));
+        assert!(!fs_pal.contains("const S_IFMT: i32"));
+    }
+
+    #[test]
+    fn shell_overlay_fallback_supports_macos_bash_3() {
+        let core = include_str!("../../../feasibility/_cargo_dotnet_core.sh");
+        assert!(
+            !core
+                .lines()
+                .any(|line| line.trim_start().starts_with("declare -A")),
+            "the fallback script must run under the Bash 3.2 shipped by macOS"
+        );
+        assert!(
+            core.contains("awk -v want=\"$n\""),
+            "multi-version overlay selection still needs to count names"
+        );
     }
 
     // ---- fd gate widen (the os/mod.rs keystone) ----
@@ -1124,7 +1624,9 @@ pub mod aix;
         // the fs::File impl gate is widened...
         assert!(t.contains("all(not(target_os = \"trusty\"), not(target_os = \"dotnet\")))]\nimpl AsFd for fs::File"));
         // ...but the TcpStream impl gate is left ENABLED for dotnet.
-        assert!(t.contains("#[cfg(not(target_os = \"trusty\"))]\nimpl AsFd for crate::net::TcpStream"));
+        assert!(
+            t.contains("#[cfg(not(target_os = \"trusty\"))]\nimpl AsFd for crate::net::TcpStream")
+        );
         // idempotent
         let a2 = defer_fd_impls(&f).unwrap();
         assert_eq!(a2, Applied::Skipped);

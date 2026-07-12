@@ -7,7 +7,7 @@
 
 use std::process::Command;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::cli::BuildArgs;
 use crate::mode::Mode;

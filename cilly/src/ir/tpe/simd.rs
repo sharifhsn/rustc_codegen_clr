@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{bimap::Interned, ClassRef, Float, Int};
+use crate::{ClassRef, Float, Int, bimap::Interned};
 
 use super::Type;
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]

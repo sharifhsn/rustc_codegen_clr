@@ -283,6 +283,7 @@ fn main() -> std::process::ExitCode {
     Console::writeln_u64(pass as u64);
     Console::writeln_u64(total as u64);
     if pass == total {
+        println!("== cd_linq_groupby done ==");
         std::process::ExitCode::SUCCESS
     } else {
         std::process::ExitCode::FAILURE

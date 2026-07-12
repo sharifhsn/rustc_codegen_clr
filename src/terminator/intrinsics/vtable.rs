@@ -1,7 +1,7 @@
 use crate::assembly::MethodCompileCtx;
 use crate::operand::handle_operand;
 use crate::place::place_set;
-use cilly::{cilnode::ExtendKind, BinOp, Int, Interned, Type};
+use cilly::{BinOp, Int, Interned, Type, cilnode::ExtendKind};
 use rustc_middle::mir::{Operand, Place};
 use rustc_span::Spanned;
 

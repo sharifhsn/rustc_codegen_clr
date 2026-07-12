@@ -1,0 +1,167 @@
+schema = 1
+
+[support]
+rust_toolchain = "nightly-2026-06-17"
+target = "x86_64-unknown-dotnet"
+dotnet = ["8"]
+profiles = ["debug", "release"]
+host_os = ["linux", "macos"]
+known_limits = [
+  "managed identity requires package metadata and custom assembly-name values are limited to the Cargo package name",
+  "Result<managed handle, E> is rejected because the Rust enum would overlap GC-reference storage",
+  "RID-specific native NuGet runtime assets are not yet projected into Rust builds",
+  "Windows hosts are unsupported for setup, build, test, packaging, publishing, and MSBuild until Windows acceptance exists",
+  "transitive path dependencies require RustDotnetInput declarations",
+]
+
+[[blocker]]
+id = "managed-identity-collision"
+fixture = "cargo_tests/cd_multi_library_collision"
+oracle = "feasibility/managed_identity_acceptance.sh"
+current_expected = "CS0433 MainModule exists in both assemblies"
+closes_when = "two libraries compile and execute through distinct managed namespace/type identities"
+status = "closed-focused"
+
+[[blocker]]
+id = "typed-dto-export"
+fixture = "cargo_tests/cd_typed_dto"
+oracle = "cargo dotnet build cargo_tests/cd_typed_dto/rustlib && dotnet run --project cargo_tests/cd_typed_dto/csharp/cd_typed_dto_cs.csproj -c Release"
+current_expected = "real CLR properties roundtrip Decimal, nullable DateOnly, and String values"
+closes_when = "fixture compiles and executes as a typed C# consumer"
+status = "closed-focused"
+
+[[blocker]]
+id = "rid-complete-nuget-assets"
+fixture = "tools/cargo-dotnet/src/fixtures/nuget-assets"
+oracle = "nuget_assets::tests::rid_asset_graph_snapshots_are_preserved"
+current_expected = "ignored red test; current parser drops runtimeTargets/native/resources/RID/owner"
+closes_when = "test is unignored and all RID snapshots pass"
+status = "closed-focused"
+
+[[blocker]]
+id = "transitive-msbuild-inputs"
+fixture = "feasibility/fixtures/msbuild_transitive_inputs"
+oracle = "feasibility/transitive_input_invalidation_acceptance.sh"
+current_expected = "path dependency mutation is skipped by MSBuild"
+closes_when = "path dependency and build input mutations rebuild, followed by a no-op"
+status = "closed-focused"
+
+[[journey]]
+id = "rust-ecosystem-native-differential"
+outcome = "dotnet-as-rust-ecosystem"
+fixture = "cargo_tests/soak_ahash"
+case = "soak_ahash"
+oracle = "native_diff"
+comparison = "stdout_exact_and_exit"
+required_artifacts = []
+presubmit = true
+
+[[journey]]
+id = "managed-self-check"
+outcome = "dotnet-as-rust-ecosystem"
+fixture = "cargo_tests/cd_pure"
+case = "cd_pure"
+oracle = "managed_selfcheck"
+comparison = "assertions_and_marker"
+completion_marker = "== cd_pure done =="
+required_artifacts = []
+presubmit = true
+
+[[journey]]
+id = "csharp-host-calls-rust"
+outcome = "rust-in-csharp-repository"
+fixture = "cargo_tests/cd_export_ergonomics"
+case = "cd_export_ergonomics"
+oracle = "managed_host"
+comparison = "csharp_consumer_and_marker"
+completion_marker = "== cd_export_ergonomics done =="
+required_artifacts = ["rust_dll", "csharp_host"]
+presubmit = true
+
+[[journey]]
+id = "msbuild-incremental-stale-and-architecture"
+outcome = "rust-in-csharp-repository"
+fixture = "cargo_tests/cd_interop/csharp"
+case = "msbuild_acceptance"
+oracle = "managed_host"
+comparison = "msbuild_invalidation_and_marker"
+completion_marker = "== msbuild_acceptance done =="
+required_artifacts = ["rust_dll", "csharp_host", "msbuild_logs"]
+presubmit = true
+
+[[journey]]
+id = "deterministic-nuget-publishing"
+outcome = "rust-library-as-nuget"
+fixture = "cargo_tests/cd_interop/rustlib"
+case = "nuget_acceptance"
+oracle = "artifact_inspection"
+comparison = "byte_identical_packages_and_custom_id_consumer_execution"
+completion_marker = "== nuget_acceptance done =="
+required_artifacts = ["nupkg", "package_hash"]
+presubmit = true
+
+[[journey]]
+id = "independent-clean-tree-reproducibility"
+outcome = "rust-library-as-nuget"
+fixture = "cargo_tests/cd_interop/rustlib"
+case = "reproducibility_acceptance"
+oracle = "independent_clean_builds"
+comparison = "package_receipt_and_sorted_zip_entry_hashes_are_identical"
+completion_marker = "== reproducibility_acceptance done =="
+required_artifacts = ["nupkg", "package_receipt", "zip_entry_hashes", "provenance", "sbom", "licenses", "build_logs"]
+presubmit = true
+
+[[journey]]
+id = "sdk-resolved-nuget-consumption"
+outcome = "dotnet-as-rust-ecosystem"
+fixture = "generated-fresh-consumer"
+case = "nuget_acceptance"
+oracle = "rust_nuget_consumer"
+comparison = "sdk_restore_bindings_and_runtime_assets"
+completion_marker = "== nuget_acceptance done =="
+required_artifacts = ["project_assets", "generated_bindings", "runtime_dll"]
+presubmit = true
+
+[[journey]]
+id = "primary-offerings-feed-first-alpine-smoke"
+outcome = "rust-in-csharp-repository"
+fixture = "external isolated Primary Offerings AIP pilot worktree"
+case = "primary_offerings_alpine_acceptance"
+oracle = "package_reference_alpine_runtime"
+comparison = "package_mode_parity_tests_and_typed_dto_runtime_markers"
+completion_marker = "PASS: immutable feed package"
+required_artifacts = ["nupkg", "package_mode_test_log", "docker_build_log", "docker_run_log"]
+presubmit = false
+
+[[journey]]
+id = "clr-public-api-compatibility"
+outcome = "rust-library-as-nuget"
+fixture = "feasibility/api_compat/fixture"
+case = "api_compat_acceptance"
+oracle = "metadata_snapshot"
+comparison = "canonical_public_surface_against_committed_baseline"
+completion_marker = "== api_compat_acceptance passed (unchanged accepted; breaking change requires major SemVer) =="
+required_artifacts = ["public_api_baseline", "breaking_diff"]
+presubmit = true
+
+[[journey]]
+id = "private-build-stores"
+outcome = "rust-in-csharp-repository"
+fixture = "cargo_tests/cd_pure,cargo_tests/cd_interop/rustlib"
+case = "hermetic_acceptance"
+oracle = "barrier_proven_concurrent_execution_and_artifact_inspection"
+comparison = "overlapping_stage_intervals_distinct_cache_namespaces_ambient_hashes_and_receipts"
+completion_marker = "== hermetic_acceptance done: distinct builds overlapped with isolated mutable caches =="
+required_artifacts = ["parallel_trace", "private_sysroot_receipt", "rust_artifact_receipts", "hermetic_logs"]
+presubmit = true
+
+[[journey]]
+id = "private-cargo-registry"
+outcome = "rust-in-csharp-repository"
+fixture = "feasibility/fixtures/private_registry_{crate,consumer}"
+case = "private_registry_acceptance"
+oracle = "authenticated_sparse_registry"
+comparison = "empty_private_cache_builds_without_ambient_mutation_or_secret_leak"
+completion_marker = "== private_registry_acceptance done =="
+required_artifacts = ["registry_events", "private_cargo_credentials", "rust_artifact_receipt", "token_safe_logs"]
+presubmit = true

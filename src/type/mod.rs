@@ -23,17 +23,18 @@ pub fn align_of<'tcx>(ty: rustc_middle::ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> u64 
     align.bytes()
 }
 
+use crate::fn_ctx::MethodCompileCtx;
 use crate::r#type::adt::FieldOffsetIterator;
 use crate::r#type::utilis::{
-    INTEROP_ARR_TPE_NAME, INTEROP_CHR_TPE_NAME, INTEROP_CLASS_TPE_NAME,
-    INTEROP_BYREF_TPE_NAME, INTEROP_GENERIC_STRUCT_TPE_NAME, INTEROP_GENERIC_TPE_NAME,
-    INTEROP_METHOD_GENERIC_TPE_NAME, INTEROP_STRUCT_TPE_NAME, INTEROP_TYPE_GENERIC_TPE_NAME, is_zst,
-    resolve_const_size,
+    INTEROP_ARR_TPE_NAME, INTEROP_BYREF_TPE_NAME, INTEROP_CHR_TPE_NAME, INTEROP_CLASS_TPE_NAME,
+    INTEROP_GENERIC_STRUCT_TPE_NAME, INTEROP_GENERIC_TPE_NAME, INTEROP_METHOD_GENERIC_TPE_NAME,
+    INTEROP_STRUCT_TPE_NAME, INTEROP_TYPE_GENERIC_TPE_NAME, is_zst, resolve_const_size,
 };
-use crate::r#type::utilis::{garg_to_usize, garg_to_string, ptr_is_fat, tuple_name};
 use crate::r#type::utilis::{adt_name, stable_adt_name};
+use crate::r#type::utilis::{garg_to_string, garg_to_usize, ptr_is_fat, tuple_name};
+use cilly::IString;
 use cilly::bimap::Interned;
-use cilly::class::ClassDefIdx;
+use cilly::class::{ClassDefIdx, FixedArrayLayout};
 use cilly::{
     Assembly, IntoAsmIndex, add, ld_arg, ptr_cast,
     tpe::GenericKind,
@@ -43,11 +44,9 @@ use cilly::{
         MethodImpl, Type, cilnode::MethodKind,
     },
 };
-use cilly::{FnSig, IString};
-use crate::fn_ctx::MethodCompileCtx;
 /// A representation of a primitve type or a reference.
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     num::{NonZero, NonZeroU32},
 };
 
@@ -55,7 +54,6 @@ use rustc_abi::{Layout, VariantIdx};
 use rustc_middle::ty::{
     AdtDef, AdtKind, CoroutineArgsExt, FloatTy, IntTy, List, Ty, TyKind, UintTy,
 };
-use rustc_span::def_id::DefId;
 
 #[must_use]
 pub fn from_int(int_tpe: &IntTy) -> cilly::Type {
@@ -101,10 +99,17 @@ fn get_adt<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Interned<ClassRef> {
     let cref = ClassRef::new(name, None, true, [].into());
+    let semantic_size = ctx.layout_of(adt_ty).layout.size().bytes();
     if ctx.contains_ref(&cref) {
-        ctx.alloc_class_ref(cref)
+        let cref = ctx.alloc_class_ref(cref);
+        ctx.set_rust_semantic_size(cref, semantic_size);
+        cref
     } else {
         let cref = ctx.alloc_class_ref(cref);
+        // Register before recursively lowering fields. Self-referential fields may encounter this
+        // pre-interned ClassRef while its definition is still under construction, and any semantic
+        // size operation in that path must still observe Rust's layout rather than CLR storage.
+        ctx.set_rust_semantic_size(cref, semantic_size);
         let adt_kind = def.adt_kind();
         // A library's exported structs get public accessors synthesized below (see `add_record_accessors`).
         let is_exported_struct =
@@ -155,7 +160,9 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
         let item_name = ctx.tcx().item_name(def.did());
         matches!(
             item_name.as_str(),
-            INTEROP_TYPE_GENERIC_TPE_NAME | INTEROP_METHOD_GENERIC_TPE_NAME | INTEROP_BYREF_TPE_NAME
+            INTEROP_TYPE_GENERIC_TPE_NAME
+                | INTEROP_METHOD_GENERIC_TPE_NAME
+                | INTEROP_BYREF_TPE_NAME
         )
     } else {
         false
@@ -169,32 +176,22 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
         TyKind::Bound(_, _inner) => Type::Void,
         TyKind::Bool => Type::Bool,
         TyKind::Char => Type::Int(Int::U32),
-        TyKind::Closure(def, args) => {
-            // Get the info about this closure: its sig + fields
+        TyKind::Closure(_def, args) => {
+            // Get the closure fields.
             let closure = args.as_closure();
-            // Extract the sig
-            let mut sig = closure.sig();
-            sig = ctx.monomorphize(sig);
-            let sig = ctx.tcx().normalize_erasing_late_bound_regions(
-                rustc_middle::ty::TypingEnv::fully_monomorphized(),
-                sig,
-            );
-            let inputs: Box<_> = sig.inputs().iter().map(|ty| get_type(*ty, ctx)).collect();
-            let output = get_type(sig.output(), ctx);
-            let sig = ctx.sig(inputs, output);
-            // Extract the closure fields
             let fields: Box<[_]> = closure
                 .upvar_tys()
                 .iter()
                 .map(|ty| get_type(ty, ctx))
                 .collect();
             // Get a closure name.
-            let name = closure_name(*def, &fields, sig, ctx);
+            let name = closure_name(ty, ctx);
             let name = ctx.alloc_string(name);
             // Get the layout of the closure
             let layout = ctx.layout_of(ty);
             // Allocate a class reference to the closure
             let cref = ctx.alloc_class_ref(ClassRef::new(name, None, true, [].into()));
+            ctx.set_rust_semantic_size(cref, layout.layout.size().bytes());
             // If there is no defition of this closure present, create the closure.
             if ctx.class_ref_to_def(cref).is_none() {
                 let type_def = closure_typedef(&fields, layout.layout, ctx, name);
@@ -319,7 +316,7 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                             ),
                         );
                     }
-                    let cref = fixed_array(ctx, elem, count, arr_size, arr_align);
+                    let cref = fixed_array(ctx, elem, count, arr_size, arr_size, arr_align);
                     return Type::ClassRef(cref);
                 }
                 return Type::SIMDVector(SIMDVector::new(
@@ -516,11 +513,11 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
             } else {
                 arr_size
             };
-            let cref = fixed_array(ctx, element, length as u64, n_arr_size, arr_align);
+            let cref = fixed_array(ctx, element, length as u64, n_arr_size, arr_size, arr_align);
             Type::ClassRef(cref)
         }
         TyKind::Alias(_) => panic!("Attempted to get the .NET type of an unmorphized type"),
-        TyKind::Coroutine(defid, coroutine_args) => {
+        TyKind::Coroutine(_defid, coroutine_args) => {
             let coroutine_args = coroutine_args.as_coroutine();
 
             // Extract the closure fields
@@ -530,12 +527,13 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                 .map(|ty| get_type(ty, ctx))
                 .collect();
             // Get a coroutine name.
-            let name = coroutine_name(*defid, &fields, ctx);
+            let name = coroutine_name(ty, ctx);
             let name = ctx.alloc_string(name);
             // Get the layout of the coroutine
             let layout = ctx.layout_of(ty);
             // Allocate a class reference to the coroutine
             let cref = ctx.alloc_class_ref(ClassRef::new(name, None, true, [].into()));
+            ctx.set_rust_semantic_size(cref, layout.layout.size().bytes());
             // If there is no defition of this coroutine present, create the coroutine.
             if ctx.class_ref_to_def(cref).is_none() {
                 let type_def = coroutine_typedef(&fields, ty, layout.layout, ctx, name);
@@ -560,36 +558,52 @@ pub fn fixed_array(
     asm: &mut Assembly,
     element: Type,
     length: u64,
-    arr_size: u64,
+    requested_size: u64,
+    semantic_size: u64,
     align: u64,
 ) -> Interned<ClassRef> {
-    assert_ne!(arr_size, 0);
-    // Get the reference to the array class
-    let cref = ClassRef::fixed_array(element, length, asm);
+    assert_ne!(requested_size, 0);
+    // Key the synthetic type by the caller-known Rust storage request, not by opportunistic local
+    // ClassDef availability. Two shards must derive the same identity even if only one currently
+    // carries the element's authoritative managed-sidecar definition; post-link merging will then
+    // expose any contradictory physical normalization instead of silently creating two CLR types
+    // for one Rust type. Element + length alone is insufficient because ordinary and over-aligned
+    // arrays can share both while requiring distinct storage definitions.
+    let cref = ClassRef::fixed_array_with_layout(element, length, requested_size, align, asm);
+    asm.set_rust_semantic_size(cref, semantic_size);
 
     // If the array definition not already present, add it.
     if asm.class_ref_to_def(cref).is_none() {
         let fields = vec![(element, asm.alloc_string("f0"), Some(0))];
         let class_ref = asm.class_ref(cref).clone();
-        let Ok(size) = std::convert::TryInto::<u32>::try_into(arr_size) else {
+        let Ok(size) = std::convert::TryInto::<u32>::try_into(requested_size) else {
             panic!(
-                "Array of {element:?} with size {arr_size} >= 2^32. Unsuported.",
+                "Array of {element:?} with requested CLR storage size {requested_size} >= 2^32. Unsupported.",
                 element = element.mangle(asm)
             )
         };
         let arr = asm
-            .class_def(ClassDef::new(
-                class_ref.name(),
-                true,
-                0,
-                None,
-                fields,
-                vec![],
-                Access::Public,
-                Some(NonZeroU32::new(size).unwrap()),
-                NonZeroU32::new(align.try_into().unwrap()),
-                true,
-            ))
+            .class_def(
+                ClassDef::new(
+                    class_ref.name(),
+                    true,
+                    0,
+                    None,
+                    fields,
+                    vec![],
+                    Access::Public,
+                    Some(NonZeroU32::new(size).unwrap()),
+                    NonZeroU32::new(align.try_into().unwrap()),
+                    true,
+                )
+                .with_fixed_array_layout(FixedArrayLayout::new(
+                    element,
+                    length,
+                    requested_size,
+                    semantic_size,
+                    align,
+                )),
+            )
             .expect("Layout error in array!");
 
         // Common nodes
@@ -714,30 +728,44 @@ pub fn fat_ptr_to<'tcx>(
     }
     cref
 }
-/// Returns the name of a clousre with a given id, fields, and signature.
-pub fn closure_name(
-    _def_id: DefId,
-    fields: &[Type],
-    _sig: Interned<FnSig>,
-    ctx: &mut MethodCompileCtx<'_, '_>,
-) -> String {
-    let mangled_fields: String = fields.iter().map(|tpe| tpe.mangle(ctx)).collect();
-    format!(
-        "Closure{field_count}{mangled_fields}",
-        field_count = fields.len()
-    )
+fn generated_type_name(kind: &str, identity: &str) -> String {
+    format!("{kind}.tid_{identity}")
 }
-/// Returns the name of a coroutine with a given id, fields, and signature.
-pub fn coroutine_name(
-    def_id: DefId,
-    fields: &[Type],
-    ctx: &mut MethodCompileCtx<'_, '_>,
-) -> String {
-    let mangled_fields: String = fields.iter().map(|tpe| tpe.mangle(ctx)).collect();
-    format!(
-        "Coroutine{def_id:?}{field_count}{mangled_fields}",
-        field_count = fields.len()
-    )
+
+#[cfg(test)]
+mod generated_type_identity_tests {
+    use super::generated_type_name;
+
+    #[test]
+    fn identical_type_identity_is_deterministic_across_shards() {
+        let identity = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            generated_type_name("Coroutine", identity),
+            generated_type_name("Coroutine", identity)
+        );
+    }
+
+    #[test]
+    fn distinct_type_identities_do_not_share_a_generated_class() {
+        assert_ne!(
+            generated_type_name("Closure", "0123456789abcdef0123456789abcdef"),
+            generated_type_name("Closure", "fedcba9876543210fedcba9876543210")
+        );
+    }
+}
+
+/// Return a deterministic identity name for a closure. Presentation text, field handles, and
+/// session-local DefId debug values are deliberately excluded; rustc's TypeId hash covers the
+/// closure definition plus its fully instantiated captured/generic types across crate metadata.
+pub fn closure_name<'tcx, 'asm>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, 'asm>) -> String {
+    let identity = format!("{:032x}", ctx.tcx().type_id_hash(ty));
+    generated_type_name("Closure", &identity)
+}
+
+/// Return the corresponding stable identity name for a coroutine/generator.
+pub fn coroutine_name<'tcx, 'asm>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, 'asm>) -> String {
+    let identity = format!("{:032x}", ctx.tcx().type_id_hash(ty));
+    generated_type_name("Coroutine", &identity)
 }
 /// Creates a [`ClassDef`] representing a closure with certain layout and fields.
 #[must_use]
@@ -796,6 +824,215 @@ pub fn closure_typedef(
         has_nonverlaping_layout,
     )
 }
+
+/// One field participating in a Rust overlapping layout before CLR normalization.
+#[derive(Clone, Copy)]
+struct OverlapField<'tcx> {
+    tpe: Type,
+    name: Interned<IString>,
+    natural_offset: u32,
+    /// The source Rust type supplies the sidecar's size/alignment when relocation is required.
+    /// Synthetic discriminants have no Rust field type and can never themselves contain a gcref.
+    rust_ty: Option<Ty<'tcx>>,
+}
+
+/// Determines whether a Rust field lowers to a GC-tracked managed value without consulting the
+/// partially-built CIL type graph.
+///
+/// Codegen shards discover and register `ClassDef`s in different orders. Basing this decision on
+/// whether a nested definition happens to be present therefore makes physical field offsets vary
+/// between shards. Walking the fully monomorphized Rust type is deterministic and sees the interop
+/// marker ADT at the leaf regardless of registration order.
+fn rust_ty_contains_managed_value<'tcx>(
+    ty: Ty<'tcx>,
+    ctx: &MethodCompileCtx<'tcx, '_>,
+    depth: u32,
+) -> bool {
+    if depth > 64 {
+        return true;
+    }
+    let ty = ctx.monomorphize(ty);
+    if is_zst(ty, ctx.tcx()) {
+        return false;
+    }
+    match ty.kind() {
+        TyKind::Adt(def, args) => {
+            let item = ctx.tcx().item_name(def.did());
+            if matches!(
+                item.as_str(),
+                INTEROP_CLASS_TPE_NAME
+                    | INTEROP_GENERIC_TPE_NAME
+                    | INTEROP_ARR_TPE_NAME
+                    | INTEROP_STRUCT_TPE_NAME
+                    | INTEROP_GENERIC_STRUCT_TPE_NAME
+                    | INTEROP_TYPE_GENERIC_TPE_NAME
+                    | INTEROP_METHOD_GENERIC_TPE_NAME
+                    | INTEROP_BYREF_TPE_NAME
+            ) {
+                return true;
+            }
+            def.all_fields().any(|field| {
+                let field_ty = ctx.monomorphize(field.ty(ctx.tcx(), args).skip_normalization());
+                rust_ty_contains_managed_value(field_ty, ctx, depth + 1)
+            })
+        }
+        TyKind::Closure(_, args) => args
+            .as_closure()
+            .upvar_tys()
+            .iter()
+            .any(|field| rust_ty_contains_managed_value(field, ctx, depth + 1)),
+        TyKind::Coroutine(def_id, args) => {
+            let args = args.as_coroutine();
+            args.upvar_tys()
+                .iter()
+                .any(|field| rust_ty_contains_managed_value(field, ctx, depth + 1))
+                || args.state_tys(*def_id, ctx.tcx()).any(|variant| {
+                    variant
+                        .into_iter()
+                        .any(|field| rust_ty_contains_managed_value(field, ctx, depth + 1))
+                })
+        }
+        TyKind::Tuple(fields) => fields
+            .iter()
+            .any(|field| rust_ty_contains_managed_value(field, ctx, depth + 1)),
+        TyKind::Array(field, _) => rust_ty_contains_managed_value(*field, ctx, depth + 1),
+        TyKind::Pat(base, _) => rust_ty_contains_managed_value(*base, ctx, depth + 1),
+        // Rust references/raw pointers and fat pointers are native pointer values. Their pointee may
+        // describe a managed marker, but the pointer itself is not a GC-tracked object reference.
+        TyKind::Ref(..)
+        | TyKind::RawPtr(..)
+        | TyKind::FnPtr(..)
+        | TyKind::Dynamic(..)
+        | TyKind::Bool
+        | TyKind::Char
+        | TyKind::Int(..)
+        | TyKind::Uint(..)
+        | TyKind::Float(..)
+        | TyKind::Never
+        | TyKind::Foreign(..)
+        | TyKind::FnDef(..)
+        | TyKind::Bound(..) => false,
+        TyKind::Slice(field) => rust_ty_contains_managed_value(*field, ctx, depth + 1),
+        TyKind::Alias(..) => true,
+        _ => false,
+    }
+}
+
+/// Converts Rust's union-style field placement into a CoreCLR-GC-safe physical layout.
+///
+/// Rust may assign the same byte offset to differently typed fields in mutually-exclusive enum or
+/// coroutine states. CoreCLR permits that explicit layout only while the offset's GC interpretation
+/// remains unambiguous. For each conflicting offset group, this routine keeps the ordinary Rust bytes
+/// at their natural offset and hoists every GC-bearing field into an aligned sidecar after the Rust
+/// extent. Fields with the same lowered type and original offset share one sidecar slot, preserving
+/// the useful overlap between mutually-exclusive variants without confusing the GC map.
+///
+/// The returned size is the CLR *storage* size. Rust's semantic size is registered separately on the
+/// assembly and `MethodCompileCtx::size_of` lowers it to a constant, so sidecars cannot change Rust
+/// `size_of` or pointer stride.
+fn normalize_overlapping_layout<'tcx>(
+    fields: Vec<OverlapField<'tcx>>,
+    rust_size: u64,
+    rust_align: u64,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> (Vec<(Type, Interned<IString>, Option<u32>)>, u64, u64) {
+    let mut by_offset: HashMap<u32, Vec<(Type, bool)>> = HashMap::new();
+    for field in &fields {
+        let managed = field
+            .rust_ty
+            .is_some_and(|ty| rust_ty_contains_managed_value(ty, ctx, 0));
+        by_offset
+            .entry(field.natural_offset)
+            .or_default()
+            .push((field.tpe, managed));
+    }
+    let unsafe_offsets: HashSet<u32> = by_offset
+        .into_iter()
+        .filter_map(|(offset, fields)| {
+            let contains_gcref = fields.iter().any(|(_, managed)| *managed);
+            let disagree = fields
+                .first()
+                .is_some_and(|(first, _)| fields.iter().any(|(tpe, _)| tpe != first));
+            (contains_gcref && disagree).then_some(offset)
+        })
+        .collect();
+
+    let mut storage_end = rust_size;
+    let mut storage_align = rust_align.max(1);
+    let mut sidecars: HashMap<(u32, Type), u32> = HashMap::new();
+    let mut normalized = Vec::with_capacity(fields.len());
+    for field in fields {
+        let must_hoist = unsafe_offsets.contains(&field.natural_offset)
+            && field
+                .rust_ty
+                .is_some_and(|ty| rust_ty_contains_managed_value(ty, ctx, 0));
+        let offset = if must_hoist {
+            if let Some(existing) = sidecars.get(&(field.natural_offset, field.tpe)) {
+                *existing
+            } else {
+                let rust_ty = field
+                    .rust_ty
+                    .expect("a GC-bearing overlapping field must have a source Rust type");
+                let layout = ctx.layout_of(rust_ty).layout;
+                let mut field_size = layout.size().bytes();
+                let mut field_align = layout.align().abi.bytes().max(1);
+                if let Type::ClassRef(class) = field.tpe {
+                    if let Some(def) = ctx
+                        .class_ref_to_def(class)
+                        .and_then(|idx| ctx.class_defs().get(&idx))
+                    {
+                        field_size = field_size
+                            .max(def.explict_size().map_or(0, |size| u64::from(size.get())));
+                        field_align =
+                            field_align.max(def.align().map_or(1, |align| u64::from(align.get())));
+                    }
+                }
+                let start = storage_end.next_multiple_of(field_align);
+                storage_end = start
+                    .checked_add(field_size)
+                    .expect("managed sidecar layout size overflow");
+                storage_align = storage_align.max(field_align);
+                let start = u32::try_from(start)
+                    .expect("managed sidecar field offset exceeds the CLR 32-bit limit");
+                sidecars.insert((field.natural_offset, field.tpe), start);
+                start
+            }
+        } else {
+            field.natural_offset
+        };
+        normalized.push((field.tpe, field.name, Some(offset)));
+    }
+
+    let storage_size = storage_end.next_multiple_of(storage_align);
+    let mut normalized_by_offset: HashMap<u32, Vec<(Type, Interned<IString>)>> = HashMap::new();
+    for (tpe, name, offset) in &normalized {
+        normalized_by_offset
+            .entry(offset.expect("normalized fields always have offsets"))
+            .or_default()
+            .push((*tpe, *name));
+    }
+    for (offset, group) in normalized_by_offset {
+        if group.iter().any(|(tpe, _)| tpe.contains_gcref(&*ctx))
+            && group
+                .first()
+                .is_some_and(|(first, _)| group.iter().any(|(tpe, _)| tpe != first))
+        {
+            panic!(
+                "overlapping-layout normalization left an unsafe GC slot at offset {offset}: {:?}",
+                group
+                    .iter()
+                    .map(|(tpe, name)| (
+                        tpe.mangle(&*ctx),
+                        ctx[*name].to_string(),
+                        tpe.contains_gcref(&*ctx)
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+    (normalized, storage_size, storage_align)
+}
+
 /// Creates a [`ClassDef`] representing a coroutine (the state machine `async fn`/`gen` blocks
 /// lower to). A coroutine is enum-like: it has upvar fields (the captured environment, shared
 /// across all states — laid out like a closure's `f_N`), an `ENUM_TAG` discriminant, and a set
@@ -818,20 +1055,37 @@ fn coroutine_typedef<'tcx>(
         TyKind::Coroutine(def_id, args) => (*def_id, args.as_coroutine()),
         _ => unreachable!("coroutine_typedef on non-coroutine {ty:?}"),
     };
-    let mut fields: Vec<(Type, Interned<IString>, Option<u32>)> = Vec::new();
+    let mut fields: Vec<OverlapField<'tcx>> = Vec::new();
     // Upvar fields (the captured environment), laid out like a closure's `f_N`.
     {
         let offset_iter = FieldOffsetIterator::fields((*layout.0).clone());
-        for ((idx, field), offset) in upvars.iter().enumerate().zip(offset_iter) {
+        for (((idx, field), rust_ty), offset) in upvars
+            .iter()
+            .enumerate()
+            .zip(coroutine_args.upvar_tys().iter())
+            .zip(offset_iter)
+        {
             if *field == Type::Void {
                 continue;
             }
             let name = ctx.alloc_string(format!("f_{idx}"));
-            fields.push((*field, name, Some(offset)));
+            fields.push(OverlapField {
+                tpe: *field,
+                name,
+                natural_offset: offset,
+                rust_ty: Some(ctx.monomorphize(rust_ty)),
+            });
         }
     }
     // The discriminant (which coroutine state we are in).
-    handle_tag(&layout, ctx, ty, &mut fields);
+    let mut tag = Vec::new();
+    handle_tag(&layout, ctx, ty, &mut tag);
+    fields.extend(tag.into_iter().map(|(tpe, name, offset)| OverlapField {
+        tpe,
+        name,
+        natural_offset: offset.expect("coroutine discriminant must have an explicit offset"),
+        rust_ty: None,
+    }));
     // Per-variant saved-local fields. `state_tys` yields one inner iterator per coroutine
     // variant (outer index = `VariantIdx`); the reserved Unresumed/Returned/Panicked variants
     // have no saved locals, so their inner iterators are empty and are naturally skipped.
@@ -850,19 +1104,15 @@ fn coroutine_typedef<'tcx>(
     // strictly additional memory that only exists on the CoreCLR side, never observed by Rust
     // code, which never `size_of`s a coroutine) and keeps the fast, fully-overlapping layout for
     // every other (safe) field.
-    let mut extra_end: u64 = layout.size().bytes();
-    let mut extra_align: u64 = layout.align().abi.bytes();
     let variant_state_tys: Vec<Vec<Ty<'tcx>>> = coroutine_args
         .state_tys(def_id, ctx.tcx())
         .map(|variant| variant.collect())
         .collect();
     for (vidx, variant_field_tys) in variant_state_tys.into_iter().enumerate() {
         let var = VariantIdx::from_u32(vidx as u32);
-        let offset_iter =
-            crate::r#type::adt::FieldOffsetIterator::fields(crate::r#type::adt::get_variant_at_index(
-                var,
-                (*layout.0).clone(),
-            ));
+        let offset_iter = crate::r#type::adt::FieldOffsetIterator::fields(
+            crate::r#type::adt::get_variant_at_index(var, (*layout.0).clone()),
+        );
         for (field_idx, (sty, offset)) in variant_field_tys.into_iter().zip(offset_iter).enumerate()
         {
             let mono_sty = ctx.monomorphize(sty);
@@ -875,30 +1125,20 @@ fn coroutine_typedef<'tcx>(
                 "{vname}_{field_idx}",
                 vname = crate::r#type::adt::coroutine_variant_name(var)
             ));
-            // Would placing this field at its natural (rustc-computed) offset create a
-            // loader-unsafe collision with a field already placed there by an earlier variant?
-            // Mirrors `ClassDef::layout_check`'s own grouping criterion exactly: unsafe iff the
-            // types differ AND at least one side carries a real gcref.
-            let unsafe_collision = fields.iter().any(|(ot, _, ooff)| {
-                *ooff == Some(offset)
-                    && *ot != fty
-                    && (ot.contains_gcref(&*ctx) || fty.contains_gcref(&*ctx))
+            fields.push(OverlapField {
+                tpe: fty,
+                name: fname,
+                natural_offset: offset,
+                rust_ty: Some(mono_sty),
             });
-            let final_offset = if unsafe_collision {
-                let field_layout = ctx.layout_of(mono_sty);
-                let f_align = field_layout.layout.align().abi.bytes().max(1);
-                let f_size = field_layout.layout.size().bytes();
-                let start = extra_end.next_multiple_of(f_align);
-                extra_end = start + f_size;
-                extra_align = extra_align.max(f_align);
-                u32::try_from(start).expect("Coroutine relocated-field offset exceeds 2^32")
-            } else {
-                offset
-            };
-            fields.push((fty, fname, Some(final_offset)));
         }
     }
-    let total_size = extra_end.max(layout.size().bytes());
+    let (fields, total_size, total_align) = normalize_overlapping_layout(
+        fields,
+        layout.size().bytes(),
+        layout.align().abi.bytes(),
+        ctx,
+    );
     // Coroutine variants overlap in memory (like enum variants), so the layout is NOT
     // non-overlapping — `closure_typedef`'s upvar-only uniqueness check would wrongly report
     // `true` once overlapping variant fields are present, so force `false` here.
@@ -912,8 +1152,12 @@ fn coroutine_typedef<'tcx>(
         Access::Public,
         Some(NonZeroU32::new(total_size.try_into().expect("Coroutine size exceeds 2^32")).unwrap()),
         Some(
-            NonZeroU32::new(extra_align.try_into().expect("Coroutine alignment exceeds 2^32"))
-                .unwrap(),
+            NonZeroU32::new(
+                total_align
+                    .try_into()
+                    .expect("Coroutine alignment exceeds 2^32"),
+            )
+            .unwrap(),
         ),
         false,
     )
@@ -942,7 +1186,10 @@ fn struct_<'tcx>(
         .zip(explicit_offset_iter)
     {
         let name = escape_field_name(&field.name.to_string());
-        let field_type = get_type(ctx.monomorphize(field.ty(ctx.tcx(), subst).skip_normalization()), ctx);
+        let field_type = get_type(
+            ctx.monomorphize(field.ty(ctx.tcx(), subst).skip_normalization()),
+            ctx,
+        );
         if field_type == Type::Void {
             continue;
         }
@@ -1031,7 +1278,7 @@ fn add_record_accessors(
     let ctor_name = ctx.alloc_string(".ctor");
     // `Access::Extern` (not `Public`): these accessors exist solely for .NET consumers, so nothing in
     // the Rust crate calls them. `Extern` both emits them as `public` CIL *and* marks them dead-code
-    // roots (like the `#[no_mangle]` exports), so the optimizer's `eliminate_dead_fns` keeps them.
+    // roots (like the `#[unsafe(no_mangle)]` exports), so the optimizer's `eliminate_dead_fns` keeps them.
     ctx.new_method(MethodDef::new(
         Access::Extern,
         class_idx,
@@ -1198,13 +1445,19 @@ fn enum_<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> ClassDef {
     let layout = ctx.layout_of(adt_ty);
-    let mut fields: Vec<(Type, Interned<IString>, Option<u32>)> = vec![];
+    let mut fields: Vec<OverlapField<'tcx>> = vec![];
     // Handle the enum tag.
-    handle_tag(&layout.layout, ctx, adt_ty, &mut fields);
+    let mut tag = Vec::new();
+    handle_tag(&layout.layout, ctx, adt_ty, &mut tag);
+    fields.extend(tag.into_iter().map(|(tpe, name, offset)| OverlapField {
+        tpe,
+        name,
+        natural_offset: offset.expect("enum discriminant must have an explicit offset"),
+        rust_ty: None,
+    }));
     // Handle enum variants
     for (vidx, variant) in adt.variants().iter_enumerated() {
         let variant_name = variant.name.to_string();
-        let mut variant_fields = vec![];
         let field_offset_iter = crate::r#type::adt::variant_offsets(adt, layout.layout, vidx);
 
         for (field, offset) in variant.fields.iter().zip(field_offset_iter) {
@@ -1212,20 +1465,26 @@ fn enum_<'tcx>(
                 "{variant_name}_{fname}",
                 fname = escape_field_name(&field.name.to_string())
             );
-            let field_ty = get_type(field.ty(ctx.tcx(), subst).skip_normalization(), ctx);
+            let rust_ty = ctx.monomorphize(field.ty(ctx.tcx(), subst).skip_normalization());
+            let field_ty = get_type(rust_ty, ctx);
             if field_ty == Type::Void {
                 continue;
             }
 
-            variant_fields.push((field_ty, ctx.alloc_string(name), Some(offset)));
+            fields.push(OverlapField {
+                tpe: field_ty,
+                name: ctx.alloc_string(name),
+                natural_offset: offset,
+                rust_ty: Some(rust_ty),
+            });
         }
-
-        fields.extend(variant_fields);
     }
-    // Check no field is void.
-    fields
-        .iter()
-        .for_each(|(tpe, _, _)| assert_ne!(*tpe, Type::Void));
+    let (fields, storage_size, storage_align) = normalize_overlapping_layout(
+        fields,
+        layout.layout.size().bytes(),
+        layout.layout.align().abi.bytes(),
+        ctx,
+    );
     ClassDef::new(
         enum_name,
         true,
@@ -1234,14 +1493,10 @@ fn enum_<'tcx>(
         fields,
         vec![],
         Access::Public,
-        Some(NonZeroU32::new(layout.layout.size().bytes().try_into().unwrap()).unwrap()),
+        Some(NonZeroU32::new(storage_size.try_into().unwrap()).unwrap()),
         Some(
             NonZeroU32::new(
-                layout
-                    .layout
-                    .align()
-                    .abi
-                    .bytes()
+                storage_align
                     .try_into()
                     .expect("Enum alignement exceeds 2^32"),
             )
@@ -1260,7 +1515,7 @@ fn union_<'tcx>(
 ) -> ClassDef {
     // Get union layout
     let layout = ctx.layout_of(adt_ty);
-    let mut fields = Vec::new();
+    let mut fields: Vec<OverlapField<'tcx>> = Vec::new();
     // Get union fields
     for (field, offset) in adt
         .all_fields()
@@ -1272,8 +1527,19 @@ fn union_<'tcx>(
         if field_type == Type::Void {
             continue;
         }
-        fields.push((field_type, ctx.alloc_string(field_name), Some(offset)));
+        fields.push(OverlapField {
+            tpe: field_type,
+            name: ctx.alloc_string(field_name),
+            natural_offset: offset,
+            rust_ty: Some(field_ty),
+        });
     }
+    let (fields, storage_size, storage_align) = normalize_overlapping_layout(
+        fields,
+        layout.layout.size().bytes(),
+        layout.layout.align().abi.bytes(),
+        ctx,
+    );
     // Create a union ClassDef
     ClassDef::new(
         name,
@@ -1283,14 +1549,10 @@ fn union_<'tcx>(
         fields,
         vec![],
         Access::Public,
-        Some(NonZeroU32::new(layout.layout.size().bytes().try_into().unwrap()).unwrap()),
+        Some(NonZeroU32::new(storage_size.try_into().unwrap()).unwrap()),
         Some(
             NonZeroU32::new(
-                layout
-                    .layout
-                    .align()
-                    .abi
-                    .bytes()
+                storage_align
                     .try_into()
                     .expect("Union alignement exceeds 2^32"),
             )
@@ -1339,6 +1601,7 @@ pub fn tuple_typedef(
     ctx: &mut MethodCompileCtx<'_, '_>,
     name: Interned<IString>,
 ) -> ClassDefIdx {
+    let semantic_size = layout.size().bytes();
     let field_iter = elements
         .iter()
         .enumerate()
@@ -1352,7 +1615,7 @@ pub fn tuple_typedef(
         }
         fields.push((field, ctx.alloc_string(name), Some(offset)));
     }
-    match ctx.class_def(ClassDef::new(
+    let class = match ctx.class_def(ClassDef::new(
         name,
         true,
         0,
@@ -1391,5 +1654,7 @@ pub fn tuple_typedef(
             );
             todo!();
         }
-    }
+    };
+    ctx.set_rust_semantic_size(class.0, semantic_size);
+    class
 }

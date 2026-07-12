@@ -1,0 +1,49 @@
+{
+  "version": 3,
+  "targets": {
+    "net8.0/linux-musl-x64": {
+      "Example.Root/1.0.0": {
+        "type": "package",
+        "dependencies": { "Example.Dependency": "2.0.0" },
+        "compile": { "ref/net8.0/Example.Root.dll": {} },
+        "runtime": { "lib/net8.0/Example.Root.dll": {} },
+        "runtimeTargets": {
+          "runtimes/linux-musl-x64/lib/net8.0/Example.Root.dll": { "rid": "linux-musl-x64", "assetType": "runtime" },
+          "runtimes/linux-musl-x64/native/libexample_root.so": { "rid": "linux-musl-x64", "assetType": "native" },
+          "runtimes/linux-x64/native/libfallback_dependency.so": { "rid": "linux-x64", "assetType": "native" }
+        }
+      },
+      "Example.Dependency/2.0.0": {
+        "type": "package",
+        "compile": { "ref/net8.0/Example.Dependency.dll": {} },
+        "runtime": { "lib/net8.0/Example.Dependency.dll": {} },
+        "runtimeTargets": {
+          "runtimes/linux-musl-x64/lib/net8.0/de/Example.Dependency.resources.dll": { "rid": "linux-musl-x64", "assetType": "resources" }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "Example.Root/1.0.0": { "type": "package", "path": "example.root/1.0.0" },
+    "Example.Dependency/2.0.0": { "type": "package", "path": "example.dependency/2.0.0" }
+  },
+  "packageFolders": { "__PACKAGE_ROOT__/": {} },
+  "runtimes": {
+    "linux-musl-x64": [ "linux-x64", "linux", "unix", "any" ],
+    "linux-x64": [ "linux", "unix", "any" ]
+  },
+  "cargoDotnetExpected": {
+    "requestedRid": "linux-musl-x64",
+    "assets": [
+      { "owner": "Example.Root/1.0.0", "kind": "compile", "path": "ref/net8.0/Example.Root.dll" },
+      { "owner": "Example.Root/1.0.0", "kind": "runtime", "path": "lib/net8.0/Example.Root.dll" },
+      { "owner": "Example.Root/1.0.0", "kind": "runtime", "rid": "linux-musl-x64", "path": "runtimes/linux-musl-x64/lib/net8.0/Example.Root.dll" },
+      { "owner": "Example.Root/1.0.0", "kind": "native", "rid": "linux-musl-x64", "path": "runtimes/linux-musl-x64/native/libexample_root.so" },
+      { "owner": "Example.Root/1.0.0", "kind": "native", "rid": "linux-x64", "path": "runtimes/linux-x64/native/libfallback_dependency.so", "fallback": true },
+      { "owner": "Example.Dependency/2.0.0", "kind": "compile", "path": "ref/net8.0/Example.Dependency.dll" },
+      { "owner": "Example.Dependency/2.0.0", "kind": "runtime", "path": "lib/net8.0/Example.Dependency.dll" },
+      { "owner": "Example.Dependency/2.0.0", "kind": "resource", "rid": "linux-musl-x64", "path": "runtimes/linux-musl-x64/lib/net8.0/de/Example.Dependency.resources.dll" }
+    ],
+    "collisions": []
+  }
+}

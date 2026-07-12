@@ -1,10 +1,10 @@
 use super::{
+    Assembly, Const, MethodDefIdx, MethodRef, Type,
     asm_link::{RelocateCtx, RelocateValue},
     bimap::Interned,
-    Assembly, Const, MethodDefIdx, MethodRef, Type,
 };
 use crate::Access;
-use crate::{utilis::assert_unique, IString};
+use crate::{IString, utilis::assert_unique};
 use serde::{Deserialize, Serialize};
 use std::{num::NonZeroU32, ops::Deref};
 #[derive(Debug)]
@@ -123,8 +123,25 @@ impl ClassRef {
         &self.generics
     }
     #[must_use]
-    pub fn fixed_array(element: Type, length: u64, asm: &mut Assembly) -> Interned<ClassRef> {
-        let name = format!("{element}_{length}", element = element.mangle(asm));
+    pub fn fixed_array_with_layout(
+        element: Type,
+        length: u64,
+        requested_size: u64,
+        requested_align: u64,
+        asm: &mut Assembly,
+    ) -> Interned<ClassRef> {
+        // Element + length alone is not a physical-layout identity. Rust can give two fixed arrays
+        // with the same logical lanes different storage alignment (for example an ordinary
+        // `[u32; 32]` and the backing array inside `#[repr(align(128))]`). Non-native SIMD and
+        // managed-sidecar normalization can also change CLR storage size independently of the Rust
+        // semantic size. If those definitions share a TypeDef name, linking codegen shards either
+        // silently chooses one layout or (correctly) rejects the conflict. Make the physical layout
+        // request part of the synthetic type's identity instead. These values must be caller-known
+        // and deterministic; opportunistic post-normalization details do not belong in an intern key.
+        let name = format!(
+            "{element}_{length}_s{requested_size}_a{requested_align}",
+            element = element.mangle(asm)
+        );
         let name = asm.alloc_string(name);
         let cref = ClassRef::new(name, None, true, [].into());
         asm.alloc_class_ref(cref)
@@ -620,12 +637,69 @@ impl RelocateValue for StaticFieldDef {
             tpe: destination.translate_type(ctx, tpe),
             name: ctx.string(destination, name),
             is_tls,
-            default_value: default_value
-                .map(|value| destination.translate_const(ctx, &value)),
+            default_value: default_value.map(|value| destination.translate_const(ctx, &value)),
             is_const,
         }
     }
 }
+#[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
+pub struct FixedArrayLayout {
+    element: Type,
+    length: u64,
+    requested_size: u64,
+    semantic_size: u64,
+    requested_align: u64,
+}
+
+impl FixedArrayLayout {
+    #[must_use]
+    pub fn new(
+        element: Type,
+        length: u64,
+        requested_size: u64,
+        semantic_size: u64,
+        requested_align: u64,
+    ) -> Self {
+        Self {
+            element,
+            length,
+            requested_size,
+            semantic_size,
+            requested_align,
+        }
+    }
+
+    #[must_use]
+    pub fn element(&self) -> Type {
+        self.element
+    }
+
+    #[must_use]
+    pub fn requested_align(&self) -> u64 {
+        self.requested_align
+    }
+
+    #[must_use]
+    pub fn semantic_element_stride(&self) -> Option<u64> {
+        (self.length != 0 && self.semantic_size % self.length == 0)
+            .then_some(self.semantic_size / self.length)
+    }
+}
+
+impl RelocateValue for FixedArrayLayout {
+    type Output = Self;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self::Output {
+        Self {
+            element: destination.translate_type(ctx, self.element),
+            length: self.length,
+            requested_size: self.requested_size,
+            semantic_size: self.semantic_size,
+            requested_align: self.requested_align,
+        }
+    }
+}
+
 #[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
 pub struct ClassDef {
     name: Interned<IString>,
@@ -705,6 +779,9 @@ pub struct ClassDef {
     /// postcard-serialized `.bc` format (the same fingerprint trap as `generic_names`/
     /// `properties` above — rebuild dylib+linker together and clean consumers).
     custom_attributes: Vec<CustomAttrDef>,
+    /// Provenance for a synthetic inline fixed array. This is serialized so layout validation is
+    /// performed only after all codegen shards and dependency artifacts have been merged.
+    fixed_array_layout: Option<FixedArrayLayout>,
 }
 
 /// One constructor-argument or named-argument value inside a `CustomAttribute` blob (§II.23.3).
@@ -1002,6 +1079,7 @@ impl RelocateValue for ClassDef {
             generic_names,
             properties,
             custom_attributes,
+            fixed_array_layout,
         } = self;
         let definition = Self {
             name: ctx.string(destination, name),
@@ -1049,6 +1127,7 @@ impl RelocateValue for ClassDef {
                 .into_iter()
                 .map(|attribute| attribute.relocate(ctx, destination))
                 .collect(),
+            fixed_array_layout: fixed_array_layout.map(|layout| layout.relocate(ctx, destination)),
         };
         RelocatedClassDef {
             definition,
@@ -1086,7 +1165,16 @@ impl ClassDef {
             // And for each custom attribute's TYPE (pulls a third-party attribute assembly, e.g.
             // `Microsoft.AspNetCore.Mvc`, into `.assembly extern` — same CS0012-avoidance
             // reasoning as `implements`/events/properties above).
-            .chain(self.custom_attributes.iter().map(|a| Type::ClassRef(a.attr_type())))
+            .chain(
+                self.custom_attributes
+                    .iter()
+                    .map(|a| Type::ClassRef(a.attr_type())),
+            )
+            .chain(
+                self.fixed_array_layout
+                    .iter()
+                    .map(FixedArrayLayout::element),
+            )
     }
     #[allow(clippy::too_many_arguments)]
     #[must_use]
@@ -1122,7 +1210,25 @@ impl ClassDef {
             generic_names: vec![],
             properties: vec![],
             custom_attributes: vec![],
+            fixed_array_layout: None,
         }
+    }
+
+    /// Marks this definition as the synthetic storage class for one Rust fixed-array request.
+    #[must_use]
+    pub fn with_fixed_array_layout(mut self, layout: FixedArrayLayout) -> Self {
+        assert!(self.is_valuetype, "a fixed array must be a value type");
+        assert!(
+            self.fixed_array_layout.is_none(),
+            "fixed-array layout already set"
+        );
+        self.fixed_array_layout = Some(layout);
+        self
+    }
+
+    #[must_use]
+    pub fn fixed_array_layout(&self) -> Option<&FixedArrayLayout> {
+        self.fixed_array_layout.as_ref()
     }
 
     /// Marks the `is_valuetype` this `ClassDef` was constructed with as AUTHORITATIVE (see the
@@ -1212,7 +1318,11 @@ impl ClassDef {
     /// assemblies at link time; this closes the same gap for the same-assembly,
     /// multiple-comptime-entrypoint case.
     pub fn add_event(&mut self, ev: EventDef) {
-        if !self.events.iter().any(|existing| existing.name() == ev.name()) {
+        if !self
+            .events
+            .iter()
+            .any(|existing| existing.name() == ev.name())
+        {
             self.events.push(ev);
         }
     }
@@ -1231,7 +1341,11 @@ impl ClassDef {
     /// multiple-comptime-entrypoint class must not accumulate two same-named `Property` rows just
     /// because two entrypoints happened to both declare one.
     pub fn add_property(&mut self, prop: PropertyDef) {
-        if !self.properties.iter().any(|existing| existing.name() == prop.name()) {
+        if !self
+            .properties
+            .iter()
+            .any(|existing| existing.name() == prop.name())
+        {
             self.properties.push(prop);
         }
     }
@@ -1461,14 +1575,27 @@ impl ClassDef {
 
         // Check valuetype matches
         assert_eq!(self.is_valuetype(), translated.is_valuetype());
+        self.is_valuetype_authoritative |= translated.is_valuetype_authoritative;
         // Check generic count matches
         assert_eq!(self.generics(), translated.generics());
         // Check declared generic-parameter names match (interned in the SAME assembly by the
         // time merge runs — `asm_link::translate_class_def` re-interns them before merging, so
         // a missed translation site fails THIS assert loudly instead of silently dropping rows).
         assert_eq!(self.generic_names(), translated.generic_names());
-        // Check inheretence matches
-        assert_eq!(self.extends(), translated.extends());
+        // A partial/re-opening comptime entrypoint carries `extends = None` to mean "no opinion";
+        // the authoritative `#[dotnet_class]` shard carries the real base. Mono-item/shard order is
+        // not stable, so merge this optional metadata symmetrically. Two concrete, different bases
+        // are a genuine type-identity conflict and must still fail loudly.
+        match (self.extends, translated.extends) {
+            (None, Some(incoming)) => self.extends = Some(incoming),
+            (Some(existing), Some(incoming)) => assert_eq!(
+                existing, incoming,
+                "class base differs across codegen shards: class={:?}, existing_base={existing:?}, \
+                 incoming_base={incoming:?}",
+                self.name
+            ),
+            (None, None) | (Some(_), None) => {}
+        }
         // Check interface-ness matches (a class re-opened by several entrypoints must agree on
         // whether it's a genuine ECMA-335 interface `TypeDef` — see `with_interface`'s doc).
         assert_eq!(self.is_interface(), translated.is_interface());
@@ -1481,7 +1608,11 @@ impl ClassDef {
 
         // Union the declared events, deduplicating by name (same reasoning as `implements` above).
         for ev in translated.events() {
-            if !self.events.iter().any(|existing| existing.name() == ev.name()) {
+            if !self
+                .events
+                .iter()
+                .any(|existing| existing.name() == ev.name())
+            {
                 self.events.push(ev.clone());
             }
         }
@@ -1502,6 +1633,56 @@ impl ClassDef {
         for attr in translated.custom_attributes() {
             self.add_custom_attribute(attr.clone());
         }
+
+        // A codegen shard may first encounter a type only as a method owner and a later shard may
+        // carry its actual instance-field definition. Dropping the latter produces a structurally
+        // valid TypeDef with methods that reference fields it does not declare (and ultimately a
+        // MissingFieldException). Merge instance fields by their semantic identity, while treating
+        // a same-named field with a different type or offset as a hard cross-shard inconsistency.
+        for field @ (field_tpe, field_name, field_offset) in translated.fields() {
+            if let Some(existing) = self
+                .fields
+                .iter()
+                .find(|(_, existing_name, _)| existing_name == field_name)
+            {
+                assert_eq!(
+                    existing, field,
+                    "class field differs across codegen shards: name={field_name:?}, \
+                     incoming_type={field_tpe:?}, incoming_offset={field_offset:?}"
+                );
+            } else {
+                self.fields.push(*field);
+            }
+        }
+
+        // Re-opened/partial definitions may omit physical-layout metadata. Preserve the concrete
+        // value from whichever shard has it, but never silently reconcile contradictory layouts.
+        fn merge_optional_layout<T: Copy + Eq + std::fmt::Debug>(
+            current: &mut Option<T>,
+            incoming: Option<T>,
+            label: &str,
+        ) {
+            match (*current, incoming) {
+                (None, Some(value)) => *current = Some(value),
+                (Some(left), Some(right)) => {
+                    assert_eq!(left, right, "class {label} differs across codegen shards")
+                }
+                _ => {}
+            }
+        }
+        merge_optional_layout(&mut self.explict_size, translated.explict_size, "size");
+        merge_optional_layout(&mut self.align, translated.align, "alignment");
+        match (&self.fixed_array_layout, &translated.fixed_array_layout) {
+            (None, Some(incoming)) => self.fixed_array_layout = Some(incoming.clone()),
+            (Some(existing), Some(incoming)) => assert_eq!(
+                existing, incoming,
+                "fixed-array provenance differs across codegen shards"
+            ),
+            (None, None) | (Some(_), None) => {}
+        }
+        // `false` is the conservative truth: if any shard describes overlapping storage, the
+        // merged class must continue to receive the stricter GC/layout validation.
+        self.has_nonveralpping_layout &= translated.has_nonveralpping_layout;
 
         // Merge the static fields, removing duplicates
         self.static_fields_mut()
@@ -1809,6 +1990,203 @@ fn merge_defs() {
     );
 
     def.clone().merge_defs(def);
+}
+
+#[test]
+fn merge_defs_preserves_instance_fields_from_partial_shards() {
+    let mut asm = Assembly::default();
+    let name = asm.alloc_string("ShardOwned");
+    let field_name = asm.alloc_string("payload");
+    let mut owner_only = ClassDef::new(
+        name,
+        true,
+        0,
+        None,
+        vec![],
+        vec![],
+        Access::Public,
+        None,
+        None,
+        true,
+    );
+    let with_layout = ClassDef::new(
+        name,
+        true,
+        0,
+        None,
+        vec![(Type::Int(crate::Int::I32), field_name, Some(4))],
+        vec![],
+        Access::Public,
+        NonZeroU32::new(8),
+        NonZeroU32::new(4),
+        false,
+    );
+
+    owner_only.merge_defs(with_layout);
+
+    assert_eq!(
+        owner_only.fields(),
+        &[(Type::Int(crate::Int::I32), field_name, Some(4))]
+    );
+    assert_eq!(owner_only.explict_size(), NonZeroU32::new(8));
+    assert_eq!(owner_only.align(), NonZeroU32::new(4));
+    assert!(!owner_only.has_nonveralpping_layout());
+}
+
+#[test]
+fn merge_defs_adopts_concrete_base_from_incoming_partial_shard() {
+    let mut asm = Assembly::default();
+    let name = asm.alloc_string("ShardBaseAdoption");
+    let base_name = asm.alloc_string("ManagedBase");
+    let base = asm.alloc_class_ref(ClassRef::new(base_name, None, false, [].into()));
+    let mut no_opinion = ClassDef::new(
+        name,
+        false,
+        0,
+        None,
+        vec![],
+        vec![],
+        Access::Public,
+        None,
+        None,
+        true,
+    );
+    let authoritative = ClassDef::new(
+        name,
+        false,
+        0,
+        Some(base),
+        vec![],
+        vec![],
+        Access::Public,
+        None,
+        None,
+        true,
+    );
+
+    no_opinion.merge_defs(authoritative);
+
+    assert_eq!(no_opinion.extends(), Some(base));
+}
+
+#[test]
+fn merge_defs_preserves_concrete_base_when_incoming_shard_has_no_opinion() {
+    let mut asm = Assembly::default();
+    let name = asm.alloc_string("ShardBasePreservation");
+    let base_name = asm.alloc_string("ManagedBase");
+    let base = asm.alloc_class_ref(ClassRef::new(base_name, None, false, [].into()));
+    let mut authoritative = ClassDef::new(
+        name,
+        false,
+        0,
+        Some(base),
+        vec![],
+        vec![],
+        Access::Public,
+        None,
+        None,
+        true,
+    );
+    let no_opinion = ClassDef::new(
+        name,
+        false,
+        0,
+        None,
+        vec![],
+        vec![],
+        Access::Public,
+        None,
+        None,
+        true,
+    );
+
+    authoritative.merge_defs(no_opinion);
+
+    assert_eq!(authoritative.extends(), Some(base));
+}
+
+#[test]
+#[should_panic(expected = "class base differs across codegen shards")]
+fn merge_defs_rejects_conflicting_concrete_bases() {
+    let mut asm = Assembly::default();
+    let name = asm.alloc_string("ShardBaseConflict");
+    let left_name = asm.alloc_string("LeftBase");
+    let right_name = asm.alloc_string("RightBase");
+    let left_base = asm.alloc_class_ref(ClassRef::new(left_name, None, false, [].into()));
+    let right_base = asm.alloc_class_ref(ClassRef::new(right_name, None, false, [].into()));
+    let mut left = ClassDef::new(
+        name,
+        false,
+        0,
+        Some(left_base),
+        vec![],
+        vec![],
+        Access::Public,
+        None,
+        None,
+        true,
+    );
+    let right = ClassDef::new(
+        name,
+        false,
+        0,
+        Some(right_base),
+        vec![],
+        vec![],
+        Access::Public,
+        None,
+        None,
+        true,
+    );
+
+    left.merge_defs(right);
+}
+
+#[test]
+fn fixed_array_identity_includes_physical_storage_layout() {
+    let mut asm = Assembly::default();
+    let element = Type::Int(crate::Int::U32);
+    let ordinary = ClassRef::fixed_array_with_layout(element, 32, 128, 4, &mut asm);
+    let ordinary_again = ClassRef::fixed_array_with_layout(element, 32, 128, 4, &mut asm);
+    let over_aligned = ClassRef::fixed_array_with_layout(element, 32, 128, 128, &mut asm);
+
+    assert_eq!(ordinary, ordinary_again);
+    assert_ne!(ordinary, over_aligned);
+    assert_ne!(asm[ordinary].name(), asm[over_aligned].name());
+}
+
+#[test]
+#[should_panic(expected = "class field differs across codegen shards")]
+fn merge_defs_rejects_conflicting_instance_fields() {
+    let mut asm = Assembly::default();
+    let name = asm.alloc_string("ShardConflict");
+    let field_name = asm.alloc_string("payload");
+    let mut left = ClassDef::new(
+        name,
+        true,
+        0,
+        None,
+        vec![(Type::Int(crate::Int::I32), field_name, Some(0))],
+        vec![],
+        Access::Public,
+        NonZeroU32::new(4),
+        NonZeroU32::new(4),
+        true,
+    );
+    let right = ClassDef::new(
+        name,
+        true,
+        0,
+        None,
+        vec![(Type::Int(crate::Int::I64), field_name, Some(0))],
+        vec![],
+        Access::Public,
+        NonZeroU32::new(4),
+        NonZeroU32::new(4),
+        true,
+    );
+
+    left.merge_defs(right);
 }
 #[test]
 #[should_panic]

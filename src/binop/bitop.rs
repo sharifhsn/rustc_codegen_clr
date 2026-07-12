@@ -1,10 +1,10 @@
 use crate::assembly::MethodCompileCtx;
+use crate::r#type::GetTypeExt;
 use cilly::{
-    cilnode::{IsPure, MethodKind},
     BinOp, Interned, Type,
+    cilnode::{IsPure, MethodKind},
     {ClassRef, Int, MethodRef},
 };
-use crate::r#type::GetTypeExt;
 use rustc_middle::span_bug;
 use rustc_middle::ty::{IntTy, Ty, TyKind, UintTy};
 

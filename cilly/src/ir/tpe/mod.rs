@@ -3,7 +3,7 @@ use std::num::NonZeroU8;
 use serde::{Deserialize, Serialize};
 use simd::SIMDVector;
 
-use super::{bimap::Interned, Assembly, ClassRef, Float, FnSig, Int};
+use super::{Assembly, ClassRef, Float, FnSig, Int, bimap::Interned};
 
 pub mod float;
 pub mod int;
@@ -306,6 +306,16 @@ impl Type {
                     && cref.asm().map(|s| asm[s].as_ref()) == Some("System.Runtime")
                     && &asm[cref.name()] == "System.UInt128"
             }
+            // `SIMDVector` is cilly's compact semantic spelling of the exact same ECMA-335 value
+            // type exported as `System.Runtime.Intrinsics.Vector{bits}<T>`. BCL static methods use
+            // an explicit ClassRef (often with a call-generic `!!0` element), while Rust locals use
+            // SIMDVector; treating them as unrelated rejects otherwise byte-identical calls such
+            // as `Vector256.Multiply<float>`. Keep the equivalence narrowly scoped to the canonical
+            // BCL assembly/name/value-type/one-generic shape.
+            (Type::SIMDVector(vector), Type::ClassRef(cref))
+            | (Type::ClassRef(cref), Type::SIMDVector(vector)) => {
+                Self::simd_class_eq(vector, cref, asm)
+            }
             (Type::Int(Int::U16 | Int::I16), Type::PlatformChar) => true,
             // A pointer/byref whose pointee is a generic marker `!N` is mutually assignable with a
             // pointer/byref of the concrete type `!N` binds to — e.g. `Span<T>.get_Item(int)` returns
@@ -332,7 +342,9 @@ impl Type {
             // name-based comparison flags them as distinct. We accept them as mutually assignable
             // *only* when both are FatPtr-named valuetypes AND their concrete field layouts match —
             // so this can never over-permit a genuinely different type (guarded by the layout check).
-            (Type::ClassRef(lhs), Type::ClassRef(rhs)) if Self::fat_ptr_layout_eq(lhs, rhs, asm) => {
+            (Type::ClassRef(lhs), Type::ClassRef(rhs))
+                if Self::fat_ptr_layout_eq(lhs, rhs, asm) =>
+            {
                 true
             }
             // A generic parameter `!N` (class) / `!!N` (method) is mutually assignable with any
@@ -371,7 +383,9 @@ impl Type {
                 if same_open {
                     let lg: Vec<Type> = lref.generics().to_vec();
                     let rg: Vec<Type> = rref.generics().to_vec();
-                    lg.iter().zip(rg.iter()).all(|(a, b)| a.is_assignable_to(*b, asm))
+                    lg.iter()
+                        .zip(rg.iter())
+                        .all(|(a, b)| a.is_assignable_to(*b, asm))
                 } else {
                     false
                 }
@@ -379,15 +393,25 @@ impl Type {
             _ => false,
         }
     }
+
+    fn simd_class_eq(vector: SIMDVector, class: Interned<ClassRef>, asm: &Assembly) -> bool {
+        let class = asm.class_ref(class);
+        if !class.is_valuetype()
+            || class.asm().map(|name| asm[name].as_ref()) != Some("System.Runtime.Intrinsics")
+            || &asm[class.name()]
+                != format!("System.Runtime.Intrinsics.Vector{}", vector.bits()).as_str()
+            || class.generics().len() != 1
+        {
+            return false;
+        }
+        let element: Type = vector.elem().into();
+        class.generics()[0] == element || matches!(class.generics()[0], Type::PlatformGeneric(_, _))
+    }
     /// Returns `true` iff `lhs` and `rhs` are both `FatPtr<…>` value-type classes with identical
     /// concrete layout (field types/names/offsets, explicit size, align). See the call site in
     /// [`Type::is_assignable_to`] for the soundness argument. Narrowly scoped to the `FatPtr` family
     /// so it cannot mask a real type mismatch between unrelated structs that merely share a size.
-    fn fat_ptr_layout_eq(
-        lhs: Interned<ClassRef>,
-        rhs: Interned<ClassRef>,
-        asm: &Assembly,
-    ) -> bool {
+    fn fat_ptr_layout_eq(lhs: Interned<ClassRef>, rhs: Interned<ClassRef>, asm: &Assembly) -> bool {
         let lref = asm.class_ref(lhs);
         let rref = asm.class_ref(rhs);
         // Both must be value-type, generic-free, locally-defined `FatPtr…` classes.
@@ -465,6 +489,28 @@ impl Type {
 }
 
 #[cfg(test)]
+mod simd_assignability_tests {
+    use super::*;
+
+    #[test]
+    fn semantic_simd_type_matches_its_exact_bcl_vector_value_type() {
+        let mut asm = Assembly::default();
+        let vector = SIMDVector::new(Float::F32.into(), 8);
+        let concrete = vector.class(&mut asm);
+        assert!(Type::SIMDVector(vector).is_assignable_to(Type::ClassRef(concrete), &asm));
+        assert!(Type::ClassRef(concrete).is_assignable_to(Type::SIMDVector(vector), &asm));
+
+        let mut generic = asm[concrete].clone();
+        generic.set_generics(vec![Type::PlatformGeneric(0, GenericKind::CallGeneric)]);
+        let generic = asm.alloc_class_ref(generic);
+        assert!(Type::SIMDVector(vector).is_assignable_to(Type::ClassRef(generic), &asm));
+
+        let wrong_width = SIMDVector::new(Float::F32.into(), 4);
+        assert!(!Type::SIMDVector(wrong_width).is_assignable_to(Type::ClassRef(concrete), &asm));
+    }
+}
+
+#[cfg(test)]
 mod fat_ptr_assignability_tests {
     //! Soundness tests for the `FatPtr` layout-equivalence arm of [`Type::is_assignable_to`]
     //! (Phase P1 of the absolute-correctness plan). Proves the relaxation accepts the proven
@@ -530,10 +576,19 @@ mod fat_ptr_assignability_tests {
         let data = asm.alloc_string(crate::DATA_PTR);
         let meta = asm.alloc_string(crate::METADATA);
         let def = ClassDef::new(
-            name, true, 0, None,
-            vec![(void_ptr, data, Some(0)), (Type::Int(Int::USize), meta, Some(8))],
-            vec![], Access::Public,
-            Some(NonZeroU32::new(16).unwrap()), Some(NonZeroU32::new(8).unwrap()), true,
+            name,
+            true,
+            0,
+            None,
+            vec![
+                (void_ptr, data, Some(0)),
+                (Type::Int(Int::USize), meta, Some(8)),
+            ],
+            vec![],
+            Access::Public,
+            Some(NonZeroU32::new(16).unwrap()),
+            Some(NonZeroU32::new(8).unwrap()),
+            true,
         );
         asm.class_def(def).unwrap();
         assert!(

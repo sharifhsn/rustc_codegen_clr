@@ -1,11 +1,12 @@
 use crate::{
-    asm::MissingMethodPatcher, bimap::Interned, tpe::simd::SIMDVector, Assembly, BasicBlock,
-    CILNode, CILRoot, MethodImpl, MethodRef, Type,
+    Assembly, BasicBlock, CILNode, CILRoot, MethodImpl, MethodRef, Type, asm::MissingMethodPatcher,
+    bimap::Interned, tpe::simd::SIMDVector,
 };
 mod eq;
 use eq::*;
 mod binop;
 use binop::*;
+mod bitmask;
 mod tail;
 fn dotnet_vec_cast(
     src: Interned<CILNode>,
@@ -16,9 +17,43 @@ fn dotnet_vec_cast(
     if src_type == target_type {
         return src;
     }
-    eprintln!("Can't cast {src_type:?} -> {target_type:?}");
-    let _ = asm;
-    src
+    assert_eq!(
+        src_type.bits(),
+        target_type.bits(),
+        "SIMD mask reinterpret must preserve the total vector width"
+    );
+
+    // BCL comparisons return `VectorN<TInput>`, while Rust's SIMD comparison result may use a
+    // signedness-different mask element (for example `u8x16 -> i8x16`). These are identical bits,
+    // not a numeric per-lane conversion. Route the reinterpret through the canonical transmute
+    // helper so the IR and final verifier both see the destination vector type explicitly.
+    asm.transmute_on_stack(
+        Type::SIMDVector(src_type),
+        Type::SIMDVector(target_type),
+        src,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Int;
+
+    #[test]
+    fn signedness_only_vector_cast_is_an_explicit_reinterpret() {
+        let mut asm = Assembly::default();
+        let src_ty = SIMDVector::new(Int::U8.into(), 16);
+        let dst_ty = SIMDVector::new(Int::I8.into(), 16);
+        let src = asm.alloc_node(CILNode::LdArg(0));
+
+        let cast = dotnet_vec_cast(src, src_ty, dst_ty, &mut asm);
+        let CILNode::Call(call) = &asm[cast] else {
+            panic!("SIMD signedness reinterpret did not use the typed transmute helper");
+        };
+        let sig = asm[asm[call.0].sig()].clone();
+        assert_eq!(*sig.output(), Type::SIMDVector(dst_ty));
+        assert_eq!(sig.inputs(), &[Type::SIMDVector(src_ty)]);
+    }
 }
 
 fn simd_ones_compliment(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
@@ -232,6 +267,7 @@ fn simd_allset(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
 }
 
 pub fn simd(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    bitmask::register_most_significant_bits(asm, patcher);
     // Comparisons via the BCL `Vector` statics (all-ones masks, hardware SIMD).
     simd_eq(asm, patcher);
     simd_lt(asm, patcher);

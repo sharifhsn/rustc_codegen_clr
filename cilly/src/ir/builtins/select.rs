@@ -1,6 +1,6 @@
 use crate::{
-    asm::MissingMethodPatcher, cilroot::BranchCond, Assembly, BasicBlock, CILNode, CILRoot, Int,
-    MethodImpl,
+    Assembly, BasicBlock, CILNode, CILRoot, Int, MethodImpl, asm::MissingMethodPatcher,
+    cilroot::BranchCond,
 };
 
 fn generate_select(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, int: Int) {

@@ -1,25 +1,26 @@
-use crate::{
-    assembly::MethodCompileCtx,
-    interop::AssemblyRef,
-    utilis::{
-        classify_magic_fn, garg_to_bool, MagicFn, CTOR_FN_NAME, MANAGED_CALL_FN_NAME,
-        MANAGED_CALL_VIRT_FN_NAME,
-    },
-};
-use cilly::{
-    cilnode::{ExtendKind, IsPure, MethodKind},
-    BinOp, ClassRef, Const, FieldDesc, FnSig, IString, Int, Interned, IntoAsmIndex,
-};
-use cilly::tpe::GenericKind;
-use cilly::{MethodRef, Type};
 use crate::call_info::CallInfo;
 use crate::fn_ctx::fn_name;
 use crate::operand::{handle_operand, operand_address};
 use crate::place::place_set;
 use crate::r#type::{
-    utilis::{garg_to_usize, garg_to_string},
     GetTypeExt,
+    utilis::{garg_to_string, garg_to_usize},
 };
+use crate::{
+    assembly::MethodCompileCtx,
+    interop::AssemblyRef,
+    utilis::{
+        CTOR_FN_NAME, MANAGED_CALL_FN_NAME, MANAGED_CALL_VIRT_FN_NAME, MagicFn, classify_magic_fn,
+        garg_to_bool,
+    },
+};
+use cilly::tpe::GenericKind;
+use cilly::{
+    BinOp, CILNode, CILRoot, ClassRef, Const, FieldDesc, FnSig, IString, Int, Interned,
+    IntoAsmIndex,
+    cilnode::{ExtendKind, IsPure, MethodKind, PtrCastRes},
+};
+use cilly::{MethodRef, Type};
 use rustc_middle::ty::InstanceKind;
 use rustc_middle::{
     mir::{Operand, Place},
@@ -328,16 +329,20 @@ fn check_generic_marker<'tcx>(
             };
             let inner_sig = ctx[sig_inner];
             let inner_rt = ctx[rt_inner];
-            check_generic_marker(inner_sig, inner_rt, class_generics, method_generics, role, ctx);
+            check_generic_marker(
+                inner_sig,
+                inner_rt,
+                class_generics,
+                method_generics,
+                role,
+                ctx,
+            );
         }
         _ => {}
     }
 }
 /// Lower a magic-fn type-parameter `subst_ref[i]` (always a real type) to its .NET type.
-fn garg_ty_to_type<'tcx>(
-    garg: GenericArg<'tcx>,
-    ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> Type {
+fn garg_ty_to_type<'tcx>(garg: GenericArg<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Type {
     let ty = ctx.monomorphize(
         garg.as_type()
             .expect("WF-9 generic interop: expected a type parameter"),
@@ -470,11 +475,25 @@ fn call_gmethod<'tcx>(
 
     // Loud-fail on an inconsistent binding — `!N` against class generics, `!!N` against method generics.
     let ret_ty = garg_ty_to_type(subst_ref[8], ctx);
-    check_generic_marker(output, ret_ty, &class_generics, &method_generics, "return", ctx);
+    check_generic_marker(
+        output,
+        ret_ty,
+        &class_generics,
+        &method_generics,
+        "return",
+        ctx,
+    );
     let recv_offset = if kind == 0 { 0 } else { 1 };
     for (j, &sig_in) in explicit_inputs.iter().enumerate() {
         let arg_ty = garg_ty_to_type(subst_ref[9 + recv_offset + j], ctx);
-        check_generic_marker(sig_in, arg_ty, &class_generics, &method_generics, "argument", ctx);
+        check_generic_marker(
+            sig_in,
+            arg_ty,
+            &class_generics,
+            &method_generics,
+            "argument",
+            ctx,
+        );
     }
 
     let this = ctx.alloc_class_ref(ClassRef::new(
@@ -673,10 +692,7 @@ fn delegate_from_fnptr<'tcx>(
             ctor_arg,
         ))));
         let ctor_ret = ctx.alloc_root(cilly::CILRoot::VoidRet);
-        let ctor_sig = ctx.sig(
-            [Type::ClassRef(shim_cref), shim_fn_ptr_ty],
-            Type::Void,
-        );
+        let ctor_sig = ctx.sig([Type::ClassRef(shim_cref), shim_fn_ptr_ty], Type::Void);
         ctx.new_method(MethodDef::new(
             Access::Public,
             shim_def,
@@ -768,7 +784,10 @@ fn delegate_from_fnptr<'tcx>(
     let shim_invoke = ctx.alloc_methodref(shim_invoke);
     let invoke_ftn = ctx.ld_ftn(shim_invoke);
     // `ldftn` yields `native int`; the delegate `.ctor`'s second param is `native int`. Normalise.
-    let invoke_ftn = ctx.alloc_node(cilly::CILNode::PtrCast(invoke_ftn, Box::new(PtrCastRes::ISize)));
+    let invoke_ftn = ctx.alloc_node(cilly::CILNode::PtrCast(
+        invoke_ftn,
+        Box::new(PtrCastRes::ISize),
+    ));
 
     // newobj DelegateClass<ClassGenerics..>::.ctor(object, native int)
     let delegate_cref = ctx.alloc_class_ref(ClassRef::new(
@@ -980,7 +999,10 @@ fn delegate_from_closure<'tcx>(
     );
     let shim_invoke = ctx.alloc_methodref(shim_invoke);
     let invoke_ftn = ctx.ld_ftn(shim_invoke);
-    let invoke_ftn = ctx.alloc_node(cilly::CILNode::PtrCast(invoke_ftn, Box::new(PtrCastRes::ISize)));
+    let invoke_ftn = ctx.alloc_node(cilly::CILNode::PtrCast(
+        invoke_ftn,
+        Box::new(PtrCastRes::ISize),
+    ));
 
     let delegate_cref = ctx.alloc_class_ref(ClassRef::new(
         class_name,
@@ -1160,7 +1182,8 @@ pub fn call_inner<'tcx>(
 
         let mut fat_ptr_address = operand_address(&args[0].node, ctx);
         let fat_ptr_dyn = ctx.alloc_string("FatPtrn3Dyn");
-        let fat_ptr_dyn_cref = ctx.alloc_class_ref(ClassRef::new(fat_ptr_dyn, None, true, [].into()));
+        let fat_ptr_dyn_cref =
+            ctx.alloc_class_ref(ClassRef::new(fat_ptr_dyn, None, true, [].into()));
         // The `m`/METADATA and `d`/DATA_PTR loads below read from the canonical erased fat-ptr class
         // `FatPtrn3Dyn`. When the virtual-call receiver is a `#[repr(transparent)]` ADT over the fat
         // pointer (e.g. `Pin<&mut dyn Future>`), `operand_address` yields a pointer whose pointee class
@@ -1181,8 +1204,8 @@ pub fn call_inner<'tcx>(
         let vtable_ptr_field_desc = ctx.alloc_field(vtable_ptr_field_desc);
         let vtable_ptr = ctx.ld_field(fat_ptr_address, vtable_ptr_field_desc);
 
-        let vtable_index = ctx
-            .alloc_node(i32::try_from(fn_idx).expect("More tahn 2^31 functions in a vtable!"));
+        let vtable_index =
+            ctx.alloc_node(i32::try_from(fn_idx).expect("More tahn 2^31 functions in a vtable!"));
         let size = ctx.size_of(Int::ISize).into_idx(ctx);
         let vtable_offset = ctx.biop(vtable_index, size, BinOp::Mul);
         let vtable_offset = ctx.int_cast(vtable_offset, Int::USize, ExtendKind::ZeroExtend);
@@ -1434,6 +1457,45 @@ pub fn call_inner<'tcx>(
                 let value = handle_operand(&args[0].node, ctx);
                 let node = ctx.box_value(value, tpe);
                 return vec![place_set(destination, node, ctx)];
+            }
+            MagicFn::ManagedBoxNew => {
+                let tpe = ctx.type_from_cache(instance.args[0].as_type().unwrap());
+                let tpe = ctx.alloc_type(tpe);
+                let value = handle_operand(&args[0].node, ctx);
+                let boxed = ctx.box_value(value, tpe);
+                let handle = ctx[boxed].clone().ref_to_handle(ctx);
+                let handle = ctx.alloc_node(handle);
+                let void = ctx.alloc_type(Type::Void);
+                let handle =
+                    ctx.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::Ptr(void))));
+                return vec![place_set(destination, handle, ctx)];
+            }
+            MagicFn::ManagedBoxTake => {
+                let tpe = ctx.type_from_cache(instance.args[0].as_type().unwrap());
+                let tpe = ctx.alloc_type(tpe);
+                let handle = handle_operand(&args[0].node, ctx);
+                let handle = ctx.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::ISize)));
+                let main_module = *ctx.main_module();
+                let handle_to_obj_name = ctx.alloc_string("handle_to_obj");
+                let handle_to_obj = ctx.class_ref(main_module).clone().static_mref(
+                    &[Type::Int(Int::ISize)],
+                    Type::PlatformObject,
+                    handle_to_obj_name,
+                    ctx,
+                );
+                let object = ctx.alloc_node(CILNode::call(handle_to_obj, [handle]));
+                let value = ctx.unbox_any(object, tpe);
+                let store = place_set(destination, value, ctx);
+
+                let handle_free_name = ctx.alloc_string("handle_free");
+                let handle_free = ctx.class_ref(main_module).clone().static_mref(
+                    &[Type::Int(Int::ISize)],
+                    Type::Void,
+                    handle_free_name,
+                    ctx,
+                );
+                let free = ctx.alloc_root(CILRoot::call(handle_free, [handle]));
+                return vec![store, free];
             }
             MagicFn::LdElemRef => {
                 assert!(

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bimap::Interned;
 
-use super::super::{cilnode::MethodKind, Assembly, CILNode, ClassRef, Const, MethodRef, Type};
+use super::super::{Assembly, CILNode, ClassRef, Const, MethodRef, Type, cilnode::MethodKind};
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Int {
@@ -34,11 +34,7 @@ impl Int {
             16 => Self::U128,
             _ => panic!("Unknown int size {size}"),
         };
-        if sign {
-            res.as_signed()
-        } else {
-            res
-        }
+        if sign { res.as_signed() } else { res }
     }
     /// Returns a reference to a class representing this type.
     pub fn class(&self, asm: &mut Assembly) -> Interned<ClassRef> {

@@ -40,9 +40,10 @@ pub mod libc_fns;
 
 pub mod artifact;
 pub use artifact::{
-    decode_assembly_artifact, ArtifactAbiConfig, ArtifactAbiConfigCaptureError,
-    ArtifactAbiConfigDifference, ArtifactAbiConfigMismatch, ArtifactDecodeError, ArtifactFormat, AssemblyArtifact, DecodedAssemblyArtifact,
-    DotnetRuntime, OutputTarget, ASSEMBLY_ARTIFACT_MAGIC, ASSEMBLY_ARTIFACT_VERSION,
+    ASSEMBLY_ARTIFACT_MAGIC, ASSEMBLY_ARTIFACT_VERSION, ArtifactAbiConfig,
+    ArtifactAbiConfigCaptureError, ArtifactAbiConfigDifference, ArtifactAbiConfigMismatch,
+    ArtifactDecodeError, ArtifactFormat, AssemblyArtifact, DecodedAssemblyArtifact, DotnetRuntime,
+    OutputTarget, decode_assembly_artifact,
 };
 pub mod ir;
 pub mod utilis;

@@ -1,12 +1,12 @@
 use fxhash::FxHashSet;
 
-use crate::{bimap::IntoBiMapIndex, IString};
+use crate::{IString, bimap::IntoBiMapIndex};
 
 use super::{
+    Assembly, BinOp, CILNode, CILRoot, ClassRef, FieldDesc, FnSig, Int, Type,
     bimap::Interned,
     cilnode::{PtrCastRes, UnOp},
     method::LocalDef,
-    Assembly, BinOp, CILNode, CILRoot, ClassRef, FieldDesc, FnSig, Int, Type,
 };
 #[derive(Debug)]
 /// Signals that a piece of CIL is not valid.
@@ -242,10 +242,16 @@ pub fn typecheck_err_to_string(
         output
     });
     let root_string = root.display(asm, sig, locals);
-    match root.typecheck(sig, locals, asm){
-        Ok(_)=> format!("digraph G{{edge [dir=\"back\"];\n{nodes} r{root_idx}  [label = \"{root_string}\" color = \"green\"] r{root_idx} ->{root_connections}}}",root_idx = root_idx.as_bimap_index()),
-        Err(err)=> format!("digraph G{{edge [dir=\"back\"];\\n{nodes} r{root_idx}  [label = \"{root_string}\n{err:?}\" color = \"red\"] r{root_idx} ->{root_connections}}}",root_idx = root_idx.as_bimap_index()),
-   }
+    match root.typecheck(sig, locals, asm) {
+        Ok(_) => format!(
+            "digraph G{{edge [dir=\"back\"];\n{nodes} r{root_idx}  [label = \"{root_string}\" color = \"green\"] r{root_idx} ->{root_connections}}}",
+            root_idx = root_idx.as_bimap_index()
+        ),
+        Err(err) => format!(
+            "digraph G{{edge [dir=\"back\"];\\n{nodes} r{root_idx}  [label = \"{root_string}\n{err:?}\" color = \"red\"] r{root_idx} ->{root_connections}}}",
+            root_idx = root_idx.as_bimap_index()
+        ),
+    }
 }
 /// Display an error during typechecking root `root_idx`.
 pub fn display_typecheck_err(
@@ -311,7 +317,8 @@ pub fn display_node(
 fn is_erased_ptr_sink(arg: Type, expected: Type, asm: &Assembly) -> bool {
     // Direct case: expected is an erased `*u8`/`*void` sink, arg is any pointer/ref.
     if let Some(expected_pointee) = expected.pointed_to().map(|t| asm[t]) {
-        if matches!(expected_pointee, Type::Int(Int::U8) | Type::Void) && arg.pointed_to().is_some() {
+        if matches!(expected_pointee, Type::Int(Int::U8) | Type::Void) && arg.pointed_to().is_some()
+        {
             return true;
         }
         // Atomic word-address pun (Class-D / WF-TC): the `atomic_{add,or,and,xor,…}_{usize,isize}`
@@ -344,9 +351,7 @@ fn is_erased_ptr_sink(arg: Type, expected: Type, asm: &Assembly) -> bool {
         if arg_sig.inputs().len() != exp_sig.inputs().len() {
             return false;
         }
-        let pos_ok = |a: Type, e: Type| -> bool {
-            a == e || is_erased_ptr_sink(a, e, asm)
-        };
+        let pos_ok = |a: Type, e: Type| -> bool { a == e || is_erased_ptr_sink(a, e, asm) };
         let inputs_ok = arg_sig
             .inputs()
             .iter()
@@ -743,13 +748,12 @@ impl CILNode {
                     }),
                 }
             }
-            CILNode::LdLoc(loc) => locals
-                .get(*loc as usize)
-                .map(|local| asm[local.1])
-                .ok_or(TypeCheckError::LocalOutOfRange {
+            CILNode::LdLoc(loc) => locals.get(*loc as usize).map(|local| asm[local.1]).ok_or(
+                TypeCheckError::LocalOutOfRange {
                     local: *loc,
                     locals: locals.len(),
-                }),
+                },
+            ),
             CILNode::LdLocA(loc) => locals
                 .get(*loc as usize)
                 .map(|local| asm.nref(asm[local.1]))
@@ -757,14 +761,12 @@ impl CILNode {
                     local: *loc,
                     locals: locals.len(),
                 }),
-            CILNode::LdArg(arg) => asm[sig]
-                .inputs()
-                .get(*arg as usize)
-                .copied()
-                .ok_or(TypeCheckError::ArgumentOutOfRange {
+            CILNode::LdArg(arg) => asm[sig].inputs().get(*arg as usize).copied().ok_or(
+                TypeCheckError::ArgumentOutOfRange {
                     argument: *arg,
                     inputs: asm[sig].inputs().len(),
-                }),
+                },
+            ),
             CILNode::LdArgA(arg) => asm[sig]
                 .inputs()
                 .get(*arg as usize)
@@ -1162,8 +1164,7 @@ impl CILNode {
                 let len_tpe = asm.get_node(*len).clone().typecheck(sig, locals, asm)?;
                 match len_tpe {
                     Type::Int(Int::I32 | Int::U32 | Int::I64 | Int::USize | Int::ISize) => (),
-                    _ => return Err(TypeCheckError::ArrIndexInvalidType {
-                            index_tpe: len_tpe }),
+                    _ => return Err(TypeCheckError::ArrIndexInvalidType { index_tpe: len_tpe }),
                 }
                 Ok(Type::PlatformArray {
                     elem: *elem,
@@ -1445,8 +1446,11 @@ impl CILRoot {
                 let arr_tpe = asm.get_node(*array).clone().typecheck(sig, locals, asm)?;
                 let index_tpe = asm.get_node(*index).clone().typecheck(sig, locals, asm)?;
                 let value_tpe = asm.get_node(*value).clone().typecheck(sig, locals, asm)?;
-                let Type::PlatformArray { elem: arr_elem, dims,
-                } = arr_tpe else {
+                let Type::PlatformArray {
+                    elem: arr_elem,
+                    dims,
+                } = arr_tpe
+                else {
                     return Err(TypeCheckError::LdLenArgNotArray { got: arr_tpe });
                 };
                 if dims.get() != 1 {
@@ -1517,12 +1521,15 @@ mod tc_tests {
     //!  * deliberately type-broken CIL is still **rejected** (the false-negative audit) — a sound,
     //!    soon-to-be-fatal checker must catch real type errors.
     use super::*;
-    use crate::ir::cilnode::MethodKind;
     use crate::Const;
+    use crate::ir::cilnode::MethodKind;
 
     /// Build a single-local, single-`StLoc` method body and return the typecheck result of that
     /// `StLoc` root. `value` is a node index that has already been allocated in `asm`.
-    fn check_stloc(asm: &mut Assembly, local_ty: Type, value: Interned<CILNode>,
+    fn check_stloc(
+        asm: &mut Assembly,
+        local_ty: Type,
+        value: Interned<CILNode>,
     ) -> Result<(), TypeCheckError> {
         let local_ty = asm.alloc_type(local_ty);
         let locals: Vec<LocalDef> = vec![(None, local_ty)];
@@ -1551,7 +1558,8 @@ mod tc_tests {
     #[test]
     fn stloc_float_into_int_is_rejected() {
         let mut asm = Assembly::default();
-        let f = asm.alloc_node(CILNode::Const(Box::new(Const::F64(super::super::hashable::HashableF64(1.0),
+        let f = asm.alloc_node(CILNode::Const(Box::new(Const::F64(
+            super::super::hashable::HashableF64(1.0),
         ))));
         assert!(
             matches!(
@@ -1660,7 +1668,10 @@ mod tc_tests {
         let callee = asm.new_methodref(*main, "takes_f64", callee_sig, MethodKind::Static, vec![]);
         // Caller passes an i64 const where an f64 is expected.
         let bad_arg = asm.alloc_node(CILNode::Const(Box::new(Const::I64(7))));
-        let call = CILRoot::Call(Box::new((callee, [bad_arg].into(), crate::ir::cilnode::IsPure::NOT,
+        let call = CILRoot::Call(Box::new((
+            callee,
+            [bad_arg].into(),
+            crate::ir::cilnode::IsPure::NOT,
         )));
         let sig = asm.sig([], Type::Void);
         let locals: Vec<LocalDef> = vec![];
@@ -1705,7 +1716,10 @@ mod tc_tests {
         let sig = asm.sig([], Type::Void);
         let locals: Vec<LocalDef> = vec![];
         assert!(
-            asm.get_node(node).clone().typecheck(sig, &locals, &mut asm).is_err(),
+            asm.get_node(node)
+                .clone()
+                .typecheck(sig, &locals, &mut asm)
+                .is_err(),
             "castclass with an i64 operand must be rejected"
         );
     }
@@ -1730,7 +1744,10 @@ mod tc_tests {
         let sig = asm.sig([src_ty], Type::Void);
         let locals: Vec<LocalDef> = vec![];
         assert!(
-            asm.get_node(node).clone().typecheck(sig, &locals, &mut asm).is_ok(),
+            asm.get_node(node)
+                .clone()
+                .typecheck(sig, &locals, &mut asm)
+                .is_ok(),
             "castclass of a managed class-ref operand to another class ref must be accepted"
         );
     }
@@ -1742,7 +1759,8 @@ mod tc_tests {
         use crate::ir::{Access, BasicBlock};
         let mut asm = Assembly::default();
         let usize_ty = asm.alloc_type(Type::Int(Int::USize));
-        let f = asm.alloc_node(CILNode::Const(Box::new(Const::F64(super::super::hashable::HashableF64(1.0),
+        let f = asm.alloc_node(CILNode::Const(Box::new(Const::F64(
+            super::super::hashable::HashableF64(1.0),
         ))));
         let bad = asm.alloc_root(CILRoot::StLoc(0, f));
         let block = BasicBlock::new(vec![bad], 0, None);
@@ -1754,7 +1772,9 @@ mod tc_tests {
             asm.alloc_string("broken"),
             sig,
             MethodKind::Static,
-            MethodImpl::MethodBody { blocks: vec![block], locals: vec![(None, usize_ty)],
+            MethodImpl::MethodBody {
+                blocks: vec![block],
+                locals: vec![(None, usize_ty)],
             },
             vec![],
         );
@@ -1768,7 +1788,10 @@ mod tc_tests {
     fn assembly_typecheck_advisory_counts_violations() {
         let mut asm = asm_with_one_broken_method();
         let n = asm.typecheck_with_policy(/*enabled=*/ true, /*fatal=*/ false);
-        assert_eq!(n, 1, "the single broken method must be counted as one violation");
+        assert_eq!(
+            n, 1,
+            "the single broken method must be counted as one violation"
+        );
     }
 
     /// WIRING (escape hatch): with the verifier disabled, the pass is skipped entirely and reports

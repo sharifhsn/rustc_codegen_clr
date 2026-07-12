@@ -38,7 +38,7 @@
 //! *unmodified* upstream mio through this (proof 2) is out of slice — see the note
 //! at the end of [`insert_posix_shim`] and LIBC_SHIM_SCOPE §4.
 
-use super::dotnet::endpoint_as_base;
+use super::dotnet::{bcl_enum_to_i32, endpoint_as_base};
 use crate::cilnode::{ExtendKind, MethodKind, PtrCastRes};
 use crate::ir::asm::MissingMethodPatcher;
 use crate::ir::cilroot::BranchCond;
@@ -83,6 +83,7 @@ const EEXIST: i32 = 17;
 #[allow(dead_code)]
 const EPIPE: i32 = 32;
 const ENAMETOOLONG: i32 = 36;
+const ENOSYS: i32 = 38;
 
 // .NET `System.Net.Sockets.SocketError` enum ints (the curated set).
 const SE_WOULD_BLOCK: i32 = 10035;
@@ -212,7 +213,11 @@ fn define_fd_entry(asm: &mut Assembly) {
         ctor_sig,
         MethodKind::Constructor,
         MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![set_handle, set_kind, set_flags, ret], 0, None)],
+            blocks: vec![BasicBlock::new(
+                vec![set_handle, set_kind, set_flags, ret],
+                0,
+                None,
+            )],
             locals: vec![],
         },
         vec![None, Some(handle), Some(kind), Some(flags)],
@@ -228,7 +233,11 @@ fn new_fd_entry(
 ) -> Interned<CILNode> {
     let entry = fd_entry_class(asm);
     let ctor = asm.class_ref(entry).clone().ctor(
-        &[Type::Int(Int::ISize), Type::Int(Int::I32), Type::Int(Int::I32)],
+        &[
+            Type::Int(Int::ISize),
+            Type::Int(Int::I32),
+            Type::Int(Int::I32),
+        ],
         asm,
     );
     asm.alloc_node(CILNode::call(ctor, [handle, kind, flags]))
@@ -308,10 +317,18 @@ fn define_epoll_reg(asm: &mut Assembly) {
     // last_ready starts 0 (not-ready) so the first readiness is an edge.
     let this2 = asm.alloc_node(CILNode::LdArg(0));
     let zero_lr = asm.alloc_node(Const::I32(0));
-    let set_lr = asm.alloc_root(CILRoot::SetField(Box::new((last_ready_field, this2, zero_lr))));
+    let set_lr = asm.alloc_root(CILRoot::SetField(Box::new((
+        last_ready_field,
+        this2,
+        zero_lr,
+    ))));
     let ret = asm.alloc_root(CILRoot::VoidRet);
     let ctor_sig = asm.sig(
-        [Type::ClassRef(*cls), Type::Int(Int::I32), Type::Int(Int::I64)],
+        [
+            Type::ClassRef(*cls),
+            Type::Int(Int::I32),
+            Type::Int(Int::I64),
+        ],
         Type::Void,
     );
     asm.new_method(MethodDef::new(
@@ -321,7 +338,11 @@ fn define_epoll_reg(asm: &mut Assembly) {
         ctor_sig,
         MethodKind::Constructor,
         MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![set_events, set_token, set_lr, ret], 0, None)],
+            blocks: vec![BasicBlock::new(
+                vec![set_events, set_token, set_lr, ret],
+                0,
+                None,
+            )],
             locals: vec![],
         },
         vec![None, Some(events), Some(token)],
@@ -335,10 +356,10 @@ fn new_epoll_reg(
     token: Interned<CILNode>,
 ) -> Interned<CILNode> {
     let cls = epoll_reg_class(asm);
-    let ctor = asm.class_ref(cls).clone().ctor(
-        &[Type::Int(Int::I32), Type::Int(Int::I64)],
-        asm,
-    );
+    let ctor = asm
+        .class_ref(cls)
+        .clone()
+        .ctor(&[Type::Int(Int::I32), Type::Int(Int::I64)], asm);
     asm.alloc_node(CILNode::call(ctor, [events, token]))
 }
 
@@ -354,10 +375,31 @@ fn new_epoll_reg(
 fn init_statics(asm: &mut Assembly) {
     let main_mod = asm.main_module();
     let dict = fd_dict(asm);
-    asm.add_static(Type::ClassRef(dict), "rcl_fd_table", false, main_mod, None, false);
-    asm.add_static(Type::Int(Int::I32), "rcl_fd_next", false, main_mod, None, false);
+    asm.add_static(
+        Type::ClassRef(dict),
+        "rcl_fd_table",
+        false,
+        main_mod,
+        None,
+        false,
+    );
+    asm.add_static(
+        Type::Int(Int::I32),
+        "rcl_fd_next",
+        false,
+        main_mod,
+        None,
+        false,
+    );
     // errno: thread_local=TRUE -> the exporter emits [ThreadStatic].
-    asm.add_static(Type::Int(Int::I32), "rcl_errno", true, main_mod, None, false);
+    asm.add_static(
+        Type::Int(Int::I32),
+        "rcl_errno",
+        true,
+        main_mod,
+        None,
+        false,
+    );
 
     // rcl_fd_table = new Dictionary<i32,object>();
     let table_sfld = fd_table_sfld(asm);
@@ -518,7 +560,11 @@ fn define_fdtable_builtins(asm: &mut Assembly) {
         define_main_method(
             asm,
             "rcl_fdtable_insert",
-            &[Type::Int(Int::ISize), Type::Int(Int::I32), Type::Int(Int::I32)],
+            &[
+                Type::Int(Int::ISize),
+                Type::Int(Int::I32),
+                Type::Int(Int::I32),
+            ],
             Type::Int(Int::I32),
             vec![store_fd, store_next, set, ret],
             vec![(None, i32_ty)],
@@ -529,7 +575,10 @@ fn define_fdtable_builtins(asm: &mut Assembly) {
     {
         let entry = entry_of_fd(asm, 0);
         let f = fd_entry_handle_field(asm);
-        let h = asm.alloc_node(CILNode::LdField { addr: entry, field: f });
+        let h = asm.alloc_node(CILNode::LdField {
+            addr: entry,
+            field: f,
+        });
         let void = asm.alloc_type(Type::Void);
         let h = asm.alloc_node(CILNode::PtrCast(h, Box::new(PtrCastRes::Ptr(void))));
         let ret = asm.alloc_root(CILRoot::Ret(h));
@@ -547,7 +596,10 @@ fn define_fdtable_builtins(asm: &mut Assembly) {
     {
         let entry = entry_of_fd(asm, 0);
         let f = fd_entry_kind_field(asm);
-        let k = asm.alloc_node(CILNode::LdField { addr: entry, field: f });
+        let k = asm.alloc_node(CILNode::LdField {
+            addr: entry,
+            field: f,
+        });
         let ret = asm.alloc_root(CILRoot::Ret(k));
         define_main_method(
             asm,
@@ -563,7 +615,10 @@ fn define_fdtable_builtins(asm: &mut Assembly) {
     {
         let entry = entry_of_fd(asm, 0);
         let f = fd_entry_flags_field(asm);
-        let v = asm.alloc_node(CILNode::LdField { addr: entry, field: f });
+        let v = asm.alloc_node(CILNode::LdField {
+            addr: entry,
+            field: f,
+        });
         let ret = asm.alloc_root(CILRoot::Ret(v));
         define_main_method(
             asm,
@@ -626,7 +681,12 @@ fn call_fdtable_handle(asm: &mut Assembly, fd: Interned<CILNode>) -> Interned<CI
     asm.alloc_node(CILNode::call(m, [fd]))
 }
 fn call_fdtable_kind(asm: &mut Assembly, fd: Interned<CILNode>) -> Interned<CILNode> {
-    let m = main_static(asm, "rcl_fdtable_kind", &[Type::Int(Int::I32)], Type::Int(Int::I32));
+    let m = main_static(
+        asm,
+        "rcl_fdtable_kind",
+        &[Type::Int(Int::I32)],
+        Type::Int(Int::I32),
+    );
     asm.alloc_node(CILNode::call(m, [fd]))
 }
 fn call_fdtable_insert(
@@ -638,12 +698,38 @@ fn call_fdtable_insert(
     let m = main_static(
         asm,
         "rcl_fdtable_insert",
-        &[Type::Int(Int::ISize), Type::Int(Int::I32), Type::Int(Int::I32)],
+        &[
+            Type::Int(Int::ISize),
+            Type::Int(Int::I32),
+            Type::Int(Int::I32),
+        ],
         Type::Int(Int::I32),
     );
     let handle_isize = asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::ISize)));
     let kind = asm.alloc_node(Const::I32(kind));
     let flags = asm.alloc_node(Const::I32(flags));
+    asm.alloc_node(CILNode::call(m, [handle_isize, kind, flags]))
+}
+
+fn call_fdtable_insert_with_flags(
+    asm: &mut Assembly,
+    handle: Interned<CILNode>,
+    kind: i32,
+    flags: Interned<CILNode>,
+) -> Interned<CILNode> {
+    let m = main_static(
+        asm,
+        "rcl_fdtable_insert",
+        &[
+            Type::Int(Int::ISize),
+            Type::Int(Int::I32),
+            Type::Int(Int::I32),
+        ],
+        Type::Int(Int::I32),
+    );
+    let handle_isize = asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::ISize)));
+    let kind = asm.alloc_node(Const::I32(kind));
+    let flags = asm.int_cast(flags, Int::I32, ExtendKind::ZeroExtend);
     asm.alloc_node(CILNode::call(m, [handle_isize, kind, flags]))
 }
 /// Like `call_fdtable_insert` but with a DYNAMIC `kind` node (the original fd's
@@ -657,7 +743,11 @@ fn call_fdtable_insert_dyn(
     let m = main_static(
         asm,
         "rcl_fdtable_insert",
-        &[Type::Int(Int::ISize), Type::Int(Int::I32), Type::Int(Int::I32)],
+        &[
+            Type::Int(Int::ISize),
+            Type::Int(Int::I32),
+            Type::Int(Int::I32),
+        ],
         Type::Int(Int::I32),
     );
     let handle_isize = asm.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::ISize)));
@@ -665,7 +755,12 @@ fn call_fdtable_insert_dyn(
     asm.alloc_node(CILNode::call(m, [handle_isize, kind, flags]))
 }
 fn call_fdtable_remove(asm: &mut Assembly, fd: Interned<CILNode>) -> Interned<CILRoot> {
-    let m = main_static(asm, "rcl_fdtable_remove", &[Type::Int(Int::I32)], Type::Void);
+    let m = main_static(
+        asm,
+        "rcl_fdtable_remove",
+        &[Type::Int(Int::I32)],
+        Type::Void,
+    );
     asm.alloc_root(CILRoot::call(m, [fd]))
 }
 
@@ -711,7 +806,11 @@ fn insert_fdtable_externs(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
         let m = main_static(
             asm,
             "rcl_fdtable_insert",
-            &[Type::Int(Int::ISize), Type::Int(Int::I32), Type::Int(Int::I32)],
+            &[
+                Type::Int(Int::ISize),
+                Type::Int(Int::I32),
+                Type::Int(Int::I32),
+            ],
             Type::Int(Int::I32),
         );
         let h = asm.alloc_node(CILNode::LdArg(0));
@@ -731,32 +830,39 @@ fn insert_fdtable_externs(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
 // errno
 // ===========================================================================
 
-/// `__errno_location() -> *mut i32` = `&rcl_errno`.
+/// `__errno_location()` / `errno_location()` -> `*mut i32` = `&rcl_errno`.
+///
+/// Linux-targeted libc uses the underscored link name; crates whose cfg tables do not yet name
+/// `target_os=dotnet` retain the Rust source identifier. Both are ABI aliases of the same TLS cell.
 fn insert_errno_location(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    let name = asm.alloc_string("__errno_location");
-    let generator = move |_, asm: &mut Assembly| {
-        let sfld = errno_sfld(asm);
-        let addr = asm.alloc_node(CILNode::LdStaticFieldAddress(sfld));
-        let i32_ty = asm.alloc_type(Type::Int(Int::I32));
-        let addr = asm.alloc_node(CILNode::PtrCast(addr, Box::new(PtrCastRes::Ptr(i32_ty))));
-        let ret = asm.alloc_root(CILRoot::Ret(addr));
-        MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
-            locals: vec![],
-        }
-    };
-    patcher.insert(name, Box::new(generator));
+    for symbol in ["__errno_location", "errno_location"] {
+        let name = asm.alloc_string(symbol);
+        let generator = move |_, asm: &mut Assembly| {
+            let sfld = errno_sfld(asm);
+            let addr = asm.alloc_node(CILNode::LdStaticFieldAddress(sfld));
+            let i32_ty = asm.alloc_type(Type::Int(Int::I32));
+            let addr = asm.alloc_node(CILNode::PtrCast(addr, Box::new(PtrCastRes::Ptr(i32_ty))));
+            let ret = asm.alloc_root(CILRoot::Ret(addr));
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            }
+        };
+        patcher.insert(name, Box::new(generator));
+    }
 }
 
 // Symmetric constant-valued counterpart to `set_errno_node` (sets `rcl_errno` to
 // a fixed errno). Currently unused — `open_errno_wrapped` was switched from a
 // blind `ENOENT` to the rich `rcl_errno_from_exception` mapper — but kept as the
 // obvious helper for any future fixed-errno wrapper.
-#[allow(dead_code)]
 fn set_errno(asm: &mut Assembly, val: i32) -> Interned<CILRoot> {
     let sfld = errno_sfld(asm);
     let v = asm.alloc_node(Const::I32(val));
-    asm.alloc_root(CILRoot::SetStaticField { field: sfld, val: v })
+    asm.alloc_root(CILRoot::SetStaticField {
+        field: sfld,
+        val: v,
+    })
 }
 
 /// Like `set_errno`, but stores an already-built i32 NODE into the thread-local
@@ -810,23 +916,39 @@ fn define_errno_from_exception(asm: &mut Assembly) {
     // unconditional `goto 1` is the EIO fallthrough.
     let exn = asm.alloc_node(CILNode::LdArg(0));
     let is_se = asm.alloc_node(CILNode::IsInst(exn, se_ty));
-    let goto_se = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, Some(BranchCond::True(is_se))))));
+    let goto_se = asm.alloc_root(CILRoot::Branch(Box::new((
+        2,
+        0,
+        Some(BranchCond::True(is_se)),
+    ))));
     let exn_fnf = asm.alloc_node(CILNode::LdArg(0));
     let is_fnf = asm.alloc_node(CILNode::IsInst(exn_fnf, fnf_ty));
-    let goto_fnf =
-        asm.alloc_root(CILRoot::Branch(Box::new((20, 0, Some(BranchCond::True(is_fnf))))));
+    let goto_fnf = asm.alloc_root(CILRoot::Branch(Box::new((
+        20,
+        0,
+        Some(BranchCond::True(is_fnf)),
+    ))));
     let exn_dnf = asm.alloc_node(CILNode::LdArg(0));
     let is_dnf = asm.alloc_node(CILNode::IsInst(exn_dnf, dnf_ty));
-    let goto_dnf =
-        asm.alloc_root(CILRoot::Branch(Box::new((20, 0, Some(BranchCond::True(is_dnf))))));
+    let goto_dnf = asm.alloc_root(CILRoot::Branch(Box::new((
+        20,
+        0,
+        Some(BranchCond::True(is_dnf)),
+    ))));
     let exn_uae = asm.alloc_node(CILNode::LdArg(0));
     let is_uae = asm.alloc_node(CILNode::IsInst(exn_uae, uae_ty));
-    let goto_uae =
-        asm.alloc_root(CILRoot::Branch(Box::new((21, 0, Some(BranchCond::True(is_uae))))));
+    let goto_uae = asm.alloc_root(CILRoot::Branch(Box::new((
+        21,
+        0,
+        Some(BranchCond::True(is_uae)),
+    ))));
     let exn_ptl = asm.alloc_node(CILNode::LdArg(0));
     let is_ptl = asm.alloc_node(CILNode::IsInst(exn_ptl, ptl_ty));
-    let goto_ptl =
-        asm.alloc_root(CILRoot::Branch(Box::new((22, 0, Some(BranchCond::True(is_ptl))))));
+    let goto_ptl = asm.alloc_root(CILRoot::Branch(Box::new((
+        22,
+        0,
+        Some(BranchCond::True(is_ptl)),
+    ))));
     let goto_eio = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
     // block 1: ret EIO.
     let eio = asm.alloc_node(Const::I32(EIO));
@@ -844,23 +966,26 @@ fn define_errno_from_exception(asm: &mut Assembly) {
     let get_code_name = asm.alloc_string("get_SocketErrorCode");
     // `SocketException.SocketErrorCode` returns the `SocketError` ENUM, not i32 —
     // the CLR matches the signature exactly, so declaring i32 yields a runtime
-    // MissingMethodException. Declare the enum return; the int-backed enum value
-    // is its underlying i32 on the eval stack (same transparency used for the
-    // SelectMode/SocketShutdown enum params elsewhere in the shim).
+    // MissingMethodException. Declare the enum return, then explicitly reinterpret
+    // the int-backed value as i32 at the managed/ABI boundary before branching.
     let socket_error = ClassRef::socket_error(asm);
-    let get_code = asm.class_ref(socket_exception).clone().instance(
-        &[],
-        Type::ClassRef(socket_error),
-        get_code_name,
-        asm,
-    );
+    let socket_error_ty = Type::ClassRef(socket_error);
+    let get_code =
+        asm.class_ref(socket_exception)
+            .clone()
+            .instance(&[], socket_error_ty, get_code_name, asm);
     let code = asm.alloc_node(CILNode::call(get_code, [se_cast]));
+    let code = bcl_enum_to_i32(code, socket_error_ty, asm);
     let store_code = asm.alloc_root(CILRoot::StLoc(0, code));
     // test chain: blocks 10..14 return mapped errno; default (15) returns EIO.
     let test = |asm: &mut Assembly, se: i32, tgt: u32| {
         let c = asm.alloc_node(CILNode::LdLoc(0));
         let sc = asm.alloc_node(Const::I32(se));
-        asm.alloc_root(CILRoot::Branch(Box::new((tgt, 0, Some(BranchCond::Eq(c, sc))))))
+        asm.alloc_root(CILRoot::Branch(Box::new((
+            tgt,
+            0,
+            Some(BranchCond::Eq(c, sc)),
+        ))))
     };
     let t_wb = test(asm, SE_WOULD_BLOCK, 10);
     let t_to = test(asm, SE_TIMED_OUT, 11);
@@ -879,7 +1004,7 @@ fn define_errno_from_exception(asm: &mut Assembly) {
     let r_eaddrinuse = mk_ret(asm, EADDRINUSE);
     let r_default = mk_ret(asm, EIO);
 
-    let se_local_ty = asm.alloc_type(Type::ClassRef(socket_error));
+    let se_local_ty = asm.alloc_type(Type::Int(Int::I32));
     let sig = asm.sig([Type::PlatformObject], Type::Int(Int::I32));
     asm.new_method(MethodDef::new(
         Access::Public,
@@ -932,10 +1057,19 @@ fn define_connect_errno_from_exception(asm: &mut Assembly) {
     // block 0: if !(exn isinst SocketException) goto 1 (delegate); else goto 2.
     let exn = asm.alloc_node(CILNode::LdArg(0));
     let is_se = asm.alloc_node(CILNode::IsInst(exn, se_ty));
-    let goto_delegate = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, Some(BranchCond::False(is_se))))));
+    let goto_delegate = asm.alloc_root(CILRoot::Branch(Box::new((
+        1,
+        0,
+        Some(BranchCond::False(is_se)),
+    ))));
     let goto_se = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None))));
     // block 1: ret rcl_errno_from_exception(exn).
-    let delegate = main_static(asm, "rcl_errno_from_exception", &[Type::PlatformObject], Type::Int(Int::I32));
+    let delegate = main_static(
+        asm,
+        "rcl_errno_from_exception",
+        &[Type::PlatformObject],
+        Type::Int(Int::I32),
+    );
     let exn_d = asm.alloc_node(CILNode::LdArg(0));
     let mapped = asm.alloc_node(CILNode::call(delegate, [exn_d]));
     let ret_delegate = asm.alloc_root(CILRoot::Ret(mapped));
@@ -945,26 +1079,30 @@ fn define_connect_errno_from_exception(asm: &mut Assembly) {
     let se_cast = asm.alloc_node(CILNode::CheckedCast(exn2, se_ty));
     let get_code_name = asm.alloc_string("get_SocketErrorCode");
     // `SocketErrorCode` returns the `SocketError` enum (see the general mapper);
-    // declaring i32 would MissingMethodException at runtime. Store into an
-    // enum-typed local, then compare (int-backed enum is its underlying i32).
+    // declaring i32 would MissingMethodException at runtime. Explicitly reinterpret
+    // the int-backed enum as i32 before comparing it to the POSIX mapping constants.
     let socket_error = ClassRef::socket_error(asm);
-    let get_code = asm.class_ref(socket_exception).clone().instance(
-        &[],
-        Type::ClassRef(socket_error),
-        get_code_name,
-        asm,
-    );
+    let socket_error_ty = Type::ClassRef(socket_error);
+    let get_code =
+        asm.class_ref(socket_exception)
+            .clone()
+            .instance(&[], socket_error_ty, get_code_name, asm);
     let code = asm.alloc_node(CILNode::call(get_code, [se_cast]));
+    let code = bcl_enum_to_i32(code, socket_error_ty, asm);
     let store_code = asm.alloc_root(CILRoot::StLoc(0, code));
     let code_l = asm.alloc_node(CILNode::LdLoc(0));
     let wb = asm.alloc_node(Const::I32(SE_WOULD_BLOCK));
-    let br_wb = asm.alloc_root(CILRoot::Branch(Box::new((3, 0, Some(BranchCond::Eq(code_l, wb))))));
+    let br_wb = asm.alloc_root(CILRoot::Branch(Box::new((
+        3,
+        0,
+        Some(BranchCond::Eq(code_l, wb)),
+    ))));
     let goto_delegate2 = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
     // block 3: ret EINPROGRESS.
     let einprog = asm.alloc_node(Const::I32(EINPROGRESS));
     let ret_einprog = asm.alloc_root(CILRoot::Ret(einprog));
 
-    let se_local_ty = asm.alloc_type(Type::ClassRef(socket_error));
+    let se_local_ty = asm.alloc_type(Type::Int(Int::I32));
     let sig = asm.sig([Type::PlatformObject], Type::Int(Int::I32));
     asm.new_method(MethodDef::new(
         Access::Public,
@@ -983,6 +1121,20 @@ fn define_connect_errno_from_exception(asm: &mut Assembly) {
         },
         vec![None],
     ));
+}
+
+#[cfg(test)]
+mod errno_mapper_tests {
+    use super::*;
+
+    #[test]
+    fn socket_error_enum_is_retyped_before_errno_comparisons() {
+        let mut asm = Assembly::default();
+        define_errno_from_exception(&mut asm);
+        define_connect_errno_from_exception(&mut asm);
+
+        assert_eq!(asm.typecheck(), 0);
+    }
 }
 
 // ===========================================================================
@@ -1018,7 +1170,10 @@ fn errno_wrapped_with(
     extra_locals: Vec<(Option<Interned<crate::IString>>, Interned<Type>)>,
     mapper: &str,
 ) -> MethodImpl {
-    let leave_ok = asm.alloc_root(CILRoot::ExitSpecialRegion { target: 2, source: 0 });
+    let leave_ok = asm.alloc_root(CILRoot::ExitSpecialRegion {
+        target: 2,
+        source: 0,
+    });
     body.push(leave_ok);
 
     // Block 1 (catch): errno = <mapper>(GetException); local0=-1; leave->2.
@@ -1026,11 +1181,17 @@ fn errno_wrapped_with(
     let map = main_static(asm, mapper, &[Type::PlatformObject], Type::Int(Int::I32));
     let mapped = asm.alloc_node(CILNode::call(map, [get_exn]));
     let errno_field = errno_sfld(asm);
-    let set_errno = asm.alloc_root(CILRoot::SetStaticField { field: errno_field, val: mapped });
+    let set_errno = asm.alloc_root(CILRoot::SetStaticField {
+        field: errno_field,
+        val: mapped,
+    });
     let minus1 = asm.alloc_node(Const::I32(-1));
     let minus1 = asm.int_cast(minus1, ret_ty_int(ret_ty), ExtendKind::SignExtend);
     let store_minus1 = asm.alloc_root(CILRoot::StLoc(0, minus1));
-    let leave_catch = asm.alloc_root(CILRoot::ExitSpecialRegion { target: 2, source: 1 });
+    let leave_catch = asm.alloc_root(CILRoot::ExitSpecialRegion {
+        target: 2,
+        source: 1,
+    });
 
     // Block 2: ret local0.
     let ld0 = asm.alloc_node(CILNode::LdLoc(0));

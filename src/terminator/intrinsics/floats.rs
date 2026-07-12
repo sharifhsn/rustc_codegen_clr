@@ -1,10 +1,12 @@
 use crate::assembly::MethodCompileCtx;
-use cilly::{
-    cilnode::MethodKind, Int, Interned, MethodRef, Type, {ClassRef, Float},
-};
-use cilly::cilnode::IsPure;
 use crate::operand::handle_operand;
 use crate::place::place_set;
+use cilly::cilnode::IsPure;
+use cilly::{
+    Int, Interned, MethodRef, Type,
+    cilnode::MethodKind,
+    {ClassRef, Float},
+};
 use rustc_middle::mir::{Operand, Place};
 use rustc_span::Spanned;
 

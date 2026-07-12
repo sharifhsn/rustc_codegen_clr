@@ -1,9 +1,9 @@
 use crate::{
+    BasicBlock, BinOp, CILNode, CILRoot, ClassRef, Const, Int, MethodImpl, MethodRef, Type,
     asm::MissingMethodPatcher,
     bimap::Interned,
     cilnode::{ExtendKind, MethodKind},
     cilroot::BranchCond,
-    BasicBlock, BinOp, CILNode, CILRoot, ClassRef, Const, Int, MethodImpl, MethodRef, Type,
 };
 
 use super::{
@@ -88,7 +88,10 @@ pub fn emulate_uint8_cmp_xchng(asm: &mut Assembly, patcher: &mut MissingMethodPa
 /// Signature: `int_ty atomic_xchng{8,16}_correct(int_ty& addr, int_ty new)`.
 /// Same LE-only + page-boundary caveats as [`emulate_subword_cmp_xchng`].
 pub fn emulate_subword_xchng(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, width: u8) {
-    debug_assert!(width == 1 || width == 2, "sub-word xchg width must be 1 or 2");
+    debug_assert!(
+        width == 1 || width == 2,
+        "sub-word xchg width must be 1 or 2"
+    );
     let name = asm.alloc_string(format!("atomic_xchng{}_correct", width * 8));
     let full_mask: u32 = if width == 1 { 0xFF } else { 0xFFFF };
     let generator = move |_, asm: &mut Assembly| {
@@ -226,8 +229,15 @@ pub fn emulate_subword_xchng(asm: &mut Assembly, patcher: &mut MissingMethodPatc
 ///   contained within one word (Rust requires natural alignment), so the aligned-down word stays in
 ///   the same allocation in practice — but the general caveat stands. Remove once .NET 9's native
 ///   sub-word `Interlocked.CompareExchange` is the floor.
-pub fn emulate_subword_cmp_xchng(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, width: u8) {
-    debug_assert!(width == 1 || width == 2, "sub-word CAS width must be 1 or 2");
+pub fn emulate_subword_cmp_xchng(
+    asm: &mut Assembly,
+    patcher: &mut MissingMethodPatcher,
+    width: u8,
+) {
+    debug_assert!(
+        width == 1 || width == 2,
+        "sub-word CAS width must be 1 or 2"
+    );
     let name = asm.alloc_string(format!("atomic_cmpxchng{}_correct", width * 8));
     let full_mask: u32 = if width == 1 { 0xFF } else { 0xFFFF };
     let generator = move |_, asm: &mut Assembly| {
@@ -437,8 +447,7 @@ pub fn compare_exchange(
         _ => todo!("Can't cmpxchng {int:?}"),
     }
 }
-type AsmGen =
-    dyn Fn(&mut Assembly, Interned<CILNode>, Interned<CILNode>, Int) -> Interned<CILNode>;
+type AsmGen = dyn Fn(&mut Assembly, Interned<CILNode>, Interned<CILNode>, Int) -> Interned<CILNode>;
 pub fn generate_atomic(
     asm: &mut Assembly,
     patcher: &mut MissingMethodPatcher,
@@ -492,8 +501,8 @@ pub fn generate_atomic_for_ints(
     patcher: &mut MissingMethodPatcher,
     op_name: &str,
     op: impl Fn(&mut Assembly, Interned<CILNode>, Interned<CILNode>, Int) -> Interned<CILNode>
-        + 'static
-        + Clone,
+    + 'static
+    + Clone,
 ) {
     const ATOMIC_INTS: [Int; 10] = [
         Int::U8,

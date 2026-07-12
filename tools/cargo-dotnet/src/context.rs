@@ -9,16 +9,41 @@
 //! docker delegation boundary (`docker.rs`) and for the inner `cargo` invocation
 //! (`buildstd.rs`), never as a thread-through-Rust contract.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
+use sha2::{Digest, Sha256};
 
 use crate::cli::BuildArgs;
 use crate::host::HostFacts;
 use crate::mode::Mode;
 use crate::passthrough;
 use crate::{host, mode};
+
+/// The managed public identity requested by `[package.metadata.dotnet]`.
+///
+/// Absence deliberately means the legacy `MainModule` surface. This keeps existing crates and
+/// serialized artifacts compatible while release-oriented crates can opt into a collision-free
+/// projection at final link time.
+#[derive(Debug, Clone)]
+pub struct ManagedIdentity {
+    pub schema: u16,
+    pub package_id: String,
+    pub assembly_name: String,
+    pub root_namespace: String,
+    pub module_type: String,
+    pub legacy_main_module: bool,
+}
+
+impl ManagedIdentity {
+    /// The CLR full type name projected from the compiler's internal `MainModule` sentinel.
+    #[must_use]
+    pub fn module_full_name(&self) -> Option<String> {
+        (!self.legacy_main_module).then(|| format!("{}.{}", self.root_namespace, self.module_type))
+    }
+}
 
 /// Build profile (replaces the stringly `CD_REL`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +88,8 @@ pub struct Paths {
     pub target_spec: PathBuf,
     /// cargo registry src dir (where build-std extracts libc).
     pub registry_src: PathBuf,
+    /// Private Cargo home used by restore/build-std. Never patch the user's ambient registry.
+    pub cargo_home: PathBuf,
     /// `root/dotnet_pal`.
     pub pal_root: PathBuf,
     /// `root/dotnet_overlays`.
@@ -71,14 +98,17 @@ pub struct Paths {
     /// project (currently just `ParameterRebinder`, see `mycorrhiza::linq`). Built and copied
     /// alongside any consumer's build output by `interop_helpers::ensure_and_copy`.
     pub interop_helpers_root: PathBuf,
+    /// SDK-owned Rust crates used by portable consumer manifests.
+    pub sdk_crates_root: PathBuf,
     pub lastbuild_log: PathBuf,
 }
 
 impl Paths {
     /// Resolve the layout for a mode (the old `NativeLayout`, kept with its bail!
     /// preflights). Installed and Dev differ ONLY here.
-    fn resolve(mode: &Mode, facts: &HostFacts) -> Result<Self> {
-        let registry_src = cargo_registry_src()?;
+    fn resolve(mode: &Mode, facts: &HostFacts, crate_dir: &Path) -> Result<Self> {
+        let cargo_home = cargo_home_for_crate(crate_dir)?;
+        let registry_src = cargo_home.join("registry/src");
         match mode {
             Mode::Installed { home } => {
                 if !home.is_dir() {
@@ -111,10 +141,12 @@ impl Paths {
                     linker,
                     target_spec,
                     registry_src,
+                    cargo_home: cargo_home.clone(),
                     pal_root: home.join("dotnet_pal"),
                     overlays_root: home.join("dotnet_overlays"),
                     interop_helpers_root: home.join("mycorrhiza_interop_helpers"),
-                    lastbuild_log: home.join("_lastbuild.log"),
+                    sdk_crates_root: home.join("crates"),
+                    lastbuild_log: cargo_home.join("logs/lastbuild.log"),
                 })
             }
             Mode::Dev { repo_root } => {
@@ -145,10 +177,12 @@ impl Paths {
                     linker,
                     target_spec,
                     registry_src,
+                    cargo_home: cargo_home.clone(),
                     pal_root: repo_root.join("dotnet_pal"),
                     overlays_root: repo_root.join("dotnet_overlays"),
                     interop_helpers_root: repo_root.join("mycorrhiza_interop_helpers"),
-                    lastbuild_log: repo_root.join("feasibility/_lastbuild.log"),
+                    sdk_crates_root: repo_root.clone(),
+                    lastbuild_log: cargo_home.join("logs/lastbuild.log"),
                 })
             }
         }
@@ -200,7 +234,9 @@ impl std::str::FromStr for DotnetVersion {
         match s.trim() {
             "8" | "net8" | "net8.0" => Ok(DotnetVersion::Net8),
             "9" | "net9" | "net9.0" => Ok(DotnetVersion::Net9),
-            other => Err(format!("--dotnet: invalid value {other:?}; expected 8 or 9")),
+            other => Err(format!(
+                "--dotnet: invalid value {other:?}; expected 8 or 9"
+            )),
         }
     }
 }
@@ -215,8 +251,8 @@ pub struct Context {
     /// The crate dir to build (absolute; verified to contain Cargo.toml).
     pub crate_dir: PathBuf,
     pub paths: Paths,
-    /// Some(toolchain) when installed (pinned via RUSTUP_TOOLCHAIN); None in dev (the
-    /// rustup dir-override / active toolchain is used).
+    /// The exact toolchain pinned into every inner Cargo/rustc invocation. External crate and
+    /// bindgen working directories cannot inherit this repository's rustup directory override.
     pub toolchain: Option<String>,
     /// The inner cargo binary (`$CARGO` or `cargo`).
     pub cargo: String,
@@ -226,6 +262,8 @@ pub struct Context {
     pub dotnet: DotnetVersion,
     /// `(PATH addition, DOTNET_ROOT)` if dotnet was self-healed from `$HOME/.dotnet`.
     pub dotnet_heal: Option<(PathBuf, PathBuf)>,
+    /// Explicit release-package identity, if the crate opted into schema 1.
+    pub managed_identity: Option<ManagedIdentity>,
 }
 
 impl Context {
@@ -243,7 +281,11 @@ impl Context {
         let dotnet: DotnetVersion = args.dotnet.parse().map_err(anyhow::Error::msg)?;
         let ilasm = host::resolve_ilasm(&host, dotnet)?;
 
-        let paths = Paths::resolve(&mode, &host)?;
+        let paths = Paths::resolve(&mode, &host, &crate_dir)?;
+        let managed_identity = resolve_managed_identity(&crate_dir)?;
+        if managed_identity.is_some() {
+            validate_managed_identity_build(args, &crate_dir)?;
+        }
 
         let toolchain = match &mode {
             Mode::Installed { home } => Some(
@@ -252,7 +294,12 @@ impl Context {
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| mode::read_home_toolchain(home)),
             ),
-            Mode::Dev { .. } => None,
+            Mode::Dev { .. } => Some(
+                std::env::var("CARGO_DOTNET_TOOLCHAIN")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| mode::DEFAULT_TOOLCHAIN.to_string()),
+            ),
         };
 
         let profile = if args.is_release() {
@@ -271,7 +318,11 @@ impl Context {
         // fail with "only accepted on the nightly channel" if `$CARGO` happens to be
         // stable. Use a bare `cargo` (PATH-resolved, i.e. the shim) whenever we are
         // pinning a toolchain; keep the `$CARGO` preference only when we are not.
-        let cargo = if toolchain.is_some() { "cargo".to_string() } else { host::inner_cargo() };
+        let cargo = if toolchain.is_some() {
+            "cargo".to_string()
+        } else {
+            host::inner_cargo()
+        };
 
         Ok(Context {
             host,
@@ -289,11 +340,12 @@ impl Context {
             ilasm,
             dotnet,
             dotnet_heal,
+            managed_identity,
         })
     }
 
-    /// The toolchain's sysroot (`rustc --print sysroot`), honouring the pinned
-    /// `RUSTUP_TOOLCHAIN` when installed. Used to locate rust-src for PAL injection.
+    /// The ambient toolchain sysroot (`rustc --print sysroot`), honouring the pinned
+    /// `RUSTUP_TOOLCHAIN`. It is read as the pristine source for a private snapshot, never patched.
     pub fn rustc_sysroot(&self) -> Result<PathBuf> {
         let mut cmd = Command::new("rustc");
         if let Some(tc) = &self.toolchain {
@@ -318,13 +370,300 @@ impl Context {
     }
 }
 
-/// The cargo registry src dir build-std extracts libc into.
-fn cargo_registry_src() -> Result<PathBuf> {
-    if let Ok(home) = std::env::var("CARGO_HOME") {
-        if !home.is_empty() {
-            return Ok(PathBuf::from(home).join("registry/src"));
+fn cargo_package(crate_dir: &Path) -> Result<cargo_metadata::Package> {
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .manifest_path(crate_dir.join("Cargo.toml"))
+        .no_deps()
+        .exec()
+        .context("read Cargo metadata for managed identity")?;
+    metadata.root_package().cloned().with_context(|| {
+        format!(
+            "Cargo metadata has no root package for {}",
+            crate_dir.display()
+        )
+    })
+}
+
+fn resolve_managed_identity(crate_dir: &Path) -> Result<Option<ManagedIdentity>> {
+    let package = cargo_package(crate_dir)?;
+    let Some(dotnet) = package.metadata.get("dotnet") else {
+        return Ok(None);
+    };
+    let Some(dotnet) = dotnet.as_object() else {
+        bail!("package.metadata.dotnet must be a table/object");
+    };
+    const IDENTITY_KEYS: &[&str] = &[
+        "identity-schema",
+        "package-id",
+        "assembly-name",
+        "root-namespace",
+        "module-type",
+        "legacy-main-module",
+    ];
+    for key in dotnet.keys() {
+        if !IDENTITY_KEYS.contains(&key.as_str()) {
+            bail!("unknown package.metadata.dotnet key {key:?}");
         }
     }
-    let home = std::env::var("HOME").context("HOME is not set (needed to locate ~/.cargo)")?;
-    Ok(PathBuf::from(home).join(".cargo/registry/src"))
+
+    let string = |key: &str| -> Result<String> {
+        dotnet
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .with_context(|| format!("package.metadata.dotnet.{key} must be a non-empty string"))
+    };
+    let schema = dotnet
+        .get("identity-schema")
+        .and_then(serde_json::Value::as_u64)
+        .context("package.metadata.dotnet.identity-schema must be integer 1")?;
+    if schema != 1 {
+        bail!("unsupported package.metadata.dotnet.identity-schema {schema}; expected 1");
+    }
+    let identity = ManagedIdentity {
+        schema: schema as u16,
+        package_id: string("package-id")?,
+        assembly_name: string("assembly-name")?,
+        root_namespace: string("root-namespace")?,
+        module_type: string("module-type")?,
+        legacy_main_module: match dotnet.get("legacy-main-module") {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .context("package.metadata.dotnet.legacy-main-module must be a boolean")?,
+        },
+    };
+    validate_identity(&identity)?;
+    Ok(Some(identity))
+}
+
+/// Print the filename/CLR identity that generic MSBuild integration must reference.
+pub fn print_managed_assembly_name(path: Option<&Path>) -> Result<i32> {
+    let crate_dir = path.unwrap_or_else(|| Path::new("."));
+    let crate_dir = crate_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalize Rust crate {}", crate_dir.display()))?;
+    let package = cargo_package(&crate_dir)?;
+    let name = resolve_managed_identity(&crate_dir)?
+        .map(|identity| identity.assembly_name)
+        .unwrap_or_else(|| package.name.to_string());
+    println!("{name}");
+    Ok(0)
+}
+
+/// Validate the deliberately narrow Wave-1 identity scope before Cargo starts a process whose
+/// linker environment is inherited by every final target.  There is no per-artifact identity
+/// channel yet, so a release identity may describe exactly one `cdylib`, never a workspace-wide
+/// or mixed bin/library invocation.
+fn validate_managed_identity_build(args: &BuildArgs, crate_dir: &Path) -> Result<()> {
+    let has_package_selection = !args.workspace.package.is_empty()
+        || args.workspace.workspace
+        || !args.workspace.exclude.is_empty()
+        || args.extra.iter().any(|flag| {
+            matches!(
+                flag.as_str(),
+                "--workspace" | "--exclude" | "-p" | "--package"
+            ) || flag.starts_with("--package=")
+                || flag.starts_with("--exclude=")
+        });
+    if has_package_selection {
+        bail!(
+            "managed identity builds support exactly one selected package; remove --workspace, \
+             --exclude, and -p/--package (identity is currently process-wide at final link)"
+        );
+    }
+
+    let package = cargo_package(crate_dir)?;
+    let final_targets: Vec<_> = package
+        .targets
+        .iter()
+        .filter(|target| {
+            target.kind.iter().any(|kind| kind == "bin")
+                || target.crate_types.iter().any(|kind| kind == "cdylib")
+        })
+        .map(|target| {
+            (
+                target.name.as_str(),
+                target.crate_types.iter().any(|kind| kind == "cdylib"),
+            )
+        })
+        .collect();
+    validate_managed_final_targets(&final_targets)
+}
+
+fn validate_managed_final_targets(final_targets: &[(&str, bool)]) -> Result<()> {
+    let is_single_cdylib = matches!(final_targets, [(_, true)]);
+    if !is_single_cdylib {
+        let names = final_targets
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "managed identity requires exactly one final cdylib target; found [{}]. \
+             Split bin/cdylib or multi-target packages into separate cargo dotnet builds.",
+            names
+        );
+    }
+    Ok(())
+}
+
+/// Validate the identities of all Rust crates referenced by one managed host before the host
+/// builds any of them.  This is the cross-process collision check that Cargo itself cannot make:
+/// MSBuild invokes cargo-dotnet once per crate, so each final linker would otherwise see only its
+/// own process-local identity.
+pub fn validate_managed_identity_set(crate_dirs: &[PathBuf]) -> Result<i32> {
+    let mut assembly_owners = BTreeMap::<String, PathBuf>::new();
+    let mut public_type_owners = BTreeMap::<String, PathBuf>::new();
+
+    for crate_dir in crate_dirs {
+        let crate_dir = crate_dir.canonicalize().with_context(|| {
+            format!(
+                "managed identity crate path does not exist: {}",
+                crate_dir.display()
+            )
+        })?;
+        let package = cargo_package(&crate_dir)?;
+        let identity = resolve_managed_identity(&crate_dir)?;
+        let assembly_name = identity
+            .as_ref()
+            .map(|identity| identity.assembly_name.clone())
+            .unwrap_or_else(|| package.name.to_string());
+        let public_type = identity
+            .as_ref()
+            .and_then(ManagedIdentity::module_full_name)
+            .unwrap_or_else(|| "MainModule".to_string());
+
+        if let Some(previous) = assembly_owners.insert(assembly_name.clone(), crate_dir.clone()) {
+            bail!(
+                "duplicate managed assembly name {assembly_name:?}: {} and {}. \
+                 Assign distinct package.metadata.dotnet.assembly-name values.",
+                previous.display(),
+                crate_dir.display()
+            );
+        }
+        if let Some(previous) = public_type_owners.insert(public_type.clone(), crate_dir.clone()) {
+            bail!(
+                "duplicate managed public type {public_type:?}: {} and {}. \
+                 Assign distinct root-namespace/module-type values or isolate legacy MainModule crates.",
+                previous.display(),
+                crate_dir.display()
+            );
+        }
+    }
+    Ok(0)
+}
+
+fn validate_identity(identity: &ManagedIdentity) -> Result<()> {
+    for (label, value) in [
+        ("assembly-name", identity.assembly_name.as_str()),
+        ("root-namespace", identity.root_namespace.as_str()),
+        ("module-type", identity.module_type.as_str()),
+    ] {
+        if !value.split('.').all(is_clr_identifier) {
+            bail!("package.metadata.dotnet.{label}={value:?} is not a dotted CLR identifier");
+        }
+    }
+    Ok(())
+}
+
+fn is_clr_identifier(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    matches!(chars.next(), Some(first) if first == '_' || first.is_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_alphanumeric())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_identity_projects_a_distinct_public_type() {
+        let identity = ManagedIdentity {
+            schema: 1,
+            package_id: "Collision.Alpha".into(),
+            assembly_name: "collision_alpha".into(),
+            root_namespace: "Collision.Alpha".into(),
+            module_type: "Exports".into(),
+            legacy_main_module: false,
+        };
+        validate_identity(&identity).unwrap();
+        assert_eq!(
+            identity.module_full_name().as_deref(),
+            Some("Collision.Alpha.Exports")
+        );
+    }
+
+    #[test]
+    fn legacy_identity_keeps_main_module() {
+        let identity = ManagedIdentity {
+            schema: 1,
+            package_id: "legacy".into(),
+            assembly_name: "legacy".into(),
+            root_namespace: "Legacy".into(),
+            module_type: "Exports".into(),
+            legacy_main_module: true,
+        };
+        assert_eq!(identity.module_full_name(), None);
+    }
+
+    #[test]
+    fn managed_identity_rejects_mixed_final_targets() {
+        let error = validate_managed_final_targets(&[("app", false), ("library", true)])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exactly one final cdylib target"), "{error}");
+        assert!(error.contains("app, library"), "{error}");
+    }
+
+    #[test]
+    fn managed_identity_accepts_one_cdylib_target() {
+        validate_managed_final_targets(&[("library", true)]).unwrap();
+    }
+
+    #[test]
+    fn identity_metadata_rejects_non_clr_names() {
+        let identity = ManagedIdentity {
+            schema: 1,
+            package_id: "Example.Widget".into(),
+            assembly_name: "example-widget".into(),
+            root_namespace: "Example.Widget".into(),
+            module_type: "Exports".into(),
+            legacy_main_module: false,
+        };
+        let error = validate_identity(&identity).unwrap_err().to_string();
+        assert!(error.contains("assembly-name"), "{error}");
+    }
+}
+
+pub(crate) fn cargo_dotnet_cache_home() -> Result<PathBuf> {
+    if let Some(path) =
+        std::env::var_os("CARGO_DOTNET_CACHE_HOME").filter(|value| !value.is_empty())
+    {
+        return Ok(PathBuf::from(path));
+    }
+    let home =
+        std::env::var_os("HOME").context("HOME is not set (needed for cargo-dotnet cache)")?;
+    Ok(PathBuf::from(home).join(".cargo-dotnet/cache"))
+}
+
+/// Stable namespace for mutable state owned by one consumer crate. Cargo registry sources are
+/// patched for the CLR PAL, so sharing a Cargo home between unrelated builds is unsafe even when
+/// their target directories differ.
+pub(crate) fn crate_cache_key(crate_dir: &Path) -> Result<String> {
+    let canonical = crate_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalize consumer crate {}", crate_dir.display()))?;
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(canonical.as_os_str().to_string_lossy().as_bytes())
+    ))
+}
+
+pub(crate) fn cargo_home_for_crate(crate_dir: &Path) -> Result<PathBuf> {
+    Ok(cargo_dotnet_cache_home()?
+        .join("crates")
+        .join(crate_cache_key(crate_dir)?)
+        .join("cargo-home"))
 }

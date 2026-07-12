@@ -1,5 +1,20 @@
 use std::path::PathBuf;
 
+// The standalone regression corpus predates Rust 2024 and intentionally tests
+// codegen rather than source-edition migration. Cargo crates carry their own
+// edition in their manifests; keep these direct-rustc fixtures on the newest
+// edition their checked-in source actually satisfies.
+const STANDALONE_TEST_EDITION: &str = "2024";
+
+fn assert_compile_succeeded(command: &str, output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "compiler command failed: {command}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 #[must_use]
 pub fn test_dotnet_executable(file_path: &str, test_dir: &str) -> String {
     use std::io::Write;
@@ -91,7 +106,10 @@ pub fn test_dotnet_executable(file_path: &str, test_dir: &str) -> String {
         );
     } else {
         #[cfg(not(target_os = "windows"))]
-        assert!(*IS_DOTNET_PRESENT, "Only mono runtime present. Mono does not support all the features required to get Rust code working.");
+        assert!(
+            *IS_DOTNET_PRESENT,
+            "Only mono runtime present. Mono does not support all the features required to get Rust code working."
+        );
     }
 
     stdout
@@ -173,6 +191,7 @@ macro_rules! compare_tests {
                     let mut cmd = super::super::compiler(stringify!($test_name), test_dir, true);
                     let copy = format!("{cmd:?}");
                     let out = cmd.output().expect("failed to execute process");
+                    super::super::assert_compile_succeeded(&copy, &out);
                     // If stderr is not empty, then something went wrong, so print the stdout and stderr for debuging.
                     if String::from_utf8(out.stderr.clone())
                         .unwrap()
@@ -207,11 +226,12 @@ macro_rules! compare_tests {
                         "-o",
                         concat!("./", stringify!($test_name), ".a"),
                         "--edition",
-                        "2021",
+                        super::super::STANDALONE_TEST_EDITION,
                         "-Ctarget-feature=+x87+sse",
                     ]);
                     let copy = format!("{cmd:?}");
                     let out = cmd.output().expect("failed to execute process");
+                    super::super::assert_compile_succeeded(&copy, &out);
                     // If stderr is not empty, then something went wrong, so print the stdout and stderr for debuging.
                     if String::from_utf8(out.stderr.clone())
                         .unwrap()
@@ -257,7 +277,9 @@ macro_rules! compare_tests {
                         .as_ref()
                         .expect("Could not build rustc!");
                     let mut cmd = super::super::compiler(stringify!($test_name), test_dir, true);
+                    let copy = format!("{cmd:?}");
                     let out = cmd.output().expect("failed to execute process");
+                    super::super::assert_compile_succeeded(&copy, &out);
                     // If stderr is not empty, then something went wrong, so print the stdout and stderr for debuging.
                     if String::from_utf8(out.stderr.clone())
                         .unwrap()
@@ -292,10 +314,12 @@ macro_rules! compare_tests {
                         "-o",
                         concat!("./", stringify!($test_name), ".a"),
                         "--edition",
-                        "2021",
+                        super::super::STANDALONE_TEST_EDITION,
                         "-Ctarget-feature=+x87+sse",
                     ]);
+                    let copy = format!("{cmd:?}");
                     let out = cmd.output().expect("failed to execute process");
+                    super::super::assert_compile_succeeded(&copy, &out);
                     // If stderr is not empty, then something went wrong, so print the stdout and stderr for debuging.
                     if String::from_utf8(out.stderr.clone())
                         .unwrap()
@@ -509,7 +533,7 @@ macro_rules! cargo_test {
                 let out = std::process::Command::new("cargo")
                     .env("RUSTFLAGS", &rustflags)
                     .current_dir(test_dir)
-                    .args(["build"])
+                    .args(["-Zjson-target-spec", "build"])
                     .output()
                     .expect("failed to execute process");
                 // panic!("out:{out:?}");
@@ -547,6 +571,7 @@ macro_rules! cargo_test {
                     .env("RUSTFLAGS", &rustflags)
                     .current_dir(test_dir)
                     .args([
+                        "-Zjson-target-spec",
                         "build",
                         "--release", //"--target",
                                      //"clr64-unknown-clr"
@@ -595,7 +620,7 @@ macro_rules! cargo_test_ignored {
                 let out = std::process::Command::new("cargo")
                     .env("RUSTFLAGS", &rustflags)
                     .current_dir(test_dir)
-                    .args(["build"])
+                    .args(["-Zjson-target-spec", "build"])
                     .output()
                     .expect("failed to execute process");
                 // panic!("out:{out:?}");
@@ -634,6 +659,7 @@ macro_rules! cargo_test_ignored {
                     .env("RUSTFLAGS", &rustflags)
                     .current_dir(test_dir)
                     .args([
+                        "-Zjson-target-spec",
                         "build",
                         "--release", //"--target",
                                      //"clr64-unknown-clr"
@@ -716,7 +742,7 @@ pub fn absolute_backend_path() -> PathBuf {
 }
 #[cfg(target_family = "unix")]
 fn with_stack_size(cmd: &mut std::process::Command, limit_kb: u64) {
-    use libc::{rlimit, setrlimit, RLIMIT_STACK};
+    use libc::{RLIMIT_STACK, rlimit, setrlimit};
     use std::os::unix::process::CommandExt;
 
     unsafe {
@@ -829,6 +855,8 @@ run_test! {core,flt2dec,unstable}
 run_test! {core,from_raw_parts,unstable}
 run_test! {core,tuple_ord,stable}
 run_test! {core,zst_iter,stable}
+run_test! {core,adt_name_collision,stable}
+run_test! {core,fixed_array_layout_identity,stable}
 
 run_test! {types,adt_enum,stable}
 run_test! {types,f128,stable}
@@ -1014,6 +1042,76 @@ static IS_MONO_PRESENT: std::sync::LazyLock<bool> =
 
 static RUSTC_BUILD_STATUS: std::sync::LazyLock<Result<(), String>> =
     std::sync::LazyLock::new(build_backend);
+
+/// The codegen backend owns rustc's `cfg(target_feature)` result. Keep that frontend contract
+/// aligned with the x86-64 ABI and prove that explicit feature settings are parsed rather than
+/// silently discarded. This catches representation-splitting failures in crates such as `wide`
+/// before they surface as ecosystem build errors.
+#[test]
+fn target_feature_cfg_contract() {
+    RUSTC_BUILD_STATUS.as_ref().expect("Could not build rustc!");
+    let backend = absolute_backend_path();
+    let target = std::fs::canonicalize("x86_64-unknown-dotnet.json")
+        .expect("x86_64 dotnet target spec is missing");
+
+    let query = |feature: Option<&str>| {
+        let mut command = std::process::Command::new("rustc");
+        command
+            .arg(format!("-Zcodegen-backend={}", backend.display()))
+            .args(["-Zunstable-options", "--print", "cfg", "--target"])
+            .arg(&target);
+        if let Some(feature) = feature {
+            command.arg(format!("-Ctarget-feature={feature}"));
+        }
+        let output = command
+            .output()
+            .expect("failed to query backend target cfg");
+        assert!(
+            output.status.success(),
+            "target cfg query failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (
+            String::from_utf8(output.stdout).expect("target cfg stdout was not UTF-8"),
+            String::from_utf8(output.stderr).expect("target cfg stderr was not UTF-8"),
+        )
+    };
+
+    let (baseline, baseline_stderr) = query(None);
+    for feature in ["fxsr", "sse", "sse2", "x87"] {
+        assert!(
+            baseline.contains(&format!("target_feature=\"{feature}\"")),
+            "mandatory x86-64 feature `{feature}` missing from:\n{baseline}"
+        );
+    }
+    assert!(
+        !baseline_stderr.contains("must be enabled to ensure that the ABI"),
+        "backend published an invalid baseline ABI:\n{baseline_stderr}"
+    );
+
+    let (with_avx2, _) = query(Some("+avx2"));
+    assert!(
+        with_avx2.contains("target_feature=\"avx2\""),
+        "explicitly enabled target feature was ignored:\n{with_avx2}"
+    );
+
+    let (without_sse2, disabled_stderr) = query(Some("-sse2"));
+    assert!(
+        !without_sse2.contains("target_feature=\"sse2\""),
+        "explicitly disabled target feature was ignored:\n{without_sse2}"
+    );
+    assert!(
+        disabled_stderr.contains("must be enabled to ensure that the ABI"),
+        "disabling mandatory SSE2 did not produce rustc's ABI diagnostic:\n{disabled_stderr}"
+    );
+
+    let target_json = std::fs::read_to_string(target).expect("could not read target spec");
+    assert!(
+        !target_json.contains("\"stack-probes\""),
+        ".NET must not inherit native x86 inline stack probes"
+    );
+}
+
 static RUSTC_CODEGEN_CLR_LINKER: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
     let _ = *RUSTC_BUILD_STATUS;
     if cfg!(debug_assertions) {
@@ -1072,7 +1170,7 @@ pub fn rustc_args() -> Box<[String]> {
             "-Z".to_owned(),
             "randomize-layout".to_owned(),
             "--edition".to_owned(),
-            "2021".to_owned(),
+            STANDALONE_TEST_EDITION.to_owned(),
         ]
         .into()
     } else {
@@ -1082,7 +1180,7 @@ pub fn rustc_args() -> Box<[String]> {
             "-C".to_owned(),
             format!("linker={}", RUSTC_CODEGEN_CLR_LINKER.display()),
             "--edition".to_owned(),
-            "2021".to_owned(),
+            STANDALONE_TEST_EDITION.to_owned(),
         ]
         .into()
     }
@@ -1101,5 +1199,7 @@ pub fn cargo_build_env() -> String {
         ""
     };
 
-    format!("-Z codegen-backend={backend} -C linker={linker} -C link-args={link_args}   {radomize_layout}")
+    format!(
+        "-Z codegen-backend={backend} -C linker={linker} -C link-args={link_args}   {radomize_layout}"
+    )
 }

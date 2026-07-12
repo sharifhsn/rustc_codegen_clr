@@ -2,10 +2,10 @@ use std::fmt::Debug;
 
 use crate::bimap::Interned;
 
+use crate::Assembly;
 use crate::cilnode::{ExtendKind, IsPure, MethodKind};
 use crate::ir::{BasicBlock, CILNode};
 use crate::{BinOp, BranchCond, CILRoot, MethodDef, Type};
-use crate::Assembly;
 use crate::{ClassRef, FnSig, Int, MethodRef, StaticFieldDesc};
 
 pub fn argc_argv_init_method(asm: &mut Assembly) -> Interned<MethodRef> {
@@ -73,7 +73,10 @@ pub fn get_environ(asm: &mut Assembly) -> Interned<MethodRef> {
             Some(asm.alloc_string("envc")),
             asm.alloc_type(Type::Int(Int::I32)),
         ),
-        (Some(asm.alloc_string("arr_ptr")), asm.alloc_type(uint8_ptr_ptr)),
+        (
+            Some(asm.alloc_string("arr_ptr")),
+            asm.alloc_type(uint8_ptr_ptr),
+        ),
         (
             Some(asm.alloc_string("idx")),
             asm.alloc_type(Type::Int(Int::I32)),
@@ -98,8 +101,11 @@ pub fn get_environ(asm: &mut Assembly) -> Interned<MethodRef> {
     let loop_end_bb: u32 = 3;
     let ret_bb: u32 = 4;
     // Environ static field load.
-    let environ_descr =
-        StaticFieldDesc::new(*asm.main_module(), asm.alloc_string("environ"), uint8_ptr_ptr);
+    let environ_descr = StaticFieldDesc::new(
+        *asm.main_module(),
+        asm.alloc_string("environ"),
+        uint8_ptr_ptr,
+    );
     let environ_fld = asm.alloc_sfld(environ_descr);
     let environ = asm.alloc_node(CILNode::LdStaticField(environ_fld));
 
@@ -262,10 +268,7 @@ pub fn get_environ(asm: &mut Assembly) -> Interned<MethodRef> {
     let addr = asm.biop(ld_arr_ptr, mul, BinOp::Add);
     let u8_ptr_ty = asm.nptr(Type::Int(Int::U8));
     loop_body_roots.push(asm.alloc_root(CILRoot::StInd(Box::new((
-        addr,
-        utf8_kval,
-        u8_ptr_ty,
-        false,
+        addr, utf8_kval, u8_ptr_ty, false,
     )))));
     let ld_idx = asm.ld_loc(idx);
     let one_i32 = asm.alloc_node(1_i32);
@@ -290,14 +293,13 @@ pub fn get_environ(asm: &mut Assembly) -> Interned<MethodRef> {
     let mul = asm.int_cast(mul, Int::USize, ExtendKind::ZeroExtend);
     let addr = asm.biop(ld_arr_ptr, mul, BinOp::Add);
     let u8_ptr_ty = asm.nptr(Type::Int(Int::U8));
-    loop_end_roots.push(asm.alloc_root(CILRoot::StInd(Box::new((
-        addr,
-        null_ptr,
-        u8_ptr_ty,
-        false,
-    )))));
-    let environ_descr2 =
-        StaticFieldDesc::new(*asm.main_module(), asm.alloc_string("environ"), uint8_ptr_ptr);
+    loop_end_roots
+        .push(asm.alloc_root(CILRoot::StInd(Box::new((addr, null_ptr, u8_ptr_ty, false)))));
+    let environ_descr2 = StaticFieldDesc::new(
+        *asm.main_module(),
+        asm.alloc_string("environ"),
+        uint8_ptr_ptr,
+    );
     let environ_fld2 = asm.alloc_sfld(environ_descr2);
     let ld_arr_ptr = asm.ld_loc(arr_ptr);
     loop_end_roots.push(asm.alloc_root(CILRoot::SetStaticField {

@@ -17,7 +17,7 @@
 // All are thin, move-only handles to a Rust-owned allocation; call Dispose() (or use `using`) to
 // free it (and, for RustBoxVec, to release the element GCHandles).
 //
-// The Rust cores are `MainModule.rcl_vec_*` / `rcl_map_*` / `rcl_str_*` — flat `#[no_mangle]` symbols
+// The Rust cores are `MainModule.rcl_vec_*` / `rcl_map_*` / `rcl_str_*` — flat `#[unsafe(no_mangle)]` symbols
 // on the consuming crate's module. `global::MainModule` names them regardless of this file's
 // namespace. A wrapper here compiles only if the matching `export_rust_*!()` macro was invoked in the
 // Rust cdylib; otherwise Roslyn reports the unresolved MainModule member (a clear signal).

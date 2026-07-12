@@ -7,7 +7,7 @@
 //! like C's `void* + size_t`). That one monomorphization serves `RustVec<int>`, `RustVec<MyStruct>`,
 //! … for any `T: unmanaged`, near-zero-cost and layout-preserving.
 //!
-//! This crate is that core: a size-erased growable vector exposed as `#[no_mangle] pub extern "C"`
+//! This crate is that core: a size-erased growable vector exposed as `#[unsafe(no_mangle)] pub extern "C"`
 //! functions (`public static` methods on `MainModule` after `cargo dotnet build`). The handle is an
 //! opaque `usize` (a boxed pointer) so nothing but primitives + thin `*const u8`/`*mut u8` pointers
 //! cross the boundary — all already-proven marshalling (cf. `cd_interop`'s `(ptr, len)` strings).
@@ -25,7 +25,7 @@ struct RustVec {
 
 /// `new RustVec<T>()` — create an empty vector whose element is `elem_size` bytes wide.
 /// Returns an opaque handle (a boxed pointer as `usize`); `0` is never a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn rcl_vec_new(elem_size: usize) -> usize {
     let v = Box::new(RustVec {
         elem_size,
@@ -36,7 +36,7 @@ pub extern "C" fn rcl_vec_new(elem_size: usize) -> usize {
 }
 
 /// `vec.Push(value)` — append `elem_size` bytes read from `elem` (a pointer to the caller's value).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rcl_vec_push(handle: usize, elem: *const u8) {
     let v = &mut *(handle as *mut RustVec);
     let es = v.elem_size;
@@ -48,7 +48,7 @@ pub unsafe extern "C" fn rcl_vec_push(handle: usize, elem: *const u8) {
 
 /// `vec[idx]` (read) — copy element `idx`'s `elem_size` bytes into `out`. Returns `false` (writing
 /// nothing) if `idx` is out of range, so the C# side can raise its own `IndexOutOfRangeException`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rcl_vec_get(handle: usize, idx: usize, out: *mut u8) -> bool {
     let v = &*(handle as *const RustVec);
     if idx >= v.len {
@@ -61,7 +61,7 @@ pub unsafe extern "C" fn rcl_vec_get(handle: usize, idx: usize, out: *mut u8) ->
 
 /// `vec[idx] = value` (write) — overwrite element `idx`'s bytes from `elem`. Returns `false` if out
 /// of range (no write).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rcl_vec_set(handle: usize, idx: usize, elem: *const u8) -> bool {
     let v = &mut *(handle as *mut RustVec);
     if idx >= v.len {
@@ -73,14 +73,14 @@ pub unsafe extern "C" fn rcl_vec_set(handle: usize, idx: usize, elem: *const u8)
 }
 
 /// `vec.Count`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rcl_vec_len(handle: usize) -> usize {
     (*(handle as *const RustVec)).len
 }
 
 /// Sum of every element interpreted as a little-endian `i32` (a tiny "Rust does real work over the
 /// elements" check, so the demo isn't only marshalling). Only meaningful for `RustVec<int>`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rcl_vec_sum_i32(handle: usize) -> i64 {
     let v = &*(handle as *const RustVec);
     let mut sum: i64 = 0;
@@ -93,7 +93,7 @@ pub unsafe extern "C" fn rcl_vec_sum_i32(handle: usize) -> i64 {
 }
 
 /// `vec.Dispose()` — free the backing allocation. The handle is invalid afterwards.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rcl_vec_free(handle: usize) {
     drop(Box::from_raw(handle as *mut RustVec));
 }

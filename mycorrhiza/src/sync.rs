@@ -14,7 +14,7 @@
 //!
 //! Separately, [`channel`]/[`bounded_channel`] give a `std::sync::mpsc`-shaped [`Sender<T>`]/
 //! [`Receiver<T>`] pair over `System.Threading.Channels` — genuinely multi-producer multi-consumer
-//! (both handles are `Copy`), with blocking, non-blocking (`try_*`), and `.await`-able forms of
+//! (both handles are cheaply `Clone`), with blocking, non-blocking (`try_*`), and `.await`-able forms of
 //! send/receive. See [`channel`]'s docs for its own cross-language nuance.
 //!
 //! This mirrors [`crate::task`]'s conventions: thin, `#[inline]` wrappers over the raw generated
@@ -41,22 +41,31 @@
 //! cross-language coordination where a *managed* lock object is shared by reference between a Rust
 //! side and a C# side.
 
-use crate::bindings::{
-    System::Threading::{Barrier as RawBarrier, CountdownEvent as RawCountdownEvent,
-        ManualResetEventSlim as RawManualResetEventSlim, ReaderWriterLockSlim as RawReaderWriterLockSlim,
-        SemaphoreSlim as RawSemaphoreSlim},
+use crate::bindings::System::Threading::{
+    Barrier as RawBarrier, CountdownEvent as RawCountdownEvent,
+    ManualResetEventSlim as RawManualResetEventSlim,
+    ReaderWriterLockSlim as RawReaderWriterLockSlim, SemaphoreSlim as RawSemaphoreSlim,
 };
+use crate::class::{Class, GenericClass};
 use crate::intrinsics::{
-    rustc_clr_interop_generic_call1, rustc_clr_interop_generic_call2, rustc_clr_interop_generic_call3,
-    rustc_clr_interop_generic_method_call0, rustc_clr_interop_generic_method_call1,
     RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric,
-    RustcCLRInteropManagedGenericStruct, RustcCLRInteropManagedStruct, RustcCLRInteropMethodGeneric,
-    RustcCLRInteropTypeGeneric,
+    RustcCLRInteropManagedGenericStruct, RustcCLRInteropManagedStruct,
+    RustcCLRInteropMethodGeneric, RustcCLRInteropTypeGeneric, rustc_clr_interop_generic_call1,
+    rustc_clr_interop_generic_call2, rustc_clr_interop_generic_call3,
+    rustc_clr_interop_generic_method_call0, rustc_clr_interop_generic_method_call1,
 };
-use crate::task::{await_task, await_unit, Task, TaskT};
+use crate::task::{Task, TaskT, await_task, await_unit};
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::ops::{Deref, DerefMut};
+
+type RootSemaphoreSlim = Class<"System.Private.CoreLib", "System.Threading.SemaphoreSlim">;
+type RootManualResetEventSlim =
+    Class<"System.Private.CoreLib", "System.Threading.ManualResetEventSlim">;
+type RootCountdownEvent = Class<"System.Threading", "System.Threading.CountdownEvent">;
+type RootBarrier = Class<"System.Threading", "System.Threading.Barrier">;
+type RootReaderWriterLockSlim =
+    Class<"System.Private.CoreLib", "System.Threading.ReaderWriterLockSlim">;
 
 // =================================================================================================
 // Semaphore
@@ -69,9 +78,9 @@ use core::ops::{Deref, DerefMut};
 /// Unlike `std::sync::Mutex`, a semaphore's "unlock" ([`release`](Semaphore::release)) is **not**
 /// tied to the acquiring thread — any holder of the handle can release it, from any thread. This is
 /// exactly the property that makes [`SharedLock`] (below) meaningful across the Rust/C# boundary.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Semaphore {
-    h: RawSemaphoreSlim,
+    h: RootSemaphoreSlim,
 }
 
 impl Semaphore {
@@ -80,51 +89,53 @@ impl Semaphore {
     /// the one-argument .NET constructor).
     #[inline]
     pub fn new(initial_count: i32) -> Self {
-        Self { h: RawSemaphoreSlim::new(initial_count) }
+        Self::from_raw(RawSemaphoreSlim::new(initial_count))
     }
 
     /// Wrap a raw managed `SemaphoreSlim` handle (e.g. one received from C#, or produced by
     /// [`SharedLock::raw`]).
     #[inline]
     pub fn from_raw(h: RawSemaphoreSlim) -> Self {
-        Self { h }
+        Self {
+            h: RootSemaphoreSlim::from_naked_ref(h),
+        }
     }
 
     /// The raw managed handle, for handing the semaphore to a .NET API (or to C#) expecting
     /// `System.Threading.SemaphoreSlim`.
     #[inline]
-    pub fn raw(self) -> RawSemaphoreSlim {
-        self.h
+    pub fn raw(&self) -> RawSemaphoreSlim {
+        unsafe { self.h.get_naked_ref() }
     }
 
     /// `SemaphoreSlim.Wait()` — block the calling thread until a permit is available, then take one.
     /// Prefer [`acquire`](Semaphore::acquire) for the RAII form (guarantees the matching release).
     #[inline]
-    pub fn wait(self) {
-        self.h.wait();
+    pub fn wait(&self) {
+        self.raw().wait();
     }
 
     /// `SemaphoreSlim.Release()` — return one permit, waking a waiter if any. Returns the semaphore's
     /// previous count (the count just before this release), matching the .NET API. Prefer
     /// [`acquire`](Semaphore::acquire)'s RAII guard over calling this directly.
     #[inline]
-    pub fn release(self) -> i32 {
-        self.h.release()
+    pub fn release(&self) -> i32 {
+        self.raw().release()
     }
 
     /// `SemaphoreSlim.CurrentCount` — the number of permits currently available (a snapshot; may be
     /// stale the instant it's read under contention).
     #[inline]
-    pub fn current_count(self) -> i32 {
-        self.h.get_current_count()
+    pub fn current_count(&self) -> i32 {
+        self.raw().get_current_count()
     }
 
     /// Blocking acquire — waits for a permit, then returns a [`SemaphorePermit`] RAII guard that
     /// releases it automatically on drop. This is the recommended entry point (mirrors
     /// `std::sync::Mutex::lock`'s guard shape).
     #[inline]
-    pub fn acquire(self) -> SemaphorePermit {
-        self.h.wait();
+    pub fn acquire(&self) -> SemaphorePermit<'_> {
+        self.wait();
         SemaphorePermit { sem: self }
     }
 
@@ -137,10 +148,12 @@ impl Semaphore {
     /// `.await` *inside* a suspending `async fn` state machine — drive it with
     /// [`crate::task::block_on`] instead.
     #[inline]
-    pub fn acquire_async(self) -> impl Future<Output = SemaphorePermit> {
-        let wtask = Task::from_raw(self.h.wait_async());
+    pub fn acquire_async(&self) -> impl Future<Output = SemaphorePermit<'_>> {
+        // Root the naked Task before constructing the coroutine. Capturing `Task` itself would put
+        // a managed reference in the coroutine's overlapping state storage.
+        let wait = await_unit(Task::from_raw(self.raw().wait_async()));
         async move {
-            await_unit(wtask).await;
+            wait.await;
             SemaphorePermit { sem: self }
         }
     }
@@ -148,11 +161,11 @@ impl Semaphore {
 
 /// RAII guard returned by [`Semaphore::acquire`] / [`Semaphore::acquire_async`] — releases its permit
 /// back to the semaphore when dropped, exactly once.
-pub struct SemaphorePermit {
-    sem: Semaphore,
+pub struct SemaphorePermit<'a> {
+    sem: &'a Semaphore,
 }
 
-impl Drop for SemaphorePermit {
+impl Drop for SemaphorePermit<'_> {
     #[inline]
     fn drop(&mut self) {
         self.sem.release();
@@ -167,9 +180,9 @@ impl Drop for SemaphorePermit {
 /// wakes **every** current and future waiter (until [`reset`](Signal::reset) clears it again) rather
 /// than handing out one permit per release — the .NET analog of `std::sync::Condvar` combined with a
 /// sticky boolean.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Signal {
-    h: RawManualResetEventSlim,
+    h: RootManualResetEventSlim,
 }
 
 impl Signal {
@@ -177,45 +190,47 @@ impl Signal {
     /// first [`set`](Signal::set)).
     #[inline]
     pub fn new() -> Self {
-        Self { h: RawManualResetEventSlim::new() }
+        Self::from_raw(RawManualResetEventSlim::new())
     }
 
     /// Wrap a raw managed `ManualResetEventSlim` handle.
     #[inline]
     pub fn from_raw(h: RawManualResetEventSlim) -> Self {
-        Self { h }
+        Self {
+            h: RootManualResetEventSlim::from_naked_ref(h),
+        }
     }
 
     /// The raw managed handle.
     #[inline]
-    pub fn raw(self) -> RawManualResetEventSlim {
-        self.h
+    pub fn raw(&self) -> RawManualResetEventSlim {
+        unsafe { self.h.get_naked_ref() }
     }
 
     /// `ManualResetEventSlim.Set()` — put the signal into the set state, releasing all current and
     /// future waiters until the next [`reset`](Signal::reset).
     #[inline]
-    pub fn set(self) {
-        self.h.set();
+    pub fn set(&self) {
+        self.raw().set();
     }
 
     /// `ManualResetEventSlim.Wait()` — block the calling thread until the signal is set. Returns
     /// immediately if it is already set.
     #[inline]
-    pub fn wait(self) {
-        self.h.wait();
+    pub fn wait(&self) {
+        self.raw().wait();
     }
 
     /// `ManualResetEventSlim.Reset()` — put the signal back into the unset state.
     #[inline]
-    pub fn reset(self) {
-        self.h.reset();
+    pub fn reset(&self) {
+        self.raw().reset();
     }
 
     /// `ManualResetEventSlim.IsSet` — `true` if the signal is currently set.
     #[inline]
-    pub fn is_set(self) -> bool {
-        self.h.get_is_set()
+    pub fn is_set(&self) -> bool {
+        self.raw().get_is_set()
     }
 }
 
@@ -233,55 +248,57 @@ impl Default for Signal {
 /// A one-shot countdown latch — `System.Threading.CountdownEvent`. Starts at `initial_count` and
 /// counts down to zero via repeated [`signal`](CountdownEvent::signal) calls; [`wait`](CountdownEvent::wait)
 /// blocks until it reaches zero. The .NET analog of a `WaitGroup`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct CountdownEvent {
-    h: RawCountdownEvent,
+    h: RootCountdownEvent,
 }
 
 impl CountdownEvent {
     /// `new CountdownEvent(initialCount)`.
     #[inline]
     pub fn new(initial_count: i32) -> Self {
-        Self { h: RawCountdownEvent::new(initial_count) }
+        Self::from_raw(RawCountdownEvent::new(initial_count))
     }
 
     /// Wrap a raw managed `CountdownEvent` handle.
     #[inline]
     pub fn from_raw(h: RawCountdownEvent) -> Self {
-        Self { h }
+        Self {
+            h: RootCountdownEvent::from_naked_ref(h),
+        }
     }
 
     /// The raw managed handle.
     #[inline]
-    pub fn raw(self) -> RawCountdownEvent {
-        self.h
+    pub fn raw(&self) -> RawCountdownEvent {
+        unsafe { self.h.get_naked_ref() }
     }
 
     /// `CountdownEvent.Signal()` — decrement the count by one. Returns `true` if this call is the one
     /// that brought the count to zero (releasing all waiters); `false` otherwise.
     #[inline]
-    pub fn signal(self) -> bool {
-        self.h.signal()
+    pub fn signal(&self) -> bool {
+        self.raw().signal()
     }
 
     /// `CountdownEvent.Wait()` — block the calling thread until the count reaches zero. Returns
     /// immediately if it is already at zero.
     #[inline]
-    pub fn wait(self) {
-        self.h.wait();
+    pub fn wait(&self) {
+        self.raw().wait();
     }
 
     /// `CountdownEvent.IsSet` — `true` once the count has reached zero.
     #[inline]
-    pub fn is_set(self) -> bool {
-        self.h.get_is_set()
+    pub fn is_set(&self) -> bool {
+        self.raw().get_is_set()
     }
 
     /// `CountdownEvent.CurrentCount` — the number of signals still needed before the count reaches
     /// zero (a snapshot).
     #[inline]
-    pub fn current_count(self) -> i32 {
-        self.h.get_current_count()
+    pub fn current_count(&self) -> i32 {
+        self.raw().get_current_count()
     }
 }
 
@@ -292,73 +309,75 @@ impl CountdownEvent {
 /// A reusable cyclic barrier — `System.Threading.Barrier`. `participant_count` threads each call
 /// [`signal_and_wait`](Barrier::signal_and_wait); none proceeds past it until all have arrived, after
 /// which the barrier resets for its next phase (unlike [`CountdownEvent`], which is one-shot).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Barrier {
-    h: RawBarrier,
+    h: RootBarrier,
 }
 
 impl Barrier {
     /// `new Barrier(participantCount)`.
     #[inline]
     pub fn new(participant_count: i32) -> Self {
-        Self { h: RawBarrier::new(participant_count) }
+        Self::from_raw(RawBarrier::new(participant_count))
     }
 
     /// Wrap a raw managed `Barrier` handle.
     #[inline]
     pub fn from_raw(h: RawBarrier) -> Self {
-        Self { h }
+        Self {
+            h: RootBarrier::from_naked_ref(h),
+        }
     }
 
     /// The raw managed handle.
     #[inline]
-    pub fn raw(self) -> RawBarrier {
-        self.h
+    pub fn raw(&self) -> RawBarrier {
+        unsafe { self.h.get_naked_ref() }
     }
 
     /// `Barrier.SignalAndWait()` — signal arrival at the barrier and block until every participant has
     /// also arrived, then proceed (the barrier resets for the next phase).
     #[inline]
-    pub fn signal_and_wait(self) {
-        self.h.signal_and_wait();
+    pub fn signal_and_wait(&self) {
+        self.raw().signal_and_wait();
     }
 
     /// `Barrier.AddParticipant()` — register one additional participant (must happen between phases).
     /// Returns the phase number the new participant will first wait on.
     #[inline]
-    pub fn add_participant(self) -> i64 {
-        self.h.add_participant()
+    pub fn add_participant(&self) -> i64 {
+        self.raw().add_participant()
     }
 
     /// `Barrier.AddParticipants(n)` — register `n` additional participants at once.
     #[inline]
-    pub fn add_participants(self, n: i32) -> i64 {
-        self.h.add_participants(n)
+    pub fn add_participants(&self, n: i32) -> i64 {
+        self.raw().add_participants(n)
     }
 
     /// `Barrier.RemoveParticipant()` — unregister one participant.
     #[inline]
-    pub fn remove_participant(self) {
-        self.h.remove_participant();
+    pub fn remove_participant(&self) {
+        self.raw().remove_participant();
     }
 
     /// `Barrier.RemoveParticipants(n)` — unregister `n` participants at once.
     #[inline]
-    pub fn remove_participants(self, n: i32) {
-        self.h.remove_participants(n);
+    pub fn remove_participants(&self, n: i32) {
+        self.raw().remove_participants(n);
     }
 
     /// `Barrier.ParticipantCount` — the total number of registered participants.
     #[inline]
-    pub fn participant_count(self) -> i32 {
-        self.h.get_participant_count()
+    pub fn participant_count(&self) -> i32 {
+        self.raw().get_participant_count()
     }
 
     /// `Barrier.ParticipantsRemaining` — how many participants have yet to arrive at the current
     /// phase (a snapshot).
     #[inline]
-    pub fn participants_remaining(self) -> i32 {
-        self.h.get_participants_remaining()
+    pub fn participants_remaining(&self) -> i32 {
+        self.raw().get_participants_remaining()
     }
 }
 
@@ -398,9 +417,9 @@ impl Barrier {
 /// concurrent `Wait()` can now also succeed, defeating exclusion until the counts happen to realign.
 /// There is no compiler or runtime check protecting against this — code review and discipline are the
 /// only defenses, on both the Rust and the C# side of a shared `SharedLock`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SharedLock {
-    h: RawSemaphoreSlim,
+    h: RootSemaphoreSlim,
 }
 
 impl SharedLock {
@@ -410,7 +429,7 @@ impl SharedLock {
     /// max-count cap is what gives this extra safety net over a bare [`Semaphore::new`]`(1)`).
     #[inline]
     pub fn new() -> Self {
-        Self { h: RawSemaphoreSlim::new_with_max(1, 1) }
+        Self::from_raw(RawSemaphoreSlim::new_with_max(1, 1))
     }
 
     /// Wrap a raw managed `SemaphoreSlim` handle — e.g. one received from C#, so Rust can join a lock
@@ -418,7 +437,9 @@ impl SharedLock {
     /// that is on the caller (see the safety notes on [`SharedLock`] itself).
     #[inline]
     pub fn from_raw(h: RawSemaphoreSlim) -> Self {
-        Self { h }
+        Self {
+            h: RootSemaphoreSlim::from_naked_ref(h),
+        }
     }
 
     /// The raw managed `SemaphoreSlim` handle — hand this to a `#[dotnet_export]` return type (or a
@@ -426,15 +447,15 @@ impl SharedLock {
     /// object. See the [`SharedLock`] docs for exactly what this does and doesn't guarantee once C#
     /// holds it.
     #[inline]
-    pub fn raw(self) -> RawSemaphoreSlim {
-        self.h
+    pub fn raw(&self) -> RawSemaphoreSlim {
+        unsafe { self.h.get_naked_ref() }
     }
 
     /// Blocking acquire — `Wait()` then return a [`SharedLockGuard`] that calls `Release()` on drop.
     /// Blocks the calling thread (Rust-native or one .NET handed control to) until the lock is free.
     #[inline]
-    pub fn lock(self) -> SharedLockGuard {
-        self.h.wait();
+    pub fn lock(&self) -> SharedLockGuard<'_> {
+        self.raw().wait();
         SharedLockGuard { lock: self }
     }
 
@@ -442,10 +463,11 @@ impl SharedLock {
     /// for the lock without blocking the calling thread, returning a [`SharedLockGuard`] once
     /// acquired.
     #[inline]
-    pub fn lock_async(self) -> impl Future<Output = SharedLockGuard> {
-        let wtask = Task::from_raw(self.h.wait_async());
+    pub fn lock_async(&self) -> impl Future<Output = SharedLockGuard<'_>> {
+        // See `Semaphore::acquire_async`: only the rooted Task future may cross suspension.
+        let wait = await_unit(Task::from_raw(self.raw().wait_async()));
         async move {
-            await_unit(wtask).await;
+            wait.await;
             SharedLockGuard { lock: self }
         }
     }
@@ -462,14 +484,14 @@ impl Default for SharedLock {
 /// underlying `SemaphoreSlim` when dropped, exactly once. See [`SharedLock`]'s docs for the honest
 /// safety story: this guard protects Rust call sites correctly, but cannot protect a C# caller holding
 /// the same raw handle from an unbalanced `Release()` — that remains the C# side's responsibility.
-pub struct SharedLockGuard {
-    lock: SharedLock,
+pub struct SharedLockGuard<'a> {
+    lock: &'a SharedLock,
 }
 
-impl Drop for SharedLockGuard {
+impl Drop for SharedLockGuard<'_> {
     #[inline]
     fn drop(&mut self) {
-        self.lock.h.release();
+        self.lock.raw().release();
     }
 }
 
@@ -532,7 +554,10 @@ impl<T> SharedMutex<T> {
     /// Construct a fresh [`SharedLock`] (a new `SemaphoreSlim(1, 1)`) and wrap `value` behind it.
     #[inline]
     pub fn new(value: T) -> Self {
-        Self { lock: SharedLock::new(), data: UnsafeCell::new(value) }
+        Self {
+            lock: SharedLock::new(),
+            data: UnsafeCell::new(value),
+        }
     }
 
     /// Wrap a C#-supplied `SemaphoreSlim` handle as the mutex's lock, alongside a Rust-owned `value`.
@@ -542,7 +567,10 @@ impl<T> SharedMutex<T> {
     /// `lock_handle` is actually shaped `(1, 1)`; that is on the caller.
     #[inline]
     pub fn from_raw(lock_handle: RawSemaphoreSlim, value: T) -> Self {
-        Self { lock: SharedLock::from_raw(lock_handle), data: UnsafeCell::new(value) }
+        Self {
+            lock: SharedLock::from_raw(lock_handle),
+            data: UnsafeCell::new(value),
+        }
     }
 
     /// Expose *just* the raw lock — e.g. for a `#[dotnet_export]` to hand to C# so it can coordinate
@@ -551,14 +579,17 @@ impl<T> SharedMutex<T> {
     /// coordination, but no path to `value`'s memory.
     #[inline]
     pub fn shared_lock(&self) -> SharedLock {
-        self.lock
+        self.lock.clone()
     }
 
     /// Blocking acquire — waits for the lock, then returns a [`SharedMutexGuard`] giving safe `&T`/
     /// `&mut T` access via `Deref`/`DerefMut`, released automatically on drop.
     #[inline]
     pub fn lock(&self) -> SharedMutexGuard<'_, T> {
-        SharedMutexGuard { guard: self.lock.lock(), data: &self.data }
+        SharedMutexGuard {
+            guard: self.lock.lock(),
+            data: &self.data,
+        }
     }
 
     /// `.await`-adapted acquire, composing [`SharedLock::lock_async`] with the data guard — waits for
@@ -568,7 +599,12 @@ impl<T> SharedMutex<T> {
     #[inline]
     pub fn lock_async(&self) -> impl Future<Output = SharedMutexGuard<'_, T>> {
         let data = &self.data;
-        async move { SharedMutexGuard { guard: self.lock.lock_async().await, data } }
+        async move {
+            SharedMutexGuard {
+                guard: self.lock.lock_async().await,
+                data,
+            }
+        }
     }
 
     /// Safe, lock-free access: `&mut self` already statically proves exclusive access (no other
@@ -596,7 +632,7 @@ pub struct SharedMutexGuard<'a, T> {
     // Never read directly -- held purely so its `Drop` (releasing the SharedLock) fires when this
     // guard is dropped.
     #[allow(dead_code)]
-    guard: SharedLockGuard,
+    guard: SharedLockGuard<'a>,
     data: &'a UnsafeCell<T>,
 }
 
@@ -658,7 +694,7 @@ impl<T> DerefMut for SharedMutexGuard<'_, T> {
 /// never `T`'s memory, since `T` lives in a private `UnsafeCell<T>` this Rust value owns and never
 /// exposes across the interop boundary.
 pub struct SharedRwLock<T> {
-    lock: RawReaderWriterLockSlim,
+    lock: RootReaderWriterLockSlim,
     data: UnsafeCell<T>,
 }
 
@@ -676,7 +712,10 @@ impl<T> SharedRwLock<T> {
     /// `value`.
     #[inline]
     pub fn new(value: T) -> Self {
-        Self { lock: RawReaderWriterLockSlim::new(), data: UnsafeCell::new(value) }
+        Self {
+            lock: RootReaderWriterLockSlim::from_naked_ref(RawReaderWriterLockSlim::new()),
+            data: UnsafeCell::new(value),
+        }
     }
 
     /// Blocking acquire of a **read** (shared) lock — `EnterReadLock()`, then returns a
@@ -684,8 +723,11 @@ impl<T> SharedRwLock<T> {
     /// the lock concurrently, as long as no writer holds it.
     #[inline]
     pub fn read(&self) -> SharedRwLockReadGuard<'_, T> {
-        self.lock.enter_read_lock();
-        SharedRwLockReadGuard { lock: &self.lock, data: &self.data }
+        unsafe { self.lock.get_naked_ref() }.enter_read_lock();
+        SharedRwLockReadGuard {
+            lock: &self.lock,
+            data: &self.data,
+        }
     }
 
     /// Blocking acquire of the **write** (exclusive) lock — `EnterWriteLock()`, then returns a
@@ -693,8 +735,11 @@ impl<T> SharedRwLock<T> {
     /// every reader and every other writer until dropped.
     #[inline]
     pub fn write(&self) -> SharedRwLockWriteGuard<'_, T> {
-        self.lock.enter_write_lock();
-        SharedRwLockWriteGuard { lock: &self.lock, data: &self.data }
+        unsafe { self.lock.get_naked_ref() }.enter_write_lock();
+        SharedRwLockWriteGuard {
+            lock: &self.lock,
+            data: &self.data,
+        }
     }
 
     /// Safe, lock-free access: `&mut self` already statically proves exclusive access, so no
@@ -716,7 +761,7 @@ impl<T> SharedRwLock<T> {
 /// the underlying `ReaderWriterLockSlim` when dropped. See [`SharedRwLock`]'s docs for the honest
 /// safety story relative to a C# caller.
 pub struct SharedRwLockReadGuard<'a, T> {
-    lock: &'a RawReaderWriterLockSlim,
+    lock: &'a RootReaderWriterLockSlim,
     data: &'a UnsafeCell<T>,
 }
 
@@ -736,7 +781,7 @@ impl<T> Deref for SharedRwLockReadGuard<'_, T> {
 impl<T> Drop for SharedRwLockReadGuard<'_, T> {
     #[inline]
     fn drop(&mut self) {
-        self.lock.exit_read_lock();
+        unsafe { self.lock.get_naked_ref() }.exit_read_lock();
     }
 }
 
@@ -744,7 +789,7 @@ impl<T> Drop for SharedRwLockReadGuard<'_, T> {
 /// `ExitWriteLock()` on the underlying `ReaderWriterLockSlim` when dropped. See [`SharedRwLock`]'s
 /// docs for the honest safety story relative to a C# caller.
 pub struct SharedRwLockWriteGuard<'a, T> {
-    lock: &'a RawReaderWriterLockSlim,
+    lock: &'a RootReaderWriterLockSlim,
     data: &'a UnsafeCell<T>,
 }
 
@@ -771,7 +816,7 @@ impl<T> DerefMut for SharedRwLockWriteGuard<'_, T> {
 impl<T> Drop for SharedRwLockWriteGuard<'_, T> {
     #[inline]
     fn drop(&mut self) {
-        self.lock.exit_write_lock();
+        unsafe { self.lock.get_naked_ref() }.exit_write_lock();
     }
 }
 
@@ -831,7 +876,10 @@ impl<T> SharedOnce<T> {
     /// `SemaphoreSlim(1, 1)`) to guard the one-time write. Mirrors `OnceLock::new()`.
     #[inline]
     pub fn new() -> Self {
-        Self { lock: SharedLock::new(), data: UnsafeCell::new(None) }
+        Self {
+            lock: SharedLock::new(),
+            data: UnsafeCell::new(None),
+        }
     }
 
     /// Expose *just* the raw lock — e.g. for a `#[dotnet_export]` to hand to C# so it can coordinate
@@ -840,7 +888,7 @@ impl<T> SharedOnce<T> {
     /// coordination, but no path to `T`'s memory.
     #[inline]
     pub fn shared_lock(&self) -> SharedLock {
-        self.lock
+        self.lock.clone()
     }
 
     /// Returns `&T` if the cell has already been initialized, `None` otherwise. Never blocks and
@@ -896,9 +944,9 @@ impl<T> Default for SharedOnce<T> {
 //
 // `System.Threading.Channels` is the .NET analog of `std::sync::mpsc`, but it is genuinely
 // **multi-producer multi-consumer** (any number of `ChannelWriter<T>`/`ChannelReader<T>` handles may
-// send/receive concurrently — [`Sender`]/[`Receiver`] here are `Copy`, unlike `std::sync::mpsc`'s
-// single-consumer-only, non-`Clone` `Receiver`), and every operation has both a synchronous,
-// non-blocking form (`TryWrite`/`TryRead`) and a `Task`-returning asynchronous form
+// send/receive concurrently — [`Sender`]/[`Receiver`] here are rooted and `Clone`, unlike
+// `std::sync::mpsc`'s single-consumer-only, non-`Clone` `Receiver`), and every operation has both a
+// synchronous, non-blocking form (`TryWrite`/`TryRead`) and a `Task`-returning asynchronous form
 // (`WriteAsync`/`ReadAsync`), which this module exposes as blocking and `.await`-able Rust APIs
 // respectively via the existing [`crate::task`] Task↔Future bridge — no second bridge is built here.
 //
@@ -917,16 +965,21 @@ const CHANNEL_WRITER: &str = "System.Threading.Channels.ChannelWriter";
 type RawReader<T> = RustcCLRInteropManagedGeneric<CHANNELS_ASM, CHANNEL_READER, (T,)>;
 /// A managed `ChannelWriter<T>` handle.
 type RawWriter<T> = RustcCLRInteropManagedGeneric<CHANNELS_ASM, CHANNEL_WRITER, (T,)>;
+type RootReader<T> = GenericClass<CHANNELS_ASM, CHANNEL_READER, (T,)>;
+type RootWriter<T> = GenericClass<CHANNELS_ASM, CHANNEL_WRITER, (T,)>;
 /// The def-shape (`!0`) reader/writer handles a `Channel<T>` `.Reader`/`.Writer` getter returns,
 /// before the class generic is bound to the caller's concrete `T`.
-type ReaderMG = RustcCLRInteropManagedGeneric<CHANNELS_ASM, CHANNEL_READER, (RustcCLRInteropTypeGeneric<0>,)>;
-type WriterMG = RustcCLRInteropManagedGeneric<CHANNELS_ASM, CHANNEL_WRITER, (RustcCLRInteropTypeGeneric<0>,)>;
+type ReaderMG =
+    RustcCLRInteropManagedGeneric<CHANNELS_ASM, CHANNEL_READER, (RustcCLRInteropTypeGeneric<0>,)>;
+type WriterMG =
+    RustcCLRInteropManagedGeneric<CHANNELS_ASM, CHANNEL_WRITER, (RustcCLRInteropTypeGeneric<0>,)>;
 /// A managed `Channel<T>` handle (the pair-holding object `.Reader`/`.Writer` are read off).
 type RawChannel<T> = RustcCLRInteropManagedGeneric<CHANNELS_ASM, CHANNEL, (T,)>;
 /// The def-shape (`!!0`, a METHOD generic — `Channel.CreateBounded`/`CreateUnbounded` are static
 /// methods on the non-generic `Channel` class, so their own type parameter is a *method* generic,
 /// not a class generic) `Channel<!!0>` the two factories return.
-type ChannelMethodGen = RustcCLRInteropManagedGeneric<CHANNELS_ASM, CHANNEL, (RustcCLRInteropMethodGeneric<0>,)>;
+type ChannelMethodGen =
+    RustcCLRInteropManagedGeneric<CHANNELS_ASM, CHANNEL, (RustcCLRInteropMethodGeneric<0>,)>;
 
 const CORELIB: &str = "System.Private.CoreLib";
 const CANCELLATION_TOKEN: &str = "System.Threading.CancellationToken";
@@ -934,7 +987,8 @@ const CANCELLATION_TOKEN: &str = "System.Threading.CancellationToken";
 /// value type; like `Nullable<T>`/`Span<T>` elsewhere in this crate, `SIZE` is a Rust-side placeholder
 /// the backend never reads — the CLR alone knows and uses the real layout.
 const CANCELLATION_TOKEN_SIZE: usize = core::mem::size_of::<usize>();
-type RawCancellationToken = RustcCLRInteropManagedStruct<CORELIB, CANCELLATION_TOKEN, CANCELLATION_TOKEN_SIZE>;
+type RawCancellationToken =
+    RustcCLRInteropManagedStruct<CORELIB, CANCELLATION_TOKEN, CANCELLATION_TOKEN_SIZE>;
 
 /// `CancellationToken.None` (the static property getter) — every `*Async` call below passes this
 /// rather than hand-constructing a zeroed value type, so the CLR itself builds the value.
@@ -947,7 +1001,15 @@ fn no_cancellation() -> RawCancellationToken {
 /// non-generic `Channel` class, returning `Channel<!!0>` (bound to `Channel<T>` at this call site).
 fn create_unbounded<T>() -> RawChannel<T> {
     rustc_clr_interop_generic_method_call0::<
-        CHANNELS_ASM, CHANNEL, false, "CreateUnbounded", 0u8, (), (T,), (ChannelMethodGen,), RawChannel<T>,
+        CHANNELS_ASM,
+        CHANNEL,
+        false,
+        "CreateUnbounded",
+        0u8,
+        (),
+        (T,),
+        (ChannelMethodGen,),
+        RawChannel<T>,
     >()
 }
 
@@ -955,20 +1017,45 @@ fn create_unbounded<T>() -> RawChannel<T> {
 /// with one real `int capacity` argument.
 fn create_bounded<T>(capacity: i32) -> RawChannel<T> {
     rustc_clr_interop_generic_method_call1::<
-        CHANNELS_ASM, CHANNEL, false, "CreateBounded", 0u8, (), (T,), (ChannelMethodGen, i32), RawChannel<T>, i32,
+        CHANNELS_ASM,
+        CHANNEL,
+        false,
+        "CreateBounded",
+        0u8,
+        (),
+        (T,),
+        (ChannelMethodGen, i32),
+        RawChannel<T>,
+        i32,
     >(capacity)
 }
 
 /// `Channel<T>.Reader` — instance getter, `callvirt`, nested-generic def-shape return `ChannelReader<!0>`.
 fn channel_reader<T>(ch: RawChannel<T>) -> RawReader<T> {
     rustc_clr_interop_generic_call1::<
-        CHANNELS_ASM, CHANNEL, false, "get_Reader", 2, (T,), (ReaderMG,), RawReader<T>, RawChannel<T>,
+        CHANNELS_ASM,
+        CHANNEL,
+        false,
+        "get_Reader",
+        2,
+        (T,),
+        (ReaderMG,),
+        RawReader<T>,
+        RawChannel<T>,
     >(ch)
 }
 /// `Channel<T>.Writer` — instance getter, same shape as [`channel_reader`].
 fn channel_writer<T>(ch: RawChannel<T>) -> RawWriter<T> {
     rustc_clr_interop_generic_call1::<
-        CHANNELS_ASM, CHANNEL, false, "get_Writer", 2, (T,), (WriterMG,), RawWriter<T>, RawChannel<T>,
+        CHANNELS_ASM,
+        CHANNEL,
+        false,
+        "get_Writer",
+        2,
+        (T,),
+        (WriterMG,),
+        RawWriter<T>,
+        RawChannel<T>,
     >(ch)
 }
 
@@ -976,8 +1063,16 @@ fn channel_writer<T>(ch: RawChannel<T>) -> RawWriter<T> {
 /// or already completed.
 fn writer_try_write<T>(w: RawWriter<T>, item: T) -> bool {
     rustc_clr_interop_generic_call2::<
-        CHANNELS_ASM, CHANNEL_WRITER, false, "TryWrite", 2, (T,),
-        (bool, RustcCLRInteropTypeGeneric<0>), bool, RawWriter<T>, T,
+        CHANNELS_ASM,
+        CHANNEL_WRITER,
+        false,
+        "TryWrite",
+        2,
+        (T,),
+        (bool, RustcCLRInteropTypeGeneric<0>),
+        bool,
+        RawWriter<T>,
+        T,
     >(w, item)
 }
 
@@ -985,13 +1080,24 @@ fn writer_try_write<T>(w: RawWriter<T>, item: T) -> bool {
 /// returns. As with `CancellationToken` above, `SIZE` is a Rust-side placeholder; the CLR knows the
 /// real layout (an `object`, a `short`, and a `bool`).
 const VALUE_TASK: &str = "System.Threading.Tasks.ValueTask";
-type RawValueTask = RustcCLRInteropManagedStruct<CORELIB, VALUE_TASK, { core::mem::size_of::<usize>() * 2 }>;
+type RawValueTask =
+    RustcCLRInteropManagedStruct<CORELIB, VALUE_TASK, { core::mem::size_of::<usize>() * 2 }>;
 /// `System.Threading.Tasks.ValueTask<T>` — the generic-value-type counterpart `ChannelReader<T>.ReadAsync`
 /// returns, reached through [`RustcCLRInteropManagedGenericStruct`] (the value-type-generic marker, same
 /// role as [`crate::nullable::Nullable`]).
-type RawValueTaskT<T> = RustcCLRInteropManagedGenericStruct<CORELIB, VALUE_TASK, { core::mem::size_of::<usize>() * 2 }, (T,)>;
+type RawValueTaskT<T> = RustcCLRInteropManagedGenericStruct<
+    CORELIB,
+    VALUE_TASK,
+    { core::mem::size_of::<usize>() * 2 },
+    (T,),
+>;
 /// The def-shape `ValueTask<!0>` a `ReadAsync` methodref return spells before `T` is bound.
-type ValueTaskMG = RustcCLRInteropManagedGenericStruct<CORELIB, VALUE_TASK, { core::mem::size_of::<usize>() * 2 }, (RustcCLRInteropTypeGeneric<0>,)>;
+type ValueTaskMG = RustcCLRInteropManagedGenericStruct<
+    CORELIB,
+    VALUE_TASK,
+    { core::mem::size_of::<usize>() * 2 },
+    (RustcCLRInteropTypeGeneric<0>,),
+>;
 const TASK_CLASS: &str = "System.Threading.Tasks.Task";
 type RawTaskHandle = RustcCLRInteropManagedClass<CORELIB, TASK_CLASS>;
 
@@ -1000,9 +1106,21 @@ type RawTaskHandle = RustcCLRInteropManagedClass<CORELIB, TASK_CLASS>;
 /// existing Task↔Future bridge rather than adding a second one for `ValueTask`.
 fn writer_write_async<T>(w: RawWriter<T>, item: T) -> Task {
     let vt: RawValueTask = rustc_clr_interop_generic_call3::<
-        CHANNELS_ASM, CHANNEL_WRITER, false, "WriteAsync", 2, (T,),
-        (RawValueTask, RustcCLRInteropTypeGeneric<0>, RawCancellationToken),
-        RawValueTask, RawWriter<T>, T, RawCancellationToken,
+        CHANNELS_ASM,
+        CHANNEL_WRITER,
+        false,
+        "WriteAsync",
+        2,
+        (T,),
+        (
+            RawValueTask,
+            RustcCLRInteropTypeGeneric<0>,
+            RawCancellationToken,
+        ),
+        RawValueTask,
+        RawWriter<T>,
+        T,
+        RawCancellationToken,
     >(w, item, no_cancellation());
     Task::from_raw(vt.vt_instance0::<"AsTask", RawTaskHandle>())
 }
@@ -1011,9 +1129,20 @@ fn writer_write_async<T>(w: RawWriter<T>, item: T) -> Task {
 fn writer_try_complete<T>(w: RawWriter<T>) -> bool {
     type CException = RustcCLRInteropManagedClass<CORELIB, "System.Exception">;
     rustc_clr_interop_generic_call2::<
-        CHANNELS_ASM, CHANNEL_WRITER, false, "TryComplete", 2, (T,),
-        (bool, CException), bool, RawWriter<T>, CException,
-    >(w, crate::intrinsics::rustc_clr_interop_managed_ld_null::<CException>())
+        CHANNELS_ASM,
+        CHANNEL_WRITER,
+        false,
+        "TryComplete",
+        2,
+        (T,),
+        (bool, CException),
+        bool,
+        RawWriter<T>,
+        CException,
+    >(
+        w,
+        crate::intrinsics::rustc_clr_interop_managed_ld_null::<CException>(),
+    )
 }
 
 /// `ChannelReader<T>.TryRead(out item)` — non-blocking. `TryRead`'s `out` parameter is a managed byref,
@@ -1024,9 +1153,16 @@ fn reader_try_read<T>(r: RawReader<T>) -> Option<T> {
     use crate::intrinsics::RustcCLRInteropByRef;
     let mut slot = core::mem::MaybeUninit::<T>::uninit();
     let ok = rustc_clr_interop_generic_call2::<
-        CHANNELS_ASM, CHANNEL_READER, false, "TryRead", 2, (T,),
+        CHANNELS_ASM,
+        CHANNEL_READER,
+        false,
+        "TryRead",
+        2,
+        (T,),
         (bool, RustcCLRInteropByRef<RustcCLRInteropTypeGeneric<0>>),
-        bool, RawReader<T>, *mut T,
+        bool,
+        RawReader<T>,
+        *mut T,
     >(r, slot.as_mut_ptr());
     if ok {
         // SAFETY: `TryRead` returning `true` means the CLR wrote a live `T` through the byref before
@@ -1042,37 +1178,57 @@ fn reader_try_read<T>(r: RawReader<T>) -> Option<T> {
 /// [`crate::nullable`]'s `get_Value`/`get_HasValue`.
 fn reader_read_async<T>(r: RawReader<T>) -> TaskT<T> {
     let vt: RawValueTaskT<T> = rustc_clr_interop_generic_call2::<
-        CHANNELS_ASM, CHANNEL_READER, false, "ReadAsync", 2, (T,),
+        CHANNELS_ASM,
+        CHANNEL_READER,
+        false,
+        "ReadAsync",
+        2,
+        (T,),
         (ValueTaskMG, RawCancellationToken),
-        RawValueTaskT<T>, RawReader<T>, RawCancellationToken,
+        RawValueTaskT<T>,
+        RawReader<T>,
+        RawCancellationToken,
     >(r, no_cancellation());
     // `AsTask()` is a value-type instance call (`IS_VALUETYPE = true`) — the receiver must be passed
     // by managed reference (`&vt`), exactly as `vt_instance0`/`nullable.rs`'s `has_value`/`get_Value`
     // take their value-type receiver.
     rustc_clr_interop_generic_call1::<
-        CORELIB, VALUE_TASK, true, "AsTask", 1, (T,),
+        CORELIB,
+        VALUE_TASK,
+        true,
+        "AsTask",
+        1,
+        (T,),
         (RustcCLRInteropManagedGeneric<CORELIB, TASK_CLASS, (RustcCLRInteropTypeGeneric<0>,)>,),
-        TaskT<T>, &RawValueTaskT<T>,
+        TaskT<T>,
+        &RawValueTaskT<T>,
     >(&vt)
 }
 /// `ChannelReader<T>.Completion` — a `Task` that completes once the channel is both marked complete
 /// (`TryComplete`) and fully drained.
 fn reader_completion<T>(r: RawReader<T>) -> Task {
     Task::from_raw(rustc_clr_interop_generic_call1::<
-        CHANNELS_ASM, CHANNEL_READER, false, "get_Completion", 2, (T,),
-        (RawTaskHandle,), RawTaskHandle, RawReader<T>,
+        CHANNELS_ASM,
+        CHANNEL_READER,
+        false,
+        "get_Completion",
+        2,
+        (T,),
+        (RawTaskHandle,),
+        RawTaskHandle,
+        RawReader<T>,
     >(r))
 }
 
-/// The sending half of a [channel]/[bounded_channel] — a thin, `Copy`, `Send`+`Sync` wrapper over a
-/// real managed `ChannelWriter<T>`.
+/// The sending half of a [channel]/[bounded_channel] — a rooted, `Clone`, `Send`+`Sync` wrapper over
+/// a real managed `ChannelWriter<T>`.
 ///
 /// **Multi-producer, by design.** Unlike `std::sync::mpsc::Sender`, this `Sender<T>` requires no
-/// `.clone()` gymnastics to hand out to multiple producer threads — `ChannelWriter<T>` itself supports
-/// concurrent callers, so this wrapper is `Copy` outright (it is exactly one managed reference).
-#[derive(Clone, Copy)]
+/// `.clone()` can hand it to multiple producer threads; every clone owns an independent `GCHandle`
+/// root for the same managed writer.
+#[derive(Clone)]
 pub struct Sender<T> {
-    h: RawWriter<T>,
+    h: RootWriter<T>,
 }
 
 // SAFETY: `ChannelWriter<T>`/`ChannelReader<T>` are documented by the BCL to be safe for concurrent
@@ -1088,18 +1244,20 @@ impl<T> Sender<T> {
     /// channel C# created (see the [`channel`] docs' cross-language nuance).
     #[inline]
     pub fn from_raw(h: RawWriter<T>) -> Self {
-        Self { h }
+        Self {
+            h: RootWriter::from_naked_ref(h),
+        }
     }
 
     /// Non-blocking send — `ChannelWriter<T>.TryWrite(item)`. Returns `Err(item)` (giving the value
     /// back, like `std::sync::mpsc::TrySendError`'s payload) if the channel is full (a bounded channel
     /// at capacity) or already closed.
     #[inline]
-    pub fn try_send(self, item: T) -> Result<(), T>
+    pub fn try_send(&self, item: T) -> Result<(), T>
     where
         T: Copy,
     {
-        if writer_try_write(self.h, item) {
+        if writer_try_write(unsafe { self.h.get_naked_ref() }, item) {
             Ok(())
         } else {
             Err(item)
@@ -1111,14 +1269,12 @@ impl<T> Sender<T> {
     /// `std::sync::mpsc::Sender::send`'s blocking contract, built on the .NET-native async primitive
     /// rather than a second hand-rolled wait loop.
     #[inline]
-    pub fn send_blocking(self, item: T) {
-        // Precompute the `Task` BEFORE constructing the `async move` block, so the coroutine itself
-        // only ever captures a non-generic [`crate::task::Task`] handle across its `.await` — never
-        // the generic `ChannelWriter<T>` handle directly. See [`send_async`]'s docs for why that
-        // distinction matters (a generic managed handle living in coroutine state, as opposed to
-        // `Task`, hits the backend's overlapping-storage layout check).
-        let task = writer_write_async(self.h, item);
-        crate::task::block_on(async move { await_unit(task).await });
+    pub fn send_blocking(&self, item: T) {
+        // Convert the naked Task to its rooted future before blocking. `block_on` accepts the
+        // future directly, so no intermediate coroutine (and therefore no raw-Task capture) is
+        // needed here.
+        let wait = await_unit(writer_write_async(unsafe { self.h.get_naked_ref() }, item));
+        crate::task::block_on(wait);
     }
 
     /// `.await`-adapted send — `ChannelWriter<T>.WriteAsync(item).AsTask()`, driven through
@@ -1126,8 +1282,8 @@ impl<T> Sender<T> {
     /// returned future's `Task` across an `.await` *inside* a suspending `async fn` — drive it with
     /// [`crate::task::block_on`] instead.
     #[inline]
-    pub fn send_async(self, item: T) -> impl Future<Output = ()> {
-        await_unit(writer_write_async(self.h, item))
+    pub fn send_async(&self, item: T) -> impl Future<Output = ()> {
+        await_unit(writer_write_async(unsafe { self.h.get_naked_ref() }, item))
     }
 
     /// `ChannelWriter<T>.TryComplete(null)` — mark the channel closed for writing (no more items will
@@ -1135,27 +1291,27 @@ impl<T> Sender<T> {
     /// no-op. Mirrors what dropping `std::sync::mpsc::Sender` does implicitly; here it must be called
     /// explicitly since the managed `ChannelWriter<T>` has no Rust-visible destructor to hook.
     #[inline]
-    pub fn close(self) -> bool {
-        writer_try_complete(self.h)
+    pub fn close(&self) -> bool {
+        writer_try_complete(unsafe { self.h.get_naked_ref() })
     }
 
     /// The raw managed `ChannelWriter<T>` handle — hand this directly to C#, or to any .NET API
     /// expecting one. See the [module docs](self) for what sharing it means.
     #[inline]
-    pub fn raw(self) -> RawWriter<T> {
-        self.h
+    pub fn raw(&self) -> RawWriter<T> {
+        unsafe { self.h.get_naked_ref() }
     }
 }
 
-/// The receiving half of a [channel]/[bounded_channel] — a thin, `Copy`, `Send`+`Sync` wrapper over a
-/// real managed `ChannelReader<T>`.
+/// The receiving half of a [channel]/[bounded_channel] — a rooted, `Clone`, `Send`+`Sync` wrapper
+/// over a real managed `ChannelReader<T>`.
 ///
 /// **Multi-consumer, by design** — unlike `std::sync::mpsc::Receiver` (single-consumer, not `Clone`),
 /// `ChannelReader<T>` supports concurrent readers competing for items (each item still goes to exactly
-/// one reader), so this wrapper is `Copy`.
-#[derive(Clone, Copy)]
+/// one reader), so clones can be used from multiple threads.
+#[derive(Clone)]
 pub struct Receiver<T> {
-    h: RawReader<T>,
+    h: RootReader<T>,
 }
 
 // SAFETY: see `Sender<T>`'s identical justification — `ChannelReader<T>` is BCL-documented safe for
@@ -1168,7 +1324,9 @@ impl<T> Receiver<T> {
     /// channel C# created (see the [`channel`] docs' cross-language nuance).
     #[inline]
     pub fn from_raw(h: RawReader<T>) -> Self {
-        Self { h }
+        Self {
+            h: RootReader::from_naked_ref(h),
+        }
     }
 
     /// Non-blocking receive — `ChannelReader<T>.TryRead(out item)`. `None` if the channel is currently
@@ -1176,8 +1334,8 @@ impl<T> Receiver<T> {
     /// [`recv_async`](Receiver::recv_async) to block/`.await` until either an item arrives or the
     /// channel is definitely, permanently drained.
     #[inline]
-    pub fn try_recv(self) -> Option<T> {
-        reader_try_read(self.h)
+    pub fn try_recv(&self) -> Option<T> {
+        reader_try_read(unsafe { self.h.get_naked_ref() })
     }
 
     /// Blocking receive — a spin-poll (via [`crate::task::block_on`]) that alternates the
@@ -1187,7 +1345,7 @@ impl<T> Receiver<T> {
     /// short-circuits to `None` instead. Returns `None` once the channel is closed and fully drained
     /// (mirroring `std::sync::mpsc::Receiver::recv`'s `Err` on a disconnected sender).
     #[inline]
-    pub fn recv_blocking(self) -> Option<T>
+    pub fn recv_blocking(&self) -> Option<T>
     where
         T: Copy,
     {
@@ -1220,8 +1378,10 @@ impl<T> Receiver<T> {
     /// Same caveat as the rest of [`crate::task`]: do not hold this future across an `.await` *inside*
     /// a suspending `async fn` — drive it with [`crate::task::block_on`] instead.
     #[inline]
-    pub fn recv_async(self) -> RecvFuture<T> {
-        RecvFuture { inner: await_task(reader_read_async(self.h)) }
+    pub fn recv_async(&self) -> RecvFuture<T> {
+        RecvFuture {
+            inner: await_task(reader_read_async(unsafe { self.h.get_naked_ref() })),
+        }
     }
 
     /// `true` once the channel is closed (writer-side [`Sender::close`]d) AND fully drained — the
@@ -1229,15 +1389,15 @@ impl<T> Receiver<T> {
     /// [`recv_async`] would otherwise wait on `ReadAsync`, which throws `ChannelClosedException` at
     /// that point instead of signalling emptiness the way `TryRead` does.
     #[inline]
-    pub fn is_definitely_drained(self) -> bool {
-        reader_completion(self.h).is_completed()
+    pub fn is_definitely_drained(&self) -> bool {
+        reader_completion(unsafe { self.h.get_naked_ref() }).is_completed()
     }
 
     /// The raw managed `ChannelReader<T>` handle — hand this directly to C#, or to any .NET API
     /// expecting one.
     #[inline]
-    pub fn raw(self) -> RawReader<T> {
-        self.h
+    pub fn raw(&self) -> RawReader<T> {
+        unsafe { self.h.get_naked_ref() }
     }
 }
 
@@ -1250,10 +1410,13 @@ pub struct RecvFuture<T> {
 
 impl<T> Future for RecvFuture<T> {
     type Output = Option<T>;
-    fn poll(self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> core::task::Poll<Option<T>> {
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Option<T>> {
         // SAFETY: projecting `Pin<&mut RecvFuture<T>>` to `Pin<&mut TaskFuture<T>>` is sound — this
-        // struct has exactly one field, is never `Unpin`-relevant (like `TaskFuture` itself, it holds
-        // only a plain `Copy` handle, no address-sensitive data), and `RecvFuture` is never moved out
+        // struct has exactly one field, is never `Unpin`-relevant (`TaskFuture` has no
+        // address-sensitive data), and `RecvFuture` is never moved out
         // of after being pinned.
         let inner = unsafe { self.map_unchecked_mut(|s| &mut s.inner) };
         // Two racing `recv_blocking`/`recv_async` callers can both pass the pre-close `TryRead`/
@@ -1300,7 +1463,9 @@ impl<T> Future for RecvFuture<T> {
 #[inline]
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let ch = create_unbounded::<T>();
-    (Sender { h: channel_writer(ch) }, Receiver { h: channel_reader(ch) })
+    let writer = channel_writer(ch);
+    let reader = channel_reader(ch);
+    (Sender::from_raw(writer), Receiver::from_raw(reader))
 }
 
 /// Create a **bounded** channel with room for `capacity` buffered items — `Channel.CreateBounded<T>(capacity)`.
@@ -1310,5 +1475,35 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
 #[inline]
 pub fn bounded_channel<T>(capacity: i32) -> (Sender<T>, Receiver<T>) {
     let ch = create_bounded::<T>(capacity);
-    (Sender { h: channel_writer(ch) }, Receiver { h: channel_reader(ch) })
+    let writer = channel_writer(ch);
+    let reader = channel_reader(ch);
+    (Sender::from_raw(writer), Receiver::from_raw(reader))
+}
+
+#[cfg(test)]
+mod tests {
+    fn method_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source.find(signature).expect("method signature");
+        let rest = &source[start..];
+        let end = rest.find("\n    }\n").expect("method end");
+        &rest[..end]
+    }
+
+    #[test]
+    fn async_adapters_root_tasks_before_constructing_coroutines() {
+        let source = include_str!("sync.rs");
+        for signature in ["pub fn acquire_async(&self)", "pub fn lock_async(&self)"] {
+            let body = method_body(source, signature);
+            let rooted = body
+                .find("let wait = await_unit(")
+                .expect("rooted Task future");
+            let coroutine = body.find("async move").expect("adapter coroutine");
+            assert!(rooted < coroutine, "{signature} captured a naked Task");
+        }
+
+        let send = method_body(source, "pub fn send_blocking(&self");
+        assert!(send.contains("let wait = await_unit("));
+        assert!(send.contains("block_on(wait)"));
+        assert!(!send.contains("async move"));
+    }
 }

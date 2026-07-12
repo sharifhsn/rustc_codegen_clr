@@ -575,10 +575,9 @@ fn define_accept_write_addr(asm: &mut Assembly) {
     ))));
     let goto_classify = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
 
-    // block 1: ep = conn.RemoteEndPoint as IPEndPoint (isinst; null if it is a
-    //   UnixDomainSocketEndPoint). store local 0; if ep != null goto 2 (v4) else
-    //   goto 4 (unix). B2 Piece 1: an AF_UNIX accept's RemoteEndPoint is NOT an
-    //   IPEndPoint, so the old unconditional cast threw — branch instead.
+    // block 1: classify conn.RemoteEndPoint with IsInst. In this IR IsInst is a boolean predicate,
+    // not the ECMA stack instruction's typed-or-null result, so retain the base EndPoint in local 2
+    // and perform a CheckedCast only after the v4 branch is proven.
     let conn = asm.alloc_node(CILNode::LdArg(0));
     let get_remote_name = asm.alloc_string("get_RemoteEndPoint");
     let get_remote = asm.class_ref(socket).clone().instance(
@@ -588,20 +587,23 @@ fn define_accept_write_addr(asm: &mut Assembly) {
         asm,
     );
     let ep_obj = asm.alloc_node(CILNode::call(get_remote, [conn]));
+    let store_endpoint_obj = asm.alloc_root(CILRoot::StLoc(2, ep_obj));
     let ip_ep_ty = asm.alloc_type(Type::ClassRef(ip_endpoint));
-    let ep = asm.alloc_node(CILNode::IsInst(ep_obj, ip_ep_ty));
-    let store_ep = asm.alloc_root(CILRoot::StLoc(0, ep));
-    let ep_l = asm.alloc_node(CILNode::LdLoc(0));
-    let null_ep = asm.alloc_node(CILNode::Const(Box::new(Const::Null(ip_endpoint))));
+    let endpoint_obj = asm.alloc_node(CILNode::LdLoc(2));
+    let is_ip_endpoint = asm.alloc_node(CILNode::IsInst(endpoint_obj, ip_ep_ty));
     let br_unix = asm.alloc_root(CILRoot::Branch(Box::new((
         4,
         0,
-        Some(BranchCond::Eq(ep_l, null_ep)),
+        Some(BranchCond::False(is_ip_endpoint)),
     ))));
     let goto_v4 = asm.alloc_root(CILRoot::Branch(Box::new((2, 0, None))));
 
     // block 2 (v4): write family/port/addr from the IPEndPoint into *sa; goto 3.
+    let endpoint_obj = asm.alloc_node(CILNode::LdLoc(2));
+    let ip_endpoint_value = asm.alloc_node(CILNode::CheckedCast(endpoint_obj, ip_ep_ty));
+    let store_ep = asm.alloc_root(CILRoot::StLoc(0, ip_endpoint_value));
     let mut blk2 = write_sockaddr_out(asm, 0, 1, 1);
+    blk2.insert(0, store_ep);
     let goto_len = asm.alloc_root(CILRoot::Branch(Box::new((3, 0, None))));
     blk2.push(goto_len);
 
@@ -658,6 +660,8 @@ fn define_accept_write_addr(asm: &mut Assembly) {
     let name = asm.alloc_string("rcl_accept_write_addr");
     let endpoint_local_name = asm.alloc_string("endpoint");
     let bytes_local_name = asm.alloc_string("bytes");
+    let endpoint_base_local_name = asm.alloc_string("endpoint_base");
+    let endpoint_base_local = asm.alloc_type(Type::ClassRef(endpoint_base));
     let sig = asm.sig([Type::ClassRef(socket), void_ptr, void_ptr], Type::Void);
     asm.new_method(MethodDef::new(
         Access::Public,
@@ -667,8 +671,8 @@ fn define_accept_write_addr(asm: &mut Assembly) {
         MethodKind::Static,
         MethodImpl::MethodBody {
             blocks: vec![
-                BasicBlock::new(vec![store_ep, br_null, goto_classify], 0, None),
-                BasicBlock::new(vec![br_unix, goto_v4], 1, None),
+                BasicBlock::new(vec![br_null, goto_classify], 0, None),
+                BasicBlock::new(vec![store_endpoint_obj, br_unix, goto_v4], 1, None),
                 BasicBlock::new(blk2, 2, None),
                 BasicBlock::new(vec![br_len_null, st_len, goto_ret3], 3, None),
                 BasicBlock::new(vec![st_fam_u, br_len_null_u, st_len_u, goto_ret4], 4, None),
@@ -677,10 +681,140 @@ fn define_accept_write_addr(asm: &mut Assembly) {
             locals: vec![
                 (Some(endpoint_local_name), ip_ep_local),
                 (Some(bytes_local_name), byte_arr),
+                (Some(endpoint_base_local_name), endpoint_base_local),
             ],
         },
         vec![None, None, None],
     ));
+}
+
+#[cfg(test)]
+mod accept_address_tests {
+    use super::*;
+
+    #[test]
+    fn accept_endpoint_predicate_and_value_have_distinct_types() {
+        let mut asm = Assembly::default();
+        define_accept_write_addr(&mut asm);
+
+        assert_eq!(asm.typecheck(), 0);
+    }
+
+    fn verify_fcntl_arity(inputs: &[Type]) {
+        let mut asm = Assembly::default();
+        let mut patcher = MissingMethodPatcher::default();
+        insert_fcntl(&mut asm, &mut patcher);
+
+        let name = asm.alloc_string("fcntl");
+        let generator = patcher.remove(&name).expect("fcntl generator registered");
+        let fcntl = Interned::<MethodRef>::builtin(
+            &mut asm,
+            "fcntl",
+            inputs,
+            Type::Int(Int::I32),
+        );
+        let body = generator(fcntl, &mut asm);
+        let sig = asm[fcntl].sig();
+        let main_module = asm.main_module();
+        asm.new_method(MethodDef::new(
+            Access::Public,
+            main_module,
+            name,
+            sig,
+            MethodKind::Static,
+            body,
+            vec![None; inputs.len()],
+        ));
+
+        assert_eq!(asm.typecheck(), 0);
+    }
+
+    #[test]
+    fn fcntl_generation_supports_two_and_three_argument_call_sites() {
+        verify_fcntl_arity(&[Type::Int(Int::I32), Type::Int(Int::I32)]);
+        verify_fcntl_arity(&[
+            Type::Int(Int::I32),
+            Type::Int(Int::I32),
+            Type::Int(Int::I32),
+        ]);
+    }
+
+    fn verify_pipe_arity(symbol: &str, has_flags: bool) {
+        let mut asm = Assembly::default();
+        let mut patcher = MissingMethodPatcher::default();
+        insert_pipe(&mut asm, &mut patcher);
+
+        let mut inputs = vec![asm.nptr(Type::Int(Int::I32))];
+        if has_flags {
+            inputs.push(Type::Int(Int::I32));
+        }
+
+        let name = asm.alloc_string(symbol);
+        let generator = patcher.remove(&name).expect("pipe generator registered");
+        let pipe = Interned::<MethodRef>::builtin(
+            &mut asm,
+            symbol,
+            &inputs,
+            Type::Int(Int::I32),
+        );
+        let body = generator(pipe, &mut asm);
+        let sig = asm[pipe].sig();
+        let main_module = asm.main_module();
+        asm.new_method(MethodDef::new(
+            Access::Public,
+            main_module,
+            name,
+            sig,
+            MethodKind::Static,
+            body,
+            vec![None; inputs.len()],
+        ));
+
+        assert_eq!(asm.typecheck(), 0);
+    }
+
+    #[test]
+    fn pipe_and_pipe2_generated_bodies_match_their_call_arity() {
+        verify_pipe_arity("pipe", false);
+        verify_pipe_arity("pipe2", true);
+    }
+
+    #[test]
+    fn timerfd_capability_fallback_is_verifier_clean_for_all_entry_points() {
+        let mut asm = Assembly::default();
+        let mut patcher = MissingMethodPatcher::default();
+        insert_timerfd_fallback(&mut asm, &mut patcher);
+
+        for (symbol, arity) in [
+            ("timerfd_create", 2_usize),
+            ("timerfd_settime", 4),
+            ("timerfd_gettime", 2),
+        ] {
+            let name = asm.alloc_string(symbol);
+            let generator = patcher.remove(&name).expect("timerfd fallback registered");
+            let inputs = vec![Type::Int(Int::I32); arity];
+            let mref = Interned::<MethodRef>::builtin(
+                &mut asm,
+                symbol,
+                &inputs,
+                Type::Int(Int::I32),
+            );
+            let body = generator(mref, &mut asm);
+            let sig = asm[mref].sig();
+            let main_module = asm.main_module();
+            asm.new_method(MethodDef::new(
+                Access::Public,
+                main_module,
+                name,
+                sig,
+                MethodKind::Static,
+                body,
+                vec![None; arity],
+            ));
+        }
+
+        assert_eq!(asm.typecheck(), 0);
+    }
 }
 
 fn insert_accept(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
@@ -996,18 +1130,105 @@ fn write_sockaddr_out(
     vec![st_fam, st_port, store_bytes, do_copy]
 }
 
-// --- fcntl / ioctl ------------------------------------------------------------
+// --- pipe / fcntl / ioctl -----------------------------------------------------
+
+/// `pipe(fds)` / `pipe2(fds, flags)` — create a managed loopback socket pair, register each
+/// independently-owned handle as a socket fd, and write the two descriptors to the caller's array.
+/// The transport is intentionally the existing pollable socket-pair approximation rather than a
+/// `System.IO.Pipes` stream, because smol/polling require readiness through the epoll shim.
+fn insert_pipe(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    for symbol in ["pipe", "pipe2"] {
+        let name = asm.alloc_string(symbol);
+        let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {
+            let void_ptr = asm.nptr(Type::Void);
+            let has_flags = asm[asm[mref].sig()].inputs().len() >= 2;
+            let flags = if has_flags {
+                asm.alloc_node(CILNode::LdArg(1))
+            } else {
+                asm.alloc_node(Const::I32(0))
+            };
+
+            // rcl_dotnet_pipe_pair writes two independently rooted Socket handles into locals 1/2.
+            let read_addr = asm.alloc_node(CILNode::LdLocA(1));
+            let read_addr = asm.cast_ptr_to(read_addr, void_ptr);
+            let write_addr = asm.alloc_node(CILNode::LdLocA(2));
+            let write_addr = asm.cast_ptr_to(write_addr, void_ptr);
+            let make_pair = dotnet_mref(
+                asm,
+                "rcl_dotnet_pipe_pair",
+                &[void_ptr, void_ptr],
+                Type::Int(Int::I32),
+            );
+            let pair_status = asm.alloc_node(CILNode::call(make_pair, [read_addr, write_addr]));
+            let discard_status = asm.alloc_root(CILRoot::Pop(pair_status));
+
+            let read_handle = asm.alloc_node(CILNode::LdLoc(1));
+            let read_fd = call_fdtable_insert_with_flags(
+                asm,
+                read_handle,
+                FD_KIND_SOCKET,
+                flags,
+            );
+            let write_handle = asm.alloc_node(CILNode::LdLoc(2));
+            let write_fd = call_fdtable_insert_with_flags(
+                asm,
+                write_handle,
+                FD_KIND_SOCKET,
+                flags,
+            );
+
+            let i32_ty = asm.alloc_type(Type::Int(Int::I32));
+            let out = asm.alloc_node(CILNode::LdArg(0));
+            let read_out = asm.alloc_node(CILNode::PtrCast(
+                out,
+                Box::new(PtrCastRes::Ptr(i32_ty)),
+            ));
+            let store_read = asm.alloc_root(CILRoot::StInd(Box::new((
+                read_out,
+                read_fd,
+                Type::Int(Int::I32),
+                false,
+            ))));
+            let out = asm.alloc_node(CILNode::LdArg(0));
+            let out = asm.alloc_node(CILNode::PtrCast(out, Box::new(PtrCastRes::ISize)));
+            let second_offset = asm.alloc_node(Const::ISize(4));
+            let write_out = asm.alloc_node(CILNode::BinOp(out, second_offset, BinOp::Add));
+            let write_out = asm.alloc_node(CILNode::PtrCast(
+                write_out,
+                Box::new(PtrCastRes::Ptr(i32_ty)),
+            ));
+            let store_write = asm.alloc_root(CILRoot::StInd(Box::new((
+                write_out,
+                write_fd,
+                Type::Int(Int::I32),
+                false,
+            ))));
+            let zero = asm.alloc_node(Const::I32(0));
+            let store_result = asm.alloc_root(CILRoot::StLoc(0, zero));
+
+            let void_ptr_idx = asm.alloc_type(void_ptr);
+            errno_wrapped(
+                asm,
+                vec![discard_status, store_read, store_write, store_result],
+                Type::Int(Int::I32),
+                vec![(None, void_ptr_idx), (None, void_ptr_idx)],
+            )
+        };
+        patcher.insert(name, Box::new(generator));
+    }
+}
 
 /// `fcntl(fd, cmd, arg) -> i32` — F_GETFL→flags word; F_SETFL→set nonblocking +
 /// store flags. Other cmds → 0. (F_GETFL=3, F_SETFL=4, O_NONBLOCK=0o4000=2048.)
 fn insert_fcntl(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("fcntl");
-    let generator = move |_, asm: &mut Assembly| {
+    let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {
         const F_GETFL: i32 = 3;
         const F_SETFL: i32 = 4;
         const F_DUPFD: i32 = 0;
         const F_DUPFD_CLOEXEC: i32 = 1030;
         const O_NONBLOCK: i32 = 2048;
+        let has_optional_arg = asm[asm[mref].sig()].inputs().len() >= 3;
         let void_ptr = asm.nptr(Type::Void);
         // block 0: if cmd==F_GETFL goto 1; if cmd==F_SETFL goto 2;
         //          if cmd==F_DUPFD || cmd==F_DUPFD_CLOEXEC goto 4 (dup); else goto 3.
@@ -1035,8 +1256,14 @@ fn insert_fcntl(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         //          rcl_fdtable_set_flags(fd, arg); ret 0.
         let fd2 = asm.alloc_node(CILNode::LdArg(0));
         let h = call_fdtable_handle(asm, fd2);
-        let arg = asm.alloc_node(CILNode::LdArg(2));
-        let arg_i = asm.int_cast(arg, Int::I32, ExtendKind::ZeroExtend);
+        let arg_i = if has_optional_arg {
+            let arg = asm.alloc_node(CILNode::LdArg(2));
+            asm.int_cast(arg, Int::I32, ExtendKind::ZeroExtend)
+        } else {
+            // A concrete two-argument F_GETFL call still shares this complete generated body.
+            // Keep dead F_SETFL/F_DUPFD blocks structurally valid without fabricating LdArg(2).
+            asm.alloc_node(Const::I32(0))
+        };
         let nbmask = asm.alloc_node(Const::I32(O_NONBLOCK));
         let masked = asm.alloc_node(CILNode::BinOp(arg_i, nbmask, BinOp::And));
         let zero_c = asm.alloc_node(Const::I32(0));
@@ -1050,10 +1277,8 @@ fn insert_fcntl(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         let snb = asm.alloc_node(CILNode::call(set_nb, [h, nb]));
         let pop = asm.alloc_root(CILRoot::Pop(snb));
         let fd3 = asm.alloc_node(CILNode::LdArg(0));
-        let arg2 = asm.alloc_node(CILNode::LdArg(2));
-        let arg2_i = asm.int_cast(arg2, Int::I32, ExtendKind::ZeroExtend);
         let setf = main_static(asm, "rcl_fdtable_set_flags", &[Type::Int(Int::I32), Type::Int(Int::I32)], Type::Void);
-        let do_setf = asm.alloc_root(CILRoot::call(setf, [fd3, arg2_i]));
+        let do_setf = asm.alloc_root(CILRoot::call(setf, [fd3, arg_i]));
         let zero2 = asm.alloc_node(Const::I32(0));
         let ret0 = asm.alloc_root(CILRoot::Ret(zero2));
 
@@ -1137,6 +1362,31 @@ fn insert_ioctl(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
         }
     };
     patcher.insert(name, Box::new(generator));
+}
+
+/// Linux timerfd is an optional polling acceleration, not a required semantic primitive. Upstream
+/// `polling` explicitly falls back to the epoll timeout when creation returns `ENOSYS`. Model that
+/// capability boundary as an ordinary POSIX error instead of a managed missing-method exception;
+/// register the companion operations too so an unexpected caller receives the same honest result.
+fn insert_timerfd_fallback(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    for symbol in ["timerfd_create", "timerfd_settime", "timerfd_gettime"] {
+        let name = asm.alloc_string(symbol);
+        let generator = move |mref: Interned<MethodRef>, asm: &mut Assembly| {
+            assert_eq!(
+                *asm[asm[mref].sig()].output(),
+                Type::Int(Int::I32),
+                "{symbol} must return c_int"
+            );
+            let set_errno = set_errno(asm, ENOSYS);
+            let unsupported = asm.alloc_node(Const::I32(-1));
+            let ret = asm.alloc_root(CILRoot::Ret(unsupported));
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![set_errno, ret], 0, None)],
+                locals: vec![],
+            }
+        };
+        patcher.insert(name, Box::new(generator));
+    }
 }
 
 // --- file open (for the ENOENT errno proof) ----------------------------------
@@ -1321,8 +1571,10 @@ pub fn insert_posix_shim(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
     insert_read(asm, patcher);
     insert_write(asm, patcher);
     insert_close(asm, patcher);
+    insert_pipe(asm, patcher);
     insert_fcntl(asm, patcher);
     insert_ioctl(asm, patcher);
+    insert_timerfd_fallback(asm, patcher);
 
     // sockets.
     define_endpoint_from_sockaddr(asm); // B2 Piece 1 — AF_UNIX/AF_INET dispatch.

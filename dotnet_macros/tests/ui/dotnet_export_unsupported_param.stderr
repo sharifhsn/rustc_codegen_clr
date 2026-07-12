@@ -1,5 +1,5 @@
-error: #[dotnet_export]: unsupported parameter type `Vec < i32 >`. Supported: the integer/float primitives, `bool`, `&str`, and `String`.
- --> tests/ui/dotnet_export_unsupported_param.rs:6:22
+error: #[dotnet_export]: unsupported parameter type `PositionDto`. Supported: the integer/float primitives, `bool`, `&str`, `String`, `Option<T>`, and `Vec<T>` (the last two for a passthrough primitive `T`).
+ --> tests/ui/dotnet_export_unsupported_param.rs:9:22
   |
-6 | pub fn bad_export(x: Vec<i32>) -> i32 {
-  |                      ^^^^^^^^
+9 | pub fn bad_export(x: PositionDto) -> i32 {
+  |                      ^^^^^^^^^^^

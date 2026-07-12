@@ -1,0 +1,5 @@
+error: #[dotnet_export]: `name` may be specified only once
+ --> tests/ui/dotnet_export_duplicate_name.rs:3:41
+  |
+3 | #[dotnet_export(name = "ParsePosition", name = "ParseAgain")]
+  |                                         ^^^^

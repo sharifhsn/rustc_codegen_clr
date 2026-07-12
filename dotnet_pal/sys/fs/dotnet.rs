@@ -304,21 +304,18 @@ impl FileType {
     /// compare. **LEAKY (L3):** block/char/fifo/socket are never modelled by the
     /// BCL, so `is(S_IFBLK/S_IFCHR/S_IFIFO/S_IFSOCK)` always answers `false`;
     /// `S_IFDIR`/`S_IFREG`/`S_IFLNK` can be `true`.
-    pub fn is(&self, mode: i32) -> bool {
-        // `mode` is a `libc::S_IF*` const, typed `c_int` (i32) in the dotnet libc
-        // face — match that here.
-        const S_IFMT: i32 = 0o170000;
-        const S_IFDIR: i32 = 0o040000;
-        const S_IFREG: i32 = 0o100000;
-        const S_IFLNK: i32 = 0o120000;
+    pub fn is(&self, mode: libc::mode_t) -> bool {
+        // Keep this boundary typed by libc itself. The canonical Linux GNU face
+        // defines mode_t/S_IF* as u32; duplicating them as i32 was an artifact of
+        // the retired hand-maintained dotnet facade.
         let synthetic = if self.is_symlink {
-            S_IFLNK
+            libc::S_IFLNK
         } else if self.is_dir {
-            S_IFDIR
+            libc::S_IFDIR
         } else {
-            S_IFREG
+            libc::S_IFREG
         };
-        mode & S_IFMT == synthetic
+        mode & libc::S_IFMT == synthetic
     }
 }
 
@@ -803,6 +800,12 @@ pub struct ReadDir {
     idx: usize,
     len: usize,
 }
+
+// The pointer is an opaque GCHandle token, not a borrowed native address. Ownership remains unique
+// and Drop frees it exactly once, so moving a directory iterator between threads is sound and
+// preserves std::fs::ReadDir's Send/Sync contract used by async-fs.
+unsafe impl Send for ReadDir {}
+unsafe impl Sync for ReadDir {}
 
 impl Drop for ReadDir {
     fn drop(&mut self) {

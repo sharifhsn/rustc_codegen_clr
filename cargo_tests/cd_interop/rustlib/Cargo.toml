@@ -1,6 +1,6 @@
 [package]
 name = "cd_interop"
-edition = "2021"
+edition = "2024"
 version = "0.1.0"
 # Required for a GitHub Packages NuGet push (§ Direction B validation): GH Packages rejects a
 # push whose .nuspec has no <repository> pointing at a repo the pushing account can write to.
@@ -9,7 +9,7 @@ repository = "https://github.com/sharifhsn/rustc_codegen_clr"
 
 [lib]
 # A .NET class library: `cargo dotnet build` emits this cdylib as a referenceable
-# .NET assembly (named `cd_interop`, no entrypoint) whose `#[no_mangle] pub extern
+# .NET assembly (named `cd_interop`, no entrypoint) whose `#[unsafe(no_mangle)] pub extern
 # "C"` functions are `public static` methods on `MainModule`, callable from C#.
 crate-type = ["cdylib"]
 

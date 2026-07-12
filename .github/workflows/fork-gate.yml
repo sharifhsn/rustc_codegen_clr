@@ -1,13 +1,14 @@
 ---
 # Fork CI (github.com/sharifhsn/rustc_codegen_clr) — runs the canonical ::stable gate with the
 # FATAL CIL typechecker (on by default) on the pinned nightly from rust-toolchain.toml.
-# Mirrors feasibility/dev.sh `gate`: same skip set, same known-failure baseline groups, same
-# flaky-retry filter — CI fails only on a REPRODUCING failure outside the baseline.
+# Uses the same stable skip set as feasibility/dev.sh, but deliberately does not inherit that
+# script's historical group-wide failure baseline. Until a reviewed exact-test baseline exists,
+# CI retries every aggregate failure and fails on every reproducing failure.
 # Upstream's rust.yml is left untouched to avoid merge conflicts.
 name: Fork gate
 on:
   push:
-    branches: [main, gaps-campaign]
+    branches: [main, gaps-campaign, codex/rearchitecture]
   pull_request:
     branches: [main, gaps-campaign]
   workflow_dispatch:
@@ -33,11 +34,19 @@ jobs:
         with:
           # the test harness rebuilds test crates constantly; cache only the backend deps
           cache-targets: "true"
+      - name: Check unified workspace
+        run: cargo check --workspace
+      - name: Audit Edition 2024 across excluded fixtures and tools
+        run: bash feasibility/check_edition_2024.sh
+      - name: Test cilly architecture and exporters
+        run: cargo test -p cilly
+      - name: Test cargo-dotnet driver
+        run: cargo test --manifest-path tools/cargo-dotnet/Cargo.toml
       - name: Build backend (unified workspace, release)
         # ONE invocation for dylib + linker — two separate builds can produce two divergent
         # libcilly builds whose serialized .bc formats mismatch (see docs/DEBUGGING.md).
         run: cargo build --release --workspace
-      - name: Run ::stable gate (baseline diff + flaky retry)
+      - name: Run strict ::stable gate (isolated flaky retry)
         run: bash .github/scripts/gate.sh
   windows_build:
     # best-effort: backend must keep COMPILING on Windows; tests are Linux-canonical
@@ -48,3 +57,81 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build on Windows
         run: cargo build --release --workspace
+  product_acceptance_smoke:
+    # One release case per decisive product oracle. The full matrix remains a manual/release gate.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup dotnet
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Ensure ilasm (mono)
+        run: |
+          ilasm --version 2>/dev/null || {
+            sudo apt-get update -qq && sudo apt-get install -y -qq mono-devel
+            ilasm --version
+          }
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "true"
+      - name: Build cargo-dotnet and backend
+        run: |
+          cargo build --manifest-path tools/cargo-dotnet/Cargo.toml --release
+          cargo build --release --workspace
+      - name: Run product acceptance smoke
+        env:
+          RCL_MATRIX_PROFILES: release
+          RCL_MATRIX_CASES: soak_ahash cd_pure cd_export_ergonomics
+          RCL_MATRIX_SUMMARY: ${{ runner.temp }}/product-acceptance.tsv
+          RCL_MATRIX_LOG_DIR: ${{ runner.temp }}/product-acceptance-logs
+          RCL_MATRIX_NATIVE_TARGET_ROOT: ${{ runner.temp }}/product-acceptance-native
+        run: bash feasibility/e2e_matrix.sh
+      - name: Run MSBuild integration acceptance
+        env:
+          RCL_MSBUILD_LOG_DIR: ${{ runner.temp }}/msbuild-acceptance-logs
+        run: bash feasibility/msbuild_acceptance.sh
+      - name: Run NuGet publishing and consumption acceptance
+        env:
+          RCL_NUGET_LOG_DIR: ${{ runner.temp }}/nuget-acceptance-logs
+        run: bash feasibility/nuget_acceptance.sh
+      - name: Run focused CLR public API compatibility acceptance
+        env:
+          RCL_API_COMPAT_WORK_DIR: ${{ runner.temp }}/api-compat-acceptance
+        run: bash feasibility/api_compat_acceptance.sh
+      - name: Run independent clean-tree reproducibility acceptance
+        env:
+          RCL_REPRO_EVIDENCE_DIR: ${{ runner.temp }}/reproducibility-acceptance
+        run: bash feasibility/reproducibility_acceptance.sh
+      - name: Run hermetic store acceptance
+        env:
+          RCL_HERMETIC_LOG_DIR: ${{ runner.temp }}/hermetic-acceptance-logs
+        run: bash feasibility/hermetic_acceptance.sh
+      - name: Run private Cargo registry acceptance
+        env:
+          RCL_PRIVATE_REGISTRY_WORK_DIR: ${{ runner.temp }}/private-registry-acceptance
+          RCL_PRIVATE_REGISTRY_KEEP_WORK: "1"
+        run: bash feasibility/private_registry_acceptance.sh
+      - name: Run Wave 0 expected-red blocker oracles
+        env:
+          RCL_WAVE0_BLOCKER_LOG_DIR: ${{ runner.temp }}/wave0-blocker-logs
+        run: bash feasibility/wave0_blocker_acceptance.sh
+      - name: Upload product acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: product-acceptance-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/product-acceptance.tsv
+            ${{ runner.temp }}/product-acceptance.receipt.json
+            ${{ runner.temp }}/product-acceptance-logs
+            ${{ runner.temp }}/wave0-blocker-logs
+            ${{ runner.temp }}/msbuild-acceptance-logs
+            ${{ runner.temp }}/nuget-acceptance-logs
+            ${{ runner.temp }}/api-compat-acceptance
+            ${{ runner.temp }}/reproducibility-acceptance
+            ${{ runner.temp }}/hermetic-acceptance-logs
+            ${{ runner.temp }}/private-registry-acceptance/logs
+            ${{ runner.temp }}/private-registry-acceptance/registry.events

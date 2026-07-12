@@ -1,8 +1,9 @@
 use crate::assembly::MethodCompileCtx;
 use cilly::{
-    cilnode::{IsPure, MethodKind},
-    BinOp, BranchCond, CILNode, CILRoot, ClassRef, Const, FieldDesc, FnSig, Int, Interned,
+    BinOp, BranchCond, CILNode, CILRoot, ClassRef, Const, FieldDesc, Float, FnSig, Int, Interned,
     MethodRef, Type,
+    cilnode::{IsPure, MethodKind},
+    tpe::simd::SIMDVector,
 };
 
 type Root = Interned<cilly::ir::CILRoot>;
@@ -54,6 +55,23 @@ pub(crate) fn emit_terminate(
     };
     let msg = ctx.alloc_string(msg);
     let msg = ctx.alloc_node(CILNode::Const(Box::new(Const::PlatformString(msg))));
+    // A catch handler starts with the thrown managed object on the evaluation stack. Naming it
+    // through `GetException` both prevents the exporter from discarding it and lets FailFast retain
+    // CLR-originated details (InvalidCastException, MissingMethodException, etc.) that otherwise
+    // collapse into the generic Rust boundary message.
+    let exception = ctx.alloc_node(CILNode::GetException);
+    let concat = MethodRef::new(
+        ClassRef::string(ctx),
+        ctx.alloc_string("Concat"),
+        ctx.sig(
+            [Type::PlatformObject, Type::PlatformObject],
+            Type::PlatformString,
+        ),
+        MethodKind::Static,
+        vec![].into(),
+    );
+    let concat = ctx.alloc_methodref(concat);
+    let diagnostic = ctx.alloc_node(CILNode::call(concat, [exception, msg]));
     let fail_fast = MethodRef::new(
         ClassRef::enviroment(ctx),
         ctx.alloc_string("FailFast"),
@@ -62,7 +80,7 @@ pub(crate) fn emit_terminate(
         vec![].into(),
     );
     let fail_fast = ctx.alloc_methodref(fail_fast);
-    let abort = ctx.alloc_root(CILRoot::call(fail_fast, vec![msg]));
+    let abort = ctx.alloc_root(CILRoot::call(fail_fast, vec![diagnostic]));
     // FailFast never returns; the trailing ReThrow only keeps the block well-formed (valid IL on a
     // path where an exception is in flight, but never executed).
     let rethrow = ctx.alloc_root(CILRoot::ReThrow);
@@ -189,12 +207,160 @@ fn strip_asm_comments(s: &str) -> String {
     out
 }
 
+fn normalized_asm_template(template: &str) -> String {
+    strip_asm_comments(template)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn is_x86_locked_not_fence(template: &str) -> bool {
+    let template = normalized_asm_template(template);
+    matches!(
+        template.as_str(),
+        "lock not qword ptr [ ]"
+            | "lock not dword ptr [ ]"
+            | "lock not qword ptr []"
+            | "lock not dword ptr []"
+    )
+}
+
+fn is_clr_owned_stack_probe(template: &str) -> bool {
+    let template = normalized_asm_template(template);
+    template.contains(".cfi_startproc")
+        && template.contains("sub rsp, 0x1000")
+        && template.contains("test qword ptr [rsp + 8], rsp")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClrOwnedStackProbeExit {
+    Fallthrough,
+    Return,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum X86PackedByteAsm {
+    EqTwoAddress,
+    EqThreeAddress,
+    AndTwoAddress,
+    AndThreeAddress,
+    MoveMask,
+}
+
+/// Recognize only the exact placeholder-stripped templates emitted by `constant_time_eq`'s
+/// SSE2/AVX wrappers. Keeping this as a closed match is important: nearby packed-byte instructions
+/// can have different lane widths, operand order, or masking semantics and must continue to hit the
+/// generic unsupported-assembly path.
+fn x86_packed_byte_asm(template: &str) -> Option<X86PackedByteAsm> {
+    match template {
+        "pcmpeqb ," => Some(X86PackedByteAsm::EqTwoAddress),
+        "vpcmpeqb , ," => Some(X86PackedByteAsm::EqThreeAddress),
+        "pand ," => Some(X86PackedByteAsm::AndTwoAddress),
+        "vpand , ," => Some(X86PackedByteAsm::AndThreeAddress),
+        "pmovmskb ," | "vpmovmskb ," => Some(X86PackedByteAsm::MoveMask),
+        _ => None,
+    }
+}
+
+fn clr_owned_stack_probe_exit(
+    template: &str,
+    has_fallthrough: bool,
+) -> Option<ClrOwnedStackProbeExit> {
+    is_clr_owned_stack_probe(template).then_some(if has_fallthrough {
+        ClrOwnedStackProbeExit::Fallthrough
+    } else {
+        ClrOwnedStackProbeExit::Return
+    })
+}
+
+#[cfg(test)]
+mod inline_asm_template_tests {
+    use super::{
+        ClrOwnedStackProbeExit, X86PackedByteAsm, clr_owned_stack_probe_exit,
+        is_clr_owned_stack_probe, is_x86_locked_not_fence, normalized_asm_template,
+        x86_packed_byte_asm,
+    };
+
+    #[test]
+    fn locked_not_local_fence_is_recognized() {
+        assert!(is_x86_locked_not_fence("lock not qword ptr [ ]"));
+        assert!(is_x86_locked_not_fence("lock not qword ptr []"));
+        assert!(!is_x86_locked_not_fence("lock add qword ptr [ ]"));
+    }
+
+    #[test]
+    fn compiler_builtins_stack_probe_is_recognized_despite_comments_and_spacing() {
+        let template = r#"
+            .cfi_startproc
+            mov    r11, rax // preserve the requested size
+            sub    rsp, 0x1000
+            test   qword ptr [rsp + 8], rsp
+            .cfi_endproc
+        "#;
+        assert!(is_clr_owned_stack_probe(template));
+    }
+
+    #[test]
+    fn naked_stack_probe_without_a_mir_target_lowers_to_a_managed_return() {
+        let template = r#"
+            .cfi_startproc
+            mov    r11, rax
+            sub    rsp, 0x1000
+            test   qword ptr [rsp + 8], rsp
+            ret
+            .cfi_endproc
+        "#;
+
+        assert_eq!(
+            clr_owned_stack_probe_exit(template, false),
+            Some(ClrOwnedStackProbeExit::Return),
+        );
+    }
+
+    #[test]
+    fn constant_time_eq_packed_byte_templates_map_to_shared_simd_semantics() {
+        let cases = [
+            ("pcmpeqb {a}, {b}", X86PackedByteAsm::EqTwoAddress),
+            ("vpcmpeqb {c}, {a}, {b}", X86PackedByteAsm::EqThreeAddress),
+            ("pand {a}, {b}", X86PackedByteAsm::AndTwoAddress),
+            ("vpand {c}, {a}, {b}", X86PackedByteAsm::AndThreeAddress),
+            ("pmovmskb {mask:e}, {a}", X86PackedByteAsm::MoveMask),
+            ("vpmovmskb {mask:e}, {a}", X86PackedByteAsm::MoveMask),
+        ];
+        for (template, expected) in cases {
+            // MIR stores placeholders separately, so emulate the concatenated String pieces that
+            // reach the classifier by removing each `{...}` operand placeholder.
+            let mut stripped = String::new();
+            let mut in_placeholder = false;
+            for ch in template.chars() {
+                match ch {
+                    '{' => in_placeholder = true,
+                    '}' => in_placeholder = false,
+                    _ if !in_placeholder => stripped.push(ch),
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                x86_packed_byte_asm(&normalized_asm_template(&stripped)),
+                Some(expected)
+            );
+        }
+
+        assert_eq!(x86_packed_byte_asm("pcmpeqw ,"), None);
+        assert_eq!(x86_packed_byte_asm("pcmpeqb , pmovmskb ,"), None);
+        assert_eq!(x86_packed_byte_asm("vpand ,"), None);
+    }
+}
+
 /// Recognize a small set of `asm!` templates the .NET backend can faithfully lower instead of
 /// throwing at runtime. Returns `Some(roots)` (always including the fall-through branch) when a
 /// template is recognized; returns `None` to let the caller keep the generic "unsupported inline
 /// asm" throw. Never silently miscompiles an unrecognized template.
 ///
-/// Match precedence: (A) `cpuid` -> (B) empty/barrier -> (C) num-bigint `div` -> `None`.
+/// Match precedence: CLR-owned naked stack probe -> (A) `cpuid` -> (B) empty/barrier ->
+/// packed-byte SIMD -> (C) scalar x86 math -> (D) aligned SIMD load ->
+/// (E) num-bigint `div` -> `None`.
 fn lower_inline_asm<'tcx>(
     template: &[InlineAsmTemplatePiece],
     operands: &[InlineAsmOperand<'tcx>],
@@ -202,14 +368,6 @@ fn lower_inline_asm<'tcx>(
     options: InlineAsmOptions,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Option<Vec<Root>> {
-    // A `noreturn` asm legitimately diverges — keep the throw, never add a fall-through goto. Also
-    // bail if there is no fall-through target to branch to.
-    if options.contains(InlineAsmOptions::NORETURN) || targets.is_empty() {
-        return None;
-    }
-    // By MIR contract `targets[0]` is the fall-through block.
-    let after = goto(ctx, targets[0].as_u32());
-
     // The textual pieces of the template, ignoring `{N}` placeholders.
     let str_pieces: Vec<&str> = template
         .iter()
@@ -221,6 +379,31 @@ fn lower_inline_asm<'tcx>(
             }
         })
         .collect();
+    let joined_template: String = str_pieces.concat();
+
+    // STACK PROBE PREFLIGHT — `#[naked] naked_asm!` is represented as NORETURN with no MIR
+    // fall-through target because the assembly itself contains `ret`. That generic shape normally
+    // stays unsupported, but this exact compiler_builtins fingerprint is CLR-redundant: the target
+    // disables rustc stack probes and CoreCLR/RyuJIT owns probing for managed frames and localloc.
+    // Recognize it before the generic guard and replace the assembly-level `ret` with a managed
+    // `VoidRet`. If rustc ever gives the helper a fall-through target, preserve that target instead.
+    match clr_owned_stack_probe_exit(&joined_template, !targets.is_empty()) {
+        Some(ClrOwnedStackProbeExit::Return) => {
+            return Some(vec![ctx.alloc_root(CILRoot::VoidRet)]);
+        }
+        Some(ClrOwnedStackProbeExit::Fallthrough) => {
+            return Some(vec![goto(ctx, targets[0].as_u32())]);
+        }
+        None => {}
+    }
+
+    // Any other `noreturn` asm legitimately diverges — keep the throw, never add a fall-through
+    // goto. Also bail if there is no fall-through target to branch to.
+    if options.contains(InlineAsmOptions::NORETURN) || targets.is_empty() {
+        return None;
+    }
+    // By MIR contract `targets[0]` is the fall-through block.
+    let after = goto(ctx, targets[0].as_u32());
 
     // (A) CPUID — stdarch `__cpuid`/`__cpuid_count` (used by std `is_x86_feature_detected!`, the
     // `cpufeatures` crate behind all RustCrypto x86 backends, and memchr's avx2 probe). The
@@ -264,7 +447,6 @@ fn lower_inline_asm<'tcx>(
     // out-place; pure Out/In barriers have no effect. (core::hint::black_box itself is a
     // `#[rustc_intrinsic]` handled on the call path and never reaches here — this covers the
     // third-party crate barriers that do.)
-    let joined_template: String = str_pieces.concat();
     if !str_pieces.is_empty() && strip_asm_comments(&joined_template).trim().is_empty() {
         let mut roots = Vec::new();
         for op in operands {
@@ -282,15 +464,68 @@ fn lower_inline_asm<'tcx>(
         return Some(roots);
     }
 
-    // (C) NUM-BIGINT DIV (stretch) — num-bigint's `div_wide` (64-bit `BigDigit=u64` arm), reached
+    let semantic_template = normalized_asm_template(&joined_template);
+
+    // event-listener and concurrent-queue use `lock not [local]` solely as a faster x86 SeqCst
+    // fence. Their single operand is an input pointer to a throwaway local; the inverted value is
+    // never observed. Lower that exact contract to the CLR's full bidirectional memory barrier.
+    if is_x86_locked_not_fence(&semantic_template)
+        && matches!(operands, [InlineAsmOperand::In { .. }])
+    {
+        let thread = ClassRef::thread(ctx);
+        let fence = MethodRef::new(
+            thread,
+            ctx.alloc_string("MemoryBarrier"),
+            ctx.sig([], Type::Void),
+            MethodKind::Static,
+            vec![].into(),
+        );
+        let fence = ctx.alloc_methodref(fence);
+        let no_args: &[Interned<CILNode>] = &[];
+        let fence = ctx.call_root(fence, no_args, IsPure::NOT);
+        return Some(vec![fence, after]);
+    }
+
+    // constant_time_eq hides its byte-wise equality/and/movemask operations behind exact SSE2 or
+    // AVX asm templates to prevent LLVM from introducing data-dependent control flow. Preserve
+    // those semantics through the shared SIMD builtins. A recognized mnemonic with the wrong MIR
+    // operand shape or lowered type deliberately returns `None`, retaining the loud unsupported
+    // fallback instead of guessing.
+    if let Some(op) = x86_packed_byte_asm(&semantic_template) {
+        return lower_x86_packed_byte_asm(op, operands, after, ctx);
+    }
+
+    // (C) SCALAR X86 MATH — compiler-builtins uses inline SSE/FMA instructions for the mandatory
+    // x86-64 float surface. CIL has exact semantic equivalents, so lower the operand contract rather
+    // than carrying an x86 instruction into an architecture-neutral assembly.
+    if semantic_template.starts_with("sqrtss") {
+        return lower_x86_scalar_sqrt(operands, after, Float::F32, ctx);
+    }
+    if semantic_template.starts_with("sqrtsd") {
+        return lower_x86_scalar_sqrt(operands, after, Float::F64, ctx);
+    }
+    if semantic_template.starts_with("vfmadd213ss") || semantic_template.starts_with("vfmaddss") {
+        return lower_x86_scalar_fma(operands, after, Float::F32, ctx);
+    }
+    if semantic_template.starts_with("vfmadd213sd") || semantic_template.starts_with("vfmaddsd") {
+        return lower_x86_scalar_fma(operands, after, Float::F64, ctx);
+    }
+
+    // (D) ALIGNED SIMD LOAD — compiler-builtins' x86 memcpy probe loads one 128-bit value from the
+    // input address. Alignment is a performance promise of `movdqa`, not a different Rust value; an
+    // ordinary typed indirect load preserves the exact bits and lets the CLR choose native code.
+    if semantic_template.starts_with("movdqa") {
+        return lower_x86_simd_load(operands, after, ctx);
+    }
+
+    // (E) NUM-BIGINT DIV (stretch) — num-bigint's `div_wide` (64-bit `BigDigit=u64` arm), reached
     // by `to_str_radix` -> `div_rem_digit`. The template is `"div {0}"`, which lowers to the String
     // pieces ["div ", ""] flanking a `{0}` placeholder, so we test the comment-free concatenation
     // (`"div "`) for a leading "div". Operand shape is In(reg-class)=divisor,
     // InOut("rdx"/"dx")=hi=>rem, InOut("rax"/"ax")=lo=>quot. Compute (hi:lo) / d and (hi:lo) % d
     // via u128 BCL div/rem builtins. If the shape is not an EXACT match, bail to None (keep
     // throwing) — never emit a wrong-width div.
-    let div_template = strip_asm_comments(&joined_template);
-    let div_template = div_template.trim();
+    let div_template = semantic_template.as_str();
     if div_template == "div" || div_template.starts_with("div ") {
         if let Some(roots) = lower_x86_div(operands, after, ctx) {
             return Some(roots);
@@ -299,6 +534,248 @@ fn lower_inline_asm<'tcx>(
     }
 
     None
+}
+
+fn inline_asm_operand_type<'tcx>(
+    operand: &Operand<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Type {
+    ctx.type_from_cache(ctx.monomorphize(operand.ty(ctx.body(), ctx.tcx())))
+}
+
+fn inline_asm_place_type<'tcx>(place: &Place<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Type {
+    ctx.type_from_cache(ctx.monomorphize(place.ty(ctx.body(), ctx.tcx()).ty))
+}
+
+fn is_128_bit_simd(tpe: Type) -> bool {
+    matches!(tpe, Type::SIMDVector(vector) if vector.bits() == 128)
+}
+
+/// Lower the exact packed-byte asm contracts used by constant_time_eq. `__m128i` is represented by
+/// rustc as an implementation-selected 128-bit SIMD element type (commonly i64x2), while `pcmpeqb`
+/// explicitly compares sixteen bytes. Reinterpret through i8x16 around the shared builtins so the
+/// lane semantics are byte-wise without changing any bits at the Rust ABI boundary.
+fn lower_x86_packed_byte_asm<'tcx>(
+    op: X86PackedByteAsm,
+    operands: &[InlineAsmOperand<'tcx>],
+    after: Root,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Option<Vec<Root>> {
+    let byte_vector = Type::SIMDVector(SIMDVector::new(Int::I8.into(), 16));
+
+    if op == X86PackedByteAsm::MoveMask {
+        let [
+            InlineAsmOperand::Out {
+                place: Some(out), ..
+            },
+            InlineAsmOperand::In { value, .. },
+        ] = operands
+        else {
+            return None;
+        };
+        let input_type = inline_asm_operand_type(value, ctx);
+        if !is_128_bit_simd(input_type) || inline_asm_place_type(out, ctx) != Type::Int(Int::U32) {
+            return None;
+        }
+        let input = handle_operand(value, ctx);
+        let input = ctx.transmute_on_stack(input_type, byte_vector, input);
+        let mask = ctx.call_static(
+            "simd_get_most_significant_bits",
+            [byte_vector],
+            Type::Int(Int::U32),
+            &[input],
+        );
+        return Some(vec![place_set(out, mask, ctx), after]);
+    }
+
+    let (lhs, rhs, out) = match op {
+        X86PackedByteAsm::EqTwoAddress | X86PackedByteAsm::AndTwoAddress => {
+            let [
+                InlineAsmOperand::InOut {
+                    in_value,
+                    out_place: Some(out),
+                    ..
+                },
+                InlineAsmOperand::In { value, .. },
+            ] = operands
+            else {
+                return None;
+            };
+            (in_value, value, out)
+        }
+        X86PackedByteAsm::EqThreeAddress | X86PackedByteAsm::AndThreeAddress => {
+            let [
+                InlineAsmOperand::Out {
+                    place: Some(out), ..
+                },
+                InlineAsmOperand::In { value: lhs, .. },
+                InlineAsmOperand::In { value: rhs, .. },
+            ] = operands
+            else {
+                return None;
+            };
+            (lhs, rhs, out)
+        }
+        X86PackedByteAsm::MoveMask => unreachable!(),
+    };
+
+    let lhs_type = inline_asm_operand_type(lhs, ctx);
+    let rhs_type = inline_asm_operand_type(rhs, ctx);
+    let output_type = inline_asm_place_type(out, ctx);
+    if !is_128_bit_simd(lhs_type) || rhs_type != lhs_type || output_type != lhs_type {
+        return None;
+    }
+
+    let lhs = handle_operand(lhs, ctx);
+    let rhs = handle_operand(rhs, ctx);
+    let lhs = ctx.transmute_on_stack(lhs_type, byte_vector, lhs);
+    let rhs = ctx.transmute_on_stack(rhs_type, byte_vector, rhs);
+    let builtin = match op {
+        X86PackedByteAsm::EqTwoAddress | X86PackedByteAsm::EqThreeAddress => "simd_eq",
+        X86PackedByteAsm::AndTwoAddress | X86PackedByteAsm::AndThreeAddress => "simd_and",
+        X86PackedByteAsm::MoveMask => unreachable!(),
+    };
+    let result = ctx.call_static(
+        builtin,
+        [byte_vector, byte_vector],
+        byte_vector,
+        &[lhs, rhs],
+    );
+    let result = ctx.transmute_on_stack(byte_vector, output_type, result);
+    Some(vec![place_set(out, result, ctx), after])
+}
+
+/// Lower compiler-builtins' scalar `sqrtss`/`sqrtsd` inout shape to
+/// `System.Single/Double.Sqrt`. The single inout register is both the input and destination.
+fn lower_x86_scalar_sqrt<'tcx>(
+    operands: &[InlineAsmOperand<'tcx>],
+    after: Root,
+    float: Float,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Option<Vec<Root>> {
+    let [
+        InlineAsmOperand::InOut {
+            in_value,
+            out_place: Some(out),
+            ..
+        },
+    ] = operands
+    else {
+        return None;
+    };
+    let ty = Type::Float(float);
+    if ctx.type_from_cache(ctx.monomorphize(in_value.ty(ctx.body(), ctx.tcx()))) != ty
+        || ctx.type_from_cache(ctx.monomorphize(out.ty(ctx.body(), ctx.tcx()).ty)) != ty
+    {
+        return None;
+    }
+    let class = match float {
+        Float::F32 => ClassRef::single(ctx),
+        Float::F64 => ClassRef::double(ctx),
+        _ => return None,
+    };
+    let sig = ctx.sig([ty], ty);
+    let sqrt = MethodRef::new(
+        class,
+        ctx.alloc_string("Sqrt"),
+        sig,
+        MethodKind::Static,
+        [].into(),
+    );
+    let sqrt = ctx.alloc_methodref(sqrt);
+    let value = handle_operand(in_value, ctx);
+    let value = ctx.call(sqrt, &[value], IsPure::NOT);
+    Some(vec![place_set(out, value, ctx), after])
+}
+
+/// Lower compiler-builtins' FMA/FMA4 scalar inout shape to the exact single-rounding BCL
+/// `FusedMultiplyAdd` operation.
+fn lower_x86_scalar_fma<'tcx>(
+    operands: &[InlineAsmOperand<'tcx>],
+    after: Root,
+    float: Float,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Option<Vec<Root>> {
+    let mut accumulator = None;
+    let mut inputs = Vec::with_capacity(2);
+    for operand in operands {
+        match operand {
+            InlineAsmOperand::InOut {
+                in_value,
+                out_place: Some(out),
+                ..
+            } if accumulator.is_none() => accumulator = Some((in_value, out)),
+            InlineAsmOperand::In { value, .. } => inputs.push(value),
+            _ => return None,
+        }
+    }
+    let ((x, out), [y, z]) = (accumulator?, inputs.as_slice()) else {
+        return None;
+    };
+    let ty = Type::Float(float);
+    for value in [x, *y, *z] {
+        if ctx.type_from_cache(ctx.monomorphize(value.ty(ctx.body(), ctx.tcx()))) != ty {
+            return None;
+        }
+    }
+    if ctx.type_from_cache(ctx.monomorphize(out.ty(ctx.body(), ctx.tcx()).ty)) != ty {
+        return None;
+    }
+    let class = match float {
+        Float::F32 => ClassRef::single(ctx),
+        Float::F64 => ClassRef::double(ctx),
+        _ => return None,
+    };
+    let sig = ctx.sig([ty, ty, ty], ty);
+    let fma = MethodRef::new(
+        class,
+        ctx.alloc_string("FusedMultiplyAdd"),
+        sig,
+        MethodKind::Static,
+        [].into(),
+    );
+    let fma = ctx.alloc_methodref(fma);
+    let x = handle_operand(x, ctx);
+    let y = handle_operand(y, ctx);
+    let z = handle_operand(z, ctx);
+    let value = ctx.call(fma, &[x, y, z], IsPure::NOT);
+    Some(vec![place_set(out, value, ctx), after])
+}
+
+/// Lower the exact `movdqa out, [addr]` compiler-builtins shape to a typed 128-bit load.
+fn lower_x86_simd_load<'tcx>(
+    operands: &[InlineAsmOperand<'tcx>],
+    after: Root,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Option<Vec<Root>> {
+    let mut addr = None;
+    let mut out = None;
+    for operand in operands {
+        match operand {
+            InlineAsmOperand::In { value, .. } if addr.is_none() => addr = Some(value),
+            InlineAsmOperand::Out {
+                place: Some(place), ..
+            } if out.is_none() => out = Some(place),
+            _ => return None,
+        }
+    }
+    let (addr, out) = (addr?, out?);
+    let output = ctx.type_from_cache(ctx.monomorphize(out.ty(ctx.body(), ctx.tcx()).ty));
+    let Type::SIMDVector(vector) = output else {
+        return None;
+    };
+    if vector.bits() != 128 {
+        return None;
+    }
+    let addr = handle_operand(addr, ctx);
+    let addr = ctx.cast_ptr(addr, output);
+    let output_idx = ctx.alloc_type(output);
+    let value = ctx.alloc_node(CILNode::LdInd {
+        addr,
+        tpe: output_idx,
+        volatile: false,
+    });
+    Some(vec![place_set(out, value, ctx), after])
 }
 
 /// Helper for case (C): match the exact `div` operand shape and emit the equivalent
@@ -518,7 +995,11 @@ pub fn handle_terminator<'tcx>(
         // `Ret`/`VoidRet` — exactly like a `Call` whose destination is `_0` plus a `Return`. The
         // CIL `.tail` prefix (the actual tail-call stack optimization) is deliberately omitted; a
         // plain call+return is behaviorally identical, only without guaranteed O(1) stack growth.
-        TerminatorKind::TailCall { func, args, fn_span: _ } => {
+        TerminatorKind::TailCall {
+            func,
+            args,
+            fn_span: _,
+        } => {
             let ret_place = Place::return_place();
             let mut trees = emit_call_into(terminator, ctx, args, &ret_place, func);
             let ret = ctx.monomorphize(ctx.body().return_ty());
@@ -597,7 +1078,10 @@ pub fn handle_terminator<'tcx>(
                     // `fn panic_misaligned_pointer_dereference(required: usize, found: usize)`
                     let required = handle_operand(required, ctx);
                     let found = handle_operand(found, ctx);
-                    (LangItem::PanicMisalignedPointerDereference, vec![required, found])
+                    (
+                        LangItem::PanicMisalignedPointerDereference,
+                        vec![required, found],
+                    )
                 }
                 AssertKind::InvalidEnumConstruction(source) => {
                     // `fn panic_invalid_enum_construction(source: u128)`
@@ -641,18 +1125,18 @@ pub fn handle_terminator<'tcx>(
             // on `is_cleanup_block`). No-op under NO_UNWIND (no cleanup blocks/handlers exist then).
             let terminate_reason: Option<u8> =
                 if is_cleanup_block && !crate::config::current().no_unwind() {
-                match unwind {
-                    rustc_middle::mir::UnwindAction::Terminate(
-                        UnwindTerminateReason::InCleanup,
-                    ) => Some(1),
-                    rustc_middle::mir::UnwindAction::Terminate(UnwindTerminateReason::Abi) => {
-                        Some(0)
+                    match unwind {
+                        rustc_middle::mir::UnwindAction::Terminate(
+                            UnwindTerminateReason::InCleanup,
+                        ) => Some(1),
+                        rustc_middle::mir::UnwindAction::Terminate(UnwindTerminateReason::Abi) => {
+                            Some(0)
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                }
-            } else {
-                None
-            };
+                } else {
+                    None
+                };
             // Wrap a single drop-call root in a `TerminateRegion` iff this is a Terminate-on-cleanup
             // edge; otherwise return it unchanged.
             let guard = |ctx: &mut MethodCompileCtx<'tcx, '_>, call: Root| -> Root {

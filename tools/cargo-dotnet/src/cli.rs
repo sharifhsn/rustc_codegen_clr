@@ -53,6 +53,8 @@ pub enum Cmd {
     Setup(SetupArgs),
     /// Build a crate's cdylib and produce a NuGet .nupkg of its .NET assembly.
     Pack(PackArgs),
+    /// Push an already-signed NuGet package under immutable release rules.
+    Push(PushArgs),
     /// Publish a C# host project with NativeAOT, producing a standalone native binary
     /// that has the referenced Rust `<RustCrate>` compiled in (`dotnet publish
     /// -p:PublishAot=true`). See `docs/PERF_GUIDANCE.md` §5 for the proven recipe this wraps.
@@ -61,6 +63,25 @@ pub enum Cmd {
     /// the same mechanism spinacz uses for the BCL), then wire the package's .dll into this
     /// crate's runtime output. Consuming the generated bindings needs no further ceremony.
     AddNuget(AddNugetArgs),
+    /// Emit Cargo's local source/build-input closure for an MSBuild incremental target.
+    MetadataInputs(MetadataInputsArgs),
+    /// Reject duplicate CLR assembly names or public managed type names across Rust crates.
+    ValidateManagedIdentities(ValidateManagedIdentitiesArgs),
+    /// Print the CLR assembly name selected for one Rust crate (metadata identity or Cargo name).
+    ManagedAssemblyName(ManagedAssemblyNameArgs),
+}
+
+#[derive(clap::Args)]
+pub struct ManagedAssemblyNameArgs {
+    /// Rust crate directory (default `.`).
+    pub path: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+pub struct ValidateManagedIdentitiesArgs {
+    /// Rust crate directories to validate as one managed host's reference set.
+    #[arg(required = true, value_name = "CRATE_DIR")]
+    pub crate_dirs: Vec<PathBuf>,
 }
 
 /// Shared args for `build` and `run`. Declaration ORDER matters: the modelled flags
@@ -228,10 +249,41 @@ pub struct PackArgs {
     /// Output directory (default: <crate>/target/nupkg).
     #[arg(long)]
     pub out: Option<PathBuf>,
+    /// Inspect the completed OPC/NuGet structure and fail before reporting success if required
+    /// metadata or managed assets are missing or unsafe.
+    #[arg(long)]
+    pub validate: bool,
+    /// Sign the completed package with this PKCS#12/PFX certificate.
+    #[arg(long, value_name = "PFX")]
+    pub sign_certificate: Option<PathBuf>,
+    /// Name of the environment variable containing the certificate password.
+    #[arg(long, value_name = "ENV", requires = "sign_certificate")]
+    pub sign_password_env: Option<String>,
+    /// Optional RFC3161 timestamp service used while signing.
+    #[arg(long, value_name = "URL", requires = "sign_certificate")]
+    pub timestamper: Option<String>,
+    /// Expected SHA-256 signer certificate fingerprint (hex, separators ignored).
+    #[arg(long, value_name = "SHA256", requires = "sign_certificate")]
+    pub signer_fingerprint: Option<String>,
     /// Target .NET runtime version for the package: `8` or `9` (default 8). Sets the build's
     /// `DOTNET_VERSION` + ilasm and the NuGet TFM (`lib/<tfm>/`), which must agree with the dll.
     #[arg(long, value_name = "8|9", default_value = "8", env = "DOTNET_VERSION")]
     pub dotnet: String,
+}
+
+#[derive(clap::Args)]
+pub struct PushArgs {
+    /// Exact `.nupkg` file to publish.
+    pub package: PathBuf,
+    /// Explicit NuGet source URL. Implicit configured sources are forbidden.
+    #[arg(long)]
+    pub source: String,
+    /// Name of the environment variable containing the feed API key.
+    #[arg(long, value_name = "ENV")]
+    pub api_key_env: String,
+    /// Expected SHA-256 signer certificate fingerprint.
+    #[arg(long, value_name = "SHA256")]
+    pub signer_fingerprint: String,
 }
 
 #[derive(clap::Args)]
@@ -247,9 +299,23 @@ pub struct AddNugetArgs {
     /// Re-fetch and re-generate even if this exact (id, version) is already cached.
     #[arg(long)]
     pub force: bool,
+    /// Runtime identifier to restore for (for example `linux-x64`, `linux-musl-x64`,
+    /// `win-x64`, or `osx-arm64`). The SDK selects the RID graph; cargo-dotnet preserves
+    /// the resulting runtime/native/resource paths and provenance in its asset manifest.
+    #[arg(long)]
+    pub rid: Option<String>,
     /// Unfiltered build log for the bindgen step.
     #[arg(short, long)]
     pub verbose: bool,
+}
+
+#[derive(clap::Args)]
+pub struct MetadataInputsArgs {
+    /// The crate dir to inspect (default `.`).
+    pub path: Option<PathBuf>,
+    /// Newline-delimited absolute input manifest. Updated only when its contents change.
+    #[arg(long)]
+    pub output: PathBuf,
 }
 
 #[derive(clap::Args)]

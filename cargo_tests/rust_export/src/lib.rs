@@ -1,12 +1,12 @@
 //! WF-7 — a Rust **library** compiled to a .NET class-library assembly.
 //!
 //! This crate has NO `main`/entrypoint: it is a `cdylib`, and the backend emits it as a referenceable
-//! .NET assembly (named after the crate, `rust_export`) whose `#[no_mangle]` functions are `public
+//! .NET assembly (named after the crate, `rust_export`) whose `#[unsafe(no_mangle)]` functions are `public
 //! static` methods on `MainModule`. Because Rust compiles to managed CIL, C# calls them as ordinary
 //! managed methods (see the companion `rust_export_cs`). No `main` means no `std` runtime init
 //! (`lang_start`).
 //!
-//! `#[no_mangle]` gives each export a stable, un-mangled name AND (via the backend) marks it
+//! `#[unsafe(no_mangle)]` gives each export a stable, un-mangled name AND (via the backend) marks it
 //! `Access::Extern`, which makes it a dead-code-elimination ROOT — essential here, since a library has
 //! no entrypoint to keep its API alive.
 //!
@@ -25,17 +25,17 @@
 
 // ---- P1: primitives (callable directly from C#) ----
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn rust_add(a: i32, b: i32) -> i32 {
     a + b
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn rust_mul(a: i32, b: i32) -> i32 {
     a * b
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn rust_fib(n: i32) -> i32 {
     if n < 2 {
         n
@@ -44,7 +44,7 @@ pub extern "C" fn rust_fib(n: i32) -> i32 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn rust_add_f64(a: f64, b: f64) -> f64 {
     a + b
 }
@@ -56,7 +56,7 @@ pub extern "C" fn rust_add_f64(a: f64, b: f64) -> f64 {
 ///
 /// # Safety
 /// `ptr` must point to `len` valid, initialized bytes for the duration of the call (C# pins them).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_strlen(ptr: *const u8, len: usize) -> i32 {
     let s = core::str::from_utf8(core::slice::from_raw_parts(ptr, len)).unwrap_or("");
     s.chars().count() as i32
@@ -69,7 +69,7 @@ pub unsafe extern "C" fn rust_strlen(ptr: *const u8, len: usize) -> i32 {
 ///
 /// # Safety
 /// `name_ptr`/`out_ptr` must point to `name_len`/`out_cap` valid bytes for the duration of the call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn greet(
     name_ptr: *const u8,
     name_len: usize,
@@ -91,7 +91,7 @@ pub unsafe extern "C" fn greet(
 ///
 /// # Safety
 /// `ptr` must point to `len` valid, initialized bytes for the duration of the call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn greet_managed(ptr: *const u8, len: usize) -> mycorrhiza::system::MString {
     let name =
         core::str::from_utf8(core::slice::from_raw_parts(ptr, len)).unwrap_or("<invalid utf8>");
@@ -114,13 +114,13 @@ pub struct Point {
 }
 
 /// Take a `Point` by value and return the sum of its fields (inbound struct marshalling).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn point_sum(p: Point) -> i32 {
     p.x + p.y
 }
 
 /// Build and return a `Point` (outbound struct marshalling).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn make_point(x: i32, y: i32) -> Point {
     Point { x, y }
 }
@@ -137,7 +137,7 @@ pub extern "C" fn make_point(x: i32, y: i32) -> Point {
 ///
 /// # Safety
 /// `ptr` must point to `len` valid, initialized `i32`s for the duration of the call (C# pins them).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn sum_slice(ptr: *const i32, len: usize) -> i32 {
     core::slice::from_raw_parts(ptr, len).iter().sum()
 }
@@ -146,7 +146,7 @@ pub unsafe extern "C" fn sum_slice(ptr: *const i32, len: usize) -> i32 {
 ///
 /// # Safety
 /// `ptr` must point to `len` valid, writable `i32`s for the duration of the call (C# pins them).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn fill_squares(ptr: *mut i32, len: usize) {
     for (i, v) in core::slice::from_raw_parts_mut(ptr, len).iter_mut().enumerate() {
         *v = (i as i32) * (i as i32);
@@ -155,7 +155,7 @@ pub unsafe extern "C" fn fill_squares(ptr: *mut i32, len: usize) {
 
 /// `Result` → value on `Ok`. (The `Err` direction — raising a C#-catchable exception — is shown by
 /// `try_div` below, which uses a *direct managed throw* rather than a panic.)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn checked_div(a: i32, b: i32) -> i32 {
     a.checked_div(b).unwrap_or(i32::MIN)
 }
@@ -164,7 +164,7 @@ pub extern "C" fn checked_div(a: i32, b: i32) -> i32 {
 /// directly (the `rustc_clr_interop_throw` intrinsic emits a `throw` IL op), which propagates out of
 /// this managed method into the C# caller's `try`/`catch`. This is the reliable Rust→.NET error
 /// direction — a Rust `panic!` does *not* cross cleanly to a managed caller.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn try_div(a: i32, b: i32) -> i32 {
     match a.checked_div(b) {
         Some(q) => q,
@@ -177,7 +177,7 @@ pub extern "C" fn try_div(a: i32, b: i32) -> i32 {
 /// `System.String` to be cast to `System.Exception`, which the CLR legitimately rejects with
 /// `InvalidCastException`. Proves the FailFast-vs-propagate fix generalizes across magic-fn *families*,
 /// not just the one (`MANAGED_THROW`) it was first found and fixed on.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bad_cast() -> i32 {
     let s: mycorrhiza::system::MString = "hello".into();
     let obj: mycorrhiza::bindings::System::Object =

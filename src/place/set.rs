@@ -278,11 +278,18 @@ pub fn ptr_set_op<'tcx>(
                 }
             },
             TyKind::Float(float_ty) => match float_ty {
-                FloatTy::F32 => ctx.st_ind(addr_calc, value_calc, Type::Float(cilly::Float::F32), false),
-                FloatTy::F64 => ctx.st_ind(addr_calc, value_calc, Type::Float(cilly::Float::F64), false),
-                FloatTy::F128 => {
-                    ctx.st_ind(addr_calc, value_calc, Type::Float(cilly::Float::F128), false)
+                FloatTy::F32 => {
+                    ctx.st_ind(addr_calc, value_calc, Type::Float(cilly::Float::F32), false)
                 }
+                FloatTy::F64 => {
+                    ctx.st_ind(addr_calc, value_calc, Type::Float(cilly::Float::F64), false)
+                }
+                FloatTy::F128 => ctx.st_ind(
+                    addr_calc,
+                    value_calc,
+                    Type::Float(cilly::Float::F128),
+                    false,
+                ),
                 FloatTy::F16 => {
                     ctx.st_ind(addr_calc, value_calc, Type::Float(cilly::Float::F16), false)
                 }

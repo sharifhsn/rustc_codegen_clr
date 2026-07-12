@@ -1,12 +1,13 @@
-use crate::{assembly::MethodCompileCtx, casts};
-use cilly::{
-    cilnode::{ExtendKind, IsPure, MethodKind},
-    Const, FieldDesc, Interned, MethodRef, Type, {ClassRef, Float, Int},
-};
-use ints::{ctlz, rotate_left, rotate_right};
 use crate::operand::{constant::load_const_value, handle_operand, operand_address};
 use crate::place::{place_address, place_set, ptr_set_op};
 use crate::r#type::GetTypeExt;
+use crate::{assembly::MethodCompileCtx, casts};
+use cilly::{
+    Const, FieldDesc, Interned, MethodRef, Type,
+    cilnode::{ExtendKind, IsPure, MethodKind},
+    {ClassRef, Float, Int},
+};
+use ints::{ctlz, rotate_left, rotate_right};
 use rustc_middle::ty::TypingEnv;
 use rustc_middle::{
     mir::{Operand, Place},
@@ -116,7 +117,14 @@ macro_rules! simd_passthrough {
         let a0 = handle_operand(&$args[0].node, $ctx);
         let a1 = handle_operand(&$args[1].node, $ctx);
         let a2 = handle_operand(&$args[2].node, $ctx);
-        simd_passthrough_call($ctx, $destination, &[vec, vec, vec], vec, $fn_name, &[a0, a1, a2])
+        simd_passthrough_call(
+            $ctx,
+            $destination,
+            &[vec, vec, vec],
+            vec,
+            $fn_name,
+            &[a0, a1, a2],
+        )
     }};
 }
 
@@ -278,27 +286,33 @@ pub fn handle_intrinsic<'tcx>(
         "atomic_xsub" => {
             // *T
             let dst = handle_operand(&args[0].node, ctx);
-            // T
-            let sub_amount = handle_operand(&args[1].node, ctx);
+            // U. Current rustc permits the source integer type to differ from the destination T.
+            let mut sub_amount = handle_operand(&args[1].node, ctx);
             // we sub by adding a negative number
 
-            let src_type = ctx.monomorphize(args[1].node.ty(ctx.body(), ctx.tcx()));
-            let src_type = ctx.type_from_cache(src_type);
-            match src_type {
+            let operand_type = ctx.monomorphize(args[1].node.ty(ctx.body(), ctx.tcx()));
+            let operand_type = ctx.type_from_cache(operand_type);
+            let result_type = ctx.monomorphize(destination.ty(ctx.body(), ctx.tcx()).ty);
+            let result_type = ctx.type_from_cache(result_type);
+            match result_type {
                 Type::Int(int) => {
+                    if operand_type != result_type {
+                        sub_amount =
+                            crate::casts::int_to_int(operand_type, result_type, sub_amount, ctx);
+                    }
                     let add_amount = if int.is_signed() {
                         ctx.neg(sub_amount)
                     } else {
                         let signed = crate::casts::int_to_int(
-                            src_type,
+                            result_type,
                             Type::Int(int.as_signed()),
                             sub_amount,
                             ctx,
                         );
                         let neg = ctx.neg(signed);
-                        crate::casts::int_to_int(Type::Int(int.as_signed()), src_type, neg, ctx)
+                        crate::casts::int_to_int(Type::Int(int.as_signed()), result_type, neg, ctx)
                     };
-                    let value = atomic_add(dst, add_amount, src_type, ctx);
+                    let value = atomic_add(dst, add_amount, result_type, ctx);
                     vec![place_set(destination, value, ctx)]
                 }
                 Type::Ptr(_) => {
@@ -310,11 +324,11 @@ pub fn handle_intrinsic<'tcx>(
                         neg,
                         ctx,
                     );
-                    let added = atomic_add(dst, add_amount, src_type, ctx);
-                    let value = ctx.cast_ptr_to(added, src_type);
+                    let added = atomic_add(dst, add_amount, result_type, ctx);
+                    let value = ctx.cast_ptr_to(added, result_type);
                     vec![place_set(destination, value, ctx)]
                 }
-                _ => panic!("{src_type:?} is not an int."),
+                _ => panic!("{result_type:?} is not an int or pointer."),
             }
         }
         "atomic_or" => call_atomic(args, destination, ctx, atomic_or),
@@ -843,8 +857,17 @@ pub fn handle_intrinsic<'tcx>(
         // `Vector` static (the lane body is generated). `simd_shr` resolves arithmetic-vs-logical
         // shift, and `simd_rem` signed-vs-unsigned remainder, from the SIMD element type's signedness
         // inside the generator.
-        "simd_or" | "simd_add" | "simd_and" | "simd_sub" | "simd_mul" | "simd_div" | "simd_shl"
-        | "simd_shr" | "simd_xor" | "simd_rem" | "simd_maximum_number_nsz"
+        "simd_or"
+        | "simd_add"
+        | "simd_and"
+        | "simd_sub"
+        | "simd_mul"
+        | "simd_div"
+        | "simd_shl"
+        | "simd_shr"
+        | "simd_xor"
+        | "simd_rem"
+        | "simd_maximum_number_nsz"
         | "simd_minimum_number_nsz" => {
             simd_passthrough!(2, ctx, args, destination, call_instance, fn_name)
         }
@@ -888,8 +911,17 @@ pub fn handle_intrinsic<'tcx>(
         // Unary `(vec) -> vec` ops, each served by a per-lane builtin of the same name. `simd_neg`
         // lives in `register_value_lane_ops`; the SIMD-tail set (per-lane integer bit ops and float
         // rounders) lives in `cilly/src/ir/builtins/simd/tail.rs`.
-        "simd_neg" | "simd_ctlz" | "simd_cttz" | "simd_ctpop" | "simd_bswap" | "simd_bitreverse"
-        | "simd_fsqrt" | "simd_floor" | "simd_ceil" | "simd_trunc" | "simd_round"
+        "simd_neg"
+        | "simd_ctlz"
+        | "simd_cttz"
+        | "simd_ctpop"
+        | "simd_bswap"
+        | "simd_bitreverse"
+        | "simd_fsqrt"
+        | "simd_floor"
+        | "simd_ceil"
+        | "simd_trunc"
+        | "simd_round"
         | "simd_round_ties_even" => {
             simd_passthrough!(1, ctx, args, destination, call_instance, fn_name)
         }
@@ -1063,7 +1095,9 @@ pub fn handle_intrinsic<'tcx>(
         // `cilly/src/ir/builtins/simd/tail.rs`).
         "simd_gather" | "simd_scatter" | "simd_masked_load" | "simd_masked_store"
         | "simd_funnel_shl" | "simd_funnel_shr" => {
-            todo!("SIMD intrinsic `{fn_name}` is not yet supported (no clean BCL Vector primitive; wire per-lane in cilly/src/ir/builtins/simd/tail.rs)")
+            todo!(
+                "SIMD intrinsic `{fn_name}` is not yet supported (no clean BCL Vector primitive; wire per-lane in cilly/src/ir/builtins/simd/tail.rs)"
+            )
         }
         _ => intrinsic_slow(fn_name, args, destination, ctx, call_instance, source_info),
     }
@@ -1238,6 +1272,6 @@ fn simd_passthrough_call<'tcx>(
 }
 #[test]
 fn test_intrinsic_slow_escape() {
-    const BAD:&str = "core::intrinsics::ptr_offset_from_unsigned::<(rustc_hir::def::LifetimeRes, rustc_resolve::late::diagnostics::LifetimeElisionCandidate)";
+    const BAD: &str = "core::intrinsics::ptr_offset_from_unsigned::<(rustc_hir::def::LifetimeRes, rustc_resolve::late::diagnostics::LifetimeElisionCandidate)";
     assert_eq!(demangled_to_stem(BAD), "ptr_offset_from_unsigned");
 }

@@ -1,20 +1,20 @@
+use crate::operand::{handle_operand, is_uninit};
+use crate::place::{place_address, place_get, place_set};
+use crate::r#type::{
+    GetTypeExt,
+    adt::{enum_tag_info, field_descrptor},
+    escape_field_name, get_type,
+    utilis::{is_zst, ptr_is_fat, simple_tuple},
+};
 use crate::{
     assembly::MethodCompileCtx,
     utilis::{adt::set_discr, field_name, instance_try_resolve, variant_name},
 };
 use cilly::{
+    Const, FieldDesc, FnSig, Int, Interned, MethodRef, Type,
     cilnode::{IsPure, MethodKind},
-    ClassRef, Const, FieldDesc, FnSig, Int, Interned, MethodRef, Type,
 };
 use rustc_abi::FieldIdx;
-use crate::operand::{handle_operand, is_uninit};
-use crate::place::{place_address, place_get, place_set};
-use crate::r#type::{
-    adt::{enum_tag_info, field_descrptor},
-    escape_field_name, get_type,
-    utilis::{is_zst, ptr_is_fat, simple_tuple},
-    GetTypeExt,
-};
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{AggregateKind, Operand, Place},
@@ -72,7 +72,13 @@ pub fn handle_aggregate<'tcx>(
             }
             let element = ctx.monomorphize(*element);
             let element = ctx.type_from_cache(element);
-            let array_type = ClassRef::fixed_array(element, value_index.len() as u64, ctx);
+            // Reuse the destination's canonical, layout-aware fixed-array class. Reconstructing a
+            // reference from only element + length aliases ordinary and over-aligned backing arrays
+            // that have different physical CLR layouts.
+            let destination_ty = ctx.monomorphize(dst_place.ty(ctx.body(), ctx.tcx()).ty);
+            let Type::ClassRef(array_type) = ctx.type_from_cache(destination_ty) else {
+                panic!("array aggregate destination did not lower to a fixed-array class")
+            };
             let array_getter = place_address(dst_place, ctx);
             let sig = FnSig::new(
                 [ctx.nref(array_type), Type::Int(Int::USize), element],
@@ -124,9 +130,7 @@ pub fn handle_aggregate<'tcx>(
             (sub_trees, (place_get(dst_place, ctx)))
         }
         AggregateKind::Closure(_def_id, _args) => {
-            let closure_ty = ctx
-                .monomorphize(dst_place.ty(ctx.body(), ctx.tcx()))
-                .ty;
+            let closure_ty = ctx.monomorphize(dst_place.ty(ctx.body(), ctx.tcx())).ty;
             let closure_type = get_type(closure_ty, ctx);
             let closure_dotnet = closure_type.as_class_ref().expect("Invalid closure type!");
             let closure_getter = place_address(dst_place, ctx);
@@ -147,9 +151,7 @@ pub fn handle_aggregate<'tcx>(
             (sub_trees, (place_get(dst_place, ctx)))
         }
         AggregateKind::Coroutine(_def_id, _args) => {
-            let coroutine_ty = ctx
-                .monomorphize(dst_place.ty(ctx.body(), ctx.tcx()))
-                .ty;
+            let coroutine_ty = ctx.monomorphize(dst_place.ty(ctx.body(), ctx.tcx())).ty;
             let coroutine_type = get_type(coroutine_ty, ctx);
             let closure_dotnet = coroutine_type
                 .as_class_ref()
@@ -219,7 +221,11 @@ pub fn handle_aggregate<'tcx>(
                     (place_get(dst_place, ctx)),
                 );
             }
-            assert!(ptr_is_fat(pointee,ctx.tcx(), ctx.instance()), "A pointer to {pointee:?} is not fat, but its metadata is {meta_ty:?}, and not a zst:{is_meta_zst}",is_meta_zst = is_zst(meta_ty,  ctx.tcx()));
+            assert!(
+                ptr_is_fat(pointee, ctx.tcx(), ctx.instance()),
+                "A pointer to {pointee:?} is not fat, but its metadata is {meta_ty:?}, and not a zst:{is_meta_zst}",
+                is_meta_zst = is_zst(meta_ty, ctx.tcx())
+            );
             let fat_ptr_type = get_type(fat_ptr, ctx);
             // Assign the components
             let data_ptr_name = ctx.alloc_string(crate::DATA_PTR);

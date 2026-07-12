@@ -6,18 +6,22 @@
 //! `artifact::locate`. This is the ONE place a child env is constructed on the native
 //! path (the inner cargo); everything else is typed Rust.
 
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 
 use crate::context::Context;
+use crate::private_sysroot::PrivateSysroot;
 use crate::{palinject, rustflags};
 
-/// Build the crate under build-std with the dotnet backend. Returns the raw JSON stdout
-/// of the `--message-format=json` pass for the artifact locator.
-pub fn build(ctx: &Context) -> Result<String> {
+/// Build against a provisioned private sysroot. This is the ordinary native pipeline path.
+pub fn build_with_sysroot(ctx: &Context, sysroot: &PrivateSysroot) -> Result<String> {
     if !ctx.crate_dir.join("Cargo.toml").is_file() {
-        bail!("not a crate dir (no Cargo.toml): {}", ctx.crate_dir.display());
+        bail!(
+            "not a crate dir (no Cargo.toml): {}",
+            ctx.crate_dir.display()
+        );
     }
     eprintln!(
         "==> cargo dotnet: building {} (profile={})",
@@ -25,16 +29,21 @@ pub fn build(ctx: &Context) -> Result<String> {
         ctx.profile.dir()
     );
 
-    if ctx.flags.clean {
+    let target_dir = cargo_target_dir(ctx, sysroot)?;
+    let sysroot_changed = target_uses_other_sysroot(&target_dir, &sysroot.root)?;
+    if ctx.flags.clean || sysroot_changed {
+        if sysroot_changed && !ctx.flags.clean {
+            eprintln!("==> private sysroot changed; invalidating stale Cargo target fingerprints");
+        }
         eprintln!("==> cargo clean (full, bulletproof)");
-        let _ = base_cargo(ctx).arg("clean").status();
+        let _ = base_cargo(ctx, sysroot).arg("clean").status();
     }
 
     // `cargo fetch` materialises registry sources WITHOUT compiling, so we can patch the
     // registry libc copy before it is compiled (the std::os::fd `libc::` refs fail on an
     // unpatched registry libc). `-Zjson-target-spec` is the unstable flag the dotnet
     // target spec (a JSON file) needs — it must NOT be dropped.
-    let _ = base_cargo(ctx)
+    let _ = base_cargo(ctx, sysroot)
         .arg("-Zjson-target-spec")
         .arg("fetch")
         .stdout(Stdio::null())
@@ -45,7 +54,7 @@ pub fn build(ctx: &Context) -> Result<String> {
     // The build pass. Capture combined output; tee it to lastbuild_log; print it FULL
     // when --verbose, else a filtered tail (errors/warnings/std-compile lines) like
     // dev.sh. Errors are always preserved in the log + the filtered view.
-    let mut build_cmd = base_cargo(ctx);
+    let mut build_cmd = base_cargo(ctx, sysroot);
     build_cmd.arg("-Zjson-target-spec").arg("build");
     if let Some(flag) = ctx.profile.cargo_flag() {
         build_cmd.arg(flag);
@@ -63,6 +72,9 @@ pub fn build(ctx: &Context) -> Result<String> {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    if let Some(parent) = ctx.paths.lastbuild_log.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let _ = std::fs::write(&ctx.paths.lastbuild_log, &log);
     if ctx.flags.verbose {
         eprint!("{log}");
@@ -75,11 +87,15 @@ pub fn build(ctx: &Context) -> Result<String> {
         eprintln!("== build exit: {} ==", out.status.code().unwrap_or(-1));
     }
     if !out.status.success() {
-        bail!("inner cargo build failed (exit {})", out.status.code().unwrap_or(-1));
+        bail!(
+            "inner cargo build failed (exit {})",
+            out.status.code().unwrap_or(-1)
+        );
     }
+    record_target_sysroot(&target_dir, &sysroot.root)?;
 
     // The JSON pass: same flags + --message-format=json; capture stdout for the locator.
-    let mut json_cmd = base_cargo(ctx);
+    let mut json_cmd = base_cargo(ctx, sysroot);
     json_cmd.arg("-Zjson-target-spec").arg("build");
     if let Some(flag) = ctx.profile.cargo_flag() {
         json_cmd.arg(flag);
@@ -92,7 +108,54 @@ pub fn build(ctx: &Context) -> Result<String> {
         .stderr(Stdio::null())
         .output()
         .context("failed to run the --message-format=json build pass")?;
+    if !out.status.success() {
+        bail!(
+            "inner cargo JSON build failed (exit {})",
+            out.status.code().unwrap_or(-1)
+        );
+    }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+const TARGET_SYSROOT_MARKER: &str = ".rustdotnet-private-sysroot";
+
+fn cargo_target_dir(ctx: &Context, sysroot: &PrivateSysroot) -> Result<PathBuf> {
+    let output = base_cargo(ctx, sysroot)
+        .arg("metadata")
+        .arg("--no-deps")
+        .arg("--format-version=1")
+        .output()
+        .context("query Cargo target directory")?;
+    if !output.status.success() {
+        bail!("cargo metadata failed while locating the target directory");
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let path = metadata
+        .get("target_directory")
+        .and_then(serde_json::Value::as_str)
+        .context("cargo metadata omitted target_directory")?;
+    Ok(PathBuf::from(path))
+}
+
+fn target_uses_other_sysroot(target_dir: &Path, sysroot: &Path) -> Result<bool> {
+    if !target_dir.exists() {
+        return Ok(false);
+    }
+    let marker = target_dir.join(TARGET_SYSROOT_MARKER);
+    if !marker.is_file() {
+        // A pre-marker target can contain build-std fingerprints with an arbitrary private path.
+        return Ok(true);
+    }
+    Ok(std::fs::read_to_string(marker)?.trim() != sysroot.to_string_lossy())
+}
+
+fn record_target_sysroot(target_dir: &Path, sysroot: &Path) -> Result<()> {
+    std::fs::create_dir_all(target_dir)?;
+    std::fs::write(
+        target_dir.join(TARGET_SYSROOT_MARKER),
+        format!("{}\n", sysroot.display()),
+    )?;
+    Ok(())
 }
 
 /// The dev.sh build-log filter: keep errors, "could not compile", unused-warnings, the
@@ -112,12 +175,8 @@ fn is_interesting(line: &str) -> bool {
 /// Patch the libc REGISTRY copies (post-`cargo fetch`). build-std resolves libc from the
 /// registry, not the rust-src vendor tree, so this covers whichever copy it picks.
 fn patch_registry_libc(ctx: &Context) -> Result<()> {
-    let pal_libc = ctx.paths.pal_root.join("libc/dotnet.rs");
-    if !pal_libc.is_file() {
-        return Ok(());
-    }
     for d in palinject::find_libc_dirs(&ctx.paths.registry_src) {
-        if palinject::patch_libc(&d, &pal_libc)? && ctx.flags.verbose {
+        if palinject::patch_libc(&d)? && ctx.flags.verbose {
             eprintln!("==> patched registry libc: {}", d.display());
         }
     }
@@ -127,15 +186,38 @@ fn patch_registry_libc(ctx: &Context) -> Result<()> {
 /// A cargo Command pre-loaded with the backend RUSTFLAGS + the dotnet/ilasm env + the
 /// pinned toolchain (installed only) + quiet/deterministic dotnet knobs. Runs in the
 /// crate dir.
-fn base_cargo(ctx: &Context) -> Command {
+fn base_cargo(ctx: &Context, sysroot: &PrivateSysroot) -> Command {
     let mut cmd = Command::new(&ctx.cargo);
     cmd.current_dir(&ctx.crate_dir);
+    cmd.env("CARGO_HOME", &ctx.paths.cargo_home);
+    if let Some(config) = crate::overlays::ambient_cargo_config(ctx) {
+        cmd.arg("--config").arg(config);
+    }
+    cmd.arg("--config")
+        .arg(crate::overlays::generated_config_path(ctx));
 
     // The backend RUSTFLAGS (verbatim incl. the getrandom custom-backend embedded quotes).
     cmd.env(
         "RUSTFLAGS",
-        rustflags::assemble(&ctx.paths.backend_dylib, &ctx.paths.linker),
+        rustflags::assemble(
+            &ctx.paths.backend_dylib,
+            &ctx.paths.linker,
+            &[
+                (&ctx.paths.sdk_crates_root, "/_/rust-dotnet-sdk"),
+                (&ctx.crate_dir, "/_/consumer"),
+                (&ctx.paths.cargo_home, "/_/cargo-home"),
+                (&sysroot.root, "/_/rust-sysroot"),
+            ],
+        ),
     );
+    cmd.env("RUST_LIB_SRC", &sysroot.library);
+    // RUSTFLAGS does not affect Cargo's rustc discovery calls. Using this executable as
+    // RUSTC_WRAPPER makes `rustc --print sysroot` return the private snapshot too, so
+    // build-std discovers and compiles the injected copy rather than ambient rust-src.
+    if let Ok(wrapper) = std::env::current_exe() {
+        cmd.env("RUSTC_WRAPPER", wrapper);
+        cmd.env("CARGO_DOTNET_PRIVATE_SYSROOT", &sysroot.root);
+    }
 
     // Pin the toolchain when installed (no rustup dir-override for an external crate).
     if let Some(tc) = &ctx.toolchain {
@@ -152,6 +234,8 @@ fn base_cargo(ctx: &Context) -> Command {
     // target the same runtime. Pairs with the version-matched ILASM_PATH above.
     cmd.env("DOTNET_VERSION", ctx.dotnet.as_env());
 
+    configure_managed_identity_env(&mut cmd, ctx.managed_identity.as_ref());
+
     // dotnet self-heal from $HOME/.dotnet.
     if let Some((path_add, dotnet_root)) = &ctx.dotnet_heal {
         let cur = std::env::var("PATH").unwrap_or_default();
@@ -165,4 +249,93 @@ fn base_cargo(ctx: &Context) -> Command {
     cmd.env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1");
     cmd.env("CARGO_TERM_COLOR", "never");
     cmd
+}
+
+/// Scrub every identity field before applying this build's one explicit identity. Cargo runs
+/// build scripts and dependencies in child processes, so inheriting an old shell identity would
+/// otherwise turn a legacy crate into a partially stamped release artifact.
+fn configure_managed_identity_env(
+    cmd: &mut Command,
+    identity: Option<&crate::context::ManagedIdentity>,
+) {
+    const IDENTITY_ENV: &[&str] = &[
+        "RCL_MANAGED_IDENTITY_SCHEMA",
+        "RCL_MANAGED_PACKAGE_ID",
+        "RCL_MANAGED_ASSEMBLY_NAME",
+        "RCL_MANAGED_ROOT_NAMESPACE",
+        "RCL_MANAGED_MODULE_TYPE",
+        "RCL_LEGACY_MAIN_MODULE",
+    ];
+    for key in IDENTITY_ENV {
+        cmd.env_remove(key);
+    }
+
+    // Link-time projection is intentionally process-local: the serialized CIL still uses the
+    // historical MainModule sentinel, and only an opted-in package's final managed artifact is
+    // given a public namespace/type identity.
+    if let Some(identity) = identity {
+        cmd.env("RCL_MANAGED_IDENTITY_SCHEMA", identity.schema.to_string());
+        cmd.env("RCL_MANAGED_PACKAGE_ID", &identity.package_id);
+        cmd.env("RCL_MANAGED_ASSEMBLY_NAME", &identity.assembly_name);
+        cmd.env("RCL_MANAGED_ROOT_NAMESPACE", &identity.root_namespace);
+        cmd.env("RCL_MANAGED_MODULE_TYPE", &identity.module_type);
+        cmd.env(
+            "RCL_LEGACY_MAIN_MODULE",
+            if identity.legacy_main_module {
+                "1"
+            } else {
+                "0"
+            },
+        );
+        // The direct PE writer does not yet accept an explicit projected MainModule owner.
+        // Make the mature ILASM route intentional instead of relying on the linker's silent
+        // branch selection; a direct linker invocation with DIRECT_PE=1 is rejected below.
+        cmd.env("DIRECT_PE", "0");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::ManagedIdentity;
+
+    #[test]
+    fn legacy_build_scrubs_ambient_managed_identity() {
+        let mut command = Command::new("cargo");
+        configure_managed_identity_env(&mut command, None);
+        let envs: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        for key in [
+            "RCL_MANAGED_IDENTITY_SCHEMA",
+            "RCL_MANAGED_PACKAGE_ID",
+            "RCL_MANAGED_ASSEMBLY_NAME",
+            "RCL_MANAGED_ROOT_NAMESPACE",
+            "RCL_MANAGED_MODULE_TYPE",
+            "RCL_LEGACY_MAIN_MODULE",
+        ] {
+            assert_eq!(envs.get(std::ffi::OsStr::new(key)), Some(&None));
+        }
+    }
+
+    #[test]
+    fn identity_build_replaces_ambient_identity_and_disables_direct_pe() {
+        let mut command = Command::new("cargo");
+        let identity = ManagedIdentity {
+            schema: 1,
+            package_id: "Example.Widget".into(),
+            assembly_name: "example_widget".into(),
+            root_namespace: "Example.Widget".into(),
+            module_type: "Exports".into(),
+            legacy_main_module: false,
+        };
+        configure_managed_identity_env(&mut command, Some(&identity));
+        let envs: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("RCL_MANAGED_ASSEMBLY_NAME")),
+            Some(&Some(std::ffi::OsStr::new("example_widget")))
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("DIRECT_PE")),
+            Some(&Some(std::ffi::OsStr::new("0")))
+        );
+    }
 }

@@ -1,0 +1,17 @@
+[package]
+name = "collision_duplicate_fqn"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.dotnet]
+identity-schema = 1
+package-id = "Collision.DuplicateFqn"
+assembly-name = "collision_duplicate_fqn"
+root-namespace = "Collision.Alpha"
+module-type = "Exports"
+legacy-main-module = false
+
+[workspace]

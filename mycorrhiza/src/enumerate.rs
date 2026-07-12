@@ -29,8 +29,8 @@
 //! the interface, so the cast is infallible.
 
 use crate::intrinsics::{
-    RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric, RustcCLRInteropManagedGenericStruct,
-    RustcCLRInteropTypeGeneric,
+    RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric,
+    RustcCLRInteropManagedGenericStruct, RustcCLRInteropTypeGeneric,
 };
 
 /// The impl assembly for the `System.Collections[.Generic]` interfaces — all live in
@@ -39,17 +39,11 @@ const CORELIB: &str = "System.Private.CoreLib";
 
 /// Generic `IEnumerable<T>` handle — the interface view of any BCL collection. Reference type, so
 /// `GetEnumerator` dispatches with `callvirt`.
-pub type IEnumerable<T> = RustcCLRInteropManagedGeneric<
-    { CORELIB },
-    { "System.Collections.Generic.IEnumerable" },
-    (T,),
->;
+pub type IEnumerable<T> =
+    RustcCLRInteropManagedGeneric<{ CORELIB }, { "System.Collections.Generic.IEnumerable" }, (T,)>;
 /// Generic `IEnumerator<T>` handle — `get_Current()` on this returns the element `!0`.
-type IEnumeratorGeneric<T> = RustcCLRInteropManagedGeneric<
-    { CORELIB },
-    { "System.Collections.Generic.IEnumerator" },
-    (T,),
->;
+type IEnumeratorGeneric<T> =
+    RustcCLRInteropManagedGeneric<{ CORELIB }, { "System.Collections.Generic.IEnumerator" }, (T,)>;
 /// The non-generic base interface `System.Collections.IEnumerable` — its `GetEnumerator()` returns
 /// the non-generic `IEnumerator` (no generic markers involved, which sidesteps the nested-generic
 /// def-shape return that the typechecker cannot accept against a concrete local).
@@ -227,7 +221,9 @@ pub unsafe fn as_enum_handle_unchecked<H, T>(handle: H) -> IEnumerable<T> {
 /// `castclass`; the generic interface extends the non-generic one).
 #[inline(always)]
 unsafe fn to_nongeneric_enumerable<T>(e: IEnumerable<T>) -> IEnumerableNonGeneric {
-    crate::intrinsics::rustc_clr_interop_managed_checked_cast::<IEnumerableNonGeneric, IEnumerable<T>>(e)
+    crate::intrinsics::rustc_clr_interop_managed_checked_cast::<IEnumerableNonGeneric, IEnumerable<T>>(
+        e,
+    )
 }
 
 /// A managed object that can produce a Rust [`Enumerator`] — i.e. anything implementing

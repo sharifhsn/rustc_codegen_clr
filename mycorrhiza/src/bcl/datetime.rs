@@ -90,14 +90,7 @@ impl DateTime {
 
     /// `new DateTime(year, month, day, hour, minute, second)`.
     #[inline(always)]
-    pub fn new_time(
-        year: i32,
-        month: i32,
-        day: i32,
-        hour: i32,
-        minute: i32,
-        second: i32,
-    ) -> Self {
+    pub fn new_time(year: i32, month: i32, day: i32, hour: i32, minute: i32, second: i32) -> Self {
         Self::new(year, month, day)
             .add_hours(hour as f64)
             .add_minutes(minute as f64)
@@ -261,7 +254,8 @@ impl core::fmt::Display for DateTime {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // Delegate to the managed `ToString()` (the invariant round-trip form) and print its UTF-16
         // content through the idiomatic string wrapper, which decodes to Rust text.
-        let s = crate::system::DotNetString::from_handle(self.0.vt_instance0::<"ToString", MString>());
+        let s =
+            crate::system::DotNetString::from_handle(self.0.vt_instance0::<"ToString", MString>());
         core::fmt::Display::fmt(&s, f)
     }
 }

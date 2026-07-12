@@ -6,7 +6,7 @@
 //! REAL dotnet PAL instead of the surrogate target. Tier-2 (managed `System.String` return, a
 //! Rust-raises-a-.NET-exception `Result`) pulls `mycorrhiza` and is deliberately omitted here.
 //!
-//! This crate has NO `main`/entrypoint: it is a `cdylib`. `#[no_mangle]` gives each export a stable,
+//! This crate has NO `main`/entrypoint: it is a `cdylib`. `#[unsafe(no_mangle)]` gives each export a stable,
 //! un-mangled name AND (via the backend) marks it `Access::Extern`, which makes it a dead-code-
 //! elimination ROOT — essential, since a library has no entrypoint to keep its API alive. No `main`
 //! means the `std` runtime tail (`lang_start`) is unreachable and DCE'd, so an I/O-free, panic-free
@@ -18,7 +18,7 @@
 // ---- primitives (callable directly from C#) ----
 
 /// Integer add. Proves primitive signatures: C# sees `int MainModule.rust_add(int, int)`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn rust_add(a: i32, b: i32) -> i32 {
     a + b
 }
@@ -34,7 +34,7 @@ pub extern "C" fn rust_add(a: i32, b: i32) -> i32 {
 /// # Safety
 /// `name_ptr`/`out_ptr` must point to `name_len`/`out_cap` valid bytes for the duration of the call
 /// (C# pins them with `fixed`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn greet(
     name_ptr: *const u8,
     name_len: usize,
@@ -65,13 +65,13 @@ pub struct Point {
 }
 
 /// Take a `Point` by value and return the sum of its fields (inbound struct marshalling).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn point_sum(p: Point) -> i32 {
     p.x + p.y
 }
 
 /// Build and return a `Point` (outbound struct marshalling).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn make_point(x: i32, y: i32) -> Point {
     Point { x, y }
 }
@@ -83,7 +83,7 @@ pub extern "C" fn make_point(x: i32, y: i32) -> Point {
 ///
 /// # Safety
 /// `ptr` must point to `len` valid, initialized `i32`s for the duration of the call (C# pins them).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn sum_slice(ptr: *const i32, len: usize) -> i32 {
     core::slice::from_raw_parts(ptr, len).iter().sum()
 }

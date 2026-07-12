@@ -1,14 +1,14 @@
 use super::PlaceTy;
-use crate::place::ptr_is_fat;
-use cilly::{
-    Assembly, BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, MethodRef, Type,
-    cilnode::{ExtendKind, MethodKind},
-};
 use crate::fn_ctx::MethodCompileCtx;
+use crate::place::ptr_is_fat;
 use crate::r#type::{
     GetTypeExt,
     adt::{FieldOffsetIterator, field_descrptor, variant_field_desc},
     fat_ptr_to, get_type,
+};
+use cilly::{
+    Assembly, BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, MethodRef, Type,
+    cilnode::{ExtendKind, MethodKind},
 };
 use rustc_middle::{
     mir::PlaceElem,
@@ -99,16 +99,12 @@ fn field_address<'a>(
                     // `Arc::from_raw` reverses by subtracting the same offset. Returning the dangling
                     // ldflda value made `Arc<ZST>`/`Waker::from(Arc<W>)` AccessViolate. Compute the
                     // address from the layout instead (mirrors how raw `ptr.add(n) as *ZST` works).
-                    let field_type = ctx.type_from_cache(field_ty);
-                    if field_type == Type::Void {
-                        let offset = FieldOffsetIterator::fields(
-                            ctx.layout_of(curr_type).layout.0.0.clone(),
-                        )
-                        .nth(field_idx as usize)
-                        .expect("Field index not in field offset iterator");
-                        let base = ctx.cast_ptr(addr_calc, Type::Int(Int::U8));
-                        let base = ctx.biop(base, Const::USize(u64::from(offset)), BinOp::Add);
-                        return ctx.cast_ptr(base, Type::Void);
+                    let owner_type = ctx.type_from_cache(curr_type);
+                    let lowered_field = ctx.type_from_cache(field_ty);
+                    if owner_type == Type::Void || lowered_field == Type::Void {
+                        return super::projected_field_address(
+                            curr_type, field_ty, field_idx, addr_calc, ctx,
+                        );
                     }
                     let field_desc = field_descrptor(curr_type, field_idx, ctx);
                     ctx.ld_field_addr(addr_calc, field_desc)
@@ -271,9 +267,7 @@ pub fn place_elem_address<'tcx>(
                     ctx.biop(data_ptr, offset, BinOp::Add)
                 }
                 TyKind::Array(element, _) => {
-                    let mref = array_get_address(ctx, *element, curr_ty);
-                    let mref = ctx.alloc_methodref(mref);
-                    ctx.call(mref, &[addr_calc, index], cilly::cilnode::IsPure::NOT)
+                    array_element_address(ctx, *element, curr_ty, addr_calc, index)
                 }
                 _ => {
                     todo!("Can't index into {curr_ty}!")
@@ -399,13 +393,11 @@ pub fn place_elem_address<'tcx>(
                     ctx.biop(base, scaled, BinOp::Add)
                 }
                 TyKind::Array(element, _) => {
-                    let mref = array_get_address(ctx, *element, curr_ty);
                     if *from_end {
                         todo!("Can't index array from end!");
                     } else {
-                        let mref = ctx.alloc_methodref(mref);
                         let offset = ctx.alloc_node(Const::USize(*offset));
-                        ctx.call(mref, &[addr_calc, offset], cilly::cilnode::IsPure::NOT)
+                        array_element_address(ctx, *element, curr_ty, addr_calc, offset)
                     }
                 }
                 _ => {
@@ -418,22 +410,38 @@ pub fn place_elem_address<'tcx>(
         }
     }
 }
-pub fn array_get_address<'tcx>(
+fn array_element_address<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     element: Ty<'tcx>,
     curr_ty: Ty<'tcx>,
-) -> MethodRef {
+    array_address: Interned<cilly::ir::CILNode>,
+    index: Interned<cilly::ir::CILNode>,
+) -> Interned<cilly::ir::CILNode> {
     let element = ctx.monomorphize(element);
     let element = ctx.type_from_cache(element);
     let array_type = ctx.type_from_cache(curr_ty);
+
+    // CLR has no value representation for a zero-sized Rust array (`[T; 0]`, or an array whose
+    // element is itself zero-sized), so type lowering intentionally maps it to Void. MIR still
+    // contains the element-address projection after its bounds assertion even though that path can
+    // never execute for `[T; 0]`. Give the dead projection a well-typed semantic pointer instead of
+    // demanding a non-existent CLR array class. The preceding MIR bounds check remains responsible
+    // for the required panic; no storage is read or written on the live path.
+    if array_type == Type::Void {
+        let base = ctx.cast_ptr(array_address, element);
+        return ctx.offset(base, index, element);
+    }
+
     let array_dotnet = array_type.as_class_ref().expect("Non array type");
     let arr_ref = ctx.nref(array_type);
     let element_ptr = ctx.nptr(element);
-    MethodRef::new(
+    let mref = MethodRef::new(
         array_dotnet,
         ctx.alloc_string("get_Address"),
         ctx.sig([arr_ref, Type::Int(Int::USize)], element_ptr),
         MethodKind::Instance,
         vec![].into(),
-    )
+    );
+    let mref = ctx.alloc_methodref(mref);
+    ctx.call(mref, &[array_address, index], cilly::cilnode::IsPure::NOT)
 }

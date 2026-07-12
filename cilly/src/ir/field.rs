@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::IString;
 
-use super::bimap::Interned;
-use super::asm_link::{RelocateCtx, RelocateValue};
 use super::Type;
+use super::asm_link::{RelocateCtx, RelocateValue};
+use super::bimap::Interned;
 use super::{Assembly, ClassRef, Int, IntoAsmIndex};
 
 impl Interned<FieldDesc> {

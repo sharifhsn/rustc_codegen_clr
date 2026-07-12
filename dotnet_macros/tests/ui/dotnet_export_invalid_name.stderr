@@ -1,0 +1,5 @@
+error: #[dotnet_export]: `name` must be a non-empty ASCII C# identifier
+ --> tests/ui/dotnet_export_invalid_name.rs:3:24
+  |
+3 | #[dotnet_export(name = "parse-position")]
+  |                        ^^^^^^^^^^^^^^^^

@@ -44,7 +44,8 @@ use crate::ir::cilnode::ExtendKind;
 use crate::ir::cilnode::UnOp;
 use crate::ir::cilroot::{BranchCond, CmpKind};
 use crate::ir::method::{LocalDef, MethodImpl};
-use crate::ir::{Assembly, CILNode, CILRoot, ClassRef, Const, Float, Int, Interned, MethodDefIdx, Type,
+use crate::ir::{
+    Assembly, CILNode, CILRoot, ClassRef, Const, Float, Int, Interned, MethodDefIdx, Type,
 };
 use std::collections::HashMap;
 
@@ -206,7 +207,8 @@ impl<'a> Emitter<'a> {
             });
             let rel = i64::from(target_off) - (i64::from(operand_off) + 4);
             let rel = i32::try_from(rel).expect("branch offset overflowed i32");
-            self.out[operand_off as usize..operand_off as usize + 4].copy_from_slice(&rel.to_le_bytes());
+            self.out[operand_off as usize..operand_off as usize + 4]
+                .copy_from_slice(&rel.to_le_bytes());
         }
     }
 
@@ -231,7 +233,7 @@ impl<'a> Emitter<'a> {
                 // clt=0xFE04, clt.un=0xFE05.
                 match op {
                     BinOp::Add => self.push_u8(0x58),
-                    BinOp::Eq => self.push_ext(0x01),   // ceq
+                    BinOp::Eq => self.push_ext(0x01), // ceq
                     BinOp::Sub => self.push_u8(0x59),
                     BinOp::Mul => self.push_u8(0x5A),
                     BinOp::Gt => self.push_ext(0x02),   // cgt
@@ -268,7 +270,10 @@ impl<'a> Emitter<'a> {
                 }
                 self.emit_call_like(mref, false);
             }
-            CILNode::IntCast { input, target, extend,
+            CILNode::IntCast {
+                input,
+                target,
+                extend,
             } => {
                 self.emit_node(input);
                 self.emit_int_cast(target, extend);
@@ -298,7 +303,10 @@ impl<'a> Emitter<'a> {
                 self.push_u8(0x7B); // ldfld
                 self.push_token(tok);
             }
-            CILNode::LdInd { addr, tpe, volatile,
+            CILNode::LdInd {
+                addr,
+                tpe,
+                volatile,
             } => {
                 self.emit_node(addr);
                 let tpe_val = self.asm[tpe];
@@ -665,7 +673,8 @@ impl<'a> Emitter<'a> {
                 self.push_i32(val as i32);
                 self.emit_int128_op_implicit(cref, Type::Int(Int::I32));
             }
-            -9_223_372_036_854_775_808..-2_147_483_648 | 2_147_483_648..=9_223_372_036_854_775_807 => {
+            -9_223_372_036_854_775_808..-2_147_483_648
+            | 2_147_483_648..=9_223_372_036_854_775_807 => {
                 self.push_u8(0x21); // ldc.i8
                 self.push_i64(val as i64);
                 self.emit_int128_op_implicit(cref, Type::Int(Int::I64));
@@ -735,9 +744,12 @@ impl<'a> Emitter<'a> {
     fn emit_int128_op_implicit(&mut self, cref: Interned<ClassRef>, from: Type) {
         let out_ty = Type::ClassRef(cref);
         let sig = self.asm.sig([from], out_ty);
-        let mref = self
-            .asm
-            .new_methodref(cref, "op_Implicit", sig, crate::ir::cilnode::MethodKind::Static, vec![],
+        let mref = self.asm.new_methodref(
+            cref,
+            "op_Implicit",
+            sig,
+            crate::ir::cilnode::MethodKind::Static,
+            vec![],
         );
         let tok = self.method_token_for_mref(mref);
         self.push_u8(0x28); // call
@@ -757,13 +769,16 @@ impl<'a> Emitter<'a> {
         // twin) that manifested at runtime as a `FileLoadException` the moment any JITted method
         // referencing this bogus MemberRef got resolved.
         let this_ty = Type::ClassRef(cref);
-        let sig = self
-            .asm
-            .sig([this_ty, Type::Int(Int::U64), Type::Int(Int::U64)], Type::Void,
+        let sig = self.asm.sig(
+            [this_ty, Type::Int(Int::U64), Type::Int(Int::U64)],
+            Type::Void,
         );
-        let mref = self
-            .asm
-            .new_methodref(cref, ".ctor", sig, crate::ir::cilnode::MethodKind::Constructor, vec![],
+        let mref = self.asm.new_methodref(
+            cref,
+            ".ctor",
+            sig,
+            crate::ir::cilnode::MethodKind::Constructor,
+            vec![],
         );
         let tok = self.method_token_for_mref(mref);
         self.push_u8(0x73); // newobj
@@ -783,10 +798,13 @@ impl<'a> Emitter<'a> {
             .asm
             .alloc_string(format!("c_{}", crate::utilis::encode(data.inner() as u64)));
         let blob_ty_name = self.asm.alloc_string(format!("__rcl_const_blob_{n}"));
-        let blob_cref = self
-            .asm
-            .alloc_class_ref(ClassRef::new(blob_ty_name, None, true, [].into()));
-        let sfld = crate::ir::field::StaticFieldDesc::new(*main_module, field_name, Type::ClassRef(blob_cref),
+        let blob_cref =
+            self.asm
+                .alloc_class_ref(ClassRef::new(blob_ty_name, None, true, [].into()));
+        let sfld = crate::ir::field::StaticFieldDesc::new(
+            *main_module,
+            field_name,
+            Type::ClassRef(blob_cref),
         );
         let sfld = self.asm.alloc_sfld(sfld);
         self.tokens.static_field_token(self.asm, sfld)
@@ -808,14 +826,18 @@ impl<'a> Emitter<'a> {
             | (Int::U128, ExtendKind::SignExtend)
             | (Int::I128, ExtendKind::ZeroExtend)
             | (Int::I128, ExtendKind::SignExtend) => {
-                todo!("§III IntCast to/from a 128-bit int — il_exporter itself has no encoding for this arm (its own todo!())")
+                todo!(
+                    "§III IntCast to/from a 128-bit int — il_exporter itself has no encoding for this arm (its own todo!())"
+                )
             }
         }
     }
     fn emit_float_cast(&mut self, target: Float, is_signed: bool) {
         match (target, is_signed) {
             (Float::F16, _) => {
-                todo!("§III FloatCast to f16 — il_exporter itself has no encoding for this arm (its own todo!())")
+                todo!(
+                    "§III FloatCast to f16 — il_exporter itself has no encoding for this arm (its own todo!())"
+                )
             }
             (Float::F32, true) => self.push_u8(0x6B), // conv.r4
             (Float::F32, false) => {
@@ -828,7 +850,9 @@ impl<'a> Emitter<'a> {
                 self.push_u8(0x6C);
             }
             (Float::F128, _) => {
-                todo!("§III FloatCast to f128 — il_exporter itself has no encoding for this arm (its own todo!())")
+                todo!(
+                    "§III FloatCast to f128 — il_exporter itself has no encoding for this arm (its own todo!())"
+                )
             }
         }
     }
@@ -889,7 +913,9 @@ impl<'a> Emitter<'a> {
             Type::PlatformString | Type::PlatformObject => self.push_u8(0x50), // ldind.ref
             Type::PlatformChar => self.push_u8(0x49),                          // ldind.u2
             Type::PlatformGeneric(_, _) => {
-                todo!("§III ldind of a generic-parameter type — il_exporter itself has no encoding for this arm")
+                todo!(
+                    "§III ldind of a generic-parameter type — il_exporter itself has no encoding for this arm"
+                )
             }
             Type::Bool => self.push_u8(0x46), // ldind.i1
             Type::Void => panic!("Void can't be dereferenced!"),
@@ -956,6 +982,16 @@ impl<'a> Emitter<'a> {
 
     fn calli_sig_token(&mut self, fn_sig: Interned<crate::ir::FnSig>) -> Token {
         let sig_val = self.asm[fn_sig].clone();
+        let semantic_key = format!(
+            "({})->{}",
+            sig_val
+                .inputs()
+                .iter()
+                .map(|input| input.mangle(self.asm))
+                .collect::<Vec<_>>()
+                .join(","),
+            sig_val.output().mangle(self.asm)
+        );
         let mut blob = Vec::new();
         // Reuse `self` as the resolver: `TokenSink::type_token` already knows how to resolve a
         // `ClassRef` to a `TypeDef`/`TypeRef`/`TypeSpec` token, which is exactly the shape a
@@ -984,7 +1020,7 @@ impl<'a> Emitter<'a> {
             &mut resolver,
             &mut blob,
         );
-        self.tokens.calli_sig_token(self.asm, &blob)
+        self.tokens.calli_sig_token(self.asm, &semantic_key, &blob)
     }
 
     // ---- root (statement) emission ---------------------------------------------------------
@@ -1016,7 +1052,12 @@ impl<'a> Emitter<'a> {
             CILRoot::Break => self.push_u8(0x01),   // break
             CILRoot::Nop => self.push_u8(0x00),     // nop
             CILRoot::Branch(branch) => self.emit_branch(*branch, is_handler, has_handler),
-            CILRoot::SourceFileInfo { line_start, line_len, col_start, col_len, file,
+            CILRoot::SourceFileInfo {
+                line_start,
+                line_len,
+                col_start,
+                col_len,
+                file,
             } => {
                 // Debug-info only — emits no IL bytes (mirrors `il_exporter`'s `.line` directive,
                 // which is likewise not an instruction). The sequence point is attributed to
@@ -1153,7 +1194,11 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn emit_branch(&mut self, branch: (u32, u32, Option<BranchCond>), is_handler: bool, has_handler: bool,
+    fn emit_branch(
+        &mut self,
+        branch: (u32, u32, Option<BranchCond>),
+        is_handler: bool,
+        has_handler: bool,
     ) {
         let (target, sub_target, cond) = branch;
         let label = branch_label(target, sub_target, has_handler, is_handler);
@@ -1172,7 +1217,7 @@ impl<'a> Emitter<'a> {
                 self.emit_node(a);
                 self.emit_node(b);
                 let op = match kind {
-                    CmpKind::Ordered | CmpKind::Signed => 0x3F,    // blt
+                    CmpKind::Ordered | CmpKind::Signed => 0x3F,     // blt
                     CmpKind::Unordered | CmpKind::Unsigned => 0x44, // blt.un
                 };
                 self.push_branch(op, label);
@@ -1181,7 +1226,7 @@ impl<'a> Emitter<'a> {
                 self.emit_node(a);
                 self.emit_node(b);
                 let op = match kind {
-                    CmpKind::Ordered | CmpKind::Signed => 0x3D,    // bgt
+                    CmpKind::Ordered | CmpKind::Signed => 0x3D,     // bgt
                     CmpKind::Unordered | CmpKind::Unsigned => 0x42, // bgt.un
                 };
                 self.push_branch(op, label);
@@ -1190,7 +1235,7 @@ impl<'a> Emitter<'a> {
                 self.emit_node(a);
                 self.emit_node(b);
                 let op = match kind {
-                    CmpKind::Ordered | CmpKind::Signed => 0x3E,    // ble
+                    CmpKind::Ordered | CmpKind::Signed => 0x3E,     // ble
                     CmpKind::Unordered | CmpKind::Unsigned => 0x43, // ble.un
                 };
                 self.push_branch(op, label);
@@ -1199,7 +1244,7 @@ impl<'a> Emitter<'a> {
                 self.emit_node(a);
                 self.emit_node(b);
                 let op = match kind {
-                    CmpKind::Ordered | CmpKind::Signed => 0x3C,    // bge
+                    CmpKind::Ordered | CmpKind::Signed => 0x3C,     // bge
                     CmpKind::Unordered | CmpKind::Unsigned => 0x41, // bge.un
                 };
                 self.push_branch(op, label);
@@ -1272,7 +1317,9 @@ impl<'a> Emitter<'a> {
             Type::PlatformString | Type::PlatformObject => self.push_u8(0x51), // stind.ref
             Type::PlatformChar => self.push_u8(0x53),                          // stind.i2
             Type::PlatformGeneric(_, _) => {
-                todo!("§III stind of a generic-parameter type — il_exporter itself has no encoding for this arm")
+                todo!(
+                    "§III stind of a generic-parameter type — il_exporter itself has no encoding for this arm"
+                )
             }
             Type::Bool => self.push_u8(0x52), // stind.i1
             Type::Void => {
@@ -1312,9 +1359,12 @@ impl<'a> Emitter<'a> {
         // (only) `string` argument, encoding a bogus zero-arg `System.Exception::.ctor()`.
         let this_ty = Type::ClassRef(cref);
         let sig = self.asm.sig([this_ty, Type::PlatformString], Type::Void);
-        let mref = self
-            .asm
-            .new_methodref(cref, ".ctor", sig, crate::ir::cilnode::MethodKind::Constructor, vec![],
+        let mref = self.asm.new_methodref(
+            cref,
+            ".ctor",
+            sig,
+            crate::ir::cilnode::MethodKind::Constructor,
+            vec![],
         );
         self.method_token_for_mref(mref)
     }
@@ -1322,7 +1372,12 @@ impl<'a> Emitter<'a> {
     /// Renders the `.try{ <protected>; leave tr_done_N } catch System.Object{ pop; ldstr <msg>;
     /// call Environment::FailFast; rethrow } tr_done_N: nop` shape (§II.25.4.6 fat clause,
     /// mirrors `il_exporter`'s `TerminateRegion` arm exactly, byte offsets instead of labels).
-    fn emit_terminate_region(&mut self, protected: Interned<CILRoot>, reason: u8, is_handler: bool, has_handler: bool,
+    fn emit_terminate_region(
+        &mut self,
+        protected: Interned<CILRoot>,
+        reason: u8,
+        is_handler: bool,
+        has_handler: bool,
     ) {
         let lbl_id = self.terminate_region_counter;
         self.terminate_region_counter += 1;
@@ -1365,9 +1420,12 @@ impl<'a> Emitter<'a> {
     fn environment_failfast(&mut self) -> Token {
         let cref = self.bcl_class_ref("System.Environment", false);
         let sig = self.asm.sig([Type::PlatformString], Type::Void);
-        let mref = self
-            .asm
-            .new_methodref(cref, "FailFast", sig, crate::ir::cilnode::MethodKind::Static, vec![],
+        let mref = self.asm.new_methodref(
+            cref,
+            "FailFast",
+            sig,
+            crate::ir::cilnode::MethodKind::Static,
+            vec![],
         );
         self.method_token_for_mref(mref)
     }
@@ -1407,17 +1465,17 @@ fn branch_label(target: u32, sub_target: u32, has_handler: bool, is_handler: boo
 /// need a real body). Implementers thread that distinction however is cleanest — e.g. returning
 /// `None` for `Extern` — but the signature below only commits to the `MethodBody`-shaped case
 /// being representable, since that's what every real caller drives today.
-pub fn assemble_method(asm: &mut Assembly, method: MethodDefIdx, tokens: &mut dyn TokenSink,
+pub fn assemble_method(
+    asm: &mut Assembly,
+    method: MethodDefIdx,
+    tokens: &mut dyn TokenSink,
 ) -> AssembledBody {
     let mimpl = asm[method].resolved_implementation(asm).clone();
-    if matches!(mimpl, MethodImpl::RegionBody { .. }) {
-        let (blocks, locals) = mimpl
-            .materialize_legacy_body(asm)
-            .expect("region body must materialize");
-        return assemble_method_body(asm, tokens, &blocks, &locals);
-    }
-    match mimpl {
-        MethodImpl::MethodBody { blocks, locals } => {
+    match &mimpl {
+        MethodImpl::MethodBody { .. } | MethodImpl::RegionBody { .. } => {
+            let (blocks, locals) = mimpl
+                .materialize_legacy_body(asm)
+                .expect("managed method body must materialize");
             assemble_method_body(asm, tokens, &blocks, &locals)
         }
         MethodImpl::Extern { .. } => AssembledBody {
@@ -1435,7 +1493,6 @@ pub fn assemble_method(asm: &mut Assembly, method: MethodDefIdx, tokens: &mut dy
             emitter.emit_throw_new_exception(&msg);
             finish_body(emitter.out, 3, None, &[], Token::new(0, 0), Vec::new())
         }
-        MethodImpl::RegionBody { .. } => unreachable!(),
     }
 }
 
@@ -1543,7 +1600,13 @@ fn assemble_method_body(
         .collect();
 
     let sequence_points = emitter.sequence_points;
-    let mut body = finish_body(emitter.out, maxstack, locals_tok, &clauses_resolved, catch_type, sequence_points,
+    let mut body = finish_body(
+        emitter.out,
+        maxstack,
+        locals_tok,
+        &clauses_resolved,
+        catch_type,
+        sequence_points,
     );
     body.locals_signature = locals_tok;
     body.locals = local_names;
@@ -1609,7 +1672,12 @@ fn finish_body(
     // (`MethodDebugInformation`'s sequence points are offsets from the start of the method body's
     // IL, not counting the header; §II.25.4.3's `CodeSize` field has the same "header doesn't
     // count" convention). No offset adjustment needed here.
-    AssembledBody { bytes, sequence_points, locals_signature: None, locals: Vec::new(), code_len: code_size,
+    AssembledBody {
+        bytes,
+        sequence_points,
+        locals_signature: None,
+        locals: Vec::new(),
+        code_len: code_size,
     }
 }
 
@@ -1679,18 +1747,28 @@ mod tests {
         requested_strings: Vec<String>,
     }
     impl TokenSink for StubSink {
-        fn method_token(&mut self, _asm: &mut Assembly, method: MethodDefIdx, _generics: &[Type],
+        fn method_token(
+            &mut self,
+            _asm: &mut Assembly,
+            method: MethodDefIdx,
+            _generics: &[Type],
         ) -> Token {
             self.requested_methods.push(method);
             self.next_method_rid += 1;
             Token::new(Token::TABLE_METHOD_DEF, self.next_method_rid)
         }
-        fn field_token(&mut self, _asm: &mut Assembly, _field: Interned<crate::ir::FieldDesc>,
+        fn field_token(
+            &mut self,
+            _asm: &mut Assembly,
+            _field: Interned<crate::ir::FieldDesc>,
         ) -> Token {
             self.next_field_rid += 1;
             Token::new(Token::TABLE_FIELD, self.next_field_rid)
         }
-        fn static_field_token(&mut self, _asm: &mut Assembly, _field: Interned<crate::ir::StaticFieldDesc>,
+        fn static_field_token(
+            &mut self,
+            _asm: &mut Assembly,
+            _field: Interned<crate::ir::StaticFieldDesc>,
         ) -> Token {
             self.next_field_rid += 1;
             Token::new(Token::TABLE_FIELD, self.next_field_rid)
@@ -1699,7 +1777,12 @@ mod tests {
             self.requested_strings.push(s.to_string());
             Token::new(0x70, self.requested_strings.len() as u32)
         }
-        fn calli_sig_token(&mut self, _asm: &mut Assembly, _sig_blob: &[u8]) -> Token {
+        fn calli_sig_token(
+            &mut self,
+            _asm: &mut Assembly,
+            _semantic_key: &str,
+            _sig_blob: &[u8],
+        ) -> Token {
             Token::new(Token::TABLE_STAND_ALONE_SIG, 1)
         }
         fn locals_sig_token(&mut self, _asm: &mut Assembly, _locals: &[Type]) -> Token {
@@ -1770,7 +1853,11 @@ mod tests {
     /// need the full form for (e.g. `-100`) must still use `.s` when it's an `I8`.
     #[test]
     fn i8_never_uses_the_full_width_form() {
-        assert_eq!(const_bytes(Const::I8(-100)), [0x1F, (-100i8) as u8], "ldc.i4.s -100");
+        assert_eq!(
+            const_bytes(Const::I8(-100)),
+            [0x1F, (-100i8) as u8],
+            "ldc.i4.s -100"
+        );
         assert_eq!(const_bytes(Const::I8(-1)), [0x15], "ldc.i4.m1");
         assert_eq!(const_bytes(Const::I8(8)), [0x1E], "ldc.i4.8");
     }
@@ -1785,8 +1872,16 @@ mod tests {
             v.extend_from_slice(&(-100i32).to_le_bytes());
             v
         };
-        assert_eq!(const_bytes(Const::I16(-100)), expected, "ldc.i4 -100 (full form, not .s)");
-        assert_eq!(const_bytes(Const::I32(-100)), expected, "ldc.i4 -100 (full form, not .s)");
+        assert_eq!(
+            const_bytes(Const::I16(-100)),
+            expected,
+            "ldc.i4 -100 (full form, not .s)"
+        );
+        assert_eq!(
+            const_bytes(Const::I32(-100)),
+            expected,
+            "ldc.i4 -100 (full form, not .s)"
+        );
     }
 
     /// `I128` in the `[-2^31, 0) | [128, 2^31)` band uses the FULL `ldc.i4` form even for small
@@ -1836,15 +1931,26 @@ mod tests {
         assert_eq!(code[18], 0x73, "newobj");
         let token_bytes = [code[19], code[20], code[21], code[22]];
         let token = Token(u32::from_le_bytes(token_bytes));
-        assert_eq!(token.table(), Token::TABLE_MEMBER_REF, "external BCL ctor resolves as a MemberRef");
+        assert_eq!(
+            token.table(),
+            Token::TABLE_MEMBER_REF,
+            "external BCL ctor resolves as a MemberRef"
+        );
 
         // Decode the interned `MethodRefSig` blob (§II.23.2.2) at the row's `Signature` column and
         // assert its declared param count is 2 — the two `uint64`s, NOT 1 (the bug's symptom).
         let row = &mb_member_ref_row(&mb, token);
         let blob = read_blob_at(mb.blobs.as_bytes(), row.signature);
         // byte0 = calling convention (HASTHIS), byte1 = compressed param count.
-        assert_eq!(blob[0] & 0x20, 0x20, "HASTHIS bit set for an instance/ctor MemberRef");
-        assert_eq!(blob[1], 2, "MethodRefSig ParamCount must be 2 (uint64,uint64), not 1");
+        assert_eq!(
+            blob[0] & 0x20,
+            0x20,
+            "HASTHIS bit set for an instance/ctor MemberRef"
+        );
+        assert_eq!(
+            blob[1], 2,
+            "MethodRefSig ParamCount must be 2 (uint64,uint64), not 1"
+        );
     }
 
     /// Test-only accessor: `MetadataBuilder::member_ref` rows are private to `tables.rs`, but a
@@ -1920,9 +2026,16 @@ mod tests {
         let mut sink = StubSink::default();
         let body = assemble_method(&mut asm, method, &mut sink);
 
-        assert_eq!(body.sequence_points.len(), 2, "one SequencePoint per SourceFileInfo root");
+        assert_eq!(
+            body.sequence_points.len(),
+            2,
+            "one SequencePoint per SourceFileInfo root"
+        );
         let p1 = &body.sequence_points[0];
-        assert_eq!(p1.il_offset, 0, "first SourceFileInfo precedes the very first instruction (`ldc.i4.3`)");
+        assert_eq!(
+            p1.il_offset, 0,
+            "first SourceFileInfo precedes the very first instruction (`ldc.i4.3`)"
+        );
         assert_eq!(p1.document_path, "src/main.rs");
         assert_eq!(p1.line, 10);
         assert_eq!(p1.end_line, 11, "line_start + line_len");
@@ -1932,10 +2045,16 @@ mod tests {
 
         let p2 = &body.sequence_points[1];
         // `ldc.i4.3`(1) + `pop`(1) = 2 bytes precede the second SourceFileInfo root.
-        assert_eq!(p2.il_offset, 2, "second SourceFileInfo's offset tracks the running code length");
+        assert_eq!(
+            p2.il_offset, 2,
+            "second SourceFileInfo's offset tracks the running code length"
+        );
         assert_eq!(p2.line, 11);
         assert_eq!(p2.end_line, 13);
-        assert!(p2.il_offset > p1.il_offset, "offsets strictly increase in visitation order");
+        assert!(
+            p2.il_offset > p1.il_offset,
+            "offsets strictly increase in visitation order"
+        );
     }
 
     /// `ldc.i4.3 ldc.i4.s 4 add ret` — straight-line arithmetic, fat header, tiny code, no locals.
@@ -1957,13 +2076,25 @@ mod tests {
         // and `4` fall in the `0..=8` short-form band (§III.3.39), so each is a single opcode byte.
         assert_eq!(body.bytes.len(), 12 + 4);
         let flags_and_size = u16::from_le_bytes([body.bytes[0], body.bytes[1]]);
-        assert_eq!(flags_and_size & 0xFFF, COR_IL_METHOD_FAT_FORMAT | COR_IL_METHOD_INIT_LOCALS);
+        assert_eq!(
+            flags_and_size & 0xFFF,
+            COR_IL_METHOD_FAT_FORMAT | COR_IL_METHOD_INIT_LOCALS
+        );
         assert_eq!(flags_and_size >> 12, FAT_HEADER_SIZE_WORDS);
-        assert_eq!(flags_and_size & COR_IL_METHOD_MORE_SECTS, 0, "no EH -> no MoreSects flag");
-        let code_size = u32::from_le_bytes([body.bytes[4], body.bytes[5], body.bytes[6], body.bytes[7]]);
+        assert_eq!(
+            flags_and_size & COR_IL_METHOD_MORE_SECTS,
+            0,
+            "no EH -> no MoreSects flag"
+        );
+        let code_size =
+            u32::from_le_bytes([body.bytes[4], body.bytes[5], body.bytes[6], body.bytes[7]]);
         assert_eq!(code_size, 4);
         let code = &body.bytes[12..];
-        assert_eq!(code, &[0x19, 0x1A, 0x58, 0x2A], "ldc.i4.3(=0x19) ldc.i4.4(=0x1A) add ret");
+        assert_eq!(
+            code,
+            &[0x19, 0x1A, 0x58, 0x2A],
+            "ldc.i4.3(=0x19) ldc.i4.4(=0x1A) add ret"
+        );
     }
 
     /// `bb0: brtrue(false)->bb1 ; br bb0` / `bb1: ret` — verifies the two-pass long-form offset
@@ -1973,7 +2104,10 @@ mod tests {
         let mut asm = Assembly::default();
         let sig = asm.sig([], Type::Void);
         let cond = asm.alloc_node(CILNode::Const(Box::new(Const::Bool(false))));
-        let branch_to_1 = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, Some(BranchCond::True(cond)),
+        let branch_to_1 = asm.alloc_root(CILRoot::Branch(Box::new((
+            1,
+            0,
+            Some(BranchCond::True(cond)),
         ))));
         let branch_to_0 = asm.alloc_root(CILRoot::Branch(Box::new((0, 0, None))));
         let bb0 = BB::new(vec![branch_to_1, branch_to_0], 0, None);
@@ -2059,7 +2193,9 @@ mod tests {
         let nop = asm.alloc_root(CILRoot::Nop);
         let get_exc = asm.alloc_node(CILNode::GetException);
         let pop_root = asm.alloc_root(CILRoot::Pop(get_exc));
-        let leave = asm.alloc_root(CILRoot::ExitSpecialRegion { target: 1, source: 0,
+        let leave = asm.alloc_root(CILRoot::ExitSpecialRegion {
+            target: 1,
+            source: 0,
         });
         let handler_block = BB::new(vec![pop_root, leave], 0, None);
         let bb0 = BB::new(vec![nop], 0, Some(vec![handler_block]));
@@ -2077,7 +2213,9 @@ mod tests {
             "a handler must set CorILMethod_MoreSects"
         );
 
-        let code_size = u32::from_le_bytes([body.bytes[4], body.bytes[5], body.bytes[6], body.bytes[7]]) as usize;
+        let code_size =
+            u32::from_le_bytes([body.bytes[4], body.bytes[5], body.bytes[6], body.bytes[7]])
+                as usize;
         let mut eh_off = 12 + code_size;
         while eh_off % 4 != 0 {
             eh_off += 1;
@@ -2086,30 +2224,60 @@ mod tests {
             body.bytes[eh_off] & (COR_IL_METHOD_SECT_EHTABLE | COR_IL_METHOD_SECT_FAT_FORMAT),
             COR_IL_METHOD_SECT_EHTABLE | COR_IL_METHOD_SECT_FAT_FORMAT
         );
-        let data_size = u32::from_le_bytes([body.bytes[eh_off + 1], body.bytes[eh_off + 2], body.bytes[eh_off + 3], 0,
+        let data_size = u32::from_le_bytes([
+            body.bytes[eh_off + 1],
+            body.bytes[eh_off + 2],
+            body.bytes[eh_off + 3],
+            0,
         ]);
-        assert_eq!(data_size, 4 + 24, "one clause: 4-byte section header + 24-byte fat clause");
+        assert_eq!(
+            data_size,
+            4 + 24,
+            "one clause: 4-byte section header + 24-byte fat clause"
+        );
 
         let clause_off = eh_off + 4;
-        let clause_flags = u32::from_le_bytes(body.bytes[clause_off..clause_off + 4].try_into().unwrap());
+        let clause_flags =
+            u32::from_le_bytes(body.bytes[clause_off..clause_off + 4].try_into().unwrap());
         assert_eq!(clause_flags, 0, "a plain typed catch has flags = 0");
-        let try_off = u32::from_le_bytes(body.bytes[clause_off + 4..clause_off + 8].try_into().unwrap(),
+        let try_off = u32::from_le_bytes(
+            body.bytes[clause_off + 4..clause_off + 8]
+                .try_into()
+                .unwrap(),
         );
-        let try_len = u32::from_le_bytes(body.bytes[clause_off + 8..clause_off + 12].try_into().unwrap(),
+        let try_len = u32::from_le_bytes(
+            body.bytes[clause_off + 8..clause_off + 12]
+                .try_into()
+                .unwrap(),
         );
-        let handler_off = u32::from_le_bytes(body.bytes[clause_off + 12..clause_off + 16].try_into().unwrap(),
+        let handler_off = u32::from_le_bytes(
+            body.bytes[clause_off + 12..clause_off + 16]
+                .try_into()
+                .unwrap(),
         );
-        let handler_len = u32::from_le_bytes(body.bytes[clause_off + 16..clause_off + 20].try_into().unwrap(),
+        let handler_len = u32::from_le_bytes(
+            body.bytes[clause_off + 16..clause_off + 20]
+                .try_into()
+                .unwrap(),
         );
         // Protected region: one `nop` (1 byte) at code offset 0.
         assert_eq!(try_off, 0);
         assert_eq!(try_len, 1);
         // Handler starts right after the try region.
         assert_eq!(handler_off, try_len);
-        assert!(handler_len > 0, "handler emits pop + leave, so its length must be non-zero");
-        let catch_tok = u32::from_le_bytes(body.bytes[clause_off + 20..clause_off + 24].try_into().unwrap(),
+        assert!(
+            handler_len > 0,
+            "handler emits pop + leave, so its length must be non-zero"
         );
-        assert_eq!(Token(catch_tok).table(), Token::TABLE_TYPE_REF, "System.Object via the stub sink"
+        let catch_tok = u32::from_le_bytes(
+            body.bytes[clause_off + 20..clause_off + 24]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(
+            Token(catch_tok).table(),
+            Token::TABLE_TYPE_REF,
+            "System.Object via the stub sink"
         );
     }
 
@@ -2180,7 +2348,9 @@ mod tests {
         let sig = asm.sig([], Type::Void);
 
         let nop = asm.alloc_root(CILRoot::Nop);
-        let leave = asm.alloc_root(CILRoot::ExitSpecialRegion { target: 1, source: 0,
+        let leave = asm.alloc_root(CILRoot::ExitSpecialRegion {
+            target: 1,
+            source: 0,
         });
         // No `GetException`/`Pop` anywhere in the handler — this is the common shape (a cleanup
         // handler that just unwinds further, ignoring the caught exception's value).
@@ -2193,7 +2363,9 @@ mod tests {
         let mut sink = StubSink::default();
         let body = assemble_method(&mut asm, method, &mut sink);
 
-        let code_size = u32::from_le_bytes([body.bytes[4], body.bytes[5], body.bytes[6], body.bytes[7]]) as usize;
+        let code_size =
+            u32::from_le_bytes([body.bytes[4], body.bytes[5], body.bytes[6], body.bytes[7]])
+                as usize;
         let code = &body.bytes[12..12 + code_size];
         // Protected region: one `nop` (1 byte) at code offset 0. The handler starts at offset 1
         // and — since the handler never names the caught exception — must open with `pop` (0x26)
@@ -2205,5 +2377,67 @@ mod tests {
              (§I.12.4.2.5), or the eval stack is left one slot too deep for the rest of the method"
         );
         assert_eq!(code[2], 0xDD, "leave");
+    }
+
+    #[test]
+    fn handler_exception_is_spilled_across_nested_leave_in_direct_pe() {
+        let mut asm = Assembly::default();
+        let sig = asm.sig([], Type::Void);
+        let protected_nop = asm.alloc_root(CILRoot::Nop);
+        let inner_nop = asm.alloc_root(CILRoot::Nop);
+        let terminate = asm.alloc_root(CILRoot::TerminateRegion {
+            protected: inner_nop,
+            reason: 1,
+        });
+        let to_use = asm.alloc_root(CILRoot::Branch(Box::new((0, 2, None))));
+        let get_exception = asm.alloc_node(CILNode::GetException);
+        let consume = asm.alloc_root(CILRoot::Pop(get_exception));
+        let leave = asm.alloc_root(CILRoot::ExitSpecialRegion {
+            target: 1,
+            source: 0,
+        });
+        let handler = vec![
+            BB::new(vec![terminate, to_use], 3, None),
+            BB::new(vec![consume, leave], 2, None),
+        ];
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        let method = make_static_method(
+            &mut asm,
+            sig,
+            vec![
+                BB::new(vec![protected_nop], 0, Some(handler)),
+                BB::new(vec![ret], 1, None),
+            ],
+            vec![],
+        );
+
+        let mut sink = StubSink::default();
+        let body = assemble_method(&mut asm, method, &mut sink);
+        assert_eq!(
+            body.locals.len(),
+            1,
+            "the hidden exception local must be emitted"
+        );
+
+        let code_size = u32::from_le_bytes(body.bytes[4..8].try_into().unwrap()) as usize;
+        let code = &body.bytes[12..12 + code_size];
+        assert_eq!(code[0], 0x00, "protected nop");
+        assert_eq!(
+            code[1], 0x0A,
+            "outer handler must immediately stloc.0 the implicit exception"
+        );
+        let nested_leave = code[2..]
+            .iter()
+            .position(|byte| *byte == 0xDD)
+            .map(|offset| offset + 2)
+            .expect("TerminateRegion must emit a nested leave");
+        let reload = code
+            .windows(3)
+            .position(|window| window == [0x06, 0x26, 0xDD])
+            .expect("later handler block must ldloc.0, pop, then leave");
+        assert!(
+            nested_leave < reload,
+            "the exception reload must occur after the nested leave emptied the eval stack"
+        );
     }
 }

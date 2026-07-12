@@ -1,7 +1,7 @@
 [package]
 name = "soak_uuid"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 [dependencies]
 # uuid "v4" pulls getrandom 0.4 transitively; the dotnet_overlays/getrandom-0.4
 # overlay supplies the PAL CSPRNG backend, so NO getrandom wiring is needed.

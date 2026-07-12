@@ -16,10 +16,10 @@
 //! sorted) — sorting is a `serialize()`-time concern, not a population-time one, so implementers
 //! can append rows in whatever order is convenient while walking the `Assembly`.
 
-use super::heaps::{write_compressed_u32, BlobHeap, GuidHeap, StringsHeap, UserStringHeap};
+use super::heaps::{BlobHeap, GuidHeap, StringsHeap, UserStringHeap, write_compressed_u32};
 use super::sig::{self, TypeDefOrRefResolver};
-use crate::ir::{Assembly, ClassRef, FieldDesc, Interned, MethodDefIdx, StaticFieldDesc, Type};
 use crate::DotnetRuntime;
+use crate::ir::{Assembly, ClassRef, FieldDesc, Interned, MethodDefIdx, StaticFieldDesc, Type};
 use std::collections::HashMap;
 
 /// A metadata token (§II.22.1.8): high byte is the table id, low 3 bytes are the 1-based row
@@ -65,7 +65,10 @@ impl Token {
     /// Builds a token from a table id (§II.22 table-id byte) and a 1-based row index.
     #[must_use]
     pub fn new(table: u32, rid: u32) -> Self {
-        debug_assert!(table <= 0xFF, "table id {table:#x} doesn't fit a token byte");
+        debug_assert!(
+            table <= 0xFF,
+            "table id {table:#x} doesn't fit a token byte"
+        );
         Token((table << 24) | rid)
     }
 
@@ -406,6 +409,8 @@ pub struct MetadataBuilder {
     /// `.locals` signatures share this cache — a signature blob is self-describing, so two
     /// identical blobs used for different purposes can safely share one row).
     standalone_sig_cache: HashMap<u32, Token>,
+    calli_sig_cache: HashMap<String, Token>,
+    locals_sig_cache: HashMap<Vec<String>, Token>,
     /// Interned `TypeSpec` rows, keyed on the signature blob offset.
     type_spec_cache: HashMap<u32, Token>,
 
@@ -453,6 +458,9 @@ pub struct MetadataBuilder {
     /// hand-built tests preserve their historical output; production export sets it explicitly
     /// before creating any `AssemblyRef` rows.
     runtime: DotnetRuntime,
+
+    /// Optional metadata projection for the compiler's internal `MainModule` sentinel.
+    public_module_full_name: Option<Box<str>>,
 }
 
 /// The 64-bit `Valid`/`Sorted` bitmask position for each table id (§II.24.2.6: bit `N` set iff
@@ -495,7 +503,10 @@ fn write_u16_le(out: &mut Vec<u8>, v: u16) {
 /// (compressed length + raw bytes, §II.23.2) for strings; the primitive's raw little-endian bytes
 /// otherwise. Every shape has a fixed, unambiguous length, so this can never desynchronize the
 /// blob — see `CustomAttrDef`'s doc.
-fn encode_custom_attr_fixed_arg(out: &mut Vec<u8>, v: &crate::ir::class::CustomAttrArg, asm: &Assembly,
+fn encode_custom_attr_fixed_arg(
+    out: &mut Vec<u8>,
+    v: &crate::ir::class::CustomAttrArg,
+    asm: &Assembly,
 ) {
     match v {
         crate::ir::class::CustomAttrArg::Str(s) => {
@@ -510,6 +521,10 @@ fn encode_custom_attr_fixed_arg(out: &mut Vec<u8>, v: &crate::ir::class::CustomA
 }
 
 impl MetadataBuilder {
+    pub(super) fn set_public_module_full_name(&mut self, name: Option<&str>) {
+        self.public_module_full_name = name.map(Into::into);
+    }
+
     /// Builds a fresh, empty builder — already seeded with the mandatory `<Module>` pseudo-`TypeDef`
     /// (§II.22.37: "The first row of the TypeDef table represents the pseudo class that acts as
     /// the parent for functions and variables defined at module scope" — every real assembly's
@@ -696,7 +711,11 @@ impl MetadataBuilder {
     /// # Panics
     /// If `tok` is not a `TypeDef` token, or its row index is out of range.
     pub fn set_type_def_field_list(&mut self, tok: Token) {
-        assert_eq!(tok.table(), Token::TABLE_TYPE_DEF, "not a TypeDef token: {tok:?}");
+        assert_eq!(
+            tok.table(),
+            Token::TABLE_TYPE_DEF,
+            "not a TypeDef token: {tok:?}"
+        );
         let idx = usize::try_from(tok.rid()).unwrap() - 1;
         self.type_def[idx].field_list = u32::try_from(self.field.len() + 1).unwrap();
     }
@@ -709,7 +728,11 @@ impl MetadataBuilder {
     /// # Panics
     /// If `tok` is not a `TypeDef` token, or its row index is out of range.
     pub fn set_type_def_method_list(&mut self, tok: Token) {
-        assert_eq!(tok.table(), Token::TABLE_TYPE_DEF, "not a TypeDef token: {tok:?}");
+        assert_eq!(
+            tok.table(),
+            Token::TABLE_TYPE_DEF,
+            "not a TypeDef token: {tok:?}"
+        );
         let idx = usize::try_from(tok.rid()).unwrap() - 1;
         self.type_def[idx].method_list = u32::try_from(self.method_def.len() + 1).unwrap();
     }
@@ -803,9 +826,8 @@ impl MetadataBuilder {
         let rid = u32::try_from(self.field.len()).unwrap();
         let tok = Token::new(Token::TABLE_FIELD, rid);
         if let Some(offset) = offset {
-            self.field_layout.push(FieldLayoutRow {
-                offset,
-                field: rid });
+            self.field_layout
+                .push(FieldLayoutRow { offset, field: rid });
         }
         tok
     }
@@ -952,7 +974,11 @@ impl MetadataBuilder {
             let name_off = pname.map_or(0, |n| self.strings.intern(n));
             // §II.23.1.13 `ParamAttributes`: 0x0002 `Out` — the only flag this exporter ever sets
             // (see `add_method`'s doc; `In`/`Optional` are never needed for the shapes we emit).
-            let flags = if out_params.contains(&sequence) { 0x0002 } else { 0 };
+            let flags = if out_params.contains(&sequence) {
+                0x0002
+            } else {
+                0
+            };
             self.param.push(ParamRow {
                 flags,
                 sequence,
@@ -1012,7 +1038,11 @@ impl MetadataBuilder {
     /// Patches the body RVA of a previously-added `MethodDef` row (§II.22.26 `RVA` column) once
     /// `pe.rs`'s layout pass has placed the assembled body bytes in `.text`.
     pub fn set_method_body_rva(&mut self, method: Token, rva: u32) {
-        assert_eq!(method.table(), Token::TABLE_METHOD_DEF, "not a MethodDef token");
+        assert_eq!(
+            method.table(),
+            Token::TABLE_METHOD_DEF,
+            "not a MethodDef token"
+        );
         let idx = usize::try_from(method.rid()).unwrap() - 1;
         self.method_def[idx].rva = rva;
     }
@@ -1097,7 +1127,11 @@ impl MetadataBuilder {
     /// [`MetadataBuilder::add_type_def`]'s `implements` argument; exposed separately for the rare
     /// case a caller needs to add one after the fact.
     pub fn interface_impl(&mut self, class: Token, interface: Token) -> Token {
-        assert_eq!(class.table(), Token::TABLE_TYPE_DEF, "InterfaceImpl.Class must be a TypeDef");
+        assert_eq!(
+            class.table(),
+            Token::TABLE_TYPE_DEF,
+            "InterfaceImpl.Class must be a TypeDef"
+        );
         self.interface_impl.push(InterfaceImplRow {
             class: class.rid(),
             interface: encode_type_def_or_ref_token(interface),
@@ -1154,7 +1188,10 @@ impl MetadataBuilder {
     pub fn mark_method_static_abstract(&mut self, method: Token) {
         debug_assert_eq!(method.table(), Token::TABLE_METHOD_DEF);
         let row = &mut self.method_def[method.rid() as usize - 1];
-        debug_assert!(row.flags & 0x10 != 0, "must have been added with is_static = true");
+        debug_assert!(
+            row.flags & 0x10 != 0,
+            "must have been added with is_static = true"
+        );
         debug_assert_eq!(row.flags & 0x100, 0, "a static virtual must NOT be NewSlot");
         row.flags |= 0x40 | 0x80 | 0x400; // Virtual | HideBySig | Abstract
     }
@@ -1190,7 +1227,11 @@ impl MetadataBuilder {
     }
 
     pub fn add_method_impl(&mut self, class: Token, body: Token, declaration: Token) {
-        assert_eq!(class.table(), Token::TABLE_TYPE_DEF, "MethodImpl.Class must be a TypeDef");
+        assert_eq!(
+            class.table(),
+            Token::TABLE_TYPE_DEF,
+            "MethodImpl.Class must be a TypeDef"
+        );
         self.method_impl.push(MethodImplRow {
             class: class.rid(),
             method_body: encode_method_def_or_ref(body),
@@ -1215,7 +1256,11 @@ impl MetadataBuilder {
         add: Token,
         remove: Token,
     ) {
-        assert_eq!(class.table(), Token::TABLE_TYPE_DEF, "Event owner must be a TypeDef");
+        assert_eq!(
+            class.table(),
+            Token::TABLE_TYPE_DEF,
+            "Event owner must be a TypeDef"
+        );
         // §II.10.4/§II.22.13: event accessors shall be `SpecialName` — how Roslyn (and reflection's
         // accessor filtering) distinguish `add_X`/`remove_X` accessor pairs from ordinary methods
         // (load-bearing for a C# consumer *implementing* an interface event: without it csc treats
@@ -1293,7 +1338,11 @@ impl MetadataBuilder {
         getter: Option<Token>,
         setter: Option<Token>,
     ) {
-        assert_eq!(class.table(), Token::TABLE_TYPE_DEF, "Property owner must be a TypeDef");
+        assert_eq!(
+            class.table(),
+            Token::TABLE_TYPE_DEF,
+            "Property owner must be a TypeDef"
+        );
         assert!(
             getter.is_some() || setter.is_some(),
             "add_property: property `{name}` has no accessors — nothing for MethodSemantics to \
@@ -1332,8 +1381,7 @@ impl MetadataBuilder {
             signature: sig_blob,
         });
         let property_rid = u32::try_from(self.property.len()).unwrap();
-        let association =
-            encode_has_semantics(Token::new(Token::TABLE_PROPERTY, property_rid));
+        let association = encode_has_semantics(Token::new(Token::TABLE_PROPERTY, property_rid));
         // §II.23.1.12 MethodSemantics.Semantics: 0x2 Getter, 0x1 Setter.
         if let Some(g) = getter {
             self.method_semantics.push(MethodSemanticsRow {
@@ -1520,7 +1568,11 @@ impl MetadataBuilder {
             .pending_field_rva
             .iter()
             .find(|p| p.field_token == field)
-            .unwrap_or_else(|| panic!("no pending FieldRVA for {field:?} — was add_static_field called with rva_data?"));
+            .unwrap_or_else(|| {
+                panic!(
+                    "no pending FieldRVA for {field:?} — was add_static_field called with rva_data?"
+                )
+            });
         self.field_rva[entry.row - 1].rva = rva;
     }
 
@@ -1535,7 +1587,12 @@ impl MetadataBuilder {
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
         let sizes = self.row_counts();
-        let widths = Widths::compute(&sizes, &self.strings, &self.blobs, &self.guids, &self.user_strings,
+        let widths = Widths::compute(
+            &sizes,
+            &self.strings,
+            &self.blobs,
+            &self.guids,
+            &self.user_strings,
         );
 
         let tables_bytes = self.serialize_tables(&sizes, &widths);
@@ -2019,9 +2076,10 @@ impl MetadataBuilder {
         // natural emission order (ascending TypeDef rid, ascending number) is already sorted —
         // the sort here is belt-and-braces, the debug_assert the tripwire.
         rows.sort_by_key(|r| (r.owner, r.number));
-        debug_assert!(rows
-            .windows(2)
-            .all(|w| (w[0].owner, w[0].number) <= (w[1].owner, w[1].number)));
+        debug_assert!(
+            rows.windows(2)
+                .all(|w| (w[0].owner, w[0].number) <= (w[1].owner, w[1].number))
+        );
         for row in rows {
             out.extend_from_slice(&row.number.to_le_bytes());
             out.extend_from_slice(&row.flags.to_le_bytes());
@@ -2361,7 +2419,11 @@ impl Widths {
         }
 
         let type_def_or_ref_max = sizes.type_def.max(sizes.type_ref).max(sizes.type_spec);
-        let resolution_scope_max = sizes.module.max(sizes.module_ref).max(sizes.assembly_ref).max(sizes.type_ref);
+        let resolution_scope_max = sizes
+            .module
+            .max(sizes.module_ref)
+            .max(sizes.assembly_ref)
+            .max(sizes.type_ref);
         let member_ref_parent_max = sizes
             .type_def
             .max(sizes.type_ref)
@@ -2472,7 +2534,9 @@ impl TypeDefOrRefResolver for MetadataBuilder {
             // added by `add_type_def` (population walks class defs before any signature needs
             // to resolve one) — if not, this is a caller-ordering bug, not a spec question.
             self.find_type_def(&raw_name).unwrap_or_else(|| {
-                panic!("ClassRef {raw_name:?} resolves to a class def not yet added via add_type_def")
+                panic!(
+                    "ClassRef {raw_name:?} resolves to a class def not yet added via add_type_def"
+                )
             })
         } else if let Some(def_id) = find_open_generic_def(asm, cref) {
             // An in-assembly INSTANTIATED generic reference (e.g. `IBox`1<int32>` where `IBox`1`
@@ -2580,7 +2644,10 @@ impl MetadataBuilder {
     /// (§II.22.39) carrying the FULL `GENERICINST` blob instead — mirrors what `ilasm` builds
     /// under the hood whenever `il_exporter`'s textual `class 'Name'<T,…>` appears as a
     /// `newobj`/`MemberRef` operand.
-    pub(super) fn class_ref_token(&mut self, asm: &mut Assembly, cref: Interned<ClassRef>,
+    pub(super) fn class_ref_token(
+        &mut self,
+        asm: &mut Assembly,
+        cref: Interned<ClassRef>,
     ) -> Token {
         if asm[cref].generics().is_empty() {
             let coded = self.type_def_or_ref(cref, asm);
@@ -2615,6 +2682,11 @@ impl MetadataBuilder {
     /// namespace name 'cd_interop' could not be found`) even though it loads and runs fine at
     /// runtime (token-based resolution never notices the empty `Namespace`).
     fn find_type_def(&self, raw_name: &str) -> Option<Token> {
+        let raw_name = if raw_name == crate::ir::asm::MAIN_MODULE {
+            self.public_module_full_name.as_deref().unwrap_or(raw_name)
+        } else {
+            raw_name
+        };
         // Split BEFORE shortening (not after) to match `add_type_def`'s own contract exactly: it
         // shortens only the (already-split-by-the-caller) `name` argument, never the combined
         // dotted string — splitting a POST-shortened (hash-suffixed) string here would risk
@@ -2623,7 +2695,9 @@ impl MetadataBuilder {
         let shortened = dotnet_class_name(name);
         for (i, row) in self.type_def.iter().enumerate() {
             if self.strings_eq(row.name, &shortened) && self.strings_eq(row.namespace, namespace) {
-                return Some(Token::new(Token::TABLE_TYPE_DEF, u32::try_from(i + 1).unwrap(),
+                return Some(Token::new(
+                    Token::TABLE_TYPE_DEF,
+                    u32::try_from(i + 1).unwrap(),
                 ));
             }
         }
@@ -2747,14 +2821,16 @@ pub trait TokenSink {
     /// because instance and static fields are interned in different `Assembly` maps —
     /// `FieldDesc` vs. `StaticFieldDesc` — mirroring the `ldsfld`/`stsfld` vs. `ldfld`/`stfld`
     /// split in `il_exporter::export_node`).
-    fn static_field_token(&mut self, asm: &mut Assembly, field: Interned<StaticFieldDesc>) -> Token;
+    fn static_field_token(&mut self, asm: &mut Assembly, field: Interned<StaticFieldDesc>)
+    -> Token;
 
     /// Interns `s` in the `#US` heap and returns the `ldstr` token (§II.22.2's *User String*
     /// token: table id `0x70`, not one of the ordinary metadata tables).
     fn user_string_token(&mut self, s: &str) -> Token;
 
     /// Interns a `StandAloneSig` row for a `calli` call-site signature and returns its token.
-    fn calli_sig_token(&mut self, asm: &mut Assembly, sig_blob: &[u8]) -> Token;
+    fn calli_sig_token(&mut self, asm: &mut Assembly, semantic_key: &str, sig_blob: &[u8])
+    -> Token;
 
     /// Interns a `StandAloneSig` row for a method body's `.locals` signature and returns its
     /// token (fat method headers store this in the `LocalVarSigTok` field, §II.25.4.3).
@@ -2787,7 +2863,11 @@ impl TokenSink for MetadataBuilder {
             let mut blob = Vec::new();
             let fnsig = asm[sig].clone();
             let is_static = method_ref.kind() == crate::ir::cilnode::MethodKind::Static;
-            let mut convention = if is_static { sig::SIG_DEFAULT } else { sig::SIG_HASTHIS };
+            let mut convention = if is_static {
+                sig::SIG_DEFAULT
+            } else {
+                sig::SIG_HASTHIS
+            };
             // §II.23.2.2 `MethodRefSig`: when this call site is a generic-method instantiation
             // (`generic_args` non-empty — the caller wraps the result in a `MethodSpec`,
             // §II.22.29), the base MemberRef this MethodSpec points at must ITSELF carry the
@@ -2822,7 +2902,13 @@ impl TokenSink for MetadataBuilder {
             } else {
                 crate::ir::FnSig::new(fnsig.inputs()[1..].to_vec(), *fnsig.output())
             };
-            sig::encode_method_sig(convention, generic_param_count, &encode_sig, asm, self, &mut blob,
+            sig::encode_method_sig(
+                convention,
+                generic_param_count,
+                &encode_sig,
+                asm,
+                self,
+                &mut blob,
             );
             let sig_off = self.blobs.intern(&blob);
             self.member_ref(class_tok, &name, sig_off)
@@ -2856,7 +2942,10 @@ impl TokenSink for MetadataBuilder {
         self.member_ref(class_tok, &name, sig_off)
     }
 
-    fn static_field_token(&mut self, asm: &mut Assembly, field: Interned<StaticFieldDesc>,
+    fn static_field_token(
+        &mut self,
+        asm: &mut Assembly,
+        field: Interned<StaticFieldDesc>,
     ) -> Token {
         let desc = asm[field];
         let owner_in_asm = asm.class_ref_to_def(desc.owner()).is_some();
@@ -2882,16 +2971,32 @@ impl TokenSink for MetadataBuilder {
         Token::new(Token::TABLE_USER_STRING, off)
     }
 
-    fn calli_sig_token(&mut self, _asm: &mut Assembly, sig_blob: &[u8]) -> Token {
+    fn calli_sig_token(
+        &mut self,
+        _asm: &mut Assembly,
+        semantic_key: &str,
+        sig_blob: &[u8],
+    ) -> Token {
+        if let Some(&token) = self.calli_sig_cache.get(semantic_key) {
+            return token;
+        }
         let off = self.blobs.intern(sig_blob);
-        self.standalone_sig(off)
+        let token = self.standalone_sig(off);
+        self.calli_sig_cache.insert(semantic_key.to_owned(), token);
+        token
     }
 
     fn locals_sig_token(&mut self, asm: &mut Assembly, locals: &[Type]) -> Token {
+        let semantic_key: Vec<_> = locals.iter().map(|local| local.mangle(asm)).collect();
+        if let Some(&token) = self.locals_sig_cache.get(&semantic_key) {
+            return token;
+        }
         let mut blob = Vec::new();
         sig::encode_locals_sig(locals, asm, self, &mut blob);
         let off = self.blobs.intern(&blob);
-        self.standalone_sig(off)
+        let token = self.standalone_sig(off);
+        self.locals_sig_cache.insert(semantic_key, token);
+        token
     }
 
     fn type_token(&mut self, asm: &mut Assembly, tpe: Type) -> Token {
@@ -2959,7 +3064,7 @@ fn decode_type_def_or_ref(coded: u32) -> Token {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{cilnode::MethodKind, Access, Float, Int};
+    use crate::ir::{Access, Float, Int, cilnode::MethodKind};
 
     #[test]
     fn token_encodes_table_and_rid() {
@@ -2996,7 +3101,11 @@ mod tests {
         // `MetadataBuilder::new`'s doc comment for the full story).
         let mut mb = MetadataBuilder::new();
         let tok = mb.add_type_def("", "MainModule", false, None, None, None, &[]);
-        assert_eq!(tok.rid(), 2, "the first real class def must be TypeDef row 2, not row 1");
+        assert_eq!(
+            tok.rid(),
+            2,
+            "the first real class def must be TypeDef row 2, not row 1"
+        );
     }
 
     #[test]
@@ -3031,12 +3140,21 @@ mod tests {
     /// `Parrot : ISpeaker` consumer — see `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md` finding #2).
     #[test]
     fn interface_type_def_and_abstract_method_are_emitted_by_pe_writer() {
-        use crate::ir::{ClassDef, ClassRef, MethodDef, MethodImpl, Type};
+        use crate::ir::{ClassDef, MethodDef, MethodImpl, Type};
 
         let mut asm = crate::ir::Assembly::default();
         let iname = asm.alloc_string("ISpeaker");
         let cdef = ClassDef::new(
-            iname, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+            iname,
+            false,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Public,
+            None,
+            None,
+            true,
         )
         .with_interface();
         let cidx = asm.class_def(cdef).unwrap();
@@ -3059,6 +3177,7 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_iface".to_string(),
+            public_module_full_name: None,
             module_name: "pe_iface.dll".to_string(),
             pdb_file_name: String::new(),
         };
@@ -3083,22 +3202,49 @@ mod tests {
         let td_w = MetadataReader::row_width(Token::TABLE_TYPE_DEF, &header);
         let iface_row = td_start + td_w; // rid 2 == index 1
         let flags = u32_at(iface_row);
-        assert_ne!(flags & 0x20, 0, "TypeDef must have Interface (0x20) flag; flags={flags:#x}");
-        assert_ne!(flags & 0x80, 0, "TypeDef must have Abstract (0x80) flag; flags={flags:#x}");
-        assert_eq!(flags & 0x100, 0, "interface TypeDef must NOT be Sealed (0x100); flags={flags:#x}");
+        assert_ne!(
+            flags & 0x20,
+            0,
+            "TypeDef must have Interface (0x20) flag; flags={flags:#x}"
+        );
+        assert_ne!(
+            flags & 0x80,
+            0,
+            "TypeDef must have Abstract (0x80) flag; flags={flags:#x}"
+        );
+        assert_eq!(
+            flags & 0x100,
+            0,
+            "interface TypeDef must NOT be Sealed (0x100); flags={flags:#x}"
+        );
         // Extends sits after Flags(4) + Name + Namespace (two `#Strings` indices).
         let str_w = if header.heap_sizes & 0x1 != 0 { 4 } else { 2 };
         let extends_off = iface_row + 4 + 2 * str_w;
-        let extends = if str_w == 4 { u32_at(extends_off) } else { u16_at(extends_off) as u32 };
-        assert_eq!(extends, 0, "interface TypeDef must have NIL Extends; got {extends:#x}");
+        let extends = if str_w == 4 {
+            u32_at(extends_off)
+        } else {
+            u16_at(extends_off) as u32
+        };
+        assert_eq!(
+            extends, 0,
+            "interface TypeDef must have NIL Extends; got {extends:#x}"
+        );
 
         // --- Speak's MethodDef row (rid 1, the only method). RVA is the first 4 bytes; Flags is a
         // u16 at offset 6 (after RVA(4) + ImplFlags(2)), both in the fixed-width prefix.
         let md_start = reader.table_offset(Token::TABLE_METHOD_DEF, &header);
         assert_eq!(u32_at(md_start), 0, "abstract method must have RVA=0");
         let m_flags = u16_at(md_start + 6);
-        assert_ne!(m_flags & 0x400, 0, "abstract method must have Abstract (0x400) flag; flags={m_flags:#x}");
-        assert_ne!(m_flags & 0x40, 0, "abstract method must still be Virtual (0x40); flags={m_flags:#x}");
+        assert_ne!(
+            m_flags & 0x400,
+            0,
+            "abstract method must have Abstract (0x400) flag; flags={m_flags:#x}"
+        );
+        assert_ne!(
+            m_flags & 0x40,
+            0,
+            "abstract method must still be Virtual (0x40); flags={m_flags:#x}"
+        );
     }
 
     /// §II.22.12 `EventMap` runs are contiguous Event-table slices delimited by the NEXT row's
@@ -3116,7 +3262,16 @@ mod tests {
         let sig = mb.blobs.intern(&[0x20, 0x00, 0x01]);
         let m: Vec<Token> = (0..6)
             .map(|i| {
-                mb.add_method(&format!("acc{i}"), sig, &[], &[], false, true, false, None, false,
+                mb.add_method(
+                    &format!("acc{i}"),
+                    sig,
+                    &[],
+                    &[],
+                    false,
+                    true,
+                    false,
+                    None,
+                    false,
                 )
             })
             .collect();
@@ -3142,7 +3297,16 @@ mod tests {
         let mut asm = crate::ir::Assembly::default();
         let iname = asm.alloc_string("IParse");
         let cdef = ClassDef::new(
-            iname, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+            iname,
+            false,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Public,
+            None,
+            None,
+            true,
         )
         .with_interface();
         let cidx = asm.class_def(cdef).unwrap();
@@ -3165,6 +3329,7 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_static_iface".to_string(),
+            public_module_full_name: None,
             module_name: "pe_static_iface.dll".to_string(),
             pdb_file_name: String::new(),
         };
@@ -3183,7 +3348,11 @@ mod tests {
         // --- Make's MethodDef row (rid 1, the only method). Row layout: RVA(4) + ImplFlags(2) +
         // Flags(2) + Name(str) + Signature(blob) + ParamList(simple).
         let md_start = reader.table_offset(Token::TABLE_METHOD_DEF, &header);
-        assert_eq!(u32_at(md_start), 0, "static abstract member must have RVA=0");
+        assert_eq!(
+            u32_at(md_start),
+            0,
+            "static abstract member must have RVA=0"
+        );
         assert_eq!(u16_at(md_start + 4), 0, "ImplFlags must be 0");
         let m_flags = u16_at(md_start + 6);
         assert_eq!(
@@ -3193,10 +3362,22 @@ mod tests {
         );
 
         // --- The signature blob: `SIG_DEFAULT` (0x00, NO `HASTHIS`), 0 params, ELEMENT_TYPE_I4.
-        let str_w = if header.heap_sizes & 0x1 != 0 { 4usize } else { 2 };
-        let blob_w = if header.heap_sizes & 0x4 != 0 { 4usize } else { 2 };
+        let str_w = if header.heap_sizes & 0x1 != 0 {
+            4usize
+        } else {
+            2
+        };
+        let blob_w = if header.heap_sizes & 0x4 != 0 {
+            4usize
+        } else {
+            2
+        };
         let sig_col = md_start + 8 + str_w;
-        let sig_off = if blob_w == 4 { u32_at(sig_col) } else { u32::from(u16_at(sig_col)) } as usize;
+        let sig_off = if blob_w == 4 {
+            u32_at(sig_col)
+        } else {
+            u32::from(u16_at(sig_col))
+        } as usize;
         let blob_heap = reader.stream("#Blob");
         // Small blob (< 0x80 bytes): a single compressed-length byte, then the blob data.
         let blob_len = blob_heap[sig_off] as usize;
@@ -3226,7 +3407,16 @@ mod tests {
         let mut asm = crate::ir::Assembly::default();
         let iname = asm.alloc_string("ISpeaker");
         let cdef = ClassDef::new(
-            iname, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+            iname,
+            false,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Public,
+            None,
+            None,
+            true,
         )
         .with_interface();
         let cidx = asm.class_def(cdef).unwrap();
@@ -3297,6 +3487,7 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_iface_prop".to_string(),
+            public_module_full_name: None,
             module_name: "pe_iface_prop.dll".to_string(),
             pdb_file_name: String::new(),
         };
@@ -3311,9 +3502,12 @@ mod tests {
         let row_bytes = &reader.stream("#~")[header.row_data_offset..];
         let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
         let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
-        let count =
-            |id: u32| {
-            header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c)
+        let count = |id: u32| {
+            header
+                .counts
+                .iter()
+                .find(|&&(t, _)| t == id)
+                .map_or(0, |&(_, c)| c)
         };
 
         // Both new tables are Valid; neither is in the Sorted bitmask (§II.24.2.6 — same
@@ -3326,15 +3520,35 @@ mod tests {
         assert_ne!(header.sorted & (1 << Token::TABLE_METHOD_SEMANTICS), 0);
 
         // Everything in this tiny image is narrow (2-byte) indices.
-        let str_w = if header.heap_sizes & 0x1 != 0 { 4usize } else { 2 };
-        let blob_w = if header.heap_sizes & 0x4 != 0 { 4usize } else { 2 };
-        assert_eq!((str_w, blob_w), (2, 2), "tiny image should have narrow heaps");
+        let str_w = if header.heap_sizes & 0x1 != 0 {
+            4usize
+        } else {
+            2
+        };
+        let blob_w = if header.heap_sizes & 0x4 != 0 {
+            4usize
+        } else {
+            2
+        };
+        assert_eq!(
+            (str_w, blob_w),
+            (2, 2),
+            "tiny image should have narrow heaps"
+        );
 
         // --- PropertyMap row: Parent = ISpeaker's TypeDef rid (2 — `<Module>` is rid 1),
         // PropertyList = 1 (the run starts at the first Property row).
         let pm_start = reader.table_offset(Token::TABLE_PROPERTY_MAP, &header);
-        assert_eq!(u16_at(pm_start), 2, "PropertyMap.Parent must be ISpeaker's TypeDef rid");
-        assert_eq!(u16_at(pm_start + 2), 1, "PropertyMap.PropertyList must open the run at 1");
+        assert_eq!(
+            u16_at(pm_start),
+            2,
+            "PropertyMap.Parent must be ISpeaker's TypeDef rid"
+        );
+        assert_eq!(
+            u16_at(pm_start + 2),
+            1,
+            "PropertyMap.PropertyList must open the run at 1"
+        );
 
         // --- Property rows: Flags=0, Name, PropertySig blob.
         let p_start = reader.table_offset(Token::TABLE_PROPERTY, &header);
@@ -3365,7 +3579,7 @@ mod tests {
 
         // --- MethodSemantics rows (sorted by Association; both Volume rows share association
         // `(1 << 1) | 1 = 3`, Name's is `(2 << 1) | 1 = 5`): Getter(0x2)+Setter(0x1) for Volume
-        // (MethodDef rids 1/2), Getter for Name (rid 3). The stable sort preserves the
+        // (canonical MethodDef rids 2/3), Getter for Name (rid 1). The stable sort preserves the
         // getter-then-setter insertion order within one property.
         let ms_start = reader.table_offset(Token::TABLE_METHOD_SEMANTICS, &header);
         let ms_w = MetadataReader::row_width(Token::TABLE_METHOD_SEMANTICS, &header);
@@ -3376,9 +3590,21 @@ mod tests {
                 u16_at(ms_start + i * ms_w + 4),
             )
         };
-        assert_eq!(sem_row(0), (0x2, 1, 3), "Getter(get_Volume) associated to Property rid 1");
-        assert_eq!(sem_row(1), (0x1, 2, 3), "Setter(set_Volume) associated to Property rid 1");
-        assert_eq!(sem_row(2), (0x2, 3, 5), "Getter(get_Name) associated to Property rid 2");
+        assert_eq!(
+            sem_row(0),
+            (0x2, 2, 3),
+            "Getter(get_Volume) associated to Property rid 1"
+        );
+        assert_eq!(
+            sem_row(1),
+            (0x1, 3, 3),
+            "Setter(set_Volume) associated to Property rid 1"
+        );
+        assert_eq!(
+            sem_row(2),
+            (0x2, 1, 5),
+            "Getter(get_Name) associated to Property rid 2"
+        );
 
         // --- Accessor MethodDef rows: RVA=0 and Public|Virtual|NewSlot|Abstract|SpecialName.
         let md_start = reader.table_offset(Token::TABLE_METHOD_DEF, &header);
@@ -3409,7 +3635,16 @@ mod tests {
         let psig = mb.blobs.intern(&[0x28, 0x00, 0x08]);
         let m: Vec<Token> = (0..3)
             .map(|i| {
-                mb.add_method(&format!("get_P{i}"), msig, &[], &[], false, true, false, None, false,
+                mb.add_method(
+                    &format!("get_P{i}"),
+                    msig,
+                    &[],
+                    &[],
+                    false,
+                    true,
+                    false,
+                    None,
+                    false,
                 )
             })
             .collect();
@@ -3436,7 +3671,16 @@ mod tests {
         let iname = asm.alloc_string("IBox`1");
         let tname = asm.alloc_string("T");
         let cdef = ClassDef::new(
-            iname, false, 1, None, vec![], vec![], Access::Public, None, None, true,
+            iname,
+            false,
+            1,
+            None,
+            vec![],
+            vec![],
+            Access::Public,
+            None,
+            None,
+            true,
         )
         .with_interface()
         .with_type_generic_names(vec![tname]);
@@ -3462,6 +3706,7 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_generic_iface".to_string(),
+            public_module_full_name: None,
             module_name: "pe_generic_iface.dll".to_string(),
             pdb_file_name: String::new(),
         };
@@ -3476,14 +3721,29 @@ mod tests {
         let row_bytes = &reader.stream("#~")[header.row_data_offset..];
         let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
         let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
-        let count =
-            |id: u32| {
-            header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c)
+        let count = |id: u32| {
+            header
+                .counts
+                .iter()
+                .find(|&&(t, _)| t == id)
+                .map_or(0, |&(_, c)| c)
         };
-        let str_w = if header.heap_sizes & 0x1 != 0 { 4usize } else { 2 };
-        let blob_w = if header.heap_sizes & 0x4 != 0 { 4usize } else { 2 };
+        let str_w = if header.heap_sizes & 0x1 != 0 {
+            4usize
+        } else {
+            2
+        };
+        let blob_w = if header.heap_sizes & 0x4 != 0 {
+            4usize
+        } else {
+            2
+        };
         let str_at = |o: usize| -> u32 {
-            if str_w == 4 { u32_at(o) } else { u32::from(u16_at(o)) }
+            if str_w == 4 {
+                u32_at(o)
+            } else {
+                u32::from(u16_at(o))
+            }
         };
 
         // (d) IBox`1's TypeDef row (rid 2 — `<Module>` is rid 1): the Name column (after the
@@ -3492,19 +3752,39 @@ mod tests {
         let td_w = MetadataReader::row_width(Token::TABLE_TYPE_DEF, &header);
         let iface_row = td_start + td_w; // rid 2
         let flags = u32_at(iface_row);
-        assert_ne!(flags & 0x20, 0, "TypeDef must have Interface (0x20); flags={flags:#x}");
+        assert_ne!(
+            flags & 0x20,
+            0,
+            "TypeDef must have Interface (0x20); flags={flags:#x}"
+        );
         assert_eq!(reader.strings_at(str_at(iface_row + 4)), "IBox`1");
 
         // (b) Exactly one GenericParam row: Number(2) + Flags(2) + Owner(coded TypeOrMethodDef,
         // 1 tag bit; TypeDef rid 2 -> (2 << 1) | 0) + Name -> "T".
         assert_eq!(count(Token::TABLE_GENERIC_PARAM), 1);
         let gp_start = reader.table_offset(Token::TABLE_GENERIC_PARAM, &header);
-        assert_eq!(u16_at(gp_start), 0, "Number must be 0 (the first declared parameter)");
-        assert_eq!(u16_at(gp_start + 2), 0, "Flags must be 0 (no variance/constraints)");
+        assert_eq!(
+            u16_at(gp_start),
+            0,
+            "Number must be 0 (the first declared parameter)"
+        );
+        assert_eq!(
+            u16_at(gp_start + 2),
+            0,
+            "Flags must be 0 (no variance/constraints)"
+        );
         let tomd_max = count(Token::TABLE_TYPE_DEF).max(count(Token::TABLE_METHOD_DEF));
         let owner_wide = tomd_max >= (1usize << 15);
-        let owner = if owner_wide { u32_at(gp_start + 4) } else { u32::from(u16_at(gp_start + 4)) };
-        assert_eq!(owner, (2 << 1) | 0, "Owner must be coded TypeOrMethodDef(TypeDef rid 2)");
+        let owner = if owner_wide {
+            u32_at(gp_start + 4)
+        } else {
+            u32::from(u16_at(gp_start + 4))
+        };
+        assert_eq!(
+            owner,
+            (2 << 1) | 0,
+            "Owner must be coded TypeOrMethodDef(TypeDef rid 2)"
+        );
         let owner_w = if owner_wide { 4 } else { 2 };
         assert_eq!(reader.strings_at(str_at(gp_start + 4 + owner_w)), "T");
 
@@ -3520,7 +3800,11 @@ mod tests {
         // ET_VAR 0 — the receiver is implicit, never a parameter.
         let md_start = reader.table_offset(Token::TABLE_METHOD_DEF, &header);
         let sig_col = md_start + 8 + str_w;
-        let sig_off = if blob_w == 4 { u32_at(sig_col) } else { u32::from(u16_at(sig_col)) } as usize;
+        let sig_off = if blob_w == 4 {
+            u32_at(sig_col)
+        } else {
+            u32::from(u16_at(sig_col))
+        } as usize;
         let blob_heap = reader.stream("#Blob");
         let blob_len = blob_heap[sig_off] as usize;
         let sig_blob = &blob_heap[sig_off + 1..sig_off + 1 + blob_len];
@@ -3548,7 +3832,16 @@ mod tests {
         let mut asm = crate::ir::Assembly::default();
         let iname = asm.alloc_string("IConverter");
         let cdef = ClassDef::new(
-            iname, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+            iname,
+            false,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Public,
+            None,
+            None,
+            true,
         )
         .with_interface();
         let cidx = asm.class_def(cdef).unwrap();
@@ -3575,6 +3868,7 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_generic_method".to_string(),
+            public_module_full_name: None,
             module_name: "pe_generic_method.dll".to_string(),
             pdb_file_name: String::new(),
         };
@@ -3589,26 +3883,57 @@ mod tests {
         let row_bytes = &reader.stream("#~")[header.row_data_offset..];
         let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
         let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
-        let count =
-            |id: u32| {
-            header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c)
+        let count = |id: u32| {
+            header
+                .counts
+                .iter()
+                .find(|&&(t, _)| t == id)
+                .map_or(0, |&(_, c)| c)
         };
-        let str_w = if header.heap_sizes & 0x1 != 0 { 4usize } else { 2 };
-        let blob_w = if header.heap_sizes & 0x4 != 0 { 4usize } else { 2 };
+        let str_w = if header.heap_sizes & 0x1 != 0 {
+            4usize
+        } else {
+            2
+        };
+        let blob_w = if header.heap_sizes & 0x4 != 0 {
+            4usize
+        } else {
+            2
+        };
         let str_at = |o: usize| -> u32 {
-            if str_w == 4 { u32_at(o) } else { u32::from(u16_at(o)) }
+            if str_w == 4 {
+                u32_at(o)
+            } else {
+                u32::from(u16_at(o))
+            }
         };
 
         // (a) Exactly one GenericParam row, owned by Echo's MethodDef (rid 1 — the only method
         // in this assembly): Owner = (1 << 1) | 1 (coded TypeOrMethodDef, MethodDef tag).
         assert_eq!(count(Token::TABLE_GENERIC_PARAM), 1);
         let gp_start = reader.table_offset(Token::TABLE_GENERIC_PARAM, &header);
-        assert_eq!(u16_at(gp_start), 0, "Number must be 0 (the first declared parameter)");
-        assert_eq!(u16_at(gp_start + 2), 0, "Flags must be 0 (no variance/constraints)");
+        assert_eq!(
+            u16_at(gp_start),
+            0,
+            "Number must be 0 (the first declared parameter)"
+        );
+        assert_eq!(
+            u16_at(gp_start + 2),
+            0,
+            "Flags must be 0 (no variance/constraints)"
+        );
         let tomd_max = count(Token::TABLE_TYPE_DEF).max(count(Token::TABLE_METHOD_DEF));
         let owner_wide = tomd_max >= (1usize << 15);
-        let owner = if owner_wide { u32_at(gp_start + 4) } else { u32::from(u16_at(gp_start + 4)) };
-        assert_eq!(owner, (1 << 1) | 1, "Owner must be coded TypeOrMethodDef(MethodDef rid 1)");
+        let owner = if owner_wide {
+            u32_at(gp_start + 4)
+        } else {
+            u32::from(u16_at(gp_start + 4))
+        };
+        assert_eq!(
+            owner,
+            (1 << 1) | 1,
+            "Owner must be coded TypeOrMethodDef(MethodDef rid 1)"
+        );
         let owner_w = if owner_wide { 4 } else { 2 };
         assert_eq!(reader.strings_at(str_at(gp_start + 4 + owner_w)), "T");
 
@@ -3617,10 +3942,22 @@ mod tests {
         // param ET_MVAR 0 — the receiver stays implicit, exactly like a non-generic member.
         let md_start = reader.table_offset(Token::TABLE_METHOD_DEF, &header);
         let flags = u16_at(md_start + 6);
-        assert_ne!(flags & 0x400, 0, "MethodDef must be Abstract (0x400); flags={flags:#x}");
-        assert_ne!(flags & 0x40, 0, "MethodDef must be Virtual (0x40); flags={flags:#x}");
+        assert_ne!(
+            flags & 0x400,
+            0,
+            "MethodDef must be Abstract (0x400); flags={flags:#x}"
+        );
+        assert_ne!(
+            flags & 0x40,
+            0,
+            "MethodDef must be Virtual (0x40); flags={flags:#x}"
+        );
         let sig_col = md_start + 8 + str_w;
-        let sig_off = if blob_w == 4 { u32_at(sig_col) } else { u32::from(u16_at(sig_col)) } as usize;
+        let sig_off = if blob_w == 4 {
+            u32_at(sig_col)
+        } else {
+            u32::from(u16_at(sig_col))
+        } as usize;
         let blob_heap = reader.stream("#Blob");
         let blob_len = blob_heap[sig_off] as usize;
         let sig_blob = &blob_heap[sig_off + 1..sig_off + 1 + blob_len];
@@ -3646,7 +3983,16 @@ mod tests {
         let iname = asm.alloc_string("IBox`1");
         let tname = asm.alloc_string("T");
         let cdef = ClassDef::new(
-            iname, false, 1, None, vec![], vec![], Access::Public, None, None, true,
+            iname,
+            false,
+            1,
+            None,
+            vec![],
+            vec![],
+            Access::Public,
+            None,
+            None,
+            true,
         )
         .with_interface()
         .with_type_generic_names(vec![tname]);
@@ -3654,8 +4000,11 @@ mod tests {
         // `static void UseBox(IBox<int> box)` — a plain static (interfaces may carry static
         // non-virtual methods with bodies), so the interface stays the only TypeDef (rid 2,
         // deterministic — class-def iteration is hash-ordered with 2+ classes).
-        let inst =
-            asm.alloc_class_ref(ClassRef::new(iname, None, false, [Type::Int(Int::I32)].into(),
+        let inst = asm.alloc_class_ref(ClassRef::new(
+            iname,
+            None,
+            false,
+            [Type::Int(Int::I32)].into(),
         ));
         let mname = asm.alloc_string("UseBox");
         let msig = asm.sig([Type::ClassRef(inst)], Type::Void);
@@ -3678,6 +4027,7 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_generic_iface_inst".to_string(),
+            public_module_full_name: None,
             module_name: "pe_generic_iface_inst.dll".to_string(),
             pdb_file_name: String::new(),
         };
@@ -3692,12 +4042,23 @@ mod tests {
         let row_bytes = &reader.stream("#~")[header.row_data_offset..];
         let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
         let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
-        let count =
-            |id: u32| {
-            header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c)
+        let count = |id: u32| {
+            header
+                .counts
+                .iter()
+                .find(|&&(t, _)| t == id)
+                .map_or(0, |&(_, c)| c)
         };
-        let str_w = if header.heap_sizes & 0x1 != 0 { 4usize } else { 2 };
-        let blob_w = if header.heap_sizes & 0x4 != 0 { 4usize } else { 2 };
+        let str_w = if header.heap_sizes & 0x1 != 0 {
+            4usize
+        } else {
+            2
+        };
+        let blob_w = if header.heap_sizes & 0x4 != 0 {
+            4usize
+        } else {
+            2
+        };
 
         // The tell-tale failure shape would be a module-scope TypeRef named `IBox`1`1` — the
         // fixed resolver never creates ANY TypeRef for this reference. This minimal image
@@ -3713,8 +4074,11 @@ mod tests {
             let scope_w: usize = if scope_max >= (1usize << 14) { 4 } else { 2 };
             for rid0 in 0..count(Token::TABLE_TYPE_REF) {
                 let name_col = tr_start + rid0 * tr_w + scope_w;
-                let name_off =
-                    if str_w == 4 { u32_at(name_col) } else { u32::from(u16_at(name_col)) };
+                let name_off = if str_w == 4 {
+                    u32_at(name_col)
+                } else {
+                    u32::from(u16_at(name_col))
+                };
                 assert!(
                     !reader.strings_at(name_off).contains('`'),
                     "no TypeRef may carry a backtick arity here — the instantiated in-assembly \
@@ -3728,7 +4092,11 @@ mod tests {
         // `GENERICINST CLASS <coded TypeDef rid 2 = (2<<2)|0 = 0x08> argc=1 ET_I4`.
         let md_start = reader.table_offset(Token::TABLE_METHOD_DEF, &header);
         let sig_col = md_start + 8 + str_w;
-        let sig_off = if blob_w == 4 { u32_at(sig_col) } else { u32::from(u16_at(sig_col)) } as usize;
+        let sig_off = if blob_w == 4 {
+            u32_at(sig_col)
+        } else {
+            u32::from(u16_at(sig_col))
+        } as usize;
         let blob_heap = reader.stream("#Blob");
         let blob_len = blob_heap[sig_off] as usize;
         let sig_blob = &blob_heap[sig_off + 1..sig_off + 1 + blob_len];
@@ -3756,7 +4124,16 @@ mod tests {
         let mut asm = crate::ir::Assembly::default();
         let iname = asm.alloc_string("ICalc");
         let cdef = ClassDef::new(
-            iname, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+            iname,
+            false,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Public,
+            None,
+            None,
+            true,
         )
         .with_interface();
         let cidx = asm.class_def(cdef).unwrap();
@@ -3799,6 +4176,7 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_dim".to_string(),
+            public_module_full_name: None,
             module_name: "pe_dim.dll".to_string(),
             pdb_file_name: String::new(),
         };
@@ -3822,15 +4200,35 @@ mod tests {
         // Abstract sibling: RVA=0, Abstract set — unharmed by the DIM next to it.
         assert_eq!(u32_at(md_start), 0, "abstract sibling must keep RVA=0");
         let base_flags = u16_at(md_start + 6);
-        assert_ne!(base_flags & 0x400, 0, "abstract sibling must keep Abstract (0x400); flags={base_flags:#x}");
+        assert_ne!(
+            base_flags & 0x400,
+            0,
+            "abstract sibling must keep Abstract (0x400); flags={base_flags:#x}"
+        );
 
         // The DIM: a real body (RVA != 0), Virtual|NewSlot, NOT Abstract.
         let dim_row = md_start + md_w;
-        assert_ne!(u32_at(dim_row), 0, "DIM must have a non-zero RVA (a real IL body)");
+        assert_ne!(
+            u32_at(dim_row),
+            0,
+            "DIM must have a non-zero RVA (a real IL body)"
+        );
         let dim_flags = u16_at(dim_row + 6);
-        assert_eq!(dim_flags & 0x400, 0, "DIM must NOT be Abstract (0x400); flags={dim_flags:#x}");
-        assert_ne!(dim_flags & 0x40, 0, "DIM must be Virtual (0x40); flags={dim_flags:#x}");
-        assert_ne!(dim_flags & 0x100, 0, "DIM must be NewSlot (0x100); flags={dim_flags:#x}");
+        assert_eq!(
+            dim_flags & 0x400,
+            0,
+            "DIM must NOT be Abstract (0x400); flags={dim_flags:#x}"
+        );
+        assert_ne!(
+            dim_flags & 0x40,
+            0,
+            "DIM must be Virtual (0x40); flags={dim_flags:#x}"
+        );
+        assert_ne!(
+            dim_flags & 0x100,
+            0,
+            "DIM must be NewSlot (0x100); flags={dim_flags:#x}"
+        );
     }
 
     /// A `ref`/`out` parameter on an abstract interface member (`#[dotnet_interface]` + `&mut T`
@@ -3847,7 +4245,16 @@ mod tests {
         let mut asm = crate::ir::Assembly::default();
         let iname = asm.alloc_string("IRefCell");
         let cdef = ClassDef::new(
-            iname, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+            iname,
+            false,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Public,
+            None,
+            None,
+            true,
         )
         .with_interface();
         let cidx = asm.class_def(cdef).unwrap();
@@ -3873,6 +4280,7 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_byref_out".to_string(),
+            public_module_full_name: None,
             module_name: "pe_byref_out.dll".to_string(),
             pdb_file_name: String::new(),
         };
@@ -3892,11 +4300,22 @@ mod tests {
         // + Flags(2) + Name(str) + Signature(blob) + ParamList(simple).
         let md_start = reader.table_offset(Token::TABLE_METHOD_DEF, &header);
         assert_eq!(u32_at(md_start), 0, "abstract member must have RVA=0");
-        let str_w = if header.heap_sizes & 0x1 != 0 { 4usize } else { 2 };
-        let blob_w = if header.heap_sizes & 0x4 != 0 { 4usize } else { 2 };
+        let str_w = if header.heap_sizes & 0x1 != 0 {
+            4usize
+        } else {
+            2
+        };
+        let blob_w = if header.heap_sizes & 0x4 != 0 {
+            4usize
+        } else {
+            2
+        };
         let sig_col = md_start + 8 + str_w;
-        let sig_off =
-            if blob_w == 4 { u32_at(sig_col) } else { u32::from(u16_at(sig_col)) } as usize;
+        let sig_off = if blob_w == 4 {
+            u32_at(sig_col)
+        } else {
+            u32::from(u16_at(sig_col))
+        } as usize;
         let blob_heap = reader.stream("#Blob");
         // Small blob (< 0x80 bytes): a single compressed-length byte, then the blob data.
         let blob_len = blob_heap[sig_off] as usize;
@@ -3931,7 +4350,16 @@ mod tests {
         let mut asm = crate::ir::Assembly::default();
         let iname = asm.alloc_string("IButton");
         let cdef = ClassDef::new(
-            iname, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+            iname,
+            false,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Public,
+            None,
+            None,
+            true,
         )
         .with_interface();
         let cidx = asm.class_def(cdef).unwrap();
@@ -3977,6 +4405,7 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_iface_event".to_string(),
+            public_module_full_name: None,
             module_name: "pe_iface_event.dll".to_string(),
             pdb_file_name: String::new(),
         };
@@ -3992,11 +4421,18 @@ mod tests {
         let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
         let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
         let count = |id: u32| {
-            header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c)
+            header
+                .counts
+                .iter()
+                .find(|&&(t, _)| t == id)
+                .map_or(0, |&(_, c)| c)
         };
         let str_w = if header.heap_sizes & 0x1 != 0 { 4 } else { 2 };
         let idx_at = |o: usize, wide: bool| {
-            if wide { u32_at(o) } else { u32::from(u16_at(o))
+            if wide {
+                u32_at(o)
+            } else {
+                u32::from(u16_at(o))
             }
         };
 
@@ -4004,13 +4440,25 @@ mod tests {
         // RVA is the first 4 bytes; Flags is a u16 at offset 6 (after RVA(4) + ImplFlags(2)).
         let md_start = reader.table_offset(Token::TABLE_METHOD_DEF, &header);
         let md_w = MetadataReader::row_width(Token::TABLE_METHOD_DEF, &header);
-        assert_eq!(count(Token::TABLE_METHOD_DEF), 2, "exactly the two accessors");
+        assert_eq!(
+            count(Token::TABLE_METHOD_DEF),
+            2,
+            "exactly the two accessors"
+        );
         for (rid0, which) in [(0usize, "add_Clicked"), (1usize, "remove_Clicked")] {
             let row = md_start + rid0 * md_w;
             assert_eq!(u32_at(row), 0, "{which}: abstract accessor must have RVA=0");
             let flags = u16_at(row + 6);
-            assert_ne!(flags & 0x400, 0, "{which}: Abstract (0x400) missing; flags={flags:#x}");
-            assert_ne!(flags & 0x40, 0, "{which}: Virtual (0x40) missing; flags={flags:#x}");
+            assert_ne!(
+                flags & 0x400,
+                0,
+                "{which}: Abstract (0x400) missing; flags={flags:#x}"
+            );
+            assert_ne!(
+                flags & 0x40,
+                0,
+                "{which}: Virtual (0x40) missing; flags={flags:#x}"
+            );
             assert_ne!(
                 flags & 0x800,
                 0,
@@ -4026,9 +4474,15 @@ mod tests {
         let td_wide = count(Token::TABLE_TYPE_DEF) > 0xFFFF;
         let ev_wide = count(Token::TABLE_EVENT) > 0xFFFF;
         let em_parent = idx_at(em_start, td_wide);
-        assert_eq!(em_parent, 2, "EventMap.Parent must be IButton's TypeDef rid");
+        assert_eq!(
+            em_parent, 2,
+            "EventMap.Parent must be IButton's TypeDef rid"
+        );
         let em_list = idx_at(em_start + if td_wide { 4 } else { 2 }, ev_wide);
-        assert_eq!(em_list, 1, "EventMap.EventList must open the run at Event rid 1");
+        assert_eq!(
+            em_list, 1,
+            "EventMap.EventList must open the run at Event rid 1"
+        );
 
         // --- Event: one row: EventFlags(u16)=0, Name -> "Clicked", EventType = TypeDefOrRef
         // coded index with the TypeRef tag (1) — the System.Action delegate is external.
@@ -4042,7 +4496,11 @@ mod tests {
             .max(count(Token::TABLE_TYPE_SPEC));
         let tdor_wide = tdor_max >= (1usize << 14);
         let event_type = idx_at(e_start + 2 + str_w, tdor_wide);
-        assert_eq!(event_type & 0x3, 1, "EventType must carry the TypeRef tag (delegate is external)");
+        assert_eq!(
+            event_type & 0x3,
+            1,
+            "EventType must carry the TypeRef tag (delegate is external)"
+        );
 
         // --- MethodSemantics: two rows, sorted by Association (both share the one Event, so
         // insertion order add-then-remove is preserved): Semantics(u16) + Method (MethodDef
@@ -4060,7 +4518,10 @@ mod tests {
             let method = idx_at(row + 2, md_wide);
             assert_eq!(method, acc_rid, "{which}: wrong accessor MethodDef rid");
             let assoc = idx_at(row + 2 + if md_wide { 4 } else { 2 }, false);
-            assert_eq!(assoc, 2, "{which}: Association must be Event rid 1 (coded 0b10)");
+            assert_eq!(
+                assoc, 2,
+                "{which}: Association must be Event rid 1 (coded 0b10)"
+            );
         }
     }
 
@@ -4072,23 +4533,43 @@ mod tests {
     /// `implements` is resolved, making the same-assembly forward reference order-independent).
     #[test]
     fn interface_inheritance_emits_interface_impl_on_the_interface_type_def() {
-        use crate::ir::{ClassDef, Type};
+        use crate::ir::ClassDef;
 
         let mut asm = crate::ir::Assembly::default();
         let base_name = asm.alloc_string("IBase");
         let base_idx = asm
             .class_def(
-                ClassDef::new(base_name, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+                ClassDef::new(
+                    base_name,
+                    false,
+                    0,
+                    None,
+                    vec![],
+                    vec![],
+                    Access::Public,
+                    None,
+                    None,
+                    true,
                 )
-                    .with_interface(),
+                .with_interface(),
             )
             .unwrap();
         let derived_name = asm.alloc_string("IDerived");
         let derived_idx = asm
             .class_def(
-                ClassDef::new(derived_name, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+                ClassDef::new(
+                    derived_name,
+                    false,
+                    0,
+                    None,
+                    vec![],
+                    vec![],
+                    Access::Public,
+                    None,
+                    None,
+                    true,
                 )
-                    .with_interface(),
+                .with_interface(),
             )
             .unwrap();
         // The base-interface reference is the SAME-ASSEMBLY ClassRef IBase's own def registered.
@@ -4098,6 +4579,7 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_iface_inherit".to_string(),
+            public_module_full_name: None,
             module_name: "pe_iface_inherit.dll".to_string(),
             pdb_file_name: String::new(),
         };
@@ -4112,15 +4594,25 @@ mod tests {
         let row_bytes = &reader.stream("#~")[header.row_data_offset..];
         let u16_at = |o: usize| u16::from_le_bytes(row_bytes[o..o + 2].try_into().unwrap());
         let u32_at = |o: usize| u32::from_le_bytes(row_bytes[o..o + 4].try_into().unwrap());
-        let count =
-            |id: u32| {
-            header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c)
+        let count = |id: u32| {
+            header
+                .counts
+                .iter()
+                .find(|&&(t, _)| t == id)
+                .map_or(0, |&(_, c)| c)
         };
         let idx_at = |o: usize, wide: bool| {
-            if wide { u32_at(o) } else { u32::from(u16_at(o))
+            if wide {
+                u32_at(o)
+            } else {
+                u32::from(u16_at(o))
             }
         };
-        let str_w = if header.heap_sizes & 0x1 != 0 { 4usize } else { 2 };
+        let str_w = if header.heap_sizes & 0x1 != 0 {
+            4usize
+        } else {
+            2
+        };
 
         // Map TypeDef rids to names (`class_def_ids` is a hash-order snapshot, so whether IBase
         // or IDerived gets the lower rid is arbitrary — resolve by name, don't assume).
@@ -4145,14 +4637,25 @@ mod tests {
         let ii_start = reader.table_offset(Token::TABLE_INTERFACE_IMPL, &header);
         let td_wide = td_count > 0xFFFF;
         let class = idx_at(ii_start, td_wide);
-        assert_eq!(class, derived_rid, "InterfaceImpl.Class must be IDerived's TypeDef rid");
+        assert_eq!(
+            class, derived_rid,
+            "InterfaceImpl.Class must be IDerived's TypeDef rid"
+        );
         let tdor_max = count(Token::TABLE_TYPE_DEF)
             .max(count(Token::TABLE_TYPE_REF))
             .max(count(Token::TABLE_TYPE_SPEC));
         let tdor_wide = tdor_max >= (1usize << 14);
         let iface = idx_at(ii_start + if td_wide { 4 } else { 2 }, tdor_wide);
-        assert_eq!(iface & 0x3, 0, "Interface must carry the TypeDef tag (same assembly)");
-        assert_eq!(iface >> 2, base_rid, "Interface must decode to IBase's TypeDef rid");
+        assert_eq!(
+            iface & 0x3,
+            0,
+            "Interface must carry the TypeDef tag (same assembly)"
+        );
+        assert_eq!(
+            iface >> 2,
+            base_rid,
+            "Interface must decode to IBase's TypeDef rid"
+        );
 
         // Both TypeDefs are genuine interfaces; IDerived's Extends stays NIL despite the base.
         for rid in [base_rid, derived_rid] {
@@ -4160,7 +4663,12 @@ mod tests {
             let flags = u32_at(row);
             assert_ne!(flags & 0x20, 0, "{}: Interface flag missing", td_name(rid));
             let extends = idx_at(row + 4 + 2 * str_w, tdor_wide);
-            assert_eq!(extends, 0, "{}: interface Extends must be NIL", td_name(rid));
+            assert_eq!(
+                extends,
+                0,
+                "{}: interface Extends must be NIL",
+                td_name(rid)
+            );
         }
     }
 
@@ -4177,7 +4685,16 @@ mod tests {
         let cls_name = asm.alloc_string("Foo");
         let cls_idx = asm
             .class_def(ClassDef::new(
-                cls_name, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+                cls_name,
+                false,
+                0,
+                None,
+                vec![],
+                vec![],
+                Access::Public,
+                None,
+                None,
+                true,
             ))
             .unwrap();
         let missing_name = asm.alloc_string("Clone");
@@ -4188,6 +4705,7 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_iface_missing".to_string(),
+            public_module_full_name: None,
             module_name: "pe_iface_missing.dll".to_string(),
             pdb_file_name: String::new(),
         };
@@ -4206,13 +4724,31 @@ mod tests {
         let base_name = asm.alloc_string("NotAnIface");
         let base_idx = asm
             .class_def(ClassDef::new(
-                base_name, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+                base_name,
+                false,
+                0,
+                None,
+                vec![],
+                vec![],
+                Access::Public,
+                None,
+                None,
+                true,
             ))
             .unwrap();
         let cls_name = asm.alloc_string("Foo");
         let cls_idx = asm
             .class_def(ClassDef::new(
-                cls_name, false, 0, None, vec![], vec![], Access::Public, None, None, true,
+                cls_name,
+                false,
+                0,
+                None,
+                vec![],
+                vec![],
+                Access::Public,
+                None,
+                None,
+                true,
             ))
             .unwrap();
         asm.class_mut(cls_idx).add_interface(*base_idx);
@@ -4221,6 +4757,7 @@ mod tests {
             runtime: DotnetRuntime::Net8,
             is_dll: true,
             assembly_name: "pe_iface_notiface".to_string(),
+            public_module_full_name: None,
             module_name: "pe_iface_notiface.dll".to_string(),
             pdb_file_name: String::new(),
         };
@@ -4297,12 +4834,17 @@ mod tests {
             let blob_w = w(hs & 0x4 != 0);
             let guid_w = w(hs & 0x2 != 0);
             let count = |id: u32| {
-                header.counts.iter().find(|&&(t, _)| t == id).map_or(0, |&(_, c)| c)
+                header
+                    .counts
+                    .iter()
+                    .find(|&&(t, _)| t == id)
+                    .map_or(0, |&(_, c)| c)
             };
             let simple_w = |rows: usize| w(rows > 0xFFFF);
             // Mirrors this module's own `coded_wide` exactly (§II.24.2.6: `>=`, not `>` — see its
             // doc comment for why the threshold row count itself already needs a wide column).
-            let coded_w = |tag_bits: u32, max_rows: usize| w(max_rows >= (1usize << (16 - tag_bits)));
+            let coded_w =
+                |tag_bits: u32, max_rows: usize| w(max_rows >= (1usize << (16 - tag_bits)));
 
             match table_id {
                 Token::TABLE_MODULE => 2 + str_w + 3 * guid_w,
@@ -4361,7 +4903,8 @@ mod tests {
                         .max(count(Token::TABLE_STAND_ALONE_SIG))
                         .max(count(Token::TABLE_MODULE_REF))
                         .max(count(Token::TABLE_METHOD_SPEC));
-                    let cat_max = count(Token::TABLE_METHOD_DEF).max(count(Token::TABLE_MEMBER_REF));
+                    let cat_max =
+                        count(Token::TABLE_METHOD_DEF).max(count(Token::TABLE_MEMBER_REF));
                     coded_w(5, hca_max) + coded_w(3, cat_max) + blob_w
                 }
                 Token::TABLE_CLASS_LAYOUT => 2 + 4 + simple_w(count(Token::TABLE_TYPE_DEF)),
@@ -4390,7 +4933,8 @@ mod tests {
                         )
                 }
                 Token::TABLE_METHOD_IMPL => {
-                    let mdor_max = count(Token::TABLE_METHOD_DEF).max(count(Token::TABLE_MEMBER_REF));
+                    let mdor_max =
+                        count(Token::TABLE_METHOD_DEF).max(count(Token::TABLE_MEMBER_REF));
                     simple_w(count(Token::TABLE_TYPE_DEF)) + 2 * coded_w(1, mdor_max)
                 }
                 Token::TABLE_MODULE_REF => str_w,
@@ -4407,7 +4951,8 @@ mod tests {
                 Token::TABLE_ASSEMBLY => 4 + 4 * 2 + 4 + blob_w + 2 * str_w,
                 Token::TABLE_ASSEMBLY_REF => 2 * 4 + 4 + blob_w + 2 * str_w + blob_w,
                 Token::TABLE_METHOD_SPEC => {
-                    let mdor_max = count(Token::TABLE_METHOD_DEF).max(count(Token::TABLE_MEMBER_REF));
+                    let mdor_max =
+                        count(Token::TABLE_METHOD_DEF).max(count(Token::TABLE_MEMBER_REF));
                     coded_w(1, mdor_max) + blob_w
                 }
                 Token::TABLE_GENERIC_PARAM => {
@@ -4563,8 +5108,10 @@ mod tests {
         // TypeRef rows come right after Module (1 row * 10 bytes).
         let type_ref_start = 10;
         // TypeRef: ResolutionScope(2, coded) + Name(2) + Namespace(2) = 6 bytes.
-        let type_ref_name_off =
-            u16::from_le_bytes(row_bytes[type_ref_start + 2..type_ref_start + 4].try_into().unwrap(),
+        let type_ref_name_off = u16::from_le_bytes(
+            row_bytes[type_ref_start + 2..type_ref_start + 4]
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(reader.strings_at(u32::from(type_ref_name_off)), "Console");
 
@@ -4573,13 +5120,20 @@ mod tests {
         let type_def_start = type_ref_start + 6;
         // TypeDef: Flags(4) + Name(2) + Namespace(2) + Extends(2, coded) + FieldList(2) +
         // MethodList(2) = 14 bytes.
-        let module_pseudo_type_name_off =
-            u16::from_le_bytes(row_bytes[type_def_start + 4..type_def_start + 6].try_into().unwrap(),
+        let module_pseudo_type_name_off = u16::from_le_bytes(
+            row_bytes[type_def_start + 4..type_def_start + 6]
+                .try_into()
+                .unwrap(),
         );
-        assert_eq!(reader.strings_at(u32::from(module_pseudo_type_name_off)), "<Module>");
+        assert_eq!(
+            reader.strings_at(u32::from(module_pseudo_type_name_off)),
+            "<Module>"
+        );
         let my_type_start = type_def_start + 14;
-        let type_def_name_off =
-            u16::from_le_bytes(row_bytes[my_type_start + 4..my_type_start + 6].try_into().unwrap(),
+        let type_def_name_off = u16::from_le_bytes(
+            row_bytes[my_type_start + 4..my_type_start + 6]
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(reader.strings_at(u32::from(type_def_name_off)), "MyType");
         let method_list = u16::from_le_bytes(
@@ -4587,7 +5141,10 @@ mod tests {
                 .try_into()
                 .unwrap(),
         );
-        assert_eq!(method_list, 1, "MyType owns MethodDef row 1 (1-based FieldList/MethodList)");
+        assert_eq!(
+            method_list, 1,
+            "MyType owns MethodDef row 1 (1-based FieldList/MethodList)"
+        );
 
         // MethodDef rows: RVA(4) + ImplFlags(2) + Flags(2) + Name(2) + Signature(2) +
         // ParamList(2) = 14 bytes.
@@ -4650,8 +5207,10 @@ mod tests {
         let assembly_start = 10 + 14;
         // Assembly: HashAlgId(4) + MajorVersion(2) + MinorVersion(2) + BuildNumber(2) +
         // RevisionNumber(2) + Flags(4) + PublicKey(2, blob) + Name(2) = offset 18 for Name.
-        let assembly_name_off =
-            u16::from_le_bytes(row_bytes[assembly_start + 18..assembly_start + 20].try_into().unwrap(),
+        let assembly_name_off = u16::from_le_bytes(
+            row_bytes[assembly_start + 18..assembly_start + 20]
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(
             reader.strings_at(u32::from(assembly_name_off)),
@@ -4706,7 +5265,11 @@ mod tests {
         let reader = MetadataReader::parse(&bytes);
         let header = reader.tables_header();
         let counts: HashMap<u32, usize> = header.counts.iter().copied().collect();
-        assert_eq!(counts[&Token::TABLE_PARAM], 2, "one Param row per arg_names entry, named or not");
+        assert_eq!(
+            counts[&Token::TABLE_PARAM],
+            2,
+            "one Param row per arg_names entry, named or not"
+        );
 
         let row_bytes = &reader.stream("#~")[header.row_data_offset..];
         let param_start = reader.table_offset(Token::TABLE_PARAM, &header);
@@ -4716,13 +5279,19 @@ mod tests {
 
         let seq0 = u16::from_le_bytes(row0[2..4].try_into().unwrap());
         let name0 = u16::from_le_bytes(row0[4..6].try_into().unwrap());
-        assert_eq!(seq0, 1, "first real arg is Sequence 1 (this is a static method, no implicit this)");
+        assert_eq!(
+            seq0, 1,
+            "first real arg is Sequence 1 (this is a static method, no implicit this)"
+        );
         assert_eq!(reader.strings_at(u32::from(name0)), "x");
 
         let seq1 = u16::from_le_bytes(row1[2..4].try_into().unwrap());
         let name1 = u16::from_le_bytes(row1[4..6].try_into().unwrap());
         assert_eq!(seq1, 2, "second arg is Sequence 2");
-        assert_eq!(name1, 0, "unnamed param has a null #Strings offset, not a dangling/garbage one");
+        assert_eq!(
+            name1, 0,
+            "unnamed param has a null #Strings offset, not a dangling/garbage one"
+        );
     }
 
     // ---------------------------------------------------------------------------------------
@@ -4837,8 +5406,16 @@ mod tests {
         let w = Widths::compute(&sizes, &strings, &blobs, &guids, &us);
         assert!(w.str_wide);
         assert_eq!(w.heap_sizes & 0x1, 0x1);
-        assert_eq!(w.heap_sizes & 0x2, 0, "GUID heap untouched, must stay narrow");
-        assert_eq!(w.heap_sizes & 0x4, 0, "Blob heap untouched, must stay narrow");
+        assert_eq!(
+            w.heap_sizes & 0x2,
+            0,
+            "GUID heap untouched, must stay narrow"
+        );
+        assert_eq!(
+            w.heap_sizes & 0x4,
+            0,
+            "Blob heap untouched, must stay narrow"
+        );
     }
 
     // ---------------------------------------------------------------------------------------
@@ -4890,7 +5467,11 @@ mod tests {
             classes.windows(2).all(|w| w[0] <= w[1]),
             "InterfaceImpl rows must be sorted ascending by Class: {classes:?}"
         );
-        assert_eq!(classes, vec![1, 2, 2], "the three rows added (class=2 via add_type_def's own implements + class=2, class=1 standalone)");
+        assert_eq!(
+            classes,
+            vec![1, 2, 2],
+            "the three rows added (class=2 via add_type_def's own implements + class=2, class=1 standalone)"
+        );
     }
 
     #[test]
@@ -4922,7 +5503,8 @@ mod tests {
         // FieldLayout row: Offset(4) + Field(simple index) — the Field column follows Offset.
         let offset_col_width = 4;
         let field_0 = u16::from_le_bytes(
-            row_bytes[field_layout_start + offset_col_width..field_layout_start + offset_col_width + 2]
+            row_bytes
+                [field_layout_start + offset_col_width..field_layout_start + offset_col_width + 2]
                 .try_into()
                 .unwrap(),
         );
@@ -4932,7 +5514,10 @@ mod tests {
                 .try_into()
                 .unwrap(),
         );
-        assert!(field_0 <= field_1, "FieldLayout must be sorted ascending by Field");
+        assert!(
+            field_0 <= field_1,
+            "FieldLayout must be sorted ascending by Field"
+        );
         assert_eq!((field_0, field_1), (1, 2));
     }
 
@@ -4962,8 +5547,14 @@ mod tests {
         assert_ne!(bcl, name_only);
         assert_eq!(bcl.table(), Token::TABLE_ASSEMBLY_REF);
         assert_eq!(mb.assembly_ref.len(), 2);
-        assert_ne!(mb.assembly_ref[0].public_key_or_token, 0, "BCL ref carries the ECMA token blob");
-        assert_eq!(mb.assembly_ref[1].public_key_or_token, 0, "name-only ref carries no token");
+        assert_ne!(
+            mb.assembly_ref[0].public_key_or_token, 0,
+            "BCL ref carries the ECMA token blob"
+        );
+        assert_eq!(
+            mb.assembly_ref[1].public_key_or_token, 0,
+            "name-only ref carries no token"
+        );
     }
 
     /// Both BCL-reference paths must consume the builder's explicit runtime rather than a process
@@ -4986,7 +5577,10 @@ mod tests {
         mb2.set_is_lib(true);
         let intrinsics_tok = mb2.find_or_create_assembly_ref("System.Runtime.Intrinsics");
         let row2 = &mb2.assembly_ref[(intrinsics_tok.rid() - 1) as usize];
-        assert_eq!((row2.major, row2.minor, row2.build, row2.revision), expected);
+        assert_eq!(
+            (row2.major, row2.minor, row2.build, row2.revision),
+            expected
+        );
 
         // `system_runtime_assembly_ref` (used by the ThreadStaticAttribute bootstrap path) is a
         // separate call site from `find_or_create_assembly_ref` — exercise it directly via a TLS
@@ -4997,9 +5591,16 @@ mod tests {
         mb3.set_is_lib(true);
         let field = mb3.add_static_field("TLS", 0, None, true, false);
         let _ = field;
-        assert_eq!(mb3.assembly_ref.len(), 1, "the TLS path must have created exactly one AssemblyRef");
+        assert_eq!(
+            mb3.assembly_ref.len(),
+            1,
+            "the TLS path must have created exactly one AssemblyRef"
+        );
         let row3 = &mb3.assembly_ref[0];
-        assert_eq!((row3.major, row3.minor, row3.build, row3.revision), expected);
+        assert_eq!(
+            (row3.major, row3.minor, row3.build, row3.revision),
+            expected
+        );
     }
 
     /// The `is_lib` gate itself (not just that the version, when stamped, comes from
@@ -5017,8 +5618,14 @@ mod tests {
         // `is_lib` NOT set — defaults to `false`, matching `export_pe`'s call before Pass 0.
         let sys_runtime_tok = mb.find_or_create_assembly_ref("System.Runtime");
         let row = &mb.assembly_ref[(sys_runtime_tok.rid() - 1) as usize];
-        assert_eq!((row.major, row.minor, row.build, row.revision), (0, 0, 0, 0));
-        assert_eq!(row.public_key_or_token, 0, "an unversioned exe ref carries no public-key token either");
+        assert_eq!(
+            (row.major, row.minor, row.build, row.revision),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(
+            row.public_key_or_token, 0,
+            "an unversioned exe ref carries no public-key token either"
+        );
 
         let mut mb2 = MetadataBuilder::new();
         let field = mb2.add_static_field("TLS", 0, None, true, false);
@@ -5041,7 +5648,10 @@ mod tests {
         let value_off = mb.custom_attribute[0].value;
         let bytes = mb.blobs.as_bytes();
         // length-prefix(1) + the 4 fixed bytes.
-        assert_eq!(&bytes[value_off as usize..value_off as usize + 5], &[4, 0x01, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            &bytes[value_off as usize..value_off as usize + 5],
+            &[4, 0x01, 0x00, 0x00, 0x00]
+        );
     }
 
     /// The general `add_custom_attribute` emitter, attached to a `TypeDef` — the exact shape
@@ -5077,7 +5687,10 @@ mod tests {
         // exactly the bug: it used to decode as `Param` instead.
         let row = &mb.custom_attribute[0];
         let parent_tag = row.parent & 0x1F; // 5 tag bits (§II.24.2.6 HasCustomAttribute)
-        assert_eq!(parent_tag, 3, "TypeDef must be HasCustomAttribute tag 3 per §II.24.2.6");
+        assert_eq!(
+            parent_tag, 3,
+            "TypeDef must be HasCustomAttribute tag 3 per §II.24.2.6"
+        );
         assert_eq!(row.parent >> 5, class_tok.rid());
 
         // One MemberRef `.ctor` row, with a HASTHIS/1-param/VOID-return/STRING-param signature.
@@ -5115,14 +5728,26 @@ mod tests {
         let plain_flags = mb.field[(plain.rid() - 1) as usize].flags;
         let konst_flags = mb.field[(konst.rid() - 1) as usize].flags;
 
-        assert_eq!(plain_flags & 0x20, 0, "non-const static must NOT have InitOnly set");
-        assert_eq!(konst_flags & 0x20, 0x20, "const static must have InitOnly set");
+        assert_eq!(
+            plain_flags & 0x20,
+            0,
+            "non-const static must NOT have InitOnly set"
+        );
+        assert_eq!(
+            konst_flags & 0x20,
+            0x20,
+            "const static must have InitOnly set"
+        );
         // Both still carry the ordinary Public|Static bits — `is_const` only adds InitOnly, it
         // doesn't replace the base flag set. `FieldAttributes::Public` is 0x6 (FieldAccessMask,
         // §II.23.1.5), not 0x1 (that's `Private` — see `add_field`'s doc for the bug this fixes).
         assert_eq!(plain_flags & (0x6 | 0x10), 0x6 | 0x10);
         assert_eq!(konst_flags & (0x6 | 0x10), 0x6 | 0x10);
-        assert_eq!(mb.custom_attribute.len(), 0, "is_const must not add any CustomAttribute row");
+        assert_eq!(
+            mb.custom_attribute.len(),
+            0,
+            "is_const must not add any CustomAttribute row"
+        );
     }
 
     #[test]
@@ -5185,7 +5810,9 @@ mod tests {
         let owner_name = asm.alloc_string("Foo");
         let owner = asm.alloc_class_ref(ClassRef::new(owner_name, None, false, [].into()));
         let method_name = asm.alloc_string("Bar");
-        let fn_sig = asm.sig([Type::ClassRef(owner), Type::Int(crate::ir::Int::I32)], Type::Bool,
+        let fn_sig = asm.sig(
+            [Type::ClassRef(owner), Type::Int(crate::ir::Int::I32)],
+            Type::Bool,
         );
         let mref = asm.alloc_methodref(crate::ir::MethodRef::new(
             owner,
@@ -5204,11 +5831,17 @@ mod tests {
         // has a length prefix from blob interning ahead of it in `#Blob` — read via the marker
         // bytes directly instead of assuming a fixed offset.
         assert_eq!(blob[1], sig::SIG_HASTHIS, "calling convention byte");
-        assert_eq!(blob[2], 1, "param count must be 1 (the receiver is NOT counted)");
+        assert_eq!(
+            blob[2], 1,
+            "param count must be 1 (the receiver is NOT counted)"
+        );
         const ET_BOOLEAN: u8 = 0x02;
         const ET_I4: u8 = 0x08;
         assert_eq!(blob[3], ET_BOOLEAN, "return type");
-        assert_eq!(blob[4], ET_I4, "the ONE real parameter, not the receiver's own ClassRef type");
+        assert_eq!(
+            blob[4], ET_I4,
+            "the ONE real parameter, not the receiver's own ClassRef type"
+        );
     }
 
     #[test]
@@ -5235,11 +5868,24 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "Extern", false, None, None, None, &[]);
-        let _m = mb.add_method("libc_call", sig_blob, &[], &[], true, false, false, Some(("libc", true)), false,
+        let _m = mb.add_method(
+            "libc_call",
+            sig_blob,
+            &[],
+            &[],
+            true,
+            false,
+            false,
+            Some(("libc", true)),
+            false,
         );
         assert_eq!(mb.impl_map.len(), 1);
         assert_eq!(mb.module_ref.len(), 1);
-        assert_eq!(mb.impl_map[0].mapping_flags & 0x40, 0x40, "SupportsLastError set");
+        assert_eq!(
+            mb.impl_map[0].mapping_flags & 0x40,
+            0x40,
+            "SupportsLastError set"
+        );
     }
 
     #[test]
@@ -5290,10 +5936,19 @@ mod tests {
         let a_row = &mb.type_def[(a.rid() - 1) as usize];
         let b_row = &mb.type_def[(b.rid() - 1) as usize];
         assert_eq!(a_row.field_list, 1, "A's fields start at row 1 (a0)");
-        assert_eq!(b_row.field_list, 3, "B's fields start at row 3 (b0), AFTER A's 2 fields");
+        assert_eq!(
+            b_row.field_list, 3,
+            "B's fields start at row 3 (b0), AFTER A's 2 fields"
+        );
         assert_eq!(mb.field.len(), 3, "3 field rows total: a0, a1, b0");
-        assert_eq!(&mb.strings.as_bytes()[mb.field[0].name as usize..][..2], b"a0");
-        assert_eq!(&mb.strings.as_bytes()[mb.field[2].name as usize..][..2], b"b0");
+        assert_eq!(
+            &mb.strings.as_bytes()[mb.field[0].name as usize..][..2],
+            b"a0"
+        );
+        assert_eq!(
+            &mb.strings.as_bytes()[mb.field[2].name as usize..][..2],
+            b"b0"
+        );
 
         // Same shape for methods: `B` gets 2 methods, `A` gets 0 — checks a ZERO-method class
         // still gets a correct (empty) run for its neighbor's sake.
@@ -5306,14 +5961,35 @@ mod tests {
         };
         mb.set_type_def_method_list(a);
         mb.set_type_def_method_list(b);
-        mb.add_method("b_m0", method_sig, &[], &[], true, false, false, None, false,
+        mb.add_method(
+            "b_m0",
+            method_sig,
+            &[],
+            &[],
+            true,
+            false,
+            false,
+            None,
+            false,
         );
-        mb.add_method("b_m1", method_sig, &[], &[], true, false, false, None, false,
+        mb.add_method(
+            "b_m1",
+            method_sig,
+            &[],
+            &[],
+            true,
+            false,
+            false,
+            None,
+            false,
         );
 
         let a_row = &mb.type_def[(a.rid() - 1) as usize];
         let b_row = &mb.type_def[(b.rid() - 1) as usize];
-        assert_eq!(a_row.method_list, 1, "A owns zero methods: its run starts where B's begins");
+        assert_eq!(
+            a_row.method_list, 1,
+            "A owns zero methods: its run starts where B's begins"
+        );
         assert_eq!(b_row.method_list, 1, "B's methods start at row 1 (b_m0)");
         assert_eq!(mb.method_def.len(), 2);
     }
@@ -5337,7 +6013,11 @@ mod tests {
         assert_eq!(tok.table(), Token::TABLE_TYPE_DEF);
 
         let row = &mb.type_def[(tok.rid() - 1) as usize];
-        assert_eq!(row.flags & 0x1, 0, "must be NotPublic (0x0), not Public (0x1)");
+        assert_eq!(
+            row.flags & 0x1,
+            0,
+            "must be NotPublic (0x0), not Public (0x1)"
+        );
         assert_eq!(row.flags & 0x100, 0x100, "Sealed bit must be set");
         assert_eq!(row.flags & 0x10, 0x10, "ExplicitLayout bit must be set");
         assert_eq!(
@@ -5348,7 +6028,10 @@ mod tests {
 
         assert_eq!(mb.class_layout.len(), 1);
         assert_eq!(mb.class_layout[0].parent, tok.rid());
-        assert_eq!(mb.class_layout[0].packing_size, 1, ".pack 1, matching il_exporter's literal text");
+        assert_eq!(
+            mb.class_layout[0].packing_size, 1,
+            ".pack 1, matching il_exporter's literal text"
+        );
         assert_eq!(
             mb.class_layout[0].class_size, 37,
             "class size must be the blob's EXACT byte length, per the FieldRVA-sizing lesson \
@@ -5412,8 +6095,16 @@ mod tests {
         assert_eq!(tok.rid(), 2);
 
         let coded = TypeDefOrRefResolver::type_def_or_ref(&mut mb, cref, &mut asm);
-        assert_eq!(decode_type_def_or_ref(coded), tok, "must resolve to the TypeDef, not create a TypeRef");
-        assert_eq!(mb.type_ref.len(), 0, "no TypeRef should be created for an in-assembly type");
+        assert_eq!(
+            decode_type_def_or_ref(coded),
+            tok,
+            "must resolve to the TypeDef, not create a TypeRef"
+        );
+        assert_eq!(
+            mb.type_ref.len(),
+            0,
+            "no TypeRef should be created for an in-assembly type"
+        );
     }
 
     /// Regression test for a real bug caught wiring the `cd_interop` C#-consumer A/B battery
@@ -5458,8 +6149,14 @@ mod tests {
 
         // The row itself must carry the SPLIT columns, not the whole dotted string in `Name`.
         let row = &mb.type_def[(tok.rid() - 1) as usize];
-        assert!(mb.strings_eq(row.namespace, "cd_interop"), "TypeDef.Namespace must be \"cd_interop\"");
-        assert!(mb.strings_eq(row.name, "Point"), "TypeDef.Name must be \"Point\", not the full dotted string");
+        assert!(
+            mb.strings_eq(row.namespace, "cd_interop"),
+            "TypeDef.Namespace must be \"cd_interop\""
+        );
+        assert!(
+            mb.strings_eq(row.name, "Point"),
+            "TypeDef.Name must be \"Point\", not the full dotted string"
+        );
 
         // A self-referencing `ClassRef` (e.g. a method returning `Point`) must still resolve to
         // this SAME TypeDef token via `find_type_def`'s lookup, proving population and lookup
@@ -5470,7 +6167,41 @@ mod tests {
             tok,
             "a self-reference to a namespaced TypeDef must resolve via find_type_def's matching split, not fail to find it"
         );
-        assert_eq!(mb.type_ref.len(), 0, "no TypeRef should be created for an in-assembly type");
+        assert_eq!(
+            mb.type_ref.len(),
+            0,
+            "no TypeRef should be created for an in-assembly type"
+        );
+    }
+
+    #[test]
+    fn projected_main_module_keeps_sentinel_self_references_on_the_public_type_def() {
+        let mut mb = MetadataBuilder::new();
+        mb.set_public_module_full_name(Some("Monark.PositionParser.NativeExports"));
+        let mut asm = Assembly::default();
+        let main = asm.main_module();
+        let main_ref = asm[main].ref_to();
+        let main_ref = asm.alloc_class_ref(main_ref);
+
+        let tok = mb.add_type_def(
+            "Monark.PositionParser",
+            "NativeExports",
+            false,
+            None,
+            None,
+            None,
+            &[],
+        );
+        let coded = TypeDefOrRefResolver::type_def_or_ref(&mut mb, main_ref, &mut asm);
+
+        assert_eq!(decode_type_def_or_ref(coded), tok);
+        assert!(
+            mb.type_ref.is_empty(),
+            "the sentinel self reference must not become a TypeRef"
+        );
+        let row = &mb.type_def[(tok.rid() - 1) as usize];
+        assert!(mb.strings_eq(row.namespace, "Monark.PositionParser"));
+        assert!(mb.strings_eq(row.name, "NativeExports"));
     }
 
     #[test]
@@ -5483,7 +6214,11 @@ mod tests {
         let tok = decode_type_def_or_ref(coded);
         assert_eq!(tok.table(), Token::TABLE_TYPE_REF);
         assert_eq!(mb.type_ref.len(), 1);
-        assert_eq!(mb.assembly_ref.len(), 1, "System.Console's assembly must be registered");
+        assert_eq!(
+            mb.assembly_ref.len(),
+            1,
+            "System.Console's assembly must be registered"
+        );
     }
 
     #[test]
@@ -5495,7 +6230,11 @@ mod tests {
         let a = TypeDefOrRefResolver::type_def_or_ref(&mut mb, cref, &mut asm);
         let b = TypeDefOrRefResolver::type_def_or_ref(&mut mb, cref, &mut asm);
         assert_eq!(a, b);
-        assert_eq!(mb.type_ref.len(), 1, "second lookup must reuse the cached row");
+        assert_eq!(
+            mb.type_ref.len(),
+            1,
+            "second lookup must reuse the cached row"
+        );
     }
 
     #[test]
@@ -5543,7 +6282,11 @@ mod tests {
         let plain = ClassRef::console(&mut asm);
         let plain_tok = TokenSink::type_token(&mut mb, &mut asm, Type::ClassRef(plain));
         assert_eq!(plain_tok.table(), Token::TABLE_TYPE_REF);
-        assert_eq!(mb.type_spec.len(), 1, "a non-generic ClassRef must not add a TypeSpec row");
+        assert_eq!(
+            mb.type_spec.len(),
+            1,
+            "a non-generic ClassRef must not add a TypeSpec row"
+        );
     }
 
     #[test]
@@ -5602,7 +6345,9 @@ mod tests {
         let iqueryable_of_mvar0 =
             asm.alloc_class_ref(ClassRef::new(iqueryable_name, None, false, [mvar0].into()));
         let method_name = asm.alloc_string("Count");
-        let fn_sig = asm.sig([Type::ClassRef(iqueryable_of_mvar0)], Type::Int(crate::ir::Int::I32),
+        let fn_sig = asm.sig(
+            [Type::ClassRef(iqueryable_of_mvar0)],
+            Type::Int(crate::ir::Int::I32),
         );
         let mref = asm.alloc_methodref(crate::ir::MethodRef::new(
             owner,
@@ -5614,16 +6359,28 @@ mod tests {
 
         // The call site's instantiation: `Count<int32>`.
         let generic_args = [Type::Int(crate::ir::Int::I32)];
-        let tok = TokenSink::method_token(&mut mb, &mut asm, MethodDefIdx::from_raw(mref), &generic_args,
+        let tok = TokenSink::method_token(
+            &mut mb,
+            &mut asm,
+            MethodDefIdx::from_raw(mref),
+            &generic_args,
         );
-        assert_eq!(tok.table(), Token::TABLE_METHOD_SPEC, "call site wraps the base in a MethodSpec");
+        assert_eq!(
+            tok.table(),
+            Token::TABLE_METHOD_SPEC,
+            "call site wraps the base in a MethodSpec"
+        );
 
         // Unwrap the MethodSpec to inspect the base MemberRef's OWN signature (not the
         // instantiation blob, which was already correct before this fix). `MethodSpecRow.method`
         // is a MethodDefOrRef-coded u32 (`(rid << 1) | tag`, tag=1 for MemberRef, mirroring
         // `encode_method_def_or_ref`) — not a plain `Token`.
         let spec_row = &mb.method_spec[(tok.rid() - 1) as usize];
-        assert_eq!(spec_row.method & 1, 1, "base must be a MemberRef, not a MethodDef");
+        assert_eq!(
+            spec_row.method & 1,
+            1,
+            "base must be a MemberRef, not a MethodDef"
+        );
         let base_rid = spec_row.method >> 1;
         let sig_off = mb.member_ref[(base_rid - 1) as usize].signature;
         let blob = &mb.blobs.as_bytes()[sig_off as usize..];
@@ -5634,8 +6391,14 @@ mod tests {
             "the base MemberRef for a generic-method call site must carry SIG_GENERIC, or CoreCLR \
              resolves it as a non-generic overload and MissingMethodExceptions"
         );
-        assert_eq!(blob[2], 1, "generic parameter COUNT (the method has one type parameter)");
-        assert_eq!(blob[3], 1, "value parameter count (the receiver is not counted)");
+        assert_eq!(
+            blob[2], 1,
+            "generic parameter COUNT (the method has one type parameter)"
+        );
+        assert_eq!(
+            blob[3], 1,
+            "value parameter count (the receiver is not counted)"
+        );
     }
 
     #[test]
@@ -5672,7 +6435,10 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             TokenSink::type_token(&mut mb, &mut asm, Type::Float(Float::F128))
         }));
-        assert!(result.is_err(), "f128 signature encoding is a known todo!() in sig.rs");
+        assert!(
+            result.is_err(),
+            "f128 signature encoding is a known todo!() in sig.rs"
+        );
     }
 
     #[test]
@@ -5737,7 +6503,16 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "MainModule", false, None, None, None, &[]);
-        let tok = mb.add_method(".tcctor", sig_blob, &[], &[], true, false, false, None, false,
+        let tok = mb.add_method(
+            ".tcctor",
+            sig_blob,
+            &[],
+            &[],
+            true,
+            false,
+            false,
+            None,
+            false,
         );
         let row = &mb.method_def[(tok.rid() - 1) as usize];
         assert_eq!(row.flags & (0x1000 | 0x0800), 0);
@@ -5823,7 +6598,16 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "MainModule", false, None, None, None, &[]);
-        let tok = mb.add_method("NotInlined", sig_blob, &[], &[], true, false, false, None, false,
+        let tok = mb.add_method(
+            "NotInlined",
+            sig_blob,
+            &[],
+            &[],
+            true,
+            false,
+            false,
+            None,
+            false,
         );
         let row = &mb.method_def[(tok.rid() - 1) as usize];
         assert_eq!(

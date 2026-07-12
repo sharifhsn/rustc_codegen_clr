@@ -1,18 +1,18 @@
 use std::{
     collections::VecDeque,
-    io::{stdin, Read},
+    io::{Read, stdin},
     num::NonZeroU32,
     panic::catch_unwind,
     time::Instant,
 };
 
 use cilly::{
-    asm::{encoded_stats, Assembly},
+    Access, BasicBlock, CILIter, CILNode, CILRoot, MethodDef, MethodImpl, MethodRef,
+    asm::{Assembly, encoded_stats},
     bimap::{Interned, IntoBiMapIndex},
     c_exporter::CExporter,
     cillyir_exporter::CillyIRExpoter,
     il_exporter::ILExporter,
-    Access, BasicBlock, CILIter, CILNode, CILRoot, MethodDef, MethodImpl, MethodRef,
 };
 use fxhash::FxHashSet;
 
@@ -205,8 +205,11 @@ fn main() {
                 };
                 let def = asm.method_def(id);
                 let name = &asm[def.name()];
-                let (block_count, local_count, root_count, node_count) = match def.resolved_implementation(&asm) {
-                    MethodImpl::MethodBody { blocks, locals } => (blocks.len(), locals.len(),
+                let (block_count, local_count, root_count, node_count) =
+                    match def.resolved_implementation(&asm) {
+                        MethodImpl::MethodBody { blocks, locals } => (
+                            blocks.len(),
+                            locals.len(),
                             blocks.iter().flat_map(|block| block.iter_roots()).count(),
                             blocks
                                 .iter()
@@ -234,22 +237,22 @@ fn main() {
                                 .flat_map(|root| CILIter::new(asm.get_root(root).clone(), &asm))
                                 .count(),
                         ),
-                    MethodImpl::Extern {
-                        lib,
-                        preserve_errno,
-                    } => {
-                        let lib = &asm[*lib];
-                        eprintln!(
-                            "Extern method {name} is in {lib} preserve_errno:{preserve_errno}"
-                        );
-                        return;
-                    }
-                    MethodImpl::AliasFor(_) => panic!("Unresolved method alias"),
-                    MethodImpl::Missing => {
-                        eprintln!("Missing method {name}");
-                        return;
-                    }
-                };
+                        MethodImpl::Extern {
+                            lib,
+                            preserve_errno,
+                        } => {
+                            let lib = &asm[*lib];
+                            eprintln!(
+                                "Extern method {name} is in {lib} preserve_errno:{preserve_errno}"
+                            );
+                            return;
+                        }
+                        MethodImpl::AliasFor(_) => panic!("Unresolved method alias"),
+                        MethodImpl::Missing => {
+                            eprintln!("Missing method {name}");
+                            return;
+                        }
+                    };
                 eprintln!(
                     "Method {name} has {locals} locals and {blocks} blocks.\n It has {roots} roots and {nodes} elements(roots + nodes).",
                     locals = local_count,
@@ -351,13 +354,10 @@ fn is_valid_c(asm: &Assembly, id: u32) -> bool {
     #[cfg(not(miri))]
     {
         catch_unwind(|| {
-            asm.clone()
-                .verify_for_export()
-                .unwrap()
-                .export(
-                    format!("/tmp/test{id}.out"),
-                    CExporter::new(false, vec![], vec![]),
-                )
+            asm.clone().verify_for_export().unwrap().export(
+                format!("/tmp/test{id}.out"),
+                CExporter::new(false, vec![], vec![]),
+            )
         })
         .is_ok()
     }

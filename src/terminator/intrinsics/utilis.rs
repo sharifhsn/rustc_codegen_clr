@@ -1,6 +1,7 @@
 use cilly::{
+    Interned, MethodRef, Type,
     cilnode::{IsPure, MethodKind},
-    Interned, MethodRef, Type, {Assembly, ClassRef, Int},
+    {Assembly, ClassRef, Int},
 };
 
 type Node = Interned<cilly::ir::CILNode>;
@@ -8,10 +9,14 @@ type Node = Interned<cilly::ir::CILNode>;
 pub fn atomic_add(addr: Node, addend: Node, tpe: Type, asm: &mut Assembly) -> Node {
     match tpe {
         Type::Int(int) => {
-            let u64_ref = asm.nref(Type::Int(int));
+            let int_ref = asm.nref(Type::Int(int));
+            // MIR atomic intrinsics expose their destination as `*mut T`, while the shared
+            // Interlocked-style builtin signature uses a managed byref (`T&`). The bits are the
+            // same address, but the verifier-visible boundary must be adapted explicitly.
+            let addr = asm.cast_ptr_to(addr, int_ref);
             asm.call_static(
                 &format!("atomic_add_{int}", int = int.name()),
-                [u64_ref, Type::Int(int)],
+                [int_ref, Type::Int(int)],
                 Type::Int(int),
                 &[addr, addend],
             )

@@ -41,8 +41,9 @@ fn main() -> std::process::ExitCode {
         static RELEASE_SEQ: AtomicU32 = AtomicU32::new(0);
         static WAIT_SEQ: AtomicU32 = AtomicU32::new(0);
 
+        let waiter_sem = sem.clone();
         let waiter = thread::spawn(move || {
-            sem.wait(); // must block here until the main thread releases
+            waiter_sem.wait(); // must block here until the main thread releases
             WAIT_SEQ.store(SEQ.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
         });
 
@@ -87,12 +88,14 @@ fn main() -> std::process::ExitCode {
         chk!(signal.is_set(), false);
         static WOKEN: AtomicI32 = AtomicI32::new(0);
 
+        let signal1 = signal.clone();
         let t1 = thread::spawn(move || {
-            signal.wait();
+            signal1.wait();
             WOKEN.fetch_add(1, Ordering::SeqCst);
         });
+        let signal2 = signal.clone();
         let t2 = thread::spawn(move || {
-            signal.wait();
+            signal2.wait();
             WOKEN.fetch_add(1, Ordering::SeqCst);
         });
 
@@ -116,7 +119,7 @@ fn main() -> std::process::ExitCode {
         chk!(latch.is_set(), false);
 
         let waiter = {
-            let latch = latch;
+            let latch = latch.clone();
             thread::spawn(move || {
                 latch.wait();
             })
@@ -154,6 +157,7 @@ fn main() -> std::process::ExitCode {
 
         let handles: Vec<_> = (0..4)
             .map(|i| {
+                let barrier = barrier.clone();
                 thread::spawn(move || {
                     // Stagger arrivals so the barrier is genuinely tested, not just a no-op.
                     thread::sleep(Duration::from_millis(10 * i as u64));
@@ -183,8 +187,8 @@ fn main() -> std::process::ExitCode {
         let lock = SharedLock::new();
         const ITERS: i64 = 200_000;
 
-        let l1 = lock;
-        let l2 = lock;
+        let l1 = lock.clone();
+        let l2 = lock.clone();
         let t1 = thread::spawn(move || {
             for _ in 0..ITERS {
                 let _g = l1.lock();

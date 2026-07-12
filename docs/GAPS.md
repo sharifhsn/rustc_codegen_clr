@@ -172,7 +172,7 @@ throughput vs C# is not where this backend competes today.
 - **WF-G part 1 (managed-array return)** — DONE. Two new IR ops `CILNode::NewArr` + `CILRoot::StElem`
   (real `newarr`/`stelem`) threaded through every exhaustive match (interner/visitor/typecheck/opt/
   il-exporter + asm `shallow_methodef_gc`); reuses the existing marker→`PlatformArray` return path. A
-  Rust `#[no_mangle]` fn now returns a first-class managed `System.Int32[]` to C# (not a ptr/len pair).
+  Rust `#[unsafe(no_mangle)]` fn now returns a first-class managed `System.Int32[]` to C# (not a ptr/len pair).
   Verified: `cd_interop_tier2`'s `make_ints()` → `int[]{10,20,30}` consumed in C# (8/8 checks); gate
   426/12. C-mode/JVM array return left as documented `todo!` (only .NET needed); arrays-of-structs/
   strings + the **generic-interop bridge remain XL / scope-only**.

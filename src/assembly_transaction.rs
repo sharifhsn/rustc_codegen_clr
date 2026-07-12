@@ -19,7 +19,7 @@ pub(crate) fn assembly_transaction<T, E>(
 mod tests {
     use super::assembly_transaction;
     use cilly::Assembly;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     fn encoded(assembly: &Assembly) -> Vec<u8> {
         postcard::to_stdvec(assembly).expect("test assembly should serialize")

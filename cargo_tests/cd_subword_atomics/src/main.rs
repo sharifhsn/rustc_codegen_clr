@@ -45,4 +45,5 @@ fn main() {
     assert_eq!(caught.unwrap(), 315);
 
     println!("cd_subword_atomics: all checks passed");
+    println!("== cd_subword_atomics done ==");
 }

@@ -1,0 +1,10 @@
+constructor ApiCompatFixture.InvoiceDto(System.Decimal,System.Nullable`1<System.DateOnly>,System.String)
+enum ApiCompatFixture.InvoiceState
+enum-member ApiCompatFixture.InvoiceState.Draft=1
+enum-member ApiCompatFixture.InvoiceState.Posted=2
+method ApiCompatFixture.InvoiceDto.Format(System.String attrs=[System.Runtime.CompilerServices.NullableAttribute(0100020000)]):System.String attrs=[System.Runtime.CompilerServices.NullableContextAttribute(0100010000)]
+property ApiCompatFixture.InvoiceDto.Amount:System.Decimal {get;}
+property ApiCompatFixture.InvoiceDto.Date:System.Nullable`1<System.DateOnly> {get;}
+property ApiCompatFixture.InvoiceDto.Memo:System.String {get;}
+property ApiCompatFixture.InvoiceDto.State:ApiCompatFixture.InvoiceState {get;set;}
+type ApiCompatFixture.InvoiceDto attrs=[System.Runtime.CompilerServices.NullableAttribute(0100000000),System.Runtime.CompilerServices.NullableContextAttribute(0100020000)]

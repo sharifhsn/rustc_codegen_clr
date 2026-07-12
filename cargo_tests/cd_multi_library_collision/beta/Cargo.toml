@@ -1,0 +1,21 @@
+[package]
+name = "collision_beta"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.dotnet]
+identity-schema = 1
+package-id = "Collision.Beta"
+assembly-name = "collision_beta"
+root-namespace = "Collision.Beta"
+module-type = "Exports"
+legacy-main-module = false
+
+[dependencies]
+dotnet_macros = { path = "../../../dotnet_macros" }
+mycorrhiza = { path = "../../../mycorrhiza" }
+
+[workspace]

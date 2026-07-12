@@ -32,7 +32,7 @@ pub trait IBox<T> {
 /// `IBox`1<int32>` to a `TypeSpec` over the local open TypeDef (the `find_open_generic_def`
 /// path). The handle is opaque to this body on purpose: the check is metadata
 /// resolution + C#-side assignability, not Rust-side dispatch (a stretch goal, per the plan).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn take_box(b: IBoxHandle<i32>) -> i32 {
     let _ = b;
     7

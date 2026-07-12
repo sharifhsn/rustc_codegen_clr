@@ -43,7 +43,7 @@ pub trait IPicker<T> {
 
 /// A trivial exported probe — keeps the class library shape (an exported `MainModule` surface)
 /// identical to the sibling `cd_iface_*` crates.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn genmethod_probe() -> i32 {
     11
 }

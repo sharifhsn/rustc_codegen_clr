@@ -26,30 +26,30 @@
 //! don't accidentally alias. `.handle()` exposes the raw [`crate::intrinsics::RustcCLRInteropManagedGeneric`]
 //! for advanced interop. There is no `Drop` — the .NET GC owns the object.
 
-/// `System.Collections.Generic.List<T>` — a growable, index-addressable managed list.
-pub use self::list::{List, ListIter};
+/// `System.Collections.Concurrent.ConcurrentBag<T>` — a thread-safe managed unordered bag.
+pub use self::concurrent_bag::ConcurrentBag;
+/// `System.Collections.Concurrent.ConcurrentDictionary<K, V>` — a thread-safe managed hash map.
+pub use self::concurrent_dictionary::ConcurrentDictionary;
+/// `System.Collections.Concurrent.ConcurrentQueue<T>` — a thread-safe managed FIFO queue.
+pub use self::concurrent_queue::ConcurrentQueue;
 /// `System.Collections.Generic.Dictionary<K, V>` — a managed hash map.
 pub use self::dictionary::Dictionary;
 /// `System.Collections.Generic.HashSet<T>` — a managed hash set.
 pub use self::hash_set::HashSet;
-/// `System.Collections.Generic.Stack<T>` — a managed LIFO stack.
-pub use self::stack::Stack;
+/// `System.Collections.Generic.LinkedList<T>` — a managed doubly-linked list.
+pub use self::linked_list::LinkedList;
+/// `System.Collections.Generic.List<T>` — a growable, index-addressable managed list.
+pub use self::list::{List, ListIter};
+/// `System.Collections.Generic.PriorityQueue<TElement, TPriority>` — a managed min-priority queue.
+pub use self::priority_queue::PriorityQueue;
 /// `System.Collections.Generic.Queue<T>` — a managed FIFO queue.
 pub use self::queue::Queue;
 /// `System.Collections.Generic.SortedDictionary<K, V>` — a managed key-ordered map (red-black tree).
 pub use self::sorted_dictionary::SortedDictionary;
 /// `System.Collections.Generic.SortedSet<T>` — a managed ordered set (red-black tree).
 pub use self::sorted_set::SortedSet;
-/// `System.Collections.Generic.LinkedList<T>` — a managed doubly-linked list.
-pub use self::linked_list::LinkedList;
-/// `System.Collections.Generic.PriorityQueue<TElement, TPriority>` — a managed min-priority queue.
-pub use self::priority_queue::PriorityQueue;
-/// `System.Collections.Concurrent.ConcurrentDictionary<K, V>` — a thread-safe managed hash map.
-pub use self::concurrent_dictionary::ConcurrentDictionary;
-/// `System.Collections.Concurrent.ConcurrentQueue<T>` — a thread-safe managed FIFO queue.
-pub use self::concurrent_queue::ConcurrentQueue;
-/// `System.Collections.Concurrent.ConcurrentBag<T>` — a thread-safe managed unordered bag.
-pub use self::concurrent_bag::ConcurrentBag;
+/// `System.Collections.Generic.Stack<T>` — a managed LIFO stack.
+pub use self::stack::Stack;
 
 // The core BCL collections all live in the implementation assembly `System.Private.CoreLib` — a
 // reference assembly forwards the type and throws `TypeLoadException` at JIT, so method-body refs must
@@ -59,9 +59,9 @@ const CORELIB: &str = "System.Private.CoreLib";
 mod list {
     use super::CORELIB;
     use crate::intrinsics::{
-        rustc_clr_interop_generic_call2, RustcCLRInteropManagedGeneric, RustcCLRInteropTypeGeneric,
+        RustcCLRInteropManagedGeneric, RustcCLRInteropTypeGeneric, rustc_clr_interop_generic_call2,
     };
-    use crate::{dotnet_generic, dotnet_generic_impl, gen};
+    use crate::{dotnet_generic, dotnet_generic_impl, r#gen};
 
     const LIST: &str = "System.Collections.Generic.List";
     const ACTION: &str = "System.Action";
@@ -73,20 +73,44 @@ mod list {
     // `List<T>.ForEach(Action<!0>)` / `Sort(Comparison<!0>)` — the delegate parameter's def-shape type
     // is parameterised by the *class* generic (`Action<!0>`), so it binds against the concrete
     // `Action<T>` argument via the nested-generic rule. Hand-written (the `dotnet_generic_impl!` line
-    // grammar doesn't express a nested-generic delegate arg); the `gen!(0)` inside the delegate's own
+    // grammar doesn't express a nested-generic delegate arg); the `r#gen!(0)` inside the delegate's own
     // generics is the `!0` def-shape spelling.
     fn raw_for_each<T>(h: Handle<T>, action: ActionH<T>) {
         rustc_clr_interop_generic_call2::<
-            CORELIB, LIST, false, "ForEach", 2, (T,),
-            ((), RustcCLRInteropManagedGeneric<CORELIB, ACTION, (RustcCLRInteropTypeGeneric<0>,)>),
-            (), Handle<T>, ActionH<T>,
+            CORELIB,
+            LIST,
+            false,
+            "ForEach",
+            2,
+            (T,),
+            (
+                (),
+                RustcCLRInteropManagedGeneric<CORELIB, ACTION, (RustcCLRInteropTypeGeneric<0>,)>,
+            ),
+            (),
+            Handle<T>,
+            ActionH<T>,
         >(h, action)
     }
     fn raw_sort_by<T>(h: Handle<T>, cmp: ComparisonH<T>) {
         rustc_clr_interop_generic_call2::<
-            CORELIB, LIST, false, "Sort", 2, (T,),
-            ((), RustcCLRInteropManagedGeneric<CORELIB, COMPARISON, (RustcCLRInteropTypeGeneric<0>,)>),
-            (), Handle<T>, ComparisonH<T>,
+            CORELIB,
+            LIST,
+            false,
+            "Sort",
+            2,
+            (T,),
+            (
+                (),
+                RustcCLRInteropManagedGeneric<
+                    CORELIB,
+                    COMPARISON,
+                    (RustcCLRInteropTypeGeneric<0>,),
+                >,
+            ),
+            (),
+            Handle<T>,
+            ComparisonH<T>,
         >(h, cmp)
     }
 
@@ -96,14 +120,14 @@ mod list {
     dotnet_generic_impl! {
         Handle<T> = [CORELIB] "System.Collections.Generic.List" < (T,) > ;
         ctor fn raw_ctor();
-        fn raw_add       = "Add"(r, item: T as gen!(0));
-        fn raw_get       = "get_Item"(r, idx: i32 as i32) -> T as gen!(0);
-        fn raw_set       = "set_Item"(r, idx: i32 as i32, item: T as gen!(0));
+        fn raw_add       = "Add"(r, item: T as r#gen!(0));
+        fn raw_get       = "get_Item"(r, idx: i32 as i32) -> T as r#gen!(0);
+        fn raw_set       = "set_Item"(r, idx: i32 as i32, item: T as r#gen!(0));
         fn raw_count     = "get_Count"(r) -> i32 as i32;
-        fn raw_contains  = "Contains"(r, item: T as gen!(0)) -> bool as bool;
-        fn raw_index_of  = "IndexOf"(r, item: T as gen!(0)) -> i32 as i32;
+        fn raw_contains  = "Contains"(r, item: T as r#gen!(0)) -> bool as bool;
+        fn raw_index_of  = "IndexOf"(r, item: T as r#gen!(0)) -> i32 as i32;
         fn raw_remove_at = "RemoveAt"(r, idx: i32 as i32);
-        fn raw_insert    = "Insert"(r, idx: i32 as i32, item: T as gen!(0));
+        fn raw_insert    = "Insert"(r, idx: i32 as i32, item: T as r#gen!(0));
         fn raw_clear     = "Clear"(r);
         fn raw_sort      = "Sort"(r);
         fn raw_reverse   = "Reverse"(r);
@@ -187,7 +211,10 @@ mod list {
         /// Sort in place by a comparator (`List<T>.Sort(Comparison<T>)`); `cmp(a, b)` returns negative
         /// / zero / positive like `Ord::cmp`. The .NET sort drives the Rust `extern "C" fn`.
         pub fn sort_by(&mut self, cmp: extern "C" fn(T, T) -> i32) {
-            raw_sort_by::<T>(self.h, crate::delegate::Comparison::<T>::from_fn(cmp).handle())
+            raw_sort_by::<T>(
+                self.h,
+                crate::delegate::Comparison::<T>::from_fn(cmp).handle(),
+            )
         }
         /// The first element, or `None` if empty (like `slice::first`, by value).
         pub fn first(&self) -> Option<T> {
@@ -379,18 +406,21 @@ mod list {
 
 mod dictionary {
     use super::CORELIB;
-    use crate::{dotnet_generic, dotnet_generic_impl, gen};
+    use crate::{dotnet_generic, dotnet_generic_impl, r#gen};
 
     dotnet_generic!(Handle<K, V> = [CORELIB] "System.Collections.Generic.Dictionary" < (K, V) >);
     // SAFETY-BEARING: `Handle<..>` really is a .NET class implementing `IEnumerable<..>` (the BCL type this alias names), so `as_enum_handle` on it is sound.
-    unsafe impl<K, V> crate::enumerate::ImplementsIEnumerable<crate::enumerate::KeyValuePair<K, V>> for Handle<K, V> {}
+    unsafe impl<K, V> crate::enumerate::ImplementsIEnumerable<crate::enumerate::KeyValuePair<K, V>>
+        for Handle<K, V>
+    {
+    }
     dotnet_generic_impl! {
         Handle<K, V> = [CORELIB] "System.Collections.Generic.Dictionary" < (K, V) > ;
         ctor fn raw_ctor();
-        fn raw_set       = "set_Item"(r, key: K as gen!(0), value: V as gen!(1));
-        fn raw_get       = "get_Item"(r, key: K as gen!(0)) -> V as gen!(1);
-        fn raw_contains  = "ContainsKey"(r, key: K as gen!(0)) -> bool as bool;
-        fn raw_remove    = "Remove"(r, key: K as gen!(0)) -> bool as bool;
+        fn raw_set       = "set_Item"(r, key: K as r#gen!(0), value: V as r#gen!(1));
+        fn raw_get       = "get_Item"(r, key: K as r#gen!(0)) -> V as r#gen!(1);
+        fn raw_contains  = "ContainsKey"(r, key: K as r#gen!(0)) -> bool as bool;
+        fn raw_remove    = "Remove"(r, key: K as r#gen!(0)) -> bool as bool;
         fn raw_count     = "get_Count"(r) -> i32 as i32;
         fn raw_clear     = "Clear"(r);
     }
@@ -403,7 +433,9 @@ mod dictionary {
     impl<K, V> Dictionary<K, V> {
         /// `new Dictionary<K, V>()`.
         pub fn new() -> Self {
-            Self { h: raw_ctor::<K, V>() }
+            Self {
+                h: raw_ctor::<K, V>(),
+            }
         }
         /// Number of entries (`Count`).
         pub fn len(&self) -> i32 {
@@ -502,7 +534,7 @@ mod dictionary {
 
 mod hash_set {
     use super::CORELIB;
-    use crate::{dotnet_generic, dotnet_generic_impl, gen};
+    use crate::{dotnet_generic, dotnet_generic_impl, r#gen};
 
     dotnet_generic!(Handle<T> = [CORELIB] "System.Collections.Generic.HashSet" < (T,) >);
     // SAFETY-BEARING: `Handle<..>` really is a .NET class implementing `IEnumerable<..>` (the BCL type this alias names), so `as_enum_handle` on it is sound.
@@ -510,9 +542,9 @@ mod hash_set {
     dotnet_generic_impl! {
         Handle<T> = [CORELIB] "System.Collections.Generic.HashSet" < (T,) > ;
         ctor fn raw_ctor();
-        fn raw_add      = "Add"(r, item: T as gen!(0)) -> bool as bool;
-        fn raw_contains = "Contains"(r, item: T as gen!(0)) -> bool as bool;
-        fn raw_remove   = "Remove"(r, item: T as gen!(0)) -> bool as bool;
+        fn raw_add      = "Add"(r, item: T as r#gen!(0)) -> bool as bool;
+        fn raw_contains = "Contains"(r, item: T as r#gen!(0)) -> bool as bool;
+        fn raw_remove   = "Remove"(r, item: T as r#gen!(0)) -> bool as bool;
         fn raw_count    = "get_Count"(r) -> i32 as i32;
         fn raw_clear    = "Clear"(r);
     }
@@ -598,7 +630,7 @@ mod hash_set {
 }
 
 mod stack {
-    use crate::{dotnet_generic, dotnet_generic_impl, gen};
+    use crate::{dotnet_generic, dotnet_generic_impl, r#gen};
 
     // `Stack<T>`/`Queue<T>` are implemented in `System.Collections.dll` (moved out of
     // `System.Private.CoreLib` in .NET Core), so their method-body refs must name that impl assembly —
@@ -611,9 +643,9 @@ mod stack {
     dotnet_generic_impl! {
         Handle<T> = [ASM] "System.Collections.Generic.Stack" < (T,) > ;
         ctor fn raw_ctor();
-        fn raw_push  = "Push"(r, item: T as gen!(0));
-        fn raw_pop   = "Pop"(r) -> T as gen!(0);
-        fn raw_peek  = "Peek"(r) -> T as gen!(0);
+        fn raw_push  = "Push"(r, item: T as r#gen!(0));
+        fn raw_pop   = "Pop"(r) -> T as r#gen!(0);
+        fn raw_peek  = "Peek"(r) -> T as r#gen!(0);
         fn raw_count = "get_Count"(r) -> i32 as i32;
         fn raw_clear = "Clear"(r);
     }
@@ -689,7 +721,7 @@ mod stack {
 }
 
 mod queue {
-    use crate::{dotnet_generic, dotnet_generic_impl, gen};
+    use crate::{dotnet_generic, dotnet_generic_impl, r#gen};
 
     // See `stack`: `Queue<T>`'s impl assembly is `System.Collections.dll`, not CoreLib.
     const ASM: &str = "System.Collections";
@@ -700,9 +732,9 @@ mod queue {
     dotnet_generic_impl! {
         Handle<T> = [ASM] "System.Collections.Generic.Queue" < (T,) > ;
         ctor fn raw_ctor();
-        fn raw_enqueue = "Enqueue"(r, item: T as gen!(0));
-        fn raw_dequeue = "Dequeue"(r) -> T as gen!(0);
-        fn raw_peek    = "Peek"(r) -> T as gen!(0);
+        fn raw_enqueue = "Enqueue"(r, item: T as r#gen!(0));
+        fn raw_dequeue = "Dequeue"(r) -> T as r#gen!(0);
+        fn raw_peek    = "Peek"(r) -> T as r#gen!(0);
         fn raw_count   = "get_Count"(r) -> i32 as i32;
         fn raw_clear   = "Clear"(r);
     }
@@ -778,7 +810,7 @@ mod queue {
 }
 
 mod sorted_dictionary {
-    use crate::{dotnet_generic, dotnet_generic_impl, gen};
+    use crate::{dotnet_generic, dotnet_generic_impl, r#gen};
 
     // `SortedDictionary`/`SortedSet`/`LinkedList`/`PriorityQueue` are implemented in
     // `System.Collections.dll` (not CoreLib, unlike `List`/`Dictionary`/`HashSet`), so their
@@ -789,10 +821,10 @@ mod sorted_dictionary {
     dotnet_generic_impl! {
         Handle<K, V> = [ASM] "System.Collections.Generic.SortedDictionary" < (K, V) > ;
         ctor fn raw_ctor();
-        fn raw_set      = "set_Item"(r, key: K as gen!(0), value: V as gen!(1));
-        fn raw_get      = "get_Item"(r, key: K as gen!(0)) -> V as gen!(1);
-        fn raw_contains = "ContainsKey"(r, key: K as gen!(0)) -> bool as bool;
-        fn raw_remove   = "Remove"(r, key: K as gen!(0)) -> bool as bool;
+        fn raw_set      = "set_Item"(r, key: K as r#gen!(0), value: V as r#gen!(1));
+        fn raw_get      = "get_Item"(r, key: K as r#gen!(0)) -> V as r#gen!(1);
+        fn raw_contains = "ContainsKey"(r, key: K as r#gen!(0)) -> bool as bool;
+        fn raw_remove   = "Remove"(r, key: K as r#gen!(0)) -> bool as bool;
         fn raw_count    = "get_Count"(r) -> i32 as i32;
         fn raw_clear    = "Clear"(r);
     }
@@ -808,7 +840,9 @@ mod sorted_dictionary {
     impl<K, V> SortedDictionary<K, V> {
         /// `new SortedDictionary<K, V>()`.
         pub fn new() -> Self {
-            Self { h: raw_ctor::<K, V>() }
+            Self {
+                h: raw_ctor::<K, V>(),
+            }
         }
         /// Number of entries (`Count`).
         pub fn len(&self) -> i32 {
@@ -867,7 +901,7 @@ mod sorted_dictionary {
 }
 
 mod sorted_set {
-    use crate::{dotnet_generic, dotnet_generic_impl, gen};
+    use crate::{dotnet_generic, dotnet_generic_impl, r#gen};
 
     // See `sorted_dictionary`: impl assembly is `System.Collections`, not CoreLib.
     const ASM: &str = "System.Collections";
@@ -878,9 +912,9 @@ mod sorted_set {
     dotnet_generic_impl! {
         Handle<T> = [ASM] "System.Collections.Generic.SortedSet" < (T,) > ;
         ctor fn raw_ctor();
-        fn raw_add      = "Add"(r, item: T as gen!(0)) -> bool as bool;
-        fn raw_contains = "Contains"(r, item: T as gen!(0)) -> bool as bool;
-        fn raw_remove   = "Remove"(r, item: T as gen!(0)) -> bool as bool;
+        fn raw_add      = "Add"(r, item: T as r#gen!(0)) -> bool as bool;
+        fn raw_contains = "Contains"(r, item: T as r#gen!(0)) -> bool as bool;
+        fn raw_remove   = "Remove"(r, item: T as r#gen!(0)) -> bool as bool;
         fn raw_count    = "get_Count"(r) -> i32 as i32;
         fn raw_clear    = "Clear"(r);
     }
@@ -971,9 +1005,9 @@ mod sorted_set {
 mod linked_list {
     use super::CORELIB;
     use crate::intrinsics::{
-        rustc_clr_interop_generic_call2, RustcCLRInteropManagedGeneric, RustcCLRInteropTypeGeneric,
+        RustcCLRInteropManagedGeneric, RustcCLRInteropTypeGeneric, rustc_clr_interop_generic_call2,
     };
-    use crate::{dotnet_generic, dotnet_generic_impl, gen};
+    use crate::{dotnet_generic, dotnet_generic_impl, r#gen};
 
     // `LinkedList<T>` is implemented in `System.Collections.dll` (see `sorted_dictionary`). The
     // `ICollection<T>` interface it is upcast to, however, is a core interface in CoreLib.
@@ -988,9 +1022,19 @@ mod linked_list {
     // (nested-generic binding), so `push_front` can call it (and discard the node).
     fn raw_add_first<T>(h: Handle<T>, item: T) -> NodeH<T> {
         rustc_clr_interop_generic_call2::<
-            ASM, LL, false, "AddFirst", 2u8, (T,),
-            (RustcCLRInteropManagedGeneric<ASM, LLNODE, (RustcCLRInteropTypeGeneric<0>,)>, RustcCLRInteropTypeGeneric<0>),
-            NodeH<T>, Handle<T>, T,
+            ASM,
+            LL,
+            false,
+            "AddFirst",
+            2u8,
+            (T,),
+            (
+                RustcCLRInteropManagedGeneric<ASM, LLNODE, (RustcCLRInteropTypeGeneric<0>,)>,
+                RustcCLRInteropTypeGeneric<0>,
+            ),
+            NodeH<T>,
+            Handle<T>,
+            T,
         >(h, item)
     }
 
@@ -1007,14 +1051,14 @@ mod linked_list {
     dotnet_generic_impl! {
         Handle<T> = [ASM] "System.Collections.Generic.LinkedList" < (T,) > ;
         ctor fn raw_ctor();
-        fn raw_contains = "Contains"(r, item: T as gen!(0)) -> bool as bool;
-        fn raw_remove   = "Remove"(r, item: T as gen!(0)) -> bool as bool;
+        fn raw_contains = "Contains"(r, item: T as r#gen!(0)) -> bool as bool;
+        fn raw_remove   = "Remove"(r, item: T as r#gen!(0)) -> bool as bool;
         fn raw_count    = "get_Count"(r) -> i32 as i32;
         fn raw_clear    = "Clear"(r);
     }
     dotnet_generic_impl! {
         ICollection<T> = [CORELIB] "System.Collections.Generic.ICollection" < (T,) > ;
-        fn raw_icoll_add = "Add"(r, item: T as gen!(0));
+        fn raw_icoll_add = "Add"(r, item: T as r#gen!(0));
     }
 
     /// A managed `System.Collections.Generic.LinkedList<T>` — a doubly-linked list. `push_front`
@@ -1039,9 +1083,10 @@ mod linked_list {
         }
         /// Append `item` at the end (`AddLast`, reached through `ICollection<T>.Add`).
         pub fn push_back(&mut self, item: T) {
-            let ic = crate::intrinsics::rustc_clr_interop_managed_checked_cast::<ICollection<T>, Handle<T>>(
-                self.h,
-            );
+            let ic = crate::intrinsics::rustc_clr_interop_managed_checked_cast::<
+                ICollection<T>,
+                Handle<T>,
+            >(self.h);
             raw_icoll_add::<T>(ic, item)
         }
         /// Prepend `item` at the front (`AddFirst`). The `LinkedListNode<T>` it returns is discarded.
@@ -1107,7 +1152,7 @@ mod linked_list {
 }
 
 mod priority_queue {
-    use crate::{dotnet_generic, dotnet_generic_impl, gen};
+    use crate::{dotnet_generic, dotnet_generic_impl, r#gen};
 
     // See `sorted_dictionary`: impl assembly is `System.Collections`, not CoreLib.
     const ASM: &str = "System.Collections";
@@ -1116,9 +1161,9 @@ mod priority_queue {
     dotnet_generic_impl! {
         Handle<E, P> = [ASM] "System.Collections.Generic.PriorityQueue" < (E, P) > ;
         ctor fn raw_ctor();
-        fn raw_enqueue = "Enqueue"(r, element: E as gen!(0), priority: P as gen!(1));
-        fn raw_dequeue = "Dequeue"(r) -> E as gen!(0);
-        fn raw_peek    = "Peek"(r) -> E as gen!(0);
+        fn raw_enqueue = "Enqueue"(r, element: E as r#gen!(0), priority: P as r#gen!(1));
+        fn raw_dequeue = "Dequeue"(r) -> E as r#gen!(0);
+        fn raw_peek    = "Peek"(r) -> E as r#gen!(0);
         fn raw_count   = "get_Count"(r) -> i32 as i32;
         fn raw_clear   = "Clear"(r);
     }
@@ -1134,7 +1179,9 @@ mod priority_queue {
     impl<E, P> PriorityQueue<E, P> {
         /// `new PriorityQueue<TElement, TPriority>()`.
         pub fn new() -> Self {
-            Self { h: raw_ctor::<E, P>() }
+            Self {
+                h: raw_ctor::<E, P>(),
+            }
         }
         /// Number of elements (`Count`).
         pub fn len(&self) -> i32 {
@@ -1183,7 +1230,7 @@ mod priority_queue {
 }
 
 mod concurrent_dictionary {
-    use crate::{dotnet_generic, dotnet_generic_impl, gen};
+    use crate::{dotnet_generic, dotnet_generic_impl, r#gen};
 
     // The concurrent collections live in `System.Collections.Concurrent.dll` — a distinct impl
     // assembly from CoreLib and from `System.Collections` (a wrong name → `TypeLoadException` at JIT).
@@ -1193,10 +1240,10 @@ mod concurrent_dictionary {
     dotnet_generic_impl! {
         Handle<K, V> = [ASM] "System.Collections.Concurrent.ConcurrentDictionary" < (K, V) > ;
         ctor fn raw_ctor();
-        fn raw_set      = "set_Item"(r, key: K as gen!(0), value: V as gen!(1));
-        fn raw_get      = "get_Item"(r, key: K as gen!(0)) -> V as gen!(1);
-        fn raw_try_add  = "TryAdd"(r, key: K as gen!(0), value: V as gen!(1)) -> bool as bool;
-        fn raw_contains = "ContainsKey"(r, key: K as gen!(0)) -> bool as bool;
+        fn raw_set      = "set_Item"(r, key: K as r#gen!(0), value: V as r#gen!(1));
+        fn raw_get      = "get_Item"(r, key: K as r#gen!(0)) -> V as r#gen!(1);
+        fn raw_try_add  = "TryAdd"(r, key: K as r#gen!(0), value: V as r#gen!(1)) -> bool as bool;
+        fn raw_contains = "ContainsKey"(r, key: K as r#gen!(0)) -> bool as bool;
         fn raw_count    = "get_Count"(r) -> i32 as i32;
         fn raw_empty    = "get_IsEmpty"(r) -> bool as bool;
         fn raw_clear    = "Clear"(r);
@@ -1214,7 +1261,9 @@ mod concurrent_dictionary {
     impl<K, V> ConcurrentDictionary<K, V> {
         /// `new ConcurrentDictionary<K, V>()`.
         pub fn new() -> Self {
-            Self { h: raw_ctor::<K, V>() }
+            Self {
+                h: raw_ctor::<K, V>(),
+            }
         }
         /// Number of entries (`Count`).
         pub fn len(&self) -> i32 {
@@ -1274,7 +1323,7 @@ mod concurrent_dictionary {
 }
 
 mod concurrent_queue {
-    use crate::{dotnet_generic, dotnet_generic_impl, gen};
+    use crate::{dotnet_generic, dotnet_generic_impl, r#gen};
 
     // See `concurrent_dictionary`: impl assembly is `System.Collections.Concurrent`.
     const ASM: &str = "System.Collections.Concurrent";
@@ -1285,7 +1334,7 @@ mod concurrent_queue {
     dotnet_generic_impl! {
         Handle<T> = [ASM] "System.Collections.Concurrent.ConcurrentQueue" < (T,) > ;
         ctor fn raw_ctor();
-        fn raw_enqueue = "Enqueue"(r, item: T as gen!(0));
+        fn raw_enqueue = "Enqueue"(r, item: T as r#gen!(0));
         fn raw_count   = "get_Count"(r) -> i32 as i32;
         fn raw_empty   = "get_IsEmpty"(r) -> bool as bool;
     }
@@ -1365,7 +1414,7 @@ mod concurrent_queue {
 }
 
 mod concurrent_bag {
-    use crate::{dotnet_generic, dotnet_generic_impl, gen};
+    use crate::{dotnet_generic, dotnet_generic_impl, r#gen};
 
     // See `concurrent_dictionary`: impl assembly is `System.Collections.Concurrent`.
     const ASM: &str = "System.Collections.Concurrent";
@@ -1376,7 +1425,7 @@ mod concurrent_bag {
     dotnet_generic_impl! {
         Handle<T> = [ASM] "System.Collections.Concurrent.ConcurrentBag" < (T,) > ;
         ctor fn raw_ctor();
-        fn raw_add   = "Add"(r, item: T as gen!(0));
+        fn raw_add   = "Add"(r, item: T as r#gen!(0));
         fn raw_count = "get_Count"(r) -> i32 as i32;
         fn raw_empty = "get_IsEmpty"(r) -> bool as bool;
     }

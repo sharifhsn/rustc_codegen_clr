@@ -15,7 +15,7 @@
 //!   * a **static** method `Counter.make(value, step)` returning a fresh `CounterHandle`;
 //!   * a **virtual instance** method `c.sum()` (its first arg is the `CounterHandle` receiver).
 //!
-//! No `#[no_mangle]` exports: the class, its ctors, accessors, mutators, and methods are all
+//! No `#[unsafe(no_mangle)]` exports: the class, its ctors, accessors, mutators, and methods are all
 //! synthesized/aliased by the backend.
 #![feature(adt_const_params, unsized_const_params)]
 #![allow(internal_features, incomplete_features, dead_code)]

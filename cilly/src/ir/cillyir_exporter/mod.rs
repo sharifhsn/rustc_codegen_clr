@@ -129,5 +129,8 @@ fn class_ref(cref: &ClassRef, asm: &Assembly) -> String {
         .map(|tpe| tpe_to(tpe, asm))
         .intersperse(",".into())
         .collect::<String>();
-    format!("{{let name = asm.alloc_string({name:?}); let ref_asm = {ref_asm};let generics = vec![{generics}].into(); let cref = ClassRef::new(name,ref_asm,{is_valuetype},generics);}}",is_valuetype = cref.is_valuetype())
+    format!(
+        "{{let name = asm.alloc_string({name:?}); let ref_asm = {ref_asm};let generics = vec![{generics}].into(); let cref = ClassRef::new(name,ref_asm,{is_valuetype},generics);}}",
+        is_valuetype = cref.is_valuetype()
+    )
 }

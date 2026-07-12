@@ -1,10 +1,10 @@
 use crate::{
+    Assembly, BasicBlock, BinOp, CILNode, CILRoot, ClassRef, Const, Float, Int, MethodImpl,
+    MethodRef, Type,
     asm::MissingMethodPatcher,
     bimap::Interned,
     cilnode::MethodKind,
     hashable::{HashableF32, HashableF64},
-    Assembly, BasicBlock, BinOp, CILNode, CILRoot, ClassRef, Const, Float, Int, MethodImpl,
-    MethodRef, Type,
 };
 
 pub fn int_max(

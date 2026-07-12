@@ -16,8 +16,8 @@
 //! eagerly raise an exception a conditionally-reached call would not.
 
 use crate::{
-    bimap::Interned, cilnode::CILNode, cilroot::CILRoot, method::LocalDef, Assembly, BasicBlock,
-    CILIter, CILIterElem, IString,
+    Assembly, BasicBlock, CILIter, CILIterElem, IString, bimap::Interned, cilnode::CILNode,
+    cilroot::CILRoot, method::LocalDef,
 };
 use std::collections::{HashMap, HashSet};
 

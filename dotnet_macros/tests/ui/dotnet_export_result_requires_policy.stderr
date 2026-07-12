@@ -1,0 +1,5 @@
+error: #[dotnet_export]: `Result<T, E>` cannot cross the managed seam; opt in to mapping `Err(E)` to a C# exception with `#[dotnet_export(error = "exception")]`
+ --> tests/ui/dotnet_export_result_requires_policy.rs:4:22
+  |
+4 | pub fn fallible() -> Result<i32, &'static str> {
+  |                      ^^^^^^^^^^^^^^^^^^^^^^^^^

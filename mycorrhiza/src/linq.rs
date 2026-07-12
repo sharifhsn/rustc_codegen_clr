@@ -38,34 +38,52 @@
 //! another generic method whose parameter is the doubly-nested `Expression<Func<!!0,bool>>`.
 
 use crate::intrinsics::{
-    rustc_clr_interop_box as box_value, rustc_clr_interop_generic_method_call1 as gmethod1,
-    rustc_clr_interop_generic_method_call2 as gmethod2, rustc_clr_interop_generic_method_call5 as gmethod5,
+    RustcCLRInteropManagedArray, RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric,
+    RustcCLRInteropMethodGeneric, rustc_clr_interop_box as box_value,
+    rustc_clr_interop_generic_method_call1 as gmethod1,
+    rustc_clr_interop_generic_method_call2 as gmethod2,
+    rustc_clr_interop_generic_method_call5 as gmethod5,
     rustc_clr_interop_managed_checked_cast as cast, rustc_clr_interop_managed_new_arr as new_arr,
-    rustc_clr_interop_managed_set_elem as set_elem, RustcCLRInteropManagedArray, RustcCLRInteropManagedClass,
-    RustcCLRInteropManagedGeneric, RustcCLRInteropMethodGeneric,
+    rustc_clr_interop_managed_set_elem as set_elem,
 };
 use crate::system::{DotNetString, MString};
 use std::marker::PhantomData;
 
 // Managed-handle aliases for the types we touch. `Expression` and its subtypes live in the
 // `System.Linq.Expressions` assembly; `Type`/`Delegate` in CoreLib.
-type CExpr = RustcCLRInteropManagedClass<"System.Linq.Expressions", "System.Linq.Expressions.Expression">;
-type CParam =
-    RustcCLRInteropManagedClass<"System.Linq.Expressions", "System.Linq.Expressions.ParameterExpression">;
-type CBinary =
-    RustcCLRInteropManagedClass<"System.Linq.Expressions", "System.Linq.Expressions.BinaryExpression">;
-type CUnary =
-    RustcCLRInteropManagedClass<"System.Linq.Expressions", "System.Linq.Expressions.UnaryExpression">;
-type CLambda =
-    RustcCLRInteropManagedClass<"System.Linq.Expressions", "System.Linq.Expressions.LambdaExpression">;
-type CConst =
-    RustcCLRInteropManagedClass<"System.Linq.Expressions", "System.Linq.Expressions.ConstantExpression">;
-type CMember =
-    RustcCLRInteropManagedClass<"System.Linq.Expressions", "System.Linq.Expressions.MemberExpression">;
-type CMethodCall =
-    RustcCLRInteropManagedClass<"System.Linq.Expressions", "System.Linq.Expressions.MethodCallExpression">;
+type CExpr =
+    RustcCLRInteropManagedClass<"System.Linq.Expressions", "System.Linq.Expressions.Expression">;
+type CParam = RustcCLRInteropManagedClass<
+    "System.Linq.Expressions",
+    "System.Linq.Expressions.ParameterExpression",
+>;
+type CBinary = RustcCLRInteropManagedClass<
+    "System.Linq.Expressions",
+    "System.Linq.Expressions.BinaryExpression",
+>;
+type CUnary = RustcCLRInteropManagedClass<
+    "System.Linq.Expressions",
+    "System.Linq.Expressions.UnaryExpression",
+>;
+type CLambda = RustcCLRInteropManagedClass<
+    "System.Linq.Expressions",
+    "System.Linq.Expressions.LambdaExpression",
+>;
+type CConst = RustcCLRInteropManagedClass<
+    "System.Linq.Expressions",
+    "System.Linq.Expressions.ConstantExpression",
+>;
+type CMember = RustcCLRInteropManagedClass<
+    "System.Linq.Expressions",
+    "System.Linq.Expressions.MemberExpression",
+>;
+type CMethodCall = RustcCLRInteropManagedClass<
+    "System.Linq.Expressions",
+    "System.Linq.Expressions.MethodCallExpression",
+>;
 type CType = RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Type">;
-type CMethodInfo = RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Reflection.MethodInfo">;
+type CMethodInfo =
+    RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Reflection.MethodInfo">;
 type CDelegate = RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Delegate">;
 type CObject = RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Object">;
 type CConvert = RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Convert">;
@@ -80,8 +98,11 @@ type CExprArr = RustcCLRInteropManagedArray<CExpr, 1>;
 // `System.Func`2<int32,bool>` — a generic *delegate* instantiation.
 type CFuncIB = RustcCLRInteropManagedGeneric<"System.Private.CoreLib", "System.Func", (i32, bool)>;
 // `Expression`1<Func`2<int32,bool>>` — the NESTED-generic type EF's `Where` consumes.
-type CExprFuncIB =
-    RustcCLRInteropManagedGeneric<"System.Linq.Expressions", "System.Linq.Expressions.Expression", (CFuncIB,)>;
+type CExprFuncIB = RustcCLRInteropManagedGeneric<
+    "System.Linq.Expressions",
+    "System.Linq.Expressions.Expression",
+    (CFuncIB,),
+>;
 // The *def-shape* return of `Expression.Lambda<!!0>` — `Expression`1<!!0>`, where `!!0` is the method
 // generic. Bound to `Func<int,bool>` at the call site; `check_generic_marker` proves the binding.
 type CExprMethGen0 = RustcCLRInteropManagedGeneric<
@@ -92,9 +113,13 @@ type CExprMethGen0 = RustcCLRInteropManagedGeneric<
 type CParamArr = RustcCLRInteropManagedArray<CParam, 1>;
 
 // ---- The IQueryable pipeline types (concrete `<int>` + the `<!!0>` def-shapes) ----
-type CIEnumInt =
-    RustcCLRInteropManagedGeneric<"System.Private.CoreLib", "System.Collections.Generic.IEnumerable", (i32,)>;
-type CIQueryInt = RustcCLRInteropManagedGeneric<"System.Linq.Expressions", "System.Linq.IQueryable", (i32,)>;
+type CIEnumInt = RustcCLRInteropManagedGeneric<
+    "System.Private.CoreLib",
+    "System.Collections.Generic.IEnumerable",
+    (i32,),
+>;
+type CIQueryInt =
+    RustcCLRInteropManagedGeneric<"System.Linq.Expressions", "System.Linq.IQueryable", (i32,)>;
 type CIEnumMG = RustcCLRInteropManagedGeneric<
     "System.Private.CoreLib",
     "System.Collections.Generic.IEnumerable",
@@ -109,7 +134,13 @@ type CIQueryMG = RustcCLRInteropManagedGeneric<
 type CExprFuncMG = RustcCLRInteropManagedGeneric<
     "System.Linq.Expressions",
     "System.Linq.Expressions.Expression",
-    (RustcCLRInteropManagedGeneric<"System.Private.CoreLib", "System.Func", (RustcCLRInteropMethodGeneric<0>, bool)>,),
+    (
+        RustcCLRInteropManagedGeneric<
+            "System.Private.CoreLib",
+            "System.Func",
+            (RustcCLRInteropMethodGeneric<0>, bool),
+        >,
+    ),
 >;
 type CEnumerable = RustcCLRInteropManagedClass<"System.Linq", "System.Linq.Enumerable">;
 
@@ -448,7 +479,8 @@ impl Expr {
     /// parameter's `.prop("Length")` is an `int`, comparable to an `int` constant).
     #[must_use]
     pub fn prop(self, name: &str) -> Expr {
-        let m = CExpr::static2::<"PropertyOrField", CExpr, MString, CMember>(self.inner, mstr(name));
+        let m =
+            CExpr::static2::<"PropertyOrField", CExpr, MString, CMember>(self.inner, mstr(name));
         Expr {
             inner: cast::<CExpr, CMember>(m),
         }
@@ -506,10 +538,8 @@ impl Expr {
         let targs: CTypeArr = new_arr::<CType>(1);
         set_elem::<CType>(targs, 0, ty);
         // Type.GetMethod(string, Type[]) -> MethodInfo
-        let method: CMethodInfo = ty.instance2::<"GetMethod", MString, CTypeArr, CMethodInfo>(
-            mstr(method_name),
-            targs,
-        );
+        let method: CMethodInfo =
+            ty.instance2::<"GetMethod", MString, CTypeArr, CMethodInfo>(mstr(method_name), targs);
         let args: CExprArr = new_arr::<CExpr>(1);
         set_elem::<CExpr>(args, 0, arg.inner);
         // Expression.Call(Expression instance, MethodInfo method, Expression[] arguments) ->
@@ -559,12 +589,10 @@ impl Expr {
             set_elem::<CParam>(arr, i, p.inner);
             i += 1;
         }
-        let inner = CExpr::static2::<
-            "Lambda",
-            CExpr,
-            RustcCLRInteropManagedArray<CParam, 1>,
-            CLambda,
-        >(self.inner, arr);
+        let inner =
+            CExpr::static2::<"Lambda", CExpr, RustcCLRInteropManagedArray<CParam, 1>, CLambda>(
+                self.inner, arr,
+            );
         Lambda { inner }
     }
 
@@ -998,8 +1026,11 @@ impl Compiled {
 
 /// Definition-shape marker: `System.Linq.IQueryable\`1<!!N>` — an `IQueryable` over method-generic
 /// slot `N`. Generalizes this module's `CIQueryMG` (which is hardcoded to method-generic slot 0).
-pub type QueryableMarker<const N: usize> =
-    RustcCLRInteropManagedGeneric<"System.Linq.Expressions", "System.Linq.IQueryable", (RustcCLRInteropMethodGeneric<N>,)>;
+pub type QueryableMarker<const N: usize> = RustcCLRInteropManagedGeneric<
+    "System.Linq.Expressions",
+    "System.Linq.IQueryable",
+    (RustcCLRInteropMethodGeneric<N>,),
+>;
 
 /// Definition-shape marker: `System.Collections.Generic.IEnumerable\`1<!!N>`.
 pub type EnumerableMarker<const N: usize> = RustcCLRInteropManagedGeneric<
@@ -1013,7 +1044,10 @@ pub type EnumerableMarker<const N: usize> = RustcCLRInteropManagedGeneric<
 pub type GroupingMarker<const K: usize, const V: usize> = RustcCLRInteropManagedGeneric<
     "System.Linq",
     "System.Linq.IGrouping",
-    (RustcCLRInteropMethodGeneric<K>, RustcCLRInteropMethodGeneric<V>),
+    (
+        RustcCLRInteropMethodGeneric<K>,
+        RustcCLRInteropMethodGeneric<V>,
+    ),
 >;
 
 /// Definition-shape marker: `System.Linq.Expressions.Expression\`1<System.Func\`2<!!A,!!B>>` — a
@@ -1022,16 +1056,36 @@ pub type GroupingMarker<const K: usize, const V: usize> = RustcCLRInteropManaged
 pub type SelectorMarker<const A: usize, const B: usize> = RustcCLRInteropManagedGeneric<
     "System.Linq.Expressions",
     "System.Linq.Expressions.Expression",
-    (RustcCLRInteropManagedGeneric<"System.Private.CoreLib", "System.Func", (RustcCLRInteropMethodGeneric<A>, RustcCLRInteropMethodGeneric<B>)>,),
+    (
+        RustcCLRInteropManagedGeneric<
+            "System.Private.CoreLib",
+            "System.Func",
+            (
+                RustcCLRInteropMethodGeneric<A>,
+                RustcCLRInteropMethodGeneric<B>,
+            ),
+        >,
+    ),
 >;
 
 /// Definition-shape marker: `Expression\`1<Func\`3<!!A,!!B,!!C>>` — a two-parameter `resultSelector`
 /// (`Join`'s last argument), from method-generics `A,B` to `C`.
-pub type ResultSelectorMarker<const A: usize, const B: usize, const C: usize> = RustcCLRInteropManagedGeneric<
-    "System.Linq.Expressions",
-    "System.Linq.Expressions.Expression",
-    (RustcCLRInteropManagedGeneric<"System.Private.CoreLib", "System.Func", (RustcCLRInteropMethodGeneric<A>, RustcCLRInteropMethodGeneric<B>, RustcCLRInteropMethodGeneric<C>)>,),
->;
+pub type ResultSelectorMarker<const A: usize, const B: usize, const C: usize> =
+    RustcCLRInteropManagedGeneric<
+        "System.Linq.Expressions",
+        "System.Linq.Expressions.Expression",
+        (
+            RustcCLRInteropManagedGeneric<
+                "System.Private.CoreLib",
+                "System.Func",
+                (
+                    RustcCLRInteropMethodGeneric<A>,
+                    RustcCLRInteropMethodGeneric<B>,
+                    RustcCLRInteropMethodGeneric<C>,
+                ),
+            >,
+        ),
+    >;
 
 /// Generalized version of [`Expr::typed_pred`]: wrap `body` into a strongly-typed
 /// `Expression<TDelegate>` over `params`, via the generic `Expression.Lambda<TDelegate>(body,
@@ -1072,7 +1126,10 @@ pub fn typed_lambda<TDelegate, TExprDelegate>(body: Expr, params: &[&Param]) -> 
 /// types for the source and the produced `IQueryable<IGrouping<TKey,TSource>>`; `KeySelector` is the
 /// concrete `Expression<Func<TSource,TKey>>` handle (built via [`typed_lambda`]).
 #[must_use]
-pub fn group_by<TSource, TKey, QSource, QResult, KeySelector>(source: QSource, key_selector: KeySelector) -> QResult {
+pub fn group_by<TSource, TKey, QSource, QResult, KeySelector>(
+    source: QSource,
+    key_selector: KeySelector,
+) -> QResult {
     gmethod2::<
         "System.Linq.Queryable",
         "System.Linq.Queryable",
@@ -1081,7 +1138,11 @@ pub fn group_by<TSource, TKey, QSource, QResult, KeySelector>(source: QSource, k
         0,
         (),
         (TSource, TKey),
-        (GroupingQueryMarker<1, 0>, QueryableMarker<0>, SelectorMarker<0, 1>),
+        (
+            GroupingQueryMarker<1, 0>,
+            QueryableMarker<0>,
+            SelectorMarker<0, 1>,
+        ),
         QResult,
         QSource,
         KeySelector,
@@ -1092,15 +1153,21 @@ pub fn group_by<TSource, TKey, QSource, QResult, KeySelector>(source: QSource, k
 /// Written as its own alias (rather than inlined at the `group_by` call site) purely for
 /// readability — `GroupingQueryMarker<K, V>` reads as "a queryable of groupings" the way the doc
 /// comment above describes it.
-pub type GroupingQueryMarker<const K: usize, const V: usize> =
-    RustcCLRInteropManagedGeneric<"System.Linq.Expressions", "System.Linq.IQueryable", (GroupingMarker<K, V>,)>;
+pub type GroupingQueryMarker<const K: usize, const V: usize> = RustcCLRInteropManagedGeneric<
+    "System.Linq.Expressions",
+    "System.Linq.IQueryable",
+    (GroupingMarker<K, V>,),
+>;
 
 /// `Queryable.SelectMany<TSource,TResult>(source, selector) -> IQueryable<TResult>`, flattening a
 /// one-to-many navigation (`selector: Expression<Func<TSource,IEnumerable<TResult>>>`). `TSource`/
 /// `TResult` are the caller's concrete method-generic handle types; `QSource`/`QResult` the concrete
 /// `IQueryable<..>` handles; `Selector` the concrete selector expression handle.
 #[must_use]
-pub fn select_many<TSource, TResult, QSource, QResult, Selector>(source: QSource, selector: Selector) -> QResult {
+pub fn select_many<TSource, TResult, QSource, QResult, Selector>(
+    source: QSource,
+    selector: Selector,
+) -> QResult {
     gmethod2::<
         "System.Linq.Queryable",
         "System.Linq.Queryable",
@@ -1115,7 +1182,13 @@ pub fn select_many<TSource, TResult, QSource, QResult, Selector>(source: QSource
             RustcCLRInteropManagedGeneric<
                 "System.Linq.Expressions",
                 "System.Linq.Expressions.Expression",
-                (RustcCLRInteropManagedGeneric<"System.Private.CoreLib", "System.Func", (RustcCLRInteropMethodGeneric<0>, EnumerableMarker<1>)>,),
+                (
+                    RustcCLRInteropManagedGeneric<
+                        "System.Private.CoreLib",
+                        "System.Func",
+                        (RustcCLRInteropMethodGeneric<0>, EnumerableMarker<1>),
+                    >,
+                ),
             >,
         ),
         QResult,
@@ -1133,7 +1206,18 @@ pub fn select_many<TSource, TResult, QSource, QResult, Selector>(source: QSource
 /// [`typed_lambda`]). Uses [`crate::intrinsics::rustc_clr_interop_generic_method_call5`] — the new
 /// arity rung this module's `Join` support needed (see the section doc above).
 #[must_use]
-pub fn join<TOuter, TInner, TKey, TResult, QOuter, IInner, KeyOuter, KeyInner, ResultSel, QResult>(
+pub fn join<
+    TOuter,
+    TInner,
+    TKey,
+    TResult,
+    QOuter,
+    IInner,
+    KeyOuter,
+    KeyInner,
+    ResultSel,
+    QResult,
+>(
     outer: QOuter,
     inner: IInner,
     outer_key_selector: KeyOuter,
@@ -1162,5 +1246,11 @@ pub fn join<TOuter, TInner, TKey, TResult, QOuter, IInner, KeyOuter, KeyInner, R
         KeyOuter,
         KeyInner,
         ResultSel,
-    >(outer, inner, outer_key_selector, inner_key_selector, result_selector)
+    >(
+        outer,
+        inner,
+        outer_key_selector,
+        inner_key_selector,
+        result_selector,
+    )
 }

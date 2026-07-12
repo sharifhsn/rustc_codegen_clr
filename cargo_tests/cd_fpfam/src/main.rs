@@ -55,5 +55,9 @@ fn main() {
     println!("family_b atomics/cell: {b}");
     println!("family_a maybeuninit u64: {a}");
     println!("family_c catch_unwind: {c}");
+    assert_eq!(b, 188);
+    assert_eq!(a, u64::from_le_bytes([1, 4, 7, 10, 13, 16, 19, 22]));
+    assert_eq!(c, 325);
     println!("cd_fpfam: done");
+    println!("== cd_fpfam done ==");
 }

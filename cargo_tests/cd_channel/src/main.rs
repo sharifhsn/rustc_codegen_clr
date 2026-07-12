@@ -40,10 +40,10 @@ fn main() -> std::process::ExitCode {
         chk!(rx.try_recv(), None); // drained again
     }
 
-    // ---------- 2. Sender/Receiver are Copy -- both halves usable from many places ----------
+    // ---------- 2. Sender/Receiver are cheaply Clone -- both halves usable from many places ----------
     {
         let (tx, rx) = channel::<i32>();
-        let tx2 = tx; // Copy, not a move -- both usable afterward
+        let tx2 = tx.clone(); // each clone roots the same managed writer
         tx.try_send(1).unwrap();
         tx2.try_send(2).unwrap();
         chk!(rx.try_recv(), Some(1));
@@ -77,8 +77,8 @@ fn main() -> std::process::ExitCode {
     }
 
     // ---------- 4. Multi-producer: several OS threads sending into ONE unbounded channel ----------
-    // The whole point of this primitive over std::sync::mpsc::Sender: Sender<T> needs no .clone()
-    // dance, and every item from every producer is observed by the single consumer exactly once.
+    // Every rooted clone targets the same managed writer, and every item from every producer is
+    // observed by the single consumer exactly once.
     {
         const PRODUCERS: i64 = 8;
         const PER_PRODUCER: i64 = 500;
@@ -86,6 +86,7 @@ fn main() -> std::process::ExitCode {
 
         let producers: Vec<_> = (0..PRODUCERS)
             .map(|p| {
+                let tx = tx.clone();
                 thread::spawn(move || {
                     for i in 0..PER_PRODUCER {
                         // Encode (producer, index) into one i64 so the consumer can verify FIFO
@@ -136,6 +137,7 @@ fn main() -> std::process::ExitCode {
 
         let consumers: Vec<_> = (0..CONSUMERS)
             .map(|_| {
+                let rx = rx.clone();
                 thread::spawn(move || loop {
                     match rx.recv_blocking() {
                         Some(v) => {

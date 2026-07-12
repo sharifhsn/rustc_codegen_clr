@@ -1,10 +1,10 @@
 pub mod constant;
 pub mod static_data;
-use cilly::Type;
-use cilly::{Interned, ir::CILNode};
 use crate::fn_ctx::MethodCompileCtx;
 use crate::place::{place_address, place_get};
 use crate::r#type::GetTypeExt;
+use cilly::Type;
+use cilly::{Interned, ir::CILNode};
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::{ConstValue, Operand};
 pub fn handle_operand<'tcx>(
@@ -70,7 +70,7 @@ pub fn is_uninit<'tcx>(operand: &Operand<'tcx>, ctx: &mut MethodCompileCtx<'tcx,
                 }
                 ConstValue::Slice { alloc_id, meta: _ } => {
                     // SUS
-                      let data = ctx.tcx().global_alloc(alloc_id).unwrap_memory();
+                    let data = ctx.tcx().global_alloc(alloc_id).unwrap_memory();
                     let mask = data.inner().init_mask();
                     let mut chunks =
                         mask.range_as_init_chunks(rustc_const_eval::interpret::AllocRange {

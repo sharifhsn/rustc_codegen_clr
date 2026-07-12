@@ -1,11 +1,11 @@
+use crate::r#type::GetTypeExt;
+use crate::r#type::utilis::simple_tuple;
 use crate::{assembly::MethodCompileCtx, casts};
 use cilly::{
-    cilnode::{ExtendKind, IsPure},
     BinOp, Interned, Type,
-    {cilnode::MethodKind, Assembly, ClassRef, Int, MethodRef},
+    cilnode::{ExtendKind, IsPure},
+    {Assembly, ClassRef, Int, MethodRef, cilnode::MethodKind},
 };
-use crate::r#type::utilis::simple_tuple;
-use crate::r#type::GetTypeExt;
 use rustc_middle::ty::{IntTy, Ty, TyKind, UintTy};
 
 type Node = Interned<cilly::ir::CILNode>;

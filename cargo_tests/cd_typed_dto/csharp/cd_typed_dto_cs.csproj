@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RustProfile Condition="'$(RustProfile)' == ''">release</RustProfile>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="cd_typed_dto">
+      <HintPath>../rustlib/target/x86_64-unknown-dotnet/$(RustProfile)/cd_typed_dto.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>

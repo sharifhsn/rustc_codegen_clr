@@ -28,16 +28,13 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 
 use crate::cli::PublishArgs;
 use crate::host::{self, HostFacts};
 
 pub fn run(args: &PublishArgs) -> Result<i32> {
-    let proj_dir = args
-        .path
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("."));
+    let proj_dir = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
     let proj_dir = std::fs::canonicalize(&proj_dir)
         .with_context(|| format!("no such directory: {}", proj_dir.display()))?;
 
@@ -52,7 +49,10 @@ pub fn run(args: &PublishArgs) -> Result<i32> {
     let dotnet_heal = host::dotnet_env_adds();
     host::ensure_dotnet(&dotnet_heal)?;
 
-    let rid = args.rid.clone().unwrap_or_else(|| facts.host_rid.to_string());
+    let rid = args
+        .rid
+        .clone()
+        .unwrap_or_else(|| facts.host_rid.to_string());
     let profile = if args.debug { "Debug" } else { "Release" };
 
     eprintln!(
@@ -97,7 +97,9 @@ pub fn run(args: &PublishArgs) -> Result<i32> {
     if let Some(bin) = locate_published_binary(&proj_dir, profile, &rid) {
         eprintln!("== published native binary: {} ==", bin.display());
     } else {
-        eprintln!("== publish succeeded (binary not auto-located; see bin/{profile}/*/{rid}/publish/) ==");
+        eprintln!(
+            "== publish succeeded (binary not auto-located; see bin/{profile}/*/{rid}/publish/) =="
+        );
     }
     Ok(0)
 }
@@ -134,7 +136,11 @@ fn find_csproj(dir: &std::path::Path) -> Result<PathBuf> {
 /// publish output layout: `<proj>/bin/<profile>/<tfm>/<rid>/publish/<AssemblyName>`.
 /// Returns `None` (non-fatal) if the layout doesn't match — `dotnet publish`'s own
 /// stdout already told the user where it wrote the binary in that case.
-fn locate_published_binary(proj_dir: &std::path::Path, profile: &str, rid: &str) -> Option<PathBuf> {
+fn locate_published_binary(
+    proj_dir: &std::path::Path,
+    profile: &str,
+    rid: &str,
+) -> Option<PathBuf> {
     let bin_dir = proj_dir.join("bin").join(profile);
     let tfm_dir = std::fs::read_dir(&bin_dir)
         .ok()?

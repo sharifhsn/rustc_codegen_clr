@@ -22,7 +22,7 @@
 #![allow(internal_features, incomplete_features, dead_code)]
 
 use mycorrhiza::system::console::Console;
-use mycorrhiza::{dotnet_generic, dotnet_generic_impl, gen};
+use mycorrhiza::{dotnet_generic, dotnet_generic_impl, r#gen};
 
 // Core BCL generic collections live in the implementation assembly (method-body refs must name the
 // impl assembly — a ref assembly resolves to a type-forwarder and throws TypeLoadException at JIT).
@@ -39,13 +39,13 @@ dotnet_generic_impl! {
     // newobj List<T>().
     ctor fn list_new();
     // Add(!0): instance void, one `!0` arg. KIND=2 (callvirt for a ref-type receiver).
-    fn list_add = "Add"(list, item: T as gen!(0));
+    fn list_add = "Add"(list, item: T as r#gen!(0));
     // get_Count(): instance, returns a CONCRETE int32 (Count is not generic).
     fn list_count = "get_Count"(list) -> i32 as i32;
     // get_Item(int32) -> !0: the index is a concrete int32 (NOT !0); the return is !0.
-    fn list_get = "get_Item"(list, idx: i32 as i32) -> T as gen!(0);
+    fn list_get = "get_Item"(list, idx: i32 as i32) -> T as r#gen!(0);
     // set_Item(int32, !0): instance void.
-    fn list_set = "set_Item"(list, idx: i32 as i32, item: T as gen!(0));
+    fn list_set = "set_Item"(list, idx: i32 as i32, item: T as r#gen!(0));
 }
 
 // ===================== generic Dictionary<K, V> wrappers =====================
@@ -56,12 +56,12 @@ dotnet_generic_impl! {
 
     ctor fn dict_new();
     // set_Item(!0, !1): insert-or-overwrite. (Add throws on a duplicate key; the indexer does not.)
-    fn dict_set = "set_Item"(dict, key: K as gen!(0), value: V as gen!(1));
+    fn dict_set = "set_Item"(dict, key: K as r#gen!(0), value: V as r#gen!(1));
     // get_Item(!0) -> !1.
-    fn dict_get = "get_Item"(dict, key: K as gen!(0)) -> V as gen!(1);
+    fn dict_get = "get_Item"(dict, key: K as r#gen!(0)) -> V as r#gen!(1);
     fn dict_count = "get_Count"(dict) -> i32 as i32;
     // ContainsKey(!0) -> bool.
-    fn dict_contains = "ContainsKey"(dict, key: K as gen!(0)) -> bool as bool;
+    fn dict_contains = "ContainsKey"(dict, key: K as r#gen!(0)) -> bool as bool;
 }
 
 // A Rust value-type element, so a class generic arg is a multi-field valuetype (not a primitive).
@@ -137,6 +137,7 @@ fn main() -> std::process::ExitCode {
     Console::writeln_u64(pass as u64);
     Console::writeln_u64(total as u64);
     if pass == total {
+        println!("== cd_generic done ==");
         std::process::ExitCode::SUCCESS
     } else {
         std::process::ExitCode::FAILURE

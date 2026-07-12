@@ -1,11 +1,15 @@
 [package]
 name = "cargo-dotnet"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FractalFir/rustc_codegen_clr"
-rust-version = "1.74"
+rust-version = "1.85"
 description = "Compile and run arbitrary Rust crates on .NET (a cargo subcommand for rustc_codegen_clr)."
+
+[package.metadata.cargo-dotnet]
+supported-host-os = ["linux", "macos"]
+windows-host-status = "unsupported-until-acceptance"
 
 # MANDATORY empty [workspace] table: this makes tools/cargo-dotnet its OWN workspace
 # root so cargo stops scanning ancestors and never treats it as a member of the
@@ -26,6 +30,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+fs2 = "0.4"
+sha2 = "0.10"
+semver = "1"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"

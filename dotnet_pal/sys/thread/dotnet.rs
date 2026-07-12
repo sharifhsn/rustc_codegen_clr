@@ -87,8 +87,7 @@ impl Thread {
             // SAFETY: `arg` is exactly the `Box<ThreadInit>` leaked in `new`,
             // handed back to us once, on the new thread.
             let init = unsafe { Box::from_raw(arg as *mut ThreadInit) };
-            let rust_start = init.init();
-            rust_start();
+            init.init_dotnet();
             ptr::null_mut()
         }
 

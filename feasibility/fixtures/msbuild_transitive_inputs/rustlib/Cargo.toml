@@ -1,0 +1,15 @@
+[package]
+name = "msbuild_transitive_fixture"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fixture_dep = { path = "deps/fixture_dep" }
+
+[workspace]
+members = ["deps/fixture_dep"]
+resolver = "3"

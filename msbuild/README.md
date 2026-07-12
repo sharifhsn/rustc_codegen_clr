@@ -5,6 +5,10 @@ seamless**: a C# dev declares a dependency on a Rust crate, and a single `dotnet
 auto-compiles it (via the installed [`cargo dotnet`](../docs/CARGO_DOTNET.md)) and references the produced
 .NET assembly — **no manual `cargo dotnet`, no `.dll` copy, no hand-written `<Reference><HintPath>`**.
 
+> **Supported hosts:** the current release supports this integration on Linux and macOS. On Windows,
+> the targets fail immediately with the cargo-dotnet host-support diagnostic until Windows build,
+> test, packaging, and MSBuild acceptance exists. This does not assert a managed target/runtime limit.
+
 This is the recommended path in [docs/INTEROP_CSHARP.md](../docs/INTEROP_CSHARP.md) §3a. The manual
 `<Reference>` + `<HintPath>` and the NuGet `cargo dotnet pack` paths are documented there too.
 
@@ -56,6 +60,22 @@ Multiple `<RustCrate>` items are supported (built serially). Optional metadata, 
 | `Clean` | (unset) | `true` → pass `--clean` (force a clean rebuild). |
 | `Private` | `true` | copy the Rust `.dll` into the consumer `bin/` (needed for `dotnet run` to resolve it at runtime). |
 
+### Additional incremental inputs
+
+The targets automatically track crate-local Rust sources, manifests, lockfile, build script,
+crate-local toolchain selection, and the targets file itself. Until Cargo-metadata-derived transitive
+fingerprinting lands, declare inputs outside the selected crate explicitly in the consuming project:
+
+```xml
+<ItemGroup>
+  <RustDotnetInput Include="../shared-rust/**/*.rs" />
+  <RustDotnetInput Include="../shared-rust/**/Cargo.toml" />
+  <RustDotnetInput Include="../templates/codegen-input.json" />
+</ItemGroup>
+```
+
+This is required for path dependencies, workspace manifests, and arbitrary files read by `build.rs`.
+
 ### Project-level property overrides
 
 | property | default | meaning |
@@ -65,6 +85,10 @@ Multiple `<RustCrate>` items are supported (built serially). Optional metadata, 
 | `RustDotnetForceBuild` | `false` | `true` defeats the incremental skip (always rebuild). |
 | `RustDotnetToolPath` | `$(HOME)/.cargo/bin:$(HOME)/.dotnet` | dirs prepended to PATH for the build Exec. |
 | `RustDotnetDotnetRoot` | `$(HOME)/.dotnet` | `DOTNET_ROOT` for the build Exec. |
+
+The current Rust target has 64-bit pointer/layout semantics. The integration rejects explicit x86,
+`Prefer32Bit`, and x86 RID consumers even though the managed assembly itself can otherwise appear
+AnyCPU. Use x64, arm64, or a 64-bit AnyCPU process.
 
 ## How it works
 
@@ -79,10 +103,17 @@ Three targets in `RustDotnet.targets`:
    to each produced `.dll`.
 3. **`_ResolveOneCrate` / `_BuildOneRustCrate`** (per crate) — resolves the crate name (Cargo.toml
    `[package] name`), computes the `.dll` path, and runs `cargo dotnet build`. **Incremental**: the
-   target's `Inputs` are the crate's `src/**/*.rs` + existing manifests and its `Outputs` is the `.dll`,
-   so MSBuild's built-in up-to-date check skips the build when the `.dll` is newer than every source
-   (re-builds when you touch a source or `Cargo.toml`). Builds run serially because `cargo dotnet`
-   mutates the shared toolchain `rust-src` on every build.
+   target's `Inputs` are the automatic and consumer-declared inputs above. An explicit success stamp,
+   written only after the expected DLL exists, is the timestamp oracle; the DLL's own timestamp is
+   not trusted. A missing DLL forces the target stale even when a stamp remains. A successful build
+   must also produce `<dll>.rustdotnet.receipt.json`, binding the artifact to source, toolchain,
+   backend, linker, target, PAL, overlays, profile, and .NET version. Once MSBuild decides a rebuild is
+   required, it deletes the old managed DLL, receipt, and stamp before invoking `cargo dotnet`; a
+   failed requested rebuild cannot leave stale output or stale evidence eligible for a later compile
+   or run. Cargo-dotnet currently keeps a conservative cross-process lock while the remaining
+   shared-cache concurrency audit is completed; ordinary builds use private content-addressed
+   sysroots and a cargo-dotnet-owned Cargo home rather than mutating ambient `rust-src` or registry
+   sources.
 
 The build `Exec` runs with the inherited PATH plus `RustDotnetToolPath` prepended (so the tool's internal
 `cargo`/`rustc`/`dotnet` and any cargo `rustc-wrapper` resolve under MSBuild's non-interactive
@@ -99,5 +130,5 @@ exit 0, with no manual steps. A second `dotnet build` skips the Rust rebuild (in
 
 - The installed `cargo dotnet` (G1): `feasibility/cargo-dotnet setup` once from a repo checkout.
 - A .NET 8 SDK (`dotnet build`/`dotnet run`).
-- The Rust crate is a `cdylib` (`[lib] crate-type = ["cdylib"]`) with `#[no_mangle] pub extern "C"`
+- The Rust crate is a `cdylib` (`[lib] crate-type = ["cdylib"]`) with `#[unsafe(no_mangle)] pub extern "C"`
   exports — see [docs/INTEROP_CSHARP.md](../docs/INTEROP_CSHARP.md).

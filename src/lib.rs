@@ -154,19 +154,19 @@ use crate::{
 };
 use cilly::{
     Assembly, AssemblyArtifact,
-    {cilnode::MethodKind, MethodRef},
+    {MethodRef, cilnode::MethodKind},
 };
 use rustc_codegen_ssa::{
+    CompiledModule, CompiledModules, CrateInfo, ModuleKind,
     back::archive::{ArArchiveBuilder, ArchiveBuilder, ArchiveBuilderBuilder},
     traits::CodegenBackend,
-    CompiledModule, CompiledModules, CrateInfo, ModuleKind,
 };
 
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::{dep_graph::WorkProductMap, ty::TyCtxt};
 use rustc_session::{
-    config::{OutputFilenames, OutputType},
     Session,
+    config::{OutputFilenames, OutputType},
 };
 
 use std::{any::Any, path::Path};
@@ -178,6 +178,27 @@ pub type AString = std::sync::Arc<Box<str>>;
 /// An instance of the codegen.
 struct MyBackend {
     config: &'static config::BackendConfig,
+}
+
+/// Rust-visible features supplied by the backend's baseline target machine.
+///
+/// This is a frontend capability contract, not a description of the host CPU: the .NET backend
+/// lowers the selected Rust/stdarch operations to portable CIL and the runtime chooses the native
+/// implementation.  The set must nevertheless obey Rust's target ABI invariants.  In particular,
+/// an `x86_64` target without SSE2 is not a valid combination; crates such as `wide` legitimately
+/// assume the mandatory x86-64 feature closure when selecting their representations.
+fn baseline_target_features(
+    arch: &rustc_target::spec::Arch,
+    os: &rustc_target::spec::Os,
+) -> &'static [&'static str] {
+    use rustc_target::spec::{Arch, Os};
+
+    match arch {
+        Arch::X86_64 if os != &Os::None => &["fxsr", "sse", "sse2", "x87"],
+        Arch::AArch64 if os == &Os::MacOs => &["neon", "aes", "sha2", "sha3"],
+        Arch::AArch64 if os != &Os::None => &["neon"],
+        _ => &[],
+    }
 }
 
 fn add_item_transactionally<'tcx>(
@@ -358,30 +379,18 @@ impl CodegenBackend for MyBackend {
     }
 
     fn target_config(&self, sess: &Session) -> rustc_codegen_ssa::TargetConfig {
-        use rustc_span::sym;
-        // FIXME return the actually used target features. this is necessary for #[cfg(target_feature)]
-        use rustc_target::spec::{Arch, Os};
-        let target_features = if sess.target.arch == Arch::X86_64 && sess.target.os != Os::None {
-            // x86_64 mandates SSE2 support and rustc requires the x87 feature to be enabled
-            vec![
-                sym::sse,
-                //sym::sse2,
-                rustc_span::Symbol::intern("x87"),
-            ]
-        } else if sess.target.arch == Arch::AArch64 {
-            match sess.target.os {
-                Os::None => vec![],
-                // On macOS the aes, sha2 and sha3 features are enabled by default and ring
-                // fails to compile on macOS when they are not present.
-                Os::MacOs => vec![sym::neon, sym::aes, sym::sha2, sym::sha3],
-                // AArch64 mandates Neon support
-                _ => vec![sym::neon],
-            }
-        } else {
-            vec![]
-        };
-        // FIXME do `unstable_target_features` properly
-        let unstable_target_features = target_features.clone();
+        let baseline = baseline_target_features(&sess.target.arch, &sess.target.os);
+
+        // Use rustc's canonical parser so `-Ctarget-feature` participates in cfg computation,
+        // including implication closure, tied-feature validation, stability filtering, and the
+        // mandatory-ABI diagnostic.  Rust feature spellings are also our diagnostic backend
+        // spellings: actual lowering is semantic MIR/CIL lowering rather than an LLVM ISA flag.
+        let (unstable_target_features, target_features) =
+            rustc_codegen_ssa::target_features::cfg_target_feature::<1>(
+                sess,
+                |feature| std::iter::once(feature).collect(),
+                |feature| baseline.contains(&feature),
+            );
 
         rustc_codegen_ssa::TargetConfig {
             target_features,
@@ -510,7 +519,7 @@ impl ArchiveBuilderBuilder for RlibArchiveBuilder {
         unimplemented!("creating dll imports is not supported");
     }
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 /// Entrypoint of the codegen. This function starts the backend up, and returns a reference to it to rustc.
 pub extern "Rust" fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
     std::alloc::set_alloc_error_hook(custom_alloc_error_hook);

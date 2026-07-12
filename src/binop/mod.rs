@@ -1,14 +1,14 @@
 use self::checked::{add_signed, add_unsigned, sub_signed, sub_unsigned};
 use crate::assembly::MethodCompileCtx;
+use crate::operand::handle_operand;
+use crate::r#type::{GetTypeExt, utilis::instance_try_resolve};
 use bitop::{bit_and_unchecked, bit_or_unchecked, bit_xor_unchecked};
 use cilly::{
-    cilnode::ExtendKind,
     BinOp as V2BinOp, Interned, IntoAsmIndex, Type,
+    cilnode::ExtendKind,
     {Float, Int},
 };
 use cmp::{eq_unchecked, gt_unchecked, lt_unchecked, ne_unchecked};
-use crate::operand::handle_operand;
-use crate::r#type::{utilis::instance_try_resolve, GetTypeExt};
 use rustc_hir::lang_items::LangItem;
 use rustc_middle::{
     mir::{BinOp, Operand},

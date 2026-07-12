@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    bimap::Interned, cilnode::IsPure, Assembly, CILNode, FieldDesc, FnSig, MethodRef,
-    StaticFieldDesc, Type,
+    Assembly, CILNode, FieldDesc, FnSig, MethodRef, StaticFieldDesc, Type, bimap::Interned,
+    cilnode::IsPure,
 };
 use crate::IString;
 #[derive(PartialEq, Hash, Eq, Clone, Debug, Serialize, Deserialize)]

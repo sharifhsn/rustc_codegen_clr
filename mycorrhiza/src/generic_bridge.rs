@@ -11,18 +11,18 @@
 //!
 //! The crux, preserved here: a positional argument or return whose .NET type is the class's `!N`
 //! generic must appear in the `Sig` tuple as `RustcCLRInteropTypeGeneric<N>` (its *def* shape), while
-//! the runtime value is passed with its ordinary, concrete Rust type. The `gen!(N)` token below
+//! the runtime value is passed with its ordinary, concrete Rust type. The `r#gen!(N)` token below
 //! captures that half: in a `Sig` position it expands to the `!N` marker, while the caller supplies
 //! the concrete Rust value type alongside it. A position whose .NET type is concrete (e.g.
 //! `get_Item`'s `int32` index, or `get_Count`'s `int32` return) uses that concrete type in *both*
 //! positions — exactly as the hand-written wrappers did.
 
-/// In a method-signature (`Sig`) position, `gen!(N)` denotes the class's `!N` generic parameter:
+/// In a method-signature (`Sig`) position, `r#gen!(N)` denotes the class's `!N` generic parameter:
 /// it expands to the def-shape marker `RustcCLRInteropTypeGeneric<N>`. Used only inside the
 /// `Sig`-type slots of a [`dotnet_generic_impl!`] method line; the matching runtime value is passed
 /// with its concrete Rust type.
 #[macro_export]
-macro_rules! gen {
+macro_rules! r#gen {
     ($n:literal) => { $crate::intrinsics::RustcCLRInteropTypeGeneric<$n> };
 }
 
@@ -66,9 +66,9 @@ macro_rules! dotnet_generic {
 ///
 /// // instance method: an explicit .NET member name, `recv` (the receiver), then
 /// // `name: ValTy as SigTy` value args, then an optional `-> Ret as SigRet`.
-/// // `SigTy`/`SigRet` are `gen!(N)` for the class's `!N`, or a concrete .NET type. No `-> …` = void.
-/// fn add = "Add"(recv, item: T as gen!(0));
-/// fn get = "get_Item"(recv, idx: i32 as i32) -> T as gen!(0);
+/// // `SigTy`/`SigRet` are `r#gen!(N)` for the class's `!N`, or a concrete .NET type. No `-> …` = void.
+/// fn add = "Add"(recv, item: T as r#gen!(0));
+/// fn get = "get_Item"(recv, idx: i32 as i32) -> T as r#gen!(0);
 /// fn count = "get_Count"(recv) -> i32 as i32;
 /// ```
 ///
@@ -91,7 +91,7 @@ macro_rules! dotnet_generic_impl {
 
 /// Internal muncher: emits one wrapper fn per method line, then recurses on the rest.
 ///
-/// `Sig`-type slots are captured as `:ty` so a `gen!(N)` macro-call (a valid type-position macro)
+/// `Sig`-type slots are captured as `:ty` so a `r#gen!(N)` macro-call (a valid type-position macro)
 /// flows straight into the `Sig` tuple and expands there — no re-matching needed.
 #[macro_export]
 #[doc(hidden)]

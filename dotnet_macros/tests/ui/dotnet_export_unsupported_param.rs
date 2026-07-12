@@ -1,10 +1,13 @@
 use dotnet_macros::dotnet_export;
 
-// `Vec<i32>` is not in the marshalled type set; the macro already rejected this with a clear
-// message pre-fix — pinned here as a regression guard for that existing good behavior.
+pub struct PositionDto {
+    pub amount: i64,
+}
+
+// Wave 0 pins the current typed-DTO blocker. Wave 2 changes this fixture to compile-pass.
 #[dotnet_export]
-pub fn bad_export(x: Vec<i32>) -> i32 {
-    x.len() as i32
+pub fn bad_export(x: PositionDto) -> i32 {
+    x.amount as i32
 }
 
 fn main() {}

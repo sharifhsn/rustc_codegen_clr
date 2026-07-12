@@ -1,0 +1,46 @@
+{
+  "version": 3,
+  "targets": {
+    "net8.0/osx-arm64": {
+      "Example.Root/1.0.0": {
+        "type": "package",
+        "dependencies": { "Example.Dependency": "2.0.0" },
+        "compile": { "ref/net8.0/Example.Root.dll": {} },
+        "runtime": { "lib/net8.0/Example.Root.dll": {} },
+        "runtimeTargets": {
+          "runtimes/osx-arm64/lib/net8.0/Example.Root.dll": { "rid": "osx-arm64", "assetType": "runtime" },
+          "runtimes/osx-arm64/native/libexample_root.dylib": { "rid": "osx-arm64", "assetType": "native" },
+          "runtimes/osx-arm64/lib/net8.0/ja/Example.Root.resources.dll": { "rid": "osx-arm64", "assetType": "resources" }
+        }
+      },
+      "Example.Dependency/2.0.0": {
+        "type": "package",
+        "compile": { "ref/net8.0/Example.Dependency.dll": {} },
+        "runtime": { "lib/net8.0/Example.Dependency.dll": {} },
+        "runtimeTargets": {
+          "runtimes/osx-arm64/native/libexample_dependency.dylib": { "rid": "osx-arm64", "assetType": "native" }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "Example.Root/1.0.0": { "type": "package", "path": "example.root/1.0.0" },
+    "Example.Dependency/2.0.0": { "type": "package", "path": "example.dependency/2.0.0" }
+  },
+  "packageFolders": { "__PACKAGE_ROOT__/": {} },
+  "runtimes": { "osx-arm64": [ "osx", "unix", "any" ] },
+  "cargoDotnetExpected": {
+    "requestedRid": "osx-arm64",
+    "assets": [
+      { "owner": "Example.Root/1.0.0", "kind": "compile", "path": "ref/net8.0/Example.Root.dll" },
+      { "owner": "Example.Root/1.0.0", "kind": "runtime", "path": "lib/net8.0/Example.Root.dll" },
+      { "owner": "Example.Root/1.0.0", "kind": "runtime", "rid": "osx-arm64", "path": "runtimes/osx-arm64/lib/net8.0/Example.Root.dll" },
+      { "owner": "Example.Root/1.0.0", "kind": "native", "rid": "osx-arm64", "path": "runtimes/osx-arm64/native/libexample_root.dylib" },
+      { "owner": "Example.Root/1.0.0", "kind": "resource", "rid": "osx-arm64", "path": "runtimes/osx-arm64/lib/net8.0/ja/Example.Root.resources.dll" },
+      { "owner": "Example.Dependency/2.0.0", "kind": "compile", "path": "ref/net8.0/Example.Dependency.dll" },
+      { "owner": "Example.Dependency/2.0.0", "kind": "runtime", "path": "lib/net8.0/Example.Dependency.dll" },
+      { "owner": "Example.Dependency/2.0.0", "kind": "native", "rid": "osx-arm64", "path": "runtimes/osx-arm64/native/libexample_dependency.dylib" }
+    ],
+    "collisions": []
+  }
+}

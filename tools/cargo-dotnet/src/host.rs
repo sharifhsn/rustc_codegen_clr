@@ -6,13 +6,14 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// Host facts derived from the build target of this very binary (`std::env::consts`),
 /// which on this tooling crate equals the host. `dylib_ext` is the codegen backend
 /// cdylib extension; `exe_ext` the apphost suffix; `host_rid` the .NET runtime id for
 /// the CoreCLR ILAsm NuGet package.
 pub struct HostFacts {
+    pub os: &'static str,
     pub dylib_ext: &'static str,
     pub exe_ext: &'static str,
     /// The .NET runtime id for the CoreCLR ILAsm NuGet package. Used by a native
@@ -37,10 +38,33 @@ impl HostFacts {
             _ => "linux-x64",
         };
         HostFacts {
+            os: env::consts::OS,
             dylib_ext,
             exe_ext,
             host_rid,
         }
+    }
+
+    #[cfg(test)]
+    pub fn for_test(os: &'static str) -> Self {
+        HostFacts {
+            os,
+            dylib_ext: "so",
+            exe_ext: "",
+            host_rid: "test-x64",
+        }
+    }
+}
+
+pub const UNSUPPORTED_WINDOWS_HOST: &str = "Windows hosts are not supported by this cargo-dotnet release; use Linux or macOS. Windows support will be enabled after Windows build, test, packaging, and MSBuild acceptance exists.";
+
+pub fn ensure_supported(facts: &HostFacts) -> Result<()> {
+    match facts.os {
+        "linux" | "macos" => Ok(()),
+        "windows" => bail!(UNSUPPORTED_WINDOWS_HOST),
+        other => bail!(
+            "{other} hosts are not supported by this cargo-dotnet release; use Linux or macOS."
+        ),
     }
 }
 
@@ -164,7 +188,10 @@ pub fn ensure_rust_toolchain() -> Result<()> {
 
 /// The inner cargo to invoke: `$CARGO` if set, else `cargo` (Book §External Tools).
 pub fn inner_cargo() -> String {
-    env::var("CARGO").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "cargo".to_string())
+    env::var("CARGO")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "cargo".to_string())
 }
 
 /// Resolve a path argument to an absolute path, defaulting to `.`. Errors if the dir
@@ -177,4 +204,25 @@ pub fn resolve_crate_dir(path: &Option<PathBuf>) -> Result<PathBuf> {
         bail!("not a crate dir (no Cargo.toml): {}", abs.display());
     }
     Ok(abs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepted_hosts_are_explicit() {
+        assert!(ensure_supported(&HostFacts::for_test("linux")).is_ok());
+        assert!(ensure_supported(&HostFacts::for_test("macos")).is_ok());
+    }
+
+    #[test]
+    fn windows_has_stable_actionable_diagnostic() {
+        assert_eq!(
+            ensure_supported(&HostFacts::for_test("windows"))
+                .unwrap_err()
+                .to_string(),
+            UNSUPPORTED_WINDOWS_HOST
+        );
+    }
 }

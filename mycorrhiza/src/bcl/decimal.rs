@@ -16,7 +16,12 @@ use crate::system::{DotNetString, MString};
 
 const CORELIB: &str = "System.Private.CoreLib";
 const DEC: &str = "System.Decimal";
-type Dec = RustcCLRInteropManagedStruct<CORELIB, DEC, 16>;
+/// Raw inline managed value for `System.Decimal`.
+///
+/// Use this at interop boundaries (including `#[dotnet_dto]` fields) where the CLR property must
+/// have the exact `System.Decimal` type. [`DotNetDecimal`] is the idiomatic Rust wrapper.
+pub type Decimal = RustcCLRInteropManagedStruct<CORELIB, DEC, 16>;
+type Dec = Decimal;
 
 /// A managed `System.Decimal`. Use it like a number: `a + b`, `a * b`, `a < b`, `a == b`, `println!("{a}")`.
 #[derive(Clone, Copy)]

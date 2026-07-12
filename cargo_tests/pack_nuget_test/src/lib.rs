@@ -10,7 +10,7 @@ pub mod nuget;
 
 use nuget::csvhelper::CsvHelper::TypeConversion::{TypeConverterCache, TypeConverterCache_Methods};
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn csv_smoke() -> i32 {
     // Trivial use of the add-nuget-sourced type: prove the assembly actually loads and its type
     // is usable, not just that the reference compiles.

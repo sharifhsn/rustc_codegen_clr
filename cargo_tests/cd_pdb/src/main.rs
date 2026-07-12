@@ -47,12 +47,18 @@ fn main() {
     println!("{trace}");
     println!("=== verdict ===");
     // .NET renders resolved frames as "at M() in /abs/path/main.rs:line N"
-    println!("names this file:      {}", trace.contains("main.rs"));
-    println!("has file:line frames: {}", trace.contains(".rs:line"));
-    println!(
-        "names probe fn:       {}",
-        trace.contains("deep_leaf_for_pdb_probe")
-    );
+    let names_this_file = trace.contains("main.rs");
+    let has_file_line_frames = trace.contains(".rs:line");
+    let names_probe_fn = trace.contains("deep_leaf_for_pdb_probe");
+    println!("names this file:      {names_this_file}");
+    println!("has file:line frames: {has_file_line_frames}");
+    println!("names probe fn:       {names_probe_fn}");
     let result = compute_with_named_locals();
     println!("compute_with_named_locals() = {result}");
+    assert!(
+        names_this_file && has_file_line_frames && names_probe_fn && result == 126,
+        "PDB verification failed: file={names_this_file}, file_line={has_file_line_frames}, \
+         function={names_probe_fn}, result={result}"
+    );
+    println!("== cd_pdb done ==");
 }

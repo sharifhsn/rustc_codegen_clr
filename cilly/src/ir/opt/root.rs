@@ -1,14 +1,14 @@
 use super::inline::inline_trivial_call_root;
 
 use super::super::{
-    cilroot::BranchCond, method::LocalDef, BinOp, CILNode, CILRoot, Const, FnSig, Type,
+    BinOp, CILNode, CILRoot, Const, FnSig, Type, cilroot::BranchCond, method::LocalDef,
 };
 pub use super::opt_fuel::OptFuel;
 use super::opt_if_fuel;
 pub use super::side_effect::*;
+use crate::Assembly;
 use crate::bimap::Interned;
 use crate::cilroot::CmpKind;
-use crate::Assembly;
 
 /// Pick the `CmpKind` for a comparison produced by *negating* an ordered/signed comparison-branch
 /// (`!(a < b)` → `a >= b`, `!(a > b)` → `a <= b`, and their unordered/unsigned `…Un` forms). The
@@ -32,11 +32,7 @@ fn negation_cmp_kind(
         .typecheck(sig, locals, asm)
         .map(|t| matches!(t, Type::Float(_)))
         .unwrap_or(false);
-    if is_float {
-        float_kind
-    } else {
-        int_kind
-    }
+    if is_float { float_kind } else { int_kind }
 }
 pub fn root_opt(
     root: CILRoot,
@@ -51,11 +47,7 @@ pub fn root_opt(
             CILNode::LdLoc(_) => CILRoot::Nop,
             _ => {
                 let has_side_effects = cache.has_side_effects(pop, asm);
-                if has_side_effects {
-                    root
-                } else {
-                    CILRoot::Nop
-                }
+                if has_side_effects { root } else { CILRoot::Nop }
             }
         },
         CILRoot::Call(info) => inline_trivial_call_root(info.0, &info.1, root_fuel, asm),
@@ -72,7 +64,8 @@ pub fn root_opt(
             _ => root,
         },
         CILRoot::SetField(info) => {
-            let (field, mut addr, val) = info.as_ref();
+            let (field, addr, val) = info.as_ref();
+            let mut addr = *addr;
             if let CILNode::RefToPtr(inner) = asm[addr] {
                 addr = inner;
             }

@@ -49,14 +49,14 @@
 //! call, with no safety net, for callers who have already decided how they want to handle (or
 //! deliberately not handle) a resolution failure.
 
-use crate::error::{try_managed, ManagedException};
+use crate::ManagedSafe;
+use crate::error::{ManagedException, try_managed};
 use crate::intrinsics::{
-    rustc_clr_interop_box as box_value, rustc_clr_interop_managed_checked_cast as checked_cast,
+    RustcCLRInteropManagedArray, RustcCLRInteropManagedClass, rustc_clr_interop_box as box_value,
+    rustc_clr_interop_managed_checked_cast as checked_cast,
     rustc_clr_interop_managed_new_arr as new_arr, rustc_clr_interop_managed_set_elem as set_elem,
-    RustcCLRInteropManagedArray, RustcCLRInteropManagedClass,
 };
 use crate::system::{MObject, MString};
-use crate::ManagedSafe;
 
 /// The bundled helper assembly's simple name. Must match `mycorrhiza_interop_helpers`'s
 /// `<AssemblyName>` and [`crate::linq::PARAMETER_REBINDER_ASSEMBLY`] exactly (same assembly, two
@@ -90,7 +90,10 @@ pub fn box_arg<T: ManagedSafe>(v: T) -> DynArg {
 pub fn ref_arg<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str>(
     v: RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH>,
 ) -> DynArg {
-    DynArg(checked_cast::<MObject, RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH>>(v))
+    DynArg(checked_cast::<
+        MObject,
+        RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH>,
+    >(v))
 }
 
 /// A `&str` argument, as a boxed `System.Object` — shorthand for `ref_arg(MString::from(s))`.

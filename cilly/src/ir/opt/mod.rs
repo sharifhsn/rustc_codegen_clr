@@ -10,11 +10,11 @@ use root::root_opt;
 use super::Float;
 
 use super::{
+    BasicBlock, CILIter, CILIterElem, CILNode, CILRoot, FieldDesc, FnSig, Int, MethodImpl, Type,
     bimap::Interned,
     cilroot::BranchCond,
     method::LocalDef,
-    typecheck::{display_typecheck_err, TypeCheckError},
-    BasicBlock, CILIter, CILIterElem, CILNode, CILRoot, FieldDesc, FnSig, Int, MethodImpl, Type,
+    typecheck::{TypeCheckError, display_typecheck_err},
 };
 use crate::{Assembly, MethodDef};
 pub use opt_fuel::OptFuel;
@@ -29,11 +29,7 @@ mod side_effect;
 mod simplify_handlers;
 mod test;
 pub fn opt_if_fuel<T>(new: T, original: T, fuel: &mut OptFuel) -> T {
-    if fuel.consume(1) {
-        new
-    } else {
-        original
-    }
+    if fuel.consume(1) { new } else { original }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LocalPropagate {
@@ -310,9 +306,7 @@ impl CILNode {
                     tpe: *unboxtpe,
                 }
             }
-            CILNode::Box {
-                value,
-                tpe: boxtpe } => {
+            CILNode::Box { value, tpe: boxtpe } => {
                 let value = asm.get_node(*value).clone();
                 let value = value.propagate_locals(asm, idx, tpe, new_node, fuel);
                 let value = asm.alloc_node(value);
@@ -747,7 +741,8 @@ impl MethodImpl {
 }
 
 impl MethodDef {
-    pub fn iter_roots_mut(&mut self,
+    pub fn iter_roots_mut(
+        &mut self,
     ) -> Option<Box<dyn Iterator<Item = &mut Interned<CILRoot>> + '_>> {
         self.implementation_mut().all_blocks_mut().map(|blocks| {
             Box::new(blocks.flat_map(super::basic_block::BasicBlock::iter_roots_mut))
@@ -976,11 +971,7 @@ pub fn is_branch_unconditional(branch: &(u32, u32, Option<BranchCond>)) -> bool 
     branch.2.is_none()
 }
 pub fn blockid_from_jump(target: u32, sub_target: u32) -> u32 {
-    if sub_target == 0 {
-        target
-    } else {
-        sub_target
-    }
+    if sub_target == 0 { target } else { sub_target }
 }
 fn block_with_id(blocks: &[BasicBlock], id: u32) -> Option<&BasicBlock> {
     blocks.iter().find(|block| block.block_id() == id)
@@ -1068,9 +1059,9 @@ fn opt_mag() {
 
     asm.opt(&mut fuel);
     #[cfg(not(miri))]
-    asm.verify_for_export()
-        .unwrap()
-        .export("/tmp/opt_mag.exe", ILExporter::new(*ILASM_FLAVOUR, false, None),
+    asm.verify_for_export().unwrap().export(
+        "/tmp/opt_mag.exe",
+        ILExporter::new(*ILASM_FLAVOUR, false, None),
     );
 }
 

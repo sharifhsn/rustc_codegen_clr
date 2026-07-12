@@ -26,8 +26,8 @@
 
 use super::OptFuel;
 use crate::{
-    bimap::Interned, cilnode::CILNode, cilroot::CILRoot, field::FieldDesc, method::LocalDef,
-    Assembly, BasicBlock, CILIter, CILIterElem, IString,
+    Assembly, BasicBlock, CILIter, CILIterElem, IString, bimap::Interned, cilnode::CILNode,
+    cilroot::CILRoot, field::FieldDesc, method::LocalDef,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -69,12 +69,12 @@ fn decall_tuple_ctors(blocks: &mut [BasicBlock], locals: &[LocalDef], asm: &mut 
                                     let f1 = asm.alloc_field(FieldDesc::new(cref, item1_s, it1));
                                     let f2 = asm.alloc_field(FieldDesc::new(cref, item2_s, it2));
                                     let addr = asm.alloc_node(CILNode::LdLocA(t));
-                                    new_roots.push(
-                                        asm.alloc_root(CILRoot::SetField(Box::new((f1, addr, args[0])))),
-                                    );
-                                    new_roots.push(
-                                        asm.alloc_root(CILRoot::SetField(Box::new((f2, addr, args[1])))),
-                                    );
+                                    new_roots.push(asm.alloc_root(CILRoot::SetField(Box::new((
+                                        f1, addr, args[0],
+                                    )))));
+                                    new_roots.push(asm.alloc_root(CILRoot::SetField(Box::new((
+                                        f2, addr, args[1],
+                                    )))));
                                     changed = true;
                                     continue;
                                 }
@@ -293,10 +293,22 @@ pub fn scalarize_aggregates(
     // means there is exactly one such initializer anywhere).
     if !decompose_tmp.is_empty() {
         for block in blocks.iter_mut() {
-            decompose_whole_writes(block.roots_mut(), &decompose_tmp, &fields, &field_to_nl, asm);
+            decompose_whole_writes(
+                block.roots_mut(),
+                &decompose_tmp,
+                &fields,
+                &field_to_nl,
+                asm,
+            );
             if let Some(handler) = block.handler_mut() {
                 for hb in handler.iter_mut() {
-                    decompose_whole_writes(hb.roots_mut(), &decompose_tmp, &fields, &field_to_nl, asm);
+                    decompose_whole_writes(
+                        hb.roots_mut(),
+                        &decompose_tmp,
+                        &fields,
+                        &field_to_nl,
+                        asm,
+                    );
                 }
             }
         }

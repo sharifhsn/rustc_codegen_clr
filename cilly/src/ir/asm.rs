@@ -1,17 +1,21 @@
 use super::{
+    Access, CILNode, CILRoot, ClassDef, ClassRef, Const, Exporter, FieldDesc, FnSig, Int,
+    IntoAsmIndex, MethodDef, MethodDefIdx, MethodRef, StaticFieldDesc, Type,
     bimap::{BiMap, BiMapIndex, Interned, IntoBiMapIndex},
     cilnode::{BinOp, ExtendKind, IsPure, MethodKind, PtrCastRes, UnOp},
     class::{ClassDefIdx, LayoutError, StaticFieldDef},
     opt::{OptFuel, SideEffectInfoCache},
-    typecheck::TypeCheckError, Access, CILNode, CILRoot, ClassDef, ClassRef, Const, Exporter,
-    FieldDesc, FnSig, Int, IntoAsmIndex, MethodDef, MethodDefIdx, MethodRef, StaticFieldDesc, Type,
+    typecheck::TypeCheckError,
 };
-use crate::{config, utilis::assert_unique, IString};
-use crate::{utilis::encode, MethodImpl};
-use fxhash::{hash64, FxHashMap, FxHashSet};
+use crate::{IString, config, utilis::assert_unique};
+use crate::{MethodImpl, utilis::encode};
+use fxhash::{FxHashMap, FxHashSet, hash64};
 
 use serde::{Deserialize, Serialize};
 use std::{any::type_name, ops::Index};
+
+#[cfg(test)]
+use super::class::FixedArrayLayout;
 
 /// Maps an exact emitted method symbol to a closure that synthesizes its `MethodImpl` on demand. Populated
 /// and consumed at link time (not codegen time) by the `linker` binary (`bin/linker/patch.rs`)
@@ -162,23 +166,42 @@ pub struct Assembly {
     sections: FxHashMap<String, Vec<u8>>,
     /// A list of all buffers within this assembly.
     pub(crate) const_data: BiMap<Box<[u8]>>,
+    /// Rust's semantic size for Rust-origin value types whose CLR storage layout may be larger.
+    ///
+    /// This is codegen-only metadata: every use is lowered to a constant before the assembly is
+    /// serialized, so linked artifacts neither need nor should carry rustc-specific layout facts.
+    /// In particular, GC-reference fields hoisted out of overlapping enum/coroutine storage grow
+    /// the physical CLR value type without changing Rust's `size_of` or pointer stride.
+    #[serde(skip)]
+    rust_semantic_sizes: FxHashMap<Interned<ClassRef>, u64>,
 }
 
-/// The first method rejected by the unconditional final-emission verifier.
+/// A failure from the unconditional final-emission verifier.
 #[derive(Debug)]
-pub struct VerificationFailure {
-    pub method: MethodDefIdx,
-    pub method_name: String,
-    pub error: TypeCheckError,
+pub enum VerificationFailure {
+    Method {
+        method: MethodDefIdx,
+        method_name: String,
+        error: TypeCheckError,
+    },
+    AssemblyInvariant {
+        message: String,
+    },
 }
 
 impl std::fmt::Display for VerificationFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "CIL type-verifier rejected method `{}` ({:?}): {:?}",
-            self.method_name, self.method, self.error
-        )
+        match self {
+            Self::Method {
+                method,
+                method_name,
+                error,
+            } => write!(
+                f,
+                "CIL type-verifier rejected method `{method_name}` ({method:?}): {error:?}"
+            ),
+            Self::AssemblyInvariant { message } => f.write_str(message),
+        }
     }
 }
 
@@ -463,6 +486,8 @@ impl Assembly {
     /// available through a mutable reference.
     pub fn verify_for_export(mut self) -> Result<ExportReadyAssembly, VerificationFailure> {
         self.sanity_check();
+        self.validate_fixed_array_layouts()
+            .map_err(|message| VerificationFailure::AssemblyInvariant { message })?;
         let method_def_idxs: Box<[_]> = self.method_defs.keys().copied().collect();
         for method in method_def_idxs {
             let mut tmp_method = self.method_def(method).clone();
@@ -470,7 +495,7 @@ impl Assembly {
                 let method_name = self[self[method].name()].to_string();
                 let dump = crate::ir::dump::dump_method(&tmp_method, &mut self);
                 eprintln!("{dump}");
-                return Err(VerificationFailure {
+                return Err(VerificationFailure::Method {
                     method,
                     method_name,
                     error,
@@ -622,6 +647,75 @@ impl Assembly {
     }
     pub fn alloc_string(&mut self, string: impl Into<IString>) -> Interned<IString> {
         self.strings.alloc(string.into())
+    }
+
+    /// Records the Rust-language size of a Rust-origin value type.
+    ///
+    /// The CLR's physical size normally agrees with this value. It deliberately may not agree for
+    /// layouts containing hoisted GC-reference sidecars, because CoreCLR requires an unambiguous GC
+    /// map while Rust's enum/coroutine ABI permits variant fields to overlap.
+    pub fn set_rust_semantic_size(&mut self, class: Interned<ClassRef>, size: u64) {
+        if let Some(previous) = self.rust_semantic_sizes.insert(class, size) {
+            assert_eq!(
+                previous,
+                size,
+                "conflicting Rust semantic sizes registered for {}",
+                self[class].display(self)
+            );
+        }
+    }
+
+    /// Returns the Rust-language size registered for a Rust-origin value type.
+    #[must_use]
+    pub fn rust_semantic_size(&self, class: Interned<ClassRef>) -> Option<u64> {
+        self.rust_semantic_sizes.get(&class).copied()
+    }
+
+    /// Validates synthetic fixed-array storage after all codegen shards have been linked.
+    ///
+    /// Rust arrays and slices encode only a data pointer and a length, so their element stride is
+    /// the Rust semantic stride. A managed value type whose CLR storage has grown (for example due
+    /// to a GC-reference sidecar for overlapping enum fields) cannot safely inhabit that storage:
+    /// fixed-array helper methods would use CLR `sizeof(T)` while raw pointers, slices, `Vec`, and
+    /// allocators continue to use Rust's semantic layout. Reject that representation boundary
+    /// explicitly until the IR has a typed allocation/stride ABI capable of preserving it.
+    pub fn validate_fixed_array_layouts(&self) -> Result<(), String> {
+        for (array_idx, array_def) in &self.class_defs {
+            let Some(layout) = array_def.fixed_array_layout() else {
+                continue;
+            };
+            let Some(semantic_stride) = layout.semantic_element_stride() else {
+                continue;
+            };
+            let Type::ClassRef(element_ref) = layout.element() else {
+                continue;
+            };
+            let Some(element_idx) = self.class_ref_to_def(element_ref) else {
+                // External value types have no local physical layout. The requested Rust layout is
+                // the only authoritative information available; CoreCLR validates the final type.
+                continue;
+            };
+            let element_def = &self[element_idx];
+            let Some(physical_size) = element_def.explict_size() else {
+                // Managed reference classes and opaque external-shaped definitions do not provide
+                // inline value storage to compare.
+                continue;
+            };
+            let physical_align = element_def.align().map_or(1, |align| align.get()) as u64;
+            let physical_stride = u64::from(physical_size.get()).next_multiple_of(physical_align);
+            if physical_stride != semantic_stride || physical_align > layout.requested_align() {
+                return Err(format!(
+                    "fixed-array layout verification failed: representation-expanded element \
+                     cannot inhabit Rust array/slice storage; array={:?}, element={:?}, \
+                     semantic_stride={semantic_stride}, physical_stride={physical_stride}, \
+                     rust_align={}, clr_align={physical_align}",
+                    self.class_ref(array_idx.0).display(self),
+                    self.class_ref(element_ref).display(self),
+                    layout.requested_align()
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn sig(
@@ -881,21 +975,30 @@ impl Assembly {
         let mref = def.ref_to();
         let def_class = def.class();
         let ref_idx = self.alloc_methodref(mref);
-        // Check that this def is unique
-        if !self
-            .method_defs
-            .contains_key(&MethodDefIdx::from_raw(ref_idx))
+        let def_idx = MethodDefIdx::from_raw(ref_idx);
+        // Call lowering may intern a `Missing` placeholder after a comptime-generated managed
+        // method with the same reference has already been defined. Definition order must not turn
+        // a real body back into a runtime "missing method" throw. The opposite direction remains
+        // valid: a later real definition replaces an earlier placeholder.
+        if matches!(def.implementation(), MethodImpl::Missing)
+            && self
+                .method_defs
+                .get(&def_idx)
+                .is_some_and(|existing| !matches!(existing.implementation(), MethodImpl::Missing))
         {
+            return def_idx;
+        }
+        // Check that this def is unique
+        if !self.method_defs.contains_key(&def_idx) {
             self.class_defs
                 .get_mut(&def_class)
                 .expect("Method added without a class")
-                .add_def(MethodDefIdx::from_raw(ref_idx));
+                .add_def(def_idx);
         }
 
-        self.method_defs
-            .insert(MethodDefIdx::from_raw(ref_idx), def);
+        self.method_defs.insert(def_idx, def);
 
-        MethodDefIdx::from_raw(ref_idx)
+        def_idx
     }
     pub fn user_init(&mut self) -> MethodDefIdx {
         let main_module = self.main_module();
@@ -1341,15 +1444,12 @@ impl Assembly {
     /// Reallocates the roots, freeing all dead ones.
     pub fn realloc_roots(&mut self) {
         let mut new_roots = BiMap::default();
-        for block in self
-            .method_defs
-            .values_mut()
-            .flat_map(|def| {
-            def.implementation_mut().all_blocks_mut()
+        for block in self.method_defs.values_mut().flat_map(|def| {
+            def.implementation_mut()
+                .all_blocks_mut()
                 .into_iter()
-            .flatten()
-        })
-        {
+                .flatten()
+        }) {
             let (handler, roots) = block.handler_and_root_mut();
             for root in roots.iter_mut().chain(
                 handler
@@ -1639,6 +1739,9 @@ impl Assembly {
             method_defs: _,
             sections: _,
             const_data: _,
+            // Codegen-only; every semantic size has already become a CIL constant before an
+            // assembly reaches relocation, linking, or serialization.
+            rust_semantic_sizes: _,
         } = self;
     }
 
@@ -1662,6 +1765,23 @@ impl Assembly {
                 relocation,
             },
         )
+    }
+
+    /// Project the internal `MainModule` sentinel to a configured public CLR type name.
+    ///
+    /// Kept separate from ordinary codegen so legacy artifact decoding and existing consumers keep
+    /// their historical global `MainModule` surface unless a release package explicitly opts in.
+    #[must_use]
+    pub fn project_main_module(self, public_type_name: &str) -> Self {
+        let mut source = self;
+        let sections = std::mem::take(&mut source.sections);
+        let (mut projected, _) = super::asm_link::relocate_assembly_with_main_module_name(
+            Self::default(),
+            &source,
+            public_type_name,
+        );
+        projected.sections = sections;
+        projected
     }
 
     #[must_use]
@@ -2028,10 +2148,8 @@ impl Assembly {
             if let Some(cdef) = self.class_ref_to_def(cref) {
                 let field = {
                     let flds = self[cdef].fields();
-                    (flds.len() == 1
-                        && flds[0].0 == dst_ty
-                        && matches!(flds[0].2, None | Some(0)))
-                    .then_some((flds[0].0, flds[0].1))
+                    (flds.len() == 1 && flds[0].0 == dst_ty && matches!(flds[0].2, None | Some(0)))
+                        .then_some((flds[0].0, flds[0].1))
                 };
                 if let Some((ftpe, fname)) = field {
                     if self.sizeof_type(self[src]) == self.sizeof_type(dst_ty) {
@@ -2076,10 +2194,7 @@ impl Assembly {
                     volatile: false,
                 })
             }
-            (
-                Type::Ptr(_) | Type::Int(Int::ISize | Int::USize),
-                Type::Int(Int::U64),
-            ) => {
+            (Type::Ptr(_) | Type::Int(Int::ISize | Int::USize), Type::Int(Int::U64)) => {
                 let input = self.alloc_node(CILNode::LdArg(argument));
                 self.alloc_node(CILNode::IntCast {
                     input,
@@ -2087,10 +2202,7 @@ impl Assembly {
                     extend: ExtendKind::ZeroExtend,
                 })
             }
-            (
-                Type::Int(target @ (Int::ISize | Int::USize)),
-                Type::Int(Int::ISize | Int::USize),
-            ) => {
+            (Type::Int(target @ (Int::ISize | Int::USize)), Type::Int(Int::ISize | Int::USize)) => {
                 let input = self.alloc_node(CILNode::LdArg(argument));
                 self.alloc_node(CILNode::IntCast {
                     input,
@@ -2110,15 +2222,9 @@ impl Assembly {
                 Type::Ptr(_) | Type::Int(Int::ISize | Int::USize) | Type::FnPtr(_),
             ) => {
                 let input = self.alloc_node(CILNode::LdArg(argument));
-                self.alloc_node(CILNode::PtrCast(
-                    input,
-                    Box::new(PtrCastRes::FnPtr(target)),
-                ))
+                self.alloc_node(CILNode::PtrCast(input, Box::new(PtrCastRes::FnPtr(target))))
             }
-            (
-                Type::Int(target @ (Int::ISize | Int::USize)),
-                Type::Ptr(_) | Type::FnPtr(_),
-            ) => {
+            (Type::Int(target @ (Int::ISize | Int::USize)), Type::Ptr(_) | Type::FnPtr(_)) => {
                 let input = self.alloc_node(CILNode::LdArg(argument));
                 self.alloc_node(CILNode::IntCast {
                     input,
@@ -2126,12 +2232,8 @@ impl Assembly {
                     extend: ExtendKind::ZeroExtend,
                 })
             }
-            (Type::Int(Int::I64), Type::Int(Int::U64)) => {
-                self.alloc_node(CILNode::LdArg(argument))
-            }
-            _ => panic!(
-                "cannot adapt wrapper argument {argument} from {source:?} to {target:?}"
-            ),
+            (Type::Int(Int::I64), Type::Int(Int::U64)) => self.alloc_node(CILNode::LdArg(argument)),
+            _ => panic!("cannot adapt wrapper argument {argument} from {source:?} to {target:?}"),
         }
     }
 
@@ -2143,36 +2245,40 @@ impl Assembly {
         source: Type,
         target: Type,
     ) -> Interned<CILNode> {
+        self.adapt_call_value(value, source, target)
+    }
+
+    /// Explicitly adapts an already-loaded value across a call boundary. This is the neutral,
+    /// symmetric primitive behind return adaptation and builtin-generated call arguments; callers
+    /// that start from a numbered wrapper argument can use [`Self::adapt_call_argument`].
+    pub fn adapt_call_value(
+        &mut self,
+        value: Interned<CILNode>,
+        source: Type,
+        target: Type,
+    ) -> Interned<CILNode> {
         if source == target {
             return value;
         }
 
         match (target, source) {
             (
-                Type::Ptr(target),
-                Type::Ptr(_) | Type::Int(Int::ISize | Int::USize) | Type::FnPtr(_),
-            ) => self.alloc_node(CILNode::PtrCast(
-                value,
-                Box::new(PtrCastRes::Ptr(target)),
-            )),
-            (
-                Type::FnPtr(target),
-                Type::Ptr(_) | Type::Int(Int::ISize | Int::USize) | Type::FnPtr(_),
-            ) => self.alloc_node(CILNode::PtrCast(
-                value,
-                Box::new(PtrCastRes::FnPtr(target)),
-            )),
-            (
-                Type::Int(target @ (Int::ISize | Int::USize)),
-                Type::Ptr(_) | Type::FnPtr(_),
-            ) => self.alloc_node(CILNode::IntCast {
-                input: value,
-                target,
-                extend: ExtendKind::ZeroExtend,
-            }),
+                target @ (Type::Ptr(_)
+                | Type::Ref(_)
+                | Type::FnPtr(_)
+                | Type::Int(Int::ISize | Int::USize)),
+                Type::Ptr(_) | Type::Ref(_) | Type::FnPtr(_) | Type::Int(Int::ISize | Int::USize),
+            ) => self.cast_ptr_to(value, target),
             (Type::Int(Int::I64), Type::Int(Int::U64))
             | (Type::Int(Int::U64), Type::Int(Int::I64)) => value,
-            _ => panic!("cannot adapt wrapper return from {source:?} to {target:?}"),
+            _ => {
+                assert_eq!(
+                    self.sizeof_type(source),
+                    self.sizeof_type(target),
+                    "cannot adapt wrapper return from {source:?} to {target:?}"
+                );
+                self.transmute_on_stack(source, target, value)
+            }
         }
     }
 
@@ -2319,17 +2425,13 @@ impl Assembly {
     }
 
     /// Reinterprets a managed reference as a raw pointer.
-    pub fn ref_to_ptr(
-        &mut self,
-        val: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILNode> {
+    pub fn ref_to_ptr(&mut self, val: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILNode> {
         let val = val.into_idx(self);
         self.alloc_node(CILNode::RefToPtr(val))
     }
 
     /// Loads a pointer to the function `mref`.
-    pub fn ld_ftn(
-        &mut self,
-        mref: impl IntoAsmIndex<Interned<MethodRef>>) -> Interned<CILNode> {
+    pub fn ld_ftn(&mut self, mref: impl IntoAsmIndex<Interned<MethodRef>>) -> Interned<CILNode> {
         let mref = mref.into_idx(self);
         self.alloc_node(CILNode::LdFtn(mref))
     }
@@ -2456,9 +2558,7 @@ impl Assembly {
     }
 
     /// Loads the length of a platform array `arr`.
-    pub fn ld_len(
-        &mut self,
-        arr: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILNode> {
+    pub fn ld_len(&mut self, arr: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILNode> {
         let arr = arr.into_idx(self);
         self.alloc_node(CILNode::LdLen(arr))
     }
@@ -2528,9 +2628,7 @@ impl Assembly {
     }
 
     /// Allocates `size` bytes from the local (per-call) pool.
-    pub fn loc_alloc(
-        &mut self,
-        size: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILNode> {
+    pub fn loc_alloc(&mut self, size: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILNode> {
         let size = size.into_idx(self);
         self.alloc_node(CILNode::LocAlloc { size })
     }
@@ -2546,9 +2644,7 @@ impl Assembly {
     }
 
     /// Loads a "type token" for `tpe`.
-    pub fn ld_type_token(
-        &mut self,
-        tpe: impl IntoAsmIndex<Interned<Type>>) -> Interned<CILNode> {
+    pub fn ld_type_token(&mut self, tpe: impl IntoAsmIndex<Interned<Type>>) -> Interned<CILNode> {
         let tpe = tpe.into_idx(self);
         self.alloc_node(CILNode::LdTypeToken(tpe))
     }
@@ -2816,9 +2912,7 @@ impl Assembly {
     }
 
     /// Allocates an anonymous static initialized to `val` and loads its address.
-    pub fn stack_addr(
-        &mut self,
-        val: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILNode> {
+    pub fn stack_addr(&mut self, val: impl IntoAsmIndex<Interned<CILNode>>) -> Interned<CILNode> {
         let val = val.into_idx(self);
         let sfld = self.annon_const(val);
         self.alloc_node(CILNode::LdStaticFieldAddress(sfld))
@@ -3035,11 +3129,7 @@ fn chunked_range(top: u32, parts: u32) -> impl Iterator<Item = std::ops::Range<u
     (0..top).filter_map(move |i| {
         let start = i * chunk_size;
         let end = std::cmp::min(start + chunk_size, top);
-        if start < top {
-            Some(start..end)
-        } else {
-            None
-        }
+        if start < top { Some(start..end) } else { None }
     })
 }
 #[doc = "Specifies the path to the IL assembler."]
@@ -3110,7 +3200,9 @@ fn get_default_ilasm() -> String {
             return ilasm_path.display().to_string();
         }
     }
-    panic!("Could not find a .NET framework in directory {framework_path:?}, when searching for ilasm.")
+    panic!(
+        "Could not find a .NET framework in directory {framework_path:?}, when searching for ilasm."
+    )
 }
 #[test]
 fn user_init() {
@@ -3126,6 +3218,41 @@ fn add_user_init() {
         asm.alloc_root(CILRoot::Nop),
     ];
     asm.add_user_init(&roots);
+}
+
+#[test]
+fn missing_placeholder_never_overwrites_a_real_method_definition() {
+    let mut asm = Assembly::default();
+    let class = asm.main_module();
+    let name = asm.alloc_string("defined_before_placeholder");
+    let sig = asm.sig([], Type::Void);
+    let ret = asm.alloc_root(CILRoot::VoidRet);
+    let idx = asm.new_method(MethodDef::new(
+        Access::Public,
+        class,
+        name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        },
+        vec![],
+    ));
+    let placeholder = asm.new_method(MethodDef::new(
+        Access::Public,
+        class,
+        name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::Missing,
+        vec![],
+    ));
+    assert_eq!(idx, placeholder);
+    assert!(!matches!(
+        asm.method_defs.get(&idx).unwrap().implementation(),
+        MethodImpl::Missing
+    ));
 }
 
 #[cfg(test)]
@@ -3145,7 +3272,7 @@ fn add_deliberately_ill_typed_method(asm: &mut Assembly) -> MethodDefIdx {
         MethodImpl::MethodBody {
             blocks: vec![super::BasicBlock::new(vec![bad_store], 0, None)],
             locals: vec![(None, local_ty)],
-},
+        },
         vec![],
     ))
 }
@@ -3156,18 +3283,150 @@ fn final_export_verification_accepts_clean_assembly() {
 }
 
 #[test]
+fn fixed_array_layout_verifier_rejects_representation_expanded_elements() {
+    let mut asm = Assembly::default();
+    let element_name = asm.alloc_string("ExpandedElement");
+    let element = asm.alloc_class_ref(ClassRef::new(element_name, None, true, [].into()));
+    asm.class_def(ClassDef::new(
+        element_name,
+        true,
+        0,
+        None,
+        vec![],
+        vec![],
+        Access::Public,
+        std::num::NonZeroU32::new(24),
+        std::num::NonZeroU32::new(8),
+        false,
+    ))
+    .unwrap();
+
+    let array = ClassRef::fixed_array_with_layout(Type::ClassRef(element), 2, 32, 8, &mut asm);
+    let array_name = asm.class_ref(array).name();
+    asm.class_def(
+        ClassDef::new(
+            array_name,
+            true,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Public,
+            std::num::NonZeroU32::new(32),
+            std::num::NonZeroU32::new(8),
+            true,
+        )
+        .with_fixed_array_layout(FixedArrayLayout::new(
+            Type::ClassRef(element),
+            2,
+            32,
+            32,
+            8,
+        )),
+    )
+    .unwrap();
+
+    let error = asm.validate_fixed_array_layouts().unwrap_err();
+    assert!(error.contains("representation-expanded element"));
+    assert!(matches!(
+        asm.verify_for_export(),
+        Err(VerificationFailure::AssemblyInvariant { .. })
+    ));
+}
+
+#[test]
+fn fixed_array_layout_validation_is_link_order_independent() {
+    fn owner_shard() -> Assembly {
+        let mut asm = Assembly::default();
+        let element_name = asm.alloc_string("CrossShardExpandedElement");
+        let element = asm.alloc_class_ref(ClassRef::new(element_name, None, true, [].into()));
+        asm.class_def(ClassDef::new(
+            element_name,
+            true,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Public,
+            None,
+            None,
+            true,
+        ))
+        .unwrap();
+        let array = ClassRef::fixed_array_with_layout(Type::ClassRef(element), 2, 32, 8, &mut asm);
+        let array_name = asm.class_ref(array).name();
+        asm.class_def(
+            ClassDef::new(
+                array_name,
+                true,
+                0,
+                None,
+                vec![],
+                vec![],
+                Access::Public,
+                std::num::NonZeroU32::new(32),
+                std::num::NonZeroU32::new(8),
+                true,
+            )
+            .with_fixed_array_layout(FixedArrayLayout::new(
+                Type::ClassRef(element),
+                2,
+                32,
+                32,
+                8,
+            )),
+        )
+        .unwrap();
+        asm
+    }
+
+    fn definition_shard() -> Assembly {
+        let mut asm = Assembly::default();
+        let name = asm.alloc_string("CrossShardExpandedElement");
+        asm.alloc_class_ref(ClassRef::new(name, None, true, [].into()));
+        asm.class_def(ClassDef::new(
+            name,
+            true,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Public,
+            std::num::NonZeroU32::new(24),
+            std::num::NonZeroU32::new(8),
+            false,
+        ))
+        .unwrap();
+        asm
+    }
+
+    for linked in [
+        owner_shard().link(definition_shard()),
+        definition_shard().link(owner_shard()),
+    ] {
+        let error = linked.validate_fixed_array_layouts().unwrap_err();
+        assert!(error.contains("representation-expanded element"));
+    }
+}
+
+#[test]
 fn final_export_verification_returns_structured_failure() {
     let mut asm = Assembly::default().prepared();
     let bad_method = add_deliberately_ill_typed_method(&mut asm);
     let Err(error) = asm.verify_for_export() else {
         panic!("an ill-typed method must not receive an export-ready seal");
     };
-    assert_eq!(error.method, bad_method);
-    assert_eq!(error.method_name, "deliberately_ill_typed");
-    assert!(matches!(
-        error.error,
-        TypeCheckError::LocalAssigementWrong { .. }
-    ));
+    let VerificationFailure::Method {
+        method,
+        method_name,
+        error,
+    } = error
+    else {
+        panic!("expected a method verification failure")
+    };
+    assert_eq!(method, bad_method);
+    assert_eq!(method_name, "deliberately_ill_typed");
+    assert!(matches!(error, TypeCheckError::LocalAssigementWrong { .. }));
 }
 
 #[test]
@@ -3276,8 +3535,7 @@ fn missing_method_resolution_only_aliases_allowlisted_rustc_runtime_symbols() {
     );
     let alloc_ref = Interned::<MethodRef>::builtin(&mut asm, mangled_alloc, &[], Type::Void);
     let posix_write = Interned::<MethodRef>::builtin(&mut asm, "write", &[], Type::Void);
-    let rust_write =
-        Interned::<MethodRef>::builtin(&mut asm, "core::fmt::write", &[], Type::Void);
+    let rust_write = Interned::<MethodRef>::builtin(&mut asm, "core::fmt::write", &[], Type::Void);
 
     let alloc_name = asm.alloc_string("__rust_alloc");
     let write_name = asm.alloc_string("write");
@@ -3285,11 +3543,8 @@ fn missing_method_resolution_only_aliases_allowlisted_rustc_runtime_symbols() {
     overrides.insert(alloc_name, Box::new(|_, asm| void_body(asm)));
     overrides.insert(write_name, Box::new(|_, asm| void_body(asm)));
 
-    let stats = asm.resolve_missing_methods(
-        &FxHashMap::default(),
-        &FxHashSet::default(),
-        &overrides,
-    );
+    let stats =
+        asm.resolve_missing_methods(&FxHashMap::default(), &FxHashSet::default(), &overrides);
 
     assert_eq!(stats.overrides_applied, 2);
     assert_eq!(stats.allocator_shims_synthesized, 1);
@@ -3323,8 +3578,20 @@ fn call_alias_adapter_explicitly_converts_pointer_and_native_int_boundaries() {
     let native_int = asm.alloc_node(Const::USize(1));
     let result = asm.adapt_call_result(native_int, Type::Int(Int::USize), void_ptr);
     let result = asm[result].clone();
+    assert_eq!(result.typecheck(sig, &[], &mut asm).unwrap(), void_ptr);
+
+    let zero = asm.alloc_node(Const::ISize(0));
+    let pointer = asm.cast_ptr_to(zero, void_ptr);
+    let native = asm.adapt_call_value(pointer, void_ptr, Type::Int(Int::USize));
+    let native_node = asm[native].clone();
     assert_eq!(
-        result.typecheck(sig, &[], &mut asm).unwrap(),
+        native_node.typecheck(sig, &[], &mut asm).unwrap(),
+        Type::Int(Int::USize)
+    );
+    let pointer = asm.adapt_call_value(native, Type::Int(Int::USize), void_ptr);
+    let pointer_node = asm[pointer].clone();
+    assert_eq!(
+        pointer_node.typecheck(sig, &[], &mut asm).unwrap(),
         void_ptr
     );
 }
@@ -3372,7 +3639,8 @@ fn missing_method_resolution_rejects_dangling_interface_refs() {
         .class_def(
             ClassDef::new(
                 interface_name,
-                false, 0,
+                false,
+                0,
                 None,
                 vec![],
                 vec![],
@@ -3631,12 +3899,13 @@ fn export_event() {
     let remove_mref = asm.alloc_methodref(remove_mref);
 
     let event_name = asm.alloc_string("Changed");
-    asm.class_mut(class_idx).add_event(super::class::EventDef::new(
-        event_name,
-        action_type,
-        add_mref,
-        remove_mref,
-    ));
+    asm.class_mut(class_idx)
+        .add_event(super::class::EventDef::new(
+            event_name,
+            action_type,
+            add_mref,
+            remove_mref,
+        ));
 
     #[cfg(not(miri))]
     asm.verify_for_export().unwrap().export(
@@ -3708,9 +3977,9 @@ fn link() {
     asm.eliminate_dead_code();
     asm.realloc_roots();
     #[cfg(not(miri))]
-    asm.verify_for_export()
-        .unwrap()
-        .export("/tmp/link_test.exe", ILExporter::new(*ILASM_FLAVOUR, false, None),
+    asm.verify_for_export().unwrap().export(
+        "/tmp/link_test.exe",
+        ILExporter::new(*ILASM_FLAVOUR, false, None),
     );
 }
 config! {LINKER_RECOVER,bool,false}

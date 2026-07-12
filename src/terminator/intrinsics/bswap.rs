@@ -1,12 +1,12 @@
 use crate::assembly::MethodCompileCtx;
-use cilly::{
-    cilnode::IsPure,
-    Interned,
-    {cilnode::MethodKind, ClassRef, MethodRef},
-};
 use crate::operand::handle_operand;
 use crate::place::place_set;
 use crate::r#type::GetTypeExt;
+use cilly::{
+    Interned,
+    cilnode::IsPure,
+    {ClassRef, MethodRef, cilnode::MethodKind},
+};
 use rustc_middle::{
     mir::{Operand, Place},
     ty::{TyKind, UintTy},

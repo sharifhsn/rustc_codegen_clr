@@ -2,15 +2,15 @@
 //! experiment: `C_MODE=1 cargo test ::stable` runs it on every CI PR, and the `linker`
 //! binary constructs it unconditionally for `C_MODE` builds the same way it does `ILExporter`.
 #![allow(dead_code, unused_imports, unused_variables, clippy::let_unit_value)]
-use fxhash::{hash64, FxHashSet, FxHasher};
+use fxhash::{FxHashSet, FxHasher, hash64};
 use std::{collections::HashSet, io::Write, num::NonZero, path::Path};
 
 use crate::{
+    BiMap, IString, MethodImpl,
     asm::LINKER_RECOVER,
     cilnode::MethodKind,
     config, typecheck,
     utilis::{assert_unique, encode},
-    BiMap, IString, MethodImpl,
 };
 
 config!(NO_SFI, bool, false);
@@ -24,6 +24,8 @@ config!(PARTS, u32, 1);
 config!(ASCII_IDENTS, bool, false);
 mod utilis;
 use super::{
+    Assembly, BinOp, CILNode, CILRoot, ClassRef, Const, Exporter, FnSig, Int, MethodDef, MethodRef,
+    Type,
     basic_block::BlockId,
     bimap::{Interned, IntoBiMapIndex},
     branch_cond_to_name,
@@ -32,8 +34,6 @@ use super::{
     class::{ClassDefIdx, StaticFieldDef},
     method::LocalDef,
     typecheck::TypeCheckError,
-    Assembly, BinOp, CILNode, CILRoot, ClassRef, Const, Exporter, FnSig, Int, MethodDef, MethodRef,
-    Type,
 };
 use utilis::*;
 
@@ -119,7 +119,7 @@ impl CExporter {
         Ok(match op {
             BinOp::Add => match tpe {
                 Type::Ptr(type_idx) | Type::Ref(type_idx) => format!(
-                    "({tpe}*)((uint8_t*)({lhs}) + (uintptr_t)({rhs}))",
+                    "({tpe}*)((uintptr_t)({lhs}) + (uintptr_t)({rhs}))",
                     tpe = c_tpe(asm[type_idx], asm)
                 ),
                 Type::FnPtr(_) => format!("({lhs}) + ({rhs})"),
@@ -148,7 +148,7 @@ impl CExporter {
             },
             BinOp::Sub => match tpe {
                 Type::Ptr(type_idx) | Type::Ref(type_idx) => format!(
-                    "({tpe}*)((uint8_t*)({lhs}) - (uintptr_t)({rhs}))",
+                    "({tpe}*)((uintptr_t)({lhs}) - (uintptr_t)({rhs}))",
                     tpe = c_tpe(asm[type_idx], asm)
                 ),
                 Type::FnPtr(_) => format!("({lhs}) - ({rhs})"),
@@ -275,19 +275,106 @@ impl CExporter {
                 _ => todo!("can't rem {tpe:?}"),
             },
             BinOp::Shl => match tpe {
-                // Signed shift is equivalent to Rust unsinged shift, but it is well defined in C
-                Type::Int(Int::I8) => format!("(int8_t)((uint8_t)({lhs}) << ({rhs}))"),
-                Type::Int(Int::I16) => format!("(int16_t)((uint16_t)({lhs}) << ({rhs}))"),
-                Type::Int(Int::I32) => format!("(int32_t)((uint32_t)({lhs}) << ({rhs}))"),
-                Type::Int(Int::I64) => format!("(int64_t)((uint64_t)({lhs}) << ({rhs}))"),
-                Type::Int(Int::I128) => format!("(__int128)((__uint128_t)({lhs}) << ({rhs}))"),
-                Type::Int(Int::ISize) => format!("(intptr_t)((uintptr_t)({lhs}) << ({rhs}))"),
-                Type::Int(_) => format!("({lhs}) << ({rhs})"),
+                // Rust and the CLI mask integer shift counts to the width of the left operand.
+                // C instead makes an over-wide shift undefined, so preserve the IR semantics
+                // explicitly at this exporter boundary.
+                Type::Int(Int::I8) => {
+                    format!("(int8_t)((uint8_t)({lhs}) << ((uintptr_t)({rhs}) & 7))")
+                }
+                Type::Int(Int::U8) => {
+                    format!("(uint8_t)((uint8_t)({lhs}) << ((uintptr_t)({rhs}) & 7))")
+                }
+                Type::Int(Int::I16) => {
+                    format!("(int16_t)((uint16_t)({lhs}) << ((uintptr_t)({rhs}) & 15))")
+                }
+                Type::Int(Int::U16) => {
+                    format!("(uint16_t)((uint16_t)({lhs}) << ((uintptr_t)({rhs}) & 15))")
+                }
+                Type::Int(Int::I32) => {
+                    format!("(int32_t)((uint32_t)({lhs}) << ((uintptr_t)({rhs}) & 31))")
+                }
+                Type::Int(Int::U32) => {
+                    format!("(uint32_t)((uint32_t)({lhs}) << ((uintptr_t)({rhs}) & 31))")
+                }
+                Type::Int(Int::I64) => {
+                    format!("(int64_t)((uint64_t)({lhs}) << ((uintptr_t)({rhs}) & 63))")
+                }
+                Type::Int(Int::U64) => {
+                    format!("(uint64_t)((uint64_t)({lhs}) << ((uintptr_t)({rhs}) & 63))")
+                }
+                Type::Int(Int::I128) => {
+                    format!("(__int128)((__uint128_t)({lhs}) << ((uintptr_t)({rhs}) & 127))")
+                }
+                Type::Int(Int::U128) => {
+                    format!("(__uint128_t)((__uint128_t)({lhs}) << ((uintptr_t)({rhs}) & 127))")
+                }
+                Type::Int(Int::ISize) => format!(
+                    "(intptr_t)((uintptr_t)({lhs}) << ((uintptr_t)({rhs}) & ((sizeof(uintptr_t) * 8) - 1)))"
+                ),
+                Type::Int(Int::USize) => format!(
+                    "(uintptr_t)((uintptr_t)({lhs}) << ((uintptr_t)({rhs}) & ((sizeof(uintptr_t) * 8) - 1)))"
+                ),
                 _ => todo!("can't shl {tpe:?}"),
             },
-            BinOp::Shr | BinOp::ShrUn => match tpe {
-                Type::Int(_) => format!("({lhs}) >> ({rhs})"),
+            BinOp::Shr => match tpe {
+                Type::Int(Int::I8) => {
+                    format!("(int8_t)((int8_t)({lhs}) >> ((uintptr_t)({rhs}) & 7))")
+                }
+                Type::Int(Int::U8) => {
+                    format!("(uint8_t)((uint8_t)({lhs}) >> ((uintptr_t)({rhs}) & 7))")
+                }
+                Type::Int(Int::I16) => {
+                    format!("(int16_t)((int16_t)({lhs}) >> ((uintptr_t)({rhs}) & 15))")
+                }
+                Type::Int(Int::U16) => {
+                    format!("(uint16_t)((uint16_t)({lhs}) >> ((uintptr_t)({rhs}) & 15))")
+                }
+                Type::Int(Int::I32) => {
+                    format!("(int32_t)((int32_t)({lhs}) >> ((uintptr_t)({rhs}) & 31))")
+                }
+                Type::Int(Int::U32) => {
+                    format!("(uint32_t)((uint32_t)({lhs}) >> ((uintptr_t)({rhs}) & 31))")
+                }
+                Type::Int(Int::I64) => {
+                    format!("(int64_t)((int64_t)({lhs}) >> ((uintptr_t)({rhs}) & 63))")
+                }
+                Type::Int(Int::U64) => {
+                    format!("(uint64_t)((uint64_t)({lhs}) >> ((uintptr_t)({rhs}) & 63))")
+                }
+                Type::Int(Int::I128) => {
+                    format!("(__int128)((__int128)({lhs}) >> ((uintptr_t)({rhs}) & 127))")
+                }
+                Type::Int(Int::U128) => {
+                    format!("(__uint128_t)((__uint128_t)({lhs}) >> ((uintptr_t)({rhs}) & 127))")
+                }
+                Type::Int(Int::ISize) => format!(
+                    "(intptr_t)((intptr_t)({lhs}) >> ((uintptr_t)({rhs}) & ((sizeof(uintptr_t) * 8) - 1)))"
+                ),
+                Type::Int(Int::USize) => format!(
+                    "(uintptr_t)((uintptr_t)({lhs}) >> ((uintptr_t)({rhs}) & ((sizeof(uintptr_t) * 8) - 1)))"
+                ),
                 _ => todo!("can't shr {tpe:?}"),
+            },
+            BinOp::ShrUn => match tpe {
+                Type::Int(Int::I8 | Int::U8) => {
+                    format!("(uint8_t)((uint8_t)({lhs}) >> ((uintptr_t)({rhs}) & 7))")
+                }
+                Type::Int(Int::I16 | Int::U16) => {
+                    format!("(uint16_t)((uint16_t)({lhs}) >> ((uintptr_t)({rhs}) & 15))")
+                }
+                Type::Int(Int::I32 | Int::U32) => {
+                    format!("(uint32_t)((uint32_t)({lhs}) >> ((uintptr_t)({rhs}) & 31))")
+                }
+                Type::Int(Int::I64 | Int::U64) => {
+                    format!("(uint64_t)((uint64_t)({lhs}) >> ((uintptr_t)({rhs}) & 63))")
+                }
+                Type::Int(Int::I128 | Int::U128) => {
+                    format!("(__uint128_t)((__uint128_t)({lhs}) >> ((uintptr_t)({rhs}) & 127))")
+                }
+                Type::Int(Int::ISize | Int::USize) => format!(
+                    "(uintptr_t)((uintptr_t)({lhs}) >> ((uintptr_t)({rhs}) & ((sizeof(uintptr_t) * 8) - 1)))"
+                ),
+                _ => todo!("can't shr.un {tpe:?}"),
             },
             BinOp::DivUn | BinOp::Div => match tpe {
                 Type::Ptr(type_idx) | Type::Ref(type_idx) => format!(
@@ -332,7 +419,9 @@ impl CExporter {
                 Const::I128(v) => {
                     let low = *v as u128 as u64;
                     let high = ((*v as u128) >> 64) as u64;
-                    format!("(__int128)((unsigned __int128)(0x{low:x}) | ((unsigned __int128)(0x{high:x}) << 64))")
+                    format!(
+                        "(__int128)((unsigned __int128)(0x{low:x}) | ((unsigned __int128)(0x{high:x}) << 64))"
+                    )
                 }
                 Const::ISize(v) => format!("(intptr_t)0x{v:x}L"),
                 // For u8 and u16, using hex makes no sense(uses more chars)
@@ -343,7 +432,9 @@ impl CExporter {
                 Const::U128(v) => {
                     let low = *v as u64;
                     let high = ({ *v } >> 64) as u64;
-                    format!("((unsigned __int128)(0x{low:x}) | ((unsigned __int128)(0x{high:x}) << 64))")
+                    format!(
+                        "((unsigned __int128)(0x{low:x}) | ((unsigned __int128)(0x{high:x}) << 64))"
+                    )
                 }
                 Const::USize(v) => {
                     if *v < u32::MAX as u64 {
@@ -400,7 +491,9 @@ impl CExporter {
                 Const::I128(v) => {
                     let low = *v as u128 as u64;
                     let high = ((*v as u128) >> 64) as u64;
-                    format!("(__int128)((unsigned __int128)(0x{low:x}) | ((unsigned __int128)(0x{high:x}) << 64))")
+                    format!(
+                        "(__int128)((unsigned __int128)(0x{low:x}) | ((unsigned __int128)(0x{high:x}) << 64))"
+                    )
                 }
                 Const::ISize(v) => format!("(intptr_t)0x{v:x}L"),
                 // For u8 and u16, using hex makes no sense(uses more chars)
@@ -411,7 +504,9 @@ impl CExporter {
                 Const::U128(v) => {
                     let low = *v as u64;
                     let high = ({ *v } >> 64) as u64;
-                    format!("((unsigned __int128)(0x{low:x}) | ((unsigned __int128)(0x{high:x}) << 64))")
+                    format!(
+                        "((unsigned __int128)(0x{low:x}) | ((unsigned __int128)(0x{high:x}) << 64))"
+                    )
                 }
                 Const::USize(v) => format!("(uintptr_t)0x{v:x}uL"),
                 Const::PlatformString(string_idx) => format!("{:?}", &asm[*string_idx]),
@@ -562,7 +657,9 @@ impl CExporter {
                     }
                     (Int::I8, ExtendKind::ZeroExtend) => format!("(int8_t)({input})"),
                     (Int::I8, ExtendKind::SignExtend) => format!("(int8_t)({input})"),
-                    (Int::I16, ExtendKind::ZeroExtend) => todo!(),
+                    (Int::I16, ExtendKind::ZeroExtend) => {
+                        format!("(int16_t)(uint16_t)({input})")
+                    }
                     (Int::I16, ExtendKind::SignExtend) => format!("(int16_t)({input})"),
                     (Int::I32, ExtendKind::ZeroExtend) => format!("(int32_t)(uint32_t)({input})"),
                     (Int::I32, ExtendKind::SignExtend) => format!("(int32_t)({input})"),
@@ -795,10 +892,17 @@ impl CExporter {
                         hash = encode(asm.alloc_root(root).as_bimap_index().get() as u64)
                     ));
                 }
-                return Ok(format!(
-                    "{name} = {node};",
-                    node = Self::node_to_string(asm[node_idx].clone(), asm, locals, inputs, sig)?,
-                ));
+                let mut node =
+                    Self::node_to_string(asm[node_idx].clone(), asm, locals, inputs, sig)?;
+                let local_type = asm[locals[id as usize].1];
+                if matches!(local_type, Type::Ptr(_) | Type::Ref(_)) {
+                    // C does not have the CLR evaluation stack's native-int/pointer equivalence.
+                    // Preserve the verifier-visible local type explicitly at the assignment
+                    // boundary, including after optimizer propagation has folded an IR PtrCast
+                    // into a call returning `usize`.
+                    node = format!("({})({node})", c_tpe(local_type, asm));
+                }
+                return Ok(format!("{name} = {node};"));
             }
             CILRoot::StArg(arg, node_idx) => match inputs[arg as usize].1 {
                 Some(name) => format!(
@@ -823,7 +927,8 @@ impl CExporter {
                 if matches!(asm[node_idx], CILNode::Const(_)) {
                     format!(
                         "eprintf(\"An error was encoutrered in %s, at %s:%d\\n\",__func__,__FILE__,__LINE__);eprintf(\"%s\\n\",{node}); abort();",
-                        node = Self::node_to_string(asm[node_idx].clone(), asm, locals, inputs, sig)?
+                        node =
+                            Self::node_to_string(asm[node_idx].clone(), asm, locals, inputs, sig)?
                     )
                 } else {
                     format!(
@@ -961,13 +1066,19 @@ impl CExporter {
                 let (addr, value, tpe, is_volitle) = info.as_ref();
                 let addr = Self::node_to_string(asm[*addr].clone(), asm, locals, inputs, sig)?;
                 let value = Self::node_to_string(asm[*value].clone(), asm, locals, inputs, sig)?;
+                // `StInd` carries the authoritative pointee type. The address expression may have
+                // a deliberately erased or otherwise verifier-equivalent pointer type (for
+                // example, a byte pointer used to address a stored slice data pointer). C has no
+                // equivalent of the CLR evaluation stack's pointer compatibility, so dereferencing
+                // the expression directly can select the wrong lvalue type. Retag the address at
+                // the store boundary, just as `StLoc` retags pointer-valued local assignments.
                 if *is_volitle {
                     format!(
                         "*((volatile {tpe}*)({addr})) = ({value});",
                         tpe = c_tpe(*tpe, asm)
                     )
                 } else {
-                    format!("*({addr}) = ({value});")
+                    format!("*(({tpe}*)({addr})) = ({value});", tpe = c_tpe(*tpe, asm))
                 }
             }
             CILRoot::InitBlk(blk) => {
@@ -1177,7 +1288,10 @@ impl CExporter {
             .intersperse(",".into())
             .collect::<String>();
         writeln!(method_defs, "{output} {method_name}({inputs}){{")?;
-        let (blocks, locals) = def.resolved_implementation(asm).clone().materialize_legacy_body(asm)
+        let (blocks, locals) = def
+            .resolved_implementation(asm)
+            .clone()
+            .materialize_legacy_body(asm)
             .expect("C exporter expected a method body");
         for (idx, (lname, local_type)) in locals.iter().enumerate() {
             // If the name of this local is found multiple times, use the L form.
@@ -1214,7 +1328,11 @@ impl CExporter {
             while let Some(root_idx) = root_iter.next() {
                 if let Err(err) = asm[*root_idx].clone().typecheck(sig, &locals, asm) {
                     eprintln!("Typecheck error:{err:?}");
-                    writeln!(method_defs, "fprintf(stderr,\"Attempted to execute a statement which failed to compile.\" {err:?}); abort();",err = format!("{err:?}"))?;
+                    writeln!(
+                        method_defs,
+                        "fprintf(stderr,\"Attempted to execute a statement which failed to compile.\" {err:?}); abort();",
+                        err = format!("{err:?}")
+                    )?;
                     continue;
                 }
 
@@ -1242,7 +1360,11 @@ impl CExporter {
                     }
                     Err(err) => {
                         eprintln!("Typecheck error:{err:?}");
-                        writeln!(method_defs, "fprintf(stderr,\"Attempted to execute a statement which failed to compile.\" {err:?}); abort();",err = format!("{err:?}"))?
+                        writeln!(
+                            method_defs,
+                            "fprintf(stderr,\"Attempted to execute a statement which failed to compile.\" {err:?}); abort();",
+                            err = format!("{err:?}")
+                        )?
                     }
                 }
             }
@@ -1254,7 +1376,11 @@ impl CExporter {
                     for root in block.roots() {
                         if let Err(err) = asm[*root].clone().typecheck(sig, &locals, asm) {
                             eprintln!("Typecheck error:{err:?}");
-                            writeln!(method_defs, "fprintf(stderr,\"Attempted to execute a statement which failed to compile.\" {err:?}); abort();",err = format!("{err:?}"))?;
+                            writeln!(
+                                method_defs,
+                                "fprintf(stderr,\"Attempted to execute a statement which failed to compile.\" {err:?}); abort();",
+                                err = format!("{err:?}")
+                            )?;
                             continue;
                         }
 
@@ -1282,7 +1408,11 @@ impl CExporter {
                             }
                             Err(err) => {
                                 eprintln!("Typecheck error:{err:?}");
-                                writeln!(method_defs, "fprintf(stderr,\"Attempted to execute a statement which failed to compile.\" {err:?}); abort();",err = format!("{err:?}"))?
+                                writeln!(
+                                    method_defs,
+                                    "fprintf(stderr,\"Attempted to execute a statement which failed to compile.\" {err:?}); abort();",
+                                    err = format!("{err:?}")
+                                )?
                             }
                         }
                     }
@@ -1346,7 +1476,18 @@ impl CExporter {
                 let fname = escape_nonfn_name(&asm[*fname]);
                 let offset = offset.unwrap();
                 if offset != last_offset {
-                    assert!(offset >= last_offset,"Type {class_name} has overlapping fields. offset:{offset},last_offset:{last_offset}\nfields:{fields:?}",fields = fields.iter().map(|(tpe,name,offset)| format!("{offset:?} {} {}\n",&asm[*name], tpe.mangle(asm))).collect::<String>());
+                    assert!(
+                        offset >= last_offset,
+                        "Type {class_name} has overlapping fields. offset:{offset},last_offset:{last_offset}\nfields:{fields:?}",
+                        fields = fields
+                            .iter()
+                            .map(|(tpe, name, offset)| format!(
+                                "{offset:?} {} {}\n",
+                                &asm[*name],
+                                tpe.mangle(asm)
+                            ))
+                            .collect::<String>()
+                    );
                     writeln!(
                         type_defs,
                         "uint8_t pad_{pad_count}[{}];\n",
@@ -1453,12 +1594,16 @@ impl CExporter {
                     Const::I128(v) => {
                         let low = *v as u128 as u64;
                         let high = ((*v as u128) >> 64) as u64;
-                        format!("(__int128)((unsigned __int128)(0x{low:x}) | ((unsigned __int128)(0x{high:x}) << 64))")
+                        format!(
+                            "(__int128)((unsigned __int128)(0x{low:x}) | ((unsigned __int128)(0x{high:x}) << 64))"
+                        )
                     }
                     Const::U128(v) => {
                         let low = *v as u64;
                         let high = ({ *v } >> 64) as u64;
-                        format!("((unsigned __int128)(0x{low:x}) | ((unsigned __int128)(0x{high:x}) << 64))")
+                        format!(
+                            "((unsigned __int128)(0x{low:x}) | ((unsigned __int128)(0x{high:x}) << 64))"
+                        )
                     }
                     Const::F32(b) => {
                         if !b.0.is_nan() {
@@ -1606,7 +1751,10 @@ impl CExporter {
 fn call_entry(out: &mut impl Write, asm: &Assembly) -> Result<(), std::io::Error> {
     let cctor_call = if asm.has_cctor() { "_cctor();" } else { "" };
 
-    writeln!(out,"int main(int argc_input, char** argv_input){{\n#ifndef __SDCC\nargc = argc_input;if(argc < 1)abort();\nargv = argv_input;if(argv == (char**)0)abort();\n#endif\n{cctor_call}entrypoint();\nreturn 0;}}")?;
+    writeln!(
+        out,
+        "int main(int argc_input, char** argv_input){{\n#ifndef __SDCC\nargc = argc_input;if(argc < 1)abort();\nargv = argv_input;if(argv == (char**)0)abort();\n#endif\n{cctor_call}entrypoint();\nreturn 0;}}"
+    )?;
     Ok(())
 }
 impl CExporter {
@@ -1856,5 +2004,122 @@ mod region_body_compat_tests {
             .unwrap();
         assert_eq!(canonical_defs, legacy_defs);
         assert_eq!(canonical_decls, legacy_decls);
+    }
+}
+
+#[cfg(test)]
+mod indirect_store_tests {
+    use super::*;
+    use crate::ir::{CILNode, Const, Int, cilnode::ExtendKind};
+
+    fn render_pointer_store(volatile: bool) -> String {
+        let mut asm = Assembly::default();
+        let sig = asm.sig([], Type::Void);
+        let byte = asm.alloc_type(Type::Int(Int::U8));
+        let store_type = Type::Ptr(byte);
+        let addr = asm.alloc_node(CILNode::Const(Box::new(Const::USize(16))));
+        let value = asm.alloc_node(CILNode::Const(Box::new(Const::USize(32))));
+        let root = CILRoot::StInd(Box::new((addr, value, store_type, volatile)));
+        CExporter::new(false, vec![], vec![])
+            .root_to_string(root, &mut asm, &[], &[], sig, None, false, false)
+            .unwrap()
+    }
+
+    fn render_pointer_arithmetic(op: BinOp) -> String {
+        let mut asm = Assembly::default();
+        let sig = asm.sig([], Type::Void);
+        let byte = asm.alloc_type(Type::Int(Int::U8));
+        CExporter::binop_to_string(
+            CILNode::Const(Box::new(Const::USize(0x1000))),
+            CILNode::Const(Box::new(Const::USize(4))),
+            op,
+            Type::Ptr(byte),
+            &mut asm,
+            &[],
+            &[],
+            sig,
+        )
+        .unwrap()
+    }
+
+    fn render_integer_shift(op: BinOp, tpe: Int) -> String {
+        let mut asm = Assembly::default();
+        let sig = asm.sig([], Type::Void);
+        CExporter::binop_to_string(
+            CILNode::Const(Box::new(Const::I32(-1))),
+            CILNode::Const(Box::new(Const::U32(255))),
+            op,
+            Type::Int(tpe),
+            &mut asm,
+            &[],
+            &[],
+            sig,
+        )
+        .unwrap()
+    }
+
+    fn render_i16_zero_extend() -> String {
+        let mut asm = Assembly::default();
+        let sig = asm.sig([], Type::Void);
+        let input = asm.alloc_node(Const::U8(u8::MAX));
+        CExporter::node_to_string(
+            CILNode::IntCast {
+                input,
+                target: Int::I16,
+                extend: ExtendKind::ZeroExtend,
+            },
+            &mut asm,
+            &[],
+            &[],
+            sig,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn indirect_store_uses_its_declared_pointee_type() {
+        let rendered = render_pointer_store(false);
+        assert!(
+            rendered.starts_with("*((uint8_t**)("),
+            "store did not retag its address as pointer-to-stored-type: {rendered}"
+        );
+    }
+
+    #[test]
+    fn volatile_indirect_store_preserves_the_same_declared_type() {
+        let rendered = render_pointer_store(true);
+        assert!(
+            rendered.starts_with("*((volatile uint8_t**)("),
+            "volatile store did not retag its address as pointer-to-stored-type: {rendered}"
+        );
+    }
+
+    #[test]
+    fn pointer_addition_uses_native_integer_arithmetic() {
+        let rendered = render_pointer_arithmetic(BinOp::Add);
+        assert!(rendered.contains("(uintptr_t)("));
+        assert!(rendered.contains(" + (uintptr_t)("));
+    }
+
+    #[test]
+    fn pointer_subtraction_uses_native_integer_arithmetic() {
+        let rendered = render_pointer_arithmetic(BinOp::Sub);
+        assert!(rendered.contains("(uintptr_t)("));
+        assert!(rendered.contains(" - (uintptr_t)("));
+    }
+
+    #[test]
+    fn integer_shift_counts_are_masked_to_the_left_operand_width() {
+        assert!(render_integer_shift(BinOp::Shl, Int::I8).contains("& 7"));
+        assert!(render_integer_shift(BinOp::Shr, Int::I16).contains("& 15"));
+        assert!(render_integer_shift(BinOp::ShrUn, Int::I32).contains("& 31"));
+        assert!(render_integer_shift(BinOp::Shl, Int::I64).contains("& 63"));
+        assert!(render_integer_shift(BinOp::Shr, Int::I128).contains("& 127"));
+        assert!(render_integer_shift(BinOp::Shl, Int::USize).contains("sizeof(uintptr_t) * 8"));
+    }
+
+    #[test]
+    fn i16_zero_extension_has_an_explicit_unsigned_intermediate() {
+        assert!(render_i16_zero_extend().starts_with("(int16_t)(uint16_t)("));
     }
 }

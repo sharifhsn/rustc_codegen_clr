@@ -379,7 +379,7 @@ cd_setup(){
   resolve_ilasm 2>/dev/null || true   # not needed for inject-only, but harmless
   local scratch="/tmp/cd_inject_warm.$$"
   rm -rf "$scratch"; mkdir -p "$scratch"
-  printf '[package]\nname = "cd_inject_warm"\nversion = "0.0.0"\nedition = "2021"\n[workspace]\n' > "$scratch/Cargo.toml"
+  printf '[package]\nname = "cd_inject_warm"\nversion = "0.0.0"\nedition = "2024"\n[workspace]\n' > "$scratch/Cargo.toml"
   mkdir -p "$scratch/src"; printf 'fn main(){}\n' > "$scratch/src/main.rs"
   (
     cd "$scratch"

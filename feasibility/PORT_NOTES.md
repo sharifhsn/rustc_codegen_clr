@@ -6,8 +6,8 @@ break the build. This file records the changes made to compile on **`nightly-202
 
 ## How to re-port (the loop)
 
-1. Bump `NIGHTLY` in [`Dockerfile`](Dockerfile) (and note: the repo's `rust-toolchain.toml`
-   pins bare `nightly`, so a host `cargo` grabs *today's* nightly automatically).
+1. Bump `NIGHTLY` in [`Dockerfile`](Dockerfile) and the exact channel in
+   [`rust-toolchain.toml`](../rust-toolchain.toml) together.
 2. `cargo check 2>/tmp/cc.txt; grep -E '^error' /tmp/cc.txt | sort | uniq -c`
 3. For each error, **read the real signature** in the local rustc sources rather than guessing:
    `$(rustc --print sysroot)/lib/rustlib/rustc-src/rust/compiler/…`

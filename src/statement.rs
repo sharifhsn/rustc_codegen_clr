@@ -1,9 +1,9 @@
 use crate::assembly::MethodCompileCtx;
-use crate::rvalue::is_rvalue_unint;
-use crate::utilis::adt::set_discr;
 use crate::place::{place_address, place_get, place_set};
-use crate::r#type::utilis::is_zst;
+use crate::rvalue::is_rvalue_unint;
 use crate::r#type::GetTypeExt;
+use crate::r#type::utilis::is_zst;
+use crate::utilis::adt::set_discr;
 
 use cilly::cilnode::ExtendKind;
 use cilly::{BinOp, Int, Interned};
@@ -32,7 +32,9 @@ pub fn handle_statement<'tcx>(
             let layout = ctx.layout_of(owner_ty);
             //let (disrc_type, _) = adt::enum_tag_info(&layout.layout, tcx);
             let cilly::Type::ClassRef(owner) = owner else {
-                panic!("Nonsense operation: attempted to set the discriminant of type {owner_ty:?}, which is not valid.");
+                panic!(
+                    "Nonsense operation: attempted to set the discriminant of type {owner_ty:?}, which is not valid."
+                );
             };
             //ops.push();
 

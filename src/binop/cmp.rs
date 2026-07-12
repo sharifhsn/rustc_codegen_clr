@@ -1,9 +1,9 @@
-use cilly::{
-    cilnode::{IsPure, MethodKind},
-    Assembly, BinOp, ClassRef, Float, Int, Interned, MethodRef, Type,
-};
 use crate::fn_ctx::MethodCompileCtx;
 use crate::r#type::{get_type, utilis::is_fat_ptr};
+use cilly::{
+    Assembly, BinOp, ClassRef, Float, Int, Interned, MethodRef, Type,
+    cilnode::{IsPure, MethodKind},
+};
 use rustc_middle::ty::{FloatTy, IntTy, Ty, TyKind, UintTy};
 
 type Node = Interned<cilly::ir::CILNode>;

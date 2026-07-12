@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    asm_link::{RelocateCtx, RelocateValue},
     Assembly, Type,
+    asm_link::{RelocateCtx, RelocateValue},
 };
 #[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
 pub struct FnSig {

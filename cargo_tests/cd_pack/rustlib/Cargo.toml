@@ -1,7 +1,7 @@
 [package]
 name = "cd_pack"
 version = "0.3.1"
-edition = "2021"
+edition = "2024"
 description = "Probe crate for the cargo-dotnet-produced NuGet package's metadata (README, license, repository, version, TFM)."
 license = "MIT"
 repository = "https://github.com/sharifhsn/rustc_codegen_clr"

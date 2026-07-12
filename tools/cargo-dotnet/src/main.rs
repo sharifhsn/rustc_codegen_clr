@@ -12,21 +12,28 @@
 //! in-repo bash front-end, which owns the container mount model.
 
 mod artifact;
+mod build_lock;
 mod buildstd;
 mod cli;
 mod context;
-mod doctor;
 mod docker;
+mod doctor;
 mod host;
 mod interop_helpers;
+mod metadata_inputs;
 mod mode;
 mod nuget;
 mod overlays;
 mod pack;
 mod palinject;
+mod parallel_trace;
 mod passthrough;
 mod pipeline;
+mod private_sysroot;
+mod provenance;
 mod publish;
+mod push;
+mod receipt;
 mod run;
 mod rustflags;
 mod scaffold;
@@ -42,6 +49,27 @@ use clap::Parser;
 use cli::{Cmd, DotnetCli};
 
 fn main() -> ExitCode {
+    // Cargo invokes RUSTC_WRAPPER as `<wrapper> <rustc> <args...>`. Re-exec rustc with
+    // the private sysroot forced even for Cargo's discovery probes (`--print sysroot`),
+    // not merely crate compilations that happen to inherit RUSTFLAGS.
+    if let Some(sysroot) = std::env::var_os("CARGO_DOTNET_PRIVATE_SYSROOT") {
+        let mut args = std::env::args_os().skip(1);
+        if let Some(rustc) = args.next() {
+            let status = std::process::Command::new(rustc)
+                .args(args)
+                .arg("--sysroot")
+                .arg(sysroot)
+                .status();
+            return match status {
+                Ok(status) => ExitCode::from(status.code().unwrap_or(1).clamp(0, 255) as u8),
+                Err(error) => {
+                    eprintln!("cargo dotnet rustc wrapper: {error}");
+                    ExitCode::from(1)
+                }
+            };
+        }
+    }
+
     // DUAL INVOCATION (both forms exist in the tree — see cli.rs):
     //   `cargo dotnet <cmd>`  -> argv = [cargo-dotnet, dotnet, <cmd>, ...]  (real cargo dispatch)
     //   `cargo-dotnet <cmd>`  -> argv = [cargo-dotnet, <cmd>, ...]          (dev.sh / MSBuild / direct)
@@ -62,6 +90,13 @@ fn main() -> ExitCode {
     let mut cli = DotnetCli::parse_from(argv);
     inject_prog_args(&mut cli.cmd, prog_args);
 
+    if requires_supported_host(&cli.cmd) {
+        if let Err(error) = host::ensure_supported(&host::HostFacts::detect()) {
+            eprintln!("cargo dotnet: {error}");
+            return ExitCode::from(1);
+        }
+    }
+
     let result = match &cli.cmd {
         Cmd::Build(args) => pipeline::run(args, false),
         Cmd::Run(args) => pipeline::run(args, true),
@@ -70,8 +105,16 @@ fn main() -> ExitCode {
         Cmd::Test(args) => test::run(args),
         Cmd::Setup(args) => setup::run(args),
         Cmd::Pack(args) => pack::run(args),
+        Cmd::Push(args) => push::run(args),
         Cmd::Publish(args) => publish::run(args),
         Cmd::AddNuget(args) => nuget::run(args),
+        Cmd::MetadataInputs(args) => metadata_inputs::run(args),
+        Cmd::ValidateManagedIdentities(args) => {
+            context::validate_managed_identity_set(&args.crate_dirs)
+        }
+        Cmd::ManagedAssemblyName(args) => {
+            context::print_managed_assembly_name(args.path.as_deref())
+        }
     };
 
     match result {
@@ -84,6 +127,20 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn requires_supported_host(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::Build(_)
+            | Cmd::Run(_)
+            | Cmd::Test(_)
+            | Cmd::Setup(_)
+            | Cmd::Pack(_)
+            | Cmd::Publish(_)
+            | Cmd::Push(_)
+            | Cmd::AddNuget(_)
+    )
 }
 
 /// Remove everything at and after the FIRST literal `--` from `argv`, returning the
@@ -114,6 +171,10 @@ fn inject_prog_args(cmd: &mut Cmd, prog_args: Vec<String>) {
         | Cmd::Setup(_)
         | Cmd::Pack(_)
         | Cmd::Publish(_)
-        | Cmd::AddNuget(_) => {}
+        | Cmd::Push(_)
+        | Cmd::AddNuget(_)
+        | Cmd::MetadataInputs(_)
+        | Cmd::ValidateManagedIdentities(_)
+        | Cmd::ManagedAssemblyName(_) => {}
     }
 }

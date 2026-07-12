@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <RustCrate Include="../alpha" Configuration="Release" />
+    <RustCrate Include="../beta" Configuration="Release" />
+    <RustCrate Include="../invalid_custom_assembly" Configuration="Release" />
+  </ItemGroup>
+  <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)' != '' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
+  <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)' == '' and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+</Project>

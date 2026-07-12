@@ -1,6 +1,6 @@
 use cilly::{
-    cilnode::{IsPure, MethodKind},
     Assembly, BinOp, ClassRef, Const, FieldDesc, Float, Int, Interned, MethodRef, Type,
+    cilnode::{IsPure, MethodKind},
 };
 use rustc_abi::{FieldIdx, FieldsShape, Layout, LayoutData, TagEncoding, VariantIdx, Variants};
 use rustc_middle::ty::Ty;
@@ -337,8 +337,7 @@ pub fn get_discr<'tcx>(
                             std::convert::TryInto::<u64>::try_into(niche_start)
                                 .expect("tag is too big to fit within u64"),
                         );
-                        let nc =
-                            crate::casts::int_to_int(Type::Int(Int::U64), disrc_type, nc, ctx);
+                        let nc = crate::casts::int_to_int(Type::Int(Int::U64), disrc_type, nc, ctx);
                         ctx.biop(tag, nc, BinOp::Eq)
                     }
                 }; //bx.icmp(IntPredicate::IntEQ, tag, niche_start);
@@ -390,8 +389,7 @@ pub fn get_discr<'tcx>(
                             std::convert::TryInto::<u64>::try_into(niche_start)
                                 .expect("tag is too big to fit within u64"),
                         );
-                        let ns =
-                            crate::casts::int_to_int(Type::Int(Int::U64), disrc_type, ns, ctx);
+                        let ns = crate::casts::int_to_int(Type::Int(Int::U64), disrc_type, ns, ctx);
                         ctx.biop(tag, ns, BinOp::Sub)
                     }
                 };
@@ -423,8 +421,7 @@ pub fn get_discr<'tcx>(
 
                     _ => {
                         let rm = ctx.alloc_node(u64::from(relative_max));
-                        let rm =
-                            crate::casts::int_to_int(Type::Int(Int::U64), disrc_type, rm, ctx);
+                        let rm = crate::casts::int_to_int(Type::Int(Int::U64), disrc_type, rm, ctx);
                         ctx.biop(relative_discr, rm, BinOp::GtUn)
                     }
                 };
@@ -505,8 +502,7 @@ pub fn get_discr<'tcx>(
             // currently in LLVM this seems to be a pessimization.
 
             let untagged = ctx.alloc_node(u64::from(untagged_variant.as_u32()));
-            let untagged =
-                crate::casts::int_to_int(Type::Int(Int::U64), disrc_type, untagged, ctx);
+            let untagged = crate::casts::int_to_int(Type::Int(Int::U64), disrc_type, untagged, ctx);
             ctx.select(disrc_type, tagged_discr, untagged, is_niche)
         }
     };

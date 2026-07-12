@@ -21,9 +21,9 @@
 //! groups by name, `MatchEvaluator` callbacks) reach for the raw bindings under
 //! [`crate::System::Text::RegularExpressions`].
 
-use crate::system::{DotNetString, MString};
 use crate::System::String as NetString;
 use crate::System::Text::RegularExpressions as bcl;
+use crate::system::{DotNetString, MString};
 
 /// Marshal a Rust `&str` into the managed `System.String` handle the bindings expect.
 #[inline(always)]
@@ -72,11 +72,7 @@ impl Regex {
     pub fn find(&self, input: &str) -> Option<Match> {
         let m = bcl::Regex::r#match(net(input), self.h.to_string());
         let m = Match { h: m };
-        if m.success() {
-            Some(m)
-        } else {
-            None
-        }
+        if m.success() { Some(m) } else { None }
     }
 
     /// All matches in `input`, in order (`Regex.Matches`). Iterate with [`Matches::iter`] / indexing.
@@ -191,11 +187,7 @@ impl Match {
         let m = Match {
             h: self.h.next_match(),
         };
-        if m.success() {
-            Some(m)
-        } else {
-            None
-        }
+        if m.success() { Some(m) } else { None }
     }
 
     /// The raw managed [`Match`](bcl::Match) handle, for lower-level BCL calls.

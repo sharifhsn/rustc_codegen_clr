@@ -1,7 +1,4 @@
-use cilly::{
-    Assembly, ClassRef, Type, bimap::Interned,
-    utilis::escape_class_name,
-};
+use cilly::{Assembly, ClassRef, Type, bimap::Interned, utilis::escape_class_name};
 use rustc_hir::attrs::CrateType;
 use rustc_middle::ty::Const;
 use rustc_middle::ty::List;
@@ -168,19 +165,43 @@ pub fn adt_name<'tcx>(
     tcx: TyCtxt<'tcx>,
     gargs: &'tcx List<GenericArg<'tcx>>,
 ) -> String {
-    //TODO: find a better way to get adt instances!
-    let krate = adt.did().krate;
-    let adt_instance = instance_try_resolve(adt.did(), tcx, gargs);
-    // Get the mangled path: it is absolute, and not poluted by types being rexported
-    let auto_mangled =
-        rustc_symbol_mangling::symbol_name_for_instance_in_crate(tcx, adt_instance, krate);
-    // Then, demangle the type name, converting it to a Rust-style one (eg. `core::option::Option::h8zc8s`)
-    let demangled = rustc_demangle::demangle(&auto_mangled);
-    // Using formating preserves the generic hash.
-    let demangled = format!("{demangled}");
-    // Replace Rust namespace(module) spearators with C# ones.
-    let dotnet_class_name = demangled.replace("::", ".");
-    escape_class_name(&dotnet_class_name)
+    // Do not manufacture an `Instance` merely to ask the symbol mangler for presentation text.
+    // ADTs are definitions, not callable instances, and forcing them through instance resolution
+    // is both fallible and conceptually the wrong identity layer. `def_path_str` supplies the stable,
+    // crate-qualified readable prefix directly.
+    let display_name = readable_def_path(tcx, adt.did());
+
+    // Presentation names are not identities: macro-generated local ADTs can have the same
+    // readable path while still being distinct DefIds (serde_with emits several local
+    // `__DeserializeWith` structs this way). The identity must also include generic arguments:
+    // `Result<LocalA, E>` and `Result<LocalB, E>` share Result's DefId and can have identical
+    // demangled presentation text. `type_id_hash` is rustc's deterministic identity for the fully
+    // instantiated type: it incorporates each definition's DefPathHash and recursively hashes the
+    // instantiated arguments with regions erased. Keep the readable prefix, but always key internal
+    // types by that full identity.
+    let instantiated = Ty::new_adt(tcx, adt, gargs);
+    let type_identity = format!("{:032x}", tcx.type_id_hash(instantiated));
+    internal_adt_name(&display_name, &type_identity)
+}
+
+fn internal_adt_name(display_name: &str, type_identity: &str) -> String {
+    let readable = display_name.replace("::", ".");
+    escape_class_name(&format!("{readable}.tid_{type_identity}"))
+}
+
+/// Builds a crate-qualified readable path directly from rustc's stable definition data.
+///
+/// Unlike `TyCtxt::def_path_str`, this never enters the diagnostic-only `trimmed_def_paths` query,
+/// which is invalid during backend codegen because that query promises to emit a diagnostic. The
+/// full type hash remains the actual internal identity; this path is presentation only.
+fn readable_def_path(tcx: TyCtxt<'_>, did: DefId) -> String {
+    let path = tcx.def_path(did);
+    let mut rendered = tcx.crate_name(path.krate).to_string();
+    for component in path.data {
+        rendered.push_str("::");
+        rendered.push_str(component.as_sym(false).as_str());
+    }
+    rendered
 }
 /// Like [`adt_name`], but produces a **stable, de-mangled** public name (e.g. `rust_export.Point`
 /// instead of the symbol-mangled `rust_export[<hash>].Point`) for types that form a library's
@@ -216,6 +237,12 @@ pub fn stable_adt_name<'tcx>(
     if !adt.did().is_local() {
         return None;
     }
+    // A stable, hash-free name is an interop ABI promise. Preserve it for public exported types,
+    // but keep private/compiler-generated helpers on the identity-bearing `adt_name` path so two
+    // distinct DefPathHashes can never collapse into one CLR class.
+    if !tcx.visibility(adt.did()).is_public() {
+        return None;
+    }
     // (2) Monomorphized generics must stay mangled (one `AdtDef`, many instantiations).
     if gargs
         .iter()
@@ -224,23 +251,37 @@ pub fn stable_adt_name<'tcx>(
         return None;
     }
     // (3) Only export artifacts de-mangle. Executables (the gate) and rlibs (build-std deps) do not.
-    let is_export_artifact = tcx
-        .crate_types()
-        .iter()
-        .any(|ct| matches!(ct, CrateType::Cdylib | CrateType::Dylib | CrateType::StaticLib));
+    let is_export_artifact = tcx.crate_types().iter().any(|ct| {
+        matches!(
+            ct,
+            CrateType::Cdylib | CrateType::Dylib | CrateType::StaticLib
+        )
+    });
     if !is_export_artifact {
         return None;
     }
     // Build a clean, stable name from the definition path (no symbol-mangling hash). Always qualify
     // with the crate name so the C# type lands in a `Crate.Module.Type` namespace.
-    let krate = tcx.crate_name(adt.did().krate);
-    let def_path = tcx.def_path_str(adt.did());
-    let qualified = if def_path.starts_with(krate.as_str()) {
-        def_path
-    } else {
-        format!("{krate}::{def_path}")
-    };
-    Some(escape_class_name(&qualified))
+    Some(escape_class_name(&readable_def_path(tcx, adt.did())))
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::internal_adt_name;
+
+    #[test]
+    fn same_display_name_with_different_def_path_hashes_stays_distinct() {
+        let left = internal_adt_name("crate::f::__DeserializeWith", "11112222");
+        let right = internal_adt_name("crate::f::__DeserializeWith", "33334444");
+        assert_ne!(left, right);
+    }
+
+    #[test]
+    fn same_type_identity_is_deterministic_across_codegen_shards() {
+        let left = internal_adt_name("crate::f::__DeserializeWith", "11112222");
+        let right = internal_adt_name("crate::f::__DeserializeWith", "11112222");
+        assert_eq!(left, right);
+    }
 }
 // WARNING: this is *wrong*: For some reason, `Instance::try_resolve` should not operate on structs(why?), and this just silences the newly introduced warning.
 // Root cause not understood — this is a `.unwrap().unwrap()` around `resolve_instance_raw`
@@ -267,9 +308,6 @@ pub fn resolve_const_size(size: Const) -> Result<usize, &'static str> {
         Some(value) => Ok(value),
         None => Err("Can't resolve scalar array size!"),
     }?;
-    let value = value
-        .try_to_leaf()
-        .unwrap()
-        .to_u64();
+    let value = value.try_to_leaf().unwrap().to_u64();
     Ok(usize::try_from(value).expect("Const size value too big."))
 }

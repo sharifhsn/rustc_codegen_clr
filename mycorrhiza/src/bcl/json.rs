@@ -119,11 +119,12 @@ fn net(s: &str) -> MString {
 /// Whether a `JsonNode` handle is a managed `null` reference. `JsonNode` overloads `==` in C#
 /// (value-ish comparison) but does **not** expose a static `op_Equality` methodref usable here, so
 /// reference-null is tested with `System.Object.ReferenceEquals(node, null)` — a CoreLib static that
-/// works for any reference type. The `JsonNode` handle upcasts to `System.Object` (both are
-/// pointer-sized object-reference handles), so the reinterpret is sound.
+/// works for any reference type. The `JsonNode` handle is upcast to `System.Object` with a real CLR
+/// `castclass`; managed references are typed GC roots and must never cross this boundary through a
+/// native pointer reinterpretation, even though both Rust marker handles are pointer-sized.
 #[inline(always)]
 fn node_is_null(h: NodeHandle) -> bool {
-    let obj: MObject = unsafe { core::mem::transmute::<NodeHandle, MObject>(h) };
+    let obj = crate::intrinsics::rustc_clr_interop_managed_checked_cast::<MObject, NodeHandle>(h);
     MObject::static2::<"ReferenceEquals", MObject, MObject, bool>(obj, MObject::null())
 }
 
@@ -198,7 +199,10 @@ impl Json {
         if self.kind() != Kind::Object {
             return None;
         }
-        Self::wrap(self.h.instance1::<"get_Item", MString, NodeHandle>(net(name)))
+        Self::wrap(
+            self.h
+                .instance1::<"get_Item", MString, NodeHandle>(net(name)),
+        )
     }
 
     /// The element at `idx` for an **array** node (`JsonNode.get_Item(int)`), or `None` if this is
@@ -215,10 +219,13 @@ impl Json {
         if self.kind() != Kind::Array {
             return 0;
         }
-        // `JsonArray` is-a `JsonNode`; the underlying managed reference is identical and both handle
-        // aliases are the same `RustcCLRInteropManagedClass` layout (one pointer-sized field), so
-        // reinterpreting the handle as `JsonArray` to reach its `get_Count` member is sound.
-        let arr: ArrayHandle = unsafe { core::mem::transmute::<NodeHandle, ArrayHandle>(self.h) };
+        // `JsonArray` is-a `JsonNode`, and the kind guard above proves this downcast is valid. Use a
+        // real CLR `castclass`: a native `transmute` would reinterpret a typed GC reference through
+        // raw-pointer CIL and is correctly rejected by the final verifier.
+        let arr = crate::intrinsics::rustc_clr_interop_managed_checked_cast::<
+            ArrayHandle,
+            NodeHandle,
+        >(self.h);
         arr.instance0::<"get_Count", i32>()
     }
 
@@ -312,5 +319,26 @@ impl core::fmt::Display for Json {
     /// The re-serialized JSON (`ToJsonString`).
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(&self.to_json_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn managed_reference_conversions_use_checked_casts() {
+        let source = include_str!("json.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source before tests");
+
+        assert!(
+            production.contains("rustc_clr_interop_managed_checked_cast::<MObject, NodeHandle>(h)")
+        );
+        assert!(production.contains(
+            "rustc_clr_interop_managed_checked_cast::<\n            ArrayHandle,\n            NodeHandle,"
+        ));
+        assert!(!production.contains("transmute::<NodeHandle, MObject>"));
+        assert!(!production.contains("transmute::<NodeHandle, ArrayHandle>"));
     }
 }

@@ -24,6 +24,7 @@
 //! the surfaced members, reach for the raw handle (each wrapper exposes a `handle()` escape hatch) and
 //! call the low-level bindings directly.
 
+pub mod dateonly;
 pub mod datetime;
 pub mod decimal;
 pub mod environment;

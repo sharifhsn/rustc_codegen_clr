@@ -15,8 +15,9 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    parse_macro_input, punctuated::Punctuated, spanned::Spanned, FnArg, ImplItem, ItemFn, ItemImpl,
-    ItemStruct, ItemTrait, LitBool, LitStr, MetaNameValue, ReturnType, Token, TraitItem, Type,
+    Expr, FnArg, ImplItem, ItemFn, ItemImpl, ItemStruct, ItemTrait, Lit, LitBool, LitStr,
+    MetaNameValue, ReturnType, Token, TraitItem, Type, parse_macro_input, punctuated::Punctuated,
+    spanned::Spanned,
 };
 
 /// Split a `"[Assembly]Namespace.Type"` spec into `(assembly, type_name)`. An empty/`[]`-less spec
@@ -40,7 +41,10 @@ fn split_dotnet_ref(spec: &str) -> (String, String) {
 fn split_generic_suffix(spec: &str) -> (String, Option<String>) {
     if let Some(open) = spec.find('<') {
         if let Some(inner) = spec.strip_suffix('>') {
-            return (spec[..open].to_string(), Some(inner[open + 1..].to_string()));
+            return (
+                spec[..open].to_string(),
+                Some(inner[open + 1..].to_string()),
+            );
         }
     }
     (spec.to_string(), None)
@@ -662,6 +666,157 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
     expanded.into()
+}
+
+/// Declares a conventional managed data-transfer object.
+///
+/// This is deliberately only validating sugar for
+/// `#[dotnet_class(default_ctor = true, properties = true)]`: it emits a managed class with a
+/// parameterless constructor and ordinary read/write CLR properties. It does not imply or generate
+/// serialization behavior.
+fn dto_backing_name(name: &str) -> String {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    if first.is_ascii_uppercase() {
+        format!("{}{}", first.to_ascii_lowercase(), chars.as_str())
+    } else {
+        name.to_owned()
+    }
+}
+
+#[proc_macro_attribute]
+pub fn dotnet_dto(attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[dotnet_dto] does not accept arguments; use #[dotnet_class(...)] for custom class options",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    // Validate here so diagnostics name the DTO surface before delegating to the established class
+    // expansion. `dotnet_class` parses it again and remains the single implementation path.
+    let mut parsed = parse_macro_input!(item as ItemStruct);
+    if !matches!(parsed.fields, syn::Fields::Named(_)) {
+        return syn::Error::new_spanned(
+            parsed,
+            "#[dotnet_dto] requires a struct with named fields",
+        )
+        .to_compile_error()
+        .into();
+    }
+    // A DTO schema often spells fields in their exact public CLR PascalCase. Keeping that spelling
+    // for the backing field would expose two same-named members (field + generated property), which
+    // Roslyn reports as CS0229. Internally normalize only an initial ASCII capital to lower-camel;
+    // `properties = true` capitalizes it again for the public property, preserving the schema name.
+    // Existing idiomatic lowercase Rust fields are unchanged.
+    for field in &mut parsed.fields {
+        let Some(ident) = &mut field.ident else {
+            continue;
+        };
+        let name = ident.to_string();
+        let backing = dto_backing_name(&name);
+        if backing != name {
+            *ident = syn::Ident::new(&backing, ident.span());
+        }
+    }
+    let dto_name = parsed.ident.clone();
+    let dto_handle = format_ident!("{}Handle", dto_name);
+    let dto_name_lit = LitStr::new(&dto_name.to_string(), dto_name.span());
+    let fields = parsed.fields.iter().collect::<Vec<_>>();
+    let field_names = fields
+        .iter()
+        .map(|field| field.ident.clone().expect("named fields were validated"))
+        .collect::<Vec<_>>();
+    let field_types = fields
+        .iter()
+        .map(|field| field.ty.clone())
+        .collect::<Vec<_>>();
+    let arg_types = (0..fields.len())
+        .map(|index| format_ident!("Arg{index}"))
+        .collect::<Vec<_>>();
+    let ctor_magic = format_ident!("rustc_clr_interop_managed_ctor{}_", fields.len());
+    let class_expansion = proc_macro2::TokenStream::from(dotnet_class(
+        quote!(default_ctor = true, properties = true).into(),
+        quote!(#parsed).into(),
+    ));
+    quote! {
+        #class_expansion
+
+        impl #dto_name {
+            /// Construct the fully initialized managed DTO through its generated primary CLR
+            /// constructor. The bridge arity is derived from the schema, so large DTOs do not need
+            /// a hand-written setter sequence or a fixed ctor0..ctor3 helper ladder.
+            #[allow(non_snake_case, dead_code, unused_variables, internal_features)]
+            pub fn new_managed(#(#field_names: #field_types),*) -> #dto_handle {
+                #[inline(never)]
+                fn #ctor_magic<
+                    const ASSEMBLY: &'static str,
+                    const CLASS_PATH: &'static str,
+                    const IS_VALUETYPE: bool,
+                    #(#arg_types),*
+                >(
+                    #(#field_names: #arg_types),*
+                ) -> ::mycorrhiza::intrinsics::RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH> {
+                    loop { ::core::hint::spin_loop(); }
+                }
+                #ctor_magic::<"", #dto_name_lit, false, #(#field_types),*>(#(#field_names),*)
+            }
+        }
+    }
+    .into()
+}
+
+#[cfg(test)]
+mod dotnet_export_name_tests {
+    use super::{dotnet_export_member_id, dto_backing_name, parse_dotnet_export_args};
+    use quote::quote;
+
+    #[test]
+    fn accepts_an_ordinary_managed_name() {
+        assert_eq!(
+            parse_dotnet_export_args(quote!(name = "ParsePosition"))
+                .unwrap()
+                .name,
+            Some("ParsePosition".to_string()),
+        );
+    }
+
+    #[test]
+    fn dto_pascal_schema_name_uses_a_distinct_lower_camel_backing_field() {
+        assert_eq!(dto_backing_name("FirmNumber"), "firmNumber");
+        assert_eq!(dto_backing_name("amount"), "amount");
+    }
+
+    #[test]
+    fn preserves_the_legacy_no_argument_form() {
+        assert_eq!(parse_dotnet_export_args(quote!()).unwrap().name, None);
+    }
+
+    #[test]
+    fn rejects_non_csharp_identifier_names() {
+        let error = parse_dotnet_export_args(quote!(name = "parse-position")).unwrap_err();
+        assert!(error.to_string().contains("ASCII C# identifier"));
+    }
+
+    #[test]
+    fn accepts_exception_policy_with_a_managed_name() {
+        let args =
+            parse_dotnet_export_args(quote!(name = "TryParse", error = "exception")).unwrap();
+        assert_eq!(args.name.as_deref(), Some("TryParse"));
+        assert!(args.error_exception);
+    }
+
+    #[test]
+    fn xml_member_ids_use_the_configured_managed_name() {
+        assert_eq!(
+            dotnet_export_member_id("ParsePosition", &["System.String".to_string()]),
+            "M:MainModule.ParsePosition(System.String)"
+        );
+    }
 }
 
 // ============================================================================
@@ -1318,7 +1473,15 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
             ReturnType::Type(_, ty) => Some((**ty).clone()),
         };
         let generic = !m.sig.generics.params.is_empty();
-        dim_callees.insert(m.sig.ident.to_string(), DimCallee { arg_tys, ret_ty, byref, generic });
+        dim_callees.insert(
+            m.sig.ident.to_string(),
+            DimCallee {
+                arg_tys,
+                ret_ty,
+                byref,
+                generic,
+            },
+        );
     }
 
     // One signature-carrier fn + one `add_abstract_method_def` call per trait method — or, for a
@@ -1331,14 +1494,17 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Every .NET member name this interface declares (plain methods AND synthesized event
     // accessors). A duplicate would silently emit two identically-named `MethodDef`s — reject it
     // loudly instead (the synthesized `add_`/`remove_` names are the non-obvious collision).
-    let mut member_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut member_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     // The `get_`/`set_` halves each `#[dotnet_property]` declares, keyed by property name in
     // DECLARATION order (a Vec, not a HashMap — validation errors below must fire
     // deterministically). Each half records the accessor fn's span for error placement. Validated
     // as a whole after the member loop: a setter without a getter (write-only property) and an
     // UNMARKED member squatting on a property's name or reserved accessor names are rejected.
-    let mut property_members: Vec<(String, (Option<proc_macro2::Span>, Option<proc_macro2::Span>))> =
-        Vec::new();
+    let mut property_members: Vec<(
+        String,
+        (Option<proc_macro2::Span>, Option<proc_macro2::Span>),
+    )> = Vec::new();
     for it in &mut input.items {
         let TraitItem::Fn(m) = it else {
             return syn::Error::new(
@@ -1776,17 +1942,14 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // carrier clone is rewritten.
                     let mut carrier_pt = pt.clone();
                     if !all_param_index.is_empty() {
-                        if let Some(idx) =
-                            bare_generic_param(&carrier_pt.ty, &method_param_index)
-                        {
+                        if let Some(idx) = bare_generic_param(&carrier_pt.ty, &method_param_index) {
                             // `is_event && !method_type_params.is_empty()` was rejected above —
                             // a method-generic marker can't reach an event's carrier.
                             let idx_lit = proc_macro2::Literal::usize_unsuffixed(idx);
                             carrier_pt.ty = Box::new(syn::parse_quote!(
                                 ::mycorrhiza::intrinsics::RustcCLRInteropMethodGeneric<#idx_lit>
                             ));
-                        } else if let Some(idx) = bare_generic_param(&carrier_pt.ty, &param_index)
-                        {
+                        } else if let Some(idx) = bare_generic_param(&carrier_pt.ty, &param_index) {
                             if is_event {
                                 return syn::Error::new(
                                     pt.ty.span(),
@@ -1964,7 +2127,9 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 }
             }
-            let slot_idx = property_members.iter().position(|(name, _)| name == prop_name);
+            let slot_idx = property_members
+                .iter()
+                .position(|(name, _)| name == prop_name);
             let idx = slot_idx.unwrap_or_else(|| {
                 property_members.push((prop_name.clone(), (None, None)));
                 property_members.len() - 1
@@ -1974,9 +2139,7 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                 if getter_span.is_some() {
                     return syn::Error::new(
                         fn_ident.span(),
-                        format!(
-                            "#[dotnet_interface]: property `{prop_name}` declares two getters"
-                        ),
+                        format!("#[dotnet_interface]: property `{prop_name}` declares two getters"),
                     )
                     .to_compile_error()
                     .into();
@@ -1986,9 +2149,7 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                 if setter_span.is_some() {
                     return syn::Error::new(
                         fn_ident.span(),
-                        format!(
-                            "#[dotnet_interface]: property `{prop_name}` declares two setters"
-                        ),
+                        format!("#[dotnet_interface]: property `{prop_name}` declares two setters"),
                     )
                     .to_compile_error()
                     .into();
@@ -2097,8 +2258,7 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
             // `MethodDef` aliasing this fn — same pipeline as a `#[dotnet_class]` virtual, just
             // owned by an interface `TypeDef`. The trait itself is re-emitted verbatim (original
             // body intact), so Rust-side trait semantics are unchanged.
-            if let Some(err) =
-                declare_member(fn_ident.to_string(), format!("method `{fn_ident}`"))
+            if let Some(err) = declare_member(fn_ident.to_string(), format!("method `{fn_ident}`"))
             {
                 return err;
             }
@@ -2110,11 +2270,11 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .first_mut()
                 .expect("instance member: carrier_inputs always starts with the receiver") =
                 syn::parse_quote!(this: #handle_ident);
-            let mut body = m
-                .default
-                .clone()
-                .expect("has_default was just checked");
-            let mut rewriter = DimRewriter { callees: &dim_callees, errors: Vec::new() };
+            let mut body = m.default.clone().expect("has_default was just checked");
+            let mut rewriter = DimRewriter {
+                callees: &dim_callees,
+                errors: Vec::new(),
+            };
             syn::visit_mut::VisitMut::visit_block_mut(&mut rewriter, &mut body);
             if let Some(err) = rewriter.errors.into_iter().reduce(|mut a, b| {
                 a.combine(b);
@@ -2168,8 +2328,7 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                 >(class, #dim_ident);
             });
         } else {
-            if let Some(err) =
-                declare_member(fn_ident.to_string(), format!("method `{fn_ident}`"))
+            if let Some(err) = declare_member(fn_ident.to_string(), format!("method `{fn_ident}`"))
             {
                 return err;
             }
@@ -2503,6 +2662,58 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
             .to_compile_error()
             .into();
         }
+        // `#[dotnet(name = "PascalCase")]` keeps the Rust implementation idiomatically
+        // snake_case while choosing the public CLR member name. This mirrors `#[dotnet_export]`'s
+        // name option but applies to methods attached to a generated class.
+        let mut managed_method_name = f.sig.ident.to_string();
+        let mut saw_dotnet_name = false;
+        for attr in &f.attrs {
+            if attr.path().is_ident("dotnet") {
+                if saw_dotnet_name {
+                    return syn::Error::new(
+                        attr.span(),
+                        "duplicate #[dotnet(...)] method attribute",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                let tokens = match &attr.meta {
+                    syn::Meta::List(list) => list.tokens.clone(),
+                    _ => {
+                        return syn::Error::new(
+                            attr.span(),
+                            "#[dotnet(name = \"ManagedName\")]: expected a name argument",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                };
+                let args = match parse_dotnet_export_args(tokens) {
+                    Ok(args) if !args.error_exception => args,
+                    Ok(_) => {
+                        return syn::Error::new(
+                            attr.span(),
+                            "#[dotnet_methods] only supports #[dotnet(name = \"ManagedName\")]",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                    Err(error) => return error.to_compile_error().into(),
+                };
+                let Some(name) = args.name else {
+                    return syn::Error::new(
+                        attr.span(),
+                        "#[dotnet(name = \"ManagedName\")]: name is required",
+                    )
+                    .to_compile_error()
+                    .into();
+                };
+                managed_method_name = name;
+                saw_dotnet_name = true;
+            }
+        }
+        f.attrs
+            .retain(|attribute| !attribute.path().is_ident("dotnet"));
         // `#[dotnet_override("[Asm]Ns.BaseType")]` — an explicit ECMA-335 `.override` of that base
         // type's same-named virtual (see `rustc_codegen_clr_mark_last_method_override`'s doc for
         // the intentionally narrow scope). Stripped from the method before `#input` is re-emitted
@@ -2556,7 +2767,7 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
         f.attrs.retain(|a| !a.path().is_ident("dotnet_event"));
         let event_role = match &event_name {
             Some(_) => {
-                let fn_name = f.sig.ident.to_string();
+                let fn_name = managed_method_name.as_str();
                 if fn_name.starts_with("add_") {
                     Some(true)
                 } else if fn_name.starts_with("remove_") {
@@ -2576,7 +2787,7 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let fn_ident = &f.sig.ident;
-        let fname_lit = LitStr::new(&fn_ident.to_string(), fn_ident.span());
+        let fname_lit = LitStr::new(&managed_method_name, fn_ident.span());
 
         // Decide static vs instance by the first parameter's type. A `self` receiver is rejected — the
         // alias must target a static symbol, so instance methods take the handle explicitly.
@@ -2593,7 +2804,7 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // never dispatch it as instance just because its first param happens to be `<Name>Handle`
         // (a binary operator's left-hand operand naturally has that shape, e.g. `op_Addition(a:
         // Vector2Handle, b: Vector2Handle)`). Checked BEFORE the handle-shape heuristic so it wins.
-        let is_operator_name = CLR_OPERATOR_METHOD_NAMES.contains(&fn_ident.to_string().as_str());
+        let is_operator_name = CLR_OPERATOR_METHOD_NAMES.contains(&managed_method_name.as_str());
         let first_is_handle = !is_operator_name
             && matches!(
                 f.sig.inputs.first(),
@@ -2688,7 +2899,10 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     quote! { #pname: #ty }
                 })
                 .collect();
-            let pre_call: Vec<_> = param_plans.iter().filter_map(|p| p.pre_call.clone()).collect();
+            let pre_call: Vec<_> = param_plans
+                .iter()
+                .filter_map(|p| p.pre_call.clone())
+                .collect();
             let call_args: Vec<_> = param_plans.iter().map(|p| p.call_arg.clone()).collect();
             shim_items.push(quote! {
                 #[inline(never)]
@@ -2857,7 +3071,7 @@ fn type_last_ident_is(ty: &Type, name: &str) -> bool {
 /// How one Rust param/return type crosses the managed seam: the CIL-visible type the shim uses, plus
 /// the code that converts between it and the idiomatic Rust type.
 struct Marshal {
-    /// The type the `#[no_mangle] extern "C"` shim uses at the seam (what C# sees).
+    /// The type the `#[unsafe(no_mangle)] extern "C"` shim uses at the seam (what C# sees).
     seam_ty: proc_macro2::TokenStream,
     /// Given a binding `#id` of `seam_ty`, produce an expression of the idiomatic Rust type to pass
     /// to the inner fn. `None` means "pass `#id` through unchanged" (identity marshalling). A boxed
@@ -2937,6 +3151,32 @@ fn single_generic_arg(ty: &Type) -> Option<(String, &Type)> {
         return None;
     };
     Some((seg.ident.to_string(), inner))
+}
+
+/// If `ty` is `Result<T, E>` (possibly path-qualified), return its two type arguments.
+fn result_args(ty: &Type) -> Option<(&Type, &Type)> {
+    let Type::Path(tp) = ty else { return None };
+    if tp.qself.is_some() {
+        return None;
+    }
+    let seg = tp.path.segments.last()?;
+    if seg.ident != "Result" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    let mut args = args.args.iter();
+    let syn::GenericArgument::Type(ok) = args.next()? else {
+        return None;
+    };
+    let syn::GenericArgument::Type(err) = args.next()? else {
+        return None;
+    };
+    if args.next().is_some() {
+        return None;
+    }
+    Some((ok, err))
 }
 
 /// True if `ty` is a plain (possibly path-qualified) reference to `mycorrhiza::task::Task` — the
@@ -3382,7 +3622,11 @@ fn scrape_doc_comment(attrs: &[syn::Attribute]) -> Option<String> {
             continue;
         }
         if let syn::Meta::NameValue(MetaNameValue {
-            value: syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }),
+            value:
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(s),
+                    ..
+                }),
             ..
         }) = &attr.meta
         {
@@ -3461,19 +3705,33 @@ fn clr_member_id_type_name(ty: &Type) -> Option<&'static str> {
 /// `<CARGO_MANIFEST_DIR>/target/dotnet_xmldoc/<crate_name>.xmldoc.jsonl`. The proc-macro runs once
 /// per fn at the consumer's compile time, so appending (not overwriting) is required; cargo-dotnet's
 /// build stage clears stale entries by deleting the file up front (see `xmldoc::collect`).
-fn emit_xmldoc_entry(fn_name: &syn::Ident, params: &[String], doc: &str) {
-    let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") else { return };
-    let Ok(crate_name) = std::env::var("CARGO_PKG_NAME") else { return };
-    let member_id = format!("M:MainModule.{}({})", fn_name, params.join(","));
+fn dotnet_export_member_id(managed_name: &str, params: &[String]) -> String {
+    format!("M:MainModule.{}({})", managed_name, params.join(","))
+}
 
-    let dir = std::path::Path::new(&manifest_dir).join("target").join("dotnet_xmldoc");
+fn emit_xmldoc_entry(managed_name: &str, params: &[String], doc: &str) {
+    let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") else {
+        return;
+    };
+    let Ok(crate_name) = std::env::var("CARGO_PKG_NAME") else {
+        return;
+    };
+    let member_id = dotnet_export_member_id(managed_name, params);
+
+    let dir = std::path::Path::new(&manifest_dir)
+        .join("target")
+        .join("dotnet_xmldoc");
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
     let file_path = dir.join(format!("{crate_name}.xmldoc.jsonl"));
     let entry = serde_json_line(&member_id, doc);
     use std::io::Write as _;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&file_path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file_path)
+    {
         let _ = writeln!(f, "{entry}");
     }
 }
@@ -3496,7 +3754,97 @@ fn serde_json_line(member: &str, summary: &str) -> String {
         }
         out
     }
-    format!("{{\"member\":\"{}\",\"summary\":\"{}\"}}", escape(member), escape(summary))
+    format!(
+        "{{\"member\":\"{}\",\"summary\":\"{}\"}}",
+        escape(member),
+        escape(summary)
+    )
+}
+
+/// Parse the optional `name = "ManagedName"` override accepted by `#[dotnet_export]`.
+///
+/// The value deliberately has a narrower contract than raw CLI metadata: it must be an ASCII C#
+/// identifier, so every accepted value is callable as an ordinary C# member without reflection,
+/// escaping, or generated-source quoting. The Rust function identifier is never changed.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct DotnetExportArgs {
+    name: Option<String>,
+    error_exception: bool,
+}
+
+fn parse_dotnet_export_args(attr: proc_macro2::TokenStream) -> syn::Result<DotnetExportArgs> {
+    if attr.is_empty() {
+        return Ok(DotnetExportArgs::default());
+    }
+
+    let parser = Punctuated::<MetaNameValue, Token![,]>::parse_terminated;
+    let entries = syn::parse::Parser::parse2(parser, attr)?;
+    let mut parsed = DotnetExportArgs::default();
+    for entry in entries {
+        if entry.path.is_ident("name") {
+            if parsed.name.is_some() {
+                return Err(syn::Error::new(
+                    entry.path.span(),
+                    "#[dotnet_export]: `name` may be specified only once",
+                ));
+            }
+            let Expr::Lit(expr_lit) = entry.value else {
+                return Err(syn::Error::new(
+                    entry.path.span(),
+                    "#[dotnet_export]: `name` must be a string literal",
+                ));
+            };
+            let Lit::Str(name) = expr_lit.lit else {
+                return Err(syn::Error::new(
+                    expr_lit.lit.span(),
+                    "#[dotnet_export]: `name` must be a string literal",
+                ));
+            };
+            let value = name.value();
+            let mut chars = value.chars();
+            let valid = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !valid {
+                return Err(syn::Error::new(
+                    name.span(),
+                    "#[dotnet_export]: `name` must be a non-empty ASCII C# identifier",
+                ));
+            }
+            parsed.name = Some(value);
+        } else if entry.path.is_ident("error") {
+            if parsed.error_exception {
+                return Err(syn::Error::new(
+                    entry.path.span(),
+                    "#[dotnet_export]: `error` may be specified only once",
+                ));
+            }
+            let Expr::Lit(expr_lit) = entry.value else {
+                return Err(syn::Error::new(
+                    entry.path.span(),
+                    "#[dotnet_export]: `error` must be the string literal \"exception\"",
+                ));
+            };
+            let Lit::Str(policy) = expr_lit.lit else {
+                return Err(syn::Error::new(
+                    expr_lit.lit.span(),
+                    "#[dotnet_export]: `error` must be the string literal \"exception\"",
+                ));
+            };
+            if policy.value() != "exception" {
+                return Err(syn::Error::new(
+                    policy.span(),
+                    "#[dotnet_export]: unsupported error policy; expected `error = \"exception\"`",
+                ));
+            }
+            parsed.error_exception = true;
+        } else {
+            return Err(syn::Error::new(
+                entry.path.span(),
+                "#[dotnet_export]: unknown attribute key; expected `name = \"ManagedName\"` or `error = \"exception\"`",
+            ));
+        }
+    }
+    Ok(parsed)
 }
 
 /// `#[dotnet_export]` on a free function — makes it callable from C# as a plain, typed method on
@@ -3509,8 +3857,10 @@ fn serde_json_line(member: &str, summary: &str) -> String {
 /// pub fn greet(name: &str) -> String { format!("Hello, {name}!") }
 /// ```
 ///
-/// and C# calls `MainModule.greet("x")`, getting back a `string`. The macro leaves the original fn
-/// untouched (still callable from Rust) and emits a hidden `#[no_mangle] extern "C"` **shim** that
+/// and C# calls `MainModule.greet("x")`, getting back a `string`. To expose an idiomatic managed
+/// name while preserving the Rust API, write `#[dotnet_export(name = "Greet")]`; C# then calls
+/// `MainModule.Greet("x")` while Rust still calls `greet`. The macro leaves the original fn
+/// untouched (still callable from Rust) and emits a hidden `#[unsafe(no_mangle)] extern "C"` **shim** that
 /// crosses the managed seam: each supported argument/return type is marshalled to/from its
 /// CIL-visible form. `&str`/`String` cross as a real managed `System.String` (so C# sees `string`,
 /// not a pointer pair); the numeric/`bool` primitives pass through unchanged.
@@ -3518,7 +3868,11 @@ fn serde_json_line(member: &str, summary: &str) -> String {
 /// The consuming `cdylib` must depend on `mycorrhiza`. Types outside the supported set produce a
 /// clear compile error (marshalling is never faked).
 #[proc_macro_attribute]
-pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let export_args = match parse_dotnet_export_args(attr.into()) {
+        Ok(args) => args,
+        Err(error) => return error.to_compile_error().into(),
+    };
     let func = parse_macro_input!(item as ItemFn);
     let sig = &func.sig;
 
@@ -3546,12 +3900,27 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
     if let Some(v) = &sig.variadic {
-        return syn::Error::new(v.span(), "#[dotnet_export]: variadic functions cannot be exported")
-            .to_compile_error()
-            .into();
+        return syn::Error::new(
+            v.span(),
+            "#[dotnet_export]: variadic functions cannot be exported",
+        )
+        .to_compile_error()
+        .into();
     }
 
     let fn_name = sig.ident.clone();
+    let (managed_name, export_attribute) = match export_args.name {
+        Some(managed_name) => {
+            let name_literal = LitStr::new(&managed_name, fn_name.span());
+            (
+                managed_name,
+                quote! { #[unsafe(export_name = #name_literal)] },
+            )
+        }
+        // Preserve the established no-argument expansion exactly, including the `no_mangle`
+        // marker that older backend versions use to classify exports.
+        None => (fn_name.to_string(), quote! { #[unsafe(no_mangle)] }),
+    };
     let shim_mod = format_ident!("__dotnet_export_{}", fn_name);
 
     // Marshal each parameter. `receiver` (self) is rejected — only free functions are exportable.
@@ -3606,20 +3975,51 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // ECMA-334 member-ID this fn resolves to as a `MainModule` static method. Best-effort: any
     // failure to write is silently ignored (never fails the actual compile over doc generation).
     if let Some(doc) = scrape_doc_comment(&func.attrs) {
-        emit_xmldoc_entry(&fn_name, &doc_param_types, &doc);
+        emit_xmldoc_entry(&managed_name, &doc_param_types, &doc);
     }
 
     // Marshal the return type. `returns_managed_handle` (Task/TaskT<T>) picks a different
     // `catch_unwind` shape below — see that field's doc comment on `Marshal` for why.
+    let mut result_error_ty = None;
     let (seam_ret, ret_expr, ret_ty_for_slot, returns_managed_handle) = match &sig.output {
         ReturnType::Default => (quote! {}, quote! { __ret }, None, false), // `-> ()`; identity.
         ReturnType::Type(_, ty) => {
-            let marshal = match marshal_return(ty) {
+            let marshal_ty = if let Some((ok_ty, error_ty)) = result_args(ty) {
+                if !export_args.error_exception {
+                    return syn::Error::new(
+                        ty.span(),
+                        "#[dotnet_export]: `Result<T, E>` cannot cross the managed seam; opt in to mapping `Err(E)` to a C# exception with `#[dotnet_export(error = \"exception\")]`",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                result_error_ty = Some(error_ty.clone());
+                ok_ty
+            } else {
+                if export_args.error_exception {
+                    return syn::Error::new(
+                        ty.span(),
+                        "#[dotnet_export]: `error = \"exception\"` requires a `Result<T, E>` return type",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                ty
+            };
+            let marshal = match marshal_return(marshal_ty) {
                 Ok(m) => m,
                 Err(msg) => {
                     return syn::Error::new(ty.span(), msg).to_compile_error().into();
                 }
             };
+            if result_error_ty.is_some() && marshal.returns_managed_handle {
+                return syn::Error::new(
+                    ty.span(),
+                    "#[dotnet_export]: `error = \"exception\"` cannot be used with a managed-handle success type: the original Rust `Result<T, E>` would place a managed reference in overlapping enum storage before the generated shim can unwrap it",
+                )
+                .to_compile_error()
+                .into();
+            }
             let seam_ty = marshal.seam_ty;
             let ret_ident = format_ident!("__ret");
             let expr = match marshal.from_rust {
@@ -3629,13 +4029,26 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
             (
                 quote! { -> #seam_ty },
                 expr,
-                Some((**ty).clone()),
+                Some(marshal_ty.clone()),
                 marshal.returns_managed_handle,
             )
         }
     };
 
-    let call = quote! { super::#fn_name(#(#call_args),*) };
+    let raw_call = quote! { super::#fn_name(#(#call_args),*) };
+    let call = if result_error_ty.is_some() {
+        quote! {
+            match #raw_call {
+                ::std::result::Result::Ok(__value) => __value,
+                ::std::result::Result::Err(__error) => {
+                    let __msg = ::std::format!("{}", __error);
+                    ::mycorrhiza::error::throw_msg(&__msg)
+                }
+            }
+        }
+    } else {
+        raw_call
+    };
 
     // The shared panic-message-extraction arm both `catch_unwind` shapes below raise through.
     let throw_arm = quote! {
@@ -3740,9 +4153,11 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // The user's function, verbatim — still callable from Rust with its idiomatic signature.
         #func
 
-        // The generated seam shim. `#[no_mangle]` gives it the flat symbol `#fn_name`, which the
-        // backend marks `Access::Extern` (a DCE root) and the exporter emits as a public static
-        // method on the assembly's `MainModule` — so C# calls it as `MainModule::#fn_name`. See
+        // The generated seam shim exports `#managed_name` as its flat symbol. The backend marks
+        // exported symbols `Access::Extern` (a DCE root) and emits them as public static methods
+        // on the assembly's `MainModule`; the configured managed name is therefore exactly the
+        // C# method name. With no attribute, `no_mangle` preserves the historical `#fn_name`
+        // behavior. See
         // `body`'s construction above for the two `catch_unwind` shapes and why a second one is
         // needed.
         //
@@ -3769,7 +4184,7 @@ pub fn dotnet_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[allow(non_snake_case, unused_imports, clippy::useless_conversion)]
         mod #shim_mod {
             use super::*;
-            #[no_mangle]
+            #export_attribute
             pub extern "C-unwind" fn #fn_name(#(#seam_params),*) #seam_ret {
                 #(#pre_call)*
                 #body
@@ -3925,7 +4340,9 @@ pub fn dotnet_entity(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 .to_compile_error()
                 .into();
             }
-            if !m.path.is_ident("namespace") && !m.path.is_ident("assembly") && !m.path.is_ident("name")
+            if !m.path.is_ident("namespace")
+                && !m.path.is_ident("assembly")
+                && !m.path.is_ident("name")
             {
                 let path = &m.path;
                 return syn::Error::new(

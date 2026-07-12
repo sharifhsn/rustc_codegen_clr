@@ -1,11 +1,8 @@
 use crate::assembly::MethodCompileCtx;
-use cilly::{
-    cilnode::ExtendKind,
-    CILRoot, Int, Interned, Type,
-};
 use crate::operand::handle_operand;
 use crate::place::place_set;
 use crate::r#type::GetTypeExt;
+use cilly::{CILRoot, Int, Interned, Type, cilnode::ExtendKind};
 use rustc_middle::{
     mir::{Operand, Place},
     ty::Instance,

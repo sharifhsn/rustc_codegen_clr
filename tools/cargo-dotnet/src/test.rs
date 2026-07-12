@@ -10,12 +10,12 @@
 //! `--` (e.g. a test-name filter, `--nocapture`, `--test-threads=1`) are forwarded to the
 //! harness verbatim, exactly like `cargo test -- <args>`.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::cli::BuildArgs;
 use crate::context::Context;
 use crate::mode::Backend;
-use crate::{artifact, buildstd, overlays, palinject, run};
+use crate::{artifact, buildstd, overlays, run};
 
 /// Run `cargo dotnet test`.
 pub fn run(args: &BuildArgs) -> Result<i32> {
@@ -48,10 +48,12 @@ fn resolve_test_context(args: &BuildArgs) -> Result<Context> {
 
 /// The native test pipeline: build with `--tests`, locate the harness binary, run it.
 fn run_native_tests(ctx: &Context, libtest_args: &[String]) -> Result<i32> {
-    palinject::inject_all(ctx)?;
+    let _build_lock = crate::build_lock::BuildLock::acquire_crate(ctx)?;
+    let private_sysroot = crate::private_sysroot::prepare(ctx)?;
     overlays::apply(ctx)?;
-    let json = buildstd::build(ctx)?;
+    let json = buildstd::build_with_sysroot(ctx, &private_sysroot)?;
     let art = artifact::locate(&json, ctx)?;
+    crate::receipt::write(ctx, &art, &private_sysroot)?;
     match art {
         artifact::Artifact::Executable(exe) => {
             eprintln!("== running #[test] harness on .NET: {} ==", exe.display());

@@ -6,7 +6,7 @@
 #![allow(incomplete_features)]
 
 /// Non-Tier-2 baseline call in the same assembly.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn rust_add(a: i32, b: i32) -> i32 {
     a + b
 }
@@ -16,7 +16,7 @@ pub extern "C" fn rust_add(a: i32, b: i32) -> i32 {
 ///
 /// # Safety
 /// `ptr` must point to `len` valid, initialized bytes for the duration of the call (C# pins them).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn greet_managed(ptr: *const u8, len: usize) -> mycorrhiza::system::MString {
     let name =
         core::str::from_utf8(core::slice::from_raw_parts(ptr, len)).unwrap_or("<invalid utf8>");
@@ -25,7 +25,7 @@ pub unsafe extern "C" fn greet_managed(ptr: *const u8, len: usize) -> mycorrhiza
 }
 
 /// On `None`, raises a `System.Exception` (a `throw` IL op) the C# caller can `catch`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn try_div(a: i32, b: i32) -> i32 {
     match a.checked_div(b) {
         Some(q) => q,
@@ -37,7 +37,7 @@ pub extern "C" fn try_div(a: i32, b: i32) -> i32 {
 /// `newarr`, populates it via `stelem`, and returns it; the public signature lowers to `int[]`.
 type IntArray = mycorrhiza::intrinsics::RustcCLRInteropManagedArray<i32, 1>;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn make_ints() -> IntArray {
     let a: IntArray = mycorrhiza::intrinsics::rustc_clr_interop_managed_new_arr::<i32>(3);
     mycorrhiza::intrinsics::rustc_clr_interop_managed_set_elem::<i32>(a, 0, 10);

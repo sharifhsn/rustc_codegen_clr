@@ -1,5 +1,5 @@
-use rustc_abi::VariantIdx;
 use crate::r#type::escape_field_name;
+use rustc_abi::VariantIdx;
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{
     ConstKind, GenericArg, Instance, List, PseudoCanonicalInput, Ty, TyCtxt, TyKind,
@@ -45,6 +45,10 @@ pub enum MagicFn {
     SetElem,
     /// `rustc_clr_interop_box` → `box` (a value type into `System.Object`).
     Box,
+    /// `rustc_clr_interop_managed_box_new` → CLR-box + GCHandle root, returned as an opaque token.
+    ManagedBoxNew,
+    /// `rustc_clr_interop_managed_box_take` → recover/unbox the rooted value and free its GCHandle.
+    ManagedBoxTake,
     /// `rustc_clr_interop_try_catch` → a CIL try/catch region catching any .NET exception.
     TryCatch,
     /// `rustc_clr_interop_generic_call{0..=3}` (WF-9) — a method on a generic .NET instantiation.
@@ -84,11 +88,17 @@ pub enum MagicFn {
 pub fn classify_magic_fn(tcx: TyCtxt, def_id: DefId) -> Option<MagicFn> {
     let path = tcx.def_path_str(def_id);
     let name = path.rsplit("::").next().unwrap_or(path.as_str());
+    // DTO primary constructors are schema-arity generated and may legitimately exceed the small
+    // hand-written ctor0..ctor3 convenience ladder. Keep the exact identifier boundary while
+    // accepting any decimal arity the call decoder can validate against generics/arguments.
+    if name
+        .strip_prefix(CTOR_FN_NAME)
+        .and_then(|suffix| suffix.strip_suffix('_'))
+        .is_some_and(|arity| !arity.is_empty() && arity.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Some(MagicFn::Ctor);
+    }
     Some(match name {
-        "rustc_clr_interop_managed_ctor0_"
-        | "rustc_clr_interop_managed_ctor1_"
-        | "rustc_clr_interop_managed_ctor2_"
-        | "rustc_clr_interop_managed_ctor3_" => MagicFn::Ctor,
         "rustc_clr_interop_managed_call_virt0_"
         | "rustc_clr_interop_managed_call_virt1_"
         | "rustc_clr_interop_managed_call_virt2_" => MagicFn::ManagedCallVirt,
@@ -105,6 +115,8 @@ pub fn classify_magic_fn(tcx: TyCtxt, def_id: DefId) -> Option<MagicFn> {
         "rustc_clr_interop_managed_new_arr" => MagicFn::NewArr,
         "rustc_clr_interop_managed_set_elem" => MagicFn::SetElem,
         "rustc_clr_interop_box" => MagicFn::Box,
+        "rustc_clr_interop_managed_box_new" => MagicFn::ManagedBoxNew,
+        "rustc_clr_interop_managed_box_take" => MagicFn::ManagedBoxTake,
         "rustc_clr_interop_try_catch" => MagicFn::TryCatch,
         "rustc_clr_interop_throw" => MagicFn::Throw,
         "rustc_clr_interop_generic_call0"

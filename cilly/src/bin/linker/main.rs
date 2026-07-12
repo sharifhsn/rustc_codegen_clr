@@ -8,13 +8,14 @@
 #![deny(unused_must_use)]
 #![allow(clippy::module_name_repetitions)]
 use cilly::{
-    libc_fns::{self, LIBC_FNS, LIBC_MODIFIES_ERRNO},
     DEAD_CODE_ELIMINATION,
+    libc_fns::{self, LIBC_FNS, LIBC_MODIFIES_ERRNO},
     {
-        asm::{MissingMethodPatcher, ILASM_FLAVOUR},
+        ArtifactAbiConfig, ArtifactAbiConfigMismatch, Assembly, BasicBlock, CILNode, CILRoot,
+        ClassDef, ClassRef, Const, DotnetRuntime, IlasmFlavour, Int, MethodImpl, OutputTarget,
+        Type,
+        asm::{ILASM_FLAVOUR, MissingMethodPatcher},
         cilnode::MethodKind,
-        ArtifactAbiConfig, ArtifactAbiConfigMismatch, Assembly, BasicBlock, CILNode, CILRoot, ClassDef,
-        ClassRef, Const, DotnetRuntime, IlasmFlavour, Int, MethodImpl, OutputTarget, Type,
     },
 };
 mod load;
@@ -55,6 +56,13 @@ struct LinkerConfig {
     panic_managed_backtrace: bool,
     native_passthrough: bool,
     direct_pe: bool,
+    managed_identity: Option<ManagedIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedIdentity {
+    assembly_name: String,
+    module_full_name: Option<String>,
 }
 
 impl LinkerConfig {
@@ -68,6 +76,12 @@ impl LinkerConfig {
             "JAVA_MODE",
             "JS_MODE",
             "MAX_STATIC_SIZE",
+            "RCL_LEGACY_MAIN_MODULE",
+            "RCL_MANAGED_ASSEMBLY_NAME",
+            "RCL_MANAGED_IDENTITY_SCHEMA",
+            "RCL_MANAGED_MODULE_TYPE",
+            "RCL_MANAGED_PACKAGE_ID",
+            "RCL_MANAGED_ROOT_NAMESPACE",
             "NATIVE_PASSTHROUGH",
             "NATIVE_PASSTROUGH",
             "NO_UNWIND",
@@ -130,6 +144,8 @@ impl LinkerConfig {
             ));
         }
 
+        let managed_identity = managed_identity_from_environment(environment)?;
+        let direct_pe = linker_bool(environment, "DIRECT_PE", true)?;
         Ok(Self {
             process_abi: ArtifactAbiConfig::from_environment(environment)
                 .map_err(|error| error.to_string())?,
@@ -138,9 +154,47 @@ impl LinkerConfig {
             pool_alloc: linker_bool(environment, "POOL_ALLOC", false)?,
             panic_managed_backtrace: linker_bool(environment, "PANIC_MANAGED_BT", false)?,
             native_passthrough,
-            direct_pe: linker_bool(environment, "DIRECT_PE", true)?,
+            direct_pe,
+            managed_identity,
         })
     }
+}
+
+fn managed_identity_from_environment(
+    environment: &HashMap<String, String>,
+) -> Result<Option<ManagedIdentity>, String> {
+    const KEYS: &[&str] = &[
+        "RCL_MANAGED_IDENTITY_SCHEMA",
+        "RCL_MANAGED_PACKAGE_ID",
+        "RCL_MANAGED_ASSEMBLY_NAME",
+        "RCL_MANAGED_ROOT_NAMESPACE",
+        "RCL_MANAGED_MODULE_TYPE",
+        "RCL_LEGACY_MAIN_MODULE",
+    ];
+    if !KEYS.iter().any(|key| environment.contains_key(*key)) {
+        return Ok(None);
+    }
+    let value = |key: &str| {
+        environment
+            .get(key)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("managed identity is incomplete: missing {key}"))
+    };
+    if value("RCL_MANAGED_IDENTITY_SCHEMA")? != "1" {
+        return Err("managed identity schema must be 1".into());
+    }
+    // Carry package-id through this boundary even though this narrow exporter slice does not yet
+    // use it as a filename. It prevents a partial caller from accidentally treating arbitrary
+    // linker environment as a complete release identity.
+    let _package_id = value("RCL_MANAGED_PACKAGE_ID")?;
+    let assembly_name = value("RCL_MANAGED_ASSEMBLY_NAME")?.clone();
+    let root_namespace = value("RCL_MANAGED_ROOT_NAMESPACE")?;
+    let module_type = value("RCL_MANAGED_MODULE_TYPE")?;
+    let legacy_main_module = linker_bool(environment, "RCL_LEGACY_MAIN_MODULE", false)?;
+    Ok(Some(ManagedIdentity {
+        assembly_name,
+        module_full_name: (!legacy_main_module).then(|| format!("{root_namespace}.{module_type}")),
+    }))
 }
 
 fn linker_bool(
@@ -275,11 +329,13 @@ fn find_linux_lib(needle: &str, fallback: &str) -> String {
 }
 #[cfg(target_os = "linux")]
 fn get_libc_() -> String {
-    find_linux_lib("libc.so.", "libc.so.6")
+    // Let CoreCLR apply its platform DllImport resolution. Embedding the build host's absolute
+    // glibc path makes a NuGet assembly unusable on Alpine/musl or another Linux distribution.
+    "libc".to_string()
 }
 #[cfg(target_os = "linux")]
 fn get_libm_() -> String {
-    find_linux_lib("libm.so.", "libm.so.6")
+    "libm".to_string()
 }
 #[cfg(target_os = "windows")]
 fn get_libc_() -> String {
@@ -291,11 +347,13 @@ fn get_libm_() -> String {
 }
 #[cfg(target_os = "macos")]
 fn get_libc_() -> String {
-    "libSystem.B.dylib".to_string()
+    // `libc` is a portable .NET native-library contract; CoreCLR resolves it to libSystem on macOS
+    // and the appropriate C runtime on Linux instead of baking the build host into the assembly.
+    "libc".to_string()
 }
 #[cfg(target_os = "macos")]
 fn get_libm_() -> String {
-    "libSystem.B.dylib".to_string()
+    "libm".to_string()
 }
 
 // Gets the name of a file without an extension
@@ -384,6 +442,9 @@ fn main() {
 
     let loaded = load::load_assemblies_with_config(to_link.as_slice(), ar_to_link.as_slice());
     let (mut final_assembly, artifact_abi_config, _, _) = loaded.into_parts();
+    final_assembly
+        .validate_fixed_array_layouts()
+        .unwrap_or_else(|error| panic!("post-link {error}"));
     let effective_abi_config =
         effective_abi_config(artifact_abi_config, linker_config.process_abi.clone())
             .unwrap_or_else(|error| {
@@ -460,7 +521,9 @@ fn main() {
             }
         }),
     );
-    if no_unwind {
+    if no_unwind || c_mode {
+        // C has no managed inheritance or exception object layout. Use the explicit-layout bridge
+        // stub; the C exporter models throws with its own abort/setjmp machinery.
         cilly::builtins::insert_exeception_stub(&mut final_assembly, &mut overrides);
     } else {
         cilly::builtins::insert_exception(&mut final_assembly, &mut overrides);
@@ -701,6 +764,15 @@ fn main() {
     final_assembly.opt(&mut fuel);
     println!("==> Optimizing in {:?}", opt_start.elapsed());
     final_assembly.eliminate_dead_code();
+    if linker_config.target == OutputTarget::DotNet && !linker_config.direct_pe {
+        if let Some(public_type_name) = linker_config
+            .managed_identity
+            .as_ref()
+            .and_then(|identity| identity.module_full_name.as_deref())
+        {
+            final_assembly = final_assembly.project_main_module(public_type_name);
+        }
+    }
     let (mut final_assembly, compaction) = final_assembly.compact();
     if std::env::var("RCL_LINK_STATS").as_deref() == Ok("1") {
         println!("==> Compaction: {compaction}");
@@ -772,10 +844,16 @@ fn main() {
         // library's `.dll` bytes land at `path` itself; an executable's bytes land at
         // `path.with_extension("exe")` (the legacy launcher-loaded artifact).
         let asm_name = if is_lib {
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.strip_prefix("lib").unwrap_or(s).to_string())
-                .unwrap_or_else(|| "rust_export".to_string())
+            linker_config
+                .managed_identity
+                .as_ref()
+                .map(|identity| identity.assembly_name.clone())
+                .unwrap_or_else(|| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.strip_prefix("lib").unwrap_or(s).to_string())
+                        .unwrap_or_else(|| "rust_export".to_string())
+                })
         } else {
             // `il_exporter` stamps a name-agnostic `.assembly _{}` placeholder for executables
             // (loaded by path, name irrelevant); `pe_exporter::ExportOptions` always needs a
@@ -852,6 +930,10 @@ fn main() {
         let pe_options = cilly::pe_exporter::export::ExportOptions {
             is_dll: is_lib,
             assembly_name: asm_name,
+            public_module_full_name: linker_config
+                .managed_identity
+                .as_ref()
+                .and_then(|identity| identity.module_full_name.clone()),
             module_name,
             pdb_file_name: pdb_file_name.clone(),
             runtime: effective_abi_config.dotnet_runtime(),
@@ -904,9 +986,15 @@ fn main() {
         // `lib` prefix, and the extension): `librust_export.so` -> `rust_export`. Executables keep the
         // legacy `_` placeholder (loaded by path via the launcher).
         let asm_name = if is_lib {
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.strip_prefix("lib").unwrap_or(s).to_string())
+            linker_config
+                .managed_identity
+                .as_ref()
+                .map(|identity| identity.assembly_name.clone())
+                .or_else(|| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.strip_prefix("lib").unwrap_or(s).to_string())
+                })
         } else {
             None
         };
@@ -1079,6 +1167,6 @@ mod linker_config_tests {
             let environment = HashMap::from([("GUARANTEED_ALIGN".to_owned(), invalid.to_owned())]);
             let error = LinkerConfig::from_environment(&environment).unwrap_err();
             assert!(error.contains("nonzero power of two"), "{error}");
+        }
     }
-}
 }

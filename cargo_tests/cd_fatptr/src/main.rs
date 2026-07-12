@@ -37,6 +37,20 @@ fn sum_lens(parts: &[&str]) -> usize {
     total
 }
 
+fn expected_bytes(parts: &[&str], separator: &[u8], trailing_separator: bool) -> Vec<u8> {
+    let mut expected = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        if index != 0 {
+            expected.extend_from_slice(separator);
+        }
+        expected.extend_from_slice(part.as_bytes());
+    }
+    if trailing_separator && !parts.is_empty() {
+        expected.extend_from_slice(separator);
+    }
+    expected
+}
+
 fn main() {
     let cases: Vec<Vec<&str>> = vec![
         vec![],
@@ -60,6 +74,10 @@ fn main() {
         let joined = join_slice(parts);
         let concated = concat_slice(parts);
         let lens = sum_lens(parts);
+        assert_eq!(pushed.as_bytes(), expected_bytes(parts, b"|", true));
+        assert_eq!(joined.as_bytes(), expected_bytes(parts, b",", false));
+        assert_eq!(concated.as_bytes(), expected_bytes(parts, b"", false));
+        assert_eq!(lens, expected_bytes(parts, b"", false).len());
         println!(
             "case {i}: push={pushed:?} join={joined:?} concat={concated:?} lens={lens}"
         );
@@ -68,6 +86,8 @@ fn main() {
     let big_slice = black_box(big.as_slice());
     let big_joined = join_slice(big_slice);
     let big_lens = sum_lens(big_slice);
+    assert_eq!(big_joined.as_bytes(), expected_bytes(big_slice, b",", false));
+    assert_eq!(big_lens, expected_bytes(big_slice, b"", false).len());
     println!("big: join.len()={} lens={}", big_joined.len(), big_lens);
     // Spot-check a few bytes of the big join so a wrong-memory read would corrupt it.
     println!("big: first40={:?}", &big_joined[..40.min(big_joined.len())]);
@@ -80,7 +100,9 @@ fn main() {
     let mut out = String::new();
     out.push_str(*rr);
     out.push_str(black_box(rr));
+    assert_eq!(out, "nestednested");
     println!("nested push: {out:?}");
 
     println!("cd_fatptr: done");
+    println!("== cd_fatptr done ==");
 }
