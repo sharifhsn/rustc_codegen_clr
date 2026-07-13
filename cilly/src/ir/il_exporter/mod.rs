@@ -1934,6 +1934,10 @@ fn assemble_file(exe_out: &Path, il_path: &Path, is_lib: bool) {
         if *ILASM_FLAVOUR == IlasmFlavour::Clasic {
             // Limit the memory usage of mono
             cmd.env("MONO_GC_PARAMS", "soft-heap-limit=500m");
+        } else {
+            // CoreCLR ILAsm otherwise assigns a fresh MVID/debug identity on every run.
+            // /DET makes identical IL produce byte-identical PE/PDB output.
+            cmd.arg("-DET");
         }
         let ilasm_start = std::time::Instant::now();
         let out = cmd.output().unwrap();
@@ -1975,6 +1979,8 @@ fn assemble_file(exe_out: &Path, il_path: &Path, is_lib: bool) {
     if *ILASM_FLAVOUR == IlasmFlavour::Clasic {
         // Limit the memory usage of mono
         cmd.env("MONO_GC_PARAMS", "soft-heap-limit=500m");
+    } else {
+        cmd.arg("-DET");
     }
     let ilasm_start = std::time::Instant::now();
     let out = cmd.output().unwrap();
@@ -1999,6 +2005,8 @@ fn assemble_file(exe_out: &Path, il_path: &Path, is_lib: bool) {
     if *ILASM_FLAVOUR == IlasmFlavour::Clasic {
         // Limit the memory usage of mono
         cmd.env("MONO_GC_PARAMS", "soft-heap-limit=500m");
+    } else {
+        cmd.arg("-DET");
     }
     let ilasm_start = std::time::Instant::now();
     let out = cmd.output().unwrap();
