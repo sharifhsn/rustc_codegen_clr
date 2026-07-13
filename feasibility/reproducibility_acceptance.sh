@@ -6,7 +6,13 @@ evidence="${RCL_REPRO_EVIDENCE_DIR:-${TMPDIR:-/tmp}/rustc_codegen_clr-reproducib
 fixture="cargo_tests/cd_interop/rustlib"
 package="Rcl.Reproducibility.Probe.1.0.0.nupkg"
 rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
-ilasm_path="${ILASM_PATH:-$HOME/.dotnet/ilasm-tool/ilasm}"
+dotnet_version="${DOTNET_VERSION:-10}"
+case "$dotnet_version" in
+    8) ilasm_tool='ilasm-tool' ;;
+    9|10) ilasm_tool="ilasm${dotnet_version}-tool" ;;
+    *) echo "reproducibility acceptance: unsupported DOTNET_VERSION=$dotnet_version" >&2; exit 2 ;;
+esac
+ilasm_path="${ILASM_PATH:-$HOME/.dotnet/$ilasm_tool/ilasm}"
 
 hash_file() {
     if command -v sha256sum >/dev/null 2>&1; then
@@ -55,6 +61,8 @@ git -C "$repo" worktree add --detach "$tree_b" "$commit" >"$evidence/worktree-b.
 build_side() {
     side="$1"
     tree="$2"
+    package_dll="lib/net${dotnet_version}.0/cd_interop.dll"
+    package_xml="lib/net${dotnet_version}.0/cd_interop.xml"
     root="$run_root/private-$side"
     tree_canonical="$(cd "$tree" && pwd -P)"
     root_canonical="$(mkdir -p "$root" && cd "$root" && pwd -P)"
@@ -104,7 +112,8 @@ build_side() {
         SOURCE_DATE_EPOCH="$source_date_epoch" \
         CARGO_DOTNET_BACKEND=native \
         "$tree/tools/cargo-dotnet/target/release/cargo-dotnet" pack "$tree/$fixture" \
-        --id Rcl.Reproducibility.Probe --version 1.0.0 --out "$out/package" --validate \
+        --id Rcl.Reproducibility.Probe --version 1.0.0 --out "$out/package" \
+        --dotnet "$dotnet_version" --validate \
         >"$out/pack.log" 2>&1
 
     pkg="$out/package/$package"
@@ -129,7 +138,7 @@ build_side() {
             fail "$side receipt entry hash mismatch: $entry"
     done <"$out/zip-entry-hashes.txt"
 
-    unzip -p "$pkg" 'lib/net8.0/cd_interop.xml' >"$out/api.xml"
+    unzip -p "$pkg" "$package_xml" >"$out/api.xml"
     unzip -p "$pkg" 'build/rustdotnet/artifact-provenance.json' >"$out/artifact-provenance.json"
     unzip -p "$pkg" 'build/rustdotnet/sbom.cdx.json' >"$out/sbom.cdx.json"
     unzip -p "$pkg" 'build/rustdotnet/licenses.json' >"$out/licenses.json"
@@ -142,10 +151,10 @@ build_side() {
     jq -e '.bom_format == "CycloneDX" and .spec_version == "1.5" and (.components | length > 0)' "$out/sbom.cdx.json" >/dev/null
     jq -e '.schema == 1 and (.components | length > 0)' "$out/licenses.json" >/dev/null
     [[ "$(jq -r '.artifact.sha256' "$out/artifact-provenance.json")" == \
-       "$(jq -r '.entries["lib/net8.0/cd_interop.dll"]' "$receipt")" ]] ||
+       "$(jq -r --arg path "$package_dll" '.entries[$path]' "$receipt")" ]] ||
         fail "$side provenance DLL hash does not match the packaged DLL"
     [[ "$(jq -r '.xml_docs.sha256' "$out/artifact-provenance.json")" == \
-       "$(jq -r '.entries["lib/net8.0/cd_interop.xml"]' "$receipt")" ]] ||
+       "$(jq -r --arg path "$package_xml" '.entries[$path]' "$receipt")" ]] ||
         fail "$side provenance XML hash does not match the packaged XML"
 }
 
