@@ -54,6 +54,19 @@ cargo_home="$work/cargo-home"
 rm -rf "$work"
 mkdir -p "$home/bin" "$home/target" "$home/crates" "$out"
 
+case "$host" in
+    linux-x64) ilasm_rid="linux-x64"; ilasm_name="ilasm" ;;
+    macos-arm64) ilasm_rid="osx-arm64"; ilasm_name="ilasm" ;;
+    windows-x64) ilasm_rid="win-x64"; ilasm_name="ilasm.exe" ;;
+esac
+ilasm_package="$work/ilasm10.zip"
+ilasm_extract="$work/ilasm10"
+curl -fsSL -o "$ilasm_package" \
+    "https://www.nuget.org/api/v2/package/runtime.$ilasm_rid.microsoft.netcore.ilasm/10.0.0"
+unzip -qo "$ilasm_package" -d "$ilasm_extract"
+cp "$ilasm_extract/runtimes/$ilasm_rid/native/$ilasm_name" "$home/bin/$ilasm_name"
+chmod +x "$home/bin/$ilasm_name" 2>/dev/null || true
+
 cp "$backend" "$home/bin/$backend_name"
 cp "$linker" "$home/bin/$(basename "$linker")"
 cp x86_64-unknown-dotnet.json "$home/target/x86_64-unknown-dotnet.json"
