@@ -18,7 +18,7 @@ if [[ ! -x "$driver" ]]; then
     exit 2
 fi
 if ! dotnet --list-runtimes | grep -q "^Microsoft.NETCore.App ${dotnet_version}\."; then
-    echo ".NET $dotnet_version runtime is not installed (set DOTNET_VERSION to 8, 9, or 10)" >&2
+    echo ".NET $dotnet_version runtime is not installed" >&2
     exit 2
 fi
 mkdir -p "$log_dir"
@@ -40,10 +40,10 @@ grep -F 'cargo dotnet setup --from-repo /path/to/rustc_codegen_clr' \
 grep -F 'cargo dotnet bundle install /path/to/cargo-dotnet-sdk-<host>.zip' \
   "$log_dir/bare-install.log"
 
-# Keep the copy-paste entry points on the one-build checkout bootstrap. Setup promotes the running
-# release executable into CARGO_HOME/bin; a preceding `cargo install` would compile it twice.
+# Keep every newcomer guide on the downloadable release installer. Source setup remains documented
+# for contributors, but it is not the normal first-user path.
 for guide in "$repo/README.md" "$repo/QUICKSTART.md" "$repo/docs/QUICKSTART_INTEROP.md"; do
-    grep -F 'cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml --' "$guide"
+    grep -F 'releases/download/rust-dotnet-v0.0.1/install.sh' "$guide"
     if head -n 40 "$guide" | grep -F 'cargo install --path tools/cargo-dotnet'; then
         echo "newcomer guide redundantly installs cargo-dotnet before setup: $guide" >&2
         exit 1
