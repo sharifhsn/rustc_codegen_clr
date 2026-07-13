@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+dotnet_version="${DOTNET_VERSION:-10}"
 log_dir="${RCL_WAVE0_BLOCKER_LOG_DIR:-/tmp/rustc_codegen_clr-wave0-blockers}"
 mkdir -p "$log_dir"
 
@@ -27,6 +28,6 @@ CARGO_DOTNET_BACKEND=native \
     build "$repo/cargo_tests/cd_typed_dto/rustlib" \
     >> "$log_dir/typed-dto.log" 2>&1
 dotnet run --project "$repo/cargo_tests/cd_typed_dto/csharp/cd_typed_dto_cs.csproj" \
-    -c Release >> "$log_dir/typed-dto.log" 2>&1
+    -c Release -p:RustDotnetVersion="$dotnet_version" >> "$log_dir/typed-dto.log" 2>&1
 
 echo '== wave0_blocker_acceptance focused-closed gates passed =='
