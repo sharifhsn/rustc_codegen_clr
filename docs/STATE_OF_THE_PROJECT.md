@@ -1,10 +1,11 @@
-# State of the project — 2026-07-01 snapshot
+# State of the project — July 2026 snapshot
 
 > **This is the authoritative dated snapshot.** The deep maps ([TRANSLATION_STATUS.md](TRANSLATION_STATUS.md),
 > [GAPS.md](GAPS.md), [ERGONOMICS_STATUS.md](ERGONOMICS_STATUS.md), [COMPAT_SURVEY.md](COMPAT_SURVEY.md))
 > are campaign documents written mid-flight; several of their "blocked / not started" claims were closed
 > by later work and **when they disagree with this doc, this doc wins** (§ Corrections below).
-> Branch: `gaps-campaign` (pushed to `mine`), toolchain pinned `nightly-2026-06-17`, .NET 8 + 9.
+> Updated migration baseline (2026-07-13): branch `main` on `mine`, toolchain pinned
+> `nightly-2026-06-17`, runtime profiles .NET 8/9/10 with .NET 10 the default.
 
 ## Where the project is, in one paragraph
 
@@ -67,7 +68,7 @@ run on the **real .NET backend**, `CARGO_DOTNET_BACKEND=native`) and/or the Dock
 | LINQ / EF | Expression trees built from Rust (parameters, binops, member access, constants via the new `box` primitive), compiled+executed, and handed to `Queryable.Where<T>(Expression<Func<T,bool>>)` | `cd_linq_expr` 30/30 |
 | .NET→Rust | `#[dotnet_export]` auto-marshal, `#[dotnet_class]` (ctors/statics/fields/managed fields), reusable containers, NuGet | `cd_export` 11/11, `cd_typedef` 16/16, `cd_containers*` |
 | BCL breadth | collections/DateTime/Guid/Regex/Json/… idiomatic wrappers | `cd_bcl` 313/313, `cd_json` 47/47 |
-| Tooling | `cargo dotnet` full pipeline, dual-mode (installed/DEV), macOS/Linux/experimental Windows native, `--dotnet 8|9|10` (10 default), MSBuild `RustDotnet.targets`, `pack`→`.nupkg` | scaffolds + cd_* consumers build hands-free |
+| Tooling | `cargo dotnet` full pipeline, dual-mode (installed/DEV), macOS/Linux plus opt-in Windows native acceptance, `--dotnet 8|9|10` (10 default), MSBuild `RustDotnet.targets`, `pack`→`.nupkg`, NativeAOT `publish` | scaffolds + cd_* consumers build hands-free; Windows CI builds/runs .NET 10 probes |
 | Perf | MIR-layer inlining + SROA + const-hoist: `iter_sum` 1764→156 ms, `iter_zip` 2765→216 ms; **whole-program NativeAOT proven** (FieldRVA sizing fixed), AOT 1.6–3.5× over JIT | `bench_rs_vs_cs`, perf docs |
 | Direct PE + PDB writer | Hand-rolled ECMA-335 PE writer is the **default** linker path, no `ilasm`; hand-rolled Portable PDB writer emits `foo.pdb`, stack traces resolve `file.rs:line` | `cargo test -p cilly --lib pe_exporter` 119/0, `cd_pdb` probe, `docs/PE_EMISSION_PLAN.md` |
 
@@ -87,7 +88,8 @@ fidelity, real signal delivery, f128 on .NET, …).
 
 **Interop tails (all pure-library or small-backend).** .NET events (`add_*`/`remove_*`);
 `#[dotnet_class]` **virtual-method overrides** (interfaces are done); exporting Rust traits as C#
-interfaces; `IEnumerable<T>` over `RustVec`; `cargo dotnet publish --aot` as a subcommand.
+interfaces; `IEnumerable<T>` over `RustVec`. NativeAOT publishing is now wired and continuously
+executes a published .NET 10 interop host on Linux.
 
 **Performance.** The `NativeMemory` malloc vs gen0-bump allocation-model gap was re-measured and
 is smaller than previously documented: the malloc/free floor itself is 28–34 ns/op (§3 of

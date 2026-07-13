@@ -53,7 +53,9 @@ jobs:
       - name: Run strict ::stable gate (isolated flaky retry)
         run: bash .github/scripts/gate.sh
   windows_build:
-    # Experimental Windows acceptance. Keep the public support guard unless this matrix is green.
+    # Experimental Windows acceptance. Keep the opt-in guard until the broader MSBuild/package
+    # surface is also proven on Windows, but exercise the compiler, driver, and migration-specific
+    # runtime behavior on every main-branch push.
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
@@ -92,6 +94,8 @@ jobs:
           DOTNET_VERSION: "10"
         run: |
           cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet run cargo_tests/cd_pure --backend native --dotnet 10 --clean
+          cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet run cargo_tests/cd_subword_atomics --backend native --dotnet 10 --clean
+          cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet run cargo_tests/cd_net10_bcl --backend native --dotnet 10 --clean
   product_acceptance_smoke:
     # One release case per decisive product oracle. The full matrix remains a manual/release gate.
     runs-on: ubuntu-22.04

@@ -10,10 +10,11 @@ the codegen backend internals — those live in [docs/ARCHITECTURE.md](ARCHITECT
 > command supplies the .NET target, `build-std` with the real .NET PAL, the codegen backend + linker,
 > and auto-applies the crate-overlay registry so syscall-using deps (`mio`/`socket2`/`tokio`) just work.
 
-> **Host support:** this release supports cargo-dotnet on Linux and macOS. Operational commands fail
-> before setup/build/test/package/publish work on Windows, pending Windows acceptance. This is a
-> host-tooling boundary only; it does not assert a target or managed-runtime restriction. Help,
-> version, scaffolding, diagnostics, and read-only metadata behavior remain available.
+> **Host support:** Linux and macOS are the published host matrix. Windows x64 is continuously tested
+> for compiler/driver unit tests plus real .NET 10 execution, including native sub-word atomics and
+> .NET 10-only BCL calls, but remains opt-in with `CARGO_DOTNET_EXPERIMENTAL_WINDOWS=1` while the
+> broader Windows MSBuild/package surface is unfinished. Help, version, scaffolding, diagnostics,
+> and read-only metadata behavior remain available without the opt-in.
 
 ---
 
@@ -191,28 +192,32 @@ This flow is verified end-to-end on macOS arm64 (J1/J2/J3 all pass, zero Docker)
 > the full name), applied identically at the type's definition and every reference. Names within the
 > limit are emitted unchanged, so the Linux/Docker output and the `::stable` suite are unaffected.
 
-### Windows (x86_64) — best-effort, UNTESTED
+### Windows (x86_64) — tested, experimental opt-in
 
-The same native pipeline is wired for Windows x64, but **it has not been run or verified on Windows**
-(no Windows host was available). The changes are defensive OS-detection branches that do not affect
-macOS/Linux. Treat the steps below as a starting recipe, not a guarantee.
+The native pipeline runs on GitHub's `windows-latest` x64 runner on every fork-gate push. The gate
+builds and tests `cilly`, the complete workspace, and `cargo-dotnet`; runs `cargo dotnet doctor`; and
+then builds and executes `cd_pure`, `cd_subword_atomics`, and `cd_net10_bcl` on .NET 10 CoreCLR.
+Windows remains experimental because MSBuild integration, NuGet packaging/consumption, and the
+command/WSL shims do not yet have equivalent Windows acceptance. Set
+`CARGO_DOTNET_EXPERIMENTAL_WINDOWS=1` to acknowledge that boundary.
 
 Prereqs (user-local where possible):
-- **Bash**: `cargo-dotnet` is a bash script. Run it under **Git Bash** (Git for Windows), MSYS2, or
-  WSL. A `feasibility\cargo-dotnet.cmd` shim forwards a normal-shell `cargo dotnet ...` to bash with
-  the native backend. It prefers Git Bash (`%ProgramFiles%\Git\bin\bash.exe`, then `bash.exe` on
-  PATH) and falls back to WSL — the WSL branch translates the script path with `wslpath` so WSL bash
-  receives a `/mnt/c/...` POSIX path. Git Bash / MSYS2 is the smoother route (it accepts a Windows
-  path directly and shares the host's `%USERPROFILE%`/`.cargo` layout); WSL runs in a separate Linux
-  filesystem, so under WSL you would build the **Linux** backend and use the Linux flow instead.
+- **Native CLI**: install the Rust driver with
+  `cargo install --path tools\cargo-dotnet --locked`, or run it from the checkout with
+  `cargo run --release --manifest-path tools\cargo-dotnet\Cargo.toml -- dotnet ...` as CI does.
+  No Bash layer is required for this tested path. The older `feasibility\cargo-dotnet.cmd` shim still
+  forwards to the legacy Bash driver through Git Bash/MSYS2/WSL, but that forwarding path is not part
+  of Windows acceptance. WSL is a separate Linux environment and should use the Linux backend.
 - **Toolchain**: `rustup toolchain install nightly-2026-06-17-x86_64-pc-windows-msvc` with
   `--component rust-src --component rustc-dev`. (The MSVC host toolchain + the Build Tools' linker
   environment are required to build the backend and the native launcher.)
-- **.NET 8 SDK** on PATH (`dotnet.exe`).
+- **.NET 10 SDK** on PATH (`dotnet.exe`). The runtime-profile machinery can also select .NET 8 or 9
+  when the matching SDK is installed.
 - **`ilasm` (optional — only for the `DIRECT_PE=0` fallback):** the default build (`DIRECT_PE=1`)
   never calls `ilasm`. If you do fall back to `DIRECT_PE=0`: the CoreCLR ILAsm tool for win-x64 — NuGet
-  `runtime.win-x64.Microsoft.NETCore.ILAsm` (8.0.x). Place its `ilasm.exe` at
-  `%USERPROFILE%\.dotnet\ilasm-tool\ilasm.exe` (Git Bash sees this as `$HOME/.dotnet/ilasm-tool/ilasm.exe`
+  `runtime.win-x64.Microsoft.NETCore.ILAsm` matching the selected runtime. For .NET 10, place its
+  `ilasm.exe` at `%USERPROFILE%\.dotnet\ilasm10-tool\ilasm.exe` (Git Bash sees this as
+  `$HOME/.dotnet/ilasm10-tool/ilasm.exe`
   and the native driver auto-discovers it), or set `ILASM_PATH` to it. Under `DIRECT_PE=0` with
   `ILASM_PATH` unset, the cilly linker's Windows default
   (`cilly/src/ir/asm.rs::get_default_ilasm`, `#[cfg(target_os = "windows")]`) probes a bare `ilasm`
@@ -226,24 +231,18 @@ Prereqs (user-local where possible):
   `executable` field) probes the `.exe` apphost via the `CD_EXE_EXT` host fact. The common run path
   reads cargo's own `"executable"` field, which already carries `.exe` on Windows.
 
-Run (from Git Bash):
-```bash
-CARGO_DOTNET_BACKEND=native feasibility/cargo-dotnet run cargo_tests/cd_pure
+Run (PowerShell):
+```powershell
+$env:CARGO_DOTNET_EXPERIMENTAL_WINDOWS = "1"
+$env:CARGO_DOTNET_BACKEND = "native"
+cargo dotnet run cargo_tests\cd_pure --dotnet 10
 ```
-or from a normal Windows shell: `feasibility\cargo-dotnet.cmd run cargo_tests\cd_pure`.
+The same command works from `cmd.exe` after setting the two environment variables with `set`.
 
-**Known unknowns on Windows** (unverified — no Windows host was available to run any of this):
-- Whether the CoreCLR win-x64 `ilasm` accepts the same flags/`.il` the macOS one does, and whether
-  the win-x64 CoreCLR loads the produced PE without further flags.
-- Whether the native launcher/apphost (compiled by the linker via `rustc -O` with the MSVC linker)
-  builds and links cleanly with the MSVC toolchain.
-- Path-separator handling deep in the pipeline. The shell core is POSIX-path throughout (Git Bash
-  presents `C:\` as `/c/`), but `rust-src` injection, the registry-libc patch, and the generated
-  `.cargo/config.toml` absolute `paths` all assume forward-slash paths — untested on a Windows
-  `rust-src` layout.
-- The `cargo-dotnet.cmd` WSL branch's `wslpath` translation and delayed-expansion logic is written
-  but unexercised.
-Report findings if you run it.
+**Still outside the Windows gate:** MSBuild integration, NuGet pack/restore consumption, NativeAOT
+publish on a Windows RID, and the `cargo-dotnet.cmd`/WSL forwarding branches. Direct native
+`cargo-dotnet.exe` execution, Windows path/config escaping, the MSVC-built launcher, direct-PE
+loading, and the three runtime probes above are covered. Report findings from the un-gated surfaces.
 
 ---
 
