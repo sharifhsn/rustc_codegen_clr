@@ -38,6 +38,16 @@ rg -q '^PASS$' "$log_dir/consumer.log"
 run_build > "$log_dir/noop-build.log" 2>&1
 if rg -q 'RustDotnet: building Rust crate' "$log_dir/noop-build.log"; then
     echo "unchanged MSBuild invocation rebuilt the Rust crate" >&2
+    stamp="$dll.rustdotnet.stamp"
+    inputs="$crate/target/x86_64-unknown-dotnet/release/.rustdotnet-cargo-inputs"
+    echo "incremental stamp: $(stat -c '%y %n' "$stamp" 2>/dev/null || stat -f '%Sm %N' "$stamp")" >&2
+    while IFS= read -r input; do
+        if [[ ! -e "$input" ]]; then
+            echo "missing incremental input: $input" >&2
+        elif [[ "$input" -nt "$stamp" ]]; then
+            echo "newer incremental input: $(stat -c '%y %n' "$input" 2>/dev/null || stat -f '%Sm %N' "$input")" >&2
+        fi
+    done < "$inputs"
     exit 1
 fi
 
