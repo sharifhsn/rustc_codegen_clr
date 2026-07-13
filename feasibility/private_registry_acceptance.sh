@@ -73,6 +73,13 @@ hash_file() {
     fi
 }
 
+credential_store() {
+    cache="$1"
+    matches="$(find "$cache/crates" -path '*/cargo-home/credentials.toml' -type f -print)"
+    [[ -n "$matches" && "$(printf '%s\n' "$matches" | wc -l | tr -d ' ')" == 1 ]]
+    printf '%s\n' "$matches"
+}
+
 ambient_config_before="$(hash_file "$work/ambient-cargo/config.toml")"
 ambient_creds_before="$(hash_file "$work/ambient-cargo/credentials.toml")"
 
@@ -84,7 +91,8 @@ CARGO_DOTNET_CACHE_HOME="$work/metadata-cache" \
 "$driver" metadata-inputs "$work/metadata-consumer" --output "$work/metadata-consumer/inputs.txt" \
     > "$work/logs/metadata-inputs.log" 2>&1
 [[ -f "$work/metadata-consumer/inputs.txt" ]]
-[[ -f "$work/metadata-cache/cargo-home/credentials.toml" ]]
+metadata_credentials="$(credential_store "$work/metadata-cache")"
+[[ -f "$metadata_credentials" ]]
 [[ ! -e "$work/ambient-cargo/registry" ]]
 
 # The consumer has no Cargo.lock: this covers both `generate-lockfile` and the real build path.
@@ -96,9 +104,10 @@ CARGO_DOTNET_BACKEND=native \
 
 [[ "$(hash_file "$work/ambient-cargo/config.toml")" == "$ambient_config_before" ]]
 [[ "$(hash_file "$work/ambient-cargo/credentials.toml")" == "$ambient_creds_before" ]]
-[[ -f "$work/private-cache/cargo-home/credentials.toml" ]]
+private_credentials="$(credential_store "$work/private-cache")"
+[[ -f "$private_credentials" ]]
 [[ ! -e "$work/ambient-cargo/registry" ]]
-[[ -d "$work/private-cache/cargo-home/registry" ]]
+[[ -d "$(dirname "$private_credentials")/registry" ]]
 [[ -f "$work/consumer/Cargo.lock" ]]
 [[ -f "$work/consumer/target/x86_64-unknown-dotnet/debug/rcl-private-registry-consumer.rustdotnet.receipt.json" ]]
 rg -qx 'config' "$work/registry.events"
