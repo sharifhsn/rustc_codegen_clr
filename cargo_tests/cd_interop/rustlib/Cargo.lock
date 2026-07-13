@@ -5,3 +5,11 @@ version = 4
 [[package]]
 name = "cd_interop"
 version = "0.1.0"
+
+[[patch.unused]]
+name = "dotnet_macros"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mycorrhiza"
+version = "0.0.0"
