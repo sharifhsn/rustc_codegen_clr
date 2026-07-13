@@ -347,6 +347,11 @@
     <Exec Command="&quot;$(_CargoDotnetExe)&quot; build &quot;$(_OneDir)&quot; $(_ProfileFlag) $(_CleanFlag) $(_DotnetFlag)"
           EnvironmentVariables="PATH=$(RustDotnetToolPath):$(PATH);DOTNET_ROOT=$(RustDotnetDotnetRoot)" />
 
+    <!-- A build can create a lockfile or change the effective local Cargo closure while applying
+         overlays. Recompute the deterministic input manifest before stamping success so the stamp
+         is newer than the final dependency graph and the immediately following build is a no-op. -->
+    <Exec Command="&quot;$(_CargoDotnetExe)&quot; metadata-inputs &quot;$(_OneDir)&quot; --output &quot;$(_OneMetadataInputs)&quot;" />
+
     <Error Condition="!Exists('$(_OneDll)')"
            Text="RustDotnet: cargo dotnet build succeeded but the expected assembly was not found: $(_OneDll). Check that the crate's [lib] crate-type = [&quot;cdylib&quot;] and that the resolved assembly name ('$(_OneCrateName)') matches the crate's [package] name (override with &lt;RustCrate CrateName=&quot;...&quot;&gt;)." />
     <Error Condition="!Exists('$(_OneReceipt)')"
