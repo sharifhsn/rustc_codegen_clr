@@ -23,7 +23,11 @@
 //!   `System.Threading.Channels`.
 //! - [`enumerate`] — wraps any .NET `IEnumerator<T>` as a Rust `impl Iterator<Item = T>`; backs
 //!   `for x in &list`-style iteration over the collection wrappers.
+//! - [`enumerate_async`] — consumes managed `IAsyncEnumerable<T>` incrementally from Rust through
+//!   `MoveNextAsync`, including genuinely incomplete `ValueTask<bool>` operations.
 //! - [`span`] — `Span<T>` / `ReadOnlySpan<T>`, zero-copy views over a Rust slice.
+//! - [`memory`] — `Memory<T>` / `ReadOnlyMemory<T>`, GC-owned buffers for managed code that retains
+//!   data or carries it across an async boundary (construction copies a Rust slice).
 //! - [`nullable`] — `System.Nullable<T>` (a generic value type) ↔ Rust `Option<T>`.
 //!
 //! **BCL wrappers**
@@ -59,7 +63,7 @@
 //! - [`comptime`] — comptime type-export intrinsics for defining a managed .NET class from Rust;
 //!   backs the `dotnet_macros::dotnet_class` proc-macro and the declarative `dotnet_typedef!`.
 //! - [`enums`] — mirrors a C# enum as a `#[repr(..)]` Rust enum via the [`dotnet_enum!`] macro.
-//! - [`containers`] — the reusable C#→Rust generic container ([`containers::export_rust_containers!`]),
+//! - [`containers`] — the reusable C#→Rust generic container (`export_rust_containers!`),
 //!   backing the shipped C# `RustDotnet.RustVec<T>` / `RustBoxVec<T>`.
 //! - [`generic_bridge`] — the lower-level WF-9 generic-interop macros (`dotnet_generic!` /
 //!   `dotnet_generic_impl!` / `r#gen!`) that the above idiomatic wrappers are themselves built on.
@@ -112,6 +116,7 @@ pub mod dynamic;
 /// The enumerator bridge — wrap any .NET `IEnumerator<T>` as a Rust `impl Iterator<Item = T>`. This
 /// is what backs by-reference iteration (`for x in &list`) over the [`collections`] wrappers.
 pub mod enumerate;
+pub mod enumerate_async;
 /// `.NET enum` ↔ Rust enum bridge — the [`dotnet_enum!`] macro mirrors a C# enum as a `#[repr(..)]`
 /// Rust enum with the boundary conversions (`to_handle`/`from_handle`).
 pub mod enums;
@@ -127,6 +132,8 @@ pub mod generic_bridge;
 pub mod intrinsics;
 /// Building `System.Linq.Expressions` trees (the shape EF Core / `IQueryable` consumes). See [`linq`].
 pub mod linq;
+/// GC-owned `System.Memory<T>` / `ReadOnlyMemory<T>` buffers that can outlive a Rust borrow.
+pub mod memory;
 /// `System.Nullable<T>` ↔ Rust `Option<T>` bridge (a generic value type). See [`nullable::NullableExt`].
 pub mod nullable;
 /// One-glance import surface — `use mycorrhiza::prelude::*;` pulls in the collections, the managed
@@ -139,14 +146,13 @@ pub mod span;
 /// `SemaphoreSlim` meant to be shared by reference with C#). See [`sync`] for the honest safety story
 /// on what does and doesn't cross the language boundary.
 pub mod sync;
+/// Wrappers around types from the `System` namespace
+pub mod system;
 /// The Task ↔ Future bridge — `.await` a .NET `Task<T>` from Rust (poll `IsCompleted` / read
 /// `Result`) and expose a Rust `async fn` as a .NET `Task<T>` (drive to completion into a
 /// `TaskCompletionSource<T>`). Built on the WF-9 generic bridge; async coroutine lowering already
 /// runs on the dotnet PAL, this is the interop seam. See [`task::await_task`] / [`task::future_to_task`].
 pub mod task;
-use class::*;
-/// Wrappers around types from the `System` namespace
-pub mod system;
 /// C# `char` type
 pub type DotNetChar = crate::intrinsics::RustcCLRInteropManagedChar;
 
@@ -194,7 +200,7 @@ macro_rules! managed_safe {
         managed_safe! { $($es),+ }
     };
 }
-managed_safe! {u8,i8,u16,i16,u32,i32,u64,i64,u128,i128,usize,isize,f32,f64}
+managed_safe! {bool,u8,i8,u16,i16,u32,i32,u64,i64,u128,i128,usize,isize,f32,f64}
 unsafe impl<T> ManagedSafe for *mut T {}
 unsafe impl<T> ManagedSafe for *const T {}
 pub trait IntoManagedSafe<Target: ManagedSafe> {

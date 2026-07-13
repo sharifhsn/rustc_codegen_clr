@@ -10,6 +10,7 @@ log_dir="${RCL_MATRIX_LOG_DIR:-/tmp/rustc_codegen_clr-e2e-matrix}"
 native_target_root="${RCL_MATRIX_NATIVE_TARGET_ROOT:-/tmp/rustc_codegen_clr-native-matrix}"
 read -r -a profiles <<< "${RCL_MATRIX_PROFILES:-release debug}"
 case_filter="${RCL_MATRIX_CASES:-}"
+dotnet_version="${DOTNET_VERSION:-10}"
 
 if [[ ! -x "$driver" ]]; then
     echo "cargo-dotnet driver is missing; build it with:" >&2
@@ -32,8 +33,9 @@ native_diff_cases=(
 # Managed-only probes cannot be compiled natively. Each must print its exact
 # completion marker only after its internal assertions/pass-count checks succeed.
 managed_selfcheck_cases=(
-    cd_bcl cd_collections cd_decimal cd_span cd_sync cd_idiomatic cd_enumerate cd_json cd_net10_bcl
-    cd_delegates cd_async cd_generic cd_fatptr cd_fpfam cd_dynamic_invoke cd_pure
+    cd_bcl cd_collections cd_decimal cd_span cd_vtgen cd_gmethod cd_linq cd_sync cd_idiomatic
+    cd_enumerate cd_json cd_net10_bcl
+    cd_delegates cd_async cd_async_stream cd_generic cd_fatptr cd_fpfam cd_dynamic_invoke cd_pure
     cd_persisted_async cd_channel cd_tokio cd_static_field_offset cd_subword_atomics
     cd_htmlagility cd_linq_expr cd_efcore cd_linq_groupby cd_pdb cd_pdfsharp
 )
@@ -79,7 +81,7 @@ native_profile_args() {
 }
 
 mkdir -p "$log_dir" "$native_target_root" "$(dirname "$summary")"
-printf 'kind|profile|case|dotnet_exit|native_exit|stdout_match|diagnostic_hits|marker|required\n' > "$summary"
+printf 'kind|dotnet|profile|case|dotnet_exit|native_exit|stdout_match|diagnostic_hits|marker|required|result\n' > "$summary"
 overall=0
 index=0
 selected_count=0
@@ -92,7 +94,7 @@ run_native_diff() {
     local case_name="$1" profile="$2" clean_flag="$3"
     local case_dir="$repo/cargo_tests/$case_name"
     local prefix="$log_dir/$profile-$case_name"
-    local dotnet_exit native_exit hits stdout_match marker dotnet_profile native_profile
+    local dotnet_exit native_exit hits stdout_match marker dotnet_profile native_profile row_result
 
     remove_generated_config "$case_dir" || return 1
     dotnet_profile="$(profile_args "$profile")" || return 1
@@ -106,7 +108,8 @@ run_native_diff() {
     native_exit=$?
 
     RCL_ICE_LOG=1 CARGO_DOTNET_BACKEND=native \
-        "$driver" dotnet run "$case_dir" "$dotnet_profile" $clean_flag --locked \
+        "$driver" dotnet run "$case_dir" "$dotnet_profile" --dotnet "$dotnet_version" \
+        $clean_flag --locked \
         > "$prefix.dotnet.stdout" 2> "$prefix.dotnet.stderr"
     dotnet_exit=$?
     remove_generated_config "$case_dir" || return 1
@@ -132,42 +135,58 @@ run_native_diff() {
     fi
     hits="$(rg -n -i "$diagnostics" "$prefix.dotnet.stdout" "$prefix.dotnet.stderr" 2>/dev/null | wc -l | tr -d ' ')"
     if rg -q "== $case_name done ==" "$prefix.dotnet.stdout"; then marker=yes; else marker=no; fi
-    printf 'native_diff|%s|%s|%d|%d|%s|%s|%s|no\n' \
-        "$profile" "$case_name" "$dotnet_exit" "$native_exit" "$stdout_match" "$hits" "$marker" >> "$summary"
-    ((dotnet_exit == 0 && native_exit == 0 && hits == 0)) && [[ "$stdout_match" == yes ]]
+    if ((dotnet_exit == 0 && native_exit == 0 && hits == 0)) && [[ "$stdout_match" == yes ]]; then
+        row_result=PASS
+    else
+        row_result=FAIL
+    fi
+    printf 'native_diff|%s|%s|%s|%d|%d|%s|%s|%s|no|%s\n' \
+        "$dotnet_version" "$profile" "$case_name" "$dotnet_exit" "$native_exit" \
+        "$stdout_match" "$hits" "$marker" "$row_result" >> "$summary"
+    [[ "$row_result" == PASS ]]
 }
 
 run_managed_selfcheck() {
     local case_name="$1" profile="$2" clean_flag="$3"
     local case_dir="$repo/cargo_tests/$case_name"
     local prefix="$log_dir/$profile-$case_name"
-    local dotnet_exit hits marker dotnet_profile
+    local dotnet_exit hits marker dotnet_profile row_result
     dotnet_profile="$(profile_args "$profile")" || return 1
 
     RCL_ICE_LOG=1 CARGO_DOTNET_BACKEND=native \
-        "$driver" dotnet run "$case_dir" "$dotnet_profile" $clean_flag --locked \
+        "$driver" dotnet run "$case_dir" "$dotnet_profile" --dotnet "$dotnet_version" \
+        $clean_flag --locked \
         > "$prefix.dotnet.stdout" 2> "$prefix.dotnet.stderr"
     dotnet_exit=$?
     hits="$(rg -n -i "$diagnostics" "$prefix.dotnet.stdout" "$prefix.dotnet.stderr" 2>/dev/null | wc -l | tr -d ' ')"
     if rg -q "== $case_name done ==" "$prefix.dotnet.stdout"; then marker=yes; else marker=no; fi
-    printf 'managed_selfcheck|%s|%s|%d|na|na|%s|%s|yes\n' \
-        "$profile" "$case_name" "$dotnet_exit" "$hits" "$marker" >> "$summary"
-    ((dotnet_exit == 0 && hits == 0)) && [[ "$marker" == yes ]]
+    if ((dotnet_exit == 0 && hits == 0)) && [[ "$marker" == yes ]]; then
+        row_result=PASS
+    else
+        row_result=FAIL
+    fi
+    printf 'managed_selfcheck|%s|%s|%s|%d|na|na|%s|%s|yes|%s\n' \
+        "$dotnet_version" "$profile" "$case_name" "$dotnet_exit" "$hits" "$marker" \
+        "$row_result" >> "$summary"
+    [[ "$row_result" == PASS ]]
 }
 
 run_managed_host() {
     local case_name="$1" profile="$2" clean_flag="$3"
     local case_dir="$repo/cargo_tests/$case_name"
     local prefix="$log_dir/$profile-$case_name"
-    local dotnet_exit hits marker dotnet_profile
+    local dotnet_exit hits marker dotnet_profile row_result
     dotnet_profile="$(profile_args "$profile")" || return 1
 
     RCL_ICE_LOG=1 CARGO_DOTNET_BACKEND=native \
-        "$driver" dotnet build "$case_dir" "$dotnet_profile" $clean_flag --locked \
+        "$driver" dotnet build "$case_dir" "$dotnet_profile" --dotnet "$dotnet_version" \
+        --source-link-url 'https://example.invalid/rust-dotnet-fixture/*' \
+        $clean_flag --locked \
         > "$prefix.build.stdout" 2> "$prefix.build.stderr"
     dotnet_exit=$?
     if ((dotnet_exit == 0)); then
-        dotnet run --project "$case_dir/csharp/cd_export_ergonomics_cs.csproj" \
+        RustDotnetVersion="$dotnet_version" RustCheckoutPath="$repo" \
+            dotnet run --project "$case_dir/csharp/cd_export_ergonomics_cs.csproj" \
             --property:RustProfile="$profile" > "$prefix.dotnet.stdout" 2> "$prefix.dotnet.stderr"
         dotnet_exit=$?
     else
@@ -177,9 +196,15 @@ run_managed_host() {
     hits="$(rg -n -i "$diagnostics" "$prefix.build.stdout" "$prefix.build.stderr" \
         "$prefix.dotnet.stdout" "$prefix.dotnet.stderr" 2>/dev/null | wc -l | tr -d ' ')"
     if rg -q "== $case_name done ==" "$prefix.dotnet.stdout"; then marker=yes; else marker=no; fi
-    printf 'managed_host|%s|%s|%d|na|na|%s|%s|yes\n' \
-        "$profile" "$case_name" "$dotnet_exit" "$hits" "$marker" >> "$summary"
-    ((dotnet_exit == 0 && hits == 0)) && [[ "$marker" == yes ]]
+    if ((dotnet_exit == 0 && hits == 0)) && [[ "$marker" == yes ]]; then
+        row_result=PASS
+    else
+        row_result=FAIL
+    fi
+    printf 'managed_host|%s|%s|%s|%d|na|na|%s|%s|yes|%s\n' \
+        "$dotnet_version" "$profile" "$case_name" "$dotnet_exit" "$hits" "$marker" \
+        "$row_result" >> "$summary"
+    [[ "$row_result" == PASS ]]
 }
 
 for kind in native_diff managed_selfcheck managed_host; do
@@ -213,7 +238,16 @@ done
 
 echo "summary: $summary"
 echo "logs: $log_dir"
-RCL_MATRIX_COMMAND="RCL_MATRIX_PROFILES=${RCL_MATRIX_PROFILES:-release debug} RCL_MATRIX_CASES=${RCL_MATRIX_CASES:-<all>} feasibility/e2e_matrix.sh" \
+capability_args=(
+    capabilities --manifest "$repo/acceptance/capabilities.toml"
+    --results "$summary" --output "${summary%.*}.capabilities.md"
+    --evidence-scope "${RCL_MATRIX_CAPABILITY_SCOPE:-presubmit}"
+)
+if [[ "${RCL_MATRIX_STRICT_CAPABILITIES:-0}" == 1 ]]; then
+    capability_args+=(--strict)
+fi
+"$driver" "${capability_args[@]}" || overall=1
+RCL_MATRIX_COMMAND="DOTNET_VERSION=$dotnet_version RCL_MATRIX_PROFILES=${RCL_MATRIX_PROFILES:-release debug} RCL_MATRIX_CASES=${RCL_MATRIX_CASES:-<all>} feasibility/e2e_matrix.sh" \
     "$repo/feasibility/write_acceptance_receipt.sh" \
     "$summary" "${summary%.*}.receipt.json" "$log_dir" || overall=1
 exit "$overall"

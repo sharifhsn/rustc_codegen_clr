@@ -11,7 +11,7 @@
 //! ## Why the enumerator is obtained non-generically, then cast
 //!
 //! The obvious call — `IEnumerable<T>::GetEnumerator()` returning `IEnumerator<T>` — needs a methodref
-//! whose *return* is the **definition-shape** `IEnumerator`1<!0>` (the interface's own generic), but
+//! whose *return* is the **definition-shape** `IEnumerator<!0>` (the interface's own generic), but
 //! whose produced Rust value must be the *concrete* `IEnumerator<T>` local. The CIL typechecker
 //! accepts a bare `!N` against a concrete type (soundly — see the WF-9 marker guard), but not a
 //! *nested* generic like `IEnumerator<!0>` against `IEnumerator<T>`, and weakening the checker is
@@ -40,18 +40,18 @@ const CORELIB: &str = "System.Private.CoreLib";
 /// Generic `IEnumerable<T>` handle — the interface view of any BCL collection. Reference type, so
 /// `GetEnumerator` dispatches with `callvirt`.
 pub type IEnumerable<T> =
-    RustcCLRInteropManagedGeneric<{ CORELIB }, { "System.Collections.Generic.IEnumerable" }, (T,)>;
+    RustcCLRInteropManagedGeneric<{ CORELIB }, "System.Collections.Generic.IEnumerable", (T,)>;
 /// Generic `IEnumerator<T>` handle — `get_Current()` on this returns the element `!0`.
 type IEnumeratorGeneric<T> =
-    RustcCLRInteropManagedGeneric<{ CORELIB }, { "System.Collections.Generic.IEnumerator" }, (T,)>;
+    RustcCLRInteropManagedGeneric<{ CORELIB }, "System.Collections.Generic.IEnumerator", (T,)>;
 /// The non-generic base interface `System.Collections.IEnumerable` — its `GetEnumerator()` returns
 /// the non-generic `IEnumerator` (no generic markers involved, which sidesteps the nested-generic
 /// def-shape return that the typechecker cannot accept against a concrete local).
 type IEnumerableNonGeneric =
-    RustcCLRInteropManagedClass<{ CORELIB }, { "System.Collections.IEnumerable" }>;
+    RustcCLRInteropManagedClass<{ CORELIB }, "System.Collections.IEnumerable">;
 /// The non-generic base interface `System.Collections.IEnumerator` — declares `MoveNext()`.
 type IEnumeratorNonGeneric =
-    RustcCLRInteropManagedClass<{ CORELIB }, { "System.Collections.IEnumerator" }>;
+    RustcCLRInteropManagedClass<{ CORELIB }, "System.Collections.IEnumerator">;
 
 /// `System.Collections.IEnumerable::GetEnumerator()` — a `callvirt` on the non-generic interface,
 /// returning the non-generic `System.Collections.IEnumerator` (a reference type). The receiver is the
@@ -65,7 +65,7 @@ fn get_enumerator_nongeneric(enumerable: IEnumerableNonGeneric) -> IEnumeratorNo
 fn get_current<T>(en: IEnumeratorGeneric<T>) -> T {
     crate::intrinsics::rustc_clr_interop_generic_call1::<
         { CORELIB },
-        { "System.Collections.Generic.IEnumerator" },
+        "System.Collections.Generic.IEnumerator",
         false,
         "get_Current",
         2,
@@ -112,7 +112,7 @@ impl<T> Iterator for Enumerator<T> {
 /// knows the real size regardless of `K`/`V` — so a single fixed `SIZE` works for every `K`, `V`.
 pub type KeyValuePair<K, V> = RustcCLRInteropManagedGenericStruct<
     { CORELIB },
-    { "System.Collections.Generic.KeyValuePair" },
+    "System.Collections.Generic.KeyValuePair",
     16,
     (K, V),
 >;
@@ -122,7 +122,7 @@ pub type KeyValuePair<K, V> = RustcCLRInteropManagedGenericStruct<
 fn kvp_key<K, V>(kvp: &KeyValuePair<K, V>) -> K {
     crate::intrinsics::rustc_clr_interop_generic_call1::<
         { CORELIB },
-        { "System.Collections.Generic.KeyValuePair" },
+        "System.Collections.Generic.KeyValuePair",
         true,
         "get_Key",
         1,
@@ -136,7 +136,7 @@ fn kvp_key<K, V>(kvp: &KeyValuePair<K, V>) -> K {
 fn kvp_value<K, V>(kvp: &KeyValuePair<K, V>) -> V {
     crate::intrinsics::rustc_clr_interop_generic_call1::<
         { CORELIB },
-        { "System.Collections.Generic.KeyValuePair" },
+        "System.Collections.Generic.KeyValuePair",
         true,
         "get_Value",
         1,

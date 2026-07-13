@@ -16,8 +16,8 @@
 //! eagerly raise an exception a conditionally-reached call would not.
 
 use crate::{
-    Assembly, BasicBlock, CILIter, CILIterElem, IString, bimap::Interned, cilnode::CILNode,
-    cilroot::CILRoot, method::LocalDef,
+    Assembly, BasicBlock, CILIter, CILIterElem, Const, IString, Type, bimap::Interned,
+    cilnode::CILNode, cilroot::CILRoot, method::LocalDef,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -37,6 +37,65 @@ fn is_const_transmute(
         }
     }
     None
+}
+
+/// A process-independent key for the constant accepted by `is_const_transmute`.
+///
+/// Interned handles cannot be used as sort keys: their numeric values reflect allocation history,
+/// not semantic identity. Resolve every handle here so the hoisted initializer order is stable
+/// across independently linked assemblies.
+fn const_key(value: &Const, asm: &Assembly) -> Vec<u8> {
+    let mut key = Vec::new();
+    macro_rules! scalar {
+        ($tag:expr, $value:expr) => {{
+            key.push($tag);
+            key.extend_from_slice(&$value.to_le_bytes());
+        }};
+    }
+    match value {
+        Const::I8(value) => scalar!(0, *value),
+        Const::I16(value) => scalar!(1, *value),
+        Const::I32(value) => scalar!(2, *value),
+        Const::I64(value) => scalar!(3, *value),
+        Const::I128(value) => scalar!(4, *value),
+        Const::ISize(value) => scalar!(5, *value),
+        Const::U8(value) => scalar!(6, *value),
+        Const::U16(value) => scalar!(7, *value),
+        Const::U32(value) => scalar!(8, *value),
+        Const::U64(value) => scalar!(9, *value),
+        Const::U128(value) => scalar!(10, *value),
+        Const::USize(value) => scalar!(11, *value),
+        Const::PlatformString(value) => {
+            key.push(12);
+            key.extend_from_slice(asm[*value].as_bytes());
+        }
+        Const::Bool(value) => key.extend_from_slice(&[13, u8::from(*value)]),
+        Const::F32(value) => scalar!(14, value.to_bits()),
+        Const::F64(value) => scalar!(15, value.to_bits()),
+        Const::Null(class) => {
+            key.push(16);
+            key.extend_from_slice(Type::ClassRef(*class).mangle(asm).as_bytes());
+        }
+        Const::ByteBuffer { data, tpe } => {
+            key.push(17);
+            key.extend_from_slice(asm[*tpe].mangle(asm).as_bytes());
+            key.push(0);
+            key.extend_from_slice(&asm.const_data[*data]);
+        }
+    }
+    key
+}
+
+fn hoist_key(value: &CILNode, asm: &Assembly) -> (String, Vec<u8>) {
+    let CILNode::Call(info) = value else {
+        unreachable!("hoist target must be a call")
+    };
+    let (method, args, _) = info.as_ref();
+    let CILNode::Const(value) = asm.get_node(args[0]) else {
+        unreachable!("hoist target must contain a constant")
+    };
+    let output = asm[asm[*method].sig()].output().mangle(asm);
+    (output, const_key(value, asm))
 }
 
 /// Hoist every `transmute(<const>)` used in a non-entry block to a once-evaluated entry-block local.
@@ -73,6 +132,8 @@ pub fn hoist_const_calls(
     //    its canonical interned node id for the entry initializer.
     let mut to_local: HashMap<CILNode, u32> = HashMap::new();
     let mut inits: Vec<(u32, Interned<CILNode>)> = Vec::new();
+    let mut targets: Vec<_> = targets.into_iter().collect();
+    targets.sort_by_cached_key(|value| hoist_key(value, asm));
     for value in targets {
         let mref = is_const_transmute(asm, &value, transmute_name).unwrap();
         let ret = *asm[asm[mref].sig()].output();
@@ -106,4 +167,33 @@ pub fn hoist_const_calls(
         .collect();
     entry.splice(0..0, init_roots);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_hoist_key_uses_values_not_interning_history() {
+        let mut first = Assembly::default();
+        let first_zeta = first.alloc_string("zeta");
+        let first_alpha = first.alloc_string("alpha");
+
+        let mut second = Assembly::default();
+        let second_alpha = second.alloc_string("alpha");
+        let second_zeta = second.alloc_string("zeta");
+
+        assert_eq!(
+            const_key(&Const::PlatformString(first_alpha), &first),
+            const_key(&Const::PlatformString(second_alpha), &second)
+        );
+        assert_eq!(
+            const_key(&Const::PlatformString(first_zeta), &first),
+            const_key(&Const::PlatformString(second_zeta), &second)
+        );
+        assert!(
+            const_key(&Const::PlatformString(first_alpha), &first)
+                < const_key(&Const::PlatformString(first_zeta), &first)
+        );
+    }
 }

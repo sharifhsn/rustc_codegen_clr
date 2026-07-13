@@ -65,7 +65,8 @@ pub struct AssembledBody {
     /// past the fat header — `pdb::PdbBuilder`/`export.rs`'s wiring must subtract the header
     /// length if it needs an offset relative to `code` alone) it was recorded at. Empty for a
     /// method with no source spans (`MethodImpl::Extern`/`Missing`, or a body whose MIR carried no
-    /// spans) — [`pdb::PdbBuilder::add_method`] treats that as "no debug info", matching the spec's
+    /// spans) — [`crate::ir::pe_exporter::pdb::PdbBuilder::add_method`] treats that as "no debug
+    /// info", matching the spec's
     /// empty-blob convention for such rows.
     pub sequence_points: Vec<SequencePoint>,
     /// The `StandAloneSig` token of this method's `.locals`, if any — mirrors the fat header's own

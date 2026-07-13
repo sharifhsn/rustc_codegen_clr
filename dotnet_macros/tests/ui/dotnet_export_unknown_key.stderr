@@ -1,4 +1,4 @@
-error: #[dotnet_export]: unknown attribute key; expected `name = "ManagedName"` or `error = "exception"`
+error: #[dotnet_export]: unknown attribute key; expected `name = "ManagedName"`, `error = "exception"`, or `enums(Type, ...)`
  --> tests/ui/dotnet_export_unknown_key.rs:3:17
   |
 3 | #[dotnet_export(rename = "ParsePosition")]

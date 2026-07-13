@@ -375,7 +375,7 @@ impl BootstrapLayout {
 }
 
 /// The number of bytes `write_pe` places in `.text` BEFORE the CLI header — `0` for a `.dll`
-/// (`has_entry_point = false`), or [`BootstrapLayout::iat_len`] for an `.exe` (the IAT the native
+/// (`has_entry_point = false`), or `BootstrapLayout::iat_len` for an `.exe` (the IAT the native
 /// bootstrap stub needs, see `write_pe`'s module doc). **Single source of truth**: callers that
 /// need to pre-compute an RVA before calling `write_pe` (e.g. `export::export_pe`'s two-pass
 /// metadata-length-probe layout) must use this instead of re-deriving the same constant, so the
@@ -396,21 +396,21 @@ pub fn text_header_len(has_entry_point: bool) -> u32 {
 
 /// The RVA `.sdata` (the section holding `FieldRVA` blobs) will start at, given the sizes of the
 /// pieces that precede it in `.text`. **Single source of truth**, same rationale as
-/// [`text_header_len`]: a caller (`export::export_pe`) must call [`MetadataBuilder::set_field_rva`]
-/// (`super::tables::MetadataBuilder::set_field_rva`) with real RVAs before the FINAL
+/// [`text_header_len`]: a caller (`export::export_pe`) must call
+/// [`super::tables::MetadataBuilder::set_field_rva`] with real RVAs before the FINAL
 /// `MetadataBuilder::serialize()` call, i.e. before `write_pe` itself runs and could otherwise be
 /// the only place this arithmetic lives — re-deriving `write_pe`'s internal `.text`-content-length
 /// math (header + CLI header + metadata + method bodies + bootstrap import table/stub tail, all
 /// `SectionAlignment`-rounded) independently would risk the same "8 bytes short" class of bug
 /// `text_header_len`'s doc comment describes, just for `FieldRVA.RVA` instead of `MethodDef.RVA`.
 ///
-/// Mirrors `write_pe`'s own `sdata` [`SectionLayout::plan`] call exactly: `.text`'s content is
+/// Mirrors `write_pe`'s own `sdata` `SectionLayout::plan` call exactly: `.text`'s content is
 /// `text_header_len(has_entry_point) + CLI_HEADER_CB + metadata_len + method_bodies_len +
 /// debug_dir_len [+ bootstrap import-table-and-stub tail when `has_entry_point`]`, and `.sdata`
 /// starts at that, rounded up to `SectionAlignment` from a `SectionAlignment`-aligned `.text` base.
 ///
 /// `debug_dir_len` is `0` when no PDB is being emitted for this image, or
-/// [`debug_directory_region_len`] of the [`super::pdb::DebugDirectoryEntry`] that will be passed
+/// `debug_directory_region_len` of the [`super::pdb::DebugDirectoryEntry`] that will be passed
 /// as `PeOptions::debug_directory` — see that function's doc for why callers can't just recompute
 /// it inline (RSDS payload length depends on the PDB path string length).
 #[must_use]
@@ -435,7 +435,7 @@ pub fn field_rva_section_start(
     align_up(SECTION_ALIGNMENT + text_content_len, SECTION_ALIGNMENT)
 }
 
-/// Public wrapper for [`debug_directory_region_len`] — `export.rs`'s two-pass metadata-length
+/// Public wrapper for `debug_directory_region_len` — `export.rs`'s two-pass metadata-length
 /// probe (mirroring [`field_rva_section_start`]'s own rationale) needs this BEFORE it can call
 /// `field_rva_section_start`, since the debug directory sits ahead of `.sdata` in `.text`.
 #[must_use]
@@ -470,7 +470,7 @@ pub fn debug_directory_len(
 /// `.text` = CLI header (`CLI_HEADER_CB` bytes) + `metadata` + `method_bodies`, back to back,
 /// starting at RVA `SECTION_ALIGNMENT`. This ordering means the CLI header's own RVA — and thus
 /// the metadata root's RVA (`CLI header start + CLI_HEADER_CB`) — is fixed *before*
-/// `method_bodies` is even known, which is exactly the property [`layout_text_section`] exposes
+/// `method_bodies` is even known, which is exactly the property `layout_text_section` exposes
 /// so callers can compute a metadata RVA before body RVAs, if some future caller needs to (today
 /// every caller follows the four-phase pipeline in the module doc and already has final
 /// `metadata`/`method_bodies` bytes by the time `write_pe` runs). `.sdata` (if `field_rva_data`

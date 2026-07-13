@@ -1,633 +1,148 @@
-# `cargo dotnet` — compile arbitrary Rust into a .NET / C# project, in one command
+# `cargo dotnet` reference
 
-This is the **average-user entry point** for the project. If you just want to take a Rust crate and
-**run it on .NET**, or **call a Rust library from C#**, this is the page. It assumes no knowledge of
-the codegen backend internals — those live in [docs/ARCHITECTURE.md](ARCHITECTURE.md).
+`cargo dotnet` is the supported user interface for `rustc_codegen_clr`. It owns compiler setup,
+the private patched sysroot, target configuration, artifact discovery, managed packaging, and
+execution. Users should not need to construct `RUSTFLAGS` or configure `build-std` manually.
 
-> **What this gives you:** `cargo dotnet build|run` compiles an *arbitrary* Rust crate to a runnable
-> .NET assembly (or a C#-referenceable `.dll`) with **zero hand-config** — no `RUSTFLAGS`, no
-> `[patch.crates-io]`, no vendoring, no `.cargo/config` edits. You write a normal `Cargo.toml`; the
-> command supplies the .NET target, `build-std` with the real .NET PAL, the codegen backend + linker,
-> and auto-applies the crate-overlay registry so syscall-using deps (`mio`/`socket2`/`tokio`) just work.
+## Supported configuration
 
-> **Host support:** Linux and macOS are the published host matrix. Windows x64 is continuously tested
-> for compiler/driver unit tests plus real .NET 10 execution, including native sub-word atomics and
-> .NET 10-only BCL calls, but remains opt-in with `CARGO_DOTNET_EXPERIMENTAL_WINDOWS=1` while the
-> broader Windows MSBuild/package surface is unfinished. Help, version, scaffolding, diagnostics,
-> and read-only metadata behavior remain available without the opt-in.
+The 0.0.1 SDK supports .NET 10 on Linux x64, macOS Apple Silicon, and Windows x64. Commands accept
+`--dotnet 10` for explicit scripts, but it is optional because 10 is the only public profile.
+Passing 8 or 9 fails immediately with an actionable diagnostic.
 
----
+The compiler contains compatibility implementation for older runtimes, which is useful for
+development and archaeology, but it is not part of this release contract.
 
-## 1. What it is
+## Commands
 
-`cargo-dotnet` is a [cargo custom subcommand](https://doc.rust-lang.org/cargo/reference/external-tools.html#custom-subcommands):
-once it is on `PATH`, `cargo dotnet …` works. It is a **`cargo install`-able clap Rust binary**
-([`tools/cargo-dotnet/`](../tools/cargo-dotnet)) that owns the **entire native pipeline in pure Rust** —
-the CLI + cargo-subcommand convention + standard-flag passthrough, AND the inner build/run/pack: it
-provisions a content-addressed private sysroot and injects the dotnet PAL into its private
-`rust-src` (a declarative, anchor-based, unit-tested injection engine — see
-[`src/palinject.rs`](../tools/cargo-dotnet/src/palinject.rs)), sets the backend RUSTFLAGS, applies the
-[`dotnet_overlays`](../dotnet_overlays/README.md) registry through an explicit build-local Cargo
-config (typed `toml`), patches libc only in cargo-dotnet's private Cargo home,
-runs `build-std`, locates the artifact (typed `serde_json`), and runs the apphost or assembles a NuGet
-`.nupkg` (the `zip` crate). It shells out only to the *external tools* it must — `cargo`/`rustc`,
-the `dotnet` apphost, the cilly linker — exactly as any build tool does. **`ilasm` is not one of
-them**: the linker's default `DIRECT_PE=1` path writes the PE directly (see
-[ARCHITECTURE.md](ARCHITECTURE.md#4-the-custom-linker-does-the-heavy-lifting)); `ilasm` is only
-needed if you opt into the `DIRECT_PE=0` fallback (§2's prerequisites below describe that opt-in
-tool, not a hard requirement of this pipeline).
-
-> **The native path needs NO bash core.** Earlier the Rust binary shelled out to a shared bash pipeline
-> (`feasibility/_cargo_dotnet_core.sh` / `$CARGO_DOTNET_HOME/core.sh`) for the inner steps. That is gone
-> on the native path: the installed binary runs the **whole** build/run/pack pipeline itself, verified
-> with `feasibility/_cargo_dotnet_core.sh` **physically absent** (J1/J2/J3 + `pack` all pass). The bash
-> script (`feasibility/cargo-dotnet` + the core) remains ONLY the in-repo **Docker dev driver** the
-> binary delegates to for `CARGO_DOTNET_BACKEND=docker` — a developer convenience that owns the
-> container mount model, not part of the user journey.
-
-> **The Rust binary replaces the old bash front-end for users.** The previous front-end was a bash
-> script copied to `~/.cargo/bin`. It is now a real clap binary installed via
-> `cargo install --path tools/cargo-dotnet` (see [§2c](#2c-install-once-use-anywhere)).
-
-```bash
-cargo dotnet build [PATH] [--release|--debug] [--clean] [-v] [CARGO FLAGS…]
-cargo dotnet run   [PATH] [--release|--debug] [--clean] [-v] [CARGO FLAGS…] [-- ARGS…]
-cargo dotnet pack  [PATH] [--release|--debug] [--id NAME] [--version VER] [--out DIR]
-cargo dotnet --version
-cargo dotnet --help
+```text
+cargo dotnet setup --from-repo PATH
+cargo dotnet doctor [MESSAGE_OR_LOG] [--workspace PATH] [--json]
+cargo dotnet new PATH --app|--lib|--plugin
+cargo dotnet build [PATH]
+cargo dotnet run [PATH] [-- PROGRAM_ARGS...]
+cargo dotnet test [PATH]
+cargo dotnet restore [PATH] [--locked|--offline|--frozen]
+cargo dotnet pack [PATH] [--out DIR] [--validate]
+cargo dotnet push PACKAGE --source URL
+cargo dotnet publish CSPROJ_OR_DIR [--rid RID] [--output DIR]
+cargo dotnet add-nuget PACKAGE VERSION OUT_DIR [--source URL]
+cargo dotnet bundle create --home PATH --out SDK.zip
+cargo dotnet bundle verify SDK.zip
+cargo dotnet bundle install SDK.zip [--home PATH] [--force]
+cargo dotnet capabilities --manifest acceptance/capabilities.toml
 ```
 
-| arg / flag | meaning |
+Run `cargo dotnet <command> --help` for the complete flags accepted by a command.
+
+## Common build flags
+
+| Flag | Meaning |
 |---|---|
-| `PATH` | the crate dir to build (default `.`). **Arbitrary** — under `cargo_tests/` *or* any fully external path (e.g. `/tmp/myproj`). |
-| `--release` | release profile — **the default** (project convention; release unless `--debug`). |
-| `--debug` | debug profile (opt out of release). |
-| `--clean` | `cargo clean` first; rebuilds std. Bulletproof but slow — reach for it if a stale-cache result looks wrong. |
-| `-v` / `--verbose` | unfiltered build log. |
-| **CARGO FLAGS** | **standard cargo flags forwarded to the inner build-std** — `--features`/`--all-features`/`--no-default-features`, `--manifest-path`, `-p`/`--package`, `--workspace`/`--exclude`, and any other flag (`--locked`/`--offline`/`--frozen`/`--target-dir`/`--message-format`/…) passed verbatim. (Unblocks getrandom 0.2's `custom` feature, too.) |
-| `-- ARGS` | (`run` only) args forwarded to the .NET program; **its exit code propagates** back out (see [§6 honest limits](#6-what-works--honest-limits)). |
-| `--id` / `--version` / `--out` | (`pack` only) override the NuGet package id / version / output dir (see [§5 consuming from C#](#5-consuming-a-rust-library-from-c)). |
-| `--version` | print the front-end version. `--help` prints usage. |
+| `--debug` | Build the Rust and managed artifacts in debug mode |
+| `--release` | Select release mode explicitly; this is the default |
+| `--clean` | Remove mode-specific outputs before building |
+| `--offline` | Require Cargo and NuGet inputs to be available locally |
+| `--frozen` | Require both offline and locked dependency state |
+| `--locked` | Require the current lockfile |
+| `--source-link-url URL_WITH_*` | Map consumer PDB documents to an immutable source URL |
+| `--backend native` | Use the installed host backend; this is the installed default |
+| `--backend docker` | Use the contributor Docker path from a checkout |
 
-Standard cargo flags come **before** any `-- ARGS`. Example:
-`cargo dotnet run ./mycrate --features net,fast -p mycrate --locked -- --port 8080`.
+## Installation layout
 
-The `pack` subcommand builds the crate (a `cdylib`) and emits a NuGet `.nupkg` of its .NET assembly to
-`<crate>/target/nupkg/<id>.<ver>.nupkg`, so a C# project can `<PackageReference>` it from a local feed.
-See [§5](#5-consuming-a-rust-library-from-c).
+The release installer places the SDK under `CARGO_DOTNET_HOME`, defaulting to
+`$HOME/.cargo-dotnet`, and the command under `CARGO_HOME/bin`, defaulting to `$HOME/.cargo/bin`.
 
-Because the Rust is compiled to **managed CIL** (not native code behind a P/Invoke wall), the produced
-assembly *is* .NET: Rust functions are ordinary managed methods, Rust panics are managed exceptions.
-That single fact is what makes both the run-on-.NET and the call-from-C# stories work without FFI glue.
+The SDK bundle contains:
 
----
+- the host compiler backend and linker;
+- the pinned target specification and toolchain identity;
+- the .NET PAL and Cargo overlays;
+- `mycorrhiza`, `dotnet_macros`, and managed helper sources;
+- MSBuild integration; and
+- the matching `cargo-dotnet` executable.
 
-## 2. Prerequisites & setup
+It deliberately does not contain rustup or the .NET SDK.
 
-The build runs inside the project's reproducible Docker harness (the `rcc-dev` image), which ships the
-pinned nightly + `rustc-dev`/`rust-src` and the .NET 8 SDK. The project is only tested on **Linux
-x86_64 / .NET 8 CoreCLR**, and the harness pins that environment so results don't depend on your host
-(macOS/arm64 is doubly off-path: wrong OS *and* wrong arch). The image also ships `ilasm` (via Mono)
-for the `DIRECT_PE=0` fallback, but the default build (`DIRECT_PE=1`) never invokes it.
+Bundle installation verifies the adjacent `.sha256`, validates the internal per-file hashes and
+host OS/architecture, restores into a temporary directory, then atomically activates the SDK.
+Installed files are integrity-checked before later builds.
 
-```bash
-# One-time: build the harness image (also the "does it still compile on nightly?" check).
-feasibility/run.sh build
-```
+## Scaffolds
 
-Then put `cargo dotnet` on `PATH`. The supported route is the **Rust binary** (see
-[§2c](#2c-install-once-use-anywhere)):
+`cargo dotnet new` creates one of three project shapes:
 
-```bash
-cargo install --path tools/cargo-dotnet        # -> ~/.cargo/bin/cargo-dotnet => `cargo dotnet …`
-```
+- `--app`: a Rust application compiled to a managed executable;
+- `--lib`: a Rust library plus a C# consumer and MSBuild integration; or
+- `--plugin`: a Rust implementation consumed through a managed interface.
 
-For the **in-repo Docker dev flow** you can still invoke the bash front-end directly (it carries the
-Docker mount model the Rust binary delegates to):
+Each scaffold targets `net10.0` and prints its exact next command.
+
+## Build and run
 
 ```bash
-feasibility/cargo-dotnet run cargo_tests/cd_pure   # Docker dev driver (CARGO_DOTNET_BACKEND=docker)
+cargo dotnet build ./crate
+cargo dotnet run ./crate -- arg1 arg2
+cargo dotnet test ./crate
 ```
 
-You need a running Docker daemon. That is the **only** host dependency — the image carries `dotnet`
-(`ilasm` too, but only the `DIRECT_PE=0` fallback path touches it).
+The driver builds a private sysroot for the pinned nightly, invokes rustc with the codegen backend,
+and writes the managed PE, Portable PDB, runtime configuration, and an artifact identity receipt.
+The normal direct-PE path does not require ILAsm; the legacy IL exporter remains a debugging escape
+hatch.
 
-> **The Docker-vs-native seam.** `cargo-dotnet` dispatches on `CARGO_DOTNET_BACKEND` (default
-> `docker`). A **native** (non-Docker) driver (`CARGO_DOTNET_BACKEND=native`) runs the *same*
-> pipeline core directly on the host — no container — against the host's real repo path and
-> `command -v rustc cargo dotnet`. The UX and pipeline are unchanged; only the
-> host-specific paths/tools differ (supplied to the shared core as `CD_*` env vars whose defaults
-> reproduce the container layout, so the Docker path is byte-for-byte unchanged). See
-> **[§2b Native (no Docker)](#2b-native-no-docker)** below and
-> [feasibility/README.md](../feasibility/README.md).
+## Rust and C# interop
 
-> **Dev path vs installed tool.** Running `feasibility/cargo-dotnet` (or `dev.sh pal-build`) from a
-> checkout is the **development** path — it builds from the repo layout and defaults to the Docker
-> backend. For the **end-user** journey — install once, then build/run *any* crate in *any* directory
-> with no repo present — use **[§2c Install once, use anywhere](#2c-install-once-use-anywhere)**. The
-> two are additive: the same script source is both the dev front-end and (after `cargo dotnet setup`
-> copies it to `~/.cargo/bin`) the installed tool.
+For C# consumption, start with a `--lib` or `--plugin` scaffold. Existing C# projects can import
+`$CARGO_DOTNET_HOME/msbuild/RustDotnet.targets` and declare a `<RustCrate>` item. See
+[`INTEROP_CSHARP.md`](INTEROP_CSHARP.md).
 
----
+For Rust calling managed APIs, `mycorrhiza` provides typed BCL wrappers and `add-nuget` generates
+bindings from NuGet's resolved asset graph. See [`QUICKSTART_INTEROP.md`](QUICKSTART_INTEROP.md) and
+[`INTEROP_COOKBOOK.md`](INTEROP_COOKBOOK.md).
 
-## 2b. Native (no Docker)
-
-The native driver runs the whole pipeline on the host's own toolchain — useful where Docker is
-unavailable or slow (e.g. a developer laptop). It is **additive**: the Docker path is the default and
-is unchanged. Select it with `CARGO_DOTNET_BACKEND=native`.
-
-> **Why the target is still `x86_64-unknown-dotnet` on a non-x86 host.** The backend output is .NET
-> **CIL**, which is architecture-agnostic — a compiled assembly JITs and runs on the host's native
-> .NET 8 regardless of host CPU. The `x86_64` in the target name is rustc's *layout model* for the
-> dotnet output, not the host arch. So you do **not** change the target spec; you only build the
-> toolchain binaries (backend dylib + linker + build-std) for the host.
-
-### macOS (arm64, Apple Silicon) — verified
-
-This flow is verified end-to-end on macOS arm64 (J1/J2/J3 all pass, zero Docker). Setup is
-**user-local, no sudo**:
-
-1. **Toolchain** (match the pinned nightly to avoid rustc-API drift):
-   ```bash
-   rustup toolchain install nightly-2026-06-17 \
-     --component rust-src --component rustc-dev --component llvm-tools-preview
-   rustup override set nightly-2026-06-17           # in the repo root
-   ```
-2. **.NET 8 SDK** (the Homebrew cask is .NET 10 — match the Docker .NET 8 instead):
-   ```bash
-   curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 8.0 --install-dir "$HOME/.dotnet"
-   export PATH="$HOME/.dotnet:$PATH"; export DOTNET_ROOT="$HOME/.dotnet"
-   ```
-3. **`ilasm` (optional — only for the `DIRECT_PE=0` fallback).** The default build never invokes
-   `ilasm` (`DIRECT_PE=1`'s hand-rolled PE writer, see [ARCHITECTURE.md](ARCHITECTURE.md)). Skip this
-   step unless you're debugging with `DIRECT_PE=0`. If you do need it: use the CoreCLR ILAsm, NOT
-   Mono. Mono's `ilasm` only emits PE32/i386 images, which
-   the native (macOS arm64 / Windows) CoreCLR loader **rejects** (`FileLoadException 0x8007000C`). The
-   CoreCLR ILAsm from NuGet emits a PE the host CoreCLR loads:
-   ```bash
-   # download + extract the osx-arm64 ILAsm tool, then place its `ilasm` here:
-   #   runtime.osx-arm64.Microsoft.NETCore.ILAsm  (version 8.0.0, matching .NET 8)
-   mkdir -p "$HOME/.dotnet/ilasm-tool"
-   # cp <extracted>/runtimes/osx-arm64/native/ilasm "$HOME/.dotnet/ilasm-tool/ilasm"
-   chmod +x "$HOME/.dotnet/ilasm-tool/ilasm" && xattr -c "$HOME/.dotnet/ilasm-tool/ilasm"
-   ```
-   The native driver auto-discovers `$HOME/.dotnet/ilasm-tool/ilasm`; override with `ILASM_PATH`.
-   *(`brew install mono` is the documented Mono fallback for the Docker/Linux flow, but it does NOT
-   work for the native macOS run — its PE32 output won't load on arm64 CoreCLR.)*
-4. **Build the host-native backend:**
-   ```bash
-   (cd cilly && cargo build --release) && cargo build --release -p rustc_codegen_clr
-   # -> target/release/librustc_codegen_clr.dylib + target/release/linker
-   ```
-5. **Run any crate, no Docker:**
-   ```bash
-   CARGO_DOTNET_BACKEND=native feasibility/cargo-dotnet run cargo_tests/cd_pure
-   CARGO_DOTNET_BACKEND=native feasibility/cargo-dotnet run cargo_tests/cd_tokio
-   CARGO_DOTNET_BACKEND=native feasibility/cargo-dotnet build cargo_tests/cd_interop/rustlib
-   ```
-
-> **One backend change made this work:** the CoreCLR `ilasm` caps class names at 1023 chars, which
-> the backend's deeply-nested monomorphized generic names exceed (Mono had no such cap). The IL
-> exporter now deterministically shortens any >1023-char class name (readable head + a 64-bit hash of
-> the full name), applied identically at the type's definition and every reference. Names within the
-> limit are emitted unchanged, so the Linux/Docker output and the `::stable` suite are unaffected.
-
-### Windows (x86_64) — tested, experimental opt-in
-
-The native pipeline runs on GitHub's `windows-latest` x64 runner on every fork-gate push. The gate
-builds and tests `cilly`, the complete workspace, and `cargo-dotnet`; runs `cargo dotnet doctor`; and
-then builds and executes `cd_pure`, `cd_subword_atomics`, and `cd_net10_bcl` on .NET 10 CoreCLR.
-Windows remains experimental because MSBuild integration, NuGet packaging/consumption, and the
-command/WSL shims do not yet have equivalent Windows acceptance. Set
-`CARGO_DOTNET_EXPERIMENTAL_WINDOWS=1` to acknowledge that boundary.
-
-Prereqs (user-local where possible):
-- **Native CLI**: install the Rust driver with
-  `cargo install --path tools\cargo-dotnet --locked`, or run it from the checkout with
-  `cargo run --release --manifest-path tools\cargo-dotnet\Cargo.toml -- dotnet ...` as CI does.
-  No Bash layer is required for this tested path. The older `feasibility\cargo-dotnet.cmd` shim still
-  forwards to the legacy Bash driver through Git Bash/MSYS2/WSL, but that forwarding path is not part
-  of Windows acceptance. WSL is a separate Linux environment and should use the Linux backend.
-- **Toolchain**: `rustup toolchain install nightly-2026-06-17-x86_64-pc-windows-msvc` with
-  `--component rust-src --component rustc-dev`. (The MSVC host toolchain + the Build Tools' linker
-  environment are required to build the backend and the native launcher.)
-- **.NET 10 SDK** on PATH (`dotnet.exe`). The runtime-profile machinery can also select .NET 8 or 9
-  when the matching SDK is installed.
-- **`ilasm` (optional — only for the `DIRECT_PE=0` fallback):** the default build (`DIRECT_PE=1`)
-  never calls `ilasm`. If you do fall back to `DIRECT_PE=0`: the CoreCLR ILAsm tool for win-x64 — NuGet
-  `runtime.win-x64.Microsoft.NETCore.ILAsm` matching the selected runtime. For .NET 10, place its
-  `ilasm.exe` at `%USERPROFILE%\.dotnet\ilasm10-tool\ilasm.exe` (Git Bash sees this as
-  `$HOME/.dotnet/ilasm10-tool/ilasm.exe`
-  and the native driver auto-discovers it), or set `ILASM_PATH` to it. Under `DIRECT_PE=0` with
-  `ILASM_PATH` unset, the cilly linker's Windows default
-  (`cilly/src/ir/asm.rs::get_default_ilasm`, `#[cfg(target_os = "windows")]`) probes a bare `ilasm`
-  on PATH and then the **legacy .NET Framework** assembler under `C:\Windows\Microsoft.NET\Framework`
-  — a different, much older ilasm whose output the CoreCLR loader may reject (and which panics if no
-  Framework is installed). The native driver always exports `ILASM_PATH` so this fallback is bypassed.
-  (Do **not** use Mono's ilasm — same PE32 problem as macOS.)
-- **Backend**: build it host-native — `librustc_codegen_clr.dll` + `linker.exe` under
-  `target\release\`. The native driver detects the `.dll`/`.exe` extensions automatically (via
-  `uname`/`OSTYPE`), locates `linker.exe`, and (for the rare bin crate whose cargo JSON omits the
-  `executable` field) probes the `.exe` apphost via the `CD_EXE_EXT` host fact. The common run path
-  reads cargo's own `"executable"` field, which already carries `.exe` on Windows.
-
-Run (PowerShell):
-```powershell
-$env:CARGO_DOTNET_EXPERIMENTAL_WINDOWS = "1"
-$env:CARGO_DOTNET_BACKEND = "native"
-cargo dotnet run cargo_tests\cd_pure --dotnet 10
-```
-The same command works from `cmd.exe` after setting the two environment variables with `set`.
-
-**Still outside the Windows gate:** MSBuild integration, NuGet pack/restore consumption, NativeAOT
-publish on a Windows RID, and the `cargo-dotnet.cmd`/WSL forwarding branches. Direct native
-`cargo-dotnet.exe` execution, Windows path/config escaping, the MSVC-built launcher, direct-PE
-loading, and the three runtime probes above are covered. Report findings from the un-gated surfaces.
-
----
-
-## 2c. Install once, use anywhere
-
-§2b runs the native pipeline **from a repo checkout**. The end-user journey removes the repo from the
-loop entirely: **clone once, run `cargo dotnet setup`, then build/run any crate in any directory** —
-no repo, no `RUSTFLAGS`, no env. `setup` provisions a self-contained install home and drops an
-installed `cargo-dotnet` on your PATH.
+## NuGet packages
 
 ```bash
-# 1. Clone the repo (the ONLY time you need it).
-git clone https://github.com/FractalFir/rustc_codegen_clr && cd rustc_codegen_clr
-
-# 2a. Install the Rust front-end (the cargo-install-able clap binary).
-cargo install --path tools/cargo-dotnet   # -> ~/.cargo/bin/cargo-dotnet => `cargo dotnet`
-
-# 2b. Provision the toolchain + backend + install home (idempotent — safe to re-run).
-cargo dotnet setup                    # builds the backend, populates CARGO_DOTNET_HOME,
-                                      # (re)installs the Rust front-end, warms rust-src
-# (`cargo dotnet setup` ALSO runs `cargo install --path tools/cargo-dotnet`, so 2a is
-#  optional from a checkout — but it bootstraps the binary you then call in 2b.)
-
-# 3. From now on, in ANY crate directory (the repo can be deleted):
-cd ~/my-rust-crate
-cargo dotnet run                      # build + run on .NET (works through real cargo dispatch)
-cargo dotnet build                    # build only
-cargo dotnet run /path/to/other-crate # or point it at a path
-cargo dotnet run --features foo -p mycrate --locked -- --port 8080   # standard cargo flags + program args
+cargo dotnet pack ./rust-library --out ./packages --validate
+cargo dotnet push ./packages/Example.0.0.1.nupkg --source https://example.invalid/v3/index.json
 ```
 
-> **`cargo dotnet <cmd>` works through genuine cargo dispatch.** The Rust binary handles the
-> cargo-subcommand argument convention (cargo prepends the `dotnet` token) idiomatically, so both
-> `cargo dotnet build …` and a direct `cargo-dotnet build …` (used by `dev.sh` + the MSBuild
-> integration) work. The previous bash front-end only worked via the direct form.
+Packages include the managed assembly, XML documentation, Portable PDB, Source Link information,
+license/provenance metadata, and deterministic contents for identical inputs.
 
-### What `setup` provisions
-
-`cargo dotnet setup` is **detect-then-act / idempotent** — each step is skipped when already
-satisfied (or re-done with `--force`):
-
-1. **Toolchain** — ensures the pinned `nightly-2026-06-17` + `rust-src`/`rustc-dev`/`llvm-tools-preview`
-   (via `rustup`). It does **not** hijack your global `rustup default`; the installed front-end pins the
-   toolchain per-build via `RUSTUP_TOOLCHAIN` instead.
-2. **.NET 8 SDK** — installs to `$HOME/.dotnet` (via `dotnet-install.sh`) if neither `$HOME/.dotnet/dotnet`
-   nor a PATH `dotnet` is present.
-3. **CoreCLR `ilasm`** (provisioned for the `DIRECT_PE=0` fallback; the default build doesn't call it)
-   — installs the host-RID `runtime.<rid>.Microsoft.NETCore.ILAsm` (8.0.0) NuGet package's `ilasm` to
-   `$HOME/.dotnet/ilasm-tool/ilasm` (**not** Mono — Mono's PE32 output is rejected by the native
-   CoreCLR loader; see §2b).
-4. **Backend + install home** — builds the backend dylib + `linker` (`cargo +<toolchain> build --release`)
-   from the checkout and copies them, the `dotnet_pal/` + `dotnet_overlays/` trees, the target spec, and a
-   copy of the pipeline core into `CARGO_DOTNET_HOME`.
-5. **Front-end** — `cargo install --path tools/cargo-dotnet` installs the **Rust** `cargo-dotnet` binary
-   to `~/.cargo/bin/cargo-dotnet`, so `cargo dotnet …` works as a cargo subcommand. (It falls back to
-   copying the bash script only if the crate or a host cargo is unavailable.) The binary is self-contained
-   and survives the repo being moved/deleted; it self-locates `CARGO_DOTNET_HOME` for everything else.
-6. **Private sysroot PAL injection** — provisions the content-addressed private sysroot, sourced from
-   the install home, and applies every PAL arm there as a fail-fast setup check. Rustup's ambient
-   `rust-src` remains unchanged.
-
-Flags: `--from-repo <path>` (default: the checkout `setup` is run from), `--home <dir>`
-(default `CARGO_DOTNET_HOME`), `--toolchain <name>`, `--skip-toolchain` / `--skip-dotnet` /
-`--skip-ilasm`, `--force`.
-
-### `CARGO_DOTNET_HOME` (the install home)
-
-Default `$HOME/.cargo-dotnet`, overridable by the `CARGO_DOTNET_HOME` env var. It is self-contained —
-the installed front-end runs the whole native pipeline from it with **`CD_REPO` pointed at the home,
-the repo absent**:
-
-```
-$CARGO_DOTNET_HOME/
-  VERSION                                # manifest: git rev, build date, host triple, pinned toolchain
-  core.sh                                # legacy bash pipeline copy — NOT used by the native path
-                                         #   (kept only so an older bash front-end still works); the
-                                         #   Rust binary runs the whole native pipeline itself.
-  cargo-dotnet                           # legacy bash front-end copy (the Rust binary is on ~/.cargo/bin)
-  bin/
-    librustc_codegen_clr.<dylib|so|dll>  # the codegen backend (host-native)
-    linker[.exe]                         # the cilly linker
-  target/x86_64-unknown-dotnet.json      # target spec; current layout contract is 64-bit
-  dotnet_pal/                            # copy of the repo PAL arms (private-sysroot injection source)
-  dotnet_overlays/                       # copy of the overlay registry (mio/socket2/tokio + REGISTRY.toml)
-```
-
-The installed front-end self-locates the home, detects host OS (`.dylib`/`.so`/`.dll`), self-heals
-`dotnet` onto PATH from `$HOME/.dotnet` if needed, and runs the **pure-Rust native pipeline** against the
-current crate dir — **the default backend is `native`** (no Docker, no bash core). Generated overlay
-configuration lives under cargo-dotnet's private Cargo cache and is passed via Cargo's `--config`;
-user-owned `.cargo/config.toml` is preserved. Private sysroots live under
-`$CARGO_DOTNET_HOME/sysroots/` and the isolated registry lives under the cargo-dotnet cache. (Verified:
-with both the repo AND `feasibility/_cargo_dotnet_core.sh` physically absent, an external crate still
-builds, runs, and packs.)
-
-> **No `CD_*` env seam.** The old design threaded ~13 `CD_*` environment variables (CD_REPO,
-> CD_BACKEND_DYLIB, CD_LINKER, CD_TARGET_SPEC, …) from the Rust front-end into the bash core. Those are
-> gone: the native pipeline carries every fact in ONE typed `Context`
-> ([`src/context.rs`](../tools/cargo-dotnet/src/context.rs)). A child env is constructed only for the
-> inner `cargo` invocation and at the docker delegation boundary.
-
-### Shell rc lines
-
-`setup` prints any lines you should add to your shell rc. Typically:
+## Offline use
 
 ```bash
-export PATH="$HOME/.cargo/bin:$PATH"      # if ~/.cargo/bin is not already on PATH
-export DOTNET_ROOT="$HOME/.dotnet"        # only if `dotnet` is not on PATH
-export PATH="$HOME/.dotnet:$PATH"         # so the linker can find `dotnet`
+cargo dotnet restore ./crate
+cargo dotnet build ./crate --offline --frozen
 ```
 
-(The installed front-end already self-heals `dotnet` from `$HOME/.dotnet`, but exporting it makes other
-tools see it too.)
+Restore writes a checksummed receipt covering dependency manifests, lock/configuration files,
+private sysroot inputs, and package caches. Source-only edits do not invalidate it; dependency or
+cache changes produce a re-restore command before compilation begins.
 
-### Caveats & maintenance
+## Diagnostics
 
-- **`getrandom`** — 0.2 / 0.3 / 0.4 **auto-work with ZERO wiring** via the
-  `dotnet_overlays/getrandom-{0.2,0.3,0.4}` overlays (each IS getrandom, patched with a
-  self-contained `target_os="dotnet"` backend arm that calls the PAL CSPRNG). So `rand`/`uuid`/`ahash`
-  and any getrandom user just build — no custom symbol/macro/feature, no `getrandom_dotnet` dep, and
-  no `--cfg getrandom_backend="custom"` RUSTFLAG (removed). See `dotnet_overlays/README.md`.
-- **Private build stores.** Native builds compile against a content-addressed private sysroot and a
-  cargo-dotnet-owned Cargo home. They do not patch rustup's ambient `rust-src` or the user's ambient
-  Cargo registry. A cross-process lock remains as a conservative migration barrier while cache
-  corruption/parallel-build testing is expanded.
-- **After a repo update**, re-run `cargo dotnet setup --from-repo <path> --force` to rebuild the
-  backend and refresh the install home.
-
-> The in-repo `feasibility/cargo-dotnet` (and `dev.sh pal-build`) remain the **development** path,
-> unchanged: when invoked from a checkout (the sibling pipeline core present) the script uses the repo
-> layout and the Docker backend by default. The installed tool is purely additive.
-
----
-
-## 3. Quickstart
-
-### 3a. A pure-Rust crate (no deps)
-
-Write a normal crate — a `Cargo.toml` and a `src/main.rs`, nothing else:
-
-```toml
-# Cargo.toml
-[package]
-name = "hello_dotnet"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-
-[workspace]                 # a BARE line — only needed if the crate sits UNDER another
-                            # workspace root (e.g. inside this repo). A truly external crate
-                            # (its own root) needs nothing here.
-```
-
-```rust
-// src/main.rs
-fn main() {
-    let words: Vec<String> = (1..=3).map(|i| format!("item-{i}")).collect();
-    println!("hello from cargo dotnet (pure Rust on the .NET PAL)");
-    println!("words = [{}]", words.join(", "));   // exercises std::alloc + the dotnet PAL
-}
-```
-
-Run it:
+Start with:
 
 ```bash
-cargo dotnet run path/to/hello_dotnet
+cargo dotnet doctor
+cargo dotnet doctor --json
 ```
 
-The worked, asserted version is [`cargo_tests/cd_pure`](../cargo_tests/cd_pure) (compute + heap +
-`println!`, with `assert_eq!`s so a miscompile would exit non-zero):
+You can also pass an exception, linker message, or log file to `doctor`. It recognizes common
+runtime/profile mismatches, unsupported managed layouts, stale artifacts, missing entry points,
+and installation problems.
 
-```bash
-cargo dotnet run cargo_tests/cd_pure
-```
+When reporting a compiler problem, include:
 
-### 3b. A crate with a real syscall-level dependency
+- host OS and architecture;
+- `cargo dotnet --version`;
+- `dotnet --info`;
+- `rustup show active-toolchain`;
+- `cargo dotnet doctor --json`; and
+- a small Rust program plus native and managed output.
 
-Add an ordinary dependency to `Cargo.toml` — exactly what you'd write for native Rust. No `[patch]`, no
-path/vendor override:
-
-```toml
-[dependencies]
-tokio = { version = "1", features = ["rt", "macros", "net", "io-util"] }
-```
-
-```bash
-cargo dotnet run cargo_tests/cd_tokio
-```
-
-[`cargo_tests/cd_tokio`](../cargo_tests/cd_tokio) is a tokio loopback TCP echo (the client sends three
-line-framed messages, the server echoes each back uppercased). Its only dep line is the plain `tokio`
-above — yet it pulls `mio` + `socket2` transitively and **runs I/O-driven async on the .NET PAL**.
-`cargo dotnet` auto-applied the overlay registry to make those deps compile on the .NET target; you saw
-none of it. That is the subject of the next section.
-
----
-
-## 4. Using dependencies that need an overlay
-
-Most crates need nothing special. The .NET target spec carries `target-family = ["unix"]`, so
-`cfg(unix)` / `cfg(target_family="unix")` are true and **plain `cfg(unix)` crates compile unpatched** —
-they pick their existing unix arms straight onto the .NET PAL.
-
-A few load-bearing crates need a small *source* edit that no cfg flip can supply (e.g. `mio` selects
-its readiness backend by `target_os`, which has no `dotnet` concept). These live in the central
-**[`dotnet_overlays`](../dotnet_overlays/README.md)** registry — one vendored copy of each crate,
-upstream-byte-identical except the lines marked `// DOTNET PAL`.
-
-**Auto-apply (you do nothing):** on each build, the pipeline core reads `dotnet_overlays/REGISTRY.toml`,
-finds every overlay whose crate name + version appears in your `Cargo.lock` (direct *or* transitive),
-and writes a build-local Cargo config under cargo-dotnet's private cache with a top-level
-`paths = [ … ]` override pointing at the overlay dirs. The config is passed explicitly with
-`--config`; a user-owned `.cargo/config.toml` is never replaced. `paths` is keyed by crate
-**name** and is graph-wide, so one entry covers both a direct `mio` and `mio`-under-`tokio`. It
-needs **zero** edits to your tracked `Cargo.toml`. On a
-name-match with a version *mismatch*, it warns loudly and skips (no silent "overlay didn't apply →
-miscompile" footgun).
-
-Today the registry ships overlays for **`mio`**, **`socket2`**, and **`tokio`** (each a heterogeneous,
-minimal edit). **Adding a new overlay** is a small recipe — vendor the pinned upstream, apply the
-minimal `// DOTNET PAL`-marked edit, add a `[[overlay]]` block to `REGISTRY.toml`. Full recipe and the
-line-by-line rationale for the existing three: [dotnet_overlays/README.md](../dotnet_overlays/README.md).
-
-> **`getrandom` note.** getrandom 0.2 / 0.3 / 0.4 auto-work with ZERO wiring via the
-> `dotnet_overlays/getrandom-{0.2,0.3,0.4}` overlays (each is getrandom patched with a self-contained
-> `target_os="dotnet"` backend arm). No custom symbol/macro/feature, no `--cfg getrandom_backend`. The
-> multi-major case uses single-version-per-name path filtering — see the overlay README.
-
----
-
-## 5. Consuming a Rust library from C#
-
-`cargo dotnet` also builds a Rust **library** (`crate-type = ["cdylib"]`) into a **C#-referenceable
-.NET assembly**, so a C# project can call exported Rust functions as ordinary managed methods — **no
-P/Invoke, no `[DllImport]`, no marshalling attributes, no reflection**, because the Rust *is* managed
-CIL.
-
-```bash
-# 1. Build the Rust cdylib -> a managed PE + a referenceable .dll copy.
-cargo dotnet build path/to/rustlib     # emits target/x86_64-unknown-dotnet/release/<crate>.dll
-
-# 2. Reference that .dll from a C# project and run it.
-dotnet run --project path/to/csharp
-```
-
-`cargo dotnet` detects the `cdylib` crate-type from cargo's JSON message stream, builds it under the
-dotnet PAL, writes the managed PE to `target/x86_64-unknown-dotnet/<profile>/lib<crate>.so`, and copies
-it to **`<crate>.dll`** beside it (a pure file copy — the assembly *identity* is `<crate>` regardless of
-the `.so` filename). `cargo dotnet run` on a library prints a "reference the .dll from C#" note and
-exits 0 (a library has no entrypoint).
-
-**Recommended — let `dotnet build` build the Rust for you (`RustDotnet.targets`).** Import the
-integration and declare the crate; a single `dotnet build`/`dotnet run` runs `cargo dotnet build` on it
-and references the produced assembly — zero manual `cargo dotnet`, zero `.dll` copy, zero hand-written
-`<Reference>` (incremental: the Rust rebuild is skipped when its `.dll` is newer than its sources).
-`cargo dotnet setup` installs `RustDotnet.targets` into `$CARGO_DOTNET_HOME/msbuild/`, so it works in
-any external project:
-
-```xml
-<Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
-        Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
-<ItemGroup>
-  <RustCrate Include="../rustlib" />
-</ItemGroup>
-```
-
-**Manual (fallback).** A C# project can also reference a pre-built `.dll` with a bare assembly
-`<Reference>` + `<HintPath>` (no `ProjectReference`). Exported `#[unsafe(no_mangle)] pub extern "C"` functions
-are `public static` methods on `MainModule`; de-mangled `#[repr(C)]` structs appear under their clean
-`Crate.Type` name with a synthesized ctor + per-field getters.
-
-```xml
-<ItemGroup>
-  <Reference Include="cd_interop"><HintPath>cd_interop.dll</HintPath></Reference>
-</ItemGroup>
-```
-
-**Distribution (NuGet).** `cargo dotnet pack path/to/rustlib` produces a `.nupkg` of the assembly that a
-C# project can `<PackageReference>` from a local feed (`<RestoreSources>`). Full guide, including the
-NuGet cache footgun, in [docs/INTEROP_CSHARP.md](INTEROP_CSHARP.md).
-
-```csharp
-int sum = MainModule.rust_add(2, 3);                 // primitives: == 5
-cd_interop.Point p = new cd_interop.Point(2, 3);     // de-mangled value-type
-int s = MainModule.point_sum(p);                     // == 5
-```
-
-### Marshalling (verified end-to-end on the real dotnet PAL)
-
-| Category | Rust signature | C# side |
-|----------|----------------|---------|
-| **Primitives** | `pub extern "C" fn rust_add(a: i32, b: i32) -> i32` | `int MainModule.rust_add(int, int)` |
-| **Strings** | `(name_ptr: *const u8, name_len: usize, out_ptr: *mut u8, out_cap: usize) -> usize` | `fixed (byte* …)` UTF-8 `(ptr, len)` in + caller out-buffer |
-| **Struct** | `#[repr(C)] pub struct Point { pub x: i32, pub y: i32 }` + `fn point_sum(p: Point) -> i32` | `new cd_interop.Point(2, 3)`, `p.get_x()` |
-| **Slice / Vec** | `(ptr: *const i32, len: usize) -> i32` | `fixed (int* …)` over a C# `int[]` |
-
-Strings and slices cross as **UTF-8 / element `(ptr, len)` pairs** (thin pointers, directly C#-usable
-with `fixed`); no Rust allocation crosses the boundary, so there is nothing to free across it. The
-worked example is [`cargo_tests/cd_interop`](../cargo_tests/cd_interop) (`rustlib/` cdylib +
-`csharp/` console app).
-
-**Full consumer guide (the `.csproj`, the C# program, why a bare `<Reference>`, what is/isn't verified):
-[docs/INTEROP_CSHARP.md](INTEROP_CSHARP.md).** It also documents the **Tier-2** surface proven on the
-surrogate target but not yet through this real-PAL flow: returning a managed `System.String` directly
-and a Rust-raises-a-.NET-exception `Result` (both pull `mycorrhiza` + the throw intrinsic).
-
----
-
-## 6. What works / honest limits
-
-### The platform — real Rust std on the .NET PAL (no surrogate)
-
-Under the `target-family = ["unix"]` flip, the dotnet PAL backs **real** `std`, not a stand-in:
-
-- **Files** — `std::fs` over `System.IO` (open/read/write/seek/flush, mkdir/rmdir, rename, readdir,
-  truncate, getcwd/chdir, canonicalize, **symlink/readlink**, **pread/pwrite**).
-- **Net** — `std::net` TCP/UDP over `System.Net.Sockets`; **I/O-driven async** (tokio `TcpStream`/
-  `TcpListener`) via the mio reactor.
-- **Threads / sync / time** — `System.Threading`; `panic = unwind` with `catch_unwind` working
-  end-to-end; monotonic + wall clock.
-- **`std::os::unix`** — AF_UNIX (`UnixStream`/`UnixListener`), `MetadataExt` (size + timestamps),
-  symlinks, the fd onion (`AsRawFd`/`FromRawFd`).
-
-### Honest limits — `ENOSYS` / synthetic, never silently faked
-
-Some POSIX primitives have no managed equivalent on stock CoreCLR and surface as
-`Err(Unsupported)`/`ENOSYS` or a documented synthetic value (never a silent lie):
-
-- **`fork` / `vfork` / `execve`** — cannot clone/replace a running JIT+GC managed runtime.
-- **Inode identity** — `st_ino` / `st_dev` / `st_nlink` → 0/1 (breaks same-file detection); hard
-  `link()` unsupported.
-- **Ownership** — `st_uid` / `st_gid`, `chown`, full POSIX mode bits → synthetic / readonly-bit only.
-- **Memory** — `mmap(MAP_FIXED)` / file-backed / shared mmap, `mprotect` guard pages, `brk`/`sbrk`.
-- **Signals** — raw signal *delivery* / arbitrary `sigaction` handlers (only SIGINT/TERM/HUP/QUIT via
-  `PosixSignalRegistration`); abstract-namespace unix sockets, SCM_RIGHTS fd-passing, ucred.
-
-The full categorized libc map (CLEAN / LEAKY / IMPOSSIBLE per cluster, with the BCL mapping for each)
-is [docs/LIBC_SHIM_SCOPE.md](LIBC_SHIM_SCOPE.md); the `std::os::unix` plan + leaky-bits ledger is
-[docs/STD_OS_UNIX_PLAN.md](STD_OS_UNIX_PLAN.md).
-
-### Soak — the breadth evidence
-
-~74 real crates have been driven through `cargo dotnet` on the dotnet PAL under the flip; **73/74 pass**.
-The one non-pass is `regex` (a deep allocator issue), not a class-level gap. 11+ class-level codegen
-fixes landed over that campaign.
-
-### Exit-code caveat
-
-Build failures and the program's own exit code propagate faithfully. But on the dotnet PAL a **panic**
-(or `std::process::exit(n)`) currently surfaces as an unhandled managed exception while the apphost
-still returns **0** — a pre-existing PAL limitation independent of `cargo dotnet`.
-
----
-
-## 7. The four proven journeys (worked examples)
-
-Each is a real, runnable crate under [`cargo_tests/`](../cargo_tests) — copy its shape.
-
-| # | Journey | Where | Proves |
-|---|---------|-------|--------|
-| **J1** | Pure Rust → .NET | [`cargo_tests/cd_pure`](../cargo_tests/cd_pure) | zero-config DX on fresh pure-Rust code (compute + heap + `println!`). |
-| **J2** | Syscall-deps → .NET | [`cargo_tests/cd_tokio`](../cargo_tests/cd_tokio) | a plain `tokio` dep runs I/O-driven async on the PAL via **auto-applied overlays**. |
-| **J3** | Consumed from C# | [`cargo_tests/cd_interop`](../cargo_tests/cd_interop) | a Rust `cdylib` → `.dll` → `<Reference>`, all four marshalling categories called from C#. |
-| **J4** | North-star | (cross-repo) | a **real, dependency-using production library** (serde/chrono/uuid data-models) was imported by C# and ran its pagination logic as .NET CIL, returning the correct result. |
-
-**J4** is the capability yardstick: a real production Rust module — *not* a toy — built with deep
-third-party dependencies, consumed from C# and executing its business logic on .NET. It ran via a
-transient FFI wrapper over a read-only cross-repo mount (leak-safe). It exercises every layer at once:
-correct codegen, real std on the PAL, the overlay registry, and the C# consumption path. Passing it is
-the strongest single signal that the stack works end-to-end on a non-contrived workload.
-
----
-
-## 8. Where to go next
-
-- **The C# consumer guide** — `.csproj`, the C# program, marshalling tiers:
-  [docs/INTEROP_CSHARP.md](INTEROP_CSHARP.md).
-- **The overlay recipe** — add a dep that needs a source edit:
-  [dotnet_overlays/README.md](../dotnet_overlays/README.md).
-- **`cargo-dotnet` flags & mechanics** (mount model, the Docker/native seam, the shared pipeline core):
-  [feasibility/README.md](../feasibility/README.md).
-- **The libc/POSIX-over-.NET design** (the categorized map, the fd-table + errno spine):
-  [docs/LIBC_SHIM_SCOPE.md](LIBC_SHIM_SCOPE.md).
-- **The `std::os::unix` plan + leaky-bits ledger:** [docs/STD_OS_UNIX_PLAN.md](STD_OS_UNIX_PLAN.md).
-- **The backend itself** (the CIL-trees IR, the V1→V2 split, Rust→.NET mapping gotchas):
-  [docs/ARCHITECTURE.md](ARCHITECTURE.md).
-- **The full Rust↔.NET completeness map:** [docs/TRANSLATION_STATUS.md](TRANSLATION_STATUS.md).
+Use the GitHub miscompilation issue template when generated behavior differs from native Rust.

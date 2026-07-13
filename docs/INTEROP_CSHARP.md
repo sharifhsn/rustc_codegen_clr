@@ -83,6 +83,11 @@ cleanly.
 | **Struct** | `#[repr(C)] pub struct Point { pub x: i32, pub y: i32 }` + `fn point_sum(p: Point) -> i32` | `new cd_interop.Point(2, 3)`, `p.get_x()` |
 | **Slice / Vec** | `(ptr: *const i32, len: usize) -> i32` | `fixed (int* …)` over a C# `int[]` |
 
+For the higher-level typed seam, prefer `#[dotnet_export]`: strings, primitive optionals/vectors,
+delegates, and `#[dotnet_enum]` types are marshalled automatically. A Rust-defined fieldless enum
+with an explicit integer `#[repr]` becomes a genuine CLR enum and crosses typed exports via
+`#[dotnet_export(enums(MyEnum))]`; see [the interop quickstart](QUICKSTART_INTEROP.md#2d-export-a-real-clr-enum-from-rust).
+
 Strings and slices cross the boundary as **UTF-8 / element `(ptr, len)` pairs** (thin pointers,
 directly C#-usable with `fixed`). No Rust allocation crosses the boundary, so there is nothing to free
 across it. For the outbound string direction, the caller passes an output buffer Rust fills.
@@ -230,6 +235,33 @@ For DISTRIBUTING a pre-built Rust .NET assembly (rather than building it from so
 cargo dotnet pack path/to/rustlib            # -> path/to/rustlib/target/nupkg/<crate>.<ver>.nupkg
 #   [--release|--debug] [--id NAME] [--version VER] [--out DIR]
 ```
+
+For a package whose Rust source is publicly retrievable, embed an immutable Source Link template:
+
+```bash
+cargo dotnet pack path/to/rustlib --validate --source-link-url \
+  'https://raw.githubusercontent.com/OWNER/REPO/COMMIT/*'
+```
+
+The PDB uses checkout-independent `/_/consumer/*` document names and maps only that root. It does
+not claim that dependency, SDK, or rust-sysroot sources belong to the same repository.
+
+### C# API documentation
+
+Put ordinary Rust `///` comments on functions annotated with `#[dotnet_export]`. The build converts
+those comments into an ECMA-334 XML documentation sidecar named after the CLR assembly. A validated
+package contains both files under the same target framework, for example:
+
+```text
+lib/net8.0/cd_export.dll
+lib/net8.0/cd_export.xml
+```
+
+That adjacent, identity-matched filename is the standard NuGet/MSBuild discovery contract used for
+IntelliSense and compiler API help. `cargo dotnet pack --validate` rejects a missing sidecar. The
+current generator documents exported `MainModule` functions; generated classes, DTO properties, and
+other synthesized members remain future coverage. `feasibility/api_docs_acceptance.sh` checks the
+package entry, XML well-formedness, a concrete member ID, and its source summary without publishing.
 
 It builds the crate via the same `cargo dotnet build` path, reads the id+version from
 `cargo metadata`, and hand-assembles a valid OPC package containing `lib/net8.0/<crate>.dll` (plus a

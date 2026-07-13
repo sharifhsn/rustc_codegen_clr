@@ -66,42 +66,43 @@ optional breadth.
 
 ## Partial (🟡) — core landed, a documented tail deferred
 
-- **Delegates & callbacks ⚑** (`5277560`, `cd_delegates` 14/14). Core done for concrete signatures. **Tail:**
-  closure *captures* (boxed-env trampoline); delegate as a **generic-method** argument
-  (`List<T>.Sort(Comparison<T>)` — needs a nested-`!N`-binding *extension* of the CIL typechecker, sound,
-  NOT a relaxation); .NET **events** (`add_*`).
-- **Extend `#[dotnet_class]`** (`c1c90ce`, `cd_typedef` 16/16). Static methods, multiple ctors, field
-  setters, managed-type fields done. **Tail:** virtual methods (needs "re-open a class" comptime) and
-  implementing a .NET interface.
+- **Delegates & callbacks ⚑** (`cd_delegates`, `cd_vtgen`, `cd_event_subscription`). Concrete
+  signatures, capturing closures, delegates whose parameter uses an enclosing class generic,
+  exported class/interface event metadata, and deterministic Rust-side event subscription are done.
+  **Tail:** generated high-level adapters for uncommon concrete event-delegate signatures; event
+  backing semantics remain user-owned.
 - **Std-trait impls for wrappers** (`24055af`). `DotNetString` has Display/Debug/Eq/Hash; List has
   element-wise Clone/Eq/Hash. **Deliberately NOT done:** a blanket `Display`-via-`ToString` (would print
   type names for collections and ref-identity equality — dishonest); `Ord` via `String.CompareTo`
   (culture-sensitive, takes `Object`). The honest call was per-type, not a blanket.
-- **Dictionary iteration** — backend-blocked (see below). Documented at `collections.rs:413`.
-- **`Nullable<T>` (valuetype)** — reference-type `null→Option` shipped; the valuetype wrapper is the same
-  backend gap.
-- **`Span<T>`/`Memory<T>`** — marker type exists (`intrinsics.rs:329`), no wrapper; same backend gap.
-- **More C#-consumable containers** — `RustHashMap`/`RustString` shipped; `IEnumerable<T>` over `RustVec`
-  not done.
+- **`Span<T>`/`Memory<T>`** — `Span<T>` and `ReadOnlySpan<T>` are zero-copy borrowed views;
+  `Memory<T>` and `ReadOnlyMemory<T>` copy into GC-owned arrays for storage/async-safe handoff.
+  Slicing, mutation, and `ReadOnlyMemory<T>.CopyTo` are proven by `cd_span` 68/68.
+- **More C#-consumable containers** — `RustHashMap`/`RustString` and `IEnumerable<T>` over
+  `RustVec<T>`/`RustBoxVec<T>` and managed async-stream consumption shipped; async-stream production
+  remains optional backend breadth.
 
 ---
 
-## Did NOT land (⬜) — and why
+## Subsequent closures and remaining breadth
 
-- **Dictionary iteration** (`for (k,v) in &dict`, `.keys()`, `.values()`), **`Span<T>`/`Memory<T>`**,
-  valuetype **`Nullable<T>`**: all blocked by ONE backend gap — **generic value-type instance methods**.
-  Enumerating dict entries yields `KeyValuePair<K,V>` (a generic *value type*); extracting `.Key`/`.Value`
-  needs `get_Key`/`get_Value`, which `src/terminator/call.rs` asserts unsupported (`!is_valuetype` for
-  KIND=1). The `get_Keys`/`get_Values` route returns a *nested* generic `KeyCollection<!0,!1>` the CIL
-  typechecker soundly rejects (and must not be relaxed). Not weakenable at the library level — needs the
-  deferred WF-9 Stage-1 tail (pass the by-value valuetype receiver by managed-pointer for `call instance`).
-- **LINQ-style adapters**, **C# delegates → Rust**, **export Rust enum/Result/Option**, **export Rust
-  traits as C# interfaces**, **enum interop**: not started. All now *unblocked* by the shipped enumerator
-  bridge + delegates, so these are pure-library follow-ups (except the trait/interface ones, which pair
-  with `#[dotnet_class]` interface support).
-- **`cargo dotnet publish --aot`**: not wired as a subcommand (AOT is codegen-proven per the gaps-campaign
-  memory, but no first-class command).
-- **Hosted API docs**, **flagship end-to-end app**: not done.
+After this original snapshot, the generic-value-type instance-method path shipped without weakening
+the checker. `cd_vtgen`, `cd_collections`, and `cd_span` now prove `KeyValuePair<K,V>`, Dictionary
+iteration, `Nullable<T>`, and zero-copy spans. `dotnet_enum!`, LINQ/IQueryable expression builders,
+capturing delegates, interface implementations, `cargo dotnet publish`, and the flagship
+`examples/issue-dashboard` application also shipped.
+
+Remaining breadth includes generated adapters for uncommon event-delegate signatures,
+managed-reference/non-primitive `Option<T>`, delegate arities above three, automatic owned-value
+callback marshalling and an `impl Fn` adapter, async-stream production,
+nullable signature annotations, and hosted API documentation. Primitive
+`Option<T>` ↔ `Nullable<T>`, `Result<T,E>` → exception, Rust traits exported as C# interfaces,
+`IEnumerable<T>` over `RustVec`, and managed `Memory<T>` are already shipped.
+
+Rust-defined enums are now exported as genuine CLR enums via `#[dotnet_enum]`; typed
+`#[dotnet_export(enums(...))]` parameters/returns, reflection, literal fields, and C# `switch`
+syntax are proven by `cd_export_ergonomics` (37/37), alongside three-argument and managed-string
+C# callback imports.
 
 ---
 
@@ -120,17 +121,11 @@ optional breadth.
 
 ---
 
-## Next steps for a fresh session (leverage order)
+## Next steps for a fresh session (current leverage order)
 
-1. **WF-9 generic value-type instance methods** (backend: `src/terminator/call.rs`; rebuild + install +
-   `dev.sh gate` required). ONE change unblocks Dictionary iteration + `Span<T>` + valuetype `Nullable<T>`.
-   Pass the by-value valuetype receiver by managed-pointer (address-of) for `call instance`. Do NOT touch
-   `cilly/src/ir/typecheck.rs`.
-2. **Delegate tail** — captures / delegate-as-generic-method-arg (nested-`!N`-binding typecheck extension)
-   / events. Unblocks LINQ predicate adapters.
-3. **Pure-library breadth** (mycorrhiza-only): LINQ adapters, enum interop, `IEnumerable<T>` over
-   `RustVec`, C#→Rust delegates, `#[dotnet_class]` virtual/interface.
-4. **Tooling/docs polish:** `cargo dotnet publish --aot`; hosted rustdoc + C# XML docs; a flagship app.
+1. Keep the supported build/onboarding/NativeAOT/release evidence continuously green.
+2. Add the remaining interop breadth only with a product-shaped consumer fixture.
+3. Publish hosted API documentation once the external hosting/release identity is selected.
 
 Build/verify loop, footguns, and the copy-these patterns are in
 [ERGONOMICS_HANDOFF.md](ERGONOMICS_HANDOFF.md) §2 + §4.

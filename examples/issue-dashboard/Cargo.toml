@@ -1,0 +1,10 @@
+[package]
+name = "rust-dotnet-issue-dashboard"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+mycorrhiza = { path = "../../mycorrhiza" }
+
+[workspace]

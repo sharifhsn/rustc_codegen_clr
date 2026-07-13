@@ -1,4 +1,4 @@
-//! An idiomatic Rust wrapper over [`System.Diagnostics.Stopwatch`] (assembly `System.Private.CoreLib`)
+//! An idiomatic Rust wrapper over `System.Diagnostics.Stopwatch` (assembly `System.Private.CoreLib`)
 //! — a high-resolution measurer of elapsed time, backed by a real managed object on the CLR heap.
 //!
 //! This is a thin, honest handle to a managed `Stopwatch`: every method delegates straight to the

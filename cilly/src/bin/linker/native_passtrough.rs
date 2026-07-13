@@ -125,7 +125,7 @@ pub fn add_shared(file_path: &str, native_pastrough: &mut NativePastroughInfo) {
 // This function should get all the function names from `file_path`, and insert them into `native_pastrough`, with the lib name in such a form, that the .NET runtime is able to handle it.
 // DO NOT USE ABSOLUTE PATHS AS THE LIB NAME. IT WILL WORK, BUT WILL NOT BE PORTABLE.
 #[cfg(not(target_os = "linux"))]
-pub fn add_shared(file_path: &str, native_pastrough: &mut NativePastroughInfo) {
+pub fn add_shared(_file_path: &str, _native_pastrough: &mut NativePastroughInfo) {
     panic!("Native passtrough not supported on this platfrom.")
 }
 // Detects all the link directiores provided by the linker,

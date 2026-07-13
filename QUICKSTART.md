@@ -1,104 +1,100 @@
-# Building the project
-## Download the project
-Clone the repo using this command:
-```
-git clone git@github.com:FractalFir/rustc_codegen_clr.git
-```
-## Instal the newest nightly rust
-```
-rustup install nightly
-```
-## Check that the project is complatible with the version of Rust you installed. 
-```
-cargo check
-```
-If the project does not compile due to error messages, try updating your rust version.
-```
-rustup update
-```
+# Quickstart: run Rust on .NET
 
-If this does not solve the problem, open an issue. The project is only compatible with a narrow set of `rustc` versions, and tries to always use the newest nigthly build.
-## Install the .NET runtime
-**Note: This is only relevant if you want to use this project in its .NET mode**
-This project requires the .NET runtime to be used. You can find [instalation instructions here](https://dotnet.microsoft.com/en-us/download).
+`rustc_codegen_clr` is experimental compiler infrastructure. The 0.0.1 preview intentionally has
+one supported runtime profile: .NET 10.
 
-After installing .NET, run ` dotnet --info` to confoirm it is installed propely.
+## Prerequisites
 
-## Install `ilasm`
-**Note: This is only relevant if you want to use this project in its .NET mode**
-### Windows
+- [rustup](https://rustup.rs/)
+- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
+- Linux x64, macOS Apple Silicon, or Windows x64
 
-`ilasm` comes [installed with Visual Studio](https://learn.microsoft.com/en-us/dotnet/framework/tools/ilasm-exe-il-assembler). So, you propably already have it. If not, install visual stuido. 
+## Install
 
-### Linux or MacOS
+Linux or macOS:
 
-This tool supports both the "Core" and "Mono" flavours of ILASM. While you *can* install / build `ilasm` separeately, installing the [mono runtime](https://www.mono-project.com/download/stable/) is the easiest option.
-
-### Checking the dependencies 
-
-After you installed `dotnet` and `ilasm`(, run `./bin/rustflags.rs` to check if you installed `ilasm` and `dotnet` correctly. 
-If you want to use the project to generate C code, set `C_MODE` to `1`.
-```
-export C_MODE=1
-```
-
-This script uses the experimental `cargo-script` feaure to will check your enviroment, build the project, and print the flags you need to use it.
-
-### Running tests
-
-As one last step, you can run `cargo test ::stable` to check if the codegen runs as expected. This can take a minute or two, but it should ensure the project is working as expected.
-
-# Using the project 
-
-The project is *relatively* simple to use. You will still have to do some setup to get `core` and `std` working, but it is a straigtforward process. 
-
-At the root of your crate, create a directory named `.cargo`. In this directory, create a file named `config.toml`, with the following contents.
-
-```
-[build] 
-target = "x86_64-unknown-linux-gnu" # Change to the host target.
-[unstable]
-build-std = ["core","alloc","std","panic_abort"]
-```
-
-Then, run the codegen utility `rustflags` again, by running `./bin/rustflags.rs` **in the directory `rustc_codegen_clr`**.
-
-It should provide you with the commands necesarry for enabling the codegen. They should look something like this:
-
-On Linux:
 ```bash
-export RUSTFLAGS="-Z codegen-backend=/home/USER/rustc_codegen_clr/target/release/librustc_codegen_clr.so -C linker=/home/USER/rustc_codegen_clr/target/release/linker -C link-args=--cargo-support "
+curl -fsSL https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.1/install.sh | sh
 ```
-On Windows:
+
+Windows PowerShell:
+
 ```powershell
-$Env:RUSTFLAGS = '-Z codegen-backend=C:\Users\USER\rustc_codegen_clr\target\release\librustc_codegen_clr.dll -C linker=\Users\USER\rustc_codegen_clr\target\release\linker.exe -C link-args=--cargo-support '
+irm https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.1/install.ps1 | iex
 ```
 
-You can then run this command in your shell session (aka. command prompt window). This command will enable the codegen for that session(command prompt window) only! 
-The project makes **no pernament changes** to your instaltation, and simply closing the shell session(command prompt window) will disable it. 
+For an inspectable install, download the script first, read it, and run it locally. The installer
+downloads a host-specific ZIP and checksum, then uses the standalone `cargo-dotnet` executable to
+verify and install the bundle.
 
-After this, simply run `cargo run` to compile & run your app inside the .NET runtime. Other cargo commands should work to. There may be quite a few error / warning messages dispalyed, but they will not stop compilation.
+If `cargo dotnet` is not found afterward, open a new terminal or add Cargo's bin directory to PATH:
 
-NOTE: the project currently does not properly support `proc-macros`, due to technical liminations. Fully supporting them is possible, but it is currently more effort than it is worth.
-# Additional information on C support
+- Linux/macOS: `$HOME/.cargo/bin`
+- Windows: `%USERPROFILE%\.cargo\bin`
 
-## Required features
-Currently, the generated code will, by default, depend on some features of C that may not always be present. 
+## Check the installation
 
-Those features are:
-1. malloc and aligned allocators - certain static/constant variables require alignments higher than the ones guaranteed by the C standard. As a workaround, `cg_clr` will use malloc & aligned allocators
-to ensure sufficient alignment of static variables. This is something I am actively working on resolving, and this should not be an issue in the near future. 
-2. POSIX threading APIs. The header files generated by `cg_clr` will override certain POSIX APIs in order to track new threads. This is needed to ensure proper initialization of thread-local data.
-
-## Odd function names
-Additionally, you might notice that the generated code sometimes calls "wierd" functions, like `System_Numerics_BitOperations_LeadingZeroCountu64i32`. 
-This is a limitation of the current abstractions over .NET and C. Most of the time, those functions simply call / emulate a C builtin. This is also something that will not be an issue in the future:
-I am actively working on better abstractions.
-
-## Non-alphabetic identifiers.
-
-By default, `cg_clr` will keep symbol(function) names more-or-less intact. However, those names may contain characters accepted by *most*, but not *all* compilers. 
+```bash
+cargo dotnet doctor
 ```
-_ZN54_$LT$$LP$A$C$B$RP$$u20$as$u20$fuzz100__PrintFDebug$GT$12printf_debug17h769fc7ecbdc54ca9E
+
+`doctor` checks the SDK bundle, pinned nightly, .NET 10 runtime, compiler backend, linker, and the
+current workspace. Its `--json` output is suitable for bug reports.
+
+## Create and run an application
+
+```bash
+cargo dotnet new hello-dotnet --app
+cargo dotnet run hello-dotnet
 ```
-In those cases, set the `ASCII_IDENTS=1` environment variable to ensure valid C identifiers.
+
+Release mode is the default. Use `--debug` for a debug build:
+
+```bash
+cargo dotnet run hello-dotnet --debug
+```
+
+Existing Cargo crates work the same way:
+
+```bash
+cargo dotnet build ./my-crate
+cargo dotnet run ./my-crate -- arg1 arg2
+cargo dotnet test ./my-crate
+```
+
+## Create a Rust library for C#
+
+```bash
+cargo dotnet new hello-library --lib
+dotnet run --project hello-library/csharp
+```
+
+The scaffold contains the Rust library, generated managed assembly, MSBuild wiring, and a C#
+consumer. The `--plugin` template creates the corresponding interface/plugin shape.
+
+## Work offline after restoring
+
+```bash
+cargo dotnet restore ./my-crate
+cargo dotnet run ./my-crate --offline --frozen
+```
+
+The restore receipt detects dependency or cache changes and tells you when another online restore
+is required.
+
+## Build from a checkout
+
+Release bundles are the normal user path. Compiler contributors can provision directly from a
+checkout:
+
+```bash
+cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- setup --from-repo "$PWD"
+cargo dotnet doctor
+```
+
+## Next steps
+
+- [`docs/CARGO_DOTNET.md`](docs/CARGO_DOTNET.md) — complete command reference
+- [`docs/QUICKSTART_INTEROP.md`](docs/QUICKSTART_INTEROP.md) — call .NET from Rust and Rust from C#
+- [`examples/issue-dashboard`](examples/issue-dashboard/README.md) — application-shaped example
+- [`docs/TRANSLATION_STATUS.md`](docs/TRANSLATION_STATUS.md) — known compiler limits

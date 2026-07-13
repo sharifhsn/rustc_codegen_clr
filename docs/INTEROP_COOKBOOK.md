@@ -170,7 +170,10 @@ fn main() -> std::io::Result<()> {
 
 `create_dir`, `read_dir`, `copy`, `rename`, `set_len`, `canonicalize`, `set_permissions`, and
 `std::process::Command` (spawn / capture output) are all wired. **Runnable:** `cargo_tests/pal_fs`
-(files/dirs), `cargo_tests/pal_fsmeta` (metadata). The one known gap is `hard_link`.
+(files/dirs), `cargo_tests/pal_fsmeta` (metadata). `hard_link` remains unsupported on the currently
+supported .NET 8–10 surface: those runtimes expose no portable managed hard-link API, and silently
+copying would violate Rust's shared-inode semantics. Host-specific P/Invoke is not substituted into
+otherwise portable managed output.
 
 ---
 
@@ -237,6 +240,17 @@ params; see `cargo_tests/spinacz/src/reflect.rs`'s doc for the exact rules).
 ```
 cargo dotnet add-nuget Newtonsoft.Json 13.0.3
 ```
+
+For a local or private feed, repeat `--source` as needed:
+
+```bash
+cargo dotnet add-nuget Contoso.Client 2.4.1 --source ./local-feed \
+  --source https://packages.example.com/v3/index.json
+```
+
+Supplying any `--source` overrides the sources from `NuGet.Config`, matching `dotnet restore`; repeat
+the flag for the complete source set. Omit it when ordinary NuGet source mapping and configured
+credentials should select the feed.
 
 writes `src/nuget/newtonsoft_json.rs` (add `mod nuget;` to your crate root the first time) and copies
 `Newtonsoft.Json.dll` into a crate-local `.cargo-dotnet-nuget-assets/` marker that every subsequent
@@ -415,7 +429,7 @@ runtime dispatching *into* the Rust callback through a first-class delegate obje
 (`callvirt Delegate::Invoke`):
 
 ```rust
-use mycorrhiza::prelude::*;                 // Action1/Action2/Func1/Func2 (Comparison via ::delegate)
+use mycorrhiza::prelude::*;                 // Action1..Action3 / Func1..Func3
 
 extern "C" fn double_it(x: i32) -> i32 { x * 2 }
 
@@ -427,8 +441,40 @@ let held = Func1::<i32, i32>::from_handle(f.handle());
 assert_eq!(held.invoke(7), 14);
 ```
 
-`Action1`/`Action2` are void-returning; `Func1`/`Func2` return a value; `Comparison<T>` is the
+`Action1`–`Action3` are void-returning; `Func1`–`Func3` return a value; `Comparison<T>` is the
 `(T,T) -> i32` comparator shape. **Runnable:** `cargo_tests/cd_delegates`.
+
+**Accept a C# delegate in exported Rust.** Put the same wrapper in a `#[dotnet_export]` or
+`#[dotnet_methods]` signature. The public CLR method receives a real `Action<T>`/`Func<T,R>` (not an
+integer or opaque value), and the generated shim reconstructs the Rust wrapper so the body can
+invoke it normally:
+
+```rust
+use dotnet_macros::dotnet_export;
+use mycorrhiza::delegate::{Action1, Func1};
+
+#[dotnet_export]
+pub fn notify(callback: Action1<i32>, value: i32) {
+    callback.invoke(value);
+}
+
+#[dotnet_export]
+pub fn transform(callback: Func1<i32, i32>, value: i32) -> i32 {
+    callback.invoke(value)
+}
+```
+
+```csharp
+MainModule.notify(x => Console.WriteLine(x), 7);
+int answer = MainModule.transform(x => x * 2, 21); // 42
+```
+
+The supported imported families are `Action1`–`Action3`, `Func1`–`Func3`, and `Comparison`, with
+passthrough primitive or managed `MString` callback parameters/results. Arity 4+ and automatic owned
+Rust strings/references need an explicit callback-boundary marshalling policy and fail at compile
+time rather than being misrepresented. These are invokable typed wrappers, not yet Rust `impl Fn`
+values. **Runnable:** `cargo_tests/cd_export_ergonomics` (C# host, all families through arity three,
+a non-ASCII string callback, and an instance method).
 
 **Capturing closures** are also shipped — a `move` closure over local state becomes a managed
 `Action`/`Func` via `::from_closure`, no need to thread state through a `static`:
@@ -479,10 +525,97 @@ Constraint: a managed `Task` handle must not be held *across* an `.await` inside
 reference can't live in the coroutine's overlapping saved state) — await it via a plain `Future`
 (`await_unit`) and keep only primitives across suspend points; the examples show the shape.
 
-**Not yet shipped: .NET event subscription** (`obj.SomeEvent += handler`, i.e. the `add_*`/`remove_*`
-accessors). Delegates work fine as plain fields/params/args (including generic-method args, above) —
-it's specifically the idiomatic `event EventHandler Foo` subscription syntax that isn't wired. Don't
-write a recipe that subscribes to a .NET event; it isn't wired.
+**Consume an async stream.** Wrap a managed `IAsyncEnumerable<T>` with `AsyncEnumerable::from_handle`,
+obtain its enumerator, and request one element at a time. `next()` returns a hand-written Rust future;
+`next_blocking()` is the synchronous-entry-point convenience. Both preserve the managed producer's
+backpressure because each call drives the real `MoveNextAsync` `ValueTask<bool>`:
+
+```rust
+let mut items = managed_stream.get_async_enumerator();
+while let Some(item) = items.next_blocking() {
+    println!("{item}");
+}
+items.dispose_blocking();
+```
+
+`ChannelReader<T>::ReadAllAsync` is exposed as `Receiver::read_all_async()`. **Runnable:**
+`cargo_tests/cd_async_stream`, whose delayed producer forces a pending `ValueTask<bool>` before
+yielding `11, 22, 33`. This is the consumer direction; producing `IAsyncEnumerable<T>` from a Rust
+`async fn` remains blocked on the coroutine managed-reference layout described in the task docs.
+
+**Consume generated async APIs.** Generated NuGet bindings preserve closed `Task<T>`, `ValueTask<T>`,
+and `IAsyncEnumerable<T>` returns when `T` is an expressible primitive, managed reference, or
+rank-1 array. Feed either task shape straight into the public task bridge, or wrap a returned stream
+handle:
+
+```rust
+use mycorrhiza::prelude::{await_task, await_value_task, block_on};
+
+let task_answer = block_on(await_task(client.get_task_answer_async()));
+let answer = block_on(await_value_task(client.get_answer_async()));
+
+let values = AsyncEnumerable::from_handle(client.stream_async())
+    .get_async_enumerator()
+    .collect_blocking();
+```
+
+`feasibility/value_task_nuget_acceptance.sh` builds a local NuGet package whose delayed method
+returns all three shapes, regenerates the Rust binding from metadata, and verifies delayed task
+results `84` and `42` plus ordered stream `[7, 8, 9]` in debug and release. Arbitrary constructed
+generics and nested async shapes remain omitted rather than receiving an incorrect CLR signature.
+
+**Export a real .NET event from Rust.** Put `#[dotnet_event("Changed")]` on the matching
+`add_Changed` and `remove_Changed` methods of a `#[dotnet_class]`. The generated assembly carries
+real Event/MethodSemantics metadata, so a C# consumer uses ordinary `+=` / `-=` syntax and
+reflection returns an `EventInfo`:
+
+```rust
+#[dotnet_methods]
+impl Notifier {
+    #[dotnet_event("Changed")]
+    pub fn add_Changed(this: NotifierHandle, value: ActionHandle) { /* retain value */ }
+
+    #[dotnet_event("Changed")]
+    pub fn remove_Changed(this: NotifierHandle, value: ActionHandle) { /* remove value */ }
+}
+```
+
+```csharp
+Action handler = () => Console.WriteLine("changed");
+notifier.Changed += handler;
+notifier.Changed -= handler;
+```
+
+The attributes define the CLR event contract; the Rust accessor bodies deliberately own backing
+storage, multicast behavior, lifetime, and synchronization. `#[dotnet_event]` also works on a
+`#[dotnet_interface]` member. **Runnable:** `cargo_tests/cd_event` and `cd_iface_event`.
+
+**Subscribe from Rust to a third-party .NET event.** Build the event's concrete delegate once and
+retain the returned `EventSubscription`; it calls the matching `remove_*` accessor on explicit
+`.unsubscribe()` or on drop, using the exact same delegate identity:
+
+```rust
+use mycorrhiza::bindings::System::ComponentModel::Component;
+use mycorrhiza::bindings::System::{EventArgs, EventHandler as RawEventHandler, Object};
+use mycorrhiza::prelude::{EventHandler, EventSubscription};
+
+extern "C" fn disposed(_sender: Object, _args: EventArgs) { /* ... */ }
+fn add(owner: Component, handler: RawEventHandler) { owner.add_disposed(handler); }
+fn remove(owner: Component, handler: RawEventHandler) { owner.remove_disposed(handler); }
+
+let component = Component::new();
+let handler = EventHandler::from_fn(disposed);
+let subscription = EventSubscription::subscribe(
+    component, handler.handle(), add, remove,
+);
+component.dispose(); // invokes `disposed`
+subscription.unsubscribe(); // deterministic removal; dropping does the same
+```
+
+`EventHandler` covers the common non-generic `System.EventHandler` shape. Other concrete delegate
+types use the same `EventSubscription` guard with their generated/raw handle and accessor adapters.
+The event owner still defines backing, multicast, threading, and disposal semantics. **Runnable:**
+`cargo_tests/cd_event_subscription` (real `System.ComponentModel.Component.Disposed`).
 
 ---
 
@@ -514,6 +647,29 @@ let _handle = ros.handle();   // escape hatch: hand the raw Span to a .NET API e
 `Span<T>`/`ReadOnlySpan<T>` are `ref struct`s (stack-only, generic value types) — this works because
 of the WF-9 value-type-generic-instance-method unlock. **Runnable:** `cargo_tests/cd_span`
 (`mycorrhiza::span` section).
+
+If managed code needs to **retain** the buffer or carry it across an async boundary, use the
+GC-owned sibling instead. Construction copies the Rust slice into a managed array; subsequent
+slices are cheap views over that same array:
+
+```rust
+use mycorrhiza::memory::{Memory, ReadOnlyMemory};
+
+let mut memory = Memory::from_slice(&[10i32, 20, 30]);
+let mut tail = memory.slice(1, 2);
+tail.set(0, 99);
+assert_eq!(memory.get(1), Some(99)); // same managed backing array
+
+let read_only = ReadOnlyMemory::from_slice(&[3i32, 1, 4]);
+let mut destination = Memory::from_slice(&[0i32, 0, 0]);
+read_only.copy_to(&mut destination);
+assert_eq!(destination.to_vec(), vec![3, 1, 4]);
+```
+
+`Memory<T>` is not advertised as zero-copy from Rust: the copy is what removes the Rust borrow
+lifetime and makes the buffer safe for managed retention. `.handle()` exposes the real managed
+value to APIs expecting `Memory<T>` / `ReadOnlyMemory<T>`. **Runnable:** `cargo_tests/cd_span`
+(`Memory<T>` section, total 68/68).
 
 ---
 
@@ -771,12 +927,16 @@ captured outputs.
 These are honest gaps as of this writing — the natural next recipes, but not yet backed by working code:
 
 - **Idiomatic `HttpClient`** — use `std::net` by hand (§4) for now.
-- **.NET event subscription** (`+=` on an event, i.e. `add_*`/`remove_*` accessors) — §8.
-- **`#[dotnet_class]` overriding a *base class's* virtual method** — implementing an *interface*
-  (§12) works; re-opening a class to override a virtual member does not.
-- **`IEnumerable<T>` over a C#-exported `RustVec<T>`** — it's indexable from C# but not `foreach`-able.
+- **Higher-level generated event adapters for every concrete delegate signature** — the generic
+  `EventSubscription` guard and common `System.EventHandler` wrapper ship (§8), but unusual delegate
+  types still need two small `add_*` / `remove_*` adapter functions.
+- **Arbitrary base-constructor chaining for every subclass shape** — explicit base-slot virtual
+  overrides ship via `#[dotnet_override]` (`cargo_tests/cd_override`), and real framework subclassing
+  ships in `cd_bgservice`; more complex constructor contracts still require an explicit supported
+  shape rather than automatic inference.
 - **A `serde` ⇄ `System.Text.Json` adapter** — the JSON bridge (§2) is a standalone DOM today.
-- **`#[dotnet_export]` of `Vec<T>` / slices / `Option` / `Result` / `char`** — primitives + strings only.
+- **General `#[dotnet_export]` Rust-enum/try-pattern and managed-reference `Option<T>` shapes** —
+  primitive `Option<T>`/`Nullable<T>`, `Vec<T>`, tasks, and `Result<T,E>`→exception already work.
 
 For the capability map and the genuine ceilings, see
 [TRANSLATION_STATUS.md](TRANSLATION_STATUS.md) and [STATE_OF_THE_PROJECT.md](STATE_OF_THE_PROJECT.md)

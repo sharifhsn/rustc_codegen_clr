@@ -252,6 +252,18 @@ impl ExportReadyAssembly {
         self.render_with_reverification(|asm| super::pe_exporter::export::export_pe(asm, options))
     }
 
+    /// Renders direct PE plus a standard Source Link payload in the Portable PDB, then performs
+    /// the same unconditional post-render verification as [`Self::render_pe`].
+    pub fn render_pe_with_source_link(
+        self,
+        options: &super::pe_exporter::export::ExportOptions,
+        source_link_json: Option<&str>,
+    ) -> Result<(Vec<u8>, Vec<u8>), VerificationFailure> {
+        self.render_with_reverification(|asm| {
+            super::pe_exporter::export::export_pe_with_source_link(asm, options, source_link_json)
+        })
+    }
+
     fn render_with_reverification<T>(
         mut self,
         render: impl FnOnce(&mut Assembly) -> T,
@@ -537,6 +549,52 @@ impl Assembly {
     pub fn default_fuel(&self) -> OptFuel {
         OptFuel::new((self.method_defs.len() * 4 + self.roots.len() * 16) as u32)
     }
+    /// Returns method definitions in a process-independent semantic order.
+    ///
+    /// `method_defs` is an `FxHashMap`. Its iteration order depends on the table's insertion and
+    /// resize history, which can differ after independently linked clean builds even when the
+    /// assembly is semantically identical. Optimizer fuel is global, so iterating that map directly
+    /// changes which methods receive the final optimization pass. In particular, `realloc_locals`
+    /// then assigns different local slots and makes otherwise-identical direct-PE output diverge.
+    fn stable_method_def_idxs(&self) -> Vec<MethodDefIdx> {
+        let mut methods: Vec<_> = self.method_defs.keys().copied().collect();
+        methods.sort_by_cached_key(|method| {
+            let method_ref = &self[method.0];
+            let class = &self[method_ref.class()];
+            let sig = &self[method_ref.sig()];
+            let class_assembly = class
+                .asm()
+                .map(|name| self[name].to_string())
+                .unwrap_or_default();
+            let class_generics = class
+                .generics()
+                .iter()
+                .map(|ty| ty.mangle(self))
+                .collect::<Vec<_>>()
+                .join(",");
+            let inputs = sig
+                .inputs()
+                .iter()
+                .map(|ty| ty.mangle(self))
+                .collect::<Vec<_>>()
+                .join(",");
+            let method_generics = method_ref
+                .generics()
+                .iter()
+                .map(|ty| ty.mangle(self))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{class_assembly}|{}|{}|{class_generics}|{}|{:?}|{inputs}|{}|{method_generics}",
+                &self[class.name()],
+                class.is_valuetype(),
+                &self[method_ref.name()],
+                method_ref.kind(),
+                sig.output().mangle(self),
+            )
+        });
+        methods
+    }
     pub(crate) fn borrow_methoddef(&mut self, def_id: MethodDefIdx) -> MethodDef {
         self.method_defs.remove(&def_id).unwrap()
     }
@@ -563,10 +621,21 @@ impl Assembly {
             }
             //let _pass_min_cost: bool = fuel.consume(1);
         }
+
+        // Optimization may exhaust the shared fuel immediately after a pass changes or removes
+        // locals. Always finish at the same canonical local-slot boundary: otherwise two
+        // semantically identical assemblies can retain different MIR/intern insertion histories in
+        // their `.locals` order, which changes StandAloneSig rows and every subsequent method-body
+        // token in direct-PE output.
+        for method in self.stable_method_def_idxs() {
+            let mut tmp_method = self.borrow_methoddef(method);
+            tmp_method.implementation_mut().realloc_locals(self);
+            self.return_methoddef(method, tmp_method);
+        }
     }
     /// Optimizes the assembly, cosuming some fuel. This performs a single optimization pass.
     pub fn opt_sigle_pass(&mut self, fuel: &mut OptFuel, cache: &mut SideEffectInfoCache) {
-        let method_def_idxs: Box<[_]> = self.method_defs.keys().copied().collect();
+        let method_def_idxs = self.stable_method_def_idxs();
         for method in method_def_idxs {
             let mut tmp_method = self.borrow_methoddef(method);
             tmp_method.optimize(self, cache, fuel);
@@ -2362,7 +2431,7 @@ impl Assembly {
         self.call(uninit_val, &EMPTY, IsPure::PURE)
     }
     /// Builds a fat-pointer value of class `slice_tpe` (a `FatPtr*` / slice class, as produced by
-    /// [`crate::r#type::fat_ptr_to`]) from a thin data `ptr` and `metadata`, via the `create_slice`
+    /// `rustc_codegen_clr::r#type::fat_ptr_to`) from a thin data `ptr` and `metadata`, via the `create_slice`
     /// builtin. Used by the place pipeline (`src/place/body.rs`).
     pub fn create_slice(
         &mut self,
@@ -3280,6 +3349,32 @@ fn add_deliberately_ill_typed_method(asm: &mut Assembly) -> MethodDefIdx {
 #[test]
 fn final_export_verification_accepts_clean_assembly() {
     assert!(Assembly::default().prepared().verify_for_export().is_ok());
+}
+
+#[test]
+fn optimizer_method_schedule_uses_semantic_order() {
+    let mut asm = Assembly::default();
+    let main = asm.main_module();
+    let sig = asm.sig([], Type::Void);
+    for name in ["zeta", "alpha", "middle"] {
+        let name = asm.alloc_string(name);
+        asm.new_method(MethodDef::new(
+            Access::Private,
+            main,
+            name,
+            sig,
+            MethodKind::Static,
+            MethodImpl::Missing,
+            vec![],
+        ));
+    }
+
+    let names: Vec<_> = asm
+        .stable_method_def_idxs()
+        .into_iter()
+        .map(|method| asm[asm[method].name()].to_string())
+        .collect();
+    assert_eq!(names, ["alpha", "middle", "zeta"]);
 }
 
 #[test]

@@ -669,11 +669,12 @@ specific is concentrated at the edges and now flows through one abstraction:
   (`linker/dotnet_jumpstart.rs` + `main.rs`), the fuzz-harness runtimeconfig, and the NuGet TFM
   (`cargo-dotnet pack`). **Public-key tokens are version-INVARIANT** (verified identical on 8 and 9) —
   only the `.ver` triplet flips; there is deliberately no token accessor.
-- **Front-end:** `cargo dotnet --dotnet <8|9|10>` (env `DOTNET_VERSION`) sets the version for the codegen
-  backend **and** the (separate-process) linker via one inner-cargo env seam, and selects the *matching*
-  matching CoreCLR ilasm (`ilasm-tool`, `ilasm9-tool`, or `ilasm10-tool`).
+- **Front-end:** the 0.0.1 SDK accepts only `cargo dotnet --dotnet 10` (or the default). It sets the
+  version for the codegen backend and separate-process linker through one inner-Cargo environment
+  seam and selects the matching `ilasm10-tool` when the legacy exporter is requested.
 - **Verified profiles:** .NET 8 retains the compatibility lowering; .NET 9 and 10 use native sub-word
   `Interlocked` operations. .NET 10 is exercised by executable Rust, C#-consumes-Rust, and NativeAOT
   acceptance, with `cd_net10_bcl` additionally proving a BCL API absent from earlier contracts.
-- **Floor/ceiling:** .NET 8 is the supported compatibility floor. Forward versions remain additive:
-  add one runtime-profile arm, its matching tools, and capability gates for genuinely new behavior.
+- **Release boundary:** Net8/Net9 remain internal compatibility implementations, not supported 0.0.1
+  profiles. A future release can expose another profile after its tools, scaffolds, packaging, and
+  product-shaped acceptance are all exercised together.

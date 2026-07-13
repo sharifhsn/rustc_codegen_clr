@@ -11,6 +11,8 @@
 //!  2. **Runtime-failure translation** — the .NET runtime's exceptions are cryptic for a
 //!     Rust dev. `cargo dotnet doctor <log-or-message>` (or piped stdin) scans the text
 //!     for the known interop failure signatures and prints the *cause + fix*, e.g.:
+//!       * `TypeLoadException: … object field … overlapped` → a managed reference was
+//!         placed in a Rust enum/union layout the CLR GC cannot represent.
 //!       * `TypeLoadException: … Stack` / `Queue` → the impl-assembly gotcha (those live
 //!         in `System.Collections`, not `System.Private.CoreLib`).
 //!       * `MissingMethodException` / `EntryPointNotFoundException: rcl_vec_*` →
@@ -24,12 +26,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Result;
+use serde::Serialize;
 
 use crate::cli::DoctorArgs;
 use crate::host::{self, HostFacts};
 use crate::mode::{self, Mode};
 
 /// One diagnostic line: a status + a human message (+ an optional fix hint).
+#[derive(Serialize)]
 struct Check {
     ok: bool,
     /// `false` for a soft warning that does not fail the overall exit code.
@@ -82,6 +86,10 @@ pub fn run(args: &DoctorArgs) -> Result<i32> {
     // Runtime-failure translation mode: an explicit log/message arg, or piped stdin.
     if let Some(input) = read_failure_input(args)? {
         let hints = diagnose_failure(&input);
+        if args.json {
+            println!("{}", failure_report_json(&hints)?);
+            return Ok(0);
+        }
         if hints.is_empty() {
             println!("cargo dotnet doctor: no known interop failure signature matched.");
             println!(
@@ -102,22 +110,38 @@ pub fn run(args: &DoctorArgs) -> Result<i32> {
     }
 
     // Environment check mode.
-    let checks = environment_checks();
+    let checks = environment_checks(&args.dotnet);
+    let wiring_checks = workspace_wiring_checks(&args.workspace);
+    let fails = checks
+        .iter()
+        .chain(&wiring_checks)
+        .filter(|check| !check.ok && check.hard)
+        .count() as u32;
+
+    if args.json {
+        println!(
+            "{}",
+            environment_report_json(
+                &args.dotnet,
+                &args.workspace,
+                &checks,
+                &wiring_checks,
+                fails,
+            )?
+        );
+        return Ok(if fails == 0 { 0 } else { 1 });
+    }
+
     let mut out = String::new();
     out.push_str("cargo dotnet doctor — environment:\n\n");
-    let mut fails = 0u32;
     for c in &checks {
         c.render(&mut out);
-        if !c.ok && c.hard {
-            fails += 1;
-        }
     }
     print!("{out}");
 
     // Workspace-wiring lints: sibling Rust crates missing a <RustCrate> reference, and
     // TFM/RustDotnetVersion mismatches. Best-effort — scan errors are reported as a single
     // soft warning rather than aborting the whole `doctor` run.
-    let wiring_checks = workspace_wiring_checks(&args.workspace);
     if !wiring_checks.is_empty() {
         let mut wout = String::new();
         wout.push_str(&format!(
@@ -126,9 +150,6 @@ pub fn run(args: &DoctorArgs) -> Result<i32> {
         ));
         for c in &wiring_checks {
             c.render(&mut wout);
-            if !c.ok && c.hard {
-                fails += 1;
-            }
         }
         print!("{wout}");
     }
@@ -145,13 +166,76 @@ pub fn run(args: &DoctorArgs) -> Result<i32> {
     }
 }
 
+#[derive(Serialize)]
+struct FailureReport<'a> {
+    schema: u32,
+    mode: &'static str,
+    matched: bool,
+    hints: &'a [Hint],
+}
+
+fn failure_report_json(hints: &[Hint]) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&FailureReport {
+        schema: 1,
+        mode: "failure",
+        matched: !hints.is_empty(),
+        hints,
+    })?)
+}
+
+#[derive(Serialize)]
+struct EnvironmentReport<'a> {
+    schema: u32,
+    mode: &'static str,
+    dotnet: &'a str,
+    workspace: String,
+    ok: bool,
+    hard_failures: u32,
+    environment: &'a [Check],
+    workspace_wiring: &'a [Check],
+}
+
+fn environment_report_json(
+    dotnet: &str,
+    workspace: &Path,
+    environment: &[Check],
+    workspace_wiring: &[Check],
+    hard_failures: u32,
+) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&EnvironmentReport {
+        schema: 1,
+        mode: "environment",
+        dotnet,
+        workspace: workspace.display().to_string(),
+        ok: hard_failures == 0,
+        hard_failures,
+        environment,
+        workspace_wiring,
+    })?)
+}
+
 // ---------------------------------------------------------------------------------
 // Environment checks.
 // ---------------------------------------------------------------------------------
 
-fn environment_checks() -> Vec<Check> {
+fn environment_checks(dotnet_version: &str) -> Vec<Check> {
     let mut checks = Vec::new();
     let facts = HostFacts::detect();
+
+    if let Ok(Mode::Installed { home }) = mode::detect() {
+        checks.push(match crate::bundle::verify_installed_if_locked(&home) {
+            Ok(true) => Check::pass(
+                "install bundle integrity",
+                "BUNDLE-LOCK.json and all declared SDK files match".to_string(),
+            ),
+            Ok(false) => Check::warn(
+                "install bundle integrity",
+                "source-checkout setup has no BUNDLE-LOCK.json; install a release bundle for checksummed SDK inputs"
+                    .to_string(),
+            ),
+            Err(error) => Check::fail("install bundle integrity", format!("{error:#}")),
+        });
+    }
 
     // rustc / cargo on PATH.
     checks.push(match host::ensure_rust_toolchain() {
@@ -164,29 +248,99 @@ fn environment_checks() -> Vec<Check> {
 
     // dotnet.
     let heal = host::dotnet_env_adds();
+    let dotnet_reachable = host::ensure_dotnet(&heal).is_ok();
     checks.push(match host::ensure_dotnet(&heal) {
         Ok(()) => Check::pass("dotnet runtime reachable", ""),
         Err(e) => Check::fail("dotnet runtime reachable", e.to_string()),
     });
 
-    // A CoreCLR (not Mono) ilasm matching the selected runtime profile.
-    let dotnet = std::env::var("DOTNET_VERSION").map_or_else(
-        |_| Ok(crate::context::DotnetVersion::default()),
-        |v| v.parse(),
-    );
-    checks.push(match dotnet {
-        Ok(dotnet) => match host::resolve_ilasm(&facts, dotnet) {
-            Ok(Some(p)) => Check::pass("CoreCLR ilasm", format!("using {}", p.display())),
-            Ok(None) => Check::pass("CoreCLR ilasm", "a non-Mono ilasm on PATH".to_string()),
-            Err(e) => Check::fail("CoreCLR ilasm", e.to_string()),
-        },
-        Err(e) => Check::fail("CoreCLR ilasm", e),
-    });
+    // The selected runtime profile must actually be installed. Merely finding a `dotnet` binary is
+    // insufficient: an older SDK can otherwise survive setup and fail only after an expensive
+    // Rust build with the runtime's opaque "install or update .NET" message.
+    let dotnet = dotnet_version.parse();
+    match dotnet {
+        Ok(dotnet) => {
+            if dotnet_reachable {
+                checks.push(check_dotnet_runtime(dotnet, heal.as_ref()));
+            }
+            // `ilasm` is only needed for DIRECT_PE=0, so its absence is a warning rather than a
+            // blocker for the default direct-PE pipeline.
+            checks.push(match host::resolve_ilasm(&facts, dotnet) {
+                Ok(Some(p)) => {
+                    Check::pass("CoreCLR ilasm fallback", format!("using {}", p.display()))
+                }
+                Ok(None) => Check::pass(
+                    "CoreCLR ilasm fallback",
+                    "a non-Mono ilasm is on PATH".to_string(),
+                ),
+                Err(e) => Check::warn(
+                    "CoreCLR ilasm fallback",
+                    format!("optional unless DIRECT_PE=0: {e}"),
+                ),
+            });
+        }
+        Err(e) => checks.push(Check::fail("selected .NET runtime", e)),
+    }
 
     // The backend install (dylib + linker + target spec + msbuild targets).
     checks.extend(check_backend_install(&facts));
 
     checks
+}
+
+fn check_dotnet_runtime(
+    dotnet: crate::context::DotnetVersion,
+    heal: Option<&(PathBuf, PathBuf)>,
+) -> Check {
+    let mut command = if let Some((path, root)) = heal {
+        let mut command = Command::new(path.join(if cfg!(windows) {
+            "dotnet.exe"
+        } else {
+            "dotnet"
+        }));
+        command.env("DOTNET_ROOT", root);
+        command
+    } else {
+        Command::new("dotnet")
+    };
+    match command.arg("--list-runtimes").output() {
+        Ok(output) if output.status.success() => {
+            let runtimes = String::from_utf8_lossy(&output.stdout);
+            if has_runtime_major(&runtimes, dotnet.as_env()) {
+                Check::pass(
+                    format!(".NET {} runtime installed", dotnet.as_env()),
+                    "Microsoft.NETCore.App is available".to_string(),
+                )
+            } else {
+                Check::fail(
+                    format!(".NET {} runtime installed", dotnet.as_env()),
+                    format!(
+                        "Microsoft.NETCore.App {}.x is missing — install the .NET {} SDK, or select an installed profile with `--dotnet` / DOTNET_VERSION",
+                        dotnet.as_env(),
+                        dotnet.as_env()
+                    ),
+                )
+            }
+        }
+        Ok(output) => Check::fail(
+            "installed .NET runtimes",
+            format!("`dotnet --list-runtimes` exited with {}", output.status),
+        ),
+        Err(error) => Check::fail(
+            "installed .NET runtimes",
+            format!("could not run `dotnet --list-runtimes`: {error}"),
+        ),
+    }
+}
+
+fn has_runtime_major(list: &str, major: &str) -> bool {
+    list.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some("Microsoft.NETCore.App")
+            && fields
+                .next()
+                .is_some_and(|version| version.starts_with(&format!("{major}.")))
+    })
 }
 
 /// Verify the pinned nightly is installed and carries rust-src (needed for build-std).
@@ -604,6 +758,7 @@ fn extract_attr(tag: &str, attr: &str) -> Option<String> {
 // ---------------------------------------------------------------------------------
 
 /// A translated diagnosis: a one-line title + a few actionable body lines.
+#[derive(Serialize)]
 pub struct Hint {
     pub title: String,
     pub body: Vec<String>,
@@ -653,8 +808,29 @@ pub fn diagnose_failure(text: &str) -> Vec<Hint> {
     let mut hints = Vec::new();
     let lower = text.to_lowercase();
 
-    // 1. TypeLoadException — usually the impl-assembly gotcha.
-    if lower.contains("typeloadexception") || lower.contains("could not load type") {
+    // 1a. A managed GC reference cannot participate in Rust's overlapping enum/union layout.
+    // Match this before the generic TypeLoadException advice: suggesting an assembly-name change
+    // for this loader error sends the user in exactly the wrong direction.
+    if (lower.contains("typeloadexception") || lower.contains("could not load type"))
+        && lower.contains("object field at offset")
+        && (lower.contains("incorrectly aligned")
+            || lower.contains("overlapped by a non-object field"))
+    {
+        hints.push(Hint {
+            title: "TypeLoadException → managed reference in an overlapping Rust layout".to_string(),
+            body: vec![
+                "The CLR garbage collector forbids an object reference from overlapping a non-object field in an explicit-layout type."
+                    .to_string(),
+                "The usual cause is placing a managed wrapper such as Json, List, or DotNetString directly inside Result, a data-carrying enum, or a union."
+                    .to_string(),
+                "Fix: pattern-match Option at the managed boundary and keep the managed handle outside the Rust enum, or convert it to Rust-owned data before wrapping it in Result."
+                    .to_string(),
+                "This is a CLR layout boundary, not an implementation-assembly mismatch."
+                    .to_string(),
+            ],
+        });
+    // 1b. Other TypeLoadExceptions are usually the impl-assembly gotcha.
+    } else if lower.contains("typeloadexception") || lower.contains("could not load type") {
         let mut body = vec![
             "A managed type failed to load. The #1 cause in interop is the IMPL-ASSEMBLY gotcha:"
                 .to_string(),
@@ -767,6 +943,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_inventory_matches_only_coreclr_major() {
+        let inventory = "Microsoft.AspNetCore.App 10.0.1 [/dotnet/shared/Microsoft.AspNetCore.App]\n\
+                         Microsoft.NETCore.App 8.0.28 [/dotnet/shared/Microsoft.NETCore.App]\n";
+        assert!(has_runtime_major(inventory, "8"));
+        assert!(!has_runtime_major(inventory, "10"));
+    }
+
+    #[test]
     fn typeload_maps_to_impl_assembly() {
         let hints = diagnose_failure(
             "Unhandled exception. System.TypeLoadException: Could not load type \
@@ -786,6 +970,24 @@ mod tests {
                 .body
                 .iter()
                 .any(|l| l.contains("names Stack/Queue"))
+        );
+    }
+
+    #[test]
+    fn overlapping_object_typeload_maps_to_managed_enum_layout() {
+        let hints = diagnose_failure(
+            "Unhandled exception. System.TypeLoadException: Could not load type \
+             'core.result.Result.tid_123' because it contains an object field at offset 8 that \
+             is incorrectly aligned or overlapped by a non-object field.",
+        );
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].title.contains("overlapping Rust layout"));
+        assert!(hints[0].body.iter().any(|line| line.contains("Result")));
+        assert!(
+            hints[0]
+                .body
+                .iter()
+                .any(|line| line.contains("not an implementation-assembly mismatch"))
         );
     }
 
@@ -820,6 +1022,33 @@ mod tests {
     #[test]
     fn unknown_text_yields_no_hint() {
         assert!(diagnose_failure("thread 'main' panicked at 'index out of bounds'").is_empty());
+    }
+
+    #[test]
+    fn failure_json_has_stable_schema_and_match_state() {
+        let hints = diagnose_failure("EntryPointNotFoundException: greet");
+        let report: serde_json::Value =
+            serde_json::from_str(&failure_report_json(&hints).unwrap()).unwrap();
+        assert_eq!(report["schema"], 1);
+        assert_eq!(report["mode"], "failure");
+        assert_eq!(report["matched"], true);
+        assert_eq!(report["hints"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn environment_json_separates_environment_and_wiring_checks() {
+        let environment = vec![Check::pass("dotnet", "reachable")];
+        let wiring = vec![Check::fail("TFM", "mismatch")];
+        let report: serde_json::Value = serde_json::from_str(
+            &environment_report_json("10", Path::new("fixture"), &environment, &wiring, 1).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["schema"], 1);
+        assert_eq!(report["mode"], "environment");
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["hard_failures"], 1);
+        assert_eq!(report["environment"][0]["label"], "dotnet");
+        assert_eq!(report["workspace_wiring"][0]["label"], "TFM");
     }
 
     #[test]

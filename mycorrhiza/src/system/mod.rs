@@ -14,14 +14,14 @@ pub type MString =
 
 /// The universal managed base type `System.Object` (a raw handle). Every managed reference upcasts to
 /// it implicitly; use it as a marker-free intermediary when a method's declared return is a nested
-/// generic def-shape (e.g. `Task`1<!0>`) that cannot be produced into a concrete local — obtain the
+/// generic def-shape (e.g. `Task<!0>`) that cannot be produced into a concrete local — obtain the
 /// value as `MObject`, then `castclass` to the concrete handle.
 pub type MObject =
     crate::intrinsics::RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Object">;
 
 /// Construct a managed `System.String` from a Rust string slice in one call —
 /// `let s: MString = "hi".into();` — no `StringBuilder` needed for a literal or already-formatted
-/// `&str`/`String`. Reach for [`crate::bcl::StringBuilder`] only when you actually need mutable,
+/// `&str`/`String`. Reach for [`crate::bcl::stringbuilder::StringBuilder`] only when you actually need mutable,
 /// incremental construction (e.g. building up a string across a loop); for anything you already
 /// hold as a Rust string, this `From` impl is the direct path.
 impl From<&str> for MString {

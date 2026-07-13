@@ -15,7 +15,7 @@ pub use basic_block::BasicBlock;
 pub use bimap::BiMap;
 pub use cilnode::{BinOp, CILNode};
 pub use cilroot::{BranchCond, CILRoot};
-pub use class::{ClassDef, ClassRef};
+pub use class::{ClassDef, ClassRef, EnumDef};
 pub use cst::Const;
 pub use field::{FieldDesc, StaticFieldDesc};
 pub use fnsig::FnSig;

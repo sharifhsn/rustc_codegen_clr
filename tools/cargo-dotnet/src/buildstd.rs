@@ -6,8 +6,11 @@
 //! `artifact::locate`. This is the ONE place a child env is constructed on the native
 //! path (the inner cargo); everything else is typed Rust.
 
+use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 
 use anyhow::{Context as _, Result, bail};
 
@@ -43,17 +46,13 @@ pub fn build_with_sysroot(ctx: &Context, sysroot: &PrivateSysroot) -> Result<Str
     // registry libc copy before it is compiled (the std::os::fd `libc::` refs fail on an
     // unpatched registry libc). `-Zjson-target-spec` is the unstable flag the dotnet
     // target spec (a JSON file) needs — it must NOT be dropped.
-    let _ = base_cargo(ctx, sysroot)
-        .arg("-Zjson-target-spec")
-        .arg("fetch")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    patch_registry_libc(ctx)?;
+    fetch_dependencies(ctx, sysroot)?;
 
-    // The build pass. Capture combined output; tee it to lastbuild_log; print it FULL
-    // when --verbose, else a filtered tail (errors/warnings/std-compile lines) like
-    // dev.sh. Errors are always preserved in the log + the filtered view.
+    // The build pass. Stream combined output while also preserving it in lastbuild_log.
+    // A previous `.output()` implementation waited until rustc + the linker had both
+    // finished before printing anything, which made an ordinary build look hung for
+    // long stretches. Keep the concise default view, but emit its progress lines as
+    // they happen; --verbose still emits every line.
     let mut build_cmd = base_cargo(ctx, sysroot);
     build_cmd.arg("-Zjson-target-spec").arg("build");
     if let Some(flag) = ctx.profile.cargo_flag() {
@@ -62,38 +61,57 @@ pub fn build_with_sysroot(ctx: &Context, sysroot: &PrivateSysroot) -> Result<Str
     for f in &ctx.flags.extra_cargo {
         build_cmd.arg(f);
     }
-    let out = build_cmd
+    let mut child = build_cmd
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())
-        .output()
+        .spawn()
         .context("failed to launch the inner build-std cargo")?;
-    let log = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+
+    let (tx, rx) = mpsc::channel();
+    let stdout_reader = spawn_line_reader(
+        child
+            .stdout
+            .take()
+            .context("inner cargo stdout was not piped")?,
+        tx.clone(),
     );
+    let stderr_reader = spawn_line_reader(
+        child
+            .stderr
+            .take()
+            .context("inner cargo stderr was not piped")?,
+        tx,
+    );
+    let mut log = String::new();
+    for line in rx {
+        log.push_str(&line);
+        log.push('\n');
+        if ctx.flags.verbose || is_interesting(&line) {
+            eprintln!("{line}");
+        }
+    }
+    let status = child.wait().context("wait for the inner build-std cargo")?;
+    stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("inner cargo stdout reader panicked"))?;
+    stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("inner cargo stderr reader panicked"))?;
     if let Some(parent) = ctx.paths.lastbuild_log.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(&ctx.paths.lastbuild_log, &log);
-    if ctx.flags.verbose {
-        eprint!("{log}");
-    } else {
-        for line in log.lines().filter(|l| is_interesting(l)).take(60) {
-            eprintln!("{line}");
-        }
-    }
-    if !out.status.success() && !ctx.flags.verbose {
+    if !status.success() && !ctx.flags.verbose {
         eprintln!("== full inner build log after failure ==");
         eprint!("{log}");
     }
-    if ctx.flags.verbose || !out.status.success() {
-        eprintln!("== build exit: {} ==", out.status.code().unwrap_or(-1));
+    if ctx.flags.verbose || !status.success() {
+        eprintln!("== build exit: {} ==", status.code().unwrap_or(-1));
     }
-    if !out.status.success() {
+    if !status.success() {
         bail!(
             "inner cargo build failed (exit {})",
-            out.status.code().unwrap_or(-1)
+            status.code().unwrap_or(-1)
         );
     }
     record_target_sysroot(&target_dir, &sysroot.root)?;
@@ -166,22 +184,131 @@ fn record_target_sysroot(target_dir: &Path, sysroot: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The dev.sh build-log filter: keep errors, "could not compile", unused-warnings, the
-/// std/core/alloc compile lines, and Finished. Everything else is noise.
+fn spawn_line_reader<R: std::io::Read + Send + 'static>(
+    reader: R,
+    tx: mpsc::Sender<String>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    })
+}
+
+/// The default build-log filter: keep failures, actionable warnings, normal Cargo
+/// compilation progress, linker stage progress, and the final Cargo summary.
 fn is_interesting(line: &str) -> bool {
     let l = line.trim_start();
     l.starts_with("error")
         || l.contains("error[")
         || l.contains("could not compile")
         || l.starts_with("warning: unused")
-        || l.starts_with("Compiling std ")
-        || l.starts_with("Compiling core ")
-        || l.starts_with("Compiling alloc ")
+        || l.starts_with("Compiling ")
+        || l.starts_with("Linking ")
+        || l.starts_with("==>")
         || l.starts_with("Finished")
 }
 
 /// Patch the libc REGISTRY copies (post-`cargo fetch`). build-std resolves libc from the
 /// registry, not the rust-src vendor tree, so this covers whichever copy it picks.
+pub(crate) fn fetch_dependencies(ctx: &Context, sysroot: &PrivateSysroot) -> Result<()> {
+    let mut command = base_cargo(ctx, sysroot);
+    command.arg("-Zjson-target-spec").arg("fetch");
+    for flag in dependency_fetch_flags(ctx) {
+        command.arg(flag);
+    }
+    let status = command.status().context("run cargo fetch")?;
+    if !status.success() {
+        bail!(
+            "cargo fetch failed (exit {}); run `cargo dotnet restore {}` while network access is available",
+            status.code().unwrap_or(-1),
+            ctx.crate_dir.display()
+        );
+    }
+    patch_registry_libc(ctx)
+}
+
+fn dependency_fetch_flags(ctx: &Context) -> Vec<String> {
+    let mut selected = Vec::new();
+    let mut flags = ctx.flags.extra_cargo.iter();
+    while let Some(flag) = flags.next() {
+        match flag.as_str() {
+            "--offline" | "--locked" | "--frozen" => selected.push(flag.clone()),
+            "--manifest-path" | "--target" => {
+                selected.push(flag.clone());
+                if let Some(value) = flags.next() {
+                    selected.push(value.clone());
+                }
+            }
+            value if value.starts_with("--manifest-path=") || value.starts_with("--target=") => {
+                selected.push(flag.clone());
+            }
+            _ => {}
+        }
+    }
+    selected
+}
+
+fn dependency_metadata_flags(ctx: &Context) -> Vec<String> {
+    let mut selected = Vec::new();
+    let mut flags = ctx.flags.extra_cargo.iter();
+    while let Some(flag) = flags.next() {
+        match flag.as_str() {
+            "--offline" | "--locked" | "--frozen" | "--all-features" | "--no-default-features" => {
+                selected.push(flag.clone())
+            }
+            "--manifest-path" | "--features" => {
+                selected.push(flag.clone());
+                if let Some(value) = flags.next() {
+                    selected.push(value.clone());
+                }
+            }
+            value if value.starts_with("--manifest-path=") || value.starts_with("--features=") => {
+                selected.push(flag.clone());
+            }
+            _ => {}
+        }
+    }
+    selected
+}
+
+pub(crate) fn local_manifest_paths(
+    ctx: &Context,
+    sysroot: &PrivateSysroot,
+) -> Result<Vec<PathBuf>> {
+    let mut command = base_cargo(ctx, sysroot);
+    command
+        .arg("-Zjson-target-spec")
+        .arg("metadata")
+        .arg("--format-version=1");
+    for flag in dependency_metadata_flags(ctx) {
+        command.arg(flag);
+    }
+    let output = command
+        .output()
+        .context("query resolved Cargo manifests for restore receipt")?;
+    if !output.status.success() {
+        bail!(
+            "cargo metadata failed while writing restore receipt:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let mut manifests = metadata["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|package| package["source"].is_null())
+        .filter_map(|package| package["manifest_path"].as_str())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    manifests.sort();
+    manifests.dedup();
+    Ok(manifests)
+}
+
 fn patch_registry_libc(ctx: &Context) -> Result<()> {
     for d in palinject::find_libc_dirs(&ctx.paths.registry_src) {
         if palinject::patch_libc(&d)? && ctx.flags.verbose {
@@ -210,14 +337,32 @@ fn base_cargo(ctx: &Context, sysroot: &PrivateSysroot) -> Command {
         rustflags::assemble(
             &ctx.paths.backend_dylib,
             &ctx.paths.linker,
+            ctx.dotnet.as_env(),
             &[
                 (&ctx.paths.sdk_crates_root, "/_/rust-dotnet-sdk"),
                 (&ctx.crate_dir, "/_/consumer"),
                 (&ctx.paths.cargo_home, "/_/cargo-home"),
                 (&sysroot.root, "/_/rust-sysroot"),
             ],
+            ctx.source_link_url.as_deref(),
         ),
     );
+    match &ctx.source_link_url {
+        Some(url) => {
+            let json = serde_json::json!({
+                "documents": {
+                    "/_/consumer/*": url,
+                }
+            });
+            cmd.env(
+                "RCL_SOURCE_LINK_JSON",
+                serde_json::to_string(&json).unwrap(),
+            );
+        }
+        None => {
+            cmd.env_remove("RCL_SOURCE_LINK_JSON");
+        }
+    }
     cmd.env("RUST_LIB_SRC", &sysroot.library);
     // RUSTFLAGS does not affect Cargo's rustc discovery calls. Using this executable as
     // RUSTC_WRAPPER makes `rustc --print sysroot` return the private snapshot too, so
@@ -345,5 +490,15 @@ mod tests {
             envs.get(std::ffi::OsStr::new("DIRECT_PE")),
             Some(&Some(std::ffi::OsStr::new("0")))
         );
+    }
+
+    #[test]
+    fn default_build_output_keeps_consumer_and_linker_progress() {
+        assert!(is_interesting(
+            "   Compiling customer_app v0.1.0 (/tmp/customer_app)"
+        ));
+        assert!(is_interesting("==> Optimizing in 1.2s"));
+        assert!(is_interesting("    Finished `dev` profile"));
+        assert!(!is_interesting("    Checking serde v1.0.0"));
     }
 }

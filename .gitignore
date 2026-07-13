@@ -41,6 +41,8 @@ cargo_tests/**/csharp/bin/
 cargo_tests/**/csharp/obj/
 cargo_tests/**/basecs/bin/
 cargo_tests/**/basecs/obj/
+# application examples are exercised in place; never commit their private-sysroot build output
+examples/**/target/
 # .NET runtime config emitted by cargo-dotnet / the linker into the run dir
 .runtimeconfig.json
 *.runtimeconfig.json

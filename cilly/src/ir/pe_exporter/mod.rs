@@ -7,18 +7,18 @@
 //! exactly the subset `il_exporter` emits today — nothing more.
 //!
 //! Layout of the writer (each stage is independently unit-tested):
-//! * [`heaps`] — the four metadata heaps (`#Strings`, `#Blob`, `#GUID`, `#US`), interned + deduped.
-//! * [`sig`] — `Type` → `ELEMENT_TYPE_*` signature-blob encoding (fields, methods, locals,
+//! * [`crate::ir::pe_exporter::heaps`] — the four metadata heaps (`#Strings`, `#Blob`, `#GUID`, `#US`), interned + deduped.
+//! * [`crate::ir::pe_exporter::sig`] — `Type` → `ELEMENT_TYPE_*` signature-blob encoding (fields, methods, locals,
 //!   `MethodSpec`, `calli` stand-alone sigs).
-//! * [`tables`] — the metadata tables + coded-index/heap-index width computation and the
+//! * [`crate::ir::pe_exporter::tables`] — the metadata tables + coded-index/heap-index width computation and the
 //!   populate → size → serialize pipeline. *(Phase 1a: implemented + unit-tested)*
-//! * [`body`] — method bodies: tiny/fat headers, opcode bytes, branch layout, fat EH sections.
+//! * [`crate::ir::pe_exporter::body`] — method bodies: tiny/fat headers, opcode bytes, branch layout, fat EH sections.
 //!   *(Phase 1a: implemented + unit-tested)*
-//! * [`pe`] — the PE/COFF container and CLI header, including the native `mscoree.dll`
+//! * [`crate::ir::pe_exporter::pe`] — the PE/COFF container and CLI header, including the native `mscoree.dll`
 //!   `_CorExeMain` bootstrap stub (IAT/Import Table/`.reloc`) an `.exe` needs to satisfy the OS's
 //!   native PE loader before the CLR ever inspects the CLI header. *(Phase 1a: implemented +
 //!   unit-tested)*
-//! * [`export`] — `export_pe`: the top-level driver wiring `tables::MetadataBuilder` +
+//! * [`crate::ir::pe_exporter::export`] — `export_pe`: the top-level driver wiring `tables::MetadataBuilder` +
 //!   `body::assemble_method` + the RVA layout pass + `pe::write_pe` into one entry point.
 //!   *(Phase 1a MILESTONE PROVEN 2026-07-02: a hand-built static-entrypoint-calling-
 //!   `Console.WriteLine` `Assembly`, exported with no `ilasm` anywhere, loads and runs under a
@@ -26,7 +26,7 @@
 //!   inventory subset that test exercises is wired; const-data `FieldRVA` blobs, non-`ByteBuffer`
 //!   static-field defaults, and `MainModule` method-count partitioning are loud `todo!()`s left
 //!   for Phase 1b — see `export`'s module doc.)*
-//! * [`pdb`] — Portable PDB (dotnet/runtime `PortablePdb-Metadata.md`): `#Pdb` stream +
+//! * [`crate::ir::pe_exporter::pdb`] — Portable PDB (dotnet/runtime `PortablePdb-Metadata.md`): `#Pdb` stream +
 //!   `Document`/`MethodDebugInformation` tables from `CILRoot::SourceFileInfo` sequence points,
 //!   plus the PE-side Debug Directory (CodeView/RSDS) hook. *(Phase 2: interface-pinning stub —
 //!   see that module's doc for the parity bar against `il_exporter`'s `.line` + `ilasm -debug`.)*

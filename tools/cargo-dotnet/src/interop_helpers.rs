@@ -70,7 +70,31 @@ fn ensure_built(ctx: &Context) -> Result<Option<PathBuf>> {
     if !depends_on_mycorrhiza(ctx) {
         return Ok(None);
     }
-    Ok(Some(build(root, ctx.flags.verbose)?))
+    Ok(Some(build(root, ctx)?))
+}
+
+/// Materialize the helper project's NuGet assets during the explicit online restore phase.
+pub(crate) fn restore_if_needed(ctx: &Context) -> Result<()> {
+    let root = &ctx.paths.interop_helpers_root;
+    if !root.is_dir() || !depends_on_mycorrhiza(ctx) {
+        return Ok(());
+    }
+    let _helper_lock = crate::build_lock::BuildLock::acquire_scope("interop-helpers")?;
+    let mut cmd = Command::new("dotnet");
+    cmd.arg("restore").arg(root).arg("--nologo");
+    if ctx.is_offline() {
+        cmd.arg("--ignore-failed-sources");
+    }
+    if !ctx.flags.verbose {
+        cmd.arg("-v").arg("quiet");
+    }
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to spawn `dotnet restore` for {}", root.display()))?;
+    if !status.success() {
+        bail!("`dotnet restore` failed for {}", root.display());
+    }
+    Ok(())
 }
 
 /// Cheap dependency check: does this crate's `Cargo.lock` list a `mycorrhiza` package? Good enough
@@ -86,7 +110,7 @@ fn depends_on_mycorrhiza(ctx: &Context) -> bool {
 
 /// `dotnet build -c Release` the helper project — a fast no-op on `dotnet`'s own incremental cache
 /// when the source hasn't changed since the last build — and return the produced dll's path.
-fn build(root: &Path, verbose: bool) -> Result<PathBuf> {
+fn build(root: &Path, ctx: &Context) -> Result<PathBuf> {
     // The bundled project has one shared obj/bin tree even when several consumer crates build in
     // parallel. Only this quick incremental helper build needs serialization.
     let _helper_lock = crate::build_lock::BuildLock::acquire_scope("interop-helpers")?;
@@ -105,7 +129,10 @@ fn build(root: &Path, verbose: bool) -> Result<PathBuf> {
             root.display(),
             "/_/mycorrhiza-interop-helpers"
         ));
-    if !verbose {
+    if ctx.is_offline() {
+        cmd.arg("--no-restore");
+    }
+    if !ctx.flags.verbose {
         cmd.arg("-v").arg("quiet");
     }
     let status = cmd

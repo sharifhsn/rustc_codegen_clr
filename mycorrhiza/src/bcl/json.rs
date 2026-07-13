@@ -26,7 +26,7 @@
 //! (`as_str`, `as_i64`, `as_f64`, `as_bool`, `is_null`) / `to_json_string` are surfaced. Anything
 //! beyond — construction/mutation, `JsonSerializer<T>` (needs a generic method instantiation),
 //! enumeration of an object's properties (needs the enumerator bridge) — is not, but the raw
-//! [`JsonNode`](NodeHandle) handle is reachable via [`Json::handle`] for lower-level BCL calls.
+//! raw `JsonNode` handle is reachable via [`Json::handle`] for lower-level BCL calls.
 //!
 //! ## `as_i64` / `as_f64` honesty
 //! `JsonNode`'s typed value reads (`GetValue<long>()`) are *generic method* instantiations, which the
@@ -65,7 +65,8 @@ type SerializerOptsHandle = RustcCLRInteropManagedClass<{ ASM }, { JSON_SERIALIZ
 /// used as the generic argument of the `Nullable<..>` below.
 type NodeOpts = RustcCLRInteropManagedStruct<{ ASM }, { JSON_NODE_OPTS }, 1>;
 /// A managed `System.Nullable<JsonNodeOptions>` value (2 bytes: a `bool has_value` + the 1-byte
-/// option). A *generic value type* — its open type `System.Nullable`1` lives in `System.Private.CoreLib`,
+/// option). A *generic value type* — its open type `System.Nullable<T>` lives in
+/// `System.Private.CoreLib`,
 /// instantiated with `JsonNodeOptions`. Only its all-zero (`None`) default is ever passed to `Parse`.
 type NodeOptsHandle =
     RustcCLRInteropManagedGenericStruct<{ CORELIB }, { NULLABLE }, 2, (NodeOpts,)>;
@@ -290,7 +291,7 @@ impl Json {
         self.json_text()
     }
 
-    /// The raw managed [`JsonNode`](NodeHandle) handle, for lower-level BCL calls.
+    /// The raw managed `JsonNode` handle, for lower-level BCL calls.
     pub fn handle(&self) -> NodeHandle {
         self.h
     }

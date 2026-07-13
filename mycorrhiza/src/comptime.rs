@@ -85,6 +85,15 @@ pub fn rustc_codegen_clr_add_static_field_def<T, const FNAME: &'static str>(
     diverge!()
 }
 
+/// Mark a value type as a genuine CLR enum. `SPEC` is the proc-macro-owned wire format
+/// `repr;Variant=value;...` (for example `i32;Ready=1;Done=2`). Values are decimal and parsed at
+/// compiler comptime into exact-width metadata constants; this function is never executed.
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_codegen_clr_set_enum<const SPEC: &'static str>(class: ClassDef) -> ClassDef {
+    diverge!()
+}
+
 /// Declare one positional argument `T` that the base class's constructor requires — repeat once
 /// per argument, in order. Without this, `finish_type` always chains to a PARAMETERLESS base
 /// `.ctor()` (see `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md`'s Tier-C note on `extends=`: general
@@ -148,7 +157,8 @@ pub fn rustc_codegen_clr_mark_last_method_override<
 /// interface marked with [`rustc_codegen_clr_mark_interface`], via
 /// [`rustc_codegen_clr_add_abstract_method_def`] — the accessor is then an abstract, body-less
 /// interface member) as the `add_*` half of a `.NET` event named `EVENT_NAME` (e.g. `event_name =
-/// "Changed"` for a C# `event Action<T> Changed`). Must come immediately after that call, before
+/// `"Changed"` for a C# event named `Changed` whose type is generic `Action` over `T`). Must come immediately
+/// after that call, before
 /// any other member-adding call. Pair with
 /// [`rustc_codegen_clr_mark_last_method_event_remove`] on the matching
 /// `remove_*` method — both must be present for the event to be emitted (see
@@ -330,12 +340,13 @@ pub fn rustc_codegen_clr_mark_interface(class: ClassDef) -> ClassDef {
 /// the declared parameter names in declaration order (e.g. `"T"` or `"K;V"`), the same separator
 /// convention as `#[dotnet_class]`'s `implements=` list. Emitted by `#[dotnet_interface]` on a
 /// generic trait (`trait IBox<T>`), whose `NAME` (in [`rustc_codegen_clr_new_typedef`]) already
-/// carries the CLS backtick-arity suffix (`IBox`1`); the backend emits one ECMA-335
+/// carries the CLS backtick-arity suffix (`IBox` with arity 1); the backend emits one ECMA-335
 /// `GenericParam` row (§II.22.20) per name on the type's own `TypeDef`. Only valid together with
 /// [`rustc_codegen_clr_mark_interface`] — a generic *class* definition is rejected loudly at
 /// `finish_type` (the historical no-explicit-layout-on-.NET-generics ban applies to classes;
 /// an interface has no layout). Member signatures reference the parameters positionally via
-/// `RustcCLRInteropTypeGeneric<N>` markers (`ELEMENT_TYPE_VAR`, C#'s `T` in `IBox<T>`).
+/// `RustcCLRInteropTypeGeneric` markers parameterized by `N` (`ELEMENT_TYPE_VAR`, C#'s `T` in a
+/// generic `IBox`).
 ///
 /// Substring-dispatch safety (see `src/comptime.rs`'s `contains()` chain): `set_type_generics`
 /// neither contains nor is contained by any sibling intrinsic's needle (audited against the full

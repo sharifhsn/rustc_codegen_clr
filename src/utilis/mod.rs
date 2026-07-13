@@ -27,7 +27,7 @@ pub enum MagicFn {
     Ctor,
     /// `rustc_clr_interop_managed_call{0..=4}_` → `call` (static or instance).
     ManagedCall,
-    /// `rustc_clr_interop_managed_call_virt{0..=2}_` → `callvirt`.
+    /// `rustc_clr_interop_managed_call_virt{0..=3}_` → `callvirt`.
     ManagedCallVirt,
     /// `rustc_clr_interop_managed_ld_len` → `ldlen`.
     LdLen,
@@ -51,7 +51,7 @@ pub enum MagicFn {
     ManagedBoxTake,
     /// `rustc_clr_interop_try_catch` → a CIL try/catch region catching any .NET exception.
     TryCatch,
-    /// `rustc_clr_interop_generic_call{0..=3}` (WF-9) — a method on a generic .NET instantiation.
+    /// `rustc_clr_interop_generic_call{0..=4}` (WF-9) — a method on a generic .NET instantiation.
     GenericCall,
     /// `rustc_clr_interop_generic_ctor{0..=2}` (WF-9) — `newobj` on a generic .NET instantiation.
     GenericCtor,
@@ -101,7 +101,8 @@ pub fn classify_magic_fn(tcx: TyCtxt, def_id: DefId) -> Option<MagicFn> {
     Some(match name {
         "rustc_clr_interop_managed_call_virt0_"
         | "rustc_clr_interop_managed_call_virt1_"
-        | "rustc_clr_interop_managed_call_virt2_" => MagicFn::ManagedCallVirt,
+        | "rustc_clr_interop_managed_call_virt2_"
+        | "rustc_clr_interop_managed_call_virt3_" => MagicFn::ManagedCallVirt,
         "rustc_clr_interop_managed_call0_"
         | "rustc_clr_interop_managed_call1_"
         | "rustc_clr_interop_managed_call2_"
@@ -122,7 +123,8 @@ pub fn classify_magic_fn(tcx: TyCtxt, def_id: DefId) -> Option<MagicFn> {
         "rustc_clr_interop_generic_call0"
         | "rustc_clr_interop_generic_call1"
         | "rustc_clr_interop_generic_call2"
-        | "rustc_clr_interop_generic_call3" => MagicFn::GenericCall,
+        | "rustc_clr_interop_generic_call3"
+        | "rustc_clr_interop_generic_call4" => MagicFn::GenericCall,
         "rustc_clr_interop_generic_ctor0"
         | "rustc_clr_interop_generic_ctor1"
         | "rustc_clr_interop_generic_ctor2" => MagicFn::GenericCtor,

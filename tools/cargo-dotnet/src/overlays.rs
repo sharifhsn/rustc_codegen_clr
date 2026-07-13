@@ -12,7 +12,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -144,6 +144,17 @@ pub fn apply(ctx: &Context) -> Result<()> {
     write_config(ctx, "")?;
     let lock_path = ctx.crate_dir.join("Cargo.lock");
     if !lock_path.is_file() {
+        if ctx.requires_existing_lock() {
+            bail!(
+                "{} requires an existing Cargo.lock; run `cargo dotnet restore {}` without --locked/--frozen first",
+                if ctx.flags.extra_cargo.iter().any(|flag| flag == "--frozen") {
+                    "--frozen"
+                } else {
+                    "--locked"
+                },
+                ctx.crate_dir.display()
+            );
+        }
         let mut lock_cmd = Command::new(&ctx.cargo);
         lock_cmd.current_dir(&ctx.crate_dir);
         // Pin the toolchain when installed, same as `base_cargo()` — otherwise this
@@ -160,12 +171,22 @@ pub fn apply(ctx: &Context) -> Result<()> {
         if let Some(config) = ambient_cargo_config(ctx) {
             lock_cmd.arg("--config").arg(config);
         }
-        let _ = lock_cmd
+        lock_cmd
             .arg("--config")
             .arg(generated_config_path(ctx))
             .arg("-Zjson-target-spec")
-            .arg("generate-lockfile")
-            .status();
+            .arg("generate-lockfile");
+        if ctx.is_offline() {
+            lock_cmd.arg("--offline");
+        }
+        let status = lock_cmd.status().context("run cargo generate-lockfile")?;
+        if !status.success() {
+            bail!(
+                "cargo generate-lockfile failed (exit {}); run `cargo dotnet restore {}` while network access is available",
+                status.code().unwrap_or(-1),
+                ctx.crate_dir.display()
+            );
+        }
     }
     let locked: Option<Lock> = if lock_path.is_file() {
         fs::read_to_string(&lock_path)
@@ -288,9 +309,7 @@ pub fn ambient_cargo_config_for(cargo_home: &Path) -> Option<std::path::PathBuf>
 fn ambient_cargo_home_for(cargo_home: &Path) -> Option<std::path::PathBuf> {
     let home = std::env::var_os("CARGO_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| {
-            crate::host::home_dir().map(|home| home.join(".cargo"))
-        })?;
+        .or_else(|| crate::host::home_dir().map(|home| home.join(".cargo")))?;
     (home != cargo_home).then_some(home)
 }
 

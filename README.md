@@ -1,134 +1,102 @@
-# rustc_codegen_clr 
+# rustc_codegen_clr
+
+[![CI](https://github.com/sharifhsn/rustc_codegen_clr/actions/workflows/fork-gate.yml/badge.svg)](https://github.com/sharifhsn/rustc_codegen_clr/actions/workflows/fork-gate.yml)
+[![Release](https://img.shields.io/github/v/release/sharifhsn/rustc_codegen_clr?include_prereleases)](https://github.com/sharifhsn/rustc_codegen_clr/releases)
+
+An experimental rustc codegen backend that compiles Rust to managed .NET assemblies. The same
+compiler IR can also emit C source.
 
 > [!WARNING]
-> This project is still early in its developement. Bugs, crashes and miscompilations are expected. DO NOT USE IT FOR ANYTHING SERIOUS.
+> This is compiler research, not a production toolchain. Crashes, unsupported APIs, and
+> miscompilations are possible. Validate important behavior against native Rust.
 
-> [!TIP]
-> **New here? Start with [docs/CARGO_DOTNET.md](docs/CARGO_DOTNET.md)** — the one-command developer
-> experience: `cargo dotnet build|run` compiles an arbitrary Rust crate to a .NET assembly (or a
-> C#-referenceable `.dll`) with zero hand-config. The deeper map of what translates and what doesn't is
-> [docs/TRANSLATION_STATUS.md](docs/TRANSLATION_STATUS.md); the backend internals are
-> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+## Install the 0.0.1 preview
 
-`rustc_codegen_clr` is an experimental Rust compiler backend(plugin), which allows you to transpile Rust into .NET assemblies, or C source files. 
+Prerequisites: [rustup](https://rustup.rs/) and the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
 
-The end goal of the project is allowing Rust to be used in places where it could not be used before. 
+Linux x64 or macOS Apple Silicon:
 
-## .NET Interop layer
-
-The project aims to provide a way to easily use Rust libraries in .NET. It comes with a Rust/.NET interop layer, which allows you to easily interact with .NET code from Rust:
-
-```
-use mychorizza::*;
-fn main(){
-    // Allocate a new GC-managed string builder
-    let stringBuilder = StringBuilder::empty();
-    // You can easily operate on GC-managed types
-    mstring.AppendChar('H');
-    mstring.AppendChar('i');
-    mstring.AppendChar('.');
-}
-```
-This should allow you to integrate Rust code with exisitng .NET codebases, and should allow you to use .NET-specific libraries or APIs from Rust.
-
-The project will also include support for defining .NET classes from Rust, allowing .NET code to easily call Rust.
-This is currently heavily WIP, and any feedback is appreciated.
-```
-// Early WIP syntax, subject to change.
-dotnet_typedef! {
-  class MyClass inherits [Some::External::Assebmly]SomeNamespace::SomeClass{
-    virtual fn ToString(_this:MyClass)->MString{
-      "I am a class defined in Rust!".into_managed()
-    },
-  }
-}
+```bash
+curl -fsSL https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.1/install.sh | sh
 ```
 
-With this approach, the classes and APIs exposed to .NET can be easily used from other .NET languages, like F# or C#. The safety of this glue layer can be checked by the Rust compiler, which should make interop issues much less likely.
+Windows x64 PowerShell:
 
-## C support
+```powershell
+irm https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.1/install.ps1 | iex
+```
 
-While .NET is the main focus of my work, this project can also be used to compile Rust to C, by setting the `C_MODE` enviroment flag to `1`.
+The installer downloads the matching host SDK bundle, verifies its checksum and host identity,
+installs it under `~/.cargo-dotnet`, and installs `cargo-dotnet` under Cargo's bin directory. It does
+not modify your system Rust installation.
 
-This may seem like a strange and unrelated feature, but the project was written in such a way that this is not only possible, but relatively easy.
+## Run Rust on .NET
 
-My representation of .NETs IR maps nicely to C, which means that I was able to add support for compiling Rust to C in 2-3K LOC. Almost all of the codebase is reused, with the C and .NET specific code only 
-present in the very last stage of compilation.
+```bash
+cargo dotnet doctor
+cargo dotnet new hello-dotnet --app
+cargo dotnet run hello-dotnet
+```
 
-This means that, instead of having to maintain 2 separate projects, I can maintain one project. Bug fixes to the .NET side of things also fix C bugs. 
-Because of that, the support for C in the project is almost as good as support for .NET.
+The generated program is a managed .NET executable produced from Rust. Release builds are the
+default; add `--debug` when needed.
 
-## Current state of the project
+For a less toy-like example:
 
-The project currently supports most Rust features (except proc macros), but it is not bug-free. It can compile a mostly working version of Rust std, but there are many minor bugs that make such `std` not 100% functional.
+```bash
+git clone https://github.com/sharifhsn/rustc_codegen_clr
+cd rustc_codegen_clr
+cargo dotnet run examples/issue-dashboard
+```
 
-Most components of `std` are about 95% working in .NET, and 80% working in C.
-So, you *can* compile a lot of existing Rust code, but it may not necessarily *work*.
+The issue dashboard parses JSON using managed `System.Text.Json` from Rust, then processes the
+result with ordinary Rust code.
 
-## Supported C compilers
+## What works
 
-Currently, the GCC and clang C compilers are supported, with partial support for `tcc` and `sdcc`.
-For obvious reasons, I am unable to add support for any C propietary compilers which are not free to use.
-However, if you have access to such a compiler, I can assist you in adding support for it.
+- Rust applications compiled to managed .NET executables
+- Rust libraries and plugins consumed from C#
+- .NET BCL and NuGet APIs called from Rust
+- Managed generics, interfaces, delegates, tasks, async streams, events, arrays, and collections
+- C#-friendly exported Rust APIs and deterministic NuGet packages
+- MSBuild integration, Portable PDBs, Source Link, and NativeAOT publishing
+- An alternate C exporter from the same compiler IR
 
-| Compiler | Status |
-| GCC | Fully Supported & regularly tested |
-| Clang | Fully Supported & regularly tested |
-| TCC | Partially supported - issues with TLS / multithreading |
-| SDCC | Partailly supported - no atomics, no statics / constants larger than 8 bytes supported |
-| CompCert | Partailly supported(no known issues), not tested! |
+The public 0.0.1 SDK supports one deliberately narrow configuration:
 
-### core, std, and alloc uint tests.
+| Component | Supported |
+|---|---|
+| .NET | .NET 10 |
+| Linux | x64 |
+| macOS | Apple Silicon |
+| Windows | x64 |
+| Rust | pinned `nightly-2026-06-17` |
 
-.NET
+The compiler retains some older-runtime compatibility code, but .NET 8 and 9 are not supported by
+the 0.0.1 SDK. A single public runtime profile keeps generated target frameworks, linker metadata,
+CoreCLR tools, examples, and diagnostics consistent.
 
-| Name | Pass	| Faliure	| Crash \ Timeout| OK precentage
-|--------------------|--------|-------|-------|------|
-| Core tests |	1764	| 48	| 20	| 96.29% |
-| Alloc tests | 	616	|8 |	40 |	92.77% |
-| Alloc benches	| 464	| 0	| 0 |	100.00% |
-| Test Harness tests |	57 |	0	| 100.00% |
-| std tests	| 931 | 43 | 64 |	89.69% |
-| Core benches	| 491 | 1| | 98.99% |
+## Documentation
 
-C
+- [`QUICKSTART.md`](QUICKSTART.md) — installation and first run
+- [`docs/CARGO_DOTNET.md`](docs/CARGO_DOTNET.md) — command reference and troubleshooting
+- [`docs/QUICKSTART_INTEROP.md`](docs/QUICKSTART_INTEROP.md) — Rust and C# interop examples
+- [`docs/INTEROP_COOKBOOK.md`](docs/INTEROP_COOKBOOK.md) — supported interop patterns
+- [`docs/TRANSLATION_STATUS.md`](docs/TRANSLATION_STATUS.md) — compiler coverage and semantic limits
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — compiler pipeline and design
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — contributor setup and test selection
 
-| Name | Pass	| Faliure| Crash \ Timeout | OK precentage
-|--------------------|--------|------|-------|------|
-| Core tests |	1712	| 71 | 8 | 95.59%|
+## Build from source
 
-## FAQ
+```bash
+git clone https://github.com/sharifhsn/rustc_codegen_clr
+cd rustc_codegen_clr
+cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- setup --from-repo "$PWD"
+cargo dotnet doctor
+```
 
-### Q: What is it?
+The repository pins the rustc nightly and required compiler components in `rust-toolchain.toml`.
 
-**A**: *This is a compiler backend for rustc, which targets the `.NET` platform and runtime; this would enable you to use some Rust libraries from C#/F#, with little effort.*
+## License
 
-### Q: Is Rust's memory management useless in .NET?
-
-**A**: *Rust code typically uses the stack more than the heap, which can speed up code running within the CLR runtime. Heap-allocated objects are allocated from unmanaged (non-GC) memory and are allocated and freed in the same way as in Rust.*
-
-### Q: Is this useless since I can already load shared libraries from C#?
-
-**A**: *The Rust APIs this codegen exposes to C#/F# code are only slightly easier to use than those exposed by a .so or .dll Rust library. Interop still requires some effort, but the Rust code is bundled with everything else. Types used from C# are guaranteed to be the same as those in C#, preventing mismatch issues. All types can be safely sent between Rust and C#, with exactly the same layout. Additionally, since all Rust code compiled with this codegen can be bundled with C#/F# code, you no longer need to ship different versions of the library for different architectures. Any architecture supported by CLR works out of the box, using the exact same assembly.*
-
-*You can also avoid the cost of switching between code running within and outside the runtime. This cost is not unbearable, but it is not easily eliminated, and reducing it can have safety penalties. In this case, all code runs within the runtime, meaning there is no transition between code running inside and outside the runtime.*
-
-*Compiling Rust to CLR can potentially improve JIT optimization. Since the CLR's JIT now sees all the code, it can make better decisions about optimization, resulting in faster code.*
-
-### Q: Compatibility?
-
-**A**: *`rustc_codegen_clr` is only tested on Linux x86_64, with the CoreCLR runtime (more commonly known as simply the .NET runtime), on .NET 8. It should work on other platforms, but it is not guaranteed.*
-
-### Q: What about Mono?
-
-**A**: *The support for the Mono runtime is not as good as it could be. Due to not supported features and differences, 128-bit integers and checked 64-bit integer arithmetic are not supported on Mono.*
-*Aligned allocators(__rust_alloc) and certain intrinsics are also not supported. I plan to expand support for Mono, but my resources are limited.*
-
-### Q: Are there any issues?
-
-**A**: *While the backend is extensively tested, it is still far from perfect, and there are still many edge cases that may break this backend.*
-**A**: *Currently, there are no .NET-specific versions of `std` or .NET specific target triples. This means that you will need separate .NET assemblies for each OS.*
-
-## Licensing
-
-`rustc_codegen_clr` is dual licensed under MIT license or Apache License, Version 2.0.
+Dual-licensed under [MIT](LICENSE) or [Apache-2.0](LICENSE-Apache).

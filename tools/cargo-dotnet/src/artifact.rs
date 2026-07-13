@@ -104,6 +104,9 @@ pub fn locate(json: &str, ctx: &Context) -> Result<Artifact> {
             .unwrap_or_else(|| cargo_stem.clone());
         let dll = so.with_file_name(format!("{stem}.dll"));
         fs::copy(&so, &dll).with_context(|| format!("cp {} -> {}", so.display(), dll.display()))?;
+        if let Some(pdb) = copy_library_pdb(&so, &dll)? {
+            eprintln!("== lib PDB: {} ==", pdb.display());
+        }
         eprintln!(
             "== lib PE: {} -> {} (assembly '{stem}') ==",
             so.display(),
@@ -143,6 +146,44 @@ pub fn locate(json: &str, ctx: &Context) -> Result<Artifact> {
     Ok(Artifact::None)
 }
 
+/// Promote the linker's PDB from Cargo's internal library name (`libfoo.pdb`) to the public
+/// managed assembly name (`Foo.pdb`) beside the copied DLL. CoreCLR and debugger consumers resolve
+/// the CodeView sidecar next to the loaded image; leaving it under `deps/lib*.pdb` makes a library's
+/// otherwise-valid sequence points unreachable from C#.
+fn copy_library_pdb(so: &std::path::Path, dll: &std::path::Path) -> Result<Option<PathBuf>> {
+    let public_candidate = so.with_extension("pdb");
+    let managed_candidate = so
+        .parent()
+        .map(|parent| parent.join("deps"))
+        .unwrap_or_default()
+        .join(
+            dll.file_name()
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .with_extension("pdb"),
+        );
+    let deps_candidate = so
+        .parent()
+        .map(|parent| parent.join("deps"))
+        .unwrap_or_default()
+        .join(
+            so.file_name()
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .with_extension("pdb"),
+        );
+    let source = [public_candidate, managed_candidate, deps_candidate]
+        .into_iter()
+        .find(|candidate| candidate.is_file());
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let destination = dll.with_extension("pdb");
+    fs::copy(&source, &destination)
+        .with_context(|| format!("cp {} -> {}", source.display(), destination.display()))?;
+    Ok(Some(destination))
+}
+
 /// The crate's bin target name via cargo_metadata (replaces the bash tr/awk scrape).
 fn bin_name(ctx: &Context) -> Option<String> {
     let meta = cargo_metadata::MetadataCommand::new()
@@ -162,4 +203,50 @@ fn bin_name(ctx: &Context) -> Option<String> {
         .file_name()
         .and_then(|s| s.to_str())
         .map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn library_pdb_is_promoted_to_the_public_dll_stem() {
+        let temp = tempfile::tempdir().unwrap();
+        let so = temp.path().join("deps/libprobe.so");
+        let dll = temp.path().join("deps/Managed.Probe.dll");
+        fs::create_dir_all(so.parent().unwrap()).unwrap();
+        fs::write(&so, b"pe").unwrap();
+        fs::write(so.with_extension("pdb"), b"portable-pdb").unwrap();
+
+        let promoted = copy_library_pdb(&so, &dll).unwrap().unwrap();
+        assert_eq!(promoted, dll.with_extension("pdb"));
+        assert_eq!(fs::read(promoted).unwrap(), b"portable-pdb");
+    }
+
+    #[test]
+    fn library_pdb_is_found_under_cargos_internal_deps_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let so = temp.path().join("libprobe.so");
+        let dll = temp.path().join("Managed.Probe.dll");
+        fs::create_dir_all(temp.path().join("deps")).unwrap();
+        fs::write(&so, b"pe").unwrap();
+        fs::write(temp.path().join("deps/libprobe.pdb"), b"deps-pdb").unwrap();
+
+        let promoted = copy_library_pdb(&so, &dll).unwrap().unwrap();
+        assert_eq!(fs::read(promoted).unwrap(), b"deps-pdb");
+    }
+
+    #[test]
+    fn library_pdb_prefers_the_managed_assembly_name_under_deps() {
+        let temp = tempfile::tempdir().unwrap();
+        let so = temp.path().join("libprobe.so");
+        let dll = temp.path().join("Managed.Probe.dll");
+        fs::create_dir_all(temp.path().join("deps")).unwrap();
+        fs::write(&so, b"pe").unwrap();
+        fs::write(temp.path().join("deps/Managed.Probe.pdb"), b"managed-pdb").unwrap();
+        fs::write(temp.path().join("deps/libprobe.pdb"), b"legacy-pdb").unwrap();
+
+        let promoted = copy_library_pdb(&so, &dll).unwrap().unwrap();
+        assert_eq!(fs::read(promoted).unwrap(), b"managed-pdb");
+    }
 }

@@ -4,7 +4,7 @@
 //! (`feasibility/cargo-dotnet`). On the NATIVE backend it owns the WHOLE pipeline in
 //! pure Rust — CLI + cargo-subcommand convention + standard-flag passthrough, plus the
 //! inner build/run/pack: PAL injection into rust-src ([`palinject`]), the
-//! [`dotnet_overlays`] apply ([`overlays`]), `build-std` ([`buildstd`]), artifact
+//! `dotnet_overlays` apply ([`overlays`]), `build-std` ([`buildstd`]), artifact
 //! location ([`artifact`]), run ([`run`]), NuGet packing ([`pack`]) and consuming a
 //! third-party NuGet package via reflection-generated bindings ([`nuget`]). It shells out
 //! only to the external tools any build tool must (cargo/rustc/ilasm/dotnet/the linker)
@@ -14,6 +14,8 @@
 mod artifact;
 mod build_lock;
 mod buildstd;
+mod bundle;
+mod capabilities;
 mod cli;
 mod context;
 mod docker;
@@ -34,6 +36,7 @@ mod provenance;
 mod publish;
 mod push;
 mod receipt;
+mod restore;
 mod run;
 mod rustflags;
 mod scaffold;
@@ -98,12 +101,15 @@ fn main() -> ExitCode {
     }
 
     let result = match &cli.cmd {
+        Cmd::Capabilities(args) => capabilities::run(args),
+        Cmd::Restore(args) => restore::run(args),
         Cmd::Build(args) => pipeline::run(args, false),
         Cmd::Run(args) => pipeline::run(args, true),
         Cmd::New(args) => scaffold::run(args),
         Cmd::Doctor(args) => doctor::run(args),
         Cmd::Test(args) => test::run(args),
         Cmd::Setup(args) => setup::run(args),
+        Cmd::Bundle(args) => bundle::run(args),
         Cmd::Pack(args) => pack::run(args),
         Cmd::Push(args) => push::run(args),
         Cmd::Publish(args) => publish::run(args),
@@ -130,9 +136,13 @@ fn main() -> ExitCode {
 }
 
 fn requires_supported_host(cmd: &Cmd) -> bool {
+    if let Cmd::Bundle(args) = cmd {
+        return !matches!(args.command, cli::BundleCommand::Verify { .. });
+    }
     matches!(
         cmd,
         Cmd::Build(_)
+            | Cmd::Restore(_)
             | Cmd::Run(_)
             | Cmd::Test(_)
             | Cmd::Setup(_)
@@ -165,10 +175,14 @@ fn split_program_args(argv: &mut Vec<OsString>) -> Vec<String> {
 /// take no program args.)
 fn inject_prog_args(cmd: &mut Cmd, prog_args: Vec<String>) {
     match cmd {
-        Cmd::Build(args) | Cmd::Run(args) | Cmd::Test(args) => args.prog_args = prog_args,
-        Cmd::New(_)
+        Cmd::Build(args) | Cmd::Run(args) | Cmd::Test(args) | Cmd::Restore(args) => {
+            args.prog_args = prog_args
+        }
+        Cmd::Capabilities(_)
+        | Cmd::New(_)
         | Cmd::Doctor(_)
         | Cmd::Setup(_)
+        | Cmd::Bundle(_)
         | Cmd::Pack(_)
         | Cmd::Publish(_)
         | Cmd::Push(_)

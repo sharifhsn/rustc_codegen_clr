@@ -11,8 +11,10 @@
 > Phase-0 span-quality gaps are closed (outermost-inline-callsite attribution; the direct-PE path
 > never had the inlining-hint gap to begin with); the third (`<WORKSPACE>` remap) was confirmed
 > out-of-scope (rustc-fork-harness-only, doesn't affect ordinary crate builds). LocalScope/
-> LocalVariable (tables 0x32/0x33) were **not** built — sequence points alone clear the acceptance
-> bar (file:line stack traces); local-variable-name debugging remains a stretch item.
+> LocalVariable (tables 0x32/0x33) are emitted for named MIR locals as a whole-method scope and are
+> consumed by the C# host acceptance. The debug profile retains a known user-authored local; the
+> release profile retains named-local metadata but may optimize that particular local away. Lexical
+> nested scopes and a live IDE locals window remain future quality work.
 > Owner constraint: the CIL typechecker is never weakened; the ilasm path stays available behind the
 > flag indefinitely as a fallback.
 
@@ -73,7 +75,7 @@ BSJB metadata blob with different tables).
 | `tables.rs` | The needed metadata tables (Module, TypeRef, TypeDef, Field, MethodDef, Param, InterfaceImpl, MemberRef, Constant, CustomAttribute, ClassLayout, FieldLayout, StandAloneSig, ModuleRef, ImplMap, FieldRVA, Assembly, AssemblyRef, TypeSpec, MethodSpec) — populate-then-size-then-serialize, sorted-table invariants, coded-index width computation |
 | `body.rs` | Method bodies: tiny/fat headers, opcode byte emission for the ~80 forms, two-pass branch layout (long-form first; short-form compaction optional later), maxstack (reuse exporter's block-based bound), fat EH sections (always fat = always valid) |
 | `pe.rs` | PE container: DOS stub, COFF/optional headers, `.text`(IL+metadata)/`.sdata`(FieldRVA)/`.reloc`, CLI header (EntryPointToken, ILONLY corflags), **byte-compare headers against CoreCLR ilasm output early** (the Mono-PE32-on-arm64 rejection gotcha lives here) |
-| `pdb.rs` (Phase 2, **DONE**) | Portable PDB: #Pdb stream, Document / MethodDebugInformation (delta-compressed sequence points from `SourceFileInfo` roots) tables; DebugDirectory CodeView + PdbChecksum entries in the PE. LocalScope/LocalVariable tables not built (optional; not needed to clear the acceptance bar) |
+| `pdb.rs` (Phase 2, **DONE**) | Portable PDB: #Pdb stream, Document / MethodDebugInformation (delta-compressed sequence points from `SourceFileInfo` roots), whole-method LocalScope / named LocalVariable tables; DebugDirectory CodeView + PdbChecksum entries in the PE. Lexical nested scopes are not modeled. |
 
 Entry: `Assembly::export_pe(...)` invoked from the linker where `il_exporter` is called today,
 selected by a `config!` flag (`DIRECT_PE`, `cilly/src/bin/linker/main.rs`), default **on** as of
@@ -138,9 +140,10 @@ quickest way to tell the two paths' output apart (ilasm stamps a real build time
     marked). Same-IL-offset runs are deduped (last-wins, mirrors ilasm's own `.line`-per-offset
     collapsing); a caller bug (non-monotonic offsets) is left to the spec's own strictly-increasing
     assert rather than silently papered over.
-  - **LocalScope/LocalVariable (0x32/0x33) — not built.** Optional per spec; sequence points alone
-    clear the Phase-2 acceptance bar (file:line resolution). Local-variable-name debugging in a
-    step-through debugger remains a documented stretch item, not a gap in what was promised.
+  - **LocalScope/LocalVariable (0x32/0x33) — built for named locals.** Each method with named MIR
+    locals receives one whole-method `LocalScope`; compiler-generated unnamed temporaries are
+    omitted and named slots receive `LocalVariable` rows. This exposes useful names without
+    pretending the current flat representation models nested lexical lifetimes.
   - **PE side**: a Debug Directory with a `IMAGE_DEBUG_TYPE_CODEVIEW` (type 2) RSDS entry (GUID +
     age + PDB path) plus a `PdbChecksum` entry; `pe.rs`'s `write_debug_directory` fixed a bug where
     the CodeView row's `TimeDateStamp` must equal `pdb_id[16..20]` (not 0 — only the PdbChecksum
@@ -151,7 +154,10 @@ quickest way to tell the two paths' output apart (ilasm stamps a real build time
     `.pdb` alongside the `.dll`/`.exe`; `dotnet_jumpstart.rs`'s embedded-launcher template unpacks
     the bundled PDB bytes under the *loaded* dll's stem (fixed a real bug where it had unpacked
     under the build-time hashed-stem name, so CoreCLR's loader silently found no PDB next to the
-    dll it actually ran).
+    dll it actually ran). Library output now receives the same treatment: `cargo dotnet build`
+    promotes the Cargo-internal PDB beside the public `<crate>.dll`, and the linker's CodeView path
+    uses that managed assembly stem rather than Cargo's host-style `lib<crate>` stem. Without both
+    fixes a C# consumer could load the DLL while CoreCLR silently ignored its otherwise-valid PDB.
   - **Two span-quality fixes** (`docs/PE_EMISSION_PLAN.md` Phase-0 gaps a/b), both flag-gated where
     they touch codegen: `span_source_info` (`src/assembly.rs`) now walks the MIR `SourceScope`
     inlined-chain up to the outermost non-inlined caller scope before resolving file/line, fixing
@@ -171,7 +177,7 @@ quickest way to tell the two paths' output apart (ilasm stamps a real build time
     unconditional assert and aborting the entire PE+PDB link for one bad span anywhere in the
     program; now widened to a 1-column span before validation instead (02da7b8).
 
-  **Verification (real numbers, this session, 2026-07-02, current HEAD `02da7b8`)**:
+  **Verification (real numbers, 2026-07-02 baseline plus 2026-07-13 consumer proof)**:
   - `cargo test -p cilly --lib pe_exporter`: **119 passed, 0 failed** (grown from the Phase-1
     baseline of 99; includes `export::tests::e2e_unhandled_exception_resolves_file_line_through_our_pdb`).
   - `cargo_tests/cd_pdb` probe, rebuilt fresh against current HEAD, run under the default
@@ -184,6 +190,16 @@ quickest way to tell the two paths' output apart (ilasm stamps a real build time
     `names probe fn`) print `true`.
   - `cargo_tests/cd_collections` (battery slice): **141/141** (`chk!` tally), rebuilt+run fresh
     against current HEAD.
+  - `feasibility/pdb_consumer_acceptance.sh` builds the exported-library fixture through the
+    default direct-PE path in both debug and release, then runs an ordinary C# host against the
+    public DLL. Both profiles prove the Rust stack trace names `lib.rs`, contains a `.rs:line`
+    frame, names the non-inlined Rust leaf, has a sidecar PDB, and exposes a Portable PDB Document,
+    LocalScope, and named-local metadata through `System.Reflection.Metadata`; debug additionally
+    requires the known Rust `debugger_probe_local`, while release only requires retained names
+    because rustc may eliminate that slot under optimization. This is the product-shaped guard for
+    library PDB promotion, CodeView/PDB filename agreement, and named-local metadata. Both profiles
+    also require the logical `/_/consumer/src/lib.rs` document and parse the standard module-owned
+    Source Link CustomDebugInformation JSON emitted from `--source-link-url`.
   - The Docker `::stable` gate **has now been re-run against the post-PDB-writer HEAD**
     (`02da7b8`+docs, default DIRECT_PE path): `feasibility/dev.sh gate` verdict **"OK: no real
     regressions"** (exit 0). The parallel run scored 405/35 vs the 16-failure baseline, and the
@@ -192,8 +208,9 @@ quickest way to tell the two paths' output apart (ilasm stamps a real build time
     run there showed 424/16 byte-identical to the ilasm baseline). The PE+PDB path is
     gate-proven at the same bar as Phase 1; the parallel-mode contention sensitivity of the
     direct-PE path (vs ilasm) remains a flagged, unexplained follow-up.
-  - A manual VS Code / debugger step-through was **not** performed this session (stretch item,
-    unverified).
+  - A manual VS Code / debugger breakpoint-and-step session remains **unverified**. The automated
+    consumer now proves lookup and sequence-point consumption, but not IDE launch/attach ergonomics
+    or the IDE's locals-window behavior and lexical-scope presentation.
 
 ## Risks & mitigations
 

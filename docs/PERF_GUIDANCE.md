@@ -122,7 +122,9 @@ warm-up, larger artifact, no runtime codegen). With the const-data gap closed, t
 as a first-class subcommand: `cargo dotnet publish <csproj-dir>` runs `dotnet publish -c Release
 -r <host-rid> --self-contained -p:PublishAot=true` against an existing `RustDotnet.targets`-importing
 C# host project (see `cargo_tests/cd_interop/csharp` for the shape) — the Rust crate builds as part
-of that same `dotnet publish` invocation. Full I/O-PAL AOT-compatibility for a standalone Rust
+of that same `dotnet publish` invocation. `--output <dir>` gives callers a stable artifact location;
+`feasibility/nativeaot_acceptance.sh` publishes there and executes the resulting binary. Full
+I/O-PAL AOT-compatibility for a standalone Rust
 *binary* (vs the C#-host-consumes-Rust-lib path proven here) is the remaining frontier.
 
 ## 6. Size-classed pool allocator (`POOL_ALLOC=1`) — PARKED, negative result

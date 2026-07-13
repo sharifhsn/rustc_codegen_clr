@@ -45,7 +45,7 @@ pub fn run(args: &NewArgs) -> Result<i32> {
     fs::create_dir_all(&dir)
         .with_context(|| format!("could not create target directory: {}", dir.display()))?;
 
-    let files = render(template, &name);
+    let files = render(template, &name, &args.dotnet);
     for f in &files {
         let path = dir.join(f.rel);
         if let Some(parent) = path.parent() {
@@ -55,7 +55,7 @@ pub fn run(args: &NewArgs) -> Result<i32> {
         fs::write(&path, &f.body).with_context(|| format!("could not write {}", path.display()))?;
     }
 
-    print_next_steps(template, &name, &dir);
+    print_next_steps(template, &name, &dir, &args.dotnet);
     Ok(0)
 }
 
@@ -115,11 +115,11 @@ fn target_dir(args: &NewArgs, name: &str) -> Result<PathBuf> {
 }
 
 /// Render every file of the chosen template with the crate name interpolated.
-fn render(template: Template, name: &str) -> Vec<File> {
+fn render(template: Template, name: &str, dotnet: &str) -> Vec<File> {
     match template {
         Template::App => app_files(name),
-        Template::Lib => lib_files(name),
-        Template::Plugin => plugin_files(name),
+        Template::Lib => lib_files(name, dotnet),
+        Template::Plugin => plugin_files(name, dotnet),
     }
 }
 
@@ -159,7 +159,7 @@ fn app_files(name: &str) -> Vec<File> {
 // --lib : a Rust cdylib exported to C# via export_rust_containers! (models cd_containers)
 // ---------------------------------------------------------------------------------
 
-fn lib_files(name: &str) -> Vec<File> {
+fn lib_files(name: &str, dotnet: &str) -> Vec<File> {
     let cs_name = format!("{name}_cs");
     vec![
         File {
@@ -197,7 +197,7 @@ fn lib_files(name: &str) -> Vec<File> {
         },
         File {
             rel: &leak_str(format!("csharp/{cs_name}.csproj")),
-            body: csproj_containers(&cs_name),
+            body: csproj_containers(&cs_name, dotnet),
         },
         File {
             rel: "csharp/.gitignore",
@@ -210,7 +210,7 @@ fn lib_files(name: &str) -> Vec<File> {
 // --plugin : #[dotnet_class] managed type consumed by a C# host (models cd_typedef)
 // ---------------------------------------------------------------------------------
 
-fn plugin_files(name: &str) -> Vec<File> {
+fn plugin_files(name: &str, dotnet: &str) -> Vec<File> {
     let cs_name = format!("{name}_cs");
     vec![
         File {
@@ -249,7 +249,7 @@ fn plugin_files(name: &str) -> Vec<File> {
         },
         File {
             rel: &leak_str(format!("csharp/{cs_name}.csproj")),
-            body: csproj_plain(&cs_name),
+            body: csproj_plain(&cs_name, dotnet),
         },
         File {
             rel: "csharp/.gitignore",
@@ -263,29 +263,31 @@ fn plugin_files(name: &str) -> Vec<File> {
 // private build config redirects them to the copies installed under CARGO_DOTNET_HOME.
 // ---------------------------------------------------------------------------------
 //
-// A scaffolded project needs `mycorrhiza = { path = ... }`. Outside the repo there is
-// no canonical published crate yet, so we emit a `<CARGO_DOTNET_HOME>/crates/...`-style
-// relative hint the user edits, and print a clear note. Inside the repo (dev), the
-// example crates use `../../mycorrhiza`; we cannot know the scaffold's depth, so we emit
-// the env-anchored path and rely on the printed note.
+// Portable manifests use ordinary version dependencies. Setup copies the matching SDK crates into
+// CARGO_DOTNET_HOME, and the build-local Cargo config patches those names to the installed sources;
+// users never edit a path dependency and the checkout can be removed after setup.
 
 // ---------------------------------------------------------------------------------
 // csproj rendering.
 // ---------------------------------------------------------------------------------
 
-/// The C#-consumer csproj for `--lib`: opts into the shipped RustVec<T>/RustBoxVec<T>
+/// The C#-consumer csproj for `--lib`: opts into the shipped `RustVec<T>`/`RustBoxVec<T>`
 /// wrappers and auto-builds the Rust crate via RustDotnet.targets.
-fn csproj_containers(cs_name: &str) -> String {
-    CSPROJ_TEMPLATE.replace("__ASSEMBLY__", cs_name).replace(
-        "__CONTAINERS_PROP__",
-        "\n    <UseRustDotnetContainers>true</UseRustDotnetContainers>",
-    )
+fn csproj_containers(cs_name: &str, dotnet: &str) -> String {
+    CSPROJ_TEMPLATE
+        .replace("__ASSEMBLY__", cs_name)
+        .replace("__DOTNET__", dotnet)
+        .replace(
+            "__CONTAINERS_PROP__",
+            "\n    <UseRustDotnetContainers>true</UseRustDotnetContainers>",
+        )
 }
 
 /// The C#-host csproj for `--plugin`: no containers, just auto-builds the Rust crate.
-fn csproj_plain(cs_name: &str) -> String {
+fn csproj_plain(cs_name: &str, dotnet: &str) -> String {
     CSPROJ_TEMPLATE
         .replace("__ASSEMBLY__", cs_name)
+        .replace("__DOTNET__", dotnet)
         .replace("__CONTAINERS_PROP__", "")
 }
 
@@ -293,7 +295,7 @@ fn csproj_plain(cs_name: &str) -> String {
 // Post-scaffold guidance.
 // ---------------------------------------------------------------------------------
 
-fn print_next_steps(template: Template, name: &str, dir: &Path) {
+fn print_next_steps(template: Template, name: &str, dir: &Path, dotnet: &str) {
     let d = dir.display();
     println!(
         "== scaffolded {} project '{name}' at {d} ==",
@@ -304,7 +306,7 @@ fn print_next_steps(template: Template, name: &str, dir: &Path) {
         Template::App => {
             println!("Next:");
             println!("  cd {d}");
-            println!("  cargo dotnet run");
+            println!("  cargo dotnet run --dotnet {dotnet}");
         }
         Template::Lib | Template::Plugin => {
             println!("Next:");
@@ -312,7 +314,7 @@ fn print_next_steps(template: Template, name: &str, dir: &Path) {
             println!(
                 "  # ensure CARGO_DOTNET_HOME points at your install (or ~/.cargo-dotnet exists)"
             );
-            println!("  dotnet run -c Release");
+            println!("  dotnet run -c Release  # targets net{dotnet}.0");
         }
     }
 }
@@ -405,7 +407,7 @@ const LIB_RUST: &str = r#"//! A Rust cdylib whose entire body exports the reusab
 mycorrhiza::export_rust_containers!();
 "#;
 
-/// `--lib` C# consumer: uses the shipped RustVec<T> wrapper against the Rust crate.
+/// `--lib` C# consumer: uses the shipped `RustVec<T>` wrapper against the Rust crate.
 const LIB_CS_PROGRAM: &str = r#"// Consuming the Rust cdylib from C# with ZERO hand-written interop: the Rust side is one
 // `export_rust_containers!()` line; this side uses the shipped RustDotnet.RustVec<T>.
 using System;
@@ -499,7 +501,7 @@ public static class Program
 const CSPROJ_TEMPLATE: &str = r#"<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <RustDotnetVersion Condition="'$(RustDotnetVersion)'==''">8</RustDotnetVersion>
+    <RustDotnetVersion Condition="'$(RustDotnetVersion)'==''">__DOTNET__</RustDotnetVersion>
     <TargetFramework>net$(RustDotnetVersion).0</TargetFramework>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Nullable>disable</Nullable>
@@ -522,6 +524,20 @@ const CSPROJ_TEMPLATE: &str = r#"<Project Sdk="Microsoft.NET.Sdk">
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_cargo_manifests_parse(files: &[File]) {
+        for file in files.iter().filter(|file| file.rel.ends_with("Cargo.toml")) {
+            toml::from_str::<toml::Value>(&file.body)
+                .unwrap_or_else(|error| panic!("generated {} is invalid TOML: {error}", file.rel));
+        }
+    }
+
+    #[test]
+    fn every_template_emits_valid_cargo_manifests() {
+        assert_cargo_manifests_parse(&app_files("demo"));
+        assert_cargo_manifests_parse(&lib_files("demo", "10"));
+        assert_cargo_manifests_parse(&plugin_files("demo", "10"));
+    }
 
     #[test]
     fn crate_name_validation() {
@@ -557,7 +573,7 @@ mod tests {
 
     #[test]
     fn lib_scaffold_has_expected_files() {
-        let files = lib_files("mylib");
+        let files = lib_files("mylib", "10");
         let rels: Vec<&str> = files.iter().map(|f| f.rel).collect();
         assert!(rels.contains(&"rustlib/Cargo.toml"));
         assert!(rels.contains(&"rustlib/src/lib.rs"));
@@ -576,6 +592,9 @@ mod tests {
         );
         // containers opt-in present for --lib.
         assert!(csproj.body.contains("UseRustDotnetContainers"));
+        assert!(csproj.body.contains(
+            "<RustDotnetVersion Condition=\"'$(RustDotnetVersion)'==''\">10</RustDotnetVersion>"
+        ));
         // Rust side exports the container core.
         let lib = &files
             .iter()
@@ -595,7 +614,7 @@ mod tests {
 
     #[test]
     fn plugin_scaffold_has_expected_files() {
-        let files = plugin_files("myplug");
+        let files = plugin_files("myplug", "10");
         let rels: Vec<&str> = files.iter().map(|f| f.rel).collect();
         assert!(rels.contains(&"rustlib/Cargo.toml"));
         assert!(rels.contains(&"rustlib/src/lib.rs"));
@@ -617,12 +636,19 @@ mod tests {
         // plugin csproj does NOT opt into containers.
         let csproj = files.iter().find(|f| f.rel.ends_with(".csproj")).unwrap();
         assert!(!csproj.body.contains("UseRustDotnetContainers"));
+        assert!(csproj.body.contains(
+            "<RustDotnetVersion Condition=\"'$(RustDotnetVersion)'==''\">10</RustDotnetVersion>"
+        ));
     }
 
     #[test]
     fn no_template_placeholders_leak() {
         for name in ["a", "b_c", "Xyz"] {
-            for files in [app_files(name), lib_files(name), plugin_files(name)] {
+            for files in [
+                app_files(name),
+                lib_files(name, "10"),
+                plugin_files(name, "10"),
+            ] {
                 for f in files {
                     assert!(
                         !f.body.contains("__ASSEMBLY__"),
@@ -637,6 +663,11 @@ mod tests {
                     assert!(
                         !f.body.contains("__CRATE__"),
                         "unresolved __CRATE__ in {}",
+                        f.rel
+                    );
+                    assert!(
+                        !f.body.contains("__DOTNET__"),
+                        "unresolved __DOTNET__ in {}",
                         f.rel
                     );
                     assert!(

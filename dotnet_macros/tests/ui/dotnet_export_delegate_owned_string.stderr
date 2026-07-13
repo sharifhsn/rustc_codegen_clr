@@ -1,0 +1,5 @@
+error: #[dotnet_export]: imported `Func1` delegate types must be passthrough primitives or `MString`; `String` needs an explicit callback-boundary marshalling policy.
+ --> tests/ui/dotnet_export_delegate_owned_string.rs:6:35
+  |
+6 | fn unsupported_callback(callback: Func1<String, i32>) -> i32 {
+  |                                   ^^^^^^^^^^^^^^^^^^

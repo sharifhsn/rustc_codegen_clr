@@ -17,15 +17,17 @@
 //!
 //! ## `.await`-ing a .NET Task (Task → Future)
 //!
-//! [`await_unit`] wraps a non-generic [`Task`] (result `()`), [`await_task`] a result-bearing
-//! [`TaskT<T>`], each in a Rust [`Future`] ([`TaskUnitFuture`] / [`TaskFuture<T>`]) whose `poll`
+//! [`await_unit`](crate::task::await_unit) wraps a non-generic [`Task`](crate::task::Task) (result
+//! `()`), [`await_task`](crate::task::await_task) a result-bearing [`TaskT`](crate::task::TaskT),
+//! each in a Rust [`Future`] ([`TaskUnitFuture`](crate::task::TaskUnitFuture) /
+//! [`TaskFuture`](crate::task::TaskFuture)) whose `poll`
 //! inspects the Task's `IsCompleted`:
 //!
 //! * completed → resolve (`()`, resp. read `Result` = `!0` = `T`);
-//! * still running → re-arm the waker (`wake_by_ref`) and return [`Poll::Pending`].
+//! * still running → re-arm the waker (`wake_by_ref`) and return [`Poll::Pending`](core::task::Poll::Pending).
 //!
 //! This is a **polling** adapter: it works with any executor whose `wake` re-polls (a spin
-//! [`block_on`], tokio's `current_thread`, …). It does *not* register a .NET continuation on the Task —
+//! [`block_on`](crate::task::block_on), tokio's `current_thread`, …). It does *not* register a .NET continuation on the Task —
 //! that would need a managed callback re-entering an arbitrary Rust `Waker`, i.e. a *capturing*
 //! delegate, which the delegate bridge does not yet support (only capture-less `extern "C" fn`). For a
 //! `block_on`-style executor (what async programs on this PAL use) polling is exactly right.
@@ -35,8 +37,9 @@
 //! object reference may not live in a coroutine's saved state (an `async fn` state machine is laid
 //! out with *overlapping* variant storage, like an enum, and .NET forbids a GC reference in an
 //! overlapping field — `cilly::ir::class`'s `layout_check`, `ManagedRefInOverlapingField`). So a raw
-//! handle must be awaited via a *plain* [`Future`] struct (as [`TaskFuture`] itself does) driven by
-//! [`block_on`], never captured directly in a suspending `async fn` body. See [`TaskFuture`].
+//! handle must be awaited via a *plain* [`Future`] struct (as [`TaskFuture`](crate::task::TaskFuture)
+//! itself does) driven by [`block_on`](crate::task::block_on), never captured directly in a
+//! suspending `async fn` body. See [`TaskFuture`](crate::task::TaskFuture).
 //!
 //! **This IS solvable, though, for the common case of holding a managed reference across an
 //! `.await`** — not by weakening `layout_check` (never done), but by never putting a gcref in the
@@ -57,17 +60,19 @@
 //!
 //! ## Exposing a Rust `async fn` as a .NET `Task` (Future → Task)
 //!
-//! [`future_to_task_unit`] drives a Rust `async fn` (`Future<Output = ()>`) to completion with a
-//! self-contained spin executor and packages it into a **completed** non-generic managed [`Task`] a
+//! [`future_to_task_unit`](crate::task::future_to_task_unit) drives a Rust `async fn`
+//! (`Future<Output = ()>`) to completion with a self-contained spin executor and packages it into a
+//! **completed** non-generic managed [`Task`](crate::task::Task) a
 //! .NET caller can `await` (it returns synchronously, the work being done). Combined with
 //! [`#[dotnet_export]`](../../dotnet_macros) this is how a Rust `async fn` becomes a C#-awaitable
 //! method.
 //!
 //! ## Result-bearing `Task<T>` — both directions supported
 //!
-//! Awaiting a `Task<T>` ([`await_task`]) and **producing** one ([`future_to_task`], via
+//! Awaiting a `Task<T>` ([`await_task`](crate::task::await_task)) and **producing** one
+//! ([`future_to_task`](crate::task::future_to_task), via
 //! `TaskCompletionSource<T>.get_Task()`) both work. `get_Task()`'s def-shape nested-generic return
-//! `Task`1<!0>` binds against the concrete `Task<T>` local — the CIL verifier accepts it (same open
+//! `Task<!0>` binds against the concrete `Task<T>` local — the CIL verifier accepts it (same open
 //! generic, `!0` pairwise-assignable) and codegen proves `!0` == `T` via the recursive WF-9 marker
 //! guard. So `async fn -> T` ⇒ `Task<T>` is symmetric with the non-generic `Task` direction.
 //! (`Task.FromResult<T>` remains unused — it needs generic-*method* `!!N` argument support the backend
@@ -78,7 +83,8 @@ use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::intrinsics::{
-    RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric, RustcCLRInteropTypeGeneric,
+    RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric,
+    RustcCLRInteropManagedGenericStruct, RustcCLRInteropTypeGeneric,
     rustc_clr_interop_generic_call1, rustc_clr_interop_generic_call2,
     rustc_clr_interop_generic_ctor0,
 };
@@ -91,17 +97,57 @@ const CORELIB: &str = "System.Private.CoreLib";
 const TASK_GEN: &str = "System.Threading.Tasks.Task";
 
 /// A handle to a managed `System.Threading.Tasks.Task<T>` — the generic (result-bearing) Task. Named
-/// `TaskT` (not `Task`) so it doesn't collide with the non-generic [`crate::bindings::Task`]. `T` must
+/// `TaskT` (not `Task`) so it doesn't collide with the generated non-generic Task binding. `T` must
 /// be a boundary-crossing .NET type (a primitive, a `#[repr(C)]` value type, or a managed handle),
 /// exactly as for [`crate::collections`].
 pub type TaskT<T> = RustcCLRInteropManagedGeneric<{ CORELIB }, { TASK_GEN }, (T,)>;
+
+const VALUE_TASK_GEN: &str = "System.Threading.Tasks.ValueTask";
+
+/// The raw managed value-type handle for `System.Threading.Tasks.ValueTask<T>`.
+///
+/// Generated NuGet bindings use this type for closed `ValueTask<T>` returns. Convert it directly
+/// into an idiomatic Rust [`Future`] with [`await_value_task`], or into a managed [`TaskT`] with
+/// [`value_task_into_task`]. The size is only a Rust-side transport buffer; the CLR owns the real
+/// generic value-type layout.
+pub type ValueTaskT<T> = RustcCLRInteropManagedGenericStruct<
+    { CORELIB },
+    { VALUE_TASK_GEN },
+    { core::mem::size_of::<usize>() * 2 },
+    (T,),
+>;
+
+/// Convert a returned managed `ValueTask<T>` into `Task<T>` via `ValueTask<T>.AsTask()`.
+///
+/// This is useful when a caller needs to retain or pass the managed task. For ordinary Rust async
+/// code, [`await_value_task`] is the shorter entry point.
+#[inline]
+pub fn value_task_into_task<T>(value_task: ValueTaskT<T>) -> TaskT<T> {
+    rustc_clr_interop_generic_call1::<
+        { CORELIB },
+        { VALUE_TASK_GEN },
+        true,
+        "AsTask",
+        1,
+        (T,),
+        (
+            RustcCLRInteropManagedGeneric<
+                { CORELIB },
+                { TASK_GEN },
+                (RustcCLRInteropTypeGeneric<0>,),
+            >,
+        ),
+        TaskT<T>,
+        &ValueTaskT<T>,
+    >(&value_task)
+}
 
 /// The raw non-generic managed `System.Threading.Tasks.Task` handle (same underlying type as
 /// [`crate::bindings::Task`]). Wrapped by [`Task`] so this module can carry its own inherent methods
 /// without colliding with the generated bindings' inherent impl on the identical alias.
 type RawTask = RustcCLRInteropManagedClass<{ CORELIB }, { TASK_GEN }>;
 /// A managed `System.Action` (parameterless) delegate handle — the argument type of `Task.Run(Action)`.
-type ActionHandle = RustcCLRInteropManagedGeneric<{ CORELIB }, { "System.Action" }, ()>;
+type ActionHandle = RustcCLRInteropManagedGeneric<{ CORELIB }, "System.Action", ()>;
 
 // ---- Task<T> members reached through the WF-9 generic bridge -----------------------------------
 //
@@ -198,7 +244,7 @@ fn task_result<T>(t: TaskT<T>) -> T {
 ///
 /// **Faulted / canceled Tasks.** If the Task ends by throwing or cancellation, reading `Result` would
 /// raise the managed exception through the interop boundary. `poll` therefore only reports `Ready`
-/// for a *successful* completion; a faulted/canceled Task resolves to a panic via [`task_result`]'s
+/// for a *successful* completion; a faulted/canceled Task resolves to a panic via `task_result`'s
 /// managed throw — matching how `.await` on a faulted Task surfaces in C# (an exception at the await).
 pub struct TaskFuture<T> {
     // Held via `GenericClass` (a `GCHandle`-backed value type — see the module docs above), NOT the
@@ -257,6 +303,16 @@ impl<T> TaskFuture<T> {
 #[inline]
 pub fn await_task<T>(task: TaskT<T>) -> TaskFuture<T> {
     TaskFuture::new(task)
+}
+
+/// `.await`-adapt a managed `ValueTask<T>` returned by a generated binding.
+///
+/// ```ignore
+/// let answer = mycorrhiza::task::await_value_task(client.get_answer_async()).await;
+/// ```
+#[inline]
+pub fn await_value_task<T>(value_task: ValueTaskT<T>) -> TaskFuture<T> {
+    await_task(value_task_into_task(value_task))
 }
 
 // ---- Task → Future for the NON-GENERIC `Task` (result `()`) ------------------------------------
@@ -323,11 +379,12 @@ impl Task {
     pub fn run(f: extern "C" fn()) -> Task {
         let action: ActionHandle = crate::intrinsics::rustc_clr_interop_delegate::<
             { CORELIB },
-            { "System.Action" },
+            "System.Action",
             false,
             (),    // Action has no generic args
             ((),), // shim `calli` sig: () -> void
             extern "C" fn(),
+            ActionHandle,
         >(f);
         Self::from_raw(RawTask::static1::<"Run", ActionHandle, RawTask>(action))
     }
@@ -470,7 +527,7 @@ fn tcs_set_result<T>(tcs: TaskCompletionSourceT<T>, value: T) {
         T,
     >(tcs, value)
 }
-/// `TaskCompletionSource<T>.get_Task()` — the produced `Task<T>`. The def-shape return `Task`1<!0>`
+/// `TaskCompletionSource<T>.get_Task()` — the produced `Task<T>`. The def-shape return `Task<!0>`
 /// binds against the concrete `TaskT<T>` local (nested-generic binding).
 #[inline]
 fn tcs_get_task<T>(tcs: TaskCompletionSourceT<T>) -> TaskT<T> {

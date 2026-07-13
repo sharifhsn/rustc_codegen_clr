@@ -31,6 +31,8 @@ that was compiled with the backend and executed on real .NET (`CARGO_DOTNET_BACK
 | `cargo_tests/cd_json` | .NET-from-Rust | **47/47** |
 | `cargo_tests/cd_delegates` | .NET-from-Rust | **14/14** |
 | `cargo_tests/cd_async` | .NET-from-Rust | **9/9** |
+| `cargo_tests/cd_async_stream` | .NET-from-Rust (`IAsyncEnumerable<T>` consumer) | **PASS** (debug + release matrix) |
+| `cargo_tests/cd_nats` | generated NuGet bindings (`byte[]`, interface calls, real NATS) | **PASS** (debug + release focused acceptance) |
 | `cargo_tests/cd_linq_expr` | .NET-from-Rust (LINQ/EF expression trees) | **89/89** |
 | `cargo_tests/cd_generic` | .NET-from-Rust (low-level bridge) | **18/18** |
 | `cargo_tests/cd_containers2` | Rust-from-C# | **30/30** |
@@ -77,7 +79,7 @@ All backed by real managed objects; used like `std`. Element `T`/`K`/`V` must cr
 | `ConcurrentBag<T>` | System.Collections.Concurrent | ✅ | `new`/`add`/`len`/`is_empty`; `IntoIterator` (snapshot), `FromIterator`, `Extend` | **`TryTake`/`TryPeek` ⛔** (out-param). |
 | `ConcurrentStack<T>`, `BlockingCollection<T>` | System.Collections.Concurrent | ⛔/🟡 | — | Not wrapped; same out-param wall on the `TryX` removers. |
 | `ObservableCollection<T>`, `ReadOnlyCollection<T>` | System.ObjectModel | 🟡 | — | Reachable via `dotnet_generic!`; no idiomatic wrapper yet. |
-| `Span<T>` / `ReadOnlySpan<T>` | CoreLib | ✅ | `mycorrhiza::span::{Span, ReadOnlySpan}` — zero-copy view over a Rust `&mut [T]`/`&[T]`: `from_slice`, `len`/`is_empty`, `get`/`set`, `fill`, `clear`, `.handle()` to pass to a .NET API | Generic **value-type** instance methods (former §8 wall #2) are now supported for the concrete members exercised here (`get_Length`, `Fill`, `Clear`, the byref `get_Item` indexer). `Memory<T>` (the heap-backed sibling) is still unwrapped. `ReadOnlySpan<T>.get_Item` is unreachable (`ref readonly T` — a `modreq`-decorated byref no plain `!0&` methodref can match); read the backing Rust slice directly instead. Proof: `cd_span` (45/45). |
+| `Span<T>` / `ReadOnlySpan<T>` / `Memory<T>` / `ReadOnlyMemory<T>` | CoreLib | ✅ | `mycorrhiza::span` supplies borrowed zero-copy views; `mycorrhiza::memory` copies into a GC-owned array for buffers that managed code retains or carries across async boundaries | Span supports slicing/fill/copy/byref indexing. Memory supports managed slicing, read/write/fill, handles, and read-only `CopyTo`. `ReadOnlySpan<T>.get_Item` remains unreachable (`ref readonly T` modreq); read the backing Rust slice. Proof: `cd_span` 68/68. |
 
 **Enumerator bridge (`mycorrhiza::enumerate`)** — ✅ `for x in &collection` over every reference-type
 collection above, plus any `IEnumerable<T>` handle via `Enumerable::iter_enumerator()` →
@@ -123,17 +125,19 @@ Proof: `cd_delegates` (14/14), `cd_async` (9/9), `cd_closures`, `cd_linq_expr` (
 
 | Feature | Status | Surface | Wall / what's missing |
 |---|---|---|---|
-| `Action<T0>` / `Action<T0,T1>` | ✅ | `Action1`/`Action2`: `from_fn(extern "C" fn)`, `invoke`, `from_handle`, `handle` | Only arities 1–2. |
-| `Func<T0,R>` / `Func<T0,T1,R>` | ✅ | `Func1`/`Func2`: same shape, value-returning | Only arities 1–2. |
+| `Action<T...>` (1–3 arguments) | ✅ | `Action1`/`Action2`/`Action3`: `from_fn(extern "C" fn)`, `invoke`, `from_handle`, `handle` | Arity 4+ remains. |
+| `Func<T...,R>` (1–3 arguments) | ✅ | `Func1`/`Func2`/`Func3`: same shape, value-returning | Arity 4+ remains. |
 | `Comparison<T>` | ✅ | `from_fn`/`invoke`/`handle` — `(T,T)->i32` | — |
 | Invoke a *held* .NET delegate from Rust | ✅ | `from_handle(h).invoke(..)` (`callvirt Delegate::Invoke`) | — |
+| Import a C# delegate into exported Rust | ✅ | Use `Action1`–`Action3`, `Func1`–`Func3`, or `Comparison` as a `#[dotnet_export]`/`#[dotnet_methods]` parameter, then call `.invoke(..)` | Primitive and managed-`MString` callback types through arity 3 are continuously proven by `cd_export_ergonomics` 37/37. Owned Rust strings/references are rejected with a targeted diagnostic; no unsafe representation guess. |
 | **Closure captures** | ✅ | `Action1::from_closure(move \|x\| ..)` (and the other delegate arities) — the capture environment is boxed and leaked for `'static` lifetime, invoked through a monomorphic trampoline | Leaked, not freed — fine for long-lived callbacks/`static`-shaped usage; not a fit for a hot per-call closure churned in a loop. Former §8 wall #5. Proof: `cd_closures`. |
 | **Delegate as a *generic-method* argument** | ✅ | `List<T>.Sort(Comparison<T>)` / `ForEach(Action<T>)` — see `sort_by`/`for_each` in §1 | The verifier now models the nested generic-param binding (`Comparison`1<!0>` param vs concrete `Comparison`1<int32>` arg) as a sound extension. Former §8 wall #4 — the doc's headline "must not be relaxed" caution was about the *checker*, not this addition, and holds: nothing was relaxed. |
-| .NET **events** (`add_*`/`remove_*`) | ⛔ | — | Not yet composed, though the delegate-as-generic-arg prerequisite is now in place. |
+| Exported and consumed .NET **events** | ✅ | `#[dotnet_event("Name")]` on exported class accessors; `#[dotnet_event]` on interface members; `EventHandler` + `EventSubscription::subscribe` for Rust consumers | Emits genuine Event/MethodSemantics metadata on the default direct-PE path. The RAII guard removes the exact same delegate on explicit unsubscribe or drop. Event owners still define backing storage, multicast, and synchronization policy. Proof: `cd_event`, `cd_iface_event`, `cd_event_subscription`. |
 | `.await` a non-generic `Task` | ✅ | `task::Task` (`delay`/`completed`/`run`/`is_completed`), `await_unit(t).await`, `block_on` | Covers the large non-result async surface (`Task.Delay`, `Task.Run(Action)`, `FlushAsync`, …). |
 | `.await` a `Task<T>` a .NET API *returned* | ✅ | `await_task(t).await` (`IsCompleted`/`Result` = bare `!0`) | Works when handed a concrete `Task<int>`. |
 | Expose a Rust `async fn` as a non-generic `Task` | ✅ | `future_to_task_unit(fut)` (via non-generic `TaskCompletionSource`) | — |
 | **Produce a `Task<T>` from a Rust value** | ✅ | `future_to_task(fut)` packages an `async fn -> T` into a real `Task<T>` via `TaskCompletionSource<T>.get_Task()` | The nested-generic-return wall (former §8 wall #1) is closed for this specific producer path. `Task.FromResult<T>` itself is still unused (it needs generic-*method* `!!N` *argument* support the backend doesn't emit) — the `TaskCompletionSource<T>` route is sufficient and used instead. |
+| Consume `IAsyncEnumerable<T>` | ✅ | `AsyncEnumerable<T>` / `AsyncEnumerator<T>` call `GetAsyncEnumerator`, await each `MoveNextAsync` `ValueTask<bool>`, read `Current`, and expose `next`, `next_blocking`, and `collect_blocking` | Consumer-side backpressure is preserved and handles are GC-rooted across suspension. Producing an async stream from a Rust `async fn` remains blocked on coroutine GC-reference layout. Proof: delayed-channel `cd_async_stream`, debug + release. |
 | LINQ / EF `IQueryable.Where(Expression<Func<T,bool>>)` | ✅ | `mycorrhiza::linq` — `Expr`/`Predicate`/`TypedPredicate<T>`/`Field<Root,Val>` build a real `System.Linq.Expressions` tree from Rust (params, binops, member access, `box`-boxed constants), compiled and handed to `IQueryable.Where` | Built on **expression trees**, not delegates — sidesteps the delegate-as-generic-arg wall entirely (EF needs the *tree*, not a compiled predicate). `.select`/`.to_list`/other LINQ operators beyond `Where` are not yet wrapped. Proof: `cd_linq_expr` (89/89). |
 
 ---
@@ -173,16 +177,16 @@ The mirror direction: a C# dev consuming a Rust `cdylib`. Proof: `cd_typedef` (1
 
 | Feature | Status | Surface | Notes / walls |
 |---|---|---|---|
-| `#[dotnet_export] fn` → `MainModule.method(..)` | ✅ | proc-macro (`dotnet_macros`); marshals `&str`/`String` (as a real managed `System.String` via the `MString` seam) + primitives, no `(ptr,len)` glue | Follow-ups (🟡/⛔): slices, `char`, `Vec<T>`, `Option`/`Result` returns. |
-| `#[dotnet_class]` struct → managed class | ✅ | proc-macro; a Rust struct becomes `Class : System.Object` with a parameterized primary ctor + a parameterless ctor | Managed-type fields, properties (`get_`/`set_`), interface impls, virtual/subclassable — ⛔ (need a "re-open an existing class" comptime capability; split decl from `impl`). |
+| `#[dotnet_export] fn` → `MainModule.method(..)` | ✅ | proc-macro (`dotnet_macros`); marshals strings/primitives, `Vec<T>`, tasks, primitive `Option<T>` as `Nullable<T>`, and explicit `Result<T,E>` errors as exceptions | General Rust enums/C# try-pattern DTOs and managed/non-primitive nullable values remain. |
+| `#[dotnet_class]` struct → managed class | ✅ | proc-macro; a Rust struct becomes a managed class with constructors, managed fields/properties, inheritance, interface implementations, and explicit virtual overrides | `cd_typedef`, `cd_iface`, `cd_override`, and `cd_bgservice_bgtest` cover the shipped shapes. Arbitrary base-constructor contracts remain explicit rather than inferred. |
 | `#[dotnet_methods] impl` → managed methods | ✅ | proc-macro; static + instance Rust fns become methods on the `#[dotnet_class]` type (getters/setters/`make`/`sum` in `cd_typedef`) | |
 | `RustVec<T>` (C# → Rust growable vec) | ✅ | `export_rust_containers!()` (Rust) + shipped `RustDotnet.RustVec<T>` / `RustBoxVec<T>` (C#). `T:unmanaged` near-zero-cost; any managed `T` via `GCHandle` boxing | Size-erased core; one monomorphization backs every `T`. |
 | `RustHashMap<K,V>` (C# → Rust map) | ✅ | `export_rust_hashmap!()` + shipped `RustDotnet.RustHashMap<K,V>` | Both `K`/`V` `unmanaged`, hashed by raw key bytes. |
 | `RustString` (C# → Rust UTF-8 buffer) | ✅ | `export_rust_string!()` + shipped `RustDotnet.RustString` | Marshals to/from managed `System.String` as UTF-8. |
 | `Class<ASM,PATH>` GCHandle wrapper (`mycorrhiza::class`) | 🟡 | `ctor0`/`ctor1`/`instanceN`/`virtN` over a `GCHandle`-rooted managed object, with `Drop`/`Clone` | Low-level building block; used when a managed object must outlive a single call. |
-| Export Rust `enum`/`Result`/`Option` as C# enum/try-pattern/nullable | ⛔ | — | Removes the manual bool/out-param convention; not yet built. |
-| Export Rust traits as C# interfaces | ⛔ | — | Pairs with `#[dotnet_class]` interface support. |
-| C# delegates → Rust `impl Fn` | ⛔ | — | Mirror of §3 delegates; unlocks C#-drives-Rust callbacks. |
+| Export Rust `enum`/`Result`/`Option` as C# enum/try-pattern/nullable | 🟡 | `#[dotnet_enum]` emits genuine CLR enums; `Option<primitive>` ↔ `Nullable<T>`; `#[dotnet_export(error="exception")] Result<T,E>` returns `T` or throws `Display(E)` | Explicit C# try-pattern DTOs and `Option` of managed/non-primitive values remain. |
+| Export Rust traits as C# interfaces | ✅ | `#[dotnet_interface]` emits genuine CLR interface metadata | Inheritance, generics/method generics, properties, events, static abstract members, and default interface methods have C# consumer fixtures. |
+| C# delegates → Rust callbacks | 🟡 | `#[dotnet_export]`/`#[dotnet_methods]` import typed `Action1`–`Action3`/`Func1`–`Func3`/`Comparison` wrappers with primitive or managed-`MString` signatures | The wrappers are directly invokable from Rust. Arity 4+, automatic owned-value callback marshalling, and implementing Rust's `Fn` traits remain. |
 
 ---
 
@@ -224,9 +228,10 @@ unwritten wrapper. (Cross-ref: `docs/TRANSLATION_STATUS.md` §7, and the module 
    instance-generic KIND); that assertion has been relaxed *soundly* for concrete instantiations, and
    is now exercised by `Span<T>.get_Length`/`Fill`/`Clear`/the byref indexer, `KeyValuePair<K,V>.
    get_Key`/`get_Value` (via the enumerator bridge), and `Nullable<T>.get_HasValue`/`get_Value`. Not
-   every generic value type is wrapped yet — `Memory<T>` and `List<T>.Enumerator` (the *struct*
-   enumerator; the bridge still uses the boxed interface enumerator) remain unwrapped, but that's
-   unbuilt breadth, not a reopened wall.
+   every generic value type is wrapped yet — `List<T>.Enumerator` (the *struct* enumerator; the
+   bridge still uses the boxed interface enumerator) remains unwrapped, but that's unbuilt breadth,
+   not a reopened wall. `Memory<T>`/`ReadOnlyMemory<T>` are now wrapped and add the first guarded
+   definition-shape generic-array (`!0[]`) constructor path.
 3. **By-ref `!N` (`out`) arguments — still open.** The generic bridge marshals value-in / value-out
    args, not a `!N` `out` parameter. Blocks the concurrent collections' `TryRemove`/`TryDequeue`/
    `TryTake`/`TryPeek` removers (all hand the element back through an `out`), and `Task.FromResult<T>`/
@@ -237,8 +242,9 @@ unwritten wrapper. (Cross-ref: `docs/TRANSLATION_STATUS.md` §7, and the module 
    `Comparison`1<int32>` arg) — implemented as a sound extension, not a relaxation, and now backs
    `List::sort_by`/`for_each` (§1). LINQ's `IQueryable.Where` predicate does **not** use this path —
    EF needs an *expression tree*, not a compiled delegate, so `mycorrhiza::linq` builds
-   `System.Linq.Expressions` trees instead (§3) and never needed this wall closed. `.NET` events
-   (`add_*`/`remove_*`) could now compose on top of this but aren't wired yet.
+   `System.Linq.Expressions` trees instead (§3) and never needed this wall closed. Exported
+   class/interface events and deterministic Rust-side `EventSubscription` removal now compose on
+   top of the delegate path; uncommon concrete event delegate types still need small adapters.
 5. **Closure captures across the delegate seam — closed.** A captured environment now has a managed
    home: `Action1::from_closure`/etc. box the closure's environment (leaked for `'static`) and invoke
    it through a monomorphic per-signature trampoline. Trade-off: the boxed environment is leaked, not

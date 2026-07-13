@@ -3,8 +3,9 @@
 //! Many BCL APIs take or return a `Nullable<T>` (a generic **value type**). This bridges it to a Rust
 //! `Option<T>` using the value-type-generic instance-method path (`get_HasValue()`/`get_Value()` are
 //! `call instance` on the unboxed valuetype). The common direction — turning a `.NET`-produced
-//! `Nullable<T>` into an `Option<T>` — is [`Nullable::to_option`]; construct a present value with
-//! [`some`].
+//! `Nullable<T>` into an `Option<T>` — is
+//! [`NullableExt::to_option`](crate::nullable::NullableExt::to_option); construct a present value
+//! with [`some`](crate::nullable::some).
 
 use crate::intrinsics::{
     RustcCLRInteropManagedGenericStruct, RustcCLRInteropTypeGeneric,

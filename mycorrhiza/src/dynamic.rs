@@ -15,7 +15,8 @@
 //!
 //! # Arity, not a slice
 //!
-//! `invoke_dynamic0..4` take up to four individual [`DynArg`]s rather than `args: &[DynArg]`. An
+//! `invoke_dynamic0..4` take up to four individual [`DynArg`](crate::dynamic::DynArg)s rather than
+//! `args: &[DynArg]`. An
 //! earlier version of this module took a Rust slice and built the helper's `object?[]` with a `for
 //! arg in args { .. }` loop; that lowering trips a backend codegen gap in the generic
 //! slice-element-load path for managed-class-containing elements (a spurious self-`ManagedPtrCast`
@@ -27,7 +28,8 @@
 //!
 //! # What `unsafe` means here
 //!
-//! [`invoke_dynamic1`] (and its `0`/`2`/`3`/`4`-arity siblings) are `unsafe`, but **not** because they
+//! [`invoke_dynamic1`](crate::dynamic::invoke_dynamic1) (and its `0`/`2`/`3`/`4`-arity siblings) are
+//! `unsafe`, but **not** because they
 //! can cause memory unsafety — a boxed `System.Object[]` argument array and a `MethodInfo.Invoke` are
 //! just as memory-safe as any other managed call this crate makes. The `unsafe` marks a *different*
 //! contract: unlike every other call in this crate, the `(assembly, type, method)` triple and the
@@ -40,9 +42,11 @@
 //! this by reflex.
 //!
 //! The parts of the job that genuinely *are* checkable stay safe: building each argument
-//! ([`box_arg`] / [`ref_arg`] / [`str_arg`]) can't go wrong (boxing a `ManagedSafe` value type, or
+//! ([`box_arg`](crate::dynamic::box_arg) / [`ref_arg`](crate::dynamic::ref_arg) /
+//! [`str_arg`](crate::dynamic::str_arg)) can't go wrong (boxing a `ManagedSafe` value type, or
 //! upcasting an existing managed reference to `object`, is always valid), and if you'd rather get a
-//! [`Result`] than crash the process on a bad call, [`invoke_dynamic1_checked`] (and siblings) wrap
+//! [`Result`] than crash the process on a bad call,
+//! [`invoke_dynamic1_checked`](crate::dynamic::invoke_dynamic1_checked) (and siblings) wrap
 //! the same call in [`crate::error::try_managed`] and are **safe** to call — the "genuinely
 //! unvalidatable" failure mode becomes a caught [`ManagedException`](crate::error::ManagedException)
 //! instead of an unhandled one. `unsafe` is reserved for the raw `invoke_dynamicN` functions: the raw
@@ -215,7 +219,7 @@ pub unsafe fn invoke_dynamic4(
 // `try_managed`'s `Result<(), ManagedException>` only gates whether `out` is meaningful.
 
 /// Safe wrapper over [`invoke_dynamic0`]: catches the failure mode `unsafe` warns about as an
-/// `Err(`[`ManagedException`]`)` instead of letting it abort the process.
+/// [`Err`] containing a [`ManagedException`] instead of letting it abort the process.
 #[inline(always)]
 pub fn invoke_dynamic0_checked(
     assembly: &str,

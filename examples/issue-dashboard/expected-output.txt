@@ -1,0 +1,5 @@
+Project: rust-dotnet-demo
+Issues: 4 total, 3 open, 2 high-priority open
+Owners:
+- Ada: 2 open
+- Grace: 1 open

@@ -34,7 +34,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::context::Context as Ctx;
 
-/// Where a [`CfgArm`] is inserted. Anchors are STRONGLY preferred; the single
+/// Where a `CfgArm` is inserted. Anchors are STRONGLY preferred; the single
 /// `Ordinal` use is documented at its call site (exit.rs).
 #[derive(Debug, Clone)]
 pub enum Anchor {
@@ -890,6 +890,7 @@ pub fn patch_libc(libc_dir: &Path) -> Result<bool> {
 /// Keep rustix on its libc backend while making its ABI cfgs agree with the canonical Linux GNU
 /// libc ABI surface selected for dotnet. The build.rs `libc` decision remains unchanged (`dotnet !=
 /// linux`), so this never enables rustix's linux-raw syscall backend.
+#[cfg(test)]
 pub fn patch_rustix(crate_dir: &Path) -> Result<bool> {
     let build_rs = crate_dir.join("build.rs");
     let src = crate_dir.join("src");
@@ -912,6 +913,7 @@ pub fn patch_rustix(crate_dir: &Path) -> Result<bool> {
 
 /// async-fs exposes raw-fd conversions under broad `cfg(unix)`. Dotnet's managed `std::fs::File`
 /// intentionally is not fd-backed, so gate only those optional conversions.
+#[cfg(test)]
 pub fn patch_async_fs(crate_dir: &Path) -> Result<bool> {
     let lib_rs = crate_dir.join("src/lib.rs");
     if !lib_rs.is_file() {
@@ -934,6 +936,7 @@ pub fn patch_async_fs(crate_dir: &Path) -> Result<bool> {
 /// Route polling through its epoll backend on dotnet. The POSIX shim already owns
 /// epoll_create1/ctl/wait over managed sockets; leaving polling on its generic Unix
 /// fallback would emit host `pipe2`/`ppoll` P/Invokes instead.
+#[cfg(test)]
 pub fn patch_polling(crate_dir: &Path) -> Result<bool> {
     let src = crate_dir.join("src");
     if !src.is_dir() {
@@ -1017,33 +1020,6 @@ fn find_libc_rec(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
             find_libc_rec(&path, depth + 1, out);
         }
     }
-}
-
-/// Find extracted registry crate roots by directory-name prefix.
-pub fn find_registry_crate_dirs(root: &Path, prefix: &str) -> Vec<PathBuf> {
-    fn visit(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<PathBuf>) {
-        if depth > 8 {
-            return;
-        }
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if name.starts_with(prefix) && path.join("Cargo.toml").is_file() {
-                out.push(path.clone());
-            }
-            visit(&path, prefix, depth + 1, out);
-        }
-    }
-
-    let mut out = Vec::new();
-    visit(root, prefix, 0, &mut out);
-    out
 }
 
 // ===========================================================================

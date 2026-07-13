@@ -243,6 +243,40 @@ fn main() -> std::process::ExitCode {
         chk(53, b[2] as i64, 30);
     }
 
+    // ---- GC-owned Memory<T> / ReadOnlyMemory<T>: async-safe managed-array storage ----
+    {
+        use mycorrhiza::memory::{Memory, ReadOnlyMemory};
+
+        let mut memory = Memory::from_slice(&[10i32, 20, 30, 40]);
+        chk(54, memory.len() as i64, 4);
+        chk(55, memory.is_empty() as i64, 0);
+        chk(56, memory.get(2).unwrap() as i64, 30);
+        chk(57, memory.get(99).is_none() as i64, 1);
+        chk(58, memory.set(1, 25) as i64, 1);
+        chk(59, memory.get(1).unwrap() as i64, 25);
+
+        // A Memory<T>.Slice is a cheap view over the SAME managed array, not a copy.
+        let mut tail = memory.slice(1, 2);
+        chk(60, tail.len() as i64, 2);
+        tail.set(1, 99);
+        chk(61, memory.get(2).unwrap() as i64, 99);
+        tail.fill(7);
+        chk(62, memory.get(1).unwrap() as i64, 7);
+        chk(63, memory.get(2).unwrap() as i64, 7);
+
+        let ro = ReadOnlyMemory::from_slice(&[3i32, 1, 4]);
+        chk(64, ro.len() as i64, 3);
+        chk(65, ro.slice(1, 2).len() as i64, 2);
+        let _ = ro.span_handle();
+
+        // CopyTo is the real ReadOnlyMemory<T>.CopyTo(Memory<T>) member.
+        let mut copied = Memory::from_slice(&[0i32, 0, 0]);
+        ro.copy_to(&mut copied);
+        chk(66, copied.get(0).unwrap() as i64, 3);
+        chk(67, copied.get(2).unwrap() as i64, 4);
+        chk(68, copied.to_vec()[1] as i64, 1);
+    }
+
     unsafe {
         Console::writeln_u64(PASS as u64);
         Console::writeln_u64(TOTAL as u64);

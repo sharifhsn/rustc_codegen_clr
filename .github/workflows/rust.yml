@@ -13,36 +13,36 @@ jobs:
   linux_build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Build on Linux
         run: cargo build --verbose
   windows_build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Build on Windows
         run: cargo build --verbose
   linux_test:
     runs-on: ubuntu-22.04
    
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Build
         run: cargo build
       - name: Setup dotnet
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
-          dotnet-version: 8.0.x
-      - name: Check ILASM
-        run: ilasm --version
+          dotnet-version: 10.0.x
       - name: Run cargo tests
+        env:
+          DOTNET_VERSION: '10'
         run: cargo test --verbose ::stable -- --skip f128 --skip num_test --skip simd --skip fuzz87
   linux_c_test:
     runs-on: ubuntu-22.04
     env: 
       C_MODE: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Build
         run: cargo build
       - name: Run cargo tests

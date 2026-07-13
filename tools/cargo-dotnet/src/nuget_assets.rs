@@ -46,7 +46,11 @@ pub(super) struct ResolvedAssets {
     pub compile_dlls: Vec<PathBuf>,
     pub runtime_dlls: Vec<PathBuf>,
     pub assets: Vec<ResolvedAsset>,
+    // Retained in the resolved graph for audit/reporting and exercised by the acceptance tests;
+    // production staging currently consumes the already-validated `assets` projection.
+    #[allow(dead_code)]
     pub collisions: Vec<AssetCollision>,
+    #[allow(dead_code)]
     pub requested_rid: Option<String>,
 }
 
@@ -64,6 +68,7 @@ pub(super) fn restore(
     cache_root: &Path,
     rid: Option<&str>,
     tfm: &str,
+    sources: &[String],
 ) -> Result<ResolvedAssets> {
     let restore_dir = cache_root.join("restore");
     let packages_dir = cache_root.join("packages");
@@ -85,11 +90,14 @@ pub(super) fn restore(
         ),
     )?;
     eprintln!("== cargo dotnet add-nuget: restoring {id} {version} with the .NET SDK ==");
-    let status = Command::new("dotnet")
-        .args(["restore", "--nologo", "--verbosity", "quiet"])
-        .arg(&project)
-        .status()
-        .with_context(|| format!("add-nuget: failed to spawn `dotnet restore` (is the {tfm} SDK installed?)"))?;
+    let mut command = Command::new("dotnet");
+    command.args(["restore", "--nologo", "--verbosity", "quiet"]);
+    for source in sources {
+        command.args(["--source", source]);
+    }
+    let status = command.arg(&project).status().with_context(|| {
+        format!("add-nuget: failed to spawn `dotnet restore` (is the {tfm} SDK installed?)")
+    })?;
     if !status.success() {
         bail!("add-nuget: `dotnet restore` failed for {id} {version}");
     }

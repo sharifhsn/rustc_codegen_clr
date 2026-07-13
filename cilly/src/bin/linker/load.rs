@@ -225,7 +225,7 @@ mod tests {
         let error = accumulator.merge_encoded(&second, "second.bc").unwrap_err();
         let diagnostic = error.to_string();
         assert!(diagnostic.contains("second.bc"));
-        assert!(diagnostic.contains("dotnet_runtime: expected Net8, found Net9"));
+        assert!(diagnostic.contains("dotnet_runtime: expected Net10, found Net9"));
         assert!(diagnostic.contains("no_unwind: expected false, found true"));
     }
 

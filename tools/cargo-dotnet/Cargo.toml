@@ -1,6 +1,6 @@
 [package]
 name = "cargo-dotnet"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FractalFir/rustc_codegen_clr"
@@ -33,6 +33,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 fs2 = "0.4"
 sha2 = "0.10"
 semver = "1"
+tempfile = "3"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"

@@ -4,7 +4,21 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 evidence="${RCL_REPRO_EVIDENCE_DIR:-${TMPDIR:-/tmp}/rustc_codegen_clr-reproducibility-evidence}"
 fixture="cargo_tests/cd_interop/rustlib"
-package="Rcl.Reproducibility.Probe.1.0.0.nupkg"
+package_id="${RCL_REPRO_PACKAGE_ID:-Rcl.Reproducibility.Probe}"
+package_version="${RCL_REPRO_PACKAGE_VERSION:-1.0.0}"
+release_tag="${RCL_REPRO_RELEASE_TAG:-}"
+semver='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?'
+[[ "$package_version" =~ ^${semver}$ ]] || {
+    echo "reproducibility acceptance: invalid exact package version: $package_version" >&2
+    exit 2
+}
+if [[ -n "$release_tag" ]]; then
+    [[ "$release_tag" == "rust-dotnet-v$package_version" ]] || {
+        echo "reproducibility acceptance: release tag $release_tag does not match package version $package_version" >&2
+        exit 2
+    }
+fi
+package="$package_id.$package_version.nupkg"
 rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
 dotnet_version="${DOTNET_VERSION:-10}"
 tfm="net${dotnet_version}.0"
@@ -118,7 +132,7 @@ build_side() {
         SOURCE_DATE_EPOCH="$source_date_epoch" \
         CARGO_DOTNET_BACKEND=native \
         "$tree/tools/cargo-dotnet/target/release/cargo-dotnet" pack "$tree/$fixture" \
-        --id Rcl.Reproducibility.Probe --version 1.0.0 --out "$out/package" \
+        --id "$package_id" --version "$package_version" --out "$out/package" \
         --dotnet "$dotnet_version" --validate \
         >"$out/pack.log" 2>&1
 
@@ -135,6 +149,7 @@ build_side() {
 
     package_hash="$(hash_file "$pkg")"
     [[ "$(jq -r '.sha256' "$receipt")" == "$package_hash" ]] || fail "$side receipt package hash mismatch"
+    [[ "$(jq -r '.package' "$receipt")" == "$package" ]] || fail "$side receipt package identity mismatch"
     [[ "$(cut -d ' ' -f 1 "$pkg.sha256")" == "$package_hash" ]] || fail "$side checksum mismatch"
     jq -e '.schema == 1 and (.entries | type == "object" and length > 0)' "$receipt" >/dev/null
     while IFS= read -r line; do
@@ -143,6 +158,12 @@ build_side() {
         [[ "$(jq -r --arg entry "$entry" '.entries[$entry] // empty' "$receipt")" == "$actual" ]] ||
             fail "$side receipt entry hash mismatch: $entry"
     done <"$out/zip-entry-hashes.txt"
+
+    nuspec_entry="$(awk '/\.nuspec$/ { print; exit }' "$out/zip-entries.txt")"
+    [[ -n "$nuspec_entry" ]] || fail "$side package has no nuspec"
+    unzip -p "$pkg" "$nuspec_entry" >"$out/package.nuspec"
+    grep -Fq "<id>$package_id</id>" "$out/package.nuspec" || fail "$side nuspec package id mismatch"
+    grep -Fq "<version>$package_version</version>" "$out/package.nuspec" || fail "$side nuspec version mismatch"
 
     unzip -p "$pkg" "$package_xml" >"$out/api.xml"
     unzip -p "$pkg" 'build/rustdotnet/artifact-provenance.json' >"$out/artifact-provenance.json"
@@ -167,19 +188,15 @@ build_side() {
 build_side a "$tree_a"
 build_side b "$tree_b"
 
-# The NuGet envelope must be independently reproducible. The backend's managed PE is still an
-# explicitly measured compiler limitation: its method/token ordering is not canonical across fresh
-# processes, so the DLL and its derived provenance/package hashes are expected to differ. Keep that
-# evidence visible while refusing drift in every other packaged entry.
-for side in a b; do
-    grep -v -E "  (lib/$tfm/cd_interop\.dll|build/rustdotnet/artifact-provenance\.json)$" \
-        "$evidence/$side/zip-entry-hashes.txt" >"$evidence/$side/envelope-entry-hashes.txt"
-done
-cmp "$evidence/a/envelope-entry-hashes.txt" "$evidence/b/envelope-entry-hashes.txt"
+# Reproducibility is a byte-for-byte release property, not merely an equivalent-envelope property.
+# Compare both the unpacked entry hashes (for actionable failure evidence) and the final NuGet bytes.
+cmp "$evidence/a/zip-entry-hashes.txt" "$evidence/b/zip-entry-hashes.txt"
+cmp "$evidence/a/package/$package" "$evidence/b/package/$package"
 dll_hash_a="$(grep "  lib/$tfm/cd_interop.dll$" "$evidence/a/zip-entry-hashes.txt" | cut -d ' ' -f 1)"
 dll_hash_b="$(grep "  lib/$tfm/cd_interop.dll$" "$evidence/b/zip-entry-hashes.txt" | cut -d ' ' -f 1)"
-printf 'commit=%s\nenvelope_reproducible=true\nmanaged_dll_reproducible=%s\nmanaged_dll_sha256_a=%s\nmanaged_dll_sha256_b=%s\n' \
-    "$commit" "$([[ "$dll_hash_a" == "$dll_hash_b" ]] && echo true || echo false)" \
+package_hash="$(hash_file "$evidence/a/package/$package")"
+printf 'commit=%s\nrelease_tag=%s\npackage_id=%s\npackage_version=%s\npackage_name=%s\npackage_reproducible=true\nenvelope_reproducible=true\nmanaged_dll_reproducible=true\npackage_sha256=%s\nmanaged_dll_sha256_a=%s\nmanaged_dll_sha256_b=%s\n' \
+    "$commit" "$release_tag" "$package_id" "$package_version" "$package" "$package_hash" \
     "$dll_hash_a" "$dll_hash_b" >"$evidence/SUMMARY.txt"
 
 echo '== reproducibility_acceptance done =='

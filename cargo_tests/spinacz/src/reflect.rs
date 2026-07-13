@@ -8,8 +8,8 @@ use mycorrhiza::intrinsics::RustcCLRInteropManagedArray;
 use mycorrhiza::system::MString;
 use mycorrhiza::{
     System::Reflection::Assembly, System::Reflection::AssemblyName,
-    System::Reflection::ConstructorInfo, System::Reflection::MemberInfo,
-    System::Reflection::MethodInfo, System::Reflection::ParameterInfo, System::Type,
+    System::Reflection::ConstructorInfo, System::Reflection::MethodInfo,
+    System::Reflection::ParameterInfo, System::Type,
 };
 use std::io::Write;
 
@@ -54,7 +54,9 @@ pub fn reflect_assembly(
         // path anywhere reachable, so the `impl From<X> for <base>` this feeds (see
         // `Namespace::export`) would be dangling — drop it (no base-type upcast emitted for
         // this type) rather than emit unresolvable code.
-        let inherits: String = if inherits.is_null() || (!known.is_empty() && !known_declaring_assembly(inherits, known)) {
+        let inherits: String = if inherits.is_null()
+            || (!known.is_empty() && !known_declaring_assembly(inherits, known))
+        {
             "".into()
         } else {
             mstring_to_string(Type::virt0::<"get_FullName", MString>(inherits))
@@ -77,7 +79,6 @@ pub fn reflect_assembly(
         *total_types += 1;
     }
 }
-
 
 fn type_asm_string(tpe: Type) -> String {
     mstring_to_string(AssemblyName::virt0::<"get_Name", MString>(
@@ -121,6 +122,22 @@ enum DType {
     /// (full .NET name with `.` -> `::`, e.g. `System::Object`). Resolved against the
     /// `use super::..*` globs the exporter already emits.
     Class(String),
+    /// A one-dimensional, zero-based managed array whose element type is itself expressible.
+    Array(Box<DType>),
+    /// A closed `System.Threading.Tasks.Task<T>` whose result type is itself expressible.
+    ///
+    /// The generated raw managed handle feeds directly into `mycorrhiza::task::await_task`.
+    Task(Box<DType>),
+    /// A closed `System.Threading.Tasks.ValueTask<T>` whose result type is itself expressible.
+    ///
+    /// This deliberately starts with one ubiquitous async value-type shape instead of pretending
+    /// arbitrary constructed generics are supported. The generated signature is the same raw
+    /// marker accepted by `mycorrhiza::task::await_value_task`.
+    ValueTask(Box<DType>),
+    /// A closed `System.Collections.Generic.IAsyncEnumerable<T>` whose element type is itself
+    /// expressible. The generated raw interface handle feeds directly into
+    /// `mycorrhiza::enumerate_async::AsyncEnumerable::from_handle`.
+    AsyncEnumerable(Box<DType>),
     /// Cannot be expressed (unbound type, value type w/o alias, generic, etc.). The
     /// presence of a single `Skip` discards the whole method.
     Skip,
@@ -128,23 +145,89 @@ enum DType {
 impl DType {
     /// Map a reflected `System.Type` to the Rust type used in a wrapper.
     ///
-    /// Returns `Skip` for by-ref/out, pointer, generic, nested, and unbound types.
+    /// Returns `Skip` for by-ref/out, pointer, generic, nested, unbound, and non-SZ-array types.
     pub fn from_tpe(tpe: Type, known: &[String]) -> Self {
         // ref/out (`T&`) and pointer (`T*`) params need the not-yet-built marshalling
         // bridge (WF-9) -> skip the whole method.
         if Type::virt0::<"get_IsByRef", bool>(tpe) || Type::virt0::<"get_IsPointer", bool>(tpe) {
             return Self::Skip;
         }
-        // Managed arrays (`T[]`, `T[][]`) have no generated alias and their `FullName` is
-        // `System.Byte[]` etc. — `[]` is not valid Rust type syntax, so spell them as `Skip`
-        // (drops the whole method). The marshalling for managed arrays is WF-9.
+        // Rank-1 SZ arrays map directly to the backend's existing managed-array interop type.
+        // Multidimensional, non-zero-based, nested, and unbound element shapes remain explicit
+        // omissions rather than being emitted with an incorrect CLR signature.
         if Type::virt0::<"get_IsArray", bool>(tpe) {
-            return Self::Skip;
+            if !Type::virt0::<"get_IsSZArray", bool>(tpe)
+                || Type::virt0::<"GetArrayRank", i32>(tpe) != 1
+            {
+                return Self::Skip;
+            }
+            let elem = Self::from_tpe(Type::virt0::<"GetElementType", Type>(tpe), known);
+            if matches!(elem, Self::Skip | Self::Void | Self::Array(_))
+                || elem.contains_async_shape()
+            {
+                return Self::Skip;
+            }
+            return Self::Array(Box::new(elem));
         }
-        // Open generic params / constructed generics can't be named.
+        // Open generic params can't be named. A small allow-list of closed constructed generics is
+        // handled below; every other generic shape remains an explicit omission.
         if Type::virt0::<"get_IsGenericParameter", bool>(tpe)
             || Type::virt0::<"get_ContainsGenericParameters", bool>(tpe)
         {
+            return Self::Skip;
+        }
+        if Type::virt0::<"get_IsConstructedGenericType", bool>(tpe) {
+            let definition = Type::virt0::<"GetGenericTypeDefinition", Type>(tpe);
+            let definition_name =
+                mstring_to_string(Type::virt0::<"get_FullName", MString>(definition));
+            if definition_name == "System.Threading.Tasks.Task`1" {
+                let args = Type::virt0::<
+                    "GetGenericArguments",
+                    RustcCLRInteropManagedArray<Type, 1>,
+                >(tpe);
+                if args.len() != 1 {
+                    return Self::Skip;
+                }
+                let result = Self::from_tpe(args.index(0), known);
+                // Nested task/stream shapes and `void` are intentionally omitted until their
+                // generated ABI is covered explicitly.
+                if matches!(result, Self::Skip | Self::Void) || result.contains_async_shape() {
+                    return Self::Skip;
+                }
+                return Self::Task(Box::new(result));
+            }
+            if definition_name == "System.Threading.Tasks.ValueTask`1" {
+                let args = Type::virt0::<
+                    "GetGenericArguments",
+                    RustcCLRInteropManagedArray<Type, 1>,
+                >(tpe);
+                if args.len() != 1 {
+                    return Self::Skip;
+                }
+                let result = Self::from_tpe(args.index(0), known);
+                // Keep the first slice deliberately bounded to concrete scalar/reference/array
+                // results. Nested async shapes and `void` cannot be faithful result types.
+                if matches!(result, Self::Skip | Self::Void) || result.contains_async_shape() {
+                    return Self::Skip;
+                }
+                return Self::ValueTask(Box::new(result));
+            }
+            if definition_name == "System.Collections.Generic.IAsyncEnumerable`1" {
+                let args = Type::virt0::<
+                    "GetGenericArguments",
+                    RustcCLRInteropManagedArray<Type, 1>,
+                >(tpe);
+                if args.len() != 1 {
+                    return Self::Skip;
+                }
+                let element = Self::from_tpe(args.index(0), known);
+                // Nested async streams and task-shaped elements are intentionally outside this
+                // first generated surface; retain omission instead of guessing their ABI.
+                if matches!(element, Self::Skip | Self::Void) || element.contains_async_shape() {
+                    return Self::Skip;
+                }
+                return Self::AsyncEnumerable(Box::new(element));
+            }
             return Self::Skip;
         }
         let name = mstring_to_string(Type::virt0::<"get_FullName", MString>(tpe));
@@ -158,8 +241,8 @@ impl DType {
         if let Some(prim) = prim_for(&name) {
             return Self::Prim(prim);
         }
-        // Generic / nested / array types are dropped by the type-alias pass too -> not bound.
-        // (`[` backstops any array-shaped `FullName` the `get_IsArray` check above missed.)
+        // Generic / nested types are dropped by the type-alias pass too -> not bound.
+        // (`[` backstops any residual array-shaped `FullName` the checks above missed.)
         if name.contains('`') || name.contains('+') || name.contains('<') || name.contains('[') {
             return Self::Skip;
         }
@@ -177,12 +260,35 @@ impl DType {
         }
         Self::Class(name.replace('.', "::"))
     }
+    fn contains_async_shape(&self) -> bool {
+        match self {
+            Self::Task(_) | Self::ValueTask(_) | Self::AsyncEnumerable(_) => true,
+            Self::Array(element) => element.contains_async_shape(),
+            Self::Void | Self::Prim(_) | Self::Class(_) | Self::Skip => false,
+        }
+    }
     /// The Rust type spelling for this `DType`, or `None` if it must be skipped.
     fn rust_ty(&self) -> Option<String> {
         match self {
             DType::Void => Some("()".into()),
             DType::Prim(p) => Some((*p).into()),
             DType::Class(path) => Some(path.clone()),
+            DType::Array(elem) => Some(format!(
+                "mycorrhiza::intrinsics::RustcCLRInteropManagedArray<{}, 1>",
+                elem.rust_ty()?
+            )),
+            DType::Task(result) => Some(format!(
+                "mycorrhiza::task::TaskT<{}>",
+                result.rust_ty()?
+            )),
+            DType::ValueTask(result) => Some(format!(
+                "mycorrhiza::task::ValueTaskT<{}>",
+                result.rust_ty()?
+            )),
+            DType::AsyncEnumerable(element) => Some(format!(
+                "mycorrhiza::enumerate_async::IAsyncEnumerable<{}>",
+                element.rust_ty()?
+            )),
             DType::Skip => None,
         }
     }
@@ -277,10 +383,7 @@ fn reflect_methods(tpe: Type, is_valuetype: bool, known: &[String]) -> Vec<DotNe
     // DeclaredOnly behaviour by hand — keep only members whose `DeclaringType` is `tpe` itself.
 
     // --- Methods ------------------------------------------------------------
-    let methods = Type::instance0::<
-        "GetMethods",
-        RustcCLRInteropManagedArray<MethodInfo, 1>,
-    >(tpe);
+    let methods = Type::instance0::<"GetMethods", RustcCLRInteropManagedArray<MethodInfo, 1>>(tpe);
     let methods_len = methods.len();
     let mut m = 0;
     while m < methods_len {
@@ -295,10 +398,8 @@ fn reflect_methods(tpe: Type, is_valuetype: bool, known: &[String]) -> Vec<DotNe
     }
 
     // --- Constructors -------------------------------------------------------
-    let ctors = Type::instance0::<
-        "GetConstructors",
-        RustcCLRInteropManagedArray<ConstructorInfo, 1>,
-    >(tpe);
+    let ctors =
+        Type::instance0::<"GetConstructors", RustcCLRInteropManagedArray<ConstructorInfo, 1>>(tpe);
     let ctors_len = ctors.len();
     let mut c = 0;
     while c < ctors_len {
@@ -354,13 +455,10 @@ fn reflect_one_method(
     // whose call won't resolve, never emitted on a hot path. So we drop the check.)
     let is_static = MethodInfo::virt0::<"get_IsStatic", bool>(mi);
     let is_virtual = MethodInfo::virt0::<"get_IsVirtual", bool>(mi);
-    let is_abstract = MethodInfo::virt0::<"get_IsAbstract", bool>(mi);
     let dotnet_name = mstring_to_string(MethodInfo::virt0::<"get_Name", MString>(mi));
 
     let (params, ok) = reflect_params(
-        MethodInfo::instance0::<"GetParameters", RustcCLRInteropManagedArray<ParameterInfo, 1>>(
-            mi,
-        ),
+        MethodInfo::instance0::<"GetParameters", RustcCLRInteropManagedArray<ParameterInfo, 1>>(mi),
         known,
     );
     if !ok {
@@ -384,14 +482,6 @@ fn reflect_one_method(
     if !arity_supported(kind, argc) {
         return;
     }
-    // A pure virtual (abstract) method with args has no virtN>0 helper to fall back to.
-    // Use `matches!` (a `match`) rather than the derived `PartialEq` `==`: the codegen lowers a
-    // derived enum `==` into a `transmute::<u128, MethodKind>` (a 16-byte -> 1-byte transmute)
-    // that produces invalid IL.
-    if is_abstract && matches!(kind, MethodKind::Virtual) && argc != 0 {
-        return;
-    }
-
     let Some(rust_name) = rust_method_name(&dotnet_name) else {
         return;
     };
@@ -475,13 +565,11 @@ fn reflect_params(
 /// Whether the hand-written helper set covers this `(kind, argc)`:
 ///   static:   static0/1/2
 ///   instance: instance0/1/2  (argc excludes the receiver)
-///   virtual:  virt0  (argc==0); virtual w/ args falls through to instanceN below
+///   virtual:  virt0/1/2
 ///   ctor:     ctor0/1/2/3
 fn arity_supported(kind: MethodKind, argc: usize) -> bool {
     match kind {
         MethodKind::Static => argc <= 2,
-        // Virtual w/ args has no helper, but we emit it via instanceN (<=2). Pure
-        // virt0 covers argc==0. Either way the cap is 2.
         MethodKind::Instance | MethodKind::Virtual => argc <= 2,
         MethodKind::Ctor => argc <= 3,
     }
@@ -518,8 +606,24 @@ fn rust_method_name(dotnet_name: &str) -> Option<String> {
     // fn is a hard error. Includes the helper families and the hand-written convenience
     // methods (`new` is the ctor wrapper we synthesize separately).
     const RESERVED: &[&str] = &[
-        "ctor0", "ctor1", "ctor2", "ctor3", "static0", "static1", "static2", "instance0",
-        "instance1", "instance2", "virt0", "to_mstring", "equality", "null", "is_null", "new",
+        "ctor0",
+        "ctor1",
+        "ctor2",
+        "ctor3",
+        "static0",
+        "static1",
+        "static2",
+        "instance0",
+        "instance1",
+        "instance2",
+        "virt0",
+        "virt1",
+        "virt2",
+        "to_mstring",
+        "equality",
+        "null",
+        "is_null",
+        "new",
     ];
     if RESERVED.contains(&snake.as_str()) {
         return None;
@@ -602,8 +706,10 @@ impl Namespace {
             let depth = self.depth + 1;
             let curr_owned = curr.to_string();
             if !self.inner.iter().any(|(k, _)| *k == curr_owned) {
-                self.inner
-                    .push((curr_owned.clone(), Namespace::new(curr_owned.clone(), depth)));
+                self.inner.push((
+                    curr_owned.clone(),
+                    Namespace::new(curr_owned.clone(), depth),
+                ));
             }
             let child = self
                 .inner
@@ -616,11 +722,7 @@ impl Namespace {
             // Dedup by full name: the same type can be reflected from several assemblies (type
             // forwarding, e.g. `System.String` forwarded from `System.Runtime` to CoreLib). A
             // duplicate `pub type` would be a hard error, so the first one wins.
-            if self
-                .types
-                .iter()
-                .any(|t| t.full_name == tpe.full_name)
-            {
+            if self.types.iter().any(|t| t.full_name == tpe.full_name) {
                 return;
             }
             self.types.push(tpe);
@@ -738,11 +840,7 @@ impl Namespace {
         // generated file, generic over the target type, so every per-type `impl UpcastTo<Base>
         // for Derived` throughout this file's namespace tree shares it.
         if !in_mycorrhiza {
-            writeln!(
-                out,
-                "pub trait UpcastTo<T> {{ fn upcast(self) -> T; }}"
-            )
-            .unwrap();
+            writeln!(out, "pub trait UpcastTo<T> {{ fn upcast(self) -> T; }}").unwrap();
         }
         for (_, inner) in &self.inner {
             inner.export(out, in_mycorrhiza);
@@ -769,7 +867,12 @@ impl Namespace {
     /// `self`/`Self` sugar, call sites never spell `_Methods` — `<name>::method(..)` resolves via
     /// ordinary trait method lookup once the trait is in scope (a blanket
     /// `use <generated_module>::*;` is enough), identical to `mycorrhiza`'s own bindings.
-    fn export_methods(out: &mut impl Write, name: &str, methods: &[DotNetMethodDef], in_mycorrhiza: bool) {
+    fn export_methods(
+        out: &mut impl Write,
+        name: &str,
+        methods: &[DotNetMethodDef],
+        in_mycorrhiza: bool,
+    ) {
         if methods.is_empty() {
             return;
         }
@@ -833,7 +936,10 @@ fn render_signature(def: &DotNetMethodDef) -> Option<String> {
             } else {
                 format!(" -> {ret_ty}")
             };
-            Some(format!("    fn {rn}({arg_decls}){ret_sig}", rn = def.rust_name))
+            Some(format!(
+                "    fn {rn}({arg_decls}){ret_sig}",
+                rn = def.rust_name
+            ))
         }
         MethodKind::Instance | MethodKind::Virtual => {
             let ret_ty = ret.rust_ty()?;
@@ -847,7 +953,10 @@ fn render_signature(def: &DotNetMethodDef) -> Option<String> {
             } else {
                 format!("self, {arg_decls}")
             };
-            Some(format!("    fn {rn}({self_decls}){ret_sig}", rn = def.rust_name))
+            Some(format!(
+                "    fn {rn}({self_decls}){ret_sig}",
+                rn = def.rust_name
+            ))
         }
     }
 }
@@ -911,11 +1020,8 @@ fn render_wrapper(def: &DotNetMethodDef, pub_kw: &str) -> Option<String> {
             } else {
                 format!("self, {arg_decls}")
             };
-            // virtual + 0 args -> virt0 (covers property getters get_X); otherwise a
-            // non-virtual instanceN call (no virtN>0 helper exists).
-            let use_virt = matches!(def.kind, MethodKind::Virtual) && argc == 0;
-            let helper = if use_virt {
-                "virt0".to_string()
+            let helper = if matches!(def.kind, MethodKind::Virtual) {
+                format!("virt{argc}")
             } else {
                 format!("instance{argc}")
             };

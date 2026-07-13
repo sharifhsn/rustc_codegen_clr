@@ -6,6 +6,7 @@ use std::path::PathBuf;
 // edition their checked-in source actually satisfies.
 const STANDALONE_TEST_EDITION: &str = "2024";
 
+#[cfg(test)]
 fn assert_compile_succeeded(command: &str, output: &std::process::Output) {
     assert!(
         output.status.success(),

@@ -1,5 +1,8 @@
 # Rust/.NET productization plan
 
+> Long-term integration plan. The experimental 0.0.1 GitHub SDK release is governed by
+> [`RELEASE_BLOCKERS.md`](RELEASE_BLOCKERS.md), not by completion of every item here.
+
 Status: proposed execution plan
 
 Execution status (2026-07-11):
@@ -20,6 +23,10 @@ Execution status (2026-07-11):
   a cargo-dotnet-owned Cargo home, and an explicit build-local Cargo config. Ambient rust-src,
   registry sources, and user Cargo config remain unchanged in executable probes. The cross-process
   lock remains as a conservative cache-provisioning barrier until parallel acceptance is complete.
+- A deterministic host-specific SDK bundle now packages and verifies every source-derived install
+  input, atomically restores a repo-independent home, persists a per-file integrity lock, and rejects
+  tampering during `doctor` and builds. This closes the checkout dependency for consumers, but the
+  full Phase-1 offline distribution still needs rustup/.NET and registry-cache packaging.
 - The first Primary Offerings pilot is selected and specified in
   [PRIMARY_OFFERINGS_PILOT.md](PRIMARY_OFFERINGS_PILOT.md); checked-in integration remains gated on
   the hermetic build path.
@@ -111,7 +118,12 @@ The following are foundations to productize, not recreate:
 - `mycorrhiza` supplies raw bindings and idiomatic wrappers for a broad BCL surface.
 - `cargo dotnet add-nuget` can retrieve packages and generate bindings for a useful preview subset.
 - `feasibility/e2e_matrix.sh` distinguishes native differential, managed self-check, and managed
-  host acceptance cases.
+  host acceptance cases and writes explicit derived result rows. Special product scripts run through
+  `record_acceptance_result.sh`, which verifies the exact completion marker and writes one atomic
+  evidence file per command. `cargo dotnet capabilities` merges repeatable `--results` inputs and
+  rejects conflicts, undeclared scripted evidence, or markerless passes. Results are keyed by each
+  journey's explicit runtime/profile contract: incomplete coverage is `PARTIAL`, absent journeys
+  remain `NOT RUN`, and strict CI mode rejects both.
 
 Current implementation anchors:
 
@@ -119,9 +131,9 @@ Current implementation anchors:
   its managed C# host inventory is still small.
 - [`msbuild/RustDotnet.targets`](../msbuild/RustDotnet.targets) contains the current build,
   serialization, incremental-input, and managed-reference wiring.
-- [`tools/cargo-dotnet/src/pack.rs`](../tools/cargo-dotnet/src/pack.rs) contains the package writer;
-  it currently uses a random OPC part identifier, so identical-input packages are not yet
-  byte-for-byte deterministic.
+- [`tools/cargo-dotnet/src/pack.rs`](../tools/cargo-dotnet/src/pack.rs) contains the deterministic
+  package writer. Independent clean-tree acceptance compares every entry and the final `.nupkg`
+  bytes, including the managed DLL and derived provenance.
 - [`tools/cargo-dotnet/src/nuget.rs`](../tools/cargo-dotnet/src/nuget.rs) contains the preview NuGet
   importer; its dependency-group union and shallow transitive walk are intentionally not general
   NuGet resolution.
@@ -166,10 +178,11 @@ Work:
 - Reconcile the current rearchitecture working tree into reviewable changes or explicitly preserved
   generated artifacts.
 - Finish the post-Edition-2024 acceptance run.
-- Promote the typed end-to-end matrix into CI.
-- Define `acceptance/capabilities.toml` as the machine-readable inventory of journeys, platforms,
-  profiles, fixtures, oracle type, and expected artifacts.
-- Generate the human capability matrix from that manifest and test results.
+- Observe the unified release-scope evidence merge green in CI, then retain the immutable artifact.
+- Execute and retain the broader .NET 8/10 debug/release presubmit cells declared by each journey.
+- Keep `acceptance/capabilities.toml` as the machine-readable inventory of journeys, explicit
+  runtime/profile contracts, fixtures, evidence kinds, oracle types, and expected artifacts.
+- Generate the human capability matrix only from that manifest and validated result files.
 - Record hashes and metadata for the backend, toolchain, target specification, overlays, generated
   bindings, helper assemblies, and produced artifacts.
 - Run every acceptance case from a clean target directory and, where relevant, an empty NuGet cache.
@@ -217,6 +230,19 @@ Work:
 - Make debug information portable and consumer-ready: deterministic/path-mapped source paths,
   correct Portable PDB sequence points in debug and optimized builds, exception-break behavior,
   Source Link policy, and IDE launch/attach instructions.
+
+Current-tree evidence: `cargo dotnet bundle create|verify|install` now produces a deterministic,
+host-bound, checksummed SDK home that installs atomically outside the checkout and remains
+tamper-checked by every build and `doctor`; `install_bundle_acceptance.sh` exercises that path. This
+is not yet the whole-machine/offline toolchain distribution: rustup, .NET, and restored registry
+caches remain prerequisites. `pdb_consumer_acceptance.sh` now proves a normal C# host consumes the
+public Rust library PDB and resolves a Rust `file.rs:line` frame in debug and release. Remaining
+debug work is an actual IDE breakpoint, remote fetch, exception-break, optimized stepping, and
+locals-window oracle. Cargo-dotnet already remaps machine paths to stable logical roots and can now
+embed a standard, fingerprinted Source Link map for `/_/consumer/*`; the C# host parses it in both
+profiles. Whole-method LocalScope and named LocalVariable metadata are present and consumer-parsed;
+debug retains a known user local, while optimized builds do not promise every source local survives.
+Nested lexical scopes and multi-repository dependency/source maps are not modeled.
 
 Exit gate:
 
@@ -379,7 +405,9 @@ Acceptance package ladder:
 3. version range and conflict;
 4. `ref/` plus runtime implementation;
 5. multiple assemblies;
-6. async and generic APIs;
+6. async and generic APIs (closed generated `Task<T>`, `ValueTask<T>`, and `IAsyncEnumerable<T>`
+   returns are supported and directly consumable; arbitrary constructed and nested generics remain
+   a follow-on);
 7. interface/delegate callbacks;
 8. runtime/RID assets; and
 9. unsupported analyzer/source-generator/content-only packages with clear diagnostics.
@@ -405,7 +433,8 @@ Candidate gaps include:
 
 - by-reference generic `out` parameters;
 - carrying the managed exception object across the catch boundary;
-- async streams and coroutine-held managed handles;
+- async-stream production and coroutine-held managed handles (consumer-side `IAsyncEnumerable<T>`
+  iteration is shipped and matrix-proven);
 - remaining delegate arities and event shapes;
 - virtual/base-class behavior needed by framework integration;
 - nested generic return and value-type shapes; and

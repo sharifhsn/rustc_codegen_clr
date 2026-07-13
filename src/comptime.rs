@@ -25,6 +25,7 @@ use cilly::{
     Access, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, FieldDesc, Interned, MethodDef,
     MethodImpl, MethodRef, Type,
 };
+use cilly::{Const, EnumDef};
 use cilly::{Float, Int};
 use rustc_middle::mir::{Mutability, Rvalue, StatementKind, TerminatorKind};
 use rustc_middle::ty::adjustment::PointerCoercion;
@@ -53,6 +54,8 @@ struct PendingClass<'tcx> {
     /// separate list from `fields` above: static state is per-TYPE, not per-instance, so it never
     /// participates in the primary ctor's field-init parameter list.
     static_fields: Vec<(Type, String)>,
+    /// Packed `repr;Variant=value;...` metadata from `#[dotnet_enum]`.
+    enum_spec: Option<String>,
     /// Positional argument types the base class's `.ctor` requires, in order
     /// (`rustc_codegen_clr_add_base_ctor_arg`) — see that intrinsic's doc. Empty means "chain to a
     /// parameterless base `.ctor()`", the historical default.
@@ -385,6 +388,7 @@ pub fn interpret<'tcx>(
                         superclass,
                         fields: vec![],
                         static_fields: vec![],
+                        enum_spec: None,
                         base_ctor_arg_types: vec![],
                         methods: vec![],
                         static_methods: vec![],
@@ -422,6 +426,16 @@ pub fn interpret<'tcx>(
                     let tpe = get_type(field_ty, ctx);
                     let field_name = garg_to_string(subst_ref[1], ctx.tcx());
                     class.static_fields.push((tpe, field_name));
+                    ComptimeLocalVar::Class(class)
+                } else if fname.contains("rustc_codegen_clr_set_enum") {
+                    let src = operand_local(&args[0].node);
+                    let mut class = locals[src].as_class().clone();
+                    let spec = garg_to_string(subst_ref[0], ctx.tcx());
+                    assert!(
+                        class.enum_spec.is_none(),
+                        "comptime: enum metadata already set"
+                    );
+                    class.enum_spec = Some(spec);
                     ComptimeLocalVar::Class(class)
                 } else if fname.contains("rustc_codegen_clr_add_base_ctor_arg") {
                     let src = operand_local(&args[0].node);
@@ -958,6 +972,49 @@ fn byref_interface_sig<'tcx>(
     sig
 }
 
+fn decode_enum_spec<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, spec: &str) -> EnumDef {
+    let mut parts = spec.split(';');
+    let repr = parts
+        .next()
+        .expect("comptime: enum metadata is missing its repr");
+    let underlying = match repr {
+        "i8" => Int::I8,
+        "u8" => Int::U8,
+        "i16" => Int::I16,
+        "u16" => Int::U16,
+        "i32" => Int::I32,
+        "u32" => Int::U32,
+        "i64" => Int::I64,
+        "u64" => Int::U64,
+        other => panic!("comptime: unsupported CLR enum repr `{other}`"),
+    };
+    let variants = parts
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (name, value) = part
+                .split_once('=')
+                .expect("comptime: malformed enum variant metadata");
+            assert!(
+                !name.is_empty(),
+                "comptime: enum variant name cannot be empty"
+            );
+            let value = match underlying {
+                Int::I8 => Const::I8(value.parse().expect("comptime: invalid i8 enum value")),
+                Int::U8 => Const::U8(value.parse().expect("comptime: invalid u8 enum value")),
+                Int::I16 => Const::I16(value.parse().expect("comptime: invalid i16 enum value")),
+                Int::U16 => Const::U16(value.parse().expect("comptime: invalid u16 enum value")),
+                Int::I32 => Const::I32(value.parse().expect("comptime: invalid i32 enum value")),
+                Int::U32 => Const::U32(value.parse().expect("comptime: invalid u32 enum value")),
+                Int::I64 => Const::I64(value.parse().expect("comptime: invalid i64 enum value")),
+                Int::U64 => Const::U64(value.parse().expect("comptime: invalid u64 enum value")),
+                _ => unreachable!(),
+            };
+            (ctx.alloc_string(name.to_string()), value)
+        })
+        .collect();
+    EnumDef::new(underlying, variants)
+}
+
 /// Build and register the managed class, then attach its virtual methods (which alias the Rust fns).
 fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<'tcx>) {
     // Superclass reference (e.g. [System.Runtime]System.Object).
@@ -979,6 +1036,10 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         .collect();
 
     let name = ctx.alloc_string(class.name.clone());
+    let enum_def = class
+        .enum_spec
+        .as_deref()
+        .map(|spec| decode_enum_spec(ctx, spec));
     // Idempotent registration: a class may be described by more than one comptime entrypoint (e.g. the
     // `#[dotnet_class]` struct decl plus a `#[dotnet_methods]` impl block re-opening it). `class_def`
     // panics on a duplicate name, so if this class is already registered, reuse its `ClassDefIdx` and
@@ -1039,6 +1100,9 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             ctx.class_mut(existing)
                 .set_is_valuetype(class.is_value_type);
         }
+        if let Some(enum_def) = enum_def.clone() {
+            ctx.class_mut(existing).set_enum_def(enum_def);
+        }
         existing
     } else {
         // No existing class found: either this is the FIRST comptime entrypoint to touch this
@@ -1089,6 +1153,9 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         // above never applies to it.
         if class.is_interface {
             def = def.with_interface();
+        }
+        if let Some(enum_def) = enum_def {
+            def = def.with_enum(enum_def);
         }
         if !class.type_generics.is_empty() {
             let names = class

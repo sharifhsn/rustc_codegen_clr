@@ -1,5 +1,3 @@
-use std::ptr::null;
-
 use crate::ManagedSafe;
 
 /// A handle to a managed reference type, identified *only* by its `(ASSEMBLY, CLASS_PATH)` const
@@ -104,7 +102,7 @@ impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str>
         >(arg1, arg2, arg3)
     }
     /// A four-explicit-arg **static** call. Added specifically for
-    /// [`crate::dynamic::invoke_dynamic`] (`Mycorrhiza.Reflection.DynamicInvoker.InvokeStatic` takes
+    /// the dynamic invocation helpers (`Mycorrhiza.Reflection.DynamicInvoker.InvokeStatic` takes
     /// `(assemblyName, typeName, methodName, args)`) -- nothing else in the tree currently needs a
     /// static call past three explicit args, but the underlying `call4_` magic-fn family and the
     /// backend's `call_managed` dispatch are fully generic over arity (`argc_from_fn_name` reads the
@@ -155,6 +153,20 @@ impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str>
             Self,
             Arg1,
         >(self, arg1)
+    }
+    #[inline(always)]
+    pub fn virt2<const METHOD: &'static str, Arg1, Arg2, Ret>(self, arg1: Arg1, arg2: Arg2) -> Ret {
+        rustc_clr_interop_managed_call_virt3_::<
+            ASSEMBLY,
+            CLASS_PATH,
+            false,
+            METHOD,
+            false,
+            Ret,
+            Self,
+            Arg1,
+            Arg2,
+        >(self, arg1, arg2)
     }
     #[inline(always)]
     pub fn instance2<const METHOD: &'static str, Arg1, Arg2, Ret>(
@@ -306,6 +318,11 @@ interop_magic_fn! {
     rustc_clr_interop_managed_call_virt2_
     [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const IS_STATIC: bool, Ret]
     (arg1: Arg1, arg2: Arg2) -> Ret
+}
+interop_magic_fn! {
+    rustc_clr_interop_managed_call_virt3_
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const IS_STATIC: bool, Ret]
+    (arg1: Arg1, arg2: Arg2, arg3: Arg3) -> Ret
 }
 //Ctors
 interop_magic_fn! {
@@ -517,6 +534,11 @@ interop_magic_fn! {
     [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const KIND: u8, ClassGenerics, Sig, Ret]
     (arg1: Arg1, arg2: Arg2, arg3: Arg3) -> Ret
 }
+interop_magic_fn! {
+    rustc_clr_interop_generic_call4
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, const KIND: u8, ClassGenerics, Sig, Ret]
+    (arg1: Arg1, arg2: Arg2, arg3: Arg3, arg4: Arg4) -> Ret
+}
 
 // Generic-METHOD calls (`!!N`): a method that itself takes type arguments (e.g.
 // `Activator.CreateInstance<T>()`, `Deserialize<T>(s)`, `GetService<T>()`). Identical to the
@@ -592,9 +614,10 @@ interop_magic_fn! {
 // ===========================================================================================
 
 /// Wraps the native fn pointer `f` into a managed delegate of the instantiation
-/// `{ASSEMBLY}{CLASS_PATH}<ClassGenerics..>` (e.g. `System.Func`2<i32,bool>`). Returns the delegate
-/// as a [`RustcCLRInteropManagedGeneric`] handle (a managed object reference), which can be passed to
-/// any .NET method taking that delegate type, or invoked via the generic bridge's `Invoke` wrapper.
+/// `{ASSEMBLY}{CLASS_PATH}<ClassGenerics..>` (e.g. `System.Func<i32, bool>`). `Ret` is the Rust-side
+/// managed-handle marker for that exact delegate: normally [`RustcCLRInteropManagedGeneric`], or a
+/// generated concrete handle for a non-generic delegate such as `System.EventHandler`. The backend
+/// returns the actual managed delegate reference, which can be passed to a .NET method or invoked.
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_delegate<
@@ -604,17 +627,19 @@ pub fn rustc_clr_interop_delegate<
     ClassGenerics,
     Sig,
     FnPtrTy,
+    Ret,
 >(
     f: FnPtrTy,
-) -> RustcCLRInteropManagedGeneric<ASSEMBLY, CLASS_PATH, ClassGenerics> {
+) -> Ret {
     core::intrinsics::abort();
 }
 
 /// Wraps a **capturing** closure into a managed delegate: `env` is a boxed-environment pointer and
-/// `trampoline` an `extern "C" fn(env, In..) -> Ret` that reconstructs the closure and calls it. The
+/// `trampoline` an `extern "C" fn(env, In..) -> CallbackRet` that reconstructs and calls it. The
 /// backend synthesises a shim holding both, whose `Invoke` prepends `env` before the `calli`, so the
 /// captured state rides along on the .NET side. Generic layout mirrors [`rustc_clr_interop_delegate`]
-/// with an extra `EnvTy` before the fn-ptr type.
+/// with an extra `EnvTy` before the fn-ptr type; its `Ret` is the exact managed-delegate handle
+/// marker described there.
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_delegate_closure<
@@ -625,10 +650,11 @@ pub fn rustc_clr_interop_delegate_closure<
     Sig,
     EnvTy,
     FnPtrTy,
+    Ret,
 >(
     env: EnvTy,
     trampoline: FnPtrTy,
-) -> RustcCLRInteropManagedGeneric<ASSEMBLY, CLASS_PATH, ClassGenerics> {
+) -> Ret {
     core::intrinsics::abort();
 }
 
@@ -675,6 +701,44 @@ impl<T> RustcCLRInteropManagedArray<T, 1> {
     }
     pub fn is_empty(self) -> bool {
         self.len() == 0
+    }
+
+    /// Allocate a GC-owned one-dimensional managed array and copy `slice` into it.
+    ///
+    /// This is the ordinary boundary helper for generated .NET APIs that accept `T[]`.
+    /// `T` must be a boundary-safe primitive, value type, or managed-reference handle.
+    pub fn from_slice(slice: &[T]) -> Self
+    where
+        T: Copy + ManagedSafe,
+    {
+        let len = i32::try_from(slice.len()).expect("managed array length exceeds i32");
+        let array = rustc_clr_interop_managed_new_arr::<T>(len);
+        for (idx, value) in slice.iter().copied().enumerate() {
+            rustc_clr_interop_managed_set_elem(array, idx as i32, value);
+        }
+        array
+    }
+
+    /// Replace one element of this one-dimensional managed array.
+    pub fn set(self, index: i32, value: T)
+    where
+        T: ManagedSafe,
+    {
+        rustc_clr_interop_managed_set_elem(self, index, value);
+    }
+}
+
+impl RustcCLRInteropManagedArray<u8, 1> {
+    /// Encode UTF-8 bytes into a GC-owned `System.Byte[]`.
+    pub fn from_utf8(value: &str) -> Self {
+        Self::from_slice(value.as_bytes())
+    }
+
+    /// Decode this `System.Byte[]` with `System.Text.Encoding.UTF8`.
+    pub fn to_utf8_string(self) -> String {
+        let encoding = crate::bindings::System::Text::Encoding::get_utf8();
+        let managed = encoding.instance1::<"GetString", Self, crate::system::MString>(self);
+        String::from(crate::system::DotNetString::from_handle(managed))
     }
 }
 impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str>

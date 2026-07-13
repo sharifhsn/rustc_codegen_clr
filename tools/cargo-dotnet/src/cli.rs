@@ -4,14 +4,14 @@
 //!   * `cargo dotnet <cmd>` (real cargo dispatch) -> argv `[cargo-dotnet, dotnet, <cmd>, ...]`
 //!   * `cargo-dotnet <cmd>` (direct, e.g. dev.sh / MSBuild) -> argv `[cargo-dotnet, <cmd>, ...]`
 //!
-//! `main` peeks argv[1] and drops a leading `dotnet`, then parses `DotnetCli` directly.
+//! `main` peeks `argv[1]` and drops a leading `dotnet`, then parses `DotnetCli` directly.
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
 /// The `cargo`-subcommand wrapper. Under genuine `cargo dotnet` dispatch, cargo
-/// prepends the subcommand name (`dotnet`) as argv[1]; this enum absorbs it. It is
+/// prepends the subcommand name (`dotnet`) as `argv[1]`; this enum absorbs it. It is
 /// kept for the idiomatic `cargo dotnet --help` path, but `main` normalises argv and
 /// parses `DotnetCli` directly (so the direct `cargo-dotnet <cmd>` form also works).
 #[derive(Parser)]
@@ -39,6 +39,10 @@ pub struct DotnetCli {
 
 #[derive(Subcommand)]
 pub enum Cmd {
+    /// Validate the product capability manifest and generate a human-readable report.
+    Capabilities(CapabilitiesArgs),
+    /// Populate and verify the private Cargo cache and injected sysroot for later offline builds.
+    Restore(BuildArgs),
     /// Build a Rust crate into a .NET assembly (exe apphost or C#-referenceable .dll).
     Build(BuildArgs),
     /// Build a Rust crate and run it on .NET (forwards exit code; args after `--`).
@@ -51,6 +55,8 @@ pub enum Cmd {
     Test(BuildArgs),
     /// Provision the toolchain + install home, then install this binary to ~/.cargo/bin.
     Setup(SetupArgs),
+    /// Create, verify, or atomically install a checksummed repo-independent SDK bundle.
+    Bundle(BundleArgs),
     /// Build a crate's cdylib and produce a NuGet .nupkg of its .NET assembly.
     Pack(PackArgs),
     /// Push an already-signed NuGet package under immutable release rules.
@@ -69,6 +75,79 @@ pub enum Cmd {
     ValidateManagedIdentities(ValidateManagedIdentitiesArgs),
     /// Print the CLR assembly name selected for one Rust crate (metadata identity or Cargo name).
     ManagedAssemblyName(ManagedAssemblyNameArgs),
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum CapabilitiesFormat {
+    Markdown,
+    Json,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum CapabilitiesEvidenceScope {
+    Presubmit,
+    Release,
+}
+
+#[derive(clap::Args)]
+pub struct CapabilitiesArgs {
+    /// Capability manifest to validate and report.
+    #[arg(long, default_value = "acceptance/capabilities.toml")]
+    pub manifest: PathBuf,
+    /// Acceptance result TSV. Repeat to merge independent matrix/script evidence files.
+    #[arg(long)]
+    pub results: Vec<PathBuf>,
+    /// Exit nonzero unless every presubmit journey has complete passing runtime/profile evidence.
+    /// The report is still written, so CI retains the diagnostic artifact.
+    #[arg(long)]
+    pub strict: bool,
+    /// Runtime/profile coverage contract used to classify PASS/PARTIAL and by `--strict`.
+    #[arg(long, value_enum, default_value = "presubmit")]
+    pub evidence_scope: CapabilitiesEvidenceScope,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "markdown")]
+    pub format: CapabilitiesFormat,
+    /// Write the report to a file instead of stdout.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+pub struct BundleArgs {
+    #[command(subcommand)]
+    pub command: BundleCommand,
+}
+
+#[derive(Subcommand)]
+pub enum BundleCommand {
+    /// Archive a provisioned CARGO_DOTNET_HOME plus this cargo-dotnet executable.
+    Create {
+        /// Provisioned install home (default: CARGO_DOTNET_HOME or ~/.cargo-dotnet).
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// Destination .zip file.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Verify structure, host metadata, sizes, and SHA-256 hashes without installing.
+    Verify {
+        /// Bundle .zip to verify.
+        archive: PathBuf,
+    },
+    /// Verify and atomically restore a bundle into CARGO_DOTNET_HOME.
+    Install {
+        /// Bundle .zip to install.
+        archive: PathBuf,
+        /// Destination install home (default: CARGO_DOTNET_HOME or ~/.cargo-dotnet).
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// Replace an existing install home after the replacement verifies successfully.
+        #[arg(long)]
+        force: bool,
+        /// Do not copy the bundled cargo-dotnet executable into CARGO_HOME/bin.
+        #[arg(long)]
+        no_install_cli: bool,
+    },
 }
 
 #[derive(clap::Args)]
@@ -107,11 +186,21 @@ pub struct BuildArgs {
     /// Execution backend: `native` (default installed) or `docker` (in-repo dev).
     #[arg(long, env = "CARGO_DOTNET_BACKEND")]
     pub backend: Option<String>,
-    /// Target .NET runtime version: `8`, `9`, or `10` (default 10).
+    /// Target .NET runtime version. The 0.0.1 SDK supports `10`.
     /// sets `DOTNET_VERSION` for the codegen backend + linker, and stamps the runtimeconfig / TFM /
     /// `.assembly extern .ver`.
-    #[arg(long, value_name = "8|9|10", default_value = "10", env = "DOTNET_VERSION")]
+    #[arg(long, value_name = "10", default_value = "10", env = "DOTNET_VERSION")]
     pub dotnet: String,
+
+    /// HTTPS Source Link template for this crate's remapped `/_/consumer/*` documents.
+    /// Include exactly one `*`, for example
+    /// `https://raw.githubusercontent.com/org/repo/<commit>/*`.
+    #[arg(
+        long,
+        value_name = "HTTPS_URL_WITH_*",
+        env = "CARGO_DOTNET_SOURCE_LINK_URL"
+    )]
+    pub source_link_url: Option<String>,
 
     // ---- standard cargo flag groups (clap-cargo) — forwarded to the inner cargo ----
     #[command(flatten)]
@@ -151,7 +240,7 @@ pub enum Template {
     App,
     /// A Rust cdylib + C# consumer via export_rust_containers! (models cd_containers).
     Lib,
-    /// A #[dotnet_class] managed type + C# host (models cd_typedef).
+    /// A `#[dotnet_class]` managed type + C# host (models cd_typedef).
     Plugin,
 }
 
@@ -184,6 +273,16 @@ pub struct NewArgs {
     /// Override the crate name (default: the final path component).
     #[arg(long)]
     pub name: Option<String>,
+
+    /// Runtime profile embedded in generated C# projects and printed run commands.
+    #[arg(
+        long,
+        value_name = "10",
+        default_value = "10",
+        value_parser = ["10"],
+        env = "DOTNET_VERSION"
+    )]
+    pub dotnet: String,
 }
 
 impl NewArgs {
@@ -209,6 +308,22 @@ pub struct DoctorArgs {
     /// consulted in environment-check mode (ignored when translating a failure).
     #[arg(long, default_value = ".")]
     pub workspace: PathBuf,
+
+    /// Runtime profile whose installation and workspace wiring should be checked.
+    #[arg(
+        long,
+        value_name = "10",
+        default_value = "10",
+        value_parser = ["10"],
+        env = "DOTNET_VERSION"
+    )]
+    pub dotnet: String,
+
+    /// Emit a stable, machine-readable JSON report instead of human-oriented text.
+    /// The command's exit code is unchanged: environment reports return 1 when a
+    /// required check fails, while failure-translation reports return 0.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Args)]
@@ -246,7 +361,7 @@ pub struct PackArgs {
     /// Override the NuGet package version (default: the crate version).
     #[arg(long)]
     pub version: Option<String>,
-    /// Output directory (default: <crate>/target/nupkg).
+    /// Output directory (default: `<crate>/target/nupkg`).
     #[arg(long)]
     pub out: Option<PathBuf>,
     /// Inspect the completed OPC/NuGet structure and fail before reporting success if required
@@ -265,10 +380,17 @@ pub struct PackArgs {
     /// Expected SHA-256 signer certificate fingerprint (hex, separators ignored).
     #[arg(long, value_name = "SHA256", requires = "sign_certificate")]
     pub signer_fingerprint: Option<String>,
-    /// Target .NET runtime version for the package: `8`, `9`, or `10` (default 10).
+    /// Target .NET runtime version for the package. The 0.0.1 SDK supports `10`.
     /// `DOTNET_VERSION` + ilasm and the NuGet TFM (`lib/<tfm>/`), which must agree with the dll.
-    #[arg(long, value_name = "8|9|10", default_value = "10", env = "DOTNET_VERSION")]
+    #[arg(long, value_name = "10", default_value = "10", env = "DOTNET_VERSION")]
     pub dotnet: String,
+    /// HTTPS Source Link template embedded in the package's Portable PDB.
+    #[arg(
+        long,
+        value_name = "HTTPS_URL_WITH_*",
+        env = "CARGO_DOTNET_SOURCE_LINK_URL"
+    )]
+    pub source_link_url: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -304,8 +426,12 @@ pub struct AddNugetArgs {
     /// the resulting runtime/native/resource paths and provenance in its asset manifest.
     #[arg(long)]
     pub rid: Option<String>,
+    /// NuGet package source to use for restore. Repeat to provide the complete source set; when
+    /// present, these override sources from NuGet.Config (matching `dotnet restore --source`).
+    #[arg(long, value_name = "PATH_OR_URL")]
+    pub source: Vec<String>,
     /// Target framework used for SDK restore and the reflection bindgen executable.
-    #[arg(long, value_name = "8|9|10", default_value = "10", env = "DOTNET_VERSION")]
+    #[arg(long, value_name = "10", default_value = "10", env = "DOTNET_VERSION")]
     pub dotnet: String,
     /// Unfiltered build log for the bindgen step.
     #[arg(short, long)]
@@ -326,12 +452,12 @@ pub struct PublishArgs {
     /// A C# host project: either its directory (containing exactly one `.csproj`) or
     /// the `.csproj` file itself. Default `.`. The project must `<Import>`
     /// `RustDotnet.targets` and declare its `<RustCrate>` (see any `cargo_tests/cd_*/csharp`
-    /// project, or scaffold one with `cargo dotnet new --app`) — `dotnet publish` builds
+    /// project, or scaffold one with `cargo dotnet new --lib` / `--plugin`) — `dotnet publish` builds
     /// the referenced Rust crate as part of the same invocation via that import.
     pub path: Option<PathBuf>,
 
     /// Target .NET runtime profile. Controls the Rust contract, host TFM, and reported output.
-    #[arg(long, value_name = "8|9|10", default_value = "10", env = "DOTNET_VERSION")]
+    #[arg(long, value_name = "10", default_value = "10", env = "DOTNET_VERSION")]
     pub dotnet: String,
 
     /// Debug configuration (default: Release — NativeAOT publishing a Debug build is
@@ -344,6 +470,11 @@ pub struct PublishArgs {
     /// apply — NativeAOT generally needs platform-matching build tools).
     #[arg(long)]
     pub rid: Option<String>,
+
+    /// Write the publish tree to this directory instead of the SDK's
+    /// `bin/<configuration>/<tfm>/<rid>/publish` default.
+    #[arg(short = 'o', long, value_name = "DIR")]
+    pub output: Option<PathBuf>,
 
     /// Unfiltered `dotnet publish` output (prints the invoked command line too).
     #[arg(short, long)]

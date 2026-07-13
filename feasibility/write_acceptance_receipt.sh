@@ -23,6 +23,14 @@ if [[ ! -f "$summary" ]]; then
     echo "acceptance summary does not exist: $summary" >&2
     exit 2
 fi
+IFS= read -r summary_header < "$summary" || true
+case "$summary_header" in
+    'kind|dotnet|profile|case|'*) ;;
+    *)
+        echo "acceptance summary is not runtime/profile-aware; regenerate it with e2e_matrix.sh" >&2
+        exit 2
+        ;;
+esac
 
 sha="$(git -C "$repo" rev-parse HEAD)"
 if [[ -n "$(git -C "$repo" status --porcelain --untracked-files=all)" ]]; then
@@ -36,6 +44,13 @@ dotnet_version="$(dotnet --version 2>&1 || true)"
 host_os="$(uname -s)"
 host_arch="$(uname -m)"
 summary_hash="$(hash_file "$summary")"
+matrix_dotnet="$(awk -F'|' 'NR > 1 && $2 != "" { print $2 }' "$summary" | LC_ALL=C sort -u | paste -sd, -)"
+matrix_profiles="$(awk -F'|' 'NR > 1 && $3 != "" { print $3 }' "$summary" | LC_ALL=C sort -u | paste -sd, -)"
+capability_report="${summary%.*}.capabilities.md"
+capability_report_hash=""
+if [[ -f "$capability_report" ]]; then
+    capability_report_hash="$(hash_file "$capability_report")"
+fi
 manifest_hash="$(hash_file "$repo/acceptance/capabilities.toml")"
 generated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 logs_hash=""
@@ -60,6 +75,10 @@ jq -n \
     --arg command "${RCL_MATRIX_COMMAND:-feasibility/e2e_matrix.sh}" \
     --arg summary "$summary" \
     --arg summary_sha256 "$summary_hash" \
+    --arg matrix_dotnet "$matrix_dotnet" \
+    --arg matrix_profiles "$matrix_profiles" \
+    --arg capability_report "$capability_report" \
+    --arg capability_report_sha256 "$capability_report_hash" \
     --arg manifest "acceptance/capabilities.toml" \
     --arg manifest_sha256 "$manifest_hash" \
     --arg log_dir "$log_dir" \
@@ -73,6 +92,11 @@ jq -n \
         command: $command,
         manifest: {path: $manifest, sha256: $manifest_sha256},
         summary: {path: $summary, sha256: $summary_sha256},
+        matrix: {
+            dotnet: ($matrix_dotnet | split(",") | map(select(length > 0))),
+            profiles: ($matrix_profiles | split(",") | map(select(length > 0)))
+        },
+        capability_report: {path: $capability_report, sha256: $capability_report_sha256},
         logs: {path: $log_dir, manifest_sha256: $logs_sha256}
     }' > "$receipt"
 

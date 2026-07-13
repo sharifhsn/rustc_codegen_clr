@@ -1,4 +1,4 @@
-//! Idiomatic Rust wrapper over the static .NET class [`System.Environment`] (assembly
+//! Idiomatic Rust wrapper over the static .NET class `System.Environment` (assembly
 //! `System.Private.CoreLib`) — process/OS information and environment-variable access, spelled the
 //! way a Rust programmer expects (`std::env`-flavoured names, `&str` in, `String`/`Option<String>`
 //! out).

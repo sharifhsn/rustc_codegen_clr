@@ -1,0 +1,97 @@
+---
+name: Release
+
+on:
+  push:
+    tags: ['rust-dotnet-v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bundle:
+    name: Bundle ${{ matrix.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: linux-x64
+            runner: ubuntu-22.04
+          - host: macos-arm64
+            runner: macos-14
+          - host: windows-x64
+            runner: windows-2022
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      DOTNET_VERSION: '10'
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Validate release identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#rust-dotnet-v}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          manifest_version="$(awk -F '"' '/^version = / { print $2; exit }' tools/cargo-dotnet/Cargo.toml)"
+          [[ "$manifest_version" == "$version" ]]
+      - name: Build compiler and installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --workspace
+          cargo +stable build --release --manifest-path tools/cargo-dotnet/Cargo.toml
+      - name: Stage, build, and install-test SDK bundle
+        shell: bash
+        env:
+          RCL_RELEASE_HOST: ${{ matrix.host }}
+          RCL_RELEASE_VERSION: ${{ github.ref_name }}
+          RCL_RELEASE_WORK_DIR: ${{ runner.temp }}/rust-dotnet-release
+        run: |
+          set -euo pipefail
+          RCL_RELEASE_VERSION="${RCL_RELEASE_VERSION#rust-dotnet-v}"
+          export RCL_RELEASE_VERSION
+          bash feasibility/release_bundle.sh
+      - name: Upload release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.host }}
+          if-no-files-found: error
+          path: ${{ runner.temp }}/rust-dotnet-release/release-assets/*
+
+  publish:
+    name: Publish GitHub release
+    needs: bundle
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Download release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Add installers
+        run: cp install.sh install.ps1 release-assets/
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "rust-dotnet ${GITHUB_REF_NAME#rust-dotnet-v}" \
+            --notes-file docs/RELEASE_NOTES_0.0.1.md \
+            --prerelease \
+            --verify-tag

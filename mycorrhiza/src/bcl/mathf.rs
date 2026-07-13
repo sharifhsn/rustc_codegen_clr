@@ -1,4 +1,4 @@
-//! Idiomatic Rust over [`System.Math`] — the .NET double-precision math routines
+//! Idiomatic Rust over `System.Math` — the .NET double-precision math routines
 //! (`System.Private.CoreLib`), used like Rust's own `f64` methods and `std::f64::consts`.
 //!
 //! `System.Math` is a *static* class (a namespace of `static` methods and `const` fields), so there is
@@ -15,7 +15,7 @@
 //! assert!((Math::PI - 3.141592653589793).abs() < 1e-12);
 //! ```
 //!
-//! **Why a newtype and not the raw binding.** The generated low-level [`crate::Math`] binding already
+//! **Why a newtype and not the raw binding.** The generated low-level `System.Math` binding already
 //! carries an `impl` on the underlying managed type, and it exposes only *one* overload per name (its
 //! `abs`/`max`/`min` resolve to the `i16`/`u8` overloads, not `double`). This module is an independent,
 //! idiomatic `f64` surface: a distinct zero-sized [`Math`] whose methods name the `double` overload

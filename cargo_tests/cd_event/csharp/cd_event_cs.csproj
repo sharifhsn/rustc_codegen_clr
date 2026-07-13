@@ -8,8 +8,8 @@
     <AssemblyName>cd_event_cs</AssemblyName>
   </PropertyGroup>
 
-  <!-- AUTO-BUILD the Rust crate and reference its `cd_event.dll` (which `.override`s
-       System.Object.ToString()). -->
+  <!-- AUTO-BUILD the Rust crate and reference its `cd_event.dll`, whose direct-PE metadata links
+       add_Changed/remove_Changed into a genuine System.Action event. -->
   <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
           Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
   <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"

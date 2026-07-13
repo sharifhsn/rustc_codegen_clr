@@ -19,14 +19,19 @@
 //!
 //! Everything is built from the ordinary managed-interop primitives (static calls, `newarr`/`stelem`,
 //! `castclass`, and the value→`object` `box`). The pieces of a real predicate are all here:
-//! **parameters** ([`Param`]), **member access** ([`Expr::prop`] — `x.Age`), **value-** and
-//! **string-constants** ([`Expr::const_i32`]/[`Expr::const_str`]), **comparison/logical** combinators,
-//! and a **[`Expr::lambda`]**. A built tree can be inspected ([`Lambda::text`] = `Expression.ToString`,
-//! what a query provider translates) AND executed end-to-end ([`Lambda::compile`] then
-//! [`Compiled::call_str`]/[`Compiled::call_i32`], returning the real boolean).
+//! **parameters** ([`Param`](crate::linq::Param)), **member access**
+//! ([`Expr::prop`](crate::linq::Expr::prop) — `x.Age`), **value-** and **string-constants**
+//! ([`Expr::const_i32`](crate::linq::Expr::const_i32)/
+//! [`Expr::const_str`](crate::linq::Expr::const_str)), **comparison/logical** combinators, and a
+//! **[`Expr::lambda`](crate::linq::Expr::lambda)**. A built tree can be inspected
+//! ([`Lambda::text`](crate::linq::Lambda::text) = `Expression.ToString`, what a query provider
+//! translates) AND executed end-to-end ([`Lambda::compile`](crate::linq::Lambda::compile) then
+//! [`Compiled::call_str`](crate::linq::Compiled::call_str)/
+//! [`Compiled::call_i32`](crate::linq::Compiled::call_i32), returning the real boolean).
 //!
-//! The full **EF `IQueryable.Where` handoff** is also here ([`IntQuery`]): a strongly-typed
-//! `Expression<Func<int,bool>>` (built via the *generic* `Expression.Lambda<T>` — [`Expr::typed_pred`])
+//! The full **EF `IQueryable.Where` handoff** is also here ([`IntQuery`](crate::linq::IntQuery)): a
+//! strongly-typed `Expression<Func<int,bool>>` (built via the *generic* `Expression.Lambda<T>` —
+//! [`Expr::typed_pred`](crate::linq::Expr::typed_pred))
 //! is passed to `Queryable.Where<int>`, exactly as EF Core consumes a predicate to translate to SQL.
 //! ```ignore
 //! let n = IntQuery::range(1, 10)                                    // IQueryable<int> over 1..=10
@@ -272,7 +277,7 @@ pub use crate::dotnet_namespace;
 /// `#[dotnet(name = "...")]`), and joining three `&'static str` consts into one at Rust-const-eval time
 /// would need `concat!`, which only accepts literals — not references to another item's `const`. Since
 /// [`Param::new`] already takes a plain (non-const) `&str`, the join happens with an ordinary runtime
-/// `format!` inside [`Field::type_name_spec`], not at const-evaluation time; this keeps `Field::new`
+/// `format!` inside `Field::type_name_spec`, not at const-evaluation time; this keeps `Field::new`
 /// itself a `const fn` (so `#[dotnet_entity]` can still emit the whole singleton, one `Field::new(..)`
 /// per field, as a single `const` value) while letting each piece resolve independently.
 ///
@@ -733,7 +738,7 @@ fn rebind_param(body: Expr, from: Param, to: Param) -> Expr {
 /// `!pred_a` — regardless of whether they were built against the SAME or DIFFERENT [`Param`] instances.
 /// When different (the common case: two independently-authored builder functions each calling
 /// `Param::new` on their own), the combinator transparently rewrites the right-hand side's parameter
-/// references to the left-hand side's parameter (see [`rebind_param`]) before combining — this is the
+/// references to the left-hand side's parameter (see `rebind_param`) before combining — this is the
 /// actual, LINQKit-equivalent fix for the "two `ParameterExpression` instances" problem, not a shortcut.
 pub struct TypedPredicate<T> {
     body: Expr,
@@ -777,7 +782,7 @@ impl<T> TypedPredicate<T> {
     /// .NET type or `Field` to build against: the internal `Param` is built against `System.Object`
     /// (always `Type.GetType`-resolvable, regardless of what `T` is) — sound because the body never
     /// performs a member access on the parameter, and combining this predicate with a real one via
-    /// `&`/`|` rebinds parameter identity structurally (see [`Self::combine`]/`rebind_param`), never
+    /// `&`/`|` rebinds parameter identity structurally (see `Self::combine`/`rebind_param`), never
     /// relying on the two operands' parameters sharing a declared .NET type. Calling `.compile()`
     /// directly on a bare `always()` (without combining it into anything) also works standalone —
     /// `Func<object,bool>` is a perfectly real, executable delegate.

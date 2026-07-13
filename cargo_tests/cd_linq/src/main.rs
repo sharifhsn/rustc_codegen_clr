@@ -5,8 +5,8 @@
 #![allow(internal_features, incomplete_features, dead_code)]
 
 use mycorrhiza::intrinsics::{
-    rustc_clr_interop_generic_method_call1, rustc_clr_interop_generic_method_call2,
     RustcCLRInteropManagedGeneric, RustcCLRInteropMethodGeneric,
+    rustc_clr_interop_generic_method_call1, rustc_clr_interop_generic_method_call2,
 };
 use mycorrhiza::prelude::*;
 use mycorrhiza::system::console::Console;
@@ -14,33 +14,68 @@ use mycorrhiza::system::console::Console;
 const CORELIB: &str = "System.Private.CoreLib";
 const LINQ: &str = "System.Linq";
 const ENUMERABLE: &str = "System.Linq.Enumerable";
-type IEnum<T> = RustcCLRInteropManagedGeneric<CORELIB, "System.Collections.Generic.IEnumerable", (T,)>;
+type IEnum<T> =
+    RustcCLRInteropManagedGeneric<CORELIB, "System.Collections.Generic.IEnumerable", (T,)>;
 type FuncTB<T> = RustcCLRInteropManagedGeneric<CORELIB, "System.Func", (T, bool)>;
 // def-shape method-generic markers
-type IEnumM = RustcCLRInteropManagedGeneric<CORELIB, "System.Collections.Generic.IEnumerable", (RustcCLRInteropMethodGeneric<0>,)>;
-type FuncM = RustcCLRInteropManagedGeneric<CORELIB, "System.Func", (RustcCLRInteropMethodGeneric<0>, bool)>;
+type IEnumM = RustcCLRInteropManagedGeneric<
+    CORELIB,
+    "System.Collections.Generic.IEnumerable",
+    (RustcCLRInteropMethodGeneric<0>,),
+>;
+type FuncM =
+    RustcCLRInteropManagedGeneric<CORELIB, "System.Func", (RustcCLRInteropMethodGeneric<0>, bool)>;
 
 // Enumerable.Count<T>(IEnumerable<T>) -> int
 fn linq_count(src: IEnum<i32>) -> i32 {
     rustc_clr_interop_generic_method_call1::<
-        LINQ, ENUMERABLE, false, "Count", 0, (), (i32,),
-        (i32, IEnumM), i32, IEnum<i32>,
+        LINQ,
+        ENUMERABLE,
+        false,
+        "Count",
+        0,
+        (),
+        (i32,),
+        (i32, IEnumM),
+        i32,
+        IEnum<i32>,
     >(src)
 }
 // Enumerable.Where<T>(IEnumerable<T>, Func<T,bool>) -> IEnumerable<T>
 fn linq_where(src: IEnum<i32>, pred: FuncTB<i32>) -> IEnum<i32> {
     rustc_clr_interop_generic_method_call2::<
-        LINQ, ENUMERABLE, false, "Where", 0, (), (i32,),
-        (IEnumM, IEnumM, FuncM), IEnum<i32>, IEnum<i32>, FuncTB<i32>,
+        LINQ,
+        ENUMERABLE,
+        false,
+        "Where",
+        0,
+        (),
+        (i32,),
+        (IEnumM, IEnumM, FuncM),
+        IEnum<i32>,
+        IEnum<i32>,
+        FuncTB<i32>,
     >(src, pred)
 }
 
 fn main() -> std::process::ExitCode {
-    let mut pass = 0u32; let mut total = 0u32;
-    macro_rules! chk { ($g:expr,$w:expr) => {{ total+=1; if $g==$w {pass+=1;} else {Console::writeln_u64(900_000_000+total as u64);} }}; }
+    let mut pass = 0u32;
+    let mut total = 0u32;
+    macro_rules! chk {
+        ($g:expr,$w:expr) => {{
+            total += 1;
+            if $g == $w {
+                pass += 1;
+            } else {
+                Console::writeln_u64(900_000_000 + total as u64);
+            }
+        }};
+    }
 
     let mut list: List<i32> = List::new();
-    for v in [1, 2, 3, 4, 5, 6] { list.push(v); }
+    for v in [1, 2, 3, 4, 5, 6] {
+        list.push(v);
+    }
     let src: IEnum<i32> = mycorrhiza::enumerate::as_enum_handle::<_, i32>(list.handle());
 
     // Count over the whole thing.
@@ -59,5 +94,10 @@ fn main() -> std::process::ExitCode {
 
     Console::writeln_u64(pass as u64);
     Console::writeln_u64(total as u64);
-    if pass == total { std::process::ExitCode::SUCCESS } else { std::process::ExitCode::FAILURE }
+    if pass == total {
+        println!("== cd_linq done ==");
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
+    }
 }

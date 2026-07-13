@@ -1,5 +1,5 @@
 use super::{
-    Assembly, Const, MethodDefIdx, MethodRef, Type,
+    Assembly, Const, Int, MethodDefIdx, MethodRef, Type,
     asm_link::{RelocateCtx, RelocateValue},
     bimap::Interned,
 };
@@ -779,9 +779,75 @@ pub struct ClassDef {
     /// postcard-serialized `.bc` format (the same fingerprint trap as `generic_names`/
     /// `properties` above — rebuild dylib+linker together and clean consumers).
     custom_attributes: Vec<CustomAttrDef>,
+    /// Genuine ECMA-335 enum metadata. Unlike an ordinary Rust enum lowered for execution, this
+    /// describes the public managed projection: a `System.Enum` base, the special `value__`
+    /// field, and one `literal hasdefault` field/Constant row per variant. Kept separate from
+    /// `static_fields` because those model storage (`FieldRVA`/`InitOnly`), while enum members are
+    /// metadata constants with no storage at all.
+    enum_def: Option<EnumDef>,
     /// Provenance for a synthetic inline fixed array. This is serialized so layout validation is
     /// performed only after all codegen shards and dependency artifacts have been merged.
     fixed_array_layout: Option<FixedArrayLayout>,
+}
+
+/// The managed metadata carried by a genuine CLR enum TypeDef.
+#[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
+pub struct EnumDef {
+    underlying: Int,
+    variants: Vec<(Interned<IString>, Const)>,
+}
+
+impl EnumDef {
+    #[must_use]
+    pub fn new(underlying: Int, variants: Vec<(Interned<IString>, Const)>) -> Self {
+        assert!(
+            matches!(
+                underlying,
+                Int::I8 | Int::U8 | Int::I16 | Int::U16 | Int::I32 | Int::U32 | Int::I64 | Int::U64
+            ),
+            "CLR enum underlying type must be an 8/16/32/64-bit integer, got {underlying:?}"
+        );
+        for (_, value) in &variants {
+            assert_eq!(
+                value.get_type(),
+                Type::Int(underlying),
+                "CLR enum literal type must match its underlying type"
+            );
+        }
+        assert_unique(
+            &variants.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            "CLR enum variant names must be unique",
+        );
+        Self {
+            underlying,
+            variants,
+        }
+    }
+
+    #[must_use]
+    pub fn underlying(&self) -> Int {
+        self.underlying
+    }
+
+    #[must_use]
+    pub fn variants(&self) -> &[(Interned<IString>, Const)] {
+        &self.variants
+    }
+}
+
+impl RelocateValue for EnumDef {
+    type Output = Self;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
+        Self {
+            underlying: self.underlying,
+            variants: self
+                .variants
+                .into_iter()
+                .map(|(name, value)| (ctx.string(destination, name), value))
+                .collect(),
+        }
+    }
 }
 
 /// One constructor-argument or named-argument value inside a `CustomAttribute` blob (§II.23.3).
@@ -905,15 +971,11 @@ impl CustomAttrDef {
 /// backing delegate-typed field — exactly the pattern `mycorrhiza::delegate` already proves works
 /// as a plain method call.
 ///
-/// Scoped intentionally narrow (see `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md`'s Tier C finding #5):
-/// proven for a single delegate-typed field with non-thread-safe `add`/`remove` bodies (no
-/// `Interlocked.CompareExchange`-based synchronization — a real C# `event` needs that for
-/// concurrent-subscription correctness, which this spike does not attempt) via a hand-written
-/// `.il` file assembled with `ilasm` directly (bypassing this struct and `il_exporter` entirely)
-/// plus this struct's own `il_exporter` wiring, both hand-verified against a real C# consumer
-/// (`+=`/`-=`/multi-subscriber fan-out/`GetEvent` reflection all correct). `pe_exporter` has no
-/// EventMap/Event/MethodSemantics table support at all yet — same `DIRECT_PE=1` gap class as
-/// virtual overrides and interface export.
+/// Both exporters support this shape: the IL exporter writes `.event`/`.addon`/`.removeon`, while
+/// the default direct-PE writer emits EventMap/Event/MethodSemantics rows. Product acceptance covers
+/// class and interface declarations through real C# `+=`/`-=` syntax and reflection. Accessor body
+/// synchronization remains author-owned: metadata linkage alone does not synthesize C#'s usual
+/// `Interlocked.CompareExchange` loop.
 #[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
 pub struct EventDef {
     name: Interned<IString>,
@@ -1079,6 +1141,7 @@ impl RelocateValue for ClassDef {
             generic_names,
             properties,
             custom_attributes,
+            enum_def,
             fixed_array_layout,
         } = self;
         let definition = Self {
@@ -1127,6 +1190,7 @@ impl RelocateValue for ClassDef {
                 .into_iter()
                 .map(|attribute| attribute.relocate(ctx, destination))
                 .collect(),
+            enum_def: enum_def.map(|definition| definition.relocate(ctx, destination)),
             fixed_array_layout: fixed_array_layout.map(|layout| layout.relocate(ctx, destination)),
         };
         RelocatedClassDef {
@@ -1210,6 +1274,7 @@ impl ClassDef {
             generic_names: vec![],
             properties: vec![],
             custom_attributes: vec![],
+            enum_def: None,
             fixed_array_layout: None,
         }
     }
@@ -1355,6 +1420,38 @@ impl ClassDef {
     #[must_use]
     pub fn custom_attributes(&self) -> &[CustomAttrDef] {
         &self.custom_attributes
+    }
+
+    /// Marks this public value type as a genuine CLR enum.
+    #[must_use]
+    pub fn with_enum(mut self, definition: EnumDef) -> Self {
+        assert!(self.is_valuetype, "a CLR enum must be a value type");
+        assert!(!self.is_interface, "a CLR enum cannot be an interface");
+        assert_eq!(self.generics, 0, "a CLR enum cannot be generic");
+        assert!(
+            self.fields.is_empty(),
+            "a CLR enum cannot declare ordinary instance fields"
+        );
+        assert!(self.enum_def.is_none(), "CLR enum metadata already set");
+        self.enum_def = Some(definition);
+        self
+    }
+
+    #[must_use]
+    pub fn enum_def(&self) -> Option<&EnumDef> {
+        self.enum_def.as_ref()
+    }
+
+    /// Installs enum metadata idempotently when comptime entrypoints are merged in an arbitrary
+    /// codegen-unit order.
+    pub fn set_enum_def(&mut self, definition: EnumDef) {
+        match &self.enum_def {
+            None => self.enum_def = Some(definition),
+            Some(existing) => assert_eq!(
+                existing, &definition,
+                "enum metadata differs across comptime entrypoints"
+            ),
+        }
     }
 
     /// Attach a custom attribute to this class. Deduplicates by full equality (a class re-opened
@@ -1632,6 +1729,15 @@ impl ClassDef {
         // `add_custom_attribute`'s own dedup — see its doc).
         for attr in translated.custom_attributes() {
             self.add_custom_attribute(attr.clone());
+        }
+
+        match (&self.enum_def, &translated.enum_def) {
+            (None, Some(incoming)) => self.enum_def = Some(incoming.clone()),
+            (Some(existing), Some(incoming)) => assert_eq!(
+                existing, incoming,
+                "enum metadata differs across codegen shards"
+            ),
+            (None, None) | (Some(_), None) => {}
         }
 
         // A codegen shard may first encounter a type only as a method owner and a later shard may

@@ -27,22 +27,23 @@
 //! callback exactly the same way.
 //!
 //! **Callback shape.** `from_fn` takes an `extern "C" fn(..) -> ..` — a plain top-level fn or a
-//! capture-less closure written `extern "C"`. **Captures are not yet supported** (a closure
-//! environment has no place to live on the managed side without a boxing trampoline); pass state via
-//! arguments or a `'static` for now. Argument/return types must each cross the boundary (a .NET
-//! primitive, a `#[repr(C)]` value type of such, or a managed handle) — the same rule as
-//! [`crate::collections`].
+//! capture-less closure written `extern "C"`. `from_closure` accepts a capturing `'static` Rust
+//! closure through a boxed trampoline. Its environment is intentionally leaked because the managed
+//! delegate may outlive every Rust scope; prefer `from_fn` for capture-less or high-churn callbacks.
+//! Argument/return types must each cross the boundary (a .NET primitive, a `#[repr(C)]` value type of
+//! such, or a managed handle) — the same rule as [`crate::collections`].
 //!
 //! **Delegate identity.** Each wrapper is a move-only handle to a managed delegate object; the .NET GC
 //! owns it (no `Drop`). `.handle()` exposes the raw
 //! [`RustcCLRInteropManagedGeneric`](crate::intrinsics::RustcCLRInteropManagedGeneric) so you can pass
 //! the delegate to any method taking this exact delegate type, or hand it to an event `add_*`.
+//! Conversely, a wrapper used as a `#[dotnet_export]`/`#[dotnet_methods]` parameter receives a real
+//! C# delegate and can invoke it directly; the automatic import surface covers primitives and
+//! managed `MString` handles for the wrapper families defined below.
 //!
-//! **Not yet:** handing a delegate to a *generic* method whose delegate parameter is itself
-//! parameterised by the class generic (`List<T>.Sort(Comparison<T>)`, `List<T>.ForEach(Action<T>)`)
-//! needs the CIL type-verifier to model nested generic-parameter binding (`Comparison`1<!0>` param
-//! vs a `Comparison`1<int32>` argument). That is a follow-up; a delegate over a *concrete* signature
-//! (everything here) is fully supported.
+//! Delegates whose signature uses an enclosing class generic are supported too: the collection
+//! wrappers use these handles for `List<T>.Sort(Comparison<T>)` and
+//! `List<T>.ForEach(Action<T>)`. See `cargo_tests/cd_collections` for the end-to-end proof.
 
 use crate::intrinsics::{
     RustcCLRInteropManagedGeneric, RustcCLRInteropTypeGeneric, rustc_clr_interop_delegate,
@@ -92,6 +93,7 @@ macro_rules! delegate_wrapper {
                     ( $($genarg,)+ ),
                     ( $fret, $($fa,)* ),
                     extern "C" fn ( $($fa),* ) -> $fret,
+                    RustcCLRInteropManagedGeneric<{ CORELIB }, { $class }, ( $($genarg,)+ )>,
                 >(f);
                 Self { h }
             }
@@ -141,11 +143,155 @@ macro_rules! delegate_wrapper {
                     ( $iret, $($iaty,)* ),
                     *mut (),
                     extern "C" fn(*mut (), $($iaty),*) -> $iret,
+                    RustcCLRInteropManagedGeneric<{ CORELIB }, { $class }, ( $($genarg,)+ )>,
                 >(env, tramp::< $($garg),+ >);
                 Self { h }
             }
         }
     };
+}
+
+/// `System.EventHandler` — the conventional `(object sender, EventArgs args) -> void` delegate
+/// used by many BCL and third-party events. Unlike [`Action2`], this is a non-generic CLR delegate
+/// type, so its handle can be passed directly to generated `add_*`/`remove_*` methods that accept
+/// `System.EventHandler`.
+pub struct EventHandler {
+    h: crate::bindings::System::EventHandler,
+}
+
+impl EventHandler {
+    /// Build an event handler from a capture-less Rust callback.
+    #[inline]
+    pub fn from_fn(
+        f: extern "C" fn(crate::bindings::System::Object, crate::bindings::System::EventArgs),
+    ) -> Self {
+        let h = rustc_clr_interop_delegate::<
+            { CORELIB },
+            "System.EventHandler",
+            false,
+            (),
+            (
+                (),
+                crate::bindings::System::Object,
+                crate::bindings::System::EventArgs,
+            ),
+            extern "C" fn(crate::bindings::System::Object, crate::bindings::System::EventArgs),
+            crate::bindings::System::EventHandler,
+        >(f);
+        Self { h }
+    }
+
+    /// Build an event handler from a capturing `'static` Rust closure. The environment follows the
+    /// delegate module's existing process-lifetime allocation rule.
+    #[inline]
+    pub fn from_closure<Fun>(f: Fun) -> Self
+    where
+        Fun: Fn(crate::bindings::System::Object, crate::bindings::System::EventArgs) + 'static,
+    {
+        type Callback = dyn Fn(crate::bindings::System::Object, crate::bindings::System::EventArgs);
+        let boxed: Box<Callback> = Box::new(f);
+        let env = Box::into_raw(Box::new(boxed)) as *mut ();
+        extern "C" fn tramp(
+            env: *mut (),
+            sender: crate::bindings::System::Object,
+            args: crate::bindings::System::EventArgs,
+        ) {
+            let callback = unsafe { &*(env as *const Box<Callback>) };
+            callback(sender, args);
+        }
+        let h = crate::intrinsics::rustc_clr_interop_delegate_closure::<
+            { CORELIB },
+            "System.EventHandler",
+            false,
+            (),
+            (
+                (),
+                crate::bindings::System::Object,
+                crate::bindings::System::EventArgs,
+            ),
+            *mut (),
+            extern "C" fn(
+                *mut (),
+                crate::bindings::System::Object,
+                crate::bindings::System::EventArgs,
+            ),
+            crate::bindings::System::EventHandler,
+        >(env, tramp);
+        Self { h }
+    }
+
+    /// The raw handle accepted by reflected/generated event accessors.
+    #[inline]
+    pub fn handle(&self) -> crate::bindings::System::EventHandler {
+        self.h
+    }
+
+    /// Invoke the held handler directly.
+    #[inline]
+    pub fn invoke(
+        &self,
+        sender: crate::bindings::System::Object,
+        args: crate::bindings::System::EventArgs,
+    ) {
+        self.h.invoke(sender, args);
+    }
+}
+
+/// An owned event registration that removes the exact same managed delegate on explicit
+/// [`unsubscribe`](Self::unsubscribe) or on drop.
+///
+/// Generated bindings expose event accessors as ordinary functions taking `(owner, delegate)`.
+/// Pass those small adapters to [`subscribe`](Self::subscribe); the guard retains both managed
+/// handles so removal cannot accidentally use a different delegate instance.
+pub struct EventSubscription<Owner: Copy, Delegate: Copy> {
+    owner: Owner,
+    delegate: Delegate,
+    remove: fn(Owner, Delegate),
+    active: bool,
+}
+
+impl<Owner: Copy, Delegate: Copy> EventSubscription<Owner, Delegate> {
+    /// Register `delegate` with `add` and return an active unsubscription guard.
+    #[inline]
+    pub fn subscribe(
+        owner: Owner,
+        delegate: Delegate,
+        add: fn(Owner, Delegate),
+        remove: fn(Owner, Delegate),
+    ) -> Self {
+        add(owner, delegate);
+        Self {
+            owner,
+            delegate,
+            remove,
+            active: true,
+        }
+    }
+
+    /// Whether this guard still owns an active event registration.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Remove the handler now. Drop observes the inactive state and does not remove twice.
+    #[inline]
+    pub fn unsubscribe(mut self) {
+        self.detach();
+    }
+
+    fn detach(&mut self) {
+        if self.active {
+            (self.remove)(self.owner, self.delegate);
+            self.active = false;
+        }
+    }
+}
+
+impl<Owner: Copy, Delegate: Copy> Drop for EventSubscription<Owner, Delegate> {
+    fn drop(&mut self) {
+        self.detach();
+    }
 }
 
 // ---- Action (void-returning) delegates ----
@@ -162,6 +308,12 @@ delegate_wrapper! {
     fnptr = extern "C" fn (T0, T1) -> (),
     invoke (a0: T0, a1: T1) -> ()
 }
+delegate_wrapper! {
+    /// `System.Action<T0, T1, T2>` — a void-returning three-argument delegate.
+    Action3<T0, T1, T2> = ACTION, gens = (T0, T1, T2),
+    fnptr = extern "C" fn (T0, T1, T2) -> (),
+    invoke (a0: T0, a1: T1, a2: T2) -> ()
+}
 
 // ---- Func (value-returning) delegates ----
 
@@ -177,11 +329,18 @@ delegate_wrapper! {
     fnptr = extern "C" fn (T0, T1) -> R,
     invoke (a0: T0, a1: T1) -> R
 }
+delegate_wrapper! {
+    /// `System.Func<T0, T1, T2, R>` — a three-argument delegate returning `R`.
+    Func3<T0, T1, T2, R> = FUNC, gens = (T0, T1, T2, R),
+    fnptr = extern "C" fn (T0, T1, T2) -> R,
+    invoke (a0: T0, a1: T1, a2: T2) -> R
+}
 
 // ---- Comparison<T> — the sort/`Comparison<T>` delegate (fixed `(T, T) -> i32` shape, one generic) ----
 
 delegate_wrapper! {
-    /// `System.Comparison<T>` — `(T, T) -> i32`, as taken by `List<T>.Sort` / `Array.Sort`. Return a
+    /// Generic `System.Comparison` over `T` — `(T, T) -> i32`, as taken by `List<T>.Sort` /
+    /// `Array.Sort`. Return a
     /// negative / zero / positive `i32` for less / equal / greater (the .NET `IComparer` convention).
     Comparison<T> = COMPARISON, gens = (T,),
     fnptr = extern "C" fn (T, T) -> i32,
@@ -259,6 +418,31 @@ impl<T0, T1> Action2<T0, T1> {
         >(self.h, a0, a1)
     }
 }
+impl<T0, T1, T2> Action3<T0, T1, T2> {
+    /// Invoke the delegate — runs the wrapped callback (`Invoke(!0, !1, !2)`, void).
+    #[inline]
+    pub fn invoke(&self, a0: T0, a1: T1, a2: T2) {
+        crate::intrinsics::rustc_clr_interop_generic_call4::<
+            { CORELIB },
+            { ACTION },
+            false,
+            { INVOKE },
+            2u8,
+            (T0, T1, T2),
+            (
+                (),
+                RustcCLRInteropTypeGeneric<0>,
+                RustcCLRInteropTypeGeneric<1>,
+                RustcCLRInteropTypeGeneric<2>,
+            ),
+            (),
+            RustcCLRInteropManagedGeneric<{ CORELIB }, { ACTION }, (T0, T1, T2)>,
+            T0,
+            T1,
+            T2,
+        >(self.h, a0, a1, a2)
+    }
+}
 impl<T0, R> Func1<T0, R> {
     /// Invoke the delegate, returning its result (`Invoke(!0) -> !1`).
     #[inline]
@@ -298,5 +482,68 @@ impl<T0, T1, R> Func2<T0, T1, R> {
             T0,
             T1,
         >(self.h, a0, a1)
+    }
+}
+impl<T0, T1, T2, R> Func3<T0, T1, T2, R> {
+    /// Invoke the delegate, returning its result (`Invoke(!0, !1, !2) -> !3`).
+    #[inline]
+    pub fn invoke(&self, a0: T0, a1: T1, a2: T2) -> R {
+        crate::intrinsics::rustc_clr_interop_generic_call4::<
+            { CORELIB },
+            { FUNC },
+            false,
+            { INVOKE },
+            2u8,
+            (T0, T1, T2, R),
+            (
+                RustcCLRInteropTypeGeneric<3>,
+                RustcCLRInteropTypeGeneric<0>,
+                RustcCLRInteropTypeGeneric<1>,
+                RustcCLRInteropTypeGeneric<2>,
+            ),
+            R,
+            RustcCLRInteropManagedGeneric<{ CORELIB }, { FUNC }, (T0, T1, T2, R)>,
+            T0,
+            T1,
+            T2,
+        >(self.h, a0, a1, a2)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EventSubscription;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static ADDS: AtomicUsize = AtomicUsize::new(0);
+    static REMOVES: AtomicUsize = AtomicUsize::new(0);
+
+    fn add(owner: u8, delegate: u16) {
+        assert_eq!((owner, delegate), (7, 42));
+        ADDS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn remove(owner: u8, delegate: u16) {
+        assert_eq!((owner, delegate), (7, 42));
+        REMOVES.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn event_subscription_removes_exactly_once_explicitly_or_on_drop() {
+        ADDS.store(0, Ordering::SeqCst);
+        REMOVES.store(0, Ordering::SeqCst);
+
+        let subscription = EventSubscription::subscribe(7, 42, add, remove);
+        assert!(subscription.is_active());
+        subscription.unsubscribe();
+        assert_eq!(REMOVES.load(Ordering::SeqCst), 1);
+
+        {
+            let subscription = EventSubscription::subscribe(7, 42, add, remove);
+            assert!(subscription.is_active());
+        }
+
+        assert_eq!(ADDS.load(Ordering::SeqCst), 2);
+        assert_eq!(REMOVES.load(Ordering::SeqCst), 2);
     }
 }

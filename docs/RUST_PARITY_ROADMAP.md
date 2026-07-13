@@ -94,12 +94,13 @@ These aren't missing features, they're defects in things that otherwise work. Or
    `add-nuget` target that ships localized resources).
 6. **`add-nuget` never fetched transitive NuGet dependencies** (fixed this campaign, same file — now
    parses the `.nuspec` and fetches one level of deps; deeper transitive chains are unverified).
-7. **spinacz's reflector drops any method with a `byte[]`/value-type-struct parameter or return**
-   (confirmed via `NATS.Client.Publish(string,byte[])`/`Msg.Data` and `PdfSharpCore`'s `XPoint`/`XRect`
-   `XGraphics` drawing methods). Not a crash, just silent omission from the generated bindings — you
-   only notice when the method you needed isn't there. A real fix would extend the array/struct-arg
-   codegen path in spinacz rather than requiring a hand-written C# shim per affected library (the
-   workaround used this campaign for NATS).
+7. **PARTIALLY FIXED.** spinacz used to drop every method with a `byte[]` parameter or return.
+   Rank-1 managed arrays whose element type is already expressible now generate
+   `RustcCLRInteropManagedArray<T, 1>`, and virtual/interface wrappers use `virt1`/`virt2` instead
+   of dropping abstract methods with arguments. `NATS.Client.Publish(string, byte[])` and
+   `Msg.Data` now round-trip two real payloads in `cd_nats` with no C# shim (debug + release).
+   Multidimensional/non-SZ arrays and value-type structs such as PdfSharpCore's `XPoint`/`XRect`
+   remain explicit omissions.
 8. **spinacz keeps only the last-seen overload when two C# methods share a name** (confirmed via
    `HtmlNodeCollection`'s two `Item` indexer overloads — the wrong one won). Affects any reflected type
    with legitimate C# overloading, which is common.

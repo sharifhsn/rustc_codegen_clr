@@ -21,7 +21,7 @@ pub fn from_poly_sig<'tcx>(
 }
 /// Returns the signature of function behind `function`.
 ///
-/// Delegates to [`CallInfo::sig_from_instance_`] so that the accepted ABI set stays in lockstep
+/// Delegates to `CallInfo::sig_from_instance_` so that the accepted ABI set stays in lockstep
 /// with the call path (the Rust family, `C`, `Custom`, and the x86 variants). This historically had
 /// its own stricter `Rust`/`C`-only checker, which made drop-glue and managed-interop calls panic
 /// on ABIs that an ordinary call would accept.

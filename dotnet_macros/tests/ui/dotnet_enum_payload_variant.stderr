@@ -1,0 +1,5 @@
+error: #[dotnet_enum]: CLR enum variants must be fieldless
+ --> tests/ui/dotnet_enum_payload_variant.rs:6:10
+  |
+6 |     Ready(i32),
+  |          ^^^^^

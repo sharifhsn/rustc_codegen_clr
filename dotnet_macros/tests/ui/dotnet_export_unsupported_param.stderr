@@ -1,4 +1,4 @@
-error: #[dotnet_export]: unsupported parameter type `PositionDto`. Supported: the integer/float primitives, `bool`, `&str`, `String`, `Option<T>`, and `Vec<T>` (the last two for a passthrough primitive `T`).
+error: #[dotnet_export]: unsupported parameter type `PositionDto`. Supported: the integer/float primitives, `bool`, `&str`, `String`, concrete `Action1`/`Action2`/`Action3`/`Func1`/`Func2`/`Func3`/`Comparison` delegates, `Option<T>`, and `Vec<T>` (delegate elements may be passthrough primitives or `MString`; collection elements must be passthrough primitives).
  --> tests/ui/dotnet_export_unsupported_param.rs:9:22
   |
 9 | pub fn bad_export(x: PositionDto) -> i32 {

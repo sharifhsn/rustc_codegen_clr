@@ -3,10 +3,9 @@
 //!
 //! Scope: exactly the tables `il_exporter` drives, per the inventory in
 //! `docs/PE_EMISSION_PLAN.md` — Module, TypeRef, TypeDef, Field, MethodDef, Param,
-//! InterfaceImpl, MemberRef, CustomAttribute, ClassLayout, FieldLayout, StandAloneSig, TypeSpec,
-//! ModuleRef, ImplMap, FieldRVA, Assembly, AssemblyRef, MethodSpec. No `Constant` table: default
-//! field values in this backend are always `FieldRVA` blobs (see `il_exporter`'s `.data cil`
-//! static-field rendering), never metadata-`Constant` literals.
+//! InterfaceImpl, MemberRef, Constant, CustomAttribute, ClassLayout, FieldLayout, StandAloneSig, TypeSpec,
+//! ModuleRef, ImplMap, FieldRVA, Assembly, AssemblyRef, MethodSpec. Ordinary static defaults remain
+//! `FieldRVA` blobs; genuine enum literal fields use the ECMA `Constant` table.
 //!
 //! Pipeline: **populate** (the `add_*`/`*_ref` methods, called while walking the `Assembly`) →
 //! **size** (row counts fix each table's row-index width; heap final sizes fix `HeapSizes`) →
@@ -19,7 +18,9 @@
 use super::heaps::{BlobHeap, GuidHeap, StringsHeap, UserStringHeap, write_compressed_u32};
 use super::sig::{self, TypeDefOrRefResolver};
 use crate::DotnetRuntime;
-use crate::ir::{Assembly, ClassRef, FieldDesc, Interned, MethodDefIdx, StaticFieldDesc, Type};
+use crate::ir::{
+    Assembly, ClassRef, Const, FieldDesc, Interned, MethodDefIdx, StaticFieldDesc, Type,
+};
 use std::collections::HashMap;
 
 /// A metadata token (§II.22.1.8): high byte is the table id, low 3 bytes are the 1-based row
@@ -39,6 +40,7 @@ impl Token {
     pub const TABLE_PARAM: u32 = 0x08;
     pub const TABLE_INTERFACE_IMPL: u32 = 0x09;
     pub const TABLE_MEMBER_REF: u32 = 0x0A;
+    pub const TABLE_CONSTANT: u32 = 0x0B;
     pub const TABLE_CUSTOM_ATTRIBUTE: u32 = 0x0C;
     pub const TABLE_CLASS_LAYOUT: u32 = 0x0F;
     pub const TABLE_FIELD_LAYOUT: u32 = 0x10;
@@ -193,6 +195,13 @@ struct MemberRefRow {
     class: u32,
     name: u32,
     signature: u32,
+}
+
+/// §II.22.9 Constant. `parent` is a HasConstant coded index; enum literals target Field (tag 0).
+struct ConstantRow {
+    type_code: u8,
+    parent: u32,
+    value: u32,
 }
 
 struct CustomAttributeRow {
@@ -379,6 +388,7 @@ pub struct MetadataBuilder {
     param: Vec<ParamRow>,
     interface_impl: Vec<InterfaceImplRow>,
     member_ref: Vec<MemberRefRow>,
+    constant: Vec<ConstantRow>,
     custom_attribute: Vec<CustomAttributeRow>,
     class_layout: Vec<ClassLayoutRow>,
     field_layout: Vec<FieldLayoutRow>,
@@ -467,6 +477,7 @@ pub struct MetadataBuilder {
 /// table `N` has at least one row / must be emitted sorted). Table ids double as bit indices
 /// since every id in this backend's inventory is `< 64`.
 const SORTED_TABLES: &[u32] = &[
+    Token::TABLE_CONSTANT,
     Token::TABLE_INTERFACE_IMPL,
     Token::TABLE_CLASS_LAYOUT,
     Token::TABLE_FIELD_LAYOUT,
@@ -554,7 +565,7 @@ impl MetadataBuilder {
         mb
     }
 
-    /// Sets [`MetadataBuilder::is_lib`] — see that field's doc. Must be called before any
+    /// Sets `MetadataBuilder::is_lib` — see that field's doc. Must be called before any
     /// `AssemblyRef` row is created (i.e. right after [`MetadataBuilder::new`]), since it only
     /// affects rows created from that point on; `export_pe` calls this first, before Pass 0.
     pub fn set_is_lib(&mut self, is_lib: bool) {
@@ -634,7 +645,7 @@ impl MetadataBuilder {
     ///
     /// A caller that must create every `TypeDef` row UP FRONT (before any field/method exists —
     /// needed so a field's *type* can forward-reference a class def that appears later in
-    /// iteration order, resolved via [`MetadataBuilder::find_type_def`]) gets a WRONG
+    /// iteration order, resolved via `MetadataBuilder::find_type_def`) gets a WRONG
     /// `field_list`/`method_list` here (every such row reads back as `1`, since no field/method
     /// row exists yet at any of those calls) and MUST re-stamp the correct run-start once that
     /// class's fields/methods are about to be appended, via
@@ -830,6 +841,53 @@ impl MetadataBuilder {
                 .push(FieldLayoutRow { offset, field: rid });
         }
         tok
+    }
+
+    /// Adds the special instance field every CLR enum must carry.
+    pub fn add_enum_value_field(&mut self, signature_blob: u32) -> Token {
+        let name = self.strings.intern("value__");
+        self.field.push(FieldRow {
+            // Public | SpecialName | RTSpecialName (§II.23.1.5).
+            flags: 0x6 | 0x0200 | 0x0400,
+            name,
+            signature: signature_blob,
+        });
+        Token::new(Token::TABLE_FIELD, u32::try_from(self.field.len()).unwrap())
+    }
+
+    /// Adds a public static literal enum member and its metadata Constant row.
+    pub fn add_enum_literal_field(
+        &mut self,
+        name: &str,
+        signature_blob: u32,
+        value: Const,
+    ) -> Token {
+        let name = self.strings.intern(name);
+        self.field.push(FieldRow {
+            // Public | Static | Literal | HasDefault (§II.23.1.5).
+            flags: 0x6 | 0x0010 | 0x0040 | 0x8000,
+            name,
+            signature: signature_blob,
+        });
+        let rid = u32::try_from(self.field.len()).unwrap();
+        let (type_code, bytes): (u8, Vec<u8>) = match value {
+            Const::I8(v) => (0x04, v.to_le_bytes().to_vec()),
+            Const::U8(v) => (0x05, v.to_le_bytes().to_vec()),
+            Const::I16(v) => (0x06, v.to_le_bytes().to_vec()),
+            Const::U16(v) => (0x07, v.to_le_bytes().to_vec()),
+            Const::I32(v) => (0x08, v.to_le_bytes().to_vec()),
+            Const::U32(v) => (0x09, v.to_le_bytes().to_vec()),
+            Const::I64(v) => (0x0A, v.to_le_bytes().to_vec()),
+            Const::U64(v) => (0x0B, v.to_le_bytes().to_vec()),
+            other => panic!("unsupported CLR enum literal constant {other:?}"),
+        };
+        let value = self.blobs.intern(&bytes);
+        self.constant.push(ConstantRow {
+            type_code,
+            parent: rid << 2, // HasConstant: Field tag = 0.
+            value,
+        });
+        Token::new(Token::TABLE_FIELD, rid)
     }
 
     /// Adds a `static` `Field` row. `rva_data` mirrors `il_exporter`'s FieldRVA statics (the
@@ -1429,12 +1487,12 @@ impl MetadataBuilder {
     /// `thread_static_attribute` above hardcodes for one specific attribute, generalized to any
     /// [`crate::ir::class::CustomAttrDef`]: resolves the attribute's TYPE via the same
     /// `ClassRef`→`TypeRef`/`TypeDef` machinery `extends`/`implements` already use
-    /// ([`MetadataBuilder::class_ref_token`]), finds-or-creates the matching `.ctor`
+    /// (`MetadataBuilder::class_ref_token`), finds-or-creates the matching `.ctor`
     /// `MemberRef` (a HASTHIS signature shaped by `attr.ctor_args()`'s element types), and
     /// assembles a well-formed `CustomAttrib` blob (prolog `0x0001`, one `FixedArg` per ctor arg
     /// in order, `NumNamed`, then one `NamedArg` per named property arg) per §II.23.3. `parent` is
     /// the target row's own token (`HasCustomAttribute` coded index, §II.24.2.6) — a `TypeDef` for
-    /// the type-level attributes this is wired up for today, though [`encode_has_custom_attribute`]
+    /// the type-level attributes this is wired up for today, though `encode_has_custom_attribute`
     /// accepts several other target kinds too.
     ///
     /// Every arg shape [`crate::ir::class::CustomAttrArg`] can express (`Str`/`Bool`/`I32`/`I64`)
@@ -1671,7 +1729,7 @@ impl MetadataBuilder {
     /// populated, in table-id order — exactly the shape [`super::pdb::TypeSystemRowCounts::rows`]
     /// needs for the standalone PDB's `#Pdb` stream (`ReferencedTypeSystemTables` mask + per-table
     /// row counts, per the Portable PDB spec). Reuses the same `(Token::TABLE_*, count)` pairing
-    /// [`serialize_tables`](Self::serialize_tables) computes from [`row_counts`](Self::row_counts),
+    /// `Self::serialize_tables` computes from `Self::row_counts`,
     /// so this can never drift out of sync with what `serialize()` actually wrote to the `.dll`'s
     /// own `#~` stream.
     #[must_use]
@@ -1686,6 +1744,7 @@ impl MetadataBuilder {
             (Token::TABLE_PARAM, sizes.param),
             (Token::TABLE_INTERFACE_IMPL, sizes.interface_impl),
             (Token::TABLE_MEMBER_REF, sizes.member_ref),
+            (Token::TABLE_CONSTANT, sizes.constant),
             (Token::TABLE_CUSTOM_ATTRIBUTE, sizes.custom_attribute),
             (Token::TABLE_CLASS_LAYOUT, sizes.class_layout),
             (Token::TABLE_FIELD_LAYOUT, sizes.field_layout),
@@ -1721,6 +1780,7 @@ impl MetadataBuilder {
             param: self.param.len(),
             interface_impl: self.interface_impl.len(),
             member_ref: self.member_ref.len(),
+            constant: self.constant.len(),
             custom_attribute: self.custom_attribute.len(),
             class_layout: self.class_layout.len(),
             field_layout: self.field_layout.len(),
@@ -1745,7 +1805,7 @@ impl MetadataBuilder {
     fn serialize_tables(&self, sizes: &RowCounts, widths: &Widths) -> Vec<u8> {
         // Every table this backend can ever emit, in ascending table-id order (§II.24.2.6
         // requires tables be written in table-id order regardless of population order).
-        let table_rowcounts: [(u32, usize); 26] = [
+        let table_rowcounts: [(u32, usize); 27] = [
             (Token::TABLE_MODULE, sizes.module),
             (Token::TABLE_TYPE_REF, sizes.type_ref),
             (Token::TABLE_TYPE_DEF, sizes.type_def),
@@ -1754,6 +1814,7 @@ impl MetadataBuilder {
             (Token::TABLE_PARAM, sizes.param),
             (Token::TABLE_INTERFACE_IMPL, sizes.interface_impl),
             (Token::TABLE_MEMBER_REF, sizes.member_ref),
+            (Token::TABLE_CONSTANT, sizes.constant),
             (Token::TABLE_CUSTOM_ATTRIBUTE, sizes.custom_attribute),
             (Token::TABLE_CLASS_LAYOUT, sizes.class_layout),
             (Token::TABLE_FIELD_LAYOUT, sizes.field_layout),
@@ -1812,6 +1873,7 @@ impl MetadataBuilder {
         self.write_param_rows(&mut out, widths);
         self.write_interface_impl_rows(&mut out, widths);
         self.write_member_ref_rows(&mut out, widths);
+        self.write_constant_rows(&mut out, widths);
         self.write_custom_attribute_rows(&mut out, widths);
         self.write_class_layout_rows(&mut out, widths);
         self.write_field_layout_rows(&mut out, widths);
@@ -1906,6 +1968,17 @@ impl MetadataBuilder {
             write_coded_idx(out, row.class, w.member_ref_parent_wide);
             write_heap_idx(out, row.name, w.str_wide);
             write_heap_idx(out, row.signature, w.blob_wide);
+        }
+    }
+
+    fn write_constant_rows(&self, out: &mut Vec<u8>, w: &Widths) {
+        let mut rows: Vec<&ConstantRow> = self.constant.iter().collect();
+        rows.sort_by_key(|row| row.parent);
+        for row in rows {
+            out.push(row.type_code);
+            out.push(0); // Padding
+            write_coded_idx(out, row.parent, w.has_constant_wide);
+            write_heap_idx(out, row.value, w.blob_wide);
         }
     }
 
@@ -2325,6 +2398,7 @@ struct RowCounts {
     param: usize,
     interface_impl: usize,
     member_ref: usize,
+    constant: usize,
     custom_attribute: usize,
     class_layout: usize,
     field_layout: usize,
@@ -2384,6 +2458,7 @@ struct Widths {
     type_def_or_ref_wide: bool,
     resolution_scope_wide: bool,
     member_ref_parent_wide: bool,
+    has_constant_wide: bool,
     method_def_or_ref_wide: bool,
     has_custom_attribute_wide: bool,
     custom_attribute_type_wide: bool,
@@ -2431,6 +2506,7 @@ impl Widths {
             .max(sizes.method_def)
             .max(sizes.type_spec);
         let method_def_or_ref_max = sizes.method_def.max(sizes.member_ref);
+        let has_constant_max = sizes.field.max(sizes.param).max(sizes.property);
         // Conservatively includes every table this backend can target with HasCustomAttribute
         // (22 possible target tables per spec; only a handful are ever nonzero here).
         let has_custom_attribute_max = sizes
@@ -2488,6 +2564,7 @@ impl Widths {
             type_def_or_ref_wide: coded_wide(2, type_def_or_ref_max),
             resolution_scope_wide: coded_wide(2, resolution_scope_max),
             member_ref_parent_wide: coded_wide(3, member_ref_parent_max),
+            has_constant_wide: coded_wide(2, has_constant_max),
             method_def_or_ref_wide: coded_wide(1, method_def_or_ref_max),
             has_custom_attribute_wide: coded_wide(5, has_custom_attribute_max),
             custom_attribute_type_wide: coded_wide(3, custom_attribute_type_max),
@@ -4883,6 +4960,12 @@ mod tests {
                         .max(count(Token::TABLE_TYPE_SPEC));
                     coded_w(3, mrp_max) + str_w + blob_w
                 }
+                Token::TABLE_CONSTANT => {
+                    let hc_max = count(Token::TABLE_FIELD)
+                        .max(count(Token::TABLE_PARAM))
+                        .max(count(Token::TABLE_PROPERTY));
+                    2 + coded_w(2, hc_max) + blob_w
+                }
                 Token::TABLE_CUSTOM_ATTRIBUTE => {
                     // Must mirror `Widths::new`'s `has_custom_attribute_max` universe — every
                     // `HasCustomAttribute` target table this backend can populate (§II.24.2.6).
@@ -5715,10 +5798,8 @@ mod tests {
         assert_eq!(&bytes[off + 16..off + 20], &7i32.to_le_bytes());
     }
 
-    /// `StaticFieldDef::is_const` (Cluster C item 3's `initonly` case) sets `FieldAttributes`
-    /// bit 0x20 (§II.23.1.5 InitOnly) and nothing else — must not be confused with a metadata
-    /// `Constant` row (§II.22.9), which `il_exporter` never emits for these fields either
-    /// (mod.rs:224/328 only ever renders the `initonly` keyword).
+    /// `StaticFieldDef::is_const` sets `FieldAttributes::InitOnly`; metadata literals are a
+    /// separate enum-only API and table path.
     #[test]
     fn add_static_field_is_const_sets_initonly_flag_only() {
         let mut mb = MetadataBuilder::new();
@@ -5748,6 +5829,41 @@ mod tests {
             0,
             "is_const must not add any CustomAttribute row"
         );
+    }
+
+    #[test]
+    fn enum_fields_carry_literal_flags_and_constant_rows() {
+        let mut mb = MetadataBuilder::new();
+        let value = mb.add_enum_value_field(7);
+        let ready = mb.add_enum_literal_field("Ready", 11, Const::U32(u32::MAX));
+
+        assert_eq!(
+            mb.field[(value.rid() - 1) as usize].flags,
+            0x6 | 0x0200 | 0x0400
+        );
+        assert_eq!(
+            mb.field[(ready.rid() - 1) as usize].flags,
+            0x6 | 0x0010 | 0x0040 | 0x8000
+        );
+        assert_eq!(mb.constant.len(), 1);
+        assert_eq!(mb.constant[0].type_code, 0x09, "ELEMENT_TYPE_U4");
+        assert_eq!(mb.constant[0].parent, ready.rid() << 2);
+
+        let bytes = mb.serialize();
+        let reader = MetadataReader::parse(&bytes);
+        let header = reader.tables_header();
+        assert_eq!(
+            header
+                .counts
+                .iter()
+                .find(|&&(id, _)| id == Token::TABLE_CONSTANT),
+            Some(&(Token::TABLE_CONSTANT, 1))
+        );
+        assert_ne!(header.sorted & (1u64 << Token::TABLE_CONSTANT), 0);
+        let start = reader.table_offset(Token::TABLE_CONSTANT, &header);
+        let rows = &reader.stream("#~")[header.row_data_offset..];
+        assert_eq!(rows[start], 0x09);
+        assert_eq!(rows[start + 1], 0);
     }
 
     #[test]

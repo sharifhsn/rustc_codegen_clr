@@ -1,4 +1,4 @@
-//! An idiomatic Rust wrapper over the managed [`System.Random`] pseudo-random number generator
+//! An idiomatic Rust wrapper over the managed `System.Random` pseudo-random number generator
 //! (assembly `System.Private.CoreLib`).
 //!
 //! This is a thin, honest handle to a real managed `Random` object living on the CLR heap — every

@@ -15,7 +15,7 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    Expr, FnArg, ImplItem, ItemFn, ItemImpl, ItemStruct, ItemTrait, Lit, LitBool, LitStr,
+    Expr, FnArg, ImplItem, ItemEnum, ItemFn, ItemImpl, ItemStruct, ItemTrait, Lit, LitBool, LitStr,
     MetaNameValue, ReturnType, Token, TraitItem, Type, parse_macro_input, punctuated::Punctuated,
     spanned::Spanned,
 };
@@ -668,6 +668,235 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+fn enum_discriminant(expr: &Expr) -> syn::Result<i128> {
+    match expr {
+        Expr::Lit(lit) => match &lit.lit {
+            Lit::Int(value) => value.base10_parse(),
+            _ => Err(syn::Error::new(
+                expr.span(),
+                "#[dotnet_enum]: discriminants must be integer literals",
+            )),
+        },
+        Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Neg(_)) => {
+            let Expr::Lit(lit) = &*unary.expr else {
+                return Err(syn::Error::new(
+                    expr.span(),
+                    "#[dotnet_enum]: negative discriminants must be integer literals",
+                ));
+            };
+            let Lit::Int(value) = &lit.lit else {
+                return Err(syn::Error::new(
+                    expr.span(),
+                    "#[dotnet_enum]: negative discriminants must be integer literals",
+                ));
+            };
+            value.base10_parse::<i128>()?.checked_neg().ok_or_else(|| {
+                syn::Error::new(expr.span(), "#[dotnet_enum]: discriminant is out of range")
+            })
+        }
+        _ => Err(syn::Error::new(
+            expr.span(),
+            "#[dotnet_enum]: discriminants must be integer literals; implicit increments are supported",
+        )),
+    }
+}
+
+fn enum_repr(input: &ItemEnum) -> syn::Result<(String, Type, usize, i128, i128)> {
+    for attr in &input.attrs {
+        if attr.path().is_ident("repr") {
+            let repr: syn::Ident = attr.parse_args()?;
+            let name = repr.to_string();
+            let (size, min, max) = match name.as_str() {
+                "i8" => (1, i8::MIN as i128, i8::MAX as i128),
+                "u8" => (1, 0, u8::MAX as i128),
+                "i16" => (2, i16::MIN as i128, i16::MAX as i128),
+                "u16" => (2, 0, u16::MAX as i128),
+                "i32" => (4, i32::MIN as i128, i32::MAX as i128),
+                "u32" => (4, 0, u32::MAX as i128),
+                "i64" => (8, i64::MIN as i128, i64::MAX as i128),
+                "u64" => (8, 0, u64::MAX as i128),
+                _ => {
+                    return Err(syn::Error::new(
+                        repr.span(),
+                        "#[dotnet_enum]: repr must be i8/u8/i16/u16/i32/u32/i64/u64",
+                    ));
+                }
+            };
+            return Ok((name, syn::parse_str(&repr.to_string())?, size, min, max));
+        }
+    }
+    Err(syn::Error::new(
+        input.ident.span(),
+        "#[dotnet_enum]: add an explicit #[repr(i8/u8/i16/u16/i32/u32/i64/u64)]",
+    ))
+}
+
+/// Export a fieldless Rust enum as a genuine CLR enum TypeDef.
+///
+/// ```ignore
+/// #[dotnet_enum(name = "Example.Status")]
+/// #[repr(i32)]
+/// pub enum Status { Ready = 1, Done = 2 }
+/// ```
+#[proc_macro_attribute]
+pub fn dotnet_enum(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as ItemEnum);
+    let parser = Punctuated::<MetaNameValue, Token![,]>::parse_terminated;
+    let args = match syn::parse::Parser::parse(parser, attr) {
+        Ok(args) => args,
+        Err(error) => return error.to_compile_error().into(),
+    };
+    let mut managed_name = None;
+    for arg in args {
+        if !arg.path.is_ident("name") || managed_name.is_some() {
+            return syn::Error::new(
+                arg.path.span(),
+                "#[dotnet_enum]: expected exactly one `name = \"Namespace.Type\"`",
+            )
+            .to_compile_error()
+            .into();
+        }
+        let Expr::Lit(lit) = arg.value else {
+            return syn::Error::new(
+                arg.path.span(),
+                "#[dotnet_enum]: `name` must be a string literal",
+            )
+            .to_compile_error()
+            .into();
+        };
+        let Lit::Str(value) = lit.lit else {
+            return syn::Error::new(
+                lit.lit.span(),
+                "#[dotnet_enum]: `name` must be a string literal",
+            )
+            .to_compile_error()
+            .into();
+        };
+        if let Err(error) = validate_dotnet_ref(&value.value(), value.span()) {
+            return error.to_compile_error().into();
+        }
+        if value.value().starts_with('[') {
+            return syn::Error::new(value.span(), "#[dotnet_enum]: a Rust-defined enum belongs to the output assembly; omit an `[Assembly]` prefix").to_compile_error().into();
+        }
+        managed_name = Some(value);
+    }
+    let managed_name =
+        managed_name.unwrap_or_else(|| LitStr::new(&input.ident.to_string(), input.ident.span()));
+    let (repr_name, repr_ty, size, min, max) = match enum_repr(&input) {
+        Ok(value) => value,
+        Err(error) => return error.to_compile_error().into(),
+    };
+    let mut next = 0i128;
+    let mut variant_values = Vec::new();
+    for variant in &input.variants {
+        if !matches!(variant.fields, syn::Fields::Unit) {
+            return syn::Error::new(
+                variant.fields.span(),
+                "#[dotnet_enum]: CLR enum variants must be fieldless",
+            )
+            .to_compile_error()
+            .into();
+        }
+        let value = match &variant.discriminant {
+            Some((_, expr)) => match enum_discriminant(expr) {
+                Ok(value) => value,
+                Err(error) => return error.to_compile_error().into(),
+            },
+            None => next,
+        };
+        if value < min || value > max {
+            return syn::Error::new(
+                variant.ident.span(),
+                format!("#[dotnet_enum]: discriminant {value} does not fit `{repr_name}`"),
+            )
+            .to_compile_error()
+            .into();
+        }
+        variant_values.push((variant.ident.clone(), value));
+        next = match value.checked_add(1) {
+            Some(value) => value,
+            None if variant.ident == input.variants.last().unwrap().ident => value,
+            None => {
+                return syn::Error::new(
+                    variant.ident.span(),
+                    "#[dotnet_enum]: implicit next discriminant overflows",
+                )
+                .to_compile_error()
+                .into();
+            }
+        };
+    }
+    if variant_values.is_empty() {
+        return syn::Error::new(
+            input.ident.span(),
+            "#[dotnet_enum]: at least one variant is required",
+        )
+        .to_compile_error()
+        .into();
+    }
+    let mut spec = repr_name;
+    for (name, value) in &variant_values {
+        spec.push(';');
+        spec.push_str(&name.to_string());
+        spec.push('=');
+        spec.push_str(&value.to_string());
+    }
+    let spec = LitStr::new(&spec, input.ident.span());
+    let name = &input.ident;
+    let handle = format_ident!("{}Handle", name);
+    let entry_mod = format_ident!("__dotnet_enum_{}", name);
+    let variants = variant_values
+        .iter()
+        .map(|(variant, value)| quote! { #value => ::core::option::Option::Some(Self::#variant) });
+    let expanded = quote! {
+        #input
+
+        #[allow(non_camel_case_types, dead_code)]
+        pub type #handle = ::mycorrhiza::intrinsics::RustcCLRInteropManagedStruct<"", #managed_name, #size>;
+
+        impl #name {
+            #[inline]
+            pub fn value(self) -> #repr_ty { self as #repr_ty }
+
+            #[inline]
+            pub fn from_value(value: #repr_ty) -> ::core::option::Option<Self> {
+                match value as i128 { #(#variants,)* _ => ::core::option::Option::None }
+            }
+
+            #[inline]
+            pub fn to_handle(self) -> #handle {
+                let value: #repr_ty = self as #repr_ty;
+                unsafe { ::core::mem::transmute_copy(&value) }
+            }
+
+            #[inline]
+            pub fn from_handle(value: #handle) -> ::core::option::Option<Self> {
+                let value: #repr_ty = unsafe { ::core::mem::transmute_copy(&value) };
+                Self::from_value(value)
+            }
+        }
+
+        impl ::mycorrhiza::enums::DotNetExportEnum for #name {
+            type Managed = #handle;
+            fn into_managed(self) -> Self::Managed { self.to_handle() }
+            fn try_from_managed(value: Self::Managed) -> ::core::option::Option<Self> { Self::from_handle(value) }
+        }
+
+        #[allow(non_snake_case, dead_code, unused_variables, internal_features)]
+        mod #entry_mod {
+            #[used]
+            static PREVENT_DCE: fn() = rustc_codegen_clr_comptime_entrypoint;
+            #[inline(never)]
+            pub fn rustc_codegen_clr_comptime_entrypoint() {
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_new_typedef::<#managed_name, true, "", "", true>();
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_set_enum::<#spec>(class);
+                ::mycorrhiza::comptime::rustc_codegen_clr_finish_type(class);
+            }
+        }
+    };
+    expanded.into()
+}
+
 /// Declares a conventional managed data-transfer object.
 ///
 /// This is deliberately only validating sugar for
@@ -772,8 +1001,12 @@ pub fn dotnet_dto(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 #[cfg(test)]
 mod dotnet_export_name_tests {
-    use super::{dotnet_export_member_id, dto_backing_name, parse_dotnet_export_args};
+    use super::{
+        clr_member_id_type_name, dotnet_export_member_id, dto_backing_name,
+        imported_delegate_param, parse_dotnet_export_args,
+    };
     use quote::quote;
+    use syn::parse_quote;
 
     #[test]
     fn accepts_an_ordinary_managed_name() {
@@ -811,11 +1044,52 @@ mod dotnet_export_name_tests {
     }
 
     #[test]
+    fn accepts_registered_enum_types() {
+        let parsed =
+            parse_dotnet_export_args(quote!(name = "Roundtrip", enums(Status, Mode))).unwrap();
+        assert_eq!(parsed.name.as_deref(), Some("Roundtrip"));
+        assert_eq!(parsed.enum_types.len(), 2);
+    }
+
+    #[test]
     fn xml_member_ids_use_the_configured_managed_name() {
         assert_eq!(
             dotnet_export_member_id("ParsePosition", &["System.String".to_string()]),
             "M:MainModule.ParsePosition(System.String)"
         );
+    }
+
+    #[test]
+    fn imported_delegate_member_ids_keep_the_constructed_clr_signature() {
+        assert_eq!(
+            clr_member_id_type_name(&parse_quote!(Func2<i32, i64, bool>)).as_deref(),
+            Some("System.Func{System.Int32,System.Int64,System.Boolean}")
+        );
+    }
+
+    #[test]
+    fn imported_delegates_accept_supported_shapes_and_reject_owned_strings() {
+        let supported = imported_delegate_param(&parse_quote!(Action2<i32, bool>))
+            .expect("recognized delegate")
+            .expect("primitive delegate should marshal");
+        assert!(supported.to_rust.is_some());
+
+        let managed_string =
+            imported_delegate_param(&parse_quote!(Func1<mycorrhiza::system::MString, i32>))
+                .expect("recognized delegate")
+                .expect("managed string handle should marshal");
+        assert!(managed_string.to_rust.is_some());
+
+        let arity_three = imported_delegate_param(&parse_quote!(Func3<i32, i32, i32, i32>))
+            .expect("recognized delegate")
+            .expect("three-argument delegate should marshal");
+        assert!(arity_three.to_rust.is_some());
+
+        let error = imported_delegate_param(&parse_quote!(Func1<String, i32>))
+            .expect("recognized delegate")
+            .err()
+            .expect("owned String callback boundary must be rejected");
+        assert!(error.contains("explicit callback-boundary marshalling policy"));
     }
 }
 
@@ -1167,8 +1441,8 @@ fn first_generic_param_mention(
 /// definition — the metadata name carries the CLS backtick-arity suffix (`IBox`1`), one
 /// `GenericParam` row per parameter, and a bare `T` in a member's parameter/return position
 /// becomes `ELEMENT_TYPE_VAR` (C#'s `T`). C# implements any instantiation (`class IntBox :
-/// IBox<int>`), and the parameterized `IBoxHandle<T>` alias lets Rust signatures reference an
-/// instantiation (e.g. `IBoxHandle<i32>` = `IBox<int>` in a `#[dotnet_export]` fn):
+/// `IBox<int>`), and the parameterized ``IBoxHandle<T>`` alias lets Rust signatures reference an
+/// instantiation (e.g. ``IBoxHandle<i32>`` = `IBox<int>` in a `#[dotnet_export]` fn):
 ///
 /// ```ignore
 /// #[dotnet_interface]
@@ -3153,6 +3427,29 @@ fn single_generic_arg(ty: &Type) -> Option<(String, &Type)> {
     Some((seg.ident.to_string(), inner))
 }
 
+/// A trailing generic type path as `(name, type arguments)`, rejecting lifetime/const arguments.
+/// This is intentionally separate from [`single_generic_arg`]: imported delegate wrappers have
+/// arities one through three, while the existing Option/Vec/Task helpers are clearer with the
+/// stricter one-argument shape.
+fn generic_type_args(ty: &Type) -> Option<(String, Vec<&Type>)> {
+    let Type::Path(tp) = ty else { return None };
+    if tp.qself.is_some() {
+        return None;
+    }
+    let seg = tp.path.segments.last()?;
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    let mut types = Vec::with_capacity(args.args.len());
+    for arg in &args.args {
+        let syn::GenericArgument::Type(ty) = arg else {
+            return None;
+        };
+        types.push(ty);
+    }
+    Some((seg.ident.to_string(), types))
+}
+
 /// If `ty` is `Result<T, E>` (possibly path-qualified), return its two type arguments.
 fn result_args(ty: &Type) -> Option<(&Type, &Type)> {
     let Type::Path(tp) = ty else { return None };
@@ -3243,6 +3540,178 @@ fn managed_array_elem(ty: &Type) -> Option<Result<&Type, String>> {
     }
 }
 
+/// Recognize the concrete delegate wrappers whose managed handles can cross into an exported Rust
+/// API unchanged. The generated shim reconstructs the ergonomic wrapper with `from_handle`, after
+/// which ordinary Rust code calls `.invoke(..)`. Primitive arguments/results and `MString` managed
+/// handles cross unchanged. Owned Rust `String` and other values still need an explicit
+/// callback-boundary marshalling policy rather than an unchecked promise.
+fn imported_delegate_param(ty: &Type) -> Option<Result<Marshal, String>> {
+    let (name, args) = generic_type_args(ty)?;
+    let expected_arity = match name.as_str() {
+        "Action1" | "Comparison" => 1,
+        "Action2" | "Func1" => 2,
+        "Action3" | "Func2" => 3,
+        "Func3" => 4,
+        _ => return None,
+    };
+    if args.len() != expected_arity {
+        return Some(Err(format!(
+            "#[dotnet_export]: `{name}` expects {expected_arity} type argument(s), found {}.",
+            args.len()
+        )));
+    }
+    for arg in &args {
+        if type_last_ident_is(arg, "MString") {
+            continue;
+        }
+        let Some(arg_name) = simple_path_ident(arg) else {
+            return Some(Err(format!(
+                "#[dotnet_export]: imported `{name}` delegate types must be passthrough primitives \
+                 or `MString`; unsupported callback type `{}`.",
+                quote! { #arg }
+            )));
+        };
+        if !is_passthrough_primitive(&arg_name) {
+            return Some(Err(format!(
+                "#[dotnet_export]: imported `{name}` delegate types must be passthrough primitives \
+                 or `MString`; `{arg_name}` needs an explicit callback-boundary marshalling policy."
+            )));
+        }
+    }
+
+    let args: Vec<Type> = args.into_iter().cloned().collect();
+    let marshal = match (name.as_str(), args.as_slice()) {
+        ("Action1", [a0]) => {
+            let a0 = a0.clone();
+            Marshal {
+                seam_ty: quote! {
+                    ::mycorrhiza::intrinsics::RustcCLRInteropManagedGeneric<
+                        { "System.Private.CoreLib" }, { "System.Action" }, (#a0,)
+                    >
+                },
+                to_rust: Some(Box::new(move |id| {
+                    quote! { let #id = ::mycorrhiza::delegate::Action1::<#a0>::from_handle(#id); }
+                })),
+                from_rust: None,
+                returns_managed_handle: false,
+            }
+        }
+        ("Action2", [a0, a1]) => {
+            let (a0, a1) = (a0.clone(), a1.clone());
+            Marshal {
+                seam_ty: quote! {
+                    ::mycorrhiza::intrinsics::RustcCLRInteropManagedGeneric<
+                        { "System.Private.CoreLib" }, { "System.Action" }, (#a0, #a1)
+                    >
+                },
+                to_rust: Some(Box::new(move |id| {
+                    quote! {
+                        let #id = ::mycorrhiza::delegate::Action2::<#a0, #a1>::from_handle(#id);
+                    }
+                })),
+                from_rust: None,
+                returns_managed_handle: false,
+            }
+        }
+        ("Action3", [a0, a1, a2]) => {
+            let (a0, a1, a2) = (a0.clone(), a1.clone(), a2.clone());
+            Marshal {
+                seam_ty: quote! {
+                    ::mycorrhiza::intrinsics::RustcCLRInteropManagedGeneric<
+                        { "System.Private.CoreLib" }, { "System.Action" }, (#a0, #a1, #a2)
+                    >
+                },
+                to_rust: Some(Box::new(move |id| {
+                    quote! {
+                        let #id = ::mycorrhiza::delegate::Action3::<#a0, #a1, #a2>::from_handle(#id);
+                    }
+                })),
+                from_rust: None,
+                returns_managed_handle: false,
+            }
+        }
+        ("Func1", [a0, ret]) => {
+            let (a0, ret) = (a0.clone(), ret.clone());
+            Marshal {
+                seam_ty: quote! {
+                    ::mycorrhiza::intrinsics::RustcCLRInteropManagedGeneric<
+                        { "System.Private.CoreLib" }, { "System.Func" }, (#a0, #ret)
+                    >
+                },
+                to_rust: Some(Box::new(move |id| {
+                    quote! {
+                        let #id = ::mycorrhiza::delegate::Func1::<#a0, #ret>::from_handle(#id);
+                    }
+                })),
+                from_rust: None,
+                returns_managed_handle: false,
+            }
+        }
+        ("Func2", [a0, a1, ret]) => {
+            let (a0, a1, ret) = (a0.clone(), a1.clone(), ret.clone());
+            Marshal {
+                seam_ty: quote! {
+                    ::mycorrhiza::intrinsics::RustcCLRInteropManagedGeneric<
+                        { "System.Private.CoreLib" }, { "System.Func" }, (#a0, #a1, #ret)
+                    >
+                },
+                to_rust: Some(Box::new(move |id| {
+                    quote! {
+                        let #id = ::mycorrhiza::delegate::Func2::<#a0, #a1, #ret>::from_handle(#id);
+                    }
+                })),
+                from_rust: None,
+                returns_managed_handle: false,
+            }
+        }
+        ("Func3", [a0, a1, a2, ret]) => {
+            let (a0, a1, a2, ret) = (a0.clone(), a1.clone(), a2.clone(), ret.clone());
+            Marshal {
+                seam_ty: quote! {
+                    ::mycorrhiza::intrinsics::RustcCLRInteropManagedGeneric<
+                        { "System.Private.CoreLib" }, { "System.Func" }, (#a0, #a1, #a2, #ret)
+                    >
+                },
+                to_rust: Some(Box::new(move |id| {
+                    quote! {
+                        let #id = ::mycorrhiza::delegate::Func3::<#a0, #a1, #a2, #ret>::from_handle(#id);
+                    }
+                })),
+                from_rust: None,
+                returns_managed_handle: false,
+            }
+        }
+        ("Comparison", [a0]) => {
+            let a0 = a0.clone();
+            Marshal {
+                seam_ty: quote! {
+                    ::mycorrhiza::intrinsics::RustcCLRInteropManagedGeneric<
+                        { "System.Private.CoreLib" }, { "System.Comparison" }, (#a0,)
+                    >
+                },
+                to_rust: Some(Box::new(move |id| {
+                    quote! {
+                        let #id = ::mycorrhiza::delegate::Comparison::<#a0>::from_handle(#id);
+                    }
+                })),
+                from_rust: None,
+                returns_managed_handle: false,
+            }
+        }
+        _ => unreachable!("delegate name and arity were validated above"),
+    };
+    Some(Ok(marshal))
+}
+
+fn is_imported_delegate_type(ty: &Type) -> bool {
+    generic_type_args(ty).is_some_and(|(name, _)| {
+        matches!(
+            name.as_str(),
+            "Action1" | "Action2" | "Action3" | "Func1" | "Func2" | "Func3" | "Comparison"
+        )
+    })
+}
+
 /// Resolve how a **parameter** type is marshalled, or `Err(message)` if unsupported.
 fn marshal_param(ty: &Type) -> Result<Marshal, String> {
     // `&str` (shared ref to a `str`) → managed `System.String` inbound.
@@ -3271,6 +3740,10 @@ fn marshal_param(ty: &Type) -> Result<Marshal, String> {
         ));
     }
 
+    if let Some(delegate) = imported_delegate_param(ty) {
+        return delegate;
+    }
+
     if let Some(name) = simple_path_ident(ty) {
         if name == "String" {
             return Ok(Marshal {
@@ -3295,8 +3768,10 @@ fn marshal_param(ty: &Type) -> Result<Marshal, String> {
         }
         return Err(format!(
             "#[dotnet_export]: unsupported parameter type `{name}`. Supported: the integer/float \
-             primitives, `bool`, `&str`, `String`, `Option<T>`, and `Vec<T>` (the last two for a \
-             passthrough primitive `T`)."
+            primitives, `bool`, `&str`, `String`, concrete `Action1`/`Action2`/`Action3`/\
+            `Func1`/`Func2`/`Func3`/\
+            `Comparison` delegates, `Option<T>`, and `Vec<T>` (delegate elements may be passthrough \
+            primitives or `MString`; collection elements must be passthrough primitives)."
         ));
     }
 
@@ -3391,8 +3866,9 @@ fn marshal_param(ty: &Type) -> Result<Marshal, String> {
 
     Err(format!(
         "#[dotnet_export]: unsupported parameter type `{}`. Supported: the integer/float primitives, \
-         `bool`, `&str`, `String`, `Option<T>`, and `Vec<T>` (the last two for a passthrough \
-         primitive `T`).",
+         `bool`, `&str`, `String`, concrete `Action1`/`Action2`/`Action3`/`Func1`/`Func2`/\
+         `Func3`/`Comparison` delegates, `Option<T>`, and `Vec<T>` (delegate elements may be \
+         passthrough primitives or `MString`; collection elements must be passthrough primitives).",
         quote! { #ty }
     ))
 }
@@ -3650,37 +4126,62 @@ fn scrape_doc_comment(attrs: &[syn::Attribute]) -> Option<String> {
 /// managed handle to a real `System.String`); everything else in the supported surface is one of
 /// the passthrough primitives, each of which XML-doc member-ID syntax spells with its full CLR
 /// name, not its C#/Rust keyword (`System.Int32`, not `int`/`i32`).
-fn clr_member_id_type_name(ty: &Type) -> Option<&'static str> {
+fn clr_member_id_type_name(ty: &Type) -> Option<String> {
     if let Type::Reference(r) = ty {
         if r.mutability.is_none() {
             if let Type::Path(tp) = &*r.elem {
                 if tp.qself.is_none() && tp.path.is_ident("str") {
-                    return Some("System.String");
+                    return Some("System.String".to_string());
                 }
             }
         }
         return None;
     }
+    if let Some((name, args)) = generic_type_args(ty) {
+        let expected = match name.as_str() {
+            "Action1" | "Comparison" => 1,
+            "Action2" | "Func1" => 2,
+            "Action3" | "Func2" => 3,
+            "Func3" => 4,
+            _ => 0,
+        };
+        if expected != 0 && args.len() == expected {
+            let args = args
+                .into_iter()
+                .map(clr_member_id_type_name)
+                .collect::<Option<Vec<_>>>()?;
+            let clr_name = match name.as_str() {
+                "Action1" | "Action2" | "Action3" => "System.Action",
+                "Func1" | "Func2" | "Func3" => "System.Func",
+                "Comparison" => "System.Comparison",
+                _ => unreachable!(),
+            };
+            return Some(format!("{clr_name}{{{}}}", args.join(",")));
+        }
+    }
     let name = simple_path_ident(ty)?;
-    Some(match name.as_str() {
-        "String" => "System.String",
-        "bool" => "System.Boolean",
-        "i8" => "System.SByte",
-        "i16" => "System.Int16",
-        "i32" => "System.Int32",
-        "i64" => "System.Int64",
-        "i128" => "System.Int128",
-        "u8" => "System.Byte",
-        "u16" => "System.UInt16",
-        "u32" => "System.UInt32",
-        "u64" => "System.UInt64",
-        "u128" => "System.UInt128",
-        "isize" => "System.IntPtr",
-        "usize" => "System.UIntPtr",
-        "f32" => "System.Single",
-        "f64" => "System.Double",
-        _ => return None,
-    })
+    Some(
+        match name.as_str() {
+            "String" | "MString" => "System.String",
+            "bool" => "System.Boolean",
+            "i8" => "System.SByte",
+            "i16" => "System.Int16",
+            "i32" => "System.Int32",
+            "i64" => "System.Int64",
+            "i128" => "System.Int128",
+            "u8" => "System.Byte",
+            "u16" => "System.UInt16",
+            "u32" => "System.UInt32",
+            "u64" => "System.UInt64",
+            "u128" => "System.UInt128",
+            "isize" => "System.IntPtr",
+            "usize" => "System.UIntPtr",
+            "f32" => "System.Single",
+            "f64" => "System.Double",
+            _ => return None,
+        }
+        .to_string(),
+    )
 }
 
 /// Append one XML-doc entry for a `#[dotnet_export]`'d fn to a per-crate sidecar-doc scratch file,
@@ -3766,10 +4267,21 @@ fn serde_json_line(member: &str, summary: &str) -> String {
 /// The value deliberately has a narrower contract than raw CLI metadata: it must be an ASCII C#
 /// identifier, so every accepted value is callable as an ordinary C# member without reflection,
 /// escaping, or generated-source quoting. The Rust function identifier is never changed.
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Default)]
 struct DotnetExportArgs {
     name: Option<String>,
     error_exception: bool,
+    enum_types: Vec<Type>,
+}
+
+impl std::fmt::Debug for DotnetExportArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DotnetExportArgs")
+            .field("name", &self.name)
+            .field("error_exception", &self.error_exception)
+            .field("enum_type_count", &self.enum_types.len())
+            .finish()
+    }
 }
 
 fn parse_dotnet_export_args(attr: proc_macro2::TokenStream) -> syn::Result<DotnetExportArgs> {
@@ -3777,10 +4289,40 @@ fn parse_dotnet_export_args(attr: proc_macro2::TokenStream) -> syn::Result<Dotne
         return Ok(DotnetExportArgs::default());
     }
 
-    let parser = Punctuated::<MetaNameValue, Token![,]>::parse_terminated;
+    let parser = Punctuated::<syn::Meta, Token![,]>::parse_terminated;
     let entries = syn::parse::Parser::parse2(parser, attr)?;
     let mut parsed = DotnetExportArgs::default();
-    for entry in entries {
+    for meta in entries {
+        if let syn::Meta::List(list) = &meta {
+            if list.path.is_ident("enums") {
+                let types =
+                    list.parse_args_with(Punctuated::<Type, Token![,]>::parse_terminated)?;
+                if types.is_empty() {
+                    return Err(syn::Error::new(
+                        list.span(),
+                        "#[dotnet_export]: `enums(...)` needs at least one enum type",
+                    ));
+                }
+                for ty in types {
+                    if parsed.enum_types.iter().any(|existing| {
+                        quote! { #existing }.to_string() == quote! { #ty }.to_string()
+                    }) {
+                        return Err(syn::Error::new(
+                            ty.span(),
+                            "#[dotnet_export]: enum type listed more than once",
+                        ));
+                    }
+                    parsed.enum_types.push(ty);
+                }
+                continue;
+            }
+        }
+        let syn::Meta::NameValue(entry) = meta else {
+            return Err(syn::Error::new(
+                meta.span(),
+                "#[dotnet_export]: expected `name = \"ManagedName\"`, `error = \"exception\"`, or `enums(Type, ...)`",
+            ));
+        };
         if entry.path.is_ident("name") {
             if parsed.name.is_some() {
                 return Err(syn::Error::new(
@@ -3840,11 +4382,53 @@ fn parse_dotnet_export_args(attr: proc_macro2::TokenStream) -> syn::Result<Dotne
         } else {
             return Err(syn::Error::new(
                 entry.path.span(),
-                "#[dotnet_export]: unknown attribute key; expected `name = \"ManagedName\"` or `error = \"exception\"`",
+                "#[dotnet_export]: unknown attribute key; expected `name = \"ManagedName\"`, `error = \"exception\"`, or `enums(Type, ...)`",
             ));
         }
     }
     Ok(parsed)
+}
+
+fn registered_export_enum(ty: &Type, enum_types: &[Type]) -> bool {
+    let Some(actual) = simple_path_ident(ty) else {
+        return false;
+    };
+    enum_types
+        .iter()
+        .any(|candidate| simple_path_ident(candidate).is_some_and(|name| name == actual))
+}
+
+fn marshal_export_enum_param(ty: &Type) -> Marshal {
+    let ty = ty.clone();
+    Marshal {
+        seam_ty: quote! { <#ty as ::mycorrhiza::enums::DotNetExportEnum>::Managed },
+        to_rust: Some(Box::new(move |id| {
+            quote! {
+                let #id: #ty = match <#ty as ::mycorrhiza::enums::DotNetExportEnum>::try_from_managed(#id) {
+                    ::core::option::Option::Some(value) => value,
+                    ::core::option::Option::None => ::mycorrhiza::error::throw_msg(
+                        concat!("invalid numeric value for exported enum `", stringify!(#ty), "`")
+                    ),
+                };
+            }
+        })),
+        from_rust: None,
+        returns_managed_handle: false,
+    }
+}
+
+fn marshal_export_enum_return(ty: &Type) -> Marshal {
+    let ty = ty.clone();
+    Marshal {
+        seam_ty: quote! { <#ty as ::mycorrhiza::enums::DotNetExportEnum>::Managed },
+        to_rust: None,
+        from_rust: Some(Box::new(move |id| {
+            quote! {
+                <#ty as ::mycorrhiza::enums::DotNetExportEnum>::into_managed(#id)
+            }
+        })),
+        returns_managed_handle: false,
+    }
 }
 
 /// `#[dotnet_export]` on a free function — makes it callable from C# as a plain, typed method on
@@ -3863,7 +4447,10 @@ fn parse_dotnet_export_args(attr: proc_macro2::TokenStream) -> syn::Result<Dotne
 /// untouched (still callable from Rust) and emits a hidden `#[unsafe(no_mangle)] extern "C"` **shim** that
 /// crosses the managed seam: each supported argument/return type is marshalled to/from its
 /// CIL-visible form. `&str`/`String` cross as a real managed `System.String` (so C# sees `string`,
-/// not a pointer pair); the numeric/`bool` primitives pass through unchanged.
+/// not a pointer pair); the numeric/`bool` primitives pass through unchanged. Concrete
+/// `Action1`/`Action2`/`Action3`/`Func1`/`Func2`/`Func3`/`Comparison` parameters with primitive or
+/// managed-`MString` signatures cross as their real managed delegate types and are reconstructed as
+/// invokable Rust wrappers.
 ///
 /// The consuming `cdylib` must depend on `mycorrhiza`. Types outside the supported set produce a
 /// clear compile error (marshalling is never faked).
@@ -3875,6 +4462,7 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     let func = parse_macro_input!(item as ItemFn);
     let sig = &func.sig;
+    let enum_types = &export_args.enum_types;
 
     // Refuse constructs the seam can't express, with a precise message.
     if let Some(c) = &sig.constness {
@@ -3928,6 +4516,7 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut pre_call = Vec::new(); // in-conversion statements (seam value → idiomatic Rust value).
     let mut call_args = Vec::new(); // expressions passed to the inner fn.
     let mut doc_param_types = Vec::new(); // CLR type names, for the XML-doc member-ID (see below).
+    let mut doc_param_types_complete = true;
     for (idx, arg) in sig.inputs.iter().enumerate() {
         let pat_ty = match arg {
             FnArg::Receiver(r) => {
@@ -3943,16 +4532,25 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
         // Use a fresh, positional binding name so we don't depend on the user's pattern being a
         // plain identifier (it may be `mut x`, `_`, a tuple pattern, …).
         let pname = format_ident!("arg{}", idx);
-        let marshal = match marshal_param(&pat_ty.ty) {
-            Ok(m) => m,
-            Err(msg) => {
-                return syn::Error::new(pat_ty.ty.span(), msg)
-                    .to_compile_error()
-                    .into();
+        let imported_delegate = is_imported_delegate_type(&pat_ty.ty);
+        let marshal = if registered_export_enum(&pat_ty.ty, enum_types) {
+            marshal_export_enum_param(&pat_ty.ty)
+        } else {
+            match marshal_param(&pat_ty.ty) {
+                Ok(m) => m,
+                Err(msg) => {
+                    return syn::Error::new(pat_ty.ty.span(), msg)
+                        .to_compile_error()
+                        .into();
+                }
             }
         };
         if let Some(clr_name) = clr_member_id_type_name(&pat_ty.ty) {
-            doc_param_types.push(clr_name.to_string());
+            doc_param_types.push(clr_name);
+        } else {
+            // Never emit a plausible-but-wrong member ID with a missing parameter. Unsupported
+            // XML-doc shapes can simply omit the entry; consumers cannot match an incorrect one.
+            doc_param_types_complete = false;
         }
         let seam_ty = &marshal.seam_ty;
         seam_params.push(quote! { #pname: #seam_ty });
@@ -3963,6 +4561,25 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
                 pre_call.push(conv(&pname));
                 if matches!(&*pat_ty.ty, Type::Reference(_)) {
                     call_args.push(quote! { &#pname });
+                } else if imported_delegate {
+                    // A delegate wrapper contains a managed object reference. Moving it directly
+                    // into `catch_unwind`'s closure makes rustc erase a managed-containing closure
+                    // environment through `*mut u8`, which this backend correctly rejects as a
+                    // ManagedPtrCast in unoptimized/debug MIR. Keep the value in an outer Option;
+                    // the closure captures only `&mut Option<Wrapper>` and takes it once. This is
+                    // the same GC-safe shape used below for managed return values.
+                    let slot = format_ident!("__managed_param_slot_{}", idx);
+                    pre_call.push(quote! {
+                        let mut #slot = ::core::option::Option::Some(#pname);
+                    });
+                    call_args.push(quote! {
+                        match #slot.take() {
+                            ::core::option::Option::Some(__value) => __value,
+                            ::core::option::Option::None => unreachable!(
+                                "dotnet_export: managed delegate parameter consumed more than once"
+                            ),
+                        }
+                    });
                 } else {
                     call_args.push(quote! { #pname });
                 }
@@ -3974,8 +4591,10 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Scrape `#[doc]` attrs and, if present, record an XML-doc sidecar entry keyed by the exact
     // ECMA-334 member-ID this fn resolves to as a `MainModule` static method. Best-effort: any
     // failure to write is silently ignored (never fails the actual compile over doc generation).
-    if let Some(doc) = scrape_doc_comment(&func.attrs) {
-        emit_xmldoc_entry(&managed_name, &doc_param_types, &doc);
+    if doc_param_types_complete {
+        if let Some(doc) = scrape_doc_comment(&func.attrs) {
+            emit_xmldoc_entry(&managed_name, &doc_param_types, &doc);
+        }
     }
 
     // Marshal the return type. `returns_managed_handle` (Task/TaskT<T>) picks a different
@@ -4006,10 +4625,14 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
                 ty
             };
-            let marshal = match marshal_return(marshal_ty) {
-                Ok(m) => m,
-                Err(msg) => {
-                    return syn::Error::new(ty.span(), msg).to_compile_error().into();
+            let marshal = if registered_export_enum(marshal_ty, enum_types) {
+                marshal_export_enum_return(marshal_ty)
+            } else {
+                match marshal_return(marshal_ty) {
+                    Ok(m) => m,
+                    Err(msg) => {
+                        return syn::Error::new(ty.span(), msg).to_compile_error().into();
+                    }
                 }
             };
             if result_error_ty.is_some() && marshal.returns_managed_handle {

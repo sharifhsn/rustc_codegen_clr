@@ -112,11 +112,9 @@ impl Paths {
         match mode {
             Mode::Installed { home } => {
                 if !home.is_dir() {
-                    bail!(
-                        "no install home at {} (run `cargo dotnet setup` first, from a repo checkout)",
-                        home.display()
-                    );
+                    bail!(missing_install_home_message(home));
                 }
+                crate::bundle::verify_installed_if_locked(home)?;
                 let backend_name = facts.backend_dylib_name();
                 let backend_dylib = home.join("bin").join(backend_name);
                 let linker = home.join(format!("bin/linker{}", facts.exe_ext));
@@ -187,27 +185,32 @@ impl Paths {
     }
 }
 
-/// The target .NET runtime version selected by `--dotnet` (env `DOTNET_VERSION`). The front-end is
-/// the *producer* of the version: it exports `DOTNET_VERSION` to the inner cargo (so both the codegen
-/// backend and the cilly linker see it) and selects the matching CoreCLR ilasm. It deliberately does
-/// NOT know per-version BCL tokens / `.ver` strings — those live in cilly (`cilly::DotnetRuntime`).
+fn missing_install_home_message(home: &Path) -> String {
+    format!(
+        "the cargo-dotnet command is installed, but its SDK home does not exist: {}\n\
+A bare `cargo install` installs only the command. Complete either supported installation path:\n  \
+from a rustc_codegen_clr checkout: cargo dotnet setup --from-repo /path/to/rustc_codegen_clr\n  \
+from a release SDK bundle:         cargo dotnet bundle install /path/to/cargo-dotnet-sdk-<host>.zip",
+        home.display()
+    )
+}
+
+/// The target .NET runtime selected by `--dotnet` (env `DOTNET_VERSION`).
+///
+/// The compiler still contains compatibility machinery for older runtimes, but the public SDK has
+/// one supported profile: .NET 10. Keeping that choice here prevents scaffolds, linker metadata,
+/// ILAsm, and NuGet target frameworks from silently drifting apart.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum DotnetVersion {
-    /// .NET 8.
-    Net8,
-    /// .NET 9.
-    Net9,
-    /// .NET 10 (default).
+    /// .NET 10.
     #[default]
     Net10,
 }
 impl DotnetVersion {
-    /// Target-framework moniker for NuGet packaging (`net8.0` / `net9.0`).
+    /// Target-framework moniker for NuGet packaging.
     #[must_use]
     pub fn tfm(self) -> &'static str {
         match self {
-            DotnetVersion::Net8 => "net8.0",
-            DotnetVersion::Net9 => "net9.0",
             DotnetVersion::Net10 => "net10.0",
         }
     }
@@ -215,18 +218,13 @@ impl DotnetVersion {
     #[must_use]
     pub fn as_env(self) -> &'static str {
         match self {
-            DotnetVersion::Net8 => "8",
-            DotnetVersion::Net9 => "9",
             DotnetVersion::Net10 => "10",
         }
     }
-    /// The matching CoreCLR ilasm tool dir under `$HOME/.dotnet` (each runtime needs its own — a
-    /// net8 ilasm's PE is rejected by the net9 runtime and vice-versa).
+    /// The matching CoreCLR ILAsm tool directory under `$HOME/.dotnet`.
     #[must_use]
     pub fn ilasm_tool_dir(self) -> &'static str {
         match self {
-            DotnetVersion::Net8 => "ilasm-tool",
-            DotnetVersion::Net9 => "ilasm9-tool",
             DotnetVersion::Net10 => "ilasm10-tool",
         }
     }
@@ -235,11 +233,9 @@ impl std::str::FromStr for DotnetVersion {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim() {
-            "8" | "net8" | "net8.0" => Ok(DotnetVersion::Net8),
-            "9" | "net9" | "net9.0" => Ok(DotnetVersion::Net9),
             "10" | "net10" | "net10.0" => Ok(DotnetVersion::Net10),
             other => Err(format!(
-                "--dotnet: invalid value {other:?}; expected 8, 9, or 10"
+                "--dotnet: unsupported value {other:?}; rust-dotnet 0.0.1 supports .NET 10"
             )),
         }
     }
@@ -268,9 +264,27 @@ pub struct Context {
     pub dotnet_heal: Option<(PathBuf, PathBuf)>,
     /// Explicit release-package identity, if the crate opted into schema 1.
     pub managed_identity: Option<ManagedIdentity>,
+    /// Optional Source Link URL template for `/_/consumer/*` documents. The validated URL is
+    /// retained separately from the deterministic JSON passed to the linker so receipts stay
+    /// human-readable.
+    pub source_link_url: Option<String>,
 }
 
 impl Context {
+    pub fn is_offline(&self) -> bool {
+        self.flags
+            .extra_cargo
+            .iter()
+            .any(|flag| flag == "--offline" || flag == "--frozen")
+    }
+
+    pub fn requires_existing_lock(&self) -> bool {
+        self.flags
+            .extra_cargo
+            .iter()
+            .any(|flag| flag == "--locked" || flag == "--frozen")
+    }
+
     /// Fold mode detection, backend resolution, the path layout, and the host preflight
     /// into ONE typed value. `is_run` selects the run-the-apphost behaviour.
     pub fn resolve(args: &BuildArgs, is_run: bool) -> Result<Self> {
@@ -287,6 +301,7 @@ impl Context {
 
         let paths = Paths::resolve(&mode, &host, &crate_dir)?;
         let managed_identity = resolve_managed_identity(&crate_dir)?;
+        let source_link_url = validate_source_link_url(args.source_link_url.as_deref())?;
         if managed_identity.is_some() {
             validate_managed_identity_build(args, &crate_dir)?;
         }
@@ -345,6 +360,7 @@ impl Context {
             dotnet,
             dotnet_heal,
             managed_identity,
+            source_link_url,
         })
     }
 
@@ -372,6 +388,32 @@ impl Context {
         }
         Ok(PathBuf::from(s))
     }
+}
+
+fn validate_source_link_url(value: Option<&str>) -> Result<Option<String>> {
+    let Some(value) = value else { return Ok(None) };
+    if !value.starts_with("https://") {
+        bail!("--source-link-url must use https://");
+    }
+    if value.chars().filter(|&ch| ch == '*').count() != 1 {
+        bail!("--source-link-url must contain exactly one `*` placeholder");
+    }
+    if value.chars().any(char::is_whitespace) {
+        bail!("--source-link-url must not contain whitespace");
+    }
+    let authority = value
+        .strip_prefix("https://")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    if authority.contains('@') {
+        bail!("--source-link-url must not contain embedded credentials");
+    }
+    if value.contains('?') || value.contains('#') {
+        bail!("--source-link-url must not contain query parameters or fragments");
+    }
+    Ok(Some(value.to_string()))
 }
 
 fn cargo_package(crate_dir: &Path) -> Result<cargo_metadata::Package> {
@@ -581,6 +623,47 @@ fn is_clr_identifier(segment: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_runtime_profile_is_dotnet_10_only() {
+        assert_eq!("10".parse::<DotnetVersion>().unwrap(), DotnetVersion::Net10);
+        for unsupported in ["8", "9", "net8.0", "net9.0", "11"] {
+            let error = unsupported.parse::<DotnetVersion>().unwrap_err();
+            assert!(error.contains("supports .NET 10"), "{error}");
+        }
+    }
+
+    #[test]
+    fn missing_install_home_explains_both_exact_recovery_paths() {
+        let message = missing_install_home_message(Path::new("/tmp/missing-sdk"));
+        assert!(message.contains("A bare `cargo install` installs only the command"));
+        assert!(message.contains("cargo dotnet setup --from-repo /path/to/rustc_codegen_clr"));
+        assert!(
+            message.contains("cargo dotnet bundle install /path/to/cargo-dotnet-sdk-<host>.zip")
+        );
+    }
+
+    #[test]
+    fn source_link_url_is_https_single_wildcard_and_credential_free() {
+        assert_eq!(
+            validate_source_link_url(Some("https://example.invalid/revision/*")).unwrap(),
+            Some("https://example.invalid/revision/*".to_string())
+        );
+        for invalid in [
+            "http://example.invalid/*",
+            "https://example.invalid/no-wildcard",
+            "https://example.invalid/**",
+            "https://user:secret@example.invalid/*",
+            "https://example.invalid/bad path/*",
+            "https://example.invalid/*?token=secret",
+            "https://example.invalid/*#fragment",
+        ] {
+            assert!(
+                validate_source_link_url(Some(invalid)).is_err(),
+                "accepted invalid Source Link URL {invalid:?}"
+            );
+        }
+    }
 
     #[test]
     fn managed_identity_projects_a_distinct_public_type() {

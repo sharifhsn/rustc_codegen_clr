@@ -218,8 +218,9 @@ hook / call_static), or release-build green (cmp / simd). Host-buildable crates
   `SetField` parity with `LdField` (a managed reference type accepts `stfld`/`ldfld` on the objref
   directly — valid CIL the exporter already emits). Verified on real CoreCLR: `cargo_tests/cd_typedef`
   (Rust lib + C# consumer) 4/4; `::stable` gate + the WF-9 interop tests (cd_generic 18/18, cd_rustvec
-  37/37) green, no regression. Remaining `#[dotnet_class]` follow-up: virtual methods (needs a
-  re-open-an-existing-class comptime capability) and managed-type fields.
+  37/37) green, no regression. Later work closed the original follow-ups too: managed-type fields,
+  interface implementation, inheritance, and explicit base-slot virtual overrides now ship; see
+  `cd_typedef`, `cd_iface`, `cd_override`, and `cd_bgservice_bgtest`.
 
 **Deferred / non-goal:**
 

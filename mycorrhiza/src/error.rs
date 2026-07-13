@@ -3,18 +3,22 @@
 //! Two everyday .NET habits become native Rust here:
 //!
 //! * **`null` ↔ [`Option`]** — a managed reference that might be `null` (the most common .NET
-//!   "no value" signal) is surfaced as an [`Option`] of a Rust value via [`from_nullable`] / the
-//!   [`Nullable`] trait's [`map_present`](Nullable::map_present) (`null` → [`None`], otherwise
+//!   "no value" signal) is surfaced as an [`Option`] of a Rust value via
+//!   [`from_nullable`](crate::error::from_nullable) / the [`Nullable`](crate::error::Nullable)
+//!   trait's [`map_present`](crate::error::Nullable::map_present) (`null` → [`None`], otherwise
 //!   `Some(f())`). No more manual `.is_null()` checks at every call site. (It maps to a Rust value
 //!   rather than `Option<managed>`, which is a layout wall — see the `null <-> Option` section.)
 //! * **thrown exception ↔ [`Result`]** — a possibly-throwing managed call is run inside a CIL
-//!   `try/catch` and its outcome surfaced as `Result<T, `[`ManagedException`]`>` via [`try_managed`]
-//!   (or the [`TryManaged::try_`] combinator on a closure). This catches *foreign* .NET/BCL
+//!   `try/catch` and its outcome surfaced as
+//!   `Result<T, ManagedException>` via [`try_managed`](crate::error::try_managed)
+//!   (or the [`TryManaged::try_`](crate::error::TryManaged::try_) combinator on a closure). This
+//!   catches *foreign* .NET/BCL
 //!   exceptions — the ones a Rust `catch_unwind` deliberately rethrows because they are not a
 //!   `RustException`.
 //! * **`?` into your own error type** — [`impl_from_managed_exception!`] generates a
 //!   `From<ManagedException>` impl for a consumer's own error type (a blanket impl isn't legal Rust
-//!   here — orphan rules), so `?` bubbles a [`try_managed`] failure straight into it without a
+//!   here — orphan rules), so `?` bubbles a [`try_managed`](crate::error::try_managed) failure
+//!   straight into it without a
 //!   hand-rolled `From` at every call site.
 //!
 //! ```ignore
@@ -80,7 +84,7 @@ pub trait Nullable: Copy {
     fn map_present<R>(self, f: impl FnOnce() -> R) -> Option<R> {
         if self.is_null_ref() { None } else { Some(f()) }
     }
-    /// `null` → [`None`], otherwise [`Some(())`] — just the presence bit, when you only need to branch
+    /// `null` → [`None`], otherwise `Some(())` — just the presence bit, when you only need to branch
     /// on "was there a value?" and don't want to move the reference at all.
     #[inline(always)]
     fn present(self) -> Option<()> {
@@ -194,7 +198,7 @@ fn catch_trampoline<F, T>(data: *mut u8) {
 ///
 /// `f` is executed inside a CIL `try/catch` that catches **any** .NET exception. If `f` returns
 /// normally, you get [`Ok`] with its value; if a managed exception is thrown, you get
-/// [`Err`]`(`[`ManagedException`]`)`. This is the *foreign-exception* counterpart to
+/// [`Err`] containing a [`ManagedException`]. This is the *foreign-exception* counterpart to
 /// [`std::panic::catch_unwind`] (which rethrows non-Rust exceptions).
 ///
 /// On the throw path, `f`'s captured state is **not** dropped (see `catch_trampoline`) — avoid
@@ -225,7 +229,7 @@ pub fn try_managed<T, F: FnOnce() -> T>(f: F) -> Result<T, ManagedException> {
 
 /// Ergonomic combinator form of [`try_managed`]: `(|| bcl_call()).try_()` reads left-to-right.
 pub trait TryManaged<T> {
-    /// Run this closure under a managed `try/catch`, yielding `Result<T, `[`ManagedException`]`>`.
+    /// Run this closure under a managed `try/catch`, yielding `Result<T, ManagedException>`.
     fn try_(self) -> Result<T, ManagedException>;
 }
 
@@ -303,7 +307,7 @@ macro_rules! impl_from_managed_exception {
 ///    opcode needs to be emitted directly by the backend.
 ///
 /// The resulting exception is a genuine managed `System.Exception` — a C# `catch (Exception e)` around
-/// the call sees `e.Message == msg`, exactly like [`rustc_clr_interop_throw`]'s fixed-message form.
+/// the call sees `e.Message == msg`, exactly like `rustc_clr_interop_throw`'s fixed-message form.
 ///
 /// `ExceptionDispatchInfo.Throw()` preserves the *original* stack trace of `ex` (which, since `ex` was
 /// just constructed here, is simply "thrown from here") rather than resetting it the way a bare

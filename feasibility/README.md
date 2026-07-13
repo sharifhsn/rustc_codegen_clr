@@ -1,11 +1,13 @@
 # Feasibility harness
 
-A reproducible environment for building and exercising `rustc_codegen_clr`, created
-to answer: *can this be revived and used to run Rust inside a .NET 8 backend?*
+A reproducible development environment for building and exercising `rustc_codegen_clr`.
+New users should start with the installed native flow in [`../QUICKSTART.md`](../QUICKSTART.md);
+this directory owns the Docker/CI compatibility harness and lower-level backend iteration tools.
 
-The project is only tested on **Linux x86_64 / .NET 8 CoreCLR**. This harness packages
-that environment in Docker so results don't depend on your host (e.g. macOS/arm64,
-which is doubly off the tested path: wrong OS *and* wrong arch).
+The contributor image contains .NET 8/9/10 compatibility runtimes on Linux; the public SDK supports
+.NET 10 only. It keeps CI and fallback
+exporter testing independent of the host while the installed `cargo dotnet` native path is also
+supported on macOS. Windows remains opt-in while its wider packaging surface is finished.
 
 ## Quick start
 
@@ -34,9 +36,16 @@ PLATFORM=linux/amd64 feasibility/run.sh test
 
 | File | Purpose |
 |------|---------|
-| `Dockerfile` | Env only: pinned nightly + `rustc-dev`/`rust-src`, .NET 8 SDK, `ilasm` (via mono), clang/gcc. Repo is mounted at runtime, not copied. |
+| `Dockerfile` | Env only: pinned nightly + `rustc-dev`/`rust-src`, .NET 8/9/10, fallback `ilasm`, clang/gcc. Repo is mounted at runtime, not copied. |
 | `run.sh` | Host driver: builds the image, runs a harness step with the repo mounted. |
 | `harness.sh` | In-container steps: `build` / `smoke` / `test` / `demo`. |
+| `onboarding_acceptance.sh` | Runs checkout setup into empty SDK/Cargo homes, proves a fresh shell discovers the installed `cargo dotnet`, then scaffolds and executes app/lib/plugin journeys outside the checkout. Also rejects a duplicate legacy `cargo install` during the one-build bootstrap. |
+| `offline_restore_acceptance.sh` | Restores into fresh crate-isolated Cargo/sysroot homes, edits ordinary Rust source, runs with Cargo offline mode plus poisoned proxies, repeats without cache drift, and proves cache tampering fails before compilation. |
+| `event_acceptance.sh` | Builds Rust-defined class and interface events through the default direct-PE writer, consumes both from real C# `+=`/`-=` syntax and reflection, subscribes Rust to a real BCL event with deterministic unsubscribe/drop removal, and fails if ILAsm is executed. |
+| `api_docs_acceptance.sh` | Generates warning-free public Rust HTML docs and the packaged C# XML sidecar, asserts a real exported member/summary, and leaves a CI-uploadable artifact without publishing it. |
+| `record_acceptance_result.sh` | Runs one special product oracle, requires its exact completion marker, scans fatal diagnostics, and atomically writes an owned runtime/profile evidence TSV for the final deterministic capability merge. |
+| `write_capability_evidence_receipt.sh` | Hash-binds the strict merged report, manifest, and every contributing result TSV to the exact source SHA, dirty state, toolchain, host, and selected evidence scope. |
+| `nats_managed_array_acceptance.sh` | Regenerates NATS.Client bindings, proves `byte[]` + interface-call signatures, and round-trips two payloads against an isolated real NATS server in debug and release without a C# shim. |
 | `dev.sh` | **Deterministic dev loop** (see below): force-rebuild, build+run a cargo_tests crate, disassemble IL, gate-with-diff. Works around Docker mtime-skew + cwd-drift. |
 | `cargo-dotnet` | **The one-command Rust→.NET DX** (see below): `cargo dotnet build/run` on ANY crate dir, zero user config. A thin host front-end over the shared pipeline core. |
 | `_cargo_dotnet_core.sh` | The crate-agnostic **pipeline core** (PAL inject + backend RUSTFLAGS + build-std + overlay auto-apply + libc patch + build/run). Single source of truth; `cargo-dotnet` AND `dev.sh pal-build` both run it. |
@@ -61,6 +70,51 @@ feasibility/dev.sh gate               # force-rebuild + `cargo test ::stable` (C
 feasibility/dev.sh sh '<bash>'        # arbitrary command in the container (correct mount, color off)
 ```
 
+The application-shaped newcomer example has its own acceptance check. It builds and runs the
+managed JSON CLI with a real input file, compares exact output, and verifies the malformed-input
+diagnostic:
+
+```bash
+DOTNET_VERSION=10 feasibility/flagship_example_acceptance.sh
+```
+
+The NativeAOT product gate uses the same public `cargo dotnet publish` command a user runs. It writes
+to an explicit output directory and executes the self-contained C#-host/Rust-library binary:
+
+```bash
+DOTNET_VERSION=10 feasibility/nativeaot_acceptance.sh
+```
+
+The API-documentation gate treats every rustdoc warning as an error and builds the same artifacts a
+release can host or attach later. It writes
+Rust HTML, C# XML, the probe NuGet package, logs, and a non-publication receipt to an explicit
+directory; it does not deploy a site or push a package:
+
+```bash
+RCL_API_DOCS_DIR=/tmp/rcl-api-docs DOTNET_VERSION=10 feasibility/api_docs_acceptance.sh
+```
+
+The install-bundle gate constructs the release SDK layout, produces it twice and compares the ZIP
+bytes, verifies the checksum/manifest, restores it outside the checkout, runs a newly scaffolded app
+through the restored backend, then proves both archive and installed-home corruption fail closed:
+
+```bash
+DOTNET_VERSION=10 feasibility/install_bundle_acceptance.sh
+```
+
+The exported-library/PDB consumer gate builds the fixture in both debug and release, then loads the
+public DLL from a normal C# host. It imports and invokes all supported C# delegate families through
+both `#[dotnet_export]` and `#[dotnet_methods]`, and requires the managed Rust stack trace to resolve to
+`lib.rs:line`, checks the non-inlined Rust leaf, and parses the PDB Document table rather than merely
+checking that a sidecar file exists. It also verifies a whole-method LocalScope and named locals in
+both profiles, including a known user-authored Rust local in debug (release optimization may remove
+that particular slot). Finally, it requires the stable `/_/consumer/src/lib.rs` document path and
+parses the exact standard Source Link JSON produced by `--source-link-url`:
+
+```bash
+DOTNET_VERSION=10 feasibility/pdb_consumer_acceptance.sh
+```
+
 Cargo-output crates (`build_std`) link to an **ELF apphost** run directly (`./build_std`), with the
 real `.dll` assembly + `.runtimeconfig.json` beside it; `il` disassembles that `.dll` with `ikdasm`
 (`monodis` is not installed).
@@ -73,12 +127,13 @@ paths, which is why the build goes there (not a custom dir).
 `build` and `test` are the load-bearing commands: `build` is the "does it compile on this
 nightly?" check, and `test` runs the project's own `cargo test ::stable` suite (the real
 end-to-end runtime validation — it drives build-std + ilasm + dotnet itself). The `smoke`/`demo`
-helpers illustrate the raw backend invocation but need the build-std cargo setup from the repo's
-`QUICKSTART.md` to actually run a standalone program.
+helpers illustrate the raw backend invocation. For a standalone application, prefer the installed
+driver workflow in the root [`QUICKSTART.md`](../QUICKSTART.md).
 
 ## The one-command DX (`cargo dotnet`)
 
-`feasibility/cargo-dotnet` is the **user-facing one command** that compiles an
+`feasibility/cargo-dotnet` is the in-repository Docker development front-end for the same pipeline
+that the installed Rust CLI exposes. It compiles an
 arbitrary Rust crate to a runnable .NET assembly with **zero hand-config** — no
 `RUSTFLAGS`, no `[patch.crates-io]`, no vendoring, no `.cargo/config` edits. It is
 a [cargo subcommand](https://doc.rust-lang.org/cargo/reference/external-tools.html#custom-subcommands):
@@ -143,9 +198,9 @@ strings, a struct value-type, and a slice**. Full consumer guide:
 
 ### Architecture (and the Docker vs. native seam)
 
-`cargo-dotnet` is a **thin host front-end**: it resolves the repo + crate dir,
+The feasibility driver is a **thin host front-end**: it resolves the repo + crate dir,
 preflights, and dispatches to an **execution backend** (`CARGO_DOTNET_BACKEND`,
-default `docker`). The docker driver streams the shared core
+default `docker` for this in-repository script). The docker driver streams the shared core
 (`feasibility/_cargo_dotnet_core.sh`) into the `rcc-dev` container. The repo is
 **always** mounted at `/work` (backend dylib, overlays, target spec); how the
 target crate is mounted depends on whether it lives **in-repo** or **external**:
@@ -167,30 +222,28 @@ command can never drift.
 A **native** (non-Docker) driver also slots into the `CARGO_DOTNET_BACKEND` switch
 (`CARGO_DOTNET_BACKEND=native`): it runs the *same* core directly on the host — no
 container — with the host's real repo path instead of `/work`/`/project` and a
-`command -v rustc cargo dotnet` + CoreCLR-`ilasm` preflight. The host-specific facts
+`command -v rustc cargo dotnet` preflight. The host-specific facts
 (repo root, backend dylib extension `.so`/`.dylib`/`.dll`, linker, target spec,
 cargo registry path) are passed to the core as `CD_*` env vars whose **defaults
 reproduce the container layout**, so the docker path is byte-for-byte unchanged and
 native is purely additive. Verified end-to-end on **macOS arm64** (J1/J2/J3, zero
-Docker); a **Windows x64** path is wired defensively but UNTESTED. Full setup +
+Docker); a **Windows x64** path is opt-in. Full setup +
 known-unknowns: [docs/CARGO_DOTNET.md §2b](../docs/CARGO_DOTNET.md#2b-native-no-docker).
-The two key native facts: the .NET target is unchanged (CIL is arch-agnostic, so it
-JITs on any host's native .NET 8), and the assembler MUST be the **CoreCLR `ilasm`**,
-not Mono (Mono emits PE32 images the native CoreCLR loader rejects).
+The key native fact is that the .NET target is unchanged: CIL is architecture-agnostic and JITs on
+the selected .NET 8, 9, or 10 runtime. The direct-PE default needs no assembler; if you explicitly
+select the legacy IL path, use CoreCLR `ilasm`, not Mono.
 
 ### Honesty / current limits
 
-- The **docker** backend (default) needs the `rcc-dev` image
+- The in-repo **docker** backend (its default) needs the `rcc-dev` image
   (`feasibility/run.sh build`) and a running Docker. The **native** backend
-  (`CARGO_DOTNET_BACKEND=native`) needs no Docker but requires the host toolchain
-  (pinned nightly + rust-src/rustc-dev, .NET 8 SDK, a CoreCLR `ilasm`, and the
-  host-built backend dylib + linker). Native is verified on macOS arm64; Windows is
-  wired but untested. See [docs/CARGO_DOTNET.md §2b](../docs/CARGO_DOTNET.md#2b-native-no-docker).
-- **Exit codes:** build failures and the program's own exit code propagate
-  faithfully. But on the dotnet PAL a **panic** (or `std::process::exit(n)`)
-  surfaces as an unhandled managed exception and the apphost still returns **0** —
-  a pre-existing PAL limitation (the managed exception is not translated to a
-  non-zero process exit), independent of `cargo dotnet`.
+  (`CARGO_DOTNET_BACKEND=native`) needs no Docker but requires the host toolchain,
+  a compatible .NET SDK, and the host-built backend dylib + linker. The direct-PE
+  default does not require `ilasm`. Native is verified on macOS arm64; Windows is
+  opt-in. See [docs/CARGO_DOTNET.md §2b](../docs/CARGO_DOTNET.md#2b-native-no-docker).
+- **Exit codes:** build failures and the program's exit status propagate through
+  `cargo dotnet`; `cargo_tests/pal_exit_code` permanently checks that
+  `std::process::exit(n)` reaches the host as `n`.
 - **`getrandom`:** `getrandom` 0.2 / 0.3 / 0.4 **auto-work with ZERO wiring** via the
   `dotnet_overlays/getrandom-{0.2,0.3,0.4}` overlays (each IS getrandom, patched with
   a self-contained `target_os="dotnet"` backend arm that calls the PAL CSPRNG). So
@@ -200,12 +253,9 @@ not Mono (Mono emits PE32 images the native CoreCLR loader rejects).
 
 ## The nightly pin
 
-The repo's `rust-toolchain.toml` says `channel = "nightly"` (unversioned), so a fresh
-checkout grabs *today's* nightly — which is how it bit-rotted. The `Dockerfile` pins
-`NIGHTLY=nightly-2026-06-17` for reproducibility. Bumping it forward is the recurring
-maintenance tax: each bump may surface a fresh batch of rustc-internal API drift to fix
-(see `docs/ARCHITECTURE.md` for why only the thin rustc-facing crates rot, while the
-`cilly` IR core stays stable).
+The repo and Docker harness both pin `nightly-2026-06-17`. Bumping that pin is a recurring
+maintenance task: a new nightly may surface rustc-internal API drift even when the `cilly` IR core
+is unchanged. Follow [`PORT_NOTES.md`](PORT_NOTES.md) for the re-port procedure.
 
 ## Status / honesty
 

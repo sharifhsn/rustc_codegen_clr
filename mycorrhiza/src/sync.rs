@@ -1,21 +1,25 @@
 //! **Cross-thread / cross-language synchronization primitives** — idiomatic Rust wrappers over the
 //! .NET `System.Threading` synchronization surface (`SemaphoreSlim`, `ManualResetEventSlim`,
-//! `CountdownEvent`, `Barrier`), plus [`SharedLock`]: a mutex-shaped `SemaphoreSlim` meant to be handed
+//! `CountdownEvent`, `Barrier`), plus [`SharedLock`](crate::sync::SharedLock): a mutex-shaped
+//! `SemaphoreSlim` meant to be handed
 //! to C# as a genuine shared managed reference so Rust and C# can take turns inside the *same* critical
 //! section.
 //!
 //! On top of `SharedLock`, this module also provides data-owning, fully-safe wrappers for the
-//! all-Rust-side case: [`SharedMutex<T>`] (mutual exclusion, a `SharedLock` + `UnsafeCell<T>` in the
-//! exact shape of `std::sync::Mutex<T>`), [`SharedRwLock<T>`] (reader/writer, over
-//! `ReaderWriterLockSlim`), and [`SharedOnce<T>`] (lazy one-time initialization, the
+//! all-Rust-side case: [`SharedMutex`](crate::sync::SharedMutex) (mutual exclusion, a `SharedLock`
+//! + `UnsafeCell<T>` in the exact shape of `std::sync::Mutex<T>`),
+//! [`SharedRwLock`](crate::sync::SharedRwLock) (reader/writer, over `ReaderWriterLockSlim`), and
+//! [`SharedOnce`](crate::sync::SharedOnce) (lazy one-time initialization, the
 //! `std::sync::OnceLock<T>` shape, over a `SharedLock`-guarded double-checked-lock). None of these
 //! require `unsafe` in calling code — see each type's docs for precisely what safety they do (and do
 //! not) extend to a C# caller that also holds the raw lock.
 //!
-//! Separately, [`channel`]/[`bounded_channel`] give a `std::sync::mpsc`-shaped [`Sender<T>`]/
-//! [`Receiver<T>`] pair over `System.Threading.Channels` — genuinely multi-producer multi-consumer
+//! Separately, [`channel`](crate::sync::channel)/[`bounded_channel`](crate::sync::bounded_channel)
+//! give a `std::sync::mpsc`-shaped [`Sender`](crate::sync::Sender)/
+//! [`Receiver`](crate::sync::Receiver) pair over `System.Threading.Channels` — genuinely
+//! multi-producer multi-consumer
 //! (both handles are cheaply `Clone`), with blocking, non-blocking (`try_*`), and `.await`-able forms of
-//! send/receive. See [`channel`]'s docs for its own cross-language nuance.
+//! send/receive. See [`channel`](crate::sync::channel)'s docs for its own cross-language nuance.
 //!
 //! This mirrors [`crate::task`]'s conventions: thin, `#[inline]` wrappers over the raw generated
 //! bindings in [`crate::bindings`], RAII guards for the acquire/release pairs, and (where a wait can be
@@ -37,7 +41,8 @@
 //! synchronization (see the foreign-thread TLS/Mutex/Parker research this module follows from) — this
 //! module exists for the cases `std::sync` cannot cover: waiting on a **.NET-native** primitive
 //! directly (so a `WaitAsync()` composes with [`crate::task`], or so a C# caller can see the exact same
-//! managed wait object), and — via [`SharedLock`]/[`SharedMutex`]/[`SharedRwLock`] — genuine
+//! managed wait object), and — via [`SharedLock`](crate::sync::SharedLock)/
+//! [`SharedMutex`](crate::sync::SharedMutex)/[`SharedRwLock`](crate::sync::SharedRwLock) — genuine
 //! cross-language coordination where a *managed* lock object is shared by reference between a Rust
 //! side and a C# side.
 
@@ -1220,6 +1225,28 @@ fn reader_completion<T>(r: RawReader<T>) -> Task {
     >(r))
 }
 
+/// `ChannelReader<T>.ReadAllAsync(CancellationToken)` — a real `IAsyncEnumerable<T>` view over all
+/// current and future channel items until the writer closes the channel.
+fn reader_read_all_async<T>(r: RawReader<T>) -> crate::enumerate_async::IAsyncEnumerable<T> {
+    type AsyncEnumerableDef = RustcCLRInteropManagedGeneric<
+        CORELIB,
+        "System.Collections.Generic.IAsyncEnumerable",
+        (RustcCLRInteropTypeGeneric<0>,),
+    >;
+    rustc_clr_interop_generic_call2::<
+        CHANNELS_ASM,
+        CHANNEL_READER,
+        false,
+        "ReadAllAsync",
+        2,
+        (T,),
+        (AsyncEnumerableDef, RawCancellationToken),
+        crate::enumerate_async::IAsyncEnumerable<T>,
+        RawReader<T>,
+        RawCancellationToken,
+    >(r, no_cancellation())
+}
+
 /// The sending half of a [channel]/[bounded_channel] — a rooted, `Clone`, `Send`+`Sync` wrapper over
 /// a real managed `ChannelWriter<T>`.
 ///
@@ -1384,9 +1411,20 @@ impl<T> Receiver<T> {
         }
     }
 
+    /// View this reader as the real managed `IAsyncEnumerable<T>` returned by
+    /// `ChannelReader<T>.ReadAllAsync`. The resulting bridge can consume channel items with
+    /// [`crate::enumerate_async::AsyncEnumerator::next`] while preserving asynchronous backpressure.
+    #[inline]
+    pub fn read_all_async(&self) -> crate::enumerate_async::AsyncEnumerable<T> {
+        crate::enumerate_async::AsyncEnumerable::from_handle(reader_read_all_async(unsafe {
+            self.h.get_naked_ref()
+        }))
+    }
+
     /// `true` once the channel is closed (writer-side [`Sender::close`]d) AND fully drained — the
-    /// definitive "no more items will ever arrive" signal. Checked before [`recv_blocking`]/
-    /// [`recv_async`] would otherwise wait on `ReadAsync`, which throws `ChannelClosedException` at
+    /// definitive "no more items will ever arrive" signal. Checked before
+    /// [`Self::recv_blocking`]/[`Self::recv_async`] would otherwise wait on `ReadAsync`, which throws
+    /// `ChannelClosedException` at
     /// that point instead of signalling emptiness the way `TryRead` does.
     #[inline]
     pub fn is_definitely_drained(&self) -> bool {

@@ -45,17 +45,22 @@ pub use crate::bcl::uri::Uri;
 // .NET `IEnumerator<T>`. The `Enumerable` trait provides `.iter_enumerator()`; `Enumerator<T>` is the
 // resulting `Iterator`.
 pub use crate::enumerate::{Enumerable, Enumerator};
+pub use crate::enumerate_async::{
+    AsyncEnumerable, AsyncEnumerator, AsyncNextFuture, IAsyncEnumerable, IAsyncEnumerator,
+};
 
 // Delegates & callbacks — hand a Rust `extern "C" fn` to .NET as an `Action`/`Func`, or invoke a held
-// .NET delegate. `Action1`/`Action2` are void-returning; `Func1`/`Func2` return a value.
-pub use crate::delegate::{Action1, Action2, Func1, Func2};
+// .NET delegate. `Action*` wrappers are void-returning; `Func*` wrappers return a value.
+pub use crate::delegate::{
+    Action1, Action2, Action3, EventHandler, EventSubscription, Func1, Func2, Func3,
+};
 
 // The Task ↔ Future bridge — `.await` a .NET `Task` (`await_unit`) / `Task<T>` (`await_task`), expose a
 // Rust `async fn` as a .NET `Task` (`future_to_task_unit`), and block a Rust future on the PAL
 // (`block_on`). `Task` is the non-generic managed Task handle; `TaskT<T>` the result-bearing one.
 pub use crate::task::{
-    Task, TaskFuture, TaskT, TaskUnitFuture, await_task, await_unit, block_on, future_to_task,
-    future_to_task_unit,
+    Task, TaskFuture, TaskT, TaskUnitFuture, ValueTaskT, await_task, await_unit, await_value_task,
+    block_on, future_to_task, future_to_task_unit, value_task_into_task,
 };
 
 // The idiomatic managed `System.String` wrapper (Display / == / Hash) and the raw handle alias.
@@ -72,6 +77,10 @@ pub use crate::nullable::NullableExt;
 // `System.Span<T>` / `ReadOnlySpan<T>` — zero-copy views over a Rust slice, for handing Rust memory to
 // a .NET API (or reading a managed span element-by-element).
 pub use crate::span::{ReadOnlySpan, Span};
+
+// GC-owned memory for APIs that retain a buffer or carry it across an async boundary. Unlike Span,
+// construction copies a Rust slice into a managed array and therefore has no Rust borrow lifetime.
+pub use crate::memory::{Memory, ReadOnlyMemory};
 
 // The single-codepoint managed `char`.
 pub use crate::DotNetChar;

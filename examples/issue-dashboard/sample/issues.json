@@ -1,0 +1,9 @@
+{
+  "project": "rust-dotnet-demo",
+  "issues": [
+    { "title": "Add Linux smoke test", "status": "open", "severity": "high", "owner": "Ada" },
+    { "title": "Document C# consumption", "status": "open", "severity": "medium", "owner": "Grace" },
+    { "title": "Make package reproducible", "status": "closed", "severity": "high", "owner": "Linus" },
+    { "title": "Improve setup diagnostics", "status": "open", "severity": "high", "owner": "Ada" }
+  ]
+}

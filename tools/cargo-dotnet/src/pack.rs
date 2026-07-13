@@ -26,7 +26,7 @@
 
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context as _, Result, bail};
@@ -49,6 +49,7 @@ pub fn run(args: &PackArgs) -> Result<i32> {
         verbose: false,
         backend: None, // pack is native-only (it builds a cdylib through the Rust stages).
         dotnet: args.dotnet.clone(),
+        source_link_url: args.source_link_url.clone(),
         features: clap_cargo::Features::default(),
         manifest: clap_cargo::Manifest::default(),
         workspace: clap_cargo::Workspace::default(),
@@ -303,6 +304,56 @@ fn require_signed_release_inputs(
     if !status.status.success() || !status.stdout.is_empty() {
         bail!("signed pack requires a clean Git revision");
     }
+    require_immutable_release_tag(crate_dir)?;
+    Ok(())
+}
+
+fn release_tag_version(tag: &str) -> Result<&str> {
+    let version = tag
+        .strip_prefix("rust-dotnet-v")
+        .context("release tag must use rust-dotnet-v<semver>")?;
+    crate::push::require_release_version(version)?;
+    Ok(version)
+}
+
+fn git_stdout(git: &Path, crate_dir: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new(git)
+        .args(args)
+        .current_dir(crate_dir)
+        .output()
+        .with_context(|| format!("signed pack: run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!("signed pack: git {} failed", args.join(" "));
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+fn require_immutable_release_tag(crate_dir: &Path) -> Result<()> {
+    let tag = std::env::var("RUSTDOTNET_RELEASE_TAG")
+        .context("signed pack requires RUSTDOTNET_RELEASE_TAG=rust-dotnet-v<semver>")?;
+    verify_immutable_release_tag(Path::new("git"), crate_dir, &tag)
+}
+
+fn verify_immutable_release_tag(git: &Path, crate_dir: &Path, tag: &str) -> Result<()> {
+    release_tag_version(&tag)?;
+    let reference = format!("refs/tags/{tag}");
+    if git_stdout(git, crate_dir, &["cat-file", "-t", &reference])? != "tag" {
+        bail!("signed pack requires an annotated release tag: {tag}");
+    }
+    let tagged = format!("{reference}^{{commit}}");
+    let tagged_commit = git_stdout(git, crate_dir, &["rev-parse", "--verify", &tagged])?;
+    let head = git_stdout(git, crate_dir, &["rev-parse", "HEAD"])?;
+    if tagged_commit != head {
+        bail!("release tag {tag} does not resolve to HEAD {head}");
+    }
+    let signature = Command::new(git)
+        .args(["verify-tag", tag])
+        .current_dir(crate_dir)
+        .status()
+        .context("signed pack: verify release tag signature")?;
+    if !signature.success() {
+        bail!("release tag {tag} does not have a valid signature from a configured trusted signer");
+    }
     Ok(())
 }
 
@@ -315,21 +366,36 @@ fn sign_and_verify(
 ) -> Result<()> {
     let env_name =
         password_env.context("signing password environment variable name is required")?;
-    let password = std::env::var_os(env_name)
-        .with_context(|| format!("signing password environment variable {env_name} is not set"))?;
+    let password = std::env::var(env_name).with_context(|| {
+        format!(
+            "signing password environment variable {env_name} is not set or is not valid Unicode"
+        )
+    })?;
     let fingerprint = crate::push::normalize_fingerprint(fingerprint)?;
-    let mut command = Command::new("dotnet");
-    command
-        .args(["nuget", "sign"])
-        .arg(package)
-        .arg("--certificate-path")
-        .arg(certificate)
-        .arg("--certificate-password")
-        .arg(password);
+    let package_arg = package
+        .to_str()
+        .context("package path is not valid Unicode")?;
+    let certificate_arg = certificate
+        .to_str()
+        .context("signing certificate path is not valid Unicode")?;
+    let mut arguments = vec![
+        "nuget".to_owned(),
+        "sign".to_owned(),
+        package_arg.to_owned(),
+        "--certificate-path".to_owned(),
+        certificate_arg.to_owned(),
+        "--certificate-password".to_owned(),
+        password,
+    ];
     if let Some(url) = timestamper {
-        command.arg("--timestamper").arg(url);
+        arguments.push("--timestamper".to_owned());
+        arguments.push(url.to_owned());
     }
-    let status = command.status().context("run `dotnet nuget sign`")?;
+    let status = crate::push::run_dotnet_with_ephemeral_response(
+        Path::new("dotnet"),
+        &arguments,
+        &[env_name],
+    )?;
     if !status.success() {
         bail!("dotnet nuget sign failed");
     }
@@ -836,6 +902,9 @@ fn is_safe_package_path(path: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
     fn package_asset(
         path: &str,
         source: PathBuf,
@@ -858,6 +927,57 @@ mod tests {
             repository: None,
             has_readme: false,
         }
+    }
+
+    #[test]
+    fn release_tag_name_contains_an_exact_semver() {
+        assert_eq!(release_tag_version("rust-dotnet-v1.2.3").unwrap(), "1.2.3");
+        assert!(release_tag_version("v1.2.3").is_err());
+        assert!(release_tag_version("rust-dotnet-vVERSION").is_err());
+        assert!(release_tag_version("rust-dotnet-v1.2.3+rebuilt").is_err());
+    }
+
+    #[cfg(unix)]
+    fn fake_git_for_tag_verification(signature_exit: i32) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let git = root.path().join("git");
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+case "$1" in
+  cat-file) printf 'tag\n' ;;
+  rev-parse) printf '0123456789abcdef\n' ;;
+  verify-tag) exit {signature_exit} ;;
+  *) exit 97 ;;
+esac
+"#
+        );
+        fs::write(&git, script).unwrap();
+        let mut permissions = fs::metadata(&git).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&git, permissions).unwrap();
+        root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_release_tag_requires_valid_signature() {
+        let trusted = fake_git_for_tag_verification(0);
+        verify_immutable_release_tag(
+            &trusted.path().join("git"),
+            trusted.path(),
+            "rust-dotnet-v1.2.3",
+        )
+        .unwrap();
+
+        let untrusted = fake_git_for_tag_verification(1);
+        let error = verify_immutable_release_tag(
+            &untrusted.path().join("git"),
+            untrusted.path(),
+            "rust-dotnet-v1.2.3",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("valid signature"), "{error:#}");
     }
 
     #[test]

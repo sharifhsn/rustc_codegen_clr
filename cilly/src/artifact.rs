@@ -8,8 +8,10 @@ use crate::Assembly;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Prefix identifying the current, schema-v4 `cilly` assembly artifact before payload decoding.
-pub const ASSEMBLY_ARTIFACT_MAGIC: &[u8; 8] = b"CILLYAR4";
+/// Prefix identifying the current, schema-v5 `cilly` assembly artifact before payload decoding.
+pub const ASSEMBLY_ARTIFACT_MAGIC: &[u8; 8] = b"CILLYAR5";
+/// Magic emitted by schema-v4 artifacts, before genuine CLR enum metadata.
+const ASSEMBLY_ARTIFACT_V4_MAGIC: &[u8; 8] = b"CILLYAR4";
 /// Magic emitted by schema-v3 artifacts, before fixed-array layout provenance.
 const ASSEMBLY_ARTIFACT_V3_MAGIC: &[u8; 8] = b"CILLYAR3";
 /// Magic emitted by schema-v2 artifacts, before canonical method-scope exception regions.
@@ -17,7 +19,7 @@ const ASSEMBLY_ARTIFACT_V2_MAGIC: &[u8; 8] = b"CILLYAR2";
 /// Magic emitted by schema-v1 artifacts, whose `BiMap` payload duplicated value storage.
 const ASSEMBLY_ARTIFACT_V1_MAGIC: &[u8; 8] = b"CILLYART";
 /// Current serialization-envelope version.
-pub const ASSEMBLY_ARTIFACT_VERSION: u16 = 4;
+pub const ASSEMBLY_ARTIFACT_VERSION: u16 = 5;
 
 /// Final output target selected by a backend or linker process.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -469,6 +471,12 @@ pub fn decode_assembly_artifact(
             supported: ASSEMBLY_ARTIFACT_VERSION,
         });
     }
+    if encoded.starts_with(ASSEMBLY_ARTIFACT_V4_MAGIC) {
+        return Err(ArtifactDecodeError::UnsupportedVersion {
+            found: 4,
+            supported: ASSEMBLY_ARTIFACT_VERSION,
+        });
+    }
     if let Some(payload) = encoded.strip_prefix(ASSEMBLY_ARTIFACT_MAGIC) {
         let artifact: AssemblyArtifact =
             postcard::from_bytes(payload).map_err(ArtifactDecodeError::InvalidVersionedEnvelope)?;
@@ -710,8 +718,8 @@ mod tests {
         assert!(matches!(
             error,
             ArtifactDecodeError::UnsupportedVersion {
-                found: 5,
-                supported: 4
+                found: 6,
+                supported: 5
             }
         ));
     }
@@ -726,7 +734,7 @@ mod tests {
             error,
             ArtifactDecodeError::UnsupportedVersion {
                 found: 1,
-                supported: 4
+                supported: 5
             }
         ));
         assert!(error.to_string().contains("Rebuild all input crates"));
@@ -742,7 +750,7 @@ mod tests {
             error,
             ArtifactDecodeError::UnsupportedVersion {
                 found: 2,
-                supported: 4
+                supported: 5
             }
         ));
         assert!(error.to_string().contains("Rebuild all input crates"));
@@ -758,7 +766,23 @@ mod tests {
             error,
             ArtifactDecodeError::UnsupportedVersion {
                 found: 3,
-                supported: 4
+                supported: 5
+            }
+        ));
+        assert!(error.to_string().contains("Rebuild all input crates"));
+    }
+
+    #[test]
+    fn v4_header_is_rejected_before_deserializing_pre_enum_metadata() {
+        let mut encoded = ASSEMBLY_ARTIFACT_V4_MAGIC.to_vec();
+        encoded.extend_from_slice(b"payload shape intentionally irrelevant");
+
+        let error = decode_assembly_artifact(&encoded).err().unwrap();
+        assert!(matches!(
+            error,
+            ArtifactDecodeError::UnsupportedVersion {
+                found: 4,
+                supported: 5
             }
         ));
         assert!(error.to_string().contains("Rebuild all input crates"));

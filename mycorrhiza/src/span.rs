@@ -1,6 +1,7 @@
 //! `System.Span<T>` / `ReadOnlySpan<T>` — zero-copy views over Rust memory.
 //!
-//! A [`Span`] / [`ReadOnlySpan`] wraps a Rust slice as a managed span *in place* (via the
+//! A [`Span`](crate::span::Span) / [`ReadOnlySpan`](crate::span::ReadOnlySpan) wraps a Rust slice as
+//! a managed span *in place* (via the
 //! `Span<T>(void* pointer, int length)` ctor), so a .NET API can read/write the very same bytes with
 //! no copy. The wrapper borrows the slice for `'a`, so the span can't outlive the memory it views.
 //!
@@ -30,8 +31,9 @@ const CORELIB: &str = "System.Private.CoreLib";
 
 // A `Span<T>` / `ReadOnlySpan<T>` value is two words (a byref + an int length). `SIZE` is a Rust-side
 // placeholder — the backend lowers this to a `ClassRef` and the CLR knows the real size.
-type RawSpan<T> = RustcCLRInteropManagedGenericStruct<CORELIB, "System.Span", 16, (T,)>;
-type RawRoSpan<T> = RustcCLRInteropManagedGenericStruct<CORELIB, "System.ReadOnlySpan", 16, (T,)>;
+pub(crate) type RawSpan<T> = RustcCLRInteropManagedGenericStruct<CORELIB, "System.Span", 16, (T,)>;
+pub(crate) type RawRoSpan<T> =
+    RustcCLRInteropManagedGenericStruct<CORELIB, "System.ReadOnlySpan", 16, (T,)>;
 
 // ---- raw Span<T> members (generic over the element type) --------------------------------------
 fn span_from_ptr<T>(ptr: *mut (), len: i32) -> RawSpan<T> {
@@ -46,20 +48,7 @@ fn span_from_ptr<T>(ptr: *mut (), len: i32) -> RawSpan<T> {
         i32,
     >(ptr, len)
 }
-fn span_len<T>(s: &RawSpan<T>) -> i32 {
-    rustc_clr_interop_generic_call1::<
-        CORELIB,
-        "System.Span",
-        true,
-        "get_Length",
-        1,
-        (T,),
-        (i32,),
-        i32,
-        &RawSpan<T>,
-    >(s)
-}
-fn span_fill<T>(s: &RawSpan<T>, value: T) {
+pub(crate) fn span_fill<T>(s: &RawSpan<T>, value: T) {
     rustc_clr_interop_generic_call2::<
         CORELIB,
         "System.Span",
@@ -87,7 +76,7 @@ fn span_clear<T>(s: &RawSpan<T>) {
     >(s)
 }
 // get_Item(int) -> ref T : the byref indexer. Returns a managed byref (`!0&`) taken as a raw pointer.
-fn span_get_ref<T>(s: &RawSpan<T>, idx: i32) -> *mut T {
+pub(crate) fn span_get_ref<T>(s: &RawSpan<T>, idx: i32) -> *mut T {
     rustc_clr_interop_generic_call2::<
         CORELIB,
         "System.Span",

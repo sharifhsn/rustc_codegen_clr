@@ -331,6 +331,22 @@ impl Type {
                 asm[a].is_assignable_to(asm[b], asm)
             }
             (Type::Ptr(ptr), Type::Ref(rf)) => ptr == rf,
+            // Definition-shape generic arrays (`!0[]`) are the array analogue of the nested
+            // generic/pointer cases below. The WF-9 bridge emits these for members such as
+            // `Memory<T>(T[])`; accept them against the concrete runtime array only when rank
+            // matches and their element types are assignable. Any generic-marker element admitted
+            // here is independently proven against the concrete class generic by
+            // `check_generic_marker`, which also recurses into arrays.
+            (
+                Type::PlatformArray {
+                    elem: lhs,
+                    dims: lhs_dims,
+                },
+                Type::PlatformArray {
+                    elem: rhs,
+                    dims: rhs_dims,
+                },
+            ) if lhs_dims == rhs_dims => asm[lhs].is_assignable_to(asm[rhs], asm),
             // Fat-pointer (DST) layout equivalence — a PROVEN false-positive fix (Phase P1 / WF-TC).
             //
             // Every `FatPtr<T>` class emitted by the backend (see `fat_ptr_to` in
@@ -507,6 +523,36 @@ mod simd_assignability_tests {
 
         let wrong_width = SIMDVector::new(Float::F32.into(), 4);
         assert!(!Type::SIMDVector(wrong_width).is_assignable_to(Type::ClassRef(concrete), &asm));
+    }
+}
+
+#[cfg(test)]
+mod generic_array_assignability_tests {
+    use super::*;
+    use std::num::NonZeroU8;
+
+    #[test]
+    fn definition_shape_generic_array_matches_only_same_rank_concrete_array() {
+        let mut asm = Assembly::default();
+        let marker = asm.alloc_type(Type::PlatformGeneric(0, GenericKind::TypeGeneric));
+        let concrete = asm.alloc_type(Type::Int(Int::I32));
+        let one = NonZeroU8::new(1).unwrap();
+        let two = NonZeroU8::new(2).unwrap();
+        let generic_array = Type::PlatformArray {
+            elem: marker,
+            dims: one,
+        };
+        let concrete_array = Type::PlatformArray {
+            elem: concrete,
+            dims: one,
+        };
+        let wrong_rank = Type::PlatformArray {
+            elem: concrete,
+            dims: two,
+        };
+        assert!(generic_array.is_assignable_to(concrete_array, &asm));
+        assert!(concrete_array.is_assignable_to(generic_array, &asm));
+        assert!(!generic_array.is_assignable_to(wrong_rank, &asm));
     }
 }
 

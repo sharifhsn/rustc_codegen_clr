@@ -112,6 +112,24 @@ fn load_addr_local(asm: &Assembly, addr: Interned<CILNode>) -> Option<u32> {
     }
 }
 
+fn field_key(asm: &Assembly, field: Interned<FieldDesc>) -> (String, String, String) {
+    let field = asm.get_field(field);
+    (
+        crate::Type::ClassRef(field.owner()).mangle(asm),
+        asm[field.name()].to_string(),
+        field.tpe().mangle(asm),
+    )
+}
+
+fn ordered_fields(
+    asm: &Assembly,
+    fields: &HashSet<Interned<FieldDesc>>,
+) -> Vec<Interned<FieldDesc>> {
+    let mut fields: Vec<_> = fields.iter().copied().collect();
+    fields.sort_by_cached_key(|field| field_key(asm, *field));
+    fields
+}
+
 /// Are the accessed fields of one local pairwise non-aliasing (safe to split into scalars)?
 fn fields_disjoint(asm: &Assembly, fields: &HashSet<Interned<FieldDesc>>) -> bool {
     // (name, explicit-layout offset if any, byte size) per accessed field.
@@ -184,7 +202,7 @@ fn decompose_whole_writes(
         if let CILRoot::StLoc(l, val) = *asm.get_root(rid) {
             if let Some(&tmp) = decompose_tmp.get(&l) {
                 out.push(asm.alloc_root(CILRoot::StLoc(tmp, val)));
-                for &f in &fields[l as usize] {
+                for f in ordered_fields(asm, &fields[l as usize]) {
                     let nl = field_to_nl[&(l, f)];
                     let addr = asm.alloc_node(CILNode::LdLocA(tmp));
                     let read = asm.alloc_node(CILNode::LdField { addr, field: f });
@@ -268,7 +286,7 @@ pub fn scalarize_aggregates(
         if !fields_disjoint(asm, &fields[l]) {
             continue;
         }
-        for &f in &fields[l] {
+        for f in ordered_fields(asm, &fields[l]) {
             let tpe = asm.get_field(f).tpe();
             let ity = asm.alloc_type(tpe);
             let nl = locals.len() as u32;
@@ -342,4 +360,27 @@ pub fn scalarize_aggregates(
         );
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Int, Type};
+
+    #[test]
+    fn scalar_fields_use_semantic_order() {
+        let mut asm = Assembly::default();
+        let owner = *asm.main_module();
+        let zeta_name = asm.alloc_string("zeta");
+        let alpha_name = asm.alloc_string("alpha");
+        let zeta = asm.alloc_field(FieldDesc::new(owner, zeta_name, Type::Int(Int::I32)));
+        let alpha = asm.alloc_field(FieldDesc::new(owner, alpha_name, Type::Int(Int::I32)));
+        let fields = HashSet::from([zeta, alpha]);
+
+        let names: Vec<_> = ordered_fields(&asm, &fields)
+            .into_iter()
+            .map(|field| asm[asm.get_field(field).name()].to_string())
+            .collect();
+        assert_eq!(names, ["alpha", "zeta"]);
+    }
 }

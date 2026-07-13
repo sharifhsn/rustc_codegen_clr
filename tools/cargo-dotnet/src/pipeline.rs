@@ -43,6 +43,9 @@ fn run_native(ctx: &Context, prog_args: &[String]) -> Result<i32> {
     let private_sysroot = private_sysroot::prepare(ctx)?;
     // 2. Apply the dotnet_overlays paths override through a build-local Cargo config.
     overlays::apply(ctx)?;
+    if ctx.is_offline() {
+        crate::restore::verify(ctx, &private_sysroot)?;
+    }
     // 2.5. Clear stale `#[dotnet_export]` XML-doc scratch entries. `dotnet_macros` APPENDS one
     // entry per fn at proc-macro-expansion time (it can only ever append, never knows about
     // previous runs), so a stale file from an earlier build would silently accumulate duplicate

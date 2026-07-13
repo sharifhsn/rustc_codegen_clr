@@ -19,7 +19,6 @@ pub struct HostFacts {
     /// The .NET runtime id for the CoreCLR ILAsm NuGet package. Used by a native
     /// `setup` port (currently staged to the bash core); kept on HostFacts so the
     /// host-detection logic stays in one place.
-    #[allow(dead_code)]
     pub host_rid: &'static str,
 }
 
@@ -71,15 +70,11 @@ impl HostFacts {
     }
 }
 
-pub const UNSUPPORTED_WINDOWS_HOST: &str = "Windows hosts are not supported by this cargo-dotnet release; use Linux or macOS. Windows support will be enabled after Windows build, test, packaging, and MSBuild acceptance exists.";
-
 pub fn ensure_supported(facts: &HostFacts) -> Result<()> {
     match facts.os {
-        "linux" | "macos" => Ok(()),
-        "windows" if env::var_os("CARGO_DOTNET_EXPERIMENTAL_WINDOWS").is_some() => Ok(()),
-        "windows" => bail!(UNSUPPORTED_WINDOWS_HOST),
+        "linux" | "macos" | "windows" => Ok(()),
         other => bail!(
-            "{other} hosts are not supported by this cargo-dotnet release; use Linux or macOS."
+            "{other} hosts are not supported by this cargo-dotnet release; use Linux, macOS, or Windows."
         ),
     }
 }
@@ -239,13 +234,8 @@ mod tests {
     }
 
     #[test]
-    fn windows_has_stable_actionable_diagnostic() {
-        assert_eq!(
-            ensure_supported(&HostFacts::for_test("windows"))
-                .unwrap_err()
-                .to_string(),
-            UNSUPPORTED_WINDOWS_HOST
-        );
+    fn windows_is_a_supported_release_host() {
+        assert!(ensure_supported(&HostFacts::for_test("windows")).is_ok());
     }
 
     #[test]

@@ -176,7 +176,9 @@ impl ILExporter {
             } else {
                 ""
             };
-            let extends = if let Some(parrent) = class_def.extends() {
+            let extends = if class_def.enum_def().is_some() {
+                "[System.Runtime]System.Enum".into()
+            } else if let Some(parrent) = class_def.extends() {
                 simple_class_ref(parrent, asm)
             } else if class_def.is_valuetype() {
                 "[System.Runtime]System.ValueType".into()
@@ -266,6 +268,21 @@ impl ILExporter {
                 writeln!(out, "//align {align}", align = align.get())?;
             }
             // Export all fields
+            if let Some(enum_def) = class_def.enum_def() {
+                let underlying = type_il(&Type::Int(enum_def.underlying()), asm);
+                writeln!(
+                    out,
+                    ".field public specialname rtspecialname {underlying} value__"
+                )?;
+                for (variant_name, value) in enum_def.variants() {
+                    let literal = enum_literal_il(value);
+                    writeln!(
+                        out,
+                        ".field public static literal valuetype '{name}' '{}' = {literal}",
+                        &asm[*variant_name]
+                    )?;
+                }
+            }
             for (tpe, name, offset) in class_def.fields() {
                 let name = &asm[*name];
                 let tpe = non_void_type_il(tpe, asm);
@@ -450,8 +467,8 @@ impl ILExporter {
             // bodies are ordinary instance methods (already emitted above by the per-method loop —
             // an `EventDef` only links their names into an Event/MethodSemantics-shaped IL block,
             // it doesn't introduce new invocation semantics). `ilasm` computes the real
-            // EventMap/Event/MethodSemantics metadata rows itself from this text; the hand-rolled
-            // PE writer has no equivalent yet (see `ClassDef::add_event`'s doc for scope).
+            // EventMap/Event/MethodSemantics metadata rows itself from this text. The hand-rolled
+            // PE writer emits the equivalent rows directly on the default path.
             for ev in class_def.events() {
                 let ev_name = asm_mut[ev.name()].to_string();
                 // `_signature` variant (not the plain `non_void_type_il` body-position path): a
@@ -2310,6 +2327,20 @@ fn non_void_type_il(tpe: &Type, asm: &Assembly) -> String {
         _ => type_il(tpe, asm),
     }
 }
+
+fn enum_literal_il(value: &Const) -> String {
+    match value {
+        Const::I8(v) => format!("int8({v})"),
+        Const::U8(v) => format!("int8({})", *v as i8),
+        Const::I16(v) => format!("int16({v})"),
+        Const::U16(v) => format!("int16({})", *v as i16),
+        Const::I32(v) => format!("int32({v})"),
+        Const::U32(v) => format!("int32({})", *v as i32),
+        Const::I64(v) => format!("int64({v})"),
+        Const::U64(v) => format!("int64({})", *v as i64),
+        other => panic!("unsupported CLR enum literal constant {other:?}"),
+    }
+}
 fn type_il(tpe: &Type, asm: &Assembly) -> String {
     match tpe {
         Type::SIMDVector(simdvec) => {
@@ -2514,7 +2545,50 @@ static DEFAULT_RUNTIME_CONFIG: std::sync::LazyLock<String> =
 #[cfg(test)]
 mod region_body_compat_tests {
     use super::*;
-    use crate::ir::{BasicBlock, ExceptionRegion, MethodImpl};
+    use crate::ir::{BasicBlock, ClassDef, EnumDef, ExceptionRegion, MethodImpl};
+
+    #[test]
+    fn genuine_enum_renders_system_enum_value_and_literal_fields() {
+        let mut asm = Assembly::default();
+        let name = asm.alloc_string("Example.Status");
+        let ready = asm.alloc_string("Ready");
+        let done = asm.alloc_string("Done");
+        let definition = ClassDef::new(
+            name,
+            true,
+            0,
+            None,
+            vec![],
+            vec![],
+            crate::Access::Public,
+            None,
+            None,
+            true,
+        )
+        .with_enum(EnumDef::new(
+            Int::I32,
+            vec![(ready, Const::I32(4)), (done, Const::I32(5))],
+        ));
+        asm.class_def(definition).unwrap();
+
+        let exporter = ILExporter::new(IlasmFlavour::Clasic, true, Some("enum_test".into()));
+        let mut output = Vec::new();
+        exporter.export_to_write(&asm, &mut output).unwrap();
+        let il = String::from_utf8(output).unwrap();
+        assert!(il.contains("extends [System.Runtime]System.Enum"), "{il}");
+        assert!(
+            il.contains("specialname rtspecialname int32 value__"),
+            "{il}"
+        );
+        assert!(
+            il.contains("static literal valuetype 'Example.Status' 'Ready' = int32(4)"),
+            "{il}"
+        );
+        assert!(
+            il.contains("static literal valuetype 'Example.Status' 'Done' = int32(5)"),
+            "{il}"
+        );
+    }
 
     #[test]
     fn exporter_runtime_defaults_to_net8_and_can_be_overridden() {

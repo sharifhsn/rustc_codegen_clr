@@ -212,6 +212,7 @@ pub struct PdbBuilder {
     /// Indexed by `MethodDef` row id minus 1 (RID-order, matching the type-system table); `None`
     /// until [`add_method`](Self::add_method) is called for that row.
     methods: Vec<Option<MethodSequencePoints>>,
+    source_link_json: Option<String>,
 }
 
 impl PdbBuilder {
@@ -224,7 +225,16 @@ impl PdbBuilder {
         Self {
             type_system,
             methods: vec![None; method_def_row_count],
+            source_link_json: None,
         }
+    }
+
+    /// Embeds the standard Source Link JSON payload as module-owned Portable PDB custom debug
+    /// information. The caller owns schema/URL validation; this writer preserves the supplied
+    /// UTF-8 bytes exactly so the PDB remains deterministic and debuggers see the same document
+    /// map the build receipt records.
+    pub fn set_source_link_json(&mut self, json: impl Into<String>) {
+        self.source_link_json = Some(json.into());
     }
 
     /// Records the [`MethodSequencePoints`] for the `MethodDef` row identified by `method_token`
@@ -286,7 +296,7 @@ impl PdbBuilder {
 
         let mut strings = StringsHeap::default();
         let mut blobs = BlobHeap::default();
-        let guids = GuidHeap::default();
+        let mut guids = GuidHeap::default();
         let user_strings = UserStringHeap::default();
 
         // Nil Language/HashAlgorithm/Hash: `PortablePdb-Metadata.md` defines C#/VB/F# language
@@ -364,6 +374,15 @@ impl PdbBuilder {
             });
         }
 
+        let custom_debug_information_rows = self.source_link_json.map_or_else(Vec::new, |json| {
+            vec![CustomDebugInformationRow {
+                // HasCustomDebugInformation: Module is tag 7, Module RID is 1.
+                parent: (1 << 5) | 7,
+                kind: guids.push(SOURCE_LINK_KIND),
+                value: blobs.intern(json.as_bytes()),
+            }]
+        });
+
         let method_def_row_count = self
             .type_system
             .rows
@@ -378,12 +397,15 @@ impl PdbBuilder {
             document_rows.len(),
             method_def_row_count,
             local_variable_rows.len(),
+            &self.type_system,
+            local_scope_rows.len(),
         );
         let tables_stream = pad4(&serialize_tables(
             &document_rows,
             &method_rows,
             &local_scope_rows,
             &local_variable_rows,
+            &custom_debug_information_rows,
             &widths,
         ));
         let strings_stream = pad4(strings.as_bytes());
@@ -433,7 +455,14 @@ const TABLE_DOCUMENT: u32 = 0x30;
 const TABLE_METHOD_DEBUG_INFORMATION: u32 = 0x31;
 const TABLE_LOCAL_SCOPE: u32 = 0x32;
 const TABLE_LOCAL_VARIABLE: u32 = 0x33;
+const TABLE_CUSTOM_DEBUG_INFORMATION: u32 = 0x37;
 const HIDDEN_LINE: u32 = 0x00FE_EFEE;
+
+/// Portable PDB Source Link custom-debug-information kind
+/// (`CC110556-A091-4D38-9FEC-25AB9A351A6A`) in metadata `#GUID` byte order.
+const SOURCE_LINK_KIND: [u8; 16] = [
+    0x56, 0x05, 0x11, 0xCC, 0x91, 0xA0, 0x38, 0x4D, 0x9F, 0xEC, 0x25, 0xAB, 0x9A, 0x35, 0x1A, 0x6A,
+];
 
 #[derive(Debug, Clone)]
 struct DocumentRow {
@@ -495,6 +524,14 @@ struct LocalVariableRow {
     name: u32,
 }
 
+#[derive(Debug, Clone)]
+struct CustomDebugInformationRow {
+    /// `HasCustomDebugInformation(Module, RID 1)`: 5-bit coded-index tag 7.
+    parent: u32,
+    kind: u32,
+    value: u32,
+}
+
 struct PdbWidths {
     heap_sizes: u8,
     blob_wide: bool,
@@ -515,6 +552,7 @@ struct PdbWidths {
     /// of 2 — sized by the `LocalVariable` table's OWN row count, exactly like `document_wide` is
     /// sized by `document_rows.len()` (a plain table-index width, unrelated to any heap size).
     local_variable_wide: bool,
+    has_custom_debug_information_wide: bool,
 }
 
 impl PdbWidths {
@@ -526,6 +564,8 @@ impl PdbWidths {
         document_rows: usize,
         method_def_row_count: u32,
         local_variable_rows: usize,
+        type_system: &TypeSystemRowCounts,
+        local_scope_rows: usize,
     ) -> Self {
         let mut heap_sizes = 0u8;
         if strings.as_bytes().len() > 0xFFFF {
@@ -546,8 +586,61 @@ impl PdbWidths {
             method_def_wide: method_def_row_count > 0xFFFF,
             strings_wide: strings.as_bytes().len() > 0xFFFF,
             local_variable_wide: local_variable_rows > 0xFFFF,
+            has_custom_debug_information_wide: has_custom_debug_information_is_wide(
+                type_system,
+                document_rows,
+                local_scope_rows,
+                local_variable_rows,
+            ),
         }
     }
+}
+
+fn has_custom_debug_information_is_wide(
+    type_system: &TypeSystemRowCounts,
+    documents: usize,
+    local_scopes: usize,
+    local_variables: usize,
+) -> bool {
+    // HasCustomDebugInformation uses 5 tag bits. Only these type-system tables participate;
+    // using all table counts would over-widen the encoded column and corrupt metadata when a
+    // large unrelated table happened to cross the 2^11 threshold.
+    const TYPE_SYSTEM_PARENTS: &[u32] = &[
+        Token::TABLE_METHOD_DEF,
+        Token::TABLE_FIELD,
+        Token::TABLE_TYPE_REF,
+        Token::TABLE_TYPE_DEF,
+        Token::TABLE_PARAM,
+        Token::TABLE_INTERFACE_IMPL,
+        Token::TABLE_MEMBER_REF,
+        Token::TABLE_MODULE,
+        0x0E, // DeclSecurity
+        Token::TABLE_PROPERTY,
+        Token::TABLE_EVENT,
+        Token::TABLE_STAND_ALONE_SIG,
+        Token::TABLE_MODULE_REF,
+        Token::TABLE_TYPE_SPEC,
+        Token::TABLE_ASSEMBLY,
+        Token::TABLE_ASSEMBLY_REF,
+        0x26, // File
+        0x27, // ExportedType
+        0x28, // ManifestResource
+        Token::TABLE_GENERIC_PARAM,
+        0x2C, // GenericParamConstraint
+        Token::TABLE_METHOD_SPEC,
+    ];
+    let type_system_max = type_system
+        .rows
+        .iter()
+        .filter(|(table, _)| TYPE_SYSTEM_PARENTS.contains(table))
+        .map(|(_, count)| *count as usize)
+        .max()
+        .unwrap_or(0);
+    type_system_max
+        .max(documents)
+        .max(local_scopes)
+        .max(local_variables)
+        > 0x07FF
 }
 
 fn intern_document_id(
@@ -820,6 +913,7 @@ fn serialize_tables(
     methods: &[MethodDebugInformationRow],
     local_scopes: &[LocalScopeRow],
     local_variables: &[LocalVariableRow],
+    custom_debug_information: &[CustomDebugInformationRow],
     widths: &PdbWidths,
 ) -> Vec<u8> {
     let mut valid = 0u64;
@@ -834,6 +928,9 @@ fn serialize_tables(
     }
     if !local_variables.is_empty() {
         valid |= 1u64 << TABLE_LOCAL_VARIABLE;
+    }
+    if !custom_debug_information.is_empty() {
+        valid |= 1u64 << TABLE_CUSTOM_DEBUG_INFORMATION;
     }
 
     // `Sorted` bitmask (§II.24.2.6): `LocalScope` (0x32) is one of the tables the Portable PDB /
@@ -851,6 +948,9 @@ fn serialize_tables(
     if !local_scopes.is_empty() {
         sorted |= 1u64 << TABLE_LOCAL_SCOPE;
     }
+    if !custom_debug_information.is_empty() {
+        sorted |= 1u64 << TABLE_CUSTOM_DEBUG_INFORMATION;
+    }
 
     let mut out = Vec::new();
     out.extend_from_slice(&0u32.to_le_bytes());
@@ -867,6 +967,7 @@ fn serialize_tables(
                 TABLE_METHOD_DEBUG_INFORMATION => methods.len(),
                 TABLE_LOCAL_SCOPE => local_scopes.len(),
                 TABLE_LOCAL_VARIABLE => local_variables.len(),
+                TABLE_CUSTOM_DEBUG_INFORMATION => custom_debug_information.len(),
                 _ => unreachable!(),
             };
             out.extend_from_slice(&(count as u32).to_le_bytes());
@@ -895,6 +996,15 @@ fn serialize_tables(
         out.extend_from_slice(&row.attributes.to_le_bytes());
         out.extend_from_slice(&row.index.to_le_bytes());
         write_heap_idx(&mut out, row.name, widths.strings_wide);
+    }
+    for row in custom_debug_information {
+        write_heap_idx(
+            &mut out,
+            row.parent,
+            widths.has_custom_debug_information_wide,
+        );
+        write_heap_idx(&mut out, row.kind, widths.guid_wide);
+        write_heap_idx(&mut out, row.value, widths.blob_wide);
     }
     out
 }
@@ -1277,6 +1387,13 @@ mod tests {
         name: u32,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct TestCustomDebugInformationRow {
+        parent: u32,
+        kind: u32,
+        value: u32,
+    }
+
     impl<'a> TestPdbReader<'a> {
         fn parse(bytes: &'a [u8]) -> Self {
             assert_eq!(&bytes[0..4], b"BSJB");
@@ -1414,6 +1531,20 @@ mod tests {
                         + 4
                 }
                 TABLE_LOCAL_VARIABLE => 2 + 2 + strings,
+                TABLE_CUSTOM_DEBUG_INFORMATION => {
+                    let (_, type_system_rows) = self.pdb_stream_rows();
+                    let type_system = TypeSystemRowCounts {
+                        rows: type_system_rows,
+                        entry_point_token: 0,
+                    };
+                    let wide = has_custom_debug_information_is_wide(
+                        &type_system,
+                        Self::table_row_count(header, TABLE_DOCUMENT),
+                        Self::table_row_count(header, TABLE_LOCAL_SCOPE),
+                        Self::table_row_count(header, TABLE_LOCAL_VARIABLE),
+                    );
+                    index(wide) + guid + blob
+                }
                 other => panic!("unexpected test PDB table {other:#x}"),
             }
         }
@@ -1578,6 +1709,43 @@ mod tests {
                 });
             }
             rows
+        }
+
+        fn custom_debug_information_rows(&self) -> Vec<TestCustomDebugInformationRow> {
+            let header = self.tables_header();
+            let count = Self::table_row_count(&header, TABLE_CUSTOM_DEBUG_INFORMATION);
+            if count == 0 {
+                return Vec::new();
+            }
+            let mut cursor =
+                header.row_data_offset + self.table_offset(TABLE_CUSTOM_DEBUG_INFORMATION, &header);
+            let tables = self.stream("#~");
+            let (_, type_system_rows) = self.pdb_stream_rows();
+            let type_system = TypeSystemRowCounts {
+                rows: type_system_rows,
+                entry_point_token: 0,
+            };
+            let parent_wide = has_custom_debug_information_is_wide(
+                &type_system,
+                Self::table_row_count(&header, TABLE_DOCUMENT),
+                Self::table_row_count(&header, TABLE_LOCAL_SCOPE),
+                Self::table_row_count(&header, TABLE_LOCAL_VARIABLE),
+            );
+            let guid_wide = header.heap_sizes & 0x2 != 0;
+            let blob_wide = header.heap_sizes & 0x4 != 0;
+            (0..count)
+                .map(|_| TestCustomDebugInformationRow {
+                    parent: Self::read_index(tables, &mut cursor, parent_wide),
+                    kind: Self::read_index(tables, &mut cursor, guid_wide),
+                    value: Self::read_index(tables, &mut cursor, blob_wide),
+                })
+                .collect()
+        }
+
+        fn guid_at(&self, index: u32) -> [u8; 16] {
+            assert_ne!(index, 0);
+            let start = (index as usize - 1) * 16;
+            self.stream("#GUID")[start..start + 16].try_into().unwrap()
         }
 
         /// Reads a plain, NUL-terminated `#Strings` heap entry — NOT the `#Blob`-compressed-length
@@ -2263,6 +2431,31 @@ mod tests {
             "second named local is slot 2 — the unnamed slot 1 leaves a gap, not compacted to 1"
         );
         assert_eq!(reader.string_at(vars[1].name), "result");
+    }
+
+    #[test]
+    fn source_link_is_module_owned_standard_custom_debug_information() {
+        let type_system = TypeSystemRowCounts {
+            rows: vec![(Token::TABLE_MODULE, 1), (Token::TABLE_METHOD_DEF, 1)],
+            entry_point_token: 0,
+        };
+        let mut builder = PdbBuilder::new(type_system, 1);
+        let json = r#"{"documents":{"/_/consumer/*":"https://example.invalid/src/*"}}"#;
+        builder.set_source_link_json(json);
+        let (bytes, _) = builder.build();
+        let reader = TestPdbReader::parse(&bytes);
+        let header = reader.tables_header();
+        assert_ne!(header.valid & (1u64 << TABLE_CUSTOM_DEBUG_INFORMATION), 0);
+        assert_ne!(
+            header.sorted & (1u64 << TABLE_CUSTOM_DEBUG_INFORMATION),
+            0,
+            "CustomDebugInformation must be sorted by Parent"
+        );
+        let rows = reader.custom_debug_information_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].parent, (1 << 5) | 7, "Module RID 1, tag 7");
+        assert_eq!(reader.guid_at(rows[0].kind), SOURCE_LINK_KIND);
+        assert_eq!(reader.blob_at(rows[0].value), json.as_bytes());
     }
 
     /// A method with ZERO named locals (either no locals at all, or locals that are all unnamed

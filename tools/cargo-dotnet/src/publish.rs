@@ -18,7 +18,8 @@
 //! project already imports) builds the referenced `<RustCrate>` as an ordinary
 //! `BeforeTargets="ResolveAssemblyReferences"` step of that SAME `dotnet publish`
 //! invocation — so this is genuinely "the existing pipeline, then AOT-publish", not a
-//! reimplementation of the build.
+//! reimplementation of the build. Use `cargo dotnet new --lib` or `--plugin` to scaffold such a
+//! Rust library + C# host; the Rust-only `--app` template does not contain a `.csproj`.
 //!
 //! We deliberately do NOT reinvent the C#-project generation here (no synthesized
 //! throwaway host project): the project already needs a `Main` entrypoint and a real
@@ -56,6 +57,15 @@ pub fn run(args: &PublishArgs) -> Result<i32> {
         .clone()
         .unwrap_or_else(|| facts.host_rid.to_string());
     let profile = if args.debug { "Debug" } else { "Release" };
+    let output = args.output.as_ref().map(|path| {
+        if path.is_absolute() {
+            path.clone()
+        } else {
+            std::env::current_dir()
+                .expect("current directory is available")
+                .join(path)
+        }
+    });
 
     eprintln!(
         "== cargo dotnet publish: {} ({profile}, AOT, {rid}) ==",
@@ -75,6 +85,9 @@ pub fn run(args: &PublishArgs) -> Result<i32> {
         // Trimming/single-file are ILC defaults under PublishAot; explicit for clarity
         // and so a consumer's csproj doesn't need to restate them.
         .arg("-p:PublishTrimmed=true");
+    if let Some(output) = &output {
+        cmd.arg("--output").arg(output);
+    }
     for extra in &args.extra {
         cmd.arg(extra);
     }
@@ -97,17 +110,24 @@ pub fn run(args: &PublishArgs) -> Result<i32> {
         return Ok(code);
     }
 
-    // Report the produced native binary path: bin/<profile>/<tfm>/<rid>/publish/<AssemblyName>.
-    if let Some(bin) = locate_published_binary(
-        csproj.parent().expect("a csproj always has a parent"),
-        profile,
-        dotnet.tfm(),
-        &rid,
-    ) {
+    // Report the produced native binary path.
+    let publish_dir = output.unwrap_or_else(|| {
+        csproj
+            .parent()
+            .expect("a csproj always has a parent")
+            .join("bin")
+            .join(profile)
+            .join(dotnet.tfm())
+            .join(&rid)
+            .join("publish")
+    });
+    let project_name = csproj.file_stem().and_then(|name| name.to_str());
+    if let Some(bin) = locate_published_binary(&publish_dir, project_name) {
         eprintln!("== published native binary: {} ==", bin.display());
     } else {
         eprintln!(
-            "== publish succeeded (binary not auto-located; see bin/{profile}/*/{rid}/publish/) =="
+            "== publish succeeded (binary not auto-located; see {}/) ==",
+            publish_dir.display()
         );
     }
     Ok(0)
@@ -130,7 +150,7 @@ fn find_csproj(dir: &std::path::Path) -> Result<PathBuf> {
         0 => bail!(
             "publish: no .csproj found in {} (pass the path to a C# host project that \
              imports RustDotnet.targets and declares its <RustCrate> — see any \
-             cargo_tests/cd_*/csharp for the shape, or `cargo dotnet new --app`)",
+             cargo_tests/cd_*/csharp for the shape, or `cargo dotnet new --lib` / `--plugin`)",
             dir.display()
         ),
         1 => Ok(candidates.into_iter().next().unwrap()),
@@ -141,31 +161,85 @@ fn find_csproj(dir: &std::path::Path) -> Result<PathBuf> {
     }
 }
 
-/// Best-effort locate the ILC-produced native executable under the SDK's standard
-/// publish output layout: `<proj>/bin/<profile>/<tfm>/<rid>/publish/<AssemblyName>`.
+/// Best-effort locate the ILC-produced native executable in a publish output directory,
+/// preferring the conventional project-name executable over unrelated native sidecars.
 /// Returns `None` (non-fatal) if the layout doesn't match — `dotnet publish`'s own
 /// stdout already told the user where it wrote the binary in that case.
 fn locate_published_binary(
-    proj_dir: &std::path::Path,
-    profile: &str,
-    tfm: &str,
-    rid: &str,
+    publish_dir: &std::path::Path,
+    project_name: Option<&str>,
 ) -> Option<PathBuf> {
-    let publish_dir = proj_dir
-        .join("bin")
-        .join(profile)
-        .join(tfm)
-        .join(rid)
-        .join("publish");
-    std::fs::read_dir(&publish_dir)
+    if let Some(project_name) = project_name {
+        for file_name in [project_name.to_string(), format!("{project_name}.exe")] {
+            let candidate = publish_dir.join(file_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(publish_dir)
         .ok()?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| {
             path.is_file()
                 && !matches!(
                     path.extension().and_then(|extension| extension.to_str()),
-                    Some("dll") | Some("pdb") | Some("json") | Some("dSYM")
+                    Some("a")
+                        | Some("dbg")
+                        | Some("dll")
+                        | Some("dylib")
+                        | Some("json")
+                        | Some("pdb")
+                        | Some("so")
                 )
         })
-        .max_by_key(|path| path.metadata().and_then(|metadata| metadata.modified()).ok())
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_csproj_accepts_file_and_single_project_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("host.csproj");
+        std::fs::write(&project, "<Project />").unwrap();
+        assert_eq!(find_csproj(&project).unwrap(), project);
+        assert_eq!(find_csproj(temp.path()).unwrap(), project);
+    }
+
+    #[test]
+    fn find_csproj_rejects_missing_and_ambiguous_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(
+            find_csproj(temp.path())
+                .unwrap_err()
+                .to_string()
+                .contains("no .csproj")
+        );
+        std::fs::write(temp.path().join("a.csproj"), "<Project />").unwrap();
+        std::fs::write(temp.path().join("b.csproj"), "<Project />").unwrap();
+        assert!(
+            find_csproj(temp.path())
+                .unwrap_err()
+                .to_string()
+                .contains("multiple .csproj")
+        );
+    }
+
+    #[test]
+    fn published_binary_prefers_project_name_and_ignores_sidecars() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("host.dbg"), "symbols").unwrap();
+        std::fs::write(temp.path().join("other"), "native").unwrap();
+        let host = temp.path().join("host");
+        std::fs::write(&host, "native").unwrap();
+        assert_eq!(
+            locate_published_binary(temp.path(), Some("host")),
+            Some(host)
+        );
+    }
 }

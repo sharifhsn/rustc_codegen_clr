@@ -32,6 +32,12 @@ feedback) turned up two more small Tier A wins (`Task<T>` export returns, `Vec<T
 export returns) and one closed non-issue (the source-generator premise is already solved by
 generics) — findings appended below.
 
+**Current-truth update:** both small return-type wins subsequently shipped. `marshal_return`
+accepts `Task`, `TaskT<T>`, and primitive `Vec<T>`; `cd_export` and the product-shaped
+`cd_efcore_async` C# host prove ordinary and real multi-await `Task<int>` consumption. The open
+part of the richer-return item is true incremental `IAsyncEnumerable<T>`, not Task or materialized
+collection return.
+
 This doc is the **next layer** of ergonomics work, organized by interface/surface rather than by
 theme, so it's easy to tell which items are pure-library (safe, mycorrhiza-only, cheap to verify)
 vs. which need backend research first (touch `cilly/src`, need the full `::stable` gate, or need a
@@ -54,13 +60,10 @@ design decision before any code is written).
   now implement `IEnumerable<T>` via an allocation-free struct `Enumerator`, so both `foreach` and LINQ
   work directly. Verified with real `foreach`/`Sum`/`Where`/`Select` checks in `cd_rustvec`
   (44/44, up from 37/37).
-- **Richer `#[dotnet_export]` return types** — `Task<T>` and `IEnumerable<T>`/`IAsyncEnumerable<T>`
-  as direct return types from an exported fn, to close the loop with async/enumerator work already
-  done in the other direction. **Research first** (interacts with the Task<T>-production ceiling
-  documented in `mycorrhiza::task`'s own module docs). **Researched 2026-07-07 — three cases of
-  wildly different size, see findings below: `Task<T>` return and `Vec<T>`→`RustVec<T>` return are
-  both small Tier A follow-ons riding on already-shipped backend capability; true incremental
-  `IAsyncEnumerable<T>` production is blocked on the sibling item's coroutine-layout wall.**
+- ~~**Richer `#[dotnet_export]` return types: `Task<T>` and materialized `IEnumerable<T>`**~~ —
+  **DONE.** `Task`/`TaskT<T>` pass managed handles through the export seam, and primitive `Vec<T>`
+  becomes the existing C# `RustVec<T>`/`IEnumerable<T>` wrapper. True incremental
+  `IAsyncEnumerable<T>` remains a separate blocked stream-production item; see the findings below.
 - **C# nullable/XML-doc annotation emission** on generated signatures — exported methods carry no
   `?` nullable-reference annotations and don't forward Rust doc comments as C# `///` XML docs, so
   IntelliSense on the C# side is blind to both. **Research first** — design proposal, since it
@@ -78,22 +81,27 @@ design decision before any code is written).
   `impl_from_managed_exception!` macro in `mycorrhiza::error` (a blanket `From` impl isn't legal
   Rust across the orphan rules, so a macro is the right shape). New `cd_error` probe (6/6) proves a
   custom error enum using `?` against a fallible managed call end-to-end.
-- ~~**`Span<T>`/`Memory<T>` deeper API**~~ — **DONE, with one documented gap** (`5a3baaa`). Filled
-  slicing, `CopyTo`, `contains`/`index_of` (as Rust-side scans). Did **not** wire `IndexOf`/
+- ~~**`Span<T>`/`Memory<T>` deeper API**~~ — **DONE, with one documented gap.** `Span<T>` and
+  `ReadOnlySpan<T>` provide zero-copy borrowed views with slicing, `CopyTo`, and Rust-side
+  `contains`/`index_of`. `Memory<T>` and `ReadOnlyMemory<T>` now copy into GC-owned arrays for
+  retained/async-safe handoff, with managed slicing, mutation, and `CopyTo` (`cd_span` 68/68). This
+  also closes the guarded `!0[]` generic-constructor signature path. Did **not** wire `IndexOf`/
   `Contains` to the real `MemoryExtensions` static generic methods — that needs a static generic
   call whose argument is itself a generic-struct type constrained on `T: IEquatable<T>`, not
   reachable through the existing generic-interop intrinsics without new `cilly/src` support;
   documented in `span.rs`'s module docs as a real, scoped gap rather than silently worked around.
   `cd_span` 45/45.
-- **`IAsyncEnumerable<T>` bridge** — `Task`/`Task<T>` are bridged both ways; async *streams*
-  (common in modern .NET APIs — EF Core, gRPC streaming) aren't. **Research first** (interacts
+- **`IAsyncEnumerable<T>` bridge** — the consumer direction now ships as
+  `mycorrhiza::enumerate_async`: Rust incrementally drives `GetAsyncEnumerator` / `MoveNextAsync` /
+  `Current`, including pending `ValueTask<bool>` operations (`cd_async_stream`, debug + release).
+  The producer direction (Rust `async fn` → managed async stream) remains open. **Research first** (interacts
   with the same coroutine-layout wall documented in `mycorrhiza::task`). **Researched 2026-07-06,
   see findings below — blocked for the sugared `async fn` case; a hand-rolled non-overlapping
   Stream-state struct is a viable Tier A follow-up. The blocking generic-interface-instantiation
   gap noted here (2026-07-07) is now FIXED** (`rustc_codegen_clr_add_generic_interface_impl` +
   `implements = "…<[Asm]Ns.Ty>"` / `"…<valuetype [Asm]Ns.Ty>"` syntax) — see the new Tier C
   finding §8 below for the full story, including a real Roslyn bug isolated and worked around along
-  the way. The Stream-state-struct spike itself is still open (this only unblocked the interface
+  the way. The Stream-state-struct producer spike itself is still open (this only unblocked the interface
   instantiation it needs).
 - ~~**A safe `Once`/lazy-init wrapper**~~ — **DONE** (`fa5ccbd`). `mycorrhiza::sync::SharedOnce<T>`,
   built on the existing `SharedLock` (double-checked locking over an `UnsafeCell<Option<T>>`), not
@@ -132,7 +140,7 @@ design decision before any code is written).
 - ~~**`cargo dotnet publish --aot`**~~ — **DONE.** `cargo dotnet publish <csproj-dir>` runs
   `dotnet publish -c Release -r <host-rid> --self-contained -p:PublishAot=true` against an
   existing C# host project (one that imports `RustDotnet.targets` and declares its
-  `<RustCrate>` — the same shape as `cargo_tests/cd_*/csharp`, or `cargo dotnet new --app`).
+  `<RustCrate>` — the same shape as `cargo_tests/cd_*/csharp`, or `cargo dotnet new --lib` / `--plugin`).
   The Rust crate build happens as part of the SAME `dotnet publish` invocation via that
   existing MSBuild import, so this genuinely wraps the proven manual recipe rather than
   reimplementing it. Verified end-to-end against `cargo_tests/cd_interop/csharp`: the
@@ -151,14 +159,11 @@ design decision before any code is written).
   `mycorrhiza/src/bindings.rs` and `cargo_tests/spinacz/out.rs` are one-time hand-committed
   `spinacz` output with no existing hash/timestamp staleness signal to check against; adding one
   would be inventing new infrastructure, out of scope for a lint pass.
-- ~~**Incremental-build feedback**~~ — **CONFIRMED REAL, fix scoped, not yet implemented.**
-  Researched 2026-07-07 by measuring a real regex-scale crate: 10-12 seconds of complete terminal
-  silence during the MIR→CIL→link→PE pipeline in default (non-verbose) mode, because
-  `feasibility/_cargo_dotnet_core.sh`'s log-filtering grep allow-lists `Compiling std/core/alloc`
-  but not the target crate's own `Compiling` line or any of the linker's existing stage
-  `println!`s — the signal already exists and is silently thrown away, not missing. See findings
-  below for the two small, additive, no-typechecker-risk edits that fix it (grep allow-list +
-  timing instrumentation) — not yet implemented, next up.
+- ~~**Incremental-build feedback**~~ — **DONE.** The typed `cargo-dotnet` driver now reads the inner
+  Cargo process incrementally instead of waiting on `Command::output()`, mirrors ordinary
+  `Compiling ...` lines plus the linker's existing `==> ...` stages as they happen, and still writes
+  the complete output to `_lastbuild.log`. `--verbose` remains unfiltered and failures still replay
+  the complete log. A unit regression keeps consumer-crate and linker progress in the default view.
 
 ## 5. Documentation & discoverability
 
@@ -507,7 +512,15 @@ Visual Studio silently shows no docs with no error — needs a differential chec
 emitted metadata name, not just "the C# compiles." (Update 2026-07-07: this half shipped, see §4's
 DONE entry — `ca74a46`.)
 
-### 5. .NET events (`add_*`/`remove_*`) on exported classes — SHIPPED (2026-07-07, IL-exporter-only)
+### 5. .NET events (`add_*`/`remove_*`) on exported classes — SHIPPED, DIRECT-PE GATED
+
+**Current status:** class and interface events are emitted by both the IL exporter and the default
+direct-PE writer. `feasibility/event_acceptance.sh` continuously compiles real C# `+=`/`-=` syntax,
+checks reflected event/accessor metadata, exercises interface dispatch, and proves the direct path
+does not execute ILAsm. Accessor-body synchronization remains application-owned.
+
+**Historical implementation record follows.** The IL-only and missing-PE statements below describe
+the intermediate 2026-07-07 state, before EventMap/Event/MethodSemantics landed in the PE writer.
 
 **Both the hand-written-ilasm spike AND a real `cilly` capability shipped, exactly as scoped
 below.** Step 1 (hand-written `.il`, zero `cilly` involvement): a `.event`/`.addon`/`.removeon`
@@ -528,7 +541,8 @@ hand-builds one `Notifier`/`Changed` event with trivial `ret`-only bodies — it
 *metadata linking* is well-formed IL `ilasm` accepts, not to re-prove the runtime semantics already
 covered by Step 1's C# consumer).
 
-**`pe_exporter`/`c_exporter` support does not exist** — same `DIRECT_PE=1` gap class as virtual
+**At that intermediate point, `pe_exporter`/`c_exporter` support did not exist** — the same
+`DIRECT_PE=1` gap class as virtual
 overrides and interface export. No EventMap/Event/MethodSemantics tables were added to
 `pe_exporter/tables.rs` (would need the exact row-sorting care this finding's "what could go wrong"
 section originally called out). `EventDef` currently has no assert-guard in either exporter (there
@@ -638,9 +652,12 @@ backing field doesn't collide with the existing field-accessor-generation machin
 
 ### 6. Richer `#[dotnet_export]` return types: `Task<T>` and `IEnumerable<T>`/`IAsyncEnumerable<T>`
 
-**Verdict: three cases of wildly different size.** `#[dotnet_export]` currently hard-rejects
-`async fn` unconditionally and `marshal_return` only recognizes `&str`/`String`/`()`/primitives —
-no container or `Task` arm exists at all.
+> **Current status:** Cases A and B below shipped after this research snapshot. The macro still
+> correctly rejects `async fn` sugar, but ordinary functions can return `Task`/`TaskT<T>` and
+> primitive `Vec<T>` directly. Case C remains open/blocked.
+
+**Original verdict: three cases of wildly different size.** At the time of this snapshot,
+`#[dotnet_export]` hard-rejected `async fn` and lacked container/Task return arms.
 
 - **Case A — `Task<T>` return (small, Tier A-adjacent):** the hard part this item worried about —
   producing a result-bearing `Task<T>` at all — is *not actually a wall anymore*: `future_to_task`
@@ -663,10 +680,9 @@ no container or `Task` arm exists at all.
   layout wall or tempt a fully-buffered shortcut that silently breaks the backpressure semantics a
   .NET consumer would reasonably assume from the type.
 
-**Recommended sequencing:** ship Case A and Case B as two small, independent `dotnet_macros`
-changes riding on already-shipped backend capability; leave Case C blocked until the sibling
-Stream-state-struct spike lands (and, per that finding above, until the `implements=`
-generic-interface-instantiation gap is fixed first).
+**Sequencing result:** Cases A and B shipped as independent `dotnet_macros` changes. Case C remains
+blocked pending the Stream-state-struct work; generic interface instantiation itself has since
+shipped and is no longer the blocker.
 
 ### 7. Source-generator-driven C# boilerplate — CLOSED, non-issue
 

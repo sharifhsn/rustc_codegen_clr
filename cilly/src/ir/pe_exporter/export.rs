@@ -60,7 +60,7 @@ use super::tables::{MetadataBuilder, Token};
 use crate::DotnetRuntime;
 use crate::Interned;
 use crate::ir::class::StaticFieldDef;
-use crate::ir::{Assembly, ClassRef, Const, MethodDefIdx};
+use crate::ir::{Assembly, ClassRef, Const, MethodDefIdx, Type};
 
 // `pe::SECTION_ALIGNMENT`/`pe::CLI_HEADER_CB` (both `pub(super)`) are used directly below rather
 // than duplicated here — an earlier version of this file kept its own copies "since the RVA
@@ -127,6 +127,17 @@ pub struct ExportOptions {
 /// On any construct outside the Phase 1a inventory — see the module doc.
 #[must_use]
 pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>, Vec<u8>) {
+    export_pe_with_source_link(asm, options, None)
+}
+
+/// Direct-PE render with an optional validated Source Link JSON document map. Kept separate from
+/// [`export_pe`] so structural tests and non-cargo callers retain the zero-configuration path.
+#[must_use]
+pub(crate) fn export_pe_with_source_link(
+    asm: &mut Assembly,
+    options: &ExportOptions,
+    source_link_json: Option<&str>,
+) -> (Vec<u8>, Vec<u8>) {
     let mut mb = MetadataBuilder::new();
     mb.set_public_module_full_name(options.public_module_full_name.as_deref());
     mb.set_runtime(options.runtime);
@@ -228,6 +239,8 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
         // loader treats it as an interface-shaped type with no concrete base).
         let extends = if class_def.is_interface() {
             None
+        } else if class_def.enum_def().is_some() {
+            Some(system_runtime_type_ref(&mut mb, "System.Enum"))
         } else if let Some(parent) = class_def.extends() {
             Some(mb.class_ref_token(asm, parent))
         } else if class_def.is_valuetype() {
@@ -424,6 +437,25 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
         // every row at the placeholder value `1`). Every class needs this call, including ones
         // with zero fields — the run-start still marks the correct boundary for its neighbors.
         mb.set_type_def_field_list(type_def_token_of[&class_def_id]);
+        if let Some(enum_def) = class_def.enum_def() {
+            let mut underlying_sig = Vec::new();
+            sig::encode_field_sig(
+                Type::Int(enum_def.underlying()),
+                asm,
+                &mut mb,
+                &mut underlying_sig,
+            );
+            let underlying_sig = mb.blobs.intern(&underlying_sig);
+            mb.add_enum_value_field(underlying_sig);
+
+            let enum_cref = asm.alloc_class_ref(class_def.ref_to());
+            let mut enum_sig = Vec::new();
+            sig::encode_field_sig(Type::ClassRef(enum_cref), asm, &mut mb, &mut enum_sig);
+            let enum_sig = mb.blobs.intern(&enum_sig);
+            for (name, value) in enum_def.variants() {
+                mb.add_enum_literal_field(&asm[*name], enum_sig, *value);
+            }
+        }
         for &(tpe, name, offset) in class_def.fields() {
             let name_str = asm[name].to_string();
             let mut blob = Vec::new();
@@ -985,6 +1017,9 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
             entry_point_token: entry_point_token.map_or(0, |t| t.0),
         };
         let mut pdb_builder = super::pdb::PdbBuilder::new(type_system, mb.method_def_row_count());
+        if let Some(source_link_json) = source_link_json {
+            pdb_builder.set_source_link_json(source_link_json);
+        }
         for (tok, assembled) in &bodies {
             // Methods with zero sequence points AND zero named locals have truly nothing for the
             // PDB to say about them — skip and let `PdbBuilder::build` fall back to its default

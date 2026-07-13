@@ -129,7 +129,7 @@ pub fn wrapper_lang_start(
 /// rethrow anything else unchanged (so a genuine backend miscompile/AV still surfaces visibly,
 /// exactly like `catch_unwind` does) — and on a real Rust panic, simply exit with code `101`
 /// (matching native's panic exit code) via `System.Environment.Exit`, without printing anything
-/// else: the "thread '<name>' panicked at ..." message was already printed by std's own
+/// else: the `thread '<name>' panicked at ...` message was already printed by std's own
 /// `panic_fmt`/default hook before the exception was thrown, so nothing further is needed here.
 ///
 /// One documented trade-off versus the (currently broken) `lang_start` path: because we never

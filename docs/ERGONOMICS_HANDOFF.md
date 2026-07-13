@@ -1,5 +1,11 @@
 # Ergonomics work — session hand-off / cold-start guide
 
+> **Historical operating guide, reconciled 2026-07-13.** Branch/commit counts and unfinished-feature
+> notes from the original campaign are no longer authoritative. Use the repository `AGENTS.md`,
+> [`STATE_OF_THE_PROJECT.md`](STATE_OF_THE_PROJECT.md), and the status-marked
+> [`ERGONOMICS_ROADMAP.md`](ERGONOMICS_ROADMAP.md) for current truth. The build recipes and implementation
+> patterns below remain useful.
+
 Everything a fresh session needs to **continue the interop-ergonomics work** without the accumulated
 context: current state, how to build & verify (the footguns that cost hours), the surface as it
 stands, the exact patterns to copy, and where to start. The *what-to-build* backlog is
@@ -9,10 +15,8 @@ stands, the exact patterns to copy, and where to start. The *what-to-build* back
 
 ## 1. Current state
 
-- **Branch:** `gaps-campaign`. **~84 commits ahead of `mine/gaps-campaign`; NOTHING is pushed.**
-  Commit locally; **never push** (`origin` = FractalFir's upstream; push to `mine` only when the owner
-  explicitly asks). End every commit message with
-  `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
+- Verify the current worktree and branch before editing; this handoff's original branch count is
+  intentionally not preserved as live guidance.
 - **The ergonomics campaign is essentially COMPLETE.** All six themes shipped their keystones and most
   breadth; the full per-theme completion report is in [ERGONOMICS_STATUS.md](ERGONOMICS_STATUS.md), the
   status-marked backlog in [ERGONOMICS_ROADMAP.md](ERGONOMICS_ROADMAP.md). Verified surface (newest first):
@@ -176,26 +180,24 @@ C# side (`cd_containers/csharp/Program.cs`): a `Check(name, got, want)` helper p
 
 ---
 
-## 5. Where to start (the campaign is essentially done — this is the remaining tail)
+## 5. Where to start (reconciled current tail)
 
 The quick wins, the enumerator bridge, `cargo dotnet new`, `#[dotnet_export]`, delegates (core),
 Task/async, the BCL wrappers, JSON, the extra collections, and the cookbook **all shipped and are
 verified** (see §1 + [ERGONOMICS_STATUS.md](ERGONOMICS_STATUS.md)). What remains, in leverage order:
 
-1. **The one backend unlock — WF-9 generic value-type instance methods** (`src/terminator/call.rs`, the
-   `!is_valuetype` assert for KIND=1). This single change is a *backend* change (rebuild + install +
-   `./feasibility/dev.sh gate` required — see §2) and it unblocks THREE roadmap items at once:
-   **Dictionary iteration** (`for (k,v) in &dict` over `KeyValuePair<K,V>`), **`Span<T>`/`Memory<T>`**,
-   and the valuetype **`Nullable<T>`** wrapper. Pass the by-value valuetype receiver by managed-pointer
-   (address-of) for `call instance`. Do NOT weaken `cilly/src/ir/typecheck.rs`. Highest leverage left.
-2. **Delegate tail (mycorrhiza + `src/`):** closure *captures* (boxed-env trampoline), delegate as a
-   **generic-method** argument (`List<T>.Sort(Comparison<T>)` — needs a nested-`!N`-binding typecheck
-   *extension*, sound, NOT a relaxation), .NET **events** (`add_*`). Unblocks LINQ predicate adapters.
-3. **Pure-library breadth (mycorrhiza-only, no backend rebuild):** LINQ-style adapters (`.where_`/
-   `.select`/`.to_list`) now that the enumerator bridge + delegates exist; enum interop; `IEnumerable<T>`
-   over a `RustVec`; C#→Rust delegates; virtual methods / interface impl for `#[dotnet_class]`.
-4. **Tooling/docs polish:** `cargo dotnet publish --aot` as a first-class command (AOT is codegen-proven);
-   hosted rustdoc + C# XML docs; a flagship end-to-end example app.
+1. Keep the product gates green: onboarding, managed execution, NuGet, byte reproducibility, and
+   `feasibility/nativeaot_acceptance.sh`.
+2. **Interop breadth:** .NET events, exported traits, `IEnumerable<T>` over `RustVec`, and C# delegates
+   consumed as Rust closures. (`Memory<T>` and exported enum/`Result`/`Option` support now have proofs.)
+3. **Docs/release breadth:** keep the generated Rust HTML + packaged C# XML artifact gate green;
+   choose an external hosting identity before publishing it.
+
+The former headline items are closed: generic value-type instance methods, Dictionary iteration,
+`Nullable<T>`, `Span<T>`/`ReadOnlySpan<T>`, capturing and generic-argument delegates, LINQ/IQueryable,
+enum interop, interface implementation, NativeAOT publish, and the flagship example all have concrete
+fixtures or acceptance scripts. Do not reopen them based on the historical text below without first
+checking the current source and tests.
 
 For any of the above: pick the item in [ERGONOMICS_ROADMAP.md](ERGONOMICS_ROADMAP.md) (status-marked),
 copy the nearest `cd_*` proof (§3 table) as the verification harness, follow the §4 recipe, and obey the

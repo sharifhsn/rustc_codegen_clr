@@ -13,12 +13,12 @@
 #![allow(internal_features, incomplete_features, dead_code)]
 
 use mycorrhiza::delegate::Action1;
-use mycorrhiza::gen;
+use mycorrhiza::r#gen;
 use mycorrhiza::intrinsics::{
+    RustcCLRInteropManagedGeneric, RustcCLRInteropManagedGenericStruct, RustcCLRInteropTypeGeneric,
     rustc_clr_interop_generic_call1, rustc_clr_interop_generic_call2,
     rustc_clr_interop_generic_call3, rustc_clr_interop_generic_ctor0,
     rustc_clr_interop_generic_ctor1, rustc_clr_interop_generic_ctor2,
-    RustcCLRInteropManagedGeneric, RustcCLRInteropManagedGenericStruct, RustcCLRInteropTypeGeneric,
 };
 use mycorrhiza::system::console::Console;
 
@@ -31,13 +31,35 @@ const ACTION: &str = "System.Action";
 // ---- Capability A: Nullable<T> (a generic value type) — ctor + value-type instance getters. ----
 type NullI32 = RustcCLRInteropManagedGenericStruct<CORELIB, NULLABLE, 16, (i32,)>;
 fn nullable_new(v: i32) -> NullI32 {
-    rustc_clr_interop_generic_ctor1::<CORELIB, NULLABLE, true, (i32,), ((), gen!(0)), NullI32, i32>(v)
+    rustc_clr_interop_generic_ctor1::<CORELIB, NULLABLE, true, (i32,), ((), r#gen!(0)), NullI32, i32>(
+        v,
+    )
 }
 fn nullable_has_value(n: &NullI32) -> bool {
-    rustc_clr_interop_generic_call1::<CORELIB, NULLABLE, true, "get_HasValue", 1, (i32,), (bool,), bool, &NullI32>(n)
+    rustc_clr_interop_generic_call1::<
+        CORELIB,
+        NULLABLE,
+        true,
+        "get_HasValue",
+        1,
+        (i32,),
+        (bool,),
+        bool,
+        &NullI32,
+    >(n)
 }
 fn nullable_value(n: &NullI32) -> i32 {
-    rustc_clr_interop_generic_call1::<CORELIB, NULLABLE, true, "get_Value", 1, (i32,), (gen!(0),), i32, &NullI32>(n)
+    rustc_clr_interop_generic_call1::<
+        CORELIB,
+        NULLABLE,
+        true,
+        "get_Value",
+        1,
+        (i32,),
+        (r#gen!(0),),
+        i32,
+        &NullI32,
+    >(n)
 }
 
 // ---- Capability B: delegate as a generic-method arg. `List<T>.ForEach(Action<!0>)` — the def-shape
@@ -46,9 +68,16 @@ type ActionI32 = RustcCLRInteropManagedGeneric<CORELIB, ACTION, (i32,)>;
 type ActionDef = RustcCLRInteropManagedGeneric<CORELIB, ACTION, (RustcCLRInteropTypeGeneric<0>,)>;
 fn list_for_each(l: RList<i32>, action: ActionI32) {
     rustc_clr_interop_generic_call2::<
-        CORELIB, LIST, false, "ForEach", 2, (i32,),
+        CORELIB,
+        LIST,
+        false,
+        "ForEach",
+        2,
+        (i32,),
         ((), ActionDef), // Sig: void ForEach(Action<!0>)
-        (), RList<i32>, ActionI32,
+        (),
+        RList<i32>,
+        ActionI32,
     >(l, action)
 }
 
@@ -66,52 +95,148 @@ fn list_new<T>() -> RList<T> {
     rustc_clr_interop_generic_ctor0::<CORELIB, LIST, false, (T,), ((),), RList<T>>()
 }
 fn list_add<T>(l: RList<T>, x: T) {
-    rustc_clr_interop_generic_call2::<CORELIB, LIST, false, "Add", 2, (T,), ((), gen!(0)), (), RList<T>, T>(l, x)
+    rustc_clr_interop_generic_call2::<
+        CORELIB,
+        LIST,
+        false,
+        "Add",
+        2,
+        (T,),
+        ((), r#gen!(0)),
+        (),
+        RList<T>,
+        T,
+    >(l, x)
 }
 fn list_count<T>(l: RList<T>) -> i32 {
-    rustc_clr_interop_generic_call1::<CORELIB, LIST, false, "get_Count", 2, (T,), (i32,), i32, RList<T>>(l)
+    rustc_clr_interop_generic_call1::<
+        CORELIB,
+        LIST,
+        false,
+        "get_Count",
+        2,
+        (T,),
+        (i32,),
+        i32,
+        RList<T>,
+    >(l)
 }
 fn list_get<T>(l: RList<T>, idx: i32) -> T {
-    rustc_clr_interop_generic_call2::<CORELIB, LIST, false, "get_Item", 2, (T,), (gen!(0), i32), T, RList<T>, i32>(l, idx)
+    rustc_clr_interop_generic_call2::<
+        CORELIB,
+        LIST,
+        false,
+        "get_Item",
+        2,
+        (T,),
+        (r#gen!(0), i32),
+        T,
+        RList<T>,
+        i32,
+    >(l, idx)
 }
 // GetRange(int32,int32) -> List<!0> : the def-shape return is the nested generic `List`1<!0>`.
 fn list_get_range<T>(l: RList<T>, index: i32, count: i32) -> RList<T> {
     rustc_clr_interop_generic_call3::<
-        CORELIB, LIST, false, "GetRange", 2, (T,),
+        CORELIB,
+        LIST,
+        false,
+        "GetRange",
+        2,
+        (T,),
         (RList<RustcCLRInteropTypeGeneric<0>>, i32, i32), // Sig: (List<!0>, int32, int32)
-        RList<T>, RList<T>, i32, i32,
+        RList<T>,
+        RList<T>,
+        i32,
+        i32,
     >(l, index, count)
 }
 
 // KeyValuePair<i32,i64>: 4-byte key + 4 pad + 8-byte value = 16 bytes.
-type KvpIL = mycorrhiza::intrinsics::RustcCLRInteropManagedGenericStruct<CORELIB, KVP, 16, (i32, i64)>;
+type KvpIL =
+    mycorrhiza::intrinsics::RustcCLRInteropManagedGenericStruct<CORELIB, KVP, 16, (i32, i64)>;
 // KeyValuePair<i64,i32>: 8-byte key + 4-byte value (+4 pad) = 16 bytes.
-type KvpLI = mycorrhiza::intrinsics::RustcCLRInteropManagedGenericStruct<CORELIB, KVP, 16, (i64, i32)>;
+type KvpLI =
+    mycorrhiza::intrinsics::RustcCLRInteropManagedGenericStruct<CORELIB, KVP, 16, (i64, i32)>;
 
 fn kvp_il(key: i32, value: i64) -> KvpIL {
     // newobj KeyValuePair`2<int32,int64>::.ctor(!0, !1)
-    rustc_clr_interop_generic_ctor2::<CORELIB, KVP, true, (i32, i64), ((), gen!(0), gen!(1)), KvpIL, i32, i64>(
-        key, value,
-    )
+    rustc_clr_interop_generic_ctor2::<
+        CORELIB,
+        KVP,
+        true,
+        (i32, i64),
+        ((), r#gen!(0), r#gen!(1)),
+        KvpIL,
+        i32,
+        i64,
+    >(key, value)
 }
 fn kvp_il_key(kvp: &KvpIL) -> i32 {
     // call instance !0 KeyValuePair`2<int32,int64>::get_Key()  (KIND=1, receiver by &)
-    rustc_clr_interop_generic_call1::<CORELIB, KVP, true, "get_Key", 1, (i32, i64), (gen!(0),), i32, &KvpIL>(kvp)
+    rustc_clr_interop_generic_call1::<
+        CORELIB,
+        KVP,
+        true,
+        "get_Key",
+        1,
+        (i32, i64),
+        (r#gen!(0),),
+        i32,
+        &KvpIL,
+    >(kvp)
 }
 fn kvp_il_value(kvp: &KvpIL) -> i64 {
-    rustc_clr_interop_generic_call1::<CORELIB, KVP, true, "get_Value", 1, (i32, i64), (gen!(1),), i64, &KvpIL>(kvp)
+    rustc_clr_interop_generic_call1::<
+        CORELIB,
+        KVP,
+        true,
+        "get_Value",
+        1,
+        (i32, i64),
+        (r#gen!(1),),
+        i64,
+        &KvpIL,
+    >(kvp)
 }
 
 fn kvp_li(key: i64, value: i32) -> KvpLI {
-    rustc_clr_interop_generic_ctor2::<CORELIB, KVP, true, (i64, i32), ((), gen!(0), gen!(1)), KvpLI, i64, i32>(
-        key, value,
-    )
+    rustc_clr_interop_generic_ctor2::<
+        CORELIB,
+        KVP,
+        true,
+        (i64, i32),
+        ((), r#gen!(0), r#gen!(1)),
+        KvpLI,
+        i64,
+        i32,
+    >(key, value)
 }
 fn kvp_li_key(kvp: &KvpLI) -> i64 {
-    rustc_clr_interop_generic_call1::<CORELIB, KVP, true, "get_Key", 1, (i64, i32), (gen!(0),), i64, &KvpLI>(kvp)
+    rustc_clr_interop_generic_call1::<
+        CORELIB,
+        KVP,
+        true,
+        "get_Key",
+        1,
+        (i64, i32),
+        (r#gen!(0),),
+        i64,
+        &KvpLI,
+    >(kvp)
 }
 fn kvp_li_value(kvp: &KvpLI) -> i32 {
-    rustc_clr_interop_generic_call1::<CORELIB, KVP, true, "get_Value", 1, (i64, i32), (gen!(1),), i32, &KvpLI>(kvp)
+    rustc_clr_interop_generic_call1::<
+        CORELIB,
+        KVP,
+        true,
+        "get_Value",
+        1,
+        (i64, i32),
+        (r#gen!(1),),
+        i32,
+        &KvpLI,
+    >(kvp)
 }
 
 static mut PASS: u32 = 0;
@@ -175,12 +300,17 @@ fn main() -> std::process::ExitCode {
 
     // ---- Ergonomic Nullable<T> -> Option<T> (mycorrhiza::nullable) ----
     use mycorrhiza::nullable::NullableExt;
-    chk_i64(16, mycorrhiza::nullable::some(7i32).to_option().unwrap() as i64, 7);
+    chk_i64(
+        16,
+        mycorrhiza::nullable::some(7i32).to_option().unwrap() as i64,
+        7,
+    );
 
     unsafe {
         Console::writeln_u64(PASS as u64);
         Console::writeln_u64(TOTAL as u64);
         if PASS == TOTAL {
+            println!("== cd_vtgen done ==");
             std::process::ExitCode::SUCCESS
         } else {
             std::process::ExitCode::FAILURE

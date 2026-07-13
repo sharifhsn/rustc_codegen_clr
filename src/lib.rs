@@ -54,13 +54,14 @@
 //!
 //! This way, it is far less likely that a piece of code will be miscompiled. It also helps with debuging, and allows us to achieve a very high-level translation of MIR.
 //!
-//! This intermediate, inefficent CIL can be optimized using the functions within the [`crate::opt`] module. Those optimzations are allowed to do things like reorder statements, remove/add locals, etc.
+//! This intermediate, inefficient CIL is converted to cilly's interned V2 IR and optimized by
+//! [`cilly::ir::opt`]. Those optimizations may reorder statements and remove or add locals.
 //! So, when debuging issues, it is recomeded the additional optimzations be turned off by seting the enviroment varaible `OPTIMIZE_CIL` to 0.
 //!
 //! ## Internal IR
 //!
-//! The project-internal IR(CIL trees) is defined in the module [`crate::cil_tree`]. Additional CIL-related data structures, such as call targets and field descriptors can be found in [`crate::cil`].
-//! [`crate::cil_tree`] will also contain a brief overview of the CIL represenation used by the project.
+//! The project-internal tree IR is defined by [`cilly::CILNode`] and [`cilly::CILRoot`]. Additional
+//! CIL data structures, including call targets and field descriptors, live in [`cilly::ir`].
 //!
 //! ## Type represenation
 //!
@@ -75,8 +76,9 @@
 //! Almost everyting in this file is related to things specific to the rust compiler - reciving MIR from rustc, loading/saving intermediate data,
 //! linking the final executable.
 //! The compilation process really begins in [`crate::assembly::add_item`] - this is where an item - static, function, or inline assembly - gets turned into
-//! its .NET representation. The [`crate::assembly::add_fn`] uses [`cilly::asm::Assembly::add_typedef`] to add all types needed by a method to the
-//! assembly. `add_fn` gets the function name, signature, local varaiables and MIR. It uses `handle_statement` and `handle_terminator` turn MIR statements
+//! its .NET representation. [`crate::assembly::add_fn`] resolves every Rust type through the
+//! method's shared type cache while constructing the assembly. `add_fn` gets the function name,
+//! signature, local variables and MIR. It uses `handle_statement` and `handle_terminator` to turn MIR statements
 //! and block terminators into CIL ops.
 // TODO: Extend project desctiption.
 

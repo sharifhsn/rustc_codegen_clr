@@ -10,6 +10,35 @@ Companion to docs/ABSOLUTE_CORRECTNESS_PLAN.md (this is the I2/I3 coverage map f
 
 # SEAM AUDIT — `rustc_codegen_clr` vs `rustc_codegen_ssa`
 
+> **Current status (2026-07-13): all safe-stable gaps found by this audit are closed.**
+> This file preserves the original 2026-06-24 findings and proposed slices as an audit trail; the
+> “confirmed gaps”, “residual gaps”, and “suggested follow-up” sections below describe the tree at
+> audit time, not the current implementation. The implementation record and verification evidence
+> live in [ABSOLUTE_CORRECTNESS_PLAN.md](ABSOLUTE_CORRECTNESS_PLAN.md#phase-p2--differential-correctness-gates-delivers-i2),
+> P2-S4 through P2-S6. The broader reachable-wall census is [P3_TOTALITY.md](P3_TOTALITY.md).
+
+## Current closure summary
+
+| Original finding | Current state | Regression proof |
+|---|---|---|
+| `UnwindAction::Terminate` escaped instead of aborting | Fixed, including cleanup-block double panic | `cargo_tests/term_abort`, `cargo_tests/double_panic` |
+| Optional overflow asserts survived release lowering | Fixed; release semantics wrap when rustc marks the check optional | `cargo_tests/overflow_elision` |
+| Nonzero-offset indirect constants loaded allocation byte 0 | Fixed in scalar and by-reference allocation paths | `cargo_tests/indirect_offset` |
+| Signed atomic min/max and compiler fence ICEs | Fixed with sign-aware atomics and a conservative CLR memory barrier | `cargo_tests/atomic_cast_arms` |
+| Narrow pointer-expose casts ICEd | Fixed for every integer target through `usize` conversion | `cargo_tests/atomic_cast_arms` |
+| Non-`.init_array` `#[link_section]` | Deliberate loud wall: portable CIL has no native section-table equivalent | `docs/P3_TOTALITY.md` |
+
+The three non-aborting ordinary-code regressions were re-run locally against the .NET 8 direct-PE
+path on 2026-07-13: `overflow_elision` printed `44`, `indirect_offset` printed the expected
+`63636363` values, and `atomic_cast_arms` printed `2 true`. The abort regressions remain part of the
+recorded P2-S4/P2-S6 differential evidence because their success condition is process termination,
+not ordinary stdout equality.
+
+## Historical audit snapshot (2026-06-24)
+
+Everything below this heading is retained to show what was found, how it was ranked, and why the
+closure slices were chosen. It should not be used as a current backlog.
+
 ## 1. Executive summary
 
 This audit covers 16 codegen surfaces where `rustc_codegen_clr` reimplements the `rustc_codegen_ssa` lowering step. Postures split as **2 delegate** (`caller_location`, `vtable_dyn`), **9 fork** (`entry_fn`, `call_terminator`, `fn_abi`, `intrinsics`, `switchint`, `rvalue_cast`, `statics_const`, `unwind_cleanup`, plus the call-terminator block layer), and **5 mixed** (`assert_terminator`, `drop`, `discriminant`, `TLS`, `statics_const`/`assert` overlap). Forking is mostly principled: the backend substitutes a calling-convention-agnostic, by-value CIL convention for the entire `PassMode`/`FnAbi` machinery (a self-consistent closed world, not drift), and re-derives a `.NET` try/catch region model for unwinding that has no LLVM analogue. There are **10 CONFIRMED real gaps** reachable from safe stable Rust on `x86_64-unknown-dotnet`: **4 LOUD** (clean ICE — I3-acceptable) and **6 SILENT_WRONG** (observable miscompile — the dangerous class). The 6 silent-wrong gaps cluster into exactly two structural roots: (a) the `UnwindAction::Terminate` edge being dropped to `None` instead of aborting — **4 of the 6 silent-wrong gaps are the same bug surfaced on different terminators/reasons**, and (b) two independent value-correctness omissions (overflow-check elision, nonzero-offset `Indirect` const). **Highest-leverage structural recommendation: converge `handler_from_action`'s `Terminate(_)` arm (`src/basic_block.rs:103-104`) onto the already-correct `UnwindTerminate`-terminator `FailFast` path (`src/terminator/mod.rs:679`), and dispatch on the reason via the real `PanicCannotUnwind`/`PanicInCleanup` lang items — one fix closes 4 of the 6 silent-wrong gaps at once.**

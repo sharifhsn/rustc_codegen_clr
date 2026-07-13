@@ -338,6 +338,31 @@ fn check_generic_marker<'tcx>(
                 ctx,
             );
         }
+        // A definition-shape array such as `!0[]` must bind element-for-element to the concrete
+        // runtime array (`i32[]`, etc.). Rank mismatches are rejected by normal type checking; for
+        // equal-rank arrays recurse so the same exact-binding proof covers the nested marker.
+        Type::PlatformArray {
+            elem: sig_elem,
+            dims: sig_dims,
+        } => {
+            let Type::PlatformArray {
+                elem: rt_elem,
+                dims: rt_dims,
+            } = runtime_ty
+            else {
+                return;
+            };
+            if sig_dims == rt_dims {
+                check_generic_marker(
+                    ctx[sig_elem],
+                    ctx[rt_elem],
+                    class_generics,
+                    method_generics,
+                    role,
+                    ctx,
+                );
+            }
+        }
         _ => {}
     }
 }

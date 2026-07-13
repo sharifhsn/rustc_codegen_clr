@@ -1501,6 +1501,54 @@ impl MethodImpl {
         }
         // Swap new and locals
         std::mem::swap(locals, new_locals.get_mut().unwrap());
+
+        // First-use order above removes unused locals and collapses arbitrary source indices, but
+        // independent rustc/codegen runs may still visit semantically independent stores in a
+        // different order. Canonicalize the remaining slots by their serialized meaning so the
+        // `.locals` signature and all local operands are process-independent. Equal type/name keys
+        // retain first-use order; swapping indistinguishable slots cannot change the signature.
+        let mut canonical_order: Vec<_> = (0..locals.len()).collect();
+        canonical_order.sort_by_cached_key(|&idx| {
+            let (name, ty) = locals[idx];
+            (
+                asm[ty].mangle(asm),
+                name.map(|name| asm[name].to_string()).unwrap_or_default(),
+            )
+        });
+        if canonical_order.iter().copied().eq(0..locals.len()) {
+            return;
+        }
+
+        let mut remap = vec![0_u32; locals.len()];
+        let canonical_locals: Vec<_> = canonical_order
+            .into_iter()
+            .enumerate()
+            .map(|(new_idx, old_idx)| {
+                remap[old_idx] = u32::try_from(new_idx).expect("local index exceeded u32");
+                locals[old_idx]
+            })
+            .collect();
+        *locals = canonical_locals;
+
+        for block in blocks.iter_mut().chain(
+            cleanup_blocks
+                .as_deref_mut()
+                .into_iter()
+                .flat_map(|blocks| blocks.iter_mut()),
+        ) {
+            block.map_roots(
+                asm,
+                &mut |root, _| match root {
+                    CILRoot::StLoc(loc, tree) => CILRoot::StLoc(remap[loc as usize], tree),
+                    _ => root,
+                },
+                &mut |node, _| match node {
+                    CILNode::LdLoc(loc) => CILNode::LdLoc(remap[loc as usize]),
+                    CILNode::LdLocA(loc) => CILNode::LdLocA(remap[loc as usize]),
+                    _ => node,
+                },
+            );
+        }
     }
 }
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]

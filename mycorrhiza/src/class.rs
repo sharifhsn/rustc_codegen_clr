@@ -46,7 +46,7 @@ impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str> Class<ASSEMBL
     /// lifetime) has no such backstop and is exactly the kind of misuse the type system cannot catch.
     /// That's why this stays `unsafe`: the caller must prove "used transiently, not persisted
     /// independently of the owning `Class`'s `GCHandle`" — a call-shape property, not a checkable type
-    /// or runtime invariant. See [`StackOnly`] trait documentation for the general pattern.
+    /// or runtime invariant. See the [`crate::StackOnly`] trait documentation for the general pattern.
     /// # Safety
     /// Use the returned reference only within the current call (e.g. pass it straight to another .NET
     /// call as an argument); do not store it anywhere that could outlive `self`'s `GCHandle` or that

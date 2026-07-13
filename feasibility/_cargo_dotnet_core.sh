@@ -661,7 +661,11 @@ fi
 # LLVM gets for native. Targeted: non-`#[inline]` fns keep the default `threshold` (50), and
 # the flag is inert in debug (mir-opt-level 1 disables the MIR inliner). 500 ≈ 5x default;
 # fully collapses the common map/filter/sum chains and plateaus there.
-export RUSTFLAGS="-Z codegen-backend=$CD_BACKEND_DYLIB -C linker=$CD_LINKER -C link-args=--cargo-support -Z inline-mir-hint-threshold=500$CD_BACKEND_CFG"
+# DOTNET_VERSION affects codegen, final-link metadata, and runtimeconfig output, but Cargo does not
+# otherwise fingerprint an environment variable consumed by a custom linker. Keep it in the inert
+# cfg key so switching --dotnet can never reuse artifacts stamped for the previous runtime.
+CD_DOTNET_CFG=" --cfg cd_dotnet_$DOTNET_VERSION --check-cfg=cfg(cd_dotnet_$DOTNET_VERSION)"
+export RUSTFLAGS="-Z codegen-backend=$CD_BACKEND_DYLIB -C linker=$CD_LINKER -C link-args=--cargo-support -Z inline-mir-hint-threshold=500$CD_BACKEND_CFG$CD_DOTNET_CFG"
 set +e
 # PHASE G — CENTRAL OVERLAY REGISTRY auto-apply. A handful of load-bearing crates
 # (mio, socket2, tokio, getrandom) need a small, marked source overlay to build/run

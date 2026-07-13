@@ -823,6 +823,7 @@ fn main() {
                 path.to_str().unwrap(),
                 "java",
                 None,
+                false,
                 effective_abi_config.dotnet_runtime(),
                 linker_config.native_passthrough,
             );
@@ -913,8 +914,11 @@ fn main() {
         // `Combine(dllDirectory, GetFileName(codeViewData.Path))`, i.e. the RSDS payload's OWN
         // filename, not a fixed `<dll-stem>.pdb` convention this writer could just assume.
         //
-        // For a LIBRARY, `exe_out == path` (the final artifact IS what's on disk, no launcher
-        // renames it), so `exe_out`'s stem is correct.
+        // For a LIBRARY, cargo-dotnet promotes Cargo's host-shaped `libfoo.so` output to the
+        // managed public artifact `<assembly-name>.dll`. The PDB travels with that public DLL, so
+        // the RSDS name must use the managed assembly identity rather than `exe_out`'s temporary
+        // `lib*.so` stem. Otherwise a C# host can parse the copied PDB but CoreCLR looks for the
+        // nonexistent `libfoo.pdb` beside `foo.dll` and emits no Rust file:line frames.
         //
         // For a `cargo_support` EXECUTABLE, `path`/`exe_out` are BOTH the linker's OWN `-o`
         // argument — cargo's internal, hash-suffixed `deps/<crate>-<hash>` name (e.g.
@@ -934,13 +938,13 @@ fn main() {
         // that never sets the env var, e.g. `bin/rustflags.rs`'s manual usage — such a caller has
         // no cargo-driven copy step to begin with, so `path`'s own name IS the final one there).
         let pdb_stem = if is_lib {
-            None
+            Some(asm_name.clone())
         } else {
             std::env::var("CARGO_CRATE_NAME").ok()
         };
         let pdb_file_name = match pdb_stem {
             Some(stem) => format!("{stem}.pdb"),
-            None => (if is_lib { &exe_out } else { &path })
+            None => path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .map(|s| format!("{s}.pdb"))
@@ -957,8 +961,11 @@ fn main() {
             pdb_file_name: pdb_file_name.clone(),
             runtime: effective_abi_config.dotnet_runtime(),
         };
+        let source_link_json = std::env::var("RCL_SOURCE_LINK_JSON")
+            .ok()
+            .filter(|value| !value.is_empty());
         let (bytes, pdb_bytes) = final_assembly
-            .render_pe(&pe_options)
+            .render_pe_with_source_link(&pe_options, source_link_json.as_deref())
             .unwrap_or_else(|error| panic!("direct-PE post-render verification failed: {error}"));
         std::fs::write(&exe_out, bytes).unwrap();
         if !pdb_bytes.is_empty() {
@@ -977,6 +984,7 @@ fn main() {
                 path.to_str().unwrap(),
                 "dotnet",
                 Some(&pdb_file_name),
+                true,
                 effective_abi_config.dotnet_runtime(),
                 linker_config.native_passthrough,
             );
@@ -1030,6 +1038,7 @@ fn main() {
                 path.to_str().unwrap(),
                 "dotnet",
                 None,
+                *ILASM_FLAVOUR != IlasmFlavour::Clasic,
                 effective_abi_config.dotnet_runtime(),
                 linker_config.native_passthrough,
             );
@@ -1068,11 +1077,15 @@ fn main() {
 /// can differ from `fpath.file_stem() + ".pdb"`: cargo's hashed `deps/` build path is not the
 /// final artifact name). `None` falls back to the pre-existing `{fpath-stem}.pdb` convention
 /// (ilasm path, and the `DIRECT_PE` library case where `fpath`'s own name already IS final).
+/// `pdb_capable` is decided by the active exporter. Keeping that decision at the call site is
+/// important: consulting `ILASM_FLAVOUR` here executes `ilasm --help`, even for direct PE and Java
+/// builds that never use ILAsm.
 fn bootstrap_source(
     fpath: &Path,
     output_file_path: &str,
     jumpstart_cmd: &str,
     pdb_file_override: Option<&str>,
+    pdb_capable: bool,
     runtime: DotnetRuntime,
     native_passthrough: bool,
 ) -> String {
@@ -1091,14 +1104,11 @@ fn bootstrap_source(
             output_file_path = fpath.file_stem().unwrap().to_string_lossy()
         ),
     };
-    // Both the ilasm path (`IlasmFlavour::Modern`, `-debug`) and the direct-PE writer
-    // (`DIRECT_PE=1`, Phase 2's `pdb.rs`) place a PDB in `fpath`'s directory when they produced
-    // debug info — checking existence at `fpath`'s own directory (not assuming a PDB exists just
-    // because a given flavour/mode CAN produce one; ilasm's own PDB writer can fail and fall back
-    // silently for giant assemblies — see this comment's earlier form for that case) is
-    // flavour-agnostic UNLESS `IlasmFlavour::Clasic`, which never writes one under EITHER exporter.
-    let has_pdb =
-        *ILASM_FLAVOUR != IlasmFlavour::Clasic && fpath.with_file_name(&pdb_file).exists();
+    // Both modern ilasm and the direct-PE writer place a PDB in `fpath`'s directory when they
+    // produced debug info. Check actual existence because ilasm's PDB writer can fail and fall
+    // back silently for giant assemblies. `pdb_capable` is supplied by the exporter branch so this
+    // shared packaging code never probes ILAsm on direct-PE or Java paths.
+    let has_pdb = pdb_capable && fpath.with_file_name(&pdb_file).exists();
     format!(
         include_str!("dotnet_jumpstart.rs"),
         jumpstart_cmd = jumpstart_cmd,
@@ -1109,11 +1119,7 @@ fn bootstrap_source(
         exec_file = fpath.file_name().unwrap().to_string_lossy(),
         has_native_companion = native_passthrough,
         has_pdb = has_pdb,
-        pdb_file = if *ILASM_FLAVOUR == IlasmFlavour::Clasic {
-            String::new()
-        } else {
-            pdb_file
-        },
+        pdb_file = if pdb_capable { pdb_file } else { String::new() },
         native_companion_file = if native_passthrough {
             format!(
                 "rust_native_{output_file_path}.so",
@@ -1138,7 +1144,7 @@ mod linker_config_tests {
 
         let error = effective_abi_config(Some(artifact), process).unwrap_err();
         let diagnostic = error.to_string();
-        assert!(diagnostic.contains("dotnet_runtime: expected Net8, found Net9"));
+        assert!(diagnostic.contains("dotnet_runtime: expected Net10, found Net9"));
         assert!(diagnostic.contains("no_unwind: expected false, found true"));
     }
 

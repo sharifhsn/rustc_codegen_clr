@@ -13,6 +13,12 @@ use crate::cli::BuildArgs;
 use crate::mode::Mode;
 
 pub fn run(args: &BuildArgs, is_run: bool, mode: &Mode) -> Result<i32> {
+    if args.source_link_url.is_some() {
+        bail!(
+            "--source-link-url is supported by the installed/native pipeline; the Docker backend \
+             remains a checkout-oriented development path"
+        );
+    }
     let repo_root = match mode {
         Mode::Dev { repo_root } => repo_root.clone(),
         Mode::Installed { .. } => bail!(

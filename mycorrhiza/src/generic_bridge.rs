@@ -19,7 +19,7 @@
 
 /// In a method-signature (`Sig`) position, `r#gen!(N)` denotes the class's `!N` generic parameter:
 /// it expands to the def-shape marker `RustcCLRInteropTypeGeneric<N>`. Used only inside the
-/// `Sig`-type slots of a [`dotnet_generic_impl!`] method line; the matching runtime value is passed
+/// `Sig`-type slots of a [`crate::dotnet_generic_impl!`] method line; the matching runtime value is passed
 /// with its concrete Rust type.
 #[macro_export]
 macro_rules! r#gen {
@@ -29,13 +29,13 @@ macro_rules! r#gen {
 /// Declares a type alias for a managed *generic* .NET instantiation handle.
 ///
 /// ```ignore
-/// dotnet_generic!(RustList<T> = ["System.Private.CoreLib"] "System.Collections.Generic.List" < (T,) >);
+/// dotnet_generic!(RustList&lt;T&gt; = ["System.Private.CoreLib"] "System.Collections.Generic.List" &lt; (T,) &gt;);
 /// ```
 ///
 /// expands to
 ///
 /// ```ignore
-/// type RustList<T> =
+/// type RustList&lt;T&gt; =
 ///     RustcCLRInteropManagedGeneric<{ "System.Private.CoreLib" }, { "System.Collections.Generic.List" }, (T,)>;
 /// ```
 ///

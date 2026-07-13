@@ -3,8 +3,9 @@
 use std::path::Path;
 
 /// The RUSTFLAGS the backend needs:
-///   -Z codegen-backend=<dylib> -C linker=<linker> -C link-args=--cargo-support
-///   --cfg cd_backend_<hash> --check-cfg=cfg(cd_backend_<hash>)
+///   `-Z codegen-backend=<dylib> -C linker=<linker> -C link-args=--cargo-support`
+///   `--cfg cd_backend_<hash> --check-cfg=cfg(cd_backend_<hash>)`
+///   `--cfg cd_dotnet_<major> --check-cfg=cfg(cd_dotnet_<major>)`
 ///
 /// getrandom needs NO cfg here: the `dotnet_overlays/getrandom-{0.2,0.3,0.4}` overlays
 /// supply a self-contained `target_os="dotnet"` backend arm (the PAL CSPRNG). The old
@@ -20,8 +21,19 @@ use std::path::Path;
 /// the dylib's content hash in busts the fingerprint EXACTLY when the backend changes (and
 /// only then — an unchanged backend keeps the same key, so normal caching applies). The cfg
 /// is inert (nothing reads it) and `--check-cfg`-declared (no `unexpected_cfgs` warning).
+/// The runtime-version cfg is another inert cache key. `DOTNET_VERSION` affects backend codegen,
+/// linker metadata, and the runtimeconfig, but Cargo does not fingerprint arbitrary environment
+/// variables used by a custom linker. Without this key, `--dotnet 10` followed by `--dotnet 8`
+/// could reuse a net10 runtimeconfig even though the new receipt claimed net8.
+///
 /// Matches the shell logic in `_cargo_dotnet_core.sh`.
-pub fn assemble(backend_dylib: &Path, linker: &Path, source_remaps: &[(&Path, &str)]) -> String {
+pub fn assemble(
+    backend_dylib: &Path,
+    linker: &Path,
+    dotnet_version: &str,
+    source_remaps: &[(&Path, &str)],
+    source_link_url: Option<&str>,
+) -> String {
     // `-Z inline-mir-hint-threshold=500`: raise rustc's MIR-inliner budget for `#[inline]`
     // items (iterator combinators, closures, small wrappers — the zero-cost-abstraction
     // surface). rustc inlines these conservatively because the native pipeline lets LLVM
@@ -47,10 +59,72 @@ pub fn assemble(backend_dylib: &Path, linker: &Path, source_remaps: &[(&Path, &s
         })
         .collect::<String>();
     let base = format!("{base}{remaps}");
+    let base = format!(
+        "{base} --cfg cd_dotnet_{dotnet_version} --check-cfg=cfg(cd_dotnet_{dotnet_version})"
+    );
+    let base = match source_link_url {
+        Some(url) => {
+            let key = fnv1a(url.as_bytes());
+            format!(
+                "{base} --cfg cd_sourcelink_{key:016x} --check-cfg=cfg(cd_sourcelink_{key:016x})"
+            )
+        }
+        None => base,
+    };
     match backend_content_key(backend_dylib) {
         Some(key) => format!("{base} --cfg cd_backend_{key} --check-cfg=cfg(cd_backend_{key})"),
         None => base,
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::assemble;
+    use std::path::Path;
+
+    #[test]
+    fn runtime_version_changes_cargo_fingerprint() {
+        let backend = Path::new("/missing/backend");
+        let linker = Path::new("/missing/linker");
+        let net8 = assemble(backend, linker, "8", &[], None);
+        let net10 = assemble(backend, linker, "10", &[], None);
+
+        assert_ne!(net8, net10);
+        assert!(net8.contains("--cfg cd_dotnet_8 --check-cfg=cfg(cd_dotnet_8)"));
+        assert!(net10.contains("--cfg cd_dotnet_10 --check-cfg=cfg(cd_dotnet_10)"));
+    }
+
+    #[test]
+    fn source_link_changes_cargo_fingerprint_without_embedding_local_paths() {
+        let backend = Path::new("/missing/backend");
+        let linker = Path::new("/missing/linker");
+        let first = assemble(
+            backend,
+            linker,
+            "10",
+            &[],
+            Some("https://example.invalid/one/*"),
+        );
+        let second = assemble(
+            backend,
+            linker,
+            "10",
+            &[],
+            Some("https://example.invalid/two/*"),
+        );
+        assert_ne!(first, second);
+        assert!(first.contains("--cfg cd_sourcelink_"));
+        assert!(!first.contains("example.invalid"));
+    }
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// 16-hex-char FNV-1a digest of the backend dylib's bytes; `None` if it can't be read

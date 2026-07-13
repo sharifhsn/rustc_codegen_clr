@@ -1,5 +1,8 @@
 # Release execution plan
 
+> Long-term package and enterprise-integration plan. It is not the checklist for the experimental
+> 0.0.1 GitHub SDK preview; see [`RELEASE_BLOCKERS.md`](RELEASE_BLOCKERS.md).
+
 This document turns every open item in [`RELEASE_BLOCKERS.md`](RELEASE_BLOCKERS.md) into an
 ordered, testable implementation program. It plans the work; it does not redefine a focused proof
 as release support.
@@ -20,6 +23,13 @@ Focused-proven in the active working tree:
   boundary mutation breadth remains).
 - The release host matrix is explicitly Linux/macOS; cargo-dotnet and MSBuild reject Windows hosts
   until Windows build, test, packaging, and MSBuild acceptance exists.
+- First-time-user entry documents now route through install/setup/doctor/scaffold/run instead of the
+  obsolete manual backend flags. Runtime choice is cache-safe, the selected CoreCLR runtime is an
+  explicit doctor gate, fallback `ilasm` is non-blocking under direct PE, and process exit status is
+  covered by a live `pal_exit_code` differential fixture.
+- Setup's required postconditions are fail-closed, and a CI-wired external onboarding gate proves
+  app/lib/plugin scaffolding, selected-runtime propagation, Cargo manifest validity, Rust execution,
+  C# consumption, and a Rust-defined managed class from fresh temporary directories.
 
 ## Definition of complete
 
@@ -255,6 +265,9 @@ Exit: the real repository and deployment shape are pilot-proven; production rema
 
 ### R4.1 Independent clean reproducibility — M/L
 
+- Status: implemented. Optimizer method scheduling, constant-hoist candidates, SROA field
+  decomposition, and final local slots use semantic ordering; the acceptance gate now requires
+  byte-identical managed DLLs, entry hashes, provenance, and final NuGet package bytes.
 - Build the same pinned source twice from independent clean worktrees/source archives, empty Cargo,
   NuGet, target, and cargo-dotnet homes.
 - Compare `.nupkg`, checksum, normalized receipt, generated source, XML docs, PDB policy, and SBOM.
@@ -296,6 +309,12 @@ Exit: packages are reproducible, inspectable, API-governed, and honest about sup
 
 ### R5.1 Signing and trusted publishing — M/L
 
+- Status: local signed-pack and push enforcement exists, signing passwords/API keys are kept out of
+  child argv and inherited environment via private, short-lived response files, and the SHA-pinned
+  tag-only evidence workflow verifies the configured GPG signer, reuses the full product gate,
+  reproduces the package probe, and emits a non-publishing manifest. The protected feed-specific
+  OIDC/trusted-publisher job is still open; this item is not complete until that remote control
+  exists and is exercised.
 - Add a protected release workflow using pinned action SHAs and an OIDC/trusted-publishing path.
 - Sign packages and provenance; verify signatures after download. Secrets never enter logs,
   receipts, caches, or artifacts.
@@ -304,6 +323,9 @@ Exit: packages are reproducible, inspectable, API-governed, and honest about sup
 
 ### R5.2 Immutable version/tag manifest — S/M
 
+- Status: enforcement implemented. Signed packing requires an exact annotated
+  `rust-dotnet-v<semver>` tag at `HEAD`, and setup records the tag with the compiler revision. The
+  first protected remote tag remains a deliberate release operation.
 - Release only from signed/annotated immutable `v*` tags and a clean checkout.
 - Emit a manifest mapping tag to compiler/backend/toolchain, NuGet, receipt, SBOM, and signature
   hashes. Never overwrite a package version.
@@ -311,6 +333,9 @@ Exit: packages are reproducible, inspectable, API-governed, and honest about sup
 
 ### R5.3 Promotion and rollback runbook — S
 
+- Status: source/package rollback is documented in
+  [`RELEASE_AND_ROLLBACK.md`](RELEASE_AND_ROLLBACK.md); feed-specific staging, yanking, and
+  compromised-key operations remain tied to the selected publisher.
 - Publish to staging, run clean consumers plus the Primary Offerings Alpine smoke, then promote.
 - Roll back by selecting the previous immutable package and disabling the shadow; document yanking
   and compromised-key procedures.

@@ -132,26 +132,21 @@ ensure_dotnet_on_path(){
 }
 
 # resolve_ilasm: EXPORT ILASM_PATH to a CoreCLR (NOT Mono) ilasm. Order: explicit
-# ILASM_PATH; $HOME/.dotnet/ilasm-tool/ilasm; a non-Mono `ilasm` on PATH. Needs
+# ILASM_PATH; the .NET 10 tool installed by setup; a non-Mono `ilasm` on PATH. Needs
 # detect_host_os run first (uses exe_ext). Dies with an actionable message.
 resolve_ilasm(){
-  # Each runtime needs its matching CoreCLR ilasm.
-  local _il_tool="ilasm-tool"
-  case "${CD_DOTNET:-10}" in
-    9) _il_tool="ilasm9-tool" ;;
-    10) _il_tool="ilasm10-tool" ;;
-  esac
+  local _il_tool="ilasm10-tool"
   if [ -n "${ILASM_PATH:-}" ]; then
     [ -x "$ILASM_PATH" ] || die "ILASM_PATH='$ILASM_PATH' is not an executable"
   elif [ -x "$HOME/.dotnet/$_il_tool/ilasm$exe_ext" ]; then
     export ILASM_PATH="$HOME/.dotnet/$_il_tool/ilasm$exe_ext"
   elif command -v ilasm >/dev/null 2>&1; then
     if ilasm --version 2>&1 | grep -qi mono; then
-      die "the \`ilasm\` on PATH is Mono's, which emits PE32 images the native CoreCLR loader rejects. Run \`cargo dotnet setup\` (installs the CoreCLR ILAsm to \$HOME/.dotnet/ilasm-tool/ilasm), or set ILASM_PATH to a CoreCLR ilasm."
+      die "the \`ilasm\` on PATH is Mono's. Run \`cargo dotnet setup\` to install the .NET 10 CoreCLR ILAsm, or use the default direct-PE exporter."
     fi
     : # a non-Mono `ilasm` on PATH — cilly's bare `ilasm` default is fine
   else
-    die "ilasm not found (no ILASM_PATH, none at \$HOME/.dotnet/ilasm-tool/ilasm, none on PATH). Run \`cargo dotnet setup\` to install the CoreCLR ILAsm NuGet tool."
+    die "ilasm not found. Run \`cargo dotnet setup\` to install the .NET 10 CoreCLR ILAsm, or use the default direct-PE exporter."
   fi
 }
 
@@ -176,6 +171,8 @@ read_home_toolchain(){
 cd_setup(){
   local FROM_REPO="" HOME_DIR="$CARGO_DOTNET_HOME" FORCE=0
   local SKIP_TOOLCHAIN=0 SKIP_DOTNET=0 SKIP_ILASM=0
+  local SKIP_FRONTEND_INSTALL="${CARGO_DOTNET_SKIP_FRONTEND_INSTALL:-0}"
+  local SKIP_LEGACY_PAL_WARM="${CARGO_DOTNET_SKIP_LEGACY_PAL_WARM:-0}"
   local TOOLCHAIN="$CD_TOOLCHAIN_DEFAULT"
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -252,67 +249,27 @@ cd_setup(){
 
   if [ "$SKIP_ILASM" = 1 ]; then
     echo "==> [3a] ilasm: skipped (--skip-ilasm)"
+  elif [ -x "$HOME/.dotnet/ilasm10-tool/ilasm$exe_ext" ]; then
+    echo "==> [3a] .NET 10 CoreCLR ILAsm present (\$HOME/.dotnet/ilasm10-tool/ilasm$exe_ext)"
+    prov_ilasm="present"
   else
-    if [ -x "$HOME/.dotnet/ilasm-tool/ilasm$exe_ext" ]; then
-      echo "==> [3a] CoreCLR ilasm present (\$HOME/.dotnet/ilasm-tool/ilasm$exe_ext)"
-      prov_ilasm="present"
-    else
-      echo "==> [3a] installing CoreCLR ILAsm ($host_rid) to \$HOME/.dotnet/ilasm-tool/ilasm$exe_ext"
-      local nupkg="/tmp/cd_ilasm.$$.nupkg" exdir="/tmp/cd_ilasm.$$.d"
-      rm -rf "$exdir"; mkdir -p "$exdir"
-      curl -sSL -o "$nupkg" "https://www.nuget.org/api/v2/package/runtime.$host_rid.microsoft.netcore.ilasm/8.0.0" \
-        || die "setup: failed to download the CoreCLR ILAsm NuGet package for $host_rid"
-      ( cd "$exdir" && unzip -qo "$nupkg" ) || die "setup: failed to unzip the ILAsm package (need unzip)"
-      local src_ilasm="$exdir/runtimes/$host_rid/native/ilasm$exe_ext"
-      [ -f "$src_ilasm" ] || die "setup: ILAsm binary not found in package at runtimes/$host_rid/native/ilasm$exe_ext"
-      mkdir -p "$HOME/.dotnet/ilasm-tool"
-      cp "$src_ilasm" "$HOME/.dotnet/ilasm-tool/ilasm$exe_ext"
-      chmod +x "$HOME/.dotnet/ilasm-tool/ilasm$exe_ext"
-      [ "$(uname -s)" = Darwin ] && xattr -c "$HOME/.dotnet/ilasm-tool/ilasm$exe_ext" 2>/dev/null || true
-      rm -f "$nupkg"; rm -rf "$exdir"
-      # Assert it is NOT Mono.
-      if "$HOME/.dotnet/ilasm-tool/ilasm$exe_ext" --version 2>&1 | grep -qi mono; then
-        die "setup: the installed ilasm reports Mono — expected the CoreCLR ILAsm. Aborting."
-      fi
-      prov_ilasm="installed"
-    fi
-    # net9 CoreCLR ILAsm (for `cargo dotnet --dotnet 9`) → ilasm9-tool; mirrors the net8 fetch.
-    # Each runtime needs ITS matching ilasm (a net8 PE is rejected by the net9 loader). The net9
-    # ilasm's --version exits non-zero, so no Mono-assert here (it is the CoreCLR NuGet binary).
-    if [ -x "$HOME/.dotnet/ilasm9-tool/ilasm$exe_ext" ]; then
-      echo "==> [3a] net9 CoreCLR ilasm present (\$HOME/.dotnet/ilasm9-tool/ilasm$exe_ext)"
-    else
-      echo "==> [3a] installing net9 CoreCLR ILAsm ($host_rid) to \$HOME/.dotnet/ilasm9-tool/ilasm$exe_ext"
-      local nupkg9="/tmp/cd_ilasm9.$$.nupkg" exdir9="/tmp/cd_ilasm9.$$.d"
-      rm -rf "$exdir9"; mkdir -p "$exdir9"
-      curl -sSL -o "$nupkg9" "https://www.nuget.org/api/v2/package/runtime.$host_rid.microsoft.netcore.ilasm/9.0.0" \
-        || die "setup: failed to download the net9 CoreCLR ILAsm NuGet package for $host_rid"
-      ( cd "$exdir9" && unzip -qo "$nupkg9" ) || die "setup: failed to unzip the net9 ILAsm package (need unzip)"
-      local src_ilasm9="$exdir9/runtimes/$host_rid/native/ilasm$exe_ext"
-      [ -f "$src_ilasm9" ] || die "setup: net9 ILAsm binary not found at runtimes/$host_rid/native/ilasm$exe_ext"
-      mkdir -p "$HOME/.dotnet/ilasm9-tool"
-      cp "$src_ilasm9" "$HOME/.dotnet/ilasm9-tool/ilasm$exe_ext"
-      chmod +x "$HOME/.dotnet/ilasm9-tool/ilasm$exe_ext"
-      [ "$(uname -s)" = Darwin ] && xattr -c "$HOME/.dotnet/ilasm9-tool/ilasm$exe_ext" 2>/dev/null || true
-      rm -f "$nupkg9"; rm -rf "$exdir9"
-    fi
-    if [ -x "$HOME/.dotnet/ilasm10-tool/ilasm$exe_ext" ]; then
-      echo "==> [3a] net10 CoreCLR ilasm present (\$HOME/.dotnet/ilasm10-tool/ilasm$exe_ext)"
-    else
-      echo "==> [3a] installing net10 CoreCLR ILAsm ($host_rid) to \$HOME/.dotnet/ilasm10-tool/ilasm$exe_ext"
-      local nupkg10="/tmp/cd_ilasm10.$$.nupkg" exdir10="/tmp/cd_ilasm10.$$.d"
-      rm -rf "$exdir10"; mkdir -p "$exdir10"
-      curl -sSL -o "$nupkg10" "https://www.nuget.org/api/v2/package/runtime.$host_rid.microsoft.netcore.ilasm/10.0.0" \
-        || die "setup: failed to download the net10 CoreCLR ILAsm NuGet package for $host_rid"
-      ( cd "$exdir10" && unzip -qo "$nupkg10" ) || die "setup: failed to unzip the net10 ILAsm package (need unzip)"
-      local src_ilasm10="$exdir10/runtimes/$host_rid/native/ilasm$exe_ext"
-      [ -f "$src_ilasm10" ] || die "setup: net10 ILAsm binary not found at runtimes/$host_rid/native/ilasm$exe_ext"
-      mkdir -p "$HOME/.dotnet/ilasm10-tool"
-      cp "$src_ilasm10" "$HOME/.dotnet/ilasm10-tool/ilasm$exe_ext"
-      chmod +x "$HOME/.dotnet/ilasm10-tool/ilasm$exe_ext"
-      [ "$(uname -s)" = Darwin ] && xattr -c "$HOME/.dotnet/ilasm10-tool/ilasm$exe_ext" 2>/dev/null || true
-      rm -f "$nupkg10"; rm -rf "$exdir10"
-    fi
+    echo "==> [3a] installing .NET 10 CoreCLR ILAsm ($host_rid)"
+    local nupkg10="/tmp/cd_ilasm10.$$.nupkg" exdir10="/tmp/cd_ilasm10.$$.d"
+    rm -rf "$exdir10"; mkdir -p "$exdir10"
+    curl -sSL -o "$nupkg10" "https://www.nuget.org/api/v2/package/runtime.$host_rid.microsoft.netcore.ilasm/10.0.0" \
+      || die "setup: failed to download .NET 10 CoreCLR ILAsm for $host_rid"
+    ( cd "$exdir10" && unzip -qo "$nupkg10" ) \
+      || die "setup: failed to unzip .NET 10 CoreCLR ILAsm (need unzip)"
+    local src_ilasm10="$exdir10/runtimes/$host_rid/native/ilasm$exe_ext"
+    [ -f "$src_ilasm10" ] \
+      || die "setup: ILAsm binary not found at runtimes/$host_rid/native/ilasm$exe_ext"
+    mkdir -p "$HOME/.dotnet/ilasm10-tool"
+    cp "$src_ilasm10" "$HOME/.dotnet/ilasm10-tool/ilasm$exe_ext"
+    chmod +x "$HOME/.dotnet/ilasm10-tool/ilasm$exe_ext"
+    [ "$(uname -s)" = Darwin ] \
+      && xattr -c "$HOME/.dotnet/ilasm10-tool/ilasm$exe_ext" 2>/dev/null || true
+    rm -f "$nupkg10"; rm -rf "$exdir10"
+    prov_ilasm="installed"
   fi
 
   # ---- STEP 3: build backend + populate CARGO_DOTNET_HOME ---------------------
@@ -321,14 +278,16 @@ cd_setup(){
   ( cd "$FROM_REPO/cilly" && cargo "+$TOOLCHAIN" build --release ) || die "setup: cilly build failed"
   ( cd "$FROM_REPO" && cargo "+$TOOLCHAIN" build --release -p rustc_codegen_clr ) || die "setup: codegen dylib build failed"
   local dylib="$FROM_REPO/target/release/librustc_codegen_clr.$dylib_ext"
-  [ "$host_os" = windows ] && dylib="$FROM_REPO/target/release/rustc_codegen_clr.dll"
+  [ "$host_rid" = win-x64 ] && dylib="$FROM_REPO/target/release/rustc_codegen_clr.dll"
   local linker="$FROM_REPO/target/release/linker$exe_ext"
   [ -f "$dylib" ]  || die "setup: backend dylib not produced: $dylib"
   [ -f "$linker" ] || die "setup: linker not produced: $linker"
 
   echo "==> [4/6] populating $HOME_DIR"
   mkdir -p "$HOME_DIR/bin" "$HOME_DIR/target"
-  cp -f "$dylib"  "$HOME_DIR/bin/librustc_codegen_clr.$dylib_ext"
+  local installed_dylib="librustc_codegen_clr.$dylib_ext"
+  [ "$host_rid" = win-x64 ] && installed_dylib="rustc_codegen_clr.dll"
+  cp -f "$dylib"  "$HOME_DIR/bin/$installed_dylib"
   cp -f "$linker" "$HOME_DIR/bin/linker$exe_ext"
   cp -f "$FROM_REPO/x86_64-unknown-dotnet.json" "$HOME_DIR/target/x86_64-unknown-dotnet.json"
   cp -f "$FROM_REPO/feasibility/_cargo_dotnet_core.sh" "$HOME_DIR/core.sh"
@@ -355,10 +314,13 @@ cd_setup(){
     cp -f "$FROM_REPO/msbuild/RustDotnet.Containers.cs" "$HOME_DIR/msbuild/RustDotnet.Containers.cs"
   fi
   # VERSION manifest.
+  local release_tag
+  release_tag="$(git -C "$FROM_REPO" describe --tags --exact-match --match 'rust-dotnet-v*' 2>/dev/null || echo untagged)"
   {
     echo "# CARGO_DOTNET_HOME manifest — generated by \`cargo dotnet setup\`."
     echo "schema = 1"
     echo "git_rev = $(git -C "$FROM_REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "release_tag = $release_tag"
     echo "built = $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "host = $(uname -sm)"
     echo "host_rid = $host_rid"
@@ -377,7 +339,9 @@ cd_setup(){
   local cargobin="${CARGO_HOME:-$HOME/.cargo}/bin"
   mkdir -p "$cargobin"
   local rust_fe="$FROM_REPO/tools/cargo-dotnet"
-  if [ -f "$rust_fe/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+  if [ "$SKIP_FRONTEND_INSTALL" = 1 ]; then
+    echo "==> [5/6] front-end install delegated to the native setup caller"
+  elif [ -f "$rust_fe/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
     echo "==> [5/6] installing the Rust cargo-dotnet binary (cargo install --path tools/cargo-dotnet)"
     if cargo install --path "$rust_fe" --force; then
       echo "==> [5/6] installed cargo-dotnet (Rust) -> $cargobin/cargo-dotnet"
@@ -397,23 +361,27 @@ cd_setup(){
   # ONCE against a scratch dir with CD_INJECT_ONLY=1, sourced from the INSTALLED
   # home (CD_REPO=$HOME_DIR), to fail-fast (rust-src writable + every arm applies)
   # and to prove deliverable #4 (injection from the install home, not the repo).
-  echo "==> [6/6] warming the rust-src PAL injection from $HOME_DIR (CD_INJECT_ONLY)"
-  resolve_ilasm 2>/dev/null || true   # not needed for inject-only, but harmless
-  local scratch="/tmp/cd_inject_warm.$$"
-  rm -rf "$scratch"; mkdir -p "$scratch"
-  printf '[package]\nname = "cd_inject_warm"\nversion = "0.0.0"\nedition = "2024"\n[workspace]\n' > "$scratch/Cargo.toml"
-  mkdir -p "$scratch/src"; printf 'fn main(){}\n' > "$scratch/src/main.rs"
-  (
-    cd "$scratch"
-    RUSTUP_TOOLCHAIN="$TOOLCHAIN" \
-    CD_INJECT_ONLY=1 \
-    CD_REPO="$HOME_DIR" \
-    CD_REGISTRY_SRC="${CARGO_HOME:-$HOME/.cargo}/registry/src" \
-    CD_LASTBUILD_LOG="$HOME_DIR/_lastbuild.log" \
-    bash -o pipefail "$HOME_DIR/core.sh"
-  ) || { rm -rf "$scratch"; die "setup: PAL injection warm-up FAILED — rust-src may not be writable (rustup component dirs normally are). See $HOME_DIR/_lastbuild.log"; }
-  rm -rf "$scratch"
-  echo "==> [6/6] PAL injection OK (toolchain $TOOLCHAIN rust-src patched, idempotent)"
+  if [ "$SKIP_LEGACY_PAL_WARM" = 1 ]; then
+    echo "==> [6/6] PAL warm delegated to the native private-sysroot setup caller"
+  else
+    echo "==> [6/6] warming the rust-src PAL injection from $HOME_DIR (CD_INJECT_ONLY)"
+    resolve_ilasm 2>/dev/null || true   # not needed for inject-only, but harmless
+    local scratch="/tmp/cd_inject_warm.$$"
+    rm -rf "$scratch"; mkdir -p "$scratch"
+    printf '[package]\nname = "cd_inject_warm"\nversion = "0.0.0"\nedition = "2024"\n[workspace]\n' > "$scratch/Cargo.toml"
+    mkdir -p "$scratch/src"; printf 'fn main(){}\n' > "$scratch/src/main.rs"
+    (
+      cd "$scratch"
+      RUSTUP_TOOLCHAIN="$TOOLCHAIN" \
+      CD_INJECT_ONLY=1 \
+      CD_REPO="$HOME_DIR" \
+      CD_REGISTRY_SRC="${CARGO_HOME:-$HOME/.cargo}/registry/src" \
+      CD_LASTBUILD_LOG="$HOME_DIR/_lastbuild.log" \
+      bash -o pipefail "$HOME_DIR/core.sh"
+    ) || { rm -rf "$scratch"; die "setup: PAL injection warm-up FAILED — rust-src may not be writable (rustup component dirs normally are). See $HOME_DIR/_lastbuild.log"; }
+    rm -rf "$scratch"
+    echo "==> [6/6] PAL injection OK (toolchain $TOOLCHAIN rust-src patched, idempotent)"
+  fi
 
   # ---- STEP 6: ready summary -------------------------------------------------
   echo ""

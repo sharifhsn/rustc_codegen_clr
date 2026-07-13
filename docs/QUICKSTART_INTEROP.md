@@ -12,12 +12,13 @@ there is no P/Invoke, no marshalling attributes, and no `unsafe` unless you ask 
 ## 0. One-time setup
 
 ```bash
-cargo dotnet setup      # installs the `cargo dotnet` subcommand + the msbuild integration to ~/.cargo-dotnet
+curl -fsSL https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.1/install.sh | sh
+cargo dotnet doctor
 ```
 
-You need the .NET runtime (`dotnet`) and, for the .NET target, the toolchain the repo pins
-(`rust-toolchain.toml`). Build/run any crate with `cargo dotnet build` / `cargo dotnet run` instead of
-plain `cargo`.
+On Windows, use the PowerShell installer from the main quickstart. You need the .NET 10 SDK and
+rustup; the SDK records the exact toolchain without changing your global rustup default. Build or
+run a crate with `cargo dotnet build` / `cargo dotnet run` instead of plain `cargo`.
 
 ---
 
@@ -181,10 +182,48 @@ The macro leaves your function untouched (still callable from Rust) and emits a 
 the numeric/`bool` primitives pass through unchanged. **No C#-side glue is needed at all** — the shim
 already presents a clean `string`/`int`/`double`/`bool` signature on `MainModule`.
 
-Supported today: the integer/float primitives, `bool`, `&str`, `String` (params and returns), and a
-`-> ()` return. Anything else is a **clear compile error** (marshalling is never faked); those types
-are the follow-up backlog. The consuming `cdylib` depends on `mycorrhiza` + `dotnet_macros`. Runnable:
-`cargo_tests/cd_export`.
+Supported today includes the integer/float primitives, `bool`, `&str`, `String`, primitive
+`Option<T>`/`Vec<T>`, concrete delegates, and enums registered as shown below. Unsupported shapes
+produce a **clear compile error** (marshalling is never faked). The consuming `cdylib` depends on
+`mycorrhiza` + `dotnet_macros`. Runnable: `cargo_tests/cd_export` and
+`cargo_tests/cd_export_ergonomics`.
+
+### 2d. Export a real CLR enum from Rust
+
+`#[dotnet_enum]` keeps the Rust API idiomatic while emitting genuine CLR enum metadata: C# sees
+`Type.IsEnum == true`, the requested underlying integer type, literal named fields, and can use
+normal casts, reflection, and `switch` expressions.
+
+```rust
+use dotnet_macros::{dotnet_enum, dotnet_export};
+
+#[dotnet_enum(name = "Example.Status")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum Status {
+    Pending = 0,
+    Ready = 4,
+    Done, // 5
+}
+
+#[dotnet_export(enums(Status))]
+pub fn roundtrip_status(status: Status) -> Status { status }
+```
+
+```csharp
+Status status = MainModule.roundtrip_status(Status.Ready);
+string label = status switch {
+    Status.Pending => "waiting",
+    Status.Ready => "ready",
+    Status.Done => "done",
+    _ => "unknown",
+};
+```
+
+The enum must be fieldless and use `#[repr(i8/u8/i16/u16/i32/u32/i64/u64)]`. Discriminants may be
+integer literals or implicit increments. List each enum crossing an exported function in that
+function's `enums(...)` argument; unknown inbound numeric values are rejected before Rust could
+construct an invalid enum discriminant. Runnable proof: `cargo_tests/cd_export_ergonomics`.
 
 ---
 
@@ -197,6 +236,7 @@ are the follow-up backlog. The consuming `cdylib` depends on `mycorrhiza` + `dot
 | `&str` / `String` (as `*const u8`, `usize`) | `byte*` + `nuint` | UTF-8; nothing crosses ownership (the hand-written §2a form) |
 | `&str` / `String` in a `#[dotnet_export] fn` | a managed `string` | §2c — no `(ptr, len)`, no glue |
 | `#[dotnet_class] struct` | a managed class | §1c |
+| `#[dotnet_enum] enum` | a genuine managed enum | §2d — reflection, literals, typed exports, `switch` |
 | `mycorrhiza::collections::*` | the real BCL collection | §1a |
 | a C# `T` in `RustVec<T>`/`RustBoxVec<T>` | a Rust-owned list | §2b |
 

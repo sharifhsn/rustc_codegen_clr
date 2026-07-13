@@ -3,7 +3,7 @@
 //! On Unix (this project's target) native↔managed exception crossing is unsupported by design, so a
 //! Rust panic is mapped to a **managed** exception (`RustException`) caught entirely within managed
 //! frames — never across a P/Invoke boundary. The *catch* side lives in
-//! [`super::insert_catch_unwind`] / [`super::insert_exception`]: it wraps the protected call in a CIL
+//! `super::insert_catch_unwind` / [`super::insert_exception`]: it wraps the protected call in a CIL
 //! `try`/`catch`, filters on `IsInst RustException`, and reads the exception's `usize data_pointer`
 //! field back out to hand to the catch closure.
 //!
