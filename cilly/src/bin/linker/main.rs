@@ -367,17 +367,36 @@ fn file_stem(file: &str) -> String {
 }
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn get_out_path(args: &[String]) -> &str {
-    &args[1 + args
-        .iter()
-        .position(|arg| *arg == "-o")
-        .unwrap_or_else(|| panic!("No output file! {args:?}"))]
+    find_out_path(args).unwrap_or_else(|| panic!("No output file! {args:?}"))
 }
 #[cfg(target_os = "windows")]
-fn get_out_path<'a>(args: &'a [String]) -> &'a str {
+fn get_out_path(args: &[String]) -> &str {
+    // The custom target uses the GNU linker protocol even when the linker executable itself is a
+    // Windows binary, so rustc passes `-o PATH`. Accept MSVC `/OUT:PATH` as well for direct use.
+    find_out_path(args).unwrap_or_else(|| panic!("No output file! {args:?}"))
+}
+
+fn find_out_path(args: &[String]) -> Option<&str> {
     args.iter()
-        .filter_map(|arg| arg.strip_prefix("/OUT:"))
-        .next()
-        .expect(&format!("No output file! {args:?}"))
+        .find_map(|arg| arg.strip_prefix("/OUT:"))
+        .or_else(|| {
+            args.windows(2)
+                .find(|pair| pair[0] == "-o")
+                .map(|pair| pair[1].as_str())
+        })
+}
+
+#[cfg(test)]
+mod output_path_tests {
+    use super::find_out_path;
+
+    #[test]
+    fn accepts_gnu_and_msvc_output_spellings() {
+        let gnu = vec!["input.bc".into(), "-o".into(), r"D:\build\app".into()];
+        let msvc = vec!["input.bc".into(), r"/OUT:D:\build\app.exe".into()];
+        assert_eq!(find_out_path(&gnu), Some(r"D:\build\app"));
+        assert_eq!(find_out_path(&msvc), Some(r"D:\build\app.exe"));
+    }
 }
 fn link_dir(path: &Path, ar_to_link: &mut Vec<String>) {
     let dir = std::fs::read_dir(path).unwrap();

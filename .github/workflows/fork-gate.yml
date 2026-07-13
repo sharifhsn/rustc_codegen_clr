@@ -137,9 +137,10 @@ jobs:
       - name: Publish and run .NET 10 NativeAOT interop host
         env:
           CARGO_DOTNET_BACKEND: native
+          CARGO_DOTNET_HOME: ${{ github.workspace }}/tools/cargo-dotnet/target/release
           DOTNET_VERSION: "10"
         run: |
-          tools/cargo-dotnet/target/release/cargo-dotnet dotnet publish cargo_tests/cd_interop/csharp --rid linux-x64 -- "-p:CargoDotnet=$GITHUB_WORKSPACE/tools/cargo-dotnet/target/release/cargo-dotnet"
+          tools/cargo-dotnet/target/release/cargo-dotnet dotnet publish cargo_tests/cd_interop/csharp --dotnet 10 --rid linux-x64
           cargo_tests/cd_interop/csharp/bin/Release/net10.0/linux-x64/publish/cd_interop_cs | tee "$RUNNER_TEMP/nativeaot-net10.log"
           grep -Fxq PASS "$RUNNER_TEMP/nativeaot-net10.log"
       - name: Run MSBuild integration acceptance
