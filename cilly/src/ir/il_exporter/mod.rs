@@ -1949,7 +1949,10 @@ fn assemble_file(exe_out: &Path, il_path: &Path, is_lib: bool) {
     let failed = |stdout: &str, stderr: &str| {
         stderr.contains("\nError\n") || stderr.contains("FAILURE") || stdout.contains("FAILURE")
     };
-    let (mut cmd, mut stdout, mut stderr) = run(true);
+    // Referenceable class libraries do not ship ilasm's PDB in our artifact contract. Avoiding
+    // that writer also removes process-specific debug metadata which survives /DET on CoreCLR 10.
+    // Executables retain sequence-point PDBs and the large-PDB retry below.
+    let (mut cmd, mut stdout, mut stderr) = run(!is_lib);
     // ilasm can assemble the whole module and write the PE, then fail *only* when writing the PDB
     // (its debug-info writer chokes on very large assemblies — the rust-lang/rust `coretests`
     // harness is ~5M IL lines and hits `Failed to write PDB file, error code=0x80070057`). The PE
@@ -1993,6 +1996,10 @@ fn assemble_file(exe_out: &Path, il_path: &Path, is_lib: bool) {
         stdout,
         String::from_utf8_lossy(&out.stderr)
     );
+    // Class-library packages do not carry ilasm PDBs; keep their /DET PE from the first pass.
+    if is_lib {
+        return;
+    }
     let asm_type = if is_lib { "-dll" } else { "-exe" };
     let mut cmd = std::process::Command::new(ILASM_PATH.clone());
     cmd.arg(il_path)
