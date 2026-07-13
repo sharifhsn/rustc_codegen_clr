@@ -86,6 +86,10 @@ CoreCLR tools, examples, and diagnostics consistent.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — compiler pipeline and design
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — contributor setup and test selection
 
+Questions and project ideas are welcome in [GitHub Discussions](https://github.com/sharifhsn/rustc_codegen_clr/discussions).
+Please report compiler bugs, installation failures, and miscompilations through
+[GitHub Issues](https://github.com/sharifhsn/rustc_codegen_clr/issues).
+
 ## Build from source
 
 ```bash

@@ -19,7 +19,7 @@ if [[ ! -x "$driver" ]]; then
 fi
 
 # Ordinary Rust ecosystem probes have a stronger oracle than a marker: their
-# stdout and exit status must exactly match the same locked crate built natively.
+# stdout and exit status must exactly match the same crate built natively.
 native_diff_cases=(
     soak_ahash soak_aho-corasick soak_anyhow soak_arrayvec soak_base64 soak_bincode
     soak_bitflags soak_blake3 soak_bytes soak_chrono soak_csv soak_fastrand soak_fxhash
@@ -104,12 +104,12 @@ run_native_diff() {
         -u C_MODE -u JS_MODE -u ILASM_PATH -u DOTNET_VERSION \
         CARGO_TARGET_DIR="$native_target_root/$case_name/$profile" \
         cargo +nightly-2026-06-17 run --manifest-path "$case_dir/Cargo.toml" \
-        $native_profile --locked --quiet > "$prefix.native.stdout" 2> "$prefix.native.stderr"
+        $native_profile --quiet > "$prefix.native.stdout" 2> "$prefix.native.stderr"
     native_exit=$?
 
     RCL_ICE_LOG=1 CARGO_DOTNET_BACKEND=native \
         "$driver" dotnet run "$case_dir" "$dotnet_profile" --dotnet "$dotnet_version" \
-        $clean_flag --locked \
+        $clean_flag \
         > "$prefix.dotnet.stdout" 2> "$prefix.dotnet.stderr"
     dotnet_exit=$?
     remove_generated_config "$case_dir" || return 1
@@ -155,7 +155,7 @@ run_managed_selfcheck() {
 
     RCL_ICE_LOG=1 CARGO_DOTNET_BACKEND=native \
         "$driver" dotnet run "$case_dir" "$dotnet_profile" --dotnet "$dotnet_version" \
-        $clean_flag --locked \
+        $clean_flag \
         > "$prefix.dotnet.stdout" 2> "$prefix.dotnet.stderr"
     dotnet_exit=$?
     hits="$(rg -n -i "$diagnostics" "$prefix.dotnet.stdout" "$prefix.dotnet.stderr" 2>/dev/null | wc -l | tr -d ' ')"
@@ -181,7 +181,7 @@ run_managed_host() {
     RCL_ICE_LOG=1 CARGO_DOTNET_BACKEND=native \
         "$driver" dotnet build "$case_dir" "$dotnet_profile" --dotnet "$dotnet_version" \
         --source-link-url 'https://example.invalid/rust-dotnet-fixture/*' \
-        $clean_flag --locked \
+        $clean_flag \
         > "$prefix.build.stdout" 2> "$prefix.build.stderr"
     dotnet_exit=$?
     if ((dotnet_exit == 0)); then

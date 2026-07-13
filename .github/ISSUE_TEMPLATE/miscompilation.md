@@ -1,22 +1,31 @@
 ---
-name: Miscompilation
-about: Report a miscompilation
-title: "[MISCOMPILATION]"
+name: Compiler bug or miscompilation
+about: Report a crash, wrong result, unsupported code path, or install problem
+title: "[BUG] "
 labels: miscompilation
 assignees: ''
 
 ---
 
-**Describe the bug**
-A clear and concise description of what the bug is.
+## What happened?
 
-**Example of miscompiled code**
+Include the command you ran and the complete error or incorrect output.
 
-**Expected behavior**
-A clear and concise description of what you expected to happen.
+## Small reproducer
 
-**Info about your system (please complete the following information):**
- - OS: [e.g. Linux Fedora 39 6.6.13-200.fc39.x86_64]
+Paste the smallest Cargo project or Rust program that still fails. A repository link is welcome
+when reducing it is impractical.
 
-**Additional context**
-Add any other context about the problem here.
+## Expected result
+
+## Diagnostics
+
+Please attach the output of:
+
+```text
+cargo dotnet doctor --json
+```
+
+Also include whether the same program works with ordinary `cargo run`.
+
+## Anything else

@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/sharifhsn/rustc_codegen_clr/discussions
+    about: Ask for help, show what you built, or discuss an idea before filing an issue.

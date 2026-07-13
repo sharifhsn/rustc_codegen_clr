@@ -7,14 +7,15 @@ assignees: ''
 
 ---
 
-**Is your feature request related to a problem? Please describe.**
-A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+## What are you trying to build?
 
-**Describe the solution you'd like**
-A clear and concise description of what you want to happen.
+Describe the Rust crate, .NET API, host, or workflow you want to use.
 
-**Describe alternatives you've considered**
-A clear and concise description of any alternative solutions or features you've considered.
+## What is missing today?
 
-**Additional context**
-Add any other context or screenshots about the feature request here.
+Include a small example or link when possible. Feature requests grounded in a real program are much
+easier to prioritize and test.
+
+## Proposed experience
+
+What command or API would make this easy?

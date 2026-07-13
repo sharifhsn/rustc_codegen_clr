@@ -25,4 +25,6 @@ cargo dotnet run hello-dotnet
 ```
 
 This is compiler research, not a production toolchain. Validate important results against native
-Rust and report crashes, unsupported behavior, or output differences through GitHub Issues.
+Rust. Report crashes, unsupported behavior, installation problems, or output differences through
+[GitHub Issues](https://github.com/sharifhsn/rustc_codegen_clr/issues), and bring questions or ideas
+to [GitHub Discussions](https://github.com/sharifhsn/rustc_codegen_clr/discussions).
