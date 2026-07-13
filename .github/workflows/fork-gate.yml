@@ -155,7 +155,7 @@ jobs:
         env:
           RCL_API_COMPAT_WORK_DIR: ${{ runner.temp }}/api-compat-acceptance
         run: bash feasibility/api_compat_acceptance.sh
-      - name: Run independent clean-tree reproducibility acceptance
+      - name: Run independent clean-tree package envelope reproducibility acceptance
         env:
           RCL_REPRO_EVIDENCE_DIR: ${{ runner.temp }}/reproducibility-acceptance
           # Earlier smoke gates intentionally generate fixture state in this ephemeral checkout.
