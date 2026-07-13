@@ -34,8 +34,10 @@ done
 
 # Release evidence must describe exactly HEAD. In particular, `git worktree add HEAD` must never
 # silently omit a caller's modified or untracked source inputs.
-[[ -z "$(git -C "$repo" status --porcelain --untracked-files=all)" ]] ||
-    fail "HEAD is dirty; commit every source-affecting input before collecting release evidence"
+if [[ "${RCL_REPRO_ALLOW_DIRTY_CALLER:-0}" != 1 ]]; then
+    [[ -z "$(git -C "$repo" status --porcelain --untracked-files=all)" ]] ||
+        fail "HEAD is dirty; commit every source-affecting input before collecting release evidence"
+fi
 
 commit="$(git -C "$repo" rev-parse HEAD)"
 source_date_epoch="$(git -C "$repo" show -s --format=%ct "$commit")"

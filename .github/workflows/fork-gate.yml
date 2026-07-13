@@ -158,6 +158,9 @@ jobs:
       - name: Run independent clean-tree reproducibility acceptance
         env:
           RCL_REPRO_EVIDENCE_DIR: ${{ runner.temp }}/reproducibility-acceptance
+          # Earlier smoke gates intentionally generate fixture state in this ephemeral checkout.
+          # The proof itself still builds two detached worktrees at the exact tested commit.
+          RCL_REPRO_ALLOW_DIRTY_CALLER: "1"
         run: bash feasibility/reproducibility_acceptance.sh
       - name: Run hermetic store acceptance
         env:
