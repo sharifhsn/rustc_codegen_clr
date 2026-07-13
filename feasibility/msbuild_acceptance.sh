@@ -35,9 +35,7 @@ dotnet run --project "$project" --no-build > "$log_dir/consumer.log" 2>&1
 rg -q '^PASS$' "$log_dir/consumer.log"
 
 # An unchanged second build must be a real MSBuild no-op for Rust.
-# Keep this invocation diagnostic: when incremental evaluation regresses on only one host,
-# MSBuild's target-decision trace names the exact stale input in the uploaded acceptance log.
-run_build --verbosity:diagnostic > "$log_dir/noop-build.log" 2>&1
+run_build > "$log_dir/noop-build.log" 2>&1
 if rg -q 'RustDotnet: building Rust crate' "$log_dir/noop-build.log"; then
     echo "unchanged MSBuild invocation rebuilt the Rust crate" >&2
     stamp="$dll.rustdotnet.stamp"
