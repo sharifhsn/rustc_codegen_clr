@@ -4,6 +4,8 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 driver="$repo/tools/cargo-dotnet/target/release/cargo-dotnet"
 log_dir="${RCL_NUGET_LOG_DIR:-/tmp/rustc_codegen_clr-nuget-acceptance}"
+dotnet_version="${DOTNET_VERSION:-10}"
+tfm="net${dotnet_version}.0"
 work="$(mktemp -d "${TMPDIR:-/tmp}/rustdotnet-nuget-acceptance.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
@@ -17,7 +19,7 @@ mkdir -p "$log_dir"
 for side in a b; do
     CARGO_DOTNET_BACKEND=native "$driver" pack "$repo/cargo_tests/cd_interop/rustlib" \
         --id Rcl.Determinism.Probe --version 1.0.0 --out "$work/pack-$side" \
-        --validate \
+        --dotnet "$dotnet_version" --validate \
         > "$log_dir/pack-$side.log" 2>&1
 done
 first="$work/pack-a/Rcl.Determinism.Probe.1.0.0.nupkg"
@@ -33,6 +35,7 @@ cp "$repo/feasibility/fixtures/nuget_consumer/Consumer.csproj" "$work/package-co
 cp "$repo/feasibility/fixtures/nuget_consumer/Program.cs" "$work/package-consumer/"
 NUGET_PACKAGES="$work/nuget-packages" dotnet run \
     --project "$work/package-consumer/Consumer.csproj" \
+    -p:RustDotnetVersion="$dotnet_version" \
     -p:RestoreSources="$work/pack-a;https://api.nuget.org/v3/index.json" \
     > "$log_dir/package-consumer.log" 2>&1
 grep -qx '42' "$log_dir/package-consumer.log"
@@ -62,9 +65,9 @@ esac
 rid_crate="$work/rid-crate"
 cp -R "$repo/cargo_tests/cd_interop/rustlib" "$rid_crate"
 assets="$rid_crate/.cargo-dotnet-nuget-assets"
-runtime_path="runtimes/$rid/lib/net8.0/cd_interop.dll"
+runtime_path="runtimes/$rid/lib/$tfm/cd_interop.dll"
 native_path="runtimes/$rid/native/librcl_rid_asset.$([[ "$rid" == osx-* ]] && echo dylib || echo so)"
-resource_path="runtimes/$rid/lib/net8.0/fr/Rcl.Rid.Asset.resources.dll"
+resource_path="runtimes/$rid/lib/$tfm/fr/Rcl.Rid.Asset.resources.dll"
 mkdir -p "$assets/owned/rid-fixture/$(dirname "$runtime_path")" \
     "$assets/owned/rid-fixture/$(dirname "$native_path")" \
     "$assets/owned/rid-fixture/$(dirname "$resource_path")"
@@ -78,7 +81,8 @@ printf '{\n  "version": 1,\n  "roots": {\n    "Rcl.Rid.Fixture": {\n      "asset
     "$resource_path" "$rid" "$resource_path" \
     > "$assets/manifest.json"
 CARGO_DOTNET_BACKEND=native "$driver" pack "$rid_crate" \
-    --id Rcl.Rid.Assets.Probe --version 1.0.0 --out "$work/rid-pack" --validate \
+    --id Rcl.Rid.Assets.Probe --version 1.0.0 --out "$work/rid-pack" \
+    --dotnet "$dotnet_version" --validate \
     > "$log_dir/rid-pack.log" 2>&1
 rid_package="$work/rid-pack/Rcl.Rid.Assets.Probe.1.0.0.nupkg"
 unzip -Z1 "$rid_package" > "$work/rid-package.entries"
@@ -92,14 +96,16 @@ sed 's/Rcl.Determinism.Probe/Rcl.Rid.Assets.Probe/' \
 cp "$repo/feasibility/fixtures/nuget_consumer/Program.cs" "$work/rid-package-consumer/Program.cs"
 NUGET_PACKAGES="$work/rid-nuget-packages" dotnet restore \
     "$work/rid-package-consumer/Consumer.csproj" \
+    -p:RustDotnetVersion="$dotnet_version" \
     --runtime "$rid" \
     --source "$work/rid-pack" --source https://api.nuget.org/v3/index.json \
     > "$log_dir/rid-package-consumer.log" 2>&1
 NUGET_PACKAGES="$work/rid-nuget-packages" dotnet build \
     "$work/rid-package-consumer/Consumer.csproj" --no-restore \
+    -p:RustDotnetVersion="$dotnet_version" \
     -p:RuntimeIdentifier="$rid" -p:SelfContained=false \
     >> "$log_dir/rid-package-consumer.log" 2>&1
-dotnet "$work/rid-package-consumer/bin/Debug/net8.0/$rid/Consumer.dll" \
+dotnet "$work/rid-package-consumer/bin/Debug/$tfm/$rid/Consumer.dll" \
     >> "$log_dir/rid-package-consumer.log" 2>&1
 grep -qx '42' "$log_dir/rid-package-consumer.log"
 
