@@ -70,7 +70,10 @@ build_side() {
     root_canonical="$(mkdir -p "$root" && cd "$root" && pwd -P)"
     tree_alias="${tree_canonical#/private}"
     root_alias="${root_canonical#/private}"
-    remap_flags="--remap-path-prefix=$tree=/_/rustc_codegen_clr --remap-path-prefix=$tree_canonical=/_/rustc_codegen_clr --remap-path-prefix=$tree_alias=/_/rustc_codegen_clr --remap-path-prefix=$root=/_/build-root --remap-path-prefix=$root_canonical=/_/build-root --remap-path-prefix=$root_alias=/_/build-root -C codegen-units=1"
+    # The raw remap arguments necessarily contain each side's absolute paths. rustc includes
+    # codegen flags in its crate disambiguator, so pin metadata as well as remapping debug paths;
+    # otherwise symbol identities differ even when every source byte is identical.
+    remap_flags="--remap-path-prefix=$tree=/_/rustc_codegen_clr --remap-path-prefix=$tree_canonical=/_/rustc_codegen_clr --remap-path-prefix=$tree_alias=/_/rustc_codegen_clr --remap-path-prefix=$root=/_/build-root --remap-path-prefix=$root_canonical=/_/build-root --remap-path-prefix=$root_alias=/_/build-root -C metadata=rustdotnet-reproducible -C codegen-units=1"
     out="$evidence/$side"
     mkdir -p "$root/home" "$root/cargo" "$root/cache" "$root/nuget" "$root/tmp" "$out/package"
 
