@@ -84,7 +84,8 @@ jobs:
           CARGO_DOTNET_EXPERIMENTAL_WINDOWS: "1"
           DOTNET_VERSION: "10"
         run: |
-          cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet doctor
+          cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet doctor --workspace cargo_tests/cd_interop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           dotnet --info
       - name: Build and run Rust on Windows CoreCLR
         shell: pwsh
