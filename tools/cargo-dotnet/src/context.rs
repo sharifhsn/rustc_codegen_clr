@@ -117,11 +117,7 @@ impl Paths {
                         home.display()
                     );
                 }
-                let backend_name = if facts.os == "windows" {
-                    "rustc_codegen_clr.dll".to_string()
-                } else {
-                    format!("librustc_codegen_clr.{}", facts.dylib_ext)
-                };
+                let backend_name = facts.backend_dylib_name();
                 let backend_dylib = home.join("bin").join(backend_name);
                 let linker = home.join(format!("bin/linker{}", facts.exe_ext));
                 let target_spec = home.join("target/x86_64-unknown-dotnet.json");
@@ -154,11 +150,7 @@ impl Paths {
                 })
             }
             Mode::Dev { repo_root } => {
-                let backend_name = if facts.os == "windows" {
-                    "rustc_codegen_clr.dll".to_string()
-                } else {
-                    format!("librustc_codegen_clr.{}", facts.dylib_ext)
-                };
+                let backend_name = facts.backend_dylib_name();
                 let backend_dylib = repo_root.join("target/release").join(backend_name);
                 let linker = repo_root.join(format!("target/release/linker{}", facts.exe_ext));
                 let target_spec = repo_root.join("x86_64-unknown-dotnet.json");

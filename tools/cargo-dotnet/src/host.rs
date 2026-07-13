@@ -47,11 +47,26 @@ impl HostFacts {
 
     #[cfg(test)]
     pub fn for_test(os: &'static str) -> Self {
+        let (dylib_ext, exe_ext) = match os {
+            "macos" => ("dylib", ""),
+            "windows" => ("dll", ".exe"),
+            _ => ("so", ""),
+        };
         HostFacts {
             os,
-            dylib_ext: "so",
-            exe_ext: "",
+            dylib_ext,
+            exe_ext,
             host_rid: "test-x64",
+        }
+    }
+
+    /// Filename Cargo gives the host codegen-backend dynamic library.
+    #[must_use]
+    pub fn backend_dylib_name(&self) -> String {
+        if self.os == "windows" {
+            format!("rustc_codegen_clr.{}", self.dylib_ext)
+        } else {
+            format!("librustc_codegen_clr.{}", self.dylib_ext)
         }
     }
 }
@@ -125,8 +140,9 @@ pub fn ensure_dotnet(heal: &Option<(PathBuf, PathBuf)>) -> Result<()> {
 }
 
 /// Resolve a CoreCLR (NOT Mono) ilasm and return its absolute path to export as
-/// `ILASM_PATH`. Order: explicit `$ILASM_PATH`; `$HOME/.dotnet/ilasm-tool/ilasm`; a
-/// non-Mono `ilasm` on PATH (returns `None`, letting cilly's bare default fire).
+/// `ILASM_PATH`. Order: explicit `$ILASM_PATH`; the selected runtime's versioned tool directory
+/// under `$HOME/.dotnet`; a non-Mono `ilasm` on PATH (returns `None`, letting cilly's bare default
+/// fire).
 /// Ports `resolve_ilasm` (cargo-dotnet:137-150).
 pub fn resolve_ilasm(
     facts: &HostFacts,
@@ -142,8 +158,8 @@ pub fn resolve_ilasm(
         }
     }
     if let Some(home) = home_dir() {
-        // Each runtime needs its MATCHING CoreCLR ilasm (a net8 ilasm's PE is rejected by the net9
-        // runtime and vice-versa): ilasm-tool for .NET 8, ilasm9-tool for .NET 9.
+        // Each runtime needs its MATCHING CoreCLR ilasm (an older ilasm's PE can be rejected by a
+        // newer runtime): ilasm-tool for .NET 8, ilasm9-tool for .NET 9, ilasm10-tool for .NET 10.
         let tool = home.join(format!(
             ".dotnet/{}/ilasm{}",
             dotnet.ilasm_tool_dir(),
@@ -162,7 +178,8 @@ pub fn resolve_ilasm(
                 bail!(
                     "the `ilasm` on PATH is Mono's, which emits PE32 images the native CoreCLR \
                      loader rejects. Run `cargo dotnet setup` (installs the CoreCLR ILAsm to \
-                     $HOME/.dotnet/ilasm-tool/ilasm), or set ILASM_PATH to a CoreCLR ilasm."
+                     $HOME/.dotnet/{}/ilasm), or set ILASM_PATH to a CoreCLR ilasm.",
+                    dotnet.ilasm_tool_dir()
                 );
             }
         }
@@ -170,8 +187,10 @@ pub fn resolve_ilasm(
         return Ok(None);
     }
     bail!(
-        "ilasm not found (no ILASM_PATH, none at $HOME/.dotnet/ilasm-tool/ilasm, none on PATH). \
-         Run `cargo dotnet setup` to install the CoreCLR ILAsm NuGet tool."
+        "ilasm not found (no ILASM_PATH, none at $HOME/.dotnet/{}/ilasm{}, none on PATH). \
+         Run `cargo dotnet setup` to install the matching CoreCLR ILAsm NuGet tool.",
+        dotnet.ilasm_tool_dir(),
+        facts.exe_ext
     )
 }
 
@@ -226,6 +245,22 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             UNSUPPORTED_WINDOWS_HOST
+        );
+    }
+
+    #[test]
+    fn backend_dylib_filename_is_platform_native() {
+        assert_eq!(
+            HostFacts::for_test("linux").backend_dylib_name(),
+            "librustc_codegen_clr.so"
+        );
+        assert_eq!(
+            HostFacts::for_test("macos").backend_dylib_name(),
+            "librustc_codegen_clr.dylib"
+        );
+        assert_eq!(
+            HostFacts::for_test("windows").backend_dylib_name(),
+            "rustc_codegen_clr.dll"
         );
     }
 }

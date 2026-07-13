@@ -169,14 +169,19 @@ fn environment_checks() -> Vec<Check> {
         Err(e) => Check::fail("dotnet runtime reachable", e.to_string()),
     });
 
-    // A CoreCLR (not Mono) ilasm.
-    checks.push(
-        match host::resolve_ilasm(&facts, crate::context::DotnetVersion::Net8) {
+    // A CoreCLR (not Mono) ilasm matching the selected runtime profile.
+    let dotnet = std::env::var("DOTNET_VERSION").map_or_else(
+        |_| Ok(crate::context::DotnetVersion::default()),
+        |v| v.parse(),
+    );
+    checks.push(match dotnet {
+        Ok(dotnet) => match host::resolve_ilasm(&facts, dotnet) {
             Ok(Some(p)) => Check::pass("CoreCLR ilasm", format!("using {}", p.display())),
             Ok(None) => Check::pass("CoreCLR ilasm", "a non-Mono ilasm on PATH".to_string()),
             Err(e) => Check::fail("CoreCLR ilasm", e.to_string()),
         },
-    );
+        Err(e) => Check::fail("CoreCLR ilasm", e),
+    });
 
     // The backend install (dylib + linker + target spec + msbuild targets).
     checks.extend(check_backend_install(&facts));
@@ -242,20 +247,18 @@ fn resolve_expected_toolchain() -> String {
 /// Check the backend artifacts + shipped msbuild targets in whichever layout applies.
 fn check_backend_install(facts: &HostFacts) -> Vec<Check> {
     let mut checks = Vec::new();
+    let backend_name = facts.backend_dylib_name();
     let (root_label, dylib, linker, target_spec, targets) = match mode::detect() {
         Ok(Mode::Installed { home }) => (
             format!("installed home {}", home.display()),
-            home.join(format!("bin/librustc_codegen_clr.{}", facts.dylib_ext)),
+            home.join("bin").join(&backend_name),
             home.join(format!("bin/linker{}", facts.exe_ext)),
             home.join("target/x86_64-unknown-dotnet.json"),
             home.join("msbuild/RustDotnet.targets"),
         ),
         Ok(Mode::Dev { repo_root }) => (
             format!("dev checkout {}", repo_root.display()),
-            repo_root.join(format!(
-                "target/release/librustc_codegen_clr.{}",
-                facts.dylib_ext
-            )),
+            repo_root.join("target/release").join(&backend_name),
             repo_root.join(format!("target/release/linker{}", facts.exe_ext)),
             repo_root.join("x86_64-unknown-dotnet.json"),
             repo_root.join("msbuild/RustDotnet.targets"),
