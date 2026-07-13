@@ -1,7 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
+    <RustDotnetVersion Condition="'$(RustDotnetVersion)'==''">10</RustDotnetVersion>
+    <TargetFramework>net$(RustDotnetVersion).0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
   <ItemGroup>

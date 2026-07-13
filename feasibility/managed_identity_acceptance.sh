@@ -5,6 +5,8 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 project="$repo/cargo_tests/cd_multi_library_collision/consumer/Consumer.csproj"
 driver="$repo/tools/cargo-dotnet/target/release/cargo-dotnet"
 log_dir="${RCL_MANAGED_IDENTITY_LOG_DIR:-/tmp/rustc_codegen_clr-managed-identity}"
+dotnet_version="${DOTNET_VERSION:-10}"
+tfm="net${dotnet_version}.0"
 mkdir -p "$log_dir"
 rm -rf "$repo/cargo_tests/cd_multi_library_collision/consumer/bin" \
     "$repo/cargo_tests/cd_multi_library_collision/consumer/obj"
@@ -63,16 +65,17 @@ pack_dir="$log_dir/custom-pack"
 rm -rf "$pack_dir"
 CARGO_DOTNET_BACKEND=native CARGO_DOTNET_HOME="$repo" "$driver" pack \
     "$repo/cargo_tests/cd_multi_library_collision/invalid_custom_assembly" \
-    --out "$pack_dir" --validate > "$log_dir/custom-pack.log" 2>&1
+    --out "$pack_dir" --dotnet "$dotnet_version" --validate > "$log_dir/custom-pack.log" 2>&1
 custom_package="$pack_dir/Collision.InvalidCustomAssembly.0.1.0.nupkg"
 [[ -f "$custom_package" ]]
-unzip -Z1 "$custom_package" | rg -q '^lib/net8\.0/Different\.Assembly\.dll$'
-unzip -Z1 "$custom_package" | rg -q '^lib/net8\.0/Different\.Assembly\.xml$'
+unzip -Z1 "$custom_package" | rg -q "^lib/$tfm/Different\\.Assembly\\.dll$"
+unzip -Z1 "$custom_package" | rg -q "^lib/$tfm/Different\\.Assembly\\.xml$"
 consumer="$repo/cargo_tests/cd_multi_library_collision/custom_package_consumer/Consumer.csproj"
 rm -rf "$repo/cargo_tests/cd_multi_library_collision/custom_package_consumer/bin" \
     "$repo/cargo_tests/cd_multi_library_collision/custom_package_consumer/obj" \
     "$log_dir/custom-packages"
 custom_output="$(dotnet run --project "$consumer" \
+    -p:RustDotnetVersion="$dotnet_version" \
     -p:RestoreSources="$pack_dir" \
     -p:RestorePackagesPath="$log_dir/custom-packages")"
 [[ "$custom_output" == "custom" ]]
