@@ -4,23 +4,20 @@
 
 Install:
 
-- the Rust nightly selected by `rust-toolchain.toml`, including `rustc-dev` and `rust-src`;
-- the .NET 10 SDK (the default profile), or the SDK matching an explicitly selected profile;
-- a C toolchain for C-output mode; and
-- Mono `ilasm` only when using the ILASM fallback (`DIRECT_PE=0`).
+- [rustup](https://rustup.rs/); and
+- the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
 
-From the repository root, build the backend and the `cargo dotnet` frontend:
+The release installer downloads the matching SDK bundle, verifies it, and installs the
+`cargo dotnet` command without changing the system Rust installation.
 
 ```bash
-cargo build --release -p cilly --bins
-cargo build --release
-cargo build --release --manifest-path tools/cargo-dotnet/Cargo.toml
+curl -fsSL https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.1/install.sh | sh
 ```
 
-Run the setup command from the tool you just built:
+On Windows x64, run this in PowerShell:
 
-```bash
-./tools/cargo-dotnet/target/release/cargo-dotnet dotnet setup
+```powershell
+irm https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.1/install.ps1 | iex
 ```
 
 Then verify the installation:
@@ -29,12 +26,19 @@ Then verify the installation:
 cargo dotnet doctor
 ```
 
-`doctor` reports missing SDK components, stale backend artifacts, and common project-wiring errors.
-The backend is selected per build; it does not permanently replace rustc's native backend.
+`doctor` reports missing SDK components and common project-wiring errors. The backend is selected
+per build; it does not permanently replace rustc's native backend.
 
-The default output targets .NET 10. To keep a project on an older supported runtime, pass
-`--dotnet 8` or `--dotnet 9`, or set `DOTNET_VERSION` in the build environment. See
-[.NET runtime profiles](runtime-profiles.md) for the compatibility contract.
+The public SDK targets .NET 10 only. Its bundled CoreCLR ILAsm is used automatically when the
+legacy ILAsm fallback is needed.
 
-> The repository currently uses a dated nightly for compatibility. Prefer the checked-in
-> `rust-toolchain.toml` over an arbitrary current nightly.
+## Build from a checkout
+
+Compiler contributors can provision directly from a repository checkout:
+
+```bash
+cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- setup --from-repo "$PWD"
+cargo dotnet doctor
+```
+
+Prefer the checked-in `rust-toolchain.toml` over an arbitrary current nightly.
