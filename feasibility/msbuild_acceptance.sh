@@ -15,6 +15,12 @@ if [[ ! -x "$driver" ]]; then
 fi
 mkdir -p "$log_dir"
 
+# Every build below is intentionally --no-restore; materialize obj/project.assets.json here so
+# the script does not depend on an earlier acceptance step having restored this csproj in-place
+# (the NativeAOT gate used to as a side effect, before it moved to a staged git-archive copy).
+CARGO_DOTNET_BACKEND=native CARGO_DOTNET_HOME="$repo" \
+    dotnet restore "$project" "-p:CargoDotnet=$driver" --nologo > "$log_dir/restore.log" 2>&1
+
 common=(
     "$project"
     "-p:CargoDotnet=$driver"
