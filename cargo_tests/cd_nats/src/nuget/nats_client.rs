@@ -156,6 +156,7 @@ pub trait Service_Methods {
     fn get_ping_response(self) -> NATS::Client::Service::PingResponse;
     fn get_info_response(self) -> NATS::Client::Service::InfoResponse;
     fn add_service_endpoint(self, a1: NATS::Client::Service::ServiceEndpoint);
+    fn start_service(self) -> mycorrhiza::task::TaskT<bool>;
     fn builder() -> NATS::Client::Service::ServiceBuilder;
     fn stop(self);
     fn reset(self);
@@ -172,6 +173,7 @@ impl Service_Methods for Service {
     fn get_ping_response(self) -> NATS::Client::Service::PingResponse { self.instance0::<"get_PingResponse", NATS::Client::Service::PingResponse>() }
     fn get_info_response(self) -> NATS::Client::Service::InfoResponse { self.instance0::<"get_InfoResponse", NATS::Client::Service::InfoResponse>() }
     fn add_service_endpoint(self, a1: NATS::Client::Service::ServiceEndpoint) { self.instance1::<"AddServiceEndpoint", NATS::Client::Service::ServiceEndpoint, ()>(a1) }
+    fn start_service(self) -> mycorrhiza::task::TaskT<bool> { self.instance0::<"StartService", mycorrhiza::task::TaskT<bool>>() }
     fn builder() -> NATS::Client::Service::ServiceBuilder { Self::static0::<"Builder", NATS::Client::Service::ServiceBuilder>() }
     fn stop(self) { self.instance0::<"Stop", ()>() }
     fn reset(self) { self.instance0::<"Reset", ()>() }
@@ -1437,6 +1439,7 @@ pub type IJetStream =  mycorrhiza::intrinsics::RustcCLRInteropManagedClass<"NATS
 use super::super::super::*;
 pub trait IJetStream_Methods {
     fn publish(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>) -> NATS::Client::JetStream::PublishAck;
+    fn publish_async(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>) -> mycorrhiza::task::TaskT<NATS::Client::JetStream::PublishAck>;
     fn pull_subscribe(self, a1: System::String, a2: NATS::Client::JetStream::PullSubscribeOptions) -> NATS::Client::JetStream::IJetStreamPullSubscription;
     fn push_subscribe_sync(self, a1: System::String) -> NATS::Client::JetStream::IJetStreamPushSyncSubscription;
     fn get_stream_context(self, a1: System::String) -> NATS::Client::JetStream::IStreamContext;
@@ -1444,6 +1447,7 @@ pub trait IJetStream_Methods {
 }
 impl IJetStream_Methods for IJetStream {
     fn publish(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>) -> NATS::Client::JetStream::PublishAck { self.virt2::<"Publish", System::String, mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>, NATS::Client::JetStream::PublishAck>(a1, a2) }
+    fn publish_async(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>) -> mycorrhiza::task::TaskT<NATS::Client::JetStream::PublishAck> { self.virt2::<"PublishAsync", System::String, mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>, mycorrhiza::task::TaskT<NATS::Client::JetStream::PublishAck>>(a1, a2) }
     fn pull_subscribe(self, a1: System::String, a2: NATS::Client::JetStream::PullSubscribeOptions) -> NATS::Client::JetStream::IJetStreamPullSubscription { self.virt2::<"PullSubscribe", System::String, NATS::Client::JetStream::PullSubscribeOptions, NATS::Client::JetStream::IJetStreamPullSubscription>(a1, a2) }
     fn push_subscribe_sync(self, a1: System::String) -> NATS::Client::JetStream::IJetStreamPushSyncSubscription { self.virt1::<"PushSubscribeSync", System::String, NATS::Client::JetStream::IJetStreamPushSyncSubscription>(a1) }
     fn get_stream_context(self, a1: System::String) -> NATS::Client::JetStream::IStreamContext { self.virt1::<"GetStreamContext", System::String, NATS::Client::JetStream::IStreamContext>(a1) }
@@ -1597,6 +1601,7 @@ mycorrhiza::intrinsics::rustc_clr_interop_managed_checked_cast::<NATS::Client::J
 }} 
 pub trait JetStream_Methods {
     fn publish(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>) -> NATS::Client::JetStream::PublishAck;
+    fn publish_async(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>) -> mycorrhiza::task::TaskT<NATS::Client::JetStream::PublishAck>;
     fn pull_subscribe(self, a1: System::String, a2: NATS::Client::JetStream::PullSubscribeOptions) -> NATS::Client::JetStream::IJetStreamPullSubscription;
     fn push_subscribe_sync(self, a1: System::String) -> NATS::Client::JetStream::IJetStreamPushSyncSubscription;
     fn get_stream_context(self, a1: System::String) -> NATS::Client::JetStream::IStreamContext;
@@ -1604,6 +1609,7 @@ pub trait JetStream_Methods {
 }
 impl JetStream_Methods for JetStream {
     fn publish(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>) -> NATS::Client::JetStream::PublishAck { self.virt2::<"Publish", System::String, mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>, NATS::Client::JetStream::PublishAck>(a1, a2) }
+    fn publish_async(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>) -> mycorrhiza::task::TaskT<NATS::Client::JetStream::PublishAck> { self.virt2::<"PublishAsync", System::String, mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>, mycorrhiza::task::TaskT<NATS::Client::JetStream::PublishAck>>(a1, a2) }
     fn pull_subscribe(self, a1: System::String, a2: NATS::Client::JetStream::PullSubscribeOptions) -> NATS::Client::JetStream::IJetStreamPullSubscription { self.virt2::<"PullSubscribe", System::String, NATS::Client::JetStream::PullSubscribeOptions, NATS::Client::JetStream::IJetStreamPullSubscription>(a1, a2) }
     fn push_subscribe_sync(self, a1: System::String) -> NATS::Client::JetStream::IJetStreamPushSyncSubscription { self.virt1::<"PushSubscribeSync", System::String, NATS::Client::JetStream::IJetStreamPushSyncSubscription>(a1) }
     fn get_stream_context(self, a1: System::String) -> NATS::Client::JetStream::IStreamContext { self.virt1::<"GetStreamContext", System::String, NATS::Client::JetStream::IStreamContext>(a1) }
@@ -3378,6 +3384,7 @@ pub trait Connection_Methods {
     fn get_last_error(self) -> System::Exception;
     fn publish(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>);
     fn request(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>) -> NATS::Client::Msg;
+    fn request_async(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>) -> mycorrhiza::task::TaskT<NATS::Client::Msg>;
     fn new_inbox(self) -> System::String;
     fn subscribe_sync(self, a1: System::String) -> NATS::Client::ISyncSubscription;
     fn subscribe_async(self, a1: System::String) -> NATS::Client::IAsyncSubscription;
@@ -3416,6 +3423,7 @@ impl Connection_Methods for Connection {
     fn get_last_error(self) -> System::Exception { self.virt0::<"get_LastError", System::Exception>() }
     fn publish(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>) { self.virt2::<"Publish", System::String, mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>, ()>(a1, a2) }
     fn request(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>) -> NATS::Client::Msg { self.virt2::<"Request", System::String, mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>, NATS::Client::Msg>(a1, a2) }
+    fn request_async(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>) -> mycorrhiza::task::TaskT<NATS::Client::Msg> { self.virt2::<"RequestAsync", System::String, mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>, mycorrhiza::task::TaskT<NATS::Client::Msg>>(a1, a2) }
     fn new_inbox(self) -> System::String { self.virt0::<"NewInbox", System::String>() }
     fn subscribe_sync(self, a1: System::String) -> NATS::Client::ISyncSubscription { self.virt1::<"SubscribeSync", System::String, NATS::Client::ISyncSubscription>(a1) }
     fn subscribe_async(self, a1: System::String) -> NATS::Client::IAsyncSubscription { self.virt1::<"SubscribeAsync", System::String, NATS::Client::IAsyncSubscription>(a1) }
@@ -3842,6 +3850,7 @@ pub trait IConnection_Methods {
     fn reconnect(self, a1: NATS::Client::ReconnectOptions);
     fn publish(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>);
     fn request(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>) -> NATS::Client::Msg;
+    fn request_async(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>) -> mycorrhiza::task::TaskT<NATS::Client::Msg>;
     fn new_inbox(self) -> System::String;
     fn subscribe_sync(self, a1: System::String) -> NATS::Client::ISyncSubscription;
     fn subscribe_async(self, a1: System::String) -> NATS::Client::IAsyncSubscription;
@@ -3878,6 +3887,7 @@ impl IConnection_Methods for IConnection {
     fn reconnect(self, a1: NATS::Client::ReconnectOptions) { self.virt1::<"Reconnect", NATS::Client::ReconnectOptions, ()>(a1) }
     fn publish(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>) { self.virt2::<"Publish", System::String, mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>, ()>(a1, a2) }
     fn request(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>) -> NATS::Client::Msg { self.virt2::<"Request", System::String, mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>, NATS::Client::Msg>(a1, a2) }
+    fn request_async(self, a1: System::String, a2: mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>) -> mycorrhiza::task::TaskT<NATS::Client::Msg> { self.virt2::<"RequestAsync", System::String, mycorrhiza::intrinsics::RustcCLRInteropManagedArray<u8, 1>, mycorrhiza::task::TaskT<NATS::Client::Msg>>(a1, a2) }
     fn new_inbox(self) -> System::String { self.virt0::<"NewInbox", System::String>() }
     fn subscribe_sync(self, a1: System::String) -> NATS::Client::ISyncSubscription { self.virt1::<"SubscribeSync", System::String, NATS::Client::ISyncSubscription>(a1) }
     fn subscribe_async(self, a1: System::String) -> NATS::Client::IAsyncSubscription { self.virt1::<"SubscribeAsync", System::String, NATS::Client::IAsyncSubscription>(a1) }
