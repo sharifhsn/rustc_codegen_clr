@@ -190,6 +190,9 @@ pub fn run(args: &PackArgs) -> Result<i32> {
     // `add-nuget` owns a complete SDK-selected graph under the crate.  Package it under its
     // original NuGet paths: `copy_assets` flattens for CLR probing beside an executable, but a
     // `.nupkg` must retain RID/native/culture directories for the consumer SDK to select.
+    // Re-stage first (see `nuget::ensure_staged`'s doc) — a fresh clone's gitignored assets dir
+    // would otherwise silently pack an incomplete/empty asset set with no error.
+    nuget::ensure_staged(&ctx)?;
     let staged_assets = nuget::staged_package_assets(&ctx.crate_dir)?;
     if !staged_assets.is_empty() {
         eprintln!(

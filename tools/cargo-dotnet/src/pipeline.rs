@@ -46,6 +46,11 @@ fn run_native(ctx: &Context, prog_args: &[String]) -> Result<i32> {
     if ctx.is_offline() {
         crate::restore::verify(ctx, &private_sysroot)?;
     }
+    // 2.1. Re-stage any `add-nuget` runtime closure missing from a fresh clone (the assets dir
+    // is gitignored, the deps manifest is checked in) before spending a full build on a crate
+    // that would fail at runtime with `FileNotFoundException` anyway. A no-op for crates that
+    // never ran `add-nuget`; fails fast with an actionable error under `--offline`/`--frozen`.
+    nuget::ensure_staged(ctx)?;
     // 2.5. Clear stale `#[dotnet_export]` XML-doc scratch entries. `dotnet_macros` APPENDS one
     // entry per fn at proc-macro-expansion time (it can only ever append, never knows about
     // previous runs), so a stale file from an earlier build would silently accumulate duplicate

@@ -1,4 +1,13 @@
 //! Explicit dependency restore and the receipt consumed by `build --offline`.
+//!
+//! The receipt's file-hash contract (below) covers Cargo's dependency graph and private
+//! sysroot/cache only. `add-nuget` runtime assets are a separate checked-in-manifest
+//! (`.cargo-dotnet-nuget-deps.json`) / gitignored-cache (`.cargo-dotnet-nuget-assets/`) pair with
+//! their own completeness check — `nuget::ensure_staged`, called both here and from the
+//! `build`/`run`/`test` pipeline — rather than being folded into `inputs`/`cache` here. Keeping
+//! them separate means a stale NuGet cache can neither mark an otherwise-fresh receipt stale nor
+//! hide behind one: `ensure_staged` fails an `--offline` build directly on its own missing-asset
+//! check regardless of the Cargo receipt's freshness.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -12,7 +21,7 @@ use crate::cli::BuildArgs;
 use crate::context::Context;
 use crate::mode::Backend;
 use crate::private_sysroot::PrivateSysroot;
-use crate::{buildstd, interop_helpers, overlays, private_sysroot};
+use crate::{buildstd, interop_helpers, nuget, overlays, private_sysroot};
 
 const SCHEMA: u32 = 1;
 const RECEIPT_NAME: &str = "restore-receipt.json";
@@ -48,6 +57,14 @@ pub fn run(args: &BuildArgs) -> Result<i32> {
     overlays::apply(&ctx)?;
     buildstd::fetch_dependencies(&ctx, &sysroot)?;
     interop_helpers::restore_if_needed(&ctx)?;
+    // Re-stage any `add-nuget` runtime closure missing or incomplete (e.g. a fresh clone, whose
+    // `.cargo-dotnet-nuget-assets/` is gitignored) — the sanctioned prepare step for a later
+    // `--offline`/`--frozen` build. A no-op for crates that never ran `add-nuget`. NuGet assets
+    // are not part of the receipt below (see its schema doc): they are their own
+    // checked-in-manifest/gitignored-cache pair, verified directly by `nuget::ensure_staged`
+    // rather than by file-hash receipt, so `build --offline` fails fast on missing assets even
+    // if the Cargo-dependency receipt is otherwise fresh.
+    nuget::ensure_staged(&ctx)?;
     let receipt = create_receipt(&ctx, &sysroot)?;
     let path = receipt_path(&ctx);
     write_atomic(&path, &receipt)?;

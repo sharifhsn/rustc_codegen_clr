@@ -112,6 +112,101 @@ pub(crate) fn staged_package_assets(crate_dir: &Path) -> Result<Vec<StagedPackag
     nuget_assets::package_assets(crate_dir)
 }
 
+/// `{id: version}` for every `add-nuget` dependency whose staged runtime closure under
+/// `.cargo-dotnet-nuget-assets/` is missing or incomplete relative to what
+/// `.cargo-dotnet-nuget-deps.json` recorded — including a staged graph whose version no longer
+/// matches the recorded one (see `nuget_assets::missing_recorded_roots`'s doc for the version-
+/// drift case this catches). `Vec::new()` for a crate that never ran `add-nuget` — cheap and
+/// silent, since it never touches `nuget_assets` beyond the deps manifest read. This is the
+/// fresh-clone detector: the deps manifest is checked in, the assets dir is gitignored, so
+/// cloning the repo and building leaves every recorded id "missing" here until `ensure_staged`
+/// re-restores it.
+fn missing_assets(crate_dir: &Path) -> Result<Vec<(String, String)>> {
+    let recorded = recorded_dependencies(crate_dir)?;
+    if recorded.is_empty() {
+        return Ok(Vec::new());
+    }
+    let missing_ids = nuget_assets::missing_recorded_roots(crate_dir, &recorded)?
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    Ok(recorded
+        .into_iter()
+        .filter(|(id, _)| missing_ids.contains(id))
+        .collect())
+}
+
+/// Re-restore and re-stage every `add-nuget` dependency whose runtime closure is missing or
+/// incomplete, called from the `build`/`run`/`test` pipeline (before `copy_assets`) and from
+/// `cargo dotnet restore` — the sanctioned offline-prepare step. A no-op (and silent) for crates
+/// that never ran `add-nuget`, and for crates whose staged assets are already complete.
+///
+/// Limitation: `.cargo-dotnet-nuget-deps.json` records only `{id: version}` — `add-nuget`'s
+/// `--rid`/`--source` are NOT recorded, so auto-restore always uses the host RID default and the
+/// configured NuGet sources. A crate originally added with `--rid`/`--source` (a custom feed or a
+/// cross-target RID) will not auto-restore from that same source/RID; re-run `add-nuget`
+/// explicitly with the original flags in that case.
+///
+/// Offline (`--offline`/`--frozen`) builds must never silently hit the network: if assets are
+/// missing while offline, this fails with a clear, actionable error instead of restoring.
+pub fn ensure_staged(ctx: &Context) -> Result<()> {
+    let missing = missing_assets(&ctx.crate_dir)?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if ctx.is_offline() {
+        let names = missing
+            .iter()
+            .map(|(id, version)| format!("{id} {version}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "offline build is missing staged NuGet assets for {names} (recorded in {}); run \
+             `cargo dotnet restore` while network access is available, or re-run `cargo dotnet \
+             add-nuget` online",
+            ctx.crate_dir.join(DEPS_MANIFEST_FILE).display()
+        );
+    }
+    eprintln!(
+        "==> cargo dotnet: auto-restoring staged NuGet assets for {} (missing or incomplete)",
+        missing
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let home = mode::cargo_dotnet_home()?;
+    for (id, version) in &missing {
+        let cache_root = home.join("nuget_cache").join(id.to_lowercase()).join(version);
+        fs::create_dir_all(&cache_root)?;
+        // Defaults only — see this fn's doc comment for the `--rid`/`--source` limitation.
+        let resolved =
+            nuget_assets::restore(id, version, &cache_root, None, ctx.dotnet.tfm(), &[])?;
+        nuget_assets::stage_assets(&ctx.crate_dir, id, &resolved.assets)?;
+    }
+    // Re-check rather than trusting the restore loop unconditionally: the recorded version is
+    // whatever the user typed to `add-nuget`, while `missing_recorded_roots`'s completeness check
+    // matches against the SDK's own NORMALIZED version from `project.assets.json` (e.g. a
+    // recorded `1.0.0.0` never equals a resolved `1.0.0`). Without this, a non-normalized
+    // recorded version would silently re-restore from the network on every single build forever
+    // instead of ever converging, and would permanently break `--offline` with a "run restore"
+    // error that re-running restore can never actually fix.
+    let still_missing = missing_assets(&ctx.crate_dir)?;
+    if !still_missing.is_empty() {
+        let names = still_missing
+            .iter()
+            .map(|(id, version)| format!("{id} {version}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "restored NuGet assets for {names} but they still don't satisfy the recorded \
+             version in {} — the recorded version may not be NuGet's normalized form; re-run \
+             `cargo dotnet add-nuget` with the exact version NuGet reports for this package",
+            ctx.crate_dir.join(DEPS_MANIFEST_FILE).display()
+        );
+    }
+    Ok(())
+}
+
 /// spinacz's reflection core, embedded at COMPILE TIME of `cargo-dotnet` itself. Written out
 /// verbatim into the ephemeral bindgen crate at RUN time (see the module doc's "why not a
 /// normal dependency" note).

@@ -15,7 +15,7 @@ use anyhow::{Result, bail};
 use crate::cli::BuildArgs;
 use crate::context::Context;
 use crate::mode::Backend;
-use crate::{artifact, buildstd, overlays, run};
+use crate::{artifact, buildstd, nuget, overlays, run};
 
 /// Run `cargo dotnet test`.
 pub fn run(args: &BuildArgs) -> Result<i32> {
@@ -51,11 +51,24 @@ fn run_native_tests(ctx: &Context, libtest_args: &[String]) -> Result<i32> {
     let _build_lock = crate::build_lock::BuildLock::acquire_crate(ctx)?;
     let private_sysroot = crate::private_sysroot::prepare(ctx)?;
     overlays::apply(ctx)?;
+    if ctx.is_offline() {
+        crate::restore::verify(ctx, &private_sysroot)?;
+    }
+    // Re-stage any `add-nuget` runtime closure missing from a fresh clone before spending a
+    // full test build on a crate that would otherwise fail the harness run with
+    // `FileNotFoundException` — see `pipeline::run_native`'s identical call for the full doc.
+    nuget::ensure_staged(ctx)?;
     let json = buildstd::build_with_sysroot(ctx, &private_sysroot)?;
     let art = artifact::locate(&json, ctx)?;
     crate::receipt::write(ctx, &art, &private_sysroot)?;
     match art {
         artifact::Artifact::Executable(exe) => {
+            // The `#[test]` harness itself is an ordinary apphost — it needs the same staged
+            // NuGet runtime closure next to it as any other build/run artifact (see
+            // `pipeline::run_native`'s identical copy_assets call for the full doc).
+            if let Some(out_dir) = exe.parent() {
+                nuget::copy_assets(&ctx.crate_dir, out_dir)?;
+            }
             eprintln!("== running #[test] harness on .NET: {} ==", exe.display());
             // The located executable IS the libtest harness; forward the libtest args.
             run::run(&artifact::Artifact::Executable(exe), libtest_args, ctx)

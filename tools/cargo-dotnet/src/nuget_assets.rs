@@ -548,6 +548,49 @@ pub(super) fn copy_staged_assets(crate_dir: &Path, out_dir: &Path) -> Result<boo
     Ok(true)
 }
 
+/// Return the subset of `recorded` `(id, version)` pairs whose staged runtime closure is missing
+/// or incomplete — no `.cargo-dotnet-nuget-assets/manifest.json` at all, no entry for that id, an
+/// empty asset list, a manifest entry whose staged file(s) no longer exist on disk (e.g. a
+/// partial manual cleanup), or — critically — a staged root whose own package asset does not
+/// carry an `owner` of exactly `{id}/{version}` (case-insensitive). That last check is what
+/// catches VERSION DRIFT: `.cargo-dotnet-nuget-deps.json` is checked in and last-write-wins, so a
+/// teammate bumping a package's recorded version and you pulling their commit must NOT pass this
+/// check against your still-locally-staged OLD version's graph — that would silently build/pack
+/// against stale dlls (worse, against dlls the checked-in `src/nuget/*.rs` bindings may no longer
+/// match). This is also the fresh-clone detector: `.cargo-dotnet-nuget-assets/` is gitignored
+/// while the deps manifest is checked in, so a clean checkout has every id "missing" here even
+/// though `add-nuget` ran successfully at some point in the repo's history.
+pub(super) fn missing_recorded_roots(
+    crate_dir: &Path,
+    recorded: &[(String, String)],
+) -> Result<Vec<String>> {
+    let assets_dir = crate_dir.join(".cargo-dotnet-nuget-assets");
+    let manifest_path = assets_dir.join(STAGING_MANIFEST);
+    if !manifest_path.is_file() {
+        return Ok(recorded.iter().map(|(id, _)| id.clone()).collect());
+    }
+    let manifest = read_manifest(&manifest_path)?;
+    let mut missing = Vec::new();
+    for (id, version) in recorded {
+        let expected_owner = format!("{id}/{version}");
+        let complete = manifest.roots.get(id).is_some_and(|root| {
+            !root.assets.is_empty()
+                && root
+                    .assets
+                    .iter()
+                    .any(|asset| asset.owner.eq_ignore_ascii_case(&expected_owner))
+                && root
+                    .assets
+                    .iter()
+                    .all(|asset| assets_dir.join(&asset.staged_path).is_file())
+        });
+        if !complete {
+            missing.push(id.clone());
+        }
+    }
+    Ok(missing)
+}
+
 fn deployment_path(asset: &OwnedAssetRecord) -> Result<PathBuf> {
     match asset.kind {
         AssetKind::Runtime | AssetKind::Native => asset
@@ -1091,6 +1134,157 @@ mod tests {
             fs::read(output.join("fr/Example.Root.resources.dll")).unwrap(),
             b"resource"
         );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn missing_recorded_roots_flags_a_fresh_clone_with_no_assets_dir() {
+        let temp = unique_temp("missing-roots-fresh-clone");
+        let crate_dir = temp.join("consumer");
+        // Simulate the gitignored assets dir never having been materialized (fresh clone):
+        // no `.cargo-dotnet-nuget-assets/` at all, even though a deps manifest recorded it.
+        let missing = missing_recorded_roots(
+            &crate_dir,
+            &[("Example.Root".to_string(), "1.0.0".to_string())],
+        )
+        .unwrap();
+        assert_eq!(missing, vec!["Example.Root".to_string()]);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn missing_recorded_roots_accepts_a_complete_staged_graph() {
+        let temp = unique_temp("missing-roots-complete");
+        let crate_dir = temp.join("consumer");
+        let source = temp.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let dll = source.join("Example.Root.dll");
+        fs::write(&dll, b"root").unwrap();
+        stage_assets(
+            &crate_dir,
+            "Example.Root",
+            &[asset(
+                "Example.Root/1.0.0",
+                AssetKind::Runtime,
+                "lib/net8.0/Example.Root.dll",
+                dll,
+                None,
+            )],
+        )
+        .unwrap();
+        let missing = missing_recorded_roots(
+            &crate_dir,
+            &[("Example.Root".to_string(), "1.0.0".to_string())],
+        )
+        .unwrap();
+        assert!(missing.is_empty());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn missing_recorded_roots_flags_a_staged_graph_whose_version_no_longer_matches_what_was_recorded()
+     {
+        let temp = unique_temp("missing-roots-version-drift");
+        let crate_dir = temp.join("consumer");
+        let source = temp.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let dll = source.join("Example.Root.dll");
+        fs::write(&dll, b"root").unwrap();
+        // Staged (and gitignored) locally under 1.0.0, but a teammate's checked-in
+        // `.cargo-dotnet-nuget-deps.json` now records 2.0.0 (e.g. after a `git pull`).
+        stage_assets(
+            &crate_dir,
+            "Example.Root",
+            &[asset(
+                "Example.Root/1.0.0",
+                AssetKind::Runtime,
+                "lib/net8.0/Example.Root.dll",
+                dll,
+                None,
+            )],
+        )
+        .unwrap();
+        let missing = missing_recorded_roots(
+            &crate_dir,
+            &[("Example.Root".to_string(), "2.0.0".to_string())],
+        )
+        .unwrap();
+        assert_eq!(missing, vec!["Example.Root".to_string()]);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn missing_recorded_roots_flags_an_id_absent_from_a_manifest_covering_other_ids() {
+        let temp = unique_temp("missing-roots-partial-manifest");
+        let crate_dir = temp.join("consumer");
+        let source = temp.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let dll = source.join("Staged.Root.dll");
+        fs::write(&dll, b"root").unwrap();
+        stage_assets(
+            &crate_dir,
+            "Staged.Root",
+            &[asset(
+                "Staged.Root/1.0.0",
+                AssetKind::Runtime,
+                "lib/net8.0/Staged.Root.dll",
+                dll,
+                None,
+            )],
+        )
+        .unwrap();
+        // A second package was recorded (e.g. in `.cargo-dotnet-nuget-deps.json`) but never
+        // staged into this manifest — a partial manifest relative to what's recorded.
+        let missing = missing_recorded_roots(
+            &crate_dir,
+            &[
+                ("Staged.Root".to_string(), "1.0.0".to_string()),
+                ("Unstaged.Root".to_string(), "1.0.0".to_string()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(missing, vec!["Unstaged.Root".to_string()]);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn missing_recorded_roots_flags_a_manifest_entry_whose_staged_file_was_deleted() {
+        let temp = unique_temp("missing-roots-deleted-file");
+        let crate_dir = temp.join("consumer");
+        let source = temp.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let dll = source.join("Example.Root.dll");
+        fs::write(&dll, b"root").unwrap();
+        stage_assets(
+            &crate_dir,
+            "Example.Root",
+            &[asset(
+                "Example.Root/1.0.0",
+                AssetKind::Runtime,
+                "lib/net8.0/Example.Root.dll",
+                dll,
+                None,
+            )],
+        )
+        .unwrap();
+        // Manually delete the staged dll while leaving the manifest entry behind, mirroring an
+        // interrupted/partial cleanup rather than a clean `rm -rf .cargo-dotnet-nuget-assets/`.
+        let staged_dll = crate_dir
+            .join(".cargo-dotnet-nuget-assets/owned")
+            .read_dir()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join("lib/net8.0/Example.Root.dll");
+        fs::remove_file(&staged_dll).unwrap();
+        let missing = missing_recorded_roots(
+            &crate_dir,
+            &[("Example.Root".to_string(), "1.0.0".to_string())],
+        )
+        .unwrap();
+        assert_eq!(missing, vec!["Example.Root".to_string()]);
         fs::remove_dir_all(temp).unwrap();
     }
 
