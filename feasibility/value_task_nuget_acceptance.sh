@@ -22,7 +22,8 @@ trap cleanup EXIT
 
 mkdir -p "$package" "$feed" "$consumer/src" "$logs"
 
-cat > "$package/AsyncFixture.csproj" <<'EOF'
+# Unquoted delimiter: the csproj needs $dotnet_version expanded (everything else is literal XML).
+cat > "$package/AsyncFixture.csproj" <<EOF
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net${dotnet_version}.0</TargetFramework>
