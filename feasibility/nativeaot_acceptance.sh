@@ -43,7 +43,10 @@ command -v tar >/dev/null || fail "tar is required"
     fail "log directory is not empty: $logs"
 mkdir -p "$output" "$logs"
 mkdir -p "$source_root"
-git -C "$repo" archive HEAD cargo_tests/cd_interop/csharp cargo_tests/cd_interop/rustlib \
+# msbuild/ must ride along: when no installed home has RustDotnet.targets, the csproj's last
+# fallback import resolves repo-relative ($(MSBuildThisFileDirectory)../../../msbuild/...), i.e.
+# inside this staged tree.
+git -C "$repo" archive HEAD cargo_tests/cd_interop/csharp cargo_tests/cd_interop/rustlib msbuild \
     | tar -x -C "$source_root"
 cargo build --manifest-path "$repo/tools/cargo-dotnet/Cargo.toml" --release
 [[ -x "$driver" ]] || fail "cargo-dotnet release driver was not built"
