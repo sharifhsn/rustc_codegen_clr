@@ -17,7 +17,7 @@ Import the integration and declare the Rust crate; `dotnet build`/`dotnet run` A
 <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
         Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
 <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"
-        Condition="'$(CARGO_DOTNET_HOME)'=='' and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+        Condition="!Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets') and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
 <ItemGroup>
   <RustCrate Include="../path/to/rustlib" />
 </ItemGroup>
@@ -148,7 +148,7 @@ fallback:
   <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
           Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
   <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"
-          Condition="'$(CARGO_DOTNET_HOME)'=='' and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+          Condition="!Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets') and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
 
   <ItemGroup>
     <RustCrate Include="../rustlib" />

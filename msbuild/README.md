@@ -36,7 +36,7 @@ Both files are also copied into `$CARGO_DOTNET_HOME/msbuild/` (default `~/.cargo
   <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
           Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
   <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"
-          Condition="'$(CARGO_DOTNET_HOME)'=='' and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+          Condition="!Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets') and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
 
   <ItemGroup>
     <RustCrate Include="../path/to/rustlib" />
