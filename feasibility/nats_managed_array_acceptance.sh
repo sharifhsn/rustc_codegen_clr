@@ -38,6 +38,19 @@ rg -q 'fn get_data\(self\) -> mycorrhiza::intrinsics::RustcCLRInteropManagedArra
 rg -q 'self\.virt2::<"Publish"' "$bindings"
 [[ ! -d "$repo/cargo_tests/cd_nats/csharp_helper" ]]
 
+# `cargo_tests/cd_nats` consumes the same pinned NATS.Client version (see its checked-in
+# `.cargo-dotnet-nuget-deps.json`) but its own `.cargo-dotnet-nuget-assets/` is gitignored and
+# NEVER staged by cloning the repo — `add-nuget` above only stages the throwaway `$generated`
+# probe used to validate bindgen output. Without this, `nuget::copy_assets` is a documented
+# no-op (see tools/cargo-dotnet/src/nuget.rs) and the run loop below fails at runtime with
+# `FileNotFoundException: NATS.Client` on a fresh checkout. Reuse the graph already fetched for
+# `$generated` instead of a second network restore; both are pinned to the same version.
+nats_deps="$repo/cargo_tests/cd_nats/.cargo-dotnet-nuget-deps.json"
+[[ "$(rg -o '"NATS\.Client"\s*:\s*"[^"]+"' "$nats_deps")" == '"NATS.Client": "1.1.8"' ]]
+rm -rf "$repo/cargo_tests/cd_nats/.cargo-dotnet-nuget-assets"
+[[ -f "$generated/.cargo-dotnet-nuget-assets/manifest.json" ]]
+cp -R "$generated/.cargo-dotnet-nuget-assets" "$repo/cargo_tests/cd_nats/.cargo-dotnet-nuget-assets"
+
 nats_url="${NATS_URL:-}"
 if [[ -z "$nats_url" ]]; then
     command -v docker >/dev/null 2>&1 || {
