@@ -23,6 +23,20 @@ use super::class::FixedArrayLayout;
 pub type MissingMethodPatcher =
     FxHashMap<Interned<IString>, Box<dyn Fn(Interned<MethodRef>, &mut Assembly) -> MethodImpl>>;
 
+/// A native symbol declared by Rust through an `extern` block and its CLR P/Invoke contract.
+///
+/// These records deliberately use owned strings rather than assembly arena indices: they are
+/// crate-level linker metadata, survive artifact serialization, and are merged before missing
+/// methods are materialized into [`MethodDef`]s.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct NativeImport {
+    pub rust_symbol: String,
+    pub entry_point: String,
+    pub library: String,
+    pub call_conv: super::PInvokeCallConv,
+    pub preserve_errno: bool,
+}
+
 /// Maps rustc's private, mangled allocator entry points onto the canonical
 /// linker builtins. This is deliberately a closed allowlist over the complete
 /// demangled path: generic "last path segment" matching made unrelated Rust
@@ -164,6 +178,7 @@ pub struct Assembly {
     statics: BiMap<StaticFieldDesc>,
     method_defs: FxHashMap<MethodDefIdx, MethodDef>,
     sections: FxHashMap<String, Vec<u8>>,
+    native_imports: Vec<NativeImport>,
     /// A list of all buffers within this assembly.
     pub(crate) const_data: BiMap<Box<[u8]>>,
     /// Rust's semantic size for Rust-origin value types whose CLR storage layout may be larger.
@@ -352,6 +367,28 @@ impl Index<Interned<FieldDesc>> for Assembly {
     }
 }
 impl Assembly {
+    /// Records a crate-level native import, rejecting contradictory declarations for one symbol.
+    pub fn add_native_import(&mut self, import: NativeImport) {
+        if let Some(existing) = self
+            .native_imports
+            .iter()
+            .find(|existing| existing.rust_symbol == import.rust_symbol)
+        {
+            assert_eq!(
+                existing, &import,
+                "conflicting native import declarations for `{}`",
+                import.rust_symbol
+            );
+            return;
+        }
+        self.native_imports.push(import);
+    }
+
+    #[must_use]
+    pub fn native_imports(&self) -> &[NativeImport] {
+        &self.native_imports
+    }
+
     /// Returns a pointer to an immutable(!) byte buffer of a given type.
     pub fn bytebuffer(
         &mut self,
@@ -1093,7 +1130,7 @@ impl Assembly {
                 locals: vec![],
             };
             let cctor_def = MethodDef::new(
-                Access::Extern,
+                Access::InternalExtern,
                 main_module,
                 user_init,
                 ctor_sig,
@@ -1129,7 +1166,7 @@ impl Assembly {
                 locals: vec![],
             };
             let cctor_def = MethodDef::new(
-                Access::Extern,
+                Access::InternalExtern,
                 main_module,
                 user_init,
                 ctor_sig,
@@ -1658,6 +1695,41 @@ impl Assembly {
                 continue;
             }
 
+            // Prefer the exact crate-level FFI declaration captured from rustc. The linker's
+            // historical hardcoded extern map remains below for compiler/runtime shims that do
+            // not originate in a user `extern` block.
+            if let Some(import) = self
+                .native_imports
+                .iter()
+                .find(|import| import.rust_symbol == emitted_name)
+                .cloned()
+            {
+                let lib = self.alloc_string(import.library);
+                let entry_point = self.alloc_string(import.entry_point);
+                let arg_names = (0..self[mref.sig()].inputs().len()).map(|_| None).collect();
+                let method_def = MethodDef::new(
+                    Access::Public,
+                    ClassDefIdx(mref.class()),
+                    mref.name(),
+                    mref.sig(),
+                    mref.kind(),
+                    MethodImpl::Extern {
+                        lib,
+                        entry_point: Some(entry_point),
+                        call_conv: import.call_conv,
+                        preserve_errno: import.preserve_errno,
+                    },
+                    arg_names,
+                );
+                assert!(
+                    self.class_defs.contains_key(&ClassDefIdx(mref.class())),
+                    "Can't yet handle missing types."
+                );
+                self.new_method(method_def);
+                stats.externs_synthesized += 1;
+                continue;
+            }
+
             // Check if this method is in the extern list
             if let Some(lib) = externs.get(&mref.name()) {
                 let arg_names = (0..(self[mref.sig()].inputs().len()))
@@ -1671,6 +1743,8 @@ impl Assembly {
                     mref.kind(),
                     MethodImpl::Extern {
                         lib: *lib,
+                        entry_point: None,
+                        call_conv: super::PInvokeCallConv::Cdecl,
                         preserve_errno: preserve_errno.contains(&mref.name()),
                     },
                     arg_names,
@@ -1807,6 +1881,7 @@ impl Assembly {
             statics: _,
             method_defs: _,
             sections: _,
+            native_imports: _,
             const_data: _,
             // Codegen-only; every semantic size has already become a CIL constant before an
             // assembly reaches relocation, linking, or serialization.
@@ -1822,9 +1897,11 @@ impl Assembly {
     pub fn compact(mut self) -> (Self, CompactionStats) {
         let before = self.arena_counts();
         let sections = std::mem::take(&mut self.sections);
+        let native_imports = std::mem::take(&mut self.native_imports);
         let (mut compacted, relocation) =
             super::asm_link::relocate_assembly(Self::default(), &self);
         compacted.sections = sections;
+        compacted.native_imports = native_imports;
         let after = compacted.arena_counts();
         (
             compacted,
@@ -1836,6 +1913,31 @@ impl Assembly {
         )
     }
 
+    /// Hides linker/runtime implementation methods that happen to live on the synthetic
+    /// `MainModule` type from external managed consumers.
+    ///
+    /// `Access::Extern` is the explicit exported API and remains public. Historically, internal
+    /// helpers synthesized by cilly and linked Rust dependencies used `Access::Public` so other
+    /// generated types could call them. CLR `assembly` visibility provides that same capability
+    /// without publishing the entire implementation through reflection and IntelliSense.
+    pub fn hide_main_module_implementation_details(&mut self) -> usize {
+        let main_module_classes: FxHashSet<_> = self
+            .class_defs
+            .iter()
+            .filter_map(|(class, definition)| {
+                (&self[definition.name()] == MAIN_MODULE).then_some(*class)
+            })
+            .collect();
+        let mut hidden = 0;
+        for method in self.method_defs.values_mut() {
+            if main_module_classes.contains(&method.class()) && *method.access() == Access::Public {
+                method.set_access(Access::Assembly);
+                hidden += 1;
+            }
+        }
+        hidden
+    }
+
     /// Project the internal `MainModule` sentinel to a configured public CLR type name.
     ///
     /// Kept separate from ordinary codegen so legacy artifact decoding and existing consumers keep
@@ -1844,12 +1946,14 @@ impl Assembly {
     pub fn project_main_module(self, public_type_name: &str) -> Self {
         let mut source = self;
         let sections = std::mem::take(&mut source.sections);
+        let native_imports = std::mem::take(&mut source.native_imports);
         let (mut projected, _) = super::asm_link::relocate_assembly_with_main_module_name(
             Self::default(),
             &source,
             public_type_name,
         );
         projected.sections = sections;
+        projected.native_imports = native_imports;
         projected
     }
 
@@ -1862,6 +1966,9 @@ impl Assembly {
     pub fn link_with_stats(self, other: Self) -> (Self, super::asm_link::RelocationStats) {
         let (mut linked, stats) = super::asm_link::relocate_assembly(self, &other);
         linked.sections.extend(other.sections);
+        for import in other.native_imports {
+            linked.add_native_import(import);
+        }
         (linked, stats)
     }
 
@@ -1954,6 +2061,7 @@ impl Assembly {
                 | CILNode::LdLen(_)
                 | CILNode::LocAllocAlgined { .. }
                 | CILNode::LdElelemRef { .. }
+                | CILNode::LdElem { .. }
                 | CILNode::NewArr { .. }
                 | CILNode::Box { .. }
                 | CILNode::UnboxAny { .. } => None,
@@ -2027,12 +2135,16 @@ impl Assembly {
                     if 0 != rem {
                         *def.implementation_mut() = MethodImpl::Extern {
                             lib: lib_name,
+                            entry_point: None,
+                            call_conv: super::PInvokeCallConv::Cdecl,
                             preserve_errno: false,
                         }
                     }
                 } else if idx.as_bimap_index().get() / div + 1 != rem {
                     *def.implementation_mut() = MethodImpl::Extern {
                         lib: lib_name,
+                        entry_point: None,
+                        call_conv: super::PInvokeCallConv::Cdecl,
                         preserve_errno: false,
                     }
                 }
@@ -2055,6 +2167,8 @@ impl Assembly {
         empty.method_defs.iter_mut().for_each(|(_, def)| {
             *def.implementation_mut() = MethodImpl::Extern {
                 lib: lib_name,
+                entry_point: None,
+                call_conv: super::PInvokeCallConv::Cdecl,
                 preserve_errno: false,
             }
         });
@@ -2641,6 +2755,19 @@ impl Assembly {
         let array = array.into_idx(self);
         let index = index.into_idx(self);
         self.alloc_node(CILNode::LdElelemRef { array, index })
+    }
+
+    /// Loads a typed value from a one-dimensional managed array.
+    pub fn ld_elem(
+        &mut self,
+        array: impl IntoAsmIndex<Interned<CILNode>>,
+        index: impl IntoAsmIndex<Interned<CILNode>>,
+        elem: impl IntoAsmIndex<Interned<Type>>,
+    ) -> Interned<CILNode> {
+        let array = array.into_idx(self);
+        let index = index.into_idx(self);
+        let elem = elem.into_idx(self);
+        self.alloc_node(CILNode::LdElem { array, index, elem })
     }
 
     /// Allocates a new 1-D managed (platform) array of `elem` with `len` elements (`newarr`).
@@ -3352,6 +3479,39 @@ fn final_export_verification_accepts_clean_assembly() {
 }
 
 #[test]
+fn main_module_visibility_keeps_only_explicit_exports_public() {
+    let mut asm = Assembly::default();
+    let main = asm.main_module();
+    let sig = asm.sig([], Type::Void);
+    for (name, access) in [
+        ("linked_helper", Access::Public),
+        ("ordinary_rust", Access::Assembly),
+        ("managed_export", Access::Extern),
+    ] {
+        let name = asm.alloc_string(name);
+        asm.new_method(MethodDef::new(
+            access,
+            main,
+            name,
+            sig,
+            MethodKind::Static,
+            MethodImpl::Missing,
+            vec![],
+        ));
+    }
+
+    assert_eq!(asm.hide_main_module_implementation_details(), 1);
+    let access_by_name: FxHashMap<_, _> = asm
+        .method_defs()
+        .values()
+        .map(|method| (asm[method.name()].to_string(), *method.access()))
+        .collect();
+    assert_eq!(access_by_name["linked_helper"], Access::Assembly);
+    assert_eq!(access_by_name["ordinary_rust"], Access::Assembly);
+    assert_eq!(access_by_name["managed_export"], Access::Extern);
+}
+
+#[test]
 fn optimizer_method_schedule_uses_semantic_order() {
     let mut asm = Assembly::default();
     let main = asm.main_module();
@@ -3658,6 +3818,43 @@ fn missing_method_resolution_only_aliases_allowlisted_rustc_runtime_symbols() {
 }
 
 #[test]
+fn declared_native_import_beats_the_legacy_extern_map_and_preserves_metadata() {
+    let mut asm = Assembly::default();
+    let imported = Interned::<MethodRef>::builtin(&mut asm, "rust_name", &[], Type::Void);
+    asm.add_native_import(NativeImport {
+        rust_symbol: "rust_name".into(),
+        entry_point: "native_name".into(),
+        library: "example-native".into(),
+        call_conv: super::PInvokeCallConv::Stdcall,
+        preserve_errno: true,
+    });
+    let mut externs = FxHashMap::default();
+    externs.insert("rust_name", "wrong-library".to_owned());
+
+    let stats = asm.resolve_missing_methods(
+        &externs,
+        &FxHashSet::default(),
+        &MissingMethodPatcher::default(),
+    );
+
+    assert_eq!(stats.externs_synthesized, 1);
+    let implementation = asm[asm.method_ref_to_def(imported).unwrap()].implementation();
+    let MethodImpl::Extern {
+        lib,
+        entry_point,
+        call_conv,
+        preserve_errno,
+    } = implementation
+    else {
+        panic!("declared native import did not become a P/Invoke method")
+    };
+    assert_eq!(&asm[*lib], "example-native");
+    assert_eq!(&asm[entry_point.unwrap()], "native_name");
+    assert_eq!(*call_conv, super::PInvokeCallConv::Stdcall);
+    assert!(*preserve_errno);
+}
+
+#[test]
 fn call_alias_adapter_explicitly_converts_pointer_and_native_int_boundaries() {
     let mut asm = Assembly::default();
     let void_ptr = asm.nptr(Type::Void);
@@ -3789,6 +3986,8 @@ fn export() {
         MethodKind::Static,
         MethodImpl::Extern {
             lib,
+            entry_point: None,
+            call_conv: super::PInvokeCallConv::Cdecl,
             preserve_errno: false,
         },
         vec![None],
@@ -3849,6 +4048,8 @@ fn export2() {
         MethodKind::Static,
         MethodImpl::Extern {
             lib,
+            entry_point: None,
+            call_conv: super::PInvokeCallConv::Cdecl,
             preserve_errno: false,
         },
         vec![None],
@@ -4060,6 +4261,8 @@ fn link() {
             MethodKind::Static,
             MethodImpl::Extern {
                 lib,
+                entry_point: None,
+                call_conv: super::PInvokeCallConv::Cdecl,
                 preserve_errno: false,
             },
             vec![None],

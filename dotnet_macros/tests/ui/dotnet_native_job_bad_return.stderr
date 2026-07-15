@@ -1,0 +1,5 @@
+error: #[dotnet_native_job]: the start adapter must return Result<Registration, StartError>
+  --> tests/ui/dotnet_native_job_bad_return.rs:15:61
+   |
+15 | fn start(controller: NativeJobController<i32, i32, i32>) -> Registration {
+   |                                                             ^^^^^^^^^^^^

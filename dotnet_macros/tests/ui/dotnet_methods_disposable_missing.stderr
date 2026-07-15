@@ -1,0 +1,9 @@
+error: #[dotnet_methods(disposable)]: missing `fn dispose(this: <Class>Handle)` method
+  --> tests/ui/dotnet_methods_disposable_missing.rs:6:1
+   |
+ 6 | / impl Resource {
+ 7 | |     pub fn status() -> i32 {
+ 8 | |         1
+ 9 | |     }
+10 | | }
+   | |_^

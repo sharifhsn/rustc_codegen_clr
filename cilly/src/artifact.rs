@@ -8,8 +8,12 @@ use crate::Assembly;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Prefix identifying the current, schema-v5 `cilly` assembly artifact before payload decoding.
-pub const ASSEMBLY_ARTIFACT_MAGIC: &[u8; 8] = b"CILLYAR5";
+/// Prefix identifying the current, schema-v7 `cilly` assembly artifact before payload decoding.
+pub const ASSEMBLY_ARTIFACT_MAGIC: &[u8; 8] = b"CILLYAR7";
+/// Magic emitted by schema-v6 artifacts, before rooted internal-linkage visibility was represented.
+const ASSEMBLY_ARTIFACT_V6_MAGIC: &[u8; 8] = b"CILLYAR6";
+/// Magic emitted by schema-v5 artifacts, before native-import metadata and rich P/Invoke methods.
+const ASSEMBLY_ARTIFACT_V5_MAGIC: &[u8; 8] = b"CILLYAR5";
 /// Magic emitted by schema-v4 artifacts, before genuine CLR enum metadata.
 const ASSEMBLY_ARTIFACT_V4_MAGIC: &[u8; 8] = b"CILLYAR4";
 /// Magic emitted by schema-v3 artifacts, before fixed-array layout provenance.
@@ -19,7 +23,7 @@ const ASSEMBLY_ARTIFACT_V2_MAGIC: &[u8; 8] = b"CILLYAR2";
 /// Magic emitted by schema-v1 artifacts, whose `BiMap` payload duplicated value storage.
 const ASSEMBLY_ARTIFACT_V1_MAGIC: &[u8; 8] = b"CILLYART";
 /// Current serialization-envelope version.
-pub const ASSEMBLY_ARTIFACT_VERSION: u16 = 5;
+pub const ASSEMBLY_ARTIFACT_VERSION: u16 = 7;
 
 /// Final output target selected by a backend or linker process.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -477,6 +481,18 @@ pub fn decode_assembly_artifact(
             supported: ASSEMBLY_ARTIFACT_VERSION,
         });
     }
+    if encoded.starts_with(ASSEMBLY_ARTIFACT_V5_MAGIC) {
+        return Err(ArtifactDecodeError::UnsupportedVersion {
+            found: 5,
+            supported: ASSEMBLY_ARTIFACT_VERSION,
+        });
+    }
+    if encoded.starts_with(ASSEMBLY_ARTIFACT_V6_MAGIC) {
+        return Err(ArtifactDecodeError::UnsupportedVersion {
+            found: 6,
+            supported: ASSEMBLY_ARTIFACT_VERSION,
+        });
+    }
     if let Some(payload) = encoded.strip_prefix(ASSEMBLY_ARTIFACT_MAGIC) {
         let artifact: AssemblyArtifact =
             postcard::from_bytes(payload).map_err(ArtifactDecodeError::InvalidVersionedEnvelope)?;
@@ -718,8 +734,8 @@ mod tests {
         assert!(matches!(
             error,
             ArtifactDecodeError::UnsupportedVersion {
-                found: 6,
-                supported: 5
+                found: 8,
+                supported: ASSEMBLY_ARTIFACT_VERSION
             }
         ));
     }
@@ -734,7 +750,7 @@ mod tests {
             error,
             ArtifactDecodeError::UnsupportedVersion {
                 found: 1,
-                supported: 5
+                supported: ASSEMBLY_ARTIFACT_VERSION
             }
         ));
         assert!(error.to_string().contains("Rebuild all input crates"));
@@ -750,7 +766,7 @@ mod tests {
             error,
             ArtifactDecodeError::UnsupportedVersion {
                 found: 2,
-                supported: 5
+                supported: ASSEMBLY_ARTIFACT_VERSION
             }
         ));
         assert!(error.to_string().contains("Rebuild all input crates"));
@@ -766,7 +782,7 @@ mod tests {
             error,
             ArtifactDecodeError::UnsupportedVersion {
                 found: 3,
-                supported: 5
+                supported: ASSEMBLY_ARTIFACT_VERSION
             }
         ));
         assert!(error.to_string().contains("Rebuild all input crates"));
@@ -782,7 +798,39 @@ mod tests {
             error,
             ArtifactDecodeError::UnsupportedVersion {
                 found: 4,
-                supported: 5
+                supported: ASSEMBLY_ARTIFACT_VERSION
+            }
+        ));
+        assert!(error.to_string().contains("Rebuild all input crates"));
+    }
+
+    #[test]
+    fn v5_header_is_rejected_before_deserializing_pre_pinvoke_metadata() {
+        let mut encoded = ASSEMBLY_ARTIFACT_V5_MAGIC.to_vec();
+        encoded.extend_from_slice(b"payload shape intentionally irrelevant");
+
+        let error = decode_assembly_artifact(&encoded).err().unwrap();
+        assert!(matches!(
+            error,
+            ArtifactDecodeError::UnsupportedVersion {
+                found: 5,
+                supported: ASSEMBLY_ARTIFACT_VERSION
+            }
+        ));
+        assert!(error.to_string().contains("Rebuild all input crates"));
+    }
+
+    #[test]
+    fn v6_header_is_rejected_before_deserializing_pre_internal_extern_visibility() {
+        let mut encoded = ASSEMBLY_ARTIFACT_V6_MAGIC.to_vec();
+        encoded.extend_from_slice(b"payload shape intentionally irrelevant");
+
+        let error = decode_assembly_artifact(&encoded).err().unwrap();
+        assert!(matches!(
+            error,
+            ArtifactDecodeError::UnsupportedVersion {
+                found: 6,
+                supported: ASSEMBLY_ARTIFACT_VERSION
             }
         ));
         assert!(error.to_string().contains("Rebuild all input crates"));

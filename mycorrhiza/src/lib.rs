@@ -92,6 +92,7 @@ pub use bindings::*;
 /// (`DateTime`, `TimeSpan`, `Guid`, `Uri`, `Regex`, `Random`, `Stopwatch`, `StringBuilder`,
 /// `Environment`, `Math`) — used like normal Rust types, no CLR-interop knowledge at the call site.
 pub mod bcl;
+pub mod cancellation;
 pub mod class;
 /// Ready-to-use, idiomatic wrappers over the common .NET generic collections (`List<T>`,
 /// `Dictionary<K, V>`, `HashSet<T>`, `Stack<T>`, `Queue<T>`) — backed by real managed objects, used
@@ -108,6 +109,9 @@ pub mod containers;
 /// [`intrinsics::rustc_clr_interop_delegate`] magic fn + the WF-9 generic bridge; no CLR-interop
 /// knowledge required at the call site.
 pub mod delegate;
+/// Host-neutral, lifetime-safe dispatch of Rust closures onto WinUI, MAUI, Unity, or custom UI
+/// threads through a small managed adapter contract.
+pub mod dispatch;
 /// Raw dynamic (late-bound) reflection invoke -- call a `.NET` method whose
 /// `(assembly, type, method, args)` isn't known until runtime, via `System.Reflection`. See
 /// [`dynamic::invoke_dynamic1`] / [`dynamic::invoke_dynamic1_checked`] (and their 0/2/3/4-arity
@@ -132,6 +136,8 @@ pub mod generic_bridge;
 pub mod intrinsics;
 /// Building `System.Linq.Expressions` trees (the shape EF Core / `IQueryable` consumes). See [`linq`].
 pub mod linq;
+/// Nullable managed references rooted without placing GC references in Rust enum storage.
+pub mod managed_option;
 /// GC-owned `System.Memory<T>` / `ReadOnlyMemory<T>` buffers that can outlive a Rust borrow.
 pub mod memory;
 /// `System.Nullable<T>` ↔ Rust `Option<T>` bridge (a generic value type). See [`nullable::NullableExt`].
@@ -139,6 +145,7 @@ pub mod nullable;
 /// One-glance import surface — `use mycorrhiza::prelude::*;` pulls in the collections, the managed
 /// `DotNetString`, and the generic-bridge macros so interop code reads like `std`.
 pub mod prelude;
+pub mod progress;
 /// `System.Span<T>` / `ReadOnlySpan<T>` — zero-copy views over a Rust slice. See [`span::Span`].
 pub mod span;
 /// Cross-thread / cross-language synchronization primitives — `Semaphore`, `Signal`

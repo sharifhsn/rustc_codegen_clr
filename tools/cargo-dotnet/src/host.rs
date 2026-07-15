@@ -7,68 +7,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-
-/// Host facts derived from the build target of this very binary (`std::env::consts`),
-/// which on this tooling crate equals the host. `dylib_ext` is the codegen backend
-/// cdylib extension; `exe_ext` the apphost suffix; `host_rid` the .NET runtime id for
-/// the CoreCLR ILAsm NuGet package.
-pub struct HostFacts {
-    pub os: &'static str,
-    pub dylib_ext: &'static str,
-    pub exe_ext: &'static str,
-    /// The .NET runtime id for the CoreCLR ILAsm NuGet package. Used by a native
-    /// `setup` port (currently staged to the bash core); kept on HostFacts so the
-    /// host-detection logic stays in one place.
-    pub host_rid: &'static str,
-}
-
-impl HostFacts {
-    pub fn detect() -> Self {
-        let (dylib_ext, exe_ext) = match env::consts::OS {
-            "macos" => ("dylib", ""),
-            "windows" => ("dll", ".exe"),
-            _ => ("so", ""),
-        };
-        let host_rid = match (env::consts::OS, env::consts::ARCH) {
-            ("macos", "aarch64") => "osx-arm64",
-            ("macos", _) => "osx-x64",
-            ("windows", _) => "win-x64",
-            (_, "aarch64") => "linux-arm64",
-            _ => "linux-x64",
-        };
-        HostFacts {
-            os: env::consts::OS,
-            dylib_ext,
-            exe_ext,
-            host_rid,
-        }
-    }
-
-    #[cfg(test)]
-    pub fn for_test(os: &'static str) -> Self {
-        let (dylib_ext, exe_ext) = match os {
-            "macos" => ("dylib", ""),
-            "windows" => ("dll", ".exe"),
-            _ => ("so", ""),
-        };
-        HostFacts {
-            os,
-            dylib_ext,
-            exe_ext,
-            host_rid: "test-x64",
-        }
-    }
-
-    /// Filename Cargo gives the host codegen-backend dynamic library.
-    #[must_use]
-    pub fn backend_dylib_name(&self) -> String {
-        if self.os == "windows" {
-            format!("rustc_codegen_clr.{}", self.dylib_ext)
-        } else {
-            format!("librustc_codegen_clr.{}", self.dylib_ext)
-        }
-    }
-}
+pub use rust_dotnet_sdk_core::host::HostFacts;
 
 pub fn ensure_supported(facts: &HostFacts) -> Result<()> {
     match facts.os {
@@ -105,24 +44,44 @@ fn on_path(cmd: &str) -> bool {
     false
 }
 
-/// Returns the `(PATH, DOTNET_ROOT)` env additions needed to reach `dotnet` if it is
-/// not already on PATH but `$HOME/.dotnet/dotnet` exists (the documented self-heal in
-/// `ensure_dotnet_on_path`). The caller applies these to the child env.
-pub fn dotnet_env_adds() -> Option<(PathBuf, PathBuf)> {
-    if on_path("dotnet") {
+/// Prefer the user-local .NET installation when the `dotnet` found on PATH cannot run the
+/// requested major runtime but `$HOME/.dotnet` can. This handles common side-by-side setups such
+/// as Homebrew .NET 8 on PATH plus the project-required .NET 10 installed by `dotnet-install`.
+pub fn dotnet_env_adds_for(runtime_major: &str) -> Option<(PathBuf, PathBuf)> {
+    let runtime_marker = format!("Microsoft.NETCore.App {runtime_major}.");
+    if on_path("dotnet")
+        && Command::new("dotnet")
+            .arg("--list-runtimes")
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(&runtime_marker)
+            })
+    {
         return None;
     }
     let home = home_dir()?;
-    let dotnet = home.join(".dotnet/dotnet");
-    if dotnet.is_file() {
-        Some((home.join(".dotnet"), home.join(".dotnet")))
-    } else {
-        None
-    }
+    let root = home.join(".dotnet");
+    let shared = root.join("shared/Microsoft.NETCore.App");
+    let has_runtime = std::fs::read_dir(shared).ok()?.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|version| version.starts_with(&format!("{runtime_major}.")))
+    });
+    (root
+        .join(if cfg!(windows) {
+            "dotnet.exe"
+        } else {
+            "dotnet"
+        })
+        .is_file()
+        && has_runtime)
+        .then(|| (root.clone(), root))
 }
 
 /// Require `dotnet` to be reachable (after the self-heal), else a helpful error.
-/// `heal` is the result of [`dotnet_env_adds`] — `Some` means a self-heal path
+/// `heal` is the result of [`dotnet_env_adds_for`] — `Some` means a self-heal path
 /// was found, so dotnet is reachable.
 pub fn ensure_dotnet(heal: &Option<(PathBuf, PathBuf)>) -> Result<()> {
     if on_path("dotnet") || heal.is_some() {

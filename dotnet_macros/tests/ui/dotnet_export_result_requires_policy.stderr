@@ -1,4 +1,4 @@
-error: #[dotnet_export]: `Result<T, E>` cannot cross the managed seam; opt in to mapping `Err(E)` to a C# exception with `#[dotnet_export(error = "exception")]`
+error: #[dotnet_export]: `Result<T, E>` cannot cross the managed seam; use `error = "exception"` for Display-only errors or `error = "managed"` for ManagedError diagnostics
  --> tests/ui/dotnet_export_result_requires_policy.rs:4:22
   |
 4 | pub fn fallible() -> Result<i32, &'static str> {

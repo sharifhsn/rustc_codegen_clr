@@ -1,0 +1,5 @@
+error: #[dotnet_class]: `constructor_visibility` must be "public", "assembly", or "private"
+ --> tests/ui/dotnet_class_bad_constructor_visibility.rs:3:41
+  |
+3 | #[dotnet_class(constructor_visibility = "protected")]
+  |                                         ^^^^^^^^^^^

@@ -12,6 +12,8 @@ package-id = "Collision.Beta"
 assembly-name = "collision_beta"
 root-namespace = "Collision.Beta"
 module-type = "Exports"
+public-namespaces = ["Collision.Beta"]
+compatibility-profile = "net10-coreclr"
 legacy-main-module = false
 
 [dependencies]

@@ -112,6 +112,11 @@ impl Iterator for CILIter<'_> {
                     | CILNode::LdElelemRef {
                         array: lhs,
                         index: rhs,
+                    }
+                    | CILNode::LdElem {
+                        array: lhs,
+                        index: rhs,
+                        ..
                     },
                 ) => match idx {
                     1 => {
@@ -538,6 +543,7 @@ impl<'this, T: Iterator<Item = CILIterElem> + 'this> TpeIter<'this> for T {
                     | CILNode::UnboxAny { tpe, .. }
                     | CILNode::Box { tpe, .. }
                     | CILNode::NewArr { elem: tpe, .. }
+                    | CILNode::LdElem { elem: tpe, .. }
                     | CILNode::LocAllocAlgined { tpe, .. } => {
                         Some(Box::new(std::iter::once(asm[tpe])))
                     }

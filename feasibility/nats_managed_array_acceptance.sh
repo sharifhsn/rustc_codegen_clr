@@ -4,7 +4,7 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-driver="$repo/tools/cargo-dotnet/target/release/cargo-dotnet"
+driver="$repo/target/release/cargo-dotnet"
 dotnet_version="${DOTNET_VERSION:-10}"
 work="${RCL_NATS_WORK_DIR:-$(mktemp -d)}"
 logs="${RCL_NATS_LOG_DIR:-$work/logs}"

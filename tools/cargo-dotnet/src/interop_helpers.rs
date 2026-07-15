@@ -80,8 +80,12 @@ pub(crate) fn restore_if_needed(ctx: &Context) -> Result<()> {
         return Ok(());
     }
     let _helper_lock = crate::build_lock::BuildLock::acquire_scope("interop-helpers")?;
+    let cache = helper_cache(ctx);
     let mut cmd = Command::new("dotnet");
-    cmd.arg("restore").arg(root).arg("--nologo");
+    cmd.arg("restore").arg(root).arg("--nologo").arg(format!(
+        "-p:BaseIntermediateOutputPath={}/",
+        cache.join("obj").display()
+    ));
     if ctx.is_offline() {
         cmd.arg("--ignore-failed-sources");
     }
@@ -114,6 +118,7 @@ fn build(root: &Path, ctx: &Context) -> Result<PathBuf> {
     // The bundled project has one shared obj/bin tree even when several consumer crates build in
     // parallel. Only this quick incremental helper build needs serialization.
     let _helper_lock = crate::build_lock::BuildLock::acquire_scope("interop-helpers")?;
+    let cache = helper_cache(ctx);
     let mut cmd = Command::new("dotnet");
     cmd.arg("build")
         .arg(root)
@@ -124,6 +129,14 @@ fn build(root: &Path, ctx: &Context) -> Result<PathBuf> {
         .arg("-p:ContinuousIntegrationBuild=true")
         .arg("-p:DebugType=None")
         .arg("-p:DebugSymbols=false")
+        .arg(format!(
+            "-p:BaseOutputPath={}/",
+            cache.join("bin").display()
+        ))
+        .arg(format!(
+            "-p:BaseIntermediateOutputPath={}/",
+            cache.join("obj").display()
+        ))
         .arg(format!(
             "-p:PathMap={}={}",
             root.display(),
@@ -141,7 +154,7 @@ fn build(root: &Path, ctx: &Context) -> Result<PathBuf> {
     if !status.success() {
         bail!("`dotnet build -c Release` failed for {}", root.display());
     }
-    let dll = root.join("bin/Release/net8.0").join(HELPER_DLL_NAME);
+    let dll = cache.join("bin/Release/net8.0").join(HELPER_DLL_NAME);
     if !dll.is_file() {
         bail!(
             "expected {} to exist after building {} — check the project's <AssemblyName>/TFM",
@@ -150,4 +163,8 @@ fn build(root: &Path, ctx: &Context) -> Result<PathBuf> {
         );
     }
     Ok(dll)
+}
+
+fn helper_cache(ctx: &Context) -> PathBuf {
+    ctx.paths.cargo_home.join("dotnet/interop-helpers")
 }

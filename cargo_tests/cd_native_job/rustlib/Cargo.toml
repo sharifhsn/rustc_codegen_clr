@@ -1,0 +1,19 @@
+[package]
+name = "cd_native_job"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dotnet_macros = { path = "../../../dotnet_macros" }
+mycorrhiza = { path = "../../../mycorrhiza" }
+pinvoke_async_callback = { path = "../../pinvoke_async_callback" }
+rust-dotnet-pinvoke = { path = "../../../crates/rust-dotnet-pinvoke" }
+
+[workspace]
+
+[profile.release.build-override]
+codegen-units = 1

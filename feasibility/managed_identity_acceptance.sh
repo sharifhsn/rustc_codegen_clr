@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 project="$repo/cargo_tests/cd_multi_library_collision/consumer/Consumer.csproj"
-driver="$repo/tools/cargo-dotnet/target/release/cargo-dotnet"
+driver="$repo/target/release/cargo-dotnet"
 log_dir="${RCL_MANAGED_IDENTITY_LOG_DIR:-/tmp/rustc_codegen_clr-managed-identity}"
 dotnet_version="${DOTNET_VERSION:-10}"
 tfm="net${dotnet_version}.0"
@@ -60,6 +60,10 @@ custom_dll="$repo/cargo_tests/cd_multi_library_collision/invalid_custom_assembly
 custom_receipt="$custom_dll.rustdotnet.receipt.json"
 [[ -f "$custom_dll" && -f "$custom_receipt" ]]
 jq -e '.managed_identity.assembly_name == "Different.Assembly"' "$custom_receipt" >/dev/null
+jq -e '.managed_identity.public_namespaces == ["Collision.InvalidCustomAssembly"]' \
+    "$custom_receipt" >/dev/null
+jq -e '.managed_identity.compatibility_profile == "net10-coreclr"' \
+    "$custom_receipt" >/dev/null
 
 pack_dir="$log_dir/custom-pack"
 rm -rf "$pack_dir"

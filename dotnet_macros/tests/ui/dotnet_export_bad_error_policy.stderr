@@ -1,4 +1,4 @@
-error: #[dotnet_export]: unsupported error policy; expected `error = "exception"`
+error: #[dotnet_export]: unsupported error policy; expected `error = "exception"` or `error = "managed"`
  --> tests/ui/dotnet_export_bad_error_policy.rs:3:25
   |
 3 | #[dotnet_export(error = "result")]

@@ -32,6 +32,8 @@ that was compiled with the backend and executed on real .NET (`CARGO_DOTNET_BACK
 | `cargo_tests/cd_delegates` | .NET-from-Rust | **14/14** |
 | `cargo_tests/cd_async` | .NET-from-Rust | **9/9** |
 | `cargo_tests/cd_async_stream` | .NET-from-Rust (`IAsyncEnumerable<T>` consumer) | **PASS** (debug + release matrix) |
+| `cargo_tests/cd_typed_dto` | C#-from-Rust (typed DTO/value/array/list/memory projections) | **PASS** (.NET 10 consumer) |
+| `cargo_tests/cd_async_export` | C#-from-Rust (`Task<T>`, cancellation/progress, rooted memory) | **PASS** (.NET 10 consumer) |
 | `cargo_tests/cd_nats` | generated NuGet bindings (`byte[]`, interface calls, real NATS) | **PASS** (debug + release focused acceptance) |
 | `cargo_tests/cd_linq_expr` | .NET-from-Rust (LINQ/EF expression trees) | **89/89** |
 | `cargo_tests/cd_generic` | .NET-from-Rust (low-level bridge) | **18/18** |
@@ -41,6 +43,7 @@ that was compiled with the backend and executed on real .NET (`CARGO_DOTNET_BACK
 | `cargo_tests/cd_containers` | Rust-from-C# (`RustVec` only) | **13/13** |
 | `cargo_tests/cd_interop` | Rust-from-C# | **PASS** |
 | `cargo_tests/cd_interop_tier2` | Rust-from-C# | **PASS** |
+| `cargo_tests/cd_typed_dto` | Rust-from-C# (DTO/record/value type and product BCL identities) | **PASS** |
 
 > **Numbers drift.** These are live per-crate `chk!` pass/total counts re-run against current `HEAD`
 > (2026-07-06) — expect them to keep growing as breadth work lands; treat "N/N" as "still all green",
@@ -100,9 +103,10 @@ anything unsurfaced.
 |---|---|---|---|---|
 | `System.String` (as `DotNetString` / `MString`) | ✅ | `from(&str)`, `to_rust_string`, `len_utf16`, `is_empty`, `contains`/`starts_with`/`ends_with`/`index_of`, `to_upper`/`to_lower`/`trim`/`substring`/`replace`/`concat`, `empty` | `Display`/`Debug`, `Eq`/`Ord` (ordinal), `Hash` (managed content hash), `From<&str>`/`From<&String>`, `FromStr`, `Default`, `Add`/`AddAssign` (concat), `PartialEq<&str>` | `MString` is the raw handle; `DotNetString` is the newtype carrying the traits. |
 | `char` (`DotNetChar`) | ✅ | `as_u16` + used across the `String` surface | — | Single UTF-16 code unit. |
-| `DateTime` | ✅ | `new`/`new_time`/`now`/`utc_now`/`today`/`parse`/`parse_str`, `year`…`second`/`ticks`/`day_of_year`, `add_days`…`add_months`, `date` | `Display`/`Debug`, `Eq`, `Ord` | `DateTimeOffset` not wrapped (🟡). |
+| `DateTime` | ✅ | `new`/`new_time`/`now`/`utc_now`/`today`/`parse`/`parse_str`, `year`…`second`/`ticks`/`day_of_year`, `add_days`…`add_months`, `date` | `Display`/`Debug`, `Eq`, `Ord` | Direct `System.DateTime` identity in exported signatures and DTO properties. |
+| `DateTimeOffset` | ✅ | `now`/`utc_now`/`parse`/`parse_str`, `utc_datetime`/`datetime`/`offset`, `unix_time_seconds`, `compare_to` | `Display`/`Debug`, `Eq`, `Ord` | Direct `System.DateTimeOffset` identity; product-shaped proof in `cd_typed_dto`. |
 | `TimeSpan` (`DotNetTimeSpan`) | ✅ | `from_ticks`/`from_days`…`from_milliseconds`/`zero`, component + `total_*` getters, `add`/`subtract`/`negate`/`duration`, `compare_to` | `Default`, `Display`/`Debug`, `Eq`, `Ord` | |
-| `Guid` | ✅ | `new_v4`/`empty`/`parse`, `is_empty`, `equals`/`compare_to`/`hash_code` | `Default`, `Display`/`Debug`, `Eq`, `Ord`, `Hash` | |
+| `Guid` | ✅ | `new_v4`/`empty`/`parse`, `is_empty`, `equals`/`compare_to`/`hash_code` | `Default`, `Display`/`Debug`, `Eq`, `Ord`, `Hash` | Direct `System.Guid` identity in exported signatures and DTO properties. |
 | `Uri` | ✅ | `new`, `scheme`/`host`/`port`/`absolute_path`/`query`/`fragment`/`user_info`/`authority`/`path_and_query`/`original_string`/`absolute_uri`, `is_absolute`/`is_file`/`is_loopback`/`is_default_port`/`is_base_of`, static `escape_data_string`/`unescape_data_string` | `Display`/`Debug`, `Eq` | |
 | `Regex` (+ `Match`/`Matches`/`Groups`/`Group`) | ✅ | `new`, `is_match`/`find`/`find_all`/`replace_all`/`count`, group accessors, static `is_match_str`/`escape`/`unescape`; iterators over matches/groups | `Display` (on the value types) | Named-group + capture navigation surfaced. |
 | `Random` | ✅ | `new`/`with_seed`/`shared`, `next`/`next_below`/`next_range`, `next_i64*`, `next_f64`/`next_f32` | `Default`, `Display` | |
@@ -115,7 +119,7 @@ anything unsurfaced.
 | `Marshal` (`system::runtime::interop_services`) | 🟡 | used internally for `PtrToStringUTF8` | — | Low-level marshalling helper; not an end-user surface. |
 | `Decimal` (`DotNetDecimal`, `mycorrhiza::bcl::decimal`) | ✅ | `from_i64`/`from_i32`/`parse`, `to_f64`, `to_dotnet_string`, `+`/`-`/`*`/`/` (`Add`/`Sub`/`Mul`/`Div`, via the real `Decimal` operators — bit-identical to C#) | `Display`, `PartialEq`/`Eq`, `PartialOrd`/`Ord` (via `Decimal.Compare` — an exact base-10 total order, not culture-sensitive, so a real `Ord` applies) | Closes the former Theme-2 backlog item ("`Decimal` operator/trait completeness audit"). Proof: `cd_decimal` (11/11), also folded into `cd_bcl`. |
 | `Nullable<T>` (`mycorrhiza::nullable`) | ✅ | `some(value)` (`new Nullable<T>(value)`); `NullableExt::to_option()` → `Option<T>` (`HasValue`/`Value`, only reads `Value` when present) | — | The former value-type-generic-instance-method wall (§8) is closed for `Nullable<T>`'s two members. See also §4 for the `null`↔`Option` (reference) bridge, which is a separate, older ✅. |
-| `DateTimeOffset`, `BigInteger`, `Version`, `IPAddress`, `Encoding`, `Convert`, `BitConverter` | 🟡 | — | Reachable via `bindings.rs` / `instanceN`; no idiomatic module yet. Prime Theme-2 breadth candidates. |
+| `BigInteger`, `Version`, `IPAddress`, `Encoding`, `Convert`, `BitConverter` | 🟡 | — | Reachable via `bindings.rs` / `instanceN`; no idiomatic module yet. Prime Theme-2 breadth candidates. |
 
 ---
 
@@ -137,7 +141,7 @@ Proof: `cd_delegates` (14/14), `cd_async` (9/9), `cd_closures`, `cd_linq_expr` (
 | `.await` a `Task<T>` a .NET API *returned* | ✅ | `await_task(t).await` (`IsCompleted`/`Result` = bare `!0`) | Works when handed a concrete `Task<int>`. |
 | Expose a Rust `async fn` as a non-generic `Task` | ✅ | `future_to_task_unit(fut)` (via non-generic `TaskCompletionSource`) | — |
 | **Produce a `Task<T>` from a Rust value** | ✅ | `future_to_task(fut)` packages an `async fn -> T` into a real `Task<T>` via `TaskCompletionSource<T>.get_Task()` | The nested-generic-return wall (former §8 wall #1) is closed for this specific producer path. `Task.FromResult<T>` itself is still unused (it needs generic-*method* `!!N` *argument* support the backend doesn't emit) — the `TaskCompletionSource<T>` route is sufficient and used instead. |
-| Consume `IAsyncEnumerable<T>` | ✅ | `AsyncEnumerable<T>` / `AsyncEnumerator<T>` call `GetAsyncEnumerator`, await each `MoveNextAsync` `ValueTask<bool>`, read `Current`, and expose `next`, `next_blocking`, and `collect_blocking` | Consumer-side backpressure is preserved and handles are GC-rooted across suspension. Producing an async stream from a Rust `async fn` remains blocked on coroutine GC-reference layout. Proof: delayed-channel `cd_async_stream`, debug + release. |
+| Consume and produce `IAsyncEnumerable<T>` | ✅ | `AsyncEnumerable<T>` / `AsyncEnumerator<T>` consume managed streams; `AsyncEnumerable::spawn` / `try_spawn` expose Rust futures through a capacity-one managed channel | Consumer handles are GC-rooted; producers use the BCL `ReadAllAsync` state machine, one-item backpressure, managed cancellation, exactly-once early-disposal cleanup, and managed fault propagation. Proof: delayed-channel `cd_async_stream` plus C# `await foreach` in `cd_async_export`. |
 | LINQ / EF `IQueryable.Where(Expression<Func<T,bool>>)` | ✅ | `mycorrhiza::linq` — `Expr`/`Predicate`/`TypedPredicate<T>`/`Field<Root,Val>` build a real `System.Linq.Expressions` tree from Rust (params, binops, member access, `box`-boxed constants), compiled and handed to `IQueryable.Where` | Built on **expression trees**, not delegates — sidesteps the delegate-as-generic-arg wall entirely (EF needs the *tree*, not a compiled predicate). `.select`/`.to_list`/other LINQ operators beyond `Where` are not yet wrapped. Proof: `cd_linq_expr` (89/89). |
 
 ---
@@ -177,7 +181,7 @@ The mirror direction: a C# dev consuming a Rust `cdylib`. Proof: `cd_typedef` (1
 
 | Feature | Status | Surface | Notes / walls |
 |---|---|---|---|
-| `#[dotnet_export] fn` → `MainModule.method(..)` | ✅ | proc-macro (`dotnet_macros`); marshals strings/primitives, `Vec<T>`, tasks, primitive `Option<T>` as `Nullable<T>`, and explicit `Result<T,E>` errors as exceptions | General Rust enums/C# try-pattern DTOs and managed/non-primitive nullable values remain. |
+| `#[dotnet_export] fn` → `MainModule.method(..)` | ✅ | proc-macro (`dotnet_macros`); marshals strings/primitives, primitive `Vec<T>` as managed `T[]`, `RustOwnedVec<T>` as explicit `RustVec<T>`, tasks, primitive `Option<T>` as `Nullable<T>`, and explicit `Result<T,E>` errors as exceptions | DTO arrays, C# try-pattern DTOs, and managed/non-primitive nullable values remain. |
 | `#[dotnet_class]` struct → managed class | ✅ | proc-macro; a Rust struct becomes a managed class with constructors, managed fields/properties, inheritance, interface implementations, and explicit virtual overrides | `cd_typedef`, `cd_iface`, `cd_override`, and `cd_bgservice_bgtest` cover the shipped shapes. Arbitrary base-constructor contracts remain explicit rather than inferred. |
 | `#[dotnet_methods] impl` → managed methods | ✅ | proc-macro; static + instance Rust fns become methods on the `#[dotnet_class]` type (getters/setters/`make`/`sum` in `cd_typedef`) | |
 | `RustVec<T>` (C# → Rust growable vec) | ✅ | `export_rust_containers!()` (Rust) + shipped `RustDotnet.RustVec<T>` / `RustBoxVec<T>` (C#). `T:unmanaged` near-zero-cost; any managed `T` via `GCHandle` boxing | Size-erased core; one monomorphization backs every `T`. |

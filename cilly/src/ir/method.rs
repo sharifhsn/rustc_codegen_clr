@@ -8,7 +8,7 @@ use super::{
     basic_block::BlockId,
     bimap::Interned,
     cilnode::MethodKind,
-    class::ClassDefIdx,
+    class::{ClassDefIdx, CustomAttrDef},
 };
 use crate::iter::TpeIter;
 use crate::{CILRoot, IString};
@@ -250,6 +250,14 @@ pub struct MethodDef {
     /// IR format — rebuild dylib + linker together and `cargo clean` consumers (the build-std
     /// fingerprint trap).
     generic_params: Vec<Interned<IString>>,
+    /// C# nullable-reference metadata for this public member. `nullable_context` is the
+    /// `NullableContextAttribute(byte)` flag inherited by unannotated reference positions;
+    /// `return_nullability` and `param_nullability` are explicit `NullableAttribute(byte)` flags
+    /// for the return parameter and receiver-stripped argument positions. The vectors describe
+    /// metadata only and do not change the CLR signature or runtime representation.
+    nullable_context: Option<u8>,
+    return_nullability: Option<u8>,
+    param_nullability: Vec<Option<u8>>,
     /// Marks this method as an ECMA-335 `SpecialName` (§II.23.1.10, 0x0800) member OUTSIDE the
     /// event/property-accessor cases (those are detected by identity against the owning
     /// `ClassDef`'s `EventDef`/`PropertyDef` lists instead — see `il_exporter`'s
@@ -262,6 +270,11 @@ pub struct MethodDef {
     /// format — rebuild dylib + linker together and `cargo clean` consumers (the build-std
     /// fingerprint trap).
     is_special_name: bool,
+    /// Safe, structured custom attributes attached to the method, its return parameter, and each
+    /// receiver-stripped caller parameter. Parameter vectors are parallel to `arg_names`.
+    custom_attributes: Vec<CustomAttrDef>,
+    return_custom_attributes: Vec<CustomAttrDef>,
+    param_custom_attributes: Vec<Vec<CustomAttrDef>>,
 }
 
 impl RelocateValue for MethodDef {
@@ -280,7 +293,13 @@ impl RelocateValue for MethodDef {
             is_abstract,
             out_params,
             generic_params,
+            nullable_context,
+            return_nullability,
+            param_nullability,
             is_special_name,
+            custom_attributes,
+            return_custom_attributes,
+            param_custom_attributes,
         } = self;
         Self {
             access,
@@ -300,7 +319,27 @@ impl RelocateValue for MethodDef {
                 .into_iter()
                 .map(|name| ctx.string(destination, name))
                 .collect(),
+            nullable_context,
+            return_nullability,
+            param_nullability,
             is_special_name,
+            custom_attributes: custom_attributes
+                .into_iter()
+                .map(|attribute| attribute.relocate(ctx, destination))
+                .collect(),
+            return_custom_attributes: return_custom_attributes
+                .into_iter()
+                .map(|attribute| attribute.relocate(ctx, destination))
+                .collect(),
+            param_custom_attributes: param_custom_attributes
+                .into_iter()
+                .map(|attributes| {
+                    attributes
+                        .into_iter()
+                        .map(|attribute| attribute.relocate(ctx, destination))
+                        .collect()
+                })
+                .collect(),
         }
     }
 }
@@ -386,7 +425,13 @@ impl MethodDef {
             is_abstract: false,
             out_params: vec![],
             generic_params: vec![],
+            nullable_context: None,
+            return_nullability: None,
+            param_nullability: vec![],
             is_special_name: false,
+            custom_attributes: vec![],
+            return_custom_attributes: vec![],
+            param_custom_attributes: vec![],
         }
     }
 
@@ -443,6 +488,40 @@ impl MethodDef {
         self.is_special_name
     }
 
+    #[must_use]
+    pub fn with_custom_attributes(
+        mut self,
+        method: Vec<CustomAttrDef>,
+        return_value: Vec<CustomAttrDef>,
+        parameters: Vec<Vec<CustomAttrDef>>,
+    ) -> Self {
+        let receiver_count = usize::from(!matches!(self.kind, MethodKind::Static));
+        assert!(
+            parameters.is_empty()
+                || parameters.len() == self.arg_names.len().saturating_sub(receiver_count),
+            "parameter custom attributes must be parallel to method arguments"
+        );
+        self.custom_attributes = method;
+        self.return_custom_attributes = return_value;
+        self.param_custom_attributes = parameters;
+        self
+    }
+
+    #[must_use]
+    pub fn custom_attributes(&self) -> &[CustomAttrDef] {
+        &self.custom_attributes
+    }
+
+    #[must_use]
+    pub fn return_custom_attributes(&self) -> &[CustomAttrDef] {
+        &self.return_custom_attributes
+    }
+
+    #[must_use]
+    pub fn param_custom_attributes(&self) -> &[Vec<CustomAttrDef>] {
+        &self.param_custom_attributes
+    }
+
     /// Marks the given 1-based, receiver-stripped parameter Sequence numbers as `[out]`
     /// (`ParamAttributes.Out`, §II.23.1.13) — see the `out_params` field's doc. The caller is
     /// responsible for each named position's signature type being `Type::Ref` (BYREF): `Out` on a
@@ -479,6 +558,47 @@ impl MethodDef {
     #[must_use]
     pub fn generic_params(&self) -> &[Interned<IString>] {
         &self.generic_params
+    }
+
+    /// Attach C# nullable-reference metadata without changing this method's CLR signature.
+    #[must_use]
+    pub fn with_nullability(
+        mut self,
+        context: u8,
+        return_flag: Option<u8>,
+        parameter_flags: Vec<Option<u8>>,
+    ) -> Self {
+        assert!(matches!(context, 1 | 2), "nullable context must be 1 or 2");
+        assert!(
+            return_flag.is_none_or(|flag| matches!(flag, 1 | 2)),
+            "nullable return flag must be 1 or 2"
+        );
+        assert!(
+            parameter_flags
+                .iter()
+                .flatten()
+                .all(|flag| matches!(flag, 1 | 2)),
+            "nullable parameter flags must be 1 or 2"
+        );
+        self.nullable_context = Some(context);
+        self.return_nullability = return_flag;
+        self.param_nullability = parameter_flags;
+        self
+    }
+
+    #[must_use]
+    pub fn nullable_context(&self) -> Option<u8> {
+        self.nullable_context
+    }
+
+    #[must_use]
+    pub fn return_nullability(&self) -> Option<u8> {
+        self.return_nullability
+    }
+
+    #[must_use]
+    pub fn param_nullability(&self) -> &[Option<u8>] {
+        &self.param_nullability
     }
 
     #[must_use]
@@ -913,6 +1033,15 @@ impl ExceptionRegion {
     }
 }
 
+#[derive(Hash, PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum PInvokeCallConv {
+    Winapi,
+    Cdecl,
+    Stdcall,
+    Thiscall,
+    Fastcall,
+}
+
 #[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
 pub enum MethodImpl {
     MethodBody {
@@ -921,6 +1050,9 @@ pub enum MethodImpl {
     },
     Extern {
         lib: Interned<IString>,
+        /// Native entry point when it differs from the managed method name.
+        entry_point: Option<Interned<IString>>,
+        call_conv: PInvokeCallConv,
         preserve_errno: bool,
     },
     AliasFor(Interned<MethodRef>),
@@ -1044,9 +1176,13 @@ impl RelocateValue for MethodImpl {
             },
             Self::Extern {
                 lib,
+                entry_point,
+                call_conv,
                 preserve_errno,
             } => Self::Extern {
                 lib: ctx.string(destination, lib),
+                entry_point: entry_point.map(|name| ctx.string(destination, name)),
+                call_conv,
                 preserve_errno,
             },
             Self::AliasFor(method) => Self::AliasFor(ctx.method_ref(destination, method)),
@@ -1381,14 +1517,20 @@ impl MethodImpl {
             (
                 MethodImpl::Extern {
                     lib,
+                    entry_point,
+                    call_conv,
                     preserve_errno,
                 },
                 MethodImpl::Extern {
                     lib: liba,
+                    entry_point: entry_pointa,
+                    call_conv: call_conva,
                     preserve_errno: preserve_errnoa,
                 },
             ) => {
                 assert_eq!(lib, liba);
+                assert_eq!(entry_point, entry_pointa);
+                assert_eq!(call_conv, call_conva);
                 assert_eq!(preserve_errno, preserve_errnoa);
                 self.clone()
             }
@@ -1398,6 +1540,8 @@ impl MethodImpl {
             (
                 MethodImpl::Extern {
                     lib,
+                    entry_point,
+                    call_conv,
                     preserve_errno,
                 },
                 MethodImpl::Missing,
@@ -1406,10 +1550,14 @@ impl MethodImpl {
                 MethodImpl::Missing,
                 MethodImpl::Extern {
                     lib,
+                    entry_point,
+                    call_conv,
                     preserve_errno,
                 },
             ) => MethodImpl::Extern {
                 lib: *lib,
+                entry_point: *entry_point,
+                call_conv: *call_conv,
                 preserve_errno: *preserve_errno,
             },
             (
@@ -1641,6 +1789,8 @@ fn test_extern() {
     assert!(
         MethodImpl::Extern {
             lib: name,
+            entry_point: None,
+            call_conv: PInvokeCallConv::Cdecl,
             preserve_errno: false,
         }
         .is_extern()
@@ -1703,6 +1853,8 @@ fn cil() {
             MethodKind::Static,
             MethodImpl::Extern {
                 lib: name,
+                entry_point: None,
+                call_conv: PInvokeCallConv::Cdecl,
                 preserve_errno: false,
             },
             vec![],
@@ -1836,6 +1988,8 @@ fn should_hint_aggressive_inline_false_for_non_method_body_impls() {
     assert!(
         !MethodImpl::Extern {
             lib: lib_name,
+            entry_point: None,
+            call_conv: PInvokeCallConv::Cdecl,
             preserve_errno: false,
         }
         .should_hint_aggressive_inline(&asm)
@@ -1981,6 +2135,8 @@ fn canonical_region_body_postcard_round_trip_and_enum_tags_are_stable() {
     assert_eq!(
         postcard::to_stdvec(&MethodImpl::Extern {
             lib,
+            entry_point: None,
+            call_conv: PInvokeCallConv::Cdecl,
             preserve_errno: false,
         })
         .unwrap()[0],

@@ -143,8 +143,12 @@ fn provision_sdk_crates(from_repo: &Path, home_override: &Option<PathBuf>) -> Re
         None => crate::mode::cargo_dotnet_home()?,
     };
     let root = home.join("crates");
-    for name in ["mycorrhiza", "dotnet_macros"] {
-        let src = from_repo.join(name);
+    for (relative, name) in [
+        ("mycorrhiza", "mycorrhiza"),
+        ("dotnet_macros", "dotnet_macros"),
+        ("crates/rust-dotnet-pinvoke", "rust-dotnet-pinvoke"),
+    ] {
+        let src = from_repo.join(relative);
         if !src.is_dir() {
             bail!("SDK crate source is missing: {}", src.display());
         }
@@ -412,7 +416,12 @@ mod tests {
     fn required_asset_provisioning_copies_scaffold_dependencies() {
         let repo = temp_root("sdk-copy");
         let home = temp_root("sdk-copy-home");
-        for relative in ["mycorrhiza", "dotnet_macros", "mycorrhiza_interop_helpers"] {
+        for relative in [
+            "mycorrhiza",
+            "dotnet_macros",
+            "crates/rust-dotnet-pinvoke",
+            "mycorrhiza_interop_helpers",
+        ] {
             let directory = repo.join(relative);
             std::fs::create_dir_all(&directory).unwrap();
             std::fs::write(directory.join("sentinel"), relative).unwrap();
@@ -421,6 +430,7 @@ mod tests {
         provision_required_assets(&repo, &Some(home.clone())).unwrap();
         assert!(home.join("crates/mycorrhiza/sentinel").is_file());
         assert!(home.join("crates/dotnet_macros/sentinel").is_file());
+        assert!(home.join("crates/rust-dotnet-pinvoke/sentinel").is_file());
         assert!(home.join("mycorrhiza_interop_helpers/sentinel").is_file());
 
         let _ = std::fs::remove_dir_all(repo);

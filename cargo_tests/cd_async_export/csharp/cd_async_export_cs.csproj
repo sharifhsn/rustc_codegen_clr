@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="cd_async_export">
+      <HintPath>../target/x86_64-unknown-dotnet/release/cd_async_export.dll</HintPath>
+    </Reference>
+    <Reference Include="Mycorrhiza.Interop.Helpers">
+      <HintPath>../target/x86_64-unknown-dotnet/release/Mycorrhiza.Interop.Helpers.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>

@@ -4,18 +4,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{bail, Context as _, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{StagedPackageAsset, StagedPackageAssetKind};
+use crate::{StagedPackageAsset, StagedPackageAssetKind};
 
 /// The SDK's asset classification.  Keep this separate from the physical source path: a
 /// `runtimeTargets` entry is selected by the SDK for one RID, but its logical NuGet path is
 /// still the stable identifier used for collision reporting and staging.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(super) enum AssetKind {
+pub enum AssetKind {
     Compile,
     Runtime,
     Native,
@@ -23,7 +23,7 @@ pub(super) enum AssetKind {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub(super) struct ResolvedAsset {
+pub struct ResolvedAsset {
     pub owner: String,
     pub kind: AssetKind,
     /// Slash-normalized path within the owning NuGet package. Never an output path.
@@ -35,14 +35,14 @@ pub(super) struct ResolvedAsset {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(super) struct AssetCollision {
+pub struct AssetCollision {
     pub logical_path: String,
     pub owners: Vec<String>,
 }
 
 #[derive(Debug)]
-pub(super) struct ResolvedAssets {
-    pub primary_dll: PathBuf,
+pub struct ResolvedAssets {
+    pub primary_dll: Option<PathBuf>,
     pub compile_dlls: Vec<PathBuf>,
     pub runtime_dlls: Vec<PathBuf>,
     pub assets: Vec<ResolvedAsset>,
@@ -62,7 +62,7 @@ struct AssetsFile {
     package_folders: serde_json::Map<String, serde_json::Value>,
 }
 
-pub(super) fn restore(
+pub fn restore(
     id: &str,
     version: &str,
     cache_root: &Path,
@@ -89,19 +89,52 @@ pub(super) fn restore(
             xml_escape(version),
         ),
     )?;
-    eprintln!("== cargo dotnet add-nuget: restoring {id} {version} with the .NET SDK ==");
-    let mut command = Command::new("dotnet");
+    eprintln!("== rust-dotnet assets: restoring {id} {version} with the .NET SDK ==");
+    let mut command = dotnet_command(tfm);
     command.args(["restore", "--nologo", "--verbosity", "quiet"]);
     for source in sources {
         command.args(["--source", source]);
     }
     let status = command.arg(&project).status().with_context(|| {
-        format!("add-nuget: failed to spawn `dotnet restore` (is the {tfm} SDK installed?)")
+        format!("asset restore: failed to spawn `dotnet restore` (is the {tfm} SDK installed?)")
     })?;
     if !status.success() {
-        bail!("add-nuget: `dotnet restore` failed for {id} {version}");
+        bail!("asset restore: `dotnet restore` failed for {id} {version}");
     }
     parse(&restore_dir.join("obj/project.assets.json"), id, rid)
+}
+
+fn dotnet_command(tfm: &str) -> Command {
+    if let Some(host) = std::env::var_os("DOTNET_HOST_PATH").filter(|value| !value.is_empty()) {
+        return Command::new(host);
+    }
+    let requested_major = tfm
+        .strip_prefix("net")
+        .and_then(|version| version.split('.').next());
+    if let (Some(home), Some(major)) = (
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
+        requested_major,
+    ) {
+        let root = PathBuf::from(home).join(".dotnet");
+        let host = root.join(if cfg!(windows) {
+            "dotnet.exe"
+        } else {
+            "dotnet"
+        });
+        let shared = root.join("shared/Microsoft.NETCore.App");
+        let has_runtime = std::fs::read_dir(shared).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|version| version.starts_with(&format!("{major}.")))
+            })
+        });
+        if host.is_file() && has_runtime {
+            return Command::new(host);
+        }
+    }
+    Command::new("dotnet")
 }
 
 fn parse(path: &Path, root_id: &str, requested_rid: Option<&str>) -> Result<ResolvedAssets> {
@@ -114,10 +147,10 @@ fn parse(path: &Path, root_id: &str, requested_rid: Option<&str>) -> Result<Reso
         .find(|(name, _)| requested_rid.is_some_and(|rid| name.ends_with(&format!("/{rid}"))))
         .or_else(|| assets.targets.iter().find(|(name, _)| !name.contains('/')))
         .or_else(|| assets.targets.iter().next())
-        .context("add-nuget: restore produced no target graph")?;
+        .context("asset restore produced no target graph")?;
     let target = target
         .as_object()
-        .context("add-nuget: target graph is not an object")?;
+        .context("asset restore target graph is not an object")?;
 
     let target_rid = target_name.rsplit_once('/').map(|(_, rid)| rid);
     let selected_rid = requested_rid.or(target_rid).map(str::to_owned);
@@ -132,10 +165,10 @@ fn parse(path: &Path, root_id: &str, requested_rid: Option<&str>) -> Result<Reso
         let package_path = library
             .get("path")
             .and_then(|v| v.as_str())
-            .with_context(|| format!("add-nuget: package {library_key} has no library path"))?;
+            .with_context(|| format!("asset restore package {library_key} has no library path"))?;
         let node = node
             .as_object()
-            .with_context(|| format!("add-nuget: target node {library_key} is not an object"))?;
+            .with_context(|| format!("asset restore target node {library_key} is not an object"))?;
         collect_group(
             &assets.package_folders,
             package_path,
@@ -153,6 +186,18 @@ fn parse(path: &Path, root_id: &str, requested_rid: Option<&str>) -> Result<Reso
             AssetKind::Runtime,
             node.get("runtime"),
             None,
+            false,
+            &mut graph,
+        )?;
+        // RID-specific target graphs commonly project selected native assets into a direct
+        // `native` group instead of retaining the richer `runtimeTargets` entries.
+        collect_group(
+            &assets.package_folders,
+            package_path,
+            library_key,
+            AssetKind::Native,
+            node.get("native"),
+            selected_rid.as_deref(),
             false,
             &mut graph,
         )?;
@@ -185,8 +230,7 @@ fn parse(path: &Path, root_id: &str, requested_rid: Option<&str>) -> Result<Reso
         .map(|asset| asset.source.clone())
         .collect::<Vec<_>>();
     let primary_dll = choose_primary(root_id, &root_runtime_dlls)
-        .or_else(|| choose_primary(root_id, &root_compile_dlls))
-        .context("add-nuget: restored package has no managed compile/runtime DLL for net8.0")?;
+        .or_else(|| choose_primary(root_id, &root_compile_dlls));
     let compile_dlls = assets
         .iter()
         .filter(|asset| asset.kind == AssetKind::Compile && is_dll(&asset.source))
@@ -248,13 +292,13 @@ fn collect_runtime_targets(
     for (relative, metadata) in group {
         let metadata = metadata
             .as_object()
-            .context("add-nuget: runtimeTargets entry is not an object")?;
+            .context("asset restore runtimeTargets entry is not an object")?;
         let kind = match metadata.get("assetType").and_then(|value| value.as_str()) {
             Some("runtime") => AssetKind::Runtime,
             Some("native") => AssetKind::Native,
             Some("resource") | Some("resources") => AssetKind::Resource,
-            Some(other) => bail!("add-nuget: unsupported runtimeTargets assetType `{other}`"),
-            None => bail!("add-nuget: runtimeTargets entry {relative} has no assetType"),
+            Some(other) => bail!("asset restore: unsupported runtimeTargets assetType `{other}`"),
+            None => bail!("asset restore: runtimeTargets entry {relative} has no assetType"),
         };
         let rid = metadata.get("rid").and_then(|value| value.as_str());
         out.insert(ResolvedAsset {
@@ -284,9 +328,7 @@ fn resolve_source(
         }
     }
     found.with_context(|| {
-        format!(
-            "add-nuget: restored asset {package_path}/{relative} is missing from package folders"
-        )
+        format!("asset restore: {package_path}/{relative} is missing from package folders")
     })
 }
 
@@ -298,7 +340,7 @@ fn normalize_logical_path(relative: &str) -> Result<String> {
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")
     {
-        bail!("add-nuget: unsafe package-relative asset path `{relative}`");
+        bail!("asset restore: unsafe package-relative asset path `{relative}`");
     }
     Ok(path)
 }
@@ -383,11 +425,7 @@ struct OwnedAssetRecord {
 /// Stage a complete SDK-selected graph under a root-package-owned directory. The manifest is
 /// replaced only after every source has copied successfully, so an interrupted refresh cannot
 /// silently leave a partial new graph masquerading as the previous package version.
-pub(super) fn stage_assets(
-    crate_dir: &Path,
-    root_id: &str,
-    assets: &[ResolvedAsset],
-) -> Result<()> {
+pub fn stage_assets(crate_dir: &Path, root_id: &str, assets: &[ResolvedAsset]) -> Result<()> {
     let collisions = collisions(assets);
     if !collisions.is_empty() {
         let details = collisions
@@ -401,7 +439,7 @@ pub(super) fn stage_assets(
             })
             .collect::<Vec<_>>()
             .join("; ");
-        bail!("add-nuget: unsafe logical asset collision while staging {root_id}: {details}");
+        bail!("asset staging: unsafe logical asset collision for {root_id}: {details}");
     }
 
     let assets_dir = crate_dir.join(".cargo-dotnet-nuget-assets");
@@ -427,11 +465,11 @@ pub(super) fn stage_assets(
             fs::create_dir_all(
                 destination
                     .parent()
-                    .context("add-nuget: asset has no parent")?,
+                    .context("asset staging: asset has no parent")?,
             )?;
             fs::copy(&asset.source, &destination).with_context(|| {
                 format!(
-                    "add-nuget: staging {} -> {}",
+                    "asset staging: {} -> {}",
                     asset.source.display(),
                     destination.display()
                 )
@@ -460,7 +498,7 @@ pub(super) fn stage_assets(
     if had_old_root {
         fs::rename(&final_dir, &backup_dir).with_context(|| {
             format!(
-                "add-nuget: moving previous staged graph {}",
+                "asset staging: moving previous graph {}",
                 final_dir.display()
             )
         })?;
@@ -470,7 +508,7 @@ pub(super) fn stage_assets(
             let _ = fs::rename(&backup_dir, &final_dir);
         }
         return Err(error)
-            .with_context(|| format!("add-nuget: promoting staged graph {}", temp_dir.display()));
+            .with_context(|| format!("asset staging: promoting graph {}", temp_dir.display()));
     }
 
     manifest.version = manifest_version();
@@ -493,7 +531,7 @@ pub(super) fn stage_assets(
 /// Materialize the staged runtime closure after a Rust build. This intentionally maps only the
 /// runtime-facing layout (`runtime`, `native`, and culture resources); compile references remain
 /// provenance in the manifest rather than being copied beside an executable.
-pub(super) fn copy_staged_assets(crate_dir: &Path, out_dir: &Path) -> Result<bool> {
+pub fn copy_staged_assets(crate_dir: &Path, out_dir: &Path) -> Result<bool> {
     let assets_dir = crate_dir.join(".cargo-dotnet-nuget-assets");
     let manifest_path = assets_dir.join(STAGING_MANIFEST);
     if !manifest_path.is_file() {
@@ -560,7 +598,7 @@ pub(super) fn copy_staged_assets(crate_dir: &Path, out_dir: &Path) -> Result<boo
 /// match). This is also the fresh-clone detector: `.cargo-dotnet-nuget-assets/` is gitignored
 /// while the deps manifest is checked in, so a clean checkout has every id "missing" here even
 /// though `add-nuget` ran successfully at some point in the repo's history.
-pub(super) fn missing_recorded_roots(
+pub fn missing_recorded_roots(
     crate_dir: &Path,
     recorded: &[(String, String)],
 ) -> Result<Vec<String>> {
@@ -635,7 +673,7 @@ fn read_manifest(path: &Path) -> Result<OwnedAssetsManifest> {
         serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     if manifest.version != manifest_version() {
         bail!(
-            "add-nuget: unsupported asset staging manifest version {}",
+            "unsupported asset staging manifest version {}",
             manifest.version
         );
     }
@@ -664,7 +702,7 @@ fn root_token(root_id: &str) -> String {
 ///
 /// The runtime build path flattens files because the CLR probes next to an executable; NuGet
 /// packages must *not* do that.  NuGet's RID and resource selection relies on these exact paths.
-pub(super) fn package_assets(crate_dir: &Path) -> Result<Vec<StagedPackageAsset>> {
+pub fn package_assets(crate_dir: &Path) -> Result<Vec<StagedPackageAsset>> {
     let assets_dir = crate_dir.join(".cargo-dotnet-nuget-assets");
     let manifest_path = assets_dir.join(STAGING_MANIFEST);
     if !manifest_path.is_file() {
@@ -802,17 +840,15 @@ mod tests {
 
         let resolved = parse(&assets_path, "Root.Package", None).unwrap();
         assert_eq!(
-            resolved.primary_dll.file_name().unwrap(),
+            resolved.primary_dll.as_ref().unwrap().file_name().unwrap(),
             "Root.Package.dll"
         );
         assert_eq!(resolved.compile_dlls.len(), 2);
         assert_eq!(resolved.runtime_dlls.len(), 2);
-        assert!(
-            resolved
-                .runtime_dlls
-                .iter()
-                .any(|p| p.ends_with("Dependency.dll"))
-        );
+        assert!(resolved
+            .runtime_dlls
+            .iter()
+            .any(|p| p.ends_with("Dependency.dll")));
         fs::remove_dir_all(temp).unwrap();
     }
 
@@ -836,8 +872,10 @@ mod tests {
         assert_eq!(
             parse(&assets_path, "Reference.Only", None)
                 .unwrap()
-                .primary_dll,
-            dll
+                .primary_dll
+                .as_ref()
+                .unwrap(),
+            &dll
         );
         fs::remove_dir_all(temp).unwrap();
     }
@@ -1182,8 +1220,8 @@ mod tests {
     }
 
     #[test]
-    fn missing_recorded_roots_flags_a_staged_graph_whose_version_no_longer_matches_what_was_recorded()
-     {
+    fn missing_recorded_roots_flags_a_staged_graph_whose_version_no_longer_matches_what_was_recorded(
+    ) {
         let temp = unique_temp("missing-roots-version-drift");
         let crate_dir = temp.join("consumer");
         let source = temp.join("source");

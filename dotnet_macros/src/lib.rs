@@ -81,7 +81,9 @@ fn validate_dotnet_ref(spec: &str, span: proc_macro2::Span) -> syn::Result<()> {
 /// So each entry here was proven individually, the way `BackgroundService` was proven in
 /// `cargo_tests/cd_bgservice/rustlib_bgtest` (subclass + override `ExecuteAsync` + run under a real
 /// `IHostBuilder` lifecycle, no crash) before being added. `System.Object` is always safe (it's the
-/// universal base every class already implicitly extends) and isn't optional.
+/// universal base every class already implicitly extends) and isn't optional. `System.ValueType`
+/// is the CLR-mandated base for an emitted value type; it is used only by `#[dotnet_value]`, whose
+/// runtime acceptance fixture verifies the resulting metadata from a separately compiled C# app.
 ///
 /// To subclass anything else without adding it here first, set `ALLOW_UNVERIFIED_BASE=1` in the
 /// environment at Rust compile time — an explicit, loud, debug-only opt-out (matching this project's
@@ -89,6 +91,7 @@ fn validate_dotnet_ref(spec: &str, span: proc_macro2::Span) -> syn::Result<()> {
 /// unsafe API, since the underlying invariant genuinely cannot be discharged by the caller.
 const EXTENDS_ALLOWLIST: &[&str] = &[
     "[System.Runtime]System.Object",
+    "[System.Runtime]System.ValueType",
     "[Microsoft.Extensions.Hosting.Abstractions]Microsoft.Extensions.Hosting.BackgroundService",
 ];
 
@@ -148,6 +151,7 @@ fn denylisted_attr_reason(full_type_name: &str) -> Option<String> {
 /// `i64`-range integer), matching the shapes `cilly::class::CustomAttrArg` can express. No other
 /// literal kind (float, char, byte-string, …) is accepted — see that enum's doc for the full
 /// "well-formed by construction" rationale this mirrors at the macro-syntax level.
+#[derive(Clone)]
 enum AttrArgLit {
     Str(String),
     Bool(bool),
@@ -226,10 +230,36 @@ fn expr_to_arg(expr: &syn::Expr) -> syn::Result<AttrArgLit> {
 /// no-arg ctor), and its named PROPERTY arguments in `props(...)` (field-targeted named args are
 /// not supported — see `cilly::class::CustomAttrDef`'s doc for why: virtually every real
 /// attribute's named-arg surface is settable properties, not public fields).
+#[derive(Clone)]
 struct AttrSpec {
     type_name: String,
     ctor_args: Vec<AttrArgLit>,
     named_args: Vec<(String, AttrArgLit)>,
+}
+
+struct ParamAttrSpec {
+    parameter: syn::Ident,
+    attribute: AttrSpec,
+}
+
+impl syn::parse::Parse for ParamAttrSpec {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let parameter = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let attribute = input.parse()?;
+        Ok(Self {
+            parameter,
+            attribute,
+        })
+    }
+}
+
+fn validate_safe_attr_spec(spec: &AttrSpec, span: proc_macro2::Span) -> syn::Result<()> {
+    let (_, bare_name) = split_dotnet_ref(&spec.type_name);
+    if let Some(reason) = denylisted_attr_reason(&bare_name) {
+        return Err(syn::Error::new(span, reason));
+    }
+    Ok(())
 }
 impl AttrSpec {
     /// Packs this spec into the single `&'static str` `rustc_codegen_clr_add_custom_attr::<SPEC>`
@@ -346,6 +376,18 @@ struct StaticFieldSpec {
     name: syn::Ident,
     ty: Type,
 }
+struct StaticFieldAttrSpec {
+    name: syn::Ident,
+    attribute: AttrSpec,
+}
+impl syn::parse::Parse for StaticFieldAttrSpec {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let name = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let attribute = input.parse()?;
+        Ok(Self { name, attribute })
+    }
+}
 impl syn::parse::Parse for StaticFieldSpec {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let name: syn::Ident = input.parse()?;
@@ -360,9 +402,11 @@ impl syn::parse::Parse for StaticFieldSpec {
 /// Emits: the original struct (unchanged); a `<Name>Handle` managed-handle alias (a method receiver /
 /// the type C# sees); and a comptime entrypoint that registers the class, one field per struct field,
 /// and a *primary constructor* (`new(field0, field1, …)` storing each arg into the matching field).
+/// `constructor_visibility = "public" | "assembly" | "private"` controls the accessibility of all
+/// synthesized constructors. `assembly` is C# `internal`, useful for factory-owned lifecycle types.
 #[proc_macro_attribute]
 pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(item as ItemStruct);
+    let mut input = parse_macro_input!(item as ItemStruct);
 
     // ---- attribute args: extends = "...", value_type = bool, default_ctor = bool,
     //      field_setters = bool, properties = bool, attr(...) (repeatable) ----
@@ -371,6 +415,9 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut default_ctor = false;
     let mut field_setters = false;
     let mut properties = false;
+    let mut readonly_properties = false;
+    let mut record_semantics = false;
+    let mut constructor_visibility = "public".to_string();
     // Managed interfaces this class implements, `;`-separated in one string (usually just one), e.g.
     // `implements = "[MyLib]MyLib.IService"` or `"[A]A.I1;[B]B.I2"`. See the interface `add_*` intrinsic.
     let mut implements: Vec<String> = Vec::new();
@@ -378,6 +425,7 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut attr_specs: Vec<AttrSpec> = Vec::new();
     // Static fields, one `static_field(NAME: Type)` entry each — see `StaticFieldSpec`'s doc.
     let mut static_field_specs: Vec<StaticFieldSpec> = Vec::new();
+    let mut static_field_attr_specs: Vec<StaticFieldAttrSpec> = Vec::new();
     // `base_ctor_args(Type1, Type2, ...)` — positional types the base class's `.ctor` requires, in
     // order. See `rustc_codegen_clr_add_base_ctor_arg`'s doc for why these are types only (no
     // values): a comptime class-shape entrypoint describes static metadata, it can't carry an
@@ -399,11 +447,8 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                             // prefix) — `spec.type_name` still carries the bracketed assembly,
                             // which would never match `ATTR_DENYLIST_NAMESPACES`'s
                             // `starts_with` and silently let every denylisted attribute through.
-                            let (_, bare_name) = split_dotnet_ref(&spec.type_name);
-                            if let Some(reason) = denylisted_attr_reason(&bare_name) {
-                                return syn::Error::new(list.span(), reason)
-                                    .to_compile_error()
-                                    .into();
+                            if let Err(error) = validate_safe_attr_spec(&spec, list.span()) {
+                                return error.to_compile_error().into();
                             }
                             attr_specs.push(spec);
                         }
@@ -415,6 +460,20 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                     match list.parse_args::<StaticFieldSpec>() {
                         Ok(spec) => static_field_specs.push(spec),
                         Err(e) => return e.to_compile_error().into(),
+                    }
+                    continue;
+                }
+                syn::Meta::List(list) if list.path.is_ident("static_field_attr") => {
+                    match list.parse_args::<StaticFieldAttrSpec>() {
+                        Ok(spec) => {
+                            if let Err(error) =
+                                validate_safe_attr_spec(&spec.attribute, list.span())
+                            {
+                                return error.to_compile_error().into();
+                            }
+                            static_field_attr_specs.push(spec);
+                        }
+                        Err(error) => return error.to_compile_error().into(),
                     }
                     continue;
                 }
@@ -471,6 +530,30 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Ok(v) => properties = v,
                     Err(e) => return e.to_compile_error().into(),
                 }
+            } else if m.path.is_ident("readonly_properties") {
+                match bool_lit_value(&m.value) {
+                    Ok(v) => readonly_properties = v,
+                    Err(e) => return e.to_compile_error().into(),
+                }
+            } else if m.path.is_ident("record_semantics") {
+                match bool_lit_value(&m.value) {
+                    Ok(v) => record_semantics = v,
+                    Err(e) => return e.to_compile_error().into(),
+                }
+            } else if m.path.is_ident("constructor_visibility") {
+                let visibility = match str_lit_value(&m.value) {
+                    Ok(value) => value,
+                    Err(e) => return e.to_compile_error().into(),
+                };
+                if !matches!(visibility.as_str(), "public" | "assembly" | "private") {
+                    return syn::Error::new(
+                        m.value.span(),
+                        "#[dotnet_class]: `constructor_visibility` must be \"public\", \"assembly\", or \"private\"",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                constructor_visibility = visibility;
             } else if m.path.is_ident("implements") {
                 let s = match str_lit_value(&m.value) {
                     Ok(s) => s,
@@ -512,6 +595,7 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                     format!(
                         "#[dotnet_class]: unknown attribute key `{}`; expected one of `extends`, \
                          `value_type`, `default_ctor`, `field_setters`, `properties`, \
+                         `readonly_properties`, `record_semantics`, `constructor_visibility`, \
                          `implements`, `attr(...)`, `static_field(...)`",
                         quote! { #path }
                     ),
@@ -522,6 +606,22 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
     let (super_asm, super_name) = split_dotnet_ref(&extends);
+    if properties && readonly_properties {
+        return syn::Error::new(
+            input.ident.span(),
+            "#[dotnet_class]: `properties = true` and `readonly_properties = true` are mutually exclusive",
+        )
+        .to_compile_error()
+        .into();
+    }
+    if record_semantics && (value_type || !readonly_properties) {
+        return syn::Error::new(
+            input.ident.span(),
+            "#[dotnet_class]: `record_semantics = true` requires a reference type with `readonly_properties = true`",
+        )
+        .to_compile_error()
+        .into();
+    }
 
     let name = input.ident.clone();
     let span = name.span();
@@ -577,31 +677,115 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
     let name_lit = LitStr::new(&name.to_string(), span);
     let super_asm_lit = LitStr::new(&super_asm, span);
     let super_name_lit = LitStr::new(&super_name, span);
+    let constructor_visibility_lit = LitStr::new(&constructor_visibility, span);
 
     // One `add_field_def::<FieldTy, "name">` per struct field, in declaration order — the primary
     // ctor's parameters follow the same order.
-    let field_calls = input.fields.iter().map(|f| {
+    let mut field_attr_specs: Vec<(Vec<AttrSpec>, Vec<AttrSpec>)> = Vec::new();
+    for field in &mut input.fields {
+        let mut field_attributes = Vec::new();
+        let mut property_attributes = Vec::new();
+        for attribute in &field.attrs {
+            let destination = if attribute.path().is_ident("dotnet_attr") {
+                Some(&mut field_attributes)
+            } else if attribute.path().is_ident("dotnet_property_attr") {
+                Some(&mut property_attributes)
+            } else {
+                None
+            };
+            let Some(destination) = destination else {
+                continue;
+            };
+            let spec = match attribute.parse_args::<AttrSpec>() {
+                Ok(spec) => spec,
+                Err(error) => return error.to_compile_error().into(),
+            };
+            if let Err(error) = validate_safe_attr_spec(&spec, attribute.span()) {
+                return error.to_compile_error().into();
+            }
+            destination.push(spec);
+        }
+        field.attrs.retain(|attribute| {
+            !attribute.path().is_ident("dotnet_attr")
+                && !attribute.path().is_ident("dotnet_property_attr")
+        });
+        if !property_attributes.is_empty() && !(properties || readonly_properties) {
+            return syn::Error::new(
+                field.span(),
+                "#[dotnet_property_attr(...)] requires `properties = true` or `readonly_properties = true`",
+            )
+            .to_compile_error()
+            .into();
+        }
+        field_attr_specs.push((field_attributes, property_attributes));
+    }
+    let field_calls = input.fields.iter().enumerate().map(|(index, f)| {
         let fname = f.ident.as_ref().map(|i| i.to_string()).unwrap_or_default();
         let fname_lit = LitStr::new(&fname, span);
         let fty = &f.ty;
+        let seam_ty = managed_data_field_seam_type(fty);
+        let nullability_lit = LitStr::new(&managed_reference_nullability(fty).to_string(), fty.span());
+        let field_attributes = field_attr_specs[index].0.iter().map(|spec| {
+            let packed = LitStr::new(&spec.encode(), f.span());
+            quote! {
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_field_custom_attr::<false, #index, #packed>(class);
+            }
+        });
+        let property_name = LitStr::new(&to_pascal_case(&fname), f.span());
+        let property_attributes = field_attr_specs[index].1.iter().map(|spec| {
+            let packed = LitStr::new(&spec.encode(), f.span());
+            quote! {
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_property_custom_attr::<#property_name, #packed>(class);
+            }
+        });
         quote! {
-            let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_field_def::<#fty, #fname_lit>(class);
+            let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_nullable_field_def::<#seam_ty, #fname_lit, #nullability_lit>(class);
+            #(#field_attributes)*
+            #(#property_attributes)*
         }
     });
 
     // One `add_static_field_def::<FieldTy, "NAME">` per `static_field(NAME: Type)` entry.
-    let static_field_calls = static_field_specs.iter().map(|s| {
+    for attribute in &static_field_attr_specs {
+        if !static_field_specs
+            .iter()
+            .any(|field| field.name == attribute.name)
+        {
+            return syn::Error::new(
+                attribute.name.span(),
+                format!(
+                    "static_field_attr refers to undeclared static field `{}`",
+                    attribute.name
+                ),
+            )
+            .to_compile_error()
+            .into();
+        }
+    }
+    let static_field_calls = static_field_specs.iter().enumerate().map(|(index, s)| {
         let fname_lit = LitStr::new(&s.name.to_string(), s.name.span());
         let fty = &s.ty;
+        let attributes = static_field_attr_specs
+            .iter()
+            .filter(|attribute| attribute.name == s.name)
+            .map(|attribute| {
+                let packed = LitStr::new(&attribute.attribute.encode(), attribute.name.span());
+                quote! {
+                    let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_field_custom_attr::<true, #index, #packed>(class);
+                }
+            });
         quote! {
             let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_static_field_def::<#fty, #fname_lit>(class);
+            #(#attributes)*
         }
     });
 
     // One `add_base_ctor_arg::<Type>` per `base_ctor_args(...)` entry, in declared order.
     let base_ctor_arg_calls = base_ctor_arg_types.iter().map(|ty| {
+        let seam_ty = managed_data_field_seam_type(ty);
+        let nullability_lit = LitStr::new(&managed_reference_nullability(ty).to_string(), ty.span());
         quote! {
-            let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_base_ctor_arg::<#ty>(class);
+            let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_base_ctor_arg::<#seam_ty, #nullability_lit>(class);
         }
     });
 
@@ -627,15 +811,49 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! {}
     };
+    let readonly_properties_call = if readonly_properties {
+        quote! {
+            let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_readonly_field_properties(class);
+        }
+    } else {
+        quote! {}
+    };
+    let record_semantics_call = if record_semantics {
+        quote! {
+            let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_record_semantics(class);
+        }
+    } else {
+        quote! {}
+    };
+    let handle_type = if value_type {
+        quote! {
+            ::mycorrhiza::intrinsics::RustcCLRInteropManagedStruct<
+                "", #name_lit, { ::core::mem::size_of::<#name>() }
+            >
+        }
+    } else {
+        quote! { ::mycorrhiza::intrinsics::RustcCLRInteropManagedClass<"", #name_lit> }
+    };
+
+    emit_dotnet_class_docs(
+        &input,
+        &base_ctor_arg_types,
+        properties || readonly_properties,
+        readonly_properties,
+        default_ctor,
+        &constructor_visibility,
+    );
 
     let expanded = quote! {
         #input
 
+        #[doc(hidden)]
+        const _: ::core::option::Option<&'static str> = option_env!("RCL_XMLDOC_BUILD_ID");
+
         /// Managed handle to this Rust-defined .NET class. (C# refers to the class by its plain name;
         /// this alias is for Rust-side references — e.g. a future method receiver.)
         #[allow(non_camel_case_types, dead_code)]
-        pub type #handle_ident =
-            ::mycorrhiza::intrinsics::RustcCLRInteropManagedClass<"", #name_lit>;
+        pub type #handle_ident = #handle_type;
 
         #[allow(non_snake_case, dead_code, unused_variables, internal_features)]
         mod #entry_mod {
@@ -657,15 +875,142 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #(#base_ctor_arg_calls)*
                 #(#interface_calls)*
                 #(#attr_calls)*
-                let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_primary_ctor(class);
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_primary_ctor::<
+                    #constructor_visibility_lit,
+                >(class);
                 #default_ctor_call
                 #field_setters_call
                 #properties_call
+                #readonly_properties_call
+                #record_semantics_call
                 ::mycorrhiza::comptime::rustc_codegen_clr_finish_type(class);
             }
         }
     };
     expanded.into()
+}
+
+fn emit_dotnet_class_docs(
+    input: &ItemStruct,
+    base_ctor_arg_types: &[Type],
+    emits_properties: bool,
+    readonly_properties: bool,
+    default_ctor: bool,
+    constructor_visibility: &str,
+) {
+    let class_name = input.ident.to_string();
+    let type_parameters: Vec<String> = input
+        .generics
+        .params
+        .iter()
+        .filter_map(|parameter| match parameter {
+            syn::GenericParam::Type(parameter) => Some(parameter.ident.to_string()),
+            _ => None,
+        })
+        .collect();
+    let metadata_type_name = if type_parameters.is_empty() {
+        class_name.clone()
+    } else {
+        format!("{class_name}`{}", type_parameters.len())
+    };
+    let type_doc = scrape_doc_comment(&input.attrs)
+        .unwrap_or_else(|| format!("Managed projection of the Rust `{class_name}` type."));
+    emit_xmldoc_member(
+        &format!("T:{metadata_type_name}"),
+        &render_rustdoc_xml(&type_doc, &[], false, &type_parameters, &[]),
+    );
+
+    let parsed_type_doc = parse_rustdoc(&type_doc);
+    let mut constructor_doc = parsed_type_doc.summary.clone();
+    if constructor_doc.is_empty() {
+        constructor_doc = format!("Initializes a new `{class_name}` instance.");
+    }
+    let mut constructor_types = Vec::new();
+    let mut constructor_names = Vec::new();
+    let mut constructor_docs = Vec::new();
+    let mut default_constructor_types = Vec::new();
+    let mut default_constructor_names = Vec::new();
+    for (index, base_type) in base_ctor_arg_types.iter().enumerate() {
+        let Some(base_type) = clr_member_id_type_name(base_type) else {
+            return;
+        };
+        let name = format!("baseArg{index}");
+        constructor_types.push(base_type.clone());
+        constructor_names.push(name.clone());
+        constructor_docs.push("Value forwarded to the base-class constructor.".to_string());
+        default_constructor_types.push(base_type);
+        default_constructor_names.push(name);
+    }
+    for (index, field) in input.fields.iter().enumerate() {
+        let field_name = field
+            .ident
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("arg{index}"));
+        let Some(field_type) = clr_member_id_type_name(&field.ty) else {
+            return;
+        };
+        let field_doc = scrape_doc_comment(&field.attrs)
+            .map(|doc| parse_rustdoc(&doc).summary)
+            .filter(|doc| !doc.is_empty())
+            .or_else(|| parsed_type_doc.parameters.get(&field_name).cloned())
+            .unwrap_or_else(|| format!("The `{field_name}` value."));
+        constructor_types.push(field_type);
+        constructor_names.push(field_name);
+        constructor_docs.push(field_doc);
+    }
+    if !constructor_names.is_empty() {
+        constructor_doc.push_str("\n\n# Parameters\n");
+        for (name, description) in constructor_names.iter().zip(&constructor_docs) {
+            constructor_doc.push_str(&format!("- `{name}`: {description}\n"));
+        }
+    }
+    if constructor_visibility != "private" {
+        let constructor_member =
+            dotnet_method_member_id(&metadata_type_name, "#ctor", &constructor_types);
+        emit_xmldoc_member(
+            &constructor_member,
+            &render_rustdoc_xml(&constructor_doc, &constructor_names, false, &[], &[]),
+        );
+        if default_ctor && !input.fields.is_empty() {
+            let mut doc =
+                format!("Initializes a new `{class_name}` instance with default field values.");
+            if !default_constructor_names.is_empty() {
+                doc.push_str("\n\n# Parameters\n");
+                for name in &default_constructor_names {
+                    doc.push_str(&format!(
+                        "- `{name}`: Value forwarded to the base-class constructor.\n"
+                    ));
+                }
+            }
+            emit_xmldoc_member(
+                &dotnet_method_member_id(&metadata_type_name, "#ctor", &default_constructor_types),
+                &render_rustdoc_xml(&doc, &default_constructor_names, false, &[], &[]),
+            );
+        }
+    }
+
+    if emits_properties {
+        for (index, field) in input.fields.iter().enumerate() {
+            let field_name = field
+                .ident
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("arg{index}"));
+            let property_name = to_pascal_case(&field_name);
+            let doc = scrape_doc_comment(&field.attrs).unwrap_or_else(|| {
+                if readonly_properties {
+                    format!("Gets the `{field_name}` value.")
+                } else {
+                    format!("Gets or sets the `{field_name}` value.")
+                }
+            });
+            emit_xmldoc_member(
+                &format!("P:{metadata_type_name}.{property_name}"),
+                &render_rustdoc_xml(&doc, &[], false, &[], &[]),
+            );
+        }
+    }
 }
 
 fn enum_discriminant(expr: &Expr) -> syn::Result<i128> {
@@ -780,8 +1125,12 @@ pub fn dotnet_enum(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         managed_name = Some(value);
     }
-    let managed_name =
-        managed_name.unwrap_or_else(|| LitStr::new(&input.ident.to_string(), input.ident.span()));
+    let managed_name = managed_name.unwrap_or_else(|| {
+        LitStr::new(
+            &to_pascal_case(&input.ident.to_string()),
+            input.ident.span(),
+        )
+    });
     let (repr_name, repr_ty, size, min, max) = match enum_repr(&input) {
         Ok(value) => value,
         Err(error) => return error.to_compile_error().into(),
@@ -848,8 +1197,27 @@ pub fn dotnet_enum(attr: TokenStream, item: TokenStream) -> TokenStream {
     let variants = variant_values
         .iter()
         .map(|(variant, value)| quote! { #value => ::core::option::Option::Some(Self::#variant) });
+    let managed_name_value = managed_name.value();
+    let enum_doc = scrape_doc_comment(&input.attrs)
+        .unwrap_or_else(|| format!("Managed projection of the Rust `{name}` enum."));
+    emit_xmldoc_member(
+        &format!("T:{managed_name_value}"),
+        &render_rustdoc_xml(&enum_doc, &[], false, &[], &[]),
+    );
+    for variant in &input.variants {
+        let variant_name = variant.ident.to_string();
+        let doc = scrape_doc_comment(&variant.attrs)
+            .unwrap_or_else(|| format!("The `{variant_name}` value."));
+        emit_xmldoc_member(
+            &format!("F:{managed_name_value}.{variant_name}"),
+            &render_rustdoc_xml(&doc, &[], false, &[], &[]),
+        );
+    }
     let expanded = quote! {
         #input
+
+        #[doc(hidden)]
+        const _: ::core::option::Option<&'static str> = option_env!("RCL_XMLDOC_BUILD_ID");
 
         #[allow(non_camel_case_types, dead_code)]
         pub type #handle = ::mycorrhiza::intrinsics::RustcCLRInteropManagedStruct<"", #managed_name, #size>;
@@ -904,44 +1272,31 @@ pub fn dotnet_enum(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// parameterless constructor and ordinary read/write CLR properties. It does not imply or generate
 /// serialization behavior.
 fn dto_backing_name(name: &str) -> String {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
+    let mut segments = name.split('_');
+    let Some(first_segment) = segments.next() else {
         return String::new();
     };
-    if first.is_ascii_uppercase() {
-        format!("{}{}", first.to_ascii_lowercase(), chars.as_str())
-    } else {
-        name.to_owned()
+    let mut first_chars = first_segment.chars();
+    let Some(first) = first_chars.next() else {
+        return String::new();
+    };
+    let mut result = format!("{}{}", first.to_ascii_lowercase(), first_chars.as_str());
+    for segment in segments.filter(|segment| !segment.is_empty()) {
+        let mut chars = segment.chars();
+        if let Some(first) = chars.next() {
+            result.push(first.to_ascii_uppercase());
+            result.push_str(chars.as_str());
+        }
     }
+    result
 }
 
-#[proc_macro_attribute]
-pub fn dotnet_dto(attr: TokenStream, item: TokenStream) -> TokenStream {
-    if !attr.is_empty() {
-        return syn::Error::new(
-            proc_macro2::Span::call_site(),
-            "#[dotnet_dto] does not accept arguments; use #[dotnet_class(...)] for custom class options",
-        )
-        .to_compile_error()
-        .into();
-    }
-
-    // Validate here so diagnostics name the DTO surface before delegating to the established class
-    // expansion. `dotnet_class` parses it again and remains the single implementation path.
-    let mut parsed = parse_macro_input!(item as ItemStruct);
-    if !matches!(parsed.fields, syn::Fields::Named(_)) {
-        return syn::Error::new_spanned(
-            parsed,
-            "#[dotnet_dto] requires a struct with named fields",
-        )
-        .to_compile_error()
-        .into();
-    }
-    // A DTO schema often spells fields in their exact public CLR PascalCase. Keeping that spelling
-    // for the backing field would expose two same-named members (field + generated property), which
-    // Roslyn reports as CS0229. Internally normalize only an initial ASCII capital to lower-camel;
-    // `properties = true` capitalizes it again for the public property, preserving the schema name.
-    // Existing idiomatic lowercase Rust fields are unchanged.
+fn expand_dotnet_data_object(
+    mut parsed: ItemStruct,
+    class_options: proc_macro2::TokenStream,
+    keep_default_constructor: bool,
+) -> proc_macro2::TokenStream {
+    // Public CLR schema fields may be PascalCase. Normalize only the hidden backing field.
     for field in &mut parsed.fields {
         let Some(ident) = &mut field.ident else {
             continue;
@@ -964,21 +1319,35 @@ pub fn dotnet_dto(attr: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .map(|field| field.ty.clone())
         .collect::<Vec<_>>();
+    let seam_types = field_types
+        .iter()
+        .map(managed_data_field_seam_type)
+        .collect::<Vec<_>>();
+    let seam_values = field_names
+        .iter()
+        .zip(field_types.iter())
+        .map(|(name, ty)| managed_data_field_into_seam(name, ty))
+        .collect::<Vec<_>>();
     let arg_types = (0..fields.len())
         .map(|index| format_ident!("Arg{index}"))
         .collect::<Vec<_>>();
     let ctor_magic = format_ident!("rustc_clr_interop_managed_ctor{}_", fields.len());
-    let class_expansion = proc_macro2::TokenStream::from(dotnet_class(
-        quote!(default_ctor = true, properties = true).into(),
-        quote!(#parsed).into(),
-    ));
+    let class_expansion =
+        proc_macro2::TokenStream::from(dotnet_class(class_options.into(), quote!(#parsed).into()));
+    let keep_primary = format_ident!("KEEP_{}_PRIMARY_CTOR", dto_name);
+    let keep_default = format_ident!("KEEP_{}_DEFAULT_CTOR", dto_name);
+    let default_constructor_anchor = keep_default_constructor.then(|| {
+        quote! {
+            #[used]
+            static #keep_default: fn() -> #dto_handle = #dto_handle::ctor0;
+        }
+    });
     quote! {
         #class_expansion
 
         impl #dto_name {
-            /// Construct the fully initialized managed DTO through its generated primary CLR
-            /// constructor. The bridge arity is derived from the schema, so large DTOs do not need
-            /// a hand-written setter sequence or a fixed ctor0..ctor3 helper ladder.
+            /// Construct the fully initialized managed data object through its generated primary
+            /// CLR constructor. The bridge arity is derived from the schema.
             #[allow(non_snake_case, dead_code, unused_variables, internal_features)]
             pub fn new_managed(#(#field_names: #field_types),*) -> #dto_handle {
                 #[inline(never)]
@@ -992,18 +1361,121 @@ pub fn dotnet_dto(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ) -> ::mycorrhiza::intrinsics::RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH> {
                     loop { ::core::hint::spin_loop(); }
                 }
-                #ctor_magic::<"", #dto_name_lit, false, #(#field_types),*>(#(#field_names),*)
+                #ctor_magic::<"", #dto_name_lit, false, #(#seam_types),*>(#(#seam_values),*)
+            }
+        }
+
+        #[used]
+        static #keep_primary: fn(#(#field_types),*) -> #dto_handle = #dto_name::new_managed;
+        #default_constructor_anchor
+    }
+}
+
+#[proc_macro_attribute]
+pub fn dotnet_dto(attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[dotnet_dto] does not accept arguments; use #[dotnet_class(...)] for custom class options",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    // Validate here so diagnostics name the DTO surface before delegating to the established class
+    // expansion. `dotnet_class` parses it again and remains the single implementation path.
+    let parsed = parse_macro_input!(item as ItemStruct);
+    if !matches!(parsed.fields, syn::Fields::Named(_)) {
+        return syn::Error::new_spanned(
+            parsed,
+            "#[dotnet_dto] requires a struct with named fields",
+        )
+        .to_compile_error()
+        .into();
+    }
+    expand_dotnet_data_object(parsed, quote!(default_ctor = true, properties = true), true).into()
+}
+
+/// Declares an immutable managed data object with a primary constructor and getter-only PascalCase
+/// CLR properties. This establishes record-shaped construction and immutability; value equality,
+/// hashing, string formatting, and deconstruction are layered onto the same type metadata.
+#[proc_macro_attribute]
+pub fn dotnet_record(attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[dotnet_record] does not accept arguments",
+        )
+        .to_compile_error()
+        .into();
+    }
+    let parsed = parse_macro_input!(item as ItemStruct);
+    if !matches!(parsed.fields, syn::Fields::Named(_)) {
+        return syn::Error::new_spanned(
+            parsed,
+            "#[dotnet_record] requires a struct with named fields",
+        )
+        .to_compile_error()
+        .into();
+    }
+    expand_dotnet_data_object(
+        parsed,
+        quote!(readonly_properties = true, record_semantics = true),
+        false,
+    )
+    .into()
+}
+
+/// Declares an explicitly value-semantic CLR struct with a primary constructor and getter-only
+/// PascalCase properties. Unlike `#[dotnet_dto]`/`#[dotnet_record]`, this emits a genuine CLR value
+/// type; the annotation is required because reference-vs-value semantics are never inferred from
+/// the Rust field layout.
+#[proc_macro_attribute]
+pub fn dotnet_value(attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[dotnet_value] does not accept arguments",
+        )
+        .to_compile_error()
+        .into();
+    }
+    let mut parsed = parse_macro_input!(item as ItemStruct);
+    if !matches!(parsed.fields, syn::Fields::Named(_)) {
+        return syn::Error::new_spanned(
+            parsed,
+            "#[dotnet_value] requires a struct with named fields",
+        )
+        .to_compile_error()
+        .into();
+    }
+    for field in &mut parsed.fields {
+        if let Some(ident) = &mut field.ident {
+            let name = ident.to_string();
+            let backing = dto_backing_name(&name);
+            if backing != name {
+                *ident = syn::Ident::new(&backing, ident.span());
             }
         }
     }
-    .into()
+    dotnet_class(
+        quote!(
+            value_type = true,
+            extends = "[System.Runtime]System.ValueType",
+            properties = true
+        )
+        .into(),
+        quote!(#parsed).into(),
+    )
 }
 
 #[cfg(test)]
 mod dotnet_export_name_tests {
     use super::{
-        clr_member_id_type_name, dotnet_export_member_id, dto_backing_name,
-        imported_delegate_param, parse_dotnet_export_args,
+        XmlDocException, clr_member_id_type_name, dotnet_export_member_id, dto_backing_name,
+        imported_delegate_param, interface_member_id_type_name, managed_nullability_spec,
+        marshal_param, marshal_return, marshalled_reference_needs_borrow, parse_dotnet_export_args,
+        render_rustdoc_xml, to_pascal_case,
     };
     use quote::quote;
     use syn::parse_quote;
@@ -1022,6 +1494,15 @@ mod dotnet_export_name_tests {
     fn dto_pascal_schema_name_uses_a_distinct_lower_camel_backing_field() {
         assert_eq!(dto_backing_name("FirmNumber"), "firmNumber");
         assert_eq!(dto_backing_name("amount"), "amount");
+        assert_eq!(dto_backing_name("shock_percent"), "shockPercent");
+        assert_eq!(dto_backing_name("horizon_days"), "horizonDays");
+    }
+
+    #[test]
+    fn managed_members_default_to_pascal_case() {
+        assert_eq!(to_pascal_case("calculate_risk"), "CalculateRisk");
+        assert_eq!(to_pascal_case("url2_value"), "Url2Value");
+        assert_eq!(to_pascal_case("AlreadyManaged"), "AlreadyManaged");
     }
 
     #[test]
@@ -1044,6 +1525,70 @@ mod dotnet_export_name_tests {
     }
 
     #[test]
+    fn accepts_structured_managed_error_policy() {
+        let args = parse_dotnet_export_args(quote!(error = "managed")).unwrap();
+        assert!(args.error_managed);
+        assert!(!args.error_exception);
+    }
+
+    #[test]
+    fn accepts_safe_attributes_on_method_return_and_parameter_targets() {
+        let args = parse_dotnet_export_args(quote!(
+            attr(
+                "[Contracts]Contracts.MarkerAttribute",
+                args("method"),
+                props(Stable = true)
+            ),
+            return_attr("[Contracts]Contracts.MarkerAttribute", args("return")),
+            param_attr(
+                value,
+                "[Contracts]Contracts.MarkerAttribute",
+                args("parameter")
+            )
+        ))
+        .unwrap();
+        assert_eq!(args.method_attrs.len(), 1);
+        assert_eq!(args.return_attrs.len(), 1);
+        assert_eq!(args.parameter_attrs.len(), 1);
+        assert_eq!(args.parameter_attrs[0].0, "value");
+    }
+
+    #[test]
+    fn rejects_runtime_semantic_attributes_on_every_general_target() {
+        let error = parse_dotnet_export_args(quote!(return_attr(
+            "[System.Runtime]System.Runtime.InteropServices.StructLayoutAttribute"
+        )))
+        .unwrap_err();
+        assert!(error.to_string().contains("runtime-semantic"));
+    }
+
+    #[test]
+    fn nullable_spec_distinguishes_required_nullable_and_value_positions() {
+        let signature: syn::Signature = parse_quote! {
+            fn choose(
+                required: String,
+                optional: ManagedOption<MString>,
+                count: i32,
+            ) -> ManagedOption<MString>
+        };
+        assert_eq!(
+            managed_nullability_spec(&signature.inputs, 0, &signature.output),
+            "1|2|1,2,0"
+        );
+    }
+
+    #[test]
+    fn nullable_spec_leaves_span_and_memory_value_types_oblivious() {
+        let signature: syn::Signature = parse_quote! {
+            fn mutate(values: &mut [i32], memory: Memory<i32>) -> i32
+        };
+        assert_eq!(
+            managed_nullability_spec(&signature.inputs, 0, &signature.output),
+            ""
+        );
+    }
+
+    #[test]
     fn accepts_registered_enum_types() {
         let parsed =
             parse_dotnet_export_args(quote!(name = "Roundtrip", enums(Status, Mode))).unwrap();
@@ -1060,10 +1605,155 @@ mod dotnet_export_name_tests {
     }
 
     #[test]
+    fn parameterless_xml_member_ids_omit_parentheses() {
+        assert_eq!(
+            dotnet_export_member_id("Version", &[]),
+            "M:MainModule.Version"
+        );
+    }
+
+    #[test]
+    fn rustdoc_sections_become_complete_escaped_intellisense_xml() {
+        let xml = render_rustdoc_xml(
+            "Computes <risk> & exposure.\n\n# Arguments\n- `positions`: Portfolio & prices.\n\n# Type Parameters\n- `T`: Numeric <kind>.\n\n# Returns\nThe computed value.\n\n# Errors\nThe operation failed.",
+            &["positions".to_string(), "horizon".to_string()],
+            true,
+            &["T".to_string()],
+            &[XmlDocException {
+                cref: "T:System.Exception",
+                fallback: "fallback",
+            }],
+        );
+        assert!(xml.contains("<summary>Computes &lt;risk&gt; &amp; exposure.</summary>"));
+        assert!(
+            xml.contains("<param name=\"positions\">Portfolio &amp; prices.</param>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(
+                "<param name=\"horizon\">No parameter documentation was provided.</param>"
+            )
+        );
+        assert!(xml.contains("<typeparam name=\"T\">Numeric &lt;kind&gt;.</typeparam>"));
+        assert!(xml.contains("<returns>The computed value.</returns>"));
+        assert!(
+            xml.contains(
+                "<exception cref=\"T:System.Exception\">The operation failed.</exception>"
+            )
+        );
+    }
+
+    #[test]
+    fn interface_member_ids_distinguish_type_and_method_generic_parameters() {
+        let type_parameters = std::collections::HashMap::from([("T".to_string(), 0)]);
+        let method_parameters = std::collections::HashMap::from([("U".to_string(), 0)]);
+        assert_eq!(
+            interface_member_id_type_name(&parse_quote!(T), &type_parameters, &method_parameters,)
+                .as_deref(),
+            Some("`0")
+        );
+        assert_eq!(
+            interface_member_id_type_name(
+                &parse_quote!(&mut U),
+                &type_parameters,
+                &method_parameters,
+            )
+            .as_deref(),
+            Some("``0@")
+        );
+    }
+
+    #[test]
     fn imported_delegate_member_ids_keep_the_constructed_clr_signature() {
         assert_eq!(
             clr_member_id_type_name(&parse_quote!(Func2<i32, i64, bool>)).as_deref(),
             Some("System.Func{System.Int32,System.Int64,System.Boolean}")
+        );
+    }
+
+    #[test]
+    fn managed_array_member_ids_use_clr_array_syntax() {
+        assert_eq!(
+            clr_member_id_type_name(&parse_quote!(ManagedArray<i32>)).as_deref(),
+            Some("System.Int32[]")
+        );
+    }
+
+    #[test]
+    fn readonly_list_member_ids_use_constructed_interface_syntax() {
+        assert_eq!(
+            clr_member_id_type_name(&parse_quote!(ReadOnlyList<i32>)).as_deref(),
+            Some("System.Collections.Generic.IReadOnlyList{System.Int32}")
+        );
+    }
+
+    #[test]
+    fn memory_member_ids_use_constructed_value_type_syntax() {
+        assert_eq!(
+            clr_member_id_type_name(&parse_quote!(Memory<i32>)).as_deref(),
+            Some("System.Memory{System.Int32}")
+        );
+        assert_eq!(
+            clr_member_id_type_name(&parse_quote!(ReadOnlyMemory<f64>)).as_deref(),
+            Some("System.ReadOnlyMemory{System.Double}")
+        );
+        assert_eq!(
+            clr_member_id_type_name(&parse_quote!(&[i32])).as_deref(),
+            Some("System.ReadOnlySpan{System.Int32}")
+        );
+        assert_eq!(
+            clr_member_id_type_name(&parse_quote!(&mut [f64])).as_deref(),
+            Some("System.Span{System.Double}")
+        );
+    }
+
+    #[test]
+    fn scoped_slice_conversions_are_not_borrowed_twice() {
+        assert!(!marshalled_reference_needs_borrow(&parse_quote!(&[i32])));
+        assert!(!marshalled_reference_needs_borrow(&parse_quote!(&mut [
+            f64
+        ])));
+        assert!(marshalled_reference_needs_borrow(&parse_quote!(&str)));
+    }
+
+    #[test]
+    fn mutable_collection_member_ids_use_interface_syntax() {
+        assert_eq!(
+            clr_member_id_type_name(&parse_quote!(MutableList<i32>)).as_deref(),
+            Some("System.Collections.Generic.IList{System.Int32}")
+        );
+        assert_eq!(
+            clr_member_id_type_name(&parse_quote!(MutableDictionary<i32, f64>)).as_deref(),
+            Some("System.Collections.Generic.IDictionary{System.Int32,System.Double}")
+        );
+        assert_eq!(
+            clr_member_id_type_name(&parse_quote!(ManagedEnumerable<i64>)).as_deref(),
+            Some("System.Collections.Generic.IEnumerable{System.Int64}")
+        );
+        assert_eq!(
+            clr_member_id_type_name(&parse_quote!(AsyncEnumerable<i64>)).as_deref(),
+            Some("System.Collections.Generic.IAsyncEnumerable{System.Int64}")
+        );
+    }
+
+    #[test]
+    fn async_enumerable_returns_as_the_framework_interface() {
+        let marshalled = marshal_return(&parse_quote!(AsyncEnumerable<i32>))
+            .expect("async enumerable return should marshal");
+        assert!(marshalled.returns_managed_handle);
+        assert!(marshalled.from_rust.is_some());
+        assert!(marshalled.seam_ty.to_string().contains("IAsyncEnumerable"));
+    }
+
+    #[test]
+    fn ui_dispatcher_parameters_use_the_host_neutral_managed_interface() {
+        let marshalled =
+            marshal_param(&parse_quote!(UiDispatcher)).expect("UI dispatcher should marshal");
+        assert!(marshalled.to_rust.is_some());
+        assert!(marshalled.seam_ty.to_string().contains("IUiDispatcher"));
+        assert_eq!(
+            clr_member_id_type_name(&parse_quote!(UiDispatcher)).as_deref(),
+            Some("Mycorrhiza.Interop.Helpers.IRustUiDispatcher")
         );
     }
 
@@ -1641,6 +2331,14 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
         format!("{trait_name}`{}", type_params.len())
     };
     let name_lit = LitStr::new(&dotnet_name, span);
+    let interface_doc = scrape_doc_comment(&input.attrs)
+        .unwrap_or_else(|| format!("Managed interface generated from Rust `{trait_name}`."));
+    let interface_type_parameters: Vec<String> =
+        type_params.iter().map(ToString::to_string).collect();
+    emit_xmldoc_member(
+        &format!("T:{dotnet_name}"),
+        &render_rustdoc_xml(&interface_doc, &[], false, &interface_type_parameters, &[]),
+    );
     // Supertraits: each becomes a .NET base interface (`interface IDerived : IBase` — an
     // `InterfaceImpl` row on this interface's TypeDef). Only a plain, non-generic trait path is
     // representable; every other bound shape is rejected loudly. The .NET name is the LAST path
@@ -1788,6 +2486,9 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
             .to_compile_error()
             .into();
         };
+        let documentation_signature = m.sig.clone();
+        let member_doc = scrape_doc_comment(&m.attrs)
+            .unwrap_or_else(|| format!("Managed interface member `{}`.", m.sig.ident));
         // `async fn` has NO faithful interface lowering: the signature carrier is built from the
         // declared inputs/output only, so the emitted member would be a *synchronous* `void`/`T`
         // shape while the author expects a `Task`-returning one — reject loudly (the same axis
@@ -1843,12 +2544,46 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
         // `rustc_codegen_clr_mark_last_abstract_property_get`/`_set` call binding it into a
         // §II.22.34 `Property` row named `<Prop>`. See the macro's top doc for the full contract.
         let mut property_name: Option<(String, bool)> = None;
+        let mut property_attr_specs = Vec::new();
         for attr in &m.attrs {
             if attr.path().is_ident("dotnet_property") {
-                if !matches!(attr.meta, syn::Meta::Path(_)) {
+                if let syn::Meta::List(list) = &attr.meta {
+                    let entries = match list
+                        .parse_args_with(Punctuated::<syn::Meta, Token![,]>::parse_terminated)
+                    {
+                        Ok(entries) => entries,
+                        Err(error) => return error.to_compile_error().into(),
+                    };
+                    for entry in entries {
+                        let syn::Meta::List(attribute) = entry else {
+                            return syn::Error::new(
+                                entry.span(),
+                                "#[dotnet_property(...)]: expected `attr(...)`",
+                            )
+                            .to_compile_error()
+                            .into();
+                        };
+                        if !attribute.path.is_ident("attr") {
+                            return syn::Error::new(
+                                attribute.path.span(),
+                                "#[dotnet_property(...)]: unknown option; expected `attr(...)`",
+                            )
+                            .to_compile_error()
+                            .into();
+                        }
+                        let spec = match attribute.parse_args::<AttrSpec>() {
+                            Ok(spec) => spec,
+                            Err(error) => return error.to_compile_error().into(),
+                        };
+                        if let Err(error) = validate_safe_attr_spec(&spec, attribute.span()) {
+                            return error.to_compile_error().into();
+                        }
+                        property_attr_specs.push(spec);
+                    }
+                } else if !matches!(attr.meta, syn::Meta::Path(_)) {
                     return syn::Error::new(
                         attr.span(),
-                        "#[dotnet_interface]: `#[dotnet_property]` takes no argument",
+                        "#[dotnet_property]: expected no arguments or `attr(...)`",
                     )
                     .to_compile_error()
                     .into();
@@ -1880,6 +2615,18 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
                 property_name = Some((prop.to_string(), is_getter));
             }
+        }
+        if !property_attr_specs.is_empty()
+            && property_name
+                .as_ref()
+                .is_some_and(|(_, is_getter)| !is_getter)
+        {
+            return syn::Error::new(
+                m.sig.ident.span(),
+                "property custom attributes belong on the `get_<Name>` declaration, not the setter",
+            )
+            .to_compile_error()
+            .into();
         }
         m.attrs.retain(|a| !a.path().is_ident("dotnet_property"));
         if property_name.is_some() && is_event {
@@ -2033,7 +2780,7 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
         // Owned clone (not `&m.sig.ident`): the parameter loop below needs `&mut m.sig.inputs`
         // to strip `#[dotnet_out]` markers in place, which a live shared borrow would block.
         let fn_ident = m.sig.ident.clone();
-        let fname_lit = LitStr::new(&fn_ident.to_string(), fn_ident.span());
+        let fname_lit = LitStr::new(&to_pascal_case(&fn_ident.to_string()), fn_ident.span());
         let carrier_ident = if is_event {
             format_ident!("__iface_sig_event_{}", fn_ident)
         } else {
@@ -2047,6 +2794,85 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
         // takes the parameter list verbatim, with no `_this` at all. Every non-receiver parameter
         // is kept verbatim in both cases.
         let is_static = !matches!(m.sig.inputs.first(), Some(FnArg::Receiver(_)));
+        let managed_parameter_names = documentation_signature
+            .inputs
+            .iter()
+            .skip(usize::from(!is_static))
+            .enumerate()
+            .filter_map(|(index, argument)| match argument {
+                FnArg::Typed(argument) => Some(documented_parameter_name(&argument.pat, index)),
+                FnArg::Receiver(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let managed_parameter_names_lit = LitStr::new(
+            &managed_parameter_names.join(";"),
+            documentation_signature.span(),
+        );
+        let nullability_lit = LitStr::new(
+            &managed_nullability_spec(
+                &documentation_signature.inputs,
+                usize::from(!is_static),
+                &documentation_signature.output,
+            ),
+            documentation_signature.span(),
+        );
+        let managed_member_name = to_pascal_case(&fn_ident.to_string());
+        if is_event {
+            emit_xmldoc_member(
+                &format!("E:{dotnet_name}.{managed_member_name}"),
+                &render_rustdoc_xml(&member_doc, &[], false, &[], &[]),
+            );
+        } else if let Some((property, is_getter)) = &property_name {
+            if *is_getter {
+                emit_xmldoc_member(
+                    &format!("P:{dotnet_name}.{property}"),
+                    &render_rustdoc_xml(&member_doc, &[], false, &[], &[]),
+                );
+            }
+        } else {
+            let mut parameter_types = Vec::new();
+            let mut parameter_names = Vec::new();
+            let mut complete = true;
+            for (index, argument) in documentation_signature
+                .inputs
+                .iter()
+                .skip(usize::from(!is_static))
+                .enumerate()
+            {
+                let FnArg::Typed(argument) = argument else {
+                    complete = false;
+                    break;
+                };
+                let Some(parameter_type) =
+                    interface_member_id_type_name(&argument.ty, &param_index, &method_param_index)
+                else {
+                    complete = false;
+                    break;
+                };
+                parameter_types.push(parameter_type);
+                parameter_names.push(documented_parameter_name(&argument.pat, index));
+            }
+            if complete {
+                let method_name = if method_type_params.is_empty() {
+                    managed_member_name
+                } else {
+                    format!("{managed_member_name}``{}", method_type_params.len())
+                };
+                let member = dotnet_method_member_id(&dotnet_name, &method_name, &parameter_types);
+                let method_type_parameter_names: Vec<String> =
+                    method_type_params.iter().map(ToString::to_string).collect();
+                emit_xmldoc_member(
+                    &member,
+                    &render_rustdoc_xml(
+                        &member_doc,
+                        &parameter_names,
+                        documented_return_has_value(&documentation_signature.output),
+                        &method_type_parameter_names,
+                        &[],
+                    ),
+                );
+            }
+        }
         if property_name.is_some() && !method_type_params.is_empty() {
             return syn::Error::new(
                 m.sig.generics.span(),
@@ -2259,6 +3085,13 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .into();
                         }
                     }
+                    if !has_default {
+                        if let Some((name, inner)) = single_generic_arg(&carrier_pt.ty) {
+                            if name == "ManagedOption" {
+                                carrier_pt.ty = Box::new(inner.clone());
+                            }
+                        }
+                    }
                     carrier_inputs.push(FnArg::Typed(carrier_pt));
                 }
                 FnArg::Receiver(r) => {
@@ -2324,6 +3157,16 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                     )
                     .to_compile_error()
                     .into();
+                } else if !has_default {
+                    if let Some((name, inner)) = single_generic_arg(ty) {
+                        if name == "ManagedOption" {
+                            ReturnType::Type(*arrow, Box::new(inner.clone()))
+                        } else {
+                            ReturnType::Type(*arrow, ty.clone())
+                        }
+                    } else {
+                        ReturnType::Type(*arrow, ty.clone())
+                    }
                 } else {
                     ReturnType::Type(*arrow, ty.clone())
                 }
@@ -2512,13 +3355,13 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
             });
             method_calls.push(quote! {
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_abstract_method_def::<
-                    #add_lit, _,
+                    #add_lit, #managed_parameter_names_lit, #nullability_lit, _,
                 >(class, #carrier_ident);
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_mark_last_method_event_add::<
                     #fname_lit,
                 >(class);
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_abstract_method_def::<
-                    #remove_lit, _,
+                    #remove_lit, #managed_parameter_names_lit, #nullability_lit, _,
                 >(class, #carrier_ident);
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_mark_last_method_event_remove::<
                     #fname_lit,
@@ -2598,7 +3441,7 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
             });
             method_calls.push(quote! {
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_default_method_def::<
-                    #fname_lit, _,
+                    #fname_lit, #managed_parameter_names_lit, #nullability_lit, _,
                 >(class, #dim_ident);
             });
         } else {
@@ -2615,7 +3458,7 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // the member's C#-visible parameter list verbatim.
                 method_calls.push(quote! {
                     let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_static_abstract_method_def::<
-                        #fname_lit, _,
+                        #fname_lit, #managed_parameter_names_lit, #nullability_lit, _,
                     >(class, #carrier_ident);
                 });
             } else if !method_type_params.is_empty() {
@@ -2632,13 +3475,13 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let gparams_lit = LitStr::new(&gparams_csv, fn_ident.span());
                 method_calls.push(quote! {
                     let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_generic_abstract_method_def::<
-                        #fname_lit, #gparams_lit, _,
+                        #fname_lit, #gparams_lit, #managed_parameter_names_lit, #nullability_lit, _,
                     >(class, #carrier_ident);
                 });
             } else {
                 method_calls.push(quote! {
                     let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_abstract_method_def::<
-                        #fname_lit, _,
+                        #fname_lit, #managed_parameter_names_lit, #nullability_lit, _,
                     >(class, #carrier_ident);
                 });
                 // `#[dotnet_property]`: bind the abstract member just registered above as a
@@ -2654,6 +3497,12 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 #prop_lit,
                             >(class);
                         });
+                        for spec in &property_attr_specs {
+                            let packed = LitStr::new(&spec.encode(), fn_ident.span());
+                            method_calls.push(quote! {
+                                let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_property_custom_attr::<#prop_lit, #packed>(class);
+                            });
+                        }
                     } else {
                         method_calls.push(quote! {
                             let class = ::mycorrhiza::comptime::rustc_codegen_clr_mark_last_abstract_property_set::<
@@ -2765,6 +3614,9 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
         // The trait, unchanged — a declaration vehicle only.
         #input
 
+        #[doc(hidden)]
+        const _: ::core::option::Option<&'static str> = option_env!("RCL_XMLDOC_BUILD_ID");
+
         #handle_alias
 
         #[allow(non_snake_case, dead_code, unused_variables, internal_features, clippy::diverging_sub_expression)]
@@ -2798,6 +3650,557 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #(#base_iface_calls)*
                 #(#method_calls)*
                 ::mycorrhiza::comptime::rustc_codegen_clr_finish_type(class);
+            }
+        }
+    };
+    expanded.into()
+}
+
+// ============================================================================
+// #[dotnet_native_job] — generate a managed lifecycle shell over NativeJob.
+// ============================================================================
+
+struct DotnetNativeJobArgs {
+    class: syn::Ident,
+    status: syn::Ident,
+    registration: Type,
+    result: Type,
+    error: Type,
+    progress: Type,
+    result_empty: Expr,
+    error_empty: Expr,
+    stop_error: syn::Path,
+    live_workers: syn::Path,
+}
+
+fn native_job_ident(value: &Expr, name: &str) -> syn::Result<syn::Ident> {
+    let Expr::Path(path) = value else {
+        return Err(syn::Error::new(
+            value.span(),
+            format!("#[dotnet_native_job]: `{name}` must be a plain identifier"),
+        ));
+    };
+    if path.qself.is_some() || path.path.segments.len() != 1 {
+        return Err(syn::Error::new(
+            value.span(),
+            format!("#[dotnet_native_job]: `{name}` must be a plain identifier"),
+        ));
+    }
+    Ok(path.path.segments[0].ident.clone())
+}
+
+fn native_job_type(value: &Expr, name: &str) -> syn::Result<Type> {
+    syn::parse2(quote!(#value)).map_err(|_| {
+        syn::Error::new(
+            value.span(),
+            format!("#[dotnet_native_job]: `{name}` must be a Rust type"),
+        )
+    })
+}
+
+fn native_job_path(value: &Expr, name: &str) -> syn::Result<syn::Path> {
+    let Expr::Path(path) = value else {
+        return Err(syn::Error::new(
+            value.span(),
+            format!("#[dotnet_native_job]: `{name}` must be a function path"),
+        ));
+    };
+    if path.qself.is_some() {
+        return Err(syn::Error::new(
+            value.span(),
+            format!("#[dotnet_native_job]: `{name}` must be a function path"),
+        ));
+    }
+    Ok(path.path.clone())
+}
+
+fn parse_dotnet_native_job_args(
+    options: Punctuated<MetaNameValue, Token![,]>,
+) -> syn::Result<DotnetNativeJobArgs> {
+    let mut class = None;
+    let mut status = None;
+    let mut registration = None;
+    let mut result = None;
+    let mut error = None;
+    let mut progress = None;
+    let mut result_empty = None;
+    let mut error_empty = None;
+    let mut stop_error = None;
+    let mut live_workers = None;
+
+    for option in options {
+        let Some(name) = option.path.get_ident().map(ToString::to_string) else {
+            return Err(syn::Error::new(
+                option.path.span(),
+                "#[dotnet_native_job]: option names must be plain identifiers",
+            ));
+        };
+        let duplicate = match name.as_str() {
+            "class" => class
+                .replace(native_job_ident(&option.value, "class")?)
+                .is_some(),
+            "status" => status
+                .replace(native_job_ident(&option.value, "status")?)
+                .is_some(),
+            "registration" => registration
+                .replace(native_job_type(&option.value, "registration")?)
+                .is_some(),
+            "result" => result
+                .replace(native_job_type(&option.value, "result")?)
+                .is_some(),
+            "error" => error
+                .replace(native_job_type(&option.value, "error")?)
+                .is_some(),
+            "progress" => progress
+                .replace(native_job_type(&option.value, "progress")?)
+                .is_some(),
+            "result_empty" => result_empty.replace(option.value.clone()).is_some(),
+            "error_empty" => error_empty.replace(option.value.clone()).is_some(),
+            "stop_error" => stop_error
+                .replace(native_job_path(&option.value, "stop_error")?)
+                .is_some(),
+            "live_workers" => live_workers
+                .replace(native_job_path(&option.value, "live_workers")?)
+                .is_some(),
+            _ => {
+                return Err(syn::Error::new(
+                    option.path.span(),
+                    format!(
+                        "#[dotnet_native_job]: unknown option `{name}`; expected class, status, \
+                         registration, result, error, progress, result_empty, error_empty, \
+                         stop_error, or live_workers"
+                    ),
+                ));
+            }
+        };
+        if duplicate {
+            return Err(syn::Error::new(
+                option.path.span(),
+                format!("#[dotnet_native_job]: duplicate `{name}` option"),
+            ));
+        }
+    }
+
+    let missing = |name: &str| {
+        syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!("#[dotnet_native_job]: missing required `{name} = ...` option"),
+        )
+    };
+    Ok(DotnetNativeJobArgs {
+        class: class.ok_or_else(|| missing("class"))?,
+        status: status.ok_or_else(|| missing("status"))?,
+        registration: registration.ok_or_else(|| missing("registration"))?,
+        result: result.ok_or_else(|| missing("result"))?,
+        error: error.ok_or_else(|| missing("error"))?,
+        progress: progress.ok_or_else(|| missing("progress"))?,
+        result_empty: result_empty.ok_or_else(|| missing("result_empty"))?,
+        error_empty: error_empty.ok_or_else(|| missing("error_empty"))?,
+        stop_error: stop_error.ok_or_else(|| missing("stop_error"))?,
+        live_workers: live_workers.ok_or_else(|| missing("live_workers"))?,
+    })
+}
+
+/// Generates a C#-natural `IDisposable` shell over one API-specific native-job start function.
+///
+/// The annotated Rust function remains the only API-specific code. Its first parameter is a
+/// `rust_dotnet_pinvoke::NativeJobController<Result, Error, Progress>`; remaining parameters become
+/// the managed static `Start` arguments; and it returns `Result<Registration, StartError>`.
+/// `Registration` must implement `RetryableStop` (the `native_api! retained_callback` declaration
+/// does this). The generated class owns a registry-backed native state, so its identifier is
+/// immutable from C#, repeated disposal is safe, and concurrent calls retain the state until their
+/// operation completes.
+#[proc_macro_attribute]
+pub fn dotnet_native_job(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let options =
+        parse_macro_input!(attr with Punctuated::<MetaNameValue, Token![,]>::parse_terminated);
+    let args = match parse_dotnet_native_job_args(options) {
+        Ok(args) => args,
+        Err(error) => return error.to_compile_error().into(),
+    };
+    let input = parse_macro_input!(item as ItemFn);
+
+    if input.sig.asyncness.is_some()
+        || input.sig.constness.is_some()
+        || input.sig.unsafety.is_some()
+        || input.sig.abi.is_some()
+        || input.sig.variadic.is_some()
+        || !input.sig.generics.params.is_empty()
+    {
+        return syn::Error::new(
+            input.sig.span(),
+            "#[dotnet_native_job]: the start adapter must be an ordinary non-generic Rust function",
+        )
+        .to_compile_error()
+        .into();
+    }
+    let Some(FnArg::Typed(controller)) = input.sig.inputs.first() else {
+        return syn::Error::new(
+            input.sig.inputs.span(),
+            "#[dotnet_native_job]: the first parameter must be NativeJobController<Result, Error, Progress>",
+        )
+        .to_compile_error()
+        .into();
+    };
+    let controller_types = match &*controller.ty {
+        Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .filter(|segment| segment.ident == "NativeJobController")
+            .and_then(|segment| match &segment.arguments {
+                syn::PathArguments::AngleBracketed(arguments) => Some(
+                    arguments
+                        .args
+                        .iter()
+                        .filter_map(|argument| match argument {
+                            syn::GenericArgument::Type(ty) => Some(ty),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            }),
+        _ => None,
+    };
+    let expected_controller_types = [&args.result, &args.error, &args.progress];
+    let controller_matches = controller_types.as_ref().is_some_and(|types| {
+        types.len() == expected_controller_types.len()
+            && types
+                .iter()
+                .zip(expected_controller_types)
+                .all(|(actual, expected)| {
+                    quote! { #actual }.to_string() == quote! { #expected }.to_string()
+                })
+    });
+    if !controller_matches {
+        return syn::Error::new(
+            controller.ty.span(),
+            "#[dotnet_native_job]: the first parameter must be NativeJobController<Result, Error, Progress> matching the declared result, error, and progress types",
+        )
+        .to_compile_error()
+        .into();
+    }
+    let ReturnType::Type(_, return_type) = &input.sig.output else {
+        return syn::Error::new(
+            input.sig.output.span(),
+            "#[dotnet_native_job]: the start adapter must return Result<Registration, StartError>",
+        )
+        .to_compile_error()
+        .into();
+    };
+    let returns_result = matches!(
+        &**return_type,
+        Type::Path(path)
+            if path.path.segments.last().is_some_and(|segment| segment.ident == "Result")
+    );
+    if !returns_result {
+        return syn::Error::new(
+            return_type.span(),
+            "#[dotnet_native_job]: the start adapter must return Result<Registration, StartError>",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let mut start_arguments = Vec::<(syn::Ident, Type)>::new();
+    for argument in input.sig.inputs.iter().skip(1) {
+        let FnArg::Typed(argument) = argument else {
+            return syn::Error::new(
+                argument.span(),
+                "#[dotnet_native_job]: `self` parameters are not supported",
+            )
+            .to_compile_error()
+            .into();
+        };
+        let syn::Pat::Ident(pattern) = &*argument.pat else {
+            return syn::Error::new(
+                argument.pat.span(),
+                "#[dotnet_native_job]: start parameters must use identifier bindings",
+            )
+            .to_compile_error()
+            .into();
+        };
+        if pattern.subpat.is_some() || pattern.by_ref.is_some() {
+            return syn::Error::new(
+                pattern.span(),
+                "#[dotnet_native_job]: start parameters must be plain by-value identifiers",
+            )
+            .to_compile_error()
+            .into();
+        }
+        start_arguments.push((pattern.ident.clone(), (*argument.ty).clone()));
+    }
+
+    let DotnetNativeJobArgs {
+        class,
+        status,
+        registration,
+        result,
+        error,
+        progress,
+        result_empty,
+        error_empty,
+        stop_error,
+        live_workers,
+    } = args;
+    let start_fn = &input.sig.ident;
+    let handle = format_ident!("{}Handle", class);
+    let state = format_ident!("__{}State", class);
+    let job = format_ident!("__{}CoreJob", class);
+    let registry_static = format_ident!("__{}_REGISTRY", class.to_string().to_ascii_uppercase());
+    let next_id_static = format_ident!("__{}_NEXT_ID", class.to_string().to_ascii_uppercase());
+    let registry_fn = format_ident!("__{}_registry", class.to_string().to_lowercase());
+    let state_fn = format_ident!("__{}_state", class.to_string().to_lowercase());
+    let start_argument_names = start_arguments.iter().map(|(name, _)| name);
+    let start_argument_defs = start_arguments.iter().map(|(name, ty)| quote!(#name: #ty));
+
+    let expanded = quote! {
+        #input
+
+        #[::dotnet_macros::dotnet_enum]
+        #[derive(Clone, Copy)]
+        #[repr(i32)]
+        pub enum #status {
+            Running = 0,
+            Succeeded = 1,
+            Failed = 2,
+            Stopped = 3,
+        }
+
+        type #job = ::rust_dotnet_pinvoke::NativeJob<
+            #registration,
+            #result,
+            #error,
+            #progress,
+        >;
+
+        struct #state {
+            job: #job,
+            progress: ::mycorrhiza::progress::ProgressReporter<#progress>,
+            pending_progress: ::std::sync::Arc<
+                ::std::sync::Mutex<::std::collections::VecDeque<#progress>>,
+            >,
+            last_stop_error: i32,
+        }
+
+        static #registry_static: ::std::sync::OnceLock<
+            ::std::sync::Mutex<
+                ::std::collections::HashMap<
+                    usize,
+                    ::std::sync::Arc<::std::sync::Mutex<#state>>,
+                >,
+            >,
+        > = ::std::sync::OnceLock::new();
+        static #next_id_static: ::std::sync::atomic::AtomicUsize =
+            ::std::sync::atomic::AtomicUsize::new(1);
+
+        fn #registry_fn() -> &'static ::std::sync::Mutex<
+            ::std::collections::HashMap<
+                usize,
+                ::std::sync::Arc<::std::sync::Mutex<#state>>,
+            >,
+        > {
+            #registry_static.get_or_init(|| {
+                ::std::sync::Mutex::new(::std::collections::HashMap::new())
+            })
+        }
+
+        fn #state_fn(this: #handle) -> ::std::sync::Arc<::std::sync::Mutex<#state>> {
+            let id = this.instance0::<"read_id", usize>();
+            #registry_fn()
+                .lock()
+                .unwrap_or_else(::std::sync::PoisonError::into_inner)
+                .get(&id)
+                .cloned()
+                .expect("managed native job is disposed or was not created by Start")
+        }
+
+        #[::dotnet_macros::dotnet_class(constructor_visibility = "assembly")]
+        pub struct #class {
+            id: usize,
+        }
+
+        #[::dotnet_macros::dotnet_methods(disposable, enums(#status))]
+        impl #class {
+            pub fn start(
+                progress: ::mycorrhiza::progress::Progress<#progress>,
+                #(#start_argument_defs),*
+            ) -> #handle {
+                let pending_progress = ::std::sync::Arc::new(
+                    ::std::sync::Mutex::new(::std::collections::VecDeque::new()),
+                );
+                let callback_progress = ::std::sync::Arc::clone(&pending_progress);
+                let job: #job = match #job::start(
+                    move |value| {
+                        callback_progress
+                            .lock()
+                            .unwrap_or_else(::std::sync::PoisonError::into_inner)
+                            .push_back(value);
+                    },
+                    move |controller| #start_fn(controller, #(#start_argument_names),*),
+                ) {
+                    ::core::result::Result::Ok(job) => job,
+                    ::core::result::Result::Err(_) => {
+                        panic!("native callback registration failed")
+                    }
+                };
+                let id = #next_id_static.fetch_add(
+                    1,
+                    ::std::sync::atomic::Ordering::Relaxed,
+                );
+                assert_ne!(id, 0, "managed native-job identifier space exhausted");
+                let previous = #registry_fn()
+                    .lock()
+                    .unwrap_or_else(::std::sync::PoisonError::into_inner)
+                    .insert(
+                        id,
+                        ::std::sync::Arc::new(::std::sync::Mutex::new(#state {
+                            job,
+                            progress: ::mycorrhiza::progress::ProgressReporter::from_raw(progress),
+                            pending_progress,
+                            last_stop_error: 0,
+                        })),
+                    );
+                assert!(previous.is_none(), "managed native-job identifier collision");
+                #handle::ctor1(id)
+            }
+
+            pub fn status(this: #handle) -> #status {
+                let state = #state_fn(this);
+                let state = state
+                    .lock()
+                    .unwrap_or_else(::std::sync::PoisonError::into_inner);
+                match state.job.status() {
+                    ::rust_dotnet_pinvoke::NativeJobStatus::Running => #status::Running,
+                    ::rust_dotnet_pinvoke::NativeJobStatus::Succeeded => #status::Succeeded,
+                    ::rust_dotnet_pinvoke::NativeJobStatus::Failed => #status::Failed,
+                    ::rust_dotnet_pinvoke::NativeJobStatus::Stopped => #status::Stopped,
+                }
+            }
+
+            pub fn request_cancellation(this: #handle) {
+                let state = #state_fn(this);
+                state
+                    .lock()
+                    .unwrap_or_else(::std::sync::PoisonError::into_inner)
+                    .job
+                    .request_cancellation();
+            }
+
+            pub fn is_cancellation_requested(this: #handle) -> bool {
+                let state = #state_fn(this);
+                state
+                    .lock()
+                    .unwrap_or_else(::std::sync::PoisonError::into_inner)
+                    .job
+                    .is_cancellation_requested()
+            }
+
+            pub fn is_registered(this: #handle) -> bool {
+                let state = #state_fn(this);
+                state
+                    .lock()
+                    .unwrap_or_else(::std::sync::PoisonError::into_inner)
+                    .job
+                    .is_registered()
+            }
+
+            pub fn take_result(this: #handle) -> #result {
+                let state = #state_fn(this);
+                state
+                    .lock()
+                    .unwrap_or_else(::std::sync::PoisonError::into_inner)
+                    .job
+                    .take_result()
+                    .unwrap_or(#result_empty)
+            }
+
+            pub fn take_error(this: #handle) -> #error {
+                let state = #state_fn(this);
+                state
+                    .lock()
+                    .unwrap_or_else(::std::sync::PoisonError::into_inner)
+                    .job
+                    .take_error()
+                    .unwrap_or(#error_empty)
+            }
+
+            pub fn fail(this: #handle, error: #error) -> bool {
+                let state = #state_fn(this);
+                state
+                    .lock()
+                    .unwrap_or_else(::std::sync::PoisonError::into_inner)
+                    .job
+                    .controller()
+                    .fail(error)
+                    .is_ok()
+            }
+
+            pub fn pump_progress(this: #handle) -> i32 {
+                let state = #state_fn(this);
+                let (progress, values) = {
+                    let state = state
+                        .lock()
+                        .unwrap_or_else(::std::sync::PoisonError::into_inner);
+                    let values = state
+                        .pending_progress
+                        .lock()
+                        .unwrap_or_else(::std::sync::PoisonError::into_inner)
+                        .drain(..)
+                        .collect::<::std::vec::Vec<_>>();
+                    (state.progress.clone(), values)
+                };
+                let count = values.len() as i32;
+                for value in values {
+                    progress.report(value);
+                }
+                count
+            }
+
+            pub fn try_stop(this: #handle) -> bool {
+                let state = #state_fn(this);
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(::std::sync::PoisonError::into_inner);
+                match state.job.try_stop() {
+                    ::core::result::Result::Ok(()) => {
+                        state.last_stop_error = 0;
+                        true
+                    }
+                    ::core::result::Result::Err(error) => {
+                        state.last_stop_error = #stop_error(error);
+                        false
+                    }
+                }
+            }
+
+            pub fn last_stop_error(this: #handle) -> i32 {
+                let state = #state_fn(this);
+                state
+                    .lock()
+                    .unwrap_or_else(::std::sync::PoisonError::into_inner)
+                    .last_stop_error
+            }
+
+            pub fn live_workers() -> i32 {
+                #live_workers()
+            }
+
+            pub fn is_disposed(this: #handle) -> bool {
+                let id = this.instance0::<"read_id", usize>();
+                !#registry_fn()
+                    .lock()
+                    .unwrap_or_else(::std::sync::PoisonError::into_inner)
+                    .contains_key(&id)
+            }
+
+            pub fn dispose(this: #handle) {
+                let id = this.instance0::<"read_id", usize>();
+                #registry_fn()
+                    .lock()
+                    .unwrap_or_else(::std::sync::PoisonError::into_inner)
+                    .remove(&id);
             }
         }
     };
@@ -2862,6 +4265,17 @@ const CLR_OPERATOR_METHOD_NAMES: &[&str] = &[
 /// the explicit first `<Name>Handle` arg). Methods must be free-standing (no `self`): the alias targets
 /// a static symbol.
 ///
+/// `#[dotnet_methods(disposable)]` additionally requires an instance `dispose`/`Dispose` method with
+/// exactly the managed handle receiver and a unit return, and attaches `System.IDisposable` to the
+/// generated class. This keeps the lifecycle contract declarative and makes a malformed disposal
+/// surface a macro error instead of a CLR load-time/interface-binding failure.
+/// `#[dotnet_methods(async_disposable)]` similarly requires
+/// `fn dispose_async(this: <Name>Handle) -> mycorrhiza::task::ValueTask` and attaches
+/// `System.IAsyncDisposable`; `mycorrhiza::task::future_to_value_task_unit` builds that value from
+/// ordinary Rust async cleanup.
+/// `enums(Type, ...)` registers Rust enums that should cross these method seams as their generated
+/// public CLR enum types, matching the explicit policy used by `#[dotnet_export]`.
+///
 /// ```ignore
 /// #[dotnet_class]
 /// pub struct Counter { value: i32 }
@@ -2873,8 +4287,72 @@ const CLR_OPERATOR_METHOD_NAMES: &[&str] = &[
 /// }
 /// ```
 #[proc_macro_attribute]
-pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn dotnet_methods(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let options =
+        parse_macro_input!(attr with Punctuated::<syn::Meta, Token![,]>::parse_terminated);
+    let mut disposable = false;
+    let mut async_disposable = false;
+    let mut enum_types = Vec::<Type>::new();
+    for option in options {
+        match option {
+            syn::Meta::Path(path) if path.is_ident("disposable") => {
+                if disposable {
+                    return syn::Error::new(path.span(), "duplicate `disposable` option")
+                        .to_compile_error()
+                        .into();
+                }
+                disposable = true;
+            }
+            syn::Meta::Path(path) if path.is_ident("async_disposable") => {
+                if async_disposable {
+                    return syn::Error::new(path.span(), "duplicate `async_disposable` option")
+                        .to_compile_error()
+                        .into();
+                }
+                async_disposable = true;
+            }
+            syn::Meta::List(list) if list.path.is_ident("enums") => {
+                let parsed =
+                    match list.parse_args_with(Punctuated::<Type, Token![,]>::parse_terminated) {
+                        Ok(parsed) if !parsed.is_empty() => parsed,
+                        Ok(_) => {
+                            return syn::Error::new(
+                                list.span(),
+                                "#[dotnet_methods]: enums(...) needs at least one enum type",
+                            )
+                            .to_compile_error()
+                            .into();
+                        }
+                        Err(error) => return error.to_compile_error().into(),
+                    };
+                for ty in parsed {
+                    if enum_types.iter().any(|existing| {
+                        quote! { #existing }.to_string() == quote! { #ty }.to_string()
+                    }) {
+                        return syn::Error::new(
+                            ty.span(),
+                            "#[dotnet_methods]: enum type listed more than once",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                    enum_types.push(ty);
+                }
+            }
+            other => {
+                return syn::Error::new(
+                    other.span(),
+                    "#[dotnet_methods]: unknown option; expected `disposable`, \
+                     `async_disposable`, or `enums(Type, ...)`",
+                )
+                .to_compile_error()
+                .into();
+            }
+        }
+    }
+
     let mut input = parse_macro_input!(item as ItemImpl);
+    let input_span = input.span();
 
     // The class name is the impl's self type (a plain path like `Counter`); its handle alias is
     // `<Name>Handle` (what an instance method takes as its receiver).
@@ -2905,6 +4383,8 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // non-fn impl items are rejected loudly.
     let mut method_calls = Vec::new();
     let mut keep_anchors = Vec::new();
+    let mut saw_dispose = false;
+    let mut saw_dispose_async = false;
     // Generated marshalling shims (see the `needs_shim` block below) — free fns emitted at the SAME
     // top level as `#input`/`mod #entry_mod` (not inside either), so `entry_mod`'s `use super::*;`
     // brings them into scope by name, and each shim's body can plainly call `#self_ty::#fn_ident`.
@@ -2936,11 +4416,13 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
             .to_compile_error()
             .into();
         }
-        // `#[dotnet(name = "PascalCase")]` keeps the Rust implementation idiomatically
-        // snake_case while choosing the public CLR member name. This mirrors `#[dotnet_export]`'s
-        // name option but applies to methods attached to a generated class.
-        let mut managed_method_name = f.sig.ident.to_string();
+        // Public CLR methods default to PascalCase while the Rust implementation remains
+        // idiomatic snake_case. `#[dotnet(name = "ExactName")]` remains the explicit override.
+        let mut managed_method_name = to_pascal_case(&f.sig.ident.to_string());
         let mut saw_dotnet_name = false;
+        let mut method_attr_specs = Vec::new();
+        let mut return_attr_specs = Vec::new();
+        let mut parameter_attr_specs = Vec::new();
         for attr in &f.attrs {
             if attr.path().is_ident("dotnet") {
                 if saw_dotnet_name {
@@ -2963,26 +4445,30 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 };
                 let args = match parse_dotnet_export_args(tokens) {
-                    Ok(args) if !args.error_exception => args,
+                    Ok(args)
+                        if !args.error_exception
+                            && !args.error_managed
+                            && !args.cancellation_task
+                            && args.enum_types.is_empty() =>
+                    {
+                        args
+                    }
                     Ok(_) => {
                         return syn::Error::new(
                             attr.span(),
-                            "#[dotnet_methods] only supports #[dotnet(name = \"ManagedName\")]",
+                            "#[dotnet_methods] supports naming and safe custom-attribute options on #[dotnet(...)]",
                         )
                         .to_compile_error()
                         .into();
                     }
                     Err(error) => return error.to_compile_error().into(),
                 };
-                let Some(name) = args.name else {
-                    return syn::Error::new(
-                        attr.span(),
-                        "#[dotnet(name = \"ManagedName\")]: name is required",
-                    )
-                    .to_compile_error()
-                    .into();
-                };
-                managed_method_name = name;
+                if let Some(name) = args.name {
+                    managed_method_name = name;
+                }
+                method_attr_specs = args.method_attrs;
+                return_attr_specs = args.return_attrs;
+                parameter_attr_specs = args.parameter_attrs;
                 saw_dotnet_name = true;
             }
         }
@@ -3040,12 +4526,12 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         f.attrs.retain(|a| !a.path().is_ident("dotnet_event"));
         let event_role = match &event_name {
-            Some(_) => {
-                let fn_name = managed_method_name.as_str();
-                if fn_name.starts_with("add_") {
-                    Some(true)
-                } else if fn_name.starts_with("remove_") {
-                    Some(false)
+            Some(event) => {
+                let rust_name = f.sig.ident.to_string();
+                let is_add = if rust_name.starts_with("add_") {
+                    true
+                } else if rust_name.starts_with("remove_") {
+                    false
                 } else {
                     return syn::Error::new(
                         f.sig.ident.span(),
@@ -3055,7 +4541,20 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     )
                     .to_compile_error()
                     .into();
+                };
+                let expected = format!("{}_{event}", if is_add { "add" } else { "remove" });
+                if saw_dotnet_name && managed_method_name != expected {
+                    return syn::Error::new(
+                        f.sig.ident.span(),
+                        format!(
+                            "#[dotnet_event(\"{event}\")]: the managed accessor name must be `{expected}`"
+                        ),
+                    )
+                    .to_compile_error()
+                    .into();
                 }
+                managed_method_name = expected;
+                Some(is_add)
             }
             None => None,
         };
@@ -3084,6 +4583,43 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 f.sig.inputs.first(),
                 Some(FnArg::Typed(pt)) if type_last_ident_is(&pt.ty, &handle_name)
             );
+
+        if disposable && managed_method_name == "Dispose" {
+            let returns_unit = match &f.sig.output {
+                ReturnType::Default => true,
+                ReturnType::Type(_, ty) => {
+                    matches!(&**ty, Type::Tuple(tuple) if tuple.elems.is_empty())
+                }
+            };
+            if !first_is_handle || f.sig.inputs.len() != 1 || !returns_unit {
+                return syn::Error::new(
+                    f.sig.span(),
+                    "#[dotnet_methods(disposable)]: `dispose` must be an instance method with the \
+                     exact shape `fn dispose(this: <Class>Handle)` and no return value",
+                )
+                .to_compile_error()
+                .into();
+            }
+            saw_dispose = true;
+        }
+        if async_disposable && managed_method_name == "DisposeAsync" {
+            let returns_value_task = match &f.sig.output {
+                ReturnType::Type(_, ty) => type_last_ident_is(ty, "ValueTask"),
+                ReturnType::Default => false,
+            };
+            if !first_is_handle || f.sig.inputs.len() != 1 || !returns_value_task {
+                return syn::Error::new(
+                    f.sig.span(),
+                    "#[dotnet_methods(async_disposable)]: `dispose_async` must have the exact \
+                     shape `fn dispose_async(this: <Class>Handle) -> \
+                     mycorrhiza::task::ValueTask`; use `future_to_value_task_unit` to wrap Rust \
+                     async cleanup",
+                )
+                .to_compile_error()
+                .into();
+            }
+            saw_dispose_async = true;
+        }
 
         // Run every param/return through the SAME marshalling table `#[dotnet_export]` uses
         // (`marshal_param`/`marshal_return`), so a `#[dotnet_methods]` instance/static method can
@@ -3114,15 +4650,24 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let FnArg::Typed(pt) = arg else {
                 continue; // `self` already rejected above.
             };
-            let pname = format_ident!("__arg{}", idx);
-            match marshal_param(&pt.ty) {
+            let pname = match &*pt.pat {
+                syn::Pat::Ident(binding) => binding.ident.clone(),
+                _ => format_ident!("__arg{}", idx),
+            };
+            let marshalled = if registered_export_enum(&pt.ty, &enum_types) {
+                Ok(marshal_export_enum_param(&pt.ty))
+            } else {
+                marshal_param(&pt.ty)
+            };
+            match marshalled {
                 Ok(m) => {
                     let seam_ty = m.seam_ty.clone();
-                    let call_arg = if m.to_rust.is_some() && matches!(&*pt.ty, Type::Reference(_)) {
-                        quote! { &#pname }
-                    } else {
-                        quote! { #pname }
-                    };
+                    let call_arg =
+                        if m.to_rust.is_some() && marshalled_reference_needs_borrow(&pt.ty) {
+                            quote! { &#pname }
+                        } else {
+                            quote! { #pname }
+                        };
                     param_plans.push(ParamPlan {
                         seam_ty,
                         pre_call: m.to_rust.map(|conv| conv(&pname)),
@@ -3145,7 +4690,11 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         let (ret_seam_ty, ret_seam_arrow, ret_expr, ret_marshalled) = match &f.sig.output {
             ReturnType::Default => (quote! { () }, quote! {}, quote! { __ret }, false),
-            ReturnType::Type(_, ty) => match marshal_return(ty) {
+            ReturnType::Type(_, ty) => match if registered_export_enum(ty, &enum_types) {
+                Ok(marshal_export_enum_return(ty))
+            } else {
+                marshal_return(ty)
+            } {
                 Ok(m) => {
                     let seam_ty = m.seam_ty.clone();
                     let expr = match m.from_rust {
@@ -3211,11 +4760,57 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
             static #keep_ident: fn(#(#seam_in_types),*) -> #ret_seam_ty = #alias_target;
         });
 
+        let managed_parameter_names: Vec<String> = f
+            .sig
+            .inputs
+            .iter()
+            .skip(usize::from(first_is_handle))
+            .enumerate()
+            .filter_map(|(index, argument)| match argument {
+                FnArg::Typed(argument) => Some(documented_parameter_name(&argument.pat, index)),
+                FnArg::Receiver(_) => None,
+            })
+            .collect();
+        let managed_parameter_names_lit =
+            LitStr::new(&managed_parameter_names.join(";"), fn_ident.span());
+        let nullability_lit = LitStr::new(
+            &managed_nullability_spec(&f.sig.inputs, usize::from(first_is_handle), &f.sig.output),
+            fn_ident.span(),
+        );
+
+        if let (Some(doc), Some((parameter_types, parameter_names))) = (
+            scrape_doc_comment(&f.attrs),
+            documented_signature_parameters(&f.sig.inputs, usize::from(first_is_handle)),
+        ) {
+            let type_parameters: Vec<String> = f
+                .sig
+                .generics
+                .params
+                .iter()
+                .filter_map(|parameter| match parameter {
+                    syn::GenericParam::Type(parameter) => Some(parameter.ident.to_string()),
+                    _ => None,
+                })
+                .collect();
+            let member =
+                dotnet_method_member_id(&class_name, &managed_method_name, &parameter_types);
+            emit_xmldoc_member(
+                &member,
+                &render_rustdoc_xml(
+                    &doc,
+                    &parameter_names,
+                    documented_return_has_value(&f.sig.output),
+                    &type_parameters,
+                    &[],
+                ),
+            );
+        }
+
         if first_is_handle {
             // Instance (virtual) method: signature includes the receiver as arg 0.
             method_calls.push(quote! {
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_method_def::<
-                    "pub", "virtual", #fname_lit, _,
+                    "pub", "virtual", #fname_lit, #managed_parameter_names_lit, #nullability_lit, _,
                 >(class, #alias_target);
             });
             if let Some(spec) = override_base {
@@ -3262,15 +4857,83 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
             // Static method: signature verbatim, no receiver.
             method_calls.push(quote! {
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_static_method_def::<
-                    #fname_lit, _,
+                    #fname_lit, #managed_parameter_names_lit, #nullability_lit, _,
                 >(class, #alias_target);
+            });
+        }
+
+        for spec in &method_attr_specs {
+            let packed = LitStr::new(&spec.encode(), fn_ident.span());
+            method_calls.push(quote! {
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_last_method_custom_attr::<#packed>(class);
+            });
+        }
+        for spec in &return_attr_specs {
+            let packed = LitStr::new(&spec.encode(), fn_ident.span());
+            method_calls.push(quote! {
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_last_return_custom_attr::<#packed>(class);
+            });
+        }
+        for (parameter, spec) in &parameter_attr_specs {
+            let Some(index) = managed_parameter_names
+                .iter()
+                .position(|candidate| candidate == parameter)
+            else {
+                return syn::Error::new(
+                    fn_ident.span(),
+                    format!(
+                        "#[dotnet(param_attr({parameter}, ...))]: `{parameter}` is not a managed parameter of `{managed_method_name}`"
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            };
+            let packed = LitStr::new(&spec.encode(), fn_ident.span());
+            method_calls.push(quote! {
+                let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_last_parameter_custom_attr::<#index, #packed>(class);
             });
         }
     }
 
+    if disposable && !saw_dispose {
+        return syn::Error::new(
+            input_span,
+            "#[dotnet_methods(disposable)]: missing `fn dispose(this: <Class>Handle)` method",
+        )
+        .to_compile_error()
+        .into();
+    }
+    if async_disposable && !saw_dispose_async {
+        return syn::Error::new(
+            input_span,
+            "#[dotnet_methods(async_disposable)]: missing \
+             `fn dispose_async(this: <Class>Handle) -> mycorrhiza::task::ValueTask` method",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let disposable_call = disposable.then(|| {
+        quote! {
+            let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_interface_impl::<
+                "System.Runtime", "System.IDisposable",
+            >(class);
+        }
+    });
+    let async_disposable_call = async_disposable.then(|| {
+        quote! {
+            let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_interface_impl::<
+                "System.Runtime", "System.IAsyncDisposable",
+            >(class);
+        }
+    });
+
     let expanded = quote! {
         // The user's impl block, verbatim — the methods remain ordinary callable Rust functions.
         #input
+
+        #[doc(hidden)]
+        const _: ::core::option::Option<&'static str> = option_env!("RCL_XMLDOC_BUILD_ID");
 
         // Marshalling shims generated for any method with an ergonomic-sugar param/return type (see
         // `needs_shim` above) — plain free fns, private to this module.
@@ -3319,6 +4982,8 @@ pub fn dotnet_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_new_typedef::<
                     #name_lit, false, "", "", false,
                 >();
+                #disposable_call
+                #async_disposable_call
                 #(#method_calls)*
                 ::mycorrhiza::comptime::rustc_codegen_clr_finish_type(class);
             }
@@ -3427,6 +5092,30 @@ fn single_generic_arg(ty: &Type) -> Option<(String, &Type)> {
     Some((seg.ident.to_string(), inner))
 }
 
+fn managed_data_field_seam_type(ty: &Type) -> Type {
+    if let Some((name, inner)) = single_generic_arg(ty) {
+        if name == "ManagedOption" {
+            return inner.clone();
+        }
+    }
+    if simple_path_ident(ty).as_deref() == Some("String") {
+        return syn::parse_quote!(::mycorrhiza::system::MString);
+    }
+    ty.clone()
+}
+
+fn managed_data_field_into_seam(name: &syn::Ident, ty: &Type) -> proc_macro2::TokenStream {
+    if let Some((wrapper, _)) = single_generic_arg(ty) {
+        if wrapper == "ManagedOption" {
+            return quote! { #name.into_raw() };
+        }
+    }
+    if simple_path_ident(ty).as_deref() == Some("String") {
+        return quote! { ::mycorrhiza::system::MString::from(#name.as_str()) };
+    }
+    quote! { #name }
+}
+
 /// A trailing generic type path as `(name, type arguments)`, rejecting lifetime/const arguments.
 /// This is intentionally separate from [`single_generic_arg`]: imported delegate wrappers have
 /// arities one through three, while the existing Option/Vec/Task helpers are clearer with the
@@ -3504,6 +5193,11 @@ fn nullable_inner(ty: &Type) -> Option<&Type> {
 /// all; `Err` (via the caller) if it names 2+ dimensions, so that case fails loudly with a clear
 /// message rather than silently mismarshalling.
 fn managed_array_elem(ty: &Type) -> Option<Result<&Type, String>> {
+    if let Some((name, elem)) = single_generic_arg(ty) {
+        if name == "ManagedArray" {
+            return Some(Ok(elem));
+        }
+    }
     let Type::Path(tp) = ty else { return None };
     if tp.qself.is_some() {
         return None;
@@ -3733,15 +5427,76 @@ fn marshal_param(ty: &Type) -> Result<Marshal, String> {
                 }
             }
         }
+        if let Type::Slice(slice) = &*r.elem {
+            let Some(element_name) = simple_path_ident(&slice.elem) else {
+                return Err(format!(
+                    "#[dotnet_export]: span element type `{}` is not yet supported; use a primitive element type or an explicit Memory<T> projection.",
+                    quote! { #slice }
+                ));
+            };
+            if !is_passthrough_primitive(&element_name) {
+                return Err(format!(
+                    "#[dotnet_export]: span element type `{element_name}` is not yet supported; scoped slice exports currently accept primitive elements only."
+                ));
+            }
+            let element = (*slice.elem).clone();
+            if r.mutability.is_some() {
+                return Ok(Marshal {
+                    seam_ty: quote! { ::mycorrhiza::span::SpanHandle<#element> },
+                    to_rust: Some(Box::new(move |id| {
+                        quote! {
+                            let #id: &mut [#element] = unsafe {
+                                ::mycorrhiza::span::handle_as_mut_slice(&#id)
+                            };
+                        }
+                    })),
+                    from_rust: None,
+                    returns_managed_handle: false,
+                });
+            }
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::span::ReadOnlySpanHandle<#element> },
+                to_rust: Some(Box::new(move |id| {
+                    quote! {
+                        let #id: &[#element] = unsafe {
+                            ::mycorrhiza::span::readonly_handle_as_slice(&#id)
+                        };
+                    }
+                })),
+                from_rust: None,
+                returns_managed_handle: false,
+            });
+        }
         return Err(format!(
             "#[dotnet_export]: unsupported reference parameter type `{}`; only `&str` is marshalled \
-             among references. Pass an owned/primitive type, or marshal manually with `MString`.",
+             among scalar references and primitive `&[T]`/`&mut [T]` slices are exposed as scoped \
+             spans. Pass an owned/primitive type, or use `Memory<T>` for retained buffers.",
             quote! { #ty }
         ));
     }
 
     if let Some(delegate) = imported_delegate_param(ty) {
         return delegate;
+    }
+
+    if let Some((name, args)) = generic_type_args(ty) {
+        if name == "MutableDictionary" && args.len() == 2 {
+            let key = args[0].clone();
+            let value = args[1].clone();
+            return Ok(Marshal {
+                seam_ty: quote! {
+                    ::mycorrhiza::collections::MutableDictionaryHandle<#key, #value>
+                },
+                to_rust: Some(Box::new(move |id| {
+                    quote! {
+                        let #id = ::mycorrhiza::collections::MutableDictionary::<#key, #value>
+                            ::from_raw(#id);
+                    }
+                })),
+                from_rust: None,
+                returns_managed_handle: false,
+            });
+        }
     }
 
     if let Some(name) = simple_path_ident(ty) {
@@ -3756,6 +5511,38 @@ fn marshal_param(ty: &Type) -> Result<Marshal, String> {
                 })),
                 from_rust: None,
                 returns_managed_handle: false,
+            });
+        }
+        if name == "CancellationToken" {
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::cancellation::CancellationToken },
+                to_rust: None,
+                from_rust: None,
+                returns_managed_handle: false,
+            });
+        }
+        if name == "Cancellation" {
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::cancellation::CancellationToken },
+                to_rust: Some(Box::new(move |id| {
+                    quote! {
+                        let #id = ::mycorrhiza::cancellation::Cancellation::from_token(#id);
+                    }
+                })),
+                from_rust: None,
+                returns_managed_handle: false,
+            });
+        }
+        if name == "UiDispatcher" {
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::dispatch::IUiDispatcher },
+                to_rust: Some(Box::new(move |id| {
+                    quote! {
+                        let #id = ::mycorrhiza::dispatch::UiDispatcher::from_raw(#id);
+                    }
+                })),
+                from_rust: None,
+                returns_managed_handle: true,
             });
         }
         if is_passthrough_primitive(&name) {
@@ -3811,36 +5598,134 @@ fn marshal_param(ty: &Type) -> Result<Marshal, String> {
                 quote! { #inner }
             ));
         }
-        // `Vec<T>` of a passthrough primitive `T` -> a `RustVec<T>` handle inbound: the caller passes
-        // the opaque `usize` handle a C#-side `RustVec<T>`/`RustBoxVec<T>` already carries, and this
-        // reconstructs an owned `Vec<T>` by walking it via the SAME `rcl_vec_len`/`rcl_vec_get` core
-        // functions the return-side `Vec<T>` arm below uses in the opposite direction (`rcl_vec_new`/
-        // `rcl_vec_push`). Same requirement as that arm: the consuming crate must have called
-        // `mycorrhiza::export_rust_containers!()` once at its crate root.
+        if name == "Progress" {
+            let inner = inner.clone();
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::progress::Progress<#inner> },
+                to_rust: None,
+                from_rust: None,
+                returns_managed_handle: true,
+            });
+        }
+        if name == "ProgressReporter" {
+            let inner = inner.clone();
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::progress::Progress<#inner> },
+                to_rust: Some(Box::new(move |id| {
+                    quote! {
+                        let #id = ::mycorrhiza::progress::ProgressReporter::from_raw(#id);
+                    }
+                })),
+                from_rust: None,
+                returns_managed_handle: true,
+            });
+        }
+        if name == "ManagedArray" {
+            let elem_ty = inner.clone();
+            return Ok(Marshal {
+                seam_ty: quote! {
+                    ::mycorrhiza::intrinsics::RustcCLRInteropManagedArray<#elem_ty, 1>
+                },
+                to_rust: None,
+                from_rust: None,
+                returns_managed_handle: false,
+            });
+        }
+        if name == "ReadOnlyList" {
+            let elem_ty = inner.clone();
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::collections::ReadOnlyList<#elem_ty> },
+                to_rust: None,
+                from_rust: None,
+                returns_managed_handle: false,
+            });
+        }
+        if name == "MutableList" {
+            let elem_ty = inner.clone();
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::collections::MutableListHandle<#elem_ty> },
+                to_rust: Some(Box::new(move |id| {
+                    quote! {
+                        let #id = ::mycorrhiza::collections::MutableList::<#elem_ty>::from_raw(#id);
+                    }
+                })),
+                from_rust: None,
+                returns_managed_handle: false,
+            });
+        }
+        if name == "ManagedEnumerable" {
+            let elem_ty = inner.clone();
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::enumerate::IEnumerable<#elem_ty> },
+                to_rust: Some(Box::new(move |id| {
+                    quote! {
+                        let #id = ::mycorrhiza::enumerate::ManagedEnumerable::<#elem_ty>
+                            ::from_raw(#id);
+                    }
+                })),
+                from_rust: None,
+                returns_managed_handle: false,
+            });
+        }
+        if name == "ManagedOption" {
+            let inner_ty = inner.clone();
+            return Ok(Marshal {
+                seam_ty: quote! { #inner_ty },
+                to_rust: Some(Box::new(move |id| {
+                    quote! {
+                        let #id = ::mycorrhiza::managed_option::ManagedOption::<#inner_ty>
+                            ::from_raw(#id);
+                    }
+                })),
+                from_rust: None,
+                returns_managed_handle: false,
+            });
+        }
+        if name == "Memory" {
+            let elem_ty = inner.clone();
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::memory::MemoryHandle<#elem_ty> },
+                to_rust: Some(Box::new(move |id| {
+                    quote! {
+                        let #id = ::mycorrhiza::memory::Memory::<#elem_ty>::from_handle(#id);
+                    }
+                })),
+                from_rust: None,
+                returns_managed_handle: false,
+            });
+        }
+        if name == "ReadOnlyMemory" {
+            let elem_ty = inner.clone();
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::memory::ReadOnlyMemoryHandle<#elem_ty> },
+                to_rust: Some(Box::new(move |id| {
+                    quote! {
+                        let #id = ::mycorrhiza::memory::ReadOnlyMemory::<#elem_ty>::from_handle(#id);
+                    }
+                })),
+                from_rust: None,
+                returns_managed_handle: false,
+            });
+        }
+        // Ordinary owned Rust vectors use the ordinary managed collection surface: C# passes a
+        // real `T[]`, and the generated shim copies it into a Rust-owned Vec<T>. Authors who want
+        // Rust ownership to remain observable and low-copy select `RustOwnedVec<T>` explicitly.
         if name == "Vec" {
             if let Some(elem_name) = simple_path_ident(inner) {
                 if is_passthrough_primitive(&elem_name) {
                     let elem_ty = inner.clone();
                     return Ok(Marshal {
-                        seam_ty: quote! { ::core::primitive::usize },
+                        seam_ty: quote! {
+                            ::mycorrhiza::intrinsics::RustcCLRInteropManagedArray<#elem_ty, 1>
+                        },
                         to_rust: Some(Box::new(move |id| {
                             quote! {
                                 let #id: ::std::vec::Vec<#elem_ty> = {
-                                    let __len: ::core::primitive::usize =
-                                        unsafe { crate::rcl_vec_len(#id) };
+                                    let __len = #id.len();
                                     let mut __out: ::std::vec::Vec<#elem_ty> =
-                                        ::std::vec::Vec::with_capacity(__len);
+                                        ::std::vec::Vec::with_capacity(__len as usize);
                                     for __i in 0..__len {
-                                        let mut __elem: #elem_ty = ::core::default::Default::default();
-                                        unsafe {
-                                            crate::rcl_vec_get(
-                                                #id,
-                                                __i,
-                                                (&mut __elem as *mut #elem_ty)
-                                                    as *mut ::core::primitive::u8,
-                                            );
-                                        }
-                                        __out.push(__elem);
+                                        __out.push(#id.get(__i));
                                     }
                                     __out
                                 };
@@ -3853,12 +5738,48 @@ fn marshal_param(ty: &Type) -> Result<Marshal, String> {
                 return Err(format!(
                     "#[dotnet_export]: unsupported `Vec<{elem_name}>` parameter element type. Only \
                      the integer/float primitives and `bool` are supported as `Vec<T>` parameters \
-                     today (this expects a `RustVec<T>` handle, whose C# side is `T : unmanaged`)."
+                     today (this marshals from a managed `T[]`)."
                 ));
             }
             return Err(format!(
                 "#[dotnet_export]: unsupported `Vec<{}>` parameter element type. Only the \
                  integer/float primitives and `bool` are supported as `Vec<T>` parameters today.",
+                quote! { #inner }
+            ));
+        }
+        if name == "RustOwnedVec" {
+            if let Some(elem_name) = simple_path_ident(inner) {
+                if is_passthrough_primitive(&elem_name) {
+                    let elem_ty = inner.clone();
+                    return Ok(Marshal {
+                        seam_ty: quote! { ::core::primitive::usize },
+                        to_rust: Some(Box::new(move |id| {
+                            quote! {
+                                let #id: ::mycorrhiza::containers::RustOwnedVec<#elem_ty> = {
+                                    let __len = unsafe { crate::rcl_vec_len(#id) };
+                                    let mut __out = ::std::vec::Vec::with_capacity(__len);
+                                    for __i in 0..__len {
+                                        let mut __elem: #elem_ty = ::core::default::Default::default();
+                                        unsafe {
+                                            crate::rcl_vec_get(
+                                                #id,
+                                                __i,
+                                                (&mut __elem as *mut #elem_ty) as *mut u8,
+                                            );
+                                        }
+                                        __out.push(__elem);
+                                    }
+                                    ::mycorrhiza::containers::RustOwnedVec::from(__out)
+                                };
+                            }
+                        })),
+                        from_rust: None,
+                        returns_managed_handle: false,
+                    });
+                }
+            }
+            return Err(format!(
+                "#[dotnet_export]: `RustOwnedVec<{}>` supports passthrough primitive elements only",
                 quote! { #inner }
             ));
         }
@@ -3871,6 +5792,19 @@ fn marshal_param(ty: &Type) -> Result<Marshal, String> {
          passthrough primitives or `MString`; collection elements must be passthrough primitives).",
         quote! { #ty }
     ))
+}
+
+/// Whether a marshalled value must be borrowed again when passed to the user's Rust function.
+///
+/// Most reference-shaped conveniences (notably `&str`) are reconstructed as owned Rust values, so
+/// their generated call sites need `&value`. Scoped spans are different: their conversion already
+/// produces the exact `&[T]` or `&mut [T]` required by the original function. Borrowing those again
+/// would produce `&&[T]` or, invalidly, `&&mut [T]`.
+fn marshalled_reference_needs_borrow(ty: &Type) -> bool {
+    let Type::Reference(reference) = ty else {
+        return false;
+    };
+    !matches!(&*reference.elem, Type::Slice(_))
 }
 
 /// Resolve how the **return** type is marshalled, or `Err(message)` if unsupported.
@@ -3896,6 +5830,21 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
              among references.",
             quote! { #ty }
         ));
+    }
+
+    if let Some((name, args)) = generic_type_args(ty) {
+        if name == "MutableDictionary" && args.len() == 2 {
+            let key = args[0].clone();
+            let value = args[1].clone();
+            return Ok(Marshal {
+                seam_ty: quote! {
+                    ::mycorrhiza::collections::MutableDictionaryHandle<#key, #value>
+                },
+                to_rust: None,
+                from_rust: Some(Box::new(|id| quote! { #id.into_raw() })),
+                returns_managed_handle: true,
+            });
+        }
     }
 
     // `mycorrhiza::task::Task` — the idiomatic non-generic managed `Task` wrapper. NOTE: unlike
@@ -4031,14 +5980,105 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
         });
     }
 
-    // `Vec<T>` of a passthrough primitive `T` -> `RustVec<T>` at the seam (a `usize` opaque handle
-    // into a size-erased Rust-owned buffer). Requires the consuming crate to have called
-    // `mycorrhiza::export_rust_containers!()` once at its crate root (same requirement as any other
-    // `RustVec<T>` consumer) so the `rcl_vec_*` core functions exist in this crate to call into.
-    // Only primitive `T` is supported for this first slice (skips `String`/managed-handle elements —
-    // narrower `RustBoxVec`/GCHandle-boxed marshalling is a separate follow-up, not attempted here).
+    // Ordinary `Vec<T>` values become ordinary managed `T[]` values. This is the allocation-owning,
+    // C#-natural default; `RustOwnedVec<T>` remains the explicit Rust-owned low-copy contract.
     if let Some((name, elem_ty)) = single_generic_arg(ty) {
+        if name == "ManagedOption" {
+            let inner_ty = elem_ty.clone();
+            return Ok(Marshal {
+                seam_ty: quote! { #inner_ty },
+                to_rust: None,
+                from_rust: Some(Box::new(|id| quote! { #id.into_raw() })),
+                returns_managed_handle: true,
+            });
+        }
+        if name == "ManagedEnumerable" {
+            let elem_ty = elem_ty.clone();
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::enumerate::IEnumerable<#elem_ty> },
+                to_rust: None,
+                from_rust: Some(Box::new(|id| quote! { #id.into_raw() })),
+                returns_managed_handle: true,
+            });
+        }
+        if name == "AsyncEnumerable" {
+            let elem_ty = elem_ty.clone();
+            return Ok(Marshal {
+                seam_ty: quote! {
+                    ::mycorrhiza::enumerate_async::IAsyncEnumerable<#elem_ty>
+                },
+                to_rust: None,
+                from_rust: Some(Box::new(|id| quote! { #id.into_handle() })),
+                returns_managed_handle: true,
+            });
+        }
+        if name == "MutableList" {
+            let elem_ty = elem_ty.clone();
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::collections::MutableListHandle<#elem_ty> },
+                to_rust: None,
+                from_rust: Some(Box::new(|id| quote! { #id.into_raw() })),
+                returns_managed_handle: true,
+            });
+        }
+        if name == "Memory" {
+            let elem_ty = elem_ty.clone();
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::memory::MemoryHandle<#elem_ty> },
+                to_rust: None,
+                from_rust: Some(Box::new(|id| quote! { #id.into_handle() })),
+                returns_managed_handle: true,
+            });
+        }
+        if name == "ReadOnlyMemory" {
+            let elem_ty = elem_ty.clone();
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::memory::ReadOnlyMemoryHandle<#elem_ty> },
+                to_rust: None,
+                from_rust: Some(Box::new(|id| quote! { #id.into_handle() })),
+                returns_managed_handle: true,
+            });
+        }
+        if name == "ReadOnlyList" {
+            let elem_ty = elem_ty.clone();
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::collections::ReadOnlyList<#elem_ty> },
+                to_rust: None,
+                from_rust: None,
+                returns_managed_handle: true,
+            });
+        }
         if name == "Vec" {
+            if let Some(elem_name) = simple_path_ident(elem_ty) {
+                if is_passthrough_primitive(&elem_name) {
+                    let elem_ty = elem_ty.clone();
+                    return Ok(Marshal {
+                        seam_ty: quote! {
+                            ::mycorrhiza::intrinsics::RustcCLRInteropManagedArray<#elem_ty, 1>
+                        },
+                        to_rust: None,
+                        from_rust: Some(Box::new(move |id| {
+                            quote! {
+                                ::mycorrhiza::intrinsics::RustcCLRInteropManagedArray::<#elem_ty, 1>
+                                    ::from_slice(&#id)
+                            }
+                        })),
+                        returns_managed_handle: false,
+                    });
+                }
+                return Err(format!(
+                    "#[dotnet_export]: unsupported `Vec<{elem_name}>` return element type. Only the \
+                     integer/float primitives and `bool` are supported as `Vec<T>` elements today \
+                     (this marshals to a managed `T[]`)."
+                ));
+            }
+            return Err(format!(
+                "#[dotnet_export]: unsupported `Vec<{}>` return element type. Only the integer/float \
+                 primitives and `bool` are supported as `Vec<T>` elements today.",
+                quote! { #elem_ty }
+            ));
+        }
+        if name == "RustOwnedVec" {
             if let Some(elem_name) = simple_path_ident(elem_ty) {
                 if is_passthrough_primitive(&elem_name) {
                     let elem_ty = elem_ty.clone();
@@ -4048,9 +6088,8 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
                         from_rust: Some(Box::new(move |id| {
                             quote! {
                                 {
-                                    let __elems: ::std::vec::Vec<#elem_ty> = #id;
-                                    let __handle: ::core::primitive::usize =
-                                        crate::rcl_vec_new(::core::mem::size_of::<#elem_ty>());
+                                    let __elems = #id.into_inner();
+                                    let __handle = crate::rcl_vec_new(::core::mem::size_of::<#elem_ty>());
                                     for __elem in __elems.iter() {
                                         unsafe {
                                             crate::rcl_vec_push(
@@ -4066,15 +6105,9 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
                         returns_managed_handle: false,
                     });
                 }
-                return Err(format!(
-                    "#[dotnet_export]: unsupported `Vec<{elem_name}>` return element type. Only the \
-                     integer/float primitives and `bool` are supported as `Vec<T>` elements today \
-                     (this marshals to a `RustVec<T>`, whose C# side is `T : unmanaged`)."
-                ));
             }
             return Err(format!(
-                "#[dotnet_export]: unsupported `Vec<{}>` return element type. Only the integer/float \
-                 primitives and `bool` are supported as `Vec<T>` elements today.",
+                "#[dotnet_export]: `RustOwnedVec<{}>` supports passthrough primitive elements only",
                 quote! { #elem_ty }
             ));
         }
@@ -4117,6 +6150,309 @@ fn scrape_doc_comment(attrs: &[syn::Attribute]) -> Option<String> {
     }
 }
 
+fn documented_parameter_name(pattern: &syn::Pat, index: usize) -> String {
+    match pattern {
+        syn::Pat::Ident(binding) => {
+            let name = binding.ident.to_string();
+            name.strip_prefix("r#").unwrap_or(&name).to_string()
+        }
+        _ => format!("arg{index}"),
+    }
+}
+
+fn documented_signature_parameters(
+    inputs: &Punctuated<FnArg, Token![,]>,
+    skip: usize,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let mut types = Vec::new();
+    let mut names = Vec::new();
+    for (index, input) in inputs.iter().enumerate().skip(skip) {
+        let FnArg::Typed(argument) = input else {
+            return None;
+        };
+        types.push(clr_member_id_type_name(&argument.ty)?);
+        names.push(documented_parameter_name(&argument.pat, index - skip));
+    }
+    Some((types, names))
+}
+
+fn documented_return_has_value(output: &ReturnType) -> bool {
+    match output {
+        ReturnType::Default => false,
+        ReturnType::Type(_, ty) => {
+            let ty = result_args(ty).map_or(&**ty, |(ok, _)| ok);
+            !matches!(ty, Type::Tuple(tuple) if tuple.elems.is_empty())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RustdocSection {
+    Summary,
+    Parameters,
+    Returns,
+    Errors,
+    TypeParameters,
+    Ignored,
+}
+
+#[derive(Default)]
+struct ParsedRustdoc {
+    summary: String,
+    parameters: std::collections::BTreeMap<String, String>,
+    returns: String,
+    errors: String,
+    type_parameters: std::collections::BTreeMap<String, String>,
+}
+
+fn rustdoc_heading(line: &str) -> Option<RustdocSection> {
+    let heading = line.trim().strip_prefix('#')?.trim().to_ascii_lowercase();
+    Some(match heading.as_str() {
+        "arguments" | "parameters" | "params" => RustdocSection::Parameters,
+        "returns" | "return value" => RustdocSection::Returns,
+        "errors" | "exceptions" => RustdocSection::Errors,
+        "type parameters" | "generic parameters" => RustdocSection::TypeParameters,
+        _ => RustdocSection::Ignored,
+    })
+}
+
+fn documented_name_and_text(line: &str) -> Option<(String, String)> {
+    let item = line
+        .trim()
+        .strip_prefix("- ")
+        .or_else(|| line.trim().strip_prefix("* "))?;
+    let rest = item.strip_prefix('`')?;
+    let end = rest.find('`')?;
+    let name = rest[..end].trim();
+    if name.is_empty() {
+        return None;
+    }
+    let text = rest[end + 1..]
+        .trim()
+        .trim_start_matches([':', '-', '–', '—'])
+        .trim();
+    Some((name.to_string(), text.to_string()))
+}
+
+fn push_doc_line(target: &mut String, line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        if !target.is_empty() && !target.ends_with('\n') {
+            target.push('\n');
+        }
+    } else {
+        if !target.is_empty() && !target.ends_with(' ') && !target.ends_with('\n') {
+            target.push(' ');
+        }
+        target.push_str(line);
+    }
+}
+
+fn parse_rustdoc(doc: &str) -> ParsedRustdoc {
+    let mut parsed = ParsedRustdoc::default();
+    let mut section = RustdocSection::Summary;
+    let mut current_named: Option<(RustdocSection, String)> = None;
+    for line in doc.lines() {
+        if let Some(next) = rustdoc_heading(line) {
+            section = next;
+            current_named = None;
+            continue;
+        }
+        match section {
+            RustdocSection::Summary => push_doc_line(&mut parsed.summary, line),
+            RustdocSection::Returns => push_doc_line(&mut parsed.returns, line),
+            RustdocSection::Errors => push_doc_line(&mut parsed.errors, line),
+            RustdocSection::Parameters | RustdocSection::TypeParameters => {
+                if let Some((name, text)) = documented_name_and_text(line) {
+                    let map = if section == RustdocSection::Parameters {
+                        &mut parsed.parameters
+                    } else {
+                        &mut parsed.type_parameters
+                    };
+                    map.insert(name.clone(), text);
+                    current_named = Some((section, name));
+                } else if let Some((kind, name)) = &current_named {
+                    let map = if *kind == RustdocSection::Parameters {
+                        &mut parsed.parameters
+                    } else {
+                        &mut parsed.type_parameters
+                    };
+                    if let Some(text) = map.get_mut(name) {
+                        push_doc_line(text, line);
+                    }
+                }
+            }
+            RustdocSection::Ignored => {}
+        }
+    }
+    parsed.summary = parsed.summary.trim().to_string();
+    parsed.returns = parsed.returns.trim().to_string();
+    parsed.errors = parsed.errors.trim().to_string();
+    for description in parsed.parameters.values_mut() {
+        *description = description.trim().to_string();
+    }
+    for description in parsed.type_parameters.values_mut() {
+        *description = description.trim().to_string();
+    }
+    parsed
+}
+
+fn xml_escape_doc_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn xml_escape_doc_attr(value: &str) -> String {
+    xml_escape_doc_text(value)
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Nullable-reference flag for the C#-visible seam type: 0 = value/oblivious, 1 = non-null
+/// reference, 2 = nullable reference. This is intentionally based on the explicit interop wrapper
+/// vocabulary, never on Rust layout inference.
+fn managed_reference_nullability(ty: &Type) -> u8 {
+    if let Type::Reference(reference) = ty {
+        if reference.mutability.is_none()
+            && matches!(&*reference.elem, Type::Path(path) if path.qself.is_none() && path.path.is_ident("str"))
+        {
+            return 1;
+        }
+        return 0;
+    }
+    if let Some((name, _)) = single_generic_arg(ty) {
+        return match name.as_str() {
+            "ManagedOption" => 2,
+            "Vec" | "ManagedArray" | "ReadOnlyList" | "MutableList" | "ManagedDictionary"
+            | "MutableDictionary" | "ManagedEnumerable" | "AsyncEnumerable" | "IEnumerable"
+            | "IAsyncEnumerable" | "TaskT" | "Progress" | "ProgressReporter" | "Func0"
+            | "Func1" | "Func2" | "Func3" | "Action1" | "Action2" | "Action3" => 1,
+            _ => 0,
+        };
+    }
+    let Some(name) = simple_path_ident(ty) else {
+        return 0;
+    };
+    match name.as_str() {
+        "String" | "MString" | "DotNetString" | "Task" | "IUiDispatcher" | "UiDispatcher"
+        | "Action" => 1,
+        "MemoryHandle" | "ReadOnlyMemoryHandle" | "SpanHandle" | "ReadOnlySpanHandle" => 0,
+        _ if name.ends_with("Handle") => 1,
+        _ => 0,
+    }
+}
+
+fn managed_return_nullability(output: &ReturnType) -> u8 {
+    match output {
+        ReturnType::Default => 0,
+        ReturnType::Type(_, ty) => result_args(ty)
+            .map(|(ok, _)| managed_reference_nullability(ok))
+            .unwrap_or_else(|| managed_reference_nullability(ty)),
+    }
+}
+
+/// Compact comptime contract: `context|return|param0,param1,...`. Empty means the member has no
+/// managed reference positions and should remain nullable-oblivious.
+fn managed_nullability_spec(
+    inputs: &Punctuated<FnArg, Token![,]>,
+    skip: usize,
+    output: &ReturnType,
+) -> String {
+    let parameters = inputs
+        .iter()
+        .skip(skip)
+        .filter_map(|argument| match argument {
+            FnArg::Typed(argument) => Some(managed_reference_nullability(&argument.ty)),
+            FnArg::Receiver(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let return_flag = managed_return_nullability(output);
+    if return_flag == 0 && parameters.iter().all(|flag| *flag == 0) {
+        return String::new();
+    }
+    format!(
+        "1|{return_flag}|{}",
+        parameters
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+struct XmlDocException<'a> {
+    cref: &'a str,
+    fallback: &'a str,
+}
+
+fn render_rustdoc_xml(
+    doc: &str,
+    parameter_names: &[String],
+    has_return: bool,
+    type_parameter_names: &[String],
+    exceptions: &[XmlDocException<'_>],
+) -> String {
+    let parsed = parse_rustdoc(doc);
+    let summary = if parsed.summary.is_empty() {
+        "No summary was provided."
+    } else {
+        &parsed.summary
+    };
+    let mut xml = format!("<summary>{}</summary>", xml_escape_doc_text(summary));
+    for name in parameter_names {
+        let description = parsed
+            .parameters
+            .get(name)
+            .map(String::as_str)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("No parameter documentation was provided.");
+        xml.push_str(&format!(
+            "\n<param name=\"{}\">{}</param>",
+            xml_escape_doc_attr(name),
+            xml_escape_doc_text(description)
+        ));
+    }
+    for name in type_parameter_names {
+        let description = parsed
+            .type_parameters
+            .get(name)
+            .map(String::as_str)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("No type-parameter documentation was provided.");
+        xml.push_str(&format!(
+            "\n<typeparam name=\"{}\">{}</typeparam>",
+            xml_escape_doc_attr(name),
+            xml_escape_doc_text(description)
+        ));
+    }
+    if has_return {
+        let description = if parsed.returns.is_empty() {
+            "No return-value documentation was provided."
+        } else {
+            &parsed.returns
+        };
+        xml.push_str(&format!(
+            "\n<returns>{}</returns>",
+            xml_escape_doc_text(description)
+        ));
+    }
+    for exception in exceptions {
+        let description = if parsed.errors.is_empty() {
+            exception.fallback
+        } else {
+            &parsed.errors
+        };
+        xml.push_str(&format!(
+            "\n<exception cref=\"{}\">{}</exception>",
+            xml_escape_doc_attr(exception.cref),
+            xml_escape_doc_text(description)
+        ));
+    }
+    xml
+}
+
 /// Map a `#[dotnet_export]`-supported Rust parameter/return type to the exact CLR metadata type
 /// name ECMA-334 member-ID strings use, or `None` if `ty` isn't one of the types that surface
 /// participates in (return `None` rather than guess — an XML-doc entry with a wrong parameter type
@@ -4135,9 +6471,62 @@ fn clr_member_id_type_name(ty: &Type) -> Option<String> {
                 }
             }
         }
+        if let Type::Slice(slice) = &*r.elem {
+            let element = clr_member_id_type_name(&slice.elem)?;
+            let container = if r.mutability.is_some() {
+                "System.Span"
+            } else {
+                "System.ReadOnlySpan"
+            };
+            return Some(format!("{container}{{{element}}}"));
+        }
         return None;
     }
     if let Some((name, args)) = generic_type_args(ty) {
+        if name == "ManagedArray" && args.len() == 1 {
+            let element = clr_member_id_type_name(args[0])?;
+            return Some(format!("{element}[]"));
+        }
+        if name == "ReadOnlyList" && args.len() == 1 {
+            let element = clr_member_id_type_name(args[0])?;
+            return Some(format!(
+                "System.Collections.Generic.IReadOnlyList{{{element}}}"
+            ));
+        }
+        if name == "MutableList" && args.len() == 1 {
+            let element = clr_member_id_type_name(args[0])?;
+            return Some(format!("System.Collections.Generic.IList{{{element}}}"));
+        }
+        if name == "ManagedEnumerable" && args.len() == 1 {
+            let element = clr_member_id_type_name(args[0])?;
+            return Some(format!(
+                "System.Collections.Generic.IEnumerable{{{element}}}"
+            ));
+        }
+        if name == "AsyncEnumerable" && args.len() == 1 {
+            let element = clr_member_id_type_name(args[0])?;
+            return Some(format!(
+                "System.Collections.Generic.IAsyncEnumerable{{{element}}}"
+            ));
+        }
+        if name == "ManagedOption" && args.len() == 1 {
+            return clr_member_id_type_name(args[0]);
+        }
+        if name == "MutableDictionary" && args.len() == 2 {
+            let key = clr_member_id_type_name(args[0])?;
+            let value = clr_member_id_type_name(args[1])?;
+            return Some(format!(
+                "System.Collections.Generic.IDictionary{{{key},{value}}}"
+            ));
+        }
+        if matches!(name.as_str(), "Memory" | "ReadOnlyMemory") && args.len() == 1 {
+            let element = clr_member_id_type_name(args[0])?;
+            return Some(format!("System.{name}{{{element}}}"));
+        }
+        if matches!(name.as_str(), "Progress" | "ProgressReporter") && args.len() == 1 {
+            let arg = clr_member_id_type_name(args[0])?;
+            return Some(format!("System.IProgress{{{arg}}}"));
+        }
         let expected = match name.as_str() {
             "Action1" | "Comparison" => 1,
             "Action2" | "Func1" => 2,
@@ -4160,9 +6549,22 @@ fn clr_member_id_type_name(ty: &Type) -> Option<String> {
         }
     }
     let name = simple_path_ident(ty)?;
+    if let Some(class_name) = name.strip_suffix("Handle") {
+        if !class_name.is_empty() {
+            return Some(class_name.to_string());
+        }
+    }
     Some(
         match name.as_str() {
             "String" | "MString" => "System.String",
+            "CancellationToken" | "Cancellation" => "System.Threading.CancellationToken",
+            "UiDispatcher" => "Mycorrhiza.Interop.Helpers.IRustUiDispatcher",
+            "Decimal" => "System.Decimal",
+            "Guid" => "System.Guid",
+            "DateTime" => "System.DateTime",
+            "DateTimeOffset" => "System.DateTimeOffset",
+            "DateOnly" => "System.DateOnly",
+            "TimeSpan" => "System.TimeSpan",
             "bool" => "System.Boolean",
             "i8" => "System.SByte",
             "i16" => "System.Int16",
@@ -4184,10 +6586,30 @@ fn clr_member_id_type_name(ty: &Type) -> Option<String> {
     )
 }
 
-/// Append one XML-doc entry for a `#[dotnet_export]`'d fn to a per-crate sidecar-doc scratch file,
-/// so `cargo-dotnet`'s packaging step can later assemble the standard ECMA-334 `<AssemblyName>.xml`
-/// doc file next to the built DLL. See `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md` ("Tier C research
-/// findings", item 4) for the design this implements.
+fn interface_member_id_type_name(
+    ty: &Type,
+    type_parameters: &std::collections::HashMap<String, usize>,
+    method_parameters: &std::collections::HashMap<String, usize>,
+) -> Option<String> {
+    if let Some(index) = bare_generic_param(ty, method_parameters) {
+        return Some(format!("``{index}"));
+    }
+    if let Some(index) = bare_generic_param(ty, type_parameters) {
+        return Some(format!("`{index}"));
+    }
+    if let Type::Reference(reference) = ty {
+        if reference.mutability.is_some() {
+            return Some(format!(
+                "{}@",
+                interface_member_id_type_name(&reference.elem, type_parameters, method_parameters,)?
+            ));
+        }
+    }
+    clr_member_id_type_name(ty)
+}
+
+/// Append one XML-doc entry for a Rust-defined managed member to a per-crate scratch file so
+/// `cargo-dotnet` can assemble the standard ECMA-334 `<AssemblyName>.xml` beside the built DLL.
 ///
 /// The entry is keyed by the exact ECMA-334 member-ID this fn will resolve to at the C# call site:
 /// `M:MainModule.<fn_name>(<ParamType1>,<ParamType2>,...)` — `#[dotnet_export]`'d free functions are
@@ -4204,21 +6626,29 @@ fn clr_member_id_type_name(ty: &Type) -> Option<String> {
 /// One line of newline-delimited JSON per entry (robust against arbitrary doc-comment text, e.g.
 /// embedded quotes/newlines) is appended to
 /// `<CARGO_MANIFEST_DIR>/target/dotnet_xmldoc/<crate_name>.xmldoc.jsonl`. The proc-macro runs once
-/// per fn at the consumer's compile time, so appending (not overwriting) is required; cargo-dotnet's
-/// build stage clears stale entries by deleting the file up front (see `xmldoc::collect`).
+/// per macro expansion at the consumer's compile time, so appending (not overwriting) is required;
+/// cargo-dotnet clears stale entries before building and injects `RCL_XMLDOC_BUILD_ID` to force a
+/// fresh expansion inventory (`tools/cargo-dotnet/src/xmldoc.rs`).
 fn dotnet_export_member_id(managed_name: &str, params: &[String]) -> String {
-    format!("M:MainModule.{}({})", managed_name, params.join(","))
+    dotnet_method_member_id("MainModule", managed_name, params)
 }
 
-fn emit_xmldoc_entry(managed_name: &str, params: &[String], doc: &str) {
+fn dotnet_method_member_id(type_name: &str, managed_name: &str, params: &[String]) -> String {
+    let base = format!("M:{type_name}.{managed_name}");
+    if params.is_empty() {
+        base
+    } else {
+        format!("{base}({})", params.join(","))
+    }
+}
+
+fn emit_xmldoc_member(member_id: &str, xml: &str) {
     let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") else {
         return;
     };
     let Ok(crate_name) = std::env::var("CARGO_PKG_NAME") else {
         return;
     };
-    let member_id = dotnet_export_member_id(managed_name, params);
-
     let dir = std::path::Path::new(&manifest_dir)
         .join("target")
         .join("dotnet_xmldoc");
@@ -4226,7 +6656,7 @@ fn emit_xmldoc_entry(managed_name: &str, params: &[String], doc: &str) {
         return;
     }
     let file_path = dir.join(format!("{crate_name}.xmldoc.jsonl"));
-    let entry = serde_json_line(&member_id, doc);
+    let entry = serde_json_line(member_id, "xml", xml);
     use std::io::Write as _;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -4237,9 +6667,29 @@ fn emit_xmldoc_entry(managed_name: &str, params: &[String], doc: &str) {
     }
 }
 
+fn emit_xmldoc_entry(
+    managed_name: &str,
+    params: &[String],
+    doc: &str,
+    parameter_names: &[String],
+    has_return: bool,
+    type_parameter_names: &[String],
+    exceptions: &[XmlDocException<'_>],
+) {
+    let member_id = dotnet_export_member_id(managed_name, params);
+    let xml = render_rustdoc_xml(
+        doc,
+        parameter_names,
+        has_return,
+        type_parameter_names,
+        exceptions,
+    );
+    emit_xmldoc_member(&member_id, &xml);
+}
+
 /// Hand-rolled minimal JSON-object-line encoder (`{"member":"...","summary":"..."}`) so this crate
 /// doesn't need a `serde_json` dependency just for two escaped string fields.
-fn serde_json_line(member: &str, summary: &str) -> String {
+fn serde_json_line(member: &str, value_key: &str, value: &str) -> String {
     fn escape(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
         for c in s.chars() {
@@ -4256,9 +6706,10 @@ fn serde_json_line(member: &str, summary: &str) -> String {
         out
     }
     format!(
-        "{{\"member\":\"{}\",\"summary\":\"{}\"}}",
+        "{{\"member\":\"{}\",\"{}\":\"{}\"}}",
         escape(member),
-        escape(summary)
+        escape(value_key),
+        escape(value)
     )
 }
 
@@ -4271,7 +6722,12 @@ fn serde_json_line(member: &str, summary: &str) -> String {
 struct DotnetExportArgs {
     name: Option<String>,
     error_exception: bool,
+    error_managed: bool,
+    cancellation_task: bool,
     enum_types: Vec<Type>,
+    method_attrs: Vec<AttrSpec>,
+    return_attrs: Vec<AttrSpec>,
+    parameter_attrs: Vec<(String, AttrSpec)>,
 }
 
 impl std::fmt::Debug for DotnetExportArgs {
@@ -4279,7 +6735,12 @@ impl std::fmt::Debug for DotnetExportArgs {
         f.debug_struct("DotnetExportArgs")
             .field("name", &self.name)
             .field("error_exception", &self.error_exception)
+            .field("error_managed", &self.error_managed)
+            .field("cancellation_task", &self.cancellation_task)
             .field("enum_type_count", &self.enum_types.len())
+            .field("method_attr_count", &self.method_attrs.len())
+            .field("return_attr_count", &self.return_attrs.len())
+            .field("parameter_attr_count", &self.parameter_attrs.len())
             .finish()
     }
 }
@@ -4294,6 +6755,24 @@ fn parse_dotnet_export_args(attr: proc_macro2::TokenStream) -> syn::Result<Dotne
     let mut parsed = DotnetExportArgs::default();
     for meta in entries {
         if let syn::Meta::List(list) = &meta {
+            if list.path.is_ident("attr") || list.path.is_ident("return_attr") {
+                let spec = list.parse_args::<AttrSpec>()?;
+                validate_safe_attr_spec(&spec, list.span())?;
+                if list.path.is_ident("attr") {
+                    parsed.method_attrs.push(spec);
+                } else {
+                    parsed.return_attrs.push(spec);
+                }
+                continue;
+            }
+            if list.path.is_ident("param_attr") {
+                let spec = list.parse_args::<ParamAttrSpec>()?;
+                validate_safe_attr_spec(&spec.attribute, list.span())?;
+                parsed
+                    .parameter_attrs
+                    .push((spec.parameter.to_string(), spec.attribute));
+                continue;
+            }
             if list.path.is_ident("enums") {
                 let types =
                     list.parse_args_with(Punctuated::<Type, Token![,]>::parse_terminated)?;
@@ -4320,7 +6799,7 @@ fn parse_dotnet_export_args(attr: proc_macro2::TokenStream) -> syn::Result<Dotne
         let syn::Meta::NameValue(entry) = meta else {
             return Err(syn::Error::new(
                 meta.span(),
-                "#[dotnet_export]: expected `name = \"ManagedName\"`, `error = \"exception\"`, or `enums(Type, ...)`",
+                "#[dotnet_export]: expected a naming/error/cancellation option, `enums(Type, ...)`, `attr(...)`, `return_attr(...)`, or `param_attr(name, ...)`",
             ));
         };
         if entry.path.is_ident("name") {
@@ -4354,7 +6833,7 @@ fn parse_dotnet_export_args(attr: proc_macro2::TokenStream) -> syn::Result<Dotne
             }
             parsed.name = Some(value);
         } else if entry.path.is_ident("error") {
-            if parsed.error_exception {
+            if parsed.error_exception || parsed.error_managed {
                 return Err(syn::Error::new(
                     entry.path.span(),
                     "#[dotnet_export]: `error` may be specified only once",
@@ -4372,19 +6851,54 @@ fn parse_dotnet_export_args(attr: proc_macro2::TokenStream) -> syn::Result<Dotne
                     "#[dotnet_export]: `error` must be the string literal \"exception\"",
                 ));
             };
-            if policy.value() != "exception" {
+            match policy.value().as_str() {
+                "exception" => parsed.error_exception = true,
+                "managed" => parsed.error_managed = true,
+                _ => {
+                    return Err(syn::Error::new(
+                        policy.span(),
+                        "#[dotnet_export]: unsupported error policy; expected `error = \"exception\"` or `error = \"managed\"`",
+                    ));
+                }
+            }
+        } else if entry.path.is_ident("cancellation") {
+            if parsed.cancellation_task {
                 return Err(syn::Error::new(
-                    policy.span(),
-                    "#[dotnet_export]: unsupported error policy; expected `error = \"exception\"`",
+                    entry.path.span(),
+                    "#[dotnet_export]: `cancellation` may be specified only once",
                 ));
             }
-            parsed.error_exception = true;
+            let Expr::Lit(expr_lit) = entry.value else {
+                return Err(syn::Error::new(
+                    entry.path.span(),
+                    "#[dotnet_export]: `cancellation` must be the string literal \"task\"",
+                ));
+            };
+            let Lit::Str(policy) = expr_lit.lit else {
+                return Err(syn::Error::new(
+                    expr_lit.lit.span(),
+                    "#[dotnet_export]: `cancellation` must be the string literal \"task\"",
+                ));
+            };
+            if policy.value() != "task" {
+                return Err(syn::Error::new(
+                    policy.span(),
+                    "#[dotnet_export]: unsupported cancellation policy; expected `cancellation = \"task\"`",
+                ));
+            }
+            parsed.cancellation_task = true;
         } else {
             return Err(syn::Error::new(
                 entry.path.span(),
-                "#[dotnet_export]: unknown attribute key; expected `name = \"ManagedName\"`, `error = \"exception\"`, or `enums(Type, ...)`",
+                "#[dotnet_export]: unknown attribute key; expected naming/error/cancellation, `enums(Type, ...)`, `attr(...)`, `return_attr(...)`, or `param_attr(name, ...)`",
             ));
         }
+    }
+    if (parsed.error_exception || parsed.error_managed) && parsed.cancellation_task {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[dotnet_export]: `error` and `cancellation = \"task\"` are mutually exclusive",
+        ));
     }
     Ok(parsed)
 }
@@ -4452,11 +6966,18 @@ fn marshal_export_enum_return(ty: &Type) -> Marshal {
 /// managed-`MString` signatures cross as their real managed delegate types and are reconstructed as
 /// invokable Rust wrappers.
 ///
+/// A non-generic `async fn` returning `T` or `()` is exported as `Task<T>` or `Task` respectively;
+/// the generated synchronous seam drives the Rust future through `mycorrhiza::task` and returns the
+/// completed managed task. `#[dotnet_export(cancellation = "task")] async fn -> Result<T, E>`
+/// explicitly maps `Ok(T)` to success and `Err(E)` to a genuinely canceled CLR task. Other async
+/// `Result<T, E>` shapes remain rejected until task-fault exception mapping has an explicit policy.
+///
 /// The consuming `cdylib` must depend on `mycorrhiza`. Types outside the supported set produce a
 /// clear compile error (marshalling is never faked).
 #[proc_macro_attribute]
 pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let export_args = match parse_dotnet_export_args(attr.into()) {
+    let attr_tokens: proc_macro2::TokenStream = attr.into();
+    let export_args = match parse_dotnet_export_args(attr_tokens.clone()) {
         Ok(args) => args,
         Err(error) => return error.to_compile_error().into(),
     };
@@ -4470,10 +6991,175 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
             .to_compile_error()
             .into();
     }
-    if let Some(a) = &sig.asyncness {
+    if sig.asyncness.is_some() {
+        for input in &sig.inputs {
+            if let FnArg::Typed(argument) = input {
+                if matches!(
+                    &*argument.ty,
+                    Type::Reference(reference) if matches!(&*reference.elem, Type::Slice(_))
+                ) {
+                    return syn::Error::new(
+                        argument.ty.span(),
+                        "#[dotnet_export]: Span<T>/ReadOnlySpan<T> parameters are synchronous-only and cannot be retained by an async export; use Memory<T>/ReadOnlyMemory<T>",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+            }
+        }
+        if export_args.error_exception || export_args.error_managed {
+            return syn::Error::new(
+                sig.output.span(),
+                "#[dotnet_export]: managed error policies on `async fn` are not yet supported; return a normal value or map the error inside the async body",
+            )
+            .to_compile_error()
+            .into();
+        }
+        if !sig.generics.params.is_empty() {
+            return syn::Error::new(
+                sig.generics.span(),
+                "#[dotnet_export]: generic async functions cannot be exported",
+            )
+            .to_compile_error()
+            .into();
+        }
+
+        let original_name = sig.ident.clone();
+        let wrapper_name = format_ident!("__dotnet_async_export_{}", original_name);
+        let mut call_args = Vec::new();
+        for input in &sig.inputs {
+            let FnArg::Typed(argument) = input else {
+                return syn::Error::new(
+                    input.span(),
+                    "#[dotnet_export]: methods with `self` cannot be exported; use a free function",
+                )
+                .to_compile_error()
+                .into();
+            };
+            let syn::Pat::Ident(binding) = &*argument.pat else {
+                return syn::Error::new(
+                    argument.pat.span(),
+                    "#[dotnet_export]: async parameters must use identifier bindings (for example `value: i32`)",
+                )
+                .to_compile_error()
+                .into();
+            };
+            call_args.push(binding.ident.clone());
+        }
+
+        let inputs = sig.inputs.clone();
+        let (wrapper_return, wrapper_body) = match &sig.output {
+            ReturnType::Default => (
+                if export_args.cancellation_task {
+                    return syn::Error::new(
+                        sig.output.span(),
+                        "#[dotnet_export]: `cancellation = \"task\"` requires async `Result<T, E>` or `Result<(), E>` output",
+                    )
+                    .to_compile_error()
+                    .into();
+                } else {
+                    quote! { -> ::mycorrhiza::task::Task }
+                },
+                quote! { ::mycorrhiza::task::future_to_task_unit(#original_name(#(#call_args),*)) },
+            ),
+            ReturnType::Type(_, output) => {
+                if let Some((ok, _error)) = result_args(output) {
+                    if !export_args.cancellation_task {
+                        return syn::Error::new(
+                            output.span(),
+                            "#[dotnet_export]: async `Result<T, E>` needs an explicit task policy; use `cancellation = \"task\"` only when every `Err` means cancellation",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                    let is_unit = matches!(ok, Type::Tuple(tuple) if tuple.elems.is_empty());
+                    if is_unit {
+                        (
+                            quote! { -> ::mycorrhiza::task::Task },
+                            quote! {
+                                ::mycorrhiza::task::future_to_task_cancelable_unit(
+                                    #original_name(#(#call_args),*)
+                                )
+                            },
+                        )
+                    } else {
+                        (
+                            quote! { -> ::mycorrhiza::task::TaskT<#ok> },
+                            quote! {
+                                ::mycorrhiza::task::future_to_task_cancelable(
+                                    #original_name(#(#call_args),*)
+                                )
+                            },
+                        )
+                    }
+                } else {
+                    if export_args.cancellation_task {
+                        return syn::Error::new(
+                            output.span(),
+                            "#[dotnet_export]: `cancellation = \"task\"` requires async `Result<T, E>` or `Result<(), E>` output",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                    (
+                        quote! { -> ::mycorrhiza::task::TaskT<#output> },
+                        quote! {
+                            ::mycorrhiza::task::future_to_task(#original_name(#(#call_args),*))
+                        },
+                    )
+                }
+            }
+        };
+        let managed_name_value = export_args
+            .name
+            .clone()
+            .unwrap_or_else(|| original_name.to_string());
+        if let (Some(doc), Some((parameter_types, parameter_names))) = (
+            scrape_doc_comment(&func.attrs),
+            documented_signature_parameters(&sig.inputs, 0),
+        ) {
+            let exceptions = if export_args.cancellation_task {
+                vec![XmlDocException {
+                    cref: "T:System.OperationCanceledException",
+                    fallback: "Thrown when the operation is canceled.",
+                }]
+            } else {
+                Vec::new()
+            };
+            emit_xmldoc_entry(
+                &managed_name_value,
+                &parameter_types,
+                &doc,
+                &parameter_names,
+                true,
+                &[],
+                &exceptions,
+            );
+        }
+        let wrapper = quote! {
+            pub fn #wrapper_name(#inputs) #wrapper_return {
+                #wrapper_body
+            }
+        };
+        let managed_name = LitStr::new(&managed_name_value, original_name.span());
+        let enum_types = &export_args.enum_types;
+        let wrapper_attr = if enum_types.is_empty() {
+            quote! { name = #managed_name }
+        } else {
+            quote! { name = #managed_name, enums(#(#enum_types),*) }
+        };
+        let expanded_wrapper = dotnet_export(wrapper_attr.into(), wrapper.into());
+        let expanded_wrapper: proc_macro2::TokenStream = expanded_wrapper.into();
+        return quote! {
+            #func
+            #expanded_wrapper
+        }
+        .into();
+    }
+    if export_args.cancellation_task {
         return syn::Error::new(
-            a.span(),
-            "#[dotnet_export]: `async fn` is not yet supported (Task/async bridge is separate)",
+            sig.span(),
+            "#[dotnet_export]: `cancellation = \"task\"` is valid only on async functions",
         )
         .to_compile_error()
         .into();
@@ -4497,11 +7183,11 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     let fn_name = sig.ident.clone();
-    let (managed_name, export_attribute) = match export_args.name {
+    let (managed_name, export_attribute) = match export_args.name.as_ref() {
         Some(managed_name) => {
             let name_literal = LitStr::new(&managed_name, fn_name.span());
             (
-                managed_name,
+                managed_name.clone(),
                 quote! { #[unsafe(export_name = #name_literal)] },
             )
         }
@@ -4510,12 +7196,64 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => (fn_name.to_string(), quote! { #[unsafe(no_mangle)] }),
     };
     let shim_mod = format_ident!("__dotnet_export_{}", fn_name);
+    let nullability_marker = LitStr::new(
+        &format!(
+            "__rustc_codegen_clr_nullability:{}",
+            managed_nullability_spec(&sig.inputs, 0, &sig.output)
+        ),
+        sig.span(),
+    );
+    let managed_parameter_names: Vec<String> = sig
+        .inputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| match argument {
+            FnArg::Typed(argument) => Some(documented_parameter_name(&argument.pat, index)),
+            FnArg::Receiver(_) => None,
+        })
+        .collect();
+    let mut custom_attr_markers = Vec::new();
+    for spec in &export_args.method_attrs {
+        custom_attr_markers.push(LitStr::new(
+            &format!("__rustc_codegen_clr_custom_attr:m:{}", spec.encode()),
+            sig.span(),
+        ));
+    }
+    for spec in &export_args.return_attrs {
+        custom_attr_markers.push(LitStr::new(
+            &format!("__rustc_codegen_clr_custom_attr:r:{}", spec.encode()),
+            sig.span(),
+        ));
+    }
+    for (parameter, spec) in &export_args.parameter_attrs {
+        let Some(index) = managed_parameter_names
+            .iter()
+            .position(|candidate| candidate == parameter)
+        else {
+            return syn::Error::new(
+                sig.span(),
+                format!(
+                    "#[dotnet_export(param_attr({parameter}, ...))]: `{parameter}` is not an exported parameter"
+                ),
+            )
+            .to_compile_error()
+            .into();
+        };
+        custom_attr_markers.push(LitStr::new(
+            &format!(
+                "__rustc_codegen_clr_custom_attr:p:{index}:{}",
+                spec.encode()
+            ),
+            sig.span(),
+        ));
+    }
 
     // Marshal each parameter. `receiver` (self) is rejected — only free functions are exportable.
     let mut seam_params = Vec::new(); // `#pname: #seam_ty` tokens for the shim signature.
     let mut pre_call = Vec::new(); // in-conversion statements (seam value → idiomatic Rust value).
     let mut call_args = Vec::new(); // expressions passed to the inner fn.
     let mut doc_param_types = Vec::new(); // CLR type names, for the XML-doc member-ID (see below).
+    let mut doc_param_names = Vec::new(); // Managed parameter names, for `<param name="...">`.
     let mut doc_param_types_complete = true;
     for (idx, arg) in sig.inputs.iter().enumerate() {
         let pat_ty = match arg {
@@ -4531,7 +7269,11 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         // Use a fresh, positional binding name so we don't depend on the user's pattern being a
         // plain identifier (it may be `mut x`, `_`, a tuple pattern, …).
-        let pname = format_ident!("arg{}", idx);
+        let pname = match &*pat_ty.pat {
+            syn::Pat::Ident(binding) => binding.ident.clone(),
+            _ => format_ident!("arg{}", idx),
+        };
+        doc_param_names.push(documented_parameter_name(&pat_ty.pat, idx));
         let imported_delegate = is_imported_delegate_type(&pat_ty.ty);
         let marshal = if registered_export_enum(&pat_ty.ty, enum_types) {
             marshal_export_enum_param(&pat_ty.ty)
@@ -4559,8 +7301,12 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // `#pname` is rebound (shadowed) to the idiomatic Rust value; `&str` params also
                 // need a borrow at the call site.
                 pre_call.push(conv(&pname));
-                if matches!(&*pat_ty.ty, Type::Reference(_)) {
-                    call_args.push(quote! { &#pname });
+                if let Type::Reference(reference) = &*pat_ty.ty {
+                    if matches!(&*reference.elem, Type::Slice(_)) {
+                        call_args.push(quote! { #pname });
+                    } else {
+                        call_args.push(quote! { &#pname });
+                    }
                 } else if imported_delegate {
                     // A delegate wrapper contains a managed object reference. Moving it directly
                     // into `catch_unwind`'s closure makes rustc erase a managed-containing closure
@@ -4588,15 +7334,6 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    // Scrape `#[doc]` attrs and, if present, record an XML-doc sidecar entry keyed by the exact
-    // ECMA-334 member-ID this fn resolves to as a `MainModule` static method. Best-effort: any
-    // failure to write is silently ignored (never fails the actual compile over doc generation).
-    if doc_param_types_complete {
-        if let Some(doc) = scrape_doc_comment(&func.attrs) {
-            emit_xmldoc_entry(&managed_name, &doc_param_types, &doc);
-        }
-    }
-
     // Marshal the return type. `returns_managed_handle` (Task/TaskT<T>) picks a different
     // `catch_unwind` shape below — see that field's doc comment on `Marshal` for why.
     let mut result_error_ty = None;
@@ -4604,10 +7341,10 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
         ReturnType::Default => (quote! {}, quote! { __ret }, None, false), // `-> ()`; identity.
         ReturnType::Type(_, ty) => {
             let marshal_ty = if let Some((ok_ty, error_ty)) = result_args(ty) {
-                if !export_args.error_exception {
+                if !export_args.error_exception && !export_args.error_managed {
                     return syn::Error::new(
                         ty.span(),
-                        "#[dotnet_export]: `Result<T, E>` cannot cross the managed seam; opt in to mapping `Err(E)` to a C# exception with `#[dotnet_export(error = \"exception\")]`",
+                        "#[dotnet_export]: `Result<T, E>` cannot cross the managed seam; use `error = \"exception\"` for Display-only errors or `error = \"managed\"` for ManagedError diagnostics",
                     )
                     .to_compile_error()
                     .into();
@@ -4615,10 +7352,10 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
                 result_error_ty = Some(error_ty.clone());
                 ok_ty
             } else {
-                if export_args.error_exception {
+                if export_args.error_exception || export_args.error_managed {
                     return syn::Error::new(
                         ty.span(),
-                        "#[dotnet_export]: `error = \"exception\"` requires a `Result<T, E>` return type",
+                        "#[dotnet_export]: an error policy requires a `Result<T, E>` return type",
                     )
                     .to_compile_error()
                     .into();
@@ -4638,7 +7375,7 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
             if result_error_ty.is_some() && marshal.returns_managed_handle {
                 return syn::Error::new(
                     ty.span(),
-                    "#[dotnet_export]: `error = \"exception\"` cannot be used with a managed-handle success type: the original Rust `Result<T, E>` would place a managed reference in overlapping enum storage before the generated shim can unwrap it",
+                    "#[dotnet_export]: an error policy cannot be used with a managed-handle success type: the original Rust `Result<T, E>` would place a managed reference in overlapping enum storage before the generated shim can unwrap it",
                 )
                 .to_compile_error()
                 .into();
@@ -4658,14 +7395,45 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Scrape Rustdoc into a standard IntelliSense member entry after the complete managed shape is
+    // known. Best-effort: documentation generation must never turn a valid build into a failure.
+    if doc_param_types_complete {
+        if let Some(doc) = scrape_doc_comment(&func.attrs) {
+            let exceptions = if export_args.error_exception || export_args.error_managed {
+                vec![XmlDocException {
+                    cref: "T:System.Exception",
+                    fallback: "Thrown when the Rust operation returns an error.",
+                }]
+            } else {
+                Vec::new()
+            };
+            emit_xmldoc_entry(
+                &managed_name,
+                &doc_param_types,
+                &doc,
+                &doc_param_names,
+                documented_return_has_value(&sig.output),
+                &[],
+                &exceptions,
+            );
+        }
+    }
+
     let raw_call = quote! { super::#fn_name(#(#call_args),*) };
     let call = if result_error_ty.is_some() {
+        let throw_error = if export_args.error_managed {
+            quote! { ::mycorrhiza::error::throw_managed_error(&__error) }
+        } else {
+            quote! {
+                let __msg = ::std::format!("{}", __error);
+                ::mycorrhiza::error::throw_msg(&__msg)
+            }
+        };
         quote! {
             match #raw_call {
                 ::std::result::Result::Ok(__value) => __value,
                 ::std::result::Result::Err(__error) => {
-                    let __msg = ::std::format!("{}", __error);
-                    ::mycorrhiza::error::throw_msg(&__msg)
+                    #throw_error
                 }
             }
         }
@@ -4776,6 +7544,9 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
         // The user's function, verbatim — still callable from Rust with its idiomatic signature.
         #func
 
+        #[doc(hidden)]
+        const _: ::core::option::Option<&'static str> = option_env!("RCL_XMLDOC_BUILD_ID");
+
         // The generated seam shim exports `#managed_name` as its flat symbol. The backend marks
         // exported symbols `Access::Extern` (a DCE root) and emits them as public static methods
         // on the assembly's `MainModule`; the configured managed name is therefore exactly the
@@ -4808,6 +7579,8 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
         mod #shim_mod {
             use super::*;
             #export_attribute
+            #[doc = #nullability_marker]
+            #(#[doc = #custom_attr_markers])*
             pub extern "C-unwind" fn #fn_name(#(#seam_params),*) #seam_ret {
                 #(#pre_call)*
                 #body

@@ -182,22 +182,21 @@ public static class Program
         int got = await MainModule.compute_answer();
         Check("await compute_answer()", got, 42, ref pass, ref total);
 
-        // ---- Case B: Vec<T> -> RustVec<T> returns — foreach/LINQ over an exported Rust Vec<T> -----
+        // ---- Case B: Vec<T> -> normal T[]; RustOwnedVec<T> -> explicit RustVec<T> -----------------
+        int[] r = MainModule.range(1, 6);
+        Check("range(1,6) Length", r.Length, 5, ref pass, ref total);
+        Check("range(1,6) values", string.Join(",", r), "1,2,3,4,5", ref pass, ref total);
+        Check("range(1,6) LINQ Sum", r.Sum(), 15, ref pass, ref total);
 
-        // RustVec<int> range(int, int).
-        using (var r = RustVec<int>.FromHandle(MainModule.range(1, 6)))
-        {
-            Check("range(1,6) Count", r.Count, 5, ref pass, ref total);
-            Check("range(1,6) values", string.Join(",", r), "1,2,3,4,5", ref pass, ref total);
-            Check("range(1,6) LINQ Sum", r.Sum(), 15, ref pass, ref total);
-        }
+        long[] s = MainModule.squares(5);
+        Check("squares(5) Length", s.Length, 5, ref pass, ref total);
+        Check("squares(5) values", string.Join(",", s), "0,1,4,9,16", ref pass, ref total);
+        Check("squares(5) LINQ Sum", s.Sum(), 30L, ref pass, ref total);
 
-        // RustVec<long> squares(int) — a second element type (i64), proving the arm generalizes.
-        using (var s = RustVec<long>.FromHandle(MainModule.squares(5)))
+        using (var owned = RustVec<int>.FromHandle(MainModule.rust_owned_range(4)))
         {
-            Check("squares(5) Count", s.Count, 5, ref pass, ref total);
-            Check("squares(5) values", string.Join(",", s), "0,1,4,9,16", ref pass, ref total);
-            Check("squares(5) LINQ Sum", s.Sum(), 30L, ref pass, ref total);
+            Check("rust_owned_range Count", owned.Count, 4, ref pass, ref total);
+            Check("rust_owned_range values", string.Join(",", owned), "0,1,2,3", ref pass, ref total);
         }
 
         Console.WriteLine($"cd_export: {pass}/{total} checks passed");

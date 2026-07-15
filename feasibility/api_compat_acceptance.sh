@@ -18,6 +18,25 @@ dotnet "$tool" "$assembly" > "$current"
 diff -u "$baseline" "$current"
 bash "$repo/feasibility/api_compat_gate.sh" "$baseline" "$current" 1.0.0 1.0.1
 
+# Snapshot the real backend-generated public contract, not only a Roslyn control fixture. The
+# selected types are the comprehensive API-docs fixture's intended managed surface; ordinary Rust
+# implementation types are deliberately not part of the contract.
+driver="$repo/target/release/cargo-dotnet"
+if [[ ! -x "$driver" ]]; then
+    cargo build --manifest-path "$repo/Cargo.toml" --release --workspace \
+        > "$work/release-build.log" 2>&1
+fi
+CARGO_DOTNET_BACKEND=native "$driver" build "$repo/cargo_tests/cd_export/rustlib" \
+    > "$work/generated-build.log" 2>&1
+generated_assembly="$repo/cargo_tests/cd_export/rustlib/target/x86_64-unknown-dotnet/release/cd_export.dll"
+generated_baseline="$root/cd-export.public-api.txt"
+generated_current="$work/cd-export.public-api.txt"
+generated_types=(MainModule RiskQuote NullableProfile DocumentationCalculator 'IDocumentedBox`1')
+dotnet "$tool" "$generated_assembly" "${generated_types[@]}" > "$generated_current"
+diff -u "$generated_baseline" "$generated_current"
+bash "$repo/feasibility/api_compat_gate.sh" \
+    "$generated_baseline" "$generated_current" 1.0.0 1.0.1
+
 # Prove that the oracle rejects a representative binary-breaking DTO change without
 # modifying the checked-in fixture or baseline.
 cp -R "$root/fixture" "$work/breaking-fixture"

@@ -1,0 +1,5 @@
+error: #[dotnet_export]: Span<T>/ReadOnlySpan<T> parameters are synchronous-only and cannot be retained by an async export; use Memory<T>/ReadOnlyMemory<T>
+ --> tests/ui/dotnet_export_async_span.rs:4:41
+  |
+4 | pub async fn invalid_async_span(values: &[i32]) -> i32 {
+  |                                         ^^^^^^

@@ -338,3 +338,100 @@ pub fn throw_msg(msg: &str) -> ! {
     // give the compiler the same terminal guarantee `rustc_clr_interop_throw` provides.
     unreachable!("ExceptionDispatchInfo::Throw() does not return")
 }
+
+/// The familiar managed exception category a Rust error should project as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagedExceptionKind {
+    Exception,
+    Argument,
+    InvalidOperation,
+    Io,
+    Timeout,
+    NotSupported,
+}
+
+/// Opt-in contract for `#[dotnet_export(error = "managed")]`.
+///
+/// The error's `Display` text becomes `Exception.Message`. Implementations may also select a
+/// familiar managed exception base class and expose a native/library status code without packing
+/// diagnostics into a string that C# would have to parse.
+pub trait ManagedError: core::fmt::Display {
+    fn exception_kind(&self) -> ManagedExceptionKind {
+        ManagedExceptionKind::Exception
+    }
+
+    fn native_status(&self) -> Option<i32> {
+        None
+    }
+}
+
+impl ManagedError for String {}
+impl ManagedError for str {}
+
+/// Raise the typed managed exception described by a [`ManagedError`].
+#[inline]
+pub fn throw_managed_error<E: ManagedError + ?Sized>(error: &E) -> ! {
+    use crate::bindings::System::Exception;
+    use crate::bindings::System::Runtime::ExceptionServices::ExceptionDispatchInfo;
+    use crate::intrinsics::{RustcCLRInteropManagedClass, rustc_clr_interop_managed_checked_cast};
+    use crate::system::{DotNetString, MString};
+
+    type RustException = RustcCLRInteropManagedClass<
+        "Mycorrhiza.Interop.Helpers",
+        "Mycorrhiza.Interop.Helpers.RustException",
+    >;
+    type RustArgumentException = RustcCLRInteropManagedClass<
+        "Mycorrhiza.Interop.Helpers",
+        "Mycorrhiza.Interop.Helpers.RustArgumentException",
+    >;
+    type RustInvalidOperationException = RustcCLRInteropManagedClass<
+        "Mycorrhiza.Interop.Helpers",
+        "Mycorrhiza.Interop.Helpers.RustInvalidOperationException",
+    >;
+    type RustIOException = RustcCLRInteropManagedClass<
+        "Mycorrhiza.Interop.Helpers",
+        "Mycorrhiza.Interop.Helpers.RustIOException",
+    >;
+    type RustTimeoutException = RustcCLRInteropManagedClass<
+        "Mycorrhiza.Interop.Helpers",
+        "Mycorrhiza.Interop.Helpers.RustTimeoutException",
+    >;
+    type RustNotSupportedException = RustcCLRInteropManagedClass<
+        "Mycorrhiza.Interop.Helpers",
+        "Mycorrhiza.Interop.Helpers.RustNotSupportedException",
+    >;
+
+    let message = format!("{error}");
+    let message = DotNetString::from(message.as_str()).handle();
+    let status = error.native_status().unwrap_or(i32::MIN);
+    let exception = match error.exception_kind() {
+        ManagedExceptionKind::Exception => {
+            let value = RustException::ctor2::<MString, i32>(message, status);
+            rustc_clr_interop_managed_checked_cast::<Exception, RustException>(value)
+        }
+        ManagedExceptionKind::Argument => {
+            let value = RustArgumentException::ctor2::<MString, i32>(message, status);
+            rustc_clr_interop_managed_checked_cast::<Exception, RustArgumentException>(value)
+        }
+        ManagedExceptionKind::InvalidOperation => {
+            let value = RustInvalidOperationException::ctor2::<MString, i32>(message, status);
+            rustc_clr_interop_managed_checked_cast::<Exception, RustInvalidOperationException>(
+                value,
+            )
+        }
+        ManagedExceptionKind::Io => {
+            let value = RustIOException::ctor2::<MString, i32>(message, status);
+            rustc_clr_interop_managed_checked_cast::<Exception, RustIOException>(value)
+        }
+        ManagedExceptionKind::Timeout => {
+            let value = RustTimeoutException::ctor2::<MString, i32>(message, status);
+            rustc_clr_interop_managed_checked_cast::<Exception, RustTimeoutException>(value)
+        }
+        ManagedExceptionKind::NotSupported => {
+            let value = RustNotSupportedException::ctor2::<MString, i32>(message, status);
+            rustc_clr_interop_managed_checked_cast::<Exception, RustNotSupportedException>(value)
+        }
+    };
+    ExceptionDispatchInfo::capture(exception).throw();
+    unreachable!("ExceptionDispatchInfo::Throw() does not return")
+}

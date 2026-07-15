@@ -770,8 +770,8 @@ pub struct ClassDef {
     /// doc for what a single entry needs. NOTE: adding this field changed the
     /// postcard-serialized `.bc` format (the same fingerprint trap as `generic_names` above).
     properties: Vec<PropertyDef>,
-    /// General ECMA-335 `CustomAttribute` rows (§II.21/§II.23.3) attached to this TYPE (not its
-    /// members — method/param-level attributes are a separate, not-yet-implemented surface).
+    /// General ECMA-335 `CustomAttribute` rows (§II.21/§II.23.3) attached to this type. Member,
+    /// property, and field attributes live on their corresponding definitions below.
     /// Populated by `#[dotnet_class(attr(...))]` via `comptime::finish_type`. Empty for every
     /// class that existed before this field: additive, `ClassDef::new` never sets it. See
     /// `CustomAttrDef`'s own doc for the exact argument shapes supported and why a raw-bytes
@@ -779,6 +779,10 @@ pub struct ClassDef {
     /// postcard-serialized `.bc` format (the same fingerprint trap as `generic_names`/
     /// `properties` above — rebuild dylib+linker together and clean consumers).
     custom_attributes: Vec<CustomAttrDef>,
+    /// General custom attributes attached to declared fields. The boolean distinguishes static
+    /// from instance storage; the name remains stable across codegen shards and is resolved to the
+    /// concrete Field row by the exporters.
+    field_custom_attributes: Vec<(Interned<IString>, bool, Vec<CustomAttrDef>)>,
     /// Genuine ECMA-335 enum metadata. Unlike an ordinary Rust enum lowered for execution, this
     /// describes the public managed projection: a `System.Enum` base, the special `value__`
     /// field, and one `literal hasdefault` field/Constant row per variant. Kept separate from
@@ -864,6 +868,9 @@ pub enum CustomAttrArg {
     Str(Interned<IString>),
     /// `ELEMENT_TYPE_BOOLEAN` (0x02): one byte, 0/1.
     Bool(bool),
+    /// `ELEMENT_TYPE_U1` (0x05): one unsigned byte. Required by compiler metadata attributes such
+    /// as `NullableAttribute(byte)` and `NullableContextAttribute(byte)`.
+    U8(u8),
     /// `ELEMENT_TYPE_I4` (0x08): four bytes, little-endian.
     I32(i32),
     /// `ELEMENT_TYPE_I8` (0x0A): eight bytes, little-endian.
@@ -877,6 +884,7 @@ impl RelocateValue for CustomAttrArg {
         match self {
             Self::Str(value) => Self::Str(ctx.string(destination, value)),
             Self::Bool(value) => Self::Bool(value),
+            Self::U8(value) => Self::U8(value),
             Self::I32(value) => Self::I32(value),
             Self::I64(value) => Self::I64(value),
         }
@@ -1050,6 +1058,8 @@ pub struct PropertyDef {
     tpe: Type,
     getter: Option<Interned<MethodRef>>,
     setter: Option<Interned<MethodRef>>,
+    nullability: Option<u8>,
+    custom_attributes: Vec<CustomAttrDef>,
 }
 impl RelocateValue for PropertyDef {
     type Output = Self;
@@ -1060,12 +1070,19 @@ impl RelocateValue for PropertyDef {
             tpe,
             getter,
             setter,
+            nullability,
+            custom_attributes,
         } = self;
         Self {
             name: ctx.string(destination, name),
             tpe: destination.translate_type(ctx, tpe),
             getter: getter.map(|method| ctx.method_ref(destination, method)),
             setter: setter.map(|method| ctx.method_ref(destination, method)),
+            nullability,
+            custom_attributes: custom_attributes
+                .into_iter()
+                .map(|attribute| attribute.relocate(ctx, destination))
+                .collect(),
         }
     }
 }
@@ -1089,7 +1106,16 @@ impl PropertyDef {
             tpe,
             getter,
             setter,
+            nullability: None,
+            custom_attributes: vec![],
         }
+    }
+    /// Attach the compiler-recognized nullable-reference flag for this property type.
+    #[must_use]
+    pub fn with_nullability(mut self, flag: u8) -> Self {
+        assert!(matches!(flag, 1 | 2), "property nullability must be 1 or 2");
+        self.nullability = Some(flag);
+        self
     }
     #[must_use]
     pub fn name(&self) -> Interned<IString> {
@@ -1106,6 +1132,19 @@ impl PropertyDef {
     #[must_use]
     pub fn setter(&self) -> Option<Interned<MethodRef>> {
         self.setter
+    }
+    #[must_use]
+    pub fn nullability(&self) -> Option<u8> {
+        self.nullability
+    }
+    #[must_use]
+    pub fn with_custom_attributes(mut self, attributes: Vec<CustomAttrDef>) -> Self {
+        self.custom_attributes = attributes;
+        self
+    }
+    #[must_use]
+    pub fn custom_attributes(&self) -> &[CustomAttrDef] {
+        &self.custom_attributes
     }
 }
 
@@ -1141,6 +1180,7 @@ impl RelocateValue for ClassDef {
             generic_names,
             properties,
             custom_attributes,
+            field_custom_attributes,
             enum_def,
             fixed_array_layout,
         } = self;
@@ -1189,6 +1229,19 @@ impl RelocateValue for ClassDef {
             custom_attributes: custom_attributes
                 .into_iter()
                 .map(|attribute| attribute.relocate(ctx, destination))
+                .collect(),
+            field_custom_attributes: field_custom_attributes
+                .into_iter()
+                .map(|(name, is_static, attributes)| {
+                    (
+                        ctx.string(destination, name),
+                        is_static,
+                        attributes
+                            .into_iter()
+                            .map(|attribute| attribute.relocate(ctx, destination))
+                            .collect(),
+                    )
+                })
                 .collect(),
             enum_def: enum_def.map(|definition| definition.relocate(ctx, destination)),
             fixed_array_layout: fixed_array_layout.map(|layout| layout.relocate(ctx, destination)),
@@ -1274,6 +1327,7 @@ impl ClassDef {
             generic_names: vec![],
             properties: vec![],
             custom_attributes: vec![],
+            field_custom_attributes: vec![],
             enum_def: None,
             fixed_array_layout: None,
         }
@@ -1462,6 +1516,42 @@ impl ClassDef {
         if !self.custom_attributes.contains(&attr) {
             self.custom_attributes.push(attr);
         }
+    }
+
+    pub fn add_field_custom_attribute(
+        &mut self,
+        name: Interned<IString>,
+        is_static: bool,
+        attr: CustomAttrDef,
+    ) {
+        if let Some((_, _, attributes)) =
+            self.field_custom_attributes
+                .iter_mut()
+                .find(|(candidate, candidate_static, _)| {
+                    *candidate == name && *candidate_static == is_static
+                })
+        {
+            if !attributes.contains(&attr) {
+                attributes.push(attr);
+            }
+        } else {
+            self.field_custom_attributes
+                .push((name, is_static, vec![attr]));
+        }
+    }
+
+    #[must_use]
+    pub fn field_custom_attributes(
+        &self,
+        name: Interned<IString>,
+        is_static: bool,
+    ) -> &[CustomAttrDef] {
+        self.field_custom_attributes
+            .iter()
+            .find(|(candidate, candidate_static, _)| {
+                *candidate == name && *candidate_static == is_static
+            })
+            .map_or(&[], |(_, _, attributes)| attributes)
     }
 
     pub(crate) fn ref_to(&self) -> ClassRef {
@@ -1729,6 +1819,11 @@ impl ClassDef {
         // `add_custom_attribute`'s own dedup — see its doc).
         for attr in translated.custom_attributes() {
             self.add_custom_attribute(attr.clone());
+        }
+        for (name, is_static, attributes) in &translated.field_custom_attributes {
+            for attribute in attributes {
+                self.add_field_custom_attribute(*name, *is_static, attribute.clone());
+            }
         }
 
         match (&self.enum_def, &translated.enum_def) {

@@ -17,8 +17,83 @@ shows the honest path that works rather than a nicer one that doesn't.
   imports `RustDotnet.targets`; you run the C# side with `dotnet run -c Release`.
 - The everyday imports are `use mycorrhiza::prelude::*;` — it pulls the collections, the BCL wrappers,
   the delegates, the Task bridge, `DotNetString`, and the error/optional bridges into scope like `std`.
-- **After any change that only touched a string literal, `rm -rf target` first** (stale-artifact
-  footgun — a native run can otherwise reuse the old `mycorrhiza` build and show the old behavior).
+- `cargo dotnet` includes SDK codegen sources in its cache key, so edits to `mycorrhiza` or the
+  proc macros invalidate consumer builds automatically.
+
+### Write IntelliSense documentation once, in Rust
+
+Public Rustdoc on `#[dotnet_export]`, `#[dotnet_class]`, `#[dotnet_dto]`, `#[dotnet_record]`,
+`#[dotnet_value]`, `#[dotnet_enum]`, `#[dotnet_methods]`, and `#[dotnet_interface]` becomes the
+standard C# XML documentation shipped beside the generated assembly. Use these headings when the
+member has structured documentation:
+
+```rust
+/// Projects a quote over a number of periods.
+///
+/// # Arguments
+///
+/// - `periods`: Number of periods to project.
+///
+/// # Returns
+///
+/// The projected whole-number value.
+///
+/// # Errors
+///
+/// Thrown when the quote cannot be projected.
+#[dotnet_export(error = "exception")]
+pub fn project(periods: i32) -> Result<i32, String> {
+    // ...
+}
+```
+
+Recognized headings are `# Arguments`/`# Parameters`, `# Returns`, `# Errors`/`# Exceptions`, and
+`# Type Parameters`; named entries use ``- `name`: description``. Field comments document generated
+properties and constructor parameters. The generator XML-escapes user text, emits correct member
+IDs for constructors, arrays, constructed generics, and type/method generic parameters, and leaves
+an explicit fallback sentence when a supported tag is undocumented. `cargo dotnet pack` clears the
+per-build sidecar before compilation and puts the resulting `.xml` beside the DLL under
+`lib/netX.0/`, so removed members cannot survive as stale IntelliSense entries.
+
+### Project Rust errors as familiar typed .NET exceptions
+
+Keep `error = "exception"` for the smallest `Display`-only mapping. When C# callers need a familiar
+exception category plus a machine-readable native/library status, implement `ManagedError` and use
+`error = "managed"`:
+
+```rust
+use mycorrhiza::prelude::{ManagedError, ManagedExceptionKind};
+
+struct NativeArgumentError { status: i32 }
+
+impl core::fmt::Display for NativeArgumentError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("native argument rejected")
+    }
+}
+
+impl ManagedError for NativeArgumentError {
+    fn exception_kind(&self) -> ManagedExceptionKind {
+        ManagedExceptionKind::Argument
+    }
+
+    fn native_status(&self) -> Option<i32> { Some(self.status) }
+}
+
+#[dotnet_export(error = "managed")]
+fn parse_native() -> Result<i32, NativeArgumentError> {
+    Err(NativeArgumentError { status: 4221 })
+}
+```
+
+C# catches `RustArgumentException` through the normal `ArgumentException` base and can inspect
+`HasNativeStatus` / `NativeStatus`; the Rust `Display` text remains `Message`. Other categories are
+`Exception`, `InvalidOperation`, `Io`, `Timeout`, and `NotSupported`. The concrete exception classes
+ship in `Mycorrhiza.Interop.Helpers.dll`, which `cargo dotnet build` and `pack` already place beside
+managed Rust consumers. This policy currently covers synchronous exports; async task-fault mapping
+remains separate from the existing cancellation-only async policy.
+
+**Runnable:** `cargo_tests/cd_export`, gated through `feasibility/api_docs_acceptance.sh`.
 
 ---
 
@@ -99,6 +174,36 @@ assert_eq!(dm.iter().find(|&(k, _)| k == 2).map(|(_, v)| v), Some(200));
 ```
 
 **Runnable:** `cargo_tests/cd_collections` (`Dictionary entry iteration` section, part of its 128 checks).
+
+### Accept familiar collection interfaces from C#
+
+Exported application APIs do not have to require the concrete wrappers above. The rooted interface
+projections accept caller-owned implementations and remain safe if a Rust future suspends:
+
+```rust
+use dotnet_macros::dotnet_export;
+use mycorrhiza::prelude::*;
+
+#[dotnet_export]
+pub async fn update(
+    mut rows: MutableList<i32>,
+    mut totals: MutableDictionary<i32, i32>,
+) -> i32 {
+    rows.push(8);
+    totals.insert(8, rows.len());
+    totals.get(8).unwrap_or_default()
+}
+
+#[dotnet_export]
+pub fn primes() -> ManagedEnumerable<i32> {
+    List::from_slice(&[2, 3, 5, 7]).into_enumerable()
+}
+```
+
+C# sees `IList<int>`, `IDictionary<int,int>`, and `IEnumerable<int>`—not Rust wrappers. Arrays,
+`List<T>`, dictionaries, LINQ iterators, or application-defined implementations can cross without
+copying merely to satisfy the API shape. `ReadOnlyList<T>` is the corresponding read-only indexed
+surface. **Runnable:** `cargo_tests/cd_typed_dto` and `cargo_tests/cd_async_export`.
 
 ---
 
@@ -370,6 +475,46 @@ int    n = MainModule.add(2, 3);        // 5
 Supported param/return types: the integer/float primitives, `bool`, `&str`, `String`, and `-> ()`.
 Anything else is a **clear compile error** (marshalling is never faked) — richer types are the backlog.
 **Runnable:** `cargo_tests/cd_export`.
+
+#### Safe CLR custom attributes
+
+The same structured `attr(...)` syntax targets types, methods, returns, parameters, fields, and
+properties. It accepts string, bool, `i32`, and `i64` constructor or named-property arguments and
+always builds a valid ECMA-335 blob; there is deliberately no raw-byte escape hatch.
+
+```rust
+#[dotnet_export(
+    attr("[My.Contracts]My.Contracts.ApiAttribute", args("Analyze"), props(Stable = true)),
+    return_attr("[My.Contracts]My.Contracts.ApiAttribute", args("result")),
+    param_attr(rows, "[My.Contracts]My.Contracts.ApiAttribute", args("input"))
+)]
+pub fn analyze(rows: i32) -> i32 { rows }
+
+#[dotnet_class(properties = true)]
+pub struct Request {
+    #[dotnet_attr("[My.Contracts]My.Contracts.ApiAttribute", args("field"))]
+    #[dotnet_property_attr("[My.Contracts]My.Contracts.ApiAttribute", args("property"))]
+    pub rows: i32,
+}
+
+#[dotnet_methods]
+impl Request {
+    #[dotnet(
+        attr("[My.Contracts]My.Contracts.ApiAttribute", args("method")),
+        return_attr("[My.Contracts]My.Contracts.ApiAttribute", args("return")),
+        param_attr(value, "[My.Contracts]My.Contracts.ApiAttribute", args("parameter"))
+    )]
+    pub fn normalize(value: i32) -> i32 { value.max(0) }
+}
+```
+
+Use `static_field_attr(NAME, ...)` beside a `static_field(NAME: Type)` declaration. On an exported
+interface property, put `attr(...)` on its getter:
+`#[dotnet_property(attr("[Assembly]Namespace.Attribute", args(...)))]`.
+
+Attributes in `System.Runtime.CompilerServices` and `System.Runtime.InteropServices` are rejected
+by both the proc macro and backend. Those namespaces contain layout and calling-convention
+metadata; dedicated verified features own those semantics.
 
 ### 7c. A raw `#[unsafe(no_mangle)] extern "C"` fn (full control)
 
@@ -648,6 +793,38 @@ let _handle = ros.handle();   // escape hatch: hand the raw Span to a .NET API e
 of the WF-9 value-type-generic-instance-method unlock. **Runnable:** `cargo_tests/cd_span`
 (`mycorrhiza::span` section).
 
+For exported synchronous APIs, ordinary primitive Rust slices are the convenient surface. They
+become framework-native spans in C#, including true `stackalloc` callers:
+
+```rust
+use dotnet_macros::dotnet_export;
+
+#[dotnet_export]
+pub fn sum(values: &[i32]) -> i32 {
+    values.iter().sum()
+}
+
+#[dotnet_export]
+pub fn scale(values: &mut [f64], factor: f64) {
+    values.iter_mut().for_each(|value| *value *= factor);
+}
+```
+
+```csharp
+ReadOnlySpan<int> input = stackalloc[] { 2, 3, 5 };
+Debug.Assert(MainModule.Sum(input) == 10);
+
+Span<double> output = stackalloc[] { 1.5, 2.0 };
+MainModule.Scale(output, 4.0);
+Debug.Assert(output.SequenceEqual(stackalloc[] { 6.0, 8.0 }));
+```
+
+This projection is intentionally synchronous-only. Applying `#[dotnet_export]` to an `async fn`
+with a slice parameter is a compile error because a CLR span cannot cross an `await`. Choose
+`Memory<T>` or `ReadOnlyMemory<T>` for retained or asynchronous buffers. **Runnable:**
+`cargo_tests/cd_typed_dto` (real backend plus .NET 10 stack-allocated caller) and
+`dotnet_macros/tests/ui/dotnet_export_async_span.rs` (fail-loud lifetime rule).
+
 If managed code needs to **retain** the buffer or carry it across an async boundary, use the
 GC-owned sibling instead. Construction copies the Rust slice into a managed array; subsequent
 slices are cheap views over that same array:
@@ -667,9 +844,30 @@ assert_eq!(destination.to_vec(), vec![3, 1, 4]);
 ```
 
 `Memory<T>` is not advertised as zero-copy from Rust: the copy is what removes the Rust borrow
-lifetime and makes the buffer safe for managed retention. `.handle()` exposes the real managed
-value to APIs expecting `Memory<T>` / `ReadOnlyMemory<T>`. **Runnable:** `cargo_tests/cd_span`
-(`Memory<T>` section, total 68/68).
+lifetime and makes the buffer safe for managed retention. Internally, the CLR value is boxed behind
+an opaque GC root, so a Rust future stores only a native token rather than the managed reference
+embedded in `System.Memory<T>`. `into_handle()` is the consuming low-level escape hatch for a
+hand-written managed call.
+
+Exported APIs need no escape hatch at all. The macro projects the framework-native types directly:
+
+```rust
+use dotnet_macros::dotnet_export;
+use mycorrhiza::memory::{Memory, ReadOnlyMemory};
+
+#[dotnet_export]
+pub async fn sum_later(values: ReadOnlyMemory<i32>) -> i32 {
+    // `values` remains rooted even if this future suspends.
+    let mut copy = Memory::from_slice(&vec![0; values.len() as usize]);
+    values.copy_to(&mut copy);
+    copy.to_vec().into_iter().sum()
+}
+```
+
+C# calls this with `ReadOnlyMemory<int>` and receives an ordinary `Task<int>`. Mutable
+`Memory<T>` writes through sliced views to the caller's original backing array. **Runnable:**
+`cargo_tests/cd_span` (Rust construction), `cargo_tests/cd_typed_dto` (C# round-trip), and
+`cargo_tests/cd_async_export` (genuine suspension).
 
 ---
 
@@ -687,6 +885,30 @@ assert_eq!(n.to_option(), Some(7));
 This is the same value-type-generic unlock `Span<T>` (§9) and dictionary iteration (§1) rest on —
 `Nullable<T>` is a generic value type, and its `HasValue`/`Value` are value-type instance methods.
 **Runnable:** `cargo_tests/cd_vtgen` (`Ergonomic Nullable<T> -> Option<T>` section).
+
+For nullable **reference** types, use `ManagedOption<T>` rather than Rust `Option<T>`. The CLR seam
+is still the underlying reference type, so C# passes either an object or `null`; internally a
+non-null value is GC-rooted behind a pointer-only `ManagedRef<T>`, which is safe in async state:
+
+```rust
+use dotnet_macros::dotnet_export;
+use mycorrhiza::managed_option::ManagedOption;
+use mycorrhiza::system::MString;
+
+#[dotnet_export]
+pub async fn has_text(value: ManagedOption<MString>) -> bool {
+    value.is_some()
+}
+```
+
+This explicit type avoids pretending Rust's enum layout is CLR's reference-or-null layout.
+It also drives real C# nullable-reference metadata: `ManagedOption<MString>` appears as `string?`,
+while `MString`, `String`, managed handles, tasks, delegates, arrays, and collection handles appear
+as required references. This applies consistently to exports, generated methods, interfaces,
+constructors, and properties; no separate C# annotation file is required.
+**Runnable:** `cargo_tests/cd_export`, `cargo_tests/cd_typed_dto`, and
+`cargo_tests/cd_async_export`. The clean packaged reflection/compiler gate is
+`feasibility/api_docs_acceptance.sh`.
 
 ---
 
@@ -922,6 +1144,515 @@ captured outputs.
 
 ---
 
+## 16. Choose reference DTO, immutable record, or CLR value semantics explicitly
+
+Use an annotation that says what C# semantics you intend. The backend never guesses whether a
+Rust struct should become a managed reference or a copied value:
+
+```rust
+use dotnet_macros::{dotnet_dto, dotnet_record, dotnet_value};
+
+#[dotnet_dto]
+pub struct Invoice {
+    amount: Decimal,
+    memo: MString,
+}
+
+#[dotnet_record]
+pub struct RiskScenario {
+    scenario_id: Guid,
+    as_of: DateTimeOffset,
+}
+
+#[dotnet_value]
+pub struct RatePoint {
+    tenor_days: i32,
+    rate: f64,
+}
+```
+
+`#[dotnet_dto]` produces a reference class with a parameterless constructor and writable PascalCase
+properties. `#[dotnet_record]` produces an immutable reference class with a full constructor,
+getter-only properties, field-wise `IEquatable<T>` and object equality, matching hashing,
+`ToString`, positional deconstruction, and null-safe `==`/`!=`. Field comparison and hashing use
+the framework's `EqualityComparer<T>.Default`, so strings, nulls, floating-point edge cases, and
+nested values retain their normal .NET semantics. `#[dotnet_value]` produces a genuine CLR value
+type with writable PascalCase properties; its generated `RatePointHandle` can cross an exported
+Rust signature by value. Managed Rust can read its backing fields without fragile accessor lookup:
+
+```rust
+pub fn annualized(point: RatePointHandle) -> f64 {
+    let days = point.vt_field::<"tenorDays", i32>();
+    let rate = point.vt_field::<"rate", f64>();
+    rate * 365.0 / days as f64
+}
+```
+
+Exported Rust `snake_case` members also default to normal CLR PascalCase (`annualized_rate` becomes
+`AnnualizedRate`). Use `#[dotnet(name = "ExactManagedName")]` only when convention is not enough.
+
+C# uses the result as an ordinary struct:
+
+```csharp
+var point = default(RatePoint);
+point.TenorDays = 730;
+point.Rate = 0.08;
+var annualized = InvoiceFacade.AnnualizedRate(point);
+```
+
+The record is equally ordinary from C#:
+
+```csharp
+var scenario = new RiskScenario(scenarioId, asOf);
+var copy = new RiskScenario(scenarioId, asOf);
+
+if (scenario == copy)
+{
+    var (id, timestamp) = scenario;
+    Console.WriteLine($"{id} at {timestamp}: {scenario}");
+}
+```
+
+**Runnable:** `cargo_tests/cd_typed_dto` proves all three shapes, full record semantics, exact
+`Guid`, `DateTime`, `DateTimeOffset`, `decimal`, `DateOnly?`, and string identities, plus
+C#-to-Rust value passage.
+
+For arrays of generated types, use `ManagedArray<T>` rather than `Vec<T>`. It is an actual GC-owned
+CLR `T[]`, so reference DTOs remain in tracked managed storage:
+
+```rust
+use mycorrhiza::prelude::ManagedArray;
+
+pub fn sum_rates(points: ManagedArray<RatePointHandle>) -> f64 {
+    (0..points.len())
+        .map(|index| points.get(index).vt_field::<"rate", f64>())
+        .sum()
+}
+
+pub fn count_invoices(invoices: ManagedArray<InvoiceDtoHandle>) -> i32 {
+    invoices.len()
+}
+```
+
+Use ordinary `Vec<primitive>` when you want an owned Rust copy, `ManagedArray<T>` when the existing
+CLR allocation should remain managed, and `Memory<T>`/`ReadOnlyMemory<T>` when data must be retained
+or cross an async suspension.
+
+Accept `ReadOnlyList<T>` when callers should be free to pass either arrays, `List<T>`, or their own
+collection implementation without a copy:
+
+```rust
+use mycorrhiza::prelude::ReadOnlyList;
+
+pub fn sum_rates(points: ReadOnlyList<RatePointHandle>) -> f64 {
+    (0..points.len())
+        .map(|index| points.at(index).vt_field::<"rate", f64>())
+        .sum()
+}
+```
+
+---
+
+## 17. Accept C# cancellation and progress without delegate plumbing
+
+Use the identity-preserving wrappers directly in a `#[dotnet_methods]` signature. C# sees the
+ordinary framework interfaces; Rust gets small, idiomatic methods:
+
+```rust
+use mycorrhiza::cancellation::CancellationToken;
+use mycorrhiza::progress::Progress;
+
+pub fn analyze(token: CancellationToken, progress: Progress<i32>) {
+    for percent in 0..=100 {
+        token.throw_if_cancellation_requested();
+        // perform one bounded unit of work
+        progress.report(percent);
+    }
+}
+```
+
+For an `async fn`, use the rooted projections; `#[dotnet_export]` still presents the exact same C#
+signature and performs the conversion before constructing the Rust future:
+
+```rust
+use mycorrhiza::cancellation::{Cancellation, CancellationRequested};
+use mycorrhiza::progress::ProgressReporter;
+
+#[dotnet_export(name = "AnalyzeAsync", cancellation = "task")]
+pub async fn analyze_async(
+    mut cancellation: Cancellation,
+    progress: ProgressReporter<i32>,
+) -> Result<i32, CancellationRequested> {
+    progress.report(10);
+    do_one_async_step().await;
+    cancellation.ensure_not_canceled()?;
+    progress.report(100);
+    Ok(42)
+}
+```
+
+The distinction is safety-critical: raw framework values contain GC references, while the rooted
+projections store only GCHandle/native tokens in Rust's overlapping coroutine state.
+
+The cancellation policy is explicit because it intentionally discards the Rust error value. It
+completes `TaskCompletionSource<T>` with `SetCanceled`, so C# sees `task.IsCanceled == true`,
+`task.IsFaulted == false`, and `await` raises `TaskCanceledException` through the normal
+`OperationCanceledException` base. `Result<(), E>` produces the equivalent non-generic `Task`.
+Without `cancellation = "task"`, async `Result<T, E>` remains a compile error until a fault/exception
+policy is selected; ordinary domain errors are never silently relabeled as cancellation.
+
+`token.register(|| ...)` returns a `CancellationRegistration` guard that owns the managed
+registration, delegate, and Rust closure together. Its synchronous `dispose`/`Drop` path waits out
+a racing callback before freeing the closure. `try_unregister` is non-blocking and returns the
+still-live guard when the CLR reports that a callback is already running.
+
+The C# call site stays conventional:
+
+```csharp
+using var cancellation = new CancellationTokenSource();
+var progress = new Progress<int>(percent => ProgressBar.Value = percent);
+Analysis.Analyze(cancellation.Token, progress);
+
+Task<int> task = Analysis.AnalyzeAsync(cancellation.Token, progress);
+try { await task; }
+catch (OperationCanceledException) { /* expected after cancellation */ }
+```
+
+---
+
+## 18. Expose Rust-owned cleanup through `using` and `await using`
+
+Declare the framework lifecycle contracts on the methods block. The macro validates the exact
+managed signatures and attaches `IDisposable`/`IAsyncDisposable`; misspelling or returning the wrong
+type is a Rust compile error rather than a CLR interface-binding surprise:
+
+```rust
+use mycorrhiza::task::{Task, ValueTask, await_unit, future_to_value_task_unit};
+
+struct NativeState;
+
+#[dotnet_class(field_setters = true)]
+pub struct NativeResource {
+    token: usize,
+}
+
+#[dotnet_methods(disposable, async_disposable)]
+impl NativeResource {
+    pub fn dispose(this: NativeResourceHandle) {
+        let token = this.instance0::<"read_token", usize>();
+        if token == 0 { return; }
+        this.instance1::<"set_token", usize, ()>(0);
+        unsafe { drop(Box::from_raw(token as *mut NativeState)) };
+    }
+
+    pub fn dispose_async(this: NativeResourceHandle) -> ValueTask {
+        // Detach before suspension: the future may own a native token, never a raw GC reference.
+        let token = this.instance0::<"read_token", usize>();
+        if token != 0 {
+            this.instance1::<"set_token", usize, ()>(0);
+        }
+        future_to_value_task_unit(async move {
+            await_unit(Task::delay(1)).await;
+            if token != 0 {
+                unsafe { drop(Box::from_raw(token as *mut NativeState)) };
+            }
+        })
+    }
+}
+```
+
+The detach-before-suspend rule is deliberate. Capturing `NativeResourceHandle` directly in the
+future is rejected by the CIL verifier because a movable managed reference cannot live in Rust's
+coroutine storage. Root a managed value explicitly when it truly must survive, or transfer only the
+native ownership token as above.
+
+C# remains completely conventional:
+
+```csharp
+using (var resource = NativeResource.Create())
+{
+    // synchronous use
+}
+
+await using (var resource = NativeResource.Create())
+{
+    // asynchronous use
+}
+```
+
+**Runnable:** `cargo_tests/cd_typed_dto` proves both interfaces, repeated `Dispose`, real
+`ValueTask`-backed `await using`, and exactly-once Rust `Drop`.
+
+---
+
+## 19. Present a retained native callback as a managed job
+
+`CallbackRegistration` owns the API-specific native token and quiescence contract. Wrap it in
+`NativeJob` when the operation also needs progress, cancellation, a terminal result or error, and a
+retryable stop surface:
+
+```rust
+use rust_dotnet_pinvoke::NativeJob;
+
+let pending = Arc::new(Mutex::new(VecDeque::<i32>::new()));
+let callback_pending = Arc::clone(&pending);
+let mut job = NativeJob::start(
+    move |value| callback_pending.lock().unwrap().push_back(value),
+    |controller| Registration::start(
+        move |value| {
+            if controller.is_cancellation_requested() { return 1; }
+            controller.report_progress(value);
+            if value == 100 {
+                let _ = controller.complete(value);
+                return 1;
+            }
+            0
+        },
+        false,
+    ),
+)?;
+
+job.request_cancellation();
+assert!(job.controller().ensure_not_canceled().is_err());
+if let Err(error) = job.try_stop() {
+    // The still-live registration is already restored inside `job`; inspect and retry later.
+    eprintln!("native stop failed: {error:?}");
+}
+```
+
+The callback and controller deliberately contain no CLR reference. A C#-facing adapter owns any
+`ProgressReporter<T>` separately and drains the native queue from an explicit `PumpProgress()`
+method on the caller's dispatcher/update thread. Generate that adapter from the one API-specific
+start function instead of reproducing its registry and lifecycle shell by hand:
+
+```rust
+#[dotnet_native_job(
+    class = ManagedNativeJob,
+    status = ManagedJobStatus,
+    registration = Registration,
+    result = i32,
+    error = i32,
+    progress = i32,
+    result_empty = i32::MIN,
+    error_empty = i32::MIN,
+    stop_error = stop_error_code,
+    live_workers = live_workers,
+)]
+fn start_native_job(
+    controller: NativeJobController<i32, i32, i32>,
+    complete_at: i32,
+    fail_at: i32,
+    fail_first_stop: bool,
+) -> Result<Registration, NativeStatusError> {
+    Registration::start(
+        move |value| {
+            if controller.is_cancellation_requested() { return 1; }
+            controller.report_progress(value);
+            if complete_at > 0 && value >= complete_at {
+                let _ = controller.complete(value);
+                return 1;
+            }
+            0
+        },
+        fail_first_stop,
+    )
+}
+```
+
+All options are required so sentinel values, native error mapping, worker diagnostics, and
+registration ownership remain API-specific and reviewable. The controller's three type arguments
+must match the declared result, error, and progress types. The generated state-ID constructor has
+CLR `assembly` accessibility: generated factory code in the same assembly can invoke it, while C#
+consumers cannot forge lifecycle objects with `new`.
+
+C# should own its cancellation registration:
+
+```csharp
+using var source = new CancellationTokenSource();
+using var job = ManagedNativeJob.Start(progress, completeAt: 100, failAt: 0,
+                                       failFirstStop: true);
+using var registration = source.Token.Register(job.RequestCancellation);
+
+job.PumpProgress(); // call from the Excel/WinUI/MAUI dispatcher or Unity update loop
+source.Cancel();
+if (!job.TryStop())
+    job.TryStop();  // same object still owns the live native registration
+```
+
+This boundary is intentional. Calling a rooted `IProgress<T>` directly from an arbitrary native
+worker violates host-thread rules in Excel, WinUI, MAUI, and Unity. Keeping CLR cancellation
+registration in C# also lets the runtime own its callback race and disposal semantics. The managed
+shell still exposes ordinary PascalCase methods and `IDisposable`; it never exposes a callback
+context pointer or native token.
+
+**Runnable:** `feasibility/pinvoke_async_callback_acceptance.sh` builds a real native Rust worker,
+the managed Rust adapter, and a .NET 10 C# consumer. It proves success, failure, cancellation,
+progress, failed-stop retry, constructor accessibility, quiescence, and zero live workers after
+disposal. Macro compile-fail tests cover missing policies, controller-type disagreement, invalid
+return shape, and invalid constructor visibility.
+
+---
+
+## 20. Stream Rust results with normal C# `await foreach`
+
+Return `AsyncEnumerable<T>` from a synchronous exported factory. The producer closure itself is an
+ordinary Rust future:
+
+```rust
+use dotnet_macros::dotnet_export;
+use mycorrhiza::enumerate_async::{AsyncEnumerable, AsyncStreamWriter};
+
+#[dotnet_export]
+pub fn risk_scenarios(count: i32) -> AsyncEnumerable<i32> {
+    AsyncEnumerable::spawn(move |writer: AsyncStreamWriter<i32>| async move {
+        for scenario in 0..count {
+            if writer.send(scenario).await.is_err() {
+                break; // C# canceled, broke out of await foreach, or abandoned the stream
+            }
+        }
+    })
+}
+```
+
+C# sees the framework interface directly:
+
+```csharp
+using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+await foreach (int scenario in MainModule.RiskScenarios(10_000)
+    .WithCancellation(cancellation.Token))
+{
+    Console.WriteLine(scenario);
+    if (scenario == 100)
+        break; // DisposeAsync stops the Rust producer
+}
+```
+
+The implementation uses a capacity-one `System.Threading.Channels` queue. Rust cannot advance more
+than one item ahead of the managed consumer, and the CLR's own `ReadAllAsync` iterator provides the
+real incomplete `ValueTask<bool>` behavior. A bundled `RustStreamLease` converges normal completion,
+cancellation, early disposal, and finalization onto one non-blocking Rust stop notification. The
+stream is deliberately single-consumer; calling `GetAsyncEnumerator` twice fails immediately.
+
+Use `AsyncEnumerable::try_spawn` when the producer returns `Result<(), E>`. `Err` faults the managed
+channel, so `await foreach` throws a normal managed exception rather than silently ending. A producer
+performing lengthy CPU or native work between sends should also poll
+`writer.is_cancellation_requested()` cooperatively. `cargo dotnet` copies and packages the bundled
+`Mycorrhiza.Interop.Helpers.dll`; a hand-written C# project referencing the raw assembly directly
+must copy/reference that companion beside it as well.
+
+**Runnable:** `cargo_tests/cd_async_export` and `feasibility/async_export_acceptance.sh` prove ordered
+completion, capacity-one backpressure before enumeration starts, early `break`, cancellation,
+producer-error propagation, and zero surviving Rust producers.
+
+---
+
+## 21. Return to a UI thread without leaking a Rust closure
+
+Accept the host-neutral dispatcher in an exported Rust API, clone it into a worker, and transfer an
+owned closure with `try_dispatch`:
+
+```rust
+use dotnet_macros::dotnet_export;
+use mycorrhiza::dispatch::UiDispatcher;
+
+#[dotnet_export]
+pub fn refresh_view(dispatcher: UiDispatcher) -> bool {
+    std::thread::spawn(move || {
+        let result = calculate_in_rust();
+        let _ = dispatcher.try_dispatch(move || update_managed_state(result));
+    });
+    true
+}
+```
+
+C# sees `IRustUiDispatcher`. The helper assembly deliberately has no UI-framework package
+dependency; adapt the host's real boolean queue operation directly:
+
+```csharp
+// WinUI 3 — capture the Window/Page DispatcherQueue.
+IRustUiDispatcher winui = new DelegateUiDispatcher(
+    () => DispatcherQueue.HasThreadAccess,
+    action => DispatcherQueue.TryEnqueue(action));
+
+// .NET MAUI — capture an IDispatcher belonging to the UI object/application.
+IRustUiDispatcher maui = new DelegateUiDispatcher(
+    () => !dispatcher.IsDispatchRequired,
+    action => dispatcher.Dispatch(action));
+
+// Unity — call from Awake/Start on the main thread, after Unity installs its context.
+IRustUiDispatcher unity = SynchronizationContextUiDispatcher.CaptureCurrent();
+```
+
+Do not construct a plain base `SynchronizationContext` and call it a UI dispatcher: its default
+`Post` can use the thread pool. Capture the actual host context on its owning thread. Unity's public
+`.NET 10` incompatibility is also unchanged: this API is ready for the planned `netstandard2.1`
+profile, but the current `.NET 10` assembly must not be copied into `Assets/Plugins` and described
+as supported.
+
+Every call creates a managed `RustDispatchWork` lease around the Rust closure. Running it,
+immediate `false` rejection, an adapter exception, or finalization exchanges the completion
+delegate exactly once. A host adapter may therefore reject during shutdown without leaking native
+state; even a broken adapter that returns `true` and drops the callback is eventually reclaimed.
+Rust panics are caught before the managed callback boundary.
+
+**Runnable:** `cargo_tests/cd_async_export` and `feasibility/async_export_acceptance.sh` pump a real
+custom synchronization context and prove worker-to-owning-thread execution, the exact managed
+thread ID, immediate-rejection cleanup, abandoned-callback finalization, panic containment, and
+zero live Rust dispatch closures.
+
+---
+
+## 22. Run a cancellable managed-Rust calculation from Excel
+
+Excel-DNA 1.9 automatically registers an `[ExcelFunction]` returning `Task<T>` as an asynchronous
+worksheet function. A final `CancellationToken` parameter is controlled by Excel-DNA and is
+signaled when the formula is deleted. The `--excel` scaffold uses that exact contract:
+
+```csharp
+[ExcelFunction(Name = "RUST.PORTFOLIO_STRESS_ASYNC")]
+public static async Task<object> PortfolioStressAsync(
+    double principal,
+    double annualRatePercent,
+    int years,
+    int scenarios,
+    CancellationToken cancellationToken)
+{
+    try
+    {
+        return await Task.Run(
+            () => MainModule.PortfolioStressScore(
+                cancellationToken, principal, annualRatePercent, years, scenarios),
+            cancellationToken).ConfigureAwait(false);
+    }
+    catch (OperationCanceledException)
+    {
+        throw; // preserve formula cancellation
+    }
+    catch (Exception error)
+    {
+        return $"#RUST! {error.Message}";
+    }
+}
+```
+
+The Rust export is synchronous and CPU-bound, receives the real CLR token, and polls it at bounded
+intervals. That is intentional: the current Rust `async fn` export bridge returns a managed task but
+does not promise a CPU scheduler. Excel's C# edge owns the scheduling policy; Rust owns the model.
+
+Only copied scalars cross into `Task.Run`. Never capture an Excel `Range`, `ExcelReference`, COM
+application object, or C-API handle in that closure. When background work intentionally needs to
+change a workbook, enqueue a separate action with `ExcelAsyncUtil.QueueAsMacro`; Excel-DNA executes
+it on Excel's main thread when Excel is ready. Pure synchronous scaffold UDFs explicitly opt into
+`IsThreadSafe = true`, while the asynchronous function relies on Excel-DNA's RTD/task lifecycle.
+
+**Runnable:** `cargo dotnet new --excel` emits this pattern and
+`feasibility/excel_dna_acceptance.sh` checks the cancellation/scheduling contract, rejects COM
+application access in the generated edge, compiles managed Rust, and packs the real x64 `.xll`.
+Opening that `.xll` in desktop Excel remains a Windows host acceptance, not something the macOS
+packaging gate pretends to prove.
+
+---
+
 ## What is *not* here (so you don't reach for it)
 
 These are honest gaps as of this writing — the natural next recipes, but not yet backed by working code:
@@ -936,7 +1667,9 @@ These are honest gaps as of this writing — the natural next recipes, but not y
   shape rather than automatic inference.
 - **A `serde` ⇄ `System.Text.Json` adapter** — the JSON bridge (§2) is a standalone DOM today.
 - **General `#[dotnet_export]` Rust-enum/try-pattern and managed-reference `Option<T>` shapes** —
-  primitive `Option<T>`/`Nullable<T>`, `Vec<T>`, tasks, and `Result<T,E>`→exception already work.
+  primitive `Option<T>`/`Nullable<T>`, `Vec<T>`↔managed `T[]`, tasks, and
+  `Result<T,E>`→exception already work. Select `RustOwnedVec<T>` explicitly when Rust ownership and
+  the disposable low-copy `RustVec<T>` C# wrapper are preferable to an array copy.
 
 For the capability map and the genuine ceilings, see
 [TRANSLATION_STATUS.md](TRANSLATION_STATUS.md) and [STATE_OF_THE_PROJECT.md](STATE_OF_THE_PROJECT.md)

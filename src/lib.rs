@@ -155,7 +155,7 @@ use crate::{
     fn_ctx::MethodCompileCtx,
 };
 use cilly::{
-    Assembly, AssemblyArtifact,
+    Assembly, AssemblyArtifact, NativeImport, PInvokeCallConv,
     {MethodRef, cilnode::MethodKind},
 };
 use rustc_codegen_ssa::{
@@ -180,6 +180,88 @@ pub type AString = std::sync::Arc<Box<str>>;
 /// An instance of the codegen.
 struct MyBackend {
     config: &'static config::BackendConfig,
+}
+
+/// Capture ordinary Rust `#[link] extern` declarations as linkable CLR P/Invoke metadata.
+///
+/// rustc already resolves `#[link_name]` into `CodegenFnAttrs::symbol_name`; retaining that exact
+/// symbol lets call lowering and final missing-method resolution agree without a backend-specific
+/// declaration macro.
+fn collect_native_imports(tcx: TyCtxt<'_>, asm: &mut Assembly) {
+    use rustc_abi::ExternAbi;
+    use rustc_hir::attrs::NativeLibKind;
+    use rustc_hir::def::DefKind;
+    use rustc_span::def_id::LOCAL_CRATE;
+
+    let foreign_modules = tcx.foreign_modules(LOCAL_CRATE);
+    for library in tcx.native_libraries(LOCAL_CRATE) {
+        let Some(module_id) = library.foreign_module else {
+            continue;
+        };
+        if !matches!(
+            library.kind,
+            NativeLibKind::Dylib { .. }
+                | NativeLibKind::RawDylib { .. }
+                | NativeLibKind::Unspecified
+        ) {
+            continue;
+        }
+        let module = foreign_modules
+            .get(&module_id)
+            .expect("native library references an unknown foreign module");
+        let call_conv = match module.abi {
+            ExternAbi::C { .. } => PInvokeCallConv::Cdecl,
+            ExternAbi::System { .. } => PInvokeCallConv::Winapi,
+            ExternAbi::Stdcall { .. } => PInvokeCallConv::Stdcall,
+            ExternAbi::Fastcall { .. } => PInvokeCallConv::Fastcall,
+            ExternAbi::Thiscall { .. } => PInvokeCallConv::Thiscall,
+            abi => tcx.dcx().span_fatal(
+                tcx.def_span(module_id),
+                format!(
+                    "P/Invoke does not support `extern \"{abi}\"`; use `extern \"C\"` or \
+                     `extern \"system\"`, and expose C++ APIs through a C-compatible shim"
+                ),
+            ),
+        };
+        for &foreign_item in &module.foreign_items {
+            if !matches!(tcx.def_kind(foreign_item), DefKind::Fn) {
+                tcx.dcx().span_fatal(
+                    tcx.def_span(foreign_item),
+                    "P/Invoke imports functions, not native statics; expose the value through a \
+                     C getter/setter function so initialization and ownership stay explicit",
+                );
+            }
+            let signature = tcx
+                .type_of(foreign_item)
+                .instantiate_identity()
+                .skip_normalization()
+                .fn_sig(tcx)
+                .skip_binder();
+            if signature.c_variadic() {
+                tcx.dcx().span_fatal(
+                    tcx.def_span(foreign_item),
+                    "variadic native imports are not supported by the portable CLR P/Invoke \
+                     surface; add a fixed-signature C wrapper around the variadic API",
+                );
+            }
+            let attrs = tcx.codegen_fn_attrs(foreign_item);
+            let entry_point = attrs
+                .symbol_name
+                .unwrap_or_else(|| tcx.item_name(foreign_item))
+                .to_string();
+            asm.add_native_import(NativeImport {
+                rust_symbol: entry_point.clone(),
+                entry_point,
+                library: library.name.to_string(),
+                call_conv,
+                // Native calls may overwrite the platform last-error slot even on success. Ask
+                // CoreCLR to capture it immediately for every user-declared import; callers that
+                // do not inspect it pay only the small P/Invoke bookkeeping cost, while managed
+                // last-error retrieval is not clobbered by later runtime work.
+                preserve_errno: true,
+            });
+        }
+    }
 }
 
 /// Rust-visible features supplied by the backend's baseline target machine.
@@ -278,6 +360,8 @@ impl CodegenBackend for MyBackend {
                 });
             result.expect("a CGU transaction cannot return an error");
         }
+
+        collect_native_imports(tcx, &mut asm);
 
         if let Some((entrypoint_did, kind)) = tcx.entry_fn(()) {
             let penv = rustc_middle::ty::TypingEnv::fully_monomorphized();

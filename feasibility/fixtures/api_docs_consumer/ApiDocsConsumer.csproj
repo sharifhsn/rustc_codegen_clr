@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RestoreSources>$(RclPackageSource)</RestoreSources>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Condition="'$(ImplementationReference)' == ''" Include="Rcl.ApiDocs.Probe" Version="0.0.0" />
+    <Reference Condition="'$(ImplementationReference)' != ''" Include="cd_export">
+      <HintPath>$(ImplementationReference)</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

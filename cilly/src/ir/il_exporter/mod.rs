@@ -169,7 +169,9 @@ impl ILExporter {
         for class_def in asm.iter_class_defs() {
             let vis = match class_def.access() {
                 crate::Access::Extern | crate::Access::Public => "public",
-                crate::Access::Private => "private",
+                crate::Access::Private
+                | crate::Access::Assembly
+                | crate::Access::InternalExtern => "private",
             };
             let sealed = if class_def.is_valuetype() {
                 "sealed"
@@ -506,9 +508,14 @@ impl ILExporter {
                     let set_text = self.method_ref_operand_text(asm_mut, s);
                     accessors.push_str(&format!(".set {set_text} "));
                 }
+                let nullable = prop.nullability().map_or_else(String::new, |flag| {
+                    format!(
+                        ".custom instance void [System.Runtime]System.Runtime.CompilerServices.NullableAttribute::.ctor(uint8) = (01 00 {flag:02X} 00 00) "
+                    )
+                });
                 writeln!(
                     out,
-                    ".property instance {prop_ty} '{prop_name}'() {{ {accessors}}}"
+                    ".property instance {prop_ty} '{prop_name}'() {{ {nullable}{accessors}}}"
                 )?;
             }
             writeln!(out, "}}")?;
@@ -577,6 +584,7 @@ impl ILExporter {
             match method.access() {
                 crate::Access::Extern | crate::Access::Public => "public",
                 crate::Access::Private => "private",
+                crate::Access::Assembly | crate::Access::InternalExtern => "assembly",
             }
         };
         // True if this method is the `add`/`remove` half of one of its own class's events (see
@@ -640,14 +648,26 @@ impl ILExporter {
         };
         let pinvoke = if let MethodImpl::Extern {
             lib,
+            entry_point,
+            call_conv,
             preserve_errno,
         } = method.implementation()
         {
             let lib = &asm[*lib];
+            let convention = match call_conv {
+                crate::ir::PInvokeCallConv::Winapi => "winapi",
+                crate::ir::PInvokeCallConv::Cdecl => "cdecl",
+                crate::ir::PInvokeCallConv::Stdcall => "stdcall",
+                crate::ir::PInvokeCallConv::Thiscall => "thiscall",
+                crate::ir::PInvokeCallConv::Fastcall => "fastcall",
+            };
+            let alias = entry_point
+                .map(|name| format!(" as \"{}\"", &asm[name]))
+                .unwrap_or_default();
             if *preserve_errno {
-                format!("pinvokeimpl(\"{lib}\" cdecl lasterr)")
+                format!("pinvokeimpl(\"{lib}\"{alias} {convention} lasterr)")
             } else {
-                format!("pinvokeimpl(\"{lib}\" cdecl)")
+                format!("pinvokeimpl(\"{lib}\"{alias} {convention})")
             }
         } else {
             String::new()
@@ -748,6 +768,28 @@ impl ILExporter {
             out,
             ".method {vis} hidebysig {kind} {pinvoke} {ret} '{name}'{gen_params}({inputs}) cil managed {aggrinline}{preservesig}{{// Method ID {method_id:?}"
         )?;
+        if let Some(flag) = method.nullable_context() {
+            writeln!(
+                out,
+                ".custom instance void [System.Runtime]System.Runtime.CompilerServices.NullableContextAttribute::.ctor(uint8) = (01 00 {flag:02X} 00 00)"
+            )?;
+        }
+        if let Some(flag) = method.return_nullability() {
+            writeln!(out, ".param [0]")?;
+            writeln!(
+                out,
+                ".custom instance void [System.Runtime]System.Runtime.CompilerServices.NullableAttribute::.ctor(uint8) = (01 00 {flag:02X} 00 00)"
+            )?;
+        }
+        for (index, flag) in method.param_nullability().iter().enumerate() {
+            if let Some(flag) = flag {
+                writeln!(out, ".param [{}]", index + 1)?;
+                writeln!(
+                    out,
+                    ".custom instance void [System.Runtime]System.Runtime.CompilerServices.NullableAttribute::.ctor(uint8) = (01 00 {flag:02X} 00 00)"
+                )?;
+            }
+        }
         // Explicit ECMA-335 `.override` (§II.15.4.2.3) for a base-class virtual override (see
         // `MethodDef::with_override`'s doc — distinct from ordinary `implements=` interface
         // satisfaction, which binds implicitly by name+signature with no `.override` at all).
@@ -1487,6 +1529,11 @@ impl ILExporter {
                 self.export_node(asm, out, array, sig, locals)?;
                 self.export_node(asm, out, index, sig, locals)?;
                 writeln!(out, "ldelem.ref")
+            }
+            CILNode::LdElem { array, index, elem } => {
+                self.export_node(asm, out, array, sig, locals)?;
+                self.export_node(asm, out, index, sig, locals)?;
+                writeln!(out, "ldelem {elem}", elem = type_il(&asm[elem], asm))
             }
             CILNode::UnboxAny { object, tpe } => {
                 self.export_node(asm, out, object, sig, locals)?;
@@ -2545,7 +2592,51 @@ static DEFAULT_RUNTIME_CONFIG: std::sync::LazyLock<String> =
 #[cfg(test)]
 mod region_body_compat_tests {
     use super::*;
-    use crate::ir::{BasicBlock, ClassDef, EnumDef, ExceptionRegion, MethodImpl};
+    use crate::ir::{
+        BasicBlock, ClassDef, ClassRef, EnumDef, ExceptionRegion, MethodDef, MethodImpl,
+    };
+
+    #[test]
+    fn nullable_method_metadata_is_rendered_for_legacy_ilasm() {
+        let mut asm = Assembly::default();
+        let string_name = asm.alloc_string("System.String");
+        let runtime = asm.alloc_string("System.Runtime");
+        let string_ref =
+            asm.alloc_class_ref(ClassRef::new(string_name, Some(runtime), false, [].into()));
+        let string_ty = Type::ClassRef(string_ref);
+        let main = asm.main_module();
+        let name = asm.alloc_string("Maybe");
+        let sig = asm.sig([string_ty], string_ty);
+        let value = asm.alloc_node(CILNode::LdArg(0));
+        let ret = asm.alloc_root(CILRoot::Ret(value));
+        let method = MethodDef::new(
+            crate::Access::Extern,
+            main,
+            name,
+            sig,
+            crate::cilnode::MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            },
+            vec![Some(asm.alloc_string("value"))],
+        )
+        .with_nullability(1, Some(2), vec![Some(2)]);
+        asm.new_method(method);
+
+        let exporter = ILExporter::new(IlasmFlavour::Clasic, true, None);
+        let mut output = Vec::new();
+        exporter.export_to_write(&asm, &mut output).unwrap();
+        let il = String::from_utf8(output).unwrap();
+        assert!(il.contains("NullableContextAttribute::.ctor(uint8) = (01 00 01 00 00)"));
+        assert!(il.contains(".param [0]"));
+        assert!(il.contains(".param [1]"));
+        assert_eq!(
+            il.matches("NullableAttribute::.ctor(uint8) = (01 00 02 00 00)")
+                .count(),
+            2
+        );
+    }
 
     #[test]
     fn genuine_enum_renders_system_enum_value_and_literal_fields() {

@@ -51,10 +51,301 @@ pub use self::sorted_set::SortedSet;
 /// `System.Collections.Generic.Stack<T>` — a managed LIFO stack.
 pub use self::stack::Stack;
 
+const IREADONLY_LIST: &str = "System.Collections.Generic.IReadOnlyList";
+const IREADONLY_COLLECTION: &str = "System.Collections.Generic.IReadOnlyCollection";
+type ReadOnlyCollection<T> =
+    crate::intrinsics::RustcCLRInteropManagedGeneric<CORELIB, IREADONLY_COLLECTION, (T,)>;
+
+/// A direct CLR `System.Collections.Generic.IReadOnlyList<T>` projection. Arrays, `List<T>`, and
+/// application collection types can cross this interface without copying into Rust storage.
+pub type ReadOnlyList<T> =
+    crate::intrinsics::RustcCLRInteropManagedGeneric<CORELIB, IREADONLY_LIST, (T,)>;
+
+impl<T> ReadOnlyList<T> {
+    /// Number of elements (`Count`).
+    pub fn len(self) -> i32 {
+        let collection: ReadOnlyCollection<T> =
+            crate::intrinsics::rustc_clr_interop_managed_checked_cast(self);
+        crate::intrinsics::rustc_clr_interop_generic_call1::<
+            CORELIB,
+            IREADONLY_COLLECTION,
+            false,
+            "get_Count",
+            2,
+            (T,),
+            (i32,),
+            i32,
+            ReadOnlyCollection<T>,
+        >(collection)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// Indexed access (`get_Item`). The CLR performs the ordinary bounds check.
+    pub fn at(self, index: i32) -> T {
+        crate::intrinsics::rustc_clr_interop_generic_call2::<
+            CORELIB,
+            IREADONLY_LIST,
+            false,
+            "get_Item",
+            2,
+            (T,),
+            (crate::intrinsics::RustcCLRInteropTypeGeneric<0>, i32),
+            T,
+            Self,
+            i32,
+        >(self, index)
+    }
+}
+
 // The core BCL collections all live in the implementation assembly `System.Private.CoreLib` — a
 // reference assembly forwards the type and throws `TypeLoadException` at JIT, so method-body refs must
 // name the impl assembly (the same rule the generic bridge documents).
 const CORELIB: &str = "System.Private.CoreLib";
+
+const ILIST: &str = "System.Collections.Generic.IList";
+const ICOLLECTION: &str = "System.Collections.Generic.ICollection";
+const IDICTIONARY: &str = "System.Collections.Generic.IDictionary";
+
+/// Raw `IList<T>` interface reference used at managed call boundaries.
+pub type MutableListHandle<T> =
+    crate::intrinsics::RustcCLRInteropManagedGeneric<CORELIB, ILIST, (T,)>;
+type CollectionHandle<T> =
+    crate::intrinsics::RustcCLRInteropManagedGeneric<CORELIB, ICOLLECTION, (T,)>;
+
+/// Coroutine-safe projection of any CLR `IList<T>` implementation.
+///
+/// C# callers can pass an array, `List<T>`, or an application-defined list. The object is rooted
+/// behind a `GCHandle`, so Rust async state contains no naked managed reference.
+pub struct MutableList<T> {
+    root: crate::class::GenericClass<CORELIB, ILIST, (T,)>,
+}
+
+impl<T> MutableList<T> {
+    pub fn from_raw(list: MutableListHandle<T>) -> Self {
+        Self {
+            root: crate::class::GenericClass::from_naked_ref(list),
+        }
+    }
+
+    #[inline(never)]
+    fn raw(&self) -> MutableListHandle<T> {
+        unsafe { self.root.get_naked_ref() }
+    }
+
+    pub fn into_raw(self) -> MutableListHandle<T> {
+        self.raw()
+    }
+
+    pub fn len(&self) -> i32 {
+        let collection: CollectionHandle<T> =
+            crate::intrinsics::rustc_clr_interop_managed_checked_cast(self.raw());
+        crate::intrinsics::rustc_clr_interop_generic_call1::<
+            CORELIB,
+            ICOLLECTION,
+            false,
+            "get_Count",
+            2,
+            (T,),
+            (i32,),
+            i32,
+            CollectionHandle<T>,
+        >(collection)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn at(&self, index: i32) -> T {
+        crate::intrinsics::rustc_clr_interop_generic_call2::<
+            CORELIB,
+            ILIST,
+            false,
+            "get_Item",
+            2,
+            (T,),
+            (crate::intrinsics::RustcCLRInteropTypeGeneric<0>, i32),
+            T,
+            MutableListHandle<T>,
+            i32,
+        >(self.raw(), index)
+    }
+
+    pub fn get(&self, index: i32) -> Option<T> {
+        (index >= 0 && index < self.len()).then(|| self.at(index))
+    }
+
+    pub fn set(&mut self, index: i32, value: T) -> bool {
+        if index < 0 || index >= self.len() {
+            return false;
+        }
+        crate::intrinsics::rustc_clr_interop_generic_call3::<
+            CORELIB,
+            ILIST,
+            false,
+            "set_Item",
+            2,
+            (T,),
+            ((), i32, crate::intrinsics::RustcCLRInteropTypeGeneric<0>),
+            (),
+            MutableListHandle<T>,
+            i32,
+            T,
+        >(self.raw(), index, value);
+        true
+    }
+
+    pub fn push(&mut self, value: T) {
+        let collection: CollectionHandle<T> =
+            crate::intrinsics::rustc_clr_interop_managed_checked_cast(self.raw());
+        crate::intrinsics::rustc_clr_interop_generic_call2::<
+            CORELIB,
+            ICOLLECTION,
+            false,
+            "Add",
+            2,
+            (T,),
+            ((), crate::intrinsics::RustcCLRInteropTypeGeneric<0>),
+            (),
+            CollectionHandle<T>,
+            T,
+        >(collection, value)
+    }
+
+    pub fn clear(&mut self) {
+        let collection: CollectionHandle<T> =
+            crate::intrinsics::rustc_clr_interop_managed_checked_cast(self.raw());
+        crate::intrinsics::rustc_clr_interop_generic_call1::<
+            CORELIB,
+            ICOLLECTION,
+            false,
+            "Clear",
+            2,
+            (T,),
+            ((),),
+            (),
+            CollectionHandle<T>,
+        >(collection)
+    }
+}
+
+impl<T> Clone for MutableList<T> {
+    fn clone(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+        }
+    }
+}
+
+/// Raw `IDictionary<K,V>` interface reference used at managed call boundaries.
+pub type MutableDictionaryHandle<K, V> =
+    crate::intrinsics::RustcCLRInteropManagedGeneric<CORELIB, IDICTIONARY, (K, V)>;
+
+/// Coroutine-safe projection of any CLR `IDictionary<K,V>` implementation.
+pub struct MutableDictionary<K, V> {
+    root: crate::class::GenericClass<CORELIB, IDICTIONARY, (K, V)>,
+}
+
+impl<K, V> MutableDictionary<K, V> {
+    pub fn from_raw(dictionary: MutableDictionaryHandle<K, V>) -> Self {
+        Self {
+            root: crate::class::GenericClass::from_naked_ref(dictionary),
+        }
+    }
+
+    #[inline(never)]
+    fn raw(&self) -> MutableDictionaryHandle<K, V> {
+        unsafe { self.root.get_naked_ref() }
+    }
+
+    pub fn into_raw(self) -> MutableDictionaryHandle<K, V> {
+        self.raw()
+    }
+
+    pub fn insert(&mut self, key: K, value: V) {
+        crate::intrinsics::rustc_clr_interop_generic_call3::<
+            CORELIB,
+            IDICTIONARY,
+            false,
+            "set_Item",
+            2,
+            (K, V),
+            (
+                (),
+                crate::intrinsics::RustcCLRInteropTypeGeneric<0>,
+                crate::intrinsics::RustcCLRInteropTypeGeneric<1>,
+            ),
+            (),
+            MutableDictionaryHandle<K, V>,
+            K,
+            V,
+        >(self.raw(), key, value)
+    }
+
+    pub fn contains_key(&self, key: K) -> bool {
+        crate::intrinsics::rustc_clr_interop_generic_call2::<
+            CORELIB,
+            IDICTIONARY,
+            false,
+            "ContainsKey",
+            2,
+            (K, V),
+            (bool, crate::intrinsics::RustcCLRInteropTypeGeneric<0>),
+            bool,
+            MutableDictionaryHandle<K, V>,
+            K,
+        >(self.raw(), key)
+    }
+
+    pub fn remove(&mut self, key: K) -> bool {
+        crate::intrinsics::rustc_clr_interop_generic_call2::<
+            CORELIB,
+            IDICTIONARY,
+            false,
+            "Remove",
+            2,
+            (K, V),
+            (bool, crate::intrinsics::RustcCLRInteropTypeGeneric<0>),
+            bool,
+            MutableDictionaryHandle<K, V>,
+            K,
+        >(self.raw(), key)
+    }
+}
+
+impl<K: Copy, V> MutableDictionary<K, V> {
+    pub fn get(&self, key: K) -> Option<V> {
+        if !self.contains_key(key) {
+            return None;
+        }
+        Some(crate::intrinsics::rustc_clr_interop_generic_call2::<
+            CORELIB,
+            IDICTIONARY,
+            false,
+            "get_Item",
+            2,
+            (K, V),
+            (
+                crate::intrinsics::RustcCLRInteropTypeGeneric<1>,
+                crate::intrinsics::RustcCLRInteropTypeGeneric<0>,
+            ),
+            V,
+            MutableDictionaryHandle<K, V>,
+            K,
+        >(self.raw(), key))
+    }
+}
+
+impl<K, V> Clone for MutableDictionary<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+        }
+    }
+}
 
 mod list {
     use super::CORELIB;
@@ -277,6 +568,12 @@ mod list {
         /// The raw managed handle, for advanced interop.
         pub fn handle(&self) -> Handle<T> {
             self.h
+        }
+        /// Consume this list and project it as the familiar producer-side `IEnumerable<T>`
+        /// interface without copying its elements.
+        pub fn into_enumerable(self) -> crate::enumerate::ManagedEnumerable<T> {
+            let interface = crate::enumerate::as_enum_handle::<_, T>(self.h);
+            crate::enumerate::ManagedEnumerable::from_raw(interface)
         }
     }
 

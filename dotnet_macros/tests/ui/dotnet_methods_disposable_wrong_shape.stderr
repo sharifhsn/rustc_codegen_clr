@@ -1,0 +1,5 @@
+error: #[dotnet_methods(disposable)]: `dispose` must be an instance method with the exact shape `fn dispose(this: <Class>Handle)` and no return value
+ --> tests/ui/dotnet_methods_disposable_wrong_shape.rs:7:9
+  |
+7 |     pub fn dispose(value: i32) -> i32 {
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

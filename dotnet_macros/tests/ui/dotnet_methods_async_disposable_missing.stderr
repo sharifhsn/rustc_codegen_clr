@@ -1,0 +1,9 @@
+error: #[dotnet_methods(async_disposable)]: missing `fn dispose_async(this: <Class>Handle) -> mycorrhiza::task::ValueTask` method
+  --> tests/ui/dotnet_methods_async_disposable_missing.rs:6:1
+   |
+ 6 | / impl Resource {
+ 7 | |     pub fn status() -> i32 {
+ 8 | |         1
+ 9 | |     }
+10 | | }
+   | |_^

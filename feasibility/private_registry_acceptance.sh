@@ -4,7 +4,7 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-driver="$repo/tools/cargo-dotnet/target/release/cargo-dotnet"
+driver="$repo/target/release/cargo-dotnet"
 fixture_crate="$repo/feasibility/fixtures/private_registry_crate"
 fixture_consumer="$repo/feasibility/fixtures/private_registry_consumer"
 server="$repo/feasibility/private_registry_server.py"

@@ -52,7 +52,7 @@ impl SideEffectInfoCache {
             CILNode::Box { .. } => true, // Boxing allocates a fresh object with reference identity; same as NewArr
             CILNode::LdStaticField(_) | CILNode::LdStaticFieldAddress(_) => false, // Loading static fields has no side effects.
             CILNode::LdLen(arr) => self.has_side_effects(*arr, asm), // Loading a length only has side effects if the index has array.
-            CILNode::LdElelemRef { array, index } => {
+            CILNode::LdElelemRef { array, index } | CILNode::LdElem { array, index, .. } => {
                 self.has_side_effects(*array, asm) || self.has_side_effects(*index, asm)
                 // Indexing only has side effects if the index or array address has side effects.
             }

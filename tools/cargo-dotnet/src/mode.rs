@@ -3,7 +3,7 @@
 //! Ports `feasibility/cargo-dotnet:60-89,152-162`. The bash decides mode by whether
 //! the sibling `_cargo_dotnet_core.sh` is next to the script. The Rust binary uses
 //! the same idea on `current_exe()`: if a repo checkout can be located relative to
-//! the binary (it lives at `<repo>/tools/cargo-dotnet/target/.../cargo-dotnet`, or a
+//! the binary (it lives at `<repo>/target/.../cargo-dotnet`, or a
 //! repo is found by walking up), we are in DEV mode; otherwise INSTALLED, sourcing
 //! everything from `CARGO_DOTNET_HOME`.
 //!
@@ -73,7 +73,7 @@ pub fn cargo_dotnet_home() -> Result<PathBuf> {
 fn find_dev_repo() -> Option<PathBuf> {
     let exe = env::current_exe().ok()?;
     // Walk up from the binary: a `cargo run`/`cargo install --path` build lives under
-    // `<repo>/tools/cargo-dotnet/target/<profile>/cargo-dotnet`, so the repo root is a
+    // `<repo>/target/<profile>/cargo-dotnet`, so the repo root is a
     // few levels up. Probe every ancestor.
     let mut cur: Option<&Path> = exe.parent();
     while let Some(dir) = cur {

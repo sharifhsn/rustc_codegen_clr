@@ -12,6 +12,8 @@ package-id = "Collision.DuplicateFqn"
 assembly-name = "collision_duplicate_fqn"
 root-namespace = "Collision.Alpha"
 module-type = "Exports"
+public-namespaces = ["Collision.Alpha"]
+compatibility-profile = "net10-coreclr"
 legacy-main-module = false
 
 [workspace]

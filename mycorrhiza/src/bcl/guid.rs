@@ -45,16 +45,13 @@ const GUID: &str = "System.Guid";
 /// (`sizeof(Guid) == 16`).
 const GUID_SIZE: usize = 16;
 
-/// The raw managed-value-type handle for `System.Guid`.
-type Handle = RustcCLRInteropManagedStruct<{ CORELIB }, { GUID }, GUID_SIZE>;
-
 /// A managed `System.Guid` — a 128-bit globally-unique identifier, stored inline as a value type
 /// (`Copy`, no GC).
 ///
+/// This aliases the compiler's managed-value marker directly, so exported signatures and DTO
+/// properties retain the genuine CLR `System.Guid` identity.
 /// See the [module docs](self) for the full member map.
-#[derive(Clone, Copy)]
-#[repr(transparent)]
-pub struct Guid(Handle);
+pub type Guid = RustcCLRInteropManagedStruct<{ CORELIB }, { GUID }, GUID_SIZE>;
 
 impl Guid {
     // --- constructors / factories -----------------------------------------------------------------
@@ -63,7 +60,7 @@ impl Guid {
     #[inline(always)]
     pub fn new_v4() -> Self {
         // A zero-argument static factory returning a `Guid` value → a static value-type `call`.
-        Guid(Handle::vt_static0::<"NewGuid", Handle>())
+        Self::vt_static0::<"NewGuid", Self>()
     }
 
     /// `Guid.Empty` — the all-zero GUID (`00000000-0000-0000-0000-000000000000`).
@@ -82,7 +79,7 @@ impl Guid {
         // `Guid.Parse` is a *static* method returning a `Guid` value directly — no `newobj`/ctor is
         // needed, so this is a clean 1-arg static value-type `call` yielding the struct handle (the
         // ctor+transmute trick is both unnecessary here and rejected by the CIL type-verifier).
-        Guid(Handle::vt_static1::<"Parse", MString, Handle>(text))
+        Self::vt_static1::<"Parse", MString, Self>(text)
     }
 
     // --- instance queries -------------------------------------------------------------------------
@@ -97,7 +94,7 @@ impl Guid {
     /// hash equally.
     #[inline(always)]
     pub fn hash_code(self) -> i32 {
-        self.0.vt_instance0::<"GetHashCode", i32>()
+        self.vt_instance0::<"GetHashCode", i32>()
     }
 
     // --- comparison -------------------------------------------------------------------------------
@@ -108,28 +105,28 @@ impl Guid {
     pub fn equals(self, other: Self) -> bool {
         // A value-type instance method taking a `Guid` argument: `call instance` on the `valuetype`
         // receiver, argument by value.
-        self.0.vt_instance1::<"Equals", Handle, bool>(other.0)
+        self.vt_instance1::<"Equals", Self, bool>(other)
     }
 
     /// Lexicographic comparison (`Guid.CompareTo`): negative if `self` sorts before `other`, zero if
     /// equal, positive if after. Matches .NET's field-by-field ordering, not raw byte order.
     #[inline(always)]
     pub fn compare_to(self, other: Self) -> i32 {
-        self.0.vt_instance1::<"CompareTo", Handle, i32>(other.0)
+        self.vt_instance1::<"CompareTo", Self, i32>(other)
     }
 
     // --- interop escape hatch ---------------------------------------------------------------------
 
     /// The raw managed value-type handle, for lower-level BCL calls not surfaced here.
     #[inline(always)]
-    pub fn handle(self) -> Handle {
-        self.0
+    pub fn handle(self) -> Self {
+        self
     }
 
     /// Wrap a raw `System.Guid` value handle (e.g. one returned by another BCL call).
     #[inline(always)]
-    pub fn from_raw(raw: Handle) -> Self {
-        Guid(raw)
+    pub fn from_raw(raw: Self) -> Self {
+        raw
     }
 }
 
@@ -146,7 +143,7 @@ impl core::fmt::Display for Guid {
         // `Guid.ToString()` yields the canonical `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` form; print
         // its UTF-16 content through the idiomatic string wrapper, which decodes to Rust text.
         let s =
-            crate::system::DotNetString::from_handle(self.0.vt_instance0::<"ToString", MString>());
+            crate::system::DotNetString::from_handle((*self).vt_instance0::<"ToString", MString>());
         core::fmt::Display::fmt(&s, f)
     }
 }

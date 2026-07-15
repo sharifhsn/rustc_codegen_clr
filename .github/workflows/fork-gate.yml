@@ -95,6 +95,30 @@ jobs:
           cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet run cargo_tests/cd_pure --backend native --dotnet 10 --clean
           cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet run cargo_tests/cd_subword_atomics --backend native --dotnet 10 --clean
           cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet run cargo_tests/cd_net10_bcl --backend native --dotnet 10 --clean
+      - name: Run Windows P/Invoke acceptances
+        shell: bash
+        run: |
+          bash feasibility/pinvoke_acceptance.sh
+          bash feasibility/pinvoke_async_callback_acceptance.sh
+      - name: Build packed Excel-DNA managed Rust add-in
+        shell: bash
+        run: bash feasibility/excel_dna_acceptance.sh
+  macos_pinvoke:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Build compiler and cargo-dotnet
+        run: cargo build --release --workspace
+      - name: Run Apple Silicon P/Invoke acceptances
+        run: |
+          bash feasibility/pinvoke_acceptance.sh
+          bash feasibility/pinvoke_async_callback_acceptance.sh
   product_acceptance_smoke:
     # One release case per decisive product oracle. The full matrix remains a manual/release gate.
     runs-on: ubuntu-22.04
@@ -155,6 +179,14 @@ jobs:
           DOTNET_VERSION: "10"
           RCL_ONBOARDING_LOG_DIR: ${{ runner.temp }}/onboarding-acceptance-logs
         run: bash feasibility/onboarding_acceptance.sh
+      - name: Run Linux P/Invoke acceptances
+        run: |
+          bash feasibility/pinvoke_acceptance.sh
+          bash feasibility/pinvoke_async_callback_acceptance.sh
+      - name: Run direct async export acceptance
+        run: bash feasibility/async_export_acceptance.sh
+      - name: Run managed-array and explicit Rust-owned-vector acceptance
+        run: bash feasibility/managed_array_export_acceptance.sh
       - name: Run deterministic repo-independent install bundle acceptance
         env:
           DOTNET_VERSION: "10"
@@ -210,7 +242,7 @@ jobs:
       - name: Publish and run .NET 10 NativeAOT interop host
         env:
           CARGO_DOTNET_BACKEND: native
-          CARGO_DOTNET_HOME: ${{ github.workspace }}/tools/cargo-dotnet/target/release
+          CARGO_DOTNET_HOME: ${{ github.workspace }}/target/release
           DOTNET_VERSION: "10"
           RCL_NATIVEAOT_OUTPUT_DIR: ${{ runner.temp }}/nativeaot-net10
           RCL_NATIVEAOT_LOG_DIR: ${{ runner.temp }}/nativeaot-logs
@@ -304,7 +336,7 @@ jobs:
           for path in "${result_files[@]}"; do
             result_args+=(--results "$path")
           done
-          tools/cargo-dotnet/target/release/cargo-dotnet capabilities \
+          target/release/cargo-dotnet capabilities \
             --manifest acceptance/capabilities.toml \
             "${result_args[@]}" \
             --evidence-scope release --strict \

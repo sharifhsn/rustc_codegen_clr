@@ -294,6 +294,16 @@ impl CILNode {
                     index: *index,
                 }
             }
+            CILNode::LdElem { array, index, elem } => {
+                let array = asm.get_node(*array).clone();
+                let array = array.propagate_locals(asm, idx, tpe, new_node, fuel);
+                let array = asm.alloc_node(array);
+                CILNode::LdElem {
+                    array,
+                    index: *index,
+                    elem: *elem,
+                }
+            }
             CILNode::UnboxAny {
                 object,
                 tpe: unboxtpe,

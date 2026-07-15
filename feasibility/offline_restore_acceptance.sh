@@ -3,7 +3,7 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-driver="${RCL_OFFLINE_RESTORE_DRIVER:-$repo/tools/cargo-dotnet/target/release/cargo-dotnet}"
+driver="${RCL_OFFLINE_RESTORE_DRIVER:-$repo/target/release/cargo-dotnet}"
 dotnet_version="${DOTNET_VERSION:-10}"
 work="${RCL_OFFLINE_RESTORE_WORK_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/rustdotnet-offline.XXXXXX")}"
 keep="${RCL_OFFLINE_RESTORE_KEEP_WORK:-0}"

@@ -19,20 +19,22 @@ pub use crate::fn_ctx::MethodCompileCtx;
 use crate::fn_ctx::fn_name;
 use crate::operand::static_data::add_static;
 use crate::r#type::{GetTypeExt, adt::field_descrptor, get_type, utilis::is_zst};
-use rustc_hir::attrs::Linkage;
+use rustc_hir::attrs::CrateType;
 use rustc_middle::{
+    middle::codegen_fn_attrs::CodegenFnAttrFlags,
     mir::{Local, LocalDecl, Statement, Terminator, interpret::GlobalAlloc},
     mono::MonoItem,
     ty::{TyCtxt, TyKind},
 };
-fn linkage_to_access(link: Option<Linkage>) -> Access {
-    match link {
-        Some(Linkage::External) => Access::Extern,
-        _ => Access::Public,
-    }
-}
 type LocalDefList = Vec<LocalDef>;
 type ArgsDebugInfo = Vec<Option<Interned<IString>>>;
+
+/// Runtime support symbols use a reserved prefix: they must be rooted like native exports because
+/// generated wrappers resolve them by stable name, but they are implementation details rather than
+/// managed API. User-facing macro exports deliberately do not use this prefix.
+fn is_reserved_runtime_symbol(name: &str) -> bool {
+    name.starts_with("rcl_")
+}
 
 /// Returns the list of all local variables within MIR of a function, and converts them to the internal type represenation `Type`
 fn locals_from_mir<'tcx>(
@@ -270,16 +272,62 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     // FIXME: figure out the source of the bug causing visibility to not be read propely.
     // let access_modifier = Access::from_visibility(tcx.visibility(instance.def_id()));
     let attrs = ctx.tcx().codegen_fn_attrs(ctx.instance().def_id());
-    // `#[unsafe(no_mangle)]` and `#[unsafe(export_name = "...")]` mark a function as an *export* —
-    // externally referenceable (e.g. callable from C#). Map those to `Access::Extern`, which the
-    // linker's dead-code pass treats as a ROOT
+    // Only an explicit `#[unsafe(no_mangle)]` or `#[unsafe(export_name = "...")]` on the user's
+    // crate authorizes a public managed export. rustc's broader `contains_extern_indicator()` also
+    // includes cross-CGU linkage, compiler-builtins, and standard-library implementation symbols;
+    // treating that native-linker metadata as CLR accessibility leaked hundreds of implementation
+    // methods through `MainModule` reflection. Dependency and ordinary Rust methods remain
+    // assembly-visible so generated wrappers can call them without exposing them to C#.
+    //
+    // Explicit exports map to `Access::Extern`, which the linker's dead-code pass treats as a ROOT
     // (`eliminate_dead_fns`). This is what lets a **library** crate keep its public API: a library has
     // no entrypoint to root the call graph, so without this every method would be eliminated. (For a
     // binary it is a no-op beyond keeping unused exports, which is the correct semantics.)
-    let access = if attrs.contains_extern_indicator() {
+    let is_final_library_artifact = ctx.tcx().crate_types().iter().any(|crate_type| {
+        matches!(
+            crate_type,
+            CrateType::Cdylib | CrateType::Dylib | CrateType::StaticLib
+        )
+    });
+    let is_explicit_local_export = is_final_library_artifact
+        && ctx.instance().def_id().is_local()
+        && !is_reserved_runtime_symbol(name)
+        && (attrs.flags.contains(CodegenFnAttrFlags::NO_MANGLE) || attrs.symbol_name.is_some());
+    let access = if is_explicit_local_export {
         Access::Extern
+    } else if attrs.contains_extern_indicator() {
+        Access::InternalExtern
     } else {
-        linkage_to_access(attrs.linkage)
+        Access::Assembly
+    };
+    #[allow(deprecated)]
+    let export_nullability = (access == Access::Extern)
+        .then(|| {
+            ctx.tcx()
+                .get_all_attrs(ctx.instance().def_id())
+                .iter()
+                .filter_map(|attribute| attribute.doc_str())
+                .find_map(|doc| {
+                    doc.as_str()
+                        .strip_prefix("__rustc_codegen_clr_nullability:")
+                        .map(str::to_owned)
+                })
+        })
+        .flatten();
+    #[allow(deprecated)]
+    let export_custom_attrs: Vec<String> = if access == Access::Extern {
+        ctx.tcx()
+            .get_all_attrs(ctx.instance().def_id())
+            .iter()
+            .filter_map(|attribute| attribute.doc_str())
+            .filter_map(|doc| {
+                doc.as_str()
+                    .strip_prefix("__rustc_codegen_clr_custom_attr:")
+                    .map(str::to_owned)
+            })
+            .collect()
+    } else {
+        vec![]
     };
     // Handle the function signature
     let call_site = CallInfo::sig_from_instance_(ctx.instance(), ctx);
@@ -500,6 +548,57 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
         arg_names,
         ctx,
     );
+    if let Some(spec) = export_nullability {
+        if let Some((context, return_flag, parameter_flags)) =
+            crate::comptime::parse_nullability_spec(&spec, sig.inputs().len())
+        {
+            method = method.with_nullability(context, return_flag, parameter_flags);
+        }
+    }
+    if !export_custom_attrs.is_empty() {
+        let mut method_attributes = Vec::new();
+        let mut return_attributes = Vec::new();
+        let mut parameter_attributes = vec![Vec::new(); sig.inputs().len()];
+        for marker in export_custom_attrs {
+            let (target, packed) = marker
+                .split_once(':')
+                .expect("dotnet export custom-attribute marker is malformed");
+            match target {
+                "m" => method_attributes.push(crate::comptime::pending_custom_attr_to_cilly(
+                    ctx,
+                    &crate::comptime::decode_custom_attr_spec(packed),
+                )),
+                "r" => return_attributes.push(crate::comptime::pending_custom_attr_to_cilly(
+                    ctx,
+                    &crate::comptime::decode_custom_attr_spec(packed),
+                )),
+                "p" => {
+                    let (index, packed) = packed
+                        .split_once(':')
+                        .expect("dotnet export parameter-attribute marker is malformed");
+                    let index = index
+                        .parse::<usize>()
+                        .expect("dotnet export parameter-attribute index is malformed");
+                    let destination = parameter_attributes.get_mut(index).unwrap_or_else(|| {
+                        panic!(
+                            "dotnet export parameter-attribute index {index} exceeds {} parameters",
+                            sig.inputs().len()
+                        )
+                    });
+                    destination.push(crate::comptime::pending_custom_attr_to_cilly(
+                        ctx,
+                        &crate::comptime::decode_custom_attr_spec(packed),
+                    ));
+                }
+                other => panic!("unknown dotnet export custom-attribute target {other:?}"),
+            }
+        }
+        method = method.with_custom_attributes(
+            method_attributes,
+            return_attributes,
+            parameter_attributes,
+        );
+    }
     if let Err(err) = method.typecheck(ctx) {
         ctx.tcx()
             .dcx()

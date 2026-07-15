@@ -47,15 +47,12 @@ const DATETIME: &str = "System.DateTime";
 /// and `DateTimeKind` (`sizeof(DateTime) == 8`).
 const DATETIME_SIZE: usize = core::mem::size_of::<i64>();
 
-/// The raw managed-value-type handle for `System.DateTime`.
-type Handle = RustcCLRInteropManagedStruct<{ CORELIB }, { DATETIME }, DATETIME_SIZE>;
-
 /// A managed `System.DateTime` — an instant in time, stored inline as a value type (`Copy`, no GC).
 ///
+/// This aliases the compiler's managed-value marker directly, so exported signatures and DTO
+/// properties retain the genuine CLR `System.DateTime` identity.
 /// See the [module docs](self) for the full member map.
-#[derive(Clone, Copy)]
-#[repr(transparent)]
-pub struct DateTime(Handle);
+pub type DateTime = RustcCLRInteropManagedStruct<{ CORELIB }, { DATETIME }, DATETIME_SIZE>;
 
 impl DateTime {
     // --- constructors -----------------------------------------------------------------------------
@@ -79,7 +76,7 @@ impl DateTime {
     /// A malformed string throws `FormatException` in managed code.
     #[inline(always)]
     pub fn parse(text: MString) -> Self {
-        DateTime(Handle::vt_static1::<"Parse", MString, Handle>(text))
+        Self::vt_static1::<"Parse", MString, Self>(text)
     }
 
     /// Convenience [`parse`](DateTime::parse) taking a Rust `&str`.
@@ -100,19 +97,19 @@ impl DateTime {
     /// `DateTime.Now` — the current local date and time.
     #[inline(always)]
     pub fn now() -> Self {
-        DateTime(Self::static_get::<"get_Now">())
+        Self::static_get::<"get_Now">()
     }
 
     /// `DateTime.UtcNow` — the current UTC date and time.
     #[inline(always)]
     pub fn utc_now() -> Self {
-        DateTime(Self::static_get::<"get_UtcNow">())
+        Self::static_get::<"get_UtcNow">()
     }
 
     /// `DateTime.Today` — the current local date with the time set to midnight.
     #[inline(always)]
     pub fn today() -> Self {
-        DateTime(Self::static_get::<"get_Today">())
+        Self::static_get::<"get_Today">()
     }
 
     // --- component getters ------------------------------------------------------------------------
@@ -120,47 +117,47 @@ impl DateTime {
     /// The year component (`DateTime.Year`).
     #[inline(always)]
     pub fn year(self) -> i32 {
-        self.0.vt_instance0::<"get_Year", i32>()
+        self.vt_instance0::<"get_Year", i32>()
     }
     /// The month component, 1..=12 (`DateTime.Month`).
     #[inline(always)]
     pub fn month(self) -> i32 {
-        self.0.vt_instance0::<"get_Month", i32>()
+        self.vt_instance0::<"get_Month", i32>()
     }
     /// The day-of-month component, 1..=31 (`DateTime.Day`).
     #[inline(always)]
     pub fn day(self) -> i32 {
-        self.0.vt_instance0::<"get_Day", i32>()
+        self.vt_instance0::<"get_Day", i32>()
     }
     /// The hour component, 0..=23 (`DateTime.Hour`).
     #[inline(always)]
     pub fn hour(self) -> i32 {
-        self.0.vt_instance0::<"get_Hour", i32>()
+        self.vt_instance0::<"get_Hour", i32>()
     }
     /// The minute component, 0..=59 (`DateTime.Minute`).
     #[inline(always)]
     pub fn minute(self) -> i32 {
-        self.0.vt_instance0::<"get_Minute", i32>()
+        self.vt_instance0::<"get_Minute", i32>()
     }
     /// The second component, 0..=59 (`DateTime.Second`).
     #[inline(always)]
     pub fn second(self) -> i32 {
-        self.0.vt_instance0::<"get_Second", i32>()
+        self.vt_instance0::<"get_Second", i32>()
     }
     /// The day of the year, 1..=366 (`DateTime.DayOfYear`).
     #[inline(always)]
     pub fn day_of_year(self) -> i32 {
-        self.0.vt_instance0::<"get_DayOfYear", i32>()
+        self.vt_instance0::<"get_DayOfYear", i32>()
     }
     /// The number of 100-nanosecond ticks representing this instant (`DateTime.Ticks`).
     #[inline(always)]
     pub fn ticks(self) -> i64 {
-        self.0.vt_instance0::<"get_Ticks", i64>()
+        self.vt_instance0::<"get_Ticks", i64>()
     }
     /// The date component with the time set to midnight (`DateTime.Date`).
     #[inline(always)]
     pub fn date(self) -> Self {
-        DateTime(self.0.vt_instance0::<"get_Date", Handle>())
+        self.vt_instance0::<"get_Date", Self>()
     }
 
     // --- calendar arithmetic ----------------------------------------------------------------------
@@ -168,32 +165,32 @@ impl DateTime {
     /// A new `DateTime` this many (fractional) days later (`DateTime.AddDays`).
     #[inline(always)]
     pub fn add_days(self, days: f64) -> Self {
-        DateTime(self.add_f64::<"AddDays">(days))
+        self.add_f64::<"AddDays">(days)
     }
     /// A new `DateTime` this many (fractional) hours later (`DateTime.AddHours`).
     #[inline(always)]
     pub fn add_hours(self, hours: f64) -> Self {
-        DateTime(self.add_f64::<"AddHours">(hours))
+        self.add_f64::<"AddHours">(hours)
     }
     /// A new `DateTime` this many (fractional) minutes later (`DateTime.AddMinutes`).
     #[inline(always)]
     pub fn add_minutes(self, minutes: f64) -> Self {
-        DateTime(self.add_f64::<"AddMinutes">(minutes))
+        self.add_f64::<"AddMinutes">(minutes)
     }
     /// A new `DateTime` this many (fractional) seconds later (`DateTime.AddSeconds`).
     #[inline(always)]
     pub fn add_seconds(self, seconds: f64) -> Self {
-        DateTime(self.add_f64::<"AddSeconds">(seconds))
+        self.add_f64::<"AddSeconds">(seconds)
     }
     /// A new `DateTime` this many whole years later (`DateTime.AddYears`).
     #[inline(always)]
     pub fn add_years(self, years: i32) -> Self {
-        DateTime(self.add_i32::<"AddYears">(years))
+        self.add_i32::<"AddYears">(years)
     }
     /// A new `DateTime` this many whole months later (`DateTime.AddMonths`).
     #[inline(always)]
     pub fn add_months(self, months: i32) -> Self {
-        DateTime(self.add_i32::<"AddMonths">(months))
+        self.add_i32::<"AddMonths">(months)
     }
 
     // --- comparison -------------------------------------------------------------------------------
@@ -204,26 +201,26 @@ impl DateTime {
     pub fn equals(self, other: Self) -> bool {
         // A value-type instance method taking a `DateTime` argument: `call instance` on the
         // `valuetype` receiver (`vt_instance1`), argument by value.
-        self.0.vt_instance1::<"Equals", Handle, bool>(other.0)
+        self.vt_instance1::<"Equals", Self, bool>(other)
     }
     /// Chronological comparison (`DateTime.CompareTo`): negative if `self` is earlier than `other`,
     /// zero if equal, positive if later.
     #[inline(always)]
     pub fn compare_to(self, other: Self) -> i32 {
-        self.0.vt_instance1::<"CompareTo", Handle, i32>(other.0)
+        self.vt_instance1::<"CompareTo", Self, i32>(other)
     }
 
     // --- interop escape hatch ---------------------------------------------------------------------
 
     /// The raw managed value-type handle, for lower-level BCL calls not surfaced here.
     #[inline(always)]
-    pub fn handle(self) -> Handle {
-        self.0
+    pub fn handle(self) -> Self {
+        self
     }
     /// Wrap a raw `System.DateTime` value handle (e.g. one returned by another BCL call).
     #[inline(always)]
-    pub fn from_raw(raw: Handle) -> Self {
-        DateTime(raw)
+    pub fn from_raw(raw: Self) -> Self {
+        raw
     }
 
     // --- private helpers --------------------------------------------------------------------------
@@ -231,22 +228,22 @@ impl DateTime {
     /// Read a static `DateTime`-returning property (`get_Now` / `get_UtcNow` / `get_Today` /
     /// `get_MinValue`) — a zero-arg static `call` on the `valuetype`, yielding the struct value.
     #[inline(always)]
-    fn static_get<const METHOD: &'static str>() -> Handle {
-        Handle::vt_static0::<METHOD, Handle>()
+    fn static_get<const METHOD: &'static str>() -> Self {
+        Self::vt_static0::<METHOD, Self>()
     }
 
     /// Shared body for the `Add*(double)` family — a single-`f64`-arg value-type instance call
     /// (`call instance`, receiver by reference) returning a fresh `DateTime` value.
     #[inline(always)]
-    fn add_f64<const METHOD: &'static str>(self, arg: f64) -> Handle {
-        self.0.vt_instance1::<METHOD, f64, Handle>(arg)
+    fn add_f64<const METHOD: &'static str>(self, arg: f64) -> Self {
+        self.vt_instance1::<METHOD, f64, Self>(arg)
     }
 
     /// Shared body for the `Add*(int)` family (`AddYears`/`AddMonths`) — a single-`i32`-arg value-type
     /// instance call returning a fresh `DateTime` value.
     #[inline(always)]
-    fn add_i32<const METHOD: &'static str>(self, arg: i32) -> Handle {
-        self.0.vt_instance1::<METHOD, i32, Handle>(arg)
+    fn add_i32<const METHOD: &'static str>(self, arg: i32) -> Self {
+        self.vt_instance1::<METHOD, i32, Self>(arg)
     }
 }
 
@@ -255,7 +252,7 @@ impl core::fmt::Display for DateTime {
         // Delegate to the managed `ToString()` (the invariant round-trip form) and print its UTF-16
         // content through the idiomatic string wrapper, which decodes to Rust text.
         let s =
-            crate::system::DotNetString::from_handle(self.0.vt_instance0::<"ToString", MString>());
+            crate::system::DotNetString::from_handle((*self).vt_instance0::<"ToString", MString>());
         core::fmt::Display::fmt(&s, f)
     }
 }

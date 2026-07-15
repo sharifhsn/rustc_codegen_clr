@@ -22,18 +22,21 @@ use core::marker::PhantomData;
 
 use crate::r#gen;
 use crate::intrinsics::{
-    RustcCLRInteropByRef, RustcCLRInteropManagedGenericStruct, RustcCLRInteropTypeGeneric,
-    rustc_clr_interop_generic_call1, rustc_clr_interop_generic_call2,
+    RustcCLRInteropByRef, RustcCLRInteropManagedGenericStruct, RustcCLRInteropMethodGeneric,
+    RustcCLRInteropTypeGeneric, rustc_clr_interop_generic_call1, rustc_clr_interop_generic_call2,
     rustc_clr_interop_generic_call3, rustc_clr_interop_generic_ctor2,
+    rustc_clr_interop_generic_method_call1,
 };
 
 const CORELIB: &str = "System.Private.CoreLib";
 
 // A `Span<T>` / `ReadOnlySpan<T>` value is two words (a byref + an int length). `SIZE` is a Rust-side
 // placeholder — the backend lowers this to a `ClassRef` and the CLR knows the real size.
-pub(crate) type RawSpan<T> = RustcCLRInteropManagedGenericStruct<CORELIB, "System.Span", 16, (T,)>;
-pub(crate) type RawRoSpan<T> =
+pub type SpanHandle<T> = RustcCLRInteropManagedGenericStruct<CORELIB, "System.Span", 16, (T,)>;
+pub type ReadOnlySpanHandle<T> =
     RustcCLRInteropManagedGenericStruct<CORELIB, "System.ReadOnlySpan", 16, (T,)>;
+pub(crate) type RawSpan<T> = SpanHandle<T>;
+pub(crate) type RawRoSpan<T> = ReadOnlySpanHandle<T>;
 
 // ---- raw Span<T> members (generic over the element type) --------------------------------------
 fn span_from_ptr<T>(ptr: *mut (), len: i32) -> RawSpan<T> {
@@ -47,6 +50,19 @@ fn span_from_ptr<T>(ptr: *mut (), len: i32) -> RawSpan<T> {
         *mut (),
         i32,
     >(ptr, len)
+}
+fn span_len<T>(span: &RawSpan<T>) -> i32 {
+    rustc_clr_interop_generic_call1::<
+        CORELIB,
+        "System.Span",
+        true,
+        "get_Length",
+        1,
+        (T,),
+        (i32,),
+        i32,
+        &RawSpan<T>,
+    >(span)
 }
 pub(crate) fn span_fill<T>(s: &RawSpan<T>, value: T) {
     rustc_clr_interop_generic_call2::<
@@ -164,6 +180,60 @@ fn rospan_len<T>(s: &RawRoSpan<T>) -> i32 {
         i32,
         &RawRoSpan<T>,
     >(s)
+}
+
+/// `MemoryMarshal.GetReference<T>(ReadOnlySpan<T>)`, whose return is a tracked managed byref.
+fn rospan_get_ref<T>(span: RawRoSpan<T>) -> *mut T {
+    rustc_clr_interop_generic_method_call1::<
+        CORELIB,
+        "System.Runtime.InteropServices.MemoryMarshal",
+        false,
+        "GetReference",
+        0,
+        (),
+        (T,),
+        (
+            RustcCLRInteropByRef<RustcCLRInteropMethodGeneric<0>>,
+            RustcCLRInteropManagedGenericStruct<
+                CORELIB,
+                "System.ReadOnlySpan",
+                16,
+                (RustcCLRInteropMethodGeneric<0>,),
+            >,
+        ),
+        *mut T,
+        RawRoSpan<T>,
+    >(span)
+}
+
+/// Borrow an incoming CLR `Span<T>` as a Rust mutable slice for the duration of a synchronous
+/// exported call.
+///
+/// # Safety
+/// `span` must be a live CLR span and the returned slice must not escape the managed call frame.
+pub unsafe fn handle_as_mut_slice<T>(span: &SpanHandle<T>) -> &mut [T] {
+    let len = span_len(span).max(0) as usize;
+    let ptr = if len == 0 {
+        core::ptr::NonNull::<T>::dangling().as_ptr()
+    } else {
+        span_get_ref(span, 0)
+    };
+    unsafe { core::slice::from_raw_parts_mut(ptr, len) }
+}
+
+/// Borrow an incoming CLR `ReadOnlySpan<T>` as a Rust slice for the duration of a synchronous
+/// exported call.
+///
+/// # Safety
+/// `span` must be live and the returned slice must not escape the managed call frame.
+pub unsafe fn readonly_handle_as_slice<T>(span: &ReadOnlySpanHandle<T>) -> &[T] {
+    let len = rospan_len(span).max(0) as usize;
+    let ptr = if len == 0 {
+        core::ptr::NonNull::<T>::dangling().as_ptr()
+    } else {
+        rospan_get_ref(*span).cast_const()
+    };
+    unsafe { core::slice::from_raw_parts(ptr, len) }
 }
 // ReadOnlySpan<T>.Slice(int start, int length) -> ReadOnlySpan<T> : same def-shape nested-generic
 // self-return pattern as `Span<T>.Slice`.

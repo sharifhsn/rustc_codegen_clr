@@ -51,6 +51,7 @@ use crate::bindings::System::Threading::{
     ManualResetEventSlim as RawManualResetEventSlim,
     ReaderWriterLockSlim as RawReaderWriterLockSlim, SemaphoreSlim as RawSemaphoreSlim,
 };
+use crate::cancellation::CancellationToken;
 use crate::class::{Class, GenericClass};
 use crate::intrinsics::{
     RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric,
@@ -987,19 +988,13 @@ type ChannelMethodGen =
     RustcCLRInteropManagedGeneric<CHANNELS_ASM, CHANNEL, (RustcCLRInteropMethodGeneric<0>,)>;
 
 const CORELIB: &str = "System.Private.CoreLib";
-const CANCELLATION_TOKEN: &str = "System.Threading.CancellationToken";
-/// `System.Threading.CancellationToken` is a one-field (`CancellationTokenSource? _source`) managed
-/// value type; like `Nullable<T>`/`Span<T>` elsewhere in this crate, `SIZE` is a Rust-side placeholder
-/// the backend never reads — the CLR alone knows and uses the real layout.
-const CANCELLATION_TOKEN_SIZE: usize = core::mem::size_of::<usize>();
-type RawCancellationToken =
-    RustcCLRInteropManagedStruct<CORELIB, CANCELLATION_TOKEN, CANCELLATION_TOKEN_SIZE>;
+type RawCancellationToken = CancellationToken;
 
 /// `CancellationToken.None` (the static property getter) — every `*Async` call below passes this
 /// rather than hand-constructing a zeroed value type, so the CLR itself builds the value.
 #[inline]
 fn no_cancellation() -> RawCancellationToken {
-    RawCancellationToken::vt_static0::<"get_None", RawCancellationToken>()
+    CancellationToken::none()
 }
 
 /// `Channel.CreateUnbounded<T>()` — a static generic method (`!!0 = T`), zero real arguments, on the
@@ -1150,6 +1145,28 @@ fn writer_try_complete<T>(w: RawWriter<T>) -> bool {
     )
 }
 
+/// `ChannelWriter<T>.TryComplete(Exception)` — fault the channel with an application error. A
+/// `ChannelReader<T>.ReadAllAsync` consumer observes the same exception from its next
+/// `MoveNextAsync`, which is the framework-native error path for an `IAsyncEnumerable<T>` producer.
+fn writer_try_complete_error<T>(
+    w: RawWriter<T>,
+    error: RustcCLRInteropManagedClass<CORELIB, "System.Exception">,
+) -> bool {
+    type CException = RustcCLRInteropManagedClass<CORELIB, "System.Exception">;
+    rustc_clr_interop_generic_call2::<
+        CHANNELS_ASM,
+        CHANNEL_WRITER,
+        false,
+        "TryComplete",
+        2,
+        (T,),
+        (bool, CException),
+        bool,
+        RawWriter<T>,
+        CException,
+    >(w, error)
+}
+
 /// `ChannelReader<T>.TryRead(out item)` — non-blocking. `TryRead`'s `out` parameter is a managed byref,
 /// which this bridge represents with [`crate::intrinsics::RustcCLRInteropByRef`] in the `Sig` slot and
 /// a plain raw pointer to a Rust local as the actual runtime argument (the same shape `span.rs`'s
@@ -1253,9 +1270,14 @@ fn reader_read_all_async<T>(r: RawReader<T>) -> crate::enumerate_async::IAsyncEn
 /// **Multi-producer, by design.** Unlike `std::sync::mpsc::Sender`, this `Sender<T>` requires no
 /// `.clone()` can hand it to multiple producer threads; every clone owns an independent `GCHandle`
 /// root for the same managed writer.
-#[derive(Clone)]
 pub struct Sender<T> {
     h: RootWriter<T>,
+}
+
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        Self { h: self.h.clone() }
+    }
 }
 
 // SAFETY: `ChannelWriter<T>`/`ChannelReader<T>` are documented by the BCL to be safe for concurrent
@@ -1320,6 +1342,15 @@ impl<T> Sender<T> {
     #[inline]
     pub fn close(&self) -> bool {
         writer_try_complete(unsafe { self.h.get_naked_ref() })
+    }
+
+    /// Complete the channel with a managed `System.Exception`. An asynchronous enumerator drains
+    /// already-buffered values and then observes this message as a normal managed exception.
+    #[inline]
+    pub fn close_with_error(&self, message: &str) -> bool {
+        let message = crate::system::DotNetString::from(message);
+        let error = crate::bindings::System::Exception::ctor1(message.handle());
+        writer_try_complete_error(unsafe { self.h.get_naked_ref() }, error)
     }
 
     /// The raw managed `ChannelWriter<T>` handle — hand this directly to C#, or to any .NET API

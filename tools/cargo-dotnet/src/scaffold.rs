@@ -2,7 +2,8 @@
 //!
 //! The onboarding keystone (ERGONOMICS_ROADMAP Theme-5 ⚑): zero-to-running in ONE
 //! command instead of hand-assembling a `Cargo.toml` + `.csproj` + `RustDotnet.targets`
-//! import. Three templates, each modelled directly on a shipped example crate so the
+//! import. Product templates are modelled directly on shipped example crates or an external host's
+//! documented project contract so the
 //! scaffold is guaranteed to be the exact shape the native pipeline already builds:
 //!
 //!   * `--app`    — a Rust-on-.NET binary using `mycorrhiza::prelude` (models `cd_collections`).
@@ -12,6 +13,8 @@
 //!                  `cd_containers`). `dotnet run` in the `csharp/` dir builds both.
 //!   * `--plugin` — the `#[dotnet_class]` variant of `--lib`: the Rust side defines a
 //!                  managed class a C# host `new`s and calls (models `cd_typedef`).
+//!   * `--excel`  — a Windows Excel-DNA add-in targeting `net10.0-windows`; ordinary attributed
+//!                  C# worksheet functions call typed managed-Rust exports.
 //!
 //! Templates are emitted from string constants (interpolating the crate name) — no
 //! network, no example-crate copy at runtime. Every file the corresponding example
@@ -120,6 +123,7 @@ fn render(template: Template, name: &str, dotnet: &str) -> Vec<File> {
         Template::App => app_files(name),
         Template::Lib => lib_files(name, dotnet),
         Template::Plugin => plugin_files(name, dotnet),
+        Template::Excel => excel_files(name, dotnet),
     }
 }
 
@@ -259,6 +263,61 @@ fn plugin_files(name: &str, dotnet: &str) -> Vec<File> {
 }
 
 // ---------------------------------------------------------------------------------
+// --excel : Excel-DNA worksheet functions backed by managed Rust
+// ---------------------------------------------------------------------------------
+
+fn excel_files(name: &str, dotnet: &str) -> Vec<File> {
+    let assembly = format!("{name}_excel");
+    let rust_crate = name.replace('-', "_");
+    vec![
+        File {
+            rel: "rustlib/Cargo.toml",
+            body: format!(
+                "[package]\n\
+                 name = \"{name}\"\n\
+                 version = \"0.1.0\"\n\
+                 edition = \"2024\"\n\
+                 \n\
+                 [lib]\n\
+                 crate-type = [\"cdylib\"]\n\
+                 \n\
+                 [dependencies]\n\
+                 mycorrhiza = \"0.0.0\"\n\
+                 dotnet_macros = \"0.1.0\"\n\
+                 [workspace]\n\
+                 \n\
+                 [profile.release.build-override]\n\
+                 codegen-units = 1\n",
+            ),
+        },
+        File {
+            rel: "rustlib/.gitignore",
+            body: GITIGNORE_RUSTLIB.to_string(),
+        },
+        File {
+            rel: "rustlib/src/lib.rs",
+            body: EXCEL_RUST.to_string(),
+        },
+        File {
+            rel: "excel/Functions.cs",
+            body: EXCEL_CS_FUNCTIONS.to_string(),
+        },
+        File {
+            rel: &leak_str(format!("excel/{assembly}.csproj")),
+            body: excel_csproj(&assembly, dotnet, &rust_crate),
+        },
+        File {
+            rel: "excel/.gitignore",
+            body: GITIGNORE_CS.to_string(),
+        },
+        File {
+            rel: "README.md",
+            body: EXCEL_README.replace("__NAME__", name),
+        },
+    ]
+}
+
+// ---------------------------------------------------------------------------------
 // SDK crates are ordinary version dependencies in portable manifests. cargo-dotnet's
 // private build config redirects them to the copies installed under CARGO_DOTNET_HOME.
 // ---------------------------------------------------------------------------------
@@ -291,6 +350,13 @@ fn csproj_plain(cs_name: &str, dotnet: &str) -> String {
         .replace("__CONTAINERS_PROP__", "")
 }
 
+fn excel_csproj(assembly: &str, dotnet: &str, rust_crate: &str) -> String {
+    EXCEL_CSPROJ_TEMPLATE
+        .replace("__ASSEMBLY__", assembly)
+        .replace("__DOTNET__", dotnet)
+        .replace("__RUST_CRATE__", rust_crate)
+}
+
 // ---------------------------------------------------------------------------------
 // Post-scaffold guidance.
 // ---------------------------------------------------------------------------------
@@ -315,6 +381,14 @@ fn print_next_steps(template: Template, name: &str, dir: &Path, dotnet: &str) {
                 "  # ensure CARGO_DOTNET_HOME points at your install (or ~/.cargo-dotnet exists)"
             );
             println!("  dotnet run -c Release  # targets net{dotnet}.0");
+        }
+        Template::Excel => {
+            println!("Next (Windows with desktop Excel installed):");
+            println!("  cd {d}/excel");
+            println!("  dotnet build -c Release  # targets net{dotnet}.0-windows");
+            println!(
+                "  # Open the generated *-packed.xll from bin/Release/net{dotnet}.0-windows/publish"
+            );
         }
     }
 }
@@ -494,6 +568,264 @@ public static class Program
 }
 "#;
 
+/// `--excel` Rust library: application logic remains normal Rust and exports a typed managed seam.
+/// Excel-DNA attributes stay in the tiny C# host until method-level custom attributes can be
+/// emitted directly on Rust exports.
+const EXCEL_RUST: &str = r#"#![feature(adt_const_params, unsized_const_params)]
+#![allow(internal_features, incomplete_features)]
+
+use dotnet_macros::dotnet_export;
+use mycorrhiza::cancellation::CancellationToken;
+
+fn validate_portfolio_inputs(
+    principal: f64,
+    annual_rate_percent: f64,
+    years: i32,
+) -> Result<(), String> {
+    if !principal.is_finite() || principal < 0.0 {
+        return Err("principal must be a finite non-negative number".to_owned());
+    }
+    if !annual_rate_percent.is_finite() || annual_rate_percent <= -100.0 {
+        return Err("annual rate must be finite and greater than -100%".to_owned());
+    }
+    if !(0..=200).contains(&years) {
+        return Err("years must be between 0 and 200".to_owned());
+    }
+    Ok(())
+}
+
+/// Compound a principal at a fixed annual rate. Excel sees a normal static method returning double.
+#[dotnet_export(name = "PortfolioFutureValue", error = "exception")]
+pub fn portfolio_future_value(
+    principal: f64,
+    annual_rate_percent: f64,
+    years: i32,
+) -> Result<f64, String> {
+    validate_portfolio_inputs(principal, annual_rate_percent, years)?;
+    Ok(principal * (1.0 + annual_rate_percent / 100.0).powi(years))
+}
+
+/// Run a deterministic portfolio stress sweep. Excel calls this on a pool thread and supplies its
+/// formula-lifetime CancellationToken, which is polled without involving the Excel object model.
+#[dotnet_export(name = "PortfolioStressScore", error = "exception")]
+pub fn portfolio_stress_score(
+    cancellation: CancellationToken,
+    principal: f64,
+    annual_rate_percent: f64,
+    years: i32,
+    scenarios: i32,
+) -> Result<f64, String> {
+    validate_portfolio_inputs(principal, annual_rate_percent, years)?;
+    if !(1..=10_000_000).contains(&scenarios) {
+        return Err("scenarios must be between 1 and 10000000".to_owned());
+    }
+
+    let base_rate = annual_rate_percent / 100.0;
+    let mut total = 0.0;
+    for scenario in 0..scenarios {
+        if scenario & 1023 == 0 {
+            cancellation.throw_if_cancellation_requested();
+        }
+        // Deterministic +/-100 bp rate sweep: useful enough to replace with a real model while
+        // keeping the generated project reproducible and allocation-free.
+        let shock = ((scenario % 201) - 100) as f64 / 10_000.0;
+        total += principal * (1.0 + base_rate + shock).powi(years);
+    }
+    cancellation.throw_if_cancellation_requested();
+    Ok(total / scenarios as f64)
+}
+
+/// A string export demonstrates ordinary managed-string marshalling in an Excel cell.
+#[dotnet_export(name = "RustEngineStatus")]
+pub fn rust_engine_status() -> String {
+    "managed Rust engine ready".to_owned()
+}
+"#;
+
+/// `--excel` C# host: Excel-DNA owns Excel registration while worksheet calculations call the
+/// managed Rust assembly directly. There is no `DllImport` and no pointer-shaped public API.
+const EXCEL_CS_FUNCTIONS: &str = r##"using ExcelDna.Integration;
+using System.Threading;
+using System.Threading.Tasks;
+
+public static class RustFunctions
+{
+    [ExcelFunction(
+        Name = "RUST.PORTFOLIO_FV",
+        Description = "Future value calculated by managed Rust.",
+        Category = "Rust on .NET",
+        IsThreadSafe = true)]
+    public static object PortfolioFutureValue(
+        [ExcelArgument(Name = "principal", Description = "Starting amount, zero or greater.")]
+        double principal,
+        [ExcelArgument(Name = "annualRatePercent", Description = "Annual percentage rate.")]
+        double annualRatePercent,
+        [ExcelArgument(Name = "years", Description = "Whole years from 0 through 200.")]
+        int years)
+    {
+        try
+        {
+            return MainModule.PortfolioFutureValue(principal, annualRatePercent, years);
+        }
+        catch (Exception error)
+        {
+            // A Rust `Result::Err` is a managed exception. Excel UDFs should return an Excel value
+            // rather than let an exception escape through the calculation engine.
+            return $"#RUST! {error.Message}";
+        }
+    }
+
+    [ExcelFunction(
+        Name = "RUST.STATUS",
+        Description = "Reports whether the managed Rust assembly loaded.",
+        Category = "Rust on .NET",
+        IsThreadSafe = true)]
+    public static string Status() => MainModule.RustEngineStatus();
+
+    [ExcelFunction(
+        Name = "RUST.PORTFOLIO_FV_TABLE",
+        Description = "Calculates future value for rows of principal, annual rate, and years.",
+        Category = "Rust on .NET",
+        IsThreadSafe = true)]
+    public static object[,] PortfolioFutureValueTable(
+        [ExcelArgument(Name = "rows", Description = "Three columns: principal, annual rate %, years.")]
+        object[,] rows)
+    {
+        int rowCount = rows.GetLength(0);
+        if (rows.GetLength(1) != 3)
+            return new object[,] { { "#RUST! expected exactly three columns" } };
+
+        var results = new object[rowCount, 1];
+        for (int row = 0; row < rowCount; row++)
+        {
+            try
+            {
+                // Excel-DNA owns Excel's object/error/empty-cell model. The public Rust seam stays
+                // a normal typed .NET API, so the calculation engine is reusable outside Excel.
+                double principal = Convert.ToDouble(rows[row, 0]);
+                double rate = Convert.ToDouble(rows[row, 1]);
+                int years = Convert.ToInt32(rows[row, 2]);
+                results[row, 0] = MainModule.PortfolioFutureValue(principal, rate, years);
+            }
+            catch (Exception error)
+            {
+                results[row, 0] = $"#RUST! row {row + 1}: {error.Message}";
+            }
+        }
+        return results;
+    }
+
+    [ExcelFunction(
+        Name = "RUST.PORTFOLIO_STRESS_ASYNC",
+        Description = "Runs a cancellable portfolio stress sweep in managed Rust without blocking Excel.",
+        Category = "Rust on .NET")]
+    public static async Task<object> PortfolioStressAsync(
+        [ExcelArgument(Name = "principal", Description = "Starting amount, zero or greater.")]
+        double principal,
+        [ExcelArgument(Name = "annualRatePercent", Description = "Annual percentage rate.")]
+        double annualRatePercent,
+        [ExcelArgument(Name = "years", Description = "Whole years from 0 through 200.")]
+        int years,
+        [ExcelArgument(Name = "scenarios", Description = "Stress scenarios from 1 through 10000000.")]
+        int scenarios,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            // Excel-DNA 1.9 treats a final CancellationToken as the lifetime of this formula and
+            // cancels it when the formula is deleted. Only scalar copies cross the pool-thread
+            // boundary: no Range, ExcelReference, C API call, or COM object is captured here.
+            return await Task.Run(
+                () => MainModule.PortfolioStressScore(
+                    cancellationToken,
+                    principal,
+                    annualRatePercent,
+                    years,
+                    scenarios),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Preserve cancellation so Excel-DNA retires the async topic instead of caching an
+            // error-looking cell value.
+            throw;
+        }
+        catch (Exception error)
+        {
+            return $"#RUST! {error.Message}";
+        }
+    }
+}
+"##;
+
+const EXCEL_README: &str = r#"# __NAME__: managed Rust in Excel
+
+This scaffold uses Excel-DNA 1.9.0 to package a `net10.0-windows` Excel add-in. Excel-DNA owns the
+Excel-specific registration and deployment surface; the worksheet functions call ordinary typed
+methods emitted from `rustlib` by `#[dotnet_export]`.
+
+On Windows with 64-bit desktop Excel and the .NET 10 Desktop Runtime installed:
+
+```powershell
+cd excel
+dotnet build -c Release
+```
+
+Open the generated 64-bit packed `.xll` under `excel/bin/Release/net10.0-windows/publish`, then use:
+
+```text
+=RUST.STATUS()
+=RUST.PORTFOLIO_FV(1000, 7, 10)
+=RUST.PORTFOLIO_FV_TABLE(A2:C20)
+=RUST.PORTFOLIO_STRESS_ASYNC(1000, 7, 10, 250000)
+```
+
+The table function accepts an ordinary Excel range with columns `principal`, `annual rate %`, and
+`years`, and spills one result per row. The C# edge owns Excel's special `object[,]` cell/error model;
+each validated typed row crosses into reusable managed Rust business logic.
+
+The asynchronous stress function returns Excel-DNA's preferred `Task<T>` shape. Excel-DNA supplies
+a hidden final `CancellationToken` and cancels it if the formula is deleted. The C# edge copies only
+scalar inputs into `Task.Run`; managed Rust polls the token during the CPU loop. Never capture a
+`Range`, `ExcelReference`, `ExcelDnaUtil.Application`, or any other Excel COM/C-API object in that
+worker. Code that intentionally changes Excel must instead schedule a command with
+`ExcelAsyncUtil.QueueAsMacro`, which runs when Excel is ready on its main thread.
+
+The generated C# host deliberately contains no P/Invoke. If a calculation needs a native Rust
+kernel, declare that private C ABI in `rustlib`, add the binary with `cargo dotnet add-native` or
+`add-native-file`, and keep Excel-facing signatures managed and typed.
+
+This template targets Windows desktop Excel. It is not a VSTO project and does not claim Office for
+macOS support; cross-platform Office extensions use the Office web-add-in model with a managed-Rust
+service or companion.
+"#;
+
+const EXCEL_CSPROJ_TEMPLATE: &str = r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net__DOTNET__.0-windows</TargetFramework>
+    <RustDotnetVersion Condition="'$(RustDotnetVersion)'==''">__DOTNET__</RustDotnetVersion>
+    <RustDotnetCompatibilityProfile>excel-dna-net10-windows</RustDotnetCompatibilityProfile>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>__ASSEMBLY__</AssemblyName>
+    <ExcelDnaCreate32BitAddIn>false</ExcelDnaCreate32BitAddIn>
+    <ExcelDnaCreate64BitAddIn>true</ExcelDnaCreate64BitAddIn>
+    <RunExcelDnaPack>true</RunExcelDnaPack>
+    <ExcelAddInExplicitExports>true</ExcelAddInExplicitExports>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ExcelDna.AddIn" Version="1.9.0" />
+    <RustCrate Include="../rustlib" CrateName="__RUST_CRATE__" />
+  </ItemGroup>
+
+  <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
+  <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'=='' and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+</Project>
+"#;
+
 /// The C# csproj, shared by `--lib` and `--plugin`. `__CONTAINERS_PROP__` toggles the
 /// shipped-container opt-in; `__ASSEMBLY__` is the C# assembly name. The 3-way
 /// RustDotnet.targets import mirrors the example crates: prefer `$CARGO_DOTNET_HOME`,
@@ -537,6 +869,7 @@ mod tests {
         assert_cargo_manifests_parse(&app_files("demo"));
         assert_cargo_manifests_parse(&lib_files("demo", "10"));
         assert_cargo_manifests_parse(&plugin_files("demo", "10"));
+        assert_cargo_manifests_parse(&excel_files("demo", "10"));
     }
 
     #[test]
@@ -642,12 +975,62 @@ mod tests {
     }
 
     #[test]
+    fn excel_scaffold_is_a_managed_rust_backed_excel_dna_addin() {
+        let files = excel_files("risk_engine", "10");
+        let rels: Vec<&str> = files.iter().map(|file| file.rel).collect();
+        assert!(rels.contains(&"rustlib/Cargo.toml"));
+        assert!(rels.contains(&"rustlib/src/lib.rs"));
+        assert!(rels.contains(&"excel/Functions.cs"));
+        assert!(rels.contains(&"excel/risk_engine_excel.csproj"));
+        assert!(rels.contains(&"README.md"));
+
+        let csproj = &files
+            .iter()
+            .find(|file| file.rel.ends_with(".csproj"))
+            .unwrap()
+            .body;
+        assert!(csproj.contains("<TargetFramework>net10.0-windows</TargetFramework>"));
+        assert!(csproj.contains("ExcelDna.AddIn\" Version=\"1.9.0"));
+        assert!(csproj.contains("<RustCrate Include=\"../rustlib\" CrateName=\"risk_engine\" />"));
+        assert!(csproj.contains("<ExcelDnaCreate32BitAddIn>false"));
+        assert!(csproj.contains("<ExcelDnaCreate64BitAddIn>true"));
+        assert!(csproj.contains("<ExcelAddInExplicitExports>true"));
+
+        let rust = &files
+            .iter()
+            .find(|file| file.rel == "rustlib/src/lib.rs")
+            .unwrap()
+            .body;
+        assert!(rust.contains("#[dotnet_export(name = \"PortfolioFutureValue\""));
+        assert!(rust.contains("#[dotnet_export(name = \"PortfolioStressScore\""));
+        assert!(rust.contains("CancellationToken"));
+        let csharp = &files
+            .iter()
+            .find(|file| file.rel == "excel/Functions.cs")
+            .unwrap()
+            .body;
+        assert!(csharp.contains("[ExcelFunction("));
+        assert!(csharp.contains("MainModule.PortfolioFutureValue"));
+        assert!(csharp.contains("PortfolioFutureValueTable"));
+        assert!(csharp.contains("object[,] rows"));
+        assert!(csharp.contains("new object[rowCount, 1]"));
+        assert!(csharp.contains("Task<object> PortfolioStressAsync"));
+        assert!(csharp.contains("CancellationToken cancellationToken"));
+        assert!(csharp.contains("Task.Run("));
+        assert!(csharp.contains("catch (OperationCanceledException)"));
+        assert!(csharp.contains("IsThreadSafe = true"));
+        assert!(!csharp.contains("ExcelDnaUtil.Application"));
+        assert!(!csharp.contains("DllImport"));
+    }
+
+    #[test]
     fn no_template_placeholders_leak() {
         for name in ["a", "b_c", "Xyz"] {
             for files in [
                 app_files(name),
                 lib_files(name, "10"),
                 plugin_files(name, "10"),
+                excel_files(name, "10"),
             ] {
                 for f in files {
                     assert!(
@@ -668,6 +1051,11 @@ mod tests {
                     assert!(
                         !f.body.contains("__DOTNET__"),
                         "unresolved __DOTNET__ in {}",
+                        f.rel
+                    );
+                    assert!(
+                        !f.body.contains("__RUST_CRATE__"),
+                        "unresolved __RUST_CRATE__ in {}",
                         f.rel
                     );
                     assert!(

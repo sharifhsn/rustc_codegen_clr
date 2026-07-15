@@ -6,7 +6,7 @@ project="$repo/cargo_tests/cd_interop/csharp/cd_interop_cs.csproj"
 crate="$repo/cargo_tests/cd_interop/rustlib"
 dll="$crate/target/x86_64-unknown-dotnet/release/cd_interop.dll"
 receipt="$dll.rustdotnet.receipt.json"
-driver="$repo/tools/cargo-dotnet/target/release/cargo-dotnet"
+driver="$repo/target/release/cargo-dotnet"
 log_dir="${RCL_MSBUILD_LOG_DIR:-/tmp/rustc_codegen_clr-msbuild-acceptance}"
 
 if [[ ! -x "$driver" ]]; then

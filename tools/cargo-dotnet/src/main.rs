@@ -24,6 +24,7 @@ mod host;
 mod interop_helpers;
 mod metadata_inputs;
 mod mode;
+mod native_bindgen;
 mod nuget;
 mod overlays;
 mod pack;
@@ -32,6 +33,7 @@ mod parallel_trace;
 mod passthrough;
 mod pipeline;
 mod private_sysroot;
+mod profiles;
 mod provenance;
 mod publish;
 mod push;
@@ -101,6 +103,7 @@ fn main() -> ExitCode {
     }
 
     let result = match &cli.cmd {
+        Cmd::Profiles(args) => profiles::run(args),
         Cmd::Capabilities(args) => capabilities::run(args),
         Cmd::Restore(args) => restore::run(args),
         Cmd::Build(args) => pipeline::run(args, false),
@@ -114,6 +117,9 @@ fn main() -> ExitCode {
         Cmd::Push(args) => push::run(args),
         Cmd::Publish(args) => publish::run(args),
         Cmd::AddNuget(args) => nuget::run(args),
+        Cmd::AddNative(args) => nuget::run_native(args),
+        Cmd::AddNativeFile(args) => nuget::run_native_file(args),
+        Cmd::Bindgen(args) => native_bindgen::run(args),
         Cmd::MetadataInputs(args) => metadata_inputs::run(args),
         Cmd::ValidateManagedIdentities(args) => {
             context::validate_managed_identity_set(&args.crate_dirs)
@@ -150,6 +156,9 @@ fn requires_supported_host(cmd: &Cmd) -> bool {
             | Cmd::Publish(_)
             | Cmd::Push(_)
             | Cmd::AddNuget(_)
+            | Cmd::AddNative(_)
+            | Cmd::AddNativeFile(_)
+            | Cmd::Bindgen(_)
     )
 }
 
@@ -178,7 +187,8 @@ fn inject_prog_args(cmd: &mut Cmd, prog_args: Vec<String>) {
         Cmd::Build(args) | Cmd::Run(args) | Cmd::Test(args) | Cmd::Restore(args) => {
             args.prog_args = prog_args
         }
-        Cmd::Capabilities(_)
+        Cmd::Profiles(_)
+        | Cmd::Capabilities(_)
         | Cmd::New(_)
         | Cmd::Doctor(_)
         | Cmd::Setup(_)
@@ -187,6 +197,9 @@ fn inject_prog_args(cmd: &mut Cmd, prog_args: Vec<String>) {
         | Cmd::Publish(_)
         | Cmd::Push(_)
         | Cmd::AddNuget(_)
+        | Cmd::AddNative(_)
+        | Cmd::AddNativeFile(_)
+        | Cmd::Bindgen(_)
         | Cmd::MetadataInputs(_)
         | Cmd::ValidateManagedIdentities(_)
         | Cmd::ManagedAssemblyName(_) => {}

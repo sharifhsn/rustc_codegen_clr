@@ -4,7 +4,7 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-driver="${RCL_ONBOARDING_DRIVER:-$repo/tools/cargo-dotnet/target/release/cargo-dotnet}"
+driver="${RCL_ONBOARDING_DRIVER:-$repo/target/release/cargo-dotnet}"
 dotnet_version="${DOTNET_VERSION:-10}"
 work="$(mktemp -d "${TMPDIR:-/tmp}/rustdotnet-onboarding.XXXXXX")"
 log_dir="${RCL_ONBOARDING_LOG_DIR:-$work/logs}"

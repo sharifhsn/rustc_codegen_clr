@@ -70,8 +70,24 @@ fn collect(crate_dir: &Path) -> Result<Vec<PathBuf>> {
         mode::Mode::Dev { repo_root } => repo_root,
         mode::Mode::Installed { home } => home.join("crates"),
     };
-    for name in ["mycorrhiza", "dotnet_macros"] {
-        let path = sdk_root.join(name);
+    for (name, relative) in [
+        ("mycorrhiza", "mycorrhiza"),
+        ("dotnet_macros", "dotnet_macros"),
+        (
+            "rust-dotnet-pinvoke",
+            if sdk_root.join("rust-dotnet-pinvoke").is_dir() {
+                "rust-dotnet-pinvoke"
+            } else {
+                "crates/rust-dotnet-pinvoke"
+            },
+        ),
+    ] {
+        if !manifest_declares_dependency(&manifest, name)?
+            || manifest_uses_direct_path_dependency(&manifest, name)?
+        {
+            continue;
+        }
+        let path = sdk_root.join(relative);
         if path.is_dir() {
             options.push("--config".to_string());
             options.push(format!(
@@ -145,6 +161,85 @@ fn collect(crate_dir: &Path) -> Result<Vec<PathBuf>> {
         );
     }
     Ok(inputs.into_iter().collect())
+}
+
+pub(crate) fn manifest_declares_dependency(manifest: &Path, package_name: &str) -> Result<bool> {
+    let document = fs::read_to_string(manifest)
+        .with_context(|| format!("read {}", manifest.display()))?
+        .parse::<toml::Value>()
+        .with_context(|| format!("parse {}", manifest.display()))?;
+
+    fn section_declares(section: Option<&toml::Value>, package_name: &str) -> bool {
+        section
+            .and_then(toml::Value::as_table)
+            .is_some_and(|dependencies| {
+                dependencies.iter().any(|(dependency_name, dependency)| {
+                    dependency_name == package_name
+                        || dependency
+                            .as_table()
+                            .and_then(|spec| spec.get("package"))
+                            .and_then(toml::Value::as_str)
+                            == Some(package_name)
+                })
+            })
+    }
+
+    for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if section_declares(document.get(section), package_name) {
+            return Ok(true);
+        }
+    }
+    if let Some(targets) = document.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values() {
+            for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                if section_declares(target.get(section), package_name) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn manifest_uses_direct_path_dependency(
+    manifest: &Path,
+    package_name: &str,
+) -> Result<bool> {
+    let document = fs::read_to_string(manifest)
+        .with_context(|| format!("read {}", manifest.display()))?
+        .parse::<toml::Value>()
+        .with_context(|| format!("parse {}", manifest.display()))?;
+
+    fn section_has_path(section: Option<&toml::Value>, package_name: &str) -> bool {
+        section
+            .and_then(toml::Value::as_table)
+            .is_some_and(|dependencies| {
+                dependencies.iter().any(|(dependency_name, dependency)| {
+                    dependency.as_table().is_some_and(|spec| {
+                        spec.contains_key("path")
+                            && (dependency_name == package_name
+                                || spec.get("package").and_then(toml::Value::as_str)
+                                    == Some(package_name))
+                    })
+                })
+            })
+    }
+
+    for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if section_has_path(document.get(section), package_name) {
+            return Ok(true);
+        }
+    }
+    if let Some(targets) = document.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values() {
+            for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                if section_has_path(target.get(section), package_name) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn metadata_toolchain() -> Result<String> {
@@ -255,6 +350,36 @@ mod tests {
     fn render_is_sorted_and_newline_delimited() {
         let inputs = vec![PathBuf::from("/a"), PathBuf::from("/b")];
         assert_eq!(render(&inputs).unwrap(), b"/a\n/b\n");
+    }
+
+    #[test]
+    fn direct_and_renamed_path_dependencies_do_not_need_sdk_patches() {
+        let root = std::env::temp_dir().join(format!(
+            "cargo-dotnet-metadata-path-deps-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("Cargo.toml");
+        fs::write(
+            &manifest,
+            r#"[package]
+name = "probe"
+version = "0.0.0"
+
+[dependencies]
+mycorrhiza = { path = "../mycorrhiza" }
+macros = { package = "dotnet_macros", path = "../dotnet_macros" }
+"#,
+        )
+        .unwrap();
+        assert!(manifest_uses_direct_path_dependency(&manifest, "mycorrhiza").unwrap());
+        assert!(manifest_uses_direct_path_dependency(&manifest, "dotnet_macros").unwrap());
+        assert!(!manifest_uses_direct_path_dependency(&manifest, "rust-dotnet-pinvoke").unwrap());
+        assert!(manifest_declares_dependency(&manifest, "mycorrhiza").unwrap());
+        assert!(manifest_declares_dependency(&manifest, "dotnet_macros").unwrap());
+        assert!(!manifest_declares_dependency(&manifest, "rust-dotnet-pinvoke").unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::path::Path;
 pub use crate::Access;
 pub use asm::{
     Assembly, AssemblyArenaCounts, CompactionStats, ExportReadyAssembly, IlasmFlavour,
-    VerificationFailure,
+    NativeImport, VerificationFailure,
 };
 pub use basic_block::BasicBlock;
 pub use bimap::BiMap;
@@ -20,7 +20,9 @@ pub use cst::Const;
 pub use field::{FieldDesc, StaticFieldDesc};
 pub use fnsig::FnSig;
 pub use iter::{CILIter, CILIterElem};
-pub use method::{ExceptionRegion, MethodDef, MethodDefIdx, MethodImpl, MethodRef};
+pub use method::{
+    ExceptionRegion, MethodDef, MethodDefIdx, MethodImpl, MethodRef, PInvokeCallConv,
+};
 
 pub use tpe::Type;
 pub use tpe::float::Float;

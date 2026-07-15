@@ -1,0 +1,5 @@
+error: #[dotnet_export]: `cancellation = "task"` requires async `Result<T, E>` or `Result<(), E>` output
+ --> tests/ui/dotnet_export_cancellation_requires_result.rs:4:45
+  |
+4 | pub async fn not_a_cancellation_result() -> i32 {
+  |                                             ^^^

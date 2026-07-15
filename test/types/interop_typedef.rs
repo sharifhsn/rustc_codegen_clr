@@ -107,7 +107,7 @@ macro_rules! typedef_fields {
         #[used]
         static KEEP_FN: extern "C" fn ($($args)*)->$ret = $fname::rustc_codegen_clr_not_magic;
 
-        $typedef = $crate::rustc_codegen_clr_add_method_def::<"pub","virtual",FNAME,_>($typedef,$fname::rustc_codegen_clr_not_magic);
+        $typedef = $crate::rustc_codegen_clr_add_method_def::<"pub","virtual",FNAME,"","",_>($typedef,$fname::rustc_codegen_clr_not_magic);
         typedef_fields!($typedef, $($tail)*)
     };
 }

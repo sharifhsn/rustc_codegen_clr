@@ -30,18 +30,8 @@ Check("is_terminal", MainModule.is_terminal(Status.Done), true);
 Check("enum switch", Status.Done switch { Status.Pending => 0, Status.Ready => 1, Status.Done => 2, _ => -1 }, 2);
 Check("typed enum parameter", typeof(MainModule).GetMethod("roundtrip_status")!.GetParameters()[0].ParameterType, typeof(Status));
 
-// #[dotnet_export] Vec<T> param now marshals inbound too (via a RustVec<int> handle) — built here
-// with the raw rcl_vec_* exports directly (same handle shape RustDotnet.RustVec<T> wraps).
-unsafe
-{
-    nuint handle = MainModule.rcl_vec_new((nuint)sizeof(int));
-    foreach (int x in new[] { 1, 2, 3, 4 })
-    {
-        MainModule.rcl_vec_push(handle, (byte*)&x);
-    }
-    Check("sum_vec([1,2,3,4])", MainModule.sum_vec(handle), 10);
-    MainModule.rcl_vec_free(handle);
-}
+// #[dotnet_export] Vec<T> is an ordinary managed T[] by default.
+Check("sum_vec([1,2,3,4])", MainModule.sum_vec(new[] { 1, 2, 3, 4 }), 10);
 
 // C# -> Rust delegate import. Rust receives the real managed delegate handle, wraps it as the
 // matching mycorrhiza delegate, and invokes it through Delegate.Invoke.

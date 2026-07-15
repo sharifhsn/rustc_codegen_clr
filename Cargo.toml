@@ -14,7 +14,7 @@ libloading = "0.8.1"
 
 postcard = { version = "1.0.8", features = ["use-std"] }
 rustc-demangle = "0.1.23"
-cilly = {path = "./cilly"}
+cilly = { path = "./cilly" }
 serde = { version = "1.0.183", features = ["derive"] }
 
 [profile.dev.package.fxhash]
@@ -23,7 +23,17 @@ opt-level = 3
 crate-type = ["dylib"]
 
 [workspace]
-members = ["cilly", "dotnet_aot", "dotnet_macros", "mycorrhiza"]
-exclude = ["rust/src/bootstrap","backup_rust/src/bootstrap", "bin", "tools/cargo-dotnet"]
+members = [
+    "cilly",
+    "dotnet_aot",
+    "dotnet_macros",
+    "mycorrhiza",
+    "crates/rust-dotnet-assets",
+    "crates/rust-dotnet-bindgen",
+    "crates/rust-dotnet-sdk-core",
+    "crates/rust-dotnet-pinvoke",
+    "tools/cargo-dotnet",
+]
+exclude = ["rust/src/bootstrap", "backup_rust/src/bootstrap", "bin"]
 [profile.release]
 debug = true

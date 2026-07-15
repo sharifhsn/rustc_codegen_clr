@@ -34,33 +34,16 @@ use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::artifact::{self, Artifact};
-use crate::cli::{AddNugetArgs, BuildArgs};
+use crate::cli::{AddNativeArgs, AddNativeFileArgs, AddNugetArgs, BuildArgs};
 use crate::context::Context;
 use crate::{buildstd, mode, overlays};
 
-#[path = "nuget_assets.rs"]
-mod nuget_assets;
-
-/// An SDK-selected runtime asset ready to be copied verbatim into a package.  The path is a
-/// NuGet package-relative path (never a deployment path): keeping it here prevents `pack` from
-/// accidentally applying the executable-directory basename flattening used by `build`/`run`.
-#[derive(Clone, Debug)]
-pub(crate) struct StagedPackageAsset {
-    pub logical_path: String,
-    pub source: PathBuf,
-    pub kind: StagedPackageAssetKind,
-    pub rid: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StagedPackageAssetKind {
-    Runtime,
-    Native,
-    Resource,
-}
+use rust_dotnet_assets as nuget_assets;
+pub(crate) use rust_dotnet_assets::{StagedPackageAsset, StagedPackageAssetKind};
 
 /// The filename of the per-crate `add-nuget` dependency manifest — see [`record_dependency`].
 const DEPS_MANIFEST_FILE: &str = ".cargo-dotnet-nuget-deps.json";
+const LOCAL_NATIVE_MANIFEST_FILE: &str = ".cargo-dotnet-native-files.json";
 
 /// `{package id: version}` for every `add-nuget` package this crate has ever added — read by
 /// `pack` to populate the produced `.nuspec`'s real `<dependency>` entries. A plain JSON map
@@ -71,6 +54,12 @@ const DEPS_MANIFEST_FILE: &str = ".cargo-dotnet-nuget-deps.json";
 struct DepsManifest {
     #[serde(flatten)]
     deps: BTreeMap<String, String>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct LocalNativeManifest {
+    schema: u32,
+    libraries: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// Upsert `{id: version}` into `<crate_dir>/.cargo-dotnet-nuget-deps.json`, creating it if this is
@@ -109,7 +98,65 @@ pub fn recorded_dependencies(crate_dir: &Path) -> Result<Vec<(String, String)>> 
 /// layout.  In particular, `runtimes/<rid>/native/` and culture-resource subdirectories are
 /// deliberately not converted to output-directory filenames here.
 pub(crate) fn staged_package_assets(crate_dir: &Path) -> Result<Vec<StagedPackageAsset>> {
-    nuget_assets::package_assets(crate_dir)
+    let mut assets = nuget_assets::package_assets(crate_dir)?;
+    assets.extend(local_native_assets(crate_dir)?);
+    let mut paths = BTreeMap::<String, PathBuf>::new();
+    for asset in &assets {
+        if let Some(previous) = paths.insert(asset.logical_path.clone(), asset.source.clone())
+            && previous != asset.source
+        {
+            bail!(
+                "native asset collision at {}: {} and {}",
+                asset.logical_path,
+                previous.display(),
+                asset.source.display()
+            );
+        }
+    }
+    Ok(assets)
+}
+
+fn local_native_assets(crate_dir: &Path) -> Result<Vec<StagedPackageAsset>> {
+    let manifest_path = crate_dir.join(LOCAL_NATIVE_MANIFEST_FILE);
+    if !manifest_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let manifest: LocalNativeManifest = serde_json::from_str(
+        &fs::read_to_string(&manifest_path)
+            .with_context(|| format!("reading {}", manifest_path.display()))?,
+    )
+    .with_context(|| format!("parsing {}", manifest_path.display()))?;
+    if manifest.schema != 1 {
+        bail!(
+            "unsupported local native manifest schema {} in {}",
+            manifest.schema,
+            manifest_path.display()
+        );
+    }
+    let mut assets = Vec::new();
+    for rid_paths in manifest.libraries.into_values() {
+        for (rid, relative) in rid_paths {
+            let source = crate_dir.join(&relative);
+            if !source.is_file() {
+                bail!(
+                    "vendored native file is missing: {} (recorded in {})",
+                    source.display(),
+                    manifest_path.display()
+                );
+            }
+            let filename = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("vendored native filename is not UTF-8")?;
+            assets.push(StagedPackageAsset {
+                logical_path: format!("runtimes/{rid}/native/{filename}"),
+                source,
+                kind: StagedPackageAssetKind::Native,
+                rid: Some(rid),
+            });
+        }
+    }
+    Ok(assets)
 }
 
 /// `{id: version}` for every `add-nuget` dependency whose staged runtime closure under
@@ -176,11 +223,21 @@ pub fn ensure_staged(ctx: &Context) -> Result<()> {
     );
     let home = mode::cargo_dotnet_home()?;
     for (id, version) in &missing {
-        let cache_root = home.join("nuget_cache").join(id.to_lowercase()).join(version);
+        let cache_root = home
+            .join("nuget_cache")
+            .join(id.to_lowercase())
+            .join(version);
         fs::create_dir_all(&cache_root)?;
-        // Defaults only — see this fn's doc comment for the `--rid`/`--source` limitation.
-        let resolved =
-            nuget_assets::restore(id, version, &cache_root, None, ctx.dotnet.tfm(), &[])?;
+        // Restore the current host RID by default, matching `add-native` and avoiding a native-only
+        // package's non-RID target graph from staging every platform binary on a fresh clone.
+        let resolved = nuget_assets::restore(
+            id,
+            version,
+            &cache_root,
+            Some(ctx.host.host_rid),
+            ctx.dotnet.tfm(),
+            &[],
+        )?;
         nuget_assets::stage_assets(&ctx.crate_dir, id, &resolved.assets)?;
     }
     // Re-check rather than trusting the restore loop unconditionally: the recorded version is
@@ -281,7 +338,9 @@ pub fn run(args: &AddNugetArgs) -> Result<i32> {
         &args.source,
     )?;
     let (dll, compile_dlls, runtime_dlls) = (
-        resolved.primary_dll,
+        resolved
+            .primary_dll
+            .context("add-nuget: restored package has no managed compile/runtime DLL for net8.0")?,
         resolved.compile_dlls,
         resolved.runtime_dlls,
     );
@@ -390,6 +449,149 @@ pub fn run(args: &AddNugetArgs) -> Result<i32> {
     Ok(0)
 }
 
+/// Restore and stage a native-only package.  This deliberately does not invoke reflection
+/// binding: native packages commonly contain no managed compile assembly.
+pub fn run_native(args: &AddNativeArgs) -> Result<i32> {
+    let dotnet: crate::context::DotnetVersion = args.dotnet.parse().map_err(anyhow::Error::msg)?;
+    let crate_dir = fs::canonicalize(args.path.clone().unwrap_or_else(|| PathBuf::from(".")))?;
+    if !crate_dir.join("Cargo.toml").is_file() {
+        bail!("add-native: not a crate dir: {}", crate_dir.display());
+    }
+    let cache_root = mode::cargo_dotnet_home()?
+        .join("nuget_cache")
+        .join(args.id.to_lowercase())
+        .join(&args.version);
+    fs::create_dir_all(&cache_root)?;
+    let host = crate::host::HostFacts::detect();
+    let rid = args.rid.as_deref().unwrap_or(host.host_rid);
+    let resolved = nuget_assets::restore(
+        &args.id,
+        &args.version,
+        &cache_root,
+        Some(rid),
+        dotnet.tfm(),
+        &[],
+    )?;
+    let native_assets = resolved
+        .assets
+        .iter()
+        .filter(|asset| asset.kind == rust_dotnet_assets::AssetKind::Native)
+        .collect::<Vec<_>>();
+    if native_assets.is_empty() {
+        bail!(
+            "add-native: package {} {} has no native assets",
+            args.id,
+            args.version
+        );
+    }
+    if !native_assets
+        .iter()
+        .any(|asset| native_library_matches(&args.library, &asset.source))
+    {
+        let available = native_assets
+            .iter()
+            .filter_map(|asset| asset.source.file_name()?.to_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "add-native: --library {:?} does not match a selected native file for {rid}; \
+             available: {available}",
+            args.library
+        );
+    }
+    nuget_assets::stage_assets(&crate_dir, &args.id, &resolved.assets)?;
+    // Use the same durable package manifest as managed dependencies so fresh clones auto-restore
+    // this native graph and `cargo dotnet pack` retains the real NuGet dependency.
+    record_dependency(&crate_dir, &args.id, &args.version)?;
+    eprintln!(
+        "== cargo dotnet add-native: staged {} {} for {rid}; declare #[link(name = {:?})] ==",
+        args.id, args.version, args.library
+    );
+    Ok(0)
+}
+
+/// Vendor a local native library under a RID-qualified project path and record it for every
+/// subsequent build, run, test, and pack. Copying rather than retaining an absolute source path
+/// keeps the project reproducible for collaborators and CI.
+pub fn run_native_file(args: &AddNativeFileArgs) -> Result<i32> {
+    let crate_dir = fs::canonicalize(args.path.clone().unwrap_or_else(|| PathBuf::from(".")))?;
+    if !crate_dir.join("Cargo.toml").is_file() {
+        bail!("add-native-file: not a crate dir: {}", crate_dir.display());
+    }
+    let source = fs::canonicalize(&args.file)
+        .with_context(|| format!("resolving native library {}", args.file.display()))?;
+    if !source.is_file() {
+        bail!("add-native-file: not a file: {}", source.display());
+    }
+    if !native_library_matches(&args.library, &source) {
+        bail!(
+            "add-native-file: --library {:?} does not match native filename {}",
+            args.library,
+            source.display()
+        );
+    }
+    let rid = args
+        .rid
+        .as_deref()
+        .unwrap_or_else(|| crate::host::HostFacts::detect().host_rid);
+    let filename = source
+        .file_name()
+        .context("native library has no filename")?;
+    let relative = PathBuf::from("native").join(rid).join(filename);
+    let destination = crate_dir.join(&relative);
+    fs::create_dir_all(destination.parent().expect("vendored file has a parent"))?;
+    if source != destination {
+        fs::copy(&source, &destination).with_context(|| {
+            format!(
+                "vendoring {} -> {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    }
+
+    let manifest_path = crate_dir.join(LOCAL_NATIVE_MANIFEST_FILE);
+    let mut manifest: LocalNativeManifest = if manifest_path.is_file() {
+        serde_json::from_str(&fs::read_to_string(&manifest_path)?)
+            .with_context(|| format!("parsing {}", manifest_path.display()))?
+    } else {
+        LocalNativeManifest {
+            schema: 1,
+            ..Default::default()
+        }
+    };
+    manifest.schema = 1;
+    manifest
+        .libraries
+        .entry(args.library.clone())
+        .or_default()
+        .insert(
+            rid.to_string(),
+            relative.to_string_lossy().replace('\\', "/"),
+        );
+    fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)
+        .with_context(|| format!("writing {}", manifest_path.display()))?;
+    eprintln!(
+        "== cargo dotnet add-native-file: vendored {} for {rid}; declare #[link(name = {:?})] ==",
+        destination.display(),
+        args.library
+    );
+    Ok(0)
+}
+
+pub(crate) fn native_library_matches(logical: &str, path: &Path) -> bool {
+    fn normalized(name: &str) -> &str {
+        let name = name.strip_prefix("lib").unwrap_or(name);
+        name.strip_suffix(".dylib")
+            .or_else(|| name.strip_suffix(".dll"))
+            .or_else(|| name.split_once(".so").map(|(stem, _)| stem))
+            .unwrap_or(name)
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|file| normalized(file).eq_ignore_ascii_case(normalized(logical)))
+}
+
 fn clear_cache_if_forced(cache_root: &Path, force: bool) -> Result<()> {
     if force && cache_root.exists() {
         fs::remove_dir_all(cache_root).with_context(|| {
@@ -408,23 +610,37 @@ fn clear_cache_if_forced(cache_root: &Path, force: bool) -> Result<()> {
 /// for crates that never ran `add-nuget`.
 pub fn copy_assets(crate_dir: &Path, out_dir: &Path) -> Result<()> {
     let assets_dir = crate_dir.join(".cargo-dotnet-nuget-assets");
-    if !assets_dir.is_dir() {
-        return Ok(());
+    if assets_dir.is_dir() && !nuget_assets::copy_staged_assets(crate_dir, out_dir)? {
+        for entry in fs::read_dir(&assets_dir)
+            .with_context(|| format!("reading {}", assets_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let dest = out_dir.join(entry.file_name());
+            fs::copy(&path, &dest)
+                .with_context(|| format!("cp {} -> {}", path.display(), dest.display()))?;
+        }
     }
-    if nuget_assets::copy_staged_assets(crate_dir, out_dir)? {
-        return Ok(());
-    }
-    for entry in
-        fs::read_dir(&assets_dir).with_context(|| format!("reading {}", assets_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
+    let host_rid = crate::host::HostFacts::detect().host_rid;
+    for asset in local_native_assets(crate_dir)? {
+        if asset.rid.as_deref() != Some(host_rid) {
             continue;
         }
-        let dest = out_dir.join(entry.file_name());
-        fs::copy(&path, &dest)
-            .with_context(|| format!("cp {} -> {}", path.display(), dest.display()))?;
+        let filename = asset
+            .source
+            .file_name()
+            .context("vendored native asset has no filename")?;
+        let destination = out_dir.join(filename);
+        fs::copy(&asset.source, &destination).with_context(|| {
+            format!(
+                "copying vendored native asset {} -> {}",
+                asset.source.display(),
+                destination.display()
+            )
+        })?;
     }
     Ok(())
 }
@@ -625,7 +841,9 @@ fn to_snake_ident(id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::clear_cache_if_forced;
+    use super::{
+        clear_cache_if_forced, native_library_matches, run_native_file, staged_package_assets,
+    };
 
     #[test]
     fn force_removes_stale_package_bytes_but_normal_restore_preserves_cache() {
@@ -639,5 +857,53 @@ mod tests {
 
         clear_cache_if_forced(&cache, true).unwrap();
         assert!(!cache.exists());
+    }
+
+    #[test]
+    fn logical_pinvoke_name_matches_platform_library_filenames() {
+        assert!(native_library_matches(
+            "e_sqlite3",
+            std::path::Path::new("libe_sqlite3.dylib")
+        ));
+        assert!(native_library_matches(
+            "e_sqlite3",
+            std::path::Path::new("libe_sqlite3.so.0")
+        ));
+        assert!(native_library_matches(
+            "e_sqlite3",
+            std::path::Path::new("e_sqlite3.dll")
+        ));
+        assert!(!native_library_matches(
+            "sqlite3",
+            std::path::Path::new("e_sqlite3.dll")
+        ));
+    }
+
+    #[test]
+    fn local_native_file_is_vendored_and_projected_to_its_rid() {
+        let temp = tempfile::tempdir().unwrap();
+        let crate_dir = temp.path().join("consumer");
+        std::fs::create_dir_all(&crate_dir).unwrap();
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let source = temp.path().join("libsample.so");
+        std::fs::write(&source, b"native").unwrap();
+        run_native_file(&crate::cli::AddNativeFileArgs {
+            file: source,
+            library: "sample".into(),
+            path: Some(crate_dir.clone()),
+            rid: Some("linux-x64".into()),
+        })
+        .unwrap();
+        let assets = staged_package_assets(&crate_dir).unwrap();
+        assert_eq!(assets.len(), 1);
+        assert_eq!(
+            assets[0].logical_path,
+            "runtimes/linux-x64/native/libsample.so"
+        );
+        assert_eq!(std::fs::read(&assets[0].source).unwrap(), b"native");
     }
 }

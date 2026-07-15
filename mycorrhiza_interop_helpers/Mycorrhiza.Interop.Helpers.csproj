@@ -3,6 +3,9 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <AssemblyName>Mycorrhiza.Interop.Helpers</AssemblyName>
+    <!-- cargo-dotnet redirects bin/obj into its immutable-input-safe cache. Keep any project-local
+         artifacts from an earlier ordinary `dotnet build` excluded after that redirect. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);bin/**;obj/**</DefaultItemExcludes>
     <!-- Must match mycorrhiza::linq::PARAMETER_REBINDER_ASSEMBLY exactly: the Rust interop bridge
          (mycorrhiza/src/linq.rs) resolves this assembly by simple name at runtime (normal
          AssemblyLoadContext probing next to the consuming app's output, no special plumbing).

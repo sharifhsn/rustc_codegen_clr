@@ -1,51 +1,68 @@
-//! Sidecar XML-doc generation for `#[dotnet_export]`.
+//! Sidecar XML-doc generation for Rust-defined managed APIs.
 //!
-//! `dotnet_macros`'s `#[dotnet_export]` expansion scrapes `#[doc = "..."]` attrs off each exported
-//! fn at the consumer's compile time and appends one newline-delimited-JSON entry per fn to
+//! `dotnet_macros` scrapes `#[doc = "..."]` attributes from exports, classes, enums, methods,
+//! properties, constructors, and interfaces at the consumer's compile time and appends one
+//! newline-delimited-JSON entry per documented member to
 //! `<crate_dir>/target/dotnet_xmldoc/<crate_name>.xmldoc.jsonl` (see `dotnet_macros/src/lib.rs`,
-//! `emit_xmldoc_entry`). This module reads that scratch file after a successful build and
+//! `emit_xmldoc_member`). This module reads that scratch file after a successful build and
 //! assembles the standard ECMA-334 `<AssemblyName>.xml` sidecar doc file next to the built DLL —
 //! the mechanism every .NET IDE/IntelliSense already knows how to pick up, with zero `cilly/src`
 //! changes on the codegen side.
-//!
-//! Design reference: `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md`, "Tier C research findings", item 4.
-//!
-//! Known limitation (documented, not solved, in this first slice): the member-ID this module
-//! writes assumes `#[dotnet_export]` always emits directly onto `MainModule` with no
-//! namespace/enclosing-type nesting and no name-shortening — true for the entire marshalling
-//! surface `dotnet_macros` supports today. If `MainModule` is ever partitioned across per-module
-//! classes for size (`cilly/src/ir/il_exporter/partition.rs`) or exported fns gain a
-//! namespace/nesting option, the member-ID derivation in `dotnet_macros::emit_xmldoc_entry` would
-//! need to track that to keep matching the real emitted metadata name exactly.
 
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
 use crate::context::{Context, ManagedIdentity};
 
-/// Preserve proc-macro scratch across incremental builds.
+/// Delete proc-macro scratch before one product build.
 ///
-/// Cargo may reuse a fully compiled crate without invoking `#[dotnet_export]` again. Deleting the
-/// scratch before such a no-op build produced an empty XML contract. `generate` de-duplicates by
-/// member ID, so retaining the append-only inventory is safe for unchanged builds and clean release
-/// builds recreate it from an empty target directory.
-pub fn clear_scratch(_ctx: &Context) {}
-
-/// One scraped doc entry: an exact ECMA-334 member-ID plus its doc-comment body.
-struct Entry {
-    member: String,
-    summary: String,
+/// [`build_id`] is injected into every documentation-producing macro expansion, so Cargo
+/// re-expands the crate after this removal even when the Rust source itself is unchanged. The
+/// human-readable and JSON artifact-locator passes share one build ID; duplicate entries from
+/// those passes are de-duplicated by member ID in [`generate`].
+pub fn clear_scratch(ctx: &Context) {
+    let _ = fs::remove_dir_all(ctx.crate_dir.join("target").join("dotnet_xmldoc"));
 }
 
-/// Parse the tiny escaped-string JSON-object-per-line format `dotnet_macros::emit_xmldoc_entry`
-/// writes: `{"member":"...","summary":"..."}`. Hand-rolled to avoid a `serde_json` dependency for
-/// two fields with a fixed, macro-controlled shape.
+/// One token for all Cargo passes launched by this driver process.
+///
+/// Macro expansions include `option_env!("RCL_XMLDOC_BUILD_ID")`, so Cargo records this value as
+/// an input and re-expands the crate after `clear_scratch`, even when no Rust source changed. The
+/// normal build and JSON artifact-locator pass share the same token and therefore do not rebuild
+/// each other.
+pub fn build_id() -> &'static str {
+    static BUILD_ID: OnceLock<String> = OnceLock::new();
+    BUILD_ID.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("{}-{nanos}", std::process::id())
+    })
+}
+
+/// One scraped doc entry: an exact ECMA-334 member-ID plus a macro-generated, escaped XML body.
+struct Entry {
+    member: String,
+    xml: String,
+}
+
+/// Parse the tiny escaped-string JSON-object-per-line format `dotnet_macros::emit_xmldoc_member`
+/// writes: `{"member":"...","xml":"..."}`. Hand-rolled to avoid a `serde_json` dependency for
+/// two fields with a fixed, macro-controlled shape; the legacy `summary` field remains readable.
 fn parse_line(line: &str) -> Option<Entry> {
     let member = extract_field(line, "member")?;
-    let summary = extract_field(line, "summary")?;
-    Some(Entry { member, summary })
+    let xml = extract_field(line, "xml").or_else(|| {
+        // Read scratch retained from SDK versions that only recorded a summary. This matters for
+        // incremental builds where Cargo may not re-run the proc macro.
+        extract_field(line, "summary")
+            .map(|summary| format!("<summary>{}</summary>", xml_escape(&summary)))
+    })?;
+    Some(Entry { member, xml })
 }
 
 fn extract_field(line: &str, key: &str) -> Option<String> {
@@ -81,6 +98,28 @@ fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_line;
+
+    #[test]
+    fn parses_structured_xml_entries() {
+        let entry = parse_line(
+            r#"{"member":"M:MainModule.Compute(System.Int32)","xml":"<summary>Compute</summary>\n<param name=\"value\">Input</param>"}"#,
+        )
+        .unwrap();
+        assert_eq!(entry.member, "M:MainModule.Compute(System.Int32)");
+        assert!(entry.xml.contains("<param name=\"value\">Input</param>"));
+    }
+
+    #[test]
+    fn upgrades_legacy_summary_entries_without_trusting_their_text_as_xml() {
+        let entry = parse_line(r#"{"member":"M:MainModule.Legacy","summary":"uses <old> & text"}"#)
+            .unwrap();
+        assert_eq!(entry.xml, "<summary>uses &lt;old&gt; &amp; text</summary>");
+    }
 }
 
 /// Read `<crate_dir>/target/dotnet_xmldoc/<crate_name>.xmldoc.jsonl` (if present) and write the
@@ -139,9 +178,9 @@ pub fn generate(
             |suffix| format!("M:{public_type}.{suffix}"),
         );
         xml.push_str(&format!(
-            "<member name=\"{}\">\n<summary>{}</summary>\n</member>\n",
+            "<member name=\"{}\">\n{}\n</member>\n",
             xml_escape(&member),
-            xml_escape(&e.summary)
+            e.xml
         ));
     }
     xml.push_str("</members>\n</doc>\n");

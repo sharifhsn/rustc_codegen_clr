@@ -37,7 +37,7 @@ use zip::{CompressionMethod, ZipWriter};
 use crate::artifact::{self, Artifact};
 use crate::cli::{BuildArgs, PackArgs};
 use crate::context::Context;
-use crate::{buildstd, interop_helpers, nuget, overlays, provenance};
+use crate::{buildstd, interop_helpers, nuget, overlays, provenance, xmldoc};
 
 pub fn run(args: &PackArgs) -> Result<i32> {
     // Build a BuildArgs view so we reuse the same Context resolution + stage pipeline.
@@ -69,16 +69,14 @@ pub fn run(args: &PackArgs) -> Result<i32> {
         .first()
         .context("pack: no package in cargo metadata")?;
     let assembly_name = ctx
-        .managed_identity
-        .as_ref()
+        .managed_identity()
         .map(|identity| identity.assembly_name.clone())
         .unwrap_or_else(|| pkg.name.clone());
     let name = args
         .id
         .clone()
         .or_else(|| {
-            ctx.managed_identity
-                .as_ref()
+            ctx.managed_identity()
                 .map(|identity| identity.package_id.clone())
         })
         .unwrap_or_else(|| pkg.name.clone());
@@ -114,6 +112,7 @@ pub fn run(args: &PackArgs) -> Result<i32> {
 
     // ---- build the cdylib via the SAME native pipeline ----
     let _build_lock = crate::build_lock::BuildLock::acquire_crate(&ctx)?;
+    xmldoc::clear_scratch(&ctx);
     let private_sysroot = crate::private_sysroot::prepare(&ctx)?;
     overlays::apply(&ctx)?;
     let json = buildstd::build_with_sysroot(&ctx, &private_sysroot)?;

@@ -3,7 +3,7 @@
 //!      passthrough primitive `T`), not just returns.
 //!   2. `#[dotnet_methods]` instance/static methods now go through the SAME marshalling table, so a
 //!      class method can take `&str`/`String`/`Option<T>`/`Vec<T>` directly instead of hand-marshalling
-//!      `MString`/`Nullable<T>`/a `RustVec<T>` handle.
+//!      `MString`/`Nullable<T>`/a container handle.
 //!   3. A C# `Action`/`Func`/`Comparison` parameter crosses as its real managed delegate handle and
 //!      is reconstructed as an invokable `mycorrhiza::delegate` wrapper inside Rust.
 #![feature(adt_const_params, unsized_const_params)]
@@ -12,10 +12,6 @@
 use dotnet_macros::{dotnet_class, dotnet_enum, dotnet_export, dotnet_methods};
 use mycorrhiza::delegate::{Action1, Action2, Action3, Comparison, Func1, Func2, Func3};
 use mycorrhiza::system::{DotNetString, MString};
-
-// Needed for the `Vec<T>` param arm's `rcl_vec_len`/`rcl_vec_get` calls (both param- and
-// method-side), matching the existing `Vec<T>` RETURN arm's requirement.
-mycorrhiza::export_rust_containers!();
 
 // ---- Rust-defined enum -> genuine CLR enum + automatic export marshalling ----------------
 
@@ -45,7 +41,7 @@ pub fn double_if_present(n: Option<i32>) -> Option<i32> {
     n.map(|v| v * 2)
 }
 
-// ---- #[dotnet_export]: Vec<T> now marshals INBOUND too (previously return-only) ----
+// ---- #[dotnet_export]: Vec<T> is a normal managed T[] inbound -----------------------------
 
 #[dotnet_export]
 pub fn sum_vec(xs: Vec<i32>) -> i32 {

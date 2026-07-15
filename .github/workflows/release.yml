@@ -52,6 +52,11 @@ jobs:
           set -euo pipefail
           cargo build --release --workspace
           cargo +stable build --release --manifest-path tools/cargo-dotnet/Cargo.toml
+      - name: Run host-native P/Invoke acceptances
+        shell: bash
+        run: |
+          bash feasibility/pinvoke_acceptance.sh
+          bash feasibility/pinvoke_async_callback_acceptance.sh
       - name: Stage, build, and install-test SDK bundle
         shell: bash
         env:

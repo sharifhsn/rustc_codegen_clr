@@ -387,6 +387,13 @@ impl<'a> Emitter<'a> {
                 self.emit_node(index);
                 self.push_u8(0x9A); // ldelem.ref
             }
+            CILNode::LdElem { array, index, elem } => {
+                self.emit_node(array);
+                self.emit_node(index);
+                let tok = self.tokens.type_token(self.asm, self.asm[elem]);
+                self.push_u8(0xA3); // ldelem <typeTok>
+                self.push_token(tok);
+            }
             CILNode::UnboxAny { object, tpe } => {
                 self.emit_node(object);
                 let tpe_val = self.asm[tpe];

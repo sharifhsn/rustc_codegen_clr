@@ -56,7 +56,7 @@ use super::body::{self, AssembledBody};
 use super::pe::{self, PeOptions};
 use super::sig;
 use super::tables::TokenSink;
-use super::tables::{MetadataBuilder, Token};
+use super::tables::{MetadataBuilder, MethodNullability, Token};
 use crate::DotnetRuntime;
 use crate::Interned;
 use crate::ir::class::StaticFieldDef;
@@ -461,7 +461,10 @@ pub(crate) fn export_pe_with_source_link(
             let mut blob = Vec::new();
             sig::encode_field_sig(tpe, asm, &mut mb, &mut blob);
             let sig_off = mb.blobs.intern(&blob);
-            mb.add_field(&name_str, sig_off, offset);
+            let field = mb.add_field(&name_str, sig_off, offset);
+            for attribute in class_def.field_custom_attributes(name, false) {
+                mb.add_custom_attribute(asm, field, attribute);
+            }
         }
         for StaticFieldDef {
             tpe,
@@ -475,12 +478,10 @@ pub(crate) fn export_pe_with_source_link(
             let mut blob = Vec::new();
             sig::encode_field_sig(*tpe, asm, &mut mb, &mut blob);
             let sig_off = mb.blobs.intern(&blob);
-            match default_value {
+            let field = match default_value {
                 // No RVA data needed — the common case (`static mut`-shaped fields with no
                 // compile-time initializer).
-                None => {
-                    mb.add_static_field(&name_str, sig_off, None, *is_tls, *is_const);
-                }
+                None => mb.add_static_field(&name_str, sig_off, None, *is_tls, *is_const),
                 Some(cst) => {
                     // Scalar default values (§II.22.18's `FieldRVA`, `il_exporter`'s `.data cil
                     // C_N` + `at C_N` pairing, mod.rs:225-325 — the semantic oracle for both which
@@ -502,7 +503,11 @@ pub(crate) fn export_pe_with_source_link(
                         *is_const,
                     );
                     pending_field_rva.push((tok, bytes));
+                    tok
                 }
+            };
+            for attribute in class_def.field_custom_attributes(*name, true) {
+                mb.add_custom_attribute(asm, field, attribute);
             }
         }
 
@@ -662,8 +667,15 @@ pub(crate) fn export_pe_with_source_link(
             let pinvoke_owned = match method.resolved_implementation(asm) {
                 crate::ir::MethodImpl::Extern {
                     lib,
+                    entry_point,
+                    call_conv,
                     preserve_errno,
-                } => Some((asm[*lib].to_string(), *preserve_errno)),
+                } => Some((
+                    asm[*lib].to_string(),
+                    entry_point.map(|name| asm[name].to_string()),
+                    *call_conv,
+                    *preserve_errno,
+                )),
                 _ => None,
             };
             let mut blob = Vec::new();
@@ -756,9 +768,12 @@ pub(crate) fn export_pe_with_source_link(
                 .iter()
                 .map(|n| n.map(|interned| &asm[interned]))
                 .collect();
-            let pinvoke_ref = pinvoke_owned
-                .as_ref()
-                .map(|(lib, preserve)| (lib.as_str(), *preserve));
+            let pinvoke_ref =
+                pinvoke_owned
+                    .as_ref()
+                    .map(|(lib, entry_point, call_conv, preserve)| {
+                        (lib.as_str(), entry_point.as_deref(), *call_conv, *preserve)
+                    });
             // Mirrors `il_exporter`'s `aggressiveinlining` JIT hint (mod.rs:455-469): small leaf
             // bodies (e.g. the `cast_f64_u32`-style saturating float->int cast helpers
             // `cilly::ir::builtins::casts` synthesizes, or monomorphized closure/iterator-adapter
@@ -777,8 +792,21 @@ pub(crate) fn export_pe_with_source_link(
             // `[out]` Param flags (`MethodDef::out_params`, from `#[dotnet_out]`): 1-based
             // Sequence numbers among the receiver-stripped `param_names`, exactly the numbering
             // `add_method`'s Param-row loop uses — no re-indexing needed.
-            let tok = mb.add_method(
+            let nullability = method.nullable_context().map(|context| {
+                debug_assert_eq!(
+                    method.param_nullability().len(),
+                    param_names.len(),
+                    "nullable flags must be parallel to receiver-stripped Param rows"
+                );
+                MethodNullability {
+                    context,
+                    return_flag: method.return_nullability(),
+                    parameter_flags: method.param_nullability(),
+                }
+            });
+            let tok = mb.add_method_with_access(
                 &name,
+                *method.access(),
                 sig_off,
                 &param_names,
                 method.out_params(),
@@ -787,6 +815,14 @@ pub(crate) fn export_pe_with_source_link(
                 is_ctor,
                 pinvoke_ref,
                 aggressive_inline,
+                nullability,
+            );
+            mb.add_method_custom_attributes(
+                asm,
+                tok,
+                method.custom_attributes(),
+                method.return_custom_attributes(),
+                method.param_custom_attributes(),
             );
             mb.register_method_def(method_id, tok);
             // One method-owned `GenericParam` row (§II.22.20, coded `TypeOrMethodDef` owner tag
@@ -900,7 +936,13 @@ pub(crate) fn export_pe_with_source_link(
                 mb.method_def_token(MethodDefIdx::from_raw(s))
                     .expect("property setter must be a MethodDef registered in pass 3")
             });
-            mb.add_property(class_tok, &name, sig_off, getter_tok, setter_tok);
+            let property = mb.add_property(class_tok, &name, sig_off, getter_tok, setter_tok);
+            if let Some(flag) = prop.nullability() {
+                mb.mark_property_nullable(property, flag);
+            }
+            for attribute in prop.custom_attributes() {
+                mb.add_custom_attribute(asm, property, attribute);
+            }
         }
     }
 
@@ -2210,6 +2252,8 @@ mod tests {
             MethodKind::Static,
             MethodImpl::Extern {
                 lib: libc_name,
+                entry_point: None,
+                call_conv: crate::ir::PInvokeCallConv::Cdecl,
                 preserve_errno: false,
             },
             vec![None],

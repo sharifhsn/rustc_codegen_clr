@@ -41,6 +41,44 @@ const CORELIB: &str = "System.Private.CoreLib";
 /// `GetEnumerator` dispatches with `callvirt`.
 pub type IEnumerable<T> =
     RustcCLRInteropManagedGeneric<{ CORELIB }, "System.Collections.Generic.IEnumerable", (T,)>;
+
+/// Coroutine-safe root for any `IEnumerable<T>` implementation.
+///
+/// Iteration itself is synchronous: do not retain the returned [`Enumerator`] across an `.await`.
+/// The enumerable owner may safely live in async state and can create a fresh iterator after each
+/// suspension point.
+pub struct ManagedEnumerable<T> {
+    root: crate::class::GenericClass<CORELIB, "System.Collections.Generic.IEnumerable", (T,)>,
+}
+
+impl<T> ManagedEnumerable<T> {
+    pub fn from_raw(enumerable: IEnumerable<T>) -> Self {
+        Self {
+            root: crate::class::GenericClass::from_naked_ref(enumerable),
+        }
+    }
+
+    #[inline(never)]
+    fn raw(&self) -> IEnumerable<T> {
+        unsafe { self.root.get_naked_ref() }
+    }
+
+    pub fn into_raw(self) -> IEnumerable<T> {
+        self.raw()
+    }
+
+    pub fn iter(&self) -> Enumerator<T> {
+        self.iter_enumerator()
+    }
+}
+
+impl<T> Clone for ManagedEnumerable<T> {
+    fn clone(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+        }
+    }
+}
 /// Generic `IEnumerator<T>` handle — `get_Current()` on this returns the element `!0`.
 type IEnumeratorGeneric<T> =
     RustcCLRInteropManagedGeneric<{ CORELIB }, "System.Collections.Generic.IEnumerator", (T,)>;
@@ -249,5 +287,11 @@ pub trait Enumerable<T> {
                 IEnumeratorNonGeneric,
             >(base);
         Enumerator { base, typed }
+    }
+}
+
+impl<T> Enumerable<T> for ManagedEnumerable<T> {
+    fn enumerable_handle(&self) -> IEnumerable<T> {
+        self.raw()
     }
 }

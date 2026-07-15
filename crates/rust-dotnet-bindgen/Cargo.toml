@@ -1,0 +1,11 @@
+[package]
+name = "rust-dotnet-bindgen"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "C-header binding generation for cargo-dotnet P/Invoke projects"
+
+[dependencies]
+anyhow = "1"
+bindgen = { version = "0.72.1", default-features = false, features = ["prettyplease", "runtime"] }
+

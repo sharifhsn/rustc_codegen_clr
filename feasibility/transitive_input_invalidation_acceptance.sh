@@ -11,7 +11,7 @@ project="$fixture/csharp/FixtureConsumer.csproj"
 crate="$fixture/rustlib"
 dep_source="$crate/deps/fixture_dep/src/lib.rs"
 build_input="$crate/build-input.txt"
-driver="$repo/tools/cargo-dotnet/target/release/cargo-dotnet"
+driver="$repo/target/release/cargo-dotnet"
 log_dir="${RCL_TRANSITIVE_INPUT_LOG_DIR:-/tmp/rustc_codegen_clr-transitive-inputs}"
 
 if [[ ! -x "$driver" ]]; then

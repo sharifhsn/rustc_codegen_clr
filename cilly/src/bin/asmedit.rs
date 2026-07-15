@@ -123,6 +123,7 @@ fn main() {
                 let access = match access {
                     "extern" => Access::Extern,
                     "priv" | "private" => Access::Private,
+                    "asm" | "assembly" | "internal" => Access::Assembly,
                     "pub" | "public" => Access::Public,
                     _ => {
                         eprintln!("Unknown accessibility {access:?}");
@@ -240,6 +241,7 @@ fn main() {
                         MethodImpl::Extern {
                             lib,
                             preserve_errno,
+                            ..
                         } => {
                             let lib = &asm[*lib];
                             eprintln!(
@@ -267,6 +269,7 @@ fn main() {
                 let access = match access {
                     "extern" => Access::Extern,
                     "priv" | "private" => Access::Private,
+                    "asm" | "assembly" | "internal" => Access::Assembly,
                     "pub" | "public" => Access::Public,
                     _ => {
                         eprintln!("Unknown accessibility {access:?}");

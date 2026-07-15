@@ -13,7 +13,7 @@ use crate::rustflags::normalize_producer_binary;
 
 use crate::artifact::Artifact;
 use crate::context::Context;
-use crate::context::ManagedIdentity;
+use crate::context::ManagedProjectConfig;
 use crate::private_sysroot::PrivateSysroot;
 
 #[derive(Serialize)]
@@ -71,6 +71,8 @@ struct ManagedIdentityReceipt {
     root_namespace: String,
     module_type: String,
     legacy_main_module: bool,
+    public_namespaces: Vec<String>,
+    compatibility_profile: String,
 }
 
 pub fn write(
@@ -103,7 +105,7 @@ pub fn write(
         artifact: file_identity(artifact_path)?,
         pdb: sidecar_identity(artifact_path, "pdb")?,
         xml_docs: sidecar_identity(artifact_path, "xml")?,
-        managed_identity: ctx.managed_identity.as_ref().map(identity_receipt),
+        managed_identity: ctx.managed_project.as_ref().map(identity_receipt),
         local_input_closure: input_closure_identity(ctx)?,
     };
     let path = PathBuf::from(format!(
@@ -153,7 +155,8 @@ fn input_closure_identity(ctx: &Context) -> Result<Option<InputClosureIdentity>>
     }))
 }
 
-fn identity_receipt(identity: &ManagedIdentity) -> ManagedIdentityReceipt {
+fn identity_receipt(project: &ManagedProjectConfig) -> ManagedIdentityReceipt {
+    let identity = &project.identity;
     ManagedIdentityReceipt {
         schema: identity.schema,
         package_id: identity.package_id.clone(),
@@ -161,6 +164,8 @@ fn identity_receipt(identity: &ManagedIdentity) -> ManagedIdentityReceipt {
         root_namespace: identity.root_namespace.clone(),
         module_type: identity.module_type.clone(),
         legacy_main_module: identity.legacy_main_module,
+        public_namespaces: project.public_namespaces.clone(),
+        compatibility_profile: project.compatibility_profile.clone(),
     }
 }
 

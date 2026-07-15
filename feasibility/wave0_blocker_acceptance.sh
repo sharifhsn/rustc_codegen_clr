@@ -24,7 +24,7 @@ bash "$repo/feasibility/transitive_input_invalidation_acceptance.sh" \
     > "$log_dir/typed-dto.log" 2>&1
 
 CARGO_DOTNET_BACKEND=native \
-    "$repo/tools/cargo-dotnet/target/release/cargo-dotnet" \
+    "$repo/target/release/cargo-dotnet" \
     build "$repo/cargo_tests/cd_typed_dto/rustlib" \
     >> "$log_dir/typed-dto.log" 2>&1
 dotnet run --project "$repo/cargo_tests/cd_typed_dto/csharp/cd_typed_dto_cs.csproj" \

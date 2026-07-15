@@ -74,8 +74,13 @@ rlibs, merges them, patches in libc / intrinsic implementations, and emits the f
   the remainder is mostly *types* and *static data*. *(v0.1.1)*
 - **Command-line arguments** — the single hardest GSoC task; Rust uses the GNU `.init` section to grab
   argv, emulated via .NET static constructors (`.cctor`) on the `RustModule` class. *(v0.1.2, v0.2.0)*
-- **Native-library P/Invoke** generation (`native_passtrough.rs`, gated by
-  `NATIVE_PASSTHROUGH`; the historical misspelling remains an alias). *(v0.1.1)*
+- **Native-library P/Invoke** — the backend records ordinary Rust `#[link]` foreign functions as
+  artifact metadata; missing-method resolution turns them into `MethodImpl::Extern`, and both PE
+  and IL exporters emit the library, entry point, calling convention, and last-error policy.
+  `rust-dotnet-bindgen` generates those declarations from C headers, while
+  `rust-dotnet-pinvoke` supplies explicit marshalling, ownership, and callback helpers; neither
+  changes the compiler contract. The older `native_passtrough.rs` GCC/`nm` experiment is separate
+  and not the public path.
 
 ## 5. How Rust constructs map to .NET (and the gotchas)
 

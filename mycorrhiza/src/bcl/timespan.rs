@@ -192,6 +192,11 @@ impl DotNetTimeSpan {
         self.0
     }
 
+    /// Wrap a raw managed `System.TimeSpan` value returned by another BCL API.
+    pub fn from_raw(handle: Handle) -> Self {
+        Self(handle)
+    }
+
     /// Shared spelling of a `TimeSpan`-in, `TimeSpan`-out value-type instance method
     /// (`Add`/`Subtract`): `call instance` on the `valuetype` receiver, argument by value.
     #[inline(always)]

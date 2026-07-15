@@ -19,7 +19,8 @@ use super::heaps::{BlobHeap, GuidHeap, StringsHeap, UserStringHeap, write_compre
 use super::sig::{self, TypeDefOrRefResolver};
 use crate::DotnetRuntime;
 use crate::ir::{
-    Assembly, ClassRef, Const, FieldDesc, Interned, MethodDefIdx, StaticFieldDesc, Type,
+    Assembly, ClassRef, Const, FieldDesc, Interned, MethodDefIdx, PInvokeCallConv, StaticFieldDesc,
+    Type,
 };
 use std::collections::HashMap;
 
@@ -178,6 +179,15 @@ struct MethodDefRow {
     name: u32,
     signature: u32,
     param_list: u32,
+}
+
+/// Nullable-reference metadata attached while one `MethodDef` and its `Param` rows are emitted.
+/// Parameter flags are receiver-stripped and parallel to `add_method`'s `param_names` slice.
+#[derive(Clone, Copy)]
+pub struct MethodNullability<'a> {
+    pub context: u8,
+    pub return_flag: Option<u8>,
+    pub parameter_flags: &'a [Option<u8>],
 }
 
 struct ParamRow {
@@ -497,6 +507,7 @@ const SORTED_TABLES: &[u32] = &[
 // directly for primitive/string FixedArgs and NamedArg FieldOrPropTypes (no boxing needed since
 // this backend never emits an `Object`-typed ctor/property parameter).
 const ATTR_ELEM_BOOLEAN: u8 = 0x02;
+const ATTR_ELEM_U1: u8 = 0x05;
 const ATTR_ELEM_I4: u8 = 0x08;
 const ATTR_ELEM_I8: u8 = 0x0A;
 const ATTR_ELEM_STRING: u8 = 0x0E;
@@ -526,6 +537,7 @@ fn encode_custom_attr_fixed_arg(
             out.extend_from_slice(text.as_bytes());
         }
         crate::ir::class::CustomAttrArg::Bool(b) => out.push(u8::from(*b)),
+        crate::ir::class::CustomAttrArg::U8(value) => out.push(*value),
         crate::ir::class::CustomAttrArg::I32(i) => out.extend_from_slice(&i.to_le_bytes()),
         crate::ir::class::CustomAttrArg::I64(i) => out.extend_from_slice(&i.to_le_bytes()),
     }
@@ -943,7 +955,8 @@ impl MetadataBuilder {
     }
 
     /// Adds a `MethodDef` row (§II.22.26) to the most recently added `TypeDef`, plus its `Param`
-    /// rows (§II.22.33, one per named argument — mirrors `MethodDef::arg_names()`). The body RVA
+    /// rows (§II.22.33, one per named argument, plus Sequence 0 when return metadata is needed).
+    /// Argument rows mirror `MethodDef::arg_names()`. The body RVA
     /// is unknown until `body.rs` assembles bytes and `pe.rs` lays them out, so it starts at 0
     /// and must be patched via [`MetadataBuilder::set_method_body_rva`] before `serialize()`.
     ///
@@ -964,8 +977,42 @@ impl MetadataBuilder {
         is_static: bool,
         is_virtual: bool,
         is_ctor: bool,
-        pinvoke: Option<(&str, bool)>,
+        pinvoke: Option<(&str, Option<&str>, PInvokeCallConv, bool)>,
         aggressive_inline: bool,
+        nullability: Option<MethodNullability<'_>>,
+    ) -> Token {
+        self.add_method_with_access(
+            name,
+            crate::Access::Public,
+            signature_blob,
+            param_names,
+            out_params,
+            is_static,
+            is_virtual,
+            is_ctor,
+            pinvoke,
+            aggressive_inline,
+            nullability,
+        )
+    }
+
+    /// Accessibility-aware counterpart to [`Self::add_method`]. Most synthetic metadata helpers
+    /// intentionally emit public methods and use the convenience wrapper; assembly export routes
+    /// real [`MethodDef`](crate::MethodDef) accessibility through this entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_method_with_access(
+        &mut self,
+        name: &str,
+        access: crate::Access,
+        signature_blob: u32,
+        param_names: &[Option<&str>],
+        out_params: &[u16],
+        is_static: bool,
+        is_virtual: bool,
+        is_ctor: bool,
+        pinvoke: Option<(&str, Option<&str>, PInvokeCallConv, bool)>,
+        aggressive_inline: bool,
+        nullability: Option<MethodNullability<'_>>,
     ) -> Token {
         // §II.23.1.10 `MethodAttributes`: the low 3 bits are `MemberAccessMask`, numbered
         // identically to `FieldAttributes::FieldAccessMask` (see `add_field`'s doc) —
@@ -988,7 +1035,11 @@ impl MetadataBuilder {
         // (and only then type-loaded, tripping this check) once `thread::spawn` first runs — this
         // is why simpler probes with no virtual dispatch never hit it, and why the failure surfaced
         // as "abstract method" arbitrarily far from the actual defect site in the stack trace.
-        let mut flags: u16 = 0x6; // public
+        let mut flags: u16 = match access {
+            crate::Access::Private => 0x1,
+            crate::Access::Assembly | crate::Access::InternalExtern => 0x3,
+            crate::Access::Extern | crate::Access::Public => 0x6,
+        };
         if is_static {
             flags |= 0x10;
         }
@@ -1027,6 +1078,28 @@ impl MetadataBuilder {
         });
         let rid = u32::try_from(self.method_def.len()).unwrap();
         let tok = Token::new(Token::TABLE_METHOD_DEF, rid);
+        if let Some(nullability) = nullability {
+            assert!(
+                matches!(nullability.context, 1 | 2),
+                "nullable context must be 1 or 2"
+            );
+            assert_eq!(
+                nullability.parameter_flags.len(),
+                param_names.len(),
+                "nullable parameter flags must be parallel to receiver-stripped Param rows"
+            );
+            self.nullable_metadata_attribute(tok, nullability.context, true);
+            if let Some(flag) = nullability.return_flag {
+                self.param.push(ParamRow {
+                    flags: 0,
+                    sequence: 0,
+                    name: 0,
+                });
+                let return_param =
+                    Token::new(Token::TABLE_PARAM, u32::try_from(self.param.len()).unwrap());
+                self.nullable_metadata_attribute(return_param, flag, false);
+            }
+        }
         for (i, pname) in param_names.iter().enumerate() {
             let sequence = u16::try_from(i + 1).unwrap();
             let name_off = pname.map_or(0, |n| self.strings.intern(n));
@@ -1042,17 +1115,31 @@ impl MetadataBuilder {
                 sequence,
                 name: name_off,
             });
+            if let Some(nullable_flag) =
+                nullability.and_then(|metadata| metadata.parameter_flags[i])
+            {
+                let param =
+                    Token::new(Token::TABLE_PARAM, u32::try_from(self.param.len()).unwrap());
+                self.nullable_metadata_attribute(param, nullable_flag, false);
+            }
         }
-        if let Some((lib, preserve_errno)) = pinvoke {
+        if let Some((lib, entry_point, call_conv, preserve_errno)) = pinvoke {
             let module_ref = self.intern_module_ref(lib);
-            // §II.23.1.7 `PInvokeAttributes`: 0x1 NoMangle | 0x4 CharSetAnsi | cdecl (0x200) |
+            // §II.23.1.7 `PInvokeAttributes`: 0x1 NoMangle | 0x4 CharSetAnsi | call convention |
             // (0x40 SupportsLastError when `preserve_errno`) — mirrors `il_exporter`'s
-            // `pinvokeimpl("<lib>" cdecl [lasterr])` rendering.
-            let mut mapping_flags: u16 = 0x1 | 0x4 | 0x200;
+            // `pinvokeimpl("<lib>" <convention> [lasterr])` rendering.
+            let convention = match call_conv {
+                PInvokeCallConv::Winapi => 0x100,
+                PInvokeCallConv::Cdecl => 0x200,
+                PInvokeCallConv::Stdcall => 0x300,
+                PInvokeCallConv::Thiscall => 0x400,
+                PInvokeCallConv::Fastcall => 0x500,
+            };
+            let mut mapping_flags: u16 = 0x1 | 0x4 | convention;
             if preserve_errno {
                 mapping_flags |= 0x40;
             }
-            let import_name = self.strings.intern(name);
+            let import_name = self.strings.intern(entry_point.unwrap_or(name));
             self.impl_map.push(ImplMapRow {
                 mapping_flags,
                 member_forwarded: encode_member_forwarded(tok),
@@ -1061,6 +1148,44 @@ impl MetadataBuilder {
             });
         }
         tok
+    }
+
+    /// Emit compiler-recognized nullable metadata on a method or Param row.
+    fn nullable_metadata_attribute(&mut self, parent: Token, flag: u8, context: bool) -> Token {
+        assert!(
+            matches!(flag, 1 | 2),
+            "nullable metadata flag must be 1 or 2"
+        );
+        let scope = self.system_runtime_assembly_ref();
+        let attribute_name = if context {
+            "NullableContextAttribute"
+        } else {
+            "NullableAttribute"
+        };
+        let type_ref = self.type_ref(
+            Some(scope),
+            "System.Runtime.CompilerServices",
+            attribute_name,
+        );
+        let ctor_signature = {
+            let mut signature = Vec::new();
+            signature.push(sig::SIG_HASTHIS);
+            write_compressed_u32(&mut signature, 1);
+            signature.push(0x01); // ELEMENT_TYPE_VOID
+            signature.push(ATTR_ELEM_U1);
+            self.blobs.intern(&signature)
+        };
+        let ctor = self.member_ref(type_ref, ".ctor", ctor_signature);
+        let value = self.blobs.intern(&[0x01, 0x00, flag, 0x00, 0x00]);
+        self.custom_attribute.push(CustomAttributeRow {
+            parent: encode_has_custom_attribute(parent),
+            ctor: encode_custom_attribute_type(ctor),
+            value,
+        });
+        Token::new(
+            Token::TABLE_CUSTOM_ATTRIBUTE,
+            u32::try_from(self.custom_attribute.len()).unwrap(),
+        )
     }
 
     /// Finds-or-creates the `ModuleRef` row for `lib` (§II.22.31), used by `pinvokeimpl` methods.
@@ -1395,7 +1520,7 @@ impl MetadataBuilder {
         sig_blob: u32,
         getter: Option<Token>,
         setter: Option<Token>,
-    ) {
+    ) -> Token {
         assert_eq!(
             class.table(),
             Token::TABLE_TYPE_DEF,
@@ -1439,7 +1564,8 @@ impl MetadataBuilder {
             signature: sig_blob,
         });
         let property_rid = u32::try_from(self.property.len()).unwrap();
-        let association = encode_has_semantics(Token::new(Token::TABLE_PROPERTY, property_rid));
+        let property = Token::new(Token::TABLE_PROPERTY, property_rid);
+        let association = encode_has_semantics(property);
         // §II.23.1.12 MethodSemantics.Semantics: 0x2 Getter, 0x1 Setter.
         if let Some(g) = getter {
             self.method_semantics.push(MethodSemanticsRow {
@@ -1455,10 +1581,17 @@ impl MetadataBuilder {
                 association,
             });
         }
+        property
     }
 
-    /// Emits the **only** custom attribute this backend produces: a bare
-    /// `[ThreadStaticAttribute]` (`System.ThreadStaticAttribute::.ctor()`) on a static field,
+    /// Attach an explicit compiler-recognized nullable-reference flag to a Property row.
+    pub fn mark_property_nullable(&mut self, property: Token, flag: u8) {
+        assert_eq!(property.table(), Token::TABLE_PROPERTY);
+        self.nullable_metadata_attribute(property, flag, false);
+    }
+
+    /// Emits the dedicated bare `[ThreadStaticAttribute]`
+    /// (`System.ThreadStaticAttribute::.ctor()`) on a static field,
     /// mirroring `il_exporter`'s `.custom instance void
     /// [System.Runtime]System.ThreadStaticAttribute::.ctor() = (01 00 00 00)` (the fixed 4-byte
     /// `01 00 00 00` prolog+zero-named-args blob, §II.23.3). `field` is the owning `Field` row's
@@ -1491,9 +1624,8 @@ impl MetadataBuilder {
     /// `MemberRef` (a HASTHIS signature shaped by `attr.ctor_args()`'s element types), and
     /// assembles a well-formed `CustomAttrib` blob (prolog `0x0001`, one `FixedArg` per ctor arg
     /// in order, `NumNamed`, then one `NamedArg` per named property arg) per §II.23.3. `parent` is
-    /// the target row's own token (`HasCustomAttribute` coded index, §II.24.2.6) — a `TypeDef` for
-    /// the type-level attributes this is wired up for today, though `encode_has_custom_attribute`
-    /// accepts several other target kinds too.
+    /// the target row's own token (`HasCustomAttribute` coded index, §II.24.2.6): TypeDef,
+    /// MethodDef, Field, Property, or Param (including return Sequence 0).
     ///
     /// Every arg shape [`crate::ir::class::CustomAttrArg`] can express (`Str`/`Bool`/`I32`/`I64`)
     /// encodes to a FIXED number of bytes with no length ambiguity, so this function can never
@@ -1510,6 +1642,7 @@ impl MetadataBuilder {
             match v {
                 crate::ir::class::CustomAttrArg::Str(_) => ATTR_ELEM_STRING,
                 crate::ir::class::CustomAttrArg::Bool(_) => ATTR_ELEM_BOOLEAN,
+                crate::ir::class::CustomAttrArg::U8(_) => ATTR_ELEM_U1,
                 crate::ir::class::CustomAttrArg::I32(_) => ATTR_ELEM_I4,
                 crate::ir::class::CustomAttrArg::I64(_) => ATTR_ELEM_I8,
             }
@@ -1548,6 +1681,65 @@ impl MetadataBuilder {
         });
         let rid = u32::try_from(self.custom_attribute.len()).unwrap();
         Token::new(Token::TABLE_CUSTOM_ATTRIBUTE, rid)
+    }
+
+    /// Attach structured attributes to a MethodDef and its return/argument Param rows. This is
+    /// called immediately after `add_method`, before another method can begin its ParamList run.
+    pub fn add_method_custom_attributes(
+        &mut self,
+        asm: &mut Assembly,
+        method: Token,
+        method_attributes: &[crate::ir::class::CustomAttrDef],
+        return_attributes: &[crate::ir::class::CustomAttrDef],
+        parameter_attributes: &[Vec<crate::ir::class::CustomAttrDef>],
+    ) {
+        assert_eq!(method.table(), Token::TABLE_METHOD_DEF);
+        for attribute in method_attributes {
+            self.add_custom_attribute(asm, method, attribute);
+        }
+
+        let method_row = &self.method_def[usize::try_from(method.rid() - 1).unwrap()];
+        let param_start = usize::try_from(method_row.param_list - 1).unwrap();
+        assert!(param_start <= self.param.len());
+
+        let token_for_sequence = |this: &mut Self, sequence: u16| {
+            let existing = this.param[param_start..]
+                .iter()
+                .position(|row| row.sequence == sequence)
+                .map(|offset| param_start + offset);
+            let index = if let Some(index) = existing {
+                index
+            } else {
+                assert_eq!(
+                    sequence, 0,
+                    "argument Param rows must already exist when attributes are attached"
+                );
+                this.param.push(ParamRow {
+                    flags: 0,
+                    sequence: 0,
+                    name: 0,
+                });
+                this.param.len() - 1
+            };
+            Token::new(Token::TABLE_PARAM, u32::try_from(index + 1).unwrap())
+        };
+
+        if !return_attributes.is_empty() {
+            let return_param = token_for_sequence(self, 0);
+            for attribute in return_attributes {
+                self.add_custom_attribute(asm, return_param, attribute);
+            }
+        }
+        for (index, attributes) in parameter_attributes.iter().enumerate() {
+            if attributes.is_empty() {
+                continue;
+            }
+            let sequence = u16::try_from(index + 1).expect("method parameter index exceeds u16");
+            let parameter = token_for_sequence(self, sequence);
+            for attribute in attributes {
+                self.add_custom_attribute(asm, parameter, attribute);
+            }
+        }
     }
 
     /// Finds-or-creates the `MemberRef` to `System.ThreadStaticAttribute::.ctor()`, resolving
@@ -2306,9 +2498,8 @@ fn encode_method_def_or_ref(token: Token) -> u32 {
 }
 
 /// `HasCustomAttribute` (5 tag bits, §II.24.2.6's largest coded index — 22 target tables). This
-/// backend only ever attaches a `CustomAttribute` to a `Field` (tag 1), but the encoder accepts
-/// any token whose table appears in the spec's ordering so future callers (e.g. attaching one to
-/// a `MethodDef`) aren't blocked.
+/// The backend attaches attributes to fields, types, methods, parameters, and properties; the
+/// encoder accepts each emitted parent kind using the spec's canonical tag ordering.
 fn encode_has_custom_attribute(token: Token) -> u32 {
     // §II.24.2.6's canonical `HasCustomAttribute` tag order: MethodDef=0, Field=1, TypeRef=2,
     // TypeDef=3, Param=4, InterfaceImpl=5, MemberRef=6, Module=7, Permission=8, Property=9,
@@ -2332,6 +2523,7 @@ fn encode_has_custom_attribute(token: Token) -> u32 {
         Token::TABLE_INTERFACE_IMPL => 5,
         Token::TABLE_MEMBER_REF => 6,
         Token::TABLE_MODULE => 7,
+        Token::TABLE_PROPERTY => 9,
         Token::TABLE_ASSEMBLY => 14,
         Token::TABLE_ASSEMBLY_REF => 15,
         Token::TABLE_TYPE_SPEC => 13,
@@ -3349,6 +3541,7 @@ mod tests {
                     false,
                     None,
                     false,
+                    None,
                 )
             })
             .collect();
@@ -3722,6 +3915,7 @@ mod tests {
                     false,
                     None,
                     false,
+                    None,
                 )
             })
             .collect();
@@ -5121,7 +5315,18 @@ mod tests {
             out.push(0x01); // void
             mb.blobs.intern(&out)
         };
-        let method_tok = mb.add_method("DoIt", sig_blob, &[], &[], true, false, false, None, false);
+        let method_tok = mb.add_method(
+            "DoIt",
+            sig_blob,
+            &[],
+            &[],
+            true,
+            false,
+            false,
+            None,
+            false,
+            None,
+        );
         assert_eq!(method_tok.table(), Token::TABLE_METHOD_DEF);
         assert_eq!(method_tok.rid(), 1);
 
@@ -5341,6 +5546,7 @@ mod tests {
             false,
             None,
             false,
+            None,
         );
         assert_eq!(method_tok.rid(), 1);
 
@@ -5798,6 +6004,151 @@ mod tests {
         assert_eq!(&bytes[off + 16..off + 20], &7i32.to_le_bytes());
     }
 
+    #[test]
+    fn custom_attribute_u8_constructor_argument_uses_u1_and_one_byte_payload() {
+        let mut mb = MetadataBuilder::new();
+        let mut asm = Assembly::default();
+        let class_tok = mb.add_type_def("", "Widget", false, None, None, None, &[]);
+        let attr_name = asm.alloc_string("NullableContextAttribute".to_string());
+        let attr_asm = asm.alloc_string("System.Runtime".to_string());
+        let attr_type =
+            asm.alloc_class_ref(ClassRef::new(attr_name, Some(attr_asm), false, [].into()));
+        let attr_def = crate::ir::class::CustomAttrDef::new(
+            attr_type,
+            vec![crate::ir::class::CustomAttrArg::U8(1)],
+            vec![],
+        );
+
+        mb.add_custom_attribute(&mut asm, class_tok, &attr_def);
+        let row = &mb.custom_attribute[0];
+        let bytes = mb.blobs.as_bytes();
+        let off = row.value as usize + 1;
+        assert_eq!(
+            &bytes[off..off + 5],
+            &[0x01, 0x00, 0x01, 0x00, 0x00],
+            "prolog, U1 fixed arg, and zero named arguments"
+        );
+
+        let signature_offset = mb.member_ref[0].signature as usize;
+        let signature_len = usize::from(bytes[signature_offset]);
+        assert_eq!(
+            &bytes[signature_offset + 1..signature_offset + 1 + signature_len],
+            &[0x20, 0x01, 0x01, ATTR_ELEM_U1],
+            "HASTHIS .ctor(byte) returning void"
+        );
+    }
+
+    #[test]
+    fn method_nullability_emits_context_return_and_parameter_attributes() {
+        let mut mb = MetadataBuilder::new();
+        mb.add_type_def("", "Api", false, None, None, None, &[]);
+        let signature = mb.blobs.intern(&[
+            sig::SIG_DEFAULT,
+            0x02,
+            ATTR_ELEM_STRING,
+            ATTR_ELEM_STRING,
+            ATTR_ELEM_STRING,
+        ]);
+        let parameter_flags = [None, Some(2)];
+        let method = mb.add_method(
+            "Choose",
+            signature,
+            &[Some("required"), Some("optional")],
+            &[],
+            true,
+            false,
+            false,
+            None,
+            false,
+            Some(MethodNullability {
+                context: 1,
+                return_flag: Some(2),
+                parameter_flags: &parameter_flags,
+            }),
+        );
+
+        assert_eq!(
+            mb.param.iter().map(|row| row.sequence).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "an attributed return uses Sequence 0 before ordinary parameters"
+        );
+        assert_eq!(mb.custom_attribute.len(), 3);
+        assert_eq!(
+            mb.custom_attribute[0].parent,
+            encode_has_custom_attribute(method),
+            "NullableContextAttribute belongs to the MethodDef"
+        );
+        let return_param = Token::new(Token::TABLE_PARAM, 1);
+        let optional_param = Token::new(Token::TABLE_PARAM, 3);
+        assert_eq!(
+            mb.custom_attribute[1].parent,
+            encode_has_custom_attribute(return_param)
+        );
+        assert_eq!(
+            mb.custom_attribute[2].parent,
+            encode_has_custom_attribute(optional_param)
+        );
+    }
+
+    #[test]
+    fn general_method_return_and_parameter_attributes_target_the_correct_rows() {
+        let mut mb = MetadataBuilder::new();
+        let mut asm = Assembly::default();
+        mb.add_type_def("", "Api", false, None, None, None, &[]);
+        let signature = mb.blobs.intern(&[
+            sig::SIG_DEFAULT,
+            0x02,
+            ATTR_ELEM_I4,
+            ATTR_ELEM_I4,
+            ATTR_ELEM_I4,
+        ]);
+        let method = mb.add_method(
+            "Compute",
+            signature,
+            &[Some("left"), Some("right")],
+            &[],
+            true,
+            false,
+            false,
+            None,
+            false,
+            None,
+        );
+        let attr_name = asm.alloc_string("MarkerAttribute".to_string());
+        let attr_asm = asm.alloc_string("Tests".to_string());
+        let attr_type =
+            asm.alloc_class_ref(ClassRef::new(attr_name, Some(attr_asm), false, [].into()));
+        let attribute = crate::ir::class::CustomAttrDef::new(attr_type, vec![], vec![]);
+        mb.add_method_custom_attributes(
+            &mut asm,
+            method,
+            std::slice::from_ref(&attribute),
+            std::slice::from_ref(&attribute),
+            &[vec![], vec![attribute.clone()]],
+        );
+
+        assert_eq!(
+            mb.param.iter().map(|row| row.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 0],
+            "return Param can be appended to the current method's run after ordinary parameters"
+        );
+        assert_eq!(mb.custom_attribute.len(), 3);
+        assert_eq!(
+            mb.custom_attribute[0].parent,
+            encode_has_custom_attribute(method)
+        );
+        assert_eq!(
+            mb.custom_attribute[1].parent,
+            encode_has_custom_attribute(Token::new(Token::TABLE_PARAM, 3)),
+            "return attribute targets Sequence 0"
+        );
+        assert_eq!(
+            mb.custom_attribute[2].parent,
+            encode_has_custom_attribute(Token::new(Token::TABLE_PARAM, 2)),
+            "second argument attribute targets Sequence 2"
+        );
+    }
+
     /// `StaticFieldDef::is_const` sets `FieldAttributes::InitOnly`; metadata literals are a
     /// separate enum-only API and table path.
     #[test]
@@ -5894,7 +6245,18 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "Owner", false, None, None, None, &[]);
-        let m = mb.add_method("Foo", sig_blob, &[], &[], true, false, false, None, false);
+        let m = mb.add_method(
+            "Foo",
+            sig_blob,
+            &[],
+            &[],
+            true,
+            false,
+            false,
+            None,
+            false,
+            None,
+        );
         assert_eq!(m.table(), Token::TABLE_METHOD_DEF);
 
         let ext = mb.assembly_ref("Other", AssemblyRefTarget::NameOnly);
@@ -5992,11 +6354,17 @@ mod tests {
             true,
             false,
             false,
-            Some(("libc", true)),
+            Some(("libc", Some("native_call"), PInvokeCallConv::Stdcall, true)),
             false,
+            None,
         );
         assert_eq!(mb.impl_map.len(), 1);
         assert_eq!(mb.module_ref.len(), 1);
+        assert_eq!(
+            reader_strings_at_offset(&mb, mb.impl_map[0].import_name),
+            "native_call"
+        );
+        assert_eq!(mb.impl_map[0].mapping_flags & 0x700, 0x300, "stdcall");
         assert_eq!(
             mb.impl_map[0].mapping_flags & 0x40,
             0x40,
@@ -6087,6 +6455,7 @@ mod tests {
             false,
             None,
             false,
+            None,
         );
         mb.add_method(
             "b_m1",
@@ -6098,6 +6467,7 @@ mod tests {
             false,
             None,
             false,
+            None,
         );
 
         let a_row = &mb.type_def[(a.rid() - 1) as usize];
@@ -6594,7 +6964,18 @@ mod tests {
         let _t = mb.add_type_def("", "MainModule", false, None, None, None, &[]);
         // Mirrors `export.rs`'s call for `.cctor`: MethodKind is Static, but the reserved-name
         // check must still route `is_ctor = true` into `add_method`.
-        let tok = mb.add_method(".cctor", sig_blob, &[], &[], true, false, true, None, false);
+        let tok = mb.add_method(
+            ".cctor",
+            sig_blob,
+            &[],
+            &[],
+            true,
+            false,
+            true,
+            None,
+            false,
+            None,
+        );
         let row = &mb.method_def[(tok.rid() - 1) as usize];
         assert_eq!(
             row.flags & (0x1000 | 0x0800),
@@ -6629,9 +7010,42 @@ mod tests {
             false,
             None,
             false,
+            None,
         );
         let row = &mb.method_def[(tok.rid() - 1) as usize];
         assert_eq!(row.flags & (0x1000 | 0x0800), 0);
+    }
+
+    #[test]
+    fn add_method_preserves_assembly_accessibility() {
+        let mut mb = MetadataBuilder::new();
+        let sig_blob = {
+            let mut out = Vec::new();
+            out.push(sig::SIG_DEFAULT);
+            write_compressed_u32(&mut out, 0);
+            out.push(0x01); // void
+            mb.blobs.intern(&out)
+        };
+        let _t = mb.add_type_def("", "FactoryOwned", false, None, None, None, &[]);
+        let tok = mb.add_method_with_access(
+            ".ctor",
+            crate::Access::Assembly,
+            sig_blob,
+            &[],
+            &[],
+            false,
+            false,
+            true,
+            None,
+            false,
+            None,
+        );
+        let row = &mb.method_def[(tok.rid() - 1) as usize];
+        assert_eq!(
+            row.flags & 0x7,
+            0x3,
+            "MethodAttributes.MemberAccessMask must encode Assembly, not Public"
+        );
     }
 
     /// **Regression test for the `pal_threads` `TypeLoadException: Abstract method with non-zero
@@ -6655,7 +7069,18 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "Start", false, None, None, None, &[]);
-        let tok = mb.add_method("Start", sig_blob, &[], &[], false, true, false, None, false);
+        let tok = mb.add_method(
+            "Start",
+            sig_blob,
+            &[],
+            &[],
+            false,
+            true,
+            false,
+            None,
+            false,
+            None,
+        );
         let row = &mb.method_def[(tok.rid() - 1) as usize];
         const NEW_SLOT: u16 = 0x0100;
         const ABSTRACT: u16 = 0x0400;
@@ -6692,7 +7117,18 @@ mod tests {
             mb.blobs.intern(&out)
         };
         let _t = mb.add_type_def("", "MainModule", false, None, None, None, &[]);
-        let tok = mb.add_method("Leaf", sig_blob, &[], &[], true, false, false, None, true);
+        let tok = mb.add_method(
+            "Leaf",
+            sig_blob,
+            &[],
+            &[],
+            true,
+            false,
+            false,
+            None,
+            true,
+            None,
+        );
         let row = &mb.method_def[(tok.rid() - 1) as usize];
         const AGGRESSIVE_INLINING: u16 = 0x0100;
         assert_eq!(
@@ -6724,6 +7160,7 @@ mod tests {
             false,
             None,
             false,
+            None,
         );
         let row = &mb.method_def[(tok.rid() - 1) as usize];
         assert_eq!(

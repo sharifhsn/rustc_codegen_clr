@@ -4,7 +4,7 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-driver="${RCL_BUNDLE_DRIVER:-$repo/tools/cargo-dotnet/target/release/cargo-dotnet}"
+driver="${RCL_BUNDLE_DRIVER:-$repo/target/release/cargo-dotnet}"
 dotnet_version="${DOTNET_VERSION:-10}"
 work="${RCL_BUNDLE_WORK_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/rustdotnet-bundle.XXXXXX")}"
 keep="${RCL_BUNDLE_KEEP_WORK:-0}"
@@ -49,6 +49,7 @@ cp -R "$repo/dotnet_overlays" "$source_home/dotnet_overlays"
 cp -R "$repo/msbuild" "$source_home/msbuild"
 cp -R "$repo/mycorrhiza" "$source_home/crates/mycorrhiza"
 cp -R "$repo/dotnet_macros" "$source_home/crates/dotnet_macros"
+cp -R "$repo/crates/rust-dotnet-pinvoke" "$source_home/crates/rust-dotnet-pinvoke"
 cp -R "$repo/mycorrhiza_interop_helpers" "$source_home/mycorrhiza_interop_helpers"
 
 toolchain="$(awk -F '"' '/channel/ { print $2; exit }' "$repo/rust-toolchain.toml")"

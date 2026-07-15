@@ -1,0 +1,10 @@
+[package]
+name = "pinvoke_async_callback"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rust-dotnet-pinvoke = { path = "../../crates/rust-dotnet-pinvoke" }
+
+[workspace]

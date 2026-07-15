@@ -49,7 +49,7 @@ pub fn run(args: &PublishArgs) -> Result<i32> {
     // publish` reports that itself with an actionable error if missing, so we don't
     // duplicate that check here.
     let facts = HostFacts::detect();
-    let dotnet_heal = host::dotnet_env_adds();
+    let dotnet_heal = host::dotnet_env_adds_for(dotnet.as_env());
     host::ensure_dotnet(&dotnet_heal)?;
 
     let rid = args

@@ -15,21 +15,21 @@ case "$host" in
         backend="target/release/librustc_codegen_clr.so"
         backend_name="librustc_codegen_clr.so"
         linker="target/release/linker"
-        driver="tools/cargo-dotnet/target/release/cargo-dotnet"
+        driver="target/release/cargo-dotnet"
         asset_driver="cargo-dotnet-linux-x64"
         ;;
     macos-arm64)
         backend="target/release/librustc_codegen_clr.dylib"
         backend_name="librustc_codegen_clr.dylib"
         linker="target/release/linker"
-        driver="tools/cargo-dotnet/target/release/cargo-dotnet"
+        driver="target/release/cargo-dotnet"
         asset_driver="cargo-dotnet-macos-arm64"
         ;;
     windows-x64)
         backend="target/release/rustc_codegen_clr.dll"
         backend_name="rustc_codegen_clr.dll"
         linker="target/release/linker.exe"
-        driver="tools/cargo-dotnet/target/release/cargo-dotnet.exe"
+        driver="target/release/cargo-dotnet.exe"
         asset_driver="cargo-dotnet-windows-x64.exe"
         ;;
     *)
@@ -74,7 +74,9 @@ cp feasibility/_cargo_dotnet_core.sh "$home/core.sh"
 cp feasibility/cargo-dotnet "$home/cargo-dotnet"
 cp -R dotnet_pal dotnet_overlays msbuild "$home/"
 cp -R mycorrhiza dotnet_macros "$home/crates/"
+cp -R crates/rust-dotnet-pinvoke "$home/crates/"
 cp -R mycorrhiza_interop_helpers "$home/"
+rm -rf "$home/mycorrhiza_interop_helpers/bin" "$home/mycorrhiza_interop_helpers/obj"
 printf 'schema = 1\ngit_rev = %s\nrelease_tag = rust-dotnet-v%s\nhost_rid = %s\ntoolchain = nightly-2026-06-17\n' \
     "$(git rev-parse HEAD)" "$version" "$host" > "$home/VERSION"
 
@@ -97,5 +99,25 @@ CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
     "$installed" dotnet doctor --workspace "$hello"
 CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
     "$installed" dotnet run "$hello" --release
+
+# Prove the installed, repo-independent SDK carries the helper crate and can restore, stage, and
+# execute a host-native P/Invoke dependency from only the checked-in project record.
+pinvoke="$work/pinvoke-sqlite"
+mkdir -p "$pinvoke/src"
+cp cargo_tests/pinvoke_sqlite/Cargo.toml "$pinvoke/Cargo.toml"
+cp cargo_tests/pinvoke_sqlite/.cargo-dotnet-nuget-deps.json \
+    "$pinvoke/.cargo-dotnet-nuget-deps.json"
+cp cargo_tests/pinvoke_sqlite/src/main.rs "$pinvoke/src/main.rs"
+cp cargo_tests/pinvoke_sqlite/src/native.rs "$pinvoke/src/native.rs"
+cp cargo_tests/pinvoke_sqlite/sqlite3_api.h "$pinvoke/sqlite3_api.h"
+CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
+    "$installed" dotnet bindgen sqlite3_api.h \
+    --library e_sqlite3 \
+    --path "$pinvoke" \
+    --allowlist-function 'sqlite3_(open|close|exec|errmsg|free|libversion_number)' \
+    --allowlist-type 'sqlite3.*' \
+    --check
+CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
+    "$installed" dotnet run "$pinvoke" --release
 
 echo "== release bundle ready: $bundle =="

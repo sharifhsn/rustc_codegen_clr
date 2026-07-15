@@ -84,7 +84,7 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::intrinsics::{
     RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric,
-    RustcCLRInteropManagedGenericStruct, RustcCLRInteropTypeGeneric,
+    RustcCLRInteropManagedGenericStruct, RustcCLRInteropManagedStruct, RustcCLRInteropTypeGeneric,
     rustc_clr_interop_generic_call1, rustc_clr_interop_generic_call2,
     rustc_clr_interop_generic_ctor0,
 };
@@ -104,6 +104,14 @@ pub type TaskT<T> = RustcCLRInteropManagedGeneric<{ CORELIB }, { TASK_GEN }, (T,
 
 const VALUE_TASK_GEN: &str = "System.Threading.Tasks.ValueTask";
 
+/// The raw non-generic managed `System.Threading.Tasks.ValueTask` value. This is the exact return
+/// contract of `IAsyncDisposable.DisposeAsync` and other allocation-sensitive non-result APIs.
+pub type ValueTask = RustcCLRInteropManagedStruct<
+    { CORELIB },
+    { VALUE_TASK_GEN },
+    { core::mem::size_of::<usize>() * 2 },
+>;
+
 /// The raw managed value-type handle for `System.Threading.Tasks.ValueTask<T>`.
 ///
 /// Generated NuGet bindings use this type for closed `ValueTask<T>` returns. Convert it directly
@@ -116,6 +124,13 @@ pub type ValueTaskT<T> = RustcCLRInteropManagedGenericStruct<
     { core::mem::size_of::<usize>() * 2 },
     (T,),
 >;
+
+/// Wrap a managed [`Task`] in `ValueTask(Task)` without losing the framework-native value-type
+/// signature required by APIs such as `IAsyncDisposable`.
+#[inline]
+pub fn task_into_value_task(task: Task) -> ValueTask {
+    ValueTask::ctor1(task.raw())
+}
 
 /// Convert a returned managed `ValueTask<T>` into `Task<T>` via `ValueTask<T>.AsTask()`.
 ///
@@ -487,6 +502,34 @@ where
     Task::from_raw(tcs.get_task())
 }
 
+/// Complete a non-generic managed task from an explicitly cancellation-shaped Rust result.
+/// `Ok(())` produces a successful task; `Err(_)` calls `TaskCompletionSource.SetCanceled`, so C#
+/// observes `Task.IsCanceled == true` and `await` throws `TaskCanceledException` (an
+/// `OperationCanceledException`), not a faulted task or an arbitrary Rust panic.
+pub fn future_to_task_cancelable_unit<E, F>(fut: F) -> Task
+where
+    F: Future<Output = Result<(), E>>,
+{
+    let outcome = block_on(fut);
+    let tcs = crate::System::Threading::Tasks::TaskCompletionSource::new();
+    match outcome {
+        Ok(()) => tcs.set_result(),
+        Err(_) => tcs.set_canceled(),
+    }
+    Task::from_raw(tcs.get_task())
+}
+
+/// Drive a unit Rust future through the existing Task bridge and expose it as a non-generic
+/// [`ValueTask`]. This is the ergonomic implementation helper for
+/// `#[dotnet_methods(async_disposable)]`.
+#[inline]
+pub fn future_to_value_task_unit<F>(fut: F) -> ValueTask
+where
+    F: Future<Output = ()>,
+{
+    task_into_value_task(future_to_task_unit(fut))
+}
+
 // ---- Result-bearing `Task<T>` PRODUCTION (the former wall — now unblocked) ----------------------
 //
 // `TaskCompletionSource<T>.get_Task()` returns the def-shape nested generic `Task`1<!0>`. That is now
@@ -527,6 +570,23 @@ fn tcs_set_result<T>(tcs: TaskCompletionSourceT<T>, value: T) {
         T,
     >(tcs, value)
 }
+
+/// `TaskCompletionSource<T>.SetCanceled()` — complete in CLR cancellation state rather than
+/// faulting. The explicit export policy decides that `Err` means cancellation.
+#[inline]
+fn tcs_set_canceled<T>(tcs: TaskCompletionSourceT<T>) {
+    rustc_clr_interop_generic_call1::<
+        { CORELIB },
+        { TCS_GEN },
+        false,
+        "SetCanceled",
+        2u8,
+        (T,),
+        ((),),
+        (),
+        TaskCompletionSourceT<T>,
+    >(tcs)
+}
 /// `TaskCompletionSource<T>.get_Task()` — the produced `Task<T>`. The def-shape return `Task<!0>`
 /// binds against the concrete `TaskT<T>` local (nested-generic binding).
 #[inline]
@@ -556,5 +616,23 @@ where
     let value = block_on(fut);
     let tcs = tcs_new::<T>();
     tcs_set_result::<T>(tcs, value);
+    tcs_get_task::<T>(tcs)
+}
+
+/// Cancellation-aware result-bearing Future→Task bridge. `Ok(value)` produces a successful
+/// `Task<T>`; `Err(_)` produces a genuinely canceled task through
+/// `TaskCompletionSource<T>.SetCanceled()`. Any error type is accepted because callers opt into
+/// the intentionally lossy `Err == cancellation` interpretation explicitly through
+/// `#[dotnet_export(cancellation = "task")]`.
+pub fn future_to_task_cancelable<T, E, F>(fut: F) -> TaskT<T>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    let outcome = block_on(fut);
+    let tcs = tcs_new::<T>();
+    match outcome {
+        Ok(value) => tcs_set_result::<T>(tcs, value),
+        Err(_) => tcs_set_canceled::<T>(tcs),
+    }
     tcs_get_task::<T>(tcs)
 }

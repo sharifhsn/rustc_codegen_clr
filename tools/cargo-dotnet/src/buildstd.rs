@@ -325,6 +325,7 @@ fn base_cargo(ctx: &Context, sysroot: &PrivateSysroot) -> Command {
     let mut cmd = Command::new(&ctx.cargo);
     cmd.current_dir(&ctx.crate_dir);
     cmd.env("CARGO_HOME", &ctx.paths.cargo_home);
+    cmd.env("RCL_XMLDOC_BUILD_ID", crate::xmldoc::build_id());
     if let Some(config) = crate::overlays::ambient_cargo_config(ctx) {
         cmd.arg("--config").arg(config);
     }
@@ -337,6 +338,7 @@ fn base_cargo(ctx: &Context, sysroot: &PrivateSysroot) -> Command {
         rustflags::assemble(
             &ctx.paths.backend_dylib,
             &ctx.paths.linker,
+            &ctx.paths.sdk_crates_root,
             ctx.dotnet.as_env(),
             &[
                 (&ctx.paths.sdk_crates_root, "/_/rust-dotnet-sdk"),
@@ -387,7 +389,7 @@ fn base_cargo(ctx: &Context, sysroot: &PrivateSysroot) -> Command {
     // target the same runtime. Pairs with the version-matched ILASM_PATH above.
     cmd.env("DOTNET_VERSION", ctx.dotnet.as_env());
 
-    configure_managed_identity_env(&mut cmd, ctx.managed_identity.as_ref());
+    configure_managed_identity_env(&mut cmd, ctx.managed_identity());
 
     // dotnet self-heal from $HOME/.dotnet.
     if let Some((path_add, dotnet_root)) = &ctx.dotnet_heal {

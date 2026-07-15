@@ -100,6 +100,12 @@ pub enum CILNode {
         array: Interned<CILNode>,
         index: Interned<CILNode>,
     },
+    /// Loads a value of `elem` from a one-dimensional managed array (`ldelem <elem>`).
+    LdElem {
+        array: Interned<CILNode>,
+        index: Interned<CILNode>,
+        elem: Interned<Type>,
+    },
     /// Turns a managed reference to object into type
     UnboxAny {
         object: Interned<CILNode>,
@@ -325,6 +331,7 @@ impl CILNode {
                 object: node_idx, ..
             } => vec![*node_idx],
             CILNode::BinOp(lhs, rhs, _) => vec![*lhs, *rhs],
+            CILNode::LdElem { array, index, .. } => vec![*array, *index],
             CILNode::Call(info) => {
                 let (_, args, _is_pure) = info.as_ref();
                 args.to_vec()
@@ -511,6 +518,16 @@ impl CILNode {
                 let node = CILNode::LdElelemRef {
                     array: asm.alloc_node(array),
                     index: asm.alloc_node(index),
+                };
+                map(node, asm)
+            }
+            CILNode::LdElem { array, index, elem } => {
+                let array = asm.get_node(array).clone().map(asm, map);
+                let index = asm.get_node(index).clone().map(asm, map);
+                let node = CILNode::LdElem {
+                    array: asm.alloc_node(array),
+                    index: asm.alloc_node(index),
+                    elem,
                 };
                 map(node, asm)
             }

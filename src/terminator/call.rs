@@ -152,6 +152,39 @@ fn call_managed<'tcx>(
         }
     }
 }
+
+/// Lowers `rustc_clr_interop_managed_get_field` to a typed `ldfld` without synthesizing or
+/// resolving an accessor method. This is the stable primitive behind generated CLR value objects:
+/// their field access must not depend on comptime accessor registration order.
+fn managed_get_field<'tcx>(
+    subst_ref: &[GenericArg<'tcx>],
+    args: &[Spanned<Operand<'tcx>>],
+    destination: &Place<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Root {
+    assert_eq!(
+        args.len(),
+        1,
+        "managed field reads require exactly one owner"
+    );
+    let InteropHeader {
+        asm,
+        class_name,
+        is_vt: is_valuetype,
+    } = InteropHeader::decode(subst_ref, ctx);
+    let owner = ctx.alloc_class_ref(ClassRef::new(class_name, asm, is_valuetype, [].into()));
+    let field_name = garg_to_string(subst_ref[3], ctx.tcx());
+    let field_name = ctx.alloc_string(field_name);
+    let field_type = ctx.type_from_cache(
+        ctx.monomorphize(subst_ref[4])
+            .as_type()
+            .expect("managed field return must be a type"),
+    );
+    let descriptor = ctx.alloc_field(FieldDesc::new(owner, field_name, field_type));
+    let object = handle_operand(&args[0].node, ctx);
+    let value = ctx.ld_field(object, descriptor);
+    place_set(destination, value, ctx)
+}
 /// Calls a virtual managed function(used for interop)
 fn callvirt_managed<'tcx>(
     subst_ref: &[GenericArg<'tcx>],
@@ -1063,8 +1096,18 @@ fn call_ctor<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Root {
     let argc = argc_from_fn_name(function_name, CTOR_FN_NAME);
-    // Check that there are enough function path and argument specifers
-    assert!(subst_ref.len() == argc as usize + 3);
+    // Current SDK intrinsics carry an explicit return type after the three identity parameters so
+    // value-type constructors can return their real transport type. Keep accepting the historical
+    // header-only shape used by direct compiler regression fixtures.
+    let input_start = match subst_ref.len() {
+        len if len == argc as usize + 4 => 4,
+        len if len == argc as usize + 3 => 3,
+        len => panic!(
+            "managed ctor generic arity mismatch: got {len}, expected {} (legacy) or {}",
+            argc as usize + 3,
+            argc as usize + 4
+        ),
+    };
     // Check that a proper number of arguments is used
     assert!(args.len() == argc as usize);
     // Decode the `<assembly, class path, is-valuetype>` header (subst[0..3]):
@@ -1091,7 +1134,7 @@ fn call_ctor<'tcx>(
         let node = ctx.call(mref, EMPTY_ARGS, IsPure::NOT);
         place_set(destination, node, ctx)
     } else {
-        let mut inputs: Vec<_> = subst_ref[3..]
+        let mut inputs: Vec<_> = subst_ref[input_start..]
             .iter()
             .map(|ty| {
                 ctx.type_from_cache(
@@ -1430,6 +1473,13 @@ pub fn call_inner<'tcx>(
                     ctx,
                 )];
             }
+            MagicFn::ManagedGetField => {
+                assert!(
+                    !call_info.split_last_tuple(),
+                    "Managed field reads may not use the `rust_call` calling convention!"
+                );
+                return vec![managed_get_field(instance.args, args, destination, ctx)];
+            }
             MagicFn::LdLen => {
                 assert!(
                     !call_info.split_last_tuple(),
@@ -1453,6 +1503,24 @@ pub fn call_inner<'tcx>(
 
                 let node = ctx.alloc_node(Const::Null(tpe));
                 return vec![place_set(destination, node, ctx)];
+            }
+            MagicFn::IsNull => {
+                assert!(
+                    !call_info.split_last_tuple(),
+                    "Managed calls may not use the `rust_call` calling convention!"
+                );
+                let tpe = ctx
+                    .type_from_cache(instance.args[0].as_type().unwrap())
+                    .as_class_ref()
+                    .expect("managed null checks require a reference type");
+                assert!(
+                    !ctx[tpe].is_valuetype(),
+                    "managed null checks require a reference type"
+                );
+                let value = handle_operand(&args[0].node, ctx);
+                let null = ctx.alloc_node(Const::Null(tpe));
+                let is_null = ctx.alloc_node(CILNode::BinOp(value, null, BinOp::Eq));
+                return vec![place_set(destination, is_null, ctx)];
             }
             MagicFn::CheckedCast => {
                 let tpe = ctx
@@ -1485,10 +1553,15 @@ pub fn call_inner<'tcx>(
             }
             MagicFn::ManagedBoxNew => {
                 let tpe = ctx.type_from_cache(instance.args[0].as_type().unwrap());
-                let tpe = ctx.alloc_type(tpe);
                 let value = handle_operand(&args[0].node, ctx);
-                let boxed = ctx.box_value(value, tpe);
-                let handle = ctx[boxed].clone().ref_to_handle(ctx);
+                let object = match tpe {
+                    Type::ClassRef(class) if !ctx[class].is_valuetype() => value,
+                    _ => {
+                        let tpe = ctx.alloc_type(tpe);
+                        ctx.box_value(value, tpe)
+                    }
+                };
+                let handle = ctx[object].clone().ref_to_handle(ctx);
                 let handle = ctx.alloc_node(handle);
                 let void = ctx.alloc_type(Type::Void);
                 let handle =
@@ -1497,7 +1570,6 @@ pub fn call_inner<'tcx>(
             }
             MagicFn::ManagedBoxTake => {
                 let tpe = ctx.type_from_cache(instance.args[0].as_type().unwrap());
-                let tpe = ctx.alloc_type(tpe);
                 let handle = handle_operand(&args[0].node, ctx);
                 let handle = ctx.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::ISize)));
                 let main_module = *ctx.main_module();
@@ -1509,7 +1581,15 @@ pub fn call_inner<'tcx>(
                     ctx,
                 );
                 let object = ctx.alloc_node(CILNode::call(handle_to_obj, [handle]));
-                let value = ctx.unbox_any(object, tpe);
+                let value = match tpe {
+                    Type::ClassRef(class) if !ctx[class].is_valuetype() => {
+                        ctx.checked_cast(object, class)
+                    }
+                    _ => {
+                        let tpe = ctx.alloc_type(tpe);
+                        ctx.unbox_any(object, tpe)
+                    }
+                };
                 let store = place_set(destination, value, ctx);
 
                 let handle_free_name = ctx.alloc_string("handle_free");
@@ -1531,6 +1611,18 @@ pub fn call_inner<'tcx>(
                 let arr = handle_operand(&args[0].node, ctx);
                 let idx = handle_operand(&args[1].node, ctx);
                 let node = ctx.ld_elem_ref(arr, idx);
+                return vec![place_set(destination, node, ctx)];
+            }
+            MagicFn::LdElem => {
+                assert!(
+                    !call_info.split_last_tuple(),
+                    "Managed calls may not use the `rust_call` calling convention!"
+                );
+                let elem = ctx.type_from_cache(instance.args[0].as_type().unwrap());
+                let elem = ctx.alloc_type(elem);
+                let arr = handle_operand(&args[0].node, ctx);
+                let idx = handle_operand(&args[1].node, ctx);
+                let node = ctx.ld_elem(arr, idx, elem);
                 return vec![place_set(destination, node, ctx)];
             }
             MagicFn::NewArr => {

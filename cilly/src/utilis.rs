@@ -317,7 +317,7 @@ pub fn get_environ(asm: &mut Assembly) -> Interned<MethodRef> {
     ];
     let sig = asm.alloc_sig(FnSig::new([], uint8_ptr_ptr));
     let def = MethodDef::from_blocks(
-        crate::Access::Extern,
+        crate::Access::InternalExtern,
         main_module,
         "get_environ",
         sig,

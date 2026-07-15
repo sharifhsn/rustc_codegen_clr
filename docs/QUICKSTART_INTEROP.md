@@ -6,7 +6,9 @@ there is no P/Invoke, no marshalling attributes, and no `unsafe` unless you ask 
 
 > Deeper references: [CARGO_DOTNET.md](CARGO_DOTNET.md) (the tool), [INTEROP_CSHARP.md](INTEROP_CSHARP.md)
 > (C#-consumes-Rust details), [TRANSLATION_STATUS.md](TRANSLATION_STATUS.md) (what maps to what and
-> the ceilings), [ARCHITECTURE.md](ARCHITECTURE.md) (why). Every snippet below has a runnable twin
+> the ceilings), [ARCHITECTURE.md](ARCHITECTURE.md) (why), and
+> [THREE_LAYER_INTEROP_EXAMPLE.md](THREE_LAYER_INTEROP_EXAMPLE.md) for a complete C# -> managed
+> Rust -> native Rust application shape. Every snippet below has a runnable twin
 > under `cargo_tests/` — named in each section.
 
 ## 0. One-time setup
@@ -183,7 +185,9 @@ the numeric/`bool` primitives pass through unchanged. **No C#-side glue is neede
 already presents a clean `string`/`int`/`double`/`bool` signature on `MainModule`.
 
 Supported today includes the integer/float primitives, `bool`, `&str`, `String`, primitive
-`Option<T>`/`Vec<T>`, concrete delegates, and enums registered as shown below. Unsupported shapes
+`Option<T>`, `Vec<T>` as a normal managed `T[]`, concrete delegates, and enums registered as shown
+below. Use `mycorrhiza::containers::RustOwnedVec<T>` when C# should instead receive the explicit
+disposable `RustDotnet.RustVec<T>` low-copy wrapper. Unsupported shapes
 produce a **clear compile error** (marshalling is never faked). The consuming `cdylib` depends on
 `mycorrhiza` + `dotnet_macros`. Runnable: `cargo_tests/cd_export` and
 `cargo_tests/cd_export_ergonomics`.

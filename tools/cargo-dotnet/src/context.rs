@@ -21,29 +21,8 @@ use crate::host::HostFacts;
 use crate::mode::Mode;
 use crate::passthrough;
 use crate::{host, mode};
-
-/// The managed public identity requested by `[package.metadata.dotnet]`.
-///
-/// Absence deliberately means the legacy `MainModule` surface. This keeps existing crates and
-/// serialized artifacts compatible while release-oriented crates can opt into a collision-free
-/// projection at final link time.
-#[derive(Debug, Clone)]
-pub struct ManagedIdentity {
-    pub schema: u16,
-    pub package_id: String,
-    pub assembly_name: String,
-    pub root_namespace: String,
-    pub module_type: String,
-    pub legacy_main_module: bool,
-}
-
-impl ManagedIdentity {
-    /// The CLR full type name projected from the compiler's internal `MainModule` sentinel.
-    #[must_use]
-    pub fn module_full_name(&self) -> Option<String> {
-        (!self.legacy_main_module).then(|| format!("{}.{}", self.root_namespace, self.module_type))
-    }
-}
+pub use rust_dotnet_sdk_core::identity::{ManagedIdentity, ManagedProjectConfig};
+pub use rust_dotnet_sdk_core::runtime::DotnetVersion;
 
 /// Build profile (replaces the stringly `CD_REL`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,52 +174,6 @@ from a release SDK bundle:         cargo dotnet bundle install /path/to/cargo-do
     )
 }
 
-/// The target .NET runtime selected by `--dotnet` (env `DOTNET_VERSION`).
-///
-/// The compiler still contains compatibility machinery for older runtimes, but the public SDK has
-/// one supported profile: .NET 10. Keeping that choice here prevents scaffolds, linker metadata,
-/// ILAsm, and NuGet target frameworks from silently drifting apart.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum DotnetVersion {
-    /// .NET 10.
-    #[default]
-    Net10,
-}
-impl DotnetVersion {
-    /// Target-framework moniker for NuGet packaging.
-    #[must_use]
-    pub fn tfm(self) -> &'static str {
-        match self {
-            DotnetVersion::Net10 => "net10.0",
-        }
-    }
-    /// The `DOTNET_VERSION` value the cilly/backend parser expects (canonical bare major).
-    #[must_use]
-    pub fn as_env(self) -> &'static str {
-        match self {
-            DotnetVersion::Net10 => "10",
-        }
-    }
-    /// The matching CoreCLR ILAsm tool directory under `$HOME/.dotnet`.
-    #[must_use]
-    pub fn ilasm_tool_dir(self) -> &'static str {
-        match self {
-            DotnetVersion::Net10 => "ilasm10-tool",
-        }
-    }
-}
-impl std::str::FromStr for DotnetVersion {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "10" | "net10" | "net10.0" => Ok(DotnetVersion::Net10),
-            other => Err(format!(
-                "--dotnet: unsupported value {other:?}; rust-dotnet 0.0.1 supports .NET 10"
-            )),
-        }
-    }
-}
-
 /// The single typed config threaded (by reference) through the stage pipeline. It is
 /// only ever resolved on the NATIVE backend (the docker backend short-circuits in
 /// `pipeline::run` before this), so it carries no `backend` discriminant.
@@ -262,8 +195,8 @@ pub struct Context {
     pub dotnet: DotnetVersion,
     /// `(PATH addition, DOTNET_ROOT)` if dotnet was self-healed from `$HOME/.dotnet`.
     pub dotnet_heal: Option<(PathBuf, PathBuf)>,
-    /// Explicit release-package identity, if the crate opted into schema 1.
-    pub managed_identity: Option<ManagedIdentity>,
+    /// Complete release/host contract, resolved from one validated Cargo metadata table.
+    pub managed_project: Option<ManagedProjectConfig>,
     /// Optional Source Link URL template for `/_/consumer/*` documents. The validated URL is
     /// retained separately from the deterministic JSON passed to the linker so receipts stay
     /// human-readable.
@@ -271,6 +204,12 @@ pub struct Context {
 }
 
 impl Context {
+    pub fn managed_identity(&self) -> Option<&ManagedIdentity> {
+        self.managed_project
+            .as_ref()
+            .map(|project| &project.identity)
+    }
+
     pub fn is_offline(&self) -> bool {
         self.flags
             .extra_cargo
@@ -294,15 +233,15 @@ impl Context {
 
         // host preflight (rustc/cargo present; dotnet reachable; ilasm resolved).
         host::ensure_rust_toolchain()?;
-        let dotnet_heal = host::dotnet_env_adds();
-        host::ensure_dotnet(&dotnet_heal)?;
         let dotnet: DotnetVersion = args.dotnet.parse().map_err(anyhow::Error::msg)?;
+        let dotnet_heal = host::dotnet_env_adds_for(dotnet.as_env());
+        host::ensure_dotnet(&dotnet_heal)?;
         let ilasm = host::resolve_ilasm(&host, dotnet)?;
 
         let paths = Paths::resolve(&mode, &host, &crate_dir)?;
-        let managed_identity = resolve_managed_identity(&crate_dir)?;
+        let managed_project = resolve_managed_project(&crate_dir)?;
         let source_link_url = validate_source_link_url(args.source_link_url.as_deref())?;
-        if managed_identity.is_some() {
+        if managed_project.is_some() {
             validate_managed_identity_build(args, &crate_dir)?;
         }
 
@@ -359,7 +298,7 @@ impl Context {
             ilasm,
             dotnet,
             dotnet_heal,
-            managed_identity,
+            managed_project,
             source_link_url,
         })
     }
@@ -430,7 +369,7 @@ fn cargo_package(crate_dir: &Path) -> Result<cargo_metadata::Package> {
     })
 }
 
-fn resolve_managed_identity(crate_dir: &Path) -> Result<Option<ManagedIdentity>> {
+fn resolve_managed_project(crate_dir: &Path) -> Result<Option<ManagedProjectConfig>> {
     let package = cargo_package(crate_dir)?;
     let Some(dotnet) = package.metadata.get("dotnet") else {
         return Ok(None);
@@ -444,6 +383,8 @@ fn resolve_managed_identity(crate_dir: &Path) -> Result<Option<ManagedIdentity>>
         "assembly-name",
         "root-namespace",
         "module-type",
+        "public-namespaces",
+        "compatibility-profile",
         "legacy-main-module",
     ];
     for key in dotnet.keys() {
@@ -481,7 +422,32 @@ fn resolve_managed_identity(crate_dir: &Path) -> Result<Option<ManagedIdentity>>
         },
     };
     validate_identity(&identity)?;
-    Ok(Some(identity))
+    let public_namespaces = dotnet
+        .get("public-namespaces")
+        .and_then(serde_json::Value::as_array)
+        .context(
+            "package.metadata.dotnet.public-namespaces must be a non-empty array of dotted CLR namespaces",
+        )?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .context("package.metadata.dotnet.public-namespaces entries must be non-empty strings")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if public_namespaces.is_empty() {
+        bail!("package.metadata.dotnet.public-namespaces must not be empty");
+    }
+    let compatibility_profile = string("compatibility-profile")?;
+    let project = ManagedProjectConfig {
+        identity,
+        public_namespaces,
+        compatibility_profile,
+    };
+    validate_managed_project(&project)?;
+    Ok(Some(project))
 }
 
 /// Print the filename/CLR identity that generic MSBuild integration must reference.
@@ -491,8 +457,8 @@ pub fn print_managed_assembly_name(path: Option<&Path>) -> Result<i32> {
         .canonicalize()
         .with_context(|| format!("canonicalize Rust crate {}", crate_dir.display()))?;
     let package = cargo_package(&crate_dir)?;
-    let name = resolve_managed_identity(&crate_dir)?
-        .map(|identity| identity.assembly_name)
+    let name = resolve_managed_project(&crate_dir)?
+        .map(|project| project.identity.assembly_name)
         .unwrap_or_else(|| package.name.to_string());
     println!("{name}");
     Ok(0)
@@ -571,14 +537,14 @@ pub fn validate_managed_identity_set(crate_dirs: &[PathBuf]) -> Result<i32> {
             )
         })?;
         let package = cargo_package(&crate_dir)?;
-        let identity = resolve_managed_identity(&crate_dir)?;
-        let assembly_name = identity
+        let project = resolve_managed_project(&crate_dir)?;
+        let assembly_name = project
             .as_ref()
-            .map(|identity| identity.assembly_name.clone())
+            .map(|project| project.identity.assembly_name.clone())
             .unwrap_or_else(|| package.name.to_string());
-        let public_type = identity
+        let public_type = project
             .as_ref()
-            .and_then(ManagedIdentity::module_full_name)
+            .and_then(|project| project.identity.module_full_name())
             .unwrap_or_else(|| "MainModule".to_string());
 
         if let Some(previous) = assembly_owners.insert(assembly_name.clone(), crate_dir.clone()) {
@@ -610,6 +576,35 @@ fn validate_identity(identity: &ManagedIdentity) -> Result<()> {
         if !value.split('.').all(is_clr_identifier) {
             bail!("package.metadata.dotnet.{label}={value:?} is not a dotted CLR identifier");
         }
+    }
+    Ok(())
+}
+
+fn validate_managed_project(project: &ManagedProjectConfig) -> Result<()> {
+    let mut namespaces = std::collections::BTreeSet::<String>::new();
+    for namespace in &project.public_namespaces {
+        if !namespace.split('.').all(is_clr_identifier) {
+            bail!(
+                "package.metadata.dotnet.public-namespaces contains invalid dotted CLR namespace {namespace:?}"
+            );
+        }
+        if !namespaces.insert(namespace.clone()) {
+            bail!(
+                "package.metadata.dotnet.public-namespaces contains duplicate namespace {namespace:?}"
+            );
+        }
+    }
+    if !namespaces.contains(project.identity.root_namespace.as_str()) {
+        bail!(
+            "package.metadata.dotnet.public-namespaces must include root-namespace {:?}",
+            project.identity.root_namespace
+        );
+    }
+    if !crate::profiles::is_known(&project.compatibility_profile) {
+        bail!(
+            "unknown package.metadata.dotnet.compatibility-profile {:?}; run `cargo dotnet profiles` for valid names",
+            project.compatibility_profile
+        );
     }
     Ok(())
 }
@@ -679,6 +674,44 @@ mod tests {
         assert_eq!(
             identity.module_full_name().as_deref(),
             Some("Collision.Alpha.Exports")
+        );
+    }
+
+    fn example_project() -> ManagedProjectConfig {
+        ManagedProjectConfig {
+            identity: ManagedIdentity {
+                schema: 1,
+                package_id: "Example.Widget".into(),
+                assembly_name: "Example.Widget".into(),
+                root_namespace: "Example.Widget".into(),
+                module_type: "Exports".into(),
+                legacy_main_module: false,
+            },
+            public_namespaces: vec!["Example.Widget".into(), "Example.Widget.Models".into()],
+            compatibility_profile: "net10-coreclr".into(),
+        }
+    }
+
+    #[test]
+    fn managed_project_validates_namespaces_and_known_profile_together() {
+        validate_managed_project(&example_project()).unwrap();
+
+        let mut missing_root = example_project();
+        missing_root.public_namespaces = vec!["Example.Widget.Models".into()];
+        assert!(
+            validate_managed_project(&missing_root)
+                .unwrap_err()
+                .to_string()
+                .contains("must include root-namespace")
+        );
+
+        let mut unknown_profile = example_project();
+        unknown_profile.compatibility_profile = "wishful-future-host".into();
+        assert!(
+            validate_managed_project(&unknown_profile)
+                .unwrap_err()
+                .to_string()
+                .contains("cargo dotnet profiles")
         );
     }
 

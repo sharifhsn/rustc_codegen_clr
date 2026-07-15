@@ -131,7 +131,7 @@ build_side() {
         CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
         SOURCE_DATE_EPOCH="$source_date_epoch" \
         CARGO_DOTNET_BACKEND=native \
-        "$tree/tools/cargo-dotnet/target/release/cargo-dotnet" pack "$tree/$fixture" \
+        "$tree/target/release/cargo-dotnet" pack "$tree/$fixture" \
         --id "$package_id" --version "$package_version" --out "$out/package" \
         --dotnet "$dotnet_version" --validate \
         >"$out/pack.log" 2>&1

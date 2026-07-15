@@ -60,6 +60,81 @@ const COMPARISON: &str = "System.Comparison";
 /// The delegate `Invoke` method name (every `Action`/`Func` exposes it).
 const INVOKE: &str = "Invoke";
 
+/// `System.Action` — a void-returning, zero-argument delegate.
+///
+/// This non-generic sibling is especially useful for cancellation registration and lifecycle
+/// callbacks. Capturing closures follow the same process-lifetime rule as the generic wrappers;
+/// APIs that can prove unregistration (such as `CancellationRegistration`) own and reclaim the
+/// environment separately.
+pub struct Action0 {
+    h: crate::bindings::System::Action,
+}
+
+impl Action0 {
+    #[inline]
+    pub fn from_fn(f: extern "C" fn()) -> Self {
+        let h = rustc_clr_interop_delegate::<
+            { CORELIB },
+            { ACTION },
+            false,
+            (),
+            ((),),
+            extern "C" fn(),
+            crate::bindings::System::Action,
+        >(f);
+        Self { h }
+    }
+
+    #[inline]
+    pub fn from_closure<Fun: Fn() + 'static>(f: Fun) -> Self {
+        type Callback = dyn Fn();
+        let boxed: Box<Callback> = Box::new(f);
+        let env = Box::into_raw(Box::new(boxed)) as *mut ();
+        unsafe { Self::from_owned_env(env, action0_trampoline) }
+    }
+
+    /// Build an action over an externally owned closure environment.
+    ///
+    /// # Safety
+    /// `env` must remain live until the delegate can no longer be invoked. `trampoline` must treat
+    /// it as the exact environment it was created from.
+    #[inline]
+    pub(crate) unsafe fn from_owned_env(env: *mut (), trampoline: extern "C" fn(*mut ())) -> Self {
+        let h = crate::intrinsics::rustc_clr_interop_delegate_closure::<
+            { CORELIB },
+            { ACTION },
+            false,
+            (),
+            ((),),
+            *mut (),
+            extern "C" fn(*mut ()),
+            crate::bindings::System::Action,
+        >(env, trampoline);
+        Self { h }
+    }
+
+    #[inline]
+    pub fn from_handle(h: crate::bindings::System::Action) -> Self {
+        Self { h }
+    }
+
+    #[inline]
+    pub fn handle(&self) -> crate::bindings::System::Action {
+        self.h
+    }
+
+    #[inline]
+    pub fn invoke(&self) {
+        self.h.invoke();
+    }
+}
+
+extern "C" fn action0_trampoline(env: *mut ()) {
+    type Callback = dyn Fn();
+    let callback = unsafe { &*(env as *const Box<Callback>) };
+    callback();
+}
+
 /// Emits one `Action<..>` / `Func<..>` wrapper: a move-only handle over the managed delegate, a
 /// `from_fn` that lowers a native fn pointer to the delegate (via `rustc_clr_interop_delegate`), an
 /// `invoke` that calls the delegate's own `Invoke` (via the WF-9 generic bridge — this is also how a

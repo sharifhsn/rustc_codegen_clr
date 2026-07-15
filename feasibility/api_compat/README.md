@@ -6,8 +6,10 @@ constructors, methods, properties, enum members, and nullability/code-analysis a
 payloads are retained as metadata blob hex so changes to nullable context and attribute arguments are
 visible without depending on runtime reflection behavior.
 
-Run `bash feasibility/api_compat_acceptance.sh`. The acceptance first compares the focused typed-DTO
-fixture with the committed baseline, then builds a temporary binary-breaking variant and proves that
-the same comparison rejects it. Update the baseline intentionally only when changing the supported
-release-package CLR contract. This is a focused binary surface check, not a complete SemVer or
+Run `bash feasibility/api_compat_acceptance.sh`. The acceptance compares both a small Roslyn control
+fixture and the real backend-generated `cd_export` managed surface with committed baselines, then
+builds a temporary binary-breaking variant and proves that the same comparison rejects it. The real
+snapshot covers `MainModule`, DTOs, generated properties/fields/constructors/methods, and a generic
+interface; compiler implementation types are intentionally excluded. Update a baseline only when
+changing the supported release-package CLR contract. This is a binary metadata gate, not a complete
 behavioral-compatibility analyzer; schema fingerprints and semantic DTO rules remain separate gates.

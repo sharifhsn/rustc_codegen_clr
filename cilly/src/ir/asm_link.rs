@@ -425,6 +425,11 @@ impl Assembly {
                 array: ctx.node(self, *array),
                 index: ctx.node(self, *index),
             },
+            CILNode::LdElem { array, index, elem } => CILNode::LdElem {
+                array: ctx.node(self, *array),
+                index: ctx.node(self, *index),
+                elem: ctx.type_id(self, *elem),
+            },
             CILNode::UnboxAny { object, tpe } => CILNode::UnboxAny {
                 object: ctx.node(self, *object),
                 tpe: ctx.type_id(self, *tpe),

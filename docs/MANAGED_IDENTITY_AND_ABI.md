@@ -14,6 +14,8 @@ package-id = "Monark.Aip.PositionParser"
 assembly-name = "Monark.Aip.PositionParser"
 root-namespace = "Monark.Aip.PositionParser"
 module-type = "AipPositionParserNative"
+public-namespaces = ["Monark.Aip.PositionParser", "Monark.Aip.PositionParser.Models"]
+compatibility-profile = "net10-coreclr"
 legacy-main-module = false
 ```
 
@@ -28,6 +30,12 @@ ManagedIdentity {
   module_type: String,
   legacy_main_module: bool,
 }
+
+ManagedProjectConfig {
+  identity: ManagedIdentity,
+  public_namespaces: Vec<String>,
+  compatibility_profile: String,
+}
 ```
 
 Rules:
@@ -35,17 +43,23 @@ Rules:
 - `package_id` is the NuGet ID and is independent of CLR assembly filename/identity.
 - `assembly_name` is the CLR assembly identity and DLL basename.
 - `root_namespace + "." + module_type` is the public static implementation type.
+- `public_namespaces` is the complete declared public namespace set. It must be nonempty, unique,
+  syntactically valid, and include `root_namespace`.
+- `compatibility_profile` must name one of the evidence-gated contracts printed by
+  `cargo dotnet profiles`; arbitrary or aspirational host names are rejected before compilation.
 - Namespace segments and `module_type` must be nonempty valid CLR/C# identifiers after Unicode
   normalization. Reserved C# words are escaped only in generated source; metadata stores the raw
   identifier.
-- Schema 1 has no guessed string identity fields: schema, package ID, assembly name, root namespace,
-  and module type are required; `legacy-main-module` defaults to false. `cargo dotnet pack --id` may
+- Schema 1 has no guessed project fields: schema, package ID, assembly name, root namespace, module
+  type, public namespaces, and compatibility profile are required; `legacy-main-module` defaults to
+  false. `cargo dotnet pack --id` may
   override only the NuGet package ID for that invocation; it never changes CLR identity.
 - Two referenced packages may share function names. CLR assembly names must be unique independently,
   and public type FQNs (`root_namespace + "." + module_type`) must be unique independently. Link and
   package validation reject either collision; comparing only the combined triple is insufficient.
-- Identity is embedded in the serialized artifact, artifact receipt, XML member IDs, NuGet
-  validation, and generated facade. A mismatch is an artifact ABI error.
+- Compiler-facing identity is embedded in the serialized artifact, XML member IDs, NuGet
+  validation, and generated facade. The complete project contract, including namespaces and host
+  profile, is recorded in the artifact receipt. A mismatch is an artifact ABI error.
 - `legacy-main-module = true` emits the historical global `MainModule`. It is never the default for
   a newly generated or release package and cannot be combined with the multi-library acceptance
   claim.

@@ -32,6 +32,32 @@
 //! - [`export_rust_string!`] emits the `rcl_str_*` core behind `RustDotnet.RustString` — a mutable,
 //!   Rust-owned UTF-8 buffer that marshals to/from a managed `System.String`.
 
+/// Explicitly keep a vector Rust-owned when exporting it to C#.
+///
+/// Ordinary `Vec<T>` export parameters and returns use managed `T[]` because that is the natural
+/// application API. `RustOwnedVec<T>` opts into the shipped disposable `RustDotnet.RustVec<T>`
+/// handle instead, avoiding the outbound array copy and making ownership/lifetime visible.
+#[repr(transparent)]
+pub struct RustOwnedVec<T>(pub Vec<T>);
+
+impl<T> RustOwnedVec<T> {
+    pub fn into_inner(self) -> Vec<T> {
+        self.0
+    }
+}
+
+impl<T> From<Vec<T>> for RustOwnedVec<T> {
+    fn from(value: Vec<T>) -> Self {
+        Self(value)
+    }
+}
+
+impl<T> From<RustOwnedVec<T>> for Vec<T> {
+    fn from(value: RustOwnedVec<T>) -> Self {
+        value.0
+    }
+}
+
 /// Emit the size-erased container core (`rcl_vec_new`/`push`/`get`/`set`/`len`/`free`) as
 /// `#[unsafe(no_mangle)] pub extern "C"` functions in the invoking crate. Call it **once**, at the crate
 /// root of your `cdylib` — the functions must be defined in *your* crate (not a dependency) so they

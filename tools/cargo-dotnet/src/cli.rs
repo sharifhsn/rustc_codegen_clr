@@ -39,6 +39,8 @@ pub struct DotnetCli {
 
 #[derive(Subcommand)]
 pub enum Cmd {
+    /// Show honest host compatibility profiles and their current support level.
+    Profiles(ProfilesArgs),
     /// Validate the product capability manifest and generate a human-readable report.
     Capabilities(CapabilitiesArgs),
     /// Populate and verify the private Cargo cache and injected sysroot for later offline builds.
@@ -69,12 +71,25 @@ pub enum Cmd {
     /// the same mechanism spinacz uses for the BCL), then wire the package's .dll into this
     /// crate's runtime output. Consuming the generated bindings needs no further ceremony.
     AddNuget(AddNugetArgs),
+    /// Fetch and stage a native-only NuGet package for P/Invoke.
+    AddNative(AddNativeArgs),
+    /// Vendor a local native library into the crate for build, run, and pack.
+    AddNativeFile(AddNativeFileArgs),
+    /// Generate ordinary Rust P/Invoke declarations from a C header.
+    Bindgen(BindgenArgs),
     /// Emit Cargo's local source/build-input closure for an MSBuild incremental target.
     MetadataInputs(MetadataInputsArgs),
     /// Reject duplicate CLR assembly names or public managed type names across Rust crates.
     ValidateManagedIdentities(ValidateManagedIdentitiesArgs),
     /// Print the CLR assembly name selected for one Rust crate (metadata identity or Cargo name).
     ManagedAssemblyName(ManagedAssemblyNameArgs),
+}
+
+#[derive(clap::Args)]
+pub struct ProfilesArgs {
+    /// Emit stable machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -242,6 +257,8 @@ pub enum Template {
     Lib,
     /// A `#[dotnet_class]` managed type + C# host (models cd_typedef).
     Plugin,
+    /// An Excel-DNA add-in whose worksheet functions call managed Rust exports.
+    Excel,
 }
 
 impl Template {
@@ -251,6 +268,7 @@ impl Template {
             Template::App => "app (Rust-on-.NET binary)",
             Template::Lib => "lib (Rust cdylib consumed from C#)",
             Template::Plugin => "plugin (#[dotnet_class] managed type)",
+            Template::Excel => "Excel-DNA add-in (worksheet functions backed by managed Rust)",
         }
     }
 }
@@ -261,14 +279,17 @@ pub struct NewArgs {
     pub path: PathBuf,
 
     /// A Rust-on-.NET binary using `mycorrhiza::prelude` (the default template).
-    #[arg(long, conflicts_with_all = ["lib", "plugin"])]
+    #[arg(long, conflicts_with_all = ["lib", "plugin", "excel"])]
     pub app: bool,
     /// A Rust cdylib exported to C# via `export_rust_containers!()` + a C# consumer.
-    #[arg(long, conflicts_with_all = ["app", "plugin"])]
+    #[arg(long, conflicts_with_all = ["app", "plugin", "excel"])]
     pub lib: bool,
     /// A `#[dotnet_class]` managed type + a C# host that constructs it.
-    #[arg(long, conflicts_with_all = ["app", "lib"])]
+    #[arg(long, conflicts_with_all = ["app", "lib", "excel"])]
     pub plugin: bool,
+    /// A Windows Excel-DNA add-in with worksheet functions backed by managed Rust.
+    #[arg(long, conflicts_with_all = ["app", "lib", "plugin"])]
+    pub excel: bool,
 
     /// Override the crate name (default: the final path component).
     #[arg(long)]
@@ -288,9 +309,10 @@ pub struct NewArgs {
 impl NewArgs {
     /// Resolve the selected template. `--app` is the default when none is given.
     pub fn template(&self) -> anyhow::Result<Template> {
-        match (self.app, self.lib, self.plugin) {
-            (_, true, _) => Ok(Template::Lib),
-            (_, _, true) => Ok(Template::Plugin),
+        match (self.app, self.lib, self.plugin, self.excel) {
+            (_, true, _, _) => Ok(Template::Lib),
+            (_, _, true, _) => Ok(Template::Plugin),
+            (_, _, _, true) => Ok(Template::Excel),
             _ => Ok(Template::App), // --app or nothing.
         }
     }
@@ -439,6 +461,71 @@ pub struct AddNugetArgs {
 }
 
 #[derive(clap::Args)]
+pub struct AddNativeArgs {
+    pub id: String,
+    pub version: String,
+    /// Logical library name used by the Rust `#[link(name = "...")]` declaration.
+    #[arg(long)]
+    pub library: String,
+    pub path: Option<PathBuf>,
+    #[arg(long)]
+    pub rid: Option<String>,
+    #[arg(long, value_name = "10", default_value = "10", env = "DOTNET_VERSION")]
+    pub dotnet: String,
+}
+
+#[derive(clap::Args)]
+pub struct AddNativeFileArgs {
+    /// Native library file to vendor.
+    pub file: PathBuf,
+    /// Logical library name used by `#[link(name = "...")]`.
+    #[arg(long)]
+    pub library: String,
+    /// Consumer crate directory (default `.`).
+    #[arg(long)]
+    pub path: Option<PathBuf>,
+    /// Runtime identifier for this binary (default current host).
+    #[arg(long)]
+    pub rid: Option<String>,
+}
+
+#[derive(clap::Args)]
+pub struct BindgenArgs {
+    /// C header to parse, relative to the consumer crate unless absolute.
+    pub header: PathBuf,
+    /// Logical library name written into generated `#[link(name = "...")]` attributes.
+    #[arg(long)]
+    pub library: String,
+    /// Consumer crate directory (default `.`).
+    #[arg(long)]
+    pub path: Option<PathBuf>,
+    /// Generated Rust module, relative to the consumer crate.
+    #[arg(short, long, default_value = "src/native.rs")]
+    pub output: PathBuf,
+    /// Regex selecting C functions. Repeat to build an allowlist.
+    #[arg(long)]
+    pub allowlist_function: Vec<String>,
+    /// Regex selecting C types. Repeat to build an allowlist.
+    #[arg(long)]
+    pub allowlist_type: Vec<String>,
+    /// Regex excluding an item. Repeat as needed.
+    #[arg(long)]
+    pub blocklist_item: Vec<String>,
+    /// Argument forwarded to libclang, such as `-Ivendor/include`. Repeat as needed.
+    #[arg(long, allow_hyphen_values = true)]
+    pub clang_arg: Vec<String>,
+    /// Derive `Default` where bindgen can do so safely.
+    #[arg(long)]
+    pub derive_default: bool,
+    /// Emit bindgen layout tests. Disabled by default for product builds.
+    #[arg(long)]
+    pub layout_tests: bool,
+    /// Fail if the checked-in output differs, without rewriting it.
+    #[arg(long)]
+    pub check: bool,
+}
+
+#[derive(clap::Args)]
 pub struct MetadataInputsArgs {
     /// The crate dir to inspect (default `.`).
     pub path: Option<PathBuf>,
@@ -483,4 +570,85 @@ pub struct PublishArgs {
     /// Extra flags forwarded verbatim to `dotnet publish` (e.g. `-p:InvariantGlobalization=true`).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub extra: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_excel_selects_the_excel_dna_template() {
+        let cli =
+            DotnetCli::try_parse_from(["cargo-dotnet", "new", "risk-engine", "--excel"]).unwrap();
+        let Cmd::New(args) = cli.cmd else {
+            panic!("new --excel did not parse to the new command")
+        };
+        assert_eq!(args.template().unwrap(), Template::Excel);
+        assert_eq!(args.dotnet, "10");
+    }
+
+    #[test]
+    fn add_native_cli_keeps_package_version_library_and_path_explicit() {
+        let cli = DotnetCli::try_parse_from([
+            "cargo-dotnet",
+            "add-native",
+            "SQLitePCLRaw.lib.e_sqlite3",
+            "3.53.3",
+            "--library",
+            "e_sqlite3",
+            "--rid",
+            "osx-arm64",
+            "fixture",
+        ])
+        .unwrap();
+        let Cmd::AddNative(args) = cli.cmd else {
+            panic!("add-native did not parse to its command variant")
+        };
+        assert_eq!(args.id, "SQLitePCLRaw.lib.e_sqlite3");
+        assert_eq!(args.version, "3.53.3");
+        assert_eq!(args.library, "e_sqlite3");
+        assert_eq!(args.rid.as_deref(), Some("osx-arm64"));
+        assert_eq!(args.path.as_deref(), Some(std::path::Path::new("fixture")));
+    }
+
+    #[test]
+    fn bindgen_cli_keeps_generation_policy_explicit() {
+        let cli = DotnetCli::try_parse_from([
+            "cargo-dotnet",
+            "bindgen",
+            "vendor/sqlite3.h",
+            "--library",
+            "e_sqlite3",
+            "--allowlist-function",
+            "sqlite3_.*",
+            "--clang-arg=-Ivendor",
+        ])
+        .unwrap();
+        let Cmd::Bindgen(args) = cli.cmd else {
+            panic!("bindgen did not parse to its command variant")
+        };
+        assert_eq!(args.library, "e_sqlite3");
+        assert_eq!(args.output, PathBuf::from("src/native.rs"));
+        assert_eq!(args.allowlist_function, ["sqlite3_.*"]);
+        assert_eq!(args.clang_arg, ["-Ivendor"]);
+    }
+
+    #[test]
+    fn local_native_file_cli_requires_its_logical_name() {
+        let cli = DotnetCli::try_parse_from([
+            "cargo-dotnet",
+            "add-native-file",
+            "vendor/libsample.dylib",
+            "--library",
+            "sample",
+            "--rid",
+            "osx-arm64",
+        ])
+        .unwrap();
+        let Cmd::AddNativeFile(args) = cli.cmd else {
+            panic!("add-native-file did not parse to its command variant")
+        };
+        assert_eq!(args.library, "sample");
+        assert_eq!(args.rid.as_deref(), Some("osx-arm64"));
+    }
 }

@@ -1,0 +1,5 @@
+error: #[dotnet_native_job]: the first parameter must be NativeJobController<Result, Error, Progress> matching the declared result, error, and progress types
+  --> tests/ui/dotnet_native_job_controller_mismatch.rs:15:22
+   |
+15 | fn start(controller: NativeJobController<i64, i32, i32>) -> Result<Registration, StartError> {
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

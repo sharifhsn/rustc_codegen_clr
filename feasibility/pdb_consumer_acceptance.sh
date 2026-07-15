@@ -4,7 +4,7 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-driver="${RCL_PDB_DRIVER:-$repo/tools/cargo-dotnet/target/release/cargo-dotnet}"
+driver="${RCL_PDB_DRIVER:-$repo/target/release/cargo-dotnet}"
 dotnet_version="${DOTNET_VERSION:-10}"
 fixture="$repo/cargo_tests/cd_export_ergonomics"
 log_dir="${RCL_PDB_LOG_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/rustdotnet-pdb.XXXXXX")}"

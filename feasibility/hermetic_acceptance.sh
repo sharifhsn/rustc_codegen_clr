@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-driver="$repo/tools/cargo-dotnet/target/release/cargo-dotnet"
+driver="$repo/target/release/cargo-dotnet"
 log_dir="${RCL_HERMETIC_LOG_DIR:-/tmp/rustc_codegen_clr-hermetic-acceptance}"
 mkdir -p "$log_dir"
 run_root="$(mktemp -d "${TMPDIR:-/tmp}/rustdotnet-parallel.XXXXXX")"

@@ -57,9 +57,16 @@ result with ordinary Rust code.
 - Rust applications compiled to managed .NET executables
 - Rust libraries and plugins consumed from C#
 - .NET BCL and NuGet APIs called from Rust
+- Native C ABI libraries called from Rust through generated or handwritten `#[link]` declarations,
+  explicit safe-wrapper helpers, and CLR P/Invoke
 - Managed generics, interfaces, delegates, tasks, async streams, events, arrays, and collections
+- Ordinary `#[dotnet_export] async fn` APIs consumed as C# `Task`/`Task<T>` methods
 - C#-friendly exported Rust APIs and deterministic NuGet packages
 - MSBuild integration, Portable PDBs, Source Link, and NativeAOT publishing
+- A Windows Excel-DNA scaffold that packages worksheet functions backed by managed Rust into a
+  64-bit `.xll` (`cargo dotnet new ./risk-engine --excel`)
+- Evidence-gated host contracts visible through `cargo dotnet profiles`—including honest preview,
+  planned, and unsupported Office/Unity/MAUI combinations
 - An alternate C exporter from the same compiler IR
 
 The public 0.0.1 SDK supports one deliberately narrow configuration:
@@ -80,8 +87,12 @@ CoreCLR tools, examples, and diagnostics consistent.
 
 - [`QUICKSTART.md`](QUICKSTART.md) — installation and first run
 - [`docs/CARGO_DOTNET.md`](docs/CARGO_DOTNET.md) — command reference and troubleshooting
+- [`docs/OFFICE_UNITY_MAUI_ERGONOMICS_EXECUTION_PLAN.md`](docs/OFFICE_UNITY_MAUI_ERGONOMICS_EXECUTION_PLAN.md)
+  — honest Office, Unity, and MAUI compatibility matrix and implementation ledger
 - [`docs/QUICKSTART_INTEROP.md`](docs/QUICKSTART_INTEROP.md) — Rust and C# interop examples
 - [`docs/INTEROP_COOKBOOK.md`](docs/INTEROP_COOKBOOK.md) — supported interop patterns
+- [`book/src/interop/native-from-rust.md`](book/src/interop/native-from-rust.md) — restore a native
+  SQLite package and call it from Rust through P/Invoke
 - [`docs/TRANSLATION_STATUS.md`](docs/TRANSLATION_STATUS.md) — compiler coverage and semantic limits
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — compiler pipeline and design
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — contributor setup and test selection

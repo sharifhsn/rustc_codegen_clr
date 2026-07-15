@@ -110,7 +110,7 @@ These PRs should contain tests/specifications, not broad implementation.
   `osx-arm64`, including `runtimeTargets`, native files, managed runtime files, resources, RID
   fallback, and two intentional collisions.
 - Snapshot the expected logical asset graph; no copying implementation in this PR.
-- Anchors: `tools/cargo-dotnet/src/nuget_assets.rs` and new fixture directory.
+- Anchors: `crates/rust-dotnet-assets/src/assets.rs` and its `fixtures/nuget-assets/` directory.
 
 ### R0.4 Cargo graph invalidation fixture — S
 

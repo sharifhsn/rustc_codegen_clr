@@ -1,0 +1,11 @@
+[package]
+name = "rust-dotnet-pinvoke"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Explicit helpers for Rust declarations calling native libraries"
+
+[features]
+default = ["std"]
+alloc = []
+std = ["alloc"]

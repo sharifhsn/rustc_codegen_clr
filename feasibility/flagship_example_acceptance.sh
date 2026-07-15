@@ -4,7 +4,7 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 example="$repo/examples/issue-dashboard"
 dotnet_version="${DOTNET_VERSION:-10}"
-driver="$repo/tools/cargo-dotnet/target/release/cargo-dotnet"
+driver="$repo/target/release/cargo-dotnet"
 work="$(mktemp -d "${TMPDIR:-/tmp}/rustdotnet-flagship.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 

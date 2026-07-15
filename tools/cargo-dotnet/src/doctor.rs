@@ -111,7 +111,8 @@ pub fn run(args: &DoctorArgs) -> Result<i32> {
 
     // Environment check mode.
     let checks = environment_checks(&args.dotnet);
-    let wiring_checks = workspace_wiring_checks(&args.workspace);
+    let mut wiring_checks = workspace_wiring_checks(&args.workspace);
+    wiring_checks.extend(native_import_checks(&args.workspace));
     let fails = checks
         .iter()
         .chain(&wiring_checks)
@@ -164,6 +165,82 @@ pub fn run(args: &DoctorArgs) -> Result<i32> {
         );
         Ok(1)
     }
+}
+
+fn native_import_checks(workspace: &Path) -> Vec<Check> {
+    use std::collections::BTreeSet;
+    use syn::visit::Visit;
+
+    #[derive(Default)]
+    struct LinkVisitor {
+        libraries: BTreeSet<String>,
+    }
+    impl<'ast> Visit<'ast> for LinkVisitor {
+        fn visit_item_foreign_mod(&mut self, item: &'ast syn::ItemForeignMod) {
+            for attribute in &item.attrs {
+                if !attribute.path().is_ident("link") {
+                    continue;
+                }
+                let _ = attribute.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("name") {
+                        let value: syn::LitStr = meta.value()?.parse()?;
+                        self.libraries.insert(value.value());
+                    }
+                    Ok(())
+                });
+            }
+            syn::visit::visit_item_foreign_mod(self, item);
+        }
+    }
+
+    fn visit_rs(root: &Path, visitor: &mut LinkVisitor) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                visit_rs(&path, visitor);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+                && let Ok(source) = std::fs::read_to_string(&path)
+                && let Ok(file) = syn::parse_file(&source)
+            {
+                visitor.visit_file(&file);
+            }
+        }
+    }
+
+    let source_root = workspace.join("src");
+    if !source_root.is_dir() {
+        return Vec::new();
+    }
+    let mut visitor = LinkVisitor::default();
+    visit_rs(&source_root, &mut visitor);
+    if visitor.libraries.is_empty() {
+        return Vec::new();
+    }
+    let staged = crate::nuget::staged_package_assets(workspace).unwrap_or_default();
+    visitor
+        .libraries
+        .into_iter()
+        .map(|library| {
+            let matches = staged.iter().any(|asset| {
+                asset.kind == crate::nuget::StagedPackageAssetKind::Native
+                    && crate::nuget::native_library_matches(&library, &asset.source)
+            });
+            if matches {
+                Check::pass(
+                    format!("native import {library}"),
+                    "matching RID-native package asset is staged",
+                )
+            } else {
+                Check::warn(
+                    format!("native import {library}"),
+                    "no matching staged package asset; this is valid only when the OS loader can resolve a system or locally supplied library",
+                )
+            }
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -246,8 +323,12 @@ fn environment_checks(dotnet_version: &str) -> Vec<Check> {
     // The pinned nightly toolchain (rust-src + rustc-dev are what the backend needs).
     checks.push(check_pinned_toolchain());
 
-    // dotnet.
-    let heal = host::dotnet_env_adds();
+    // dotnet. Select the requested profile before choosing among side-by-side hosts.
+    let dotnet: Result<crate::context::DotnetVersion, _> = dotnet_version.parse();
+    let heal = dotnet
+        .as_ref()
+        .ok()
+        .and_then(|dotnet| host::dotnet_env_adds_for(dotnet.as_env()));
     let dotnet_reachable = host::ensure_dotnet(&heal).is_ok();
     checks.push(match host::ensure_dotnet(&heal) {
         Ok(()) => Check::pass("dotnet runtime reachable", ""),
@@ -257,7 +338,6 @@ fn environment_checks(dotnet_version: &str) -> Vec<Check> {
     // The selected runtime profile must actually be installed. Merely finding a `dotnet` binary is
     // insufficient: an older SDK can otherwise survive setup and fail only after an expensive
     // Rust build with the runtime's opaque "install or update .NET" message.
-    let dotnet = dotnet_version.parse();
     match dotnet {
         Ok(dotnet) => {
             if dotnet_reachable {

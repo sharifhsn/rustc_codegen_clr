@@ -1,6 +1,6 @@
 //! RUSTFLAGS assembly. Ports `_cargo_dotnet_core.sh`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The RUSTFLAGS the backend needs:
 ///   `-Z codegen-backend=<dylib> -C linker=<linker> -C link-args=--cargo-support`
@@ -30,6 +30,7 @@ use std::path::Path;
 pub fn assemble(
     backend_dylib: &Path,
     linker: &Path,
+    sdk_crates_root: &Path,
     dotnet_version: &str,
     source_remaps: &[(&Path, &str)],
     source_link_url: Option<&str>,
@@ -71,10 +72,17 @@ pub fn assemble(
         }
         None => base,
     };
-    match backend_content_key(backend_dylib) {
-        Some(key) => format!("{base} --cfg cd_backend_{key} --check-cfg=cfg(cd_backend_{key})"),
-        None => base,
+    let mut base = base;
+    if let Some(key) = producer_content_key(backend_dylib) {
+        base = format!("{base} --cfg cd_backend_{key} --check-cfg=cfg(cd_backend_{key})");
     }
+    if let Some(key) = producer_content_key(linker) {
+        base = format!("{base} --cfg cd_linker_{key} --check-cfg=cfg(cd_linker_{key})");
+    }
+    if let Some(key) = sdk_codegen_content_key(sdk_crates_root) {
+        base = format!("{base} --cfg cd_sdk_{key} --check-cfg=cfg(cd_sdk_{key})");
+    }
+    base
 }
 
 #[cfg(test)]
@@ -86,8 +94,9 @@ mod tests {
     fn runtime_version_changes_cargo_fingerprint() {
         let backend = Path::new("/missing/backend");
         let linker = Path::new("/missing/linker");
-        let net8 = assemble(backend, linker, "8", &[], None);
-        let net10 = assemble(backend, linker, "10", &[], None);
+        let sdk = Path::new("/missing/sdk");
+        let net8 = assemble(backend, linker, sdk, "8", &[], None);
+        let net10 = assemble(backend, linker, sdk, "10", &[], None);
 
         assert_ne!(net8, net10);
         assert!(net8.contains("--cfg cd_dotnet_8 --check-cfg=cfg(cd_dotnet_8)"));
@@ -101,6 +110,7 @@ mod tests {
         let first = assemble(
             backend,
             linker,
+            Path::new("/missing/sdk"),
             "10",
             &[],
             Some("https://example.invalid/one/*"),
@@ -108,6 +118,7 @@ mod tests {
         let second = assemble(
             backend,
             linker,
+            Path::new("/missing/sdk"),
             "10",
             &[],
             Some("https://example.invalid/two/*"),
@@ -115,6 +126,31 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.contains("--cfg cd_sourcelink_"));
         assert!(!first.contains("example.invalid"));
+    }
+
+    #[test]
+    fn sdk_codegen_source_changes_cargo_fingerprint() {
+        let root =
+            std::env::temp_dir().join(format!("cargo-dotnet-sdk-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("dotnet_macros/src")).unwrap();
+        std::fs::write(
+            root.join("dotnet_macros/Cargo.toml"),
+            "[package]\nname='x'\n",
+        )
+        .unwrap();
+        let source = root.join("dotnet_macros/src/lib.rs");
+        std::fs::write(&source, "pub fn first() {}\n").unwrap();
+
+        let first = super::sdk_codegen_content_key(&root).unwrap();
+        std::fs::write(&source, "pub fn second() {}\n").unwrap();
+        let second = super::sdk_codegen_content_key(&root).unwrap();
+        assert_ne!(first, second);
+
+        std::fs::create_dir_all(root.join("dotnet_macros/target")).unwrap();
+        std::fs::write(root.join("dotnet_macros/target/ignored"), "noise").unwrap();
+        assert_eq!(second, super::sdk_codegen_content_key(&root).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -129,7 +165,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// 16-hex-char FNV-1a digest of the backend dylib's bytes; `None` if it can't be read
 /// (in which case we omit the cfg and fall back to the prior path-keyed behavior).
-fn backend_content_key(path: &Path) -> Option<String> {
+fn producer_content_key(path: &Path) -> Option<String> {
     let mut bytes = std::fs::read(path).ok()?;
     normalize_producer_binary(path, &mut bytes);
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -138,6 +174,58 @@ fn backend_content_key(path: &Path) -> Option<String> {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     Some(format!("{h:016x}"))
+}
+
+/// Stable content key for SDK-owned crates whose proc macros or runtime wrappers can change the
+/// generated public assembly without changing the backend dylib path. Cargo normally tracks path
+/// dependencies itself; this inert cfg is a second, product-level fence that also covers installed
+/// bundle layouts and prevents a stale consumer artifact when an SDK crate is replaced in place.
+fn sdk_codegen_content_key(root: &Path) -> Option<String> {
+    let candidates = [
+        root.join("dotnet_macros"),
+        root.join("mycorrhiza"),
+        root.join("rust-dotnet-pinvoke"),
+        root.join("crates/rust-dotnet-pinvoke"),
+    ];
+    let mut files = Vec::new();
+    for candidate in candidates.iter().filter(|path| path.is_dir()) {
+        collect_sdk_files(candidate, &mut files).ok()?;
+    }
+    if files.is_empty() {
+        return None;
+    }
+    files.sort();
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    for path in files {
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        hash_bytes(&mut hash, relative.to_string_lossy().as_bytes());
+        hash_bytes(&mut hash, &std::fs::read(path).ok()?);
+    }
+    Some(format!("{hash:016x}"))
+}
+
+fn collect_sdk_files(root: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        if name == "target" || name == ".git" {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            collect_sdk_files(&path, files)?;
+        } else if entry.file_type()?.is_file() {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
 }
 
 /// Mach-O's linker-generated UUID changes between otherwise identical builds. It has no effect

@@ -5,9 +5,29 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out="${RCL_API_DOCS_DIR:-/tmp/rustc_codegen_clr-api-documentation}"
 dotnet_version="${DOTNET_VERSION:-10}"
 tfm="net${dotnet_version}.0"
-driver="$repo/tools/cargo-dotnet/target/release/cargo-dotnet"
+driver="$repo/target/release/cargo-dotnet"
 work="$(mktemp -d "${TMPDIR:-/tmp}/rustdotnet-api-docs.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
+
+select_dotnet() {
+    local candidate
+    for candidate in \
+        "${DOTNET_ROOT:+$DOTNET_ROOT/dotnet}" \
+        "$(command -v dotnet 2>/dev/null || true)" \
+        "$HOME/.dotnet/dotnet" \
+        "$HOME/.dotnet/dotnet.exe"; do
+        [[ -n "$candidate" && -f "$candidate" ]] || continue
+        if "$candidate" --list-sdks | grep -q "^${dotnet_version}\."; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    echo ".NET $dotnet_version SDK is required for API documentation acceptance" >&2
+    return 1
+}
+
+dotnet_cmd="$(select_dotnet)"
+dotnet_root="$(cd "$(dirname "$dotnet_cmd")" && pwd)"
 
 fail() {
     echo "api docs acceptance: $*" >&2
@@ -28,7 +48,8 @@ RUSTDOCFLAGS="-D warnings" CARGO_TARGET_DIR="$work/rustdoc-target" cargo doc \
     --manifest-path "$repo/tools/cargo-dotnet/Cargo.toml" --no-deps \
     >"$out/logs/rustdoc-cargo-dotnet.log" 2>&1
 
-for crate in rustc_codegen_clr cilly mycorrhiza dotnet_aot dotnet_macros cargo_dotnet; do
+for crate in rustc_codegen_clr cilly mycorrhiza dotnet_aot dotnet_macros cargo_dotnet \
+    rust_dotnet_assets rust_dotnet_bindgen rust_dotnet_sdk_core rust_dotnet_pinvoke; do
     [[ -f "$work/rustdoc-target/doc/$crate/index.html" ]] \
         || fail "missing generated Rust API index for $crate"
 done
@@ -43,6 +64,10 @@ cp -R "$work/rustdoc-target/doc/." "$out/rust/"
         '<li><a href="mycorrhiza/index.html">mycorrhiza interop API</a></li>' \
         '<li><a href="cargo_dotnet/index.html">cargo-dotnet driver</a></li>' \
         '<li><a href="dotnet_macros/index.html">dotnet macros</a></li>' \
+        '<li><a href="rust_dotnet_assets/index.html">Rust/.NET asset resolution</a></li>' \
+        '<li><a href="rust_dotnet_bindgen/index.html">C-header P/Invoke generation</a></li>' \
+        '<li><a href="rust_dotnet_sdk_core/index.html">Rust/.NET SDK core</a></li>' \
+        '<li><a href="rust_dotnet_pinvoke/index.html">P/Invoke helpers</a></li>' \
         '<li><a href="dotnet_aot/index.html">NativeAOT helpers</a></li>' '</ul>' \
         >"$out/rust/index.html"
 }
@@ -69,8 +94,51 @@ else
 fi
 grep -Fq '<member name="M:MainModule.greet(System.String)">' "$out/csharp/cd_export.xml" \
     || fail "generated C# documentation lacks the greet API member"
-grep -Fq 'inbound `&amp;str`, outbound `String`' "$out/csharp/cd_export.xml" \
-    || fail "generated C# documentation lacks the Rust source summary"
+grep -Fq '<param name="name">Name to include in the greeting; `&lt;` and `&amp;` remain escaped in IntelliSense.</param>' "$out/csharp/cd_export.xml" \
+    || fail "generated C# documentation lacks the greet parameter contract"
+grep -Fq '<returns>A greeting produced by managed Rust.</returns>' "$out/csharp/cd_export.xml" \
+    || fail "generated C# documentation lacks the greet return contract"
+grep -Fq '<exception cref="T:System.Exception">Thrown when the checked answer is unavailable.</exception>' "$out/csharp/cd_export.xml" \
+    || fail "generated C# documentation lacks the managed exception contract"
+grep -Fq '<member name="T:RiskQuote">' "$out/csharp/cd_export.xml" \
+    || fail "generated C# documentation lacks the DTO type"
+grep -Fq '<member name="M:RiskQuote.#ctor(System.Int32,System.Boolean)">' "$out/csharp/cd_export.xml" \
+    || fail "generated C# documentation lacks the DTO primary constructor"
+grep -Fq '<member name="M:RiskQuote.#ctor">' "$out/csharp/cd_export.xml" \
+    || fail "generated C# documentation lacks the parameterless DTO constructor"
+grep -Fq '<member name="P:RiskQuote.Value">' "$out/csharp/cd_export.xml" \
+    || fail "generated C# documentation lacks the DTO property"
+grep -Fq '<member name="M:DocumentationCalculator.Project(System.Int32)">' "$out/csharp/cd_export.xml" \
+    || fail "generated C# documentation lacks the generated method"
+grep -Fq '<param name="periods">Number of periods to project.</param>' "$out/csharp/cd_export.xml" \
+    || fail "generated C# documentation lacks the generated-method parameter contract"
+grep -Fq '<member name="T:IDocumentedBox`1">' "$out/csharp/cd_export.xml" \
+    || fail "generated C# documentation lacks the generic interface type"
+grep -Fq '<typeparam name="T">Value stored by the interface.</typeparam>' "$out/csharp/cd_export.xml" \
+    || fail "generated C# documentation lacks the interface type-parameter contract"
+grep -Fq '<member name="M:IDocumentedBox`1.Put(`0)">' "$out/csharp/cd_export.xml" \
+    || fail "generated C# documentation lacks the interface method"
+grep -Fq '<member name="M:IDocumentedBox`1.Echo``1(``0)">' "$out/csharp/cd_export.xml" \
+    || fail "generated C# documentation lacks the generic interface method"
+grep -Fq '<typeparam name="U">Echoed value type.</typeparam>' "$out/csharp/cd_export.xml" \
+    || fail "generated C# documentation lacks the method type-parameter contract"
+grep -Fq '<member name="P:IDocumentedBox`1.Count">' "$out/csharp/cd_export.xml" \
+    || fail "generated C# documentation lacks the interface property"
+grep -Fq '<member name="M:MainModule.version">' "$out/csharp/cd_export.xml" \
+    || fail "parameterless XML member IDs must omit parentheses"
+
+echo '== run clean packaged documentation consumer =='
+cp -R "$repo/feasibility/fixtures/api_docs_consumer" "$work/consumer"
+DOTNET_ROOT="$dotnet_root" "$dotnet_cmd" restore "$work/consumer/ApiDocsConsumer.csproj" \
+    -p:RclPackageSource="$work/package" \
+    -p:RestorePackagesPath="$work/nuget-cache" \
+    >"$out/logs/csharp-xmldoc-consumer-restore.log" 2>&1
+DOTNET_ROOT="$dotnet_root" "$dotnet_cmd" run --project "$work/consumer/ApiDocsConsumer.csproj" --no-restore \
+    -p:RclPackageSource="$work/package" \
+    -p:RestorePackagesPath="$work/nuget-cache" \
+    >"$out/logs/csharp-xmldoc-consumer-run.log" 2>&1
+grep -Fq 'api docs clean consumer: PASS' "$out/logs/csharp-xmldoc-consumer-run.log" \
+    || fail "clean packaged documentation consumer did not pass"
 
 cp "$package" "$out/packages/"
 cp "$package.sha256" "$out/packages/"
@@ -87,9 +155,10 @@ driver_warnings="$(grep -c '^warning:' "$out/logs/rustdoc-cargo-dotnet.log" || t
     printf 'dotnet_tfm=%s\n' "$tfm"
     printf 'rustdoc_workspace_warnings=%s\n' "$workspace_warnings"
     printf 'rustdoc_cargo_dotnet_warnings=%s\n' "$driver_warnings"
-    printf 'rust_indexes=%s\n' 'rustc_codegen_clr,cilly,mycorrhiza,dotnet_aot,dotnet_macros,cargo_dotnet'
+    printf 'rust_indexes=%s\n' 'rustc_codegen_clr,cilly,mycorrhiza,dotnet_aot,dotnet_macros,cargo_dotnet,rust_dotnet_assets,rust_dotnet_bindgen,rust_dotnet_sdk_core,rust_dotnet_pinvoke'
     printf 'csharp_xml=%s\n' "$xml_path"
-    printf 'csharp_probe_member=%s\n' 'M:MainModule.greet(System.String)'
+    printf 'csharp_probe_members=%s\n' 'method,param,return,exception,type,constructor,property,generated-method,generic-interface,generic-method,nullable-export,nullable-method,nullable-interface,nullable-dto'
+    printf 'clean_packaged_consumer=%s\n' 'passed'
     printf 'publication_performed=false\n'
 } >"$out/SUMMARY.txt"
 

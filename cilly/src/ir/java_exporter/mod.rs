@@ -36,7 +36,9 @@ impl JavaExporter {
         for class_def in asm.iter_class_defs() {
             let vis = match class_def.access() {
                 crate::Access::Extern | crate::Access::Public => "public",
-                crate::Access::Private => "private",
+                crate::Access::Private
+                | crate::Access::Assembly
+                | crate::Access::InternalExtern => "private",
             };
             let sealed = if class_def.is_valuetype() {
                 "final"

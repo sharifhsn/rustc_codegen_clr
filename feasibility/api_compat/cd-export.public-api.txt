@@ -1,0 +1,50 @@
+constructor NullableProfile()
+constructor NullableProfile(System.String,System.String attrs=[System.Runtime.CompilerServices.NullableAttribute(0100020000)]) attrs=[System.Runtime.CompilerServices.NullableContextAttribute(0100010000)]
+constructor RiskQuote()
+constructor RiskQuote(System.Int32,System.Boolean)
+field DocumentationCalculator.MarkerState:System.Int32 static  attrs=[Mycorrhiza.Interop.Helpers.RustApiAttribute(01000C7374617469632D6669656C640000)]
+field NullableProfile.optionalName:System.String
+field NullableProfile.requiredName:System.String  attrs=[Mycorrhiza.Interop.Helpers.RustApiAttribute(01000E72657175697265642D6669656C640000)]
+field RiskQuote.active:System.Boolean
+field RiskQuote.value:System.Int32
+interface IDocumentedBox`1
+method DocumentationCalculator.OptionalLabel(System.String attrs=[System.Runtime.CompilerServices.NullableAttribute(0100020000)]):System.String attrs=[System.Runtime.CompilerServices.NullableAttribute(0100020000)] attrs=[System.Runtime.CompilerServices.NullableContextAttribute(0100010000)]
+method DocumentationCalculator.Project(System.Int32 attrs=[Mycorrhiza.Interop.Helpers.RustApiAttribute(01000F70726F6A6563742D706572696F64730000)]):System.Int32 attrs=[Mycorrhiza.Interop.Helpers.RustApiAttribute(01000E70726F6A6563742D726573756C740000)] attrs=[Mycorrhiza.Interop.Helpers.RustApiAttribute(01000770726F6A6563740000)]
+method DocumentationCalculator.RequiredLabel(System.String):System.String attrs=[System.Runtime.CompilerServices.NullableContextAttribute(0100010000)]
+method DocumentationCalculator.get_MarkerState():System.Int32
+method DocumentationCalculator.set_MarkerState(System.Int32):System.Void
+method IDocumentedBox`1.Echo(!!0):!!0
+method IDocumentedBox`1.OptionalLabel(System.String attrs=[System.Runtime.CompilerServices.NullableAttribute(0100020000)]):System.String attrs=[System.Runtime.CompilerServices.NullableAttribute(0100020000)] attrs=[System.Runtime.CompilerServices.NullableContextAttribute(0100010000)]
+method IDocumentedBox`1.Put(!0):System.Void
+method IDocumentedBox`1.RequiredLabel(System.String):System.String attrs=[System.Runtime.CompilerServices.NullableContextAttribute(0100010000)]
+method MainModule.add(System.Int32,System.Int32):System.Int32
+method MainModule.boom(System.String):System.Int32 attrs=[System.Runtime.CompilerServices.NullableContextAttribute(0100010000)]
+method MainModule.checked_answer(System.Boolean):System.Int32
+method MainModule.compute_answer():System.Threading.Tasks.Task`1<System.Int32> attrs=[System.Runtime.CompilerServices.NullableContextAttribute(0100010000)]
+method MainModule.delayed_ping():System.Threading.Tasks.Task
+method MainModule.greet(System.String attrs=[Mycorrhiza.Interop.Helpers.RustApiAttribute(01000D6772656574696E672D6E616D650000)]):System.String attrs=[Mycorrhiza.Interop.Helpers.RustApiAttribute(01000F6772656574696E672D726573756C740000)] attrs=[Mycorrhiza.Interop.Helpers.RustApiAttribute(01000567726565740200540206537461626C65015408054F7264657201000000),System.Runtime.CompilerServices.NullableContextAttribute(0100010000)]
+method MainModule.is_even(System.Int64):System.Boolean
+method MainModule.maybe_greet(System.String attrs=[System.Runtime.CompilerServices.NullableAttribute(0100020000)]):System.String attrs=[System.Runtime.CompilerServices.NullableAttribute(0100020000)] attrs=[System.Runtime.CompilerServices.NullableContextAttribute(0100010000)]
+method MainModule.ping():System.Void
+method MainModule.range(System.Int32,System.Int32):System.Int32[] attrs=[System.Runtime.CompilerServices.NullableContextAttribute(0100010000)]
+method MainModule.rust_owned_range(System.Int32):System.UIntPtr
+method MainModule.scale(System.Double,System.Int32):System.Double
+method MainModule.shout(System.String):System.String attrs=[System.Runtime.CompilerServices.NullableContextAttribute(0100010000)]
+method MainModule.squares(System.Int32):System.Int64[] attrs=[System.Runtime.CompilerServices.NullableContextAttribute(0100010000)]
+method MainModule.str_len(System.String):System.Int32 attrs=[System.Runtime.CompilerServices.NullableContextAttribute(0100010000)]
+method MainModule.typed_failure():System.Int32
+method MainModule.version():System.String attrs=[System.Runtime.CompilerServices.NullableContextAttribute(0100010000)]
+method NullableProfile.read_optionalName():System.String attrs=[System.Runtime.CompilerServices.NullableAttribute(0100020000)] attrs=[System.Runtime.CompilerServices.NullableContextAttribute(0100010000)]
+method NullableProfile.read_requiredName():System.String attrs=[System.Runtime.CompilerServices.NullableContextAttribute(0100010000)]
+method RiskQuote.read_active():System.Boolean
+method RiskQuote.read_value():System.Int32
+property IDocumentedBox`1.Count:System.Int32 {get;} attrs=[Mycorrhiza.Interop.Helpers.RustApiAttribute(01000E636F756E742D70726F70657274790000)]
+property IDocumentedBox`1.OptionalName:System.String {get;} attrs=[System.Runtime.CompilerServices.NullableAttribute(0100020000)]
+property NullableProfile.OptionalName:System.String {get;set;} attrs=[System.Runtime.CompilerServices.NullableAttribute(0100020000)]
+property NullableProfile.RequiredName:System.String {get;set;} attrs=[Mycorrhiza.Interop.Helpers.RustApiAttribute(01001172657175697265642D70726F70657274790100540206537461626C6501),System.Runtime.CompilerServices.NullableAttribute(0100010000)]
+property RiskQuote.Active:System.Boolean {get;set;}
+property RiskQuote.Value:System.Int32 {get;set;}
+type DocumentationCalculator
+type MainModule
+type NullableProfile
+type RiskQuote

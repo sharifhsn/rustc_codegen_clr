@@ -98,8 +98,7 @@ pub fn locate(json: &str, ctx: &Context) -> Result<Artifact> {
         let file = so.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
         let cargo_stem = file.strip_prefix("lib").unwrap_or(file).to_string();
         let stem = ctx
-            .managed_identity
-            .as_ref()
+            .managed_identity()
             .map(|identity| identity.assembly_name.clone())
             .unwrap_or_else(|| cargo_stem.clone());
         let dll = so.with_file_name(format!("{stem}.dll"));
@@ -114,12 +113,9 @@ pub fn locate(json: &str, ctx: &Context) -> Result<Artifact> {
         );
         // Best-effort sidecar XML doc for `#[dotnet_export]` doc comments (see `xmldoc.rs`); never
         // fails the build over doc generation.
-        if let Err(e) = crate::xmldoc::generate(
-            &ctx.crate_dir,
-            &cargo_stem,
-            &dll,
-            ctx.managed_identity.as_ref(),
-        ) {
+        if let Err(e) =
+            crate::xmldoc::generate(&ctx.crate_dir, &cargo_stem, &dll, ctx.managed_identity())
+        {
             eprintln!("== xml docs: skipped ({e}) ==");
         }
         return Ok(Artifact::Library { so, dll, stem });

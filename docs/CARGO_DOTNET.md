@@ -17,8 +17,9 @@ development and archaeology, but it is not part of this release contract.
 
 ```text
 cargo dotnet setup --from-repo PATH
+cargo dotnet profiles [--json]
 cargo dotnet doctor [MESSAGE_OR_LOG] [--workspace PATH] [--json]
-cargo dotnet new PATH --app|--lib|--plugin
+cargo dotnet new PATH --app|--lib|--plugin|--excel
 cargo dotnet build [PATH]
 cargo dotnet run [PATH] [-- PROGRAM_ARGS...]
 cargo dotnet test [PATH]
@@ -26,7 +27,10 @@ cargo dotnet restore [PATH] [--locked|--offline|--frozen]
 cargo dotnet pack [PATH] [--out DIR] [--validate]
 cargo dotnet push PACKAGE --source URL
 cargo dotnet publish CSPROJ_OR_DIR [--rid RID] [--output DIR]
-cargo dotnet add-nuget PACKAGE VERSION OUT_DIR [--source URL]
+cargo dotnet add-nuget PACKAGE VERSION [PATH] [--source URL]
+cargo dotnet add-native PACKAGE VERSION --library NAME [PATH] [--rid RID]
+cargo dotnet add-native-file FILE --library NAME [--path PATH] [--rid RID]
+cargo dotnet bindgen HEADER --library NAME [--path PATH] [--output FILE]
 cargo dotnet bundle create --home PATH --out SDK.zip
 cargo dotnet bundle verify SDK.zip
 cargo dotnet bundle install SDK.zip [--home PATH] [--force]
@@ -71,13 +75,21 @@ Installed files are integrity-checked before later builds.
 
 ## Scaffolds
 
-`cargo dotnet new` creates one of three project shapes:
+`cargo dotnet new` creates one of four project shapes:
 
 - `--app`: a Rust application compiled to a managed executable;
 - `--lib`: a Rust library plus a C# consumer and MSBuild integration; or
-- `--plugin`: a Rust implementation consumed through a managed interface.
+- `--plugin`: a Rust implementation consumed through a managed interface; or
+- `--excel`: a Windows Excel-DNA `net10.0-windows` add-in whose attributed worksheet functions
+  call managed Rust exports directly.
 
-Each scaffold targets `net10.0` and prints its exact next command.
+The general scaffolds target `net10.0`; the Excel host targets `net10.0-windows`. Each prints its
+exact next command. `--excel` uses stable Excel-DNA 1.9.0, generates a 64-bit packed `.xll`, and is
+deliberately not presented as VSTO or Office-for-macOS support.
+
+Run `cargo dotnet profiles` for the current host-by-host support contract. Profile names describe a
+real loader/runtime contract, not merely a target framework string; planned Unity and mobile
+profiles are listed but rejected as supported until their runtime acceptance passes.
 
 ## Build and run
 
@@ -101,6 +113,12 @@ For C# consumption, start with a `--lib` or `--plugin` scaffold. Existing C# pro
 For Rust calling managed APIs, `mycorrhiza` provides typed BCL wrappers and `add-nuget` generates
 bindings from NuGet's resolved asset graph. See [`QUICKSTART_INTEROP.md`](QUICKSTART_INTEROP.md) and
 [`INTEROP_COOKBOOK.md`](INTEROP_COOKBOOK.md).
+
+For Rust calling a native C ABI library, use an ordinary `#[link] unsafe extern` declaration.
+`add-native` restores and stages host-RID files from a native NuGet package; see the mdBook's
+[`Call native libraries from Rust`](../book/src/interop/native-from-rust.md) guide.
+`add-native-file` vendors an unpublished binary by RID, while `bindgen` generates checked-in Rust
+declarations from a C header and supports `--check` for CI.
 
 ## NuGet packages
 

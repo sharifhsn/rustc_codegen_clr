@@ -1,0 +1,13 @@
+error: #[dotnet_native_job]: missing required `live_workers = ...` option
+  --> tests/ui/dotnet_native_job_missing_option.rs:3:1
+   |
+ 3 | / #[dotnet_native_job(
+ 4 | |     class = ManagedJob,
+ 5 | |     status = JobStatus,
+ 6 | |     registration = Registration,
+...  |
+12 | |     stop_error = stop_error,
+13 | | )]
+   | |__^
+   |
+   = note: this error originates in the attribute macro `dotnet_native_job` (in Nightly builds, run with -Z macro-backtrace for more info)

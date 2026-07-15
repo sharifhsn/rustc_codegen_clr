@@ -33,16 +33,22 @@ pub enum MagicFn {
     LdLen,
     /// `rustc_clr_interop_managed_ld_null` → `ldnull`.
     LdNull,
+    /// `rustc_clr_interop_managed_is_null` → reference comparison with `ldnull`.
+    IsNull,
     /// `rustc_clr_interop_managed_checked_cast` → `castclass`.
     CheckedCast,
     /// `rustc_clr_interop_managed_is_inst` → `isinst`.
     IsInst,
     /// `rustc_clr_interop_managed_ld_elem_ref` → `ldelem.ref`.
     LdElemRef,
+    /// `rustc_clr_interop_managed_get_elem` → typed `ldelem`.
+    LdElem,
     /// `rustc_clr_interop_managed_new_arr` → `newarr`.
     NewArr,
     /// `rustc_clr_interop_managed_set_elem` → `stelem`.
     SetElem,
+    /// `rustc_clr_interop_managed_get_field` → typed `ldfld`.
+    ManagedGetField,
     /// `rustc_clr_interop_box` → `box` (a value type into `System.Object`).
     Box,
     /// `rustc_clr_interop_managed_box_new` → CLR-box + GCHandle root, returned as an opaque token.
@@ -110,11 +116,14 @@ pub fn classify_magic_fn(tcx: TyCtxt, def_id: DefId) -> Option<MagicFn> {
         | "rustc_clr_interop_managed_call4_" => MagicFn::ManagedCall,
         "rustc_clr_interop_managed_ld_len" => MagicFn::LdLen,
         "rustc_clr_interop_managed_ld_null" => MagicFn::LdNull,
+        "rustc_clr_interop_managed_is_null" => MagicFn::IsNull,
         "rustc_clr_interop_managed_checked_cast" => MagicFn::CheckedCast,
         "rustc_clr_interop_managed_is_inst" => MagicFn::IsInst,
         "rustc_clr_interop_managed_ld_elem_ref" => MagicFn::LdElemRef,
+        "rustc_clr_interop_managed_get_elem" => MagicFn::LdElem,
         "rustc_clr_interop_managed_new_arr" => MagicFn::NewArr,
         "rustc_clr_interop_managed_set_elem" => MagicFn::SetElem,
+        "rustc_clr_interop_managed_get_field" => MagicFn::ManagedGetField,
         "rustc_clr_interop_box" => MagicFn::Box,
         "rustc_clr_interop_managed_box_new" => MagicFn::ManagedBoxNew,
         "rustc_clr_interop_managed_box_take" => MagicFn::ManagedBoxTake,
@@ -199,6 +208,24 @@ pub fn garg_to_bool<'tcx>(garg: GenericArg<'tcx>, _ctx: TyCtxt<'tcx>) -> bool {
             scalar.to_uint(scalar.size()) != 0
         }
         _ => todo!("Can't convert generic arg of const kind {kind:?} to string!"),
+    }
+}
+
+/// Converts a `usize` const-generic argument to its host index representation.
+pub fn garg_to_usize<'tcx>(garg: GenericArg<'tcx>, _ctx: TyCtxt<'tcx>) -> usize {
+    let value = garg
+        .as_const()
+        .expect("Generic argument was not a constant!");
+    match value.kind() {
+        ConstKind::Value(value) => {
+            let scalar = value
+                .try_to_leaf()
+                .expect("usize const did not contain a scalar");
+            assert!(value.ty.is_usize(), "Generic argument was not usize");
+            usize::try_from(scalar.to_uint(scalar.size()))
+                .expect("usize const-generic value exceeds host usize")
+        }
+        kind => todo!("Can't convert generic arg of const kind {kind:?} to usize!"),
     }
 }
 /// This function returns the size of a type at the compile time. This should be used ONLY for handling constants. It currently assumes a 64 bit env

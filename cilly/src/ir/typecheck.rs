@@ -138,6 +138,11 @@ pub enum TypeCheckError {
         /// Received index type
         index_tpe: Type,
     },
+    /// A typed managed-array load requested a different element type than the array contains.
+    ArrayElementTypeMismatch {
+        expected: Type,
+        got: Type,
+    },
     /// An indirect call with a non-fn-pointer type
     IndirectCallInvalidFnPtrType {
         /// non-fn-pointer-type
@@ -1142,6 +1147,33 @@ impl CILNode {
                     _ => return Err(TypeCheckError::ArrIndexInvalidType { index_tpe }),
                 }
                 Ok(asm[elem])
+            }
+            CILNode::LdElem { array, index, elem } => {
+                let arr_tpe = asm.get_node(*array).clone().typecheck(sig, locals, asm)?;
+                let index_tpe = asm.get_node(*index).clone().typecheck(sig, locals, asm)?;
+                let Type::PlatformArray {
+                    elem: array_elem,
+                    dims,
+                } = arr_tpe
+                else {
+                    return Err(TypeCheckError::LdLenArgNotArray { got: arr_tpe });
+                };
+                if dims.get() != 1 {
+                    return Err(TypeCheckError::LdLenArrNot1D { got: arr_tpe });
+                }
+                match index_tpe {
+                    Type::Int(Int::I32 | Int::U32 | Int::I64 | Int::USize | Int::ISize) => (),
+                    _ => return Err(TypeCheckError::ArrIndexInvalidType { index_tpe }),
+                }
+                let expected = asm[array_elem];
+                let requested = asm[*elem];
+                if expected != requested {
+                    return Err(TypeCheckError::ArrayElementTypeMismatch {
+                        expected,
+                        got: requested,
+                    });
+                }
+                Ok(requested)
             }
             CILNode::UnboxAny { object, tpe } => {
                 let object = asm.get_node(*object).clone();

@@ -1,6 +1,6 @@
 //! Idiomatic Rust wrappers over the most-reached-for **Base Class Library** value types and static
-//! helpers — `DateTime`, `TimeSpan`, `Guid`, `Uri`, `Regex`, `Random`, `Stopwatch`, `StringBuilder`,
-//! `Environment`, and `Math`.
+//! helpers — `DateTime`, `DateTimeOffset`, `TimeSpan`, `Guid`, `Uri`, `Regex`, `Random`,
+//! `Stopwatch`, `StringBuilder`, `Environment`, and `Math`.
 //!
 //! Each submodule wraps the low-level BCL surface (the generated [`crate::bindings`] and the raw
 //! [`crate::intrinsics`] magic) so the type reads like a normal Rust type: constructors are associated
@@ -26,6 +26,7 @@
 
 pub mod dateonly;
 pub mod datetime;
+pub mod datetimeoffset;
 pub mod decimal;
 pub mod environment;
 pub mod guid;

@@ -783,6 +783,12 @@ fn main() {
     final_assembly.opt(&mut fuel);
     println!("==> Optimizing in {:?}", opt_start.elapsed());
     final_assembly.eliminate_dead_code();
+    if linker_config.target == OutputTarget::DotNet {
+        let hidden = final_assembly.hide_main_module_implementation_details();
+        if hidden != 0 {
+            println!("==> Hid {hidden} internal MainModule methods from the public CLR API");
+        }
+    }
     if linker_config.target == OutputTarget::DotNet && !linker_config.direct_pe {
         if let Some(public_type_name) = linker_config
             .managed_identity

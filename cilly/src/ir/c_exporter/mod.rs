@@ -853,6 +853,11 @@ impl CExporter {
                 let index = Self::node_to_string(asm[index].clone(), asm, locals, inputs, sig)?;
                 format!("({array})[{index}]")
             }
+            CILNode::LdElem { array, index, .. } => {
+                let array = Self::node_to_string(asm[array].clone(), asm, locals, inputs, sig)?;
+                let index = Self::node_to_string(asm[index].clone(), asm, locals, inputs, sig)?;
+                format!("({array})[{index}]")
+            }
             CILNode::UnboxAny { object, tpe } => format!(
                 "({object})",
                 object = Self::node_to_string(asm[object].clone(), asm, locals, inputs, sig)?
@@ -1218,6 +1223,7 @@ impl CExporter {
             MethodImpl::Extern {
                 lib,
                 preserve_errno,
+                ..
             } => match mname.as_str() {
                 "printf"
                 | "puts"

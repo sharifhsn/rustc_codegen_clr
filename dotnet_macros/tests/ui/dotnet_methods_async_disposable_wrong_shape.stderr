@@ -1,0 +1,5 @@
+error: #[dotnet_methods(async_disposable)]: `dispose_async` must have the exact shape `fn dispose_async(this: <Class>Handle) -> mycorrhiza::task::ValueTask`; use `future_to_value_task_unit` to wrap Rust async cleanup
+ --> tests/ui/dotnet_methods_async_disposable_wrong_shape.rs:8:9
+  |
+8 |     pub fn dispose_async(_this: ResourceHandle) {}
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

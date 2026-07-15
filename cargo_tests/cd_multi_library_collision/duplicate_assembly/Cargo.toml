@@ -12,6 +12,8 @@ package-id = "Collision.DuplicateAssembly"
 assembly-name = "collision_alpha"
 root-namespace = "Collision.DuplicateAssembly"
 module-type = "Exports"
+public-namespaces = ["Collision.DuplicateAssembly"]
+compatibility-profile = "net10-coreclr"
 legacy-main-module = false
 
 [workspace]

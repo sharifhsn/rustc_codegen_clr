@@ -3,9 +3,9 @@ using System.Reflection;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
 
-if (args.Length != 1)
+if (args.Length < 1)
 {
-    Console.Error.WriteLine("usage: ApiSnapshot <assembly.dll>");
+    Console.Error.WriteLine("usage: ApiSnapshot <assembly.dll> [Public.Type ...]");
     return 2;
 }
 
@@ -15,27 +15,14 @@ if (!pe.HasMetadata)
     throw new InvalidDataException($"{args[0]} has no CLR metadata");
 
 var reader = pe.GetMetadataReader();
-var formatter = new ApiFormatter(reader);
+var selectedTypes = args.Skip(1).ToHashSet(StringComparer.Ordinal);
+var formatter = new ApiFormatter(reader, selectedTypes);
 foreach (var line in formatter.Snapshot().Order(StringComparer.Ordinal))
     Console.WriteLine(line);
 return 0;
 
-sealed class ApiFormatter(MetadataReader reader)
+sealed class ApiFormatter(MetadataReader reader, IReadOnlySet<string> selectedTypes)
 {
-    private static readonly HashSet<string> NullabilityAttributes = new(StringComparer.Ordinal)
-    {
-        "System.Runtime.CompilerServices.NullableAttribute",
-        "System.Runtime.CompilerServices.NullableContextAttribute",
-        "System.Runtime.CompilerServices.RequiredMemberAttribute",
-        "System.Diagnostics.CodeAnalysis.AllowNullAttribute",
-        "System.Diagnostics.CodeAnalysis.DisallowNullAttribute",
-        "System.Diagnostics.CodeAnalysis.MaybeNullAttribute",
-        "System.Diagnostics.CodeAnalysis.NotNullAttribute",
-        "System.Diagnostics.CodeAnalysis.NotNullIfNotNullAttribute",
-        "System.Diagnostics.CodeAnalysis.MemberNotNullAttribute",
-        "System.Diagnostics.CodeAnalysis.MemberNotNullWhenAttribute",
-    };
-
     private readonly TypeNames names = new(reader);
 
     public IEnumerable<string> Snapshot()
@@ -45,6 +32,7 @@ sealed class ApiFormatter(MetadataReader reader)
             var type = reader.GetTypeDefinition(handle);
             if (!IsPublic(type.Attributes)) continue;
             var typeName = names.Definition(handle);
+            if (selectedTypes.Count != 0 && !selectedTypes.Contains(typeName)) continue;
             var kind = IsEnum(type) ? "enum" : type.Attributes.HasFlag(TypeAttributes.Interface) ? "interface" : "type";
             yield return $"{kind} {typeName}{Attributes(type.GetCustomAttributes())}";
 
@@ -57,14 +45,25 @@ sealed class ApiFormatter(MetadataReader reader)
                     yield return $"enum-member {typeName}.{reader.GetString(field.Name)}={Constant(field.GetDefaultValue())}";
                 }
             }
+            else if (typeName != "MainModule")
+            {
+                foreach (var fieldHandle in type.GetFields())
+                {
+                    var field = reader.GetFieldDefinition(fieldHandle);
+                    if (!field.Attributes.HasFlag(FieldAttributes.Public)) continue;
+                    var fieldType = field.DecodeSignature(names, null);
+                    var storage = field.Attributes.HasFlag(FieldAttributes.Static) ? "static " : "";
+                    yield return $"field {typeName}.{reader.GetString(field.Name)}:{fieldType} {storage}{Attributes(field.GetCustomAttributes())}".TrimEnd();
+                }
+            }
 
-            var propertyAccessors = new HashSet<MethodDefinitionHandle>();
+            var associatedAccessors = new HashSet<MethodDefinitionHandle>();
             foreach (var propertyHandle in type.GetProperties())
             {
                 var property = reader.GetPropertyDefinition(propertyHandle);
                 var accessors = property.GetAccessors();
-                if (!accessors.Getter.IsNil) propertyAccessors.Add(accessors.Getter);
-                if (!accessors.Setter.IsNil) propertyAccessors.Add(accessors.Setter);
+                if (!accessors.Getter.IsNil) associatedAccessors.Add(accessors.Getter);
+                if (!accessors.Setter.IsNil) associatedAccessors.Add(accessors.Setter);
                 if (!IsPublic(accessors.Getter) && !IsPublic(accessors.Setter)) continue;
                 var signature = property.DecodeSignature(names, null);
                 var index = signature.ParameterTypes.Length == 0 ? "" : $"[{string.Join(",", signature.ParameterTypes)}]";
@@ -72,21 +71,43 @@ sealed class ApiFormatter(MetadataReader reader)
                 yield return $"property {typeName}.{reader.GetString(property.Name)}{index}:{signature.ReturnType} {access}{Attributes(property.GetCustomAttributes())}";
             }
 
+            foreach (var eventHandle in type.GetEvents())
+            {
+                var @event = reader.GetEventDefinition(eventHandle);
+                var accessors = @event.GetAccessors();
+                if (!accessors.Adder.IsNil) associatedAccessors.Add(accessors.Adder);
+                if (!accessors.Remover.IsNil) associatedAccessors.Add(accessors.Remover);
+                if (!IsPublic(accessors.Adder) && !IsPublic(accessors.Remover)) continue;
+                yield return $"event {typeName}.{reader.GetString(@event.Name)}:{names.Entity(@event.Type)}{Attributes(@event.GetCustomAttributes())}";
+            }
+
             foreach (var methodHandle in type.GetMethods())
             {
                 var method = reader.GetMethodDefinition(methodHandle);
-                if (!method.Attributes.HasFlag(MethodAttributes.Public) || propertyAccessors.Contains(methodHandle)) continue;
+                if (!method.Attributes.HasFlag(MethodAttributes.Public) || associatedAccessors.Contains(methodHandle)) continue;
                 var methodName = reader.GetString(method.Name);
                 if (methodName == ".cctor") continue;
                 var signature = method.DecodeSignature(names, null);
                 var parameters = Parameters(method, signature.ParameterTypes);
                 var attrs = Attributes(method.GetCustomAttributes());
+                var returnAttrs = ReturnAttributes(method);
                 if (methodName == ".ctor")
                     yield return $"constructor {typeName}({parameters}){attrs}";
                 else
-                    yield return $"method {typeName}.{methodName}({parameters}):{signature.ReturnType}{attrs}";
+                    yield return $"method {typeName}.{methodName}({parameters}):{signature.ReturnType}{returnAttrs}{attrs}";
             }
         }
+    }
+
+    private string ReturnAttributes(MethodDefinition method)
+    {
+        foreach (var parameterHandle in method.GetParameters())
+        {
+            var parameter = reader.GetParameter(parameterHandle);
+            if (parameter.SequenceNumber == 0)
+                return Attributes(parameter.GetCustomAttributes());
+        }
+        return "";
     }
 
     private string Parameters(MethodDefinition method, ImmutableArray<string> types)
@@ -114,7 +135,6 @@ sealed class ApiFormatter(MetadataReader reader)
         {
             var attribute = reader.GetCustomAttribute(handle);
             var name = AttributeType(attribute.Constructor);
-            if (!NullabilityAttributes.Contains(name)) continue;
             values.Add($"{name}({Convert.ToHexString(reader.GetBlobBytes(attribute.Value))})");
         }
         values.Sort(StringComparer.Ordinal);
@@ -167,7 +187,7 @@ sealed class TypeNames(MetadataReader reader) : ISignatureTypeProvider<string, o
         return string.IsNullOrEmpty(ns) ? name : ns + "." + name;
     }
 
-    public string Entity(EntityHandle handle) => handle.Kind switch
+    public string Entity(EntityHandle handle) => handle.IsNil ? "<nil>" : handle.Kind switch
     {
         HandleKind.TypeDefinition => Definition((TypeDefinitionHandle)handle),
         HandleKind.TypeReference => Reference((TypeReferenceHandle)handle),

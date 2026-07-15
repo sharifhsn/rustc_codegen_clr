@@ -12,6 +12,8 @@ package-id = "Collision.Alpha"
 assembly-name = "collision_alpha"
 root-namespace = "Collision.Alpha"
 module-type = "Exports"
+public-namespaces = ["Collision.Alpha"]
+compatibility-profile = "net10-coreclr"
 legacy-main-module = false
 
 [dependencies]

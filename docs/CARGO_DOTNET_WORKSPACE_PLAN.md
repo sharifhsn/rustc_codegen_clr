@@ -1,147 +1,114 @@
-# `cargo dotnet` workspace and P/Invoke plan
+# `cargo dotnet` workspace boundaries
 
-## Purpose
+Status: the root workspace split required for first-class P/Invoke is complete.
 
-Keep Rust-on-.NET product concerns in one repository-level Cargo workspace while
-preserving a clear division between the compiler backend, the installed `cargo`
-`dotnet` command, dependency/asset handling, and a future Rust-facing P/Invoke
-API.
+## Result
 
-This is an incremental extraction plan. It does **not** propose a broad compiler
-rewrite or a breaking change to `cargo dotnet`.
-
-## Current constraint
-
-`tools/cargo-dotnet` is presently its own Cargo workspace. That is intentional:
-the installed CLI must build with the host stable toolchain, while the backend
-uses a pinned rustc-private nightly. Moving it into the root workspace is only
-acceptable if both workflows remain reliable:
+The repository now uses one Cargo workspace and one dependency graph for the backend, reusable SDK
+crates, and `cargo-dotnet`. Stable CLI development remains an explicit supported command even though
+the repository's default toolchain is the pinned rustc-private nightly:
 
 ```bash
 cargo +stable check -p cargo-dotnet
 cargo +nightly-2026-06-17 check -p rustc_codegen_clr
 ```
 
-The target is one repository workspace and shared lockfile. If Cargo cannot
-preserve the host-tool isolation in practice, retain a small nested workspace
-for the CLI rather than make normal installation depend on rustc-private nightly.
-The product boundary is more important than the directory shape.
+`tools/cargo-dotnet` no longer declares a nested workspace or owns a second lockfile.
 
-## Target boundaries
+## Ownership map
 
 ```text
-cargo-dotnet
-  ├─ rust-dotnet-sdk-core
-  ├─ rust-dotnet-assets
-  └─ invokes rustc_codegen_clr as the compiler backend
+crates/rust-dotnet-sdk-core
+  host/RID facts, .NET runtime model, managed identity
 
-rust-dotnet-pinvoke
-  └─ defines the Rust declaration contract
+crates/rust-dotnet-assets
+  NuGet graph parsing, RID selection, native/runtime/resource staging,
+  collision detection, clean-clone restoration, package projection
 
-rustc_codegen_clr + cilly
-  └─ recognize that contract and emit CLR P/Invoke metadata
+crates/rust-dotnet-bindgen
+  C-header parsing, deterministic declaration generation, stale-output checks
+
+crates/rust-dotnet-pinvoke
+  optional no_std/alloc/std FFI helpers for strings, status, handles, and callbacks
+
+tools/cargo-dotnet
+  CLI syntax, user messages, process orchestration, project mutation,
+  build/run/test/doctor/setup/pack/push
+
+rustc_codegen_clr
+  pinned-rustc adapter that collects standard #[link] foreign declarations
+
+cilly
+  serialized import contract, linker resolution, verifier, PE/IL exporters
 ```
 
-The compiler backend must never depend on `cargo-dotnet`. The CLI is the
-user-facing orchestrator; it may depend on reusable support crates.
+The dependency direction is one-way: `cargo-dotnet` may use stable reusable crates; neither the
+backend nor `cilly` depends on the CLI. The helper crate does not fetch packages or transport
+compiler metadata.
 
-Proposed layout:
+## What moved
 
-```text
-crates/
-  rust-dotnet-sdk-core/        # toolchain discovery, paths, project metadata
-  rust-dotnet-assets/          # NuGet/native asset resolution and staging
-  rust-dotnet-pinvoke/         # Rust API, ABI types, wrapper helpers
-  rust-dotnet-pinvoke-macros/  # optional attribute macros
-tools/
-  cargo-dotnet/                # CLI parsing, UX, and orchestration
+### SDK core
+
+- `HostFacts`, including supported host RID and executable/library naming;
+- `ManagedIdentity`; and
+- the public .NET 10 runtime profile model.
+
+The process-heavy `Context`, bundle verification, build locks, command execution, and user-facing
+diagnostics remain in the CLI because they are orchestration, not reusable domain types.
+
+### Asset layer
+
+- the complete former `nuget_assets` implementation;
+- its RID matrix fixtures and focused tests;
+- native-only package support through an optional primary managed DLL;
+- direct SDK `native` group plus `runtimeTargets` parsing; and
+- selection of an appropriate .NET host for restore in side-by-side installations.
+
+The move is physical: `rust-dotnet-assets` does not include source from `tools/cargo-dotnet` by path.
+`add-nuget` explicitly requires a managed DLL; `add-native` requires a native asset. Both use the
+same durable package manifest and restaging pipeline.
+
+### P/Invoke helper
+
+`rust-dotnet-pinvoke` is `no_std` capable and intentionally contains only explicit wrapper
+primitives. Raw standard Rust FFI remains the declaration contract, so adopting the helper is
+optional.
+
+### Header generator
+
+`rust-dotnet-bindgen` owns upstream rust-bindgen/libclang integration and deterministic source
+generation. `cargo-dotnet` supplies command-line policy and paths; the compiler still consumes only
+ordinary Rust declarations.
+
+## Product surface enabled by the split
+
+```bash
+cargo dotnet add-native <PACKAGE> <VERSION> --library <PINVOKE_NAME>
+cargo dotnet add-native-file <FILE> --library <PINVOKE_NAME> --rid <RID>
+cargo dotnet bindgen <HEADER> --library <PINVOKE_NAME>
+cargo dotnet build
+cargo dotnet run
+cargo dotnet pack
 ```
 
-`rustc_codegen_clr`, `cilly`, `mycorrhiza`, and `dotnet_macros` remain in their
-current homes. Do not split compiler internals merely to mirror this product
-layout.
+The complete compiler, asset, fixture, documentation, and release-gate design is recorded in
+[`NEXT_MILESTONE_NATIVE_INTEROP.md`](NEXT_MILESTONE_NATIVE_INTEROP.md).
 
-## Milestones
+## Guardrails kept
 
-### 1. Prove the workspace/toolchain contract
+- The public `cargo dotnet` command names and installed-SDK layout did not change.
+- The compiler backend does not depend on a host-stable CLI crate.
+- Direct managed Rust-to-C#/F# interop remains the preferred managed boundary; P/Invoke is for
+  Rust consuming native C ABI libraries.
+- `NATIVE_PASSTHROUGH` remains an internal GCC/`nm` experiment and is not presented as the portable
+  public surface.
+- C++ ABI, variadics, inferred ownership, and cross-RID native compilation remain outside the C
+  P/Invoke contract. Header generation and explicit ownership/marshalling helpers are supported.
 
-Make `cargo-dotnet` a root member only after a small spike proves that stable
-CLI installation/development and pinned-nightly backend development both work.
-Add separate CI jobs for the two commands above. Do not change the public CLI
-or its installation instructions in this milestone.
+## Follow-up extraction criteria
 
-### 2. Extract `rust-dotnet-sdk-core`
-
-Move reusable, stable concepts out of the CLI:
-
-- installed SDK home and layout;
-- backend and toolchain discovery;
-- supported host/RID facts;
-- project metadata and managed assembly identity; and
-- diagnostics shared with `cargo dotnet doctor`.
-
-Keep command parsing, user-facing messages, and process execution in
-`cargo-dotnet`.
-
-### 3. Extract `rust-dotnet-assets`
-
-Promote the existing NuGet asset machinery into the reusable asset layer:
-
-- RID-specific runtime-target selection;
-- collision detection and owned-asset manifests;
-- output staging and cleanup; and
-- package-path validation.
-
-Generalize the input from only NuGet packages to a resolved asset source. This
-must accommodate NuGet `runtimes/<rid>/native/` assets, local native libraries,
-and system-library names without duplicating staging logic.
-
-### 4. Keep `cargo-dotnet` deliberately thin
-
-The CLI remains responsible for `new`, `build`, `run`, `test`, `doctor`,
-`setup`, `pack`, and `push`; argument parsing; progress and errors; exit codes;
-and orchestration. It should not retain reusable RID selection, package staging,
-or P/Invoke marshalling policy.
-
-### 5. Add first-class P/Invoke
-
-`rust-dotnet-pinvoke` is a separate Rust project in this workspace, tightly
-integrated with the backend and CLI. Its first public surface supports only:
-
-- explicit C ABI primitive values, pointers, and `#[repr(C)]` structs;
-- library name, entry point, calling convention, and last-error metadata;
-- compile-time rejection of unsupported declaration shapes; and
-- explicit UTF-8/UTF-16 and ownership helpers.
-
-The backend lowers that declaration contract to the existing body-less CLR
-P/Invoke (`ImplMap`) machinery. `cargo dotnet` uses `rust-dotnet-assets` to
-select and stage the required library for each supported RID.
-
-Do not initially promise automatic bindgen, arbitrary C++ APIs, callbacks,
-variadics, automatic ownership conversion, or broad marshalling inference.
-
-### 6. Validate one complete user journey
-
-Ship a cross-platform SQLite fixture before declaring the feature ready:
-
-1. Rust declares a native import.
-2. `cargo dotnet` resolves or stages SQLite for Linux x64, macOS Apple Silicon,
-   and Windows x64.
-3. The emitted managed assembly calls it successfully.
-4. `cargo dotnet pack` retains the required runtime assets.
-
-This end-to-end acceptance is the feature gate. Individual crate builds are
-necessary but not sufficient.
-
-## Guardrails
-
-- Preserve `cargo dotnet` command names, configuration, and installation flow
-  during extraction.
-- Move existing focused tests with every extraction and add a CLI acceptance
-  test for unchanged behavior.
-- Make each milestone independently reviewable and releasable.
-- Do not advertise the existing `NATIVE_PASSTHROUGH` implementation as the
-  public P/Invoke solution: it is WIP and Linux/GCC-oriented.
-- Keep direct managed Rust-to-C#/F# interop as the default. P/Invoke is for
-  Rust code that consumes a native library, not the preferred bridge for C#
-  code consuming Rust.
+Do not split more code merely for symmetry. A new stable crate is warranted only when at least two
+real consumers need the same policy and the boundary can avoid CLI process orchestration or
+rustc-private types. Likely candidates are project-manifest editing and diagnostic report models;
+neither is required for the current native-interoperability journey.

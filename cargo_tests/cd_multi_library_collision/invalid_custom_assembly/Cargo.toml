@@ -12,6 +12,8 @@ package-id = "Collision.InvalidCustomAssembly"
 assembly-name = "Different.Assembly"
 root-namespace = "Collision.InvalidCustomAssembly"
 module-type = "Exports"
+public-namespaces = ["Collision.InvalidCustomAssembly"]
+compatibility-profile = "net10-coreclr"
 legacy-main-module = false
 
 [dependencies]

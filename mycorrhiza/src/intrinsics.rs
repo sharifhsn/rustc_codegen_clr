@@ -34,24 +34,44 @@ pub struct RustcCLRInteropManagedStruct<
     size_hint: [u8; SIZE],
 }
 
+/// Reads a named field from a managed class or value type. The backend replaces this body with a
+/// typed `ldfld`; the declaration exists only to carry the owner identity, field name, and Rust
+/// return type through MIR.
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_clr_interop_managed_get_field<
+    const ASSEMBLY: &'static str,
+    const CLASS_PATH: &'static str,
+    const IS_VALUETYPE: bool,
+    const FIELD: &'static str,
+    Ret,
+    Owner,
+>(
+    owner: Owner,
+) -> Ret {
+    core::intrinsics::abort();
+}
+
 impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str>
     RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH>
 {
     #[inline(always)]
     pub fn ctor0() -> Self {
-        rustc_clr_interop_managed_ctor0_::<ASSEMBLY, CLASS_PATH, false>()
+        rustc_clr_interop_managed_ctor0_::<ASSEMBLY, CLASS_PATH, false, Self>()
     }
     #[inline(always)]
     pub fn ctor1<Arg1>(arg1: Arg1) -> Self {
-        rustc_clr_interop_managed_ctor1_::<ASSEMBLY, CLASS_PATH, false, Arg1>(arg1)
+        rustc_clr_interop_managed_ctor1_::<ASSEMBLY, CLASS_PATH, false, Self, Arg1>(arg1)
     }
     #[inline(always)]
     pub fn ctor2<Arg1, Arg2>(arg1: Arg1, arg2: Arg2) -> Self {
-        rustc_clr_interop_managed_ctor2_::<ASSEMBLY, CLASS_PATH, false, Arg1, Arg2>(arg1, arg2)
+        rustc_clr_interop_managed_ctor2_::<ASSEMBLY, CLASS_PATH, false, Self, Arg1, Arg2>(
+            arg1, arg2,
+        )
     }
     #[inline(always)]
     pub fn ctor3<Arg1, Arg2, Arg3>(arg1: Arg1, arg2: Arg2, arg3: Arg3) -> Self {
-        rustc_clr_interop_managed_ctor3_::<ASSEMBLY, CLASS_PATH, false, Arg1, Arg2, Arg3>(
+        rustc_clr_interop_managed_ctor3_::<ASSEMBLY, CLASS_PATH, false, Self, Arg1, Arg2, Arg3>(
             arg1, arg2, arg3,
         )
     }
@@ -214,6 +234,13 @@ pub struct RustcCLRInteropManagedArray<T, const DIMENSIONS: usize> {
     object_ref: usize,
     pd: core::marker::PhantomData<T>,
 }
+
+/// Idiomatic public spelling for a GC-owned one-dimensional CLR `T[]`.
+///
+/// Unlike `Vec<T>`, this remains managed storage and may safely contain managed references. Keep it
+/// transient in synchronous Rust code; use `Memory<T>`/`ReadOnlyMemory<T>` when the buffer must be
+/// retained or cross an async suspension.
+pub type ManagedArray<T> = RustcCLRInteropManagedArray<T, 1>;
 /// Arity-ladder generator for the interop "magic" function declarations.
 ///
 /// Every member of the `rustc_clr_interop_managed_call*` / `_call_virt*` / `_ctor*` and WF-9
@@ -272,6 +299,16 @@ pub fn rustc_clr_interop_managed_set_elem<T>(
 ) {
     core::intrinsics::abort();
 }
+/// Loads `arr[idx]` as `T` (`ldelem T`). Unlike `ldelem.ref`, this supports primitive and managed
+/// value-type arrays without pretending their elements are object references.
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_clr_interop_managed_get_elem<T>(
+    arr: RustcCLRInteropManagedArray<T, 1>,
+    idx: i32,
+) -> T {
+    core::intrinsics::abort()
+}
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_ld_elem_ref<
@@ -327,12 +364,19 @@ interop_magic_fn! {
 //Ctors
 interop_magic_fn! {
     rustc_clr_interop_managed_ctor0_
-    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool]
-    () -> RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH>
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, Ret]
+    () -> Ret
 }
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_ld_null<T>() -> T {
+    core::intrinsics::abort();
+}
+/// Returns whether a managed reference is null. The backend emits a direct reference comparison;
+/// no type-specific `op_Equality` member is required.
+#[allow(unused_variables)]
+#[inline(never)]
+pub fn rustc_clr_interop_managed_is_null<T>(value: T) -> bool {
     core::intrinsics::abort();
 }
 /// Raises a managed `System.Exception(MSG)` directly (a `throw` IL op), so a .NET caller can `catch`
@@ -373,18 +417,18 @@ pub fn rustc_clr_interop_box<T>(
 }
 interop_magic_fn! {
     rustc_clr_interop_managed_ctor1_
-    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool]
-    (arg1: Arg1) -> RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH>
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, Ret]
+    (arg1: Arg1) -> Ret
 }
 interop_magic_fn! {
     rustc_clr_interop_managed_ctor2_
-    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool]
-    (arg1: Arg1, arg2: Arg2) -> RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH>
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, Ret]
+    (arg1: Arg1, arg2: Arg2) -> Ret
 }
 interop_magic_fn! {
     rustc_clr_interop_managed_ctor3_
-    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool]
-    (arg1: Arg1, arg2: Arg2, arg3: Arg3) -> RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH>
+    [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, Ret]
+    (arg1: Arg1, arg2: Arg2, arg3: Arg3) -> Ret
 }
 impl From<u16> for RustcCLRInteropManagedChar {
     fn from(utf16_char: u16) -> RustcCLRInteropManagedChar {
@@ -726,6 +770,14 @@ impl<T> RustcCLRInteropManagedArray<T, 1> {
     {
         rustc_clr_interop_managed_set_elem(self, index, value);
     }
+
+    /// Copy one value from this one-dimensional managed array.
+    pub fn get(self, index: i32) -> T
+    where
+        T: Copy + ManagedSafe,
+    {
+        rustc_clr_interop_managed_get_elem(self, index)
+    }
 }
 
 impl RustcCLRInteropManagedArray<u8, 1> {
@@ -759,6 +811,38 @@ unsafe impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const 
 impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const SIZE: usize>
     RustcCLRInteropManagedStruct<ASSEMBLY, CLASS_PATH, SIZE>
 {
+    /// Construct a managed value type through its parameterless `.ctor`.
+    #[inline(always)]
+    pub fn ctor0() -> Self {
+        rustc_clr_interop_managed_ctor0_::<ASSEMBLY, CLASS_PATH, true, Self>()
+    }
+
+    /// Construct a managed value type through a one-argument `.ctor`.
+    #[inline(always)]
+    pub fn ctor1<Arg1>(arg1: Arg1) -> Self {
+        rustc_clr_interop_managed_ctor1_::<ASSEMBLY, CLASS_PATH, true, Self, Arg1>(arg1)
+    }
+
+    /// Construct a managed value type through a two-argument `.ctor`.
+    #[inline(always)]
+    pub fn ctor2<Arg1, Arg2>(arg1: Arg1, arg2: Arg2) -> Self {
+        rustc_clr_interop_managed_ctor2_::<ASSEMBLY, CLASS_PATH, true, Self, Arg1, Arg2>(arg1, arg2)
+    }
+
+    /// Construct a managed value type through a three-argument `.ctor`.
+    #[inline(always)]
+    pub fn ctor3<Arg1, Arg2, Arg3>(arg1: Arg1, arg2: Arg2, arg3: Arg3) -> Self {
+        rustc_clr_interop_managed_ctor3_::<ASSEMBLY, CLASS_PATH, true, Self, Arg1, Arg2, Arg3>(
+            arg1, arg2, arg3,
+        )
+    }
+
+    /// Reads one field directly from an unboxed managed value type.
+    #[inline(always)]
+    pub fn vt_field<const FIELD: &'static str, Ret>(self) -> Ret {
+        rustc_clr_interop_managed_get_field::<ASSEMBLY, CLASS_PATH, true, FIELD, Ret, &Self>(&self)
+    }
+
     #[inline(always)]
     pub fn instance0<const METHOD: &'static str, Ret>(self) -> Ret {
         rustc_clr_interop_managed_call1_::<ASSEMBLY, CLASS_PATH, false, METHOD, false, Ret, &Self>(

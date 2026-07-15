@@ -4,7 +4,7 @@
 set -u
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-driver="$repo/tools/cargo-dotnet/target/release/cargo-dotnet"
+driver="$repo/target/release/cargo-dotnet"
 summary="${RCL_MATRIX_SUMMARY:-/tmp/rustc_codegen_clr-e2e-matrix.tsv}"
 log_dir="${RCL_MATRIX_LOG_DIR:-/tmp/rustc_codegen_clr-e2e-matrix}"
 native_target_root="${RCL_MATRIX_NATIVE_TARGET_ROOT:-/tmp/rustc_codegen_clr-native-matrix}"

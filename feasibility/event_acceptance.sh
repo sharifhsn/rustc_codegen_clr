@@ -3,7 +3,7 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-driver="${RCL_EVENT_DRIVER:-$repo/tools/cargo-dotnet/target/release/cargo-dotnet}"
+driver="${RCL_EVENT_DRIVER:-$repo/target/release/cargo-dotnet}"
 dotnet_version="${DOTNET_VERSION:-10}"
 log_dir="${RCL_EVENT_LOG_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/rustdotnet-events.XXXXXX")}"
 sentinel="$log_dir/ilasm-must-not-run"

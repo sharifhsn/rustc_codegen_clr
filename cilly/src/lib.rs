@@ -23,6 +23,14 @@ pub enum Access {
     Extern,
     Public,
     Private,
+    /// Visible to every type in the same managed assembly, but not to external consumers.
+    /// Maps to ECMA-335 `assembly` accessibility / `MethodAttributes.Assembly`.
+    Assembly,
+    /// A native-linker-visible symbol and dead-code root that remains internal to the CLR assembly.
+    ///
+    /// rustc uses external linkage for compiler/runtime implementation symbols. Those symbols must
+    /// survive linking, but external linkage is not a public managed API declaration.
+    InternalExtern,
 }
 
 impl Access {
@@ -31,7 +39,7 @@ impl Access {
     /// [`Extern`]: Access::Extern
     #[must_use]
     pub fn is_extern(&self) -> bool {
-        matches!(self, Self::Extern)
+        matches!(self, Self::Extern | Self::InternalExtern)
     }
 }
 
