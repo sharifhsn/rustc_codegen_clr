@@ -63,6 +63,7 @@ result with ordinary Rust code.
 - Ordinary `#[dotnet_export] async fn` APIs consumed as C# `Task`/`Task<T>` methods
 - C#-friendly exported Rust APIs and deterministic NuGet packages
 - MSBuild integration, Portable PDBs, Source Link, and NativeAOT publishing
+- Safe, idempotent existing-project wiring with `cargo dotnet attach HOST.csproj --rust-crate PATH`
 - A Windows Excel-DNA scaffold that packages worksheet functions backed by managed Rust into a
   64-bit `.xll` (`cargo dotnet new ./risk-engine --excel`)
 - Executable ASP.NET Core and Worker scaffolds (`--webapi`, `--worker`) whose MSBuild projects

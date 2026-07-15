@@ -293,7 +293,11 @@ MAUI is a profile matrix rather than one runtime:
   hosts share one typed schema-1 `Namespace.Backend` Rust assembly contract. The generated Web API
   endpoint and Worker execute managed Rust on macOS in `product_hosts_acceptance.sh`; WinUI remains
   planned and Windows-only until its build and launch gate exists.
-- [ ] `cargo dotnet attach <csproj> --rust-crate <path>` for existing solutions.
+- [x] `cargo dotnet attach <csproj> --rust-crate <path>` for existing SDK-style solutions. It
+  requires schema-1 identity, validates host/profile compatibility before mutation, writes one
+  marked atomic/idempotent block, supports `--containers` and `--dry-run`, and refuses to guess
+  around hand-authored wiring. The product-host acceptance attaches a clean console project and
+  executes the referenced managed Rust API.
 - [ ] `cargo dotnet attach-unity <UnityProject> --rust-crate <path>` only after the
   `netstandard2.1` managed profile is proven; copy/reference artifacts and preserve Unity `.meta`
   semantics deterministically.

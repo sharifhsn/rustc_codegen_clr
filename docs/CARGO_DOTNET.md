@@ -20,6 +20,7 @@ cargo dotnet setup --from-repo PATH
 cargo dotnet profiles [--json]
 cargo dotnet doctor [MESSAGE_OR_LOG] [--workspace PATH] [--json]
 cargo dotnet new PATH --app|--lib|--plugin|--excel|--webapi|--worker|--winui|--maui
+cargo dotnet attach HOST.csproj --rust-crate PATH [--containers] [--dry-run]
 cargo dotnet build [PATH]
 cargo dotnet run [PATH] [-- PROGRAM_ARGS...]
 cargo dotnet test [PATH]
@@ -97,6 +98,12 @@ remain planned profiles until Windows CI builds and launches them with the requi
 Run `cargo dotnet profiles` for the current host-by-host support contract. Profile names describe a
 real loader/runtime contract, not merely a target framework string; planned Unity and mobile
 profiles are listed but rejected as supported until their runtime acceptance passes.
+
+For an existing SDK-style project, `cargo dotnet attach` inserts one clearly marked,
+idempotent block containing the validated compatibility profile, `<RustCrate>`, and conditional
+`RustDotnet.targets` imports. The Rust crate must declare managed identity schema 1. Attachment
+rejects profile/TFM mismatches and pre-existing hand-authored wiring instead of rewriting or
+guessing around it. `--dry-run` prints the exact block without changing the project.
 
 ## Build and run
 

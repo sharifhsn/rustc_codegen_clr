@@ -51,6 +51,8 @@ pub enum Cmd {
     Run(BuildArgs),
     /// Scaffold a Rust-on-.NET app, library, or product host.
     New(NewArgs),
+    /// Attach a schema-1 managed Rust crate to an existing SDK-style C# project.
+    Attach(AttachArgs),
     /// Diagnose the toolchain, or translate a .NET runtime failure into an actionable fix.
     Doctor(DoctorArgs),
     /// Build a crate's #[test]s with the backend and run them on .NET.
@@ -363,6 +365,24 @@ impl NewArgs {
         }
         Ok(template)
     }
+}
+
+#[derive(clap::Args)]
+pub struct AttachArgs {
+    /// Existing SDK-style C# project to update.
+    pub project: PathBuf,
+
+    /// Rust cdylib directory containing Cargo.toml and package.metadata.dotnet schema 1.
+    #[arg(long, value_name = "PATH")]
+    pub rust_crate: PathBuf,
+
+    /// Include the shipped RustVec<T>/RustBoxVec<T> C# wrappers.
+    #[arg(long)]
+    pub containers: bool,
+
+    /// Print the exact managed block without modifying the project.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(clap::Args)]

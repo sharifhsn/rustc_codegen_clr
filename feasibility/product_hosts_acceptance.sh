@@ -45,8 +45,21 @@ export CARGO_DOTNET_HOME="$sdk_home"
 
 web_project="$work/webapi-demo/webapi/WebapiDemo.WebApi.csproj"
 worker_project="$work/worker-demo/worker/WorkerDemo.Worker.csproj"
+attached_dir="$work/attached-consumer"
+dotnet new console --name AttachedConsumer --output "$attached_dir" --framework net10.0
+cp "$repo/feasibility/fixtures/attach/Program.cs" "$attached_dir/Program.cs"
+"$cargo_dotnet" attach "$attached_dir/AttachedConsumer.csproj" \
+    --rust-crate "$work/webapi-demo/rustlib"
+cp "$attached_dir/AttachedConsumer.csproj" "$work/attached-once.csproj"
+"$cargo_dotnet" attach "$attached_dir/AttachedConsumer.csproj" \
+    --rust-crate "$work/webapi-demo/rustlib"
+cmp "$work/attached-once.csproj" "$attached_dir/AttachedConsumer.csproj"
+
 dotnet build "$web_project" -c Release -p:CargoDotnet="$cargo_dotnet_msbuild"
 dotnet build "$worker_project" -c Release -p:CargoDotnet="$cargo_dotnet_msbuild"
+attached_output="$(dotnet run --project "$attached_dir/AttachedConsumer.csproj" -c Release \
+    -p:CargoDotnet="$cargo_dotnet_msbuild")"
+[[ "$attached_output" == *'managed Rust processed 21 into 42'* ]]
 
 web_log="$work/webapi.log"
 port=$((40000 + RANDOM % 20000))
@@ -75,4 +88,4 @@ web_pid=""
 worker_output="$(dotnet run --project "$worker_project" -c Release --no-build 2>&1)"
 [[ "$worker_output" == *'managed Rust processed 21 into 42; answer=42'* ]]
 
-echo "Product host acceptance OK: Web API endpoint and Worker executed managed Rust; WinUI/MAUI contracts generated without unsupported mobile claims"
+echo "Product host acceptance OK: attached console, Web API endpoint, and Worker executed managed Rust; WinUI/MAUI contracts generated without unsupported mobile claims"

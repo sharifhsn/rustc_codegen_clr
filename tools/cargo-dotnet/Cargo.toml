@@ -28,6 +28,7 @@ fs2 = "0.4"
 sha2 = "0.10"
 semver = "1"
 tempfile = "3"
+pathdiff = "0.2"
 syn = { version = "2", features = ["full", "visit"] }
 rust-dotnet-assets = { path = "../../crates/rust-dotnet-assets" }
 rust-dotnet-bindgen = { path = "../../crates/rust-dotnet-bindgen" }

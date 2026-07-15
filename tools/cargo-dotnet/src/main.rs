@@ -12,6 +12,7 @@
 //! in-repo bash front-end, which owns the container mount model.
 
 mod artifact;
+mod attach;
 mod build_lock;
 mod buildstd;
 mod bundle;
@@ -109,6 +110,7 @@ fn main() -> ExitCode {
         Cmd::Build(args) => pipeline::run(args, false),
         Cmd::Run(args) => pipeline::run(args, true),
         Cmd::New(args) => scaffold::run(args),
+        Cmd::Attach(args) => attach::run(args),
         Cmd::Doctor(args) => doctor::run(args),
         Cmd::Test(args) => test::run(args),
         Cmd::Setup(args) => setup::run(args),
@@ -190,6 +192,7 @@ fn inject_prog_args(cmd: &mut Cmd, prog_args: Vec<String>) {
         Cmd::Profiles(_)
         | Cmd::Capabilities(_)
         | Cmd::New(_)
+        | Cmd::Attach(_)
         | Cmd::Doctor(_)
         | Cmd::Setup(_)
         | Cmd::Bundle(_)
