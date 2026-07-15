@@ -15,6 +15,13 @@
 //!                  managed class a C# host `new`s and calls (models `cd_typedef`).
 //!   * `--excel`  — a Windows Excel-DNA add-in targeting `net10.0-windows`; ordinary attributed
 //!                  C# worksheet functions call typed managed-Rust exports.
+//!   * `--webapi` — an ASP.NET Core minimal API whose application logic is a schema-1 managed
+//!                  Rust assembly. It builds and runs anywhere the supported CoreCLR profile does.
+//!   * `--worker` — the same managed Rust contract hosted by a .NET worker service.
+//!   * `--winui`  — an unpackaged WinUI 3 desktop app. The scaffold is Windows-only and remains
+//!                  planned until its Windows runtime acceptance passes.
+//!   * `--maui`   — a Windows-first MAUI app. Mobile TFMs are deliberately not generated until
+//!                  their packaging and runtime gates exist.
 //!
 //! Templates are emitted from string constants (interpolating the crate name) — no
 //! network, no example-crate copy at runtime. Every file the corresponding example
@@ -124,6 +131,10 @@ fn render(template: Template, name: &str, dotnet: &str) -> Vec<File> {
         Template::Lib => lib_files(name, dotnet),
         Template::Plugin => plugin_files(name, dotnet),
         Template::Excel => excel_files(name, dotnet),
+        Template::Maui => maui_files(name, dotnet),
+        Template::Winui => winui_files(name, dotnet),
+        Template::WebApi => webapi_files(name, dotnet),
+        Template::Worker => worker_files(name, dotnet),
     }
 }
 
@@ -318,6 +329,214 @@ fn excel_files(name: &str, dotnet: &str) -> Vec<File> {
 }
 
 // ---------------------------------------------------------------------------------
+// Product hosts: one schema-1 managed Rust backend, several ordinary .NET hosts.
+// ---------------------------------------------------------------------------------
+
+fn managed_stem(name: &str) -> String {
+    let mut result = String::new();
+    for part in name.split(['-', '_']).filter(|part| !part.is_empty()) {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            result.push(first.to_ascii_uppercase());
+            result.extend(chars);
+        }
+    }
+    if result.is_empty() {
+        "RustApp".to_owned()
+    } else {
+        result
+    }
+}
+
+fn product_rust_files(name: &str, compatibility_profile: &str) -> Vec<File> {
+    let managed = managed_stem(name);
+    let assembly = format!("{managed}.Rust");
+    vec![
+        File {
+            rel: "rustlib/Cargo.toml",
+            body: format!(
+                "[package]\n\
+                 name = \"{name}\"\n\
+                 version = \"0.1.0\"\n\
+                 edition = \"2024\"\n\
+                 \n\
+                 [lib]\n\
+                 crate-type = [\"cdylib\"]\n\
+                 \n\
+                 [package.metadata.dotnet]\n\
+                 identity-schema = 1\n\
+                 package-id = \"{assembly}\"\n\
+                 assembly-name = \"{assembly}\"\n\
+                 root-namespace = \"{managed}\"\n\
+                 module-type = \"Backend\"\n\
+                 public-namespaces = [\"{managed}\"]\n\
+                 compatibility-profile = \"{compatibility_profile}\"\n\
+                 legacy-main-module = false\n\
+                 \n\
+                 [dependencies]\n\
+                 mycorrhiza = \"0.0.0\"\n\
+                 dotnet_macros = \"0.1.0\"\n\
+                 [workspace]\n\
+                 \n\
+                 [profile.release.build-override]\n\
+                 codegen-units = 1\n",
+            ),
+        },
+        File {
+            rel: "rustlib/src/lib.rs",
+            body: PRODUCT_HOST_RUST.to_string(),
+        },
+        File {
+            rel: "rustlib/.gitignore",
+            body: GITIGNORE_RUSTLIB.to_string(),
+        },
+    ]
+}
+
+fn webapi_files(name: &str, dotnet: &str) -> Vec<File> {
+    let managed = managed_stem(name);
+    let mut files = product_rust_files(name, "net10-coreclr");
+    files.extend([
+        File {
+            rel: "webapi/Program.cs",
+            body: WEBAPI_PROGRAM.replace("__NAMESPACE__", &managed),
+        },
+        File {
+            rel: &leak_str(format!("webapi/{managed}.WebApi.csproj")),
+            body: WEBAPI_CSPROJ_TEMPLATE
+                .replace("__DOTNET__", dotnet)
+                .replace("__ASSEMBLY__", &format!("{managed}.WebApi")),
+        },
+        File {
+            rel: "webapi/.gitignore",
+            body: GITIGNORE_CS.to_string(),
+        },
+        File {
+            rel: "README.md",
+            body: PRODUCT_README
+                .replace("__HOST__", "ASP.NET Core Web API")
+                .replace("__DIR__", "webapi")
+                .replace("__COMMAND__", "dotnet run -c Release"),
+        },
+    ]);
+    files
+}
+
+fn worker_files(name: &str, dotnet: &str) -> Vec<File> {
+    let managed = managed_stem(name);
+    let mut files = product_rust_files(name, "net10-coreclr");
+    files.extend([
+        File {
+            rel: "worker/Program.cs",
+            body: WORKER_PROGRAM.replace("__NAMESPACE__", &managed),
+        },
+        File {
+            rel: "worker/RustWorker.cs",
+            body: WORKER_SERVICE.replace("__NAMESPACE__", &managed),
+        },
+        File {
+            rel: &leak_str(format!("worker/{managed}.Worker.csproj")),
+            body: WORKER_CSPROJ_TEMPLATE
+                .replace("__DOTNET__", dotnet)
+                .replace("__ASSEMBLY__", &format!("{managed}.Worker")),
+        },
+        File {
+            rel: "worker/.gitignore",
+            body: GITIGNORE_CS.to_string(),
+        },
+        File {
+            rel: "README.md",
+            body: PRODUCT_README
+                .replace("__HOST__", ".NET worker service")
+                .replace("__DIR__", "worker")
+                .replace("__COMMAND__", "dotnet run -c Release"),
+        },
+    ]);
+    files
+}
+
+fn winui_files(name: &str, dotnet: &str) -> Vec<File> {
+    let managed = managed_stem(name);
+    let mut files = product_rust_files(name, "winui3-net10-windows");
+    files.extend([
+        File {
+            rel: "winui/App.xaml",
+            body: WINUI_APP_XAML.replace("__NAMESPACE__", &managed),
+        },
+        File {
+            rel: "winui/App.xaml.cs",
+            body: WINUI_APP_CS.replace("__NAMESPACE__", &managed),
+        },
+        File {
+            rel: "winui/MainWindow.xaml",
+            body: WINUI_MAIN_WINDOW_XAML.replace("__NAMESPACE__", &managed),
+        },
+        File {
+            rel: "winui/MainWindow.xaml.cs",
+            body: WINUI_MAIN_WINDOW_CS.replace("__NAMESPACE__", &managed),
+        },
+        File {
+            rel: &leak_str(format!("winui/{managed}.WinUI.csproj")),
+            body: WINUI_CSPROJ_TEMPLATE
+                .replace("__DOTNET__", dotnet)
+                .replace("__ASSEMBLY__", &format!("{managed}.WinUI")),
+        },
+        File {
+            rel: "winui/.gitignore",
+            body: GITIGNORE_CS.to_string(),
+        },
+        File {
+            rel: "README.md",
+            body: WINDOWS_HOST_README
+                .replace("__HOST__", "WinUI 3")
+                .replace("__DIR__", "winui"),
+        },
+    ]);
+    files
+}
+
+fn maui_files(name: &str, dotnet: &str) -> Vec<File> {
+    let managed = managed_stem(name);
+    let mut files = product_rust_files(name, "maui-windows-net10");
+    files.extend([
+        File {
+            rel: "maui/MauiProgram.cs",
+            body: MAUI_PROGRAM.replace("__NAMESPACE__", &managed),
+        },
+        File {
+            rel: "maui/App.cs",
+            body: MAUI_APP.replace("__NAMESPACE__", &managed),
+        },
+        File {
+            rel: "maui/Platforms/Windows/App.xaml",
+            body: MAUI_WINDOWS_APP_XAML.replace("__NAMESPACE__", &managed),
+        },
+        File {
+            rel: "maui/Platforms/Windows/App.xaml.cs",
+            body: MAUI_WINDOWS_APP_CS.replace("__NAMESPACE__", &managed),
+        },
+        File {
+            rel: &leak_str(format!("maui/{managed}.Maui.csproj")),
+            body: MAUI_CSPROJ_TEMPLATE
+                .replace("__DOTNET__", dotnet)
+                .replace("__ASSEMBLY__", &format!("{managed}.Maui"))
+                .replace("__NAMESPACE__", &managed),
+        },
+        File {
+            rel: "maui/.gitignore",
+            body: GITIGNORE_CS.to_string(),
+        },
+        File {
+            rel: "README.md",
+            body: WINDOWS_HOST_README
+                .replace("__HOST__", ".NET MAUI for Windows")
+                .replace("__DIR__", "maui"),
+        },
+    ]);
+    files
+}
+
+// ---------------------------------------------------------------------------------
 // SDK crates are ordinary version dependencies in portable manifests. cargo-dotnet's
 // private build config redirects them to the copies installed under CARGO_DOTNET_HOME.
 // ---------------------------------------------------------------------------------
@@ -389,6 +608,29 @@ fn print_next_steps(template: Template, name: &str, dir: &Path, dotnet: &str) {
             println!(
                 "  # Open the generated *-packed.xll from bin/Release/net{dotnet}.0-windows/publish"
             );
+        }
+        Template::WebApi => {
+            println!("Next:");
+            println!("  cd {d}/webapi");
+            println!("  dotnet run -c Release  # http://localhost:5000/health");
+        }
+        Template::Worker => {
+            println!("Next:");
+            println!("  cd {d}/worker");
+            println!("  dotnet run -c Release");
+        }
+        Template::Winui => {
+            println!("Next (Windows with Visual Studio and the Windows App SDK workload):");
+            println!("  cd {d}/winui");
+            println!("  dotnet run -c Release");
+            println!("  # Profile winui3-net10-windows remains planned until runtime CI passes.");
+        }
+        Template::Maui => {
+            println!("Next (Windows with the .NET MAUI workload installed):");
+            println!("  cd {d}/maui");
+            println!("  dotnet workload install maui-windows  # once per machine");
+            println!("  dotnet run -c Release -f net{dotnet}.0-windows10.0.19041.0");
+            println!("  # Android/iOS/Mac Catalyst are not generated or claimed yet.");
         }
     }
 }
@@ -853,6 +1095,307 @@ const CSPROJ_TEMPLATE: &str = r#"<Project Sdk="Microsoft.NET.Sdk">
 </Project>
 "#;
 
+const PRODUCT_HOST_RUST: &str = r#"#![feature(adt_const_params, unsized_const_params)]
+#![allow(internal_features, incomplete_features)]
+
+use dotnet_macros::dotnet_export;
+
+/// A small typed operation shared by every generated host. Replace its body with domain logic;
+/// the managed signature remains an ordinary `static int Double(int)` method.
+#[dotnet_export(name = "Double")]
+pub fn double(value: i32) -> i32 {
+    value.saturating_mul(2)
+}
+
+/// Managed strings cross directly; the host does not need P/Invoke or a generated C# shim.
+#[dotnet_export(name = "Describe")]
+pub fn describe(value: i32) -> String {
+    format!("managed Rust processed {value} into {}", double(value))
+}
+"#;
+
+const WEBAPI_PROGRAM: &str = r#"using __NAMESPACE__;
+
+var builder = WebApplication.CreateBuilder(args);
+var app = builder.Build();
+
+app.MapGet("/health", () => new
+{
+    status = "ok",
+    engine = Backend.Describe(21),
+    answer = Backend.Double(21),
+});
+
+app.Run();
+"#;
+
+const WORKER_PROGRAM: &str = r#"using __NAMESPACE__.WorkerHost;
+
+var builder = Host.CreateApplicationBuilder(args);
+builder.Services.AddHostedService<RustWorker>();
+await builder.Build().RunAsync();
+"#;
+
+const WORKER_SERVICE: &str = r#"using __NAMESPACE__;
+
+namespace __NAMESPACE__.WorkerHost;
+
+public sealed class RustWorker(
+    ILogger<RustWorker> logger,
+    IHostApplicationLifetime lifetime) : BackgroundService
+{
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        logger.LogInformation("{Message}; answer={Answer}",
+            Backend.Describe(21), Backend.Double(21));
+        lifetime.StopApplication();
+        return Task.CompletedTask;
+    }
+}
+"#;
+
+const WEBAPI_CSPROJ_TEMPLATE: &str = r#"<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net__DOTNET__.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>__ASSEMBLY__</AssemblyName>
+    <RustDotnetVersion Condition="'$(RustDotnetVersion)'==''">__DOTNET__</RustDotnetVersion>
+    <RustDotnetCompatibilityProfile>net10-coreclr</RustDotnetCompatibilityProfile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <RustCrate Include="../rustlib" />
+  </ItemGroup>
+
+  <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
+  <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'=='' and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+</Project>
+"#;
+
+const WORKER_CSPROJ_TEMPLATE: &str = r#"<Project Sdk="Microsoft.NET.Sdk.Worker">
+  <PropertyGroup>
+    <TargetFramework>net__DOTNET__.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>__ASSEMBLY__</AssemblyName>
+    <RustDotnetVersion Condition="'$(RustDotnetVersion)'==''">__DOTNET__</RustDotnetVersion>
+    <RustDotnetCompatibilityProfile>net10-coreclr</RustDotnetCompatibilityProfile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
+    <RustCrate Include="../rustlib" />
+  </ItemGroup>
+
+  <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
+  <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'=='' and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+</Project>
+"#;
+
+const WINUI_APP_XAML: &str = r#"<Application
+    x:Class="__NAMESPACE__.WinUI.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+</Application>
+"#;
+
+const WINUI_APP_CS: &str = r#"using Microsoft.UI.Xaml;
+
+namespace __NAMESPACE__.WinUI;
+
+public partial class App : Application
+{
+    private Window? window;
+
+    public App() => InitializeComponent();
+
+    protected override void OnLaunched(LaunchActivatedEventArgs args)
+    {
+        window = new MainWindow();
+        window.Activate();
+    }
+}
+"#;
+
+const WINUI_MAIN_WINDOW_XAML: &str = r#"<Window
+    x:Class="__NAMESPACE__.WinUI.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <Grid Padding="32">
+    <StackPanel Spacing="12">
+      <TextBlock FontSize="28" Text="Rust on .NET + WinUI 3" />
+      <TextBlock x:Name="RustResult" TextWrapping="Wrap" />
+    </StackPanel>
+  </Grid>
+</Window>
+"#;
+
+const WINUI_MAIN_WINDOW_CS: &str = r#"using Microsoft.UI.Xaml;
+using __NAMESPACE__;
+
+namespace __NAMESPACE__.WinUI;
+
+public sealed partial class MainWindow : Window
+{
+    public MainWindow()
+    {
+        InitializeComponent();
+        RustResult.Text = Backend.Describe(21);
+    }
+}
+"#;
+
+const WINUI_CSPROJ_TEMPLATE: &str = r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net__DOTNET__.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <UseWinUI>true</UseWinUI>
+    <WindowsPackageType>None</WindowsPackageType>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>__ASSEMBLY__</AssemblyName>
+    <RustDotnetVersion Condition="'$(RustDotnetVersion)'==''">__DOTNET__</RustDotnetVersion>
+    <RustDotnetCompatibilityProfile>winui3-net10-windows</RustDotnetCompatibilityProfile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.2.0" />
+    <RustCrate Include="../rustlib" />
+  </ItemGroup>
+
+  <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
+  <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'=='' and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+</Project>
+"#;
+
+const MAUI_PROGRAM: &str = r#"using Microsoft.Maui.Hosting;
+
+namespace __NAMESPACE__;
+
+public static class MauiProgram
+{
+    public static MauiApp CreateMauiApp() =>
+        MauiApp.CreateBuilder().UseMauiApp<App>().Build();
+}
+"#;
+
+const MAUI_APP: &str = r#"using Microsoft.Maui;
+using Microsoft.Maui.Controls;
+
+namespace __NAMESPACE__;
+
+public sealed class App : Application
+{
+    protected override Window CreateWindow(IActivationState? activationState)
+    {
+        var result = Backend.Describe(21);
+        return new Window(new ContentPage
+        {
+            Title = "Rust on .NET",
+            Content = new VerticalStackLayout
+            {
+                Padding = 32,
+                Spacing = 12,
+                Children =
+                {
+                    new Label { Text = "Managed Rust + .NET MAUI", FontSize = 28 },
+                    new Label { Text = result },
+                },
+            },
+        });
+    }
+}
+"#;
+
+const MAUI_WINDOWS_APP_XAML: &str = r#"<maui:MauiWinUIApplication
+    x:Class="__NAMESPACE__.WinUI.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:maui="using:Microsoft.Maui">
+</maui:MauiWinUIApplication>
+"#;
+
+const MAUI_WINDOWS_APP_CS: &str = r#"using Microsoft.Maui;
+using Microsoft.Maui.Hosting;
+
+namespace __NAMESPACE__.WinUI;
+
+public partial class App : MauiWinUIApplication
+{
+    public App() => InitializeComponent();
+
+    protected override MauiApp CreateMauiApp() => MauiProgram.CreateMauiApp();
+}
+"#;
+
+const MAUI_CSPROJ_TEMPLATE: &str = r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!-- Windows is the only generated TFM until Android/iOS/Mac Catalyst runtime gates pass. -->
+    <TargetFramework>net__DOTNET__.0-windows10.0.19041.0</TargetFramework>
+    <OutputType>WinExe</OutputType>
+    <RootNamespace>__NAMESPACE__</RootNamespace>
+    <UseMaui>true</UseMaui>
+    <SingleProject>true</SingleProject>
+    <WindowsPackageType>None</WindowsPackageType>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>__ASSEMBLY__</AssemblyName>
+    <RustDotnetVersion Condition="'$(RustDotnetVersion)'==''">__DOTNET__</RustDotnetVersion>
+    <RustDotnetCompatibilityProfile>maui-windows-net10</RustDotnetCompatibilityProfile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Maui.Controls" Version="$(MauiVersion)" />
+    <RustCrate Include="../rustlib" />
+  </ItemGroup>
+
+  <Import Project="$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'!='' and Exists('$(CARGO_DOTNET_HOME)/msbuild/RustDotnet.targets')" />
+  <Import Project="$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets"
+          Condition="'$(CARGO_DOTNET_HOME)'=='' and Exists('$(HOME)/.cargo-dotnet/msbuild/RustDotnet.targets')" />
+</Project>
+"#;
+
+const PRODUCT_README: &str = r#"# Managed Rust + __HOST__
+
+`rustlib` is compiled into a normal schema-1 .NET assembly. The host references it through the
+shipped `RustDotnet.targets`; no hand-written P/Invoke or separate Rust build command is required.
+
+```bash
+cd __DIR__
+__COMMAND__
+```
+
+Edit `rustlib/src/lib.rs` for application logic. Its public CLR contract is the namespace and
+`Backend` type declared in `[package.metadata.dotnet]`.
+"#;
+
+const WINDOWS_HOST_README: &str = r#"# Managed Rust + __HOST__
+
+This is an honest Windows-first scaffold. Build it on Windows with the relevant Visual Studio/.NET
+workload installed:
+
+```powershell
+cd __DIR__
+dotnet run -c Release
+```
+
+The C# project imports `RustDotnet.targets`, so build/debug automatically rebuilds and references
+`rustlib`. This host profile remains **planned**, not supported, until the repository's Windows
+runtime acceptance executes the generated app. Mobile TFMs are not silently enabled.
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -870,6 +1413,10 @@ mod tests {
         assert_cargo_manifests_parse(&lib_files("demo", "10"));
         assert_cargo_manifests_parse(&plugin_files("demo", "10"));
         assert_cargo_manifests_parse(&excel_files("demo", "10"));
+        assert_cargo_manifests_parse(&maui_files("demo", "10"));
+        assert_cargo_manifests_parse(&winui_files("demo", "10"));
+        assert_cargo_manifests_parse(&webapi_files("demo", "10"));
+        assert_cargo_manifests_parse(&worker_files("demo", "10"));
     }
 
     #[test]
@@ -1024,6 +1571,101 @@ mod tests {
     }
 
     #[test]
+    fn product_hosts_share_one_schema_one_managed_backend_contract() {
+        for (files, profile) in [
+            (webapi_files("risk-engine", "10"), "net10-coreclr"),
+            (worker_files("risk-engine", "10"), "net10-coreclr"),
+            (winui_files("risk-engine", "10"), "winui3-net10-windows"),
+            (maui_files("risk-engine", "10"), "maui-windows-net10"),
+        ] {
+            let cargo = &files
+                .iter()
+                .find(|file| file.rel == "rustlib/Cargo.toml")
+                .unwrap()
+                .body;
+            assert!(cargo.contains("identity-schema = 1"));
+            assert!(cargo.contains("assembly-name = \"RiskEngine.Rust\""));
+            assert!(cargo.contains("root-namespace = \"RiskEngine\""));
+            assert!(cargo.contains("module-type = \"Backend\""));
+            assert!(cargo.contains(&format!("compatibility-profile = \"{profile}\"")));
+            assert!(cargo.contains("legacy-main-module = false"));
+
+            let csproj = files
+                .iter()
+                .find(|file| file.rel.ends_with(".csproj"))
+                .unwrap();
+            assert!(csproj.body.contains("<RustCrate Include=\"../rustlib\" />"));
+            assert!(csproj.body.contains("RustDotnet.targets"));
+        }
+    }
+
+    #[test]
+    fn webapi_and_worker_are_cross_platform_net10_hosts() {
+        let webapi = webapi_files("service", "10");
+        let webapi_project = webapi
+            .iter()
+            .find(|file| file.rel.ends_with(".csproj"))
+            .unwrap();
+        assert!(webapi_project.body.contains("Microsoft.NET.Sdk.Web"));
+        assert!(
+            webapi_project
+                .body
+                .contains("<TargetFramework>net10.0</TargetFramework>")
+        );
+        let program = &webapi
+            .iter()
+            .find(|file| file.rel == "webapi/Program.cs")
+            .unwrap()
+            .body;
+        assert!(program.contains("Backend.Describe(21)"));
+        assert!(program.contains("MapGet(\"/health\""));
+
+        let worker = worker_files("service", "10");
+        let worker_project = worker
+            .iter()
+            .find(|file| file.rel.ends_with(".csproj"))
+            .unwrap();
+        assert!(worker_project.body.contains("Microsoft.NET.Sdk.Worker"));
+        let service = &worker
+            .iter()
+            .find(|file| file.rel == "worker/RustWorker.cs")
+            .unwrap()
+            .body;
+        assert!(service.contains("Backend.Describe(21)"));
+        assert!(service.contains("StopApplication()"));
+    }
+
+    #[test]
+    fn windows_hosts_are_explicitly_windows_only() {
+        let winui = winui_files("desktop", "10");
+        let winui_project = winui
+            .iter()
+            .find(|file| file.rel.ends_with(".csproj"))
+            .unwrap();
+        assert!(winui_project.body.contains("<UseWinUI>true</UseWinUI>"));
+        assert!(
+            winui_project
+                .body
+                .contains("Microsoft.WindowsAppSDK\" Version=\"2.2.0")
+        );
+
+        let maui = maui_files("desktop", "10");
+        let maui_project = maui
+            .iter()
+            .find(|file| file.rel.ends_with(".csproj"))
+            .unwrap();
+        assert!(maui_project.body.contains("<UseMaui>true</UseMaui>"));
+        assert!(
+            maui_project
+                .body
+                .contains("<TargetFramework>net10.0-windows10.0.19041.0")
+        );
+        assert!(!maui_project.body.contains("-android"));
+        assert!(!maui_project.body.contains("-ios"));
+        assert!(!maui_project.body.contains("-maccatalyst"));
+    }
+
+    #[test]
     fn no_template_placeholders_leak() {
         for name in ["a", "b_c", "Xyz"] {
             for files in [
@@ -1031,6 +1673,10 @@ mod tests {
                 lib_files(name, "10"),
                 plugin_files(name, "10"),
                 excel_files(name, "10"),
+                maui_files(name, "10"),
+                winui_files(name, "10"),
+                webapi_files(name, "10"),
+                worker_files(name, "10"),
             ] {
                 for f in files {
                     assert!(
@@ -1056,6 +1702,11 @@ mod tests {
                     assert!(
                         !f.body.contains("__RUST_CRATE__"),
                         "unresolved __RUST_CRATE__ in {}",
+                        f.rel
+                    );
+                    assert!(
+                        !f.body.contains("__NAMESPACE__"),
+                        "unresolved __NAMESPACE__ in {}",
                         f.rel
                     );
                     assert!(

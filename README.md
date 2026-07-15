@@ -65,6 +65,10 @@ result with ordinary Rust code.
 - MSBuild integration, Portable PDBs, Source Link, and NativeAOT publishing
 - A Windows Excel-DNA scaffold that packages worksheet functions backed by managed Rust into a
   64-bit `.xll` (`cargo dotnet new ./risk-engine --excel`)
+- Executable ASP.NET Core and Worker scaffolds (`--webapi`, `--worker`) whose MSBuild projects
+  rebuild and reference a schema-1 managed Rust backend automatically
+- Windows-first WinUI 3 and MAUI scaffolds (`--winui`, `--maui`), kept at planned status until
+  Windows workload build-and-launch evidence exists; mobile MAUI targets are not claimed
 - Evidence-gated host contracts visible through `cargo dotnet profiles`—including honest preview,
   planned, and unsupported Office/Unity/MAUI combinations
 - An alternate C exporter from the same compiler IR

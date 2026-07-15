@@ -58,7 +58,15 @@ const PROFILES: &[CompatibilityProfile] = &[
         host: ".NET MAUI Windows on CoreCLR 10",
         managed_contract: "net10.0-windows10.0.19041.0",
         native_assets: "win-x64 or win-arm64 per package",
-        evidence: "scaffold and runtime fixture not yet landed",
+        evidence: "scaffold contract passes; Windows build and runtime fixture remain",
+    },
+    CompatibilityProfile {
+        name: "winui3-net10-windows",
+        support: Support::Planned,
+        host: "unpackaged WinUI 3 desktop app on Windows 10 1809 or newer",
+        managed_contract: "net10.0-windows10.0.19041.0 / CoreCLR 10",
+        native_assets: "win-x64 or win-arm64 per package",
+        evidence: "scaffold contract exists; Windows build and runtime fixture remain",
     },
     CompatibilityProfile {
         name: "unity-netstandard2.1",

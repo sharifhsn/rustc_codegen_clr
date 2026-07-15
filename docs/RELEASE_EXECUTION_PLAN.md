@@ -13,7 +13,7 @@ Focused-proven in the active working tree:
 
 - R0.1–R0.4 contracts and executable fixtures;
 - R1.1's opt-in unique managed namespace/type path, duplicate identity preflight, strict schema,
-  single-final-artifact guard, and explicit ilasm requirement (generated facade/direct PE remain);
+  single-final-artifact guard, and default direct-PE projection;
 - R1.3 automatic reachable Cargo input closure, stable no-op, failure invalidation, and receipt hash;
 - R1.4 authenticated private-registry/config/credential layering without ambient mutation or token
   leakage;
@@ -21,8 +21,9 @@ Focused-proven in the active working tree:
   preserved runtime/native/resource package paths, and a fresh host-RID C# consumer; and
 - R3.1's deterministic synthetic full/blank/short AIP corpus comparing all 82 fields (malformed and
   boundary mutation breadth remains).
-- The release host matrix is explicitly Linux/macOS; cargo-dotnet and MSBuild reject Windows hosts
-  until Windows build, test, packaging, and MSBuild acceptance exists.
+- The SDK host matrix is Linux x64, macOS Apple Silicon, and Windows x64. Compiler, CLI, P/Invoke,
+  and generated Web API/Worker execution are gated on those hosts; WinUI, MAUI, and real Excel
+  launches remain separate Windows product-host evidence rather than inherited support claims.
 - First-time-user entry documents now route through install/setup/doctor/scaffold/run instead of the
   obsolete manual backend flags. Runtime choice is cache-safe, the selected CoreCLR runtime is an
   explicit doctor gate, fallback `ilasm` is non-blocking under direct PE, and process exit status is

@@ -284,9 +284,15 @@ MAUI is a profile matrix rather than one runtime:
 - [ ] Finish the Excel product proof with an optional native kernel and a real Windows Excel launch.
   The mdBook now has a complete scaffold/build/formula/architecture/deployment guide and states the
   Windows-only preview boundary explicitly.
-- [ ] `cargo dotnet new --maui`: multi-target MAUI host with initially honest Windows support and
-  explicit experimental/unsupported markers for Android/iOS until their acceptance gates pass.
-- [ ] `cargo dotnet new --winui`, `--webapi`, and `--worker` product templates.
+- [x] `cargo dotnet new --maui`: the generated MAUI host is deliberately Windows-only today, uses
+  the `maui-windows-net10` schema-1 backend profile, builds Rust through `RustDotnet.targets`, and
+  explicitly declines to generate Android/iOS/Mac Catalyst TFMs until their acceptance gates pass.
+  The cross-platform scaffold contract passes; a Windows workload build and launch remain a
+  separate product-evidence requirement below.
+- [x] `cargo dotnet new --winui`, `--webapi`, and `--worker` product templates. All four product
+  hosts share one typed schema-1 `Namespace.Backend` Rust assembly contract. The generated Web API
+  endpoint and Worker execute managed Rust on macOS in `product_hosts_acceptance.sh`; WinUI remains
+  planned and Windows-only until its build and launch gate exists.
 - [ ] `cargo dotnet attach <csproj> --rust-crate <path>` for existing solutions.
 - [ ] `cargo dotnet attach-unity <UnityProject> --rust-crate <path>` only after the
   `netstandard2.1` managed profile is proven; copy/reference artifacts and preserve Unity `.meta`

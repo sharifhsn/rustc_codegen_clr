@@ -49,7 +49,7 @@ pub enum Cmd {
     Build(BuildArgs),
     /// Build a Rust crate and run it on .NET (forwards exit code; args after `--`).
     Run(BuildArgs),
-    /// Scaffold a ready-to-run interop project (--app / --lib / --plugin).
+    /// Scaffold a Rust-on-.NET app, library, or product host.
     New(NewArgs),
     /// Diagnose the toolchain, or translate a .NET runtime failure into an actionable fix.
     Doctor(DoctorArgs),
@@ -259,6 +259,14 @@ pub enum Template {
     Plugin,
     /// An Excel-DNA add-in whose worksheet functions call managed Rust exports.
     Excel,
+    /// A .NET MAUI application with an initially Windows-only managed Rust backend.
+    Maui,
+    /// An unpackaged WinUI 3 application with a managed Rust backend.
+    Winui,
+    /// An ASP.NET Core minimal API with a managed Rust backend.
+    WebApi,
+    /// A .NET Generic Host worker service with a managed Rust backend.
+    Worker,
 }
 
 impl Template {
@@ -269,9 +277,17 @@ impl Template {
             Template::Lib => "lib (Rust cdylib consumed from C#)",
             Template::Plugin => "plugin (#[dotnet_class] managed type)",
             Template::Excel => "Excel-DNA add-in (worksheet functions backed by managed Rust)",
+            Template::Maui => "MAUI Windows app (managed Rust backend)",
+            Template::Winui => "WinUI 3 app (managed Rust backend)",
+            Template::WebApi => "ASP.NET Core Web API (managed Rust backend)",
+            Template::Worker => ".NET worker service (managed Rust backend)",
         }
     }
 }
+
+const NEW_TEMPLATE_FLAGS: &[&str] = &[
+    "app", "lib", "plugin", "excel", "maui", "winui", "webapi", "worker",
+];
 
 #[derive(clap::Args)]
 pub struct NewArgs {
@@ -279,17 +295,29 @@ pub struct NewArgs {
     pub path: PathBuf,
 
     /// A Rust-on-.NET binary using `mycorrhiza::prelude` (the default template).
-    #[arg(long, conflicts_with_all = ["lib", "plugin", "excel"])]
+    #[arg(long, conflicts_with_all = ["lib", "plugin", "excel", "maui", "winui", "webapi", "worker"])]
     pub app: bool,
     /// A Rust cdylib exported to C# via `export_rust_containers!()` + a C# consumer.
-    #[arg(long, conflicts_with_all = ["app", "plugin", "excel"])]
+    #[arg(long, conflicts_with_all = ["app", "plugin", "excel", "maui", "winui", "webapi", "worker"])]
     pub lib: bool,
     /// A `#[dotnet_class]` managed type + a C# host that constructs it.
-    #[arg(long, conflicts_with_all = ["app", "lib", "excel"])]
+    #[arg(long, conflicts_with_all = ["app", "lib", "excel", "maui", "winui", "webapi", "worker"])]
     pub plugin: bool,
     /// A Windows Excel-DNA add-in with worksheet functions backed by managed Rust.
-    #[arg(long, conflicts_with_all = ["app", "lib", "plugin"])]
+    #[arg(long, conflicts_with_all = ["app", "lib", "plugin", "maui", "winui", "webapi", "worker"])]
     pub excel: bool,
+    /// A Windows-first .NET MAUI app. Android/iOS/Mac Catalyst remain unsupported until gated.
+    #[arg(long, conflicts_with_all = ["app", "lib", "plugin", "excel", "winui", "webapi", "worker"])]
+    pub maui: bool,
+    /// An unpackaged WinUI 3 desktop app for Windows.
+    #[arg(long, conflicts_with_all = ["app", "lib", "plugin", "excel", "maui", "webapi", "worker"])]
+    pub winui: bool,
+    /// An ASP.NET Core minimal API with Rust business logic compiled to managed .NET.
+    #[arg(long, conflicts_with_all = ["app", "lib", "plugin", "excel", "maui", "winui", "worker"])]
+    pub webapi: bool,
+    /// A .NET worker service with Rust business logic compiled to managed .NET.
+    #[arg(long, conflicts_with_all = ["app", "lib", "plugin", "excel", "maui", "winui", "webapi"])]
+    pub worker: bool,
 
     /// Override the crate name (default: the final path component).
     #[arg(long)]
@@ -309,12 +337,31 @@ pub struct NewArgs {
 impl NewArgs {
     /// Resolve the selected template. `--app` is the default when none is given.
     pub fn template(&self) -> anyhow::Result<Template> {
-        match (self.app, self.lib, self.plugin, self.excel) {
-            (_, true, _, _) => Ok(Template::Lib),
-            (_, _, true, _) => Ok(Template::Plugin),
-            (_, _, _, true) => Ok(Template::Excel),
-            _ => Ok(Template::App), // --app or nothing.
+        let selected = [
+            (self.app, Template::App),
+            (self.lib, Template::Lib),
+            (self.plugin, Template::Plugin),
+            (self.excel, Template::Excel),
+            (self.maui, Template::Maui),
+            (self.winui, Template::Winui),
+            (self.webapi, Template::WebApi),
+            (self.worker, Template::Worker),
+        ];
+        let mut templates = selected
+            .into_iter()
+            .filter_map(|(enabled, template)| enabled.then_some(template));
+        let template = templates.next().unwrap_or(Template::App);
+        if templates.next().is_some() {
+            anyhow::bail!(
+                "select exactly one template flag: {}",
+                NEW_TEMPLATE_FLAGS
+                    .iter()
+                    .map(|flag| format!("--{flag}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
+        Ok(template)
     }
 }
 
@@ -585,6 +632,37 @@ mod tests {
         };
         assert_eq!(args.template().unwrap(), Template::Excel);
         assert_eq!(args.dotnet, "10");
+    }
+
+    #[test]
+    fn new_product_host_flags_select_their_templates() {
+        for (flag, expected) in [
+            ("--maui", Template::Maui),
+            ("--winui", Template::Winui),
+            ("--webapi", Template::WebApi),
+            ("--worker", Template::Worker),
+        ] {
+            let cli = DotnetCli::try_parse_from(["cargo-dotnet", "new", "demo", flag]).unwrap();
+            let Cmd::New(args) = cli.cmd else {
+                panic!("new {flag} did not parse to the new command")
+            };
+            assert_eq!(args.template().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn new_rejects_multiple_template_flags() {
+        let error = match DotnetCli::try_parse_from([
+            "cargo-dotnet",
+            "new",
+            "demo",
+            "--webapi",
+            "--worker",
+        ]) {
+            Ok(_) => panic!("two template flags unexpectedly parsed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

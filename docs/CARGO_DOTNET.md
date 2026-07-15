@@ -19,7 +19,7 @@ development and archaeology, but it is not part of this release contract.
 cargo dotnet setup --from-repo PATH
 cargo dotnet profiles [--json]
 cargo dotnet doctor [MESSAGE_OR_LOG] [--workspace PATH] [--json]
-cargo dotnet new PATH --app|--lib|--plugin|--excel
+cargo dotnet new PATH --app|--lib|--plugin|--excel|--webapi|--worker|--winui|--maui
 cargo dotnet build [PATH]
 cargo dotnet run [PATH] [-- PROGRAM_ARGS...]
 cargo dotnet test [PATH]
@@ -75,17 +75,24 @@ Installed files are integrity-checked before later builds.
 
 ## Scaffolds
 
-`cargo dotnet new` creates one of four project shapes:
+`cargo dotnet new` creates one of eight project shapes:
 
 - `--app`: a Rust application compiled to a managed executable;
-- `--lib`: a Rust library plus a C# consumer and MSBuild integration; or
-- `--plugin`: a Rust implementation consumed through a managed interface; or
+- `--lib`: a Rust library plus a C# consumer and MSBuild integration;
+- `--plugin`: a Rust implementation consumed through a managed interface;
 - `--excel`: a Windows Excel-DNA `net10.0-windows` add-in whose attributed worksheet functions
-  call managed Rust exports directly.
+  call managed Rust exports directly;
+- `--webapi`: an ASP.NET Core minimal API with a schema-1 managed Rust backend;
+- `--worker`: a Generic Host worker service with the same backend contract;
+- `--winui`: an unpackaged Windows WinUI 3 application; or
+- `--maui`: a Windows-only MAUI application. Android, iOS, and Mac Catalyst TFMs are not generated
+  until their packaging and runtime gates pass.
 
-The general scaffolds target `net10.0`; the Excel host targets `net10.0-windows`. Each prints its
-exact next command. `--excel` uses stable Excel-DNA 1.9.0, generates a 64-bit packed `.xll`, and is
-deliberately not presented as VSTO or Office-for-macOS support.
+The general, Web API, and Worker scaffolds target `net10.0`; the desktop product hosts target their
+explicit Windows TFMs. Each prints its exact next command. `--excel` uses stable Excel-DNA 1.9.0,
+generates a 64-bit packed `.xll`, and is deliberately not presented as VSTO or Office-for-macOS
+support. Web API and Worker have runtime acceptance on the supported CoreCLR hosts. WinUI and MAUI
+remain planned profiles until Windows CI builds and launches them with the required workloads.
 
 Run `cargo dotnet profiles` for the current host-by-host support contract. Profile names describe a
 real loader/runtime contract, not merely a target framework string; planned Unity and mobile
@@ -101,7 +108,8 @@ cargo dotnet test ./crate
 
 The driver builds a private sysroot for the pinned nightly, invokes rustc with the codegen backend,
 and writes the managed PE, Portable PDB, runtime configuration, and an artifact identity receipt.
-The normal direct-PE path does not require ILAsm; the legacy IL exporter remains a debugging escape
+The normal direct-PE path, including schema-1 projected assembly/type identity, does not require
+ILAsm. Set `DIRECT_PE=0` only when intentionally using the legacy IL exporter as a debugging escape
 hatch.
 
 ## Rust and C# interop

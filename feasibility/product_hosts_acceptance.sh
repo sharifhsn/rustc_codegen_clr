@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+work="$(mktemp -d "${TMPDIR:-/tmp}/rust-dotnet-product-hosts.XXXXXX")"
+web_pid=""
+cleanup() {
+    if [[ -n "$web_pid" ]]; then
+        kill "$web_pid" 2>/dev/null || true
+        wait "$web_pid" 2>/dev/null || true
+    fi
+    rm -rf "$work"
+}
+trap cleanup EXIT
+
+cd "$repo"
+cargo build -p cargo-dotnet
+cargo_dotnet="$repo/target/debug/cargo-dotnet"
+
+for template in webapi worker winui maui; do
+    "$cargo_dotnet" new "$work/$template-demo" "--$template"
+done
+
+# Windows-only projects are contract-checked here. Runtime support remains planned until the
+# Windows CI jobs build and launch them with their actual workloads installed.
+winui_project="$work/winui-demo/winui/WinuiDemo.WinUI.csproj"
+maui_project="$work/maui-demo/maui/MauiDemo.Maui.csproj"
+rg -q '<RustDotnetCompatibilityProfile>winui3-net10-windows</RustDotnetCompatibilityProfile>' "$winui_project"
+rg -q '<UseWinUI>true</UseWinUI>' "$winui_project"
+rg -q '<RustDotnetCompatibilityProfile>maui-windows-net10</RustDotnetCompatibilityProfile>' "$maui_project"
+rg -q '<UseMaui>true</UseMaui>' "$maui_project"
+if rg -q 'net10\.0-(android|ios|maccatalyst)' "$maui_project"; then
+    echo "MAUI scaffold advertises an unproven mobile target" >&2
+    exit 1
+fi
+
+export CARGO_DOTNET_BACKEND=native
+sdk_home="$repo"
+cargo_dotnet_msbuild="$cargo_dotnet"
+if command -v cygpath >/dev/null 2>&1; then
+    sdk_home="$(cygpath -w "$repo")"
+    cargo_dotnet_msbuild="$(cygpath -w "$cargo_dotnet")"
+fi
+export CARGO_DOTNET_HOME="$sdk_home"
+
+web_project="$work/webapi-demo/webapi/WebapiDemo.WebApi.csproj"
+worker_project="$work/worker-demo/worker/WorkerDemo.Worker.csproj"
+dotnet build "$web_project" -c Release -p:CargoDotnet="$cargo_dotnet_msbuild"
+dotnet build "$worker_project" -c Release -p:CargoDotnet="$cargo_dotnet_msbuild"
+
+web_log="$work/webapi.log"
+port=$((40000 + RANDOM % 20000))
+web_url="http://127.0.0.1:$port"
+dotnet run --project "$web_project" -c Release --no-build --urls "$web_url" >"$web_log" 2>&1 &
+web_pid=$!
+
+for _ in {1..100}; do
+    if response="$(curl --fail --silent "$web_url/health" 2>/dev/null)"; then
+        break
+    fi
+    if ! kill -0 "$web_pid" 2>/dev/null; then
+        echo "generated Web API exited before listening" >&2
+        head -200 "$web_log" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+[[ -n "${response:-}" ]] || { echo "generated Web API did not answer /health" >&2; exit 1; }
+[[ "$response" == *'"engine":"managed Rust processed 21 into 42"'* ]]
+[[ "$response" == *'"answer":42'* ]]
+kill "$web_pid"
+wait "$web_pid" 2>/dev/null || true
+web_pid=""
+
+worker_output="$(dotnet run --project "$worker_project" -c Release --no-build 2>&1)"
+[[ "$worker_output" == *'managed Rust processed 21 into 42; answer=42'* ]]
+
+echo "Product host acceptance OK: Web API endpoint and Worker executed managed Rust; WinUI/MAUI contracts generated without unsupported mobile claims"

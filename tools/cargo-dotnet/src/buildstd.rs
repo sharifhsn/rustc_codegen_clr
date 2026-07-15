@@ -442,10 +442,6 @@ fn configure_managed_identity_env(
                 "0"
             },
         );
-        // The direct PE writer does not yet accept an explicit projected MainModule owner.
-        // Make the mature ILASM route intentional instead of relying on the linker's silent
-        // branch selection; a direct linker invocation with DIRECT_PE=1 is rejected below.
-        cmd.env("DIRECT_PE", "0");
     }
 }
 
@@ -472,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_build_replaces_ambient_identity_and_disables_direct_pe() {
+    fn identity_build_replaces_ambient_identity_without_overriding_exporter_selection() {
         let mut command = Command::new("cargo");
         let identity = ManagedIdentity {
             schema: 1,
@@ -488,10 +484,7 @@ mod tests {
             envs.get(std::ffi::OsStr::new("RCL_MANAGED_ASSEMBLY_NAME")),
             Some(&Some(std::ffi::OsStr::new("example_widget")))
         );
-        assert_eq!(
-            envs.get(std::ffi::OsStr::new("DIRECT_PE")),
-            Some(&Some(std::ffi::OsStr::new("0")))
-        );
+        assert!(!envs.contains_key(std::ffi::OsStr::new("DIRECT_PE")));
     }
 
     #[test]

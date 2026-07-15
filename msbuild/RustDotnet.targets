@@ -71,8 +71,6 @@
   <!--    If none exists -> actionable <Error>.                                -->
   <!-- ====================================================================== -->
   <Target Name="FindCargoDotnet">
-    <Error Condition="$([MSBuild]::IsOSPlatform('Windows'))"
-           Text="Windows hosts are not supported by this cargo-dotnet release; use Linux or macOS. Windows support will be enabled after Windows build, test, packaging, and MSBuild acceptance exists." />
     <PropertyGroup>
       <_CdHome>$(CARGO_DOTNET_HOME)</_CdHome>
       <_CdHome Condition="'$(_CdHome)'==''">$(HOME)/.cargo-dotnet</_CdHome>
