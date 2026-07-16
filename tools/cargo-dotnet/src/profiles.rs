@@ -32,6 +32,7 @@ struct CompatibilityProfile {
     host: &'static str,
     managed_contract: &'static str,
     native_assets: &'static str,
+    host_rids: &'static [&'static str],
     evidence: &'static str,
 }
 
@@ -42,6 +43,7 @@ const PROFILES: &[CompatibilityProfile] = &[
         host: ".NET 10 CoreCLR on Linux x64, macOS arm64, or Windows x64",
         managed_contract: "net10.0 / Microsoft.NETCore.App 10",
         native_assets: "host RID when P/Invoke is used",
+        host_rids: &["linux-x64", "osx-arm64", "win-x64"],
         evidence: "release SDK onboarding and managed consumer acceptance",
     },
     CompatibilityProfile {
@@ -50,6 +52,7 @@ const PROFILES: &[CompatibilityProfile] = &[
         host: "64-bit desktop Excel on Windows x64 through Excel-DNA 1.9",
         managed_contract: "net10.0-windows / CoreCLR 10",
         native_assets: "win-x64 when P/Invoke is used",
+        host_rids: &["win-x64"],
         evidence: "packed XLL build passes; real Excel launch proof remains",
     },
     CompatibilityProfile {
@@ -58,6 +61,7 @@ const PROFILES: &[CompatibilityProfile] = &[
         host: ".NET MAUI Windows on CoreCLR 10",
         managed_contract: "net10.0-windows10.0.19041.0",
         native_assets: "win-x64 or win-arm64 per package",
+        host_rids: &["win-x64", "win-arm64"],
         evidence: "scaffold contract passes; Windows build and runtime fixture remain",
     },
     CompatibilityProfile {
@@ -66,6 +70,7 @@ const PROFILES: &[CompatibilityProfile] = &[
         host: "unpackaged WinUI 3 desktop app on Windows 10 1809 or newer",
         managed_contract: "net10.0-windows10.0.19041.0 / CoreCLR 10",
         native_assets: "win-x64 or win-arm64 per package",
+        host_rids: &["win-x64", "win-arm64"],
         evidence: "scaffold contract exists; Windows build and runtime fixture remain",
     },
     CompatibilityProfile {
@@ -74,6 +79,7 @@ const PROFILES: &[CompatibilityProfile] = &[
         host: "Unity 6 Editor plus Mono and IL2CPP players",
         managed_contract: "netstandard2.1-compatible API surface; not net10.0",
         native_assets: "Unity plugin layout per player platform",
+        host_rids: &[],
         evidence: "requires a restricted BCL contract and Editor plus player execution",
     },
     CompatibilityProfile {
@@ -82,6 +88,7 @@ const PROFILES: &[CompatibilityProfile] = &[
         host: ".NET MAUI Android (Mono first; CoreCLR separately experimental)",
         managed_contract: "Android-compatible managed IL with trimming constraints",
         native_assets: "android-arm64/x64 ABI directories",
+        host_rids: &["android-arm64", "android-x64"],
         evidence: "APK/emulator runtime and packaging proof required",
     },
     CompatibilityProfile {
@@ -90,6 +97,12 @@ const PROFILES: &[CompatibilityProfile] = &[
         host: ".NET MAUI iOS and Mac Catalyst",
         managed_contract: "fully AOT- and trimming-compatible managed IL",
         native_assets: "signed static frameworks per Apple target",
+        host_rids: &[
+            "ios-arm64",
+            "iossimulator-arm64",
+            "maccatalyst-arm64",
+            "maccatalyst-x64",
+        ],
         evidence: "simulator/device NativeAOT and packaging proof required",
     },
     CompatibilityProfile {
@@ -98,12 +111,20 @@ const PROFILES: &[CompatibilityProfile] = &[
         host: "VSTO add-in process",
         managed_contract: "VSTO remains .NET Framework 4.8; modern .NET coexistence is unsupported",
         native_assets: "not applicable",
+        host_rids: &[],
         evidence: "use Excel-DNA or a thin VSTO shim with an out-of-process .NET 10 service",
     },
 ];
 
 pub(crate) fn is_known(name: &str) -> bool {
     PROFILES.iter().any(|profile| profile.name == name)
+}
+
+pub(crate) fn package_contract(name: &str) -> Option<(&'static str, &'static [&'static str])> {
+    PROFILES
+        .iter()
+        .find(|profile| profile.name == name)
+        .map(|profile| (profile.support.label(), profile.host_rids))
 }
 
 pub fn run(args: &ProfilesArgs) -> Result<i32> {
@@ -118,6 +139,14 @@ pub fn run(args: &ProfilesArgs) -> Result<i32> {
         println!("  host: {}", profile.host);
         println!("  managed: {}", profile.managed_contract);
         println!("  native: {}", profile.native_assets);
+        println!(
+            "  RIDs: {}",
+            if profile.host_rids.is_empty() {
+                "none declared".to_owned()
+            } else {
+                profile.host_rids.join(", ")
+            }
+        );
         println!("  evidence: {}", profile.evidence);
     }
     Ok(0)

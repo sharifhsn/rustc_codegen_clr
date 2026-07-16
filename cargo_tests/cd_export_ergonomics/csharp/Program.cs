@@ -53,13 +53,13 @@ Check("invoke_string_func", MainModule.invoke_string_func(s => s.Length, callbac
 Check("invoke_comparison", MainModule.invoke_comparison((a, b) => a.CompareTo(b), 3, 9), -1);
 
 // #[dotnet_methods] instance method taking &str/String directly (no manual MString).
-Greeting g = Greeting.make(2);
-Check("g.greet(\"World\")", g.greet("World"), "Hi, World! Hi, World! ");
+Greeting g = Greeting.Make(2);
+Check("g.Greet(\"World\")", g.Greet("World"), "Hi, World! Hi, World! ");
 
 // #[dotnet_methods] instance method taking Option<i32> directly.
-Check("g.add_bonus(5)", g.add_bonus(5), 7);
-Check("g.add_bonus(null)", g.add_bonus(null), 2);
-Check("g.apply(Func<int,int>)", g.apply(x => x + 1, 39), 42);
+Check("g.AddBonus(5)", g.AddBonus(5), 7);
+Check("g.AddBonus(null)", g.AddBonus(null), 2);
+Check("g.Apply(Func<int,int>)", g.Apply(x => x + 1, 39), 42);
 
 // C# -> Rust debugger/source proof. The call enters an exported Rust method, captures a managed
 // stack there, and relies on the adjacent Portable PDB to resolve the Rust frame to lib.rs:line N.

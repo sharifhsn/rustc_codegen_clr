@@ -40,7 +40,7 @@ for profile in debug release; do
     grep -F 'invoke_func1 = 21 (ok)' "$log_dir/csharp-$profile.log"
     grep -F 'invoke_func2 = 42 (ok)' "$log_dir/csharp-$profile.log"
     grep -F 'invoke_comparison = -1 (ok)' "$log_dir/csharp-$profile.log"
-    grep -F 'g.apply(Func<int,int>) = 42 (ok)' "$log_dir/csharp-$profile.log"
+    grep -F 'g.Apply(Func<int,int>) = 42 (ok)' "$log_dir/csharp-$profile.log"
     grep -F 'Rust sidecar PDB exists = True (ok)' "$log_dir/csharp-$profile.log"
     grep -F 'Rust Portable PDB has documents = True (ok)' "$log_dir/csharp-$profile.log"
     grep -F 'Rust PDB uses logical consumer path = True (ok)' "$log_dir/csharp-$profile.log"

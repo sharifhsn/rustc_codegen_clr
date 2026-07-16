@@ -1297,6 +1297,7 @@ mod tests {
             "linux-x64"
         };
         let staged = vec![crate::nuget::StagedPackageAsset {
+            owner: "fixture/1.0.0".into(),
             logical_path: format!("runtimes/{other_rid}/native/libsample.so"),
             source: PathBuf::from("libsample.so"),
             kind: crate::nuget::StagedPackageAssetKind::Native,

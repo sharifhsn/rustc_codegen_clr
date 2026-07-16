@@ -158,7 +158,16 @@ cargo dotnet push ./packages/Example.0.0.1.nupkg --source https://example.invali
 ```
 
 Packages include the managed assembly, XML documentation, Portable PDB, Source Link information,
-license/provenance metadata, and deterministic contents for identical inputs.
+README and Cargo license/repository metadata, provenance, SBOM, and license inventory. The
+`build/rustdotnet/package-metadata.json` contract records the exact package and assembly identity,
+target framework, compatibility-profile evidence state and host RIDs, RIDs with included native
+assets, Source Link template, sidecar inventory, and one owner/RID/path notice for every native
+dependency. `--validate` cross-checks that contract against the actual NuGet entries.
+
+Acceptance restores and executes four clean package shapes: a portable managed package, real
+transitive NuGet dependencies, the bundled Mycorrhiza helper assembly, and an SDK-selected RID
+layout containing managed, native, and satellite-resource assets. Identical inputs remain
+byte-for-byte deterministic.
 
 ## Offline use
 

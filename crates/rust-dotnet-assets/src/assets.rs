@@ -730,6 +730,7 @@ pub fn package_assets(crate_dir: &Path) -> Result<Vec<StagedPackageAsset>> {
                 AssetKind::Compile => unreachable!("compile assets were skipped"),
             };
             let staged = StagedPackageAsset {
+                owner: asset.owner.clone(),
                 logical_path: logical_path.clone(),
                 source,
                 kind,

@@ -20,6 +20,7 @@ for side in a b; do
     CARGO_DOTNET_BACKEND=native "$driver" pack "$repo/cargo_tests/cd_interop/rustlib" \
         --id Rcl.Determinism.Probe --version 1.0.0 --out "$work/pack-$side" \
         --dotnet "$dotnet_version" --validate \
+        --source-link-url 'https://example.invalid/rust-dotnet-nuget/*' \
         > "$log_dir/pack-$side.log" 2>&1
 done
 first="$work/pack-a/Rcl.Determinism.Probe.1.0.0.nupkg"
@@ -27,6 +28,22 @@ second="$work/pack-b/Rcl.Determinism.Probe.1.0.0.nupkg"
 cmp "$first" "$second"
 [[ -f "$first.sha256" ]]
 [[ -f "$second.sha256" ]]
+unzip -p "$first" 'build/rustdotnet/package-metadata.json' > "$work/package-metadata.json"
+jq -e --arg tfm "$tfm" '
+    .schema == 1 and
+    .package_id == "Rcl.Determinism.Probe" and
+    .assembly_name == "cd_interop" and
+    .target_framework == $tfm and
+    .compatibility_profile == "net10-coreclr" and
+    .profile_support == "supported" and
+    .supported_rids == ["linux-x64", "osx-arm64", "win-x64"] and
+    .included_native_rids == [] and
+    .source_link_url == "https://example.invalid/rust-dotnet-nuget/*" and
+    .portable_pdb == true and .xml_docs == true and .readme == true and
+    .license == "MIT" and
+    .repository_url == "https://github.com/sharifhsn/rustc_codegen_clr" and
+    .native_dependencies == []
+' "$work/package-metadata.json" >/dev/null
 
 # A custom package ID must retain the CLR assembly's real filename/identity and execute when
 # consumed through ordinary PackageReference restore.
@@ -39,6 +56,42 @@ NUGET_PACKAGES="$work/nuget-packages" dotnet run \
     -p:RestoreSources="$work/pack-a;https://api.nuget.org/v3/index.json" \
     > "$log_dir/package-consumer.log" 2>&1
 grep -qx '42' "$log_dir/package-consumer.log"
+
+# Exercise the other package layouts through a fresh, reflection-only C# consumer: a package with
+# real transitive NuGet dependencies and one with the bundled Mycorrhiza helper assembly. Merely
+# finding these entries in the ZIP would not prove NuGet restore or CoreCLR resolution.
+run_layout_consumer() {
+    local crate="$1" package_id="$2" assembly="$3" method="$4" layout="$5"
+    local feed="$work/$layout-feed" consumer="$work/$layout-consumer"
+    CARGO_DOTNET_BACKEND=native "$driver" pack "$repo/$crate" \
+        --id "$package_id" --version 1.0.0 --out "$feed" \
+        --dotnet "$dotnet_version" --validate \
+        --source-link-url 'https://example.invalid/rust-dotnet-nuget/*' \
+        > "$log_dir/$layout-pack.log" 2>&1
+    cp -R "$repo/feasibility/fixtures/package_layout_consumer" "$consumer"
+    NUGET_PACKAGES="$work/$layout-nuget-packages" dotnet restore \
+        "$consumer/PackageLayoutConsumer.csproj" \
+        -p:RustDotnetPackageId="$package_id" -p:RustDotnetPackageVersion=1.0.0 \
+        --source "$feed" --source https://api.nuget.org/v3/index.json \
+        > "$log_dir/$layout-consumer.log" 2>&1
+    NUGET_PACKAGES="$work/$layout-nuget-packages" dotnet run \
+        --project "$consumer/PackageLayoutConsumer.csproj" --no-restore \
+        -p:RustDotnetPackageId="$package_id" -p:RustDotnetPackageVersion=1.0.0 \
+        -- "$assembly" "$method" >> "$log_dir/$layout-consumer.log" 2>&1
+    grep -qx "$assembly.$method=42" "$log_dir/$layout-consumer.log"
+}
+
+run_layout_consumer cargo_tests/pack_nuget_test Rcl.TransitiveNuget.Probe \
+    pack_nuget_test csv_smoke transitive
+transitive_package="$work/transitive-feed/Rcl.TransitiveNuget.Probe.1.0.0.nupkg"
+unzip -p "$transitive_package" 'Rcl.TransitiveNuget.Probe.nuspec' > "$work/transitive.nuspec"
+grep -Fq '<dependency id="CsvHelper" version="30.0.1" />' "$work/transitive.nuspec"
+grep -Fq '<dependency id="HtmlAgilityPack" version="1.11.72" />' "$work/transitive.nuspec"
+
+run_layout_consumer cargo_tests/pack_linq_combinator_test Rcl.BundledHelper.Probe \
+    pack_linq_combinator_test linq_combinator_smoke helper
+helper_package="$work/helper-feed/Rcl.BundledHelper.Probe.1.0.0.nupkg"
+unzip -Z1 "$helper_package" | grep -Fx "lib/$tfm/Mycorrhiza.Interop.Helpers.dll"
 
 # A fresh external crate must restore through the SDK assets graph and receive generated bindings
 # plus runtime assets without relying on this repository's rustup directory override.
@@ -83,12 +136,21 @@ printf '{\n  "version": 1,\n  "roots": {\n    "Rcl.Rid.Fixture": {\n      "asset
 CARGO_DOTNET_BACKEND=native "$driver" pack "$rid_crate" \
     --id Rcl.Rid.Assets.Probe --version 1.0.0 --out "$work/rid-pack" \
     --dotnet "$dotnet_version" --validate \
+    --source-link-url 'https://example.invalid/rust-dotnet-nuget/*' \
     > "$log_dir/rid-pack.log" 2>&1
 rid_package="$work/rid-pack/Rcl.Rid.Assets.Probe.1.0.0.nupkg"
 unzip -Z1 "$rid_package" > "$work/rid-package.entries"
 grep -Fx "$runtime_path" "$work/rid-package.entries"
 grep -Fx "$native_path" "$work/rid-package.entries"
 grep -Fx "$resource_path" "$work/rid-package.entries"
+unzip -p "$rid_package" 'build/rustdotnet/package-metadata.json' > "$work/rid-package-metadata.json"
+jq -e --arg rid "$rid" --arg native_path "$native_path" '
+    .included_native_rids == [$rid] and
+    (.native_dependencies | length) == 1 and
+    .native_dependencies[0].owner == "Rcl.Rid.Fixture/1.0.0" and
+    .native_dependencies[0].rid == $rid and
+    .native_dependencies[0].package_path == $native_path
+' "$work/rid-package-metadata.json" >/dev/null
 mkdir -p "$work/rid-package-consumer"
 sed 's/Rcl.Determinism.Probe/Rcl.Rid.Assets.Probe/' \
     "$repo/feasibility/fixtures/nuget_consumer/Consumer.csproj" \

@@ -134,7 +134,7 @@ fn local_native_assets(crate_dir: &Path) -> Result<Vec<StagedPackageAsset>> {
         );
     }
     let mut assets = Vec::new();
-    for rid_paths in manifest.libraries.into_values() {
+    for (library, rid_paths) in manifest.libraries {
         for (rid, relative) in rid_paths {
             let source = crate_dir.join(&relative);
             if !source.is_file() {
@@ -149,6 +149,7 @@ fn local_native_assets(crate_dir: &Path) -> Result<Vec<StagedPackageAsset>> {
                 .and_then(|name| name.to_str())
                 .context("vendored native filename is not UTF-8")?;
             assets.push(StagedPackageAsset {
+                owner: format!("local:{library}"),
                 logical_path: format!("runtimes/{rid}/native/{filename}"),
                 source,
                 kind: StagedPackageAssetKind::Native,

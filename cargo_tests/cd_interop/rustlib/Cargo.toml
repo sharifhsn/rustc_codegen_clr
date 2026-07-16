@@ -2,6 +2,9 @@
 name = "cd_interop"
 edition = "2024"
 version = "0.1.0"
+description = "Managed Rust NuGet consumer acceptance fixture."
+license = "MIT"
+readme = "README.md"
 # Required for a GitHub Packages NuGet push (§ Direction B validation): GH Packages rejects a
 # push whose .nuspec has no <repository> pointing at a repo the pushing account can write to.
 # `cargo dotnet pack` reads this straight from cargo_metadata into the .nuspec.
@@ -12,6 +15,16 @@ repository = "https://github.com/sharifhsn/rustc_codegen_clr"
 # .NET assembly (named `cd_interop`, no entrypoint) whose `#[unsafe(no_mangle)] pub extern
 # "C"` functions are `public static` methods on `MainModule`, callable from C#.
 crate-type = ["cdylib"]
+
+[package.metadata.dotnet]
+identity-schema = 1
+package-id = "Rcl.Interop.Probe"
+assembly-name = "cd_interop"
+root-namespace = "Rcl.Interop"
+module-type = "MainModule"
+public-namespaces = ["Rcl.Interop"]
+compatibility-profile = "net10-coreclr"
+legacy-main-module = true
 
 # This crate lives UNDER the repo workspace root, so it needs a bare `[workspace]`
 # line or cargo treats it as a member of the outer workspace (the cd_pure footgun).

@@ -25,11 +25,12 @@
 //!     `mycorrhiza` at all, same criterion `build`/`run` already use).
 
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context as _, Result, bail};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -199,6 +200,59 @@ pub fn run(args: &PackArgs) -> Result<i32> {
             staged_assets.len()
         );
     }
+    let (compatibility_profile, profile_support, supported_rids) = ctx
+        .managed_project
+        .as_ref()
+        .map(|project| {
+            let (support, rids) = crate::profiles::package_contract(&project.compatibility_profile)
+                .expect("managed project profile was validated during context resolution");
+            (
+                Some(project.compatibility_profile.clone()),
+                Some(support.to_owned()),
+                rids.iter().map(|rid| (*rid).to_owned()).collect(),
+            )
+        })
+        .unwrap_or_else(|| (None, None, Vec::new()));
+    let mut native_dependencies = staged_assets
+        .iter()
+        .filter(|asset| asset.kind == nuget::StagedPackageAssetKind::Native)
+        .map(|asset| NativeDependencyNotice {
+            owner: asset.owner.clone(),
+            rid: asset.rid.clone(),
+            package_path: asset.logical_path.clone(),
+        })
+        .collect::<Vec<_>>();
+    native_dependencies.sort_by(|left, right| {
+        (&left.owner, &left.rid, &left.package_path).cmp(&(
+            &right.owner,
+            &right.rid,
+            &right.package_path,
+        ))
+    });
+    let included_native_rids = native_dependencies
+        .iter()
+        .filter_map(|notice| notice.rid.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let package_contract = serde_json::to_vec_pretty(&PackageContract {
+        schema: 1,
+        package_id: name.clone(),
+        package_version: ver.clone(),
+        assembly_name: assembly_name.clone(),
+        target_framework: ctx.dotnet.tfm().to_owned(),
+        compatibility_profile,
+        profile_support,
+        supported_rids,
+        included_native_rids,
+        source_link_url: ctx.source_link_url.clone(),
+        portable_pdb: pdb.is_some(),
+        xml_docs: xml_docs.is_some(),
+        readme: readme_bytes.is_some(),
+        license: license.clone(),
+        repository_url: repo.clone(),
+        native_dependencies,
+    })?;
 
     write_nupkg(
         &nupkg,
@@ -216,12 +270,13 @@ pub fn run(args: &PackArgs) -> Result<i32> {
         &staged_assets,
         xml_docs.as_deref(),
         pdb.as_deref(),
+        &package_contract,
         &artifact_provenance,
         &sbom,
         &licenses,
     )?;
     if args.validate {
-        validate_nupkg(&nupkg, &name, &assembly_name, ctx.dotnet.tfm())?;
+        validate_nupkg(&nupkg, &name, &assembly_name, &ver, ctx.dotnet.tfm())?;
     }
     if let Some(certificate) = &args.sign_certificate {
         sign_and_verify(
@@ -417,6 +472,33 @@ struct NuspecMeta<'a> {
     has_readme: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PackageContract {
+    schema: u32,
+    package_id: String,
+    package_version: String,
+    assembly_name: String,
+    target_framework: String,
+    compatibility_profile: Option<String>,
+    profile_support: Option<String>,
+    supported_rids: Vec<String>,
+    included_native_rids: Vec<String>,
+    source_link_url: Option<String>,
+    portable_pdb: bool,
+    xml_docs: bool,
+    readme: bool,
+    license: Option<String>,
+    repository_url: Option<String>,
+    native_dependencies: Vec<NativeDependencyNotice>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct NativeDependencyNotice {
+    owner: String,
+    rid: Option<String>,
+    package_path: String,
+}
+
 /// Write the OPC `.nupkg` with the zip crate. `[Content_Types].xml` is written FIRST
 /// (strict OPC readers expect it as the first entry), then the rest. Stored (no
 /// compression) for the small XML parts; the dll is deflated.
@@ -434,11 +516,13 @@ fn write_nupkg(
     staged_assets: &[nuget::StagedPackageAsset],
     xml_docs: Option<&[u8]>,
     pdb: Option<&[u8]>,
+    package_contract: &[u8],
     artifact_provenance: &[u8],
     sbom: &[u8],
     licenses: &[u8],
 ) -> Result<()> {
     provenance::require_nonempty("artifact provenance", artifact_provenance)?;
+    provenance::require_nonempty("package metadata", package_contract)?;
     provenance::require_nonempty("SBOM", sbom)?;
     provenance::require_nonempty("license inventory", licenses)?;
     validate_package_entries(
@@ -648,6 +732,12 @@ fn write_nupkg(
     }
     add_entry(
         &mut zip,
+        "build/rustdotnet/package-metadata.json",
+        package_contract,
+        deflated,
+    )?;
+    add_entry(
+        &mut zip,
         "build/rustdotnet/artifact-provenance.json",
         artifact_provenance,
         deflated,
@@ -710,7 +800,13 @@ fn add_entry(
     Ok(())
 }
 
-fn validate_nupkg(path: &PathBuf, name: &str, assembly_name: &str, tfm: &str) -> Result<()> {
+fn validate_nupkg(
+    path: &PathBuf,
+    name: &str,
+    assembly_name: &str,
+    version: &str,
+    tfm: &str,
+) -> Result<()> {
     let file =
         File::open(path).with_context(|| format!("open {} for validation", path.display()))?;
     let mut zip = zip::ZipArchive::new(file)
@@ -735,6 +831,7 @@ fn validate_nupkg(path: &PathBuf, name: &str, assembly_name: &str, tfm: &str) ->
         "package/services/metadata/core-properties/rustdotnet.psmdcp".to_string(),
         "_rels/.rels".to_string(),
         format!("lib/{tfm}/{assembly_name}.xml"),
+        "build/rustdotnet/package-metadata.json".to_string(),
         "build/rustdotnet/artifact-provenance.json".to_string(),
         "build/rustdotnet/sbom.cdx.json".to_string(),
         "build/rustdotnet/licenses.json".to_string(),
@@ -742,6 +839,50 @@ fn validate_nupkg(path: &PathBuf, name: &str, assembly_name: &str, tfm: &str) ->
         if !names.contains(&required) {
             bail!("pack validation: required package part is missing: {required}");
         }
+    }
+    let contract: PackageContract = {
+        let mut entry = zip.by_name("build/rustdotnet/package-metadata.json")?;
+        let mut json = String::new();
+        entry.read_to_string(&mut json)?;
+        serde_json::from_str(&json).context("pack validation: parse package metadata")?
+    };
+    if contract.schema != 1
+        || contract.package_id != name
+        || contract.package_version != version
+        || contract.assembly_name != assembly_name
+        || contract.target_framework != tfm
+    {
+        bail!("pack validation: package metadata identity does not match the NuGet layout");
+    }
+    if contract.portable_pdb != names.contains(&format!("lib/{tfm}/{assembly_name}.pdb"))
+        || contract.xml_docs != names.contains(&format!("lib/{tfm}/{assembly_name}.xml"))
+        || contract.readme != names.contains("README.md")
+    {
+        bail!("pack validation: package metadata sidecar inventory does not match package entries");
+    }
+    if contract.source_link_url.is_some() && !contract.portable_pdb {
+        bail!("pack validation: Source Link was declared without a Portable PDB");
+    }
+    let native_paths = names
+        .iter()
+        .filter(|path| path.starts_with("runtimes/") && path.contains("/native/"))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let notice_paths = contract
+        .native_dependencies
+        .iter()
+        .map(|notice| notice.package_path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if native_paths != notice_paths {
+        bail!("pack validation: native dependency notices do not match packaged native assets");
+    }
+    let notice_rids = contract
+        .native_dependencies
+        .iter()
+        .filter_map(|notice| notice.rid.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if contract.included_native_rids != notice_rids.into_iter().collect::<Vec<_>>() {
+        bail!("pack validation: included native RID inventory is inconsistent");
     }
     for entry_name in &names {
         if entry_name.starts_with("runtimes/") {
@@ -752,7 +893,6 @@ fn validate_nupkg(path: &PathBuf, name: &str, assembly_name: &str, tfm: &str) ->
 }
 
 fn package_entry_hashes(path: &PathBuf) -> Result<std::collections::BTreeMap<String, String>> {
-    use std::io::Read as _;
     let mut zip = zip::ZipArchive::new(File::open(path)?)?;
     let mut hashes = std::collections::BTreeMap::new();
     for index in 0..zip.len() {
@@ -785,6 +925,7 @@ fn validate_package_entries(
         format!("{name}.nuspec"),
         format!("build/{name}.targets"),
         format!("lib/{tfm}/{assembly_name}.dll"),
+        "build/rustdotnet/package-metadata.json".to_string(),
         "build/rustdotnet/artifact-provenance.json".to_string(),
         "build/rustdotnet/sbom.cdx.json".to_string(),
         "build/rustdotnet/licenses.json".to_string(),
@@ -914,6 +1055,7 @@ mod tests {
         rid: Option<&str>,
     ) -> nuget::StagedPackageAsset {
         nuget::StagedPackageAsset {
+            owner: "fixture/1.0.0".into(),
             logical_path: path.to_owned(),
             source,
             kind,
@@ -929,6 +1071,49 @@ mod tests {
             repository: None,
             has_readme: false,
         }
+    }
+
+    fn test_contract(
+        package_id: &str,
+        assembly_name: &str,
+        tfm: &str,
+        readme: bool,
+        assets: &[nuget::StagedPackageAsset],
+    ) -> Vec<u8> {
+        let native_dependencies = assets
+            .iter()
+            .filter(|asset| asset.kind == nuget::StagedPackageAssetKind::Native)
+            .map(|asset| NativeDependencyNotice {
+                owner: asset.owner.clone(),
+                rid: asset.rid.clone(),
+                package_path: asset.logical_path.clone(),
+            })
+            .collect::<Vec<_>>();
+        let included_native_rids = native_dependencies
+            .iter()
+            .filter_map(|notice| notice.rid.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        serde_json::to_vec(&PackageContract {
+            schema: 1,
+            package_id: package_id.to_owned(),
+            package_version: "1.0.0".into(),
+            assembly_name: assembly_name.to_owned(),
+            target_framework: tfm.to_owned(),
+            compatibility_profile: None,
+            profile_support: None,
+            supported_rids: Vec::new(),
+            included_native_rids,
+            source_link_url: None,
+            portable_pdb: false,
+            xml_docs: true,
+            readme,
+            license: Some("MIT".into()),
+            repository_url: None,
+            native_dependencies,
+        })
+        .unwrap()
     }
 
     #[test]
@@ -1001,6 +1186,13 @@ esac
         };
         let readme = b"# deterministic\n";
         let dependencies = vec![("Example.Dependency".to_string(), "1.2.3".to_string())];
+        let contract = test_contract(
+            "deterministic_fixture",
+            "fixture_assembly",
+            "net8.0",
+            true,
+            &[],
+        );
 
         for path in [&first, &second] {
             write_nupkg(
@@ -1017,6 +1209,7 @@ esac
                 &[],
                 Some(b"<doc/>"),
                 None,
+                &contract,
                 b"{}",
                 b"{}",
                 b"{}",
@@ -1066,6 +1259,13 @@ esac
                 Some("osx-arm64"),
             ),
         ];
+        let contract = test_contract(
+            "Fixture.Package",
+            "Fixture.Assembly",
+            "net8.0",
+            false,
+            &assets,
+        );
         write_nupkg(
             &package,
             "Fixture.Package",
@@ -1080,12 +1280,20 @@ esac
             &assets,
             Some(b"<doc/>"),
             None,
+            &contract,
             b"{}",
             b"{}",
             b"{}",
         )
         .unwrap();
-        validate_nupkg(&package, "Fixture.Package", "Fixture.Assembly", "net8.0").unwrap();
+        validate_nupkg(
+            &package,
+            "Fixture.Package",
+            "Fixture.Assembly",
+            "1.0.0",
+            "net8.0",
+        )
+        .unwrap();
         let file = File::open(&package).unwrap();
         let mut zip = zip::ZipArchive::new(file).unwrap();
         for expected in [

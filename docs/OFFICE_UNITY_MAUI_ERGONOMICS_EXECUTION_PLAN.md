@@ -325,9 +325,18 @@ MAUI is a profile matrix rather than one runtime:
   now key the backend binary, linker binary, .NET runtime/profile inputs, Source Link configuration,
   and the complete `dotnet_macros`/`mycorrhiza`/`rust-dotnet-pinvoke` SDK source trees. Regression
   tests prove an in-place SDK source edit changes the key while ignored `target/` noise does not.
-- [ ] Execute a clean packed consumer for every package layout, not only inspect ZIP entries.
-- [ ] Include README, license, repository URL, symbols, Portable PDB, Source Link, XML docs, target
+- [x] Execute a clean packed consumer for every package layout, not only inspect ZIP entries.
+  `nuget_acceptance.sh` now restores and executes isolated C# consumers for the portable managed,
+  transitive-NuGet, bundled-helper, and RID-managed/native/resource layouts. The RID consumer uses
+  SDK restore selection and runs the restored managed assembly rather than stopping at ZIP checks.
+- [x] Include README, license, repository URL, symbols, Portable PDB, Source Link, XML docs, target
   profile, supported RIDs, and native dependency notices in NuGet output.
+  Every package carries a validated `build/rustdotnet/package-metadata.json` contract with exact
+  package/assembly/TFM identity, compatibility-profile support and host RIDs, included native RIDs,
+  Source Link and sidecar state, Cargo metadata, and owner/RID/path notices matching every packaged
+  native asset. The full-metadata acceptance package proves README, MIT license, repository URL,
+  XML docs, Portable PDB, and Source Link configuration together; the separate Portable-PDB gate
+  proves the embedded standard Source Link payload resolves logical Rust documents.
 - [ ] Diagnose host/profile incompatibility explicitly for VSTO, Unity, MAUI platform targets, and
   older/newer CoreCLR hosts rather than failing later in the loader.
 - [x] Add named, machine-readable compatibility profiles through `cargo dotnet profiles --json`:

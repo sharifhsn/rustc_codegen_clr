@@ -14,6 +14,8 @@ pub enum StagedPackageAssetKind {
 
 #[derive(Clone, Debug)]
 pub struct StagedPackageAsset {
+    /// NuGet package/version or local logical library that supplied this asset.
+    pub owner: String,
     pub logical_path: String,
     pub source: std::path::PathBuf,
     pub kind: StagedPackageAssetKind,
