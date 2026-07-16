@@ -61,6 +61,8 @@ pub enum DotnetRuntime {
     /// .NET 10 API surface.
     #[default]
     Net10,
+    /// Unity's managed `netstandard2.1` profile; this is not a numbered CoreCLR runtime.
+    UnityNetStandard21,
 }
 
 impl DotnetRuntime {
@@ -71,6 +73,7 @@ impl DotnetRuntime {
             Self::Net8 => "net8.0",
             Self::Net9 => "net9.0",
             Self::Net10 => "net10.0",
+            Self::UnityNetStandard21 => "netstandard2.1",
         }
     }
 
@@ -81,6 +84,7 @@ impl DotnetRuntime {
             Self::Net8 => "8:0:0:0",
             Self::Net9 => "9:0:0:0",
             Self::Net10 => "10:0:0:0",
+            Self::UnityNetStandard21 => "4:0:0:0",
         }
     }
 
@@ -91,6 +95,7 @@ impl DotnetRuntime {
             Self::Net8 => (8, 0, 0, 0),
             Self::Net9 => (9, 0, 0, 0),
             Self::Net10 => (10, 0, 0, 0),
+            Self::UnityNetStandard21 => (4, 0, 0, 0),
         }
     }
 
@@ -101,6 +106,7 @@ impl DotnetRuntime {
             Self::Net8 => "8.0.0",
             Self::Net9 => "9.0.0",
             Self::Net10 => "10.0.0",
+            Self::UnityNetStandard21 => "2.1.0",
         }
     }
 
@@ -111,6 +117,7 @@ impl DotnetRuntime {
             Self::Net8 => 8,
             Self::Net9 => 9,
             Self::Net10 => 10,
+            Self::UnityNetStandard21 => 0,
         }
     }
 
@@ -127,6 +134,7 @@ impl std::fmt::Display for DotnetRuntime {
             Self::Net8 => f.write_str(".NET 8"),
             Self::Net9 => f.write_str(".NET 9"),
             Self::Net10 => f.write_str(".NET 10"),
+            Self::UnityNetStandard21 => f.write_str("Unity netstandard2.1"),
         }
     }
 }
@@ -173,11 +181,14 @@ impl ArtifactAbiConfig {
             None | Some("10" | "net10" | "net10.0") => DotnetRuntime::Net10,
             Some("8" | "net8" | "net8.0") => DotnetRuntime::Net8,
             Some("9" | "net9" | "net9.0") => DotnetRuntime::Net9,
+            Some("unity" | "unity-netstandard2.1" | "netstandard2.1") => {
+                DotnetRuntime::UnityNetStandard21
+            }
             Some(value) => {
                 return Err(ArtifactAbiConfigCaptureError::InvalidValue {
                     variable: "DOTNET_VERSION",
                     value: value.to_owned(),
-                    expected: "8, 9, or 10 (also net8.0, net9.0, or net10.0)",
+                    expected: "8, 9, 10, or unity-netstandard2.1",
                 });
             }
         };
@@ -871,5 +882,17 @@ mod tests {
         let config = ArtifactAbiConfig::from_environment(&environment).unwrap();
         assert_eq!(config.dotnet_runtime(), DotnetRuntime::Net9);
         assert!(config.no_unwind());
+    }
+
+    #[test]
+    fn environment_snapshot_accepts_unity_profile() {
+        let environment = HashMap::from([(
+            "DOTNET_VERSION".to_owned(),
+            "unity-netstandard2.1".to_owned(),
+        )]);
+        let config = ArtifactAbiConfig::from_environment(&environment).unwrap();
+        assert_eq!(config.dotnet_runtime(), DotnetRuntime::UnityNetStandard21);
+        assert_eq!(config.dotnet_runtime().tfm(), "netstandard2.1");
+        assert!(!config.dotnet_runtime().supports_subword_interlocked());
     }
 }

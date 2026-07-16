@@ -1542,6 +1542,23 @@ impl ClassDef {
         }
     }
 
+    /// Removes event/property rows whose accessor MethodDefs were eliminated.
+    ///
+    /// Member-shaped metadata is not executable on its own: every retained row must point to the
+    /// ordinary method table. DCE calls this after pruning methods so exporters never observe a
+    /// dangling MethodSemantics reference.
+    pub(crate) fn retain_member_metadata(
+        &mut self,
+        mut method_exists: impl FnMut(Interned<MethodRef>) -> bool,
+    ) {
+        self.events
+            .retain(|event| method_exists(event.add()) && method_exists(event.remove()));
+        self.properties.retain(|property| {
+            property.getter().is_none_or(&mut method_exists)
+                && property.setter().is_none_or(&mut method_exists)
+        });
+    }
+
     /// The general `CustomAttribute` rows attached to this TYPE (see `CustomAttrDef`'s doc).
     /// Usually empty.
     #[must_use]

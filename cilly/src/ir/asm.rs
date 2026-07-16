@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::{any::type_name, ops::Index};
 
 #[cfg(test)]
-use super::class::FixedArrayLayout;
+use super::class::{FixedArrayLayout, PropertyDef};
 
 /// Maps an exact emitted method symbol to a closure that synthesizes its `MethodImpl` on demand. Populated
 /// and consumed at link time (not codegen time) by the `linker` binary (`bin/linker/patch.rs`)
@@ -956,6 +956,9 @@ impl Assembly {
     pub fn alloc_field(&mut self, field: FieldDesc) -> Interned<FieldDesc> {
         self.fields.alloc(field)
     }
+    pub(crate) fn field_descs(&self) -> &[FieldDesc] {
+        self.fields.values()
+    }
     #[must_use]
     pub fn get_field(&self, key: Interned<FieldDesc>) -> &FieldDesc {
         self.fields.get(key)
@@ -1411,12 +1414,19 @@ impl Assembly {
     }
     pub(crate) fn eliminate_dead_fns(&mut self, only_imports: bool) {
         // 1st. Collect all "extern" method definitons, since those are always alive.
-        let mut wave: FxHashSet<MethodDefIdx> = self
+        let wave: FxHashSet<MethodDefIdx> = self
             .method_defs
             .iter()
             .filter(|(_, def)| def.access().is_extern())
             .map(|(idx, _)| *idx)
             .collect();
+        self.eliminate_dead_fns_from_roots(wave, only_imports);
+    }
+    fn eliminate_dead_fns_from_roots(
+        &mut self,
+        mut wave: FxHashSet<MethodDefIdx>,
+        only_imports: bool,
+    ) {
         let mut next_wave: FxHashSet<MethodDefIdx> = FxHashSet::default();
         let mut alive: FxHashSet<MethodDefIdx> = FxHashSet::default();
         // If only cleaning up imports, assume all non-import fns are alive.
@@ -1483,16 +1493,384 @@ impl Assembly {
             .map(|id| (*id, self.method_defs.remove(id).unwrap()))
             .collect();
         // clean up typedefs
+        let live_method_refs: FxHashSet<_> = self.method_defs.keys().map(|id| id.0).collect();
         self.class_defs.values_mut().for_each(|tdef| {
             tdef.methods_mut()
                 .retain(|def| self.method_defs.contains_key(def));
+            tdef.retain_member_metadata(|method| live_method_refs.contains(&method));
         });
     }
     pub fn eliminate_dead_code(&mut self) {
         self.eliminate_dead_fns(false);
-        self.eliminate_dead_types();
+        self.eliminate_dead_types_with_export_roots(true);
+    }
+    /// Re-runs reachability after a public facade has replaced the original exported roots.
+    ///
+    /// Unlike ordinary DCE, empty assembly-local public types are not roots by themselves. Public
+    /// types that own a live method or appear in a live signature remain reachable. This keeps a
+    /// facade's real API while allowing constrained AOT consumers to avoid parsing unrelated Rust
+    /// runtime metadata.
+    pub fn eliminate_dead_code_after_facade_projection(&mut self, public_type_name: &str) {
+        let public_classes: FxHashSet<_> = self
+            .class_defs
+            .iter()
+            .filter_map(|(id, class)| (&self[class.name()] == public_type_name).then_some(*id))
+            .collect();
+        let mut roots: FxHashSet<_> = self
+            .method_defs
+            .iter()
+            .filter_map(|(id, method)| public_classes.contains(&method.class()).then_some(*id))
+            .collect();
+        // Comptime-authored CLR types use local `Extern` ClassDefs to distinguish intentional
+        // managed API from ordinary compiler-generated Rust layout classes. Their externally
+        // visible members remain public even when no facade method mentions the type directly
+        // (DTOs are commonly constructed by C#). Root constructors and ordinary methods as well
+        // as property/event accessors, while unrelated runtime symbols still disappear.
+        for (class_id, class) in &self.class_defs {
+            if !matches!(class.access(), Access::Extern)
+                || self.class_ref(class_id.0).asm().is_some()
+            {
+                continue;
+            }
+            for definition in class.methods() {
+                if let Some(method) = self.method_defs.get(definition)
+                    && matches!(method.access(), Access::Public | Access::Extern)
+                {
+                    roots.insert(*definition);
+                }
+            }
+        }
+        self.eliminate_dead_fns_from_roots(roots, false);
+        self.eliminate_dead_types_with_export_roots(false);
+    }
+
+    /// Installs the small, assembly-internal 128-bit integer compatibility types used only by the
+    /// Unity direct-PE profile. Unity's netstandard2.1 facade predates the BCL Int128 types, while
+    /// ordinary 64-bit Rust allocation code uses 128-bit intermediates for layout constants and
+    /// overflow checks. Keeping two u64 limbs here lets supported Rust code execute without
+    /// exposing a public `u128` promise.
+    pub fn install_unity_legacy_128_types(&mut self) {
+        if self
+            .class_defs
+            .values()
+            .any(|class| &self[class.name()] == "System.UInt128")
+        {
+            return;
+        }
+
+        let uint = self.install_unity_legacy_128_class("System.UInt128");
+        self.install_unity_uint128_methods(uint);
+        let int = self.install_unity_legacy_128_class("System.Int128");
+        self.install_unity_int128_methods(int);
+    }
+
+    fn install_unity_legacy_128_class(&mut self, name: &str) -> ClassDefIdx {
+        let name = self.alloc_string(name);
+        let low = self.alloc_string("_low");
+        let high = self.alloc_string("_high");
+        let class = self
+            .class_def(ClassDef::new(
+                name,
+                true,
+                0,
+                None,
+                vec![
+                    (Type::Int(Int::U64), low, Some(0)),
+                    (Type::Int(Int::U64), high, Some(8)),
+                ],
+                vec![],
+                Access::Private,
+                std::num::NonZeroU32::new(16),
+                std::num::NonZeroU32::new(8),
+                true,
+            ))
+            .expect("Unity Int128 compatibility class must have a valid layout");
+
+        let class_type = Type::ClassRef(class.0);
+        let ctor_name = self.alloc_string(".ctor");
+        let ctor_sig = self.sig(
+            [class_type, Type::Int(Int::U64), Type::Int(Int::U64)],
+            Type::Void,
+        );
+        let low_field = self.alloc_field(FieldDesc::new(class.0, low, Type::Int(Int::U64)));
+        let high_field = self.alloc_field(FieldDesc::new(class.0, high, Type::Int(Int::U64)));
+        let this = self.alloc_node(CILNode::LdArg(0));
+        let low_value = self.alloc_node(CILNode::LdArg(1));
+        let set_low = self.alloc_root(CILRoot::SetField(Box::new((low_field, this, low_value))));
+        let this = self.alloc_node(CILNode::LdArg(0));
+        let high_value = self.alloc_node(CILNode::LdArg(2));
+        let set_high = self.alloc_root(CILRoot::SetField(Box::new((high_field, this, high_value))));
+        let ret = self.alloc_root(CILRoot::VoidRet);
+        self.new_method(MethodDef::new(
+            Access::Assembly,
+            class,
+            ctor_name,
+            ctor_sig,
+            MethodKind::Constructor,
+            MethodImpl::MethodBody {
+                blocks: vec![super::BasicBlock::new(
+                    vec![set_low, set_high, ret],
+                    0,
+                    None,
+                )],
+                locals: vec![],
+            },
+            vec![None, Some(low), Some(high)],
+        ));
+        class
+    }
+
+    fn unity_128_fields(
+        &mut self,
+        class: ClassDefIdx,
+    ) -> (Interned<FieldDesc>, Interned<FieldDesc>) {
+        let low = self.alloc_string("_low");
+        let high = self.alloc_string("_high");
+        (
+            self.alloc_field(FieldDesc::new(class.0, low, Type::Int(Int::U64))),
+            self.alloc_field(FieldDesc::new(class.0, high, Type::Int(Int::U64))),
+        )
+    }
+
+    fn unity_128_ctor_ref(&mut self, class: ClassDefIdx) -> Interned<MethodRef> {
+        let name = self.alloc_string(".ctor");
+        let sig = self.sig(
+            [
+                Type::ClassRef(class.0),
+                Type::Int(Int::U64),
+                Type::Int(Int::U64),
+            ],
+            Type::Void,
+        );
+        self.alloc_methodref(MethodRef::new(
+            class.0,
+            name,
+            sig,
+            MethodKind::Constructor,
+            vec![].into(),
+        ))
+    }
+
+    fn unity_128_construct(
+        &mut self,
+        class: ClassDefIdx,
+        low: Interned<CILNode>,
+        high: Interned<CILNode>,
+    ) -> Interned<CILNode> {
+        let ctor = self.unity_128_ctor_ref(class);
+        self.call(ctor, &[low, high], IsPure::NOT)
+    }
+
+    fn install_unity_uint128_methods(&mut self, class: ClassDefIdx) {
+        let class_type = Type::ClassRef(class.0);
+        let zero = self.alloc_node(Const::U64(0));
+        for input in [Int::U32, Int::U64, Int::USize] {
+            let value = self.alloc_node(CILNode::LdArg(0));
+            let low = if input == Int::U64 {
+                value
+            } else {
+                self.int_cast(value, Int::U64, ExtendKind::ZeroExtend)
+            };
+            let result = self.unity_128_construct(class, low, zero);
+            let ret = self.alloc_root(CILRoot::Ret(result));
+            let name = self.alloc_string("op_Implicit");
+            let sig = self.sig([Type::Int(input)], class_type);
+            self.new_method(MethodDef::new(
+                Access::Assembly,
+                class,
+                name,
+                sig,
+                MethodKind::Static,
+                MethodImpl::MethodBody {
+                    blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
+                    locals: vec![],
+                },
+                vec![None],
+            ));
+        }
+
+        let (low_field, high_field) = self.unity_128_fields(class);
+        let equality = self.alloc_string("op_Equality");
+        let sig = self.sig([class_type, class_type], Type::Bool);
+        let a = self.alloc_node(CILNode::LdArg(0));
+        let a_low = self.ld_field(a, low_field);
+        let b = self.alloc_node(CILNode::LdArg(1));
+        let b_low = self.ld_field(b, low_field);
+        let low_eq = self.biop(a_low, b_low, BinOp::Eq);
+        let a = self.alloc_node(CILNode::LdArg(0));
+        let a_high = self.ld_field(a, high_field);
+        let b = self.alloc_node(CILNode::LdArg(1));
+        let b_high = self.ld_field(b, high_field);
+        let high_eq = self.biop(a_high, b_high, BinOp::Eq);
+        let equal = self.biop(low_eq, high_eq, BinOp::And);
+        let ret = self.alloc_root(CILRoot::Ret(equal));
+        self.new_method(MethodDef::new(
+            Access::Assembly,
+            class,
+            equality,
+            sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            },
+            vec![None, None],
+        ));
+
+        let greater = self.alloc_string("op_GreaterThan");
+        let sig = self.sig([class_type, class_type], Type::Bool);
+        let a = self.alloc_node(CILNode::LdArg(0));
+        let a_high = self.ld_field(a, high_field);
+        let b = self.alloc_node(CILNode::LdArg(1));
+        let b_high = self.ld_field(b, high_field);
+        let high_gt = self.biop(a_high, b_high, BinOp::GtUn);
+        let a = self.alloc_node(CILNode::LdArg(0));
+        let a_high = self.ld_field(a, high_field);
+        let b = self.alloc_node(CILNode::LdArg(1));
+        let b_high = self.ld_field(b, high_field);
+        let high_eq = self.biop(a_high, b_high, BinOp::Eq);
+        let a = self.alloc_node(CILNode::LdArg(0));
+        let a_low = self.ld_field(a, low_field);
+        let b = self.alloc_node(CILNode::LdArg(1));
+        let b_low = self.ld_field(b, low_field);
+        let low_gt = self.biop(a_low, b_low, BinOp::GtUn);
+        let same_high_low_gt = self.biop(high_eq, low_gt, BinOp::And);
+        let result = self.biop(high_gt, same_high_low_gt, BinOp::Or);
+        let ret = self.alloc_root(CILRoot::Ret(result));
+        self.new_method(MethodDef::new(
+            Access::Assembly,
+            class,
+            greater,
+            sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            },
+            vec![None, None],
+        ));
+
+        self.install_unity_uint128_multiply(class, low_field, high_field);
+    }
+
+    fn install_unity_uint128_multiply(
+        &mut self,
+        class: ClassDefIdx,
+        low_field: Interned<FieldDesc>,
+        high_field: Interned<FieldDesc>,
+    ) {
+        let class_type = Type::ClassRef(class.0);
+        let load = |asm: &mut Self, arg, field| {
+            let value = asm.alloc_node(CILNode::LdArg(arg));
+            asm.ld_field(value, field)
+        };
+        let mask = self.alloc_node(Const::U64(u64::from(u32::MAX)));
+        let shift = self.alloc_node(Const::U32(32));
+        let a_low = load(self, 0, low_field);
+        let b_low = load(self, 1, low_field);
+        let a0 = self.biop(a_low, mask, BinOp::And);
+        let a1 = self.biop(a_low, shift, BinOp::ShrUn);
+        let b0 = self.biop(b_low, mask, BinOp::And);
+        let b1 = self.biop(b_low, shift, BinOp::ShrUn);
+        let t0 = self.biop(a0, b0, BinOp::Mul);
+        let w0 = self.biop(t0, mask, BinOp::And);
+        let k = self.biop(t0, shift, BinOp::ShrUn);
+        let a1b0 = self.biop(a1, b0, BinOp::Mul);
+        let t1 = self.biop(a1b0, k, BinOp::Add);
+        let w1 = self.biop(t1, mask, BinOp::And);
+        let w2 = self.biop(t1, shift, BinOp::ShrUn);
+        let a0b1 = self.biop(a0, b1, BinOp::Mul);
+        let t2 = self.biop(a0b1, w1, BinOp::Add);
+        let t2_shifted = self.biop(t2, shift, BinOp::Shl);
+        let low = self.biop(t2_shifted, w0, BinOp::Add);
+
+        let t2_high = self.biop(t2, shift, BinOp::ShrUn);
+        let a1b1 = self.biop(a1, b1, BinOp::Mul);
+        let partial = self.biop(t2_high, w2, BinOp::Add);
+        let partial = self.biop(partial, a1b1, BinOp::Add);
+        let a_low = load(self, 0, low_field);
+        let b_high = load(self, 1, high_field);
+        let cross1 = self.biop(a_low, b_high, BinOp::Mul);
+        let partial = self.biop(partial, cross1, BinOp::Add);
+        let a_high = load(self, 0, high_field);
+        let b_low = load(self, 1, low_field);
+        let cross2 = self.biop(a_high, b_low, BinOp::Mul);
+        let high = self.biop(partial, cross2, BinOp::Add);
+        let result = self.unity_128_construct(class, low, high);
+        let ret = self.alloc_root(CILRoot::Ret(result));
+        let name = self.alloc_string("op_Multiply");
+        let sig = self.sig([class_type, class_type], class_type);
+        self.new_method(MethodDef::new(
+            Access::Assembly,
+            class,
+            name,
+            sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            },
+            vec![None, None],
+        ));
+    }
+
+    fn install_unity_int128_methods(&mut self, class: ClassDefIdx) {
+        let class_type = Type::ClassRef(class.0);
+        let value = self.alloc_node(CILNode::LdArg(0));
+        let signed = self.int_cast(value, Int::I64, ExtendKind::SignExtend);
+        let low = self.int_cast(signed, Int::U64, ExtendKind::ZeroExtend);
+        let shift = self.alloc_node(Const::U32(63));
+        let high = self.biop(signed, shift, BinOp::Shr);
+        let high = self.int_cast(high, Int::U64, ExtendKind::ZeroExtend);
+        let result = self.unity_128_construct(class, low, high);
+        let ret = self.alloc_root(CILRoot::Ret(result));
+        let name = self.alloc_string("op_Implicit");
+        let sig = self.sig([Type::Int(Int::I32)], class_type);
+        self.new_method(MethodDef::new(
+            Access::Assembly,
+            class,
+            name,
+            sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            },
+            vec![None],
+        ));
+
+        let (low_field, high_field) = self.unity_128_fields(class);
+        let a = self.alloc_node(CILNode::LdArg(0));
+        let a_low = self.ld_field(a, low_field);
+        let b = self.alloc_node(CILNode::LdArg(1));
+        let b_low = self.ld_field(b, low_field);
+        let low_eq = self.biop(a_low, b_low, BinOp::Eq);
+        let a = self.alloc_node(CILNode::LdArg(0));
+        let a_high = self.ld_field(a, high_field);
+        let b = self.alloc_node(CILNode::LdArg(1));
+        let b_high = self.ld_field(b, high_field);
+        let high_eq = self.biop(a_high, b_high, BinOp::Eq);
+        let result = self.biop(low_eq, high_eq, BinOp::And);
+        let ret = self.alloc_root(CILRoot::Ret(result));
+        let name = self.alloc_string("op_Equality");
+        let sig = self.sig([class_type, class_type], Type::Bool);
+        self.new_method(MethodDef::new(
+            Access::Assembly,
+            class,
+            name,
+            sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            },
+            vec![None, None],
+        ));
     }
     pub(crate) fn eliminate_dead_types(&mut self) {
+        self.eliminate_dead_types_with_export_roots(true);
+    }
+    fn eliminate_dead_types_with_export_roots(&mut self, keep_exported_types: bool) {
         let mut wave: FxHashSet<ClassDefIdx> = self
             .method_defs()
             .values()
@@ -1500,13 +1878,20 @@ impl Assembly {
             .flat_map(|tpe| tpe.iter_class_refs(self).collect::<Vec<_>>())
             .filter_map(|cref| self.class_ref_to_def(cref))
             .collect();
-        wave.extend(self.class_defs().iter().filter_map(|(defid, def)| {
-            if def.access().is_extern() {
-                Some(defid)
-            } else {
-                None
-            }
-        }));
+        wave.extend(self.method_defs().values().map(MethodDef::class));
+        // Keep exported classes defined by this assembly as roots, but do not root
+        // external BCL declaration classes merely because they are marked `Extern`.
+        // Those declarations are metadata-only conveniences for lowering calls; rooting
+        // every one makes their unused signatures (for example Int128/Vector512 and
+        // System.Net types) become TypeRef/AssemblyRef rows in otherwise primitive DLLs.
+        // A BCL declaration is retained when a live method/type actually references it via
+        // the wave above.
+        if keep_exported_types {
+            wave.extend(self.class_defs().iter().filter_map(|(defid, def)| {
+                (def.access().is_extern() && self.class_ref(defid.0).asm().is_none())
+                    .then_some(defid)
+            }));
+        }
         let rust_void = self.alloc_string("RustVoid");
         let rust_void = self.alloc_class_ref(ClassRef::new(rust_void, None, true, vec![].into()));
         if let Some(cref) = self.class_ref_to_def(rust_void) {
@@ -1936,6 +2321,95 @@ impl Assembly {
             }
         }
         hidden
+    }
+
+    /// Projects explicit managed exports onto a small public facade type.
+    ///
+    /// rustc and the linker place most generated functions on the synthetic `MainModule` class.
+    /// Merely renaming that class to the product's public type makes a CLR load of one tiny export
+    /// resolve every unrelated Rust/runtime signature on the same type. That is especially toxic
+    /// on Unity's netstandard2.1 profile, where a reachable implementation detail may mention a
+    /// newer BCL type such as `System.UInt128` even though the public export does not.
+    ///
+    /// For each body-backed `Access::Extern` static method, this creates a tiny public forwarding
+    /// definition on `public_type_name`, keeps the original implementation and MainModule identity
+    /// assembly-local, and leaves all existing internal call sites valid. The public type therefore
+    /// contains only intentional API signatures and trivial bridge bodies while the implementation
+    /// remains free to call the linked Rust runtime.
+    pub fn project_main_module_exports(&mut self, public_type_name: &str) -> usize {
+        assert_ne!(
+            public_type_name, MAIN_MODULE,
+            "the public managed facade must not reuse the internal MainModule sentinel"
+        );
+
+        let main_module = self.main_module();
+        let public_name = self.alloc_string(public_type_name);
+        let public_class = self
+            .class_def(ClassDef::new(
+                public_name,
+                false,
+                0,
+                None,
+                vec![],
+                vec![],
+                Access::Extern,
+                None,
+                None,
+                true,
+            ))
+            .unwrap_or_else(|error| {
+                panic!("invalid public managed facade {public_type_name:?}: {error:?}")
+            });
+
+        let exports: Vec<_> = self
+            .method_defs
+            .iter()
+            .filter(|(_, method)| {
+                let name = &self[method.name()];
+                method.class() == main_module
+                    && *method.access() == Access::Extern
+                    && !matches!(method.implementation(), MethodImpl::Extern { .. })
+                    && !matches!(name.as_ref(), CCTOR | TCCTOR | USER_INIT)
+            })
+            .map(|(id, method)| (*id, method.clone()))
+            .collect();
+
+        for (original_id, mut projected) in exports.iter().cloned() {
+            assert_eq!(
+                projected.kind(),
+                MethodKind::Static,
+                "managed MainModule export {} must be static before facade projection",
+                &self[projected.name()]
+            );
+            let original_ref = self.alloc_methodref(projected.ref_to());
+            projected.set_class(public_class);
+            let signature = self[projected.sig()].clone();
+            let arguments: Vec<_> = (0..signature.inputs().len())
+                .map(|index| self.alloc_node(CILNode::LdArg(index as u32)))
+                .collect();
+            let mut roots = Vec::with_capacity(2);
+            if *signature.output() == Type::Void {
+                roots.push(self.alloc_root(CILRoot::call(original_ref, arguments)));
+                roots.push(self.alloc_root(CILRoot::VoidRet));
+            } else {
+                let call = self.call(original_ref, &arguments, IsPure::NOT);
+                roots.push(self.alloc_root(CILRoot::Ret(call)));
+            }
+            let forwarding_body = MethodImpl::MethodBody {
+                blocks: vec![super::BasicBlock::new(roots, 0, None)],
+                locals: vec![],
+            };
+
+            let original = self
+                .method_defs
+                .get_mut(&original_id)
+                .expect("snapshotted MainModule export");
+            original.set_access(Access::Assembly);
+            *projected.implementation_mut() = forwarding_body;
+            self.new_method(projected.clone());
+        }
+
+        exports.len()
     }
 
     /// Project the internal `MainModule` sentinel to a configured public CLR type name.
@@ -3479,6 +3953,232 @@ fn final_export_verification_accepts_clean_assembly() {
 }
 
 #[test]
+fn dead_type_elimination_prunes_unreachable_external_declarations() {
+    let mut asm = Assembly::default();
+    let external_assembly = asm.alloc_string("System.Runtime.Intrinsics");
+    let dead_name = asm.alloc_string("System.Runtime.Intrinsics.Vector512");
+    let dead_ref = asm.alloc_class_ref(ClassRef::new(
+        dead_name,
+        Some(external_assembly),
+        true,
+        [].into(),
+    ));
+    let dead_def = ClassDef::new(
+        dead_name,
+        true,
+        0,
+        None,
+        vec![],
+        vec![],
+        Access::Extern,
+        None,
+        None,
+        false,
+    );
+    asm.class_defs.insert(ClassDefIdx(dead_ref), dead_def);
+
+    let kept_name = asm.alloc_string("ExportedType");
+    let kept_ref = asm.alloc_class_ref(ClassRef::new(kept_name, None, true, [].into()));
+    asm.class_defs.insert(
+        ClassDefIdx(kept_ref),
+        ClassDef::new(
+            kept_name,
+            true,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Extern,
+            None,
+            None,
+            false,
+        ),
+    );
+
+    let reachable_name = asm.alloc_string("System.Runtime.Intrinsics.Vector128");
+    let reachable_ref = asm.alloc_class_ref(ClassRef::new(
+        reachable_name,
+        Some(external_assembly),
+        true,
+        [].into(),
+    ));
+    asm.class_defs.insert(
+        ClassDefIdx(reachable_ref),
+        ClassDef::new(
+            reachable_name,
+            true,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Extern,
+            None,
+            None,
+            false,
+        ),
+    );
+    let main = asm.main_module();
+    let method_name = asm.alloc_string("uses_vector128");
+    let sig = asm.sig([], Type::ClassRef(reachable_ref));
+    asm.new_method(MethodDef::new(
+        Access::Public,
+        main,
+        method_name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::Missing,
+        vec![],
+    ));
+
+    asm.eliminate_dead_types();
+    assert!(!asm.class_defs.contains_key(&ClassDefIdx(dead_ref)));
+    assert!(asm.class_defs.contains_key(&ClassDefIdx(kept_ref)));
+    assert!(asm.class_defs.contains_key(&ClassDefIdx(reachable_ref)));
+}
+
+#[test]
+fn facade_dce_drops_unrelated_exported_types() {
+    let mut asm = Assembly::default();
+    let dead_name = asm.alloc_string("DeadRuntimeType");
+    let dead = asm
+        .class_def(ClassDef::new(
+            dead_name,
+            true,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Extern,
+            None,
+            None,
+            false,
+        ))
+        .unwrap();
+    let facade_name = asm.alloc_string("Game.Exports");
+    let facade = asm
+        .class_def(ClassDef::new(
+            facade_name,
+            false,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Extern,
+            None,
+            None,
+            true,
+        ))
+        .unwrap();
+    let dto_name = asm.alloc_string("Game.Snapshot");
+    let dto = asm
+        .class_def(ClassDef::new(
+            dto_name,
+            false,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Extern,
+            None,
+            None,
+            true,
+        ))
+        .unwrap();
+    let ctor_name = asm.alloc_string(".ctor");
+    let ctor_sig = asm.sig([], Type::Void);
+    let ctor_ret = asm.alloc_root(CILRoot::VoidRet);
+    let ctor = asm.new_method(MethodDef::new(
+        Access::Extern,
+        dto,
+        ctor_name,
+        ctor_sig,
+        MethodKind::Constructor,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(vec![ctor_ret], 0, None)],
+            locals: vec![],
+        },
+        vec![],
+    ));
+    let getter_name = asm.alloc_string("get_Score");
+    let getter_sig = asm.sig([], Type::Int(Int::I32));
+    let score = asm.alloc_node(Const::I32(7));
+    let getter_ret = asm.alloc_root(CILRoot::Ret(score));
+    let getter = asm.new_method(MethodDef::new(
+        Access::Extern,
+        dto,
+        getter_name,
+        getter_sig,
+        MethodKind::Instance,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(vec![getter_ret], 0, None)],
+            locals: vec![],
+        },
+        vec![],
+    ));
+    let property_name = asm.alloc_string("Score");
+    asm.class_mut(dto).add_property(PropertyDef::new(
+        property_name,
+        Type::Int(Int::I32),
+        Some(getter.0),
+        None,
+    ));
+    let method_name = asm.alloc_string("answer");
+    let sig = asm.sig([], Type::Int(Int::I32));
+    let answer = asm.alloc_node(Const::I32(42));
+    let ret = asm.alloc_root(CILRoot::Ret(answer));
+    asm.new_method(MethodDef::new(
+        Access::Extern,
+        facade,
+        method_name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        },
+        vec![],
+    ));
+
+    asm.eliminate_dead_code_after_facade_projection("Game.Exports");
+
+    assert!(!asm.class_defs.contains_key(&dead));
+    assert!(asm.class_defs.contains_key(&facade));
+    assert!(asm.class_defs.contains_key(&dto));
+    assert!(asm.method_defs.contains_key(&ctor));
+    assert!(asm.method_defs.contains_key(&getter));
+    assert_eq!(asm.method_defs.len(), 3);
+}
+
+#[test]
+fn unity_legacy_128_helpers_are_well_typed_and_internal() {
+    let mut asm = Assembly::default();
+    asm.install_unity_legacy_128_types();
+
+    assert_eq!(asm.typecheck_with_policy(true, true), 0);
+    for type_name in ["System.Int128", "System.UInt128"] {
+        let class = asm
+            .class_defs()
+            .values()
+            .find(|class| &asm[class.name()] == type_name)
+            .expect("compatibility type must exist");
+        assert_eq!(*class.access(), Access::Private);
+        assert_eq!(
+            class.explict_size().map(std::num::NonZeroU32::get),
+            Some(16)
+        );
+        assert!(
+            class
+                .methods()
+                .iter()
+                .all(|method| *asm[*method].access() == Access::Assembly)
+        );
+    }
+    let before = asm.class_defs().len();
+    asm.install_unity_legacy_128_types();
+    assert_eq!(asm.class_defs().len(), before, "installation is idempotent");
+}
+
+#[test]
 fn main_module_visibility_keeps_only_explicit_exports_public() {
     let mut asm = Assembly::default();
     let main = asm.main_module();
@@ -3509,6 +4209,71 @@ fn main_module_visibility_keeps_only_explicit_exports_public() {
     assert_eq!(access_by_name["linked_helper"], Access::Assembly);
     assert_eq!(access_by_name["ordinary_rust"], Access::Assembly);
     assert_eq!(access_by_name["managed_export"], Access::Extern);
+}
+
+#[test]
+fn public_facade_contains_only_explicit_exports() {
+    let mut asm = Assembly::default();
+    let main = asm.main_module();
+    let sig = asm.sig([], Type::Int(Int::I32));
+    for (name, access) in [
+        ("runtime_helper_with_newer_bcl_types", Access::Public),
+        ("sample_value", Access::Extern),
+    ] {
+        let name = asm.alloc_string(name);
+        asm.new_method(MethodDef::new(
+            access,
+            main,
+            name,
+            sig,
+            MethodKind::Static,
+            MethodImpl::Missing,
+            vec![],
+        ));
+    }
+
+    assert_eq!(asm.hide_main_module_implementation_details(), 1);
+    assert_eq!(
+        asm.project_main_module_exports("Rust.Unity.Sample.Exports"),
+        1
+    );
+
+    let mut methods: Vec<_> = asm
+        .method_defs()
+        .values()
+        .map(|method| {
+            (
+                asm[asm[method.class()].name()].to_string(),
+                asm[method.name()].to_string(),
+                *method.access(),
+                matches!(method.implementation(), MethodImpl::MethodBody { .. }),
+            )
+        })
+        .collect();
+    methods.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+    assert_eq!(
+        methods,
+        vec![
+            (
+                "MainModule".to_string(),
+                "runtime_helper_with_newer_bcl_types".to_string(),
+                Access::Assembly,
+                false,
+            ),
+            (
+                "MainModule".to_string(),
+                "sample_value".to_string(),
+                Access::Assembly,
+                false,
+            ),
+            (
+                "Rust.Unity.Sample.Exports".to_string(),
+                "sample_value".to_string(),
+                Access::Extern,
+                true,
+            ),
+        ]
+    );
 }
 
 #[test]

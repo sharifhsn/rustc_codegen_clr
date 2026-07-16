@@ -174,27 +174,226 @@ fn load_ptr_arg(asm: &mut Assembly, arg: u32) -> Interned<CILNode> {
     let void_ptr = asm.alloc_type(void_ptr);
     reinterpret_arg(asm, arg, void_ptr)
 }
-fn insert_rust_alloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, use_pool_alloc: bool) {
+
+/// Loads a transparent pointer wrapper through its declared field instead of reinterpreting the
+/// argument slot. Unity Mono has been observed to return zero for `ldarga; ldind.i` on an explicit
+/// layout `NonNull<u8>` argument even while `ldfld pointer` sees the correct value.
+fn load_declared_ptr_field_arg(
+    asm: &mut Assembly,
+    mref: Interned<MethodRef>,
+    arg: u32,
+) -> Option<Interned<CILNode>> {
+    let sig = asm[mref].sig();
+    let input = *asm[sig].inputs().get(arg as usize)?;
+    let owner = input.as_class_ref()?;
+    let def = asm.class_ref_to_def(owner)?;
+    let (field_tpe, field_name) = asm[def]
+        .fields()
+        .iter()
+        .find_map(|(tpe, name, _)| matches!(tpe, Type::Ptr(_)).then_some((*tpe, *name)))?;
+    let field = asm.alloc_field(FieldDesc::new(owner, field_name, field_tpe));
+    let value = asm.alloc_node(CILNode::LdArg(arg));
+    let value = asm.ld_field(value, field);
+    let void_ptr = asm.nptr(Type::Void);
+    Some(asm.cast_ptr(value, void_ptr))
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct AlignedAllocatorRefs {
+    pub(super) alloc: Interned<MethodRef>,
+    pub(super) free: Interned<MethodRef>,
+}
+
+/// Returns the runtime's aligned allocator surface. Unity's netstandard2.1 profile does not
+/// expose the .NET 6 `NativeMemory` class, so that profile gets a tiny private compatibility
+/// type backed by the cross-platform `Marshal.AllocHGlobal` API. The compatibility allocator
+/// stores the original allocation in one pointer-sized word immediately before the aligned
+/// address, allowing `AlignedFree` to recover it without changing Rust's allocator ABI.
+pub(super) fn aligned_allocator_refs(
+    asm: &mut Assembly,
+    unity_netstandard: bool,
+) -> AlignedAllocatorRefs {
+    let void_ptr = asm.nptr(Type::Void);
+    let alloc_sig = asm.sig([Type::Int(Int::USize), Type::Int(Int::USize)], void_ptr);
+    let free_sig = asm.sig([void_ptr], Type::Void);
+    if !unity_netstandard {
+        let native_mem = ClassRef::native_mem(asm);
+        let alloc_name = asm.alloc_string("AlignedAlloc");
+        let free_name = asm.alloc_string("AlignedFree");
+        return AlignedAllocatorRefs {
+            alloc: asm.alloc_methodref(MethodRef::new(
+                native_mem,
+                alloc_name,
+                alloc_sig,
+                MethodKind::Static,
+                [].into(),
+            )),
+            free: asm.alloc_methodref(MethodRef::new(
+                native_mem,
+                free_name,
+                free_sig,
+                MethodKind::Static,
+                [].into(),
+            )),
+        };
+    }
+
+    const CLASS_NAME: &str = "RustcCodegenClr.UnityAlignedAllocator";
+    let existing = {
+        asm.iter_class_def_ids()
+            .copied()
+            .find(|class| &asm[asm[*class].name()] == CLASS_NAME)
+    };
+    let class = match existing {
+        Some(class) => class,
+        None => {
+            let name = asm.alloc_string(CLASS_NAME);
+            let object = ClassRef::object(asm);
+            asm.class_def(ClassDef::new(
+                name,
+                false,
+                0,
+                Some(object),
+                vec![],
+                vec![],
+                Access::Private,
+                None,
+                None,
+                true,
+            ))
+            .expect("Unity allocator compatibility class must be valid")
+        }
+    };
+
+    let alloc_name = asm.alloc_string("AlignedAlloc");
+    let free_name = asm.alloc_string("AlignedFree");
+    let alloc = asm.alloc_methodref(MethodRef::new(
+        class.0,
+        alloc_name,
+        alloc_sig,
+        MethodKind::Static,
+        [].into(),
+    ));
+    let free = asm.alloc_methodref(MethodRef::new(
+        class.0,
+        free_name,
+        free_sig,
+        MethodKind::Static,
+        [].into(),
+    ));
+
+    let already_installed = asm.method_defs().values().any(|method| {
+        method.class() == class && method.name() == alloc_name && method.sig() == alloc_sig
+    });
+    if already_installed {
+        return AlignedAllocatorRefs { alloc, free };
+    }
+
+    // raw = Marshal.AllocHGlobal((nint)(size + align + sizeof(nuint)))
+    // aligned = (raw + sizeof(nuint) + align - 1) & ~(align - 1)
+    // *(nuint*)(aligned - sizeof(nuint)) = raw
+    let marshal = ClassRef::marshal(asm);
+    let marshal_alloc_sig = asm.sig([Type::Int(Int::ISize)], Type::Int(Int::ISize));
+    let marshal_alloc_name = asm.alloc_string("AllocHGlobal");
+    let marshal_alloc = asm.alloc_methodref(MethodRef::new(
+        marshal,
+        marshal_alloc_name,
+        marshal_alloc_sig,
+        MethodKind::Static,
+        [].into(),
+    ));
+    let header = asm.alloc_node(Const::USize(8));
+    let size = asm.alloc_node(CILNode::LdArg(0));
+    let align = asm.alloc_node(CILNode::LdArg(1));
+    let total = asm.biop(size, align, super::cilnode::BinOp::Add);
+    let total = asm.biop(total, header, super::cilnode::BinOp::Add);
+    let total = asm.int_cast(total, Int::ISize, super::cilnode::ExtendKind::ZeroExtend);
+    let raw = asm.alloc_node(CILNode::call(marshal_alloc, [total]));
+    let store_raw = asm.alloc_root(CILRoot::StLoc(0, raw));
+    let raw = asm.alloc_node(CILNode::LdLoc(0));
+    let raw = asm.int_cast(raw, Int::USize, super::cilnode::ExtendKind::ZeroExtend);
+    let with_header = asm.biop(raw, header, super::cilnode::BinOp::Add);
+    let one = asm.alloc_node(Const::USize(1));
+    let align_minus_one = asm.biop(align, one, super::cilnode::BinOp::Sub);
+    let rounded = asm.biop(with_header, align_minus_one, super::cilnode::BinOp::Add);
+    let mask = asm.alloc_node(CILNode::UnOp(align_minus_one, super::cilnode::UnOp::Not));
+    let aligned = asm.biop(rounded, mask, super::cilnode::BinOp::And);
+    let header_addr = asm.biop(aligned, header, super::cilnode::BinOp::Sub);
+    let usize_ptr = asm.nptr(Type::Int(Int::USize));
+    let header_ptr = asm.cast_ptr_to(header_addr, usize_ptr);
+    let save_raw = asm.st_ind(header_ptr, raw, Type::Int(Int::USize), false);
+    let result = asm.cast_ptr_to(aligned, void_ptr);
+    let ret = asm.alloc_root(CILRoot::Ret(result));
+    let isize_type = asm.alloc_type(Type::Int(Int::ISize));
+    asm.new_method(MethodDef::new(
+        Access::Assembly,
+        class,
+        alloc_name,
+        alloc_sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![store_raw, save_raw, ret], 0, None)],
+            locals: vec![(None, isize_type)],
+        },
+        vec![None, None],
+    ));
+
+    // Marshal.FreeHGlobal((nint)*(nuint*)((nuint)ptr - sizeof(nuint)))
+    let marshal_free_sig = asm.sig([Type::Int(Int::ISize)], Type::Void);
+    let marshal_free_name = asm.alloc_string("FreeHGlobal");
+    let marshal_free = asm.alloc_methodref(MethodRef::new(
+        marshal,
+        marshal_free_name,
+        marshal_free_sig,
+        MethodKind::Static,
+        [].into(),
+    ));
+    let ptr = asm.alloc_node(CILNode::LdArg(0));
+    let ptr = asm.cast_ptr_to(ptr, Type::Int(Int::USize));
+    let header_addr = asm.biop(ptr, header, super::cilnode::BinOp::Sub);
+    let header_addr = asm.cast_ptr_to(header_addr, usize_ptr);
+    let usize_type = asm.alloc_type(Type::Int(Int::USize));
+    let raw = asm.alloc_node(CILNode::LdInd {
+        addr: header_addr,
+        tpe: usize_type,
+        volatile: false,
+    });
+    let raw = asm.int_cast(raw, Int::ISize, super::cilnode::ExtendKind::ZeroExtend);
+    let free_call = asm.alloc_root(CILRoot::call(marshal_free, [raw]));
+    let ret = asm.alloc_root(CILRoot::VoidRet);
+    asm.new_method(MethodDef::new(
+        Access::Assembly,
+        class,
+        free_name,
+        free_sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![free_call, ret], 0, None)],
+            locals: vec![],
+        },
+        vec![None],
+    ));
+
+    AlignedAllocatorRefs { alloc, free }
+}
+
+fn insert_rust_alloc(
+    asm: &mut Assembly,
+    patcher: &mut MissingMethodPatcher,
+    use_pool_alloc: bool,
+    unity_netstandard: bool,
+) {
     if use_pool_alloc {
         pool_alloc::insert_rust_alloc(asm, patcher);
         return;
     }
+    let allocator = aligned_allocator_refs(asm, unity_netstandard);
     let name = asm.alloc_string("__rust_alloc");
     let generator = move |mref, asm: &mut Assembly| {
         let size = asm.alloc_node(CILNode::LdArg(0));
         let align = load_align_usize(asm, 1);
         let void_ptr = asm.nptr(Type::Void);
-        let sig = asm.sig([Type::Int(Int::USize), Type::Int(Int::USize)], void_ptr);
-        let aligned_alloc = asm.alloc_string("AlignedAlloc");
-        let native_mem = ClassRef::native_mem(asm);
-        let call_method = asm.alloc_methodref(MethodRef::new(
-            native_mem,
-            aligned_alloc,
-            sig,
-            MethodKind::Static,
-            [].into(),
-        ));
-        let alloc = asm.alloc_node(CILNode::call(call_method, [size, align]));
+        let alloc = asm.alloc_node(CILNode::call(allocator.alloc, [size, align]));
         let alloc = adapt_runtime_result(mref, alloc, void_ptr, asm);
         let ret = asm.alloc_root(CILRoot::Ret(alloc));
         let cap = asm.alloc_node(Const::USize(ALLOC_CAP));
@@ -226,28 +425,20 @@ fn insert_rust_alloc_zeroed(
     asm: &mut Assembly,
     patcher: &mut MissingMethodPatcher,
     use_pool_alloc: bool,
+    unity_netstandard: bool,
 ) {
     if use_pool_alloc {
         pool_alloc::insert_rust_alloc_zeroed(asm, patcher);
         return;
     }
+    let allocator = aligned_allocator_refs(asm, unity_netstandard);
     let name = asm.alloc_string("__rust_alloc_zeroed");
     let generator = move |mref, asm: &mut Assembly| {
         let size = asm.alloc_node(CILNode::LdArg(0));
         let align = load_align_usize(asm, 1);
         let void_ptr = asm.nptr(Type::Void);
         let void_idx = asm.alloc_type(Type::Void);
-        let sig = asm.sig([Type::Int(Int::USize), Type::Int(Int::USize)], void_ptr);
-        let aligned_alloc = asm.alloc_string("AlignedAlloc");
-        let native_mem = ClassRef::native_mem(asm);
-        let call_method = asm.alloc_methodref(MethodRef::new(
-            native_mem,
-            aligned_alloc,
-            sig,
-            MethodKind::Static,
-            [].into(),
-        ));
-        let alloc = asm.alloc_node(CILNode::call(call_method, [size, align]));
+        let alloc = asm.alloc_node(CILNode::call(allocator.alloc, [size, align]));
         let alloc = asm.alloc_node(CILNode::PtrCast(
             alloc,
             Box::new(super::cilnode::PtrCastRes::Ptr(void_idx)),
@@ -359,11 +550,16 @@ fn insert_rust_realloc(
     patcher: &mut MissingMethodPatcher,
     use_libc: bool,
     use_pool_alloc: bool,
+    unity_netstandard: bool,
 ) {
     let name = asm.alloc_string("__rust_realloc");
     if use_libc {
         let generator = move |mref, asm: &mut Assembly| {
-            let ptr = load_ptr_arg(asm, 0);
+            let ptr = if unity_netstandard {
+                load_declared_ptr_field_arg(asm, mref, 0).unwrap_or_else(|| load_ptr_arg(asm, 0))
+            } else {
+                load_ptr_arg(asm, 0)
+            };
             let align = load_align_usize(asm, 2);
             let new_size = asm.alloc_node(CILNode::LdArg(3));
             let new_size = asm.alloc_node(CILNode::IntCast {
@@ -420,6 +616,7 @@ fn insert_rust_realloc(
     } else if use_pool_alloc {
         pool_alloc::insert_rust_realloc(asm, patcher);
     } else {
+        let allocator = aligned_allocator_refs(asm, unity_netstandard);
         let generator = move |mref, asm: &mut Assembly| {
             // realloc = AlignedAlloc + copy + AlignedFree, NOT `NativeMemory.AlignedRealloc`.
             // `AlignedRealloc` THROWS `OutOfMemoryException` when the requested size is unsatisfiable
@@ -432,7 +629,11 @@ fn insert_rust_realloc(
             // block). `min(old, new)` bytes are copied so a shrink never overruns the smaller block.
             // Surfaced by alloctests `{vec,string,vec_deque}::test_try_reserve`.
             let void_ptr = asm.nptr(Type::Void);
-            let ptr = load_ptr_arg(asm, 0);
+            let ptr = if unity_netstandard {
+                load_declared_ptr_field_arg(asm, mref, 0).unwrap_or_else(|| load_ptr_arg(asm, 0))
+            } else {
+                load_ptr_arg(asm, 0)
+            };
             let old_size = asm.alloc_node(CILNode::LdArg(1));
             let old_size = asm.alloc_node(CILNode::IntCast {
                 input: old_size,
@@ -447,16 +648,6 @@ fn insert_rust_realloc(
                 extend: super::cilnode::ExtendKind::ZeroExtend,
             });
             // loc0 = NativeMemory.AlignedAlloc(new_size, align)   (NULL on unsatisfiable size)
-            let native_mem = ClassRef::native_mem(asm);
-            let alloc_name = asm.alloc_string("AlignedAlloc");
-            let alloc_sig = asm.sig([Type::Int(Int::USize), Type::Int(Int::USize)], void_ptr);
-            let aligned_alloc = asm.alloc_methodref(MethodRef::new(
-                native_mem,
-                alloc_name,
-                alloc_sig,
-                MethodKind::Static,
-                [].into(),
-            ));
             // cap guard, mirroring `__rust_alloc`: `AlignedAlloc` OOM-THROWS for sizes beyond
             // `ALLOC_CAP` (it does not return NULL), so short-circuit to NULL *without calling it*
             // when `new_size` exceeds the cap. (block 0 -> block 2 on `new_size > ALLOC_CAP`.)
@@ -470,7 +661,7 @@ fn insert_rust_realloc(
                     super::cilroot::CmpKind::Unsigned,
                 )),
             ))));
-            let buff = asm.alloc_node(CILNode::call(aligned_alloc, [new_size, align]));
+            let buff = asm.alloc_node(CILNode::call(allocator.alloc, [new_size, align]));
             let st_buff = asm.alloc_root(CILRoot::StLoc(0, buff));
             // if the new block is NULL, return NULL WITHOUT touching the old block (block 0 -> 2).
             let buff_ld = asm.alloc_node(CILNode::LdLoc(0));
@@ -487,19 +678,8 @@ fn insert_rust_realloc(
                 super::cilnode::BinOp::LtUn,
             ));
             let copy_len = asm.select(Type::Int(Int::USize), old_size, new_size, lt);
-            let buff_dst = asm.alloc_node(CILNode::LdLoc(0));
-            let copy = asm.alloc_root(CILRoot::CpBlk(Box::new((buff_dst, ptr, copy_len))));
             // free the old block (only reached on success)
-            let free_name = asm.alloc_string("AlignedFree");
-            let free_sig = asm.sig([void_ptr], Type::Void);
-            let aligned_free = asm.alloc_methodref(MethodRef::new(
-                native_mem,
-                free_name,
-                free_sig,
-                MethodKind::Static,
-                [].into(),
-            ));
-            let free_old = asm.alloc_root(CILRoot::call(aligned_free, [ptr]));
+            let free_old = asm.alloc_root(CILRoot::call(allocator.free, [ptr]));
             // explicit goto block 1: block 0 ends in a (non-terminating) `call`, so without this it
             // would fall through into block 2 (`ret NULL`) and a SUCCESSFUL realloc would return NULL.
             let goto_ok = asm.alloc_root(CILRoot::Branch(Box::new((1, 0, None))));
@@ -512,6 +692,9 @@ fn insert_rust_realloc(
             let null = asm.alloc_node(Const::USize(0));
             let null = adapt_runtime_result(mref, null, Type::Int(Int::USize), asm);
             let ret_null = asm.alloc_root(CILRoot::Ret(null));
+            let void_ptr_type = asm.alloc_type(void_ptr);
+            let buff_dst = asm.alloc_node(CILNode::LdLoc(0));
+            let copy = asm.alloc_root(CILRoot::CpBlk(Box::new((buff_dst, ptr, copy_len))));
             MethodImpl::MethodBody {
                 blocks: vec![
                     BasicBlock::new(
@@ -522,7 +705,7 @@ fn insert_rust_realloc(
                     BasicBlock::new(vec![ret_ok], 1, None),
                     BasicBlock::new(vec![ret_null], 2, None),
                 ],
-                locals: vec![(None, asm.alloc_type(void_ptr))],
+                locals: vec![(None, void_ptr_type)],
             }
         };
         patcher.insert(name, Box::new(generator));
@@ -533,11 +716,16 @@ fn insert_rust_dealloc(
     patcher: &mut MissingMethodPatcher,
     use_libc: bool,
     use_pool_alloc: bool,
+    unity_netstandard: bool,
 ) {
     let name = asm.alloc_string("__rust_dealloc");
     if use_libc {
-        let generator = move |_, asm: &mut Assembly| {
-            let ldarg_0 = load_ptr_arg(asm, 0);
+        let generator = move |mref, asm: &mut Assembly| {
+            let ldarg_0 = if unity_netstandard {
+                load_declared_ptr_field_arg(asm, mref, 0).unwrap_or_else(|| load_ptr_arg(asm, 0))
+            } else {
+                load_ptr_arg(asm, 0)
+            };
             let void_ptr = asm.nptr(Type::Void);
             let sig = asm.sig([void_ptr], Type::Void);
             let mm_free = asm.alloc_string("_mm_free");
@@ -560,20 +748,14 @@ fn insert_rust_dealloc(
     } else if use_pool_alloc {
         pool_alloc::insert_rust_dealloc(asm, patcher);
     } else {
-        let generator = move |_, asm: &mut Assembly| {
-            let ldarg_0 = load_ptr_arg(asm, 0);
-            let void_ptr = asm.nptr(Type::Void);
-            let sig = asm.sig([void_ptr], Type::Void);
-            let aligned_realloc = asm.alloc_string("AlignedFree");
-            let native_mem = ClassRef::native_mem(asm);
-            let call_method = asm.alloc_methodref(MethodRef::new(
-                native_mem,
-                aligned_realloc,
-                sig,
-                MethodKind::Static,
-                [].into(),
-            ));
-            let alloc = asm.alloc_node(CILNode::call(call_method, [ldarg_0]));
+        let allocator = aligned_allocator_refs(asm, unity_netstandard);
+        let generator = move |mref, asm: &mut Assembly| {
+            let ldarg_0 = if unity_netstandard {
+                load_declared_ptr_field_arg(asm, mref, 0).unwrap_or_else(|| load_ptr_arg(asm, 0))
+            } else {
+                load_ptr_arg(asm, 0)
+            };
+            let alloc = asm.alloc_node(CILNode::call(allocator.free, [ldarg_0]));
             let ret = asm.alloc_root(CILRoot::Ret(alloc));
             MethodImpl::MethodBody {
                 blocks: vec![BasicBlock::new(vec![ret], 0, None)],
@@ -657,15 +839,16 @@ pub fn insert_heap(
     patcher: &mut MissingMethodPatcher,
     use_libc: bool,
     use_pool_alloc: bool,
+    unity_netstandard: bool,
 ) {
     let use_pool_alloc = use_pool_alloc && !use_libc;
     if use_pool_alloc {
         pool_alloc::insert_pool_helpers(asm);
     }
-    insert_rust_alloc(asm, patcher, use_pool_alloc);
-    insert_rust_alloc_zeroed(asm, patcher, use_pool_alloc);
-    insert_rust_realloc(asm, patcher, use_libc, use_pool_alloc);
-    insert_rust_dealloc(asm, patcher, use_libc, use_pool_alloc);
+    insert_rust_alloc(asm, patcher, use_pool_alloc, unity_netstandard);
+    insert_rust_alloc_zeroed(asm, patcher, use_pool_alloc, unity_netstandard);
+    insert_rust_realloc(asm, patcher, use_libc, use_pool_alloc, unity_netstandard);
+    insert_rust_dealloc(asm, patcher, use_libc, use_pool_alloc, unity_netstandard);
     insert_pause(asm, patcher);
     insert_prefetch(asm, patcher);
 }

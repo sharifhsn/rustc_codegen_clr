@@ -21,6 +21,10 @@ test/out
 .cargo/
 config.toml
 rust/
+!feasibility/unity_sample/rust/
+!feasibility/unity_sample/rust/Cargo.toml
+!feasibility/unity_sample/rust/src/
+!feasibility/unity_sample/rust/src/**
 cargo_tests/spinacz/target/
 # feasibility harness: container-only build output (mounted repo) + demo artifacts
 .docker-target/
@@ -28,6 +32,10 @@ feasibility/demo/**/bin/
 feasibility/demo/**/obj/
 # transient build log sink written by dev.sh / cargo-dotnet (the pipeline core)
 feasibility/_lastbuild.log
+# Unity/Mono crash reports and acceptance output are diagnostic build artifacts.
+mono_crash.*.json
+feasibility/unity_sample/Builds/
+feasibility/unity_sample/feasibility/
 # rustc internal-compiler-error dumps (common while chasing nightly drift)
 rustc-ice-*.txt
 # cargo_tests corpus: per-crate build artifacts. The corpus tracks ONLY Cargo.toml + src/;

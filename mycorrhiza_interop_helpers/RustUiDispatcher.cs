@@ -41,7 +41,10 @@ public sealed class DelegateUiDispatcher : IRustUiDispatcher
 
     public bool TryDispatch(Action callback)
     {
-        ArgumentNullException.ThrowIfNull(callback);
+        if (callback is null)
+        {
+            throw new ArgumentNullException(nameof(callback));
+        }
         return _tryDispatch(callback);
     }
 }
@@ -81,7 +84,10 @@ public sealed class SynchronizationContextUiDispatcher : IRustUiDispatcher
 
     public bool TryDispatch(Action callback)
     {
-        ArgumentNullException.ThrowIfNull(callback);
+        if (callback is null)
+        {
+            throw new ArgumentNullException(nameof(callback));
+        }
         if (CheckAccess)
         {
             callback();
@@ -162,8 +168,14 @@ public static class RustUiDispatch
     /// </summary>
     public static bool TryDispatch(IRustUiDispatcher dispatcher, RustDispatchWork work)
     {
-        ArgumentNullException.ThrowIfNull(dispatcher);
-        ArgumentNullException.ThrowIfNull(work);
+        if (dispatcher is null)
+        {
+            throw new ArgumentNullException(nameof(dispatcher));
+        }
+        if (work is null)
+        {
+            throw new ArgumentNullException(nameof(work));
+        }
 
         try
         {

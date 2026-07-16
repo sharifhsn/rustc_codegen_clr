@@ -55,6 +55,8 @@ pub enum Cmd {
     Attach(AttachArgs),
     /// Diagnose the toolchain, or translate a .NET runtime failure into an actionable fix.
     Doctor(DoctorArgs),
+    /// Diagnose the local Unity Editor integration prerequisites.
+    Unity(UnityArgs),
     /// Build a crate's #[test]s with the backend and run them on .NET.
     Test(BuildArgs),
     /// Provision the toolchain + install home, then install this binary to ~/.cargo/bin.
@@ -269,6 +271,8 @@ pub enum Template {
     WebApi,
     /// A .NET Generic Host worker service with a managed Rust backend.
     Worker,
+    /// A Unity 6.3 project with managed Rust and an optional native Rust kernel.
+    Unity,
 }
 
 impl Template {
@@ -283,12 +287,13 @@ impl Template {
             Template::Winui => "WinUI 3 app (managed Rust backend)",
             Template::WebApi => "ASP.NET Core Web API (managed Rust backend)",
             Template::Worker => ".NET worker service (managed Rust backend)",
+            Template::Unity => "Unity 6.3 managed Rust preview",
         }
     }
 }
 
 const NEW_TEMPLATE_FLAGS: &[&str] = &[
-    "app", "lib", "plugin", "excel", "maui", "winui", "webapi", "worker",
+    "app", "lib", "plugin", "excel", "maui", "winui", "webapi", "worker", "unity",
 ];
 
 #[derive(clap::Args)]
@@ -320,6 +325,9 @@ pub struct NewArgs {
     /// A .NET worker service with Rust business logic compiled to managed .NET.
     #[arg(long, conflicts_with_all = ["app", "lib", "plugin", "excel", "maui", "winui", "webapi"])]
     pub worker: bool,
+    /// A Unity 6.3 project with managed Rust and an optional native Rust kernel.
+    #[arg(long, conflicts_with_all = ["app", "lib", "plugin", "excel", "maui", "winui", "webapi", "worker"])]
+    pub unity: bool,
 
     /// Override the crate name (default: the final path component).
     #[arg(long)]
@@ -348,6 +356,7 @@ impl NewArgs {
             (self.winui, Template::Winui),
             (self.webapi, Template::WebApi),
             (self.worker, Template::Worker),
+            (self.unity, Template::Unity),
         ];
         let mut templates = selected
             .into_iter()
@@ -411,6 +420,103 @@ pub struct DoctorArgs {
     /// Emit a stable, machine-readable JSON report instead of human-oriented text.
     /// The command's exit code is unchanged: environment reports return 1 when a
     /// required check fails, while failure-translation reports return 0.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(clap::Args)]
+pub struct UnityArgs {
+    #[command(subcommand)]
+    pub command: UnityCommand,
+}
+
+#[derive(Subcommand)]
+pub enum UnityCommand {
+    /// Verify Unity Editor, managed profile, and platform modules.
+    Doctor(UnityDoctorArgs),
+    /// Build a Rust crate and atomically stage its managed output into a Unity project.
+    Build(UnityBuildArgs),
+    /// Build and stage an ordinary native Rust cdylib for Unity P/Invoke.
+    Native(UnityNativeArgs),
+    /// Attach managed and optional native Rust crates to an existing Unity project.
+    Attach(UnityAttachArgs),
+    /// Materialize the staged integration as a Unity Package Manager package.
+    Package(UnityPackageArgs),
+}
+
+#[derive(clap::Args)]
+pub struct UnityAttachArgs {
+    /// Existing Unity project directory (contains Assets/).
+    pub project: PathBuf,
+    /// Managed Rust crate directory or Cargo.toml path.
+    pub crate_dir: PathBuf,
+    /// Optional native Rust cdylib crate to stage alongside managed Rust.
+    #[arg(long)]
+    pub native_crate: Option<PathBuf>,
+    /// Native export that must exist before attachment stages the plug-in. Repeat as needed.
+    #[arg(long = "native-export")]
+    pub native_exports: Vec<String>,
+    /// Replace cargo-dotnet generated files from an older schema.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(clap::Args)]
+pub struct UnityPackageArgs {
+    /// Unity project containing staged cargo-dotnet assets.
+    pub project: PathBuf,
+    /// Output directory for the materialized UPM package.
+    pub output: PathBuf,
+    /// Reverse-DNS Unity package identifier.
+    #[arg(long, default_value = "com.rustdotnet.game")]
+    pub name: String,
+    /// SemVer package version.
+    #[arg(long, default_value = "0.0.1")]
+    pub version: String,
+    /// Replace a previously generated package directory.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(clap::Args)]
+pub struct UnityBuildArgs {
+    /// Unity project directory (contains Assets/).
+    #[arg(default_value = ".")]
+    pub project: PathBuf,
+    /// Rust crate directory or manifest path (defaults to the attach receipt or ./rustlib).
+    pub crate_dir: Option<PathBuf>,
+    /// Stage under Assets/Plugins/Managed (or custom relative Assets path).
+    #[arg(long, default_value = "Assets/Plugins/Managed")]
+    pub destination: PathBuf,
+}
+
+#[derive(clap::Args)]
+pub struct UnityNativeArgs {
+    /// Unity project directory (contains Assets/).
+    #[arg(default_value = ".")]
+    pub project: PathBuf,
+    /// Native Rust cdylib crate directory or Cargo.toml path (defaults to the attach receipt).
+    pub crate_dir: Option<PathBuf>,
+    /// Required native export to verify in the built library. Repeat as needed.
+    #[arg(long = "export", required = true)]
+    pub exports: Vec<String>,
+}
+
+#[derive(clap::Args)]
+pub struct UnityDoctorArgs {
+    /// Unity Editor executable or Unity.app path (defaults to UNITY_EDITOR or platform lookup).
+    #[arg(long, env = "UNITY_EDITOR")]
+    pub editor: Option<PathBuf>,
+    /// Required Unity editor major version number (Unity 6 uses 6000).
+    #[arg(long, default_value = "6000")]
+    pub version: u32,
+    /// Managed compatibility profile (default: netstandard2.1).
+    #[arg(long, default_value = "netstandard2.1")]
+    pub profile: String,
+    /// Unity project to validate in addition to the installed Editor.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    /// Emit JSON instead of human-readable diagnostics.
     #[arg(long)]
     pub json: bool,
 }
@@ -661,6 +767,7 @@ mod tests {
             ("--winui", Template::Winui),
             ("--webapi", Template::WebApi),
             ("--worker", Template::Worker),
+            ("--unity", Template::Unity),
         ] {
             let cli = DotnetCli::try_parse_from(["cargo-dotnet", "new", "demo", flag]).unwrap();
             let Cmd::New(args) = cli.cmd else {
@@ -683,6 +790,52 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn unity_native_requires_and_collects_verified_exports() {
+        let missing =
+            match DotnetCli::try_parse_from(["cargo-dotnet", "unity", "native", ".", "native"]) {
+                Ok(_) => panic!("unity native parsed without a required --export"),
+                Err(error) => error,
+            };
+        assert_eq!(
+            missing.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        let cli = DotnetCli::try_parse_from([
+            "cargo-dotnet",
+            "unity",
+            "native",
+            ".",
+            "native",
+            "--export",
+            "first",
+            "--export",
+            "second",
+        ])
+        .unwrap();
+        let Cmd::Unity(args) = cli.cmd else {
+            panic!("unity native did not parse to the Unity command")
+        };
+        let UnityCommand::Native(args) = args.command else {
+            panic!("unity native did not parse to the native subcommand")
+        };
+        assert_eq!(args.exports, ["first", "second"]);
+    }
+
+    #[test]
+    fn unity_build_defaults_to_project_and_receipt_inference() {
+        let cli = DotnetCli::try_parse_from(["cargo-dotnet", "unity", "build"]).unwrap();
+        let Cmd::Unity(args) = cli.cmd else {
+            panic!("unity build did not parse to the Unity command")
+        };
+        let UnityCommand::Build(args) = args.command else {
+            panic!("unity build did not parse to the build subcommand")
+        };
+        assert_eq!(args.project, PathBuf::from("."));
+        assert!(args.crate_dir.is_none());
     }
 
     #[test]

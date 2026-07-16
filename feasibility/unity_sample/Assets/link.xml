@@ -1,0 +1,5 @@
+<linker>
+  <assembly fullname="Rust.Unity.Sample">
+    <type fullname="Rust.Unity.Sample.Exports" preserve="all" />
+  </assembly>
+</linker>

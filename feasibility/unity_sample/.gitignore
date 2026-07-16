@@ -1,0 +1,21 @@
+# Unity-generated project state and standalone players.
+/Library/
+/Logs/
+/Temp/
+/UserSettings/
+/Builds/
+/*.exe
+
+# The acceptance fixture creates a scene at runtime and does not persist asset references, so
+# Unity's machine-generated metadata is intentionally local to each test checkout.
+*.meta
+/Assets/GeneratedRustUnityAcceptance.unity
+
+# cargo-dotnet stages these generated plug-ins atomically for each acceptance run.
+/Assets/Plugins/Managed/
+/Assets/Plugins/macOS/
+/Assets/RustDotnetGenerated/
+
+# Rust build output is reproducible from the two checked-in fixture crates.
+/rust/target/
+/native/target/

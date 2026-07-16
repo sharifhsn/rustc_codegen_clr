@@ -508,11 +508,15 @@ impl ILExporter {
                     let set_text = self.method_ref_operand_text(asm_mut, s);
                     accessors.push_str(&format!(".set {set_text} "));
                 }
-                let nullable = prop.nullability().map_or_else(String::new, |flag| {
-                    format!(
-                        ".custom instance void [System.Runtime]System.Runtime.CompilerServices.NullableAttribute::.ctor(uint8) = (01 00 {flag:02X} 00 00) "
-                    )
-                });
+                let nullable = if self.runtime == crate::DotnetRuntime::UnityNetStandard21 {
+                    String::new()
+                } else {
+                    prop.nullability().map_or_else(String::new, |flag| {
+                        format!(
+                            ".custom instance void [System.Runtime]System.Runtime.CompilerServices.NullableAttribute::.ctor(uint8) = (01 00 {flag:02X} 00 00) "
+                        )
+                    })
+                };
                 writeln!(
                     out,
                     ".property instance {prop_ty} '{prop_name}'() {{ {nullable}{accessors}}}"
@@ -768,13 +772,14 @@ impl ILExporter {
             out,
             ".method {vis} hidebysig {kind} {pinvoke} {ret} '{name}'{gen_params}({inputs}) cil managed {aggrinline}{preservesig}{{// Method ID {method_id:?}"
         )?;
-        if let Some(flag) = method.nullable_context() {
+        let emit_nullable_metadata = self.runtime != crate::DotnetRuntime::UnityNetStandard21;
+        if emit_nullable_metadata && let Some(flag) = method.nullable_context() {
             writeln!(
                 out,
                 ".custom instance void [System.Runtime]System.Runtime.CompilerServices.NullableContextAttribute::.ctor(uint8) = (01 00 {flag:02X} 00 00)"
             )?;
         }
-        if let Some(flag) = method.return_nullability() {
+        if emit_nullable_metadata && let Some(flag) = method.return_nullability() {
             writeln!(out, ".param [0]")?;
             writeln!(
                 out,
@@ -782,7 +787,7 @@ impl ILExporter {
             )?;
         }
         for (index, flag) in method.param_nullability().iter().enumerate() {
-            if let Some(flag) = flag {
+            if emit_nullable_metadata && let Some(flag) = flag {
                 writeln!(out, ".param [{}]", index + 1)?;
                 writeln!(
                     out,

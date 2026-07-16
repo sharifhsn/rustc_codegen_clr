@@ -135,6 +135,7 @@ fn render(template: Template, name: &str, dotnet: &str) -> Vec<File> {
         Template::Winui => winui_files(name, dotnet),
         Template::WebApi => webapi_files(name, dotnet),
         Template::Worker => worker_files(name, dotnet),
+        Template::Unity => unity_files(name),
     }
 }
 
@@ -632,8 +633,183 @@ fn print_next_steps(template: Template, name: &str, dir: &Path, dotnet: &str) {
             println!("  dotnet run -c Release -f net{dotnet}.0-windows10.0.19041.0");
             println!("  # Android/iOS/Mac Catalyst are not generated or claimed yet.");
         }
+        Template::Unity => {
+            println!("Next (Unity 6.3 project with managed Rust):");
+            println!("  cd {d}");
+            println!("  cargo dotnet unity doctor");
+            println!("  cargo dotnet unity build . rustlib");
+            println!(
+                "  cargo dotnet unity native . native --export rust_native_multiply  # optional macOS native kernel"
+            );
+            println!(
+                "  # Open this directory in Unity Hub and press Play; the demo scene is generated automatically."
+            );
+        }
     }
 }
+
+fn unity_files(name: &str) -> Vec<File> {
+    let managed = managed_stem(name);
+    let assembly = format!("{managed}.Rust");
+    let native = format!("{}_native", name.replace('-', "_"));
+    vec![
+        File { rel: "rustlib/Cargo.toml", body: format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\nmycorrhiza = \"0.0.0\"\ndotnet_macros = \"0.1.0\"\n\n[package.metadata.dotnet]\nidentity-schema = 1\npackage-id = \"{assembly}\"\nassembly-name = \"{assembly}\"\nroot-namespace = \"{managed}\"\nmodule-type = \"Exports\"\npublic-namespaces = [\"{managed}\"]\ncompatibility-profile = \"unity-netstandard2.1\"\nlegacy-main-module = false\n[workspace]\n") },
+        File { rel: "rustlib/src/lib.rs", body: UNITY_RUST.to_string() },
+        File {
+            rel: "native/Cargo.toml",
+            body: format!(
+                "[package]\nname = \"{native}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[workspace]\n"
+            ),
+        },
+        File {
+            rel: "native/src/lib.rs",
+            body: UNITY_NATIVE_RUST.to_string(),
+        },
+        File {
+            rel: "Assets/Scripts/CargoDotnetUnity.cs",
+            body: UNITY_RUNTIME
+                .replace("__TYPE__", &format!("{managed}.Exports"))
+                .replace("__NATIVE__", &native),
+        },
+        File { rel: "Assets/Scripts/CargoDotnetUnity.asmdef", body: format!(r#"{{ "name": "{name}.Runtime", "rootNamespace": "RustcCodegenClr.Unity" }}
+"#) },
+        File {
+            rel: "Assets/Editor/CargoDotnetUnityBuild.cs",
+            body: UNITY_EDITOR_BOOTSTRAP.to_string(),
+        },
+        File {
+            rel: "Assets/Editor/CargoDotnetUnity.Editor.asmdef",
+            body: format!(
+                "{{\n  \"name\": \"{name}.Editor\",\n  \"references\": [\"{name}.Runtime\"],\n  \"includePlatforms\": [\"Editor\"],\n  \"autoReferenced\": true\n}}\n"
+            ),
+        },
+        File {
+            rel: "Assets/README.md",
+            body: "# Unity assets\n\nRun `cargo dotnet unity build . rustlib` before opening or refreshing the project. The command atomically stages the managed Rust DLL, PDB, XML docs, helper closure, and `Assets/RustDotnetGenerated/link.xml`. On macOS, `cargo dotnet unity native . native --export rust_native_multiply` additionally verifies and stages the optional native Rust kernel. On first import the generated Editor bootstrap creates `Assets/Scenes/CargoDotnetUnity.unity`, attaches the typed adapter, and adds the scene to Build Settings. Open that scene and press Play; no hand wiring is required.\n".to_string(),
+        },
+        File {
+            rel: ".gitignore",
+            body: "Library/\nLogs/\nTemp/\nUserSettings/\nobj/\nrustlib/target/\nnative/target/\n**/Cargo.lock\nAssets/Plugins/Managed/\nAssets/Plugins/macOS/\nAssets/RustDotnetGenerated/\n".to_string(),
+        },
+        File { rel: "ProjectSettings/ProjectVersion.txt", body: "m_EditorVersion: 6000.3.19f1\nm_EditorVersionWithRevision: 6000.3.19f1 (unity)\n".to_string() },
+        File { rel: "Packages/manifest.json", body: "{\n  \"dependencies\": {\n    \"com.unity.modules.physics\": \"1.0.0\"\n  }\n}\n".to_string() },
+    ]
+}
+
+const UNITY_RUST: &str = r#"#![feature(adt_const_params, unsized_const_params)]
+#![allow(internal_features, incomplete_features)]
+use dotnet_macros::dotnet_export;
+#[dotnet_export(name = "RustEngineStatus")]
+pub fn rust_engine_status() -> i32 { 1 }
+"#;
+
+const UNITY_NATIVE_RUST: &str = r#"#[unsafe(no_mangle)]
+pub extern "C" fn rust_native_multiply(left: i32, right: i32) -> i32 {
+    left * right
+}
+"#;
+
+const UNITY_RUNTIME: &str = r#"using System.Runtime.InteropServices;
+using UnityEngine;
+
+namespace RustcCodegenClr.Unity
+{
+    /// Thin Unity edge: scene lifecycle stays in C#, durable game/domain logic stays in managed Rust.
+    public sealed class CargoDotnetUnity : MonoBehaviour
+    {
+        [DllImport("__NATIVE__", EntryPoint = "rust_native_multiply")]
+        private static extern int RustNativeMultiply(int left, int right);
+
+        [SerializeField] private bool probeOnStart = true;
+
+        public int ProbeManagedRust()
+        {
+            return __TYPE__.RustEngineStatus();
+        }
+
+        /// Optional high-performance native seam. Stage it first with
+        /// `cargo dotnet unity native . native --export rust_native_multiply` on macOS.
+        public int ProbeNativeRust(int left, int right) => RustNativeMultiply(left, right);
+
+        private void Start()
+        {
+            if (probeOnStart)
+            {
+                var status = ProbeManagedRust();
+                Debug.Log($"RUST_UNITY_READY={status}");
+                if (Application.isBatchMode)
+                    Application.Quit(status == 1 ? 0 : 1);
+            }
+        }
+    }
+}
+"#;
+
+const UNITY_EDITOR_BOOTSTRAP: &str = r#"#if UNITY_EDITOR
+using System;
+using System.Linq;
+using UnityEditor;
+using UnityEditor.Build;
+using UnityEditor.Build.Reporting;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+namespace RustcCodegenClr.Unity.Editor
+{
+    /// Generated, readable project automation for the scaffold's first scene and player builds.
+    [InitializeOnLoad]
+    public static class CargoDotnetUnityBuild
+    {
+        public const string ScenePath = "Assets/Scenes/CargoDotnetUnity.unity";
+
+        static CargoDotnetUnityBuild() => EditorApplication.delayCall += EnsureDemoScene;
+
+        [MenuItem("Rust/.NET/Prepare Demo Scene")]
+        public static void EnsureDemoScene()
+        {
+            if (AssetDatabase.LoadAssetAtPath<SceneAsset>(ScenePath) == null)
+            {
+                if (!AssetDatabase.IsValidFolder("Assets/Scenes"))
+                    AssetDatabase.CreateFolder("Assets", "Scenes");
+                var scene = EditorSceneManager.NewScene(NewSceneSetup.DefaultGameObjects, NewSceneMode.Single);
+                var host = new GameObject("Managed Rust Host");
+                host.AddComponent<CargoDotnetUnity>();
+                if (!EditorSceneManager.SaveScene(scene, ScenePath))
+                    throw new InvalidOperationException($"Could not save generated scene {ScenePath}");
+            }
+
+            if (!EditorBuildSettings.scenes.Any(scene => scene.path == ScenePath && scene.enabled))
+            {
+                var scenes = EditorBuildSettings.scenes
+                    .Where(scene => scene.path != ScenePath)
+                    .Concat(new[] { new EditorBuildSettingsScene(ScenePath, true) })
+                    .ToArray();
+                EditorBuildSettings.scenes = scenes;
+            }
+        }
+
+        public static void Mono() => Build("Builds/Mono.app", ScriptingImplementation.Mono2x);
+        public static void IL2CPP() => Build("Builds/IL2CPP.app", ScriptingImplementation.IL2CPP);
+
+        private static void Build(string output, ScriptingImplementation backend)
+        {
+            EnsureDemoScene();
+            PlayerSettings.SetScriptingBackend(NamedBuildTarget.Standalone, backend);
+            // The optional scaffolded native plug-in is built for the Apple-Silicon host.
+            PlayerSettings.SetArchitecture(NamedBuildTarget.Standalone, 1);
+            var report = BuildPipeline.BuildPlayer(
+                new[] { ScenePath },
+                output,
+                BuildTarget.StandaloneOSX,
+                BuildOptions.None);
+            if (report.summary.result != BuildResult.Succeeded)
+                throw new InvalidOperationException(report.summary.ToString());
+        }
+    }
+}
+#endif
+"#;
 
 // ---------------------------------------------------------------------------------
 // A `&'static str` from an owned String (rel paths are `&'static` in `File`). Scaffold
@@ -1451,6 +1627,99 @@ mod tests {
         assert_cargo_manifests_parse(&winui_files("demo", "10"));
         assert_cargo_manifests_parse(&webapi_files("demo", "10"));
         assert_cargo_manifests_parse(&worker_files("demo", "10"));
+        assert_cargo_manifests_parse(&unity_files("demo"));
+    }
+
+    #[test]
+    fn unity_scaffold_is_a_project_with_buildable_rust_subcrate() {
+        let files = unity_files("demo");
+        let rels: Vec<&str> = files.iter().map(|f| f.rel).collect();
+        assert!(rels.contains(&"ProjectSettings/ProjectVersion.txt"));
+        assert!(rels.contains(&"Packages/manifest.json"));
+        assert!(rels.contains(&"Assets/README.md"));
+        assert!(rels.contains(&"Assets/Scripts/CargoDotnetUnity.cs"));
+        assert!(rels.contains(&"Assets/Editor/CargoDotnetUnityBuild.cs"));
+        assert!(rels.contains(&"Assets/Editor/CargoDotnetUnity.Editor.asmdef"));
+        assert!(rels.contains(&"rustlib/Cargo.toml"));
+        assert!(rels.contains(&"rustlib/src/lib.rs"));
+        assert!(rels.contains(&"native/Cargo.toml"));
+        assert!(rels.contains(&"native/src/lib.rs"));
+        assert!(rels.contains(&"Assets/Scripts/CargoDotnetUnity.asmdef"));
+        assert!(rels.contains(&".gitignore"));
+        assert!(!rels.iter().any(|rel| rel.ends_with("package.json")));
+        assert!(!rels.iter().any(|rel| rel.starts_with("Runtime/")));
+
+        let manifest = files
+            .iter()
+            .find(|file| file.rel == "rustlib/Cargo.toml")
+            .expect("Unity scaffold must include a Rust manifest");
+        let parsed: toml::Value = toml::from_str(&manifest.body).unwrap();
+        assert_eq!(parsed["package"]["name"].as_str(), Some("demo"));
+        assert_eq!(parsed["lib"]["crate-type"][0].as_str(), Some("cdylib"));
+        assert_eq!(
+            parsed["package"]["metadata"]["dotnet"]["compatibility-profile"].as_str(),
+            Some("unity-netstandard2.1")
+        );
+        assert_eq!(
+            parsed["package"]["metadata"]["dotnet"]["assembly-name"].as_str(),
+            Some("Demo.Rust")
+        );
+        let native_manifest = files
+            .iter()
+            .find(|file| file.rel == "native/Cargo.toml")
+            .expect("Unity scaffold must include its optional native kernel");
+        let native_parsed: toml::Value = toml::from_str(&native_manifest.body).unwrap();
+        assert_eq!(
+            native_parsed["package"]["name"].as_str(),
+            Some("demo_native")
+        );
+        assert_eq!(
+            native_parsed["lib"]["crate-type"][0].as_str(),
+            Some("cdylib")
+        );
+
+        let project_version = files
+            .iter()
+            .find(|file| file.rel == "ProjectSettings/ProjectVersion.txt")
+            .expect("Unity scaffold must pin a known editor version");
+        assert!(
+            project_version
+                .body
+                .contains("m_EditorVersion: 6000.3.19f1")
+        );
+
+        let runtime = files
+            .iter()
+            .find(|file| file.rel == "Assets/Scripts/CargoDotnetUnity.cs")
+            .expect("Unity scaffold must include its managed bridge");
+        assert!(runtime.body.contains("Demo.Exports"));
+        assert!(runtime.body.contains("demo_native"));
+        assert!(runtime.body.contains("rust_native_multiply"));
+        assert!(runtime.body.contains("ProbeNativeRust"));
+        assert!(runtime.body.contains("RUST_UNITY_READY="));
+        assert!(runtime.body.contains("Application.Quit"));
+        assert!(runtime.body.contains("Demo.Exports.RustEngineStatus()"));
+        assert!(!runtime.body.contains("System.Reflection"));
+
+        let editor = files
+            .iter()
+            .find(|file| file.rel == "Assets/Editor/CargoDotnetUnityBuild.cs")
+            .expect("Unity scaffold must generate its demo scene and player automation");
+        assert!(editor.body.contains("EnsureDemoScene"));
+        assert!(
+            editor
+                .body
+                .contains("host.AddComponent<CargoDotnetUnity>()")
+        );
+        assert!(editor.body.contains("ScriptingImplementation.IL2CPP"));
+
+        let asmdef = files
+            .iter()
+            .find(|file| file.rel == "Assets/Scripts/CargoDotnetUnity.asmdef")
+            .expect("Unity scaffold must define a runtime assembly");
+        let asmdef_json: serde_json::Value =
+            serde_json::from_str(&asmdef.body).expect("generated asmdef must be valid JSON");
+        assert_eq!(asmdef_json["name"].as_str(), Some("demo.Runtime"));
     }
 
     #[test]

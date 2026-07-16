@@ -1951,7 +1951,12 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             extends,
             fields,
             vec![],
-            Access::Public,
+            // A comptime-authored CLR type is an intentional managed export, not an ordinary
+            // compiler-generated Rust layout class. `Extern` gives the linker that provenance
+            // while both exporters render it with the same public TypeDef visibility as
+            // `Public`. Post-facade DCE relies on this distinction to retain DTO constructors and
+            // accessors without rooting thousands of internal monomorphized layout types.
+            Access::Extern,
             None,
             None,
             true,

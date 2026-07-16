@@ -113,7 +113,7 @@ pub fn run(args: &PackArgs) -> Result<i32> {
 
     // ---- build the cdylib via the SAME native pipeline ----
     let _build_lock = crate::build_lock::BuildLock::acquire_crate(&ctx)?;
-    xmldoc::clear_scratch(&ctx);
+    xmldoc::prepare(&ctx)?;
     let private_sysroot = crate::private_sysroot::prepare(&ctx)?;
     overlays::apply(&ctx)?;
     let json = buildstd::build_with_sysroot(&ctx, &private_sysroot)?;

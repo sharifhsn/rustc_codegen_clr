@@ -92,16 +92,27 @@ pub mod runtime {
     pub enum DotnetVersion {
         #[default]
         Net10,
+        /// Unity's managed `netstandard2.1` profile (not a CoreCLR runtime).
+        UnityNetStandard21,
     }
     impl DotnetVersion {
         pub fn tfm(self) -> &'static str {
-            "net10.0"
+            match self {
+                Self::Net10 => "net10.0",
+                Self::UnityNetStandard21 => "netstandard2.1",
+            }
         }
         pub fn as_env(self) -> &'static str {
-            "10"
+            match self {
+                Self::Net10 => "10",
+                Self::UnityNetStandard21 => "unity-netstandard2.1",
+            }
         }
         pub fn ilasm_tool_dir(self) -> &'static str {
-            "ilasm10-tool"
+            match self {
+                Self::Net10 => "ilasm10-tool",
+                Self::UnityNetStandard21 => "ilasm-unity-tool",
+            }
         }
     }
     impl std::str::FromStr for DotnetVersion {
@@ -109,8 +120,9 @@ pub mod runtime {
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             match s.trim() {
                 "10" | "net10" | "net10.0" => Ok(Self::Net10),
+                "unity" | "unity-netstandard2.1" | "netstandard2.1" => Ok(Self::UnityNetStandard21),
                 other => Err(format!(
-                    "--dotnet: unsupported value {other:?}; rust-dotnet 0.0.1 supports .NET 10"
+                    "--dotnet: unsupported value {other:?}; rust-dotnet 0.0.1 supports .NET 10 or Unity netstandard2.1"
                 )),
             }
         }

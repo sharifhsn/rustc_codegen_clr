@@ -75,12 +75,12 @@ const PROFILES: &[CompatibilityProfile] = &[
     },
     CompatibilityProfile {
         name: "unity-netstandard2.1",
-        support: Support::Planned,
-        host: "Unity 6 Editor plus Mono and IL2CPP players",
+        support: Support::Supported,
+        host: "Unity 6000.3.19f1 on macOS Apple Silicon: Editor plus Mono and IL2CPP players",
         managed_contract: "netstandard2.1-compatible API surface; not net10.0",
-        native_assets: "Unity plugin layout per player platform",
-        host_rids: &[],
-        evidence: "requires a restricted BCL contract and Editor plus player execution",
+        native_assets: "macOS arm64 Unity plug-in layout",
+        host_rids: &["osx-arm64"],
+        evidence: "clean EditMode calls and launched Mono/IL2CPP players pass for managed Rust and native P/Invoke",
     },
     CompatibilityProfile {
         name: "maui-android-net10",
@@ -170,12 +170,12 @@ mod tests {
     }
 
     #[test]
-    fn only_coreclr_is_fully_supported_until_host_execution_lands() {
+    fn supported_profiles_have_host_execution_evidence() {
         let supported: Vec<_> = PROFILES
             .iter()
             .filter(|profile| matches!(profile.support, Support::Supported))
             .map(|profile| profile.name)
             .collect();
-        assert_eq!(supported, ["net10-coreclr"]);
+        assert_eq!(supported, ["net10-coreclr", "unity-netstandard2.1"]);
     }
 }

@@ -1,0 +1,5 @@
+{
+  "name": "Rust.Unity.Sample.PlayMode.Tests",
+  "references": ["Rust.Unity.Sample.Runtime"],
+  "optionalUnityReferences": ["TestAssemblies"]
+}

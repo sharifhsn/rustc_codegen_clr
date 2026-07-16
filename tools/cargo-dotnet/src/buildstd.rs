@@ -14,7 +14,7 @@ use std::thread;
 
 use anyhow::{Context as _, Result, bail};
 
-use crate::context::Context;
+use crate::context::{Context, DotnetVersion};
 use crate::private_sysroot::PrivateSysroot;
 use crate::{palinject, rustflags};
 
@@ -325,7 +325,6 @@ fn base_cargo(ctx: &Context, sysroot: &PrivateSysroot) -> Command {
     let mut cmd = Command::new(&ctx.cargo);
     cmd.current_dir(&ctx.crate_dir);
     cmd.env("CARGO_HOME", &ctx.paths.cargo_home);
-    cmd.env("RCL_XMLDOC_BUILD_ID", crate::xmldoc::build_id());
     if let Some(config) = crate::overlays::ambient_cargo_config(ctx) {
         cmd.arg("--config").arg(config);
     }
@@ -388,6 +387,13 @@ fn base_cargo(ctx: &Context, sysroot: &PrivateSysroot) -> Command {
     // reads it via cilly) AND the cilly linker (a separate process: runtimeconfig + `.ver` stamps)
     // target the same runtime. Pairs with the version-matched ILASM_PATH above.
     cmd.env("DOTNET_VERSION", ctx.dotnet.as_env());
+    if matches!(ctx.dotnet, DotnetVersion::UnityNetStandard21) {
+        // Keep the serialized codegen shards and final linker on one AOT-safe ABI contract.
+        // The Unity-specific export shim avoids catch_unwind; the backend's existing NO_UNWIND
+        // lowering remains preferable to `-C panic=abort`, which changes MIR layouts in ways the
+        // backend does not yet support for build-std.
+        cmd.env("NO_UNWIND", "1");
+    }
 
     configure_managed_identity_env(&mut cmd, ctx.managed_identity());
 

@@ -234,9 +234,19 @@ impl Context {
         // host preflight (rustc/cargo present; dotnet reachable; ilasm resolved).
         host::ensure_rust_toolchain()?;
         let dotnet: DotnetVersion = args.dotnet.parse().map_err(anyhow::Error::msg)?;
-        let dotnet_heal = host::dotnet_env_adds_for(dotnet.as_env());
+        let dotnet_heal = match dotnet {
+            DotnetVersion::Net10 => host::dotnet_env_adds_for(dotnet.as_env()),
+            // The Unity target consumes the SDK's netstandard2.1 reference pack and does not
+            // require a matching CoreCLR runtime installation.
+            DotnetVersion::UnityNetStandard21 => None,
+        };
         host::ensure_dotnet(&dotnet_heal)?;
-        let ilasm = host::resolve_ilasm(&host, dotnet)?;
+        let ilasm = match dotnet {
+            DotnetVersion::Net10 => host::resolve_ilasm(&host, dotnet)?,
+            // Unity support is direct-PE only. Requiring or invoking a CoreCLR ILAsm here would
+            // stamp the wrong framework contract into the plug-in.
+            DotnetVersion::UnityNetStandard21 => None,
+        };
 
         let paths = Paths::resolve(&mode, &host, &crate_dir)?;
         let managed_project = resolve_managed_project(&crate_dir)?;
@@ -620,8 +630,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_runtime_profile_is_dotnet_10_only() {
+    fn public_runtime_profiles_include_unity_netstandard() {
         assert_eq!("10".parse::<DotnetVersion>().unwrap(), DotnetVersion::Net10);
+        assert_eq!(
+            "unity-netstandard2.1".parse::<DotnetVersion>().unwrap(),
+            DotnetVersion::UnityNetStandard21
+        );
         for unsupported in ["8", "9", "net8.0", "net9.0", "11"] {
             let error = unsupported.parse::<DotnetVersion>().unwrap_err();
             assert!(error.contains("supports .NET 10"), "{error}");

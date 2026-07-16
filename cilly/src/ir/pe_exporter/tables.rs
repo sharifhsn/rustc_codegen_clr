@@ -114,6 +114,9 @@ const ECMA_PUBLIC_KEY_TOKEN: [u8; 8] = [0xB0, 0x3F, 0x5F, 0x7F, 0x11, 0xD5, 0x0A
 /// See `bcl_public_key_token`'s doc for how this was verified.
 const EXTENSIONS_PUBLIC_KEY_TOKEN: [u8; 8] = [0xAD, 0xB9, 0x79, 0x38, 0x29, 0xDD, 0xAE, 0x60];
 
+const NETSTANDARD_PUBLIC_KEY_TOKEN: [u8; 8] = [0xCC, 0x7B, 0x13, 0xFF, 0xCD, 0x2D, 0xDD, 0x51];
+const MSCORLIB_PUBLIC_KEY_TOKEN: [u8; 8] = [0xB7, 0x7A, 0x5C, 0x56, 0x19, 0x34, 0xE0, 0x89];
+
 /// The maximum class-name length the CoreCLR `ilasm` accepts ("Full class name too long
 /// (N characters, 1023 allowed)"); ported from `il_exporter::ILASM_MAX_CLASS_NAME` so `tables.rs`
 /// applies the identical shortening at both TypeDef- and TypeRef-name construction time (no
@@ -760,6 +763,18 @@ impl MetadataBuilder {
         self.type_def[idx].method_list = u32::try_from(self.method_def.len() + 1).unwrap();
     }
 
+    /// Applies top-level TypeDef visibility after row creation. `add_type_def` historically
+    /// defaulted every row to public; preserving the Assembly IR's access is required for
+    /// implementation-only compatibility types and keeps direct PE aligned with the IL exporter.
+    pub fn set_type_def_access(&mut self, tok: Token, access: crate::Access) {
+        assert_eq!(tok.table(), Token::TABLE_TYPE_DEF, "not a TypeDef token");
+        let idx = usize::try_from(tok.rid()).unwrap() - 1;
+        self.type_def[idx].flags &= !0x7; // TypeAttributes.VisibilityMask
+        if matches!(access, crate::Access::Extern | crate::Access::Public) {
+            self.type_def[idx].flags |= 0x1; // Public; otherwise NotPublic (0)
+        }
+    }
+
     /// Adds a `private explicit ansi sealed` `TypeDef` (§II.22.37) sized to exactly `size` bytes
     /// with `.pack 1` — the "blob-sized valuetype" shape a const-data buffer's synthetic
     /// `__rcl_const_blob_{size}` carrier type needs (see `docs/PE_EMISSION_PLAN.md`'s FieldRVA-
@@ -775,9 +790,10 @@ impl MetadataBuilder {
     /// the one new (private, sealed, explicit-layout, fixed-size) shape as its own entry point
     /// instead of threading a visibility flag through everything that doesn't need it.
     pub fn add_blob_sized_valuetype(&mut self, name: &str, extends: Token, size: u32) -> Token {
+        let (namespace, name) = split_namespace(name);
         let name = dotnet_class_name(name);
         let name_off = self.strings.intern(&name);
-        let namespace_off = self.strings.intern("");
+        let namespace_off = self.strings.intern(namespace);
         let extends_coded = encode_type_def_or_ref_token(extends);
         // §II.23.1.15 `TypeAttributes`: 0x0 NotPublic (private) | 0x100 Sealed | 0x10 ExplicitLayout.
         let flags: u32 = 0x100 | 0x10;
@@ -1770,29 +1786,7 @@ impl MetadataBuilder {
     /// `ThreadStaticAttribute` (a BCL type). Cached separately from the generic
     /// `assembly_ref`/`type_ref` interning caches since it has a fixed identity.
     fn system_runtime_assembly_ref(&mut self) -> Token {
-        const NAME: &str = "System.Runtime";
-        for (i, row) in self.assembly_ref.iter().enumerate() {
-            if self.strings_eq(row.name, NAME) {
-                return Token::new(Token::TABLE_ASSEMBLY_REF, u32::try_from(i + 1).unwrap());
-            }
-        }
-        // Uses the tuple form since `AssemblyRefRow`'s columns are raw `u16`s (§II.22.5), not the
-        // `"8:0:0:0"` string the textual exporter interpolates into IL.
-        //
-        // Gated on `self.is_lib` exactly like `il_exporter`'s `if self.is_lib { … }` (mod.rs:70):
-        // an executable gets a name-only (`0.0.0.0`) reference — mirrors ilasm's own inferred-extern
-        // default for an `.exe`'s implicit `[[assembly]Type` uses — while a `.dll` gets the real BCL
-        // version+token so a C# compiler can bind it directly (CS0012 otherwise). See
-        // `MetadataBuilder::is_lib`'s doc for the concrete `FileLoadException` this fixes.
-        let target = if self.is_lib {
-            AssemblyRefTarget::Bcl {
-                version: self.runtime.assembly_ver_tuple(),
-                token: ECMA_PUBLIC_KEY_TOKEN,
-            }
-        } else {
-            AssemblyRefTarget::NameOnly
-        };
-        self.assembly_ref(NAME, target)
+        self.find_or_create_assembly_ref("System.Runtime")
     }
 
     fn strings_eq(&self, off: u32, s: &str) -> bool {
@@ -2803,7 +2797,9 @@ impl TypeDefOrRefResolver for MetadataBuilder {
         }
         let class_ref = asm.class_ref(cref).clone();
         let raw_name = asm[class_ref.name()].to_string();
-        let tok = if asm.class_ref_to_def(cref).is_some() {
+        let tok = if let Some(tok) = self.unity_legacy_128_token(&raw_name) {
+            tok
+        } else if asm.class_ref_to_def(cref).is_some() {
             // Defined in this assembly: the corresponding TypeDef row must already have been
             // added by `add_type_def` (population walks class defs before any signature needs
             // to resolve one) — if not, this is a caller-ordering bug, not a spec question.
@@ -2955,7 +2951,7 @@ impl MetadataBuilder {
     /// namespaced Rust-exported type becomes uncompilable-against from C# (`CS0246: The type or
     /// namespace name 'cd_interop' could not be found`) even though it loads and runs fine at
     /// runtime (token-based resolution never notices the empty `Namespace`).
-    fn find_type_def(&self, raw_name: &str) -> Option<Token> {
+    pub(super) fn find_type_def(&self, raw_name: &str) -> Option<Token> {
         let raw_name = if raw_name == crate::ir::asm::MAIN_MODULE {
             self.public_module_full_name.as_deref().unwrap_or(raw_name)
         } else {
@@ -2978,6 +2974,18 @@ impl MetadataBuilder {
         None
     }
 
+    /// Resolve implementation-only 128-bit integer signatures through the private local carrier
+    /// installed by the Unity direct-PE exporter. Unity's netstandard2.1 facade predates
+    /// `System.Int128`/`System.UInt128`, yet dormant Rust helpers can mention them and Mono resolves
+    /// every signature on a type when loading it. The carriers intentionally provide layout only,
+    /// not arithmetic members: reachable 128-bit operations remain unsupported.
+    pub(super) fn unity_legacy_128_token(&self, raw_name: &str) -> Option<Token> {
+        (self.runtime == DotnetRuntime::UnityNetStandard21
+            && matches!(raw_name, "System.Int128" | "System.UInt128"))
+        .then(|| self.find_type_def(raw_name))
+        .flatten()
+    }
+
     /// Finds-or-creates an `AssemblyRef` row for `name`, applying the same BCL-vs-consumer split
     /// as `il_exporter`'s `bcl_public_key_token` (this local port avoids depending on
     /// `il_exporter`, per the hard constraint that `pe_exporter` may not import it). Public so
@@ -2986,6 +2994,18 @@ impl MetadataBuilder {
     /// calling the always-inserts [`MetadataBuilder::assembly_ref`] directly and creating
     /// duplicate rows for repeated bootstrap references.
     pub fn find_or_create_assembly_ref(&mut self, name: &str) -> Token {
+        // A normal netstandard2.1 C# library scopes framework TypeRefs through the single
+        // `netstandard, Version=2.1.0.0` facade. Unity ships that exact reference facade and does
+        // not promise CoreCLR implementation assemblies such as System.Private.CoreLib. Keep the
+        // lowering-time assembly labels as useful API provenance, but collapse every BCL label to
+        // the facade at PE emission for the Unity profile.
+        let name = if self.runtime == DotnetRuntime::UnityNetStandard21
+            && bcl_public_key_token(name).is_some()
+        {
+            "netstandard"
+        } else {
+            name
+        };
         for (i, row) in self.assembly_ref.iter().enumerate() {
             if self.strings_eq(row.name, name) {
                 return Token::new(Token::TABLE_ASSEMBLY_REF, u32::try_from(i + 1).unwrap());
@@ -2995,8 +3015,12 @@ impl MetadataBuilder {
             // Same explicitly selected runtime as `system_runtime_assembly_ref`. Also gated on
             // `self.is_lib` for the same reason — see `MetadataBuilder::is_lib`'s doc.
             AssemblyRefTarget::Bcl {
-                version: self.runtime.assembly_ver_tuple(),
-                token,
+                version: bcl_assembly_version(self.runtime, name),
+                token: if self.runtime == DotnetRuntime::UnityNetStandard21 {
+                    bcl_assembly_token(self.runtime, name)
+                } else {
+                    token
+                },
             }
         } else {
             AssemblyRefTarget::NameOnly
@@ -3032,6 +3056,29 @@ fn bcl_public_key_token(name: &str) -> Option<[u8; 8]> {
         return Some(EXTENSIONS_PUBLIC_KEY_TOKEN);
     }
     None
+}
+
+fn bcl_assembly_version(runtime: DotnetRuntime, name: &str) -> (u16, u16, u16, u16) {
+    if runtime == DotnetRuntime::UnityNetStandard21 {
+        return match name {
+            "System.Runtime" => (4, 1, 2, 0),
+            "netstandard" => (2, 1, 0, 0),
+            "mscorlib" => (4, 0, 0, 0),
+            _ => (4, 0, 0, 0),
+        };
+    }
+    runtime.assembly_ver_tuple()
+}
+
+fn bcl_assembly_token(runtime: DotnetRuntime, name: &str) -> [u8; 8] {
+    if runtime == DotnetRuntime::UnityNetStandard21 {
+        return match name {
+            "netstandard" => NETSTANDARD_PUBLIC_KEY_TOKEN,
+            "mscorlib" => MSCORLIB_PUBLIC_KEY_TOKEN,
+            _ => ECMA_PUBLIC_KEY_TOKEN,
+        };
+    }
+    bcl_public_key_token(name).unwrap_or(ECMA_PUBLIC_KEY_TOKEN)
 }
 
 /// Splits an EXTERNAL type's dotted name into a metadata `TypeNamespace`/`TypeName` pair
@@ -3132,10 +3179,52 @@ impl TokenSink for MetadataBuilder {
             // its declaring ClassRef, mirroring `il_exporter`'s BCL-call rendering.
             let method_ref = asm[*method].clone();
             let class_tok = self.class_ref_token(asm, method_ref.class());
+            let class_name = asm[asm[method_ref.class()].name()].to_string();
             let name = asm[method_ref.name()].to_string();
             let sig = method_ref.sig();
             let mut blob = Vec::new();
-            let fnsig = asm[sig].clone();
+            let mut fnsig = asm[sig].clone();
+            // Unity's netstandard facade exposes the pointer-sized Interlocked overloads as
+            // `IntPtr`, not `UIntPtr`. The CLI evaluation stack uses the same native-int shape for
+            // both, but IL2CPP resolves MemberRefs by their exact metadata signature and rejects
+            // the unsigned spelling before reachability analysis. Project only this BCL seam to
+            // signed native integers; Rust-visible atomic semantics and generated instructions are
+            // unchanged.
+            if self.runtime == DotnetRuntime::UnityNetStandard21
+                && class_name == "System.Threading.Interlocked"
+            {
+                let project = |tpe: Type, asm: &mut Assembly| match tpe {
+                    Type::Int(crate::ir::Int::U32) => Type::Int(crate::ir::Int::I32),
+                    Type::Int(crate::ir::Int::U64) => Type::Int(crate::ir::Int::I64),
+                    Type::Int(crate::ir::Int::USize) => Type::Int(crate::ir::Int::ISize),
+                    Type::Ref(inner) if asm[inner] == Type::Int(crate::ir::Int::U32) => {
+                        let signed = asm.alloc_type(Type::Int(crate::ir::Int::I32));
+                        Type::Ref(signed)
+                    }
+                    Type::Ref(inner) if asm[inner] == Type::Int(crate::ir::Int::U64) => {
+                        let signed = asm.alloc_type(Type::Int(crate::ir::Int::I64));
+                        Type::Ref(signed)
+                    }
+                    Type::Ref(inner) if asm[inner] == Type::Int(crate::ir::Int::USize) => {
+                        let signed = asm.alloc_type(Type::Int(crate::ir::Int::ISize));
+                        Type::Ref(signed)
+                    }
+                    Type::Ptr(inner) if asm[inner] == Type::Int(crate::ir::Int::USize) => {
+                        let signed = asm.alloc_type(Type::Int(crate::ir::Int::ISize));
+                        Type::Ptr(signed)
+                    }
+                    _ => tpe,
+                };
+                fnsig = crate::ir::FnSig::new(
+                    fnsig
+                        .inputs()
+                        .iter()
+                        .copied()
+                        .map(|tpe| project(tpe, asm))
+                        .collect::<Vec<_>>(),
+                    project(*fnsig.output(), asm),
+                );
+            }
             let is_static = method_ref.kind() == crate::ir::cilnode::MethodKind::Static;
             let mut convention = if is_static {
                 sig::SIG_DEFAULT
@@ -3339,6 +3428,54 @@ fn decode_type_def_or_ref(coded: u32) -> Token {
 mod tests {
     use super::*;
     use crate::ir::{Access, Float, Int, cilnode::MethodKind};
+
+    #[test]
+    fn unity_framework_assembly_identities_match_netstandard_profile() {
+        let runtime = DotnetRuntime::UnityNetStandard21;
+        assert_eq!(
+            bcl_assembly_version(runtime, "System.Runtime"),
+            (4, 1, 2, 0)
+        );
+        assert_eq!(
+            bcl_assembly_token(runtime, "System.Runtime"),
+            ECMA_PUBLIC_KEY_TOKEN
+        );
+        assert_eq!(bcl_assembly_version(runtime, "netstandard"), (2, 1, 0, 0));
+        assert_eq!(
+            bcl_assembly_token(runtime, "netstandard"),
+            NETSTANDARD_PUBLIC_KEY_TOKEN
+        );
+        assert_eq!(bcl_assembly_version(runtime, "mscorlib"), (4, 0, 0, 0));
+        assert_eq!(
+            bcl_assembly_token(runtime, "mscorlib"),
+            MSCORLIB_PUBLIC_KEY_TOKEN
+        );
+        assert_eq!(
+            bcl_assembly_version(DotnetRuntime::Net10, "System.Runtime"),
+            (10, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn unity_framework_references_collapse_to_the_netstandard_facade() {
+        let mut builder = MetadataBuilder::new();
+        builder.set_is_lib(true);
+        builder.set_runtime(DotnetRuntime::UnityNetStandard21);
+
+        let runtime = builder.find_or_create_assembly_ref("System.Runtime");
+        let corelib = builder.find_or_create_assembly_ref("System.Private.CoreLib");
+        let collections = builder.find_or_create_assembly_ref("System.Collections");
+
+        assert_eq!(runtime, corelib);
+        assert_eq!(runtime, collections);
+        assert_eq!(builder.assembly_ref.len(), 1);
+        let row = &builder.assembly_ref[0];
+        assert!(builder.strings_eq(row.name, "netstandard"));
+        assert_eq!(
+            (row.major, row.minor, row.build, row.revision),
+            (2, 1, 0, 0)
+        );
+    }
 
     #[test]
     fn token_encodes_table_and_rid() {

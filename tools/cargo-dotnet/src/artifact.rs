@@ -102,7 +102,12 @@ pub fn locate(json: &str, ctx: &Context) -> Result<Artifact> {
             .map(|identity| identity.assembly_name.clone())
             .unwrap_or_else(|| cargo_stem.clone());
         let dll = so.with_file_name(format!("{stem}.dll"));
-        fs::copy(&so, &dll).with_context(|| format!("cp {} -> {}", so.display(), dll.display()))?;
+        // Some target/linker combinations (notably the Unity netstandard profile) already
+        // report the managed assembly under its public `<assembly>.dll` name.  In that case
+        // `dll` and `so` are the same path; attempting `fs::copy` would fail with “same file”
+        // even though artifact discovery succeeded.  Keep the existing file and only copy
+        // when Cargo gave us an internal/alternate filename.
+        copy_library_image(&so, &dll)?;
         if let Some(pdb) = copy_library_pdb(&so, &dll)? {
             eprintln!("== lib PDB: {} ==", pdb.display());
         }
@@ -140,6 +145,14 @@ pub fn locate(json: &str, ctx: &Context) -> Result<Artifact> {
     }
 
     Ok(Artifact::None)
+}
+
+fn copy_library_image(so: &std::path::Path, dll: &std::path::Path) -> Result<()> {
+    if so == dll {
+        return Ok(());
+    }
+    fs::copy(so, dll).with_context(|| format!("cp {} -> {}", so.display(), dll.display()))?;
+    Ok(())
 }
 
 /// Promote the linker's PDB from Cargo's internal library name (`libfoo.pdb`) to the public
@@ -244,5 +257,15 @@ mod tests {
 
         let promoted = copy_library_pdb(&so, &dll).unwrap().unwrap();
         assert_eq!(fs::read(promoted).unwrap(), b"managed-pdb");
+    }
+
+    #[test]
+    fn library_image_copy_is_a_noop_when_cargo_already_reports_public_dll() {
+        let temp = tempfile::tempdir().unwrap();
+        let dll = temp.path().join("Managed.Probe.dll");
+        fs::write(&dll, b"pe").unwrap();
+
+        copy_library_image(&dll, &dll).unwrap();
+        assert_eq!(fs::read(&dll).unwrap(), b"pe");
     }
 }

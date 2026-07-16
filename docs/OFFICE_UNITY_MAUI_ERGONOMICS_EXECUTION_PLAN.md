@@ -31,6 +31,12 @@ Two separate journeys are required:
 2. **Native Rust Unity plugin:** package a narrow C ABI per Unity platform and generate a clean C#
    wrapper. This is useful sooner, but remains native P/Invoke and is not evidence for managed Rust.
 
+The complete target architecture, compiler/profile split, Unity package UX, IL2CPP/linker work,
+native matrix, sample game, and promotion gates are specified in
+[`UNITY_RUST_STRATEGY.md`](UNITY_RUST_STRATEGY.md). The managed profile, scaffold, attachment,
+native staging, linker roots, and deterministic package surface are implemented. Licensed Editor,
+launched-player, and IL2CPP acceptance remain the promotion gates.
+
 ### .NET MAUI
 
 MAUI is a profile matrix rather than one runtime:
@@ -311,9 +317,9 @@ MAUI is a profile matrix rather than one runtime:
   executes both its managed Rust API and a vendored host-RID native Rust library through P/Invoke.
   The build emits an exact source/relative-destination asset manifest, so MSBuild preserves native,
   helper, and satellite-resource layouts without globbing Cargo output or requiring hand-copying.
-- [ ] `cargo dotnet attach-unity <UnityProject> --rust-crate <path>` only after the
-  `netstandard2.1` managed profile is proven; copy/reference artifacts and preserve Unity `.meta`
-  semantics deterministically.
+- [x] `cargo dotnet unity attach PROJECT MANAGED_CRATE` stages the managed integration and records
+  a receipt; optional native staging and deterministic UPM materialization are provided by
+  `unity native` and `unity package`. Editor/player/IL2CPP promotion remains evidence-gated.
 - [ ] Attachment must add/validate the MSBuild import, `<RustCrate>`, target profile, generated
   container opt-ins, native assets, namespace/assembly identity, and starter service without
   overwriting unrelated project content. Import, crate/profile, container opt-in, native-asset,

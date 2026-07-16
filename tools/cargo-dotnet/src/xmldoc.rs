@@ -11,38 +11,84 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
+use sha2::{Digest as _, Sha256};
 
 use crate::context::{Context, ManagedIdentity};
 
-/// Delete proc-macro scratch before one product build.
+/// Prepare the proc-macro documentation inventory for the current source snapshot.
 ///
-/// [`build_id`] is injected into every documentation-producing macro expansion, so Cargo
-/// re-expands the crate after this removal even when the Rust source itself is unchanged. The
-/// human-readable and JSON artifact-locator passes share one build ID; duplicate entries from
-/// those passes are de-duplicated by member ID in [`generate`].
-pub fn clear_scratch(ctx: &Context) {
-    let _ = fs::remove_dir_all(ctx.crate_dir.join("target").join("dotnet_xmldoc"));
+/// The old per-process timestamp deliberately forced rustc to re-expand every export on every
+/// invocation, turning a no-op Unity refresh into a multi-second managed rebuild. A deterministic
+/// source ID gives Cargo its normal incremental behavior while still clearing removed/renamed
+/// members whenever the consumer source or export-macro implementation changes.
+pub fn prepare(ctx: &Context) -> Result<()> {
+    let scratch = ctx.crate_dir.join("target").join("dotnet_xmldoc");
+    let marker = scratch.join(".source-id");
+    let current = source_id(ctx)?;
+    if fs::read_to_string(&marker).ok().as_deref() != Some(current.as_str()) {
+        let _ = fs::remove_dir_all(&scratch);
+        fs::create_dir_all(&scratch)?;
+        fs::write(marker, &current)?;
+    }
+    Ok(())
 }
 
-/// One token for all Cargo passes launched by this driver process.
-///
-/// Macro expansions include `option_env!("RCL_XMLDOC_BUILD_ID")`, so Cargo records this value as
-/// an input and re-expands the crate after `clear_scratch`, even when no Rust source changed. The
-/// normal build and JSON artifact-locator pass share the same token and therefore do not rebuild
-/// each other.
-pub fn build_id() -> &'static str {
-    static BUILD_ID: OnceLock<String> = OnceLock::new();
-    BUILD_ID.get_or_init(|| {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        format!("{}-{nanos}", std::process::id())
-    })
+fn source_id(ctx: &Context) -> Result<String> {
+    let mut files = Vec::new();
+    collect_source_files(&ctx.crate_dir, &ctx.crate_dir, &mut files)?;
+    for candidate in [
+        ctx.paths.sdk_crates_root.join("dotnet_macros"),
+        ctx.paths.sdk_crates_root.join("crates/dotnet_macros"),
+    ] {
+        if candidate.is_dir() {
+            collect_source_files(&candidate, &candidate, &mut files)?;
+            break;
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hash = Sha256::new();
+    for (logical, path) in files {
+        hash.update(logical.as_bytes());
+        hash.update([0]);
+        hash.update(fs::read(&path).with_context(|| format!("read {}", path.display()))?);
+        hash.update([0]);
+    }
+    Ok(hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn collect_source_files(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<(String, std::path::PathBuf)>,
+) -> Result<()> {
+    let mut entries: Vec<_> = fs::read_dir(current)?.collect::<std::result::Result<_, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            if entry.file_name() != "target" && entry.file_name() != ".git" {
+                collect_source_files(root, &path, files)?;
+            }
+            continue;
+        }
+        let include = path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml")
+            || path.extension().and_then(|extension| extension.to_str()) == Some("rs");
+        if include {
+            files.push((
+                path.strip_prefix(root)?
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                path,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One scraped doc entry: an exact ECMA-334 member-ID plus a macro-generated, escaped XML body.

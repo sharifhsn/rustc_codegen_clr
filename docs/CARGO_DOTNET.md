@@ -19,7 +19,7 @@ development and archaeology, but it is not part of this release contract.
 cargo dotnet setup --from-repo PATH
 cargo dotnet profiles [--json]
 cargo dotnet doctor [MESSAGE_OR_LOG] [--workspace PATH] [--json]
-cargo dotnet new PATH --app|--lib|--plugin|--excel|--webapi|--worker|--winui|--maui
+cargo dotnet new PATH --app|--lib|--plugin|--excel|--webapi|--worker|--winui|--maui|--unity
 cargo dotnet attach HOST.csproj --rust-crate PATH [--containers] [--dry-run]
 cargo dotnet build [PATH]
 cargo dotnet run [PATH] [-- PROGRAM_ARGS...]
@@ -36,6 +36,11 @@ cargo dotnet bundle create --home PATH --out SDK.zip
 cargo dotnet bundle verify SDK.zip
 cargo dotnet bundle install SDK.zip [--home PATH] [--force]
 cargo dotnet capabilities --manifest acceptance/capabilities.toml
+cargo dotnet unity doctor --project PROJECT [--editor PATH] [--json]
+cargo dotnet unity build [PROJECT] [RUST_CRATE]
+cargo dotnet unity native [PROJECT] [NATIVE_CRATE] --export NAME ...
+cargo dotnet unity attach PROJECT MANAGED_CRATE [--native-crate NATIVE_CRATE --native-export NAME ... --force]
+cargo dotnet unity package PROJECT OUTPUT [--name NAME --version VERSION --force]
 ```
 
 Run `cargo dotnet <command> --help` for the complete flags accepted by a command.
@@ -119,9 +124,76 @@ the generated C# edge still owns proven worksheet registration, range/error conv
 policy. Web API and Worker have runtime acceptance on the supported CoreCLR hosts. WinUI and MAUI
 remain planned profiles until Windows CI builds and launches them with the required workloads.
 
-Run `cargo dotnet profiles` for the current host-by-host support contract. Profile names describe a
-real loader/runtime contract, not merely a target framework string; planned Unity and mobile
-profiles are listed but rejected as supported until their runtime acceptance passes.
+Run `cargo dotnet profiles` for the current host-by-host support contract. The Unity profile targets
+`netstandard2.1`, emits a real public managed facade (no CoreCLR runtimeconfig), and automatically
+uses `NO_UNWIND=1`; a panic is terminal rather than a managed exception. The pinned Unity
+6000.3.19f1 macOS Apple-Silicon workflow is proven in EditMode and launched Mono and IL2CPP players
+for both the managed-export and native-P/Invoke paths. Native staging is currently macOS-only. No
+Windows, Linux, mobile, Web, or console Unity support is claimed.
+
+### Unity workflow
+
+Create a starter project:
+
+```bash
+cargo dotnet new ./my-rust-game --unity
+cd ./my-rust-game
+cargo dotnet unity build . ./rustlib
+cargo dotnet unity doctor --project .
+```
+
+Open the generated project in the pinned Unity editor and press Play. Its Editor bootstrap creates
+the demo scene, attaches the generated `CargoDotnetUnity` component, and adds the scene to Build
+Settings without touching user-authored scenes. Its readable C# calls the public managed Rust
+facade directly, so the happy path does not depend on runtime reflection. The first build also
+creates the project-relative attachment receipt used by `doctor` and later inferred-path builds.
+The build command stages the managed
+DLL, PDB, XML documentation, helper closure, and `Assets/RustDotnetGenerated/link.xml`; failed
+builds never replace the last known-good artifact. The scaffold also includes an optional native Rust kernel and a ready
+`DllImport` probe. On macOS, stage it with:
+
+```bash
+cargo dotnet unity native . ./native --export rust_native_multiply
+```
+
+The isolated acceptance fixture is reproducible with:
+
+```bash
+UNITY_BIN=/Applications/Unity/Hub/Editor/6000.3.19f1/Unity.app/Contents/MacOS/Unity \
+  feasibility/unity_sample/run_acceptance.sh
+```
+
+It retains Editor NUnit XML, build logs, and launched-player logs and requires the same managed and
+native result marker from both Mono and IL2CPP instead of treating compilation as runtime proof.
+It runs both EditMode and PlayMode tests.
+
+The public scaffold and package path has a second, clean-project acceptance gate:
+
+```bash
+UNITY_BIN=/Applications/Unity/Hub/Editor/6000.3.19f1/Unity.app/Contents/MacOS/Unity \
+  feasibility/unity_clean_acceptance.sh
+```
+
+That runner starts from `cargo dotnet new --unity`, proves automatic attachment and scene creation,
+launches Mono and IL2CPP players, materializes a UPM package, removes the Rust source crates, and
+imports and launches that package from another clean Unity project using only an embedded relative
+package reference.
+
+For an existing Unity project, `unity attach` records managed and optional native crate paths in
+a receipt. Follow-up `unity build` and `unity native` calls may omit crate paths and infer them
+from that receipt (managed build otherwise defaults to `./rustlib`). Native staging requires
+`--export` names and validates architecture and symbols before promotion. Failed builds leave the
+last known-good assets in place because generated writes are staged in a temporary directory.
+
+`unity package PROJECT OUTPUT` materializes a deterministic directory-based UPM package. OUTPUT
+must not overlap the project root or `Assets`; a project-local `Packages/...` destination is
+supported. A non-empty output requires `--force`, and replacement is allowed only when an existing
+`package.json` has the requested package name. The package includes an Editor-only hook that
+materializes its preservation roots into project-side `Assets/RustDotnetGenerated/link.xml` only
+when the content changes. Current runtime evidence is limited to Unity 6000.3.19f1 on macOS Apple
+Silicon, where EditMode, PlayMode, direct-scaffold and clean-UPM-consumer launched Mono/IL2CPP
+players pass. Do not infer other Unity versions or platform support without licensed acceptance
+runs.
 
 For an existing SDK-style project, `cargo dotnet attach` inserts one clearly marked,
 idempotent block containing the validated compatibility profile, `<RustCrate>`, and conditional

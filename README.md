@@ -72,10 +72,17 @@ result with ordinary Rust code.
   64-bit `.xll` (`cargo dotnet new ./risk-engine --excel`)
 - Executable ASP.NET Core and Worker scaffolds (`--webapi`, `--worker`) whose MSBuild projects
   rebuild and reference a schema-1 managed Rust backend automatically
+- A macOS Apple-Silicon Unity preview: `cargo dotnet new ./game --unity`,
+  `cargo dotnet unity doctor --project ./game`, and `cargo dotnet unity build ./game` produce a `netstandard2.1` managed
+  facade with Unity-safe no-unwind exports. On pinned Unity `6000.3.19f1`, the acceptance fixture
+  proves managed Rust and native Rust P/Invoke in EditMode, PlayMode, and launched Mono and IL2CPP
+  macOS players. A second clean-project gate installs the generated UPM package and launches both
+  backends without Rust source-tree paths. Other Unity versions, operating systems, and
+  architectures remain unclaimed.
 - Windows-first WinUI 3 and MAUI scaffolds (`--winui`, `--maui`), kept at planned status until
   Windows workload build-and-launch evidence exists; mobile MAUI targets are not claimed
-- Evidence-gated host contracts visible through `cargo dotnet profiles`—including honest preview,
-  planned, and unsupported Office/Unity/MAUI combinations
+- Evidence-gated host contracts visible through `cargo dotnet profiles`, with honest preview and
+  unsupported Office/Unity/MAUI combinations
 - An alternate C exporter from the same compiler IR
 
 The public 0.0.1 SDK supports one deliberately narrow configuration:
@@ -88,6 +95,10 @@ The public 0.0.1 SDK supports one deliberately narrow configuration:
 | Windows | x64 |
 | Rust | pinned `nightly-2026-06-17` |
 
+Unity is a separate preview profile, not part of the .NET 10 SDK matrix: Unity `6000.3.19f1`,
+macOS Apple Silicon, managed `netstandard2.1`; native staging is currently macOS-only. Windows,
+Linux, Android, iOS, Web, and consoles are not claimed.
+
 The compiler retains some older-runtime compatibility code, but .NET 8 and 9 are not supported by
 the 0.0.1 SDK. A single public runtime profile keeps generated target frameworks, linker metadata,
 CoreCLR tools, examples, and diagnostics consistent.
@@ -98,6 +109,8 @@ CoreCLR tools, examples, and diagnostics consistent.
 - [`docs/CARGO_DOTNET.md`](docs/CARGO_DOTNET.md) — command reference and troubleshooting
 - [`docs/OFFICE_UNITY_MAUI_ERGONOMICS_EXECUTION_PLAN.md`](docs/OFFICE_UNITY_MAUI_ERGONOMICS_EXECUTION_PLAN.md)
   — honest Office, Unity, and MAUI compatibility matrix and implementation ledger
+- [`docs/UNITY_RUST_STRATEGY.md`](docs/UNITY_RUST_STRATEGY.md) — phased architecture and evidence
+  plan for Rust-first Unity games with managed Rust and optional native Rust kernels
 - [`docs/QUICKSTART_INTEROP.md`](docs/QUICKSTART_INTEROP.md) — Rust and C# interop examples
 - [`docs/INTEROP_COOKBOOK.md`](docs/INTEROP_COOKBOOK.md) — supported interop patterns
 - [`book/src/interop/native-from-rust.md`](book/src/interop/native-from-rust.md) — restore a native

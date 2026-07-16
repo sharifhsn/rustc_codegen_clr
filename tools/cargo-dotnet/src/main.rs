@@ -45,6 +45,10 @@ mod rustflags;
 mod scaffold;
 mod setup;
 mod test;
+mod unity;
+mod unity_attach;
+mod unity_native;
+mod unity_package;
 mod xmldoc;
 
 use std::ffi::OsString;
@@ -112,6 +116,7 @@ fn main() -> ExitCode {
         Cmd::New(args) => scaffold::run(args),
         Cmd::Attach(args) => attach::run(args),
         Cmd::Doctor(args) => doctor::run(args),
+        Cmd::Unity(args) => unity::run(args),
         Cmd::Test(args) => test::run(args),
         Cmd::Setup(args) => setup::run(args),
         Cmd::Bundle(args) => bundle::run(args),
@@ -194,6 +199,7 @@ fn inject_prog_args(cmd: &mut Cmd, prog_args: Vec<String>) {
         | Cmd::New(_)
         | Cmd::Attach(_)
         | Cmd::Doctor(_)
+        | Cmd::Unity(_)
         | Cmd::Setup(_)
         | Cmd::Bundle(_)
         | Cmd::Pack(_)

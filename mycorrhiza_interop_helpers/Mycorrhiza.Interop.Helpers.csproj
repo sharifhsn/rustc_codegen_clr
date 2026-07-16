@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFrameworks>net8.0;netstandard2.1</TargetFrameworks>
+    <LangVersion>12.0</LangVersion>
     <Nullable>enable</Nullable>
     <AssemblyName>Mycorrhiza.Interop.Helpers</AssemblyName>
     <!-- cargo-dotnet redirects bin/obj into its immutable-input-safe cache. Keep any project-local

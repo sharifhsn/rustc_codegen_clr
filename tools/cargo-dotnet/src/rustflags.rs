@@ -60,8 +60,13 @@ pub fn assemble(
         })
         .collect::<String>();
     let base = format!("{base}{remaps}");
+    let dotnet_cfg = dotnet_version
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
     let base = format!(
-        "{base} --cfg cd_dotnet_{dotnet_version} --check-cfg=cfg(cd_dotnet_{dotnet_version})"
+        "{base} --cfg cd_dotnet_{dotnet_cfg} --check-cfg=cfg(cd_dotnet_{dotnet_cfg}) \
+         --check-cfg=cfg(cd_dotnet_unity_netstandard2_1)"
     );
     let base = match source_link_url {
         Some(url) => {
@@ -101,6 +106,22 @@ mod tests {
         assert_ne!(net8, net10);
         assert!(net8.contains("--cfg cd_dotnet_8 --check-cfg=cfg(cd_dotnet_8)"));
         assert!(net10.contains("--cfg cd_dotnet_10 --check-cfg=cfg(cd_dotnet_10)"));
+    }
+
+    #[test]
+    fn unity_runtime_fingerprint_is_a_valid_cfg_identifier() {
+        let flags = assemble(
+            Path::new("/missing/backend"),
+            Path::new("/missing/linker"),
+            Path::new("/missing/sdk"),
+            "unity-netstandard2.1",
+            &[],
+            None,
+        );
+        assert!(flags.contains(
+            "--cfg cd_dotnet_unity_netstandard2_1 --check-cfg=cfg(cd_dotnet_unity_netstandard2_1)"
+        ));
+        assert!(!flags.contains("cd_dotnet_unity-netstandard"));
     }
 
     #[test]

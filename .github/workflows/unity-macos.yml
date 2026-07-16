@@ -1,0 +1,53 @@
+name: Unity macOS acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      unity_editor:
+        description: Pinned Unity 6000.3.19f1 editor executable
+        required: true
+        default: /Applications/Unity/Hub/Editor/6000.3.19f1/Unity.app/Contents/MacOS/Unity
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unity-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos-apple-silicon:
+    # Unity licensing and the pinned IL2CPP/Xcode installation live on the evidence runner.
+    runs-on: [self-hosted, macOS, ARM64, unity-6000.3.19f1]
+    timeout-minutes: 180
+    env:
+      UNITY_BIN: ${{ inputs.unity_editor }}
+      UNITY_ACCEPTANCE_ROOT: ${{ runner.temp }}/rust-dotnet-unity-clean
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build product CLI and linker
+        run: cargo build --release -p cargo-dotnet -p cilly
+
+      - name: Product-shaped Unity fixture
+        run: feasibility/unity_sample/run_acceptance.sh "$UNITY_BIN"
+
+      - name: Clean scaffold and UPM consumer
+        run: feasibility/unity_clean_acceptance.sh "$UNITY_BIN"
+
+      - name: Upload retained Unity evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unity-6000.3.19f1-macos-arm64-${{ github.run_id }}
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            feasibility/unity_sample/Builds/
+            ${{ env.UNITY_ACCEPTANCE_ROOT }}/producer/game/*-build.log
+            ${{ env.UNITY_ACCEPTANCE_ROOT }}/producer/game/*-player.log
+            ${{ env.UNITY_ACCEPTANCE_ROOT }}/consumer/game/*-build.log
+            ${{ env.UNITY_ACCEPTANCE_ROOT }}/consumer/game/*-player.log
+            ${{ env.UNITY_ACCEPTANCE_ROOT }}/com.example.rustgame/package.json

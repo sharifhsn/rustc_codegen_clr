@@ -54,13 +54,9 @@ fn run_native(ctx: &Context, prog_args: &[String]) -> Result<i32> {
     // that would fail at runtime with `FileNotFoundException` anyway. A no-op for crates that
     // never ran `add-nuget`; fails fast with an actionable error under `--offline`/`--frozen`.
     nuget::ensure_staged(ctx)?;
-    // 2.5. Clear stale managed-API XML-doc scratch entries. `dotnet_macros` APPENDS one
-    // entry per member at proc-macro-expansion time (it can only ever append, never knows about
-    // previous runs), so a stale file from an earlier build would silently accumulate duplicate
-    // and removed entries. `RCL_XMLDOC_BUILD_ID` is a per-driver-process Cargo input on every
-    // documentation-producing expansion, so deleting the directory forces one fresh inventory;
-    // the normal and JSON locator passes share the token and do not rebuild each other.
-    xmldoc::clear_scratch(ctx);
+    // 2.5. Refresh managed-API XML-doc scratch only when its source snapshot changed. This keeps
+    // removed members correct without forcing every no-op Unity refresh through rustc again.
+    xmldoc::prepare(ctx)?;
     // 3. build-std with the backend; returns the JSON message stream.
     let build_trace = crate::parallel_trace::StageGuard::enter(ctx, "build")?;
     let json = buildstd::build_with_sysroot(ctx, &private_sysroot)?;

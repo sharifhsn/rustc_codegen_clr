@@ -606,6 +606,17 @@ impl MethodDef {
         self.class
     }
 
+    /// Rehomes this definition onto another class during a final-link projection.
+    ///
+    /// This is deliberately not a general lowering-time mutation: a method's owning class is
+    /// part of its [`MethodRef`] identity, so callers must re-intern the definition with
+    /// [`Assembly::new_method`] after changing it. The Unity/public-facade projection uses this
+    /// on a cloned definition while leaving the original implementation and identity in place
+    /// behind a tiny public forwarding method.
+    pub(crate) fn set_class(&mut self, class: ClassDefIdx) {
+        self.class = class;
+    }
+
     #[must_use]
     pub fn name(&self) -> Interned<IString> {
         self.name

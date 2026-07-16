@@ -663,7 +663,15 @@ fn main() {
     cilly::builtins::unaligned_read(&mut final_assembly, &mut overrides);
 
     cilly::builtins::casts::insert_casts(&mut final_assembly, &mut overrides);
-    cilly::builtins::insert_heap(&mut final_assembly, &mut overrides, c_mode, pool_alloc);
+    let unity_netstandard =
+        effective_abi_config.dotnet_runtime() == DotnetRuntime::UnityNetStandard21;
+    cilly::builtins::insert_heap(
+        &mut final_assembly,
+        &mut overrides,
+        c_mode,
+        pool_alloc,
+        unity_netstandard,
+    );
     cilly::builtins::rust_assert(&mut final_assembly, &mut overrides);
     cilly::builtins::int128::generate_int128_ops(&mut final_assembly, &mut overrides, c_mode);
     cilly::builtins::int128::i128_mul_ovf_check(&mut final_assembly, &mut overrides);
@@ -726,7 +734,12 @@ fn main() {
         cilly::builtins::argc_argv_init(&mut final_assembly, &mut overrides);
         // .NET PAL BCL bindings (rcl_dotnet_alloc / _free / _write) used by the
         // std-side dotnet PAL. .NET-only: they emit calls into the BCL.
-        cilly::builtins::dotnet::insert_dotnet_pal(&mut final_assembly, &mut overrides, pool_alloc);
+        cilly::builtins::dotnet::insert_dotnet_pal(
+            &mut final_assembly,
+            &mut overrides,
+            pool_alloc,
+            unity_netstandard,
+        );
         // POSIX/libc-over-.NET shim (the proof slice): int-fd⇄GCHandle fd-table +
         // thread-local errno + the bare POSIX C-ABI symbol cluster (socket/read/
         // epoll_*/…), each re-packaging an existing rcl_dotnet_* body. .NET-only;
@@ -788,14 +801,19 @@ fn main() {
         if hidden != 0 {
             println!("==> Hid {hidden} internal MainModule methods from the public CLR API");
         }
-    }
-    if linker_config.target == OutputTarget::DotNet && !linker_config.direct_pe {
         if let Some(public_type_name) = linker_config
             .managed_identity
             .as_ref()
             .and_then(|identity| identity.module_full_name.as_deref())
         {
-            final_assembly = final_assembly.project_main_module(public_type_name);
+            let projected = final_assembly.project_main_module_exports(public_type_name);
+            println!(
+                "==> Projected {projected} managed export(s) onto public facade {public_type_name}"
+            );
+            // Facade projection demotes the original MainModule exports to assembly visibility.
+            // Recompute reachability now so implementation types that were roots only before the
+            // projection do not leak into constrained consumers such as UnityLinker/IL2CPP.
+            final_assembly.eliminate_dead_code_after_facade_projection(public_type_name);
         }
     }
     let (mut final_assembly, compaction) = final_assembly.compact();
@@ -959,10 +977,10 @@ fn main() {
         let pe_options = cilly::pe_exporter::export::ExportOptions {
             is_dll: is_lib,
             assembly_name: asm_name,
-            public_module_full_name: linker_config
-                .managed_identity
-                .as_ref()
-                .and_then(|identity| identity.module_full_name.clone()),
+            // Managed identities are materialized as a real facade TypeDef during final linking.
+            // Keeping the old metadata-only MainModule rename here would collide with that facade
+            // and put implementation methods back on the public type.
+            public_module_full_name: None,
             module_name,
             pdb_file_name: pdb_file_name.clone(),
             runtime: effective_abi_config.dotnet_runtime(),

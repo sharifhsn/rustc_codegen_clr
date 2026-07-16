@@ -1,0 +1,6 @@
+{
+  "name": "Rust.Unity.Sample.Tests",
+  "references": ["Rust.Unity.Sample.Runtime"],
+  "optionalUnityReferences": ["TestAssemblies"],
+  "includePlatforms": ["Editor"]
+}

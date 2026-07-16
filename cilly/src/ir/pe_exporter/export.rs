@@ -130,6 +130,139 @@ pub(crate) fn export_pe(asm: &mut Assembly, options: &ExportOptions) -> (Vec<u8>
     export_pe_with_source_link(asm, options, None)
 }
 
+fn unity_explicit_layout_field_aliases(
+    asm: &Assembly,
+) -> std::collections::HashMap<crate::ir::class::ClassDefIdx, Vec<(Type, Interned<crate::IString>)>>
+{
+    let mut referenced = Vec::new();
+    for method in asm.method_defs().values() {
+        let Some(cil) = method.iter_cil(asm) else {
+            continue;
+        };
+        for element in cil {
+            match element {
+                crate::CILIterElem::Node(crate::ir::CILNode::LdField { field, .. })
+                | crate::CILIterElem::Node(crate::ir::CILNode::LdFieldAddress { field, .. }) => {
+                    referenced.push(field)
+                }
+                crate::CILIterElem::Root(crate::ir::CILRoot::SetField(info)) => {
+                    referenced.push(info.0);
+                }
+                _ => {}
+            }
+        }
+    }
+    // Keep arena descriptors as a conservative supplement for synthesized bodies which do not
+    // expose an ordinary CIL iterator.
+    let mut descriptors = referenced
+        .into_iter()
+        .map(|field| asm[field])
+        .chain(asm.field_descs().iter().copied())
+        .collect::<Vec<_>>();
+    descriptors.sort_unstable_by_key(|desc| (desc.owner().inner(), desc.name().inner()));
+    descriptors.dedup();
+
+    let mut aliases = std::collections::HashMap::<_, Vec<_>>::new();
+    for desc in descriptors {
+        // Lowering may intern a second ClassRef for the same Rust layout name (for example a
+        // transparent wrapper viewed through an enum/pointer projection). PE TypeRef resolution
+        // also unifies these by metadata name, so mirror that behavior when finding the TypeDef
+        // that must carry the alias.
+        let owner_name = asm[desc.owner()].name();
+        let Some(owner) = asm.class_def_by_name(owner_name) else {
+            continue;
+        };
+        let Some(class) = asm.class_defs().get(&owner) else {
+            continue;
+        };
+        // Offset-zero aliases are meaningful only for explicit-layout Rust storage wrappers.
+        if class.explict_size().is_none()
+            && !class.fields().iter().any(|(_, _, offset)| offset.is_some())
+        {
+            continue;
+        }
+        if class
+            .fields()
+            .iter()
+            .any(|(_, name, _)| *name == desc.name())
+        {
+            continue;
+        }
+        let class_aliases = aliases.entry(owner).or_default();
+        let alias = (desc.tpe(), desc.name());
+        if !class_aliases.contains(&alias) {
+            class_aliases.push(alias);
+        }
+    }
+
+    // IL permits an address of an explicit-layout wrapper to flow directly into an `ldfld` whose
+    // owner is the wrapper's offset-zero payload type. Mono follows the address; IL2CPP instead
+    // keeps the wrapper's generated C++ pointer type and spells the payload field on that outer
+    // type. Mirror transparent Rust layout by declaring the payload's offset-zero fields as
+    // aliases on every containing wrapper. Iterate to a fixed point for nested wrappers such as
+    // `Cell<UnsafeCell<Option<T>>>`.
+    loop {
+        let snapshot = aliases.clone();
+        let mut additions = Vec::new();
+        for (&outer_id, outer) in asm.class_defs() {
+            if outer.explict_size().is_none()
+                && !outer.fields().iter().any(|(_, _, offset)| offset.is_some())
+            {
+                continue;
+            }
+            for &(payload_tpe, _, offset) in outer.fields() {
+                if offset.unwrap_or(0) != 0 {
+                    continue;
+                }
+                let Type::ClassRef(payload_ref) = payload_tpe else {
+                    continue;
+                };
+                let payload_name = asm[payload_ref].name();
+                let Some(payload_id) = asm.class_def_by_name(payload_name) else {
+                    continue;
+                };
+                let payload = &asm[payload_id];
+                for &(tpe, name, field_offset) in payload.fields() {
+                    if field_offset.unwrap_or(0) == 0 {
+                        additions.push((outer_id, tpe, name));
+                    }
+                }
+                if let Some(payload_aliases) = snapshot.get(&payload_id) {
+                    additions.extend(
+                        payload_aliases
+                            .iter()
+                            .map(|&(tpe, name)| (outer_id, tpe, name)),
+                    );
+                }
+            }
+        }
+
+        let mut changed = false;
+        for (owner, tpe, name) in additions {
+            let class = &asm[owner];
+            if class
+                .fields()
+                .iter()
+                .any(|(_, existing, _)| *existing == name)
+            {
+                continue;
+            }
+            let class_aliases = aliases.entry(owner).or_default();
+            if !class_aliases.contains(&(tpe, name)) {
+                class_aliases.push((tpe, name));
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for class_aliases in aliases.values_mut() {
+        class_aliases.sort_unstable_by_key(|(_, name)| asm[*name].to_string());
+    }
+    aliases
+}
+
 /// Direct-PE render with an optional validated Source Link JSON document map. Kept separate from
 /// [`export_pe`] so structural tests and non-cargo callers retain the zero-configuration path.
 #[must_use]
@@ -138,6 +271,9 @@ pub(crate) fn export_pe_with_source_link(
     options: &ExportOptions,
     source_link_json: Option<&str>,
 ) -> (Vec<u8>, Vec<u8>) {
+    if options.runtime == DotnetRuntime::UnityNetStandard21 {
+        asm.install_unity_legacy_128_types();
+    }
     let mut mb = MetadataBuilder::new();
     mb.set_public_module_full_name(options.public_module_full_name.as_deref());
     mb.set_runtime(options.runtime);
@@ -160,6 +296,20 @@ pub(crate) fn export_pe_with_source_link(
     // in the PE and must be stable for byte-reproducible NuGet packages.
     let mut class_def_ids: Vec<_> = asm.iter_class_def_ids().copied().collect();
     class_def_ids.sort_unstable_by_key(|id| asm[asm[*id].name()].to_string());
+
+    // Rust layout lowering occasionally addresses an explicit-layout storage wrapper through a
+    // typed alias at offset zero. CoreCLR/Mono resolve that MemberRef by its explicit offset, but
+    // IL2CPP turns the reference into a literal C++ member access. If the alias is not also a
+    // declared Field row, the generated C++ refers to a member that does not exist (`___v`,
+    // `___Item1`, ...). Materialize those live aliases as overlapping offset-zero fields for the
+    // Unity profile. This preserves the operand's real type (canonicalizing it to the wrapper's
+    // storage field would change the evaluation-stack type) and makes the union explicit to AOT
+    // consumers.
+    let unity_field_aliases = if options.runtime == DotnetRuntime::UnityNetStandard21 {
+        unity_explicit_layout_field_aliases(asm)
+    } else {
+        std::collections::HashMap::new()
+    };
 
     // --- Pass 0: const-data carrier TypeDefs (`__rcl_const_blob_N`), one per DISTINCT blob length
     // present in `asm.const_data` — mirrors `il_exporter::export_to_write`'s ordering exactly:
@@ -301,6 +451,7 @@ pub(crate) fn export_pe_with_source_link(
             size,
             &[],
         );
+        mb.set_type_def_access(tok, *class_def.access());
         if class_def.is_interface() {
             mb.mark_type_def_interface(tok);
         }
@@ -464,6 +615,14 @@ pub(crate) fn export_pe_with_source_link(
             let field = mb.add_field(&name_str, sig_off, offset);
             for attribute in class_def.field_custom_attributes(name, false) {
                 mb.add_custom_attribute(asm, field, attribute);
+            }
+        }
+        if let Some(aliases) = unity_field_aliases.get(&class_def_id) {
+            for &(tpe, name) in aliases {
+                let mut blob = Vec::new();
+                sig::encode_field_sig(tpe, asm, &mut mb, &mut blob);
+                let sig_off = mb.blobs.intern(&blob);
+                mb.add_field(&asm[name], sig_off, Some(0));
             }
         }
         for StaticFieldDef {
@@ -792,18 +951,26 @@ pub(crate) fn export_pe_with_source_link(
             // `[out]` Param flags (`MethodDef::out_params`, from `#[dotnet_out]`): 1-based
             // Sequence numbers among the receiver-stripped `param_names`, exactly the numbering
             // `add_method`'s Param-row loop uses — no re-indexing needed.
-            let nullability = method.nullable_context().map(|context| {
-                debug_assert_eq!(
-                    method.param_nullability().len(),
-                    param_names.len(),
-                    "nullable flags must be parallel to receiver-stripped Param rows"
-                );
-                MethodNullability {
-                    context,
-                    return_flag: method.return_nullability(),
-                    parameter_flags: method.param_nullability(),
-                }
-            });
+            // Unity 6's netstandard2.1 profile does not expose the compiler-only
+            // Nullable{Context}Attribute types to its bundled Mono loader. The annotations carry
+            // no runtime semantics, so omit them for this profile while preserving the actual
+            // reference/Nullable<T> signatures. Emitting them makes Unity reject the entire
+            // assembly before any game code runs.
+            let nullability = (options.runtime != DotnetRuntime::UnityNetStandard21)
+                .then(|| method.nullable_context())
+                .flatten()
+                .map(|context| {
+                    debug_assert_eq!(
+                        method.param_nullability().len(),
+                        param_names.len(),
+                        "nullable flags must be parallel to receiver-stripped Param rows"
+                    );
+                    MethodNullability {
+                        context,
+                        return_flag: method.return_nullability(),
+                        parameter_flags: method.param_nullability(),
+                    }
+                });
             let tok = mb.add_method_with_access(
                 &name,
                 *method.access(),
@@ -937,7 +1104,9 @@ pub(crate) fn export_pe_with_source_link(
                     .expect("property setter must be a MethodDef registered in pass 3")
             });
             let property = mb.add_property(class_tok, &name, sig_off, getter_tok, setter_tok);
-            if let Some(flag) = prop.nullability() {
+            if options.runtime != DotnetRuntime::UnityNetStandard21
+                && let Some(flag) = prop.nullability()
+            {
                 mb.mark_property_nullable(property, flag);
             }
             for attribute in prop.custom_attributes() {
@@ -1363,6 +1532,10 @@ struct SignatureOnlyResolver<'a> {
 impl super::sig::TypeDefOrRefResolver for SignatureOnlyResolver<'_> {
     fn type_def_or_ref(&mut self, cref: Interned<ClassRef>, asm: &mut Assembly) -> u32 {
         let class_ref = asm.class_ref(cref).clone();
+        let raw_name = asm[class_ref.name()].to_string();
+        if let Some(tok) = self.mb.unity_legacy_128_token(&raw_name) {
+            return encode_type_def_or_ref_token(tok);
+        }
         if asm.class_ref_to_def(cref).is_some()
             // An INSTANTIATED reference to a generic type this assembly itself defines (e.g. an
             // `IBoxHandle<i32>` parameter of a `#[dotnet_export]` fn, where `IBox`1` is this
@@ -1375,9 +1548,8 @@ impl super::sig::TypeDefOrRefResolver for SignatureOnlyResolver<'_> {
             // already knows how to find its `TypeDef` row — reuse it verbatim.
             return self.mb.type_def_or_ref(cref, asm);
         }
-        let raw_name = &asm[class_ref.name()];
         let scope = class_ref.asm().map(|asm_name_id| {
-            let name = ref_assembly_name_for_type(&asm[asm_name_id], raw_name).to_string();
+            let name = ref_assembly_name_for_type(&asm[asm_name_id], &raw_name).to_string();
             self.mb.find_or_create_assembly_ref(&name)
         });
         let full_name = if class_ref.generics().is_empty() {

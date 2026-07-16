@@ -25,7 +25,7 @@ use std::process::Command;
 
 use anyhow::{Context as _, Result, bail};
 
-use crate::context::Context;
+use crate::context::{Context, DotnetVersion};
 
 /// Must match `mycorrhiza::linq::PARAMETER_REBINDER_ASSEMBLY` and the helper project's
 /// `<AssemblyName>` exactly.
@@ -124,6 +124,8 @@ fn build(root: &Path, ctx: &Context) -> Result<PathBuf> {
         .arg(root)
         .arg("-c")
         .arg("Release")
+        .arg("-f")
+        .arg(helper_tfm(ctx.dotnet))
         .arg("--nologo")
         .arg("-p:Deterministic=true")
         .arg("-p:ContinuousIntegrationBuild=true")
@@ -154,7 +156,10 @@ fn build(root: &Path, ctx: &Context) -> Result<PathBuf> {
     if !status.success() {
         bail!("`dotnet build -c Release` failed for {}", root.display());
     }
-    let dll = cache.join("bin/Release/net8.0").join(HELPER_DLL_NAME);
+    let dll = cache
+        .join("bin/Release")
+        .join(helper_tfm(ctx.dotnet))
+        .join(HELPER_DLL_NAME);
     if !dll.is_file() {
         bail!(
             "expected {} to exist after building {} — check the project's <AssemblyName>/TFM",
@@ -165,6 +170,30 @@ fn build(root: &Path, ctx: &Context) -> Result<PathBuf> {
     Ok(dll)
 }
 
+/// CoreCLR 10 can consume the existing net8 helper, while Unity must receive only a
+/// netstandard2.1 dependency closure. Keeping this selection next to the copy step prevents a
+/// successful Unity-target build from accidentally staging the CoreCLR helper beside it.
+fn helper_tfm(dotnet: DotnetVersion) -> &'static str {
+    match dotnet {
+        DotnetVersion::Net10 => "net8.0",
+        DotnetVersion::UnityNetStandard21 => "netstandard2.1",
+    }
+}
+
 fn helper_cache(ctx: &Context) -> PathBuf {
     ctx.paths.cargo_home.join("dotnet/interop-helpers")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unity_selects_netstandard_helper() {
+        assert_eq!(helper_tfm(DotnetVersion::Net10), "net8.0");
+        assert_eq!(
+            helper_tfm(DotnetVersion::UnityNetStandard21),
+            "netstandard2.1"
+        );
+    }
 }

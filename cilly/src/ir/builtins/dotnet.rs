@@ -277,12 +277,13 @@ pub fn insert_dotnet_pal(
     asm: &mut Assembly,
     patcher: &mut MissingMethodPatcher,
     use_pool_alloc: bool,
+    unity_netstandard: bool,
 ) {
     if use_pool_alloc {
         super::pool_alloc::insert_pool_helpers(asm);
     }
-    insert_dotnet_alloc(asm, patcher, use_pool_alloc);
-    insert_dotnet_free(asm, patcher, use_pool_alloc);
+    insert_dotnet_alloc(asm, patcher, use_pool_alloc, unity_netstandard);
+    insert_dotnet_free(asm, patcher, use_pool_alloc, unity_netstandard);
     insert_dotnet_write(asm, patcher);
     insert_dotnet_random_fill(asm, patcher);
     insert_dotnet_instant_ticks(asm, patcher);
@@ -810,6 +811,7 @@ fn insert_dotnet_alloc(
     asm: &mut Assembly,
     patcher: &mut MissingMethodPatcher,
     use_pool_alloc: bool,
+    unity_netstandard: bool,
 ) {
     if use_pool_alloc {
         dotnet_hook!(asm, patcher, "rcl_dotnet_alloc", |mref, asm| {
@@ -827,21 +829,12 @@ fn insert_dotnet_alloc(
         });
         return;
     }
+    let allocator = super::aligned_allocator_refs(asm, unity_netstandard);
     dotnet_hook!(asm, patcher, "rcl_dotnet_alloc", |mref, asm| {
         let size = asm.alloc_node(CILNode::LdArg(0));
         let align = asm.alloc_node(CILNode::LdArg(1));
         let void_ptr = asm.nptr(Type::Void);
-        let sig = asm.sig([Type::Int(Int::USize), Type::Int(Int::USize)], void_ptr);
-        let aligned_alloc = asm.alloc_string("AlignedAlloc");
-        let native_mem = ClassRef::native_mem(asm);
-        let call_method = asm.alloc_methodref(MethodRef::new(
-            native_mem,
-            aligned_alloc,
-            sig,
-            MethodKind::Static,
-            [].into(),
-        ));
-        let alloc = asm.alloc_node(CILNode::call(call_method, [size, align]));
+        let alloc = asm.alloc_node(CILNode::call(allocator.alloc, [size, align]));
         let alloc = super::adapt_runtime_result(mref, alloc, void_ptr, asm);
         let ret = asm.alloc_root(CILRoot::Ret(alloc));
         MethodImpl::MethodBody {
@@ -861,6 +854,7 @@ fn insert_dotnet_free(
     asm: &mut Assembly,
     patcher: &mut MissingMethodPatcher,
     use_pool_alloc: bool,
+    unity_netstandard: bool,
 ) {
     if use_pool_alloc {
         dotnet_hook!(asm, patcher, "rcl_dotnet_free", |asm| {
@@ -879,22 +873,13 @@ fn insert_dotnet_free(
         });
         return;
     }
+    let allocator = super::aligned_allocator_refs(asm, unity_netstandard);
     dotnet_hook!(asm, patcher, "rcl_dotnet_free", |asm| {
         let ptr = asm.alloc_node(CILNode::LdArg(0));
         let void_ptr = asm.nptr(Type::Void);
         // Reinterpret *mut u8 as void* for the AlignedFree signature.
         let ptr = asm.cast_ptr(ptr, void_ptr);
-        let sig = asm.sig([void_ptr], Type::Void);
-        let aligned_free = asm.alloc_string("AlignedFree");
-        let native_mem = ClassRef::native_mem(asm);
-        let call_method = asm.alloc_methodref(MethodRef::new(
-            native_mem,
-            aligned_free,
-            sig,
-            MethodKind::Static,
-            [].into(),
-        ));
-        let free = asm.alloc_root(CILRoot::call(call_method, [ptr]));
+        let free = asm.alloc_root(CILRoot::call(allocator.free, [ptr]));
         let ret = asm.alloc_root(CILRoot::VoidRet);
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![free, ret], 0, None)],

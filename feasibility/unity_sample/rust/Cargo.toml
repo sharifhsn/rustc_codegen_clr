@@ -1,0 +1,23 @@
+[package]
+name = "unity_managed_sample"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.dotnet]
+identity-schema = 1
+package-id = "Rust.Unity.Sample"
+assembly-name = "Rust.Unity.Sample"
+root-namespace = "Rust.Unity.Sample"
+module-type = "Exports"
+public-namespaces = ["Rust.Unity.Sample"]
+compatibility-profile = "unity-netstandard2.1"
+legacy-main-module = false
+
+[dependencies]
+dotnet_macros = { path = "../../../dotnet_macros" }
+mycorrhiza = { path = "../../../mycorrhiza" }
+
+[workspace]

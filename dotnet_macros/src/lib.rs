@@ -859,9 +859,6 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #input
 
-        #[doc(hidden)]
-        const _: ::core::option::Option<&'static str> = option_env!("RCL_XMLDOC_BUILD_ID");
-
         /// Managed handle to this Rust-defined .NET class. (C# refers to the class by its plain name;
         /// this alias is for Rust-side references — e.g. a future method receiver.)
         #[allow(non_camel_case_types, dead_code)]
@@ -1227,9 +1224,6 @@ pub fn dotnet_enum(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
     let expanded = quote! {
         #input
-
-        #[doc(hidden)]
-        const _: ::core::option::Option<&'static str> = option_env!("RCL_XMLDOC_BUILD_ID");
 
         #[allow(non_camel_case_types, dead_code)]
         pub type #handle = ::mycorrhiza::intrinsics::RustcCLRInteropManagedStruct<"", #managed_name, #size>;
@@ -3627,9 +3621,6 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
         // The trait, unchanged — a declaration vehicle only.
         #input
 
-        #[doc(hidden)]
-        const _: ::core::option::Option<&'static str> = option_env!("RCL_XMLDOC_BUILD_ID");
-
         #handle_alias
 
         #[allow(non_snake_case, dead_code, unused_variables, internal_features, clippy::diverging_sub_expression)]
@@ -4945,9 +4936,6 @@ pub fn dotnet_methods(attr: TokenStream, item: TokenStream) -> TokenStream {
         // The user's impl block, verbatim — the methods remain ordinary callable Rust functions.
         #input
 
-        #[doc(hidden)]
-        const _: ::core::option::Option<&'static str> = option_env!("RCL_XMLDOC_BUILD_ID");
-
         // Marshalling shims generated for any method with an ergonomic-sugar param/return type (see
         // `needs_shim` above) — plain free fns, private to this module.
         #(#shim_items)*
@@ -5526,6 +5514,18 @@ fn marshal_param(ty: &Type) -> Result<Marshal, String> {
                 returns_managed_handle: false,
             });
         }
+        if name == "DotNetString" {
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::system::MString },
+                to_rust: Some(Box::new(|id| {
+                    quote! {
+                        let #id = ::mycorrhiza::system::DotNetString::from_handle(#id);
+                    }
+                })),
+                from_rust: None,
+                returns_managed_handle: false,
+            });
+        }
         if name == "CancellationToken" {
             return Ok(Marshal {
                 seam_ty: quote! { ::mycorrhiza::cancellation::CancellationToken },
@@ -5800,7 +5800,7 @@ fn marshal_param(ty: &Type) -> Result<Marshal, String> {
 
     Err(format!(
         "#[dotnet_export]: unsupported parameter type `{}`. Supported: the integer/float primitives, \
-         `bool`, `&str`, `String`, concrete `Action1`/`Action2`/`Action3`/`Func1`/`Func2`/\
+         `bool`, `&str`, `String`, `DotNetString`, concrete `Action1`/`Action2`/`Action3`/`Func1`/`Func2`/\
          `Func3`/`Comparison` delegates, `Option<T>`, and `Vec<T>` (delegate elements may be \
          passthrough primitives or `MString`; collection elements must be passthrough primitives).",
         quote! { #ty }
@@ -5899,6 +5899,14 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
                 returns_managed_handle: false,
             });
         }
+        if name == "DotNetString" {
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::system::MString },
+                to_rust: None,
+                from_rust: Some(Box::new(|id| quote! { #id.handle() })),
+                returns_managed_handle: false,
+            });
+        }
         if is_passthrough_primitive(&name) {
             return Ok(Marshal {
                 seam_ty: quote! { #ty },
@@ -5909,7 +5917,7 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
         }
         return Err(format!(
             "#[dotnet_export]: unsupported return type `{name}`. Supported: the integer/float \
-             primitives, `bool`, `&str`, `String`, `()`, `mycorrhiza::task::Task`, \
+             primitives, `bool`, `&str`, `String`, `DotNetString`, `()`, `mycorrhiza::task::Task`, \
              `mycorrhiza::task::TaskT<T>`, `Option<T>`, and `Vec<T>` of a passthrough primitive `T`."
         ));
     }
@@ -6639,9 +6647,10 @@ fn interface_member_id_type_name(
 /// One line of newline-delimited JSON per entry (robust against arbitrary doc-comment text, e.g.
 /// embedded quotes/newlines) is appended to
 /// `<CARGO_MANIFEST_DIR>/target/dotnet_xmldoc/<crate_name>.xmldoc.jsonl`. The proc-macro runs once
-/// per macro expansion at the consumer's compile time, so appending (not overwriting) is required;
-/// cargo-dotnet clears stale entries before building and injects `RCL_XMLDOC_BUILD_ID` to force a
-/// fresh expansion inventory (`tools/cargo-dotnet/src/xmldoc.rs`).
+/// per macro expansion at the consumer's compile time, so appending (not overwriting) is required.
+/// `cargo-dotnet` clears stale entries whenever its deterministic consumer-source snapshot changes;
+/// Cargo's normal dependency tracking then reruns the affected macro expansions
+/// (`tools/cargo-dotnet/src/xmldoc.rs`).
 fn dotnet_export_member_id(managed_name: &str, params: &[String]) -> String {
     dotnet_method_member_id("MainModule", managed_name, params)
 }
@@ -7553,12 +7562,19 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Unity's product profile is intentionally panic-abort/no-unwind: Mono's netstandard2.1
+    // surface and IL2CPP cannot honor the normal Rust-unwind-to-managed-exception bridge. Avoid
+    // instantiating `catch_unwind` at all for that target. Besides matching the runtime contract,
+    // this keeps tiny exports from retaining the entire panic/backtrace graph and its references
+    // to BCL APIs newer than Unity's facade.
+    let unity_body = quote! {
+        let __ret = #call;
+        #ret_expr
+    };
+
     let expanded = quote! {
         // The user's function, verbatim — still callable from Rust with its idiomatic signature.
         #func
-
-        #[doc(hidden)]
-        const _: ::core::option::Option<&'static str> = option_env!("RCL_XMLDOC_BUILD_ID");
 
         // The generated seam shim exports `#managed_name` as its flat symbol. The backend marks
         // exported symbols `Access::Extern` (a DCE root) and emits them as public static methods
@@ -7596,7 +7612,14 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#[doc = #custom_attr_markers])*
             pub extern "C-unwind" fn #fn_name(#(#seam_params),*) #seam_ret {
                 #(#pre_call)*
-                #body
+                #[cfg(cd_dotnet_unity_netstandard2_1)]
+                {
+                    #unity_body
+                }
+                #[cfg(not(cd_dotnet_unity_netstandard2_1))]
+                {
+                    #body
+                }
             }
         }
     };
