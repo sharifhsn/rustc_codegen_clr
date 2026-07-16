@@ -40,6 +40,21 @@ cargo dotnet capabilities --manifest acceptance/capabilities.toml
 
 Run `cargo dotnet <command> --help` for the complete flags accepted by a command.
 
+With `--workspace <crate>`, `doctor` also inventories every `#[link(name = ...)]` block and its
+effective native entry points. For staged native assets it validates the host RID, binary
+architecture, and export table before launch. An unstaged library is reported as a warning because
+it may intentionally come from the operating system; a staged wrong-RID, wrong-architecture, or
+missing-export binary is a hard failure with the Rust symbol and native entry point named.
+
+The backend rejects unsafe-to-project P/Invoke declarations while compiling, before CoreCLR can
+load or invoke them. The portable raw boundary accepts C integer and floating-point scalars,
+`usize`/`isize`, raw pointers, `()` returns, and fixed-signature `extern "C"` callbacks (including
+nullable `Option<extern "C" fn(...)>` callbacks). Rust references, slices, `bool`, `char`, by-value
+aggregates, variadics, and callbacks with a non-C ABI produce a diagnostic naming the library, Rust
+symbol, effective `#[link_name]`, offending position and type, plus the supported replacement. Put
+rich data behind a raw pointer to a `#[repr(C)]` DTO or expose a fixed-signature C shim; use the
+safe types and callback guards in `rust-dotnet-pinvoke` above that raw declaration.
+
 ## Common build flags
 
 | Flag | Meaning |

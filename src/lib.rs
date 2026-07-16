@@ -218,7 +218,7 @@ fn collect_native_imports(tcx: TyCtxt<'_>, asm: &mut Assembly) {
             abi => tcx.dcx().span_fatal(
                 tcx.def_span(module_id),
                 format!(
-                    "P/Invoke does not support `extern \"{abi}\"`; use `extern \"C\"` or \
+                    "P/Invoke does not support `extern {abi}`; use `extern \"C\"` or \
                      `extern \"system\"`, and expose C++ APIs through a C-compatible shim"
                 ),
             ),
@@ -237,18 +237,52 @@ fn collect_native_imports(tcx: TyCtxt<'_>, asm: &mut Assembly) {
                 .skip_normalization()
                 .fn_sig(tcx)
                 .skip_binder();
-            if signature.c_variadic() {
-                tcx.dcx().span_fatal(
-                    tcx.def_span(foreign_item),
-                    "variadic native imports are not supported by the portable CLR P/Invoke \
-                     surface; add a fixed-signature C wrapper around the variadic API",
-                );
-            }
             let attrs = tcx.codegen_fn_attrs(foreign_item);
+            let rust_symbol = tcx.item_name(foreign_item).to_string();
             let entry_point = attrs
                 .symbol_name
                 .unwrap_or_else(|| tcx.item_name(foreign_item))
                 .to_string();
+            if signature.c_variadic() {
+                tcx.dcx().span_fatal(
+                    tcx.def_span(foreign_item),
+                    format!(
+                        "P/Invoke signature rejected: library `{}`, Rust symbol `{rust_symbol}`, \
+                         native entry point `{entry_point}` is variadic; add a fixed-signature C \
+                         wrapper around the variadic API",
+                        library.name
+                    ),
+                );
+            }
+            for (index, input) in signature.inputs().iter().enumerate() {
+                if let Some(reason) = pinvoke_type_error(tcx, *input, false) {
+                    tcx.dcx().span_fatal(
+                        tcx.def_span(foreign_item),
+                        pinvoke_signature_error(
+                            &library.name.to_string(),
+                            &rust_symbol,
+                            &entry_point,
+                            &format!("parameter {}", index + 1),
+                            *input,
+                            &reason,
+                        ),
+                    );
+                }
+            }
+            let output = signature.output();
+            if let Some(reason) = pinvoke_type_error(tcx, output, true) {
+                tcx.dcx().span_fatal(
+                    tcx.def_span(foreign_item),
+                    pinvoke_signature_error(
+                        &library.name.to_string(),
+                        &rust_symbol,
+                        &entry_point,
+                        "return value",
+                        output,
+                        &reason,
+                    ),
+                );
+            }
             asm.add_native_import(NativeImport {
                 rust_symbol: entry_point.clone(),
                 entry_point,
@@ -262,6 +296,103 @@ fn collect_native_imports(tcx: TyCtxt<'_>, asm: &mut Assembly) {
             });
         }
     }
+}
+
+fn pinvoke_signature_error(
+    library: &str,
+    rust_symbol: &str,
+    entry_point: &str,
+    position: &str,
+    offending: rustc_middle::ty::Ty<'_>,
+    reason: &str,
+) -> String {
+    format!(
+        "P/Invoke signature rejected: library `{library}`, Rust symbol `{rust_symbol}`, native \
+         entry point `{entry_point}`, {position} has unsupported type `{offending}` ({reason}). \
+         Supported boundary shapes are C integer/float scalars, usize/isize, raw pointers, \
+         fixed-signature `extern \"C\"` function pointers (optionally nullable), and `()` returns. \
+         Use a `#[repr(C)]` data transfer object behind a raw pointer or a fixed-signature C shim \
+         for richer native APIs"
+    )
+}
+
+fn pinvoke_type_error<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: rustc_middle::ty::Ty<'tcx>,
+    is_return: bool,
+) -> Option<String> {
+    use rustc_hir::LangItem;
+    use rustc_middle::ty::TyKind;
+
+    match ty.kind() {
+        TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) | TyKind::RawPtr(_, _) => None,
+        TyKind::Tuple(fields) if is_return && fields.is_empty() => None,
+        TyKind::FnPtr(signature, header) => {
+            pinvoke_fn_pointer_error(tcx, *signature, header.abi())
+        }
+        TyKind::Adt(definition, arguments)
+            if tcx.is_lang_item(definition.did(), LangItem::Option) =>
+        {
+            let inner = arguments.type_at(0);
+            match inner.kind() {
+                TyKind::FnPtr(signature, header) => {
+                    pinvoke_fn_pointer_error(tcx, *signature, header.abi())
+                }
+                _ => Some(
+                    "only Option<extern fn> has a stable nullable C ABI; use a raw pointer plus an explicit null policy"
+                        .to_owned(),
+                ),
+            }
+        }
+        TyKind::Bool => Some(
+            "Rust bool is one byte while platform P/Invoke bool conventions vary; use u8 or i32 and convert explicitly"
+                .to_owned(),
+        ),
+        TyKind::Char => Some("Rust char is not a C char; use u8, i8, or u32 explicitly".to_owned()),
+        TyKind::Ref(..) => Some(
+            "Rust references carry aliasing and lifetime promises native code cannot uphold; use *const T or *mut T"
+                .to_owned(),
+        ),
+        TyKind::Str | TyKind::Slice(_) => Some(
+            "Rust dynamically sized values have no C ABI; pass a pointer and explicit length"
+                .to_owned(),
+        ),
+        TyKind::Array(..) => Some(
+            "by-value Rust arrays are not projected as portable P/Invoke arrays; pass a pointer and explicit length"
+                .to_owned(),
+        ),
+        TyKind::Adt(..) | TyKind::Tuple(_) => Some(
+            "by-value Rust aggregates are not yet a supported portable P/Invoke contract"
+                .to_owned(),
+        ),
+        _ => Some("this Rust type has no explicit portable CLR P/Invoke mapping".to_owned()),
+    }
+}
+
+fn pinvoke_fn_pointer_error<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    signature: rustc_middle::ty::Binder<'tcx, rustc_middle::ty::FnSigTys<TyCtxt<'tcx>>>,
+    abi: rustc_abi::ExternAbi,
+) -> Option<String> {
+    if !matches!(abi, rustc_abi::ExternAbi::C { .. }) {
+        return Some(format!(
+            "callback calling convention `extern {abi}` is unsupported; use `extern \"C\"`"
+        ));
+    }
+    let signature = tcx.normalize_erasing_late_bound_regions(
+        rustc_middle::ty::TypingEnv::fully_monomorphized(),
+        signature,
+    );
+    for (index, input) in signature.inputs().iter().enumerate() {
+        if let Some(reason) = pinvoke_type_error(tcx, *input, false) {
+            return Some(format!(
+                "callback parameter {} is unsupported: {reason}",
+                index + 1
+            ));
+        }
+    }
+    pinvoke_type_error(tcx, signature.output(), true)
+        .map(|reason| format!("callback return value is unsupported: {reason}"))
 }
 
 /// Rust-visible features supplied by the backend's baseline target machine.

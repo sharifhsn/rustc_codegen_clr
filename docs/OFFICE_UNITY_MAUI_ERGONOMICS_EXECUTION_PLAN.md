@@ -309,10 +309,17 @@ MAUI is a profile matrix rather than one runtime:
 
 ### F. Deployment, diagnostics, and packaging
 
-- [ ] Teach `cargo dotnet doctor` to enumerate declared native imports and distinguish a missing
+- [x] Teach `cargo dotnet doctor` to enumerate declared native imports and distinguish a missing
   library, unsupported/missing RID, architecture mismatch, and missing entry point before launch.
-- [ ] Reject unsupported foreign signatures early with library, Rust symbol, native entry point,
+  The scanner records the Rust symbol plus effective `#[link_name]`, checks the host-RID binary
+  architecture and export table directly, and treats an unstaged system library as an explicit
+  warning rather than a fabricated failure. SQLite acceptance proves the complete staged path.
+- [x] Reject unsupported foreign signatures early with library, Rust symbol, native entry point,
   offending type, and supported alternatives in the diagnostic.
+  The compiler now validates parameters, returns, nested callbacks, callback ABIs, and variadics.
+  `pinvoke_acceptance.sh` proves both an invalid Rust reference and a non-C callback fail with the
+  complete declaration identity and a concrete portable replacement, while the SQLite and retained
+  asynchronous callback fixtures still execute through CoreCLR.
 - [x] Make `cargo dotnet` cache keys include every code-generating input. In addition to Cargo's
   project/profile/dependency fingerprints and the private-sysroot receipt, inert `RUSTFLAGS` cfgs
   now key the backend binary, linker binary, .NET runtime/profile inputs, Source Link configuration,

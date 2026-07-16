@@ -1,24 +1,16 @@
 //! `cargo dotnet doctor` — diagnose the interop toolchain + translate runtime failures.
 //!
-//! Two jobs (ERGONOMICS_ROADMAP Theme-5 "Better interop diagnostics"):
+//! Three user-facing checks:
 //!
 //!  1. **Environment check** — verify the pieces a native `cargo dotnet` build/run needs
-//!     are actually present (the pinned nightly + rust-src + rustc-dev, a CoreCLR — not
-//!     Mono — ilasm, `dotnet`, and the installed/dev backend dylib + linker + target
-//!     spec + the shipped `msbuild/RustDotnet.targets`). Each missing piece prints the
-//!     one actionable fix (almost always `cargo dotnet setup`).
+//!     are present: the pinned nightly components, .NET SDK, backend, linker, target spec,
+//!     and MSBuild integration. CoreCLR ILAsm is an optional fallback for `DIRECT_PE=0`.
 //!
-//!  2. **Runtime-failure translation** — the .NET runtime's exceptions are cryptic for a
-//!     Rust dev. `cargo dotnet doctor <log-or-message>` (or piped stdin) scans the text
-//!     for the known interop failure signatures and prints the *cause + fix*, e.g.:
-//!       * `TypeLoadException: … object field … overlapped` → a managed reference was
-//!         placed in a Rust enum/union layout the CLR GC cannot represent.
-//!       * `TypeLoadException: … Stack` / `Queue` → the impl-assembly gotcha (those live
-//!         in `System.Collections`, not `System.Private.CoreLib`).
-//!       * `MissingMethodException` / `EntryPointNotFoundException: rcl_vec_*` →
-//!         "did you `export_rust_containers!()` / mark the fn `#[unsafe(no_mangle)]`?".
-//!     The same matcher powers both the file/arg mode and (future) an auto-hint on a
-//!     failed run.
+//!  2. **Workspace wiring and native imports** — validate Rust/MSBuild configuration, then
+//!     compare declared `#[link]`/`#[link_name]` imports with staged host-RID binaries.
+//!
+//!  3. **Runtime-failure translation** — scan a supplied log or piped message and turn known
+//!     managed-loader and P/Invoke exceptions into concrete causes and recovery commands.
 
 use std::fmt::Write as _;
 use std::io::Read;
@@ -167,16 +159,23 @@ pub fn run(args: &DoctorArgs) -> Result<i32> {
     }
 }
 
+#[derive(Clone, Ord, PartialOrd, Eq, PartialEq)]
+struct NativeImport {
+    rust_symbol: String,
+    entry_point: String,
+}
+
 fn native_import_checks(workspace: &Path) -> Vec<Check> {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use syn::visit::Visit;
 
     #[derive(Default)]
     struct LinkVisitor {
-        libraries: BTreeSet<String>,
+        libraries: BTreeMap<String, BTreeSet<NativeImport>>,
     }
     impl<'ast> Visit<'ast> for LinkVisitor {
         fn visit_item_foreign_mod(&mut self, item: &'ast syn::ItemForeignMod) {
+            let mut library = None;
             for attribute in &item.attrs {
                 if !attribute.path().is_ident("link") {
                     continue;
@@ -184,10 +183,33 @@ fn native_import_checks(workspace: &Path) -> Vec<Check> {
                 let _ = attribute.parse_nested_meta(|meta| {
                     if meta.path.is_ident("name") {
                         let value: syn::LitStr = meta.value()?.parse()?;
-                        self.libraries.insert(value.value());
+                        library = Some(value.value());
                     }
                     Ok(())
                 });
+            }
+            if let Some(library) = library {
+                let imports = self.libraries.entry(library).or_default();
+                for foreign_item in &item.items {
+                    let syn::ForeignItem::Fn(function) = foreign_item else {
+                        continue;
+                    };
+                    let rust_symbol = function.sig.ident.to_string();
+                    let mut entry_point = rust_symbol.clone();
+                    for attribute in &function.attrs {
+                        if attribute.path().is_ident("link_name")
+                            && let syn::Meta::NameValue(name_value) = &attribute.meta
+                            && let syn::Expr::Lit(expression) = &name_value.value
+                            && let syn::Lit::Str(value) = &expression.lit
+                        {
+                            entry_point = value.value();
+                        }
+                    }
+                    imports.insert(NativeImport {
+                        rust_symbol,
+                        entry_point,
+                    });
+                }
             }
             syn::visit::visit_item_foreign_mod(self, item);
         }
@@ -219,28 +241,155 @@ fn native_import_checks(workspace: &Path) -> Vec<Check> {
     if visitor.libraries.is_empty() {
         return Vec::new();
     }
-    let staged = crate::nuget::staged_package_assets(workspace).unwrap_or_default();
+    let staged = match crate::nuget::staged_package_assets(workspace) {
+        Ok(staged) => staged,
+        Err(error) => {
+            return vec![Check::fail(
+                "native asset manifest",
+                format!("could not enumerate declared native assets: {error:#}"),
+            )];
+        }
+    };
+    let host = HostFacts::detect();
     visitor
         .libraries
         .into_iter()
-        .map(|library| {
-            let matches = staged.iter().any(|asset| {
-                asset.kind == crate::nuget::StagedPackageAssetKind::Native
-                    && crate::nuget::native_library_matches(&library, &asset.source)
-            });
-            if matches {
-                Check::pass(
-                    format!("native import {library}"),
-                    "matching RID-native package asset is staged",
-                )
+        .map(|(library, imports)| inspect_native_import(&library, &imports, &staged, &host))
+        .collect()
+}
+
+fn inspect_native_import(
+    library: &str,
+    imports: &std::collections::BTreeSet<NativeImport>,
+    staged: &[crate::nuget::StagedPackageAsset],
+    host: &HostFacts,
+) -> Check {
+    let matching = staged
+        .iter()
+        .filter(|asset| {
+            asset.kind == crate::nuget::StagedPackageAssetKind::Native
+                && crate::nuget::native_library_matches(library, &asset.source)
+        })
+        .collect::<Vec<_>>();
+    let declared = imports
+        .iter()
+        .map(|import| {
+            if import.rust_symbol == import.entry_point {
+                import.entry_point.clone()
             } else {
-                Check::warn(
-                    format!("native import {library}"),
-                    "no matching staged package asset; this is valid only when the OS loader can resolve a system or locally supplied library",
-                )
+                format!("{} -> {}", import.rust_symbol, import.entry_point)
             }
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if matching.is_empty() {
+        return Check::warn(
+            format!("native import {library}"),
+            format!(
+                "declares [{declared}], but no matching staged package asset exists; this is valid only when the host OS loader supplies the library"
+            ),
+        );
+    }
+
+    let available_rids = matching
+        .iter()
+        .filter_map(|asset| asset.rid.as_deref())
+        .collect::<std::collections::BTreeSet<_>>();
+    let host_assets = matching
+        .into_iter()
+        .filter(|asset| asset.rid.as_deref().is_none_or(|rid| rid == host.host_rid))
+        .collect::<Vec<_>>();
+    if host_assets.is_empty() {
+        return Check::fail(
+            format!("native import {library}"),
+            format!(
+                "missing RID asset for host {}; available RID(s): {}. Restore or vendor this library for {}",
+                host.host_rid,
+                available_rids.into_iter().collect::<Vec<_>>().join(", "),
+                host.host_rid
+            ),
+        );
+    }
+
+    let mut failures = Vec::new();
+    for asset in host_assets {
+        match inspect_native_binary(&asset.source, host, imports) {
+            Ok(()) => {
+                return Check::pass(
+                    format!("native import {library}"),
+                    format!(
+                        "{} matches host {} and exports [{}]",
+                        asset.source.display(),
+                        host.host_rid,
+                        declared
+                    ),
+                );
+            }
+            Err(error) => failures.push(format!("{}: {error:#}", asset.source.display())),
+        }
+    }
+    Check::fail(format!("native import {library}"), failures.join("; "))
+}
+
+fn inspect_native_binary(
+    path: &Path,
+    host: &HostFacts,
+    imports: &std::collections::BTreeSet<NativeImport>,
+) -> anyhow::Result<()> {
+    use object::{Object as _, ObjectSymbol as _};
+
+    let bytes = std::fs::read(path)?;
+    let file = object::File::parse(bytes.as_slice())?;
+    let expected_architecture = if host.host_rid.ends_with("-arm64") {
+        object::Architecture::Aarch64
+    } else {
+        object::Architecture::X86_64
+    };
+    if file.architecture() != expected_architecture {
+        anyhow::bail!(
+            "architecture mismatch: host {} requires {:?}, binary is {:?}",
+            host.host_rid,
+            expected_architecture,
+            file.architecture()
+        );
+    }
+
+    let mut exports = std::collections::BTreeSet::new();
+    if let Ok(file_exports) = file.exports() {
+        for export in file_exports {
+            if let Ok(name) = std::str::from_utf8(export.name()) {
+                exports.insert(name.to_owned());
+            }
+        }
+    }
+    for symbol in file.dynamic_symbols() {
+        if symbol.is_definition()
+            && let Ok(name) = symbol.name()
+        {
+            exports.insert(name.to_owned());
+        }
+    }
+    let missing = imports
+        .iter()
+        .filter(|import| {
+            let entry = &import.entry_point;
+            !exports.contains(entry)
+                && !(host.os == "macos" && exports.contains(&format!("_{entry}")))
+        })
+        .map(|import| {
+            format!(
+                "Rust symbol {} expects native entry point {}",
+                import.rust_symbol, import.entry_point
+            )
+        })
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "missing entry point(s): {}; regenerate declarations or correct #[link_name]",
+            missing.join(", ")
+        );
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -936,19 +1085,15 @@ pub fn diagnose_failure(text: &str) -> Vec<Hint> {
         });
     }
 
-    // 2. Missing method / entry point — usually a not-exported Rust fn.
-    if lower.contains("missingmethodexception")
-        || lower.contains("missingmethod")
-        || lower.contains("entrypointnotfoundexception")
-        || lower.contains("entry point")
-    {
+    // 2a. Missing managed method.
+    if lower.contains("missingmethodexception") || lower.contains("missingmethod") {
         let mut body = vec![
-            "A method/entry point the C# side called was not found in the Rust assembly.".to_string(),
+            "A managed method the C# side called was not found in the Rust assembly.".to_string(),
             "Common causes:".to_string(),
             "  • the Rust side did not `mycorrhiza::export_rust_containers!()` (no rcl_vec_* exported)"
                 .to_string(),
-            "  • the exported fn is missing `#[unsafe(no_mangle)]` (so its symbol was mangled away)".to_string(),
-            "  • a signature mismatch between the C# P/Invoke and the Rust `extern` fn".to_string(),
+            "  • the public Rust export was renamed or removed without rebuilding the C# consumer"
+                .to_string(),
         ];
         if lower.contains("rcl_vec") {
             body.push(
@@ -958,39 +1103,53 @@ pub fn diagnose_failure(text: &str) -> Vec<Hint> {
             );
         }
         hints.push(Hint {
-            title: "MissingMethod / EntryPointNotFound → un-exported Rust symbol".to_string(),
+            title: "MissingMethod → managed Rust API mismatch".to_string(),
             body,
         });
     }
 
-    // 3. DllNotFound — the Rust assembly/native lib was not found/referenced.
-    if lower.contains("dllnotfoundexception")
-        || (lower.contains("unable to load") && lower.contains("dll"))
-    {
+    // 2b. Native P/Invoke symbol absent from a library that did load.
+    if lower.contains("entrypointnotfoundexception") || lower.contains("entry point") {
         hints.push(Hint {
-            title: "DllNotFound → the Rust assembly was not built/referenced".to_string(),
+            title: "EntryPointNotFound → native export name/signature mismatch".to_string(),
             body: vec![
-                "The C# project could not locate the Rust-produced assembly.".to_string(),
-                "  • ensure the csproj imports RustDotnet.targets and has a <RustCrate Include=... />"
+                "The native library loaded, but it does not export the entry point recorded by the Rust declaration."
                     .to_string(),
-                "  • ensure CARGO_DOTNET_HOME (or ~/.cargo-dotnet) points at a valid install"
+                "Run `cargo dotnet doctor --workspace <crate>` to compare every #[link] declaration and #[link_name] against the staged host-RID binary."
                     .to_string(),
-                "  • run `cargo dotnet doctor` (no args) to verify the backend install".to_string(),
+                "Fix the native export, regenerate bindgen declarations, or correct #[link_name]; changing only the Rust function identifier does not change an explicit native entry point."
+                    .to_string(),
             ],
         });
     }
 
-    // 4. BadImageFormat — almost always the Mono-ilasm PE mismatch.
+    // 3. DllNotFound — a native dependency was not resolvable by the host loader.
+    if lower.contains("dllnotfoundexception")
+        || (lower.contains("unable to load") && lower.contains("dll"))
+    {
+        hints.push(Hint {
+            title: "DllNotFound → native library or host RID asset missing".to_string(),
+            body: vec![
+                "CoreCLR could not resolve a native library named by P/Invoke.".to_string(),
+                "Run `cargo dotnet doctor --workspace <crate>` to distinguish no staged library from a missing RID, architecture mismatch, or missing entry point."
+                    .to_string(),
+                "Use `cargo dotnet add-native` for a NuGet-native package or `add-native-file` for a local binary; keep #[link(name = ...)] equal to the logical loader name."
+                    .to_string(),
+            ],
+        });
+    }
+
+    // 4. BadImageFormat — invalid managed PE or wrong-architecture native binary.
     if lower.contains("badimageformatexception") || lower.contains("bad il format") {
         hints.push(Hint {
-            title: "BadImageFormat → Mono ilasm PE (CoreCLR rejects it)".to_string(),
+            title: "BadImageFormat → invalid managed PE or native architecture mismatch"
+                .to_string(),
             body: vec![
-                "The assembly's PE image was rejected by the CoreCLR loader.".to_string(),
-                "The classic cause is Mono's ilasm (emits PE32 CoreCLR won't load), or a .NET \
-                 version/ilasm mismatch (a net8 ilasm's output is rejected by net9 and vice-versa)."
+                "CoreCLR rejected either a managed assembly image or a native P/Invoke dependency."
                     .to_string(),
-                "Fix: `cargo dotnet setup` installs the matching CoreCLR ilasm, or set ILASM_PATH \
-                 to a CoreCLR ilasm."
+                "For native code, run `cargo dotnet doctor --workspace <crate>` to compare the binary architecture with the host RID."
+                    .to_string(),
+                "For the optional DIRECT_PE=0 path, use the matching CoreCLR ILAsm; Mono ILAsm output is not a supported substitute."
                     .to_string(),
             ],
         });
@@ -1076,7 +1235,7 @@ mod tests {
         let hints =
             diagnose_failure("System.MissingMethodException: Method not found: rcl_vec_new");
         assert_eq!(hints.len(), 1);
-        assert!(hints[0].title.contains("un-exported"));
+        assert!(hints[0].title.contains("managed Rust API mismatch"));
         assert!(
             hints[0]
                 .body
@@ -1089,14 +1248,100 @@ mod tests {
     fn entrypoint_not_found_maps_to_export() {
         let hints = diagnose_failure("EntryPointNotFoundException: greet");
         assert_eq!(hints.len(), 1);
-        assert!(hints[0].title.contains("un-exported"));
+        assert!(hints[0].title.contains("native export"));
+        assert!(
+            hints[0]
+                .body
+                .iter()
+                .any(|line| line.contains("#[link_name]"))
+        );
     }
 
     #[test]
     fn badimage_maps_to_mono_ilasm() {
         let hints = diagnose_failure("System.BadImageFormatException: Bad IL format.");
         assert_eq!(hints.len(), 1);
-        assert!(hints[0].title.contains("Mono ilasm"));
+        assert!(hints[0].title.contains("architecture mismatch"));
+        assert!(hints[0].body.iter().any(|line| line.contains("Mono ILAsm")));
+    }
+
+    #[test]
+    fn native_import_scan_reports_rust_and_explicit_entry_point_names() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("src/lib.rs"),
+            r#"
+                #[link(name = "sample")]
+                unsafe extern "C" {
+                    fn ordinary(value: i32) -> i32;
+                    #[link_name = "native_renamed"]
+                    fn rust_renamed() -> i32;
+                }
+            "#,
+        )
+        .unwrap();
+        let checks = native_import_checks(temp.path());
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].hard);
+        assert!(checks[0].detail.contains("ordinary"));
+        assert!(checks[0].detail.contains("rust_renamed -> native_renamed"));
+    }
+
+    #[test]
+    fn native_import_check_distinguishes_missing_host_rid() {
+        let host = HostFacts::detect();
+        let other_rid = if host.host_rid == "linux-x64" {
+            "osx-arm64"
+        } else {
+            "linux-x64"
+        };
+        let staged = vec![crate::nuget::StagedPackageAsset {
+            logical_path: format!("runtimes/{other_rid}/native/libsample.so"),
+            source: PathBuf::from("libsample.so"),
+            kind: crate::nuget::StagedPackageAssetKind::Native,
+            rid: Some(other_rid.to_owned()),
+        }];
+        let imports = [NativeImport {
+            rust_symbol: "call".into(),
+            entry_point: "call".into(),
+        }]
+        .into_iter()
+        .collect();
+        let check = inspect_native_import("sample", &imports, &staged, &host);
+        assert!(check.hard && !check.ok);
+        assert!(check.detail.contains("missing RID asset"));
+        assert!(check.detail.contains(host.host_rid));
+        assert!(check.detail.contains(other_rid));
+    }
+
+    #[test]
+    fn binary_inspection_distinguishes_architecture_and_missing_entry_point() {
+        let executable = std::env::current_exe().unwrap();
+        let host = HostFacts::detect();
+        let no_imports = std::collections::BTreeSet::new();
+        inspect_native_binary(&executable, &host, &no_imports).unwrap();
+
+        let missing = [NativeImport {
+            rust_symbol: "rust_probe".into(),
+            entry_point: "rcl_entry_that_cannot_exist_7d78614b".into(),
+        }]
+        .into_iter()
+        .collect();
+        let error = inspect_native_binary(&executable, &host, &missing).unwrap_err();
+        assert!(error.to_string().contains("missing entry point"));
+        assert!(error.to_string().contains("rust_probe"));
+
+        let wrong_host = HostFacts {
+            host_rid: if host.host_rid.ends_with("-arm64") {
+                "test-x64"
+            } else {
+                "test-arm64"
+            },
+            ..host
+        };
+        let error = inspect_native_binary(&executable, &wrong_host, &no_imports).unwrap_err();
+        assert!(error.to_string().contains("architecture mismatch"));
     }
 
     #[test]
