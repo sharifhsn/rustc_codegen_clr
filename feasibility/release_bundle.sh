@@ -109,6 +109,7 @@ cp cargo_tests/pinvoke_sqlite/.cargo-dotnet-nuget-deps.json \
     "$pinvoke/.cargo-dotnet-nuget-deps.json"
 cp cargo_tests/pinvoke_sqlite/src/main.rs "$pinvoke/src/main.rs"
 cp cargo_tests/pinvoke_sqlite/src/native.rs "$pinvoke/src/native.rs"
+cp cargo_tests/pinvoke_sqlite/src/sqlite.rs "$pinvoke/src/sqlite.rs"
 cp cargo_tests/pinvoke_sqlite/sqlite3_api.h "$pinvoke/sqlite3_api.h"
 CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
     "$installed" dotnet bindgen sqlite3_api.h \
@@ -119,5 +120,43 @@ CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
     --check
 CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
     "$installed" dotnet run "$pinvoke" --release
+
+# Prove the installed SDK's MSBuild integration from an unrelated C# project, including the hard
+# deployment case that motivated the runtime-asset manifest: managed Rust calls a vendored native
+# Rust library through P/Invoke, while the C# host receives and loads the sidecar automatically.
+native_crate="$repo/cargo_tests/pinvoke_async_callback_native"
+cargo build --manifest-path "$native_crate/Cargo.toml" --release
+case "$host" in
+    linux-x64) native_rid="linux-x64"; native_library="$native_crate/target/release/libasync_callback.so" ;;
+    macos-arm64) native_rid="osx-arm64"; native_library="$native_crate/target/release/libasync_callback.dylib" ;;
+    windows-x64) native_rid="win-x64"; native_library="$native_crate/target/release/async_callback.dll" ;;
+esac
+native_filename="$(basename "$native_library")"
+
+product="$work/webapi-demo"
+CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
+    "$installed" dotnet new "$product" --webapi
+cat "$repo/feasibility/fixtures/attach/native_probe.rs" >> "$product/rustlib/src/lib.rs"
+CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
+    "$installed" dotnet add-native-file "$native_library" \
+    --library async_callback --path "$product/rustlib" --rid "$native_rid"
+
+consumer="$work/attached-consumer"
+dotnet new console --name AttachedConsumer --output "$consumer" --framework net10.0
+cp "$repo/feasibility/fixtures/attach/Program.cs" "$consumer/Program.cs"
+CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
+    "$installed" dotnet attach "$consumer/AttachedConsumer.csproj" \
+    --rust-crate "$product/rustlib"
+cargo_dotnet_msbuild="$installed"
+if command -v cygpath >/dev/null 2>&1; then
+    cargo_dotnet_msbuild="$(cygpath -w "$installed")"
+fi
+attached_log="$work/attached-consumer.log"
+CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
+    dotnet run --project "$consumer/AttachedConsumer.csproj" -c Release \
+    -p:CargoDotnet="$cargo_dotnet_msbuild" > "$attached_log" 2>&1
+grep -Fq 'managed Rust processed 21 into 42' "$attached_log"
+grep -Fq 'native Rust probe=0' "$attached_log"
+test -s "$consumer/bin/Release/net10.0/$native_filename"
 
 echo "== release bundle ready: $bundle =="

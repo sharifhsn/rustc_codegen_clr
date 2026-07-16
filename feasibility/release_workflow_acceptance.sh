@@ -30,6 +30,9 @@ grep -Fq 'feasibility/release_bundle.sh' "$release" || fail "release does not ru
 grep -Fq 'bundle create' "$bundle" || fail "release does not create SDK bundles"
 grep -Fq 'bundle verify' "$bundle" || fail "release does not verify SDK bundles"
 grep -Fq 'bundle install' "$bundle" || fail "release does not clean-install SDK bundles"
+grep -Fq 'dotnet attach' "$bundle" || fail "release does not exercise installed MSBuild attachment"
+grep -Fq 'native Rust probe=0' "$bundle" \
+    || fail "release does not exercise installed attached-host native sidecars"
 grep -Fq 'actions/upload-artifact@' "$release" || fail "release does not archive host assets"
 grep -Fq 'actions/download-artifact@' "$release" || fail "release does not collect host assets"
 grep -Fq 'gh release create' "$release" || fail "release does not publish a GitHub release"
