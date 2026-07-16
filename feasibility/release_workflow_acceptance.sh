@@ -36,6 +36,10 @@ grep -Fq 'native Rust probe=0' "$bundle" \
 grep -Fq 'actions/upload-artifact@' "$release" || fail "release does not archive host assets"
 grep -Fq 'actions/download-artifact@' "$release" || fail "release does not collect host assets"
 grep -Fq 'gh release create' "$release" || fail "release does not publish a GitHub release"
+grep -Fq 'RELEASE_NOTES_${version}.md' "$release" \
+    || fail "release notes are not selected from the immutable tag version"
+! grep -Fq -- '--notes-file docs/RELEASE_NOTES_0.0.1.md' "$release" \
+    || fail "release notes are still hardcoded to 0.0.1"
 grep -Fq -- '--prerelease' "$release" || fail "0.x compiler release must remain a prerelease"
 grep -Fq 'install.sh install.ps1' "$release" || fail "release does not attach bootstrap installers"
 
