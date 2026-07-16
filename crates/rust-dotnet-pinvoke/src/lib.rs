@@ -1619,10 +1619,66 @@ macro_rules! native_api {
         $crate::native_api! { $($rest)* }
     };
 
+    (
+        $(#[$metadata:meta])*
+        $visibility:vis handle $name:ident($target:ty) { $($policies:tt)* }
+        $($rest:tt)*
+    ) => {
+        ::core::compile_error!(::core::concat!(
+            "native_api!: handle `", ::core::stringify!($name),
+            "` has an incomplete or contradictory ownership policy. A safe handle requires exactly `close = path;`; raw native handles may remain in ordinary bindgen declarations. Observed policy: `",
+            ::core::stringify!($($policies)*), "`"
+        ));
+    };
+
+    (
+        $(#[$metadata:meta])*
+        $visibility:vis scoped_callback $storage:ident as $trampoline:ident(
+            $($arguments:tt)*
+        ) -> $return_type:ty { $($policies:tt)* }
+        $($rest:tt)*
+    ) => {
+        ::core::compile_error!(::core::concat!(
+            "native_api!: scoped callback `", ::core::stringify!($storage),
+            "` has an incomplete or contradictory callback policy. A safe scoped callback requires `on_panic = fallback;` and a fixed `extern \"C\"` trampoline; raw callback declarations remain a supported escape hatch. Observed policy: `",
+            ::core::stringify!($($policies)*), "`"
+        ));
+    };
+
+    (
+        $(#[$metadata:meta])*
+        $visibility:vis retained_callback $registration:ident, $stop_failure:ident
+            as $trampoline:ident($($arguments:tt)*) -> $return_type:ty
+        { $($policies:tt)* }
+        $($rest:tt)*
+    ) => {
+        ::core::compile_error!(::core::concat!(
+            "native_api!: retained callback `", ::core::stringify!($registration),
+            "` has an incomplete or contradictory lifetime policy. Retained callbacks must explicitly declare start arguments, token type, register and unregister calls, status mapping, panic fallback, `quiescence = unregister_waits;`, and `threading = send;`; use a raw declaration when the native API cannot make those guarantees. Observed policy: `",
+            ::core::stringify!($($policies)*), "`"
+        ));
+    };
+
+    (
+        $(#[$metadata:meta])*
+        $visibility:vis fn $name:ident($($argument:ident : $argument_type:ty),* $(,)?)
+            -> $success_type:ty
+        { $($policies:tt)* }
+        $($rest:tt)*
+    ) => {
+        ::core::compile_error!(::core::concat!(
+            "native_api!: function `", ::core::stringify!($name),
+            "` has an incomplete or contradictory safe-facade policy. Every facade requires one `unsafe_call`, one `status` mapper, and one matching `success` projection; converted strings need utf8/utf16 storage, out values must match the projection, owned strings require an explicit free function, and error strings require `error_out` plus `error`. Raw `extern`/bindgen declarations remain valid and callable without a facade. Observed policies: `",
+            ::core::stringify!($($policies)*), "`"
+        ));
+    };
+
     ($($invalid:tt)+) => {
         ::core::compile_error!(
-            "native_api!: expected an explicit `handle` declaration or a function with out, \
-             unsafe_call, status, and success policies"
+            "native_api!: unrecognized declaration. Expected `handle`, `scoped_callback`, \
+             `retained_callback`, or `fn` with explicit unsafe_call/status/success policies. \
+             Ordinary raw extern/bindgen declarations do not need native_api! and remain the \
+             supported escape hatch for APIs without a complete safe policy"
         );
     };
 }

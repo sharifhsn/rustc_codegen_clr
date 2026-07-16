@@ -100,6 +100,7 @@ jobs:
         run: |
           bash feasibility/pinvoke_acceptance.sh
           bash feasibility/pinvoke_async_callback_acceptance.sh
+          bash feasibility/pinvoke_policy_diagnostics_acceptance.sh
       - name: Run Windows product host acceptance
         shell: bash
         run: bash feasibility/product_hosts_acceptance.sh
@@ -125,6 +126,7 @@ jobs:
         run: |
           bash feasibility/pinvoke_acceptance.sh
           bash feasibility/pinvoke_async_callback_acceptance.sh
+          bash feasibility/pinvoke_policy_diagnostics_acceptance.sh
       - name: Run Apple Silicon product host acceptance
         run: bash feasibility/product_hosts_acceptance.sh
       - name: Run Apple Silicon host/profile diagnostics acceptance
@@ -193,6 +195,7 @@ jobs:
         run: |
           bash feasibility/pinvoke_acceptance.sh
           bash feasibility/pinvoke_async_callback_acceptance.sh
+          bash feasibility/pinvoke_policy_diagnostics_acceptance.sh
       - name: Run Linux product host acceptance
         run: bash feasibility/product_hosts_acceptance.sh
       - name: Run Linux host/profile diagnostics acceptance

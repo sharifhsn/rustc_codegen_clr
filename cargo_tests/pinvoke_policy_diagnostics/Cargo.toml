@@ -1,0 +1,18 @@
+[package]
+name = "pinvoke_policy_diagnostics"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["raw"]
+raw = []
+incomplete-function = []
+contradictory-string = []
+incomplete-retained = []
+incomplete-scoped = []
+incomplete-handle = []
+
+[dependencies]
+rust-dotnet-pinvoke = { path = "../../crates/rust-dotnet-pinvoke" }
+
+[workspace]

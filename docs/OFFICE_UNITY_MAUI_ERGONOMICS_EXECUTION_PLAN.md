@@ -273,8 +273,13 @@ MAUI is a profile matrix rather than one runtime:
   exactly-once result/error extraction, retryable stop, diagnostics, and idempotent disposal. Its
   state-ID constructor is assembly-internal rather than forgeable from consumer C#; the full
   native-worker acceptance reflects that metadata and exercises every lifecycle outcome.
-- [ ] Keep raw bindgen declarations as the escape hatch and produce diagnostics whenever a safe
+- [x] Keep raw bindgen declarations as the escape hatch and produce diagnostics whenever a safe
   wrapper policy is incomplete or contradictory.
+  `native_api!` now has declaration-specific fallbacks for functions, handles, scoped callbacks,
+  and retained callbacks. Each diagnostic names the facade, prints the observed policy, lists the
+  complete safety contract, and points back to ordinary raw extern/bindgen declarations. The
+  cross-platform policy-diagnostics acceptance proves raw-only compilation plus missing function,
+  contradictory UTF projection, incomplete handle, scoped-callback, and retained-callback failures.
 
 ### E. Product scaffolding and existing-project attachment
 
