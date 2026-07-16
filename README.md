@@ -30,6 +30,10 @@ The installer downloads the matching host SDK bundle, verifies its checksum and 
 installs it under `~/.cargo-dotnet`, and installs `cargo-dotnet` under Cargo's bin directory. It does
 not modify your system Rust installation.
 
+The commands above install the immutable 0.0.1 tag. Current `main` contains newer interop and
+product-host work that will ship only after a new three-platform release passes the same bundle
+and clean-install gates; the 0.0.1 assets are not silently replaced.
+
 ## Run Rust on .NET
 
 ```bash
@@ -52,7 +56,7 @@ cargo dotnet run examples/issue-dashboard
 The issue dashboard parses JSON using managed `System.Text.Json` from Rust, then processes the
 result with ordinary Rust code.
 
-## What works
+## What works on current main
 
 - Rust applications compiled to managed .NET executables
 - Rust libraries and plugins consumed from C#

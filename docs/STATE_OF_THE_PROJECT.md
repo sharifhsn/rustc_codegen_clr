@@ -29,9 +29,10 @@ compiler ABI, and may still crash, reject valid Rust, or miscompile unsupported 
   unwinding, async Rust, and core tokio/rayon-shaped workloads.
 - The alternate C exporter shares the compiler IR but remains a secondary prototype.
 
-Repository test campaigns currently report 2,657 passing core tests, roughly 96% of the relevant
-rustc run-pass suite, and a 137-crate ecosystem differential survey with roughly 85% byte-identical
-results. These are broad confidence signals, not a guarantee for arbitrary programs.
+The repository maintains compiler regressions, native-Rust differential checks, host-runtime
+acceptances, package consumers, and clean-install tests. Those gates are confidence signals, not a
+guarantee for arbitrary programs; support claims are limited to the explicit compatibility
+profiles and host evidence recorded by the current release workflow.
 
 ## Interop
 
@@ -78,8 +79,8 @@ remain normal host prerequisites.
 
 ## Near-term priorities
 
-1. Publish and clean-install the three host SDK bundles.
+1. Keep clean-install and first-run acceptance green for all three published SDK hosts.
 2. Make first-user failures reproducible and actionable through GitHub Issues.
-3. Expand Windows MSBuild/packaging and interactive debugger coverage.
+3. Add real Windows Excel, WinUI, and MAUI launch evidence before promoting those host profiles.
 4. Improve correctness and ecosystem compatibility based on real external programs.
 5. Pursue an upstream Rust `*-unknown-dotnet` target as the longer-term integration path.
