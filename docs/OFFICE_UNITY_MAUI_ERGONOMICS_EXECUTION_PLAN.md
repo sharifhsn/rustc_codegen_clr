@@ -337,8 +337,15 @@ MAUI is a profile matrix rather than one runtime:
   native asset. The full-metadata acceptance package proves README, MIT license, repository URL,
   XML docs, Portable PDB, and Source Link configuration together; the separate Portable-PDB gate
   proves the embedded standard Source Link payload resolves logical Rust documents.
-- [ ] Diagnose host/profile incompatibility explicitly for VSTO, Unity, MAUI platform targets, and
+- [x] Diagnose host/profile incompatibility explicitly for VSTO, Unity, MAUI platform targets, and
   older/newer CoreCLR hosts rather than failing later in the loader.
+  `cargo dotnet doctor --workspace` now joins each `<RustCrate>` to its schema-1 Cargo profile and
+  checks the MSBuild profile, TFM matrix, VSTO/MAUI/WinUI markers, evidence state, and current host
+  RID. VSTO gets the Excel-DNA/out-of-process alternatives; Unity explains the missing
+  `netstandard2.1` artifact; planned/unsupported profiles are hard failures; preview profiles are
+  explicit non-fatal warnings. Unit fixtures cover VSTO, Unity, MAUI, CoreCLR drift, and Windows
+  Excel preview, while `profile_diagnostics_acceptance.sh` generates Web API and MAUI projects and
+  proves supported versus planned JSON on Linux, macOS, and Windows CI.
 - [x] Add named, machine-readable compatibility profiles through `cargo dotnet profiles --json`:
   `net10-coreclr`, `excel-dna-net10-windows`, `unity-netstandard2.1`, `maui-windows-net10`,
   Android, Apple, and explicitly unsupported in-process VSTO. Only `net10-coreclr` is marked fully

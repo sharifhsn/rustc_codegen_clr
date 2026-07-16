@@ -692,20 +692,8 @@ fn file_check(label: &str, path: &Path, hard: bool) -> Check {
 // ---------------------------------------------------------------------------------
 // Workspace wiring lints (RustCrate csproj wiring + TFM/RustDotnetVersion mismatches).
 //
-// These are static-text scans, not MSBuild evaluation: they look for the `<RustCrate
-// Include="...">` item and `<RustDotnetVersion>`/`<TargetFramework>` properties by simple
-// XML string matching, which is good enough to catch the common mistakes (a sibling Rust
-// crate nobody references; a hardcoded TargetFramework that has drifted from
-// RustDotnetVersion) without pulling in a full MSBuild evaluator.
-//
-// NOTE on the third lint the backlog item asked about — "stale generated bindings": there
-// is no existing per-project generated-bindings artifact with a staleness signal to check.
-// `mycorrhiza/src/bindings.rs` is a hand-committed, one-time `spinacz`-generated file (see
-// its module doc), not something rebuilt per project with a hash/timestamp marker; the only
-// other "generated bindings" in the tree is `cargo_tests/spinacz/out.rs`, a one-off demo
-// output with the same lack of a freshness marker. Inventing a new hashing/timestamp scheme
-// here would be new infrastructure, which the task instructions say to skip rather than add.
-// So only checks (1) and (2) are implemented.
+// These are static-text scans, not full MSBuild evaluation. They catch missing `<RustCrate>`
+// wiring, runtime-version drift, and host/profile contradictions before the CLR loader runs.
 // ---------------------------------------------------------------------------------
 
 /// Directory names never worth descending into while scanning a workspace.
@@ -719,6 +707,17 @@ const SKIP_DIRS: &[&str] = &[
     ".idea",
     "graphify-out",
 ];
+
+struct CsProjFacts {
+    path: PathBuf,
+    rust_crate_dirs: Vec<PathBuf>,
+    rust_dotnet_version: Option<String>,
+    target_framework: Option<String>,
+    compatibility_profile: Option<String>,
+    use_maui: bool,
+    use_winui: bool,
+    source: String,
+}
 
 fn workspace_wiring_checks(root: &Path) -> Vec<Check> {
     if !root.is_dir() {
@@ -739,12 +738,6 @@ fn workspace_wiring_checks(root: &Path) -> Vec<Check> {
 
     // Read each csproj once: (path, contents, RustCrate Include paths (resolved absolute),
     // RustDotnetVersion property value if present, TargetFramework property value if present).
-    struct CsProjFacts {
-        path: PathBuf,
-        rust_crate_dirs: Vec<PathBuf>,
-        rust_dotnet_version: Option<String>,
-        target_framework: Option<String>,
-    }
     let mut csproj_facts = Vec::new();
     for csproj in &csprojs {
         let Ok(text) = std::fs::read_to_string(csproj) else {
@@ -759,7 +752,14 @@ fn workspace_wiring_checks(root: &Path) -> Vec<Check> {
             path: csproj.clone(),
             rust_crate_dirs,
             rust_dotnet_version: extract_property(&text, "RustDotnetVersion"),
-            target_framework: extract_property(&text, "TargetFramework"),
+            target_framework: extract_property(&text, "TargetFramework")
+                .or_else(|| extract_property(&text, "TargetFrameworks")),
+            compatibility_profile: extract_property(&text, "RustDotnetCompatibilityProfile"),
+            use_maui: extract_property(&text, "UseMaui")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+            use_winui: extract_property(&text, "UseWinUI")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+            source: text,
         });
     }
 
@@ -828,7 +828,7 @@ fn workspace_wiring_checks(root: &Path) -> Vec<Check> {
                 if tfm.contains("$(RustDotnetVersion)") {
                     continue;
                 }
-                if tfm != expected {
+                if !tfm_matches_runtime(tfm, &expected) {
                     checks.push(Check::fail(
                         format!("TFM/RustDotnetVersion: {}", f.path.display()),
                         format!(
@@ -848,8 +848,8 @@ fn workspace_wiring_checks(root: &Path) -> Vec<Check> {
                 // only if the hardcoded TFM disagrees with that default (net9.0, net10.0, …),
                 // since that is the actual failure mode (dotnet build targets a runtime the
                 // Rust side wasn't built for).
-                if tfm != "net10.0" {
-                    checks.push(Check::warn(
+                if !tfm_matches_runtime(tfm, "net10.0") {
+                    checks.push(Check::fail(
                         format!("TFM/RustDotnetVersion: {}", f.path.display()),
                         format!(
                             "<TargetFramework>{tfm}</TargetFramework> is set but \
@@ -866,6 +866,16 @@ fn workspace_wiring_checks(root: &Path) -> Vec<Check> {
         }
     }
 
+    // (3) Product host / compatibility-profile mismatches. The Rust crate is authoritative;
+    // an explicit MSBuild property must agree with it, and evidence-gated planned/unsupported
+    // profiles fail here instead of surfacing later as TypeLoad/DllNotFound errors.
+    let host = HostFacts::detect();
+    for project in &csproj_facts {
+        for crate_dir in &project.rust_crate_dirs {
+            checks.push(profile_compatibility_check(project, crate_dir, &host));
+        }
+    }
+
     if checks.is_empty() {
         checks.push(Check::pass(
             "workspace wiring",
@@ -873,6 +883,160 @@ fn workspace_wiring_checks(root: &Path) -> Vec<Check> {
         ));
     }
     checks
+}
+
+fn tfm_matches_runtime(tfm: &str, expected: &str) -> bool {
+    tfm.split(';').all(|candidate| {
+        let candidate = candidate.trim();
+        candidate == expected || candidate.starts_with(&format!("{expected}-"))
+    })
+}
+
+fn rust_compatibility_profile(crate_dir: &Path) -> anyhow::Result<Option<String>> {
+    let manifest = crate_dir.join("Cargo.toml");
+    let source = std::fs::read_to_string(&manifest)?;
+    let value: toml::Value = toml::from_str(&source)?;
+    Ok(value
+        .get("package")
+        .and_then(|value| value.get("metadata"))
+        .and_then(|value| value.get("dotnet"))
+        .and_then(|value| value.get("compatibility-profile"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned))
+}
+
+fn profile_compatibility_check(project: &CsProjFacts, crate_dir: &Path, host: &HostFacts) -> Check {
+    let label = format!("host/profile: {}", project.path.display());
+    let rust_profile = match rust_compatibility_profile(crate_dir) {
+        Ok(Some(profile)) => profile,
+        Ok(None) => {
+            return Check::warn(
+                label,
+                format!(
+                    "{} has no package.metadata.dotnet.compatibility-profile; migrate it to identity-schema 1 so host compatibility is explicit",
+                    crate_dir.display()
+                ),
+            );
+        }
+        Err(error) => {
+            return Check::fail(
+                label,
+                format!("could not read {}: {error:#}", crate_dir.display()),
+            );
+        }
+    };
+    if let Some(msbuild_profile) = project.compatibility_profile.as_deref()
+        && msbuild_profile != rust_profile
+    {
+        return Check::fail(
+            label,
+            format!(
+                "C# declares RustDotnetCompatibilityProfile {msbuild_profile:?}, but {} declares {rust_profile:?}; re-run `cargo dotnet attach` or make both declarations agree",
+                crate_dir.display()
+            ),
+        );
+    }
+    let Some((support, supported_rids)) = crate::profiles::package_contract(&rust_profile) else {
+        return Check::fail(
+            label,
+            format!("unknown compatibility profile {rust_profile:?}; run `cargo dotnet profiles`"),
+        );
+    };
+    let source = project.source.to_ascii_lowercase();
+    let declared_tfm = project.target_framework.as_deref().unwrap_or("<missing>");
+    let resolved_tfm = declared_tfm.replace(
+        "$(RustDotnetVersion)",
+        project.rust_dotnet_version.as_deref().unwrap_or("10"),
+    );
+    let tfm = resolved_tfm.as_str();
+    let is_vsto = source.contains("microsoft.office.tools")
+        || source.contains("<officeapplication>")
+        || source.contains("vstoinstall");
+    if is_vsto || rust_profile == "vsto-net10-in-process" {
+        return Check::fail(
+            label,
+            "in-process VSTO targets .NET Framework 4.8 and cannot load the .NET 10 Rust assembly; use the Excel-DNA profile or a thin VSTO shim calling an out-of-process .NET 10 service"
+                .to_owned(),
+        );
+    }
+    if tfm == "<missing>" {
+        return Check::fail(
+            label,
+            "a Rust-consuming project must declare TargetFramework or TargetFrameworks so its compatibility profile can be verified"
+                .to_owned(),
+        );
+    }
+    if rust_profile == "unity-netstandard2.1" {
+        return Check::fail(
+            label,
+            format!(
+                "Unity requires a proven netstandard2.1 artifact, but the public SDK currently emits net10.0; found {tfm}. The Unity profile remains planned until Editor and IL2CPP execution pass"
+            ),
+        );
+    }
+    if !tfm_matches_runtime(tfm, "net10.0") {
+        return Check::fail(
+            label,
+            format!(
+                "profile {rust_profile:?} requires the public .NET 10 contract, but the project targets {tfm:?}; older and newer CoreCLR hosts are not binary-compatibility claims"
+            ),
+        );
+    }
+    let is_maui = project.use_maui
+        || tfm.contains("-android")
+        || tfm.contains("-ios")
+        || tfm.contains("-maccatalyst");
+    let is_winui = project.use_winui;
+    if is_maui && !rust_profile.starts_with("maui-") {
+        return Check::fail(
+            label,
+            format!(
+                "MAUI target {tfm:?} cannot use profile {rust_profile:?}; select a matching MAUI profile and satisfy its platform runtime gate"
+            ),
+        );
+    }
+    if is_winui && rust_profile != "winui3-net10-windows" {
+        return Check::fail(
+            label,
+            format!(
+                "WinUI 3 cannot use profile {rust_profile:?}; use winui3-net10-windows after its Windows runtime gate passes"
+            ),
+        );
+    }
+    if support == "planned" || support == "unsupported" {
+        return Check::fail(
+            label,
+            format!(
+                "compatibility profile {rust_profile:?} is {support}, not executable product support; `cargo dotnet profiles` lists the missing evidence"
+            ),
+        );
+    }
+    if !supported_rids.is_empty() && !supported_rids.contains(&host.host_rid) {
+        return Check::fail(
+            label,
+            format!(
+                "profile {rust_profile:?} supports host RID(s) {}, but this machine is {}; build and launch it on a supported host",
+                supported_rids.join(", "),
+                host.host_rid
+            ),
+        );
+    }
+    if support == "preview" {
+        return Check::warn(
+            label,
+            format!(
+                "{rust_profile} [preview] matches {tfm} on {}, but its final in-host launch evidence is not complete; `cargo dotnet profiles` states the remaining gate",
+                host.host_rid
+            ),
+        );
+    }
+    Check::pass(
+        label,
+        format!(
+            "{rust_profile} [{support}] matches {tfm} on {}",
+            host.host_rid
+        ),
+    )
 }
 
 /// Recursively collect `Cargo.toml` and `*.csproj` paths under `dir`, skipping build/VCS dirs.
@@ -1439,13 +1603,15 @@ mod tests {
         let root = tmp_dir("clean");
         write(
             &root.join("good/rustlib/Cargo.toml"),
-            "[package]\nname = \"probe\"\n",
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n\
+             [package.metadata.dotnet]\ncompatibility-profile = \"net10-coreclr\"\n",
         );
         write(
             &root.join("good/csharp/probe_cs.csproj"),
             r#"<Project><PropertyGroup>
-                <RustDotnetVersion>8</RustDotnetVersion>
+                <RustDotnetVersion>10</RustDotnetVersion>
                 <TargetFramework>net$(RustDotnetVersion).0</TargetFramework>
+                <RustDotnetCompatibilityProfile>net10-coreclr</RustDotnetCompatibilityProfile>
             </PropertyGroup>
             <ItemGroup><RustCrate Include="../rustlib" /></ItemGroup></Project>"#,
         );
@@ -1455,6 +1621,128 @@ mod tests {
             "expected a clean report, got a flagged check"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn profile_probe(
+        name: &str,
+        rust_profile: &str,
+        tfm: &str,
+        msbuild_profile: Option<&str>,
+        extra_xml: &str,
+        host: HostFacts,
+    ) -> Check {
+        let root = tmp_dir(name);
+        let crate_dir = root.join("rustlib");
+        write(
+            &crate_dir.join("Cargo.toml"),
+            &format!(
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n\
+                 [package.metadata.dotnet]\ncompatibility-profile = \"{rust_profile}\"\n"
+            ),
+        );
+        let profile_xml = msbuild_profile
+            .map(|profile| {
+                format!(
+                    "<RustDotnetCompatibilityProfile>{profile}</RustDotnetCompatibilityProfile>"
+                )
+            })
+            .unwrap_or_default();
+        let facts = CsProjFacts {
+            path: root.join("Probe.csproj"),
+            rust_crate_dirs: vec![crate_dir.clone()],
+            rust_dotnet_version: Some("10".into()),
+            target_framework: Some(tfm.into()),
+            compatibility_profile: msbuild_profile.map(str::to_owned),
+            use_maui: extra_xml
+                .to_ascii_lowercase()
+                .contains("<usemaui>true</usemaui>"),
+            use_winui: extra_xml
+                .to_ascii_lowercase()
+                .contains("<usewinui>true</usewinui>"),
+            source: format!(
+                "<Project><PropertyGroup><TargetFramework>{tfm}</TargetFramework>{profile_xml}{extra_xml}</PropertyGroup></Project>"
+            ),
+        };
+        let check = profile_compatibility_check(&facts, &crate_dir, &host);
+        let _ = std::fs::remove_dir_all(root);
+        check
+    }
+
+    #[test]
+    fn profile_diagnostics_cover_vsto_unity_maui_and_coreclr_drift() {
+        let windows = HostFacts {
+            os: "windows",
+            dylib_ext: "dll",
+            exe_ext: ".exe",
+            host_rid: "win-x64",
+        };
+        let vsto = profile_probe(
+            "vsto",
+            "net10-coreclr",
+            "net10.0-windows",
+            Some("net10-coreclr"),
+            "<Reference Include=\"Microsoft.Office.Tools\" />",
+            windows,
+        );
+        assert!(vsto.hard && !vsto.ok && vsto.detail.contains("VSTO"));
+
+        let unity = profile_probe(
+            "unity",
+            "unity-netstandard2.1",
+            "netstandard2.1",
+            Some("unity-netstandard2.1"),
+            "",
+            windows,
+        );
+        assert!(unity.hard && !unity.ok && unity.detail.contains("Unity requires"));
+
+        let maui = profile_probe(
+            "maui",
+            "net10-coreclr",
+            "net10.0-android",
+            Some("net10-coreclr"),
+            "<UseMaui>true</UseMaui>",
+            windows,
+        );
+        assert!(maui.hard && !maui.ok && maui.detail.contains("MAUI target"));
+
+        let old_coreclr = profile_probe(
+            "old_coreclr",
+            "net10-coreclr",
+            "net9.0",
+            Some("net10-coreclr"),
+            "",
+            windows,
+        );
+        assert!(
+            old_coreclr.hard
+                && !old_coreclr.ok
+                && old_coreclr.detail.contains("older and newer CoreCLR")
+        );
+    }
+
+    #[test]
+    fn windows_excel_preview_profile_is_explicitly_accepted_on_windows() {
+        let check = profile_probe(
+            "excel_preview",
+            "excel-dna-net10-windows",
+            "net10.0-windows",
+            Some("excel-dna-net10-windows"),
+            "",
+            HostFacts {
+                os: "windows",
+                dylib_ext: "dll",
+                exe_ext: ".exe",
+                host_rid: "win-x64",
+            },
+        );
+        assert!(!check.ok && !check.hard, "{}", check.detail);
+        assert!(check.detail.contains("[preview]"));
+        assert!(tfm_matches_runtime(
+            "net10.0-windows10.0.19041.0",
+            "net10.0"
+        ));
+        assert!(!tfm_matches_runtime("net9.0", "net10.0"));
     }
 
     #[test]

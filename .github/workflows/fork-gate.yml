@@ -103,6 +103,9 @@ jobs:
       - name: Run Windows product host acceptance
         shell: bash
         run: bash feasibility/product_hosts_acceptance.sh
+      - name: Run Windows host/profile diagnostics acceptance
+        shell: bash
+        run: bash feasibility/profile_diagnostics_acceptance.sh
       - name: Build packed Excel-DNA managed Rust add-in
         shell: bash
         run: bash feasibility/excel_dna_acceptance.sh
@@ -124,6 +127,8 @@ jobs:
           bash feasibility/pinvoke_async_callback_acceptance.sh
       - name: Run Apple Silicon product host acceptance
         run: bash feasibility/product_hosts_acceptance.sh
+      - name: Run Apple Silicon host/profile diagnostics acceptance
+        run: bash feasibility/profile_diagnostics_acceptance.sh
   product_acceptance_smoke:
     # One release case per decisive product oracle. The full matrix remains a manual/release gate.
     runs-on: ubuntu-22.04
@@ -190,6 +195,8 @@ jobs:
           bash feasibility/pinvoke_async_callback_acceptance.sh
       - name: Run Linux product host acceptance
         run: bash feasibility/product_hosts_acceptance.sh
+      - name: Run Linux host/profile diagnostics acceptance
+        run: bash feasibility/profile_diagnostics_acceptance.sh
       - name: Run direct async export acceptance
         run: bash feasibility/async_export_acceptance.sh
       - name: Run managed-array and explicit Rust-owned-vector acceptance

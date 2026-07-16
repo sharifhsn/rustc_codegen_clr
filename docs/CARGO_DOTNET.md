@@ -189,6 +189,12 @@ cargo dotnet doctor
 cargo dotnet doctor --json
 ```
 
+When a C# project references a schema-1 Rust crate, `doctor --workspace` compares the crate's
+compatibility profile with `RustDotnetCompatibilityProfile`, the project TFM(s), product markers,
+and the current host RID. It rejects older/newer CoreCLR contracts, in-process VSTO, unproven Unity
+`netstandard2.1`, MAUI/WinUI profile misuse, and every planned or unsupported profile before the
+loader runs. Preview profiles remain non-fatal warnings and name their missing host-execution gate.
+
 You can also pass an exception, linker message, or log file to `doctor`. It recognizes common
 runtime/profile mismatches, unsupported managed layouts, stale artifacts, missing entry points,
 and installation problems.
