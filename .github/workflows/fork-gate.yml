@@ -122,6 +122,13 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Build compiler and cargo-dotnet
         run: cargo build --release --workspace
+      - name: Install .NET 10 CoreCLR ILAsm
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/ilasm10.zip" "https://www.nuget.org/api/v2/package/runtime.osx-arm64.microsoft.netcore.ilasm/10.0.0"
+          unzip -qo "$RUNNER_TEMP/ilasm10.zip" -d "$RUNNER_TEMP/ilasm10"
+          mkdir -p "$HOME/.dotnet/ilasm10-tool"
+          cp "$RUNNER_TEMP/ilasm10/runtimes/osx-arm64/native/ilasm" "$HOME/.dotnet/ilasm10-tool/ilasm"
+          chmod +x "$HOME/.dotnet/ilasm10-tool/ilasm"
       - name: Run Apple Silicon P/Invoke acceptances
         run: |
           bash feasibility/pinvoke_acceptance.sh

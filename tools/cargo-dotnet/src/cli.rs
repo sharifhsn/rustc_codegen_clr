@@ -376,7 +376,7 @@ pub struct AttachArgs {
     #[arg(long, value_name = "PATH")]
     pub rust_crate: PathBuf,
 
-    /// Include the shipped RustVec<T>/RustBoxVec<T> C# wrappers.
+    /// Include the shipped `RustVec<T>`/`RustBoxVec<T>` C# wrappers.
     #[arg(long)]
     pub containers: bool,
 

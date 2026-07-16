@@ -167,6 +167,7 @@ mod tests {
     use super::{runtime_asset_manifest_path, write_runtime_asset_manifest};
     use crate::artifact::Artifact;
     use std::fs;
+    use std::path::Path;
 
     #[test]
     fn runtime_asset_manifest_preserves_relative_deployment_paths() {
@@ -192,7 +193,11 @@ mod tests {
         let source = fs::canonicalize(&resource).unwrap();
         assert_eq!(
             fs::read_to_string(runtime_asset_manifest_path(&dll)).unwrap(),
-            format!("{}|fr/Backend.resources.dll\n", source.display())
+            format!(
+                "{}|{}\n",
+                source.display(),
+                Path::new("fr").join("Backend.resources.dll").display()
+            )
         );
         fs::remove_dir_all(root).unwrap();
     }

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -848,10 +848,12 @@ mod tests {
         );
         assert_eq!(resolved.compile_dlls.len(), 2);
         assert_eq!(resolved.runtime_dlls.len(), 2);
-        assert!(resolved
-            .runtime_dlls
-            .iter()
-            .any(|p| p.ends_with("Dependency.dll")));
+        assert!(
+            resolved
+                .runtime_dlls
+                .iter()
+                .any(|p| p.ends_with("Dependency.dll"))
+        );
         fs::remove_dir_all(temp).unwrap();
     }
 
@@ -1223,8 +1225,8 @@ mod tests {
     }
 
     #[test]
-    fn missing_recorded_roots_flags_a_staged_graph_whose_version_no_longer_matches_what_was_recorded(
-    ) {
+    fn missing_recorded_roots_flags_a_staged_graph_whose_version_no_longer_matches_what_was_recorded()
+     {
         let temp = unique_temp("missing-roots-version-drift");
         let crate_dir = temp.join("consumer");
         let source = temp.join("source");
