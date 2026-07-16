@@ -9,7 +9,10 @@
 //! The native pipeline maps the bash core's three separable phases onto typed stages:
 //!   PAL inject -> overlays apply -> build-std -> locate artifact -> (run | report).
 
-use anyhow::Result;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context as _, Result, bail};
 
 use crate::artifact::Artifact;
 use crate::cli::BuildArgs;
@@ -73,11 +76,14 @@ fn run_native(ctx: &Context, prog_args: &[String]) -> Result<i32> {
         Artifact::None => None,
     };
     if let Some(out_dir) = out_dir {
-        nuget::copy_assets(&ctx.crate_dir, out_dir)?;
+        let mut runtime_assets = nuget::copy_assets(&ctx.crate_dir, out_dir)?;
         // 4.6. Copy the bundled `Mycorrhiza.Interop.Helpers` companion dll (building it first if
         // needed) for any crate that depends on `mycorrhiza` — see `interop_helpers`'s doc comment
         // for why this is unconditional rather than gated on a marker directory like 4.5 above.
-        interop_helpers::ensure_and_copy(ctx, out_dir)?;
+        if let Some(helper) = interop_helpers::ensure_and_copy(ctx, out_dir)? {
+            runtime_assets.push(helper);
+        }
+        write_runtime_asset_manifest(&art, &runtime_assets)?;
     }
     if let Some(receipt) = crate::receipt::write(ctx, &art, &private_sysroot)? {
         eprintln!("== artifact receipt: {} ==", receipt.display());
@@ -88,6 +94,107 @@ fn run_native(ctx: &Context, prog_args: &[String]) -> Result<i32> {
     } else {
         report(&art);
         Ok(0)
+    }
+}
+
+/// Record the exact runtime sidecars materialized beside a managed Rust library. Each line is
+/// `absolute-source|relative-destination`: MSBuild can therefore combine assets from several Rust
+/// crates while preserving culture-resource subdirectories instead of flattening every file into
+/// the host output root.
+fn write_runtime_asset_manifest(artifact: &Artifact, assets: &[PathBuf]) -> Result<()> {
+    let Artifact::Library { dll, .. } = artifact else {
+        return Ok(());
+    };
+    let root = dll
+        .parent()
+        .context("managed Rust library has no artifact directory")?;
+    let root = fs::canonicalize(root)
+        .with_context(|| format!("resolving artifact directory {}", root.display()))?;
+    let mut assets = assets
+        .iter()
+        .map(|path| {
+            let source = fs::canonicalize(path)
+                .with_context(|| format!("resolving runtime asset {}", path.display()))?;
+            let relative = source
+                .strip_prefix(&root)
+                .with_context(|| {
+                    format!(
+                        "runtime asset {} is outside artifact directory {}",
+                        source.display(),
+                        root.display()
+                    )
+                })?
+                .to_path_buf();
+            if relative.as_os_str().is_empty() {
+                bail!("runtime asset cannot be the artifact directory itself");
+            }
+            Ok((source, relative))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    assets.sort();
+    assets.dedup();
+    let mut text = String::new();
+    for (source, relative) in assets {
+        let source_value = source.to_string_lossy();
+        let relative_value = relative.to_string_lossy();
+        if source_value.contains(['\r', '\n', '|', ';'])
+            || relative_value.contains(['\r', '\n', '|', ';'])
+        {
+            bail!(
+                "runtime asset path contains a manifest-reserved character: {}",
+                source.display()
+            );
+        }
+        text.push_str(&source_value);
+        text.push('|');
+        text.push_str(&relative_value);
+        text.push('\n');
+    }
+    let manifest = runtime_asset_manifest_path(dll);
+    if fs::read_to_string(&manifest).ok().as_deref() != Some(text.as_str()) {
+        fs::write(&manifest, text)
+            .with_context(|| format!("writing runtime asset manifest {}", manifest.display()))?;
+    }
+    Ok(())
+}
+
+fn runtime_asset_manifest_path(dll: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.rustdotnet.runtime-assets", dll.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{runtime_asset_manifest_path, write_runtime_asset_manifest};
+    use crate::artifact::Artifact;
+    use std::fs;
+
+    #[test]
+    fn runtime_asset_manifest_preserves_relative_deployment_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "cargo-dotnet-runtime-manifest-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let culture = root.join("fr");
+        fs::create_dir_all(&culture).unwrap();
+        let dll = root.join("Backend.dll");
+        let resource = culture.join("Backend.resources.dll");
+        fs::write(&dll, b"managed").unwrap();
+        fs::write(&resource, b"resource").unwrap();
+        let artifact = Artifact::Library {
+            so: root.join("libbackend.so"),
+            dll: dll.clone(),
+            stem: "Backend".to_string(),
+        };
+
+        write_runtime_asset_manifest(&artifact, std::slice::from_ref(&resource)).unwrap();
+
+        let source = fs::canonicalize(&resource).unwrap();
+        assert_eq!(
+            fs::read_to_string(runtime_asset_manifest_path(&dll)).unwrap(),
+            format!("{}|fr/Backend.resources.dll\n", source.display())
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
 

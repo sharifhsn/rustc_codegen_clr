@@ -531,11 +531,11 @@ pub fn stage_assets(crate_dir: &Path, root_id: &str, assets: &[ResolvedAsset]) -
 /// Materialize the staged runtime closure after a Rust build. This intentionally maps only the
 /// runtime-facing layout (`runtime`, `native`, and culture resources); compile references remain
 /// provenance in the manifest rather than being copied beside an executable.
-pub fn copy_staged_assets(crate_dir: &Path, out_dir: &Path) -> Result<bool> {
+pub fn copy_staged_assets(crate_dir: &Path, out_dir: &Path) -> Result<Option<Vec<PathBuf>>> {
     let assets_dir = crate_dir.join(".cargo-dotnet-nuget-assets");
     let manifest_path = assets_dir.join(STAGING_MANIFEST);
     if !manifest_path.is_file() {
-        return Ok(false);
+        return Ok(None);
     }
     let manifest = read_manifest(&manifest_path)?;
     let mut destinations = BTreeMap::<PathBuf, &OwnedAssetRecord>::new();
@@ -566,6 +566,7 @@ pub fn copy_staged_assets(crate_dir: &Path, out_dir: &Path) -> Result<bool> {
             }
         }
     }
+    let mut copied = Vec::with_capacity(destinations.len());
     for (deployment, asset) in destinations {
         let source = assets_dir.join(&asset.staged_path);
         if !source.is_file() {
@@ -582,8 +583,9 @@ pub fn copy_staged_assets(crate_dir: &Path, out_dir: &Path) -> Result<bool> {
         )?;
         fs::copy(&source, &destination)
             .with_context(|| format!("cp {} -> {}", source.display(), destination.display()))?;
+        copied.push(destination);
     }
-    Ok(true)
+    Ok(Some(copied))
 }
 
 /// Return the subset of `recorded` `(id, version)` pairs whose staged runtime closure is missing
@@ -1110,7 +1112,7 @@ mod tests {
         assert_eq!(staged.len(), 1);
         assert_eq!(staged[0].logical_path, "lib/net8.0/New.dll");
         let output = temp.join("output");
-        assert!(copy_staged_assets(&crate_dir, &output).unwrap());
+        assert!(copy_staged_assets(&crate_dir, &output).unwrap().is_some());
         assert_eq!(fs::read(output.join("New.dll")).unwrap(), b"new");
         assert!(!output.join("Old.dll").exists());
         fs::remove_dir_all(temp).unwrap();

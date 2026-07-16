@@ -308,15 +308,22 @@ MAUI is a profile matrix rather than one runtime:
   requires schema-1 identity, validates host/profile compatibility before mutation, writes one
   marked atomic/idempotent block, supports `--containers` and `--dry-run`, and refuses to guess
   around hand-authored wiring. The product-host acceptance attaches a clean console project and
-  executes the referenced managed Rust API.
+  executes both its managed Rust API and a vendored host-RID native Rust library through P/Invoke.
+  The build emits an exact source/relative-destination asset manifest, so MSBuild preserves native,
+  helper, and satellite-resource layouts without globbing Cargo output or requiring hand-copying.
 - [ ] `cargo dotnet attach-unity <UnityProject> --rust-crate <path>` only after the
   `netstandard2.1` managed profile is proven; copy/reference artifacts and preserve Unity `.meta`
   semantics deterministically.
 - [ ] Attachment must add/validate the MSBuild import, `<RustCrate>`, target profile, generated
   container opt-ins, native assets, namespace/assembly identity, and starter service without
-  overwriting unrelated project content.
+  overwriting unrelated project content. Import, crate/profile, container opt-in, native-asset,
+  namespace/assembly identity, atomicity, and idempotence are covered; a general starter-service
+  contract is still unresolved, so this aggregate item remains open.
 - [ ] Make Visual Studio/Rider/Unity/MAUI build and debug invoke the Rust build without a separate
-  terminal-only step.
+  terminal-only step. SDK-style Visual Studio/Rider projects already get automatic Rust builds and
+  exact runtime sidecar copying through `RustDotnet.targets`; Unity remains gated on its managed
+  profile and MAUI still needs the Windows workload launch proof, so the cross-host item remains
+  open.
 
 ### F. Deployment, diagnostics, and packaging
 

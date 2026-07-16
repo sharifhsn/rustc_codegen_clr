@@ -127,7 +127,11 @@ For an existing SDK-style project, `cargo dotnet attach` inserts one clearly mar
 idempotent block containing the validated compatibility profile, `<RustCrate>`, and conditional
 `RustDotnet.targets` imports. The Rust crate must declare managed identity schema 1. Attachment
 rejects profile/TFM mismatches and pre-existing hand-authored wiring instead of rewriting or
-guessing around it. `--dry-run` prints the exact block without changing the project.
+guessing around it. `--dry-run` prints the exact block without changing the project. Normal
+`dotnet build`, Visual Studio, and Rider builds then invoke `cargo dotnet` through MSBuild. The Rust
+build writes an exact runtime-asset manifest, and MSBuild copies its managed helpers, host-RID
+native libraries, and culture-resource subdirectories into the C# output. Consequently an
+attached project that uses Rust P/Invoke does not require a separate manual copy step.
 
 ## Build and run
 

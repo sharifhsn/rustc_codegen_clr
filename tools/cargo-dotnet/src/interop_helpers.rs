@@ -36,16 +36,16 @@ pub(crate) const HELPER_DLL_NAME: &str = "Mycorrhiza.Interop.Helpers.dll";
 /// also a silent no-op if the helper project isn't present at `ctx.paths.interop_helpers_root`
 /// (e.g. an older Installed-mode home predating this feature) — mirrors `nuget::copy_assets`'s
 /// "never fatal for a crate that doesn't need it" shape.
-pub fn ensure_and_copy(ctx: &Context, out_dir: &Path) -> Result<()> {
+pub fn ensure_and_copy(ctx: &Context, out_dir: &Path) -> Result<Option<PathBuf>> {
     let Some(dll) = ensure_built(ctx)? else {
-        return Ok(());
+        return Ok(None);
     };
     let dest = out_dir.join(HELPER_DLL_NAME);
     fs::copy(&dll, &dest).with_context(|| format!("cp {} -> {}", dll.display(), dest.display()))?;
     if ctx.flags.verbose {
         eprintln!("==> copied {} -> {}", HELPER_DLL_NAME, dest.display());
     }
-    Ok(())
+    Ok(Some(dest))
 }
 
 /// Same gating as [`ensure_and_copy`], but returns the built dll's raw bytes instead of copying

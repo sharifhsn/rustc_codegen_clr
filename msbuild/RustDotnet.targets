@@ -182,7 +182,27 @@
         <Private>%(_RustCrateDll.Private)</Private>
         <RustDotnetGenerated>true</RustDotnetGenerated>
       </Reference>
+      <_RustRuntimeAssetManifest Include="@(_RustCrateDll->'%(FullPath).rustdotnet.runtime-assets')" />
     </ItemGroup>
+
+    <!-- cargo-dotnet records the exact runtime/native companions it staged beside each managed
+         Rust assembly. Copy those into the host output so Visual Studio/Rider/MSBuild launches
+         observe the same loader layout as `cargo dotnet run`; never glob Cargo's artifact tree. -->
+    <Error Condition="!Exists('%(_RustRuntimeAssetManifest.Identity)')"
+           Text="RustDotnet: missing runtime asset manifest %(_RustRuntimeAssetManifest.Identity). Rebuild/reinstall cargo-dotnet so attached projects cannot silently omit native dependencies." />
+    <ReadLinesFromFile File="%(_RustRuntimeAssetManifest.Identity)">
+      <Output TaskParameter="Lines" ItemName="_RustRuntimeAssetLine" />
+    </ReadLinesFromFile>
+    <ItemGroup>
+      <_RustRuntimeAsset Include="@(_RustRuntimeAssetLine)">
+        <Source>$([System.Text.RegularExpressions.Regex]::Replace('%(Identity)', '\|.*$', ''))</Source>
+        <RelativePath>$([System.Text.RegularExpressions.Regex]::Replace('%(Identity)', '^.*\|', ''))</RelativePath>
+      </_RustRuntimeAsset>
+    </ItemGroup>
+    <Copy SourceFiles="@(_RustRuntimeAsset->'%(Source)')"
+          DestinationFiles="@(_RustRuntimeAsset->'$(OutDir)%(RelativePath)')"
+          SkipUnchangedFiles="true"
+          Condition="'@(_RustRuntimeAsset)'!=''" />
 
     <Message Importance="high"
              Text="RustDotnet: referenced %(_RustCrateDll.CrateName) (%(_RustCrateDll.Identity))" />
@@ -213,6 +233,7 @@
     <ItemGroup Condition="'$(RustDotnetForceBuild)'=='true' or '$(_OneClean)'=='true'">
       <_PriorManagedArtifact Include="$(_OneDir)/target/$(RustDotnetTarget)/$(_OneProfile)/*.dll" />
       <_PriorManagedArtifact Include="$(_OneDir)/target/$(RustDotnetTarget)/$(_OneProfile)/*.dll.rustdotnet.receipt.json" />
+      <_PriorManagedArtifact Include="$(_OneDir)/target/$(RustDotnetTarget)/$(_OneProfile)/*.dll.rustdotnet.runtime-assets" />
       <_PriorManagedArtifact Include="$(_OneDir)/target/$(RustDotnetTarget)/$(_OneProfile)/*.dll.rustdotnet.stamp" />
     </ItemGroup>
     <Delete Files="@(_PriorManagedArtifact)" />
@@ -235,6 +256,7 @@
 
       <_OneDll>$(_OneDir)/target/$(RustDotnetTarget)/$(_OneProfile)/$(_OneCrateName).dll</_OneDll>
       <_OneReceipt>$(_OneDll).rustdotnet.receipt.json</_OneReceipt>
+      <_OneRuntimeAssetsManifest>$(_OneDll).rustdotnet.runtime-assets</_OneRuntimeAssetsManifest>
       <_OneStamp>$(_OneDll).rustdotnet.stamp</_OneStamp>
       <!-- Encode the build configuration in an immutable marker name. This avoids relying on
            WriteLinesToFile's host-dependent WriteOnlyWhenDifferent behavior (newer Linux MSBuild
@@ -260,7 +282,7 @@
          metadata or compiler command runs. This preserves the stale-artifact safety
          contract even if the selected cargo-dotnet executable is itself broken and
          therefore cannot produce the metadata manifest. -->
-    <Delete Files="$(_OneDll);$(_OneReceipt);$(_OneStamp)"
+    <Delete Files="$(_OneDll);$(_OneReceipt);$(_OneRuntimeAssetsManifest);$(_OneStamp)"
             Condition="'$(RustDotnetForceBuild)'=='true' or '$(_OneClean)'=='true'" />
 
     <!-- Cargo, rather than MSBuild, owns the dependency graph. Ask the installed tool for
@@ -309,6 +331,7 @@
       <_OneInputs Include="$(_OneConfigStamp)" />
       <_OneInputs Include="$(_OneDir)/__rustdotnet_missing_dll__" Condition="!Exists('$(_OneDll)')" />
       <_OneInputs Include="$(_OneDir)/__rustdotnet_missing_receipt__" Condition="!Exists('$(_OneReceipt)')" />
+      <_OneInputs Include="$(_OneDir)/__rustdotnet_missing_runtime_assets__" Condition="!Exists('$(_OneRuntimeAssetsManifest)')" />
       <_OneInputs Include="$(_OneDir)/__rustdotnet_force_rebuild__" Condition="'$(RustDotnetForceBuild)'=='true'" />
       <_OneInputs Include="$(_OneDir)/__rustdotnet_clean_rebuild__" Condition="'$(_OneClean)'=='true'" />
     </ItemGroup>
@@ -342,7 +365,7 @@
 
     <!-- Once MSBuild has decided this crate is stale, the previous assembly is ineligible. Remove
          it before cargo-dotnet so a failed requested rebuild cannot leave a stale DLL behind. -->
-    <Delete Files="$(_OneDll);$(_OneReceipt);$(_OneStamp)" />
+    <Delete Files="$(_OneDll);$(_OneReceipt);$(_OneRuntimeAssetsManifest);$(_OneStamp)" />
 
     <!-- Run the installed cargo-dotnet. PATH is the INHERITED PATH with the tool dirs
          prepended (so the tool's internal cargo/rustc/dotnet + any cargo rustc-wrapper
@@ -361,6 +384,8 @@
            Text="RustDotnet: cargo dotnet build succeeded but the expected assembly was not found: $(_OneDll). Check that the crate's [lib] crate-type = [&quot;cdylib&quot;] and that the resolved assembly name ('$(_OneCrateName)') matches the crate's [package] name (override with &lt;RustCrate CrateName=&quot;...&quot;&gt;)." />
     <Error Condition="!Exists('$(_OneReceipt)')"
            Text="RustDotnet: cargo dotnet produced $(_OneDll) without its required identity receipt $(_OneReceipt). Reinstall or rebuild cargo-dotnet so MSBuild never references an unreceipted artifact." />
+    <Error Condition="!Exists('$(_OneRuntimeAssetsManifest)')"
+           Text="RustDotnet: cargo dotnet produced $(_OneDll) without its required runtime asset manifest $(_OneRuntimeAssetsManifest). Reinstall or rebuild cargo-dotnet so MSBuild never drops native/runtime dependencies." />
     <Touch Files="$(_OneStamp)" AlwaysCreate="true" />
   </Target>
 

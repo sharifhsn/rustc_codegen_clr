@@ -609,22 +609,29 @@ fn clear_cache_if_forced(cache_root: &Path, force: bool) -> Result<()> {
 /// the just-built artifact). Legacy flat marker directories remain readable for older consumers.
 /// Called from `pipeline.rs` after `artifact::locate`, before `run`/`report` — a no-op (and silent)
 /// for crates that never ran `add-nuget`.
-pub fn copy_assets(crate_dir: &Path, out_dir: &Path) -> Result<()> {
+pub fn copy_assets(crate_dir: &Path, out_dir: &Path) -> Result<Vec<PathBuf>> {
     let assets_dir = crate_dir.join(".cargo-dotnet-nuget-assets");
-    if assets_dir.is_dir() && !nuget_assets::copy_staged_assets(crate_dir, out_dir)? {
-        for entry in fs::read_dir(&assets_dir)
-            .with_context(|| format!("reading {}", assets_dir.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
+    let mut copied = match nuget_assets::copy_staged_assets(crate_dir, out_dir)? {
+        Some(paths) => paths,
+        None if assets_dir.is_dir() => {
+            let mut paths = Vec::new();
+            for entry in fs::read_dir(&assets_dir)
+                .with_context(|| format!("reading {}", assets_dir.display()))?
+            {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let dest = out_dir.join(entry.file_name());
+                fs::copy(&path, &dest)
+                    .with_context(|| format!("cp {} -> {}", path.display(), dest.display()))?;
+                paths.push(dest);
             }
-            let dest = out_dir.join(entry.file_name());
-            fs::copy(&path, &dest)
-                .with_context(|| format!("cp {} -> {}", path.display(), dest.display()))?;
+            paths
         }
-    }
+        None => Vec::new(),
+    };
     let host_rid = crate::host::HostFacts::detect().host_rid;
     for asset in local_native_assets(crate_dir)? {
         if asset.rid.as_deref() != Some(host_rid) {
@@ -642,8 +649,11 @@ pub fn copy_assets(crate_dir: &Path, out_dir: &Path) -> Result<()> {
                 destination.display()
             )
         })?;
+        copied.push(destination);
     }
-    Ok(())
+    copied.sort();
+    copied.dedup();
+    Ok(copied)
 }
 
 /// Generate + build + run an ephemeral bindgen crate at `bindgen_dir`: copies `reflect.rs`
