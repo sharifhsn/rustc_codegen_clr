@@ -511,8 +511,8 @@ const ATTR_ELEM_U1: u8 = 0x05;
 const ATTR_ELEM_I4: u8 = 0x08;
 const ATTR_ELEM_I8: u8 = 0x0A;
 const ATTR_ELEM_STRING: u8 = 0x0E;
-/// §II.23.3 `NamedArg` kind discriminator: `0x54` PROPERTY. `0x53` FIELD is not emitted — see
-/// `CustomAttrDef`'s doc for why field-targeted named args are out of scope.
+/// §II.23.3 `NamedArg` kind discriminators.
+const ATTR_NAMED_FIELD: u8 = 0x53;
 const ATTR_NAMED_PROPERTY: u8 = 0x54;
 
 fn write_u16_le(out: &mut Vec<u8>, v: u16) {
@@ -1623,7 +1623,8 @@ impl MetadataBuilder {
     /// (`MetadataBuilder::class_ref_token`), finds-or-creates the matching `.ctor`
     /// `MemberRef` (a HASTHIS signature shaped by `attr.ctor_args()`'s element types), and
     /// assembles a well-formed `CustomAttrib` blob (prolog `0x0001`, one `FixedArg` per ctor arg
-    /// in order, `NumNamed`, then one `NamedArg` per named property arg) per §II.23.3. `parent` is
+    /// in order, `NumNamed`, then one explicitly field- or property-targeted `NamedArg`) per
+    /// §II.23.3. `parent` is
     /// the target row's own token (`HasCustomAttribute` coded index, §II.24.2.6): TypeDef,
     /// MethodDef, Field, Property, or Param (including return Sequence 0).
     ///
@@ -1665,10 +1666,14 @@ impl MetadataBuilder {
             encode_custom_attr_fixed_arg(&mut blob, a, asm);
         }
         write_u16_le(&mut blob, u16::try_from(attr.named_args().len()).unwrap());
-        for (name, val) in attr.named_args() {
-            blob.push(ATTR_NAMED_PROPERTY); // §II.23.3: 0x54 PROPERTY (only shape supported)
+        for named in attr.named_args() {
+            let val = named.value();
+            blob.push(match named.kind() {
+                crate::ir::class::CustomAttrNamedArgKind::Field => ATTR_NAMED_FIELD,
+                crate::ir::class::CustomAttrNamedArgKind::Property => ATTR_NAMED_PROPERTY,
+            });
             blob.push(arg_kind(val));
-            let name_str = asm[*name].to_string();
+            let name_str = asm[named.name()].to_string();
             write_compressed_u32(&mut blob, u32::try_from(name_str.len()).unwrap());
             blob.extend_from_slice(name_str.as_bytes());
             encode_custom_attr_fixed_arg(&mut blob, val, asm);
@@ -5961,11 +5966,21 @@ mod tests {
         let attr_type =
             asm.alloc_class_ref(ClassRef::new(attr_name, Some(attr_asm), false, [].into()));
         let prop_name = asm.alloc_string("Bar".to_string());
+        let field_name = asm.alloc_string("Baz".to_string());
         let ctor_arg = asm.alloc_string("hello".to_string());
-        let attr_def = crate::ir::class::CustomAttrDef::new(
+        let attr_def = crate::ir::class::CustomAttrDef::new_with_named_args(
             attr_type,
             vec![crate::ir::class::CustomAttrArg::Str(ctor_arg)],
-            vec![(prop_name, crate::ir::class::CustomAttrArg::I32(7))],
+            vec![
+                crate::ir::class::CustomAttrNamedArg::property(
+                    prop_name,
+                    crate::ir::class::CustomAttrArg::I32(7),
+                ),
+                crate::ir::class::CustomAttrNamedArg::field(
+                    field_name,
+                    crate::ir::class::CustomAttrArg::Bool(true),
+                ),
+            ],
         );
 
         let attr_tok = mb.add_custom_attribute(&mut asm, class_tok, &attr_def);
@@ -5986,7 +6001,7 @@ mod tests {
         assert_eq!(mb.member_ref.len(), 1);
 
         // Blob: prolog(2) + FixedArg string "hello" (1-byte len + 5 bytes) + NumNamed(2) +
-        // NamedArg(PROPERTY tag + I4 type + name SerString + 4-byte i32 value).
+        // one PROPERTY/I4 and one FIELD/BOOLEAN NamedArg.
         let bytes = mb.blobs.as_bytes();
         // `+1`: the blob heap itself prefixes every entry with its own compressed length
         // (§II.24.2.4) — `row.value` points at THAT prefix, not the raw `CustomAttrib` bytes
@@ -5996,12 +6011,21 @@ mod tests {
         assert_eq!(&bytes[off..off + 2], &[0x01, 0x00], "prolog");
         assert_eq!(bytes[off + 2], 5, "ctor string arg length prefix");
         assert_eq!(&bytes[off + 3..off + 8], b"hello");
-        assert_eq!(&bytes[off + 8..off + 10], &[0x01, 0x00], "NumNamed = 1");
+        assert_eq!(&bytes[off + 8..off + 10], &[0x02, 0x00], "NumNamed = 2");
         assert_eq!(bytes[off + 10], 0x54, "NamedArg kind = PROPERTY");
         assert_eq!(bytes[off + 11], 0x08, "NamedArg type = ELEMENT_TYPE_I4");
         assert_eq!(bytes[off + 12], 3, "property name length prefix");
         assert_eq!(&bytes[off + 13..off + 16], b"Bar");
         assert_eq!(&bytes[off + 16..off + 20], &7i32.to_le_bytes());
+        assert_eq!(bytes[off + 20], 0x53, "NamedArg kind = FIELD");
+        assert_eq!(
+            bytes[off + 21],
+            0x02,
+            "NamedArg type = ELEMENT_TYPE_BOOLEAN"
+        );
+        assert_eq!(bytes[off + 22], 3, "field name length prefix");
+        assert_eq!(&bytes[off + 23..off + 26], b"Baz");
+        assert_eq!(bytes[off + 26], 1, "field bool value");
     }
 
     #[test]

@@ -482,9 +482,18 @@ The same structured `attr(...)` syntax targets types, methods, returns, paramete
 properties. It accepts string, bool, `i32`, and `i64` constructor or named-property arguments and
 always builds a valid ECMA-335 blob; there is deliberately no raw-byte escape hatch.
 
+Use `props(...)` for settable attribute properties and `fields(...)` for public attribute fields.
+The distinction is part of the CLR blob, not stylistic: reflection rejects a field encoded as a
+property or vice versa. Excel-DNA is a prominent field-based example.
+
 ```rust
 #[dotnet_export(
-    attr("[My.Contracts]My.Contracts.ApiAttribute", args("Analyze"), props(Stable = true)),
+    attr(
+        "[My.Contracts]My.Contracts.ApiAttribute",
+        args("Analyze"),
+        props(Stable = true),
+        fields(Category = "interop")
+    ),
     return_attr("[My.Contracts]My.Contracts.ApiAttribute", args("result")),
     param_attr(rows, "[My.Contracts]My.Contracts.ApiAttribute", args("input"))
 )]

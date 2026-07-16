@@ -354,7 +354,7 @@ pub fn rustc_codegen_clr_add_generic_interface_impl<
 /// — the general mechanism `#[dotnet_class(attr(...))]` lowers to, one call per attribute. `SPEC`
 /// is a single encoded string (built by the `dotnet_macros` proc-macro at compile time — never
 /// hand-written) carrying the attribute type reference, positional constructor args, and named
-/// property args in one packed field, using ASCII control-character delimiters (`\x1E` record
+/// property/field args in one packed field, using ASCII control-character delimiters (`\x1E` record
 /// separator between top-level fields, `\x1D` group separator between list items, `\x1C` between a
 /// named arg's name and value) — chosen specifically because they can never appear in ordinary
 /// source text, so no escaping is needed; `dotnet_macros` rejects any literal that contains one.

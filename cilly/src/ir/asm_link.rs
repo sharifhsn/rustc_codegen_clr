@@ -725,7 +725,10 @@ mod tests {
     use crate::{
         Access, BasicBlock, Const, ExceptionRegion, IString, Int, MethodDef, MethodImpl, Type,
         ir::cilnode::{BinOp, MethodKind},
-        ir::class::{CustomAttrArg, CustomAttrDef, EventDef, PropertyDef, StaticFieldDef},
+        ir::class::{
+            CustomAttrArg, CustomAttrDef, CustomAttrNamedArg, CustomAttrNamedArgKind, EventDef,
+            PropertyDef, StaticFieldDef,
+        },
     };
     use std::num::NonZeroU32;
 
@@ -1326,9 +1329,10 @@ mod tests {
         let ctor_text = source.alloc_string("ctor-text");
         let named_name = source.alloc_string("NamedText");
         let named_text = source.alloc_string("named-text");
+        let named_field_name = source.alloc_string("NamedFlag");
         source
             .class_mut(class_id)
-            .add_custom_attribute(CustomAttrDef::new(
+            .add_custom_attribute(CustomAttrDef::new_with_named_args(
                 attr_type,
                 vec![
                     CustomAttrArg::Str(ctor_text),
@@ -1336,7 +1340,10 @@ mod tests {
                     CustomAttrArg::I32(17),
                     CustomAttrArg::I64(29),
                 ],
-                vec![(named_name, CustomAttrArg::Str(named_text))],
+                vec![
+                    CustomAttrNamedArg::property(named_name, CustomAttrArg::Str(named_text)),
+                    CustomAttrNamedArg::field(named_field_name, CustomAttrArg::Bool(true)),
+                ],
             ));
 
         let argument_inner = source.alloc_type(Type::Int(Int::I32));
@@ -1453,9 +1460,22 @@ mod tests {
         assert_eq!(attribute.ctor_args()[1], CustomAttrArg::Bool(true));
         assert_eq!(attribute.ctor_args()[2], CustomAttrArg::I32(17));
         assert_eq!(attribute.ctor_args()[3], CustomAttrArg::I64(29));
-        assert_eq!(&linked[attribute.named_args()[0].0], "NamedText");
+        assert_eq!(
+            attribute.named_args()[0].kind(),
+            CustomAttrNamedArgKind::Property
+        );
+        assert_eq!(&linked[attribute.named_args()[0].name()], "NamedText");
         assert!(
-            matches!(attribute.named_args()[0].1, CustomAttrArg::Str(value) if &linked[value] == "named-text")
+            matches!(attribute.named_args()[0].value(), CustomAttrArg::Str(value) if &linked[*value] == "named-text")
+        );
+        assert_eq!(
+            attribute.named_args()[1].kind(),
+            CustomAttrNamedArgKind::Field
+        );
+        assert_eq!(&linked[attribute.named_args()[1].name()], "NamedFlag");
+        assert_eq!(
+            attribute.named_args()[1].value(),
+            &CustomAttrArg::Bool(true)
         );
 
         let method = linked

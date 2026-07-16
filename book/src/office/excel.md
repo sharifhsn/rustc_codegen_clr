@@ -49,6 +49,12 @@ generated C# function copies only the four scalar arguments into `Task.Run`; man
 token during its deterministic scenario sweep. Normal validation failures become `#RUST!` values,
 while cancellation remains cancellation instead of being cached as a fake error string.
 
+The generated Rust assembly also carries valid `ExcelFunctionAttribute` and
+`ExcelArgumentAttribute` metadata on a `RustEngineInfo` method. The repository reflects the exact
+field values after packing. Automatic discovery of that dependency as a worksheet formula is not
+claimed until the Windows Excel launch gate exercises it; the four formulas above remain the
+supported scaffold surface.
+
 ## Where code belongs
 
 Keep the Excel-specific boundary small:
@@ -58,6 +64,10 @@ Excel cells (`object[,]` and Excel errors)
     -> generated C# Excel-DNA functions (validation/conversion)
     -> typed managed Rust exports (`double`, `int`, DTOs, arrays)
     -> optional private native Rust kernel (P/Invoke)
+
+Simple CLR-only method metadata
+    -> structured Excel-DNA attributes emitted directly by managed Rust
+    -> Windows Excel discovery gate before it becomes a documented formula
 ```
 
 Edit `rustlib/src/lib.rs` for reusable calculations. Edit `excel/Functions.cs` only for worksheet

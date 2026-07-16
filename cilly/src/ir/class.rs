@@ -891,13 +891,75 @@ impl RelocateValue for CustomAttrArg {
     }
 }
 
+/// Whether one named custom-attribute argument targets a public field or a settable property.
+/// ECMA-335 stores this distinction in the `NamedArg` header (`0x53` FIELD / `0x54` PROPERTY),
+/// and reflection rejects a well-formed blob when the selected member kind does not exist.
+#[derive(Hash, PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum CustomAttrNamedArgKind {
+    Field,
+    Property,
+}
+
+/// One named custom-attribute argument, retaining the member kind required by §II.23.3.
+#[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
+pub struct CustomAttrNamedArg {
+    kind: CustomAttrNamedArgKind,
+    name: Interned<IString>,
+    value: CustomAttrArg,
+}
+
+impl CustomAttrNamedArg {
+    #[must_use]
+    pub fn field(name: Interned<IString>, value: CustomAttrArg) -> Self {
+        Self {
+            kind: CustomAttrNamedArgKind::Field,
+            name,
+            value,
+        }
+    }
+
+    #[must_use]
+    pub fn property(name: Interned<IString>, value: CustomAttrArg) -> Self {
+        Self {
+            kind: CustomAttrNamedArgKind::Property,
+            name,
+            value,
+        }
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> CustomAttrNamedArgKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn name(&self) -> Interned<IString> {
+        self.name
+    }
+
+    #[must_use]
+    pub fn value(&self) -> &CustomAttrArg {
+        &self.value
+    }
+}
+
+impl RelocateValue for CustomAttrNamedArg {
+    type Output = Self;
+
+    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
+        Self {
+            kind: self.kind,
+            name: ctx.string(destination, self.name),
+            value: self.value.relocate(ctx, destination),
+        }
+    }
+}
+
 /// One ECMA-335 `CustomAttribute` row (§II.22.10) attached to a type: the attribute TYPE (its
 /// `.ctor` is resolved from this at export time via the same `ClassRef`→`TypeRef`/`TypeDef`
 /// machinery `extends`/`implements` already use — see `pe_exporter::tables::class_ref_token`),
 /// positional constructor arguments (in declaration order, matching the ctor overload this
-/// implies), and named PROPERTY arguments (§II.23.3 `NamedArg` — field-targeted named args are
-/// not supported, matching how virtually every real .NET attribute exposes its named-arg surface
-/// as settable properties, not public fields).
+/// implies), and explicitly field- or property-targeted named arguments (§II.23.3 `NamedArg`).
 ///
 /// SAFETY NOTE (this is why the API is safe, not `unsafe`): because every `CustomAttrArg` is one
 /// of a small set of mechanically well-formed shapes, [`CustomAttrDef`] can only ever produce a
@@ -916,7 +978,7 @@ impl RelocateValue for CustomAttrArg {
 pub struct CustomAttrDef {
     attr_type: Interned<ClassRef>,
     ctor_args: Vec<CustomAttrArg>,
-    named_args: Vec<(Interned<IString>, CustomAttrArg)>,
+    named_args: Vec<CustomAttrNamedArg>,
 }
 impl RelocateValue for CustomAttrDef {
     type Output = Self;
@@ -935,12 +997,7 @@ impl RelocateValue for CustomAttrDef {
                 .collect(),
             named_args: named_args
                 .into_iter()
-                .map(|(name, arg)| {
-                    (
-                        ctx.string(destination, name),
-                        arg.relocate(ctx, destination),
-                    )
-                })
+                .map(|arg| arg.relocate(ctx, destination))
                 .collect(),
         }
     }
@@ -951,6 +1008,22 @@ impl CustomAttrDef {
         attr_type: Interned<ClassRef>,
         ctor_args: Vec<CustomAttrArg>,
         named_args: Vec<(Interned<IString>, CustomAttrArg)>,
+    ) -> Self {
+        Self::new_with_named_args(
+            attr_type,
+            ctor_args,
+            named_args
+                .into_iter()
+                .map(|(name, value)| CustomAttrNamedArg::property(name, value))
+                .collect(),
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_named_args(
+        attr_type: Interned<ClassRef>,
+        ctor_args: Vec<CustomAttrArg>,
+        named_args: Vec<CustomAttrNamedArg>,
     ) -> Self {
         Self {
             attr_type,
@@ -967,7 +1040,7 @@ impl CustomAttrDef {
         &self.ctor_args
     }
     #[must_use]
-    pub fn named_args(&self) -> &[(Interned<IString>, CustomAttrArg)] {
+    pub fn named_args(&self) -> &[CustomAttrNamedArg] {
         &self.named_args
     }
 }

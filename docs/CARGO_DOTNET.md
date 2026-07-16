@@ -114,7 +114,9 @@ Installed files are integrity-checked before later builds.
 The general, Web API, and Worker scaffolds target `net10.0`; the desktop product hosts target their
 explicit Windows TFMs. Each prints its exact next command. `--excel` uses stable Excel-DNA 1.9.0,
 generates a 64-bit packed `.xll`, and is deliberately not presented as VSTO or Office-for-macOS
-support. Web API and Worker have runtime acceptance on the supported CoreCLR hosts. WinUI and MAUI
+support. Its Rust assembly carries reflected `ExcelFunction`/`ExcelArgument` field metadata, while
+the generated C# edge still owns proven worksheet registration, range/error conversion, and async
+policy. Web API and Worker have runtime acceptance on the supported CoreCLR hosts. WinUI and MAUI
 remain planned profiles until Windows CI builds and launches them with the required workloads.
 
 Run `cargo dotnet profiles` for the current host-by-host support contract. Profile names describe a

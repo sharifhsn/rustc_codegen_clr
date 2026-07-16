@@ -205,13 +205,14 @@ struct PendingMemberCustomAttrs {
 
 /// One decoded `rustc_codegen_clr_add_custom_attr::<SPEC>` call: the attribute's `(assembly,
 /// full_type_name)` reference (same shape as `PendingClass::superclass`/`interfaces`), its
-/// positional constructor args, and its named PROPERTY args.
+/// positional constructor args, and its explicitly distinguished named PROPERTY/FIELD args.
 #[derive(Clone, Debug)]
 pub(crate) struct PendingCustomAttr {
     asm: String,
     type_name: String,
     ctor_args: Vec<PendingAttrArg>,
-    named_args: Vec<(String, PendingAttrArg)>,
+    named_properties: Vec<(String, PendingAttrArg)>,
+    named_fields: Vec<(String, PendingAttrArg)>,
 }
 
 #[derive(Clone, Debug)]
@@ -269,7 +270,8 @@ pub(crate) fn decode_custom_attr_spec(spec: &str) -> PendingCustomAttr {
     let asm = fields.next().unwrap_or_default().to_string();
     let type_name = fields.next().unwrap_or_default().to_string();
     let ctor_raw = fields.next().unwrap_or_default();
-    let named_raw = fields.next().unwrap_or_default();
+    let properties_raw = fields.next().unwrap_or_default();
+    let named_fields_raw = fields.next().unwrap_or_default();
     assert!(
         fields.next().is_none(),
         "comptime: malformed custom-attr SPEC (too many top-level fields): {spec:?}"
@@ -300,19 +302,22 @@ pub(crate) fn decode_custom_attr_spec(spec: &str) -> PendingCustomAttr {
     } else {
         ctor_raw.split('\u{1D}').map(decode_val).collect()
     };
-    let named_args = if named_raw.is_empty() {
-        vec![]
-    } else {
-        named_raw
-            .split('\u{1D}')
-            .map(|entry| {
-                let (name, val) = entry.split_once('\u{1C}').unwrap_or_else(|| {
-                    panic!("comptime: malformed named custom-attr entry: {entry:?}")
-                });
-                (name.to_string(), decode_val(val))
-            })
-            .collect()
+    let decode_named = |raw: &str| {
+        if raw.is_empty() {
+            vec![]
+        } else {
+            raw.split('\u{1D}')
+                .map(|entry| {
+                    let (name, val) = entry.split_once('\u{1C}').unwrap_or_else(|| {
+                        panic!("comptime: malformed named custom-attr entry: {entry:?}")
+                    });
+                    (name.to_string(), decode_val(val))
+                })
+                .collect()
+        }
     };
+    let named_properties = decode_named(properties_raw);
+    let named_fields = decode_named(named_fields_raw);
 
     if let Some(reason) = denylisted_attr_reason(&type_name) {
         panic!("comptime: denylisted custom attribute type — {reason}");
@@ -322,7 +327,8 @@ pub(crate) fn decode_custom_attr_spec(spec: &str) -> PendingCustomAttr {
         asm,
         type_name,
         ctor_args,
-        named_args,
+        named_properties,
+        named_fields,
     }
 }
 
@@ -354,17 +360,27 @@ pub(crate) fn pending_custom_attr_to_cilly<'tcx>(
         .iter()
         .map(|value| pending_attr_arg_to_cilly(ctx, value))
         .collect();
-    let named_args = attr
-        .named_args
+    let named_properties = attr
+        .named_properties
         .iter()
         .map(|(name, value)| {
-            (
+            cilly::class::CustomAttrNamedArg::property(
                 ctx.alloc_string(name.clone()),
                 pending_attr_arg_to_cilly(ctx, value),
             )
         })
-        .collect();
-    cilly::class::CustomAttrDef::new(attr_type, ctor_args, named_args)
+        .collect::<Vec<_>>();
+    let named_fields = attr.named_fields.iter().map(|(name, value)| {
+        cilly::class::CustomAttrNamedArg::field(
+            ctx.alloc_string(name.clone()),
+            pending_attr_arg_to_cilly(ctx, value),
+        )
+    });
+    cilly::class::CustomAttrDef::new_with_named_args(
+        attr_type,
+        ctor_args,
+        named_properties.into_iter().chain(named_fields).collect(),
+    )
 }
 
 fn attach_pending_member_attrs<'tcx>(

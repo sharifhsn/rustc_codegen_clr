@@ -42,6 +42,9 @@ rg -q 'catch \(OperationCanceledException\)' "$functions"
 rg -q 'IsThreadSafe = true' "$functions"
 rg -q 'PortfolioStressScore' "$rust_source"
 rg -q 'throw_if_cancellation_requested' "$rust_source"
+rg -q 'ExcelDna.Integration.ExcelFunctionAttribute' "$rust_source"
+rg -q 'ExcelDna.Integration.ExcelArgumentAttribute' "$rust_source"
+rg -q 'RUST.ENGINE_INFO' "$rust_source"
 if rg -q 'ExcelDnaUtil\.(Application|DynamicApplication)' "$functions"; then
     echo "Excel async UDF illegally captures the Excel COM application surface" >&2
     exit 1
@@ -55,5 +58,10 @@ PATH="$(dirname "$dotnet_bin"):$HOME/.cargo/bin:$PATH" \
 packed="$sample/excel/bin/Release/net10.0-windows/publish/excel-risk-engine_excel-AddIn64-packed.xll"
 test -s "$packed"
 test -s "$sample/rustlib/target/x86_64-unknown-dotnet/release/excel_risk_engine.dll"
+
+PATH="$(dirname "$dotnet_bin"):$PATH" "$dotnet_bin" run -c Release \
+    --project "$repo/feasibility/fixtures/excel_metadata_inspector/ExcelMetadataInspector.csproj" \
+    -- "$sample/rustlib/target/x86_64-unknown-dotnet/release/excel_risk_engine.dll" \
+    | grep -Fx 'managed Rust ExcelFunction/ExcelArgument metadata OK'
 
 echo "Excel-DNA managed Rust acceptance OK: $packed"

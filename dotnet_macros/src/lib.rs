@@ -146,7 +146,8 @@ fn denylisted_attr_reason(full_type_name: &str) -> Option<String> {
     None
 }
 
-/// One literal constructor/named argument inside an `attr(...)` entry — `args(...)`/`props(...)`
+/// One literal constructor/named argument inside an `attr(...)` entry —
+/// `args(...)`/`props(...)`/`fields(...)`
 /// accept exactly these four Rust literal kinds (a plain string, bool, `i32`-range integer, or
 /// `i64`-range integer), matching the shapes `cilly::class::CustomAttrArg` can express. No other
 /// literal kind (float, char, byte-string, …) is accepted — see that enum's doc for the full
@@ -224,17 +225,17 @@ fn expr_to_arg(expr: &syn::Expr) -> syn::Result<AttrArgLit> {
     }
 }
 
-/// One `attr("[Assembly]Namespace.AttrType", args(1, "x", true), props(Name = "Foo", Order = 1))`
+/// One `attr("[Assembly]Namespace.AttrType", args(1, "x", true), props(Name = "Foo"),
+/// fields(Order = 1))`
 /// entry: the attribute's `.NET` type reference (same `"[Asm]Ns.Type"` spelling as `extends`/
 /// `implements`), its positional constructor arguments in `args(...)` (empty/omitted for a
-/// no-arg ctor), and its named PROPERTY arguments in `props(...)` (field-targeted named args are
-/// not supported — see `cilly::class::CustomAttrDef`'s doc for why: virtually every real
-/// attribute's named-arg surface is settable properties, not public fields).
+/// no-arg ctor), and its explicitly distinguished named PROPERTY/FIELD arguments.
 #[derive(Clone)]
 struct AttrSpec {
     type_name: String,
     ctor_args: Vec<AttrArgLit>,
-    named_args: Vec<(String, AttrArgLit)>,
+    named_properties: Vec<(String, AttrArgLit)>,
+    named_fields: Vec<(String, AttrArgLit)>,
 }
 
 struct ParamAttrSpec {
@@ -263,9 +264,9 @@ fn validate_safe_attr_spec(spec: &AttrSpec, span: proc_macro2::Span) -> syn::Res
 }
 impl AttrSpec {
     /// Packs this spec into the single `&'static str` `rustc_codegen_clr_add_custom_attr::<SPEC>`
-    /// carries: `<asm>\x1E<type>\x1E<ctor_args>\x1E<named_args>`, where `ctor_args` is a `\x1D`-
-    /// joined list of `AttrArgLit::encode()` outputs and `named_args` is a `\x1D`-joined list of
-    /// `<name>\x1C<AttrArgLit::encode()>` entries. `\x1C`/`\x1D`/`\x1E` are ASCII-reserved
+    /// carries: `<asm>\x1E<type>\x1E<ctor_args>\x1E<named_properties>\x1E<named_fields>`, where
+    /// each argument list is `\x1D`-joined and named entries use
+    /// `<name>\x1C<AttrArgLit::encode()>`. `\x1C`/`\x1D`/`\x1E` are ASCII-reserved
     /// (Unit/Group/Record Separator) control characters chosen specifically because ordinary
     /// source text can't contain them — `validate_no_delims` rejects any string literal that
     /// does, so this packing can never desynchronize. `src/comptime.rs`'s `decode_custom_attr_spec`
@@ -278,13 +279,15 @@ impl AttrSpec {
             .map(AttrArgLit::encode)
             .collect::<Vec<_>>()
             .join("\u{1D}");
-        let named = self
-            .named_args
-            .iter()
-            .map(|(name, v)| format!("{name}\u{1C}{}", v.encode()))
-            .collect::<Vec<_>>()
-            .join("\u{1D}");
-        format!("{asm}\u{1E}{type_name}\u{1E}{ctor}\u{1E}{named}")
+        let encode_named = |args: &[(String, AttrArgLit)]| {
+            args.iter()
+                .map(|(name, v)| format!("{name}\u{1C}{}", v.encode()))
+                .collect::<Vec<_>>()
+                .join("\u{1D}")
+        };
+        let properties = encode_named(&self.named_properties);
+        let fields = encode_named(&self.named_fields);
+        format!("{asm}\u{1E}{type_name}\u{1E}{ctor}\u{1E}{properties}\u{1E}{fields}")
     }
 }
 impl syn::parse::Parse for AttrSpec {
@@ -294,7 +297,8 @@ impl syn::parse::Parse for AttrSpec {
         validate_dotnet_ref(&type_name, type_lit.span())?;
         validate_no_delims(&type_name, type_lit.span())?;
         let mut ctor_args = Vec::new();
-        let mut named_args = Vec::new();
+        let mut named_properties = Vec::new();
+        let mut named_fields = Vec::new();
         while input.peek(Token![,]) {
             input.parse::<Token![,]>()?;
             if input.is_empty() {
@@ -308,28 +312,36 @@ impl syn::parse::Parse for AttrSpec {
                 for l in lits {
                     ctor_args.push(lit_to_arg(&l)?);
                 }
-            } else if ident == "props" {
+            } else if ident == "props" || ident == "fields" {
                 let nvs = Punctuated::<MetaNameValue, Token![,]>::parse_terminated(&content)?;
+                let destination = if ident == "props" {
+                    &mut named_properties
+                } else {
+                    &mut named_fields
+                };
                 for nv in nvs {
                     let name = nv
                         .path
                         .get_ident()
-                        .ok_or_else(|| syn::Error::new(nv.path.span(), "expected a property name"))?
+                        .ok_or_else(|| syn::Error::new(nv.path.span(), "expected a member name"))?
                         .to_string();
                     validate_no_delims(&name, nv.path.span())?;
-                    named_args.push((name, expr_to_arg(&nv.value)?));
+                    destination.push((name, expr_to_arg(&nv.value)?));
                 }
             } else {
                 return Err(syn::Error::new(
                     ident.span(),
-                    format!("attr(...): unknown key `{ident}`; expected `args` or `props`"),
+                    format!(
+                        "attr(...): unknown key `{ident}`; expected `args`, `props`, or `fields`"
+                    ),
                 ));
             }
         }
         Ok(AttrSpec {
             type_name,
             ctor_args,
-            named_args,
+            named_properties,
+            named_fields,
         })
     }
 }
@@ -488,7 +500,7 @@ pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
                     return syn::Error::new(
                         meta.span(),
                         "#[dotnet_class]: expected `key = \"...\"`, `attr(\"[Asm]Ns.Type\", \
-                         args(...), props(...))`, `static_field(NAME: Type)`, or \
+                         args(...), props(...), fields(...))`, `static_field(NAME: Type)`, or \
                          `base_ctor_args(Type, ...)`",
                     )
                     .to_compile_error()
@@ -1537,7 +1549,8 @@ mod dotnet_export_name_tests {
             attr(
                 "[Contracts]Contracts.MarkerAttribute",
                 args("method"),
-                props(Stable = true)
+                props(Stable = true),
+                fields(Category = "interop")
             ),
             return_attr("[Contracts]Contracts.MarkerAttribute", args("return")),
             param_attr(

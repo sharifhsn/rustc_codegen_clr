@@ -214,7 +214,8 @@ MAUI is a profile matrix rather than one runtime:
   not only type-level metadata. `attr(...)`, `return_attr(...)`, `param_attr(name, ...)`,
   `#[dotnet_attr(...)]`, `#[dotnet_property_attr(...)]`, interface-property attributes, and
   `static_field_attr(...)` all lower through one structured ECMA-335 representation with no raw
-  blob escape hatch. The proc macro and backend independently denylist runtime-semantic
+  blob escape hatch. Named arguments retain the ECMA-335 FIELD/PROPERTY distinction through macro,
+  compile-time decoding, linking, and direct-PE emission. The proc macro and backend independently denylist runtime-semantic
   `System.Runtime.CompilerServices` / `System.Runtime.InteropServices` attributes. The clean
   packaged API consumer reflects every target, including constructor and named-property values,
   from a direct-PE assembly.
@@ -224,8 +225,13 @@ MAUI is a profile matrix rather than one runtime:
   must be valid, unique, and include the root namespace, while the profile must match the
   evidence-gated `cargo dotnet profiles` registry. The full contract is recorded in artifact
   receipts and the multi-library MSBuild/packaged-consumer acceptance verifies it end to end.
-- [ ] Generate Excel-DNA attributes such as `ExcelFunction`/`ExcelArgument`, Unity metadata where
-  genuinely required, and MAUI binding-friendly metadata through the safe attribute surface.
+- [x] Generate host metadata through the safe attribute surface without inventing host contracts.
+  The Excel scaffold emits real field-based `ExcelFunctionAttribute`/`ExcelArgumentAttribute`
+  metadata from Rust; the packed-artifact acceptance reflects the exact names, descriptions,
+  category, and thread-safety flag. Automatic Excel formula discovery remains in the separate real
+  Windows launch gate. Unity managed plugins have no universal registration attribute, and MAUI's
+  baseline binding surface is ordinary CLR properties/events/interfaces already covered above;
+  project-specific attributes can use the same safe field/property-aware surface when required.
 - [x] Add API snapshot compatibility checks for every generated public shape. The checked-in
   `cd-export.public-api.txt` is produced from a real backend-built DLL and records exported
   functions, constructors, fields, properties, generic interfaces, parameter/return nullability,

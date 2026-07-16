@@ -811,8 +811,8 @@ public static class Program
 "#;
 
 /// `--excel` Rust library: application logic remains normal Rust and exports a typed managed seam.
-/// Excel-DNA attributes stay in the tiny C# host until method-level custom attributes can be
-/// emitted directly on Rust exports.
+/// Simple CLR-native UDFs can carry Excel-DNA metadata directly; the C# edge remains responsible
+/// for Excel-specific range/error objects and asynchronous scheduling policy.
 const EXCEL_RUST: &str = r#"#![feature(adt_const_params, unsized_const_params)]
 #![allow(internal_features, incomplete_features)]
 
@@ -881,6 +881,34 @@ pub fn portfolio_stress_score(
 #[dotnet_export(name = "RustEngineStatus")]
 pub fn rust_engine_status() -> String {
     "managed Rust engine ready".to_owned()
+}
+
+/// A metadata-bearing Excel-DNA UDF proving safe external method and parameter attributes on a
+/// backend-emitted managed Rust method. Rich Excel object/range/error policies stay in Functions.cs.
+#[dotnet_export(
+    name = "RustEngineInfo",
+    attr(
+        "[ExcelDna.Integration]ExcelDna.Integration.ExcelFunctionAttribute",
+        fields(
+            Name = "RUST.ENGINE_INFO",
+            Description = "Queries the managed Rust engine without a C# forwarding method.",
+            Category = "Rust on .NET",
+            IsThreadSafe = true
+        )
+    ),
+    param_attr(
+        topic,
+        "[ExcelDna.Integration]ExcelDna.Integration.ExcelArgumentAttribute",
+        fields(Name = "topic", Description = "status, runtime, or profile")
+    )
+)]
+pub fn rust_engine_info(topic: String) -> String {
+    match topic.trim().to_ascii_lowercase().as_str() {
+        "status" => "managed Rust engine ready".to_owned(),
+        "runtime" => ".NET 10 CoreCLR".to_owned(),
+        "profile" => "excel-dna-net10-windows preview".to_owned(),
+        _ => "unknown topic; use status, runtime, or profile".to_owned(),
+    }
 }
 "#;
 
@@ -1036,6 +1064,12 @@ worker. Code that intentionally changes Excel must instead schedule a command wi
 The generated C# host deliberately contains no P/Invoke. If a calculation needs a native Rust
 kernel, declare that private C ABI in `rustlib`, add the binary with `cargo dotnet add-native` or
 `add-native-file`, and keep Excel-facing signatures managed and typed.
+
+The Rust assembly also emits `RustEngineInfo` directly with structured `ExcelFunctionAttribute`
+and `ExcelArgumentAttribute` metadata. Repository acceptance reflects those fields from the packed
+dependency. Its automatic worksheet discovery remains part of the real Windows Excel launch gate,
+so the scaffold does not yet advertise a `RUST.ENGINE_INFO` formula. The C# functions intentionally
+own Excel's range conversion, cell-error values, and async scheduling rules.
 
 This template targets Windows desktop Excel. It is not a VSTO project and does not claim Office for
 macOS support; cross-platform Office extensions use the Office web-add-in model with a managed-Rust
@@ -1550,6 +1584,9 @@ mod tests {
             .body;
         assert!(rust.contains("#[dotnet_export(name = \"PortfolioFutureValue\""));
         assert!(rust.contains("#[dotnet_export(name = \"PortfolioStressScore\""));
+        assert!(rust.contains("ExcelDna.Integration.ExcelFunctionAttribute"));
+        assert!(rust.contains("ExcelDna.Integration.ExcelArgumentAttribute"));
+        assert!(rust.contains("RUST.ENGINE_INFO"));
         assert!(rust.contains("CancellationToken"));
         let csharp = &files
             .iter()
