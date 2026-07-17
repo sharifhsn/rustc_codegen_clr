@@ -7,18 +7,13 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 dotnet_version="${DOTNET_VERSION:-10}"
 unity_bin="${UNITY_BIN:-}"
 
-steps=(
-    "e2e managed/native matrix|feasibility/e2e_matrix.sh"
-    "P/Invoke synchronous|feasibility/pinvoke_acceptance.sh"
-    "P/Invoke asynchronous callbacks|feasibility/pinvoke_async_callback_acceptance.sh"
-    "P/Invoke policy diagnostics|feasibility/pinvoke_policy_diagnostics_acceptance.sh"
-)
-if [[ -n "$unity_bin" ]]; then
-    steps+=("Unity clean project|feasibility/unity_clean_acceptance.sh $unity_bin")
-fi
-
 if [[ "${1:-}" == "--list" ]]; then
-    printf '%s\n' "${steps[@]%%|*}"
+    printf '%s\n' \
+        "e2e managed/native matrix" \
+        "P/Invoke synchronous" \
+        "P/Invoke asynchronous callbacks" \
+        "P/Invoke policy diagnostics"
+    [[ -n "$unity_bin" ]] && echo "Unity clean project"
     [[ -n "$unity_bin" ]] || echo "Unity clean project (set UNITY_BIN to enable)"
     exit 0
 fi
@@ -27,10 +22,18 @@ if [[ "${1:-}" != "" ]]; then
     exit 2
 fi
 
-for entry in "${steps[@]}"; do
-    label="${entry%%|*}"
-    command="${entry#*|}"
+run_step() {
+    local label="$1"
+    shift
     echo "== $label =="
-    (cd "$repo" && DOTNET_VERSION="$dotnet_version" bash -c "$command")
-done
+    (cd "$repo" && DOTNET_VERSION="$dotnet_version" "$@")
+}
+
+run_step "e2e managed/native matrix" feasibility/e2e_matrix.sh
+run_step "P/Invoke synchronous" feasibility/pinvoke_acceptance.sh
+run_step "P/Invoke asynchronous callbacks" feasibility/pinvoke_async_callback_acceptance.sh
+run_step "P/Invoke policy diagnostics" feasibility/pinvoke_policy_diagnostics_acceptance.sh
+if [[ -n "$unity_bin" ]]; then
+    run_step "Unity clean project" feasibility/unity_clean_acceptance.sh "$unity_bin"
+fi
 echo "== primetime acceptance passed (Net10 managed, P/Invoke, and optional Unity) =="
