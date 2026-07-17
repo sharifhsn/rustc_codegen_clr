@@ -16,13 +16,7 @@ pub fn run(args: &UnityNativeArgs) -> Result<i32> {
     if !cfg!(target_os = "macos") {
         bail!("unity native currently supports only the macOS host");
     }
-    let project = fs::canonicalize(&args.project).context("resolving Unity project")?;
-    if !project.join("Assets").is_dir() {
-        bail!(
-            "Unity project has no Assets directory: {}",
-            project.display()
-        );
-    }
+    let project = crate::unity::resolve_project(&args.project, "resolving Unity project")?;
     let crate_arg = match &args.crate_dir {
         Some(path) => path.clone(),
         None => crate::unity::attached_crate_path(&project, "native_crate")?

@@ -81,13 +81,7 @@ fn package(args: &UnityPackageArgs) -> Result<i32> {
 }
 
 fn build(args: &UnityBuildArgs) -> Result<i32> {
-    let project = fs::canonicalize(&args.project).context("resolving Unity project")?;
-    if !project.join("Assets").is_dir() {
-        bail!(
-            "Unity project has no Assets directory: {}",
-            project.display()
-        );
-    }
+    let project = resolve_project(&args.project, "resolving Unity project")?;
     let crate_arg = match &args.crate_dir {
         Some(path) => path.clone(),
         None => attached_crate_path(&project, "managed_crate")?
@@ -107,30 +101,8 @@ fn build(args: &UnityBuildArgs) -> Result<i32> {
     let crate_root = manifest
         .parent()
         .context("managed Rust manifest has no parent")?;
-    match attached_crate_path(&project, "managed_crate")? {
-        Some(attached) => {
-            let attached = fs::canonicalize(&attached).with_context(|| {
-                format!(
-                    "resolving managed crate from Unity attachment receipt {}",
-                    attached.display()
-                )
-            })?;
-            anyhow::ensure!(
-                attached == crate_root,
-                "Unity project is attached to {}, but this build requested {}; run `cargo dotnet unity attach {} {} --force` to change it",
-                attached.display(),
-                crate_root.display(),
-                project.display(),
-                crate_root.display()
-            );
-        }
-        None => {
-            // A freshly scaffolded project should become a fully diagnosed attachment after its
-            // first build; requiring a separate attach command makes `new --unity` and `doctor
-            // --project` disagree about what a valid generated project is.
-            crate::unity_attach::attach(&project, crate_root, None, false)?;
-        }
-    }
+    // A freshly scaffolded project becomes a diagnosed attachment on its first build.
+    crate::unity_attach::ensure_attachment(&project, crate_root)?;
     let metadata =
         crate::context::cargo_metadata(&manifest).context("reading Rust crate metadata")?;
     let package = metadata
@@ -222,6 +194,17 @@ fn build(args: &UnityBuildArgs) -> Result<i32> {
     )?;
     println!("staged {assembly} into {}", dest.display());
     Ok(0)
+}
+
+pub(crate) fn resolve_project(project: &Path, context: &str) -> Result<PathBuf> {
+    let project = fs::canonicalize(project).with_context(|| context.to_owned())?;
+    if !project.join("Assets").is_dir() {
+        bail!(
+            "Unity project has no Assets directory: {}",
+            project.display()
+        );
+    }
+    Ok(project)
 }
 
 fn write_managed_meta_tree(root: &Path, identity: &str) -> Result<()> {

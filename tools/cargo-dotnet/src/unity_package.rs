@@ -27,15 +27,10 @@ pub fn package(
 ) -> Result<PackageSummary> {
     validate_name(package_name)?;
     Version::parse(version).with_context(|| format!("invalid UPM package version {version:?}"))?;
-    let project = project
-        .canonicalize()
-        .with_context(|| format!("resolving Unity project {}", project.display()))?;
-    if !project.join("Assets").is_dir() {
-        bail!(
-            "Unity project has no Assets directory: {}",
-            project.display()
-        );
-    }
+    let project = crate::unity::resolve_project(
+        project,
+        &format!("resolving Unity project {}", project.display()),
+    )?;
     let output = resolve_output(output)?;
     if output == project
         || project.starts_with(&output)

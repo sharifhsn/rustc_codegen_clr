@@ -4,7 +4,7 @@
 //! mutate Unity scenes or project settings, making repeated `attach` calls safe.
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::fs;
 use std::io::Write;
@@ -13,7 +13,7 @@ use std::path::Path;
 const GENERATED: &str = "Assets/RustDotnetGenerated";
 const SCHEMA: u32 = 1;
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AttachReceipt {
     pub schema: u32,
     pub assembly_name: String,
@@ -23,6 +23,32 @@ pub struct AttachReceipt {
     pub managed_crate: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_crate: Option<String>,
+}
+
+/// Ensure the project is attached to `rust_crate`, preserving the existing receipt contract.
+pub(crate) fn ensure_attachment(project: &Path, rust_crate: &Path) -> Result<AttachReceipt> {
+    match crate::unity::attached_crate_path(project, "managed_crate")? {
+        Some(attached) => {
+            let attached = fs::canonicalize(&attached).with_context(|| {
+                format!(
+                    "resolving managed crate from Unity attachment receipt {}",
+                    attached.display()
+                )
+            })?;
+            ensure!(
+                attached == rust_crate,
+                "Unity project is attached to {}, but this build requested {}; run `cargo dotnet unity attach {} {} --force` to change it",
+                attached.display(),
+                rust_crate.display(),
+                project.display(),
+                rust_crate.display()
+            );
+            let receipt =
+                fs::read_to_string(project.join(GENERATED).join("rustdotnet.attach.json"))?;
+            Ok(serde_json::from_str(&receipt).context("read Unity attachment receipt")?)
+        }
+        None => attach(project, rust_crate, None, false),
+    }
 }
 
 /// Attach a managed Rust crate (and optionally a native crate) to an existing
