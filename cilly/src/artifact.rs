@@ -11,79 +11,8 @@ pub const ASSEMBLY_ARTIFACT_MAGIC: &[u8; 8] = b"CILLYAR9";
 /// Current serialization-envelope version.
 pub const ASSEMBLY_ARTIFACT_VERSION: u16 = 9;
 
-/// .NET runtime surface available to generated code and linker-provided builtins.
-#[derive(
-    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
-pub enum DotnetRuntime {
-    /// .NET 10 API surface.
-    #[default]
-    Net10,
-    /// Unity's managed `netstandard2.1` profile; this is not a numbered CoreCLR runtime.
-    UnityNetStandard21,
-}
-
-impl DotnetRuntime {
-    /// Target-framework moniker for `runtimeconfig.json` / `.nuspec`.
-    #[must_use]
-    pub const fn tfm(self) -> &'static str {
-        match self {
-            Self::Net10 => "net10.0",
-            Self::UnityNetStandard21 => "netstandard2.1",
-        }
-    }
-
-    /// The `.ver` triplet for a BCL `.assembly extern` stamp.
-    #[must_use]
-    pub const fn assembly_ver(self) -> &'static str {
-        match self {
-            Self::Net10 => "10:0:0:0",
-            Self::UnityNetStandard21 => "4:0:0:0",
-        }
-    }
-
-    /// The parsed `.ver` tuple used by the direct PE exporter's `AssemblyRef` rows.
-    #[must_use]
-    pub const fn assembly_ver_tuple(self) -> (u16, u16, u16, u16) {
-        match self {
-            Self::Net10 => (10, 0, 0, 0),
-            Self::UnityNetStandard21 => (4, 0, 0, 0),
-        }
-    }
-
-    /// `Microsoft.NETCore.App` framework-version floor for `runtimeconfig.json`.
-    #[must_use]
-    pub const fn framework_version(self) -> &'static str {
-        match self {
-            Self::Net10 => "10.0.0",
-            Self::UnityNetStandard21 => "2.1.0",
-        }
-    }
-
-    /// Runtime major version.
-    #[must_use]
-    pub const fn major(self) -> u32 {
-        match self {
-            Self::Net10 => 10,
-            Self::UnityNetStandard21 => 0,
-        }
-    }
-
-    /// Whether this runtime exposes native byte/sbyte/short/ushort Interlocked overloads.
-    #[must_use]
-    pub const fn supports_subword_interlocked(self) -> bool {
-        self.major() >= 9
-    }
-}
-
-impl std::fmt::Display for DotnetRuntime {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Net10 => f.write_str(".NET 10"),
-            Self::UnityNetStandard21 => f.write_str("Unity netstandard2.1"),
-        }
-    }
-}
+/// Compatibility alias for the canonical runtime profile owned by the SDK crate.
+pub use rust_dotnet_sdk_core::runtime::DotnetVersion as DotnetRuntime;
 
 /// Immutable ABI choices that affect the IR emitted independently by each rustc process.
 ///

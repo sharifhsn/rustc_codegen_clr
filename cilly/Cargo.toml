@@ -13,6 +13,7 @@ ar = "0.9.0"
 fxhash = "0.2.1"
 hashbrown = "0.17.1"
 rustc-demangle = "0.1.24"
+rust-dotnet-sdk-core = { path = "../crates/rust-dotnet-sdk-core" }
 [[bin]]
 name = "linker"
 test = false

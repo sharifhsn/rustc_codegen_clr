@@ -86,7 +86,15 @@ pub mod identity {
 }
 
 pub mod runtime {
-    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+    use serde::{Deserialize, Serialize};
+
+    /// Managed runtime/API profile emitted by rustc_codegen_clr.
+    ///
+    /// Keep the variant order stable: this enum is serialized inside the cilly artifact ABI
+    /// envelope. Adding or reordering variants requires an artifact schema bump.
+    #[derive(
+        Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+    )]
     pub enum DotnetVersion {
         #[default]
         Net10,
@@ -106,10 +114,49 @@ pub mod runtime {
                 Self::UnityNetStandard21 => "unity-netstandard2.1",
             }
         }
-        pub fn ilasm_tool_dir(self) -> &'static str {
+        /// The `.ver` triplet for a BCL assembly reference.
+        pub const fn assembly_ver(self) -> &'static str {
             match self {
-                Self::Net10 => "ilasm10-tool",
-                Self::UnityNetStandard21 => "ilasm-unity-tool",
+                Self::Net10 => "10:0:0:0",
+                Self::UnityNetStandard21 => "4:0:0:0",
+            }
+        }
+
+        /// The parsed `.ver` tuple used by direct PE assembly-reference rows.
+        pub const fn assembly_ver_tuple(self) -> (u16, u16, u16, u16) {
+            match self {
+                Self::Net10 => (10, 0, 0, 0),
+                Self::UnityNetStandard21 => (4, 0, 0, 0),
+            }
+        }
+
+        /// `Microsoft.NETCore.App` framework-version floor for runtime configuration.
+        pub const fn framework_version(self) -> &'static str {
+            match self {
+                Self::Net10 => "10.0.0",
+                Self::UnityNetStandard21 => "2.1.0",
+            }
+        }
+
+        /// Runtime major version, or zero for Unity's netstandard profile.
+        pub const fn major(self) -> u32 {
+            match self {
+                Self::Net10 => 10,
+                Self::UnityNetStandard21 => 0,
+            }
+        }
+
+        /// Whether this runtime exposes native subword `Interlocked` overloads.
+        pub const fn supports_subword_interlocked(self) -> bool {
+            self.major() >= 9
+        }
+    }
+
+    impl std::fmt::Display for DotnetVersion {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Net10 => f.write_str(".NET 10"),
+                Self::UnityNetStandard21 => f.write_str("Unity netstandard2.1"),
             }
         }
     }

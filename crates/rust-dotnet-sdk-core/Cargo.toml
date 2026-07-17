@@ -6,3 +6,4 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1"
+serde = { version = "1.0.183", features = ["derive"] }
