@@ -4,7 +4,6 @@
 //! mutate Unity scenes or project settings, making repeated `attach` calls safe.
 
 use anyhow::{Context, Result, bail, ensure};
-use cargo_metadata::MetadataCommand;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use std::fs;
@@ -191,19 +190,7 @@ pub fn attach(
 }
 
 fn read_package(crate_dir: &Path) -> Result<cargo_metadata::Package> {
-    let manifest = if crate_dir.is_file() {
-        crate_dir
-    } else {
-        &crate_dir.join("Cargo.toml")
-    };
-    MetadataCommand::new()
-        .manifest_path(manifest)
-        .no_deps()
-        .exec()
-        .context("read managed crate Cargo metadata")?
-        .root_package()
-        .cloned()
-        .context("managed crate metadata has no root package")
+    crate::context::cargo_package(crate_dir).context("read managed crate Cargo metadata")
 }
 
 fn relative_path(project: &Path, path: &Path) -> Result<String> {

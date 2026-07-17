@@ -240,10 +240,11 @@ impl Context {
         };
         host::ensure_dotnet(&dotnet_heal)?;
         let paths = Paths::resolve(&mode, &host, &crate_dir)?;
-        let managed_project = resolve_managed_project(&crate_dir)?;
+        let package = cargo_package(&crate_dir)?;
+        let managed_project = resolve_managed_project(&package)?;
         let source_link_url = validate_source_link_url(args.source_link_url.as_deref())?;
         if managed_project.is_some() {
-            validate_managed_identity_build(args, &crate_dir)?;
+            validate_managed_identity_build(args, &package)?;
         }
 
         let toolchain = match &mode {
@@ -355,22 +356,43 @@ fn validate_source_link_url(value: Option<&str>) -> Result<Option<String>> {
     Ok(Some(value.to_string()))
 }
 
-fn cargo_package(crate_dir: &Path) -> Result<cargo_metadata::Package> {
-    let metadata = cargo_metadata::MetadataCommand::new()
-        .manifest_path(crate_dir.join("Cargo.toml"))
-        .no_deps()
-        .exec()
-        .context("read Cargo metadata for managed identity")?;
-    metadata.root_package().cloned().with_context(|| {
-        format!(
-            "Cargo metadata has no root package for {}",
-            crate_dir.display()
-        )
-    })
+/// Resolve a crate directory or manifest to the manifest Cargo should inspect.
+pub(crate) fn manifest_path(crate_path: &Path) -> PathBuf {
+    if crate_path.is_file() {
+        crate_path.to_path_buf()
+    } else {
+        crate_path.join("Cargo.toml")
+    }
 }
 
-fn resolve_managed_project(crate_dir: &Path) -> Result<Option<ManagedProjectConfig>> {
-    let package = cargo_package(crate_dir)?;
+/// Read the ordinary root package metadata used by build/attach/pack operations.
+///
+/// Full-graph callers (provenance, restore receipts, and metadata-input tracking) deliberately
+/// keep their own Cargo invocation because they need locked/config/toolchain semantics.
+pub(crate) fn cargo_package(crate_path: &Path) -> Result<cargo_metadata::Package> {
+    cargo_metadata(crate_path)?
+        .root_package()
+        .cloned()
+        .with_context(|| {
+            format!(
+                "Cargo metadata has no root package for {}",
+                crate_path.display()
+            )
+        })
+}
+
+pub(crate) fn cargo_metadata(crate_path: &Path) -> Result<cargo_metadata::Metadata> {
+    let manifest = manifest_path(crate_path);
+    cargo_metadata::MetadataCommand::new()
+        .manifest_path(manifest)
+        .no_deps()
+        .exec()
+        .context("read Cargo metadata")
+}
+
+fn resolve_managed_project(
+    package: &cargo_metadata::Package,
+) -> Result<Option<ManagedProjectConfig>> {
     let Some(dotnet) = package.metadata.get("dotnet") else {
         return Ok(None);
     };
@@ -450,7 +472,7 @@ pub fn print_managed_assembly_name(path: Option<&Path>) -> Result<i32> {
         .canonicalize()
         .with_context(|| format!("canonicalize Rust crate {}", crate_dir.display()))?;
     let package = cargo_package(&crate_dir)?;
-    let name = resolve_managed_project(&crate_dir)?
+    let name = resolve_managed_project(&package)?
         .map(|project| project.identity.assembly_name)
         .unwrap_or_else(|| package.name.to_string());
     println!("{name}");
@@ -461,7 +483,10 @@ pub fn print_managed_assembly_name(path: Option<&Path>) -> Result<i32> {
 /// linker environment is inherited by every final target.  There is no per-artifact identity
 /// channel yet, so a release identity may describe exactly one `cdylib`, never a workspace-wide
 /// or mixed bin/library invocation.
-fn validate_managed_identity_build(args: &BuildArgs, crate_dir: &Path) -> Result<()> {
+fn validate_managed_identity_build(
+    args: &BuildArgs,
+    package: &cargo_metadata::Package,
+) -> Result<()> {
     let has_package_selection = !args.workspace.package.is_empty()
         || args.workspace.workspace
         || !args.workspace.exclude.is_empty()
@@ -479,7 +504,6 @@ fn validate_managed_identity_build(args: &BuildArgs, crate_dir: &Path) -> Result
         );
     }
 
-    let package = cargo_package(crate_dir)?;
     let final_targets: Vec<_> = package
         .targets
         .iter()
@@ -530,7 +554,7 @@ pub fn validate_managed_identity_set(crate_dirs: &[PathBuf]) -> Result<i32> {
             )
         })?;
         let package = cargo_package(&crate_dir)?;
-        let project = resolve_managed_project(&crate_dir)?;
+        let project = resolve_managed_project(&package)?;
         let assembly_name = project
             .as_ref()
             .map(|project| project.identity.assembly_name.clone())

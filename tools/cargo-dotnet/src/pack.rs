@@ -37,7 +37,7 @@ use zip::{CompressionMethod, ZipWriter};
 
 use crate::artifact::{self, Artifact};
 use crate::cli::{BuildArgs, PackArgs};
-use crate::context::Context;
+use crate::context::{self, Context};
 use crate::{buildstd, interop_helpers, nuget, overlays, provenance, xmldoc};
 
 pub fn run(args: &PackArgs) -> Result<i32> {
@@ -60,15 +60,7 @@ pub fn run(args: &PackArgs) -> Result<i32> {
     let ctx = Context::resolve(&build_args, false)?;
 
     // ---- crate name + version from cargo_metadata (typed) ----
-    let meta = cargo_metadata::MetadataCommand::new()
-        .manifest_path(ctx.crate_dir.join("Cargo.toml"))
-        .no_deps()
-        .exec()
-        .context("pack: `cargo metadata` failed")?;
-    let pkg = meta
-        .packages
-        .first()
-        .context("pack: no package in cargo metadata")?;
+    let pkg = context::cargo_package(&ctx.crate_dir).context("pack: `cargo metadata` failed")?;
     let assembly_name = ctx
         .managed_identity()
         .map(|identity| identity.assembly_name.clone())

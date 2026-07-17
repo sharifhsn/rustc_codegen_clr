@@ -131,12 +131,8 @@ fn build(args: &UnityBuildArgs) -> Result<i32> {
             crate::unity_attach::attach(&project, crate_root, None, false)?;
         }
     }
-    let mut metadata_command = cargo_metadata::MetadataCommand::new();
-    let metadata = metadata_command
-        .manifest_path(&manifest)
-        .no_deps()
-        .exec()
-        .context("reading Rust crate metadata")?;
+    let metadata =
+        crate::context::cargo_metadata(&manifest).context("reading Rust crate metadata")?;
     let package = metadata
         .root_package()
         .context("Rust crate metadata has no root package")?;

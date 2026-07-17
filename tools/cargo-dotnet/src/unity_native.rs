@@ -1,7 +1,6 @@
 //! Stage a Rust `cdylib` into a Unity project's native plug-in directory.
 
 use anyhow::{Context, Result, bail, ensure};
-use cargo_metadata::MetadataCommand;
 use object::{Architecture, Object as _, ObjectSymbol as _};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -39,11 +38,8 @@ pub fn run(args: &UnityNativeArgs) -> Result<i32> {
     if !manifest.is_file() {
         bail!("Rust crate has no Cargo.toml: {}", manifest.display());
     }
-    let metadata = MetadataCommand::new()
-        .manifest_path(&manifest)
-        .no_deps()
-        .exec()
-        .context("read native crate Cargo metadata")?;
+    let metadata =
+        crate::context::cargo_metadata(&manifest).context("read native crate Cargo metadata")?;
     let package = metadata
         .root_package()
         .context("native crate metadata has no root package")?;

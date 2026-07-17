@@ -195,16 +195,10 @@ fn copy_library_pdb(so: &std::path::Path, dll: &std::path::Path) -> Result<Optio
 
 /// The crate's bin target name via cargo_metadata (replaces the bash tr/awk scrape).
 fn bin_name(ctx: &Context) -> Option<String> {
-    let meta = cargo_metadata::MetadataCommand::new()
-        .manifest_path(ctx.crate_dir.join("Cargo.toml"))
-        .no_deps()
-        .exec()
-        .ok()?;
-    for pkg in &meta.packages {
-        for t in &pkg.targets {
-            if t.kind.iter().any(|k| k == "bin") {
-                return Some(t.name.clone());
-            }
+    let pkg = crate::context::cargo_package(&ctx.crate_dir).ok()?;
+    for t in &pkg.targets {
+        if t.kind.iter().any(|k| k == "bin") {
+            return Some(t.name.clone());
         }
     }
     // last resort: the crate dir basename.
