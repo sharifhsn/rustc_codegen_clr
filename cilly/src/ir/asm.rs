@@ -1109,9 +1109,9 @@ impl Assembly {
 
         def_idx
     }
-    pub fn user_init(&mut self) -> MethodDefIdx {
+    fn ensure_init(&mut self, name: &str, access: Access) -> MethodDefIdx {
         let main_module = self.main_module();
-        let user_init = self.alloc_string(USER_INIT);
+        let user_init = self.alloc_string(name);
         let ctor_sig = self.sig([], Type::Void);
         let mref = MethodRef::new(
             *main_module,
@@ -1133,7 +1133,7 @@ impl Assembly {
                 locals: vec![],
             };
             let cctor_def = MethodDef::new(
-                Access::InternalExtern,
+                access,
                 main_module,
                 user_init,
                 ctor_sig,
@@ -1144,41 +1144,12 @@ impl Assembly {
             self.new_method(cctor_def)
         }
     }
+    pub fn user_init(&mut self) -> MethodDefIdx {
+        self.ensure_init(USER_INIT, Access::InternalExtern)
+    }
     /// Returns a reference to tht thread local constructor.
     pub fn tcctor(&mut self) -> MethodDefIdx {
-        let main_module = self.main_module();
-        let user_init = self.alloc_string(TCCTOR);
-        let ctor_sig = self.sig([], Type::Void);
-        let mref = MethodRef::new(
-            *main_module,
-            user_init,
-            ctor_sig,
-            MethodKind::Static,
-            vec![].into(),
-        );
-        let mref = self.alloc_methodref(mref);
-        if self.method_defs.contains_key(&MethodDefIdx::from_raw(mref)) {
-            MethodDefIdx::from_raw(mref)
-        } else {
-            let mimpl = MethodImpl::MethodBody {
-                blocks: vec![super::BasicBlock::new(
-                    vec![self.alloc_root(CILRoot::VoidRet)],
-                    0,
-                    None,
-                )],
-                locals: vec![],
-            };
-            let cctor_def = MethodDef::new(
-                Access::InternalExtern,
-                main_module,
-                user_init,
-                ctor_sig,
-                MethodKind::Static,
-                mimpl,
-                vec![],
-            );
-            self.new_method(cctor_def)
-        }
+        self.ensure_init(TCCTOR, Access::InternalExtern)
     }
     fn cctor_mref(&mut self) -> Interned<MethodRef> {
         let main_module = self.main_module();
@@ -1259,92 +1230,38 @@ impl Assembly {
         if self.method_defs.contains_key(&MethodDefIdx::from_raw(mref)) {
             MethodDefIdx::from_raw(mref)
         } else {
-            let mimpl = MethodImpl::MethodBody {
-                blocks: vec![super::BasicBlock::new(
-                    vec![self.alloc_root(CILRoot::VoidRet)],
-                    0,
-                    None,
-                )],
-                locals: vec![],
-            };
-            let main_module = self.main_module();
-            let user_init = self.alloc_string(CCTOR);
-            let ctor_sig = self.sig([], Type::Void);
-            let cctor_def = MethodDef::new(
-                Access::Extern,
-                main_module,
-                user_init,
-                ctor_sig,
-                MethodKind::Static,
-                mimpl,
-                vec![],
-            );
-            self.new_method(cctor_def)
+            self.ensure_init(CCTOR, Access::Extern)
+        }
+    }
+    fn append_init_roots(&mut self, init: MethodDefIdx, roots: &[Interned<CILRoot>], name: &str) {
+        let init = self.method_defs.get_mut(&init).unwrap();
+        let blocks = init
+            .implementation_mut()
+            .blocks_mut()
+            .unwrap_or_else(|| panic!("EROROR: {name} has no body."));
+        let last = blocks
+            .iter_mut()
+            .last()
+            .unwrap_or_else(|| panic!("ERROR: {name} has a body without blocks."));
+        let last_root_idx = last.roots().len().saturating_sub(1);
+        for (idx, root) in roots.iter().enumerate() {
+            last.roots_mut().insert(idx + last_root_idx, *root);
         }
     }
     /// Adds new rooots to the user init list.
     pub fn add_user_init(&mut self, roots: &[Interned<CILRoot>]) {
         let user_init = self.user_init();
-        let user_init = self.method_defs.get_mut(&user_init).unwrap();
-        let blocks = user_init
-            .implementation_mut()
-            .blocks_mut()
-            .expect("EROROR: {USER_INIT} has no body.");
-        let last = blocks
-            .iter_mut()
-            .last()
-            .expect("ERROR: {USER_INIT} has a body without blocks.");
-        let last_root_idx = if last.roots().is_empty() {
-            0
-        } else {
-            last.roots().len() - 1
-        };
-        for (idx, root) in roots.iter().enumerate() {
-            last.roots_mut().insert(idx + last_root_idx, *root);
-        }
+        self.append_init_roots(user_init, roots, USER_INIT);
     }
     /// Adds new rooots to the thread local intiailzer .
     pub fn add_tcctor(&mut self, roots: &[Interned<CILRoot>]) {
         let user_init = self.tcctor();
-        let user_init = self.method_defs.get_mut(&user_init).unwrap();
-        let blocks = user_init
-            .implementation_mut()
-            .blocks_mut()
-            .expect("EROROR: {TCCTOR} has no body.");
-        let last = blocks
-            .iter_mut()
-            .last()
-            .expect("ERROR: {TCCTOR} has a body without blocks.");
-        let last_root_idx = if last.roots().is_empty() {
-            0
-        } else {
-            last.roots().len() - 1
-        };
-        for (idx, root) in roots.iter().enumerate() {
-            last.roots_mut().insert(idx + last_root_idx, *root);
-        }
+        self.append_init_roots(user_init, roots, TCCTOR);
     }
     /// Adds new rooots to the static initializer
     pub fn add_cctor(&mut self, roots: &[Interned<CILRoot>]) {
         let user_init = self.cctor();
-        let user_init = self.method_defs.get_mut(&user_init).unwrap();
-        let blocks = user_init
-            .implementation_mut()
-            .blocks_mut()
-            .expect("EROROR: {CCTOR} has no body.");
-        let last = blocks
-            .iter_mut()
-            .last()
-            .expect("ERROR: {CCTOR} has a body without blocks.");
-        let last_root_idx = if last.roots().is_empty() {
-            0
-        } else {
-            last.roots().len() - 1
-        };
-
-        for (idx, root) in roots.iter().enumerate() {
-            last.roots_mut().insert(idx + last_root_idx, *root);
-        }
+        self.append_init_roots(user_init, roots, CCTOR);
     }
     /// Serializes and saves this assembly
     pub fn save_tmp<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
@@ -2466,187 +2383,6 @@ impl Assembly {
     pub fn iter_roots(&self) -> impl Iterator<Item = &CILRoot> {
         self.roots.values().iter()
     }
-    pub fn remove_dead_statics(&mut self) {
-        /*// Check which statics are referenced by real code.
-                let alive_statics: FxHashSet<Interned<StaticFieldDesc>> = self
-                    .iter_nodes()
-                    .filter_map(|node| match node {
-                        CILNode::LdStaticField(fld) | CILNode::LdStaticFieldAdress(fld) => Some(*fld),
-                        _ => None,
-                    })
-                    .collect();
-                let defs: Vec<_> = self.iter_class_def_ids().copied().collect();
-                for class_id in defs {
-                    let class = self.get_class_def(class_id).clone();
-                    // Collect all statics which, to which there exists a corresponding static field desc.
-                    let statics: Vec<_> = class
-                        .static_fields()
-                        .iter()
-                        .copied()
-                        .filter(|(tpe, name, _)| {
-                            alive_statics
-                                .contains(&self.alloc_sfld(StaticFieldDesc::new(*class_id, *name, *tpe)))
-                        })
-                        .collect();
-                    let class = self.class_mut(class_id);
-                    *class.static_fields_mut() = statics;
-                }
-                // After removing all statics whose address nor value is not taken, replace any writes to those statics with pops.
-        */
-    }
-    /// Preforms a "shallow" GC pass on all method defs, removing them if and only if:
-    /// 1. They are not referenced by anything inside this assembly
-    /// 2. They are not accessible from outside of it.
-    ///
-    /// **WARNING**: This gc is highly conservative, and will often not collect some things.
-    /// To improve its accuracy, first do `link_gc`.
-    pub fn shallow_methodef_gc(&mut self) {
-        let live: FxHashSet<Interned<MethodRef>> = self
-            .iter_nodes()
-            .filter_map(|node| match node {
-                CILNode::Call(boxed) => Some(boxed.0),
-                CILNode::LdFtn(method_ref_idx) => Some(*method_ref_idx),
-                CILNode::Const(_)
-                | CILNode::BinOp(_, _, _)
-                | CILNode::UnOp(_, _)
-                | CILNode::LdLoc(_)
-                | CILNode::LdLocA(_)
-                | CILNode::LdArg(_)
-                | CILNode::LdArgA(_)
-                | CILNode::IntCast { .. }
-                | CILNode::FloatCast { .. }
-                | CILNode::RefToPtr(_)
-                | CILNode::PtrCast(_, _)
-                | CILNode::LdFieldAddress { .. }
-                | CILNode::LdField { .. }
-                | CILNode::LdInd { .. }
-                | CILNode::SizeOf(_)
-                | CILNode::GetException
-                | CILNode::IsInst(_, _)
-                | CILNode::CheckedCast(_, _)
-                | CILNode::CallI(_)
-                | CILNode::LocAlloc { .. }
-                | CILNode::LdStaticField(_)
-                | CILNode::LdStaticFieldAddress(_)
-                | CILNode::LdTypeToken(_)
-                | CILNode::LdLen(_)
-                | CILNode::LocAllocAlgined { .. }
-                | CILNode::LdElelemRef { .. }
-                | CILNode::LdElem { .. }
-                | CILNode::NewArr { .. }
-                | CILNode::Box { .. }
-                | CILNode::UnboxAny { .. } => None,
-            })
-            .chain(self.iter_roots().filter_map(|root| match root {
-                CILRoot::Call(boxed) => Some(boxed.0),
-                CILRoot::StLoc(_, _)
-                | CILRoot::InitObj(_, _)
-                | CILRoot::StArg(_, _)
-                | CILRoot::Ret(_)
-                | CILRoot::Pop(_)
-                | CILRoot::Throw(_)
-                | CILRoot::VoidRet
-                | CILRoot::Break
-                | CILRoot::Nop
-                | CILRoot::Branch(_)
-                | CILRoot::SourceFileInfo { .. }
-                | CILRoot::SetField(_)
-                | CILRoot::StInd(_)
-                | CILRoot::InitBlk(_)
-                | CILRoot::CpBlk(_)
-                | CILRoot::CallI(_)
-                | CILRoot::ExitSpecialRegion { .. }
-                | CILRoot::ReThrow
-                // `protected` is interned in the same root bimap, so this `iter_roots` over
-                // `self.roots.values()` already visits it directly — the region itself holds no
-                // MethodRef.
-                | CILRoot::TerminateRegion { .. }
-                | CILRoot::SetStaticField { .. }
-                | CILRoot::CpObj { .. }
-                | CILRoot::StElem { .. }
-                | CILRoot::Unreachable(_) => None,
-            }))
-            .collect();
-
-        let mut live: FxHashSet<MethodDefIdx> = live
-            .into_iter()
-            .filter_map(|mref| self.method_ref_to_def(mref))
-            .collect();
-        if live.len() == self.method_defs.len() {
-            println!("shallow_methodref_gc failed(no unreferenced methods)");
-            return;
-        }
-        self.method_defs.retain(|id, def| {
-            if live.contains(id) {
-                true
-            } else if !matches!(def.implementation(), MethodImpl::Extern { .. }) {
-                live.insert(*id);
-                true
-            } else {
-                false
-            }
-        });
-        if live.len() == self.method_defs.len() {
-            println!("shallow_methodref_gc failed(no unreferenced, externaly invisible methods)");
-        }
-        self.class_defs.values_mut().for_each(|tdef| {
-            tdef.methods_mut()
-                .retain(|methodef| live.contains(methodef));
-        });
-    }
-    pub fn split_to_parts(&self, parts: u32) -> impl Iterator<Item = Self> + use<'_> {
-        let lib_name = Interned::from_index(std::num::NonZeroU32::new(1).unwrap());
-        // Since 1st part is dedicated to methods which access statics, split the rest into n-1 parts.
-        let div = (self.method_refs.len().div_ceil(parts as usize - 1)) as u32;
-        // Into 1st. Only split out the methods where it is known, for sure, that they don't access any statics.
-        (0..parts).map(move |rem| {
-            let mut part = self.clone();
-            part.method_defs.iter_mut().for_each(|(idx, def)| {
-                if def.accesses_statics(self) {
-                    if 0 != rem {
-                        *def.implementation_mut() = MethodImpl::Extern {
-                            lib: lib_name,
-                            entry_point: None,
-                            call_conv: super::PInvokeCallConv::Cdecl,
-                            preserve_errno: false,
-                        }
-                    }
-                } else if idx.as_bimap_index().get() / div + 1 != rem {
-                    *def.implementation_mut() = MethodImpl::Extern {
-                        lib: lib_name,
-                        entry_point: None,
-                        call_conv: super::PInvokeCallConv::Cdecl,
-                        preserve_errno: false,
-                    }
-                }
-            });
-            if 0 != rem {
-                part.class_defs
-                    .iter_mut()
-                    .for_each(|(_, def)| *def.static_fields_mut() = vec![]);
-            }
-            part.eliminate_dead_types();
-            //part.eliminate_dead_fns(true);
-            part = part.link_gc();
-            part.shallow_methodef_gc();
-            part
-        })
-    }
-    pub fn only_statics(&self) -> Self {
-        let lib_name = Interned::from_index(std::num::NonZeroU32::new(1).unwrap());
-        let mut empty = self.clone();
-        empty.method_defs.iter_mut().for_each(|(_, def)| {
-            *def.implementation_mut() = MethodImpl::Extern {
-                lib: lib_name,
-                entry_point: None,
-                call_conv: super::PInvokeCallConv::Cdecl,
-                preserve_errno: false,
-            }
-        });
-        empty.eliminate_dead_types();
-        empty = empty.link_gc();
-        empty
-    }
     pub fn fix_alignment(&mut self, guaranteed_align: u8) {
         let method_def_idxs: Box<[_]> = self.method_defs.keys().copied().collect();
         for method in method_def_idxs {
@@ -2697,11 +2433,6 @@ impl Assembly {
         })
     }
 
-    fn link_gc(self) -> Self {
-        let mut clone = self.clone();
-        clone = clone.link(self);
-        clone
-    }
     pub(crate) fn ptr_size(&self) -> u32 {
         8
     }
