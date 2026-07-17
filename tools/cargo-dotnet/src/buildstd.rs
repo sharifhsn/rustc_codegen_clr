@@ -1,6 +1,6 @@
 //! `build-std` invocation — typed port of the bash build block (core 626-744).
 //!
-//! Sets the backend RUSTFLAGS + the dotnet/ilasm env, runs `cargo fetch` then patches
+//! Sets the backend RUSTFLAGS + the dotnet env, runs `cargo fetch` then patches
 //! the libc REGISTRY copy (the post-fetch second pass), runs the filtered/verbose
 //! build, then a final `--message-format=json` pass whose stdout it returns for
 //! `artifact::locate`. This is the ONE place a child env is constructed on the native
@@ -318,7 +318,7 @@ fn patch_registry_libc(ctx: &Context) -> Result<()> {
     Ok(())
 }
 
-/// A cargo Command pre-loaded with the backend RUSTFLAGS + the dotnet/ilasm env + the
+/// A cargo Command pre-loaded with the backend RUSTFLAGS + the dotnet env + the
 /// pinned toolchain (installed only) + quiet/deterministic dotnet knobs. Runs in the
 /// crate dir.
 fn base_cargo(ctx: &Context, sysroot: &PrivateSysroot) -> Command {
@@ -378,14 +378,9 @@ fn base_cargo(ctx: &Context, sysroot: &PrivateSysroot) -> Command {
         cmd.env("RUSTUP_TOOLCHAIN", tc);
     }
 
-    // ilasm (CoreCLR, exported for the cilly linker; version-matched in `host::resolve_ilasm`).
-    if let Some(ilasm) = &ctx.ilasm {
-        cmd.env("ILASM_PATH", ilasm);
-    }
-
     // Target .NET version — the SINGLE seam: exported so BOTH the codegen backend (rustc, which
     // reads it via cilly) AND the cilly linker (a separate process: runtimeconfig + `.ver` stamps)
-    // target the same runtime. Pairs with the version-matched ILASM_PATH above.
+    // target the same runtime.
     cmd.env("DOTNET_VERSION", ctx.dotnet.as_env());
     if matches!(ctx.dotnet, DotnetVersion::UnityNetStandard21) {
         // Keep the serialized codegen shards and final linker on one AOT-safe ABI contract.
@@ -479,7 +474,6 @@ mod tests {
             envs.get(std::ffi::OsStr::new("RCL_MANAGED_ASSEMBLY_NAME")),
             Some(&Some(std::ffi::OsStr::new("example_widget")))
         );
-        assert!(!envs.contains_key(std::ffi::OsStr::new("DIRECT_PE")));
     }
 
     #[test]

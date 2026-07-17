@@ -10,7 +10,6 @@ REM   * Git for Windows (provides bash) on PATH, or WSL.
 REM   * rustup nightly-2026-06-17-x86_64-pc-windows-msvc + rust-src + rustc-dev.
 REM   * .NET 8 SDK on PATH (dotnet.exe).
 REM   * The CoreCLR ILAsm tool (NuGet runtime.win-x64.Microsoft.NETCore.ILAsm) at
-REM     %USERPROFILE%\.dotnet\ilasm-tool\ilasm.exe, or ILASM_PATH set to it.
 REM   * The host backend built: librustc_codegen_clr.dll + linker.exe under target\release.
 REM
 REM This path is IMPLEMENTED DEFENSIVELY but NOT verified on Windows. See the docs.

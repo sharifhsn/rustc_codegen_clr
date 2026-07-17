@@ -11,10 +11,8 @@ use cilly::{
     libc_fns::{self, LIBC_FNS, LIBC_MODIFIES_ERRNO},
     {
         ArtifactAbiConfig, ArtifactAbiConfigMismatch, Assembly, BasicBlock, CILNode, CILRoot,
-        ClassDef, ClassRef, Const, DotnetRuntime, IlasmFlavour, Int, MethodImpl, OutputTarget,
-        Type,
-        asm::{ILASM_FLAVOUR, MissingMethodPatcher},
-        cilnode::MethodKind,
+        ClassDef, ClassRef, Const, DotnetRuntime, Int, MethodImpl, OutputTarget, Type,
+        asm::MissingMethodPatcher, cilnode::MethodKind,
     },
 };
 mod load;
@@ -52,7 +50,6 @@ struct LinkerConfig {
     guaranteed_align: u8,
     pool_alloc: bool,
     panic_managed_backtrace: bool,
-    direct_pe: bool,
     managed_identity: Option<ManagedIdentity>,
 }
 
@@ -67,7 +64,6 @@ impl LinkerConfig {
         const SETTINGS: &[&str] = &[
             "ASCI_IDENT",
             "C_MODE",
-            "DIRECT_PE",
             "DOTNET_VERSION",
             "GUARANTEED_ALIGN",
             "MAX_STATIC_SIZE",
@@ -123,7 +119,6 @@ impl LinkerConfig {
         }
 
         let managed_identity = managed_identity_from_environment(environment)?;
-        let direct_pe = linker_bool(environment, "DIRECT_PE", true)?;
         Ok(Self {
             process_abi: ArtifactAbiConfig::from_environment(environment)
                 .map_err(|error| error.to_string())?,
@@ -131,7 +126,6 @@ impl LinkerConfig {
             guaranteed_align,
             pool_alloc: linker_bool(environment, "POOL_ALLOC", false)?,
             panic_managed_backtrace: linker_bool(environment, "PANIC_MANAGED_BT", false)?,
-            direct_pe,
             managed_identity,
         })
     }
@@ -403,7 +397,7 @@ fn main() {
     // Load assemblies from files
 
     let loaded = load::load_assemblies_with_config(to_link.as_slice(), ar_to_link.as_slice());
-    let (mut final_assembly, artifact_abi_config, _) = loaded.into_parts();
+    let (mut final_assembly, artifact_abi_config) = loaded.into_parts();
     final_assembly
         .validate_fixed_array_layouts()
         .unwrap_or_else(|error| panic!("post-link {error}"));
@@ -780,7 +774,7 @@ fn main() {
         let cexport = cilly::c_exporter::CExporter::new(is_lib, libs, dirs);
 
         final_assembly.export(&path, cexport);
-    } else if linker_config.direct_pe {
+    } else {
         // Hand-rolled ECMA-335 PE writer (`cilly::pe_exporter`) — bypasses `ilasm` entirely. See
         // `docs/PE_EMISSION_PLAN.md`. `il_exporter`'s own `Exporter::export` (the `else` branch
         // below) is left byte-for-byte untouched; this is a parallel call site, not a
@@ -934,77 +928,12 @@ fn main() {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-    } else {
-        // For a library, derive a real .NET assembly name from the output file (strip dir, the cargo
-        // `lib` prefix, and the extension): `librust_export.so` -> `rust_export`. Executables keep the
-        // legacy `_` placeholder (loaded by path via the launcher).
-        let asm_name = if is_lib {
-            linker_config
-                .managed_identity
-                .as_ref()
-                .map(|identity| identity.assembly_name.clone())
-                .or_else(|| {
-                    path.file_stem()
-                        .and_then(|s| s.to_str())
-                        .map(|s| s.strip_prefix("lib").unwrap_or(s).to_string())
-                })
-        } else {
-            None
-        };
-        final_assembly.export(
-            &path,
-            cilly::il_exporter::ILExporter::new(*ILASM_FLAVOUR, is_lib, asm_name)
-                .with_runtime(effective_abi_config.dotnet_runtime()),
-        );
-        // A library has no entrypoint to launch, so it needs no native launcher — the .NET assembly
-        // emitted at `path` (above) IS the artifact. Only executables get the launcher.
-        if cargo_support && !is_lib {
-            let bootstrap = bootstrap_source(
-                &path.with_extension("exe"),
-                path.to_str().unwrap(),
-                "dotnet",
-                None,
-                *ILASM_FLAVOUR != IlasmFlavour::Clasic,
-                effective_abi_config.dotnet_runtime(),
-            );
-            let bootstrap_path = path.with_extension("rs");
-            let mut bootstrap_file = std::fs::File::create(&bootstrap_path).unwrap();
-            bootstrap_file.write_all(bootstrap.as_bytes()).unwrap();
-            // Compile the bootstrap launcher with the *default* (native LLVM) backend, NOT cg_clr,
-            // so we must drop the RUSTFLAGS / cargo-encoded flags that point `-Zcodegen-backend` at
-            // this backend (otherwise the launcher build would recurse into cg_clr). This previously
-            // used `env_clear()` + PATH, which also wiped `RUSTUP_TOOLCHAIN`/`HOME`: `rustc` then fell
-            // back to rustup's default channel and triggered a toolchain *download/sync* whose
-            // progress text lands on stderr, tripping the old `stderr.is_empty()` assert. Keep the
-            // environment (so the pinned toolchain is used and no sync happens) but remove only the
-            // backend-selecting vars, and gate on the exit status (rustc may emit benign warnings).
-            let out = std::process::Command::new("rustc")
-                .arg("-O")
-                .arg(bootstrap_path)
-                .arg("-o")
-                .arg(out_path)
-                .env_remove("RUSTFLAGS")
-                .env_remove("CARGO_ENCODED_RUSTFLAGS")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "bootstrap launcher compilation failed:\n{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
     }
-
+    // Direct PE is the sole managed emitter.
     //todo!();
 }
-/// `pdb_file_override`: `Some(name)` when the caller already knows the EXACT bare filename its
-/// PDB was written under (the `DIRECT_PE` executable case — see that call site's doc for why this
-/// can differ from `fpath.file_stem() + ".pdb"`: cargo's hashed `deps/` build path is not the
-/// final artifact name). `None` falls back to the pre-existing `{fpath-stem}.pdb` convention
-/// (ilasm path, and the `DIRECT_PE` library case where `fpath`'s own name already IS final).
-/// `pdb_capable` is decided by the active exporter. Keeping that decision at the call site is
-/// important: consulting `ILASM_FLAVOUR` here executes `ilasm --help`, even for direct PE
-/// builds that never use ILAsm.
+/// `pdb_file_override` is the exact PDB filename when the caller already knows it; otherwise the
+/// output stem is used. `pdb_capable` controls whether the launcher carries PDB metadata.
 fn bootstrap_source(
     fpath: &Path,
     output_file_path: &str,
@@ -1081,13 +1010,11 @@ mod linker_config_tests {
             ("C_MODE".to_owned(), "1".to_owned()),
             ("GUARANTEED_ALIGN".to_owned(), "16".to_owned()),
             ("POOL_ALLOC".to_owned(), "true".to_owned()),
-            ("DIRECT_PE".to_owned(), "0".to_owned()),
         ]);
         let config = LinkerConfig::from_environment(&environment).unwrap();
         assert_eq!(config.target, OutputTarget::C);
         assert_eq!(config.guaranteed_align, 16);
         assert!(config.pool_alloc);
-        assert!(!config.direct_pe);
         assert_eq!(config.process_abi, ArtifactAbiConfig::default());
     }
 

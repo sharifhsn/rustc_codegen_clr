@@ -18,7 +18,7 @@ mkdir -p "$log_dir"
 for profile in debug release; do
     profile_flag="--release"
     [[ "$profile" == debug ]] && profile_flag="--debug"
-    DIRECT_PE=1 CARGO_DOTNET_BACKEND=native "$driver" build "$fixture" \
+        CARGO_DOTNET_BACKEND=native "$driver" build "$fixture" \
         "$profile_flag" --dotnet "$dotnet_version" \
         --source-link-url 'https://example.invalid/rust-dotnet-fixture/*' \
         > "$log_dir/rust-$profile.log" 2>&1

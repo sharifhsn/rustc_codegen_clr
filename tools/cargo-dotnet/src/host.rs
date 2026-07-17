@@ -1,6 +1,4 @@
-//! Host facts + tool discovery (dotnet / ilasm). Ports the SHARED HOST HELPERS in
-//! `feasibility/cargo-dotnet:103-150` (`detect_host_os`, `ensure_dotnet_on_path`,
-//! `resolve_ilasm`).
+//! Host facts + tool discovery (dotnet).
 
 use std::env;
 use std::path::PathBuf;
@@ -90,73 +88,6 @@ pub fn ensure_dotnet(heal: &Option<(PathBuf, PathBuf)>) -> Result<()> {
     bail!(
         "dotnet not found on PATH or at $HOME/.dotnet/dotnet \
          (run `cargo dotnet setup`, or add $HOME/.dotnet to PATH)"
-    )
-}
-
-/// Resolve a CoreCLR (NOT Mono) ilasm and return its absolute path to export as
-/// `ILASM_PATH`. Order: explicit `$ILASM_PATH`; the installed cargo-dotnet SDK; the selected
-/// runtime's versioned tool directory under `$HOME/.dotnet`; a non-Mono `ilasm` on PATH (returns
-/// `None`, letting cilly's bare default fire).
-/// Ports `resolve_ilasm` (cargo-dotnet:137-150).
-pub fn resolve_ilasm(
-    facts: &HostFacts,
-    dotnet: crate::context::DotnetVersion,
-) -> Result<Option<PathBuf>> {
-    if let Ok(explicit) = env::var("ILASM_PATH") {
-        if !explicit.is_empty() {
-            let p = PathBuf::from(&explicit);
-            if !p.is_file() {
-                bail!("ILASM_PATH='{explicit}' is not an executable");
-            }
-            return Ok(Some(p));
-        }
-    }
-    let bundled_name = format!("ilasm{}", facts.exe_ext);
-    if let Some(sdk_home) = env::var_os("CARGO_DOTNET_HOME").map(PathBuf::from) {
-        let tool = sdk_home.join("bin").join(&bundled_name);
-        if tool.is_file() {
-            return Ok(Some(tool));
-        }
-    }
-    if let Some(home) = home_dir() {
-        let bundled = home.join(".cargo-dotnet/bin").join(&bundled_name);
-        if bundled.is_file() {
-            return Ok(Some(bundled));
-        }
-        // Each runtime needs its MATCHING CoreCLR ilasm (an older ilasm's PE can be rejected by a
-        // newer runtime): ilasm-tool for .NET 8, ilasm9-tool for .NET 9, ilasm10-tool for .NET 10.
-        let tool = home.join(format!(
-            ".dotnet/{}/ilasm{}",
-            dotnet.ilasm_tool_dir(),
-            facts.exe_ext
-        ));
-        if tool.is_file() {
-            return Ok(Some(tool));
-        }
-    }
-    if on_path("ilasm") {
-        // Reject Mono's ilasm (PE32 output the CoreCLR loader rejects).
-        if let Ok(out) = Command::new("ilasm").arg("--version").output() {
-            let text = String::from_utf8_lossy(&out.stdout).to_lowercase()
-                + &String::from_utf8_lossy(&out.stderr).to_lowercase();
-            if text.contains("mono") {
-                bail!(
-                    "the `ilasm` on PATH is Mono's, which emits PE32 images the native CoreCLR \
-                     loader rejects. Run `cargo dotnet setup` (installs the CoreCLR ILAsm to \
-                     $HOME/.dotnet/{}/ilasm), or set ILASM_PATH to a CoreCLR ilasm.",
-                    dotnet.ilasm_tool_dir()
-                );
-            }
-        }
-        // A non-Mono `ilasm` on PATH — cilly's bare `ilasm` default is fine.
-        return Ok(None);
-    }
-    bail!(
-        "ilasm not found (no ILASM_PATH, no bundled SDK tool, none at \
-         $HOME/.dotnet/{}/ilasm{}, none on PATH). \
-         Run `cargo dotnet setup` to install the matching CoreCLR ILAsm NuGet tool.",
-        dotnet.ilasm_tool_dir(),
-        facts.exe_ext
     )
 }
 

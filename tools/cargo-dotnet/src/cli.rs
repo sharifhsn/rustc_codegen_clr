@@ -537,7 +537,6 @@ pub struct SetupArgs {
     #[arg(long)]
     pub skip_dotnet: bool,
     #[arg(long)]
-    pub skip_ilasm: bool,
     #[arg(long)]
     pub force: bool,
 }
@@ -576,7 +575,7 @@ pub struct PackArgs {
     #[arg(long, value_name = "SHA256", requires = "sign_certificate")]
     pub signer_fingerprint: Option<String>,
     /// Target .NET runtime version for the package. The 0.0.1 SDK supports `10`.
-    /// `DOTNET_VERSION` + ilasm and the NuGet TFM (`lib/<tfm>/`), which must agree with the dll.
+    /// `DOTNET_VERSION` and the NuGet TFM (`lib/<tfm>/`), which must agree with the dll.
     #[arg(long, value_name = "10", default_value = "10", env = "DOTNET_VERSION")]
     pub dotnet: String,
     /// HTTPS Source Link template embedded in the package's Portable PDB.

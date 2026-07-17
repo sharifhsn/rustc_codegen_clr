@@ -22,12 +22,6 @@ package="$package_id.$package_version.nupkg"
 rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
 dotnet_version="${DOTNET_VERSION:-10}"
 tfm="net${dotnet_version}.0"
-case "$dotnet_version" in
-    8) ilasm_tool='ilasm-tool' ;;
-    9|10) ilasm_tool="ilasm${dotnet_version}-tool" ;;
-    *) echo "reproducibility acceptance: unsupported DOTNET_VERSION=$dotnet_version" >&2; exit 2 ;;
-esac
-ilasm_path="${ILASM_PATH:-$HOME/.dotnet/$ilasm_tool/ilasm}"
 
 hash_file() {
     if command -v sha256sum >/dev/null 2>&1; then
@@ -45,7 +39,6 @@ fail() {
 for tool in cargo git jq unzip; do
     command -v "$tool" >/dev/null || fail "required tool is missing: $tool"
 done
-[[ -x "$ilasm_path" ]] || fail "CoreCLR ilasm is missing: $ilasm_path"
 
 # Release evidence must describe exactly HEAD. In particular, `git worktree add HEAD` must never
 # silently omit a caller's modified or untracked source inputs.
@@ -99,7 +92,6 @@ build_side() {
         CARGO_DOTNET_CACHE_HOME="$root/cache" \
         NUGET_PACKAGES="$root/nuget" \
         TMPDIR="$root/tmp" \
-        ILASM_PATH="$ilasm_path" \
         CARGO_INCREMENTAL=0 \
         SOURCE_DATE_EPOCH="$source_date_epoch" \
         RUSTFLAGS="$remap_flags" \
@@ -112,7 +104,6 @@ build_side() {
         CARGO_DOTNET_CACHE_HOME="$root/cache" \
         NUGET_PACKAGES="$root/nuget" \
         TMPDIR="$root/tmp" \
-        ILASM_PATH="$ilasm_path" \
         CARGO_INCREMENTAL=0 \
         SOURCE_DATE_EPOCH="$source_date_epoch" \
         RUSTFLAGS="$remap_flags" \
@@ -125,7 +116,6 @@ build_side() {
         CARGO_DOTNET_CACHE_HOME="$root/cache" \
         NUGET_PACKAGES="$root/nuget" \
         TMPDIR="$root/tmp" \
-        ILASM_PATH="$ilasm_path" \
         CARGO_INCREMENTAL=0 \
         CARGO_BUILD_JOBS=1 \
         CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \

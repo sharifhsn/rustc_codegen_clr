@@ -25,7 +25,6 @@ if [[ ! -f "$sdk_home/msbuild/RustDotnet.targets" ]]; then
         --home "$sdk_home" \
         --skip-toolchain \
         --skip-dotnet \
-        --skip-ilasm \
         --force
 fi
 

@@ -55,7 +55,7 @@ done
 # provisioner. Keep the log: the explicit delegated message is the regression assertion.
 CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
   "$driver" setup --from-repo "$repo" --home "$install_home" \
-  --skip-toolchain --skip-dotnet --skip-ilasm --force > "$log_dir/setup.log" 2>&1
+  --skip-toolchain --skip-dotnet --force > "$log_dir/setup.log" 2>&1
 grep -F 'front-end install delegated to the native setup caller' "$log_dir/setup.log"
 grep -F 'PAL warm delegated to the native private-sysroot setup caller' "$log_dir/setup.log"
 grep -F "installed the already-built cargo-dotnet -> $cargo_home/bin/cargo-dotnet" \

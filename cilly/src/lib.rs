@@ -169,7 +169,7 @@ config!(
     bool,
     false,
     "When true, prefer debuggable managed stack frames over RyuJIT throughput by suppressing \
-     il_exporter's aggressiveinlining method hint. Default false preserves existing codegen/perf."
+     managed exporter's aggressiveinlining method hint. Default false preserves existing codegen/perf."
 );
 
 #[derive(Copy, Clone)]

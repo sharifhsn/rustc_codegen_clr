@@ -20,12 +20,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NUGET_XMLDOC_MODE=skip \
     CARGO_TERM_COLOR=always
 
-# System toolchain: C compilers (for C_MODE), git/curl, and `ilasm` via mono
-# (the project supports both the Mono and CoreCLR ILASM flavours; mono is easiest).
+# System toolchain: C compilers, git, and curl.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git pkg-config \
         build-essential clang gcc \
-        mono-devel \
     && rm -rf /var/lib/apt/lists/*
 
 # .NET 10 SDK (the default target) plus the supported downlevel runtimes.
@@ -46,31 +44,6 @@ RUN curl --proto '=https' --tlsv1.2 -fsSf https://sh.rustup.rs \
         -c rustc-dev -c rust-src -c llvm-tools-preview -c rustfmt -c clippy \
     && rustup default "${NIGHTLY}" \
     && rustc -V && cargo -V
-
-# Matching CoreCLR ilasm binaries for .NET 9 and 10. Direct PE is the default, but the fallback
-# exporter must never assemble with a different runtime generation.
-# Placed AFTER the rust layer so it doesn't bust that (expensive) cache.
-RUN apt-get update && apt-get install -y --no-install-recommends unzip \
-    && rm -rf /var/lib/apt/lists/* \
-    && rid=linux-x64; case "$(dpkg --print-architecture)" in arm64) rid=linux-arm64;; esac \
-    && curl -fsSL -o /tmp/ilasm9.nupkg "https://www.nuget.org/api/v2/package/runtime.$rid.microsoft.netcore.ilasm/9.0.0" \
-    && mkdir -p /tmp/ilasm9 /root/.dotnet/ilasm9-tool \
-    && (cd /tmp/ilasm9 && unzip -qo /tmp/ilasm9.nupkg) \
-    && cp "/tmp/ilasm9/runtimes/$rid/native/ilasm" /root/.dotnet/ilasm9-tool/ilasm \
-    && chmod +x /root/.dotnet/ilasm9-tool/ilasm \
-    && rm -rf /tmp/ilasm9 /tmp/ilasm9.nupkg \
-    && test -x /root/.dotnet/ilasm9-tool/ilasm \
-    && curl -fsSL -o /tmp/ilasm10.nupkg "https://www.nuget.org/api/v2/package/runtime.$rid.microsoft.netcore.ilasm/10.0.0" \
-    && mkdir -p /tmp/ilasm10 /root/.dotnet/ilasm10-tool \
-    && (cd /tmp/ilasm10 && unzip -qo /tmp/ilasm10.nupkg) \
-    && cp "/tmp/ilasm10/runtimes/$rid/native/ilasm" /root/.dotnet/ilasm10-tool/ilasm \
-    && chmod +x /root/.dotnet/ilasm10-tool/ilasm \
-    && rm -rf /tmp/ilasm10 /tmp/ilasm10.nupkg \
-    && test -x /root/.dotnet/ilasm10-tool/ilasm
-
-# Sanity-check ilasm is on PATH (mono provides it). Non-fatal: version output is noisy.
-RUN (ilasm --version 2>/dev/null || mono --version 2>/dev/null | head -1) | head -1 \
-    || echo "WARNING: ilasm not found on PATH"
 
 # Force the pinned nightly. The repo's rust-toolchain.toml pins bare "nightly", which would
 # otherwise make rustup download a fresh (newer) nightly inside the container, defeating

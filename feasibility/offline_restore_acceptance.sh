@@ -9,7 +9,6 @@ work="${RCL_OFFLINE_RESTORE_WORK_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/rustdotnet-of
 keep="${RCL_OFFLINE_RESTORE_KEEP_WORK:-0}"
 ambient_home="$HOME"
 rustup_home="${RUSTUP_HOME:-$ambient_home/.rustup}"
-ilasm="${ILASM_PATH:-$ambient_home/.dotnet/ilasm${dotnet_version}-tool/ilasm}"
 
 if [[ "$keep" != 1 ]]; then trap 'rm -rf "$work"' EXIT; fi
 [[ -n "$work" && "$work" != "/" ]]
@@ -18,7 +17,6 @@ mkdir -p "$work/home/.cargo" "$work/cache" "$work/sdk" "$work/logs"
 
 [[ -x "$driver" ]] || { echo "cargo-dotnet release driver missing: $driver" >&2; exit 2; }
 [[ -d "$rustup_home" ]] || { echo "rustup home missing: $rustup_home" >&2; exit 2; }
-[[ -x "$ilasm" ]] || { echo "CoreCLR ilasm missing: $ilasm" >&2; exit 2; }
 
 common_env=(
     HOME="$work/home"
@@ -27,7 +25,6 @@ common_env=(
     CARGO_DOTNET_HOME="$work/sdk"
     CARGO_DOTNET_CACHE_HOME="$work/cache"
     CARGO_DOTNET_BACKEND=native
-    ILASM_PATH="$ilasm"
     DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
     DOTNET_CLI_TELEMETRY_OPTOUT=1
     NUGET_XMLDOC_MODE=skip

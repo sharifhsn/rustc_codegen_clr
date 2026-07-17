@@ -101,7 +101,7 @@ run_native_diff() {
     native_profile="$(native_profile_args "$profile")"
 
     env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u CARGO_BUILD_TARGET \
-        -u C_MODE -u ILASM_PATH -u DOTNET_VERSION \
+        -u C_MODE -u DOTNET_VERSION \
         CARGO_TARGET_DIR="$native_target_root/$case_name/$profile" \
         cargo +nightly-2026-06-17 run --manifest-path "$case_dir/Cargo.toml" \
         $native_profile --quiet > "$prefix.native.stdout" 2> "$prefix.native.stderr"

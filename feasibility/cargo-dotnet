@@ -6,7 +6,7 @@
 # ~/.cargo/bin) and use it as:
 #
 #   cargo dotnet setup [--from-repo PATH] [--home DIR] [--skip-toolchain]
-#                      [--skip-dotnet] [--skip-ilasm] [--force]
+#                      [--skip-dotnet] [--force]
 #   cargo dotnet build [PATH] [--release|--debug] [--clean] [-v]
 #   cargo dotnet run   [PATH] [--release|--debug] [--clean] [-v] [-- ARGS...]
 #   cargo dotnet pack  [PATH] [--release|--debug] [--id NAME] [--version VER]
@@ -131,25 +131,6 @@ ensure_dotnet_on_path(){
   fi
 }
 
-# resolve_ilasm: EXPORT ILASM_PATH to a CoreCLR (NOT Mono) ilasm. Order: explicit
-# ILASM_PATH; the .NET 10 tool installed by setup; a non-Mono `ilasm` on PATH. Needs
-# detect_host_os run first (uses exe_ext). Dies with an actionable message.
-resolve_ilasm(){
-  local _il_tool="ilasm10-tool"
-  if [ -n "${ILASM_PATH:-}" ]; then
-    [ -x "$ILASM_PATH" ] || die "ILASM_PATH='$ILASM_PATH' is not an executable"
-  elif [ -x "$HOME/.dotnet/$_il_tool/ilasm$exe_ext" ]; then
-    export ILASM_PATH="$HOME/.dotnet/$_il_tool/ilasm$exe_ext"
-  elif command -v ilasm >/dev/null 2>&1; then
-    if ilasm --version 2>&1 | grep -qi mono; then
-      die "the \`ilasm\` on PATH is Mono's. Run \`cargo dotnet setup\` to install the .NET 10 CoreCLR ILAsm, or use the default direct-PE exporter."
-    fi
-    : # a non-Mono `ilasm` on PATH — cilly's bare `ilasm` default is fine
-  else
-    die "ilasm not found. Run \`cargo dotnet setup\` to install the .NET 10 CoreCLR ILAsm, or use the default direct-PE exporter."
-  fi
-}
-
 # read_home_toolchain: echo the pinned toolchain recorded in CARGO_DOTNET_HOME/VERSION
 # (key `toolchain = …`), or the literal default if no manifest. An external crate has
 # no rustup dir-override, so the installed build arm EXPORTs this as RUSTUP_TOOLCHAIN.
@@ -170,7 +151,7 @@ read_home_toolchain(){
 # ============================================================================
 cd_setup(){
   local FROM_REPO="" HOME_DIR="$CARGO_DOTNET_HOME" FORCE=0
-  local SKIP_TOOLCHAIN=0 SKIP_DOTNET=0 SKIP_ILASM=0
+  local SKIP_TOOLCHAIN=0 SKIP_DOTNET=0
   local SKIP_FRONTEND_INSTALL="${CARGO_DOTNET_SKIP_FRONTEND_INSTALL:-0}"
   local SKIP_LEGACY_PAL_WARM="${CARGO_DOTNET_SKIP_LEGACY_PAL_WARM:-0}"
   local TOOLCHAIN="$CD_TOOLCHAIN_DEFAULT"
@@ -181,7 +162,6 @@ cd_setup(){
       --toolchain) TOOLCHAIN="${2:-}"; shift ;;
       --skip-toolchain) SKIP_TOOLCHAIN=1 ;;
       --skip-dotnet)    SKIP_DOTNET=1 ;;
-      --skip-ilasm)     SKIP_ILASM=1 ;;
       --force)     FORCE=1 ;;
       -h|--help)   usage; return 0 ;;
       *) die "setup: unknown flag '$1'" ;;
@@ -203,7 +183,7 @@ cd_setup(){
   [ -f "$FROM_REPO/x86_64-unknown-dotnet.json" ] || die "setup: target spec missing in repo: $FROM_REPO/x86_64-unknown-dotnet.json"
 
   detect_host_os
-  local prov_tc="skipped" prov_dotnet="skipped" prov_ilasm="skipped"
+  local prov_tc="skipped" prov_dotnet="skipped"
 
   echo "== cargo dotnet setup =="
   echo "   from-repo : $FROM_REPO"
@@ -231,7 +211,7 @@ cd_setup(){
     [ "$prov_tc" = installed ] || prov_tc="present"
   fi
 
-  # ---- STEP 2: .NET 10 SDK + CoreCLR ilasm -----------------------------------
+  # ---- STEP 2: .NET 10 SDK ---------------------------------------------------
   if [ "$SKIP_DOTNET" = 1 ]; then
     echo "==> [2/6] .NET SDK: skipped (--skip-dotnet)"
   else
@@ -245,31 +225,6 @@ cd_setup(){
       prov_dotnet="installed"
     fi
     [ "$prov_dotnet" = installed ] || prov_dotnet="present"
-  fi
-
-  if [ "$SKIP_ILASM" = 1 ]; then
-    echo "==> [3a] ilasm: skipped (--skip-ilasm)"
-  elif [ -x "$HOME/.dotnet/ilasm10-tool/ilasm$exe_ext" ]; then
-    echo "==> [3a] .NET 10 CoreCLR ILAsm present (\$HOME/.dotnet/ilasm10-tool/ilasm$exe_ext)"
-    prov_ilasm="present"
-  else
-    echo "==> [3a] installing .NET 10 CoreCLR ILAsm ($host_rid)"
-    local nupkg10="/tmp/cd_ilasm10.$$.nupkg" exdir10="/tmp/cd_ilasm10.$$.d"
-    rm -rf "$exdir10"; mkdir -p "$exdir10"
-    curl -sSL -o "$nupkg10" "https://www.nuget.org/api/v2/package/runtime.$host_rid.microsoft.netcore.ilasm/10.0.0" \
-      || die "setup: failed to download .NET 10 CoreCLR ILAsm for $host_rid"
-    ( cd "$exdir10" && unzip -qo "$nupkg10" ) \
-      || die "setup: failed to unzip .NET 10 CoreCLR ILAsm (need unzip)"
-    local src_ilasm10="$exdir10/runtimes/$host_rid/native/ilasm$exe_ext"
-    [ -f "$src_ilasm10" ] \
-      || die "setup: ILAsm binary not found at runtimes/$host_rid/native/ilasm$exe_ext"
-    mkdir -p "$HOME/.dotnet/ilasm10-tool"
-    cp "$src_ilasm10" "$HOME/.dotnet/ilasm10-tool/ilasm$exe_ext"
-    chmod +x "$HOME/.dotnet/ilasm10-tool/ilasm$exe_ext"
-    [ "$(uname -s)" = Darwin ] \
-      && xattr -c "$HOME/.dotnet/ilasm10-tool/ilasm$exe_ext" 2>/dev/null || true
-    rm -f "$nupkg10"; rm -rf "$exdir10"
-    prov_ilasm="installed"
   fi
 
   # ---- STEP 3: build backend + populate CARGO_DOTNET_HOME ---------------------
@@ -365,7 +320,6 @@ cd_setup(){
     echo "==> [6/6] PAL warm delegated to the native private-sysroot setup caller"
   else
     echo "==> [6/6] warming the rust-src PAL injection from $HOME_DIR (CD_INJECT_ONLY)"
-    resolve_ilasm 2>/dev/null || true   # not needed for inject-only, but harmless
     local scratch="/tmp/cd_inject_warm.$$"
     rm -rf "$scratch"; mkdir -p "$scratch"
     printf '[package]\nname = "cd_inject_warm"\nversion = "0.0.0"\nedition = "2024"\n[workspace]\n' > "$scratch/Cargo.toml"
@@ -391,7 +345,7 @@ cd_setup(){
   echo " install home : $HOME_DIR"
   echo " front-end    : $cargobin/cargo-dotnet"
   echo " toolchain    : $TOOLCHAIN  ($prov_tc)"
-  echo " .NET SDK     : $prov_dotnet     ilasm: $prov_ilasm"
+  echo " .NET SDK     : $prov_dotnet"
   echo " git rev      : $(git -C "$FROM_REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   echo ""
   echo " Add these to your shell rc IF they are not already there:"
@@ -636,8 +590,7 @@ case "$BACKEND" in
     # The docker backend is a DEV/in-repo path (it mounts the repo at /work). It is
     # not available to the installed front-end, which has no repo.
     [ "$INSTALLED" = 0 ] || die "the docker backend needs a repo checkout (mounts it at /work); the installed tool runs native. Use the in-repo feasibility/cargo-dotnet for the docker path, or unset CARGO_DOTNET_BACKEND to use native."
-    # Preflight (helpful errors). The native driver moves the dotnet/ilasm tool
-    # checks to the host; here the rcc-dev image always ships dotnet + ilasm
+    # Preflight (helpful errors). The native driver performs the dotnet checks.
     # (mono-devel), so the image-exists check covers "tools present".
     command -v docker >/dev/null 2>&1 || die "docker not found on PATH (the docker backend needs it; or set CARGO_DOTNET_BACKEND=native once that driver lands)"
     docker image inspect "$IMAGE" >/dev/null 2>&1 || die "docker image '$IMAGE' missing — build it first: feasibility/run.sh build"
@@ -662,10 +615,8 @@ case "$BACKEND" in
     #
     # Detect in-repo by repo-root prefix: REL is the repo-relative subpath if the
     # crate is strictly under the repo (and not the repo root itself).
-    # Target-version env for the container plus the matching CoreCLR ilasm path.
+    # Target-version env for the container.
     DK_ENV=(-e DOTNET_VERSION="$CD_DOTNET")
-    [ "$CD_DOTNET" = 9 ] && DK_ENV+=(-e ILASM_PATH=/root/.dotnet/ilasm9-tool/ilasm)
-    [ "$CD_DOTNET" = 10 ] && DK_ENV+=(-e ILASM_PATH=/root/.dotnet/ilasm10-tool/ilasm)
     REL="${CRATE_ABS#"$REPO_ROOT"/}"
     if [ "$REL" != "$CRATE_ABS" ] && [ "$CRATE_ABS" != "$REPO_ROOT" ]; then
       # IN-REPO: build within the /work mount so sibling path-deps resolve.
@@ -712,9 +663,6 @@ case "$BACKEND" in
     # is not already on PATH, THEN require it.
     ensure_dotnet_on_path
     command -v dotnet >/dev/null 2>&1 || die "dotnet not found on PATH or at \$HOME/.dotnet/dotnet (run \`cargo dotnet setup\`, or add \$HOME/.dotnet to PATH)"
-    # ilasm: CoreCLR (NOT Mono), exported as ILASM_PATH for the cilly linker.
-    resolve_ilasm
-
     if [ "$INSTALLED" = 1 ]; then
       # ---- INSTALLED: everything comes from CARGO_DOTNET_HOME (no repo) ----------
       BACKEND_DYLIB="$CARGO_DOTNET_HOME/bin/librustc_codegen_clr.$dylib_ext"

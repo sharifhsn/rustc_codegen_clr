@@ -2,39 +2,20 @@ use ar::Archive;
 
 use cilly::{
     ArtifactAbiConfig, ArtifactAbiConfigMismatch, ArtifactDecodeError, Assembly, AssemblyArtifact,
-    IString, decode_assembly_artifact,
+    decode_assembly_artifact,
 };
 use std::io::Read;
-pub struct LinkableFile {
-    name: IString,
-    file: Box<[u8]>,
-}
-
-impl LinkableFile {
-    pub fn new(name: IString, file: Box<[u8]>) -> Self {
-        Self { name, file }
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn file(&self) -> &[u8] {
-        &self.file
-    }
-}
 
 /// Assemblies and their validated immutable artifact ABI loaded for one link.
 pub struct LoadedAssemblies {
     assembly: Assembly,
     abi_config: Option<ArtifactAbiConfig>,
-    linkables: Vec<LinkableFile>,
 }
 
 impl LoadedAssemblies {
     /// Consumes all loaded state for the linker pipeline.
-    pub fn into_parts(self) -> (Assembly, Option<ArtifactAbiConfig>, Vec<LinkableFile>) {
-        (self.assembly, self.abi_config, self.linkables)
+    pub fn into_parts(self) -> (Assembly, Option<ArtifactAbiConfig>) {
+        (self.assembly, self.abi_config)
     }
 }
 
@@ -74,11 +55,10 @@ impl AssemblyAccumulator {
         Ok(())
     }
 
-    fn finish(self, linkables: Vec<LinkableFile>) -> LoadedAssemblies {
+    fn finish(self) -> LoadedAssemblies {
         LoadedAssemblies {
             assembly: self.assembly,
             abi_config: self.abi_config,
-            linkables,
         }
     }
 }
@@ -111,12 +91,8 @@ impl std::fmt::Display for ArtifactLoadError {
 
 impl std::error::Error for ArtifactLoadError {}
 
-fn load_ar(
-    r: &mut impl std::io::Read,
-    merged: &mut AssemblyAccumulator,
-) -> std::io::Result<Vec<LinkableFile>> {
+fn load_ar(r: &mut impl std::io::Read, merged: &mut AssemblyAccumulator) -> std::io::Result<()> {
     let mut archive = Archive::new(r);
-    let mut linkables = Vec::new();
     // Iterate over all entries in the archive:
     while let Some(entry_result) = archive.next_entry() {
         let mut entry = entry_result?;
@@ -134,24 +110,17 @@ fn load_ar(
             merged.merge_encoded(&asm_bytes, &name).map_err(|error| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
             })?;
-        } else if ext.contains("o") {
-            let mut file_bytes = Vec::with_capacity(0x100);
-            entry
-                .read_to_end(&mut file_bytes)
-                .expect("ERROR: Could not load the assembly file!");
-            linkables.push(LinkableFile::new(name.clone().into(), file_bytes.into()));
         } else if name.contains(".so") {
             eprintln!("shr:{name}");
         }
     }
-    Ok(linkables)
+    Ok(())
 }
 
 /// Loads, validates, and merges all assembly artifacts while retaining their ABI contract.
 pub fn load_assemblies_with_config(raw_files: &[&String], archives: &[String]) -> LoadedAssemblies {
     println!("==> Preparing to load assmeblies");
     let mut merged = AssemblyAccumulator::default();
-    let mut linkables = Vec::new();
     for asm_path in raw_files {
         let mut asm_file =
             std::fs::File::open(asm_path).expect("ERROR:Could not open the assembly file!");
@@ -166,13 +135,11 @@ pub fn load_assemblies_with_config(raw_files: &[&String], archives: &[String]) -
     for asm_path in archives {
         let mut asm_file =
             std::fs::File::open(asm_path).expect("ERROR: Could not open the assembly file!");
-        linkables.extend(
-            load_ar(&mut asm_file, &mut merged)
-                .unwrap_or_else(|error| panic!("Could not load archive {asm_path:?}: {error}")),
-        );
+        load_ar(&mut asm_file, &mut merged)
+            .unwrap_or_else(|error| panic!("Could not load archive {asm_path:?}: {error}"));
     }
     println!("==> Loaded assmeblies");
-    merged.finish(linkables)
+    merged.finish()
 }
 
 #[cfg(test)]

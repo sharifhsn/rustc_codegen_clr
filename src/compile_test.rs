@@ -60,8 +60,11 @@ pub fn test_dotnet_executable(file_path: &str, test_dir: &str) -> String {
         let mut file = std::fs::File::create(&config_path).unwrap_or_else(|err| {
             panic!("Could not create runtime config file at {config_path:?} due to {err:?}")
         });
-        let runtime_config = cilly::il_exporter::get_runtime_config(
-            crate::config::current().artifact_abi().dotnet_runtime(),
+        let runtime = crate::config::current().artifact_abi().dotnet_runtime();
+        let runtime_config = format!(
+            "{{\n  \"runtimeOptions\": {{\n    \"tfm\": \"{}\",\n    \"framework\": {{\n      \"name\": \"Microsoft.NETCore.App\",\n      \"version\": \"{}\"\n    }},\n    \"rollForward\": \"LatestMajor\"\n  }}\n}}\n",
+            runtime.tfm(),
+            runtime.framework_version(),
         );
         file.write_all(runtime_config.as_bytes())
             .expect("Could not write runtime config");

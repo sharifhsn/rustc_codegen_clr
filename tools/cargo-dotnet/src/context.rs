@@ -189,8 +189,6 @@ pub struct Context {
     pub toolchain: Option<String>,
     /// The inner cargo binary (`$CARGO` or `cargo`).
     pub cargo: String,
-    /// A resolved CoreCLR ilasm to export as ILASM_PATH (None lets cilly's default fire).
-    pub ilasm: Option<PathBuf>,
     /// The target .NET runtime version (`--dotnet`). Exported as `DOTNET_VERSION` to the inner cargo.
     pub dotnet: DotnetVersion,
     /// `(PATH addition, DOTNET_ROOT)` if dotnet was self-healed from `$HOME/.dotnet`.
@@ -231,7 +229,7 @@ impl Context {
         let host = HostFacts::detect();
         let crate_dir = host::resolve_crate_dir(&args.path)?;
 
-        // host preflight (rustc/cargo present; dotnet reachable; ilasm resolved).
+        // host preflight (rustc/cargo present; dotnet reachable).
         host::ensure_rust_toolchain()?;
         let dotnet: DotnetVersion = args.dotnet.parse().map_err(anyhow::Error::msg)?;
         let dotnet_heal = match dotnet {
@@ -241,13 +239,6 @@ impl Context {
             DotnetVersion::UnityNetStandard21 => None,
         };
         host::ensure_dotnet(&dotnet_heal)?;
-        let ilasm = match dotnet {
-            DotnetVersion::Net10 => host::resolve_ilasm(&host, dotnet)?,
-            // Unity support is direct-PE only. Requiring or invoking a CoreCLR ILAsm here would
-            // stamp the wrong framework contract into the plug-in.
-            DotnetVersion::UnityNetStandard21 => None,
-        };
-
         let paths = Paths::resolve(&mode, &host, &crate_dir)?;
         let managed_project = resolve_managed_project(&crate_dir)?;
         let source_link_url = validate_source_link_url(args.source_link_url.as_deref())?;
@@ -305,7 +296,6 @@ impl Context {
             paths,
             toolchain,
             cargo,
-            ilasm,
             dotnet,
             dotnet_heal,
             managed_project,

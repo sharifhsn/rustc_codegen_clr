@@ -4,7 +4,7 @@
 //!
 //!  1. **Environment check** — verify the pieces a native `cargo dotnet` build/run needs
 //!     are present: the pinned nightly components, .NET SDK, backend, linker, target spec,
-//!     and MSBuild integration. CoreCLR ILAsm is an optional fallback for `DIRECT_PE=0`.
+//!     and MSBuild integration.
 //!
 //!  2. **Workspace wiring and native imports** — validate Rust/MSBuild configuration, then
 //!     compare declared `#[link]`/`#[link_name]` imports with staged host-RID binaries.
@@ -86,7 +86,7 @@ pub fn run(args: &DoctorArgs) -> Result<i32> {
             println!("cargo dotnet doctor: no known interop failure signature matched.");
             println!(
                 "  (recognised: TypeLoadException, MissingMethod/EntryPointNotFound, \
-                      DllNotFound, BadImageFormat, and the Mono-ilasm PE mismatch)"
+                      DllNotFound, and BadImageFormat)"
             );
             return Ok(0);
         }
@@ -492,21 +492,6 @@ fn environment_checks(dotnet_version: &str) -> Vec<Check> {
             if dotnet_reachable {
                 checks.push(check_dotnet_runtime(dotnet, heal.as_ref()));
             }
-            // `ilasm` is only needed for DIRECT_PE=0, so its absence is a warning rather than a
-            // blocker for the default direct-PE pipeline.
-            checks.push(match host::resolve_ilasm(&facts, dotnet) {
-                Ok(Some(p)) => {
-                    Check::pass("CoreCLR ilasm fallback", format!("using {}", p.display()))
-                }
-                Ok(None) => Check::pass(
-                    "CoreCLR ilasm fallback",
-                    "a non-Mono ilasm is on PATH".to_string(),
-                ),
-                Err(e) => Check::warn(
-                    "CoreCLR ilasm fallback",
-                    format!("optional unless DIRECT_PE=0: {e}"),
-                ),
-            });
         }
         Err(e) => checks.push(Check::fail("selected .NET runtime", e)),
     }
@@ -1313,8 +1298,6 @@ pub fn diagnose_failure(text: &str) -> Vec<Hint> {
                     .to_string(),
                 "For native code, run `cargo dotnet doctor --workspace <crate>` to compare the binary architecture with the host RID."
                     .to_string(),
-                "For the optional DIRECT_PE=0 path, use the matching CoreCLR ILAsm; Mono ILAsm output is not a supported substitute."
-                    .to_string(),
             ],
         });
     }
@@ -1422,11 +1405,16 @@ mod tests {
     }
 
     #[test]
-    fn badimage_maps_to_mono_ilasm() {
+    fn badimage_maps_to_architecture_diagnostic() {
         let hints = diagnose_failure("System.BadImageFormatException: Bad IL format.");
         assert_eq!(hints.len(), 1);
         assert!(hints[0].title.contains("architecture mismatch"));
-        assert!(hints[0].body.iter().any(|line| line.contains("Mono ILAsm")));
+        assert!(
+            hints[0]
+                .body
+                .iter()
+                .any(|line| line.contains("managed assembly"))
+        );
     }
 
     #[test]

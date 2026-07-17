@@ -7,7 +7,7 @@
 //! `dotnet_overlays` apply ([`overlays`]), `build-std` ([`buildstd`]), artifact
 //! location ([`artifact`]), run ([`run`]), NuGet packing ([`pack`]) and consuming a
 //! third-party NuGet package via reflection-generated bindings ([`nuget`]). It shells out
-//! only to the external tools any build tool must (cargo/rustc/ilasm/dotnet/the linker)
+//! only to the external tools any build tool must (cargo/rustc/dotnet/the linker)
 //! — never to a bash pipeline core. The DOCKER backend (dev-only) still delegates to the
 //! in-repo bash front-end, which owns the container mount model.
 

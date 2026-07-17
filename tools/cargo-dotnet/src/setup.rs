@@ -1,7 +1,7 @@
 //! `setup` — provision the toolchain + install home, then warm the PAL natively.
 //!
 //! The HEAVY provisioning (rustup nightly + components, .NET 10 SDK via dotnet-install.sh,
-//! the CoreCLR ilasm NuGet, building the backend, populating CARGO_DOTNET_HOME) shells
+//! building the backend, populating CARGO_DOTNET_HOME) shells
 //! out to the dev-only bash front-end (`feasibility/cargo-dotnet` `cd_setup`, :170-382).
 //! That is idiomatic — rustup/curl/cargo are external tools, NOT "the bash CORE" — and
 //! is a dev-only `--from-repo` step that does not touch the build/run/pack proof.
@@ -57,9 +57,6 @@ pub fn run(args: &SetupArgs) -> Result<i32> {
     }
     if args.skip_dotnet {
         cmd.arg("--skip-dotnet");
-    }
-    if args.skip_ilasm {
-        cmd.arg("--skip-ilasm");
     }
     if args.force {
         cmd.arg("--force");

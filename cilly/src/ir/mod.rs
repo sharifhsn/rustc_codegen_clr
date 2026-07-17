@@ -8,8 +8,8 @@ use std::path::Path;
 
 pub use crate::Access;
 pub use asm::{
-    Assembly, AssemblyArenaCounts, CompactionStats, ExportReadyAssembly, IlasmFlavour,
-    NativeImport, VerificationFailure,
+    Assembly, AssemblyArenaCounts, CompactionStats, ExportReadyAssembly, NativeImport,
+    VerificationFailure,
 };
 pub use basic_block::BasicBlock;
 pub use bimap::BiMap;
@@ -58,8 +58,6 @@ pub mod field;
 pub mod fnsig;
 /// Defines hashable and equable floating point types. All NaNs are compared by bits, and -0.0 != 0.0.
 pub mod hashable;
-/// Exports IR to .NET bytecode
-pub mod il_exporter;
 /// IR iterator
 pub mod iter;
 /// Exports IR to JVM bytecode
