@@ -5,6 +5,23 @@ use serde::Serialize;
 
 use crate::cli::ProfilesArgs;
 
+pub(crate) const CORECLR: &str = "net10-coreclr";
+pub(crate) const EXCEL_DNA: &str = "excel-dna-net10-windows";
+pub(crate) const MAUI_WINDOWS: &str = "maui-windows-net10";
+pub(crate) const WINUI3: &str = "winui3-net10-windows";
+pub(crate) const UNITY: &str = "unity-netstandard2.1";
+pub(crate) const MAUI_ANDROID: &str = "maui-android-net10";
+pub(crate) const MAUI_APPLE: &str = "maui-apple-net10";
+pub(crate) const VSTO: &str = "vsto-net10-in-process";
+
+pub(crate) fn is_windows(name: &str) -> bool {
+    matches!(name, EXCEL_DNA | MAUI_WINDOWS | WINUI3)
+}
+
+pub(crate) fn is_attachable(name: &str) -> bool {
+    !matches!(name, UNITY | MAUI_ANDROID | MAUI_APPLE | VSTO)
+}
+
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum Support {
@@ -38,7 +55,7 @@ struct CompatibilityProfile {
 
 const PROFILES: &[CompatibilityProfile] = &[
     CompatibilityProfile {
-        name: "net10-coreclr",
+        name: CORECLR,
         support: Support::Supported,
         host: ".NET 10 CoreCLR on Linux x64, macOS arm64, or Windows x64",
         managed_contract: "net10.0 / Microsoft.NETCore.App 10",
@@ -47,7 +64,7 @@ const PROFILES: &[CompatibilityProfile] = &[
         evidence: "release SDK onboarding and managed consumer acceptance",
     },
     CompatibilityProfile {
-        name: "excel-dna-net10-windows",
+        name: EXCEL_DNA,
         support: Support::Preview,
         host: "64-bit desktop Excel on Windows x64 through Excel-DNA 1.9",
         managed_contract: "net10.0-windows / CoreCLR 10",
@@ -56,7 +73,7 @@ const PROFILES: &[CompatibilityProfile] = &[
         evidence: "packed XLL build passes; real Excel launch proof remains",
     },
     CompatibilityProfile {
-        name: "maui-windows-net10",
+        name: MAUI_WINDOWS,
         support: Support::Planned,
         host: ".NET MAUI Windows on CoreCLR 10",
         managed_contract: "net10.0-windows10.0.19041.0",
@@ -65,7 +82,7 @@ const PROFILES: &[CompatibilityProfile] = &[
         evidence: "scaffold contract passes; Windows build and runtime fixture remain",
     },
     CompatibilityProfile {
-        name: "winui3-net10-windows",
+        name: WINUI3,
         support: Support::Planned,
         host: "unpackaged WinUI 3 desktop app on Windows 10 1809 or newer",
         managed_contract: "net10.0-windows10.0.19041.0 / CoreCLR 10",
@@ -74,7 +91,7 @@ const PROFILES: &[CompatibilityProfile] = &[
         evidence: "scaffold contract exists; Windows build and runtime fixture remain",
     },
     CompatibilityProfile {
-        name: "unity-netstandard2.1",
+        name: UNITY,
         support: Support::Supported,
         host: "Unity 6000.3.19f1 on macOS Apple Silicon: Editor plus Mono and IL2CPP players",
         managed_contract: "netstandard2.1-compatible API surface; not net10.0",
@@ -83,7 +100,7 @@ const PROFILES: &[CompatibilityProfile] = &[
         evidence: "clean EditMode calls and launched Mono/IL2CPP players pass for managed Rust and native P/Invoke",
     },
     CompatibilityProfile {
-        name: "maui-android-net10",
+        name: MAUI_ANDROID,
         support: Support::Planned,
         host: ".NET MAUI Android (Mono first; CoreCLR separately experimental)",
         managed_contract: "Android-compatible managed IL with trimming constraints",
@@ -92,7 +109,7 @@ const PROFILES: &[CompatibilityProfile] = &[
         evidence: "APK/emulator runtime and packaging proof required",
     },
     CompatibilityProfile {
-        name: "maui-apple-net10",
+        name: MAUI_APPLE,
         support: Support::Planned,
         host: ".NET MAUI iOS and Mac Catalyst",
         managed_contract: "fully AOT- and trimming-compatible managed IL",
@@ -106,7 +123,7 @@ const PROFILES: &[CompatibilityProfile] = &[
         evidence: "simulator/device NativeAOT and packaging proof required",
     },
     CompatibilityProfile {
-        name: "vsto-net10-in-process",
+        name: VSTO,
         support: Support::Unsupported,
         host: "VSTO add-in process",
         managed_contract: "VSTO remains .NET Framework 4.8; modern .NET coexistence is unsupported",

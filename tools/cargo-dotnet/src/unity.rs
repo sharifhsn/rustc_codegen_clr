@@ -148,7 +148,7 @@ fn build(args: &UnityBuildArgs) -> Result<i32> {
         .arg("build")
         .arg(manifest.parent().unwrap_or(Path::new(".")))
         .arg("--dotnet")
-        .arg("unity-netstandard2.1")
+        .arg(crate::profiles::UNITY)
         .arg("--backend")
         .arg("native")
         .status()?;

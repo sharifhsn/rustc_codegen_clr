@@ -217,10 +217,7 @@ fn validate_project_shape(source: &str, profile: &str) -> Result<()> {
             "C# project declares RustDotnetCompatibilityProfile {existing:?}, but the Rust crate declares {profile:?}"
         );
     }
-    let windows_profile = matches!(
-        profile,
-        "excel-dna-net10-windows" | "maui-windows-net10" | "winui3-net10-windows"
-    );
+    let windows_profile = crate::profiles::is_windows(profile);
     if windows_profile
         && target_frameworks
             .iter()
@@ -230,7 +227,7 @@ fn validate_project_shape(source: &str, profile: &str) -> Result<()> {
             "compatibility profile {profile:?} requires a Windows TargetFramework, such as net10.0-windows10.0.19041.0"
         );
     }
-    if profile == "net10-coreclr"
+    if profile == crate::profiles::CORECLR
         && target_frameworks.iter().any(|framework| {
             ["-android", "-ios", "-maccatalyst"]
                 .iter()
@@ -241,19 +238,13 @@ fn validate_project_shape(source: &str, profile: &str) -> Result<()> {
             "mobile target framework(s) {target_framework:?} require a proven mobile compatibility profile; net10-coreclr is not a mobile claim"
         );
     }
-    if source.contains("<UseMaui>true</UseMaui>") && profile != "maui-windows-net10" {
+    if source.contains("<UseMaui>true</UseMaui>") && profile != crate::profiles::MAUI_WINDOWS {
         bail!("a MAUI project requires the maui-windows-net10 Rust compatibility profile");
     }
-    if source.contains("<UseWinUI>true</UseWinUI>") && profile != "winui3-net10-windows" {
+    if source.contains("<UseWinUI>true</UseWinUI>") && profile != crate::profiles::WINUI3 {
         bail!("a WinUI project requires the winui3-net10-windows Rust compatibility profile");
     }
-    if matches!(
-        profile,
-        "unity-netstandard2.1"
-            | "maui-android-net10"
-            | "maui-apple-net10"
-            | "vsto-net10-in-process"
-    ) {
+    if !crate::profiles::is_attachable(profile) {
         bail!(
             "compatibility profile {profile:?} is not attachable yet; `cargo dotnet profiles` explains the missing runtime evidence"
         );

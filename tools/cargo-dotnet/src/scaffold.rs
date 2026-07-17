@@ -395,7 +395,7 @@ fn product_rust_files(name: &str, compatibility_profile: &str) -> Vec<File> {
 
 fn webapi_files(name: &str, dotnet: &str) -> Vec<File> {
     let managed = managed_stem(name);
-    let mut files = product_rust_files(name, "net10-coreclr");
+    let mut files = product_rust_files(name, crate::profiles::CORECLR);
     files.extend([
         File {
             rel: "webapi/Program.cs",
@@ -424,7 +424,7 @@ fn webapi_files(name: &str, dotnet: &str) -> Vec<File> {
 
 fn worker_files(name: &str, dotnet: &str) -> Vec<File> {
     let managed = managed_stem(name);
-    let mut files = product_rust_files(name, "net10-coreclr");
+    let mut files = product_rust_files(name, crate::profiles::CORECLR);
     files.extend([
         File {
             rel: "worker/Program.cs",
@@ -457,7 +457,7 @@ fn worker_files(name: &str, dotnet: &str) -> Vec<File> {
 
 fn winui_files(name: &str, dotnet: &str) -> Vec<File> {
     let managed = managed_stem(name);
-    let mut files = product_rust_files(name, "winui3-net10-windows");
+    let mut files = product_rust_files(name, crate::profiles::WINUI3);
     files.extend([
         File {
             rel: "winui/App.xaml",
@@ -497,7 +497,7 @@ fn winui_files(name: &str, dotnet: &str) -> Vec<File> {
 
 fn maui_files(name: &str, dotnet: &str) -> Vec<File> {
     let managed = managed_stem(name);
-    let mut files = product_rust_files(name, "maui-windows-net10");
+    let mut files = product_rust_files(name, crate::profiles::MAUI_WINDOWS);
     files.extend([
         File {
             rel: "maui/MauiProgram.cs",
