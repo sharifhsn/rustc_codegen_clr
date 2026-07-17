@@ -29,8 +29,7 @@ cargo dotnet doctor
 `doctor` reports missing SDK components and common project-wiring errors. The backend is selected
 per build; it does not permanently replace rustc's native backend.
 
-The public SDK targets .NET 10 only. Its bundled CoreCLR ILAsm is used automatically when the
-legacy ILAsm fallback is needed.
+The public SDK targets .NET 10 only and emits managed PE files directly.
 
 ## Build from a checkout
 

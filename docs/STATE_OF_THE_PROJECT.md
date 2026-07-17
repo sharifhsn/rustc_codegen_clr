@@ -12,9 +12,8 @@ The 0.0.1 SDK supports:
 - Linux x64, macOS Apple Silicon, and Windows x64; and
 - the pinned `nightly-2026-06-17` rustc toolchain.
 
-The compiler retains internal .NET 8/9 compatibility machinery, but those profiles are not exposed
-as supported choices in 0.0.1. One public profile prevents target-framework, linker, runtimeconfig,
-ILAsm, and example drift.
+Unity is documented separately as a preview profile. Older runtime implementations are not public
+compatibility promises.
 
 This is an experimental compiler preview. It is not production-ready, does not promise a stable
 compiler ABI, and may still crash, reject valid Rust, or miscompile unsupported edge cases.
@@ -22,12 +21,11 @@ compiler ABI, and may still crash, reject valid Rust, or miscompile unsupported 
 ## Compiler and runtime
 
 - The fatal CIL verifier is enabled by default.
-- The main exporter writes managed PE files directly; ILAsm is a legacy fallback.
+- The exporter writes managed PE files directly.
 - Portable PDBs include Rust sequence points, source paths, local metadata, and optional Source
   Link mappings.
 - The .NET PAL covers files, networking, threads, locks, TLS, process execution and output,
   unwinding, async Rust, and core tokio/rayon-shaped workloads.
-- The alternate C exporter shares the compiler IR but remains a secondary prototype.
 
 The repository maintains compiler regressions, native-Rust differential checks, host-runtime
 acceptances, package consumers, and clean-install tests. Those gates are confidence signals, not a

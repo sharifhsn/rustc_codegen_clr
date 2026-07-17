@@ -116,7 +116,7 @@ operate through raw pointers passed into the intrinsic, not `LdLocA` of a direct
 but it is a latent hole for `volatile_load`/`volatile_store` (reachable from
 `std::ptr::read_volatile`/`write_volatile`) and for the newly-`volatile_load`-based `atomic_load`
 if the optimizer or inliner ever produces that shape. Since this is in `cilly/src/ir/opt/` (not
-`typecheck.rs`/`il_exporter/`, which are off-limits), it was in scope to fix.
+`typecheck.rs`, which is off-limits), it was in scope to fix.
 
 **Fix**: both rewrite rules now guard on `!volatile` — the fold only fires for non-volatile
 loads/stores; volatile ones are left alone (never folded, so their fence is never lost). This is

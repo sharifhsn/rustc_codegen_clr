@@ -1,13 +1,7 @@
 # Architecture & background notes
 
-A codebase-oriented digest of the design decisions behind `rustc_codegen_clr`, distilled
-from the author's (FractalFir's) blog series. Local copies of the articles are in
-[`fractalfir_articles/`](fractalfir_articles/) (see its [README](fractalfir_articles/README.md)
-for the index); citations like *(v0.2.1)* point at the article that explains a point in depth.
-
-The articles are the authoritative source for **why** things are the way they are. This file
-maps those explanations onto the actual code so you can navigate faster. Where the blog and the
-code disagree, the **code wins** — the project moves fast and some articles predate later rewrites.
+This file is the code-oriented description of the current compiler architecture. The source code
+and acceptance tests are authoritative when implementation and prose differ.
 
 ---
 
