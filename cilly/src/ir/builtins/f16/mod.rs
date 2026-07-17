@@ -46,18 +46,34 @@ pub fn float_to_f16(asm: &mut Assembly, input: Interned<CILNode>, src: Float) ->
     ));
     asm.alloc_node(CILNode::call(mref, [input]))
 }
-/// Implements a given BinOp directly, as an operation on two floating-point args.
-fn op_direct(
+/// Implements a given half-float operation through the BCL `System.Half`
+/// operators.  Direct CIL operators were only valid for the retired C path.
+fn op_indirect(
     asm: &mut Assembly,
     patcher: &mut MissingMethodPatcher,
-    lhs: Float,
-    _rhs: Float,
+    lhs_type: Float,
+    rhs_type: Float,
     op: BinOp,
+    ret_type: Type,
 ) {
-    let name = asm.alloc_string(format!("{op}_{lhs}", op = op.name(), lhs = lhs.name()));
+    let name = asm.alloc_string(format!(
+        "{op}_{lhs_type}",
+        op = op.name(),
+        lhs_type = lhs_type.name()
+    ));
     let generator = move |_, asm: &mut Assembly| {
-        let op = asm.biop(CILNode::LdArg(0), CILNode::LdArg(1), op);
-        let ret = asm.alloc_root(CILRoot::Ret(op));
+        let lhs = asm.alloc_node(CILNode::LdArg(0));
+        let rhs = asm.alloc_node(CILNode::LdArg(1));
+        let class = lhs_type.class(asm);
+        let class = asm[class].clone();
+        let call_op = class.static_mref(
+            &[Type::Float(lhs_type), Type::Float(rhs_type)],
+            ret_type,
+            asm.alloc_string(op.dotnet_name()),
+            asm,
+        );
+        let call = asm.alloc_node(CILNode::call(call_op, [lhs, rhs]));
+        let ret = asm.alloc_root(CILRoot::Ret(call));
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![ret], 0, None)],
             locals: vec![],
@@ -81,13 +97,13 @@ pub fn generate_f16_ops(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) 
     let ints = [Float::F16];
     for op in OPS {
         for float in ints {
-            op_direct(asm, patcher, float, float, op);
+            op_indirect(asm, patcher, float, float, op, Type::Float(float));
         }
     }
 
     for op in CMPS {
         for float in ints {
-            op_direct(asm, patcher, float, float, op);
+            op_indirect(asm, patcher, float, float, op, Type::Bool);
         }
     }
 }

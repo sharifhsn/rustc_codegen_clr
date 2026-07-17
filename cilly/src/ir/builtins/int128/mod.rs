@@ -3,17 +3,35 @@ use crate::{
     Interned, MethodImpl, MethodRef, Type, asm::MissingMethodPatcher, cilnode::ExtendKind,
 };
 
-fn op_direct(
+// Int128 operations must call the BCL implementation.  The direct CIL
+// operators are not valid for these value types and were only used by the
+// retired C exporter.
+fn op_indirect(
     asm: &mut Assembly,
     patcher: &mut MissingMethodPatcher,
-    lhs: Int,
-    _rhs: Int,
+    lhs_type: Int,
+    rhs_type: Int,
     op: BinOp,
+    ret_type: Type,
 ) {
-    let name = asm.alloc_string(format!("{op}_{lhs}", op = op.name(), lhs = lhs.name()));
+    let name = asm.alloc_string(format!(
+        "{op}_{lhs_type}",
+        op = op.name(),
+        lhs_type = lhs_type.name()
+    ));
     let generator = move |_, asm: &mut Assembly| {
-        let op = asm.biop(CILNode::LdArg(0), CILNode::LdArg(1), op);
-        let ret = asm.alloc_root(CILRoot::Ret(op));
+        let lhs = asm.alloc_node(CILNode::LdArg(0));
+        let rhs = asm.alloc_node(CILNode::LdArg(1));
+        let class = lhs_type.class(asm);
+        let class = asm[class].clone();
+        let call_op = class.static_mref(
+            &[Type::Int(lhs_type), Type::Int(rhs_type)],
+            ret_type,
+            asm.alloc_string(op.dotnet_name()),
+            asm,
+        );
+        let call = asm.alloc_node(CILNode::call(call_op, [lhs, rhs]));
+        let ret = asm.alloc_root(CILRoot::Ret(call));
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![ret], 0, None)],
             locals: vec![],
@@ -37,17 +55,17 @@ pub fn generate_int128_ops(asm: &mut Assembly, patcher: &mut MissingMethodPatche
     let ints = [Int::U128, Int::I128];
     for op in OPS {
         for int in ints {
-            op_direct(asm, patcher, int, int, op);
+            op_indirect(asm, patcher, int, int, op, Type::Int(int));
         }
     }
     for op in SHIFTS {
         for int in ints {
-            op_direct(asm, patcher, int, Int::I32, op);
+            op_indirect(asm, patcher, int, Int::I32, op, Type::Int(int));
         }
     }
     for op in CMPS {
         for int in ints {
-            op_direct(asm, patcher, int, int, op);
+            op_indirect(asm, patcher, int, int, op, Type::Bool);
         }
     }
 }
