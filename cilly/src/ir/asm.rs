@@ -1781,6 +1781,7 @@ impl Assembly {
             vec![None, None],
         ));
     }
+    #[cfg(test)]
     pub(crate) fn eliminate_dead_types(&mut self) {
         self.eliminate_dead_types_with_export_roots(true);
     }
