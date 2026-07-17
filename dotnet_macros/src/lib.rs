@@ -418,8 +418,11 @@ impl syn::parse::Parse for StaticFieldSpec {
 /// synthesized constructors. `assembly` is C# `internal`, useful for factory-owned lifecycle types.
 #[proc_macro_attribute]
 pub fn dotnet_class(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let mut input = parse_macro_input!(item as ItemStruct);
+    let input = parse_macro_input!(item as ItemStruct);
+    expand_dotnet_class(attr, input)
+}
 
+fn expand_dotnet_class(attr: TokenStream, mut input: ItemStruct) -> TokenStream {
     // ---- attribute args: extends = "...", value_type = bool, default_ctor = bool,
     //      field_setters = bool, properties = bool, attr(...) (repeatable) ----
     let mut extends = "[System.Runtime]System.Object".to_string();
@@ -1339,7 +1342,7 @@ fn expand_dotnet_data_object(
         .collect::<Vec<_>>();
     let ctor_magic = format_ident!("rustc_clr_interop_managed_ctor{}_", fields.len());
     let class_expansion =
-        proc_macro2::TokenStream::from(dotnet_class(class_options.into(), quote!(#parsed).into()));
+        proc_macro2::TokenStream::from(expand_dotnet_class(class_options.into(), parsed));
     let keep_primary = format_ident!("KEEP_{}_PRIMARY_CTOR", dto_name);
     let keep_default = format_ident!("KEEP_{}_DEFAULT_CTOR", dto_name);
     let default_constructor_anchor = keep_default_constructor.then(|| {
