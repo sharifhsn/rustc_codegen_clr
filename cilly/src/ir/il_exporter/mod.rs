@@ -56,7 +56,7 @@ impl ILExporter {
         Self {
             flavour,
             is_lib,
-            runtime: crate::DotnetRuntime::Net8,
+            runtime: crate::DotnetRuntime::Net10,
             asm_name,
             terminate_region_label: std::cell::Cell::new(0),
             partition: std::cell::RefCell::new(None),
@@ -2592,7 +2592,7 @@ pub fn get_default_runtime_config() -> &'static str {
 }
 
 static DEFAULT_RUNTIME_CONFIG: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| get_runtime_config(crate::DotnetRuntime::Net8));
+    std::sync::LazyLock::new(|| get_runtime_config(crate::DotnetRuntime::Net10));
 
 #[cfg(test)]
 mod region_body_compat_tests {
@@ -2687,20 +2687,22 @@ mod region_body_compat_tests {
     }
 
     #[test]
-    fn exporter_runtime_defaults_to_net8_and_can_be_overridden() {
+    fn exporter_runtime_defaults_to_net10_and_can_be_overridden() {
         let exporter = ILExporter::new(IlasmFlavour::Clasic, true, None);
-        assert_eq!(exporter.runtime, crate::DotnetRuntime::Net8);
+        assert_eq!(exporter.runtime, crate::DotnetRuntime::Net10);
         assert_eq!(
-            exporter.with_runtime(crate::DotnetRuntime::Net9).runtime,
-            crate::DotnetRuntime::Net9
+            exporter
+                .with_runtime(crate::DotnetRuntime::UnityNetStandard21)
+                .runtime,
+            crate::DotnetRuntime::UnityNetStandard21
         );
     }
 
     #[test]
     fn runtime_config_uses_the_explicit_runtime() {
-        let config = get_runtime_config(crate::DotnetRuntime::Net9);
-        assert!(config.contains("\"tfm\": \"net9.0\""));
-        assert!(config.contains("\"version\": \"9.0.0\""));
+        let config = get_runtime_config(crate::DotnetRuntime::Net10);
+        assert!(config.contains("\"tfm\": \"net10.0\""));
+        assert!(config.contains("\"version\": \"10.0.0\""));
     }
 
     #[test]

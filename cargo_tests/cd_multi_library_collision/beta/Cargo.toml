@@ -14,7 +14,6 @@ root-namespace = "Collision.Beta"
 module-type = "Exports"
 public-namespaces = ["Collision.Beta"]
 compatibility-profile = "net10-coreclr"
-legacy-main-module = false
 
 [dependencies]
 dotnet_macros = { path = "../../../dotnet_macros" }

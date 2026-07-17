@@ -184,7 +184,7 @@ mod tests {
     fn accumulator_rejects_field_level_config_mismatch_before_linking() {
         let expected = ArtifactAbiConfig::default();
         let found = ArtifactAbiConfig::default()
-            .with_dotnet_runtime(DotnetRuntime::Net9)
+            .with_dotnet_runtime(DotnetRuntime::Net10)
             .with_no_unwind(true);
         let first = AssemblyArtifact::new(Assembly::default(), expected)
             .encode()

@@ -85,13 +85,6 @@ pub fn attach(
             .is_some_and(|v| !v.is_empty()),
         "managed crate metadata is missing dotnet.public-namespaces"
     );
-    ensure!(
-        !dotnet
-            .get("legacy-main-module")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        "Unity attach requires legacy-main-module = false"
-    );
     let assembly_name = dotnet
         .get("assembly-name")
         .and_then(|v| v.as_str())
@@ -306,7 +299,7 @@ mod tests {
         fs::create_dir_all(project.join("Assets")).unwrap();
         let crate_dir = t.path().join("rust");
         fs::create_dir_all(&crate_dir).unwrap();
-        fs::write(crate_dir.join("Cargo.toml"), "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[package.metadata.dotnet]\nidentity-schema=1\npackage-id=\"Demo.Managed\"\nassembly-name=\"Demo.Managed\"\nroot-namespace=\"Demo.Managed\"\nmodule-type=\"Exports\"\npublic-namespaces=[\"Demo.Managed\"]\ncompatibility-profile=\"unity-netstandard2.1\"\nlegacy-main-module=false\n").unwrap();
+        fs::write(crate_dir.join("Cargo.toml"), "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[package.metadata.dotnet]\nidentity-schema=1\npackage-id=\"Demo.Managed\"\nassembly-name=\"Demo.Managed\"\nroot-namespace=\"Demo.Managed\"\nmodule-type=\"Exports\"\npublic-namespaces=[\"Demo.Managed\"]\ncompatibility-profile=\"unity-netstandard2.1\"\n").unwrap();
         fs::create_dir_all(crate_dir.join("src")).unwrap();
         fs::write(crate_dir.join("src/lib.rs"), "pub fn marker() {}\n").unwrap();
         (t, project, crate_dir)

@@ -6,10 +6,10 @@ use crate::Assembly;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Prefix identifying the current, schema-v8 `cilly` assembly artifact before payload decoding.
-pub const ASSEMBLY_ARTIFACT_MAGIC: &[u8; 8] = b"CILLYAR8";
+/// Prefix identifying the current, schema-v9 `cilly` assembly artifact before payload decoding.
+pub const ASSEMBLY_ARTIFACT_MAGIC: &[u8; 8] = b"CILLYAR9";
 /// Current serialization-envelope version.
-pub const ASSEMBLY_ARTIFACT_VERSION: u16 = 8;
+pub const ASSEMBLY_ARTIFACT_VERSION: u16 = 9;
 
 /// Final output target selected by a backend or linker process.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -38,10 +38,6 @@ impl std::fmt::Display for OutputTarget {
     Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
 )]
 pub enum DotnetRuntime {
-    /// .NET 8 API surface.
-    Net8,
-    /// .NET 9 API surface.
-    Net9,
     /// .NET 10 API surface.
     #[default]
     Net10,
@@ -54,8 +50,6 @@ impl DotnetRuntime {
     #[must_use]
     pub const fn tfm(self) -> &'static str {
         match self {
-            Self::Net8 => "net8.0",
-            Self::Net9 => "net9.0",
             Self::Net10 => "net10.0",
             Self::UnityNetStandard21 => "netstandard2.1",
         }
@@ -65,8 +59,6 @@ impl DotnetRuntime {
     #[must_use]
     pub const fn assembly_ver(self) -> &'static str {
         match self {
-            Self::Net8 => "8:0:0:0",
-            Self::Net9 => "9:0:0:0",
             Self::Net10 => "10:0:0:0",
             Self::UnityNetStandard21 => "4:0:0:0",
         }
@@ -76,8 +68,6 @@ impl DotnetRuntime {
     #[must_use]
     pub const fn assembly_ver_tuple(self) -> (u16, u16, u16, u16) {
         match self {
-            Self::Net8 => (8, 0, 0, 0),
-            Self::Net9 => (9, 0, 0, 0),
             Self::Net10 => (10, 0, 0, 0),
             Self::UnityNetStandard21 => (4, 0, 0, 0),
         }
@@ -87,8 +77,6 @@ impl DotnetRuntime {
     #[must_use]
     pub const fn framework_version(self) -> &'static str {
         match self {
-            Self::Net8 => "8.0.0",
-            Self::Net9 => "9.0.0",
             Self::Net10 => "10.0.0",
             Self::UnityNetStandard21 => "2.1.0",
         }
@@ -98,8 +86,6 @@ impl DotnetRuntime {
     #[must_use]
     pub const fn major(self) -> u32 {
         match self {
-            Self::Net8 => 8,
-            Self::Net9 => 9,
             Self::Net10 => 10,
             Self::UnityNetStandard21 => 0,
         }
@@ -115,8 +101,6 @@ impl DotnetRuntime {
 impl std::fmt::Display for DotnetRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Net8 => f.write_str(".NET 8"),
-            Self::Net9 => f.write_str(".NET 9"),
             Self::Net10 => f.write_str(".NET 10"),
             Self::UnityNetStandard21 => f.write_str("Unity netstandard2.1"),
         }
@@ -163,8 +147,6 @@ impl ArtifactAbiConfig {
     ) -> Result<Self, ArtifactAbiConfigCaptureError> {
         let dotnet_runtime = match environment.get("DOTNET_VERSION").map(String::as_str) {
             None | Some("10" | "net10" | "net10.0") => DotnetRuntime::Net10,
-            Some("8" | "net8" | "net8.0") => DotnetRuntime::Net8,
-            Some("9" | "net9" | "net9.0") => DotnetRuntime::Net9,
             Some("unity" | "unity-netstandard2.1" | "netstandard2.1") => {
                 DotnetRuntime::UnityNetStandard21
             }
@@ -172,7 +154,7 @@ impl ArtifactAbiConfig {
                 return Err(ArtifactAbiConfigCaptureError::InvalidValue {
                     variable: "DOTNET_VERSION",
                     value: value.to_owned(),
-                    expected: "8, 9, 10, or unity-netstandard2.1",
+                    expected: "10 or unity-netstandard2.1",
                 });
             }
         };
@@ -430,7 +412,7 @@ pub enum ArtifactDecodeError {
     },
     /// The magic prefix was present, but the envelope payload was malformed.
     InvalidVersionedEnvelope(postcard::Error),
-    /// The bytes are not a current CILLYAR8 artifact.
+    /// The bytes are not a current CILLYAR9 artifact.
     IncompatibleArtifact,
 }
 
@@ -447,7 +429,7 @@ impl std::fmt::Display for ArtifactDecodeError {
             }
             Self::IncompatibleArtifact => write!(
                 f,
-                "incompatible cilly artifact; expected CILLYAR8 schema {}. Rebuild all input crates/artifacts with the current backend",
+                "incompatible cilly artifact; expected CILLYAR9 schema {}. Rebuild all input crates/artifacts with the current backend",
                 ASSEMBLY_ARTIFACT_VERSION
             ),
         }
@@ -475,7 +457,7 @@ mod tests {
         let mut assembly = Assembly::default();
         assembly.main_module();
         let config = ArtifactAbiConfig::default()
-            .with_dotnet_runtime(DotnetRuntime::Net9)
+            .with_dotnet_runtime(DotnetRuntime::Net10)
             .with_no_unwind(true);
         let encoded = AssemblyArtifact::new(assembly, config.clone())
             .encode()
@@ -599,7 +581,7 @@ mod tests {
     fn abi_config_mismatch_reports_every_differing_field() {
         let expected = ArtifactAbiConfig::default();
         let found = ArtifactAbiConfig::default()
-            .with_dotnet_runtime(DotnetRuntime::Net9)
+            .with_dotnet_runtime(DotnetRuntime::UnityNetStandard21)
             .with_no_unwind(true);
 
         let error = expected.ensure_compatible(&found).unwrap_err();
@@ -611,7 +593,7 @@ mod tests {
         assert_eq!(fields, ["dotnet_runtime", "no_unwind"]);
         assert_eq!(
             error.to_string(),
-            "incompatible artifact ABI configuration; dotnet_runtime: expected Net10, found Net9; \
+            "incompatible artifact ABI configuration; dotnet_runtime: expected Net10, found UnityNetStandard21; \
              no_unwind: expected false, found true"
         );
     }
@@ -637,20 +619,20 @@ mod tests {
         let encoded = postcard::to_stdvec(&Assembly::default()).unwrap();
         let error = decode_assembly_artifact(&encoded).err().unwrap();
         assert!(matches!(error, ArtifactDecodeError::IncompatibleArtifact));
-        assert!(error.to_string().contains("CILLYAR8"));
+        assert!(error.to_string().contains("CILLYAR9"));
         assert!(error.to_string().contains("Rebuild all input crates"));
     }
 
     #[test]
     fn environment_snapshot_contains_only_abi_settings() {
         let environment = HashMap::from([
-            ("DOTNET_VERSION".to_owned(), "net9.0".to_owned()),
+            ("DOTNET_VERSION".to_owned(), "net10.0".to_owned()),
             ("NO_UNWIND".to_owned(), "true".to_owned()),
             ("C_MODE".to_owned(), "ignored-linker-setting".to_owned()),
         ]);
 
         let config = ArtifactAbiConfig::from_environment(&environment).unwrap();
-        assert_eq!(config.dotnet_runtime(), DotnetRuntime::Net9);
+        assert_eq!(config.dotnet_runtime(), DotnetRuntime::Net10);
         assert!(config.no_unwind());
     }
 

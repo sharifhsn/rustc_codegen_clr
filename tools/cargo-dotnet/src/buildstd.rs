@@ -425,7 +425,6 @@ fn configure_managed_identity_env(
         "RCL_MANAGED_ASSEMBLY_NAME",
         "RCL_MANAGED_ROOT_NAMESPACE",
         "RCL_MANAGED_MODULE_TYPE",
-        "RCL_LEGACY_MAIN_MODULE",
     ];
     for key in IDENTITY_ENV {
         cmd.env_remove(key);
@@ -440,14 +439,6 @@ fn configure_managed_identity_env(
         cmd.env("RCL_MANAGED_ASSEMBLY_NAME", &identity.assembly_name);
         cmd.env("RCL_MANAGED_ROOT_NAMESPACE", &identity.root_namespace);
         cmd.env("RCL_MANAGED_MODULE_TYPE", &identity.module_type);
-        cmd.env(
-            "RCL_LEGACY_MAIN_MODULE",
-            if identity.legacy_main_module {
-                "1"
-            } else {
-                "0"
-            },
-        );
     }
 }
 
@@ -467,7 +458,6 @@ mod tests {
             "RCL_MANAGED_ASSEMBLY_NAME",
             "RCL_MANAGED_ROOT_NAMESPACE",
             "RCL_MANAGED_MODULE_TYPE",
-            "RCL_LEGACY_MAIN_MODULE",
         ] {
             assert_eq!(envs.get(std::ffi::OsStr::new(key)), Some(&None));
         }
@@ -482,7 +472,6 @@ mod tests {
             assembly_name: "example_widget".into(),
             root_namespace: "Example.Widget".into(),
             module_type: "Exports".into(),
-            legacy_main_module: false,
         };
         configure_managed_identity_env(&mut command, Some(&identity));
         let envs: std::collections::BTreeMap<_, _> = command.get_envs().collect();

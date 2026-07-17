@@ -71,7 +71,6 @@ impl LinkerConfig {
             "DOTNET_VERSION",
             "GUARANTEED_ALIGN",
             "MAX_STATIC_SIZE",
-            "RCL_LEGACY_MAIN_MODULE",
             "RCL_MANAGED_ASSEMBLY_NAME",
             "RCL_MANAGED_IDENTITY_SCHEMA",
             "RCL_MANAGED_MODULE_TYPE",
@@ -147,7 +146,6 @@ fn managed_identity_from_environment(
         "RCL_MANAGED_ASSEMBLY_NAME",
         "RCL_MANAGED_ROOT_NAMESPACE",
         "RCL_MANAGED_MODULE_TYPE",
-        "RCL_LEGACY_MAIN_MODULE",
     ];
     if !KEYS.iter().any(|key| environment.contains_key(*key)) {
         return Ok(None);
@@ -168,10 +166,9 @@ fn managed_identity_from_environment(
     let assembly_name = value("RCL_MANAGED_ASSEMBLY_NAME")?.clone();
     let root_namespace = value("RCL_MANAGED_ROOT_NAMESPACE")?;
     let module_type = value("RCL_MANAGED_MODULE_TYPE")?;
-    let legacy_main_module = linker_bool(environment, "RCL_LEGACY_MAIN_MODULE", false)?;
     Ok(Some(ManagedIdentity {
         assembly_name,
-        module_full_name: (!legacy_main_module).then(|| format!("{root_namespace}.{module_type}")),
+        module_full_name: Some(format!("{root_namespace}.{module_type}")),
     }))
 }
 
@@ -1058,7 +1055,7 @@ mod linker_config_tests {
     fn versioned_artifact_abi_must_match_linker_process() {
         let artifact = ArtifactAbiConfig::default();
         let process = ArtifactAbiConfig::default()
-            .with_dotnet_runtime(DotnetRuntime::Net9)
+            .with_dotnet_runtime(DotnetRuntime::Net10)
             .with_no_unwind(true);
 
         let error = effective_abi_config(Some(artifact), process).unwrap_err();
@@ -1070,7 +1067,7 @@ mod linker_config_tests {
     #[test]
     fn all_legacy_inputs_use_the_linker_process_snapshot() {
         let process = ArtifactAbiConfig::default()
-            .with_dotnet_runtime(DotnetRuntime::Net9)
+            .with_dotnet_runtime(DotnetRuntime::Net10)
             .with_no_unwind(true);
 
         assert_eq!(

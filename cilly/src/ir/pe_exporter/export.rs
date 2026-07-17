@@ -1618,7 +1618,7 @@ mod tests {
         let mut asm = Assembly::default();
         let _ = asm.main_module();
         let options = ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: true,
             assembly_name: "export_pe_smoke".to_string(),
             public_module_full_name: None,
@@ -1684,7 +1684,7 @@ mod tests {
     fn export_pe_hand_built_hello_world_has_an_entry_point_token() {
         let mut asm = build_hello_world_assembly();
         let options = ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: false,
             assembly_name: "pe_e2e_hello".to_string(),
             public_module_full_name: None,
@@ -1797,7 +1797,7 @@ mod tests {
         asm.new_method(entry_def);
 
         let options = ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: false,
             assembly_name: "pe_e2e_pdb".to_string(),
             public_module_full_name: None,
@@ -2020,7 +2020,7 @@ mod tests {
 
         let mut asm = build_hello_world_assembly();
         let options = ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: false,
             assembly_name: "pe_e2e_hello".to_string(),
             public_module_full_name: None,
@@ -2122,7 +2122,7 @@ mod tests {
         asm.new_method(entry_def);
 
         let options = ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: false,
             assembly_name: "pe_e2e_pdb_throw".to_string(),
             public_module_full_name: None,
@@ -2215,7 +2215,7 @@ mod tests {
         asm.new_method(entry_def);
 
         let options = ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: false,
             assembly_name: "pe_e2e_const_data".to_string(),
             public_module_full_name: None,
@@ -2331,7 +2331,7 @@ mod tests {
         asm.new_method(entry_def);
 
         let options = ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: false,
             assembly_name: "pe_e2e_no_alias".to_string(),
             public_module_full_name: None,
@@ -2453,7 +2453,7 @@ mod tests {
         asm.new_method(entry_def);
 
         let options = ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: false,
             assembly_name: "pe_e2e_no_pinvoke_alias".to_string(),
             public_module_full_name: None,
@@ -2662,7 +2662,7 @@ mod tests {
         asm.new_method(entry_def);
 
         let options = ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: false,
             assembly_name: "pe_e2e_static_default".to_string(),
             public_module_full_name: None,
@@ -2706,7 +2706,7 @@ mod tests {
         asm.class_mut(main).add_interface(idisposable);
 
         let options = ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: true,
             assembly_name: "export_pe_implements".to_string(),
             public_module_full_name: None,
@@ -2826,7 +2826,7 @@ mod tests {
         asm.new_method(entry_def);
 
         let options = ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: false,
             assembly_name: "pe_e2e_layout".to_string(),
             public_module_full_name: None,
@@ -2999,7 +2999,7 @@ mod tests {
         asm.new_method(entry_def);
 
         let options = ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: false,
             assembly_name: "pe_e2e_fnptr_field".to_string(),
             public_module_full_name: None,

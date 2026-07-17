@@ -3585,7 +3585,7 @@ mod tests {
         asm.new_method(mdef);
 
         let options = super::super::export::ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: true,
             assembly_name: "pe_iface".to_string(),
             public_module_full_name: None,
@@ -3738,7 +3738,7 @@ mod tests {
         asm.new_method(mdef);
 
         let options = super::super::export::ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: true,
             assembly_name: "pe_static_iface".to_string(),
             public_module_full_name: None,
@@ -3896,7 +3896,7 @@ mod tests {
         ));
 
         let options = super::super::export::ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: true,
             assembly_name: "pe_iface_prop".to_string(),
             public_module_full_name: None,
@@ -4116,7 +4116,7 @@ mod tests {
         asm.new_method(mdef);
 
         let options = super::super::export::ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: true,
             assembly_name: "pe_generic_iface".to_string(),
             public_module_full_name: None,
@@ -4278,7 +4278,7 @@ mod tests {
         asm.new_method(mdef);
 
         let options = super::super::export::ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: true,
             assembly_name: "pe_generic_method".to_string(),
             public_module_full_name: None,
@@ -4437,7 +4437,7 @@ mod tests {
         asm.new_method(mdef);
 
         let options = super::super::export::ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: true,
             assembly_name: "pe_generic_iface_inst".to_string(),
             public_module_full_name: None,
@@ -4586,7 +4586,7 @@ mod tests {
         asm.new_method(dim_def);
 
         let options = super::super::export::ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: true,
             assembly_name: "pe_dim".to_string(),
             public_module_full_name: None,
@@ -4690,7 +4690,7 @@ mod tests {
         asm.new_method(mdef);
 
         let options = super::super::export::ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: true,
             assembly_name: "pe_byref_out".to_string(),
             public_module_full_name: None,
@@ -4815,7 +4815,7 @@ mod tests {
             .add_event(EventDef::new(ev_name, delegate_ty, add_mref, remove_mref));
 
         let options = super::super::export::ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: true,
             assembly_name: "pe_iface_event".to_string(),
             public_module_full_name: None,
@@ -4989,7 +4989,7 @@ mod tests {
         asm.class_mut(derived_idx).add_interface(*base_idx);
 
         let options = super::super::export::ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: true,
             assembly_name: "pe_iface_inherit".to_string(),
             public_module_full_name: None,
@@ -5115,7 +5115,7 @@ mod tests {
         asm.class_mut(cls_idx).add_interface(missing);
 
         let options = super::super::export::ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: true,
             assembly_name: "pe_iface_missing".to_string(),
             public_module_full_name: None,
@@ -5167,7 +5167,7 @@ mod tests {
         asm.class_mut(cls_idx).add_interface(*base_idx);
 
         let options = super::super::export::ExportOptions {
-            runtime: DotnetRuntime::Net8,
+            runtime: DotnetRuntime::Net10,
             is_dll: true,
             assembly_name: "pe_iface_notiface".to_string(),
             public_module_full_name: None,
@@ -5992,10 +5992,10 @@ mod tests {
     /// global or a hardcoded .NET 8 literal.
     #[test]
     fn bcl_assembly_refs_are_stamped_from_the_explicit_runtime() {
-        let expected = DotnetRuntime::Net9.assembly_ver_tuple();
+        let expected = DotnetRuntime::Net10.assembly_ver_tuple();
 
         let mut mb = MetadataBuilder::new();
-        mb.set_runtime(DotnetRuntime::Net9);
+        mb.set_runtime(DotnetRuntime::Net10);
         mb.set_is_lib(true);
         let sys_runtime_tok = mb.find_or_create_assembly_ref("System.Runtime");
         let row = &mb.assembly_ref[(sys_runtime_tok.rid() - 1) as usize];
@@ -6004,7 +6004,7 @@ mod tests {
         // A second, distinct BCL name via the same helper must agree too (not a fluke of caching
         // the first lookup).
         let mut mb2 = MetadataBuilder::new();
-        mb2.set_runtime(DotnetRuntime::Net9);
+        mb2.set_runtime(DotnetRuntime::Net10);
         mb2.set_is_lib(true);
         let intrinsics_tok = mb2.find_or_create_assembly_ref("System.Runtime.Intrinsics");
         let row2 = &mb2.assembly_ref[(intrinsics_tok.rid() - 1) as usize];
@@ -6018,7 +6018,7 @@ mod tests {
         // static field, which routes through `thread_static_attribute` -> `thread_static_ctor_ref`
         // -> `system_runtime_assembly_ref`.
         let mut mb3 = MetadataBuilder::new();
-        mb3.set_runtime(DotnetRuntime::Net9);
+        mb3.set_runtime(DotnetRuntime::Net10);
         mb3.set_is_lib(true);
         let field = mb3.add_static_field("TLS", 0, None, true, false);
         let _ = field;

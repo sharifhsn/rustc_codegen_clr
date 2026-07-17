@@ -372,7 +372,6 @@ fn product_rust_files(name: &str, compatibility_profile: &str) -> Vec<File> {
                  module-type = \"Backend\"\n\
                  public-namespaces = [\"{managed}\"]\n\
                  compatibility-profile = \"{compatibility_profile}\"\n\
-                 legacy-main-module = false\n\
                  \n\
                  [dependencies]\n\
                  mycorrhiza = \"0.0.0\"\n\
@@ -653,7 +652,7 @@ fn unity_files(name: &str) -> Vec<File> {
     let assembly = format!("{managed}.Rust");
     let native = format!("{}_native", name.replace('-', "_"));
     vec![
-        File { rel: "rustlib/Cargo.toml", body: format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\nmycorrhiza = \"0.0.0\"\ndotnet_macros = \"0.1.0\"\n\n[package.metadata.dotnet]\nidentity-schema = 1\npackage-id = \"{assembly}\"\nassembly-name = \"{assembly}\"\nroot-namespace = \"{managed}\"\nmodule-type = \"Exports\"\npublic-namespaces = [\"{managed}\"]\ncompatibility-profile = \"unity-netstandard2.1\"\nlegacy-main-module = false\n[workspace]\n") },
+        File { rel: "rustlib/Cargo.toml", body: format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\nmycorrhiza = \"0.0.0\"\ndotnet_macros = \"0.1.0\"\n\n[package.metadata.dotnet]\nidentity-schema = 1\npackage-id = \"{assembly}\"\nassembly-name = \"{assembly}\"\nroot-namespace = \"{managed}\"\nmodule-type = \"Exports\"\npublic-namespaces = [\"{managed}\"]\ncompatibility-profile = \"unity-netstandard2.1\"\n[workspace]\n") },
         File { rel: "rustlib/src/lib.rs", body: UNITY_RUST.to_string() },
         File {
             rel: "native/Cargo.toml",
@@ -1894,7 +1893,6 @@ mod tests {
             assert!(cargo.contains("root-namespace = \"RiskEngine\""));
             assert!(cargo.contains("module-type = \"Backend\""));
             assert!(cargo.contains(&format!("compatibility-profile = \"{profile}\"")));
-            assert!(cargo.contains("legacy-main-module = false"));
 
             let csproj = files
                 .iter()

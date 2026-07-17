@@ -454,7 +454,7 @@ mod tests {
         let config = config_with(&[
             ("C_MODE", "true"),
             ("NO_UNWIND", "1"),
-            ("DOTNET_VERSION", "net9.0"),
+            ("DOTNET_VERSION", "net10.0"),
             ("DRY_RUN", "True"),
             ("DUMP_MIR", "needle"),
         ]);
@@ -462,7 +462,7 @@ mod tests {
         assert!(config.no_unwind());
         assert!(config.dry_run());
         assert_eq!(config.dump_mir(), Some("needle"));
-        assert_eq!(config.artifact_abi().dotnet_runtime(), DotnetRuntime::Net9);
+        assert_eq!(config.artifact_abi().dotnet_runtime(), DotnetRuntime::Net10);
         assert!(!config.abort_on_error());
     }
 

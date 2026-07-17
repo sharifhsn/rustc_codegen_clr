@@ -216,7 +216,7 @@ pub fn generate(
     ));
     xml.push_str("<members>\n");
     let public_type = managed_identity
-        .and_then(ManagedIdentity::module_full_name)
+        .map(ManagedIdentity::module_full_name)
         .unwrap_or_else(|| "MainModule".to_string());
     for e in &entries {
         let member = e.member.strip_prefix("M:MainModule.").map_or_else(

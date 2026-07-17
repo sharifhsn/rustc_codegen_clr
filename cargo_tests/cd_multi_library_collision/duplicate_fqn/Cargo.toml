@@ -14,6 +14,5 @@ root-namespace = "Collision.Alpha"
 module-type = "Exports"
 public-namespaces = ["Collision.Alpha"]
 compatibility-profile = "net10-coreclr"
-legacy-main-module = false
 
 [workspace]

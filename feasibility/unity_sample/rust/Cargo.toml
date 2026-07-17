@@ -14,7 +14,6 @@ root-namespace = "Rust.Unity.Sample"
 module-type = "Exports"
 public-namespaces = ["Rust.Unity.Sample"]
 compatibility-profile = "unity-netstandard2.1"
-legacy-main-module = false
 
 [dependencies]
 dotnet_macros = { path = "../../../dotnet_macros" }

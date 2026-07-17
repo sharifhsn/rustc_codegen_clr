@@ -67,12 +67,10 @@ pub mod identity {
         pub assembly_name: String,
         pub root_namespace: String,
         pub module_type: String,
-        pub legacy_main_module: bool,
     }
     impl ManagedIdentity {
-        pub fn module_full_name(&self) -> Option<String> {
-            (!self.legacy_main_module)
-                .then(|| format!("{}.{}", self.root_namespace, self.module_type))
+        pub fn module_full_name(&self) -> String {
+            format!("{}.{}", self.root_namespace, self.module_type)
         }
     }
 

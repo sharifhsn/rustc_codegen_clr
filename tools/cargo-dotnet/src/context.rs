@@ -395,7 +395,6 @@ fn resolve_managed_project(crate_dir: &Path) -> Result<Option<ManagedProjectConf
         "module-type",
         "public-namespaces",
         "compatibility-profile",
-        "legacy-main-module",
     ];
     for key in dotnet.keys() {
         if !IDENTITY_KEYS.contains(&key.as_str()) {
@@ -424,12 +423,6 @@ fn resolve_managed_project(crate_dir: &Path) -> Result<Option<ManagedProjectConf
         assembly_name: string("assembly-name")?,
         root_namespace: string("root-namespace")?,
         module_type: string("module-type")?,
-        legacy_main_module: match dotnet.get("legacy-main-module") {
-            None => false,
-            Some(value) => value
-                .as_bool()
-                .context("package.metadata.dotnet.legacy-main-module must be a boolean")?,
-        },
     };
     validate_identity(&identity)?;
     let public_namespaces = dotnet
@@ -554,7 +547,7 @@ pub fn validate_managed_identity_set(crate_dirs: &[PathBuf]) -> Result<i32> {
             .unwrap_or_else(|| package.name.to_string());
         let public_type = project
             .as_ref()
-            .and_then(|project| project.identity.module_full_name())
+            .map(|project| project.identity.module_full_name())
             .unwrap_or_else(|| "MainModule".to_string());
 
         if let Some(previous) = assembly_owners.insert(assembly_name.clone(), crate_dir.clone()) {
@@ -682,13 +675,9 @@ mod tests {
             assembly_name: "collision_alpha".into(),
             root_namespace: "Collision.Alpha".into(),
             module_type: "Exports".into(),
-            legacy_main_module: false,
         };
         validate_identity(&identity).unwrap();
-        assert_eq!(
-            identity.module_full_name().as_deref(),
-            Some("Collision.Alpha.Exports")
-        );
+        assert_eq!(identity.module_full_name(), "Collision.Alpha.Exports");
     }
 
     fn example_project() -> ManagedProjectConfig {
@@ -699,7 +688,6 @@ mod tests {
                 assembly_name: "Example.Widget".into(),
                 root_namespace: "Example.Widget".into(),
                 module_type: "Exports".into(),
-                legacy_main_module: false,
             },
             public_namespaces: vec!["Example.Widget".into(), "Example.Widget.Models".into()],
             compatibility_profile: "net10-coreclr".into(),
@@ -730,16 +718,15 @@ mod tests {
     }
 
     #[test]
-    fn legacy_identity_keeps_main_module() {
+    fn managed_identity_projects_module_type() {
         let identity = ManagedIdentity {
             schema: 1,
             package_id: "legacy".into(),
             assembly_name: "legacy".into(),
             root_namespace: "Legacy".into(),
             module_type: "Exports".into(),
-            legacy_main_module: true,
         };
-        assert_eq!(identity.module_full_name(), None);
+        assert_eq!(identity.module_full_name(), "Legacy.Exports");
     }
 
     #[test]
@@ -764,7 +751,6 @@ mod tests {
             assembly_name: "example-widget".into(),
             root_namespace: "Example.Widget".into(),
             module_type: "Exports".into(),
-            legacy_main_module: false,
         };
         let error = validate_identity(&identity).unwrap_err().to_string();
         assert!(error.contains("assembly-name"), "{error}");

@@ -70,7 +70,6 @@ struct ManagedIdentityReceipt {
     assembly_name: String,
     root_namespace: String,
     module_type: String,
-    legacy_main_module: bool,
     public_namespaces: Vec<String>,
     compatibility_profile: String,
 }
@@ -163,7 +162,6 @@ fn identity_receipt(project: &ManagedProjectConfig) -> ManagedIdentityReceipt {
         assembly_name: identity.assembly_name.clone(),
         root_namespace: identity.root_namespace.clone(),
         module_type: identity.module_type.clone(),
-        legacy_main_module: identity.legacy_main_module,
         public_namespaces: project.public_namespaces.clone(),
         compatibility_profile: project.compatibility_profile.clone(),
     }
