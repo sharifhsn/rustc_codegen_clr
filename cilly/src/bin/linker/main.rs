@@ -738,25 +738,24 @@ fn main() {
     final_assembly.opt(&mut fuel);
     println!("==> Optimizing in {:?}", opt_start.elapsed());
     final_assembly.eliminate_dead_code();
-    if linker_config.target == OutputTarget::DotNet {
+    if linker_config.target == OutputTarget::DotNet
+        && let Some(public_type_name) = linker_config
+            .managed_identity
+            .as_ref()
+            .and_then(|identity| identity.module_full_name.as_deref())
+    {
         let hidden = final_assembly.hide_main_module_implementation_details();
         if hidden != 0 {
             println!("==> Hid {hidden} internal MainModule methods from the public CLR API");
         }
-        if let Some(public_type_name) = linker_config
-            .managed_identity
-            .as_ref()
-            .and_then(|identity| identity.module_full_name.as_deref())
-        {
-            let projected = final_assembly.project_main_module_exports(public_type_name);
-            println!(
-                "==> Projected {projected} managed export(s) onto public facade {public_type_name}"
-            );
-            // Facade projection demotes the original MainModule exports to assembly visibility.
-            // Recompute reachability now so implementation types that were roots only before the
-            // projection do not leak into constrained consumers such as UnityLinker/IL2CPP.
-            final_assembly.eliminate_dead_code_after_facade_projection(public_type_name);
-        }
+        let projected = final_assembly.project_main_module_exports(public_type_name);
+        println!(
+            "==> Projected {projected} managed export(s) onto public facade {public_type_name}"
+        );
+        // Facade projection demotes the original MainModule exports to assembly visibility.
+        // Recompute reachability now so implementation types that were roots only before the
+        // projection do not leak into constrained consumers such as UnityLinker/IL2CPP.
+        final_assembly.eliminate_dead_code_after_facade_projection(public_type_name);
     }
     let (mut final_assembly, compaction) = final_assembly.compact();
     if std::env::var("RCL_LINK_STATS").as_deref() == Ok("1") {

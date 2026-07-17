@@ -31,9 +31,13 @@ type ArgsDebugInfo = Vec<Option<Interned<IString>>>;
 
 /// Runtime support symbols use a reserved prefix: they must be rooted like native exports because
 /// generated wrappers resolve them by stable name, but they are implementation details rather than
-/// managed API. User-facing macro exports deliberately do not use this prefix.
+/// managed API. The shipped container macros predate that convention and intentionally expose their
+/// stable `rcl_vec_*`, `rcl_map_*`, and `rcl_str_*` entry points to C#.
 fn is_reserved_runtime_symbol(name: &str) -> bool {
     name.starts_with("rcl_")
+        && !["rcl_vec_", "rcl_map_", "rcl_str_"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
 }
 
 /// Returns the list of all local variables within MIR of a function, and converts them to the internal type represenation `Type`
