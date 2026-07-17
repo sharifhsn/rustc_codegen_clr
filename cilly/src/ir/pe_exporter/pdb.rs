@@ -1,10 +1,12 @@
-//! Portable PDB writer (Phase 2, `docs/PE_EMISSION_PLAN.md`) — a *second* BSJB metadata blob,
+//! Portable PDB writer for the direct PE backend — a BSJB metadata blob containing
 //! sibling to the one `tables::MetadataBuilder`/`pe::write_pe` produce for the `.dll`/`.exe`
 //! itself, per the dotnet/runtime `PortablePdb-Metadata.md` spec (which augments ECMA-335 §II.24
 //! with a `#Pdb` stream and three PDB-only tables: `Document` 0x30, `MethodDebugInformation`
 //! 0x31, and the optional `LocalScope`/`LocalVariable` 0x32/0x33).
 //!
-//! # Parity bar
+//! The writer consumes sequence points in method-definition order and emits the matching CodeView
+//! record. The resulting image and standalone PDB are loadable together by standard .NET tools.
+/* Historical implementation notes retained in git history, not in the public module contract.
 //!
 //! `il_exporter` (`cilly/src/ir/il_exporter/mod.rs:1289-1308`) turns every `CILRoot::SourceFileInfo`
 //! root into a `.line {line_start},{line_end}:{col_start},{col_end} '{file}'` directive (the
@@ -105,7 +107,7 @@
 //! the `#Pdb` stream, PDB-only `#~` tables (`Document` and `MethodDebugInformation`), and the
 //! independent debug heaps. Sequence-point collection in `body.rs` and PE Debug Directory wiring
 //! in `pe.rs` remain separate follow-up integration points; the writer here is metadata-only and
-//! does not change emitted IL or execution semantics.
+//! does not change emitted IL or execution semantics. */
 
 use super::{
     heaps::{BlobHeap, GuidHeap, StringsHeap, UserStringHeap, write_compressed_u32},
@@ -1263,13 +1265,7 @@ impl PdbChecksumEntry {
 /// 16-byte GUID, 4-byte age, then a NUL-terminated path to the PDB file. CoreCLR's loader looks
 /// for `<assembly-stem>.pdb` next to the `.dll`/`.exe` first and only falls back to this embedded
 /// path, but the entry must still be well-formed for `StackTrace(fNeedFileInfo: true)` to resolve
-/// file:line (confirmed live by the Phase-0 probe against an ilasm-produced image; this type pins
-/// the shape [`pe::write_pe`](super::pe::write_pe) will need to grow a parameter for).
-///
-/// This is a **stub signature only** — no writer code in `pe.rs` calls this yet; wiring it into
-/// `write_pe`'s layout pass (a new small data directory entry pointing at a Debug Directory table
-/// entry placed in `.text`, per this module's doc on `write_pe`'s existing layout-pass shape) is
-/// follow-up work, not part of this interface-pinning task.
+/// file:line. `pe::write_pe` serializes this record into the image's debug directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DebugDirectoryEntry {
     /// Bytes `0..16` of the [`PdbId`] this entry's PDB was built with.

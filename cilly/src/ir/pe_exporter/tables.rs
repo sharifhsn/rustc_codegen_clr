@@ -90,7 +90,7 @@ impl Token {
 /// versioned BCL/framework assembly (mirrors `il_exporter`'s `.assembly extern '<name>' { .ver …
 /// .publickeytoken = (…) }` for `bcl_public_key_token`-matched names) or a bare name-only
 /// reference (mirrors the `else` arm, used for a consumer's own non-BCL library).
-pub enum AssemblyRefTarget<'a> {
+pub enum AssemblyRefTarget {
     /// A BCL/framework assembly: runtime-selected `.ver` triplet + the
     /// real public-key token for that assembly's signing family (see `bcl_public_key_token`) —
     /// NOT always the ECMA token; `Microsoft.Extensions.*`/`Microsoft.AspNetCore.*`/
@@ -101,8 +101,6 @@ pub enum AssemblyRefTarget<'a> {
     },
     /// A consumer-supplied assembly, referenced by simple name only — no version, no token.
     NameOnly,
-    #[doc(hidden)]
-    _Marker(std::marker::PhantomData<&'a ()>),
 }
 
 /// The fixed ECMA public-key token every real `System.*`/CoreLib assembly reference carries
@@ -117,18 +115,15 @@ const EXTENSIONS_PUBLIC_KEY_TOKEN: [u8; 8] = [0xAD, 0xB9, 0x79, 0x38, 0x29, 0xDD
 const NETSTANDARD_PUBLIC_KEY_TOKEN: [u8; 8] = [0xCC, 0x7B, 0x13, 0xFF, 0xCD, 0x2D, 0xDD, 0x51];
 const MSCORLIB_PUBLIC_KEY_TOKEN: [u8; 8] = [0xB7, 0x7A, 0x5C, 0x56, 0x19, 0x34, 0xE0, 0x89];
 
-/// The maximum class-name length the CoreCLR `ilasm` accepts ("Full class name too long
-/// (N characters, 1023 allowed)"); ported from `il_exporter::ILASM_MAX_CLASS_NAME` so `tables.rs`
-/// applies the identical shortening at both TypeDef- and TypeRef-name construction time (no
-/// def/ref skew, exactly as the textual exporter documents).
-const ILASM_MAX_CLASS_NAME: usize = 1023;
+/// Maximum metadata name length accepted by the CLR type loader.
+///
+/// Names beyond this bound are shortened deterministically for both TypeDef and TypeRef rows so
+/// definitions and references remain aligned.
+const CLR_METADATA_NAME_LIMIT: usize = 1023;
 
-/// Deterministically shorten an over-long class name so the CoreCLR `ilasm` accepts it — a local
-/// port of `il_exporter::dotnet_class_name` (see that function's doc comment for the full
-/// rationale; kept in sync by construction since both are pure functions of the same FNV-1a
-/// scheme over the same input string).
+/// Deterministically shorten an over-long CLR type name using a stable FNV-1a suffix.
 fn dotnet_class_name(name: &str) -> std::borrow::Cow<'_, str> {
-    if name.len() <= ILASM_MAX_CLASS_NAME {
+    if name.len() <= CLR_METADATA_NAME_LIMIT {
         return std::borrow::Cow::Borrowed(name);
     }
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -595,7 +590,7 @@ impl MetadataBuilder {
     /// Interns an `AssemblyRef` row (§II.22.5), returning its token. `name` is the `.NET`
     /// assembly identity (e.g. `"System.Runtime"`); `target` selects the BCL-versioned vs.
     /// name-only shape per `il_exporter`'s `bcl_public_key_token` split.
-    pub fn assembly_ref(&mut self, name: &str, target: AssemblyRefTarget<'_>) -> Token {
+    pub fn assembly_ref(&mut self, name: &str, target: AssemblyRefTarget) -> Token {
         let name_off = self.strings.intern(name);
         let (major, minor, build, revision, public_key_or_token) = match target {
             AssemblyRefTarget::Bcl {
@@ -603,7 +598,6 @@ impl MetadataBuilder {
                 token,
             } => (maj, min, bui, rev, self.blobs.intern(&token)),
             AssemblyRefTarget::NameOnly => (0, 0, 0, 0, 0),
-            AssemblyRefTarget::_Marker(_) => unreachable!("hidden marker variant"),
         };
         self.assembly_ref.push(AssemblyRefRow {
             major,

@@ -1,57 +1,16 @@
-//! Top-level orchestration: `export_pe` walks a whole `Assembly` (class defs, fields, methods)
-//! and drives the four-phase pipeline documented in `pe::write_pe`'s module doc —
-//! `MetadataBuilder` population → `body::assemble_method` → RVA layout → `pe::write_pe`.
+//! Top-level orchestration for the direct PE backend. `export_pe` walks the assembly, populates
+//! ECMA-335 metadata, assembles method bodies, lays out RVAs, and delegates final PE/COFF writing
+//! to `pe::write_pe`. Portable PDB data is built from the same method order and attached through
+//! the PE debug directory, so the image and symbols remain synchronized.
 //!
 //! Semantic oracle for *what* to walk and *how* to shape each row: `il_exporter::export_to_write`
 //! (`cilly/src/ir/il_exporter/mod.rs`) — this function mirrors its per-class/per-method iteration
 //! order (see that function's doc-adjacent comments) so the two exporters agree on every
 //! assembly this milestone exercises.
 //!
-//! # Phase 1a scope
-//!
-//! This milestone only needs to carry a hand-built two-method assembly (a static `"entrypoint"`
-//! calling a BCL method, per `docs/PE_EMISSION_PLAN.md`'s Phase 1a acceptance check) from
-//! `Assembly` to a loadable `.exe`. The `Assembly` table's self-identity row IS wired
-//! (`mb.set_assembly`, version `0.0.0.0` — mirrors `il_exporter`'s `.assembly _{}` executable
-//! placeholder; a real version stamp for a named library assembly is deferred with the rest of
-//! the `.dll` output path).
-//!
-//! # Phase 1b additions
-//!
-//! Closed since Phase 1a: named-parameter `Param` rows, `ClassDef::implements()` ->
-//! `InterfaceImpl` rows, scalar `StaticFieldDef::default_value` (`FieldRVA` blobs sized to the
-//! field's own declared type — no synthetic carrier needed), and const-data `FieldRVA` blobs
-//! (`__rcl_const_blob_N` synthetic statics owned by `MainModule`, mirroring `body.rs`'s
-//! `const_blob_field_token` — see that function's doc and the Pass 2.5 comment below for why the
-//! ownership and naming must match it exactly).
-//!
-//! **Deliberately still unimplemented, but now loudly guarded (not a silent gap)**: `MainModule`
-//! method-count partitioning (CoreCLR's ~65,535-methods-per-type cap, `il_exporter::partition`).
-//! Verified NOT to be an upstream/assembly-level concern this exporter could inherit for free:
-//! `il_exporter::partition::build` operates entirely inside `ILExporter::export_to_write`, keyed
-//! by demangled `MethodDefIdx` names, with zero effect on the `Assembly` IR itself
-//! (`cilly/src/ir/il_exporter/partition.rs`). Porting it here needs a second, interleaved
-//! TypeDef/MethodDef pass (extra per-module classes must be added to `MetadataBuilder` *between*
-//! `MainModule`'s own TypeDef and the next class def, since `add_type_def`'s
-//! `method_list`/`field_list` cursors are table-position-sensitive — see `tables.rs::add_type_def`'s
-//! doc, and see Pass 0/Pass 2's comments below for a *concrete* case of exactly this ordering trap
-//! biting the const-data pass during this milestone's own development) plus a `body.rs`/`TokenSink`
-//! redirect so a call from a partitioned class back into `MainModule` resolves to the right
-//! TypeDef. Rather than leaving this an implicit, silent gap, `export_pe` now calls
-//! `check_main_module_method_count` (Pass 3) and panics with a clear message before producing an
-//! image `dotnet` would otherwise reject far more opaquely at load time.
-//!
-//! **Entry-point / `is_dll` handling**: fully wired *within* `export_pe` itself — the
-//! `"entrypoint"`-named-method convention (matching `il_exporter`'s `ENTRYPOINT`/`asm::ENTRYPOINT`)
-//! sets [`PeOptions::entry_point`], and [`ExportOptions::is_dll`] passes straight through to
-//! [`PeOptions::is_dll`]; neither has an outstanding `todo!()`. What's still open is **outside**
-//! this file's scope: `export_pe` returns `Vec<u8>` directly and does not implement the
-//! `Exporter` trait used by the linker output paths.
-//! dispatch (`Assembly::export`) expects, so wiring a `DIRECT_PE` config flag into the real linker
-//! binary needs either a thin `Exporter`-trait adapter or a parallel `export_pe` + `std::fs::write`
-//! call site in the linker's `main()` — a decision for that call site, not something `export.rs`'s
-//! internal `todo!()`s can express. Left for the dedicated linker-wiring task.
-
+//! The exporter fails before emission when an unsupported structural boundary is reached,
+//! including the `MainModule` method-count limit and invalid generic metadata. This keeps
+//! malformed images out of the linker and gives callers an actionable error.
 use super::body::{self, AssembledBody};
 use super::pe::{self, PeOptions};
 use super::sig;
