@@ -20,22 +20,6 @@ pub fn test_dotnet_executable(file_path: &str, test_dir: &str) -> String {
     #[cfg(target_os = "windows")]
     let exec_path = &std::fs::canonicalize(format!("{test_dir}//{exec_path}")).unwrap();
     let mut stdout = String::new();
-    if *C_MODE {
-        let out = std::process::Command::new("timeout")
-            .current_dir(test_dir)
-            .arg("-v")
-            .arg("1")
-            .arg(exec_path)
-            .output()
-            .expect("failed to run test program!");
-        let stderr = String::from_utf8(out.stderr).expect("stderr is not UTF8 String!");
-        assert!(
-            stderr.is_empty(),
-            "Test program failed with message {stderr:}"
-        );
-        return String::from_utf8_lossy(&out.stdout).to_string();
-    }
-
     //println!("exec_path:{exec_path:?}");
     if *IS_DOTNET_PRESENT {
         let config_path = if file_path.contains(test_dir) {
@@ -68,7 +52,6 @@ pub fn test_dotnet_executable(file_path: &str, test_dir: &str) -> String {
         };
         cmd.current_dir(test_dir);
 
-    
         let out = cmd.output().expect("failed to run test assebmly!");
 
         let stderr = String::from_utf8(out.stderr).expect("Stdout is not UTF8 String!");
@@ -197,25 +180,6 @@ pub fn cargo_build_env() -> String {
     };
     format!("-Z codegen-backend={backend} -C linker={linker} -C link-args={link_args} {radomize_layout}")
 }
-pub fn ilasm_check() {
-    match std::process::Command::new(&*ILASM_PATH).output(){
-        Ok(_)=>println!("An CIL assembler has been detected."),
-        Err(err)=>panic!("Could not find the CIL assembler at name/path {:?}, due to {err:?}. 
-Please instal the CIL assembler, and/or set the ILASM_PATH enviroment variable to point to your CIL assembler.",*ILASM_PATH)
-    }
-}
-#[doc = "Specifies the path to the IL assembler."]
-pub static ILASM_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    std::env::vars()
-        .find_map(|(key, value)| {
-            if key == "ILASM_PATH" {
-                Some(value)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(get_default_ilasm())
-});
 /// Absolute path to the codegen backend shared library.
 #[must_use]
 pub fn absolute_backend_path() -> PathBuf {
@@ -240,39 +204,6 @@ pub fn absolute_backend_path() -> PathBuf {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-/// Finds the default instance of the IL assembler.
-fn get_default_ilasm() -> String {
-    "ilasm".into()
-}
-#[cfg(target_os = "windows")]
-fn get_default_ilasm() -> String {
-    if std::process::Command::new("ilasm")
-        .arg("--help")
-        .output()
-        .is_ok()
-    {
-        return "ilasm".into();
-    }
-    // Framework Path
-    let framework_path = std::path::PathBuf::from("C:\\Windows\\Microsoft.NET\\Framework");
-    let framework_dir = std::fs::read_dir(&framework_path).unwrap_or_else(|_| panic!("Could not find the .NET framework directory at {framework_path:?}, when searching for ilasm."));
-    for entry in framework_dir {
-        let entry = entry.unwrap();
-        // TODO: find the most recent framework
-        if entry.metadata().unwrap().is_dir() {
-            let mut ilasm_path = entry.path();
-            ilasm_path.push("ilasm");
-            ilasm_path.set_extension("exe");
-            if !std::fs::exists(&ilasm_path).unwrap_or(false) {
-                eprintln!("Could not find ilasm at:{ilasm_path:?}");
-                continue;
-            }
-            return ilasm_path.display().to_string();
-        }
-    }
-    panic!("Could not find a .NET framework in directory {framework_path:?}, when searching for ilasm.")
-}
 static RUSTC_BUILD_STATUS: std::sync::LazyLock<Result<(), String>> =
     std::sync::LazyLock::new(build_backend);
 static RUSTC_CODEGEN_CLR_LINKER: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
@@ -360,9 +291,7 @@ fn run_test_impl(test_id: u64, is_release: bool) -> Option<f64> {
     // Ensures the test directory is present
     std::fs::create_dir_all(test_dir).expect("Could not setup the test env");
     // Builds the backend if neceasry
-    RUSTC_BUILD_STATUS
-        .as_ref()
-        .expect("Could not build rustc!");
+    RUSTC_BUILD_STATUS.as_ref().expect("Could not build rustc!");
     // Compiles the test project
     let mut cmd = std::process::Command::new("rustc");
     //.env("RUST_TARGET_PATH","../../")
@@ -384,8 +313,7 @@ fn run_test_impl(test_id: u64, is_release: bool) -> Option<f64> {
 
     //super::peverify(exec_path, test_dir);
 
-    let dotnet_out =
-        test_dotnet_executable(&dotnet_wrapper, test_dir);
+    let dotnet_out = test_dotnet_executable(&dotnet_wrapper, test_dir);
     // Compiles the project with native rust
     let mut cmd = std::process::Command::new("rustc");
     //.env("RUST_TARGET_PATH","../../")
@@ -451,7 +379,7 @@ fn test(test_id: u64, generator: &str) -> Option<(u64, f64)> {
     if res.is_none() {
         std::fs::remove_file(format!("/tmp/fuzz/fuzz{test_id}.rs")).unwrap();
     }
-    std::fs::remove_file(format!("/tmp/fuzz/fuzz{test_id}.il")).unwrap();
+    let _ = std::fs::remove_file(format!("/tmp/fuzz/fuzz{test_id}.il"));
     std::fs::remove_file(format!("/tmp/fuzz/fuzz{test_id}.runtimeconfig.json")).unwrap();
     // Try removing the .mdb, if present.
     let _ = std::fs::remove_file(format!("/tmp/fuzz/fuzz{test_id}.exe.mdb"));
@@ -480,7 +408,6 @@ fn main() {
     );
 }
 config_flag! {DRY_RUN,false,"Tells the codegen test suite to not execute or link any test code, enabling testing on platforms without the .NET runtime present."}
-config_flag! {C_MODE,false,"Tells the codegen to emmit C source files."}
 config_flag! {TEST_WITH_MONO,false,"Tells the codegen to use the mono runtime for tests."}
 #[cfg(target_os = "windows")]
 const IS_DOTNET_PRESENT: &bool = &true;
@@ -490,7 +417,7 @@ static IS_DOTNET_PRESENT: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::process::Command::new("dotnet").output().is_ok());
 static IS_MONO_PRESENT: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::process::Command::new("mono").output().is_ok());
-    /// Cached runtime configuration string, obtained from calling the .NET runtime.
+/// Cached runtime configuration string, obtained from calling the .NET runtime.
 #[must_use]
 pub fn get_runtime_config() -> &'static str {
     RUNTIME_CONFIG.as_ref()

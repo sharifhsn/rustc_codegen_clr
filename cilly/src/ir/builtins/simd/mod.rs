@@ -290,4 +290,3 @@ pub fn simd(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     // Per-lane value ops with no BCL-static equivalent here (xor/shl/shr/div/cast).
     binop::register_value_lane_ops(asm, patcher);
 }
-pub use binop::fallback_simd;

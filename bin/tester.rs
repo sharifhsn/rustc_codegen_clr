@@ -1,8 +1,6 @@
 #!/usr/bin/env -S cargo +nightly -Zscript
 #![feature(iter_intersperse)]
 use core::str;
-use std::collections::HashSet;
-use std::path::Path;
 #[macro_export]
 macro_rules! config {
     ($name:ident,bool,$default:expr) => {
@@ -51,43 +49,23 @@ macro_rules! config {
         });
     };
 }
-config!(C_MODE, bool, false);
 fn get_test_list(exec_path: &String) -> Vec<String> {
-    if *C_MODE {
-        let mut cmd = std::process::Command::new(exec_path);
-        cmd.arg("--list");
-        let out = cmd.output().unwrap();
-        let stdout = std::str::from_utf8(&out.stdout).unwrap();
-        assert!(stdout.contains("tests"));
-        stdout
-            .split('\n')
-            .map(|name| {
-                name.trim()
-                    .rsplit_once(':')
-                    .unwrap_or(("", ""))
-                    .0
-                    .to_owned()
-            })
-            .filter(|name| !name.is_empty())
-            .collect()
-    } else {
-        let mut cmd = std::process::Command::new("dotnet");
-        cmd.arg(exec_path.clone());
-        cmd.arg("--list");
-        let out = cmd.output().unwrap();
-        let stdout = std::str::from_utf8(&out.stdout).unwrap();
-        stdout
-            .split('\n')
-            .map(|name| {
-                name.trim()
-                    .rsplit_once(':')
-                    .unwrap_or(("", ""))
-                    .0
-                    .to_owned()
-            })
-            .filter(|name| !name.is_empty())
-            .collect()
-    }
+    let out = std::process::Command::new("dotnet")
+        .args([exec_path, "--list"])
+        .output()
+        .unwrap();
+    let stdout = std::str::from_utf8(&out.stdout).unwrap();
+    stdout
+        .split('\n')
+        .map(|name| {
+            name.trim()
+                .rsplit_once(':')
+                .unwrap_or(("", ""))
+                .0
+                .to_owned()
+        })
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
 fn run_test(
@@ -101,12 +79,7 @@ fn run_test(
     cmd.arg("-k");
     cmd.arg("20");
     cmd.arg("20");
-    if !*C_MODE {
-        cmd.arg("dotnet");
-    }
-
-    cmd.arg(exec_path);
-    cmd.arg(test_name);
+    cmd.args(["dotnet", exec_path, test_name]);
     let out = cmd.output().unwrap();
     let stdout = std::str::from_utf8(&out.stdout).unwrap();
     if stdout.contains(" passed") && !stdout.contains(" 0 passed") {
@@ -123,11 +96,7 @@ fn run_test(
     }
 }
 fn successes_from_disk(exec_name: &str) -> Vec<String> {
-    let name = if *C_MODE {
-        format!("c_success_{exec_name}.txt")
-    } else {
-        format!("success_{exec_name}.txt")
-    };
+    let name = format!("success_{exec_name}.txt");
     let Ok(file) = std::fs::File::open(name) else {
         return Vec::default();
     };
@@ -139,11 +108,7 @@ fn successes_from_disk(exec_name: &str) -> Vec<String> {
 }
 fn successes_to_disk(successes: &[String], exec_name: &str) {
     use std::io::Write;
-    let name = if *C_MODE {
-        format!("c_success_{exec_name}.txt")
-    } else {
-        format!("success_{exec_name}.txt")
-    };
+    let name = format!("success_{exec_name}.txt");
     let mut successes = successes.to_vec();
     successes.sort();
     std::fs::File::create(&name)

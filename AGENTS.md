@@ -25,7 +25,6 @@ cargo test -p cilly
 cargo test --manifest-path tools/cargo-dotnet/Cargo.toml
 cargo build --release --workspace
 cargo test ::stable
-C_MODE=1 cargo test ::stable
 ```
 
 Use `cargo dotnet` for product-shaped runs:
@@ -45,7 +44,7 @@ binary after a failed build. Clean a fixture when switching between native and b
 2. `src/assembly.rs` walks monomorphized MIR items.
 3. `src/statement.rs` and `src/terminator/` lower MIR into cilly's interned CIL-tree IR.
 4. `cilly/src/ir/opt/` and `cilly/src/ir/typecheck.rs` optimize and verify that IR.
-5. The `linker` merges serialized assemblies and emits a managed PE/PDB or C source.
+5. The `linker` merges serialized assemblies and emits a managed PE/PDB.
 
 There is one interned IR under `cilly/src/ir/`. The former V1/V2 split and `Assembly::from_v1` no
 longer exist. Do not restore that historical boundary in docs or code.

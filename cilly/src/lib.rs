@@ -50,7 +50,7 @@ pub mod artifact;
 pub use artifact::{
     ASSEMBLY_ARTIFACT_MAGIC, ASSEMBLY_ARTIFACT_VERSION, ArtifactAbiConfig,
     ArtifactAbiConfigCaptureError, ArtifactAbiConfigDifference, ArtifactAbiConfigMismatch,
-    ArtifactDecodeError, AssemblyArtifact, DotnetRuntime, OutputTarget, decode_assembly_artifact,
+    ArtifactDecodeError, AssemblyArtifact, DotnetRuntime, decode_assembly_artifact,
 };
 pub mod ir;
 pub mod utilis;

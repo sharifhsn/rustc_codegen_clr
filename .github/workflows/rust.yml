@@ -37,14 +37,4 @@ jobs:
         env:
           DOTNET_VERSION: '10'
         run: cargo test --verbose ::stable -- --skip f128 --skip num_test --skip simd --skip fuzz87
-  linux_c_test:
-    runs-on: ubuntu-22.04
-    env: 
-      C_MODE: 1
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Build
-        run: cargo build
-      - name: Run cargo tests
-        run: cargo test --verbose ::stable -- --skip f128 --skip num_test --skip arithmetic_misc --skip simd --skip round --skip interop --skip cargo --skip fuzz87 --skip fuzz86 --skip fuzz47 --skip f16 --skip fuzz96
  

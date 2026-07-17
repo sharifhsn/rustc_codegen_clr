@@ -2746,6 +2746,7 @@ impl Assembly {
         self.sections.insert(arg.into(), packed_metadata.into());
     }
 
+    #[cfg(test)]
     pub(crate) fn get_section(&self, arg: &str) -> Option<&Vec<u8>> {
         self.sections.get(arg)
     }
@@ -2757,10 +2758,6 @@ impl Assembly {
 
     pub(crate) fn alloc_const_data(&mut self, data: &[u8]) -> Interned<Box<[u8]>> {
         self.const_data.alloc(data.into())
-    }
-
-    pub(crate) fn char_is_u8(&self) -> bool {
-        true
     }
 
     pub fn load_static(

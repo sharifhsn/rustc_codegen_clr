@@ -2,8 +2,7 @@
 //! serialized `cilly` `Assembly` from its rlib (`load.rs`), merges them into one program via
 //! `asm_link`, patches in libc/intrinsic implementations referenced but never defined by
 //! rustc-generated code via a `MissingMethodPatcher` (`patch.rs`), optionally runs Native AOT
-//! (`aot.rs`), then hands the result to an `Exporter` (`il_exporter`/`c_exporter`) to emit the
-//! final `.NET` executable or C source.
+//! (`aot.rs`), then hands the result to the direct PE exporter to emit the final `.NET` executable.
 #![deny(unused_must_use)]
 #![allow(clippy::module_name_repetitions)]
 use cilly::{
@@ -11,8 +10,8 @@ use cilly::{
     libc_fns::{self, LIBC_FNS, LIBC_MODIFIES_ERRNO},
     {
         ArtifactAbiConfig, ArtifactAbiConfigMismatch, Assembly, BasicBlock, CILNode, CILRoot,
-        ClassDef, ClassRef, Const, DotnetRuntime, Int, MethodImpl, OutputTarget, Type,
-        asm::MissingMethodPatcher, cilnode::MethodKind,
+        ClassDef, ClassRef, Const, DotnetRuntime, Int, MethodImpl, Type, asm::MissingMethodPatcher,
+        cilnode::MethodKind,
     },
 };
 mod load;
@@ -46,7 +45,6 @@ fn effective_abi_config(
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LinkerConfig {
     process_abi: ArtifactAbiConfig,
-    target: OutputTarget,
     guaranteed_align: u8,
     pool_alloc: bool,
     panic_managed_backtrace: bool,
@@ -63,7 +61,6 @@ impl LinkerConfig {
     fn capture() -> Result<Self, String> {
         const SETTINGS: &[&str] = &[
             "ASCI_IDENT",
-            "C_MODE",
             "DOTNET_VERSION",
             "GUARANTEED_ALIGN",
             "MAX_STATIC_SIZE",
@@ -106,11 +103,6 @@ impl LinkerConfig {
             }
         }
 
-        let c_mode = linker_bool(environment, "C_MODE", false)?;
-        let target = match c_mode {
-            false => OutputTarget::DotNet,
-            true => OutputTarget::C,
-        };
         let guaranteed_align = linker_number(environment, "GUARANTEED_ALIGN", 8_u8)?;
         if !guaranteed_align.is_power_of_two() {
             return Err(format!(
@@ -122,7 +114,6 @@ impl LinkerConfig {
         Ok(Self {
             process_abi: ArtifactAbiConfig::from_environment(environment)
                 .map_err(|error| error.to_string())?,
-            target,
             guaranteed_align,
             pool_alloc: linker_bool(environment, "POOL_ALLOC", false)?,
             panic_managed_backtrace: linker_bool(environment, "PANIC_MANAGED_BT", false)?,
@@ -354,19 +345,6 @@ fn link_backup_std(to_link: &[&String], ar_to_link: &mut Vec<String>, backup: &P
         link_dir(backup, ar_to_link);
     }
 }
-fn extract_libs(args: &[String]) -> Vec<String> {
-    args.iter()
-        .filter(|arg| arg[..2] == *"-l")
-        .map(|arg| arg.to_string())
-        .collect()
-}
-fn extract_dirs(args: &[String]) -> Vec<String> {
-    args.iter()
-        .filter(|arg| arg[..2] == *"-B")
-        .map(|arg| arg.to_string())
-        .collect()
-}
-
 fn main() {
     let linker_config = LinkerConfig::capture()
         .unwrap_or_else(|error| panic!("invalid linker configuration: {error}"));
@@ -411,7 +389,6 @@ fn main() {
             });
     println!("==> Artifact ABI: {effective_abi_config}");
     println!("==> Linker configuration: {linker_config:?}");
-    let c_mode = matches!(linker_config.target, OutputTarget::C);
     let no_unwind = effective_abi_config.no_unwind();
     let pool_alloc = linker_config.pool_alloc;
     let panic_managed_backtrace = linker_config.panic_managed_backtrace;
@@ -476,82 +453,58 @@ fn main() {
             }
         }),
     );
-    if no_unwind || c_mode {
-        // C has no managed inheritance or exception object layout. Use the explicit-layout bridge
-        // stub; the C exporter models throws with its own abort/setjmp machinery.
+    if no_unwind {
         cilly::builtins::insert_exeception_stub(&mut final_assembly, &mut overrides);
     } else {
         cilly::builtins::insert_exception(&mut final_assembly, &mut overrides);
     };
     // Override allocator
-    if !c_mode {
-        // Get the marshal class
-        let marshal = ClassRef::marshal(&mut final_assembly);
-        // Overrides calls to malloc
-        let sig = final_assembly.sig([Type::Int(Int::ISize)], Type::Int(Int::ISize));
-        let allochglobal =
-            final_assembly.new_methodref(marshal, "AllocHGlobal", sig, MethodKind::Static, []);
-        let mref = final_assembly[allochglobal].clone();
-        call_alias(&mut overrides, &mut final_assembly, "malloc", mref);
-        // Overrides calls to realloc
-        let sig = final_assembly.sig(
-            [Type::Int(Int::ISize), Type::Int(Int::ISize)],
-            Type::Int(Int::ISize),
-        );
-        let realloc =
-            final_assembly.new_methodref(marshal, "ReAllocHGlobal", sig, MethodKind::Static, []);
-        let mref = final_assembly[realloc].clone();
-        call_alias(&mut overrides, &mut final_assembly, "realloc", mref);
-        // Overrides calls to free
-        let sig = final_assembly.sig([Type::Int(Int::ISize)], Type::Void);
-        let allochglobal =
-            final_assembly.new_methodref(marshal, "FreeHGlobal", sig, MethodKind::Static, []);
-        let mref = final_assembly[allochglobal].clone();
-        call_alias(&mut overrides, &mut final_assembly, "free", mref);
-    } else {
-        let void_ptr = final_assembly.nptr(Type::Void);
-        let sig = final_assembly.sig(
-            [void_ptr, void_ptr, void_ptr, void_ptr],
-            Type::Int(Int::I32),
-        );
-        let main_module = final_assembly.main_module();
-        let allochglobal = final_assembly.new_methodref(
-            *main_module,
-            "pthread_create_wrapper",
-            sig,
-            MethodKind::Static,
-            [],
-        );
-        let mref = final_assembly[allochglobal].clone();
-        externs.insert("pthread_create_wrapper", LIBC.clone());
-        call_alias(&mut overrides, &mut final_assembly, "pthread_create", mref);
-    }
+    // Get the marshal class
+    let marshal = ClassRef::marshal(&mut final_assembly);
+    // Overrides calls to malloc
+    let sig = final_assembly.sig([Type::Int(Int::ISize)], Type::Int(Int::ISize));
+    let allochglobal =
+        final_assembly.new_methodref(marshal, "AllocHGlobal", sig, MethodKind::Static, []);
+    let mref = final_assembly[allochglobal].clone();
+    call_alias(&mut overrides, &mut final_assembly, "malloc", mref);
+    // Overrides calls to realloc
+    let sig = final_assembly.sig(
+        [Type::Int(Int::ISize), Type::Int(Int::ISize)],
+        Type::Int(Int::ISize),
+    );
+    let realloc =
+        final_assembly.new_methodref(marshal, "ReAllocHGlobal", sig, MethodKind::Static, []);
+    let mref = final_assembly[realloc].clone();
+    call_alias(&mut overrides, &mut final_assembly, "realloc", mref);
+    // Overrides calls to free
+    let sig = final_assembly.sig([Type::Int(Int::ISize)], Type::Void);
+    let allochglobal =
+        final_assembly.new_methodref(marshal, "FreeHGlobal", sig, MethodKind::Static, []);
+    let mref = final_assembly[allochglobal].clone();
+    call_alias(&mut overrides, &mut final_assembly, "free", mref);
     // Throw side of the panic ↔ managed-exception bridge: override `_Unwind_RaiseException` to throw a
     // `RustException` (the catch side is `insert_exception`/`insert_catch_unwind` above). Only for the
-    // .NET path and only when unwinding is enabled — `NO_UNWIND` installs the ctor-less exception stub,
-    // and C mode has its own setjmp/longjmp bridge.
-    if !panic_managed_backtrace && !c_mode && !no_unwind {
+    // .NET path and only when unwinding is enabled — `NO_UNWIND` installs the ctor-less exception stub.
+    if !panic_managed_backtrace && !no_unwind {
         cilly::builtins::unwind::raise_exception(&mut final_assembly, &mut overrides);
     }
-    if !c_mode {
-        overrides.insert(
-            final_assembly.alloc_string("_Unwind_Backtrace"),
-            Box::new(|mref, asm| {
-                // 1 Get the output of the method.
-                let mref = &asm[mref];
-                let sig = asm[mref.sig()].clone();
-                let output = sig.output();
-                // 2. Create one local of the output type
-                let loc_name = asm.alloc_string("uninit");
-                let locals = vec![(Some(loc_name), asm.alloc_type(*output))];
-                // 3. Create CIL returning an uninitialized value of this type. TODO: even tough this value is shortly discarded on the Rust side, this is UB. Consider zero-initializing it.
-                let loc = asm.alloc_node(CILNode::LdLoc(0));
-                let ret = asm.alloc_root(CILRoot::Ret(loc));
-                let blocks = vec![BasicBlock::new(vec![ret], 0, None)];
-                MethodImpl::MethodBody { blocks, locals }
-            }),
-        );
-    }
+    overrides.insert(
+        final_assembly.alloc_string("_Unwind_Backtrace"),
+        Box::new(|mref, asm| {
+            // 1 Get the output of the method.
+            let mref = &asm[mref];
+            let sig = asm[mref.sig()].clone();
+            let output = sig.output();
+            // 2. Create one local of the output type
+            let loc_name = asm.alloc_string("uninit");
+            let locals = vec![(Some(loc_name), asm.alloc_type(*output))];
+            // 3. Create CIL returning an uninitialized value of this type. TODO: even tough this value is shortly discarded on the Rust side, this is UB. Consider zero-initializing it.
+            let loc = asm.alloc_node(CILNode::LdLoc(0));
+            let ret = asm.alloc_root(CILRoot::Ret(loc));
+            let blocks = vec![BasicBlock::new(vec![ret], 0, None)];
+            MethodImpl::MethodBody { blocks, locals }
+        }),
+    );
 
     overrides.insert(
         final_assembly.alloc_string("_Unwind_DeleteException"),
@@ -604,16 +557,15 @@ fn main() {
     cilly::builtins::insert_heap(
         &mut final_assembly,
         &mut overrides,
-        c_mode,
         pool_alloc,
         unity_netstandard,
     );
     cilly::builtins::rust_assert(&mut final_assembly, &mut overrides);
-    cilly::builtins::int128::generate_int128_ops(&mut final_assembly, &mut overrides, c_mode);
+    cilly::builtins::int128::generate_int128_ops(&mut final_assembly, &mut overrides);
     cilly::builtins::int128::i128_mul_ovf_check(&mut final_assembly, &mut overrides);
     cilly::builtins::int128::u128_mul_ovf_check(&mut final_assembly, &mut overrides);
     cilly::builtins::int128::generate_x86_wide_carry(&mut final_assembly, &mut overrides);
-    cilly::builtins::f16::generate_f16_ops(&mut final_assembly, &mut overrides, c_mode);
+    cilly::builtins::f16::generate_f16_ops(&mut final_assembly, &mut overrides);
     cilly::builtins::atomics::generate_all_atomics(&mut final_assembly, &mut overrides);
     cilly::builtins::transmute(&mut final_assembly, &mut overrides);
     cilly::builtins::create_slice(&mut final_assembly, &mut overrides);
@@ -622,69 +574,27 @@ fn main() {
 
     cilly::builtins::math::bitreverse(&mut final_assembly, &mut overrides);
 
-    if c_mode {
-        externs.insert("__dso_handle", LIBC.clone());
-        externs.insert("_mm_malloc", LIBC.clone());
-        externs.insert("_mm_free", LIBC.clone());
-        externs.insert("abort", LIBC.clone());
-        for fnc in [
-            "pthread_getattr_np",
-            "pthread_attr_getguardsize",
-            "pthread_attr_getstack",
-            "pthread_attr_destroy",
-            "pthread_self",
-            "pthread_create",
-            "pthread_detach",
-            "pthread_attr_setstacksize",
-            "pthread_attr_init",
-            "pthread_setname_np",
-            "pthread_key_create",
-            "pthread_key_delete",
-            "pthread_join",
-            "pthread_setspecific",
-            "ldexpf",
-            "ldexp",
-        ] {
-            externs.insert(fnc, LIBC.clone());
-        }
-        overrides.insert(
-            final_assembly.alloc_string("argc_argv_init"),
-            Box::new(|_, asm| {
-                let blocks = vec![BasicBlock::new(
-                    vec![asm.alloc_root(CILRoot::VoidRet)],
-                    0,
-                    None,
-                )];
-                MethodImpl::MethodBody {
-                    blocks,
-                    locals: vec![],
-                }
-            }),
-        );
-        cilly::builtins::simd::fallback_simd(&mut final_assembly, &mut overrides);
-    } else {
-        cilly::builtins::instert_threading(&mut final_assembly, &mut overrides);
-        cilly::builtins::math::math(&mut final_assembly, &mut overrides);
-        cilly::builtins::simd::simd(&mut final_assembly, &mut overrides);
+    cilly::builtins::instert_threading(&mut final_assembly, &mut overrides);
+    cilly::builtins::math::math(&mut final_assembly, &mut overrides);
+    cilly::builtins::simd::simd(&mut final_assembly, &mut overrides);
 
-        cilly::builtins::argc_argv_init(&mut final_assembly, &mut overrides);
-        // .NET PAL BCL bindings (rcl_dotnet_alloc / _free / _write) used by the
-        // std-side dotnet PAL. .NET-only: they emit calls into the BCL.
-        cilly::builtins::dotnet::insert_dotnet_pal(
-            &mut final_assembly,
-            &mut overrides,
-            pool_alloc,
-            unity_netstandard,
-        );
-        // POSIX/libc-over-.NET shim (the proof slice): int-fd⇄GCHandle fd-table +
-        // thread-local errno + the bare POSIX C-ABI symbol cluster (socket/read/
-        // epoll_*/…), each re-packaging an existing rcl_dotnet_* body. .NET-only;
-        // additive (os=dotnet symbols + overrides), so ::stable is untouched. The
-        // fd-table MethodDefs are defined here; fixed-point missing-method resolution below
-        // resolves the wrappers' forward refs to them. See
-        // cilly/src/ir/builtins/posix.rs and docs/LIBC_SHIM_SCOPE.md.
-        cilly::builtins::posix::insert_posix_shim(&mut final_assembly, &mut overrides);
-    }
+    cilly::builtins::argc_argv_init(&mut final_assembly, &mut overrides);
+    // .NET PAL BCL bindings (rcl_dotnet_alloc / _free / _write) used by the
+    // std-side dotnet PAL. .NET-only: they emit calls into the BCL.
+    cilly::builtins::dotnet::insert_dotnet_pal(
+        &mut final_assembly,
+        &mut overrides,
+        pool_alloc,
+        unity_netstandard,
+    );
+    // POSIX/libc-over-.NET shim (the proof slice): int-fd⇄GCHandle fd-table +
+    // thread-local errno + the bare POSIX C-ABI symbol cluster (socket/read/
+    // epoll_*/…), each re-packaging an existing rcl_dotnet_* body. .NET-only;
+    // additive (os=dotnet symbols + overrides), so ::stable is untouched. The
+    // fd-table MethodDefs are defined here; fixed-point missing-method resolution below
+    // resolves the wrappers' forward refs to them. See
+    // cilly/src/ir/builtins/posix.rs and docs/LIBC_SHIM_SCOPE.md.
+    cilly::builtins::posix::insert_posix_shim(&mut final_assembly, &mut overrides);
 
     // Ensure the cctor and tcctor exist!
     let _ = final_assembly.tcctor();
@@ -732,11 +642,10 @@ fn main() {
     final_assembly.opt(&mut fuel);
     println!("==> Optimizing in {:?}", opt_start.elapsed());
     final_assembly.eliminate_dead_code();
-    if linker_config.target == OutputTarget::DotNet
-        && let Some(public_type_name) = linker_config
-            .managed_identity
-            .as_ref()
-            .and_then(|identity| identity.module_full_name.as_deref())
+    if let Some(public_type_name) = linker_config
+        .managed_identity
+        .as_ref()
+        .and_then(|identity| identity.module_full_name.as_deref())
     {
         let hidden = final_assembly.hide_main_module_implementation_details();
         if hidden != 0 {
@@ -765,21 +674,11 @@ fn main() {
     final_assembly
         .save_tmp(&mut std::fs::File::create(path.with_extension("cilly2")).unwrap())
         .unwrap();
-    let libs = extract_libs(args);
-    let dirs = extract_dirs(args);
     if *FORCE_FAIL {
         panic!("FORCE_FAIL");
     }
-    if c_mode {
-        let cexport = cilly::c_exporter::CExporter::new(is_lib, libs, dirs);
-
-        final_assembly.export(&path, cexport);
-    } else {
-        // Hand-rolled ECMA-335 PE writer (`cilly::pe_exporter`) — bypasses `ilasm` entirely. See
-        // `docs/PE_EMISSION_PLAN.md`. `il_exporter`'s own `Exporter::export` (the `else` branch
-        // below) is left byte-for-byte untouched; this is a parallel call site, not a
-        // modification of it, per the task's hard constraint that the ilasm path must keep
-        // working unchanged.
+    {
+        // Hand-rolled ECMA-335 PE writer (`cilly::pe_exporter`) — bypasses `ilasm` entirely.
         //
         // Output-path convention mirrors `ILExporter::export` exactly (see that function): a
         // library's `.dll` bytes land at `path` itself; an executable's bytes land at
@@ -796,7 +695,7 @@ fn main() {
                         .unwrap_or_else(|| "rust_export".to_string())
                 })
         } else {
-            // `il_exporter` stamps a name-agnostic `.assembly _{}` placeholder for executables
+            // Executable names are path-loaded, so use a name-agnostic placeholder.
             // (loaded by path, name irrelevant); `pe_exporter::ExportOptions` always needs a
             // concrete name, so use the same placeholder text.
             "_".to_string()
@@ -1002,20 +901,6 @@ mod linker_config_tests {
             effective_abi_config(None, process.clone()).unwrap(),
             process
         );
-    }
-
-    #[test]
-    fn final_link_settings_are_not_part_of_artifact_compatibility() {
-        let environment = HashMap::from([
-            ("C_MODE".to_owned(), "1".to_owned()),
-            ("GUARANTEED_ALIGN".to_owned(), "16".to_owned()),
-            ("POOL_ALLOC".to_owned(), "true".to_owned()),
-        ]);
-        let config = LinkerConfig::from_environment(&environment).unwrap();
-        assert_eq!(config.target, OutputTarget::C);
-        assert_eq!(config.guaranteed_align, 16);
-        assert!(config.pool_alloc);
-        assert_eq!(config.process_abi, ArtifactAbiConfig::default());
     }
 
     #[test]

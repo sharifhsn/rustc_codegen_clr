@@ -40,7 +40,6 @@ pub mod bimap;
 /// Builtin intrinsics
 pub mod builtins;
 /// Code exporting C source files
-pub mod c_exporter;
 /// Exports modules to IR builders. Used for quickly implementing intrinsics
 pub mod cillyir_exporter;
 pub mod cilnode;

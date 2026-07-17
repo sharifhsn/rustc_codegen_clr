@@ -31,22 +31,6 @@ pub fn test_dotnet_executable(file_path: &str, test_dir: &str) -> String {
     #[cfg(target_os = "windows")]
     let exec_path = &std::fs::canonicalize(format!("{test_dir}//{exec_path}")).unwrap();
     let mut stdout = String::new();
-    if crate::config::current().c_mode() {
-        let out = std::process::Command::new("timeout")
-            .current_dir(test_dir)
-            .arg("-v")
-            .arg("1")
-            .arg(exec_path)
-            .output()
-            .expect("failed to run test program!");
-        let stderr = String::from_utf8(out.stderr).expect("stderr is not UTF8 String!");
-        assert!(
-            stderr.is_empty(),
-            "Test program failed with message {stderr:}"
-        );
-        return String::from_utf8_lossy(&out.stdout).to_string();
-    }
-
     //println!("exec_path:{exec_path:?}");
     if *IS_DOTNET_PRESENT {
         let config_path = if file_path.contains(test_dir) {

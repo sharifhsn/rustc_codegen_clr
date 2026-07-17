@@ -49,7 +49,6 @@ macro_rules! config {
         });
     };
 }
-config!(C_MODE, bool, false);
 fn main() {
     let exec_path = std::env::args().nth(1).unwrap();
     let mut ok: HashSet<String> = HashSet::default();
@@ -62,11 +61,7 @@ fn main() {
         cmd.arg("-k");
         cmd.arg(&timeout);
         cmd.arg(&timeout);
-        if !*C_MODE {
-            cmd.arg("dotnet");
-        }
-
-        cmd.arg(exec_path.clone());
+        cmd.args(["dotnet", &exec_path]);
         if shuffles > 0 {
             cmd.arg("--shuffle");
             cmd.arg("-Z");
@@ -132,17 +127,10 @@ fn main() {
         println!("{faliure}");
     }
     println!("COMMAND:");
-    if *C_MODE {
-        let mut cmd = std::process::Command::new(exec_path.clone());
-
-        cmd.args(broken.iter().flat_map(|arg| ["--skip", arg]));
-        println!("{cmd:?}");
-    } else {
-        let mut cmd = std::process::Command::new("dotnet");
-        cmd.arg(exec_path.clone());
-        cmd.args(broken.iter().flat_map(|arg| ["--skip", arg]));
-        println!("{cmd:?}");
-    }
+    let mut cmd = std::process::Command::new("dotnet");
+    cmd.arg(exec_path.clone());
+    cmd.args(broken.iter().flat_map(|arg| ["--skip", arg]));
+    println!("{cmd:?}");
     println!(
         "\nsearch result: ok:{ok}, failures:{failures} broken:{broken}",
         ok = ok.len(),

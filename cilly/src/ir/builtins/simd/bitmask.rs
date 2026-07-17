@@ -132,17 +132,12 @@ mod tests {
     }
 
     #[test]
-    fn bitmask_packer_is_registered_for_dotnet_and_fallback_simd() {
-        for register in [
-            super::super::simd as fn(&mut Assembly, &mut MissingMethodPatcher),
-            super::super::fallback_simd,
-        ] {
-            let mut asm = Assembly::default();
-            let mut patcher = MissingMethodPatcher::default();
-            register(&mut asm, &mut patcher);
-            let name = asm.alloc_string("simd_get_most_significant_bits");
-            assert!(patcher.contains_key(&name));
-        }
+    fn bitmask_packer_is_registered_for_dotnet_simd() {
+        let mut asm = Assembly::default();
+        let mut patcher = MissingMethodPatcher::default();
+        super::super::simd(&mut asm, &mut patcher);
+        let name = asm.alloc_string("simd_get_most_significant_bits");
+        assert!(patcher.contains_key(&name));
     }
 
     fn lane_index(addr: Interned<CILNode>, asm: &Assembly) -> Option<usize> {

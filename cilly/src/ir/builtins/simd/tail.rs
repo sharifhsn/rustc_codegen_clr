@@ -432,8 +432,7 @@ fn simd_shuffle(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     patcher.insert(name, Box::new(generator));
 }
 
-/// Register all SIMD-tail per-lane ops. Called from `register_value_lane_ops`, so they serve both
-/// the .NET (`simd`) and C (`fallback_simd`) builtin sets.
+/// Register all SIMD-tail per-lane ops.
 pub(super) fn register_tail_ops(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     simd_shuffle(asm, patcher);
     // Per-lane integer bit ops.

@@ -11,28 +11,6 @@ pub const ASSEMBLY_ARTIFACT_MAGIC: &[u8; 8] = b"CILLYAR9";
 /// Current serialization-envelope version.
 pub const ASSEMBLY_ARTIFACT_VERSION: u16 = 9;
 
-/// Final output target selected by a backend or linker process.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub enum OutputTarget {
-    /// .NET CIL/PE output.
-    #[default]
-    DotNet,
-    /// C source output.
-    C,
-    /// JVM bytecode output.
-    Java,
-}
-
-impl std::fmt::Display for OutputTarget {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DotNet => f.write_str(".NET"),
-            Self::C => f.write_str("C"),
-            Self::Java => f.write_str("Java"),
-        }
-    }
-}
-
 /// .NET runtime surface available to generated code and linker-provided builtins.
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
@@ -628,7 +606,6 @@ mod tests {
         let environment = HashMap::from([
             ("DOTNET_VERSION".to_owned(), "net10.0".to_owned()),
             ("NO_UNWIND".to_owned(), "true".to_owned()),
-            ("C_MODE".to_owned(), "ignored-linker-setting".to_owned()),
         ]);
 
         let config = ArtifactAbiConfig::from_environment(&environment).unwrap();

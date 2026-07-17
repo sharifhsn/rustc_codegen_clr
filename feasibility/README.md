@@ -36,7 +36,7 @@ PLATFORM=linux/amd64 feasibility/run.sh test
 
 | File | Purpose |
 |------|---------|
-| `Dockerfile` | Env only: pinned nightly + `rustc-dev`/`rust-src`, .NET 8/9/10, fallback `ilasm`, clang/gcc. Repo is mounted at runtime, not copied. |
+| `Dockerfile` | Env only: pinned nightly + `rustc-dev`/`rust-src`, .NET 8/9/10, and native build prerequisites. Repo is mounted at runtime, not copied. |
 | `run.sh` | Host driver: builds the image, runs a harness step with the repo mounted. |
 | `harness.sh` | In-container steps: `build` / `smoke` / `test` / `demo`. |
 | `onboarding_acceptance.sh` | Runs checkout setup into empty SDK/Cargo homes, proves a fresh shell discovers the installed `cargo dotnet`, then scaffolds and executes app/lib/plugin journeys outside the checkout. Also rejects a duplicate legacy `cargo install` during the one-build bootstrap. |

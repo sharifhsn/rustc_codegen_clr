@@ -6,7 +6,7 @@
 
 #[cfg(test)]
 use cilly::DotnetRuntime;
-use cilly::{ArtifactAbiConfig, ArtifactAbiConfigCaptureError, OutputTarget};
+use cilly::{ArtifactAbiConfig, ArtifactAbiConfigCaptureError};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::sync::OnceLock;
@@ -63,7 +63,6 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
 
 const ACTIVE_SETTINGS: &[&str] = &[
     "ABORT_ON_ERROR",
-    "C_MODE",
     "DOTNET_VERSION",
     "DRY_RUN",
     "DUMP_LAYOUT",
@@ -84,7 +83,6 @@ const ACTIVE_SETTINGS: &[&str] = &[
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackendConfig {
     abi: ArtifactAbiConfig,
-    output_target: OutputTarget,
     abort_on_error: bool,
     insert_mir_debug_comments: bool,
     print_local_types: bool,
@@ -114,16 +112,8 @@ impl BackendConfig {
             return Err(BackendConfigError::RetiredSettings(retired));
         }
 
-        let c_mode = parse_bool(environment, "C_MODE", false)?;
-        let output_target = if c_mode {
-            OutputTarget::C
-        } else {
-            OutputTarget::DotNet
-        };
-
         Ok(Self {
             abi: ArtifactAbiConfig::from_environment(environment)?,
-            output_target,
             abort_on_error: parse_bool(environment, "ABORT_ON_ERROR", false)?,
             insert_mir_debug_comments: parse_bool(environment, "INSERT_MIR_DEBUG_COMMENTS", false)?,
             print_local_types: parse_bool(environment, "PRINT_LOCAL_TYPES", false)?,
@@ -146,11 +136,6 @@ impl BackendConfig {
     }
 
     #[must_use]
-    pub const fn output_target(&self) -> OutputTarget {
-        self.output_target
-    }
-
-    #[must_use]
     pub const fn abort_on_error(&self) -> bool {
         self.abort_on_error
     }
@@ -158,11 +143,6 @@ impl BackendConfig {
     #[must_use]
     pub const fn no_unwind(&self) -> bool {
         self.abi.no_unwind()
-    }
-
-    #[must_use]
-    pub const fn c_mode(&self) -> bool {
-        matches!(self.output_target, OutputTarget::C)
     }
 
     #[must_use]
@@ -452,13 +432,11 @@ mod tests {
     #[test]
     fn parses_backend_and_abi_settings_from_one_snapshot() {
         let config = config_with(&[
-            ("C_MODE", "true"),
             ("NO_UNWIND", "1"),
             ("DOTNET_VERSION", "net10.0"),
             ("DRY_RUN", "True"),
             ("DUMP_MIR", "needle"),
         ]);
-        assert!(config.c_mode());
         assert!(config.no_unwind());
         assert!(config.dry_run());
         assert_eq!(config.dump_mir(), Some("needle"));

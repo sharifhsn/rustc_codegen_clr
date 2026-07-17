@@ -20,10 +20,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NUGET_XMLDOC_MODE=skip \
     CARGO_TERM_COLOR=always
 
-# System toolchain: C compilers, git, and curl.
+# System packages needed by the Rust and .NET build harness.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git pkg-config \
-        build-essential clang gcc \
+        build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # .NET 10 SDK (the default target) plus the supported downlevel runtimes.
