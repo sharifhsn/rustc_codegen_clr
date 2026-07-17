@@ -1,8 +1,8 @@
 use ar::Archive;
 
 use cilly::{
-    ArtifactAbiConfig, ArtifactAbiConfigMismatch, ArtifactDecodeError, ArtifactFormat, Assembly,
-    DecodedAssemblyArtifact, IString, decode_assembly_artifact,
+    ArtifactAbiConfig, ArtifactAbiConfigMismatch, ArtifactDecodeError, Assembly, AssemblyArtifact,
+    IString, decode_assembly_artifact,
 };
 use std::io::Read;
 pub struct LinkableFile {
@@ -29,25 +29,12 @@ pub struct LoadedAssemblies {
     assembly: Assembly,
     abi_config: Option<ArtifactAbiConfig>,
     linkables: Vec<LinkableFile>,
-    legacy_artifacts: usize,
 }
 
 impl LoadedAssemblies {
     /// Consumes all loaded state for the linker pipeline.
-    pub fn into_parts(
-        self,
-    ) -> (
-        Assembly,
-        Option<ArtifactAbiConfig>,
-        Vec<LinkableFile>,
-        usize,
-    ) {
-        (
-            self.assembly,
-            self.abi_config,
-            self.linkables,
-            self.legacy_artifacts,
-        )
+    pub fn into_parts(self) -> (Assembly, Option<ArtifactAbiConfig>, Vec<LinkableFile>) {
+        (self.assembly, self.abi_config, self.linkables)
     }
 }
 
@@ -55,7 +42,6 @@ impl LoadedAssemblies {
 struct AssemblyAccumulator {
     assembly: Assembly,
     abi_config: Option<ArtifactAbiConfig>,
-    legacy_artifacts: usize,
 }
 
 impl AssemblyAccumulator {
@@ -70,24 +56,19 @@ impl AssemblyAccumulator {
 
     fn merge_decoded(
         &mut self,
-        decoded: DecodedAssemblyArtifact,
+        decoded: AssemblyArtifact,
         source: &str,
     ) -> Result<(), ArtifactLoadError> {
-        let (assembly, config, format) = decoded.into_parts();
-        if let Some(config) = config {
-            if let Some(expected) = &self.abi_config {
-                expected.ensure_compatible(&config).map_err(|error| {
-                    ArtifactLoadError::IncompatibleAbiConfig {
-                        source: source.to_owned(),
-                        error,
-                    }
-                })?;
-            } else {
-                self.abi_config = Some(config);
-            }
-        }
-        if format == ArtifactFormat::LegacyRawAssembly {
-            self.legacy_artifacts += 1;
+        let (config, assembly) = decoded.into_parts();
+        if let Some(expected) = &self.abi_config {
+            expected.ensure_compatible(&config).map_err(|error| {
+                ArtifactLoadError::IncompatibleAbiConfig {
+                    source: source.to_owned(),
+                    error,
+                }
+            })?;
+        } else {
+            self.abi_config = Some(config);
         }
         self.assembly = std::mem::take(&mut self.assembly).link(assembly);
         Ok(())
@@ -98,7 +79,6 @@ impl AssemblyAccumulator {
             assembly: self.assembly,
             abi_config: self.abi_config,
             linkables,
-            legacy_artifacts: self.legacy_artifacts,
         }
     }
 }
@@ -191,13 +171,6 @@ pub fn load_assemblies_with_config(raw_files: &[&String], archives: &[String]) -
                 .unwrap_or_else(|error| panic!("Could not load archive {asm_path:?}: {error}")),
         );
     }
-    if merged.legacy_artifacts != 0 {
-        eprintln!(
-            "linker: loaded {} legacy raw-Assembly artifact(s); artifact ABI compatibility \
-             could not be validated for those inputs",
-            merged.legacy_artifacts
-        );
-    }
     println!("==> Loaded assmeblies");
     merged.finish(linkables)
 }
@@ -230,14 +203,11 @@ mod tests {
     }
 
     #[test]
-    fn accumulator_accepts_legacy_artifact_but_marks_config_as_unvalidated() {
+    fn accumulator_rejects_prefixless_legacy_artifact() {
         let legacy = postcard::to_stdvec(&Assembly::default()).unwrap();
         let mut accumulator = AssemblyAccumulator::default();
-        accumulator.merge_encoded(&legacy, "legacy.bc").unwrap();
-        let loaded = accumulator.finish(Vec::new());
-        let (_, config, _, legacy_artifacts) = loaded.into_parts();
-
-        assert_eq!(legacy_artifacts, 1);
-        assert!(config.is_none());
+        let error = accumulator.merge_encoded(&legacy, "legacy.bc").unwrap_err();
+        assert!(error.to_string().contains("incompatible cilly artifact"));
+        assert!(error.to_string().contains("Rebuild all input crates"));
     }
 }

@@ -21,7 +21,6 @@ macro_rules! include_bytes_if{{
   (false,$path:literal)=>{{b""}};
 }}
 
-static BUNDLED_SHARED_LIB:&[u8] = include_bytes_if!({has_native_companion},"{native_companion_file}");
 static BUNDLED_PDB:&[u8] = include_bytes_if!({has_pdb},"{pdb_file}");
 fn main(){{
     let curr_path = std::env::current_exe().unwrap();
@@ -51,13 +50,6 @@ fn main(){{
         let mut file = std::fs::File::create(config).expect("Could not create a file to save .NET runtime settings.");
         file.write_all(RUNTIME_COFIG).expect("Could not save .NET runtime settings");
     }}
-    if {has_native_companion} {{
-      if !std::path::Path::new("{native_companion_file}").exists() || needs_refresh{{
-          let mut file = std::fs::File::create("{native_companion_file}").expect("Could not create a file to provide the native companion.");
-          file.write_all(BUNDLED_SHARED_LIB).expect("Could create a file to provide the native companion");
-      }}
-  
-    }}
     if {has_pdb}{{
       if !pdb_file.exists() || needs_refresh{{
           let mut file = std::fs::File::create(pdb_file).expect("Could not create a file to provide the pdb debug info.");
@@ -72,4 +64,3 @@ fn main(){{
     // conventional 128+SIGABRT.
     std::process::exit(status.code().unwrap_or(134));
 }}
-

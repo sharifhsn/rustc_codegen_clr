@@ -3,8 +3,7 @@
 //! `asm_link`, patches in libc/intrinsic implementations referenced but never defined by
 //! rustc-generated code via a `MissingMethodPatcher` (`patch.rs`), optionally runs Native AOT
 //! (`aot.rs`), then hands the result to an `Exporter` (`il_exporter`/`c_exporter`) to emit the
-//! final `.NET` executable or C source. `native_passtrough.rs` is WIP support for passing
-//! calls through to the platform C runtime instead of reimplementing them (not yet wired in).
+//! final `.NET` executable or C source.
 #![deny(unused_must_use)]
 #![allow(clippy::module_name_repetitions)]
 use cilly::{
@@ -19,7 +18,6 @@ use cilly::{
     },
 };
 mod load;
-mod native_passtrough;
 mod patch;
 use fxhash::FxHashMap;
 use patch::call_alias;
@@ -54,7 +52,6 @@ struct LinkerConfig {
     guaranteed_align: u8,
     pool_alloc: bool,
     panic_managed_backtrace: bool,
-    native_passthrough: bool,
     direct_pe: bool,
     managed_identity: Option<ManagedIdentity>,
 }
@@ -73,8 +70,6 @@ impl LinkerConfig {
             "DIRECT_PE",
             "DOTNET_VERSION",
             "GUARANTEED_ALIGN",
-            "JAVA_MODE",
-            "JS_MODE",
             "MAX_STATIC_SIZE",
             "RCL_LEGACY_MAIN_MODULE",
             "RCL_MANAGED_ASSEMBLY_NAME",
@@ -82,8 +77,6 @@ impl LinkerConfig {
             "RCL_MANAGED_MODULE_TYPE",
             "RCL_MANAGED_PACKAGE_ID",
             "RCL_MANAGED_ROOT_NAMESPACE",
-            "NATIVE_PASSTHROUGH",
-            "NATIVE_PASSTROUGH",
             "NO_UNWIND",
             "PANIC_MANAGED_BT",
             "POOL_ALLOC",
@@ -105,7 +98,7 @@ impl LinkerConfig {
     fn from_environment(environment: &HashMap<String, String>) -> Result<Self, String> {
         for (retired, replacement) in [
             ("ASCI_IDENT", Some("ASCII_IDENTS")),
-            ("JS_MODE", Some("JAVA_MODE")),
+            ("JS_MODE", None),
             ("MAX_STATIC_SIZE", None),
         ] {
             if environment.contains_key(retired) {
@@ -119,24 +112,10 @@ impl LinkerConfig {
         }
 
         let c_mode = linker_bool(environment, "C_MODE", false)?;
-        let java_mode = linker_bool(environment, "JAVA_MODE", false)?;
-        let target = match (c_mode, java_mode) {
-            (false, false) => OutputTarget::DotNet,
-            (true, false) => OutputTarget::C,
-            (false, true) => OutputTarget::Java,
-            (true, true) => {
-                return Err(
-                    "conflicting output modes: C_MODE and JAVA_MODE; enable at most one".into(),
-                );
-            }
+        let target = match c_mode {
+            false => OutputTarget::DotNet,
+            true => OutputTarget::C,
         };
-
-        let native_passthrough = linker_bool_alias(
-            environment,
-            "NATIVE_PASSTHROUGH",
-            "NATIVE_PASSTROUGH",
-            false,
-        )?;
         let guaranteed_align = linker_number(environment, "GUARANTEED_ALIGN", 8_u8)?;
         if !guaranteed_align.is_power_of_two() {
             return Err(format!(
@@ -153,7 +132,6 @@ impl LinkerConfig {
             guaranteed_align,
             pool_alloc: linker_bool(environment, "POOL_ALLOC", false)?,
             panic_managed_backtrace: linker_bool(environment, "PANIC_MANAGED_BT", false)?,
-            native_passthrough,
             direct_pe,
             managed_identity,
         })
@@ -209,29 +187,6 @@ fn linker_bool(
         Some(value) => Err(format!(
             "boolean environment setting {variable} has invalid value {value:?}; expected 0/1 or false/true"
         )),
-    }
-}
-
-fn linker_bool_alias(
-    environment: &HashMap<String, String>,
-    canonical: &'static str,
-    legacy: &'static str,
-    default: bool,
-) -> Result<bool, String> {
-    let canonical_value = environment
-        .contains_key(canonical)
-        .then(|| linker_bool(environment, canonical, default))
-        .transpose()?;
-    let legacy_value = environment
-        .contains_key(legacy)
-        .then(|| linker_bool(environment, legacy, default))
-        .transpose()?;
-    match (canonical_value, legacy_value) {
-        (Some(left), Some(right)) if left != right => Err(format!(
-            "{canonical} and legacy alias {legacy} disagree; set only {canonical}"
-        )),
-        (Some(value), _) | (_, Some(value)) => Ok(value),
-        (None, None) => Ok(default),
     }
 }
 
@@ -356,15 +311,6 @@ fn get_libm_() -> String {
     "libm".to_string()
 }
 
-// Gets the name of a file without an extension
-fn file_stem(file: &str) -> String {
-    std::path::Path::new(file)
-        .file_stem()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_owned()
-}
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn get_out_path(args: &[String]) -> &str {
     find_out_path(args).unwrap_or_else(|| panic!("No output file! {args:?}"))
@@ -460,7 +406,7 @@ fn main() {
     // Load assemblies from files
 
     let loaded = load::load_assemblies_with_config(to_link.as_slice(), ar_to_link.as_slice());
-    let (mut final_assembly, artifact_abi_config, _, _) = loaded.into_parts();
+    let (mut final_assembly, artifact_abi_config, _) = loaded.into_parts();
     final_assembly
         .validate_fixed_array_layouts()
         .unwrap_or_else(|error| panic!("post-link {error}"));
@@ -475,7 +421,6 @@ fn main() {
     println!("==> Artifact ABI: {effective_abi_config}");
     println!("==> Linker configuration: {linker_config:?}");
     let c_mode = matches!(linker_config.target, OutputTarget::C);
-    let java_mode = matches!(linker_config.target, OutputTarget::Java);
     let no_unwind = effective_abi_config.no_unwind();
     let pool_alloc = linker_config.pool_alloc;
     let panic_managed_backtrace = linker_config.panic_managed_backtrace;
@@ -839,44 +784,6 @@ fn main() {
         let cexport = cilly::c_exporter::CExporter::new(is_lib, libs, dirs);
 
         final_assembly.export(&path, cexport);
-    } else if java_mode {
-        final_assembly.export(&path, cilly::java_exporter::JavaExporter::new(is_lib));
-        if cargo_support {
-            let bootstrap = bootstrap_source(
-                &path.with_extension("jar"),
-                path.to_str().unwrap(),
-                "java",
-                None,
-                false,
-                effective_abi_config.dotnet_runtime(),
-                linker_config.native_passthrough,
-            );
-            let bootstrap_path = path.with_extension("rs");
-            let mut bootstrap_file = std::fs::File::create(&bootstrap_path).unwrap();
-            bootstrap_file.write_all(bootstrap.as_bytes()).unwrap();
-            // Compile the bootstrap launcher with the *default* (native LLVM) backend, NOT cg_clr,
-            // so we must drop the RUSTFLAGS / cargo-encoded flags that point `-Zcodegen-backend` at
-            // this backend (otherwise the launcher build would recurse into cg_clr). This previously
-            // used `env_clear()` + PATH, which also wiped `RUSTUP_TOOLCHAIN`/`HOME`: `rustc` then fell
-            // back to rustup's default channel and triggered a toolchain *download/sync* whose
-            // progress text lands on stderr, tripping the old `stderr.is_empty()` assert. Keep the
-            // environment (so the pinned toolchain is used and no sync happens) but remove only the
-            // backend-selecting vars, and gate on the exit status (rustc may emit benign warnings).
-            let out = std::process::Command::new("rustc")
-                .arg("-O")
-                .arg(bootstrap_path)
-                .arg("-o")
-                .arg(out_path)
-                .env_remove("RUSTFLAGS")
-                .env_remove("CARGO_ENCODED_RUSTFLAGS")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "bootstrap launcher compilation failed:\n{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
     } else if linker_config.direct_pe {
         // Hand-rolled ECMA-335 PE writer (`cilly::pe_exporter`) — bypasses `ilasm` entirely. See
         // `docs/PE_EMISSION_PLAN.md`. `il_exporter`'s own `Exporter::export` (the `else` branch
@@ -1010,7 +917,6 @@ fn main() {
                 Some(&pdb_file_name),
                 true,
                 effective_abi_config.dotnet_runtime(),
-                linker_config.native_passthrough,
             );
             let bootstrap_path = path.with_extension("rs");
             let mut bootstrap_file = std::fs::File::create(&bootstrap_path).unwrap();
@@ -1064,7 +970,6 @@ fn main() {
                 None,
                 *ILASM_FLAVOUR != IlasmFlavour::Clasic,
                 effective_abi_config.dotnet_runtime(),
-                linker_config.native_passthrough,
             );
             let bootstrap_path = path.with_extension("rs");
             let mut bootstrap_file = std::fs::File::create(&bootstrap_path).unwrap();
@@ -1102,7 +1007,7 @@ fn main() {
 /// final artifact name). `None` falls back to the pre-existing `{fpath-stem}.pdb` convention
 /// (ilasm path, and the `DIRECT_PE` library case where `fpath`'s own name already IS final).
 /// `pdb_capable` is decided by the active exporter. Keeping that decision at the call site is
-/// important: consulting `ILASM_FLAVOUR` here executes `ilasm --help`, even for direct PE and Java
+/// important: consulting `ILASM_FLAVOUR` here executes `ilasm --help`, even for direct PE
 /// builds that never use ILAsm.
 fn bootstrap_source(
     fpath: &Path,
@@ -1111,7 +1016,6 @@ fn bootstrap_source(
     pdb_file_override: Option<&str>,
     pdb_capable: bool,
     runtime: DotnetRuntime,
-    native_passthrough: bool,
 ) -> String {
     if let Err(err) = std::fs::remove_file(output_file_path) {
         match err.kind() {
@@ -1131,7 +1035,7 @@ fn bootstrap_source(
     // Both modern ilasm and the direct-PE writer place a PDB in `fpath`'s directory when they
     // produced debug info. Check actual existence because ilasm's PDB writer can fail and fall
     // back silently for giant assemblies. `pdb_capable` is supplied by the exporter branch so this
-    // shared packaging code never probes ILAsm on direct-PE or Java paths.
+    // shared packaging code never probes ILAsm on direct-PE paths.
     let has_pdb = pdb_capable && fpath.with_file_name(&pdb_file).exists();
     format!(
         include_str!("dotnet_jumpstart.rs"),
@@ -1141,17 +1045,8 @@ fn bootstrap_source(
         tfm = runtime.tfm(),
         framework_version = runtime.framework_version(),
         exec_file = fpath.file_name().unwrap().to_string_lossy(),
-        has_native_companion = native_passthrough,
         has_pdb = has_pdb,
         pdb_file = if pdb_capable { pdb_file } else { String::new() },
-        native_companion_file = if native_passthrough {
-            format!(
-                "rust_native_{output_file_path}.so",
-                output_file_path = file_stem(output_file_path)
-            )
-        } else {
-            String::new()
-        }
     )
 }
 
@@ -1198,16 +1093,6 @@ mod linker_config_tests {
         assert!(config.pool_alloc);
         assert!(!config.direct_pe);
         assert_eq!(config.process_abi, ArtifactAbiConfig::default());
-    }
-
-    #[test]
-    fn canonical_native_passthrough_alias_is_supported() {
-        let environment = HashMap::from([("NATIVE_PASSTHROUGH".to_owned(), "true".to_owned())]);
-        assert!(
-            LinkerConfig::from_environment(&environment)
-                .unwrap()
-                .native_passthrough
-        );
     }
 
     #[test]

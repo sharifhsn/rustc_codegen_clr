@@ -53,7 +53,6 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
     RetiredSetting::removed("ENFORCE_CIL_VALID"),
     RetiredSetting::removed("ESCAPE_NAMES"),
     RetiredSetting::removed("INLINE_SIMPLE_FUNCTIONS"),
-    RetiredSetting::renamed("JS_MODE", "JAVA_MODE"),
     RetiredSetting::removed("MAX_STATIC_SIZE"),
     RetiredSetting::removed("NEW_UNSIZE"),
     RetiredSetting::removed("REMOVE_UNSUED_LOCALS"),
@@ -72,7 +71,6 @@ const ACTIVE_SETTINGS: &[&str] = &[
     "DUMP_MIR",
     "DUMP_MIR_OUT",
     "INSERT_MIR_DEBUG_COMMENTS",
-    "JAVA_MODE",
     "NO_UNWIND",
     "PRINT_LOCAL_TYPES",
     "RANDOMIZE_LAYOUT",
@@ -117,16 +115,10 @@ impl BackendConfig {
         }
 
         let c_mode = parse_bool(environment, "C_MODE", false)?;
-        let java_mode = parse_bool(environment, "JAVA_MODE", false)?;
-        let output_target = match (c_mode, java_mode) {
-            (false, false) => OutputTarget::DotNet,
-            (true, false) => OutputTarget::C,
-            (false, true) => OutputTarget::Java,
-            (true, true) => {
-                return Err(BackendConfigError::ConflictingOutputModes {
-                    enabled: vec!["C_MODE", "JAVA_MODE"],
-                });
-            }
+        let output_target = if c_mode {
+            OutputTarget::C
+        } else {
+            OutputTarget::DotNet
         };
 
         Ok(Self {
@@ -442,7 +434,6 @@ mod tests {
     #[test]
     fn reports_retired_settings_with_replacements_in_stable_order() {
         let environment = HashMap::from([
-            ("JS_MODE".to_owned(), "1".to_owned()),
             ("ASCI_IDENT".to_owned(), "0".to_owned()),
             ("CHECK_ALLOCATIONS".to_owned(), "0".to_owned()),
         ]);
@@ -452,11 +443,10 @@ mod tests {
                 .iter()
                 .map(|setting| setting.name())
                 .collect::<Vec<_>>(),
-            ["ASCI_IDENT", "CHECK_ALLOCATIONS", "JS_MODE"]
+            ["ASCI_IDENT", "CHECK_ALLOCATIONS"]
         );
         let error = BackendConfig::from_environment(&environment).unwrap_err();
         assert!(error.to_string().contains("ASCI_IDENT (use ASCII_IDENTS)"));
-        assert!(error.to_string().contains("JS_MODE (use JAVA_MODE)"));
     }
 
     #[test]
@@ -474,19 +464,6 @@ mod tests {
         assert_eq!(config.dump_mir(), Some("needle"));
         assert_eq!(config.artifact_abi().dotnet_runtime(), DotnetRuntime::Net9);
         assert!(!config.abort_on_error());
-    }
-
-    #[test]
-    fn rejects_conflicting_output_targets() {
-        let error = BackendConfig::from_environment(&HashMap::from([
-            ("C_MODE".to_owned(), "1".to_owned()),
-            ("JAVA_MODE".to_owned(), "true".to_owned()),
-        ]))
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            BackendConfigError::ConflictingOutputModes { .. }
-        ));
     }
 
     #[test]

@@ -46,7 +46,7 @@
 //! sets [`PeOptions::entry_point`], and [`ExportOptions::is_dll`] passes straight through to
 //! [`PeOptions::is_dll`]; neither has an outstanding `todo!()`. What's still open is **outside**
 //! this file's scope: `export_pe` returns `Vec<u8>` directly and does not implement the
-//! `Exporter` trait the linker's existing `if *C_MODE {…} else if *JAVA_MODE {…} else {…}`
+//! `Exporter` trait used by the linker output paths.
 //! dispatch (`Assembly::export`) expects, so wiring a `DIRECT_PE` config flag into the real linker
 //! binary needs either a thin `Exporter`-trait adapter or a parallel `export_pe` + `std::fs::write`
 //! call site in the linker's `main()` — a decision for that call site, not something `export.rs`'s

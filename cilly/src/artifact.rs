@@ -1,8 +1,6 @@
 //! Versioned serialization envelope for linkable `cilly` assemblies.
 //!
-//! The [`Assembly`] postcard representation is schema-versioned inside the envelope. A short magic
-//! prefix distinguishes new artifacts from the historical raw-`Assembly` format, allowing the
-//! decoder to retain an explicit legacy path without guessing after a versioned decode failure.
+//! The [`Assembly`] postcard representation is schema-versioned inside the envelope.
 
 use crate::Assembly;
 use serde::{Deserialize, Serialize};
@@ -10,20 +8,6 @@ use std::collections::HashMap;
 
 /// Prefix identifying the current, schema-v8 `cilly` assembly artifact before payload decoding.
 pub const ASSEMBLY_ARTIFACT_MAGIC: &[u8; 8] = b"CILLYAR8";
-/// Magic emitted by schema-v7 artifacts, before custom-attribute named fields were represented.
-const ASSEMBLY_ARTIFACT_V7_MAGIC: &[u8; 8] = b"CILLYAR7";
-/// Magic emitted by schema-v6 artifacts, before rooted internal-linkage visibility was represented.
-const ASSEMBLY_ARTIFACT_V6_MAGIC: &[u8; 8] = b"CILLYAR6";
-/// Magic emitted by schema-v5 artifacts, before native-import metadata and rich P/Invoke methods.
-const ASSEMBLY_ARTIFACT_V5_MAGIC: &[u8; 8] = b"CILLYAR5";
-/// Magic emitted by schema-v4 artifacts, before genuine CLR enum metadata.
-const ASSEMBLY_ARTIFACT_V4_MAGIC: &[u8; 8] = b"CILLYAR4";
-/// Magic emitted by schema-v3 artifacts, before fixed-array layout provenance.
-const ASSEMBLY_ARTIFACT_V3_MAGIC: &[u8; 8] = b"CILLYAR3";
-/// Magic emitted by schema-v2 artifacts, before canonical method-scope exception regions.
-const ASSEMBLY_ARTIFACT_V2_MAGIC: &[u8; 8] = b"CILLYAR2";
-/// Magic emitted by schema-v1 artifacts, whose `BiMap` payload duplicated value storage.
-const ASSEMBLY_ARTIFACT_V1_MAGIC: &[u8; 8] = b"CILLYART";
 /// Current serialization-envelope version.
 pub const ASSEMBLY_ARTIFACT_VERSION: u16 = 8;
 
@@ -412,106 +396,13 @@ impl AssemblyArtifact {
     }
 }
 
-/// Serialization format identified while decoding an artifact.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ArtifactFormat {
-    /// Magic-prefixed [`AssemblyArtifact`].
-    Versioned,
-    /// Historical raw postcard [`Assembly`].
-    LegacyRawAssembly,
-}
-
-/// A decoded versioned artifact or explicitly recognized legacy raw assembly.
-pub enum DecodedAssemblyArtifact {
-    /// Current magic-prefixed artifact.
-    Versioned(AssemblyArtifact),
-    /// Legacy raw `Assembly`; no ABI contract was serialized with it.
-    Legacy(Assembly),
-}
-
-impl DecodedAssemblyArtifact {
-    /// Identified serialization format.
-    #[must_use]
-    pub const fn format(&self) -> ArtifactFormat {
-        match self {
-            Self::Versioned(_) => ArtifactFormat::Versioned,
-            Self::Legacy(_) => ArtifactFormat::LegacyRawAssembly,
-        }
-    }
-
-    /// Serialized ABI contract, absent for legacy raw assemblies.
-    #[must_use]
-    pub fn abi_config(&self) -> Option<&ArtifactAbiConfig> {
-        match self {
-            Self::Versioned(artifact) => Some(artifact.abi_config()),
-            Self::Legacy(_) => None,
-        }
-    }
-
-    /// Consumes the decoded value into assembly, optional ABI contract, and format.
-    #[must_use]
-    pub fn into_parts(self) -> (Assembly, Option<ArtifactAbiConfig>, ArtifactFormat) {
-        match self {
-            Self::Versioned(artifact) => {
-                let (config, assembly) = artifact.into_parts();
-                (assembly, Some(config), ArtifactFormat::Versioned)
-            }
-            Self::Legacy(assembly) => (assembly, None, ArtifactFormat::LegacyRawAssembly),
-        }
-    }
-}
-
-/// Decodes a versioned artifact, or a historical raw `Assembly` when the magic prefix is absent.
+/// Decodes a current versioned artifact.
 ///
 /// # Errors
 ///
-/// Versioned artifacts never fall back to the legacy decoder: an unsupported or corrupt envelope
-/// reports that exact failure. Prefix-less bytes report a legacy decode failure.
-pub fn decode_assembly_artifact(
-    encoded: &[u8],
-) -> Result<DecodedAssemblyArtifact, ArtifactDecodeError> {
-    if encoded.starts_with(ASSEMBLY_ARTIFACT_V1_MAGIC) {
-        return Err(ArtifactDecodeError::UnsupportedVersion {
-            found: 1,
-            supported: ASSEMBLY_ARTIFACT_VERSION,
-        });
-    }
-    if encoded.starts_with(ASSEMBLY_ARTIFACT_V2_MAGIC) {
-        return Err(ArtifactDecodeError::UnsupportedVersion {
-            found: 2,
-            supported: ASSEMBLY_ARTIFACT_VERSION,
-        });
-    }
-    if encoded.starts_with(ASSEMBLY_ARTIFACT_V3_MAGIC) {
-        return Err(ArtifactDecodeError::UnsupportedVersion {
-            found: 3,
-            supported: ASSEMBLY_ARTIFACT_VERSION,
-        });
-    }
-    if encoded.starts_with(ASSEMBLY_ARTIFACT_V4_MAGIC) {
-        return Err(ArtifactDecodeError::UnsupportedVersion {
-            found: 4,
-            supported: ASSEMBLY_ARTIFACT_VERSION,
-        });
-    }
-    if encoded.starts_with(ASSEMBLY_ARTIFACT_V5_MAGIC) {
-        return Err(ArtifactDecodeError::UnsupportedVersion {
-            found: 5,
-            supported: ASSEMBLY_ARTIFACT_VERSION,
-        });
-    }
-    if encoded.starts_with(ASSEMBLY_ARTIFACT_V6_MAGIC) {
-        return Err(ArtifactDecodeError::UnsupportedVersion {
-            found: 6,
-            supported: ASSEMBLY_ARTIFACT_VERSION,
-        });
-    }
-    if encoded.starts_with(ASSEMBLY_ARTIFACT_V7_MAGIC) {
-        return Err(ArtifactDecodeError::UnsupportedVersion {
-            found: 7,
-            supported: ASSEMBLY_ARTIFACT_VERSION,
-        });
-    }
+/// Older magic prefixes and prefix-less bytes are rejected. Rebuild all inputs with the current
+/// backend rather than attempting schema migration.
+pub fn decode_assembly_artifact(encoded: &[u8]) -> Result<AssemblyArtifact, ArtifactDecodeError> {
     if let Some(payload) = encoded.strip_prefix(ASSEMBLY_ARTIFACT_MAGIC) {
         let artifact: AssemblyArtifact =
             postcard::from_bytes(payload).map_err(ArtifactDecodeError::InvalidVersionedEnvelope)?;
@@ -521,11 +412,9 @@ pub fn decode_assembly_artifact(
                 supported: ASSEMBLY_ARTIFACT_VERSION,
             });
         }
-        Ok(DecodedAssemblyArtifact::Versioned(artifact))
+        Ok(artifact)
     } else {
-        postcard::from_bytes(encoded)
-            .map(DecodedAssemblyArtifact::Legacy)
-            .map_err(ArtifactDecodeError::InvalidLegacyAssembly)
+        Err(ArtifactDecodeError::IncompatibleArtifact)
     }
 }
 
@@ -541,8 +430,8 @@ pub enum ArtifactDecodeError {
     },
     /// The magic prefix was present, but the envelope payload was malformed.
     InvalidVersionedEnvelope(postcard::Error),
-    /// Prefix-less bytes were not a historical raw `Assembly`.
-    InvalidLegacyAssembly(postcard::Error),
+    /// The bytes are not a current CILLYAR8 artifact.
+    IncompatibleArtifact,
 }
 
 impl std::fmt::Display for ArtifactDecodeError {
@@ -556,9 +445,11 @@ impl std::fmt::Display for ArtifactDecodeError {
             Self::InvalidVersionedEnvelope(error) => {
                 write!(f, "invalid versioned cilly artifact envelope: {error}")
             }
-            Self::InvalidLegacyAssembly(error) => {
-                write!(f, "invalid legacy raw cilly Assembly: {error}")
-            }
+            Self::IncompatibleArtifact => write!(
+                f,
+                "incompatible cilly artifact; expected CILLYAR8 schema {}. Rebuild all input crates/artifacts with the current backend",
+                ASSEMBLY_ARTIFACT_VERSION
+            ),
         }
     }
 }
@@ -566,10 +457,8 @@ impl std::fmt::Display for ArtifactDecodeError {
 impl std::error::Error for ArtifactDecodeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::UnsupportedVersion { .. } => None,
-            Self::InvalidVersionedEnvelope(error) | Self::InvalidLegacyAssembly(error) => {
-                Some(error)
-            }
+            Self::UnsupportedVersion { .. } | Self::IncompatibleArtifact => None,
+            Self::InvalidVersionedEnvelope(error) => Some(error),
         }
     }
 }
@@ -594,10 +483,9 @@ mod tests {
         assert!(encoded.starts_with(ASSEMBLY_ARTIFACT_MAGIC));
 
         let decoded = decode_assembly_artifact(&encoded).unwrap();
-        assert_eq!(decoded.format(), ArtifactFormat::Versioned);
-        assert_eq!(decoded.abi_config(), Some(&config));
-        let (assembly, decoded_config, _) = decoded.into_parts();
-        assert_eq!(decoded_config, Some(config));
+        assert_eq!(decoded.abi_config(), &config);
+        let (decoded_config, assembly) = decoded.into_parts();
+        assert_eq!(decoded_config, config);
         assert_eq!(assembly.class_defs().len(), 1);
     }
 
@@ -651,7 +539,7 @@ mod tests {
             .encode()
             .unwrap();
         let decoded = decode_assembly_artifact(&encoded).unwrap();
-        let (assembly, _, _) = decoded.into_parts();
+        let (_, assembly) = decoded.into_parts();
         assert!(
             assembly
                 .validate_fixed_array_layouts()
@@ -687,7 +575,7 @@ mod tests {
             .encode()
             .unwrap();
         let decoded = decode_assembly_artifact(&encoded).unwrap();
-        let (assembly, _, _) = decoded.into_parts();
+        let (_, assembly) = decoded.into_parts();
         let method = assembly
             .method_defs()
             .values()
@@ -729,21 +617,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_raw_assembly_decode_is_explicit() {
-        let mut assembly = Assembly::default();
-        assembly.main_module();
-        let encoded = postcard::to_stdvec(&assembly).unwrap();
-
-        let decoded = decode_assembly_artifact(&encoded).unwrap();
-        assert_eq!(decoded.format(), ArtifactFormat::LegacyRawAssembly);
-        assert_eq!(decoded.abi_config(), None);
-        let (assembly, config, format) = decoded.into_parts();
-        assert_eq!(config, None);
-        assert_eq!(format, ArtifactFormat::LegacyRawAssembly);
-        assert_eq!(assembly.class_defs().len(), 1);
-    }
-
-    #[test]
     fn magic_prefixed_unsupported_payload_version_never_falls_back_to_legacy() {
         let mut artifact = AssemblyArtifact::new(Assembly::default(), ArtifactAbiConfig::default());
         artifact.version = ASSEMBLY_ARTIFACT_VERSION + 1;
@@ -760,114 +633,11 @@ mod tests {
     }
 
     #[test]
-    fn v1_header_is_rejected_before_deserializing_its_old_bimap_shape() {
-        let mut encoded = ASSEMBLY_ARTIFACT_V1_MAGIC.to_vec();
-        encoded.extend_from_slice(b"payload shape intentionally irrelevant");
-
+    fn prefixless_legacy_artifact_is_rejected_for_clean_rebuild() {
+        let encoded = postcard::to_stdvec(&Assembly::default()).unwrap();
         let error = decode_assembly_artifact(&encoded).err().unwrap();
-        assert!(matches!(
-            error,
-            ArtifactDecodeError::UnsupportedVersion {
-                found: 1,
-                supported: ASSEMBLY_ARTIFACT_VERSION
-            }
-        ));
-        assert!(error.to_string().contains("Rebuild all input crates"));
-    }
-
-    #[test]
-    fn v2_header_is_rejected_before_deserializing_its_pre_region_body_shape() {
-        let mut encoded = ASSEMBLY_ARTIFACT_V2_MAGIC.to_vec();
-        encoded.extend_from_slice(b"payload shape intentionally irrelevant");
-
-        let error = decode_assembly_artifact(&encoded).err().unwrap();
-        assert!(matches!(
-            error,
-            ArtifactDecodeError::UnsupportedVersion {
-                found: 2,
-                supported: ASSEMBLY_ARTIFACT_VERSION
-            }
-        ));
-        assert!(error.to_string().contains("Rebuild all input crates"));
-    }
-
-    #[test]
-    fn v3_header_is_rejected_before_deserializing_pre_layout_provenance() {
-        let mut encoded = ASSEMBLY_ARTIFACT_V3_MAGIC.to_vec();
-        encoded.extend_from_slice(b"payload shape intentionally irrelevant");
-
-        let error = decode_assembly_artifact(&encoded).err().unwrap();
-        assert!(matches!(
-            error,
-            ArtifactDecodeError::UnsupportedVersion {
-                found: 3,
-                supported: ASSEMBLY_ARTIFACT_VERSION
-            }
-        ));
-        assert!(error.to_string().contains("Rebuild all input crates"));
-    }
-
-    #[test]
-    fn v4_header_is_rejected_before_deserializing_pre_enum_metadata() {
-        let mut encoded = ASSEMBLY_ARTIFACT_V4_MAGIC.to_vec();
-        encoded.extend_from_slice(b"payload shape intentionally irrelevant");
-
-        let error = decode_assembly_artifact(&encoded).err().unwrap();
-        assert!(matches!(
-            error,
-            ArtifactDecodeError::UnsupportedVersion {
-                found: 4,
-                supported: ASSEMBLY_ARTIFACT_VERSION
-            }
-        ));
-        assert!(error.to_string().contains("Rebuild all input crates"));
-    }
-
-    #[test]
-    fn v5_header_is_rejected_before_deserializing_pre_pinvoke_metadata() {
-        let mut encoded = ASSEMBLY_ARTIFACT_V5_MAGIC.to_vec();
-        encoded.extend_from_slice(b"payload shape intentionally irrelevant");
-
-        let error = decode_assembly_artifact(&encoded).err().unwrap();
-        assert!(matches!(
-            error,
-            ArtifactDecodeError::UnsupportedVersion {
-                found: 5,
-                supported: ASSEMBLY_ARTIFACT_VERSION
-            }
-        ));
-        assert!(error.to_string().contains("Rebuild all input crates"));
-    }
-
-    #[test]
-    fn v6_header_is_rejected_before_deserializing_pre_internal_extern_visibility() {
-        let mut encoded = ASSEMBLY_ARTIFACT_V6_MAGIC.to_vec();
-        encoded.extend_from_slice(b"payload shape intentionally irrelevant");
-
-        let error = decode_assembly_artifact(&encoded).err().unwrap();
-        assert!(matches!(
-            error,
-            ArtifactDecodeError::UnsupportedVersion {
-                found: 6,
-                supported: ASSEMBLY_ARTIFACT_VERSION
-            }
-        ));
-        assert!(error.to_string().contains("Rebuild all input crates"));
-    }
-
-    #[test]
-    fn v7_header_is_rejected_before_deserializing_pre_custom_attribute_named_fields() {
-        let mut encoded = ASSEMBLY_ARTIFACT_V7_MAGIC.to_vec();
-        encoded.extend_from_slice(b"payload shape intentionally irrelevant");
-
-        let error = decode_assembly_artifact(&encoded).err().unwrap();
-        assert!(matches!(
-            error,
-            ArtifactDecodeError::UnsupportedVersion {
-                found: 7,
-                supported: ASSEMBLY_ARTIFACT_VERSION
-            }
-        ));
+        assert!(matches!(error, ArtifactDecodeError::IncompatibleArtifact));
+        assert!(error.to_string().contains("CILLYAR8"));
         assert!(error.to_string().contains("Rebuild all input crates"));
     }
 

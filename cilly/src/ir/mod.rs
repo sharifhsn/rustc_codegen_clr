@@ -63,7 +63,6 @@ pub mod il_exporter;
 /// IR iterator
 pub mod iter;
 /// Exports IR to JVM bytecode
-pub mod java_exporter;
 pub mod macros;
 /// IR functions
 pub mod method;
