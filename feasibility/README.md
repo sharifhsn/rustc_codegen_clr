@@ -4,12 +4,22 @@ A reproducible development environment for building and exercising `rustc_codege
 New users should start with the installed native flow in [`../QUICKSTART.md`](../QUICKSTART.md);
 this directory owns the Docker/CI compatibility harness and lower-level backend iteration tools.
 
-The contributor image contains .NET 8/9/10 compatibility runtimes on Linux; the public SDK supports
-.NET 10 only. It keeps CI and fallback
-exporter testing independent of the host while the installed `cargo dotnet` native path is also
-supported on macOS. Windows remains opt-in while its wider packaging surface is finished.
+The public SDK and this release-readiness matrix target .NET 10. The installed `cargo dotnet`
+native path is supported on macOS and Windows remains opt-in while its wider packaging surface is
+finished.
 
 ## Quick start
+
+For the current public surface, run the one-command matrix after building the workspace:
+
+```bash
+DOTNET_VERSION=10 feasibility/primetime_acceptance.sh
+# Add a Unity editor/player path to include the Unity gate:
+DOTNET_VERSION=10 UNITY_BIN=/path/to/Unity feasibility/primetime_acceptance.sh
+```
+
+Use `feasibility/primetime_acceptance.sh --list` to print the selected gates without running them.
+The individual scripts below remain useful for focused diagnosis.
 
 ```bash
 # build cilly + the codegen backend (this is the "compiles on latest nightly?" check)
@@ -36,7 +46,8 @@ PLATFORM=linux/amd64 feasibility/run.sh test
 
 | File | Purpose |
 |------|---------|
-| `Dockerfile` | Env only: pinned nightly + `rustc-dev`/`rust-src`, .NET 8/9/10, and native build prerequisites. Repo is mounted at runtime, not copied. |
+| `Dockerfile` | Env only: pinned nightly + `rustc-dev`/`rust-src`, and native build prerequisites. Repo is mounted at runtime, not copied. |
+| `primetime_acceptance.sh` | Current release-readiness entrypoint: Net10 managed/native matrix plus the three P/Invoke gates, with the Unity gate when `UNITY_BIN` is set. |
 | `run.sh` | Host driver: builds the image, runs a harness step with the repo mounted. |
 | `harness.sh` | In-container steps: `build` / `smoke` / `test` / `demo`. |
 | `onboarding_acceptance.sh` | Runs checkout setup into empty SDK/Cargo homes, proves a fresh shell discovers the installed `cargo dotnet`, then scaffolds and executes app/lib/plugin journeys outside the checkout. Also rejects a duplicate legacy `cargo install` during the one-build bootstrap. |
@@ -124,11 +135,9 @@ real `.dll` assembly + `.runtimeconfig.json` beside it; `il` disassembles that `
 and persist across runs for caching. The project's own test harness hardcodes `target/release`
 paths, which is why the build goes there (not a custom dir).
 
-`build` and `test` are the load-bearing commands: `build` is the "does it compile on this
-nightly?" check, and `test` runs the project's own `cargo test ::stable` suite (the real
-end-to-end runtime validation — it drives build-std + ilasm + dotnet itself). The `smoke`/`demo`
-helpers illustrate the raw backend invocation. For a standalone application, prefer the installed
-driver workflow in the root [`QUICKSTART.md`](../QUICKSTART.md).
+`build` and `test` are the load-bearing development commands. The `primetime_acceptance.sh` matrix
+is the current release-readiness entrypoint; `smoke`/`demo` remain raw backend examples. For a
+standalone application, prefer the installed driver workflow in the root [`QUICKSTART.md`](../QUICKSTART.md).
 
 ## The one-command DX (`cargo dotnet`)
 
@@ -230,16 +239,15 @@ native is purely additive. Verified end-to-end on **macOS arm64** (J1/J2/J3, zer
 Docker); a **Windows x64** path is opt-in. Full setup +
 known-unknowns: [docs/CARGO_DOTNET.md §2b](../docs/CARGO_DOTNET.md#2b-native-no-docker).
 The key native fact is that the .NET target is unchanged: CIL is architecture-agnostic and JITs on
-the selected .NET 8, 9, or 10 runtime. The direct-PE default needs no assembler; if you explicitly
-select the legacy IL path, use CoreCLR `ilasm`, not Mono.
+the selected .NET 10 runtime. The direct-PE writer is the only supported managed emitter and needs
+no assembler.
 
 ### Honesty / current limits
 
 - The in-repo **docker** backend (its default) needs the `rcc-dev` image
   (`feasibility/run.sh build`) and a running Docker. The **native** backend
   (`CARGO_DOTNET_BACKEND=native`) needs no Docker but requires the host toolchain,
-  a compatible .NET SDK, and the host-built backend dylib + linker. The direct-PE
-  default does not require `ilasm`. Native is verified on macOS arm64; Windows is
+  a compatible .NET 10 SDK, and the host-built backend dylib + linker. Native is verified on macOS arm64; Windows is
   opt-in. See [docs/CARGO_DOTNET.md §2b](../docs/CARGO_DOTNET.md#2b-native-no-docker).
 - **Exit codes:** build failures and the program's exit status propagate through
   `cargo dotnet`; `cargo_tests/pal_exit_code` permanently checks that
