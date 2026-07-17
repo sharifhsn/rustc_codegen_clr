@@ -216,8 +216,7 @@ cargo dotnet test ./crate
 The driver builds a private sysroot for the pinned nightly, invokes rustc with the codegen backend,
 and writes the managed PE, Portable PDB, runtime configuration, and an artifact identity receipt.
 The normal direct-PE path, including schema-1 projected assembly/type identity, does not require
-ILAsm. Set `DIRECT_PE=0` only when intentionally using the legacy IL exporter as a debugging escape
-hatch.
+external IL tools.
 
 ## Rust and C# interop
 

@@ -3,8 +3,7 @@
 [![CI](https://github.com/sharifhsn/rustc_codegen_clr/actions/workflows/fork-gate.yml/badge.svg)](https://github.com/sharifhsn/rustc_codegen_clr/actions/workflows/fork-gate.yml)
 [![Release](https://img.shields.io/github/v/release/sharifhsn/rustc_codegen_clr?include_prereleases)](https://github.com/sharifhsn/rustc_codegen_clr/releases)
 
-An experimental rustc codegen backend that compiles Rust to managed .NET assemblies. The same
-compiler IR can also emit C source.
+An experimental rustc codegen backend that compiles Rust to managed .NET assemblies.
 
 > [!WARNING]
 > This is compiler research, not a production toolchain. Crashes, unsupported APIs, and
@@ -83,7 +82,6 @@ result with ordinary Rust code.
   Windows workload build-and-launch evidence exists; mobile MAUI targets are not claimed
 - Evidence-gated host contracts visible through `cargo dotnet profiles`, with honest preview and
   unsupported Office/Unity/MAUI combinations
-- An alternate C exporter from the same compiler IR
 
 The public 0.0.1 SDK supports one deliberately narrow configuration:
 
@@ -107,8 +105,7 @@ CoreCLR tools, examples, and diagnostics consistent.
 
 - [`QUICKSTART.md`](QUICKSTART.md) — installation and first run
 - [`docs/CARGO_DOTNET.md`](docs/CARGO_DOTNET.md) — command reference and troubleshooting
-- [`docs/OFFICE_UNITY_MAUI_ERGONOMICS_EXECUTION_PLAN.md`](docs/OFFICE_UNITY_MAUI_ERGONOMICS_EXECUTION_PLAN.md)
-  — honest Office, Unity, and MAUI compatibility matrix and implementation ledger
+- [`book/src/office/excel.md`](book/src/office/excel.md) — Excel-DNA preview workflow
 - [`docs/UNITY_RUST_STRATEGY.md`](docs/UNITY_RUST_STRATEGY.md) — phased architecture and evidence
   plan for Rust-first Unity games with managed Rust and optional native Rust kernels
 - [`docs/QUICKSTART_INTEROP.md`](docs/QUICKSTART_INTEROP.md) — Rust and C# interop examples

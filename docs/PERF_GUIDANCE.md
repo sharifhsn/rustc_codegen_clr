@@ -103,7 +103,7 @@ gaps.
 
 > Caveat: the lib build needs a *current* installed toolchain — re-run `cargo dotnet setup` if
 > `~/.cargo-dotnet` predates a backend change (a stale install builds with the old linker/dylib; the
-> il_exporter + optimizer run in BOTH the backend dylib and the linker, so refresh both).
+> the optimizer runs in BOTH the backend dylib and the linker, so refresh both).
 
 ### Const data under AOT (the bug that hid here)
 

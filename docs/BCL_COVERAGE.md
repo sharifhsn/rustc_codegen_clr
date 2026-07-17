@@ -1,6 +1,6 @@
 # BCL coverage matrix — what `mycorrhiza` wraps idiomatically vs raw vs not-yet
 
-*(Theme 6 / ERGONOMICS_ROADMAP.md.) A single-glance map of which .NET Base Class Library types,
+This is a single-glance map of which .NET Base Class Library types,
 collections, and interop features have an **idiomatic** `mycorrhiza` wrapper (used like `std` — no
 CLR-interop knowledge at the call site), which are reachable only through the **raw generated
 bindings** / low-level intrinsics, and which are **not yet supported** (with the reason — almost

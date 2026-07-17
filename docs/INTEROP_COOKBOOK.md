@@ -6,7 +6,7 @@ the checks in those crates all pass. Where a task is only *partially* covered, t
 shows the honest path that works rather than a nicer one that doesn't.
 
 > New here? Start with [QUICKSTART_INTEROP.md](QUICKSTART_INTEROP.md) (the two-direction overview) and
-> [ERGONOMICS_HANDOFF.md](ERGONOMICS_HANDOFF.md) (build/verify recipe). For the C#-consumes-Rust wiring
+> [CARGO_DOTNET.md](CARGO_DOTNET.md) (build/verify recipe). For the C#-consumes-Rust wiring
 > details see [INTEROP_CSHARP.md](INTEROP_CSHARP.md).
 
 ## Conventions used below
@@ -1681,6 +1681,4 @@ These are honest gaps as of this writing — the natural next recipes, but not y
   the disposable low-copy `RustVec<T>` C# wrapper are preferable to an array copy.
 
 For the capability map and the genuine ceilings, see
-[TRANSLATION_STATUS.md](TRANSLATION_STATUS.md) and [STATE_OF_THE_PROJECT.md](STATE_OF_THE_PROJECT.md)
-(the authoritative dated snapshot); for the DX backlog,
-[MYCORRHIZA_ERGONOMICS_BACKLOG.md](MYCORRHIZA_ERGONOMICS_BACKLOG.md).
+[TRANSLATION_STATUS.md](TRANSLATION_STATUS.md) and [STATE_OF_THE_PROJECT.md](STATE_OF_THE_PROJECT.md).

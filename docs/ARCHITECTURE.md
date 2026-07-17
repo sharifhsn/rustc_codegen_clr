@@ -15,15 +15,12 @@ code disagree, the **code wins** — the project moves fast and some articles pr
 
 - This is a **rustc codegen backend plugin** loaded via `-Z codegen-backend=librustc_codegen_clr.so`.
   rustc hands it **MIR** (mid-level IR); the backend translates MIR → **CIL** (Common Intermediate
-  Language, the stack-based IR that .NET/CoreCLR and Mono execute) or, in `C_MODE`, → C source. *(v0.0.1, v0.1.0)*
+  Language, the stack-based IR that .NET/CoreCLR and Mono execute). *(v0.0.1, v0.1.0)*
 - To the .NET runtime, compiled Rust looks like **unsafe C#** — it can call .NET APIs and hold
   managed objects. The end goal is near-seamless Rust ↔ C#/F# interop (see the `mycorrhiza` crate
   and the WIP `dotnet_typedef!` macro for defining .NET classes in Rust). *(v0.2.0, v0.2.1)*
-- The IR (`cilly`) is deliberately **backend-agnostic**: the same IR is lowered to .NET CIL, C, and
-  (experimentally) JVM/JS. This is why C support cost only ~1–2K LOC — "pretend C is a very weird
-  .NET runtime." *(v0.1.2)* See the exporters under `cilly/src/ir/{pe_exporter,il_exporter,c_exporter,java_exporter}`.
-  For .NET output the linker's **default** path is the hand-rolled `pe_exporter` (writes a PE directly,
-  no external tools); `il_exporter` (ilasm-based) is only the `DIRECT_PE=0` fallback. *(see docs/PE_EMISSION_PLAN.md)*
+- The IR (`cilly`) is deliberately backend-agnostic: the same interned representation feeds
+  the optimizer, verifier, and direct PE emitter.
 
 ## 2. Two guiding principles (these explain most of the code's shape)
 
@@ -66,8 +63,7 @@ code disagree, the **code wins** — the project moves fast and some articles pr
 
 Set via `-C linker=` (binary in `cilly/src/bin/linker/`). It loads the serialized assemblies from
 rlibs, merges them, patches in libc / intrinsic implementations, and emits the final .NET executable
-(`pe_exporter`, the default, or `il_exporter`+ilasm under `DIRECT_PE=0`) or C output (AOT path in
-`aot.rs`). Things that live here rather than in the compiler:
+through the direct PE emitter. Things that live here rather than in the compiler:
 
 - **Cross-crate dead-code elimination** (a copying-GC-style reachability pass) — rustc's frontend DCE
   can't see across crates and must keep all public `std` functions. DCE roughly halved assembly size;
@@ -162,6 +158,6 @@ rlibs, merges them, patches in libc / intrinsic implementations, and emits the f
 `TyCache`; `subst` + `DefID`, `Gn` (generics by index); `FnSig` vs `FnAbi`; `_tag`/`v_<Variant>`/`m_<n>`
 (enum layout); `DATA_PTR`/`METADATA`/`ENUM_TAG`; `TyKind::Foreign` (thin-ptr unsized); ZST / `Type::Void`;
 `RustModule` + `.cctor`; `leave` / cleanup-block duplication; `MAX_BASIC_BLOCKS` (JIT inline limit);
-`IlasmFlavour`; serialized artifact ABI settings `NO_UNWIND`, `DOTNET_VERSION`; linker-local output
-and policy settings `C_MODE`, `JAVA_MODE`, `NATIVE_PASSTHROUGH`; diagnostic controls
+serialized artifact ABI settings `NO_UNWIND`, `DOTNET_VERSION`; linker-local output
+and policy settings; diagnostic controls
 `OPTIMIZE_CIL`, `OPT_FUEL`, `ASCII_IDENTS`.

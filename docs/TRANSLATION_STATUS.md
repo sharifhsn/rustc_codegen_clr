@@ -196,8 +196,7 @@ and — under the `target-family=["unix"]` flip plus a **libc/POSIX shim** (fd-t
 + ~20 bare-C-ABI POSIX symbols backed by the existing BCL hooks) — **full `std::os::unix`** (AF_UNIX,
 `MetadataExt`, symlinks, pread/pwrite, the fd onion). `std` runs on .NET with **no surrogate**; the
 remaining host-libc `LIBC_FNS` entries are unreachable on the dotnet target. The detailed libc map is
-[docs/LIBC_SHIM_SCOPE.md](LIBC_SHIM_SCOPE.md); the os::unix plan + leaky-bits ledger is
-[docs/STD_OS_UNIX_PLAN.md](STD_OS_UNIX_PLAN.md).
+Platform-specific edges are tracked by the runtime and acceptance tests.
 
 **Dead/WIP:** comptime interpreter, AOT (`aot.rs`/`native_passtrough.rs`: `#![allow(dead_code)]`, zero
 callers), softfloat ("Sample code", unused).
