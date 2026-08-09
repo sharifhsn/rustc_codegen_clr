@@ -25,7 +25,6 @@ mod opt_node;
 mod root;
 mod scalarize;
 mod side_effect;
-mod simplify_handlers;
 mod test;
 pub fn opt_if_fuel<T>(new: T, original: T, fuel: &mut OptFuel) -> T {
     if fuel.consume(1) { new } else { original }
@@ -835,10 +834,6 @@ impl MethodDef {
             if let Some(block) = linearize_blocks(blocks, asm) {
                 *blocks = vec![block];
             }
-            // Better, not yet done OPT.
-            // linearilze_best_span(blocks, asm);
-            // Linear, so supports some additional opts.
-            if blocks.len() == 1 {}
         }
 
         self.remove_useless_handlers(asm, fuel, cache);
@@ -958,18 +953,20 @@ impl MethodDef {
             return;
         }
 
-        // TODO: this is a hack, which makes root inlining optimizations not consume fuel.
-        let fuel = std::sync::Mutex::new(&mut *fuel);
+        // Root and node callbacks execute synchronously on this method. `RefCell` is only needed
+        // because the mapping API stores both closures at once; no optimizer state is shared
+        // across threads here.
+        let fuel = std::cell::RefCell::new(&mut *fuel);
         let locals = self.locals().map(|locs| locs.to_vec()).unwrap();
         let mut cache2 = EffectInfoCache::default();
         self.map_roots(
             asm,
             &mut |root, asm| {
-                let mut root_fuel = fuel.lock().unwrap();
+                let mut root_fuel = fuel.borrow_mut();
                 root_opt(root, asm, &mut root_fuel, cache, &locals, sig)
             },
             &mut |node, asm| {
-                let mut fuel = fuel.lock().unwrap();
+                let mut fuel = fuel.borrow_mut();
                 opt_node::opt_node(node, asm, *fuel, &mut cache2)
             },
         );
@@ -1107,24 +1104,4 @@ fn linearize_blocks(blocks: &[BasicBlock], asm: &Assembly) -> Option<BasicBlock>
         }
     }
     Some(BasicBlock::new(res, blocks[0].block_id(), None))
-}
-// Disabled block-linearization optimization; its only call site (~line 699) is commented out.
-#[allow(dead_code)]
-fn linearilze_best_span(blocks: &mut [BasicBlock], asm: &Assembly) {
-    let mut best_score = 1;
-    let mut best_span_start = 0;
-    let mut best_block = None;
-    for s in 0..(blocks.len()) {
-        for e in (s + best_score)..(blocks.len()) {
-            let score = e - s;
-            let Some(block) = linearize_blocks(&blocks[s..=e], asm) else {
-                continue;
-            };
-            best_block = Some(block);
-            best_score = score;
-            best_span_start = s;
-        }
-    }
-    let Some(best_block) = best_block else { return };
-    blocks[best_span_start] = best_block;
 }

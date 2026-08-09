@@ -1032,6 +1032,39 @@ impl MethodDef {
     }
 }
 pub type LocalDef = (Option<Interned<IString>>, Interned<Type>);
+
+struct LocalReallocator<'a> {
+    source: &'a [LocalDef],
+    remapped: Vec<LocalDef>,
+    indices: FxHashMap<u32, u32>,
+}
+
+impl<'a> LocalReallocator<'a> {
+    fn new(source: &'a [LocalDef]) -> Self {
+        Self {
+            source,
+            remapped: Vec::new(),
+            indices: FxHashMap::default(),
+        }
+    }
+
+    fn local(&mut self, old: u32) -> u32 {
+        match self.indices.entry(old) {
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let new = u32::try_from(self.remapped.len()).expect("local index exceeded u32");
+                self.remapped.push(
+                    *self
+                        .source
+                        .get(old as usize)
+                        .expect("CIL references an undeclared local"),
+                );
+                *entry.insert(new)
+            }
+        }
+    }
+}
+
 /// A method-scope catch-all unwind association. `protected` identifies a normal CFG block and
 /// `handler_entry` identifies the entry block in `MethodImpl::RegionBody::cleanup_blocks`.
 ///
@@ -1626,8 +1659,11 @@ impl MethodImpl {
         let Some((blocks, mut cleanup_blocks, locals)) = self.body_parts_mut() else {
             return;
         };
-        let mut new_locals = std::sync::Mutex::new(Vec::new());
-        let local_map = std::sync::Mutex::new(FxHashMap::default());
+        // `BasicBlock::map_roots` accepts separate root/node closures even though traversal is
+        // strictly local and single-threaded. Keep their shared state in one explicit local owner;
+        // `RefCell` supplies only the closure-aliasing needed by that API, without a synchronization
+        // primitive or any implication that this method is mapped in parallel.
+        let reallocator = std::cell::RefCell::new(LocalReallocator::new(locals));
         for block in blocks.iter_mut().chain(
             cleanup_blocks
                 .as_deref_mut()
@@ -1637,49 +1673,20 @@ impl MethodImpl {
             block.map_roots(
                 asm,
                 &mut |root, _| match root {
-                    CILRoot::StLoc(loc, tree) => CILRoot::StLoc(
-                        match local_map.lock().unwrap().entry(loc) {
-                            std::collections::hash_map::Entry::Occupied(val) => *val.get(),
-                            std::collections::hash_map::Entry::Vacant(empty) => {
-                                let mut new_locals = new_locals.lock().unwrap();
-                                let new_idx = new_locals.len();
-                                new_locals.push(locals[loc as usize]);
-                                *empty.insert(new_idx as u32)
-                            }
-                        },
-                        tree,
-                    ),
+                    CILRoot::StLoc(loc, tree) => {
+                        CILRoot::StLoc(reallocator.borrow_mut().local(loc), tree)
+                    }
                     _ => root,
                 },
                 &mut |node, _| match node {
-                    CILNode::LdLoc(loc) => {
-                        CILNode::LdLoc(match local_map.lock().unwrap().entry(loc) {
-                            std::collections::hash_map::Entry::Occupied(val) => *val.get(),
-                            std::collections::hash_map::Entry::Vacant(empty) => {
-                                let mut new_locals = new_locals.lock().unwrap();
-                                let new_idx = new_locals.len();
-                                new_locals.push(locals[loc as usize]);
-                                *empty.insert(new_idx as u32)
-                            }
-                        })
-                    }
-                    CILNode::LdLocA(loc) => {
-                        CILNode::LdLocA(match local_map.lock().unwrap().entry(loc) {
-                            std::collections::hash_map::Entry::Occupied(val) => *val.get(),
-                            std::collections::hash_map::Entry::Vacant(empty) => {
-                                let mut new_locals = new_locals.lock().unwrap();
-                                let new_idx = new_locals.len();
-                                new_locals.push(locals[loc as usize]);
-                                *empty.insert(new_idx as u32)
-                            }
-                        })
-                    }
+                    CILNode::LdLoc(loc) => CILNode::LdLoc(reallocator.borrow_mut().local(loc)),
+                    CILNode::LdLocA(loc) => CILNode::LdLocA(reallocator.borrow_mut().local(loc)),
                     _ => node,
                 },
             );
         }
-        // Swap new and locals
-        std::mem::swap(locals, new_locals.get_mut().unwrap());
+        let remapped = reallocator.into_inner().remapped;
+        *locals = remapped;
 
         // First-use order above removes unused locals and collapses arbitrary source indices, but
         // independent rustc/codegen runs may still visit semantically independent stores in a

@@ -313,9 +313,9 @@ pub(crate) fn export_pe_with_source_link(
         };
 
     // --- Pass 1: a TypeDef row for every class def, in assembly iteration order. Signature
-    // encoding (reached from field/method population below) resolves a `ClassRef` to a TypeDef
-    // row via `MetadataBuilder::find_type_def`'s linear scan, which requires the owning class
-    // def's TypeDef row to already exist — see `tables.rs`'s `TypeDefOrRefResolver` impl doc
+    // encoding (reached from field/method population below) resolves a `ClassRef` through
+    // `MetadataBuilder`'s precomputed TypeDef-token index, which requires the owning class def's
+    // TypeDef row to already exist — see `tables.rs`'s `TypeDefOrRefResolver` impl doc
     // ("population walks class defs before any signature needs to resolve one"). Mirrors
     // `il_exporter::export_to_write`'s per-class loop (`.class … extends …`).
     //
@@ -330,8 +330,8 @@ pub(crate) fn export_pe_with_source_link(
     // position happens to land in, surfacing as `TypeLoadException: field '…' was not given an
     // explicit offset` or similar on a totally unrelated type). Pass 2/3 below re-stamp the
     // correct value via `set_type_def_field_list`/`set_type_def_method_list` immediately before
-    // adding each class's own rows — this map is what lets them find the right `TypeDef` token
-    // without a second `find_type_def` scan.
+    // adding each class's own rows — this map lets them retain the exact `ClassDefIdx` -> token
+    // association without repeating semantic name resolution.
     let mut type_def_token_of: std::collections::HashMap<crate::ir::class::ClassDefIdx, Token> =
         std::collections::HashMap::with_capacity(class_def_ids.len());
     for &class_def_id in &class_def_ids {
@@ -1473,6 +1473,90 @@ mod tests {
         );
         asm.new_method(entry_def);
         asm
+    }
+
+    fn build_repeated_field_lookup_assembly() -> Assembly {
+        let mut asm = Assembly::default();
+        let main = asm.main_module();
+        let holder_name = asm.alloc_string("Lookup.Holder");
+        let value_name = asm.alloc_string("value");
+        let value_type = Type::Int(crate::ir::Int::I32);
+        let holder = crate::ir::class::ClassDef::new(
+            holder_name,
+            true,
+            0,
+            None,
+            vec![(value_type, value_name, Some(0))],
+            vec![],
+            Access::Public,
+            std::num::NonZeroU32::new(4),
+            None,
+            true,
+        );
+        let holder = asm.class_def(holder).expect("unique lookup holder");
+        let holder_type = Type::ClassRef(holder.0);
+        let holder_local = asm.alloc_type(holder_type);
+        let field = asm.alloc_field(crate::ir::field::FieldDesc::new(
+            holder.0, value_name, value_type,
+        ));
+
+        let address = asm.alloc_node(CILNode::LdLocA(0));
+        let zero = asm.alloc_node(CILNode::Const(Box::new(Const::I32(0))));
+        let mut roots = vec![asm.alloc_root(CILRoot::SetField(Box::new((field, address, zero))))];
+        for _ in 0..64 {
+            let holder = asm.alloc_node(CILNode::LdLoc(0));
+            let value = asm.alloc_node(CILNode::LdField {
+                addr: holder,
+                field,
+            });
+            roots.push(asm.alloc_root(CILRoot::Pop(value)));
+        }
+        roots.push(asm.alloc_root(CILRoot::VoidRet));
+
+        let name = asm.alloc_string("touch_field_repeatedly");
+        let signature = asm.sig([], Type::Void);
+        asm.new_method(MethodDef::new(
+            Access::Public,
+            main,
+            name,
+            signature,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(roots, 0, None)],
+                locals: vec![(None, holder_local)],
+            },
+            vec![],
+        ));
+        asm
+    }
+
+    #[test]
+    fn cached_metadata_lookups_preserve_byte_identical_pe_and_pdb_output() {
+        let options = ExportOptions {
+            runtime: DotnetRuntime::Net10,
+            is_dll: true,
+            assembly_name: "cached_metadata_lookups".to_string(),
+            public_module_full_name: None,
+            module_name: "cached_metadata_lookups.dll".to_string(),
+            pdb_file_name: "cached_metadata_lookups.pdb".to_string(),
+        };
+        let mut left = build_repeated_field_lookup_assembly();
+        let mut right = build_repeated_field_lookup_assembly();
+        let (left_pe, left_pdb) = export_pe(&mut left, &options);
+        let (right_pe, right_pdb) = export_pe(&mut right, &options);
+
+        assert_eq!(
+            left_pe, right_pe,
+            "metadata caches must not reorder PE rows"
+        );
+        assert_eq!(
+            left_pdb, right_pdb,
+            "metadata caches must not reorder PDB rows"
+        );
+        assert!(
+            !left_pdb.is_empty(),
+            "the comparison must exercise PDB emission"
+        );
     }
 
     #[test]

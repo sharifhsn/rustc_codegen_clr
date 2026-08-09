@@ -370,13 +370,14 @@ struct GenericParamRow {
     name: u32,
 }
 
-/// Deferred `FieldRVA` bookkeeping: the row itself can't be built until the layout pass
-/// (`pe.rs`) hands back a real RVA for the queued blob, so `add_static_field` records enough to
-/// materialize it later via [`MetadataBuilder::set_field_rva`].
-struct PendingFieldRva {
-    /// Row index (1-based) into `field_rva` this pending entry will occupy once resolved.
-    row: usize,
-    field_token: Token,
+#[cfg(test)]
+#[derive(Default)]
+struct MetadataLookupCounts {
+    type_defs: std::cell::Cell<usize>,
+    assembly_refs: std::cell::Cell<usize>,
+    fields: std::cell::Cell<usize>,
+    params: std::cell::Cell<usize>,
+    field_rvas: std::cell::Cell<usize>,
 }
 
 /// Owns the four metadata heaps and every table row this backend populates. One instance per
@@ -419,8 +420,14 @@ pub struct MetadataBuilder {
     /// Interned `TypeRef` rows, keyed on (resolution_scope token bits, namespace, name) so
     /// repeated references to the same external type share one row.
     type_ref_cache: HashMap<(u32, Box<str>, Box<str>), Token>,
+    /// Defined types keyed by their final metadata namespace and shortened name. This is a
+    /// lookup-only index: table row order remains the deterministic insertion order above.
+    type_def_cache: HashMap<Box<str>, HashMap<Box<str>, Token>>,
     /// Interned `MemberRef` rows, keyed on (class token, name, signature blob offset).
     member_ref_cache: HashMap<(u32, Box<str>, u32), Token>,
+    /// The first `AssemblyRef` row for each normalized assembly name, matching the old linear
+    /// scan's first-match behavior even if a low-level caller explicitly inserts duplicates.
+    assembly_ref_cache: HashMap<Box<str>, Token>,
     /// Interned `ModuleRef` rows, keyed on the module (library) name.
     module_ref_cache: HashMap<Box<str>, Token>,
     /// Interned `StandAloneSig` rows, keyed on the signature blob offset (both `calli` sites and
@@ -440,9 +447,19 @@ pub struct MetadataBuilder {
     /// so [`TokenSink::method_token`] can look up an in-assembly method without a second table
     /// scan.
     method_def_cache: HashMap<MethodDefIdx, Token>,
+    /// `(owning TypeDef token bits, #Strings name offset)` -> the first matching Field row.
+    /// Field operands are common in method bodies, so resolving them must not scan TypeDef and
+    /// Field table runs for every instruction.
+    field_def_cache: HashMap<(u32, u32), Token>,
+    /// `(MethodDef token, Param.Sequence)` -> Param token for custom-attribute attachment.
+    method_param_cache: HashMap<(Token, u16), Token>,
 
-    /// Deferred `FieldRVA` rows awaiting a real RVA from the `pe` layout pass.
-    pending_field_rva: Vec<PendingFieldRva>,
+    /// Deferred `FieldRVA` rows awaiting a real RVA from the `pe` layout pass, keyed directly by
+    /// their Field token instead of scanning a pending vector once per laid-out blob.
+    pending_field_rva: HashMap<Token, usize>,
+
+    #[cfg(test)]
+    lookup_counts: MetadataLookupCounts,
 
     /// `EntryPointToken` (§II.25.3.3), set by [`MetadataBuilder::set_entry_point`].
     entry_point: Option<Token>,
@@ -572,6 +589,10 @@ impl MetadataBuilder {
             field_list: 1,
             method_list: 1,
         });
+        mb.type_def_cache
+            .entry(Box::from(""))
+            .or_default()
+            .insert(Box::from("<Module>"), Token::new(Token::TABLE_TYPE_DEF, 1));
         mb
     }
 
@@ -612,7 +633,11 @@ impl MetadataBuilder {
             hash_value: 0,
         });
         let rid = u32::try_from(self.assembly_ref.len()).unwrap();
-        Token::new(Token::TABLE_ASSEMBLY_REF, rid)
+        let token = Token::new(Token::TABLE_ASSEMBLY_REF, rid);
+        self.assembly_ref_cache
+            .entry(Box::from(name))
+            .or_insert(token);
+        token
     }
 
     /// Interns a `TypeRef` row (§II.22.38): a reference to a type defined in another module or
@@ -700,6 +725,11 @@ impl MetadataBuilder {
         });
         let rid = u32::try_from(self.type_def.len()).unwrap();
         let tok = Token::new(Token::TABLE_TYPE_DEF, rid);
+        self.type_def_cache
+            .entry(Box::from(namespace))
+            .or_default()
+            .entry(Box::from(name.as_ref()))
+            .or_insert(tok);
         self.current_type_def = Some(rid);
         if has_explicit_layout {
             self.class_layout.push(ClassLayoutRow {
@@ -738,6 +768,7 @@ impl MetadataBuilder {
         );
         let idx = usize::try_from(tok.rid()).unwrap() - 1;
         self.type_def[idx].field_list = u32::try_from(self.field.len() + 1).unwrap();
+        self.current_type_def = Some(tok.rid());
     }
 
     /// The `MethodDef`-table analogue of [`MetadataBuilder::set_type_def_field_list`] — re-stamps
@@ -803,6 +834,11 @@ impl MetadataBuilder {
         });
         let rid = u32::try_from(self.type_def.len()).unwrap();
         let tok = Token::new(Token::TABLE_TYPE_DEF, rid);
+        self.type_def_cache
+            .entry(Box::from(namespace))
+            .or_default()
+            .entry(Box::from(name.as_ref()))
+            .or_insert(tok);
         self.current_type_def = Some(rid);
         self.class_layout.push(ClassLayoutRow {
             packing_size: 1,
@@ -834,6 +870,17 @@ impl MetadataBuilder {
         self.blobs.intern(&blob)
     }
 
+    fn register_field_def(&mut self, name: u32, token: Token) {
+        let Some(owner) = self.current_type_def else {
+            // Low-level metadata-table unit tests may construct isolated Field rows. Real PE
+            // population always opens a TypeDef run first.
+            return;
+        };
+        self.field_def_cache
+            .entry((Token::new(Token::TABLE_TYPE_DEF, owner).0, name))
+            .or_insert(token);
+    }
+
     /// Adds an instance `Field` row (§II.22.15) to the most recently added `TypeDef`.
     /// `offset` mirrors `ClassDef::fields()`'s `Option<u32>` (`.field [N] …`) and populates a
     /// `FieldLayout` row (§II.22.16) when present.
@@ -858,6 +905,7 @@ impl MetadataBuilder {
         });
         let rid = u32::try_from(self.field.len()).unwrap();
         let tok = Token::new(Token::TABLE_FIELD, rid);
+        self.register_field_def(name_off, tok);
         if let Some(offset) = offset {
             self.field_layout
                 .push(FieldLayoutRow { offset, field: rid });
@@ -874,7 +922,9 @@ impl MetadataBuilder {
             name,
             signature: signature_blob,
         });
-        Token::new(Token::TABLE_FIELD, u32::try_from(self.field.len()).unwrap())
+        let token = Token::new(Token::TABLE_FIELD, u32::try_from(self.field.len()).unwrap());
+        self.register_field_def(name, token);
+        token
     }
 
     /// Adds a public static literal enum member and its metadata Constant row.
@@ -909,7 +959,9 @@ impl MetadataBuilder {
             parent: rid << 2, // HasConstant: Field tag = 0.
             value,
         });
-        Token::new(Token::TABLE_FIELD, rid)
+        let token = Token::new(Token::TABLE_FIELD, rid);
+        self.register_field_def(name, token);
+        token
     }
 
     /// Adds a `static` `Field` row. `rva_data` mirrors `il_exporter`'s FieldRVA statics (the
@@ -948,15 +1000,13 @@ impl MetadataBuilder {
         });
         let rid = u32::try_from(self.field.len()).unwrap();
         let tok = Token::new(Token::TABLE_FIELD, rid);
+        self.register_field_def(name_off, tok);
         if rva_data.is_some() {
-            // Placeholder row; `set_field_rva` overwrites `rva` once the layout pass runs.
-            // Recorded positionally via `pending_field_rva` so `serialize()` can assert every
-            // queued blob was eventually resolved.
+            // Placeholder row; `set_field_rva` overwrites `rva` once the layout pass runs. Keep
+            // its row index keyed by Field token so layout patches are constant-time.
             self.field_rva.push(FieldRvaRow { rva: 0, field: rid });
-            self.pending_field_rva.push(PendingFieldRva {
-                row: self.field_rva.len(),
-                field_token: tok,
-            });
+            let previous = self.pending_field_rva.insert(tok, self.field_rva.len() - 1);
+            debug_assert!(previous.is_none(), "duplicate pending FieldRVA token");
         }
         if is_thread_static {
             self.thread_static_attribute(tok);
@@ -1107,6 +1157,7 @@ impl MetadataBuilder {
                 });
                 let return_param =
                     Token::new(Token::TABLE_PARAM, u32::try_from(self.param.len()).unwrap());
+                self.method_param_cache.insert((tok, 0), return_param);
                 self.nullable_metadata_attribute(return_param, flag, false);
             }
         }
@@ -1125,11 +1176,11 @@ impl MetadataBuilder {
                 sequence,
                 name: name_off,
             });
+            let param = Token::new(Token::TABLE_PARAM, u32::try_from(self.param.len()).unwrap());
+            self.method_param_cache.insert((tok, sequence), param);
             if let Some(nullable_flag) =
                 nullability.and_then(|metadata| metadata.parameter_flags[i])
             {
-                let param =
-                    Token::new(Token::TABLE_PARAM, u32::try_from(self.param.len()).unwrap());
                 self.nullable_metadata_attribute(param, nullable_flag, false);
             }
         }
@@ -1709,34 +1760,34 @@ impl MetadataBuilder {
         parameter_attributes: &[Vec<crate::ir::class::CustomAttrDef>],
     ) {
         assert_eq!(method.table(), Token::TABLE_METHOD_DEF);
+        assert!(
+            usize::try_from(method.rid()).unwrap() <= self.method_def.len(),
+            "MethodDef token is outside the emitted table"
+        );
         for attribute in method_attributes {
             self.add_custom_attribute(asm, method, attribute);
         }
 
-        let method_row = &self.method_def[usize::try_from(method.rid() - 1).unwrap()];
-        let param_start = usize::try_from(method_row.param_list - 1).unwrap();
-        assert!(param_start <= self.param.len());
-
         let token_for_sequence = |this: &mut Self, sequence: u16| {
-            let existing = this.param[param_start..]
-                .iter()
-                .position(|row| row.sequence == sequence)
-                .map(|offset| param_start + offset);
-            let index = if let Some(index) = existing {
-                index
-            } else {
-                assert_eq!(
-                    sequence, 0,
-                    "argument Param rows must already exist when attributes are attached"
-                );
-                this.param.push(ParamRow {
-                    flags: 0,
-                    sequence: 0,
-                    name: 0,
-                });
-                this.param.len() - 1
-            };
-            Token::new(Token::TABLE_PARAM, u32::try_from(index + 1).unwrap())
+            #[cfg(test)]
+            this.lookup_counts
+                .params
+                .set(this.lookup_counts.params.get() + 1);
+            if let Some(&token) = this.method_param_cache.get(&(method, sequence)) {
+                return token;
+            }
+            assert_eq!(
+                sequence, 0,
+                "argument Param rows must already exist when attributes are attached"
+            );
+            this.param.push(ParamRow {
+                flags: 0,
+                sequence: 0,
+                name: 0,
+            });
+            let token = Token::new(Token::TABLE_PARAM, u32::try_from(this.param.len()).unwrap());
+            this.method_param_cache.insert((method, sequence), token);
+            token
         };
 
         if !return_attributes.is_empty() {
@@ -1783,6 +1834,7 @@ impl MetadataBuilder {
         self.find_or_create_assembly_ref("System.Runtime")
     }
 
+    #[cfg(test)]
     fn strings_eq(&self, off: u32, s: &str) -> bool {
         let bytes = self.strings.as_bytes();
         let start = off as usize;
@@ -1807,16 +1859,14 @@ impl MetadataBuilder {
     /// `.sdata`, and materializes the deferred `FieldRVA` row (§II.22.18) for `field` (added via
     /// [`MetadataBuilder::add_static_field`]'s `rva_data`).
     pub fn set_field_rva(&mut self, field: Token, rva: u32) {
-        let entry = self
-            .pending_field_rva
-            .iter()
-            .find(|p| p.field_token == field)
-            .unwrap_or_else(|| {
-                panic!(
-                    "no pending FieldRVA for {field:?} — was add_static_field called with rva_data?"
-                )
-            });
-        self.field_rva[entry.row - 1].rva = rva;
+        #[cfg(test)]
+        self.lookup_counts
+            .field_rvas
+            .set(self.lookup_counts.field_rvas.get() + 1);
+        let &row = self.pending_field_rva.get(&field).unwrap_or_else(|| {
+            panic!("no pending FieldRVA for {field:?} — was add_static_field called with rva_data?")
+        });
+        self.field_rva[row].rva = rva;
     }
 
     /// Populate → size → serialize (see module docs). Produces the complete BSJB metadata root
@@ -2946,6 +2996,10 @@ impl MetadataBuilder {
     /// namespace name 'cd_interop' could not be found`) even though it loads and runs fine at
     /// runtime (token-based resolution never notices the empty `Namespace`).
     pub(super) fn find_type_def(&self, raw_name: &str) -> Option<Token> {
+        #[cfg(test)]
+        self.lookup_counts
+            .type_defs
+            .set(self.lookup_counts.type_defs.get() + 1);
         let raw_name = if raw_name == crate::ir::asm::MAIN_MODULE {
             self.public_module_full_name.as_deref().unwrap_or(raw_name)
         } else {
@@ -2957,15 +3011,10 @@ impl MetadataBuilder {
         // disagreeing with `add_type_def` for any name near the 1023-char cutoff.
         let (namespace, name) = split_namespace(raw_name);
         let shortened = dotnet_class_name(name);
-        for (i, row) in self.type_def.iter().enumerate() {
-            if self.strings_eq(row.name, &shortened) && self.strings_eq(row.namespace, namespace) {
-                return Some(Token::new(
-                    Token::TABLE_TYPE_DEF,
-                    u32::try_from(i + 1).unwrap(),
-                ));
-            }
-        }
-        None
+        self.type_def_cache
+            .get(namespace)
+            .and_then(|names| names.get(shortened.as_ref()))
+            .copied()
     }
 
     /// Resolve implementation-only 128-bit integer signatures through the private local carrier
@@ -3000,10 +3049,12 @@ impl MetadataBuilder {
         } else {
             name
         };
-        for (i, row) in self.assembly_ref.iter().enumerate() {
-            if self.strings_eq(row.name, name) {
-                return Token::new(Token::TABLE_ASSEMBLY_REF, u32::try_from(i + 1).unwrap());
-            }
+        #[cfg(test)]
+        self.lookup_counts
+            .assembly_refs
+            .set(self.lookup_counts.assembly_refs.get() + 1);
+        if let Some(&token) = self.assembly_ref_cache.get(name) {
+            return token;
         }
         let target = if let (Some(token), true) = (bcl_public_key_token(name), self.is_lib) {
             // Same explicitly selected runtime as `system_runtime_assembly_ref`. Also gated on
@@ -3282,17 +3333,16 @@ impl TokenSink for MetadataBuilder {
 
     fn field_token(&mut self, asm: &mut Assembly, field: Interned<FieldDesc>) -> Token {
         let desc = asm[field];
+        let name = asm[desc.name()].to_string();
         let owner_in_asm = asm.class_ref_to_def(desc.owner()).is_some();
         if owner_in_asm {
-            let raw_name = asm[desc.owner()].name();
-            let raw_name = asm[raw_name].to_string();
-            let field_name = asm[desc.name()].to_string();
-            if let Some(tok) = self.find_field(&raw_name, &field_name) {
+            let owner = self.class_ref_token(asm, desc.owner());
+            let name_offset = self.strings.intern(&name);
+            if let Some(tok) = self.field_def_token(owner, name_offset) {
                 return tok;
             }
         }
         let class_tok = self.class_ref_token(asm, desc.owner());
-        let name = asm[desc.name()].to_string();
         let mut blob = Vec::new();
         sig::encode_field_sig(desc.tpe(), asm, self, &mut blob);
         let sig_off = self.blobs.intern(&blob);
@@ -3305,17 +3355,16 @@ impl TokenSink for MetadataBuilder {
         field: Interned<StaticFieldDesc>,
     ) -> Token {
         let desc = asm[field];
+        let name = asm[desc.name()].to_string();
         let owner_in_asm = asm.class_ref_to_def(desc.owner()).is_some();
         if owner_in_asm {
-            let raw_name = asm[desc.owner()].name();
-            let raw_name = asm[raw_name].to_string();
-            let field_name = asm[desc.name()].to_string();
-            if let Some(tok) = self.find_field(&raw_name, &field_name) {
+            let owner = self.class_ref_token(asm, desc.owner());
+            let name_offset = self.strings.intern(&name);
+            if let Some(tok) = self.field_def_token(owner, name_offset) {
                 return tok;
             }
         }
         let class_tok = self.class_ref_token(asm, desc.owner());
-        let name = asm[desc.name()].to_string();
         let mut blob = Vec::new();
         sig::encode_field_sig(desc.tpe(), asm, self, &mut blob);
         let sig_off = self.blobs.intern(&blob);
@@ -3372,31 +3421,12 @@ impl TokenSink for MetadataBuilder {
 }
 
 impl MetadataBuilder {
-    /// Finds a previously-added instance/static `Field` row owned by a `TypeDef` named
-    /// `owner_name` (the raw, un-shortened name — matched via [`dotnet_class_name`] exactly like
-    /// [`Self::find_type_def`]). This is a best-effort linear scan tying a `Field` row back to
-    /// its owning `TypeDef`'s field run (`FieldList`..next `TypeDef.FieldList`), used so repeat
-    /// lookups of the same in-assembly field return the already-added row instead of no row at
-    /// all (this writer never creates a `MemberRef` to its own `TypeDef`'s field).
-    fn find_field(&self, owner_name: &str, field_name: &str) -> Option<Token> {
-        let shortened_owner = dotnet_class_name(owner_name);
-        let type_idx = self
-            .type_def
-            .iter()
-            .position(|row| self.strings_eq(row.name, &shortened_owner))?;
-        let field_start = self.type_def[type_idx].field_list as usize; // 1-based
-        let field_end = self
-            .type_def
-            .get(type_idx + 1)
-            .map_or(self.field.len() + 1, |next| next.field_list as usize);
-        for rid in field_start..field_end {
-            if let Some(row) = self.field.get(rid - 1) {
-                if self.strings_eq(row.name, field_name) {
-                    return Some(Token::new(Token::TABLE_FIELD, u32::try_from(rid).unwrap()));
-                }
-            }
-        }
-        None
+    fn field_def_token(&self, owner: Token, name_offset: u32) -> Option<Token> {
+        #[cfg(test)]
+        self.lookup_counts
+            .fields
+            .set(self.lookup_counts.fields.get() + 1);
+        self.field_def_cache.get(&(owner.0, name_offset)).copied()
     }
 }
 
@@ -3422,6 +3452,97 @@ fn decode_type_def_or_ref(coded: u32) -> Token {
 mod tests {
     use super::*;
     use crate::ir::{Access, Float, Int, cilnode::MethodKind};
+
+    #[test]
+    fn metadata_hot_path_maps_use_one_abstract_lookup_per_query() {
+        const ROWS: usize = 128;
+        let mut builder = MetadataBuilder::new();
+
+        let mut type_rows = Vec::with_capacity(ROWS);
+        for index in 0..ROWS {
+            let name = format!("Type{index}");
+            let token = builder.add_type_def("Lookup", &name, false, None, None, None, &[]);
+            type_rows.push((format!("Lookup.{name}"), token));
+        }
+        builder.lookup_counts.type_defs.set(0);
+        for (name, expected) in &type_rows {
+            assert_eq!(builder.find_type_def(name), Some(*expected));
+        }
+        assert_eq!(builder.lookup_counts.type_defs.get(), ROWS);
+
+        let mut assembly_rows = Vec::with_capacity(ROWS);
+        for index in 0..ROWS {
+            let name = format!("Dependency{index}");
+            let token = builder.assembly_ref(&name, AssemblyRefTarget::NameOnly);
+            assembly_rows.push((name, token));
+        }
+        builder.lookup_counts.assembly_refs.set(0);
+        for (name, expected) in &assembly_rows {
+            assert_eq!(builder.find_or_create_assembly_ref(name), *expected);
+        }
+        assert_eq!(builder.lookup_counts.assembly_refs.get(), ROWS);
+
+        let mut field_rows = Vec::with_capacity(ROWS);
+        for (_, owner) in &type_rows {
+            builder.set_type_def_field_list(*owner);
+            let token = builder.add_field("value", 0, None);
+            field_rows.push((*owner, token));
+        }
+        let field_name = builder.strings.intern("value");
+        builder.lookup_counts.fields.set(0);
+        for (owner, expected) in &field_rows {
+            assert_eq!(builder.field_def_token(*owner, field_name), Some(*expected));
+        }
+        assert_eq!(builder.lookup_counts.fields.get(), ROWS);
+
+        let mut rva_fields = Vec::with_capacity(ROWS);
+        for index in 0..ROWS {
+            rva_fields.push(builder.add_static_field(
+                &format!("Rva{index}"),
+                0,
+                Some(vec![0]),
+                false,
+                false,
+            ));
+        }
+        builder.lookup_counts.field_rvas.set(0);
+        for (index, field) in rva_fields.into_iter().enumerate() {
+            builder.set_field_rva(field, u32::try_from(index + 1).unwrap());
+        }
+        assert_eq!(builder.lookup_counts.field_rvas.get(), ROWS);
+
+        let parameter_names: Vec<String> = (0..ROWS).map(|index| format!("arg{index}")).collect();
+        let parameter_names: Vec<Option<&str>> = parameter_names
+            .iter()
+            .map(|name| Some(name.as_str()))
+            .collect();
+        let method = builder.add_method(
+            "Attributed",
+            0,
+            &parameter_names,
+            &[],
+            true,
+            false,
+            false,
+            None,
+            false,
+            None,
+        );
+        let mut asm = Assembly::default();
+        let attr_name = asm.alloc_string("LookupAttribute");
+        let attr_assembly = asm.alloc_string("Lookup.Attributes");
+        let attr_type = asm.alloc_class_ref(ClassRef::new(
+            attr_name,
+            Some(attr_assembly),
+            false,
+            [].into(),
+        ));
+        let attribute = crate::ir::class::CustomAttrDef::new(attr_type, vec![], vec![]);
+        let parameter_attributes = vec![vec![attribute]; ROWS];
+        builder.lookup_counts.params.set(0);
+        builder.add_method_custom_attributes(&mut asm, method, &[], &[], &parameter_attributes);
+        assert_eq!(builder.lookup_counts.params.get(), ROWS);
+    }
 
     #[test]
     fn unity_framework_assembly_identities_match_netstandard_profile() {

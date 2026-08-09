@@ -26,7 +26,6 @@ use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
 };
-mod aot;
 
 fn effective_abi_config(
     artifact_config: Option<ArtifactAbiConfig>,
