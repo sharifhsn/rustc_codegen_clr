@@ -151,7 +151,8 @@ pub mod config;
 mod unsize;
 // rustc functions used here.
 use crate::{
-    assembly_transaction::assembly_transaction, codegen_error::panic_payload_msg,
+    assembly_transaction::{assembly_transaction, build_assembly_shard, commit_assembly_shard},
+    codegen_error::panic_payload_msg,
     fn_ctx::MethodCompileCtx,
 };
 use cilly::{
@@ -422,6 +423,7 @@ fn add_item_transactionally<'tcx>(
     tcx: TyCtxt<'tcx>,
     abort_on_error: bool,
 ) {
+    let is_global_asm = matches!(item, rustc_middle::mono::MonoItem::GlobalAsm(_));
     let item_name = match item {
         rustc_middle::mono::MonoItem::Fn(_) | rustc_middle::mono::MonoItem::Static(_) => {
             item.symbol_name(tcx).to_string()
@@ -430,21 +432,34 @@ fn add_item_transactionally<'tcx>(
     };
 
     if abort_on_error {
-        // Deliberately do not catch this branch: an uncaught panic must resume with its original
-        // payload after the uncommitted shard is dropped.
-        assembly_transaction(parent, |shard| assembly::add_item(shard, item, tcx))
+        // Deliberately catch neither phase in correctness mode. A build panic drops the isolated
+        // shard; a commit panic must stop codegen because `Assembly::link` consumes the old parent.
+        let ((), shard) = build_assembly_shard(|shard| assembly::add_item(shard, item, tcx))
             .unwrap_or_else(|error| panic!("Could not add item `{item_name}`: {error:?}"));
+        commit_assembly_shard(parent, shard);
         return;
     }
 
+    // Exploratory mode may recover from a panic while constructing an isolated item shard. Commit
+    // is intentionally outside this catch: catching a consuming-link panic would continue with an
+    // empty parent and silently erase all items previously committed in the current CGU.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        assembly_transaction(parent, |shard| assembly::add_item(shard, item, tcx))
+        build_assembly_shard(|shard| assembly::add_item(shard, item, tcx))
     }));
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => eprintln!(
-            "could not compile item `{item_name}`: {error:?}; discarded its assembly shard"
-        ),
+    let shard = match result {
+        Ok(Ok(((), shard))) => shard,
+        Ok(Err(error)) if is_global_asm => {
+            // A function can be replaced by an explicit throwing stub in exploratory mode. A
+            // discarded crate-level assembly item has no observable substitute, so continuing
+            // would falsely claim a successful compilation of a different program.
+            panic!("Could not add item `{item_name}`: {error:?}");
+        }
+        Ok(Err(error)) => {
+            eprintln!(
+                "could not compile item `{item_name}`: {error:?}; discarded its assembly shard"
+            );
+            return;
+        }
         Err(payload) => {
             if let Some(message) = panic_payload_msg(payload.as_ref()) {
                 eprintln!(
@@ -457,8 +472,10 @@ fn add_item_transactionally<'tcx>(
                      payload; discarded its assembly shard"
                 );
             }
+            return;
         }
-    }
+    };
+    commit_assembly_shard(parent, shard);
 }
 
 impl CodegenBackend for MyBackend {
@@ -663,10 +680,14 @@ impl CodegenBackend for MyBackend {
             );
             let mut prepared = asm.prepared();
             prepared.opt(&mut prepared.fuel_from_env());
-            // Phase P1 type gate: in fatal mode (ALLOW_MISCOMPILATIONS=0) this aborts the build on
-            // the first ill-typed method; in the default advisory mode it returns the violation
-            // count, which we intentionally drop here (per-method warnings are already emitted).
-            let _typecheck_violations = prepared.typecheck();
+            // The compiler must never serialize ill-typed CIL. `cilly`'s default fatal mode already
+            // panics on a violation; assert the returned advisory-mode count as well so setting the
+            // legacy `ALLOW_MISCOMPILATIONS=1` escape hatch cannot make rustc report false success.
+            let typecheck_violations = prepared.typecheck();
+            assert_eq!(
+                typecheck_violations, 0,
+                "refusing to serialize an assembly with CIL verifier violations"
+            );
             let artifact = AssemblyArtifact::new(prepared, self.config.artifact_abi().clone());
             asm_out
                 .write_all(

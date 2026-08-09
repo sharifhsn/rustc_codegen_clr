@@ -18,12 +18,14 @@ use crate::ManagedSafe;
 /// almost always already a `From` impl — grep `bindings.rs` for `impl From<` before reaching for the
 /// low-level intrinsic. Reserve `rustc_clr_interop_managed_checked_cast` for downcasts (checked
 /// `castclass`) or cross-hierarchy casts that have no generated `From` impl.
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct RustcCLRInteropManagedClass<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str>
 {
     size_hint: usize,
 }
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct RustcCLRInteropManagedStruct<
@@ -37,6 +39,7 @@ pub struct RustcCLRInteropManagedStruct<
 /// Reads a named field from a managed class or value type. The backend replaces this body with a
 /// typed `ldfld`; the declaration exists only to carry the owner identity, field name, and Rust
 /// return type through MIR.
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_get_field<
@@ -223,11 +226,13 @@ impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str>
     }
 }
 
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct RustcCLRInteropManagedChar {
     utf16_char: u16,
 }
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct RustcCLRInteropManagedArray<T, const DIMENSIONS: usize> {
@@ -246,16 +251,15 @@ pub type ManagedArray<T> = RustcCLRInteropManagedArray<T, 1>;
 /// Every member of the `rustc_clr_interop_managed_call*` / `_call_virt*` / `_ctor*` and WF-9
 /// `rustc_clr_interop_generic_call*` / `_generic_ctor*` families is the same shape: a `pub fn` whose
 /// body is `core::intrinsics::abort();` and which differs *only* by how many `ArgN` type params /
-/// `argN` value params it declares. They are never actually run — the codegen backend recognizes them
-/// by *name* (see `is_magic_fn` / the call-site dispatch in `src/terminator/call.rs`) and lowers
-/// the call directly to a managed `call`/`callvirt`/`newobj`/etc.
+/// `argN` value params it declares. They are never actually run — the codegen backend recognizes
+/// their defining crate/module, exact private marker, and exact identifier together, then lowers the
+/// call directly to a managed `call`/`callvirt`/`newobj`/etc.
 ///
-/// **The function name is load-bearing and must be byte-identical.** The backend matches on name
-/// substrings (`rustc_clr_interop_managed_call`, …) and parses the arity digit + the trailing `_`
-/// (`argc_from_fn_name`). So each invocation spells the *literal* `ident` name — including the arity
-/// digit and any trailing underscore — rather than building it from `concat!`/`paste!`; the macro only
-/// factors out the repeated `#[allow]/#[inline(never)]` attributes, the common generic-param prefix,
-/// and the `arg`-ladder body.
+/// **The function name is load-bearing and must be byte-identical.** Classification uses exact
+/// identifiers; after classification, the call decoder parses the arity digit + trailing `_`
+/// (`argc_from_fn_name`). So each invocation spells the literal `ident` — including the arity digit
+/// and any trailing underscore — rather than building it from `concat!`/`paste!`; the macro only
+/// factors out the repeated marker/attributes, common generic-param prefix, and argument ladder.
 macro_rules! interop_magic_fn {
     (
         $name:ident
@@ -263,6 +267,7 @@ macro_rules! interop_magic_fn {
         ( $($arg:ident : $argty:ident),* $(,)? )
         -> $ret:ty
     ) => {
+        #[doc = "__rustc_codegen_clr_intrinsic_v1"]
         #[allow(unused_variables)]
         #[inline(never)]
         pub fn $name< $($prefix)* $(, $argty)* >( $($arg : $argty),* ) -> $ret {
@@ -277,6 +282,7 @@ interop_magic_fn! {
     [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, const METHOD: &'static str, Ret]
     () -> Ret
 }
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_ld_len<T>(arr: RustcCLRInteropManagedArray<T, 1>) -> i32 {
@@ -284,12 +290,14 @@ pub fn rustc_clr_interop_managed_ld_len<T>(arr: RustcCLRInteropManagedArray<T, 1
 }
 /// Allocates a new managed (.NET) 1-D array of `T` with `len` elements (`newarr`). The element type
 /// `T` must be a primitive that maps to a .NET primitive (e.g. `i32`/`i64`/`f64`).
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_new_arr<T>(len: i32) -> RustcCLRInteropManagedArray<T, 1> {
     core::intrinsics::abort();
 }
 /// Stores `val` into the managed array `arr` at `idx` (`stelem`).
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_set_elem<T>(
@@ -301,6 +309,7 @@ pub fn rustc_clr_interop_managed_set_elem<T>(
 }
 /// Loads `arr[idx]` as `T` (`ldelem T`). Unlike `ldelem.ref`, this supports primitive and managed
 /// value-type arrays without pretending their elements are object references.
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_get_elem<T>(
@@ -309,6 +318,7 @@ pub fn rustc_clr_interop_managed_get_elem<T>(
 ) -> T {
     core::intrinsics::abort()
 }
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_ld_elem_ref<
@@ -367,6 +377,7 @@ interop_magic_fn! {
     [const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const IS_VALUETYPE: bool, Ret]
     () -> Ret
 }
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_ld_null<T>() -> T {
@@ -374,6 +385,7 @@ pub fn rustc_clr_interop_managed_ld_null<T>() -> T {
 }
 /// Returns whether a managed reference is null. The backend emits a direct reference comparison;
 /// no type-specific `op_Equality` member is required.
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_is_null<T>(value: T) -> bool {
@@ -382,6 +394,7 @@ pub fn rustc_clr_interop_managed_is_null<T>(value: T) -> bool {
 /// Raises a managed `System.Exception(MSG)` directly (a `throw` IL op), so a .NET caller can `catch`
 /// it. This is the C#-catchable error direction — unlike a Rust `panic!`, which goes through the
 /// unwinder and does not propagate cleanly out to a managed frame.
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_throw<const MSG: &'static str>() -> ! {
@@ -395,11 +408,13 @@ pub fn rustc_clr_interop_throw<const MSG: &'static str>() -> ! {
 /// `src.into()` instead, it's the same cast with no turbofish required. See the type-identity note
 /// on [`RustcCLRInteropManagedClass`] for when two differently-named handle types need no cast at
 /// all. Reach for this function directly only for downcasts or hierarchy jumps with no `From` impl.
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_checked_cast<DST, SRC>(src: SRC) -> DST {
     core::intrinsics::abort();
 }
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_is_inst<DST, SRC>(src: SRC) -> bool {
@@ -408,6 +423,7 @@ pub fn rustc_clr_interop_managed_is_inst<DST, SRC>(src: SRC) -> bool {
 /// Boxes the value-type `val` into a managed `System.Object` (the .NET `box <T>` instruction). `T`
 /// must be a value type (an integer/float/bool primitive or a value-type managed struct); boxing a
 /// reference type is rejected by the CIL typechecker.
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_box<T>(
@@ -460,6 +476,7 @@ impl From<u16> for RustcCLRInteropManagedChar {
 /// A handle to a managed object of a *generic* .NET instantiation, e.g. `List<i32>`.
 /// `ASSEMBLY`/`CLASS_PATH` name the open generic type and `ClassGenerics` is a tuple of the
 /// concrete .NET type arguments. Lowers to a `ClassRef` carrying those generics.
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[repr(C)]
 pub struct RustcCLRInteropManagedGeneric<
     const ASSEMBLY: &'static str,
@@ -494,6 +511,7 @@ impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, ClassGenerics
 /// `ASSEMBLY`/`CLASS_PATH` name the open generic value type, `SIZE` is its byte size (used only for
 /// Rust-side layout — the CLR knows the real size), and `ClassGenerics` is a tuple of the concrete
 /// .NET type arguments (e.g. `(JsonNodeOptions,)`).
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[repr(C)]
 pub struct RustcCLRInteropManagedGenericStruct<
     const ASSEMBLY: &'static str,
@@ -528,11 +546,13 @@ unsafe impl<
 }
 
 /// Method-definition-signature marker: lowers to the .NET *class* generic parameter `!N`.
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct RustcCLRInteropTypeGeneric<const N: usize>;
 
 /// Method-definition-signature marker: lowers to the .NET *method* generic parameter `!!N`.
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct RustcCLRInteropMethodGeneric<const N: usize>;
@@ -541,6 +561,7 @@ pub struct RustcCLRInteropMethodGeneric<const N: usize>;
 /// slot for a byref-returning member — e.g. `Span<T>.get_Item(int) -> ref T` is
 /// `RustcCLRInteropByRef<RustcCLRInteropTypeGeneric<0>>` (`!0&`). The matching runtime value is a raw
 /// pointer (`*mut Inner`), read/written through directly.
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct RustcCLRInteropByRef<Inner> {
@@ -662,6 +683,7 @@ interop_magic_fn! {
 /// managed-handle marker for that exact delegate: normally [`RustcCLRInteropManagedGeneric`], or a
 /// generated concrete handle for a non-generic delegate such as `System.EventHandler`. The backend
 /// returns the actual managed delegate reference, which can be passed to a .NET method or invoked.
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_delegate<
@@ -684,6 +706,7 @@ pub fn rustc_clr_interop_delegate<
 /// captured state rides along on the .NET side. Generic layout mirrors [`rustc_clr_interop_delegate`]
 /// with an extra `EnvTy` before the fn-ptr type; its `Ret` is the exact managed-delegate handle
 /// marker described there.
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_delegate_closure<

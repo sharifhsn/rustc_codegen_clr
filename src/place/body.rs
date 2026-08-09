@@ -7,7 +7,7 @@ use crate::r#type::{
     fat_ptr_to,
     utilis::ptr_is_fat,
 };
-use cilly::{BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, Type};
+use cilly::{BinOp, Const, FieldDesc, Int, Interned, Type};
 use rustc_middle::mir::{Local, PlaceElem};
 use rustc_middle::ty::{Ty, TyKind};
 pub fn local_body<'tcx>(
@@ -16,6 +16,17 @@ pub fn local_body<'tcx>(
 ) -> (Interned<cilly::ir::CILNode>, Ty<'tcx>) {
     let ty = ctx.body().local_decls[Local::from_usize(local)].ty;
     let ty = ctx.monomorphize(ty);
+    // A storage-less local has no CLR slot whose address can carry its Rust provenance. Use the
+    // same correctly aligned dangling base as `place_address` does for the unprojected local; any
+    // following ZST field/index projection then preserves or layout-adjusts that container base.
+    // This is especially important for `[Zst; N]`: every element address equals the array base.
+    let layout = ctx.layout_of(ty);
+    if layout.is_zst() {
+        let align = layout.align.abi.bytes();
+        let lowered_ty = ctx.type_from_cache(ty);
+        let base = ctx.alloc_node(Const::USize(align));
+        return (ctx.cast_ptr(base, lowered_ty), ty);
+    }
     if body_ty_is_by_address(ty, ctx) {
         (super::address::local_address(local, ctx.body(), ctx), ty)
     } else {
@@ -138,6 +149,13 @@ fn body_field<'a>(
         }
         super::PlaceTy::EnumVariant(enm, var_idx) => {
             let owner = ctx.monomorphize(enm);
+            let field_type = ctx.monomorphize(field_ty);
+            if ctx.type_from_cache(field_type) == Type::Void {
+                let addr = super::projected_variant_field_address(
+                    owner, field_type, field_idx, var_idx, node, ctx,
+                );
+                return (field_ty.into(), addr);
+            }
             let field_desc = variant_field_desc(owner, field_idx, var_idx, ctx);
             (field_ty.into(), ctx.ld_field_addr(node, field_desc))
         }
@@ -160,17 +178,8 @@ pub fn place_elem_body_index<'tcx>(
                 ctx.alloc_string(cilly::DATA_PTR),
                 ctx.nptr(Type::Void),
             );
-            let size = ctx.size_of(inner_type);
-            let size = size.into_idx(ctx);
-            let size = ctx.alloc_node(cilly::CILNode::IntCast {
-                input: size,
-                target: Int::USize,
-                extend: cilly::cilnode::ExtendKind::ZeroExtend,
-            });
-            let offset = ctx.biop(index, size, cilly::BinOp::Mul);
             let addr = ctx.ld_field(node, desc);
-            let addr = ctx.cast_ptr(addr, inner_type);
-            let addr = ctx.biop(addr, offset, BinOp::Add);
+            let addr = super::indexed_element_address(addr, index, inner_type, ctx);
 
             if body_ty_is_by_address(inner, ctx) {
                 (inner.into(), addr)
@@ -188,8 +197,7 @@ pub fn place_elem_body_index<'tcx>(
                 extend: cilly::cilnode::ExtendKind::ZeroExtend,
             });
             let element_tpe = ctx.type_from_cache(*element);
-            let node = ctx.cast_ptr(node, element_tpe);
-            let addr = ctx.offset(node, index, element_tpe);
+            let addr = super::indexed_element_address(node, index, element_tpe, ctx);
             if body_ty_is_by_address(*element, ctx) {
                 ((*element).into(), addr)
             } else {
@@ -279,8 +287,7 @@ pub fn place_elem_body<'tcx>(
                     };
 
                     let addr = ctx.ld_field(node, desc);
-                    let addr = ctx.cast_ptr(addr, inner_type);
-                    let addr = ctx.offset(addr, index, inner_type);
+                    let addr = super::indexed_element_address(addr, index, inner_type, ctx);
 
                     if body_ty_is_by_address(inner, ctx) {
                         (inner.into(), addr)
@@ -297,22 +304,11 @@ pub fn place_elem_body<'tcx>(
                     assert!(!from_end, "Can't index array from end!");
                     let index = ctx.alloc_node(Const::USize(*offset));
                     let element_tpe = ctx.type_from_cache(*element);
+                    let addr = super::indexed_element_address(node, index, element_tpe, ctx);
                     if body_ty_is_by_address(*element, ctx) {
-                        let node = ctx.cast_ptr(node, element_tpe);
-                        let addr = ctx.offset(node, index, element_tpe);
-                        if body_ty_is_by_address(*element, ctx) {
-                            ((*element).into(), addr)
-                        } else {
-                            ((*element).into(), ctx.load(addr, element_tpe))
-                        }
+                        ((*element).into(), addr)
                     } else {
-                        let node = ctx.cast_ptr(node, element_tpe);
-                        let addr = ctx.offset(node, index, element_tpe);
-                        if body_ty_is_by_address(*element, ctx) {
-                            ((*element).into(), addr)
-                        } else {
-                            ((*element).into(), ctx.load(addr, element_tpe))
-                        }
+                        ((*element).into(), ctx.load(addr, element_tpe))
                     }
                 }
                 _ => {

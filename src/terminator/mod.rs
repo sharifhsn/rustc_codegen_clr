@@ -1,8 +1,9 @@
 use crate::assembly::MethodCompileCtx;
 use cilly::{
-    BinOp, BranchCond, CILNode, CILRoot, ClassRef, Const, FieldDesc, Float, FnSig, Int, Interned,
-    MethodRef, Type,
+    Access, BasicBlock as CILBasicBlock, BinOp, BranchCond, CILNode, CILRoot, ClassRef, Const,
+    FieldDesc, Float, FnSig, Int, Interned, MethodDef, MethodImpl, MethodRef, Type,
     cilnode::{IsPure, MethodKind},
+    tpe::GenericKind,
     tpe::simd::SIMDVector,
 };
 
@@ -153,13 +154,21 @@ fn call_panic_lang_item<'tcx>(
     let signature = call_info.sig().clone();
     let name = fn_name(ctx.tcx().symbol_name(instance));
     let mut call_args: Vec<Interned<CILNode>> = args.to_vec();
-    // The lang item is `#[track_caller]`: rustc appends an implicit `&core::panic::Location` param
-    // that the call site must supply (FnSig ≠ FnAbi). Supply the correct caller location — forwarded
-    // from our own implicit arg if we are track_caller, else materialized from `span`.
-    if call_args.len() < signature.inputs().len() {
-        let location = get_caller_location(ctx, source_info);
-        call_args.push(location);
+    // Ask the resolved instance rather than treating any arity mismatch as track_caller: another
+    // ABI adjustment must fail loudly instead of receiving a caller-location value by accident.
+    if instance.def.requires_caller_location(ctx.tcx()) {
+        assert_eq!(
+            call_args.len() + 1,
+            signature.inputs().len(),
+            "a track_caller panic lang item must add exactly one implicit caller-location slot"
+        );
+        call_args.push(get_caller_location(ctx, source_info));
     }
+    assert_eq!(
+        call_args.len(),
+        signature.inputs().len(),
+        "panic lang-item arguments do not match its ABI"
+    );
     let main = ctx.main_module();
     let site = MethodRef::new(
         *main,
@@ -213,6 +222,162 @@ fn normalized_asm_template(template: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CpuidTemplate {
+    /// A direct `cpuid` whose four architectural outputs use explicit registers.
+    Direct,
+    /// stdarch's RBX-preserving form, where this operand is the temporary carrying EBX.
+    RbxScratch(usize),
+}
+
+/// Recognize only CPUID itself and stdarch's exact RBX-preserving wrapper. In particular, the mere
+/// presence of a `cpuid` instruction inside arbitrary user assembly is not enough: surrounding
+/// instructions can change its inputs or outputs and must remain unsupported.
+fn cpuid_template(template: &[InlineAsmTemplatePiece]) -> Option<CpuidTemplate> {
+    let mut rendered = String::new();
+    for piece in template {
+        match piece {
+            InlineAsmTemplatePiece::String(text) => {
+                rendered.push_str(text);
+                rendered.push(' ');
+            }
+            InlineAsmTemplatePiece::Placeholder { operand_idx, .. } => {
+                rendered.push_str(&format!(" __operand_{operand_idx}__ "));
+            }
+        }
+    }
+    let rendered = normalized_asm_template(&rendered);
+    if rendered == "cpuid" {
+        return Some(CpuidTemplate::Direct);
+    }
+    for register in ["ebx", "rbx"] {
+        let Some(rest) = rendered.strip_prefix("mov __operand_") else {
+            continue;
+        };
+        let Some((operand, rest)) = rest.split_once("__") else {
+            continue;
+        };
+        let Ok(operand) = operand.parse::<usize>() else {
+            continue;
+        };
+        let expected = format!(", {register} cpuid xchg __operand_{operand}__ , {register}");
+        if rest.trim() == expected {
+            return Some(CpuidTemplate::RbxScratch(operand));
+        }
+    }
+    None
+}
+
+pub(crate) fn cpuid_result_class(ctx: &mut MethodCompileCtx<'_, '_>) -> Interned<ClassRef> {
+    let name = ctx.alloc_string("System.ValueTuple");
+    let assembly = Some(ctx.alloc_string("System.Private.CoreLib"));
+    ctx.alloc_class_ref(ClassRef::new(
+        name,
+        assembly,
+        true,
+        [Type::Int(Int::I32); 4].into(),
+    ))
+}
+
+/// One evaluation-once tuple local is reserved for every potentially recognized CPUID terminator.
+/// Operand validation happens later; reserving an unused local for a near miss is harmless and
+/// keeps local indices fixed before per-root verification begins.
+pub(crate) fn cpuid_scratch_local_count(body: &rustc_middle::mir::Body<'_>) -> usize {
+    body.basic_blocks
+        .iter()
+        .filter(|block| {
+            matches!(
+                block.terminator().kind,
+                TerminatorKind::InlineAsm { ref template, .. } if cpuid_template(template).is_some()
+            )
+        })
+        .count()
+}
+
+/// Returns a private helper that faithfully executes CPUID where the runtime supports x86
+/// intrinsics. On a non-x86 runtime `X86Base.IsSupported` is false; only that branch returns zeros,
+/// avoiding `PlatformNotSupportedException` while preserving real x86 semantics everywhere else.
+fn cpuid_helper(ctx: &mut MethodCompileCtx<'_, '_>) -> Interned<MethodRef> {
+    let result_class = cpuid_result_class(ctx);
+    let result_type = Type::ClassRef(result_class);
+    let helper_sig = ctx.sig([Type::Int(Int::U32), Type::Int(Int::U32)], result_type);
+    let helper_name = ctx.alloc_string("__rustc_codegen_clr_cpuid");
+    let main_module = ctx.main_module();
+    let main_module_ref = *main_module;
+    let helper = ctx.alloc_methodref(MethodRef::new(
+        main_module_ref,
+        helper_name,
+        helper_sig,
+        MethodKind::Static,
+        [].into(),
+    ));
+    let corelib = Some(ctx.alloc_string("System.Private.CoreLib"));
+    let x86_base_name = ctx.alloc_string("System.Runtime.Intrinsics.X86.X86Base");
+    let x86_base = ctx.alloc_class_ref(ClassRef::new(x86_base_name, corelib, false, [].into()));
+    let is_supported_name = ctx.alloc_string("get_IsSupported");
+    let is_supported_sig = ctx.sig([], Type::Bool);
+    let is_supported = ctx.alloc_methodref(MethodRef::new(
+        x86_base,
+        is_supported_name,
+        is_supported_sig,
+        MethodKind::Static,
+        [].into(),
+    ));
+    let is_supported = ctx.alloc_node(CILNode::call(is_supported, []));
+    let supported_branch = ctx.alloc_root(CILRoot::Branch(Box::new((
+        1,
+        0,
+        Some(BranchCond::True(is_supported)),
+    ))));
+
+    let result_type_idx = ctx.alloc_type(result_type);
+    let result_address = ctx.alloc_node(CILNode::LdLocA(0));
+    let initialize_zero = ctx.init_obj(result_address, result_type_idx);
+    let zero_result = ctx.alloc_node(CILNode::LdLoc(0));
+    let return_zero = ctx.alloc_root(CILRoot::Ret(zero_result));
+
+    let leaf = ctx.alloc_node(CILNode::LdArg(0));
+    let leaf = crate::casts::int_to_int(Type::Int(Int::U32), Type::Int(Int::I32), leaf, ctx);
+    let subleaf = ctx.alloc_node(CILNode::LdArg(1));
+    let subleaf = crate::casts::int_to_int(Type::Int(Int::U32), Type::Int(Int::I32), subleaf, ctx);
+    let cpu_id_name = ctx.alloc_string("CpuId");
+    let cpu_id_sig = ctx.sig([Type::Int(Int::I32), Type::Int(Int::I32)], result_type);
+    let cpu_id = ctx.alloc_methodref(MethodRef::new(
+        x86_base,
+        cpu_id_name,
+        cpu_id_sig,
+        MethodKind::Static,
+        [].into(),
+    ));
+    let result = ctx.call(cpu_id, &[leaf, subleaf], IsPure::NOT);
+    let return_result = ctx.alloc_root(CILRoot::Ret(result));
+
+    let body = MethodImpl::MethodBody {
+        blocks: vec![
+            CILBasicBlock::new(
+                vec![supported_branch, initialize_zero, return_zero],
+                0,
+                None,
+            ),
+            CILBasicBlock::new(vec![return_result], 1, None),
+        ],
+        locals: vec![(Some(ctx.alloc_string("result")), result_type_idx)],
+    };
+    let leaf_name = ctx.alloc_string("leaf");
+    let subleaf_name = ctx.alloc_string("subleaf");
+    let helper_def = MethodDef::new(
+        Access::Private,
+        main_module,
+        helper_name,
+        helper_sig,
+        MethodKind::Static,
+        body,
+        vec![Some(leaf_name), Some(subleaf_name)],
+    );
+    ctx.new_method(helper_def);
+    helper
 }
 
 fn is_x86_locked_not_fence(template: &str) -> bool {
@@ -277,10 +442,55 @@ fn clr_owned_stack_probe_exit(
 #[cfg(test)]
 mod inline_asm_template_tests {
     use super::{
-        ClrOwnedStackProbeExit, X86PackedByteAsm, clr_owned_stack_probe_exit,
-        is_clr_owned_stack_probe, is_x86_locked_not_fence, normalized_asm_template,
+        ClrOwnedStackProbeExit, CpuidTemplate, X86PackedByteAsm, clr_owned_stack_probe_exit,
+        cpuid_template, is_clr_owned_stack_probe, is_x86_locked_not_fence, normalized_asm_template,
         x86_packed_byte_asm,
     };
+    use rustc_ast::InlineAsmTemplatePiece;
+    use rustc_span::DUMMY_SP;
+
+    fn asm_placeholder(operand_idx: usize) -> InlineAsmTemplatePiece {
+        InlineAsmTemplatePiece::Placeholder {
+            operand_idx,
+            modifier: None,
+            span: DUMMY_SP,
+        }
+    }
+
+    #[test]
+    fn cpuid_classifier_accepts_only_the_supported_exact_shapes() {
+        assert_eq!(
+            cpuid_template(&[InlineAsmTemplatePiece::String("cpuid".into())]),
+            Some(CpuidTemplate::Direct),
+        );
+
+        let stdarch_rbx_wrapper = [
+            InlineAsmTemplatePiece::String("mov ".into()),
+            asm_placeholder(3),
+            InlineAsmTemplatePiece::String(", rbx\ncpuid\nxchg ".into()),
+            asm_placeholder(3),
+            InlineAsmTemplatePiece::String(", rbx".into()),
+        ];
+        assert_eq!(
+            cpuid_template(&stdarch_rbx_wrapper),
+            Some(CpuidTemplate::RbxScratch(3)),
+        );
+    }
+
+    #[test]
+    fn cpuid_classifier_rejects_nearby_user_assembly() {
+        let extra_instruction = [InlineAsmTemplatePiece::String("xor eax, eax\ncpuid".into())];
+        assert_eq!(cpuid_template(&extra_instruction), None);
+
+        let mismatched_rbx_scratch = [
+            InlineAsmTemplatePiece::String("mov ".into()),
+            asm_placeholder(2),
+            InlineAsmTemplatePiece::String(", ebx\ncpuid\nxchg ".into()),
+            asm_placeholder(3),
+            InlineAsmTemplatePiece::String(", ebx".into()),
+        ];
+        assert_eq!(cpuid_template(&mismatched_rbx_scratch), None);
+    }
 
     #[test]
     fn locked_not_local_fence_is_recognized() {
@@ -405,33 +615,12 @@ fn lower_inline_asm<'tcx>(
     // By MIR contract `targets[0]` is the fall-through block.
     let after = goto(ctx, targets[0].as_u32());
 
-    // (A) CPUID — stdarch `__cpuid`/`__cpuid_count` (used by std `is_x86_feature_detected!`, the
-    // `cpufeatures` crate behind all RustCrypto x86 backends, and memchr's avx2 probe). The
-    // x86_64 template is ["mov {0:r}, rbx", "cpuid", "xchg {0:r}, rbx"]; the bare "cpuid" piece
-    // matches. Lowering: write 0 to every output operand. A cpuid that reports an all-zero result
-    // makes std_detect see no features (max_basic_leaf < 1 early-returns the empty feature set),
-    // so the portable/scalar backend is selected everywhere. Strictly safe — can only force the
-    // safe scalar path.
-    if str_pieces
-        .iter()
-        .any(|s| s.trim().eq_ignore_ascii_case("cpuid"))
-    {
-        let mut roots = Vec::new();
-        for op in operands {
-            let out = match op {
-                InlineAsmOperand::Out { place: Some(p), .. }
-                | InlineAsmOperand::InOut {
-                    out_place: Some(p), ..
-                } => p,
-                // In / discarded outs (place None) / Const / Sym* / Label: nothing to write.
-                _ => continue,
-            };
-            // cpuid outputs are all u32.
-            let zero = load_const_uint(0, rustc_middle::ty::UintTy::U32, ctx);
-            roots.push(place_set(out, zero, ctx));
-        }
-        roots.push(after);
-        return Some(roots);
+    // (A) CPUID — stdarch `__cpuid`/`__cpuid_count` and an exact direct-register equivalent.
+    // Execute the real BCL intrinsic once, then unpack EAX/EBX/ECX/EDX. A nearby but non-equivalent
+    // user template is rejected rather than being mistaken for CPUID merely because it contains
+    // that mnemonic.
+    if cpuid_template(template).is_some() {
+        return lower_cpuid(template, operands, after, ctx);
     }
 
     // (B) EMPTY / BARRIER — optimization-barrier asm!s whose template carries no actual
@@ -545,6 +734,136 @@ fn inline_asm_operand_type<'tcx>(
 
 fn inline_asm_place_type<'tcx>(place: &Place<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Type {
     ctx.type_from_cache(ctx.monomorphize(place.ty(ctx.body(), ctx.tcx()).ty))
+}
+
+/// Lower the exact four-register CPUID contract. Inputs are captured by the helper call before any
+/// output place is written, matching inline-asm's simultaneous register-update semantics even when
+/// a MIR output aliases an input local.
+fn lower_cpuid<'tcx>(
+    template: &[InlineAsmTemplatePiece],
+    operands: &[InlineAsmOperand<'tcx>],
+    after: Root,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Option<Vec<Root>> {
+    use rustc_target::asm::InlineAsmRegOrRegClass;
+
+    fn explicit_reg(reg: &InlineAsmRegOrRegClass) -> Option<String> {
+        match reg {
+            InlineAsmRegOrRegClass::Reg(reg) => Some(reg.name().to_ascii_lowercase()),
+            InlineAsmRegOrRegClass::RegClass(_) => None,
+        }
+    }
+
+    let template = cpuid_template(template)?;
+    if operands.len() != 4 {
+        return None;
+    }
+
+    let mut leaf = None;
+    let mut subleaf = None;
+    let mut has_eax = false;
+    let mut has_ebx = false;
+    let mut has_ecx = false;
+    let mut has_edx = false;
+    // (ValueTuple generic field index, destination), retained in MIR operand order.
+    let mut outputs = Vec::with_capacity(4);
+
+    for (operand_index, operand) in operands.iter().enumerate() {
+        match operand {
+            InlineAsmOperand::InOut {
+                reg,
+                in_value,
+                out_place,
+                ..
+            } => {
+                let (input_slot, seen, tuple_field) = match explicit_reg(reg)?.as_str() {
+                    "eax" => (&mut leaf, &mut has_eax, 0),
+                    "ecx" => (&mut subleaf, &mut has_ecx, 2),
+                    _ => return None,
+                };
+                if *seen || input_slot.is_some() {
+                    return None;
+                }
+                if inline_asm_operand_type(in_value, ctx) != Type::Int(Int::U32) {
+                    return None;
+                }
+                *input_slot = Some(in_value);
+                *seen = true;
+                if let Some(place) = out_place.as_ref() {
+                    if inline_asm_place_type(place, ctx) != Type::Int(Int::U32) {
+                        return None;
+                    }
+                    outputs.push((tuple_field, place));
+                }
+            }
+            InlineAsmOperand::Out { reg, place, .. } => {
+                let tuple_field = if let Some(register) = explicit_reg(reg) {
+                    match register.as_str() {
+                        "ebx" if matches!(template, CpuidTemplate::Direct) => {
+                            if has_ebx {
+                                return None;
+                            }
+                            has_ebx = true;
+                            1
+                        }
+                        "edx" => {
+                            if has_edx {
+                                return None;
+                            }
+                            has_edx = true;
+                            3
+                        }
+                        _ => return None,
+                    }
+                } else if matches!(
+                    template,
+                    CpuidTemplate::RbxScratch(index) if index == operand_index
+                ) {
+                    if has_ebx {
+                        return None;
+                    }
+                    has_ebx = true;
+                    1
+                } else {
+                    return None;
+                };
+                if let Some(place) = place.as_ref() {
+                    if inline_asm_place_type(place, ctx) != Type::Int(Int::U32) {
+                        return None;
+                    }
+                    outputs.push((tuple_field, place));
+                }
+            }
+            _ => return None,
+        }
+    }
+    if !(has_eax && has_ebx && has_ecx && has_edx) {
+        return None;
+    }
+
+    let leaf = handle_operand(leaf?, ctx);
+    let subleaf = handle_operand(subleaf?, ctx);
+    let helper = cpuid_helper(ctx);
+    let result = ctx.call(helper, &[leaf, subleaf], IsPure::NOT);
+    let result_local = ctx.next_synthetic_local();
+    let mut roots = vec![ctx.alloc_root(CILRoot::StLoc(result_local, result))];
+    let result_class = cpuid_result_class(ctx);
+    for (field_index, destination) in outputs {
+        // MemberRef field signatures on a constructed ValueTuple retain `!N`; the CLR binds that
+        // marker to int32 from the owner TypeSpec. Using a concrete int32 field signature looks
+        // equivalent but produces MissingFieldException at runtime.
+        let field_name = ctx.alloc_string(format!("Item{}", field_index + 1));
+        let field = ctx.alloc_field(FieldDesc::new(
+            result_class,
+            field_name,
+            Type::PlatformGeneric(field_index, GenericKind::TypeGeneric),
+        ));
+        let result = ctx.alloc_node(CILNode::LdLoc(result_local));
+        let value = ctx.ld_field(result, field);
+        roots.push(place_set(destination, value, ctx));
+    }
+    roots.push(after);
+    Some(roots)
 }
 
 fn is_128_bit_simd(tpe: Type) -> bool {

@@ -805,6 +805,7 @@ run_test! {intrinsics,caller_location,stable}
 run_test! {intrinsics,catch,stable}
 run_test! {intrinsics,cmp_bytes,stable}
 run_test! {intrinsics,copy_nonoverlaping,stable}
+run_test! {intrinsics,cpuid,stable}
 run_test! {intrinsics,ctpop,stable}
 run_test! {intrinsics,malloc,stable}
 run_test! {intrinsics,offset_of,stable}
@@ -858,6 +859,7 @@ run_test! {types,dyns,stable}
 run_test! {types,enums,stable}
 run_test! {types,int128,stable}
 run_test! {types,interop,stable}
+run_test! {types,lowering_boundaries,stable}
 run_test! {types,interop_typedef,unstable}
 run_test! {types,maybeuninit,stable}
 run_test! {types,nbody,stable}
@@ -1030,6 +1032,41 @@ static IS_MONO_PRESENT: std::sync::LazyLock<bool> =
 
 static RUSTC_BUILD_STATUS: std::sync::LazyLock<Result<(), String>> =
     std::sync::LazyLock::new(build_backend);
+
+#[test]
+fn global_asm_is_a_hard_codegen_error() {
+    RUSTC_BUILD_STATUS.as_ref().expect("Could not build rustc!");
+    let source = std::fs::canonicalize("test/compile_fail/global_asm.rs")
+        .expect("global_asm compile-fail fixture is missing");
+    let output_path = std::env::temp_dir().join(format!(
+        "rustc_codegen_clr_global_asm_{}.rlib",
+        std::process::id()
+    ));
+    let output = std::process::Command::new("rustc")
+        // Global assembly has no sound throwing-stub replacement, so it must remain fatal even in
+        // the explicitly requested exploratory recovery mode.
+        .env("ABORT_ON_ERROR", "0")
+        .arg(format!(
+            "-Zcodegen-backend={}",
+            absolute_backend_path().display()
+        ))
+        .args(["--edition", STANDALONE_TEST_EDITION, "--crate-type", "lib"])
+        .arg(source)
+        .arg("-o")
+        .arg(&output_path)
+        .output()
+        .expect("failed to run global_asm compile-fail fixture");
+    let _ = std::fs::remove_file(output_path);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "global_asm unexpectedly compiled successfully"
+    );
+    assert!(
+        stderr.contains("UnsupportedFeature") && stderr.contains("global_asm"),
+        "global_asm failed without the structured unsupported diagnostic:\n{stderr}"
+    );
+}
 
 /// The codegen backend owns rustc's `cfg(target_feature)` result. Keep that frontend contract
 /// aligned with the x86-64 ABI and prove that explicit feature settings are parsed rather than

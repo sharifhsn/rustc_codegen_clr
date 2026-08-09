@@ -1167,6 +1167,8 @@ pub fn call_closure<'tcx>(
     destination: &Place<'tcx>,
     sig: FnSig,
     function_name: &str,
+    requires_caller_location: bool,
+    source_info: rustc_middle::mir::SourceInfo,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Root {
     let last_arg = args
@@ -1211,8 +1213,19 @@ pub fn call_closure<'tcx>(
         }
         _ => panic!("Can't unbox type {last_arg_type:?}!"),
     }
-    //panic!("Last arg:{last_arg:?}last_arg_type:{last_arg_type:?}");
-    //assert_eq!(args.len(),signature.inputs().len(),"CALL SIGNATURE ARG COUNT MISMATCH!");
+    if requires_caller_location {
+        assert_eq!(
+            call_args.len() + 1,
+            sig.inputs().len(),
+            "a track_caller rust-call target must add exactly one implicit caller-location slot"
+        );
+        call_args.push(crate::terminator::get_caller_location(ctx, source_info));
+    }
+    assert_eq!(
+        call_args.len(),
+        sig.inputs().len(),
+        "rust-call argument count does not match the callee ABI"
+    );
     let is_void = matches!(sig.output(), cilly::Type::Void);
 
     let call = MethodRef::new(
@@ -1685,11 +1698,14 @@ pub fn call_inner<'tcx>(
         }
     }
     if call_info.split_last_tuple() {
+        let requires_caller_location = instance.def.requires_caller_location(ctx.tcx());
         return vec![call_closure(
             args,
             destination,
             signature,
             &function_name,
+            requires_caller_location,
+            source_info,
             ctx,
         )];
     }
@@ -1708,7 +1724,7 @@ pub fn call_inner<'tcx>(
                 .collect::<Box<_>>(),
         );
     }
-    if args.len() < signature.inputs().len() {
+    if instance.def.requires_caller_location(ctx.tcx()) {
         // The callee is `#[track_caller]`: rustc appends an implicit `&core::panic::Location` param
         // that the *call site* must supply (this is why `FnSig` ≠ `FnAbi` for track_caller fns).
         // Supply the correct caller location: if *we* are also track_caller, forward our own implicit
@@ -1716,10 +1732,18 @@ pub fn call_inner<'tcx>(
         // accounting for any MIR-inlined track_caller frames, materialize it from the call-site span.
         // Previously this unconditionally materialized the local span, which both lost the propagation
         // and (under MIR inlining) reported the inlined body's span instead of the user's.
-        let location = crate::terminator::get_caller_location(ctx, source_info);
-        call_args.push(location);
+        assert_eq!(
+            call_args.len() + 1,
+            signature.inputs().len(),
+            "a track_caller callee must add exactly one implicit caller-location slot"
+        );
+        call_args.push(crate::terminator::get_caller_location(ctx, source_info));
     }
-    //assert_eq!(args.len(),signature.inputs().len(),"CALL SIGNATURE ARG COUNT MISMATCH!");
+    assert_eq!(
+        call_args.len(),
+        signature.inputs().len(),
+        "MIR call argument count does not match the callee ABI"
+    );
     let is_void = matches!(signature.output(), cilly::Type::Void);
     //rustc_middle::ty::print::with_no_trimmed_paths! {call.push(CILOp::Comment(format!("Calling {instance:?}").into()))};
     if let InstanceKind::DropGlue(_def, None) = instance.def {

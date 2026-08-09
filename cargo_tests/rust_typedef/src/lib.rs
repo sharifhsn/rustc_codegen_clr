@@ -46,6 +46,8 @@ pub fn rustc_codegen_clr_add_method_def<
     const VIS: &'static str,
     const MODIFIERS: &'static str,
     const FNAME: &'static str,
+    const PARAM_NAMES: &'static str,
+    const NULLABILITY: &'static str,
     FnType,
 >(
     class: ClassDef,
@@ -120,6 +122,7 @@ macro_rules! dotnet_typedef {
         mod $name {
             #[used]
             static PREVENT_DEAD_CODE_REMOVAL: fn() = rustc_codegen_clr_comptime_entrypoint;
+            #[doc = "__rustc_codegen_clr_comptime_entrypoint_v1"]
             #[inline(never)]
             pub fn rustc_codegen_clr_comptime_entrypoint() {
                 const NAME: &str = stringify!($name);

@@ -7,6 +7,11 @@ pub enum CodegenError {
     Error(crate::IString),
     Method(MethodCodegenError),
     FunctionABIUnsuported(&'static str),
+    /// A source construct that this backend cannot faithfully represent.
+    UnsupportedFeature {
+        feature: &'static str,
+        detail: String,
+    },
 }
 
 impl From<MethodCodegenError> for CodegenError {
@@ -17,6 +22,14 @@ impl From<MethodCodegenError> for CodegenError {
 impl CodegenError {
     pub fn from_panic_message(msg: &str) -> Self {
         Self::Error(msg.into())
+    }
+
+    #[must_use]
+    pub fn unsupported(feature: &'static str, detail: impl Into<String>) -> Self {
+        Self::UnsupportedFeature {
+            feature,
+            detail: detail.into(),
+        }
     }
 }
 

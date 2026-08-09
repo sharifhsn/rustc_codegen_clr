@@ -154,6 +154,7 @@ impl core::fmt::Display for ManagedException {
 // exception thrown inside `try_fn` unwind *up to* the surrounding IL `catch`. A plain `extern "C"`
 // callback is `nounwind`, so rustc inserts an abort-on-unwind guard into it and the managed exception
 // triggers a `FailFast` ("unwinding crossed a nounwind ABI boundary") before the IL catch ever runs.
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[allow(unused_variables)]
 #[inline(never)]
 fn rustc_clr_interop_try_catch(try_fn: fn(*mut u8), data: *mut u8, catch_fn: fn(*mut u8)) -> i32 {

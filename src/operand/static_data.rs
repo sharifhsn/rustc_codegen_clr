@@ -15,7 +15,7 @@ use crate::r#type::{GetTypeExt, align_of, fixed_array};
 use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::interpret::{AllocId, Allocation, GlobalAlloc},
-    ty::{Instance, List, TyCtxt, TypingEnv},
+    ty::{Instance, List, TyCtxt, TyKind, TypingEnv},
 };
 use rustc_span::def_id::DefId;
 
@@ -28,6 +28,43 @@ use rustc_span::def_id::DefId;
 /// rustc's own `GlobalAlloc::size_and_align`, which branches on exactly this flag.
 fn static_is_nested(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     matches!(tcx.def_kind(def_id), DefKind::Static { nested: true, .. })
+}
+
+/// Materialize a function allocation using an explicit ABI slot map.
+///
+/// An ordinary function keeps every source argument, including a leading ZST. A captureless
+/// closure-to-fn coercion is the one supported shape that drops an argument here: exactly slot 0,
+/// the closure receiver. Inferring that distinction by stripping all leading `Type::Void` values
+/// corrupts perfectly legal pointers such as `fn((), u32)`.
+pub(crate) fn reify_allocation_function<'tcx>(
+    instance: Instance<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Interned<CILNode> {
+    let call_info = CallInfo::sig_from_instance_(instance, ctx);
+    let real_sig = call_info.sig().clone();
+    let function_name = fn_name(ctx.tcx().symbol_name(instance));
+    let real_sig_idx = ctx.alloc_sig(real_sig.clone());
+    let method = MethodRef::new(
+        *ctx.main_module(),
+        ctx.alloc_string(function_name),
+        real_sig_idx,
+        MethodKind::Static,
+        vec![].into(),
+    );
+    let fn_ty = instance.ty(ctx.tcx(), TypingEnv::fully_monomorphized());
+    if matches!(fn_ty.kind(), TyKind::Closure(..)) && real_sig.inputs().first() == Some(&Type::Void)
+    {
+        let target_sig = ctx.alloc_sig(FnSig::new(
+            real_sig.inputs()[1..].to_vec(),
+            *real_sig.output(),
+        ));
+        ctx.reify_fnptr_with_ignored(method, target_sig, &[0])
+    } else {
+        // Exact signature: in particular, do not reinterpret a legitimate leading ZST argument as
+        // a closure receiver. Closure methods whose receiver is a real pointer (for example a
+        // vtable entry) also belong here: they are not closure-to-bare-fn coercions.
+        ctx.reify_fnptr_with_ignored(method, real_sig_idx, &[])
+    }
 }
 
 /// Build the .NET storage `Type` for a static's backing field directly from its
@@ -247,17 +284,7 @@ pub fn add_allocation(alloc_id: u64, ctx: &mut MethodCompileCtx<'_, '_>) -> Inte
             // a function alloc to a real fn-ptr (mirroring `load_scalar_ptr`'s Function arm in
             // constant.rs) instead of returning a null `f_{id}` static, closing the latent
             // null for any direct `add_allocation(Function)` caller.
-            let call_info = CallInfo::sig_from_instance_(instance, ctx);
-            let function_name = fn_name(ctx.tcx().symbol_name(instance));
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string(function_name),
-                ctx.alloc_sig(call_info.sig().clone()),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            return ctx.alloc_node(CILNode::LdFtn(mref));
+            return reify_allocation_function(instance, ctx);
         }
         // A `TypeId` alloc has no backing memory: the pointer's *offset* is the
         // type-id hash fragment and equality only requires it be self-consistent.
@@ -416,40 +443,14 @@ fn allocation_initializer_method(
             {
                 // If it is a function, patch its pointer up.
                 let mut ctx = MethodCompileCtx::new(ctx.tcx(), None, finstance, ctx);
-                let call_info = CallInfo::sig_from_instance_(finstance, &mut ctx);
-                let keep_zst_sig = call_info.sig().clone();
-                let function_name = fn_name(ctx.tcx().symbol_name(finstance));
-                let mref = MethodRef::new(
-                    *ctx.main_module(),
-                    ctx.alloc_string(function_name),
-                    ctx.alloc_sig(keep_zst_sig.clone()),
-                    MethodKind::Static,
-                    vec![].into(),
-                );
                 // addr = (LdLoc(0) + offset) cast to *usize
                 let ld_loc = ctx.alloc_node(CILNode::LdLoc(0));
                 let off = ctx.alloc_node(Const::USize(offset.into()));
                 let addr = ctx.biop(ld_loc, off, cilly::BinOp::Add);
                 let usize_ptr = ctx.nptr(Type::Int(Int::USize));
                 let addr = ctx.cast_ptr_to(addr, usize_ptr);
-                // A const `fn`-pointer relocation must store a pointer whose CIL arity matches the
-                // bare `fn`-pointer type it will be invoked through (`from_poly_sig`: receiver-free).
-                // The physical method `mref` keeps every `fn_abi.args` entry, including the closure's
-                // ZST/Ignore receiver, which is always the FIRST arg and is lowered to a `Type::Void`
-                // (`RustVoid`) param. If we stored a plain `ldftn` of that method, a later indirect
-                // `calli` through the narrower fn-ptr type would push too few args and the callee
-                // would read a garbage extra slot (the TLS `LazyStorage::initialize` AccessViolation).
-                // Strip only the leading `Void` receiver param(s) to form the receiver-free target
-                // sig, then route through `reify_fnptr`, which emits an arity-matching adapter thunk
-                // when (and only when) params were elided. A non-leading `Void` (a genuine ZST value
-                // argument) is preserved, so regular `fn`-item pointers keep their exact arity and hit
-                // `reify_fnptr`'s fast path (no adapter, identical to the previous behaviour).
-                let inputs = keep_zst_sig.inputs();
-                let lead_void = inputs.iter().take_while(|t| **t == Type::Void).count();
-                let target_inputs: Vec<Type> = inputs[lead_void..].to_vec();
-                let target_sig = ctx.alloc_sig(FnSig::new(target_inputs, *keep_zst_sig.output()));
                 // val = LdFtn(adapter-or-method) cast to usize
-                let ftn = ctx.reify_fnptr(mref, target_sig);
+                let ftn = reify_allocation_function(finstance, &mut ctx);
                 let val = ctx.cast_ptr_to(ftn, Type::Int(Int::USize));
                 trees.push(ctx.alloc_root(CILRoot::StInd(Box::new((
                     addr,

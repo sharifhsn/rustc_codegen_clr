@@ -179,7 +179,15 @@ pub fn handle_rvalue<'tcx>(
                 // Route through the adapter-thunk helper: when the physical method has elided
                 // (Void/ZST) params that the fn-ptr type lacks, this synthesises an arity-matching
                 // adapter instead of lying about the pointer's ABI with a bare cast.
-                (vec![], ctx.reify_fnptr(call_site, target_sig))
+                // A closure-to-fn coercion removes exactly the closure receiver. For a
+                // captureless closure that receiver lowers to `Void`, but a real user argument may
+                // also be a ZST/`Void`; positional type matching cannot distinguish the two. Pass
+                // the proven receiver slot explicitly so legitimate ZST arguments remain in the
+                // indirect-call signature.
+                (
+                    vec![],
+                    ctx.reify_fnptr_with_ignored(call_site, target_sig, &[0]),
+                )
             }
             _ => panic!(
                 "{} cannot be cast to a fn ptr",
@@ -294,8 +302,7 @@ pub fn handle_rvalue<'tcx>(
             {
                 let subst = ctx.monomorphize(*subst_ref);
                 let env = rustc_middle::ty::TypingEnv::fully_monomorphized();
-                let Some(instance) = Instance::try_resolve(ctx.tcx(), env, *def_id, subst)
-                    .expect("Invalid function def")
+                let Some(instance) = Instance::resolve_for_fn_ptr(ctx.tcx(), env, *def_id, subst)
                 else {
                     panic!("ERROR: Could not get function instance. fn type:{operand_ty:?}")
                 };
@@ -306,7 +313,9 @@ pub fn handle_rvalue<'tcx>(
             let function_name = fn_name(ctx.tcx().symbol_name(instance));
             let function_sig = crate::function_sig::sig_from_instance_(instance, ctx)
                 .expect("Could not get function signature when trying to get a function pointer!");
-            //FIXME: properly handle `#[track_caller]`
+            // `resolve_for_fn_ptr` is important here: it selects rustc's `ReifyShim` for targets
+            // such as `#[track_caller]` functions, whose hidden caller-location argument cannot be
+            // represented in a bare Rust fn-pointer type.
             let call_site = MethodRef::new(
                 *ctx.main_module(),
                 ctx.alloc_string(function_name),
@@ -319,7 +328,10 @@ pub fn handle_rvalue<'tcx>(
             // arity via the adapter-thunk helper (a no-op fast path when the sigs already agree).
             let target_type = ctx.type_from_cache(*target);
             if let Type::FnPtr(target_sig) = target_type {
-                (vec![], ctx.reify_fnptr(call_site, target_sig))
+                (
+                    vec![],
+                    ctx.reify_fnptr_with_ignored(call_site, target_sig, &[]),
+                )
             } else {
                 // Defensive: the destination is not a fn-ptr type (should not happen for
                 // ReifyFnPointer). Fall back to taking the method's address directly.

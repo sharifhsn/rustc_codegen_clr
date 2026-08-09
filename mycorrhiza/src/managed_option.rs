@@ -11,12 +11,14 @@ use core::marker::PhantomData;
 
 use crate::intrinsics::{rustc_clr_interop_managed_is_null, rustc_clr_interop_managed_ld_null};
 
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[allow(unused_variables)]
 #[inline(never)]
 fn rustc_clr_interop_managed_box_new<T>(value: T) -> *mut u8 {
     core::intrinsics::abort()
 }
 
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[allow(unused_variables)]
 #[inline(never)]
 unsafe fn rustc_clr_interop_managed_box_take<T>(handle: *mut u8) -> T {

@@ -2,14 +2,14 @@ use crate::{
     IString,
     basic_block::handler_for_block,
     codegen_error::{CodegenError, MethodCodegenError},
-    utilis::classify_magic_fn,
+    utilis::{classify_magic_fn, is_comptime_entrypoint},
 };
 use cilly::{
     Access, Assembly, CILRoot, ExceptionRegion, Int, Interned, IntoAsmIndex, MethodDef, MethodRef,
     StaticFieldDesc, Type,
     cilnode::{MethodKind, PtrCastRes},
     ir::BasicBlock,
-    ir::method::LocalDef,
+    ir::method::{LocalDef, MethodImpl},
     utilis::{self},
 };
 
@@ -253,14 +253,39 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     }
     let mut ctx = ctx.with_body(mir);
     let ctx = &mut ctx;
-    // The comptime entrypoint is *interpreted* (it describes a managed class) rather than codegen'd.
-    // But `dotnet_typedef!` declares each virtual method's body fn (`…_not_magic`) *inside* the
-    // entrypoint fn, so its symbol name also contains "comptime_entrypoint" — that one must fall
-    // through to NORMAL codegen (it is the real method the class's virtual aliases forward to).
-    if name.contains("rustc_codegen_clr_comptime_entrypoint")
-        && !name.contains("rustc_codegen_clr_not_magic")
-    {
+    // A generated managed-type definition opts into interpretation with an exact marker. Symbol
+    // substrings are not identity: an ordinary same-named function/module must compile normally.
+    if is_comptime_entrypoint(ctx.tcx(), ctx.instance().def_id()) {
         crate::comptime::interpret(ctx, mir);
+        // The generated `#[used]` retention static still references this carrier function after
+        // its MIR has been interpreted into metadata. Leaving the carrier undefined therefore
+        // creates a reachable `MethodImpl::Missing`, which the fatal post-link verifier correctly
+        // rejects. Materialize a harmless void body: the function has already done its only job at
+        // compile time, but remains a valid target if metadata reachability keeps the symbol alive.
+        let sig = CallInfo::sig_from_instance_(ctx.instance(), ctx)
+            .sig()
+            .clone();
+        assert!(
+            sig.inputs().is_empty() && *sig.output() == Type::Void,
+            "comptime entrypoint must have signature fn()"
+        );
+        let sig = ctx.alloc_sig(sig);
+        let class = ctx.main_module();
+        let name = ctx.alloc_string(name);
+        let ret = ctx.alloc_root(CILRoot::VoidRet);
+        let method = MethodDef::new(
+            Access::Assembly,
+            class,
+            name,
+            sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            },
+            vec![],
+        );
+        ctx.new_method(method);
         return Ok(());
     }
     if classify_magic_fn(ctx.tcx(), ctx.instance().def_id()).is_some() {
@@ -340,9 +365,21 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     // Get locals
     let (mut arg_names, mut locals) =
         locals_from_mir(&mir.local_decls, mir.arg_count, &mir.var_debug_info, ctx);
-    if sig.inputs().len() > arg_names.len() {
+    let requires_caller_location = ctx.instance().def.requires_caller_location(ctx.tcx());
+    let ordinary_abi_args = sig
+        .inputs()
+        .len()
+        .checked_sub(usize::from(requires_caller_location))
+        .expect("track_caller function ABI is missing its caller-location argument");
+    // Argument names are metadata for the physical CIL signature, not a semantic mirror of MIR
+    // locals. Rust-call may spread one MIR tuple into several ABI slots, while other shims may
+    // elide MIR-only arguments. Resize in either direction so metadata never invents an ABI
+    // invariant; lowering of the actual values is validated at each call site.
+    arg_names.resize(ordinary_abi_args, None);
+    if requires_caller_location {
         arg_names.push(Some("panic_location".into_idx(ctx)));
     }
+    assert_eq!(arg_names.len(), sig.inputs().len());
 
     let blocks = &mir.basic_blocks;
     let mut normal_bbs = Vec::new();
@@ -384,6 +421,17 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     } else {
         vec![]
     };
+    let cpuid_scratch_count = crate::terminator::cpuid_scratch_local_count(mir);
+    if cpuid_scratch_count != 0 {
+        let scratch_start = u32::try_from(locals.len()).expect("more than 2^32 method locals");
+        let result_type = Type::ClassRef(crate::terminator::cpuid_result_class(ctx));
+        let result_type = ctx.alloc_type(result_type);
+        locals.extend((0..cpuid_scratch_count).map(|_| (None, result_type)));
+        ctx.reserve_synthetic_local_range(
+            scratch_start,
+            u32::try_from(cpuid_scratch_count).expect("more than 2^32 CPUID sites"),
+        );
+    }
     let sig_idx = ctx.alloc_sig(sig.clone());
     // If any statement fails to compile, the per-statement `throw` recovery below would leave the
     // surrounding block structure (branches/handlers) intact while the failed statement no longer
@@ -652,10 +700,10 @@ pub fn add_item<'tcx>(
             drop(fn_timer);
             Ok(())
         }
-        MonoItem::GlobalAsm(asm) => {
-            eprintln!("Unsuported item - Global ASM:{asm:?}");
-            Ok(())
-        }
+        MonoItem::GlobalAsm(asm) => Err(CodegenError::unsupported(
+            "global_asm",
+            format!("the .NET backend cannot emit this global assembly item: {asm:?}"),
+        )),
         MonoItem::Static(stotic) => {
             let static_timer = tcx.prof.generic_activity_with_arg(
                 "compile static initializer",

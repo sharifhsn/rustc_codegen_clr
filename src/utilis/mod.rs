@@ -16,6 +16,55 @@ pub const MANAGED_CALL_FN_NAME: &str = "rustc_clr_interop_managed_call";
 /// See [`CTOR_FN_NAME`] — same reason (`callvirt_managed`'s arity parsing), same caveat.
 pub const MANAGED_CALL_VIRT_FN_NAME: &str = "rustc_clr_interop_managed_call_virt";
 
+/// Exact marker emitted on generated managed-type definition entrypoints.
+///
+/// These functions live in the consuming crate, so crate provenance cannot identify them the way
+/// it identifies the `mycorrhiza::intrinsics` magic functions. An explicit generated marker avoids
+/// interpreting an unrelated user function merely because its symbol contains a magic substring.
+pub const COMPTIME_ENTRYPOINT_MARKER: &str = "__rustc_codegen_clr_comptime_entrypoint_v1";
+/// Exact private marker carried by every backend-recognized mycorrhiza declaration.
+pub const MYCORRHIZA_INTRINSIC_MARKER: &str = "__rustc_codegen_clr_intrinsic_v1";
+
+/// Whether `def_id` names an explicitly marked item from a known mycorrhiza interop module.
+///
+/// The final source identifier is not sufficient identity: any Rust crate can legally declare a
+/// same-named function or marker ADT. Requiring both the defining crate and module keeps dependency
+/// renaming/re-exporting working because those operations do not change the item's `DefId` origin.
+pub fn is_mycorrhiza_intrinsic(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    if tcx.crate_name(def_id.krate).as_str() != "mycorrhiza" {
+        return false;
+    }
+    let path = tcx.def_path_str(def_id);
+    let mut segments = path.rsplit("::");
+    let _item = segments.next();
+    if !matches!(
+        segments.next(),
+        Some("intrinsics" | "memory" | "cancellation" | "managed_option" | "error")
+    ) {
+        return false;
+    }
+    #[allow(deprecated)]
+    tcx.get_all_attrs(def_id)
+        .iter()
+        .filter_map(|attr| attr.doc_str())
+        .any(|doc| doc.as_str() == MYCORRHIZA_INTRINSIC_MARKER)
+}
+
+/// Whether this exact definition opted into comptime managed-type interpretation.
+pub fn is_comptime_entrypoint(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    if tcx
+        .opt_item_name(def_id)
+        .is_none_or(|name| name.as_str() != "rustc_codegen_clr_comptime_entrypoint")
+    {
+        return false;
+    }
+    #[allow(deprecated)]
+    tcx.get_all_attrs(def_id)
+        .iter()
+        .filter_map(|attr| attr.doc_str())
+        .any(|doc| doc.as_str() == COMPTIME_ENTRYPOINT_MARKER)
+}
+
 /// The canonical, exhaustive classification of every "magic" interop fn the backend recognizes and
 /// substitutes real CIL for (see [`classify_magic_fn`]). One variant per *dispatch shape* in
 /// `src/terminator/call.rs::call_inner`, not one per concrete arity-ladder function — e.g. `Ctor`
@@ -92,6 +141,9 @@ pub enum MagicFn {
 /// match doesn't need at all; (2) an ordinary user function can never be accidentally misclassified as
 /// magic just because its mangled name happens to contain one of these strings as a substring.
 pub fn classify_magic_fn(tcx: TyCtxt, def_id: DefId) -> Option<MagicFn> {
+    if !is_mycorrhiza_intrinsic(tcx, def_id) {
+        return None;
+    }
     let path = tcx.def_path_str(def_id);
     let name = path.rsplit("::").next().unwrap_or(path.as_str());
     // DTO primary constructors are schema-arity generated and may legitimately exceed the small

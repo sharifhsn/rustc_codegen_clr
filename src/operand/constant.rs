@@ -1,11 +1,9 @@
 use core::f16;
 
-use crate::call_info::CallInfo;
 use crate::fn_ctx::MethodCompileCtx;
 use crate::r#type::{GetTypeExt, utilis::is_fat_ptr};
 use cilly::{
-    Assembly, CILNode, ClassRef, Const, Float, Int, Interned, IntoAsmIndex, MethodRef,
-    StaticFieldDesc, Type,
+    Assembly, CILNode, ClassRef, Const, Float, Int, Interned, MethodRef, StaticFieldDesc, Type,
     cilnode::{IsPure, MethodKind},
     hashable::{HashableF32, HashableF64},
 };
@@ -20,7 +18,7 @@ use rustc_middle::{
 };
 use rustc_span::def_id::DefId;
 
-use crate::operand::static_data::add_allocation;
+use crate::operand::static_data::{add_allocation, reify_allocation_function};
 pub fn handle_constant<'tcx>(
     const_op: &ConstOperand<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
@@ -216,17 +214,7 @@ fn load_scalar_ptr(
             instance: finstance,
         } => {
             assert_eq!(offset.bytes(), 0);
-            // If it is a function, patch its pointer up.
-            let call_info = CallInfo::sig_from_instance_(finstance, ctx);
-            let function_name = crate::fn_ctx::fn_name(ctx.tcx().symbol_name(finstance));
-            let mref = MethodRef::new(
-                *ctx.main_module(),
-                ctx.alloc_string(function_name),
-                ctx.alloc_sig(call_info.sig().clone()),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            CILNode::LdFtn(ctx.alloc_methodref(mref)).into_idx(ctx)
+            reify_allocation_function(finstance, ctx)
         }
         GlobalAlloc::TypeId { .. } => {
             // A `TypeId` pointer is opaque: its integer value (`offset`) is one

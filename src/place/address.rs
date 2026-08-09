@@ -7,7 +7,7 @@ use crate::r#type::{
     fat_ptr_to, get_type,
 };
 use cilly::{
-    Assembly, BinOp, Const, FieldDesc, Int, Interned, IntoAsmIndex, MethodRef, Type,
+    Assembly, BinOp, Const, FieldDesc, Int, Interned, MethodRef, Type,
     cilnode::{ExtendKind, MethodKind},
 };
 use rustc_middle::{
@@ -219,6 +219,12 @@ fn field_address<'a>(
         }
         super::PlaceTy::EnumVariant(enm, var_idx) => {
             let owner = ctx.monomorphize(enm);
+            let field_ty = ctx.monomorphize(field_type);
+            if ctx.type_from_cache(field_ty) == Type::Void {
+                return super::projected_variant_field_address(
+                    owner, field_ty, field_idx, var_idx, addr_calc, ctx,
+                );
+            }
             let field_desc = variant_field_desc(owner, field_idx, var_idx, ctx);
             ctx.ld_field_addr(addr_calc, field_desc)
         }
@@ -252,19 +258,8 @@ pub fn place_elem_address<'tcx>(
                     let data_ptr_name = ctx.alloc_string(cilly::DATA_PTR);
                     let void_ptr = ctx.nptr(Type::Void);
                     let desc = ctx.alloc_field(FieldDesc::new(slice, data_ptr_name, void_ptr));
-                    // This is a false positive
-                    //    #[allow(unused_parens)]
-                    let size = ctx.size_of(inner_type);
-                    let size = size.into_idx(ctx);
-                    let size = ctx.alloc_node(cilly::CILNode::IntCast {
-                        input: size,
-                        target: Int::USize,
-                        extend: cilly::cilnode::ExtendKind::ZeroExtend,
-                    });
-                    let offset = ctx.biop(index, size, cilly::BinOp::Mul);
                     let data_ptr = ctx.ld_field(addr_calc, desc);
-                    let data_ptr = ctx.cast_ptr(data_ptr, inner_type);
-                    ctx.biop(data_ptr, offset, BinOp::Add)
+                    super::indexed_element_address(data_ptr, index, inner_type, ctx)
                 }
                 TyKind::Array(element, _) => {
                     array_element_address(ctx, *element, curr_ty, addr_calc, index)
@@ -302,13 +297,8 @@ pub fn place_elem_address<'tcx>(
                     Ty::new_ptr(ctx.tcx(), sub_ty, rustc_middle::ty::Mutability::Mut),
                     ctx,
                 );
-                let elem_ptr = ctx.cast_ptr(addr_calc, elem_type);
-                let at_from = if *from != 0 {
-                    let from_node = ctx.alloc_node(Const::USize(*from));
-                    ctx.offset(elem_ptr, from_node, elem_type)
-                } else {
-                    elem_ptr
-                };
+                let from_node = ctx.alloc_node(Const::USize(*from));
+                let at_from = super::indexed_element_address(addr_calc, from_node, elem_type, ctx);
                 return ctx.cast_ptr_to(at_from, sub_ptr_ty);
             }
 
@@ -328,15 +318,9 @@ pub fn place_elem_address<'tcx>(
                 let meta_fld = ctx.ld_field(addr_calc, metadata_field);
                 let metadata = ctx.biop(meta_fld, Const::USize(*to + from), BinOp::Sub);
 
-                let data_ptr = if elem_type != Type::Void {
-                    let base = ctx.ld_field(addr_calc, ptr_field);
-                    let stride = ctx.size_of(elem_type).into_idx(ctx);
-                    let stride = ctx.int_cast(stride, Int::USize, ExtendKind::ZeroExtend);
-                    let scaled = ctx.biop(Const::USize(*from), stride, BinOp::Mul);
-                    ctx.biop(base, scaled, BinOp::Add)
-                } else {
-                    ctx.ld_field(addr_calc, ptr_field)
-                };
+                let base = ctx.ld_field(addr_calc, ptr_field);
+                let from = ctx.alloc_node(Const::USize(*from));
+                let data_ptr = super::indexed_element_address(base, from, elem_type, ctx);
                 ctx.create_slice(curr_type, data_ptr, metadata)
             } else {
                 let void_ptr = ctx.nptr(Type::Void);
@@ -345,10 +329,8 @@ pub fn place_elem_address<'tcx>(
                 let ptr_field = ctx.alloc_field(FieldDesc::new(curr_type, data_ptr, void_ptr));
                 let metadata = ctx.alloc_node(Const::USize(to - from));
                 let base = ctx.ld_field(addr_calc, ptr_field);
-                let stride = ctx.size_of(elem_type).into_idx(ctx);
-                let stride = ctx.int_cast(stride, Int::USize, ExtendKind::ZeroExtend);
-                let scaled = ctx.biop(Const::USize(*from), stride, BinOp::Mul);
-                let data_ptr = ctx.biop(base, scaled, BinOp::Add);
+                let from = ctx.alloc_node(Const::USize(*from));
+                let data_ptr = super::indexed_element_address(base, from, elem_type, ctx);
 
                 ctx.create_slice(curr_type, data_ptr, metadata)
             }
@@ -386,11 +368,7 @@ pub fn place_elem_address<'tcx>(
                     };
 
                     let base = ctx.ld_field(addr_calc, desc);
-                    let base = ctx.cast_ptr(base, inner_type);
-                    let stride = ctx.size_of(inner_type).into_idx(ctx);
-                    let stride = ctx.int_cast(stride, Int::USize, ExtendKind::ZeroExtend);
-                    let scaled = ctx.biop(index, stride, BinOp::Mul);
-                    ctx.biop(base, scaled, BinOp::Add)
+                    super::indexed_element_address(base, index, inner_type, ctx)
                 }
                 TyKind::Array(element, _) => {
                     if *from_end {
@@ -428,8 +406,7 @@ fn array_element_address<'tcx>(
     // demanding a non-existent CLR array class. The preceding MIR bounds check remains responsible
     // for the required panic; no storage is read or written on the live path.
     if array_type == Type::Void {
-        let base = ctx.cast_ptr(array_address, element);
-        return ctx.offset(base, index, element);
+        return ctx.cast_ptr(array_address, element);
     }
 
     let array_dotnet = array_type.as_class_ref().expect("Non array type");

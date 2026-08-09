@@ -27,7 +27,10 @@ type Object = RustcCLRInteropManagedClass<"System.Runtime", "System.Object">;
 type MString = RustcCLRInteropManagedClass<"System.Runtime", "System.String">;
 impl Into<MString> for &str {
     fn into(self) -> MString {
-        todo!()
+        // This fixture only verifies typedef metadata construction; its managed-string body is
+        // never executed. Keep the placeholder representable by the backend's abort intrinsic so
+        // the fatal post-link verifier is not defeated by a deliberately unresolved panic shim.
+        core::intrinsics::abort()
     }
 }
 type RustObj_ = RustcCLRInteropManagedClass<"", "RustObj">;
@@ -46,6 +49,8 @@ pub fn rustc_codegen_clr_add_method_def<
     const VIS: &'static str,
     const MODIFIERS: &'static str,
     const FNAME: &'static str,
+    const PARAM_NAMES: &'static str,
+    const NULLABILITY: &'static str,
     FnType,
 >(
     class: ClassDef,
@@ -118,6 +123,7 @@ macro_rules! dotnet_typedef {
         mod $name {
             #[used]
             static PREVENT_DEAD_CODE_REMOVAL: fn() = rustc_codegen_clr_comptime_entrypoint;
+            #[doc = "__rustc_codegen_clr_comptime_entrypoint_v1"]
             #[inline(never)]
             pub fn rustc_codegen_clr_comptime_entrypoint() {
                 const NAME: &str = stringify!($name);
@@ -136,6 +142,7 @@ macro_rules! dotnet_typedef {
             #[used]
             static PREVENT_DEAD_CODE_REMOVAL: fn() = rustc_codegen_clr_comptime_entrypoint;
 
+            #[doc = "__rustc_codegen_clr_comptime_entrypoint_v1"]
             #[inline(never)]
             pub fn rustc_codegen_clr_comptime_entrypoint() {
                 const NAME: &str = stringify!($name);
@@ -166,7 +173,7 @@ dotnet_typedef! {
     class RustObj2 inherits [System::Runtime]System::Runtime::Object{
         a : f32,
         virtual fn ToString(this:RustObj2_)->MString{
-            panic!()
+            core::intrinsics::abort()
         },
 
     }

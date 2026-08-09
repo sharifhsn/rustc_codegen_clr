@@ -114,7 +114,10 @@ impl BackendConfig {
 
         Ok(Self {
             abi: ArtifactAbiConfig::from_environment(environment)?,
-            abort_on_error: parse_bool(environment, "ABORT_ON_ERROR", false)?,
+            // Correctness is the product default: unsupported code must fail the build rather than
+            // silently becoming a runtime-throwing stub or a missing mono item. Setting
+            // `ABORT_ON_ERROR=0` retains the historical exploratory mode explicitly.
+            abort_on_error: parse_bool(environment, "ABORT_ON_ERROR", true)?,
             insert_mir_debug_comments: parse_bool(environment, "INSERT_MIR_DEBUG_COMMENTS", false)?,
             print_local_types: parse_bool(environment, "PRINT_LOCAL_TYPES", false)?,
             test_with_mono: parse_bool(environment, "TEST_WITH_MONO", false)?,
@@ -441,7 +444,7 @@ mod tests {
         assert!(config.dry_run());
         assert_eq!(config.dump_mir(), Some("needle"));
         assert_eq!(config.artifact_abi().dotnet_runtime(), DotnetRuntime::Net10);
-        assert!(!config.abort_on_error());
+        assert!(config.abort_on_error());
     }
 
     #[test]
@@ -451,10 +454,10 @@ mod tests {
         assert_eq!(install_into(&slot, first.clone()), Ok(&first));
         assert_eq!(install_into(&slot, first.clone()), Ok(&first));
 
-        let different = config_with(&[("ABORT_ON_ERROR", "1")]);
+        let different = config_with(&[("ABORT_ON_ERROR", "0")]);
         let error = install_into(&slot, different).unwrap_err();
         assert_eq!(error.active, first);
-        assert!(error.attempted.abort_on_error());
+        assert!(!error.attempted.abort_on_error());
     }
 
     #[test]

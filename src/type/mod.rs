@@ -157,13 +157,17 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
     // method's definition-shape signature), never as a runtime value, so the usual ZST→Void
     // collapse would erase them. Exempt them before the ZST early-return.
     let is_generic_marker = if let TyKind::Adt(def, _) = ty.kind() {
-        let item_name = ctx.tcx().item_name(def.did());
-        matches!(
-            item_name.as_str(),
-            INTEROP_TYPE_GENERIC_TPE_NAME
-                | INTEROP_METHOD_GENERIC_TPE_NAME
-                | INTEROP_BYREF_TPE_NAME
-        )
+        if !crate::utilis::is_mycorrhiza_intrinsic(ctx.tcx(), def.did()) {
+            false
+        } else {
+            let item_name = ctx.tcx().item_name(def.did());
+            matches!(
+                item_name.as_str(),
+                INTEROP_TYPE_GENERIC_TPE_NAME
+                    | INTEROP_METHOD_GENERIC_TPE_NAME
+                    | INTEROP_BYREF_TPE_NAME
+            )
+        }
     } else {
         false
     };
@@ -333,18 +337,19 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
             // generic type that merely HOLDS a managed value falls through to the normal ADT path.
             let item_name = ctx.tcx().item_name(def.did());
             let item_name = item_name.as_str();
-            let is_interop_adt = matches!(
-                item_name,
-                INTEROP_CLASS_TPE_NAME
-                    | INTEROP_STRUCT_TPE_NAME
-                    | INTEROP_ARR_TPE_NAME
-                    | INTEROP_CHR_TPE_NAME
-                    | INTEROP_GENERIC_TPE_NAME
-                    | INTEROP_GENERIC_STRUCT_TPE_NAME
-                    | INTEROP_TYPE_GENERIC_TPE_NAME
-                    | INTEROP_METHOD_GENERIC_TPE_NAME
-                    | INTEROP_BYREF_TPE_NAME
-            );
+            let is_interop_adt = crate::utilis::is_mycorrhiza_intrinsic(ctx.tcx(), def.did())
+                && matches!(
+                    item_name,
+                    INTEROP_CLASS_TPE_NAME
+                        | INTEROP_STRUCT_TPE_NAME
+                        | INTEROP_ARR_TPE_NAME
+                        | INTEROP_CHR_TPE_NAME
+                        | INTEROP_GENERIC_TPE_NAME
+                        | INTEROP_GENERIC_STRUCT_TPE_NAME
+                        | INTEROP_TYPE_GENERIC_TPE_NAME
+                        | INTEROP_METHOD_GENERIC_TPE_NAME
+                        | INTEROP_BYREF_TPE_NAME
+                );
             if is_interop_adt {
                 if item_name == INTEROP_CLASS_TPE_NAME {
                     assert!(
@@ -858,17 +863,19 @@ fn rust_ty_contains_managed_value<'tcx>(
     match ty.kind() {
         TyKind::Adt(def, args) => {
             let item = ctx.tcx().item_name(def.did());
-            if matches!(
-                item.as_str(),
-                INTEROP_CLASS_TPE_NAME
-                    | INTEROP_GENERIC_TPE_NAME
-                    | INTEROP_ARR_TPE_NAME
-                    | INTEROP_STRUCT_TPE_NAME
-                    | INTEROP_GENERIC_STRUCT_TPE_NAME
-                    | INTEROP_TYPE_GENERIC_TPE_NAME
-                    | INTEROP_METHOD_GENERIC_TPE_NAME
-                    | INTEROP_BYREF_TPE_NAME
-            ) {
+            if crate::utilis::is_mycorrhiza_intrinsic(ctx.tcx(), def.did())
+                && matches!(
+                    item.as_str(),
+                    INTEROP_CLASS_TPE_NAME
+                        | INTEROP_GENERIC_TPE_NAME
+                        | INTEROP_ARR_TPE_NAME
+                        | INTEROP_STRUCT_TPE_NAME
+                        | INTEROP_GENERIC_STRUCT_TPE_NAME
+                        | INTEROP_TYPE_GENERIC_TPE_NAME
+                        | INTEROP_METHOD_GENERIC_TPE_NAME
+                        | INTEROP_BYREF_TPE_NAME
+                )
+            {
                 return true;
             }
             def.all_fields().any(|field| {

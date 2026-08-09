@@ -875,6 +875,7 @@ fn expand_dotnet_class(attr: TokenStream, mut input: ItemStruct) -> TokenStream 
             #[used]
             static PREVENT_DCE: fn() = rustc_codegen_clr_comptime_entrypoint;
             #[inline(never)]
+            #[doc = "__rustc_codegen_clr_comptime_entrypoint_v1"]
             pub fn rustc_codegen_clr_comptime_entrypoint() {
                 // `HAS_TYPE_KIND_OPINION = true`: this IS the authoritative `#[dotnet_class]`
                 // declaration — `#value_type` is the real `value_type = ...` attribute value, not
@@ -1264,6 +1265,7 @@ pub fn dotnet_enum(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[used]
             static PREVENT_DCE: fn() = rustc_codegen_clr_comptime_entrypoint;
             #[inline(never)]
+            #[doc = "__rustc_codegen_clr_comptime_entrypoint_v1"]
             pub fn rustc_codegen_clr_comptime_entrypoint() {
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_new_typedef::<#managed_name, true, "", "", true>();
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_set_enum::<#spec>(class);
@@ -3640,6 +3642,7 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[used]
             static PREVENT_DCE: fn() = rustc_codegen_clr_comptime_entrypoint;
             #[inline(never)]
+            #[doc = "__rustc_codegen_clr_comptime_entrypoint_v1"]
             pub fn rustc_codegen_clr_comptime_entrypoint() {
                 // An interface has no base type -> empty superclass args. `HAS_TYPE_KIND_OPINION
                 // = true`: an interface is always registered fresh by exactly one entrypoint (no
@@ -4953,6 +4956,7 @@ pub fn dotnet_methods(attr: TokenStream, item: TokenStream) -> TokenStream {
             // Keep each aliased method fn alive through rustc's mono-collector (see above).
             #(#keep_anchors)*
             #[inline(never)]
+            #[doc = "__rustc_codegen_clr_comptime_entrypoint_v1"]
             pub fn rustc_codegen_clr_comptime_entrypoint() {
                 // Re-open the class by name so `finish_type`'s idempotent registration finds the
                 // already-registered `ClassDef` (from the `#[dotnet_class]` struct decl) and

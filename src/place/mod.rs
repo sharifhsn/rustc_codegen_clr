@@ -1,6 +1,6 @@
 use crate::fn_ctx::MethodCompileCtx;
 use crate::r#type::GetTypeExt;
-use crate::r#type::adt::FieldOffsetIterator;
+use crate::r#type::adt::{FieldOffsetIterator, get_variant_at_index};
 use crate::r#type::utilis::ptr_is_fat;
 use cilly::{BinOp, Const, Int, Interned, Type};
 
@@ -84,6 +84,41 @@ fn projected_field_address<'tcx>(
     let offset = FieldOffsetIterator::fields((*layout.layout.0).clone())
         .nth(field_idx as usize)
         .expect("Field index not in field offset iterator");
+    projected_address_at_offset(field_ty, offset, base, ctx)
+}
+
+/// Computes the native-layout address of a field selected by an enum/coroutine `Downcast`.
+///
+/// Variant ZST fields are deliberately absent from CLR metadata, just like struct ZST fields. The
+/// per-variant rustc layout nevertheless gives them a real offset from the enum/coroutine base, and
+/// that address must survive both final `Downcast -> Field` projections and intermediate chains.
+fn projected_variant_field_address<'tcx>(
+    owner_ty: Ty<'tcx>,
+    field_ty: Ty<'tcx>,
+    field_idx: u32,
+    variant_idx: u32,
+    base: Interned<cilly::ir::CILNode>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Interned<cilly::ir::CILNode> {
+    let owner_ty = ctx.monomorphize(owner_ty);
+    let field_ty = ctx.monomorphize(field_ty);
+    let layout = ctx.layout_of(owner_ty);
+    let variant = get_variant_at_index(
+        rustc_abi::VariantIdx::from_u32(variant_idx),
+        (*layout.layout.0).clone(),
+    );
+    let offset = FieldOffsetIterator::fields(variant)
+        .nth(field_idx as usize)
+        .expect("Field index not in variant field offset iterator");
+    projected_address_at_offset(field_ty, offset, base, ctx)
+}
+
+fn projected_address_at_offset<'tcx>(
+    field_ty: Ty<'tcx>,
+    offset: u32,
+    base: Interned<cilly::ir::CILNode>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Interned<cilly::ir::CILNode> {
     let byte_ptr = ctx.cast_ptr(base, Type::Int(Int::U8));
     let at_field = if offset == 0 {
         byte_ptr
@@ -92,6 +127,25 @@ fn projected_field_address<'tcx>(
     };
     let lowered_field = ctx.type_from_cache(field_ty);
     ctx.cast_ptr(at_field, lowered_field)
+}
+
+/// Applies Rust sequence indexing while preserving a ZST's container-derived pointer.
+///
+/// Rust array/slice stride is `size_of::<T>()`, hence exactly zero for a ZST. CIL has no size-zero
+/// value type, so asking its `SizeOf(Void)` machinery to scale the index is both invalid and
+/// semantically wrong. Casting the data/base pointer without adding an offset is the exact result.
+fn indexed_element_address(
+    base: Interned<cilly::ir::CILNode>,
+    index: Interned<cilly::ir::CILNode>,
+    element_type: Type,
+    ctx: &mut MethodCompileCtx<'_, '_>,
+) -> Interned<cilly::ir::CILNode> {
+    let base = ctx.cast_ptr(base, element_type);
+    if element_type == Type::Void {
+        base
+    } else {
+        ctx.offset(base, index, element_type)
+    }
 }
 
 /// Given a type `deref_ty`, it retuns a set of instructions to get a value behind a pointer to `deref_ty`.
@@ -141,29 +195,13 @@ pub fn place_address<'a>(
             local_address(place.local.as_usize(), ctx.body(), ctx)
         }
     } else {
-        // A projected ZST place keeps the dangling sentinel UNLESS it ends in a `Field` projection:
-        // the address of a ZST field of a (non-ZST) container is a real, offset-correct pointer that
-        // code round-trips (`Arc::as_ptr` = `&raw (*inner).data`), handled by `field_address`. Other
-        // ZST projections (Index / Deref / Downcast) keep the sentinel — their address is never used
-        // as a handle, and routing them through the general machinery would surface ZST paths the
-        // blanket short-circuit historically masked.
-        if layout.is_zst() {
-            // Only a `Field` reached through `Deref`s alone (`&s.z` = `[Field]`, `Arc::as_ptr` =
-            // `[Deref, Field]`) gets the real base+offset address — `field_address` handles the final
-            // ZST field, and the `Deref`-only body cannot hit the field-of-non-object paths the
-            // blanket short-circuit historically masked. Every other ZST place keeps the dangling
-            // sentinel (its address is never used as a round-trip handle).
-            let (head, body) = slice_head(place.projection);
-            let field_of_derefs = matches!(head, rustc_middle::mir::PlaceElem::Field(..))
-                && body
-                    .iter()
-                    .all(|e| matches!(e, rustc_middle::mir::PlaceElem::Deref));
-            if !field_of_derefs {
-                let place_type = ctx.type_from_cache(place_ty);
-                let node = ctx.alloc_node(Const::USize(layout.align.abi.bytes()));
-                return ctx.cast_ptr(node, place_type);
-            }
-        }
+        // Every projected place, including a ZST, derives its address from its container. ZST
+        // fields consume no storage, but their raw pointers still carry the allocation provenance
+        // and offset needed by pointer round-trips (`Arc::from_raw`, nested array/field projections,
+        // enum downcasts, and strict-provenance code). `place_elem_body` and
+        // `projected_field_address` handle missing physical CLR fields without manufacturing a
+        // fresh sentinel. Only a genuinely storage-less local uses the aligned dangling base
+        // (seeded above for the final local or by `local_body` before further projections).
         let (mut addr_calc, mut ty) = local_body(place.local.as_usize(), ctx);
 
         ty = ctx.monomorphize(ty);

@@ -9,6 +9,8 @@ pub struct MethodCompileCtx<'tcx, 'asm> {
     method_instance: Instance<'tcx>,
     asm: &'asm mut Assembly,
     span: Option<Span>,
+    synthetic_local_next: u32,
+    synthetic_local_end: u32,
 }
 
 // `Target` is `&'asm mut Assembly`, not `Assembly`: `asm` is itself a borrow with its own
@@ -48,6 +50,8 @@ impl<'tcx, 'asm> MethodCompileCtx<'tcx, 'asm> {
             method_instance: self.method_instance,
             asm: self.asm,
             span: Some(body.span),
+            synthetic_local_next: 0,
+            synthetic_local_end: 0,
         }
     }
     pub fn new(
@@ -62,7 +66,36 @@ impl<'tcx, 'asm> MethodCompileCtx<'tcx, 'asm> {
             method_instance,
             asm,
             span: None,
+            synthetic_local_next: 0,
+            synthetic_local_end: 0,
         }
+    }
+
+    /// Installs a predeclared range of lowering-only locals.
+    ///
+    /// MIR locals are fixed before individual statements and terminators are lowered, while a few
+    /// faithful lowerings need an evaluation-once temporary. The owner must append the matching
+    /// local definitions before calling this method so per-root typechecking sees the same indices.
+    pub fn reserve_synthetic_local_range(&mut self, start: u32, count: u32) {
+        assert_eq!(
+            self.synthetic_local_next, self.synthetic_local_end,
+            "cannot replace a synthetic-local range while it is in use"
+        );
+        self.synthetic_local_next = start;
+        self.synthetic_local_end = start
+            .checked_add(count)
+            .expect("synthetic local range exceeds u32");
+    }
+
+    /// Claims the next local from the range installed by [`Self::reserve_synthetic_local_range`].
+    pub fn next_synthetic_local(&mut self) -> u32 {
+        assert!(
+            self.synthetic_local_next < self.synthetic_local_end,
+            "lowering requested an undeclared synthetic local"
+        );
+        let local = self.synthetic_local_next;
+        self.synthetic_local_next += 1;
+        local
     }
     pub fn span(&self) -> Span {
         self.span.unwrap_or(Span::default())
