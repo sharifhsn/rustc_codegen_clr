@@ -1,8 +1,11 @@
 use std::fmt::Debug;
 
-use super::cilroot::BranchCond;
+use fxhash::FxHashSet;
 
-use super::{Assembly, CILNode, CILRoot, Type};
+use super::{
+    Assembly, CILNode, CILRoot, ClassRef, FnSig, MethodDef, MethodRef, Type, bimap::Interned,
+    class::ClassDefIdx, method::MethodImpl,
+};
 #[derive(Hash, PartialEq, Eq, Clone, Debug)]
 pub enum CILIterElem {
     Node(CILNode),
@@ -29,316 +32,186 @@ impl From<CILNode> for CILIterElem {
         Self::Node(v)
     }
 }
+
+/// Memoized traversal of every type identity reachable through IR metadata.
+///
+/// A `ClassRef` is not just its name: its constructed generic arguments are part of the type, and
+/// a `MethodRef` carries three independent type-bearing edges (owner, signature, and method generic
+/// arguments). In particular, an external call has no local `MethodDef` whose metadata can be used
+/// as a substitute. Keeping these rules in one walker prevents DCE consumers from each growing a
+/// subtly different, incomplete notion of reachability.
+pub(crate) struct SemanticReachability<'asm> {
+    asm: &'asm Assembly,
+    types: FxHashSet<Interned<Type>>,
+    signatures: FxHashSet<Interned<FnSig>>,
+    methods: FxHashSet<Interned<MethodRef>>,
+    classes: FxHashSet<Interned<ClassRef>>,
+    class_definitions: FxHashSet<ClassDefIdx>,
+}
+
+impl<'asm> SemanticReachability<'asm> {
+    pub(crate) fn new(asm: &'asm Assembly) -> Self {
+        Self {
+            asm,
+            types: FxHashSet::default(),
+            signatures: FxHashSet::default(),
+            methods: FxHashSet::default(),
+            classes: FxHashSet::default(),
+            class_definitions: FxHashSet::default(),
+        }
+    }
+
+    pub(crate) fn visit_type(&mut self, tpe: Type) {
+        match tpe {
+            Type::Ptr(inner) | Type::Ref(inner) | Type::PlatformArray { elem: inner, .. } => {
+                self.visit_type_id(inner);
+            }
+            Type::ClassRef(class) => self.visit_class_ref(class),
+            Type::FnPtr(signature) => self.visit_signature(signature),
+            Type::Int(_)
+            | Type::Float(_)
+            | Type::PlatformString
+            | Type::PlatformChar
+            | Type::PlatformGeneric(_, _)
+            | Type::PlatformObject
+            | Type::Bool
+            | Type::Void
+            | Type::SIMDVector(_) => {}
+        }
+    }
+
+    fn visit_type_id(&mut self, tpe: Interned<Type>) {
+        if self.types.insert(tpe) {
+            self.visit_type(self.asm[tpe]);
+        }
+    }
+
+    fn visit_signature(&mut self, signature: Interned<FnSig>) {
+        if !self.signatures.insert(signature) {
+            return;
+        }
+        let types: Vec<_> = self.asm[signature].iter_types().collect();
+        for tpe in types {
+            self.visit_type(tpe);
+        }
+    }
+
+    pub(crate) fn visit_class_ref(&mut self, class: Interned<ClassRef>) {
+        if !self.classes.insert(class) {
+            return;
+        }
+        let generics = self.asm[class].generics().to_vec();
+        for generic in generics {
+            self.visit_type(generic);
+        }
+    }
+
+    pub(crate) fn visit_method_ref(&mut self, method: Interned<MethodRef>) {
+        if !self.methods.insert(method) {
+            return;
+        }
+        let types: Vec<_> = self.asm[method].iter_types(self.asm).collect();
+        for tpe in types {
+            self.visit_type(tpe);
+        }
+    }
+
+    pub(crate) fn visit_method_definition(&mut self, method: &MethodDef) {
+        let types: Vec<_> = method.iter_types(self.asm).collect();
+        for tpe in types {
+            self.visit_type(tpe);
+        }
+        if let MethodImpl::AliasFor(target) = method.implementation() {
+            self.visit_method_ref(*target);
+        }
+        if let Some(target) = method.overrides() {
+            self.visit_method_ref(target);
+        }
+    }
+
+    pub(crate) fn visit_class_definition(&mut self, class: ClassDefIdx) {
+        if !self.class_definitions.insert(class) {
+            return;
+        }
+        self.visit_class_ref(class.0);
+        let definition = &self.asm[class];
+        let types: Vec<_> = definition.iter_types().collect();
+        let accessors: Vec<_> = definition.iter_member_method_refs().collect();
+        for tpe in types {
+            self.visit_type(tpe);
+        }
+        for accessor in accessors {
+            self.visit_method_ref(accessor);
+        }
+    }
+
+    /// Follows every discovered assembly-local class definition until its metadata closure is
+    /// complete. Constructed external classes remain references, while their generic arguments are
+    /// still traversed by `visit_class_ref` above.
+    pub(crate) fn close_local_class_definitions(&mut self) {
+        loop {
+            let pending: Vec<_> = self
+                .classes
+                .iter()
+                .filter_map(|class| self.asm.class_ref_to_def(*class))
+                .filter(|class| !self.class_definitions.contains(class))
+                .collect();
+            if pending.is_empty() {
+                return;
+            }
+            for class in pending {
+                self.visit_class_definition(class);
+            }
+        }
+    }
+
+    pub(crate) fn class_definitions(&self) -> impl Iterator<Item = ClassDefIdx> + '_ {
+        self.class_definitions.iter().copied()
+    }
+
+    pub(crate) fn into_class_refs(self) -> Vec<Interned<ClassRef>> {
+        let mut classes: Vec<_> = self.classes.into_iter().collect();
+        classes.sort_unstable_by_key(|class| class.inner());
+        classes
+    }
+}
 pub struct CILIter<'asm> {
-    elems: Vec<(CILIterElem, usize)>,
+    elems: Vec<CILIterElem>,
     asm: &'asm Assembly,
 }
 
 impl<'asm> CILIter<'asm> {
     pub fn new(elems: impl Into<CILIterElem>, asm: &'asm Assembly) -> Self {
         Self {
-            elems: vec![(elems.into(), 0)],
+            elems: vec![elems.into()],
             asm,
         }
     }
 }
+
 impl Iterator for CILIter<'_> {
     type Item = CILIterElem;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let (elem, idx) = self.elems.iter_mut().last()?;
-            if *idx == 0 {
-                *idx += 1;
-                return Some(elem.clone());
+        let elem = self.elems.pop()?;
+        let mut children = Vec::new();
+        match &elem {
+            CILIterElem::Node(node) => {
+                node.visit_child_nodes(|child| {
+                    children.push(CILIterElem::Node(self.asm.get_node(*child).clone()));
+                });
             }
-            match elem {
-                CILIterElem::Root(CILRoot::SetField(fld)) => match idx {
-                    1 => {
-                        *idx += 1;
-                        let lhs = self.asm.get_node(fld.1);
-                        self.elems.push((CILIterElem::Node(lhs.clone()), 0));
-                        continue;
-                    }
-                    2 => {
-                        *idx += 1;
-                        let rhs = self.asm.get_node(fld.2);
-                        self.elems.push((CILIterElem::Node(rhs.clone()), 0));
-                        continue;
-                    }
-                    _ => {
-                        self.elems.pop();
-                        continue;
-                    }
-                },
-                CILIterElem::Root(CILRoot::StInd(ind)) => match idx {
-                    1 => {
-                        *idx += 1;
-                        let lhs = self.asm.get_node(ind.0);
-                        self.elems.push((CILIterElem::Node(lhs.clone()), 0));
-                        continue;
-                    }
-                    2 => {
-                        *idx += 1;
-                        let rhs = self.asm.get_node(ind.1);
-                        self.elems.push((CILIterElem::Node(rhs.clone()), 0));
-                        continue;
-                    }
-                    _ => {
-                        self.elems.pop();
-                        continue;
-                    }
-                },
-                CILIterElem::Root(CILRoot::CpObj { src, dst, .. }) => match idx {
-                    1 => {
-                        *idx += 1;
-                        let lhs = self.asm.get_node(*src);
-                        self.elems.push((CILIterElem::Node(lhs.clone()), 0));
-                        continue;
-                    }
-                    2 => {
-                        *idx += 1;
-                        let rhs = self.asm.get_node(*dst);
-                        self.elems.push((CILIterElem::Node(rhs.clone()), 0));
-                        continue;
-                    }
-                    _ => {
-                        self.elems.pop();
-                        continue;
-                    }
-                },
-                CILIterElem::Node(
-                    CILNode::BinOp(lhs, rhs, _)
-                    | CILNode::LdElelemRef {
-                        array: lhs,
-                        index: rhs,
-                    }
-                    | CILNode::LdElem {
-                        array: lhs,
-                        index: rhs,
-                        ..
-                    },
-                ) => match idx {
-                    1 => {
-                        *idx += 1;
-                        let lhs = self.asm.get_node(*lhs);
-                        self.elems.push((CILIterElem::Node(lhs.clone()), 0));
-                        continue;
-                    }
-                    2 => {
-                        *idx += 1;
-                        let rhs = self.asm.get_node(*rhs);
-                        self.elems.push((CILIterElem::Node(rhs.clone()), 0));
-                        continue;
-                    }
-                    _ => {
-                        self.elems.pop();
-                        continue;
-                    }
-                },
-                CILIterElem::Node(CILNode::Call(info)) | CILIterElem::Root(CILRoot::Call(info)) => {
-                    if *idx - 1 < info.1.len() {
-                        let arg = &info.1[*idx - 1];
-                        let arg = self.asm.get_node(*arg);
-                        *idx += 1;
-                        self.elems.push((CILIterElem::Node(arg.clone()), 0));
-                        continue;
-                    } else {
-                        self.elems.pop();
-                        continue;
-                    }
-                }
-                CILIterElem::Node(CILNode::CallI(info))
-                | CILIterElem::Root(CILRoot::CallI(info)) => match (*idx - 1).cmp(&info.2.len()) {
-                    std::cmp::Ordering::Less => {
-                        let arg = &info.2[*idx - 1];
-                        let arg = self.asm.get_node(*arg);
-                        *idx += 1;
-                        self.elems.push((CILIterElem::Node(arg.clone()), 0));
-                        continue;
-                    }
-                    std::cmp::Ordering::Equal => {
-                        let arg = self.asm.get_node(info.0);
-                        *idx += 1;
-                        self.elems.push((CILIterElem::Node(arg.clone()), 0));
-                    }
-                    std::cmp::Ordering::Greater => {
-                        self.elems.pop();
-                        continue;
-                    }
-                },
-                CILIterElem::Node(
-                    CILNode::UnOp(val, _)
-                    | CILNode::PtrCast(val, _)
-                    | CILNode::LdLen(val)
-                    | CILNode::RefToPtr(val)
-                    | CILNode::IntCast { input: val, .. }
-                    | CILNode::FloatCast { input: val, .. }
-                    | CILNode::LdField { addr: val, .. }
-                    | CILNode::LdFieldAddress { addr: val, .. }
-                    | CILNode::LdInd { addr: val, .. }
-                    | CILNode::IsInst(val, _)
-                    | CILNode::CheckedCast(val, _)
-                    | CILNode::LocAlloc { size: val }
-                    | CILNode::NewArr { len: val, .. }
-                    | CILNode::UnboxAny { object: val, .. }
-                    | CILNode::Box { value: val, .. },
-                )
-                | CILIterElem::Root(
-                    CILRoot::StLoc(_, val)
-                    | CILRoot::StArg(_, val)
-                    | CILRoot::Ret(val)
-                    | CILRoot::InitObj(val, _)
-                    | CILRoot::Pop(val)
-                    | CILRoot::Throw(val)
-                    | CILRoot::SetStaticField { val, .. },
-                ) => {
-                    if idx == &1 {
-                        *idx += 1;
-                        let val = self.asm.get_node(*val);
-                        self.elems.push((CILIterElem::Node(val.clone()), 0));
-                        continue;
-                    } else {
-                        self.elems.pop();
-                        continue;
-                    }
-                }
-                CILIterElem::Node(
-                    CILNode::Const(_)
-                    | CILNode::LdArg(_)
-                    | CILNode::LdLoc(_)
-                    | CILNode::LdArgA(_)
-                    | CILNode::LdLocA(_)
-                    | CILNode::SizeOf(_)
-                    | CILNode::LdStaticField(_)
-                    | CILNode::LdStaticFieldAddress(_)
-                    | CILNode::LdFtn(_)
-                    | CILNode::LdTypeToken(_)
-                    | CILNode::LocAllocAlgined { .. }
-                    | CILNode::GetException,
-                )
-                | CILIterElem::Root(
-                    CILRoot::VoidRet
-                    | CILRoot::Break
-                    | CILRoot::SourceFileInfo { .. }
-                    | CILRoot::ExitSpecialRegion { .. }
-                    | CILRoot::Nop
-                    | CILRoot::ReThrow
-                    | CILRoot::Unreachable(_),
-                ) => {
-                    self.elems.pop();
-                }
-                CILIterElem::Root(CILRoot::TerminateRegion { protected, .. }) => {
-                    if idx == &1 {
-                        *idx += 1;
-                        // Recurse into the single protected child ROOT (not a node) so node/type
-                        // collection reaches the guarded op — it lives nowhere else in the block.
-                        let protected = self.asm.get_root(*protected).clone();
-                        self.elems.push((CILIterElem::Root(protected), 0));
-                        continue;
-                    } else {
-                        self.elems.pop();
-                        continue;
-                    }
-                }
-                CILIterElem::Root(CILRoot::InitBlk(blk) | CILRoot::CpBlk(blk)) => match idx {
-                    1 => {
-                        *idx += 1;
-                        let rhs = self.asm.get_node(blk.0);
-                        self.elems.push((CILIterElem::Node(rhs.clone()), 0));
-                        continue;
-                    }
-                    2 => {
-                        *idx += 1;
-                        let rhs = self.asm.get_node(blk.1);
-                        self.elems.push((CILIterElem::Node(rhs.clone()), 0));
-                        continue;
-                    }
-                    3 => {
-                        *idx += 1;
-                        let rhs = self.asm.get_node(blk.2);
-                        self.elems.push((CILIterElem::Node(rhs.clone()), 0));
-                        continue;
-                    }
-                    _ => {
-                        self.elems.pop();
-                        continue;
-                    }
-                },
-                CILIterElem::Root(CILRoot::StElem {
-                    array,
-                    index,
-                    value,
-                    ..
-                }) => match idx {
-                    1 => {
-                        *idx += 1;
-                        let node = self.asm.get_node(*array);
-                        self.elems.push((CILIterElem::Node(node.clone()), 0));
-                        continue;
-                    }
-                    2 => {
-                        *idx += 1;
-                        let node = self.asm.get_node(*index);
-                        self.elems.push((CILIterElem::Node(node.clone()), 0));
-                        continue;
-                    }
-                    3 => {
-                        *idx += 1;
-                        let node = self.asm.get_node(*value);
-                        self.elems.push((CILIterElem::Node(node.clone()), 0));
-                        continue;
-                    }
-                    _ => {
-                        self.elems.pop();
-                        continue;
-                    }
-                },
-                CILIterElem::Root(CILRoot::Branch(packed)) => {
-                    let (_, _, cond) = packed.as_ref();
-                    let Some(cond) = cond else {
-                        self.elems.pop();
-                        continue;
-                    };
-                    match cond {
-                        BranchCond::True(cond) | BranchCond::False(cond) => {
-                            if idx == &1 {
-                                *idx += 1;
-                                let val = self.asm.get_node(*cond);
-                                self.elems.push((CILIterElem::Node(val.clone()), 0));
-                                continue;
-                            } else {
-                                self.elems.pop();
-                                continue;
-                            }
-                        }
-                        BranchCond::Eq(lhs, rhs)
-                        | BranchCond::Ne(lhs, rhs)
-                        | BranchCond::Lt(lhs, rhs, _)
-                        | BranchCond::Gt(lhs, rhs, _)
-                        | BranchCond::Le(lhs, rhs, _)
-                        | BranchCond::Ge(lhs, rhs, _) => match idx {
-                            1 => {
-                                *idx += 1;
-                                let rhs = self.asm.get_node(*rhs);
-                                self.elems.push((CILIterElem::Node(rhs.clone()), 0));
-                                continue;
-                            }
-                            2 => {
-                                *idx += 1;
-                                let lhs = self.asm.get_node(*lhs);
-                                self.elems.push((CILIterElem::Node(lhs.clone()), 0));
-                                continue;
-                            }
-                            _ => {
-                                self.elems.pop();
-                                continue;
-                            }
-                        },
-                    }
-                }
+            CILIterElem::Root(root) => {
+                root.visit_nodes(|child| {
+                    children.push(CILIterElem::Node(self.asm.get_node(*child).clone()));
+                });
+                root.visit_child_roots(|child| {
+                    children.push(CILIterElem::Root(self.asm.get_root(*child).clone()));
+                });
             }
         }
+        self.elems.extend(children.into_iter().rev());
+        Some(elem)
     }
 }
 
@@ -514,8 +387,8 @@ impl<'this, T: Iterator<Item = CILIterElem> + 'this> TpeIter<'this> for T {
                     | CILNode::LocAlloc { .. }
                     | CILNode::LdLen(_)
                     | CILNode::LdElelemRef { .. } => None,
-                    // Since this method is called, then if it uses an "internal" type, we must assume it is defined in this module. Thus, its types are already included, and we don't need to include them again.
-                    CILNode::Call(_) | CILNode::LdFtn(_) => None,
+                    CILNode::Call(info) => Some(Box::new(asm[info.0].iter_types(asm))),
+                    CILNode::LdFtn(method) => Some(Box::new(asm[method].iter_types(asm))),
                     CILNode::PtrCast(_, res) => match res.as_ref() {
                         crate::cilnode::PtrCastRes::Ptr(inner) => {
                             Some(Box::new(std::iter::once(asm[*inner])))
@@ -597,8 +470,8 @@ impl<'this, T: Iterator<Item = CILIterElem> + 'this> TpeIter<'this> for T {
                     | CILRoot::StElem { elem: tpe, .. } => {
                         Some(Box::new(std::iter::once(asm[tpe])))
                     }
-                    // Since this method is called, then if it uses an "internal" type, we must assume it is defined in this module. Thus, its types are already included, and we don't need to include them again.
-                    CILRoot::Call(_) | CILRoot::CallI(_) => None,
+                    CILRoot::Call(info) => Some(Box::new(asm[info.0].iter_types(asm))),
+                    CILRoot::CallI(_) => None,
                     CILRoot::StInd(info) => Some(Box::new(std::iter::once(info.2))),
                 },
             };

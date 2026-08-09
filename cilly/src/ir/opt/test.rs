@@ -1,9 +1,13 @@
 #[cfg(test)]
 use super::{
-    CILIter, CILIterElem, CILNode, Float, OptFuel, SideEffectInfoCache, Type, propagate_roots,
+    CILIter, CILIterElem, CILNode, EffectInfoCache, Float, MethodImpl, OptFuel, Type,
+    propagate_roots,
 };
 #[cfg(test)]
-use crate::{Assembly, BasicBlock, BinOp, CILRoot};
+use crate::{
+    Access, Assembly, BasicBlock, BinOp, CILRoot, Const, MethodDef, StaticFieldDesc,
+    cilnode::MethodKind,
+};
 
 #[test]
 fn sfi_dedup() {
@@ -36,6 +40,48 @@ fn sfi_dedup() {
     assert_eq!(bb.roots().len(), 3);
     bb.remove_duplicate_sfi(&mut asm);
     assert_eq!(bb.roots().len(), 2);
+}
+
+#[test]
+fn handler_with_static_store_is_never_removed_as_useless() {
+    let mut asm = Assembly::default();
+    let owner = asm.main_module();
+    let field_name = asm.alloc_string("cleanup_observed");
+    let field = asm.alloc_sfld(StaticFieldDesc::new(
+        owner.0,
+        field_name,
+        Type::Int(crate::Int::I32),
+    ));
+    let value = asm.alloc_node(Const::I32(1));
+    let store = asm.alloc_root(CILRoot::SetStaticField { field, val: value });
+    let rethrow = asm.alloc_root(CILRoot::ReThrow);
+    let protected = asm.alloc_root(CILRoot::Nop);
+    let block = BasicBlock::new(
+        vec![protected],
+        0,
+        Some(vec![BasicBlock::new(vec![store, rethrow], 1, None)]),
+    );
+    let sig = asm.sig([], Type::Void);
+    let name = asm.alloc_string("static_store_cleanup");
+    let mut method = MethodDef::new(
+        Access::Private,
+        owner,
+        name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![block],
+            locals: vec![],
+        },
+        vec![],
+    );
+    let mut cache = EffectInfoCache::default();
+    let mut fuel = OptFuel::new(u32::MAX);
+    method.optimize(&mut asm, &mut cache, &mut fuel);
+    let MethodImpl::MethodBody { blocks, .. } = method.implementation() else {
+        panic!("test method changed implementation kind");
+    };
+    assert!(blocks[0].handler().is_some());
 }
 
 /// Regression test found while investigating the fractal-demo Mandelbrot perf gap:
@@ -71,7 +117,7 @@ fn propagate_locals_does_not_duplicate_multi_use_expr() {
     let mut root = asm.alloc_root(CILRoot::StLoc(3, mul_tree));
 
     let sig = asm.sig([], Type::Void);
-    let mut cache = SideEffectInfoCache::default();
+    let mut cache = EffectInfoCache::default();
     let mut fuel = OptFuel::new(u32::MAX);
     propagate_roots(
         &mut asm, &mut root, prev_root, &mut cache, &locals, sig, &mut fuel,

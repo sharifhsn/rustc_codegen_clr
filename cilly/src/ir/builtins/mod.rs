@@ -5,7 +5,7 @@ use crate::{StaticFieldDesc, utilis::mstring_to_utf8ptr};
 use super::{
     Access, Assembly, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, Const, FieldDesc, Int,
     MethodDef, MethodImpl, MethodRef, Type,
-    asm::MissingMethodPatcher,
+    asm::{MissingMethodPatcher, RuntimeService},
     bimap::Interned,
     cilnode::{MethodKind, PtrCastRes},
     cilroot::BranchCond,
@@ -388,7 +388,6 @@ fn insert_rust_alloc(
         return;
     }
     let allocator = aligned_allocator_refs(asm, unity_netstandard);
-    let name = asm.alloc_string("__rust_alloc");
     let generator = move |mref, asm: &mut Assembly| {
         let size = asm.alloc_node(CILNode::LdArg(0));
         let align = load_align_usize(asm, 1);
@@ -419,7 +418,7 @@ fn insert_rust_alloc(
             locals: vec![],
         }
     };
-    patcher.insert(name, Box::new(generator));
+    patcher.insert_runtime_service(asm, RuntimeService::Alloc, Box::new(generator));
 }
 fn insert_rust_alloc_zeroed(
     asm: &mut Assembly,
@@ -432,7 +431,6 @@ fn insert_rust_alloc_zeroed(
         return;
     }
     let allocator = aligned_allocator_refs(asm, unity_netstandard);
-    let name = asm.alloc_string("__rust_alloc_zeroed");
     let generator = move |mref, asm: &mut Assembly| {
         let size = asm.alloc_node(CILNode::LdArg(0));
         let align = load_align_usize(asm, 1);
@@ -468,7 +466,7 @@ fn insert_rust_alloc_zeroed(
             locals: vec![(None, asm.alloc_type(void_ptr))],
         }
     };
-    patcher.insert(name, Box::new(generator));
+    patcher.insert_runtime_service(asm, RuntimeService::AllocZeroed, Box::new(generator));
 }
 
 pub fn uninit_val(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
@@ -551,7 +549,6 @@ fn insert_rust_realloc(
     use_pool_alloc: bool,
     unity_netstandard: bool,
 ) {
-    let name = asm.alloc_string("__rust_realloc");
     if use_pool_alloc {
         pool_alloc::insert_rust_realloc(asm, patcher);
     } else {
@@ -647,7 +644,7 @@ fn insert_rust_realloc(
                 locals: vec![(None, void_ptr_type)],
             }
         };
-        patcher.insert(name, Box::new(generator));
+        patcher.insert_runtime_service(asm, RuntimeService::Realloc, Box::new(generator));
     }
 }
 fn insert_rust_dealloc(
@@ -656,7 +653,6 @@ fn insert_rust_dealloc(
     use_pool_alloc: bool,
     unity_netstandard: bool,
 ) {
-    let name = asm.alloc_string("__rust_dealloc");
     if use_pool_alloc {
         pool_alloc::insert_rust_dealloc(asm, patcher);
     } else {
@@ -674,7 +670,7 @@ fn insert_rust_dealloc(
                 locals: vec![],
             }
         };
-        patcher.insert(name, Box::new(generator));
+        patcher.insert_runtime_service(asm, RuntimeService::Dealloc, Box::new(generator));
     }
 }
 pub fn insert_exeception_stub(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {

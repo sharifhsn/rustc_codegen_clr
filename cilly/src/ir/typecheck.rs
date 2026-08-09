@@ -25,6 +25,17 @@ pub enum TypeCheckError {
         argument: u32,
         inputs: usize,
     },
+    /// A root instruction produced a value that is incompatible with its destination.
+    RootTypeMismatch {
+        operation: &'static str,
+        got: Type,
+        expected: Type,
+    },
+    /// A root instruction received an operand of the wrong stack kind.
+    RootOperandType {
+        operation: &'static str,
+        got: Type,
+    },
     /// CIL contains a binop with incorrect arguments
     WrongBinopArgs {
         /// The type of the left argument of this op
@@ -1230,6 +1241,27 @@ impl CILNode {
         }
     }
 }
+
+fn root_types_compatible(got: Type, expected: Type, asm: &Assembly) -> bool {
+    got.is_assignable_to(expected, asm) || is_erased_ptr_sink(got, expected, asm)
+}
+
+fn require_root_pointer(operation: &'static str, got: Type) -> Result<(), TypeCheckError> {
+    if got.pointed_to().is_some() {
+        Ok(())
+    } else {
+        Err(TypeCheckError::RootOperandType { operation, got })
+    }
+}
+
+fn require_root_integer(operation: &'static str, got: Type) -> Result<(), TypeCheckError> {
+    if got.as_int().is_some() || got == Type::Bool {
+        Ok(())
+    } else {
+        Err(TypeCheckError::RootOperandType { operation, got })
+    }
+}
+
 impl CILRoot {
     pub fn typecheck(
         &self,
@@ -1240,7 +1272,12 @@ impl CILRoot {
         match self {
             Self::StLoc(loc, node) => {
                 let got = asm.get_node(*node).clone().typecheck(sig, locals, asm)?;
-                let expected = asm[locals[*loc as usize].1];
+                let expected = locals.get(*loc as usize).map(|local| asm[local.1]).ok_or(
+                    TypeCheckError::LocalOutOfRange {
+                        local: *loc,
+                        locals: locals.len(),
+                    },
+                )?;
                 // Benign-noise suppression (diagnostics only): storing a Void-typed value into a
                 // local is a no-op at runtime — a Void value carries no bits and is elided by the
                 // exporter/JIT. This arises from `LdStaticField` of opaque/ZST marker statics (e.g.
@@ -1304,6 +1341,70 @@ impl CILRoot {
                     Ok(())
                 }
             }
+            Self::StArg(arg, node) => {
+                let got = asm.get_node(*node).clone().typecheck(sig, locals, asm)?;
+                let expected = asm[sig].inputs().get(*arg as usize).copied().ok_or(
+                    TypeCheckError::ArgumentOutOfRange {
+                        argument: *arg,
+                        inputs: asm[sig].inputs().len(),
+                    },
+                )?;
+                if root_types_compatible(got, expected, asm) {
+                    Ok(())
+                } else {
+                    Err(TypeCheckError::RootTypeMismatch {
+                        operation: "starg",
+                        got,
+                        expected,
+                    })
+                }
+            }
+            Self::Ret(node) => {
+                let got = asm.get_node(*node).clone().typecheck(sig, locals, asm)?;
+                let expected = *asm[sig].output();
+                if root_types_compatible(got, expected, asm) {
+                    Ok(())
+                } else {
+                    Err(TypeCheckError::RootTypeMismatch {
+                        operation: "ret",
+                        got,
+                        expected,
+                    })
+                }
+            }
+            Self::VoidRet => {
+                let expected = *asm[sig].output();
+                if expected == Type::Void {
+                    Ok(())
+                } else {
+                    Err(TypeCheckError::RootTypeMismatch {
+                        operation: "ret",
+                        got: Type::Void,
+                        expected,
+                    })
+                }
+            }
+            Self::Pop(node) => {
+                asm.get_node(*node).clone().typecheck(sig, locals, asm)?;
+                Ok(())
+            }
+            Self::Throw(node) => {
+                let got = asm.get_node(*node).clone().typecheck(sig, locals, asm)?;
+                if got.is_gcref(asm) {
+                    Ok(())
+                } else {
+                    Err(TypeCheckError::RootOperandType {
+                        operation: "throw",
+                        got,
+                    })
+                }
+            }
+            Self::Break
+            | Self::Nop
+            | Self::SourceFileInfo { .. }
+            | Self::ExitSpecialRegion { .. }
+            | Self::ReThrow
+            | Self::Unreachable(_) => Ok(()),
             Self::Branch(boxed) => {
                 let (_, _, cond) = boxed.as_ref();
                 let Some(cond) = cond else { return Ok(()) };
@@ -1435,30 +1536,17 @@ impl CILRoot {
             Self::Call(boxed) => {
                 let (mref, args, _is_pure) = boxed.as_ref();
                 let mref = asm[*mref].clone();
-                let call_sig = asm[mref.sig()].clone();
-                match mref.kind() {
-                    crate::cilnode::MethodKind::Static => {
-                        let expected = call_sig.inputs().len();
-                        let got = args.len();
-                        if expected != got {
-                            return Err(TypeCheckError::CallArgcWrong {
-                                expected,
-                                got,
-                                mname: asm[mref.name()].into(),
-                            });
-                        }
-                    }
-                    crate::cilnode::MethodKind::Instance
-                    | crate::cilnode::MethodKind::Virtual
-                    | crate::cilnode::MethodKind::Constructor => (),
+                let inputs: Box<[_]> = mref.stack_inputs(asm).into();
+                if inputs.len() != args.len() {
+                    return Err(TypeCheckError::CallArgcWrong {
+                        expected: inputs.len(),
+                        got: args.len(),
+                        mname: asm[mref.name()].into(),
+                    });
                 }
-                for (index, (arg, expected)) in
-                    args.iter().zip(call_sig.inputs().iter()).enumerate()
-                {
+                for (index, (arg, expected)) in args.iter().zip(inputs.iter()).enumerate() {
                     let arg = asm[*arg].clone().typecheck(sig, locals, asm)?;
-                    if !arg.is_assignable_to(*expected, asm)
-                        && !is_erased_ptr_sink(arg, *expected, asm)
-                    {
+                    if !root_types_compatible(arg, *expected, asm) {
                         return Err(TypeCheckError::CallArgTypeWrong {
                             got: arg.mangle(asm),
                             expected: expected.mangle(asm),
@@ -1467,7 +1555,88 @@ impl CILRoot {
                         });
                     }
                 }
-                Ok(())
+                let output = mref.output(asm);
+                if output == Type::Void {
+                    Ok(())
+                } else {
+                    Err(TypeCheckError::RootTypeMismatch {
+                        operation: "statement call result",
+                        got: output,
+                        expected: Type::Void,
+                    })
+                }
+            }
+            Self::CallI(boxed) => {
+                let output = CILNode::CallI(boxed.clone()).typecheck(sig, locals, asm)?;
+                if output == Type::Void {
+                    Ok(())
+                } else {
+                    Err(TypeCheckError::RootTypeMismatch {
+                        operation: "statement calli result",
+                        got: output,
+                        expected: Type::Void,
+                    })
+                }
+            }
+            Self::InitBlk(boxed) => {
+                let (dst, value, count) = boxed.as_ref();
+                let dst = asm[*dst].clone().typecheck(sig, locals, asm)?;
+                let value = asm[*value].clone().typecheck(sig, locals, asm)?;
+                let count = asm[*count].clone().typecheck(sig, locals, asm)?;
+                require_root_pointer("initblk destination", dst)?;
+                require_root_integer("initblk value", value)?;
+                require_root_integer("initblk count", count)
+            }
+            Self::CpBlk(boxed) => {
+                let (dst, src, count) = boxed.as_ref();
+                let dst = asm[*dst].clone().typecheck(sig, locals, asm)?;
+                let src = asm[*src].clone().typecheck(sig, locals, asm)?;
+                let count = asm[*count].clone().typecheck(sig, locals, asm)?;
+                require_root_pointer("cpblk destination", dst)?;
+                require_root_pointer("cpblk source", src)?;
+                require_root_integer("cpblk count", count)
+            }
+            Self::CpObj { src, dst, tpe } => {
+                let src = asm[*src].clone().typecheck(sig, locals, asm)?;
+                let dst = asm[*dst].clone().typecheck(sig, locals, asm)?;
+                require_root_pointer("cpobj source", src)?;
+                require_root_pointer("cpobj destination", dst)?;
+                let copied = asm[*tpe];
+                if copied == Type::Void {
+                    Err(TypeCheckError::RootOperandType {
+                        operation: "cpobj type",
+                        got: copied,
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+            Self::InitObj(addr, tpe) => {
+                let addr = asm[*addr].clone().typecheck(sig, locals, asm)?;
+                require_root_pointer("initobj destination", addr)?;
+                let initialized = asm[*tpe];
+                if initialized == Type::Void {
+                    Err(TypeCheckError::RootOperandType {
+                        operation: "initobj type",
+                        got: initialized,
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+            Self::SetStaticField { field, val } => {
+                let field = *asm.get_static_field(*field);
+                let got = asm[*val].clone().typecheck(sig, locals, asm)?;
+                let expected = field.tpe();
+                if root_types_compatible(got, expected, asm) {
+                    Ok(())
+                } else {
+                    Err(TypeCheckError::RootTypeMismatch {
+                        operation: "stsfld",
+                        got,
+                        expected,
+                    })
+                }
             }
             Self::StElem {
                 array,
@@ -1526,12 +1695,6 @@ impl CILRoot {
                 // any block's top-level root list, so nothing else would check it).
                 asm.get_root(*protected).clone().typecheck(sig, locals, asm)
             }
-            _ => {
-                for node in self.nodes() {
-                    asm.get_node(*node).clone().typecheck(sig, locals, asm)?;
-                }
-                Ok(())
-            }
         }
     }
 }
@@ -1570,6 +1733,40 @@ mod tc_tests {
         root.typecheck(sig, &locals, asm)
     }
 
+    #[test]
+    fn root_compatibility_does_not_erase_integer_width_or_boolean_type() {
+        let asm = Assembly::default();
+
+        assert!(!root_types_compatible(
+            Type::Bool,
+            Type::Int(Int::I64),
+            &asm
+        ));
+        assert!(!root_types_compatible(
+            Type::Int(Int::U64),
+            Type::Bool,
+            &asm
+        ));
+        assert!(!root_types_compatible(
+            Type::Int(Int::I32),
+            Type::Int(Int::U32),
+            &asm
+        ));
+    }
+
+    #[test]
+    fn root_compatibility_preserves_directional_pointer_to_byref_assignment() {
+        let mut asm = Assembly::default();
+        // `*u8` is deliberately accepted as an erased ABI sink elsewhere. Use an ordinary
+        // pointee here so this regression isolates the pointer/byref assignment direction.
+        let i32_tpe = asm.alloc_type(Type::Int(Int::I32));
+        let ptr = Type::Ptr(i32_tpe);
+        let byref = Type::Ref(i32_tpe);
+
+        assert!(root_types_compatible(ptr, byref, &asm));
+        assert!(!root_types_compatible(byref, ptr, &asm));
+    }
+
     /// PROVEN FALSE POSITIVE (task #43 / WF-C): storing a `Void`-typed value (e.g. a `LdStaticField`
     /// of an opaque ZST marker static like `__rust_no_alloc_shim_is_unstable`) into a non-void local
     /// is a runtime no-op — Void carries no bits. The checker must NOT flag it.
@@ -1600,6 +1797,120 @@ mod tc_tests {
             ),
             "storing an f64 into a usize local must be rejected"
         );
+    }
+
+    #[test]
+    fn root_store_indices_are_checked_without_panicking() {
+        let mut asm = Assembly::default();
+        let value = asm.alloc_node(Const::I32(1));
+        let void_sig = asm.sig([], Type::Void);
+        assert!(matches!(
+            CILRoot::StLoc(4, value).typecheck(void_sig, &[], &mut asm),
+            Err(TypeCheckError::LocalOutOfRange {
+                local: 4,
+                locals: 0
+            })
+        ));
+
+        let one_arg_sig = asm.sig([Type::Int(Int::I32)], Type::Void);
+        assert!(matches!(
+            CILRoot::StArg(1, value).typecheck(one_arg_sig, &[], &mut asm),
+            Err(TypeCheckError::ArgumentOutOfRange {
+                argument: 1,
+                inputs: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn root_return_kind_must_match_method_signature() {
+        let mut asm = Assembly::default();
+        let value = asm.alloc_node(Const::I32(1));
+        let void_sig = asm.sig([], Type::Void);
+        assert!(matches!(
+            CILRoot::Ret(value).typecheck(void_sig, &[], &mut asm),
+            Err(TypeCheckError::RootTypeMismatch {
+                operation: "ret",
+                ..
+            })
+        ));
+
+        let value_sig = asm.sig([], Type::Int(Int::I32));
+        assert!(matches!(
+            CILRoot::VoidRet.typecheck(value_sig, &[], &mut asm),
+            Err(TypeCheckError::RootTypeMismatch {
+                operation: "ret",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn statement_call_checks_instance_arity_and_void_result() {
+        let mut asm = Assembly::default();
+        let owner = asm.main_module();
+        let owner_tpe = Type::ClassRef(owner.0);
+        let name = asm.alloc_string("instance_call_target");
+        let callee_sig = asm.sig([owner_tpe, Type::Int(Int::I32)], Type::Void);
+        let callee = asm.alloc_methodref(super::super::MethodRef::new(
+            owner.0,
+            name,
+            callee_sig,
+            MethodKind::Instance,
+            [].into(),
+        ));
+        let only_receiver = asm.alloc_node(CILNode::LdArg(0));
+        let caller_sig = asm.sig([owner_tpe], Type::Void);
+        let call = CILRoot::Call(Box::new((
+            callee,
+            [only_receiver].into(),
+            crate::cilnode::IsPure::NOT,
+        )));
+        assert!(matches!(
+            call.typecheck(caller_sig, &[], &mut asm),
+            Err(TypeCheckError::CallArgcWrong {
+                expected: 2,
+                got: 1,
+                ..
+            })
+        ));
+
+        let value_name = asm.alloc_string("value_call_target");
+        let value_sig = asm.sig([], Type::Int(Int::I32));
+        let void_sig = asm.sig([], Type::Void);
+        let value_callee = asm.alloc_methodref(super::super::MethodRef::new(
+            owner.0,
+            value_name,
+            value_sig,
+            MethodKind::Static,
+            [].into(),
+        ));
+        let call = CILRoot::Call(Box::new((
+            value_callee,
+            [].into(),
+            crate::cilnode::IsPure::NOT,
+        )));
+        assert!(matches!(
+            call.typecheck(void_sig, &[], &mut asm),
+            Err(TypeCheckError::RootTypeMismatch {
+                operation: "statement call result",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn throw_requires_a_managed_reference() {
+        let mut asm = Assembly::default();
+        let value = asm.alloc_node(Const::I32(1));
+        let sig = asm.sig([], Type::Void);
+        assert!(matches!(
+            CILRoot::Throw(value).typecheck(sig, &[], &mut asm),
+            Err(TypeCheckError::RootOperandType {
+                operation: "throw",
+                ..
+            })
+        ));
     }
 
     #[test]

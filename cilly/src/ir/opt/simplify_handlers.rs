@@ -3,7 +3,7 @@ use fxhash::{FxHashMap, FxHashSet};
 
 use crate::{Assembly, BasicBlock, CILRoot};
 
-use super::{OptFuel, SideEffectInfoCache, block_with_id, blockid_from_jump};
+use super::{EffectInfoCache, OptFuel, block_with_id, blockid_from_jump};
 
 fn block_gc(blocks: &mut Vec<BasicBlock>, asm: &Assembly) {
     //debug_assert!(is_sorted(bbs.iter(),|a,b|a.id + 1 == b.id));
@@ -38,7 +38,7 @@ pub fn simplify_bbs(
     handler: Option<&mut Vec<BasicBlock>>,
     asm: &mut Assembly,
     fuel: &mut OptFuel,
-    cache: &mut SideEffectInfoCache,
+    cache: &mut EffectInfoCache,
 ) {
     let Some(blocks) = handler else { return };
     let direct_jumps: FxHashMap<_, Option<(u32, u32)>> = blocks
@@ -69,7 +69,7 @@ pub fn simplify_bbs(
             if cond
                 .nodes()
                 .into_iter()
-                .any(|node| cache.has_side_effects(node, asm))
+                .any(|node| !cache.summary(node, asm).is_pure_total())
             {
                 continue;
             }

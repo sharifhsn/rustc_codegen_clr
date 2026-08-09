@@ -151,7 +151,7 @@ mod tests {
     fn accumulator_rejects_field_level_config_mismatch_before_linking() {
         let expected = ArtifactAbiConfig::default();
         let found = ArtifactAbiConfig::default()
-            .with_dotnet_runtime(DotnetRuntime::Net10)
+            .with_dotnet_runtime(DotnetRuntime::UnityNetStandard21)
             .with_no_unwind(true);
         let first = AssemblyArtifact::new(Assembly::default(), expected)
             .encode()
@@ -165,7 +165,7 @@ mod tests {
         let error = accumulator.merge_encoded(&second, "second.bc").unwrap_err();
         let diagnostic = error.to_string();
         assert!(diagnostic.contains("second.bc"));
-        assert!(diagnostic.contains("dotnet_runtime: expected Net10, found Net9"));
+        assert!(diagnostic.contains("dotnet_runtime: expected Net10, found UnityNetStandard21"));
         assert!(diagnostic.contains("no_unwind: expected false, found true"));
     }
 

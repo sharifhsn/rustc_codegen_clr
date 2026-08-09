@@ -689,39 +689,18 @@ pub(crate) fn export_pe_with_source_link(
     // --- Pass 3: methods. Every class def's methods, in insertion order, matching
     // `il_exporter::export_to_write`'s per-class method loop (the unpartitioned path only — the
     // `MainModule`-overflow partition split is a documented, deliberately-deferred gap, see the
-    // module doc's "Phase 1b additions" section). Fail LOUDLY here rather than silently emitting an
-    // over-large `MainModule` TypeDef that would only fail much later, opaquely, as a
-    // `TypeLoadException: … contains more methods than the current implementation allows` at
-    // `dotnet` load time with no indication which pass caused it.
-    if let Some(main_class) = class_def_ids.iter().find(|&&id| id == main_module_id) {
-        check_main_module_method_count(asm[*main_class].methods().len());
-    }
+    // module doc's "Phase 1b additions" section). `validate_for_pe` rejects an over-large module
+    // before this byte writer is entered.
     let ordered_methods: std::collections::HashMap<_, Vec<_>> = class_def_ids
         .iter()
         .map(|&class_id| {
             let mut methods = asm[class_id].methods().to_vec();
-            methods.sort_unstable_by_key(|&method_id| {
-                let method = &asm[method_id];
-                let sig = &asm[method.sig()];
-                let inputs = sig
-                    .inputs()
-                    .iter()
-                    .map(|input| input.mangle(asm))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                format!(
-                    "{}({inputs})->{}:{}",
-                    &asm[method.name()],
-                    sig.output().mangle(asm),
-                    method.generic_params().len()
-                )
-            });
+            methods.sort_by_cached_key(|&method_id| asm.method_semantic_key(method_id));
             (class_id, methods)
         })
         .collect();
     let mut entry_point_token: Option<Token> = None;
     for &class_def_id in &class_def_ids {
-        let class_def = asm[class_def_id].clone();
         // Same run-start re-stamp as Pass 2's `set_type_def_field_list`, for `MethodList`
         // instead of `FieldList` — see Pass 1's doc comment; `add_method`'s own doc documents
         // the identical "most recently added TypeDef" assumption this call satisfies.
@@ -837,28 +816,8 @@ pub(crate) fn export_pe_with_source_link(
             // `.method` header line — see that resolver's doc for why every other
             // `TypeDefOrRefResolver` call site in this exporter (bodies, `extends`, `calli`,
             // fields) must stay on the shared, impl-assembly-qualified `MetadataBuilder` path.
-            // Soundness gate for a generic method DEFINITION's declared signature: every
-            // `!!N` (`ELEMENT_TYPE_MVAR`, `GenericKind::CallGeneric`) marker must name one of
-            // this method's OWN declared parameters (`N < generic_count`), and every `!N`
-            // (`ELEMENT_TYPE_VAR`, `TypeGeneric`/`MethodGeneric`) must name one of the OWNING
-            // TYPE's declared parameters (`N < class arity`). An out-of-range index — or a
-            // `GenParamCount` that disagrees with the owned `GenericParam` row count — is
-            // exactly the malformed metadata CoreCLR's type loader rejects with a
-            // `TypeLoadException` far from the defect; panic here, naming the method, instead.
-            // Scoped to methods that declare generics: a non-generic method's signature is
-            // untouched (whatever marker misuse was possible before this feature still fails
-            // the same way it always did, at the same place).
-            if generic_count > 0 {
-                for tpe in encode_sig.iter_types() {
-                    assert_generic_indices_in_range(
-                        asm,
-                        tpe,
-                        generic_count,
-                        class_def.generics(),
-                        &name,
-                    );
-                }
-            }
+            // `validate_for_pe` has already checked every nested `!N`/`!!N` against this
+            // method/type's owning generic arity, including non-generic methods on generic types.
             sig::encode_method_sig(
                 convention,
                 generic_count,
@@ -1305,110 +1264,6 @@ fn bytes_for_scalar_const(cst: &Const) -> Vec<u8> {
     }
 }
 
-/// CoreCLR's per-type method cap, with headroom (mirrors `il_exporter::partition::PARTITION_LIMIT`,
-/// `cilly/src/ir/il_exporter/partition.rs:32`).
-const PARTITION_LIMIT: usize = 60_000;
-
-/// Fails loudly if `MainModule` has grown past [`PARTITION_LIMIT`] methods — see Pass 3's call
-/// site for why this can't be a silent no-op.
-///
-/// `PARTITION_LIMIT` is intentionally duplicated (not imported) from
-/// `il_exporter::partition::PARTITION_LIMIT`: that module is `mod partition;` (private, not `pub
-/// mod`) inside `il_exporter`, so it is genuinely unreachable from `pe_exporter` today —
-/// confirming, not just asserting, the module doc's claim that partitioning is NOT an
-/// upstream/assembly-level transform this exporter could inherit for free (`ModulePartition` is
-/// built and consumed entirely inside `ILExporter::export_to_write`).
-///
-/// A standalone `usize -> ()` function (rather than inlined at the call site) so the overflow
-/// case is unit-testable without actually constructing 60,001 `MethodDef`s (measured: doing so in
-/// a test took over 60 seconds — some downstream bookkeeping the `Assembly` builder does per
-/// `new_method` call is not built for that scale, which is itself a data point about why this
-/// exporter needs the real partition port before anything that large is a realistic input).
-fn check_main_module_method_count(method_count: usize) {
-    assert!(
-        method_count <= PARTITION_LIMIT,
-        "MainModule has {method_count} methods (> {PARTITION_LIMIT}) — `pe_exporter` does not yet \
-         port `il_exporter::partition`'s per-module TypeDef split (see this file's module doc: \
-         porting it needs an interleaved TypeDef/MethodDef pass, since `add_type_def`'s \
-         `method_list`/`field_list` cursors are table-position-sensitive, plus a `body.rs` \
-         cross-partition call-token redirect). No assembly this milestone's test suite builds gets \
-         anywhere near this size; a real whole-program build that does will need that work landed \
-         first rather than silently producing a `TypeLoadException`-doomed image."
-    );
-}
-
-/// Recursively asserts every generic-parameter marker inside `tpe` (a type appearing in a
-/// generic method DEFINITION's declared signature — `MethodDef::generic_params` non-empty) is in
-/// range: a `!!N` (`ELEMENT_TYPE_MVAR`, `GenericKind::CallGeneric`) must satisfy
-/// `N < method_generic_count` (the method's own declared arity), and a `!N`
-/// (`ELEMENT_TYPE_VAR`, `TypeGeneric`/`MethodGeneric` — see `sig.rs`'s naming-crossover note)
-/// must satisfy `N < class_generic_count` (the owning type's declared arity — 0 for a
-/// non-generic owner, so ANY `!N` on one is rejected: no class generic context exists).
-/// Recurses through pointer/byref pointees, array elements, `ClassRef` instantiation arguments,
-/// and fn-pointer signatures — everywhere `sig.rs`'s encoder can reach a nested
-/// `Type::PlatformGeneric`. Called from Pass 3 only for methods that declare generics (see the
-/// call-site comment for why non-generic methods are left untouched).
-fn assert_generic_indices_in_range(
-    asm: &Assembly,
-    tpe: crate::ir::Type,
-    method_generic_count: u32,
-    class_generic_count: u32,
-    method_name: &str,
-) {
-    use crate::ir::tpe::GenericKind;
-    match tpe {
-        crate::ir::Type::PlatformGeneric(n, GenericKind::CallGeneric) => assert!(
-            n < method_generic_count,
-            "generic method definition `{method_name}` declares {method_generic_count} generic \
-             parameter(s) but its signature references `!!{n}` (ELEMENT_TYPE_MVAR index {n}) — \
-             out-of-range metadata CoreCLR's type loader would reject at load time"
-        ),
-        crate::ir::Type::PlatformGeneric(
-            n,
-            GenericKind::TypeGeneric | GenericKind::MethodGeneric,
-        ) => {
-            assert!(
-                n < class_generic_count,
-                "generic method definition `{method_name}`'s signature references the owning \
-                 type's generic parameter `!{n}` (ELEMENT_TYPE_VAR index {n}), but the owning \
-                 type declares {class_generic_count} generic parameter(s)"
-            );
-        }
-        crate::ir::Type::Ptr(inner)
-        | crate::ir::Type::Ref(inner)
-        | crate::ir::Type::PlatformArray { elem: inner, .. } => assert_generic_indices_in_range(
-            asm,
-            asm[inner],
-            method_generic_count,
-            class_generic_count,
-            method_name,
-        ),
-        crate::ir::Type::ClassRef(cref) => {
-            for &garg in asm[cref].generics() {
-                assert_generic_indices_in_range(
-                    asm,
-                    garg,
-                    method_generic_count,
-                    class_generic_count,
-                    method_name,
-                );
-            }
-        }
-        crate::ir::Type::FnPtr(fnsig) => {
-            for inner in asm[fnsig].iter_types() {
-                assert_generic_indices_in_range(
-                    asm,
-                    inner,
-                    method_generic_count,
-                    class_generic_count,
-                    method_name,
-                );
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Finds-or-creates a `TypeRef` to `System.Runtime`-scoped `type_name` (`System.Object` /
 /// `System.ValueType` — the two implicit base types every class needs, see the Pass 1 comment
 /// above). Uses [`MetadataBuilder::find_or_create_assembly_ref`] (not the always-inserts
@@ -1548,25 +1403,6 @@ mod tests {
     use crate::ir::{Access, BasicBlock, CILNode, CILRoot, Const, MethodImpl, Type};
     use std::io::Write as _;
     use std::process::Command;
-
-    /// The `MainModule`-overflow guard (`check_main_module_method_count`, called from Pass 3) must
-    /// fail LOUDLY rather than silently letting `export_pe` emit an image `dotnet` would only
-    /// reject much later, opaquely, with `TypeLoadException: … contains more methods than the
-    /// current implementation allows`. Calls the guard directly with a huge count instead of
-    /// constructing 60,001 real `MethodDef`s through `export_pe` — measured that construction path
-    /// alone (independent of this change) at over 60 seconds, too slow for a unit test; see
-    /// `check_main_module_method_count`'s doc for why a standalone function was worth it here.
-    #[test]
-    #[should_panic(expected = "does not yet port")]
-    fn check_main_module_method_count_panics_loudly_past_the_partition_limit() {
-        check_main_module_method_count(PARTITION_LIMIT + 1);
-    }
-
-    #[test]
-    fn check_main_module_method_count_accepts_up_to_the_partition_limit() {
-        check_main_module_method_count(PARTITION_LIMIT);
-        check_main_module_method_count(0);
-    }
 
     #[test]
     fn export_pe_smoke_no_entry_point_produces_a_loadable_shape() {

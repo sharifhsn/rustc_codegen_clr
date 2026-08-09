@@ -437,7 +437,7 @@ fn main() {
             .iter()
             .map(|fn_name| (*fn_name, "gameboy".to_owned())),
     );
-    let mut overrides: MissingMethodPatcher = FxHashMap::default();
+    let mut overrides = MissingMethodPatcher::default();
     overrides.insert(
         final_assembly.alloc_string("pthread_atfork"),
         Box::new(|_, asm: &mut Assembly| {
@@ -620,11 +620,14 @@ fn main() {
         ))
         .unwrap();
 
-    let resolution = final_assembly.resolve_missing_methods(&externs, &modifies_errno, &overrides);
+    let resolution = final_assembly
+        .try_resolve_missing_methods(&externs, &modifies_errno, &overrides)
+        .unwrap_or_else(|error| panic!("missing-method resolution failed: {error}"));
     println!("==> Missing-method resolution: {resolution}");
     if resolution.unresolved_missing_methods != 0 {
         println!(
-            "linker: preserving {} unresolved non-abstract MethodImpl::Missing runtime stub(s)",
+            "linker: deferring {} unresolved non-abstract MethodImpl::Missing runtime stub(s); \
+             any that remain reachable after dead-code elimination will fail final verification",
             resolution.unresolved_missing_methods
         );
     }
@@ -786,7 +789,7 @@ fn main() {
             .filter(|value| !value.is_empty());
         let (bytes, pdb_bytes) = final_assembly
             .render_pe_with_source_link(&pe_options, source_link_json.as_deref())
-            .unwrap_or_else(|error| panic!("direct-PE post-render verification failed: {error}"));
+            .unwrap_or_else(|error| panic!("direct-PE emission failed: {error}"));
         std::fs::write(&exe_out, bytes).unwrap();
         if !pdb_bytes.is_empty() {
             std::fs::write(exe_out.with_file_name(&pdb_file_name), pdb_bytes).unwrap();
@@ -882,12 +885,12 @@ mod linker_config_tests {
     fn versioned_artifact_abi_must_match_linker_process() {
         let artifact = ArtifactAbiConfig::default();
         let process = ArtifactAbiConfig::default()
-            .with_dotnet_runtime(DotnetRuntime::Net10)
+            .with_dotnet_runtime(DotnetRuntime::UnityNetStandard21)
             .with_no_unwind(true);
 
         let error = effective_abi_config(Some(artifact), process).unwrap_err();
         let diagnostic = error.to_string();
-        assert!(diagnostic.contains("dotnet_runtime: expected Net10, found Net9"));
+        assert!(diagnostic.contains("dotnet_runtime: expected Net10, found UnityNetStandard21"));
         assert!(diagnostic.contains("no_unwind: expected false, found true"));
     }
 

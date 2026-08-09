@@ -8,7 +8,7 @@ use crate::Access;
 
 use super::ALLOC_CAP;
 use crate::Assembly;
-use crate::ir::asm::MissingMethodPatcher;
+use crate::ir::asm::{MissingMethodPatcher, RuntimeService};
 use crate::ir::cilnode::{ExtendKind, MethodKind};
 use crate::ir::cilroot::{BranchCond, CmpKind};
 use crate::ir::{
@@ -84,7 +84,6 @@ pub(super) fn pool_realloc_mref(asm: &mut Assembly) -> crate::Interned<MethodRef
 }
 
 pub(super) fn insert_rust_alloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    let name = asm.alloc_string("__rust_alloc");
     let generator = move |mref, asm: &mut Assembly| {
         let size = asm.alloc_node(CILNode::LdArg(0));
         let align = super::load_align_usize(asm, 1);
@@ -98,11 +97,10 @@ pub(super) fn insert_rust_alloc(asm: &mut Assembly, patcher: &mut MissingMethodP
             locals: vec![],
         }
     };
-    patcher.insert(name, Box::new(generator));
+    patcher.insert_runtime_service(asm, RuntimeService::Alloc, Box::new(generator));
 }
 
 pub(super) fn insert_rust_alloc_zeroed(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    let name = asm.alloc_string("__rust_alloc_zeroed");
     let generator = move |mref, asm: &mut Assembly| {
         let size = asm.alloc_node(CILNode::LdArg(0));
         let align = super::load_align_usize(asm, 1);
@@ -134,11 +132,10 @@ pub(super) fn insert_rust_alloc_zeroed(asm: &mut Assembly, patcher: &mut Missing
             locals: vec![(None, asm.alloc_type(void_ptr))],
         }
     };
-    patcher.insert(name, Box::new(generator));
+    patcher.insert_runtime_service(asm, RuntimeService::AllocZeroed, Box::new(generator));
 }
 
 pub(super) fn insert_rust_realloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    let name = asm.alloc_string("__rust_realloc");
     let generator = move |mref, asm: &mut Assembly| {
         let ptr = super::load_ptr_arg(asm, 0);
         let old_size = asm.alloc_node(CILNode::LdArg(1));
@@ -167,11 +164,10 @@ pub(super) fn insert_rust_realloc(asm: &mut Assembly, patcher: &mut MissingMetho
             locals: vec![],
         }
     };
-    patcher.insert(name, Box::new(generator));
+    patcher.insert_runtime_service(asm, RuntimeService::Realloc, Box::new(generator));
 }
 
 pub(super) fn insert_rust_dealloc(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    let name = asm.alloc_string("__rust_dealloc");
     let generator = move |_, asm: &mut Assembly| {
         let ptr = super::load_ptr_arg(asm, 0);
         let size = asm.alloc_node(CILNode::LdArg(1));
@@ -189,7 +185,7 @@ pub(super) fn insert_rust_dealloc(asm: &mut Assembly, patcher: &mut MissingMetho
             locals: vec![],
         }
     };
-    patcher.insert(name, Box::new(generator));
+    patcher.insert_runtime_service(asm, RuntimeService::Dealloc, Box::new(generator));
 }
 
 fn ensure_pool_alloc_method(asm: &mut Assembly) {

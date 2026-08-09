@@ -94,31 +94,13 @@ impl Type {
             _ => self.is_gcref(asm),
         }
     }
-    pub fn iter_class_refs<'a, 'asm: 'a>(
-        &'a self,
-        asm: &'asm Assembly,
-    ) -> impl Iterator<Item = Interned<ClassRef>> + 'a {
-        let tmp: Box<dyn Iterator<Item = Interned<ClassRef>>> = match self {
-            Type::PlatformArray { elem: inner, .. } | Type::Ptr(inner) | Type::Ref(inner) => {
-                asm[*inner].iter_class_refs::<'a, 'asm>(asm)
-            }
-            Type::Int(_)
-            | Type::Float(_)
-            | Type::PlatformString
-            | Type::PlatformChar
-            | Type::PlatformGeneric(_, _)
-            | Type::PlatformObject
-            | Type::Bool
-            | Type::Void
-            | Type::SIMDVector(_) => Box::new(std::iter::empty()),
-            Type::FnPtr(sig) => Box::new(
-                asm[*sig]
-                    .iter_types()
-                    .flat_map(|tpe| tpe.iter_class_refs(asm).collect::<Box<_>>()),
-            ),
-            Type::ClassRef(cref) => Box::new(std::iter::once(*cref)),
-        };
-        tmp
+    pub fn iter_class_refs(
+        &self,
+        asm: &Assembly,
+    ) -> impl Iterator<Item = Interned<ClassRef>> + use<> {
+        let mut reachability = super::iter::SemanticReachability::new(asm);
+        reachability.visit_type(*self);
+        reachability.into_class_refs().into_iter()
     }
     #[must_use]
     pub fn deref<'a, 'b: 'a>(&'a self, asm: &'b Assembly) -> &'a Self {

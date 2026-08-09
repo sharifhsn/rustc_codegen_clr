@@ -134,6 +134,13 @@ impl MethodRef {
     pub fn generics(&self) -> &[Type] {
         &self.generics
     }
+
+    /// Every type-bearing edge in this reference, whether or not it resolves to a local definition.
+    pub(crate) fn iter_types<'a>(&'a self, asm: &'a Assembly) -> impl Iterator<Item = Type> + 'a {
+        std::iter::once(Type::ClassRef(self.class()))
+            .chain(asm[self.sig()].iter_types())
+            .chain(self.generics().iter().copied())
+    }
     /// Returns the inputs of this methods, excluding this for constructors.
     pub fn stack_inputs<'s, 'asm: 's>(&'s self, asm: &'asm Assembly) -> &'s [Type] {
         let sig = &asm[self.sig];
@@ -349,19 +356,32 @@ impl MethodDef {
         &'a self,
         asm: &'asm Assembly,
     ) -> impl Iterator<Item = Type> + 'a {
-        let defining_class = Type::ClassRef(*self.class());
+        let mut types = Vec::new();
+        types.push(Type::ClassRef(*self.class()));
         let sig = &asm[self.sig()];
-        let sig_types = sig.iter_types();
-        let local_types = self.iter_locals(asm).map(|(_, tpe)| asm[*tpe]);
-        let body_types = self
-            .iter_cil(asm)
-            .into_iter()
-            .map(|cil| cil.iter_types(asm));
-        let body_types = body_types.flatten();
-        std::iter::once(defining_class)
-            .chain(sig_types)
-            .chain(local_types)
-            .chain(body_types)
+        types.extend(sig.iter_types());
+        types.extend(self.iter_locals(asm).map(|(_, tpe)| asm[*tpe]));
+        if let Some(cil) = self.iter_cil(asm) {
+            types.extend(cil.iter_types(asm));
+        }
+
+        // Metadata is part of the reachability graph just as much as executable CIL. Without
+        // these edges DCE can remove an assembly-local base/attribute type while retained method
+        // metadata still emits a MethodImpl or CustomAttribute row referencing it.
+        if let MethodImpl::AliasFor(target) = self.implementation() {
+            types.extend(asm[*target].iter_types(asm));
+        }
+        if let Some(overridden) = self.overrides() {
+            types.extend(asm[overridden].iter_types(asm));
+        }
+        types.extend(
+            self.custom_attributes()
+                .iter()
+                .chain(self.return_custom_attributes())
+                .chain(self.param_custom_attributes().iter().flatten())
+                .map(|attribute| Type::ClassRef(attribute.attr_type())),
+        );
+        types.into_iter()
     }
     #[must_use]
     pub fn iter_cil<'asm: 'method, 'method>(
@@ -1238,7 +1258,7 @@ impl MethodImpl {
     pub fn root_count(&self) -> usize {
         match self {
             MethodImpl::MethodBody { blocks, .. } => {
-                blocks.iter().map(|block| block.roots().len()).sum()
+                blocks.iter().map(|block| block.iter_roots().count()).sum()
             }
             MethodImpl::RegionBody {
                 blocks,
@@ -1247,7 +1267,7 @@ impl MethodImpl {
             } => blocks
                 .iter()
                 .chain(cleanup_blocks)
-                .map(|block| block.roots().len())
+                .map(|block| block.iter_roots().count())
                 .sum(),
             MethodImpl::Extern { .. } => 0,
             MethodImpl::AliasFor(_) => 0,

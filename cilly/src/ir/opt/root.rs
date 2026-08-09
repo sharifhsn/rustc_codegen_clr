@@ -1,5 +1,3 @@
-use super::inline::inline_trivial_call_root;
-
 use super::super::{
     BinOp, CILNode, CILRoot, Const, FnSig, Type, cilroot::BranchCond, method::LocalDef,
 };
@@ -38,7 +36,7 @@ pub fn root_opt(
     root: CILRoot,
     asm: &mut Assembly,
     root_fuel: &mut OptFuel,
-    cache: &mut SideEffectInfoCache,
+    cache: &mut EffectInfoCache,
     locals: &[LocalDef],
     sig: Interned<FnSig>,
 ) -> CILRoot {
@@ -46,11 +44,15 @@ pub fn root_opt(
         CILRoot::Pop(pop) => match asm.get_node(pop) {
             CILNode::LdLoc(_) => CILRoot::Nop,
             _ => {
-                let has_side_effects = cache.has_side_effects(pop, asm);
-                if has_side_effects { root } else { CILRoot::Nop }
+                if cache.summary(pop, asm).is_pure_total() {
+                    CILRoot::Nop
+                } else {
+                    root
+                }
             }
         },
-        CILRoot::Call(info) => inline_trivial_call_root(info.0, &info.1, root_fuel, asm),
+        // See `opt_node`: call-site argument evaluation must remain explicit and once-only.
+        CILRoot::Call(_) => root,
 
         // As with the `LdInd`->`LdLoc` fold in `opt_node.rs`: only collapse `stind(ldloca X, v)`
         // to `stloc X, v` when the store is NOT volatile. A `volatile.` store is a release fence

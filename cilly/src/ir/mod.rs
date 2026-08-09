@@ -8,7 +8,9 @@ use std::path::Path;
 
 pub use crate::Access;
 pub use asm::{
-    Assembly, AssemblyArenaCounts, CompactionStats, ExportReadyAssembly, NativeImport,
+    Assembly, AssemblyArenaCounts, CompactionStats, ExportReadyAssembly, MethodResolution,
+    MissingMethodGenerator, MissingMethodPatcher, MissingMethodResolutionError,
+    MissingMethodResolutionStats, NativeImport, PeEmissionError, RuntimeCapability, RuntimeService,
     VerificationFailure,
 };
 pub use basic_block::BasicBlock;

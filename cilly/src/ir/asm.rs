@@ -4,7 +4,8 @@ use super::{
     bimap::{BiMap, BiMapIndex, Interned, IntoBiMapIndex},
     cilnode::{BinOp, ExtendKind, IsPure, MethodKind, PtrCastRes, UnOp},
     class::{ClassDefIdx, LayoutError, StaticFieldDef},
-    opt::{OptFuel, SideEffectInfoCache},
+    iter::SemanticReachability,
+    opt::{EffectInfoCache, OptFuel},
     typecheck::TypeCheckError,
 };
 use crate::{IString, config, utilis::assert_unique};
@@ -15,13 +16,177 @@ use serde::{Deserialize, Serialize};
 use std::{any::type_name, ops::Index};
 
 #[cfg(test)]
-use super::class::{FixedArrayLayout, PropertyDef};
+use super::class::{EventDef, FixedArrayLayout, PropertyDef};
 
-/// Maps an exact emitted method symbol to a closure that synthesizes its `MethodImpl` on demand. Populated
-/// and consumed at link time (not codegen time) by the `linker` binary (`bin/linker/patch.rs`)
-/// to fill in libc/intrinsic shims referenced but never defined by rustc-generated code.
-pub type MissingMethodPatcher =
-    FxHashMap<Interned<IString>, Box<dyn Fn(Interned<MethodRef>, &mut Assembly) -> MethodImpl>>;
+pub type MissingMethodGenerator = Box<dyn Fn(Interned<MethodRef>, &mut Assembly) -> MethodImpl>;
+
+/// A well-known service requested by rustc-generated runtime glue.
+///
+/// This classification is deliberately not serialized: artifacts retain their historical method
+/// symbols, while the final linker classifies them once and resolves them against target/runtime
+/// capabilities. That preserves the existing artifact format without letting correctness hinge on
+/// repeated ad-hoc string comparisons.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RuntimeService {
+    Alloc,
+    AllocZeroed,
+    Dealloc,
+    Realloc,
+    NoAllocShim,
+}
+
+impl RuntimeService {
+    #[must_use]
+    pub fn classify(emitted_symbol: &str) -> Option<Self> {
+        let demangled = format!("{:#}", rustc_demangle::demangle(emitted_symbol));
+        match demangled.as_str() {
+            "__rustc::__rust_alloc" | "__rust_alloc" => Some(Self::Alloc),
+            "__rustc::__rust_alloc_zeroed" | "__rust_alloc_zeroed" => Some(Self::AllocZeroed),
+            "__rustc::__rust_dealloc" | "__rust_dealloc" => Some(Self::Dealloc),
+            "__rustc::__rust_realloc" | "__rust_realloc" => Some(Self::Realloc),
+            "__rustc::__rust_no_alloc_shim_is_unstable"
+            | "__rustc::__rust_no_alloc_shim_is_unstable_v2"
+            | "__rust_no_alloc_shim_is_unstable"
+            | "__rust_no_alloc_shim_is_unstable_v2" => Some(Self::NoAllocShim),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn canonical_symbol(self) -> &'static str {
+        match self {
+            Self::Alloc => "__rust_alloc",
+            Self::AllocZeroed => "__rust_alloc_zeroed",
+            Self::Dealloc => "__rust_dealloc",
+            Self::Realloc => "__rust_realloc",
+            Self::NoAllocShim => "__rust_no_alloc_shim_is_unstable",
+        }
+    }
+
+    const fn requires_registered_capability(self) -> bool {
+        !matches!(self, Self::NoAllocShim)
+    }
+}
+
+/// The concrete capability used to resolve one missing method reference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeCapability {
+    PatcherOverride,
+    DeclaredNativeImport,
+    LegacyNativeImport,
+    BuiltinNoOp,
+}
+
+/// Typed result of resolving one method reference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MethodResolution {
+    ExternalReference,
+    AlreadyDefined,
+    Resolved {
+        capability: RuntimeCapability,
+        service: Option<RuntimeService>,
+    },
+    Unresolved,
+}
+
+/// A structured failure while resolving runtime services and missing method references.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MissingMethodResolutionError {
+    UnsupportedRuntimeService {
+        service: RuntimeService,
+        emitted_symbol: String,
+    },
+    InterfaceMemberMismatch {
+        interface: String,
+        member: String,
+        signature: String,
+    },
+    MissingOwner {
+        owner: String,
+        member: String,
+    },
+}
+
+impl std::fmt::Display for MissingMethodResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedRuntimeService {
+                service,
+                emitted_symbol,
+            } => write!(
+                f,
+                "runtime service {service:?} requested by `{emitted_symbol}` has no registered linker capability"
+            ),
+            Self::InterfaceMemberMismatch {
+                interface,
+                member,
+                signature,
+            } => write!(
+                f,
+                "call to `{interface}::{member}` does not match a declared interface member (signature {signature})"
+            ),
+            Self::MissingOwner { owner, member } => write!(
+                f,
+                "cannot synthesize missing method `{member}` because owner type `{owner}` has no definition"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MissingMethodResolutionError {}
+
+/// Registry of exact linker shims plus typed implementations of well-known runtime services.
+/// Exact symbols remain available for the large intrinsic/libc surface, while allocator/runtime
+/// choices are registered and queried through [`RuntimeService`].
+#[derive(Default)]
+pub struct MissingMethodPatcher {
+    symbols: FxHashMap<Interned<IString>, MissingMethodGenerator>,
+    services: FxHashMap<RuntimeService, Interned<IString>>,
+}
+
+impl MissingMethodPatcher {
+    pub fn insert(
+        &mut self,
+        symbol: Interned<IString>,
+        generator: MissingMethodGenerator,
+    ) -> Option<MissingMethodGenerator> {
+        self.symbols.insert(symbol, generator)
+    }
+
+    pub fn insert_runtime_service(
+        &mut self,
+        asm: &mut Assembly,
+        service: RuntimeService,
+        generator: MissingMethodGenerator,
+    ) -> Option<MissingMethodGenerator> {
+        let symbol = asm.alloc_string(service.canonical_symbol());
+        self.services.insert(service, symbol);
+        self.symbols.insert(symbol, generator)
+    }
+
+    #[must_use]
+    pub fn get(&self, symbol: &Interned<IString>) -> Option<&MissingMethodGenerator> {
+        self.symbols.get(symbol)
+    }
+
+    #[must_use]
+    pub fn get_runtime_service(&self, service: RuntimeService) -> Option<&MissingMethodGenerator> {
+        self.services
+            .get(&service)
+            .and_then(|symbol| self.symbols.get(symbol))
+    }
+
+    #[must_use]
+    pub fn contains_key(&self, symbol: &Interned<IString>) -> bool {
+        self.symbols.contains_key(symbol)
+    }
+
+    pub fn remove(&mut self, symbol: &Interned<IString>) -> Option<MissingMethodGenerator> {
+        self.services
+            .retain(|_, registered_symbol| registered_symbol != symbol);
+        self.symbols.remove(symbol)
+    }
+}
 
 /// A native symbol declared by Rust through an `extern` block and its CLR P/Invoke contract.
 ///
@@ -35,30 +200,6 @@ pub struct NativeImport {
     pub library: String,
     pub call_conv: super::PInvokeCallConv,
     pub preserve_errno: bool,
-}
-
-/// Maps rustc's private, mangled allocator entry points onto the canonical
-/// linker builtins. This is deliberately a closed allowlist over the complete
-/// demangled path: generic "last path segment" matching made unrelated Rust
-/// functions such as `core::fmt::write` collide with libc shims.
-fn rustc_runtime_builtin_alias(emitted_symbol: &str) -> Option<&'static str> {
-    match format!("{:#}", rustc_demangle::demangle(emitted_symbol)).as_str() {
-        "__rustc::__rust_alloc" => Some("__rust_alloc"),
-        "__rustc::__rust_alloc_zeroed" => Some("__rust_alloc_zeroed"),
-        "__rustc::__rust_dealloc" => Some("__rust_dealloc"),
-        "__rustc::__rust_realloc" => Some("__rust_realloc"),
-        _ => None,
-    }
-}
-
-fn is_rustc_no_alloc_marker(emitted_symbol: &str) -> bool {
-    matches!(
-        format!("{:#}", rustc_demangle::demangle(emitted_symbol)).as_str(),
-        "__rustc::__rust_no_alloc_shim_is_unstable"
-            | "__rustc::__rust_no_alloc_shim_is_unstable_v2"
-            | "__rust_no_alloc_shim_is_unstable"
-            | "__rust_no_alloc_shim_is_unstable_v2"
-    )
 }
 
 /// Summary of one fixed-point missing-method resolution pass.
@@ -80,6 +221,45 @@ pub struct MissingMethodResolutionStats {
     pub no_alloc_shims_synthesized: usize,
     pub missing_stubs_synthesized: usize,
     pub unresolved_missing_methods: usize,
+}
+
+impl MissingMethodResolutionStats {
+    fn record(&mut self, resolution: MethodResolution) {
+        match resolution {
+            MethodResolution::ExternalReference => self.external_method_refs += 1,
+            MethodResolution::AlreadyDefined => self.already_defined += 1,
+            MethodResolution::Resolved {
+                capability: RuntimeCapability::PatcherOverride,
+                service,
+            } => {
+                self.overrides_applied += 1;
+                if matches!(
+                    service,
+                    Some(
+                        RuntimeService::Alloc
+                            | RuntimeService::AllocZeroed
+                            | RuntimeService::Dealloc
+                            | RuntimeService::Realloc
+                    )
+                ) {
+                    self.allocator_shims_synthesized += 1;
+                }
+            }
+            MethodResolution::Resolved {
+                capability: RuntimeCapability::DeclaredNativeImport,
+                ..
+            }
+            | MethodResolution::Resolved {
+                capability: RuntimeCapability::LegacyNativeImport,
+                ..
+            } => self.externs_synthesized += 1,
+            MethodResolution::Resolved {
+                capability: RuntimeCapability::BuiltinNoOp,
+                ..
+            } => self.no_alloc_shims_synthesized += 1,
+            MethodResolution::Unresolved => self.missing_stubs_synthesized += 1,
+        }
+    }
 }
 
 /// Stable size snapshot of every assembly-owned interning arena and definition collection.
@@ -222,6 +402,56 @@ impl std::fmt::Display for VerificationFailure {
 
 impl std::error::Error for VerificationFailure {}
 
+/// A direct-PE render failure, separated into target-independent IR verification and target
+/// capability validation. Unsupported PE constructs are reported before the writer can reach a
+/// `todo!()` arm or release partial bytes.
+#[derive(Debug)]
+pub enum PeEmissionError {
+    Verification(VerificationFailure),
+    Target(super::pe_exporter::PeTargetError),
+}
+
+impl std::fmt::Display for PeEmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Verification(error) => error.fmt(f),
+            Self::Target(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for PeEmissionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Verification(error) => Some(error),
+            Self::Target(error) => Some(error),
+        }
+    }
+}
+
+impl From<VerificationFailure> for PeEmissionError {
+    fn from(error: VerificationFailure) -> Self {
+        Self::Verification(error)
+    }
+}
+
+impl From<super::pe_exporter::PeTargetError> for PeEmissionError {
+    fn from(error: super::pe_exporter::PeTargetError) -> Self {
+        Self::Target(error)
+    }
+}
+
+impl PeEmissionError {
+    fn into_verification_failure(self) -> VerificationFailure {
+        match self {
+            Self::Verification(error) => error,
+            Self::Target(error) => VerificationFailure::AssemblyInvariant {
+                message: error.to_string(),
+            },
+        }
+    }
+}
+
 /// An assembly that passed the unconditional verifier after its final mutation.
 ///
 /// The inner [`Assembly`] is deliberately private and this type does not implement `DerefMut`:
@@ -264,6 +494,15 @@ impl ExportReadyAssembly {
         self,
         options: &super::pe_exporter::export::ExportOptions,
     ) -> Result<(Vec<u8>, Vec<u8>), VerificationFailure> {
+        self.try_render_pe(options)
+            .map_err(PeEmissionError::into_verification_failure)
+    }
+
+    /// Renders direct PE with target-capability failures preserved as structured errors.
+    pub fn try_render_pe(
+        self,
+        options: &super::pe_exporter::export::ExportOptions,
+    ) -> Result<(Vec<u8>, Vec<u8>), PeEmissionError> {
         self.render_with_reverification(|asm| super::pe_exporter::export::export_pe(asm, options))
     }
 
@@ -274,17 +513,36 @@ impl ExportReadyAssembly {
         options: &super::pe_exporter::export::ExportOptions,
         source_link_json: Option<&str>,
     ) -> Result<(Vec<u8>, Vec<u8>), VerificationFailure> {
+        self.try_render_pe_with_source_link(options, source_link_json)
+            .map_err(PeEmissionError::into_verification_failure)
+    }
+
+    /// Renders direct PE plus Source Link while preserving structured target-capability errors.
+    pub fn try_render_pe_with_source_link(
+        self,
+        options: &super::pe_exporter::export::ExportOptions,
+        source_link_json: Option<&str>,
+    ) -> Result<(Vec<u8>, Vec<u8>), PeEmissionError> {
         self.render_with_reverification(|asm| {
             super::pe_exporter::export::export_pe_with_source_link(asm, options, source_link_json)
         })
     }
 
     fn render_with_reverification<T>(
-        mut self,
+        self,
         render: impl FnOnce(&mut Assembly) -> T,
-    ) -> Result<T, VerificationFailure> {
-        let output = render(&mut self.inner);
-        self.inner.verify_for_export()?;
+    ) -> Result<T, PeEmissionError> {
+        // Definition-owned constraints are already retained and can fail cheaply before copying a
+        // very large unsupported graph. Arena-sensitive capability checks run only after compaction,
+        // so the validator and byte writer see the same graph and dead interned nodes are irrelevant.
+        super::pe_exporter::validate_retained_definitions_for_pe(&self.inner)?;
+        let (compacted, _) = self.inner.compact();
+        let verified = compacted.verify_for_export()?;
+        let mut inner = verified.inner;
+        super::pe_exporter::validate_for_pe(&inner)?;
+        let output = render(&mut inner);
+        let verified = inner.verify_for_export()?;
+        super::pe_exporter::validate_for_pe(&verified.inner)?;
         Ok(output)
     }
 }
@@ -537,7 +795,20 @@ impl Assembly {
         self.sanity_check();
         self.validate_fixed_array_layouts()
             .map_err(|message| VerificationFailure::AssemblyInvariant { message })?;
-        let method_def_idxs: Box<[_]> = self.method_defs.keys().copied().collect();
+        let method_def_idxs = self.stable_method_def_idxs();
+        for &method in &method_def_idxs {
+            let definition = self.method_def(method);
+            if !definition.is_abstract()
+                && matches!(definition.implementation(), MethodImpl::Missing)
+            {
+                let method_name = self[definition.name()].to_string();
+                return Err(VerificationFailure::AssemblyInvariant {
+                    message: format!(
+                        "reachable method `{method_name}` ({method:?}) still has MethodImpl::Missing after resolution and DCE"
+                    ),
+                });
+            }
+        }
         for method in method_def_idxs {
             let mut tmp_method = self.method_def(method).clone();
             if let Err(error) = tmp_method.typecheck(&mut self) {
@@ -584,53 +855,214 @@ impl Assembly {
     }
     #[must_use]
     pub fn default_fuel(&self) -> OptFuel {
-        OptFuel::new((self.method_defs.len() * 4 + self.roots.len() * 16) as u32)
+        let total = self
+            .method_defs
+            .values()
+            .map(|method| Self::method_optimization_weight(method))
+            .sum::<u64>();
+        OptFuel::new(u32::try_from(total).unwrap_or(u32::MAX))
+    }
+
+    fn push_semantic_len(key: &mut Vec<u8>, len: usize) {
+        key.extend_from_slice(
+            &u64::try_from(len)
+                .expect("semantic key component exceeds u64")
+                .to_le_bytes(),
+        );
+    }
+
+    fn push_semantic_str(&self, key: &mut Vec<u8>, value: Interned<IString>) {
+        let value = &self[value];
+        Self::push_semantic_bytes(key, value.as_bytes());
+    }
+
+    /// Prefix-free string encoding which preserves ordinary lexical ordering. A zero byte in the
+    /// source is escaped as `0,0`; `0,1` terminates the component.
+    fn push_semantic_bytes(key: &mut Vec<u8>, value: &[u8]) {
+        for &byte in value {
+            if byte == 0 {
+                key.extend_from_slice(&[0, 0]);
+            } else {
+                key.push(byte);
+            }
+        }
+        key.extend_from_slice(&[0, 1]);
+    }
+
+    fn push_class_semantic_key(&self, key: &mut Vec<u8>, class: Interned<ClassRef>) {
+        let class = &self[class];
+        match class.asm() {
+            Some(assembly) => {
+                key.push(1);
+                self.push_semantic_str(key, assembly);
+            }
+            None => key.push(0),
+        }
+        self.push_semantic_str(key, class.name());
+        key.push(u8::from(class.is_valuetype()));
+        Self::push_semantic_len(key, class.generics().len());
+        for generic in class.generics() {
+            self.push_type_semantic_key(key, *generic);
+        }
+    }
+
+    fn push_signature_semantic_key(&self, key: &mut Vec<u8>, signature: Interned<FnSig>) {
+        let signature = &self[signature];
+        Self::push_semantic_len(key, signature.inputs().len());
+        for input in signature.inputs() {
+            self.push_type_semantic_key(key, *input);
+        }
+        self.push_type_semantic_key(key, *signature.output());
+    }
+
+    fn push_type_semantic_key(&self, key: &mut Vec<u8>, tpe: Type) {
+        match tpe {
+            Type::Ptr(inner) => {
+                key.push(0);
+                self.push_type_semantic_key(key, self[inner]);
+            }
+            Type::Ref(inner) => {
+                key.push(1);
+                self.push_type_semantic_key(key, self[inner]);
+            }
+            Type::Int(int) => {
+                key.push(2);
+                Self::push_semantic_bytes(key, int.name().as_bytes());
+            }
+            Type::ClassRef(class) => {
+                key.push(3);
+                self.push_class_semantic_key(key, class);
+            }
+            Type::Float(float) => {
+                key.push(4);
+                Self::push_semantic_bytes(key, float.name().as_bytes());
+            }
+            Type::PlatformString => key.push(5),
+            Type::PlatformChar => key.push(6),
+            Type::PlatformGeneric(index, kind) => {
+                key.push(7);
+                key.push(match kind {
+                    super::tpe::GenericKind::MethodGeneric => 0,
+                    super::tpe::GenericKind::CallGeneric => 1,
+                    super::tpe::GenericKind::TypeGeneric => 2,
+                });
+                key.extend_from_slice(&index.to_le_bytes());
+            }
+            Type::PlatformObject => key.push(8),
+            Type::Bool => key.push(9),
+            Type::Void => key.push(10),
+            Type::PlatformArray { elem, dims } => {
+                key.push(11);
+                key.push(dims.get());
+                self.push_type_semantic_key(key, self[elem]);
+            }
+            Type::FnPtr(signature) => {
+                key.push(12);
+                self.push_signature_semantic_key(key, signature);
+            }
+            Type::SIMDVector(vector) => {
+                key.push(13);
+                let name = vector.name();
+                Self::push_semantic_bytes(key, name.as_bytes());
+            }
+        }
+    }
+
+    fn push_method_ref_semantic_key(&self, key: &mut Vec<u8>, method: Interned<MethodRef>) {
+        let method = &self[method];
+        self.push_class_semantic_key(key, method.class());
+        self.push_semantic_str(key, method.name());
+        key.push(match method.kind() {
+            MethodKind::Static => 0,
+            MethodKind::Instance => 1,
+            MethodKind::Virtual => 2,
+            MethodKind::Constructor => 3,
+        });
+        self.push_signature_semantic_key(key, method.sig());
+        Self::push_semantic_len(key, method.generics().len());
+        for generic in method.generics() {
+            self.push_type_semantic_key(key, *generic);
+        }
+    }
+
+    /// An injective, process-independent encoding of a method's complete `MethodRef` identity.
+    pub(crate) fn method_semantic_key(&self, method: MethodDefIdx) -> Vec<u8> {
+        let mut key = Vec::new();
+        self.push_method_ref_semantic_key(&mut key, method.0);
+        key
     }
     /// Returns method definitions in a process-independent semantic order.
     ///
     /// `method_defs` is an `FxHashMap`. Its iteration order depends on the table's insertion and
     /// resize history, which can differ after independently linked clean builds even when the
-    /// assembly is semantically identical. Optimizer fuel is global, so iterating that map directly
-    /// changes which methods receive the final optimization pass. In particular, `realloc_locals`
-    /// then assigns different local slots and makes otherwise-identical direct-PE output diverge.
+    /// assembly is semantically identical. The optimizer allocates fuel in this order so hash-map
+    /// history cannot decide which method receives a remainder unit. In particular, preserving the
+    /// order through `realloc_locals` keeps otherwise-identical direct-PE output reproducible.
     fn stable_method_def_idxs(&self) -> Vec<MethodDefIdx> {
         let mut methods: Vec<_> = self.method_defs.keys().copied().collect();
-        methods.sort_by_cached_key(|method| {
-            let method_ref = &self[method.0];
-            let class = &self[method_ref.class()];
-            let sig = &self[method_ref.sig()];
-            let class_assembly = class
-                .asm()
-                .map(|name| self[name].to_string())
-                .unwrap_or_default();
-            let class_generics = class
-                .generics()
-                .iter()
-                .map(|ty| ty.mangle(self))
-                .collect::<Vec<_>>()
-                .join(",");
-            let inputs = sig
-                .inputs()
-                .iter()
-                .map(|ty| ty.mangle(self))
-                .collect::<Vec<_>>()
-                .join(",");
-            let method_generics = method_ref
-                .generics()
-                .iter()
-                .map(|ty| ty.mangle(self))
-                .collect::<Vec<_>>()
-                .join(",");
-            format!(
-                "{class_assembly}|{}|{}|{class_generics}|{}|{:?}|{inputs}|{}|{method_generics}",
-                &self[class.name()],
-                class.is_valuetype(),
-                &self[method_ref.name()],
-                method_ref.kind(),
-                sig.output().mangle(self),
-            )
-        });
+        methods.sort_by_cached_key(|method| self.method_semantic_key(*method));
         methods
+    }
+
+    /// Estimates the optimizer work owned by one method. The constants retain the historical
+    /// budget shape (four units per method plus sixteen per retained root), but count roots on the
+    /// method rather than charging against the process-wide root arena.
+    fn method_optimization_weight(method: &MethodDef) -> u64 {
+        let roots = method.implementation().root_count();
+        4_u64.saturating_add(u64::try_from(roots).unwrap_or(u64::MAX).saturating_mul(16))
+    }
+
+    fn optimizer_method_schedule(&self) -> Vec<(MethodDefIdx, u64)> {
+        self.stable_method_def_idxs()
+            .into_iter()
+            .map(|method| {
+                (
+                    method,
+                    Self::method_optimization_weight(&self.method_defs[&method]),
+                )
+            })
+            .collect()
+    }
+
+    /// Splits a caller-supplied total budget before optimization starts. No method can consume
+    /// another method's allocation, and the largest-remainder tie-break follows semantic method
+    /// order, so insertion/hash-map history cannot decide who gets the last work units.
+    #[cfg(test)]
+    fn optimizer_method_budgets(&self, total: u32) -> Vec<(MethodDefIdx, u32)> {
+        let schedule = self.optimizer_method_schedule();
+        Self::optimizer_method_budgets_for_schedule(&schedule, total)
+    }
+
+    fn optimizer_method_budgets_for_schedule(
+        schedule: &[(MethodDefIdx, u64)],
+        total: u32,
+    ) -> Vec<(MethodDefIdx, u32)> {
+        if schedule.is_empty() || total == 0 {
+            return schedule.iter().map(|(method, _)| (*method, 0)).collect();
+        }
+        let total_weight = schedule.iter().map(|(_, weight)| *weight).sum::<u64>();
+        debug_assert_ne!(total_weight, 0);
+
+        let mut budgets = Vec::with_capacity(schedule.len());
+        let mut remainders = Vec::with_capacity(schedule.len());
+        let mut assigned = 0_u32;
+        for (position, &(method, weight)) in schedule.iter().enumerate() {
+            let numerator = u128::from(total) * u128::from(weight);
+            let budget = u32::try_from(numerator / u128::from(total_weight))
+                .expect("proportional optimizer budget exceeds its total");
+            assigned = assigned
+                .checked_add(budget)
+                .expect("optimizer budget accounting overflow");
+            budgets.push((method, budget));
+            remainders.push((numerator % u128::from(total_weight), position));
+        }
+        remainders.sort_unstable_by(|(lhs_rem, lhs_pos), (rhs_rem, rhs_pos)| {
+            rhs_rem.cmp(lhs_rem).then_with(|| lhs_pos.cmp(rhs_pos))
+        });
+        for &(_, position) in remainders.iter().take((total - assigned) as usize) {
+            budgets[position].1 += 1;
+        }
+        budgets
     }
     pub(crate) fn borrow_methoddef(&mut self, def_id: MethodDefIdx) -> MethodDef {
         self.method_defs.remove(&def_id).unwrap()
@@ -641,47 +1073,64 @@ impl Assembly {
             "Could not return a methoddef, because a method def is already present."
         );
     }
-    /// Optimizes the assembly uitill all fuel is consumed, or no more progress can be made
+    /// Optimizes every method with a deterministic, preallocated share of `fuel`.
     pub fn opt(&mut self, fuel: &mut OptFuel) {
         // The CIL optimizer is purely local/intra-method (copy-prop, DCE, peepholes, block
         // linearization). It does NOT inline calls — Rust's zero-cost abstractions are inlined at the
         // MIR level by rustc's own inliner (the backend raises `-Zinline-mir-hint-threshold`), which
         // is correct by construction and runs before codegen. So a fixpoint of local passes suffices;
         // no soundness snapshot/revert is needed.
-        let mut cache = SideEffectInfoCache::default();
-        while !fuel.exchausted() {
-            let prev = fuel.clone();
-            self.opt_sigle_pass(fuel, &mut cache);
-            // No fuel consumed, progress can't be made, break.
-            if *fuel == prev {
-                break;
+        let initial_fuel = fuel.raw();
+        let schedule = self.optimizer_method_schedule();
+        let mut consumed = 0_u32;
+        for (method, budget) in Self::optimizer_method_budgets_for_schedule(&schedule, initial_fuel)
+        {
+            let mut method_fuel = OptFuel::new(budget);
+            let mut cache = EffectInfoCache::default();
+            let mut tmp_method = self.borrow_methoddef(method);
+            while !method_fuel.exchausted() {
+                let prev = method_fuel.clone();
+                tmp_method.optimize(self, &mut cache, &mut method_fuel);
+                tmp_method.remove_dead_blocks(self);
+                if method_fuel == prev {
+                    break;
+                }
             }
-            //let _pass_min_cost: bool = fuel.consume(1);
+            consumed = consumed
+                .checked_add(budget - method_fuel.raw())
+                .expect("optimizer fuel consumption overflow");
+            self.return_methoddef(method, tmp_method);
         }
+        *fuel = OptFuel::from_raw(initial_fuel - consumed);
 
         // Optimization may exhaust the shared fuel immediately after a pass changes or removes
         // locals. Always finish at the same canonical local-slot boundary: otherwise two
         // semantically identical assemblies can retain different MIR/intern insertion histories in
         // their `.locals` order, which changes StandAloneSig rows and every subsequent method-body
         // token in direct-PE output.
-        for method in self.stable_method_def_idxs() {
+        for (method, _) in schedule {
             let mut tmp_method = self.borrow_methoddef(method);
             tmp_method.implementation_mut().realloc_locals(self);
             self.return_methoddef(method, tmp_method);
         }
     }
     /// Optimizes the assembly, cosuming some fuel. This performs a single optimization pass.
-    pub fn opt_sigle_pass(&mut self, fuel: &mut OptFuel, cache: &mut SideEffectInfoCache) {
-        let method_def_idxs = self.stable_method_def_idxs();
-        for method in method_def_idxs {
+    pub fn opt_sigle_pass(&mut self, fuel: &mut OptFuel, cache: &mut EffectInfoCache) {
+        let initial_fuel = fuel.raw();
+        let schedule = self.optimizer_method_schedule();
+        let mut consumed = 0_u32;
+        for (method, budget) in Self::optimizer_method_budgets_for_schedule(&schedule, initial_fuel)
+        {
+            let mut method_fuel = OptFuel::new(budget);
             let mut tmp_method = self.borrow_methoddef(method);
-            tmp_method.optimize(self, cache, fuel);
+            tmp_method.optimize(self, cache, &mut method_fuel);
             tmp_method.remove_dead_blocks(self);
             self.return_methoddef(method, tmp_method);
-            if fuel.exchausted() {
-                break;
-            }
+            consumed = consumed
+                .checked_add(budget - method_fuel.raw())
+                .expect("optimizer fuel consumption overflow");
         }
+        *fuel = OptFuel::from_raw(initial_fuel - consumed);
     }
     /// Finds all methods matching the closure
     pub fn methods_with<'a>(
@@ -1109,6 +1558,34 @@ impl Assembly {
 
         def_idx
     }
+
+    #[cfg(test)]
+    pub(crate) fn add_abstract_methods_bulk_for_test(&mut self, class: ClassDefIdx, count: usize) {
+        let sig = self.sig([], Type::Void);
+        let mut methods = Vec::with_capacity(count);
+        for index in 0..count {
+            let name = self.alloc_string(format!("bulk_test_method_{index}"));
+            let definition = MethodDef::new(
+                Access::Private,
+                class,
+                name,
+                sig,
+                MethodKind::Static,
+                MethodImpl::Missing,
+                vec![],
+            )
+            .with_abstract();
+            let method = MethodDefIdx::from_raw(self.alloc_methodref(definition.ref_to()));
+            assert!(self.method_defs.insert(method, definition).is_none());
+            methods.push(method);
+        }
+        self.class_defs
+            .get_mut(&class)
+            .expect("bulk test methods require an existing class")
+            .methods_mut()
+            .extend(methods);
+    }
+
     fn ensure_init(&mut self, name: &str, access: Access) -> MethodDefIdx {
         let main_module = self.main_module();
         let user_init = self.alloc_string(name);
@@ -1326,20 +1803,80 @@ impl Assembly {
     pub(crate) fn method_def_from_ref(&self, mref: Interned<MethodRef>) -> Option<&MethodDef> {
         self.method_defs.get(&MethodDefIdx::from_raw(mref))
     }
+
+    /// Follows retained type metadata and adds each event/property accessor to the method graph.
+    ///
+    /// A type can be live without owning a live method itself (for example, a private DTO exposed
+    /// by an exported method signature). Walking the type closure here keeps member semantics on
+    /// those owners without turning metadata on unrelated types into assembly-wide roots.
+    fn extend_member_accessor_edges(
+        &self,
+        class_roots: impl IntoIterator<Item = ClassDefIdx>,
+        seen_classes: &mut FxHashSet<ClassDefIdx>,
+        method_wave: &mut FxHashSet<MethodDefIdx>,
+        alive_methods: &FxHashSet<MethodDefIdx>,
+    ) {
+        let roots: Vec<_> = class_roots
+            .into_iter()
+            .filter(|class| self.class_defs.contains_key(class))
+            .collect();
+        let mut reachability = SemanticReachability::new(self);
+        for class in roots {
+            reachability.visit_class_definition(class);
+        }
+        reachability.close_local_class_definitions();
+        let owners: Vec<_> = reachability.class_definitions().collect();
+        for class_id in owners {
+            if !seen_classes.insert(class_id) {
+                continue;
+            }
+            let class = &self.class_defs[&class_id];
+            method_wave.extend(
+                class
+                    .iter_member_method_refs()
+                    .map(MethodDefIdx::from_raw)
+                    .filter(|method| {
+                        self.method_defs.contains_key(method) && !alive_methods.contains(method)
+                    }),
+            );
+        }
+    }
+
     pub(crate) fn eliminate_dead_fns(&mut self, only_imports: bool) {
         // 1st. Collect all "extern" method definitons, since those are always alive.
-        let wave: FxHashSet<MethodDefIdx> = self
+        let mut wave: FxHashSet<MethodDefIdx> = self
             .method_defs
             .iter()
             .filter(|(_, def)| def.access().is_extern())
             .map(|(idx, _)| *idx)
             .collect();
-        self.eliminate_dead_fns_from_roots(wave, only_imports);
+        // Event/property metadata is an edge from its owning type, not an assembly-wide root.
+        // Only assembly-local exported type definitions are live before any method is reached;
+        // accessors on every other class are discovered below when another live method makes that
+        // owner reachable. Rooting every accessor unconditionally kept otherwise-dead private
+        // types (and their transitive implementation graph) alive forever.
+        let exported_classes: Vec<_> = self
+            .class_defs
+            .iter()
+            .filter_map(|(class_id, class)| {
+                (class.access().is_extern() && self.class_ref(class_id.0).asm().is_none())
+                    .then_some(*class_id)
+            })
+            .collect();
+        let mut seen_member_owners = FxHashSet::default();
+        self.extend_member_accessor_edges(
+            exported_classes,
+            &mut seen_member_owners,
+            &mut wave,
+            &FxHashSet::default(),
+        );
+        self.eliminate_dead_fns_from_roots(wave, only_imports, seen_member_owners);
     }
     fn eliminate_dead_fns_from_roots(
         &mut self,
         mut wave: FxHashSet<MethodDefIdx>,
         only_imports: bool,
+        mut seen_member_owners: FxHashSet<ClassDefIdx>,
     ) {
         let mut next_wave: FxHashSet<MethodDefIdx> = FxHashSet::default();
         let mut alive: FxHashSet<MethodDefIdx> = FxHashSet::default();
@@ -1366,6 +1903,29 @@ impl Assembly {
                         next_wave.insert(tdef);
                     }
                 }
+                // An explicit `.override` is an executable metadata edge to the base slot. Keep a
+                // same-assembly base MethodDef alive even when no ordinary call references it.
+                if let Some(target) = def.overrides() {
+                    let tdef = MethodDefIdx::from_raw(target);
+                    if self.method_defs.contains_key(&tdef) && !alive.contains(&tdef) {
+                        next_wave.insert(tdef);
+                    }
+                }
+                // A live method makes its owner and every type in its metadata signature live.
+                // Their event/property accessors are method-graph edges as well. Following the
+                // transitive class metadata closure matters for exported signatures such as
+                // `fn public(dto: PrivateDto)`, where `PrivateDto` has no independently-rooted
+                // method but its property semantics must remain intact.
+                let mut reachability = SemanticReachability::new(self);
+                reachability.visit_method_definition(def);
+                reachability.close_local_class_definitions();
+                let class_roots: Vec<_> = reachability.class_definitions().collect();
+                self.extend_member_accessor_edges(
+                    class_roots,
+                    &mut seen_member_owners,
+                    &mut next_wave,
+                    &alive,
+                );
                 // Iterate torugh the cil of this method, if present
                 let Some(cil) = def.iter_cil(self) else {
                     continue;
@@ -1454,7 +2014,7 @@ impl Assembly {
                 }
             }
         }
-        self.eliminate_dead_fns_from_roots(roots, false);
+        self.eliminate_dead_fns_from_roots(roots, false, FxHashSet::default());
         self.eliminate_dead_types_with_export_roots(false);
     }
 
@@ -1786,14 +2346,15 @@ impl Assembly {
         self.eliminate_dead_types_with_export_roots(true);
     }
     fn eliminate_dead_types_with_export_roots(&mut self, keep_exported_types: bool) {
-        let mut wave: FxHashSet<ClassDefIdx> = self
-            .method_defs()
-            .values()
-            .flat_map(|method| method.iter_types(self))
-            .flat_map(|tpe| tpe.iter_class_refs(self).collect::<Vec<_>>())
-            .filter_map(|cref| self.class_ref_to_def(cref))
-            .collect();
-        wave.extend(self.method_defs().values().map(MethodDef::class));
+        let rust_void = self.alloc_string("RustVoid");
+        let rust_void = self.alloc_class_ref(ClassRef::new(rust_void, None, true, vec![].into()));
+        let f128 = self.alloc_string("f128");
+        let f128 = self.alloc_class_ref(ClassRef::new(f128, None, true, vec![].into()));
+
+        let mut reachability = SemanticReachability::new(self);
+        for method in self.method_defs().values() {
+            reachability.visit_method_definition(method);
+        }
         // Keep exported classes defined by this assembly as roots, but do not root
         // external BCL declaration classes merely because they are marked `Extern`.
         // Those declarations are metadata-only conveniences for lowering calls; rooting
@@ -1802,42 +2363,27 @@ impl Assembly {
         // A BCL declaration is retained when a live method/type actually references it via
         // the wave above.
         if keep_exported_types {
-            wave.extend(self.class_defs().iter().filter_map(|(defid, def)| {
-                (def.access().is_extern() && self.class_ref(defid.0).asm().is_none())
-                    .then_some(defid)
-            }));
-        }
-        let rust_void = self.alloc_string("RustVoid");
-        let rust_void = self.alloc_class_ref(ClassRef::new(rust_void, None, true, vec![].into()));
-        if let Some(cref) = self.class_ref_to_def(rust_void) {
-            wave.insert(cref);
-        }
-        let f128 = self.alloc_string("f128");
-        let f128 = self.alloc_class_ref(ClassRef::new(f128, None, true, vec![].into()));
-        if let Some(cref) = self.class_ref_to_def(f128) {
-            wave.insert(cref);
-        }
-
-        let mut next_wave: FxHashSet<ClassDefIdx> = FxHashSet::default();
-        let mut alive: FxHashSet<ClassDefIdx> = FxHashSet::default();
-        while !wave.is_empty() {
-            for def in &wave {
-                let defids: FxHashSet<ClassDefIdx> = self.class_defs[def]
-                    .iter_types()
-                    .flat_map(|tpe| tpe.iter_class_refs(self).collect::<Vec<_>>())
-                    .filter_map(|cref| self.class_ref_to_def(cref))
-                    .filter(|refid| !alive.contains(refid))
-                    .collect();
-
-                next_wave.extend(defids);
+            let exported: Vec<_> = self
+                .class_defs()
+                .iter()
+                .filter_map(|(defid, def)| {
+                    (def.access().is_extern() && self.class_ref(defid.0).asm().is_none())
+                        .then_some(*defid)
+                })
+                .collect();
+            for class in exported {
+                reachability.visit_class_definition(class);
             }
-            alive.extend(wave);
-            wave = next_wave;
-            next_wave = FxHashSet::default();
         }
-        // Some cheap sanity checks
-        assert!(wave.is_empty());
-        assert!(next_wave.is_empty());
+        if let Some(cref) = self.class_ref_to_def(rust_void) {
+            reachability.visit_class_definition(cref);
+        }
+        if let Some(cref) = self.class_ref_to_def(f128) {
+            reachability.visit_class_definition(cref);
+        }
+        reachability.close_local_class_definitions();
+        let alive: FxHashSet<_> = reachability.class_definitions().collect();
+        drop(reachability);
         // Set the class_defs to only include alive classes
         self.class_defs = alive
             .iter()
@@ -1892,6 +2438,19 @@ impl Assembly {
         modifies_errno: &FxHashSet<&str>,
         override_methods: &MissingMethodPatcher,
     ) -> MissingMethodResolutionStats {
+        self.try_resolve_missing_methods(externs, modifies_errno, override_methods)
+            .unwrap_or_else(|error| panic!("linker: {error}"))
+    }
+
+    /// Strict missing-method resolution. Known runtime services without a registered target
+    /// capability and malformed local owners are returned as structured errors rather than being
+    /// converted into delayed runtime-throwing stubs.
+    pub fn try_resolve_missing_methods(
+        &mut self,
+        externs: &FxHashMap<&str, String>,
+        modifies_errno: &FxHashSet<&str>,
+        override_methods: &MissingMethodPatcher,
+    ) -> Result<MissingMethodResolutionStats, MissingMethodResolutionError> {
         let initial_mref_count = self.method_refs.len();
         let mut stats = MissingMethodResolutionStats::default();
         let externs: FxHashMap<_, _> = externs
@@ -1928,7 +2487,7 @@ impl Assembly {
 
             if class.asm().is_some() {
                 // Is extern, skip
-                stats.external_method_refs += 1;
+                stats.record(MethodResolution::ExternalReference);
                 continue;
             }
             // Check if this method already has an implementation.
@@ -1937,7 +2496,7 @@ impl Assembly {
                 .contains_key(&MethodDefIdx::from_raw(mref_idx))
             {
                 // A method defintion already present, so we don't need to do anyting, so skip.
-                stats.already_defined += 1;
+                stats.record(MethodResolution::AlreadyDefined);
                 continue;
             }
             // FAIL-LOUDLY BACKSTOP: an in-assembly `MethodRef` that resolves to NO `MethodDef` on
@@ -1949,36 +2508,41 @@ impl Assembly {
             // whose generic parameter name was shadowed by a concrete type). Materializing the
             // usual `MethodImpl::Missing` stub here would inject a SECOND, non-abstract member
             // onto the interface: reflection then sees two same-named members
-            // (`AmbiguousMatchException`) and the call throws at runtime. Panic at link time
-            // instead, naming the member.
-            if let Some(class_def) = self.class_defs.get(&ClassDefIdx(mref.class())) {
-                if class_def.is_interface() {
-                    let sig = self[mref.sig()].clone();
-                    panic!(
-                        "linker: call to `{iface}::{name}` does not match any member declared on \
-                         interface `{iface}` (signature {sig:?}). This usually means a \
-                         `#[dotnet_interface]` default body calls a member whose declared \
-                         signature differs from the call's lowering — e.g. a `&mut T` parameter \
-                         hidden behind a type alias (declared as managed byref `ref T`, but the \
-                         self-call lowers it as `T*`), or a generic member called with its type \
-                         parameter shadowed by a concrete type. Refusing to inject a phantom \
-                         member onto the interface.",
-                        iface = self.class_ref(mref.class()).display(self),
-                        name = &self[mref.name()],
-                    );
-                }
+            // (`AmbiguousMatchException`) and the call throws at runtime. Return a structural
+            // linker error instead, naming the member.
+            let owner = ClassDefIdx(mref.class());
+            let owner_name = self.class_ref(mref.class()).display(self);
+            let member_name = self[mref.name()].to_string();
+            let Some(class_def) = self.class_defs.get(&owner) else {
+                return Err(MissingMethodResolutionError::MissingOwner {
+                    owner: owner_name,
+                    member: member_name,
+                });
+            };
+            if class_def.is_interface() {
+                return Err(MissingMethodResolutionError::InterfaceMemberMismatch {
+                    interface: owner_name,
+                    member: member_name,
+                    signature: format!("{:?}", self[mref.sig()]),
+                });
             }
             // Patch exact linker symbols, plus the closed rustc-runtime alias set above. Matching
             // arbitrary demangled leaf names is forbidden: `core::fmt::write` must never resolve
             // to the POSIX `write` builtin merely because both end in the same word.
             let emitted_name = self[mref.name()].to_string();
-            let runtime_alias = rustc_runtime_builtin_alias(&emitted_name);
-            let override_key = if override_methods.contains_key(&mref.name()) {
-                Some(mref.name())
-            } else {
-                runtime_alias.map(|name| self.alloc_string(name))
-            };
-            if let Some(overrider) = override_key.and_then(|key| override_methods.get(&key)) {
+            let service = RuntimeService::classify(&emitted_name);
+            let compatibility_key = service
+                .filter(|service| service.requires_registered_capability())
+                .map(|service| self.alloc_string(service.canonical_symbol()));
+            let overrider = override_methods
+                .get(&mref.name())
+                .or_else(|| {
+                    service.and_then(|service| override_methods.get_runtime_service(service))
+                })
+                // Compatibility for downstream patcher builders which still register the
+                // canonical allocator symbol through `insert` rather than the typed API.
+                .or_else(|| compatibility_key.and_then(|key| override_methods.get(&key)));
+            if let Some(overrider) = overrider {
                 let mref = mref.clone();
                 let implementation = overrider(mref_idx, self);
                 // `Access::Public`, not `Private`: these patched helpers live on `MainModule`
@@ -1988,10 +2552,39 @@ impl Assembly {
                 // `MethodAccessException`. Public is not a DCE root, so unused helpers are still
                 // culled; intra-class callers (the `::stable` executables) are unaffected.
                 self.new_method(mref.into_def(implementation, Access::Public, self));
-                stats.overrides_applied += 1;
-                if runtime_alias.is_some() {
-                    stats.allocator_shims_synthesized += 1;
-                }
+                stats.record(MethodResolution::Resolved {
+                    capability: RuntimeCapability::PatcherOverride,
+                    service,
+                });
+                continue;
+            }
+
+            if service.is_some_and(RuntimeService::requires_registered_capability) {
+                return Err(MissingMethodResolutionError::UnsupportedRuntimeService {
+                    service: service.expect("checked as Some"),
+                    emitted_symbol: emitted_name,
+                });
+            }
+
+            if service == Some(RuntimeService::NoAllocShim) {
+                let arg_names = (0..self[mref.sig()].inputs().len()).map(|_| None).collect();
+                let ret = self.alloc_root(CILRoot::VoidRet);
+                self.new_method(MethodDef::new(
+                    Access::Public,
+                    owner,
+                    mref.name(),
+                    mref.sig(),
+                    mref.kind(),
+                    MethodImpl::MethodBody {
+                        blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
+                        locals: vec![],
+                    },
+                    arg_names,
+                ));
+                stats.record(MethodResolution::Resolved {
+                    capability: RuntimeCapability::BuiltinNoOp,
+                    service,
+                });
                 continue;
             }
 
@@ -2021,12 +2614,11 @@ impl Assembly {
                     },
                     arg_names,
                 );
-                assert!(
-                    self.class_defs.contains_key(&ClassDefIdx(mref.class())),
-                    "Can't yet handle missing types."
-                );
                 self.new_method(method_def);
-                stats.externs_synthesized += 1;
+                stats.record(MethodResolution::Resolved {
+                    capability: RuntimeCapability::DeclaredNativeImport,
+                    service: None,
+                });
                 continue;
             }
 
@@ -2049,13 +2641,11 @@ impl Assembly {
                     },
                     arg_names,
                 );
-                assert!(
-                    self.class_defs.contains_key(&ClassDefIdx(mref.class())),
-                    "Can't yet handle missing types."
-                );
-
                 self.new_method(method_def);
-                stats.externs_synthesized += 1;
+                stats.record(MethodResolution::Resolved {
+                    capability: RuntimeCapability::LegacyNativeImport,
+                    service: None,
+                });
 
                 continue;
             }
@@ -2064,44 +2654,17 @@ impl Assembly {
             let arg_names = (0..(self[mref.sig()].inputs().len()))
                 .map(|_| None)
                 .collect();
-            // `__rust_no_alloc_shim_is_unstable[_v2]` is a marker the alloc shim references purely to
-            // keep the global allocator symbols linked; it has no effect. Recent rustc emits it as a
-            // (mangled) *function* call rather than the old `u8` static, so provide a no-op body
-            // (a bare return) — otherwise it resolves to `MethodImpl::Missing` and throws at runtime
-            // (`box_new_uninit` -> alloc -> missing method) the moment anything allocates.
-            let is_noalloc_shim = is_rustc_no_alloc_marker(&emitted_name);
-            let imp = if is_noalloc_shim {
-                stats.no_alloc_shims_synthesized += 1;
-                MethodImpl::MethodBody {
-                    blocks: vec![super::BasicBlock::new(
-                        vec![self.alloc_root(CILRoot::VoidRet)],
-                        0,
-                        None,
-                    )],
-                    locals: vec![],
-                }
-            } else {
-                stats.missing_stubs_synthesized += 1;
-                MethodImpl::Missing
-            };
             let method_def = MethodDef::new(
                 Access::Public,
                 ClassDefIdx(mref.class()),
                 mref.name(),
                 mref.sig(),
                 mref.kind(),
-                imp,
+                MethodImpl::Missing,
                 arg_names,
             );
-            assert!(
-                self.class_defs.contains_key(&ClassDefIdx(mref.class())),
-                "Can't yet handle missing types. Type {} with id {:?} is missing. Method {}",
-                self.class_ref(mref.class()).display(self),
-                mref.class(),
-                &self[mref.name()]
-            );
-
             self.new_method(method_def);
+            stats.record(MethodResolution::Unresolved);
         }
         stats.method_refs_added = self.method_refs.len() - initial_mref_count;
         stats.unresolved_missing_methods = self
@@ -2109,7 +2672,7 @@ impl Assembly {
             .values()
             .filter(|def| !def.is_abstract() && matches!(def.implementation(), MethodImpl::Missing))
             .count();
-        stats
+        Ok(stats)
     }
 
     #[must_use]
@@ -2383,6 +2946,21 @@ impl Assembly {
     /// Iterates trough *all the roots* in this assembly
     pub fn iter_roots(&self) -> impl Iterator<Item = &CILRoot> {
         self.roots.values().iter()
+    }
+    pub(crate) fn iter_type_values(&self) -> impl Iterator<Item = &Type> {
+        self.types.values().iter()
+    }
+    pub(crate) fn iter_signatures(&self) -> impl Iterator<Item = &FnSig> {
+        self.sigs.values().iter()
+    }
+    pub(crate) fn iter_class_refs(&self) -> impl Iterator<Item = &ClassRef> {
+        self.class_refs.values().iter()
+    }
+    pub(crate) fn iter_field_descs(&self) -> impl Iterator<Item = &FieldDesc> {
+        self.fields.values().iter()
+    }
+    pub(crate) fn iter_static_field_descs(&self) -> impl Iterator<Item = &StaticFieldDesc> {
+        self.statics.values().iter()
     }
     pub fn fix_alignment(&mut self, guaranteed_align: u8) {
         let method_def_idxs: Box<[_]> = self.method_defs.keys().copied().collect();
@@ -2819,83 +3397,140 @@ impl Assembly {
         self.alloc_node(CILNode::LdFtn(mref))
     }
 
-    /// Produces a function-pointer (`LdFtn`) value whose CIL arity matches `target_sig`, for the
-    /// physical method `real_ref` (whose own physical signature is `real_ref.sig()`).
+    /// Produces a function pointer only when `real_ref` already has exactly `target_sig`.
     ///
-    /// The backend builds a physical method signature from *every* `fn_abi.args` entry — including
-    /// `PassMode::Ignore`/ZST receivers, which lower to `Type::Void` (`valuetype RustVoid`)
-    /// parameters. A bare `fn`-pointer *type*, by contrast, is built receiver-free. So when a
-    /// closure / `FnDef` with a ZST receiver is turned into a bare `fn` pointer (either via a MIR
-    /// `ClosureFnPointer`/`ReifyFnPointer` coercion, or via a const fn-pointer relocation in static
-    /// data), the physical method has *more* parameters (the elided `Void` ones) than the fn-pointer
-    /// type it is stored into and later invoked through. Taking the method's address with a plain
-    /// `ldftn` then stores a pointer whose arity disagrees with the eventual indirect `calli`: the
-    /// `calli` pushes too few arguments, and the callee's `ldarg.N` reads a non-existent slot
-    /// (garbage). This was the root cause of the TLS `LazyStorage::initialize`
-    /// `AccessViolationException`.
-    ///
-    /// The fix is an adapter thunk: a fresh static method whose physical signature *is* `target_sig`;
-    /// it loads each real argument from its target slot, supplies an uninitialised `RustVoid` value
-    /// for each elided `Void`/ZST parameter, calls the real method, and returns its result. The
-    /// returned `LdFtn` points at this adapter, so the indirect `calli` and the callee agree on
-    /// arity.
-    ///
-    /// Fast path: when `real_ref.sig()` already equals `target_sig` (no elided params), the real
-    /// method's address is taken directly with no adapter. The adapter is memoised by
-    /// `(real method name, target sig)`, so it is emitted exactly once across coercion sites.
+    /// Signature adaptation cannot be inferred from `Type::Void`: that type represents both a
+    /// physically present `RustVoid`/ZST parameter and a Rust ABI `PassMode::Ignore` slot. Callers
+    /// which intentionally elide ABI slots must use [`Self::reify_fnptr_with_ignored`] and provide
+    /// those slots explicitly.
     pub fn reify_fnptr(
         &mut self,
         real_ref: MethodRef,
         target_sig: Interned<FnSig>,
     ) -> Interned<CILNode> {
+        assert_eq!(
+            real_ref.sig(),
+            target_sig,
+            "reify_fnptr: signature adaptation requires explicit ignored ABI slots; \
+             use reify_fnptr_with_ignored"
+        );
+        let method = self.alloc_methodref(real_ref);
+        self.ld_ftn(method)
+    }
+
+    /// Reifies `real_ref` as `target_sig`, explicitly naming real-signature argument slots which
+    /// are absent from the target function-pointer ABI. Explicit slots avoid guessing from
+    /// `Type::Void`: an unignored Void/ZST slot is a real positional argument and consumes the
+    /// corresponding target slot, while an ignored slot is synthesized inside the adapter.
+    pub fn reify_fnptr_with_ignored(
+        &mut self,
+        real_ref: MethodRef,
+        target_sig: Interned<FnSig>,
+        ignored_real_slots: &[usize],
+    ) -> Interned<CILNode> {
         let real_sig_idx = real_ref.sig();
-        // Fast path: signatures already agree (the common case: no ZST/Ignore receiver was elided).
-        if real_sig_idx == target_sig {
-            let m = self.alloc_methodref(real_ref);
-            return self.ld_ftn(m);
-        }
         let real_sig = self[real_sig_idx].clone();
         let target_sig_val = self[target_sig].clone();
         let real_inputs = real_sig.inputs();
         let target_inputs = target_sig_val.inputs();
-        // Compute the positional mapping between the real (keep-ZST) inputs and the target inputs.
-        // The two sigs may differ ONLY by keep-ZST params whose CIL type is `Type::Void` (the elided
-        // `PassMode::Ignore`/ZST args). For each real input, record whether it consumes the next
-        // target slot (non-Void) or is filled with an uninitialised `Void` value (elided).
+        assert_eq!(
+            real_sig.output(),
+            target_sig_val.output(),
+            "reify_fnptr: adapter return types differ. real:{real_sig:?} target:{target_sig_val:?}"
+        );
+
+        let mut ignored = ignored_real_slots.to_vec();
+        ignored.sort_unstable();
+        assert!(
+            ignored.windows(2).all(|pair| pair[0] != pair[1]),
+            "reify_fnptr: duplicate ignored real slot"
+        );
+        assert!(
+            ignored.iter().all(|slot| *slot < real_inputs.len()),
+            "reify_fnptr: ignored real slot is out of range"
+        );
+        assert!(
+            ignored.iter().all(|slot| real_inputs[*slot] == Type::Void),
+            "reify_fnptr: only Type::Void ABI slots may be ignored"
+        );
+        if real_sig_idx == target_sig && ignored.is_empty() {
+            let method = self.alloc_methodref(real_ref);
+            return self.ld_ftn(method);
+        }
+
         let mut target_idx = 0usize;
-        // `slot_map[i] = Some(j)` => real arg `i` is loaded from target slot `j`;
-        // `slot_map[i] = None`    => real arg `i` is an elided Void/ZST arg, supplied as `uninit_val`.
         let mut slot_map: Vec<Option<usize>> = Vec::with_capacity(real_inputs.len());
-        for real in real_inputs {
-            if *real == Type::Void {
+        for (real_idx, real) in real_inputs.iter().enumerate() {
+            if ignored.binary_search(&real_idx).is_ok() {
                 slot_map.push(None);
-            } else {
-                let Some(target) = target_inputs.get(target_idx) else {
-                    panic!(
-                        "reify_fnptr: real sig has more non-Void params than target sig. real:{:?} target:{:?}",
-                        real_inputs, target_inputs
-                    );
-                };
-                assert_eq!(
-                    *real, *target,
-                    "reify_fnptr: real param at non-Void position {target_idx} does not match \
-                     target param. real:{real_inputs:?} target:{target_inputs:?}"
-                );
-                slot_map.push(Some(target_idx));
-                target_idx += 1;
+                continue;
             }
+            let Some(target) = target_inputs.get(target_idx) else {
+                panic!(
+                    "reify_fnptr: real sig has more retained params than target sig. real:{real_inputs:?} target:{target_inputs:?} ignored:{ignored:?}"
+                );
+            };
+            assert_eq!(
+                *real, *target,
+                "reify_fnptr: retained real param {real_idx} does not match target param \
+                 {target_idx}. real:{real_inputs:?} target:{target_inputs:?} ignored:{ignored:?}"
+            );
+            slot_map.push(Some(target_idx));
+            target_idx += 1;
         }
         assert_eq!(
             target_idx,
             target_inputs.len(),
             "reify_fnptr: target sig has params the real sig does not consume. \
-             real:{real_inputs:?} target:{target_inputs:?}"
+             real:{real_inputs:?} target:{target_inputs:?} ignored:{ignored:?}"
         );
-        // Deterministic, collision-free adapter name keyed on the real method + the target sig, so
-        // the adapter is emitted exactly once even across multiple coercion sites (`new_method` is
-        // idempotent for the same MethodRef).
+        // Key the adapter on the callee's full semantic identity rather than its display name.
+        // Distinct owners and overloads routinely share a method name; using just that name and an
+        // assembly-local signature index could silently alias their adapters after artifact merge.
         let real_name = self[real_ref.name()].to_string();
-        let adapter_name = format!("{real_name}$fnptr_adapter${}", target_sig.inner());
+        let ignored_key = ignored
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join("_");
+        let real_class = self[real_ref.class()].clone();
+        let class_assembly = real_class
+            .asm()
+            .map(|name| self[name].to_string())
+            .unwrap_or_default();
+        let class_generics = real_class
+            .generics()
+            .iter()
+            .map(|tpe| tpe.mangle(self))
+            .collect::<Vec<_>>()
+            .join(",");
+        let real_inputs_key = real_inputs
+            .iter()
+            .map(|tpe| tpe.mangle(self))
+            .collect::<Vec<_>>()
+            .join(",");
+        let real_generics = real_ref
+            .generics()
+            .iter()
+            .map(|tpe| tpe.mangle(self))
+            .collect::<Vec<_>>()
+            .join(",");
+        let target_inputs_key = target_inputs
+            .iter()
+            .map(|tpe| tpe.mangle(self))
+            .collect::<Vec<_>>()
+            .join(",");
+        let semantic_key = format!(
+            "{class_assembly}|{}|{}|{class_generics}|{real_name}|{:?}|{real_inputs_key}|{}|\
+             {real_generics}|{target_inputs_key}|{}|{ignored_key}",
+            &self[real_class.name()],
+            real_class.is_valuetype(),
+            real_ref.kind(),
+            real_sig.output().mangle(self),
+            target_sig_val.output().mangle(self),
+        );
+        let adapter_key = crate::utilis::encode(crate::calculate_hash(&semantic_key));
+        let adapter_name = format!("{real_name}$fnptr_adapter${adapter_key}");
         let main_module = self.main_module();
         let adapter_ref = MethodRef::new(
             *main_module,
@@ -2911,18 +3546,21 @@ impl Assembly {
         let real_ref_idx = self.alloc_methodref(real_ref);
         let args: Vec<Interned<CILNode>> = slot_map
             .iter()
-            .map(|slot| match slot {
+            .enumerate()
+            .map(|(real_idx, slot)| match slot {
                 Some(target_index) => self.alloc_node(CILNode::LdArg(*target_index as u32)),
-                None => self.uninit_val(Type::Void),
+                None => self.uninit_val(real_inputs[real_idx]),
             })
             .collect();
-        let call = self.call(real_ref_idx, &args, IsPure::NOT);
-        let ret_root = if real_ret == Type::Void {
-            self.alloc_root(CILRoot::VoidRet)
+        let roots = if real_ret == Type::Void {
+            let call = self.call_root(real_ref_idx, &args, IsPure::NOT);
+            let ret = self.alloc_root(CILRoot::VoidRet);
+            vec![call, ret]
         } else {
-            self.alloc_root(CILRoot::Ret(call))
+            let call = self.call(real_ref_idx, &args, IsPure::NOT);
+            vec![self.alloc_root(CILRoot::Ret(call))]
         };
-        let block = super::BasicBlock::new(vec![ret_root], 0, None);
+        let block = super::BasicBlock::new(roots, 0, None);
         let arg_names = (0..target_inputs.len()).map(|_| None).collect();
         let adapter_def = MethodDef::new(
             Access::Private,
@@ -3597,9 +4235,541 @@ fn add_deliberately_ill_typed_method(asm: &mut Assembly) -> MethodDefIdx {
     ))
 }
 
+#[cfg(test)]
+fn test_pe_options(name: &str) -> super::pe_exporter::export::ExportOptions {
+    super::pe_exporter::export::ExportOptions {
+        runtime: rust_dotnet_sdk_core::runtime::DotnetVersion::Net10,
+        is_dll: true,
+        assembly_name: name.to_string(),
+        public_module_full_name: None,
+        module_name: format!("{name}.dll"),
+        pdb_file_name: String::new(),
+    }
+}
+
+#[test]
+fn fnptr_adapter_roots_void_call_before_return() {
+    let mut asm = Assembly::default();
+    let owner = asm.main_module();
+    let real_sig = asm.sig([Type::Void, Type::Int(Int::I32)], Type::Void);
+    let target_sig = asm.sig([Type::Int(Int::I32)], Type::Void);
+    let name = asm.alloc_string("void_fnptr_target");
+    let real = MethodRef::new(owner.0, name, real_sig, MethodKind::Static, [].into());
+    asm.reify_fnptr_with_ignored(real, target_sig, &[0]);
+
+    let adapter = asm
+        .method_defs()
+        .values()
+        .find(|method| asm[method.name()].contains("$fnptr_adapter$"))
+        .expect("adapter method");
+    let MethodImpl::MethodBody { blocks, .. } = adapter.implementation() else {
+        panic!("adapter must have a body");
+    };
+    assert_eq!(blocks[0].roots().len(), 2);
+    assert!(matches!(asm[blocks[0].roots()[0]], CILRoot::Call(_)));
+    assert_eq!(asm[blocks[0].roots()[1]], CILRoot::VoidRet);
+}
+
+#[test]
+fn fnptr_adapter_ignores_only_explicit_slots() {
+    let mut asm = Assembly::default();
+    let owner = asm.main_module();
+    let real_sig = asm.sig([Type::Void, Type::Void, Type::Int(Int::I32)], Type::Void);
+    let target_sig = asm.sig([Type::Void, Type::Int(Int::I32)], Type::Void);
+    let name = asm.alloc_string("explicit_fnptr_slots");
+    let real = MethodRef::new(owner.0, name, real_sig, MethodKind::Static, [].into());
+    asm.reify_fnptr_with_ignored(real, target_sig, &[1]);
+
+    let adapter = asm
+        .method_defs()
+        .values()
+        .find(|method| asm[method.name()].contains("$fnptr_adapter$"))
+        .expect("adapter method");
+    let MethodImpl::MethodBody { blocks, .. } = adapter.implementation() else {
+        panic!("adapter must have a body");
+    };
+    let CILRoot::Call(call) = &asm[blocks[0].roots()[0]] else {
+        panic!("void adapter must call before returning");
+    };
+    assert_eq!(call.1.len(), 3);
+    assert_eq!(asm[call.1[0]], CILNode::LdArg(0));
+    assert_eq!(asm[call.1[2]], CILNode::LdArg(1));
+    assert_ne!(asm[call.1[1]], CILNode::LdArg(0));
+    assert_ne!(asm[call.1[1]], CILNode::LdArg(1));
+}
+
+#[test]
+fn fnptr_adapters_for_same_named_methods_do_not_alias() {
+    let mut asm = Assembly::default();
+    let owner_a_name = asm.alloc_string("AdapterOwnerA");
+    let owner_b_name = asm.alloc_string("AdapterOwnerB");
+    let owner_a = asm.alloc_class_ref(ClassRef::new(owner_a_name, None, false, [].into()));
+    let owner_b = asm.alloc_class_ref(ClassRef::new(owner_b_name, None, false, [].into()));
+    let real_sig = asm.sig([Type::Void], Type::Void);
+    let target_sig = asm.sig([], Type::Void);
+    let name = asm.alloc_string("same_name");
+
+    for owner in [owner_a, owner_b] {
+        let real = MethodRef::new(owner, name, real_sig, MethodKind::Static, [].into());
+        asm.reify_fnptr_with_ignored(real, target_sig, &[0]);
+    }
+
+    let adapter_names: std::collections::HashSet<_> = asm
+        .method_defs()
+        .values()
+        .filter_map(|method| {
+            let name = &asm[method.name()];
+            name.contains("$fnptr_adapter$").then(|| name.to_string())
+        })
+        .collect();
+    assert_eq!(adapter_names.len(), 2);
+}
+
+#[test]
+#[should_panic(expected = "signature adaptation requires explicit ignored ABI slots")]
+fn fnptr_legacy_api_does_not_guess_ignored_void_slots() {
+    let mut asm = Assembly::default();
+    let owner = asm.main_module();
+    let real_sig = asm.sig([Type::Void], Type::Void);
+    let target_sig = asm.sig([], Type::Void);
+    let name = asm.alloc_string("ambiguous_void_slot");
+    let real = MethodRef::new(owner.0, name, real_sig, MethodKind::Static, [].into());
+    asm.reify_fnptr(real, target_sig);
+}
+
 #[test]
 fn final_export_verification_accepts_clean_assembly() {
     assert!(Assembly::default().prepared().verify_for_export().is_ok());
+}
+
+#[test]
+fn optimizer_fuel_is_preallocated_per_method_and_hash_order_independent() {
+    fn add_method(asm: &mut Assembly, name: &str, root_count: usize) -> MethodDefIdx {
+        let owner = asm.main_module();
+        let name = asm.alloc_string(name);
+        let sig = asm.sig([], Type::Void);
+        let nop = asm.alloc_root(CILRoot::Nop);
+        let mut roots = vec![nop; root_count];
+        roots.push(asm.alloc_root(CILRoot::VoidRet));
+        asm.new_method(MethodDef::new(
+            Access::Private,
+            owner,
+            name,
+            sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![super::BasicBlock::new(roots, 0, None)],
+                locals: vec![],
+            },
+            vec![],
+        ))
+    }
+
+    let mut original = Assembly::default();
+    let small = add_method(&mut original, "budget_small", 1);
+    let large = add_method(&mut original, "budget_large", 4);
+    let budgets: FxHashMap<_, _> = original.optimizer_method_budgets(96).into_iter().collect();
+    assert!(budgets[&small] > 0);
+    assert!(budgets[&large] > budgets[&small]);
+    assert_eq!(budgets.values().sum::<u32>(), 96);
+
+    let mut reordered = original.clone();
+    let mut definitions: Vec<_> = reordered.method_defs.drain().collect();
+    definitions.reverse();
+    reordered.method_defs.extend(definitions);
+    assert_eq!(
+        original.optimizer_method_budgets(96),
+        reordered.optimizer_method_budgets(96)
+    );
+
+    let mut original_fuel = OptFuel::new(96);
+    let mut reordered_fuel = OptFuel::new(96);
+    original.opt(&mut original_fuel);
+    reordered.opt(&mut reordered_fuel);
+    assert_eq!(original_fuel, reordered_fuel);
+    assert_eq!(original.method_defs, reordered.method_defs);
+    assert_eq!(original.nodes.values(), reordered.nodes.values());
+    assert_eq!(original.roots.values(), reordered.roots.values());
+}
+
+#[test]
+fn dce_keeps_method_metadata_types_and_override_targets() {
+    let mut asm = Assembly::default();
+    let owner = asm.main_module();
+    let void_sig = asm.sig([], Type::Void);
+    let ret = asm.alloc_root(CILRoot::VoidRet);
+
+    let attribute_name = asm.alloc_string("OnlyMethodMetadataKeepsMe");
+    let attribute = asm
+        .class_def(ClassDef::new(
+            attribute_name,
+            false,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Private,
+            None,
+            None,
+            true,
+        ))
+        .unwrap();
+
+    let base_name = asm.alloc_string("metadata_base");
+    let base = asm.new_method(MethodDef::new(
+        Access::Private,
+        owner,
+        base_name,
+        void_sig,
+        MethodKind::Virtual,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        },
+        vec![],
+    ));
+
+    let exported_name = asm.alloc_string("metadata_export");
+    let exported = MethodDef::new(
+        Access::Extern,
+        owner,
+        exported_name,
+        void_sig,
+        MethodKind::Virtual,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        },
+        vec![],
+    )
+    .with_override(base.0)
+    .with_custom_attributes(
+        vec![super::class::CustomAttrDef::new(
+            attribute.0,
+            vec![],
+            vec![],
+        )],
+        vec![],
+        vec![],
+    );
+    asm.new_method(exported);
+
+    asm.eliminate_dead_code();
+    assert!(asm.method_defs().contains_key(&base));
+    assert!(asm.class_defs().contains_key(&attribute));
+}
+
+#[test]
+fn dce_drops_member_accessors_with_a_dead_owner() {
+    let mut asm = Assembly::default();
+    let owner_name = asm.alloc_string("DeadMemberOwner");
+    let owner = asm
+        .class_def(ClassDef::new(
+            owner_name,
+            false,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Private,
+            None,
+            None,
+            true,
+        ))
+        .unwrap();
+    let void_sig = asm.sig([], Type::Void);
+    let void_ret = asm.alloc_root(CILRoot::VoidRet);
+    let void_body = || MethodImpl::MethodBody {
+        blocks: vec![super::BasicBlock::new(vec![void_ret], 0, None)],
+        locals: vec![],
+    };
+    let add_name = asm.alloc_string("add_Changed");
+    let add = asm.new_method(MethodDef::new(
+        Access::Private,
+        owner,
+        add_name,
+        void_sig,
+        MethodKind::Instance,
+        void_body(),
+        vec![],
+    ));
+    let remove_name = asm.alloc_string("remove_Changed");
+    let remove = asm.new_method(MethodDef::new(
+        Access::Private,
+        owner,
+        remove_name,
+        void_sig,
+        MethodKind::Instance,
+        void_body(),
+        vec![],
+    ));
+    let getter_sig = asm.sig([], Type::Int(Int::I32));
+    let zero = asm.alloc_node(Const::I32(0));
+    let getter_ret = asm.alloc_root(CILRoot::Ret(zero));
+    let getter_name = asm.alloc_string("get_Value");
+    let getter = asm.new_method(MethodDef::new(
+        Access::Private,
+        owner,
+        getter_name,
+        getter_sig,
+        MethodKind::Instance,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(vec![getter_ret], 0, None)],
+            locals: vec![],
+        },
+        vec![],
+    ));
+    let event_name = asm.alloc_string("Changed");
+    asm.class_mut(owner).add_event(EventDef::new(
+        event_name,
+        Type::PlatformObject,
+        add.0,
+        remove.0,
+    ));
+    let property_name = asm.alloc_string("Value");
+    asm.class_mut(owner).add_property(PropertyDef::new(
+        property_name,
+        Type::Int(Int::I32),
+        Some(getter.0),
+        None,
+    ));
+
+    asm.eliminate_dead_code();
+
+    assert!(!asm.class_defs().contains_key(&owner));
+    assert!(!asm.method_defs().contains_key(&add));
+    assert!(!asm.method_defs().contains_key(&remove));
+    assert!(!asm.method_defs().contains_key(&getter));
+}
+
+#[test]
+fn dce_keeps_member_accessors_for_an_owner_reached_through_a_live_signature() {
+    let mut asm = Assembly::default();
+    let owner_name = asm.alloc_string("SignatureMemberOwner");
+    let owner = asm
+        .class_def(ClassDef::new(
+            owner_name,
+            false,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Private,
+            None,
+            None,
+            true,
+        ))
+        .unwrap();
+    let getter_sig = asm.sig([], Type::Int(Int::I32));
+    let zero = asm.alloc_node(Const::I32(0));
+    let getter_ret = asm.alloc_root(CILRoot::Ret(zero));
+    let getter_name = asm.alloc_string("get_Value");
+    let getter = asm.new_method(MethodDef::new(
+        Access::Private,
+        owner,
+        getter_name,
+        getter_sig,
+        MethodKind::Instance,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(vec![getter_ret], 0, None)],
+            locals: vec![],
+        },
+        vec![],
+    ));
+    let property_name = asm.alloc_string("Value");
+    asm.class_mut(owner).add_property(PropertyDef::new(
+        property_name,
+        Type::Int(Int::I32),
+        Some(getter.0),
+        None,
+    ));
+
+    let exported_sig = asm.sig([Type::ClassRef(owner.0)], Type::Void);
+    let exported_ret = asm.alloc_root(CILRoot::VoidRet);
+    let exported_name = asm.alloc_string("use_signature_owner");
+    let main = asm.main_module();
+    asm.new_method(MethodDef::new(
+        Access::Extern,
+        main,
+        exported_name,
+        exported_sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(vec![exported_ret], 0, None)],
+            locals: vec![],
+        },
+        vec![None],
+    ));
+
+    asm.eliminate_dead_code();
+
+    assert!(asm.class_defs().contains_key(&owner));
+    assert!(asm.method_defs().contains_key(&getter));
+    assert_eq!(asm.class_defs()[&owner].properties().len(), 1);
+}
+
+#[test]
+fn dce_follows_nested_generics_and_external_method_reference_metadata() {
+    fn property_owner(asm: &mut Assembly, name: &str) -> (ClassDefIdx, MethodDefIdx) {
+        let name = asm.alloc_string(name);
+        let owner = asm
+            .class_def(ClassDef::new(
+                name,
+                false,
+                0,
+                None,
+                vec![],
+                vec![],
+                Access::Private,
+                None,
+                None,
+                true,
+            ))
+            .unwrap();
+        let getter_name = asm.alloc_string("get_Value");
+        let getter_sig = asm.sig([Type::ClassRef(owner.0)], Type::Int(Int::I32));
+        let zero = asm.alloc_node(Const::I32(0));
+        let ret = asm.alloc_root(CILRoot::Ret(zero));
+        let getter = asm.new_method(MethodDef::new(
+            Access::Private,
+            owner,
+            getter_name,
+            getter_sig,
+            MethodKind::Instance,
+            MethodImpl::MethodBody {
+                blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            },
+            vec![None],
+        ));
+        let property_name = asm.alloc_string("Value");
+        asm.class_mut(owner).add_property(PropertyDef::new(
+            property_name,
+            Type::Int(Int::I32),
+            Some(getter.0),
+            None,
+        ));
+        (owner, getter)
+    }
+
+    let mut asm = Assembly::default();
+    let (owner_payload, owner_getter) = property_owner(&mut asm, "OwnerGenericPayload");
+    let (method_payload, method_getter) = property_owner(&mut asm, "MethodGenericPayload");
+    let (signature_payload, signature_getter) = property_owner(&mut asm, "SignaturePayload");
+
+    let external_assembly = asm.alloc_string("External.Api");
+    let envelope_name = asm.alloc_string("External.Envelope`1");
+    let envelope = asm.alloc_class_ref(ClassRef::new(
+        envelope_name,
+        Some(external_assembly),
+        false,
+        [Type::ClassRef(owner_payload.0)].into(),
+    ));
+    let api_name = asm.alloc_string("External.GenericApi`1");
+    let api = asm.alloc_class_ref(ClassRef::new(
+        api_name,
+        Some(external_assembly),
+        false,
+        [Type::ClassRef(envelope)].into(),
+    ));
+    let invoke_name = asm.alloc_string("Invoke");
+    let invoke_sig = asm.sig([], Type::Void);
+    let invoke = asm.alloc_methodref(MethodRef::new(
+        api,
+        invoke_name,
+        invoke_sig,
+        MethodKind::Static,
+        [Type::ClassRef(method_payload.0)].into(),
+    ));
+    let call = asm.call_root(invoke, &[] as &[Interned<CILNode>], IsPure::NOT);
+
+    let capture_name = asm.alloc_string("Capture");
+    let capture_sig = asm.sig([Type::ClassRef(signature_payload.0)], Type::Void);
+    let capture = asm.alloc_methodref(MethodRef::new(
+        api,
+        capture_name,
+        capture_sig,
+        MethodKind::Static,
+        [].into(),
+    ));
+    let function = asm.ld_ftn(capture);
+    let pop_function = asm.alloc_root(CILRoot::Pop(function));
+    let ret = asm.alloc_root(CILRoot::VoidRet);
+    let exported_name = asm.alloc_string("exercise_external_metadata");
+    let exported_sig = asm.sig([], Type::Void);
+    let main = asm.main_module();
+    asm.new_method(MethodDef::new(
+        Access::Extern,
+        main,
+        exported_name,
+        exported_sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(
+                vec![call, pop_function, ret],
+                0,
+                None,
+            )],
+            locals: vec![],
+        },
+        vec![],
+    ));
+
+    asm.eliminate_dead_code();
+
+    for (owner, getter) in [
+        (owner_payload, owner_getter),
+        (method_payload, method_getter),
+        (signature_payload, signature_getter),
+    ] {
+        assert!(asm.class_defs().contains_key(&owner));
+        assert!(asm.method_defs().contains_key(&getter));
+        assert_eq!(asm.class_defs()[&owner].properties().len(), 1);
+    }
+
+    let ready = asm.verify_for_export().unwrap();
+    let (image, _) = ready
+        .try_render_pe(&test_pe_options("semantic-reachability"))
+        .unwrap();
+    assert_eq!(&image[..2], b"MZ");
+}
+
+#[test]
+fn final_verifier_rejects_only_missing_methods_that_survive_dce() {
+    let mut asm = Assembly::default().prepared();
+    let owner = asm.main_module();
+    let sig = asm.sig([], Type::Void);
+    let dead_name = asm.alloc_string("dead_missing");
+    asm.new_method(MethodDef::new(
+        Access::Private,
+        owner,
+        dead_name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::Missing,
+        vec![],
+    ));
+    asm.eliminate_dead_code();
+    assert!(asm.verify_for_export().is_ok());
+
+    let mut asm = Assembly::default().prepared();
+    let owner = asm.main_module();
+    let sig = asm.sig([], Type::Void);
+    let live_name = asm.alloc_string("live_missing");
+    asm.new_method(MethodDef::new(
+        Access::Extern,
+        owner,
+        live_name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::Missing,
+        vec![],
+    ));
+    asm.eliminate_dead_code();
+    let Err(VerificationFailure::AssemblyInvariant { message }) = asm.verify_for_export() else {
+        panic!("a reachable missing method must fail the final verifier")
+    };
+    assert!(message.contains("live_missing"), "{message}");
 }
 
 #[test]
@@ -3953,6 +5123,86 @@ fn optimizer_method_schedule_uses_semantic_order() {
 }
 
 #[test]
+fn constructed_generic_overload_order_is_total_and_reproducible() {
+    fn assembly(reverse: bool) -> Assembly {
+        let mut asm = Assembly::default();
+        let external = asm.alloc_string("System.Collections");
+        let list_name = asm.alloc_string("System.Collections.Generic.List`1");
+        let list_i32 = asm.alloc_class_ref(ClassRef::new(
+            list_name,
+            Some(external),
+            false,
+            [Type::Int(Int::I32)].into(),
+        ));
+        let list_string = asm.alloc_class_ref(ClassRef::new(
+            list_name,
+            Some(external),
+            false,
+            [Type::PlatformString].into(),
+        ));
+        let nop = asm.alloc_root(CILRoot::Nop);
+        let ret = asm.alloc_root(CILRoot::VoidRet);
+        let name = asm.alloc_string("same_name");
+        let owner = asm.main_module();
+        let mut overloads = vec![(list_i32, 2_usize), (list_string, 5_usize)];
+        if reverse {
+            overloads.reverse();
+        }
+        for (parameter, root_count) in overloads {
+            let sig = asm.sig([Type::ClassRef(parameter)], Type::Void);
+            let mut roots = vec![nop; root_count - 1];
+            roots.push(ret);
+            asm.new_method(MethodDef::new(
+                Access::Private,
+                owner,
+                name,
+                sig,
+                MethodKind::Static,
+                MethodImpl::MethodBody {
+                    blocks: vec![super::BasicBlock::new(roots, 0, None)],
+                    locals: vec![],
+                },
+                vec![None],
+            ));
+        }
+        asm
+    }
+
+    fn semantic_budgets(asm: &Assembly, total: u32) -> std::collections::BTreeMap<Vec<u8>, u32> {
+        asm.optimizer_method_budgets(total)
+            .into_iter()
+            .map(|(method, budget)| (asm.method_semantic_key(method), budget))
+            .collect()
+    }
+
+    let mut forward = assembly(false);
+    let mut reverse = assembly(true);
+    assert_eq!(
+        semantic_budgets(&forward, 73),
+        semantic_budgets(&reverse, 73)
+    );
+
+    let mut forward_fuel = OptFuel::new(73);
+    let mut reverse_fuel = OptFuel::new(73);
+    forward.opt(&mut forward_fuel);
+    reverse.opt(&mut reverse_fuel);
+    assert_eq!(forward_fuel, reverse_fuel);
+    assert_eq!(forward.arena_counts(), reverse.arena_counts());
+
+    let forward = forward
+        .verify_for_export()
+        .unwrap()
+        .try_render_pe(&test_pe_options("generic-overload-order"))
+        .unwrap();
+    let reverse = reverse
+        .verify_for_export()
+        .unwrap()
+        .try_render_pe(&test_pe_options("generic-overload-order"))
+        .unwrap();
+    assert_eq!(forward, reverse);
+}
+
+#[test]
 fn fixed_array_layout_verifier_rejects_representation_expanded_elements() {
     let mut asm = Assembly::default();
     let element_name = asm.alloc_string("ExpandedElement");
@@ -4113,6 +5363,63 @@ fn direct_pe_render_reverifies_before_releasing_artifacts() {
 }
 
 #[test]
+fn direct_pe_preflight_returns_structured_error_before_rendering() {
+    use std::cell::Cell;
+
+    let mut asm = Assembly::default().prepared();
+    let input = asm.alloc_node(Const::I32(1));
+    let unsupported = asm.alloc_node(CILNode::IntCast {
+        input,
+        target: Int::I128,
+        extend: ExtendKind::SignExtend,
+    });
+    let pop = asm.alloc_root(CILRoot::Pop(unsupported));
+    let ret = asm.alloc_root(CILRoot::VoidRet);
+    let main = asm.main_module();
+    let name = asm.alloc_string("retained_unsupported_cast");
+    let sig = asm.sig([], Type::Void);
+    asm.new_method(MethodDef::new(
+        Access::Private,
+        main,
+        name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(vec![pop, ret], 0, None)],
+            locals: vec![],
+        },
+        vec![],
+    ));
+    let ready = asm.verify_for_export().unwrap();
+    let rendered = Cell::new(false);
+    let result = ready.render_with_reverification(|_| rendered.set(true));
+    assert!(matches!(result, Err(PeEmissionError::Target(_))));
+    assert!(
+        !rendered.get(),
+        "unsupported IR must not enter the byte writer"
+    );
+}
+
+#[test]
+fn direct_pe_preflight_ignores_unreachable_interned_constructs() {
+    let mut asm = Assembly::default().prepared();
+    let input = asm.alloc_node(Const::I32(1));
+    asm.alloc_node(CILNode::IntCast {
+        input,
+        target: Int::I128,
+        extend: ExtendKind::SignExtend,
+    });
+    asm.sig([], Type::Float(super::Float::F128));
+
+    let (image, _) = asm
+        .verify_for_export()
+        .unwrap()
+        .try_render_pe(&test_pe_options("dead-preflight-ir"))
+        .unwrap();
+    assert_eq!(&image[..2], b"MZ");
+}
+
+#[test]
 fn missing_method_resolution_reaches_fixed_point() {
     use std::{cell::Cell, rc::Rc};
 
@@ -4198,8 +5505,8 @@ fn missing_method_resolution_only_aliases_allowlisted_rustc_runtime_symbols() {
     let mut asm = Assembly::default();
     let mangled_alloc = "_RNvCsk5I9pfA249o_7___rustc12___rust_alloc";
     assert_eq!(
-        rustc_runtime_builtin_alias(mangled_alloc),
-        Some("__rust_alloc"),
+        RuntimeService::classify(mangled_alloc),
+        Some(RuntimeService::Alloc),
         "unexpected demangling: {}",
         rustc_demangle::demangle(mangled_alloc)
     );
@@ -4207,10 +5514,13 @@ fn missing_method_resolution_only_aliases_allowlisted_rustc_runtime_symbols() {
     let posix_write = Interned::<MethodRef>::builtin(&mut asm, "write", &[], Type::Void);
     let rust_write = Interned::<MethodRef>::builtin(&mut asm, "core::fmt::write", &[], Type::Void);
 
-    let alloc_name = asm.alloc_string("__rust_alloc");
     let write_name = asm.alloc_string("write");
     let mut overrides = MissingMethodPatcher::default();
-    overrides.insert(alloc_name, Box::new(|_, asm| void_body(asm)));
+    overrides.insert_runtime_service(
+        &mut asm,
+        RuntimeService::Alloc,
+        Box::new(|_, asm| void_body(asm)),
+    );
     overrides.insert(write_name, Box::new(|_, asm| void_body(asm)));
 
     let stats =
@@ -4229,6 +5539,52 @@ fn missing_method_resolution_only_aliases_allowlisted_rustc_runtime_symbols() {
     assert!(matches!(
         asm[asm.method_ref_to_def(rust_write).unwrap()].implementation(),
         MethodImpl::Missing
+    ));
+}
+
+#[test]
+fn unsupported_runtime_service_is_a_structured_resolution_error() {
+    let mut asm = Assembly::default();
+    let alloc = Interned::<MethodRef>::builtin(&mut asm, "__rust_alloc", &[], Type::Void);
+    let error = asm
+        .try_resolve_missing_methods(
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+            &MissingMethodPatcher::default(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        MissingMethodResolutionError::UnsupportedRuntimeService {
+            service: RuntimeService::Alloc,
+            ..
+        }
+    ));
+    assert!(asm.method_ref_to_def(alloc).is_none());
+}
+
+#[test]
+fn no_alloc_marker_is_a_typed_builtin_noop_capability() {
+    let mut asm = Assembly::default();
+    let marker = Interned::<MethodRef>::builtin(
+        &mut asm,
+        "__rustc::__rust_no_alloc_shim_is_unstable_v2",
+        &[],
+        Type::Void,
+    );
+    let stats = asm
+        .try_resolve_missing_methods(
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+            &MissingMethodPatcher::default(),
+        )
+        .unwrap();
+
+    assert_eq!(stats.no_alloc_shims_synthesized, 1);
+    assert!(matches!(
+        asm[asm.method_ref_to_def(marker).unwrap()].implementation(),
+        MethodImpl::MethodBody { .. }
     ));
 }
 
@@ -4338,8 +5694,7 @@ fn missing_method_resolution_reports_runtime_stubs_but_not_abstract_placeholders
 }
 
 #[test]
-#[should_panic(expected = "Refusing to inject a phantom member onto the interface")]
-fn missing_method_resolution_rejects_dangling_interface_refs() {
+fn missing_method_resolution_rejects_dangling_interface_refs_structurally() {
     let mut asm = Assembly::default();
     let interface_name = asm.alloc_string("ITest");
     let interface = asm
@@ -4364,8 +5719,13 @@ fn missing_method_resolution_rejects_dangling_interface_refs() {
 
     let externs: FxHashMap<&str, String> = FxHashMap::default();
     let modifies_errno: FxHashSet<&str> = FxHashSet::default();
-    let _ =
-        asm.resolve_missing_methods(&externs, &modifies_errno, &MissingMethodPatcher::default());
+    let error = asm
+        .try_resolve_missing_methods(&externs, &modifies_errno, &MissingMethodPatcher::default())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MissingMethodResolutionError::InterfaceMemberMismatch { .. }
+    ));
 }
 
 config! {LINKER_RECOVER,bool,false}

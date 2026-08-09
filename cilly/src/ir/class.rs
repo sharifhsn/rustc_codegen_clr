@@ -1361,9 +1361,35 @@ impl ClassDef {
                     .map(|a| Type::ClassRef(a.attr_type())),
             )
             .chain(
+                self.field_custom_attributes
+                    .iter()
+                    .flat_map(|(_, _, attributes)| attributes)
+                    .map(|a| Type::ClassRef(a.attr_type())),
+            )
+            .chain(
+                self.properties
+                    .iter()
+                    .flat_map(PropertyDef::custom_attributes)
+                    .map(|a| Type::ClassRef(a.attr_type())),
+            )
+            .chain(
                 self.fixed_array_layout
                     .iter()
                     .map(FixedArrayLayout::element),
+            )
+    }
+
+    /// Method references carried only by Event/Property metadata. These are genuine graph edges:
+    /// deleting an accessor while retaining its metadata row yields a dangling MethodSemantics
+    /// reference (or silently drops the public member during cleanup).
+    pub(crate) fn iter_member_method_refs(&self) -> impl Iterator<Item = Interned<MethodRef>> + '_ {
+        self.events
+            .iter()
+            .flat_map(|event| [event.add(), event.remove()])
+            .chain(
+                self.properties.iter().flat_map(|property| {
+                    [property.getter(), property.setter()].into_iter().flatten()
+                }),
             )
     }
     #[allow(clippy::too_many_arguments)]
@@ -1995,7 +2021,7 @@ impl ClassDef {
     }
     /*
     /// Optimizes this class definition, consuming fuel
-    pub fn opt(&mut self, fuel: &mut OptFuel, asm: &mut Assembly, cache: &mut SideEffectInfoCache) {
+    pub fn opt(&mut self, fuel: &mut OptFuel, asm: &mut Assembly, cache: &mut EffectInfoCache) {
     } */
 }
 fn into_unique<T: Eq + std::hash::Hash>(input: Vec<T>) -> Vec<T> {

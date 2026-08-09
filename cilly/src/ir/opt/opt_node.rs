@@ -1,6 +1,6 @@
 use crate::{Assembly, BinOp, CILNode, Const, Int, Type, bimap::Interned, cilnode::ExtendKind};
 
-use super::{OptFuel, SideEffectInfoCache, opt_if_fuel};
+use super::{EffectInfoCache, OptFuel, opt_if_fuel};
 /// Optimizes an intiger cast.
 fn opt_int_cast(
     original: CILNode,
@@ -93,7 +93,7 @@ pub fn opt_node(
     original: CILNode,
     asm: &mut Assembly,
     fuel: &mut OptFuel,
-    _cache: &mut SideEffectInfoCache,
+    _cache: &mut EffectInfoCache,
 ) -> CILNode {
     match original {
         CILNode::SizeOf(tpe) => match asm[tpe] {
@@ -123,7 +123,11 @@ pub fn opt_node(
             target,
             extend,
         } => opt_int_cast(original, asm, fuel, input, target, extend),
-        CILNode::Call(info) => super::inline::trivial_inline_call(info.0, &info.1, fuel, asm),
+        // Calls are deliberately left intact. Substituting the caller's expression trees for
+        // `LdArg` nodes does not preserve call-site evaluation: an unused argument would vanish,
+        // a multiply-used argument would be evaluated more than once, and argument order could
+        // change. rustc's MIR inliner is the sound place to inline Rust calls.
+        CILNode::Call(_) => original,
         CILNode::LdInd {
             addr,
             tpe,

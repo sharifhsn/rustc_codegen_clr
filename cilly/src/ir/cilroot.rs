@@ -90,6 +90,22 @@ pub enum BranchCond {
     Ge(Interned<CILNode>, Interned<CILNode>, CmpKind),
 }
 impl BranchCond {
+    /// Visits the operands in evaluation order without allocating.
+    pub fn visit_nodes<'a>(&'a self, mut visit: impl FnMut(&'a Interned<CILNode>)) {
+        match self {
+            BranchCond::True(cond) | BranchCond::False(cond) => visit(cond),
+            BranchCond::Eq(lhs, rhs)
+            | BranchCond::Ne(lhs, rhs)
+            | BranchCond::Lt(lhs, rhs, _)
+            | BranchCond::Gt(lhs, rhs, _)
+            | BranchCond::Le(lhs, rhs, _)
+            | BranchCond::Ge(lhs, rhs, _) => {
+                visit(lhs);
+                visit(rhs);
+            }
+        }
+    }
+
     /// Returns all the nodes used by this branch cond.
     /// ```
     /// # use cilly::*;
@@ -104,15 +120,9 @@ impl BranchCond {
     /// assert_eq!(cond_true.nodes(),vec![ldarg_0]);
     /// ```
     pub fn nodes(&self) -> Vec<Interned<CILNode>> {
-        match self {
-            BranchCond::True(cond) | BranchCond::False(cond) => vec![*cond],
-            BranchCond::Eq(lhs, rhs)
-            | BranchCond::Ne(lhs, rhs)
-            | BranchCond::Lt(lhs, rhs, _)
-            | BranchCond::Gt(lhs, rhs, _)
-            | BranchCond::Le(lhs, rhs, _)
-            | BranchCond::Ge(lhs, rhs, _) => vec![*lhs, *rhs],
-        }
+        let mut nodes = Vec::new();
+        self.visit_nodes(|node| nodes.push(*node));
+        nodes
     }
 }
 #[derive(Hash, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
@@ -130,6 +140,78 @@ impl CILRoot {
     pub fn is_meaningufull(&self) -> bool {
         !matches!(self, CILRoot::Nop | CILRoot::SourceFileInfo { .. })
     }
+
+    /// Visits every direct node operand in evaluation order without allocating.
+    pub fn visit_nodes<'a>(&'a self, mut visit: impl FnMut(&'a Interned<CILNode>)) {
+        match self {
+            CILRoot::Unreachable(_)
+            | CILRoot::SourceFileInfo { .. }
+            | CILRoot::ExitSpecialRegion { .. }
+            | CILRoot::VoidRet
+            | CILRoot::Break
+            | CILRoot::Nop
+            | CILRoot::TerminateRegion { .. }
+            | CILRoot::ReThrow => {}
+            CILRoot::StLoc(_, node)
+            | CILRoot::StArg(_, node)
+            | CILRoot::Ret(node)
+            | CILRoot::Pop(node)
+            | CILRoot::Throw(node)
+            | CILRoot::InitObj(node, _)
+            | CILRoot::SetStaticField { val: node, .. } => visit(node),
+            CILRoot::Branch(info) => {
+                if let Some(condition) = &info.2 {
+                    condition.visit_nodes(visit);
+                }
+            }
+            CILRoot::SetField(info) => {
+                visit(&info.1);
+                visit(&info.2);
+            }
+            CILRoot::Call(info) => {
+                for arg in &info.1 {
+                    visit(arg);
+                }
+            }
+            CILRoot::StInd(info) => {
+                visit(&info.0);
+                visit(&info.1);
+            }
+            CILRoot::InitBlk(info) | CILRoot::CpBlk(info) => {
+                visit(&info.0);
+                visit(&info.1);
+                visit(&info.2);
+            }
+            CILRoot::CallI(info) => {
+                for arg in &info.2 {
+                    visit(arg);
+                }
+                visit(&info.0);
+            }
+            CILRoot::CpObj { src, dst, .. } => {
+                visit(src);
+                visit(dst);
+            }
+            CILRoot::StElem {
+                array,
+                index,
+                value,
+                ..
+            } => {
+                visit(array);
+                visit(index);
+                visit(value);
+            }
+        }
+    }
+
+    /// Visits nested root operands. Currently only [`CILRoot::TerminateRegion`] owns one.
+    pub fn visit_child_roots<'a>(&'a self, mut visit: impl FnMut(&'a Interned<CILRoot>)) {
+        if let CILRoot::TerminateRegion { protected, .. } = self {
+            visit(protected);
+        }
+    }
+
     /// Returns a mutable reference to all the arguments of this CIL root, in the order they are evaluated.
     pub fn nodes_mut(&mut self) -> Box<[&mut Interned<CILNode>]> {
         match self {
@@ -190,62 +272,9 @@ impl CILRoot {
         }
     }
     pub fn nodes(&self) -> Box<[&Interned<CILNode>]> {
-        match self {
-            CILRoot::Unreachable(_) => [].into(),
-            CILRoot::StLoc(_, tree)
-            | CILRoot::StArg(_, tree)
-            | CILRoot::Ret(tree)
-            | CILRoot::Pop(tree)
-            | CILRoot::Throw(tree)
-            | CILRoot::InitObj(tree, _)
-            | CILRoot::SetStaticField { val: tree, .. } => [tree].into(),
-            CILRoot::SourceFileInfo { .. }
-            | CILRoot::ExitSpecialRegion { .. }
-            | CILRoot::VoidRet
-            | CILRoot::Break
-            | CILRoot::Nop
-            | CILRoot::TerminateRegion { .. }
-            | CILRoot::ReThrow => [].into(),
-            CILRoot::Branch(info) => {
-                let (_, _, cond) = info.as_ref();
-                let Some(cond) = cond else { return [].into() };
-                match cond {
-                    BranchCond::True(cond) | BranchCond::False(cond) => [cond].into(),
-                    BranchCond::Eq(lhs, rhs)
-                    | BranchCond::Ne(lhs, rhs)
-                    | BranchCond::Lt(lhs, rhs, _)
-                    | BranchCond::Gt(lhs, rhs, _)
-                    | BranchCond::Le(lhs, rhs, _)
-                    | BranchCond::Ge(lhs, rhs, _) => [lhs, rhs].into(),
-                }
-            }
-            CILRoot::SetField(info) => {
-                let (_, addr, val) = info.as_ref();
-                [addr, val].into()
-            }
-            CILRoot::Call(info) => many_ref(&info.1).into(),
-            CILRoot::StInd(info) => {
-                let (addr, val, _, _) = info.as_ref();
-                [addr, val].into()
-            }
-            CILRoot::InitBlk(info) | CILRoot::CpBlk(info) => {
-                let (addr, val, len) = info.as_ref();
-                [addr, val, len].into()
-            }
-            CILRoot::CallI(info) => {
-                let (ptr, _, args) = info.as_ref();
-                let mut args = many_ref(args);
-                args.push(ptr);
-                args.into()
-            }
-            CILRoot::CpObj { src, dst, .. } => [src, dst].into(),
-            CILRoot::StElem {
-                array,
-                index,
-                value,
-                ..
-            } => [array, index, value].into(),
-        }
+        let mut nodes = Vec::new();
+        self.visit_nodes(|node| nodes.push(node));
+        nodes.into()
     }
     /// Maps this root using `root_map` and `node_map`.
     #[allow(clippy::too_many_lines)]
@@ -540,18 +569,6 @@ fn many_mut<T>(input: &mut [T]) -> Vec<&mut T> {
     };
     assert_eq!(res.len(), input_len);
     res
-}
-/// Changes a reference to a slice to an vec of references to the elements.
-fn many_ref<T>(inputs: &[T]) -> Vec<&T> {
-    inputs.iter().collect()
-}
-#[test]
-fn test_many_ref() {
-    let inputs = [0, 1, 2, 3, 4];
-    let res = many_ref(&inputs);
-    assert_eq!(res.len(), inputs.len());
-    assert_eq!(res[0], &0);
-    assert_eq!(res[4], &4);
 }
 #[test]
 fn test_many_mut() {

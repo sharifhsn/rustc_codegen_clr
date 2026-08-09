@@ -280,17 +280,8 @@ impl CILNode {
     pub fn call(mref: Interned<MethodRef>, args: impl Into<Box<[Interned<CILNode>]>>) -> Self {
         Self::Call(Box::new((mref, args.into(), IsPure::NOT)))
     }
-    /// Returns all the nodes this node references.
-    /// ```
-    /// # use cilly::*;
-    /// # let mut asm = Assembly::default();
-    /// let ldarg_0 = asm.alloc_node(CILNode::LdArg(0));
-    /// let ldloc_1 = asm.alloc_node(CILNode::LdLoc(1));
-    /// let binop = CILNode::BinOp(ldarg_0,ldloc_1,BinOp::Add);
-    /// // Two child nodes - ldarg_0 and ldloc_1
-    /// assert_eq!(binop.child_nodes(),vec![ldarg_0,ldloc_1]);
-    /// ```
-    pub fn child_nodes(&self) -> Vec<Interned<CILNode>> {
+    /// Visits every direct child node in structural order without allocating.
+    pub fn visit_child_nodes<'a>(&'a self, mut visit: impl FnMut(&'a Interned<CILNode>)) {
         match self {
             CILNode::Const(_)
             | CILNode::LdLoc(_)
@@ -303,46 +294,60 @@ impl CILNode {
             | CILNode::LdTypeToken(_)
             | CILNode::LdStaticField(_)
             | CILNode::LdStaticFieldAddress(_)
-            | CILNode::GetException => vec![],
-            CILNode::UnOp(node_idx, _)
-            | CILNode::RefToPtr(node_idx)
-            | CILNode::PtrCast(node_idx, _)
-            | CILNode::LdLen(node_idx)
-            | CILNode::LdFieldAddress { addr: node_idx, .. }
-            | CILNode::LdField { addr: node_idx, .. }
-            | CILNode::LdInd { addr: node_idx, .. }
-            | CILNode::LocAlloc { size: node_idx }
-            | CILNode::IsInst(node_idx, _)
-            | CILNode::CheckedCast(node_idx, _)
-            | CILNode::IntCast {
-                input: node_idx, ..
+            | CILNode::GetException => {}
+            CILNode::UnOp(node, _)
+            | CILNode::RefToPtr(node)
+            | CILNode::PtrCast(node, _)
+            | CILNode::LdLen(node)
+            | CILNode::LdFieldAddress { addr: node, .. }
+            | CILNode::LdField { addr: node, .. }
+            | CILNode::LdInd { addr: node, .. }
+            | CILNode::LocAlloc { size: node }
+            | CILNode::IsInst(node, _)
+            | CILNode::CheckedCast(node, _)
+            | CILNode::IntCast { input: node, .. }
+            | CILNode::FloatCast { input: node, .. }
+            | CILNode::LdElelemRef { array: node, .. }
+            | CILNode::NewArr { len: node, .. }
+            | CILNode::Box { value: node, .. }
+            | CILNode::UnboxAny { object: node, .. } => visit(node),
+            CILNode::BinOp(lhs, rhs, _)
+            | CILNode::LdElem {
+                array: lhs,
+                index: rhs,
+                ..
+            } => {
+                visit(lhs);
+                visit(rhs);
             }
-            | CILNode::FloatCast {
-                input: node_idx, ..
-            }
-            | CILNode::LdElelemRef {
-                array: node_idx, ..
-            }
-            | CILNode::NewArr { len: node_idx, .. }
-            | CILNode::Box {
-                value: node_idx, ..
-            }
-            | CILNode::UnboxAny {
-                object: node_idx, ..
-            } => vec![*node_idx],
-            CILNode::BinOp(lhs, rhs, _) => vec![*lhs, *rhs],
-            CILNode::LdElem { array, index, .. } => vec![*array, *index],
             CILNode::Call(info) => {
-                let (_, args, _is_pure) = info.as_ref();
-                args.to_vec()
+                for arg in &info.1 {
+                    visit(arg);
+                }
             }
             CILNode::CallI(info) => {
-                let (fnptr, _, args) = info.as_ref();
-                let mut res = vec![*fnptr];
-                res.extend(args);
-                res
+                visit(&info.0);
+                for arg in &info.2 {
+                    visit(arg);
+                }
             }
         }
+    }
+
+    /// Returns all the nodes this node references.
+    /// ```
+    /// # use cilly::*;
+    /// # let mut asm = Assembly::default();
+    /// let ldarg_0 = asm.alloc_node(CILNode::LdArg(0));
+    /// let ldloc_1 = asm.alloc_node(CILNode::LdLoc(1));
+    /// let binop = CILNode::BinOp(ldarg_0,ldloc_1,BinOp::Add);
+    /// // Two child nodes - ldarg_0 and ldloc_1
+    /// assert_eq!(binop.child_nodes(),vec![ldarg_0,ldloc_1]);
+    /// ```
+    pub fn child_nodes(&self) -> Vec<Interned<CILNode>> {
+        let mut children = Vec::new();
+        self.visit_child_nodes(|child| children.push(*child));
+        children
     }
     /// Turns a native object handle into a special handle of type [`Int::ISize`]
     #[must_use]
@@ -365,6 +370,33 @@ impl CILNode {
         let arg = asm.alloc_node(self.clone());
         let alloc = asm.alloc_node(CILNode::call(alloc, [arg]));
         CILNode::call(op_explict, [alloc])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FnSig, MethodRef, Type, cilnode::MethodKind};
+
+    #[test]
+    fn identity_map_preserves_call_purity() {
+        let mut asm = Assembly::default();
+        let owner = asm.main_module();
+        let name = asm.alloc_string("pure_call");
+        let sig = asm.alloc_sig(FnSig::new([], Type::Void));
+        let method = asm.alloc_methodref(MethodRef::new(
+            owner.0,
+            name,
+            sig,
+            MethodKind::Static,
+            [].into(),
+        ));
+        let call = CILNode::Call(Box::new((method, [].into(), IsPure::PURE)));
+        let mapped = call.map(&mut asm, &mut |node, _| node);
+        let CILNode::Call(mapped) = mapped else {
+            panic!("identity map changed the call variant");
+        };
+        assert_eq!(mapped.2, IsPure::PURE);
     }
 }
 impl CILNode {
@@ -398,7 +430,7 @@ impl CILNode {
                 map(node, asm)
             }
             CILNode::Call(call_info) => {
-                let (method_id, args, _is_pure) = *call_info;
+                let (method_id, args, is_pure) = *call_info;
                 let args = args
                     .iter()
                     .map(|arg| {
@@ -407,7 +439,7 @@ impl CILNode {
                     })
                     .collect::<Box<_>>();
 
-                let node = CILNode::call(method_id, args);
+                let node = CILNode::Call(Box::new((method_id, args, is_pure)));
                 map(node, asm)
             }
             CILNode::IntCast {

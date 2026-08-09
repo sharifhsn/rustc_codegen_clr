@@ -20,7 +20,6 @@ use crate::{Assembly, MethodDef};
 pub use opt_fuel::OptFuel;
 pub use side_effect::*;
 mod hoist;
-mod inline;
 mod opt_fuel;
 mod opt_node;
 mod root;
@@ -389,7 +388,7 @@ impl BasicBlock {
         &mut self,
         asm: &mut Assembly,
         locals: &[LocalDef],
-        cache: &mut SideEffectInfoCache,
+        cache: &mut EffectInfoCache,
         fuel: &mut OptFuel,
         sig: Interned<FnSig>,
     ) {
@@ -442,7 +441,7 @@ fn propagate_roots(
     asm: &mut Assembly,
     root: &mut Interned<CILRoot>,
     prev_root: CILRoot,
-    cache: &mut SideEffectInfoCache,
+    cache: &mut EffectInfoCache,
     locals: &[LocalDef],
     sig: Interned<FnSig>,
     fuel: &mut OptFuel,
@@ -450,7 +449,7 @@ fn propagate_roots(
     match prev_root {
         CILRoot::StLoc(loc, tree) => {
             // 1 st. check if the previous node is a candiate for propagation.
-            if cache.has_side_effects(tree, asm) {
+            if !cache.summary(tree, asm).is_pure_total() {
                 return true;
             }
             // Check that the tree is not too big
@@ -484,7 +483,7 @@ fn propagate_roots(
         CILRoot::SetField(info) => {
             let (field, addr, tree) = info.as_ref();
             // 1 st. check if the previous node is a candiate for propagation.
-            if cache.has_side_effects(*tree, asm) {
+            if !cache.summary(*tree, asm).is_pure_total() {
                 return true;
             }
             // Check that the tree is not too big
@@ -548,7 +547,7 @@ fn propagate_roots(
         }
         CILRoot::StArg(arg, tree) => {
             // 1 st. check if the previous node is a candiate for propagation.
-            if cache.has_side_effects(tree, asm) {
+            if !cache.summary(tree, asm).is_pure_total() {
                 return true;
             }
             // Check that the tree is not too big
@@ -583,7 +582,7 @@ fn propagate_roots(
 fn propagate_root(
     asm: &mut Assembly,
     root: &mut Interned<CILRoot>,
-    cache: &mut SideEffectInfoCache,
+    cache: &mut EffectInfoCache,
     idx: LocalPropagate,
     tpe: Type,
     tree: Interned<CILNode>,
@@ -595,7 +594,10 @@ fn propagate_root(
         let new_node: CILNode = asm.get_node(*node).clone();
 
         let new_node = new_node.map(asm, &mut |node: CILNode, asm| {
-            if cache.has_side_effects(asm.alloc_node(node.clone()), asm) {
+            if !cache
+                .summary(asm.alloc_node(node.clone()), asm)
+                .is_pure_total()
+            {
                 cant_prop = true;
             }
 
@@ -621,7 +623,7 @@ impl MethodImpl {
     pub fn propagate_locals(
         &mut self,
         asm: &mut Assembly,
-        cache: &mut SideEffectInfoCache,
+        cache: &mut EffectInfoCache,
         fuel: &mut OptFuel,
         sig: Interned<FnSig>,
     ) {
@@ -644,7 +646,7 @@ impl MethodImpl {
     pub fn remove_dead_writes(
         &mut self,
         asm: &mut Assembly,
-        cache: &mut SideEffectInfoCache,
+        cache: &mut EffectInfoCache,
         fuel: &mut OptFuel,
     ) {
         // Optimization only suported for methods with locals
@@ -696,7 +698,7 @@ impl MethodImpl {
                     // If the local is never read nor address of, replace it with a pop or a nop.
                     if !local_reads[*local as usize] && (local_address_of[*local as usize] <= 0) {
                         // Tree has side effects, so it has to be evalueted, so we replace it with a pop
-                        if cache.has_side_effects(*tree, asm) {
+                        if !cache.summary(*tree, asm).is_pure_total() {
                             *root = asm.alloc_root(CILRoot::Pop(*tree));
                         } else {
                             *root = asm.alloc_root(CILRoot::Nop);
@@ -715,7 +717,7 @@ impl MethodImpl {
                     if let CILNode::LdLocA(loc) = asm[info.1] {
                         if !local_reads[loc as usize] && (local_address_of[loc as usize] <= 0) {
                             // Tree has side effects, so it has to be evalueted, so we replace it with a pop
-                            if cache.has_side_effects(info.2, asm) {
+                            if !cache.summary(info.2, asm).is_pure_total() {
                                 *root = asm.alloc_root(CILRoot::Pop(info.2));
                             } else {
                                 *root = asm.alloc_root(CILRoot::Nop);
@@ -792,7 +794,7 @@ impl MethodDef {
     pub fn optimize(
         &mut self,
         asm: &mut Assembly,
-        cache: &mut SideEffectInfoCache,
+        cache: &mut EffectInfoCache,
         fuel: &mut OptFuel,
     ) {
         let sig = self.sig();
@@ -855,7 +857,7 @@ impl MethodDef {
         &mut self,
         asm: &mut Assembly,
         fuel: &mut OptFuel,
-        cache: &mut SideEffectInfoCache,
+        cache: &mut EffectInfoCache,
     ) {
         if let MethodImpl::MethodBody { blocks, .. } = self.implementation_mut() {
             for block in blocks.iter_mut() {
@@ -871,15 +873,13 @@ impl MethodDef {
                                 if let Some(cond) = &info.2 {
                                     cond.nodes()
                                         .iter()
-                                        .all(|node| !cache.has_side_effects(*node, asm))
+                                        .all(|node| cache.summary(*node, asm).is_pure_total())
                                 } else {
                                     true
                                 }
                             }
-                            CILRoot::StLoc(_, tree) => !cache.has_side_effects(*tree, asm),
-                            CILRoot::ReThrow | CILRoot::Nop | CILRoot::SetStaticField { .. } => {
-                                true
-                            }
+                            CILRoot::StLoc(_, tree) => cache.summary(*tree, asm).is_pure_total(),
+                            CILRoot::ReThrow | CILRoot::Nop => true,
                             _ => false,
                         })
                 }) && fuel.consume(6)
@@ -950,7 +950,7 @@ impl MethodDef {
     fn opt_roots(
         &mut self,
         fuel: &mut OptFuel,
-        cache: &mut SideEffectInfoCache,
+        cache: &mut EffectInfoCache,
         asm: &mut Assembly,
         sig: Interned<FnSig>,
     ) {
@@ -961,7 +961,7 @@ impl MethodDef {
         // TODO: this is a hack, which makes root inlining optimizations not consume fuel.
         let fuel = std::sync::Mutex::new(&mut *fuel);
         let locals = self.locals().map(|locs| locs.to_vec()).unwrap();
-        let mut cache2 = SideEffectInfoCache::default();
+        let mut cache2 = EffectInfoCache::default();
         self.map_roots(
             asm,
             &mut |root, asm| {
@@ -1027,7 +1027,7 @@ fn local_prop() {
     let sum = asm.biop(loc0.clone(), loc0, BinOp::Add);
     let ret = asm.alloc_root(CILRoot::Ret(sum));
     let mut block = BasicBlock::new(vec![stloc_0, ret], 0, None);
-    let mut cache = SideEffectInfoCache::default();
+    let mut cache = EffectInfoCache::default();
     let mut fuel = OptFuel::new(1000);
     let isize_tpe = asm.alloc_type(Type::Int(Int::ISize));
     let sig = asm.sig([], Type::Void);
