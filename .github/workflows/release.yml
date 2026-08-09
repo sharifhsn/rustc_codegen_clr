@@ -57,6 +57,7 @@ jobs:
         run: |
           bash feasibility/pinvoke_acceptance.sh
           bash feasibility/pinvoke_async_callback_acceptance.sh
+          bash feasibility/pinvoke_safe_rust_acceptance.sh
       - name: Stage, build, and install-test SDK bundle
         shell: bash
         env:

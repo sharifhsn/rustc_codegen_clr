@@ -62,6 +62,7 @@ cp feasibility/cargo-dotnet "$home/cargo-dotnet"
 cp -R dotnet_pal dotnet_overlays msbuild "$home/"
 cp -R mycorrhiza dotnet_macros "$home/crates/"
 cp -R crates/rust-dotnet-pinvoke "$home/crates/"
+cp -R crates/rust-dotnet-native-contract-macros "$home/crates/"
 cp -R mycorrhiza_interop_helpers "$home/"
 rm -rf "$home/mycorrhiza_interop_helpers/bin" "$home/mycorrhiza_interop_helpers/obj"
 printf 'schema = 1\ngit_rev = %s\nrelease_tag = rust-dotnet-v%s\nhost_rid = %s\ntoolchain = nightly-2026-06-17\n' \

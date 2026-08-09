@@ -144,6 +144,10 @@ fn provision_sdk_crates(from_repo: &Path, home_override: &Option<PathBuf>) -> Re
         ("mycorrhiza", "mycorrhiza"),
         ("dotnet_macros", "dotnet_macros"),
         ("crates/rust-dotnet-pinvoke", "rust-dotnet-pinvoke"),
+        (
+            "crates/rust-dotnet-native-contract-macros",
+            "rust-dotnet-native-contract-macros",
+        ),
     ] {
         let src = from_repo.join(relative);
         if !src.is_dir() {
@@ -417,6 +421,7 @@ mod tests {
             "mycorrhiza",
             "dotnet_macros",
             "crates/rust-dotnet-pinvoke",
+            "crates/rust-dotnet-native-contract-macros",
             "mycorrhiza_interop_helpers",
         ] {
             let directory = repo.join(relative);
@@ -428,6 +433,10 @@ mod tests {
         assert!(home.join("crates/mycorrhiza/sentinel").is_file());
         assert!(home.join("crates/dotnet_macros/sentinel").is_file());
         assert!(home.join("crates/rust-dotnet-pinvoke/sentinel").is_file());
+        assert!(
+            home.join("crates/rust-dotnet-native-contract-macros/sentinel")
+                .is_file()
+        );
         assert!(home.join("mycorrhiza_interop_helpers/sentinel").is_file());
 
         let _ = std::fs::remove_dir_all(repo);

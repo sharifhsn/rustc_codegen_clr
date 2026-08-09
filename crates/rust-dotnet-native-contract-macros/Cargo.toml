@@ -1,0 +1,16 @@
+[package]
+name = "rust-dotnet-native-contract-macros"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Generated safe Rust facades for small C ABI native contracts"
+repository = "https://github.com/FractalFir/rustc_codegen_clr"
+documentation = "https://docs.rs/rust-dotnet-native-contract-macros"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

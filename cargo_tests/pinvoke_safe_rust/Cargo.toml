@@ -1,0 +1,12 @@
+[package]
+name = "pinvoke_safe_rust"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+pinvoke-safe-rust-facade = { path = "facade" }
+
+[workspace]
+members = ["facade", "managed-lib"]
+default-members = ["."]

@@ -1,0 +1,14 @@
+[package]
+name = "pinvoke-safe-rust-native"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "safe_rust_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+rust-dotnet-pinvoke = { path = "../../../crates/rust-dotnet-pinvoke" }
+
+[workspace]

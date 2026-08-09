@@ -207,6 +207,8 @@ fn sdk_codegen_content_key(root: &Path) -> Option<String> {
         root.join("mycorrhiza"),
         root.join("rust-dotnet-pinvoke"),
         root.join("crates/rust-dotnet-pinvoke"),
+        root.join("rust-dotnet-native-contract-macros"),
+        root.join("crates/rust-dotnet-native-contract-macros"),
     ];
     let mut files = Vec::new();
     for candidate in candidates.iter().filter(|path| path.is_dir()) {

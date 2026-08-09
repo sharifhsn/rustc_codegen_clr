@@ -50,6 +50,8 @@ cp -R "$repo/msbuild" "$source_home/msbuild"
 cp -R "$repo/mycorrhiza" "$source_home/crates/mycorrhiza"
 cp -R "$repo/dotnet_macros" "$source_home/crates/dotnet_macros"
 cp -R "$repo/crates/rust-dotnet-pinvoke" "$source_home/crates/rust-dotnet-pinvoke"
+cp -R "$repo/crates/rust-dotnet-native-contract-macros" \
+    "$source_home/crates/rust-dotnet-native-contract-macros"
 cp -R "$repo/mycorrhiza_interop_helpers" "$source_home/mycorrhiza_interop_helpers"
 
 toolchain="$(awk -F '"' '/channel/ { print $2; exit }' "$repo/rust-toolchain.toml")"

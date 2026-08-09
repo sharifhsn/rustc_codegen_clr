@@ -1,8 +1,13 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-//! Explicit helpers for building safe wrappers around raw P/Invoke declarations.
+// `native_api!` is an explicit facade DSL whose `unsafe_call` clause is intentionally evaluated
+// inside generated unsafe code after its declared marshalling policies prepare the arguments.
+#![allow(clippy::macro_metavars_in_unsafe)]
+//! Safe helpers and generated contracts for P/Invoke.
 //!
-//! This crate does not declare imports or infer ownership. Its types make common validation and
-//! cleanup steps reusable while leaving the native call itself visibly `unsafe`.
+//! The manual helpers make validation and cleanup reusable while leaving each native call visibly
+//! `unsafe`. When both sides are Rust, [`native_export`] and [`native_import`] generate matching
+//! private ABI shims from safe scalar, string, and buffer contracts. Generated glue copies owned
+//! results and frees them in the native library; it never infers ownership from a C header.
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -11,6 +16,7 @@ mod status;
 pub use status::{NativeStatusError, status_nonnegative, status_zero};
 mod handles;
 pub use handles::OwnedHandle;
+pub use rust_dotnet_native_contract_macros::{native_export, native_import};
 
 /// Validation failure while borrowing a native string buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1022,6 +1028,34 @@ impl<Args, Return> Callback<Args, Return> {
 /// be any path or closure returning `Result<_, NativeStatusError>`. Handle projection rejects a
 /// null pointer even when the native status reports success.
 ///
+/// Borrowed buffers use an explicit pointer-and-length policy while remaining ordinary Rust
+/// slices at the call site:
+///
+/// ```ignore
+/// native_api! {
+///     fn square_into(input: &[i32], output: &mut [i32]) -> usize {
+///         slice input => input_ptr, input_len;
+///         mut_slice output => output_ptr, output_len;
+///         out written: usize => written_ptr;
+///         unsafe_call = raw::square_into(
+///             input_ptr, input_len, output_ptr, output_len, written_ptr,
+///         );
+///         status = status_zero;
+///         success = value written;
+///     }
+/// }
+/// ```
+///
+/// `slice` requires an `&[T]` argument and `mut_slice` requires an `&mut [T]` argument. Both
+/// policies pass the slice's pointer and length to the native call. Empty slices deliberately use
+/// Rust's valid non-null dangling slice pointer with a zero length; the native ABI must not
+/// dereference a buffer when its declared length is zero. APIs whose null-versus-empty distinction
+/// is semantically meaningful need a raw binding or a separate explicit policy.
+///
+/// List all `slice` policies before all `mut_slice` policies, followed by any `out` policies.
+/// This fixed order keeps the declaration readable and makes the mutable native borrow evident at
+/// the boundary.
+///
 /// Missing policies fail at the declaration rather than producing an incomplete wrapper:
 ///
 /// ```compile_fail
@@ -1034,9 +1068,54 @@ impl<Args, Return> Callback<Args, Return> {
 ///     }
 /// }
 /// ```
+///
+/// Slice declarations also require the usual call, status, and success policies:
+///
+/// ```compile_fail
+/// use rust_dotnet_pinvoke::native_api;
+///
+/// native_api! {
+///     fn incomplete(values: &[u32]) -> u32 {
+///         slice values => values_ptr, values_len;
+///         out result: u32 => result_ptr;
+///         success = value result;
+///     }
+/// }
+/// ```
+///
+/// The declaration itself verifies that the named argument is a slice, rather than accepting an
+/// accidentally owned collection:
+///
+/// ```compile_fail
+/// use rust_dotnet_pinvoke::{native_api, status_zero};
+///
+/// unsafe extern "C" fn raw(_: *const u32, _: usize, _: *mut u32) -> i32 { 0 }
+///
+/// native_api! {
+///     fn wrong(values: Vec<u32>) -> u32 {
+///         slice values => values_ptr, values_len;
+///         out result: u32 => result_ptr;
+///         unsafe_call = raw(values_ptr, values_len, result_ptr);
+///         status = status_zero;
+///         success = value result;
+///     }
+/// }
+/// ```
 #[macro_export]
 macro_rules! native_api {
     () => {};
+
+    (@slice_success unit) => {
+        ::core::result::Result::Ok(())
+    };
+
+    (@slice_success value $value:ident) => {
+        ::core::result::Result::Ok($value)
+    };
+
+    (@slice_success tuple($($value:ident),+ $(,)?)) => {
+        ::core::result::Result::Ok(($($value),+,))
+    };
 
     (
         $(#[$metadata:meta])*
@@ -1233,6 +1312,53 @@ macro_rules! native_api {
             }
         }
 
+        $crate::native_api! { $($rest)* }
+    };
+
+    (
+        $(#[$metadata:meta])*
+        $visibility:vis fn $name:ident($($argument:ident : $argument_type:ty),* $(,)?)
+            -> $success_type:ty
+        {
+            $(slice $slice_argument:ident => $slice_pointer:ident, $slice_len:ident;)*
+            $(mut_slice $mut_slice_argument:ident => $mut_slice_pointer:ident, $mut_slice_len:ident;)*
+            $(out $out_value:ident : $out_type:ty => $out_pointer:ident;)*
+            unsafe_call = $call:expr;
+            status = $status:expr;
+            success = $success_kind:ident
+                $($success_value:ident)?
+                $(($($tuple_value:ident),+ $(,)?))?;
+        }
+        $($rest:tt)*
+    ) => {
+        $(#[$metadata])*
+        $visibility fn $name(
+            $($argument: $argument_type),*
+        ) -> ::core::result::Result<$success_type, $crate::NativeCallError> {
+            $(
+                let $slice_argument: &[_] = $slice_argument;
+                let $slice_pointer = $slice_argument.as_ptr();
+                let $slice_len = $slice_argument.len();
+            )*
+            $(
+                let $mut_slice_argument: &mut [_] = $mut_slice_argument;
+                let $mut_slice_pointer = $mut_slice_argument.as_mut_ptr();
+                let $mut_slice_len = $mut_slice_argument.len();
+            )*
+            $(
+                let mut $out_value = $crate::Out::<$out_type>::new();
+                let $out_pointer = $out_value.as_mut_ptr();
+            )*
+            let native_status = unsafe { $call };
+            let _ = ($status)(native_status).map_err($crate::NativeCallError::from)?;
+            $(let $out_value = unsafe { $out_value.assume_init() };)*
+            $crate::native_api!(
+                @slice_success
+                $success_kind
+                $($success_value)?
+                $(($($tuple_value),+))?
+            )
+        }
         $crate::native_api! { $($rest)* }
     };
 
@@ -1666,10 +1792,16 @@ mod tests {
     use std::sync::Arc;
 
     static TYPED_CLOSES: AtomicUsize = AtomicUsize::new(0);
+    static FACADE_CLOSES: AtomicUsize = AtomicUsize::new(0);
     static STRING_FREES: AtomicUsize = AtomicUsize::new(0);
 
     unsafe extern "C" fn close_typed_handle(_: *mut u8) -> i32 {
         TYPED_CLOSES.fetch_add(1, Ordering::Relaxed);
+        0
+    }
+
+    unsafe extern "C" fn close_facade_handle(_: *mut u8) -> i32 {
+        FACADE_CLOSES.fetch_add(1, Ordering::Relaxed);
         0
     }
 
@@ -1759,6 +1891,40 @@ mod tests {
         17
     }
 
+    unsafe extern "C" fn square_facade_slice(
+        input: *const i32,
+        input_len: usize,
+        output: *mut i32,
+        output_len: usize,
+        total: *mut i64,
+    ) -> i32 {
+        if input_len != output_len {
+            return 31;
+        }
+
+        // A slice pointer is valid even when empty. Its length, rather than nullness, controls
+        // whether this native API may dereference it.
+        assert!(!input.is_null());
+        assert!(!output.is_null());
+        let input = unsafe { core::slice::from_raw_parts(input, input_len) };
+        let output = unsafe { core::slice::from_raw_parts_mut(output, output_len) };
+        let mut sum = 0_i64;
+        for (source, destination) in input.iter().zip(output.iter_mut()) {
+            *destination = source * source;
+            sum += i64::from(*destination);
+        }
+        unsafe { total.write(sum) };
+        0
+    }
+
+    unsafe extern "C" fn negate_facade_slice(values: *mut i32, values_len: usize) -> i32 {
+        assert!(!values.is_null());
+        for value in unsafe { core::slice::from_raw_parts_mut(values, values_len) } {
+            *value = value.wrapping_neg();
+        }
+        0
+    }
+
     const fn status_seventeen(code: i32) -> Result<(), NativeStatusError> {
         if code == 17 {
             Ok(())
@@ -1775,7 +1941,7 @@ mod tests {
     native_api! {
         /// Handle and open wrapper generated from explicit facade policies.
         handle FacadeHandle(u8) {
-            close = close_typed_handle;
+            close = close_facade_handle;
         }
 
         fn facade_open(name: &str) -> FacadeHandle {
@@ -1826,6 +1992,28 @@ mod tests {
             unsafe_call = split_facade_value(input, first_pointer, second_pointer);
             status = status_seventeen;
             success = tuple(first, second);
+        }
+
+        fn facade_square_into(input: &[i32], output: &mut [i32]) -> i64 {
+            slice input => input_pointer, input_len;
+            mut_slice output => output_pointer, output_len;
+            out total: i64 => total_pointer;
+            unsafe_call = square_facade_slice(
+                input_pointer,
+                input_len,
+                output_pointer,
+                output_len,
+                total_pointer,
+            );
+            status = status_zero;
+            success = value total;
+        }
+
+        fn facade_negate_in_place(values: &mut [i32]) -> () {
+            mut_slice values => values_pointer, values_len;
+            unsafe_call = negate_facade_slice(values_pointer, values_len);
+            status = status_zero;
+            success = unit;
         }
     }
 
@@ -1916,24 +2104,24 @@ mod tests {
 
     #[test]
     fn declarative_native_api_projects_utf8_handles_outs_and_custom_status() {
-        TYPED_CLOSES.store(0, Ordering::Relaxed);
+        FACADE_CLOSES.store(0, Ordering::Relaxed);
         STRING_FREES.store(0, Ordering::Relaxed);
 
         let handle = facade_open("facade").unwrap();
         assert_eq!(handle.as_ptr(), core::ptr::dangling_mut());
         drop(handle);
-        assert_eq!(TYPED_CLOSES.load(Ordering::Relaxed), 1);
+        assert_eq!(FACADE_CLOSES.load(Ordering::Relaxed), 1);
 
         let wide_handle = facade_open_wide("λ").unwrap();
         drop(wide_handle);
-        assert_eq!(TYPED_CLOSES.load(Ordering::Relaxed), 2);
+        assert_eq!(FACADE_CLOSES.load(Ordering::Relaxed), 2);
 
         facade_open("facade").unwrap().close();
-        assert_eq!(TYPED_CLOSES.load(Ordering::Relaxed), 3);
+        assert_eq!(FACADE_CLOSES.load(Ordering::Relaxed), 3);
         let raw = facade_open("facade").unwrap().into_raw();
-        assert_eq!(TYPED_CLOSES.load(Ordering::Relaxed), 3);
+        assert_eq!(FACADE_CLOSES.load(Ordering::Relaxed), 3);
         unsafe { FacadeHandle::from_raw(raw) }.unwrap().close();
-        assert_eq!(TYPED_CLOSES.load(Ordering::Relaxed), 4);
+        assert_eq!(FACADE_CLOSES.load(Ordering::Relaxed), 4);
 
         assert!(matches!(
             facade_open_failure("facade"),
@@ -1962,6 +2150,23 @@ mod tests {
             }) if message == "wide detail"
         ));
         assert_eq!(STRING_FREES.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn declarative_native_api_borrows_immutable_and_mutable_slices() {
+        let input = [2, -3, 4];
+        let mut output = [0; 3];
+        assert_eq!(facade_square_into(&input, &mut output), Ok(29));
+        assert_eq!(output, [4, 9, 16]);
+
+        let mut empty = [];
+        assert_eq!(facade_square_into(&[], &mut empty), Ok(0));
+
+        let mut values = [7, -2, 0];
+        assert_eq!(facade_negate_in_place(&mut values), Ok(()));
+        assert_eq!(values, [-7, 2, 0]);
+
+        assert_eq!(facade_negate_in_place(&mut empty), Ok(()));
     }
 
     #[test]

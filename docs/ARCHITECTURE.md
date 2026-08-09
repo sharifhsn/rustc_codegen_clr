@@ -68,9 +68,12 @@ through the direct PE emitter. Things that live here rather than in the compiler
   artifact metadata; missing-method resolution turns them into `MethodImpl::Extern`, and both PE
   and IL exporters emit the library, entry point, calling convention, and last-error policy.
   `rust-dotnet-bindgen` generates those declarations from C headers, while
-  `rust-dotnet-pinvoke` supplies explicit marshalling, ownership, and callback helpers; neither
-  changes the compiler contract. The older `native_passtrough.rs` GCC/`nm` experiment is separate
-  and not the public path.
+  `rust-dotnet-pinvoke` supplies explicit marshalling, ownership, and callback helpers. When both
+  sides are Rust, its `native_export` and `native_import!` macros generate matching private C ABI
+  shims from safe scalar, borrowed string/slice, and owned string/vector signatures. Generated
+  deallocators keep cross-library memory ownership correct. None of these layers changes the
+  compiler contract. The older `native_passtrough.rs` GCC/`nm` experiment is separate and not the
+  public path.
 
 ## 5. How Rust constructs map to .NET (and the gotchas)
 

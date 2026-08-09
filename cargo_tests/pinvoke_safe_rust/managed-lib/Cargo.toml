@@ -1,0 +1,14 @@
+[package]
+name = "pinvoke-safe-rust-managed"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "pinvoke_safe_managed"
+crate-type = ["cdylib"]
+
+[dependencies]
+dotnet_macros = { path = "../../../dotnet_macros" }
+mycorrhiza = { path = "../../../mycorrhiza" }
+pinvoke-safe-rust-facade = { path = "../facade" }

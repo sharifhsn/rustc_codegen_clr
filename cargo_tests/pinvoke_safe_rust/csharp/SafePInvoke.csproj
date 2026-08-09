@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="pinvoke_safe_managed">
+      <HintPath>../target/x86_64-unknown-dotnet/release/pinvoke_safe_managed.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>

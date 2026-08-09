@@ -1,10 +1,85 @@
 # Call native libraries from Rust
 
-`rustc_codegen_clr` turns ordinary Rust FFI declarations into CLR P/Invoke methods. You do not need
-a C# shim, a custom declaration macro, or a native Rust wrapper library.
+`rustc_codegen_clr` turns ordinary Rust FFI declarations into CLR P/Invoke methods. Third-party C
+libraries do not need a C# shim or custom declaration macro. When you own native Rust code on the
+other side, matching macros can hide the C ABI completely so both application layers use safe Rust.
 
 This page assumes `cargo dotnet` is installed and Rust plus the .NET 10 SDK are available. Run
 `cargo dotnet doctor` first if the basic quickstart does not work.
+
+## Safe Rust on both sides
+
+Add `rust-dotnet-pinvoke = "0.0.1"` to the managed and native crates. The native implementation is
+an ordinary safe function:
+
+```rust
+use rust_dotnet_pinvoke::native_export;
+
+#[native_export]
+pub fn sum_squares(values: &[i32]) -> Result<i64, i32> {
+    Ok(values.iter().map(|&value| i64::from(value) * i64::from(value)).sum())
+}
+
+#[native_export]
+pub fn describe(label: &str, values: &[i32]) -> Result<String, i32> {
+    let total: i64 = values.iter().map(|&value| i64::from(value)).sum();
+    Ok(format!("{label}: count={}, sum={total}", values.len()))
+}
+
+#[native_export]
+pub fn running_totals(values: &[i32]) -> Result<Vec<i64>, i32> {
+    let mut total = 0;
+    values
+        .iter()
+        .map(|&value| {
+            total = total.checked_add(i64::from(value)).ok_or(2)?;
+            Ok(total)
+        })
+        .collect()
+}
+```
+
+The managed-Rust crate declares the same safe contract:
+
+```rust
+use rust_dotnet_pinvoke::native_import;
+
+native_import! {
+    library = "safe_rust_native";
+    pub fn sum_squares(values: &[i32]) -> Result<i64, i32>;
+}
+
+native_import! {
+    library = "safe_rust_native";
+    pub fn describe(label: &str, values: &[i32]) -> Result<String, i32>;
+}
+
+native_import! {
+    library = "safe_rust_native";
+    pub fn running_totals(values: &[i32]) -> Result<Vec<i64>, i32>;
+}
+
+let total = sum_squares(&[2, -3, 6])?;
+assert_eq!(total, 49);
+assert_eq!(describe("report", &[2, -3, 6])?, "report: count=3, sum=5");
+assert_eq!(running_totals(&[2, -3, 6])?, vec![2, -1, 5]);
+```
+
+`native_export` generates the native C ABI export and `native_import!` generates the private
+P/Invoke declaration plus safe caller. Pointer/length expansion, nonempty-null and alignment
+checks, UTF-8 validation, initialized output handling, status conversion, and native panic
+containment stay in generated code. Inputs may be primitive scalars, `&str`, `&[T]`, or
+`&mut [T]`; results may be `Result<primitive | String | Vec<T> | (), i32>` for primitive `T`.
+
+Owned results use a private pointer/length/capacity ABI plus a generated deallocator. The managed
+side copies the value and then asks the native library to free its own allocation, including when a
+later conversion fails. Application code never handles the raw buffer or chooses an allocator.
+More specialized C ownership contracts still use the explicit facade helpers below.
+
+Build the native crate for each RID you ship, then stage each binary with
+`cargo dotnet add-native-file`. The executable repository example is
+`cargo_tests/pinvoke_safe_rust`, driven by
+`feasibility/pinvoke_safe_rust_acceptance.sh` on Linux x64, macOS Apple Silicon, and Windows x64.
 
 ## Complete SQLite example
 

@@ -41,7 +41,8 @@ The repository is one root Cargo workspace. The relevant ownership boundaries ar
 | `rust-dotnet-sdk-core` | Host facts, public managed identity, and supported .NET runtime model. |
 | `rust-dotnet-assets` | NuGet restore graph parsing, RID-native selection, staging, collision checks, and package projection. |
 | `rust-dotnet-bindgen` | C-header parsing through libclang, deterministic Rust generation, and `#[link]` projection. |
-| `rust-dotnet-pinvoke` | Safe-facade building blocks for strings, status/error policy, out values, typed handles, and callbacks. |
+| `rust-dotnet-pinvoke` | Safe facades for strings, slices, status/error policy, out values, typed handles, callbacks, and generated Rust-to-Rust native contracts. |
+| `rust-dotnet-native-contract-macros` | Internal proc-macro implementation re-exported by `rust-dotnet-pinvoke`; generates matching private export/import ABI shims. |
 | `cargo-dotnet` | CLI parsing, project mutation, build/run orchestration, diagnostics, restore, and pack. |
 | `cilly` | Serializable native-import records, link-time resolution, verification, and PE/IL emission. |
 | `rustc_codegen_clr` | Adapter from rustc's native-library and foreign-module queries into `cilly`. |
@@ -98,6 +99,9 @@ The public surface supports:
 Automated above the raw ABI:
 
 - C-header ingestion with regex allowlists, clang include arguments, and a stale-output check;
+- matching `native_export`/`native_import!` shims for safe native-Rust scalars, `&str`, `&[T]`,
+  `&mut [T]`, `String`, and `Vec<T>` contracts, including pointer and UTF-8 validation, owned-result
+  cleanup, out values, status mapping, and panic containment;
 - owned UTF-8 and UTF-16 input strings plus borrowed native-string validation;
 - status-aware out parameters that cannot be read on native failure;
 - typed RAII native handles with explicitly named cleanup functions;
@@ -157,9 +161,16 @@ optional allocation and standard-library layers provide:
   assembly-internal, while `Start`, progress pumping, cancellation, results, stop retry, and
   diagnostics remain public.
 - `native_api!` for explicit borrowed UTF-8/UTF-16 conversion, native-owned strings with matching
-  free functions, one or more initialized-out values, custom status policies, null-checked handle
-  projection, deterministic close functions, scoped panic-contained callback declarations, and
-  retained registration/stop guards with an explicit quiescence assertion.
+  free functions, borrowed immutable/mutable slice pointer-and-length conversion, one or more
+  initialized-out values, custom status policies, null-checked handle projection, deterministic
+  close functions, scoped panic-contained callback declarations, and retained registration/stop
+  guards with an explicit quiescence assertion.
+- `native_export` and `native_import!` for the special case where both sides are Rust. Application
+  code writes and calls safe functions; generated private shims own the raw C ABI. Supported inputs
+  are primitive scalars, `&str`, `&[T]`, and `&mut [T]`. Supported results are
+  `Result<primitive | String | Vec<T> | (), i32>`, where `T` is a primitive ABI scalar. Owned
+  results are copied by the importer and released by a generated deallocator in the native
+  library, so allocators never free one another's memory.
 
 It does not transport compiler metadata, acquire packages, or infer ownership. Generated bindgen
 declarations remain the raw escape hatch; an API-specific facade is the only place that needs to
@@ -188,6 +199,12 @@ exactly-once result/error extraction, retryable stop, `IDisposable`, and zero su
 It also reflects the generated class and rejects any public constructor while requiring exactly one
 assembly-internal factory constructor.
 The same acceptance runs on Linux x64, macOS Apple Silicon, and Windows x64 CI and release hosts.
+
+`feasibility/pinvoke_safe_rust_acceptance.sh` builds a native Rust `cdylib` from safe annotated
+functions, stages it by RID, and runs a managed-Rust executable that calls it with ordinary slices,
+UTF-8 strings, owned strings/vectors, and `Result`. Neither application crate contains an `unsafe`
+block, raw pointer, or manual buffer length. The fixture projects the same facade as natural C#
+`string`, `int[]`, and `long[]` methods.
 
 Automated gates:
 
