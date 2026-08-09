@@ -6,11 +6,10 @@
 //! That is idiomatic — rustup/curl/cargo are external tools, NOT "the bash CORE" — and
 //! is a dev-only `--from-repo` step that does not touch the build/run/pack proof.
 //!
-//! Two parts ARE native: (1) `cargo install --path tools/cargo-dotnet` installs THIS
-//! Rust binary to `~/.cargo/bin` (the real clap front-end, not a bash copy); and (2)
-//! the private-sysroot PAL warm runs the Rust injection engine directly (no `CD_INJECT_ONLY`
-//! bash hook), so the same fail-fast injection the build uses is verified once at setup without
-//! modifying ambient rust-src.
+//! Two parts ARE native: (1) the matching Rust front-end and staged SDK home are activated as one
+//! rollback-capable transaction; and (2) the private-sysroot PAL warm runs the Rust injection
+//! engine directly (no `CD_INJECT_ONLY` bash hook), so the same fail-fast injection the build uses
+//! is verified before either previous installation backup is discarded.
 //!
 //! Ports `feasibility/cargo-dotnet:170-382`, with the front-end install + PAL warm native.
 
@@ -35,6 +34,43 @@ pub fn run(args: &SetupArgs) -> Result<i32> {
         );
     }
 
+    let home = args
+        .home
+        .clone()
+        .unwrap_or(crate::mode::cargo_dotnet_home()?);
+    if home.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    }) {
+        bail!("setup home must be a normalized path: {}", home.display());
+    }
+    let home_parent = home
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(home_parent)?;
+    crate::path_safety::require_owned_or_empty_sdk_home(&home)?;
+    let planned_home = crate::path_safety::planned_absolute(&home)?;
+    let cargo_home = cargo_home()?;
+    let cargo_bin = cargo_home.join("bin");
+    std::fs::create_dir_all(&cargo_bin)?;
+    let current_exe = std::env::current_exe().context("locating the running cargo-dotnet")?;
+    crate::path_safety::reject_ancestor_of(
+        &planned_home,
+        [
+            ("repository", from_repo.clone()),
+            ("working directory", std::env::current_dir()?),
+            ("running cargo-dotnet", current_exe.clone()),
+            ("Cargo home", cargo_home.clone()),
+        ],
+    )?;
+    let staged_home_area = tempfile::Builder::new()
+        .prefix(".cargo-dotnet-setup-stage-")
+        .tempdir_in(home_parent)?;
+    let staged_home = staged_home_area.path().join("home");
+
     // ---- delegate the provisioning to the bash setup (STAGED) ----
     let mut cmd = Command::new(&front_end);
     cmd.arg("setup");
@@ -45,10 +81,9 @@ pub fn run(args: &SetupArgs) -> Result<i32> {
     // content-addressed private sysroot below.
     cmd.env("CARGO_DOTNET_SKIP_FRONTEND_INSTALL", "1");
     cmd.env("CARGO_DOTNET_SKIP_LEGACY_PAL_WARM", "1");
+    cmd.env("CARGO_DOTNET_CLI_VERSION", env!("CARGO_PKG_VERSION"));
     cmd.arg("--from-repo").arg(&from_repo);
-    if let Some(home) = &args.home {
-        cmd.arg("--home").arg(home);
-    }
+    cmd.arg("--home").arg(&staged_home);
     if let Some(tc) = &args.toolchain {
         cmd.arg("--toolchain").arg(tc);
     }
@@ -68,50 +103,44 @@ pub fn run(args: &SetupArgs) -> Result<i32> {
         return Ok(status.code().unwrap_or(1));
     }
 
-    // ---- the native upgrade: install THIS Rust binary to ~/.cargo/bin ----
+    // ---- stage the matching native front-end without touching the active installation ----
     // A checkout bootstrap runs this command through `cargo run --release`. Reuse that just-built
     // executable instead of compiling the same crate a second time with `cargo install`. An older
     // already-installed front-end still rebuilds from `crate_dir`, preserving setup's guarantee
     // that the installed command matches the checkout being provisioned.
     let crate_dir = from_repo.join("tools/cargo-dotnet");
-    if crate_dir.join("Cargo.toml").is_file() {
-        let current_exe = std::env::current_exe().context("locating the running cargo-dotnet")?;
-        if executable_is_from_repo(&current_exe, &from_repo) {
-            let destination = install_running_executable(&current_exe)?;
-            println!(
-                "==> installed the already-built cargo-dotnet -> {}",
-                destination.display()
-            );
-        } else {
-            println!(
-                "==> installing the Rust cargo-dotnet binary (cargo install --path tools/cargo-dotnet)"
-            );
-            if cargo_install(&crate_dir)? {
-                println!("==> installed cargo-dotnet (Rust) -> ~/.cargo/bin/cargo-dotnet");
-            } else {
-                bail!(
-                    "`cargo install --path tools/cargo-dotnet` failed; setup cannot guarantee that \
-                     the installed command matches the provisioned backend"
-                );
-            }
-        }
-    } else {
+    if !crate_dir.join("Cargo.toml").is_file() {
         bail!(
             "tools/cargo-dotnet is missing from {}; setup requires the Rust front-end source",
             from_repo.display()
         );
     }
+    let built_front_end_area;
+    let front_end_source = if executable_is_from_repo(&current_exe, &from_repo) {
+        current_exe
+    } else {
+        println!("==> building the matching Rust cargo-dotnet front-end in an isolated root");
+        built_front_end_area = tempfile::Builder::new()
+            .prefix("cargo-dotnet-setup-build-")
+            .tempdir()?;
+        if !cargo_install(&crate_dir, built_front_end_area.path())? {
+            bail!(
+                "`cargo install --path tools/cargo-dotnet` failed; setup cannot guarantee that \
+                 the installed command matches the provisioned backend"
+            );
+        }
+        built_front_end_area
+            .path()
+            .join("bin")
+            .join(format!("cargo-dotnet{}", std::env::consts::EXE_SUFFIX))
+    };
+    let staged_front_end = stage_running_executable_into(&front_end_source, &cargo_home)?;
 
     // ---- native PAL warm: run the Rust injection engine once, fail-fast ----
     // Replaces the bash `CD_INJECT_ONLY=1` core hook. We build an installed Context
     // against the freshly-populated home and run the same `inject_all` the build uses,
     // so a broken rust-src / drifted anchor surfaces at setup, not on first build.
-    warm_pal(args).context(
-        "PAL warm failed; setup stopped so the first user build cannot inherit a broken sysroot",
-    )?;
-
-    // ---- provision the bundled mycorrhiza_interop_helpers C# project into the Installed
-    // home ----
+    // ---- provision the bundled mycorrhiza_interop_helpers C# project into the staged home ----
     // `interop_helpers::ensure_and_copy` (called on every `cargo dotnet build`/`run`) looks for
     // this project at `Context::paths.interop_helpers_root`, which in Installed mode resolves to
     // `<home>/mycorrhiza_interop_helpers` — but nothing else populates that path, so without this
@@ -120,7 +149,19 @@ pub fn run(args: &SetupArgs) -> Result<i32> {
     // throw `FileNotFoundException` at runtime. Bash setup already populated `home`, so it's safe
     // to write into it now. If this checkout ships the helper, a copy failure is fatal: reporting
     // success would defer the problem to a runtime-only failure for LINQ users.
-    provision_required_assets(&from_repo, &args.home)?;
+    provision_required_assets(&from_repo, &Some(staged_home.clone()))?;
+
+    let destination = staged_front_end.destination.clone();
+    activate_setup(&staged_home, &home, staged_front_end, || {
+        warm_pal(args).context(
+            "PAL warm failed; setup stopped so the first user build cannot inherit a broken sysroot",
+        )
+    })?;
+    println!(
+        "==> activated SDK home {} and cargo-dotnet front-end {}",
+        home.display(),
+        destination.display()
+    );
 
     Ok(0)
 }
@@ -289,47 +330,156 @@ fn cargo_home() -> Result<PathBuf> {
         )
 }
 
-/// Atomically promote the executable `cargo run` just built into Cargo's command directory.
-fn install_running_executable(source: &Path) -> Result<PathBuf> {
-    install_running_executable_into(source, &cargo_home()?)
+struct StagedExecutable {
+    temporary: tempfile::TempPath,
+    destination: PathBuf,
+    expected: Vec<u8>,
 }
 
-fn install_running_executable_into(source: &Path, cargo_home: &Path) -> Result<PathBuf> {
+/// Copy the selected front-end into a uniquely-created file beside its final destination. The
+/// active executable remains untouched until the SDK home is also ready to promote.
+fn stage_running_executable_into(source: &Path, cargo_home: &Path) -> Result<StagedExecutable> {
     let bin_dir = cargo_home.join("bin");
     std::fs::create_dir_all(&bin_dir)
         .with_context(|| format!("creating Cargo binary directory {}", bin_dir.display()))?;
     let destination = bin_dir.join(format!("cargo-dotnet{}", std::env::consts::EXE_SUFFIX));
-    if source == destination {
-        return Ok(destination);
+    if let Ok(metadata) = std::fs::symlink_metadata(&destination)
+        && (!metadata.is_file() || metadata.file_type().is_symlink())
+    {
+        bail!(
+            "refusing to replace non-regular cargo-dotnet front-end: {}",
+            destination.display()
+        );
     }
-    let staging = bin_dir.join(format!(".cargo-dotnet.installing.{}", std::process::id()));
-    std::fs::copy(source, &staging).with_context(|| {
+    let temporary = tempfile::Builder::new()
+        .prefix(".cargo-dotnet-cli-stage-")
+        .tempfile_in(&bin_dir)?
+        .into_temp_path();
+    std::fs::copy(source, &temporary).with_context(|| {
         format!(
             "copying the running cargo-dotnet from {} to {}",
             source.display(),
-            staging.display()
+            temporary.display()
         )
     })?;
-    if destination.exists() {
-        std::fs::remove_file(&destination).with_context(|| {
-            format!(
-                "replacing installed cargo-dotnet at {}",
-                destination.display()
-            )
-        })?;
-    }
-    std::fs::rename(&staging, &destination).with_context(|| {
-        format!(
-            "promoting the running cargo-dotnet into {}",
-            destination.display()
-        )
-    })?;
-    Ok(destination)
+    let expected = std::fs::read(&temporary)?;
+    Ok(StagedExecutable {
+        temporary,
+        destination,
+        expected,
+    })
 }
 
-/// `cargo install --path <crate_dir>` using a host cargo (not the pinned nightly).
+fn activate_setup<F>(
+    staged_home: &Path,
+    home: &Path,
+    front_end: StagedExecutable,
+    validate: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    activate_setup_with_hook(staged_home, home, front_end, || Ok(()), validate)
+}
+
+fn activate_setup_with_hook<F, G>(
+    staged_home: &Path,
+    home: &Path,
+    front_end: StagedExecutable,
+    before_backup: F,
+    validate: G,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+    G: FnOnce() -> Result<()>,
+{
+    crate::path_safety::require_owned_or_empty_sdk_home(home)?;
+    let home_parent = home
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let home_backups = tempfile::Builder::new()
+        .prefix(".cargo-dotnet-home-backup-")
+        .tempdir_in(home_parent)?;
+    let cli_parent = front_end
+        .destination
+        .parent()
+        .context("cargo-dotnet destination has no parent")?;
+    let cli_backups = tempfile::Builder::new()
+        .prefix(".cargo-dotnet-cli-backup-")
+        .tempdir_in(cli_parent)?;
+    let old_home = home_backups.path().join("previous");
+    let failed_home = home_backups.path().join("failed-new");
+    let old_cli = cli_backups.path().join("previous");
+    let failed_cli = cli_backups.path().join("failed-new");
+    before_backup()?;
+    let had_home = home.exists();
+    let had_cli = front_end.destination.exists();
+    let mut home_backed_up = false;
+    let mut cli_backed_up = false;
+    let mut home_promoted = false;
+    let mut cli_promoted = false;
+
+    let transaction = (|| -> Result<()> {
+        if had_cli {
+            std::fs::rename(&front_end.destination, &old_cli)
+                .context("backing up previous cargo-dotnet front-end")?;
+            cli_backed_up = true;
+            let metadata = std::fs::symlink_metadata(&old_cli)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("previous cargo-dotnet front-end is not a regular file");
+            }
+        }
+        if had_home {
+            std::fs::rename(home, &old_home).context("backing up previous SDK home")?;
+            home_backed_up = true;
+            crate::path_safety::require_owned_or_empty_sdk_home(&old_home)?;
+        }
+        std::fs::rename(staged_home, home).context("activating staged SDK home")?;
+        home_promoted = true;
+        std::fs::rename(&front_end.temporary, &front_end.destination)
+            .context("activating staged cargo-dotnet front-end")?;
+        cli_promoted = true;
+        if std::fs::read(&front_end.destination)? != front_end.expected {
+            bail!("activated cargo-dotnet front-end bytes changed during promotion");
+        }
+        validate()?;
+        Ok(())
+    })();
+
+    if let Err(error) = transaction {
+        let mut rollback_errors = Vec::new();
+        if cli_promoted && let Err(rollback) = std::fs::rename(&front_end.destination, &failed_cli)
+        {
+            rollback_errors.push(format!("remove failed front-end: {rollback}"));
+        }
+        if home_promoted && let Err(rollback) = std::fs::rename(home, &failed_home) {
+            rollback_errors.push(format!("remove failed SDK home: {rollback}"));
+        }
+        if home_backed_up && let Err(rollback) = std::fs::rename(&old_home, home) {
+            rollback_errors.push(format!("restore previous SDK home: {rollback}"));
+        }
+        if cli_backed_up && let Err(rollback) = std::fs::rename(&old_cli, &front_end.destination) {
+            rollback_errors.push(format!("restore previous front-end: {rollback}"));
+        }
+        if rollback_errors.is_empty() {
+            return Err(error).context("SDK/front-end setup transaction rolled back");
+        }
+        let home_recovery = home_backups.keep();
+        let cli_recovery = cli_backups.keep();
+        bail!(
+            "setup transaction failed ({error:#}); rollback also failed: {}; recoverable backups: {}, {}",
+            rollback_errors.join("; "),
+            home_recovery.display(),
+            cli_recovery.display()
+        );
+    }
+    Ok(())
+}
+
+/// `cargo install --path <crate_dir>` into an isolated root using a host cargo.
 /// Returns Ok(true) on success.
-fn cargo_install(crate_dir: &Path) -> Result<bool> {
+fn cargo_install(crate_dir: &Path, root: &Path) -> Result<bool> {
     // Use the host's default cargo; the crate's nested [workspace] keeps it off the
     // rustc_private toolchain. Prefer a stable toolchain if rustup is the driver.
     let cargo = crate::host::inner_cargo();
@@ -337,7 +487,10 @@ fn cargo_install(crate_dir: &Path) -> Result<bool> {
         .arg("install")
         .arg("--path")
         .arg(crate_dir)
+        .arg("--root")
+        .arg(root)
         .arg("--force")
+        .arg("--locked")
         .status()
         .with_context(|| format!("failed to launch `{cargo} install`"))?;
     Ok(status.success())
@@ -377,14 +530,21 @@ mod tests {
     }
 
     #[test]
-    fn running_executable_is_promoted_without_recompiling() {
+    fn running_executable_and_sdk_home_are_promoted_together() {
         let root = temp_root("promote-running-exe");
         let source = root.join(format!("cargo-dotnet{}", std::env::consts::EXE_SUFFIX));
         let cargo_home = root.join("cargo-home");
+        let staged_home = root.join("staged-home");
+        let home = root.join("active-home");
         std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&staged_home).unwrap();
         std::fs::write(&source, b"already-built-driver").unwrap();
+        std::fs::write(staged_home.join("marker"), b"new-sdk").unwrap();
 
-        let destination = install_running_executable_into(&source, &cargo_home).unwrap();
+        let staged = stage_running_executable_into(&source, &cargo_home).unwrap();
+        let destination = staged.destination.clone();
+        assert!(!destination.exists());
+        activate_setup(&staged_home, &home, staged, || Ok(())).unwrap();
         assert_eq!(
             destination,
             cargo_home
@@ -392,7 +552,116 @@ mod tests {
                 .join(format!("cargo-dotnet{}", std::env::consts::EXE_SUFFIX))
         );
         assert_eq!(std::fs::read(destination).unwrap(), b"already-built-driver");
+        assert_eq!(std::fs::read(home.join("marker")).unwrap(), b"new-sdk");
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn setup_activation_rolls_back_sdk_home_and_front_end() {
+        let root = temp_root("rollback-setup");
+        let source = root.join(format!("new-cargo-dotnet{}", std::env::consts::EXE_SUFFIX));
+        let cargo_home = root.join("cargo-home");
+        let destination = cargo_home
+            .join("bin")
+            .join(format!("cargo-dotnet{}", std::env::consts::EXE_SUFFIX));
+        let staged_home = root.join("staged-home");
+        let home = root.join("active-home");
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&staged_home).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(&source, b"new-cli").unwrap();
+        std::fs::write(&destination, b"old-cli").unwrap();
+        std::fs::write(staged_home.join("marker"), b"new-sdk").unwrap();
+        std::fs::write(home.join("marker"), b"old-sdk").unwrap();
+        std::fs::write(
+            home.join("VERSION"),
+            "schema = 1\nrelease_tag = untagged\nhost_rid = test\ntoolchain = nightly\n",
+        )
+        .unwrap();
+        let staged = stage_running_executable_into(&source, &cargo_home).unwrap();
+
+        let error = activate_setup(&staged_home, &home, staged, || {
+            bail!("injected validation failure")
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("rolled back"), "{error:#}");
+        assert_eq!(std::fs::read(home.join("marker")).unwrap(), b"old-sdk");
+        assert_eq!(std::fs::read(destination).unwrap(), b"old-cli");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn setup_activation_never_replaces_an_unowned_directory() {
+        let root = temp_root("reject-unowned-setup-home");
+        let source = root.join(format!("new-cargo-dotnet{}", std::env::consts::EXE_SUFFIX));
+        let cargo_home = root.join("cargo-home");
+        let staged_home = root.join("staged-home");
+        let home = root.join("unrelated-home");
+        std::fs::create_dir_all(&staged_home).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(&source, b"new-cli").unwrap();
+        std::fs::write(staged_home.join("marker"), b"new-sdk").unwrap();
+        std::fs::write(home.join("do-not-delete"), b"unrelated").unwrap();
+        let staged = stage_running_executable_into(&source, &cargo_home).unwrap();
+
+        let error = activate_setup(&staged_home, &home, staged, || Ok(())).unwrap_err();
+
+        assert!(error.to_string().contains("ownership marker"), "{error:#}");
+        assert_eq!(
+            std::fs::read(home.join("do-not-delete")).unwrap(),
+            b"unrelated"
+        );
+        assert_eq!(
+            std::fs::read(staged_home.join("marker")).unwrap(),
+            b"new-sdk"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn setup_revalidates_the_exact_home_moved_to_backup() {
+        let root = temp_root("setup-home-swap");
+        let source = root.join(format!("new-cargo-dotnet{}", std::env::consts::EXE_SUFFIX));
+        let cargo_home = root.join("cargo-home");
+        let staged_home = root.join("staged-home");
+        let home = root.join("active-home");
+        std::fs::create_dir_all(&staged_home).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(&source, b"new-cli").unwrap();
+        std::fs::write(staged_home.join("marker"), b"new-sdk").unwrap();
+        std::fs::write(
+            home.join("VERSION"),
+            "schema = 1\nrelease_tag = untagged\nhost_rid = test\ntoolchain = nightly\n",
+        )
+        .unwrap();
+        let staged = stage_running_executable_into(&source, &cargo_home).unwrap();
+        let swapped_home = home.clone();
+
+        let error = activate_setup_with_hook(
+            &staged_home,
+            &home,
+            staged,
+            move || {
+                std::fs::remove_dir_all(&swapped_home)?;
+                std::fs::create_dir(&swapped_home)?;
+                std::fs::write(swapped_home.join("do-not-delete"), b"swapped-unrelated")?;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("rolled back"), "{error:#}");
+        assert_eq!(
+            std::fs::read(home.join("do-not-delete")).unwrap(),
+            b"swapped-unrelated"
+        );
+        assert_eq!(
+            std::fs::read(staged_home.join("marker")).unwrap(),
+            b"new-sdk"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

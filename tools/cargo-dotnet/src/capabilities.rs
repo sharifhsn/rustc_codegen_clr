@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -101,6 +101,25 @@ struct ResultRow {
     result: String,
     marker: String,
     required: String,
+    artifacts: BTreeSet<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactReceipt {
+    schema: u32,
+    case: String,
+    kind: String,
+    dotnet: String,
+    profiles: Vec<String>,
+    artifacts: BTreeMap<String, ArtifactRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactRecord {
+    path: PathBuf,
+    sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -380,6 +399,7 @@ fn parse_result_file(path: &Path) -> Result<Vec<(String, ResultRow)>> {
         .iter()
         .position(|column| *column == "required")
         .context("acceptance results have no required column")?;
+    let receipt_idx = columns.iter().position(|column| *column == "receipt");
     let mut out = Vec::new();
     for (line_no, line) in lines.enumerate() {
         if line.trim().is_empty() {
@@ -407,10 +427,95 @@ fn parse_result_file(path: &Path) -> Result<Vec<(String, ResultRow)>> {
                 result: result.to_string(),
                 marker: fields[marker_idx].to_string(),
                 required: fields[required_idx].to_string(),
+                artifacts: receipt_idx
+                    .filter(|_| result == "PASS")
+                    .map(|index| {
+                        load_artifact_receipt(
+                            path,
+                            fields[index],
+                            fields[case_idx],
+                            fields[kind_idx],
+                            fields[dotnet_idx],
+                            fields[profile_idx],
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or_default(),
             },
         ));
     }
     Ok(out)
+}
+
+fn load_artifact_receipt(
+    result_path: &Path,
+    receipt_field: &str,
+    case: &str,
+    kind: &str,
+    dotnet: &str,
+    profile: &str,
+) -> Result<BTreeSet<String>> {
+    if receipt_field.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let receipt_path = Path::new(receipt_field);
+    let receipt_path = if receipt_path.is_absolute() {
+        receipt_path.to_path_buf()
+    } else {
+        result_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(receipt_path)
+    };
+    let receipt: ArtifactReceipt = serde_json::from_slice(
+        &fs::read(&receipt_path)
+            .with_context(|| format!("reading artifact receipt {}", receipt_path.display()))?,
+    )
+    .with_context(|| format!("parsing artifact receipt {}", receipt_path.display()))?;
+    if receipt.schema != 1
+        || receipt.case != case
+        || receipt.kind != kind
+        || receipt.dotnet != dotnet
+        || !receipt.profiles.iter().any(|value| value == profile)
+    {
+        bail!(
+            "artifact receipt {} does not match {case:?}/{kind:?}/net{dotnet}/{profile}",
+            receipt_path.display()
+        );
+    }
+    for (name, artifact) in &receipt.artifacts {
+        if name.is_empty()
+            || artifact.sha256.len() != 64
+            || !artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!(
+                "artifact receipt {} has invalid entry {name:?}",
+                receipt_path.display()
+            );
+        }
+        let artifact_path = if artifact.path.is_absolute() {
+            artifact.path.clone()
+        } else {
+            receipt_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&artifact.path)
+        };
+        let bytes = fs::read(&artifact_path).with_context(|| {
+            format!(
+                "reading artifact {name:?} from receipt {} at {}",
+                receipt_path.display(),
+                artifact_path.display()
+            )
+        })?;
+        if crate::provenance::hash_bytes(&bytes) != artifact.sha256 {
+            bail!(
+                "artifact {name:?} failed receipt verification: {}",
+                artifact_path.display()
+            );
+        }
+    }
+    Ok(receipt.artifacts.into_keys().collect())
 }
 
 fn validate_result_dimensions(
@@ -486,6 +591,23 @@ fn validate_result_dimensions(
                     "passing acceptance result for case {case:?}, kind {:?} did not prove its required completion marker",
                     row.kind
                 );
+            }
+            if row.result == "PASS" {
+                for journey in &matching {
+                    let missing = journey
+                        .required_artifacts
+                        .iter()
+                        .filter(|artifact| !row.artifacts.contains(artifact.as_str()))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !missing.is_empty() {
+                        bail!(
+                            "passing acceptance result for case {case:?}, kind {:?} is missing required artifact receipts: {}",
+                            row.kind,
+                            missing.join(", ")
+                        );
+                    }
+                }
             }
         }
     }
@@ -710,6 +832,7 @@ mod tests {
             result: result.into(),
             marker: "yes".into(),
             required: "yes".into(),
+            artifacts: BTreeSet::new(),
         }
     }
 
@@ -773,6 +896,63 @@ mod tests {
             &rows,
             CapabilitiesEvidenceScope::Presubmit
         ));
+    }
+
+    #[test]
+    fn passing_rows_must_cover_required_artifacts() {
+        let mut journey_cfg = journey();
+        journey_cfg.required_artifacts = vec!["rust_dll".into()];
+        let manifest = Manifest {
+            schema: 1,
+            support: support(),
+            blocker: Vec::new(),
+            journey: vec![journey_cfg],
+        };
+        let mut observed = BTreeMap::from([("case".into(), vec![row("10", "debug", "PASS")])]);
+        assert!(validate_result_dimensions(&manifest, &observed).is_err());
+        observed.get_mut("case").unwrap()[0]
+            .artifacts
+            .insert("rust_dll".into());
+        validate_result_dimensions(&manifest, &observed).unwrap();
+    }
+
+    #[test]
+    fn artifact_receipt_hash_is_verified() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("library.dll");
+        fs::write(&artifact, b"managed assembly").unwrap();
+        let receipt = temp.path().join("receipt.json");
+        fs::write(
+            &receipt,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1,
+                "case": "case",
+                "kind": "managed_selfcheck",
+                "dotnet": "10",
+                "profiles": ["debug"],
+                "artifacts": {
+                    "rust_dll": {
+                        "path": artifact,
+                        "sha256": crate::provenance::hash_bytes(b"managed assembly")
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let results = temp.path().join("results.tsv");
+        fs::write(
+            &results,
+            format!(
+                "kind|dotnet|profile|case|marker|required|result|receipt\nmanaged_selfcheck|10|debug|case|yes|yes|PASS|{}\n",
+                receipt.display()
+            ),
+        )
+        .unwrap();
+        let rows = parse_result_file(&results).unwrap();
+        assert!(rows[0].1.artifacts.contains("rust_dll"));
+        fs::write(&artifact, b"tampered").unwrap();
+        assert!(parse_result_file(&results).is_err());
     }
 
     #[test]
@@ -887,6 +1067,15 @@ mod tests {
                         profile.clone(),
                     );
                     if unique.insert(key) {
+                        let artifacts = manifest
+                            .journey
+                            .iter()
+                            .filter(|candidate| {
+                                candidate.case == journey.case
+                                    && candidate.evidence_kind == journey.evidence_kind
+                            })
+                            .flat_map(|candidate| candidate.required_artifacts.iter().cloned())
+                            .collect();
                         observed
                             .entry(journey.case.clone())
                             .or_default()
@@ -897,6 +1086,7 @@ mod tests {
                                 result: "PASS".into(),
                                 marker: "yes".into(),
                                 required: "yes".into(),
+                                artifacts,
                             });
                     }
                 }

@@ -2,9 +2,10 @@ pub mod host {
     use std::env;
     use std::path::PathBuf;
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
     pub struct HostFacts {
         pub os: &'static str,
+        pub arch: &'static str,
         pub dylib_ext: &'static str,
         pub exe_ext: &'static str,
         pub host_rid: &'static str,
@@ -12,6 +13,28 @@ pub mod host {
 
     impl HostFacts {
         pub fn for_test(os: &'static str) -> Self {
+            let arch = if os == "macos" { "aarch64" } else { "x86_64" };
+            Self::for_target(os, arch).unwrap_or_else(|| Self::unsupported(os, arch))
+        }
+
+        /// Return facts only for the exact host triples carried by the public SDK.
+        pub fn for_target(os: &'static str, arch: &'static str) -> Option<Self> {
+            let (dylib_ext, exe_ext, host_rid) = match (os, arch) {
+                ("linux", "x86_64") => ("so", "", "linux-x64"),
+                ("macos", "aarch64") => ("dylib", "", "osx-arm64"),
+                ("windows", "x86_64") => ("dll", ".exe", "win-x64"),
+                _ => return None,
+            };
+            Some(Self {
+                os,
+                arch,
+                dylib_ext,
+                exe_ext,
+                host_rid,
+            })
+        }
+
+        fn unsupported(os: &'static str, arch: &'static str) -> Self {
             let (dylib_ext, exe_ext) = match os {
                 "macos" => ("dylib", ""),
                 "windows" => ("dll", ".exe"),
@@ -19,36 +42,55 @@ pub mod host {
             };
             Self {
                 os,
+                arch,
                 dylib_ext,
                 exe_ext,
-                host_rid: "test-x64",
+                host_rid: "unsupported",
             }
         }
+
+        pub fn is_supported(self) -> bool {
+            Self::for_target(self.os, self.arch).is_some()
+        }
+
         pub fn detect() -> Self {
-            let (dylib_ext, exe_ext) = match env::consts::OS {
-                "macos" => ("dylib", ""),
-                "windows" => ("dll", ".exe"),
-                _ => ("so", ""),
-            };
-            let host_rid = match (env::consts::OS, env::consts::ARCH) {
-                ("macos", "aarch64") => "osx-arm64",
-                ("macos", _) => "osx-x64",
-                ("windows", _) => "win-x64",
-                (_, "aarch64") => "linux-arm64",
-                _ => "linux-x64",
-            };
-            Self {
-                os: env::consts::OS,
-                dylib_ext,
-                exe_ext,
-                host_rid,
-            }
+            Self::for_target(env::consts::OS, env::consts::ARCH)
+                .unwrap_or_else(|| Self::unsupported(env::consts::OS, env::consts::ARCH))
         }
         pub fn backend_dylib_name(&self) -> String {
             if self.os == "windows" {
                 format!("rustc_codegen_clr.{}", self.dylib_ext)
             } else {
                 format!("librustc_codegen_clr.{}", self.dylib_ext)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::HostFacts;
+
+        #[test]
+        fn accepts_only_public_release_hosts() {
+            assert_eq!(
+                HostFacts::for_target("linux", "x86_64").unwrap().host_rid,
+                "linux-x64"
+            );
+            assert_eq!(
+                HostFacts::for_target("macos", "aarch64").unwrap().host_rid,
+                "osx-arm64"
+            );
+            assert_eq!(
+                HostFacts::for_target("windows", "x86_64").unwrap().host_rid,
+                "win-x64"
+            );
+            for (os, arch) in [
+                ("linux", "aarch64"),
+                ("macos", "x86_64"),
+                ("windows", "aarch64"),
+                ("freebsd", "x86_64"),
+            ] {
+                assert!(HostFacts::for_target(os, arch).is_none(), "{os}-{arch}");
             }
         }
     }
@@ -167,7 +209,7 @@ pub mod runtime {
                 "10" | "net10" | "net10.0" => Ok(Self::Net10),
                 "unity" | "unity-netstandard2.1" | "netstandard2.1" => Ok(Self::UnityNetStandard21),
                 other => Err(format!(
-                    "--dotnet: unsupported value {other:?}; rust-dotnet 0.0.1 supports .NET 10 or Unity netstandard2.1"
+                    "--dotnet: unsupported value {other:?}; rust-dotnet 0.0.2 supports .NET 10 or Unity netstandard2.1"
                 )),
             }
         }

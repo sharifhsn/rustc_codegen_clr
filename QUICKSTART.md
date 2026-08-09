@@ -1,6 +1,6 @@
 # Quickstart: run Rust on .NET
 
-`rustc_codegen_clr` is experimental compiler infrastructure. The 0.0.1 preview intentionally has
+`rustc_codegen_clr` is experimental compiler infrastructure. The 0.0.2 preview intentionally has
 one supported runtime profile: .NET 10.
 
 ## Prerequisites
@@ -14,13 +14,13 @@ one supported runtime profile: .NET 10.
 Linux or macOS:
 
 ```bash
-curl -fsSL https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.1/install.sh | sh
+curl -fsSL https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.2/install.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.1/install.ps1 | iex
+irm https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.2/install.ps1 | iex
 ```
 
 For an inspectable install, download the script first, read it, and run it locally. The installer

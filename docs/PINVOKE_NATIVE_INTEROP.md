@@ -170,7 +170,9 @@ optional allocation and standard-library layers provide:
   are primitive scalars, `&str`, `&[T]`, and `&mut [T]`. Supported results are
   `Result<primitive | String | Vec<T> | (), i32>`, where `T` is a primitive ABI scalar. Owned
   results are copied by the importer and released by a generated deallocator in the native
-  library, so allocators never free one another's memory.
+  library, so allocators never free one another's memory. A versioned ABI fingerprint is part of
+  every generated symbol, including explicitly named contracts, so signature drift fails symbol
+  resolution rather than silently reusing an incompatible entry point.
 
 It does not transport compiler metadata, acquire packages, or infer ownership. Generated bindgen
 declarations remain the raw escape hatch; an API-specific facade is the only place that needs to

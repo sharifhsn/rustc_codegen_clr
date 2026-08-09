@@ -5,9 +5,9 @@
 *.d
 *.rmeta
 *.lock
+!/Cargo.lock
 test/out
 /target
-/Cargo.lock
 .vscode/
 *.bc
 *log.txt

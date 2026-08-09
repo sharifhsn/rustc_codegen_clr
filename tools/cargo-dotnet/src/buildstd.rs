@@ -39,7 +39,7 @@ pub fn build_with_sysroot(ctx: &Context, sysroot: &PrivateSysroot) -> Result<Str
             eprintln!("==> private sysroot changed; invalidating stale Cargo target fingerprints");
         }
         eprintln!("==> cargo clean (full, bulletproof)");
-        let _ = base_cargo(ctx, sysroot).arg("clean").status();
+        let _ = base_cargo(ctx, sysroot)?.arg("clean").status();
     }
 
     // `cargo fetch` materialises registry sources WITHOUT compiling, so we can patch the
@@ -53,7 +53,7 @@ pub fn build_with_sysroot(ctx: &Context, sysroot: &PrivateSysroot) -> Result<Str
     // finished before printing anything, which made an ordinary build look hung for
     // long stretches. Keep the concise default view, but emit its progress lines as
     // they happen; --verbose still emits every line.
-    let mut build_cmd = base_cargo(ctx, sysroot);
+    let mut build_cmd = base_cargo(ctx, sysroot)?;
     build_cmd.arg("-Zjson-target-spec").arg("build");
     if let Some(flag) = ctx.profile.cargo_flag() {
         build_cmd.arg(flag);
@@ -117,7 +117,7 @@ pub fn build_with_sysroot(ctx: &Context, sysroot: &PrivateSysroot) -> Result<Str
     record_target_sysroot(&target_dir, &sysroot.root)?;
 
     // The JSON pass: same flags + --message-format=json; capture stdout for the locator.
-    let mut json_cmd = base_cargo(ctx, sysroot);
+    let mut json_cmd = base_cargo(ctx, sysroot)?;
     json_cmd.arg("-Zjson-target-spec").arg("build");
     if let Some(flag) = ctx.profile.cargo_flag() {
         json_cmd.arg(flag);
@@ -142,7 +142,7 @@ pub fn build_with_sysroot(ctx: &Context, sysroot: &PrivateSysroot) -> Result<Str
 const TARGET_SYSROOT_MARKER: &str = ".rustdotnet-private-sysroot";
 
 fn cargo_target_dir(ctx: &Context, sysroot: &PrivateSysroot) -> Result<PathBuf> {
-    let output = base_cargo(ctx, sysroot)
+    let output = base_cargo(ctx, sysroot)?
         .arg("-Zjson-target-spec")
         .arg("metadata")
         .arg("--no-deps")
@@ -214,7 +214,7 @@ fn is_interesting(line: &str) -> bool {
 /// Patch the libc REGISTRY copies (post-`cargo fetch`). build-std resolves libc from the
 /// registry, not the rust-src vendor tree, so this covers whichever copy it picks.
 pub(crate) fn fetch_dependencies(ctx: &Context, sysroot: &PrivateSysroot) -> Result<()> {
-    let mut command = base_cargo(ctx, sysroot);
+    let mut command = base_cargo(ctx, sysroot)?;
     command.arg("-Zjson-target-spec").arg("fetch");
     for flag in dependency_fetch_flags(ctx) {
         command.arg(flag);
@@ -278,7 +278,7 @@ pub(crate) fn local_manifest_paths(
     ctx: &Context,
     sysroot: &PrivateSysroot,
 ) -> Result<Vec<PathBuf>> {
-    let mut command = base_cargo(ctx, sysroot);
+    let mut command = base_cargo(ctx, sysroot)?;
     command
         .arg("-Zjson-target-spec")
         .arg("metadata")
@@ -321,7 +321,7 @@ fn patch_registry_libc(ctx: &Context) -> Result<()> {
 /// A cargo Command pre-loaded with the backend RUSTFLAGS + the dotnet env + the
 /// pinned toolchain (installed only) + quiet/deterministic dotnet knobs. Runs in the
 /// crate dir.
-fn base_cargo(ctx: &Context, sysroot: &PrivateSysroot) -> Command {
+fn base_cargo(ctx: &Context, sysroot: &PrivateSysroot) -> Result<Command> {
     let mut cmd = Command::new(&ctx.cargo);
     cmd.current_dir(&ctx.crate_dir);
     cmd.env("CARGO_HOME", &ctx.paths.cargo_home);
@@ -331,23 +331,23 @@ fn base_cargo(ctx: &Context, sysroot: &PrivateSysroot) -> Command {
     cmd.arg("--config")
         .arg(crate::overlays::generated_config_path(ctx));
 
-    // The backend RUSTFLAGS (verbatim incl. the getrandom custom-backend embedded quotes).
-    cmd.env(
-        "RUSTFLAGS",
-        rustflags::assemble(
-            &ctx.paths.backend_dylib,
-            &ctx.paths.linker,
-            &ctx.paths.sdk_crates_root,
-            ctx.dotnet.as_env(),
-            &[
-                (&ctx.paths.sdk_crates_root, "/_/rust-dotnet-sdk"),
-                (&ctx.crate_dir, "/_/consumer"),
-                (&ctx.paths.cargo_home, "/_/cargo-home"),
-                (&sysroot.root, "/_/rust-sysroot"),
-            ],
-            ctx.source_link_url.as_deref(),
-        ),
+    // Use Cargo's unit-separator encoding so spaces and non-ASCII path bytes remain inside their
+    // individual rustc arguments. A whitespace-delimited RUSTFLAGS string cannot represent them.
+    let flags = rustflags::assemble(
+        &ctx.paths.backend_dylib,
+        &ctx.paths.linker,
+        &ctx.paths.sdk_crates_root,
+        ctx.dotnet.as_env(),
+        &[
+            (&ctx.paths.sdk_crates_root, "/_/rust-dotnet-sdk"),
+            (&ctx.crate_dir, "/_/consumer"),
+            (&ctx.paths.cargo_home, "/_/cargo-home"),
+            (&sysroot.root, "/_/rust-sysroot"),
+        ],
+        ctx.source_link_url.as_deref(),
     );
+    cmd.env_remove("RUSTFLAGS");
+    cmd.env("CARGO_ENCODED_RUSTFLAGS", rustflags::encode(&flags));
     match &ctx.source_link_url {
         Some(url) => {
             let json = serde_json::json!({
@@ -394,8 +394,14 @@ fn base_cargo(ctx: &Context, sysroot: &PrivateSysroot) -> Command {
 
     // dotnet self-heal from $HOME/.dotnet.
     if let Some((path_add, dotnet_root)) = &ctx.dotnet_heal {
-        let cur = std::env::var("PATH").unwrap_or_default();
-        cmd.env("PATH", format!("{}:{}", path_add.display(), cur));
+        let mut paths = vec![path_add.clone()];
+        if let Some(current) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&current));
+        }
+        cmd.env(
+            "PATH",
+            std::env::join_paths(paths).context("constructing PATH for the selected dotnet")?,
+        );
         cmd.env("DOTNET_ROOT", dotnet_root);
     }
 
@@ -404,7 +410,7 @@ fn base_cargo(ctx: &Context, sysroot: &PrivateSysroot) -> Command {
     cmd.env("DOTNET_NOLOGO", "1");
     cmd.env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1");
     cmd.env("CARGO_TERM_COLOR", "never");
-    cmd
+    Ok(cmd)
 }
 
 /// Scrub every identity field before applying this build's one explicit identity. Cargo runs

@@ -6,7 +6,7 @@ on:
     tags: ['rust-dotnet-v*']
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -22,7 +22,7 @@ jobs:
           - host: linux-x64
             runner: ubuntu-22.04
           - host: macos-arm64
-            runner: macos-14
+            runner: macos-15
           - host: windows-x64
             runner: windows-2022
     runs-on: ${{ matrix.runner }}
@@ -34,6 +34,10 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
+      - name: Verify annotated signed release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash feasibility/verify_release_tag.sh
       - name: Set up .NET 10
         uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
@@ -44,14 +48,32 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#rust-dotnet-v}"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          manifest_version="$(awk -F '"' '/^version = / { print $2; exit }' tools/cargo-dotnet/Cargo.toml)"
-          [[ "$manifest_version" == "$version" ]]
+          release_manifests=(
+            Cargo.toml
+            tools/cargo-dotnet/Cargo.toml
+            crates/rust-dotnet-assets/Cargo.toml
+            crates/rust-dotnet-bindgen/Cargo.toml
+            crates/rust-dotnet-sdk-core/Cargo.toml
+            crates/rust-dotnet-pinvoke/Cargo.toml
+            crates/rust-dotnet-native-contract-macros/Cargo.toml
+          )
+          for manifest in "${release_manifests[@]}"; do
+            manifest_version="$(awk -F '"' '/^version = / { print $2; exit }' "$manifest")"
+            [[ "$manifest_version" == "$version" ]] || {
+              echo "$manifest version $manifest_version does not match tag $version" >&2
+              exit 1
+            }
+          done
+          grep -Fq "RUST_DOTNET_VERSION:-$version" install.sh
+          grep -Fq "else { \"$version\" }" install.ps1
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
       - name: Build compiler and installer
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release --workspace
-          cargo +stable build --release --manifest-path tools/cargo-dotnet/Cargo.toml
+          cargo build --release --workspace --frozen
+          cargo +stable build --release --frozen --manifest-path tools/cargo-dotnet/Cargo.toml
       - name: Run host-native P/Invoke acceptances
         shell: bash
         run: |
@@ -80,9 +102,17 @@ jobs:
     name: Publish GitHub release
     needs: bundle
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     steps:
       - name: Check out release tag
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Re-verify annotated signed release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash feasibility/verify_release_tag.sh
       - name: Download release assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:

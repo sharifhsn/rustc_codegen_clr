@@ -88,11 +88,7 @@ pub fn prepare(ctx: &Context) -> Result<PrivateSysroot> {
 }
 
 fn store_root() -> Result<PathBuf> {
-    if let Some(home) = std::env::var_os("CARGO_DOTNET_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(home).join("sysroots"));
-    }
-    let home = crate::host::home_dir().context("neither HOME nor USERPROFILE is set")?;
-    Ok(home.join(".cargo-dotnet/sysroots"))
+    Ok(crate::context::cargo_dotnet_cache_home()?.join("sysroots"))
 }
 
 fn snapshot_key(ctx: &Context, ambient: &Path) -> Result<String> {

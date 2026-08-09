@@ -9,29 +9,28 @@ An experimental rustc codegen backend that compiles Rust to managed .NET assembl
 > This is compiler research, not a production toolchain. Crashes, unsupported APIs, and
 > miscompilations are possible. Validate important behavior against native Rust.
 
-## Install the 0.0.1 preview
+## Install the 0.0.2 preview
 
 Prerequisites: [rustup](https://rustup.rs/) and the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
 
 Linux x64 or macOS Apple Silicon:
 
 ```bash
-curl -fsSL https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.1/install.sh | sh
+curl -fsSL https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.2/install.sh | sh
 ```
 
 Windows x64 PowerShell:
 
 ```powershell
-irm https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.1/install.ps1 | iex
+irm https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.2/install.ps1 | iex
 ```
 
 The installer downloads the matching host SDK bundle, verifies its checksum and host identity,
 installs it under `~/.cargo-dotnet`, and installs `cargo-dotnet` under Cargo's bin directory. It does
 not modify your system Rust installation.
 
-The commands above install the immutable 0.0.1 tag. Current `main` contains newer interop and
-product-host work that will ship only after a new three-platform release passes the same bundle
-and clean-install gates; the 0.0.1 assets are not silently replaced.
+The commands above install the immutable 0.0.2 tag. The historical 0.0.1 tag and its assets remain
+unchanged; releases are versioned instead of silently replacing an existing SDK.
 
 ## Run Rust on .NET
 
@@ -83,7 +82,7 @@ result with ordinary Rust code.
 - Evidence-gated host contracts visible through `cargo dotnet profiles`, with honest preview and
   unsupported Office/Unity/MAUI combinations
 
-The public 0.0.1 SDK supports one deliberately narrow configuration:
+The public 0.0.2 SDK supports one deliberately narrow configuration:
 
 | Component | Supported |
 |---|---|
@@ -98,7 +97,7 @@ macOS Apple Silicon, managed `netstandard2.1`; native staging is currently macOS
 Linux, Android, iOS, Web, and consoles are not claimed.
 
 The compiler retains some older-runtime compatibility code, but .NET 8 and 9 are not supported by
-the 0.0.1 SDK. A single public runtime profile keeps generated target frameworks, linker metadata,
+the 0.0.2 SDK. A single public runtime profile keeps generated target frameworks, linker metadata,
 CoreCLR tools, examples, and diagnostics consistent.
 
 ## Documentation

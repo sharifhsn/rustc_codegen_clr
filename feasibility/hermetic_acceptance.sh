@@ -66,5 +66,8 @@ interop_home="$(jq -r '.cargo_home' "$interop_receipt")"
 [[ "$pure_home" == "$cache"/crates/*/cargo-home ]]
 [[ "$interop_home" == "$cache"/crates/*/cargo-home ]]
 cp "$trace" "$log_dir/parallel-trace.jsonl"
+sysroot_receipt="$(find "$cache/sysroots" -name receipt.json -type f | LC_ALL=C sort | head -1)"
+[[ -n "$sysroot_receipt" ]]
+cp "$sysroot_receipt" "$log_dir/private-sysroot-receipt.json"
 
 echo '== hermetic_acceptance done: distinct builds overlapped with isolated mutable caches =='

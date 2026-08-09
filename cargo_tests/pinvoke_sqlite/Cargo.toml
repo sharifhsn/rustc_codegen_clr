@@ -5,6 +5,6 @@ edition = "2024"
 publish = false
 
 [dependencies]
-rust-dotnet-pinvoke = "0.0.1"
+rust-dotnet-pinvoke = "0.0.2"
 
 [workspace]

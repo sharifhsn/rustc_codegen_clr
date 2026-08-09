@@ -6,7 +6,7 @@ execution. Users should not need to construct `RUSTFLAGS` or configure `build-st
 
 ## Supported configuration
 
-The 0.0.1 SDK supports .NET 10 on Linux x64, macOS Apple Silicon, and Windows x64. Commands accept
+The 0.0.2 SDK supports .NET 10 on Linux x64, macOS Apple Silicon, and Windows x64. Commands accept
 `--dotnet 10` for explicit scripts, but it is optional because 10 is the only public profile.
 Passing 8 or 9 fails immediately with an actionable diagnostic.
 

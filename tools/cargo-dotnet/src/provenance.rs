@@ -150,19 +150,15 @@ fn strip_paths(value: &Value) -> Value {
     }
 }
 
-pub fn package_receipt(package: &Path, entries: &BTreeMap<String, String>) -> Result<Vec<u8>> {
+pub fn package_receipt(
+    package: &Path,
+    published_name: &str,
+    entries: &BTreeMap<String, String>,
+) -> Result<Vec<u8>> {
     let bytes = fs::read(package).with_context(|| format!("read {}", package.display()))?;
     let mut value = Map::new();
     value.insert("schema".into(), Value::from(1));
-    value.insert(
-        "package".into(),
-        Value::from(
-            package
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("package.nupkg"),
-        ),
-    );
+    value.insert("package".into(), Value::from(published_name));
     value.insert("sha256".into(), Value::from(hash_bytes(&bytes)));
     value.insert("entries".into(), serde_json::to_value(entries)?);
     deterministic_json(&Value::Object(value))

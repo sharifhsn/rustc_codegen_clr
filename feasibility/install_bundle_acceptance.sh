@@ -55,9 +55,16 @@ cp -R "$repo/crates/rust-dotnet-native-contract-macros" \
 cp -R "$repo/mycorrhiza_interop_helpers" "$source_home/mycorrhiza_interop_helpers"
 
 toolchain="$(awk -F '"' '/channel/ { print $2; exit }' "$repo/rust-toolchain.toml")"
+version="$(awk -F '"' '/^version = / { print $2; exit }' "$repo/tools/cargo-dotnet/Cargo.toml")"
 git_rev="$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo unknown)"
-printf 'schema = 1\ngit_rev = %s\nrelease_tag = untagged\nhost = %s\ntoolchain = %s\n' \
-    "$git_rev" "$(uname -sm)" "$toolchain" > "$source_home/VERSION"
+case "${RUNNER_OS:-$(uname -s)}:$(uname -m)" in
+    Linux:x86_64) host_rid=linux-x64 ;;
+    macOS:arm64|Darwin:arm64) host_rid=osx-arm64 ;;
+    Windows:x86_64|MINGW*:x86_64|MSYS*:x86_64|CYGWIN*:x86_64) host_rid=win-x64 ;;
+    *) echo "install bundle acceptance: unsupported host $(uname -sm)" >&2; exit 2 ;;
+esac
+printf 'schema = 1\ngit_rev = %s\nrelease_tag = rust-dotnet-v%s\ncargo_dotnet_version = %s\nhost_rid = %s\ntoolchain = %s\n' \
+    "$git_rev" "$version" "$version" "$host_rid" "$toolchain" > "$source_home/VERSION"
 
 mkdir -p "$work/artifacts"
 "$driver" bundle create --home "$source_home" --out "$work/artifacts/sdk-a.zip"
@@ -113,6 +120,16 @@ fresh_shell new "$work/hello" \
 fresh_shell run "$work/hello" --dotnet "$dotnet_version" \
     > "$work/artifacts/run.log" 2>&1
 grep -Fx 'hello from Rust on .NET' "$work/artifacts/run.log"
+
+printf 'fn injected() {}\n' > "$restore_home/dotnet_pal/injected.rs"
+if fresh_shell doctor \
+    --dotnet "$dotnet_version" --workspace "$work/empty-workspace" --json \
+    > "$work/artifacts/extra-file-tamper.json" 2>&1; then
+    echo "bundle home with an injected file unexpectedly passed doctor" >&2
+    exit 1
+fi
+grep -F 'undeclared file' "$work/artifacts/extra-file-tamper.json"
+rm "$restore_home/dotnet_pal/injected.rs"
 
 printf '\ntampered\n' >> "$restore_home/target/x86_64-unknown-dotnet.json"
 if fresh_shell doctor \

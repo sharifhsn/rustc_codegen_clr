@@ -1452,6 +1452,7 @@ mod tests {
             owner: "fixture/1.0.0".into(),
             logical_path: format!("runtimes/{other_rid}/native/libsample.so"),
             source: PathBuf::from("libsample.so"),
+            contents: Vec::new().into(),
             kind: crate::nuget::StagedPackageAssetKind::Native,
             rid: Some(other_rid.to_owned()),
         }];
@@ -1486,6 +1487,11 @@ mod tests {
         assert!(error.to_string().contains("rust_probe"));
 
         let wrong_host = HostFacts {
+            arch: if host.host_rid.ends_with("-arm64") {
+                "x86_64"
+            } else {
+                "aarch64"
+            },
             host_rid: if host.host_rid.ends_with("-arm64") {
                 "test-x64"
             } else {
@@ -1660,6 +1666,7 @@ mod tests {
     fn profile_diagnostics_cover_vsto_unity_maui_and_coreclr_drift() {
         let windows = HostFacts {
             os: "windows",
+            arch: "x86_64",
             dylib_ext: "dll",
             exe_ext: ".exe",
             host_rid: "win-x64",
@@ -1719,6 +1726,7 @@ mod tests {
             "",
             HostFacts {
                 os: "windows",
+                arch: "x86_64",
                 dylib_ext: "dll",
                 exe_ext: ".exe",
                 host_rid: "win-x64",

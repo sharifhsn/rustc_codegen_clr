@@ -34,8 +34,58 @@ for path in "$manifest" "$report" "$@"; do
     [[ -f "$path" ]] || { echo "capability evidence input does not exist: $path" >&2; exit 2; }
 done
 
+sha="$(git -C "$repo" rev-parse HEAD)"
+if [[ -n "$(git -C "$repo" status --porcelain --untracked-files=all)" ]]; then
+    dirty=true
+else
+    dirty=false
+fi
+if [[ "$scope" == release && "$dirty" == true ]]; then
+    echo 'release capability evidence requires a clean source tree' >&2
+    exit 2
+fi
+
+mkdir -p "$(dirname "$receipt")"
+receipt_dir="$(cd "$(dirname "$receipt")" && pwd -P)"
+receipt="$receipt_dir/$(basename "$receipt")"
+manifest_snapshot="$receipt_dir/capabilities.manifest.toml"
+report_snapshot="$receipt_dir/capability-report.md"
+cp "$manifest" "$manifest_snapshot"
+cp "$report" "$report_snapshot"
+
+relative_evidence_file() {
+    local path="$1" directory absolute
+    [[ -f "$path" && ! -L "$path" ]] || {
+        echo "evidence file is missing, not regular, or a symlink: $path" >&2
+        return 2
+    }
+    directory="$(cd "$(dirname "$path")" && pwd -P)"
+    absolute="$directory/$(basename "$path")"
+    case "$absolute" in
+        "$receipt_dir"/*) printf '%s\n' "${absolute#"$receipt_dir"/}" ;;
+        *)
+            echo "evidence file is outside the evidence-owned directory: $absolute" >&2
+            return 2
+            ;;
+    esac
+}
+
+require_normalized_relative_path() {
+    local path="$1" label="$2"
+    case "$path" in
+        ''|/*|*\\*|.|./*|*/./*|*/.|..|../*|*/../*|*/..|*//* )
+            echo "$label must be normalized and relative: $path" >&2
+            return 2
+            ;;
+    esac
+}
+
 evidence='[]'
+artifact_receipts='[]'
+artifact_files='[]'
+seen_artifact_receipts='|'
 for path in "$@"; do
+    result_relative="$(relative_evidence_file "$path")"
     IFS= read -r header < "$path" || true
     case "$header" in
         'kind|dotnet|profile|case|'*) ;;
@@ -43,18 +93,64 @@ for path in "$@"; do
     esac
     evidence="$(jq -cn \
         --argjson current "$evidence" \
-        --arg path "$path" \
+        --arg path "$result_relative" \
         --arg sha256 "$(hash_file "$path")" \
         '$current + [{path: $path, sha256: $sha256}]')"
+
+    IFS='|' read -r -a columns <<< "$header"
+    receipt_index=-1
+    for index in "${!columns[@]}"; do
+        if [[ "${columns[$index]}" == receipt ]]; then
+            receipt_index="$index"
+            break
+        fi
+    done
+    if ((receipt_index >= 0)); then
+        while IFS='|' read -r -a fields; do
+            artifact_receipt="${fields[$receipt_index]:-}"
+            [[ -n "$artifact_receipt" ]] || continue
+            require_normalized_relative_path "$artifact_receipt" \
+                'acceptance artifact receipt path' || exit 2
+            artifact_receipt="$(dirname "$path")/$artifact_receipt"
+            receipt_relative="$(relative_evidence_file "$artifact_receipt")"
+            case "$seen_artifact_receipts" in
+                *"|$receipt_relative|"*) continue ;;
+            esac
+            jq -e '.schema == 1 and (.artifacts | type == "object")' \
+                "$artifact_receipt" >/dev/null
+            artifact_receipts="$(jq -cn \
+                --argjson current "$artifact_receipts" \
+                --arg path "$receipt_relative" \
+                --arg sha256 "$(hash_file "$artifact_receipt")" \
+                '$current + [{path: $path, sha256: $sha256}]')"
+            while IFS=$'\t' read -r name artifact_path expected_sha256; do
+                [[ -n "$name" && -n "$artifact_path" && -n "$expected_sha256" ]] || {
+                    echo "malformed artifact entry in $artifact_receipt" >&2
+                    exit 2
+                }
+                require_normalized_relative_path "$artifact_path" \
+                    'artifact receipt path' || exit 2
+                artifact_file="$(dirname "$artifact_receipt")/$artifact_path"
+                artifact_relative="$(relative_evidence_file "$artifact_file")"
+                actual_sha256="$(hash_file "$artifact_file")"
+                if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+                    echo "artifact hash changed after its receipt was written: $artifact_relative" >&2
+                    exit 2
+                fi
+                artifact_files="$(jq -cn \
+                    --argjson current "$artifact_files" \
+                    --arg receipt "$receipt_relative" \
+                    --arg name "$name" \
+                    --arg path "$artifact_relative" \
+                    --arg sha256 "$actual_sha256" \
+                    '$current + [{receipt: $receipt, name: $name, path: $path, sha256: $sha256}]')"
+            done < <(jq -r '.artifacts | to_entries[] | [.key, .value.path, .value.sha256] | @tsv' \
+                "$artifact_receipt")
+            seen_artifact_receipts="$seen_artifact_receipts$receipt_relative|"
+        done < <(tail -n +2 "$path")
+    fi
 done
 
-sha="$(git -C "$repo" rev-parse HEAD)"
-if [[ -n "$(git -C "$repo" status --porcelain --untracked-files=all)" ]]; then
-    dirty=true
-else
-    dirty=false
-fi
-mkdir -p "$(dirname "$receipt")"
 tmp="$(mktemp "${receipt}.tmp.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
 jq -n \
@@ -68,11 +164,13 @@ jq -n \
     --arg host_arch "$(uname -m)" \
     --arg scope "$scope" \
     --arg command "${RCL_CAPABILITY_COMMAND:-cargo dotnet capabilities --strict}" \
-    --arg manifest "$manifest" \
-    --arg manifest_sha256 "$(hash_file "$manifest")" \
-    --arg report "$report" \
-    --arg report_sha256 "$(hash_file "$report")" \
+    --arg manifest "$(basename "$manifest_snapshot")" \
+    --arg manifest_sha256 "$(hash_file "$manifest_snapshot")" \
+    --arg report "$(basename "$report_snapshot")" \
+    --arg report_sha256 "$(hash_file "$report_snapshot")" \
     --argjson result_files "$evidence" \
+    --argjson artifact_receipts "$artifact_receipts" \
+    --argjson artifact_files "$artifact_files" \
     '{
         schema: $schema,
         generated_at: $generated_at,
@@ -83,7 +181,9 @@ jq -n \
         command: $command,
         manifest: {path: $manifest, sha256: $manifest_sha256},
         report: {path: $report, sha256: $report_sha256},
-        result_files: $result_files
+        result_files: $result_files,
+        artifact_receipts: $artifact_receipts,
+        artifact_files: $artifact_files
     }' > "$tmp"
 mv -f "$tmp" "$receipt"
 trap - EXIT

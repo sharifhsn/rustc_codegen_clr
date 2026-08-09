@@ -777,9 +777,19 @@ pub(crate) fn cargo_dotnet_cache_home() -> Result<PathBuf> {
     {
         return Ok(PathBuf::from(path));
     }
+    if let Some(sdk_home) = std::env::var_os("CARGO_DOTNET_HOME").filter(|value| !value.is_empty())
+    {
+        let sdk_home = PathBuf::from(sdk_home);
+        let parent = sdk_home.parent().unwrap_or_else(|| Path::new("."));
+        let name = sdk_home
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("cargo-dotnet");
+        return Ok(parent.join(format!("{name}-cache")));
+    }
     let home = crate::host::home_dir()
         .context("neither HOME nor USERPROFILE is set (needed for cargo-dotnet cache)")?;
-    Ok(home.join(".cargo-dotnet/cache"))
+    Ok(home.join(".cargo-dotnet-cache"))
 }
 
 /// Stable namespace for mutable state owned by one consumer crate. Cargo registry sources are

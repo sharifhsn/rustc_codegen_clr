@@ -28,15 +28,17 @@ compiler ABI, or complete Rust/.NET semantic parity.
 ## Required for the next prerelease
 
 - [ ] Current `main` passes the Linux, macOS, and Windows compiler/product gates.
-- [ ] A new immutable version/tag is selected; do not move or overwrite `rust-dotnet-v0.0.1`.
+- [x] `rust-dotnet-v0.0.2` is the selected next immutable version; do not move or overwrite `rust-dotnet-v0.0.1`.
 - [ ] Matching host bundles pass the same isolated install and first-run acceptance as 0.0.1.
 - [ ] Release notes distinguish shipped behavior from planned Excel, Unity, MAUI, and NativeAOT
   work.
 - [ ] The documented installer and a managed-Rust plus P/Invoke attached-host journey pass from the
   published assets, outside this checkout.
 
-NuGet trusted publishing, signed tags, and platform package signing are useful hardening but are not
-claims made by this experimental GitHub prerelease.
+The 0.0.2 workflow requires an annotated GitHub-verified signed tag that resolves directly to the
+checked-out release commit before either building or publishing. NuGet trusted publishing and
+platform package signing remain useful hardening, but are not claims made by this experimental
+GitHub prerelease.
 
 ## Later expansion
 

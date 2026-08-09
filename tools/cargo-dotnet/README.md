@@ -24,7 +24,7 @@ installer or provision the SDK from a compiler checkout before building.
 
 `publish` consumes the C# host emitted by `cargo dotnet new --lib` or `--plugin`; it invokes the
 host's existing `RustDotnet.targets` pipeline and ILC in one build. It does not consume the Rust-only
-`--app` scaffold. The 0.0.1 release supports .NET 10 on Linux x64, macOS Apple Silicon, and Windows
+`--app` scaffold. The 0.0.2 release supports .NET 10 on Linux x64, macOS Apple Silicon, and Windows
 x64. NativeAOT additionally requires the platform C compiler/linker expected by the .NET SDK.
 
 ## Signed, immutable NuGet releases

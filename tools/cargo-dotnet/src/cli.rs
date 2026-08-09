@@ -205,7 +205,7 @@ pub struct BuildArgs {
     /// Execution backend: `native` (default installed) or `docker` (in-repo dev).
     #[arg(long, env = "CARGO_DOTNET_BACKEND")]
     pub backend: Option<String>,
-    /// Target .NET runtime version. The 0.0.1 SDK supports `10`.
+    /// Target .NET runtime version. The 0.0.2 SDK supports `10`.
     /// sets `DOTNET_VERSION` for the codegen backend + linker, and stamps the runtimeconfig / TFM /
     /// `.assembly extern .ver`.
     #[arg(long, value_name = "10", default_value = "10", env = "DOTNET_VERSION")]
@@ -471,7 +471,7 @@ pub struct UnityPackageArgs {
     #[arg(long, default_value = "com.rustdotnet.game")]
     pub name: String,
     /// SemVer package version.
-    #[arg(long, default_value = "0.0.1")]
+    #[arg(long, default_value = "0.0.2")]
     pub version: String,
     /// Replace a previously generated package directory.
     #[arg(long)]
@@ -574,7 +574,7 @@ pub struct PackArgs {
     /// Expected SHA-256 signer certificate fingerprint (hex, separators ignored).
     #[arg(long, value_name = "SHA256", requires = "sign_certificate")]
     pub signer_fingerprint: Option<String>,
-    /// Target .NET runtime version for the package. The 0.0.1 SDK supports `10`.
+    /// Target .NET runtime version for the package. The 0.0.2 SDK supports `10`.
     /// `DOTNET_VERSION` and the NuGet TFM (`lib/<tfm>/`), which must agree with the dll.
     #[arg(long, value_name = "10", default_value = "10", env = "DOTNET_VERSION")]
     pub dotnet: String,

@@ -106,6 +106,8 @@ CARGO_DOTNET_BACKEND=native \
 [[ "$(hash_file "$work/ambient-cargo/credentials.toml")" == "$ambient_creds_before" ]]
 private_credentials="$(credential_store "$work/private-cache")"
 [[ -f "$private_credentials" ]]
+printf 'schema=1\ncredential_sha256=%s\nprivate_store_outside_ambient=true\n' \
+    "$(hash_file "$private_credentials")" > "$work/private-credentials-proof.txt"
 [[ ! -e "$work/ambient-cargo/registry" ]]
 [[ -d "$(dirname "$private_credentials")/registry" ]]
 [[ -f "$work/consumer/Cargo.lock" ]]

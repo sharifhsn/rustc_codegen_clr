@@ -13,6 +13,8 @@ on:
     branches: [main, gaps-campaign]
   workflow_dispatch:
   workflow_call:
+permissions:
+  contents: read
 env:
   CARGO_TERM_COLOR: always
 jobs:
@@ -38,23 +40,23 @@ jobs:
           # the test harness rebuilds test crates constantly; cache only the backend deps
           cache-targets: "true"
       - name: Check unified workspace
-        run: cargo check --workspace
+        run: cargo check --workspace --locked
       - name: Audit Edition 2024 across excluded fixtures and tools
         run: bash feasibility/check_edition_2024.sh
       - name: Audit release workflow invariants
         run: bash feasibility/release_workflow_acceptance.sh
       - name: Test cilly architecture and exporters
-        run: cargo test -p cilly
+        run: cargo test -p cilly --locked
       - name: Test cargo-dotnet driver
-        run: cargo test --manifest-path tools/cargo-dotnet/Cargo.toml
+        run: cargo test --manifest-path tools/cargo-dotnet/Cargo.toml --locked
       - name: Build backend (unified workspace, release)
         # ONE invocation for dylib + linker — two separate builds can produce two divergent
         # libcilly builds whose serialized .bc formats mismatch (see docs/DEBUGGING.md).
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --locked
       - name: Run strict ::stable gate (isolated flaky retry)
         run: bash .github/scripts/gate.sh
   windows_build:
-    # Windows is a public 0.0.1 SDK host; exercise the compiler, driver, and runtime behavior on
+    # Windows is a public 0.0.2 SDK host; exercise the compiler, driver, and runtime behavior on
     # every main-branch push.
     runs-on: windows-latest
     timeout-minutes: 90
@@ -74,16 +76,16 @@ jobs:
           Copy-Item "$env:RUNNER_TEMP\ilasm10\runtimes\win-x64\native\ilasm.exe" "$env:USERPROFILE\.dotnet\ilasm10-tool\ilasm.exe"
       - name: Build and test compiler on Windows
         run: |
-          cargo test -p cilly
-          cargo build --release --workspace
+          cargo test -p cilly --locked
+          cargo build --release --workspace --locked
       - name: Build and test cargo-dotnet on Windows
-        run: cargo test --manifest-path tools/cargo-dotnet/Cargo.toml
+        run: cargo test --manifest-path tools/cargo-dotnet/Cargo.toml --locked
       - name: Probe Windows CLI on .NET 10
         shell: pwsh
         env:
           DOTNET_VERSION: "10"
         run: |
-          cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet doctor --workspace cargo_tests/cd_interop
+          cargo run --release --locked --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet doctor --workspace cargo_tests/cd_interop
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           dotnet --info
       - name: Build and run Rust on Windows CoreCLR
@@ -92,9 +94,9 @@ jobs:
           CARGO_DOTNET_BACKEND: native
           DOTNET_VERSION: "10"
         run: |
-          cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet run cargo_tests/cd_pure --backend native --dotnet 10 --clean
-          cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet run cargo_tests/cd_subword_atomics --backend native --dotnet 10 --clean
-          cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet run cargo_tests/cd_net10_bcl --backend native --dotnet 10 --clean
+          cargo run --release --locked --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet run cargo_tests/cd_pure --backend native --dotnet 10 --clean
+          cargo run --release --locked --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet run cargo_tests/cd_subword_atomics --backend native --dotnet 10 --clean
+          cargo run --release --locked --manifest-path tools/cargo-dotnet/Cargo.toml -- dotnet run cargo_tests/cd_net10_bcl --backend native --dotnet 10 --clean
       - name: Run Windows P/Invoke acceptances
         shell: bash
         run: |
@@ -112,7 +114,7 @@ jobs:
         shell: bash
         run: bash feasibility/excel_dna_acceptance.sh
   macos_pinvoke:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -124,7 +126,7 @@ jobs:
         run: brew install ripgrep
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Build compiler and cargo-dotnet
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --locked
       - name: Install .NET 10 CoreCLR ILAsm
         run: |
           curl -fsSL -o "$RUNNER_TEMP/ilasm10.zip" "https://www.nuget.org/api/v2/package/runtime.osx-arm64.microsoft.netcore.ilasm/10.0.0"
@@ -165,8 +167,8 @@ jobs:
           cache-targets: "true"
       - name: Build cargo-dotnet and backend
         run: |
-          cargo build --manifest-path tools/cargo-dotnet/Cargo.toml --release
-          cargo build --release --workspace
+          cargo build --manifest-path tools/cargo-dotnet/Cargo.toml --release --locked
+          cargo build --release --workspace --locked
       - name: Install .NET 10 CoreCLR ILAsm
         run: |
           curl -fsSL -o "$RUNNER_TEMP/ilasm10.zip" "https://www.nuget.org/api/v2/package/runtime.linux-x64.microsoft.netcore.ilasm/10.0.0"
@@ -188,12 +190,15 @@ jobs:
           RCL_EVIDENCE_DOTNET: independent
           RCL_EVIDENCE_PROFILES: release
           RCL_EVIDENCE_MARKER: "== api_compat_acceptance passed (unchanged accepted; breaking change requires major SemVer) =="
+          RCL_EVIDENCE_ARTIFACTS: |
+            public_api_baseline=${{ github.workspace }}/feasibility/api_compat/typed-dto.public-api.txt
+            breaking_diff=${{ runner.temp }}/api-compat-acceptance/breaking.diff
         run: bash feasibility/record_acceptance_result.sh bash feasibility/api_compat_acceptance.sh
       - name: Run product acceptance smoke
         env:
           RCL_MATRIX_PROFILES: release
           RCL_MATRIX_CASES: soak_ahash cd_pure cd_async_stream cd_subword_atomics cd_net10_bcl cd_export_ergonomics
-          RCL_MATRIX_SUMMARY: ${{ runner.temp }}/product-acceptance.tsv
+          RCL_MATRIX_SUMMARY: ${{ runner.temp }}/capability-evidence/product-acceptance.tsv
           RCL_MATRIX_LOG_DIR: ${{ runner.temp }}/product-acceptance-logs
           RCL_MATRIX_NATIVE_TARGET_ROOT: ${{ runner.temp }}/product-acceptance-native
         run: bash feasibility/e2e_matrix.sh
@@ -227,6 +232,12 @@ jobs:
           RCL_EVIDENCE_DOTNET: "10"
           RCL_EVIDENCE_PROFILES: release
           RCL_EVIDENCE_MARKER: "== install_bundle_acceptance done: deterministic, PATH-discovered repo-less run, tamper rejected =="
+          RCL_EVIDENCE_ARTIFACTS: |
+            sdk_bundle=${{ runner.temp }}/install-bundle-acceptance/artifacts/sdk-a.zip
+            bundle_checksum=${{ runner.temp }}/install-bundle-acceptance/artifacts/sdk-a.zip.sha256
+            doctor_json=${{ runner.temp }}/install-bundle-acceptance/artifacts/doctor.json
+            run_log=${{ runner.temp }}/install-bundle-acceptance/artifacts/run.log
+            tamper_json=${{ runner.temp }}/install-bundle-acceptance/artifacts/tamper.json
         run: bash feasibility/record_acceptance_result.sh bash feasibility/install_bundle_acceptance.sh
       - name: Restore once and run from isolated caches in Cargo offline mode
         env:
@@ -250,6 +261,10 @@ jobs:
           RCL_EVIDENCE_DOTNET: "10"
           RCL_EVIDENCE_PROFILES: debug release
           RCL_EVIDENCE_MARKER: "== nats_managed_array_acceptance done: generated byte[] bindings, no C# shim, real debug+release roundtrip =="
+          RCL_EVIDENCE_ARTIFACTS: |
+            generated_bindings=${{ runner.temp }}/nats-managed-array-acceptance/generated/src/nuget/nats_client.rs
+            release_log=${{ runner.temp }}/nats-managed-array-acceptance/logs/release.log
+            debug_log=${{ runner.temp }}/nats-managed-array-acceptance/logs/debug.log
         run: bash feasibility/record_acceptance_result.sh bash feasibility/nats_managed_array_acceptance.sh
       - name: Regenerate and consume closed async NuGet bindings
         env:
@@ -262,6 +277,11 @@ jobs:
           RCL_EVIDENCE_DOTNET: "10"
           RCL_EVIDENCE_PROFILES: debug release
           RCL_EVIDENCE_MARKER: "== value_task_nuget_acceptance done: generated Task<int>, ValueTask<int>, and IAsyncEnumerable<int>, delayed debug+release =="
+          RCL_EVIDENCE_ARTIFACTS: |
+            local_nupkg=${{ runner.temp }}/value-task-nuget-acceptance/feed/RustcCodegenClr.AsyncFixture.1.0.0.nupkg
+            generated_bindings=${{ runner.temp }}/value-task-nuget-acceptance/consumer/src/nuget/rustccodegenclr_asyncfixture.rs
+            release_log=${{ runner.temp }}/value-task-nuget-acceptance/logs/release.log
+            debug_log=${{ runner.temp }}/value-task-nuget-acceptance/logs/debug.log
         run: bash feasibility/record_acceptance_result.sh bash feasibility/value_task_nuget_acceptance.sh
       - name: Run C#-hosted Portable PDB acceptance in debug and release
         env:
@@ -285,6 +305,10 @@ jobs:
           RCL_EVIDENCE_DOTNET: "10"
           RCL_EVIDENCE_PROFILES: release
           RCL_EVIDENCE_MARKER: "== msbuild_acceptance done =="
+          RCL_EVIDENCE_ARTIFACTS: |
+            rust_dll=${{ github.workspace }}/cargo_tests/cd_interop/rustlib/target/x86_64-unknown-dotnet/release/cd_interop.dll
+            csharp_host=${{ github.workspace }}/cargo_tests/cd_interop/csharp/bin/Debug/net10.0/cd_interop_cs.dll
+            msbuild_logs=${{ runner.temp }}/msbuild-acceptance-logs/restored-build.log
         run: bash feasibility/record_acceptance_result.sh bash feasibility/msbuild_acceptance.sh
       - name: Run NuGet publishing and consumption acceptance
         env:
@@ -296,6 +320,12 @@ jobs:
           RCL_EVIDENCE_DOTNET: "10"
           RCL_EVIDENCE_PROFILES: release
           RCL_EVIDENCE_MARKER: "== nuget_acceptance done =="
+          RCL_EVIDENCE_ARTIFACTS: |
+            nupkg=${{ runner.temp }}/nuget-acceptance-logs/evidence.nupkg
+            package_hash=${{ runner.temp }}/nuget-acceptance-logs/evidence.nupkg.sha256
+            project_assets=${{ runner.temp }}/nuget-acceptance-logs/evidence-project-assets.json
+            generated_bindings=${{ runner.temp }}/nuget-acceptance-logs/evidence-bindings.rs
+            runtime_dll=${{ runner.temp }}/nuget-acceptance-logs/evidence-runtime.dll
         run: bash feasibility/record_acceptance_result.sh bash feasibility/nuget_acceptance.sh
       - name: Run independent clean-tree package envelope reproducibility acceptance
         env:
@@ -310,6 +340,14 @@ jobs:
           RCL_EVIDENCE_DOTNET: "10"
           RCL_EVIDENCE_PROFILES: release
           RCL_EVIDENCE_MARKER: "== reproducibility_acceptance done =="
+          RCL_EVIDENCE_ARTIFACTS: |
+            nupkg=${{ runner.temp }}/reproducibility-acceptance/a/package/Rcl.Reproducibility.Probe.1.0.0.nupkg
+            package_receipt=${{ runner.temp }}/reproducibility-acceptance/a/package/Rcl.Reproducibility.Probe.1.0.0.nupkg.rustdotnet.receipt.json
+            zip_entry_hashes=${{ runner.temp }}/reproducibility-acceptance/a/zip-entry-hashes.txt
+            provenance=${{ runner.temp }}/reproducibility-acceptance/a/artifact-provenance.json
+            sbom=${{ runner.temp }}/reproducibility-acceptance/a/sbom.cdx.json
+            licenses=${{ runner.temp }}/reproducibility-acceptance/a/licenses.json
+            build_logs=${{ runner.temp }}/reproducibility-acceptance/a/backend-build.log
         run: bash feasibility/record_acceptance_result.sh bash feasibility/reproducibility_acceptance.sh
       - name: Run hermetic store acceptance
         env:
@@ -321,6 +359,11 @@ jobs:
           RCL_EVIDENCE_DOTNET: "10"
           RCL_EVIDENCE_PROFILES: debug release
           RCL_EVIDENCE_MARKER: "== hermetic_acceptance done: distinct builds overlapped with isolated mutable caches =="
+          RCL_EVIDENCE_ARTIFACTS: |
+            parallel_trace=${{ runner.temp }}/hermetic-acceptance-logs/parallel-trace.jsonl
+            private_sysroot_receipt=${{ runner.temp }}/hermetic-acceptance-logs/private-sysroot-receipt.json
+            rust_artifact_receipts=${{ github.workspace }}/cargo_tests/cd_pure/target/x86_64-unknown-dotnet/debug/cd_pure.rustdotnet.receipt.json
+            hermetic_logs=${{ runner.temp }}/hermetic-acceptance-logs/cd-pure.log
         run: bash feasibility/record_acceptance_result.sh bash feasibility/hermetic_acceptance.sh
       - name: Run private Cargo registry acceptance
         env:
@@ -333,11 +376,17 @@ jobs:
           RCL_EVIDENCE_DOTNET: "10"
           RCL_EVIDENCE_PROFILES: debug
           RCL_EVIDENCE_MARKER: "== private_registry_acceptance done =="
+          RCL_EVIDENCE_ARTIFACTS: |
+            registry_events=${{ runner.temp }}/private-registry-acceptance/registry.events
+            private_cargo_credentials_proof=${{ runner.temp }}/private-registry-acceptance/private-credentials-proof.txt
+            rust_artifact_receipt=${{ runner.temp }}/private-registry-acceptance/consumer/target/x86_64-unknown-dotnet/debug/rcl-private-registry-consumer.rustdotnet.receipt.json
+            token_safe_logs=${{ runner.temp }}/private-registry-acceptance/logs/cargo-dotnet.log
         run: bash feasibility/record_acceptance_result.sh bash feasibility/private_registry_acceptance.sh
       - name: Merge and enforce release capability evidence
         run: |
           evidence_dir="${{ runner.temp }}/capability-evidence"
-          expected_special=(
+          expected_results=(
+            product-acceptance.tsv
             api-compat.tsv
             install-bundle.tsv
             nats-managed-array.tsv
@@ -348,15 +397,15 @@ jobs:
             hermetic.tsv
             private-registry.tsv
           )
-          result_files=("${{ runner.temp }}/product-acceptance.tsv")
-          for name in "${expected_special[@]}"; do
+          result_files=()
+          for name in "${expected_results[@]}"; do
             path="$evidence_dir/$name"
             [[ -f "$path" ]] || { echo "missing capability evidence: $path" >&2; exit 1; }
             result_files+=("$path")
           done
           shopt -s nullglob
           actual_special=("$evidence_dir"/*.tsv)
-          if ((${#actual_special[@]} != ${#expected_special[@]})); then
+          if ((${#actual_special[@]} != ${#expected_results[@]})); then
             echo "unexpected capability evidence files in $evidence_dir" >&2
             printf '  %s\n' "${actual_special[@]}" >&2
             exit 1
@@ -369,12 +418,12 @@ jobs:
             --manifest acceptance/capabilities.toml \
             "${result_args[@]}" \
             --evidence-scope release --strict \
-            --output "${{ runner.temp }}/product-acceptance.capabilities.md"
+            --output "$evidence_dir/product-acceptance.capabilities.md"
           bash feasibility/write_capability_evidence_receipt.sh \
             acceptance/capabilities.toml \
-            "${{ runner.temp }}/product-acceptance.capabilities.md" \
+            "$evidence_dir/product-acceptance.capabilities.md" \
             release \
-            "${{ runner.temp }}/product-acceptance.capabilities.receipt.json" \
+            "$evidence_dir/product-acceptance.capabilities.receipt.json" \
             "${result_files[@]}"
       - name: Run Wave 0 expected-red blocker oracles
         env:
@@ -387,10 +436,6 @@ jobs:
           name: product-acceptance-${{ github.sha }}
           if-no-files-found: error
           path: |
-            ${{ runner.temp }}/product-acceptance.tsv
-            ${{ runner.temp }}/product-acceptance.capabilities.md
-            ${{ runner.temp }}/product-acceptance.capabilities.receipt.json
-            ${{ runner.temp }}/product-acceptance.receipt.json
             ${{ runner.temp }}/capability-evidence
             ${{ runner.temp }}/product-acceptance-logs
             ${{ runner.temp }}/onboarding-acceptance-logs

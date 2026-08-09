@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -420,6 +420,8 @@ struct OwnedAssetRecord {
     rid: Option<String>,
     fallback: bool,
     staged_path: String,
+    #[serde(default)]
+    sha256: String,
 }
 
 /// Stage a complete SDK-selected graph under a root-package-owned directory. The manifest is
@@ -467,13 +469,11 @@ pub fn stage_assets(crate_dir: &Path, root_id: &str, assets: &[ResolvedAsset]) -
                     .parent()
                     .context("asset staging: asset has no parent")?,
             )?;
-            fs::copy(&asset.source, &destination).with_context(|| {
-                format!(
-                    "asset staging: {} -> {}",
-                    asset.source.display(),
-                    destination.display()
-                )
+            let contents = fs::read(&asset.source).with_context(|| {
+                format!("asset staging: reading source {}", asset.source.display())
             })?;
+            fs::write(&destination, &contents)
+                .with_context(|| format!("asset staging: writing {}", destination.display()))?;
             records.push(OwnedAssetRecord {
                 owner: asset.owner.clone(),
                 kind: asset.kind.clone(),
@@ -481,6 +481,7 @@ pub fn stage_assets(crate_dir: &Path, root_id: &str, assets: &[ResolvedAsset]) -
                 rid: asset.rid.clone(),
                 fallback: asset.fallback,
                 staged_path: format!("owned/{root_token}/{logical_path}"),
+                sha256: format!("{:x}", Sha256::digest(&contents)),
             });
         }
         Ok(records)
@@ -568,21 +569,16 @@ pub fn copy_staged_assets(crate_dir: &Path, out_dir: &Path) -> Result<Option<Vec
     }
     let mut copied = Vec::with_capacity(destinations.len());
     for (deployment, asset) in destinations {
-        let source = assets_dir.join(&asset.staged_path);
-        if !source.is_file() {
-            bail!(
-                "cargo-dotnet: staged asset referenced by manifest is missing: {}",
-                source.display()
-            );
-        }
+        let (source, contents) = staged_snapshot(&assets_dir, asset, "cargo-dotnet")?;
         let destination = out_dir.join(deployment);
         fs::create_dir_all(
             destination
                 .parent()
                 .context("cargo-dotnet: output asset has no parent")?,
         )?;
-        fs::copy(&source, &destination)
-            .with_context(|| format!("cp {} -> {}", source.display(), destination.display()))?;
+        fs::write(&destination, &contents).with_context(|| {
+            format!("copying {} -> {}", source.display(), destination.display())
+        })?;
         copied.push(destination);
     }
     Ok(Some(copied))
@@ -613,17 +609,29 @@ pub fn missing_recorded_roots(
     let mut missing = Vec::new();
     for (id, version) in recorded {
         let expected_owner = format!("{id}/{version}");
-        let complete = manifest.roots.get(id).is_some_and(|root| {
-            !root.assets.is_empty()
-                && root
-                    .assets
-                    .iter()
-                    .any(|asset| asset.owner.eq_ignore_ascii_case(&expected_owner))
-                && root
-                    .assets
-                    .iter()
-                    .all(|asset| assets_dir.join(&asset.staged_path).is_file())
-        });
+        let complete = if let Some(root) = manifest.roots.get(id) {
+            let has_expected_owner = root
+                .assets
+                .iter()
+                .any(|asset| asset.owner.eq_ignore_ascii_case(&expected_owner));
+            let mut staged_files_exist = true;
+            for asset in &root.assets {
+                let relative = staged_relative_path(&asset.staged_path, "cargo-dotnet")?;
+                if !assets_dir.join(relative).exists() {
+                    staged_files_exist = false;
+                    continue;
+                }
+                let source = staged_source(&assets_dir, &asset.staged_path, "cargo-dotnet")?;
+                if !valid_sha256(&asset.sha256)
+                    || format!("{:x}", Sha256::digest(fs::read(source)?)) != asset.sha256
+                {
+                    staged_files_exist = false;
+                }
+            }
+            !root.assets.is_empty() && has_expected_owner && staged_files_exist
+        } else {
+            false
+        };
         if !complete {
             missing.push(id.clone());
         }
@@ -632,15 +640,15 @@ pub fn missing_recorded_roots(
 }
 
 fn deployment_path(asset: &OwnedAssetRecord) -> Result<PathBuf> {
+    let logical_path = normalize_logical_path(&asset.logical_path)?;
     match asset.kind {
-        AssetKind::Runtime | AssetKind::Native => asset
-            .logical_path
+        AssetKind::Runtime | AssetKind::Native => logical_path
             .rsplit('/')
             .next()
             .map(PathBuf::from)
             .context("cargo-dotnet: asset has no filename"),
         AssetKind::Resource => {
-            let parts = asset.logical_path.split('/').collect::<Vec<_>>();
+            let parts = logical_path.split('/').collect::<Vec<_>>();
             let Some(lib_index) = parts.iter().position(|part| *part == "lib") else {
                 return parts
                     .last()
@@ -650,7 +658,7 @@ fn deployment_path(asset: &OwnedAssetRecord) -> Result<PathBuf> {
             if parts.len() <= lib_index + 2 {
                 bail!(
                     "cargo-dotnet: resource path lacks a culture/file suffix: {}",
-                    asset.logical_path
+                    logical_path
                 );
             }
             let mut output = PathBuf::new();
@@ -680,6 +688,70 @@ fn read_manifest(path: &Path) -> Result<OwnedAssetsManifest> {
         );
     }
     Ok(manifest)
+}
+
+/// Resolve a manifest-owned path without permitting it to select data outside the private
+/// staging tree. Canonicalizing both sides also rejects symlink escapes inside that tree.
+fn staged_source(assets_dir: &Path, staged_path: &str, context: &str) -> Result<PathBuf> {
+    let relative = staged_relative_path(staged_path, context)?;
+    let canonical_root = fs::canonicalize(assets_dir)
+        .with_context(|| format!("{context}: canonicalizing {}", assets_dir.display()))?;
+    let candidate = assets_dir.join(relative);
+    let canonical_source = fs::canonicalize(&candidate).with_context(|| {
+        format!(
+            "{context}: staged asset is missing: {}",
+            candidate.display()
+        )
+    })?;
+    if !canonical_source.starts_with(&canonical_root) || !canonical_source.is_file() {
+        bail!(
+            "{context}: staged asset escapes the asset root or is not a regular file: {}",
+            candidate.display()
+        );
+    }
+    Ok(canonical_source)
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn staged_snapshot(
+    assets_dir: &Path,
+    asset: &OwnedAssetRecord,
+    context: &str,
+) -> Result<(PathBuf, std::sync::Arc<[u8]>)> {
+    if !valid_sha256(&asset.sha256) {
+        bail!(
+            "{context}: staged asset has no valid content hash; restore it again: {}",
+            asset.staged_path
+        );
+    }
+    let source = staged_source(assets_dir, &asset.staged_path, context)?;
+    let contents = fs::read(&source)
+        .with_context(|| format!("{context}: reading staged asset {}", source.display()))?;
+    let actual = format!("{:x}", Sha256::digest(&contents));
+    if actual != asset.sha256 {
+        bail!(
+            "{context}: staged asset content changed after staging: {}",
+            source.display()
+        );
+    }
+    Ok((source, contents.into()))
+}
+
+fn staged_relative_path<'a>(staged_path: &'a str, context: &str) -> Result<&'a Path> {
+    let relative = Path::new(staged_path);
+    if relative.as_os_str().is_empty()
+        || staged_path.contains('\\')
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("{context}: unsafe staged asset path: {staged_path}");
+    }
+    Ok(relative)
 }
 
 fn write_manifest_atomic(path: &Path, manifest: &OwnedAssetsManifest) -> Result<()> {
@@ -718,13 +790,7 @@ pub fn package_assets(crate_dir: &Path) -> Result<Vec<StagedPackageAsset>> {
                 continue;
             }
             let logical_path = normalize_logical_path(&asset.logical_path)?;
-            let source = assets_dir.join(&asset.staged_path);
-            if !source.is_file() {
-                bail!(
-                    "pack: staged NuGet asset referenced by manifest is missing: {}",
-                    source.display()
-                );
-            }
+            let (source, contents) = staged_snapshot(&assets_dir, asset, "pack")?;
             let kind = match asset.kind {
                 AssetKind::Runtime => StagedPackageAssetKind::Runtime,
                 AssetKind::Native => StagedPackageAssetKind::Native,
@@ -735,6 +801,7 @@ pub fn package_assets(crate_dir: &Path) -> Result<Vec<StagedPackageAsset>> {
                 owner: asset.owner.clone(),
                 logical_path: logical_path.clone(),
                 source,
+                contents,
                 kind,
                 rid: asset.rid.clone(),
             };
@@ -1075,6 +1142,144 @@ mod tests {
             rid: rid.map(str::to_owned),
             fallback: false,
         }
+    }
+
+    fn write_test_manifest(crate_dir: &Path, staged_path: String) {
+        let assets_dir = crate_dir.join(".cargo-dotnet-nuget-assets");
+        fs::create_dir_all(&assets_dir).unwrap();
+        let manifest = OwnedAssetsManifest {
+            version: manifest_version(),
+            roots: BTreeMap::from([(
+                "Example.Root".to_owned(),
+                OwnedRootAssets {
+                    assets: vec![OwnedAssetRecord {
+                        owner: "Example.Root/1.0.0".to_owned(),
+                        kind: AssetKind::Runtime,
+                        logical_path: "lib/net8.0/Escape.dll".to_owned(),
+                        rid: None,
+                        fallback: false,
+                        staged_path,
+                        sha256: "0".repeat(64),
+                    }],
+                },
+            )]),
+        };
+        write_manifest_atomic(&assets_dir.join(STAGING_MANIFEST), &manifest).unwrap();
+    }
+
+    #[test]
+    fn manifest_staged_paths_reject_parent_and_absolute_paths() {
+        let temp = unique_temp("unsafe-staged-paths");
+        let crate_dir = temp.join("consumer");
+        let outside = temp.join("outside.dll");
+        fs::create_dir_all(&crate_dir).unwrap();
+        fs::write(&outside, b"outside").unwrap();
+
+        write_test_manifest(&crate_dir, "../outside.dll".to_owned());
+        assert!(
+            package_assets(&crate_dir)
+                .unwrap_err()
+                .to_string()
+                .contains("unsafe")
+        );
+        assert!(
+            copy_staged_assets(&crate_dir, &temp.join("output"))
+                .unwrap_err()
+                .to_string()
+                .contains("unsafe")
+        );
+
+        write_test_manifest(&crate_dir, outside.to_string_lossy().into_owned());
+        assert!(
+            package_assets(&crate_dir)
+                .unwrap_err()
+                .to_string()
+                .contains("unsafe")
+        );
+
+        let assets_dir = crate_dir.join(".cargo-dotnet-nuget-assets");
+        let staged = assets_dir.join("owned/payload.dll");
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        fs::write(&staged, b"payload").unwrap();
+        write_test_manifest(&crate_dir, "owned/payload.dll".to_owned());
+        let manifest_path = assets_dir.join(STAGING_MANIFEST);
+        let mut manifest = read_manifest(&manifest_path).unwrap();
+        manifest.roots.get_mut("Example.Root").unwrap().assets[0].logical_path =
+            "lib/net8.0/../../escape.dll".to_owned();
+        write_manifest_atomic(&manifest_path, &manifest).unwrap();
+        assert!(
+            copy_staged_assets(&crate_dir, &temp.join("output"))
+                .unwrap_err()
+                .to_string()
+                .contains("unsafe")
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_staged_paths_reject_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let temp = unique_temp("symlink-staged-path");
+        let crate_dir = temp.join("consumer");
+        let assets_dir = crate_dir.join(".cargo-dotnet-nuget-assets");
+        let owned = assets_dir.join("owned");
+        let outside = temp.join("outside.dll");
+        fs::create_dir_all(&owned).unwrap();
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, owned.join("escape.dll")).unwrap();
+        write_test_manifest(&crate_dir, "owned/escape.dll".to_owned());
+
+        let package_error = package_assets(&crate_dir).unwrap_err().to_string();
+        assert!(package_error.contains("escapes the asset root"));
+        let copy_error = copy_staged_assets(&crate_dir, &temp.join("output"))
+            .unwrap_err()
+            .to_string();
+        assert!(copy_error.contains("escapes the asset root"));
+        let missing_error = missing_recorded_roots(
+            &crate_dir,
+            &[("Example.Root".to_owned(), "1.0.0".to_owned())],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing_error.contains("escapes the asset root"));
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaged_asset_snapshot_survives_a_post_validation_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let temp = unique_temp("package-snapshot-swap");
+        let crate_dir = temp.join("consumer");
+        let source_dir = temp.join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        let original = source_dir.join("Original.dll");
+        let outside = temp.join("Outside.dll");
+        fs::write(&original, b"owned-original").unwrap();
+        fs::write(&outside, b"outside-swapped").unwrap();
+        stage_assets(
+            &crate_dir,
+            "Example.Root",
+            &[asset(
+                "Example.Root/1.0.0",
+                AssetKind::Runtime,
+                "lib/net8.0/Original.dll",
+                original,
+                None,
+            )],
+        )
+        .unwrap();
+
+        let snapshot = package_assets(&crate_dir).unwrap().pop().unwrap();
+        fs::remove_file(&snapshot.source).unwrap();
+        symlink(&outside, &snapshot.source).unwrap();
+
+        assert_eq!(&*snapshot.contents, b"owned-original");
+        assert!(package_assets(&crate_dir).is_err());
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]

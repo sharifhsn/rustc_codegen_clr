@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use crate::artifact::{self, Artifact};
 use crate::cli::{AddNativeArgs, AddNativeFileArgs, AddNugetArgs, BuildArgs};
 use crate::context::Context;
-use crate::{buildstd, mode, overlays};
+use crate::{buildstd, overlays};
 
 use rust_dotnet_assets as nuget_assets;
 pub(crate) use rust_dotnet_assets::{StagedPackageAsset, StagedPackageAssetKind};
@@ -66,11 +66,13 @@ struct LocalNativeManifest {
 /// the crate's first `add-nuget` call. Last-write-wins per id, mirroring how re-running `add-nuget
 /// <id> <newer-version>` already overwrites that id's cached dll.
 fn record_dependency(crate_dir: &Path, id: &str, version: &str) -> Result<()> {
+    crate::path_safety::validate_nuget_id(id)?;
+    crate::path_safety::validate_nuget_version(version)?;
     let path = crate_dir.join(DEPS_MANIFEST_FILE);
     let mut manifest: DepsManifest = if path.is_file() {
         let text =
             fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        serde_json::from_str(&text).unwrap_or_default()
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
     } else {
         DepsManifest::default()
     };
@@ -136,22 +138,26 @@ fn local_native_assets(crate_dir: &Path) -> Result<Vec<StagedPackageAsset>> {
     let mut assets = Vec::new();
     for (library, rid_paths) in manifest.libraries {
         for (rid, relative) in rid_paths {
-            let source = crate_dir.join(&relative);
-            if !source.is_file() {
-                bail!(
-                    "vendored native file is missing: {} (recorded in {})",
-                    source.display(),
-                    manifest_path.display()
-                );
-            }
+            crate::path_safety::validate_path_component("native asset RID", &rid)?;
+            let source = crate::path_safety::canonical_file_within(crate_dir, Path::new(&relative))
+                .with_context(|| {
+                    format!(
+                        "invalid vendored native file {relative:?} recorded in {}",
+                        manifest_path.display()
+                    )
+                })?;
             let filename = source
                 .file_name()
                 .and_then(|name| name.to_str())
                 .context("vendored native filename is not UTF-8")?;
+            let contents = fs::read(&source)
+                .with_context(|| format!("snapshotting vendored native file {}", source.display()))?
+                .into();
             assets.push(StagedPackageAsset {
                 owner: format!("local:{library}"),
                 logical_path: format!("runtimes/{rid}/native/{filename}"),
                 source,
+                contents,
                 kind: StagedPackageAssetKind::Native,
                 rid: Some(rid),
             });
@@ -222,12 +228,10 @@ pub fn ensure_staged(ctx: &Context) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let home = mode::cargo_dotnet_home()?;
+    let cache_base = crate::context::cargo_dotnet_cache_home()?.join("nuget");
+    fs::create_dir_all(&cache_base)?;
     for (id, version) in &missing {
-        let cache_root = home
-            .join("nuget_cache")
-            .join(id.to_lowercase())
-            .join(version);
+        let cache_root = crate::path_safety::package_cache_dir(&cache_base, id, version)?;
         fs::create_dir_all(&cache_root)?;
         // Restore the current host RID by default, matching `add-native` and avoiding a native-only
         // package's non-RID target graph from staging every platform binary on a fresh clone.
@@ -313,16 +317,16 @@ pub fn run(args: &AddNugetArgs) -> Result<i32> {
         );
     }
 
-    let home = mode::cargo_dotnet_home()?;
-    let cache_root = home
-        .join("nuget_cache")
-        .join(args.id.to_lowercase())
-        .join(&args.version);
+    crate::path_safety::validate_nuget_id(&args.id)?;
+    crate::path_safety::validate_nuget_version(&args.version)?;
+    let cache_base = crate::context::cargo_dotnet_cache_home()?.join("nuget");
+    fs::create_dir_all(&cache_base)?;
+    let cache_root = crate::path_safety::package_cache_dir(&cache_base, &args.id, &args.version)?;
     // `--force` promises a real re-fetch, which matters for local/private-feed development where
     // the same exact version may be rebuilt before publication. Merely regenerating `out.rs` is
     // insufficient: NuGet otherwise reuses the old package bytes under RestorePackagesPath and
     // reflection silently sees a stale API surface.
-    clear_cache_if_forced(&cache_root, args.force)?;
+    clear_cache_if_forced(&cache_base, &cache_root, args.force)?;
     let dll_marker = cache_root.join(".dll_path");
     let bindings_marker = cache_root.join("out.rs");
 
@@ -458,13 +462,15 @@ pub fn run_native(args: &AddNativeArgs) -> Result<i32> {
     if !crate_dir.join("Cargo.toml").is_file() {
         bail!("add-native: not a crate dir: {}", crate_dir.display());
     }
-    let cache_root = mode::cargo_dotnet_home()?
-        .join("nuget_cache")
-        .join(args.id.to_lowercase())
-        .join(&args.version);
+    crate::path_safety::validate_nuget_id(&args.id)?;
+    crate::path_safety::validate_nuget_version(&args.version)?;
+    let cache_base = crate::context::cargo_dotnet_cache_home()?.join("nuget");
+    fs::create_dir_all(&cache_base)?;
+    let cache_root = crate::path_safety::package_cache_dir(&cache_base, &args.id, &args.version)?;
     fs::create_dir_all(&cache_root)?;
     let host = crate::host::HostFacts::detect();
     let rid = args.rid.as_deref().unwrap_or(host.host_rid);
+    crate::path_safety::validate_path_component("native asset RID", rid)?;
     let resolved = nuget_assets::restore(
         &args.id,
         &args.version,
@@ -535,6 +541,7 @@ pub fn run_native_file(args: &AddNativeFileArgs) -> Result<i32> {
         .rid
         .as_deref()
         .unwrap_or_else(|| crate::host::HostFacts::detect().host_rid);
+    crate::path_safety::validate_path_component("native asset RID", rid)?;
     let filename = source
         .file_name()
         .context("native library has no filename")?;
@@ -593,9 +600,9 @@ pub(crate) fn native_library_matches(logical: &str, path: &Path) -> bool {
         .is_some_and(|file| normalized(file).eq_ignore_ascii_case(normalized(logical)))
 }
 
-fn clear_cache_if_forced(cache_root: &Path, force: bool) -> Result<()> {
+fn clear_cache_if_forced(cache_base: &Path, cache_root: &Path, force: bool) -> Result<()> {
     if force && cache_root.exists() {
-        fs::remove_dir_all(cache_root).with_context(|| {
+        crate::path_safety::remove_dir_all_within(cache_base, cache_root).with_context(|| {
             format!(
                 "add-nuget: clearing forced package cache {}",
                 cache_root.display()
@@ -815,7 +822,7 @@ fn main() {{
 /// The absolute path to this repo's `mycorrhiza` crate, derived from `cargo-dotnet`'s own
 /// compile-time location (`tools/cargo-dotnet` -> `../../mycorrhiza`). Works regardless of the
 /// consumer crate's own location, since the ephemeral bindgen crate is generated OUTSIDE the
-/// consumer entirely (under `~/.cargo-dotnet/nuget_cache/`).
+/// consumer entirely (under the mutable cargo-dotnet cache home).
 fn mycorrhiza_path() -> Result<String> {
     let here = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mycorrhiza = here.join("..").join("..").join("mycorrhiza");
@@ -859,14 +866,15 @@ mod tests {
     #[test]
     fn force_removes_stale_package_bytes_but_normal_restore_preserves_cache() {
         let temp = tempfile::tempdir().unwrap();
-        let cache = temp.path().join("nuget-cache");
+        let base = temp.path().join("nuget-cache");
+        let cache = base.join("package/1.0.0");
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(cache.join("stale.dll"), b"old package").unwrap();
 
-        clear_cache_if_forced(&cache, false).unwrap();
+        clear_cache_if_forced(&base, &cache, false).unwrap();
         assert!(cache.join("stale.dll").is_file());
 
-        clear_cache_if_forced(&cache, true).unwrap();
+        clear_cache_if_forced(&base, &cache, true).unwrap();
         assert!(!cache.exists());
     }
 

@@ -11,13 +11,13 @@ The release installer downloads the matching SDK bundle, verifies it, and instal
 `cargo dotnet` command without changing the system Rust installation.
 
 ```bash
-curl -fsSL https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.1/install.sh | sh
+curl -fsSL https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.2/install.sh | sh
 ```
 
 On Windows x64, run this in PowerShell:
 
 ```powershell
-irm https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.1/install.ps1 | iex
+irm https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.2/install.ps1 | iex
 ```
 
 Then verify the installation:

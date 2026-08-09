@@ -18,6 +18,9 @@ pub struct StagedPackageAsset {
     pub owner: String,
     pub logical_path: String,
     pub source: std::path::PathBuf,
+    /// Immutable bytes captured while validating the owned staging record. Packaging consumes
+    /// this snapshot rather than reopening `source`, closing post-validation path/symlink swaps.
+    pub contents: std::sync::Arc<[u8]>,
     pub kind: StagedPackageAssetKind,
     pub rid: Option<String>,
 }

@@ -15,14 +15,31 @@ fail() {
 
 grep -Fq "tags: ['rust-dotnet-v*']" "$release" || fail "release trigger is not tag-only"
 ! grep -Fq 'workflow_dispatch:' "$release" || fail "manual branch dispatch could bypass tag identity"
-grep -Fq 'contents: write' "$release" || fail "release workflow cannot create a GitHub release"
+grep -Fq 'contents: read' "$release" || fail "release workflow does not default to read-only contents"
+grep -Fq '    permissions:' "$release" || fail "publish job does not declare scoped permissions"
+grep -Fq '      contents: write' "$release" || fail "publish job cannot create a GitHub release"
+[[ "$(rg -c 'bash feasibility/verify_release_tag.sh' "$release")" == 2 ]] \
+    || fail "signed tag is not verified before both build and publish"
+tag_gate="$repo/feasibility/verify_release_tag.sh"
+[[ -x "$tag_gate" ]] || fail "release tag verification helper is missing or not executable"
+grep -Fq 'git cat-file -t' "$tag_gate" || fail "release tag gate does not require an annotated tag"
+grep -Fq '$tag_ref^{commit}' "$tag_gate" || fail "release tag gate does not bind the tag to HEAD"
+grep -Fq '.verification.verified == true' "$tag_gate" \
+    || fail "release tag gate does not require GitHub signature verification"
 grep -Fq 'manifest_version' "$release" || fail "release tag is not matched to the CLI version"
+grep -Fq 'cargo fetch --locked' "$release" || fail "release does not fetch its locked graph before frozen builds"
+grep -Fq -- '--frozen' "$release" || fail "release builds are not frozen after the explicit fetch"
+fetch_line="$(rg -n 'cargo fetch --locked' "$release" | cut -d: -f1 | head -1)"
+frozen_line="$(rg -n -- '--frozen' "$release" | cut -d: -f1 | head -1)"
+((fetch_line < frozen_line)) || fail "release frozen build appears before the locked dependency fetch"
 
 for host in linux-x64 macos-arm64 windows-x64; do
     grep -Fq "host: $host" "$release" || fail "release matrix is missing $host"
     grep -Fq "$host" "$repo/install.sh" "$repo/install.ps1" \
         || fail "bootstrap installers are missing $host"
 done
+grep -Fq 'runner: macos-15' "$release" \
+    || fail "release macOS bundle is not built on the supported Apple-Silicon runner"
 
 grep -Fq 'cargo build --release --workspace' "$release" \
     || fail "release does not build the compiler workspace"
@@ -42,6 +59,10 @@ grep -Fq 'RELEASE_NOTES_${version}.md' "$release" \
     || fail "release notes are still hardcoded to 0.0.1"
 grep -Fq -- '--prerelease' "$release" || fail "0.x compiler release must remain a prerelease"
 grep -Fq 'install.sh install.ps1' "$release" || fail "release does not attach bootstrap installers"
+grep -Fq 'cargo-dotnet-$host.sha256' "$repo/install.sh" \
+    || fail "Unix installer does not verify a standalone driver checksum"
+grep -Fq 'cargo-dotnet-$HostId.exe.sha256' "$repo/install.ps1" \
+    || fail "PowerShell installer does not verify a standalone driver checksum"
 
 bad_actions="$(rg -n 'uses:[[:space:]]+[^[:space:]]+@' "$workflows" \
     | rg -v 'uses:[[:space:]]+[^[:space:]]+@[0-9a-f]{40}([[:space:]]+#.*)?$' || true)"
@@ -50,7 +71,7 @@ bad_actions="$(rg -n 'uses:[[:space:]]+[^[:space:]]+@' "$workflows" \
     fail "every workflow action must be pinned to a full commit SHA"
 }
 
-ruby -e 'require "yaml"; ARGV.each { |path| YAML.safe_load(File.read(path), aliases: true) }' \
+ruby -e 'require "yaml"; ARGV.each { |path| document = YAML.safe_load(File.read(path), aliases: true); raise "#{path}: default contents permission is not read" unless document.dig("permissions", "contents") == "read" }' \
     "$workflows"/*.yml
 
 echo '== release_workflow_acceptance done =='

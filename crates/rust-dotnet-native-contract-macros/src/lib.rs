@@ -10,6 +10,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
+use sha2::{Digest as _, Sha256};
 use syn::{
     Error, FnArg, ItemFn, LitStr, Pat, PatIdent, Result, ReturnType, Signature, Token, Type,
     TypePath, Visibility, parse::Parse, parse::ParseStream, parse_macro_input,
@@ -26,8 +27,9 @@ const INVALID_OWNED_RESULT_STATUS: i32 = -2_147_483_643;
 ///
 /// The function may use scalar values, `&str`, and scalar slices as inputs. Results may contain a
 /// scalar, `String`, `Vec<scalar>`, or `()`. The generated symbol is
-/// `rust_dotnet_native__<function-name>` unless overridden with
-/// `#[native_export(symbol = "...")]`; owned results also emit a matching private deallocator.
+/// `rust_dotnet_native__<function-name>__abi_<fingerprint>` unless its base is overridden with
+/// `#[native_export(symbol = "...")]`; the ABI fingerprint is always appended, and owned results
+/// also emit a matching private deallocator.
 #[proc_macro_attribute]
 pub fn native_export(attribute: TokenStream, item: TokenStream) -> TokenStream {
     match native_export_impl(attribute.into(), parse_macro_input!(item as ItemFn)) {
@@ -53,8 +55,9 @@ pub fn native_import(input: TokenStream) -> TokenStream {
 }
 
 fn native_export_impl(attribute: TokenStream2, function: ItemFn) -> Result<TokenStream2> {
-    let symbol = parse_export_symbol(attribute, &function.sig.ident)?;
     let contract = Contract::from_signature(&function.sig)?;
+    let base_symbol = parse_export_symbol(attribute, &function.sig.ident)?;
+    let symbol = contract_symbol(&base_symbol, &contract);
     let raw_name = format_ident!("__rust_dotnet_native_export_{}", function.sig.ident);
     let raw_free_name = format_ident!("__rust_dotnet_native_free_{}", function.sig.ident);
     let free_symbol = owned_free_symbol(&symbol);
@@ -93,9 +96,10 @@ fn native_import_impl(input: ImportInput) -> Result<TokenStream2> {
     let raw_module = format_ident!("__rust_dotnet_native_import_{}", function_name);
     let raw_function = format_ident!("call");
     let raw_free_function = format_ident!("free_owned");
-    let symbol = input
+    let base_symbol = input
         .symbol
         .unwrap_or_else(|| default_symbol(function_name));
+    let symbol = contract_symbol(&base_symbol, &contract);
     let free_symbol = owned_free_symbol(&symbol);
     let raw_parameters = contract.raw_parameters();
     let raw_arguments = contract.import_raw_arguments();
@@ -291,6 +295,32 @@ impl Contract {
         };
         let output = parse_result_output(result)?;
         Ok(Self { arguments, output })
+    }
+
+    fn abi_descriptor(&self) -> String {
+        let arguments = self
+            .arguments
+            .iter()
+            .map(|argument| match argument {
+                Argument::Scalar { ty, .. } => scalar_name(ty).to_string(),
+                Argument::Slice {
+                    element, mutable, ..
+                } => format!(
+                    "{}[{}]",
+                    if *mutable { "&mut" } else { "&" },
+                    scalar_name(element)
+                ),
+                Argument::Str { .. } => "&str".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let output = match &self.output {
+            Output::Scalar(ty) => scalar_name(ty).to_string(),
+            Output::String => "String".to_string(),
+            Output::Vec(element) => format!("Vec<{}>", scalar_name(element)),
+            Output::Unit => "()".to_string(),
+        };
+        format!("rust-dotnet-native-contract-v1({arguments})->Result<{output},i32>")
     }
 
     fn raw_parameters(&self) -> Vec<TokenStream2> {
@@ -813,11 +843,29 @@ fn is_scalar(ty: &Type) -> bool {
     )
 }
 
+fn scalar_name(ty: &Type) -> String {
+    let Type::Path(TypePath { qself: None, path }) = ty else {
+        unreachable!("scalar type was validated before ABI description")
+    };
+    path.get_ident()
+        .expect("scalar type was validated as one identifier")
+        .to_string()
+}
+
 fn default_symbol(function: &Ident) -> LitStr {
     LitStr::new(
         &format!("rust_dotnet_native__{function}"),
         Span::call_site(),
     )
+}
+
+fn contract_symbol(base: &LitStr, contract: &Contract) -> LitStr {
+    let digest = Sha256::digest(contract.abi_descriptor().as_bytes());
+    let fingerprint = digest[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    LitStr::new(&format!("{}__abi_{fingerprint}", base.value()), base.span())
 }
 
 fn owned_free_symbol(symbol: &LitStr) -> LitStr {
@@ -889,5 +937,30 @@ mod tests {
                 .to_string()
                 .contains("cannot be generic, async, or unsafe")
         );
+    }
+
+    #[test]
+    fn abi_fingerprint_matches_structure_and_rejects_drift() {
+        let exported: Signature =
+            parse_quote!(fn exported(values: &[i32]) -> Result<Vec<i64>, i32>);
+        let matching: Signature =
+            parse_quote!(fn imported(input: &[i32]) -> Result<std::vec::Vec<i64>, i32>);
+        let changed_input: Signature =
+            parse_quote!(fn imported(input: &[u32]) -> Result<Vec<i64>, i32>);
+        let changed_output: Signature =
+            parse_quote!(fn imported(input: &[i32]) -> Result<Vec<u64>, i32>);
+        let base = LitStr::new("shared_contract", Span::call_site());
+
+        let exported = contract_symbol(&base, &Contract::from_signature(&exported).unwrap());
+        let matching = contract_symbol(&base, &Contract::from_signature(&matching).unwrap());
+        let changed_input =
+            contract_symbol(&base, &Contract::from_signature(&changed_input).unwrap());
+        let changed_output =
+            contract_symbol(&base, &Contract::from_signature(&changed_output).unwrap());
+
+        assert_eq!(exported.value(), matching.value());
+        assert_ne!(exported.value(), changed_input.value());
+        assert_ne!(exported.value(), changed_output.value());
+        assert!(exported.value().starts_with("shared_contract__abi_"));
     }
 }

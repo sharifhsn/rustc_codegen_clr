@@ -1,6 +1,6 @@
 [package]
 name = "rust-dotnet-pinvoke"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Safe helpers and generated Rust-to-Rust contracts for native libraries"
@@ -8,7 +8,7 @@ repository = "https://github.com/FractalFir/rustc_codegen_clr"
 documentation = "https://docs.rs/rust-dotnet-pinvoke"
 
 [dependencies]
-rust-dotnet-native-contract-macros = { version = "0.0.1", path = "../rust-dotnet-native-contract-macros" }
+rust-dotnet-native-contract-macros = { version = "0.0.2", path = "../rust-dotnet-native-contract-macros" }
 
 [features]
 default = ["std"]

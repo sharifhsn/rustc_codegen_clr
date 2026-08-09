@@ -6,6 +6,14 @@ host="${RCL_RELEASE_HOST:?set RCL_RELEASE_HOST}"
 version="${RCL_RELEASE_VERSION:?set RCL_RELEASE_VERSION}"
 work="${RCL_RELEASE_WORK_DIR:-${RUNNER_TEMP:-/tmp}/rust-dotnet-release}"
 
+hash_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
 if [[ "${RUNNER_OS:-}" == Windows ]] && command -v cygpath >/dev/null 2>&1; then
     work="$(cygpath -u "$work")"
 fi
@@ -17,6 +25,7 @@ case "$host" in
         linker="target/release/linker"
         driver="target/release/cargo-dotnet"
         asset_driver="cargo-dotnet-linux-x64"
+        runtime_rid="linux-x64"
         ;;
     macos-arm64)
         backend="target/release/librustc_codegen_clr.dylib"
@@ -24,6 +33,7 @@ case "$host" in
         linker="target/release/linker"
         driver="target/release/cargo-dotnet"
         asset_driver="cargo-dotnet-macos-arm64"
+        runtime_rid="osx-arm64"
         ;;
     windows-x64)
         backend="target/release/rustc_codegen_clr.dll"
@@ -31,6 +41,7 @@ case "$host" in
         linker="target/release/linker.exe"
         driver="target/release/cargo-dotnet.exe"
         asset_driver="cargo-dotnet-windows-x64.exe"
+        runtime_rid="win-x64"
         ;;
     *)
         echo "unsupported release host: $host" >&2
@@ -65,11 +76,13 @@ cp -R crates/rust-dotnet-pinvoke "$home/crates/"
 cp -R crates/rust-dotnet-native-contract-macros "$home/crates/"
 cp -R mycorrhiza_interop_helpers "$home/"
 rm -rf "$home/mycorrhiza_interop_helpers/bin" "$home/mycorrhiza_interop_helpers/obj"
-printf 'schema = 1\ngit_rev = %s\nrelease_tag = rust-dotnet-v%s\nhost_rid = %s\ntoolchain = nightly-2026-06-17\n' \
-    "$(git rev-parse HEAD)" "$version" "$host" > "$home/VERSION"
+printf 'schema = 1\ngit_rev = %s\nrelease_tag = rust-dotnet-v%s\ncargo_dotnet_version = %s\nhost_rid = %s\ntoolchain = nightly-2026-06-17\n' \
+    "$(git rev-parse HEAD)" "$version" "$version" "$runtime_rid" > "$home/VERSION"
 
 cp "$driver" "$out/$asset_driver"
 chmod +x "$out/$asset_driver" 2>/dev/null || true
+printf '%s  %s\n' "$(hash_file "$out/$asset_driver")" "$asset_driver" \
+    > "$out/$asset_driver.sha256"
 bundle="$out/cargo-dotnet-sdk-$host-$version.zip"
 "$driver" bundle create --home "$home" --out "$bundle"
 "$driver" bundle verify "$bundle"

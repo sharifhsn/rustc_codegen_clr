@@ -13,7 +13,7 @@ known_limits = [
   "managed identity requires package metadata and custom assembly-name values are limited to the Cargo package name",
   "Result<managed handle, E> is rejected because the Rust enum would overlap GC-reference storage",
   "generated NuGet bindings preserve rank-1 SZ arrays and closed Task<T>, ValueTask<T>, and IAsyncEnumerable<T> returns with expressible element/result types; arbitrary constructed generics, multidimensional or non-SZ arrays, and unsupported value-type structs remain omitted",
-  "Windows x64 is supported by the 0.0.1 compiler SDK; MSBuild and NativeAOT coverage is narrower than Linux",
+  "Windows x64 is supported by the 0.0.2 compiler SDK; MSBuild and NativeAOT coverage is narrower than Linux",
   "MSBuild derives Cargo-local inputs automatically; non-Cargo external inputs require RustDotnetInput declarations",
 ]
 
@@ -283,7 +283,7 @@ evidence_kind = "private_registry"
 oracle = "authenticated_sparse_registry"
 comparison = "empty_private_cache_builds_without_ambient_mutation_or_secret_leak"
 completion_marker = "== private_registry_acceptance done =="
-required_artifacts = ["registry_events", "private_cargo_credentials", "rust_artifact_receipt", "token_safe_logs"]
+required_artifacts = ["registry_events", "private_cargo_credentials_proof", "rust_artifact_receipt", "token_safe_logs"]
 presubmit_runtimes = ["10"]
 presubmit_profiles = ["debug"]
 release_runtimes = ["10"]

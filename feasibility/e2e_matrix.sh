@@ -81,7 +81,7 @@ native_profile_args() {
 }
 
 mkdir -p "$log_dir" "$native_target_root" "$(dirname "$summary")"
-printf 'kind|dotnet|profile|case|dotnet_exit|native_exit|stdout_match|diagnostic_hits|marker|required|result\n' > "$summary"
+printf 'kind|dotnet|profile|case|dotnet_exit|native_exit|stdout_match|diagnostic_hits|marker|required|result|receipt\n' > "$summary"
 overall=0
 index=0
 selected_count=0
@@ -140,7 +140,7 @@ run_native_diff() {
     else
         row_result=FAIL
     fi
-    printf 'native_diff|%s|%s|%s|%d|%d|%s|%s|%s|no|%s\n' \
+    printf 'native_diff|%s|%s|%s|%d|%d|%s|%s|%s|no|%s|\n' \
         "$dotnet_version" "$profile" "$case_name" "$dotnet_exit" "$native_exit" \
         "$stdout_match" "$hits" "$marker" "$row_result" >> "$summary"
     [[ "$row_result" == PASS ]]
@@ -165,7 +165,7 @@ run_managed_selfcheck() {
     else
         row_result=FAIL
     fi
-    printf 'managed_selfcheck|%s|%s|%s|%d|na|na|%s|%s|yes|%s\n' \
+    printf 'managed_selfcheck|%s|%s|%s|%d|na|na|%s|%s|yes|%s|\n' \
         "$dotnet_version" "$profile" "$case_name" "$dotnet_exit" "$hits" "$marker" \
         "$row_result" >> "$summary"
     [[ "$row_result" == PASS ]]
@@ -175,7 +175,7 @@ run_managed_host() {
     local case_name="$1" profile="$2" clean_flag="$3"
     local case_dir="$repo/cargo_tests/$case_name"
     local prefix="$log_dir/$profile-$case_name"
-    local dotnet_exit hits marker dotnet_profile row_result
+    local dotnet_exit hits marker dotnet_profile row_result receipt rust_dll csharp_host
     dotnet_profile="$(profile_args "$profile")" || return 1
 
     RCL_ICE_LOG=1 CARGO_DOTNET_BACKEND=native \
@@ -201,9 +201,18 @@ run_managed_host() {
     else
         row_result=FAIL
     fi
-    printf 'managed_host|%s|%s|%s|%d|na|na|%s|%s|yes|%s\n' \
+    receipt=''
+    if [[ "$row_result" == PASS ]]; then
+        receipt="$(dirname "$summary")/${case_name}-${profile}.artifacts.json"
+        rust_dll="$case_dir/target/x86_64-unknown-dotnet/$profile/cd_export_ergonomics.dll"
+        csharp_host="$case_dir/csharp/bin/Debug/net${dotnet_version}.0/cd_export_ergonomics_cs.dll"
+        bash "$repo/feasibility/write_acceptance_artifact_receipt.sh" \
+            "$receipt" "$case_name" managed_host "$dotnet_version" "$profile" \
+            "rust_dll=$rust_dll" "csharp_host=$csharp_host"
+    fi
+    printf 'managed_host|%s|%s|%s|%d|na|na|%s|%s|yes|%s|%s\n' \
         "$dotnet_version" "$profile" "$case_name" "$dotnet_exit" "$hits" "$marker" \
-        "$row_result" >> "$summary"
+        "$row_result" "$(basename "$receipt")" >> "$summary"
     [[ "$row_result" == PASS ]]
 }
 

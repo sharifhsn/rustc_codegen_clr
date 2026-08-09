@@ -156,6 +156,8 @@ fn create(home: &Path, out: &Path) -> Result<()> {
         cargo_dotnet_version: env!("CARGO_PKG_VERSION").to_string(),
         files,
     };
+    validate_manifest(&manifest, true)?;
+    validate_version_identity(&manifest, &fs::read_to_string(home.join("VERSION"))?)?;
 
     if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         fs::create_dir_all(parent)
@@ -250,6 +252,7 @@ fn verify(path: &Path, require_host: bool) -> Result<BundleManifest> {
     }
     let mut seen = BTreeSet::new();
     let mut manifest_entries = 0usize;
+    let mut version_identity = None;
     for index in 0..zip.len() {
         let mut entry = zip.by_index(index)?;
         let name = entry.name().to_string();
@@ -278,6 +281,10 @@ fn verify(path: &Path, require_host: bool) -> Result<BundleManifest> {
         if hex_sha256(&bytes) != expected_file.sha256 {
             bail!("bundle SHA-256 mismatch for {relative}");
         }
+        if relative == "VERSION" {
+            version_identity =
+                Some(String::from_utf8(bytes).context("bundle VERSION is not valid UTF-8")?);
+        }
     }
     if manifest_entries != 1 {
         bail!("bundle must contain exactly one manifest (found {manifest_entries})");
@@ -290,10 +297,16 @@ fn verify(path: &Path, require_host: bool) -> Result<BundleManifest> {
             .unwrap_or("<unknown>");
         bail!("manifest payload is missing from archive: {missing}");
     }
+    validate_version_identity(
+        &manifest,
+        version_identity
+            .as_deref()
+            .context("bundle payload is missing VERSION identity")?,
+    )?;
     Ok(manifest)
 }
 
-fn validate_manifest(manifest: &BundleManifest, require_host: bool) -> Result<()> {
+fn validate_manifest(manifest: &BundleManifest, require_running_cli: bool) -> Result<()> {
     if manifest.schema != SCHEMA {
         bail!(
             "unsupported cargo-dotnet bundle schema {} (expected {SCHEMA})",
@@ -312,13 +325,29 @@ fn validate_manifest(manifest: &BundleManifest, require_host: bool) -> Result<()
     {
         bail!("bundle manifest is missing host/toolchain/front-end identity");
     }
+    let expected_rid =
+        expected_host_rid(&manifest.host_os, &manifest.host_arch).ok_or_else(|| {
+            anyhow::anyhow!(
+                "bundle names an unsupported host tuple: {}-{}",
+                manifest.host_os,
+                manifest.host_arch
+            )
+        })?;
+    if manifest.host_rid != expected_rid {
+        bail!(
+            "bundle RID {} does not match host tuple {}-{} (expected {expected_rid})",
+            manifest.host_rid,
+            manifest.host_os,
+            manifest.host_arch
+        );
+    }
     for file in &manifest.files {
         validate_relative(&file.path)?;
         if file.sha256.len() != 64 || !file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             bail!("invalid SHA-256 in bundle manifest for {}", file.path);
         }
     }
-    if require_host
+    if require_running_cli
         && (manifest.host_os != std::env::consts::OS
             || manifest.host_arch != std::env::consts::ARCH)
     {
@@ -329,6 +358,86 @@ fn validate_manifest(manifest: &BundleManifest, require_host: bool) -> Result<()
             std::env::consts::OS,
             std::env::consts::ARCH
         );
+    }
+    if require_running_cli {
+        if manifest.cargo_dotnet_version != env!("CARGO_PKG_VERSION") {
+            bail!(
+                "bundle cargo-dotnet version {} does not match running CLI {}",
+                manifest.cargo_dotnet_version,
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+        if manifest.toolchain != crate::mode::DEFAULT_TOOLCHAIN {
+            bail!(
+                "bundle toolchain {} does not match running CLI toolchain {}",
+                manifest.toolchain,
+                crate::mode::DEFAULT_TOOLCHAIN
+            );
+        }
+        let cli_path = if cfg!(windows) {
+            "bin/cargo-dotnet.exe"
+        } else {
+            "bin/cargo-dotnet"
+        };
+        let bundled_cli = manifest
+            .files
+            .iter()
+            .find(|file| file.path == cli_path)
+            .context("bundle manifest does not contain its cargo-dotnet front-end")?;
+        let running_cli = std::env::current_exe().context("locating running cargo-dotnet")?;
+        let running_hash = hex_sha256(&fs::read(&running_cli)?);
+        if bundled_cli.sha256 != running_hash {
+            bail!(
+                "bundle front-end does not match the running cargo-dotnet executable: {}",
+                running_cli.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn expected_host_rid(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("linux", "x86_64") => Some("linux-x64"),
+        ("macos", "aarch64") => Some("osx-arm64"),
+        ("windows", "x86_64") => Some("win-x64"),
+        _ => None,
+    }
+}
+
+fn version_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines().find_map(|line| {
+        let (candidate, value) = line.split_once('=')?;
+        (candidate.trim() == key).then(|| value.trim().trim_matches('"'))
+    })
+}
+
+fn validate_version_identity(manifest: &BundleManifest, text: &str) -> Result<()> {
+    let schema = version_value(text, "schema").context("VERSION is missing schema")?;
+    let release_tag =
+        version_value(text, "release_tag").context("VERSION is missing release_tag")?;
+    let recorded_cli_version = version_value(text, "cargo_dotnet_version");
+    let host_rid = version_value(text, "host_rid").context("VERSION is missing host_rid")?;
+    let toolchain = version_value(text, "toolchain").context("VERSION is missing toolchain")?;
+    let expected_release_tag = format!("rust-dotnet-v{}", manifest.cargo_dotnet_version);
+    let version_matches = recorded_cli_version
+        .map(|version| version == manifest.cargo_dotnet_version)
+        // Backward-compatible verification for immutable 0.0.1 bundles, whose VERSION file
+        // predates the explicit cargo_dotnet_version field but has an exact release tag.
+        .unwrap_or(release_tag == expected_release_tag);
+    let host_rid_matches = host_rid == manifest.host_rid
+        || (manifest.cargo_dotnet_version == "0.0.1"
+            && matches!(
+                (manifest.host_rid.as_str(), host_rid),
+                ("osx-arm64", "macos-arm64") | ("win-x64", "windows-x64")
+            ));
+    if schema != "1"
+        || !version_matches
+        || (release_tag != "untagged" && release_tag != expected_release_tag)
+        || !host_rid_matches
+        || toolchain != manifest.toolchain
+    {
+        bail!("bundle VERSION identity does not match its manifest");
     }
     Ok(())
 }
@@ -347,6 +456,23 @@ fn install(archive: &Path, home: &Path, force: bool, install_cli: bool) -> Resul
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
+    crate::path_safety::require_owned_or_empty_sdk_home(home)?;
+    let planned_home = crate::path_safety::planned_absolute(home)?;
+    let cargo_home = cargo_home_path()?;
+    fs::create_dir_all(&cargo_home)?;
+    let mut protected = vec![
+        ("bundle archive", fs::canonicalize(archive)?),
+        ("working directory", std::env::current_dir()?),
+        (
+            "running cargo-dotnet",
+            std::env::current_exe().context("locating running cargo-dotnet")?,
+        ),
+        ("Cargo home", cargo_home),
+    ];
+    if let crate::mode::Mode::Dev { repo_root } = crate::mode::detect()? {
+        protected.push(("repository", repo_root));
+    }
+    crate::path_safety::reject_ancestor_of(&planned_home, protected)?;
     let temp = tempfile::Builder::new()
         .prefix(".cargo-dotnet-restore-")
         .tempdir_in(parent)?;
@@ -357,27 +483,11 @@ fn install(archive: &Path, home: &Path, force: bool, install_cli: bool) -> Resul
         serde_json::to_vec_pretty(&manifest)?,
     )?;
 
-    let backup = parent.join(format!(".cargo-dotnet-backup-{}", std::process::id()));
-    if backup.exists() {
-        fs::remove_dir_all(&backup)?;
-    }
-    if home.exists() {
-        fs::rename(home, &backup).context("moving previous install home aside")?;
-    }
     let staged = temp.keep();
-    if let Err(error) = fs::rename(&staged, home) {
-        if backup.exists() {
-            let _ = fs::rename(&backup, home);
-        }
-        return Err(error).context("activating restored install home");
-    }
-    if backup.exists() {
-        fs::remove_dir_all(&backup)?;
-    }
-
-    if install_cli {
-        install_front_end(home)?;
-    }
+    let front_end = install_cli
+        .then(|| stage_front_end(&staged, home))
+        .transpose()?;
+    activate_install(&staged, home, front_end, || Ok(()))?;
     println!(
         "installed verified cargo-dotnet bundle -> {} (toolchain {})",
         home.display(),
@@ -414,12 +524,68 @@ fn extract_verified(archive: &Path, destination: &Path, manifest: &BundleManifes
 }
 
 fn verify_tree(root: &Path, manifest: &BundleManifest) -> Result<()> {
+    let expected = manifest
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect::<BTreeMap<_, _>>();
+    let mut allowed_dirs = BTreeSet::new();
+    for file in &manifest.files {
+        let mut parent = Path::new(&file.path).parent();
+        while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
+            allowed_dirs.insert(portable_path(path)?);
+            parent = path.parent();
+        }
+    }
+    verify_tree_entries(root, root, &expected, &allowed_dirs)?;
     for file in &manifest.files {
         let path = root.join(&file.path);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("reading restored bundle metadata: {}", path.display()))?;
+        if !metadata.is_file() || is_executable(&path, &metadata) != file.executable {
+            bail!(
+                "restored bundle file metadata failed verification: {}",
+                file.path
+            );
+        }
         let bytes = fs::read(&path)
             .with_context(|| format!("restored bundle file is missing: {}", path.display()))?;
         if bytes.len() as u64 != file.bytes || hex_sha256(&bytes) != file.sha256 {
             bail!("restored bundle file failed verification: {}", file.path);
+        }
+    }
+    Ok(())
+}
+
+fn verify_tree_entries<'a>(
+    root: &Path,
+    directory: &Path,
+    expected: &BTreeMap<&'a str, &'a BundleFile>,
+    allowed_dirs: &BTreeSet<String>,
+) -> Result<()> {
+    let mut entries = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let relative = portable_path(
+            path.strip_prefix(root)
+                .context("bundle path escaped root")?,
+        )?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            bail!("installed bundle contains a symlink: {relative}");
+        }
+        if file_type.is_dir() {
+            if !allowed_dirs.contains(&relative) {
+                bail!("installed bundle contains an undeclared directory: {relative}");
+            }
+            verify_tree_entries(root, &path, expected, allowed_dirs)?;
+        } else if file_type.is_file() {
+            if relative != INSTALL_LOCK && !expected.contains_key(relative.as_str()) {
+                bail!("installed bundle contains an undeclared file: {relative}");
+            }
+        } else {
+            bail!("installed bundle contains an unsupported file type: {relative}");
         }
     }
     Ok(())
@@ -438,35 +604,212 @@ pub(crate) fn verify_installed_if_locked(home: &Path) -> Result<bool> {
     )
     .context("parsing installed bundle lock")?;
     validate_manifest(&manifest, true)?;
+    validate_version_identity(&manifest, &fs::read_to_string(home.join("VERSION"))?)?;
     verify_tree(home, &manifest).context("installed cargo-dotnet bundle integrity check failed")?;
     Ok(true)
 }
 
-fn install_front_end(home: &Path) -> Result<()> {
+struct StagedFrontEnd {
+    temporary: tempfile::TempPath,
+    destination: PathBuf,
+}
+
+fn cargo_home_path() -> Result<PathBuf> {
+    Ok(std::env::var_os("CARGO_HOME").map(PathBuf::from).unwrap_or(
+        crate::host::home_dir()
+            .context("locating home for CARGO_HOME")?
+            .join(".cargo"),
+    ))
+}
+
+fn stage_front_end(staged_home: &Path, install_home: &Path) -> Result<StagedFrontEnd> {
     let name = if cfg!(windows) {
         "cargo-dotnet.exe"
     } else {
         "cargo-dotnet"
     };
-    let source = home.join("bin").join(name);
-    let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from).unwrap_or(
-        crate::host::home_dir()
-            .context("locating home for CARGO_HOME")?
-            .join(".cargo"),
-    );
+    let source = staged_home.join("bin").join(name);
+    let cargo_home = cargo_home_path()?;
     let destination = cargo_home.join("bin").join(name);
-    fs::create_dir_all(destination.parent().expect("cargo bin has a parent"))?;
-    let temporary = destination.with_extension("tmp");
+    let destination_parent = destination.parent().expect("cargo bin has a parent");
+    fs::create_dir_all(destination_parent)?;
+    let canonical_destination_parent = fs::canonicalize(destination_parent)?;
+    let install_parent = install_home
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_install_home = if install_home.exists() {
+        fs::canonicalize(install_home)?
+    } else {
+        fs::canonicalize(install_parent)?.join(
+            install_home
+                .file_name()
+                .context("install home has no final component")?,
+        )
+    };
+    if canonical_destination_parent.starts_with(&canonical_install_home) {
+        bail!("CARGO_HOME must not be located inside the immutable SDK install home");
+    }
+    let temporary = tempfile::Builder::new()
+        .prefix(".cargo-dotnet-cli-stage-")
+        .tempfile_in(destination_parent)?
+        .into_temp_path();
     fs::copy(&source, &temporary)?;
     set_executable(&temporary, true)?;
-    if cfg!(windows) && destination.exists() {
-        fs::remove_file(&destination)?;
+    Ok(StagedFrontEnd {
+        temporary,
+        destination,
+    })
+}
+
+fn activate_install<F>(
+    staged_home: &Path,
+    home: &Path,
+    front_end: Option<StagedFrontEnd>,
+    before_front_end: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    activate_install_with_hook(staged_home, home, front_end, || Ok(()), before_front_end)
+}
+
+fn activate_install_with_hook<F, G>(
+    staged_home: &Path,
+    home: &Path,
+    front_end: Option<StagedFrontEnd>,
+    before_backup: F,
+    before_front_end: G,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+    G: FnOnce() -> Result<()>,
+{
+    crate::path_safety::require_owned_or_empty_sdk_home(home)?;
+    let parent = home
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let home_backup_area = tempfile::Builder::new()
+        .prefix(".cargo-dotnet-home-backup-")
+        .tempdir_in(parent)?;
+    let home_backup = home_backup_area.path().join("previous");
+    let home_discard = home_backup_area.path().join("failed-new");
+    let cli_backup_area = front_end
+        .as_ref()
+        .map(|front_end| {
+            tempfile::Builder::new()
+                .prefix(".cargo-dotnet-cli-backup-")
+                .tempdir_in(
+                    front_end
+                        .destination
+                        .parent()
+                        .expect("cargo-dotnet destination has a parent"),
+                )
+        })
+        .transpose()?;
+    let cli_backup = cli_backup_area
+        .as_ref()
+        .map(|area| area.path().join("previous"));
+    let cli_discard = cli_backup_area
+        .as_ref()
+        .map(|area| area.path().join("failed-new"));
+
+    before_backup()?;
+    let had_home = home.exists();
+    let had_cli = front_end
+        .as_ref()
+        .is_some_and(|front_end| front_end.destination.exists());
+    let mut home_backed_up = false;
+    let mut cli_backed_up = false;
+    let mut home_promoted = false;
+    let mut cli_promoted = false;
+
+    let transaction = (|| -> Result<()> {
+        if had_cli {
+            let front_end = front_end.as_ref().expect("had_cli implies a front-end");
+            fs::rename(&front_end.destination, cli_backup.as_ref().unwrap())
+                .context("moving previous cargo-dotnet front-end aside")?;
+            cli_backed_up = true;
+            let metadata = fs::symlink_metadata(cli_backup.as_ref().unwrap())?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("previous cargo-dotnet front-end is not a regular file");
+            }
+        }
+        if had_home {
+            fs::rename(home, &home_backup).context("moving previous install home aside")?;
+            home_backed_up = true;
+            crate::path_safety::require_owned_or_empty_sdk_home(&home_backup)?;
+        }
+        fs::rename(staged_home, home).context("activating restored install home")?;
+        home_promoted = true;
+        before_front_end()?;
+        if let Some(front_end) = &front_end {
+            fs::rename(&front_end.temporary, &front_end.destination)
+                .context("activating cargo-dotnet front-end")?;
+            cli_promoted = true;
+            if fs::read(
+                home.join("bin").join(
+                    front_end
+                        .destination
+                        .file_name()
+                        .context("front-end destination has no filename")?,
+                ),
+            )? != fs::read(&front_end.destination)?
+            {
+                bail!("installed front-end bytes do not match the activated SDK bundle");
+            }
+        }
+        if !verify_installed_if_locked(home)? {
+            bail!("activated SDK home has no bundle integrity lock");
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = transaction {
+        let mut rollback_errors = Vec::new();
+        if cli_promoted
+            && let Some(front_end) = &front_end
+            && let Some(discard) = &cli_discard
+            && let Err(rollback) = fs::rename(&front_end.destination, discard)
+        {
+            rollback_errors.push(format!("remove failed front-end: {rollback}"));
+        }
+        if home_promoted && let Err(rollback) = fs::rename(home, &home_discard) {
+            rollback_errors.push(format!("remove failed SDK home: {rollback}"));
+        }
+        if home_backed_up && let Err(rollback) = fs::rename(&home_backup, home) {
+            rollback_errors.push(format!("restore previous SDK home: {rollback}"));
+        }
+        if cli_backed_up
+            && let Some(front_end) = &front_end
+            && let Some(backup) = &cli_backup
+            && let Err(rollback) = fs::rename(backup, &front_end.destination)
+        {
+            rollback_errors.push(format!("restore previous front-end: {rollback}"));
+        }
+        if rollback_errors.is_empty() {
+            return Err(error).context("SDK/front-end activation rolled back");
+        }
+        let home_recovery = home_backup_area.keep();
+        let cli_recovery = cli_backup_area.map(tempfile::TempDir::keep);
+        bail!(
+            "SDK/front-end activation failed ({error:#}); rollback also failed: {}; recoverable backups: {}{}",
+            rollback_errors.join("; "),
+            home_recovery.display(),
+            cli_recovery
+                .as_ref()
+                .map(|path| format!(", {}", path.display()))
+                .unwrap_or_default()
+        );
     }
-    fs::rename(&temporary, &destination)?;
-    println!(
-        "installed cargo-dotnet front-end -> {}",
-        destination.display()
-    );
+
+    if let Some(front_end) = &front_end {
+        println!(
+            "installed cargo-dotnet front-end -> {}",
+            front_end.destination.display()
+        );
+    }
     Ok(())
 }
 
@@ -570,7 +913,13 @@ mod tests {
         }
         fs::write(
             home.join("VERSION"),
-            "schema = 1\ntoolchain = nightly-2026-06-17\n",
+            format!(
+                "schema = 1\nrelease_tag = rust-dotnet-v{}\ncargo_dotnet_version = {}\nhost_rid = {}\ntoolchain = {}\n",
+                env!("CARGO_PKG_VERSION"),
+                env!("CARGO_PKG_VERSION"),
+                crate::host::HostFacts::detect().host_rid,
+                crate::mode::DEFAULT_TOOLCHAIN
+            ),
         )
         .unwrap();
         fs::write(home.join("bin/linker"), b"linker").unwrap();
@@ -603,6 +952,10 @@ mod tests {
             b"pal"
         );
         assert!(verify_installed_if_locked(&restored).unwrap());
+        fs::write(restored.join("dotnet_pal/injected.rs"), b"fn main() {}").unwrap();
+        assert!(verify_installed_if_locked(&restored).is_err());
+        fs::remove_file(restored.join("dotnet_pal/injected.rs")).unwrap();
+        assert!(verify_installed_if_locked(&restored).unwrap());
         fs::write(restored.join("dotnet_pal/pal.rs"), b"tampered").unwrap();
         assert!(verify_installed_if_locked(&restored).is_err());
         assert!(install(&archive, &restored, false, false).is_err());
@@ -615,5 +968,173 @@ mod tests {
         for path in ["", "../escape", "/absolute", "a/../b", "a\\b"] {
             assert!(validate_relative(path).is_err(), "accepted {path:?}");
         }
+    }
+
+    #[test]
+    fn manifest_identity_rejects_cross_bound_host_version_and_toolchain() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = fake_home(temp.path());
+        let archive = temp.path().join("sdk.zip");
+        create(&home, &archive).unwrap();
+        let manifest = verify(&archive, false).unwrap();
+
+        let mut wrong_rid = BundleManifest {
+            host_rid: "wrong-rid".into(),
+            ..manifest
+        };
+        assert!(validate_manifest(&wrong_rid, false).is_err());
+        wrong_rid.host_rid = expected_host_rid(&wrong_rid.host_os, &wrong_rid.host_arch)
+            .unwrap()
+            .into();
+        wrong_rid.cargo_dotnet_version = "9.9.9".into();
+        assert!(validate_manifest(&wrong_rid, true).is_err());
+        wrong_rid.cargo_dotnet_version = env!("CARGO_PKG_VERSION").into();
+        wrong_rid.toolchain = "nightly-cross-bound".into();
+        assert!(validate_manifest(&wrong_rid, true).is_err());
+        wrong_rid.toolchain = crate::mode::DEFAULT_TOOLCHAIN.into();
+        let cli_path = if cfg!(windows) {
+            "bin/cargo-dotnet.exe"
+        } else {
+            "bin/cargo-dotnet"
+        };
+        wrong_rid
+            .files
+            .iter_mut()
+            .find(|file| file.path == cli_path)
+            .unwrap()
+            .sha256 = "0".repeat(64);
+        let cli_error = validate_manifest(&wrong_rid, true).unwrap_err();
+        assert!(cli_error.to_string().contains("running cargo-dotnet"));
+        assert!(
+            validate_version_identity(
+                &wrong_rid,
+                "schema = 1\nrelease_tag = rust-dotnet-v0.0.2\nhost_rid = wrong\ntoolchain = wrong\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_release_rid_aliases_are_scoped_to_exactly_0_0_1() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = fake_home(temp.path());
+        let archive = temp.path().join("sdk.zip");
+        create(&home, &archive).unwrap();
+        let mut manifest = verify(&archive, false).unwrap();
+        manifest.cargo_dotnet_version = "0.0.1".into();
+
+        for (manifest_rid, legacy_rid) in [("osx-arm64", "macos-arm64"), ("win-x64", "windows-x64")]
+        {
+            manifest.host_rid = manifest_rid.into();
+            let legacy = format!(
+                "schema = 1\nrelease_tag = rust-dotnet-v0.0.1\nhost_rid = {legacy_rid}\ntoolchain = {}\n",
+                manifest.toolchain
+            );
+            validate_version_identity(&manifest, &legacy).unwrap();
+
+            manifest.cargo_dotnet_version = "0.0.2".into();
+            let current = legacy.replace("rust-dotnet-v0.0.1", "rust-dotnet-v0.0.2");
+            assert!(validate_version_identity(&manifest, &current).is_err());
+            manifest.cargo_dotnet_version = "0.0.1".into();
+        }
+    }
+
+    #[test]
+    fn sdk_and_front_end_activation_roll_back_together() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("active-sdk");
+        let staged = temp.path().join("staged-sdk");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(home.join("marker"), b"old-sdk").unwrap();
+        fs::write(
+            home.join("VERSION"),
+            "schema = 1\nrelease_tag = untagged\nhost_rid = test\ntoolchain = nightly\n",
+        )
+        .unwrap();
+        fs::write(staged.join("marker"), b"new-sdk").unwrap();
+
+        let cli_dir = temp.path().join("cargo/bin");
+        fs::create_dir_all(&cli_dir).unwrap();
+        let destination = cli_dir.join(if cfg!(windows) {
+            "cargo-dotnet.exe"
+        } else {
+            "cargo-dotnet"
+        });
+        fs::write(&destination, b"old-cli").unwrap();
+        let temporary = tempfile::Builder::new()
+            .prefix(".cargo-dotnet-cli-stage-")
+            .tempfile_in(&cli_dir)
+            .unwrap()
+            .into_temp_path();
+        fs::write(&temporary, b"new-cli").unwrap();
+
+        let error = activate_install(
+            &staged,
+            &home,
+            Some(StagedFrontEnd {
+                temporary,
+                destination: destination.clone(),
+            }),
+            || bail!("injected activation failure"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("rolled back"), "{error:#}");
+        assert_eq!(fs::read(home.join("marker")).unwrap(), b"old-sdk");
+        assert_eq!(fs::read(destination).unwrap(), b"old-cli");
+    }
+
+    #[test]
+    fn no_cli_bundle_activation_never_replaces_an_unowned_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("unrelated-home");
+        let staged = temp.path().join("staged-sdk");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(home.join("do-not-delete"), b"unrelated").unwrap();
+        fs::write(staged.join("marker"), b"new-sdk").unwrap();
+
+        let error = activate_install(&staged, &home, None, || Ok(())).unwrap_err();
+
+        assert!(error.to_string().contains("ownership marker"), "{error:#}");
+        assert_eq!(fs::read(home.join("do-not-delete")).unwrap(), b"unrelated");
+        assert_eq!(fs::read(staged.join("marker")).unwrap(), b"new-sdk");
+    }
+
+    #[test]
+    fn bundle_revalidates_the_exact_home_moved_to_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("active-home");
+        let staged = temp.path().join("staged-sdk");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(
+            home.join("VERSION"),
+            "schema = 1\nrelease_tag = untagged\nhost_rid = test\ntoolchain = nightly\n",
+        )
+        .unwrap();
+        fs::write(staged.join("marker"), b"new-sdk").unwrap();
+        let swapped_home = home.clone();
+
+        let error = activate_install_with_hook(
+            &staged,
+            &home,
+            None,
+            move || {
+                fs::remove_dir_all(&swapped_home)?;
+                fs::create_dir(&swapped_home)?;
+                fs::write(swapped_home.join("do-not-delete"), b"swapped-unrelated")?;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("rolled back"), "{error:#}");
+        assert_eq!(
+            fs::read(home.join("do-not-delete")).unwrap(),
+            b"swapped-unrelated"
+        );
+        assert_eq!(fs::read(staged.join("marker")).unwrap(), b"new-sdk");
     }
 }

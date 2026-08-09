@@ -171,4 +171,14 @@ dotnet "$work/rid-package-consumer/bin/Debug/$tfm/$rid/Consumer.dll" \
     >> "$log_dir/rid-package-consumer.log" 2>&1
 grep -qx '42' "$log_dir/rid-package-consumer.log"
 
+# Preserve the exact files named by the capability manifest after this script's temporary work
+# directory is removed. The result recorder hashes these paths into its structured receipt.
+cp "$first" "$log_dir/evidence.nupkg"
+cp "$first.sha256" "$log_dir/evidence.nupkg.sha256"
+cp "$work/consumer/rustlib/.cargo-dotnet-nuget-assets/manifest.json" \
+    "$log_dir/evidence-project-assets.json"
+cp "$work/consumer/rustlib/src/nuget/newtonsoft_json.rs" \
+    "$log_dir/evidence-bindings.rs"
+cp "$assets/owned/rid-fixture/$runtime_path" "$log_dir/evidence-runtime.dll"
+
 echo '== nuget_acceptance done =='

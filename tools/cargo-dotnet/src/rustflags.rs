@@ -1,5 +1,6 @@
 //! RUSTFLAGS assembly. Ports `_cargo_dotnet_core.sh`.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 /// The RUSTFLAGS the backend needs:
@@ -34,7 +35,7 @@ pub fn assemble(
     dotnet_version: &str,
     source_remaps: &[(&Path, &str)],
     source_link_url: Option<&str>,
-) -> String {
+) -> Vec<OsString> {
     // `-Z inline-mir-hint-threshold=500`: raise rustc's MIR-inliner budget for `#[inline]`
     // items (iterator combinators, closures, small wrappers — the zero-cost-abstraction
     // surface). rustc inlines these conservatively because the native pipeline lets LLVM
@@ -44,55 +45,73 @@ pub fn assemble(
     // real borrow info, battle-tested) gives RyuJIT the same flat loop LLVM gets for native.
     // Inert in debug (mir-opt-level 1 disables the MIR inliner); non-`#[inline]` fns keep the
     // default `threshold` (50).
-    let base = format!(
-        "-Z codegen-backend={dylib} -C linker={linker} -C link-args=--cargo-support \
-         -Z inline-mir-hint-threshold=500",
-        dylib = backend_dylib.display(),
-        linker = linker.display(),
-    );
-    let remaps = source_remaps
-        .iter()
-        .map(|(source, logical)| {
-            format!(
-                " --remap-path-prefix={}={logical}",
-                source.to_string_lossy()
-            )
-        })
-        .collect::<String>();
-    let base = format!("{base}{remaps}");
+    let mut flags = vec![
+        OsString::from("-Z"),
+        prefixed_path("codegen-backend=", backend_dylib),
+        OsString::from("-C"),
+        prefixed_path("linker=", linker),
+        OsString::from("-C"),
+        OsString::from("link-args=--cargo-support"),
+        OsString::from("-Z"),
+        OsString::from("inline-mir-hint-threshold=500"),
+    ];
+    for (source, logical) in source_remaps {
+        let mut remap = OsString::from("--remap-path-prefix=");
+        remap.push(source.as_os_str());
+        remap.push("=");
+        remap.push(logical);
+        flags.push(remap);
+    }
     let dotnet_cfg = dotnet_version
         .chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
         .collect::<String>();
-    let base = format!(
-        "{base} --cfg cd_dotnet_{dotnet_cfg} --check-cfg=cfg(cd_dotnet_{dotnet_cfg}) \
-         --check-cfg=cfg(cd_dotnet_unity_netstandard2_1)"
-    );
-    let base = match source_link_url {
-        Some(url) => {
-            let key = fnv1a(url.as_bytes());
-            format!(
-                "{base} --cfg cd_sourcelink_{key:016x} --check-cfg=cfg(cd_sourcelink_{key:016x})"
-            )
-        }
-        None => base,
-    };
-    let mut base = base;
+    push_cfg(&mut flags, &format!("cd_dotnet_{dotnet_cfg}"));
+    flags.push(OsString::from(
+        "--check-cfg=cfg(cd_dotnet_unity_netstandard2_1)",
+    ));
+    if let Some(url) = source_link_url {
+        let key = fnv1a(url.as_bytes());
+        push_cfg(&mut flags, &format!("cd_sourcelink_{key:016x}"));
+    }
     if let Some(key) = producer_content_key(backend_dylib) {
-        base = format!("{base} --cfg cd_backend_{key} --check-cfg=cfg(cd_backend_{key})");
+        push_cfg(&mut flags, &format!("cd_backend_{key}"));
     }
     if let Some(key) = producer_content_key(linker) {
-        base = format!("{base} --cfg cd_linker_{key} --check-cfg=cfg(cd_linker_{key})");
+        push_cfg(&mut flags, &format!("cd_linker_{key}"));
     }
     if let Some(key) = sdk_codegen_content_key(sdk_crates_root) {
-        base = format!("{base} --cfg cd_sdk_{key} --check-cfg=cfg(cd_sdk_{key})");
+        push_cfg(&mut flags, &format!("cd_sdk_{key}"));
     }
-    base
+    flags
+}
+
+fn prefixed_path(prefix: &str, path: &Path) -> OsString {
+    let mut value = OsString::from(prefix);
+    value.push(path.as_os_str());
+    value
+}
+
+fn push_cfg(flags: &mut Vec<OsString>, name: &str) {
+    flags.push(OsString::from("--cfg"));
+    flags.push(OsString::from(name));
+    flags.push(OsString::from(format!("--check-cfg=cfg({name})")));
+}
+
+pub fn encode(flags: &[OsString]) -> OsString {
+    let mut encoded = OsString::new();
+    for (index, flag) in flags.iter().enumerate() {
+        if index != 0 {
+            encoded.push(OsStr::new("\u{1f}"));
+        }
+        encoded.push(flag);
+    }
+    encoded
 }
 
 #[cfg(test)]
 mod tests {
-    use super::assemble;
+    use super::{assemble, encode};
     use std::path::Path;
 
     #[test]
@@ -104,8 +123,8 @@ mod tests {
         let net10 = assemble(backend, linker, sdk, "10", &[], None);
 
         assert_ne!(net8, net10);
-        assert!(net8.contains("--cfg cd_dotnet_8 --check-cfg=cfg(cd_dotnet_8)"));
-        assert!(net10.contains("--cfg cd_dotnet_10 --check-cfg=cfg(cd_dotnet_10)"));
+        assert!(net8.iter().any(|flag| flag == "cd_dotnet_8"));
+        assert!(net10.iter().any(|flag| flag == "cd_dotnet_10"));
     }
 
     #[test]
@@ -118,10 +137,15 @@ mod tests {
             &[],
             None,
         );
-        assert!(flags.contains(
-            "--cfg cd_dotnet_unity_netstandard2_1 --check-cfg=cfg(cd_dotnet_unity_netstandard2_1)"
-        ));
-        assert!(!flags.contains("cd_dotnet_unity-netstandard"));
+        assert!(
+            flags
+                .iter()
+                .any(|flag| flag == "cd_dotnet_unity_netstandard2_1")
+        );
+        assert!(!flags.iter().any(|flag| {
+            flag.to_string_lossy()
+                .contains("cd_dotnet_unity-netstandard")
+        }));
     }
 
     #[test]
@@ -145,8 +169,33 @@ mod tests {
             Some("https://example.invalid/two/*"),
         );
         assert_ne!(first, second);
-        assert!(first.contains("--cfg cd_sourcelink_"));
-        assert!(!first.contains("example.invalid"));
+        assert!(
+            first
+                .iter()
+                .any(|flag| flag.to_string_lossy().starts_with("cd_sourcelink_"))
+        );
+        assert!(
+            !first
+                .iter()
+                .any(|flag| flag.to_string_lossy().contains("example.invalid"))
+        );
+    }
+
+    #[test]
+    fn encoded_flags_preserve_paths_with_spaces_as_one_argument() {
+        let flags = assemble(
+            Path::new("/tmp/sdk with spaces/backend.so"),
+            Path::new("/tmp/sdk with spaces/linker"),
+            Path::new("/missing/sdk"),
+            "10",
+            &[(Path::new("/tmp/source with spaces"), "/_/source")],
+            None,
+        );
+        let encoded = encode(&flags).to_string_lossy().into_owned();
+        let decoded = encoded.split('\u{1f}').collect::<Vec<_>>();
+        assert!(decoded.contains(&"codegen-backend=/tmp/sdk with spaces/backend.so"));
+        assert!(decoded.contains(&"linker=/tmp/sdk with spaces/linker"));
+        assert!(decoded.contains(&"--remap-path-prefix=/tmp/source with spaces=/_/source"));
     }
 
     #[test]

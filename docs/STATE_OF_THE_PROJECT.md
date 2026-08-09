@@ -6,7 +6,7 @@ understandable, and useful outside this checkout.
 
 ## Public preview contract
 
-The 0.0.1 SDK supports:
+The 0.0.2 SDK supports:
 
 - .NET 10;
 - Linux x64, macOS Apple Silicon, and Windows x64; and

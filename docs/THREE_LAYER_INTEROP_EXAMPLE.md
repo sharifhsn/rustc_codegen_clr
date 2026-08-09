@@ -246,9 +246,9 @@ The managed crate needs the normal managed-Rust dependencies plus the safe P/Inv
 crate-type = ["cdylib"]
 
 [dependencies]
-dotnet_macros = "0.0.1"
-mycorrhiza = "0.0.1"
-rust-dotnet-pinvoke = "0.0.1"
+dotnet_macros = "0.1.0"
+mycorrhiza = "0.0.0"
+rust-dotnet-pinvoke = "0.0.2"
 ```
 
 Stage one native binary per target RID with `cargo dotnet add-native-file`; applications then load

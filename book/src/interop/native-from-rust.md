@@ -9,7 +9,7 @@ This page assumes `cargo dotnet` is installed and Rust plus the .NET 10 SDK are 
 
 ## Safe Rust on both sides
 
-Add `rust-dotnet-pinvoke = "0.0.1"` to the managed and native crates. The native implementation is
+Add `rust-dotnet-pinvoke = "0.0.2"` to the managed and native crates. The native implementation is
 an ordinary safe function:
 
 ```rust
@@ -70,6 +70,9 @@ P/Invoke declaration plus safe caller. Pointer/length expansion, nonempty-null a
 checks, UTF-8 validation, initialized output handling, status conversion, and native panic
 containment stay in generated code. Inputs may be primitive scalars, `&str`, `&[T]`, or
 `&mut [T]`; results may be `Result<primitive | String | Vec<T> | (), i32>` for primitive `T`.
+The generated symbol includes a versioned fingerprint of that complete contract. If the two Rust
+declarations drift in type, order, mutability, or result shape, the importer no longer resolves the
+export instead of invoking an incompatible ABI.
 
 Owned results use a private pointer/length/capacity ABI plus a generated deallocator. The managed
 side copies the value and then asks the native library to free its own allocation, including when a
@@ -173,7 +176,7 @@ module while the rest of the application uses ordinary safe Rust:
 
 ```toml
 [dependencies]
-rust-dotnet-pinvoke = "0.0.1"
+rust-dotnet-pinvoke = "0.0.2"
 ```
 
 The installed SDK supplies this version through its build-local Cargo configuration, just like

@@ -77,12 +77,8 @@ pub fn run(args: &PackArgs) -> Result<i32> {
         .version
         .clone()
         .unwrap_or_else(|| pkg.version.to_string());
-    if name.is_empty() {
-        bail!("pack: could not determine crate name (pass --id)");
-    }
-    if ver.is_empty() {
-        bail!("pack: could not determine crate version (pass --version)");
-    }
+    crate::path_safety::validate_nuget_id(&name).context("pack: invalid package id")?;
+    crate::path_safety::validate_nuget_version(&ver).context("pack: invalid package version")?;
     if args.sign_certificate.is_some() {
         require_signed_release_inputs(args, &ctx.crate_dir, &ver)?;
     }
@@ -150,7 +146,13 @@ pub fn run(args: &PackArgs) -> Result<i32> {
         .unwrap_or_else(|| ctx.crate_dir.join("target/nupkg"));
     fs::create_dir_all(&out_dir).with_context(|| format!("mkdir -p {}", out_dir.display()))?;
     let nupkg = out_dir.join(format!("{name}.{ver}.nupkg"));
-    let _ = fs::remove_file(&nupkg);
+    let staging = tempfile::Builder::new()
+        .prefix(".cargo-dotnet-pack-")
+        .suffix(".nupkg")
+        .tempfile_in(&out_dir)
+        .with_context(|| format!("creating staged package in {}", out_dir.display()))?
+        .into_temp_path();
+    let staged_nupkg = staging.to_path_buf();
 
     let dll_bytes = fs::read(&dll).with_context(|| format!("read {}", dll.display()))?;
     let readme_bytes = readme_path.as_ref().and_then(|p| fs::read(p).ok());
@@ -247,7 +249,7 @@ pub fn run(args: &PackArgs) -> Result<i32> {
     })?;
 
     write_nupkg(
-        &nupkg,
+        &staged_nupkg,
         &name,
         &assembly_name,
         &ver,
@@ -267,23 +269,28 @@ pub fn run(args: &PackArgs) -> Result<i32> {
         &sbom,
         &licenses,
     )?;
-    if args.validate {
-        validate_nupkg(&nupkg, &name, &assembly_name, &ver, ctx.dotnet.tfm())?;
-    }
+    // Structural validation is a package invariant, not an opt-in release feature.
+    validate_nupkg(&staged_nupkg, &name, &assembly_name, &ver, ctx.dotnet.tfm())?;
     if let Some(certificate) = &args.sign_certificate {
         sign_and_verify(
-            &nupkg,
+            &staged_nupkg,
             certificate,
             args.sign_password_env.as_deref(),
             args.timestamper.as_deref(),
             args.signer_fingerprint.as_deref().unwrap(),
         )?;
+        // Signing rewrites the ZIP. Re-check the final bytes before publication.
+        validate_nupkg(&staged_nupkg, &name, &assembly_name, &ver, ctx.dotnet.tfm())?;
     }
-    let package_bytes = fs::read(&nupkg)?;
+    let package_bytes = fs::read(&staged_nupkg)?;
     let package_sha256 = format!("{:x}", Sha256::digest(&package_bytes));
     let checksum_path = PathBuf::from(format!("{}.sha256", nupkg.display()));
+    let checksum_staging = tempfile::Builder::new()
+        .prefix(".cargo-dotnet-checksum-")
+        .tempfile_in(&out_dir)?
+        .into_temp_path();
     fs::write(
-        &checksum_path,
+        &checksum_staging,
         format!(
             "{}  {}\n",
             package_sha256,
@@ -293,12 +300,31 @@ pub fn run(args: &PackArgs) -> Result<i32> {
                 .unwrap_or("package.nupkg")
         ),
     )?;
-    let entry_hashes = package_entry_hashes(&nupkg)?;
+    let entry_hashes = package_entry_hashes(&staged_nupkg)?;
     let package_receipt_path =
         PathBuf::from(format!("{}.rustdotnet.receipt.json", nupkg.display()));
+    let receipt_staging = tempfile::Builder::new()
+        .prefix(".cargo-dotnet-receipt-")
+        .tempfile_in(&out_dir)?
+        .into_temp_path();
     fs::write(
-        &package_receipt_path,
-        provenance::package_receipt(&nupkg, &entry_hashes)?,
+        &receipt_staging,
+        provenance::package_receipt(
+            &staged_nupkg,
+            nupkg
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("package.nupkg"),
+            &entry_hashes,
+        )?,
+    )?;
+    publish_staged_files(
+        &[
+            (staged_nupkg.as_ref(), nupkg.as_path()),
+            (checksum_staging.as_ref(), checksum_path.as_path()),
+            (receipt_staging.as_ref(), package_receipt_path.as_path()),
+        ],
+        |_| Ok(()),
     )?;
 
     eprintln!();
@@ -323,6 +349,111 @@ pub fn run(args: &PackArgs) -> Result<i32> {
     eprintln!(" changing the Rust and re-packing the SAME version, clear the cache or bump");
     eprintln!(" --version: dotnet nuget locals global-packages --clear");
     Ok(0)
+}
+
+fn publish_staged_files<F>(files: &[(&Path, &Path)], mut before_promote: F) -> Result<()>
+where
+    F: FnMut(usize) -> Result<()>,
+{
+    let (_, first_destination) = files.first().context("no package files to publish")?;
+    let parent = first_destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut expected_hashes = Vec::with_capacity(files.len());
+    for (staged, destination) in files {
+        if !staged.is_file() || destination.parent().unwrap_or_else(|| Path::new(".")) != parent {
+            bail!("package publication inputs must be regular files in one output directory");
+        }
+        if destination.exists() && !fs::symlink_metadata(destination)?.is_file() {
+            bail!(
+                "refusing to replace non-file package output: {}",
+                destination.display()
+            );
+        }
+        expected_hashes.push(format!("{:x}", Sha256::digest(fs::read(staged)?)));
+    }
+
+    let backup_area = tempfile::Builder::new()
+        .prefix(".cargo-dotnet-package-backup-")
+        .tempdir_in(parent)?;
+    let mut backed_up = vec![false; files.len()];
+    let mut promoted = vec![false; files.len()];
+    let transaction = (|| -> Result<()> {
+        for (index, (_, destination)) in files.iter().enumerate() {
+            if destination.exists() {
+                fs::rename(
+                    destination,
+                    backup_area.path().join(format!("previous-{index}")),
+                )
+                .with_context(|| format!("backing up {}", destination.display()))?;
+                backed_up[index] = true;
+                let backup = backup_area.path().join(format!("previous-{index}"));
+                let metadata = fs::symlink_metadata(&backup)?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    bail!(
+                        "package output changed to a non-regular file before backup: {}",
+                        destination.display()
+                    );
+                }
+            }
+        }
+        for (index, (staged, destination)) in files.iter().enumerate() {
+            before_promote(index)?;
+            fs::rename(staged, destination).with_context(|| {
+                format!(
+                    "publishing {} -> {}",
+                    staged.display(),
+                    destination.display()
+                )
+            })?;
+            promoted[index] = true;
+        }
+        for (index, (_, destination)) in files.iter().enumerate() {
+            let actual = format!("{:x}", Sha256::digest(fs::read(destination)?));
+            if actual != expected_hashes[index] {
+                bail!(
+                    "published package output failed verification: {}",
+                    destination.display()
+                );
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = transaction {
+        let mut rollback_errors = Vec::new();
+        for (index, (_, destination)) in files.iter().enumerate().rev() {
+            if promoted[index]
+                && let Err(rollback) = fs::rename(
+                    destination,
+                    backup_area.path().join(format!("failed-new-{index}")),
+                )
+            {
+                rollback_errors.push(format!("remove {}: {rollback}", destination.display()));
+            }
+        }
+        for (index, (_, destination)) in files.iter().enumerate() {
+            if backed_up[index]
+                && let Err(rollback) = fs::rename(
+                    backup_area.path().join(format!("previous-{index}")),
+                    destination,
+                )
+            {
+                rollback_errors.push(format!("restore {}: {rollback}", destination.display()));
+            }
+        }
+        if rollback_errors.is_empty() {
+            return Err(error).context("package publication set rolled back");
+        }
+        let recovery = backup_area.keep();
+        bail!(
+            "package publication failed ({error:#}); rollback also failed: {}; recoverable files: {}",
+            rollback_errors.join("; "),
+            recovery.display()
+        );
+    }
+    Ok(())
 }
 
 fn require_signed_release_inputs(
@@ -760,9 +891,7 @@ fn write_nupkg(
     // use file_name()/basename here: that would silently turn distinct RID or culture assets
     // into one platform-dependent file.
     for asset in staged_assets {
-        let bytes = fs::read(&asset.source)
-            .with_context(|| format!("read staged NuGet asset {}", asset.source.display()))?;
-        add_entry(&mut zip, &asset.logical_path, &bytes, deflated)?;
+        add_entry(&mut zip, &asset.logical_path, &asset.contents, deflated)?;
     }
 
     zip.finish().context("finalize .nupkg zip")?;
@@ -1046,10 +1175,12 @@ mod tests {
         kind: nuget::StagedPackageAssetKind,
         rid: Option<&str>,
     ) -> nuget::StagedPackageAsset {
+        let contents = fs::read(&source).unwrap().into();
         nuget::StagedPackageAsset {
             owner: "fixture/1.0.0".into(),
             logical_path: path.to_owned(),
             source,
+            contents,
             kind,
             rid: rid.map(str::to_owned),
         }
@@ -1234,7 +1365,7 @@ esac
         let assets = vec![
             package_asset(
                 "runtimes/osx-arm64/lib/net8.0/Fixture.Rid.dll",
-                runtime,
+                runtime.clone(),
                 nuget::StagedPackageAssetKind::Runtime,
                 Some("osx-arm64"),
             ),
@@ -1251,6 +1382,7 @@ esac
                 Some("osx-arm64"),
             ),
         ];
+        fs::write(&runtime, b"post-validation-swap").unwrap();
         let contract = test_contract(
             "Fixture.Package",
             "Fixture.Assembly",
@@ -1295,6 +1427,12 @@ esac
         ] {
             assert!(zip.by_name(expected).is_ok(), "missing {expected}");
         }
+        let mut runtime_entry = zip
+            .by_name("runtimes/osx-arm64/lib/net8.0/Fixture.Rid.dll")
+            .unwrap();
+        let mut runtime_bytes = Vec::new();
+        runtime_entry.read_to_end(&mut runtime_bytes).unwrap();
+        assert_eq!(runtime_bytes, b"rid-managed");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1350,5 +1488,73 @@ esac
                 .contains("runtime asset must use lib or native")
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn package_publication_promotes_the_complete_output_set() {
+        let root = tempfile::tempdir().unwrap();
+        let staged = [
+            root.path().join("stage-package"),
+            root.path().join("stage-checksum"),
+            root.path().join("stage-receipt"),
+        ];
+        let outputs = [
+            root.path().join("fixture.nupkg"),
+            root.path().join("fixture.nupkg.sha256"),
+            root.path().join("fixture.nupkg.rustdotnet.receipt.json"),
+        ];
+        for (index, path) in staged.iter().enumerate() {
+            fs::write(path, format!("new-{index}")).unwrap();
+        }
+        let files = staged
+            .iter()
+            .zip(outputs.iter())
+            .map(|(staged, output)| (staged.as_path(), output.as_path()))
+            .collect::<Vec<_>>();
+
+        publish_staged_files(&files, |_| Ok(())).unwrap();
+
+        for (index, output) in outputs.iter().enumerate() {
+            assert_eq!(fs::read_to_string(output).unwrap(), format!("new-{index}"));
+        }
+    }
+
+    #[test]
+    fn package_publication_rolls_back_the_complete_output_set() {
+        let root = tempfile::tempdir().unwrap();
+        let staged = [
+            root.path().join("stage-package"),
+            root.path().join("stage-checksum"),
+            root.path().join("stage-receipt"),
+        ];
+        let outputs = [
+            root.path().join("fixture.nupkg"),
+            root.path().join("fixture.nupkg.sha256"),
+            root.path().join("fixture.nupkg.rustdotnet.receipt.json"),
+        ];
+        for (index, path) in staged.iter().enumerate() {
+            fs::write(path, format!("new-{index}")).unwrap();
+        }
+        for (index, path) in outputs.iter().enumerate() {
+            fs::write(path, format!("old-{index}")).unwrap();
+        }
+        let files = staged
+            .iter()
+            .zip(outputs.iter())
+            .map(|(staged, output)| (staged.as_path(), output.as_path()))
+            .collect::<Vec<_>>();
+
+        let error = publish_staged_files(&files, |index| {
+            if index == 1 {
+                bail!("injected publication failure");
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("rolled back"));
+        for (index, output) in outputs.iter().enumerate() {
+            assert_eq!(fs::read_to_string(output).unwrap(), format!("old-{index}"));
+        }
     }
 }

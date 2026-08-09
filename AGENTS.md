@@ -8,7 +8,7 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) before changing compiler cod
 experimental rustc codegen backend that emits managed .NET assemblies or, in an alternate mode, C
 source. It is loaded by rustc through `-Z codegen-backend`; it is not a standalone compiler.
 
-The public 0.0.1 SDK supports .NET 10 on Linux x64, macOS Apple Silicon, and Windows x64. Internal
+The public 0.0.2 SDK supports .NET 10 on Linux x64, macOS Apple Silicon, and Windows x64. Internal
 older-runtime branches are not a public compatibility promise.
 
 ## Toolchain

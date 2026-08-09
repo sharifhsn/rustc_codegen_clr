@@ -43,7 +43,7 @@ grep -F 'cargo dotnet bundle install /path/to/cargo-dotnet-sdk-<host>.zip' \
 # Keep every newcomer guide on the downloadable release installer. Source setup remains documented
 # for contributors, but it is not the normal first-user path.
 for guide in "$repo/README.md" "$repo/QUICKSTART.md" "$repo/docs/QUICKSTART_INTEROP.md"; do
-    grep -F 'releases/download/rust-dotnet-v0.0.1/install.sh' "$guide"
+    grep -F 'releases/download/rust-dotnet-v0.0.2/install.sh' "$guide"
     if head -n 40 "$guide" | grep -F 'cargo install --path tools/cargo-dotnet'; then
         echo "newcomer guide redundantly installs cargo-dotnet before setup: $guide" >&2
         exit 1

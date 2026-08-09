@@ -14,7 +14,7 @@ there is no P/Invoke, no marshalling attributes, and no `unsafe` unless you ask 
 ## 0. One-time setup
 
 ```bash
-curl -fsSL https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.1/install.sh | sh
+curl -fsSL https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.2/install.sh | sh
 cargo dotnet doctor
 ```
 

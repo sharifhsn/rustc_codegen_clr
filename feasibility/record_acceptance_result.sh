@@ -10,6 +10,8 @@ dotnet_version="${RCL_EVIDENCE_DOTNET:?set RCL_EVIDENCE_DOTNET to a runtime or i
 profiles_text="${RCL_EVIDENCE_PROFILES:?set RCL_EVIDENCE_PROFILES to one or more profiles}"
 marker_text="${RCL_EVIDENCE_MARKER:?set RCL_EVIDENCE_MARKER to the exact completion line}"
 command_log="${RCL_EVIDENCE_LOG:-${results%.*}.command.log}"
+artifacts_text="${RCL_EVIDENCE_ARTIFACTS:-}"
+artifact_receipt="${RCL_EVIDENCE_RECEIPT:-${results%.*}.artifacts.json}"
 
 if (($# == 0)); then
     echo 'record_acceptance_result: expected an acceptance command' >&2
@@ -23,6 +25,18 @@ if ((${#profiles[@]} == 0)); then
 fi
 
 mkdir -p "$(dirname "$results")" "$(dirname "$command_log")"
+results_dir="$(cd "$(dirname "$results")" && pwd -P)"
+mkdir -p "$(dirname "$artifact_receipt")"
+receipt_dir="$(cd "$(dirname "$artifact_receipt")" && pwd -P)"
+if [[ "$receipt_dir" != "$results_dir" ]]; then
+    echo 'record_acceptance_result: artifact receipt must be owned by the results directory' >&2
+    exit 2
+fi
+receipt_name="$(basename "$artifact_receipt")"
+if [[ "$receipt_name" == *'|'* || "$receipt_name" == *$'\n'* ]]; then
+    echo 'record_acceptance_result: artifact receipt filename is not TSV-safe' >&2
+    exit 2
+fi
 tmp="$(mktemp "${results}.tmp.XXXXXX")"
 cleanup() {
     rm -f "$tmp"
@@ -49,15 +63,27 @@ else
     result=FAIL
 fi
 
-printf 'kind|dotnet|profile|case|dotnet_exit|native_exit|stdout_match|diagnostic_hits|marker|required|result\n' > "$tmp"
+receipt_field=''
+if [[ "$result" == PASS && -n "$artifacts_text" ]]; then
+    artifact_specs=()
+    while IFS= read -r spec; do
+        [[ -n "$spec" ]] && artifact_specs+=("$spec")
+    done <<< "$artifacts_text"
+    "$(dirname "$0")/write_acceptance_artifact_receipt.sh" \
+        "$artifact_receipt" "$case_name" "$kind" "$dotnet_version" "$profiles_text" \
+        "${artifact_specs[@]}"
+    receipt_field="$receipt_name"
+fi
+
+printf 'kind|dotnet|profile|case|dotnet_exit|native_exit|stdout_match|diagnostic_hits|marker|required|result|receipt\n' > "$tmp"
 for profile in "${profiles[@]}"; do
     case "$profile" in
         debug|release|independent) ;;
         *) echo "record_acceptance_result: unsupported profile $profile" >&2; exit 2 ;;
     esac
-    printf '%s|%s|%s|%s|%d|na|na|%s|%s|yes|%s\n' \
+    printf '%s|%s|%s|%s|%d|na|na|%s|%s|yes|%s|%s\n' \
         "$kind" "$dotnet_version" "$profile" "$case_name" "$command_exit" \
-        "$diagnostic_hits" "$marker" "$result" >> "$tmp"
+        "$diagnostic_hits" "$marker" "$result" "$receipt_field" >> "$tmp"
 done
 mv -f "$tmp" "$results"
 trap - EXIT

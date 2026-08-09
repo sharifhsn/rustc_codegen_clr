@@ -8,11 +8,14 @@ use anyhow::{Context, Result, bail};
 pub use rust_dotnet_sdk_core::host::HostFacts;
 
 pub fn ensure_supported(facts: &HostFacts) -> Result<()> {
-    match facts.os {
-        "linux" | "macos" | "windows" => Ok(()),
-        other => bail!(
-            "{other} hosts are not supported by this cargo-dotnet release; use Linux, macOS, or Windows."
-        ),
+    if facts.is_supported() {
+        Ok(())
+    } else {
+        bail!(
+            "{}-{} is not supported by this cargo-dotnet release; supported hosts are Linux x64, macOS Apple Silicon, and Windows x64.",
+            facts.os,
+            facts.arch
+        )
     }
 }
 

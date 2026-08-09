@@ -6,7 +6,7 @@ Rust.
 
 The project is suitable for experimentation and controlled integrations. It is not yet a general
 production replacement for Rust's native backends: the compiler tracks a specific nightly, the
-public 0.0.1 SDK supports only .NET 10 on Linux x64, macOS Apple Silicon, and Windows x64, and
+public 0.0.2 SDK supports only .NET 10 on Linux x64, macOS Apple Silicon, and Windows x64, and
 unsupported Rust or CLR edge cases can still fail compilation or behave incorrectly. Release
 bundles are built and install-tested on their matching GitHub runners.
 

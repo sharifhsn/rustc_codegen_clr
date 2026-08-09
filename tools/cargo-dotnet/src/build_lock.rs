@@ -51,13 +51,7 @@ impl Drop for BuildLock {
 }
 
 fn lock_path(scope: &str) -> Result<PathBuf> {
-    if let Some(home) = std::env::var_os("CARGO_DOTNET_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(home).join(format!("locks/{scope}.lock")));
-    }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .context("neither HOME nor USERPROFILE is set for cargo-dotnet build lock")?;
-    Ok(PathBuf::from(home).join(format!(".cargo-dotnet/locks/{scope}.lock")))
+    Ok(crate::context::cargo_dotnet_cache_home()?.join(format!("locks/{scope}.lock")))
 }
 
 #[cfg(test)]
@@ -67,6 +61,6 @@ mod tests {
     #[test]
     fn default_lock_is_outside_the_consumer_crate() {
         let path = lock_path("crate-abc").unwrap();
-        assert!(path.ends_with(".cargo-dotnet/locks/crate-abc.lock"));
+        assert!(path.ends_with(".cargo-dotnet-cache/locks/crate-abc.lock"));
     }
 }

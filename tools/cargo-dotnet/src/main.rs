@@ -32,6 +32,7 @@ mod pack;
 mod palinject;
 mod parallel_trace;
 mod passthrough;
+mod path_safety;
 mod pipeline;
 mod private_sysroot;
 mod profiles;

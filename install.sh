@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-version="${RUST_DOTNET_VERSION:-0.0.1}"
+version="${RUST_DOTNET_VERSION:-0.0.2}"
 repository="${RUST_DOTNET_REPOSITORY:-sharifhsn/rustc_codegen_clr}"
 
 case "$(uname -s)-$(uname -m)" in
@@ -28,11 +28,22 @@ bundle="$work/cargo-dotnet-sdk-$host-$version.zip"
 
 echo "Downloading rust-dotnet $version for $host..."
 curl -fsSL "$base/cargo-dotnet-$host" -o "$driver"
+curl -fsSL "$base/cargo-dotnet-$host.sha256" -o "$driver.sha256"
 curl -fsSL "$base/cargo-dotnet-sdk-$host-$version.zip" -o "$bundle"
 curl -fsSL "$base/cargo-dotnet-sdk-$host-$version.zip.sha256" -o "$bundle.sha256"
+expected_driver="$(awk '{print $1; exit}' "$driver.sha256")"
+if command -v sha256sum >/dev/null 2>&1; then
+  actual_driver="$(sha256sum "$driver" | awk '{print $1}')"
+else
+  actual_driver="$(shasum -a 256 "$driver" | awk '{print $1}')"
+fi
+[ "$actual_driver" = "$expected_driver" ] || {
+  echo "cargo-dotnet driver checksum mismatch" >&2
+  exit 1
+}
 chmod +x "$driver"
 
-"$driver" bundle install "$bundle"
+"$driver" bundle install "$bundle" --force
 
 echo
 cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"

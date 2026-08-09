@@ -1,6 +1,6 @@
 # Product acceptance
 
-This directory describes the user journeys exercised by CI and release builds. The public 0.0.1
+This directory describes the user journeys exercised by CI and release builds. The public 0.0.2
 contract is intentionally small:
 
 - .NET 10
