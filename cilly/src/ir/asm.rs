@@ -1399,6 +1399,19 @@ impl Assembly {
             "Could not return a methoddef, because a method def is already present."
         );
     }
+    /// Canonicalizes every retained method's CFG without consuming optimizer fuel.
+    ///
+    /// This is a correctness boundary, not a peephole optimization: roots after an unconditional
+    /// transfer and blocks unreachable from the method entry must not participate in whole-program
+    /// call-graph reachability. Run it before DCE even when optional CIL optimization is disabled.
+    pub fn canonicalize_control_flow(&mut self) {
+        for method in self.stable_method_def_idxs() {
+            let mut definition = self.borrow_methoddef(method);
+            definition.remove_dead_blocks(self);
+            self.return_methoddef(method, definition);
+        }
+    }
+
     /// Optimizes every method with a deterministic, preallocated share of `fuel`.
     pub fn opt(&mut self, fuel: &mut OptFuel) {
         // The CIL optimizer is purely local/intra-method (copy-prop, DCE, peepholes, block
@@ -2204,6 +2217,7 @@ impl Assembly {
         only_imports: bool,
         mut seen_member_owners: FxHashSet<ClassDefIdx>,
     ) {
+        self.canonicalize_control_flow();
         let mut next_wave: FxHashSet<MethodDefIdx> = FxHashSet::default();
         let mut alive: FxHashSet<MethodDefIdx> = FxHashSet::default();
         // If only cleaning up imports, assume all non-import fns are alive.
@@ -5191,6 +5205,255 @@ fn final_verifier_rejects_only_missing_methods_that_survive_dce() {
         panic!("a reachable missing method must fail the final verifier")
     };
     assert!(message.contains("live_missing"), "{message}");
+}
+
+#[cfg(test)]
+fn add_cfg_test_missing(asm: &mut Assembly, name: &str) -> MethodDefIdx {
+    let owner = asm.main_module();
+    let sig = asm.sig([], Type::Void);
+    let name = asm.alloc_string(name);
+    asm.new_method(MethodDef::new(
+        Access::Private,
+        owner,
+        name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::Missing,
+        vec![],
+    ))
+}
+
+#[cfg(test)]
+fn add_cfg_test_export(
+    asm: &mut Assembly,
+    name: &str,
+    inputs: impl Into<Box<[Type]>>,
+    blocks: Vec<super::BasicBlock>,
+) -> MethodDefIdx {
+    let owner = asm.main_module();
+    let sig = asm.sig(inputs, Type::Void);
+    let name = asm.alloc_string(name);
+    asm.new_method(MethodDef::new(
+        Access::Extern,
+        owner,
+        name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks,
+            locals: vec![],
+        },
+        vec![],
+    ))
+}
+
+#[test]
+fn mandatory_cfg_cleanup_drops_roots_after_an_unconditional_transfer() {
+    let mut asm = Assembly::default();
+    let missing = add_cfg_test_missing(&mut asm, "dead_post_terminator_missing");
+    let to_live = asm.branch(2, 0, None);
+    let unreachable_default = asm.branch(1, 0, None);
+    let call = asm.call_root(missing.0, &[] as &[Interned<CILNode>], IsPure::NOT);
+    let ret = asm.alloc_root(CILRoot::VoidRet);
+    let caller = add_cfg_test_export(
+        &mut asm,
+        "post_terminator_cfg",
+        [],
+        vec![
+            super::BasicBlock::new(vec![to_live, unreachable_default], 0, None),
+            super::BasicBlock::new(vec![call, ret], 1, None),
+            super::BasicBlock::new(vec![ret], 2, None),
+        ],
+    );
+
+    asm.eliminate_dead_code();
+
+    assert!(!asm.method_defs().contains_key(&missing));
+    let blocks = asm.method_defs()[&caller]
+        .implementation()
+        .blocks()
+        .unwrap();
+    assert_eq!(
+        blocks
+            .iter()
+            .map(super::BasicBlock::block_id)
+            .collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    assert_eq!(blocks[0].roots(), &[to_live]);
+}
+
+#[test]
+fn mandatory_cfg_cleanup_folds_const_false_before_call_graph_dce() {
+    let mut asm = Assembly::default();
+    let missing = add_cfg_test_missing(&mut asm, "const_false_missing");
+    let false_node = asm.alloc_node(Const::Bool(false));
+    let dead_branch = asm.branch(1, 0, Some(super::BranchCond::True(false_node)));
+    let live_branch = asm.branch(2, 0, None);
+    let call = asm.call_root(missing.0, &[] as &[Interned<CILNode>], IsPure::NOT);
+    let ret = asm.alloc_root(CILRoot::VoidRet);
+    add_cfg_test_export(
+        &mut asm,
+        "const_false_cfg",
+        [],
+        vec![
+            super::BasicBlock::new(vec![dead_branch, live_branch], 0, None),
+            super::BasicBlock::new(vec![call, ret], 1, None),
+            super::BasicBlock::new(vec![ret], 2, None),
+        ],
+    );
+
+    asm.eliminate_dead_code();
+    assert!(!asm.method_defs().contains_key(&missing));
+}
+
+#[test]
+fn mandatory_cfg_cleanup_folds_const_true_and_preserves_the_live_call() {
+    let mut asm = Assembly::default();
+    let missing = add_cfg_test_missing(&mut asm, "const_true_missing");
+    let true_node = asm.alloc_node(Const::Bool(true));
+    let live_branch = asm.branch(1, 0, Some(super::BranchCond::True(true_node)));
+    let dead_default = asm.branch(2, 0, None);
+    let call = asm.call_root(missing.0, &[] as &[Interned<CILNode>], IsPure::NOT);
+    let ret = asm.alloc_root(CILRoot::VoidRet);
+    add_cfg_test_export(
+        &mut asm,
+        "const_true_cfg",
+        [],
+        vec![
+            super::BasicBlock::new(vec![live_branch, dead_default], 0, None),
+            super::BasicBlock::new(vec![call, ret], 1, None),
+            super::BasicBlock::new(vec![ret], 2, None),
+        ],
+    );
+
+    asm.eliminate_dead_code();
+    assert!(asm.method_defs().contains_key(&missing));
+}
+
+#[test]
+fn mandatory_cfg_cleanup_retains_both_edges_of_a_dynamic_branch() {
+    let mut asm = Assembly::default();
+    let missing = add_cfg_test_missing(&mut asm, "dynamic_branch_missing");
+    let dynamic = asm.alloc_node(CILNode::LdArg(0));
+    let conditional = asm.branch(1, 0, Some(super::BranchCond::True(dynamic)));
+    let fallthrough = asm.branch(2, 0, None);
+    let call = asm.call_root(missing.0, &[] as &[Interned<CILNode>], IsPure::NOT);
+    let ret = asm.alloc_root(CILRoot::VoidRet);
+    add_cfg_test_export(
+        &mut asm,
+        "dynamic_cfg",
+        [Type::Bool],
+        vec![
+            super::BasicBlock::new(vec![conditional, fallthrough], 0, None),
+            super::BasicBlock::new(vec![call, ret], 1, None),
+            super::BasicBlock::new(vec![ret], 2, None),
+        ],
+    );
+
+    asm.eliminate_dead_code();
+    assert!(asm.method_defs().contains_key(&missing));
+}
+
+#[test]
+fn mandatory_cfg_cleanup_drops_an_unrooted_block_cycle() {
+    let mut asm = Assembly::default();
+    let missing = add_cfg_test_missing(&mut asm, "dead_cycle_missing");
+    let entry_to_exit = asm.branch(3, 0, None);
+    let one_to_two = asm.branch(2, 0, None);
+    let two_to_one = asm.branch(1, 0, None);
+    let call = asm.call_root(missing.0, &[] as &[Interned<CILNode>], IsPure::NOT);
+    let ret = asm.alloc_root(CILRoot::VoidRet);
+    let caller = add_cfg_test_export(
+        &mut asm,
+        "dead_cycle_cfg",
+        [],
+        vec![
+            super::BasicBlock::new(vec![entry_to_exit], 0, None),
+            super::BasicBlock::new(vec![call, one_to_two], 1, None),
+            super::BasicBlock::new(vec![two_to_one], 2, None),
+            super::BasicBlock::new(vec![ret], 3, None),
+        ],
+    );
+
+    asm.eliminate_dead_code();
+
+    assert!(!asm.method_defs().contains_key(&missing));
+    let blocks = asm.method_defs()[&caller]
+        .implementation()
+        .blocks()
+        .unwrap();
+    assert_eq!(
+        blocks
+            .iter()
+            .map(super::BasicBlock::block_id)
+            .collect::<Vec<_>>(),
+        vec![0, 3]
+    );
+}
+
+#[test]
+fn mandatory_cfg_cleanup_preserves_live_exception_region_graphs() {
+    let mut asm = Assembly::default();
+    let owner = asm.main_module();
+    let sig = asm.sig([], Type::Void);
+    let to_exit = asm.branch(2, 0, None);
+    let cleanup_next = asm.branch(11, 0, None);
+    let ret = asm.alloc_root(CILRoot::VoidRet);
+    let rethrow = asm.alloc_root(CILRoot::ReThrow);
+    let name = asm.alloc_string("region_cfg");
+    let method = asm.new_method(MethodDef::new(
+        Access::Extern,
+        owner,
+        name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::RegionBody {
+            blocks: vec![
+                super::BasicBlock::new(vec![to_exit], 0, None),
+                super::BasicBlock::new(vec![ret], 1, None),
+                super::BasicBlock::new(vec![ret], 2, None),
+            ],
+            cleanup_blocks: vec![
+                super::BasicBlock::new(vec![cleanup_next], 10, None),
+                super::BasicBlock::new(vec![rethrow], 11, None),
+                super::BasicBlock::new(vec![rethrow], 20, None),
+            ],
+            exception_regions: vec![
+                super::ExceptionRegion::new(0, 10),
+                super::ExceptionRegion::new(1, 20),
+            ],
+            locals: vec![],
+        },
+        vec![],
+    ));
+
+    asm.canonicalize_control_flow();
+
+    let MethodImpl::RegionBody {
+        blocks,
+        cleanup_blocks,
+        exception_regions,
+        ..
+    } = asm.method_defs()[&method].implementation()
+    else {
+        panic!("region body changed representation")
+    };
+    assert_eq!(
+        blocks
+            .iter()
+            .map(super::BasicBlock::block_id)
+            .collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    assert_eq!(
+        cleanup_blocks
+            .iter()
+            .map(super::BasicBlock::block_id)
+            .collect::<Vec<_>>(),
+        vec![10, 11]
+    );
+    assert_eq!(exception_regions, &[super::ExceptionRegion::new(0, 10)]);
 }
 
 #[test]

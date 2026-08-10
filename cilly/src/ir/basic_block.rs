@@ -1,10 +1,12 @@
 use fxhash::{FxBuildHasher, FxHashSet};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 
 use super::{
-    Assembly, CILNode, CILRoot,
+    Assembly, BranchCond, CILNode, CILRoot, Const,
     asm_link::{RelocateCtx, RelocateValue},
     bimap::Interned,
+    cilroot::CmpKind,
     opt,
 };
 pub type BlockId = u32;
@@ -50,6 +52,79 @@ impl RelocateValue for BasicBlock {
 }
 
 impl BasicBlock {
+    /// Canonicalizes the executable prefix of this block and its legacy handler blocks.
+    ///
+    /// MIR lowering represents a conditional transfer as a conditional branch followed by its
+    /// fallthrough branch. After monomorphization, the first transfer can already be unconditional
+    /// (for example an `if const` whose generic size predicate is false). Every root after an
+    /// unconditional transfer is unreachable CIL and must not contribute call-graph or CFG edges.
+    /// Direct constant branch conditions are folded here as a mandatory correctness pass, without
+    /// optimizer fuel.
+    pub(crate) fn canonicalize_control_flow(&mut self, asm: &mut Assembly) {
+        // Legacy embedded handlers append addressable `ExitSpecialRegion` launching pads after
+        // ordinary branches in the protected/handler block. They look like post-terminator roots,
+        // but branches target the labels they define, so truncating that suffix would corrupt EH.
+        // Canonical `RegionBody` blocks never contain these pads; exporters materialize them only
+        // on a scratch clone after this pass. Preserve legacy blocks conservatively.
+        let has_legacy_leave_pads = self
+            .roots
+            .iter()
+            .any(|root| matches!(asm.get_root(*root), CILRoot::ExitSpecialRegion { .. }));
+        if has_legacy_leave_pads {
+            if let Some(handler) = &mut self.handler {
+                for block in handler {
+                    block.canonicalize_control_flow(asm);
+                }
+            }
+            return;
+        }
+
+        let mut canonical = Vec::with_capacity(self.roots.len());
+        for root in std::mem::take(&mut self.roots) {
+            match asm.get_root(root).clone() {
+                CILRoot::Branch(info) => {
+                    let (target, sub_target, cond) = *info;
+                    match cond
+                        .as_ref()
+                        .and_then(|condition| constant_branch_value(condition, asm))
+                    {
+                        Some(false) => continue,
+                        Some(true) => {
+                            canonical.push(
+                                asm.alloc_root(CILRoot::Branch(Box::new((
+                                    target, sub_target, None,
+                                )))),
+                            );
+                            break;
+                        }
+                        None => {
+                            canonical.push(root);
+                            if cond.is_none() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                CILRoot::Ret(_)
+                | CILRoot::VoidRet
+                | CILRoot::Throw(_)
+                | CILRoot::ReThrow
+                | CILRoot::Unreachable(_) => {
+                    canonical.push(root);
+                    break;
+                }
+                _ => canonical.push(root),
+            }
+        }
+        self.roots = canonical;
+
+        if let Some(handler) = &mut self.handler {
+            for block in handler {
+                block.canonicalize_control_flow(asm);
+            }
+        }
+    }
+
     /// Returns the list of blocks this block can potentially jump to.
     pub fn targets<'block, 'asm: 'block>(
         &'block self,
@@ -430,6 +505,143 @@ impl BasicBlock {
         self.handler_id = None;
     }
 }
+
+fn constant_branch_value(condition: &BranchCond, asm: &Assembly) -> Option<bool> {
+    let constant = |node| match asm.get_node(node) {
+        CILNode::Const(value) => Some(value.as_ref()),
+        _ => None,
+    };
+    match condition {
+        BranchCond::True(value) => constant(*value).and_then(constant_truthiness),
+        BranchCond::False(value) => constant(*value).and_then(constant_truthiness).map(|v| !v),
+        BranchCond::Eq(lhs, rhs) => constant_equality(constant(*lhs)?, constant(*rhs)?),
+        BranchCond::Ne(lhs, rhs) => {
+            constant_equality(constant(*lhs)?, constant(*rhs)?).map(|value| !value)
+        }
+        BranchCond::Lt(lhs, rhs, kind) => {
+            constant_order(constant(*lhs)?, constant(*rhs)?, kind, Ordering::is_lt)
+        }
+        BranchCond::Gt(lhs, rhs, kind) => {
+            constant_order(constant(*lhs)?, constant(*rhs)?, kind, Ordering::is_gt)
+        }
+        BranchCond::Le(lhs, rhs, kind) => {
+            constant_order(constant(*lhs)?, constant(*rhs)?, kind, |order| {
+                order.is_lt() || order.is_eq()
+            })
+        }
+        BranchCond::Ge(lhs, rhs, kind) => {
+            constant_order(constant(*lhs)?, constant(*rhs)?, kind, |order| {
+                order.is_gt() || order.is_eq()
+            })
+        }
+    }
+}
+
+fn constant_truthiness(value: &Const) -> Option<bool> {
+    match value {
+        Const::Bool(value) => Some(*value),
+        Const::I8(value) => Some(*value != 0),
+        Const::I16(value) => Some(*value != 0),
+        Const::I32(value) => Some(*value != 0),
+        Const::I64(value) | Const::ISize(value) => Some(*value != 0),
+        Const::U8(value) => Some(*value != 0),
+        Const::U16(value) => Some(*value != 0),
+        Const::U32(value) => Some(*value != 0),
+        Const::U64(value) | Const::USize(value) => Some(*value != 0),
+        Const::I128(_)
+        | Const::U128(_)
+        | Const::PlatformString(_)
+        | Const::F32(_)
+        | Const::F64(_)
+        | Const::Null(_)
+        | Const::ByteBuffer { .. } => None,
+    }
+}
+
+fn constant_equality(lhs: &Const, rhs: &Const) -> Option<bool> {
+    if lhs.get_type() != rhs.get_type() {
+        return None;
+    }
+    match (lhs, rhs) {
+        (Const::Bool(lhs), Const::Bool(rhs)) => Some(lhs == rhs),
+        (Const::I8(lhs), Const::I8(rhs)) => Some(lhs == rhs),
+        (Const::I16(lhs), Const::I16(rhs)) => Some(lhs == rhs),
+        (Const::I32(lhs), Const::I32(rhs)) => Some(lhs == rhs),
+        (Const::I64(lhs), Const::I64(rhs)) => Some(lhs == rhs),
+        (Const::ISize(lhs), Const::ISize(rhs)) => Some(lhs == rhs),
+        (Const::U8(lhs), Const::U8(rhs)) => Some(lhs == rhs),
+        (Const::U16(lhs), Const::U16(rhs)) => Some(lhs == rhs),
+        (Const::U32(lhs), Const::U32(rhs)) => Some(lhs == rhs),
+        (Const::U64(lhs), Const::U64(rhs)) => Some(lhs == rhs),
+        (Const::USize(lhs), Const::USize(rhs)) => Some(lhs == rhs),
+        (Const::F32(lhs), Const::F32(rhs)) => Some(lhs.0 == rhs.0),
+        (Const::F64(lhs), Const::F64(rhs)) => Some(lhs.0 == rhs.0),
+        _ => None,
+    }
+}
+
+fn constant_order(
+    lhs: &Const,
+    rhs: &Const,
+    kind: &CmpKind,
+    accepts: impl FnOnce(std::cmp::Ordering) -> bool,
+) -> Option<bool> {
+    if lhs.get_type() != rhs.get_type() {
+        return None;
+    }
+    let order = match (lhs, rhs) {
+        (Const::F32(lhs), Const::F32(rhs)) => {
+            return float_order(f64::from(lhs.0), f64::from(rhs.0), kind, accepts);
+        }
+        (Const::F64(lhs), Const::F64(rhs)) => {
+            return float_order(lhs.0, rhs.0, kind, accepts);
+        }
+        _ => {
+            let (lhs, lhs_width) = integer_bits(lhs)?;
+            let (rhs, rhs_width) = integer_bits(rhs)?;
+            if lhs_width != rhs_width {
+                return None;
+            }
+            if matches!(kind, CmpKind::Signed | CmpKind::Ordered) {
+                signed_bits(lhs, lhs_width).cmp(&signed_bits(rhs, rhs_width))
+            } else {
+                lhs.cmp(&rhs)
+            }
+        }
+    };
+    Some(accepts(order))
+}
+
+fn float_order(
+    lhs: f64,
+    rhs: f64,
+    kind: &CmpKind,
+    accepts: impl FnOnce(std::cmp::Ordering) -> bool,
+) -> Option<bool> {
+    match lhs.partial_cmp(&rhs) {
+        Some(order) => Some(accepts(order)),
+        None => Some(matches!(kind, CmpKind::Unordered | CmpKind::Unsigned)),
+    }
+}
+
+fn integer_bits(value: &Const) -> Option<(u128, u32)> {
+    match value {
+        Const::I8(value) => Some((u128::from(*value as u8), 8)),
+        Const::I16(value) => Some((u128::from(*value as u16), 16)),
+        Const::I32(value) => Some((u128::from(*value as u32), 32)),
+        Const::I64(value) | Const::ISize(value) => Some((u128::from(*value as u64), 64)),
+        Const::U8(value) => Some((u128::from(*value), 8)),
+        Const::U16(value) => Some((u128::from(*value), 16)),
+        Const::U32(value) => Some((u128::from(*value), 32)),
+        Const::U64(value) | Const::USize(value) => Some((u128::from(*value), 64)),
+        _ => None,
+    }
+}
+
+fn signed_bits(value: u128, width: u32) -> i128 {
+    let shift = 128 - width;
+    ((value << shift) as i128) >> shift
+}
 fn find_bb(id: BlockId, bbs: &[BasicBlock]) -> &BasicBlock {
     bbs.iter().find(|bb| bb.block_id() == id).unwrap()
 }
@@ -504,4 +716,51 @@ fn materialized_handler_rethrows_after_side_effecting_terminal_cleanup() {
     assert_eq!(meaningful.len(), 2);
     assert_eq!(*asm.get_root(meaningful[0]), CILRoot::Break);
     assert_eq!(*asm.get_root(meaningful[1]), CILRoot::ReThrow);
+}
+
+#[test]
+fn mandatory_cfg_cleanup_preserves_legacy_exception_leave_pads() {
+    let mut asm = Assembly::default();
+    let branch = asm.alloc_root(CILRoot::Branch(Box::new((0, 7, None))));
+    let first_pad = asm.alloc_root(CILRoot::ExitSpecialRegion {
+        target: 7,
+        source: 0,
+    });
+    let second_pad = asm.alloc_root(CILRoot::ExitSpecialRegion {
+        target: 8,
+        source: 0,
+    });
+    let expected = vec![branch, first_pad, second_pad];
+    let mut block = BasicBlock::new(expected.clone(), 0, None);
+
+    block.canonicalize_control_flow(&mut asm);
+
+    assert_eq!(block.roots(), expected);
+}
+
+#[test]
+fn mandatory_cfg_cleanup_evaluates_boolean_and_scalar_constant_branches() {
+    let mut asm = Assembly::default();
+    let false_node = asm.alloc_node(Const::Bool(false));
+    let minus_one = asm.alloc_node(Const::I32(-1));
+    let one = asm.alloc_node(Const::I32(1));
+    let nan = asm.alloc_node(Const::F64(super::hashable::HashableF64(f64::NAN)));
+    let zero = asm.alloc_node(Const::F64(super::hashable::HashableF64(0.0)));
+
+    assert_eq!(
+        constant_branch_value(&BranchCond::False(false_node), &asm),
+        Some(true)
+    );
+    assert_eq!(
+        constant_branch_value(&BranchCond::Lt(minus_one, one, CmpKind::Signed), &asm),
+        Some(true)
+    );
+    assert_eq!(
+        constant_branch_value(&BranchCond::Lt(nan, zero, CmpKind::Ordered), &asm),
+        Some(false)
+    );
+    assert_eq!(
+        constant_branch_value(&BranchCond::Lt(nan, zero, CmpKind::Unordered), &asm),
+        Some(true)
+    );
 }

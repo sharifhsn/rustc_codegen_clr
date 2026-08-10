@@ -633,6 +633,11 @@ fn main() {
 
     add_mandatory_statics(&mut final_assembly);
 
+    // Mandatory CFG cleanup is independent of the optional optimizer. rustc's monomorphization
+    // collector can omit a generic callee hidden behind a const-false branch; roots after the
+    // already-unconditional transfer must be removed before call-graph DCE sees them.
+    final_assembly.canonicalize_control_flow();
+
     if *DEAD_CODE_ELIMINATION {
         println!("==> Eliminating dead code");
         let dce_start = std::time::Instant::now();

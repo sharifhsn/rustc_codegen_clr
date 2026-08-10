@@ -907,7 +907,18 @@ impl MethodDef {
         *blocks[0].roots_mut() = preamble;
     }
 
-    pub(crate) fn remove_dead_blocks(&mut self, asm: &Assembly) {
+    fn canonicalize_control_flow(&mut self, asm: &mut Assembly) {
+        let Some(blocks) = self.implementation_mut().all_blocks_mut() else {
+            return;
+        };
+        for block in blocks {
+            block.canonicalize_control_flow(asm);
+        }
+    }
+
+    pub(crate) fn remove_dead_blocks(&mut self, asm: &mut Assembly) {
+        self.canonicalize_control_flow(asm);
+
         if let MethodImpl::RegionBody {
             blocks,
             cleanup_blocks,
@@ -921,47 +932,23 @@ impl MethodDef {
                 return;
             }
 
-            // Preserve the legacy normal-CFG policy, then make the method-level unwind edges
-            // explicit: regions protecting removed normal blocks are removed, and the canonical
-            // cleanup graph is retained only when reachable from a remaining handler entry.
-            let mut alive_normal: FxHashSet<_> =
-                blocks.iter().flat_map(|block| block.targets(asm)).collect();
-            alive_normal.insert(blocks[0].block_id());
+            // The normal CFG is rooted only at the method entry. A union of every block's targets
+            // incorrectly keeps dead cycles and, more subtly, branches that occur after an
+            // unconditional transfer. Exception edges are method-level metadata: retain a region
+            // exactly when its protected normal block survives, then root the cleanup CFG at each
+            // surviving handler entry.
+            let alive_normal = reachable_block_ids(blocks[0].block_id(), blocks, asm, false);
             blocks.retain(|block| alive_normal.contains(&block.block_id()));
             exception_regions.retain(|region| alive_normal.contains(&region.protected()));
 
-            let cleanup_ids: FxHashSet<_> =
-                cleanup_blocks.iter().map(BasicBlock::block_id).collect();
             let mut alive_cleanup = FxHashSet::default();
-            let mut pending: Vec<_> = exception_regions
-                .iter()
-                .map(|region| region.handler_entry())
-                .collect();
-            while let Some(block_id) = pending.pop() {
-                assert!(
-                    cleanup_ids.contains(&block_id),
-                    "exception region references missing cleanup block {block_id}"
-                );
-                if !alive_cleanup.insert(block_id) {
-                    continue;
-                }
-                let block = cleanup_blocks
-                    .iter()
-                    .find(|block| block.block_id() == block_id)
-                    .expect("cleanup id set and cleanup block vector disagree");
-                for (target, sub_target) in block.targets_with_sub(asm) {
-                    assert_eq!(
-                        sub_target, 0,
-                        "canonical cleanup blocks cannot contain handler subtargets"
-                    );
-                    assert!(
-                        cleanup_ids.contains(&target),
-                        "cleanup block {block_id} branches outside the cleanup graph to {target}"
-                    );
-                    if !alive_cleanup.contains(&target) {
-                        pending.push(target);
-                    }
-                }
+            for region in exception_regions.iter() {
+                alive_cleanup.extend(reachable_block_ids(
+                    region.handler_entry(),
+                    cleanup_blocks,
+                    asm,
+                    false,
+                ));
             }
             cleanup_blocks.retain(|block| alive_cleanup.contains(&block.block_id()));
             return;
@@ -971,42 +958,26 @@ impl MethodDef {
         let Some(blocks) = self.implementation().blocks() else {
             return;
         };
-        // Check if the entry block does not jump anywhere(no targets) and has no handler - if so, only keep it.
-        if blocks[0].targets(asm).count() == 0 && blocks[0].handler().is_none() {
-            let entry = blocks[0].clone();
-            *self.implementation_mut().blocks_mut().unwrap() = vec![entry];
+        if blocks.is_empty() {
             return;
         }
-        let mut alive: FxHashSet<_> = blocks.iter().flat_map(|block| block.targets(asm)).collect();
-        // entry block is always live
-        alive.insert(blocks[0].block_id());
-        // if alive < total, then there are some dead blocks, then remove them.
-        if alive.len() >= blocks.len() {
-            return;
+        let alive = reachable_block_ids(blocks[0].block_id(), blocks, asm, true);
+        let blocks = self.implementation_mut().blocks_mut().unwrap();
+        blocks.retain(|block| alive.contains(&block.block_id()));
+
+        // Legacy handlers are nested CFGs rooted at their first block. Keep their unwind edge
+        // whenever the protected normal block is live, but do not let an unreachable handler
+        // cycle contribute calls to whole-program reachability.
+        for block in blocks {
+            let Some(handler) = block.handler_mut() else {
+                continue;
+            };
+            let Some(entry) = handler.first().map(BasicBlock::block_id) else {
+                continue;
+            };
+            let alive_handler = reachable_block_ids(entry, handler, asm, false);
+            handler.retain(|block| alive_handler.contains(&block.block_id()));
         }
-        // If handlers jump to normal blocks, do not GC.
-        if blocks
-            .iter()
-            .flat_map(|block| block.handler())
-            .flatten()
-            .flat_map(|block| block.roots())
-            .any(|root| {
-                matches!(
-                    asm[*root],
-                    CILRoot::ExitSpecialRegion {
-                        target: _,
-                        source: _
-                    }
-                )
-            })
-        {
-            return;
-        }
-        //let blocks_copy = blocks.clone();
-        self.implementation_mut()
-            .blocks_mut()
-            .unwrap()
-            .retain(|block| alive.contains(&block.block_id()));
     }
 
     pub(crate) fn locals(&self) -> Option<&[LocalDef]> {
@@ -1030,6 +1001,60 @@ impl MethodDef {
             )
         })
     }
+}
+
+fn reachable_block_ids(
+    entrypoint: BlockId,
+    blocks: &[BasicBlock],
+    asm: &Assembly,
+    include_handler_edges: bool,
+) -> FxHashSet<BlockId> {
+    let by_id: FxHashMap<_, _> = blocks
+        .iter()
+        .map(|block| (block.block_id(), block))
+        .collect();
+    let mut alive = FxHashSet::default();
+    let mut pending = vec![entrypoint];
+    while let Some(block_id) = pending.pop() {
+        if !alive.insert(block_id) {
+            continue;
+        }
+        let Some(block) = by_id.get(&block_id) else {
+            // Leave invalid branch targets for the verifier to diagnose; CFG cleanup must never
+            // turn malformed input into a panic or manufacture a replacement block.
+            continue;
+        };
+        pending.extend(
+            block
+                .targets(asm)
+                .filter(|target| by_id.contains_key(target)),
+        );
+
+        if include_handler_edges {
+            for handler in block
+                .handler()
+                .into_iter()
+                .filter(|handler| !handler.is_empty())
+            {
+                let alive_handler = reachable_block_ids(handler[0].block_id(), handler, asm, false);
+                for root in handler
+                    .iter()
+                    .filter(|block| alive_handler.contains(&block.block_id()))
+                    .flat_map(BasicBlock::iter_roots)
+                {
+                    let target = match asm.get_root(root) {
+                        CILRoot::ExitSpecialRegion { target, .. } => Some(*target),
+                        CILRoot::Branch(info) => Some(if info.1 == 0 { info.0 } else { info.1 }),
+                        _ => None,
+                    };
+                    if let Some(target) = target.filter(|target| by_id.contains_key(target)) {
+                        pending.push(target);
+                    }
+                }
+            }
+        }
+    }
+    alive
 }
 pub type LocalDef = (Option<Interned<IString>>, Interned<Type>);
 
