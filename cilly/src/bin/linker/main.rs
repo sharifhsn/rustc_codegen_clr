@@ -493,6 +493,7 @@ fn main() {
     // independently of whether Rust panic unwinding itself is enabled.
     cilly::builtins::unwind::find_enclosing_function(&mut final_assembly, &mut overrides);
     cilly::builtins::unwind::get_cfa(&mut final_assembly, &mut overrides);
+    cilly::builtins::unwind::get_ip(&mut final_assembly, &mut overrides);
     cilly::builtins::unwind::backtrace_end_of_stack(&mut final_assembly, &mut overrides);
 
     overrides.insert(

@@ -289,6 +289,9 @@ pub enum RuntimeService {
     /// The libgcc/libunwind accessor for a native unwind context's stack pointer.
     /// Managed CIL cannot produce such a context, so the registered capability reports no CFA.
     UnwindGetCfa,
+    /// The libgcc/libunwind accessor for a native unwind context's instruction pointer.
+    /// Managed CIL cannot produce such a context, so the registered capability reports no IP.
+    UnwindGetIp,
     /// The libgcc/libunwind frame walker.
     /// Managed CIL has no native unwind table to walk, so the registered capability reports EOF.
     UnwindBacktrace,
@@ -353,6 +356,7 @@ impl RuntimeService {
             | "__rust_no_alloc_shim_is_unstable_v2" => Some(Self::NoAllocShim),
             "_Unwind_FindEnclosingFunction" => Some(Self::UnwindFindEnclosingFunction),
             "_Unwind_GetCFA" => Some(Self::UnwindGetCfa),
+            "_Unwind_GetIP" => Some(Self::UnwindGetIp),
             "_Unwind_Backtrace" => Some(Self::UnwindBacktrace),
             _ => PanicKind::ALL
                 .into_iter()
@@ -373,6 +377,7 @@ impl RuntimeService {
             Self::CoreUbPrecondition => "core::ub_checks::precondition_check",
             Self::UnwindFindEnclosingFunction => "_Unwind_FindEnclosingFunction",
             Self::UnwindGetCfa => "_Unwind_GetCFA",
+            Self::UnwindGetIp => "_Unwind_GetIP",
             Self::UnwindBacktrace => "_Unwind_Backtrace",
         }
     }
@@ -391,6 +396,7 @@ pub enum RuntimeCapability {
     PatcherOverride,
     BuiltinUnwindIdentity,
     BuiltinUnwindCfaUnavailable,
+    BuiltinUnwindIpUnavailable,
     BuiltinUnwindBacktraceEndOfStack,
     DeclaredNativeImport,
     LegacyNativeImport,
@@ -560,6 +566,7 @@ pub struct MissingMethodResolutionStats {
     pub core_ub_precondition_shims_synthesized: usize,
     pub unwind_shims_synthesized: usize,
     pub unwind_cfa_shims_synthesized: usize,
+    pub unwind_ip_shims_synthesized: usize,
     pub unwind_backtrace_shims_synthesized: usize,
     pub missing_stubs_synthesized: usize,
     pub unresolved_missing_methods: usize,
@@ -606,6 +613,17 @@ impl MissingMethodResolutionStats {
                 capability: RuntimeCapability::BuiltinUnwindCfaUnavailable,
                 service,
             } => panic!("managed unwind CFA fallback recorded for wrong service {service:?}"),
+            MethodResolution::Resolved {
+                capability: RuntimeCapability::BuiltinUnwindIpUnavailable,
+                service: Some(RuntimeService::UnwindGetIp),
+            } => {
+                self.unwind_shims_synthesized += 1;
+                self.unwind_ip_shims_synthesized += 1;
+            }
+            MethodResolution::Resolved {
+                capability: RuntimeCapability::BuiltinUnwindIpUnavailable,
+                service,
+            } => panic!("managed unwind IP fallback recorded for wrong service {service:?}"),
             MethodResolution::Resolved {
                 capability: RuntimeCapability::BuiltinUnwindBacktraceEndOfStack,
                 service: Some(RuntimeService::UnwindBacktrace),
@@ -3050,6 +3068,7 @@ impl Assembly {
             if let Some(
                 service @ (RuntimeService::UnwindFindEnclosingFunction
                 | RuntimeService::UnwindGetCfa
+                | RuntimeService::UnwindGetIp
                 | RuntimeService::UnwindBacktrace),
             ) = service
             {
@@ -3061,7 +3080,7 @@ impl Assembly {
                             && signature.inputs()[0] == *signature.output()
                             && self.is_rust_c_void_pointer(signature.inputs()[0])
                     }
-                    RuntimeService::UnwindGetCfa => {
+                    RuntimeService::UnwindGetCfa | RuntimeService::UnwindGetIp => {
                         matches!(signature.inputs(), [input] if self.is_void_pointer(*input))
                             && *signature.output() == Type::Int(Int::USize)
                     }
@@ -3080,7 +3099,7 @@ impl Assembly {
                         RuntimeService::UnwindFindEnclosingFunction => {
                             "static nongeneric MainModule identity function with one `core::ffi::c_void` pointer input and the same pointer output"
                         }
-                        RuntimeService::UnwindGetCfa => {
+                        RuntimeService::UnwindGetCfa | RuntimeService::UnwindGetIp => {
                             "static nongeneric MainModule function with one opaque `*void` unwind-context input and a `usize` output"
                         }
                         RuntimeService::UnwindBacktrace => {
@@ -3132,6 +3151,9 @@ impl Assembly {
                         }
                         Some(RuntimeService::UnwindGetCfa) => {
                             RuntimeCapability::BuiltinUnwindCfaUnavailable
+                        }
+                        Some(RuntimeService::UnwindGetIp) => {
+                            RuntimeCapability::BuiltinUnwindIpUnavailable
                         }
                         Some(RuntimeService::UnwindBacktrace) => {
                             RuntimeCapability::BuiltinUnwindBacktraceEndOfStack
@@ -6594,6 +6616,10 @@ fn panic_runtime_service_classification_is_exact_and_covers_the_pinned_set() {
         Some(RuntimeService::UnwindGetCfa)
     );
     assert_eq!(
+        RuntimeService::classify("_Unwind_GetIP"),
+        Some(RuntimeService::UnwindGetIp)
+    );
+    assert_eq!(
         RuntimeService::classify("_Unwind_Backtrace"),
         Some(RuntimeService::UnwindBacktrace)
     );
@@ -6605,6 +6631,9 @@ fn panic_runtime_service_classification_is_exact_and_covers_the_pinned_set() {
         "my_crate::_Unwind_GetCFA",
         "_Unwind_GetCFA_suffix",
         "prefix_Unwind_GetCFA",
+        "my_crate::_Unwind_GetIP",
+        "_Unwind_GetIP_suffix",
+        "prefix_Unwind_GetIP",
         "my_crate::_Unwind_Backtrace",
         "_Unwind_Backtrace_suffix",
         "prefix_Unwind_Backtrace",
@@ -7085,6 +7114,106 @@ fn managed_unwind_cfa_rejects_near_miss_abis_and_requires_capability() {
 }
 
 #[test]
+fn managed_unwind_ip_capability_reports_unavailable_with_exact_abi() {
+    let mut asm = Assembly::default();
+    let context = asm.nptr(Type::Void);
+    let method = Interned::<MethodRef>::builtin(
+        &mut asm,
+        "_Unwind_GetIP",
+        &[context],
+        Type::Int(Int::USize),
+    );
+    let mut patcher = MissingMethodPatcher::default();
+    super::builtins::unwind::get_ip(&mut asm, &mut patcher);
+
+    let stats = asm
+        .try_resolve_missing_methods(&FxHashMap::default(), &FxHashSet::default(), &patcher)
+        .unwrap();
+    assert_eq!(stats.unwind_shims_synthesized, 1);
+    assert_eq!(stats.unwind_cfa_shims_synthesized, 0);
+    assert_eq!(stats.unwind_ip_shims_synthesized, 1);
+    assert_eq!(stats.unwind_backtrace_shims_synthesized, 0);
+    let definition = &asm[asm.method_ref_to_def(method).unwrap()];
+    let MethodImpl::MethodBody { blocks, locals } = definition.implementation() else {
+        panic!("managed unwind IP capability did not produce a method body")
+    };
+    assert!(locals.is_empty());
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].roots().len(), 1);
+    let CILRoot::Ret(value) = &asm[blocks[0].roots()[0]] else {
+        panic!("managed unwind IP capability must return a value")
+    };
+    let CILNode::Const(value) = &asm[*value] else {
+        panic!("managed unwind IP capability must return a constant")
+    };
+    assert_eq!(value.as_ref(), &Const::USize(0));
+    assert_eq!(asm.typecheck(), 0);
+}
+
+#[test]
+fn managed_unwind_ip_rejects_near_miss_abis_and_requires_capability() {
+    fn assert_rejected(make: impl FnOnce(&mut Assembly) -> Interned<MethodRef>) {
+        let mut asm = Assembly::default();
+        let method = make(&mut asm);
+        let mut patcher = MissingMethodPatcher::default();
+        super::builtins::unwind::get_ip(&mut asm, &mut patcher);
+        let error = asm
+            .try_resolve_missing_methods(&FxHashMap::default(), &FxHashSet::default(), &patcher)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MissingMethodResolutionError::RuntimeServiceSignatureMismatch {
+                service: RuntimeService::UnwindGetIp,
+                ..
+            }
+        ));
+        assert!(asm.method_ref_to_def(method).is_none());
+    }
+
+    assert_rejected(|asm| {
+        Interned::<MethodRef>::builtin(asm, "_Unwind_GetIP", &[], Type::Int(Int::USize))
+    });
+    assert_rejected(|asm| {
+        let context = asm.nptr(Type::Void);
+        Interned::<MethodRef>::builtin(asm, "_Unwind_GetIP", &[context], Type::Int(Int::ISize))
+    });
+    assert_rejected(|asm| {
+        let context = rust_c_void_pointer(asm);
+        Interned::<MethodRef>::builtin(asm, "_Unwind_GetIP", &[context], Type::Int(Int::USize))
+    });
+    assert_rejected(|asm| {
+        let context = asm.nptr(Type::Void);
+        let signature = asm.sig([context], Type::Int(Int::USize));
+        let main = *asm.main_module();
+        asm.new_methodref(main, "_Unwind_GetIP", signature, MethodKind::Instance, [])
+    });
+
+    let mut asm = Assembly::default();
+    let context = asm.nptr(Type::Void);
+    let method = Interned::<MethodRef>::builtin(
+        &mut asm,
+        "_Unwind_GetIP",
+        &[context],
+        Type::Int(Int::USize),
+    );
+    let error = asm
+        .try_resolve_missing_methods(
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+            &MissingMethodPatcher::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MissingMethodResolutionError::UnsupportedRuntimeService {
+            service: RuntimeService::UnwindGetIp,
+            ..
+        }
+    ));
+    assert!(asm.method_ref_to_def(method).is_none());
+}
+
+#[test]
 fn managed_unwind_backtrace_capability_returns_end_of_stack() {
     let mut asm = Assembly::default();
     let method = unwind_backtrace_method(&mut asm);
@@ -7246,6 +7375,20 @@ fn linked_unwind_context_services_win_over_managed_fallbacks() {
     };
     asm.new_method(asm[get_cfa].clone().into_def(body, Access::Public, &asm));
 
+    let get_ip = Interned::<MethodRef>::builtin(
+        &mut asm,
+        "_Unwind_GetIP",
+        &[context],
+        Type::Int(Int::USize),
+    );
+    let get_ip_value = asm.alloc_node(Const::USize(23));
+    let get_ip_marker = asm.alloc_root(CILRoot::Ret(get_ip_value));
+    let body = MethodImpl::MethodBody {
+        blocks: vec![super::BasicBlock::new(vec![get_ip_marker], 0, None)],
+        locals: vec![],
+    };
+    asm.new_method(asm[get_ip].clone().into_def(body, Access::Public, &asm));
+
     let backtrace = unwind_backtrace_method(&mut asm);
     let reason = *asm[asm[backtrace].sig()].output();
     let reason = asm.alloc_type(reason);
@@ -7259,12 +7402,14 @@ fn linked_unwind_context_services_win_over_managed_fallbacks() {
 
     let mut patcher = MissingMethodPatcher::default();
     super::builtins::unwind::get_cfa(&mut asm, &mut patcher);
+    super::builtins::unwind::get_ip(&mut asm, &mut patcher);
     super::builtins::unwind::backtrace_end_of_stack(&mut asm, &mut patcher);
     let stats = asm
         .try_resolve_missing_methods(&FxHashMap::default(), &FxHashSet::default(), &patcher)
         .unwrap();
-    assert_eq!(stats.already_defined, 2);
+    assert_eq!(stats.already_defined, 3);
     assert_eq!(stats.unwind_cfa_shims_synthesized, 0);
+    assert_eq!(stats.unwind_ip_shims_synthesized, 0);
     assert_eq!(stats.unwind_backtrace_shims_synthesized, 0);
     let MethodImpl::MethodBody { blocks, .. } =
         asm[asm.method_ref_to_def(get_cfa).unwrap()].implementation()
@@ -7272,6 +7417,12 @@ fn linked_unwind_context_services_win_over_managed_fallbacks() {
         panic!("linked GetCFA definition changed implementation kind")
     };
     assert_eq!(blocks[0].roots(), &[get_cfa_marker]);
+    let MethodImpl::MethodBody { blocks, .. } =
+        asm[asm.method_ref_to_def(get_ip).unwrap()].implementation()
+    else {
+        panic!("linked GetIP definition changed implementation kind")
+    };
+    assert_eq!(blocks[0].roots(), &[get_ip_marker]);
     let MethodImpl::MethodBody { blocks, .. } =
         asm[asm.method_ref_to_def(backtrace).unwrap()].implementation()
     else {

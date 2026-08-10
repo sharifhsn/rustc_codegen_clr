@@ -63,6 +63,26 @@ pub fn get_cfa(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     );
 }
 
+/// Registers the managed fallback for libunwind's instruction-pointer accessor.
+///
+/// The only pinned-`std` caller reads a return address from a native `_Unwind_Context`. The managed
+/// `_Unwind_Backtrace` capability never constructs or exposes such a context, so zero truthfully
+/// reports that no native instruction pointer is available.
+pub fn get_ip(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    patcher.insert_runtime_service(
+        asm,
+        RuntimeService::UnwindGetIp,
+        Box::new(|_, asm| {
+            let unavailable = asm.alloc_node(Const::USize(0));
+            let ret = asm.alloc_root(CILRoot::Ret(unavailable));
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            }
+        }),
+    );
+}
+
 /// Registers the managed fallback for libunwind's native frame walker.
 ///
 /// Managed assemblies have no DWARF unwind table and therefore expose no native frames to the
