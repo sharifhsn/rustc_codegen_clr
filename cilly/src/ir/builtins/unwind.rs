@@ -15,9 +15,9 @@
 //! payload round-trips unchanged.
 
 use crate::{
-    BasicBlock, CILNode, CILRoot, ClassRef, Int, MethodImpl, MethodRef, Type,
+    BasicBlock, CILNode, CILRoot, ClassRef, Const, Int, MethodImpl, MethodRef, Type,
     asm::{MissingMethodPatcher, RuntimeService},
-    cilnode::{IsPure, MethodKind},
+    cilnode::{IsPure, MethodKind, PtrCastRes},
 };
 
 use super::super::Assembly;
@@ -38,6 +38,61 @@ pub fn find_enclosing_function(asm: &mut Assembly, patcher: &mut MissingMethodPa
             MethodImpl::MethodBody {
                 blocks: vec![BasicBlock::new(vec![ret], 0, None)],
                 locals: vec![],
+            }
+        }),
+    );
+}
+
+/// Registers the managed fallback for libunwind's canonical-frame-address accessor.
+///
+/// The only pinned-`std` caller uses this to copy the stack pointer out of a native
+/// `_Unwind_Context`. The managed `_Unwind_Backtrace` capability never constructs or exposes such
+/// a context, so zero is the only truthful value: no native stack pointer is available.
+pub fn get_cfa(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    patcher.insert_runtime_service(
+        asm,
+        RuntimeService::UnwindGetCfa,
+        Box::new(|_, asm| {
+            let unavailable = asm.alloc_node(Const::USize(0));
+            let ret = asm.alloc_root(CILRoot::Ret(unavailable));
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            }
+        }),
+    );
+}
+
+/// Registers the managed fallback for libunwind's native frame walker.
+///
+/// Managed assemblies have no DWARF unwind table and therefore expose no native frames to the
+/// callback. Returning `_URC_END_OF_STACK` (the pinned ABI value `5`) reports that empty walk
+/// deterministically instead of returning an uninitialized local.
+pub fn backtrace_end_of_stack(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    patcher.insert_runtime_service(
+        asm,
+        RuntimeService::UnwindBacktrace,
+        Box::new(|mref, asm| {
+            let output = *asm[asm[mref].sig()].output();
+            let output = asm.alloc_type(output);
+            let i32_type = asm.alloc_type(Type::Int(Int::I32));
+            let output_address = asm.alloc_node(CILNode::LdLocA(0));
+            let output_address = asm.alloc_node(CILNode::PtrCast(
+                output_address,
+                Box::new(PtrCastRes::Ptr(i32_type)),
+            ));
+            let end_of_stack = asm.alloc_node(Const::I32(5));
+            let initialize = asm.alloc_root(CILRoot::StInd(Box::new((
+                output_address,
+                end_of_stack,
+                Type::Int(Int::I32),
+                false,
+            ))));
+            let result = asm.alloc_node(CILNode::LdLoc(0));
+            let ret = asm.alloc_root(CILRoot::Ret(result));
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![initialize, ret], 0, None)],
+                locals: vec![(None, output)],
             }
         }),
     );

@@ -9,8 +9,8 @@ use cilly::{
     DEAD_CODE_ELIMINATION,
     libc_fns::{self, LIBC_FNS, LIBC_MODIFIES_ERRNO},
     {
-        ArtifactAbiConfig, ArtifactAbiConfigMismatch, Assembly, BasicBlock, CILNode, CILRoot,
-        ClassDef, ClassRef, Const, DotnetRuntime, Int, MethodImpl, Type, asm::MissingMethodPatcher,
+        ArtifactAbiConfig, ArtifactAbiConfigMismatch, Assembly, BasicBlock, CILRoot, ClassDef,
+        ClassRef, Const, DotnetRuntime, Int, MethodImpl, Type, asm::MissingMethodPatcher,
         cilnode::MethodKind,
     },
 };
@@ -492,23 +492,8 @@ fn main() {
     // `_Unwind_FindEnclosingFunction` is unavailable or unreliable. This capability is needed
     // independently of whether Rust panic unwinding itself is enabled.
     cilly::builtins::unwind::find_enclosing_function(&mut final_assembly, &mut overrides);
-    overrides.insert(
-        final_assembly.alloc_string("_Unwind_Backtrace"),
-        Box::new(|mref, asm| {
-            // 1 Get the output of the method.
-            let mref = &asm[mref];
-            let sig = asm[mref.sig()].clone();
-            let output = sig.output();
-            // 2. Create one local of the output type
-            let loc_name = asm.alloc_string("uninit");
-            let locals = vec![(Some(loc_name), asm.alloc_type(*output))];
-            // 3. Create CIL returning an uninitialized value of this type. TODO: even tough this value is shortly discarded on the Rust side, this is UB. Consider zero-initializing it.
-            let loc = asm.alloc_node(CILNode::LdLoc(0));
-            let ret = asm.alloc_root(CILRoot::Ret(loc));
-            let blocks = vec![BasicBlock::new(vec![ret], 0, None)];
-            MethodImpl::MethodBody { blocks, locals }
-        }),
-    );
+    cilly::builtins::unwind::get_cfa(&mut final_assembly, &mut overrides);
+    cilly::builtins::unwind::backtrace_end_of_stack(&mut final_assembly, &mut overrides);
 
     overrides.insert(
         final_assembly.alloc_string("_Unwind_DeleteException"),
