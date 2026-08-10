@@ -16,11 +16,32 @@
 
 use crate::{
     BasicBlock, CILNode, CILRoot, ClassRef, Int, MethodImpl, MethodRef, Type,
-    asm::MissingMethodPatcher,
+    asm::{MissingMethodPatcher, RuntimeService},
     cilnode::{IsPure, MethodKind},
 };
 
 use super::super::Assembly;
+
+/// Registers the managed fallback for libunwind's symbol-address helper.
+///
+/// `std::backtrace` uses `_Unwind_FindEnclosingFunction` only to turn a frame program counter into
+/// a symbol address. Managed CIL has no native DWARF unwind table to query. Returning the original
+/// pointer matches Rust's own fallback on targets where the native helper is unavailable or
+/// unreliable, while preserving backtrace capture instead of returning null or terminating.
+pub fn find_enclosing_function(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    patcher.insert_runtime_service(
+        asm,
+        RuntimeService::UnwindFindEnclosingFunction,
+        Box::new(|_, asm| {
+            let pc = asm.alloc_node(CILNode::LdArg(0));
+            let ret = asm.alloc_root(CILRoot::Ret(pc));
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            }
+        }),
+    );
+}
 
 /// Registers the .NET throw-bridge: overrides `_Unwind_RaiseException` to throw a `RustException`
 /// wrapping its `*mut _Unwind_Exception` argument. Requires [`super::insert_exception`] (which defines

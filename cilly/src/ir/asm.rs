@@ -283,6 +283,9 @@ pub enum RuntimeService {
     Panic(PanicKind),
     /// A monomorphic helper emitted by `core::ub_checks::assert_unsafe_precondition!`.
     CoreUbPrecondition,
+    /// The libgcc/libunwind helper used only to turn a program counter into a symbol address.
+    /// Managed CIL has no DWARF FDE to query, so the registered capability preserves the PC.
+    UnwindFindEnclosingFunction,
 }
 
 fn is_core_ub_precondition(demangled: &str) -> bool {
@@ -342,6 +345,7 @@ impl RuntimeService {
             | "__rustc::__rust_no_alloc_shim_is_unstable_v2"
             | "__rust_no_alloc_shim_is_unstable"
             | "__rust_no_alloc_shim_is_unstable_v2" => Some(Self::NoAllocShim),
+            "_Unwind_FindEnclosingFunction" => Some(Self::UnwindFindEnclosingFunction),
             _ => PanicKind::ALL
                 .into_iter()
                 .find(|kind| demangled == kind.canonical_symbol())
@@ -359,6 +363,7 @@ impl RuntimeService {
             Self::NoAllocShim => "__rust_no_alloc_shim_is_unstable",
             Self::Panic(kind) => kind.canonical_symbol(),
             Self::CoreUbPrecondition => "core::ub_checks::precondition_check",
+            Self::UnwindFindEnclosingFunction => "_Unwind_FindEnclosingFunction",
         }
     }
 
@@ -374,6 +379,7 @@ impl RuntimeService {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeCapability {
     PatcherOverride,
+    BuiltinUnwindIdentity,
     DeclaredNativeImport,
     LegacyNativeImport,
     BuiltinNoOp,
@@ -409,6 +415,12 @@ pub enum MissingMethodResolutionError {
         owner: String,
         member: String,
     },
+    RuntimeServiceSignatureMismatch {
+        service: RuntimeService,
+        emitted_symbol: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 impl std::fmt::Display for MissingMethodResolutionError {
@@ -432,6 +444,15 @@ impl std::fmt::Display for MissingMethodResolutionError {
             Self::MissingOwner { owner, member } => write!(
                 f,
                 "cannot synthesize missing method `{member}` because owner type `{owner}` has no definition"
+            ),
+            Self::RuntimeServiceSignatureMismatch {
+                service,
+                emitted_symbol,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "runtime service {service:?} requested by `{emitted_symbol}` has signature {actual}; expected {expected}"
             ),
         }
     }
@@ -525,6 +546,7 @@ pub struct MissingMethodResolutionStats {
     pub no_alloc_shims_synthesized: usize,
     pub panic_shims_synthesized: usize,
     pub core_ub_precondition_shims_synthesized: usize,
+    pub unwind_shims_synthesized: usize,
     pub missing_stubs_synthesized: usize,
     pub unresolved_missing_methods: usize,
 }
@@ -551,6 +573,14 @@ impl MissingMethodResolutionStats {
                     self.allocator_shims_synthesized += 1;
                 }
             }
+            MethodResolution::Resolved {
+                capability: RuntimeCapability::BuiltinUnwindIdentity,
+                service: Some(RuntimeService::UnwindFindEnclosingFunction),
+            } => self.unwind_shims_synthesized += 1,
+            MethodResolution::Resolved {
+                capability: RuntimeCapability::BuiltinUnwindIdentity,
+                service,
+            } => panic!("managed unwind identity recorded for wrong service {service:?}"),
             MethodResolution::Resolved {
                 capability: RuntimeCapability::DeclaredNativeImport,
                 ..
@@ -652,6 +682,7 @@ impl std::fmt::Display for MissingMethodResolutionStats {
             f,
             "processed {} method refs ({} discovered during resolution): {} overrides, {} externs, \
              {} allocator shims, {} no-alloc shims, {} panic shims, {} core UB precondition shims, \
+             {} unwind shims, \
              {} missing stubs; {} unresolved non-abstract MethodImpl::Missing definitions remain",
             self.method_refs_processed,
             self.method_refs_added,
@@ -661,6 +692,7 @@ impl std::fmt::Display for MissingMethodResolutionStats {
             self.no_alloc_shims_synthesized,
             self.panic_shims_synthesized,
             self.core_ub_precondition_shims_synthesized,
+            self.unwind_shims_synthesized,
             self.missing_stubs_synthesized,
             self.unresolved_missing_methods,
         )
@@ -2827,6 +2859,27 @@ impl Assembly {
             .unwrap_or_else(|error| panic!("linker: {error}"))
     }
 
+    fn is_rust_c_void_pointer(&self, candidate: Type) -> bool {
+        let Type::Ptr(pointee) = candidate else {
+            return false;
+        };
+        let Type::ClassRef(class) = self[pointee] else {
+            return false;
+        };
+        let class = self.class_ref(class);
+        if !class.is_valuetype() || class.asm().is_some() || !class.generics().is_empty() {
+            return false;
+        }
+        let name = &self[class.name()];
+        let Some(identity) = name.strip_prefix("core.ffi.c_void.tid_") else {
+            return false;
+        };
+        identity.len() == 32
+            && identity
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
     /// Strict missing-method resolution. Known runtime services without a registered target
     /// capability and malformed local owners are returned as structured errors rather than being
     /// converted into delayed runtime-throwing stubs.
@@ -2916,6 +2969,34 @@ impl Assembly {
             // to the POSIX `write` builtin merely because both end in the same word.
             let emitted_name = self[mref.name()].to_string();
             let service = RuntimeService::classify(&emitted_name);
+            if service == Some(RuntimeService::UnwindFindEnclosingFunction) {
+                let signature = &self[mref.sig()];
+                let pointer_identity = signature.inputs().len() == 1
+                    && signature.inputs()[0] == *signature.output()
+                    && self.is_rust_c_void_pointer(signature.inputs()[0]);
+                if mref.kind() != MethodKind::Static
+                    || !mref.generics().is_empty()
+                    || !self.class_ref(mref.class()).generics().is_empty()
+                    || !pointer_identity
+                {
+                    return Err(
+                        MissingMethodResolutionError::RuntimeServiceSignatureMismatch {
+                            service: RuntimeService::UnwindFindEnclosingFunction,
+                            emitted_symbol: emitted_name,
+                            expected:
+                                "static nongeneric identity function with one `core::ffi::c_void` pointer input and the same pointer output"
+                                    .to_string(),
+                            actual: format!(
+                                "{:?} {:?} with {} method generic arguments and {} owner generic arguments",
+                                mref.kind(),
+                                signature,
+                                mref.generics().len(),
+                                self.class_ref(mref.class()).generics().len(),
+                            ),
+                        },
+                    );
+                }
+            }
             let compatibility_key = service
                 .filter(|service| service.requires_registered_capability())
                 .map(|service| self.alloc_string(service.canonical_symbol()));
@@ -2938,7 +3019,11 @@ impl Assembly {
                 // culled; intra-class callers (the `::stable` executables) are unaffected.
                 self.new_method(mref.into_def(implementation, Access::Public, self));
                 stats.record(MethodResolution::Resolved {
-                    capability: RuntimeCapability::PatcherOverride,
+                    capability: if service == Some(RuntimeService::UnwindFindEnclosingFunction) {
+                        RuntimeCapability::BuiltinUnwindIdentity
+                    } else {
+                        RuntimeCapability::PatcherOverride
+                    },
                     service,
                 });
                 continue;
@@ -6386,6 +6471,19 @@ fn panic_runtime_service_classification_is_exact_and_covers_the_pinned_set() {
         assert_eq!(RuntimeService::classify(unrelated), None, "{unrelated}");
     }
 
+    assert_eq!(
+        RuntimeService::classify("_Unwind_FindEnclosingFunction"),
+        Some(RuntimeService::UnwindFindEnclosingFunction)
+    );
+    for unrelated in [
+        "my_crate::_Unwind_FindEnclosingFunction",
+        "_Unwind_FindEnclosingFunction_suffix",
+        "prefix_Unwind_FindEnclosingFunction",
+        "_RNvC1234_8my_crate29_Unwind_FindEnclosingFunction",
+    ] {
+        assert_eq!(RuntimeService::classify(unrelated), None, "{unrelated}");
+    }
+
     let pointer_guard =
         "_RNvNvMNtNtCs5bnaVnPOCY4_4core3ptr9const_ptrPp20offset_from_unsigned18precondition_check";
     assert_eq!(
@@ -6424,6 +6522,265 @@ fn panic_runtime_service_classification_is_exact_and_covers_the_pinned_set() {
     ] {
         assert_eq!(RuntimeService::classify(unrelated), None, "{unrelated}");
     }
+}
+
+#[cfg(test)]
+fn rust_c_void_pointer(asm: &mut Assembly) -> Type {
+    let name = asm.alloc_string("core.ffi.c_void.tid_1c1f13fc4e744fd85b767c73c88e69aa");
+    let class = asm
+        .class_def(ClassDef::new(
+            name,
+            true,
+            0,
+            None,
+            vec![],
+            vec![],
+            Access::Assembly,
+            std::num::NonZeroU32::new(1),
+            std::num::NonZeroU32::new(1),
+            true,
+        ))
+        .unwrap();
+    let pointee = asm.alloc_type(Type::ClassRef(class.0));
+    Type::Ptr(pointee)
+}
+
+#[cfg(test)]
+fn named_test_pointer(
+    asm: &mut Assembly,
+    name: &str,
+    is_valuetype: bool,
+    assembly: Option<&str>,
+    generics: Vec<Type>,
+) -> Type {
+    let name = asm.alloc_string(name);
+    let assembly = assembly.map(|assembly| asm.alloc_string(assembly));
+    let class = asm.alloc_class_ref(ClassRef::new(
+        name,
+        assembly,
+        is_valuetype,
+        generics.into_boxed_slice(),
+    ));
+    let pointee = asm.alloc_type(Type::ClassRef(class));
+    Type::Ptr(pointee)
+}
+
+#[test]
+fn managed_unwind_symbol_address_capability_is_typed_identity_cil() {
+    let mut asm = Assembly::default();
+    let pointer = rust_c_void_pointer(&mut asm);
+    let method = Interned::<MethodRef>::builtin(
+        &mut asm,
+        "_Unwind_FindEnclosingFunction",
+        &[pointer],
+        pointer,
+    );
+    let mut patcher = MissingMethodPatcher::default();
+    super::builtins::unwind::find_enclosing_function(&mut asm, &mut patcher);
+
+    let stats = asm
+        .try_resolve_missing_methods(&FxHashMap::default(), &FxHashSet::default(), &patcher)
+        .unwrap();
+
+    assert_eq!(stats.unwind_shims_synthesized, 1);
+    assert_eq!(stats.overrides_applied, 0);
+    assert_eq!(stats.unresolved_missing_methods, 0);
+    let definition = &asm[asm.method_ref_to_def(method).unwrap()];
+    assert_eq!(definition.sig(), asm[method].sig());
+    let MethodImpl::MethodBody { blocks, locals } = definition.implementation() else {
+        panic!("managed unwind identity capability did not produce a method body")
+    };
+    assert!(locals.is_empty());
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].roots().len(), 1);
+    let CILRoot::Ret(value) = &asm[blocks[0].roots()[0]] else {
+        panic!("managed unwind identity capability must return its argument")
+    };
+    assert!(matches!(asm[*value], CILNode::LdArg(0)));
+
+    let (image, _) = asm
+        .prepared()
+        .verify_for_export()
+        .unwrap()
+        .try_render_pe(&test_pe_options("unwind-symbol-address-identity"))
+        .unwrap();
+    assert_eq!(&image[..2], b"MZ");
+}
+
+#[test]
+fn managed_unwind_symbol_address_requires_an_exact_abi_and_capability() {
+    fn assert_signature_rejected(make: impl FnOnce(&mut Assembly) -> Interned<MethodRef>) {
+        let mut asm = Assembly::default();
+        let method = make(&mut asm);
+        let mut patcher = MissingMethodPatcher::default();
+        super::builtins::unwind::find_enclosing_function(&mut asm, &mut patcher);
+        let error = asm
+            .try_resolve_missing_methods(&FxHashMap::default(), &FxHashSet::default(), &patcher)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MissingMethodResolutionError::RuntimeServiceSignatureMismatch {
+                service: RuntimeService::UnwindFindEnclosingFunction,
+                ..
+            }
+        ));
+        assert!(asm.method_ref_to_def(method).is_none());
+    }
+
+    assert_signature_rejected(|asm| {
+        let pointer = rust_c_void_pointer(asm);
+        Interned::<MethodRef>::builtin(asm, "_Unwind_FindEnclosingFunction", &[], pointer)
+    });
+    assert_signature_rejected(|asm| {
+        let pointer = rust_c_void_pointer(asm);
+        Interned::<MethodRef>::builtin(
+            asm,
+            "_Unwind_FindEnclosingFunction",
+            &[pointer],
+            Type::Int(Int::ISize),
+        )
+    });
+    assert_signature_rejected(|asm| {
+        let pointer = asm.nptr(Type::Void);
+        Interned::<MethodRef>::builtin(asm, "_Unwind_FindEnclosingFunction", &[pointer], pointer)
+    });
+    assert_signature_rejected(|asm| {
+        Interned::<MethodRef>::builtin(
+            asm,
+            "_Unwind_FindEnclosingFunction",
+            &[Type::Int(Int::ISize)],
+            Type::Int(Int::ISize),
+        )
+    });
+    for malformed in [
+        "core.ffi.c_void",
+        "core.ffi.c_void.tid_short",
+        "core.ffi.c_void.tid_1C1F13FC4E744FD85B767C73C88E69AA",
+        "core.ffi.c_void.tid_1c1f13fc4e744fd85b767c73c88e69ag",
+        "core.ffi.c_void.tid_1c1f13fc4e744fd85b767c73c88e69aa_suffix",
+    ] {
+        assert_signature_rejected(|asm| {
+            let pointer = named_test_pointer(asm, malformed, true, None, vec![]);
+            Interned::<MethodRef>::builtin(
+                asm,
+                "_Unwind_FindEnclosingFunction",
+                &[pointer],
+                pointer,
+            )
+        });
+    }
+    assert_signature_rejected(|asm| {
+        let pointer = named_test_pointer(
+            asm,
+            "core.ffi.c_void.tid_1c1f13fc4e744fd85b767c73c88e69aa",
+            false,
+            None,
+            vec![],
+        );
+        Interned::<MethodRef>::builtin(asm, "_Unwind_FindEnclosingFunction", &[pointer], pointer)
+    });
+    assert_signature_rejected(|asm| {
+        let pointer = named_test_pointer(
+            asm,
+            "core.ffi.c_void.tid_1c1f13fc4e744fd85b767c73c88e69aa",
+            true,
+            Some("foreign"),
+            vec![],
+        );
+        Interned::<MethodRef>::builtin(asm, "_Unwind_FindEnclosingFunction", &[pointer], pointer)
+    });
+    assert_signature_rejected(|asm| {
+        let pointer = named_test_pointer(
+            asm,
+            "core.ffi.c_void.tid_1c1f13fc4e744fd85b767c73c88e69aa",
+            true,
+            None,
+            vec![Type::Int(Int::I32)],
+        );
+        Interned::<MethodRef>::builtin(asm, "_Unwind_FindEnclosingFunction", &[pointer], pointer)
+    });
+    assert_signature_rejected(|asm| {
+        let pointer = rust_c_void_pointer(asm);
+        let signature = asm.sig([pointer], pointer);
+        let main = *asm.main_module();
+        asm.new_methodref(
+            main,
+            "_Unwind_FindEnclosingFunction",
+            signature,
+            MethodKind::Instance,
+            [],
+        )
+    });
+    assert_signature_rejected(|asm| {
+        let pointer = rust_c_void_pointer(asm);
+        let signature = asm.sig([pointer], pointer);
+        let main = *asm.main_module();
+        asm.new_methodref(
+            main,
+            "_Unwind_FindEnclosingFunction",
+            signature,
+            MethodKind::Static,
+            [Type::Int(Int::I32)],
+        )
+    });
+
+    let mut asm = Assembly::default();
+    let pointer = rust_c_void_pointer(&mut asm);
+    let method = Interned::<MethodRef>::builtin(
+        &mut asm,
+        "_Unwind_FindEnclosingFunction",
+        &[pointer],
+        pointer,
+    );
+    let error = asm
+        .try_resolve_missing_methods(
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+            &MissingMethodPatcher::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MissingMethodResolutionError::UnsupportedRuntimeService {
+            service: RuntimeService::UnwindFindEnclosingFunction,
+            ..
+        }
+    ));
+    assert!(asm.method_ref_to_def(method).is_none());
+}
+
+#[test]
+fn linked_unwind_symbol_address_definition_wins_over_the_managed_fallback() {
+    let mut asm = Assembly::default();
+    let pointer = rust_c_void_pointer(&mut asm);
+    let method = Interned::<MethodRef>::builtin(
+        &mut asm,
+        "_Unwind_FindEnclosingFunction",
+        &[pointer],
+        pointer,
+    );
+    let marker = asm.alloc_node(CILNode::LdArg(0));
+    let marker = asm.alloc_root(CILRoot::Ret(marker));
+    let body = MethodImpl::MethodBody {
+        blocks: vec![super::BasicBlock::new(vec![marker], 0, None)],
+        locals: vec![],
+    };
+    let definition = asm[method].clone().into_def(body, Access::Public, &asm);
+    asm.new_method(definition);
+    let mut patcher = MissingMethodPatcher::default();
+    super::builtins::unwind::find_enclosing_function(&mut asm, &mut patcher);
+
+    let stats = asm
+        .try_resolve_missing_methods(&FxHashMap::default(), &FxHashSet::default(), &patcher)
+        .unwrap();
+    assert_eq!(stats.already_defined, 1);
+    assert_eq!(stats.unwind_shims_synthesized, 0);
+    let MethodImpl::MethodBody { blocks, .. } =
+        asm[asm.method_ref_to_def(method).unwrap()].implementation()
+    else {
+        panic!("linked unwind definition changed implementation kind")
+    };
+    assert_eq!(blocks[0].roots(), &[marker]);
 }
 
 #[cfg(test)]

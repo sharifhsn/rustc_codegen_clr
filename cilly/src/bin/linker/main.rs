@@ -487,6 +487,11 @@ fn main() {
     if !panic_managed_backtrace && !no_unwind {
         cilly::builtins::unwind::raise_exception(&mut final_assembly, &mut overrides);
     }
+    // Managed assemblies have no DWARF FDE for libunwind to inspect. Preserve the program
+    // counter for std's symbol-address lookup, matching Rust's own fallback on targets where
+    // `_Unwind_FindEnclosingFunction` is unavailable or unreliable. This capability is needed
+    // independently of whether Rust panic unwinding itself is enabled.
+    cilly::builtins::unwind::find_enclosing_function(&mut final_assembly, &mut overrides);
     overrides.insert(
         final_assembly.alloc_string("_Unwind_Backtrace"),
         Box::new(|mref, asm| {
