@@ -695,6 +695,9 @@ pub struct Assembly {
     /// the physical CLR value type without changing Rust's `size_of` or pointer stride.
     #[serde(skip)]
     rust_semantic_sizes: FxHashMap<Interned<ClassRef>, u64>,
+    /// Non-serialized semantic indexes retained across repeated codegen-shard links.
+    #[serde(skip)]
+    pub(crate) link_preflight_index: Option<Box<super::asm_link::AssemblyLinkIndex>>,
 }
 
 /// A failure from the unconditional final-emission verifier.
@@ -965,6 +968,13 @@ impl Assembly {
             );
             return;
         }
+        self.link_preflight_index = None;
+        self.native_imports.push(import);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_native_import_unchecked_for_test(&mut self, import: NativeImport) {
+        self.link_preflight_index = None;
         self.native_imports.push(import);
     }
 
@@ -1232,6 +1242,13 @@ impl Assembly {
         }
     }
 
+    /// An injective, process-independent encoding of a class reference identity.
+    pub(crate) fn class_semantic_key(&self, class: Interned<ClassRef>) -> Vec<u8> {
+        let mut key = Vec::new();
+        self.push_class_semantic_key(&mut key, class);
+        key
+    }
+
     fn push_signature_semantic_key(&self, key: &mut Vec<u8>, signature: Interned<FnSig>) {
         let signature = &self[signature];
         Self::push_semantic_len(key, signature.inputs().len());
@@ -1294,6 +1311,13 @@ impl Assembly {
         }
     }
 
+    /// An injective, process-independent encoding of a CIL type identity.
+    pub(crate) fn type_semantic_key(&self, tpe: Type) -> Vec<u8> {
+        let mut key = Vec::new();
+        self.push_type_semantic_key(&mut key, tpe);
+        key
+    }
+
     fn push_method_ref_semantic_key(&self, key: &mut Vec<u8>, method: Interned<MethodRef>) {
         let method = &self[method];
         self.push_class_semantic_key(key, method.class());
@@ -1311,11 +1335,15 @@ impl Assembly {
         }
     }
 
+    pub(crate) fn method_ref_semantic_key(&self, method: Interned<MethodRef>) -> Vec<u8> {
+        let mut key = Vec::new();
+        self.push_method_ref_semantic_key(&mut key, method);
+        key
+    }
+
     /// An injective, process-independent encoding of a method's complete `MethodRef` identity.
     pub(crate) fn method_semantic_key(&self, method: MethodDefIdx) -> Vec<u8> {
-        let mut key = Vec::new();
-        self.push_method_ref_semantic_key(&mut key, method.0);
-        key
+        self.method_ref_semantic_key(method.0)
     }
     /// Returns method definitions in a process-independent semantic order.
     ///
@@ -1391,9 +1419,16 @@ impl Assembly {
         budgets
     }
     pub(crate) fn borrow_methoddef(&mut self, def_id: MethodDefIdx) -> MethodDef {
+        // The returned definition can be changed through crate-private setters before it comes
+        // back. Conservatively discard semantic link identities at the borrow boundary.
+        self.link_preflight_index = None;
         self.method_defs.remove(&def_id).unwrap()
     }
     pub(crate) fn return_methoddef(&mut self, def_id: MethodDefIdx, def: MethodDef) {
+        // Most callers obtained `def` through `borrow_methoddef`, which already invalidates this
+        // cache. Keep the return boundary independently correct too: crate-internal callers and
+        // future refactors may synthesize a replacement whose MethodRef identity differs.
+        self.link_preflight_index = None;
         assert!(
             self.method_defs.insert(def_id, def).is_none(),
             "Could not return a methoddef, because a method def is already present."
@@ -1525,6 +1560,7 @@ impl Assembly {
         self.strings.get_id(&string.into())
     }
     pub fn class_mut(&mut self, id: ClassDefIdx) -> &mut ClassDef {
+        self.link_preflight_index = None;
         self.class_defs.get_mut(&id).unwrap()
     }
     #[must_use]
@@ -1678,6 +1714,7 @@ impl Assembly {
     }
     pub fn strct(&mut self, name: IString) -> Interned<ClassRef> {
         let class = ClassRef::new(self.alloc_string(name), None, true, vec![].into());
+        self.link_preflight_index = None;
         self.class_refs.alloc(class)
     }
 
@@ -1686,6 +1723,7 @@ impl Assembly {
     }
 
     pub fn alloc_class_ref(&mut self, cref: ClassRef) -> Interned<ClassRef> {
+        self.link_preflight_index = None;
         self.class_refs.alloc(cref)
     }
 
@@ -1840,6 +1878,7 @@ impl Assembly {
                 &self[def.name()]
             )
         }
+        self.link_preflight_index = None;
         self.class_defs.insert(ClassDefIdx(cref), def.clone());
         Ok(ClassDefIdx(cref))
     }
@@ -1893,6 +1932,7 @@ impl Assembly {
                 .add_def(def_idx);
         }
 
+        self.link_preflight_index = None;
         self.method_defs.insert(def_idx, def);
 
         def_idx
@@ -1900,6 +1940,7 @@ impl Assembly {
 
     #[cfg(test)]
     pub(crate) fn add_abstract_methods_bulk_for_test(&mut self, class: ClassDefIdx, count: usize) {
+        self.link_preflight_index = None;
         let sig = self.sig([], Type::Void);
         let mut methods = Vec::with_capacity(count);
         for index in 0..count {
@@ -2050,6 +2091,7 @@ impl Assembly {
         }
     }
     fn append_init_roots(&mut self, init: MethodDefIdx, roots: &[Interned<CILRoot>], name: &str) {
+        self.link_preflight_index = None;
         let init = self.method_defs.get_mut(&init).unwrap();
         let blocks = init
             .implementation_mut()
@@ -2302,6 +2344,7 @@ impl Assembly {
         assert!(wave.is_empty());
         assert!(next_wave.is_empty());
         // Set the method set to only include alive methods
+        self.link_preflight_index = None;
         self.method_defs = alive
             .iter()
             .map(|id| (*id, self.method_defs.remove(id).unwrap()))
@@ -2725,6 +2768,7 @@ impl Assembly {
         let alive: FxHashSet<_> = reachability.class_definitions().collect();
         drop(reachability);
         // Set the class_defs to only include alive classes
+        self.link_preflight_index = None;
         self.class_defs = alive
             .iter()
             .map(|id| (*id, self.class_defs.remove(id).unwrap()))
@@ -2735,6 +2779,7 @@ impl Assembly {
     }*/
     /// Reallocates the roots, freeing all dead ones.
     pub fn realloc_roots(&mut self) {
+        self.link_preflight_index = None;
         let mut new_roots = BiMap::default();
         for block in self.method_defs.values_mut().flat_map(|def| {
             def.implementation_mut()
@@ -3162,6 +3207,8 @@ impl Assembly {
             // Codegen-only; every semantic size has already become a CIL constant before an
             // assembly reaches relocation, linking, or serialization.
             rust_semantic_sizes: _,
+            // Derived, non-serialized semantic lookup cache maintained by the linker.
+            link_preflight_index: _,
         } = self;
     }
 
@@ -3197,6 +3244,7 @@ impl Assembly {
     /// generated types could call them. CLR `assembly` visibility provides that same capability
     /// without publishing the entire implementation through reflection and IntelliSense.
     pub fn hide_main_module_implementation_details(&mut self) -> usize {
+        self.link_preflight_index = None;
         let main_module_classes: FxHashSet<_> = self
             .class_defs
             .iter()
@@ -3328,13 +3376,79 @@ impl Assembly {
     }
 
     #[must_use]
-    pub fn link_with_stats(self, other: Self) -> (Self, super::asm_link::RelocationStats) {
+    pub fn link_with_stats(mut self, other: Self) -> (Self, super::asm_link::RelocationStats) {
+        let stats = self
+            .try_link_in_place(other)
+            .unwrap_or_else(|error| panic!("assembly link failed: {error}"));
+        (self, stats)
+    }
+
+    fn link_with_stats_unchecked(self, other: Self) -> (Self, super::asm_link::RelocationStats) {
         let (mut linked, stats) = super::asm_link::relocate_assembly(self, &other);
+        let link_preflight_index = linked.link_preflight_index.take();
         linked.sections.extend(other.sections);
         for import in other.native_imports {
             linked.add_native_import(import);
         }
+        linked.link_preflight_index = link_preflight_index;
         (linked, stats)
+    }
+
+    fn rebuild_with_class_kind_overrides(
+        mut self,
+        overrides: &super::asm_link::ClassKindOverrides,
+    ) -> Self {
+        let sections = std::mem::take(&mut self.sections);
+        let native_imports = std::mem::take(&mut self.native_imports);
+        let (mut rebuilt, _) = super::asm_link::relocate_assembly_with_class_kind_overrides(
+            Self::default(),
+            &self,
+            overrides.clone(),
+        );
+        rebuilt.sections = sections;
+        rebuilt.native_imports = native_imports;
+        rebuilt
+    }
+
+    /// Commits `other` into this assembly after a read-only semantic-conflict preflight.
+    ///
+    /// Every returned [`AssemblyLinkError`](super::asm_link::AssemblyLinkError) leaves `self`
+    /// unchanged. Once preflight succeeds, relocation retains its existing fail-stop invariant
+    /// behavior: an unexpected panic is not converted into a recoverable error.
+    pub fn try_link_in_place(
+        &mut self,
+        mut other: Self,
+    ) -> Result<super::asm_link::RelocationStats, super::asm_link::AssemblyLinkError> {
+        let plan = super::asm_link::preflight_assembly_link_cached(self, &mut other)?;
+        if plan.requires_class_kind_rebuild() {
+            // Rebuild a staged clone of the parent so every retained reference adopts the sole
+            // authoritative value kind. The original parent remains byte-for-byte untouched until
+            // normalized graphs pass the complete preflight and link successfully.
+            let mut normalized_parent = self
+                .clone()
+                .rebuild_with_class_kind_overrides(plan.class_kind_overrides());
+            let mut normalized_other =
+                other.rebuild_with_class_kind_overrides(plan.class_kind_overrides());
+            let normalized_plan = super::asm_link::preflight_assembly_link_cached(
+                &mut normalized_parent,
+                &mut normalized_other,
+            )?;
+            assert!(
+                !normalized_plan.requires_class_kind_rebuild(),
+                "class-kind reconciliation did not reach a canonical fixed point"
+            );
+            let mut preflight_stats = plan.preflight_stats();
+            preflight_stats.accumulate(normalized_plan.preflight_stats());
+            let (linked, mut stats) = normalized_parent.link_with_stats_unchecked(normalized_other);
+            stats.preflight = preflight_stats;
+            *self = linked;
+            return Ok(stats);
+        }
+        let destination = std::mem::take(self);
+        let (linked, mut stats) = destination.link_with_stats_unchecked(other);
+        stats.preflight = plan.preflight_stats();
+        *self = linked;
+        Ok(stats)
     }
 
     pub fn method_defs(&self) -> &FxHashMap<MethodDefIdx, MethodDef> {
@@ -3350,6 +3464,7 @@ impl Assembly {
     pub(crate) fn class_defs_mut_strings(
         &mut self,
     ) -> (&mut FxHashMap<ClassDefIdx, ClassDef>, &BiMap<IString>) {
+        self.link_preflight_index = None;
         (&mut self.class_defs, &self.strings)
     }
     /// Iteates trough *all the nodes* in this assembly
@@ -3368,6 +3483,11 @@ impl Assembly {
     }
     pub(crate) fn iter_class_refs(&self) -> impl Iterator<Item = &ClassRef> {
         self.class_refs.values().iter()
+    }
+    pub(crate) fn iter_class_ref_ids(
+        &self,
+    ) -> impl ExactSizeIterator<Item = Interned<ClassRef>> + DoubleEndedIterator {
+        self.class_refs.ids()
     }
     pub(crate) fn iter_field_descs(&self) -> impl Iterator<Item = &FieldDesc> {
         self.fields.values().iter()
@@ -3416,6 +3536,9 @@ impl Assembly {
     }
 
     pub fn shorten_strings(&mut self, size_cap: usize) {
+        // Class/method/native identity keys embed string contents. `map_values` preserves interned
+        // ids but changes their semantic values, so every cached key is stale afterward.
+        self.link_preflight_index = None;
         self.strings.map_values(|string| {
             if string.len() > size_cap {
                 eprint!("shortening {string}");

@@ -6,17 +6,22 @@ use crate::Assembly;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Prefix identifying the current, schema-v9 `cilly` assembly artifact before payload decoding.
-pub const ASSEMBLY_ARTIFACT_MAGIC: &[u8; 8] = b"CILLYAR9";
+/// Prefix identifying the current, schema-v11 `cilly` assembly artifact before payload decoding.
+///
+/// Version 11 needs nine bytes to keep the human-readable `CILLYAR` stem unambiguous; do not
+/// truncate the decimal version back into the eight-byte v9 prefix.
+pub const ASSEMBLY_ARTIFACT_MAGIC: &[u8; 9] = b"CILLYAR11";
 /// Current serialization-envelope version.
-pub const ASSEMBLY_ARTIFACT_VERSION: u16 = 9;
+pub const ASSEMBLY_ARTIFACT_VERSION: u16 = 11;
+const ASSEMBLY_ARTIFACT_V10_MAGIC: &[u8; 9] = b"CILLYAR10";
+const ASSEMBLY_ARTIFACT_V9_MAGIC: &[u8; 8] = b"CILLYAR9";
 
 /// Compatibility alias for the canonical runtime profile owned by the SDK crate.
 pub use rust_dotnet_sdk_core::runtime::DotnetVersion as DotnetRuntime;
 
 /// Immutable ABI choices that affect the IR emitted independently by each rustc process.
 ///
-/// Final-link and emitter settings deliberately do not live here: one V2 assembly can be exported
+/// Final-link and emitter settings deliberately do not live here: one interned assembly can be exported
 /// to multiple targets, and allocator/emitter policy can be selected after all inputs are loaded.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ArtifactAbiConfig {
@@ -302,6 +307,22 @@ pub fn decode_assembly_artifact(encoded: &[u8]) -> Result<AssemblyArtifact, Arti
             });
         }
         Ok(artifact)
+    } else if encoded.starts_with(ASSEMBLY_ARTIFACT_V10_MAGIC) {
+        // CILRoot gained the durable special-initializer fragment boundary in schema 11. Never
+        // feed a v10 payload into the v11 postcard shape: enum discriminants after the insertion
+        // are positional and could otherwise be decoded as the wrong root variant.
+        Err(ArtifactDecodeError::UnsupportedVersion {
+            found: 10,
+            supported: ASSEMBLY_ARTIFACT_VERSION,
+        })
+    } else if encoded.starts_with(ASSEMBLY_ARTIFACT_V9_MAGIC) {
+        // ClassDef gained positional value-kind authority metadata in schema 10. Never feed a v9
+        // payload into the current postcard shape: depending on the following bytes, positional
+        // decoding could otherwise appear to succeed while shifting every subsequent field.
+        Err(ArtifactDecodeError::UnsupportedVersion {
+            found: 9,
+            supported: ASSEMBLY_ARTIFACT_VERSION,
+        })
     } else {
         Err(ArtifactDecodeError::IncompatibleArtifact)
     }
@@ -319,7 +340,7 @@ pub enum ArtifactDecodeError {
     },
     /// The magic prefix was present, but the envelope payload was malformed.
     InvalidVersionedEnvelope(postcard::Error),
-    /// The bytes are not a current CILLYAR9 artifact.
+    /// The bytes are not a current CILLYAR11 artifact.
     IncompatibleArtifact,
 }
 
@@ -336,7 +357,7 @@ impl std::fmt::Display for ArtifactDecodeError {
             }
             Self::IncompatibleArtifact => write!(
                 f,
-                "incompatible cilly artifact; expected CILLYAR9 schema {}. Rebuild all input crates/artifacts with the current backend",
+                "incompatible cilly artifact; expected CILLYAR11 schema {}. Rebuild all input crates/artifacts with the current backend",
                 ASSEMBLY_ARTIFACT_VERSION
             ),
         }
@@ -522,11 +543,50 @@ mod tests {
     }
 
     #[test]
+    fn schema_v9_magic_is_rejected_before_positional_payload_decode() {
+        // A current payload after the old prefix is intentionally tempting: if the decoder ever
+        // strips v9 and tries postcard, this can decode far enough to turn a stale positional
+        // ClassDef layout into apparently valid current data.
+        let current = AssemblyArtifact::new(Assembly::default(), ArtifactAbiConfig::default());
+        let mut stale = ASSEMBLY_ARTIFACT_V9_MAGIC.to_vec();
+        stale.extend(postcard::to_stdvec(&current).unwrap());
+
+        let error = decode_assembly_artifact(&stale).err().unwrap();
+        assert!(matches!(
+            error,
+            ArtifactDecodeError::UnsupportedVersion {
+                found: 9,
+                supported: ASSEMBLY_ARTIFACT_VERSION
+            }
+        ));
+        assert!(error.to_string().contains("version 9"));
+        assert!(error.to_string().contains("version 11"));
+    }
+
+    #[test]
+    fn schema_v10_magic_is_rejected_before_positional_root_decode() {
+        let current = AssemblyArtifact::new(Assembly::default(), ArtifactAbiConfig::default());
+        let mut stale = ASSEMBLY_ARTIFACT_V10_MAGIC.to_vec();
+        stale.extend(postcard::to_stdvec(&current).unwrap());
+
+        let error = decode_assembly_artifact(&stale).err().unwrap();
+        assert!(matches!(
+            error,
+            ArtifactDecodeError::UnsupportedVersion {
+                found: 10,
+                supported: ASSEMBLY_ARTIFACT_VERSION
+            }
+        ));
+        assert!(error.to_string().contains("version 10"));
+        assert!(error.to_string().contains("version 11"));
+    }
+
+    #[test]
     fn prefixless_legacy_artifact_is_rejected_for_clean_rebuild() {
         let encoded = postcard::to_stdvec(&Assembly::default()).unwrap();
         let error = decode_assembly_artifact(&encoded).err().unwrap();
         assert!(matches!(error, ArtifactDecodeError::IncompatibleArtifact));
-        assert!(error.to_string().contains("CILLYAR9"));
+        assert!(error.to_string().contains("CILLYAR11"));
         assert!(error.to_string().contains("Rebuild all input crates"));
     }
 

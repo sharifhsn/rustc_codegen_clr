@@ -565,7 +565,11 @@ fn main() {
     cilly::builtins::int128::u128_mul_ovf_check(&mut final_assembly, &mut overrides);
     cilly::builtins::int128::generate_x86_wide_carry(&mut final_assembly, &mut overrides);
     cilly::builtins::f16::generate_f16_ops(&mut final_assembly, &mut overrides);
-    cilly::builtins::atomics::generate_all_atomics(&mut final_assembly, &mut overrides);
+    cilly::builtins::atomics::generate_all_atomics(
+        &mut final_assembly,
+        &mut overrides,
+        !unity_netstandard,
+    );
     cilly::builtins::transmute(&mut final_assembly, &mut overrides);
     cilly::builtins::create_slice(&mut final_assembly, &mut overrides);
     cilly::builtins::ovf_check_tuple(&mut final_assembly, &mut overrides);

@@ -13,6 +13,7 @@ pub use asm::{
     MissingMethodResolutionStats, NativeImport, PanicKind, PeEmissionError, RuntimeCapability,
     RuntimeService, VerificationFailure,
 };
+pub use asm_link::AssemblyLinkError;
 pub use basic_block::BasicBlock;
 pub use bimap::BiMap;
 pub use cilnode::{BinOp, CILNode};

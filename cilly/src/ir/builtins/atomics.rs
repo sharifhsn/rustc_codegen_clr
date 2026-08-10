@@ -10,76 +10,6 @@ use super::{
     super::Assembly,
     math::{int_max, int_min},
 };
-/// Emulates operations on bytes using operations on int32s. Enidianess dependent, can cause segfuaults when used on a page boundary.
-/// TODO: remove when .NET 9 is out.
-///
-/// NOTE: the `cmpxchng{8,16}` builtins generated here splice the new sub-word *unconditionally* (their
-/// body never reads the comparand). That is correct ONLY as the inner step of the re-reading RMW loop
-/// in [`generate_atomic`]. For Rust's `atomic_cxchg`/`atomic_xchg` (which must honour the comparand and
-/// not write on mismatch) use [`emulate_subword_cmp_xchng`] / [`emulate_subword_xchng`] instead.
-pub fn emulate_uint8_cmp_xchng(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    generate_atomic(
-        asm,
-        patcher,
-        "cmpxchng8",
-        Box::new(|asm, prev, arg, _| {
-            // 1st, mask the previous value
-            let prev_mask = asm.alloc_node(Const::I32(0xFFFF_FF00_u32 as i32));
-            let prev = asm.alloc_node(CILNode::BinOp(prev, prev_mask, BinOp::And));
-            let arg = asm.alloc_node(CILNode::IntCast {
-                input: arg,
-                target: Int::I32,
-                extend: ExtendKind::ZeroExtend,
-            });
-            asm.alloc_node(CILNode::BinOp(prev, arg, BinOp::Or))
-        }),
-        Int::I32,
-    );
-    generate_atomic(
-        asm,
-        patcher,
-        "cmpxchng16",
-        Box::new(|asm, prev, arg, _| {
-            // 1st, mask the previous value
-            let prev_mask = asm.alloc_node(Const::I32(0xFFFF_0000_u32 as i32));
-            let prev = asm.alloc_node(CILNode::BinOp(prev, prev_mask, BinOp::And));
-            let arg = asm.alloc_node(CILNode::IntCast {
-                input: arg,
-                target: Int::I32,
-                extend: ExtendKind::ZeroExtend,
-            });
-            asm.alloc_node(CILNode::BinOp(prev, arg, BinOp::Or))
-        }),
-        Int::I32,
-    );
-    let name = asm.alloc_string("atomic_xchng_u8");
-    let generator = move |_, asm: &mut Assembly| {
-        let ldarg_0 = asm.alloc_node(CILNode::LdArg(0));
-        let ldarg_1 = asm.alloc_node(CILNode::LdArg(1));
-        let ldloc_0 = asm.alloc_node(CILNode::LdLoc(0));
-        let uint8_idx = asm.alloc_type(Type::Int(Int::U8));
-        // Load value at addr 0 and write it to tmp
-        let arg0_val = asm.alloc_node(CILNode::LdInd {
-            addr: ldarg_0,
-            tpe: uint8_idx,
-            volatile: true,
-        });
-        let set_tmp = asm.alloc_root(CILRoot::StLoc(0, arg0_val));
-        // Copy arg1 to addr0
-        let copy_arg1 = asm.alloc_root(CILRoot::StInd(Box::new((
-            ldarg_0,
-            ldarg_1,
-            Type::Int(Int::U8),
-            true,
-        ))));
-        let ret = asm.alloc_root(CILRoot::Ret(ldloc_0));
-        MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![set_tmp, copy_arg1, ret], 0, None)],
-            locals: vec![(None, uint8_idx)],
-        }
-    };
-    patcher.insert(name, Box::new(generator));
-}
 /// Emits a sub-word (`u8`/`i8`/`u16`/`i16`) atomic exchange, named `atomic_xchng{8,16}_correct`, as a
 /// masked 32-bit `Interlocked.CompareExchange` loop that unconditionally splices the new sub-word and
 /// retries until the full word swaps. Unlike a plain volatile load/store, this is genuinely atomic
@@ -94,7 +24,15 @@ pub fn emulate_subword_xchng(asm: &mut Assembly, patcher: &mut MissingMethodPatc
     );
     let name = asm.alloc_string(format!("atomic_xchng{}_correct", width * 8));
     let full_mask: u32 = if width == 1 { 0xFF } else { 0xFFFF };
-    let generator = move |_, asm: &mut Assembly| {
+    let generator = move |method: Interned<MethodRef>, asm: &mut Assembly| {
+        let signature = asm[method].sig();
+        let return_int = match *asm[signature].output() {
+            Type::Int(int) if int.size() == Some(width.into()) => int,
+            ref output => panic!(
+                "atomic_xchng{}_correct has incompatible return type {output:?}",
+                width * 8
+            ),
+        };
         // locals: 0 = word_addr (i32*), 1 = shift (i32), 2 = observed_word (i32), 3 = prev (i32)
         let i32_t = asm.alloc_type(Type::Int(Int::I32));
         // Loc 0 is the `int32&` argument of `Interlocked.CompareExchange` — declare it as a
@@ -191,6 +129,11 @@ pub fn emulate_subword_xchng(asm: &mut Assembly, patcher: &mut MissingMethodPatc
         let mask_node2 = asm.alloc_node(Const::I32(full_mask as i32));
         let old_shifted = asm.alloc_node(CILNode::BinOp(ld_old_word, ld_shift3, BinOp::ShrUn));
         let old_sub = asm.alloc_node(CILNode::BinOp(old_shifted, mask_node2, BinOp::And));
+        let old_sub = asm.alloc_node(CILNode::IntCast {
+            input: old_sub,
+            target: return_int,
+            extend: ExtendKind::ZeroExtend,
+        });
         let bb2 = vec![asm.alloc_root(CILRoot::Ret(old_sub))];
         MethodImpl::MethodBody {
             blocks: vec![
@@ -222,13 +165,13 @@ pub fn emulate_subword_xchng(asm: &mut Assembly, patcher: &mut MissingMethodPatc
 /// Signature: `int_ty atomic_cmpxchng{8,16}_correct(int_ty& addr, int_ty comparand, int_ty new)`.
 ///
 /// CAVEATS (inherent to the word-CAS strategy, and matching the existing emulation):
-/// * Little-endian only (the LE x86_64 / .NET 8 target): the sub-word byte lives in the LOW bits of
-///   the containing word at `(addr & 3) * 8`.
+/// * Little-endian only (the legacy Unity ABI is supported only on the project's 64-bit LE hosts):
+///   the sub-word byte lives in the LOW bits of the containing word at `(addr & 3) * 8`.
 /// * Page-boundary hazard: the address is aligned DOWN to its containing 32-bit word, so up to 3
 ///   bytes before the target byte are touched. A naturally-aligned `u8`/`u16` atomic is always
 ///   contained within one word (Rust requires natural alignment), so the aligned-down word stays in
-///   the same allocation in practice — but the general caveat stands. Remove once .NET 9's native
-///   sub-word `Interlocked.CompareExchange` is the floor.
+///   the same allocation in practice — but the general caveat stands. Public .NET 10 artifacts do
+///   not register this isolated legacy fallback.
 pub fn emulate_subword_cmp_xchng(
     asm: &mut Assembly,
     patcher: &mut MissingMethodPatcher,
@@ -240,7 +183,15 @@ pub fn emulate_subword_cmp_xchng(
     );
     let name = asm.alloc_string(format!("atomic_cmpxchng{}_correct", width * 8));
     let full_mask: u32 = if width == 1 { 0xFF } else { 0xFFFF };
-    let generator = move |_, asm: &mut Assembly| {
+    let generator = move |method: Interned<MethodRef>, asm: &mut Assembly| {
+        let signature = asm[method].sig();
+        let return_int = match *asm[signature].output() {
+            Type::Int(int) if int.size() == Some(width.into()) => int,
+            ref output => panic!(
+                "atomic_cmpxchng{}_correct has incompatible return type {output:?}",
+                width * 8
+            ),
+        };
         // locals: 0 = word_addr (i32*), 1 = shift (i32), 2 = observed_word (i32), 3 = observed_sub (i32)
         let i32_t = asm.alloc_type(Type::Int(Int::I32));
         // Loc 0 holds the containing-word ADDRESS and is passed as the `int32&` argument of
@@ -370,6 +321,11 @@ pub fn emulate_subword_cmp_xchng(
         ];
         // --- bb3: return the genuine old sub-word (==comparand on success, observed on failure). ---
         let ret_sub = asm.alloc_node(CILNode::LdLoc(3));
+        let ret_sub = asm.alloc_node(CILNode::IntCast {
+            input: ret_sub,
+            target: return_int,
+            extend: ExtendKind::ZeroExtend,
+        });
         let bb3 = vec![asm.alloc_root(CILRoot::Ret(ret_sub))];
         MethodImpl::MethodBody {
             blocks: vec![
@@ -395,8 +351,24 @@ pub fn compare_exchange(
     addr: Interned<CILNode>,
     value: Interned<CILNode>,
     comaprand: Interned<CILNode>,
+    native_subword: bool,
 ) -> Interned<CILNode> {
     match int.size().unwrap_or(8) {
+        1 | 2 if native_subword => {
+            let compare_exchange = asm.alloc_string("CompareExchange");
+            let tpe = Type::Int(int);
+            let tref = asm.nref(tpe);
+            let cmpxchng_sig = asm.sig([tref, tpe, tpe], tpe);
+            let interlocked = ClassRef::interlocked(asm);
+            let mref = asm.alloc_methodref(MethodRef::new(
+                interlocked,
+                compare_exchange,
+                cmpxchng_sig,
+                MethodKind::Static,
+                vec![].into(),
+            ));
+            asm.alloc_node(CILNode::call(mref, [addr, value, comaprand]))
+        }
         // Sub-word (u8/i8/u16/i16) CAS via the COMPARAND-CHECKED `_correct` builtin. The old path
         // called `atomic_cmpxchng{8,16}_i32`, which splices the new sub-word UNCONDITIONALLY — it
         // never reads the comparand, so it is an atomic *exchange*, not a CAS. As the inner step of
@@ -447,13 +419,89 @@ pub fn compare_exchange(
         _ => todo!("Can't cmpxchng {int:?}"),
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AtomicRmwOp {
+    Add,
+    Sub,
+    Or,
+    Xor,
+    And,
+    Nand,
+    Min,
+    Max,
+}
+
+impl AtomicRmwOp {
+    const ALL: [Self; 8] = [
+        Self::Add,
+        Self::Sub,
+        Self::Or,
+        Self::Xor,
+        Self::And,
+        Self::Nand,
+        Self::Min,
+        Self::Max,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Sub => "sub",
+            Self::Or => "or",
+            Self::Xor => "xor",
+            Self::And => "and",
+            Self::Nand => "nand",
+            Self::Min => "min",
+            Self::Max => "max",
+        }
+    }
+
+    fn apply(
+        self,
+        asm: &mut Assembly,
+        lhs: Interned<CILNode>,
+        rhs: Interned<CILNode>,
+        int: Int,
+    ) -> Interned<CILNode> {
+        match self {
+            Self::Add => asm.alloc_node(CILNode::BinOp(lhs, rhs, BinOp::Add)),
+            Self::Sub => asm.alloc_node(CILNode::BinOp(lhs, rhs, BinOp::Sub)),
+            Self::Or => asm.alloc_node(CILNode::BinOp(lhs, rhs, BinOp::Or)),
+            Self::Xor => asm.alloc_node(CILNode::BinOp(lhs, rhs, BinOp::XOr)),
+            Self::And => asm.alloc_node(CILNode::BinOp(lhs, rhs, BinOp::And)),
+            Self::Nand => {
+                let and = asm.alloc_node(CILNode::BinOp(lhs, rhs, BinOp::And));
+                asm.alloc_node(CILNode::UnOp(and, crate::cilnode::UnOp::Not))
+            }
+            Self::Min => int_min(asm, lhs, rhs, int),
+            Self::Max => int_max(asm, lhs, rhs, int),
+        }
+    }
+}
+
+/// Integer widths supported by every generated atomic RMW operation.
+const ATOMIC_INTS: [Int; 10] = [
+    Int::U8,
+    Int::I8,
+    Int::U16,
+    Int::I16,
+    Int::U32,
+    Int::I32,
+    Int::U64,
+    Int::I64,
+    Int::USize,
+    Int::ISize,
+];
+
 type AsmGen = dyn Fn(&mut Assembly, Interned<CILNode>, Interned<CILNode>, Int) -> Interned<CILNode>;
-pub fn generate_atomic(
+
+fn generate_atomic_impl(
     asm: &mut Assembly,
     patcher: &mut MissingMethodPatcher,
     op_name: &str,
     op: Box<AsmGen>,
     int: Int,
+    native_subword: bool,
 ) {
     let name = asm.alloc_string(format!("atomic_{op_name}_{int}", int = int.name()));
     let generator = move |_, asm: &mut Assembly| {
@@ -465,8 +513,8 @@ pub fn generate_atomic(
         // Types for which this atomic is implemented
 
         // The OP of this atomic
-        let op = op(asm, ldloc_0, ldarg_1, int);
-        let call = compare_exchange(asm, int, ldarg_0, op, ldloc_0);
+        let value = op(asm, ldloc_0, ldarg_1, int);
+        let call = compare_exchange(asm, int, ldarg_0, value, ldloc_0, native_subword);
 
         let tpe = Type::Int(int);
         let zero = asm.alloc_node(int.zero());
@@ -496,81 +544,47 @@ pub fn generate_atomic(
     };
     patcher.insert(name, Box::new(generator));
 }
-pub fn generate_atomic_for_ints(
+
+fn generate_atomic(
     asm: &mut Assembly,
     patcher: &mut MissingMethodPatcher,
-    op_name: &str,
-    op: impl Fn(&mut Assembly, Interned<CILNode>, Interned<CILNode>, Int) -> Interned<CILNode>
-    + 'static
-    + Clone,
+    op: AtomicRmwOp,
+    int: Int,
+    native_subword: bool,
 ) {
-    const ATOMIC_INTS: [Int; 10] = [
-        Int::U8,
-        Int::I8,
-        Int::U16,
-        Int::I16,
-        Int::U32,
-        Int::U64,
-        Int::USize,
-        Int::I32,
-        Int::I64,
-        Int::ISize,
-    ];
-    for int in ATOMIC_INTS {
-        generate_atomic(asm, patcher, op_name, Box::new(op.clone()), int);
-    }
+    generate_atomic_impl(
+        asm,
+        patcher,
+        op.name(),
+        Box::new(move |asm, lhs, rhs, int| op.apply(asm, lhs, rhs, int)),
+        int,
+        native_subword,
+    );
 }
-/// Adds all the builitn atomic functions to the patcher, allowing for their use.
-pub fn generate_all_atomics(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    generate_atomic_for_ints(asm, patcher, "add", |asm, lhs, rhs, _| {
-        asm.alloc_node(CILNode::BinOp(lhs, rhs, BinOp::Add))
-    });
-    generate_atomic_for_ints(asm, patcher, "sub", |asm, lhs, rhs, _| {
-        asm.alloc_node(CILNode::BinOp(lhs, rhs, BinOp::Sub))
-    });
-    // XOR
-    generate_atomic_for_ints(asm, patcher, "xor", |asm, lhs, rhs, _| {
-        asm.alloc_node(CILNode::BinOp(lhs, rhs, BinOp::XOr))
-    });
-    // NAND
-    generate_atomic_for_ints(asm, patcher, "nand", |asm, lhs, rhs, _| {
-        let and = asm.alloc_node(CILNode::BinOp(lhs, rhs, BinOp::And));
-        asm.alloc_node(CILNode::UnOp(and, crate::cilnode::UnOp::Not))
-    });
-    // Max
-    generate_atomic_for_ints(asm, patcher, "max", int_max);
-    // Max
-    generate_atomic_for_ints(asm, patcher, "min", int_min);
-    // Emulates 1 byte compare exchange
-    emulate_uint8_cmp_xchng(asm, patcher);
-    // Correct, comparand-checked sub-word compare-exchange for Rust's `atomic_cxchg` (8 & 16 bit).
+
+/// Registers the fallback-only atomics required by the legacy Unity artifact ABI. Public .NET 10
+/// codegen uses native sub-word `Interlocked.Exchange`/`CompareExchange` overloads and therefore
+/// never references these helpers.
+fn generate_legacy_subword_fallbacks(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     emulate_subword_cmp_xchng(asm, patcher, 1);
     emulate_subword_cmp_xchng(asm, patcher, 2);
-    // Genuinely-atomic sub-word exchange for Rust's `atomic_xchg` (8 & 16 bit).
     emulate_subword_xchng(asm, patcher, 1);
     emulate_subword_xchng(asm, patcher, 2);
-    for int in [Int::ISize, Int::USize, Int::U8, Int::I8] {
-        generate_atomic(
-            asm,
-            patcher,
-            "or",
-            Box::new(|asm, lhs, rhs, _| asm.alloc_node(CILNode::BinOp(lhs, rhs, BinOp::Or))),
-            int,
-        );
-        generate_atomic(
-            asm,
-            patcher,
-            "and",
-            Box::new(|asm, lhs, rhs, _| asm.alloc_node(CILNode::BinOp(lhs, rhs, BinOp::And))),
-            int,
-        );
-        generate_atomic(
-            asm,
-            patcher,
-            "add",
-            Box::new(|asm, lhs, rhs, _| asm.alloc_node(CILNode::BinOp(lhs, rhs, BinOp::Add))),
-            int,
-        );
+}
+
+/// Adds every builtin atomic function to the patcher.
+pub fn generate_all_atomics(
+    asm: &mut Assembly,
+    patcher: &mut MissingMethodPatcher,
+    native_subword: bool,
+) {
+    for op in AtomicRmwOp::ALL {
+        for int in ATOMIC_INTS {
+            generate_atomic(asm, patcher, op, int, native_subword);
+        }
+    }
+    if !native_subword {
+        generate_legacy_subword_fallbacks(asm, patcher);
     }
 }
 /*
@@ -610,3 +624,167 @@ pub fn generate_all_atomics(asm: &mut Assembly, patcher: &mut MissingMethodPatch
     } // end of method Tmp::atomic_xor
 
 */
+
+#[cfg(test)]
+mod tests {
+    use super::{ATOMIC_INTS, AtomicRmwOp, generate_all_atomics};
+    use crate::{
+        Assembly, CILIter, CILIterElem, CILNode, CILRoot, Int, MethodImpl, MissingMethodPatcher,
+        Type, cilnode::MethodKind,
+    };
+
+    fn assert_legacy_helper_return_cast(
+        asm: &mut Assembly,
+        patcher: &MissingMethodPatcher,
+        name: &str,
+        int: Int,
+        argument_count: usize,
+    ) {
+        let symbol = asm.alloc_string(name);
+        let tpe = Type::Int(int);
+        let mut inputs = vec![asm.nref(tpe)];
+        inputs.extend(std::iter::repeat_n(tpe, argument_count - 1));
+        let signature = asm.sig(inputs, tpe);
+        let owner = *asm.main_module();
+        let method = asm.new_methodref(owner, name, signature, MethodKind::Static, vec![]);
+        let implementation = patcher.get(&symbol).expect("legacy atomic generator")(method, asm);
+        let MethodImpl::MethodBody { blocks, .. } = implementation else {
+            panic!("legacy atomic generator must produce a method body");
+        };
+        let return_root = *blocks
+            .last()
+            .expect("legacy helper exit block")
+            .roots()
+            .last()
+            .expect("legacy helper return");
+        let CILRoot::Ret(value) = asm.get_root(return_root) else {
+            panic!("legacy helper must end in a return");
+        };
+        assert!(matches!(
+            asm.get_node(*value),
+            CILNode::IntCast { target, .. } if *target == int
+        ));
+    }
+
+    fn generated_u16_add_call_names(native_subword: bool) -> Vec<String> {
+        let mut asm = Assembly::default();
+        let mut patcher = MissingMethodPatcher::default();
+        generate_all_atomics(&mut asm, &mut patcher, native_subword);
+        let symbol = asm.alloc_string("atomic_add_u16");
+        let owner = asm.main_module();
+        let signature = asm.sig([], Type::Void);
+        let probe = asm.new_methodref(
+            *owner,
+            "atomic_test_probe",
+            signature,
+            MethodKind::Static,
+            vec![],
+        );
+        let implementation = patcher.get(&symbol).expect("u16 add generator")(probe, &mut asm);
+        let MethodImpl::MethodBody { blocks, .. } = implementation else {
+            panic!("atomic generator must produce a method body");
+        };
+        blocks
+            .iter()
+            .flat_map(|block| block.roots())
+            .flat_map(|root| CILIter::new(asm.get_root(*root).clone(), &asm))
+            .filter_map(|element| match element {
+                CILIterElem::Node(CILNode::Call(info)) => {
+                    let (method, _, _) = *info;
+                    Some(asm[asm[method].name()].to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn registers_the_complete_integer_rmw_matrix() {
+        let mut asm = Assembly::default();
+        let mut patcher = MissingMethodPatcher::default();
+        generate_all_atomics(&mut asm, &mut patcher, true);
+
+        for op in AtomicRmwOp::ALL {
+            for int in ATOMIC_INTS {
+                let symbol = asm.alloc_string(format!("atomic_{}_{}", op.name(), int.name()));
+                assert!(
+                    patcher.contains_key(&symbol),
+                    "missing registration for {} on {int:?}",
+                    op.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_includes_both_sixteen_bit_integer_types() {
+        assert!(ATOMIC_INTS.contains(&crate::Int::U16));
+        assert!(ATOMIC_INTS.contains(&crate::Int::I16));
+    }
+
+    #[test]
+    fn legacy_subword_fallbacks_are_not_registered_for_dotnet_10() {
+        let mut public_asm = Assembly::default();
+        let mut public_patcher = MissingMethodPatcher::default();
+        generate_all_atomics(&mut public_asm, &mut public_patcher, true);
+        let fallback = public_asm.alloc_string("atomic_cmpxchng16_correct");
+        assert!(!public_patcher.contains_key(&fallback));
+
+        let mut legacy_asm = Assembly::default();
+        let mut legacy_patcher = MissingMethodPatcher::default();
+        generate_all_atomics(&mut legacy_asm, &mut legacy_patcher, false);
+        let fallback = legacy_asm.alloc_string("atomic_cmpxchng16_correct");
+        assert!(legacy_patcher.contains_key(&fallback));
+        let exchange = legacy_asm.alloc_string("atomic_xchng8_correct");
+        assert!(legacy_patcher.contains_key(&exchange));
+        let obsolete_exchange = legacy_asm.alloc_string("atomic_xchng_u8");
+        assert!(!legacy_patcher.contains_key(&obsolete_exchange));
+
+        let public_calls = generated_u16_add_call_names(true);
+        assert!(public_calls.iter().any(|name| name == "CompareExchange"));
+        assert!(
+            !public_calls
+                .iter()
+                .any(|name| name == "atomic_cmpxchng16_correct")
+        );
+        let legacy_calls = generated_u16_add_call_names(false);
+        assert!(
+            legacy_calls
+                .iter()
+                .any(|name| name == "atomic_cmpxchng16_correct")
+        );
+
+        for int in [Int::U8, Int::I8] {
+            assert_legacy_helper_return_cast(
+                &mut legacy_asm,
+                &legacy_patcher,
+                "atomic_xchng8_correct",
+                int,
+                2,
+            );
+            assert_legacy_helper_return_cast(
+                &mut legacy_asm,
+                &legacy_patcher,
+                "atomic_cmpxchng8_correct",
+                int,
+                3,
+            );
+        }
+        for int in [Int::U16, Int::I16] {
+            assert_legacy_helper_return_cast(
+                &mut legacy_asm,
+                &legacy_patcher,
+                "atomic_xchng16_correct",
+                int,
+                2,
+            );
+            assert_legacy_helper_return_cast(
+                &mut legacy_asm,
+                &legacy_patcher,
+                "atomic_cmpxchng16_correct",
+                int,
+                3,
+            );
+        }
+    }
+}

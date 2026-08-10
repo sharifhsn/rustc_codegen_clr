@@ -2,7 +2,7 @@ use ar::Archive;
 
 use cilly::{
     ArtifactAbiConfig, ArtifactAbiConfigMismatch, ArtifactDecodeError, Assembly, AssemblyArtifact,
-    decode_assembly_artifact,
+    AssemblyLinkError, decode_assembly_artifact,
 };
 use std::io::Read;
 
@@ -41,6 +41,7 @@ impl AssemblyAccumulator {
         source: &str,
     ) -> Result<(), ArtifactLoadError> {
         let (config, assembly) = decoded.into_parts();
+        let install_config = self.abi_config.is_none();
         if let Some(expected) = &self.abi_config {
             expected.ensure_compatible(&config).map_err(|error| {
                 ArtifactLoadError::IncompatibleAbiConfig {
@@ -48,10 +49,16 @@ impl AssemblyAccumulator {
                     error,
                 }
             })?;
-        } else {
+        }
+        self.assembly
+            .try_link_in_place(assembly)
+            .map_err(|error| ArtifactLoadError::Link {
+                source: source.to_owned(),
+                error,
+            })?;
+        if install_config {
             self.abi_config = Some(config);
         }
-        self.assembly = std::mem::take(&mut self.assembly).link(assembly);
         Ok(())
     }
 
@@ -73,6 +80,10 @@ enum ArtifactLoadError {
         source: String,
         error: ArtifactAbiConfigMismatch,
     },
+    Link {
+        source: String,
+        error: AssemblyLinkError,
+    },
 }
 
 impl std::fmt::Display for ArtifactLoadError {
@@ -85,11 +96,25 @@ impl std::fmt::Display for ArtifactLoadError {
                 f,
                 "cilly artifact {source:?} cannot be linked with earlier inputs: {error}"
             ),
+            Self::Link { source, error } => {
+                write!(
+                    f,
+                    "cilly artifact {source:?} conflicts with earlier inputs: {error}"
+                )
+            }
         }
     }
 }
 
-impl std::error::Error for ArtifactLoadError {}
+impl std::error::Error for ArtifactLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Decode { error, .. } => Some(error),
+            Self::IncompatibleAbiConfig { error, .. } => Some(error),
+            Self::Link { error, .. } => Some(error),
+        }
+    }
+}
 
 fn load_ar(r: &mut impl std::io::Read, merged: &mut AssemblyAccumulator) -> std::io::Result<()> {
     let mut archive = Archive::new(r);
@@ -145,7 +170,28 @@ pub fn load_assemblies_with_config(raw_files: &[&String], archives: &[String]) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cilly::{ArtifactAbiConfig, AssemblyArtifact, DotnetRuntime};
+    use cilly::{Access, ArtifactAbiConfig, AssemblyArtifact, ClassDef, DotnetRuntime, Int, Type};
+
+    fn collision_assembly(field_type: Type) -> Assembly {
+        let mut assembly = Assembly::default();
+        let name = assembly.alloc_string("ArtifactLoadCollision");
+        let field = assembly.alloc_string("value");
+        assembly
+            .class_def(ClassDef::new(
+                name,
+                true,
+                0,
+                None,
+                vec![(field_type, field, Some(0))],
+                vec![],
+                Access::Private,
+                None,
+                None,
+                true,
+            ))
+            .unwrap();
+        assembly
+    }
 
     #[test]
     fn accumulator_rejects_field_level_config_mismatch_before_linking() {
@@ -176,5 +222,32 @@ mod tests {
         let error = accumulator.merge_encoded(&legacy, "legacy.bc").unwrap_err();
         assert!(error.to_string().contains("incompatible cilly artifact"));
         assert!(error.to_string().contains("Rebuild all input crates"));
+    }
+
+    #[test]
+    fn accumulator_link_error_preserves_loaded_assembly_and_reports_source() {
+        let first = AssemblyArtifact::new(
+            collision_assembly(Type::Int(Int::I32)),
+            ArtifactAbiConfig::default(),
+        );
+        let second = AssemblyArtifact::new(
+            collision_assembly(Type::Int(Int::I64)),
+            ArtifactAbiConfig::default(),
+        );
+        let mut accumulator = AssemblyAccumulator::default();
+        accumulator.merge_decoded(first, "first.bc").unwrap();
+        let before_counts = accumulator.assembly.arena_counts();
+        let before_bytes = postcard::to_stdvec(&accumulator.assembly).unwrap();
+        let before_config = accumulator.abi_config.clone();
+
+        let error = accumulator.merge_decoded(second, "second.bc").unwrap_err();
+        assert!(matches!(error, ArtifactLoadError::Link { .. }));
+        assert!(error.to_string().contains("second.bc"));
+        assert_eq!(accumulator.assembly.arena_counts(), before_counts);
+        assert_eq!(
+            postcard::to_stdvec(&accumulator.assembly).unwrap(),
+            before_bytes
+        );
+        assert_eq!(accumulator.abi_config, before_config);
     }
 }

@@ -15,6 +15,11 @@ pub enum CILRoot {
     VoidRet,
     Break,
     Nop,
+    /// Link-time-only separator between independently emitted static-initializer fragments.
+    ///
+    /// It emits no IL and is retained in serialized IR so repeated or deserialized shard merges
+    /// can sort whole fragments without ever reordering roots within one source initializer.
+    InitFragmentBoundary,
     /// target subtarget cond
     Branch(Box<(u32, u32, Option<BranchCond>)>),
     SourceFileInfo {
@@ -138,7 +143,10 @@ impl CILRoot {
     }
     /// Checks if this root has any effect on the execution of this program.
     pub fn is_meaningufull(&self) -> bool {
-        !matches!(self, CILRoot::Nop | CILRoot::SourceFileInfo { .. })
+        !matches!(
+            self,
+            CILRoot::Nop | CILRoot::SourceFileInfo { .. } | CILRoot::InitFragmentBoundary
+        )
     }
 
     /// Visits every direct node operand in evaluation order without allocating.
@@ -150,6 +158,7 @@ impl CILRoot {
             | CILRoot::VoidRet
             | CILRoot::Break
             | CILRoot::Nop
+            | CILRoot::InitFragmentBoundary
             | CILRoot::TerminateRegion { .. }
             | CILRoot::ReThrow => {}
             CILRoot::StLoc(_, node)
@@ -228,6 +237,7 @@ impl CILRoot {
             | CILRoot::VoidRet
             | CILRoot::Break
             | CILRoot::Nop
+            | CILRoot::InitFragmentBoundary
             | CILRoot::TerminateRegion { .. }
             | CILRoot::ReThrow => [].into(),
             CILRoot::Branch(info) => {
@@ -321,6 +331,7 @@ impl CILRoot {
             | CILRoot::VoidRet
             | CILRoot::Break
             | CILRoot::Nop
+            | CILRoot::InitFragmentBoundary
             | CILRoot::ExitSpecialRegion { .. }
             | CILRoot::ReThrow => root_map(self, asm),
             CILRoot::TerminateRegion { protected, reason } => {

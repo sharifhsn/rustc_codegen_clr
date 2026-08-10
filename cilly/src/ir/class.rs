@@ -118,6 +118,10 @@ impl ClassRef {
         self.is_valuetype
     }
 
+    pub(crate) fn set_is_valuetype_for_link(&mut self, is_valuetype: bool) {
+        self.is_valuetype = is_valuetype;
+    }
+
     #[must_use]
     pub fn generics(&self) -> &[Type] {
         &self.generics
@@ -689,6 +693,16 @@ impl FixedArrayLayout {
     }
 
     #[must_use]
+    pub(crate) fn link_semantic_dimensions(&self) -> (u64, u64, u64, u64) {
+        (
+            self.length,
+            self.requested_size,
+            self.semantic_size,
+            self.requested_align,
+        )
+    }
+
+    #[must_use]
     pub fn requested_align(&self) -> u64 {
         self.requested_align
     }
@@ -1248,6 +1262,7 @@ impl RelocateValue for ClassDef {
     type Output = RelocatedClassDef;
 
     fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self::Output {
+        let kind_override = ctx.class_definition_kind_override(self.name, self.generics);
         let Self {
             name,
             is_valuetype,
@@ -1271,6 +1286,8 @@ impl RelocateValue for ClassDef {
             enum_def,
             fixed_array_layout,
         } = self;
+        let is_valuetype = kind_override.unwrap_or(is_valuetype);
+        let is_valuetype_authoritative = kind_override.is_some() || is_valuetype_authoritative;
         let definition = Self {
             name: ctx.string(destination, name),
             is_valuetype,
@@ -1291,10 +1308,20 @@ impl RelocateValue for ClassDef {
                     )
                 })
                 .collect(),
-            static_fields: static_fields
-                .into_iter()
-                .map(|field| field.relocate(ctx, destination))
-                .collect(),
+            static_fields: {
+                let mut relocated = Vec::with_capacity(static_fields.len());
+                let mut seen = std::collections::HashSet::with_capacity(static_fields.len());
+                for field in static_fields {
+                    let field = field.relocate(ctx, destination);
+                    // Authority projection can make two formerly distinct ClassRef-bearing field
+                    // types identical. Preserve first-seen order while coalescing compatible rows;
+                    // conflicting metadata is rejected by read-only link preflight beforehand.
+                    if seen.insert(field.clone()) {
+                        relocated.push(field);
+                    }
+                }
+                relocated
+            },
             methods: Vec::new(),
             access,
             explict_size,
@@ -1341,6 +1368,68 @@ impl RelocateValue for ClassDef {
 }
 
 impl ClassDef {
+    /// Clone class metadata without cloning the method-definition list.
+    ///
+    /// Link preflight frequently needs an isolated owner shell in order to normalize one method
+    /// graph through authoritative class-kind overrides. Cloning the complete `methods` vector
+    /// for every method makes that otherwise linear audit quadratic for large partial classes.
+    pub(crate) fn clone_without_methods(&self) -> Self {
+        Self {
+            name: self.name,
+            is_valuetype: self.is_valuetype,
+            is_valuetype_authoritative: self.is_valuetype_authoritative,
+            generics: self.generics,
+            extends: self.extends,
+            implements: self.implements.clone(),
+            fields: self.fields.clone(),
+            static_fields: self.static_fields.clone(),
+            methods: Vec::new(),
+            access: self.access,
+            explict_size: self.explict_size,
+            align: self.align,
+            has_nonveralpping_layout: self.has_nonveralpping_layout,
+            is_interface: self.is_interface,
+            events: self.events.clone(),
+            generic_names: self.generic_names.clone(),
+            properties: self.properties.clone(),
+            custom_attributes: self.custom_attributes.clone(),
+            field_custom_attributes: self.field_custom_attributes.clone(),
+            enum_def: self.enum_def.clone(),
+            fixed_array_layout: self.fixed_array_layout.clone(),
+        }
+    }
+
+    /// Build the smallest owner definition needed to relocate and index one method graph.
+    ///
+    /// Class metadata is validated independently before method normalization. Carrying fields,
+    /// statics, events, properties, or attributes here would clone and relocate the entire owner
+    /// once per method, turning an authority-only audit quadratic for otherwise unrelated members.
+    pub(crate) fn method_owner_identity_shell(&self) -> Self {
+        Self {
+            name: self.name,
+            is_valuetype: self.is_valuetype,
+            is_valuetype_authoritative: self.is_valuetype_authoritative,
+            generics: self.generics,
+            extends: None,
+            implements: Vec::new(),
+            fields: Vec::new(),
+            static_fields: Vec::new(),
+            methods: Vec::new(),
+            access: self.access,
+            explict_size: None,
+            align: None,
+            has_nonveralpping_layout: true,
+            is_interface: self.is_interface,
+            events: Vec::new(),
+            generic_names: self.generic_names.clone(),
+            properties: Vec::new(),
+            custom_attributes: Vec::new(),
+            field_custom_attributes: Vec::new(),
+            enum_def: None,
+            fixed_array_layout: None,
+        }
+    }
+
     /// Checks if this class defition has a with the name and type.
     #[must_use]
     pub fn has_static_field(&self, fld_name: Interned<IString>, fld_tpe: Type) -> bool {
@@ -1519,6 +1608,10 @@ impl ClassDef {
         &self.implements
     }
 
+    pub(crate) fn implements_mut(&mut self) -> &mut Vec<Interned<ClassRef>> {
+        &mut self.implements
+    }
+
     /// Declare that this class implements `iface` (append, deduplicating). The class must expose a
     /// public virtual method matching each interface member's name+signature — CLR then binds them
     /// implicitly, so no `.override` is emitted.
@@ -1532,6 +1625,10 @@ impl ClassDef {
     #[must_use]
     pub fn events(&self) -> &[EventDef] {
         &self.events
+    }
+
+    pub(crate) fn events_mut(&mut self) -> &mut Vec<EventDef> {
+        &mut self.events
     }
 
     /// Declare an event on this class. The `add`/`remove` methods it names must already exist as
@@ -1563,6 +1660,10 @@ impl ClassDef {
     #[must_use]
     pub fn properties(&self) -> &[PropertyDef] {
         &self.properties
+    }
+
+    pub(crate) fn properties_mut(&mut self) -> &mut Vec<PropertyDef> {
+        &mut self.properties
     }
 
     /// Declare a property on this class. The accessor methods it names must already exist as
@@ -1604,6 +1705,10 @@ impl ClassDef {
     #[must_use]
     pub fn custom_attributes(&self) -> &[CustomAttrDef] {
         &self.custom_attributes
+    }
+
+    pub(crate) fn custom_attributes_mut(&mut self) -> &mut Vec<CustomAttrDef> {
+        &mut self.custom_attributes
     }
 
     /// Marks this public value type as a genuine CLR enum.
@@ -1654,6 +1759,17 @@ impl ClassDef {
         is_static: bool,
         attr: CustomAttrDef,
     ) {
+        if self
+            .field_custom_attributes
+            .iter()
+            .filter(|(candidate, candidate_static, _)| {
+                *candidate == name && *candidate_static == is_static
+            })
+            .flat_map(|(_, _, attributes)| attributes)
+            .any(|existing| existing == &attr)
+        {
+            return;
+        }
         if let Some((_, _, attributes)) =
             self.field_custom_attributes
                 .iter_mut()
@@ -1661,9 +1777,7 @@ impl ClassDef {
                     *candidate == name && *candidate_static == is_static
                 })
         {
-            if !attributes.contains(&attr) {
-                attributes.push(attr);
-            }
+            attributes.push(attr);
         } else {
             self.field_custom_attributes
                 .push((name, is_static, vec![attr]));
@@ -1675,13 +1789,25 @@ impl ClassDef {
         &self,
         name: Interned<IString>,
         is_static: bool,
-    ) -> &[CustomAttrDef] {
+    ) -> impl Iterator<Item = &CustomAttrDef> {
         self.field_custom_attributes
             .iter()
-            .find(|(candidate, candidate_static, _)| {
+            .filter(move |(candidate, candidate_static, _)| {
                 *candidate == name && *candidate_static == is_static
             })
-            .map_or(&[], |(_, _, attributes)| attributes)
+            .flat_map(|(_, _, attributes)| attributes)
+    }
+
+    pub(crate) fn field_custom_attribute_groups(
+        &self,
+    ) -> &[(Interned<IString>, bool, Vec<CustomAttrDef>)] {
+        &self.field_custom_attributes
+    }
+
+    pub(crate) fn field_custom_attribute_groups_mut(
+        &mut self,
+    ) -> &mut Vec<(Interned<IString>, bool, Vec<CustomAttrDef>)> {
+        &mut self.field_custom_attributes
     }
 
     pub(crate) fn ref_to(&self) -> ClassRef {
@@ -1760,9 +1886,9 @@ impl ClassDef {
         }
         Ok(())
     }
-    pub fn add_def(&mut self, val: MethodDefIdx) {
+    /// Records a method already proven new by `Assembly::new_method`'s definition map.
+    pub(crate) fn add_def(&mut self, val: MethodDefIdx) {
         self.methods.push(val);
-        assert_unique(self.methods(), "add_def failed: method were not unique!");
     }
     pub fn methods_mut(&mut self) -> &mut Vec<MethodDefIdx> {
         &mut self.methods
@@ -1782,6 +1908,11 @@ impl ClassDef {
     #[must_use]
     pub fn is_valuetype(&self) -> bool {
         self.is_valuetype
+    }
+
+    #[must_use]
+    pub(crate) fn is_valuetype_authoritative(&self) -> bool {
+        self.is_valuetype_authoritative
     }
 
     #[must_use]
@@ -1886,7 +2017,7 @@ impl ClassDef {
         self.generics
     }
 
-    pub(super) fn merge_defs(&mut self, translated: ClassDef) {
+    pub(super) fn merge_defs(&mut self, mut translated: ClassDef) {
         // Check name matches
         assert_eq!(self.name(), translated.name());
 
@@ -1917,44 +2048,16 @@ impl ClassDef {
         // whether it's a genuine ECMA-335 interface `TypeDef` — see `with_interface`'s doc).
         assert_eq!(self.is_interface(), translated.is_interface());
 
-        // Union the implemented interfaces (a class re-opened by several entrypoints may accumulate
-        // its `implements` set across them, exactly like fields/methods).
-        for iface in translated.implements() {
-            self.add_interface(*iface);
-        }
-
-        // Union the declared events, deduplicating by name (same reasoning as `implements` above).
-        for ev in translated.events() {
-            if !self
-                .events
-                .iter()
-                .any(|existing| existing.name() == ev.name())
-            {
-                self.events.push(ev.clone());
-            }
-        }
-
-        // Union the declared properties, deduplicating by name (same reasoning as events above).
-        for prop in translated.properties() {
-            if !self
-                .properties
-                .iter()
-                .any(|existing| existing.name() == prop.name())
-            {
-                self.properties.push(prop.clone());
-            }
-        }
-
-        // Union the custom attributes, deduplicating by full equality (same reasoning as
-        // `add_custom_attribute`'s own dedup — see its doc).
-        for attr in translated.custom_attributes() {
-            self.add_custom_attribute(attr.clone());
-        }
-        for (name, is_static, attributes) in &translated.field_custom_attributes {
-            for attribute in attributes {
-                self.add_field_custom_attribute(*name, *is_static, attribute.clone());
-            }
-        }
+        // AssemblyLinkIndex/RelocateCtx already removed every compatible duplicate and rejected
+        // every conflicting identity before this hot commit path. Appending only the retained
+        // deltas avoids rescanning the accumulated class for every partial mono-item shard.
+        self.implements.append(&mut translated.implements);
+        self.events.append(&mut translated.events);
+        self.properties.append(&mut translated.properties);
+        self.custom_attributes
+            .append(&mut translated.custom_attributes);
+        self.field_custom_attributes
+            .append(&mut translated.field_custom_attributes);
 
         match (&self.enum_def, &translated.enum_def) {
             (None, Some(incoming)) => self.enum_def = Some(incoming.clone()),
@@ -1965,26 +2068,7 @@ impl ClassDef {
             (None, None) | (Some(_), None) => {}
         }
 
-        // A codegen shard may first encounter a type only as a method owner and a later shard may
-        // carry its actual instance-field definition. Dropping the latter produces a structurally
-        // valid TypeDef with methods that reference fields it does not declare (and ultimately a
-        // MissingFieldException). Merge instance fields by their semantic identity, while treating
-        // a same-named field with a different type or offset as a hard cross-shard inconsistency.
-        for field @ (field_tpe, field_name, field_offset) in translated.fields() {
-            if let Some(existing) = self
-                .fields
-                .iter()
-                .find(|(_, existing_name, _)| existing_name == field_name)
-            {
-                assert_eq!(
-                    existing, field,
-                    "class field differs across codegen shards: name={field_name:?}, \
-                     incoming_type={field_tpe:?}, incoming_offset={field_offset:?}"
-                );
-            } else {
-                self.fields.push(*field);
-            }
-        }
+        self.fields.append(&mut translated.fields);
 
         // Re-opened/partial definitions may omit physical-layout metadata. Preserve the concrete
         // value from whichever shard has it, but never silently reconcile contradictory layouts.
@@ -2015,13 +2099,18 @@ impl ClassDef {
         // merged class must continue to receive the stricter GC/layout validation.
         self.has_nonveralpping_layout &= translated.has_nonveralpping_layout;
 
-        // Merge the static fields, removing duplicates
+        // Cross-shard static duplicates were filtered through AssemblyLinkIndex before this hot
+        // commit path. ClassDef::relocate also removes compatible duplicates internal to one
+        // source definition, so appending only the retained source delta is sufficient here and
+        // avoids rebuilding the full accumulated destination set for every mono shard.
         self.static_fields_mut()
             .extend(translated.static_fields().iter().cloned());
-        make_unique(&mut self.static_fields);
-        // Merge the methods, removing duplicates
-        self.methods_mut().extend(translated.methods());
-        make_unique(self.methods_mut());
+        // Method definitions are relocated separately so body conflicts and special initializers
+        // retain their dedicated semantics; RelocatedClassDef deliberately clears this list.
+        assert!(
+            translated.methods().is_empty(),
+            "relocated class metadata unexpectedly carried method definitions"
+        );
         // Check accessibility matches
         assert_eq!(self.access(), translated.access());
     }
@@ -2038,36 +2127,6 @@ impl ClassDef {
     pub fn opt(&mut self, fuel: &mut OptFuel, asm: &mut Assembly, cache: &mut EffectInfoCache) {
     } */
 }
-fn into_unique<T: Eq + std::hash::Hash>(input: Vec<T>) -> Vec<T> {
-    let set: fxhash::FxHashSet<_> = input.into_iter().collect();
-    set.into_iter().collect()
-}
-fn make_unique<T: Eq + std::hash::Hash>(input: &mut Vec<T>) {
-    let mut tmp = Vec::new();
-    std::mem::swap(&mut tmp, input);
-    let mut tmp = into_unique(tmp);
-    std::mem::swap(&mut tmp, input);
-}
-#[test]
-fn test_into_unique() {
-    assert!(into_unique::<u32>(vec![]).is_empty());
-    assert_eq!(into_unique::<u32>(vec![0]), vec![0]);
-    assert_eq!(into_unique::<u32>(vec![0, 0]), vec![0]);
-    assert_eq!(into_unique::<u32>(vec![2, 1, 1]).len(), 2);
-    let mut v = vec![];
-    make_unique::<u32>(&mut v);
-    assert!(v.is_empty());
-    let mut v = vec![0];
-    make_unique::<u32>(&mut v);
-    assert_eq!(v, vec![0]);
-    let mut v = vec![0, 1];
-    make_unique::<u32>(&mut v);
-    assert_eq!(v, vec![0, 1]);
-    let mut v = vec![2, 1, 1];
-    make_unique::<u32>(&mut v);
-    assert_eq!(v.len(), 2);
-}
-
 #[test]
 fn static_field_default_value_participates_in_equality_and_hash() {
     use std::hash::{DefaultHasher, Hash, Hasher};
@@ -2486,39 +2545,6 @@ fn fixed_array_identity_includes_physical_storage_layout() {
     assert_ne!(asm[ordinary].name(), asm[over_aligned].name());
 }
 
-#[test]
-#[should_panic(expected = "class field differs across codegen shards")]
-fn merge_defs_rejects_conflicting_instance_fields() {
-    let mut asm = Assembly::default();
-    let name = asm.alloc_string("ShardConflict");
-    let field_name = asm.alloc_string("payload");
-    let mut left = ClassDef::new(
-        name,
-        true,
-        0,
-        None,
-        vec![(Type::Int(crate::Int::I32), field_name, Some(0))],
-        vec![],
-        Access::Public,
-        NonZeroU32::new(4),
-        NonZeroU32::new(4),
-        true,
-    );
-    let right = ClassDef::new(
-        name,
-        true,
-        0,
-        None,
-        vec![(Type::Int(crate::Int::I64), field_name, Some(0))],
-        vec![],
-        Access::Public,
-        NonZeroU32::new(4),
-        NonZeroU32::new(4),
-        true,
-    );
-
-    left.merge_defs(right);
-}
 #[test]
 #[should_panic]
 fn merge_defs_different() {

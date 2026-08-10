@@ -443,6 +443,7 @@ impl<'this, T: Iterator<Item = CILIterElem> + 'this> TpeIter<'this> for T {
                     | CILRoot::VoidRet
                     | CILRoot::Break
                     | CILRoot::Nop
+                    | CILRoot::InitFragmentBoundary
                     | CILRoot::Branch(_)
                     | CILRoot::SourceFileInfo { .. }
                     | CILRoot::ExitSpecialRegion { .. }

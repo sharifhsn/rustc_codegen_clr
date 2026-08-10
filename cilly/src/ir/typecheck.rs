@@ -1401,6 +1401,7 @@ impl CILRoot {
             }
             Self::Break
             | Self::Nop
+            | Self::InitFragmentBoundary
             | Self::SourceFileInfo { .. }
             | Self::ExitSpecialRegion { .. }
             | Self::ReThrow

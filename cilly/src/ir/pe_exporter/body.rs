@@ -1059,6 +1059,8 @@ impl<'a> Emitter<'a> {
             CILRoot::VoidRet => self.push_u8(0x2A), // ret
             CILRoot::Break => self.push_u8(0x01),   // break
             CILRoot::Nop => self.push_u8(0x00),     // nop
+            // Link-only semantic separator. It deliberately has no runtime encoding.
+            CILRoot::InitFragmentBoundary => {}
             CILRoot::Branch(branch) => self.emit_branch(*branch, is_handler, has_handler),
             CILRoot::SourceFileInfo {
                 line_start,
