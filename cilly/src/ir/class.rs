@@ -355,6 +355,20 @@ crate::bcl_class! {
         runtime_type_hadle => "System.RuntimeTypeHandle", value;
         /// Returns a reference to the `System.String`
         exception => "System.Exception", class;
+        /// The managed fallback for a bounds-check panic when native `core` has no cilly body.
+        index_out_of_range_exception => "System.IndexOutOfRangeException", class;
+        /// The managed fallback for compiler-generated arithmetic-overflow panics.
+        overflow_exception => "System.OverflowException", class;
+        /// The managed fallback for compiler-generated divide/remainder-by-zero panics.
+        divide_by_zero_exception => "System.DivideByZeroException", class;
+        /// The managed fallback for invalid coroutine/generator resume-state panics.
+        invalid_operation_exception => "System.InvalidOperationException", class;
+        /// The managed fallback type for a misaligned raw-pointer dereference.
+        data_misaligned_exception => "System.DataMisalignedException", class;
+        /// The managed fallback type for a null raw-pointer dereference.
+        null_reference_exception => "System.NullReferenceException", class;
+        /// The managed fallback type for construction from an invalid enum discriminant.
+        invalid_cast_exception => "System.InvalidCastException", class;
         /// Returns a reference to the `System.Console`
         console => "System.Console", "System.Console", class;
         /// Returns a reference to the class `System.Collections.IDictionaryEnumerator`

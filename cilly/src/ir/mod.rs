@@ -10,8 +10,8 @@ pub use crate::Access;
 pub use asm::{
     Assembly, AssemblyArenaCounts, CompactionStats, ExportReadyAssembly, MethodResolution,
     MissingMethodGenerator, MissingMethodPatcher, MissingMethodResolutionError,
-    MissingMethodResolutionStats, NativeImport, PeEmissionError, RuntimeCapability, RuntimeService,
-    VerificationFailure,
+    MissingMethodResolutionStats, NativeImport, PanicKind, PeEmissionError, RuntimeCapability,
+    RuntimeService, VerificationFailure,
 };
 pub use basic_block::BasicBlock;
 pub use bimap::BiMap;

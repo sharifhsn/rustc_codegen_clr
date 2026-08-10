@@ -20,6 +20,253 @@ use super::class::{EventDef, FixedArrayLayout, PropertyDef};
 
 pub type MissingMethodGenerator = Box<dyn Fn(Interned<MethodRef>, &mut Assembly) -> MethodImpl>;
 
+/// A compiler-generated panic entry point whose body may be absent when cilly links against the
+/// host toolchain's native (non-cilly) `core` artifact.
+///
+/// Keep this list exact and pinned-toolchain-shaped. In particular, classification must never use
+/// a leaf-name or prefix match: user code is allowed to define functions with all of these leaf
+/// names. A real cilly `core` definition always wins before this fallback is considered.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PanicKind {
+    Format,
+    NoUnwindFormat,
+    Explicit,
+    NoUnwind,
+    NoUnwindNoBacktrace,
+    PanicStr2015,
+    ConstPanicFormat,
+    BoundsCheck,
+    MisalignedPointerDereference,
+    NullPointerDereference,
+    InvalidEnumConstruction,
+    CannotUnwind,
+    InCleanup,
+    AddOverflow,
+    SubOverflow,
+    MulOverflow,
+    DivOverflow,
+    RemOverflow,
+    NegOverflow,
+    ShrOverflow,
+    ShlOverflow,
+    DivByZero,
+    RemByZero,
+    CoroutineResumed,
+    AsyncFnResumed,
+    AsyncGenFnResumed,
+    GenFnNone,
+    CoroutineResumedAfterPanic,
+    AsyncFnResumedAfterPanic,
+    AsyncGenFnResumedAfterPanic,
+    GenFnNoneAfterPanic,
+    CoroutineResumedAfterDrop,
+    AsyncFnResumedAfterDrop,
+    AsyncGenFnResumedAfterDrop,
+    GenFnNoneAfterDrop,
+}
+
+impl PanicKind {
+    const ALL: [Self; 35] = [
+        Self::Format,
+        Self::NoUnwindFormat,
+        Self::Explicit,
+        Self::NoUnwind,
+        Self::NoUnwindNoBacktrace,
+        Self::PanicStr2015,
+        Self::ConstPanicFormat,
+        Self::BoundsCheck,
+        Self::MisalignedPointerDereference,
+        Self::NullPointerDereference,
+        Self::InvalidEnumConstruction,
+        Self::CannotUnwind,
+        Self::InCleanup,
+        Self::AddOverflow,
+        Self::SubOverflow,
+        Self::MulOverflow,
+        Self::DivOverflow,
+        Self::RemOverflow,
+        Self::NegOverflow,
+        Self::ShrOverflow,
+        Self::ShlOverflow,
+        Self::DivByZero,
+        Self::RemByZero,
+        Self::CoroutineResumed,
+        Self::AsyncFnResumed,
+        Self::AsyncGenFnResumed,
+        Self::GenFnNone,
+        Self::CoroutineResumedAfterPanic,
+        Self::AsyncFnResumedAfterPanic,
+        Self::AsyncGenFnResumedAfterPanic,
+        Self::GenFnNoneAfterPanic,
+        Self::CoroutineResumedAfterDrop,
+        Self::AsyncFnResumedAfterDrop,
+        Self::AsyncGenFnResumedAfterDrop,
+        Self::GenFnNoneAfterDrop,
+    ];
+
+    #[must_use]
+    pub const fn canonical_symbol(self) -> &'static str {
+        match self {
+            Self::Format => "core::panicking::panic_fmt",
+            Self::NoUnwindFormat => "core::panicking::panic_nounwind_fmt",
+            Self::Explicit => "core::panicking::panic",
+            Self::NoUnwind => "core::panicking::panic_nounwind",
+            Self::NoUnwindNoBacktrace => "core::panicking::panic_nounwind_nobacktrace",
+            Self::PanicStr2015 => "core::panicking::panic_str_2015",
+            Self::ConstPanicFormat => "core::panicking::const_panic_fmt",
+            Self::BoundsCheck => "core::panicking::panic_bounds_check",
+            Self::MisalignedPointerDereference => {
+                "core::panicking::panic_misaligned_pointer_dereference"
+            }
+            Self::NullPointerDereference => "core::panicking::panic_null_pointer_dereference",
+            Self::InvalidEnumConstruction => "core::panicking::panic_invalid_enum_construction",
+            Self::CannotUnwind => "core::panicking::panic_cannot_unwind",
+            Self::InCleanup => "core::panicking::panic_in_cleanup",
+            Self::AddOverflow => "core::panicking::panic_const::panic_const_add_overflow",
+            Self::SubOverflow => "core::panicking::panic_const::panic_const_sub_overflow",
+            Self::MulOverflow => "core::panicking::panic_const::panic_const_mul_overflow",
+            Self::DivOverflow => "core::panicking::panic_const::panic_const_div_overflow",
+            Self::RemOverflow => "core::panicking::panic_const::panic_const_rem_overflow",
+            Self::NegOverflow => "core::panicking::panic_const::panic_const_neg_overflow",
+            Self::ShrOverflow => "core::panicking::panic_const::panic_const_shr_overflow",
+            Self::ShlOverflow => "core::panicking::panic_const::panic_const_shl_overflow",
+            Self::DivByZero => "core::panicking::panic_const::panic_const_div_by_zero",
+            Self::RemByZero => "core::panicking::panic_const::panic_const_rem_by_zero",
+            Self::CoroutineResumed => "core::panicking::panic_const::panic_const_coroutine_resumed",
+            Self::AsyncFnResumed => "core::panicking::panic_const::panic_const_async_fn_resumed",
+            Self::AsyncGenFnResumed => {
+                "core::panicking::panic_const::panic_const_async_gen_fn_resumed"
+            }
+            Self::GenFnNone => "core::panicking::panic_const::panic_const_gen_fn_none",
+            Self::CoroutineResumedAfterPanic => {
+                "core::panicking::panic_const::panic_const_coroutine_resumed_panic"
+            }
+            Self::AsyncFnResumedAfterPanic => {
+                "core::panicking::panic_const::panic_const_async_fn_resumed_panic"
+            }
+            Self::AsyncGenFnResumedAfterPanic => {
+                "core::panicking::panic_const::panic_const_async_gen_fn_resumed_panic"
+            }
+            Self::GenFnNoneAfterPanic => {
+                "core::panicking::panic_const::panic_const_gen_fn_none_panic"
+            }
+            Self::CoroutineResumedAfterDrop => {
+                "core::panicking::panic_const::panic_const_coroutine_resumed_drop"
+            }
+            Self::AsyncFnResumedAfterDrop => {
+                "core::panicking::panic_const::panic_const_async_fn_resumed_drop"
+            }
+            Self::AsyncGenFnResumedAfterDrop => {
+                "core::panicking::panic_const::panic_const_async_gen_fn_resumed_drop"
+            }
+            Self::GenFnNoneAfterDrop => {
+                "core::panicking::panic_const::panic_const_gen_fn_none_drop"
+            }
+        }
+    }
+
+    #[must_use]
+    const fn message(self) -> &'static str {
+        match self {
+            Self::Format => "formatted Rust panic",
+            Self::NoUnwindFormat => "non-unwinding formatted Rust panic",
+            Self::Explicit => "explicit Rust panic",
+            Self::NoUnwind => "non-unwinding Rust panic",
+            Self::NoUnwindNoBacktrace => "non-unwinding Rust panic (backtrace disabled)",
+            Self::PanicStr2015 => "Rust 2015 panic",
+            Self::ConstPanicFormat => "const-formatted Rust panic",
+            Self::BoundsCheck => "index out of bounds",
+            Self::MisalignedPointerDereference => "misaligned pointer dereference",
+            Self::NullPointerDereference => "null pointer dereference occurred",
+            Self::InvalidEnumConstruction => "trying to construct an enum from an invalid value",
+            Self::CannotUnwind => "panic in a function that cannot unwind",
+            Self::InCleanup => "panic in a destructor during cleanup",
+            Self::AddOverflow => "attempt to add with overflow",
+            Self::SubOverflow => "attempt to subtract with overflow",
+            Self::MulOverflow => "attempt to multiply with overflow",
+            Self::DivOverflow => "attempt to divide with overflow",
+            Self::RemOverflow => "attempt to calculate the remainder with overflow",
+            Self::NegOverflow => "attempt to negate with overflow",
+            Self::ShrOverflow => "attempt to shift right with overflow",
+            Self::ShlOverflow => "attempt to shift left with overflow",
+            Self::DivByZero => "attempt to divide by zero",
+            Self::RemByZero => "attempt to calculate the remainder with a divisor of zero",
+            Self::CoroutineResumed => "coroutine resumed after completion",
+            Self::AsyncFnResumed => "`async fn` resumed after completion",
+            Self::AsyncGenFnResumed => "`async gen fn` resumed after completion",
+            Self::GenFnNone => "`gen fn` should just keep returning `None` after completion",
+            Self::CoroutineResumedAfterPanic => "coroutine resumed after panicking",
+            Self::AsyncFnResumedAfterPanic => "`async fn` resumed after panicking",
+            Self::AsyncGenFnResumedAfterPanic => "`async gen fn` resumed after panicking",
+            Self::GenFnNoneAfterPanic => {
+                "`gen fn` should just keep returning `None` after panicking"
+            }
+            Self::CoroutineResumedAfterDrop => "coroutine resumed after async drop",
+            Self::AsyncFnResumedAfterDrop => "`async fn` resumed after async drop",
+            Self::AsyncGenFnResumedAfterDrop => "`async gen fn` resumed after async drop",
+            Self::GenFnNoneAfterDrop => "`gen fn` resumed after async drop",
+        }
+    }
+
+    #[must_use]
+    fn managed_exception(self, asm: &mut Assembly) -> Interned<ClassRef> {
+        match self {
+            Self::Format
+            | Self::NoUnwindFormat
+            | Self::Explicit
+            | Self::NoUnwind
+            | Self::NoUnwindNoBacktrace
+            | Self::PanicStr2015
+            | Self::ConstPanicFormat
+            | Self::CannotUnwind
+            | Self::InCleanup => ClassRef::invalid_operation_exception(asm),
+            Self::BoundsCheck => ClassRef::index_out_of_range_exception(asm),
+            Self::MisalignedPointerDereference => ClassRef::data_misaligned_exception(asm),
+            Self::NullPointerDereference => ClassRef::null_reference_exception(asm),
+            Self::InvalidEnumConstruction => ClassRef::invalid_cast_exception(asm),
+            Self::AddOverflow
+            | Self::SubOverflow
+            | Self::MulOverflow
+            | Self::DivOverflow
+            | Self::RemOverflow
+            | Self::NegOverflow
+            | Self::ShrOverflow
+            | Self::ShlOverflow => ClassRef::overflow_exception(asm),
+            Self::DivByZero | Self::RemByZero => ClassRef::divide_by_zero_exception(asm),
+            Self::CoroutineResumed
+            | Self::AsyncFnResumed
+            | Self::AsyncGenFnResumed
+            | Self::GenFnNone
+            | Self::CoroutineResumedAfterPanic
+            | Self::AsyncFnResumedAfterPanic
+            | Self::AsyncGenFnResumedAfterPanic
+            | Self::GenFnNoneAfterPanic
+            | Self::CoroutineResumedAfterDrop
+            | Self::AsyncFnResumedAfterDrop
+            | Self::AsyncGenFnResumedAfterDrop
+            | Self::GenFnNoneAfterDrop => ClassRef::invalid_operation_exception(asm),
+        }
+    }
+
+    /// These entry points carry rustc's `nounwind` contract. The native implementation aborts if
+    /// its panic handler attempts to unwind; the managed fallback must therefore terminate through
+    /// `Environment.FailFast` rather than letting even a typed managed exception cross the call.
+    #[must_use]
+    const fn is_nounwind(self) -> bool {
+        matches!(
+            self,
+            Self::NoUnwindFormat
+                | Self::NoUnwind
+                | Self::NoUnwindNoBacktrace
+                | Self::MisalignedPointerDereference
+                | Self::NullPointerDereference
+                | Self::InvalidEnumConstruction
+                | Self::CannotUnwind
+                | Self::InCleanup
+        )
+    }
+}
+
 /// A well-known service requested by rustc-generated runtime glue.
 ///
 /// This classification is deliberately not serialized: artifacts retain their historical method
@@ -33,12 +280,59 @@ pub enum RuntimeService {
     Dealloc,
     Realloc,
     NoAllocShim,
+    Panic(PanicKind),
+    /// A monomorphic helper emitted by `core::ub_checks::assert_unsafe_precondition!`.
+    CoreUbPrecondition,
+}
+
+fn is_core_ub_precondition(demangled: &str) -> bool {
+    if !demangled.ends_with("::precondition_check") {
+        return false;
+    }
+    if demangled.starts_with("core::") {
+        return true;
+    }
+
+    // Alternate rustc demangling erases the encoded `core` owner for inherent methods on
+    // primitives. User crates cannot define inherent primitive methods, but keep this exception
+    // pinned to the exact method families observed in the pinned core rather than accepting an
+    // arbitrary leaf-name suffix.
+    if matches!(
+        demangled,
+        "<*const _>::offset_from_unsigned::precondition_check"
+            | "<*mut _>::offset_from_unsigned::precondition_check"
+    ) {
+        return true;
+    }
+    let Some((receiver, method)) = demangled
+        .strip_prefix('<')
+        .and_then(|path| path.split_once(">::"))
+    else {
+        return false;
+    };
+    matches!(
+        receiver,
+        "u8" | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+    ) && method == "unchecked_add::precondition_check"
 }
 
 impl RuntimeService {
     #[must_use]
     pub fn classify(emitted_symbol: &str) -> Option<Self> {
         let demangled = format!("{:#}", rustc_demangle::demangle(emitted_symbol));
+        if is_core_ub_precondition(&demangled) {
+            return Some(Self::CoreUbPrecondition);
+        }
         match demangled.as_str() {
             "__rustc::__rust_alloc" | "__rust_alloc" => Some(Self::Alloc),
             "__rustc::__rust_alloc_zeroed" | "__rust_alloc_zeroed" => Some(Self::AllocZeroed),
@@ -48,7 +342,10 @@ impl RuntimeService {
             | "__rustc::__rust_no_alloc_shim_is_unstable_v2"
             | "__rust_no_alloc_shim_is_unstable"
             | "__rust_no_alloc_shim_is_unstable_v2" => Some(Self::NoAllocShim),
-            _ => None,
+            _ => PanicKind::ALL
+                .into_iter()
+                .find(|kind| demangled == kind.canonical_symbol())
+                .map(Self::Panic),
         }
     }
 
@@ -60,11 +357,16 @@ impl RuntimeService {
             Self::Dealloc => "__rust_dealloc",
             Self::Realloc => "__rust_realloc",
             Self::NoAllocShim => "__rust_no_alloc_shim_is_unstable",
+            Self::Panic(kind) => kind.canonical_symbol(),
+            Self::CoreUbPrecondition => "core::ub_checks::precondition_check",
         }
     }
 
     const fn requires_registered_capability(self) -> bool {
-        !matches!(self, Self::NoAllocShim)
+        !matches!(
+            self,
+            Self::NoAllocShim | Self::Panic(_) | Self::CoreUbPrecondition
+        )
     }
 }
 
@@ -75,6 +377,8 @@ pub enum RuntimeCapability {
     DeclaredNativeImport,
     LegacyNativeImport,
     BuiltinNoOp,
+    BuiltinPanic,
+    BuiltinCoreUbPrecondition,
 }
 
 /// Typed result of resolving one method reference.
@@ -219,6 +523,8 @@ pub struct MissingMethodResolutionStats {
     pub externs_synthesized: usize,
     pub allocator_shims_synthesized: usize,
     pub no_alloc_shims_synthesized: usize,
+    pub panic_shims_synthesized: usize,
+    pub core_ub_precondition_shims_synthesized: usize,
     pub missing_stubs_synthesized: usize,
     pub unresolved_missing_methods: usize,
 }
@@ -257,6 +563,24 @@ impl MissingMethodResolutionStats {
                 capability: RuntimeCapability::BuiltinNoOp,
                 ..
             } => self.no_alloc_shims_synthesized += 1,
+            MethodResolution::Resolved {
+                capability: RuntimeCapability::BuiltinPanic,
+                service: Some(RuntimeService::Panic(_)),
+            } => self.panic_shims_synthesized += 1,
+            MethodResolution::Resolved {
+                capability: RuntimeCapability::BuiltinPanic,
+                service,
+            } => panic!("builtin panic resolution recorded for non-panic service {service:?}"),
+            MethodResolution::Resolved {
+                capability: RuntimeCapability::BuiltinCoreUbPrecondition,
+                service: Some(RuntimeService::CoreUbPrecondition),
+            } => self.core_ub_precondition_shims_synthesized += 1,
+            MethodResolution::Resolved {
+                capability: RuntimeCapability::BuiltinCoreUbPrecondition,
+                service,
+            } => {
+                panic!("core UB precondition resolution recorded for wrong service {service:?}")
+            }
             MethodResolution::Unresolved => self.missing_stubs_synthesized += 1,
         }
     }
@@ -327,14 +651,16 @@ impl std::fmt::Display for MissingMethodResolutionStats {
         write!(
             f,
             "processed {} method refs ({} discovered during resolution): {} overrides, {} externs, \
-             {} allocator shims, {} no-alloc shims, {} missing stubs; {} unresolved non-abstract \
-             MethodImpl::Missing definitions remain",
+             {} allocator shims, {} no-alloc shims, {} panic shims, {} core UB precondition shims, \
+             {} missing stubs; {} unresolved non-abstract MethodImpl::Missing definitions remain",
             self.method_refs_processed,
             self.method_refs_added,
             self.overrides_applied,
             self.externs_synthesized,
             self.allocator_shims_synthesized,
             self.no_alloc_shims_synthesized,
+            self.panic_shims_synthesized,
+            self.core_ub_precondition_shims_synthesized,
             self.missing_stubs_synthesized,
             self.unresolved_missing_methods,
         )
@@ -2588,6 +2914,79 @@ impl Assembly {
                 continue;
             }
 
+            if let Some(RuntimeService::Panic(kind)) = service {
+                // Direct-rustc fixtures link the host toolchain's native `core` rlib. The cilly
+                // linker cannot decode its LLVM object members, so compiler-generated calls to
+                // these non-generic panic entry points have no cilly MethodDef. Product builds use
+                // `-Zbuild-std`; their real `core` MethodDef was handled by `AlreadyDefined` above
+                // and retains the RustException payload/catch_unwind path.
+                //
+                // Do not fake a RustException here. Its `data_pointer` must name an allocated Rust
+                // panic payload, and these signatures supply only a Location (plus bounds values).
+                // A null/fabricated pointer would be handed to `__rust_panic_cleanup`. A typed BCL
+                // exception is therefore the safe fallback: it preserves never-returning control
+                // flow and is deliberately rethrown by Rust catch_unwind, which accepts only a
+                // genuine RustException. `interop_try_catch` remains the catch-all managed bridge.
+                let arg_names = (0..self[mref.sig()].inputs().len()).map(|_| None).collect();
+                let exception_class = kind.managed_exception(self);
+                let throw = self.throw_exception_msg(exception_class, kind.message());
+                let mut roots = Vec::with_capacity(usize::from(kind.is_nounwind()) + 1);
+                if kind.is_nounwind() {
+                    roots.push(self.fail_fast_msg(kind.message()));
+                }
+                // The typed throw is the observable fallback for ordinary panics. It also leaves
+                // nounwind bodies structurally terminal if FailFast were ever to return, while
+                // the actual nounwind path remains uncatchable.
+                roots.push(throw);
+                self.new_method(MethodDef::new(
+                    Access::Public,
+                    owner,
+                    mref.name(),
+                    mref.sig(),
+                    mref.kind(),
+                    MethodImpl::MethodBody {
+                        blocks: vec![super::BasicBlock::new(roots, 0, None)],
+                        locals: vec![],
+                    },
+                    arg_names,
+                ));
+                stats.record(MethodResolution::Resolved {
+                    capability: RuntimeCapability::BuiltinPanic,
+                    service,
+                });
+                continue;
+            }
+
+            if service == Some(RuntimeService::CoreUbPrecondition) {
+                // `assert_unsafe_precondition!` generates a *conditional* diagnostic helper. A
+                // valid operation calls the helper and returns after its predicate succeeds; an
+                // unconditional FailFast replacement would therefore terminate defined programs.
+                // The host's native core artifact cannot provide that monomorphic body to cilly,
+                // so omit this optional UB diagnostic while preserving its signature and normal
+                // return. Inputs for which the original helper would fail already violate an
+                // unsafe Rust precondition and have undefined behavior. Product `-Zbuild-std`
+                // builds retain the real definition through `AlreadyDefined` above.
+                let arg_names = (0..self[mref.sig()].inputs().len()).map(|_| None).collect();
+                let ret = self.alloc_root(CILRoot::VoidRet);
+                self.new_method(MethodDef::new(
+                    Access::Public,
+                    owner,
+                    mref.name(),
+                    mref.sig(),
+                    mref.kind(),
+                    MethodImpl::MethodBody {
+                        blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
+                        locals: vec![],
+                    },
+                    arg_names,
+                ));
+                stats.record(MethodResolution::Resolved {
+                    capability: RuntimeCapability::BuiltinCoreUbPrecondition,
+                    service,
+                });
+                continue;
+            }
+
             // Prefer the exact crate-level FFI declaration captured from rustc. The linker's
             // historical hardcoded extern map remains below for compiler/runtime shims that do
             // not originate in a user `extern` block.
@@ -4084,9 +4483,8 @@ impl Assembly {
         self.call_root(mref, &[i64val], IsPure::NOT)
     }
 
-    /// Builds a root that throws a new `Exception` with message `msg`.
-    pub fn throw_msg(&mut self, msg: &str) -> Interned<CILRoot> {
-        let class = ClassRef::exception(self);
+    /// Builds a root that throws a new exception of `class` with message `msg`.
+    fn throw_exception_msg(&mut self, class: Interned<ClassRef>, msg: &str) -> Interned<CILRoot> {
         let name = self.alloc_string(".ctor");
         let signature = self.sig([class.into(), Type::PlatformString], Type::Void);
         let ctor = self.alloc_methodref(MethodRef::new(
@@ -4100,6 +4498,29 @@ impl Assembly {
         let msg = self.alloc_node(CILNode::Const(Box::new(Const::PlatformString(msg))));
         let exception = self.call(ctor, &[msg], IsPure::NOT);
         self.throw(exception)
+    }
+
+    /// Builds the uncatchable terminal call required by rustc's `nounwind` panic entry points.
+    fn fail_fast_msg(&mut self, msg: &str) -> Interned<CILRoot> {
+        let environment = ClassRef::enviroment(self);
+        let name = self.alloc_string("FailFast");
+        let signature = self.sig([Type::PlatformString], Type::Void);
+        let fail_fast = self.alloc_methodref(MethodRef::new(
+            environment,
+            name,
+            signature,
+            MethodKind::Static,
+            vec![].into(),
+        ));
+        let msg = self.alloc_string(msg);
+        let msg = self.alloc_node(CILNode::Const(Box::new(Const::PlatformString(msg))));
+        self.call_root(fail_fast, &[msg], IsPure::NOT)
+    }
+
+    /// Builds a root that throws a new `Exception` with message `msg`.
+    pub fn throw_msg(&mut self, msg: &str) -> Interned<CILRoot> {
+        let class = ClassRef::exception(self);
+        self.throw_exception_msg(class, msg)
     }
 }
 /// An initializer, which runs before everything else. By convention, it is used to initialize static / const data. Should not execute any user code
@@ -5540,6 +5961,329 @@ fn missing_method_resolution_only_aliases_allowlisted_rustc_runtime_symbols() {
         asm[asm.method_ref_to_def(rust_write).unwrap()].implementation(),
         MethodImpl::Missing
     ));
+}
+
+#[test]
+fn panic_runtime_service_classification_is_exact_and_covers_the_pinned_set() {
+    for kind in PanicKind::ALL {
+        assert_eq!(
+            RuntimeService::classify(kind.canonical_symbol()),
+            Some(RuntimeService::Panic(kind)),
+            "unclassified pinned panic service {}",
+            kind.canonical_symbol()
+        );
+    }
+
+    // Exact symbols observed from the pinned toolchain's direct-rustc fixtures. Alternate
+    // demangling removes the crate disambiguator but retains the complete module path.
+    assert_eq!(
+        RuntimeService::classify("_RNvNtCsh6vCWCGbp4W_4core9panicking18panic_bounds_check"),
+        Some(RuntimeService::Panic(PanicKind::BoundsCheck))
+    );
+    assert_eq!(
+        RuntimeService::classify("_RNvNtCs5bnaVnPOCY4_4core9panicking5panic"),
+        Some(RuntimeService::Panic(PanicKind::Explicit))
+    );
+    assert_eq!(
+        RuntimeService::classify(
+            "_RNvNtNtCs5bnaVnPOCY4_4core9panicking11panic_const23panic_const_rem_by_zero"
+        ),
+        Some(RuntimeService::Panic(PanicKind::RemByZero))
+    );
+
+    for unrelated in [
+        "my_crate::panic_bounds_check",
+        "my_crate::panic_const::panic_const_rem_by_zero",
+        "core::fmt::panic_bounds_check",
+        "core::panicking::panic_const::panic_const_rem_by_zero_suffix",
+    ] {
+        assert_eq!(RuntimeService::classify(unrelated), None, "{unrelated}");
+    }
+
+    let pointer_guard =
+        "_RNvNvMNtNtCs5bnaVnPOCY4_4core3ptr9const_ptrPp20offset_from_unsigned18precondition_check";
+    assert_eq!(
+        format!("{:#}", rustc_demangle::demangle(pointer_guard)),
+        "<*const _>::offset_from_unsigned::precondition_check"
+    );
+    assert_eq!(
+        RuntimeService::classify(pointer_guard),
+        Some(RuntimeService::CoreUbPrecondition)
+    );
+    let integer_guard = "_RNvNvMs9_NtCs5bnaVnPOCY4_4core3numj13unchecked_add18precondition_check";
+    assert_eq!(
+        format!("{:#}", rustc_demangle::demangle(integer_guard)),
+        "<usize>::unchecked_add::precondition_check"
+    );
+    assert_eq!(
+        RuntimeService::classify(integer_guard),
+        Some(RuntimeService::CoreUbPrecondition)
+    );
+    assert_eq!(
+        RuntimeService::classify("<u8>::unchecked_add::precondition_check"),
+        Some(RuntimeService::CoreUbPrecondition)
+    );
+    assert_eq!(
+        RuntimeService::classify("core::slice::raw::from_raw_parts::precondition_check"),
+        Some(RuntimeService::CoreUbPrecondition)
+    );
+    for unrelated in [
+        "my_crate::offset_from_unsigned::precondition_check",
+        "<bool>::unchecked_add::precondition_check",
+        "<u8>::checked_add::precondition_check",
+        "<u8>::unchecked_add::precondition_check_suffix",
+        "<u8 as my_crate::Unchecked>::unchecked_add::precondition_check",
+        "core::slice::raw::from_raw_parts::not_the_precondition_check",
+        "precondition_check",
+    ] {
+        assert_eq!(RuntimeService::classify(unrelated), None, "{unrelated}");
+    }
+}
+
+#[cfg(test)]
+fn thrown_exception_name(asm: &Assembly, method: Interned<MethodRef>) -> String {
+    let definition = &asm[asm.method_ref_to_def(method).expect("resolved method")];
+    let MethodImpl::MethodBody { blocks, locals } = definition.implementation() else {
+        panic!("panic service did not resolve to a method body")
+    };
+    assert!(locals.is_empty());
+    assert_eq!(blocks.len(), 1);
+    let root = blocks[0].roots().last().expect("panic service terminal");
+    let CILRoot::Throw(exception) = &asm[*root] else {
+        panic!("panic service body must terminate with throw")
+    };
+    let CILNode::Call(call) = &asm[*exception] else {
+        panic!("panic service must throw a constructed exception")
+    };
+    let (ctor, _, _) = call.as_ref();
+    let ctor = &asm[*ctor];
+    assert_eq!(&asm[ctor.name()], ".ctor");
+    let class = asm.class_ref(ctor.class());
+    assert!(
+        class.asm().is_some(),
+        "panic fallback must be an external managed exception, not a fabricated RustException"
+    );
+    asm[class.name()].to_string()
+}
+
+#[test]
+fn absent_native_core_panics_resolve_to_signature_correct_typed_throws() {
+    let mut asm = Assembly::default();
+    let location = asm.nptr(Type::Void);
+    let bounds = Interned::<MethodRef>::builtin(
+        &mut asm,
+        "_RNvNtCsh6vCWCGbp4W_4core9panicking18panic_bounds_check",
+        &[Type::Int(Int::USize), Type::Int(Int::USize), location],
+        Type::Void,
+    );
+    let remainder = Interned::<MethodRef>::builtin(
+        &mut asm,
+        "_RNvNtNtCs5bnaVnPOCY4_4core9panicking11panic_const23panic_const_rem_by_zero",
+        &[location],
+        Type::Void,
+    );
+    let resumed = Interned::<MethodRef>::builtin(
+        &mut asm,
+        PanicKind::AsyncFnResumed.canonical_symbol(),
+        &[location],
+        Type::Void,
+    );
+    let explicit = Interned::<MethodRef>::builtin(
+        &mut asm,
+        "_RNvNtCs5bnaVnPOCY4_4core9panicking5panic",
+        &[Type::Int(Int::USize), location],
+        Type::Void,
+    );
+    let cannot_unwind = Interned::<MethodRef>::builtin(
+        &mut asm,
+        PanicKind::CannotUnwind.canonical_symbol(),
+        &[],
+        Type::Void,
+    );
+    let pointer_guard = Interned::<MethodRef>::builtin(
+        &mut asm,
+        "_RNvNvMNtNtCs5bnaVnPOCY4_4core3ptr9const_ptrPp20offset_from_unsigned18precondition_check",
+        &[location, location, location],
+        Type::Void,
+    );
+    let integer_guard = Interned::<MethodRef>::builtin(
+        &mut asm,
+        "_RNvNvMs9_NtCs5bnaVnPOCY4_4core3numj13unchecked_add18precondition_check",
+        &[Type::Int(Int::USize), Type::Int(Int::USize), location],
+        Type::Void,
+    );
+
+    let stats = asm
+        .try_resolve_missing_methods(
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+            &MissingMethodPatcher::default(),
+        )
+        .unwrap();
+
+    assert_eq!(stats.panic_shims_synthesized, 5);
+    assert_eq!(stats.core_ub_precondition_shims_synthesized, 2);
+    assert_eq!(stats.missing_stubs_synthesized, 0);
+    assert_eq!(stats.unresolved_missing_methods, 0);
+    assert_eq!(
+        thrown_exception_name(&asm, bounds),
+        "System.IndexOutOfRangeException"
+    );
+    assert_eq!(
+        thrown_exception_name(&asm, remainder),
+        "System.DivideByZeroException"
+    );
+    assert_eq!(
+        thrown_exception_name(&asm, resumed),
+        "System.InvalidOperationException"
+    );
+    assert_eq!(
+        thrown_exception_name(&asm, explicit),
+        "System.InvalidOperationException"
+    );
+    assert_eq!(
+        thrown_exception_name(&asm, cannot_unwind),
+        "System.InvalidOperationException"
+    );
+    let MethodImpl::MethodBody { blocks, .. } =
+        asm[asm.method_ref_to_def(cannot_unwind).unwrap()].implementation()
+    else {
+        panic!("nounwind panic did not resolve to a method body")
+    };
+    assert_eq!(blocks[0].roots().len(), 2);
+    let CILRoot::Call(fail_fast) = &asm[blocks[0].roots()[0]] else {
+        panic!("nounwind panic must call Environment.FailFast")
+    };
+    let fail_fast_ref = &asm[fail_fast.0];
+    assert_eq!(&asm[fail_fast_ref.name()], "FailFast");
+    assert_eq!(
+        &asm[asm.class_ref(fail_fast_ref.class()).name()],
+        "System.Environment"
+    );
+
+    // This helper performs a conditional check in native core. The fallback must return for a
+    // valid pointer operation instead of unconditionally failing; only its optional UB diagnostic
+    // is unavailable when direct-rustc fixtures link the native core artifact.
+    let guard_definition = &asm[asm.method_ref_to_def(pointer_guard).unwrap()];
+    assert_eq!(guard_definition.sig(), asm[pointer_guard].sig());
+    let MethodImpl::MethodBody { blocks, locals } = guard_definition.implementation() else {
+        panic!("core UB precondition did not resolve to a body")
+    };
+    assert!(locals.is_empty());
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].roots().len(), 1);
+    assert!(matches!(&asm[blocks[0].roots()[0]], CILRoot::VoidRet));
+    let MethodImpl::MethodBody { blocks, .. } =
+        asm[asm.method_ref_to_def(integer_guard).unwrap()].implementation()
+    else {
+        panic!("integer UB precondition did not resolve to a body")
+    };
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].roots().len(), 1);
+    assert!(matches!(&asm[blocks[0].roots()[0]], CILRoot::VoidRet));
+
+    // This is the strict verifier + direct-emitter boundary used by the linker. A throw is a valid
+    // terminal for every retained panic signature, and the precondition helper remains a valid
+    // void-returning method, including its hidden track-caller argument.
+    let (image, _) = asm
+        .prepared()
+        .verify_for_export()
+        .unwrap()
+        .try_render_pe(&test_pe_options("typed-panic-fallbacks"))
+        .unwrap();
+    assert_eq!(&image[..2], b"MZ");
+}
+
+#[test]
+fn linked_core_panic_definition_wins_over_the_native_core_fallback() {
+    let mut asm = Assembly::default();
+    let location = asm.nptr(Type::Void);
+    let method = Interned::<MethodRef>::builtin(
+        &mut asm,
+        PanicKind::RemByZero.canonical_symbol(),
+        &[location],
+        Type::Void,
+    );
+    let real_body_marker = asm.alloc_root(CILRoot::VoidRet);
+    let body = MethodImpl::MethodBody {
+        blocks: vec![super::BasicBlock::new(vec![real_body_marker], 0, None)],
+        locals: vec![],
+    };
+    let reference = asm[method].clone();
+    let definition = reference.into_def(body, Access::Public, &asm);
+    asm.new_method(definition);
+
+    let stats = asm
+        .try_resolve_missing_methods(
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+            &MissingMethodPatcher::default(),
+        )
+        .unwrap();
+
+    assert_eq!(stats.already_defined, 1);
+    assert_eq!(stats.panic_shims_synthesized, 0);
+    let MethodImpl::MethodBody { blocks, .. } =
+        asm[asm.method_ref_to_def(method).unwrap()].implementation()
+    else {
+        panic!("linked core definition changed implementation kind")
+    };
+    assert_eq!(blocks[0].roots(), &[real_body_marker]);
+}
+
+#[test]
+fn rust_catch_unwind_rethrows_managed_panic_fallbacks_without_a_fake_payload() {
+    let mut asm = Assembly::default();
+    let mut patcher = MissingMethodPatcher::default();
+    super::builtins::insert_exception(&mut asm, &mut patcher);
+    let catch_name = asm.alloc_string("catch_unwind");
+    let byte_ptr = asm.nptr(Type::Int(Int::U8));
+    let catch_ref = Interned::<MethodRef>::builtin(
+        &mut asm,
+        "catch_unwind",
+        &[byte_ptr, byte_ptr, byte_ptr],
+        Type::Int(Int::I32),
+    );
+    let implementation = patcher.get(&catch_name).unwrap()(catch_ref, &mut asm);
+    let MethodImpl::MethodBody { blocks, .. } = implementation else {
+        panic!("catch_unwind patcher did not produce a body")
+    };
+    let handler = blocks[0].handler().expect("catch_unwind handler");
+    assert!(
+        handler
+            .iter()
+            .flat_map(super::BasicBlock::roots)
+            .any(|root| matches!(asm[*root], CILRoot::ReThrow))
+    );
+    let checked_type = handler
+        .iter()
+        .flat_map(super::BasicBlock::roots)
+        .find_map(|root| {
+            let CILRoot::Branch(branch) = &asm[*root] else {
+                return None;
+            };
+            let (_, _, Some(super::BranchCond::False(check))) = branch.as_ref() else {
+                return None;
+            };
+            let CILNode::IsInst(_, checked_type) = asm[*check] else {
+                return None;
+            };
+            Some(checked_type)
+        })
+        .expect("catch_unwind RustException type test");
+    let Type::ClassRef(rust_exception) = asm[checked_type] else {
+        panic!("catch_unwind must test a class reference")
+    };
+    assert_eq!(&asm[asm.class_ref(rust_exception).name()], "RustException");
+    assert!(asm.class_ref(rust_exception).asm().is_none());
+
+    let managed_fallback = PanicKind::Explicit.managed_exception(&mut asm);
+    assert_eq!(
+        &asm[asm.class_ref(managed_fallback).name()],
+        "System.InvalidOperationException"
+    );
+    assert!(asm.class_ref(managed_fallback).asm().is_some());
+    assert_ne!(managed_fallback, rust_exception);
 }
 
 #[test]
