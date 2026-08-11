@@ -106,7 +106,8 @@ CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
     "$home_driver" bundle install "$bundle"
 installed="$cargo_home/bin/cargo-dotnet"
 [[ "$host" == windows-x64 ]] && installed="$cargo_home/bin/cargo-dotnet.exe"
-"$installed" --version
+CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
+    "$installed" --version
 
 hello="$work/hello-dotnet"
 CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
