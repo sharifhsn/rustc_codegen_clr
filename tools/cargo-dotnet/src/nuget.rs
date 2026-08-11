@@ -1704,9 +1704,12 @@ fn missing_assets_locked(crate_dir: &Path) -> Result<Vec<(String, DependencyReco
 /// `cargo dotnet restore` — the sanctioned offline-prepare step. A no-op (and silent) for crates
 /// that never ran `add-nuget`, and for crates whose staged assets are already complete.
 ///
-/// The versioned dependency manifest records the exact RID/TFM/source selection. Local feeds must
-/// live below the consumer crate and are stored project-relative, so a fresh clone can reproduce
-/// the restore without retaining machine-specific absolute paths or credentials.
+/// The versioned dependency manifest records an optional explicit RID plus the exact TFM/source
+/// selection. When no RID was pinned, each fresh clone restores the current supported host RID;
+/// leaving the restore portable must not mean staging every RID carried by a native package.
+/// Local feeds must live below the consumer crate and are stored project-relative, so a fresh
+/// clone can reproduce the restore without retaining machine-specific absolute paths or
+/// credentials.
 ///
 /// Offline (`--offline`/`--frozen`) builds must never silently hit the network: if assets are
 /// missing while offline, this fails with a clear, actionable error instead of restoring.
@@ -1743,10 +1746,11 @@ pub fn ensure_staged(ctx: &Context) -> Result<()> {
         );
         for (id, record) in &missing {
             let sources = resolved_dependency_sources(&ctx.crate_dir, &record.sources)?;
+            let rid = dependency_restore_rid(record, ctx.host.host_rid);
             let resolved = crate::nuget_cache::restore(
                 id,
                 &record.version,
-                record.rid.as_deref(),
+                Some(rid),
                 &record.tfm,
                 &sources,
                 false,
@@ -1772,6 +1776,10 @@ pub fn ensure_staged(ctx: &Context) -> Result<()> {
         }
         Ok(())
     })
+}
+
+fn dependency_restore_rid<'a>(record: &'a DependencyRecord, host_rid: &'a str) -> &'a str {
+    record.rid.as_deref().unwrap_or(host_rid)
 }
 
 /// spinacz's reflection core, embedded at COMPILE TIME of `cargo-dotnet` itself. Written out
@@ -2777,12 +2785,28 @@ fn test_nuget_transaction_crash_point(_point: &str) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        DependencySource, NativePublishPoint, hash_bindgen_identity_parts, hash_binding_assembly,
-        hash_optional_path, load_deps_manifest, mycorrhiza_path_for_mode, native_library_matches,
-        record_dependency, resolved_dependency_sources, run_native_file, run_native_file_with_hook,
+        DependencyRecord, DependencySource, NativePublishPoint, dependency_restore_rid,
+        hash_bindgen_identity_parts, hash_binding_assembly, hash_optional_path, load_deps_manifest,
+        mycorrhiza_path_for_mode, native_library_matches, record_dependency,
+        resolved_dependency_sources, run_native_file, run_native_file_with_hook,
         staged_package_assets, with_nuget_transaction,
     };
     use sha2::Digest;
+
+    #[test]
+    fn portable_dependency_restore_selects_the_current_host_rid() {
+        let mut record = DependencyRecord {
+            version: "1.0.0".into(),
+            rid: None,
+            tfm: "net10.0".into(),
+            sources: vec![DependencySource::Default],
+            source_identity_sha256: "0".repeat(64),
+        };
+        assert_eq!(dependency_restore_rid(&record, "osx-arm64"), "osx-arm64");
+
+        record.rid = Some("linux-x64".into());
+        assert_eq!(dependency_restore_rid(&record, "osx-arm64"), "linux-x64");
+    }
 
     #[test]
     fn binding_fingerprint_changes_with_assembly_bytes() {
