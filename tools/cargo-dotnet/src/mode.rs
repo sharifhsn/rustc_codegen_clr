@@ -157,6 +157,16 @@ fn installed_home_from_executable(exe: &Path) -> Result<Option<PathBuf>> {
     let Some(home) = bin.parent() else {
         return Ok(None);
     };
+    // `cargo install --root <temporary>` also produces `<temporary>/bin/cargo-dotnet` while
+    // setup is building the driver that will later be sealed into the real SDK home.  The path
+    // shape alone is therefore not authority.  Absence of the installed-home marker means this
+    // optional inference does not apply; an existing but malformed/link-backed marker still
+    // reaches `installed_home_for_executable` and fails closed.
+    match std::fs::symlink_metadata(home.join("VERSION")) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
     installed_home_for_executable(exe, home)
 }
 
@@ -261,6 +271,29 @@ mod tests {
             }
             Mode::Dev { repo_root } => panic!(
                 "direct installed driver was misclassified as dev: {}",
+                repo_root.display()
+            ),
+        }
+    }
+
+    #[test]
+    fn temporary_cargo_install_root_does_not_override_configured_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let configured_home = temp.path().join("staged-sdk");
+        let temporary_install = temp.path().join("cargo-install-root");
+        let driver = temporary_install
+            .join("bin")
+            .join(format!("cargo-dotnet{}", std::env::consts::EXE_SUFFIX));
+        std::fs::create_dir_all(&configured_home).unwrap();
+        std::fs::write(configured_home.join("VERSION"), b"schema = 1\n").unwrap();
+        std::fs::create_dir_all(driver.parent().unwrap()).unwrap();
+        std::fs::write(&driver, b"driver").unwrap();
+
+        let mode = detect_from(&driver, &configured_home).unwrap();
+        match mode {
+            Mode::Installed { home: detected } => assert_eq!(detected, configured_home),
+            Mode::Dev { repo_root } => panic!(
+                "temporary cargo install root was misclassified as dev: {}",
                 repo_root.display()
             ),
         }
