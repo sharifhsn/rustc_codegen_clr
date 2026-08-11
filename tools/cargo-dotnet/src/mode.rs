@@ -144,6 +144,22 @@ fn installed_home_for_executable(exe: &Path, home: &Path) -> Result<Option<PathB
     Ok(Some(canonical_home))
 }
 
+/// Recognize a directly invoked home driver at `<home>/bin/cargo-dotnet` without requiring the
+/// caller to repeat `<home>` through `CARGO_DOTNET_HOME`. The candidate is accepted only through
+/// the same retained-capability VERSION/executable proof as an explicitly configured home.
+fn installed_home_from_executable(exe: &Path) -> Result<Option<PathBuf>> {
+    let Some(bin) = exe.parent() else {
+        return Ok(None);
+    };
+    if bin.file_name().is_none_or(|name| name != "bin") {
+        return Ok(None);
+    }
+    let Some(home) = bin.parent() else {
+        return Ok(None);
+    };
+    installed_home_for_executable(exe, home)
+}
+
 fn is_repo_root(dir: &Path) -> bool {
     dir.join("feasibility/_cargo_dotnet_core.sh").is_file()
         && dir.join("x86_64-unknown-dotnet.json").is_file()
@@ -160,6 +176,9 @@ pub fn detect() -> Result<Mode> {
 
 fn detect_from(exe: &Path, home: &Path) -> Result<Mode> {
     if let Some(home) = installed_home_for_executable(exe, home)? {
+        return Ok(Mode::Installed { home });
+    }
+    if let Some(home) = installed_home_from_executable(exe)? {
         return Ok(Mode::Installed { home });
     }
     if let Some(repo_root) = find_dev_repo_from(exe) {
@@ -221,5 +240,29 @@ mod tests {
             ),
         }
         assert_eq!(find_repo_ancestor(&home), Some(repo));
+    }
+
+    #[test]
+    fn direct_home_driver_infers_its_sealed_home_without_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let configured_elsewhere = temp.path().join("default-home");
+        let home = temp.path().join("installed-sdk");
+        let driver = home
+            .join("bin")
+            .join(format!("cargo-dotnet{}", std::env::consts::EXE_SUFFIX));
+        std::fs::create_dir_all(driver.parent().unwrap()).unwrap();
+        std::fs::write(home.join("VERSION"), b"schema = 1\n").unwrap();
+        std::fs::write(&driver, b"driver").unwrap();
+
+        let mode = detect_from(&driver, &configured_elsewhere).unwrap();
+        match mode {
+            Mode::Installed { home: detected } => {
+                assert_eq!(detected, std::fs::canonicalize(&home).unwrap())
+            }
+            Mode::Dev { repo_root } => panic!(
+                "direct installed driver was misclassified as dev: {}",
+                repo_root.display()
+            ),
+        }
     }
 }

@@ -63,10 +63,10 @@ pub(crate) enum Entry {
 
 pub(crate) fn enter() -> Result<Entry> {
     std::hint::black_box(&CARGO_DOTNET_BUILD_ID_BINARY_RECEIPT);
-    if matches!(crate::mode::detect()?, crate::mode::Mode::Dev { .. }) {
-        return Ok(Entry::Continue(None));
-    }
-    let home = crate::mode::cargo_dotnet_home()?;
+    let home = match crate::mode::detect()? {
+        crate::mode::Mode::Dev { .. } => return Ok(Entry::Continue(None)),
+        crate::mode::Mode::Installed { home } => home,
+    };
     let current = std::env::current_exe().context("locating running cargo-dotnet")?;
     let mut recovered = false;
     loop {
