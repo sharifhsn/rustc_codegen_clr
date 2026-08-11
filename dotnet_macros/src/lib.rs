@@ -1244,12 +1244,26 @@ pub fn dotnet_enum(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[inline]
             pub fn to_handle(self) -> #handle {
                 let value: #repr_ty = self as #repr_ty;
-                unsafe { ::core::mem::transmute_copy(&value) }
+                unsafe {
+                    ::mycorrhiza::enums::rustc_clr_interop_enum_from_repr::<
+                        { "" },
+                        { #managed_name },
+                        #size,
+                        #repr_ty,
+                    >(value)
+                }
             }
 
             #[inline]
             pub fn from_handle(value: #handle) -> ::core::option::Option<Self> {
-                let value: #repr_ty = unsafe { ::core::mem::transmute_copy(&value) };
+                let value: #repr_ty = unsafe {
+                    ::mycorrhiza::enums::rustc_clr_interop_enum_to_repr::<
+                        { "" },
+                        { #managed_name },
+                        #size,
+                        #repr_ty,
+                    >(value)
+                };
                 Self::from_value(value)
             }
         }
