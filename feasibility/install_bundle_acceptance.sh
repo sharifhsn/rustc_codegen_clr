@@ -59,7 +59,7 @@ fi
 grep -F 'bundle archive SHA-256 mismatch' "$work/artifacts/archive-tamper.log"
 mkdir -p "$consumer_cargo_home"
 CARGO_HOME="$consumer_cargo_home" \
-    "$driver" bundle install "$work/artifacts/sdk-a.zip" --home "$restore_home"
+    "$source_driver" bundle install "$work/artifacts/sdk-a.zip" --home "$restore_home"
 
 installed_driver="$consumer_cargo_home/bin/cargo-dotnet"
 [[ -f "$consumer_cargo_home/bin/cargo-dotnet.exe" ]] \

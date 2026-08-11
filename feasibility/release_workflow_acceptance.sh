@@ -66,7 +66,8 @@ grep -Fq 'git_tag="${CARGO_DOTNET_SOURCE_GIT_TAG:-' "$compat_launcher" \
     || fail "local setup does not retain descriptive exact-tag provenance separately"
 grep -Fq 'bundle create' "$bundle" || fail "release does not create SDK bundles"
 grep -Fq 'bundle verify' "$bundle" || fail "release does not verify SDK bundles"
-grep -Fq 'bundle install' "$bundle" || fail "release does not clean-install SDK bundles"
+grep -Fq '"$home_driver" bundle install "$bundle"' "$bundle" \
+    || fail "release does not install with the exact sealed bundle driver"
 grep -Fq 'dotnet attach' "$bundle" || fail "release does not exercise installed MSBuild attachment"
 grep -Fq 'native Rust probe=0' "$bundle" \
     || fail "release does not exercise installed attached-host native sidecars"

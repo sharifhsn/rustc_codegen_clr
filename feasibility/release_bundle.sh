@@ -103,7 +103,7 @@ bundle="$out/cargo-dotnet-sdk-$host-$version.zip"
 "$home_driver" bundle verify "$bundle"
 
 CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
-    "$driver" bundle install "$bundle"
+    "$home_driver" bundle install "$bundle"
 installed="$cargo_home/bin/cargo-dotnet"
 [[ "$host" == windows-x64 ]] && installed="$cargo_home/bin/cargo-dotnet.exe"
 "$installed" --version
