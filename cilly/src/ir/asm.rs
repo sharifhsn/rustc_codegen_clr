@@ -2480,6 +2480,20 @@ impl Assembly {
             .iter()
             .filter_map(|(id, method)| public_classes.contains(&method.class()).then_some(*id))
             .collect();
+        // `MainModule::.cctor` is a CLR runtime entrypoint, not an ordinary managed export. Facade
+        // projection deliberately demotes the original exported methods and then rebuilds
+        // reachability from the facade, so the module initializer must be an explicit root. Its
+        // transitive call graph initializes immutable Rust statics such as fmt's DECIMAL_PAIRS;
+        // dropping it leaves their pointer fields null even though the consuming methods remain
+        // reachable. Keep the two linker initializer helpers as roots as well: they carry thread-
+        // local and GNU-style user initialization that is semantically part of the module startup
+        // contract even though neither is projected onto the public facade.
+        roots.extend(self.method_defs.iter().filter_map(|(id, method)| {
+            let class = self.class_defs.get(&method.class())?;
+            let is_main_module = &self[class.name()] == MAIN_MODULE;
+            let name = &self[method.name()];
+            (is_main_module && matches!(name.as_ref(), CCTOR | TCCTOR | USER_INIT)).then_some(*id)
+        }));
         // Comptime-authored CLR types use local `Extern` ClassDefs to distinguish intentional
         // managed API from ordinary compiler-generated Rust layout classes. Their externally
         // visible members remain public even when no facade method mentions the type directly
@@ -6022,6 +6036,66 @@ fn facade_dce_drops_unrelated_exported_types() {
     assert!(asm.method_defs.contains_key(&ctor));
     assert!(asm.method_defs.contains_key(&getter));
     assert_eq!(asm.method_defs.len(), 3);
+}
+
+#[test]
+fn facade_dce_preserves_main_module_initializers_and_their_callees() {
+    let mut asm = Assembly::default();
+    let main = asm.main_module();
+    let void_sig = asm.sig([], Type::Void);
+
+    let helper_name = asm.alloc_string("init_reachable_static");
+    let helper_ret = asm.alloc_root(CILRoot::VoidRet);
+    let helper = asm.new_method(MethodDef::new(
+        Access::Public,
+        main,
+        helper_name,
+        void_sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(vec![helper_ret], 0, None)],
+            locals: vec![],
+        },
+        vec![],
+    ));
+    let helper_ref = asm.alloc_methodref(asm[helper].ref_to());
+    let helper_call = asm.alloc_root(CILRoot::call(helper_ref, []));
+    asm.add_cctor(&[helper_call]);
+    asm.add_tcctor(&[helper_call]);
+    asm.add_user_init(&[helper_call]);
+    let cctor_ref = asm.cctor_mref();
+    let cctor = asm
+        .method_ref_to_def(cctor_ref)
+        .expect("module constructor definition");
+    let tcctor = asm.tcctor();
+    let user_init = asm.user_init();
+
+    let export_name = asm.alloc_string("answer");
+    let export_sig = asm.sig([], Type::Int(Int::I32));
+    let answer = asm.alloc_node(Const::I32(42));
+    let export_ret = asm.alloc_root(CILRoot::Ret(answer));
+    asm.new_method(MethodDef::new(
+        Access::Extern,
+        main,
+        export_name,
+        export_sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(vec![export_ret], 0, None)],
+            locals: vec![],
+        },
+        vec![],
+    ));
+
+    assert_eq!(asm.hide_main_module_implementation_details(), 1);
+    assert_eq!(asm.project_main_module_exports("Game.Exports"), 1);
+    asm.eliminate_dead_code_after_facade_projection("Game.Exports");
+
+    assert!(asm.method_defs.contains_key(&cctor));
+    assert!(asm.method_defs.contains_key(&tcctor));
+    assert!(asm.method_defs.contains_key(&user_init));
+    assert!(asm.method_defs.contains_key(&helper));
+    assert_eq!(asm.typecheck(), 0);
 }
 
 #[test]

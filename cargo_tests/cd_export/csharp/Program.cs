@@ -122,6 +122,12 @@ public static class Program
 
         // String (owned) inbound, String outbound.
         Check("shout(\"hi\")", MainModule.shout("hi"), "HI!", ref pass, ref total);
+        Check(
+            "DescribeNumbers(21)",
+            MainModule.DescribeNumbers(21),
+            "managed Rust processed 21 into 42",
+            ref pass,
+            ref total);
 
         // &str inbound, primitive return — proves the string content crossed intact.
         Check("str_len(\"héllo\")", MainModule.str_len("héllo"), 6, ref pass, ref total); // é is 2 UTF-8 bytes

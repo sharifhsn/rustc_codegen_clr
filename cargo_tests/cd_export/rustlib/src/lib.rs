@@ -37,6 +37,15 @@ pub fn greet(name: &str) -> String {
     format!("Hello, {name}, from Rust!")
 }
 
+/// Formats integer arguments before returning an owned managed string.
+#[dotnet_export(name = "DescribeNumbers")]
+pub fn describe_numbers(value: i32) -> String {
+    format!(
+        "managed Rust processed {value} into {}",
+        value.saturating_mul(2)
+    )
+}
+
 /// Round-trips an explicitly nullable exported managed string.
 #[dotnet_export]
 pub fn maybe_greet(name: ManagedOption<MString>) -> ManagedOption<MString> {
